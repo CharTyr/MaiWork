@@ -1,0 +1,234 @@
+# MaiWork 配置示例（对应 docs/02-设计.md §12.4）
+# 每个字段都有默认值；默认全关、什么都不干。只有写进服务群的群才会被 MaiWork 接触到。
+
+[plugin]
+# 是否启用 MaiWork；默认关闭。宿主在没写 enabled 时会当成开启，所以这里必须显式写。
+enabled = false
+# 配置版本；改默认值时会升。一般不用手改。
+config_version = "0.3.10"
+
+
+[groups]
+# 服务群列表：只有这里列出的群，MaiWork 才会读消息、记信号、做后续的事。
+# 群号必须写成 "qq:号码"（只支持 qq）。
+# [[groups.serve]]
+# group = "qq:123456789"
+# 工作区名：空则用 "g<群号>"；多个群填同一个值即共享一个工作区
+# （共享工作区的群会互相看到群画像）。只能用字母、数字、下划线、横线，1~64 个字符。
+# workspace = "team-a"
+#
+# 再来一个群就再加一段：
+# [[groups.serve]]
+# group = "qq:987654321"
+# workspace = "team-a"      # 和上面同一个名字 = 两个群共用一个工作区
+
+
+[focus]
+# 每群最多关注几个人（最活跃的、和 MaiBot 关系好的、明确请 MaiBot 准备东西的）。
+max_members = 5
+# 是否给关注成员建个人画像；关掉就只看群，不看个人。
+personal_profile = true
+# 是否给有画像的关注成员出个人向的资讯和构想（只给本人和管理员看，不进群视图、
+# 不跨群；关掉就不出）。要 personal_profile 开着才有效。
+personal_feeds = true
+# 个人向资讯每人每次最多出几条（每人每天最多 1 次，北京时间 9:00–22:00 之间跑）。
+personal_per_day = 3
+
+
+[feeds]
+# 每群每天备资讯的时段（北京时间），到点去搜、筛，不进群直推。
+news_slots = ["08:30", "14:00", "19:00"]
+# 每个时段随机提前/推后多少分钟以内（避免所有群同一秒发请求）。
+news_jitter_minutes = 30
+# 每群每天最多出几个构想。
+ideas_per_day = 1
+# （旧的 min_score 已不用——2026-09-27 质量标准起改看 web_min_avg，写了只会在问题清单里收到提示）
+# 每批最多入选几条资讯（先按平均分和相关度过线，再按这个话题/来源/敏感的上限去同质化）。
+max_items = 10
+# 和最近多少天已出过的资讯去重（链接相同或标题高度相似都跳过）。
+lookback_days = 14
+# 来源屏蔽名单（域名，含其子域；如 "spam.com" 连 m.spam.com 一起屏蔽）。
+# 管理员在网页上也可以加减，两边会合并生效。
+blocked_domains = []
+# 资讯/好文上网页的五项平均分门槛（1~5；且相关度要 >= 3）。
+web_min_avg = 3.0
+# 资讯进群里开话题候选池的平均分门槛（1~5；且相关度、值得聊都要 >= 4）。
+pool_min_avg = 4.0
+# 备资讯时要不要同时找「好文」（教程、好文章、工具介绍；不看新不新，只核对现在还适不适用）。
+guides = true
+
+
+[topics]
+# 冷场开话题（设计 §4.4）。
+enabled = true
+# 谁说：maiwork = MaiWork 按人设直接发一句开场白；maibot = 请 MaiBot 自己开口（它可能不说）。
+speaker = "maiwork"
+# 每群每天最多开几个话题。
+per_day = 2
+# 同一群两次开话题的最小间隔（小时）。
+min_gap_hours = 3
+# 话题候选池里一条资讯多少小时后过期。
+candidate_ttl_hours = 12
+
+
+[delivery]
+# 每群每天主动推到群里的上限（含开话题）。
+push_per_day = 3
+# 睡觉时段（北京时间）：不开话题，其他主动推送推迟。支持跨午夜。
+quiet_hours = "23:00-08:00"
+# 「可提起清单」里一条的有效期（分钟）：这段时间内 MaiBot 聊天时可以顺口提起。
+mention_ttl_minutes = 120
+
+
+[approval]
+# 群友 @ 派的活，是否要 bot 管理员批准后才开工。
+required = true
+# bot 管理员 QQ 号列表（纯数字，不带 qq:）。这些人在网页上能批准、改群画像。
+# 默认 100000001（部署人的 QQ）；要加人就往后写。
+admins = ["qq:100000001"]
+# 免批的群号（纯数字）。
+exempt_groups = []
+# 派活免批的人（QQ 号，纯数字）。
+exempt_users = []
+# 待批超过 24 小时没人处理时，在群里提醒管理员一次。false = 不提醒（网页上一直看得到）。
+remind = true
+
+
+[models]
+# MaiWork 自己的 OpenAI 兼容端点（如 NewAPI），不走 MaiBot 的模型登记。
+# 网页「设置 → 模型」里改的也直接写进这里（同一份，没有网页覆盖层）。
+base_url = ""
+# 端点密钥；只进不出（接口只回 key_set: true/false），不写日志。
+api_key = ""
+# 主模型（理解群、决定做什么、验收）。
+main = ""
+# 主模型备用（主模型挂了换它再试一次，不能和主模型同名）。
+main_backup = ""
+# 子 agent 模型（干活的）。
+worker = ""
+# 子 agent 模型备用。
+worker_backup = ""
+# 同一模型调用失败（网络错误、429、408、5xx）最多重试几次（0~10）；主备模型各自按这个数重试。
+retries = 5
+# 两次重试之间等几秒（1~60）；429（被限流）不按这个等，改由下面的端点冷却决定。
+retry_delay_s = 10
+# 同一个端点同时最多几个请求在路上（1~8）。被限流（429）多就调成 1。
+# 任何一次 429 都会让整个端点先歇一会儿：有 Retry-After 按它（最多 120 秒），没有按 10/20/40/60 秒递增。
+max_concurrency = 2
+# 同一个端点每分钟最多发几次（0 = 不限，最多 600）。
+max_rpm = 0
+
+
+[jev]
+# 是否用 Jev（快速是非/选择判断器）；关掉则所有判断走主模型慢路径。
+enabled = true
+# 单次判断超时（毫秒，200~1200）。
+timeout_ms = 1200
+# Jev 密钥；一般留空走默认文件。读取顺序（有哪个用哪个，靠前的优先）：
+# 环境变量 TYPESAFE_API_KEY → 网页「设置」里存的密钥 → 这里的 api_key → key_file → ~/.typesafe_key。
+# 只被代码读取：不打印、不入库、不进聊天；网页只进不出。
+api_key = ""
+# Jev 密钥文件路径；空 = 默认 ~/.typesafe_key（线上即 /root/.typesafe_key）。
+# 文件只被代码读取：不打印、不入库、不进聊天。
+key_file = ""
+# Jev 服务端地址；一般不用改。
+api_url = "https://api.typesafe.ai/v1/systemone"
+# Jev 模型名；一般不用改。
+model = "jev-1.13.0"
+
+[usage]
+# 一天 token 总量超过这个数就在网页/日志提醒；0 = 不提醒；只提醒不暂停。
+alert_daily_tokens = 0
+# 单个任务 token 超过这个数就提醒；0 = 不提醒。
+alert_task_tokens = 0
+
+
+[console]
+# 网页监听地址，必须是 IP:端口（不支持域名）。
+listen = "127.0.0.1:18650"
+# 管理员密码；空则首次启动自动生成 16 位随机密码，写到 <数据目录>/console_password.txt。
+password = ""
+# 网页对外的地址（如 https://maiwork.example.com）；用来拼群专属链接。不公开就留空。
+public_url = ""
+
+
+[environments]
+# 是否允许用 Railway 临时 VM 跑活（ssh railway.new）。
+railway = true
+# 已有的专用 VM/VPS，按列出顺序优先用。
+# [[environments.ssh]]
+# name = "vps1"
+# host = "maiwork@1.2.3.4:22"
+# note = "月付的小机器，跑轻活"
+# 工作区根目录：每个工作区是它下面的一个子目录，归 maiwork 用户所有。
+workspace_root = "/home/maiwork/workspaces"
+# 单条命令的内存上限。
+memory_max = "512M"
+# 单条命令最长跑多少秒。
+runtime_max_sec = 1800
+# 本机执行方式："systemd"（线上：用 systemd-run 以独立用户跑，带内存/时长上限，隔离）；
+# "direct" 只给本机开发测试用（直接开子进程，没有任何隔离，线上绝不能填这个）。
+local_mode = "systemd"
+# 本机命令以哪个系统用户身份跑（systemd 模式的 --uid/--gid）。
+run_as = "maiwork"
+# 每个工作区同时跑的子 agent 个数。
+max_parallel = 2
+# 子 agent 单条命令的默认时长上限（秒）。
+command_timeout_s = 300
+# Railway 一次性 VM 每天最多用几台（官方同一出口 IP 每天最多 3 台；留 1 台余量给派活）。
+railway_daily_max = 2
+# 每轮备资讯最多实测几条（同一台 VM 里依次测）。
+verify_per_round = 2
+# 单条资讯/好文实测的时长上限（分钟）。
+verify_minutes = 10
+
+
+[profile]
+# 攒够多少条新消息就交主模型提炼一次群画像。
+batch_messages = 80
+# 距上次提炼最多隔几个小时（且至少有 5 条新消息）就提炼。
+max_interval_hours = 3
+# 第一次建画像往回读多少天的消息。
+backfill_days = 7
+# 第一次建画像最多读多少条。
+backfill_max_messages = 1500
+# 每周哪一天整体整理画像（合并、去掉过时的）；0 = 周一，6 = 周日。
+weekly_day = 0
+# 后台每隔多少分钟增量读一次新消息。
+read_interval_minutes = 10
+
+
+[storage]
+# 数据目录：数据库、密钥、自动生成的密码文件都放这里。
+# 空 = <MaiBot>/data/maiwork（即插件目录上两级下的 data/maiwork）。
+data_dir = ""
+
+
+[group_space]
+# 群空间（群文件 / 公告 / 相册）：启动时探测适配器开放了哪些接口，有才开放；
+# 线上适配器还是旧版时这些操作一律不出现，关掉这里就连探测都不做。
+enabled = true
+# 每群每天最多发几条群公告（发之前会先在群里说一句预告，防手滑）。
+notice_per_day = 1
+
+
+[extensions]
+# 子 agent 的扩展：MCP 端点和 skill。MaiWork 自己加载，只注册进自己的工具表
+# （不给 MaiBot 的 planner）；skill 由管理员放到 <数据目录>/skills/<名字>/SKILL.md，不用配置。
+# 联网搜索不写死在配置里：在网页「设置 → 扩展」里加一个带搜索工具的 MCP（如 Tavily 的
+# 托管 MCP），再点「用作联网搜索」绑上即可（绑定存数据库，见 docs/02 §10）。
+# 每个 [[extensions.mcp]] 是一个 MCP 端点（Streamable HTTP）。连不上不影响启动，
+# 网页「设置 → 健康」里能看到错误，管理员也可以在那里手动重连。
+# [[extensions.mcp]]
+# name = "github"                        # 只用字母、数字、下划线、横线，1~32 个字符
+# url = "https://mcp.example.com/mcp"   # 必须 https:// 开头
+# enabled = true                        # 关掉就不连接、不注册工具
+# 额外请求头（密钥写这里）：只由代码读取，网页不回显、不写日志、不落库。
+# [extensions.mcp.headers]
+# Authorization = "Bearer 填你的密钥"
+# 工具白名单（远端工具名）；空 = 全部都注册。注册名是 mcp_<name>_<工具名>。
+# tools = ["get_issue", "list_repos"]
+# 谁能用这些工具：默认只有子 agent（"worker"）；加 "main" 让主模型也能用。
+# roles = ["worker"]
+# 单次请求超时（秒）。
+# timeout_s = 20

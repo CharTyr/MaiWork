@@ -1,0 +1,210 @@
+"""联网搜索绑定（docs/02 §10、docs/07 §10.3）：搜索只能走「扩展」里指定的一个 MCP 的某个工具。
+
+- 存法：kv["extensions.search"] = {"mcp": 扩展名, "tool": 搜索工具名, "extract_tool": 抓正文工具名或 ""}。
+  **只存数据库，不进 config.toml**（网页保存的东西不写回 plugins/，会触发全部插件重载）。
+- 候选清单：所有已启用 MCP 扩展的工具，按名字/描述猜哪个像搜索、哪个像抓正文（guess_tool_role），
+  前端据此给下拉排序和标徽章。
+- 状态（status_of）：没绑定 / 绑定的扩展不在了 / 扩展没启用 / 扩展没连上 / 工具不在了 / 好了——
+  中文说明，设置总览的健康项和 GET /api/extensions/search 都用它。
+- 扩展被删除 / 改名：调用方（console 路由）调 clear_binding(store, mcp=名字) 跟着清掉。
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any, Callable
+
+from . import extensions_web
+
+logger = logging.getLogger("maiwork.search_binding")
+
+KV_SEARCH = "extensions.search"
+
+_BINDING_KEYS = ("mcp", "tool", "extract_tool")
+
+
+# ----------------------------------------------------------------------
+# 读 / 写 / 清
+# ----------------------------------------------------------------------
+
+
+def _norm_binding(raw: Any) -> dict[str, str] | None:
+    """kv 里读出来的东西规范化成 {"mcp","tool","extract_tool"}；不合法 → None。"""
+    if not isinstance(raw, dict):
+        return None
+    mcp = str(raw.get("mcp") or "").strip()
+    tool = str(raw.get("tool") or "").strip()
+    if not mcp or not tool:
+        return None
+    return {"mcp": mcp, "tool": tool, "extract_tool": str(raw.get("extract_tool") or "").strip()}
+
+
+def get_binding(store: Any) -> dict[str, str] | None:
+    """当前搜索绑定；没有 / 被改坏 → None。"""
+    try:
+        return _norm_binding(store.kv_get(KV_SEARCH))
+    except Exception:
+        return None
+
+
+def set_binding(store: Any, binding: dict[str, Any]) -> dict[str, str]:
+    """直接写绑定（不校验扩展/工具在不在——校验走 save_binding）。返回规范化后的绑定。"""
+    norm = _norm_binding(binding)
+    if norm is None:
+        raise ValueError("绑定要写成 {\"mcp\": 扩展名, \"tool\": 搜索工具名}")
+    with store.tx() as conn:
+        store.kv_set(conn, KV_SEARCH, norm)
+    logger.info("搜索绑定已保存：用 %s 的 %s%s", norm["mcp"], norm["tool"],
+                f"（抓正文 {norm['extract_tool']}）" if norm["extract_tool"] else "")
+    return norm
+
+
+def clear_binding(store: Any, *, mcp: str | None = None) -> bool:
+    """解绑。mcp 给了时：只有当前绑定正好绑着这个名字才清（扩展被删 / 改名时用）。
+    返回有没有真的清掉。幂等。"""
+    current = get_binding(store)
+    if current is None:
+        return False
+    if mcp is not None and current["mcp"] != str(mcp):
+        return False
+    with store.tx() as conn:
+        conn.execute("DELETE FROM kv WHERE key=?", (KV_SEARCH,))
+    logger.info("搜索绑定已解除（原绑定：%s 的 %s）", current["mcp"], current["tool"])
+    return True
+
+
+def save_binding(
+    store: Any,
+    settings: Any,
+    body: dict[str, Any],
+    *,
+    tool_spec_of: Callable[[str, str], dict | None],
+) -> dict[str, str]:
+    """校验 + 写绑定。tool_spec_of(扩展名, 工具名) → 工具的 spec（含 inputSchema）或 None。
+
+    ValueError（中文）：扩展不存在 / 工具不存在 / 搜索和抓正文是同一个工具。
+    """
+    if not isinstance(body, dict):
+        raise ValueError("请求体要写成 {\"mcp\": 扩展名, \"tool\": 搜索工具名, \"extract_tool\": 可选}")
+    mcp = str(body.get("mcp") or "").strip()
+    tool = str(body.get("tool") or "").strip()
+    extract_tool = str(body.get("extract_tool") or "").strip()
+    if not mcp or not tool:
+        raise ValueError("要给出 mcp（扩展名）和 tool（搜索工具名）")
+    names = {e.name for e in extensions_web.merged_entries(settings, store)}
+    if mcp not in names:
+        raise ValueError(f"没有这个扩展「{mcp}」——先去 设置 → 扩展 里添加")
+    if tool_spec_of(mcp, tool) is None:
+        raise ValueError(f"扩展 {mcp} 没有这个工具「{tool}」——先 reload 一下扩展拿最新工具清单")
+    if extract_tool:
+        if extract_tool == tool:
+            raise ValueError("搜索和抓正文不能是同一个工具")
+        if tool_spec_of(mcp, extract_tool) is None:
+            raise ValueError(f"扩展 {mcp} 没有这个工具「{extract_tool}」——先 reload 一下扩展拿最新工具清单")
+    return set_binding(store, {"mcp": mcp, "tool": tool, "extract_tool": extract_tool})
+
+
+# ----------------------------------------------------------------------
+# 状态（可用性判断 + 中文说明）
+# ----------------------------------------------------------------------
+
+
+def _entry_of(settings: Any, store: Any, name: str) -> Any | None:
+    for e in extensions_web.merged_entries(settings, store):
+        if e.name == name:
+            return e
+    return None
+
+
+def status_of(
+    store: Any,
+    settings: Any,
+    runtime_of: Callable[[str], Any],
+) -> tuple[bool, str]:
+    """(可用, 中文说明)。runtime_of(扩展名) → 扩展运行状态（extensions.runtime_of）或 None。"""
+    binding = get_binding(store)
+    if binding is None:
+        return False, "还没指定联网搜索：去 设置 → 扩展 里选一个 MCP 用作联网搜索"
+    entry = _entry_of(settings, store, binding["mcp"])
+    if entry is None:
+        return False, f"搜索绑定的扩展「{binding['mcp']}」不在了：去 设置 → 扩展 重新选一个"
+    if not entry.enabled:
+        return False, f"搜索绑定的扩展「{binding['mcp']}」没启用：去 设置 → 扩展 打开它"
+    runtime = runtime_of(binding["mcp"])
+    client = getattr(runtime, "client", None) if runtime is not None else None
+    if client is None:
+        return False, f"搜索绑定的扩展「{binding['mcp']}」还没连上：去 设置 → 扩展 里 reload 一下"
+    tools_remote = runtime.tools_remote() if hasattr(runtime, "tools_remote") else {}
+    if binding["tool"] not in tools_remote:
+        return False, f"扩展「{binding['mcp']}」没有这个工具「{binding["tool"]}」：去 设置 → 扩展 重新绑定"
+    if binding["extract_tool"] and binding["extract_tool"] not in tools_remote:
+        return False, f"扩展「{binding['mcp']}」没有这个工具「{binding["extract_tool"]}」：去 设置 → 扩展 重新绑定"
+    text = f"用 {binding['mcp']} 的 {binding['tool']}"
+    if binding["extract_tool"]:
+        text += f"（抓正文 {binding['extract_tool']}）"
+    return True, text
+
+
+# ----------------------------------------------------------------------
+# 候选清单（GET /api/extensions/search 的 candidates 段）
+# ----------------------------------------------------------------------
+
+_SEARCH_HINT = re.compile(r"search|搜索|检索|find|lookup|query", re.IGNORECASE)
+_EXTRACT_HINT = re.compile(r"extract|contents?|crawl|scrape|fetch|read|正文|抓取|抽", re.IGNORECASE)
+
+
+def guess_tool_role(name: str, description: str = "") -> str:
+    """按名字/描述猜这个工具像「搜索」还是「抓正文」；"search" | "extract" | ""。"""
+    text = f"{name} {description}"
+    if _SEARCH_HINT.search(text):
+        return "search"
+    if _EXTRACT_HINT.search(text):
+        return "extract"
+    return ""
+
+
+def candidates_of(settings: Any, store: Any, runtime_of: Callable[[str], Any]) -> list[dict[str, Any]]:
+    """所有已启用 MCP 扩展的工具清单：[{"mcp", "tools": [{"name","description","guess"}]}]。"""
+    out: list[dict[str, Any]] = []
+    for entry in extensions_web.merged_entries(settings, store):
+        if not entry.enabled:
+            continue
+        runtime = runtime_of(entry.name)
+        tools_remote: dict = {}
+        if runtime is not None and hasattr(runtime, "tools_remote"):
+            try:
+                tools_remote = runtime.tools_remote() or {}
+            except Exception:
+                tools_remote = {}
+        tools: list[dict[str, Any]] = []
+        for remote_name, spec in sorted(tools_remote.items()):
+            if not isinstance(spec, dict):
+                spec = {}
+            desc = str(spec.get("description") or "")
+            tools.append({
+                "name": remote_name,
+                "description": desc,
+                "guess": guess_tool_role(remote_name, desc),
+            })
+        out.append({"mcp": entry.name, "tools": tools})
+    return out
+
+
+def search_view(store: Any, settings: Any, runtime_of: Callable[[str], Any]) -> dict[str, Any]:
+    """GET /api/extensions/search 的响应：{binding, status: {ok, text}, candidates}。"""
+    ok, text = status_of(store, settings, runtime_of)
+    return {
+        "binding": get_binding(store),
+        "status": {"ok": ok, "text": text},
+        "candidates": candidates_of(settings, store, runtime_of),
+    }
+
+
+def search_role_of(store: Any, ext_name: str) -> str:
+    """GET /api/extensions 条目上的徽章："search"（绑定的搜索工具在它家）/
+    "extract"（只绑了抓正文在它家）/ ""。"""
+    binding = get_binding(store)
+    if binding is None or binding["mcp"] != ext_name:
+        return ""
+    return "search" if binding["tool"] else ("extract" if binding["extract_tool"] else "")

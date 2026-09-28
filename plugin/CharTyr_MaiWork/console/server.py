@@ -1,0 +1,2588 @@
+"""console 的 HTTP 层：aiohttp 路由、鉴权、静态文件、ConsoleServer。
+
+路由和返回结构严格按 docs/07-代码接口.md §9.1/§9.2/§9.3（M1 部分），
+M2/M3 的路由先注册、统一 501。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+
+from aiohttp import web
+
+from .. import clock
+from . import usage_history
+from . import views
+from .auth import COOKIE_NAME, ConsoleAuth, same_origin
+
+logger = logging.getLogger("maiwork.console.server")
+
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+_TOKEN_CHARS = frozenset("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789")
+
+Handler = Callable[[web.Request], Awaitable[web.Response]]
+AUTH_KEY = web.AppKey("auth", object)  # ConsoleAuth；放 app[AUTH_KEY]，避免魔术字符串
+
+
+@dataclass
+class Identity:
+    role: str  # "admin" | "member" | "none"
+    group_id: str | None = None
+
+
+def _err(status: int, text: str) -> web.Response:
+    return web.json_response({"error": text}, status=status)
+
+
+def _looks_like_token(ref: str) -> bool:
+    return bool(ref) and not ref.isdigit() and all(c in _TOKEN_CHARS for c in ref)
+
+
+class ConsoleServer:
+    """MaiWork 的网页服务。端口被占用 → 记错误日志、不抛（插件照常运行）。"""
+
+    def __init__(self, svc: Any) -> None:
+        self._svc = svc
+        self.app: web.Application = self._build_app()
+        self._runner: web.AppRunner | None = None
+        self.port: int | None = None
+
+    async def start(self, host: str, port: int) -> bool:
+        if self._runner is not None:
+            return True
+        runner = web.AppRunner(self.app)
+        try:
+            await runner.setup()
+            await web.TCPSite(runner, host, port).start()
+        except OSError as e:
+            logger.error("网页端口 %s:%s 起不来（可能被占用）：%s。网页这次不开了，插件其他功能照常。", host, port, e)
+            try:
+                await runner.cleanup()
+            except Exception:
+                pass
+            return False
+        self._runner = runner
+        self.port = port
+        logger.info("MaiWork 网页已开在 http://%s:%s", host, port)
+        return True
+
+    async def stop(self) -> None:
+        runner, self._runner = self._runner, None
+        port, self.port = self.port, None
+        if runner is not None:
+            try:
+                await asyncio.wait_for(runner.cleanup(), timeout=5)
+            except Exception:
+                logger.exception("网页关闭时出错")
+            # cleanup() 关服务端连接是 fire-and-forget，监听端口真正释放有毫秒级延迟；
+            # 等它真的连不上再返回，调用方立刻重 bind 不会撞到
+            if port is not None:
+                await self._wait_port_free(port)
+
+    @staticmethod
+    async def _wait_port_free(port: int, timeout: float = 3.0) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except OSError:
+                    pass
+            except OSError:
+                return  # 连不上 = 端口空了
+            await asyncio.sleep(0.05)
+
+    # ------------------------------------------------------------------
+    # 鉴权
+    # ------------------------------------------------------------------
+
+    def _identify(self, request: web.Request) -> Identity:
+        auth: ConsoleAuth = request.app[AUTH_KEY]
+        cookie = request.cookies.get(COOKIE_NAME, "")
+        if cookie and auth.check_cookie(cookie):
+            return Identity(role="admin")
+        token = request.headers.get("X-MW-Group", "").strip()
+        if token:
+            gid = views.group_id_by_token(self._svc, token)
+            if gid is not None:
+                return Identity(role="member", group_id=gid)
+        return Identity(role="none")
+
+    def _require_admin(self, request: web.Request) -> web.Response | None:
+        ident = self._identify(request)
+        if ident.role == "admin":
+            return None
+        if ident.role == "member":
+            return _err(403, "这里只有管理员能进")
+        return _err(401, "先登录管理员")
+
+    @staticmethod
+    def _origin_guard(request: web.Request) -> web.Response | None:
+        """非 GET 且有 Origin 头：Origin 的 host:port 必须等于请求 Host。"""
+        if request.method == "GET":
+            return None
+        origin = request.headers.get("Origin")
+        if origin is None:
+            return None
+        host = request.headers.get("Host", "")
+        if not same_origin(origin, host):
+            logger.warning("拒了一次跨源 %s %s", request.method, request.path)
+            return _err(403, "跨源请求被拒绝")
+        return None
+
+    @staticmethod
+    def _redeliver_failed(svc: Any, task_id: str) -> dict:
+        """redeliver：把该任务 failed / uncertain 的 outbox 项 retry。
+
+        M1：kind=file 且 status=uncertain 的项跳过（群文件上传不幂等，可能其实
+        已经传上去了）——返回里带 warning 让网页提示「群文件可能已发出，请先到群里确认」。
+        返回 {"retried": int, "skipped": int, "warning": str}。
+        """
+        outbox = getattr(svc, "outbox", None)
+        store = getattr(svc, "store", None)
+        result = {"retried": 0, "skipped": 0, "warning": ""}
+        if outbox is None or store is None:
+            return result
+        try:
+            rows = store.read().execute(
+                "SELECT id, kind, status FROM outbox WHERE task_id=? AND status IN ('failed', 'uncertain')",
+                (str(task_id),),
+            ).fetchall()
+        except Exception:
+            logger.exception("redeliver 查询失败（任务 %s）", task_id)
+            return result
+        for r in rows:
+            if str(r["kind"]) == "file" and str(r["status"]) == "uncertain":
+                result["skipped"] += 1
+                continue
+            try:
+                outbox.retry(int(r["id"]))
+                result["retried"] += 1
+            except ValueError:
+                pass
+        if result["skipped"]:
+            result["warning"] = "有的群文件发送超时被跳过了：群文件可能已发出，请先到群里确认，确认没发出来再让管理员强制重发"
+        return result
+
+    def _write(self, handler: Handler) -> Handler:
+        """非 GET 处理器的同源守卫包装。"""
+
+        async def wrapped(request: web.Request) -> web.Response:
+            guard = self._origin_guard(request)
+            if guard is not None:
+                return guard
+            return await handler(request)
+
+        return wrapped
+
+    def _resolve_ref(self, ref: str) -> str | None:
+        """群引用（群号或链接码）→ 群号；只认配置里的服务群。"""
+        svc = self._svc
+        settings = svc.get_settings()
+        if settings is not None and settings.is_served(ref):
+            return ref
+        return views.group_id_by_token(svc, ref)
+
+    # ------------------------------------------------------------------
+    # 组装
+    # ------------------------------------------------------------------
+
+    def _build_app(self) -> web.Application:
+        svc = self._svc
+        app = web.Application(middlewares=(self._errors_mw,))
+        app[AUTH_KEY] = ConsoleAuth(svc.store, svc.get_settings)
+
+        def get(path: str):
+            def deco(fn: Handler) -> Handler:
+                app.router.add_get(path, fn)
+                return fn
+
+            return deco
+
+        def post(path: str):
+            def deco(fn: Handler) -> Handler:
+                app.router.add_post(path, self._write(fn))
+                return fn
+
+            return deco
+
+        async def _json_body(request: web.Request) -> dict[str, Any] | None:
+            try:
+                body = await request.json()
+            except Exception:
+                return None
+            return body if isinstance(body, dict) else None
+
+        # ---------- 身份 ----------
+
+        @get("/api/me")
+        async def _me(request: web.Request) -> web.Response:
+            ident = self._identify(request)
+            group = None
+            if ident.role == "member":
+                group = ident.group_id
+            elif ident.role == "admin":
+                # 管理员带链接码打开时也能定位到那个群（还能顺便核对 admin 看群号路径不冲突）
+                token = request.headers.get("X-MW-Group", "").strip()
+                if token:
+                    group = views.group_id_by_token(svc, token)
+            return web.json_response(
+                {
+                    "role": ident.role,
+                    "group": group,
+                    "bot": views._bot_info(svc),
+                    "now": clock.now(),
+                }
+            )
+
+        @post("/api/login")
+        async def _login(request: web.Request) -> web.Response:
+            auth: ConsoleAuth = request.app[AUTH_KEY]
+            ip = request.remote or ""
+            if auth.login_blocked(ip):
+                return _err(429, "错太多次了，过 10 分钟再试")
+            body = await _json_body(request)
+            password = str((body or {}).get("password") or "")
+            if not password or not auth.verify_password(password):
+                auth.record_login_fail(ip)
+                logger.info("网页登录失败一次（IP %s）", ip)
+                return _err(401, "密码不对，再试一次")
+            auth.record_login_ok(ip)
+            value, max_age = auth.make_cookie()
+            resp = web.json_response({"ok": True})
+            resp.set_cookie(COOKIE_NAME, value, max_age=max_age, httponly=True, samesite="Strict", path="/")
+            return resp
+
+        @post("/api/logout")
+        async def _logout(request: web.Request) -> web.Response:
+            resp = web.json_response({"ok": True})
+            resp.del_cookie(COOKIE_NAME, path="/")
+            return resp
+
+        # ---------- 群 ----------
+
+        @get("/api/groups")
+        async def _groups(request: web.Request) -> web.Response:
+            ident = self._identify(request)
+            if ident.role == "admin":
+                return web.json_response(views.list_summaries(svc, admin=True))
+            if ident.role == "member":
+                return web.json_response(views.list_summaries(svc, admin=False, only_group_id=ident.group_id))
+            return _err(401, "先登录管理员，或用群链接打开")
+
+        @get("/api/groups/{ref}")
+        async def _group_view(request: web.Request) -> web.Response:
+            ident = self._identify(request)
+            ref = request.match_info["ref"]
+            if ident.role == "admin":
+                gid = self._resolve_ref(ref)
+                if gid is None:
+                    return _err(404, "没有这个群")
+                return web.json_response(views.group_view(svc, gid, admin=True))
+            if ident.role == "member":
+                if not _looks_like_token(ref):
+                    return _err(403, "群友要用自己群的链接打开")
+                token_gid = views.group_id_by_token(svc, ref)
+                if token_gid is None:
+                    return _err(404, "这个链接打不开了")
+                if token_gid != ident.group_id:
+                    return _err(403, "只能看自己群的内容")
+                return web.json_response(views.group_view(svc, token_gid, admin=False))
+            return _err(401, "先登录管理员，或用群链接打开")
+
+        # ---------- 画像 / 关注成员（管理员） ----------
+
+        @post("/api/groups/{gid}/profile")
+        async def _profile_add(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            gid = request.match_info["gid"]
+            if self._resolve_ref(gid) is None:
+                return _err(404, "没有这个群")
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            category = str(body.get("category") or "").strip()
+            text = str(body.get("text") or "").strip()
+            if category not in views.CATEGORY_KEYS:
+                return _err(400, "类别不对，只支持五类画像")
+            if not text:
+                return _err(400, "内容不能是空的")
+            entry_id = svc.profiles.add_entry(gid, category, text)
+            return web.json_response({"ok": True, "id": int(entry_id)})
+
+        async def _profile_edit(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            kwargs: dict[str, Any] = {}
+            if body.get("text") is not None:
+                kwargs["text"] = str(body["text"])
+            if body.get("locked") is not None:
+                kwargs["locked"] = bool(body["locked"])
+            try:
+                svc.profiles.edit_entry(int(request.match_info["entry_id"]), **kwargs)
+            except (KeyError, ValueError):
+                return _err(404, "这条画像不存在")
+            return web.json_response({"ok": True})
+
+        async def _profile_delete(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            try:
+                svc.profiles.delete_entry(int(request.match_info["entry_id"]))
+            except (KeyError, ValueError):
+                return _err(404, "这条画像不存在")
+            return web.json_response({"ok": True})
+
+        app.router.add_route("PATCH", "/api/profile/{entry_id}", self._write(_profile_edit))
+        app.router.add_route("DELETE", "/api/profile/{entry_id}", self._write(_profile_delete))
+
+        @post("/api/groups/{gid}/focus")
+        async def _focus(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            gid = request.match_info["gid"]
+            if self._resolve_ref(gid) is None:
+                return _err(404, "没有这个群")
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            user_id = str(body.get("user_id") or "").strip()
+            action = str(body.get("action") or "").strip()
+            if not user_id.isdigit():
+                return _err(400, "QQ 号应该是纯数字")
+            if action not in ("add", "remove", "auto"):
+                return _err(400, "action 只支持 add / remove / auto")
+            svc.profiles.set_focus(gid, user_id, action)
+            return web.json_response({"ok": True})
+
+        @post("/api/groups/{gid}/token")
+        async def _token_reset(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            gid = request.match_info["gid"]
+            if self._resolve_ref(gid) is None:
+                return _err(404, "没有这个群")
+            new_token = svc.reset_group_token(gid)
+            if not new_token:
+                return _err(404, "这个群还没有链接码")
+            logger.info("群 %s 的链接码已重置，旧链接即刻失效", gid)
+            return web.json_response({"token": new_token})
+
+        # ---------- 设置（管理员） ----------
+
+        @get("/api/settings")
+        async def _settings(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            return web.json_response(views.settings_view(svc))
+
+        async def _models_put(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            patch: dict[str, Any] = {
+                "base_url": str(body.get("base_url") or ""),
+                "main": str(body.get("main") or ""),
+                "main_backup": str(body.get("main_backup") or ""),
+                "worker": str(body.get("worker") or ""),
+                "worker_backup": str(body.get("worker_backup") or ""),
+            }
+            if body.get("api_key"):
+                patch["api_key"] = str(body["api_key"])
+            try:
+                models = svc.models.save(patch)
+            except ValueError as e:
+                return _err(400, str(e))
+            except Exception as e:
+                from .. import config_file as _cf
+
+                if isinstance(e, _cf.ConfigFileError):
+                    return _err(500, str(e))
+                logger.exception("保存模型设置出错")
+                return _err(500, "服务器出错了")
+            # save 里的后台应用是排队的；路由这里同步等一次，保证返回的就是已生效的新设置
+            try:
+                from .. import config_file as _cf
+
+                text = _cf.read_text(svc.config_file_ops()[0])
+                await svc.apply_config_text(text)
+                models = svc.models.settings()
+            except Exception:
+                logger.exception("模型设置写后应用出错（文件已写，宿主文件监控会补一次）")
+            return web.json_response(models.public())
+
+        app.router.add_route("PUT", "/api/settings/models", self._write(_models_put))
+
+        @post("/api/settings/models/test")
+        async def _models_test(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            base_url = str(body.get("base_url") or "").strip()
+            if not base_url.startswith(("http://", "https://")):
+                return _err(400, "端点地址要以 http:// 或 https:// 开头")
+            api_key = str(body.get("api_key") or "")
+            try:
+                available = await svc.models.list_models(base_url, api_key)
+            except Exception as e:
+                message = str(e) or "连接失败"
+                logger.info("模型端点测试失败：%s", message[:120])
+                return web.json_response({"ok": False, "models": [], "error": message})
+            self._save_checked(base_url, available)
+            return web.json_response({"ok": True, "models": available})
+
+        # ---------- 规则（网页可改的设置；存 kv["rules.override"]，不写 config.toml） ----------
+
+        def _rules_view() -> Any:
+            from .. import rules as _rules
+
+            base = svc.base_settings() if callable(getattr(svc, "base_settings", None)) else svc.get_settings()
+            return _rules.rules_view(base, svc.store, effective=svc.get_settings())
+
+        @get("/api/settings/rules")
+        async def _rules_get(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            return web.json_response(_rules_view())
+
+        async def _rules_put(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from .. import rules as _rules
+
+            base = svc.base_settings() if callable(getattr(svc, "base_settings", None)) else svc.get_settings()
+            try:
+                _rules.save_patch(svc.store, body, base=base)
+            except ValueError as e:
+                return _err(400, str(e))
+            return web.json_response(_rules_view())
+
+        app.router.add_route("PUT", "/api/settings/rules", self._write(_rules_put))
+
+        @post("/api/settings/rules/reset")
+        async def _rules_reset(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from .. import rules as _rules
+
+            try:
+                _rules.reset_field(svc.store, body.get("field"))
+            except ValueError as e:
+                return _err(400, str(e))
+            return web.json_response(_rules_view())
+
+        # ---------- 通用设置（管理员；直写 config.toml，数据库不再存覆盖层） ----------
+
+        def _config_view() -> Any:
+            from .. import rules as _rules
+
+            base = svc.base_settings() if callable(getattr(svc, "base_settings", None)) else svc.get_settings()
+            return _rules.config_view(base, svc.store, effective=svc.get_settings())
+
+        @get("/api/settings/config")
+        async def _config_get(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            return web.json_response(_config_view())
+
+        async def _config_put(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from .. import config_file as _cf
+            from .. import rules as _rules
+
+            base = svc.base_settings() if callable(getattr(svc, "base_settings", None)) else svc.get_settings()
+            try:
+                plugin_dir, _data_dir = svc.config_file_ops()
+            except Exception:
+                plugin_dir = None
+            try:
+                changed = _rules.save_config_patch(svc.store, body, base=base, plugin_dir=plugin_dir)
+            except ValueError as e:
+                return _err(400, str(e))
+            except _cf.ConfigFileError as e:
+                return _err(500, str(e))
+            except Exception:
+                logger.exception("保存配置出错")
+                return _err(500, "服务器出错了")
+            if changed:
+                # 写完文件立刻在本进程应用（不等宿主文件监控；宿主随后发的是同一份，幂等）
+                try:
+                    text = _cf.read_text(svc.config_file_ops()[0])
+                    await svc.apply_config_text(text)
+                except Exception:
+                    logger.exception("配置写后应用出错（文件已写，宿主文件监控会补一次）")
+            return web.json_response(_config_view())
+
+        app.router.add_route("PUT", "/api/settings/config", self._write(_config_put))
+
+        @post("/api/settings/config/reset")
+        async def _config_reset(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from .. import config_file as _cf
+            from .. import rules as _rules
+
+            base = svc.base_settings() if callable(getattr(svc, "base_settings", None)) else svc.get_settings()
+            try:
+                plugin_dir, _data_dir = svc.config_file_ops()
+            except Exception:
+                plugin_dir = None
+            try:
+                _rules.reset_config_field(svc.store, body.get("field"), base=base, plugin_dir=plugin_dir)
+            except ValueError as e:
+                return _err(400, str(e))
+            except _cf.ConfigFileError as e:
+                return _err(500, str(e))
+            try:
+                text = _cf.read_text(svc.config_file_ops()[0])
+                await svc.apply_config_text(text)
+            except Exception:
+                logger.exception("配置写后应用出错（文件已写，宿主文件监控会补一次）")
+            return web.json_response(_config_view())
+
+        # ---------- 首次安装引导（管理员） ----------
+
+        @get("/api/onboarding")
+        async def _onboarding_get(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            from .. import onboarding as _onb
+
+            return web.json_response(_onb.view(svc))
+
+        async def _onboarding_post(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from .. import onboarding as _onb
+
+            try:
+                return web.json_response(_onb.act(svc, str(body.get("action") or "")))
+            except ValueError as e:
+                return _err(400, str(e))
+
+        app.router.add_route("POST", "/api/onboarding", self._write(_onboarding_post))
+
+        # ---------- 最近模型/工具请求日志（管理员，docs/07 §9.4） ----------
+
+        from .. import models as _models_mod
+        import json as _json_lib
+
+        def _limit_param(request: web.Request) -> int:
+            try:
+                n = int(str(request.query.get("limit") or "50"))
+            except (TypeError, ValueError):
+                n = 50
+            return max(1, min(200, n))
+
+        def _before_param(request: web.Request) -> int:
+            try:
+                return max(0, int(str(request.query.get("before_id") or "0")))
+            except (TypeError, ValueError):
+                return 0
+
+        def _failed_where(request: web.Request) -> tuple[str, list]:
+            """failed=0|1 → ok 过滤；SQLite 里 ok 存成整数，外部给的是「失败与否」。"""
+            failed = str(request.query.get("failed") or "").strip()
+            if failed == "1":
+                return "ok = 0", []
+            if failed == "0":
+                return "ok = 1", []
+            return "", []
+
+        def _safe_loads(text: Any) -> dict:
+            """model_calls 的 request/response 可能截在 80KB 上沿断了（不合法 JSON），
+            解析不了就把字符串藏进 _raw，保证详情接口永远有结构。"""
+            if not isinstance(text, str) or not text:
+                return {}
+            try:
+                data = _json_lib.loads(text)
+            except (ValueError, TypeError):
+                return {"_raw": text}
+            return data if isinstance(data, dict) else {"_raw": text}
+
+        def _group_names() -> dict[str, str]:
+            names: dict[str, str] = {}
+            try:
+                for row in svc.store.read().execute("SELECT group_id, name FROM groups").fetchall():
+                    names[str(row["group_id"])] = str(row["name"] or "")
+            except Exception:
+                pass
+            from ..names import clean_group_name
+
+            return {gid: clean_group_name(n, gid) for gid, n in names.items()}
+
+        def _secret_list() -> list[str]:
+            secrets = []
+            try:
+                for row in svc.store.read().execute("SELECT value FROM secrets").fetchall():
+                    v = str(row["value"] or "")
+                    if v and len(v) <= 4096:
+                        secrets.append(v)
+            except Exception:
+                pass
+            try:
+                settings = svc.get_settings()
+                if settings is not None:
+                    v = str(getattr(settings.models, "api_key", "") or "")
+                    if v:
+                        secrets.append(v)
+            except Exception:
+                pass
+            return secrets
+
+        _LIST_TEXT_MAX = 300
+        _DETAIL_TEXT_MAX = 20000
+
+        @get("/api/logs/model-calls")
+        async def _logs_model_calls(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            limit = _limit_param(request)
+            before_id = _before_param(request)
+            clauses: list[str] = []
+            args: list = []
+            failed_sql, failed_args = _failed_where(request)
+            if failed_sql:
+                clauses.append(failed_sql)
+                args.extend(failed_args)
+            purpose = str(request.query.get("purpose") or "").strip()
+            if purpose:
+                clauses.append("purpose = ?")
+                args.append(purpose)
+            group = str(request.query.get("group") or "").strip()
+            if group:
+                clauses.append("mc.group_id = ?")
+                args.append(group)
+            if before_id > 0:
+                clauses.append("id < ?")
+                args.append(before_id)
+            where = "WHERE " + " AND ".join(clauses) if clauses else ""
+            try:
+                rows = svc.store.read().execute(
+                    f"SELECT mc.* FROM model_calls mc {where} ORDER BY id DESC LIMIT ?",
+                    tuple(args) + (limit + 1,),
+                ).fetchall()
+            except Exception:
+                # 表还没建（旧数据目录）→ 空列表，绝不 500
+                rows = []
+            names = _group_names()
+            items: list[dict] = []
+            for r in rows[:limit]:
+                d = dict(r)
+                gid = str(d.get("group_id") or "")
+                items.append(
+                    {
+                        "id": int(d["id"]),
+                        "ts": float(d["ts"]),
+                        "purpose": str(d.get("purpose") or ""),
+                        "purpose_name": views.purpose_name(d.get("purpose")),
+                        "role": str(d.get("role") or ""),
+                        "model": str(d.get("model") or ""),
+                        "group_id": gid,
+                        "group_name": names.get(gid, "") if gid else "",
+                        "task_id": str(d.get("task_id") or ""),
+                        "attempt": int(d.get("attempt") or 1),
+                        "ok": bool(d.get("ok")),
+                        "status": int(d.get("status") or 0),
+                        "ms": int(d.get("ms") or 0),
+                        "prompt_tokens": int(d.get("prompt_tokens") or 0),
+                        "completion_tokens": int(d.get("completion_tokens") or 0),
+                        "error": _redact_secret(str(d.get("error") or ""), _secret_list()),
+                    }
+                )
+            next_before_id = int(rows[limit - 1]["id"]) if len(rows) > limit else None
+            return web.json_response({"items": items, "next_before_id": next_before_id})
+
+        def _redact_secret(text: str, secrets: list[str]) -> str:
+            return _models_mod._redact_full(text, secrets)
+
+        @get("/api/logs/model-calls/{id}")
+        async def _logs_model_call_detail(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            try:
+                entry_id = int(str(request.match_info["id"]))
+            except (ValueError, TypeError):
+                return _err(404, "这条日志不存在")
+            try:
+                row = svc.store.read().execute(
+                    "SELECT * FROM model_calls WHERE id=?", (entry_id,)
+                ).fetchone()
+            except Exception:
+                row = None
+            if row is None:
+                return _err(404, "这条日志不存在")
+            d = dict(row)
+            secrets = _secret_list()
+            gid = str(d.get("group_id") or "")
+            names = _group_names()
+            req_json = _safe_loads(d.get("request"))
+            resp_json = _safe_loads(d.get("response"))
+            return web.json_response(
+                {
+                    "id": int(d["id"]),
+                    "ts": float(d["ts"]),
+                    "purpose": str(d.get("purpose") or ""),
+                    "purpose_name": views.purpose_name(d.get("purpose")),
+                    "role": str(d.get("role") or ""),
+                    "model": str(d.get("model") or ""),
+                    "group_id": gid,
+                    "group_name": names.get(gid, "") if gid else "",
+                    "task_id": str(d.get("task_id") or ""),
+                    "attempt": int(d.get("attempt") or 1),
+                    "ok": bool(d.get("ok")),
+                    "status": int(d.get("status") or 0),
+                    "ms": int(d.get("ms") or 0),
+                    "prompt_tokens": int(d.get("prompt_tokens") or 0),
+                    "completion_tokens": int(d.get("completion_tokens") or 0),
+                    "error": _redact_secret(str(d.get("error") or ""), secrets),
+                    "request": _redact_json(req_json, secrets),
+                    "response": _redact_json(resp_json, secrets),
+                }
+            )
+
+        def _redact_json(value: Any, secrets: list[str]) -> Any:
+            """对日志里已存的 JSON 再走一遍遮罩（库里的旧行可能没遮过）。"""
+            if isinstance(value, str):
+                return _models_mod._redact_full(value, secrets)
+            if isinstance(value, list):
+                return [_redact_json(x, secrets) for x in value]
+            if isinstance(value, dict):
+                return {str(k): _redact_json(v, secrets) for k, v in value.items()}
+            return value
+
+        @get("/api/logs/tool-calls")
+        async def _logs_tool_calls(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            limit = _limit_param(request)
+            before_id = _before_param(request)
+            clauses: list[str] = []
+            args: list = []
+            failed_sql, failed_args = _failed_where(request)
+            if failed_sql:
+                clauses.append(failed_sql)
+                args.extend(failed_args)
+            if before_id > 0:
+                clauses.append("id < ?")
+                args.append(before_id)
+            where = "WHERE " + " AND ".join(clauses) if clauses else ""
+            try:
+                rows = svc.store.read().execute(
+                    f"SELECT * FROM tool_calls {where} ORDER BY id DESC LIMIT ?",
+                    tuple(args) + (limit + 1,),
+                ).fetchall()
+            except Exception:
+                rows = []
+            names = _group_names()
+            items = []
+            for r in rows[:limit]:
+                d = dict(r)
+                gid = str(d.get("group_id") or "")
+                items.append(
+                    {
+                        "id": int(d["id"]),
+                        "ts": float(d["ts"]),
+                        "group_id": gid,
+                        "group_name": names.get(gid, "") if gid else "",
+                        "task_id": str(d.get("task_id") or ""),
+                        "actor": str(d.get("actor") or ""),
+                        "tool": str(d.get("tool") or ""),
+                        "ok": bool(d.get("ok")),
+                        "ms": int(d.get("ms") or 0),
+                        "input": str(d.get("input") or "")[:_LIST_TEXT_MAX],
+                        "output": str(d.get("output") or "")[:_LIST_TEXT_MAX],
+                        "error": str(d.get("error") or ""),
+                    }
+                )
+            next_before_id = int(rows[limit - 1]["id"]) if len(rows) > limit else None
+            return web.json_response({"items": items, "next_before_id": next_before_id})
+
+        @get("/api/logs/tool-calls/{id}")
+        async def _logs_tool_call_detail(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            try:
+                entry_id = int(str(request.match_info["id"]))
+            except (ValueError, TypeError):
+                return _err(404, "这条日志不存在")
+            try:
+                row = svc.store.read().execute(
+                    "SELECT * FROM tool_calls WHERE id=?", (entry_id,)
+                ).fetchone()
+            except Exception:
+                row = None
+            if row is None:
+                return _err(404, "这条日志不存在")
+            d = dict(row)
+            gid = str(d.get("group_id") or "")
+            names = _group_names()
+            return web.json_response(
+                {
+                    "id": int(d["id"]),
+                    "ts": float(d["ts"]),
+                    "group_id": gid,
+                    "group_name": names.get(gid, "") if gid else "",
+                    "task_id": str(d.get("task_id") or ""),
+                    "actor": str(d.get("actor") or ""),
+                    "tool": str(d.get("tool") or ""),
+                    "ok": bool(d.get("ok")),
+                    "ms": int(d.get("ms") or 0),
+                    "input": str(d.get("input") or "")[:_DETAIL_TEXT_MAX],
+                    "output": str(d.get("output") or "")[:_DETAIL_TEXT_MAX],
+                    "error": str(d.get("error") or ""),
+                }
+            )
+
+        @get("/api/logs/summary")
+        async def _logs_summary(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            day_start = clock.bj(clock.now()).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            r0 = svc.store.read().execute(
+                "SELECT COUNT(*) AS calls,"
+                " COALESCE(SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END),0) AS failed,"
+                " COALESCE(SUM(CASE WHEN attempt>1 THEN 1 ELSE 0 END),0) AS retried,"
+                " COALESCE(SUM(prompt_tokens + completion_tokens),0) AS tokens"
+                " FROM model_calls WHERE ts >= ?",
+                (day_start,),
+            ).fetchone()
+            today = {
+                "calls": int(r0["calls"]) if r0 else 0,
+                "failed": int(r0["failed"]) if r0 else 0,
+                "retried": int(r0["retried"]) if r0 else 0,
+                "tokens": int(r0["tokens"]) if r0 else 0,
+            }
+            last_failure = None
+            try:
+                rf = svc.store.read().execute(
+                    "SELECT ts, purpose, model, error FROM model_calls WHERE ok=0"
+                    " ORDER BY ts DESC LIMIT 1"
+                ).fetchone()
+            except Exception:
+                rf = None
+            if rf is not None:
+                last_failure = {
+                    "ts": float(rf["ts"]),
+                    "purpose": str(rf["purpose"] or ""),
+                    "purpose_name": views.purpose_name(rf["purpose"]),
+                    "model": str(rf["model"] or ""),
+                    "error": _redact_secret(str(rf["error"] or ""), _secret_list()),
+                }
+            by_purpose: list[dict] = []
+            try:
+                rp_rows = svc.store.read().execute(
+                    "SELECT purpose, COUNT(*) AS calls,"
+                    " COALESCE(SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END),0) AS failed,"
+                    " COALESCE(AVG(ms),0) AS avg_ms"
+                    " FROM model_calls WHERE ts >= ? GROUP BY purpose",
+                    (day_start,),
+                ).fetchall()
+                for r in rp_rows:
+                    by_purpose.append(
+                        {
+                            "purpose": str(r["purpose"] or ""),
+                            "purpose_name": views.purpose_name(r["purpose"]),
+                            "calls": int(r["calls"]),
+                            "failed": int(r["failed"]),
+                            "avg_ms": float(r["avg_ms"]),
+                        }
+                    )
+            except Exception:
+                by_purpose = []
+            by_purpose.sort(key=lambda b: -b["calls"])
+            return web.json_response(
+                {"today": today, "last_failure": last_failure, "by_purpose": by_purpose}
+            )
+
+        @get("/api/usage/history")
+        async def _usage_history(request: web.Request) -> web.Response:
+            """用量历史（管理员）：?days=N（1..30，默认 7）或 ?date=YYYY-MM-DD（优先）。
+
+            结构见 docs/07 §9.5；拼装全在 console/usage_history.py，这里只接线。
+            """
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            try:
+                data = usage_history.history_view(
+                    svc,
+                    days=request.query.get("days"),
+                    date=request.query.get("date"),
+                )
+            except ValueError as e:  # date 格式不对
+                return _err(400, str(e))
+            return web.json_response(data)
+
+        # ---------- M2：资讯 / 构想 / 开话题（docs/07 §9.2 末段） ----------
+
+        async def _ident_for_group_action(request: web.Request, *, need_admin: bool) -> tuple[Identity | None, web.Response | None]:
+            """M2 写操作的统一身份闸。
+            need_admin=True → 只管理员；False → 管理员或群友都行（群友只能动本群的条目）。
+            """
+            ident = self._identify(request)
+            if ident.role == "admin":
+                return ident, None
+            if need_admin:
+                if ident.role == "member":
+                    return None, _err(403, "这里只有管理员能进")
+                return None, _err(401, "先登录管理员")
+            if ident.role == "member":
+                return ident, None
+            return None, _err(401, "先登录管理员，或用群链接打开")
+
+        def _group_of(kind: str, item_id: int) -> str | None:
+            """从库里查条目属于哪个群（鉴权用，不经过 feeds/topics）。"""
+            if svc.store is None:
+                return None
+            table = {"news": "news_items", "ideas": "ideas", "topics": "topic_log"}.get(kind)
+            if table is None:
+                return None
+            try:
+                row = svc.store.read().execute(f"SELECT group_id FROM {table} WHERE id=?", (int(item_id),)).fetchone()
+            except Exception as e:
+                # 表还没建（M2 迁移没跑过）→ 按「没这条」处理，绝不 500
+                logger.debug("%s 查询失败（%s）", table, type(e).__name__)
+                return None
+            return str(row["group_id"]) if row is not None else None
+
+        def _personal_item(kind: str, item_id: int) -> bool:
+            """这条是不是「给某个关注成员的」个人向内容（只给管理员看，群友按不存在处理）。"""
+            if svc.store is None:
+                return False
+            table = {"news": "news_items", "ideas": "ideas"}.get(kind)
+            if table is None:
+                return False
+            try:
+                row = svc.store.read().execute(
+                    f"SELECT * FROM {table} WHERE id=?", (int(item_id),)
+                ).fetchone()
+                if row is None or "target_user_id" not in row.keys():
+                    return False  # 老库没有这一列 = 没有个人向内容
+                return bool(str(row["target_user_id"] or ""))
+            except Exception:
+                return False
+
+        def _m2_ready(module: Any) -> web.Response | None:
+            if module is None:
+                return _err(503, "这个功能还没开")
+            return None
+
+        async def _news_feedback(request: web.Request) -> web.Response:
+            ident, deny = await _ident_for_group_action(request, need_admin=False)
+            if deny is not None:
+                return deny
+            not_ready = _m2_ready(svc.feeds)
+            if not_ready is not None:
+                return not_ready
+            try:
+                item_id = int(request.match_info["id"])
+            except (ValueError, TypeError):
+                return _err(400, "id 要是数字")
+            gid = _group_of("news", item_id)
+            if gid is None:
+                return _err(404, "这条资讯不存在")
+            if ident.role == "member" and ident.group_id != gid:
+                return _err(403, "只能管自己群的内容")
+            if ident.role == "member" and _personal_item("news", item_id):
+                return _err(404, "这条资讯不存在")
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            try:
+                out = svc.feeds.feedback("news", item_id, body.get("value"), body.get("prev"))
+            except KeyError:
+                return _err(404, "这条资讯不存在")
+            # 身份与工作记忆：被标「没用」累计 3 次的来源/话题 → 自动记进本群记忆（不调模型）
+            try:
+                if body.get("value") == "down":
+                    hook = getattr(svc, "note_useless_feedback", None)
+                    if callable(hook):
+                        hook(gid, item_id)
+            except Exception:
+                logger.exception("反馈自动记 hook 出错（群 %s 条 %s，不影响反馈）", gid, item_id)
+            return web.json_response(out)
+
+        async def _ideas_feedback(request: web.Request) -> web.Response:
+            ident, deny = await _ident_for_group_action(request, need_admin=False)
+            if deny is not None:
+                return deny
+            not_ready = _m2_ready(svc.feeds)
+            if not_ready is not None:
+                return not_ready
+            try:
+                item_id = int(request.match_info["id"])
+            except (ValueError, TypeError):
+                return _err(400, "id 要是数字")
+            gid = _group_of("ideas", item_id)
+            if gid is None:
+                return _err(404, "这条构想不存在")
+            if ident.role == "member" and ident.group_id != gid:
+                return _err(403, "只能管自己群的内容")
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            try:
+                out = svc.feeds.feedback("ideas", item_id, body.get("value"), body.get("prev"))
+            except KeyError:
+                return _err(404, "这条构想不存在")
+            return web.json_response(out)
+
+        def _idea_action(op: str) -> Handler:
+            async def _handler(request: web.Request) -> web.Response:
+                need_admin = op in ("do", "dismiss")
+                ident, deny = await _ident_for_group_action(request, need_admin=need_admin)
+                if deny is not None:
+                    return deny
+                not_ready = _m2_ready(svc.feeds)
+                if not_ready is not None:
+                    return not_ready
+                try:
+                    item_id = int(request.match_info["id"])
+                except (ValueError, TypeError):
+                    return _err(400, "id 要是数字")
+                gid = _group_of("ideas", item_id)
+                if gid is None:
+                    return _err(404, "这条构想不存在")
+                if ident.role == "member" and ident.group_id != gid:
+                    return _err(403, "只能管自己群的内容")
+                by = "管理员" if ident.role == "admin" else "群友（网页）"
+                try:
+                    out = svc.feeds.idea_action(item_id, op, by=by)
+                except KeyError:
+                    return _err(404, "这条构想不存在")
+                except ValueError as e:
+                    return _err(400, str(e))
+                # 「想要这个」→ 待批请求：在路由这里接（feeds 不感知批准；do 走 app 的 on_start 回调）
+                if op == "want":
+                    hook = getattr(svc, "on_idea_want", None)
+                    if callable(hook):
+                        try:
+                            hook(dict(out), gid)
+                        except Exception:
+                            logger.exception("构想「想要这个」接线出错（构想 %s）", item_id)
+                    # want 之后状态可能变成 pending / started：回一次新的 view 给前端
+                    try:
+                        for item in svc.feeds.ideas_view(gid) or []:
+                            if isinstance(item, dict) and int(item.get("id") or 0) == item_id:
+                                out = item
+                                break
+                    except Exception:
+                        pass
+                return web.json_response(out)
+
+            return _handler
+
+        async def _topics_verdict(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            not_ready = _m2_ready(svc.topics)
+            if not_ready is not None:
+                return not_ready
+            try:
+                item_id = int(request.match_info["id"])
+            except (ValueError, TypeError):
+                return _err(400, "id 要是数字")
+            if _group_of("topics", item_id) is None:
+                return _err(404, "这条开话题记录不存在")
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            value = body.get("value")
+            if value not in ("right", "wrong", None):
+                return _err(400, 'value 只支持 "right" / "wrong" / null')
+            svc.topics.verdict(item_id, value)
+            return web.json_response({"ok": True})
+
+        app.router.add_post("/api/news/{id}/feedback", self._write(_news_feedback))
+        app.router.add_post("/api/ideas/{id}/feedback", self._write(_ideas_feedback))
+        app.router.add_post("/api/ideas/{id}/want", self._write(_idea_action("want")))
+        app.router.add_post("/api/ideas/{id}/do", self._write(_idea_action("do")))
+        app.router.add_post("/api/ideas/{id}/dismiss", self._write(_idea_action("dismiss")))
+        app.router.add_post("/api/topics/{id}/verdict", self._write(_topics_verdict))
+
+        async def _feeds_domains(request: web.Request) -> web.Response:
+            """管理员加减来源屏蔽名单（2026-09-27 质量标准 §4.1）。
+
+            请求体 {domain, blocked: true|false}；域名规范化（小写、去 www.、
+            只允许合法域名字符）后写 kv["feeds.blocked_domains"]——kv 存「当时生效名单」
+            的全量（首次改动前 = 配置；改过一次之后以网页为准，见 feeds.blocked_domains_effective）。
+            返回 {"blocked_domains": [...]}（生效名单，稳定排序）。
+            """
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from ..config import normalize_domain
+            from ..feeds import blocked_domains_effective
+
+            domain = normalize_domain(body.get("domain"))
+            if not domain:
+                return _err(400, "域名不合法（只认字母、数字、横线、点，如 example.com）")
+            blocked_v = body.get("blocked")
+            if not isinstance(blocked_v, bool):
+                return _err(400, "blocked 要是 true / false")
+            settings = svc.get_settings()
+            config_blocked: tuple = tuple(getattr(settings.feeds, "blocked_domains", ()) or ()) if settings is not None else ()
+            merged: set[str] = set(blocked_domains_effective(svc.store, config_blocked))
+            if blocked_v:
+                merged.add(domain)
+            else:
+                merged.discard(domain)
+            out_list = sorted(merged)
+            with svc.store.tx() as conn:
+                svc.store.kv_set(conn, "feeds.blocked_domains", out_list)
+            return web.json_response({"blocked_domains": out_list})
+
+        app.router.add_post("/api/feeds/domains", self._write(_feeds_domains))
+
+        # ---------- 扩展：MCP（docs/02 §10；只管理员；不回显 headers） ----------
+
+        async def _mcp_reload(request: web.Request) -> web.Response:
+            """POST /api/extensions/mcp/{name}/reload：重连并刷新工具。"""
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            name = request.match_info["name"]
+            reloader = getattr(svc, "reload_mcp", None)
+            if not callable(reloader):
+                return _err(503, "MCP 扩展还没开")
+            try:
+                result = await reloader(name)
+            except Exception:
+                logger.exception("MCP 扩展 %s reload 出错", name)
+                return _err(500, "reload 出错了")
+            if result is None:
+                return _err(404, "没有叫这个名字的 MCP 扩展")
+            return web.json_response(
+                {"ok": bool(result.get("ok")), "tools": int(result.get("tools") or 0), "error": str(result.get("error") or "")}
+            )
+
+        app.router.add_post("/api/extensions/mcp/{name}/reload", self._write(_mcp_reload))
+
+        # ---------- 扩展网页管理（docs/02 §10、docs/07 §10.9；只管理员；密钥只进不出） ----------
+        #
+        # 存法：kv["extensions.mcp"]（不含头值）+ secrets["mcp.<名>.<头名>"]；config 来源的
+        # 开关存 kv["extensions.mcp.disabled"] 名单。网页加的存数据库，不写回 config.toml。
+
+        def _ext_ready() -> web.Response | None:
+            if svc.extensions is None:
+                return _err(503, "MCP 扩展还没开")
+            return None
+
+        def _mcp_item(name: str) -> dict | None:
+            """合并视图里的单项（响应结构同 GET /api/extensions 的 mcp[i]）。"""
+            from .. import extensions_web
+
+            for item in extensions_web.list_items(svc.get_settings(), svc.store, svc.extensions):
+                if item.get("name") == name:
+                    return item
+            return None
+
+        @get("/api/extensions")
+        async def _extensions_list(request: web.Request) -> web.Response:
+            """合并后的 MCP + skill 清单（结构见 docs/07 §10.9；头值绝不回显）。"""
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            from .. import extensions_web, skills_web
+
+            try:
+                mcp = extensions_web.list_items(svc.get_settings(), svc.store, svc.extensions)
+            except Exception:
+                logger.exception("拼 MCP 扩展清单出错")
+                mcp = []
+            try:
+                skills = skills_web.list_view(svc.get_settings().data_dir, svc.store)
+            except Exception:
+                logger.exception("拼 skill 清单出错")
+                skills = []
+            return web.json_response({"mcp": mcp, "skills": skills})
+
+        @post("/api/extensions/mcp")
+        async def _mcp_create(request: web.Request) -> web.Response:
+            """新增网页 MCP 扩展：校验（同 config 规则）→ 落库 → 立即连接一次，返回单项。"""
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            not_ready = _ext_ready()
+            if not_ready is not None:
+                return not_ready
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from .. import extensions_web
+
+            try:
+                entry = extensions_web.create(svc.store, svc.get_settings(), body)
+            except ValueError as e:
+                return _err(400, str(e))
+            except FileExistsError:
+                return _err(409, f"已经有叫「{str(body.get('name') or '')}」的 MCP 扩展了（重名）")
+            name = str(entry["name"])
+            try:
+                await svc.reload_mcp(name)  # 立即连接一次
+            except Exception:
+                logger.exception("新增 MCP 扩展 %s 后首次连接出错", name)
+            item = _mcp_item(name)
+            if item is None:
+                return _err(500, "保存后拼视图出错了")
+            return web.json_response(item)
+
+        async def _mcp_update(request: web.Request) -> web.Response:
+            """修改网页 MCP 扩展；config 来源 → 409（只能开关不能改地址）；不存在 → 404。
+
+            headers 里值为空字符串 = 不改这个头；remove_headers:[名字] 删头。改完立即重连。
+            """
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            not_ready = _ext_ready()
+            if not_ready is not None:
+                return not_ready
+            from .. import extensions_web
+
+            name = str(request.match_info["name"])
+            source = extensions_web.source_of(svc.get_settings(), svc.store, name)
+            if source is None:
+                return _err(404, "没有叫这个名字的 MCP 扩展")
+            if source != "web":
+                return _err(409, "这个扩展来自配置文件，只能开关不能改——请改 config.toml")
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            try:
+                extensions_web.update(svc.store, name, body)
+            except ValueError as e:
+                return _err(400, str(e))
+            except KeyError:
+                return _err(404, "没有叫这个名字的 MCP 扩展")
+            try:
+                await svc.reload_mcp(name)  # 立即重连刷新工具
+            except Exception:
+                logger.exception("修改 MCP 扩展 %s 后重连出错", name)
+            item = _mcp_item(name)
+            if item is None:
+                return _err(500, "保存后拼视图出错了")
+            return web.json_response(item)
+
+        async def _mcp_delete(request: web.Request) -> web.Response:
+            """删除网页 MCP 扩展（只允许 source=web）：摘工具、关连接、清 kv 和头值。"""
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            not_ready = _ext_ready()
+            if not_ready is not None:
+                return not_ready
+            from .. import extensions_web
+
+            name = str(request.match_info["name"])
+            source = extensions_web.source_of(svc.get_settings(), svc.store, name)
+            if source is None:
+                return _err(404, "没有叫这个名字的 MCP 扩展")
+            if source != "web":
+                return _err(409, "这个扩展来自配置文件，网页上只能开关，不能删除")
+            try:
+                extensions_web.delete(svc.store, name)
+            except KeyError:
+                return _err(404, "没有叫这个名字的 MCP 扩展")
+            try:
+                await svc.remove_mcp(name)  # 立即摘工具、关连接
+            except Exception:
+                logger.exception("删除 MCP 扩展 %s 后摘工具出错", name)
+            try:
+                from .. import search_binding
+
+                search_binding.clear_binding(svc.store, mcp=name)  # 搜索绑定绑着它 → 跟着清掉
+            except Exception:
+                logger.exception("清 MCP 扩展 %s 的搜索绑定出错", name)
+            return web.json_response({"ok": True})
+
+        @post("/api/extensions/mcp/{name}/toggle")
+        async def _mcp_toggle(request: web.Request) -> web.Response:
+            """开关（config 来源也能开关）：开/关后立即摘工具或重连注册。"""
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            not_ready = _ext_ready()
+            if not_ready is not None:
+                return not_ready
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            enabled_v = body.get("enabled")
+            if not isinstance(enabled_v, bool):
+                return _err(400, "enabled 要是 true / false")
+            from .. import extensions_web
+
+            name = str(request.match_info["name"])
+            try:
+                extensions_web.toggle(svc.store, svc.get_settings(), name, enabled_v)
+            except KeyError:
+                return _err(404, "没有叫这个名字的 MCP 扩展")
+            except ValueError as e:
+                return _err(409, str(e))
+            try:
+                await svc.reload_mcp(name)  # 关掉：旧工具已摘；开：重连注册
+            except Exception:
+                logger.exception("开关 MCP 扩展 %s 后重连出错", name)
+            item = _mcp_item(name)
+            if item is None:
+                return _err(500, "保存后拼视图出错了")
+            return web.json_response(item)
+
+        @post("/api/extensions/mcp/test")
+        async def _mcp_test(request: web.Request) -> web.Response:
+            """只试连（initialize + tools/list），不保存。headers 为空时传 name 可用已存的。"""
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from .. import extensions_web
+
+            url = str(body.get("url") or "").strip()
+            if not url.startswith("https://"):
+                return _err(400, "MCP 端点地址必须 https:// 开头（密钥走这个请求，http 会泄露）")
+            headers_raw = body.get("headers")
+            headers: dict[str, str] = {}
+            if headers_raw is not None:
+                if not isinstance(headers_raw, dict):
+                    return _err(400, "headers 要是 {名字: 值} 的表")
+                for k, v in headers_raw.items():
+                    k_s, v_s = str(k or "").strip(), str(v or "")
+                    if k_s and v_s:
+                        headers[k_s] = v_s
+            name_s = str(body.get("name") or "").strip()
+            if name_s:
+                stored = extensions_web.stored_headers_for(svc.store, svc.get_settings(), name_s)
+                for k, v in stored.items():  # 已存的垫底，页面传的覆盖
+                    headers.setdefault(k, v)
+            try:
+                timeout_s = max(1, int(body.get("timeout_s") or 20))
+            except (TypeError, ValueError):
+                timeout_s = 20
+            from ..mcp_client import MCPError, McpSessionClient
+
+            client = McpSessionClient(url, "", timeout_s=timeout_s, transport=getattr(svc, "extensions_transport", None), headers=headers)
+            try:
+                tools = await client.list_tools()
+            except MCPError as e:
+                return web.json_response({"ok": False, "tools": [], "error": str(e)})
+            except Exception as e:
+                logger.warning("试连 MCP 出意外错：%s", type(e).__name__, exc_info=True)
+                return web.json_response({"ok": False, "tools": [], "error": f"连接出错：{type(e).__name__}"})
+            finally:
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+            names = [str(t.get("name") or "").strip() for t in tools if str(t.get("name") or "").strip()]
+            return web.json_response({"ok": True, "tools": names[:50], "error": ""})
+
+        # ---------- skill 网页管理 ----------
+
+        def _skill_view_or_404(name: str) -> tuple[dict | None, web.Response | None]:
+            from .. import skills_web
+
+            view = skills_web.get_view(svc.get_settings().data_dir, svc.store, name)
+            if view is None:
+                return None, _err(404, "没有这个 skill")
+            return view, None
+
+        # ---------- 联网搜索绑定（2026-10；docs/07 §10.3；只管理员） ----------
+        # 搜索只走「扩展」里指定的一个 MCP 的某个工具；绑定存 kv["extensions.search"]。
+
+        def _tool_spec_of(mcp: str, tool: str) -> dict | None:
+            getter = getattr(svc.extensions, "tool_spec", None) if svc.extensions is not None else None
+            return getter(mcp, tool) if callable(getter) else None
+
+        def _runtime_of(name: str):
+            return svc.extensions.runtime_of(name) if svc.extensions is not None else None
+
+        @get("/api/extensions/search")
+        async def _search_binding_get(request: web.Request) -> web.Response:
+            """{binding, status: {ok, text}, candidates: [{mcp, tools: [{name, description, guess}]}]}。"""
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            from .. import search_binding
+
+            try:
+                return web.json_response(search_binding.search_view(svc.store, svc.get_settings(), _runtime_of))
+            except Exception:
+                logger.exception("拼搜索绑定视图出错")
+                return _err(500, "读搜索绑定出错了")
+
+        async def _search_binding_put(request: web.Request) -> web.Response:
+            """绑定：{"mcp","tool","extract_tool"} → 校验扩展存在、工具存在 → 保存 → 返回同 GET。"""
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from .. import search_binding
+
+            try:
+                search_binding.save_binding(svc.store, svc.get_settings(), body, tool_spec_of=_tool_spec_of)
+            except ValueError as e:
+                return _err(400, str(e))
+            except Exception:
+                logger.exception("保存搜索绑定出错")
+                return _err(500, "保存搜索绑定出错了")
+            return web.json_response(search_binding.search_view(svc.store, svc.get_settings(), _runtime_of))
+
+        async def _search_binding_delete(request: web.Request) -> web.Response:
+            """解绑（幂等）。"""
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            from .. import search_binding
+
+            search_binding.clear_binding(svc.store)
+            return web.json_response(search_binding.search_view(svc.store, svc.get_settings(), _runtime_of))
+
+        app.router.add_route("PUT", "/api/extensions/search", self._write(_search_binding_put))
+        app.router.add_route("DELETE", "/api/extensions/search", self._write(_search_binding_delete))
+
+        @get("/api/extensions/skills/{name}")
+        async def _skill_get(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            view, not_found = _skill_view_or_404(str(request.match_info["name"]))
+            if not_found is not None:
+                return not_found
+            return web.json_response(view)
+
+        @post("/api/extensions/skills")
+        async def _skill_create(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from .. import skills_web
+
+            try:
+                view = skills_web.create(svc.get_settings().data_dir, svc.store, body)
+            except ValueError as e:
+                return _err(400, str(e))
+            except FileExistsError:
+                return _err(409, f"已经有叫「{str(body.get('name') or '')}」的 skill 了（重名）")
+            return web.json_response(view)
+
+        async def _skill_update(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from .. import skills_web
+
+            name = str(request.match_info["name"])
+            try:
+                view = skills_web.update(svc.get_settings().data_dir, svc.store, name, body)
+            except KeyError:
+                return _err(404, "没有这个 skill")
+            except ValueError as e:
+                return _err(400, str(e))
+            return web.json_response(view)
+
+        async def _skill_delete(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            from .. import skills_web
+
+            name = str(request.match_info["name"])
+            try:
+                skills_web.delete(svc.get_settings().data_dir, svc.store, name)
+            except KeyError:
+                return _err(404, "没有这个 skill")
+            except PermissionError as e:
+                return _err(409, str(e))
+            except ValueError as e:
+                return _err(400, str(e))
+            return web.json_response({"ok": True})
+
+        # ---------- skill zip 上传（POST /api/extensions/skills/upload） ----------
+        #
+        # 请求体两种都支持：
+        # 1) 原始字节：Content-Type: application/zip（或 application/octet-stream），文件名走
+        #    X-Filename 头（前端 encodeURIComponent 过）；
+        # 2) multipart：字段名 file（带 filename）。
+        # ?replace=1 同名替换；只管理员；过同源检查（POST）。
+
+        async def _skill_upload(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            from .. import skills_web
+
+            filename_raw = str(request.headers.get("X-Filename") or "").strip()
+            body_bytes: bytes | None = None
+            # 1) 优先试 raw body（application/zip / octet-stream）
+            ct = str(request.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if ct in ("application/zip", "application/octet-stream", "application/x-zip-compressed"):
+                body_bytes = await request.read()
+            else:
+                # 2) multipart
+                try:
+                    data = await request.post()
+                    field = data.get("file") if data is not None else None
+                    if field is not None and hasattr(field, "file"):
+                        body_bytes = field.file.read()
+                        filename_raw = str(getattr(field, "filename", "") or filename_raw)
+                except Exception:
+                    body_bytes = None
+            if not body_bytes:
+                return _err(400, "请求体不是 zip（Content-Type: application/zip 或 multipart 字段 file）")
+            replace = str(request.query.get("replace") or "").strip() in ("1", "true", "yes")
+            try:
+                view = skills_web.install_zip(
+                    svc.store, svc.get_settings().data_dir, body_bytes,
+                    filename=filename_raw, replace=replace,
+                )
+            except FileExistsError as e:
+                return _err(409, str(e))
+            except ValueError as e:
+                return _err(400, str(e))
+            # 装完通知面板刷一下 list（Skills 每次 start 时枚举，不用额外重载——
+            # 网页的管理看的是 skills_web / skills，只要目录变了，下次 skills.list 就是新的）
+            return web.json_response(view)
+
+        app.router.add_post("/api/extensions/skills/upload", self._write(_skill_upload))
+
+        app.router.add_route("PUT", "/api/extensions/mcp/{name}", self._write(_mcp_update))
+        app.router.add_route("DELETE", "/api/extensions/mcp/{name}", self._write(_mcp_delete))
+        app.router.add_route("PUT", "/api/extensions/skills/{name}", self._write(_skill_update))
+        app.router.add_route("DELETE", "/api/extensions/skills/{name}", self._write(_skill_delete))
+
+        async def _feeds_pref_get(request: web.Request) -> web.Response:
+            """资讯偏好：GET 对所有人可见（含群友，只读）。"""
+            ident = self._identify(request)
+            if ident.role not in ("admin", "member"):
+                return _err(401, "先登录管理员，或用群链接打开")
+            gid = request.match_info["gid"]
+            resolved = self._resolve_ref(gid)
+            if resolved is None:
+                return _err(404, "没有这个群")
+            if ident.role == "member" and resolved != ident.group_id:
+                return _err(403, "只能看自己群的内容")
+            not_ready = _m2_ready(svc.feeds)
+            if not_ready is not None:
+                return not_ready
+            return web.json_response({"text": svc.feeds.pref(resolved)})
+
+        async def _feeds_pref_put(request: web.Request) -> web.Response:
+            """资讯偏好：PUT 只管理员。"""
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            gid = request.match_info["gid"]
+            resolved = self._resolve_ref(gid)
+            if resolved is None:
+                return _err(404, "没有这个群")
+            not_ready = _m2_ready(svc.feeds)
+            if not_ready is not None:
+                return not_ready
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            text = svc.feeds.set_pref(resolved, str(body.get("text") or ""))
+            return web.json_response({"text": text})
+
+        async def _news_run(request: web.Request) -> web.Response:
+            """管理员「现在就备一批」：后台开跑，立刻返回 {"started", "reason"}。"""
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            resolved = self._resolve_ref(request.match_info["gid"])
+            if resolved is None:
+                return _err(404, "没有这个群")
+            fn = getattr(svc, "run_news_now", None)
+            if fn is None:
+                return _err(503, "资讯模块没开")
+            out = fn(resolved)
+            if not out.get("started"):
+                return _err(409, str(out.get("reason") or "现在开不了"))
+            return web.json_response(out)
+
+        app.router.add_get("/api/groups/{gid}/feeds-pref", _feeds_pref_get)
+        app.router.add_route("PUT", "/api/groups/{gid}/feeds-pref", self._write(_feeds_pref_put))
+        app.router.add_post("/api/groups/{gid}/news/run", self._write(_news_run))
+
+        async def _news_chat_vote(request: web.Request) -> web.Response:
+            """「想在群里聊」：群友（本群）或管理员，只计数 +1。网页没有身份，
+            重复点由前端自己防；这里只负责累加。够票自动补进开话题候选池。"""
+            ident, deny = await _ident_for_group_action(request, need_admin=False)
+            if deny is not None:
+                return deny
+            not_ready = _m2_ready(svc.feeds)
+            if not_ready is not None:
+                return not_ready
+            try:
+                item_id = int(request.match_info["id"])
+            except (ValueError, TypeError):
+                return _err(400, "id 要是数字")
+            gid = _group_of("news", item_id)
+            if gid is None:
+                return _err(404, "这条资讯不存在")
+            if ident.role == "member" and ident.group_id != gid:
+                return _err(403, "只能管自己群的内容")
+            if ident.role == "member" and _personal_item("news", item_id):
+                return _err(404, "这条资讯不存在")
+            try:
+                out = svc.feeds.admin_chat_vote(gid, item_id)
+            except KeyError:
+                return _err(404, "这条资讯不存在")
+            return web.json_response(out)
+
+        app.router.add_post("/api/news/{id}/chat-vote", self._write(_news_chat_vote))
+
+        async def _news_mention_to_member(request: web.Request) -> web.Response:
+            """管理员在网页点「在群里提给他」：往本群可提起清单加一句（ttl 6 小时）。
+
+            只加备忘，不直接发群消息；文字不含画像细节（模块里过 privacy.scrub）。
+            只管理员（群友 403、匿名 401）。返回 {"ok": true}。
+            """
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            personal = getattr(svc, "personal", None)
+            mentions = getattr(svc, "mentions", None)
+            if personal is None or mentions is None:
+                return _err(503, "这个功能还没开")
+            try:
+                item_id = int(request.match_info["id"])
+            except (ValueError, TypeError):
+                return _err(400, "id 要是数字")
+            gid = _group_of("news", item_id)
+            if gid is None:
+                return _err(404, "这条资讯不存在")
+            try:
+                out = personal.mention_to_member(gid, item_id, mentions=mentions)
+            except KeyError:
+                return _err(404, "这条不是个人向资讯")
+            return web.json_response(out)
+
+        app.router.add_post(
+            "/api/news/{id}/mention-to-member", self._write(_news_mention_to_member)
+        )
+
+        # ---------- RSS 资讯源（rss.py；每群 ≤20；写接口过同源检查） ----------
+
+        def _rss_resolve_gid(request: web.Request) -> tuple[str | None, web.Response | None]:
+            gid = self._resolve_ref(str(request.match_info["gid"]))
+            if gid is None:
+                return None, _err(404, "没有这个群")
+            return gid, None
+
+        @get("/api/groups/{gid}/rss")
+        async def _rss_list(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            gid, deny = _rss_resolve_gid(request)
+            if deny is not None:
+                return deny
+            from .. import rss as _rss
+
+            return web.json_response({"rss": _rss.list_feeds(svc.store, gid)})
+
+        @post("/api/groups/{gid}/rss")
+        async def _rss_add(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            gid, deny = _rss_resolve_gid(request)
+            if deny is not None:
+                return deny
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            url = str(body.get("url") or "").strip()
+            if not url.startswith(("http://", "https://")):
+                return _err(400, "RSS 源地址必须以 http:// 或 https:// 开头")
+            from .. import rss as _rss
+
+            # 先试取一次，成功才保存（title 用 feed 的；取不到 / 解析不了 → 400 中文原因）
+            settings = svc.get_settings()
+            lookback = int(getattr(getattr(settings, "feeds", None), "lookback_days", 14) or 14)
+            out = await _rss.fetch_feed_source(
+                url,
+                transport=getattr(svc, "rss_transport", None),
+                lookback_days=lookback,
+                now=clock.now(),
+                limit=1,
+            )
+            if out.get("error"):
+                return _err(400, f"先试取失败：{out['error']}")
+            try:
+                entry = _rss.add_feed(
+                    svc.store, gid, url=url, title=str(out.get("title") or ""),
+                    feed_id="", now=clock.now(),
+                )
+            except _rss.RssError as e:
+                return _err(400, str(e))
+            return web.json_response(
+                {"id": entry["id"], "url": entry["url"], "title": entry["title"], "items_count": len(out.get("items") or [])}
+            )
+
+        async def _rss_delete(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            gid, deny = _rss_resolve_gid(request)
+            if deny is not None:
+                return deny
+            from .. import rss as _rss
+
+            removed = _rss.remove_feed(svc.store, gid, str(request.match_info["id"]))
+            if removed is None:
+                return _err(404, "没有这个 RSS 源")
+            return web.json_response({"ok": True})
+
+        @post("/api/groups/{gid}/rss/{id}/toggle")
+        async def _rss_toggle(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            gid, deny = _rss_resolve_gid(request)
+            if deny is not None:
+                return deny
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            enabled_v = body.get("enabled")
+            if not isinstance(enabled_v, bool):
+                return _err(400, "enabled 要是 true / false")
+            from .. import rss as _rss
+
+            try:
+                entry = _rss.toggle_feed(svc.store, gid, str(request.match_info["id"]), enabled=enabled_v)
+            except _rss.RssError as e:
+                return _err(404, str(e))
+            return web.json_response(entry)
+
+        app.router.add_route("DELETE", "/api/groups/{gid}/rss/{id}", self._write(_rss_delete))
+
+        # ---------- M3：批准 / 任务 / 目标（docs/07 §9.2 M3 段、§9.3 任务详情） ----------
+
+        def _m3_ready(module: Any) -> web.Response | None:
+            if module is None:
+                return _err(503, "这个功能还没开")
+            return None
+
+        def _merge_delivery(detail: dict, tid: str) -> None:
+            """任务详情合并 delivery.delivery_records 和 undelivered（模块没开就不动）。"""
+            delivery = getattr(svc, "delivery", None)
+            if delivery is None:
+                return
+            try:
+                detail["delivery"] = delivery.delivery_records(tid)
+                detail["undelivered"] = bool(delivery.undelivered(tid))
+            except Exception:
+                logger.exception("拼任务交付记录失败（%s）", tid)
+
+        def _start_approved_task(res: Any) -> None:
+            tid = str((res or {}).get("task_id") or "")
+            if not tid:
+                return
+            starter = getattr(svc, "spawn_run_task", None)
+            if callable(starter):
+                try:
+                    starter(tid)
+                except Exception:
+                    logger.exception("批准后 spawn run_task 出错（%s）", tid)
+
+        def _stop_running_task(svc_obj: Any, tid: str) -> None:
+            """取消后把正在跑的子 agent 停掉（统一入口在 app.cancel_task_run）。"""
+            stopper = getattr(svc_obj, "cancel_task_run", None)
+            if callable(stopper):
+                try:
+                    stopper(tid)
+                except Exception:
+                    logger.exception("停任务 %s 的后台协程出错", tid)
+
+        @get("/api/tasks/{id}")
+        async def _task_detail(request: web.Request) -> web.Response:
+            ident = self._identify(request)
+            if ident.role not in ("admin", "member"):
+                return _err(401, "先登录管理员，或用群链接打开")
+            not_ready = _m3_ready(getattr(svc, "tasks", None))
+            if not_ready is not None:
+                return not_ready
+            tid = request.match_info["id"]
+            try:
+                row = svc.tasks.get(tid)
+            except Exception:
+                row = None
+            if row is None:
+                return _err(404, "找不到这个任务")
+            # 群友只能看本群
+            if ident.role == "member" and str(row.get("group_id") or "") != str(ident.group_id or ""):
+                return _err(403, "只能看自己群的内容")
+            try:
+                detail = svc.tasks.detail_view(tid, admin=(ident.role == "admin"))
+            except KeyError:
+                return _err(404, "找不到这个任务")
+            _merge_delivery(detail, tid)
+            if ident.role != "admin":
+                # detail_view(admin=False) 已经不给了，这里再断言一次
+                # （红线：群友看不到 env / timeline / tokens / workspace / source / request_id / requester_id）
+                for key in ("env", "timeline", "tokens", "workspace", "source", "request_id", "requester_id"):
+                    detail.pop(key, None)
+            return web.json_response(detail)
+
+        def _request_decide(op: str) -> Handler:
+            async def _handler(request: web.Request) -> web.Response:
+                forbid = self._require_admin(request)
+                if forbid is not None:
+                    return forbid
+                not_ready = _m3_ready(getattr(svc, "approvals", None))
+                if not_ready is not None:
+                    return not_ready
+                rid = request.match_info["id"]
+                try:
+                    if op == "approve":
+                        res = svc.approvals.approve(rid, by="网页管理员")
+                    else:
+                        res = svc.approvals.reject(rid, by="网页管理员")
+                except KeyError:
+                    return _err(404, "找不到这个请求")
+                except ValueError as e:
+                    return _err(409, str(e))
+                if op == "approve":
+                    # 批准后任务已落地 → 后台开工（同一任务不并发由 app 保证）
+                    _start_approved_task(res)
+                return web.json_response(res)
+
+            return _handler
+
+        def _task_op_detail(tid: str) -> dict:
+            detail = svc.tasks.detail_view(tid, admin=True)
+            _merge_delivery(detail, tid)
+            return detail
+
+        async def _task_op(request: web.Request, op: str) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            not_ready = _m3_ready(getattr(svc, "tasks", None))
+            if not_ready is not None:
+                return not_ready
+            tid = request.match_info["id"]
+            try:
+                row = svc.tasks.get(tid)
+            except Exception:
+                row = None
+            if row is None:
+                return _err(404, "找不到这个任务")
+            status = str(row.get("status") or "")
+            redeliver_warning = ""
+            try:
+                if op == "pause":
+                    svc.tasks.transition(tid, "paused", reason="网页暂停")
+                elif op == "resume":
+                    if status not in ("paused", "shelved"):
+                        return _err(409, f"任务现在是「{status}」，不用恢复")
+                    svc.tasks.transition(tid, "queued", reason="网页恢复")
+                    # 恢复不立刻 spawn：后台循环到点会把 queued 捞起来（同一任务不并发）
+                elif op == "cancel":
+                    svc.tasks.transition(tid, "cancelled", reason="网页取消")
+                    _stop_running_task(svc, tid)
+                elif op == "retry":
+                    if status != "failed":
+                        return _err(409, "只有失败的任务能重试")
+                    svc.tasks.transition(tid, "queued", reason="网页重试")
+                    _start_approved_task({"task_id": tid})
+                elif op == "redeliver":
+                    redeliver_result = self._redeliver_failed(svc, tid)
+                    redeliver_warning = str(redeliver_result.get("warning") or "")
+                else:
+                    return _err(404, "没有这个操作")
+            except KeyError:
+                return _err(404, "找不到这个任务")
+            except ValueError as e:
+                return _err(409, str(e))
+            try:
+                detail = _task_op_detail(tid)
+                if redeliver_warning:
+                    detail["redeliver_warning"] = redeliver_warning  # M1：网页提示先去群里确认
+                return web.json_response(detail)
+            except KeyError:
+                return _err(404, "找不到这个任务")
+
+        async def _goal_op(request: web.Request, op: str) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            not_ready = _m3_ready(getattr(svc, "goals", None))
+            if not_ready is not None:
+                return not_ready
+            gid_param = request.match_info["id"]
+            try:
+                if op == "pause":
+                    svc.goals.pause(gid_param)
+                elif op == "resume":
+                    svc.goals.resume(gid_param)
+                elif op == "cancel":
+                    svc.goals.cancel(gid_param)
+                else:
+                    return _err(404, "没有这个操作")
+            except KeyError:
+                return _err(404, "找不到这个目标")
+            except ValueError as e:
+                return _err(409, str(e))
+            return web.json_response({"ok": True})
+
+        app.router.add_post("/api/requests/{id}/approve", self._write(_request_decide("approve")))
+        app.router.add_post("/api/requests/{id}/reject", self._write(_request_decide("reject")))
+        for _op in ("pause", "resume", "cancel", "retry", "redeliver"):
+            app.router.add_post(
+                f"/api/tasks/{{id}}/{_op}",
+                self._write(lambda req, op=_op: _task_op(req, op)),
+            )
+        for _op in ("pause", "resume", "cancel"):
+            app.router.add_post(
+                f"/api/goals/{{id}}/{_op}",
+                self._write(lambda req, op=_op: _goal_op(req, op)),
+            )
+
+        # ---------- 身份与工作记忆（identity.py；只管理员；docs/02「身份与工作记忆」） ----------
+
+        def _identity_ready() -> Any:
+            ident = getattr(svc, "identity", None)
+            if ident is None:
+                return None, _err(503, "身份与工作记忆还没开")
+            return ident, None
+
+        @get("/api/identity")
+        async def _identity_get(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            ident, not_ready = _identity_ready()
+            if not_ready is not None:
+                return not_ready
+            limits = ident.limits
+            return web.json_response(
+                {
+                    "soul": ident.read("soul"),
+                    "agents": ident.read("agents"),
+                    "memory": ident.read("memory"),
+                    "group_memory": ident.group_memory_map(),
+                    "limits": dict(limits),
+                }
+            )
+
+        async def _identity_put(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            ident, not_ready = _identity_ready()
+            if not_ready is not None:
+                return not_ready
+            kind = request.match_info["kind"]
+            if kind not in ("soul", "agents", "memory"):
+                return _err(404, "没有这个身份文件（只支持 soul / agents / memory）")
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            try:
+                out = ident.write(kind, str(body.get("text") or ""))
+            except ValueError as e:
+                return _err(400, str(e))
+            return web.json_response(out)
+
+        app.router.add_route("PUT", "/api/identity/{kind}", self._write(_identity_put))
+
+        async def _identity_group_memory_put(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            ident, not_ready = _identity_ready()
+            if not_ready is not None:
+                return not_ready
+            gid = str(request.match_info["gid"])
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            try:
+                out = ident.group_write(gid, str(body.get("text") or ""))
+            except KeyError:
+                return _err(404, "没有这个群（只支持服务群）")
+            except ValueError as e:
+                return _err(400, str(e))
+            return web.json_response(out)
+
+        app.router.add_route(
+            "PUT", "/api/identity/group-memory/{gid}", self._write(_identity_group_memory_put)
+        )
+
+        async def _identity_soul_sync(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            ident, not_ready = _identity_ready()
+            if not_ready is not None:
+                return not_ready
+            out = await ident.sync_soul_from_maibot()
+            changed = bool(out.pop("preview_changed", False))
+            return web.json_response({"soul": out, "preview_changed": changed})
+
+        app.router.add_post("/api/identity/soul/sync", self._write(_identity_soul_sync))
+
+        # ---------- 和 MaiWork 聊：管理员对话（只管理员；配套 static/app.js 的对话页） ----------
+        #
+        # 返回结构按 static/app.js 的「和 MaiWork 聊」页：
+        #   GET    /api/chat                     → {"chats": [...]}
+        #   POST   /api/chat                     → 新对话（单个 chat）
+        #   PATCH  /api/chat/{id}                → 改标题 / 聚焦群 / 归档（单个 chat）
+        #   GET    /api/chat/{id}?after=<msg id> → {"chat", "running", "messages", "pending"}
+        #   POST   /api/chat/{id}/messages       → 202 {"accepted": true, "user_message_id": n}
+        #   POST   /api/chat/pending/{pid}       → {"status", "result"}
+        # 模块没开 503；对话 / 确认项不存在 404；发消息 / 确认时上一句还在跑 409、小票已处理过 409；
+        # 空文本、非法 id 400。
+        # admin_chat 的方法同步异步都认（跑出来是 awaitable 就 await）；「找不到 / 群不合法」
+        # 一律 ValueError（ChatBusy 是它的子类），server.py 不硬依赖 admin_chat 模块，按类名认忙。
+        # 带对话内容的响应出网页前整份过一遍密钥遮罩（消息和工具结果里有可能抄到密钥）；
+        # 发消息的 202 只回 id，不带内容。
+
+        async def _call(fn: Any, *args: Any, **kwargs: Any) -> Any:
+            out = fn(*args, **kwargs)
+            if inspect.isawaitable(out):
+                out = await out
+            return out
+
+        def _is_busy_error(e: BaseException) -> bool:
+            return type(e).__name__ == "ChatBusy"
+
+        def _chat_ready() -> tuple[Any, web.Response | None]:
+            mod = getattr(svc, "admin_chat", None)
+            if mod is None:
+                return None, _err(503, "这个功能还没开")
+            return mod, None
+
+        def _id_param(raw: Any, what: str) -> tuple[int, web.Response | None]:
+            try:
+                n = int(str(raw))
+            except (TypeError, ValueError):
+                return 0, _err(400, f"{what} id 要是数字")
+            if n <= 0:
+                return 0, _err(400, f"{what} id 要是数字")
+            return n, None
+
+        def _chat_exists(mod: Any, chat_id: int) -> bool:
+            """出错后分「对话不存在（404）」还是「内容不合规（400）」：detail 能读出来就是后者。"""
+            try:
+                return isinstance(mod.detail(chat_id, after=0), dict)
+            except Exception:
+                return False
+
+        def _running_of(mod: Any, chat_id: Any, explicit: Any = None) -> bool:
+            """running 优先用 admin_chat 给的；没给就问 is_busy（前端靠它决定轮询和禁发送）。"""
+            if explicit is not None:
+                return bool(explicit)
+            busy = getattr(mod, "is_busy", None)
+            if not callable(busy):
+                return False
+            try:
+                return bool(busy(chat_id))
+            except Exception:
+                logger.exception("查对话忙不忙出错（%s）", chat_id)
+                return False
+
+        def _chat_json(payload: Any) -> web.Response:
+            try:
+                payload = _redact_json(payload, _secret_list())
+            except Exception:
+                logger.exception("对话响应遮罩失败")
+            return web.json_response(payload)
+
+        def _pending_status(out: dict, approve: bool) -> str:
+            """前端认 status：done / failed（拒绝不算 failed，别弹成红色报错）。"""
+            status = out.get("status")
+            if isinstance(status, str) and status:
+                return status  # admin_chat 已经给标准状态就用它的
+            if not approve:
+                return "rejected"
+            return "done" if out.get("ok") else "failed"
+
+        def _pending_result(out: dict) -> str:
+            for key in ("result", "error", "output"):
+                value = out.get(key)
+                if value:
+                    return value if isinstance(value, str) else str(value)
+            return ""
+
+        @get("/api/chat")
+        async def _chat_list(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            mod, not_ready = _chat_ready()
+            if not_ready is not None:
+                return not_ready
+            chats = list(await _call(mod.list_chats) or [])
+            if callable(getattr(mod, "is_busy", None)):
+                # 侧栏的「正在回答」小圆点：admin_chat 没在列表里带 running 就补上
+                chats = [
+                    c if not isinstance(c, dict) or "running" in c else {**c, "running": _running_of(mod, c.get("id"))}
+                    for c in chats
+                ]
+            return _chat_json({"chats": chats})
+
+        @post("/api/chat")
+        async def _chat_create(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            mod, not_ready = _chat_ready()
+            if not_ready is not None:
+                return not_ready
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            gid = str(body.get("group_id") or "").strip()
+            if gid:
+                resolved = self._resolve_ref(gid)  # 只认服务群（群号或链接码）
+                if resolved is None:
+                    return _err(404, "没有这个群")
+                gid = resolved
+            try:
+                chat = await _call(mod.create, group_id=gid)
+            except (KeyError, ValueError):
+                return _err(404, "没有这个群")
+            if not isinstance(chat, dict):
+                return _err(500, "新对话没建起来")
+            return _chat_json(chat)
+
+        async def _chat_update(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            mod, not_ready = _chat_ready()
+            if not_ready is not None:
+                return not_ready
+            chat_id, bad_id = _id_param(request.match_info["id"], "对话")
+            if bad_id is not None:
+                return bad_id
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            kwargs: dict[str, Any] = {}
+            if body.get("title") is not None:
+                title = str(body["title"]).strip()
+                if not title:
+                    return _err(400, "标题不能是空的")
+                kwargs["title"] = title
+            if body.get("group_id") is not None:
+                raw_gid = str(body["group_id"] or "").strip()
+                if raw_gid:
+                    resolved = self._resolve_ref(raw_gid)
+                    if resolved is None:
+                        return _err(404, "没有这个群")
+                    kwargs["group_id"] = resolved
+                else:
+                    kwargs["group_id"] = ""  # 空 = 不限群
+            if body.get("archived") is not None:
+                if not isinstance(body["archived"], bool):
+                    return _err(400, "archived 要是 true / false")
+                kwargs["archived"] = body["archived"]
+            if not kwargs:
+                return _err(400, "没有要改的字段")
+            try:
+                chat = await _call(mod.update, chat_id, **kwargs)
+            except (KeyError, ValueError) as e:
+                if _is_busy_error(e):
+                    return _err(409, str(e))
+                # 对话在、只是要改的值不合规（标题太长等）→ 400；对话不在 → 404
+                return _err(400, str(e) or "这个值改不了") if _chat_exists(mod, chat_id) else _err(404, "找不到这个对话")
+            if not isinstance(chat, dict):
+                return _err(404, "找不到这个对话")
+            return _chat_json(chat)
+
+        @get("/api/chat/{id}")
+        async def _chat_detail(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            mod, not_ready = _chat_ready()
+            if not_ready is not None:
+                return not_ready
+            chat_id, bad_id = _id_param(request.match_info["id"], "对话")
+            if bad_id is not None:
+                return bad_id
+            try:
+                after = max(0, int(str(request.query.get("after") or "0")))
+            except (TypeError, ValueError):
+                after = 0
+            try:
+                out = await _call(mod.detail, chat_id, after=after)
+            except (KeyError, ValueError):
+                return _err(404, "找不到这个对话")
+            if not isinstance(out, dict):
+                return _err(404, "找不到这个对话")
+            chat = out.get("chat")
+            if not isinstance(chat, dict):
+                # admin_chat 把 chat 字段直接铺在顶层也认；四个键一定齐，前端不用判 undefined
+                chat = {k: v for k, v in out.items() if k not in ("messages", "pending", "running")}
+            return _chat_json(
+                {
+                    "chat": chat,
+                    "running": _running_of(mod, chat_id, out.get("running")),
+                    "messages": list(out.get("messages") or []),
+                    "pending": list(out.get("pending") or []),
+                }
+            )
+
+        @post("/api/chat/{id}/messages")
+        async def _chat_send(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            mod, not_ready = _chat_ready()
+            if not_ready is not None:
+                return not_ready
+            chat_id, bad_id = _id_param(request.match_info["id"], "对话")
+            if bad_id is not None:
+                return bad_id
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            text = str(body.get("text") or "").strip()
+            if not text:
+                return _err(400, "说的话不能是空的")
+            try:
+                mid = await _call(mod.send, chat_id, text)
+            except (KeyError, ValueError) as e:
+                # 忙是 ChatBusy（ValueError 子类）→ 409；对话在、只是话不合规（太长）→ 400；否则 404
+                if _is_busy_error(e):
+                    return _err(409, str(e) or "上一句还在处理，等一下")
+                if _chat_exists(mod, chat_id):
+                    return _err(400, str(e) or "这句话发不了")
+                return _err(404, "找不到这个对话")
+            if mid is None:
+                return _err(404, "找不到这个对话")
+            if isinstance(mid, dict):
+                mid = mid.get("user_message_id", mid.get("id", 0))
+            try:
+                user_message_id = int(mid)
+            except (TypeError, ValueError):
+                user_message_id = 0
+            return web.json_response({"accepted": True, "user_message_id": user_message_id}, status=202)
+
+        async def _chat_pending(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            mod, not_ready = _chat_ready()
+            if not_ready is not None:
+                return not_ready
+            pending_id, bad_id = _id_param(request.match_info["pid"], "确认项")
+            if bad_id is not None:
+                return bad_id
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            approve = body.get("approve")
+            if not isinstance(approve, bool):
+                return _err(400, "approve 要是 true / false")
+            try:
+                out = await _call(mod.confirm, pending_id, approve)
+            except (KeyError, ValueError) as e:
+                if _is_busy_error(e):
+                    return _err(409, str(e) or "上一句还在处理，等一下")
+                if type(e).__name__ == "PendingDecided":
+                    return _err(409, str(e) or "这条待确认动作已经处理过了")
+                return _err(404, "这个确认项不存在")
+            if not isinstance(out, dict):
+                return _err(404, "这个确认项不存在")
+            return _chat_json({"status": _pending_status(out, approve), "result": _pending_result(out)})
+
+
+        # pending 路由先落：路径段数和 /api/chat/{id} 不同，顺序只为了让「静态段优先」一眼可见
+        app.router.add_post("/api/chat/pending/{pid}", self._write(_chat_pending))
+        app.router.add_route("PATCH", "/api/chat/{id}", self._write(_chat_update))
+
+        # ---------- 头像（console/avatar.py；docs/02「网页控制台 · 头像」） ----------
+        #
+        # GET /api/avatar/bot 不用登录（登录页也要显示）；自定义网址 → 302 到该网址，
+        # 本地文件 → FileResponse（Content-Type 按魔数），没有 → 404（前端回落默认图）。
+        # GET /api/avatar/m/<token> 要管理员：token 反查关注成员的 QQ 后走 qlogo 代理
+        # （QQ 号不进 URL / 响应头 / 日志）。
+        # GET /api/avatar/g/<token> 要身份：token = HMAC("avatar-g|<群号>")，只认服务群；
+        # 管理员可看全部服务群，群友只能看自己群（别人群 403），非 qq 平台 / 查不到 → 404。
+        # 管理接口 /api/settings/avatar：GET 给 {source, platform, url, custom_kind,
+        # custom_url}；POST 收 {"url"} 或 {"data","mime"}（base64，≤2MB，按魔数收
+        # png/jpeg/webp/gif）；DELETE 清自定义回自动。写操作过 _write 同源守卫。
+
+        def _avatar_svc() -> Any:
+            from .avatar import service_of
+
+            av = service_of(svc)
+            if av is None:
+                logger.warning("头像服务没就位（store / settings 缺），这次没有头像")
+            return av
+
+        async def _avatar_state(av: Any) -> dict:
+            """settings_state 需要知道 bot_qq 有没有值（异步）；失败按没有算。"""
+            try:
+                qq = await av._bot_qq()  # noqa: SLF001 —— 同源模块的探针，不落日志
+            except Exception:
+                qq = ""
+            return av.settings_state(bot_qq_known=bool(qq))
+
+        @get("/api/avatar/bot")
+        async def _avatar_bot(request: web.Request) -> web.Response:
+            av = _avatar_svc()
+            if av is None:
+                return _err(404, "没有头像")
+            kind, payload = await av.resolve_bot()
+            if kind == "redirect":
+                raise web.HTTPFound(str(payload))
+            if kind == "bytes":
+                data, mime = payload
+                return web.Response(body=data, content_type=mime, headers={"Cache-Control": "no-cache"})
+            if kind == "path":
+                from .avatar import ext_to_mime
+
+                return web.FileResponse(
+                    payload,
+                    headers={"Cache-Control": "no-cache", "Content-Type": ext_to_mime(payload)},
+                )
+            return _err(404, "没有头像")
+
+        @get("/api/avatar/m/{token}")
+        async def _avatar_member(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            av = _avatar_svc()
+            if av is None:
+                return _err(404, "没有这个头像")
+            settings = svc.get_settings()
+            group_ids = list(settings.groups.keys()) if settings is not None else []
+            kind, payload = await av.resolve_member(str(request.match_info["token"]), group_ids)
+            if kind == "bytes":
+                data, mime = payload
+                return web.Response(body=data, content_type=mime, headers={"Cache-Control": "no-cache"})
+            if kind == "path":
+                from .avatar import ext_to_mime
+
+                return web.FileResponse(
+                    payload,
+                    headers={"Cache-Control": "no-cache", "Content-Type": ext_to_mime(payload)},
+                )
+            return _err(404, "没有这个头像")
+
+        @get("/api/avatar/g/{token}")
+        async def _avatar_group(request: web.Request) -> web.Response:
+            ident = self._identify(request)
+            if ident.role == "none":
+                return _err(401, "先登录管理员，或用群链接打开")
+            av = _avatar_svc()
+            if av is None:
+                return _err(404, "没有这个头像")
+            settings = svc.get_settings()
+            group_ids = list(settings.groups.keys()) if settings is not None else []
+            token = str(request.match_info["token"])
+            gid = av.find_group_by_token(token, group_ids)
+            if gid is None:
+                return _err(404, "没有这个头像")
+            if ident.role == "member" and ident.group_id != gid:
+                return _err(403, "只能看自己群的头像")
+            kind, payload = await av.resolve_group(token, group_ids)
+            if kind == "bytes":
+                data, mime = payload
+                return web.Response(body=data, content_type=mime, headers={"Cache-Control": "no-cache"})
+            if kind == "path":
+                from .avatar import ext_to_mime
+
+                return web.FileResponse(
+                    payload,
+                    headers={"Cache-Control": "no-cache", "Content-Type": ext_to_mime(payload)},
+                )
+            return _err(404, "没有这个头像")
+
+        @get("/api/settings/avatar")
+        async def _avatar_settings_get(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            av = _avatar_svc()
+            if av is None:
+                return _err(503, "头像服务没就位")
+            return web.json_response(await _avatar_state(av))
+
+        async def _avatar_settings_post(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            av = _avatar_svc()
+            if av is None:
+                return _err(503, "头像服务没就位")
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from .avatar import parse_avatar_post
+
+            try:
+                kind, payload = parse_avatar_post(body)
+                if kind == "url":
+                    av.set_custom_url(str(payload))
+                else:
+                    av.set_custom_upload(payload)
+            except ValueError as e:
+                return _err(400, str(e))
+            logger.info("bot 头像已由管理员更换（%s）", "自定义网址" if kind == "url" else "上传图片")
+            return web.json_response(await _avatar_state(av))
+
+        async def _avatar_settings_delete(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            av = _avatar_svc()
+            if av is None:
+                return _err(503, "头像服务没就位")
+            av.clear_custom()
+            logger.info("bot 头像已恢复为自动（平台头像 / 默认图）")
+            return web.json_response(await _avatar_state(av))
+
+        app.router.add_post("/api/settings/avatar", self._write(_avatar_settings_post))
+        app.router.add_route("DELETE", "/api/settings/avatar", self._write(_avatar_settings_delete))
+
+        # ---------- 静态 ----------
+
+        @get("/")
+        async def _index(request: web.Request) -> web.Response:
+            return web.FileResponse(_STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+
+        @get("/g/{token}")
+        async def _group_link(request: web.Request) -> web.Response:
+            raise web.HTTPFound(f"/#/{request.match_info['token']}/news")
+
+        app.router.add_static("/static/", _STATIC_DIR, show_index=False)
+
+        # 未知 /api 路由 → JSON 404（放在最后兜底）
+        async def _api_404(request: web.Request) -> web.Response:
+            return _err(404, "没有这个接口")
+
+        app.router.add_route("*", "/api/{tail:.*}", _api_404)
+        return app
+
+    # ------------------------------------------------------------------
+    # 中间件
+    # ------------------------------------------------------------------
+
+    @web.middleware
+    async def _errors_mw(self, request: web.Request, handler: Handler) -> web.Response:
+        try:
+            resp = await handler(request)
+        except web.HTTPException:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("网页请求未捕获异常：%s %s", request.method, request.path)
+            resp = _err(500, "服务器出错了")
+        try:
+            resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+            resp.headers.setdefault("Referrer-Policy", "no-referrer")
+            resp.headers.setdefault("X-Frame-Options", "DENY")
+        except Exception:
+            pass
+        return resp
+
+    # ------------------------------------------------------------------
+    # 模型测试成功后的回写
+    # ------------------------------------------------------------------
+
+    def _save_checked(self, base_url: str, available: list[str]) -> None:
+        """把 available / checked_at 存回 kv["models.checked"]（测试连接结果，不是配置）。
+
+        模型设置本体在 config.toml 的 [models]（网页保存也写它）；这份回写只在
+        端点一致时并进来显示（models.settings() 里对齐）。
+        """
+        svc = self._svc
+        checked_at = clock.now()
+        try:
+            with svc.store.tx() as conn:
+                svc.store.kv_set(conn, "models.checked", {"base_url": base_url.rstrip("/"), "available": list(available), "checked_at": checked_at})
+        except Exception:
+            logger.exception("回写模型测试记录失败")
+        # 内存里的缓存也顺手对齐（settings() 缓存键含 kv 值，其实下次自己就会重算）
+        try:
+            ms = svc.models.settings()
+            if ms.base_url == base_url.rstrip("/"):
+                ms.available = list(available)
+                ms.checked_at = checked_at
+        except Exception:
+            pass
+
+
+def create_app(svc: Any) -> web.Application:
+    """拼出 aiohttp Application；svc 是 app.py 里的服务对象。"""
+    return ConsoleServer(svc).app

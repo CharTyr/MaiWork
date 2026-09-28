@@ -1,0 +1,50 @@
+{
+  "manifest_version": 2,
+  "id": "chartyr.maiwork",
+  "version": "0.1.0",
+  "name": "MaiWork",
+  "description": "懂群、会主动做事的后台 agent：资讯、构想、目标。默认关闭。",
+  "plugin_type": "extension",
+  "author": {
+    "name": "CharTyr",
+    "url": "https://github.com/CharTyr"
+  },
+  "license": "GPL-v3.0-or-later",
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "config.get",
+    "message.get_by_time_in_chat",
+    "knowledge.search",
+    "person.get_id",
+    "person.get_value",
+    "chat.get_stream_by_group_id",
+    "chat.get_group_streams",
+    "api.call",
+    "api.list",
+    "send.hybrid",
+    "maisaka.proactive.trigger"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "display": {
+    "icon": {
+      "type": "lucide",
+      "value": "briefcase"
+    }
+  },
+  "urls": {
+    "repository": "https://github.com/CharTyr"
+  }
+}

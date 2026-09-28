@@ -1,0 +1,11 @@
+._*
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+# 线上运行时配置含密钥，永远不进仓库
+plugin/CharTyr_MaiWork/config.toml
+*.db
+*.db-wal
+*.db-shm

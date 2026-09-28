@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#0e0e10" media="(prefers-color-scheme: dark)" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="referrer" content="no-referrer" />
+  <title>MaiWork</title>
+  <link rel="icon" href="/static/assets/icons/sparkles.png" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body class="booting">
+  <div class="app" id="app">
+    <aside class="rail" id="rail" aria-label="群和页面"></aside>
+    <main class="main" id="main">
+      <header class="top" id="top"></header>
+      <div class="view" id="view"></div>
+    </main>
+    <aside class="side" id="side" aria-label="概况和详情"></aside>
+  </div>
+
+  <nav class="tabbar" id="tabbar" aria-label="页面"></nav>
+
+  <div class="scrim" id="scrim" hidden></div>
+  <section class="sheet" id="sheet" role="dialog" aria-modal="true" hidden></section>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
