@@ -64,6 +64,34 @@ class TestMigration:
         assert conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 5000
 
 
+class TestIdeaItemsMigration:
+    """2026-10：构想「包含的项目」+ 派活请求来源两列（store._m_idea_items）。"""
+
+    def test_new_columns_exist(self, store: Store) -> None:
+        ideas = {r["name"] for r in store.read().execute("PRAGMA table_info(ideas)")}
+        assert "items" in ideas
+        reqs = {r["name"] for r in store.read().execute("PRAGMA table_info(requests)")}
+        assert {"item_nos", "source"} <= reqs
+
+    def test_old_rows_read_as_empty(self, store: Store) -> None:
+        """老构想（没写 items）读出来是 '[]'，不能报错。"""
+        with store.tx() as conn:
+            conn.execute(
+                "INSERT INTO ideas (group_id, title, step, effort, created, updated)"
+                " VALUES ('g1', '老构想', '第一步', '半天', 0, 0)"
+            )
+            cur = conn.execute(
+                "INSERT INTO requests (id, group_id, kind, title, created, updated)"
+                " VALUES ('R-9', 'g1', 'task', '老的', 0, 0)"
+            )
+            assert cur.rowcount == 1
+        row = store.read().execute("SELECT items, step, effort FROM ideas").fetchone()
+        assert row["items"] == "[]"
+        assert row["step"] == "第一步" and row["effort"] == "半天"  # 老字段照样读得动
+        req = store.read().execute("SELECT item_nos, source FROM requests WHERE id='R-9'").fetchone()
+        assert req["item_nos"] == "[]" and req["source"] == ""
+
+
 class TestTx:
     def test_tx_commits(self, store: Store) -> None:
         with store.tx() as conn:

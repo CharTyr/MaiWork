@@ -35,7 +35,7 @@ import json
 import logging
 from typing import Any
 
-from . import clock
+from . import clock, compaction
 from .models import ModelError, _redact_full
 from .names import clean_group_name
 from .tools import ToolContext
@@ -43,11 +43,11 @@ from .tools import ToolContext
 logger = logging.getLogger("maiwork.admin_chat")
 
 MAX_ROUNDS = 12            # 一条用户消息最多让主模型调 12 轮工具
-CONTEXT_LIMIT = 40         # 送进模型的最近消息条数
 MAX_TEXT = 20000           # 单条消息字数上限（防呆）
 MAX_TITLE = 100            # 对话标题字数上限
 TOOL_CONTENT_MAX = 6000    # 工具结果进对话前截断（和 coordinator._run_tool_calls 一致）
 DEFAULT_TITLE = "管理员对话"
+_SUMMARY_ROLE = "assistant"   # 摘要消息在库里仍存 assistant；meta.kind == "summary" 区分
 
 
 class ChatBusy(ValueError):
@@ -655,10 +655,16 @@ class AdminChat:
                 return
             messages: list[dict] = [{"role": "system", "content": self._system_prompt(row)}]
             messages.extend(self._history(chat_id))
+            # 上下文超触发线：先在库里写一条新摘要（自动整理），再发——不丢老对话
             try:
-                result = await models.chat(
-                    "main",
+                messages = await self._auto_compact_for_turn(chat_id, messages)
+            except Exception:
+                logger.exception("自动整理摘要出错（对话 %s），原样继续", chat_id)
+            try:
+                result = await compaction.chat_with_retry_on_long_context(
                     messages,
+                    models=models,
+                    role="main",
                     tools=spec_list or None,
                     json_mode=False,
                     purpose="admin_chat",
@@ -903,9 +909,75 @@ class AdminChat:
         """写一条系统提示（给管理员和主模型都看得到的那行灰字）。密钥先遮掉。"""
         return self._add_msg(int(chat_id), "system_note", self._mask(text))
 
+    def _latest_summary_row(self, chat_id: int) -> tuple[dict, dict] | None:
+        """最新一条摘要消息（meta.kind == "summary"）及其 meta；没有 → None。"""
+        store = self.store
+        if store is None:
+            return None
+        try:
+            rows = store.read().execute(
+                "SELECT * FROM admin_chat_msgs WHERE chat_id=? ORDER BY id DESC LIMIT 30",
+                (int(chat_id),),
+            ).fetchall()
+        except Exception:
+            return None
+        for row in rows:
+            d = dict(row)
+            meta = _json_or({}, d.get("meta"))
+            if isinstance(meta, dict) and meta.get("kind") == "summary":
+                return d, meta
+        return None
+
     def _history(self, chat_id: int) -> list[dict]:
-        """最近 40 条消息 → OpenAI messages；顺序和配对严格修好（断了的工具块补一条）。"""
-        rows = self._rows(chat_id)[-CONTEXT_LIMIT:]
+        """构造送模型的上下文：最新摘要 + 其后没被覆盖的消息（0.4.0 起不再按条数丢）。
+
+        - 有摘要（meta.kind == "summary"）：摘要本身作为第一条 user 消息，其后
+          id > meta.msg_to 的消息原样回放——老消息永远靠压缩保留，不是直接丢掉；
+        - 没有摘要：全部消息原样回放（估算超触发线时由 _turn 先自动整理摘要再发）；
+        - 摘要之外的行照样严格修好 assistant(tool_calls) ↔ tool 的顺序。
+        """
+        items: list[dict] = []
+        after_id = 0
+        latest = self._latest_summary_row(chat_id)
+        if latest is not None:
+            row, meta = latest
+            after_id = int(meta.get("msg_to") or row.get("id") or 0)
+            items.append(
+                {
+                    "role": "user",
+                    "content": _s(row.get("content")) or "（前面已经整理成摘要）",
+                }
+            )
+        store = self.store
+        if store is None:
+            return items
+        rows = [
+            dict(r)
+            for r in store.read().execute(
+                "SELECT * FROM admin_chat_msgs WHERE chat_id=? AND id>? ORDER BY id ASC",
+                (int(chat_id), int(after_id)),
+            ).fetchall()
+        ]
+        rows = [r for r in rows if _json_or({}, r.get("meta")).get("kind") != "summary"]
+        items.extend(self._history_rows(rows))
+        return items
+
+    def _rows_after(self, chat_id: int, after_id: int) -> list[dict]:
+        """库里 id > after_id 的非摘要消息（自动 / 手动压缩用）。"""
+        store = self.store
+        if store is None:
+            return []
+        rows = [
+            dict(r)
+            for r in store.read().execute(
+                "SELECT * FROM admin_chat_msgs WHERE chat_id=? AND id>? ORDER BY id ASC",
+                (int(chat_id), int(after_id)),
+            ).fetchall()
+        ]
+        return [r for r in rows if _json_or({}, r.get("meta")).get("kind") != "summary"]
+
+    def _history_rows(self, rows: list[dict]) -> list[dict]:
+        """一段消息行 → 严格修好的 OpenAI messages（断了的工具块补一条）。"""
         out: list[dict] = []
         waiting: list[str] = []
         deferred: list[str] = []
@@ -932,7 +1004,7 @@ class AdminChat:
             if role == "tool":
                 tcid = _s(row.get("tool_call_id"))
                 if not waiting:
-                    continue  # 没有对应 assistant 的孤儿 tool 行：丢掉，别让端点 400
+                    continue
                 if tcid and tcid not in waiting:
                     continue
                 if not tcid:
@@ -950,7 +1022,7 @@ class AdminChat:
             if role == "system_note":
                 text = "（系统提示）" + _s(row.get("content"))
                 if waiting:
-                    deferred.append(text)  # 不能插在 assistant(tool_calls) 和 tool 中间
+                    deferred.append(text)
                 else:
                     _flush_notes()
                     out.append({"role": "user", "content": text})
@@ -975,3 +1047,132 @@ class AdminChat:
             _flush_tools()
         _flush_notes()
         return out
+
+    # ------------------------------------------------------------------
+    # 摘要（手动压缩 + 上下文超线的自动整理）
+    # ------------------------------------------------------------------
+
+    def _context_window(self) -> int:
+        settings = self._settings_or_none()
+        try:
+            return int(getattr(getattr(settings, "models", None), "context_window", None) or 128000)
+        except Exception:
+            return 128000
+
+    async def _summarize_and_store(self, chat_id: int, cut: list[dict], covered_rows: list[dict]) -> dict:
+        """把 cut（OpenAI messages）总结成一条摘要消息（8 节）写库，返回消息视图。
+
+        - covered_rows：这段摘要在库里盖住的行（msg_from / msg_to / covers / ts 范围）；
+        - 摘要消息 role=assistant，meta.kind="summary"；模型 purpose 追加 ":compact"；
+        - 摘要失败（ModelError 等）：向上抛，由调用方决定（手动：400；自动：按原样继续）。
+        """
+        store = self._store_or_raise()
+        row = self._chat_or_raise(chat_id)
+        gid = _s(row.get("group_id"))
+        text = await compaction.summarize_messages(
+            cut,
+            models=self.models,
+            role="main",
+            purpose="admin_chat",
+            group_id=gid,
+        )
+        body = compaction.summary_to_message(text).get("content") or ""
+        first = covered_rows[0] if covered_rows else {}
+        last = covered_rows[-1] if covered_rows else {}
+        meta = {
+            "kind": "summary",
+            "covers": len(covered_rows),
+            "from_ts": float(first.get("ts") or 0.0),
+            "to_ts": float(last.get("ts") or 0.0),
+            "msg_from": int(first.get("id") or 0),
+            "msg_to": int(last.get("id") or 0),
+        }
+        with store.tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO admin_chat_msgs (chat_id, ts, role, content, meta) VALUES (?, ?, 'assistant', ?, ?)",
+                (int(chat_id), clock.now(), body, json.dumps(meta, ensure_ascii=False)),
+            )
+            mid = int(cur.lastrowid or 0)
+            conn.execute("UPDATE admin_chats SET updated=? WHERE id=?", (clock.now(), int(chat_id)))
+        # 返回这条新消息的视图（给网页 / 调用方）
+        msg_row = store.read().execute(
+            "SELECT * FROM admin_chat_msgs WHERE id=?", (mid,)
+        ).fetchone()
+        return self._msg_view(dict(msg_row)) if msg_row is not None else {"id": mid, "meta": meta}
+
+    async def compact(self, chat_id: Any) -> dict:
+        """手动压缩：把「上一条摘要之后的全部消息」整理成一条新摘要（8 节）。
+
+        {"summary": <消息视图>}
+        - 对话正忙 → ChatBusy（网页 409）；
+        - 对话不存在 → ValueError（404）；
+        - 模型没配好 → ValueError（400）；
+        - 上一条摘要之后没有可整理的消息 → ValueError（400 没的整理）；
+        - 摘要模型出错 → ValueError（400）。
+        """
+        row = self._chat_or_raise(chat_id)
+        cid = int(row["id"])
+        models = self.models
+        if models is None or not self._ready(models):
+            raise ValueError("模型还没配好，整理不了摘要：先到「设置 → 模型」里填好端点、密钥和模型名")
+        self._begin(cid)
+        try:
+            latest = self._latest_summary_row(cid)
+            after_id = 0
+            prev_summary_text = ""
+            if latest is not None:
+                prev_row, meta = latest
+                after_id = int(meta.get("msg_to") or prev_row.get("id") or 0)
+                prev_summary_text = _s(prev_row.get("content"))
+            rows = self._rows_after(cid, after_id)
+            if not rows:
+                raise ValueError("这段对话还没有新内容可整理")
+            cut = self._history_rows(rows)
+            if prev_summary_text:
+                cut = [{"role": "user", "content": prev_summary_text}] + cut
+            try:
+                summary = await self._summarize_and_store(cid, cut, rows)
+            except ModelError as e:
+                # 模型连不上 / 出错：给网页一句能看懂的话（400），不写半截摘要
+                raise ValueError(f"整理没成功：模型暂时没回应（{e}），稍后再试") from e
+            return {"summary": summary}
+        finally:
+            self._end(cid)
+
+    async def _auto_compact_for_turn(self, chat_id: int, messages: list[dict]) -> list[dict]:
+        """_turn 每轮调用前的自动整理：上下文超触发线就写一条新摘要，返回新的 messages。
+
+        - 估算把 system + 历史一起算；阈值/compaction 规则同 workers；
+        - 摘要失败：原样返回（这一轮照旧发，绝不因为整理失败打断对话）。
+        """
+        window = self._context_window()
+        threshold = compaction.compact_threshold(window, compaction.DEFAULT_OUTPUT_RESERVE)
+        if compaction.estimate_tokens_in_messages(messages) < threshold:
+            return messages
+        latest = self._latest_summary_row(chat_id)
+        after_id = 0
+        prev_summary_text = ""
+        if latest is not None:
+            prev_row, meta = latest
+            after_id = int(meta.get("msg_to") or prev_row.get("id") or 0)
+            prev_summary_text = _s(prev_row.get("content"))
+        rows = self._rows_after(chat_id, after_id)
+        raw = self._history_rows(rows)
+        keep, cut = compaction.pick_cut_point(
+            raw, context_window=window, output_reserve=compaction.DEFAULT_OUTPUT_RESERVE
+        )
+        if not cut:
+            return messages
+        covered_rows = rows[: min(len(cut), len(rows))]
+        if not covered_rows:
+            return messages
+        piece = cut
+        if prev_summary_text:
+            piece = [{"role": "user", "content": prev_summary_text}] + piece
+        try:
+            await self._summarize_and_store(chat_id, piece, covered_rows)
+        except Exception:
+            logger.exception("管理员对话自动整理摘要失败（对话 %s），原样继续", chat_id)
+            return messages
+        row = self._chat_row(chat_id) or {}
+        return [{"role": "system", "content": self._system_prompt(row or {})}] + self._history(chat_id)

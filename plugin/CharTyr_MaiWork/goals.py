@@ -238,6 +238,21 @@ class Goals:
             if cur.rowcount == 0:
                 raise KeyError(f"目标不存在: {goal_id}")
 
+    def set_criteria(self, goal_id: str, criteria: Iterable[str]) -> list[dict]:
+        """整组换掉完成标准（只给「第一次检查补齐验收标准」用；空文字丢弃）。
+
+        和 set_criterion 一样，找不到目标抛 KeyError。
+        """
+        crit = [{"text": str(c).strip(), "done": False} for c in criteria if str(c).strip()]
+        with self._store.tx() as conn:
+            cur = conn.execute(
+                "UPDATE goals SET criteria=?, updated=? WHERE id=?",
+                (json.dumps(crit, ensure_ascii=False), clock.now(), str(goal_id)),
+            )
+            if cur.rowcount == 0:
+                raise KeyError(f"目标不存在: {goal_id}")
+        return crit
+
     def set_criterion(self, goal_id: str, index: int, done: bool) -> None:
         with self._store.tx() as conn:
             row = conn.execute("SELECT criteria FROM goals WHERE id=?", (str(goal_id),)).fetchone()

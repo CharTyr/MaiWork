@@ -293,6 +293,7 @@ class ModelSettings:
     retry_delay_s: int = 10  # 两次重试之间等几秒（1~60）
     max_concurrency: int = 2  # 同一端点同时最多几个在途请求（1~8）
     max_rpm: int = 0          # 同一端点每分钟最多几次（0 = 不限）
+    context_window: int = 128000  # 模型上下文长度（tokens，8192~2000000），上下文压缩用
 
     def ready(self) -> bool:
         """端点、密钥、主模型、子 agent 模型都有。"""
@@ -315,6 +316,7 @@ class ModelSettings:
             "retry_delay_s": self.retry_delay_s,
             "max_concurrency": self.max_concurrency,
             "max_rpm": self.max_rpm,
+            "context_window": self.context_window,
         }
 
 
@@ -368,6 +370,8 @@ def _validate(patch: dict) -> list[str]:
         problems.append("同时请求数（max_concurrency）必须是 1~8 的整数")
     if patch.get("max_rpm") is not None and not _valid_int(patch.get("max_rpm"), 0, 600):
         problems.append("每分钟上限（max_rpm）必须是 0~600 的整数（0 = 不限）")
+    if patch.get("context_window") is not None and not _valid_int(patch.get("context_window"), 8192, 2_000_000):
+        problems.append("上下文长度必须是 8192~2000000 的整数（tokens）")
     return problems
 
 
@@ -447,6 +451,9 @@ class Models:
         max_rpm = cfg.get("max_rpm")
         if not _int_in(max_rpm, 0, 600):
             max_rpm = 0
+        context_window = cfg.get("context_window")
+        if not _int_in(context_window, 8192, 2_000_000):
+            context_window = 128000
         return ModelSettings(
             base_url=base_url,
             main=main,
@@ -461,6 +468,7 @@ class Models:
             retry_delay_s=int(retry_delay_s),
             max_concurrency=int(max_concurrency),
             max_rpm=int(max_rpm),
+            context_window=int(context_window),
         )
 
     def _current_key(self, settings: Settings) -> str:
@@ -492,7 +500,7 @@ class Models:
             "models.worker_backup": str(patch.get("worker_backup") or "").strip(),
         }
         # retries / retry_delay_s / 限流两项：没传保留当前有效值（别把网页上没动的重试清零）
-        for key in ("retries", "retry_delay_s", "max_concurrency", "max_rpm"):
+        for key in ("retries", "retry_delay_s", "max_concurrency", "max_rpm", "context_window"):
             if patch.get(key) is not None:
                 writes[f"models.{key}"] = int(patch[key])
             else:

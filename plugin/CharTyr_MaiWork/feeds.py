@@ -37,12 +37,19 @@ reason/body/audience 过 privacy.scrub（按 note/persona 片段规则，名字�
 写帖子失败回落 body=summary、reason=why，不丢条目。好文同样处理。
 定关注点可额外产出 0–1 个「不同角度 / 反方观点」方向（diverse），命中它的候选打
 angle='diverse'，去同质化每轮最多留 2 条 diverse。
+「别打转、要拓展」（2026-10 与用户定）：定关注点时提示词带「群里最近两天真实在聊的（节选）」
+（chatlog.recent_chat）和「最近几轮已经找过的方向」（kv["feeds.focus_hist.<群号>"]，最多 15 个，
+每次成功后追加）；要求给 3–5 个分散的关注点，每项带 source（recent|long|explore）。
+子 agent 的 brief 带一段精简群画像，允许它按画像自己拓展 1–2 个方向（交回时标 explore: true），
+这类条目 angle='explore'（去同质化时 explore 不设上限，只有 diverse 有上限）。
+构想提示词也带「群里最近三天真实在聊的（节选）」，最近资讯只作参考（只列 5 条）。
 8. 被筛掉的也入库（rejected=1 + reject_gate + reject_reason + scores）；
    一个事务写 news_batches + news_items；过第三道的 topics.add_candidate(kind="news", …)。
 
 任何一步模型 / 子 agent 失败 → 记 skipped 批次（note 中文原因），返回 0，不抛。
 
-构想（make_idea）：画像没成形 / 模型没配好 → None；主模型写 0 或 1 条「我可以……」；
+构想（make_idea）：画像没成形 / 模型没配好 → None；主模型看着群里最近三天真实在聊的 +
+画像里的「在做的事 / 长期兴趣」写 0 或 1 条「我可以……」（最近资讯只作参考）；
 和最近 30 天构想标题 difflib ≥ 0.75 → None；chat_worthy 的才进话题候选池。
 
 view 结构照 docs/07 §9.3（news 只含过线的 kind=news 条目；rejected 一栏只给管理员；
@@ -53,6 +60,7 @@ from __future__ import annotations
 
 import difflib
 import ipaddress
+import itertools
 import json
 import logging
 import re as _re
@@ -77,12 +85,73 @@ def clean_step(raw: Any) -> str:
     return _STEP_PREFIX.sub("", str(raw or "")).strip()
 
 
+# 构想「包含的项目」（2026-10）：每条构想带 0~5 个具体项目，批准时逐个落成任务 / agent 目标。
+_IDEA_ITEMS_MAX = 5
+_IDEA_ITEM_TITLE_MAX = 40
+_IDEA_ITEM_DESC_MAX = 200
+
+_IDEA_ITEM_KINDS = ("task", "goal")
+
+
+def _row_get(row: Any, key: str, default: Any = "") -> Any:
+    """行里有这个列就取，没有（老库 schema / 测试里的假行）→ 给默认值，不抛。"""
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def parse_idea_items(value: Any) -> list[dict]:
+    """把落库的 items（JSON 串或现成列表）规范成 `[{kind, title, desc}]`，最多 5 个。
+
+    宽容处理：不是列表 → []；每项不是表 / 没标题 → 丢；kind 只认 task / goal（认不出一律 task）；
+    标题截 40 字、说明截 200 字。老构想（items 为 '[]' 或列不存在）→ []。
+    """
+    raw: Any = value
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw or "[]")
+        except (TypeError, ValueError):
+            return []
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        title = str(it.get("title") or "").strip()[:_IDEA_ITEM_TITLE_MAX]
+        if not title:
+            continue
+        kind = str(it.get("kind") or "").strip().lower()
+        if kind not in _IDEA_ITEM_KINDS:
+            kind = "task"
+        out.append(
+            {
+                "kind": kind,
+                "title": title,
+                "desc": str(it.get("desc") or "").strip()[:_IDEA_ITEM_DESC_MAX],
+            }
+        )
+        if len(out) >= _IDEA_ITEMS_MAX:
+            break
+    return out
+
+
+def idea_items_view(value: Any) -> list[dict]:
+    """网页 API 用的 items：在 parse_idea_items 之上加从 1 起的序号 no。"""
+    out = parse_idea_items(value)
+    for i, it in enumerate(out):
+        it["no"] = i + 1
+    return out
+
+
 def focus_items(data: Any) -> list[dict]:
     """从模型回的 JSON 里拿出关注点列表，对格式宽容。
 
-    约定是 {"focus": [{"query", "why"}]}，但有的模型会：直接回一个关注点对象
+    约定是 {"focus": [{"query", "why", "source"}]}，但有的模型会：直接回一个关注点对象
     （线上 step-5-preview 实测）、回裸列表、focus 给成单个对象、换键名、或给纯字符串。
     都认；认不出返回 []。顶层 "diverse" 不算 focus。
+    给了 source 就带上（认不出就原样带，_plan_focus 再规范化成 recent|long|explore）。
     """
     raw: Any = None
     if isinstance(data, list):
@@ -104,10 +173,20 @@ def focus_items(data: Any) -> list[dict]:
         if isinstance(f, str) and f.strip():
             out.append({"query": f.strip(), "why": ""})
         elif isinstance(f, dict) and str(f.get("query") or "").strip():
-            out.append({"query": str(f["query"]).strip(), "why": str(f.get("why") or "")})
+            item = {"query": str(f["query"]).strip(), "why": str(f.get("why") or "")}
+            src = str(f.get("source") or "").strip()
+            if src:
+                item["source"] = src
+            out.append(item)
     return out
 
 logger = logging.getLogger("maiwork.feeds")
+
+
+def _norm_source(raw: Any) -> str:
+    """关注点的 source 只认 recent / long / explore；别的（含没给）一律 ""。"""
+    src = str(raw or "").strip().lower()
+    return src if src in ("recent", "long", "explore") else ""
 
 # 资讯实测（railway.new 一次性 VM，docs/09）
 _VERIFY_BUDGET_S = 20 * 60.0        # 一轮实测的总时长上限 20 分钟
@@ -123,6 +202,8 @@ _ICONS = (
 )
 
 _CANDIDATE_CAP = 12         # 子 agent 最多交回多少条（brief 里也这么要求）
+# 每轮备料给子 agent 的 task_id 标记序号（同一毫秒也不会撞；统计就按这个标记点数）
+_collect_mark_seq = itertools.count(1)
 _FEEDBACK_SCAN_DAYS = 14    # 关注点提示 / 打分参考的最近反馈窗口
 _IDEA_DEDUP_DAYS = 30       # 构想去重窗口
 _IDEA_DEDUP_RATIO = 0.75
@@ -150,6 +231,14 @@ _REASON_MAX = 200           # reason 最多留多少字
 _AUDIENCE_MAX = 8           # audience 最多几个名字
 _KEYWORDS_MAX = 10          # keywords 最多几个
 _SEARCH_QUOTES = 6          # 写帖子每条最多带几条群原话
+_FOCUS_HIST_MAX = 15        # 「最近几轮已经找过的方向」最多记几个（kv["feeds.focus_hist.<群号>"]）
+_RECENT_CHAT_FOCUS_H = 48   # 定关注点看「群里最近在聊」的窗口（小时）
+_RECENT_CHAT_FOCUS_N = 60   # 定关注点最多看几条最近发言
+_RECENT_CHAT_FOCUS_TEXT = 80  # 最近发言每条给模型看多少字
+_RECENT_CHAT_IDEA_H = 72    # 构想看「群里最近在聊」的窗口（小时）
+_RECENT_CHAT_IDEA_N = 80    # 构想最多看几条最近发言
+_BRIEF_PROFILE_MAX = 12     # 子 agent brief 里的群画像最多几条
+_BRIEF_PROFILE_TEXT_MAX = 60  # brief 里每条画像最多多少字
 
 _NEWS_OUTPUT_SCHEMA = {
     "type": "object",
@@ -168,6 +257,7 @@ _NEWS_OUTPUT_SCHEMA = {
                     "quote": {"type": "string"},
                     "paywall": {"type": "boolean"},
                     "image_url": {"type": "string"},
+                    "explore": {"type": "boolean"},
                 },
                 "required": ["title", "url", "summary", "kind", "fetched", "quote", "paywall"],
             },
@@ -502,15 +592,23 @@ class Feeds:
             return 0
 
         # ② 子 agent 找候选（资讯 + 好文；每条必须真打开过）
+        # 这轮子 agent 的 task_id 标记：工具调用按它落库，统计（搜了几次/看了几篇）按它点数
+        collect_mark = (
+            f"feeds-collect:{gid}:{int(clock.now() * 1000)}:{next(_collect_mark_seq)}"
+        )
         try:
-            candidates = await self._collect(gid, focus, settings)
+            candidates = await self._collect(gid, focus, settings, task_id=collect_mark)
         except (ModelError, ValueError) as e:
             logger.info("备资讯-子 agent 失败（群 %s）：%s", gid, e)
-            self._skipped_batch(gid, f"子 agent 没找到东西：{e}")
+            self._skipped_batch(
+                gid, f"子 agent 没找到东西：{e}", stats=self._collect_stats(collect_mark)
+            )
             return 0
         except Exception as e:  # 兜底：任何意外都不能炸后台循环
             logger.exception("备资讯-子 agent 意外错误（群 %s）", gid)
-            self._skipped_batch(gid, f"子 agent 出了意外：{e}")
+            self._skipped_batch(
+                gid, f"子 agent 出了意外：{e}", stats=self._collect_stats(collect_mark)
+            )
             return 0
 
         # ③ 第一道（代码侧）：没打开过 / 付费 / 屏蔽来源 / URL·标题重复
@@ -522,7 +620,10 @@ class Feeds:
                 await self._score(gid, settings, survivors)
             except (ModelError, ValueError) as e:
                 logger.info("备资讯-打分失败（群 %s）：%s", gid, e)
-                self._skipped_batch(gid, f"模型打分失败：{e}", found=len(candidates))
+                self._skipped_batch(
+                    gid, f"模型打分失败：{e}", found=len(candidates),
+                    stats=self._collect_stats(collect_mark),
+                )
                 return 0
             # 第一道（模型侧）：不扎实 / 垃圾 / 同一件事
             self._hard_reject_model(survivors)
@@ -584,6 +685,7 @@ class Feeds:
             accepted_items=accepted,
             ttl_h=ttl_h,
             note=note,
+            stats=self._collect_stats(collect_mark),
         )
         del batch_id  # 目前不对外用
         # 第三道：kind=news、avg≥pool_min_avg、relevance≥4、chat≥4、48 小时内、非敏感；
@@ -802,6 +904,63 @@ class Feeds:
         return now - float(published) <= _POOL_NEWS_MAX_AGE_H * 3600.0
 
     # ------------------------------------------------------------------
+    # 每轮统计（搜了几次 / 看了几篇 / 收了几条）
+    # ------------------------------------------------------------------
+
+    def _collect_stats(self, task_id: str) -> dict:
+        """这轮子 agent 的工具用量：searches=web_search 调用数，pages=fetch_page 成功数。
+
+        子 agent 的每次工具调用都落 tool_calls 表（tools.py），这里按这轮的 task_id
+        标记点数；读不到就当 0（不许因为统计把备料搞挂）。
+        """
+        mark = str(task_id or "")
+        if not mark:
+            return {"searches": 0, "pages": 0}
+        try:
+            rows = self._store.read().execute(
+                "SELECT tool, ok FROM tool_calls WHERE task_id=?"
+                " AND tool IN ('web_search', 'fetch_page')",
+                (mark,),
+            ).fetchall()
+        except Exception:
+            logger.exception("读资讯收集统计失败（%s）", mark)
+            return {"searches": 0, "pages": 0}
+        searches = sum(1 for r in rows if str(r["tool"]) == "web_search")
+        pages = sum(1 for r in rows if str(r["tool"]) == "fetch_page" and int(r["ok"] or 0) == 1)
+        return {"searches": searches, "pages": pages}
+
+    @staticmethod
+    def _batch_stats_key(batch_id: Any) -> str:
+        return f"feeds.batch_stats.{int(batch_id)}"
+
+    def _write_batch_stats(self, conn: Any, batch_id: Any, *, searches: int, pages: int, kept: int) -> None:
+        """把这一轮的 {searches, pages, kept} 挂在批次上（kv，不动 store.py 的表结构）。"""
+        self._store.kv_set(
+            conn,
+            self._batch_stats_key(batch_id),
+            {
+                "searches": max(0, int(searches or 0)),
+                "pages": max(0, int(pages or 0)),
+                "kept": max(0, int(kept or 0)),
+            },
+        )
+
+    def _batch_stats(self, batch_id: Any) -> dict | None:
+        """读这一轮的统计；老批次（这功能之前落的）没有 → None，前端显示「没统计」。"""
+        try:
+            saved = self._store.kv_get(self._batch_stats_key(batch_id))
+        except Exception:
+            logger.debug("读批次统计失败（%s）", batch_id, exc_info=True)
+            return None
+        if not isinstance(saved, dict):
+            return None
+        return {
+            "searches": int(saved.get("searches") or 0),
+            "pages": int(saved.get("pages") or 0),
+            "kept": int(saved.get("kept") or 0),
+        }
+
+    # ------------------------------------------------------------------
     # 落库
     # ------------------------------------------------------------------
 
@@ -816,6 +975,7 @@ class Feeds:
         accepted_items: list[dict],
         ttl_h: float,
         note: str,
+        stats: dict | None = None,
     ) -> int:
         """一个事务写批次 + 全部条目（通过的和被筛的都在），返回批次 id。
 
@@ -831,6 +991,12 @@ class Feeds:
                 (gid, now, int(found), int(kept), 1 if not kept else 0, str(note)[:300], now),
             )
             batch_id = int(cur.lastrowid or 0)
+            self._write_batch_stats(
+                conn, batch_id,
+                searches=int((stats or {}).get("searches") or 0),
+                pages=int((stats or {}).get("pages") or 0),
+                kept=int(kept),
+            )
             for item in accepted_items:
                 sc = item.get("scores") or {}
                 post = item.get("post") or {}
@@ -897,12 +1063,100 @@ class Feeds:
                 )
         return batch_id
 
-    async def _plan_focus(self, gid: str, settings: Settings) -> list[dict]:
-        """定关注点。返回 [{"query", "why", "angle"}]；angle='diverse' 的是「不同角度/反方观点」。
+    # ------------------------------------------------------------------
+    # 「别打转、要拓展」：最近在聊 / 找过的方向 / 精简画像（2026-10）
+    # ------------------------------------------------------------------
 
-        提示词里带：群画像 + 最近反馈 + 资讯偏好（kv["feeds.pref.<群号>"]）。
+    def _recent_chat_excerpt(
+        self, gid: str, *, hours: float, limit: int, text_max: int = 80
+    ) -> list[str]:
+        """本群最近 hours 小时发言的提示词节选：每行「- 名字：原话」，原话截 text_max 字。
+
+        只给主模型 / 子 agent 看；名字不会写进入库字段（构想 basis 的「不点名群友」照旧）。
+        没发言 / 库错误 → []（这段就不加）。
+        """
+        from .chatlog import recent_chat
+
+        try:
+            rows = recent_chat(self._store, gid, hours=hours, limit=limit)
+        except Exception:
+            logger.info("读最近群发言失败（群 %s）", gid, exc_info=True)
+            return []
+        out: list[str] = []
+        for r in rows or []:
+            text = str(r.get("text") or "").strip().replace("\n", " ")
+            if not text:
+                continue
+            who = str(r.get("who") or "").strip() or "群友"
+            out.append(f"- {who}：{text[:text_max]}")
+        return out
+
+    @staticmethod
+    def _focus_hist_key(gid: str) -> str:
+        return f"feeds.focus_hist.{gid}"
+
+    def focus_history(self, gid: str) -> list[dict]:
+        """kv["feeds.focus_hist.<群号>"]：最近几轮找过的方向 [{query, ts}]，最多 _FOCUS_HIST_MAX 个。"""
+        try:
+            raw = self._store.kv_get(self._focus_hist_key(str(gid)), [])
+        except Exception:
+            return []
+        if not isinstance(raw, list):
+            return []
+        out: list[dict] = []
+        for r in raw:
+            if not isinstance(r, dict):
+                continue
+            q = str(r.get("query") or "").strip()
+            if not q:
+                continue
+            try:
+                ts = float(r.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            out.append({"query": q, "ts": ts})
+        return out[-_FOCUS_HIST_MAX:]
+
+    def _append_focus_history(self, gid: str, focus: list[dict]) -> None:
+        """这轮定下来的关注点追加进 kv（只存 query + ts，最多留 _FOCUS_HIST_MAX 个）；写失败不抛。"""
+        hist = self.focus_history(gid)
+        now = clock.now()
+        for f in focus:
+            q = str(f.get("query") or "").strip()
+            if q:
+                hist.append({"query": q, "ts": float(now)})
+        if not hist:
+            return
+        try:
+            with self._store.tx() as conn:
+                self._store.kv_set(conn, self._focus_hist_key(str(gid)), hist[-_FOCUS_HIST_MAX:])
+        except Exception:
+            logger.info("写关注点历史失败（群 %s）", gid, exc_info=True)
+
+    def _brief_profile_lines(self, gid: str) -> list[str]:
+        """子 agent brief 的精简群画像：优先「长期兴趣 / 在做的事」再补其他，≤12 条、每条截 60 字。"""
+        preferred = ("interest", "ongoing")
+        entries = self._safe_entries(gid)
+        primary = [e for e in entries if str(e.get("category") or "") in preferred]
+        others = [e for e in entries if str(e.get("category") or "") not in preferred]
+        out: list[str] = []
+        for e in (primary + others)[:_BRIEF_PROFILE_MAX]:
+            text = str(e.get("text") or "").strip().replace("\n", " ")
+            if text:
+                out.append(f"- {text[:_BRIEF_PROFILE_TEXT_MAX]}")
+        return out
+
+    async def _plan_focus(self, gid: str, settings: Settings) -> list[dict]:
+        """定关注点。返回 [{"query", "why", "angle", "source"}]。
+
+        angle='diverse' 的是「不同角度/反方观点」；source 是 recent|long|explore（缺省 ""）。
+        提示词里带：群画像 + 群里最近两天真实在聊的（recent_chat）+ 最近反馈 + 资讯偏好
+        （kv["feeds.pref.<群号>"]）+ 最近几轮已经找过的方向（kv["feeds.focus_hist.<群号>"]，
+        要求别再重复、换别的），并要求 3–5 个分散的关注点（recent ≤2、至少 1 个 long、
+        再加 1 个 explore）。
         模型可额外给 0–1 个不同角度关注点（顶层 "diverse" 键），进搜索列表，产出条目
         带 angle='diverse'；去同质化时每轮最多留 2 条。
+        只给 1 个关注点也照样返回（不报错），日志记一下数量。
         """
         entries = self._safe_entries(gid)
         feedback = self._recent_feedback_titles(gid)
@@ -917,6 +1171,17 @@ class Feeds:
                 lines.append(f"- [{e.get('category', '')}] {e.get('text', '')}")
         else:
             lines.append("（画像还是空的，就按泛科技兴趣挑）")
+        # 「群里最近两天真实在聊的」：别总围着同一个热点打转（2026-10，用户实测）。
+        chat_lines = self._recent_chat_excerpt(
+            gid,
+            hours=_RECENT_CHAT_FOCUS_H,
+            limit=_RECENT_CHAT_FOCUS_N,
+            text_max=_RECENT_CHAT_FOCUS_TEXT,
+        )
+        if chat_lines:
+            lines.append("")
+            lines.append("群里最近两天真实在聊的（节选）：")
+            lines.extend(chat_lines)
         lines.append("")
         pref = self.pref(gid)
         if pref:
@@ -929,11 +1194,20 @@ class Feeds:
             lines.append("最近这些资讯群友觉得没用（避开这类）：")
             lines.extend(f"- {t}" for t in feedback["down"][:10])
         lines.append("")
+        hist = self.focus_history(gid)
+        if hist:
+            lines.append("最近几轮已经找过的方向（除非有明显新进展，别再重复这些方向，换别的）：")
+            lines.extend(f"- {h['query']}" for h in hist)
+            lines.append("")
         lines.append(
-            "请给出 3–5 个接下来要去找的关注点，只回 JSON："
-            '{"focus": [{"query": "拿去搜索的关键词（具体一点）", "why": "为什么这个群会在意"}],'
+            "请给出 3–5 个接下来要去找的关注点，要分散，只回 JSON："
+            '{"focus": [{"query": "拿去搜索的关键词（具体一点）", "why": "为什么这个群会在意",'
+            ' "source": "recent | long | explore"}],'
             ' "diverse": {"query": "…", "why": "…"} | null}'
-            "。另外如果找得到一个「不同角度 / 反方观点」的方向（避免回音壁），就放进 diverse"
+            "。分配要求：来自「最近在聊」的最多 2 个（source=recent）；至少 1 个来自长期兴趣 /"
+            " 在做的事 / 常用资源（source=long）；再加 1 个「拓展」方向（source=explore）——"
+            "基于你对这个群的理解推断出来、群里还没直接聊过、但大概率会感兴趣的相邻方向。"
+            "另外如果找得到一个「不同角度 / 反方观点」的方向（避免回音壁），就放进 diverse"
             "（最多 1 个，没有合适的就 null）。"
         )
         result = await self._models.chat(
@@ -944,7 +1218,10 @@ class Feeds:
             group_id=gid,
         )
         data = json.loads(result.text)
-        out = [{**f, "angle": ""} for f in focus_items(data)[:5]]
+        out = [
+            {**f, "angle": "", "source": _norm_source(f.get("source"))}
+            for f in focus_items(data)[:5]
+        ]
         if not out:
             raise ValueError("模型没给出能用的关注点（返回格式不对或是空的）")
         diverse = data.get("diverse") if isinstance(data, dict) else None
@@ -954,11 +1231,24 @@ class Feeds:
                     "query": str(diverse["query"]).strip(),
                     "why": str(diverse.get("why") or ""),
                     "angle": "diverse",
+                    "source": "",
                 }
             )
+        self._append_focus_history(gid, out)
+        logger.info(
+            "定关注点（群 %s）：%d 个（recent=%d long=%d explore=%d diverse=%d）",
+            gid,
+            len(out),
+            sum(1 for f in out if f.get("source") == "recent"),
+            sum(1 for f in out if f.get("source") == "long"),
+            sum(1 for f in out if f.get("source") == "explore"),
+            sum(1 for f in out if f.get("angle") == "diverse"),
+        )
         return out
 
-    async def _collect(self, gid: str, focus: list[dict], settings: Settings) -> list[dict]:
+    async def _collect(self, gid: str, focus: list[dict], settings: Settings, task_id: str = "") -> list[dict]:
+        # 资讯收集子 agent 的时间盒（0.4.0，[feeds] collect_minutes 默认 15）：到点把已找到的交回
+        collect_minutes = max(1, int(getattr(settings.feeds, "collect_minutes", 15) or 15))
         lines = []
         for f in focus:
             tag = "（不同角度，刻意找反方观点）" if f.get("angle") == "diverse" else ""
@@ -979,8 +1269,17 @@ class Feeds:
             for it in rss_items[:20]:
                 rss_lines.append(f"- （RSS：{it.get('_rss_title') or 'rss'}）{it['title']} —— {it['url']}")
             rss_section = "\n".join(rss_lines) + "\n\n"
+        # 精简群画像：给子 agent 拓展方向用（≤12 条，优先长期兴趣 / 在做的事，每条截 60 字）。
+        profile_lines = self._brief_profile_lines(gid)
+        profile_section = ""
+        if profile_lines:
+            profile_section = (
+                "这个群大致是这样的（给你拓展方向用）：\n" + "\n".join(profile_lines) + "\n\n"
+            )
         brief = (
-            "帮这个群找值得看的内容。关注点如下：\n"
+            "帮这个群找值得看的内容。\n"
+            + profile_section
+            + "关注点如下：\n"
             + "\n".join(lines)
             + "\n\n"
             + rss_section
@@ -994,14 +1293,22 @@ class Feeds:
             f"{kind_field}published（发布时间，ISO 格式或 epoch 秒，实在拿不到就空字符串）、"
             f"fetched（确实用 fetch_page 打开过就 true）、quote（从原文里抄一小段能支撑摘要的依据，≤{_QUOTE_MAX} 字）、"
             "paywall（要登录/付费就 true）、"
-            "image_url（fetch_page 说有封面图就把那个地址抄过来，没有就空字符串）；\n"
-            "6. 最后用 submit_result 交回，data 按约定的 JSON Schema。"
+            "image_url（fetch_page 说有封面图就把那个地址抄过来，没有就空字符串）、"
+            "explore（这条是你自己按群画像拓展的方向就 true，否则省略）；\n"
+            "6. 除了上面的关注点，你也可以根据群画像自己拓展 1–2 个这个群大概率会感兴趣、"
+            "上面没列到的方向去找；这类条目在 JSON 里标 explore: true。总数仍然不超过上限，"
+            "质量要求一样；\n"
+            "7. 最后用 submit_result 交回，data 按约定的 JSON Schema；"
+            f"你只有大约 {collect_minutes} 分钟，到点前记得把已经找到的交回来（部分结果也算，不会丢）。"
         )
+        deadline_ts = clock.now() + collect_minutes * 60
         report = await self._workers.run(
             brief,
             group_id=gid,
             tools=["web_search", "fetch_page"],
             output_schema=_NEWS_OUTPUT_SCHEMA,
+            task_id=task_id,
+            deadline_ts=deadline_ts,
         )
         if not getattr(report, "ok", False):
             raise ValueError(str(getattr(report, "error", "") or getattr(report, "summary", "") or "子 agent 没干成"))
@@ -1032,6 +1339,7 @@ class Feeds:
                     "quote": str(raw.get("quote") or "").replace("\n", " ").strip()[:_QUOTE_MAX],
                     "paywall": bool(raw.get("paywall")),
                     "image_url": _public_http_url(raw.get("image_url")),
+                    "explore": bool(raw.get("explore")),
                     "url_key": _normalize_url(url),
                 }
             )
@@ -1049,6 +1357,11 @@ class Feeds:
                 haystack = f"{item['title']} {item['summary']}"
                 if any(w in haystack for w in words):
                     item["angle"] = "diverse"
+        # 「自己拓展」的方向：子 agent 标了 explore、又没被判成 diverse 的条目 angle='explore'。
+        # explore 只作记录：去同质化不给它设上限（只有 diverse 有上限）。
+        for item in items:
+            if item.get("explore") and str(item.get("angle") or "") != "diverse":
+                item["angle"] = "explore"
         return items
 
     async def _score(self, gid: str, settings: Settings, candidates: list[dict]) -> None:
@@ -1654,14 +1967,22 @@ class Feeds:
         except Exception:
             logger.info("投票补进候选池失败（群 %s 条 %s）", gid, iid, exc_info=True)
 
-    def _skipped_batch(self, gid: str, note: str, *, found: int = 0) -> None:
+    def _skipped_batch(self, gid: str, note: str, *, found: int = 0, stats: dict | None = None) -> None:
         now = clock.now()
         try:
             with self._store.tx() as conn:
-                conn.execute(
+                cur = conn.execute(
                     "INSERT INTO news_batches (group_id, slot_ts, found, kept, skipped, note, created)"
                     " VALUES (?, ?, ?, 0, 1, ?, ?)",
                     (gid, now, int(found), str(note)[:300], now),
+                )
+                # 跳过的轮也记一份统计（默认全 0）：前端能按同一套字段读；收集之后才失败的
+                # 轮（打分失败等）传 stats 保留已经发生的搜索 / 打开次数，kept 一律 0。
+                self._write_batch_stats(
+                    conn, int(cur.lastrowid or 0),
+                    searches=int((stats or {}).get("searches") or 0),
+                    pages=int((stats or {}).get("pages") or 0),
+                    kept=0,
                 )
         except Exception:
             logger.exception("记 skipped 批次失败（群 %s）", gid)
@@ -1705,10 +2026,23 @@ class Feeds:
         lines = ([p for p in prefix_parts] if prefix_parts else []) + ["这是一个 QQ 群的画像要点："]
         for e in entries[:25]:
             lines.append(f"- [{e.get('category', '')}] {e.get('text', '')}")
+        # 「群里最近三天真实在聊的」：构想主要从这儿和画像里的「在做的事 / 长期兴趣」出发，
+        # 别被最近找过的资讯带偏（2026-10，用户实测）。
+        idea_chat_lines = self._recent_chat_excerpt(
+            gid,
+            hours=_RECENT_CHAT_IDEA_H,
+            limit=_RECENT_CHAT_IDEA_N,
+            text_max=_RECENT_CHAT_FOCUS_TEXT,
+        )
+        if idea_chat_lines:
+            lines.append("")
+            lines.append("群里最近三天真实在聊的（节选）：")
+            lines.extend(idea_chat_lines)
+            lines.append("构想主要从这里和画像里的「在做的事 / 长期兴趣」出发。")
         if recent_news:
             lines.append("")
-            lines.append("最近给这个群找过的资讯（感受一下方向）：")
-            lines.extend(f"- {t}" for t in recent_news[:10])
+            lines.append("最近找过的资讯（只作参考，别围着资讯想）：")
+            lines.extend(f"- {t}" for t in recent_news[:5])
         if recent_ideas:
             lines.append("")
             lines.append("最近已经提过的构想（别再提类似的）：")
@@ -1718,14 +2052,17 @@ class Feeds:
         lines.append(
             "想一个值得这个群试试的点子，想不到合适的就 null。只回 JSON："
             '{"idea": {"title": "我可以……（一句话）", "body": "想法是什么（两三句）",'
-            ' "basis": "为什么适合这个群（引用画像，不点名群友）", "step": "第一步怎么做",'
-            ' "effort": "大概要多少功夫",'
+            ' "basis": "为什么适合这个群（引用画像，不点名群友）",'
             f' "icon": "从下面这些挑一个：{icon_list}",'
             ' "chat_worthy": 适不适合拿到群里聊一聊 true/false,'
             ' "feasibility": {"level": "ok"|"maybe"|"need", "note": "一句话：'
             '能做 / 可能能做 / 需要你提供什么"},'
-            ' "keywords": ["5–10 个关键词，中英文、同义词都放点"]} | null}'
-            "。构想不吹牛：level 只许这三个——ok=我真能做，maybe=可能能做，need=还需要群里提供什么"
+            ' "keywords": ["5–10 个关键词，中英文、同义词都放点"],'
+            ' "items": [{"kind": "task" 或 "goal", "title": "短标题", "desc": "一句话说明"}]} | null}'
+            f"。items 是这个构想包含的项目，最多 {_IDEA_ITEMS_MAX} 个：kind=task 是能一次做完、"
+            "有交付物的事，kind=goal 是要长期盯着、慢慢推进的事。**克制**：最好只给 1 个 task + "
+            "1 个 goal，也可以只有其中之一；确实需要才多给，凑数不如少给。"
+            "构想不吹牛：level 只许这三个——ok=我真能做，maybe=可能能做，need=还需要群里提供什么"
             "（note 里写清楚需要什么）。"
         )
         try:
@@ -1776,19 +2113,19 @@ class Feeds:
                 if len(keywords) >= _KEYWORDS_MAX:
                     break
         keywords_json = json.dumps(keywords, ensure_ascii=False)
+        items = parse_idea_items(idea.get("items"))
+        items_json = json.dumps(items, ensure_ascii=False)
         now = clock.now()
         with self._store.tx() as conn:
             cur = conn.execute(
                 "INSERT INTO ideas (group_id, icon, title, body, basis, step, effort, state,"
-                " requested_by, task_id, up, down, created, updated, feasibility, keywords)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, 'new', NULL, NULL, 0, 0, ?, ?, ?, ?)",
+                " requested_by, task_id, up, down, created, updated, feasibility, keywords, items)"
+                " VALUES (?, ?, ?, ?, ?, '', '', 'new', NULL, NULL, 0, 0, ?, ?, ?, ?, ?)",
                 (
                     gid, icon, title,
                     str(idea.get("body") or "").strip(),
                     str(idea.get("basis") or "").strip(),
-                    str(idea.get("step") or "").strip(),
-                    str(idea.get("effort") or "").strip(),
-                    now, now, feasibility_json, keywords_json,
+                    now, now, feasibility_json, keywords_json, items_json,
                 ),
             )
             idea_id = int(cur.lastrowid or 0)
@@ -1851,7 +2188,12 @@ class Feeds:
     # 构想操作
     # ------------------------------------------------------------------
 
-    def idea_action(self, idea_id: int, op: str, *, by: str) -> dict:
+    def idea_action(self, idea_id: int, op: str, *, by: str, item_nos: Any = None) -> dict:
+        """构想操作：want / do / dismiss。
+
+        do 可以只做勾选的项目：item_nos 是构想项目序号（1 起；空 / 非法 = 全部）。这份选择
+        只随 view 传给 on_start 回调（网页「直接开工」用），不影响返回给网页的 view 本身。
+        """
         if op not in ("want", "do", "dismiss"):
             raise ValueError(f"构想操作只认 want / do / dismiss，收到 {op!r}")
         iid = int(idea_id)
@@ -1887,9 +2229,9 @@ class Feeds:
                 conn.execute("UPDATE ideas SET state='dismissed', updated=? WHERE id=?", (now, iid))
         view = self._idea_one(iid)
         if op == "do" and self.on_start is not None:
-            # 回调抛错不影响状态（只记日志）
+            # 回调抛错不影响状态（只记日志）；勾选的项目序号随 view 复制一份传过去
             try:
-                self.on_start(view)
+                self.on_start({**view, "item_nos": item_nos})
             except Exception:
                 logger.exception("on_start 回调出错（构想 %s）", iid)
         return view
@@ -1953,6 +2295,8 @@ class Feeds:
                 "note": str(b["note"] or ""),
                 "rejected_count": len(rejected_rows),
                 "items": items,
+                # 这一轮工具用量：{searches, pages, kept}；老批次没有 → None
+                "stats": self._batch_stats(int(b["id"])),
             }
             if admin:
                 entry["rejected"] = [self._rejected_row_to_view(r) for r in rejected_rows]
@@ -2143,6 +2487,7 @@ class Feeds:
             "feedback": {"up": int(r["up"] or 0), "down": int(r["down"] or 0)},
             "feasibility": feasibility,
             "keywords": keywords,
+            "items": idea_items_view(_row_get(r, "items")),
         }
 
     def today_count(self, group_id: str) -> int:
@@ -2253,7 +2598,8 @@ async def run_railway_verify(
     """一轮资讯实测（docs/09）：申请 → 逐条派子 agent 在一次性 VM 里测 → 释放。
 
     - 拿不到 VM（acquire → None）→ 这轮不测，items 一个不写 verify，照常入库；
-    - 每条派一次 Workers.run（tools = vm_run/vm_put_file/vm_read_file，max_steps 12），
+    - 每条派一次 Workers.run（tools = vm_run/vm_put_file/vm_read_file，0.4.0 起不限步数，
+      以 submit_result 收尾；时间受 _VERIFY_BUDGET_S 约束），
       brief 写清「只做只读/无副作用的验证」；
     - 实测总时长上限 20 分钟（_VERIFY_BUDGET_S）：到钟就不再派下一条，没测的不留半截；
     - 用完必 release（本地删 key 目录；远端没有销毁命令，只能等它过期）；
@@ -2301,7 +2647,6 @@ async def run_railway_verify(
                     group_id=str(gid),
                     tools=list(_VERIFY_TOOLS),
                     actor="实测子 agent",
-                    max_steps=12,
                 )
             except Exception as e:
                 logger.exception("实测子 agent 崩溃（群 %s 条 %r）", gid, item.get("title", "")[:30])

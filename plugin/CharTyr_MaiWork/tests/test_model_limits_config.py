@@ -58,6 +58,32 @@ class TestLimitSettings:
             models.save(_patch(api_key=SECRET, **{field: bad}))
 
 
+class TestContextWindowOnModelsPage:
+    """「设置 → 模型」也能看/改上下文长度（[models] context_window，默认 128000）。"""
+
+    def test_default_in_public(self, tmp_path) -> None:
+        store, models = _make(tmp_path, {"models": _chat_payload(api_key=SECRET)}, FakeEndpoint({}))
+        assert models.settings().public()["context_window"] == 128000
+
+    def test_config_value_reaches_public(self, tmp_path) -> None:
+        cfg = {"models": _chat_payload(api_key=SECRET, context_window=64000)}
+        store, models = _make(tmp_path, cfg, FakeEndpoint({}))
+        assert models.settings().public()["context_window"] == 64000
+
+    def test_save_and_keep(self, tmp_path) -> None:
+        store, models = _make(tmp_path, {}, FakeEndpoint({}))
+        models.save(_patch(api_key=SECRET, context_window=256000))
+        assert models.settings().context_window == 256000
+        models.save(_patch())
+        assert models.settings().context_window == 256000
+
+    @pytest.mark.parametrize("bad", [1000, 3_000_000, "x"])
+    def test_save_invalid(self, tmp_path, bad) -> None:
+        store, models = _make(tmp_path, {}, FakeEndpoint({}))
+        with pytest.raises(ValueError):
+            models.save(_patch(api_key=SECRET, context_window=bad))
+
+
 class TestListModelsDuringCooldown:
     @pytest.mark.asyncio
     async def test_fails_fast_instead_of_waiting(self, tmp_path, monkeypatch) -> None:

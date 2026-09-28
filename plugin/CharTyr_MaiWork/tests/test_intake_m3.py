@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 import pytest
@@ -428,3 +429,85 @@ async def test_at_with_other_plugin_command_is_ignored() -> None:
     assert _is_command("/pic nsfw 猫")
     assert _is_command("  ！remind 明天")
     assert not _is_command("帮我整理一份清单 /pic 在后面也不算指令")
+
+
+# ----------------------------------------------------------------------
+# 构想引用：认「（构想 #12，要做：1、3）」（2026-10）
+# ----------------------------------------------------------------------
+
+
+class TestIdeaRefWithItems:
+    def test_parse_wanted_forms(self) -> None:
+        from CharTyr_MaiWork.intake import parse_idea_wanted
+        # 没写「要做」→ None（= 全部项目）
+        assert parse_idea_wanted("") is None
+        assert parse_idea_wanted("，") is None
+        assert parse_idea_wanted("，谢谢") is None
+        # 中英文逗号 / 顿号 / 空格 混着都认
+        assert parse_idea_wanted("，要做：1、3") == [1, 3]
+        assert parse_idea_wanted("，要做 1,3") == [1, 3]
+        assert parse_idea_wanted(" 要做: 2 4 ") == [2, 4]
+        assert parse_idea_wanted("，要做：１、３") == [1, 3]   # 全角数字
+        assert parse_idea_wanted("，要做：1、1、2") == [1, 2]  # 去重
+        assert parse_idea_wanted("，要做：0、2") == [2]       # 序号从 1 起
+        # 写了「要做」但一个数字都没有 → None（当全部，别卡住）
+        assert parse_idea_wanted("，要做：全部") is None
+
+    @pytest.mark.asyncio
+    async def test_idea_request_carries_selected_items(self, tmp_path) -> None:
+        from CharTyr_MaiWork.store import Store
+
+        store = Store(tmp_path / "t.db")
+        store.migrate()
+        with store.tx() as conn:
+            conn.execute(
+                "INSERT INTO ideas (group_id, icon, title, body, items, state, created, updated)"
+                " VALUES (?, 'books', '做铝价表', '整理铝价', ?, 'new', 0, 0)",
+                (G1, json.dumps([
+                    {"kind": "task", "title": "抓铝价数据"},
+                    {"kind": "goal", "title": "每周更新铝价表"},
+                    {"kind": "task", "title": "发给群友"},
+                ], ensure_ascii=False)),
+            )
+        approvals, mentions = _FakeApprovals(), _FakeMentions()
+        jev = _FakeJev({"kind": ("prepare", 0.9, 0.9)})
+        intake, signals, spawned = _make(jev=jev, approvals=approvals, mentions=mentions)
+        intake._store = store
+        try:
+            text = "帮我做这个构想：做铝价表 / 整理铝价 /（构想 #1，要做：1、3）"
+            out = await intake.handle(hook_message(is_at=True, text=text))
+            assert out == {"action": "continue"}
+            await _drain(spawned)
+        finally:
+            store.close()
+        assert jev.calls == []            # 认出构想编号就不问 Jev
+        assert len(approvals.created) == 1
+        gid, kw = approvals.created[0]
+        assert gid == G1
+        assert kw["idea_id"] == 1
+        assert kw["items"] == [1, 3]       # 选中的序号存进请求
+        assert kw["source"] == "idea"
+        assert "来自构想 #1" in kw["via"]
+
+    @pytest.mark.asyncio
+    async def test_idea_request_without_wanted_means_all(self, tmp_path) -> None:
+        from CharTyr_MaiWork.store import Store
+
+        store = Store(tmp_path / "t.db")
+        store.migrate()
+        with store.tx() as conn:
+            conn.execute(
+                "INSERT INTO ideas (group_id, icon, title, body, items, state, created, updated)"
+                " VALUES (?, 'bulb', '做个清单', '列条目', '[]', 'new', 0, 0)",
+                (G1,),
+            )
+        approvals = _FakeApprovals()
+        intake, signals, spawned = _make(approvals=approvals, jev=_FakeJev(None))
+        intake._store = store
+        try:
+            await intake.handle(hook_message(is_at=True, text="帮我做这个构想（构想 #1）"))
+            await _drain(spawned)
+        finally:
+            store.close()
+        assert len(approvals.created) == 1
+        assert approvals.created[0][1]["items"] is None   # 没写「要做」= 全部

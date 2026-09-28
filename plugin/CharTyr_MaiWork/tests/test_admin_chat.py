@@ -580,18 +580,16 @@ class TestFailures:
 
     @pytest.mark.asyncio
     async def test_context_window_keeps_last_40(self, svc: _Svc) -> None:
+        """0.4.0 起不再按条数丢：60 条都送（还没到 128000 触发线；压缩由
+        _turn 里估算超线时自动整理，test_admin_chat_compact.py 另测）。"""
         chat, cid = _chat(svc)
         _seed_msgs(svc, cid, 60)
         await chat.send(cid, "最新一句")
         assert await chat.wait_idle(cid)
         _role, messages, _kw = svc.models.calls[0]
         assert messages[0]["role"] == "system"
-        assert len(messages) == 41  # 1 条 system + 最近 40 条
+        assert len(messages) == 62  # 1 条 system + 60 条旧消息 + 新发的这一句（0.4.0 起不按条数丢）
         assert messages[-1] == {"role": "user", "content": "最新一句"}
-        blob = json.dumps(messages, ensure_ascii=False)
-        assert "旧消息0" not in blob
-        assert "旧消息20" not in blob
-        assert "旧消息21" in blob
 
 
 # ---------------------------------------------------------------------------

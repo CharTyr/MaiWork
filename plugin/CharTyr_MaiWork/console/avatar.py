@@ -11,7 +11,7 @@ Bot 头像来源优先级（GET /api/avatar/bot，不用登录，登录页也要
    （Telegram / Discord / …）**没有无需密钥的公开头像地址**——Telegram 要
    Bot API token 调 getUserProfilePhotos，Discord 要 bot token——拿不到 token
    就没法代理，只能跳过（代码注释在此，新增平台时再评）。
-4. 自带默认图 /static/assets/bot.jpg（不经过本模块，服务端给 404 让前端回落）。
+4. 默认图 /static/assets/maimai.png（MaiBot WebUI 的图标 maimai.ico 转成的 png）（不经过本模块，服务端给 404 让前端回落）。
 
 群头像（GET /api/avatar/g/<token>）：
 - token = HMAC-SHA256(console_secret, "avatar-g|<群号>") 前 16 位十六进制；只认服务群。

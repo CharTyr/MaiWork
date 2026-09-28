@@ -425,8 +425,8 @@ class FakeFeeds:
             raise KeyError(item_id)
         return dict(self.feedback_result)
 
-    def idea_action(self, idea_id: int, op: str, *, by: str = "") -> Dict[str, Any]:
-        self.idea_calls.append((int(idea_id), str(op), str(by)))
+    def idea_action(self, idea_id: int, op: str, *, by: str = "", item_nos: Any = None) -> Dict[str, Any]:
+        self.idea_calls.append((int(idea_id), str(op), str(by), item_nos))
         if int(idea_id) in self.missing_idea:
             raise KeyError(idea_id)
         out = dict(self.idea_result)

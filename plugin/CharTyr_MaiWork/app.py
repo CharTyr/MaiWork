@@ -104,10 +104,13 @@ class MaiWorkApp:
         self.topics: Any = None
         self.feeds: Any = None
         self.scheduler: Any = None
+        self.goal_proposer: Any = None
         # M3 模块（docs/07 §11）
         self.tasks: Any = None
         self.goals: Any = None
         self.approvals: Any = None
+        # 派活自动审核（auto_review.py）：低风险轻活由主模型判断后自动批
+        self.auto_review: Any = None
         self.env: Any = None
         # 一次性 VM 执行环境（environments/railway.py；railway=false / 模块没就位 → None）
         self.railway: Any = None
@@ -306,7 +309,7 @@ class MaiWorkApp:
                 register_remember_tool(self.tools, self.identity)
             except Exception:
                 logger.exception("注册 remember 工具出错，主模型这次没有记忆工具用")
-        self.workers = Workers(self.models, self.tools, identity=self.identity, tasks=self.tasks)
+        self.workers = Workers(self.models, self.tools, identity=self.identity, tasks=self.tasks, get_settings=self.get_settings)
         self.mentions = Mentions(self.store, self.get_settings)
         self.pushes = Pushes(self.store, self.get_settings)
         self.topics = Topics(
@@ -334,6 +337,12 @@ class MaiWorkApp:
         self.tasks = Tasks(self.store, self.get_settings, self.tools)
         self.goals = Goals(self.store, self.get_settings)
         self.approvals = Approvals(self.store, self.get_settings, self.tasks, self.goals)
+        # 主动提目标（GoalProposer；[goals] propose 默认开）：到点由后台循环调一次
+        self.goal_proposer = self._make_goal_proposer()
+        # 派活自动审核（auto_review.py）：Approvals 每落一条待批请求就回调一次，
+        # 这里把判断 spawn 到后台（调模型是慢活，绝不卡住收消息钩子）
+        self.auto_review = self._make_auto_review()
+        self._wire_auto_review()
         self.env = self._make_env()
         try:
             register_exec_tools(
@@ -400,6 +409,15 @@ class MaiWorkApp:
             logger.info("发件箱恢复：%d 条「发送中」标成不确定，不自动重发", recovered)
         self.delivery = Delivery(self.store, self.outbox, self.tasks)
         self.coordinator = self._make_coordinator()
+        # 按群的管理员（group_admins.py）：密码哈希 / 本群管理员名单只进数据库，
+        # 不进 config.toml。/mw 批准 要用它，所以建在 commands 之前。
+        try:
+            from .group_admins import GroupAdmins
+
+            self.group_admins = GroupAdmins(self.store, get_settings=self.get_settings)
+        except Exception:
+            logger.exception("建群管理员存储出错，群管理员这次不可用")
+            self.group_admins = None
         self.commands = self._make_commands()
         # 3.7 回收上次配置里删掉、库里残留的群数据（就地标记，不删）
         try:
@@ -617,6 +635,8 @@ class MaiWorkApp:
         self.tasks = None
         self.goals = None
         self.approvals = None
+        self.auto_review = None
+        self.goal_proposer = None
         self.env = None
         self.railway = None
         self.outbox = None
@@ -624,6 +644,7 @@ class MaiWorkApp:
         self.herenow = None
         self.coordinator = None
         self.commands = None
+        self.group_admins = None
         self.personal = None
         self._running_tasks.clear()
         self.profiles = None
@@ -1092,6 +1113,59 @@ class MaiWorkApp:
             logger.exception("建 Feeds 出错，资讯/构想这次跳过")
             return None
 
+    def _make_goal_proposer(self) -> Any:
+        """GoalProposer（主动提目标）；模块没就位 / 构造失败就 None，这块功能跳过。"""
+        try:
+            from .goal_proposal import GoalProposer
+
+            return GoalProposer(
+                self.store, self.models, self.goals, self.approvals, self.get_settings,
+                profiles=self.profiles, identity=self.identity,
+            )
+        except Exception:
+            logger.exception("建 GoalProposer 出错，主动提目标这次跳过")
+            return None
+
+    def _make_auto_review(self) -> Any:
+        """自动审核（auto_review.py）；模块没就位 / 构造失败就 None，这块功能跳过。
+
+        开工入口复用 self.spawn_run_task（`/mw 批准` 和网页批准也是这条）。
+        """
+        try:
+            from .auto_review import AutoReviewer
+
+            return AutoReviewer(
+                self.store, self.models, self.approvals, self.get_settings,
+                run_task_starter=self.spawn_run_task,
+            )
+        except Exception:
+            logger.exception("建 AutoReviewer 出错，派活自动审核这次跳过")
+            return None
+
+    def _wire_auto_review(self) -> None:
+        """把「刚记下一条待批请求」的回调挂到 Approvals 上。
+
+        回调只登记（spawn 后台协程），所以收消息钩子永远不会被审核卡住。
+        """
+        reviewer = self.auto_review
+        approvals = self.approvals
+        if reviewer is None or approvals is None:
+            return
+        try:
+            approvals.set_review_hook(self._spawn_auto_review)
+        except Exception:
+            logger.exception("挂自动审核回调出错，派活自动审核这次不生效")
+
+    def _spawn_auto_review(self, request_id: str, group_id: str) -> None:
+        """Approvals.create 落了 pending 之后的回调：后台审一次（失败只记日志）。"""
+        reviewer = self.auto_review
+        if reviewer is None:
+            return
+        rid = str(request_id or "")
+        if not rid:
+            return
+        self._spawn_bg(reviewer.review(rid, group_id=str(group_id or "")), name=f"maiwork-review-{rid}")
+
     def _make_identity(self) -> Any:
         """identity.py（身份与工作记忆）；没就位 / 构造失败就 None，各注入点自动跳过。"""
         try:
@@ -1227,6 +1301,7 @@ class MaiWorkApp:
                 coordinator=self.coordinator,
                 run_task_starter=self.spawn_run_task,
                 run_task_stopper=self.cancel_task_run,
+                group_admins=self.group_admins,
             )
         except Exception:
             logger.exception("建 Commands 出错，/mw 指令这次跳过")
@@ -1555,9 +1630,13 @@ class MaiWorkApp:
     # ------------------------------------------------------------------
 
     def _on_idea_started(self, view: dict) -> None:
-        """构想「做这个」：管理员直接批准 → 落成任务（queued）并开工。
+        """构想「做这个」：管理员直接批准 → 落成任务 / agent 目标并开工。
 
-        feeds.idea_action 同步调用；任何异常只记日志，不影响构想状态变更。
+        2026-10：构想带 items 时按项目逐个落（kind=goal 的要 models 就位才建 agent 目标；
+        没有 goals 模块时整条按老逻辑建一个任务）。网页「直接开工」可以只勾选部分项目
+        （view["item_nos"]，1 起序号；越界 / 非法 / 一个都对不上 → 按全部处理，口径复用
+        approvals.picked_idea_items）。feeds.idea_action 同步调用；任何异常只记日志，
+        不影响构想状态变更。
         """
         try:
             if self.tasks is None or self.store is None or not isinstance(view, dict):
@@ -1570,24 +1649,77 @@ class MaiWorkApp:
                 logger.warning("构想 #%s 找不到群，没落成任务", idea_id)
                 return
             title = str(view.get("title") or "构想")
-            req = self._idea_request_text(view)
-            task_id = self.tasks.create(
-                gid,
-                title=title,
-                req=req,
-                criteria=[],
-                source="idea",
-                requester_id="",
-                requester_name=str(view.get("requested_by") or "管理员"),
-                icon=str(view.get("icon") or "package"),
-                status="queued",
-            )
-            with self.store.tx() as conn:
-                conn.execute("UPDATE ideas SET task_id=? WHERE id=?", (str(task_id), int(idea_id)))
-            logger.info("构想 #%s「做这个」落成任务 %s（群 %s）", idea_id, task_id, gid)
-            self.spawn_run_task(task_id)
+            requester = str(view.get("requested_by") or "管理员")
+            items = self._picked_idea_items(view)
+            task_ids: list[str] = []
+            if items and self.goals is not None:
+                ctx = f"来自构想 #{idea_id}《{title}》：{str(view.get('body') or '').strip()}".strip("：")
+                for it in items:
+                    body = self._idea_item_req(it, ctx)
+                    if str(it.get("kind")) == "goal":
+                        self.goals.create_agent(
+                            gid,
+                            title=str(it["title"]),
+                            body=body,
+                            criteria=[],
+                            by_text=f"{requester} 直接开工 · 来自构想",
+                            icon=str(view.get("icon") or "bullseye"),
+                        )
+                    else:
+                        task_ids.append(
+                            self.tasks.create(
+                                gid,
+                                title=str(it["title"]),
+                                req=body,
+                                criteria=[],
+                                source="idea",
+                                requester_id="",
+                                requester_name=requester,
+                                icon=str(view.get("icon") or "package"),
+                                status="queued",
+                            )
+                        )
+            else:
+                task_ids.append(
+                    self.tasks.create(
+                        gid,
+                        title=title,
+                        req=self._idea_request_text(view),
+                        criteria=[],
+                        source="idea",
+                        requester_id="",
+                        requester_name=requester,
+                        icon=str(view.get("icon") or "package"),
+                        status="queued",
+                    )
+                )
+            task_id = task_ids[0] if task_ids else None
+            if task_id is not None:
+                with self.store.tx() as conn:
+                    conn.execute(
+                        "UPDATE ideas SET task_id=? WHERE id=?", (str(task_id), int(idea_id))
+                    )
+            logger.info("构想 #%s「做这个」落成 %s 个任务（群 %s）", idea_id, len(task_ids), gid)
+            for one in task_ids:
+                self.spawn_run_task(one)
         except Exception:
             logger.exception("构想「做这个」落地任务出错（view=%s）", view)
+
+    @staticmethod
+    def _picked_idea_items(view: dict) -> list[dict]:
+        """构想 view 里这次要落的项目：view["item_nos"] 勾选的（1 起序号）。
+
+        口径复用 approvals.picked_idea_items：空 / 非法序号 / 一个都对不上 → 全部项目
+        （写错序号不该变成什么都不做）；没有 items 的老构想 → []，外层按老逻辑建一个。
+        """
+        from .approvals import Approvals, _parse_item_nos
+
+        return Approvals._picked_idea_items(view, _parse_item_nos(view.get("item_nos")))
+
+    @staticmethod
+    def _idea_item_req(item: dict, ctx: str) -> str:
+        desc = str(item.get("desc") or "").strip()
+        return f"{desc}\n\n{ctx}".strip() if desc else ctx
 
     def on_idea_want(self, view: dict, group_id: str) -> None:
         """构想「想要这个」（网页 want 路由在 idea_action 之后调）：落成待批请求。
@@ -1612,6 +1744,7 @@ class MaiWorkApp:
                 requester_name=str(view.get("requested_by") or "群友（网页）"),
                 idea_id=idea_id,
                 icon=str(view.get("icon") or "magnifier"),
+                source="idea",
             )
             if not isinstance(res, dict):
                 return
@@ -1643,6 +1776,19 @@ class MaiWorkApp:
             parts.append(f"依据：{basis}")
         if step:
             parts.append(f"第一步：{step}")
+        items = view.get("items")
+        if isinstance(items, list) and items:
+            lines = ["包含的项目（批准后逐个开工）："]
+            for i, it in enumerate(items):
+                if not isinstance(it, dict):
+                    continue
+                no = it.get("no") or (i + 1)
+                kind_zh = "目标" if str(it.get("kind") or "") == "goal" else "任务"
+                desc = str(it.get("desc") or "").strip()
+                title = str(it.get("title") or "").strip()
+                lines.append(f"{no}. （{kind_zh}）{title}" + (f"：{desc}" if desc else ""))
+            if len(lines) > 1:
+                parts.append("\n".join(lines))
         return "\n".join(p for p in parts if p).strip() or str(view.get("title") or "构想")
 
     def _group_of_idea(self, idea_id: int) -> str:
@@ -2114,7 +2260,7 @@ class MaiWorkApp:
 
     async def _schedule_round(self, gid: str, now: float, sig: Any) -> None:
         """一个群的排程巡检：scheduler.due 到点的事 → spawn 长活。"""
-        if self.scheduler is None or self.feeds is None:
+        if self.scheduler is None:
             return
         last_msg_ts = float(getattr(sig, "last_ts", 0.0) or 0.0) if sig is not None else 0.0
         if last_msg_ts <= 0.0:
@@ -2128,13 +2274,28 @@ class MaiWorkApp:
         due = self.scheduler.due(gid, now, last_msg_ts=last_msg_ts)
         for job in due or []:
             if job == "news":
+                if self.feeds is None:
+                    continue
                 if (gid, "news_manual") in self._running_jobs:
                     continue  # 手动的那批还在跑，这次先不开（下一轮再看）
                 self._spawn_long_job(gid, "news", self.feeds.prepare_news)
             elif job == "idea":
+                if self.feeds is None:
+                    continue
                 if (gid, "idea_manual") in self._running_jobs:
                     continue  # 手动点的那个还在跑，这次先不开（下一轮再看）
                 self._spawn_long_job(gid, "idea", self.feeds.make_idea)
+            elif job == "goal":
+                if self.goal_proposer is None:
+                    continue
+                self._spawn_long_job(gid, "goal", self._propose_goal_round)
+
+    async def _propose_goal_round(self, gid: str) -> None:
+        """主动提目标一轮：开关 / 非服务群 / 每日上限都在 GoalProposer 里兜住。"""
+        proposer = self.goal_proposer
+        if proposer is None:
+            return
+        await proposer.propose(gid)
 
     def _topics_effective_on(self) -> bool:
         """有效设置里开话题开没开（网页规则覆盖后）。"""
@@ -2217,9 +2378,9 @@ class MaiWorkApp:
             except Exception:
                 logger.exception("群 %s 的 %s 长活出错了", gid, kind)
             finally:
-                # scheduler 管的事（news/idea）不管成功失败都算做过，错过不补（docs/07 §10.5）；
+                # scheduler 管的事（news/idea/goal）不管成功失败都算做过，错过不补（docs/07 §10.5）；
                 # 画像提炼（profile）不在 scheduler 的词表里，不汇报
-                if kind in ("news", "idea"):
+                if kind in ("news", "idea", "goal"):
                     try:
                         if self.scheduler is not None:
                             self.scheduler.done(gid, kind, _now())

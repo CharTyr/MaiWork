@@ -51,6 +51,25 @@ CATEGORY_NAMES = {
 Resolver = Callable[[str], list[str]]
 
 
+
+def _maybe_json(text: str) -> tuple[Any, bool]:
+    """字符串看着像 JSON（去掉 ```json 围栏后以 { 或 [ 开头）就解析。
+
+    返回 (值, 解析失败?)；不像 JSON 的原样返回、不算失败。
+    """
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        if t[:4].lower() == "json":
+            t = t[4:]
+        t = t.strip()
+    if not t or t[0] not in "{[":
+        return text, False
+    try:
+        return json.loads(t), False
+    except ValueError:
+        return text, True
+
 def _default_resolver(host: str) -> list[str]:
     """默认 DNS 解析：返回该主机名的所有 A/AAAA 地址字符串。"""
     infos = socket.getaddrinfo(host, None)
@@ -219,35 +238,40 @@ def _extract_og_image(html: str, final_url: str) -> str:
 
 async def _fetch_page_text(
     url: str, *, transport: Any, resolver: Resolver
-) -> tuple[bool, str, str]:
-    """跟随跳转抓页面，返回 (ok, 文本或错误原因, og:image 或 "")。错误文本面向子 agent（中文）。"""
+) -> tuple[bool, str, str, str]:
+    """跟随跳转抓页面，返回 (ok, 文本或错误原因, og:image 或 "", 最终地址)。
+
+    最终地址 = 跟随跳转后真正取到正文的那个 URL（没跳转就等于请求地址）；失败时是 ""。
+    交付里引用的常是跳转后的长链，验收引用核对要把它也算作「打开过」。
+    错误文本面向子 agent（中文）。
+    """
     current = str(url or "").strip()
     for hop in range(_MAX_REDIRECTS + 1):
         parsed = urlparse(current)
         if parsed.scheme not in ("http", "https"):
-            return False, f"只支持 http/https 链接，{parsed.scheme or '(没有协议)'} 不支持", ""
+            return False, f"只支持 http/https 链接，{parsed.scheme or '(没有协议)'} 不支持", "", ""
         if not parsed.hostname:
-            return False, "链接里没有主机名，打不开", ""
+            return False, "链接里没有主机名，打不开", "", ""
         if _host_is_forbidden(parsed.hostname, resolver):
-            return False, f"{parsed.hostname} 解析到内网/本机地址，不允许打开", ""
+            return False, f"{parsed.hostname} 解析到内网/本机地址，不允许打开", "", ""
         try:
             async with httpx.AsyncClient(transport=transport, timeout=20.0) as client:
                 resp = await client.get(current, follow_redirects=False)
         except httpx.HTTPError as e:
-            return False, f"打开页面失败：{e}", ""
+            return False, f"打开页面失败：{e}", "", ""
         if resp.status_code in (301, 302, 303, 307, 308):
             if hop >= _MAX_REDIRECTS:
-                return False, f"跳转超过 {_MAX_REDIRECTS} 次，放弃", ""
+                return False, f"跳转超过 {_MAX_REDIRECTS} 次，放弃", "", ""
             location = resp.headers.get("location") or ""
             if not location:
-                return False, f"页面返回 {resp.status_code} 但没给跳转到哪", ""
+                return False, f"页面返回 {resp.status_code} 但没给跳转到哪", "", ""
             current = urljoin(current, location)
             continue
         if resp.status_code != 200:
-            return False, f"页面返回 {resp.status_code}", ""
+            return False, f"页面返回 {resp.status_code}", "", ""
         ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
         if ctype and not any(ctype.startswith(p) for p in _ALLOWED_PREFIXES):
-            return False, f"页面类型是 {ctype}，只支持网页/纯文本/JSON", ""
+            return False, f"页面类型是 {ctype}，只支持网页/纯文本/JSON", "", ""
         raw = resp.content[: _MAX_BODY_BYTES + 1]
         if len(raw) > _MAX_BODY_BYTES:
             raw = raw[:_MAX_BODY_BYTES]
@@ -259,8 +283,28 @@ async def _fetch_page_text(
             text = (f"《{title}》\n{body}" if title else body) or text
         if len(text) > _TEXT_MAX_CHARS:
             text = text[:_TEXT_MAX_CHARS] + " …（后面还有，已截断）"
-        return True, text, image_url
-    return False, "跳转次数太多，放弃", ""
+        return True, text, image_url, current
+    return False, "跳转次数太多，放弃", "", ""
+
+
+# ----------------------------------------------------------------------
+# 最终地址（验收引用核对要认它；不改 tool_calls 表结构，写在 output 摘要里）
+# ----------------------------------------------------------------------
+
+FINAL_URL_LABEL = "最终地址"
+# 到「）」/ 空白为止（标记是我们自己写的「（最终地址：<url>）」）
+_FINAL_URL_RE = re.compile(FINAL_URL_LABEL + r"[:：]\s*([^\s）]+)")
+
+
+def final_url_from_summary(text: str) -> str:
+    """从 tool_calls 的 output 摘要里取「最终地址」；没有 / 解析不出 → ""。"""
+    m = _FINAL_URL_RE.search(str(text or ""))
+    return m.group(1) if m else ""
+
+
+def final_url_note(url: str) -> str:
+    """可解析的最终地址标记（fetch_page 的 tool_calls output 摘要 + 正文提示都用它）。"""
+    return f"（{FINAL_URL_LABEL}：{url}）"
 
 
 # ----------------------------------------------------------------------
@@ -318,7 +362,9 @@ def register_builtin(
         url = str(args.get("url") or "").strip()
         if not url:
             return ToolResult(ok=False, output="", error="url 不能为空")
-        ok, text, image_url = await _fetch_page_text(url, transport=http_transport, resolver=resolve)
+        ok, text, image_url, final_url = await _fetch_page_text(
+            url, transport=http_transport, resolver=resolve
+        )
         if not ok:
             # 普通抓取被网站拦了（403 等）→ 改用搜索服务的正文抽取（Tavily extract）再试一次。
             # 内网 / 非法地址（安全拒绝）绝不走这条路。线上实测约三分之一原文页 403。
@@ -333,13 +379,20 @@ def register_builtin(
                 if extracted:
                     host = urlparse(url).hostname or ""
                     return ToolResult(ok=True, output=extracted[:20000] + "\n\n（网站拦了普通抓取，这是经搜索服务抽取的正文）",
-                                      data={"url": url, "host": host, "image_url": "", "via": "extract"})
+                                      data={"url": url, "final_url": url, "host": host,
+                                            "image_url": "", "via": "extract"})
             return ToolResult(ok=False, output="", error=text)
         host = urlparse(url).hostname or ""
         if image_url:
             # 拿到封面图就告诉子 agent 一声（交回候选时带 image_url）
             text += f"\n\n（这页有封面图：{image_url}）"
-        return ToolResult(ok=True, output=text, data={"url": url, "host": host, "image_url": image_url})
+        if final_url and final_url != url:
+            # 跳转后的最终地址也告诉子 agent：交付里常引用它，验收引用核对要认
+            text += f"\n\n（这个链接跳转到了：{final_url}）"
+        return ToolResult(
+            ok=True, output=text,
+            data={"url": url, "final_url": final_url, "host": host, "image_url": image_url},
+        )
 
     async def read_profile(ctx: ToolContext, args: dict) -> ToolResult:
         gid = str(args.get("group_id") or ctx.group_id or "").strip()
@@ -370,7 +423,21 @@ def register_builtin(
         summary = str(args.get("summary") or "").strip()
         if not summary:
             return ToolResult(ok=False, output="", error="summary 不能为空，给一句「干完了什么」")
+        # 有的模型（线上实测 step-5-preview）把 data / evidence 写成 JSON 字符串交回：
+        # 看着像 JSON 就解析成对象；解析不出来（多半被截断）→ 交回失败，让模型改成对象重交。
+        data = args.get("data")
+        if isinstance(data, str):
+            parsed, bad = _maybe_json(data)
+            if bad:
+                return ToolResult(
+                    ok=False, output="",
+                    error="data 要直接给 JSON 对象，不要写成字符串；这次的字符串也解析不出来（可能太长被截断了），请精简后重新调用 submit_result",
+                )
+            data = parsed
         evidence = args.get("evidence")
+        if isinstance(evidence, str):
+            parsed_ev, bad_ev = _maybe_json(evidence)
+            evidence = parsed_ev if not bad_ev else evidence
         if evidence is None:
             evidence_list: list[str] = []
         elif isinstance(evidence, list):
@@ -380,7 +447,7 @@ def register_builtin(
         return ToolResult(
             ok=True,
             output=f"已交回：{summary}",
-            data={"summary": summary, "data": args.get("data"), "evidence": evidence_list},
+            data={"summary": summary, "data": data, "evidence": evidence_list},
         )
 
     tools.register(
@@ -418,7 +485,16 @@ def register_builtin(
             handler=fetch_page,
             summarize=lambda args, res: (
                 str(args.get("url", "")),
-                ("取到正文 %d 字" % len(res.output)) if res.ok else (res.error or "打不开"),
+                (
+                    ("取到正文 %d 字" % len(res.output))
+                    + (
+                        final_url_note(str((res.data or {}).get("final_url") or ""))
+                        if (res.data or {}).get("final_url")
+                        else ""
+                    )
+                )
+                if res.ok
+                else (res.error or "打不开"),
             ),
             timeout_s=30.0,
         )

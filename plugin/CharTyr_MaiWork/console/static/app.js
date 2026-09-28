@@ -45,6 +45,7 @@
   const TONES = ["#FFD8A8", "#D0BFFF", "#A5D8FF", "#B2F2BB", "#FFC9C9", "#FFEC99", "#C3FAE8", "#EEBEFA"];
 
   const state = {
+    ga: {}, // 群号 → {password_set, accounts}（设置 → 群链接 里的群管理员）
     me: null, // {role, group, bot, now}
     groups: [],
     view: null, // 当前群的 GroupView
@@ -69,6 +70,9 @@
     extEdit: null, // {kind: "mcp"|"skill", name: null|string, data}
   };
   const admin = () => state.me && state.me.role === "admin";
+  // 群管理员：能管自己那一个群（批准、画像、资讯偏好…），看不到全局设置；个人画像只读
+  const isGA = () => !!(state.me && state.me.role === "group_admin");
+  const gadmin = () => admin() || isGA();
 
   /* ───────────── 小工具 ───────────── */
 
@@ -188,7 +192,7 @@
 
   async function api(method, path, body) {
     const headers = { Accept: "application/json" };
-    if (state.ref && !admin()) headers["X-MW-Group"] = state.ref;
+    if (state.ref && !gadmin()) headers["X-MW-Group"] = state.ref;
     if (body !== undefined) headers["Content-Type"] = "application/json";
     let res;
     try {
@@ -212,7 +216,7 @@
 
   const grp = () => state.groups.find((x) => x.id === state.g) || null;
   const gview = () => (state.view && state.view.id === state.g ? state.view : null);
-  const groupRef = (g) => (admin() ? g.id : state.ref);
+  const groupRef = (g) => (gadmin() ? g.id : state.ref);
   const gname = (g) => (g && (g.name || `群 ${g.id}`)) || "";
   // 太长的名字：平时省略号，鼠标放上去 / 手指按住时滚动显示全名（滚动距离运行时量）
   const mq = (text) => `<span class="mq" title="${esc(text)}"><span class="mq-in">${esc(text)}</span></span>`;
@@ -339,7 +343,7 @@
   /* ───────────── 各页面 ───────────── */
 
   function emptyState(iconName, title, text) {
-    return `<div class="empty enter">${ico(iconName)}<b>${esc(title)}</b><span>${esc(text)}</span></div>`;
+    return `<div class="empty enter">${ico(iconName)}<b>${esc(title)}</b>${text ? `<span>${esc(text)}</span>` : ""}</div>`;
   }
   const loading = () => `<div class="loading"><span></span><span></span><span></span></div>`;
 
@@ -389,9 +393,11 @@
     const refs = (it.refs || []).slice(0, 3);
     const aud = it.audience || [];
     if (!reason && !refs.length && !aud.length) return "";
+    // 默认收起，点标题展开；展开状态记在内存里，轮询重画后不会自己合上
+    const open = !!reasonOpen[it.id];
     return `
-      <div class="reason">
-        <div class="reason-h">我发这条的原因</div>
+      <details class="reason" data-rid="${esc(it.id)}"${open ? " open" : ""}>
+        <summary class="reason-h">我发这条的原因</summary>
         ${reason ? `<p class="reason-t">${esc(reason)}</p>` : ""}
         ${
           refs.length
@@ -402,8 +408,17 @@
         }
         ${aud.length ? `<div class="aud">可能用得上：${aud.map((n) => `<b>${esc(n)}</b>`).join("、")}</div>` : ""}
         ${it.profile_ref ? `<div class="aud">对上了群画像里的「${esc(it.profile_ref)}」</div>` : ""}
-      </div>`;
+      </details>`;
   }
+  const reasonOpen = {};
+  document.addEventListener(
+    "toggle",
+    (e) => {
+      const d = e.target;
+      if (d && d.matches && d.matches("details.reason")) reasonOpen[d.dataset.rid] = d.open;
+    },
+    true
+  );
 
   const VOTE_KEY = "mw-chatvote";
   const myVotes = () => {
@@ -457,6 +472,13 @@
     return `${when_}${it.created_ts ? dayWord(it.created_ts) + "找到" : "核对过还适用"}`;
   }
 
+  // 每轮找资讯的账：有统计就说搜了几次、看了几篇、收了几条；老数据没统计按旧说法
+  function batchStats(batch) {
+    const st = batch.stats;
+    if (st && typeof st === "object") return `搜了 ${st.searches || 0} 次，看了 ${st.pages || 0} 篇，收了 ${st.kept || 0} 条`;
+    return `找了 ${batch.found || 0} 条，留下 ${batch.kept || 0} 条`;
+  }
+
   function rejectedBlock(batch) {
     const list = batch.rejected || [];
     if (!admin() || !list.length) return "";
@@ -487,12 +509,12 @@
 
   function prefBox(v) {
     const pref = (v && v.feeds_pref) || "";
-    if (!pref && !admin()) return "";
-    return `<div class="pref">${ico("pushpin", "")}<div class="pref-t">${pref ? `<b>这个群想看：</b>${esc(pref)}` : `还没写这个群想看什么。写一句，MaiWork 每轮备料都会照着找。`}</div>${admin() ? `<button class="btn small" data-act="pref-edit">${pref ? "改" : "写一句"}</button>` : ""}</div>`;
+    if (!pref && !gadmin()) return "";
+    return `<div class="pref">${ico("pushpin", "")}<div class="pref-t">${pref ? `<b>这个群想看：</b>${esc(pref)}` : `想看什么、不想看什么，可以写一句`}</div>${gadmin() ? `<button class="btn small" data-act="pref-edit">${pref ? "改" : "写一句"}</button>` : ""}</div>`;
   }
 
   function newsRunBtn() {
-    if (!admin()) return "";
+    if (!gadmin()) return "";
     const running = state.newsRunning === state.g;
     return `<button class="btn small news-run" data-act="news-run" ${running ? "disabled" : ""}>${running ? "在备料…" : "现在就备一批"}</button>`;
   }
@@ -501,23 +523,23 @@
     const t = state.newsTab || "news";
     return prefBox(gview()) + `<div class="news-bar"><div class="seg" role="tablist">
       <button role="tab" data-act="news-tab" data-t="news" aria-selected="${t === "news"}">资讯</button>
-      <button role="tab" data-act="news-tab" data-t="guides" aria-selected="${t === "guides"}">好文</button>
+      <button role="tab" data-act="news-tab" data-t="guides" aria-selected="${t === "guides"}">文章</button>
     </div>${newsRunBtn()}</div>`;
   }
 
   function viewNews(g, v) {
     if (g.fresh) {
-      return `<h1 class="h-page">资讯</h1>` + emptyState("seedling", "还在熟悉这个群", "群画像成形之前不出资讯，免得乱推。");
+      return `<h1 class="h-page">资讯</h1>` + emptyState("seedling", "还在熟悉这个群", "熟悉之后就开始找资讯。");
     }
     if ((state.newsTab || "news") === "guides") {
       const guides = (v && v.guides) || [];
-      let html = newsSwitch() + `<h1 class="h-page">好文</h1><p class="h-meta">教程、好文章、好工具。不看新不新，只看现在还适不适用</p>`;
-      if (!guides.length) return html + emptyState("books", "还没有好文", "备料时会顺便找对这个群有用的教程和文章。");
+      let html = newsSwitch() + `<h1 class="h-page">文章</h1><p class="h-meta">教程、好文章和好用的工具</p>`;
+      if (!guides.length) return html + emptyState("books", "还没有文章", "");
       return html + guides.map((it, k) => newsItem(it, k, true)).join("");
     }
     const news = (v && v.news) || [];
     if (!news.length) {
-      return newsSwitch() + `<h1 class="h-page">资讯</h1><p class="h-meta">每天几个时段按群画像去找，没有值得看的就不出</p>` + emptyState("newspaper", "还没有资讯", "下一批备料时会按这个群在聊的去找。");
+      return newsSwitch() + `<h1 class="h-page">资讯</h1>` + emptyState("newspaper", "还没有资讯", "");
     }
     let i = 0;
     return (
@@ -525,7 +547,7 @@
       news
         .map((batch, b) => {
           const rc = batch.rejected_count || 0;
-          const head = `<h1 class="h-page" ${b ? 'style="margin-top:46px"' : ""}>${esc(slotName(batch.slot_ts))}</h1><p class="h-meta">${hhmm(batch.slot_ts)} 备料 · 找了 ${batch.found || 0} 条，留下 ${batch.kept || 0} 条${rc ? `，筛掉 ${rc} 条` : ""}</p>`;
+          const head = `<h1 class="h-page" ${b ? 'style="margin-top:46px"' : ""}>${esc(slotName(batch.slot_ts))}</h1><p class="h-meta">${hhmm(batch.slot_ts)} 备料 · ${batchStats(batch)}${rc ? `，筛掉 ${rc} 条` : ""}</p>`;
           if (batch.skipped || !(batch.items || []).length) {
             return head + `<div class="skipped enter" style="--i:${i++}">${ico("teacup")}<span>${esc(batch.note || "这一批没有值得看的，跳过了。")}</span></div>` + rejectedBlock(batch);
           }
@@ -540,9 +562,9 @@
 
   function viewIdeas(g, v) {
     const ideas = (v && v.ideas) || [];
-    let html = `<h1 class="h-page">构想</h1><p class="h-meta">按这个群最近在聊的、在做的想出来的。点开一条，复制要求，到群里 @MaiBot 发出去，MaiWork 就会接下来${admin() ? "" : "（管理员批准后开工）"}</p>`;
+    let html = `<h1 class="h-page">构想</h1><p class="h-meta">看中哪个，复制要求到群里 @MaiBot 就能开工</p>`;
     if (!ideas.length) {
-      return html + emptyState("bulb", "还没有构想", g.fresh ? "等群画像成形后，MaiWork 会开始提想法。" : "最近没有想到适合这个群的点子，不硬凑。");
+      return html + emptyState("bulb", "还没有构想", g.fresh ? "熟悉这个群之后就开始提想法。" : "");
     }
     html += ideas
       .map((it, k) => {
@@ -571,35 +593,64 @@
   }
 
   // 复制出去的要求：到群里 @MaiBot 粘贴发送；末尾的「构想 #id」让 MaiWork 认出是哪条构想
+  // 构想里「包含的项目」默认全选；state.ideaOff[构想id] 记被取消勾选的序号
+  function ideaItems(it) {
+    return Array.isArray(it.items) ? it.items : [];
+  }
+  function ideaPicked(it) {
+    const off = (state.ideaOff && state.ideaOff[it.id]) || [];
+    return ideaItems(it).filter((x) => !off.includes(x.no));
+  }
+
   function ideaAsk(it) {
     const lines = [`帮我做这个构想：${it.title}`];
     if (it.body) lines.push(it.body);
-    if (it.step) lines.push(`第一步：${it.step}`);
-    lines.push(`（构想 #${it.id}）`);
+    const all = ideaItems(it);
+    const picked = ideaPicked(it);
+    picked.forEach((x) => lines.push(`${x.no}. ${x.title}`));
+    const some = all.length && picked.length < all.length;
+    lines.push(some ? `（构想 #${it.id}，要做：${picked.map((x) => x.no).join("、")}）` : `（构想 #${it.id}）`);
     return lines.join("\n");
+  }
+
+  function ideaItemsBlock(it, open) {
+    const items = ideaItems(it);
+    if (!items.length) return "";
+    const picked = ideaPicked(it).map((x) => x.no);
+    const row = (x) => {
+      const on = picked.includes(x.no);
+      const kind = x.kind === "goal" ? "目标" : "任务";
+      const inner = `
+          <span class="ii-mark">${open ? (on ? SVG.check : "") : ""}</span>
+          <span class="ii-text"><span class="ii-title">${esc(x.title)}<span class="ii-kind">${kind}</span></span>${x.desc ? `<span class="ii-desc">${esc(x.desc)}</span>` : ""}</span>`;
+      return open
+        ? `<button class="ii-row${on ? " on" : ""}" data-act="idea-item" data-id="${it.id}" data-no="${x.no}" aria-pressed="${on}">${inner}</button>`
+        : `<div class="ii-row static">${inner}</div>`;
+    };
+    return `<div class="dt-sec idea-items"><div class="dt-label">包含的项目${open && items.length > 1 ? ` <small>${picked.length}/${items.length}</small>` : ""}</div>${items.map(row).join("")}</div>`;
   }
 
   function ideaDetail(it) {
     const st = IDEA_STATE[it.state] || "新想法";
     const f = it.feasibility || {};
     const rows = [];
-    if (it.step) rows.push(["第一步", it.step]);
-    if (it.effort) rows.push(["要多久", it.effort]);
     if (f.note) rows.push([f.level === "ok" ? "能做" : f.level === "need" ? "需要帮忙" : "可能能做", f.note]);
     if (it.basis) rows.push(["为什么想到这个", it.basis]);
     const open = it.state === "new" || it.state === "wanted";
+    const none = open && ideaItems(it).length > 0 && !ideaPicked(it).length;
     const more = state.ideaMore === it.id;
     const menu = more
       ? `<div class="idea-menu">
           <div class="idea-menu-row"><span>有没有用</span>${fbButtons("ideas", it)}</div>
-          ${admin() && open ? `<button class="idea-menu-btn" data-act="idea" data-op="do" data-id="${it.id}">${SVG.check}<span>不用发到群里，直接开工</span></button>` : ""}
-          ${admin() && open ? `<button class="idea-menu-btn danger" data-act="idea" data-op="dismiss" data-id="${it.id}">${SVG.close}<span>收起，以后不再提</span></button>` : ""}
+          ${gadmin() && open && !none ? `<button class="idea-menu-btn" data-act="idea" data-op="do" data-id="${it.id}">${SVG.check}<span>不用发到群里，直接开工</span></button>` : ""}
+          ${gadmin() && open ? `<button class="idea-menu-btn danger" data-act="idea" data-op="dismiss" data-id="${it.id}">${SVG.close}<span>收起，以后不再提</span></button>` : ""}
         </div>`
       : "";
     let main;
-    if (open) main = `<button class="btn primary idea-go" data-act="idea-copy" data-id="${it.id}">${SVG.copy}复制要求</button>`;
+    if (none) main = `<button class="btn primary idea-go" disabled>至少选一个项目</button>`;
+    else if (open) main = `<button class="btn primary idea-go" data-act="idea-copy" data-id="${it.id}">${SVG.copy}复制要求</button>`;
     else if (it.state === "started" && it.task_id) main = `<button class="btn primary idea-go" data-act="task" data-id="${esc(it.task_id)}">看任务</button>`;
-    else if (it.state === "pending" && admin()) main = `<button class="btn primary idea-go" data-act="tab" data-tab="tasks">去批准</button>`;
+    else if (it.state === "pending" && gadmin()) main = `<button class="btn primary idea-go" data-act="tab" data-tab="tasks">去批准</button>`;
     else main = `<button class="btn idea-go" disabled>${esc(st)}</button>`;
     return `
       <div class="dt-head">
@@ -610,7 +661,8 @@
         </div>
       </div>
       <div class="dt-sec"><div class="dt-text">${esc(it.body)}</div></div>
-      ${rows.length ? `<div class="dt-sec idea-rows"><div class="dt-label">怎么做</div>${rows.map(([k, t]) => `<div class="idea-row"><div class="idea-row-k">${esc(k)}</div><div class="idea-row-v">${esc(t)}</div></div>`).join("")}</div>` : ""}
+      ${ideaItemsBlock(it, open)}
+      ${rows.length ? `<div class="dt-sec idea-rows"><div class="dt-label">补充</div>${rows.map(([k, t]) => `<div class="idea-row"><div class="idea-row-k">${esc(k)}</div><div class="idea-row-v">${esc(t)}</div></div>`).join("")}</div>` : ""}
       ${forWho(it.for_member)}
       <div class="idea-bar">
         ${menu}
@@ -618,7 +670,7 @@
           <button class="idea-more" data-act="idea-more" data-id="${it.id}" aria-expanded="${more}" aria-label="更多">${SVG.more}</button>
           ${main}
         </div>
-        ${open ? `<p class="idea-how">复制后到群里 @MaiBot 粘贴发送，MaiWork 认得出是这条构想${admin() ? "" : "，管理员批准后开工"}。</p>` : ""}
+        ${open ? `<p class="idea-how">复制后到群里 @MaiBot 发送${gadmin() ? "" : "，管理员批准后开工"}</p>` : ""}
       </div>`;
   }
 
@@ -640,11 +692,11 @@
     const agent = goals.agent || [];
     const member = goals.member || [];
     if (!agent.length && !member.length) {
-      return html + emptyState("bullseye", "还没有目标", "有人在群里说「帮我们盯着……」或「提醒我……」时，会记在这里。");
+      return html + emptyState("bullseye", "还没有目标", "在群里说「提醒我……」或「帮我们盯着……」试试");
     }
     let i = 0;
     if (agent.length) {
-      html += `<h2 class="h-sub">我在推进 <small>${agent.length} 个 · 闲时静默推进，有结果再说</small></h2>`;
+      html += `<h2 class="h-sub">我在推进 <small>${agent.length} 个</small></h2>`;
       html += agent
         .map((goal) => {
           const crit = goal.criteria || [];
@@ -664,7 +716,7 @@
         .join("");
     }
     if (member.length) {
-      html += `<h2 class="h-sub">帮大家记着 <small>${member.length} 件 · 到点提醒</small></h2>`;
+      html += `<h2 class="h-sub">帮大家记着 <small>${member.length} 件</small></h2>`;
       html += member
         .map((m) => {
           const due = m.repeat === "daily" ? "每天" : m.due_ts ? when(m.due_ts) : "没定时间";
@@ -691,10 +743,21 @@
         ${ico(t.icon || "package")}
         <span>
           <span class="row-title">${esc(t.title)}</span>
-          <span class="row-meta"><span class="dot ${DOT[t.status] !== undefined ? DOT[t.status] : t.status}"></span><span>${STATUS[t.status] || esc(t.status)}${t.meta ? ` · ${esc(t.meta)}` : ""}${t.undelivered ? ` · <b class="warn-t">做完了但还没发出去</b>` : ""}</span></span>
+          <span class="row-meta"><span class="dot ${DOT[t.status] !== undefined ? DOT[t.status] : t.status}"></span><span>${STATUS[t.status] || esc(t.status)}${t.meta ? ` · ${esc(t.meta)}` : ""}${t.auto_reason ? " · 自动审核通过" : ""}${t.undelivered ? ` · <b class="warn-t">做完了但还没发出去</b>` : ""}</span></span>
         </span>
         <span class="chev">${SVG.right}</span>
       </button>`;
+  }
+
+  // 来自构想的请求：列出这次要做的项目（没点名 = 全部）
+  function pendingItems(p) {
+    if (p.source !== "idea" || !p.idea_id) return "";
+    const it = findIdea(p.idea_id);
+    const all = it ? ideaItems(it) : [];
+    if (!all.length) return "";
+    const want = Array.isArray(p.items) && p.items.length ? all.filter((x) => p.items.includes(x.no)) : all;
+    if (!want.length) return "";
+    return `<ul class="pend-items">${want.map((x) => `<li>${esc(x.title)}<span class="ii-kind">${x.kind === "goal" ? "目标" : "任务"}</span></li>`).join("")}</ul>`;
   }
 
   function viewTasks(g, v) {
@@ -704,11 +767,11 @@
     const list = tasks.list || [];
     const botName = (state.me && state.me.bot && state.me.bot.name) || "MaiBot";
     if (!pending.length && !list.length) {
-      return html + emptyState("package", "还没有任务", `群里有人 @ ${botName} 请它准备东西，或者在构想里点了「做这个」，任务就会出现在这里。`);
+      return html + emptyState("package", "还没有任务", `在群里 @${botName} 请它做点什么试试`);
     }
     let i = 0;
     if (pending.length) {
-      html += `<h2 class="h-sub" style="margin-top:22px">${admin() ? "等你批准" : "等管理员批准"} <small>${pending.length} 件</small></h2>`;
+      html += `<h2 class="h-sub" style="margin-top:22px">${gadmin() ? "等你批准" : "等管理员批准"} <small>${pending.length} 件</small></h2>`;
       html += pending
         .map(
           (p) => `
@@ -716,10 +779,11 @@
             ${ico(p.icon || "magnifier")}
             <div>
               <h3 class="item-title">${esc(p.title)}</h3>
+              ${pendingItems(p)}
               ${p.quote ? `<div class="quote"><span class="quote-by">${esc(p.who)} · ${esc(when(p.ts))}</span>${esc(p.quote)}</div>` : ""}
               <div class="via">${esc(p.via || "")}${p.age_s > 86400 ? ` · <b class="warn-t">等了 ${dur(p.age_s)}</b>` : ""}</div>
               ${
-                admin()
+                gadmin()
                   ? `<div class="actions">
                 <button class="btn primary" data-act="req" data-op="approve" data-id="${esc(p.id)}">批准</button>
                 <button class="btn" data-act="req" data-op="reject" data-id="${esc(p.id)}">拒绝</button>
@@ -739,7 +803,7 @@
       }).join("")}</div>`;
       const f = FILTERS.find((x) => x.id === state.filter) || FILTERS[0];
       const rows = list.filter(f.match);
-      html += rows.length ? `<div>${rows.map((t) => taskRow(t, i++)).join("")}</div>` : `<p class="h-meta" style="margin-top:18px">这一栏现在是空的。</p>`;
+      html += rows.length ? `<div>${rows.map((t) => taskRow(t, i++)).join("")}</div>` : `<p class="h-meta" style="margin-top:18px">空的</p>`;
     }
     return html;
   }
@@ -758,7 +822,7 @@
           ${opened ? `<div class="opener">${esc(t.opener)}</div>` : ""}
           ${opened ? `<div class="status"><span class="dot ${r && r.replies ? "used" : ""}"></span><span class="status-text">${r ? (r.replies ? `${r.replies} 人接话${r.followups ? `，MaiBot 接着聊了 ${r.followups} 句` : ""}` : "10 分钟内没人接，下次隔久一点") : "等着看有没有人接"}</span></div>` : ""}
           ${
-            admin()
+            gadmin()
               ? `<div class="verdict">这次判断对吗？
             <button class="btn" data-act="verdict" data-id="${t.id}" data-v="right" aria-pressed="${t.verdict === "right"}">对</button>
             <button class="btn" data-act="verdict" data-id="${t.id}" data-v="wrong" aria-pressed="${t.verdict === "wrong"}">不对</button>
@@ -776,16 +840,16 @@
     return CATS.map(([cat, name]) => {
       const sec = byCat[cat] || { entries: [] };
       const entries = sec.entries || [];
-      if (!entries.length && !admin()) return "";
+      if (!entries.length && !gadmin()) return "";
       return `
         <div class="pf-sec enter" style="--i:${i++}">
-          <div class="pf-name">${esc(sec.name || name)}${admin() ? `<button class="pf-add" data-act="pf-add" data-cat="${cat}" aria-label="加一条">${SVG.plus}</button>` : ""}</div>
+          <div class="pf-name">${esc(sec.name || name)}${gadmin() ? `<button class="pf-add" data-act="pf-add" data-cat="${cat}" aria-label="加一条">${SVG.plus}</button>` : ""}</div>
           ${
             entries.length
               ? entries
                   .map((e) => {
                     const meta = e.locked
-                      ? admin()
+                      ? gadmin()
                         ? e.source === "admin"
                           ? "你加的 · 不会被改写"
                           : "已锁定 · 不会被改写"
@@ -795,7 +859,7 @@
               <div class="pf" data-entry="${e.id}">
                 <div><div class="pf-text">${esc(e.text)}</div><div class="pf-meta">${esc(meta)}</div></div>
                 ${
-                  admin()
+                  gadmin()
                     ? `<div class="pf-acts">
                   <button class="icon-btn" data-act="pf-edit" data-id="${e.id}" aria-label="修改">${SVG.pen}</button>
                   <button class="icon-btn" data-act="pf-lock" data-id="${e.id}" aria-pressed="${!!e.locked}" aria-label="${e.locked ? "解锁" : "锁定"}">${SVG.lock}</button>
@@ -824,18 +888,18 @@
     ];
     const any = cap.some(([k]) => gs[k]);
     return `
-      <h2 class="h-sub">群空间 <small>机器人在这个群是${esc(role)}</small></h2>
+      <h2 class="h-sub">群空间 <small>${esc(role)}</small></h2>
       ${
         any
           ? `<div class="caps">${cap.map(([k, n]) => `<span class="cap ${gs[k] ? "on" : ""}">${gs[k] ? SVG.check : ""}${n}</span>`).join("")}</div>`
-          : `<p class="h-meta">现在都用不了：QQ 适配器还是旧版，或者机器人不是管理员。升级适配器后会自动开放。</p>`
+          : `<p class="h-meta">暂时用不了</p>`
       }`;
   }
 
   function focusSection(v) {
     const focus = (v && v.focus) || [];
     let html = `<div class="h-sub-row"><h2 class="h-sub">关注成员 <span class="private">${SVG.lock}只有管理员看得到</span></h2><button class="btn small" data-act="focus-add">加一个人</button></div>`;
-    if (!focus.length) return html + `<p class="h-meta">还没有。MaiWork 会从最活跃的、请它准备过东西的人里挑。</p>`;
+    if (!focus.length) return html + `<p class="h-meta">还没有</p>`;
     return (
       html +
       focus
@@ -848,7 +912,7 @@
             ${personaBlock(p)}
             ${personalBlock(p)}
           </div>
-          <button class="icon-btn" data-act="focus-rm" data-uid="${esc(p.user_id)}" aria-label="不再关注">${SVG.close}</button>
+          ${admin() ? `<button class="icon-btn" data-act="focus-rm" data-uid="${esc(p.user_id)}" aria-label="不再关注">${SVG.close}</button>` : ""}
         </div>`
         )
         .join("")
@@ -889,7 +953,7 @@
               ${src ? `<a class="pers-title" href="${safeUrl(src.url)}" target="_blank" rel="noopener noreferrer">${esc(n.title)}</a>` : `<span class="pers-title">${esc(n.title)}</span>`}
               <div class="pers-body">${richText(n.body || n.summary || "")}</div>
             </div>
-            <button class="btn small" data-act="mention-member" data-id="${n.id}" data-name="${esc(pname(p))}">在群里提给 ta</button>
+            ${admin() ? `<button class="btn small" data-act="mention-member" data-id="${n.id}" data-name="${esc(pname(p))}">在群里提给 ta</button>` : ""}
           </div>`;
           })
           .join("")}
@@ -908,15 +972,15 @@
     html += pulseCard(g, v, false);
     if (!v) return html + loading();
     if (g.fresh) {
-      html += emptyState("seedling", "群画像还没成形", "MaiWork 读够聊天记录后，会在这里整理出这个群在聊什么、关心什么。");
-      return admin() ? html + focusSection(v) : html;
+      html += emptyState("seedling", "还在熟悉这个群", "");
+      return gadmin() ? html + focusSection(v) : html;
     }
     const log = v.topic_log || [];
-    html += `<h2 class="h-sub">开话题记录 <small>冷场时 MaiWork 开的头</small></h2>`;
-    html += log.length ? log.map((t, k) => topicItem(t, k)).join("") : `<p class="h-meta">还没有冷场到需要开话题。</p>`;
-    html += `<h2 class="h-sub">群画像 <small>${admin() ? "改过、锁定的以你为准" : "MaiWork 眼中的这个群"}</small></h2>`;
+    html += `<h2 class="h-sub">开话题记录 </h2>`;
+    html += log.length ? log.map((t, k) => topicItem(t, k)).join("") : `<p class="h-meta">还没有</p>`;
+    html += `<h2 class="h-sub">群画像 </h2>`;
     html += profileSection(v);
-    if (admin()) html += groupSpaceBlock(v) + focusSection(v);
+    if (gadmin()) html += groupSpaceBlock(v) + focusSection(v);
     return html;
   }
 
@@ -931,6 +995,35 @@
     return v && v.tasks ? (v.tasks.list || []).find((x) => x.id === id) : null;
   }
 
+  // 验收意见 + 引用核对：结构化结果在 link_check，意见文本里同一行去掉免得重复
+  function reviewBlock(t) {
+    const lc = t.link_check && typeof t.link_check === "object" ? t.link_check : null;
+    let text = String(t.review || "");
+    if (lc) text = text.split("\n").filter((l) => !/^\s*引用核对：/.test(l)).join("\n").trim();
+    let html = text ? `<div class="dt-sec"><div class="dt-label">验收意见</div><div class="dt-text">${esc(text)}</div></div>` : "";
+    if (lc && lc.links) {
+      const bad = lc.unopened || 0;
+      const urls = (lc.unopened_urls || []).slice(0, 10);
+      html += `<div class="dt-sec"><div class="dt-label">引用核对</div><div class="dt-text">${bad ? `引用了 ${lc.links} 个链接，其中 ${bad} 个这次没打开核实过` : `引用了 ${lc.links} 个链接，都打开核实过`}</div>${
+        urls.length ? `<ul class="dt-list lc-list">${urls.map((u) => `<li><a href="${safeUrl(u)}" target="_blank" rel="noopener noreferrer">${esc(u)}</a></li>`).join("")}</ul>` : ""
+      }</div>`;
+    }
+    return html;
+  }
+
+  // 安全网自动暂停（paused_reason 只在自动暂停时有值；手动暂停为 null）
+  const wan = (n) => (n >= 1e4 ? `${Math.round(n / 1e4)} 万` : String(n || 0));
+  function pausedBlock(t) {
+    const r = t.status === "paused" && t.paused_reason;
+    if (!r || !r.kind) return "";
+    const text =
+      r.kind === "tokens"
+        ? `这个任务的用量到了上限（用了约 ${wan(r.used)} token，上限 ${wan(r.limit)}），先自动停下，等你决定。`
+        : `这个任务已经做了 ${dur(r.used)}，到了时长上限（${dur(r.limit)}），先自动停下，等你决定。`;
+    const tail = gadmin() ? "想接着做就点「继续」，用量和时长从那一刻重新算；不想做了就「取消」。上限在「设置 → 全部配置 → 任务安全网」里改。" : "管理员决定要不要接着做。";
+    return `<div class="dt-sec"><div class="dt-label">为什么停了</div><div class="dt-text">${esc(text)}${esc(tail)}</div></div>`;
+  }
+
   function taskDetail(id) {
     const t = state.tasks[id];
     const row = findTaskRow(id);
@@ -942,7 +1035,7 @@
     const st = t.status;
     const dot = DOT[st] !== undefined ? DOT[st] : st;
     let acts = "";
-    if (admin()) {
+    if (gadmin()) {
       const b = (op, label, primary) => `<button class="btn${primary ? " primary" : ""}" data-act="task-op" data-op="${op}" data-id="${esc(t.id)}">${label}</button>`;
       if (["running", "reviewing", "queued", "waiting_input"].includes(st)) acts = b("pause", "暂停") + b("cancel", "取消");
       else if (st === "paused" || st === "shelved") acts = b("resume", "继续", true) + b("cancel", "取消");
@@ -958,6 +1051,8 @@
         </div>
       </div>
       <div class="dt-sec"><div class="dt-label">要做什么</div><div class="dt-text">${esc(t.req || t.meta || "")}</div></div>
+      ${pausedBlock(t)}
+      ${t.auto_reason ? `<div class="dt-sec"><div class="dt-label">谁批的</div><div class="dt-text">MaiWork 自动审核通过：${esc(t.auto_reason)}</div></div>` : ""}
       ${t.question ? `<div class="dt-sec"><div class="dt-label">在等回答</div><div class="quote">${esc(t.question)}</div></div>` : ""}
       ${(t.criteria || []).length ? `<div class="dt-sec"><div class="dt-label">怎样算完成</div><ul class="dt-list">${t.criteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul></div>` : ""}
       ${admin() && t.env ? `<div class="dt-sec"><div class="dt-label">在哪里做</div><div class="dt-text">${esc(t.env)}</div></div>` : ""}
@@ -979,7 +1074,7 @@
               .join("")}</ol></div>`
           : ""
       }
-      ${t.review ? `<div class="dt-sec"><div class="dt-label">验收意见</div><div class="dt-text">${esc(t.review)}</div></div>` : ""}
+      ${reviewBlock(t)}
       ${
         (t.delivery || []).length
           ? `<div class="dt-sec"><div class="dt-label">交付</div>${t.delivery
@@ -999,7 +1094,7 @@
     const done = crit.filter((c) => c.done).length;
     const row = goal.task_id && findTaskRow(goal.task_id);
     let acts = "";
-    if (admin() && goal.state !== "done" && goal.state !== "cancelled") {
+    if (gadmin() && goal.state !== "done" && goal.state !== "cancelled") {
       acts = `<div class="actions" style="margin-top:28px">${
         goal.state === "paused"
           ? `<button class="btn primary" data-act="goal-op" data-op="resume" data-id="${esc(goal.id)}">继续</button>`
@@ -1074,15 +1169,15 @@
   }
 
   const SET_SUBS = [
-    ["overview", "总览", "gear", "各个群、今天的用量、运行状态"],
-    ["identity", "身份", "lotus", "SOUL、做事规矩、工作记忆"],
-    ["models", "模型", "robot", "端点、密钥、主模型和子 agent 模型"],
-    ["extensions", "扩展", "tools", "MCP 和 skill，可给主模型或子 agent"],
-    ["usage", "用量", "chart", "每天的 tokens 和调用次数，能看以前的"],
+    ["overview", "总览", "gear", "运行状态和今天的用量"],
+    ["identity", "身份", "lotus", "性格、规矩和记忆"],
+    ["models", "模型", "robot", "用哪些模型"],
+    ["extensions", "扩展", "tools", "联网搜索、MCP 和 skill"],
+    ["usage", "用量", "chart", "每天用了多少"],
     ["sources", "资讯来源", "newspaper", "RSS 和屏蔽的来源"],
     ["links", "群链接", "link", "群友看到的专属链接"],
-    ["rules", "全部配置", "moon", "配置文件里的每一项，都能在这里改"],
-    ["logs", "请求日志", "memo", "最近的模型调用、工具调用和失败记录"],
+    ["rules", "全部配置", "moon", "所有设置项"],
+    ["logs", "请求日志", "memo", "出问题时看这里"],
   ];
 
   function setNav() {
@@ -1117,10 +1212,30 @@
     return `
       ${(s.groups || [])
         .map(
-          (g) => `<div class="set-row">${ico("link")}<div><div class="set-name">${esc(g.name || `群 ${g.id}`)}</div><div class="set-text mono-link">${esc(fullLink(g))}</div></div><span class="row-btns"><button class="btn small" data-act="copy" data-link="${esc(fullLink(g))}">复制</button><button class="btn small" data-act="reset-link" data-g="${esc(g.id)}">重置</button></span></div>`
+          (g) => `<div class="set-row">${ico("link")}<div><div class="set-name">${esc(g.name || `群 ${g.id}`)}</div><div class="set-text mono-link">${esc(fullLink(g))}</div></div><span class="row-btns"><button class="btn small" data-act="copy" data-link="${esc(fullLink(g))}">复制</button><button class="btn small" data-act="reset-link" data-g="${esc(g.id)}">重置</button></span></div>
+          <div class="set-row ga-row">${ico("lock")}<div><div class="set-name">群管理员</div><div class="set-text">${esc(gaText(state.ga[g.id]))}</div></div><span class="row-btns"><button class="btn small" data-act="ga-edit" data-g="${esc(g.id)}" data-name="${esc(g.name || `群 ${g.id}`)}">设置</button></span></div>`
         )
         .join("") || `<p class="h-meta">还没有服务群。</p>`}
-      <p class="fine">群友打开自己群的链接，只看得到这个群；看不到别的群、关注成员和设置。链接泄露了就点「重置」，旧链接马上失效。</p>`;
+      <p class="fine">群友用链接只能看到自己的群。链接外泄了就点「重置」。群管理员用自己的密码登录，只能管本群。</p>`;
+  }
+
+  // 群管理员一行的状态文字
+  function gaText(x) {
+    if (!x) return "…";
+    const n = (x.accounts || []).length;
+    if (!x.password_set && !n) return "没设置";
+    return [x.password_set ? "网页密码已设置" : "没有网页密码", n ? `群里 ${n} 人能批准` : ""].filter(Boolean).join(" · ");
+  }
+
+  async function loadGA() {
+    const gs = (state.settings && state.settings.groups) || [];
+    await Promise.all(
+      gs.map((g) =>
+        api("GET", `/api/groups/${encodeURIComponent(g.id)}/group-admin`)
+          .then((r) => (state.ga[g.id] = r))
+          .catch(() => (state.ga[g.id] = { password_set: false, accounts: [] }))
+      )
+    );
   }
 
   function settingsOverview(s) {
@@ -1144,9 +1259,9 @@
         </button>`
               )
               .join("")
-          : `<p class="h-meta">还没有服务群。去「全部配置 → 服务群」加上群号，保存后就会出现在这里。</p>`
+          : `<p class="h-meta">还没有服务群 <button type="button" class="link-btn" data-act="cfg-goto" data-s="groups">去添加</button></p>`
       }
-      ${s.models && !s.models.ready ? `<div class="warn-box" style="margin-top:18px">还没配好模型，MaiWork 现在不会做任何要用模型的事。<button class="btn small" data-act="set-sub" data-sub="models" style="margin-left:8px">去配</button></div>` : ""}
+      ${s.models && !s.models.ready ? `<div class="warn-box" style="margin-top:18px">还没配好模型，MaiWork 暂时不会工作<button class="btn small" data-act="set-sub" data-sub="models" style="margin-left:8px">去配</button></div>` : ""}
       <div class="h-sub-row"><h2 class="h-sub">今天的用量</h2><button class="btn small" data-act="set-sub" data-sub="usage">看以前的</button></div>
       <div class="usage">
         <div><b>${tokens(u.main)}</b><span>主模型 · tokens</span></div>
@@ -1158,7 +1273,7 @@
           ? `<div class="warn-box"><b>今天超过提醒线了：</b><br />${s.usage.alerts.map((a) => esc(a.text)).join("<br />")}</div>`
           : ""
       }
-      <p class="fine">${alert ? `每日提醒线 ${tokens(alert)} tokens，今天用了 ${Math.round((used / alert) * 100)}%。` : "没设提醒线。"}只提醒，不暂停。${u.errors ? ` 今天有 ${u.errors} 次调用出错。` : ""}</p>
+      <p class="fine">${alert ? `每日提醒线 ${tokens(alert)} tokens，今天用了 ${Math.round((used / alert) * 100)}%。` : "没设提醒线。"}${u.errors ? ` 今天有 ${u.errors} 次调用出错。` : ""}</p>
       <h2 class="h-sub">运行状态</h2>
       ${(s.health || []).map((h) => `<div class="set-row">${ico(h.icon || "gear")}<div><div class="set-name">${esc(h.name)}</div><div class="set-text">${esc(h.text)}</div></div><span class="dot ${h.state === "ok" ? "ok" : h.state === "warn" ? "pending" : ""}"></span></div>`).join("")}
       <div class="actions" style="margin-top:22px"><button class="btn" data-act="onb-restart">重新引导</button><button class="btn" data-act="logout">退出管理员</button></div>`;
@@ -1176,13 +1291,13 @@
     const pasting = ed && ed.kind === "mcp-paste";
     const newSkill = ed && ed.kind === "skill" && !ed.name;
     return `
-      <p class="h-meta">给 MaiWork 自己用：每一项都可以选「只给主模型」「只给子 agent」或「两边都能用」。主模型就是你在「和 MaiWork 聊」里对话、以及派活验收的那个。都不会挂到 MaiBot 上；在这里改的存在服务器数据目录里，不会让 MaiBot 重载插件。</p>
+      <p class="h-meta">给 MaiWork 接上外部工具和做事说明</p>
       ${searchCard()}
-      <div class="h-sub-row"><h2 class="h-sub">MCP <small>接外部工具</small></h2>${newMcp || pasting ? "" : `<span class="row-btns"><button class="btn small" data-act="mcp-paste">粘贴配置</button><button class="btn small" data-act="ext-new" data-kind="mcp">加一个</button></span>`}</div>
+      <div class="h-sub-row"><h2 class="h-sub">MCP</h2>${newMcp || pasting ? "" : `<span class="row-btns"><button class="btn small" data-act="mcp-paste">粘贴配置</button><button class="btn small" data-act="ext-new" data-kind="mcp">加一个</button></span>`}</div>
       ${pasting ? mcpPasteForm() : ""}
       ${newMcp ? mcpForm(null) : ""}
       ${mcp.length ? mcp.map((m) => (ed && ed.kind === "mcp" && ed.name === m.name ? mcpForm(m) : mcpRow(m))).join("") : newMcp ? "" : `<p class="h-meta">还没有。</p>`}
-      <div class="h-sub-row"><h2 class="h-sub">skill <small>写给模型的做事说明</small></h2>${newSkill ? "" : `<span class="row-btns"><label class="btn small file-btn">上传 zip<input type="file" id="skill-zip" accept=".zip,application/zip" hidden /></label><button class="btn small" data-act="ext-new" data-kind="skill">加一个</button></span>`}</div>
+      <div class="h-sub-row"><h2 class="h-sub">skill</h2>${newSkill ? "" : `<span class="row-btns"><label class="btn small file-btn">上传 zip<input type="file" id="skill-zip" accept=".zip,application/zip" hidden /></label><button class="btn small" data-act="ext-new" data-kind="skill">加一个</button></span>`}</div>
       ${newSkill ? skillForm(null) : ""}
       ${skills.length ? skills.map((k) => (ed && ed.kind === "skill" && ed.name === k.name ? skillForm(k) : skillRow(k))).join("") : newSkill ? "" : `<p class="h-meta">还没有。</p>`}`;
   }
@@ -1195,8 +1310,8 @@
     const st = sx.status || {};
     const cands = (sx.candidates || []).filter((c) => (c.tools || []).length);
     const editing = state.searchEdit || !b;
-    const head = `<div class="h-sub-row"><h2 class="h-sub">联网搜索 <small>找资讯、查资料都用它</small></h2>${!editing ? `<span class="row-btns"><button class="btn small" data-act="search-edit">换一个</button></span>` : ""}</div>`;
-    const stLine = `<div class="set-text ext-st"><span class="dot ${st.ok ? "ok" : b ? "failed" : ""}"></span>${esc(b ? st.text || "" : "还没指定：资讯和个人向内容会暂停找新的")}</div>`;
+    const head = `<div class="h-sub-row"><h2 class="h-sub">联网搜索</h2>${!editing ? `<span class="row-btns"><button class="btn small" data-act="search-edit">换一个</button></span>` : ""}</div>`;
+    const stLine = `<div class="set-text ext-st"><span class="dot ${st.ok ? "ok" : b ? "failed" : ""}"></span>${esc(b ? st.text || "" : "还没选")}</div>`;
     if (!editing) {
       return `${head}
         <div class="ext-row search-now">
@@ -1207,10 +1322,10 @@
             ${stLine}
           </div>
         </div>
-        <p class="fine search-agents">想让它搜得更合你意（比如只看中文站、优先官方来源），写进「设置 → 身份」的 AGENTS.md 就行。</p>`;
+        <p class="fine search-agents">搜索偏好可以写进「身份 → AGENTS.md」</p>`;
     }
     if (!cands.length) {
-      return `${head}${stLine}<p class="h-meta">先在下面接一个能搜索的 MCP（比如 Tavily、Exa、You.com 的 MCP），接好以后回这里选它。</p>`;
+      return `${head}${stLine}<p class="h-meta">先在下面接一个能搜索的 MCP，比如 Tavily、Exa</p>`;
     }
     const all = cands.flatMap((c) => c.tools.map((t) => ({ mcp: c.mcp, ...t })));
     const pick = b ? all.find((t) => t.mcp === b.mcp && t.name === b.tool) : all.find((t) => t.guess === "search") || all[0];
@@ -1219,7 +1334,7 @@
       <div class="login ext-form search-form">
         <label for="sx-tool">用哪个工具搜索</label>
         <select id="sx-tool">${all.map((t) => opt(t, pick && t.mcp === pick.mcp && t.name === pick.name)).join("")}</select>
-        <label for="sx-extract">抓网页正文 <span class="fine-inline">可选，网页打不开时用它读全文</span></label>
+        <label for="sx-extract">抓网页正文 <span class="fine-inline">可选</span></label>
         <select id="sx-extract">${extractOpts(pick ? pick.mcp : "", b ? b.extract_tool : null)}</select>
         <div class="actions">
           <button class="btn primary" data-act="search-save">用这个</button>
@@ -1269,7 +1384,7 @@
     return `
       <form id="mcp-paste-form" class="login ext-form" autocomplete="off">
         <div class="ext-form-h">粘贴 MCP 配置</div>
-        <p class="fine" style="margin:0">支持 Claude Desktop / Cursor 的 <span class="mono">mcpServers</span>、VS Code 的 <span class="mono">servers</span>，或单个服务器的 <span class="mono">{"type":"http","url":…,"headers":…}</span>。只支持远程（http / sse）的，要在本机跑命令的那种（<span class="mono">command</span>）不支持。</p>
+        <p class="fine" style="margin:0">支持 Claude Desktop、Cursor、VS Code 格式，仅限远程（http / sse）</p>
         <textarea id="mp-text" class="mono-area" rows="9" spellcheck="false" placeholder='{"mcpServers": {"tavily": {"type": "http", "url": "https://…/mcp", "headers": {"Authorization": "Bearer …"}}}}'></textarea>
         <p class="err" id="mp-err" hidden></p>
         <div class="actions">
@@ -1351,7 +1466,7 @@
     return `
       <form id="mcp-form" class="login ext-form" autocomplete="off" data-name="${esc(isNew ? "" : m.name)}">
         <div class="ext-form-h">${isNew ? "加一个 MCP" : `改 ${esc(m.name)}`}</div>
-        ${pre ? `<p class="fine" style="margin:0">从粘贴的配置里读出来的，看一眼没问题就保存。</p>` : ""}
+        ${pre ? `` : ""}
         ${isNew ? `<label for="x-name">名字</label><input id="x-name" spellcheck="false" placeholder="只用字母、数字、下划线、横线，比如 github" value="${esc(m.name || "")}" />` : ""}
         <label for="x-url">地址</label>
         <input id="x-url" type="url" inputmode="url" spellcheck="false" value="${esc(m.url || "")}" placeholder="https://…/mcp" />
@@ -1403,7 +1518,7 @@
         ${roleChecks("k", d.roles)}
         <label for="k-body">内容 <small class="lbl-hint">怎么做、注意什么、例子；最多 40KB</small></label>
         <textarea id="k-body" class="mono-area" rows="14" spellcheck="false">${esc(d.body || "")}</textarea>
-        ${(d.files || []).length ? `<p class="fine" style="margin:0">附带的文件（只能在服务器上改）：${d.files.map(esc).join("、")}</p>` : ""}
+        ${(d.files || []).length ? `<p class="fine" style="margin:0">附带文件：${d.files.map(esc).join("、")}</p>` : ""}
         <p class="err" id="k-err" hidden></p>
         <div class="actions">
           <button class="btn primary" type="submit">保存</button>
@@ -1601,8 +1716,8 @@
     const jump = state.cfgSec && secs.some((s) => s.id === state.cfgSec) ? state.cfgSec : "";
     const shown = jump ? secs.filter((s) => s.id === jump) : secs;
     return `
-      <p class="h-meta">插件配置文件（${esc(r.file || "config.toml")}）里的每一项都在这里。点「保存」直接写进这个文件，MaiWork 马上按新值来，不用重启、也不会连带其他插件。标「改过」的是和默认值不一样的，点「恢复默认」退回去。</p>
-      ${pending.length ? `<div class="warn-box">有 ${pending.length} 项改了还没生效（${pending.map((k) => esc((cfgField(k) || {}).label || k)).join("、")}）：要等插件下次重载。重载会让 MaiBot 的全部插件一起重载，请你挑空闲时自己做。</div>` : ""}
+      <p class="h-meta">保存后马上生效</p>
+      ${pending.length ? `<div class="warn-box">有 ${pending.length} 项改了还没生效（${pending.map((k) => esc((cfgField(k) || {}).label || k)).join("、")}），要等插件重载后才生效</div>` : ""}
       <div class="cfg-jump" role="tablist"><button type="button" role="tab" aria-selected="${!jump}" data-act="cfg-sec" data-s="">全部</button>${secs.map((s) => `<button type="button" role="tab" aria-selected="${jump === s.id}" data-act="cfg-sec" data-s="${esc(s.id)}">${esc(s.label)}</button>`).join("")}</div>
       <datalist id="mw-platforms">${Object.keys(PLATFORM_NAMES).map((p) => `<option value="${p}">${PLATFORM_NAMES[p]}</option>`).join("")}</datalist>
       <form id="rules-form" class="rules-form" autocomplete="off">
@@ -1620,7 +1735,7 @@
                 <div class="rule-l">
                   <label for="${cfgId(f.key)}" class="set-name">${esc(f.label || f.key)}${over ? `<span class="tag">改过</span>` : ""}${f.applies === "reload" ? `<span class="tag tag-warn">重载后生效</span>` : ""}</label>
                   ${f.help ? `<div class="set-text">${esc(f.help)}</div>` : ""}
-                  ${f.readonly ? `<div class="set-text">${SVG.lock} 只能在配置文件里改${f.readonly_reason ? `：${esc(f.readonly_reason)}` : ""}</div>` : ""}
+                  ${f.readonly ? `<div class="set-text">${SVG.lock} 只能在服务器上改</div>` : ""}
                   ${over && !f.readonly ? `<div class="set-text">默认是：<span class="mono">${esc(cfgShow(f.default))}</span> <button type="button" class="link-btn" data-act="rule-reset" data-f="${esc(f.key)}">恢复默认</button></div>` : ""}
                 </div>
                 <div class="rule-r">${cfgInput(f)}</div>
@@ -1726,7 +1841,7 @@
         <div><b>${t.jev || 0}</b><span>Jev 判断 · 次</span></div>
       </div>
       <div class="ubars" style="--n:${list.length}">${bars}</div>
-      <p class="fine"><span class="lg lg-m"></span>主模型 <span class="lg lg-w"></span>子 agent · 点一根柱子看那天的明细</p>
+      <p class="fine"><span class="lg lg-m"></span>主模型 <span class="lg lg-w"></span>子 agent</p>
       <label class="u-pick"><span>直接看某一天</span><input type="date" class="u-date" value="${esc(u.sel || "")}" min="${esc((list[0] || {}).day || "")}" max="${esc((list[list.length - 1] || {}).day || "")}" /></label>
       ${usageDay(u)}`;
   }
@@ -1757,8 +1872,8 @@
     const rss = ((s.feeds || {}).rss) || {};
     const groups = s.groups || [];
     return `
-      <h2 class="h-sub" style="margin-top:18px">RSS <small>指定要看的来源，更准</small></h2>
-      <p class="h-meta">每轮备料会先看这里的新文章，和搜到的一起过同一套质量标准，不合格的照样不上。每个群最多 20 个。</p>
+      <h2 class="h-sub" style="margin-top:18px">RSS</h2>
+      <p class="h-meta">优先看这些来源，每个群最多 20 个</p>
       ${
         groups.length
           ? groups
@@ -1795,9 +1910,9 @@
     return `
       <h2 class="h-sub">头像</h2>
       <div class="av-row">
-        <img class="top-avatar av-big" src="${esc((a && a.url) || avatar())}" alt="" onerror="this.onerror=null;this.src='/static/assets/bot.jpg'" />
+        <img class="top-avatar av-big" src="${esc((a && a.url) || avatar())}" alt="" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" />
         <div class="av-main">
-          <div class="set-text">网页左上角和各处 MaiWork 的头像。默认跟 MaiBot 的 QQ 头像同步；没有 QQ 就用其他平台的。</div>
+          <div class="set-text">默认和 MaiBot 的头像一样</div>
           ${a ? `<div class="set-text">现在：<b>${esc(src)}</b></div>` : ""}
           <div class="row-btns" style="margin-top:8px">
             <label class="btn small file-btn">上传图片<input type="file" id="avatar-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden /></label>
@@ -1851,13 +1966,13 @@
     const gm = d.group_memory || {};
     const groups = s.groups || [];
     return `
-      <p class="h-meta">MaiWork 自己的身份和记忆，存在服务器数据目录里，改了下一次就生效。</p>
+      
       ${avatarBlock()}
-      ${idBlock("soul", "SOUL.md", "MaiWork 说话的口吻和性格：写资讯、开场白、交付说明时都照这个来。" + (d.soul && d.soul.synced_from_maibot ? "（现在是从 MaiBot 同步来的）" : ""), d.soul, lim.soul, `<button type="button" class="btn small" data-act="soul-sync">从 MaiBot 同步</button>`)}
-      ${idBlock("agents", "AGENTS.md", "给 MaiWork 主模型和子 agent 的做事规矩：派活、干活、验收时都会看。", d.agents, lim.agents)}
-      ${idBlock("memory", "工作记忆（全局）", "和具体群、具体人无关的经验：你的偏好、哪些工具和来源好用、做事的教训。所有群都会用到，所以这里不能写具体的群和人。", d.memory, lim.memory)}
+      ${idBlock("soul", "SOUL.md", "说话的口吻和性格" + (d.soul && d.soul.synced_from_maibot ? " · 已和 MaiBot 同步" : ""), d.soul, lim.soul, `<button type="button" class="btn small" data-act="soul-sync">从 MaiBot 同步</button>`)}
+      ${idBlock("agents", "AGENTS.md", "做事的规矩和偏好", d.agents, lim.agents)}
+      ${idBlock("memory", "工作记忆（全局）", "所有群通用的经验，不写具体的群和人", d.memory, lim.memory)}
       <h2 class="h-sub">每个群的工作记忆</h2>
-      <p class="h-meta" style="margin-top:-6px">MaiWork 在这个群干活学到的东西（这个群喜欢什么形式、哪类资讯被点没用）。只在这个群里用，不会带到别的群。</p>
+      <p class="h-meta" style="margin-top:-6px">每个群各自的经验，只在那个群里用</p>
       ${
         groups.length
           ? groups
@@ -1897,7 +2012,7 @@
     const t = (L.summary && L.summary.today) || {};
     const lf = L.summary.last_failure;
     return `
-      <p class="h-meta">最近的模型调用和工具调用，排查问题用。只有管理员看得到；密钥不会出现在这里。模型调用记录留 3 天。</p>
+      <p class="h-meta">最近 3 天的模型和工具调用</p>
       <div class="usage" style="margin-top:14px">
         <div><b>${t.calls || 0}</b><span>今天调用模型 · 次</span></div>
         <div><b class="${t.failed ? "bad-t" : ""}">${t.failed || 0}</b><span>失败 · 次</span></div>
@@ -1993,14 +2108,14 @@
     const manual = f.blocked_domains || [];
     const auto = f.auto_blocked || [];
     return `
-      ${page ? `<p class="h-meta">这些网站的内容不会再出现在资讯里。</p>` : `<h2 class="h-sub">屏蔽的资讯来源</h2>`}
+      ${page ? `` : `<h2 class="h-sub">屏蔽的资讯来源</h2>`}
       ${
         manual.length || auto.length
           ? [
               ...manual.map((d) => `<div class="set-row">${ico("lock")}<div><div class="set-name mono">${esc(d)}</div><div class="set-text">你屏蔽的</div></div><button class="btn small" data-act="unblock-domain" data-domain="${esc(d)}">解除</button></div>`),
-              ...auto.map((d) => `<div class="set-row">${ico("lock")}<div><div class="set-name mono">${esc(d)}</div><div class="set-text">被标「没用」太多次，自动屏蔽</div></div><span></span></div>`),
+              ...auto.map((d) => `<div class="set-row">${ico("lock")}<div><div class="set-name mono">${esc(d)}</div><div class="set-text">自动屏蔽</div></div><span></span></div>`),
             ].join("")
-          : `<p class="h-meta">还没有。在资讯页「被筛掉的」里可以一键屏蔽来源。</p>`
+          : `<p class="h-meta">还没有</p>`
       }`;
   }
 
@@ -2012,11 +2127,11 @@
     const row = (icon, name, text) => `<div class="set-row">${ico(icon)}<div><div class="set-name">${name}</div><div class="set-text">${text}</div></div><span></span></div>`;
     return `
       ${page ? "" : `<div class="h-sub-row"><h2 class="h-sub">模型</h2><button class="btn small" data-act="models">修改</button></div>`}
-      ${m.ready ? "" : `<div class="warn-box">还没配好模型，MaiWork 现在不会做任何要用模型的事。点「修改」填上端点和模型。</div>`}
+      ${m.ready ? "" : `<div class="warn-box">还没配好模型，MaiWork 暂时不会工作</div>`}
       ${row("link", "端点", `<span class="mono">${esc(m.base_url) || "没填"}</span> · 密钥${m.key_set ? "已填" : "<b>没填</b>"}`)}
-      ${row("robot", "主模型", `${m.main ? `<span class="mono">${esc(m.main)}</span>` : "<b>没选</b>"} · ${backup(m.main_backup)}<br>理解群、出资讯和构想、派活和验收`)}
-      ${row("tools", "子 agent 模型", `${m.worker ? `<span class="mono">${esc(m.worker)}</span>` : "<b>没选</b>"} · ${backup(m.worker_backup)}<br>真正动手干活`)}
-      ${row("sparkles", "Jev", `判断群消息值不值得理的小模型，单独连 TypeSafe · 密钥${m.jev_key_set === false ? "<b>没填</b>" : m.jev_key_set ? "已填" : "在「全部配置」里"} <button type="button" class="link-btn" data-act="cfg-goto" data-s="jev">去填 Jev 密钥</button>`)}`;
+      ${row("robot", "主模型", `${m.main ? `<span class="mono">${esc(m.main)}</span>` : "<b>没选</b>"} · ${backup(m.main_backup)}<br>负责思考和安排`)}
+      ${row("tools", "子 agent 模型", `${m.worker ? `<span class="mono">${esc(m.worker)}</span>` : "<b>没选</b>"} · ${backup(m.worker_backup)}<br>负责动手干活`)}
+      ${row("sparkles", "Jev", `快速判断群消息 · 密钥${m.jev_key_set === false ? "<b>没填</b>" : m.jev_key_set ? "已填" : "在「全部配置」里"} <button type="button" class="link-btn" data-act="cfg-goto" data-s="jev">去填 Jev 密钥</button>`)}`;
   }
 
   const draft = { models: null }; // 模型表单里临时拉到的列表
@@ -2040,66 +2155,91 @@
     const checked = draft.models ? `刚刚测过 · 找到 ${draft.models.length} 个模型` : m.checked_at ? `${when(m.checked_at)} 测过 · 找到 ${(m.available || []).length} 个模型` : "";
     return `
       <h2 class="h-sub">修改</h2>
-      <p class="h-meta sheet-lead">MaiWork 用自己的模型，不占用 MaiBot 的。填一个 OpenAI 兼容的地址（比如 NewAPI），再选模型。</p>
+      <p class="h-meta sheet-lead">填一个 OpenAI 兼容的地址，再选模型</p>
       <form id="models" class="login" autocomplete="off">
         <label for="m-url">端点地址</label>
         <input id="m-url" name="m-url" type="url" inputmode="url" spellcheck="false" value="${esc(m.base_url || "")}" placeholder="https://…/v1" />
         <label for="m-key" style="margin-top:6px">API 密钥</label>
         <input id="m-key" name="m-key" type="password" autocomplete="new-password" placeholder="${m.key_set ? "已填写 · 留空就不改" : "粘贴密钥"}" />
-        <p class="fine" style="margin:0">保存后写进服务器上插件的 config.toml；网页上看不到密钥，只会显示「已填」。</p>
+        
         <div class="actions" style="margin-top:4px"><button class="btn" type="button" data-act="models-test">测试连接</button><span class="fine" id="m-check" style="margin:0;align-self:center">${esc(checked)}</span></div>
 
         <h2 class="h-sub">主模型</h2>
-        <p class="fine" style="margin:0 0 4px">理解群、出资讯和构想、派活和验收。选聪明一点的。</p>
+        <p class="fine" style="margin:0 0 4px">负责思考和安排，选聪明的</p>
         ${modelSelect("m-main", m.main, list)}
         <label for="m-main-b">出错时换用</label>
         ${modelSelect("m-main-b", m.main_backup, list, true)}
 
         <h2 class="h-sub">子 agent 模型</h2>
-        <p class="fine" style="margin:0 0 4px">真正动手写代码、查资料、做文件。用得最多，选便宜耐用的。</p>
+        <p class="fine" style="margin:0 0 4px">负责动手干活，选便宜耐用的</p>
         ${modelSelect("m-worker", m.worker, list)}
         <label for="m-worker-b">出错时换用</label>
         ${modelSelect("m-worker-b", m.worker_backup, list, true)}
 
         <h2 class="h-sub">失败重试</h2>
-        <p class="fine" style="margin:0 0 4px">模型端点连不上、超时、限流或出错时，隔一会儿再试；试完还不行才换备用模型。后台主循环里的调用（比如冷场开场白）只重试 1 次，免得卡住别的事。</p>
+        <p class="fine" style="margin:0 0 4px">出错时隔一会儿再试，还不行就换备用模型</p>
         <div class="two-col">
           <div><label for="m-retries">最多重试几次</label><input id="m-retries" type="number" min="0" max="10" step="1" value="${esc(m.retries ?? 5)}" /></div>
           <div><label for="m-retry-delay">每次间隔（秒）</label><input id="m-retry-delay" type="number" min="1" max="60" step="1" value="${esc(m.retry_delay_s ?? 10)}" /></div>
         </div>
 
         <h2 class="h-sub">请求频率</h2>
-        <p class="fine" style="margin:0 0 4px">端点说「请求太多」（429）时，整个端点会先歇一会儿再发（10 秒起，越限越久，最多 2 分钟）。经常被限就把同时请求调成 1，或者设个每分钟上限。</p>
+        <p class="fine" style="margin:0 0 4px">经常提示请求太多，就调小一点</p>
         <div class="two-col">
           <div><label for="m-conc">同时最多几个请求</label><input id="m-conc" type="number" min="1" max="8" step="1" value="${esc(m.max_concurrency ?? 2)}" /></div>
           <div><label for="m-rpm">每分钟最多（0 = 不限）</label><input id="m-rpm" type="number" min="0" max="600" step="1" value="${esc(m.max_rpm ?? 0)}" /></div>
         </div>
+        <h2 class="h-sub">上下文长度</h2>
+        <p class="fine" style="margin:0 0 4px">填模型能记住的最大长度（tokens）。对话快满时，MaiWork 会把前面的内容整理成摘要再接着做</p>
+        <div class="two-col">
+          <div><label for="m-ctx">上下文长度（tokens）</label><input id="m-ctx" type="number" min="8192" max="2000000" step="1024" value="${esc(m.context_window ?? 128000)}" /></div>
+          <div></div>
+        </div>
         <p class="err" id="m-err" hidden></p>
         <button class="btn primary wide" type="submit">保存</button>
-        <p class="fine">保存后下一次调用就用新设置，正在跑的任务不受影响。不会让 MaiBot 重载插件。</p>
+        
       </form>`;
   }
 
   function loginSheet() {
+    if (isGA())
+      return `
+      <h1 class="h-page">群管理员</h1>
+      <p class="h-meta sheet-lead">你管的是「${esc(gname(grp()))}」：能批准本群派的活、改群画像和资讯偏好。关注成员的个人画像只能看。</p>
+      <div class="actions" style="margin-top:22px"><button class="btn" data-act="logout">退出</button></div>
+      <p class="fine" style="margin-top:22px">要用别的密码登录，先退出。</p>`;
     return `
       <h1 class="h-page">管理员</h1>
-      <p class="h-meta sheet-lead">输入密码后能看到所有群，也能批准任务、修改群画像、查看设置。</p>
+      
       <form id="login" class="login" autocomplete="off">
         <label for="pw">密码</label>
-        <input id="pw" name="pw" type="password" autocomplete="current-password" placeholder="管理员密码" />
+        <input id="pw" name="pw" type="password" autocomplete="current-password" placeholder="管理员或群管理员密码" />
         <p class="err" ${state.loginError ? "" : "hidden"}>${esc(state.loginError)}</p>
         <button class="btn primary wide" type="submit">进入管理</button>
-        <p class="fine">密码在服务器上 MaiWork 的数据目录里（console_password.txt），或者是 config.toml 里 [console] 的 password。</p>
+        <p class="fine">忘了密码？在服务器上 MaiWork 数据目录的 console_password.txt 里</p>
       </form>`;
   }
 
   function editSheet() {
     const e = state.editing || {};
-    const title = e.kind === "focus" ? "加一个关注成员" : e.kind === "pref" ? "这个群想看什么" : e.id ? "改这一条" : `加到「${(CATS.find((c) => c[0] === e.cat) || [, ""])[1]}」`;
+    if (e.kind === "ga")
+      return `
+      <h1 class="h-page">群管理员 · ${esc(e.name || "")}</h1>
+      <p class="h-meta sheet-lead">能批准本群派的活、改群画像和资讯偏好；看不到别的群和全局设置</p>
+      <form id="edit" class="login" autocomplete="off">
+        <label for="ga-pw">网页密码</label>
+        <input id="ga-pw" type="password" autocomplete="new-password" placeholder="${e.password_set ? "已设置 · 留空就不改" : "至少 8 位 · 可以不填"}" />
+        <label>群里能批准的人</label>
+        ${chipEditor("ga-accs", "accounts", e.accounts || [])}
+        <p class="err" id="ed-err" hidden></p>
+        <button class="btn primary wide" type="submit">保存</button>
+        ${e.password_set ? `<button class="btn wide" type="button" data-act="ga-clear" style="margin-top:10px">清掉网页密码</button>` : ""}
+      </form>`;
+    const title = e.kind === "focus" ? "加一个关注成员" : e.kind === "pref" ? "这个群想看什么（可选）" : e.id ? "改这一条" : `加到「${(CATS.find((c) => c[0] === e.cat) || [, ""])[1]}」`;
     const isFocus = e.kind === "focus";
     return `
       <h1 class="h-page">${esc(title)}</h1>
-      <p class="h-meta sheet-lead">${isFocus ? "填这个人的 QQ 号。关注成员的个人画像只有管理员看得到，不会出现在群里。" : e.kind === "pref" ? "一句话写清想看什么、不想看什么，比如「多找自部署和开源硬件的，少一点手机评测」。群友也看得到这句。" : "你改过或加的条目会自动锁定，MaiWork 以后不会改写它。"}</p>
+      <p class="h-meta sheet-lead">${isFocus ? "个人画像只有管理员看得到" : e.kind === "pref" ? "比如「多找自部署和开源硬件的，少一点手机评测」" : "改过的条目 MaiWork 不会再动"}</p>
       <form id="edit" class="login" autocomplete="off">
         ${
           isFocus
@@ -2222,7 +2362,22 @@
       </div>`;
   }
 
+  // 整理出来的摘要（meta.kind = summary）：默认收起，点开看全文
+  function chatSummaryHTML(m) {
+    const meta = m.meta || {};
+    const open = state.chatOpen && state.chatOpen["s" + m.id];
+    const span = meta.from_ts && meta.to_ts ? `${when(meta.from_ts)} – ${when(meta.to_ts)}` : "";
+    return `
+      <div class="cm-summary${open ? " open" : ""}">
+        <button class="cm-summary-h" data-act="chat-summary" data-id="${m.id}" aria-expanded="${!!open}">
+          ${ico("memo", "")}<span class="cm-summary-l">前面的对话已整理成摘要${meta.covers ? `<small>${meta.covers} 条${span ? ` · ${esc(span)}` : ""}</small>` : ""}</span>${SVG.down}
+        </button>
+        ${open ? `<div class="cm-summary-b md">${mdLite(m.content || "")}</div>` : ""}
+      </div>`;
+  }
+
   function chatMsgHTML(m) {
+    if (m.meta && m.meta.kind === "summary") return chatSummaryHTML(m);
     if (m.role === "user") return `<div class="cm cm-user"><div class="cm-bubble">${esc(m.content || "")}</div></div>`;
     if (m.role === "tool") return chatToolMsg(m);
     if (m.role === "system_note") return `<div class="cm-note">${esc(m.content || "")}</div>`;
@@ -2231,7 +2386,7 @@
     if (!String(m.content || "").trim()) return calls ? "" : "";
     return `
       <div class="cm cm-bot">
-        <img class="cm-ava" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/bot.jpg'" alt="" />
+        <img class="cm-ava" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="" />
         <div class="cm-text md">${mdLite(m.content)}</div>
       </div>`;
   }
@@ -2267,12 +2422,12 @@
     const pend = (C.pending || []).filter((p) => p.status === "pending").map(pendingCard).join("");
     const empty = !C.messages.length
       ? `<div class="chat-empty">
-          <img src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/bot.jpg'" alt="" />
-          <p>直接说你想要什么。我能看各群的情况、改群画像和规则、马上备一批资讯、派任务、设目标……会让群友看到的事和删除会先请你确认。</p>
+          <img src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="" />
+          <p>想让我做什么，直接说</p>
           <div class="chat-sugs">${CHAT_SUGGEST.map((t) => `<button class="btn small" data-act="chat-suggest" data-t="${esc(t)}">${esc(t)}</button>`).join("")}</div>
         </div>`
       : "";
-    const typing = C.running ? `<div class="cm cm-bot cm-typing"><img class="cm-ava" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/bot.jpg'" alt="" /><div class="cm-dots"><i></i><i></i><i></i></div></div>` : "";
+    const typing = C.running ? `<div class="cm cm-bot cm-typing"><img class="cm-ava" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="" /><div class="cm-dots"><i></i><i></i><i></i></div></div>` : "";
     return empty + msgs + pend + typing;
   }
 
@@ -2292,6 +2447,7 @@
                 </select>`
               : ""
           }
+          ${C && C.messages.length ? `<button class="btn small" data-act="chat-compact" title="把前面的对话整理成一段摘要，之后接着聊更省、更不容易忘">整理前面的对话</button>` : ""}
           <button class="btn small chat-list-btn" data-act="chat-list">对话</button>
           <button class="btn small" data-act="chat-new">新对话</button>
         </div>
@@ -2354,13 +2510,13 @@
 
   /* ───────────── 渲染 ───────────── */
 
-  const avatar = () => (state.me && state.me.bot && state.me.bot.avatar) || "/static/assets/bot.jpg";
+  const avatar = () => (state.me && state.me.bot && state.me.bot.avatar) || "/static/assets/maimai.png";
   const botName = () => (state.me && state.me.bot && state.me.bot.name) || "MaiBot";
 
   function renderTop() {
     if (state.page === "chat") {
       $("top").innerHTML = `
-        <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/bot.jpg'" alt="${esc(botName())}" />
+        <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="${esc(botName())}" />
         <div class="chip">和 MaiWork 聊</div>
         <div class="chip-sub">管理员</div>
         <button class="round-btn" data-act="tab" data-tab="${state.tab}" aria-label="回到群">${SVG.close}</button>`;
@@ -2368,7 +2524,7 @@
     }
     if (state.page === "settings") {
       $("top").innerHTML = `
-        <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/bot.jpg'" alt="${esc(botName())}" />
+        <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="${esc(botName())}" />
         <div class="chip">设置</div>
         <div class="chip-sub">管理员</div>
         <button class="round-btn" data-act="tab" data-tab="${state.tab}" aria-label="回到群">${SVG.close}</button>`;
@@ -2377,13 +2533,13 @@
     const g = grp();
     const q = quiet(g);
     $("top").innerHTML = `
-      <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/bot.jpg'" alt="${esc(botName())}" />
+      <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="${esc(botName())}" />
       ${admin() && state.groups.length > 1 ? `<button class="chip" data-act="groups" aria-label="切换群，当前：${esc(gname(g))}">${mq(gname(g))}${SVG.down}</button>` : `<div class="chip">${mq(gname(g))}</div>`}
       <div class="chip-sub"><span class="dot ${q.live ? "ok" : ""}"></span>${esc(q.text)}</div>
       ${
         admin()
           ? `<button class="round-btn left" data-act="chat" aria-label="和 MaiWork 聊">${SVG.chat}</button><button class="round-btn" data-act="settings" aria-label="设置">${SVG.sliders}</button>`
-          : `<button class="round-btn" data-act="login" aria-label="管理员登录">${SVG.key}</button>`
+          : `<button class="round-btn" data-act="login" aria-label="${isGA() ? "群管理员" : "管理员登录"}">${SVG.key}</button>`
       }`;
   }
 
@@ -2399,7 +2555,7 @@
         (t) => `
         <button class="tab" data-act="tab" data-tab="${t.id}" aria-current="${idx >= 0 && t.id === state.tab}">
           ${SVG[t.id]}<span class="sr">${t.label}</span>
-          ${admin() && t.id === "tasks" && n ? `<span class="badge">${n}</span>` : ""}
+          ${gadmin() && t.id === "tasks" && n ? `<span class="badge">${n}</span>` : ""}
         </button>`
       ).join("");
   }
@@ -2410,8 +2566,8 @@
     const n = pendingCount(g);
     $("rail").innerHTML = `
       <div class="brand">
-        <img src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/bot.jpg'" alt="${esc(botName())}" />
-        <div class="brand-t"><div class="brand-name">MaiWork</div><div class="brand-sub">${admin() ? "管理员 · 全部群" : esc(botName()) + "的后台"}</div></div>
+        <img src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="${esc(botName())}" />
+        <div class="brand-t"><div class="brand-name">MaiWork</div><div class="brand-sub">${admin() ? "管理员 · 全部群" : isGA() ? "群管理员" : esc(botName()) + "的后台"}</div></div>
       </div>
       ${admin() ? `<div class="rail-label">群</div>` : ""}
       ${list
@@ -2420,7 +2576,7 @@
         <button class="r-item" data-act="group" data-g="${esc(x.id)}" aria-current="${x.id === state.g}" title="${esc(gname(x))}">
           ${gface(x)}
           <span class="r-text"><span class="r-name">${mq(gname(x))}</span><span class="r-sub">${esc(quiet(x).text)}</span></span>
-          ${admin() && pendingCount(x) ? `<span class="r-badge">${pendingCount(x)}</span><span class="r-dot"></span>` : ""}
+          ${gadmin() && pendingCount(x) ? `<span class="r-badge">${pendingCount(x)}</span><span class="r-dot"></span>` : ""}
         </button>`
         )
         .join("")}
@@ -2430,7 +2586,7 @@
         (t) => `
         <button class="r-item" data-act="tab" data-tab="${t.id}" aria-current="${!state.page && t.id === state.tab}" title="${t.label}">
           ${SVG[t.id]}<span class="r-text"><span class="r-name">${t.label}</span></span>
-          ${admin() && t.id === "tasks" && n ? `<span class="r-badge">${n}</span><span class="r-dot"></span>` : ""}
+          ${gadmin() && t.id === "tasks" && n ? `<span class="r-badge">${n}</span><span class="r-dot"></span>` : ""}
         </button>`
       ).join("")}
       <div class="rail-foot">
@@ -2438,7 +2594,7 @@
         ${
           admin()
             ? `<button class="r-item" data-act="settings" title="设置" aria-current="${state.page === "settings"}">${SVG.sliders}<span class="r-text"><span class="r-name">设置</span></span>${state.settings && state.settings.models && !state.settings.models.ready ? `<span class="r-badge">!</span><span class="r-dot"></span>` : ""}</button>`
-            : `<button class="r-item" data-act="login" title="管理员">${SVG.key}<span class="r-text"><span class="r-name">管理员</span></span></button>`
+            : `<button class="r-item" data-act="login" title="${isGA() ? "群管理员" : "管理员"}">${SVG.key}<span class="r-text"><span class="r-name">${isGA() ? "群管理员" : "管理员"}</span></span></button>`
         }
       </div>`;
   }
@@ -2475,7 +2631,7 @@
       <div class="stats">
         <button class="stat" data-act="tab" data-tab="news"><b>${t.news || 0}</b><span>条资讯</span></button>
         <button class="stat" data-act="tab" data-tab="group"><b>${t.topics || 0}</b><span>次开话题</span></button>
-        <button class="stat" data-act="tab" data-tab="tasks"><b>${t.pending || 0}</b><span>${admin() ? "件等你批准" : "件等批准"}</span></button>
+        <button class="stat" data-act="tab" data-tab="tasks"><b>${t.pending || 0}</b><span>${gadmin() ? "件等你批准" : "件等批准"}</span></button>
         <button class="stat" data-act="tab" data-tab="tasks"><b>${t.running || 0}</b><span>件在做</span></button>
       </div>
       ${
@@ -2543,7 +2699,7 @@
     const bad = state.badLink;
     return `
       <div class="landing">
-        <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/bot.jpg'" alt="" style="width:120px;height:120px" />
+        <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="" style="width:120px;height:120px" />
         <h1 class="h-page" style="margin-top:22px">MaiWork</h1>
         <p class="landing-text">${esc(botName())}在群里的后台：资讯、构想、目标和任务都在这里。</p>
         ${bad ? `<div class="warn-box" style="width:100%;text-align:left">这个链接打不开了：可能是管理员重置过，或者复制时少了几个字。请在群里重新发 <b>/mw 网页</b> 拿新链接。</div>` : ""}
@@ -2558,9 +2714,9 @@
   function noGroups() {
     return `
       <div class="landing">
-        <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/bot.jpg'" alt="" style="width:120px;height:120px" />
+        <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="" style="width:120px;height:120px" />
         <h1 class="h-page" style="margin-top:22px">还没有服务群</h1>
-        <p class="landing-text">在插件的 config.toml 里 [groups] 下加上群号、把 enabled 打开，群就会出现在这里。</p>
+        <p class="landing-text">在设置里加上要服务的群</p>
         <button class="btn primary" data-act="settings" style="height:48px;padding:0 28px">打开设置</button>
       </div>`;
   }
@@ -2686,7 +2842,7 @@
     }
     const g = grp();
     if (!g) return;
-    const ref = admin() ? g.id : state.ref;
+    const ref = gadmin() ? g.id : state.ref;
     const h = `#/${ref}/${state.tab}` + (state.detail ? `/${state.detail.id}` : "");
     if (location.hash !== h) history.replaceState(null, "", h);
   }
@@ -2704,7 +2860,7 @@
     if (h.chat && h.id) state.chatId = Number(h.id) || h.id;
     if (h.settings) state.setSub = SET_SUBS.some((x) => x[0] === h.sub) ? h.sub : "overview";
     if (TABS.some((x) => x.id === h.tab)) state.tab = h.tab;
-    if (admin()) {
+    if (gadmin()) {
       const hit = state.groups.find((x) => x.id === h.ref || x.token === h.ref);
       state.g = hit ? hit.id : state.g && state.groups.some((x) => x.id === state.g) ? state.g : state.groups.length ? state.groups[0].id : null;
     }
@@ -2719,7 +2875,7 @@
     state.me = me;
     if (me.now) state.skew = me.now - Date.now() / 1000;
     state.badLink = me.role === "none" && !!h.ref;
-    if (me.role === "member") state.g = me.group;
+    if (me.role === "member" || me.role === "group_admin") state.g = me.group;
   }
 
   async function loadGroups() {
@@ -2778,8 +2934,10 @@
       ? loadSettings().then(async () => {
           if (state.page === "settings" && state.setSub === "extensions") await loadExt();
           if (state.page === "settings" && state.setSub === "rules") await loadRules();
+          if (state.page === "settings" && state.setSub === "usage") await loadUsage();
           if (state.page === "settings" && state.setSub === "identity") await loadIdentity();
           if (state.page === "settings" && state.setSub === "logs") await loadLogs();
+          if (state.page === "settings" && state.setSub === "links") await loadGA();
           renderRail();
           repaintSheet();
         })
@@ -2814,6 +2972,7 @@
     if (state.setSub === "usage") await loadUsage();
     if (state.setSub === "identity") await loadIdentity();
     if (state.setSub === "logs") await loadLogs();
+    if (state.setSub === "links") await loadGA();
     if (state.page === "settings") {
       renderView();
       renderSide();
@@ -3051,6 +3210,33 @@
         $("chat-input").value = el.dataset.t;
         $("chat-input").focus();
         break;
+      case "chat-summary":
+        state.chatOpen["s" + el.dataset.id] = !state.chatOpen["s" + el.dataset.id];
+        paintChat(false);
+        break;
+      case "chat-compact": {
+        const C = state.chat;
+        if (!C) break;
+        if (C.running) {
+          toast("MaiWork 还在回话，等它说完再整理");
+          break;
+        }
+        el.disabled = true;
+        const label = el.textContent;
+        el.textContent = "整理中…";
+        try {
+          await api("POST", `/api/chat/${encodeURIComponent(C.id)}/compact`);
+          await loadChat(C.id);
+          paintChat(true);
+          toast("前面的对话整理好了");
+        } catch (err) {
+          toast(err.status === 409 ? "MaiWork 还在回话，等它说完再整理" : err.message, true);
+        } finally {
+          el.disabled = false;
+          el.textContent = label;
+        }
+        break;
+      }
       case "chat-tool":
         state.chatOpen[el.dataset.id] = !state.chatOpen[el.dataset.id];
         paintChat(false);
@@ -3364,7 +3550,7 @@
         break;
       }
       case "search-off": {
-        if (!confirm("不用联网搜索？资讯和给关注成员找的内容会暂停找新的，直到重新指定。")) break;
+        if (!confirm("不用联网搜索？资讯会暂停更新")) break;
         try {
           await api("DELETE", "/api/extensions/search");
           state.searchEdit = false;
@@ -3461,8 +3647,32 @@
           toast("复制不了，手动选中复制吧", true);
         }
         break;
+      case "ga-edit": {
+        const gid = el.dataset.g;
+        try {
+          const r = state.ga[gid] || (state.ga[gid] = await api("GET", `/api/groups/${encodeURIComponent(gid)}/group-admin`));
+          state.editing = { kind: "ga", gid, name: el.dataset.name, password_set: !!r.password_set, accounts: r.accounts || [] };
+          openSheet("edit");
+        } catch (err) {
+          toast(err.message, true);
+        }
+        break;
+      }
+      case "ga-clear": {
+        const ed = state.editing || {};
+        if (!confirm("清掉后，用这个密码登录的人会马上退出。确定？")) break;
+        try {
+          state.ga[ed.gid] = await api("DELETE", `/api/groups/${encodeURIComponent(ed.gid)}/group-admin/password`);
+          closeSheet();
+          repaintSheet();
+          toast("清掉了");
+        } catch (err) {
+          toast(err.message, true);
+        }
+        break;
+      }
       case "reset-link": {
-        if (!confirm("重置后旧链接马上失效，群友要重新发 /mw 网页 拿新链接。确定重置？")) break;
+        if (!confirm("重置后旧链接会失效，群友要重新发 /mw 网页 拿新链接。确定重置？")) break;
         try {
           await api("POST", `/api/groups/${encodeURIComponent(el.dataset.g)}/token`, {});
           await Promise.all([loadGroups(), loadSettings()]);
@@ -3511,7 +3721,9 @@
         const op = el.dataset.op;
         el.disabled = true;
         try {
-          await api("POST", `/api/ideas/${encodeURIComponent(el.dataset.id)}/${op}`, {});
+          const it = op === "do" ? findIdea(el.dataset.id) : null;
+          const body = it && ideaItems(it).length ? { items: ideaPicked(it).map((x) => x.no) } : {};
+          await api("POST", `/api/ideas/${encodeURIComponent(el.dataset.id)}/${op}`, body);
           state.ideaMore = null;
           await loadView(true);
           renderTopBits();
@@ -3664,6 +3876,15 @@
         state.ideaMore = state.ideaMore === Number(el.dataset.id) ? null : Number(el.dataset.id);
         refreshDetail();
         break;
+      case "idea-item": {
+        const id = Number(el.dataset.id);
+        const no = Number(el.dataset.no);
+        state.ideaOff = state.ideaOff || {};
+        const off = state.ideaOff[id] || [];
+        state.ideaOff[id] = off.includes(no) ? off.filter((x) => x !== no) : off.concat(no);
+        refreshDetail();
+        break;
+      }
       case "idea-copy": {
         const it = findIdea(el.dataset.id);
         if (!it) break;
@@ -3774,13 +3995,13 @@
     const bot = (state.me && state.me.bot) || {};
     if (id === "hello")
       return `
-        <div class="onb-hero"><img class="onb-avatar" src="${esc(bot.avatar || "/static/assets/bot.jpg")}" alt="" /><span class="onb-spark">${ico("sparkles", "ico")}</span></div>
+        <div class="onb-hero"><img class="onb-avatar" src="${esc(bot.avatar || "/static/assets/maimai.png")}" alt="" /><span class="onb-spark">${ico("sparkles", "ico")}</span></div>
         <h1 class="onb-title">欢迎用 MaiWork</h1>
-        <p class="onb-lead">MaiWork 会读懂你服务的群，主动出资讯、提构想、接活干活。先花两分钟把几样东西配好。</p>
+        <p class="onb-lead">花两分钟配好几样东西就能开始</p>
         <ul class="onb-list">
-          <li>${ico("robot")}<div><b>模型</b><span>MaiWork 用自己的模型，不占 MaiBot 的。必填。</span></div></li>
-          <li>${ico("speech")}<div><b>服务的群</b><span>只在这些群里读消息、做事。</span></div></li>
-          <li>${ico("lock")}<div><b>管理员和密钥</b><span>可以先不填，以后在设置里改。</span></div></li>
+          <li>${ico("robot")}<div><b>模型</b><span>必填</span></div></li>
+          <li>${ico("speech")}<div><b>服务的群</b><span>MaiWork 在哪些群工作</span></div></li>
+          <li>${ico("lock")}<div><b>管理员和密钥</b><span>可以之后再填</span></div></li>
         </ul>`;
     if (id === "models") {
       const list = onb.models || m.available || [];
@@ -3792,7 +4013,7 @@
       return `
         <div class="onb-step-ico">${ico("robot")}</div>
         <h1 class="onb-title">连上模型</h1>
-        <p class="onb-lead">填一个 OpenAI 兼容的地址（比如 NewAPI）和密钥，测一下，再选模型。</p>
+        <p class="onb-lead">填一个 OpenAI 兼容的地址和密钥，再选模型</p>
         <div class="login onb-form">
           <label for="onb-url">端点地址</label>
           <input id="onb-url" type="url" inputmode="url" spellcheck="false" value="${esc(m.base_url || "")}" placeholder="https://…/v1" />
@@ -3800,9 +4021,9 @@
           <input id="onb-key" type="password" autocomplete="new-password" placeholder="${m.key_set ? "已填写 · 留空就不改" : "粘贴密钥"}" />
           <div class="onb-test"><button class="btn" type="button" data-act="onb-test">测试连接</button><span class="onb-status" id="onb-status">${list.length ? `<i class="onb-ok">${SVG.check}</i>找到 ${list.length} 个模型` : ""}</span></div>
           <div class="onb-picks ${list.length ? "" : "is-off"}">
-            <label for="onb-main">主模型 <span class="fine-inline">理解群、派活验收，选聪明的</span></label>
+            <label for="onb-main">主模型 <span class="fine-inline">选聪明的</span></label>
             ${sel("onb-main", m.main)}
-            <label for="onb-worker">子 agent 模型 <span class="fine-inline">真正干活，选便宜耐用的</span></label>
+            <label for="onb-worker">子 agent 模型 <span class="fine-inline">选便宜耐用的</span></label>
             ${sel("onb-worker", m.worker)}
           </div>
         </div>`;
@@ -3812,37 +4033,38 @@
       return `
         <div class="onb-step-ico">${ico("speech")}</div>
         <h1 class="onb-title">服务哪些群</h1>
-        <p class="onb-lead">写成 <span class="mono">qq:群号</span>。MaiWork 只在这些群里读消息和做事，别的群一概不碰。</p>
+        <p class="onb-lead">MaiWork 只在这些群里工作</p>
         <div class="login onb-form">${f ? rowsEditor("onb-serve", ROWS_COLS.serve_groups, f.value) : `<p class="fine">读不到配置，先跳过这步。</p>`}</div>
-        <p class="fine">改完马上生效，会直接写进插件的 config.toml。</p>`;
+        `;
     }
     if (id === "keys") {
       const jev = onbField("jev.api_key") || {};
       return `
         <div class="onb-step-ico">${ico("lock")}</div>
         <h1 class="onb-title">可选：快速判断</h1>
-        <p class="onb-lead">不填也能用，填了判断群消息会更快。密钥只存服务器上，网页看不到。</p>
+        <p class="onb-lead">不填也能用，填了反应更快</p>
         <div class="login onb-form">
-          <label for="onb-jev">Jev 密钥 <span class="fine-inline">判断群消息值不值得理</span></label>
+          <label for="onb-jev">Jev 密钥 </label>
           <input id="onb-jev" type="password" autocomplete="new-password" placeholder="${jev.set ? "已设置 · 留空就不改" : "没设置 · 可以不填"}" />
         </div>
-        <p class="fine">联网搜索不在这里设：引导结束后，去「设置 → 扩展」接一个能搜索的 MCP，再在最上面的「联网搜索」里选它。</p>`;
+        `;
     }
     if (id === "admins") {
       const f = onbField("approval.admins");
       return `
         <div class="onb-step-ico">${ico("bell")}</div>
         <h1 class="onb-title">谁是管理员</h1>
-        <p class="onb-lead">群友派的活要管理员批准才开工。填上你的 QQ 号，就能在群里和网页上批准。</p>
-        <div class="login onb-form">${f ? chipEditor("onb-admins", "accounts", f.value) : `<p class="fine">读不到配置，先跳过这步。</p>`}</div>`;
+        <p class="onb-lead">群友派的活要管理员批准才开工</p>
+        <div class="login onb-form">${f ? chipEditor("onb-admins", "accounts", f.value) : `<p class="fine">读不到配置，先跳过这步。</p>`}</div>
+        ${onbGaBlock()}`;
     }
     if (id === "look") {
       const a = state.avatarCfg;
-      const src = (a && a.url) || bot.avatar || "/static/assets/bot.jpg";
+      const src = (a && a.url) || bot.avatar || "/static/assets/maimai.png";
       return `
-        <div class="onb-hero"><img class="onb-avatar" id="onb-av" src="${esc(src)}" alt="" onerror="this.onerror=null;this.src='/static/assets/bot.jpg'" /></div>
+        <div class="onb-hero"><img class="onb-avatar" id="onb-av" src="${esc(src)}" alt="" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" /></div>
         <h1 class="onb-title">可选：换个头像</h1>
-        <p class="onb-lead">默认跟 MaiBot 的 QQ 头像同步。想让网页里的 MaiWork 用别的图，可以在这里换；以后在「设置 → 身份」也能改。</p>
+        <p class="onb-lead">默认和 MaiBot 一样，也可以换一张</p>
         <div class="onb-av-btns">
           <label class="btn file-btn">上传图片<input type="file" id="avatar-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden /></label>
           <button type="button" class="btn" data-act="avatar-url">用网址</button>
@@ -3856,7 +4078,7 @@
     return `
       <div class="onb-done-mark"><svg viewBox="0 0 52 52"><circle cx="26" cy="26" r="24"/><path d="M15 27l7.5 7.5L37.5 19"/></svg></div>
       <h1 class="onb-title">都准备好了</h1>
-      <p class="onb-lead">没配的以后在「设置」里随时补。想再走一遍引导，在设置概况最下面点「重新引导」。</p>
+      <p class="onb-lead">没配的随时可以在「设置」里补</p>
       <ul class="onb-list onb-summary">
         ${row(c.models, "模型", c.models ? "配好了" : "还没配，MaiWork 暂时不会做要用模型的事", 0)}
         ${row(c.groups, "服务的群", c.groups ? "已有群" : "还没有", 1)}
@@ -3864,6 +4086,32 @@
         ${row(c.search, "联网搜索", c.search ? "开了" : "没开", 3)}
         ${row(c.admins, "管理员", c.admins ? "已填" : "还没填", 4)}
       </ul>`;
+  }
+
+  // 引导「管理员」一步里的各群群管理员（可选）：网页密码 + 群里能批准的人
+  const onbServed = () => {
+    const f = onbField("groups.serve");
+    return ((f && f.value) || []).map((r) => String((r && r.group) || "").replace(/^qq:/, "")).filter((x) => /^\d+$/.test(x));
+  };
+  function onbGaBlock() {
+    const gids = onbServed().filter((gid) => onb.ga && onb.ga[gid]);
+    if (!gids.length) return "";
+    return `
+      <div class="onb-ga-head"><b>各群的群管理员</b><span>可选 · 只能管自己的群</span></div>
+      ${gids
+        .map((gid) => {
+          const x = onb.ga[gid];
+          const g = state.groups.find((y) => y.id === gid);
+          return `
+        <div class="onb-ga login">
+          <div class="onb-ga-name">${esc(gname(g) || `群 ${gid}`)}</div>
+          <label for="onb-ga-pw-${gid}">网页密码</label>
+          <input id="onb-ga-pw-${gid}" type="password" autocomplete="new-password" placeholder="${x.password_set ? "已设置 · 留空就不改" : "至少 8 位 · 可以不填"}" />
+          <label>群里能批准的人</label>
+          ${chipEditor(`onb-ga-${gid}`, "accounts", x.accounts || [])}
+        </div>`;
+        })
+        .join("")}`;
   }
 
   function onbShell() {
@@ -4065,6 +4313,22 @@
     if (id === "keys") {
       if (v("onb-jev")) patch["jev.api_key"] = v("onb-jev");
     }
+    if (id === "admins" && onb.ga) {
+      for (const gid of Object.keys(onb.ga)) {
+        const box = $(`onb-ga-${gid}`);
+        if (!box) continue;
+        const pw = ($(`onb-ga-pw-${gid}`) || {}).value || "";
+        const accounts = [...box.querySelectorAll(".ci")].map((c) => c.dataset.v);
+        if (pw && pw.length < 8) return "群管理员密码至少 8 位。";
+        const same = JSON.stringify(accounts) === JSON.stringify(onb.ga[gid].accounts || []);
+        if (!pw && same) continue;
+        try {
+          onb.ga[gid] = await api("PUT", `/api/groups/${encodeURIComponent(gid)}/group-admin`, { password: pw || undefined, accounts });
+        } catch (e) {
+          return `群 ${gid}：${e.message}`;
+        }
+      }
+    }
     if (id === "admins" && $("onb-admins")) patch["approval.admins"] = [...$("onb-admins").querySelectorAll(".ci")].map((c) => c.dataset.v);
     // 没变的不提交，免得把「要重载」标记白白点亮
     for (const k of Object.keys(patch)) {
@@ -4080,6 +4344,16 @@
     const to = Math.max(0, Math.min(ONB_STEPS.length - 1, onb.i + delta));
     if (to === onb.i) return;
     onb.i = to;
+    if (ONB_STEPS[to].id === "admins") {
+      onb.ga = {};
+      await Promise.all(
+        onbServed().map((gid) =>
+          api("GET", `/api/groups/${encodeURIComponent(gid)}/group-admin`)
+            .then((r) => (onb.ga[gid] = r))
+            .catch(() => {})
+        )
+      );
+    }
     if (ONB_STEPS[to].id === "look" && !state.avatarCfg) {
       try {
         state.avatarCfg = await api("GET", "/api/settings/avatar");
@@ -4216,10 +4490,10 @@
       if (!pw) return;
       btn.disabled = true;
       try {
-        await api("POST", "/api/login", { password: pw });
+        const r = await api("POST", "/api/login", { password: pw });
         closeSheet();
         await reboot();
-        toast("已进入管理员，能看到全部群");
+        toast(r && r.role === "group_admin" ? "已进入群管理员，能管这个群" : "已进入管理员，能看到全部群");
       } catch (err) {
         state.loginError = err.status === 429 ? "错太多次了，过 10 分钟再试。" : err.status === 401 ? "密码不对，再试一次。" : err.message;
         const p = f.querySelector(".err");
@@ -4263,6 +4537,7 @@
           retry_delay_s: Math.max(1, Math.min(60, parseInt(v("m-retry-delay"), 10) || 10)),
           max_concurrency: Math.max(1, Math.min(8, parseInt(v("m-conc"), 10) || 2)),
           max_rpm: Math.max(0, Math.min(600, parseInt(v("m-rpm"), 10) || 0)),
+          context_window: Math.max(8192, Math.min(2000000, parseInt(v("m-ctx"), 10) || 128000)),
         });
         if (state.settings) state.settings.models = r;
         draft.models = null;
@@ -4454,11 +4729,35 @@
       }
       return;
     }
+    if (f.id === "edit" && (state.editing || {}).kind === "ga") {
+      const ed = state.editing;
+      const err = $("ed-err");
+      const pw = $("ga-pw").value;
+      const accounts = [...$("ga-accs").querySelectorAll(".ci")].map((c) => c.dataset.v);
+      if (pw && pw.length < 8) {
+        err.textContent = "密码至少 8 位。";
+        err.hidden = false;
+        return;
+      }
+      btn.disabled = true;
+      try {
+        state.ga[ed.gid] = await api("PUT", `/api/groups/${encodeURIComponent(ed.gid)}/group-admin`, { password: pw || undefined, accounts });
+        closeSheet();
+        repaintSheet();
+        toast("保存好了");
+      } catch (ex) {
+        err.textContent = ex.message;
+        err.hidden = false;
+      } finally {
+        btn.disabled = false;
+      }
+      return;
+    }
     if (f.id === "edit") {
       const ed = state.editing || {};
       const text = $("ed-text").value.trim();
       const err = $("ed-err");
-      if (!text) {
+      if (!text && ed.kind !== "pref") {
         err.textContent = ed.kind === "focus" ? "填一个 QQ 号。" : "内容不能是空的。";
         err.hidden = false;
         return;
@@ -4479,7 +4778,7 @@
         closeSheet();
         await loadView(true);
         renderView();
-        toast(ed.kind === "focus" ? "加上了" : ed.kind === "pref" ? "记下了，下一轮备料就照这个找" : "保存好了，这条已锁定");
+        toast(ed.kind === "focus" ? "加上了" : ed.kind === "pref" ? (text ? "记下了，下一轮备料就照这个找" : "清空了，按群里平时聊的来找") : "保存好了，这条已锁定");
       } catch (ex) {
         err.textContent = ex.message;
         err.hidden = false;
@@ -4495,7 +4794,7 @@
   });
   window.addEventListener("hashchange", () => {
     const h = parseHash();
-    if (!admin() && h.ref !== state.ref) return reboot();
+    if (!gadmin() && h.ref !== state.ref) return reboot();
     applyHash();
     if (state.page === "chat") {
       enterChat(state.chatId);
@@ -4511,6 +4810,7 @@
         state.setSub === "usage" ? loadUsage() : null,
         state.setSub === "identity" ? loadIdentity() : null,
         state.setSub === "logs" ? loadLogs() : null,
+        state.setSub === "links" ? loadGA() : null,
       ]).then(() => render());
       return;
     }

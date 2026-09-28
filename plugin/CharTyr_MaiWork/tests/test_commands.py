@@ -383,3 +383,52 @@ class TestCoordinatorFallback:
             await asyncio.sleep(0.01)
         assert len(coord.run_calls) == 1
         assert coord.run_calls[0].startswith("T-")
+
+
+class TestApproveIdeaItems:
+    """/mw 批准走的是 approvals.approve：带项目的构想要逐个开工（和网页批准同一条路）。"""
+
+    def _idea_with_items(self, env: SimpleEnv, items: list) -> int:
+        import json as _json
+
+        with env.store.tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO ideas (group_id, icon, title, body, items, state, created, updated)"
+                " VALUES (?, 'books', '做铝价表', '整理铝价', ?, 'new', 1, 1)",
+                (G1, _json.dumps(items, ensure_ascii=False)),
+            )
+            return int(cur.lastrowid or 0)
+
+    @pytest.mark.asyncio
+    async def test_approve_multi_item_starts_all_tasks(self, tmp_path: Path) -> None:
+        started: list[str] = []
+        env = _env(tmp_path, run_task_starter=started.append)
+        idea_id = self._idea_with_items(env, [
+            {"kind": "task", "title": "抓铝价数据", "desc": "先抓一个月"},
+            {"kind": "task", "title": "做成表", "desc": ""},
+        ])
+        req = env.approvals.create(
+            G1, kind="task", title="做铝价表", quote="", via="来自构想",
+            requester_id=MEMBER, requester_name=f"名字{MEMBER}", idea_id=idea_id,
+        )
+        reply = await env.say(f"/mw 批准 {req['id']}", user=ADMIN)
+        assert "开工" in reply
+        assert started == ["T-1", "T-2"]
+        assert "T-1" in reply and "T-2" in reply
+        assert env.tasks.get("T-1")["title"] == "抓铝价数据"
+
+    @pytest.mark.asyncio
+    async def test_approve_goal_item_creates_goal_not_task(self, tmp_path: Path) -> None:
+        started: list[str] = []
+        env = _env(tmp_path, run_task_starter=started.append)
+        idea_id = self._idea_with_items(env, [
+            {"kind": "goal", "title": "每周更新铝价", "desc": "每周更新一次"},
+        ])
+        req = env.approvals.create(
+            G1, kind="task", title="做铝价表", quote="", via="来自构想",
+            requester_id=MEMBER, requester_name=f"名字{MEMBER}", idea_id=idea_id,
+        )
+        reply = await env.say(f"/mw 批准 {req['id']}", user=ADMIN)
+        assert "目标 G-1" in reply
+        assert started == []
+        assert env.goals.get("G-1")["title"] == "每周更新铝价"

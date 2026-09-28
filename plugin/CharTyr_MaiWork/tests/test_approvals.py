@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from CharTyr_MaiWork import clock
@@ -376,3 +378,114 @@ class TestCanCancel:
     def test_random_member_cannot_cancel(self, ap, mem_store, kind):
         obj = self._mk_task(mem_store, GID) if kind == "task" else self._mk_goal(mem_store, GID)
         assert ap.can_cancel(kind, obj, "99999", group_role="member") is False
+
+
+class TestIdeaItemsLanding:
+    """2026-10：批准「带项目的构想」→ 按选中的项目逐个建任务 / agent 目标。"""
+
+    ITEMS = [
+        {"kind": "task", "title": "抓铝价数据", "desc": "先把最近一个月的铝价抓下来"},
+        {"kind": "goal", "title": "每周更新铝价表", "desc": "盯着这件事，每周更新一次"},
+        {"kind": "task", "title": "把表发给群友", "desc": ""},
+    ]
+
+    def _insert_idea_with_items(self, mem_store, items=None, gid: str = GID) -> int:
+        with mem_store.tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO ideas (group_id, icon, title, body, items, state, created, updated)"
+                " VALUES (?, 'books', '做个铝价表', '把铝价整理成表', ?, 'new', 1, 1)",
+                (gid, json.dumps(self.ITEMS if items is None else items, ensure_ascii=False)),
+            )
+            return int(cur.lastrowid or 0)
+
+    def test_approve_all_items_creates_tasks_and_goal(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        idea_id = self._insert_idea_with_items(mem_store)
+        r = ap.create(GID, **dict(_DEFAULTS, idea_id=idea_id, via="来自构想"))
+        out = ap.approve(r["id"], by="42")
+        assert out["task_ids"] == ["T-1", "T-2"]     # 两个 task 项目
+        assert out["goal_ids"] == ["G-1"]            # 一个 goal 项目
+        assert out["task_id"] == "T-1" and out["goal_id"] == "G-1"
+        t1 = tasks.get("T-1")
+        assert t1["title"] == "抓铝价数据"
+        assert "先把最近一个月的铝价抓下来" in t1["req"]
+        assert "来自构想" in t1["req"]
+        g1 = goals.get("G-1")
+        assert g1["title"] == "每周更新铝价表"
+        assert g1["body"].startswith("盯着这件事")
+        assert "来自构想" in g1["by_text"]
+        # 构想标 started 并回写第一个任务
+        row = mem_store.read().execute("SELECT state, task_id FROM ideas WHERE id=?", (idea_id,)).fetchone()
+        assert row["state"] == "started" and row["task_id"] == "T-1"
+
+    def test_approve_selected_items_only(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        idea_id = self._insert_idea_with_items(mem_store)
+        r = ap.create(GID, **dict(_DEFAULTS, idea_id=idea_id, items=[2]))
+        out = ap.approve(r["id"], by="42")
+        assert out["task_ids"] == [] and out["goal_ids"] == ["G-1"]  # 只做了第 2 项
+        assert out["task_id"] is None
+        row = mem_store.read().execute("SELECT state FROM ideas WHERE id=?", (idea_id,)).fetchone()
+        assert row["state"] == "started"
+
+    def test_out_of_range_selection_falls_back_to_all(self, mem_store, tasks, goals):
+        """写了不存在的序号 → 当「全部」处理（别什么都不做）。"""
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        idea_id = self._insert_idea_with_items(mem_store)
+        r = ap.create(GID, **dict(_DEFAULTS, idea_id=idea_id, items=[9, 99]))
+        out = ap.approve(r["id"], by="42")
+        assert out["task_ids"] == ["T-1", "T-2"] and out["goal_ids"] == ["G-1"]
+
+    def test_idea_without_items_keeps_old_single_task(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        with mem_store.tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO ideas (group_id, icon, title, body, items, state, created, updated)"
+                " VALUES (?, 'bulb', '老构想', '老正文', '[]', 'pending', 1, 1)",
+                (GID,),
+            )
+            idea_id = int(cur.lastrowid or 0)
+        r = ap.create(GID, **dict(_DEFAULTS, idea_id=idea_id, title="老请求"))
+        out = ap.approve(r["id"], by="42")
+        assert out["task_ids"] == ["T-1"] and out["goal_ids"] == []
+        assert tasks.get("T-1")["title"] == "老请求"   # 用请求的标题，不按项目拆
+
+    def test_auto_approved_idea_with_items_also_expands(self, mem_store, tasks, goals):
+        """免批路径（required=False）也走同一套拆项目逻辑。"""
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=False))
+        idea_id = self._insert_idea_with_items(mem_store)
+        r = ap.create(GID, **dict(_DEFAULTS, idea_id=idea_id))
+        assert r["status"] == "approved" and r["auto"] is True
+        assert r["task_ids"] == ["T-1", "T-2"] and r["goal_ids"] == ["G-1"]
+
+    def test_maiwork_source_never_auto_approves(self, mem_store, tasks, goals):
+        """红线：MaiWork 主动提的目标永远要管理员批准，免批群 / required=False 都不生效。"""
+        ap = _approvals(
+            mem_store, tasks, goals,
+            _ApprovalSetting(required=False, exempt_groups=(GID,), exempt_users=("10001",)),
+        )
+        r = ap.create(
+            GID, kind="goal", title="盯着群里的开源项目", quote="看群里最近在聊的",
+            via="MaiWork 提议", requester_id="10001", requester_name="MaiWork",
+            source="maiwork", force_manual=True,
+        )
+        assert r["status"] == "pending" and r["auto"] is None
+        assert goals.get("G-1") is None            # 没批准就不立目标
+        view = ap.pending_view(GID)
+        assert len(view) == 1
+        assert view[0]["source"] == "maiwork"
+
+    def test_pending_view_exposes_source_and_items(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        ap.create(GID, **dict(_DEFAULTS, source="idea", items=[1, 3]))
+        view = ap.pending_view(GID)
+        assert view[0]["source"] == "idea"
+        assert view[0]["items"] == [1, 3]
+        assert view[0]["idea_id"] is None
+
+    def test_create_drops_bad_item_nos(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        r = ap.create(GID, **dict(_DEFAULTS, items=[0, -1, "x", 2, 2, 3]))
+        view = ap.pending_view(GID)
+        assert view[0]["items"] == [2, 3]
+        assert r["status"] == "pending"

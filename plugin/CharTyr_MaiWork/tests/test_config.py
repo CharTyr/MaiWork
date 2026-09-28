@@ -43,7 +43,9 @@ class TestDefaults:
         # verify_per_round / verify_minutes
         # 0.3.8：关注成员个人向产出：focus 加 personal_feeds / personal_per_day
         # 0.3.9：模型重试设置：[models] 加 retries / retry_delay_s
-        assert CONFIG_VERSION == "0.3.10"
+        # 0.3.10：管理员 / 免批名单改成「平台:账号」
+        # 0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
+        assert CONFIG_VERSION == "0.4.0"
         assert MaiWorkConfig().plugin.config_version == CONFIG_VERSION
 
     def test_railway_verify_new_fields_defaults(self) -> None:
@@ -80,6 +82,7 @@ class TestDefaults:
         assert s.feeds.news_slots == ("08:30", "14:00", "19:00")
         assert s.feeds.news_jitter_minutes == 30
         assert s.feeds.ideas_per_day == 1
+        assert s.goals.propose is True  # 主动提目标默认开
         assert s.topics.enabled is True
         assert s.topics.speaker == "maiwork"
         assert s.topics.per_day == 2

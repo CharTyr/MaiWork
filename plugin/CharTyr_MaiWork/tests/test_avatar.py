@@ -158,7 +158,7 @@ class TestBotAvatarNoLogin:
             client = TestClient(server, cookie_jar=aiohttp.CookieJar(unsafe=True))
             await client.start_server()
             r = await client.get("/api/avatar/bot")
-            assert r.status == 404  # 前端回落 /static/assets/bot.jpg
+            assert r.status == 404  # 前端回落 /static/assets/maimai.png
             await client.close()
         finally:
             await app.stop()
@@ -329,7 +329,7 @@ class TestAvatarSettings:
         r = await env.client.get("/api/me")
         data = await r.json()
         assert data["bot"]["avatar"].startswith("/api/avatar/bot?v=")
-        assert "bot.jpg" not in data["bot"]["avatar"]
+        assert "maimai.png" not in data["bot"]["avatar"]
 
     @pytest.mark.asyncio
     async def test_jpeg_gif_webp_magic_accepted(self, env) -> None:

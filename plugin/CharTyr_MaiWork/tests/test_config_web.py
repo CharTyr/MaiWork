@@ -144,7 +144,8 @@ class TestSchemaCoverage:
         for f in rules_mod.CONFIG_SCHEMA:
             assert f["key"].count(".") == 1
             assert f["type"] in types
-            assert f["label"] and f["help"]
+            # 说明是可选的（2026-09-28：网页文案按产品口吻精简，名字已经说清楚的不再配说明）
+            assert f["label"] and isinstance(f["help"], str)
             assert f["applies"] in ("now", "reload")
             if f["type"] == "enum":
                 assert f.get("options"), f'{f["key"]} 是 enum 但没给 options'
@@ -169,9 +170,10 @@ class TestConfigApi:
         ids = [s["id"] for s in data["sections"]]
         # 「启用 MaiWork」总开关不上网页（关了网页自己就没了），整个「插件」分区不列
         assert "plugin.enabled" not in {f["key"] for sec in data["sections"] for f in sec["fields"]}
+        # 0.4.0：模型上下文窗口（models 节）+ 任务安全网（tasks 节）也上网页「全部配置」
         assert ids == [
-            "groups", "focus", "feeds", "topics", "delivery", "approval",
-            "jev", "usage", "console", "environments", "profile",
+            "groups", "focus", "feeds", "goals", "topics", "delivery", "approval",
+            "tasks", "models", "jev", "usage", "console", "environments", "profile",
             "storage", "group_space",
         ]
         assert data["file"] == "config.toml"

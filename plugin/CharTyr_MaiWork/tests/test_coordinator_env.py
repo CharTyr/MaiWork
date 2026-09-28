@@ -88,7 +88,7 @@ class FakeWorkers:
         self.before_return = None
 
     async def run(self, brief, *, group_id, tools, task_id="", actor="", max_steps=12,
-                  output_schema=None, workspace=None):
+                  output_schema=None, workspace=None, system_extra=""):
         self.calls.append(
             {
                 "brief": brief,
@@ -99,6 +99,7 @@ class FakeWorkers:
                 "max_steps": max_steps,
                 "output_schema": output_schema,
                 "workspace": workspace,
+                "system_extra": system_extra,
             }
         )
         if self.before_return is not None:

@@ -121,6 +121,24 @@ class TestStaticAndMisc:
         assert r.headers.get("X-Frame-Options") == "DENY"
 
     @pytest.mark.asyncio
+    async def test_index_versions_assets(self, env: SimpleEnv) -> None:
+        """部署新版后浏览器不能还用缓存的旧 app.js / style.css：首页给资源带内容版本号。"""
+        import hashlib
+        import re as _re
+
+        from CharTyr_MaiWork.console import server as _srv
+
+        r = await env.client.get("/")
+        html = await r.text()
+        for name in ("app.js", "style.css"):
+            m = _re.search(r"/static/" + _re.escape(name) + r"\?v=([0-9a-f]{8,})", html)
+            assert m, f"{name} 没带版本号"
+            digest = hashlib.sha256((_srv._STATIC_DIR / name).read_bytes()).hexdigest()
+            assert digest.startswith(m.group(1))
+        r2 = await env.client.get("/static/app.js?v=abc")
+        assert r2.status == 200
+
+    @pytest.mark.asyncio
     async def test_static_files_served(self, env: SimpleEnv) -> None:
         r = await env.client.get("/static/app.js")
         assert r.status == 200
@@ -828,8 +846,8 @@ class _FakeFeeds:
             raise KeyError(item_id)
         return dict(self.feedback_result)
 
-    def idea_action(self, idea_id, op, *, by=""):
-        self.idea_calls.append((int(idea_id), str(op), str(by)))
+    def idea_action(self, idea_id, op, *, by="", item_nos=None):
+        self.idea_calls.append((int(idea_id), str(op), str(by), item_nos))
         if int(idea_id) in self.missing:
             raise KeyError(idea_id)
         out = dict(self.idea_result)
@@ -933,7 +951,7 @@ class TestM2RoutesAuth:
         assert r.status == 200, r.status
         data = await r.json()
         assert data["state"] == "wanted"
-        assert m2_client.app.feeds.idea_calls[0] == (11, "want", "群友（网页）")
+        assert m2_client.app.feeds.idea_calls[0] == (11, "want", "群友（网页）", None)
 
     @pytest.mark.asyncio
     async def test_member_cannot_want_other_group_idea(self, m2_client) -> None:
@@ -967,6 +985,32 @@ class TestM2RoutesAuth:
         assert r.status == 200, r.status
         r = await m2_client.client.post("/api/topics/5/verdict", json={"value": "fly"})
         assert r.status == 400, r.status
+
+    @pytest.mark.asyncio
+    async def test_admin_do_passes_picked_items_to_feeds(self, m2_client) -> None:
+        """「直接开工」body 里的 items（构想项目序号）要原样传给 feeds.idea_action。"""
+        from CharTyr_MaiWork.console.auth import COOKIE_NAME
+        from CharTyr_MaiWork.console.server import AUTH_KEY
+
+        auth = None
+        for v in vars(m2_client.client._server).values():
+            try:
+                auth = v[AUTH_KEY]
+                break
+            except Exception:
+                continue
+        assert auth is not None, "摸不到 ConsoleAuth"
+        value, _max_age = auth.make_cookie()
+        m2_client.client.session.cookie_jar.update_cookies({COOKIE_NAME: value})
+
+        r = await m2_client.client.post("/api/ideas/11/do", json={"items": [1, 3]})
+        assert r.status == 200, r.status
+        assert m2_client.app.feeds.idea_calls[-1] == (11, "do", "管理员", [1, 3])
+
+        # 不带 body / body 里没有 items → None（= 全部）
+        r = await m2_client.client.post("/api/ideas/11/do")
+        assert r.status == 200, r.status
+        assert m2_client.app.feeds.idea_calls[-1] == (11, "do", "管理员", None)
 
     @pytest.mark.asyncio
     async def test_feedback_unknown_item_404(self, m2_client) -> None:
@@ -1160,6 +1204,79 @@ class TestM3Routes:
         assert "delivery" in detail and "undelivered" in detail
 
     @pytest.mark.asyncio
+    async def test_task_detail_includes_link_check(self, env: SimpleEnv) -> None:
+        """验收引用核对的结构化结果（coordinator 存 kv）要出现在任务详情里；没有就 null。"""
+        await env.login()
+        tid = self._make_task(env.app)
+        r0 = await env.client.get(f"/api/tasks/{tid}")
+        assert (await r0.json())["link_check"] is None
+        with env.app.store.tx() as conn:
+            env.app.store.kv_set(
+                conn,
+                f"task.link_check.{tid}",
+                {
+                    "ts": 123.0,
+                    "attempt": 1,
+                    "links": 3,
+                    "unopened": 1,
+                    "unopened_urls": ["https://never.example/x"],
+                },
+            )
+        r = await env.client.get(f"/api/tasks/{tid}")
+        assert r.status == 200
+        detail = await r.json()
+        assert detail["link_check"] == {
+            "links": 3, "unopened": 1, "unopened_urls": ["https://never.example/x"],
+        }
+        # 群友版也给这个字段
+        token = env.app.token_of(G1)
+        r2 = await env.client.get(f"/api/tasks/{tid}", headers={"X-MW-Group": token})
+        assert r2.status == 200
+        member = await r2.json()
+        assert member["link_check"]["unopened"] == 1
+
+    @pytest.mark.asyncio
+    async def test_split_tasks_all_get_approval_info(self, env: SimpleEnv) -> None:
+        """构想拆成多个任务落地：任务列表和任务详情对**每个**任务都给批准人 / 自动审核理由。"""
+        await env.login()
+        app = env.app
+        now = clock.now()
+        with app.store.tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO ideas (group_id, icon, title, body, items, state, created, updated)"
+                " VALUES (?, 'bulb', '做两件事', '', ?, 'wanted', ?, ?)",
+                (
+                    G1,
+                    json.dumps(
+                        [
+                            {"kind": "task", "title": "第一件", "desc": ""},
+                            {"kind": "task", "title": "第二件", "desc": ""},
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    now,
+                    now,
+                ),
+            )
+            idea_id = int(cur.lastrowid or 0)
+        req = app.approvals.create(
+            G1, kind="task", title="做两件事", quote="", via="来自构想",
+            requester_id="", requester_name="阿柒", idea_id=idea_id,
+        )
+        res = app.approvals.approve(req["id"], by="网页管理员", auto_reason="查资料的小活，低风险")
+        tids = [str(t) for t in res["task_ids"]]
+        assert len(tids) == 2
+        for tid in tids:
+            detail = await (await env.client.get(f"/api/tasks/{tid}")).json()
+            assert detail["approved_by"] == "网页管理员"
+            assert detail["auto_reason"] == "查资料的小活，低风险"
+        view = await (await env.client.get(f"/api/groups/{G1}")).json()
+        by_id = {str(t.get("id")): t for t in view["tasks"]["list"]}
+        for tid in tids:
+            assert by_id[tid]["approved_by"] == "网页管理员"
+            assert by_id[tid]["auto_reason"] == "查资料的小活，低风险"
+
+    @pytest.mark.asyncio
     async def test_task_detail_member_sees_no_env_no_timeline(self, env: SimpleEnv) -> None:
         token = env.app.token_of(G1)
         tid = self._make_task(env.app, G1)
@@ -1204,6 +1321,42 @@ class TestM3Routes:
                 break
             await asyncio.sleep(0.02)
         assert tid in coord.run_calls
+
+    @pytest.mark.asyncio
+    async def test_request_approve_idea_items_spawns_all_tasks(self, env: SimpleEnv) -> None:
+        """网页批准带项目的构想：逐个落任务，返回 task_ids，并把每个都开工。"""
+        import json as _json
+
+        from fakes import FakeCoordinator
+
+        coord = FakeCoordinator()
+        env.app.coordinator = coord
+        with env.app.store.tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO ideas (group_id, icon, title, body, items, state, created, updated)"
+                " VALUES (?, 'books', '做铝价表', '整理铝价', ?, 'new', 1, 1)",
+                (G1, _json.dumps([
+                    {"kind": "task", "title": "抓铝价", "desc": "先抓一个月"},
+                    {"kind": "task", "title": "做成表", "desc": ""},
+                ], ensure_ascii=False)),
+            )
+            idea_id = int(cur.lastrowid or 0)
+        req = env.app.approvals.create(
+            G1, kind="task", title="做铝价表", quote="", via="来自构想",
+            requester_id="20002", requester_name="阿柒", idea_id=idea_id,
+        )
+        await env.login()
+        r = await env.client.post(f"/api/requests/{req['id']}/approve", json={})
+        assert r.status == 200
+        res = await r.json()
+        assert res["task_ids"] == ["T-1", "T-2"]
+        assert res["task_id"] == "T-1"
+        for tid in ("T-1", "T-2"):
+            for _ in range(30):
+                if tid in coord.run_calls:
+                    break
+                await asyncio.sleep(0.02)
+            assert tid in coord.run_calls
 
     @pytest.mark.asyncio
     async def test_request_reject_and_state_errors(self, env: SimpleEnv) -> None:

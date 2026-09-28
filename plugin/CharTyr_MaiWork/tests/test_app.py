@@ -475,14 +475,18 @@ class TestPlannerHook:
 
 
 class TestM3IdeaHooks:
-    def _insert_idea(self, app: MaiWorkApp, gid: str = G1) -> int:
+    def _insert_idea(self, app: MaiWorkApp, gid: str = G1, *, items: list | None = None) -> int:
+        import json as _json
+
         from CharTyr_MaiWork import clock
 
         with app.store.tx() as conn:
             cur = conn.execute(
-                "INSERT INTO ideas (group_id, icon, title, body, basis, step, effort, state, created, updated)"
-                " VALUES (?, 'bulb', '做个铝价表', '把最近铝价整理成表', '群里天天聊铝', '先抓数据', '半天', 'new', ?, ?)",
-                (gid, clock.now(), clock.now()),
+                "INSERT INTO ideas (group_id, icon, title, body, basis, step, effort, items,"
+                " state, created, updated)"
+                " VALUES (?, 'bulb', '做个铝价表', '把最近铝价整理成表', '群里天天聊铝', '', '', ?,"
+                " 'new', ?, ?)",
+                (gid, _json.dumps(items or [], ensure_ascii=False), clock.now(), clock.now()),
             )
             return int(cur.lastrowid or 0)
 
@@ -575,6 +579,92 @@ class TestM3IdeaHooks:
         finally:
             await app.stop()
 
+    @pytest.mark.asyncio
+    async def test_on_idea_started_with_items_lands_each_item(self, tmp_path: Path) -> None:
+        """「做这个」也认项目：task 项落任务、goal 项落 agent 目标，所有任务都开工。"""
+        from fakes import FakeCoordinator
+
+        coord = FakeCoordinator()
+        app = _app(tmp_path)
+        app.coordinator_factory = lambda *a, **kw: coord
+        await app.start()
+        try:
+            idea_id = self._insert_idea(app, items=[
+                {"kind": "task", "title": "抓铝价数据", "desc": "先抓一个月"},
+                {"kind": "goal", "title": "每周更新铝价表", "desc": "每周更新一次"},
+                {"kind": "task", "title": "做成一张表", "desc": ""},
+            ])
+            app._on_idea_started(self._idea_view(app, idea_id))
+            rows = app.store.read().execute(
+                "SELECT id, title, req FROM tasks WHERE group_id=? ORDER BY id", (G1,)
+            ).fetchall()
+            assert [r["title"] for r in rows] == ["抓铝价数据", "做成一张表"]
+            assert "先抓一个月" in rows[0]["req"] and "来自构想" in rows[0]["req"]
+            goals = app.goals.view(G1)["agent"]
+            assert [g["title"] for g in goals] == ["每周更新铝价表"]
+            tid = str(app.store.read().execute(
+                "SELECT task_id FROM ideas WHERE id=?", (idea_id,)
+            ).fetchone()["task_id"])
+            assert tid == rows[0]["id"]
+            for one in (rows[0]["id"], rows[1]["id"]):
+                for _ in range(30):
+                    if one in coord.run_calls:
+                        break
+                    await asyncio.sleep(0.02)
+                assert one in coord.run_calls
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_on_idea_started_only_picked_items(self, tmp_path: Path) -> None:
+        """网页「直接开工」带 item_nos 时只落勾选的项目（1 起序号），别的项目不动。"""
+        from fakes import FakeCoordinator
+
+        coord = FakeCoordinator()
+        app = _app(tmp_path)
+        app.coordinator_factory = lambda *a, **kw: coord
+        await app.start()
+        try:
+            idea_id = self._insert_idea(app, items=[
+                {"kind": "task", "title": "抓铝价数据", "desc": "先抓一个月"},
+                {"kind": "goal", "title": "每周更新铝价表", "desc": "每周更新一次"},
+                {"kind": "task", "title": "做成一张表", "desc": ""},
+            ])
+            view = self._idea_view(app, idea_id)
+            view["item_nos"] = [1, 3]
+            app._on_idea_started(view)
+            rows = app.store.read().execute(
+                "SELECT title FROM tasks WHERE group_id=? ORDER BY id", (G1,)
+            ).fetchall()
+            assert [r["title"] for r in rows] == ["抓铝价数据", "做成一张表"]
+            assert app.goals.view(G1)["agent"] == []  # 第 2 项（goal）没被勾选
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_on_idea_started_bad_item_nos_lands_all(self, tmp_path: Path) -> None:
+        """越界 / 非法序号一个都对不上 → 按「全部」处理（和 approvals 的口径一致）。"""
+        from fakes import FakeCoordinator
+
+        coord = FakeCoordinator()
+        app = _app(tmp_path)
+        app.coordinator_factory = lambda *a, **kw: coord
+        await app.start()
+        try:
+            idea_id = self._insert_idea(app, items=[
+                {"kind": "task", "title": "第一件", "desc": ""},
+                {"kind": "task", "title": "第二件", "desc": ""},
+            ])
+            view = self._idea_view(app, idea_id)
+            view["item_nos"] = [9, "x", None]
+            app._on_idea_started(view)
+            rows = app.store.read().execute(
+                "SELECT title FROM tasks WHERE group_id=? ORDER BY id", (G1,)
+            ).fetchall()
+            assert [r["title"] for r in rows] == ["第一件", "第二件"]
+        finally:
+            await app.stop()
+
 
 # ----------------------------------------------------------------------
 # M3：后台循环接 outbox / approvals / goals / coordinator
@@ -622,6 +712,55 @@ class TestM3Loop:
             assert app.delivery is not None
             assert app.commands is not None
             assert app.env is not None  # environments/local.py 在本机上能建（direct/systemd 都能构造）
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_auto_review_wired_and_reuses_spawn_run_task(self, tmp_path: Path) -> None:
+        """自动审核接在 Approvals 上；开工入口和人批 / 网页批准同一个（app.spawn_run_task）。"""
+        app = _app(tmp_path)
+        await app.start()
+        try:
+            assert app.auto_review is not None
+            assert app.approvals._review_hook is not None
+            assert app.auto_review._run_task_starter == app.spawn_run_task
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_pending_request_auto_approved_in_background(self, tmp_path: Path) -> None:
+        """落一条待批请求 → 回调 spawn 后台审核 → 主模型说能批 → 批准 + 开工（钩子不阻塞）。"""
+        app = _app(tmp_path)
+        await app.start()
+        try:
+            class _FakeModels:
+                def settings(self):
+                    class _S:
+                        def ready(self) -> bool:
+                            return True
+
+                    return _S()
+
+                async def chat(self, role, messages, **kwargs):
+                    return type("R", (), {"text": '{"approve": true, "reason": "查资料的小活"}'})()
+
+            app.auto_review._models = _FakeModels()
+            started: list[str] = []
+            app.auto_review._run_task_starter = started.append
+            r = app.approvals.create(
+                G1, kind="task", title="帮我查一下免费图床", quote="帮我查一下",
+                via="群里 @", requester_id="10001", requester_name="阿柒",
+            )
+            assert r["status"] == "pending"  # create 直接返回，没等模型
+            for _ in range(50):
+                if started:
+                    break
+                await asyncio.sleep(0.01)
+            row = app.store.read().execute("SELECT * FROM requests WHERE id=?", (r["id"],)).fetchone()
+            assert str(row["status"]) == "approved"
+            assert str(row["decided_by"]) == "MaiWork 自动审核"
+            assert str(row["auto_reason"]) == "查资料的小活"
+            assert started == [str(row["task_id"])]
         finally:
             await app.stop()
 
@@ -1066,6 +1205,58 @@ class TestM2Loop:
                 await asyncio.sleep(0.02)
             assert G2 in feeds.make_idea_calls
             assert G2 not in feeds.prepare_calls
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_goal_due_routes_to_proposer(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """scheduler 报 goal → 调 GoalProposer.propose（一天一次由它自己兜），并记 scheduler.done。"""
+        from fakes import FakeFeeds, FakeScheduler
+
+        calls: list[str] = []
+
+        class _Proposer:
+            async def propose(self, gid: str):
+                calls.append(str(gid))
+                return None
+
+        feeds = FakeFeeds()
+        scheduler = FakeScheduler()
+        scheduler.due_map[G2] = [["goal"]]
+        app = _app(tmp_path)
+        app.feeds_factory = lambda *a, **kw: feeds
+        app.scheduler_factory = lambda *a, **kw: scheduler
+        await app.start()
+        app.goal_proposer = _Proposer()
+        try:
+            await app.run_loop_once()
+            for _ in range(40):
+                if G2 in calls:
+                    break
+                await asyncio.sleep(0.02)
+            assert G2 in calls
+            assert G2 not in feeds.make_idea_calls
+            assert any(c[0] == G2 and c[1] == "goal" for c in scheduler.done_calls)
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_goal_due_without_proposer_is_skipped(self, tmp_path: Path) -> None:
+        """GoalProposer 没就位（模块缺）→ 这轮跳过，不炸。"""
+        from fakes import FakeFeeds, FakeScheduler
+
+        feeds = FakeFeeds()
+        scheduler = FakeScheduler()
+        scheduler.due_map[G1] = [["goal"]]
+        app = _app(tmp_path)
+        app.feeds_factory = lambda *a, **kw: feeds
+        app.scheduler_factory = lambda *a, **kw: scheduler
+        await app.start()
+        app.goal_proposer = None
+        try:
+            await app.run_loop_once()
+            await asyncio.sleep(0.05)
+            assert feeds.make_idea_calls == []
         finally:
             await app.stop()
 

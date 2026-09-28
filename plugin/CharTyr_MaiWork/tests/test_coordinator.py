@@ -90,7 +90,7 @@ class FakeWorkers:
         self.before_return = None  # async callable()：返回前执行（用来模拟晚到）
 
     async def run(self, brief, *, group_id, tools, task_id="", actor="", max_steps=12,
-                  output_schema=None, workspace=None):
+                  output_schema=None, workspace=None, system_extra=""):
         self.calls.append(
             {
                 "brief": brief,
@@ -101,6 +101,7 @@ class FakeWorkers:
                 "max_steps": max_steps,
                 "output_schema": output_schema,
                 "workspace": workspace,
+                "system_extra": system_extra,
             }
         )
         if self.before_return is not None:
@@ -574,7 +575,7 @@ async def test_same_workspace_tasks_serialized(
 
     class _Worker:
         async def run(self, brief, *, group_id, tools, task_id="", actor="", max_steps=12,
-                      output_schema=None, workspace=None):
+                      output_schema=None, workspace=None, system_extra=""):
             entered.append(task_id)
             order.append(f"enter:{task_id}")
             await asyncio.sleep(0.05)
@@ -943,3 +944,91 @@ async def test_tokens_aggregated_to_tasks(mem_store: Store, settings, env, tools
         )
     await coordinator.run_task(tid)
     assert tasks.get(tid)["tokens"] >= 450  # 100+50+200+100
+
+
+# ---------------------------------------------------------------------------
+# check_goal 带群聊上下文（2026-10）：第一次检查补验收标准；每次都带最近群聊
+# ---------------------------------------------------------------------------
+
+
+def _seed_chat(store: Store, gid: str, rows: list[tuple[str, str]]) -> None:
+    with store.tx() as conn:
+        for i, (who, text) in enumerate(rows):
+            conn.execute(
+                "INSERT INTO chat_log (text, group_id, message_id, ts, user_id, user_name)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (text, gid, f"gm{i}", NOW - i * 60, f"gu{i}", who),
+            )
+
+
+async def test_check_goal_first_check_fills_criteria_from_chat(
+    mem_store: Store, settings, env, tools, tasks, goals
+):
+    """criteria 为空 → 第一次检查用群聊补出验收标准并落库。"""
+    goal_id = goals.create_agent(GID, title="把群里的工具链跑通", body="帮群友跑通", criteria=[], by_text="")
+    _seed_chat(mem_store, GID, [("阿柒", "脚本还是报错，缺个依赖"), ("老李", "我刚测了，换个版本就好了")])
+    models = ModelsQueue(
+        replies=[
+            json.dumps(
+                {
+                    "criteria": ["脚本能在本机跑通", "群里有人验证过"],
+                    "done_criteria": [],
+                    "next_check_hours": 12,
+                    "progress": None,
+                    "new_task": None,
+                    "report": None,
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    coordinator = _build(
+        mem_store=mem_store, settings=settings, env=env, tools=tools, tasks=tasks,
+        goals=goals, models=models, workers=FakeWorkers(), outbox=FakeOutbox(),
+    )
+    await coordinator.check_goal(goal_id)
+
+    goal = goals.get(goal_id)
+    crit = json.loads(goal["criteria"])
+    assert [c["text"] for c in crit] == ["脚本能在本机跑通", "群里有人验证过"]
+    assert all(c["done"] is False for c in crit)
+    prompt = models.calls[0][1][-1]["content"]
+    assert "脚本还是报错，缺个依赖" in prompt          # 群聊片段进了提示词
+    assert "第一次检查" in prompt and '"criteria"' in prompt
+
+
+async def test_check_goal_prompt_always_carries_recent_chat(
+    mem_store: Store, settings, env, tools, tasks, goals
+):
+    """已有 criteria 的常规检查：提示词照样带最近群聊，但不许改已有标准。"""
+    gid_goal = _seed_goal(goals)  # criteria = 写好脚本 / 跑通测试
+    long_line = "今天群里在聊" + "很长的进展" * 40  # 300+ 字，要截断
+    _seed_chat(mem_store, GID, [("阿柒", "已经把脚本提交了"), ("老李", long_line)])
+    models = ModelsQueue(
+        replies=[
+            json.dumps(
+                {
+                    "criteria": ["模型乱改的标准"],
+                    "done_criteria": [0],
+                    "next_check_hours": 12,
+                    "progress": None,
+                    "new_task": None,
+                    "report": None,
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    coordinator = _build(
+        mem_store=mem_store, settings=settings, env=env, tools=tools, tasks=tasks,
+        goals=goals, models=models, workers=FakeWorkers(), outbox=FakeOutbox(),
+    )
+    await coordinator.check_goal(gid_goal)
+
+    prompt = models.calls[0][1][-1]["content"]
+    assert "已经把脚本提交了" in prompt
+    assert "今天群里在聊" in prompt
+    assert "很长的进展" * 30 not in prompt       # 每条截到 80 字
+    assert "第一次检查" not in prompt            # 已有标准就不再要它补
+    crit = [c["text"] for c in json.loads(goals.get(gid_goal)["criteria"])]
+    assert crit == ["写好脚本", "跑通测试"]       # 没被模型的 criteria 乱改

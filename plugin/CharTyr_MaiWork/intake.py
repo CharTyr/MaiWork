@@ -62,10 +62,38 @@ _TITLE_MAX = 30
 _COMMAND_MENTION_TTL_S = 120        # /mw 指令说明只留 2 分钟
 _REQUEST_MENTION_TTL_S = 30 * 60    # 「已记下，等管理员批准」留 30 分钟
 _SLOW_QUEUE_MAX = 200               # 慢路径内存队列上限（满了丢最旧的）
-# 网页构想详情「复制要求」带的编号（「（构想 #12）」）：认出来就按这条构想建请求，不问 Jev
-_IDEA_REF = re.compile(r"构想\s*[#＃]\s*(\d{1,9})")
+# 网页构想详情「复制要求」带的编号（「（构想 #12）」）：认出来就按这条构想建请求，不问 Jev。
+# 2026-10：还认「（构想 #12，要做：1、3）」这种挑了项目的写法（尾部不跨右括号 / 换行）。
+_IDEA_REF = re.compile(r"构想\s*[#＃]\s*(\d{1,9})([^\n）)]{0,80})")
+# 尾部里的「要做：1、3 / 1,3 / 1 3」；分隔符中英文逗号、顿号、空格、点、斜杠都认
+_IDEA_WANT = re.compile(r"要做\s*[:：]?\s*([0-9０-９][0-9０-９\s、,，.．/／-]*)")
+_IDEA_ITEM_NO_MAX = 24                     # 一次最多认这么多序号（防刷屏）
 _IDEA_OPEN_STATES = ("new", "wanted", "dismissed")
 _IDEA_BUSY_TEXT = {"pending": "已经在等管理员批准了", "started": "已经在做了"}
+_FULLWIDTH_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
+
+
+def parse_idea_wanted(text: Any) -> list[int] | None:
+    """从「构想 #N」后面的尾巴里读出「要做：1、3」的序号。
+
+    - 没写「要做」→ None（= 这条构想的全部项目）；
+    - 写了但一个数字都没有 → None（同样当「全部」，别因为写错就什么都不做）；
+    - 序号去重、只留正数、最多 24 个。
+    """
+    m = _IDEA_WANT.search(str(text or ""))
+    if not m:
+        return None
+    nums: list[int] = []
+    for chunk in re.findall(r"[0-9０-９]+", m.group(1).translate(_FULLWIDTH_DIGITS)):
+        try:
+            n = int(chunk)
+        except (TypeError, ValueError):
+            continue
+        if n > 0 and n not in nums:
+            nums.append(n)
+        if len(nums) >= _IDEA_ITEM_NO_MAX:
+            break
+    return nums or None
 
 
 @dataclass
@@ -403,7 +431,11 @@ class Intake:
         )
 
     def _idea_of(self, group_id: str, text: str) -> dict | None:
-        """消息里带「构想 #N」且这条构想属于本群 → 构想行（dict）；否则 None（照常问 Jev）。"""
+        """消息里带「构想 #N」且这条构想属于本群 → 构想行（dict，带 wanted）；否则 None。
+
+        `wanted` 是「（构想 #12，要做：1、3）」里点名的项目序号；没写 / 写不出数字 → None
+        （= 这条构想的全部项目）。
+        """
         if self._store is None:
             return None
         m = _IDEA_REF.search(str(text or ""))
@@ -417,7 +449,11 @@ class Intake:
         except Exception:
             logger.debug("查构想编号失败（群 %s）", group_id, exc_info=True)
             return None
-        return dict(row) if row is not None else None
+        if row is None:
+            return None
+        idea = dict(row)
+        idea["wanted"] = parse_idea_wanted(m.group(2))
+        return idea
 
     async def _create_idea_request(
         self, group_id: str, idea: dict, user_id: str, user_name: str, message_id: str, text: str
@@ -450,6 +486,8 @@ class Intake:
                 message_id=message_id,
                 idea_id=iid,
                 icon=str(idea.get("icon") or "package"),
+                items=idea.get("wanted"),
+                source="idea",
             )
         except Exception:
             logger.exception("按构想记待批请求出错（群 %s，构想 %s）", group_id, iid)

@@ -661,8 +661,59 @@ def _m_focus_names(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE focus_members ADD COLUMN profile_ts REAL NOT NULL DEFAULT 0")
 
 
+# 构想「包含的项目」+ 派活请求的来源与选中项目（2026-10）：
+# - ideas.items：这条构想包含哪些项目，JSON `[{"kind":"task"|"goal","title","desc"}]`（最多 5 个）；
+#   老的构想默认 `[]`（读取时按「没有项目」走老逻辑，不报错）；step/effort 两列留着不删，
+#   只为读得动老数据，新构想不再生成。
+# - requests.item_nos：从构想转来的请求里，群友点名要做的项目序号 JSON（`[]` = 全部项目）。
+# - requests.source：请求来源标记（`""` = 群友 @ / 网页发起，`"maiwork"` = MaiWork 主动提议）。
+def _m_idea_items(conn: sqlite3.Connection) -> None:
+    def _cols(table: str) -> set[str]:
+        return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+    ideas = _cols("ideas")
+    if "items" not in ideas:
+        conn.execute("ALTER TABLE ideas ADD COLUMN items TEXT NOT NULL DEFAULT '[]'")
+    requests = _cols("requests")
+    if "item_nos" not in requests:
+        conn.execute("ALTER TABLE requests ADD COLUMN item_nos TEXT NOT NULL DEFAULT '[]'")
+    if "source" not in requests:
+        conn.execute("ALTER TABLE requests ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+
+
+# 派活「自动审核」（auto_review.py；docs/02 §5.2，2026-10）：requests 加两列——
+# - force_manual：这条请求是不是**永远**要管理员批准（MaiWork 主动提的目标走这条；
+#   自动审核一律绕过它）；
+# - auto_reason：自动审核通过时主模型给的一句话理由（批准人是「MaiWork 自动审核」，
+#   记在 decided_by 里）；人批 / 免批的行是空串。
+def _m_auto_review(conn: sqlite3.Connection) -> None:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(requests)")}
+    if "force_manual" not in cols:
+        conn.execute("ALTER TABLE requests ADD COLUMN force_manual INTEGER NOT NULL DEFAULT 0")
+    if "auto_reason" not in cols:
+        conn.execute("ALTER TABLE requests ADD COLUMN auto_reason TEXT NOT NULL DEFAULT ''")
+
+
+# 一条请求落地出的**全部**任务（2026-10）：构想按项目拆成多个任务时，requests.task_id 只
+# 记得住第一个，导致 auto_info_by_task 只给第一个任务批准人 / 自动审核理由。
+# - requests.task_ids：JSON 数组 `["T-1","T-2"]`；老数据默认 `[]`（读取时回落 requests.task_id）。
+def _m_landed_task_ids(conn: sqlite3.Connection) -> None:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(requests)")}
+    if "task_ids" not in cols:
+        conn.execute("ALTER TABLE requests ADD COLUMN task_ids TEXT NOT NULL DEFAULT '[]'")
+
+
+# 任务安全网（0.4.0，[tasks] token_limit / run_seconds）：tasks 加 paused_reason
+# （JSON：{"kind": "tokens"|"time", "limit": N, "used": M}，null = 不是安全网停的）。
+# 手动暂停没有它；网页 tasks.list / 详情都带，前端据它显示「自动暂停原因」。
+def _m_task_nets(conn: sqlite3.Connection) -> None:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+    if "paused_reason" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN paused_reason TEXT")
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets]
 
 
 class Store:

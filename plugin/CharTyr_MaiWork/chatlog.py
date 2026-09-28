@@ -15,6 +15,10 @@ user_id / user_name，由 store._m_humane 建好）。只读本群的。
 - search_chat(store, group_id, query, *, days=14, limit=8, now=None)：
   [{ts, who, text, message_id}]，新的在前；trigram 要 ≥3 个字符，短词自动换 LIKE 兜底；
   只查本群；空查询 / 没命中 → []。
+- recent_chat(store, group_id, *, hours=48, limit=60, now=None)：
+  本群最近 hours 小时内的发言，[{ts, who, text, message_id}]，按时间**从旧到新**
+  （取最新的 limit 条再正序），单条 text 截 _RESULT_TEXT_MAX；只查本群；
+  库错误按「没有」处理 → []。给 _plan_focus / _collect / make_idea 看「群里真实在聊什么」用。
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ _TRIGRAM_MIN = 3           # trigram 索引要求查询词至少几个字符
 _TEXT_MAX = 500            # 单条入库最多留多少字（防刷屏长文撑爆）
 _RESULT_TEXT_MAX = 200     # 查询返回的单条摘要上限
 _PICTURE_PLACEHOLDER = "[图片]"
+_RECENT_SCAN_MAX = 200       # recent_chat 单次最多取多少条（limit 的上限）
 
 
 def record_messages(store: Any, group_id: str, msgs: list, *, now: float) -> int:
@@ -99,6 +104,46 @@ def prune_old(store: Any, group_id: str, *, now: float, keep_days: int = _KEEP_D
 def _fts_escape(query: str) -> str:
     """FTS5 查询串转义：只把它当一段普通文本（phrase）匹配，不让特殊字符炸查询。"""
     return '"' + query.replace('"', ' ') + '"'
+
+
+def recent_chat(
+    store: Any,
+    group_id: str,
+    *,
+    hours: float = 48,
+    limit: int = 60,
+    now: float | None = None,
+) -> list[dict]:
+    """本群最近 hours 小时内的发言。返回 [{ts, who, text, message_id}]，按时间从旧到新。
+
+    最多 limit 条：先取最新的 limit 条，再翻成从旧到新（给提示词看「最近在聊什么」用）。
+    单条 text 截 _RESULT_TEXT_MAX。只查本群；任何库错误按「没有」处理（返回 []）。
+    """
+    gid = str(group_id)
+    if now is None:
+        now = clock.now()
+    since = float(now) - max(1.0, float(hours)) * 3600.0
+    limit_i = max(1, min(_RECENT_SCAN_MAX, int(limit)))
+    try:
+        rows = store.read().execute(
+            "SELECT text, ts, user_name, message_id FROM chat_log"
+            " WHERE group_id=? AND ts>=? ORDER BY ts DESC LIMIT ?",
+            (gid, since, limit_i),
+        ).fetchall()
+    except Exception:
+        logger.info("chat_log 最近发言查询失败（群 %s）", gid, exc_info=True)
+        return []
+    out: list[dict] = []
+    for r in reversed(rows):  # 取的是最新 limit 条（倒序），翻成正序
+        out.append(
+            {
+                "ts": float(r["ts"] or 0.0),
+                "who": str(r["user_name"] or ""),
+                "text": str(r["text"] or "")[:_RESULT_TEXT_MAX],
+                "message_id": str(r["message_id"] or ""),
+            }
+        )
+    return out
 
 
 def search_chat(

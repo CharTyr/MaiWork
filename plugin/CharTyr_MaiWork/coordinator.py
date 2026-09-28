@@ -39,10 +39,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
-from . import clock
+from . import clock, compaction
 from .host import HostError
 from .models import ModelError
 from .outbox import report_error as _report_error
@@ -70,6 +72,88 @@ _GROUPSPACE_TOOL_CAPS = (
 _GROUPSPACE_TOOLS = tuple(name for name, _cap in _GROUPSPACE_TOOL_CAPS)
 
 _AGENT_DONE_WORD_HINT = "目标完成"
+
+# 目标检查带的群聊上下文（2026-10）：最近 48 小时、最多 40 条、每条截 80 字
+_GOAL_CHAT_H = 48
+_GOAL_CHAT_N = 40
+_GOAL_CHAT_TEXT = 80
+
+# ---------------------------------------------------------------------------
+# 调研类子任务 + 验收引用核对（2026-10）
+# ---------------------------------------------------------------------------
+
+# 计划里子任务没给 type 时的关键词兜底：brief 里出现这些词就当调研/对比/盘点类。
+# 偏保守：做东西（写页面、跑脚本）的 brief 一般不带这些词；带了也顶多多一段提示，不影响干活。
+_RESEARCH_JOB_WORDS = (
+    "调研", "调查", "对比", "盘点", "汇总", "综述", "怎么看", "口碑",
+    "评测", "现状", "梳理", "搜集",
+)
+# 验收核对链接时扫的文本成品后缀（PDF/图片等二进制一律跳过）
+_TEXT_ARTIFACT_SUFFIXES = (
+    ".md", ".markdown", ".txt", ".html", ".htm", ".json", ".csv", ".tsv",
+    ".yaml", ".yml", ".rst", ".org", ".xml", ".svg", ".vtt", ".srt",
+)
+_ARTIFACT_SCAN_MAX_FILES = 20          # 最多扫 20 个成品文件
+_ARTIFACT_SCAN_MAX_BYTES = 200_000     # 每个文件最多读 200KB
+_UNOPENED_URLS_IN_PROMPT = 10          # 喂给验收模型的「没打开」清单最多列 10 条
+_LINK_RE = re.compile(r"https?://[^\s<>\"'()\[\]{}，。；、）】》]+", re.IGNORECASE)
+# 跟踪参数：utm_* 前缀 + 这些常见名字（比对时两边都去掉）
+_TRACKING_PARAM_NAMES = frozenset({
+    "fbclid", "gclid", "igshid", "mc_cid", "mc_eid", "ref_src", "spm",
+    "si", "share_token", "share_source", "share_medium",
+})
+
+
+def _is_tracking_param(name: str) -> bool:
+    low = str(name or "").strip().lower()
+    return low.startswith("utm_") or low in _TRACKING_PARAM_NAMES
+
+
+def normalize_link_for_check(url: str) -> str:
+    """链接比对用的规范化：去 fragment、末尾 /、utm_* 等跟踪参数；http/https 视同；主机名小写。
+
+    解析不了（不是 http(s)、没有主机名、端口非法）返回 ""。
+    """
+    raw = str(url or "").strip()
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return ""
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return ""
+    host = parsed.hostname.lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    if port and port not in (80, 443):
+        host = f"{host}:{port}"
+    path = parsed.path.rstrip("/")
+    pairs = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if not _is_tracking_param(k)]
+    query = urlencode(pairs)
+    return f"{host}{path}{('?' + query) if query else ''}"
+
+
+def extract_http_links(text: str) -> list[str]:
+    """从一段文本里抽 http(s) 链接（按出现顺序、去重按规范化结果）。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in _LINK_RE.finditer(str(text or "")):
+        url = match.group(0).rstrip(".,;:!?、。，；：）)】」』>\"'")
+        key = normalize_link_for_check(url)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(url)
+    return out
+
+
+def looks_like_research_brief(brief: str) -> bool:
+    """计划没标 type 时的兜底：brief 里带调研/对比/盘点这类词就当调研。"""
+    text = str(brief or "")
+    return any(word in text for word in _RESEARCH_JOB_WORDS)
 
 # 本机命令类工具（选 railway 时从子 agent 工具名单里换成 vm_*）
 _LOCAL_EXEC_TOOLS = ("run_command", "start_process", "check_process", "stop_process")
@@ -282,9 +366,86 @@ class Coordinator:
             pass
         return f"g{group_id}"
 
-    def _worker_max_steps(self) -> int:
-        # 按配置/默认 16：environments 节目前没有专门字段，仓库惯例先 16
-        return 16
+    def _context_window(self) -> int:
+        """主模型上下文窗口（tokens）；取不到配置就用默认 128000。"""
+        try:
+            settings = self._get_settings()
+            return int(getattr(getattr(settings, "models", None), "context_window", None) or 128000)
+        except Exception:
+            return 128000
+
+    async def _chat_main(
+        self,
+        messages: list[dict],
+        *,
+        purpose: str,
+        group_id: str = "",
+        task_id: str = "",
+        tools: Any = None,
+        json_mode: bool = False,
+        retries: Any = None,
+    ) -> Any:
+        """主模型统一出口（0.4.0）：调之前先上下文压缩，撞上「上下文超长」裁最旧一段重试一次。
+
+        - 压缩规则见 compaction.py：估算超触发线先截旧 tool 结果，仍超把最老一段总结成
+          一条 8 节摘要（summary 失败原样继续，不抛）；
+        - 「上下文超长」类错误：裁掉最旧一段再重试一次；其他错误原样抛；
+        - 返回 ChatResult（原样）。
+        """
+        try:
+            messages = await compaction.maybe_compact(
+                messages,
+                models=self._models,
+                role="main",
+                context_window=self._context_window(),
+                purpose=purpose,
+                group_id=group_id,
+                task_id=task_id,
+            )
+        except Exception:
+            logger.exception("主模型上下文压缩失败（%s），原样继续", purpose)
+        kwargs: dict[str, Any] = {
+            "group_id": group_id,
+            "task_id": task_id,
+            "tools": tools,
+            "json_mode": json_mode,
+        }
+        if retries is not None:
+            kwargs["retries"] = retries
+        result = await compaction.chat_with_retry_on_long_context(
+            messages,
+            models=self._models,
+            role="main",
+            purpose=purpose,
+            **kwargs,
+        )
+        # 安全网：这一调用量可能把这任务推过了 [tasks] 的线——超了就立刻 paused，
+        # 由 workers / 主循环下一步看到 paused 停手，而不是把这一回合跑完才停。
+        if task_id:
+            try:
+                await self._net_check(str(task_id))
+            except Exception:
+                logger.exception("安全网巡检出错（任务 %s）", task_id)
+        return result
+
+    async def _net_check(self, task_id: str) -> dict | None:
+        """安全网：任务超过 [tasks] token_limit / run_seconds 就自动 paused（原因进 paused_reason）。
+
+        逻辑真身在 Tasks.net_check（纯数据、不调模型）；这里包一层异步、不抛：
+        - tokens 按「继续那时刻」的基线 kv[task.net_base.<任务ID>] 起算（没基线 = 从 0）；
+        - 时长按 resume_ts（没基线 = started_ts / created）；
+        - 管理员把任务 queued 恢复时 Tasks.transition 自动清原因、重记基线
+          （恢复后 token 从恢复那时刻重新累计、时长重新开始跑）；
+        - 返回触发原因 dict（没触发 / 任务不在 running → None）。
+        """
+        try:
+            reason = self._tasks.net_check(task_id)
+            if reason:
+                logger.info("任务 %s 安全网自动暂停：%s", task_id, reason)
+            return reason
+        except Exception:
+            logger.exception("安全网巡检出错（任务 %s）", task_id)
+            return None
 
     def _artifact_dir(self, task_id: str) -> str:
         return f"artifacts/{task_id}"
@@ -485,7 +646,10 @@ class Coordinator:
             ' "deliver_kind": "view|file|text"（view=做成网页给人打开看；file=做成文件给人下载/编辑；text=不用成品，直接在群里文字回复）,'
             + env_field
             + ' "jobs": [{"brief": "派给一个子 agent 的具体活，要写清楚要做什么、写到 artifacts/<任务ID>/ 下；'
-            '展示类做成单页 index.html（手机能看、不依赖外部资源）", "tools": ["子 agent 工具名单里的名字"]}]（1 到 2 个）,'
+            '展示类做成单页 index.html（手机能看、不依赖外部资源）",'
+            ' "type": "research|build|other"（research=要查资料出结论的活：调研、对比、盘点、「大家怎么看」、找现状/口碑；'
+            'build=做东西；other=其它）,'
+            ' "tools": ["子 agent 工具名单里的名字"]}]（1 到 2 个）,'
             ' "question": null | "如果信息不够、不能开工，写一句要在群里问发起人的话；能开工就是 null"}'
         )
         if railway_ok:
@@ -509,8 +673,7 @@ class Coordinator:
         if not specs:
             # 一个排计划能用的工具都没有（roles 含 main 的 MCP / skill 工具全没注册）：
             # 行为完全不变——一次 json_mode=True 的纯 JSON 调用，不带 tools。
-            result = await self._models.chat(
-                "main",
+            result = await self._chat_main(
                 [{"role": "user", "content": prefix + "\n".join(prompt_lines)}],
                 json_mode=True,
                 purpose="coordinator.plan",
@@ -538,8 +701,7 @@ class Coordinator:
             )
             data = None
             for _round in range(_PLAN_TOOL_LIMIT):
-                result = await self._models.chat(
-                    "main",
+                result = await self._chat_main(
                     messages,
                     tools=specs,
                     json_mode=False,
@@ -573,8 +735,7 @@ class Coordinator:
             if data is None:
                 # 用满 _PLAN_TOOL_LIMIT 轮还在调工具 / 一直不给 JSON：
                 # 最后强制一次（tools=None + json_mode=True）把 JSON 拿回来。
-                result = await self._models.chat(
-                    "main",
+                result = await self._chat_main(
                     messages,
                     tools=None,
                     json_mode=True,
@@ -615,7 +776,11 @@ class Coordinator:
                 tools_list = [str(x) for x in (j.get("tools") or []) if str(x).strip()]
                 # 群空间工具（roles={"main"}）是主模型自己用的，子 agent 名单里一律不许出现
                 tools_list = [t for t in tools_list if t not in _GROUPSPACE_TOOLS]
-                jobs.append({"brief": brief, "tools": tools_list})
+                # 子任务类型：计划给了就认 research/build/other；没给或乱给按关键词兜底
+                job_type = str(j.get("type") or "").strip().lower()
+                if job_type not in ("research", "build", "other"):
+                    job_type = "research" if looks_like_research_brief(brief) else "other"
+                jobs.append({"brief": brief, "tools": tools_list, "type": job_type})
 
         question = data.get("question")
         question = str(question).strip() if question else ""
@@ -634,6 +799,8 @@ class Coordinator:
             "question": question,
             "env": env_choice,
             "env_reason": env_reason,
+            # 有子任务被标成调研类 → 验收时做引用核对（交付里没链接就不加那段，见 _review）
+            "research": any(j["type"] == "research" for j in jobs),
         }
 
     # ------------------------------------------------------------------
@@ -708,6 +875,12 @@ class Coordinator:
             self._fail_with_err(tid, attempt_id, f"计划失败：{e}", gid)
             return "done"
 
+        # 安全网可能在计划回合把任务 paused 了：别再往下走 wait/重排
+        _now = self._tasks.get(tid)
+        if _now is None or str(_now.get("status") or "") not in ("running", "reviewing"):
+            logger.info("任务 %s 计划后状态已变（预案里被暂停或终态），停", tid)
+            return "done"
+
         # question → waiting_input + 群里问一句
         if plan["question"]:
             try:
@@ -770,6 +943,7 @@ class Coordinator:
                         tid=tid,
                         job_idx=i + 1,
                         ws_name=ws_name,
+                        job_type=str(j.get("type") or "other"),
                     )
                     for i, j in enumerate(jobs)
                 ]
@@ -787,9 +961,12 @@ class Coordinator:
             )
             return "done"
 
-        # 子 agent 都交回了，但任务可能刚被取消：终态立刻停，不再验收、不交付、不往群里发
+        # 子 agent 都交回了，但任务可能刚被取消 / 被安全网暂停：终态和暂停都立刻停，
+        # 不再验收、不交付、不往群里发（安全网恢复后 run_task 会从 queued 重新开工）
         task_now = self._tasks.get(tid)
-        if task_now is not None and str(task_now["status"]) in ("cancelled", "completed", "failed", "rejected"):
+        if task_now is not None and str(task_now["status"]) in (
+            "cancelled", "completed", "failed", "rejected", "paused", "waiting_input", "shelved",
+        ):
             logger.info("任务 %s 已是「%s」，不验收不交付", tid, task_now["status"])
             return "done"
 
@@ -826,6 +1003,11 @@ class Coordinator:
             self._fail_with_err(tid, attempt_id, f"验收失败：{e}", gid)
             return "done"
 
+        _now2 = self._tasks.get(tid)
+        if _now2 is None or str(_now2.get("status") or "") not in ("running", "reviewing"):
+            logger.info("任务 %s 验收后状态已变（安全网暂停或终态），不再写结果", tid)
+            return "done"
+
         # 汇总 attempt 结果先写（无论过不过）
         self._tasks.finish_attempt(
             attempt_id,
@@ -849,7 +1031,8 @@ class Coordinator:
     # ------------------------------------------------------------------
 
     async def _run_job(
-        self, *, brief: str, tools: list[str], gid: str, tid: str, job_idx: int, ws_name: str
+        self, *, brief: str, tools: list[str], gid: str, tid: str, job_idx: int, ws_name: str,
+        job_type: str = "other",
     ) -> Any:
         sem = self._semaphore_for(ws_name)
         async with sem:
@@ -860,6 +1043,15 @@ class Coordinator:
                 from .workers import WorkerReport
 
                 return WorkerReport(ok=False, summary="", error=f"拿不到工作区：{e}")
+            # 调研类子任务：system 提示追加报告框架（做东西的活不加）
+            system_extra = ""
+            if str(job_type) == "research":
+                try:
+                    from .workers import RESEARCH_REPORT_FRAMEWORK
+
+                    system_extra = RESEARCH_REPORT_FRAMEWORK
+                except Exception:
+                    logger.exception("取调研报告框架失败")
             try:
                 return await self._workers.run(
                     brief,
@@ -867,8 +1059,8 @@ class Coordinator:
                     tools=tools,
                     task_id=tid,
                     actor=f"子 agent #{job_idx}",
-                    max_steps=self._worker_max_steps(),
                     workspace=ws_path,
+                    system_extra=system_extra,
                 )
             except (ModelError, HostError) as e:
                 from .workers import WorkerReport
@@ -978,6 +1170,7 @@ class Coordinator:
         ws_name = str(task.get("workspace") or self._workspace_name(gid))
 
         # 列 artifacts 目录清单放进 prompt
+        listing: list[dict] = []
         try:
             listing = await self._env.list_files(ws_name, self._artifact_dir(tid), depth=3, limit=50)
             artifact_lines = [
@@ -1009,6 +1202,30 @@ class Coordinator:
         prompt_lines.append("")
         prompt_lines.append(f"工作区 {self._artifact_dir(tid)}/ 下的成品清单：")
         prompt_lines.append(artifacts_text)
+
+        # 引用核对（只对调研类任务做）：代码抽交付物里的 http(s) 链接，和本任务
+        # fetch_page 成功过的 URL 比对；没打开过的清单作为事实喂给验收模型。
+        link_check: dict | None = None
+        if bool(plan.get("research")):
+            try:
+                link_check = await self._link_check(
+                    tid=tid, ws_name=ws_name, listing=listing, summary=summary, evidence=evidence
+                )
+            except Exception:
+                logger.exception("验收引用核对出错（任务 %s），这次跳过", tid)
+                link_check = None
+        if link_check and link_check["unopened"]:
+            prompt_lines.append("")
+            prompt_lines.append(
+                "事实核对（代码查的，不是模型判断）：下面这些链接出现在交付内容里，"
+                "但这个任务里没有真正打开过（fetch_page 没成功过；只在搜索结果里出现过不算打开过）："
+            )
+            for url in link_check["unopened_urls"]:
+                prompt_lines.append(f"- {url}")
+            prompt_lines.append(
+                "请据此判断：只是少量、且不是关键结论的依据 → 可以 pass，但要在 review 里点出来；"
+                "关键结论只靠这些没打开过的链接撑着 → pass 必须 false，并在 review 里点名要求打开核实或删掉。"
+            )
         prompt_lines.append("")
         prompt_lines.append(
             "只回 JSON："
@@ -1030,8 +1247,7 @@ class Coordinator:
         )
         review_data: dict | None = None
         for _round in range(_REVIEW_TOOL_LIMIT):
-            result = await self._models.chat(
-                "main",
+            result = await self._chat_main(
                 messages,
                 tools=specs or None,
                 json_mode=False,
@@ -1092,13 +1308,118 @@ class Coordinator:
                     passed = False
                     review_text = f"（{problem}，视为不通过）" + review_text
 
+        # 引用核对留痕：验收意见里带一行「引用核对：N 条链接，M 条没打开过」，
+        # 结构化结果存 kv["task.link_check.<任务ID>"]（前端读它做字段）。
+        if link_check is not None:
+            review_text = self._append_link_check_line(review_text, link_check)
+            try:
+                with self._store.tx() as conn:
+                    self._store.kv_set(
+                        conn,
+                        f"task.link_check.{tid}",
+                        {
+                            "ts": clock.now(),
+                            "attempt": int(task.get("attempts") or 0),
+                            "links": int(link_check["links"]),
+                            "unopened": int(link_check["unopened"]),
+                            "unopened_urls": list(link_check["unopened_urls"]),
+                        },
+                    )
+            except Exception:
+                logger.exception("写引用核对记录失败（任务 %s）", tid)
+
         return {
             "pass": passed,
             "review": review_text,
             "artifact": artifact,
             "note": note,
             "missing": missing,
+            "link_check": link_check,
         }
+
+    # ------------------------------------------------------------------
+    # 验收引用核对（调研类任务）：交付里的链接是不是这个任务真打开过
+    # ------------------------------------------------------------------
+
+    def _opened_urls(self, tid: str) -> set[str]:
+        """本任务 fetch_page 成功过的 URL（规范化）；web_search 结果里的链接不算打开过。
+
+        请求地址（tool_calls.input）和跳转后的最终地址都算打开过：交付里常引用最终的长链。
+        最终地址从 fetch_page 的 output 摘要标记里解析（tools_builtin.final_url_from_summary，
+        不改表结构）。
+        """
+        from .tools_builtin import final_url_from_summary
+
+        try:
+            rows = self._store.read().execute(
+                "SELECT input, output FROM tool_calls WHERE task_id=? AND tool='fetch_page' AND ok=1",
+                (str(tid),),
+            ).fetchall()
+        except Exception:
+            logger.exception("读 fetch_page 记录失败（任务 %s）", tid)
+            return set()
+        opened: set[str] = set()
+        for row in rows:
+            raw = str(row["input"] or "").strip()
+            url = raw
+            if raw.startswith("{"):  # 工具的 summarize 给的是 JSON 摘要时兜底取 url
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        url = str(parsed.get("url") or "")
+                except (ValueError, TypeError):
+                    url = raw
+            final = final_url_from_summary(str(row["output"] or ""))
+            for one in (url, final):
+                key = normalize_link_for_check(one)
+                if key:
+                    opened.add(key)
+        return opened
+
+    async def _gather_deliverable_texts(
+        self, ws_name: str, listing: list[dict], summary: str, evidence: list[str]
+    ) -> list[str]:
+        """交付物文本：summary + evidence + 工作区里的文本成品（md/html/json…；二进制跳过）。"""
+        texts: list[str] = [str(summary or ""), "\n".join(str(e) for e in (evidence or []))]
+        files = 0
+        for entry in listing or []:
+            if not isinstance(entry, dict) or entry.get("is_dir"):
+                continue
+            path = str(entry.get("path") or "")
+            if not path.lower().endswith(_TEXT_ARTIFACT_SUFFIXES):
+                continue
+            if files >= _ARTIFACT_SCAN_MAX_FILES:
+                break
+            files += 1
+            try:
+                texts.append(await self._env.read_file(ws_name, path, max_bytes=_ARTIFACT_SCAN_MAX_BYTES))
+            except Exception:
+                logger.debug("读成品 %s 失败，跳过", path, exc_info=True)
+        return texts
+
+    async def _link_check(
+        self, *, tid: str, ws_name: str, listing: list[dict], summary: str, evidence: list[str]
+    ) -> dict:
+        """交付里引用的链接 vs 本任务真打开过的链接；返回 {links, unopened, unopened_urls}。"""
+        links: list[str] = []
+        for text in await self._gather_deliverable_texts(ws_name, listing, summary, evidence):
+            links.extend(extract_http_links(text))
+        opened = self._opened_urls(tid)
+        unopened = [u for u in links if normalize_link_for_check(u) not in opened]
+        return {
+            "links": len(links),
+            "unopened": len(unopened),
+            "unopened_urls": unopened[:_UNOPENED_URLS_IN_PROMPT],
+        }
+
+    @staticmethod
+    def _append_link_check_line(review_text: str, link_check: dict) -> str:
+        line = f"引用核对：{int(link_check['links'])} 条链接，{int(link_check['unopened'])} 条没打开过。"
+        if link_check["unopened_urls"]:
+            line += "没打开过的：" + "、".join(str(u) for u in link_check["unopened_urls"][:5])
+        base = str(review_text or "").strip()
+        return f"{base}\n{line}" if base else line
+
 
     async def _run_tool_calls(
         self,
@@ -1229,8 +1550,7 @@ class Coordinator:
         )
         for _round in range(_GROUPSPACE_TOOL_LIMIT):
             try:
-                result = await self._models.chat(
-                    "main",
+                result = await self._chat_main(
                     messages,
                     tools=specs,
                     json_mode=False,
@@ -1314,8 +1634,7 @@ class Coordinator:
         for _round in range(_REMEMBER_TOOL_LIMIT + 2):  # 工具配额 2 次 + 收尾/提醒各一次机会
             quota_left = _REMEMBER_TOOL_LIMIT - used
             try:
-                result = await self._models.chat(
-                    "main",
+                result = await self._chat_main(
                     messages,
                     tools=specs if quota_left > 0 else None,
                     json_mode=False,
@@ -1551,16 +1870,26 @@ class Coordinator:
             for i, c in enumerate(crit)
         ]
         last_text = str(goal.get("last_text") or "")
+        # 群聊上下文（2026-10）：目标检查要考虑群里最近的新进展；第一次检查时还要靠它
+        # 补出验收标准（criteria 为空 → 请模型顺手补 3–5 条，落库）。
+        chat_lines = self._goal_chat_lines(gid)
+        need_criteria = not crit
 
-        prompt = "\n".join(
+        prompt_lines = [
+            "你是 MaiWork 的主模型，在检查一个 agent 目标的进展。",
+            f"目标标题：{goal['title']}",
+            f"目标内容：{str(goal.get('body') or '')}",
+            f"时间要求（by）：{str(goal.get('by_text') or '')}",
+            "",
+            "完成标准（带索引）：",
+            *(crit_lines or ["（还没定——这是第一次检查，请先根据群聊补出 3–5 条能验收的标准）"]),
+        ]
+        if chat_lines:
+            prompt_lines.extend(
+                ["", "群里最近两天在聊的（判断进展用；没有新进展就别硬说）：", *chat_lines]
+            )
+        prompt_lines.extend(
             [
-                "你是 MaiWork 的主模型，在检查一个 agent 目标的进展。",
-                f"目标标题：{goal['title']}",
-                f"目标内容：{str(goal.get('body') or '')}",
-                f"时间要求（by）：{str(goal.get('by_text') or '')}",
-                "",
-                "完成标准（带索引）：",
-                *crit_lines,
                 "",
                 f"最近进展：{last_text or '（还没记过）'}",
                 "",
@@ -1572,12 +1901,15 @@ class Coordinator:
                 ' "next_check_hours": 几小时后再检查,'
                 ' "progress": "一句话的新进展，没有新进展就 null",'
                 ' "new_task": {"title","req","criteria":["…"]} | null,'
-                ' "report": "有阶段性结果想发到群里说的一句话，没有就 null"}',
+                ' "report": "有阶段性结果想发到群里说的一句话，没有就 null"'
+                + (',' + ' "criteria": ["第一次检查补出的完成标准（3–5 条，一句话一条）"]'
+                   if need_criteria else '')
+                + "}",
             ]
         )
+        prompt = "\n".join(prompt_lines)
         try:
-            result = await self._models.chat(
-                "main",
+            result = await self._chat_main(
                 [{"role": "user", "content": prompt}],
                 json_mode=True,
                 purpose="coordinator.check_goal",
@@ -1610,6 +1942,18 @@ class Coordinator:
             self._goals.beat(goal_id, clock.now())
         except Exception:
             logger.exception("目标 %s 写心跳失败", goal_id)
+
+        # 第一次检查：模型顺手补出的验收标准先落库（这样下面的 done_criteria 索引才对得上）
+        if need_criteria:
+            raw_crit = data.get("criteria")
+            if isinstance(raw_crit, list):
+                texts = [str(x).strip() for x in raw_crit if str(x).strip()]
+                if texts:
+                    try:
+                        self._goals.set_criteria(goal_id, texts)
+                        crit = self._safe_json_list(self._goals.get(goal_id).get("criteria"))
+                    except Exception:
+                        logger.exception("目标 %s 补验收标准落库失败", goal_id)
 
         # 勾完成标准
         done_list = data.get("done_criteria") or []
@@ -1767,6 +2111,29 @@ class Coordinator:
             self._goals.fail(goal_id, str(error or ""), clock.now())
         except Exception:
             logger.exception("目标 %s 出错计数失败", goal_id)
+
+    def _goal_chat_lines(self, gid: str) -> list[str]:
+        """目标检查用的群聊节选：本群最近 _GOAL_CHAT_H 小时，每条截 _GOAL_CHAT_TEXT 字。
+
+        只给主模型看；读不到 / 库错误 → []（那段就不加，检查照常跑）。
+        """
+        from .chatlog import recent_chat
+
+        try:
+            rows = recent_chat(self._store, gid, hours=_GOAL_CHAT_H, limit=_GOAL_CHAT_N)
+        except Exception:
+            logger.info("目标检查读群聊失败（群 %s）", gid, exc_info=True)
+            return []
+        out: list[str] = []
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            text = str(r.get("text") or "").strip().replace("\n", " ")
+            if not text:
+                continue
+            who = str(r.get("who") or "").strip() or "群友"
+            out.append(f"- {who}：{text[:_GOAL_CHAT_TEXT]}")
+        return out
 
     @staticmethod
     def _safe_json_list(value: Any) -> list:

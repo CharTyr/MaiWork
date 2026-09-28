@@ -314,3 +314,24 @@ class TestView:
         gid = _mk_agent(goals)
         goals.cancel(gid)
         assert goals.view(GID)["agent"] == []
+
+
+class TestSetCriteria:
+    """2026-10：目标第一次检查补验收标准用（整组替换，done 一律 False）。"""
+
+    def test_replaces_criteria(self, goals: Goals, mem_store: Store):
+        gid = goals.create_agent(GID, title="盯着", body="", criteria=[], by_text="")
+        got = goals.set_criteria(gid, ["第一条", "第二条", "  "])
+        assert [c["text"] for c in got] == ["第一条", "第二条"]
+        assert all(c["done"] is False for c in got)
+        row = mem_store.read().execute("SELECT criteria FROM goals WHERE id=?", (gid,)).fetchone()
+        assert [c["text"] for c in json.loads(row["criteria"])] == ["第一条", "第二条"]
+
+    def test_empty_list_clears(self, goals: Goals):
+        gid = goals.create_agent(GID, title="盯着", body="", criteria=["旧"], by_text="")
+        assert goals.set_criteria(gid, []) == []
+        assert json.loads(goals.get(gid)["criteria"]) == []
+
+    def test_unknown_goal_raises(self, goals: Goals):
+        with pytest.raises(KeyError):
+            goals.set_criteria("G-999", ["x"])

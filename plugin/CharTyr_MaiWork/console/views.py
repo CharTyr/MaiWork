@@ -592,6 +592,18 @@ def _tasks_view(svc: Any, group_id: str) -> dict[str, Any]:
                     pass
     except Exception:
         pass
+    # 批准信息（自动审核 / 人批）：approved_by + auto_reason，任务里能看到
+    # 「自动审核通过：<理由>」。一次查完，不逐条查。
+    try:
+        appr = getattr(svc, "approvals", None)
+        if appr is not None and lst:
+            info = appr.auto_info_by_task([str(x.get("id") or "") for x in lst])
+            for item in lst:
+                got = info.get(str(item.get("id") or ""))
+                if got:
+                    item.update(got)
+    except Exception:
+        pass
     return {"pending": pending, "list": lst}
 
 
@@ -744,10 +756,10 @@ def _jev_health(svc: Any) -> dict[str, Any]:
     """Jev 健康项：available → ok「能用 · 今天判断 N 次」；没密钥 → warn；关了 → off。"""
     jev = getattr(svc, "jev", None)
     if jev is None:
-        return {"key": "jev", "icon": "sparkles", "name": "快速判断", "state": "off", "text": "还没启用，后面的阶段才开"}
+        return {"key": "jev", "icon": "sparkles", "name": "快速判断", "state": "off", "text": "还没启用"}
     settings = svc.get_settings()
     if settings is not None and not bool(getattr(settings.jev, "enabled", True)):
-        return {"key": "jev", "icon": "sparkles", "name": "快速判断", "state": "off", "text": "关掉了：判断都走主模型慢路径"}
+        return {"key": "jev", "icon": "sparkles", "name": "快速判断", "state": "off", "text": "已关闭"}
     try:
         if jev.available():
             try:
@@ -776,7 +788,7 @@ def _search_health(svc: Any) -> dict[str, Any]:
     search = getattr(svc, "search", None)
     if search is None:
         return {"key": "search", "icon": "search", "name": "搜索", "state": "warn",
-                "text": "还没指定联网搜索：去 设置 → 扩展 里选一个 MCP 用作联网搜索"}
+                "text": "还没选：去「设置 → 扩展」选一个"}
     try:
         ok, text = search.status()
     except Exception:
@@ -832,16 +844,16 @@ def _groupspace_health(svc: Any) -> dict[str, Any]:
     base = {"key": "group_space", "icon": "folder", "name": "群空间"}
     gs = getattr(svc, "group_space", None)
     if gs is None:
-        return {**base, "state": "off", "text": "关掉了，不管群文件 / 公告 / 相册"}
+        return {**base, "state": "off", "text": "已关闭"}
     try:
         opened = bool(gs.adapter_open())
     except Exception:
         opened = False
     if opened:
-        return {**base, "state": "ok", "text": "能管群文件 / 公告 / 相册（按群看身份）"}
+        return {**base, "state": "ok", "text": "能管群文件、公告和相册"}
     return {
         **base, "state": "warn",
-        "text": "QQ 适配器是旧版，群公告、相册、文件管理用不了（升级到 v1.0.1 后自动开放）",
+        "text": "暂时用不了：QQ 适配器是旧版，升级到 v1.0.1 就行",
     }
 
 
@@ -862,7 +874,7 @@ def _railway_health(svc: Any) -> dict[str, Any] | None:
     if env is None:
         return None
     if not bool(getattr(env, "railway", True)):
-        return {**base, "state": "off", "text": "关掉了，不在一次性 VM 里跑实测"}
+        return {**base, "state": "off", "text": "已关闭"}
     daily_max = max(1, int(getattr(env, "railway_daily_max", 2) or 2))
     used = 0
     last_fail: dict | None = None
@@ -913,13 +925,13 @@ def _bot_info(svc: Any) -> dict[str, str]:
         name = str(getattr(svc.host, "bot_name_cache", "") or "")
     except Exception:
         name = ""
-    avatar = "/static/assets/bot.jpg"
+    avatar = "/static/assets/maimai.png"
     try:
         av = getattr(svc, "avatar", None)
         if av is not None:
             avatar = av.bot_avatar_url()
     except Exception:
-        avatar = "/static/assets/bot.jpg"
+        avatar = "/static/assets/maimai.png"
     return {"name": name or "MaiBot", "avatar": avatar}
 
 
@@ -928,7 +940,7 @@ def settings_view(svc: Any) -> dict[str, Any]:
     now = clock.now()
     models = svc.models.settings()
     model_state = "ok" if models.ready() else "off"
-    model_text = "配好了，能用" if models.ready() else "还没配好，MaiWork 不会做任何要用模型的事"
+    model_text = "配好了，能用" if models.ready() else "还没配好，MaiWork 暂时不会工作"
     if models.ready() and _recent_model_errors(svc.store, now):
         model_state = "warn"
         model_text = "最近 1 小时有调用出错"

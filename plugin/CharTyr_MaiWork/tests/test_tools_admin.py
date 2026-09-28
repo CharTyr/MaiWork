@@ -595,6 +595,58 @@ class TestH1SetRulesLoosen:
         assert "666666" not in svc.get_settings().approval.exempt_users
 
 
+class TestAutoReviewRulesConfirm:
+    """自动审核两键：打开 / 调高上限才算放宽（要确认）；关掉 / 调低不用。
+
+    小票里不露英文键名（用中文标签「自动审核轻活」「每群每天最多自动批」）。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _chat(self, svc: _Svc) -> None:
+        _bind_chat(svc)
+
+    def _settings_off(self, svc: _Svc) -> None:
+        svc._settings, _ = load_settings(_raw_config(svc.data_dir, approval={"auto_review": False}))
+
+    @pytest.mark.asyncio
+    async def test_turn_off_auto_review_needs_no_ticket(self, svc: _Svc) -> None:
+        r = await svc.tools.call("set_rules", {"patch": {"approval": {"auto_review": False}}}, _ctx())
+        assert r.ok, r.error
+        assert _pending_rows(svc.store) == []
+        assert rules.read_override(svc.store)["approval"]["auto_review"] is False
+
+    @pytest.mark.asyncio
+    async def test_turn_on_auto_review_needs_ticket_with_chinese_label(self, svc: _Svc) -> None:
+        self._settings_off(svc)
+        r = await svc.tools.call("set_rules", {"patch": {"approval": {"auto_review": True}}}, _ctx())
+        assert r.ok, r.error
+        assert "已请求管理员确认" in r.output
+        rows = _pending_rows(svc.store)
+        assert len(rows) == 1 and rows[0]["tool"] == "set_rules"
+        summary = rows[0]["summary"]
+        assert "自动审核轻活" in summary
+        assert "approval.auto_review" not in summary
+        assert rules.read_override(svc.store) == {}  # 没同意前不落库
+
+    @pytest.mark.asyncio
+    async def test_raise_auto_review_daily_needs_ticket_with_chinese_label(self, svc: _Svc) -> None:
+        r = await svc.tools.call("set_rules", {"patch": {"approval": {"auto_review_daily": 8}}}, _ctx())
+        assert r.ok, r.error
+        assert "已请求管理员确认" in r.output
+        rows = _pending_rows(svc.store)
+        assert len(rows) == 1 and rows[0]["tool"] == "set_rules"
+        summary = rows[0]["summary"]
+        assert "每群每天最多自动批" in summary
+        assert "approval.auto_review_daily" not in summary
+
+    @pytest.mark.asyncio
+    async def test_lower_auto_review_daily_needs_no_ticket(self, svc: _Svc) -> None:
+        r = await svc.tools.call("set_rules", {"patch": {"approval": {"auto_review_daily": 2}}}, _ctx())
+        assert r.ok, r.error
+        assert _pending_rows(svc.store) == []
+        assert rules.read_override(svc.store)["approval"]["auto_review_daily"] == 2
+
+
 class TestM1SummaryListsAllFields:
     """M1：混合 patch 的小票摘要要列出全部字段，不能只写放宽那一项。"""
 

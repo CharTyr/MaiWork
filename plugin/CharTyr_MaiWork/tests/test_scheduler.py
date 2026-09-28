@@ -274,3 +274,36 @@ def test_next_news_ts_within_day_and_next_day(tmp_path) -> None:
 def test_next_news_ts_none_when_no_slots(tmp_path) -> None:
     _, _, sched = _make(tmp_path, cfg={"feeds": {"news_slots": []}})
     assert sched.next_news_ts(GID, _bj_ts(Y, M, D, 12, 0)) is None
+
+
+# ----------------------------------------------------------------------
+# 主动提目标（goal）due / done：一天一次，只在北京时间 19:00–21:00
+# ----------------------------------------------------------------------
+
+
+def test_goal_due_window_then_done_blocks_today(tmp_path) -> None:
+    _, _, sched = _make(tmp_path)
+    now = _bj_ts(Y, M, D, 19, 30)
+    assert "goal" in sched.due(GID, now)
+    sched.done(GID, "goal", now)
+    assert "goal" not in sched.due(GID, now + 600)
+    tomorrow = now + 86400
+    assert "goal" in sched.due(GID, tomorrow)  # 第二天又可以
+
+
+def test_goal_outside_window(tmp_path) -> None:
+    _, _, sched = _make(tmp_path)
+    for hh_mm in ((18, 59), (21, 0), (22, 30), (2, 0)):
+        now = _bj_ts(Y, M, D, *hh_mm)
+        assert "goal" not in sched.due(GID, now), hh_mm
+
+
+def test_goal_switch_off(tmp_path) -> None:
+    _, _, sched = _make(tmp_path, cfg={"goals": {"propose": False}})
+    assert "goal" not in sched.due(GID, _bj_ts(Y, M, D, 19, 30))
+
+
+def test_goal_not_ready_group(tmp_path) -> None:
+    _, _, sched = _make(tmp_path, ready=False)
+    assert "goal" not in sched.due(GID, _bj_ts(Y, M, D, 19, 30))
+    sched.done(GID, "goal", _bj_ts(Y, M, D, 19, 30))  # done 不报错

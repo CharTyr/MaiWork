@@ -18,11 +18,42 @@ from aiohttp import web
 from .. import clock
 from . import usage_history
 from . import views
+from ..group_admins import GroupAdmins
 from .auth import COOKIE_NAME, ConsoleAuth, same_origin
 
 logger = logging.getLogger("maiwork.console.server")
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# 首页里的 app.js / style.css 带内容版本号（?v=前 12 位 sha256）：部署新版后浏览器必定拿新文件，
+# 不会用启发式缓存里的旧版。按 (mtime, size) 缓存，文件没变不重算。
+_ASSET_VER_CACHE: dict[str, tuple[tuple[float, int], str]] = {}
+
+
+def _asset_version(name: str) -> str:
+    import hashlib
+
+    path = _STATIC_DIR / name
+    try:
+        st = path.stat()
+    except OSError:
+        return ""
+    key = (st.st_mtime, st.st_size)
+    hit = _ASSET_VER_CACHE.get(name)
+    if hit and hit[0] == key:
+        return hit[1]
+    ver = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+    _ASSET_VER_CACHE[name] = (key, ver)
+    return ver
+
+
+def _index_html() -> str:
+    html = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    for name in ("app.js", "style.css"):
+        ver = _asset_version(name)
+        if ver:
+            html = html.replace(f'"/static/{name}"', f'"/static/{name}?v={ver}"')
+    return html
 _TOKEN_CHARS = frozenset("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789")
 
 Handler = Callable[[web.Request], Awaitable[web.Response]]
@@ -31,8 +62,12 @@ AUTH_KEY = web.AppKey("auth", object)  # ConsoleAuth；放 app[AUTH_KEY]，避�
 
 @dataclass
 class Identity:
-    role: str  # "admin" | "member" | "none"
+    role: str  # "admin" | "group_admin" | "member" | "none"
     group_id: str | None = None
+
+
+# 群管理员碰个人画像 / 个人向资讯时的统一文案（只读）
+_PERSONAL_READONLY = "群管理员只能看，不能改个人画像"
 
 
 def _err(status: int, text: str) -> web.Response:
@@ -106,8 +141,14 @@ class ConsoleServer:
     def _identify(self, request: web.Request) -> Identity:
         auth: ConsoleAuth = request.app[AUTH_KEY]
         cookie = request.cookies.get(COOKIE_NAME, "")
-        if cookie and auth.check_cookie(cookie):
-            return Identity(role="admin")
+        if cookie:
+            if cookie.startswith("g:"):
+                # 群管理员 cookie：g:<群号>.<到期>.<签名>；群不再是服务群 → 视为 none
+                gid = auth.check_group_cookie(cookie)
+                if gid is not None and self._resolve_ref(gid) is not None:
+                    return Identity(role="group_admin", group_id=gid)
+            elif auth.check_cookie(cookie):
+                return Identity(role="admin")
         token = request.headers.get("X-MW-Group", "").strip()
         if token:
             gid = views.group_id_by_token(self._svc, token)
@@ -116,12 +157,31 @@ class ConsoleServer:
         return Identity(role="none")
 
     def _require_admin(self, request: web.Request) -> web.Response | None:
+        """只给总管理员；群管理员碰全局的东西 → 403，群友 403、匿名 401。"""
         ident = self._identify(request)
         if ident.role == "admin":
             return None
+        if ident.role == "group_admin":
+            return _err(403, "群管理员只能管本群的事")
         if ident.role == "member":
             return _err(403, "这里只有管理员能进")
         return _err(401, "先登录管理员")
+
+    @staticmethod
+    def _require_group_admin_ident(ident: Identity, gid: Any) -> web.Response | None:
+        """按群的管理动作：总管理员随便；群管理员只在本群；群友 / 匿名拒绝。"""
+        if ident.role == "admin":
+            return None
+        if ident.role == "group_admin":
+            if str(ident.group_id or "") == str(gid or ""):
+                return None
+            return _err(403, "群管理员只能管本群的事")
+        if ident.role == "member":
+            return _err(403, "这里只有管理员能进")
+        return _err(401, "先登录管理员，或用群链接打开")
+
+    def _require_group_admin(self, request: web.Request, gid: Any) -> web.Response | None:
+        return self._require_group_admin_ident(self._identify(request), gid)
 
     @staticmethod
     def _origin_guard(request: web.Request) -> web.Response | None:
@@ -197,7 +257,25 @@ class ConsoleServer:
     def _build_app(self) -> web.Application:
         svc = self._svc
         app = web.Application(middlewares=(self._errors_mw,))
-        app[AUTH_KEY] = ConsoleAuth(svc.store, svc.get_settings)
+        auth = ConsoleAuth(svc.store, svc.get_settings)
+        # 群管理员：指纹签 cookie（ConsoleAuth ← GroupAdmins），密码比对总管理员（反向）
+        group_admins = getattr(svc, "group_admins", None)
+        if group_admins is None:
+            try:
+                group_admins = GroupAdmins(svc.store, get_settings=svc.get_settings)
+            except Exception:
+                logger.exception("建群管理员存储出错，群管理员这次不可用")
+                group_admins = None
+        if group_admins is not None:
+            try:
+                group_admins.bind_console_auth(auth)
+            except Exception:
+                logger.exception("群管理员接总管理员密码比对上出错")
+            try:
+                auth.bind_group_admins(group_admins)
+            except Exception:
+                logger.exception("总管理员接群管理员密码指纹上出错")
+        app[AUTH_KEY] = auth
 
         def get(path: str):
             def deco(fn: Handler) -> Handler:
@@ -226,7 +304,7 @@ class ConsoleServer:
         async def _me(request: web.Request) -> web.Response:
             ident = self._identify(request)
             group = None
-            if ident.role == "member":
+            if ident.role in ("member", "group_admin"):
                 group = ident.group_id
             elif ident.role == "admin":
                 # 管理员带链接码打开时也能定位到那个群（还能顺便核对 admin 看群号路径不冲突）
@@ -250,15 +328,35 @@ class ConsoleServer:
                 return _err(429, "错太多次了，过 10 分钟再试")
             body = await _json_body(request)
             password = str((body or {}).get("password") or "")
-            if not password or not auth.verify_password(password):
-                auth.record_login_fail(ip)
-                logger.info("网页登录失败一次（IP %s）", ip)
-                return _err(401, "密码不对，再试一次")
-            auth.record_login_ok(ip)
-            value, max_age = auth.make_cookie()
-            resp = web.json_response({"ok": True})
-            resp.set_cookie(COOKIE_NAME, value, max_age=max_age, httponly=True, samesite="Strict", path="/")
-            return resp
+            if password and auth.verify_password(password):
+                # 总管理员：cookie 格式和以前一样
+                auth.record_login_ok(ip)
+                value, max_age = auth.make_cookie()
+                resp = web.json_response({"ok": True, "role": "admin"})
+                resp.set_cookie(COOKIE_NAME, value, max_age=max_age, httponly=True, samesite="Strict", path="/")
+                return resp
+            gid_hit = None
+            if password:
+                ga = getattr(svc, "group_admins", None)
+                if ga is not None:
+                    try:
+                        gid_hit = ga.match(password)
+                    except Exception:
+                        logger.exception("群管理员密码匹配出错")
+                        gid_hit = None
+            if gid_hit:
+                value, max_age = auth.make_group_cookie(gid_hit)
+                if not value:
+                    auth.record_login_fail(ip)
+                    return _err(401, "密码不对，再试一次")
+                auth.record_login_ok(ip)
+                logger.info("群 %s 的群管理员从网页登录了（IP %s）", gid_hit, ip)
+                resp = web.json_response({"ok": True, "role": "group_admin", "group": gid_hit})
+                resp.set_cookie(COOKIE_NAME, value, max_age=max_age, httponly=True, samesite="Strict", path="/")
+                return resp
+            auth.record_login_fail(ip)
+            logger.info("网页登录失败一次（IP %s）", ip)
+            return _err(401, "密码不对，再试一次")
 
         @post("/api/logout")
         async def _logout(request: web.Request) -> web.Response:
@@ -273,6 +371,11 @@ class ConsoleServer:
             ident = self._identify(request)
             if ident.role == "admin":
                 return web.json_response(views.list_summaries(svc, admin=True))
+            if ident.role == "group_admin":
+                # 群管理员只看到自己那一个群（管理员版视图：带链接码，他能重置本群链接）
+                return web.json_response(
+                    views.list_summaries(svc, admin=True, only_group_id=ident.group_id)
+                )
             if ident.role == "member":
                 return web.json_response(views.list_summaries(svc, admin=False, only_group_id=ident.group_id))
             return _err(401, "先登录管理员，或用群链接打开")
@@ -285,6 +388,14 @@ class ConsoleServer:
                 gid = self._resolve_ref(ref)
                 if gid is None:
                     return _err(404, "没有这个群")
+                return web.json_response(views.group_view(svc, gid, admin=True))
+            if ident.role == "group_admin":
+                # 只限本群；给管理员版视图（能管这个群的事）
+                gid = self._resolve_ref(ref)
+                if gid is None:
+                    return _err(404, "没有这个群")
+                if str(gid) != str(ident.group_id or ""):
+                    return _err(403, "群管理员只能管本群的事")
                 return web.json_response(views.group_view(svc, gid, admin=True))
             if ident.role == "member":
                 if not _looks_like_token(ref):
@@ -301,12 +412,12 @@ class ConsoleServer:
 
         @post("/api/groups/{gid}/profile")
         async def _profile_add(request: web.Request) -> web.Response:
-            forbid = self._require_admin(request)
+            gid = self._resolve_ref(request.match_info["gid"])
+            if gid is None:
+                return _err(404, "没有这个群")
+            forbid = self._require_group_admin(request, gid)
             if forbid is not None:
                 return forbid
-            gid = request.match_info["gid"]
-            if self._resolve_ref(gid) is None:
-                return _err(404, "没有这个群")
             body = await _json_body(request)
             if body is None:
                 return _err(400, "请求体不是 JSON")
@@ -319,8 +430,35 @@ class ConsoleServer:
             entry_id = svc.profiles.add_entry(gid, category, text)
             return web.json_response({"ok": True, "id": int(entry_id)})
 
+        def _profile_group(entry_id: int) -> str | None:
+            """这条画像条目属于哪个群（鉴权用；遍历服务群，不碰别的模块内部）。"""
+            settings = svc.get_settings()
+            gids = list(settings.groups.keys()) if settings is not None else []
+            for gid in gids:
+                try:
+                    entries = svc.profiles.entries(gid) or []
+                except Exception:
+                    continue
+                for e in entries:
+                    if not isinstance(e, dict):
+                        continue
+                    if int(e.get("id") or 0) == int(entry_id) and not e.get("deleted"):
+                        return str(gid)
+            return None
+
         async def _profile_edit(request: web.Request) -> web.Response:
-            forbid = self._require_admin(request)
+            ident = self._identify(request)
+            if ident.role not in ("admin", "group_admin"):
+                forbid = self._require_admin(request)
+                return forbid
+            try:
+                entry_id = int(request.match_info["entry_id"])
+            except (ValueError, TypeError):
+                return _err(404, "这条画像不存在")
+            gid = _profile_group(entry_id)
+            if gid is None:
+                return _err(404, "这条画像不存在")
+            forbid = self._require_group_admin_ident(ident, gid)
             if forbid is not None:
                 return forbid
             body = await _json_body(request)
@@ -332,17 +470,28 @@ class ConsoleServer:
             if body.get("locked") is not None:
                 kwargs["locked"] = bool(body["locked"])
             try:
-                svc.profiles.edit_entry(int(request.match_info["entry_id"]), **kwargs)
+                svc.profiles.edit_entry(entry_id, **kwargs)
             except (KeyError, ValueError):
                 return _err(404, "这条画像不存在")
             return web.json_response({"ok": True})
 
         async def _profile_delete(request: web.Request) -> web.Response:
-            forbid = self._require_admin(request)
+            ident = self._identify(request)
+            if ident.role not in ("admin", "group_admin"):
+                forbid = self._require_admin(request)
+                return forbid
+            try:
+                entry_id = int(request.match_info["entry_id"])
+            except (ValueError, TypeError):
+                return _err(404, "这条画像不存在")
+            gid = _profile_group(entry_id)
+            if gid is None:
+                return _err(404, "这条画像不存在")
+            forbid = self._require_group_admin_ident(ident, gid)
             if forbid is not None:
                 return forbid
             try:
-                svc.profiles.delete_entry(int(request.match_info["entry_id"]))
+                svc.profiles.delete_entry(entry_id)
             except (KeyError, ValueError):
                 return _err(404, "这条画像不存在")
             return web.json_response({"ok": True})
@@ -352,12 +501,12 @@ class ConsoleServer:
 
         @post("/api/groups/{gid}/focus")
         async def _focus(request: web.Request) -> web.Response:
-            forbid = self._require_admin(request)
+            gid = self._resolve_ref(request.match_info["gid"])
+            if gid is None:
+                return _err(404, "没有这个群")
+            forbid = self._require_group_admin(request, gid)
             if forbid is not None:
                 return forbid
-            gid = request.match_info["gid"]
-            if self._resolve_ref(gid) is None:
-                return _err(404, "没有这个群")
             body = await _json_body(request)
             if body is None:
                 return _err(400, "请求体不是 JSON")
@@ -367,22 +516,106 @@ class ConsoleServer:
                 return _err(400, "QQ 号应该是纯数字")
             if action not in ("add", "remove", "auto"):
                 return _err(400, "action 只支持 add / remove / auto")
+            if action == "remove" and self._identify(request).role != "admin":
+                return _err(403, "移除关注会删掉个人画像，只有总管理员能做")
             svc.profiles.set_focus(gid, user_id, action)
             return web.json_response({"ok": True})
 
         @post("/api/groups/{gid}/token")
         async def _token_reset(request: web.Request) -> web.Response:
-            forbid = self._require_admin(request)
+            gid = self._resolve_ref(request.match_info["gid"])
+            if gid is None:
+                return _err(404, "没有这个群")
+            forbid = self._require_group_admin(request, gid)
             if forbid is not None:
                 return forbid
-            gid = request.match_info["gid"]
-            if self._resolve_ref(gid) is None:
-                return _err(404, "没有这个群")
             new_token = svc.reset_group_token(gid)
             if not new_token:
                 return _err(404, "这个群还没有链接码")
             logger.info("群 %s 的链接码已重置，旧链接即刻失效", gid)
             return web.json_response({"token": new_token})
+
+        # ---------- 群管理员（按群的管理员；设置 / 查看只给总管理员） ----------
+
+        def _group_admin_ready() -> tuple[Any, web.Response | None]:
+            ga = getattr(svc, "group_admins", None)
+            if ga is None:
+                return None, _err(503, "群管理员还没开")
+            return ga, None
+
+        def _group_admin_view(gid: str) -> dict[str, Any]:
+            ga = getattr(svc, "group_admins", None)
+            if ga is None:
+                return {"password_set": False, "accounts": []}
+            return {
+                "password_set": bool(ga.has_password(gid)),
+                "accounts": list(ga.accounts(gid)),
+            }
+
+        @get("/api/groups/{gid}/group-admin")
+        async def _group_admin_get(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            _ga, not_ready = _group_admin_ready()
+            if not_ready is not None:
+                return not_ready
+            gid = self._resolve_ref(request.match_info["gid"])
+            if gid is None:
+                return _err(404, "没有这个群")
+            return web.json_response(_group_admin_view(gid))
+
+        async def _group_admin_put(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            ga, not_ready = _group_admin_ready()
+            if not_ready is not None:
+                return not_ready
+            gid = self._resolve_ref(request.match_info["gid"])
+            if gid is None:
+                return _err(404, "没有这个群")
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            password = str(body.get("password") or "")
+            has_accounts = "accounts" in body and body.get("accounts") is not None
+            accounts_v = body.get("accounts") if has_accounts else None
+            if has_accounts and not isinstance(accounts_v, list):
+                return _err(400, "名单要是数组，比如 [\"qq:123456\"]")
+            if password:
+                try:
+                    ga.set_password(gid, password)
+                except ValueError as e:
+                    return _err(400, str(e))
+                # 日志只说「改了」，不记密码本身
+                logger.info("群 %s 的群管理员密码已更新", gid)
+            if has_accounts:
+                try:
+                    accounts = ga.set_accounts(gid, accounts_v)
+                except ValueError as e:
+                    return _err(400, str(e))
+                logger.info("群 %s 的群管理员名单改成 %d 人", gid, len(accounts))
+            return web.json_response(_group_admin_view(gid))
+
+        async def _group_admin_delete_password(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            ga, not_ready = _group_admin_ready()
+            if not_ready is not None:
+                return not_ready
+            gid = self._resolve_ref(request.match_info["gid"])
+            if gid is None:
+                return _err(404, "没有这个群")
+            ga.clear_password(gid)
+            logger.info("群 %s 的群管理员密码已清掉，该群旧的登录状态立刻失效", gid)
+            return web.json_response(_group_admin_view(gid))
+
+        app.router.add_route("PUT", "/api/groups/{gid}/group-admin", self._write(_group_admin_put))
+        app.router.add_route(
+            "DELETE", "/api/groups/{gid}/group-admin/password", self._write(_group_admin_delete_password)
+        )
 
         # ---------- 设置（管理员） ----------
 
@@ -976,12 +1209,28 @@ class ConsoleServer:
             if ident.role == "admin":
                 return ident, None
             if need_admin:
+                if ident.role == "group_admin":
+                    return ident, None  # 能不能动这条由调用方按条目所属群再判
                 if ident.role == "member":
                     return None, _err(403, "这里只有管理员能进")
                 return None, _err(401, "先登录管理员")
-            if ident.role == "member":
+            if ident.role in ("member", "group_admin"):
                 return ident, None
             return None, _err(401, "先登录管理员，或用群链接打开")
+
+        def _wrong_group(ident: Identity, gid: str) -> bool:
+            """群友 / 群管理员只能动本群的条目。"""
+            return ident.role in ("member", "group_admin") and str(ident.group_id or "") != str(gid)
+
+        def _personal_deny(ident: Identity, kind: str, item_id: int) -> web.Response | None:
+            """个人向内容（关注成员的）：群友当不存在（404），群管理员只读（403）。"""
+            if not _personal_item(kind, item_id):
+                return None
+            if ident.role == "group_admin":
+                return _err(403, _PERSONAL_READONLY)
+            if ident.role == "member" and kind == "news":
+                return _err(404, "这条资讯不存在")
+            return None
 
         def _group_of(kind: str, item_id: int) -> str | None:
             """从库里查条目属于哪个群（鉴权用，不经过 feeds/topics）。"""
@@ -1034,10 +1283,11 @@ class ConsoleServer:
             gid = _group_of("news", item_id)
             if gid is None:
                 return _err(404, "这条资讯不存在")
-            if ident.role == "member" and ident.group_id != gid:
+            if _wrong_group(ident, gid):
                 return _err(403, "只能管自己群的内容")
-            if ident.role == "member" and _personal_item("news", item_id):
-                return _err(404, "这条资讯不存在")
+            personal_deny = _personal_deny(ident, "news", item_id)
+            if personal_deny is not None:
+                return personal_deny
             body = await _json_body(request)
             if body is None:
                 return _err(400, "请求体不是 JSON")
@@ -1069,8 +1319,11 @@ class ConsoleServer:
             gid = _group_of("ideas", item_id)
             if gid is None:
                 return _err(404, "这条构想不存在")
-            if ident.role == "member" and ident.group_id != gid:
+            if _wrong_group(ident, gid):
                 return _err(403, "只能管自己群的内容")
+            personal_deny = _personal_deny(ident, "ideas", item_id)
+            if personal_deny is not None:
+                return personal_deny
             body = await _json_body(request)
             if body is None:
                 return _err(400, "请求体不是 JSON")
@@ -1096,11 +1349,26 @@ class ConsoleServer:
                 gid = _group_of("ideas", item_id)
                 if gid is None:
                     return _err(404, "这条构想不存在")
-                if ident.role == "member" and ident.group_id != gid:
+                if _wrong_group(ident, gid):
                     return _err(403, "只能管自己群的内容")
-                by = "管理员" if ident.role == "admin" else "群友（网页）"
+                personal_deny = _personal_deny(ident, "ideas", item_id)
+                if personal_deny is not None:
+                    return personal_deny
+                if ident.role == "admin":
+                    by = "管理员"
+                elif ident.role == "group_admin":
+                    by = "群管理员（网页）"
+                else:
+                    by = "群友（网页）"
+                # 「直接开工」可以只做勾选的项目：body {"items": [1,3]}（构想项目序号，1 起）；
+                # 不带 / 空 / 非法 = 全部（口径和 approvals.parse_idea_wanted 一致）。
+                picked: Any = None
+                if op == "do":
+                    body = await _json_body(request)
+                    if isinstance(body, dict):
+                        picked = body.get("items")
                 try:
-                    out = svc.feeds.idea_action(item_id, op, by=by)
+                    out = svc.feeds.idea_action(item_id, op, by=by, item_nos=picked)
                 except KeyError:
                     return _err(404, "这条构想不存在")
                 except ValueError as e:
@@ -1126,9 +1394,6 @@ class ConsoleServer:
             return _handler
 
         async def _topics_verdict(request: web.Request) -> web.Response:
-            forbid = self._require_admin(request)
-            if forbid is not None:
-                return forbid
             not_ready = _m2_ready(svc.topics)
             if not_ready is not None:
                 return not_ready
@@ -1136,8 +1401,12 @@ class ConsoleServer:
                 item_id = int(request.match_info["id"])
             except (ValueError, TypeError):
                 return _err(400, "id 要是数字")
-            if _group_of("topics", item_id) is None:
+            topic_gid = _group_of("topics", item_id)
+            if topic_gid is None:
                 return _err(404, "这条开话题记录不存在")
+            forbid = self._require_group_admin(request, topic_gid)
+            if forbid is not None:
+                return forbid
             body = await _json_body(request)
             if body is None:
                 return _err(400, "请求体不是 JSON")
@@ -1619,15 +1888,14 @@ class ConsoleServer:
         app.router.add_route("DELETE", "/api/extensions/skills/{name}", self._write(_skill_delete))
 
         async def _feeds_pref_get(request: web.Request) -> web.Response:
-            """资讯偏好：GET 对所有人可见（含群友，只读）。"""
+            """资讯偏好：GET 对所有人可见（含群友 / 本群群管理员，只读）。"""
             ident = self._identify(request)
-            if ident.role not in ("admin", "member"):
+            if ident.role not in ("admin", "member", "group_admin"):
                 return _err(401, "先登录管理员，或用群链接打开")
-            gid = request.match_info["gid"]
-            resolved = self._resolve_ref(gid)
+            resolved = self._resolve_ref(request.match_info["gid"])
             if resolved is None:
                 return _err(404, "没有这个群")
-            if ident.role == "member" and resolved != ident.group_id:
+            if _wrong_group(ident, resolved):
                 return _err(403, "只能看自己群的内容")
             not_ready = _m2_ready(svc.feeds)
             if not_ready is not None:
@@ -1635,14 +1903,13 @@ class ConsoleServer:
             return web.json_response({"text": svc.feeds.pref(resolved)})
 
         async def _feeds_pref_put(request: web.Request) -> web.Response:
-            """资讯偏好：PUT 只管理员。"""
-            forbid = self._require_admin(request)
-            if forbid is not None:
-                return forbid
-            gid = request.match_info["gid"]
-            resolved = self._resolve_ref(gid)
+            """资讯偏好：PUT 管理员或本群群管理员。"""
+            resolved = self._resolve_ref(request.match_info["gid"])
             if resolved is None:
                 return _err(404, "没有这个群")
+            forbid = self._require_group_admin(request, resolved)
+            if forbid is not None:
+                return forbid
             not_ready = _m2_ready(svc.feeds)
             if not_ready is not None:
                 return not_ready
@@ -1653,13 +1920,13 @@ class ConsoleServer:
             return web.json_response({"text": text})
 
         async def _news_run(request: web.Request) -> web.Response:
-            """管理员「现在就备一批」：后台开跑，立刻返回 {"started", "reason"}。"""
-            forbid = self._require_admin(request)
-            if forbid is not None:
-                return forbid
+            """管理员 / 本群群管理员「现在就备一批」：后台开跑，立刻返回 {"started", "reason"}。"""
             resolved = self._resolve_ref(request.match_info["gid"])
             if resolved is None:
                 return _err(404, "没有这个群")
+            forbid = self._require_group_admin(request, resolved)
+            if forbid is not None:
+                return forbid
             fn = getattr(svc, "run_news_now", None)
             if fn is None:
                 return _err(503, "资讯模块没开")
@@ -1668,7 +1935,24 @@ class ConsoleServer:
                 return _err(409, str(out.get("reason") or "现在开不了"))
             return web.json_response(out)
 
+        async def _ideas_run(request: web.Request) -> web.Response:
+            """管理员 / 本群群管理员「现在出一个构想」：后台开跑，立刻返回 {"started", "reason"}。"""
+            resolved = self._resolve_ref(request.match_info["gid"])
+            if resolved is None:
+                return _err(404, "没有这个群")
+            forbid = self._require_group_admin(request, resolved)
+            if forbid is not None:
+                return forbid
+            fn = getattr(svc, "make_idea_now", None)
+            if fn is None:
+                return _err(503, "构想模块没开")
+            out = fn(resolved)
+            if not out.get("started"):
+                return _err(409, str(out.get("reason") or "现在开不了"))
+            return web.json_response(out)
+
         app.router.add_get("/api/groups/{gid}/feeds-pref", _feeds_pref_get)
+        app.router.add_post("/api/groups/{gid}/ideas/run", self._write(_ideas_run))
         app.router.add_route("PUT", "/api/groups/{gid}/feeds-pref", self._write(_feeds_pref_put))
         app.router.add_post("/api/groups/{gid}/news/run", self._write(_news_run))
 
@@ -1688,10 +1972,11 @@ class ConsoleServer:
             gid = _group_of("news", item_id)
             if gid is None:
                 return _err(404, "这条资讯不存在")
-            if ident.role == "member" and ident.group_id != gid:
+            if _wrong_group(ident, gid):
                 return _err(403, "只能管自己群的内容")
-            if ident.role == "member" and _personal_item("news", item_id):
-                return _err(404, "这条资讯不存在")
+            personal_deny = _personal_deny(ident, "news", item_id)
+            if personal_deny is not None:
+                return personal_deny
             try:
                 out = svc.feeds.admin_chat_vote(gid, item_id)
             except KeyError:
@@ -1708,6 +1993,8 @@ class ConsoleServer:
             """
             forbid = self._require_admin(request)
             if forbid is not None:
+                if self._identify(request).role == "group_admin":
+                    return _err(403, _PERSONAL_READONLY)
                 return forbid
             personal = getattr(svc, "personal", None)
             mentions = getattr(svc, "mentions", None)
@@ -1738,26 +2025,30 @@ class ConsoleServer:
                 return None, _err(404, "没有这个群")
             return gid, None
 
+        def _rss_guard(request: web.Request, gid: str) -> web.Response | None:
+            """RSS 增删：管理员或本群群管理员。"""
+            return self._require_group_admin(request, gid)
+
         @get("/api/groups/{gid}/rss")
         async def _rss_list(request: web.Request) -> web.Response:
-            forbid = self._require_admin(request)
-            if forbid is not None:
-                return forbid
             gid, deny = _rss_resolve_gid(request)
             if deny is not None:
                 return deny
+            forbid = _rss_guard(request, gid)
+            if forbid is not None:
+                return forbid
             from .. import rss as _rss
 
             return web.json_response({"rss": _rss.list_feeds(svc.store, gid)})
 
         @post("/api/groups/{gid}/rss")
         async def _rss_add(request: web.Request) -> web.Response:
-            forbid = self._require_admin(request)
-            if forbid is not None:
-                return forbid
             gid, deny = _rss_resolve_gid(request)
             if deny is not None:
                 return deny
+            forbid = _rss_guard(request, gid)
+            if forbid is not None:
+                return forbid
             body = await _json_body(request)
             if body is None:
                 return _err(400, "请求体不是 JSON")
@@ -1790,12 +2081,12 @@ class ConsoleServer:
             )
 
         async def _rss_delete(request: web.Request) -> web.Response:
-            forbid = self._require_admin(request)
-            if forbid is not None:
-                return forbid
             gid, deny = _rss_resolve_gid(request)
             if deny is not None:
                 return deny
+            forbid = _rss_guard(request, gid)
+            if forbid is not None:
+                return forbid
             from .. import rss as _rss
 
             removed = _rss.remove_feed(svc.store, gid, str(request.match_info["id"]))
@@ -1805,12 +2096,12 @@ class ConsoleServer:
 
         @post("/api/groups/{gid}/rss/{id}/toggle")
         async def _rss_toggle(request: web.Request) -> web.Response:
-            forbid = self._require_admin(request)
-            if forbid is not None:
-                return forbid
             gid, deny = _rss_resolve_gid(request)
             if deny is not None:
                 return deny
+            forbid = _rss_guard(request, gid)
+            if forbid is not None:
+                return forbid
             body = await _json_body(request)
             if body is None:
                 return _err(400, "请求体不是 JSON")
@@ -1845,16 +2136,70 @@ class ConsoleServer:
             except Exception:
                 logger.exception("拼任务交付记录失败（%s）", tid)
 
+        def _merge_auto_review(detail: dict, tid: str) -> None:
+            """任务详情合并批准信息：approved_by（批准人）+ auto_reason（自动审核的一句话理由）。
+
+            自动审核通过的任务，前端照着 auto_reason 显示「自动审核通过：<理由>」；
+            人批的任务 auto_reason 是空串；免批直接落地的任务两个字段都不给。
+            （群友也看得到——这条活本来是当着他的面派的，说明是谁批的没有隐私问题。）
+            """
+            appr = getattr(svc, "approvals", None)
+            if appr is None or not isinstance(detail, dict):
+                return
+            try:
+                info = appr.auto_info_by_task([str(tid)]).get(str(tid))
+            except Exception:
+                logger.exception("拼任务批准信息失败（%s）", tid)
+                return
+            if info:
+                detail.update(info)
+
+        def _merge_link_check(detail: dict, tid: str) -> None:
+            """任务详情合并验收引用核对：coordinator 存的 kv["task.link_check.<任务ID>"]。
+
+            给 `{links, unopened, unopened_urls}`；没做过 / 老任务 → null（前端据此不画这块）。
+            群友版、管理员版都带（只是「引用了几个链接、几个没打开核实过」）。
+            """
+            store = getattr(svc, "store", None)
+            if store is None or not isinstance(detail, dict):
+                return
+            saved = None
+            try:
+                saved = store.kv_get(f"task.link_check.{tid}")
+            except Exception:
+                logger.exception("读引用核对记录失败（%s）", tid)
+            if isinstance(saved, dict):
+                def _num(key: str) -> int:
+                    try:
+                        return int(saved.get(key) or 0)
+                    except (TypeError, ValueError):
+                        return 0
+
+                urls = saved.get("unopened_urls")
+                detail["link_check"] = {
+                    "links": _num("links"),
+                    "unopened": _num("unopened"),
+                    "unopened_urls": [str(u) for u in urls] if isinstance(urls, list) else [],
+                }
+            else:
+                detail["link_check"] = None
+
         def _start_approved_task(res: Any) -> None:
-            tid = str((res or {}).get("task_id") or "")
-            if not tid:
+            data = res if isinstance(res, dict) else {}
+            tids = [str(t) for t in (data.get("task_ids") or []) if str(t)]
+            tid = str(data.get("task_id") or "")
+            if tid and tid not in tids:
+                tids.insert(0, tid)
+            if not tids:
                 return
             starter = getattr(svc, "spawn_run_task", None)
-            if callable(starter):
+            if not callable(starter):
+                return
+            for one in tids:
                 try:
-                    starter(tid)
+                    starter(one)
                 except Exception:
-                    logger.exception("批准后 spawn run_task 出错（%s）", tid)
+                    logger.exception("批准后 spawn run_task 出错（%s）", one)
 
         def _stop_running_task(svc_obj: Any, tid: str) -> None:
             """取消后把正在跑的子 agent 停掉（统一入口在 app.cancel_task_run）。"""
@@ -1868,7 +2213,7 @@ class ConsoleServer:
         @get("/api/tasks/{id}")
         async def _task_detail(request: web.Request) -> web.Response:
             ident = self._identify(request)
-            if ident.role not in ("admin", "member"):
+            if ident.role not in ("admin", "member", "group_admin"):
                 return _err(401, "先登录管理员，或用群链接打开")
             not_ready = _m3_ready(getattr(svc, "tasks", None))
             if not_ready is not None:
@@ -1880,14 +2225,16 @@ class ConsoleServer:
                 row = None
             if row is None:
                 return _err(404, "找不到这个任务")
-            # 群友只能看本群
-            if ident.role == "member" and str(row.get("group_id") or "") != str(ident.group_id or ""):
+            # 群友 / 群管理员只能看本群
+            if _wrong_group(ident, str(row.get("group_id") or "")):
                 return _err(403, "只能看自己群的内容")
             try:
                 detail = svc.tasks.detail_view(tid, admin=(ident.role == "admin"))
             except KeyError:
                 return _err(404, "找不到这个任务")
             _merge_delivery(detail, tid)
+            _merge_auto_review(detail, tid)
+            _merge_link_check(detail, tid)
             if ident.role != "admin":
                 # detail_view(admin=False) 已经不给了，这里再断言一次
                 # （红线：群友看不到 env / timeline / tokens / workspace / source / request_id / requester_id）
@@ -1897,18 +2244,32 @@ class ConsoleServer:
 
         def _request_decide(op: str) -> Handler:
             async def _handler(request: web.Request) -> web.Response:
-                forbid = self._require_admin(request)
-                if forbid is not None:
+                ident = self._identify(request)
+                if ident.role not in ("admin", "group_admin"):
+                    forbid = self._require_admin(request)
                     return forbid
                 not_ready = _m3_ready(getattr(svc, "approvals", None))
                 if not_ready is not None:
                     return not_ready
                 rid = request.match_info["id"]
+                if ident.role == "group_admin":
+                    # 请求参数是 R-xx：先查出它属于哪个群，再判本群群管理员能不能动
+                    try:
+                        req_gid = svc.approvals.group_of(rid)
+                    except Exception:
+                        logger.exception("查请求归属出错（%s）", rid)
+                        req_gid = None
+                    if req_gid is None:
+                        return _err(404, "找不到这个请求")
+                    forbid = self._require_group_admin_ident(ident, req_gid)
+                    if forbid is not None:
+                        return forbid
+                by = "网页管理员" if ident.role == "admin" else "群管理员（网页）"
                 try:
                     if op == "approve":
-                        res = svc.approvals.approve(rid, by="网页管理员")
+                        res = svc.approvals.approve(rid, by=by)
                     else:
-                        res = svc.approvals.reject(rid, by="网页管理员")
+                        res = svc.approvals.reject(rid, by=by)
                 except KeyError:
                     return _err(404, "找不到这个请求")
                 except ValueError as e:
@@ -1926,8 +2287,9 @@ class ConsoleServer:
             return detail
 
         async def _task_op(request: web.Request, op: str) -> web.Response:
-            forbid = self._require_admin(request)
-            if forbid is not None:
+            ident = self._identify(request)
+            if ident.role not in ("admin", "group_admin"):
+                forbid = self._require_admin(request)
                 return forbid
             not_ready = _m3_ready(getattr(svc, "tasks", None))
             if not_ready is not None:
@@ -1939,6 +2301,9 @@ class ConsoleServer:
                 row = None
             if row is None:
                 return _err(404, "找不到这个任务")
+            forbid = self._require_group_admin_ident(ident, str(row.get("group_id") or ""))
+            if forbid is not None:
+                return forbid
             status = str(row.get("status") or "")
             redeliver_warning = ""
             try:
@@ -1975,13 +2340,23 @@ class ConsoleServer:
                 return _err(404, "找不到这个任务")
 
         async def _goal_op(request: web.Request, op: str) -> web.Response:
-            forbid = self._require_admin(request)
-            if forbid is not None:
+            ident = self._identify(request)
+            if ident.role not in ("admin", "group_admin"):
+                forbid = self._require_admin(request)
                 return forbid
             not_ready = _m3_ready(getattr(svc, "goals", None))
             if not_ready is not None:
                 return not_ready
             gid_param = request.match_info["id"]
+            try:
+                goal_row = svc.goals.get(gid_param)
+            except Exception:
+                goal_row = None
+            if goal_row is None:
+                return _err(404, "找不到这个目标")
+            forbid = self._require_group_admin_ident(ident, str(goal_row.get("group_id") or ""))
+            if forbid is not None:
+                return forbid
             try:
                 if op == "pause":
                     svc.goals.pause(gid_param)
@@ -2058,14 +2433,33 @@ class ConsoleServer:
 
         app.router.add_route("PUT", "/api/identity/{kind}", self._write(_identity_put))
 
-        async def _identity_group_memory_put(request: web.Request) -> web.Response:
-            forbid = self._require_admin(request)
+        @get("/api/identity/group-memory/{gid}")
+        async def _identity_group_memory_get(request: web.Request) -> web.Response:
+            """本群工作记忆（读）：总管理员或本群群管理员。"""
+            gid = self._resolve_ref(str(request.match_info["gid"]))
+            if gid is None:
+                return _err(404, "没有这个群（只支持服务群）")
+            forbid = self._require_group_admin(request, gid)
             if forbid is not None:
                 return forbid
             ident, not_ready = _identity_ready()
             if not_ready is not None:
                 return not_ready
-            gid = str(request.match_info["gid"])
+            try:
+                return web.json_response(ident.group_read(gid))
+            except KeyError:
+                return _err(404, "没有这个群（只支持服务群）")
+
+        async def _identity_group_memory_put(request: web.Request) -> web.Response:
+            gid = self._resolve_ref(str(request.match_info["gid"]))
+            if gid is None:
+                return _err(404, "没有这个群（只支持服务群）")
+            forbid = self._require_group_admin(request, gid)
+            if forbid is not None:
+                return forbid
+            ident, not_ready = _identity_ready()
+            if not_ready is not None:
+                return not_ready
             body = await _json_body(request)
             if body is None:
                 return _err(400, "请求体不是 JSON")
@@ -2363,8 +2757,34 @@ class ConsoleServer:
             return _chat_json({"status": _pending_status(out, approve), "result": _pending_result(out)})
 
 
+        @post("/api/chat/{id}/compact")
+        async def _chat_compact(request: web.Request) -> web.Response:
+            """手动整理摘要（0.4.0）：忙时 409「等一下」，其余按 404/400 分岔。"""
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            mod, not_ready = _chat_ready()
+            if not_ready is not None:
+                return not_ready
+            chat_id, bad_id = _id_param(request.match_info["id"], "对话")
+            if bad_id is not None:
+                return bad_id
+            try:
+                out = await _call(mod.compact, chat_id)
+            except (KeyError, ValueError) as e:
+                if _is_busy_error(e):
+                    return _err(409, str(e) or "上一句还在处理，等一下再整理")
+                if _chat_exists(mod, chat_id):
+                    return _err(400, str(e) or "现在整理不了")
+                return _err(404, "找不到这个对话")
+            if not isinstance(out, dict):
+                return _err(404, "找不到这个对话")
+            summary = out.get("summary") if isinstance(out.get("summary"), dict) else out
+            return _chat_json({"summary": summary, "chat_id": chat_id})
+
         # pending 路由先落：路径段数和 /api/chat/{id} 不同，顺序只为了让「静态段优先」一眼可见
         app.router.add_post("/api/chat/pending/{pid}", self._write(_chat_pending))
+        app.router.add_post("/api/chat/{id}/compact", self._write(_chat_compact))
         app.router.add_route("PATCH", "/api/chat/{id}", self._write(_chat_update))
 
         # ---------- 头像（console/avatar.py；docs/02「网页控制台 · 头像」） ----------
@@ -2452,7 +2872,7 @@ class ConsoleServer:
             gid = av.find_group_by_token(token, group_ids)
             if gid is None:
                 return _err(404, "没有这个头像")
-            if ident.role == "member" and ident.group_id != gid:
+            if ident.role in ("member", "group_admin") and str(ident.group_id or "") != str(gid):
                 return _err(403, "只能看自己群的头像")
             kind, payload = await av.resolve_group(token, group_ids)
             if kind == "bytes":
@@ -2518,7 +2938,10 @@ class ConsoleServer:
 
         @get("/")
         async def _index(request: web.Request) -> web.Response:
-            return web.FileResponse(_STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+            return web.Response(
+                text=_index_html(), content_type="text/html", charset="utf-8",
+                headers={"Cache-Control": "no-cache"},
+            )
 
         @get("/g/{token}")
         async def _group_link(request: web.Request) -> web.Response:

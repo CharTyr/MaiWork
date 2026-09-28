@@ -201,6 +201,31 @@ class TestFetchPage:
         assert "最终正文" in r.output
 
     @pytest.mark.asyncio
+    async def test_fetch_page_leaves_final_url_after_redirect(self, store, settings):
+        """跟随跳转后要留下最终地址：交付里引用最终地址时，验收引用核对才不会误判「没打开过」。
+
+        - 结果 data 里带 final_url；
+        - tool_calls 的 output 摘要里有可解析的「最终地址」标记（不改表结构）。
+        """
+        def handler(request):
+            if request.url.path == "/short":
+                return httpx.Response(302, headers={"location": "https://long.example/very/long?a=1"})
+            return httpx.Response(200, text=self._html(body="长链正文"), headers={"content-type": "text/html"})
+
+        tools = _make(store, settings, transport=httpx.MockTransport(handler))
+        r = await tools.call("fetch_page", {"url": "http://example.com/short"}, _ctx())
+        assert r.ok
+        assert r.data["url"] == "http://example.com/short"  # 请求的短链照旧留着
+        assert r.data["final_url"] == "https://long.example/very/long?a=1"
+
+        row = store.read().execute(
+            "SELECT input, output FROM tool_calls WHERE tool='fetch_page'"
+        ).fetchone()
+        assert row["input"] == "http://example.com/short"
+        assert "最终地址" in str(row["output"])
+        assert "https://long.example/very/long?a=1" in str(row["output"])
+
+    @pytest.mark.asyncio
     async def test_reject_non_http_scheme(self, store, settings):
         tools = _make(store, settings)
         for url in ["file:///etc/passwd", "ftp://x.com/a", "gopher://x/"]:
@@ -381,6 +406,28 @@ class TestSubmitResult:
         assert r.data["summary"] == "找好了"
         assert r.data["data"] == {"items": [1, 2]}
         assert r.data["evidence"] == ["https://a.com/1"]
+
+    @pytest.mark.asyncio
+    async def test_submit_data_as_json_string_is_parsed(self, store, settings):
+        """线上实测（2026-09-28，step-5-preview）：模型把 data 写成 JSON 字符串交回，
+        以前原样透传 → 调用方判「格式不对」整轮作废。现在字符串能解析成对象就当对象用。"""
+        tools = _make(store, settings)
+        r = await tools.call(
+            "submit_result",
+            {"summary": "找好了", "data": '{"items": [{"title": "t"}]}', "evidence": '["https://a.com/1"]'},
+            _ctx(),
+        )
+        assert r.ok
+        assert r.data["data"] == {"items": [{"title": "t"}]}
+        assert r.data["evidence"] == ["https://a.com/1"]
+
+    @pytest.mark.asyncio
+    async def test_submit_data_broken_string_asks_model_to_resubmit(self, store, settings):
+        """字符串解析不出来（比如被截断）→ 交回失败，报错告诉模型改成对象重交，而不是悄悄吞掉。"""
+        tools = _make(store, settings)
+        r = await tools.call("submit_result", {"summary": "找好了", "data": '{"items": [{"title": "t"'}, _ctx())
+        assert r.ok is False
+        assert "data" in (r.error or "")
 
     @pytest.mark.asyncio
     async def test_submit_needs_summary(self, store, settings):

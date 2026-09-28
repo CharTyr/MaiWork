@@ -555,10 +555,12 @@ _IDEA_JSON = json.dumps(
             "title": "我可以帮群把每周讨论整理成一页",
             "body": "每周自动汇总",
             "basis": "群里每周都在复盘",
-            "step": "先收集一周消息",
-            "effort": "一两天",
             "icon": "books",
             "chat_worthy": True,
+            "items": [
+                {"kind": "task", "title": "做一页每周复盘模板", "desc": "先出一版模板给大家改"},
+                {"kind": "goal", "title": "每周自动汇总讨论", "desc": "盯着这件事，每周五汇总一次"},
+            ],
         }
     },
     ensure_ascii=False,
@@ -579,6 +581,63 @@ def test_make_idea_happy_path(tmp_path) -> None:
     assert topics.calls[0]["kind"] == "idea"
     assert topics.calls[0]["ref_id"] == got
     assert models.calls[0][2].get("json_mode") is True
+    # 新构想：items 落库、step / effort 不再生成（留空）
+    assert json.loads(row["items"]) == [
+        {"kind": "task", "title": "做一页每周复盘模板", "desc": "先出一版模板给大家改"},
+        {"kind": "goal", "title": "每周自动汇总讨论", "desc": "盯着这件事，每周五汇总一次"},
+    ]
+    assert row["step"] == "" and row["effort"] == ""
+    view = feeds.ideas_view(GID)[0]
+    assert [it["no"] for it in view["items"]] == [1, 2]
+    assert view["items"][1]["kind"] == "goal"
+
+
+def test_make_idea_prompt_asks_items_and_drops_step_effort(tmp_path) -> None:
+    """提示词要「包含的项目」和克制要求；不再要第一步 / 要多久。"""
+    models = FakeModelsQueue(ready=True, replies=[_IDEA_JSON])
+    store, settings, feeds, models, *_ = _make_feeds(tmp_path, models=models)
+    _run(feeds.make_idea(GID))
+    prompt = models.calls[0][1][-1]["content"]
+    assert "items" in prompt
+    assert "task" in prompt and "goal" in prompt
+    assert "最多 5 个" in prompt
+    assert '"step"' not in prompt and '"effort"' not in prompt
+
+
+def test_make_idea_items_capped_at_5_and_bad_ones_dropped(tmp_path) -> None:
+    many = json.dumps(
+        {"idea": {"title": "我可以做一堆小事", "body": "b", "basis": "x", "icon": "tools",
+                  "chat_worthy": False,
+                  "items": [
+                      {"kind": "task", "title": f"事 {i}"} for i in range(1, 9)
+                  ] + ["不是表", {"desc": "没标题"}, {"kind": "wat", "title": "怪类型"}]}},
+        ensure_ascii=False,
+    )
+    models = FakeModelsQueue(ready=True, replies=[many])
+    store, settings, feeds, *_ = _make_feeds(tmp_path, models=models)
+    got = _run(feeds.make_idea(GID))
+    row = store.read().execute("SELECT items FROM ideas WHERE id=?", (got,)).fetchone()
+    items = json.loads(row["items"])
+    assert len(items) == 5
+    assert [it["title"] for it in items] == ["事 1", "事 2", "事 3", "事 4", "事 5"]
+    # 怪类型的 kind 回落 task
+    assert items[0]["kind"] == "task"
+
+
+def test_make_idea_no_items_writes_empty_list(tmp_path) -> None:
+    """模型没给 items（老格式）→ 存 '[]'，读取按没有项目走老逻辑。"""
+    plain = json.dumps(
+        {"idea": {"title": "我可以整理一份清单", "body": "b", "basis": "x",
+                  "step": "列条目", "effort": "一小时", "icon": "books", "chat_worthy": False}},
+        ensure_ascii=False,
+    )
+    models = FakeModelsQueue(ready=True, replies=[plain])
+    store, settings, feeds, *_ = _make_feeds(tmp_path, models=models)
+    got = _run(feeds.make_idea(GID))
+    row = store.read().execute("SELECT items, step FROM ideas WHERE id=?", (got,)).fetchone()
+    assert row["items"] == "[]"
+    assert row["step"] == ""  # 新构想不再生成第一步
+    assert feeds.ideas_view(GID)[0]["items"] == []
 
 
 def test_make_idea_null_returns_none(tmp_path) -> None:
@@ -816,10 +875,12 @@ def test_news_view_structure_and_order(tmp_path) -> None:
     assert view[0]["id"] == b2  # 新的批次在前
     assert view[1]["id"] == b1
     for b in view:
-        # 群友版：没有 rejected 一栏；rejected_count 人人可见（质量标准）
-        assert set(b.keys()) == {"id", "slot_ts", "found", "kept", "skipped", "note", "rejected_count", "items"}
+        # 群友版：没有 rejected 一栏；rejected_count 人人可见（质量标准）；
+        # stats=这一轮工具用量 {searches, pages, kept}，老批次没有 → None
+        assert set(b.keys()) == {"id", "slot_ts", "found", "kept", "skipped", "note", "rejected_count", "items", "stats"}
         assert isinstance(b["skipped"], bool)
         assert b["rejected_count"] == 0
+        assert b["stats"] is None  # 测试里是手插的批次，没有统计
     items = view[0]["items"]
     assert [i["title"] for i in items] == ["高分", "低分"]  # 按分数降序
     item = items[0]
@@ -914,7 +975,7 @@ def test_ideas_view_structure_and_rules(tmp_path) -> None:
     assert set(it.keys()) == {
         "id", "icon", "title", "body", "basis", "step", "effort",
         "state", "requested_by", "task_id", "created_ts", "feedback",
-        "feasibility", "keywords", "target_user_id",
+        "feasibility", "keywords", "target_user_id", "items",
     }
     assert set(it["feedback"].keys()) == {"up", "down"}
     assert all(isinstance(x["created_ts"], float) for x in view)

@@ -7,7 +7,10 @@
   网页改密码成功后旧的自动生成哈希会被删掉（rules.save_config_patch / 迁移）。
 - cookie mw_admin = "<到期时间戳>.<HMAC>"，HttpOnly、SameSite=Strict、Path=/、7 天；
   HMAC 密钥是 secrets.console_secret（没有就生成），且混入密码哈希——改了管理员密码旧 cookie 就失效。
-- 同一 IP 10 分钟内密码错 5 次 → 429。
+- 群管理员 cookie（2026-10）：同一个 cookie 名，值 = "g:<群号>.<到期时间戳>.<HMAC>"，
+  签名内容 = "group|<群号>|<到期>|<该群密码指纹>"——改了 / 清了这个群的群管理员密码，
+  旧 cookie 立刻失效（指纹没了或不一致）。总管理员的格式保持兼容不变。
+- 同一 IP 10 分钟内密码错 5 次 → 429（总管理员和群管理员共用同一套限流）。
 """
 
 from __future__ import annotations
@@ -36,6 +39,8 @@ class ConsoleAuth:
         self._store = store
         self._get_settings = get_settings
         self._fails: dict[str, list[float]] = {}
+        # GroupAdmins：群管理员密码指纹要从它拿（ConsoleServer 组装时接上）
+        self._group_admins: Any = None
 
     # ------------------------------------------------------------------
     # 密钥与密码
@@ -107,7 +112,7 @@ class ConsoleAuth:
     # ------------------------------------------------------------------
 
     def make_cookie(self) -> tuple[str, int]:
-        """返回 (cookie 值, max_age)。"""
+        """返回总管理员的 (cookie 值, max_age)。"""
         expire = int(clock.now()) + COOKIE_TTL
         sig = self._sign(str(expire))
         return f"{expire}.{sig}", COOKIE_TTL
@@ -126,6 +131,54 @@ class ConsoleAuth:
         # 混入密码指纹：改了管理员密码（config）旧 cookie 立刻失效
         msg = f"admin|{payload}|{self._password_fingerprint()}".encode("utf-8")
         return hmac.new(self._console_secret(), msg, hashlib.sha256).hexdigest()
+
+    # ------------------------------------------------------------------
+    # 群管理员 cookie（g:<群号>.<到期>.<HMAC>）
+    # ------------------------------------------------------------------
+
+    def bind_group_admins(self, group_admins: Any) -> None:
+        """接上 GroupAdmins（指纹来源）。"""
+        self._group_admins = group_admins
+
+    def _group_fingerprint(self, gid: str) -> str:
+        ga = self._group_admins
+        if ga is None:
+            return ""
+        try:
+            return str(ga.fingerprint(gid) or "")
+        except Exception:
+            logger.debug("读群 %s 的群管理员密码指纹失败", gid, exc_info=True)
+            return ""
+
+    def _sign_group(self, gid: str, expire_s: str, fingerprint: str) -> str:
+        msg = f"group|{gid}|{expire_s}|{fingerprint}".encode("utf-8")
+        return hmac.new(self._console_secret(), msg, hashlib.sha256).hexdigest()
+
+    def make_group_cookie(self, gid: str) -> tuple[str, int]:
+        """返回群管理员的 (cookie 值, max_age)；该群没设密码时返回 ("", 0)。"""
+        gid_s = str(gid)
+        fingerprint = self._group_fingerprint(gid_s)
+        if not fingerprint:
+            return "", 0
+        expire = int(clock.now()) + COOKIE_TTL
+        sig = self._sign_group(gid_s, str(expire), fingerprint)
+        return f"g:{gid_s}.{expire}.{sig}", COOKIE_TTL
+
+    def check_group_cookie(self, value: str) -> str | None:
+        """群管理员 cookie → 群号；签名不对 / 过期 / 密码改了或清了 → None。"""
+        if not value or not value.startswith("g:") or value.count(".") != 2:
+            return None
+        head, expire_s, sig = value.split(".", 2)
+        gid = head[2:]
+        if not gid or not expire_s.isdigit():
+            return None
+        fingerprint = self._group_fingerprint(gid)
+        if not fingerprint:
+            return None
+        expect = self._sign_group(gid, expire_s, fingerprint)
+        if not hmac.compare_digest(sig, expect):
+            return None
+        return gid if int(expire_s) > int(clock.now()) else None
 
     # ------------------------------------------------------------------
     # 登录限流（同一 IP 10 分钟错 5 次 → 429）

@@ -42,7 +42,7 @@ def _norm_accounts(values: object, field_zh: str, problems: list[str]) -> tuple[
     return tuple(out)
 
 
-CONFIG_VERSION = "0.3.10"  # 0.3.10：管理员 / 免批名单改成「平台:账号」（qq:100000001），旧纯数字当 qq
+CONFIG_VERSION = "0.4.0"  # 0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
 
 # 插件目录 = 本文件所在目录；默认数据目录 = 插件目录上两级 / data / maiwork
 # （线上 <MaiBot>/plugins/CharTyr_MaiWork → <MaiBot>/data/maiwork）
@@ -100,9 +100,18 @@ class FeedsSectionConfig(PluginConfigBase):
     max_items: int = Field(default=10, description="每批最多入选几条资讯")
     lookback_days: int = Field(default=14, description="和最近多少天已出的资讯去重")
     blocked_domains: list[str] = Field(default_factory=list, description="来源屏蔽名单（域名，含其子域）")
-    web_min_avg: float = Field(default=3.0, description="资讯/好文上网页的五项平均分门槛（1~5）")
+    web_min_avg: float = Field(default=3.0, description="资讯/文章上网页的五项平均分门槛（1~5）")
     pool_min_avg: float = Field(default=4.0, description="资讯进群里开话题候选池的平均分门槛（1~5）")
-    guides: bool = Field(default=True, description="备资讯时要不要同时找「好文」（教程、好文章、工具介绍）")
+    guides: bool = Field(default=True, description="备资讯时要不要同时找「文章」（教程、好文章、工具介绍）")
+    collect_minutes: int = Field(default=15, description="资讯收集子 agent 每轮最多跑多少分钟（到点把已找到的交回来）")
+
+
+class GoalsSectionConfig(PluginConfigBase):
+    __ui_label__ = "目标"
+    __ui_icon__ = "bullseye"
+    __ui_order__ = 6
+
+    propose: bool = Field(default=True, description="MaiWork 觉得群里缺个长期目标时，主动提一个等管理员批准（每群每天最多一次）")
 
 
 class TopicsSectionConfig(PluginConfigBase):
@@ -137,6 +146,8 @@ class ApprovalSectionConfig(PluginConfigBase):
     exempt_groups: list[str] = Field(default_factory=list, description="免批的群，写成「平台:群号」，如 qq:900000001")
     exempt_users: list[str] = Field(default_factory=list, description="派活免批的人，写成「平台:账号」，如 qq:10001")
     remind: bool = Field(default=True, description="待批超过 24 小时没人处理时，在群里提醒管理员一次（可关）")
+    auto_review: bool = Field(default=True, description="低风险的小活（调研、找东西、做个小网页、出个 PDF）由主模型看过就直接开工；高风险 / 大工程 / 说不清的仍然等你批")
+    auto_review_daily: int = Field(default=5, description="每个群每天最多这样自动开工几件；0 = 关掉自动审核")
 
 
 class ModelsSectionConfig(PluginConfigBase):
@@ -154,6 +165,7 @@ class ModelsSectionConfig(PluginConfigBase):
     retry_delay_s: int = Field(default=10, description="两次重试之间等几秒（1~60）")
     max_concurrency: int = Field(default=2, description="同一个端点同时最多几个请求在路上（1~8）；被限流（429）多就调成 1")
     max_rpm: int = Field(default=0, description="同一个端点每分钟最多发几次（0 = 不限，最多 600）")
+    context_window: int = Field(default=128000, description="模型的上下文窗口（tokens）；对话快满时先截旧工具结果、再总结旧对话")
 
 
 class JevSectionConfig(PluginConfigBase):
@@ -176,6 +188,15 @@ class UsageSectionConfig(PluginConfigBase):
 
     alert_daily_tokens: int = Field(default=0, description="一天 token 超过这个数就提醒；0=不提醒；只提醒不暂停")
     alert_task_tokens: int = Field(default=0, description="单个任务 token 超过这个数就提醒；0=不提醒")
+
+
+class TasksSectionConfig(PluginConfigBase):
+    __ui_label__ = "任务安全网"
+    __ui_icon__ = "shield"
+    __ui_order__ = 9
+
+    token_limit: int = Field(default=2_000_000, description="单个任务累计 token 超过这个数就自动暂停（0 = 不限）")
+    run_seconds: int = Field(default=10800, description="单个任务开工满这么多秒就自动暂停（0 = 不限）")
 
 
 class ConsoleSectionConfig(PluginConfigBase):
@@ -215,7 +236,7 @@ class EnvironmentsSectionConfig(PluginConfigBase):
     command_timeout_s: int = Field(default=300, description="子 agent 单条命令的默认时长上限（秒）")
     railway_daily_max: int = Field(default=2, description="Railway 一次性 VM 每天最多用几台（同一出口 IP 每天最多 3 台，留 1 台给派活）")
     verify_per_round: int = Field(default=2, description="每轮备资讯最多实测几条（同一台 VM 里依次测）")
-    verify_minutes: int = Field(default=10, description="单条资/好文实测的时长上限（分钟）")
+    verify_minutes: int = Field(default=10, description="单条资讯/文章实测的时长上限（分钟）")
 
 
 class ProfileSectionConfig(PluginConfigBase):
@@ -276,12 +297,14 @@ class MaiWorkConfig(PluginConfigBase):
     groups: GroupsSectionConfig = Field(default_factory=GroupsSectionConfig)
     focus: FocusSectionConfig = Field(default_factory=FocusSectionConfig)
     feeds: FeedsSectionConfig = Field(default_factory=FeedsSectionConfig)
+    goals: GoalsSectionConfig = Field(default_factory=GoalsSectionConfig)
     topics: TopicsSectionConfig = Field(default_factory=TopicsSectionConfig)
     delivery: DeliverySectionConfig = Field(default_factory=DeliverySectionConfig)
     approval: ApprovalSectionConfig = Field(default_factory=ApprovalSectionConfig)
     models: ModelsSectionConfig = Field(default_factory=ModelsSectionConfig)
     jev: JevSectionConfig = Field(default_factory=JevSectionConfig)
     usage: UsageSectionConfig = Field(default_factory=UsageSectionConfig)
+    tasks: TasksSectionConfig = Field(default_factory=TasksSectionConfig)
     console: ConsoleSectionConfig = Field(default_factory=ConsoleSectionConfig)
     environments: EnvironmentsSectionConfig = Field(default_factory=EnvironmentsSectionConfig)
     profile: ProfileSectionConfig = Field(default_factory=ProfileSectionConfig)
@@ -321,6 +344,12 @@ class FeedsSetting:
     web_min_avg: float
     pool_min_avg: float
     guides: bool
+    collect_minutes: int = 15  # 资讯收集子 agent 每轮时间盒（到点把已找到的交回）
+
+
+@dataclass(frozen=True)
+class GoalsSetting:
+    propose: bool = True
 
 
 @dataclass(frozen=True)
@@ -346,6 +375,10 @@ class ApprovalSetting:
     exempt_groups: tuple[str, ...]
     exempt_users: tuple[str, ...]
     remind: bool = True
+    # 自动审核（auto_review.py）：低风险轻活由主模型判断后直接开工；
+    # auto_review_daily 是每群每天上限（0 = 关）
+    auto_review: bool = True
+    auto_review_daily: int = 5
 
 
 @dataclass(frozen=True)
@@ -360,6 +393,7 @@ class ModelsSetting:
     retry_delay_s: int = 10
     max_concurrency: int = 2
     max_rpm: int = 0
+    context_window: int = 128000  # 模型上下文窗口（tokens），0.4.0 起用于上下文压缩
 
 
 @dataclass(frozen=True)
@@ -376,6 +410,12 @@ class JevSetting:
 class UsageSetting:
     alert_daily_tokens: int
     alert_task_tokens: int
+
+
+@dataclass(frozen=True)
+class TasksSetting:
+    token_limit: int = 2_000_000  # 单任务累计 token 自动暂停线（0 = 不限）
+    run_seconds: int = 10800      # 单任务开工时长自动暂停线（秒；0 = 不限）
 
 
 @dataclass(frozen=True)
@@ -453,6 +493,7 @@ class Settings:
     workspace_root: Path
     focus: FocusSetting
     feeds: FeedsSetting
+    goals: GoalsSetting
     topics: TopicsSetting
     delivery: DeliverySetting
     approval: ApprovalSetting
@@ -462,6 +503,7 @@ class Settings:
     console: ConsoleSetting
     environments: EnvironmentsSetting
     profile: ProfileSetting
+    tasks: TasksSetting = TasksSetting()
     extensions: ExtensionsSetting = ExtensionsSetting(mcp=())
     group_space: GroupSpaceSetting = GroupSpaceSetting(enabled=True, notice_per_day=1)
     problems: tuple[str, ...] = ()
@@ -601,6 +643,7 @@ def _parse_feeds(feeds: FeedsSectionConfig, problems: list[str], *, min_score_ex
         web_min_avg=_clamp_score("web_min_avg", feeds.web_min_avg, 3.0),
         pool_min_avg=_clamp_score("pool_min_avg", feeds.pool_min_avg, 4.0),
         guides=bool(feeds.guides),
+        collect_minutes=max(1, min(60, _clamp_int(getattr(feeds, "collect_minutes", 15), 1, 60, 15))),
     )
 
 
@@ -780,12 +823,14 @@ _SECTIONS: tuple[tuple[str, type[PluginConfigBase]], ...] = (
     ("groups", GroupsSectionConfig),
     ("focus", FocusSectionConfig),
     ("feeds", FeedsSectionConfig),
+    ("goals", GoalsSectionConfig),
     ("topics", TopicsSectionConfig),
     ("delivery", DeliverySectionConfig),
     ("approval", ApprovalSectionConfig),
     ("models", ModelsSectionConfig),
     ("jev", JevSectionConfig),
     ("usage", UsageSectionConfig),
+    ("tasks", TasksSectionConfig),
     ("console", ConsoleSectionConfig),
     ("environments", EnvironmentsSectionConfig),
     ("profile", ProfileSectionConfig),
@@ -859,12 +904,14 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
     plugin = sections["plugin"]
     focus = sections["focus"]
     feeds = sections["feeds"]
+    goals = sections["goals"]
     topics = sections["topics"]
     delivery = sections["delivery"]
     approval = sections["approval"]
     models = sections["models"]
     jev = sections["jev"]
     usage = sections["usage"]
+    tasks_cfg = sections["tasks"]
     console = sections["console"]
     env = sections["environments"]
     profile = sections["profile"]
@@ -874,12 +921,14 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
     assert isinstance(plugin, PluginSectionConfig)
     assert isinstance(focus, FocusSectionConfig)
     assert isinstance(feeds, FeedsSectionConfig)
+    assert isinstance(goals, GoalsSectionConfig)
     assert isinstance(topics, TopicsSectionConfig)
     assert isinstance(delivery, DeliverySectionConfig)
     assert isinstance(approval, ApprovalSectionConfig)
     assert isinstance(models, ModelsSectionConfig)
     assert isinstance(jev, JevSectionConfig)
     assert isinstance(usage, UsageSectionConfig)
+    assert isinstance(tasks_cfg, TasksSectionConfig)
     assert isinstance(console, ConsoleSectionConfig)
     assert isinstance(env, EnvironmentsSectionConfig)
     assert isinstance(profile, ProfileSectionConfig)
@@ -912,6 +961,7 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
             personal_per_day=max(1, int(getattr(focus, "personal_per_day", 3))),
         ),
         feeds=_parse_feeds(feeds, problems, min_score_explicit=min_score_explicit),
+        goals=GoalsSetting(propose=bool(getattr(goals, "propose", True))),
         topics=TopicsSetting(
             enabled=bool(topics.enabled), speaker=str(topics.speaker or "maiwork"),
             per_day=int(topics.per_day), min_gap_hours=int(topics.min_gap_hours),
@@ -928,6 +978,10 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
             exempt_groups=_norm_accounts(approval.exempt_groups, "免批的群", problems),
             exempt_users=_norm_accounts(approval.exempt_users, "免批的人", problems),
             remind=bool(getattr(approval, "remind", True)),
+            auto_review=bool(getattr(approval, "auto_review", True)),
+            auto_review_daily=_clamp_int(
+                getattr(approval, "auto_review_daily", 5), 0, 50, 5
+            ),
         ),
         models=ModelsSetting(
             base_url=str(models.base_url or ""), api_key=str(models.api_key or ""),
@@ -937,11 +991,16 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
             retry_delay_s=_clamp_int(models.retry_delay_s, 1, 60, 10),
             max_concurrency=_clamp_int(getattr(models, "max_concurrency", 2), 1, 8, 2),
             max_rpm=_clamp_int(getattr(models, "max_rpm", 0), 0, 600, 0),
+            context_window=_clamp_int(getattr(models, "context_window", 128000), 8192, 2_000_000, 128000),
         ),
         jev=_parse_jev(jev, problems),
         usage=UsageSetting(
             alert_daily_tokens=int(usage.alert_daily_tokens),
             alert_task_tokens=int(usage.alert_task_tokens),
+        ),
+        tasks=TasksSetting(
+            token_limit=max(0, _clamp_int(getattr(tasks_cfg, "token_limit", 2_000_000), 0, 10**9, 2_000_000)),
+            run_seconds=max(0, _clamp_int(getattr(tasks_cfg, "run_seconds", 10800), 0, 30 * 86400, 10800)),
         ),
         console=ConsoleSetting(
             listen=listen,

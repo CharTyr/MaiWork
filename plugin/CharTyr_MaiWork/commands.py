@@ -9,8 +9,10 @@
 指令表（02 §5.3）：
 - /mw            任何人：本群进行中的目标、任务、待批请求（简短，各最多 5 条）
 - /mw 网页       任何人：本群网页链接（没配 public_url 就回「网页还没公开，找管理员要」）
-- /mw 批准 [ID]  bot 管理员：批准待批请求；不带 ID 时本群只有一个待批直接处理，多个列出让人选
-- /mw 拒绝 [ID]  bot 管理员：同上
+- /mw 批准 [ID]  bot 管理员 或**本群**群管理员（kv["group_admins.<群号>"] 名单里的人）：
+  批准待批请求；不带 ID 时本群只有一个待批直接处理，多个列出让人选；
+  本群管理员只能批本群的请求（别的群的请求 ID 直接拒）
+- /mw 拒绝 [ID]  bot 管理员 或本群群管理员：同上
 - /mw 取消 [ID]  发起人 / 群主 / 群管理 / bot 管理员：取消任务（T-）、agent 目标（G-）、提醒（M-）
 """
 
@@ -61,6 +63,7 @@ class Commands:
         coordinator: Any = None,
         run_task_starter: Callable[[str], None] | None = None,
         run_task_stopper: Callable[[str], None] | None = None,
+        group_admins: Any = None,
     ) -> None:
         self._store = store
         self._approvals = approvals
@@ -70,6 +73,8 @@ class Commands:
         self._host = host
         self._get_settings = get_settings
         self._coordinator = coordinator
+        # 按群的管理员（group_admins.py）；没接上就只有 bot 管理员能批
+        self._group_admins = group_admins
         # 开工任务的回调（app 提供，保证同一任务不并发；没有就用兜底 spawn）
         self._run_task_starter = run_task_starter
         # 停掉正在跑的任务的回调（app.cancel_task_run；取消后子 agent 尽快停）
@@ -210,14 +215,26 @@ class Commands:
     # /mw 批准 / 拒绝 [ID]：只限 bot 管理员
     # ------------------------------------------------------------------
 
+    def _is_group_admin(self, gid: str, user_id: str) -> bool:
+        """本群群管理员名单里的人（group_admins 没接上 / 读失败都当不是）。"""
+        if self._group_admins is None:
+            return False
+        try:
+            return bool(self._group_admins.is_group_admin(gid, user_id))
+        except Exception:
+            logger.exception("/mw 判本群管理员失败（群 %s）", gid)
+            return False
+
     async def _decide(self, gid: str, user_id: str, rid: str, *, op: str) -> str:
         verb = "批准" if op == "approve" else "拒绝"
         try:
-            if not self._approvals.is_admin(user_id):
-                return "只有 bot 管理员能批准 / 拒绝"
+            is_bot_admin = bool(self._approvals.is_admin(user_id))
         except Exception:
             logger.exception("/mw 判管理员失败")
             return "这条指令处理出错了，日志里有"
+        is_group_admin = (not is_bot_admin) and self._is_group_admin(gid, user_id)
+        if not (is_bot_admin or is_group_admin):
+            return "只有 bot 管理员或本群管理员能批准 / 拒绝"
         rid_s = str(rid or "").strip()
         if not rid_s:
             try:
@@ -236,6 +253,17 @@ class Commands:
             rid_s = str(pending[0].get("id") or "")
         if not rid_s:
             return "现在没有待批的请求"
+        if is_group_admin and not is_bot_admin:
+            # 本群管理员只能批本群的请求：先查出这条请求属于哪个群
+            try:
+                req_gid = self._approvals.group_of(rid_s)
+            except Exception:
+                logger.exception("/mw 查请求归属失败（%s）", rid_s)
+                return "这条指令处理出错了，日志里有"
+            if req_gid is None:
+                return f"没找到请求 {rid_s}"
+            if str(req_gid) != str(gid):
+                return f"请求 {rid_s} 不在本群，管不了"
         try:
             if op == "approve":
                 res = self._approvals.approve(rid_s, by=user_id)
@@ -249,11 +277,15 @@ class Commands:
             return f"已拒绝 {rid_s}"
         if not isinstance(res, dict):
             return f"已批准 {rid_s}"
+        tids = [str(t) for t in (res.get("task_ids") or []) if str(t)]
         tid = str(res.get("task_id") or "")
+        if tid and tid not in tids:
+            tids.insert(0, tid)
         goal_id = str(res.get("goal_id") or "")
-        if tid:
-            self._start_task(tid)
-            return f"已批准 {rid_s}，任务 {tid} 这就开工"
+        if tids:
+            for one in tids:
+                self._start_task(one)
+            return f"已批准 {rid_s}，任务 {'、'.join(tids)} 这就开工"
         if goal_id:
             return f"已批准 {rid_s}，目标 {goal_id} 记下了，会定期检查"
         return f"已批准 {rid_s}"

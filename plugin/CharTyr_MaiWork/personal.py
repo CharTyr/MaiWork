@@ -1027,6 +1027,8 @@ class Personal:
             "effort": str(r["effort"] or ""),
             "target_user_id": str(r["target_user_id"] or ""),
             "created_ts": float(r["created"] or 0.0),
+            # 个人向构想没有项目列表（还是老的单任务形态）；给个空列表让网页形状一致。
+            "items": [],
         }
 
     # ------------------------------------------------------------------

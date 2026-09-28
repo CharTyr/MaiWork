@@ -44,6 +44,7 @@ _LEGAL: dict[str, frozenset[str]] = {
 _MUTABLE_FIELDS = frozenset({
     "review", "question", "question_ts", "question_msg_id",
     "env", "delivery_kind", "delivery", "undelivered", "tokens",
+    "paused_reason",  # 安全网（0.4.0）：自动暂停原因 JSON；queued 时自动清空
 })
 
 _TERMINAL = frozenset({"completed", "cancelled", "rejected"})
@@ -176,8 +177,37 @@ class Tasks:
                     updates[key] = json.dumps(list(value), ensure_ascii=False)
                 elif key == "undelivered":
                     updates[key] = 1 if value else 0
+                elif key == "paused_reason":
+                    # 安全网原因：dict 序列化成 JSON；None/"" 表示清空
+                    if isinstance(value, dict):
+                        updates[key] = json.dumps(value, ensure_ascii=False)
+                    else:
+                        updates[key] = str(value) if value else ""
                 else:
                     updates[key] = value
+
+            # 从 paused/shelved 恢复（→ queued）：清掉暂停原因 + 记安全网基线
+            # （tokens 基线 = 当前 usage 总量；时长基线 = resume 时刻）。本轮继续后，
+            # 安全网从这条基线重新算——这就是「继续后重新计时 / 重新起算」的口径。
+            if to_s == "queued" and src in ("paused", "shelved"):
+                updates["paused_reason"] = ""
+                try:
+                    usage_row = conn.execute(
+                        "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS t FROM usage WHERE task_id=?",
+                        (str(task_id),),
+                    ).fetchone()
+                    used_so_far = int(usage_row["t"]) if usage_row is not None else 0
+                except Exception:
+                    used_so_far = 0
+                conn.execute(
+                    "INSERT INTO kv (key, value, updated) VALUES (?, ?, ?)"
+                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated=excluded.updated",
+                    (
+                        f"task.net_base.{task_id}",
+                        json.dumps({"tokens": used_so_far, "resume_ts": now}, ensure_ascii=False),
+                        now,
+                    ),
+                )
 
             cols = ", ".join(f"{k}=?" for k in updates)
             conn.execute(f"UPDATE tasks SET {cols} WHERE id=?", [*updates.values(), str(task_id)])
@@ -357,6 +387,75 @@ class Tasks:
         return int(row["c"]) if row is not None else 0
 
     # ------------------------------------------------------------------
+    # 安全网（0.4.0，[tasks] token_limit / run_seconds）
+    # ------------------------------------------------------------------
+
+    def net_check(self, task_id: str) -> dict | None:
+        """安全网巡检：任务超限（token / 时长）就自动 paused 并写 paused_reason，返回原因。
+
+        口径：
+        - tokens：usage 里这个任务的累计（减去继续那时刻的基线 task.net_base 的 tokens）；
+        - 时长：现在 − resume_ts（没有基线 = started_ts / created）；
+        - 没在 running 的任务不碰；限值 0 = 不限；失败返回 None（不抛）。
+        网页 / /mw / admin 把它 queued 回来时 transition 自动清原因、按那时刻重记基线
+        （恢复后 token 从恢复那时刻重新累计、时长重新开始跑）。
+        """
+        try:
+            settings = self._get_settings()
+            cfg = getattr(settings, "tasks", None)
+        except Exception:
+            cfg = None
+        token_limit = int(getattr(cfg, "token_limit", 0) or 0) if cfg is not None else 0
+        run_seconds = int(getattr(cfg, "run_seconds", 0) or 0) if cfg is not None else 0
+        if token_limit <= 0 and run_seconds <= 0:
+            return None
+        tid = str(task_id or "")
+        try:
+            row = self.get(tid)
+        except Exception:
+            row = None
+        if row is None or str(row.get("status") or "") != "running":
+            return None
+        now = clock.now()
+        try:
+            base = self._store.kv_get(f"task.net_base.{tid}")
+        except Exception:
+            base = None
+        base_tokens = int((base or {}).get("tokens") or 0) if isinstance(base, dict) else 0
+        base_ts = float((base or {}).get("resume_ts") or 0.0) if isinstance(base, dict) else 0.0
+        total_tokens = 0
+        try:
+            r = self._store.read().execute(
+                "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS t FROM usage WHERE task_id=?",
+                (tid,),
+            ).fetchone()
+            total_tokens = int(r["t"]) if r is not None else 0
+        except Exception:
+            total_tokens = 0
+        used_tokens = max(0, total_tokens - base_tokens)
+        started = base_ts or float(row.get("started_ts") or row.get("created") or now)
+        elapsed = max(0.0, now - started)
+        reason: dict | None = None
+        if token_limit > 0 and used_tokens >= token_limit:
+            reason = {"kind": "tokens", "limit": token_limit, "used": used_tokens}
+        elif run_seconds > 0 and elapsed >= run_seconds:
+            reason = {"kind": "time", "limit": run_seconds, "used": int(elapsed)}
+        if reason is None:
+            return None
+        note = (
+            f"安全网：token 超线（{used_tokens} / {token_limit}），自动暂停"
+            if reason["kind"] == "tokens"
+            else f"安全网：跑满 {run_seconds} 秒，自动暂停"
+        )
+        try:
+            self.transition(tid, "paused", reason=note, paused_reason=reason)
+        except (KeyError, ValueError):
+            pass
+        except Exception:
+            return None
+        return reason
+
+    # ------------------------------------------------------------------
     # 内部
     # ------------------------------------------------------------------
 
@@ -413,6 +512,12 @@ class Tasks:
         if status == "queued":
             return "排队中"
         if status == "paused":
+            # 安全网自动暂停（0.4.0）：原因进 meta，网页直接显示
+            pr = _load_json(row["paused_reason"] if "paused_reason" in row.keys() else None, None) if hasattr(row, "keys") else _load_json(row["paused_reason"], None)
+            if isinstance(pr, dict) and pr.get("kind"):
+                if pr["kind"] == "tokens":
+                    return "自动暂停：用量到上限了，等你决定"
+                return "自动暂停：做得太久了，等你决定"
             return "已暂停"
         if status == "cancelled":
             return "已取消"
@@ -431,6 +536,19 @@ class Tasks:
         return ""
 
     def _list_item(self, row: sqlite3.Row) -> dict:
+        # 安全网自动暂停原因（0.4.0）：task row 有没有这列按 sqlite Row 的 keys 判断（老库容差）；
+        # 手动暂停 / 正常运行都是 None（前端只对它显示「自动暂停原因」徽章）
+        paused_reason = None
+        try:
+            pr = _load_json(row["paused_reason"] if "paused_reason" in row.keys() else None, None)
+            if isinstance(pr, dict) and pr.get("kind"):
+                paused_reason = {
+                    "kind": str(pr["kind"]),
+                    "limit": int(pr.get("limit") or 0),
+                    "used": int(pr.get("used") or 0),
+                }
+        except Exception:
+            paused_reason = None
         return {
             "id": str(row["id"]),
             "icon": str(row["icon"] or "package"),
@@ -440,4 +558,5 @@ class Tasks:
             "goal_id": (str(row["goal_id"]) if row["goal_id"] else None),
             "updated_ts": float(row["updated"]),
             "undelivered": bool(row["undelivered"]),
+            "paused_reason": paused_reason,
         }

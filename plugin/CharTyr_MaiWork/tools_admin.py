@@ -1182,8 +1182,10 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         """验过的 patch 里有没有「放宽安全 / 让 MaiWork 更常往群里发东西」的；返回中文说明（没有 → ""）。
 
         判定口径（宁可多确认一次，不让模型绕过确认）：
-        - approval 节**任何字段**：管理员名单、免批群 / 免批人、批准开关、提醒开关，
-          全都是权限边界，一律要管理员点头；
+        - approval 节里除了下面两个「自动审核」键，**任何字段**（管理员名单、免批群 / 免批人、
+          批准开关、提醒开关）都是权限边界，一律要管理员点头；
+        - approval.auto_review：从「关」变「开」= 放宽（要确认）；关掉不用；
+        - approval.auto_review_daily：上限调大 = 放宽（要确认）；调低不用；
         - delivery.push_per_day：比现在大（或 >5）= 推送变多；
         - delivery.quiet_hours：安静窗口变窄 = 能发的时间段变长；
         - topics.per_day 变大、min_gap_hours 变小、enabled 从关到开 = 开话题更勤。
@@ -1197,9 +1199,31 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             "admins": "bot 管理员名单",
             "exempt_groups": "免批准的群",
             "exempt_users": "免批准的人",
+            "auto_review": "自动审核轻活",
+            "auto_review_daily": "每群每天最多自动批",
         }
+        current = _settings()
+        now_approval = getattr(current, "approval", None)
         for field, value in approval.items():
             label = _APPROVAL_ZH.get(field, f"approval.{field}")
+            if field == "auto_review":
+                # 只有「打开」算放宽；关掉不确认。读不到当前值时按放宽处理。
+                now_on = getattr(now_approval, "auto_review", None)
+                if value is True and now_on is not True:
+                    out.append(f"打开{label}")
+                continue
+            if field == "auto_review_daily":
+                # 只有「上限调大」算放宽；调低不确认。读不到当前值时按放宽处理。
+                now_n = getattr(now_approval, "auto_review_daily", None)
+                if not isinstance(now_n, int) or isinstance(now_n, bool):
+                    now_n = None
+                if (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and (now_n is None or value > now_n)
+                ):
+                    out.append(f"每天最多自动批放宽到 {value}")
+                continue
             if field in ("required", "remind"):
                 if value is False:
                     out.append(f"关掉{label}")
@@ -1208,7 +1232,6 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             else:
                 members = "、".join(str(m) for m in value) if isinstance(value, list) else str(value)
                 out.append(f"改动{label}（{members or '清空'}）")
-        current = _settings()
         delivery = validated.get("delivery") or {}
         if "push_per_day" in delivery:
             new_push = delivery["push_per_day"]
@@ -1247,7 +1270,15 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
 
     def _patch_summary(validated: dict[str, dict[str, Any]], loosen: str) -> str:
         """小票摘要：patch 里**全部**要改的字段都列出来（节.键 → 新值，名单类显示成员），
-        超长截断但写明「共改 N 项」——管理员点头前看到的必须和真正会改的一致。"""
+        超长截断但写明「共改 N 项」——管理员点头前看到的必须和真正会改的一致。
+
+        自动审核那两个键用中文标签（别让管理员看到 approval.auto_review 这种英文键名）；
+        其余字段沿用「节.字段」老样子（现有契约 / 测试就认它）。
+        """
+        labels = {
+            "approval.auto_review": "自动审核轻活",
+            "approval.auto_review_daily": "每群每天最多自动批",
+        }
         items: list[str] = []
         for section in sorted(validated.keys()):
             for field in sorted(validated[section].keys()):
@@ -1258,7 +1289,8 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                     shown = "开" if value else "关"
                 else:
                     shown = str(value)
-                items.append(f"{section}.{field} → {shown}")
+                name = labels.get(f"{section}.{field}", f"{section}.{field}")
+                items.append(f"{name} → {shown}")
         total = len(items)
         head = "改规则：" + "；".join(items)
         if len(head) <= MAX_SUMMARY - 1:
