@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from CharTyr_MaiWork.config import load_settings
+from CharTyr_MaiWork.maiwork.config import load_settings
 
 
 class TestContextWindow:
@@ -17,7 +17,7 @@ class TestContextWindow:
         assert settings.models.context_window == 2_000_000
 
     def test_web_save_schema(self):
-        from CharTyr_MaiWork.rules import CONFIG_BY_KEY
+        from CharTyr_MaiWork.maiwork.rules import CONFIG_BY_KEY
 
         assert "models.context_window" in CONFIG_BY_KEY
         spec = CONFIG_BY_KEY["models.context_window"]
@@ -38,7 +38,7 @@ class TestTaskNets:
         assert settings.tasks.run_seconds == 0
 
     def test_web_save_schema(self):
-        from CharTyr_MaiWork.rules import CONFIG_BY_KEY, CONFIG_SECTIONS
+        from CharTyr_MaiWork.maiwork.rules import CONFIG_BY_KEY, CONFIG_SECTIONS
 
         assert "tasks.token_limit" in CONFIG_BY_KEY
         assert "tasks.run_seconds" in CONFIG_BY_KEY

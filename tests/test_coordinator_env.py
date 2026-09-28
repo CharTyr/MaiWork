@@ -21,18 +21,18 @@ from typing import Any
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.coordinator import Coordinator
-from CharTyr_MaiWork.environments.local import LocalEnv
-from CharTyr_MaiWork.environments.railway import Box
-from CharTyr_MaiWork.goals import Goals
-from CharTyr_MaiWork.models import ModelError
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tasks import Tasks
-from CharTyr_MaiWork.tools import Tools
-from CharTyr_MaiWork.tools_exec import register_exec_tools
-from CharTyr_MaiWork.tools_railway import register_vm_tools
-from CharTyr_MaiWork.workers import WorkerReport
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.coordinator import Coordinator
+from CharTyr_MaiWork.maiwork.environments.local import LocalEnv
+from CharTyr_MaiWork.maiwork.environments.railway import Box
+from CharTyr_MaiWork.maiwork.goals import Goals
+from CharTyr_MaiWork.maiwork.models import ModelError
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tasks import Tasks
+from CharTyr_MaiWork.maiwork.tools import Tools
+from CharTyr_MaiWork.maiwork.tools_exec import register_exec_tools
+from CharTyr_MaiWork.maiwork.tools_railway import register_vm_tools
+from CharTyr_MaiWork.maiwork.workers import WorkerReport
 
 pytestmark = pytest.mark.asyncio
 
@@ -181,7 +181,7 @@ class FakeRailwayEnv:
         return self._box
 
     async def run(self, box: Any, command: str, *, timeout_s: int) -> Any:
-        from CharTyr_MaiWork.environments.local import RunResult
+        from CharTyr_MaiWork.maiwork.environments.local import RunResult
 
         self.run_calls.append({"cmd": str(command), "timeout_s": int(timeout_s)})
         return RunResult(exit_code=0, stdout="ok", stderr="", ms=5, timed_out=False, oom=False)
@@ -558,7 +558,7 @@ async def test_railway_on_offers_railway_choice_in_prompt(
 async def test_vm_fetch_file_rejects_out_of_bounds(
     mem_store: Store, settings, env, tools, tasks, goals
 ):
-    from CharTyr_MaiWork.tools import ToolContext
+    from CharTyr_MaiWork.maiwork.tools import ToolContext
 
     railway = FakeRailwayEnv(give_box=True)
     await railway.acquire("T-9")
@@ -575,7 +575,7 @@ async def test_vm_fetch_file_rejects_out_of_bounds(
 async def test_vm_fetch_file_copies_into_artifacts(
     mem_store: Store, settings, env, tools, tasks, goals
 ):
-    from CharTyr_MaiWork.tools import ToolContext
+    from CharTyr_MaiWork.maiwork.tools import ToolContext
 
     railway = FakeRailwayEnv(give_box=True)
     await railway.acquire("T-7")
@@ -600,7 +600,7 @@ async def test_vm_fetch_file_copies_into_artifacts(
 async def test_near_expiry_appends_reminder_to_vm_tool_output(
     mem_store: Store, settings, env, tools, tasks, goals
 ):
-    from CharTyr_MaiWork.tools import ToolContext
+    from CharTyr_MaiWork.maiwork.tools import ToolContext
 
     railway = FakeRailwayEnv(give_box=True, remaining_s=300.0)  # 只剩 5 分钟（<10）
     await railway.acquire("T-5")
@@ -617,7 +617,7 @@ async def test_expired_vm_tools_fail_chinese(
     mem_store: Store, settings, env, tools, tasks, goals
 ):
     """已经过 60 分钟窗口（剩余 ≤0）→ vm 工具一律失败，提示别再用这台机器。"""
-    from CharTyr_MaiWork.tools import ToolContext
+    from CharTyr_MaiWork.maiwork.tools import ToolContext
 
     railway = FakeRailwayEnv(give_box=True, remaining_s=-5.0)  # 已过期
     await railway.acquire("T-6")

@@ -14,11 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork import config_file, rules
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.models import Models
-from CharTyr_MaiWork.migrations import migrate_db_config_to_file
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import config_file, rules
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.models import Models
+from CharTyr_MaiWork.maiwork.migrations import migrate_db_config_to_file
+from CharTyr_MaiWork.maiwork.store import Store
 
 
 def _plugin_dir(tmp_path: Path) -> Path:

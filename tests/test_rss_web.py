@@ -17,13 +17,13 @@ import pytest
 import pytest_asyncio
 from aiohttp.test_utils import TestClient, TestServer
 
-from fakes import FakeCtx, FakeModelsQueue, FakeProfiles
+from fakes import FakeCtx, FakeModelsQueue, FakeProfiles, focus_reply
 
-from CharTyr_MaiWork import clock, rss
-from CharTyr_MaiWork.app import MaiWorkApp
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.feeds import Feeds
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock, rss
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.feeds import Feeds
+from CharTyr_MaiWork.maiwork.store import Store
 
 SECRET = "sk-rss-web-test-显眼Cc3"
 PASSWORD = "RSS 测试密码-显眼-456"
@@ -164,7 +164,7 @@ class _FakeWorkers:
 
 
 def _worker_report(items: list[dict]) -> Any:
-    from CharTyr_MaiWork.workers import WorkerReport
+    from CharTyr_MaiWork.maiwork.workers import WorkerReport
 
     return WorkerReport(ok=True, summary="找好了", data={"items": items}, evidence=[], steps=1)
 

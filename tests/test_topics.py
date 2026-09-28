@@ -14,12 +14,12 @@ from typing import Any, Dict, List, Tuple
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.delivery import Mentions, Pushes
-from CharTyr_MaiWork.host import Msg
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.topics import Topics
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.delivery import Mentions, Pushes
+from CharTyr_MaiWork.maiwork.host import Msg
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.topics import Topics
 
 from fakes import FakeCtx, FakeHost, FakeModelsQueue, FakeProfiles, SignalsStub
 

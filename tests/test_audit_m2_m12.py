@@ -14,11 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.environments.local import LocalEnv
-from CharTyr_MaiWork.tools import Tools, ToolContext
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tools_exec import register_exec_tools
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.environments.local import LocalEnv
+from CharTyr_MaiWork.maiwork.tools import Tools, ToolContext
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tools_exec import register_exec_tools
 
 pytestmark = pytest.mark.asyncio
 

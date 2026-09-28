@@ -6,8 +6,8 @@ from __future__ import annotations
 
 import pytest
 
-from CharTyr_MaiWork.config import load_settings, norm_account
-from CharTyr_MaiWork import rules
+from CharTyr_MaiWork.maiwork.config import load_settings, norm_account
+from CharTyr_MaiWork.maiwork import rules
 
 
 def test_norm_account() -> None:
@@ -41,8 +41,8 @@ def test_rules_accept_platform_form() -> None:
 
 
 def test_is_admin_by_platform(tmp_path) -> None:
-    from CharTyr_MaiWork.approvals import Approvals
-    from CharTyr_MaiWork.store import Store
+    from CharTyr_MaiWork.maiwork.approvals import Approvals
+    from CharTyr_MaiWork.maiwork.store import Store
     s, _ = load_settings({"approval": {"admins": ["qq:10001", "telegram:bob"]}})
     st = Store(tmp_path / "t.db"); st.migrate()
     a = Approvals(st, lambda: s, None, None)
@@ -55,8 +55,8 @@ def test_is_admin_by_platform(tmp_path) -> None:
 
 
 def test_exempt_group_and_user_by_platform(tmp_path) -> None:
-    from CharTyr_MaiWork.approvals import Approvals
-    from CharTyr_MaiWork.store import Store
+    from CharTyr_MaiWork.maiwork.approvals import Approvals
+    from CharTyr_MaiWork.maiwork.store import Store
     s, _ = load_settings({"approval": {"exempt_groups": ["qq:900000001"], "exempt_users": ["qq:20001"]}})
     st = Store(tmp_path / "t.db"); st.migrate()
     a = Approvals(st, lambda: s, None, None)

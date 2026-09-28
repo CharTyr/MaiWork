@@ -21,10 +21,10 @@ from pathlib import Path
 import httpx
 import pytest
 
-from CharTyr_MaiWork.app import MaiWorkApp
-from CharTyr_MaiWork.config import CONFIG_VERSION, load_settings
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tools import Tool, ToolContext, ToolResult, Tools
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.config import CONFIG_VERSION, load_settings
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tools import Tool, ToolContext, ToolResult, Tools
 
 G1 = "900000001"
 MCP_URL = "https://mcp-ext.example/mcp"
@@ -234,7 +234,7 @@ def _ctx(role: str = "worker") -> ToolContext:
 class TestMcpRegistration:
     @pytest.mark.asyncio
     async def test_register_and_named(self, store: Store) -> None:
-        from CharTyr_MaiWork.extensions import Extensions
+        from CharTyr_MaiWork.maiwork.extensions import Extensions
 
         server = _McpServer([_tool_spec("get_issue"), _tool_spec("list.repos")])
         s = _mcp_setting()
@@ -256,7 +256,7 @@ class TestMcpRegistration:
 
     @pytest.mark.asyncio
     async def test_whitelist(self, store: Store) -> None:
-        from CharTyr_MaiWork.extensions import Extensions
+        from CharTyr_MaiWork.maiwork.extensions import Extensions
 
         server = _McpServer([_tool_spec("a"), _tool_spec("b"), _tool_spec("c")])
         s = _mcp_setting(tools=["a", "c"])
@@ -271,7 +271,7 @@ class TestMcpRegistration:
 
     @pytest.mark.asyncio
     async def test_roles_and_schema_passthrough(self, store: Store) -> None:
-        from CharTyr_MaiWork.extensions import Extensions
+        from CharTyr_MaiWork.maiwork.extensions import Extensions
 
         schema = {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}
         server = _McpServer([_tool_spec("deep", description="深工具", schema=schema)])
@@ -297,7 +297,7 @@ class TestMcpRegistration:
 
     @pytest.mark.asyncio
     async def test_disabled_not_connected(self, store: Store) -> None:
-        from CharTyr_MaiWork.extensions import Extensions
+        from CharTyr_MaiWork.maiwork.extensions import Extensions
 
         server = _McpServer([_tool_spec("a")])
         s = _mcp_setting(enabled=False)
@@ -313,7 +313,7 @@ class TestMcpRegistration:
 
     @pytest.mark.asyncio
     async def test_long_tool_name_truncated_to_64(self, store: Store) -> None:
-        from CharTyr_MaiWork.extensions import Extensions
+        from CharTyr_MaiWork.maiwork.extensions import Extensions
 
         long_name = "t" * 100
         server = _McpServer([_tool_spec(long_name)])
@@ -331,7 +331,7 @@ class TestMcpRegistration:
 class TestMcpCall:
     @pytest.mark.asyncio
     async def test_call_maps_arguments_and_joins_text(self, store: Store) -> None:
-        from CharTyr_MaiWork.extensions import Extensions
+        from CharTyr_MaiWork.maiwork.extensions import Extensions
 
         def on_call(request: httpx.Request, body: dict) -> httpx.Response:
             return _sse(
@@ -371,7 +371,7 @@ class TestMcpCall:
 
     @pytest.mark.asyncio
     async def test_output_truncated_8000(self, store: Store) -> None:
-        from CharTyr_MaiWork.extensions import Extensions
+        from CharTyr_MaiWork.maiwork.extensions import Extensions
 
         def on_call(request: httpx.Request, body: dict) -> httpx.Response:
             return _sse(
@@ -396,7 +396,7 @@ class TestMcpCall:
 
     @pytest.mark.asyncio
     async def test_iserror_result_not_ok(self, store: Store) -> None:
-        from CharTyr_MaiWork.extensions import Extensions
+        from CharTyr_MaiWork.maiwork.extensions import Extensions
 
         def on_call(request: httpx.Request, body: dict) -> httpx.Response:
             return _sse(
@@ -421,7 +421,7 @@ class TestMcpCall:
 
     @pytest.mark.asyncio
     async def test_network_failure_in_call_is_tool_failure(self, store: Store) -> None:
-        from CharTyr_MaiWork.extensions import Extensions
+        from CharTyr_MaiWork.maiwork.extensions import Extensions
 
         server = _McpServer([_tool_spec("x")], lambda r, b: httpx.Response(500, text=f"key={HEADER_SECRET}"))
         s = _mcp_setting(headers={"X-Key": HEADER_SECRET})
@@ -442,7 +442,7 @@ class TestMcpSecretMasking:
         """headers 里的密钥：不落 tool_calls、不进日志、不在 extensions.info() 里。"""
         import logging
 
-        from CharTyr_MaiWork.extensions import Extensions
+        from CharTyr_MaiWork.maiwork.extensions import Extensions
 
         # 服务端把密钥回显进返回文本（最坏的泄漏情形）
         def on_call(request: httpx.Request, body: dict) -> httpx.Response:
@@ -638,7 +638,7 @@ def _make_skill(data_dir: Path, name: str, *, front: str = "", body: str = "", f
 
 class TestSkills:
     def test_list_and_front_matter(self, tmp_path: Path) -> None:
-        from CharTyr_MaiWork.skills import Skills
+        from CharTyr_MaiWork.maiwork.skills import Skills
 
         _make_skill(
             tmp_path,
@@ -659,14 +659,14 @@ class TestSkills:
         assert set(by_name["bare"]["roles"]) == {"worker"}
 
     def test_name_mismatch_uses_dir_name(self, tmp_path: Path) -> None:
-        from CharTyr_MaiWork.skills import Skills
+        from CharTyr_MaiWork.maiwork.skills import Skills
 
         _make_skill(tmp_path, "dir-name", front="---\nname: 别的名字\ndescription: x\n---\n")
         sk = Skills(tmp_path)
         assert [i["name"] for i in sk.list()] == ["dir-name"]
 
     def test_list_max_20_and_hint(self, tmp_path: Path) -> None:
-        from CharTyr_MaiWork.skills import Skills
+        from CharTyr_MaiWork.maiwork.skills import Skills
 
         for i in range(25):
             _make_skill(tmp_path, f"s{i:02d}", front=f"---\nname: s{i:02d}\ndescription: 第{i}个\n---\n")
@@ -677,7 +677,7 @@ class TestSkills:
         assert "s00" in hint and "第0个" in hint
 
     def test_read_full_text_and_cap(self, tmp_path: Path) -> None:
-        from CharTyr_MaiWork.skills import Skills
+        from CharTyr_MaiWork.maiwork.skills import Skills
 
         _make_skill(
             tmp_path,
@@ -691,20 +691,20 @@ class TestSkills:
         assert len(text) <= 40 * 1024
 
     def test_read_missing_returns_none(self, tmp_path: Path) -> None:
-        from CharTyr_MaiWork.skills import Skills
+        from CharTyr_MaiWork.maiwork.skills import Skills
 
         assert Skills(tmp_path).read("nope") is None
         assert Skills(tmp_path).read_file("nope", "a.txt") is None
 
     def test_read_file_ok(self, tmp_path: Path) -> None:
-        from CharTyr_MaiWork.skills import Skills
+        from CharTyr_MaiWork.maiwork.skills import Skills
 
         _make_skill(tmp_path, "kit", files={"scripts/build.py": "print('hi')\n"})
         sk = Skills(tmp_path)
         assert sk.read_file("kit", "scripts/build.py") == "print('hi')\n"
 
     def test_read_file_traversal_rejected(self, tmp_path: Path) -> None:
-        from CharTyr_MaiWork.skills import Skills
+        from CharTyr_MaiWork.maiwork.skills import Skills
 
         _make_skill(tmp_path, "kit", files={"a.txt": "ok"})
         sk = Skills(tmp_path)
@@ -712,7 +712,7 @@ class TestSkills:
             assert sk.read_file("kit", rel) is None, rel
 
     def test_read_file_symlink_rejected(self, tmp_path: Path) -> None:
-        from CharTyr_MaiWork.skills import Skills
+        from CharTyr_MaiWork.maiwork.skills import Skills
 
         d = _make_skill(tmp_path, "kit", files={"a.txt": "ok"})
         outside = tmp_path / "outside.txt"
@@ -735,7 +735,7 @@ class TestSkills:
             assert all(i["name"] != "linked" for i in sk.list())
 
     def test_skills_dir_missing_is_empty(self, tmp_path: Path) -> None:
-        from CharTyr_MaiWork.skills import Skills
+        from CharTyr_MaiWork.maiwork.skills import Skills
 
         sk = Skills(tmp_path / "不存在")
         assert sk.list() == []
@@ -746,8 +746,8 @@ class TestSkills:
 class TestSkillTools:
     @pytest.mark.asyncio
     async def test_list_skills_and_read_skill(self, store: Store, tmp_path: Path) -> None:
-        from CharTyr_MaiWork.skills import Skills
-        from CharTyr_MaiWork.skills_tools import register_skill_tools
+        from CharTyr_MaiWork.maiwork.skills import Skills
+        from CharTyr_MaiWork.maiwork.skills_tools import register_skill_tools
 
         _make_skill(
             tmp_path,
@@ -836,7 +836,7 @@ def _submit_tools(store: Store) -> Tools:
 class TestWorkersSkillsHint:
     @pytest.mark.asyncio
     async def test_hint_in_system_prompt(self, store: Store) -> None:
-        from CharTyr_MaiWork.workers import Workers
+        from CharTyr_MaiWork.maiwork.workers import Workers
 
         tools = _submit_tools(store)
         models = ReplayModels([_submit_call()])
@@ -849,7 +849,7 @@ class TestWorkersSkillsHint:
 
     @pytest.mark.asyncio
     async def test_run_argument_overrides_default(self, store: Store) -> None:
-        from CharTyr_MaiWork.workers import Workers
+        from CharTyr_MaiWork.maiwork.workers import Workers
 
         tools = _submit_tools(store)
         models = ReplayModels([_submit_call(), _submit_call()])
@@ -864,7 +864,7 @@ class TestWorkersSkillsHint:
 
     @pytest.mark.asyncio
     async def test_no_hint_keeps_prompt_unchanged(self, store: Store) -> None:
-        from CharTyr_MaiWork.workers import Workers, _system_prompt
+        from CharTyr_MaiWork.maiwork.workers import Workers, _system_prompt
 
         tools = _submit_tools(store)
         models = ReplayModels([])

@@ -7,9 +7,9 @@ import json
 
 import pytest
 
-from CharTyr_MaiWork.coordinator import Coordinator
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tasks import Tasks
+from CharTyr_MaiWork.maiwork.coordinator import Coordinator
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tasks import Tasks
 
 pytestmark = pytest.mark.asyncio
 
@@ -34,7 +34,7 @@ class _Models:
     async def chat(self, role, messages, **kw):
         self.calls.append((role, [dict(m) for m in messages], dict(kw)))
         if str(kw.get("purpose") or "").endswith(":compact"):
-            from CharTyr_MaiWork.models import ChatResult
+            from CharTyr_MaiWork.maiwork.models import ChatResult
             return ChatResult(text="Primary Request and Intent 摘要 8 节", tool_calls=[], model="m", prompt_tokens=1, completion_tokens=1, raw_message={})
         if self._gate is not None:
             return self._gate(messages)
@@ -47,7 +47,7 @@ class _Tools:
         ]
 
     async def call(self, name, args, ctx):
-        from CharTyr_MaiWork.tools import ToolResult
+        from CharTyr_MaiWork.maiwork.tools import ToolResult
         return ToolResult(ok=True, output="x" * 20000)
 
 
@@ -82,7 +82,7 @@ def _coordinator(models):
 class TestMainCompaction:
     async def test_plan_loop_compacts_before_chat(self):
         """排计划工具回合多次后，上下文超线 -> 摘要消息出现在后续调用里。"""
-        from CharTyr_MaiWork.models import ChatResult
+        from CharTyr_MaiWork.maiwork.models import ChatResult
 
         big_out = "x" * 20000
         rounds = {"n": 0}
@@ -111,7 +111,7 @@ class TestMainCompaction:
 
     async def test_context_length_error_trims_and_retries(self):
         """模型返回上下文超长 -> 裁掉最旧一段重试一次。"""
-        from CharTyr_MaiWork.models import ChatResult, ModelError
+        from CharTyr_MaiWork.maiwork.models import ChatResult, ModelError
 
         state = {"n": 0}
 

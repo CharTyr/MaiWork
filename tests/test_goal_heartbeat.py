@@ -16,13 +16,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.coordinator import Coordinator
-from CharTyr_MaiWork.goals import Goals
-from CharTyr_MaiWork.models import ModelError
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tasks import Tasks
-from CharTyr_MaiWork.tools import Tools
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.coordinator import Coordinator
+from CharTyr_MaiWork.maiwork.goals import Goals
+from CharTyr_MaiWork.maiwork.models import ModelError
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tasks import Tasks
+from CharTyr_MaiWork.maiwork.tools import Tools
 
 pytestmark = pytest.mark.asyncio
 
@@ -371,7 +371,7 @@ def _app_raw(data_dir: Path, *, listen: str = "127.0.0.1:18711") -> dict:
 async def test_app_goals_round_marks_unconfigured_and_count_stays_zero(tmp_path):
     from fakes import FakeCtx, FakeProfiles
 
-    from CharTyr_MaiWork.app import MaiWorkApp
+    from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
     app = MaiWorkApp(FakeCtx({}), _app_raw(tmp_path / "data"), plugin_dir=Path(__file__).resolve().parents[1])
     app.profiles_cls = FakeProfiles
@@ -399,7 +399,7 @@ async def test_app_goals_round_marks_unconfigured_and_count_stays_zero(tmp_path)
 async def test_stale_goals_count_counts_timeout_stale(tmp_path):
     from fakes import FakeCtx, FakeProfiles
 
-    from CharTyr_MaiWork.app import MaiWorkApp
+    from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
     app = MaiWorkApp(FakeCtx({}), _app_raw(tmp_path / "data2"), plugin_dir=Path(__file__).resolve().parents[1])
     app.profiles_cls = FakeProfiles
@@ -426,7 +426,7 @@ async def test_stale_goals_count_counts_timeout_stale(tmp_path):
 async def test_stale_goals_count_not_started(tmp_path):
     from fakes import FakeCtx
 
-    from CharTyr_MaiWork.app import MaiWorkApp
+    from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
     app = MaiWorkApp(FakeCtx({}), _app_raw(tmp_path / "data3"), plugin_dir=Path(__file__).resolve().parents[1])
     assert app.stale_goals_count(GID) == 0  # 没启动不炸，返回 0

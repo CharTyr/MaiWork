@@ -6,6 +6,7 @@
 - passed / failed 都写进 news_items.verify（前端如实显示 verify 块）；
 - 每轮最多 [environments] verify_per_round（默认 2）条，挑多了夹回；
 - [environments] railway=false → 整个实测关掉（不挑、不调 runner）；
+- [environments] verify_enabled=false（默认）→ 整个挑实测跳过：不调模型挑条、不申请 VM；
 - 实测总时长上限：run_railway_verify 到钟就收尾、没测的条绝不留半截 verify；
 - verify 字段最终结构：{"status","summary","steps"(≤6 条每条≤80字),"minutes","ts"}。
 """
@@ -20,19 +21,27 @@ from typing import Any
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.feeds import Feeds, run_railway_verify
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.workers import WorkerReport
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.feeds import Feeds, run_railway_verify
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.workers import WorkerReport
 
-from fakes import FakeModelsQueue, FakeProfiles
+from fakes import FakeModelsQueue, FakeProfiles, focus_reply
 
 BJ = timezone(timedelta(hours=8))
 NOW = 1_790_000_000.0
 GID = "111"
 
 _QUOTE = "原文里确实写着这件事，摘要能在正文找到依据。"
+
+
+@pytest.fixture(autouse=True)
+def _pin_clock(monkeypatch):
+    """本文件的候选发布时间都围着 NOW 造；不钉住时钟的话，真实时间一过 NOW+7 天，
+    「资讯超过 7 天算旧闻」的硬规则就把它们拒掉（2026-09-28 12:13 UTC 实际踩到）。
+    个别用例自己再 monkeypatch clock.now 的，以它的为准（后设覆盖前设）。"""
+    monkeypatch.setattr(clock, "now", lambda: NOW)
 
 _WORKER_ITEMS = {
     "items": [
@@ -61,10 +70,8 @@ _SCORES_JSON = json.dumps(
     ensure_ascii=False,
 )
 
-_FOCUS_JSON = json.dumps(
-    {"focus": [{"query": "顺手的开源小工具", "why": "群友喜欢折腾"}]},
-    ensure_ascii=False,
-)
+# 定关注点要求 3–5 个（少了会触发追问重试），统一用 fakes.focus_reply 造
+_FOCUS_JSON = focus_reply("顺手的开源小工具", "本地大模型新玩法", "开源掌机社区风向")
 
 _VERIFY_PICK_JSON = json.dumps(
     {"verify": [{"i": 0, "title": "一行命令把 JSON 转成 CSV 的新工具",
@@ -174,7 +181,7 @@ def test_no_pick_means_no_vm_and_normal_insert(tmp_path: Path) -> None:
     runner = RecordingVerifyRunner()
     store, settings, feeds = _make_feeds(
         tmp_path, models=models, workers=FakeWorkers([_worker_report_items()]),
-        verify_runner=runner,
+        verify_runner=runner, cfg={"environments": {"verify_enabled": True}},
     )
     got = asyncio.run(feeds.prepare_news(GID))
     assert got == 2
@@ -189,7 +196,7 @@ def test_railway_off_means_whole_verify_disabled(tmp_path: Path) -> None:
     runner = RecordingVerifyRunner({0: {"status": "passed"}})
     store, _settings, feeds = _make_feeds(
         tmp_path, models=models, workers=FakeWorkers([_worker_report_items()]),
-        verify_runner=runner, cfg={"environments": {"railway": False}},
+        verify_runner=runner, cfg={"environments": {"railway": False, "verify_enabled": True}},
     )
     got = asyncio.run(feeds.prepare_news(GID))
     assert got == 2
@@ -200,6 +207,45 @@ def test_railway_off_means_whole_verify_disabled(tmp_path: Path) -> None:
         assert row["verify"] == ""
 
 
+def test_verify_enabled_off_skips_pick_and_runner(tmp_path: Path) -> None:
+    """[environments] verify_enabled=false（默认）→ 整个挑实测跳过：
+    不调模型挑条、不调 runner、不多一次模型调用；出资讯照常。"""
+    models = FakeModelsQueue(ready=True, replies=[
+        _FOCUS_JSON, _SCORES_JSON, '{"posts": []}', _VERIFY_PICK_JSON,
+    ])
+    runner = RecordingVerifyRunner({0: {"status": "passed"}})
+    store, _settings, feeds = _make_feeds(
+        tmp_path, models=models, workers=FakeWorkers([_worker_report_items()]),
+        verify_runner=runner, cfg={"environments": {"verify_enabled": False}},
+    )
+    got = asyncio.run(feeds.prepare_news(GID))
+    assert got == 2
+    assert runner.calls == []  # 一次都没申请 VM
+    # 主模型只被问了 3 次（focus/score/post），没有第 4 次挑实测的调用
+    assert len(models.calls) == 3
+    for row in _accepted_verify(tmp_path, store):
+        assert row["verify"] == ""
+
+
+def test_verify_enabled_on_keeps_existing_behavior(tmp_path: Path) -> None:
+    """[environments] verify_enabled=true → 老实测：先调模型挑条，再交给 runner。"""
+    models = FakeModelsQueue(ready=True, replies=[
+        _FOCUS_JSON, _SCORES_JSON, '{"posts": []}', _VERIFY_PICK_JSON,
+    ])
+    runner = RecordingVerifyRunner({0: {"status": "passed"}})
+    store, _settings, feeds = _make_feeds(
+        tmp_path, models=models, workers=FakeWorkers([_worker_report_items()]),
+        verify_runner=runner, cfg={"environments": {"verify_enabled": True}},
+    )
+    got = asyncio.run(feeds.prepare_news(GID))
+    assert got == 2
+    assert len(models.calls) == 4  # 第 4 次是挑实测
+    assert len(runner.calls) == 1
+    assert [int(p["index"]) for p in runner.calls[0]["plans"]] == [0]
+    rows = _accepted_verify(tmp_path, store)
+    assert json.loads(rows[0]["verify"])["status"] == "passed"
+
+
 def test_vm_unavailable_still_inserts_normally(tmp_path: Path) -> None:
     """runner 表示拿不到 VM（什么都不写就回来）→ 照常入库、返回入选数不变。"""
     models = FakeModelsQueue(ready=True, replies=[
@@ -208,7 +254,7 @@ def test_vm_unavailable_still_inserts_normally(tmp_path: Path) -> None:
     runner = RecordingVerifyRunner()  # 不写任何 verify = 没拿到机器
     store, _settings, feeds = _make_feeds(
         tmp_path, models=models, workers=FakeWorkers([_worker_report_items()]),
-        verify_runner=runner,
+        verify_runner=runner, cfg={"environments": {"verify_enabled": True}},
     )
     got = asyncio.run(feeds.prepare_news(GID))
     assert got == 2
@@ -236,7 +282,7 @@ def test_passed_and_failed_both_written_to_verify(tmp_path: Path) -> None:
     runner = RecordingVerifyRunner({0: v_pass, 1: v_fail})
     store, _settings, feeds = _make_feeds(
         tmp_path, models=models, workers=FakeWorkers([_worker_report_items()]),
-        verify_runner=runner,
+        verify_runner=runner, cfg={"environments": {"verify_enabled": True}},
     )
     got = asyncio.run(feeds.prepare_news(GID))
     assert got == 2
@@ -268,7 +314,7 @@ def test_per_round_cap_is_two(tmp_path: Path) -> None:
     runner = RecordingVerifyRunner()
     _store, _settings, feeds = _make_feeds(
         tmp_path, models=models, workers=FakeWorkers([_worker_report_items()]),
-        verify_runner=runner,
+        verify_runner=runner, cfg={"environments": {"verify_enabled": True}},
     )
     asyncio.run(feeds.prepare_news(GID))
     assert len(runner.calls) == 1
@@ -291,7 +337,7 @@ def test_pick_out_of_range_dropped(tmp_path: Path) -> None:
     runner = RecordingVerifyRunner()
     _store, _settings, feeds = _make_feeds(
         tmp_path, models=models, workers=FakeWorkers([_worker_report_items()]),
-        verify_runner=runner,
+        verify_runner=runner, cfg={"environments": {"verify_enabled": True}},
     )
     asyncio.run(feeds.prepare_news(GID))
     assert len(runner.calls) == 1
@@ -314,7 +360,7 @@ class _FakeRailEnv:
     async def acquire(self, job_id: str) -> Any:
         if not self.give_box:
             return None
-        from CharTyr_MaiWork.environments.railway import Box
+        from CharTyr_MaiWork.maiwork.environments.railway import Box
 
         return Box(job_id=str(job_id), key_path=Path("/tmp/fake-id"),
                    expires_ts=NOW + 3600, preview_url="", key_dir=Path("/tmp"))
@@ -475,7 +521,7 @@ def test_verify_full_chain_end_to_end(tmp_path: Path) -> None:
     runner = RecordingVerifyRunner({0: v})
     store, _settings, feeds = _make_feeds(
         tmp_path, models=models, workers=FakeWorkers([_worker_report_items()]),
-        verify_runner=runner,
+        verify_runner=runner, cfg={"environments": {"verify_enabled": True}},
     )
     got = asyncio.run(feeds.prepare_news(GID))
     assert got == 2

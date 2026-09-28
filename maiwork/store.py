@@ -712,8 +712,24 @@ def _m_task_nets(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN paused_reason TEXT")
 
 
+# 群空间「自有文件夹登记」（插件中心审核整改 2026-10，platforms/qq_onebot.py）：
+# 防手滑第二层——delete_folder 只能删机器人自己建、且里面只有机器人自己传的文件 /
+# 自己建的子文件夹的文件夹。create_folder 成功后登记一行；拿不到 folder_id 时
+# 只记日志不登记（最坏后果：这个文件夹以后不能删）。
+def _m_group_folders(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS group_folders_owned (
+        group_id TEXT NOT NULL,
+        folder_id TEXT NOT NULL,
+        name TEXT NOT NULL DEFAULT '',
+        created_ts REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (group_id, folder_id)
+    );
+    """)
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders]
 
 
 class Store:

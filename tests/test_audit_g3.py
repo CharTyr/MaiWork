@@ -10,11 +10,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tasks import Tasks
-from CharTyr_MaiWork.console import views
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tasks import Tasks
+from CharTyr_MaiWork.maiwork.console import views
 
 GID = "900000001"
 MEMBER_HIDDEN_TASK_KEYS = ("tokens", "workspace", "source", "request_id", "requester_id")

@@ -19,14 +19,14 @@ import pytest
 
 from fakes import FakeModelsQueue
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.approvals import Approvals
-from CharTyr_MaiWork.auto_review import AUTO_BY, AutoReviewer
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.goals import Goals
-from CharTyr_MaiWork.models import ModelError
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tasks import Tasks
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.approvals import Approvals
+from CharTyr_MaiWork.maiwork.auto_review import AUTO_BY, AutoReviewer
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.goals import Goals
+from CharTyr_MaiWork.maiwork.models import ModelError
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tasks import Tasks
 
 G1 = "900000001"
 G2 = "111222333"
@@ -493,7 +493,7 @@ class TestConfig:
         assert s.approval.auto_review_daily == 9
 
     def test_schema_has_product_labels(self) -> None:
-        from CharTyr_MaiWork.rules import CONFIG_BY_KEY
+        from CharTyr_MaiWork.maiwork.rules import CONFIG_BY_KEY
 
         f = CONFIG_BY_KEY["approval.auto_review"]
         assert f["type"] == "bool"
@@ -504,7 +504,7 @@ class TestConfig:
         assert g["min"] == 0
 
     def test_validate_patch_accepts_both(self) -> None:
-        from CharTyr_MaiWork.rules import validate_patch
+        from CharTyr_MaiWork.maiwork.rules import validate_patch
 
         assert validate_patch("approval.auto_review", True) == ("approval.auto_review", True)
         assert validate_patch("approval.auto_review_daily", 3) == ("approval.auto_review_daily", 3)
@@ -514,7 +514,7 @@ class TestConfig:
             validate_patch("approval.auto_review_daily", -1)
 
     def test_hot_apply_override(self, tmp_path) -> None:
-        from CharTyr_MaiWork.rules import effective_settings
+        from CharTyr_MaiWork.maiwork.rules import effective_settings
 
         base = _settings()
         merged = effective_settings(base, {"approval": {"auto_review": False, "auto_review_daily": 2}})
@@ -526,7 +526,7 @@ class TestConfig:
     @pytest.mark.asyncio
     async def test_hot_apply_changes_reviewer_behaviour(self, tmp_path) -> None:
         h = _setup(tmp_path, replies=[_OK])
-        from CharTyr_MaiWork import rules as _rules
+        from CharTyr_MaiWork.maiwork import rules as _rules
 
         off = _rules.effective_settings(h.settings, {"approval": {"auto_review": False}})
         reviewer = AutoReviewer(h.store, h.models, h.approvals, lambda: off)
@@ -573,7 +573,7 @@ class TestIntakeIntegration:
         """钩子只登记（spawn 一个协程），审核在后台跑；跑完自动批 + 开工。"""
         from fakes import hook_message
 
-        from CharTyr_MaiWork.intake import Intake, Signals
+        from CharTyr_MaiWork.maiwork.intake import Intake, Signals
 
         h = _setup(tmp_path, replies=[_OK])
         spawned: list = []
@@ -607,7 +607,7 @@ class TestIntakeIntegration:
         """群里看到的固定话和「免批直接开工」那句一致（都是 intake 那句）。"""
         from fakes import hook_message
 
-        from CharTyr_MaiWork.intake import Intake, Signals
+        from CharTyr_MaiWork.maiwork.intake import Intake, Signals
 
         h = _setup(tmp_path, replies=[_OK])
         mentions = _FakeMentions()
@@ -634,7 +634,7 @@ class TestIntakeIntegration:
         """@ 判成 goal → approvals 记 kind=goal → 自动审核零模型调用。"""
         from fakes import hook_message
 
-        from CharTyr_MaiWork.intake import Intake, Signals
+        from CharTyr_MaiWork.maiwork.intake import Intake, Signals
 
         h = _setup(tmp_path, replies=[_OK])
         spawned: list = []

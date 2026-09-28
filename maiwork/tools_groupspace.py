@@ -1,7 +1,8 @@
 """tools_groupspace.py（群空间工具，roles={"main"}，docs/02-设计.md §10）：
 
 - group_files_list：看群文件（根目录或指定文件夹）。
-- group_file_manage：delete / rename / move / mkdir（只动机器人自己传的文件）。
+- group_file_manage：delete / rename / move / mkdir / rmdir（只动机器人自己传的文件、
+  只删机器人自己建且里面只有自己东西的文件夹）。
 - group_notice_send：发群公告（先在群里说一句预告；每群每天最多 1 条）。
 - group_album_upload：把工作区里的成品图传进群相册。
 
@@ -20,7 +21,7 @@ from .tools_admin import _check_upload_path
 
 logger = logging.getLogger("maiwork.tools_groupspace")
 
-_ACTIONS = ("delete", "rename", "move", "mkdir")
+_ACTIONS = ("delete", "rename", "move", "mkdir", "rmdir")
 
 
 def register_groupspace_tools(
@@ -94,6 +95,11 @@ def register_groupspace_tools(
                     return ToolResult(ok=False, output="", error="move 要给 file_id 和 folder_id")
                 await group_space.move_file(gid, file_id, folder_id)
                 return ToolResult(ok=True, output=f"已把文件移到文件夹 {folder_id}")
+            if action == "rmdir":
+                if not folder_id:
+                    return ToolResult(ok=False, output="", error="rmdir 要给 folder_id")
+                await group_space.delete_folder(gid, folder_id)
+                return ToolResult(ok=True, output=f"已删除文件夹 {folder_id}")
             # mkdir
             if not name:
                 return ToolResult(ok=False, output="", error="mkdir 要给 name")
@@ -165,14 +171,18 @@ def register_groupspace_tools(
     tools.register(
         Tool(
             name="group_file_manage",
-            description="管理本群群文件：delete 删 / rename 改名 / move 移文件夹 / mkdir 建文件夹。只能动机器人自己传的文件。",
+            description=(
+                "管理本群群文件：delete 删文件 / rename 改名 / move 移文件夹 / mkdir 建文件夹 /"
+                " rmdir 删文件夹。文件和文件夹都只能动机器人自己传 / 自己建的；"
+                "删文件夹时要求里面只有机器人自己传的文件和自己建的子文件夹，否则不删。"
+            ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": list(_ACTIONS), "description": "delete / rename / move / mkdir"},
+                    "action": {"type": "string", "enum": list(_ACTIONS), "description": "delete / rename / move / mkdir / rmdir"},
                     "file_id": {"type": "string", "description": "文件 ID（delete / rename / move 必填）"},
                     "name": {"type": "string", "description": "新名字（rename）或文件夹名（mkdir）"},
-                    "folder_id": {"type": "string", "description": "目标文件夹 ID（move）或父文件夹（mkdir，可选）"},
+                    "folder_id": {"type": "string", "description": "目标文件夹 ID（move）或父文件夹（mkdir，可选）/ 要删的文件夹（rmdir）"},
                 },
                 "required": ["action"],
             },

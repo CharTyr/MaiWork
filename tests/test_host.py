@@ -9,7 +9,7 @@ import pytest
 
 from fakes import FakeCtx
 
-from CharTyr_MaiWork.host import Host, HostError, Msg, SendResult
+from CharTyr_MaiWork.maiwork.host import Host, HostError, Msg, SendResult
 
 # ----------------------------------------------------------------------
 # messages()

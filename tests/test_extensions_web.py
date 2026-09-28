@@ -285,7 +285,7 @@ class TestSecretOnlyIn:
     @pytest.mark.asyncio
     async def test_secret_never_leaks(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
         """新增 / 改 / 试连 / 工具调用：响应、日志、tool_calls 里都搜不到头值。"""
-        from CharTyr_MaiWork.tools import ToolContext
+        from CharTyr_MaiWork.maiwork.tools import ToolContext
 
         # 服务端把密钥回显进返回文本（最坏泄漏情形）
         def on_call(request: httpx.Request, body: dict) -> httpx.Response:
@@ -644,7 +644,7 @@ class TestWebOverridesConfig:
     @pytest.mark.asyncio
     async def test_web_entry_shadows_config(self, tmp_path: Path) -> None:
         """config 里已有 gh：网页加同名的 → 合并结果只有一条，且是网页的（以网页为准）。"""
-        from CharTyr_MaiWork.extensions_web import merged
+        from CharTyr_MaiWork.maiwork.extensions_web import merged
 
         app, client = await _make(
             tmp_path,
@@ -749,7 +749,7 @@ class TestSkillCreateRead:
             assert one["size"] > 0 and one["updated_ts"] > 0
             assert one["roles"] == ["worker"]
             # 子 agent 的 list_skills 工具下一次就读到新的
-            from CharTyr_MaiWork.tools import ToolContext
+            from CharTyr_MaiWork.maiwork.tools import ToolContext
 
             res = await app.tools.call(
                 "list_skills", {}, ToolContext(group_id=G1, task_id="T-1", actor="子 agent #1", role="worker")
@@ -898,7 +898,7 @@ class TestSkillCreateRead:
     @pytest.mark.asyncio
     async def test_delete_not_escape_skills_dir(self, tmp_path: Path) -> None:
         """数据层直接调 delete：名字不合法 / 越界 → 报错且 skills 目录外的东西原样。"""
-        from CharTyr_MaiWork import skills_web
+        from CharTyr_MaiWork.maiwork import skills_web
 
         app, client = await _make(tmp_path)
         try:

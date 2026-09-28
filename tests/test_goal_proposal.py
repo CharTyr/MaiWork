@@ -17,12 +17,12 @@ import pytest
 
 from fakes import FakeModelsQueue
 
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.goals import Goals
-from CharTyr_MaiWork.approvals import Approvals
-from CharTyr_MaiWork.goal_proposal import GoalProposer
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tasks import Tasks
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.goals import Goals
+from CharTyr_MaiWork.maiwork.approvals import Approvals
+from CharTyr_MaiWork.maiwork.goal_proposal import GoalProposer
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tasks import Tasks
 
 G1 = "900000001"
 G2 = "111222333"
@@ -34,7 +34,7 @@ pytestmark = pytest.mark.asyncio
 
 @pytest.fixture(autouse=True)
 def fixed_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    from CharTyr_MaiWork import clock
+    from CharTyr_MaiWork.maiwork import clock
 
     holding = [NOW]
     monkeypatch.setattr(clock, "now", lambda: holding[0])
@@ -218,7 +218,7 @@ class TestGuards:
         assert models.calls == []
 
     async def test_model_error_does_not_mark_the_day(self, tmp_path) -> None:
-        from CharTyr_MaiWork.models import ModelError
+        from CharTyr_MaiWork.maiwork.models import ModelError
 
         store, settings, models, tasks, goals, approvals, profiles, proposer = _setup(
             tmp_path, replies=[ModelError("端点挂了"), _GOAL_JSON]

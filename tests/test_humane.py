@@ -32,14 +32,14 @@ import pytest
 import pytest_asyncio
 from aiohttp.test_utils import TestClient, TestServer
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.app import MaiWorkApp
-from CharTyr_MaiWork.chatlog import record_messages
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.feeds import Feeds
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.chatlog import record_messages
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.feeds import Feeds
+from CharTyr_MaiWork.maiwork.store import Store
 
-from fakes import FakeCtx, FakeModelsQueue, FakeProfiles
+from fakes import FakeCtx, FakeModelsQueue, FakeProfiles, focus_reply
 
 BJ = timezone(timedelta(hours=8))
 NOW = 1_790_000_000.0
@@ -68,7 +68,7 @@ def _seed_group(store: Store, gid: str = GID) -> None:
 
 class _TimePatch:
     def __enter__(self):
-        import CharTyr_MaiWork.feeds as feeds_mod
+        import CharTyr_MaiWork.maiwork.feeds as feeds_mod
 
         self._mod = feeds_mod
         self._orig = feeds_mod.clock.now
@@ -112,21 +112,23 @@ class FakeHostCfg:
 
 
 def _ok_report(data: dict) -> Any:
-    from CharTyr_MaiWork.workers import WorkerReport
+    from CharTyr_MaiWork.maiwork.workers import WorkerReport
 
     return WorkerReport(ok=True, summary="找好了", data=data, evidence=[], steps=3)
 
 
 _QUOTE = "原文里确实写着这件事，摘要能在正文找到依据。"
 
-_FOCUS_JSON = json.dumps(
-    {"focus": [{"query": "FPGA 新动态", "why": "群里在做硬件"}]},
-    ensure_ascii=False,
-)
+# 定关注点现在要求 3–5 个（少于 3 个会触发一次追问重试），统一用 fakes.focus_reply 造
+_FOCUS_JSON = focus_reply("FPGA 新动态", "本地大模型新玩法", "开源掌机社区风向")
 
 _FOCUS_DIVERSE_JSON = json.dumps(
     {
-        "focus": [{"query": "FPGA 新动态", "why": "群里在做硬件"}],
+        "focus": [
+            {"query": "FPGA 新动态", "why": "群里在做硬件", "source": "recent"},
+            {"query": "本地大模型新玩法", "why": "长期兴趣", "source": "long"},
+            {"query": "开源掌机社区风向", "why": "拓展方向", "source": "explore"},
+        ],
         "diverse": {"query": "FPGA 厂商宣传水分", "why": "反方观点：新板子参数存疑"},
     },
     ensure_ascii=False,

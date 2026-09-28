@@ -24,18 +24,18 @@ import pytest
 
 from fakes import FakeCtx, FakeHost, FakeModelsQueue, FakeProfiles, hook_message
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.app import MaiWorkApp
-from CharTyr_MaiWork.approvals import Approvals
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.delivery import Mentions, Pushes
-from CharTyr_MaiWork.goals import Goals
-from CharTyr_MaiWork.host import Msg
-from CharTyr_MaiWork.intake import Intake, Signals
-from CharTyr_MaiWork.outbox import Outbox
-from CharTyr_MaiWork.profile import Profiles, _parse_bj_when
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tasks import Tasks
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.approvals import Approvals
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.delivery import Mentions, Pushes
+from CharTyr_MaiWork.maiwork.goals import Goals
+from CharTyr_MaiWork.maiwork.host import Msg
+from CharTyr_MaiWork.maiwork.intake import Intake, Signals
+from CharTyr_MaiWork.maiwork.outbox import Outbox
+from CharTyr_MaiWork.maiwork.profile import Profiles, _parse_bj_when
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tasks import Tasks
 
 GID = "900000001"
 # 2026-09-26 06:05 UTC = 北京时间 14:05（周六）

@@ -9,9 +9,9 @@ from typing import Any
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.admin_chat import AdminChat, ChatBusy
-from CharTyr_MaiWork.models import ChatResult
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.admin_chat import AdminChat, ChatBusy
+from CharTyr_MaiWork.maiwork.models import ChatResult
 
 from test_admin_chat import G1, SECRET, _Models, _Svc, _res
 
@@ -111,7 +111,7 @@ class TestManualCompact:
     @pytest.mark.asyncio
     async def test_compact_model_error_becomes_friendly_valueerror(self, tmp_path: Path) -> None:
         """整理时模型连不上：给网页一句能看懂的 400，而不是 500「服务器出错了」；也不留半截摘要。"""
-        from CharTyr_MaiWork.models import ModelError
+        from CharTyr_MaiWork.maiwork.models import ModelError
 
         svc = _Svc(tmp_path, models=_Models(script=[ModelError("网络错误（ConnectError）")]))
         chat = AdminChat(svc)
@@ -141,7 +141,7 @@ class TestServerRoute:
     @pytest.mark.asyncio
     async def test_compact_route_and_busy_409(self, tmp_path: Path) -> None:
         """POST /api/chat/{id}/compact：没错返回 summary；忙时 409。"""
-        from CharTyr_MaiWork.console.server import AUTH_KEY, create_app
+        from CharTyr_MaiWork.maiwork.console.server import AUTH_KEY, create_app
         from tests.test_admin_chat_routes import _FakeStore, _Settings
         from aiohttp.test_utils import TestClient, TestServer
         import aiohttp
@@ -180,7 +180,7 @@ class TestServerRoute:
         await client.start_server()
         try:
             auth = app[AUTH_KEY]
-            from CharTyr_MaiWork.console.auth import COOKIE_NAME
+            from CharTyr_MaiWork.maiwork.console.auth import COOKIE_NAME
             value, _max_age = auth.make_cookie()
             client.session.cookie_jar.update_cookies({COOKIE_NAME: value})
 

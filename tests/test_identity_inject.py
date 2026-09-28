@@ -19,11 +19,11 @@ from typing import Any
 
 import pytest
 
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.identity import Identity, register_remember_tool
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.identity import Identity, register_remember_tool
+from CharTyr_MaiWork.maiwork.store import Store
 
-from fakes import FakeModelsQueue
+from fakes import FakeModelsQueue, focus_reply
 
 pytestmark = pytest.mark.asyncio
 
@@ -73,7 +73,7 @@ class _NoTopics:
 
 async def test_feeds_write_posts_uses_soul_when_present(tmp_path: Path) -> None:
     """有 SOUL：写帖子的提示词带「## MaiWork 的身份」+ SOUL 内容，不再带「你（MaiBot）的人设」。"""
-    from CharTyr_MaiWork.feeds import Feeds
+    from CharTyr_MaiWork.maiwork.feeds import Feeds
 
     store, profiles = _feeds_fixtures(tmp_path)
     identity = await _identity(tmp_path, store)
@@ -93,7 +93,7 @@ async def test_feeds_write_posts_uses_soul_when_present(tmp_path: Path) -> None:
 
 async def test_feeds_write_posts_falls_back_without_soul(tmp_path: Path) -> None:
     """SOUL 为空：回落原人设逻辑（host.config）——老行为不能变。"""
-    from CharTyr_MaiWork.feeds import Feeds
+    from CharTyr_MaiWork.maiwork.feeds import Feeds
 
     store, profiles = _feeds_fixtures(tmp_path)
     settings = _settings()
@@ -113,7 +113,7 @@ async def test_feeds_write_posts_falls_back_without_soul(tmp_path: Path) -> None
 
 async def test_feeds_focus_and_score_and_idea_inject_memory(tmp_path: Path) -> None:
     """定关注点 / 打分 / 构想提示带「## 工作记忆（全局）」和本群那份；别的群的不带。"""
-    from CharTyr_MaiWork.feeds import Feeds
+    from CharTyr_MaiWork.maiwork.feeds import Feeds
 
     store, profiles = _feeds_fixtures(tmp_path)
     identity = await _identity(tmp_path, store)
@@ -122,8 +122,9 @@ async def test_feeds_focus_and_score_and_idea_inject_memory(tmp_path: Path) -> N
     identity.group_write(GID_OTHER, "- 别群的秘密经验")
     settings = _settings()
     models = FakeModelsQueue(ready=True, replies=[
-        '{"focus": [{"query": "q1", "why": "w"}]}',  # _plan_focus
-        '{"scores": []}',  # _score
+        focus_reply("q1", "q2", "q3"),  # _plan_focus（给 3 个免得触发追问重试）
+        # _score（给一条对得上的：打分分批后「一条都没对上」算失败会抛错）
+        '{"scores": [{"i": 0, "info": 3, "source": 3, "relevance": 3, "timeliness": 3, "chat": 3}]}',
         '{"idea": null}',  # make_idea
     ])
     feeds = Feeds(store, models, None, profiles, _NoTopics(), lambda: settings, identity=identity)
@@ -150,8 +151,8 @@ async def test_feeds_focus_and_score_and_idea_inject_memory(tmp_path: Path) -> N
 
 async def test_topics_opener_injects_soul(tmp_path: Path) -> None:
     """开场白提示带「## MaiWork 的身份」+ SOUL 内容。"""
-    from CharTyr_MaiWork.delivery import Mentions, Pushes
-    from CharTyr_MaiWork.topics import Topics
+    from CharTyr_MaiWork.maiwork.delivery import Mentions, Pushes
+    from CharTyr_MaiWork.maiwork.topics import Topics
     from fakes import FakeHost, FakeProfiles, SignalsStub
 
     store = Store(tmp_path / "t.db")
@@ -182,7 +183,7 @@ async def test_topics_opener_injects_soul(tmp_path: Path) -> None:
 
 async def test_workers_system_prompt_carries_agents(tmp_path: Path) -> None:
     """子 agent 的 system 提示带 AGENTS 规矩（## 做事规矩 + 内容）。"""
-    from CharTyr_MaiWork.workers import _system_prompt
+    from CharTyr_MaiWork.maiwork.workers import _system_prompt
 
     store = Store(tmp_path / "t.db")
     store.migrate()
@@ -217,11 +218,11 @@ class _CoordSettings:
 
 
 def _coord_fixtures(tmp_path: Path, with_groups: bool = True) -> tuple:
-    from CharTyr_MaiWork.environments.local import LocalEnv
-    from CharTyr_MaiWork.goals import Goals
-    from CharTyr_MaiWork.tasks import Tasks
-    from CharTyr_MaiWork.tools import Tools
-    from CharTyr_MaiWork.tools_exec import register_exec_tools
+    from CharTyr_MaiWork.maiwork.environments.local import LocalEnv
+    from CharTyr_MaiWork.maiwork.goals import Goals
+    from CharTyr_MaiWork.maiwork.tasks import Tasks
+    from CharTyr_MaiWork.maiwork.tools import Tools
+    from CharTyr_MaiWork.maiwork.tools_exec import register_exec_tools
 
     store = Store(tmp_path / "t.db")
     store.migrate()
@@ -236,7 +237,7 @@ def _coord_fixtures(tmp_path: Path, with_groups: bool = True) -> tuple:
 
 def _new_coordinator(store, models, workers, tools, tasks, goals, env, settings, identity=None):
     from test_coordinator import FakeDelivery, FakeOutbox, _Profiles
-    from CharTyr_MaiWork.coordinator import Coordinator
+    from CharTyr_MaiWork.maiwork.coordinator import Coordinator
 
     kwargs: dict[str, Any] = {}
     if identity is not None:
@@ -364,13 +365,13 @@ async def test_coordinator_remember_round_skipped_without_identity(tmp_path: Pat
 
 async def test_feeds_plan_focus_injects_agents_block(tmp_path: Path) -> None:
     """feeds._plan_focus：提示词带「## 做事规矩」（AGENTS.md）。"""
-    from CharTyr_MaiWork.feeds import Feeds
+    from CharTyr_MaiWork.maiwork.feeds import Feeds
 
     store, profiles = _feeds_fixtures(tmp_path)
     identity = await _identity(tmp_path, store)
     identity.write("agents", "搜索要求：优先官方来源。")
     settings = _settings()
-    models = FakeModelsQueue(ready=True, replies=['{"focus": [{"query": "q1", "why": "w"}]}'])
+    models = FakeModelsQueue(ready=True, replies=[focus_reply("q1", "q2", "q3")])
     feeds = Feeds(store, models, None, profiles, _NoTopics(), lambda: settings, identity=identity)
     await feeds._plan_focus(GID, settings)
     prompt = models.calls[0][1][-1]["content"]
@@ -380,7 +381,7 @@ async def test_feeds_plan_focus_injects_agents_block(tmp_path: Path) -> None:
 
 async def test_personal_plan_focus_injects_agents_block(tmp_path: Path) -> None:
     """personal._plan_focus：提示词带「## 做事规矩」（AGENTS.md）。"""
-    from CharTyr_MaiWork.personal import Personal
+    from CharTyr_MaiWork.maiwork.personal import Personal
 
     store = Store(tmp_path / "t.db")
     store.migrate()

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork.store import Store
 
 
 @pytest.fixture

@@ -17,16 +17,16 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork import coordinator
-from CharTyr_MaiWork.coordinator import Coordinator
-from CharTyr_MaiWork.environments.local import LocalEnv
-from CharTyr_MaiWork.goals import Goals
-from CharTyr_MaiWork.skills import Skills
-from CharTyr_MaiWork.skills_tools import register_skill_tools
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tasks import Tasks
-from CharTyr_MaiWork.tools import Tool, ToolContext, ToolResult, Tools
-from CharTyr_MaiWork.tools_exec import register_exec_tools
+from CharTyr_MaiWork.maiwork import coordinator
+from CharTyr_MaiWork.maiwork.coordinator import Coordinator
+from CharTyr_MaiWork.maiwork.environments.local import LocalEnv
+from CharTyr_MaiWork.maiwork.goals import Goals
+from CharTyr_MaiWork.maiwork.skills import Skills
+from CharTyr_MaiWork.maiwork.skills_tools import register_skill_tools
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tasks import Tasks
+from CharTyr_MaiWork.maiwork.tools import Tool, ToolContext, ToolResult, Tools
+from CharTyr_MaiWork.maiwork.tools_exec import register_exec_tools
 from test_coordinator import (
     FakeDelivery,
     FakeOutbox,

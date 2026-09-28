@@ -13,11 +13,11 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.delivery import Mentions, Pushes
-from CharTyr_MaiWork.outbox import Delivery, Outbox
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.delivery import Mentions, Pushes
+from CharTyr_MaiWork.maiwork.outbox import Delivery, Outbox
+from CharTyr_MaiWork.maiwork.store import Store
 
 GID = "900000001"
 
@@ -102,7 +102,7 @@ class TestServerRedeliverSkips:
         svc = _Svc()
         svc.outbox = ob
         svc.store = store
-        from CharTyr_MaiWork.console.server import ConsoleServer
+        from CharTyr_MaiWork.maiwork.console.server import ConsoleServer
 
         result = ConsoleServer._redeliver_failed(svc, "T-1")
         assert isinstance(result, dict)

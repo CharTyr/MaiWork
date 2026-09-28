@@ -8,15 +8,15 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork import clock, rules
-from CharTyr_MaiWork.approvals import Approvals
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.goals import Goals
-from CharTyr_MaiWork.models import Models
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tasks import Tasks
-from CharTyr_MaiWork.tools import ToolContext, Tools
-from CharTyr_MaiWork.tools_admin import _CHAT_CTX
+from CharTyr_MaiWork.maiwork import clock, rules
+from CharTyr_MaiWork.maiwork.approvals import Approvals
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.goals import Goals
+from CharTyr_MaiWork.maiwork.models import Models
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tasks import Tasks
+from CharTyr_MaiWork.maiwork.tools import ToolContext, Tools
+from CharTyr_MaiWork.maiwork.tools_admin import _CHAT_CTX
 
 G1 = "900000001"
 G2 = "123456789"
@@ -86,7 +86,7 @@ def _pending_rows(store: Store) -> list[dict]:
 def svc(tmp_path: Path) -> _Svc:
     # 门闸的「当前对话 / 已批准指纹」是模块级 ContextVar：每个测试开始时复位，
     # 防止上一个测试任务里的绑定 / 批准泄漏到这个测试（pytest-asyncio 可能复用主任务）
-    from CharTyr_MaiWork.tools_admin import _APPROVED_CTX, _CHAT_CTX, register_admin_tools
+    from CharTyr_MaiWork.maiwork.tools_admin import _APPROVED_CTX, _CHAT_CTX, register_admin_tools
 
     _CHAT_CTX.set((0, 0))
     _APPROVED_CTX.set(None)
@@ -213,7 +213,7 @@ class TestWriteTools:
     def _wire_profiles(self, svc: _Svc) -> None:
         from fakes import FakeHost
 
-        from CharTyr_MaiWork.profile import Profiles
+        from CharTyr_MaiWork.maiwork.profile import Profiles
 
         svc.profiles = Profiles(svc.store, FakeHost(), svc.models, svc.get_settings)
 
@@ -280,7 +280,7 @@ class TestWriteTools:
     async def test_create_task_needs_confirm_then_creates(self, svc: _Svc) -> None:
         """create_task 进了 CONFIRM_TOOLS（任务开工后 coordinator 会自动往群里发消息）：
         同意前只写小票不建任务，同意后才建并开工。真模块端到端版本在 test_tools_admin_real.py。"""
-        from CharTyr_MaiWork.tools_admin import _CHAT_CTX
+        from CharTyr_MaiWork.maiwork.tools_admin import _CHAT_CTX
 
         _bind_chat(svc, cid=900)
         try:
@@ -308,7 +308,7 @@ class TestWriteTools:
     @pytest.mark.asyncio
     async def test_create_goal_needs_confirm_then_creates(self, svc: _Svc) -> None:
         """create_goal 进了 CONFIRM_TOOLS（agent 目标后台检查会往群里发汇报 / 完成话）。"""
-        from CharTyr_MaiWork.tools_admin import _CHAT_CTX
+        from CharTyr_MaiWork.maiwork.tools_admin import _CHAT_CTX
 
         _bind_chat(svc, cid=901)
         try:
@@ -451,7 +451,7 @@ class TestConfirmGate:
 
     @pytest.mark.asyncio
     async def test_rss_remove_queued(self, svc: _Svc) -> None:
-        from CharTyr_MaiWork import rss as _rss
+        from CharTyr_MaiWork.maiwork import rss as _rss
 
         _rss.add_feed(svc.store, G1, url="https://a.com/feed", title="A", feed_id="f1", now=clock.now())
         r = await svc.tools.call("rss_remove", {"group_id": G1, "feed_id": "f1"}, _ctx())
@@ -512,7 +512,7 @@ class _OutboxRec:
 
 def _bind_chat(svc: _Svc, cid: int = 1, gid: str = G1) -> int:
     """建一段真实对话并把门闸绑上去（小票必须有归属，没绑定不写票）。"""
-    from CharTyr_MaiWork.tools_admin import _CHAT_CTX
+    from CharTyr_MaiWork.maiwork.tools_admin import _CHAT_CTX
 
     with svc.store.tx() as conn:
         conn.execute(
@@ -712,7 +712,7 @@ class TestM2ApprovalFingerprint:
     @pytest.mark.asyncio
     async def test_spawned_child_does_not_inherit_approval(self, svc: _Svc) -> None:
         """execute 期间 handler 派出的子任务再调确认类工具：必须写新票，不能免确认。"""
-        from CharTyr_MaiWork.tools import Tool, ToolResult
+        from CharTyr_MaiWork.maiwork.tools import Tool, ToolResult
 
         _bind_chat(svc)
         svc.outbox = _OutboxRec()
@@ -745,7 +745,7 @@ class TestM2ApprovalFingerprint:
     @pytest.mark.asyncio
     async def test_same_tool_different_args_still_needs_confirm(self, svc: _Svc) -> None:
         """同一张票执行时，同工具但参数不一样的再调用也要重新写票。"""
-        from CharTyr_MaiWork.tools import Tool, ToolResult
+        from CharTyr_MaiWork.maiwork.tools import Tool, ToolResult
 
         _bind_chat(svc)
         svc.outbox = _OutboxRec()
@@ -929,7 +929,7 @@ class TestM4MakeIdeaMutex:
         """真 app 的 make_idea_now：同群互斥、登记进 _running_jobs、和定时 idea 互斥。"""
         from fakes import FakeCtx
 
-        from CharTyr_MaiWork.app import MaiWorkApp
+        from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
         raw = {
             "plugin": {"enabled": True},
@@ -975,7 +975,7 @@ class TestM4MakeIdeaMutex:
         """手动的还在跑时，定时巡检到点的 idea 这一轮先不开。"""
         from fakes import FakeCtx
 
-        from CharTyr_MaiWork.app import MaiWorkApp
+        from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
         raw = {
             "plugin": {"enabled": True},
@@ -1166,7 +1166,7 @@ class TestL5ExecuteTimeout:
 
     @pytest.mark.asyncio
     async def test_slow_handler_marks_failed(self, svc: _Svc) -> None:
-        from CharTyr_MaiWork.tools import Tool, ToolResult
+        from CharTyr_MaiWork.maiwork.tools import Tool, ToolResult
 
         async def slow(ctx_, args):
             await asyncio.sleep(5)
@@ -1209,7 +1209,7 @@ class TestGroupSpaceAlbumPath:
 
     @pytest.mark.asyncio
     async def test_groupspace_upload_path_checked(self, tmp_path: Path) -> None:
-        from CharTyr_MaiWork.tools_groupspace import register_groupspace_tools
+        from CharTyr_MaiWork.maiwork.tools_groupspace import register_groupspace_tools
 
         store = Store(tmp_path / "g.db")
         store.migrate()

@@ -19,12 +19,12 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.delivery import Mentions, Pushes
-from CharTyr_MaiWork.herenow import HereNow, HereNowError, _iter_files
-from CharTyr_MaiWork.host import HostError
-from CharTyr_MaiWork.outbox import Delivery, Outbox
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.delivery import Mentions, Pushes
+from CharTyr_MaiWork.maiwork.herenow import HereNow, HereNowError, _iter_files
+from CharTyr_MaiWork.maiwork.host import HostError
+from CharTyr_MaiWork.maiwork.outbox import Delivery, Outbox
+from CharTyr_MaiWork.maiwork.store import Store
 
 pytestmark = pytest.mark.asyncio
 
@@ -275,7 +275,7 @@ class TestFileUploadGuards:
 class TestCoordinatorArtifactSymlinkCheck:
     def test_check_function_flags_outside_symlink(self, tmp_path: Path) -> None:
         """交付前递归检查：目录里含指向工作区外的符号链接 → 返回问题说明（验收按不通过）。"""
-        from CharTyr_MaiWork.coordinator import Coordinator
+        from CharTyr_MaiWork.maiwork.coordinator import Coordinator
 
         secret = _outside(tmp_path)
         art = tmp_path / "art"
@@ -287,7 +287,7 @@ class TestCoordinatorArtifactSymlinkCheck:
         assert "evil.html" in str(problem)
 
     def test_check_function_clean_dir_ok(self, tmp_path: Path) -> None:
-        from CharTyr_MaiWork.coordinator import Coordinator
+        from CharTyr_MaiWork.maiwork.coordinator import Coordinator
 
         art = tmp_path / "art"
         art.mkdir()

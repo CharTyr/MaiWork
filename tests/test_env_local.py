@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.environments.local import LocalEnv
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.environments.local import LocalEnv
 
 ON_MACOS = sys.platform == "darwin"
 
@@ -319,8 +319,8 @@ class TestRunSystemdArgv:
             coro.close()  # 同上：mock 的 create_task 不会调度它
             return mock.MagicMock()
 
-        with mock.patch("CharTyr_MaiWork.environments.local.asyncio.wait_for", side_effect=wait_for_times_out):
-            with mock.patch("CharTyr_MaiWork.environments.local.asyncio.get_running_loop") as get_loop:
+        with mock.patch("CharTyr_MaiWork.maiwork.environments.local.asyncio.wait_for", side_effect=wait_for_times_out):
+            with mock.patch("CharTyr_MaiWork.maiwork.environments.local.asyncio.get_running_loop") as get_loop:
                 created: list[mock.MagicMock] = []
 
                 def create_task_spy(coro):
@@ -670,3 +670,96 @@ class TestSystemdProcessArgv:
         env = _env(tmp_path, mode="systemd")
         env.workspace("ws")
         assert await env.logs("ws", "maiwork-ws-nothing") == ""
+
+
+class TestDynamicUserArgv:
+    """DynamicUser 方式（系统里没建 run_as 用户的 Linux+systemd+root）：
+
+    - 固定单元用户名 maiwork-sbx + StateDirectory=maiwork/workspaces/<工作区名>；
+    - 实际工作区在 /var/lib/private/maiwork/workspaces/<名>；
+    - 插件（root）写进工作区的文件 chown 成 65534:65534（下次单元启动时随 StateDirectory
+      一起修正给该用户——2026-09-28 实测）。
+    """
+
+    def _dyn_env(self, tmp_path: Path, runner=None) -> LocalEnv:
+        from CharTyr_MaiWork.maiwork.environments import capability
+
+        # 工作区根模拟线上的 /var/lib/private/maiwork/workspaces（app 按判定结果换好再传进来）
+        root = tmp_path / "private" / "maiwork" / "workspaces"
+        settings = _settings(root, mode="systemd")
+        decision = capability.Decision(
+            mode="dynamic", ok=True, exec_kind="isolated", unit_user=capability.DYNAMIC_USER,
+            reason="", hint="", log_line="test",
+        )
+        return LocalEnv(lambda: settings, runner=runner, capability=decision)
+
+    @pytest.mark.asyncio
+    async def test_run_argv_dynamic_user(self, tmp_path: Path) -> None:
+        runner, calls = runner_with(exit_code=0, out="ok")
+        env = self._dyn_env(tmp_path, runner=runner)
+        r = await env.run("ws", "echo hi", timeout_s=30)
+        assert r.exit_code == 0
+        argv = calls[0]["argv"]
+        assert argv[0] == "systemd-run"
+        assert "--uid" not in " ".join(argv) and "--gid" not in " ".join(argv)
+        assert "-p DynamicUser=yes" in " ".join(argv)
+        assert "-p User=maiwork-sbx" in " ".join(argv)
+        assert "StateDirectory=maiwork/workspaces/ws" in argv
+        # 系统只读 + StateDirectory 可写；不再用 BindPaths/TemporaryFileSystem 挂工作区
+        assert "ProtectSystem=strict" in argv
+        assert not any(a.startswith("BindPaths=") for a in argv)
+        assert not any(a.startswith("TemporaryFileSystem=") for a in argv)
+        assert "ProtectHome=yes" in argv
+        assert "PrivateTmp=yes" in argv
+        assert "NoNewPrivileges=yes" in argv
+        assert "MemoryMax=512M" in argv and "MemorySwapMax=0" in argv
+        assert "RuntimeMaxSec=30" in argv
+        ws = str((tmp_path / "private" / "maiwork" / "workspaces" / "ws").resolve())
+        assert f"WorkingDirectory={ws}" in argv
+        # HOME 也指到工作区实际路径（单元里 HOME=工作区）
+        assert f"--setenv=HOME={ws}" in argv
+
+    @pytest.mark.asyncio
+    async def test_start_argv_dynamic_user(self, tmp_path: Path) -> None:
+        runner, calls = runner_with()
+        env = self._dyn_env(tmp_path, runner=runner)
+        unit = await env.start("ws", "python bot.py", label="watcher", timeout_s=600)
+        assert unit == "maiwork-ws-watcher"
+        argv = calls[0]["argv"]
+        assert "-p DynamicUser=yes" in " ".join(argv)
+        assert "-p User=maiwork-sbx" in " ".join(argv)
+        assert "StateDirectory=maiwork/workspaces/ws" in argv
+        ws = str((tmp_path / "private" / "maiwork" / "workspaces" / "ws").resolve())
+        assert f"WorkingDirectory={ws}" in argv
+
+    def test_chown_65534_for_plugin_written_files(self, tmp_path: Path, monkeypatch) -> None:
+        """dynamic 下插件写的工作区文件 chown 65534:65534（本地用假 os.chown 验证意图）。"""
+        chowned: list[tuple[str, int, int]] = []
+        monkeypatch.setattr("os.chown", lambda p, u, g: chowned.append((str(p), u, g)))
+        monkeypatch.setattr("os.geteuid", lambda: 0, raising=False)
+        env = self._dyn_env(tmp_path)
+        env.workspace("ws")
+        assert chowned, "root + dynamic 下建工作区应该 chown"
+        assert all(u == 65534 and g == 65534 for _p, u, g in chowned)
+
+    def test_fixed_still_chowns_run_as(self, tmp_path: Path, monkeypatch) -> None:
+        """固定用户方式不变：root 时 chown 给 run_as 用户（本机没有 maiwork 用户 → 警告跳过）。"""
+        import logging
+
+        monkeypatch.setattr("os.geteuid", lambda: 0, raising=False)
+        recs: list[logging.LogRecord] = []
+
+        class H(logging.Handler):
+            def emit(self, record):
+                recs.append(record)
+
+        logger = logging.getLogger("maiwork.environments.local")
+        h = H()
+        logger.addHandler(h)
+        try:
+            settings = _settings(tmp_path, mode="systemd")
+            env = LocalEnv(lambda: settings)
+            env.workspace("ws")
+        finally:
+            logger.removeHandler(h)
+        assert any("没有用户" in r.getMessage() for r in recs)

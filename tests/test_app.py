@@ -12,7 +12,7 @@ import pytest
 
 from fakes import FakeCtx, FakeProfiles, hook_message
 
-from CharTyr_MaiWork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 from CharTyr_MaiWork.plugin import MaiWorkPlugin, create_plugin
 
 G1 = "900000001"
@@ -254,7 +254,7 @@ class TestLoop:
 
 def _plugin_config(**overrides) -> dict:
     """按宿主的方式生成完整默认配置，再叠测试要改的节（带 config_version）。"""
-    from CharTyr_MaiWork.config import MaiWorkConfig
+    from CharTyr_MaiWork.maiwork.config import MaiWorkConfig
 
     raw = MaiWorkConfig().model_dump(mode="python")
     for section, values in overrides.items():
@@ -295,6 +295,49 @@ class TestPluginWiring:
         assert _port_open(P2)
         await p.on_unload()
         assert not _port_open(P2)
+
+    @pytest.mark.asyncio
+    async def test_no_host_ctx_does_not_start_app(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """没有宿主 ctx（极端情况：测试直接建插件）→ 不启动 app，只记日志。
+
+        插件本体照常加载，on_unload 也不炸。以前这里塞了个动态属性替身
+        （__getattr__ 返回一个什么都抛的协程）绕源码扫描，审核不接受，已删。
+        """
+        p = _plugin(monkeypatch, tmp_path)
+        p.set_plugin_config(
+            _plugin_config(
+                plugin={"enabled": True},
+                groups={"serve": [{"group": f"qq:{G1}"}]},
+                console={"listen": f"127.0.0.1:{P2}", "password": "x"},
+            )
+        )
+        # 故意不调 _set_context（self._ctx 保持 None）
+        await p.on_load()
+        assert p._app is None
+        assert not _port_open(P2)  # 网页端口都没开
+        # 钩子照旧安全返回
+        assert await p.maiwork_intake(message={"message_info": {}}) == {"action": "continue"}
+        await p.on_unload()  # 不炸
+
+    @pytest.mark.asyncio
+    async def test_config_update_without_ctx_does_not_start_app(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """热更新把插件从关到开、但还没有 ctx → 同样不启动，不炸。"""
+        p = _plugin(monkeypatch, tmp_path)
+        p.set_plugin_config(_plugin_config(plugin={"enabled": False}))
+        await p.on_load()
+        await p.on_config_update(
+            "self",
+            _plugin_config(
+                plugin={"enabled": True},
+                console={"listen": f"127.0.0.1:{P3}", "password": "x"},
+                groups={"serve": [{"group": f"qq:{G1}"}]},
+            ),
+            "0.1.0",
+        )
+        assert p._app is None
+        assert not _port_open(P3)
 
     @pytest.mark.asyncio
     async def test_on_load_exception_does_not_propagate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -478,7 +521,7 @@ class TestM3IdeaHooks:
     def _insert_idea(self, app: MaiWorkApp, gid: str = G1, *, items: list | None = None) -> int:
         import json as _json
 
-        from CharTyr_MaiWork import clock
+        from CharTyr_MaiWork.maiwork import clock
 
         with app.store.tx() as conn:
             cur = conn.execute(
@@ -673,7 +716,7 @@ class TestM3IdeaHooks:
 
 class TestReminderParse:
     def test_parse_ok(self) -> None:
-        from CharTyr_MaiWork.app import _parse_reminder_json
+        from CharTyr_MaiWork.maiwork.app import _parse_reminder_json
 
         now = 1_790_000_000.0
         out = _parse_reminder_json(
@@ -682,7 +725,7 @@ class TestReminderParse:
         assert out == {"title": "吃药", "due_ts": now + 600, "remind_ts": now + 500}
 
     def test_parse_ok_false_and_garbage(self) -> None:
-        from CharTyr_MaiWork.app import _parse_reminder_json
+        from CharTyr_MaiWork.maiwork.app import _parse_reminder_json
 
         now = 1_790_000_000.0
         assert _parse_reminder_json('{"ok": false}', now) is None
@@ -692,7 +735,7 @@ class TestReminderParse:
         assert _parse_reminder_json(f'{{"ok": true, "title": "x", "due_ts": {now - 3600}}}', now) is None
 
     def test_remind_ts_defaults_to_due_ts(self) -> None:
-        from CharTyr_MaiWork.app import _parse_reminder_json
+        from CharTyr_MaiWork.maiwork.app import _parse_reminder_json
 
         now = 1_790_000_000.0
         out = _parse_reminder_json(f'{{"ok": true, "title": "吃药", "due_ts": {now + 600}}}', now)
@@ -835,7 +878,7 @@ class TestM3Loop:
                 G2, kind="task", title="旧请求二", quote="", via="群里 @",
                 requester_id="20003", requester_name="老八",
             )
-            from CharTyr_MaiWork import clock
+            from CharTyr_MaiWork.maiwork import clock
 
             t = clock.now()
             with app.store.tx() as conn:
@@ -872,7 +915,7 @@ class TestM3Loop:
         app.coordinator_factory = lambda *a, **kw: coord
         await app.start()
         try:
-            from CharTyr_MaiWork import clock
+            from CharTyr_MaiWork.maiwork import clock
 
             t = clock.now()
             mid = app.goals.create_member(
@@ -912,7 +955,7 @@ class TestM3Loop:
             tid = app.tasks.create(G1, title="等回答的活", req="", criteria=[], source="test", status="queued")
             app.tasks.transition(tid, "running")
             app.tasks.transition(tid, "waiting_input", question="预算多少？", question_ts=1.0)
-            from CharTyr_MaiWork import clock
+            from CharTyr_MaiWork.maiwork import clock
 
             t = clock.now()
             with app.store.tx() as conn:
@@ -930,7 +973,7 @@ class TestM3Loop:
             tid = app.tasks.create(G1, title="等回答的活", req="", criteria=[], source="test", status="queued")
             app.tasks.transition(tid, "running")
             app.tasks.transition(tid, "waiting_input", question="预算多少？", question_ts=1.0)
-            from CharTyr_MaiWork import clock
+            from CharTyr_MaiWork.maiwork import clock
 
             t = clock.now()
             with app.store.tx() as conn:
@@ -1002,7 +1045,7 @@ class TestM3Loop:
         app.coordinator_factory = lambda *a, **kw: coord
         await app.start()
         try:
-            from CharTyr_MaiWork import clock
+            from CharTyr_MaiWork.maiwork import clock
 
             t = clock.now()
             gid_goal = app.goals.create_agent(G1, title="盯着铝价", body="", criteria=[], by_text="管理员 发起")
@@ -1343,7 +1386,7 @@ class TestRailwayWiring:
     @pytest.mark.asyncio
     async def test_railway_on_wires_verify_runner_and_vm_tools(self, tmp_path: Path) -> None:
         """railway=true：建 RailwayEnv、注册 vm 工具、Feeds 拿到非 None 的 verify_runner。"""
-        from CharTyr_MaiWork.console.views import settings_view
+        from CharTyr_MaiWork.maiwork.console.views import settings_view
 
         captured, factory = _capture_feeds_kwargs()
         app = _app(tmp_path)  # 没写 [environments] → railway 默认 true
@@ -1365,7 +1408,7 @@ class TestRailwayWiring:
     @pytest.mark.asyncio
     async def test_railway_off_no_runner_and_no_vm_tools(self, tmp_path: Path) -> None:
         """railway=false：不建 RailwayEnv、不注册 vm 工具、Feeds 的 verify_runner 是 None。"""
-        from CharTyr_MaiWork.console.views import settings_view
+        from CharTyr_MaiWork.maiwork.console.views import settings_view
 
         captured, factory = _capture_feeds_kwargs()
         raw = _raw(tmp_path / "data")
@@ -1451,7 +1494,7 @@ class TestDirectAwaitChatUsesRetries1:
         import ast
         import inspect
 
-        from CharTyr_MaiWork import topics as topics_mod
+        from CharTyr_MaiWork.maiwork import topics as topics_mod
 
         tree = ast.parse(inspect.getsource(topics_mod))
         chat_calls = [

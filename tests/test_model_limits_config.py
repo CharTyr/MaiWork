@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import pytest
 
-import CharTyr_MaiWork.models as mm
-from CharTyr_MaiWork.models import ModelError
+import CharTyr_MaiWork.maiwork.models as mm
+from CharTyr_MaiWork.maiwork.models import ModelError
 
 from test_models import SECRET, FakeEndpoint, _chat_payload, _patch
 from test_model_retry import _make

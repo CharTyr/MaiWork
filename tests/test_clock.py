@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from CharTyr_MaiWork.clock import BJ, bj, day_key, in_range, now, parse_hhmm_range
+from CharTyr_MaiWork.maiwork.clock import BJ, bj, day_key, in_range, now, parse_hhmm_range
 
 
 def _utc(y, mo, d, h, mi, s=0) -> float:

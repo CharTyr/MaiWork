@@ -18,13 +18,13 @@ import pytest
 
 from fakes import FakeCoordinator, FakeCtx, FakeProfiles, hook_message
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.app import MaiWorkApp
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.coordinator import Coordinator
-from CharTyr_MaiWork.intake import Intake, Signals
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tasks import Tasks
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.coordinator import Coordinator
+from CharTyr_MaiWork.maiwork.intake import Intake, Signals
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tasks import Tasks
 
 pytestmark = pytest.mark.asyncio
 

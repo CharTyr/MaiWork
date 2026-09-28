@@ -12,12 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.host import Msg
-from CharTyr_MaiWork.models import ModelError
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.profile import Profiles
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.host import Msg
+from CharTyr_MaiWork.maiwork.models import ModelError
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.profile import Profiles
 
 from fakes import FakeHost, FakeModelsQueue
 

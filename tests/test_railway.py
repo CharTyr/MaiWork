@@ -18,10 +18,10 @@ from typing import Any
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.environments.railway import Box, RailwayEnv
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.environments.railway import Box, RailwayEnv
+from CharTyr_MaiWork.maiwork.store import Store
 
 BJ = timezone(timedelta(hours=8))
 NOW = 1_790_000_000.0
@@ -425,8 +425,8 @@ class TestFileOps:
 
 
 async def _tools_with_box(tmp_path: Path, box: Box | None):
-    from CharTyr_MaiWork.tools import Tools
-    from CharTyr_MaiWork.tools_railway import register_vm_tools
+    from CharTyr_MaiWork.maiwork.tools import Tools
+    from CharTyr_MaiWork.maiwork.tools_railway import register_vm_tools
 
     store = Store(tmp_path / "tools.db")
     store.migrate()
@@ -437,7 +437,7 @@ async def _tools_with_box(tmp_path: Path, box: Box | None):
     class FakeRailEnv:
         async def run(self, _box, command, *, timeout_s):
             env_calls.append({"cmd": command, "timeout_s": timeout_s})
-            from CharTyr_MaiWork.environments.local import RunResult
+            from CharTyr_MaiWork.maiwork.environments.local import RunResult
 
             return RunResult(exit_code=0, stdout="OUT", stderr="ERR", ms=5, timed_out=False, oom=False)
 
@@ -457,7 +457,7 @@ class TestVmTools:
     async def test_vm_run_passes_command_and_caps_timeout(self, tmp_path: Path) -> None:
         box = Box(job_id="j", key_path=tmp_path / "id", expires_ts=NOW + 3600, preview_url="")
         tools, _store, env_calls = await _tools_with_box(tmp_path, box)
-        from CharTyr_MaiWork.tools import ToolContext
+        from CharTyr_MaiWork.maiwork.tools import ToolContext
 
         ctx = ToolContext(group_id="111", actor="子 agent", role="worker")
         r = await tools.call("vm_run", {"command": "ls -la /app", "timeout_s": 600}, ctx)
@@ -473,7 +473,7 @@ class TestVmTools:
     @pytest.mark.asyncio
     async def test_vm_run_without_box_fails_chinese(self, tmp_path: Path) -> None:
         tools, _store, _ = await _tools_with_box(tmp_path, None)
-        from CharTyr_MaiWork.tools import ToolContext
+        from CharTyr_MaiWork.maiwork.tools import ToolContext
 
         ctx = ToolContext(group_id="111", actor="子 agent", role="worker")
         r = await tools.call("vm_run", {"command": "ls"}, ctx)
@@ -484,7 +484,7 @@ class TestVmTools:
     async def test_vm_roles_worker_only(self, tmp_path: Path) -> None:
         box = Box(job_id="j", key_path=tmp_path / "id", expires_ts=NOW + 3600, preview_url="")
         tools, _store, _ = await _tools_with_box(tmp_path, box)
-        from CharTyr_MaiWork.tools import ToolContext
+        from CharTyr_MaiWork.maiwork.tools import ToolContext
 
         main_ctx = ToolContext(group_id="111", actor="主模型", role="main")
         r = await tools.call("vm_run", {"command": "ls"}, main_ctx)
@@ -495,7 +495,7 @@ class TestVmTools:
         """只许传工作区里的一个文件，落 VM 的 /app 下；越界（..、绝对路径）拒。"""
         box = Box(job_id="j", key_path=tmp_path / "id", expires_ts=NOW + 3600, preview_url="")
         tools, _store, env_calls = await _tools_with_box(tmp_path, box)
-        from CharTyr_MaiWork.tools import ToolContext
+        from CharTyr_MaiWork.maiwork.tools import ToolContext
 
         ws = tmp_path / "wsa"
         ws.mkdir()
@@ -512,7 +512,7 @@ class TestVmTools:
     async def test_vm_read_file(self, tmp_path: Path) -> None:
         box = Box(job_id="j", key_path=tmp_path / "id", expires_ts=NOW + 3600, preview_url="")
         tools, _store, env_calls = await _tools_with_box(tmp_path, box)
-        from CharTyr_MaiWork.tools import ToolContext
+        from CharTyr_MaiWork.maiwork.tools import ToolContext
 
         ctx = ToolContext(group_id="111", actor="子 agent", role="worker")
         r = await tools.call("vm_read_file", {"path": "/app/job.log"}, ctx)
@@ -523,8 +523,8 @@ class TestVmTools:
     @pytest.mark.asyncio
     async def test_vm_read_file_truncates_at_20000(self, tmp_path: Path) -> None:
         """读 VM 文件超过 20000 字截断（带提示）。"""
-        from CharTyr_MaiWork.tools import ToolContext, Tools
-        from CharTyr_MaiWork.tools_railway import register_vm_tools
+        from CharTyr_MaiWork.maiwork.tools import ToolContext, Tools
+        from CharTyr_MaiWork.maiwork.tools_railway import register_vm_tools
 
         store = Store(tmp_path / "t2.db")
         store.migrate()

@@ -12,12 +12,12 @@ import pytest
 
 from fakes import FakeCoordinator, FakeHost
 
-from CharTyr_MaiWork.approvals import Approvals
-from CharTyr_MaiWork.commands import Commands
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.goals import Goals
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tasks import Tasks
+from CharTyr_MaiWork.maiwork.approvals import Approvals
+from CharTyr_MaiWork.maiwork.commands import Commands
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.goals import Goals
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tasks import Tasks
 
 G1 = "900000001"
 ADMIN = "10001"

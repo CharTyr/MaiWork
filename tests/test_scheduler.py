@@ -16,9 +16,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.scheduler import Scheduler
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.scheduler import Scheduler
+from CharTyr_MaiWork.maiwork.store import Store
 
 BJ = timezone(timedelta(hours=8))
 GID = "111"
@@ -176,7 +176,7 @@ def test_done_records_only_today_and_yesterday(tmp_path) -> None:
         sched.done(GID, "news", day1 + i * 86400)
     got = store.kv_get(f"sched.{GID}.news")
     assert isinstance(got, list)
-    from CharTyr_MaiWork import clock
+    from CharTyr_MaiWork.maiwork import clock
 
     # 最后一次 done 的「当天」是 D+3；只留 D+2 和 D+3
     day3 = day1 + 2 * 86400
@@ -243,7 +243,7 @@ def test_idea_day_key_uses_beijing(tmp_path) -> None:
     # done 直接写；第二天 00:30（还在北京第二天）可以再报吗？——00:30 在窗外，不报；
     # 用 done 的 kv 验证日期键：北京 day 是 D 日
     sched.done(GID, "idea", late)
-    from CharTyr_MaiWork import clock
+    from CharTyr_MaiWork.maiwork import clock
 
     assert clock.day_key(late) == f"{Y}-{'%02d' % M}-{'%02d' % D}"
 

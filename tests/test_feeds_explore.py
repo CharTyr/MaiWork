@@ -27,18 +27,18 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-from CharTyr_MaiWork.chatlog import _RESULT_TEXT_MAX, recent_chat, record_messages
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.feeds import Feeds
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork.chatlog import _RESULT_TEXT_MAX, recent_chat, record_messages
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.feeds import Feeds
+from CharTyr_MaiWork.maiwork.store import Store
 
-from fakes import FakeModelsQueue, FakeProfiles
+from fakes import FakeModelsQueue, FakeProfiles, focus_reply
 
 NOW = 1_790_000_000.0
 GID = "111"
 GID_B = "555666777"
 
-_FOCUS_JSON = json.dumps({"focus": [{"query": "FPGA 新动态", "why": "群里在做硬件"}]}, ensure_ascii=False)
+_FOCUS_JSON = focus_reply("FPGA 新动态", "本地大模型新玩法", "开源掌机社区风向")
 
 
 def _run(coro):
@@ -54,7 +54,7 @@ class _TimePatch:
     """feeds.clock.now 固定为 NOW（chatlog 和 feeds 共用同一个 clock 模块）。"""
 
     def __enter__(self):
-        import CharTyr_MaiWork.feeds as feeds_mod
+        import CharTyr_MaiWork.maiwork.feeds as feeds_mod
 
         self._mod = feeds_mod
         self._orig = feeds_mod.clock.now
@@ -99,7 +99,7 @@ class FakeTopics:
 
 
 def _ok_report(data: dict) -> Any:
-    from CharTyr_MaiWork.workers import WorkerReport
+    from CharTyr_MaiWork.maiwork.workers import WorkerReport
 
     return WorkerReport(ok=True, summary="找好了", data=data, evidence=[], steps=3)
 
@@ -281,12 +281,14 @@ class TestPlanFocusPrompt:
     def test_prompt_lists_focus_hist_after_success(self, tmp_path: Path) -> None:
         store, settings, feeds, models, *_r = _feeds(tmp_path, replies=[])
         models.reply_queue = [
-            json.dumps({"focus": [{"query": "上一轮找的方向", "why": "w", "source": "recent"}]}, ensure_ascii=False),
-            json.dumps({"focus": [{"query": "这一轮换个方向", "why": "w", "source": "explore"}]}, ensure_ascii=False),
+            # 第一轮一次回够 3 个（不触发追问重试），第二轮的提示词该带上轮的方向
+            focus_reply("上一轮找的方向", "上一轮另一个方向", "上一轮第三个方向"),
+            focus_reply("这一轮换个方向", "这一轮再换个方向", "这一轮第三个方向"),
         ]
         with _TimePatch():
             _run(feeds._plan_focus(GID, settings))
             _run(feeds._plan_focus(GID, settings))
+        assert len(models.calls) == 2  # 两轮各调一次（都没重试）
         prompt2 = _prompt(models, 1)
         assert "最近几轮已经找过的方向" in prompt2
         assert "上一轮找的方向" in prompt2
@@ -311,13 +313,29 @@ class TestPlanFocusPrompt:
         assert [f["source"] for f in focus] == ["recent", "long", "explore", "", ""]
         assert all("source" in f for f in focus)
 
-    def test_single_focus_is_ok(self, tmp_path: Path) -> None:
-        reply = json.dumps({"focus": [{"query": "只有一个方向", "why": "w"}]}, ensure_ascii=False)
-        store, settings, feeds, models, *_r = _feeds(tmp_path, replies=[reply])
+    def test_single_focus_retries_once_and_uses_retry(self, tmp_path: Path) -> None:
+        """第一回只给 1 个 → 触发一次追问重试；重试给 3 个就用 3 个（新语义 2026-11）。"""
+        store, settings, feeds, models, *_r = _feeds(tmp_path, replies=[
+            focus_reply("只有一个方向"),
+            focus_reply("重试方向A", "重试方向B", "重试方向C"),
+        ])
         with _TimePatch():
             focus = _run(feeds._plan_focus(GID, settings))
-        assert len(focus) == 1
-        assert focus[0]["query"] == "只有一个方向"
+        assert len(models.calls) == 2  # 一次原调 + 一次追问重试
+        assert [f["query"] for f in focus] == ["只有一个方向", "重试方向A", "重试方向B", "重试方向C"]
+
+    def test_single_focus_twice_keeps_single_after_one_retry(self, tmp_path: Path) -> None:
+        """两回都只给 1 个：只重试一次，就用手头这 1 个继续跑，不再重试、不报错。"""
+        no_source = lambda q: json.dumps({"focus": [{"query": q, "why": "w"}]}, ensure_ascii=False)
+        store, settings, feeds, models, *_r = _feeds(tmp_path, replies=[
+            no_source("只有一个方向"),
+            no_source("换了一个方向"),
+        ])
+        with _TimePatch():
+            focus = _run(feeds._plan_focus(GID, settings))
+        assert len(models.calls) == 2  # 只重试一次
+        # 两次结果按 query 去重合并（新语义）：手头两份不同的都留着
+        assert [f["query"] for f in focus] == ["只有一个方向", "换了一个方向"]
         assert focus[0]["source"] == ""
         assert focus[0]["angle"] == ""
 
@@ -399,10 +417,7 @@ class TestCollectBrief:
 class TestExploreEndToEnd:
     def test_explore_item_stored_with_angle(self, tmp_path: Path) -> None:
         """子 agent 标 explore 的条目过完三道门槛，入库 news_items.angle='explore'。"""
-        focus = json.dumps(
-            {"focus": [{"query": "本地 NAS 备份方案", "why": "长期折腾", "source": "long"}]},
-            ensure_ascii=False,
-        )
+        focus = focus_reply("本地 NAS 备份方案", "本地大模型新玩法", "开源掌机社区风向")
         scores = json.dumps(
             {
                 "scores": [

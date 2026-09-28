@@ -20,10 +20,10 @@ from typing import Any, List
 import pytest
 import pytest_asyncio
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.identity import Identity
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.identity import Identity
+from CharTyr_MaiWork.maiwork.store import Store
 
 GID = "111"
 GID_OTHER = "222"
@@ -433,7 +433,7 @@ async def web_env(tmp_path: Path):
     from aiohttp.test_utils import TestClient, TestServer
 
     from fakes import FakeCtx, FakeProfiles
-    from CharTyr_MaiWork.app import MaiWorkApp
+    from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
     raw = {
         "plugin": {"enabled": True},

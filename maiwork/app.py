@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import secrets
@@ -112,6 +113,13 @@ class MaiWorkApp:
         # 派活自动审核（auto_review.py）：低风险轻活由主模型判断后自动批
         self.auto_review: Any = None
         self.env: Any = None
+        # 本机执行能力判定（environments/capability.py）：启动算一次、记一行中文日志；
+        # fixed=固定用户隔离 / dynamic=自动分配用户隔离 / stopped=本机不能隔离跑命令。
+        self.capability: Any = None
+        # 判定后的实际工作区根（None = 还没判定，get_settings 不套修正）
+        self._ws_root: Path | None = None
+        # 测试注入点：替换探测（默认走 capability.probe 真探测）
+        self.capability_probe: Callable[[str], Any] | None = None
         # 一次性 VM 执行环境（environments/railway.py；railway=false / 模块没就位 → None）
         self.railway: Any = None
         self.outbox: Any = None
@@ -166,15 +174,10 @@ class MaiWorkApp:
     def intake(self) -> Intake | None:
         return self._intake
 
-    def get_settings(self) -> Settings:
-        """各模块用这个方法拿**有效**配置（config.toml + 网页规则覆盖）。
+    def _effective_settings(self) -> Settings:
+        """有效配置（config.toml + 网页规则覆盖），**不**套执行方式判定的工作区根修正。
 
-        Settings 的唯一出口：网页存的 kv["rules.override"] 在这里做一次合并
-        （rules.effective_settings，新对象一层缓存，override 变了才重建），
-        所有模块读到的都是合并后的值——topics 开关关掉下一轮立刻停靠的就是这里。
-        没开库（没启动 / enabled=false）给 config 原值。
-        （2026-10：「全部配置」网页改的直接写 config.toml，走 update_config 热更新
-        到 base Settings，不再有 kv["config.override"] 这一层。）
+        给 _workspace_root_for 用：它要读用户配置的根再决定实际根，套了修正会自循环。
         """
         assert self._settings is not None
         base = self._settings
@@ -193,6 +196,38 @@ class MaiWorkApp:
         merged = _rules.effective_settings(base, override)
         self._effective_cache = (id(base), override, merged)
         return merged
+
+    def get_settings(self) -> Settings:
+        """各模块用这个方法拿**有效**配置（config.toml + 网页规则覆盖 + 实际工作区根）。
+
+        Settings 的唯一出口：网页存的 kv["rules.override"] 在这里做一次合并
+        （rules.effective_settings，新对象一层缓存，override 变了才重建），
+        所有模块读到的都是合并后的值——topics 开关关掉下一轮立刻停靠的就是这里。
+        没开库（没启动 / enabled=false）给 config 原值。
+        （2026-10：「全部配置」网页改的直接写 config.toml，走 update_config 热更新
+        到 base Settings，不再有 kv["config.override"] 这一层。）
+        再套一层「执行方式判定后的工作区根」（启动时算出，见 _detect_local_capability）：
+        dynamic 落在 /var/lib/private/maiwork/workspaces、受限落在数据目录下的 workspaces/。
+        这样 LocalEnv 读写文件、outbox 校验交付路径、coordinator 算成品目录看到的是同一个根。
+        Settings 里两处都要换：environments.workspace_root（LocalEnv 读）和顶层
+        workspace_root（outbox 的交付闸 / 暂存目录读）。
+        """
+        s = self._effective_settings()
+        root = self._ws_root
+        if root is None:
+            return s
+        try:
+            env = s.environments
+            ws = Path(root)
+            if Path(env.workspace_root) == ws and Path(s.workspace_root) == ws:
+                return s
+            return dataclasses.replace(
+                s,
+                workspace_root=ws,
+                environments=dataclasses.replace(env, workspace_root=ws),
+            )
+        except Exception:
+            return s
 
     def base_settings(self) -> Settings:
         """config.toml 的原始配置（不含网页规则覆盖）；只在「和文件值比 / 展示 defaults」时用。"""
@@ -343,12 +378,16 @@ class MaiWorkApp:
         # 这里把判断 spawn 到后台（调模型是慢活，绝不卡住收消息钩子）
         self.auto_review = self._make_auto_review()
         self._wire_auto_review()
+        # 执行方式自动判定：fixed（固定用户隔离）/ dynamic（自动分配用户隔离）/ stopped（受限）
+        self._detect_local_capability()
         self.env = self._make_env()
         try:
             register_exec_tools(
                 self.tools, env=self.env, host=self.host,
                 get_settings=self.get_settings, session_of=self._session_of_group,
             )
+            # 「受限」时不给子 agent 跑命令的工具（文件读写工具保留）
+            self._drop_command_tools_if_stopped(self.tools)
         except Exception:
             logger.exception("注册执行工具出错，子 agent 这次用不了文件 / 命令 / 聊天历史")
         # vm_fetch_file 需要本机 LocalEnv（此刻才建好）；register_vm_tools 逐个幂等，
@@ -691,6 +730,13 @@ class MaiWorkApp:
         self._settings = new_settings
         for p in problems:
             logger.warning("配置问题：%s", p)
+        # 执行方式跟着配置变（run_as / workspace_root）：重判一次，工作区根跟着换
+        # （判定结果变了会记一行中文日志提示要重启才完全生效）
+        try:
+            self._detect_local_capability()
+        except Exception:
+            logger.exception("配置更新后重判本机执行能力出错")
+        self._drop_command_tools_if_stopped(self.tools)
         self._ensure_groups()
         # 配置里删掉的群：残留就地标记（发件 cancelled / 任务 cancelled / 目标 cancelled / 待批 expired）
         try:
@@ -1108,6 +1154,7 @@ class MaiWorkApp:
                 self.store, self.models, self.workers, self.profiles, self.topics,
                 self.get_settings, host=self.host, on_start=self._on_idea_started,
                 verify_runner=self._make_verify_runner(), identity=self.identity,
+                rss_transport=self.rss_transport,
             )
         except Exception:
             logger.exception("建 Feeds 出错，资讯/构想这次跳过")
@@ -1222,14 +1269,84 @@ class MaiWorkApp:
     # M3 接线（docs/07 §11）
     # ------------------------------------------------------------------
 
+    def _detect_local_capability(self) -> Any:
+        """启动时判定一次本机执行能力（记一行中文日志；配置改了下次重判）。
+
+        探测真跑 environments/capability.probe；测试用 capability_probe 注入假判定。
+        """
+        from .environments import capability as _cap
+
+        settings = self.get_settings()
+        run_as = str(getattr(getattr(settings, "environments", None), "run_as", "maiwork") or "maiwork")
+        probe = self.capability_probe or _cap.probe
+        try:
+            dec = probe(run_as)
+        except Exception:
+            logger.exception("本机执行能力探测失败，按「受限」处理")
+            dec = _cap.Decision(
+                mode="stopped", ok=False, exec_kind="plugin", unit_user="",
+                reason="探测失败", hint="本机跑命令的活这次用不了",
+                log_line="本机干活：不能用——探测本机执行能力失败",
+            )
+        old = self.capability
+        self.capability = dec
+        try:
+            self._ws_root = self._workspace_root_for(dec)
+        except Exception:
+            logger.exception("算实际工作区根出错，按配置里的来")
+            self._ws_root = None
+        logger.info("%s", dec.log_line)
+        if old is not None and getattr(old, "mode", "") != dec.mode:
+            logger.info(
+                "本机干活：执行方式从「%s」变成「%s」——起子 agent 的方式要重启插件才完全生效",
+                getattr(old, "mode", ""), dec.mode,
+            )
+        return dec
+
+    def _workspace_root_for(self, dec: Any) -> Path:
+        """按判定结果定工作区根（受限→数据目录下；dynamic→/var/lib/private；fixed→配置）。
+
+        读的是**没套修正**的有效配置（_effective_settings），套了会自循环。
+        """
+        from .environments import capability as _cap
+
+        settings = self._effective_settings()
+        cfg_root = Path(getattr(getattr(settings, "environments", None), "workspace_root", "") or "")
+        data_dir = Path(getattr(settings, "data_dir", "") or ".")
+        return _cap.resolve_workspace_root(cfg_root, dec, data_dir=data_dir)
+
+    def _drop_command_tools_if_stopped(self, tools: Any) -> None:
+        """「受限」（本机不能隔离跑命令）→ 摘掉跑命令类工具，文件工具保留。
+
+        工具一开始按全量注册；判定结果出来后再摘。配置热更新时本函数幂等
+        （unregister 对不存在的名字返回 False），所以每次启动/热更新都安全调用。
+        """
+        cap = self.capability
+        if cap is None or getattr(cap, "ok", False):
+            return
+        for name in ("run_command", "start_process", "check_process", "stop_process"):
+            try:
+                tools.unregister(name)
+            except Exception:
+                logger.exception("摘工具 %s 失败", name)
+
     def _make_env(self) -> Any:
-        """本机执行环境；模块没就位 / 建不起来就 None（网页健康里能看到）。"""
+        """本机执行环境；模块没就位 / 建不起来就 None（网页健康里能看到）。
+
+        先判定执行能力（_detect_local_capability 已跑过，结果在 self.capability）：
+        - fixed/dynamic：LocalEnv(判定) —— 工作区根由 get_settings 统一换成实际根；
+        - stopped：照样建 LocalEnv（工作区在数据目录下，子 agent 读写文件要用），
+          但跑命令类工具随后被 _drop_command_tools_if_stopped 摘掉。
+        """
         factory = self.env_factory
         cls = factory if factory is not None else _import_m2_class("environments.local", "LocalEnv")
         if cls is None:
             return None
         try:
-            return cls(self.get_settings)
+            try:
+                return cls(self.get_settings, capability=self.capability)
+            except TypeError:
+                return cls(self.get_settings)
         except Exception:
             logger.exception("建本机执行环境出错，派活这次跳过")
             return None
@@ -1286,6 +1403,7 @@ class MaiWorkApp:
                 self.goals, self.delivery, self.outbox, self.env, self.profiles,
                 self.get_settings, host=self.host, railway=self.railway,
                 group_space=self.group_space, identity=self.identity,
+                capability=self.capability,
             )
         except Exception:
             logger.exception("建 Coordinator 出错，任务执行这次跳过")

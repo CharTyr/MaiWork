@@ -528,9 +528,16 @@ def _check_workspace_root(value: Any) -> str:
 def _check_local_mode(value: Any) -> str:
     s = str(value or "").strip().lower()
     if s == "direct":
-        raise ValueError('"direct" 没有任何隔离，只给本机开发测试用，只能在 config.toml 文件里改；网页只接受 "systemd"')
+        raise ValueError(
+            '"direct" 没有任何隔离，生产一律按 systemd；只给本机开发测试用——'
+            "config.toml 里写它默认也不生效，要本机设环境变量 MAIWORK_DEV_ALLOW_DIRECT=1；"
+            '网页只接受 "systemd"'
+        )
     if s != "systemd":
-        raise ValueError('本机执行方式网页上只能填 "systemd"（"direct" 无隔离，只能在 config.toml 文件里改）')
+        raise ValueError(
+            '本机执行方式网页上只能填 "systemd"（"direct" 无隔离，config.toml 里写它默认也不生效，'
+            "要本机设 MAIWORK_DEV_ALLOW_DIRECT=1）"
+        )
     return s
 
 
@@ -734,6 +741,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     _F("environments.max_parallel", "同时子 agent 数", "", "int", min=1, max=10),
     _F("environments.command_timeout_s", "子 agent 单条命令默认时长（秒）", "", "int", min=10, max=3600),
     _F("environments.railway_daily_max", "Railway 每日上限", "官方限制每天最多 3 台", "int", min=1, max=3),
+    _F("environments.verify_enabled", "资讯实测（上 VM 试一试）", "挑几条资讯上 Railway 一次性 VM 真跑一遍，结果写进网页", "bool"),
     _F("environments.verify_per_round", "每轮实测条数", "", "int", min=1, max=3),
     _F("environments.verify_minutes", "单条实测时长上限（分钟）", "", "int", min=1, max=60),
 

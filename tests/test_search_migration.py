@@ -14,10 +14,10 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork import config_file
-from CharTyr_MaiWork.migrations import migrate_search_config_to_extension
-from CharTyr_MaiWork.search_binding import get_binding
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import config_file
+from CharTyr_MaiWork.maiwork.migrations import migrate_search_config_to_extension
+from CharTyr_MaiWork.maiwork.search_binding import get_binding
+from CharTyr_MaiWork.maiwork.store import Store
 
 TAVILY_MCP_URL = "https://mcp.third-party.example/mcp"
 
@@ -47,7 +47,7 @@ def store(tmp_path: Path) -> Store:
 
 
 def _add_web_ext(store: Store, name: str, url: str, headers: dict[str, str] | None = None) -> None:
-    from CharTyr_MaiWork import extensions_web
+    from CharTyr_MaiWork.maiwork import extensions_web
 
     entries = extensions_web._web_raw_entries(store)
     entries.append({
@@ -76,7 +76,7 @@ class TestTavilyMcp:
         assert "tvly-迁移密钥-显眼" not in text  # 密钥绝不留文件里
         assert "# 注释别丢" in text
         # 新建了 tavily 扩展（网页来源），密钥进了 secrets
-        from CharTyr_MaiWork import extensions_web
+        from CharTyr_MaiWork.maiwork import extensions_web
 
         entries = extensions_web._web_raw_entries(store)
         assert len(entries) == 1
@@ -99,7 +99,7 @@ class TestTavilyMcp:
         ))
         migrated = migrate_search_config_to_extension(store, plug, tmp_path / "data")
         assert migrated is True
-        from CharTyr_MaiWork import extensions_web
+        from CharTyr_MaiWork.maiwork import extensions_web
 
         entries = extensions_web._web_raw_entries(store)
         assert len(entries) == 1  # 没有新建
@@ -121,7 +121,7 @@ class TestTavilyMcp:
         assert migrate_search_config_to_extension(store, plug, tmp_path / "data") is True
         binding = get_binding(store)
         assert binding["mcp"] == "search1"
-        from CharTyr_MaiWork import extensions_web
+        from CharTyr_MaiWork.maiwork import extensions_web
 
         assert len(extensions_web._web_raw_entries(store)) == 1
 
@@ -175,7 +175,7 @@ class TestOtherProviders:
             'api_key = "tvly-直连密钥"\n'
         ))
         assert migrate_search_config_to_extension(store, plug, tmp_path / "data") is True
-        from CharTyr_MaiWork import extensions_web
+        from CharTyr_MaiWork.maiwork import extensions_web
 
         entries = extensions_web._web_raw_entries(store)
         assert entries[0]["name"] == "tavily"
@@ -191,7 +191,7 @@ class TestOtherProviders:
             'api_key = "exa-密钥"\n'
         ))
         assert migrate_search_config_to_extension(store, plug, tmp_path / "data") is True
-        from CharTyr_MaiWork import extensions_web
+        from CharTyr_MaiWork.maiwork import extensions_web
 
         entries = extensions_web._web_raw_entries(store)
         assert entries[0]["name"] == "exa"
@@ -207,7 +207,7 @@ class TestOtherProviders:
             'api_key = "you-密钥"\n'
         ))
         assert migrate_search_config_to_extension(store, plug, tmp_path / "data") is True
-        from CharTyr_MaiWork import extensions_web
+        from CharTyr_MaiWork.maiwork import extensions_web
 
         entries = extensions_web._web_raw_entries(store)
         assert entries[0]["name"] == "you"
@@ -221,7 +221,7 @@ class TestOtherProviders:
             'provider = "you"\n'
         ))
         assert migrate_search_config_to_extension(store, plug, tmp_path / "data") is True
-        from CharTyr_MaiWork import extensions_web
+        from CharTyr_MaiWork.maiwork import extensions_web
 
         entries = extensions_web._web_raw_entries(store)
         assert entries[0]["url"] == "https://api.you.com/mcp?profile=free"
@@ -248,7 +248,7 @@ class TestNoop:
 
     def test_existing_binding_not_overwritten(self, tmp_path: Path, store: Store) -> None:
         """已经有搜索绑定了（管理员手动配过）→ 不覆盖，但 [search] 段照样清掉。"""
-        from CharTyr_MaiWork.search_binding import set_binding
+        from CharTyr_MaiWork.maiwork.search_binding import set_binding
 
         _add_web_ext(store, "mine", "https://mcp.mine.example/mcp")
         set_binding(store, {"mcp": "mine", "tool": "mine-search", "extract_tool": ""})

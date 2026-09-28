@@ -29,13 +29,13 @@ import pytest
 import pytest_asyncio
 from aiohttp.test_utils import TestClient, TestServer
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.app import MaiWorkApp
-from CharTyr_MaiWork.config import CONFIG_VERSION, load_settings
-from CharTyr_MaiWork.feeds import Feeds, _normalize_domain
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.config import CONFIG_VERSION, load_settings
+from CharTyr_MaiWork.maiwork.feeds import Feeds, _normalize_domain
+from CharTyr_MaiWork.maiwork.store import Store
 
-from fakes import FakeCtx, FakeModelsQueue, FakeProfiles
+from fakes import FakeCtx, FakeModelsQueue, FakeProfiles, focus_reply
 
 BJ = timezone(timedelta(hours=8))
 NOW = 1_790_000_000.0
@@ -66,7 +66,7 @@ class _TimePatch:
     """feeds.clock.now 固定为 NOW（本文件的数据都围着 NOW 造）。"""
 
     def __enter__(self):
-        import CharTyr_MaiWork.feeds as feeds_mod
+        import CharTyr_MaiWork.maiwork.feeds as feeds_mod
 
         self._mod = feeds_mod
         self._orig = feeds_mod.clock.now
@@ -100,15 +100,13 @@ class FakeTopics:
 
 
 def _ok_report(data: dict) -> Any:
-    from CharTyr_MaiWork.workers import WorkerReport
+    from CharTyr_MaiWork.maiwork.workers import WorkerReport
 
     return WorkerReport(ok=True, summary="找好了", data=data, evidence=[], steps=3)
 
 
-_FOCUS_JSON = json.dumps(
-    {"focus": [{"query": "FPGA 新动态", "why": "群里在做硬件"}]},
-    ensure_ascii=False,
-)
+# 定关注点现在要求 3–5 个（少于 3 个会触发一次追问重试），统一用 fakes.focus_reply 造
+_FOCUS_JSON = focus_reply("FPGA 新动态", "本地大模型新玩法", "开源掌机社区风向")
 
 
 def _cand(
@@ -322,9 +320,11 @@ def test_not_fetched_candidates_rejected(tmp_path) -> None:
     assert {r["reject_gate"] for r in hard} == {"hard"}
     for r in hard:
         assert "原文没打开过" in r["reject_reason"]
-    # 打分只招呼到幸存的那 1 条；「有人味」写帖子是第三次模型调用（过第二道门槛的才写）
-    assert len(models.calls) == 3
+    # 打分只招呼到幸存的那 1 条；「有人味」写帖子是第三次模型调用（过第二道门槛的才写）；
+    # 2026-11 起写帖子一回没落着的会补一次重试（本用例队列里没备帖子回复 → 重试也落空回落），所以共 4 次
+    assert len(models.calls) == 4
     assert models.calls[2][2].get("purpose") == "feeds.post"
+    assert models.calls[3][2].get("purpose") == "feeds.post"
     assert "摘要3" in _score_prompt(models)
 
 

@@ -36,14 +36,14 @@ from test_coordinator import (  # noqa: F401  （同目录测试模块互相导�
     _review,
 )
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.coordinator import Coordinator
-from CharTyr_MaiWork.environments.local import LocalEnv
-from CharTyr_MaiWork.goals import Goals
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tasks import Tasks
-from CharTyr_MaiWork.tools import Tools
-from CharTyr_MaiWork.workers import WorkerReport
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.coordinator import Coordinator
+from CharTyr_MaiWork.maiwork.environments.local import LocalEnv
+from CharTyr_MaiWork.maiwork.goals import Goals
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tasks import Tasks
+from CharTyr_MaiWork.maiwork.tools import Tools
+from CharTyr_MaiWork.maiwork.workers import WorkerReport
 
 pytestmark = pytest.mark.asyncio
 
@@ -308,8 +308,8 @@ async def test_review_counts_redirect_final_url_as_opened(mem_store, settings, e
     """
     import httpx
 
-    from CharTyr_MaiWork.tools import ToolContext
-    from CharTyr_MaiWork.tools_builtin import register_builtin
+    from CharTyr_MaiWork.maiwork.tools import ToolContext
+    from CharTyr_MaiWork.maiwork.tools_builtin import register_builtin
 
     tid = _create_task(tasks)
 
@@ -414,7 +414,7 @@ async def test_non_research_task_has_no_link_check(mem_store, settings, env, too
 
 
 async def test_normalize_link_for_check_rules():
-    from CharTyr_MaiWork.coordinator import normalize_link_for_check as norm
+    from CharTyr_MaiWork.maiwork.coordinator import normalize_link_for_check as norm
 
     # http/https 视同、主机名大小写不敏感、去末尾 /、去 fragment、去 utm_*
     assert norm("HTTPS://Example.COM/a/?utm_source=x&keep=1#frag") == norm("http://example.com/a?keep=1")
@@ -425,7 +425,7 @@ async def test_normalize_link_for_check_rules():
 
 
 async def test_extract_http_links_dedup_and_trim():
-    from CharTyr_MaiWork.coordinator import extract_http_links
+    from CharTyr_MaiWork.maiwork.coordinator import extract_http_links
 
     text = (
         "看这两个：https://a.example/x。还有 (https://a.example/x/?utm_source=q#f)，"

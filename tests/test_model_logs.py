@@ -19,10 +19,10 @@ import pytest_asyncio
 
 from aiohttp.test_utils import TestClient, TestServer
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.models import Models
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.models import Models
+from CharTyr_MaiWork.maiwork.store import Store
 
 from test_models import SECRET, FakeEndpoint, _settings, _transport
 
@@ -317,7 +317,7 @@ class _AppSvc:
 @pytest_asyncio.fixture
 async def logs_client(tmp_path):
     """起真 console（假 svc），库里有预置的 model_calls / tool_calls 数据。"""
-    from CharTyr_MaiWork.console.server import ConsoleServer
+    from CharTyr_MaiWork.maiwork.console.server import ConsoleServer
 
     store = Store(tmp_path / "t.db")
     store.migrate()
@@ -386,7 +386,7 @@ class TestModelCallsApi:
     @pytest.mark.asyncio
     async def test_anonymous_401_member_403(self, logs_client, monkeypatch) -> None:
         client, _ = logs_client
-        from CharTyr_MaiWork.console import views as _views
+        from CharTyr_MaiWork.maiwork.console import views as _views
 
         monkeypatch.setattr(_views, "group_id_by_token", lambda _svc, token: G1 if token == "tok-member" else None)
         for path in ("/api/logs/model-calls", "/api/logs/model-calls/1", "/api/logs/tool-calls", "/api/logs/tool-calls/1", "/api/logs/summary"):
@@ -477,7 +477,7 @@ class TestModelCallsApi:
     @pytest.mark.asyncio
     async def test_purpose_map_covers_known(self) -> None:
         """views.PURPOSE_NAMES 把代码里实际出现的 purpose 全列上。"""
-        from CharTyr_MaiWork.console.views import PURPOSE_NAMES
+        from CharTyr_MaiWork.maiwork.console.views import PURPOSE_NAMES
         for p in ("profile.refresh", "feeds.focus", "feeds.score", "feeds.post", "feeds.idea",
                   "feeds.verify_plan", "worker", "coordinator.plan", "coordinator.review",
                   "persona.refresh", "personal.focus", "opener"):

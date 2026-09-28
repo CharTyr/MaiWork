@@ -13,12 +13,12 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.delivery import Mentions, Pushes
-from CharTyr_MaiWork.host import HostError
-from CharTyr_MaiWork.outbox import Delivery, Outbox, report_error
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.delivery import Mentions, Pushes
+from CharTyr_MaiWork.maiwork.host import HostError
+from CharTyr_MaiWork.maiwork.outbox import Delivery, Outbox, report_error
+from CharTyr_MaiWork.maiwork.store import Store
 
 pytestmark = pytest.mark.asyncio
 
@@ -87,7 +87,9 @@ def _make(tmp_path, *, cfg: dict | None = None, herenow=None):
     store = Store(tmp_path / "t.db")
     store.migrate()
     merged = {
-        "environments": {"workspace_root": str(tmp_path / "ws")},
+        # 工作区根目录 = tmp_path；_seed_task 里工作区名是 "ws" → 工作区就是 tmp_path/ws
+        # （交付路径闸要按 <工作区>/artifacts/<task_id>/ 比较，所以这两个得对得上）
+        "environments": {"workspace_root": str(tmp_path)},
         "groups": {"serve": [{"group": f"qq:{GID}"}]},  # flush 只发服务群（S1），测试群必须配上
     }
     if cfg:
@@ -112,6 +114,20 @@ def _seed_task(store: Store, task_id: str = "T-1") -> None:
             " VALUES (?, ?, 'ws', '测试任务', 'completed', 0, 0)",
             (task_id, GID),
         )
+
+
+def _artifact_file(
+    tmp_path, name: str = "报告.html", *, task_id: str = "T-1", text: str = "<html>ok</html>"
+) -> Path:
+    """任务工作区里 artifacts/<task_id>/ 下的成品文件。
+
+    交付路径闸（审核整改 6）要求交付的 path 在这个目录里；工作区 = tmp_path/ws。
+    """
+    d = tmp_path / "ws" / "artifacts" / task_id
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / name
+    f.write_text(text, encoding="utf-8")
+    return f
 
 
 def _rows(store: Store):
@@ -388,14 +404,12 @@ async def test_herenow_success_sends_link_note(tmp_path):
 
 async def test_view_delivery_falls_back_to_group_file(tmp_path):
     """view 首选 herenow；失败自动回落群文件（html 本身）。"""
-    from CharTyr_MaiWork.herenow import HereNowError
+    from CharTyr_MaiWork.maiwork.herenow import HereNowError
 
     hn = FakeHereNow()
     hn.results.append(HereNowError("发布失败：模拟"))
     store, _, host, _, _, ob = _make(tmp_path, herenow=hn)
-    (tmp_path / "ws").mkdir(exist_ok=True)
-    f = tmp_path / "ws" / "报告.html"  # S3 起上传文件必须在 workspace_root 下
-    f.write_text("<html>", encoding="utf-8")
+    f = _artifact_file(tmp_path, "报告.html", text="<html>")  # 交付路径必须在 artifacts/T-1/ 里
     delivery = Delivery(store, ob)
     _seed_task(store)
     await delivery.deliver_task("T-1", kind="view", path=f, name="报告.html", note="报告做好了")
@@ -416,8 +430,7 @@ async def test_file_delivery_falls_back_to_herenow(tmp_path):
     """file 首选群文件；失败回落 here.now 附件页。"""
     hn = FakeHereNow()
     store, _, host, _, _, ob = _make(tmp_path, herenow=hn)
-    f = tmp_path / "数据.csv"
-    f.write_text("a,b\n1,2", encoding="utf-8")
+    f = _artifact_file(tmp_path, "数据.csv", text="a,b\n1,2")
     host.upload_errors.append(HostError("上传失败"))
     delivery = Delivery(store, ob)
     _seed_task(store)
@@ -436,14 +449,13 @@ async def test_file_delivery_falls_back_to_herenow(tmp_path):
 
 async def test_both_channels_failed_sends_final_notice(tmp_path):
     """两条路都失败 → 发兜底说明「成品在 MaiWork 网页里」。"""
-    from CharTyr_MaiWork.herenow import HereNowError
+    from CharTyr_MaiWork.maiwork.herenow import HereNowError
 
     hn = FakeHereNow()
     hn.results.append(HereNowError("发布失败：模拟"))
     hn.results.append(HereNowError("发布失败：还是失败"))
     store, _, host, _, _, ob = _make(tmp_path, herenow=hn)
-    f = tmp_path / "报告.html"
-    f.write_text("<html>", encoding="utf-8")
+    f = _artifact_file(tmp_path, "报告.html", text="<html>")
     host.upload_errors.append(HostError("上传失败"))
     delivery = Delivery(store, ob)
     _seed_task(store)
@@ -465,13 +477,11 @@ async def test_both_channels_failed_sends_final_notice(tmp_path):
 
 async def test_uncertain_does_not_trigger_fallback(tmp_path):
     """超时不确定 → 不回落（可能其实传上去了）。"""
-    from CharTyr_MaiWork.herenow import HereNowError
+    from CharTyr_MaiWork.maiwork.herenow import HereNowError
 
     hn = FakeHereNow()
     store, _, host, _, _, ob = _make(tmp_path, herenow=hn)
-    (tmp_path / "ws").mkdir(exist_ok=True)
-    f = tmp_path / "ws" / "数据.csv"  # S3 起上传文件必须在 workspace_root 下
-    f.write_text("a", encoding="utf-8")
+    f = _artifact_file(tmp_path, "数据.csv", text="a")  # 交付路径必须在 artifacts/T-1/ 里
     host.upload_errors.append(HostError("调用宿主能力超时: api.call"))
     delivery = Delivery(store, ob)
     _seed_task(store)
@@ -512,14 +522,13 @@ async def test_delivery_records_and_undelivered(tmp_path):
 
 
 async def test_undelivered_true_when_all_failed(tmp_path):
-    from CharTyr_MaiWork.herenow import HereNowError
+    from CharTyr_MaiWork.maiwork.herenow import HereNowError
 
     hn = FakeHereNow()
     hn.results.append(HereNowError("失败1"))
     hn.results.append(HereNowError("失败2"))
     store, _, host, _, _, ob = _make(tmp_path, herenow=hn)
-    f = tmp_path / "报告.html"
-    f.write_text("<html>", encoding="utf-8")
+    f = _artifact_file(tmp_path, "报告.html", text="<html>")
     host.upload_errors.append(HostError("上传失败"))
     delivery = Delivery(store, ob)
     _seed_task(store)
@@ -544,8 +553,7 @@ async def test_deliver_task_single_html_file_published_as_index(tmp_path):
     """view 单个 html 文件：临时放进目录当 index.html 发布。"""
     hn = FakeHereNow()
     store, _, host, _, _, ob = _make(tmp_path, herenow=hn)
-    f = tmp_path / "漂亮报告.html"
-    f.write_text("<html>hi</html>", encoding="utf-8")
+    f = _artifact_file(tmp_path, "漂亮报告.html", text="<html>hi</html>")
     delivery = Delivery(store, ob)
     _seed_task(store)
     await delivery.deliver_task("T-1", kind="view", path=f, name="漂亮报告.html", note="看看")
@@ -618,3 +626,66 @@ async def test_herenow_kind_without_herenow_goes_failed(tmp_path):
     ob.enqueue("h1", GID, "herenow", {"dir": str(d), "note": "n", "push_kind": "delivery"})
     await ob.flush(NOON)
     assert _rows(store)[0]["status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# 交付路径第二道闸：path 必须在 <工作区>/artifacts/<task_id>/ 里（审核整改 6）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [".", "tasks/x.txt", "artifacts/T-其他/index.html"],
+)
+async def test_deliver_task_rejects_path_outside_artifact_dir(tmp_path, rel: str):
+    """".", "tasks/..."、"artifacts/别的任务/..." → ValueError，一个条目都不入队。"""
+    store, _, _, _, _, ob = _make(tmp_path)
+    _seed_task(store)
+    delivery = Delivery(store, ob)
+    if rel == ".":
+        target = tmp_path / "ws"
+    else:
+        target = tmp_path / "ws" / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_dir():
+        target.mkdir(parents=True, exist_ok=True)
+    else:
+        target.write_text("<html>别人的</html>", encoding="utf-8")
+    with pytest.raises(ValueError) as ei:
+        await delivery.deliver_task("T-1", kind="view", path=target, name="x", note="x")
+    assert "artifacts" in str(ei.value) or "成品目录" in str(ei.value)
+    assert _rows(store) == []          # 没入队
+    assert store.read().execute("SELECT COUNT(*) c FROM outbox").fetchone()["c"] == 0
+
+
+async def test_deliver_task_rejects_symlink_pointing_outside(tmp_path):
+    """artifacts/<本任务>/link.html 指向工作区外 → 解析后不在成品目录里 → ValueError。"""
+    store, _, _, _, _, ob = _make(tmp_path)
+    _seed_task(store)
+    delivery = Delivery(store, ob)
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("机密", encoding="utf-8")
+    d = tmp_path / "ws" / "artifacts" / "T-1"
+    d.mkdir(parents=True, exist_ok=True)
+    link = d / "link.html"
+    link.symlink_to(outside)
+    with pytest.raises(ValueError):
+        await delivery.deliver_task("T-1", kind="file", path=link, name="link.html", note="x")
+    assert _rows(store) == []
+
+
+async def test_deliver_task_accepts_file_and_dir_inside_artifact_dir(tmp_path):
+    """artifacts/<本任务>/index.html 和整个目录 artifacts/<本任务> → 放行。"""
+    store, _, _, _, _, ob = _make(tmp_path)
+    _seed_task(store, "T-1")
+    _seed_task(store, "T-2")
+    delivery = Delivery(store, ob)
+    f = _artifact_file(tmp_path, "index.html", task_id="T-1")
+    oid1 = await delivery.deliver_task("T-1", kind="view", path=f, name="页面", note="看")
+    d = tmp_path / "ws" / "artifacts" / "T-2"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "index.html").write_text("<html>目录交付</html>", encoding="utf-8")
+    oid2 = await delivery.deliver_task("T-2", kind="view", path=d, name="目录", note="看")
+    rows = _rows(store)
+    assert len(rows) == 2
+    assert rows[0]["id"] == oid1 and rows[1]["id"] == oid2

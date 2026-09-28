@@ -17,8 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork.chatlog import prune_old, record_messages, search_chat
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork.chatlog import prune_old, record_messages, search_chat
+from CharTyr_MaiWork.maiwork.store import Store
 
 GID = "900000001"
 GID_B = "555666777"
@@ -237,8 +237,8 @@ class TestTickWiring:
     """tick 里统计之后：本轮新消息（非机器人、非 [图片]）进 chat_log；14 天旧的清掉。"""
 
     def _profiles(self, store: Store, msgs: list):
-        from CharTyr_MaiWork.config import load_settings
-        from CharTyr_MaiWork.profile import Profiles
+        from CharTyr_MaiWork.maiwork.config import load_settings
+        from CharTyr_MaiWork.maiwork.profile import Profiles
         from fakes import FakeHost, FakeModels
 
         settings, _ = load_settings({"groups": {"serve": [{"group": f"qq:{GID}"}]}})
@@ -246,8 +246,8 @@ class TestTickWiring:
         return Profiles(store, host, FakeModels(ready=False), lambda: settings)
 
     def test_tick_writes_chat_log(self, store: Store, monkeypatch) -> None:
-        from CharTyr_MaiWork import clock as _clock
-        from CharTyr_MaiWork.profile import _BIN_SECONDS
+        from CharTyr_MaiWork.maiwork import clock as _clock
+        from CharTyr_MaiWork.maiwork.profile import _BIN_SECONDS
 
         monkeypatch.setattr(_clock, "now", lambda: NOW)
         msgs = [

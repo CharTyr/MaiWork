@@ -12,8 +12,8 @@ import pytest
 import pytest_asyncio
 from aiohttp.test_utils import TestClient, TestServer
 
-from CharTyr_MaiWork.console.auth import COOKIE_NAME
-from CharTyr_MaiWork.console.server import AUTH_KEY, create_app
+from CharTyr_MaiWork.maiwork.console.auth import COOKIE_NAME
+from CharTyr_MaiWork.maiwork.console.server import AUTH_KEY, create_app
 
 SECRET = "sk-管理员对话测试密钥-绝不该出现在响应里"
 SK_LIKE = "sk-abcdef123456"
@@ -595,7 +595,7 @@ class TestSendAndConfirm:
     @pytest.mark.asyncio
     async def test_confirm_already_decided_409_with_reason(self, env: _Env) -> None:
         """在两个页面各点一次同意：第二次要说「已经处理过了」，不是「不存在」。"""
-        from CharTyr_MaiWork.admin_chat import PendingDecided
+        from CharTyr_MaiWork.maiwork.admin_chat import PendingDecided
 
         await env.login_admin()
         env.chat.confirm_error = PendingDecided("这条待确认动作已经处理过了（approved）")

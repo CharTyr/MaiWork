@@ -312,6 +312,7 @@ class Coordinator:
         railway: Any = None,
         group_space: Any = None,
         identity: Any = None,
+        capability: Any = None,
     ) -> None:
         self._store = store
         self._models = models
@@ -325,6 +326,10 @@ class Coordinator:
         self._profiles = profiles
         self._get_settings = get_settings
         self._host = host
+        # 本机执行能力判定（environments/capability.py 的 Decision；None = 老调用/没判定，
+        # 按「本机能隔离跑命令」处理，行为和以前一样）。ok=False（受限）时本机不跑命令：
+        # 有一次性机器就去机器上做，没有就把话说明白、任务判失败。
+        self._capability = capability
         # 一次性 VM 执行环境（RailwayEnv；None / railway=false → 不提供 railway 选项）
         self._railway = railway
         # 群空间（platforms.qq_onebot.GroupSpace；None = 没开 / 没就位 → 交付前不折腾群空间）
@@ -450,6 +455,29 @@ class Coordinator:
     def _artifact_dir(self, task_id: str) -> str:
         return f"artifacts/{task_id}"
 
+    def _deliver_path_in_task_dir(self, ws_name: str, task_id: str, artifact: str) -> Path | None:
+        """交付路径闸（插件中心审核整改 6）：成品必须在这个任务的成品目录里。
+
+        - 先用 `_env.resolve` 拿本机绝对路径（越界 / 绝对路径 / 符号链接指出去 → PermissionError）；
+        - 再把成品目录 `artifacts/<task_id>/` 也 resolve 出来，要求「解析后的真实路径」等于它
+          或位于它下面；`.`、`tasks/...`、`artifacts/别的任务/...`、指到外面的符号链接都过不去。
+        - 不满足 → 记日志、返回 None（调用方不交付，任务照常 done，和解析失败一个处理）。
+        """
+        try:
+            path = self._env.resolve(ws_name, artifact)
+            base = self._env.resolve(ws_name, self._artifact_dir(task_id))
+            real = Path(path).resolve()
+            real_base = Path(base).resolve()
+        except (PermissionError, ValueError, OSError) as e:
+            logger.warning("交付路径解析失败 %s：%s", artifact, e)
+            return None
+        if real != real_base and real_base not in real.parents:
+            logger.warning(
+                "交付路径不在本任务的成品目录 %s/ 里，不交付：%s", self._artifact_dir(task_id), artifact
+            )
+            return None
+        return real
+
     def _artifact_exists(self, workspace_name: str, artifact: str) -> bool:
         try:
             p = self._env.resolve(workspace_name, str(artifact))
@@ -472,8 +500,19 @@ class Coordinator:
             pass
         return callable(getattr(self._railway, "acquire", None))
 
+    def _local_can_exec(self) -> bool:
+        """本机能不能隔离跑命令（判定 ok；没判定过按能，行为和以前一样）。"""
+        return bool(getattr(getattr(self, "_capability", None), "ok", True))
+
     def _local_env_desc(self) -> str:
-        """任务 env 字段（本机）：「本机 · maiwork 用户 · 内存上限 512M」。"""
+        """任务 env 字段（本机）：「本机 · maiwork 用户 · 内存上限 512M」。
+
+        受限（本机不能隔离跑命令）时写明「受限」，别让管理员以为活在本机跑得起来。
+        """
+        if not self._local_can_exec():
+            cap = getattr(self, "_capability", None)
+            why = str(getattr(cap, "reason", "") or "这台机器不能隔离跑命令")
+            return f"本机 · 受限（不能隔离跑命令：{why}）"
         run_as = "maiwork"
         mem = "512M"
         try:
@@ -932,6 +971,16 @@ class Coordinator:
         # 执行环境：主模型选 railway → 拿一台一次性机器（拿不到回落本机并在 env/时间线写清原因）
         on_railway, railway_box = await self._setup_exec_env(tid, plan, gid)
 
+        # 本机不能隔离跑命令、也没拿到一次性机器：不假装开工，给一句实在话就收
+        # （_setup_exec_env 已把原因写进 env 字段和时间线）
+        if not on_railway and railway_box is None and not self._local_can_exec():
+            cap = getattr(self, "_capability", None)
+            why = str(getattr(cap, "reason", "") or "这台机器不能隔离跑命令")
+            msg = f"本机不能隔离跑命令（{why}），也没开一次性机器：这个任务做不了"
+            logger.warning("任务 %s %s", tid, msg)
+            self._fail_with_err(tid, attempt_id, msg, gid)
+            return "done"
+
         # 执行 jobs 并发（受信号量）；结束（成功/失败/异常）一定 release 一次性机器
         try:
             reports: list[Any] = await asyncio.gather(
@@ -1080,12 +1129,16 @@ class Coordinator:
         """决定这轮在哪干 + 把任务 env 字段写好。返回 (跑在 railway 上?, 拿到的 Box | None)。
 
         - 计划选 local：不走 railway（Box=None），env 字段写本机；
+        - 计划选 local 但本机不能隔离跑命令（受限）：有一次性机器就改去机器上做，
+          没有就把话说明白（env/时间线写原因），返回 (False, None)——调用方据此判失败；
         - 计划选 railway 且拿到机器：env 字段写一次性机器，返回 (True, Box)；
         - 计划选 railway 但拿不到（配额用完 / 同时占用 / refused）：回落本机，
           env 字段和时间线写明「一次性机器拿不到，改在本机做：原因」，返回 (False, None)。
         """
         want = str(plan.get("env") or "local")
         if want != "railway":
+            if not self._local_can_exec():
+                return await self._stopped_local_fallback(tid)
             # 本机：把 env 字段写出来（管理员在详情页看得见在哪干的）
             try:
                 self._tasks.set_env(tid, self._local_env_desc())
@@ -1120,6 +1173,37 @@ class Coordinator:
         except Exception:
             logger.exception("写任务 %s 的 env 字段失败", tid)
         return True, box
+
+    async def _stopped_local_fallback(self, tid: str) -> tuple[bool, Any]:
+        """本机不能隔离跑命令（受限）：能去一次性机器就去，去不了就把话说明白。
+
+        env 字段 + 时间线都写清原因；返回 (跑在机器上?, Box|None)。调用方看到
+        (False, None) 就知道这活本机干不了，直接判失败，不假装开工。
+        """
+        cap = getattr(self, "_capability", None)
+        why = str(getattr(cap, "reason", "") or "这台机器不能隔离跑命令")
+        if self._railway_available():
+            try:
+                box = await self._railway.acquire(tid)
+            except Exception:
+                logger.exception("申请一次性机器出错（任务 %s）", tid)
+                box = None
+            if box is not None:
+                note = f"不能隔离跑命令，改在一次性机器上做：{why}"
+                try:
+                    self._tasks.set_env(tid, self._railway_env_desc(box), note=note)
+                except Exception:
+                    logger.exception("写任务 %s 的 env 字段失败", tid)
+                return True, box
+            reason = await self._fetch_acquire_reason()
+            note = f"不能隔离跑命令，一次性机器也没拿到，这个活做不了：{reason}"
+        else:
+            note = f"不能隔离跑命令，也没开一次性机器，这个活做不了：{why}"
+        try:
+            self._tasks.set_env(tid, self._local_env_desc(), note=note)
+        except Exception:
+            logger.exception("写任务 %s 的 env 字段失败", tid)
+        return False, None
 
     async def _release_railway(self, box: Any) -> None:
         """结束（成功 / 失败 / 取消 / 异常）一定释放一次性机器；自身不再抛错。"""
@@ -1520,15 +1604,13 @@ class Coordinator:
             prompt_lines.append(f"- {name}：{_tool_desc.get(name, '')}")
         artifact = str(review.get("artifact") or "").strip()
         if artifact:
-            abs_path = ""
-            try:
-                abs_path = str(self._env.resolve(ws_name, artifact))
-            except (PermissionError, ValueError):
-                abs_path = ""
+            # 同一道交付路径闸：不在本任务成品目录里的 artifact 不写进提示词
+            # （免得不小心把工作区里的内部文件当「成品」传给群空间工具）
+            art_path = self._deliver_path_in_task_dir(ws_name, task_id, artifact)
             prompt_lines.append("")
             prompt_lines.append(
                 f"这次交付的成品（工作区相对路径 {artifact}"
-                + (f"，绝对路径 {abs_path}" if abs_path else "")
+                + (f"，绝对路径 {art_path}" if art_path is not None else "")
                 + "）"
             )
         prompt_lines.append("")
@@ -1753,10 +1835,8 @@ class Coordinator:
                 logger.exception("text 交付入队失败")
         else:
             artifact = review.get("artifact") or ""
-            try:
-                path = self._env.resolve(ws_name, artifact)
-            except (PermissionError, ValueError) as e:
-                logger.warning("交付路径解析失败 %s：%s", artifact, e)
+            path = self._deliver_path_in_task_dir(ws_name, task_id, artifact)
+            if path is None:
                 return "done"
             name = Path(path).name or Path(path).parent.name or task_id
             try:

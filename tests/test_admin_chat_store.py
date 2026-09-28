@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from CharTyr_MaiWork.store import _MIGRATIONS, Store
+from CharTyr_MaiWork.maiwork.store import _MIGRATIONS, Store
 
 
 def _tables(store: Store) -> set[str]:

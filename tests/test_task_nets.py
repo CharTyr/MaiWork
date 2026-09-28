@@ -6,9 +6,9 @@ import json
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tasks import Tasks
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tasks import Tasks
 
 
 class _Settings:
@@ -98,8 +98,8 @@ class TestCoordinatorNet:
     @pytest.mark.asyncio
     async def test_token_limit_pauses(self, tmp_path):
         """coordinator 在一次主模型调后用掉 > limit 的 token：任务自动 paused。"""
-        from CharTyr_MaiWork.coordinator import Coordinator
-        from CharTyr_MaiWork.models import ChatResult
+        from CharTyr_MaiWork.maiwork.coordinator import Coordinator
+        from CharTyr_MaiWork.maiwork.models import ChatResult
 
         class _S:
             class tasks:
@@ -154,8 +154,8 @@ class TestCoordinatorNet:
     @pytest.mark.asyncio
     async def test_time_limit_pauses(self, tmp_path):
         """跑太久（started_ts 远早于现在）：paused kind=time。"""
-        from CharTyr_MaiWork.coordinator import Coordinator
-        from CharTyr_MaiWork.models import ChatResult
+        from CharTyr_MaiWork.maiwork.coordinator import Coordinator
+        from CharTyr_MaiWork.maiwork.models import ChatResult
 
         class _S:
             class tasks:

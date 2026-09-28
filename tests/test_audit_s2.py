@@ -14,10 +14,10 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.delivery import Mentions, Pushes
-from CharTyr_MaiWork.outbox import Outbox
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.delivery import Mentions, Pushes
+from CharTyr_MaiWork.maiwork.outbox import Outbox
+from CharTyr_MaiWork.maiwork.store import Store
 
 pytestmark = pytest.mark.asyncio
 

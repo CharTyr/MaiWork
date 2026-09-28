@@ -23,17 +23,17 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.coordinator import Coordinator
-from CharTyr_MaiWork.environments.local import LocalEnv
-from CharTyr_MaiWork.goals import Goals
-from CharTyr_MaiWork.host import HostError
-from CharTyr_MaiWork.models import ModelError
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tasks import Tasks
-from CharTyr_MaiWork.tools import ToolContext, ToolResult, Tools
-from CharTyr_MaiWork.tools_exec import register_exec_tools
-from CharTyr_MaiWork.workers import WorkerReport
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.coordinator import Coordinator
+from CharTyr_MaiWork.maiwork.environments.local import LocalEnv
+from CharTyr_MaiWork.maiwork.goals import Goals
+from CharTyr_MaiWork.maiwork.host import HostError
+from CharTyr_MaiWork.maiwork.models import ModelError
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tasks import Tasks
+from CharTyr_MaiWork.maiwork.tools import ToolContext, ToolResult, Tools
+from CharTyr_MaiWork.maiwork.tools_exec import register_exec_tools
+from CharTyr_MaiWork.maiwork.workers import WorkerReport
 
 pytestmark = pytest.mark.asyncio
 
@@ -1032,3 +1032,112 @@ async def test_check_goal_prompt_always_carries_recent_chat(
     assert "第一次检查" not in prompt            # 已有标准就不再要它补
     crit = [c["text"] for c in json.loads(goals.get(gid_goal)["criteria"])]
     assert crit == ["写好脚本", "跑通测试"]       # 没被模型的 criteria 乱改
+
+
+# ---------------------------------------------------------------------------
+# 交付路径必须落在本任务的成品目录 artifacts/<task_id>/ 里（插件中心审核整改 6）
+# ---------------------------------------------------------------------------
+#
+# 背景：验收返回的 review["artifact"] 原先把 "." 或 "tasks/..." 也放行，会把整个
+# 工作区（tasks/、runtime/、tools/…）发到 here.now 公开页面或群文件。现在解析后的
+# 真实路径必须等于或位于 <工作区>/artifacts/<task_id>/ 之下（resolve 后比较，防 ../
+# 和符号链接），否则不交付、记日志、任务照常 done（和解析失败一样）。
+
+
+def _write_in_workspace(env, tasks, tid: str, files: dict) -> Path:
+    """在任务工作区里按相对路径写文件（父目录自动建）；返回工作区根。"""
+    ws = env.workspace(tasks.get(tid)["workspace"])
+    for rel, text in files.items():
+        p = ws / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+    return ws
+
+
+async def _deliver_with_artifact(
+    mem_store, settings, env, tools, tasks, goals, tid: str, artifact: str, files: dict
+):
+    """跑一轮「计划 → worker 写文件 → 验收 pass(artifact)」，返回 (task, delivery)。"""
+    _write_in_workspace(env, tasks, tid, files)
+    models = ModelsQueue(replies=[_plan(), _review(pass_=True, artifact=artifact)])
+    workers = FakeWorkers()
+    delivery = FakeDelivery()
+    coordinator = _build(
+        mem_store=mem_store, settings=settings, env=env, tools=tools, tasks=tasks,
+        goals=goals, models=models, workers=workers, delivery=delivery, outbox=FakeOutbox(),
+    )
+    # 每次重试都重写一遍（重试会再跑 worker）
+    workers.before_return = lambda: _write_in_workspace(env, tasks, tid, files)
+    await coordinator.run_task(tid)
+    return tasks.get(tid), delivery
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    [".", "tasks/x.txt", f"artifacts/T-其他/index.html"],
+)
+async def test_delivery_rejects_outside_task_artifact_dir(
+    mem_store: Store, settings, env, tools, tasks, goals, artifact: str
+):
+    """".", "tasks/x.txt", "artifacts/别的任务/x" → 不交付，任务照常 completed。"""
+    tid = _create_task(tasks)
+    files = {"tasks/x.txt": "内部草稿", "artifacts/T-其他/index.html": "<html>别人的</html>"}
+    task, delivery = await _deliver_with_artifact(
+        mem_store, settings, env, tools, tasks, goals, tid, artifact, files
+    )
+    assert task["status"] == "completed"          # 任务照常结束（不卡住）
+    assert delivery.delivered == []               # 但一个渠道都没发
+
+
+async def test_delivery_rejects_symlink_escape(
+    mem_store: Store, settings, env, tools, tasks, goals, tmp_path
+):
+    """artifacts/<本任务>/link.html 是指向工作区外的符号链接 → 不交付。"""
+    tid = _create_task(tasks)
+    files = {"artifacts/__tid__/real.txt": "x"}
+    files = {k.replace("__tid__", tid): v for k, v in files.items()}
+    ws = _write_in_workspace(env, tasks, tid, files)
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("机密", encoding="utf-8")
+    (ws / "artifacts" / tid / "link.html").symlink_to(outside)
+
+    models = ModelsQueue(replies=[_plan(), _review(pass_=True, artifact=f"artifacts/{tid}/link.html")])
+    delivery = FakeDelivery()
+    coordinator = _build(
+        mem_store=mem_store, settings=settings, env=env, tools=tools, tasks=tasks,
+        goals=goals, models=models, workers=FakeWorkers(), delivery=delivery, outbox=FakeOutbox(),
+    )
+    await coordinator.run_task(tid)
+    assert delivery.delivered == []
+    # 1 次不通过后重试 3 次 → failed；关键是**从来没交付**
+    assert tasks.get(tid)["status"] in ("completed", "failed")
+
+
+async def test_delivery_allows_file_inside_task_artifact_dir(
+    mem_store: Store, settings, env, tools, tasks, goals
+):
+    """artifacts/<本任务>/index.html → 照常交付（且交的是解析后的绝对路径）。"""
+    tid = _create_task(tasks)
+    task, delivery = await _deliver_with_artifact(
+        mem_store, settings, env, tools, tasks, goals, tid,
+        f"artifacts/{tid}/index.html", {f"artifacts/{tid}/index.html": "<html>ok</html>"},
+    )
+    assert task["status"] == "completed"
+    assert len(delivery.delivered) == 1
+    d = delivery.delivered[0]
+    assert d["path"].name == "index.html"
+    assert (d["path"].parent / "index.html").exists() or d["path"].name == "index.html"
+
+
+async def test_delivery_allows_task_artifact_dir_itself(
+    mem_store: Store, settings, env, tools, tasks, goals
+):
+    """artifacts/<本任务> 整个目录 → 放行（发目录）。"""
+    tid = _create_task(tasks)
+    task, delivery = await _deliver_with_artifact(
+        mem_store, settings, env, tools, tasks, goals, tid,
+        f"artifacts/{tid}", {f"artifacts/{tid}/index.html": "<html>ok</html>"},
+    )
+    assert task["status"] == "completed"
+    assert len(delivery.delivered) == 1
+    assert delivery.delivered[0]["path"] == env.workspace(tasks.get(tid)["workspace"]) / "artifacts" / tid

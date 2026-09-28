@@ -12,7 +12,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from CharTyr_MaiWork import rss
+from CharTyr_MaiWork.maiwork import rss
 
 NOW = 1_790_000_000.0
 
@@ -226,7 +226,7 @@ class TestParseFeed:
 
 class TestKv:
     def _store(self, tmp_path):
-        from CharTyr_MaiWork.store import Store
+        from CharTyr_MaiWork.maiwork.store import Store
 
         s = Store(tmp_path / "t.db")
         s.migrate()

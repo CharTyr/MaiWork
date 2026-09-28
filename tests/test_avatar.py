@@ -23,7 +23,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from fakes import FakeCtx, FakeProfiles
 
-from CharTyr_MaiWork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
 SECRET = "sk-test-十分显眼的密钥AaBbCc123"
 PASSWORD = "测试密码-非常显眼-不要出现在日志里"
@@ -158,7 +158,7 @@ class TestBotAvatarNoLogin:
             client = TestClient(server, cookie_jar=aiohttp.CookieJar(unsafe=True))
             await client.start_server()
             r = await client.get("/api/avatar/bot")
-            assert r.status == 404  # 前端回落 /static/assets/maimai.png
+            assert r.status == 404  # 前端回落 /static/assets/logo.png
             await client.close()
         finally:
             await app.stop()
@@ -329,7 +329,7 @@ class TestAvatarSettings:
         r = await env.client.get("/api/me")
         data = await r.json()
         assert data["bot"]["avatar"].startswith("/api/avatar/bot?v=")
-        assert "maimai.png" not in data["bot"]["avatar"]
+        assert "assets/logo.png" not in data["bot"]["avatar"]
 
     @pytest.mark.asyncio
     async def test_jpeg_gif_webp_magic_accepted(self, env) -> None:

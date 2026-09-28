@@ -11,10 +11,10 @@ import json
 import httpx
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.models import ModelError, Models
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.models import ModelError, Models
+from CharTyr_MaiWork.maiwork.store import Store
 
 # 测试里用的假密钥；专门用来断言「绝不出现在任何输出里」
 # SECRET 用不带 sk- 前缀的形式，确保遮罩靠的是「已知密钥精确替换」，
@@ -311,7 +311,7 @@ class TestSecretPrivacy:
         assert SECRET not in row["payload"]
 
     def test_redact_function_itself(self) -> None:
-        from CharTyr_MaiWork.models import _redact
+        from CharTyr_MaiWork.maiwork.models import _redact
 
         out = _redact(f"key=abc 再去 Bearer {BEARER_SECRET} 和 sk-realkey999", ["abc"])
         for bad in ("abc", BEARER_SECRET, "sk-realkey999"):

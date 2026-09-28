@@ -17,10 +17,10 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from fakes import FakeCtx, FakeProfiles
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.app import MaiWorkApp
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.console.views import icon_for_group
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.console.views import icon_for_group
 
 SECRET = "sk-test-十分显眼的密钥AaBbCc123"
 
@@ -126,7 +126,7 @@ class TestStaticAndMisc:
         import hashlib
         import re as _re
 
-        from CharTyr_MaiWork.console import server as _srv
+        from CharTyr_MaiWork.maiwork.console import server as _srv
 
         r = await env.client.get("/")
         html = await r.text()
@@ -470,7 +470,7 @@ class TestAdminOps:
         new = (await r.json())["token"]
         assert new and new != old
         # 旧链接码不再映射到群（匿名视角：角色变 none）
-        from CharTyr_MaiWork.console import views as _views
+        from CharTyr_MaiWork.maiwork.console import views as _views
 
         assert _views.group_id_by_token(env.app, old) is None
         r2 = await env.client.get("/api/me", headers={"X-MW-Group": old})
@@ -571,9 +571,9 @@ class TestSettingsView:
         assert states["search"]["state"] == "warn"
         assert "还没指定联网搜索" in states["search"]["text"]
         assert "内部代号" not in json.dumps(s, ensure_ascii=False)
-        # M3：local_mode 默认 systemd → ok「systemd 隔离 · 同时最多 N 个子 agent」
+        # M3：启动时判定成 fixed（conftest 的假探测）→ ok「隔离运行（固定账号 maiwork）」
         assert states["localenv"]["state"] == "ok"
-        assert states["localenv"]["text"] == "systemd 隔离 · 同时最多 2 个子 agent"
+        assert states["localenv"]["text"] == "隔离运行（固定账号 maiwork）"
         assert s["rules"]["approval_required"] is True
         assert s["rules"]["admins"] == 2
         assert len(s["groups"]) == 2
@@ -627,7 +627,7 @@ class TestViewDetails:
 
     @pytest.mark.asyncio
     async def test_icon_stable_and_from_icons_dir(self) -> None:
-        from CharTyr_MaiWork.console.views import group_icons
+        from CharTyr_MaiWork.maiwork.console.views import group_icons
 
         icons = group_icons()
         assert icons
@@ -882,7 +882,7 @@ async def m2_client(tmp_path: Path):
 
     from aiohttp.test_utils import TestClient, TestServer
 
-    from CharTyr_MaiWork.console.server import create_app
+    from CharTyr_MaiWork.maiwork.console.server import create_app
 
     feeds = _FakeFeeds()
     topics = _FakeTopics()
@@ -898,7 +898,7 @@ async def m2_client(tmp_path: Path):
     app = create_app(svc)
 
     # 拿一个「能让 _identify 返回 member@G1」的身份：直接伪造（不改 db）
-    from CharTyr_MaiWork.console import views as _views
+    from CharTyr_MaiWork.maiwork.console import views as _views
 
     orig = _views.group_id_by_token
     _views.group_id_by_token = lambda _svc, token: (G1 if token == "tok-g1" else None)
@@ -961,8 +961,8 @@ class TestM2RoutesAuth:
     @pytest.mark.asyncio
     async def test_admin_can_do_dismiss(self, m2_client) -> None:
         # 模拟管理员：摸回到 aiohttp app 拿 ConsoleAuth，做合法 cookie 塞进 cookie jar
-        from CharTyr_MaiWork.console.auth import COOKIE_NAME
-        from CharTyr_MaiWork.console.server import AUTH_KEY
+        from CharTyr_MaiWork.maiwork.console.auth import COOKIE_NAME
+        from CharTyr_MaiWork.maiwork.console.server import AUTH_KEY
 
         auth = None
         for v in vars(m2_client.client._server).values():
@@ -989,8 +989,8 @@ class TestM2RoutesAuth:
     @pytest.mark.asyncio
     async def test_admin_do_passes_picked_items_to_feeds(self, m2_client) -> None:
         """「直接开工」body 里的 items（构想项目序号）要原样传给 feeds.idea_action。"""
-        from CharTyr_MaiWork.console.auth import COOKIE_NAME
-        from CharTyr_MaiWork.console.server import AUTH_KEY
+        from CharTyr_MaiWork.maiwork.console.auth import COOKIE_NAME
+        from CharTyr_MaiWork.maiwork.console.server import AUTH_KEY
 
         auth = None
         for v in vars(m2_client.client._server).values():
@@ -1027,11 +1027,11 @@ class TestGroupViewM2Fields:
     @pytest.mark.asyncio
     async def test_member_view_topic_log_visible_but_no_verdict(self, m2_client) -> None:
         """群友看得到 topic_log，但没有 verdict 字段；也不含 focus 个人画像信息。"""
-        from CharTyr_MaiWork.console import views as _views
+        from CharTyr_MaiWork.maiwork.console import views as _views
 
         # 这个测试需要 _views.group_id_by_token 已 patch（fixture 做了）
         # 用 topics 给一条「已开话题」和一条「忍住没开」
-        from CharTyr_MaiWork import clock as _clock
+        from CharTyr_MaiWork.maiwork import clock as _clock
 
         now = _clock.now()
         svc = m2_client.app  # 实际是 _FakeSvc
@@ -1081,8 +1081,8 @@ class TestGroupViewM2Fields:
     @pytest.mark.asyncio
     async def test_admin_view_keeps_verdict(self, m2_client) -> None:
         """管理员的 topic_log 保留 verdict。"""
-        from CharTyr_MaiWork import clock as _clock
-        from CharTyr_MaiWork.console import views as _views
+        from CharTyr_MaiWork.maiwork import clock as _clock
+        from CharTyr_MaiWork.maiwork.console import views as _views
 
         now = _clock.now()
         svc = m2_client.app
@@ -1096,7 +1096,7 @@ class TestGroupViewM2Fields:
     @pytest.mark.asyncio
     async def test_empty_m2_modules_gives_empty_lists_and_zero_today(self, m2_client) -> None:
         """feeds/topics 给空 → news/ideas/topic_log/pulse.spells/pulse.topics 全空，today.news/topics = 0。"""
-        from CharTyr_MaiWork.console import views as _views
+        from CharTyr_MaiWork.maiwork.console import views as _views
         svc = m2_client.app
         view = _views.group_view(svc, G1, admin=True)
         assert view["news"] == [] and view["ideas"] == [] and view["topic_log"] == []
@@ -1106,8 +1106,8 @@ class TestGroupViewM2Fields:
     @pytest.mark.asyncio
     async def test_today_counts_come_from_feeds_and_topic_log(self, m2_client) -> None:
         """today.news = feeds.today_count；today.topics = topic_log 里今天开了话题的次数。"""
-        from CharTyr_MaiWork import clock as _clock
-        from CharTyr_MaiWork.console import views as _views
+        from CharTyr_MaiWork.maiwork import clock as _clock
+        from CharTyr_MaiWork.maiwork.console import views as _views
 
         now = _clock.now()
         svc = m2_client.app
@@ -1126,7 +1126,7 @@ class TestGroupViewM2Fields:
         """upcoming 里有「下一批资讯备料」（scheduler.next_news_ts）。"""
         from fakes import FakeScheduler
 
-        from CharTyr_MaiWork.console import views as _views
+        from CharTyr_MaiWork.maiwork.console import views as _views
 
         svc = m2_client.app
         sched = FakeScheduler()

@@ -13,9 +13,9 @@ import json
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tasks import Tasks
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tasks import Tasks
 
 NOW = 1_790_000_000.0
 
@@ -436,7 +436,7 @@ class TestListView:
 
 class TestDetailView:
     def test_member_view_has_no_env_and_no_timeline(self, mem_store: Store):
-        from CharTyr_MaiWork.tools import Tools
+        from CharTyr_MaiWork.maiwork.tools import Tools
         tasks = Tasks(mem_store, GET_SETTINGS, tools=Tools(mem_store))
         tid = _create(tasks, status="running")
         mem_store.read().execute(

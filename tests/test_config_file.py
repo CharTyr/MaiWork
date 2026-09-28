@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork import config_file
+from CharTyr_MaiWork.maiwork import config_file
 
 
 def _plugin_dir(tmp_path: Path, *, with_config: bool = True) -> Path:

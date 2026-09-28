@@ -46,7 +46,8 @@ CONFIG_VERSION = "0.4.0"  # 0.4.0：[models] context_window、[tasks] 安全网�
 
 # 插件目录 = 本文件所在目录；默认数据目录 = 插件目录上两级 / data / maiwork
 # （线上 <MaiBot>/plugins/CharTyr_MaiWork → <MaiBot>/data/maiwork）
-_PLUGIN_DIR = Path(__file__).resolve().parent
+# 插件根目录（plugins/CharTyr_MaiWork）：代码在 maiwork/ 子包里，所以往上两级
+_PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -230,11 +231,18 @@ class EnvironmentsSectionConfig(PluginConfigBase):
     workspace_root: str = Field(default="/home/maiwork/workspaces", description="工作区根目录；每个工作区是它下面的一个子目录")
     memory_max: str = Field(default="512M", description="单个命令的内存上限，如 512M / 1G")
     runtime_max_sec: int = Field(default=1800, description="单条命令最长跑多少秒")
-    local_mode: str = Field(default="systemd", description='本机执行方式："systemd"（线上，隔离）或 "direct"（只给本地测试，不隔离）')
+    local_mode: str = Field(
+        default="systemd",
+        description=(
+            "本机执行方式，只支持 \"systemd\"（隔离）。\"direct\" 不给任何隔离、生产一律按 systemd："
+            "只有本机开发测试显式设了环境变量 MAIWORK_DEV_ALLOW_DIRECT=1 且不是 root 时才生效"
+        ),
+    )
     run_as: str = Field(default="maiwork", description="本机命令以哪个系统用户身份跑（systemd 模式的 --uid/--gid）")
     max_parallel: int = Field(default=2, description="每个工作区同时跑的子 agent 个数")
     command_timeout_s: int = Field(default=300, description="子 agent 单条命令的默认时长上限（秒）")
     railway_daily_max: int = Field(default=2, description="Railway 一次性 VM 每天最多用几台（同一出口 IP 每天最多 3 台，留 1 台给派活）")
+    verify_enabled: bool = Field(default=False, description="备资讯时挑几条上 Railway 一次性 VM 实测（默认关）")
     verify_per_round: int = Field(default=2, description="每轮备资讯最多实测几条（同一台 VM 里依次测）")
     verify_minutes: int = Field(default=10, description="单条资讯/文章实测的时长上限（分钟）")
 
@@ -440,11 +448,12 @@ class EnvironmentsSetting:
     workspace_root: Path
     memory_max: str
     runtime_max_sec: int
-    local_mode: str  # "systemd" | "direct"（direct 只给本地测试，不隔离）
+    local_mode: str  # "systemd" | "direct"（direct 无隔离，只在本机开发开关下才可能留下）
     run_as: str
     max_parallel: int
     command_timeout_s: int
     railway_daily_max: int   # Railway 一次性 VM 每天最多用几台（官方同一出口 IP 最多 3 台/天）
+    verify_enabled: bool    # 备资讯时要不要挑几条上 Railway 一次性 VM 实测（默认关）
     verify_per_round: int    # 每轮备资讯最多实测几条
     verify_minutes: int      # 单条实测的时长上限（分钟）
 
@@ -677,20 +686,38 @@ def _running_as_root() -> bool:
         return False
 
 
+# 显式开发开关（不新增配置项）：只有本机开发测试才该有「无隔离的 direct」。
+# 生产路径（systemd 服务/容器）里进程环境变量不会带它 → 配置里写 direct 一律按 systemd。
+DEV_ALLOW_DIRECT_ENV = "MAIWORK_DEV_ALLOW_DIRECT"
+
+
+def _dev_allow_direct() -> bool:
+    """进程环境变量 MAIWORK_DEV_ALLOW_DIRECT=1 才算开了开发开关。"""
+    import os
+
+    return str(os.environ.get(DEV_ALLOW_DIRECT_ENV) or "").strip() == "1"
+
+
 def _parse_environments(
     env: EnvironmentsSectionConfig, workspace_root: Path, problems: list[str]
 ) -> EnvironmentsSetting:
     """[environments] 节规范化。
 
-    local_mode 只允许 "systemd" / "direct"；写错回落 systemd（线上必须隔离，
-    direct 只给本地测试机用，不给子 agent 任何隔离），并记中文问题。
-    另外（G1）：插件以 root 跑时（线上）direct = 子 agent 直接拿 root shell，
-    必须强制回落 systemd 并记问题。
+    local_mode 只允许 "systemd" / "direct"；写错回落 systemd（线上必须隔离），并记中文问题。
+    direct **默认不生效**：它不给子 agent 任何隔离，生产路径一律按 systemd，并记中文问题；
+    只有本机开发测试显式设了环境变量 MAIWORK_DEV_ALLOW_DIRECT=1、且进程不是 root 时才允许
+    （G1：插件以 root 跑时 direct = 子 agent 直接拿 root shell，即使开了开关也回落 systemd）。
     """
     local_mode = str(env.local_mode or "").strip().lower()
     if local_mode not in ("systemd", "direct"):
         problems.append(
             f'[environments] local_mode = "{local_mode}" 不认识（只能是 systemd / direct），本次按 systemd 处理'
+        )
+        local_mode = "systemd"
+    if local_mode == "direct" and not _dev_allow_direct():
+        problems.append(
+            '[environments] local_mode = "direct" 不生效（它没有任何隔离，生产一律按 systemd）：'
+            "只有本机开发测试显式设了环境变量 MAIWORK_DEV_ALLOW_DIRECT=1 才允许，本次按 systemd 处理"
         )
         local_mode = "systemd"
     if local_mode == "direct" and _running_as_root():
@@ -707,6 +734,7 @@ def _parse_environments(
         max_parallel=max(1, int(env.max_parallel)),
         command_timeout_s=max(1, int(env.command_timeout_s)),
         railway_daily_max=max(1, int(env.railway_daily_max)),
+        verify_enabled=bool(env.verify_enabled),
         verify_per_round=max(1, min(3, int(env.verify_per_round))),
         verify_minutes=max(1, int(env.verify_minutes)),
     )

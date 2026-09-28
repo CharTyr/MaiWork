@@ -22,12 +22,12 @@ from pathlib import Path
 import httpx
 import pytest
 
-from CharTyr_MaiWork import coordinator, extensions_web
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.skills import Skills, _normalize_roles, parse_front_matter
-from CharTyr_MaiWork.skills_tools import register_skill_tools
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tools import Tool, ToolContext, ToolResult, Tools
+from CharTyr_MaiWork.maiwork import coordinator, extensions_web
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.skills import Skills, _normalize_roles, parse_front_matter
+from CharTyr_MaiWork.maiwork.skills_tools import register_skill_tools
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tools import Tool, ToolContext, ToolResult, Tools
 from test_extensions import MCP_URL, _McpServer, _make_skill, _tool_spec
 from test_extensions_web import _login, _make
 
@@ -147,7 +147,7 @@ class TestMcpRolesValidation:
 
 class TestSkillRolesValidation:
     def test_create_default_and_explicit(self, tmp_path: Path, store: Store) -> None:
-        from CharTyr_MaiWork import skills_web
+        from CharTyr_MaiWork.maiwork import skills_web
 
         view = skills_web.create(tmp_path, store, {"name": "s1", "body": "x"})
         assert view["roles"] == ["worker"]
@@ -162,7 +162,7 @@ class TestSkillRolesValidation:
 
     @pytest.mark.parametrize("bad", [[], [""], ["  "], ["boss"], ["worker", "boss"]])
     def test_create_bad_roles_400(self, tmp_path: Path, store: Store, bad) -> None:
-        from CharTyr_MaiWork import skills_web
+        from CharTyr_MaiWork.maiwork import skills_web
 
         with pytest.raises(ValueError) as e:
             skills_web.create(tmp_path, store, {"name": "s", "body": "x", "roles": bad})
@@ -171,14 +171,14 @@ class TestSkillRolesValidation:
 
     @pytest.mark.parametrize("bad", ["worker", 3])
     def test_create_roles_not_list_400(self, tmp_path: Path, store: Store, bad) -> None:
-        from CharTyr_MaiWork import skills_web
+        from CharTyr_MaiWork.maiwork import skills_web
 
         with pytest.raises(ValueError) as e:
             skills_web.create(tmp_path, store, {"name": "s", "body": "x", "roles": bad})
         assert "roles" in str(e.value)
 
     def test_update_keeps_roles_when_absent(self, tmp_path: Path, store: Store) -> None:
-        from CharTyr_MaiWork import skills_web
+        from CharTyr_MaiWork.maiwork import skills_web
 
         skills_web.create(tmp_path, store, {"name": "s", "body": "x", "roles": ["main"]})
         view = skills_web.update(tmp_path, store, "s", {"description": "改描述"})
@@ -192,7 +192,7 @@ class TestSkillRolesValidation:
     def test_update_bad_roles_400_and_keeps_old(
         self, tmp_path: Path, store: Store, bad
     ) -> None:
-        from CharTyr_MaiWork import skills_web
+        from CharTyr_MaiWork.maiwork import skills_web
 
         skills_web.create(tmp_path, store, {"name": "s", "body": "x", "roles": ["main"]})
         with pytest.raises(ValueError) as e:
@@ -263,7 +263,7 @@ class TestFrontMatterTolerance:
 class TestMcpRoleRouting:
     @pytest.mark.asyncio
     async def test_specs_split_by_roles(self, store: Store) -> None:
-        from CharTyr_MaiWork.extensions import Extensions
+        from CharTyr_MaiWork.maiwork.extensions import Extensions
 
         server = _McpServer([_tool_spec("t")])
         settings = _settings(
@@ -338,11 +338,11 @@ class TestCoordinatorRoleRouting:
             _review,
         )
 
-        from CharTyr_MaiWork.coordinator import Coordinator
-        from CharTyr_MaiWork.environments.local import LocalEnv
-        from CharTyr_MaiWork.goals import Goals
-        from CharTyr_MaiWork.tasks import Tasks
-        from CharTyr_MaiWork.tools_exec import register_exec_tools
+        from CharTyr_MaiWork.maiwork.coordinator import Coordinator
+        from CharTyr_MaiWork.maiwork.environments.local import LocalEnv
+        from CharTyr_MaiWork.maiwork.goals import Goals
+        from CharTyr_MaiWork.maiwork.tasks import Tasks
+        from CharTyr_MaiWork.maiwork.tools_exec import register_exec_tools
 
         store = Store(tmp_path / "m.db")
         store.migrate()

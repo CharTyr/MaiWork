@@ -13,7 +13,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from CharTyr_MaiWork.herenow import HereNow, HereNowError
+from CharTyr_MaiWork.maiwork.herenow import HereNow, HereNowError
 
 
 def _resp(payload: dict, status: int = 200, headers: dict | None = None) -> httpx.Response:
@@ -255,7 +255,7 @@ async def test_publish_file_too_large(tmp_path):
     """单文件超限（>50MB，M3 起单文件上限不得超过总量 200MB）→ 中文报错（不真造大文件，monkeypatch 扫描结果就行）。"""
     d = _mk_dir(tmp_path, {"big.bin": b"x"})
 
-    import CharTyr_MaiWork.herenow as herenow_mod
+    import CharTyr_MaiWork.maiwork.herenow as herenow_mod
 
     real_iter = herenow_mod._iter_files
     big = 251 * 1024 * 1024
@@ -278,7 +278,7 @@ async def test_publish_total_too_large(tmp_path):
     """总量 >200MB → 中文报错。"""
     d = _mk_dir(tmp_path, {"a.bin": b"x", "b.bin": b"y"})
 
-    import CharTyr_MaiWork.herenow as herenow_mod
+    import CharTyr_MaiWork.maiwork.herenow as herenow_mod
 
     real_iter = herenow_mod._iter_files
 

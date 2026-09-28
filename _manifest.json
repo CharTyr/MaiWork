@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "chartyr.maiwork",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "name": "MaiWork",
   "description": "MaiBot 群聊生产力 Agent：和 MaiBot 并行运行，理解群、主动找资讯、提构想、追目标，接群友派的活并交付。默认关闭。",
   "plugin_type": "extension",
@@ -9,7 +9,7 @@
     "name": "CharTyr",
     "url": "https://github.com/CharTyr"
   },
-  "license": "GPL-3.0-or-later",
+  "license": "AGPL-3.0-or-later",
   "host_application": {
     "min_version": "1.0.0",
     "max_version": "1.99.99"
@@ -18,7 +18,23 @@
     "min_version": "2.0.0",
     "max_version": "2.99.99"
   },
-  "dependencies": [],
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "httpx",
+      "version_spec": ">=0.24"
+    },
+    {
+      "type": "python_package",
+      "name": "tomlkit",
+      "version_spec": ">=0.12"
+    },
+    {
+      "type": "python_package",
+      "name": "aiohttp",
+      "version_spec": ">=3.9"
+    }
+  ],
   "capabilities": [
     "config.get",
     "message.get_by_time_in_chat",

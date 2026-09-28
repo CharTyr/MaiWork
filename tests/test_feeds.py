@@ -26,12 +26,12 @@ from typing import Any, Dict, List
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.feeds import Feeds, _normalize_url
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.feeds import Feeds, _normalize_url
+from CharTyr_MaiWork.maiwork.store import Store
 
-from fakes import FakeModelsQueue, FakeProfiles
+from fakes import FakeModelsQueue, FakeProfiles, focus_reply
 
 BJ = timezone(timedelta(hours=8))
 NOW = 1_790_000_000.0  # 测试里的「现在」
@@ -71,7 +71,7 @@ class UnavailableSearch:
     """没配好的假搜索：search() 抛 SearchUnavailable（和 search.py 行为一致）。"""
 
     async def search(self, query: str, **kw: Any) -> list:
-        from CharTyr_MaiWork.search import SearchUnavailable
+        from CharTyr_MaiWork.maiwork.search import SearchUnavailable
 
         raise SearchUnavailable("没配搜索服务，本次跳过联网搜索")
 
@@ -91,7 +91,7 @@ class FakeWorkers:
 
 
 def _ok_report(data: dict) -> Any:
-    from CharTyr_MaiWork.workers import WorkerReport
+    from CharTyr_MaiWork.maiwork.workers import WorkerReport
 
     return WorkerReport(ok=True, summary="找好了", data=data, evidence=[], steps=3)
 
@@ -110,10 +110,8 @@ class FakeTopics:
 # 常用的模型回复素材
 # --
 
-_FOCUS_JSON = json.dumps(
-    {"focus": [{"query": "FPGA 新动态", "why": "群里在做硬件"}, {"query": "开源项目", "why": "群友喜欢折腾"}]},
-    ensure_ascii=False,
-)
+# 定关注点要求 3–5 个（少了会触发追问重试），统一用 fakes.focus_reply 造
+_FOCUS_JSON = focus_reply("FPGA 新动态", "开源项目", "本地大模型新玩法")
 
 _QUOTE = "原文里确实写着这件事，摘要能在正文找到依据。"
 
@@ -356,7 +354,7 @@ def test_prepare_news_max_items_cap(tmp_path) -> None:
 
 
 def test_prepare_news_worker_fails_marks_skipped(tmp_path) -> None:
-    from CharTyr_MaiWork.workers import WorkerReport
+    from CharTyr_MaiWork.maiwork.workers import WorkerReport
 
     models = FakeModelsQueue(ready=True, replies=[_FOCUS_JSON])
     workers = FakeWorkers(WorkerReport(ok=False, summary="", data=None, evidence=[], steps=2, error="步数用完"))
@@ -712,7 +710,7 @@ def test_make_idea_no_dedup_beyond_30_days(tmp_path) -> None:
 
 
 def test_make_idea_model_error_returns_none(tmp_path) -> None:
-    from CharTyr_MaiWork.models import ModelError
+    from CharTyr_MaiWork.maiwork.models import ModelError
 
     models = FakeModelsQueue(ready=True, replies=[ModelError("端点挂了")])
     store, settings, feeds, *_ = _make_feeds(tmp_path, models=models)
@@ -999,7 +997,7 @@ class _TimePatch:
     """临时把 feeds.clock.now 改成一个固定值（本测试文件的数据都围着 NOW 造）。"""
 
     def __enter__(self):
-        import CharTyr_MaiWork.feeds as feeds_mod
+        import CharTyr_MaiWork.maiwork.feeds as feeds_mod
 
         self._mod = feeds_mod
         self._orig = feeds_mod.clock.now

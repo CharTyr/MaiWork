@@ -16,8 +16,8 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork import skills_web
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import skills_web
+from CharTyr_MaiWork.maiwork.store import Store
 
 
 def _store(tmp_path: Path) -> Store:
@@ -182,7 +182,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from fakes import FakeCtx, FakeProfiles
 
-from CharTyr_MaiWork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
 
 def _raw_config(data_dir: Path, **over):

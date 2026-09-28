@@ -45,6 +45,34 @@ def test_version_matches_code():
     assert MANIFEST["id"] == PLUGIN_ID
 
 
+# 插件代码里 import 的第三方包（maibot_sdk 是宿主自带，不声明）。
+# 声明要让宿主依赖流水线：已装好且满足约束 → 不跑 pip；和宿主约束必须有交集
+# （见 docs/06「manifest 依赖声明」一节的实测结果）。
+THIRD_PARTY_PACKAGES = ("aiohttp", "httpx", "tomlkit")
+
+
+def test_python_package_dependencies_declared():
+    from packaging.specifiers import SpecifierSet
+
+    deps = MANIFEST["dependencies"]
+    assert isinstance(deps, list) and deps, "dependencies 不能是空的：代码 import 了 httpx / tomlkit / aiohttp"
+    declared: dict[str, str] = {}
+    for dep in deps:
+        assert isinstance(dep, dict), dep
+        assert dep["type"] == "python_package", dep
+        # 宿主是严格模型（extra="forbid"），字段只能这三个
+        assert set(dep) == {"type", "name", "version_spec"}, dep
+        assert re.fullmatch(r"[A-Za-z0-9._-]+", dep["name"]), dep
+        spec = dep["version_spec"]
+        assert spec.strip() == spec and spec, dep
+        SpecifierSet(spec)  # 不是合法 PEP 440 约束，宿主会报「Python 包依赖声明无效」
+        # 宽松：只给下界，别把宿主已经装好的版本卡掉
+        assert spec.startswith(">="), dep
+        declared[dep["name"].lower().replace("_", "-")] = spec
+    for name in THIRD_PARTY_PACKAGES:
+        assert name in declared, f"没声明第三方依赖 {name}（宿主会当缺失去装，或运行时 import 失败）"
+
+
 def test_urls_point_to_public_repo():
     u = MANIFEST["urls"]
     assert u["repository"] == REPO  # 不带 .git、不是个人主页
@@ -53,9 +81,10 @@ def test_urls_point_to_public_repo():
 
 
 def test_license_file_matches_manifest():
-    assert MANIFEST["license"] == "GPL-3.0-or-later"
+    # 2026-09-28 起改为 AGPL-3.0-or-later（网页控制台属网络服务，改了要给用户源码）
+    assert MANIFEST["license"] == "AGPL-3.0-or-later"
     text = (PLUGIN_DIR / "LICENSE").read_text(encoding="utf-8")
-    assert "GNU GENERAL PUBLIC LICENSE" in text and "Version 3, 29 June 2007" in text
+    assert "GNU AFFERO GENERAL PUBLIC LICENSE" in text and "Version 3, 19 November 2007" in text
 
 
 def test_gitignore_keeps_runtime_files_out():

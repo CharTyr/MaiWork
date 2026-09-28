@@ -6,6 +6,7 @@ app 用全路径取（`_import_m2_class("environments.railway", "RailwayEnv")`�
 
 from __future__ import annotations
 
+from . import capability
 from .local import LocalEnv, RunResult
 
-__all__ = ["LocalEnv", "RunResult"]
+__all__ = ["LocalEnv", "RunResult", "capability"]

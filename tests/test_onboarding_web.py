@@ -18,7 +18,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from fakes import FakeCtx, FakeProfiles
 
-from CharTyr_MaiWork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
 pytestmark = pytest.mark.asyncio
 

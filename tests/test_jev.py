@@ -13,9 +13,9 @@ from typing import Any, List, Tuple
 import httpx
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.store import Store
 
 SECRET = "typesafe-testkey-123"  # 假密钥；专门用来断言「绝不出现在任何输出里」
 
@@ -44,7 +44,7 @@ def _make_jev(
     responder=None,
     n_requests: List[httpx.Request] | None = None,
 ):
-    from CharTyr_MaiWork.jev import Jev
+    from CharTyr_MaiWork.maiwork.jev import Jev
 
     store = Store(tmp_path / "t.db")
     store.migrate()

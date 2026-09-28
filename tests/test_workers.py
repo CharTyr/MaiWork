@@ -7,10 +7,10 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from CharTyr_MaiWork.models import ModelError
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tools import ToolContext, ToolResult, Tools
-from CharTyr_MaiWork.workers import WorkerReport, Workers
+from CharTyr_MaiWork.maiwork.models import ModelError
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tools import ToolContext, ToolResult, Tools
+from CharTyr_MaiWork.maiwork.workers import WorkerReport, Workers
 
 
 @dataclass
@@ -71,7 +71,7 @@ def tools(store):
             data={"summary": args.get("summary", ""), "data": args.get("data"), "evidence": args.get("evidence", [])},
         )
 
-    from CharTyr_MaiWork.tools import Tool
+    from CharTyr_MaiWork.maiwork.tools import Tool
 
     for name, handler, roles in (
         ("web_search", web_search, {"worker"}),
@@ -292,7 +292,7 @@ class TestFailures:
 
     @pytest.mark.asyncio
     async def test_tool_result_truncated_in_message(self, store, tools):
-        from CharTyr_MaiWork.tools import Tool
+        from CharTyr_MaiWork.maiwork.tools import Tool
 
         async def big(ctx, args):
             return ToolResult(ok=True, output="长" * 20000)
@@ -413,7 +413,7 @@ class TestWorkersCompaction:
         async def big_handler(ctx, args):
             return ToolResult(ok=True, output=big_text)
 
-        from CharTyr_MaiWork.tools import Tool
+        from CharTyr_MaiWork.maiwork.tools import Tool
 
         tools.register(
             Tool(name="big_out", description="d", parameters={"type": "object", "properties": {}},
@@ -453,7 +453,7 @@ class TestWorkersContextCompaction:
         async def big_handler(ctx, args):
             return ToolResult(ok=True, output=big)
 
-        from CharTyr_MaiWork.tools import Tool
+        from CharTyr_MaiWork.maiwork.tools import Tool
 
         tools.unregister("web_search")
         tools.register(
@@ -503,7 +503,7 @@ class TestWorkersSpill:
         async def huge_out(ctx, args):
             return ToolResult(ok=True, output=huge)
 
-        from CharTyr_MaiWork.tools import Tool
+        from CharTyr_MaiWork.maiwork.tools import Tool
 
         tools.register(
             Tool(name="huge_out", description="d",
@@ -555,12 +555,12 @@ class TestDeadlineWrapUp:
     @pytest.mark.asyncio
     async def test_deadline_forces_submit(self, store, tools, monkeypatch):
         """到点：催一次 submit_result；能交出已找到的就 ok。"""
-        from CharTyr_MaiWork import clock as _clock
+        from CharTyr_MaiWork.maiwork import clock as _clock
 
         t = [1000.0]
         monkeypatch.setattr(_clock, "now", lambda: t[0])
         # workers 也用 clock（直接 import 的模块名）——monkeypatch 两处
-        from CharTyr_MaiWork import workers as _workers
+        from CharTyr_MaiWork.maiwork import workers as _workers
 
         # ⚠️ 这里我们假设 Workers.run 用 clock.now() 判断截止
         models = ReplayModels(
@@ -600,7 +600,7 @@ class TestDeadlineWrapUp:
     @pytest.mark.asyncio
     async def test_deadline_no_submit_fails(self, store, tools):
         """到期强制交回时仍不交 → 失败（保留进展在 summary 里）。"""
-        from CharTyr_MaiWork import clock as _clock
+        from CharTyr_MaiWork.maiwork import clock as _clock
 
         models = ReplayModels(
             [FakeChatResult(tool_calls=[_tool_call("web_search", {"query": "x"}, "c1")]) ] * 5

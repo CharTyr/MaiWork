@@ -197,7 +197,7 @@ class FakeProfiles:
 class FakeHost:
     """假的 Host：预置 Msg 列表，按 [start, end] 过滤返回升序前 limit 条。
 
-    - msgs: list；元素是 CharTyr_MaiWork.host.Msg 或有同名属性的对象。
+    - msgs: list；元素是 CharTyr_MaiWork.maiwork.host.Msg 或有同名属性的对象。
     - session_id: session_for_group 的固定返回值；session_error 非空时抛它。
     - info: group_info 的固定返回 dict；info_error 非空时抛它。
     - 记录：msg_calls=[(session_id, start, end, limit)]、session_calls=[gid]、info_calls=[gid]。
@@ -521,3 +521,29 @@ class FakeCoordinator:
     async def resume(self, task_id: str, answer_text: str) -> None:
         self.resume_calls.append((str(task_id), str(answer_text)))
 
+
+
+# ---------------------------------------------------------------------------
+# feeds 定关注点回复（2026-11 追加，只加不改）：定关注点现在要求 3–5 个，
+# 少于 3 个会带一句追问重试一次——所以绝大多数「走到定关注点」的用例都该喂 ≥3 个。
+# ---------------------------------------------------------------------------
+
+
+def focus_reply(*queries: str) -> str:
+    """造一条定关注点的模型回复 JSON：{"focus":[{"query","why","source"},…]}。
+
+    不传参数时给 3 个互不相同的默认方向（recent/long/explore 各一）；
+    要测「少于 3 个触发重试」的用例显式传 1–2 个 query。
+    """
+    import json as _json
+
+    srcs = ["recent", "long", "explore"]
+    qs = list(queries) or ["FPGA 新动态", "本地大模型新玩法", "开源掌机社区风向"]
+    whys = ["群里最近在聊", "长期兴趣", "拓展方向"]
+    return _json.dumps(
+        {"focus": [
+            {"query": q, "why": whys[i % len(whys)], "source": srcs[i % len(srcs)]}
+            for i, q in enumerate(qs)
+        ]},
+        ensure_ascii=False,
+    )

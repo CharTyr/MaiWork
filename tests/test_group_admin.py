@@ -21,10 +21,10 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from fakes import FakeCtx, FakeProfiles
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.app import MaiWorkApp
-from CharTyr_MaiWork.console.auth import COOKIE_NAME
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.console.auth import COOKIE_NAME
+from CharTyr_MaiWork.maiwork.store import Store
 
 G1 = "900000001"
 G2 = "123456789"
@@ -48,7 +48,7 @@ def _make_store(tmp_path: Path) -> Store:
 
 
 def _make_settings(gids: tuple[str, ...] = (G1, G2)):
-    from CharTyr_MaiWork.config import load_settings
+    from CharTyr_MaiWork.maiwork.config import load_settings
 
     settings, problems = load_settings(
         {
@@ -62,7 +62,7 @@ def _make_settings(gids: tuple[str, ...] = (G1, G2)):
 
 
 def _ga(store: Store, settings=None, auth=None):
-    from CharTyr_MaiWork.group_admins import GroupAdmins
+    from CharTyr_MaiWork.maiwork.group_admins import GroupAdmins
 
     return GroupAdmins(
         store,
@@ -106,7 +106,7 @@ class TestGroupAdminsStore:
         assert ga.has_password(G2) is False
 
     def test_duplicate_password_with_total_admin_rejected(self, tmp_path: Path) -> None:
-        from CharTyr_MaiWork.console.auth import ConsoleAuth
+        from CharTyr_MaiWork.maiwork.console.auth import ConsoleAuth
 
         store = _make_store(tmp_path)
         settings = _make_settings()
@@ -381,7 +381,7 @@ class TestLoginAndCookie:
         assert (await env.login(G2_PW)).status == 200
         assert (await env.me())["group"] == G2
         # 群被移出服务名单 → 旧 cookie 视为 none
-        from CharTyr_MaiWork.config import load_settings
+        from CharTyr_MaiWork.maiwork.config import load_settings
 
         settings = env.app.get_settings()
         only_g1, _ = load_settings(
@@ -892,12 +892,12 @@ class CmdEnv:
 def _cmd_env(tmp_path: Path) -> CmdEnv:
     from fakes import FakeCoordinator, FakeHost
 
-    from CharTyr_MaiWork.approvals import Approvals
-    from CharTyr_MaiWork.commands import Commands
-    from CharTyr_MaiWork.goals import Goals
-    from CharTyr_MaiWork.tasks import Tasks
+    from CharTyr_MaiWork.maiwork.approvals import Approvals
+    from CharTyr_MaiWork.maiwork.commands import Commands
+    from CharTyr_MaiWork.maiwork.goals import Goals
+    from CharTyr_MaiWork.maiwork.tasks import Tasks
 
-    from CharTyr_MaiWork.config import load_settings
+    from CharTyr_MaiWork.maiwork.config import load_settings
 
     store = Store(tmp_path / "cmd.db")
     store.migrate()

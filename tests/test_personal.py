@@ -26,11 +26,11 @@ from typing import Any, Dict, List
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.store import Store
 
-from fakes import FakeCtx, FakeModelsQueue, FakeProfiles
+from fakes import FakeCtx, FakeModelsQueue, FakeProfiles, focus_reply
 from test_feeds import FakeSearch, UnavailableSearch, FakeWorkers, _ok_report  # noqa: F401
 
 BJ = timezone(timedelta(hours=8))
@@ -165,7 +165,7 @@ class _time_patch:
     """临时把 personal.clock.now 钉到 NOW（数据都围 NOW 造）。"""
 
     def __enter__(self):
-        import CharTyr_MaiWork.personal as mod
+        import CharTyr_MaiWork.maiwork.personal as mod
 
         self._mod = mod
         self._orig = mod.clock.now
@@ -213,7 +213,7 @@ def _make_personal(
         {"category": "ongoing", "text": "在做开源硬件项目"},
         {"category": "interest", "text": "本地大模型"},
     ]
-    from CharTyr_MaiWork.personal import Personal
+    from CharTyr_MaiWork.maiwork.personal import Personal
 
     personal = Personal(
         store, models, workers, profiles, topics, lambda: settings, search=search
@@ -412,7 +412,7 @@ class TestPersonalPrepare:
 
     def test_reason_only_quotes_himself(self, tmp_path) -> None:
         """reason 里能引用的原话只来自他本人（chatlog.search_chat 只取该 user_id 的发言）。"""
-        from CharTyr_MaiWork import chatlog
+        from CharTyr_MaiWork.maiwork import chatlog
 
         class _Msg:
             def __init__(self, mid, ts, uid, name, text):
@@ -488,7 +488,7 @@ def _seed_personal_news(store: Store, uid: str = UID, gid: str = GID, *, created
 
 class _feeds_time_patch:
     def __enter__(self):
-        import CharTyr_MaiWork.feeds as mod
+        import CharTyr_MaiWork.maiwork.feeds as mod
 
         self._mod = mod
         self._orig = mod.clock.now
@@ -501,7 +501,7 @@ class _feeds_time_patch:
 
 class _delivery_time_patch:
     def __enter__(self):
-        import CharTyr_MaiWork.delivery as mod
+        import CharTyr_MaiWork.maiwork.delivery as mod
 
         self._mod = mod
         self._orig = mod.clock.now
@@ -515,7 +515,7 @@ class _delivery_time_patch:
 class TestPersonalIsolation:
     def test_news_view_excludes_personal_all_roles(self, tmp_path) -> None:
         """群资讯视图（管理员和群友）都不含个人向条目。"""
-        from CharTyr_MaiWork.feeds import Feeds
+        from CharTyr_MaiWork.maiwork.feeds import Feeds
 
         store = Store(tmp_path / "t.db")
         store.migrate()
@@ -546,7 +546,7 @@ class TestPersonalIsolation:
     def test_guides_ideas_views_exclude_personal(self, tmp_path) -> None:
         """好文专栏不含个人向条目。构想页（2026-09-28 起）含个人向构想、带 target_user_id，
         群友版（admin=False）清掉个人向构想的 basis（画像摘要）。"""
-        from CharTyr_MaiWork.feeds import Feeds
+        from CharTyr_MaiWork.maiwork.feeds import Feeds
 
         store = Store(tmp_path / "t.db")
         store.migrate()
@@ -570,7 +570,7 @@ class TestPersonalIsolation:
 
     def test_topic_matcher_excludes_personal(self, tmp_path) -> None:
         """TopicMatcher 候选不含个人向条目（MaiBot 不会顺着个人向去接话）。"""
-        from CharTyr_MaiWork.delivery import TopicMatcher
+        from CharTyr_MaiWork.maiwork.delivery import TopicMatcher
 
         store = Store(tmp_path / "t.db")
         store.migrate()
@@ -615,7 +615,7 @@ class TestPersonalIsolation:
 
 class TestMentionToMember:
     def _mentions(self, store, settings):
-        from CharTyr_MaiWork.delivery import Mentions
+        from CharTyr_MaiWork.maiwork.delivery import Mentions
 
         return Mentions(store, lambda: settings)
 
@@ -671,7 +671,7 @@ class TestMentionToMember:
 class TestSchedule:
     def test_window_9_to_22(self, tmp_path) -> None:
         """北京时间 9:00–22:00 之外不给到期的人跑。"""
-        from CharTyr_MaiWork.personal import in_personal_window
+        from CharTyr_MaiWork.maiwork.personal import in_personal_window
 
         with _time_patch():
             assert in_personal_window(_bj_ts(2026, 8, 31, 15)) is True   # 15 点（窗内）
@@ -737,7 +737,7 @@ class TestFocusPersonalView:
                 " target_user_id, status_kind) VALUES (?, ?, '给阿二的', ?, 'news', 0, ?, 'pool')",
                 (bid, GID, NOW, UID2),
             )
-        from CharTyr_MaiWork.personal import Personal
+        from CharTyr_MaiWork.maiwork.personal import Personal
 
         settings = _settings()
         personal = Personal(
@@ -757,7 +757,7 @@ class TestFocusPersonalView:
         store = Store(tmp_path / "t.db")
         store.migrate()
         _seed_group(store, GID, ready=True)
-        from CharTyr_MaiWork.personal import Personal
+        from CharTyr_MaiWork.maiwork.personal import Personal
 
         settings = _settings()
         personal = Personal(
@@ -796,7 +796,7 @@ class _fake_clock:
 
     def __enter__(self):
         clock.now = lambda: self._ts
-        import CharTyr_MaiWork.app as app_mod
+        import CharTyr_MaiWork.maiwork.app as app_mod
 
         self._app_mod = app_mod
         self._app_orig = app_mod._now
@@ -813,7 +813,7 @@ class TestMentionRoute:
         import aiohttp
         from aiohttp.test_utils import TestClient, TestServer
 
-        from CharTyr_MaiWork.app import MaiWorkApp
+        from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
         app = MaiWorkApp(FakeCtx({"config.get": "987654321"}), _app_config(tmp_path / "data-mention"), plugin_dir=Path(__file__).resolve().parents[1])
         app.profiles_cls = FakeProfiles
@@ -916,7 +916,7 @@ class _FakePersonal:
 @pytest.mark.asyncio
 class TestAppScheduling:
     async def _app(self, tmp_path: Path, personal):
-        from CharTyr_MaiWork.app import MaiWorkApp
+        from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
         raw = _app_config(tmp_path / "data-sched")
         raw["models"] = {"base_url": "http://127.0.0.1:9/v1", "api_key": "test-key", "main": "m1"}
@@ -942,7 +942,7 @@ class TestAppScheduling:
         _seed_group(store)
         _add_focus_member(store, UID)
         settings = _settings()
-        from CharTyr_MaiWork.personal import Personal
+        from CharTyr_MaiWork.maiwork.personal import Personal
 
         personal = Personal(store, FakeModelsQueue(), FakeWorkers(), FakeProfiles(), FakeTopics(), lambda: settings)
         with _fake_clock(_bj_ts(2026, 8, 31, 23)):
@@ -990,7 +990,7 @@ class TestAppScheduling:
         _seed_group(store)
         _add_focus_member(store, UID)
         settings = _settings({"focus": {"personal_feeds": False}})
-        from CharTyr_MaiWork.personal import Personal
+        from CharTyr_MaiWork.maiwork.personal import Personal
 
         personal = Personal(store, FakeModelsQueue(), FakeWorkers(), FakeProfiles(), FakeTopics(), lambda: settings)
         with _fake_clock(NOW):

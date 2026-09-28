@@ -192,8 +192,8 @@ workspace_root = "/home/maiwork/workspaces"
 memory_max = "512M"
 # 单条命令最长跑多少秒。
 runtime_max_sec = 1800
-# 本机执行方式："systemd"（线上：用 systemd-run 以独立用户跑，带内存/时长上限，隔离）；
-# "direct" 只给本机开发测试用（直接开子进程，没有任何隔离，线上绝不能填这个）。
+# 本机执行方式：只写 "systemd"（用 systemd-run 以独立用户跑，带内存/时长上限，隔离）。
+# 本机开发测试要无隔离的 "direct" 时不用改这里（写了默认也不生效），见 docs/00-开发入门.md。
 local_mode = "systemd"
 # 本机命令以哪个系统用户身份跑（systemd 模式的 --uid/--gid）。
 run_as = "maiwork"
@@ -203,6 +203,8 @@ max_parallel = 2
 command_timeout_s = 300
 # Railway 一次性 VM 每天最多用几台（官方同一出口 IP 每天最多 3 台；留 1 台余量给派活）。
 railway_daily_max = 2
+# 备资讯时挑几条上 Railway 一次性 VM 实测（默认关）。开了会多调一次主模型挑条、多花一台 VM。
+verify_enabled = false
 # 每轮备资讯最多实测几条（同一台 VM 里依次测）。
 verify_per_round = 2
 # 单条资讯/好文实测的时长上限（分钟）。

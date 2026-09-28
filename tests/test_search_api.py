@@ -16,8 +16,8 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from fakes import FakeCtx, FakeProfiles
 
-from CharTyr_MaiWork.app import MaiWorkApp
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.store import Store
 
 PASSWORD = "搜索绑定测试密码-显眼-789"
 G1 = "900000001"

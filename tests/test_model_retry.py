@@ -15,9 +15,9 @@ import json
 import httpx
 import pytest
 
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.models import ModelError, Models
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.models import ModelError, Models
+from CharTyr_MaiWork.maiwork.store import Store
 
 from test_models import SECRET, FakeEndpoint, _chat_payload, _patch, _settings, _transport, _usage_rows
 
@@ -133,7 +133,7 @@ class TestRetryBehavior:
         所以超时一次后要成功，要用自定义 handler（不能依赖 FakeEndpoint 的 calls 索引）。
         """
         slept: list[float] = []
-        import CharTyr_MaiWork.models as mm
+        import CharTyr_MaiWork.maiwork.models as mm
 
         async def _rec(s: float) -> None:
             slept.append(s)
@@ -184,7 +184,7 @@ class TestRetryBehavior:
     async def test_5xx_retries_same_model(self, tmp_path, monkeypatch) -> None:
         """5xx 也是可重试错误：同一模型重试，不立刻换备用。"""
         slept: list[float] = []
-        import CharTyr_MaiWork.models as mm
+        import CharTyr_MaiWork.maiwork.models as mm
 
         async def _rec(s: float) -> None:
             slept.append(s)
@@ -211,7 +211,7 @@ class TestRetryBehavior:
     async def test_429_honors_retry_after(self, tmp_path, monkeypatch) -> None:
         """429 带 Retry-After=30：整个端点冷却 30 秒后才重试（不再用 retry_delay_s=5）。"""
         slept: list[float] = []
-        import CharTyr_MaiWork.models as mm
+        import CharTyr_MaiWork.maiwork.models as mm
 
         async def _rec(s: float) -> None:
             slept.append(s)
@@ -247,7 +247,7 @@ class TestRetryBehavior:
     async def test_429_retry_after_capped_120(self, tmp_path, monkeypatch) -> None:
         """Retry-After 再大也最多 120 秒（防端点胡来把请求卡死）。"""
         slept: list[float] = []
-        import CharTyr_MaiWork.models as mm
+        import CharTyr_MaiWork.maiwork.models as mm
 
         async def _rec(s: float) -> None:
             slept.append(s)
@@ -270,7 +270,7 @@ class TestRetryBehavior:
     async def test_429_without_header_uses_endpoint_backoff(self, tmp_path, monkeypatch) -> None:
         """429 没有 Retry-After：按端点退避 10 秒（±20% 抖动），不再用 retry_delay_s=8。"""
         slept: list[float] = []
-        import CharTyr_MaiWork.models as mm
+        import CharTyr_MaiWork.maiwork.models as mm
 
         async def _rec(s: float) -> None:
             slept.append(s)
@@ -339,7 +339,7 @@ class TestRetryBehavior:
     async def test_switches_backup_immediately_outside_backoff(self, tmp_path, monkeypatch) -> None:
         """换备用模型之间没有重试等待（等待只发生在同一模型的两次尝试之间）。"""
         slept: list[float] = []
-        import CharTyr_MaiWork.models as mm
+        import CharTyr_MaiWork.maiwork.models as mm
 
         async def _rec(s: float) -> None:
             slept.append(s)
@@ -364,7 +364,7 @@ class TestRetryBehavior:
     async def test_retries_param_overrides_settings(self, tmp_path, monkeypatch) -> None:
         """chat(retries=1)：后台主循环里直接 await 的调用不能默认 5 次把循环卡住。"""
         slept: list[float] = []
-        import CharTyr_MaiWork.models as mm
+        import CharTyr_MaiWork.maiwork.models as mm
 
         async def _rec(s: float) -> None:
             slept.append(s)

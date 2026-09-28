@@ -1451,8 +1451,8 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         if err is not None:
             return err
         action = str(args.get("action") or "").strip().lower()
-        if action not in ("delete", "rename", "move", "mkdir"):
-            return _bad("action 只能是 delete / rename / move / mkdir")
+        if action not in ("delete", "rename", "move", "mkdir", "rmdir"):
+            return _bad("action 只能是 delete / rename / move / mkdir / rmdir")
         space = _group_space(gid)
         if space is None:
             return _bad("群空间能力没就位，这次动不了群文件")
@@ -1467,6 +1467,8 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                 await space.rename_file(gid, str(args.get("file_id") or ""), str(args.get("name") or ""))
             elif action == "move":
                 await space.move_file(gid, str(args.get("file_id") or ""), str(args.get("folder_id") or ""))
+            elif action == "rmdir":
+                await space.delete_folder(gid, str(args.get("folder_id") or ""))
             else:
                 await space.create_folder(gid, str(args.get("name") or ""), str(args.get("folder_id") or "") or None)
         except Exception as e:
@@ -2231,15 +2233,18 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         (
             {
                 "name": "group_file_manage",
-                "description": "管群文件：delete / rename / move / mkdir（要管理员确认；只能动机器人自己传的文件）。",
+                "description": (
+                    "管群文件：delete / rename / move / mkdir / rmdir（要管理员确认；"
+                    "文件和文件夹都只能动机器人自己传 / 自己建的，删文件夹时里面只能有自己的东西）。"
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "group_id": {"type": "string", "description": "群号（可选）"},
-                        "action": {"type": "string", "enum": ["delete", "rename", "move", "mkdir"]},
+                        "action": {"type": "string", "enum": ["delete", "rename", "move", "mkdir", "rmdir"]},
                         "file_id": {"type": "string", "description": "文件编号"},
                         "name": {"type": "string", "description": "新名字 / 文件夹名"},
-                        "folder_id": {"type": "string", "description": "目标文件夹"},
+                        "folder_id": {"type": "string", "description": "目标文件夹 / 要删的文件夹"},
                     },
                     "required": ["action"],
                 },

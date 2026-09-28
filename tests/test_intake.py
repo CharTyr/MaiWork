@@ -11,8 +11,8 @@ import pytest
 
 from fakes import hook_message
 
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.intake import Intake, Signal, Signals
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.intake import Intake, Signal, Signals
 
 
 def _settings(serve: list[dict]) -> object:
@@ -157,7 +157,7 @@ class TestGarbageTolerance:
 
     @pytest.mark.asyncio
     async def test_hook_exception_swallowed(self, monkeypatch) -> None:
-        from CharTyr_MaiWork import intake as intake_mod
+        from CharTyr_MaiWork.maiwork import intake as intake_mod
 
         settings, _ = load_settings({"groups": {"serve": [{"group": "qq:900000001"}]}})
         signals = Signals()

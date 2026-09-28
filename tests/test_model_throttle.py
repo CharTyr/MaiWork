@@ -27,9 +27,9 @@ from typing import Any
 import httpx
 import pytest
 
-import CharTyr_MaiWork.models as mm
-from CharTyr_MaiWork.models import ModelError, Models
-from CharTyr_MaiWork.store import Store
+import CharTyr_MaiWork.maiwork.models as mm
+from CharTyr_MaiWork.maiwork.models import ModelError, Models
+from CharTyr_MaiWork.maiwork.store import Store
 
 from test_models import SECRET, _chat_payload, _settings
 

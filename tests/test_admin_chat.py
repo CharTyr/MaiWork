@@ -23,13 +23,13 @@ from typing import Any
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.admin_chat import AdminChat, ChatBusy
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.identity import Identity
-from CharTyr_MaiWork.models import ChatResult, ModelError
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tools import Tool, ToolContext, ToolResult, Tools
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.admin_chat import AdminChat, ChatBusy
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.identity import Identity
+from CharTyr_MaiWork.maiwork.models import ChatResult, ModelError
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tools import Tool, ToolContext, ToolResult, Tools
 
 G1 = "900000001"
 G2 = "123456789"
@@ -774,7 +774,7 @@ class TestConfirm:
 
     @pytest.mark.asyncio
     async def test_decided_pending_raises_pending_decided(self, svc: _Svc) -> None:
-        from CharTyr_MaiWork.admin_chat import PendingDecided
+        from CharTyr_MaiWork.maiwork.admin_chat import PendingDecided
 
         chat, cid = _chat(svc, G1)
         pid = _seed_pending(svc, cid)
@@ -844,7 +844,7 @@ class TestConfirm:
 
 class TestRealGate:
     def _wire(self, svc: _Svc) -> None:
-        from CharTyr_MaiWork.tools_admin import register_admin_tools
+        from CharTyr_MaiWork.maiwork.tools_admin import register_admin_tools
 
         svc.admin_pending = register_admin_tools(svc.tools, svc)
 

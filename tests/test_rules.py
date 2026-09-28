@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.store import Store
 
 
 @pytest.fixture
@@ -36,33 +36,33 @@ def _base(cfg: dict | None = None):
 
 class TestValidate:
     def test_valid_patch(self):
-        from CharTyr_MaiWork.rules import validate_patch
+        from CharTyr_MaiWork.maiwork.rules import validate_patch
 
         key, value = validate_patch("delivery.quiet_hours", "22:30-07:00")
         assert key == "delivery.quiet_hours"
         assert value == "22:30-07:00"
 
     def test_unknown_section_rejected(self):
-        from CharTyr_MaiWork.rules import validate_patch
+        from CharTyr_MaiWork.maiwork.rules import validate_patch
 
         with pytest.raises(ValueError, match="不认识的规则"):
             validate_patch("models.main", "x")
 
     def test_unknown_field_rejected(self):
-        from CharTyr_MaiWork.rules import validate_patch
+        from CharTyr_MaiWork.maiwork.rules import validate_patch
 
         with pytest.raises(ValueError, match="不认识的规则"):
             validate_patch("delivery.mention_ttl_minutes", 30)
 
     def test_bad_shape(self):
-        from CharTyr_MaiWork.rules import validate_patch
+        from CharTyr_MaiWork.maiwork.rules import validate_patch
 
         for bad in ("delivery", "delivery.", ".quiet_hours", "delivery.quiet_hours.x", "Delivery.quiet_hours"):
             with pytest.raises(ValueError):
                 validate_patch(bad, "23:00-08:00")
 
     def test_quiet_hours_format(self):
-        from CharTyr_MaiWork.rules import validate_patch
+        from CharTyr_MaiWork.maiwork.rules import validate_patch
 
         for bad in ("23:00", "23:00-25:00", "23:00-8:00", "23:60-08:00", "23-08", "23:00~08:00", "", 2300, None):
             with pytest.raises(ValueError, match="睡觉时段"):
@@ -72,7 +72,7 @@ class TestValidate:
         assert v == "08:00-08:00"
 
     def test_news_slots(self):
-        from CharTyr_MaiWork.rules import validate_patch
+        from CharTyr_MaiWork.maiwork.rules import validate_patch
 
         _, v = validate_patch("feeds.news_slots", ["08:30", " 14:00 ", "19:00"])
         assert v == ["08:30", "14:00", "19:00"]
@@ -81,7 +81,7 @@ class TestValidate:
                 validate_patch("feeds.news_slots", bad)
 
     def test_push_per_day_range(self):
-        from CharTyr_MaiWork.rules import validate_patch
+        from CharTyr_MaiWork.maiwork.rules import validate_patch
 
         _, v = validate_patch("delivery.push_per_day", 5)
         assert v == 5
@@ -90,7 +90,7 @@ class TestValidate:
                 validate_patch("delivery.push_per_day", bad)
 
     def test_topics_fields(self):
-        from CharTyr_MaiWork.rules import validate_patch
+        from CharTyr_MaiWork.maiwork.rules import validate_patch
 
         _, v = validate_patch("topics.enabled", False)
         assert v is False
@@ -108,7 +108,7 @@ class TestValidate:
             validate_patch("topics.enabled", "yes")
 
     def test_approval_fields(self):
-        from CharTyr_MaiWork.rules import validate_patch
+        from CharTyr_MaiWork.maiwork.rules import validate_patch
 
         key, v = validate_patch("approval.admins", ["10001", " 10002 "])
         assert v == ["qq:10001", "qq:10002"]  # 纯数字当 qq（「平台:账号」写法）
@@ -126,7 +126,7 @@ class TestValidate:
             validate_patch("approval.remind", [])
 
     def test_feeds_scores(self):
-        from CharTyr_MaiWork.rules import validate_patch
+        from CharTyr_MaiWork.maiwork.rules import validate_patch
 
         _, v = validate_patch("feeds.web_min_avg", 3.5)
         assert v == 3.5
@@ -153,14 +153,14 @@ class TestValidate:
 
 class TestSave:
     def test_save_and_read(self, store: Store):
-        from CharTyr_MaiWork import rules
+        from CharTyr_MaiWork.maiwork import rules
 
         out = rules.save_patch(store, {"delivery": {"push_per_day": 5}, "topics": {"enabled": False}})
         assert out == {"delivery": {"push_per_day": 5}, "topics": {"enabled": False}}
         assert store.kv_get(rules.KV_OVERRIDE) == {"delivery": {"push_per_day": 5}, "topics": {"enabled": False}}
 
     def test_save_merges_with_existing(self, store: Store):
-        from CharTyr_MaiWork import rules
+        from CharTyr_MaiWork.maiwork import rules
 
         rules.save_patch(store, {"delivery": {"push_per_day": 5}})
         rules.save_patch(store, {"delivery": {"quiet_hours": "22:00-07:00"}})
@@ -169,21 +169,21 @@ class TestSave:
         }
 
     def test_bad_field_rejects_whole_patch(self, store: Store):
-        from CharTyr_MaiWork import rules
+        from CharTyr_MaiWork.maiwork import rules
 
         with pytest.raises(ValueError):
             rules.save_patch(store, {"delivery": {"push_per_day": 0, "quiet_hours": "22:00-07:00"}})
         assert store.kv_get(rules.KV_OVERRIDE) is None
 
     def test_empty_section_ignored(self, store: Store):
-        from CharTyr_MaiWork import rules
+        from CharTyr_MaiWork.maiwork import rules
 
         out = rules.save_patch(store, {"delivery": {}, "topics": {"enabled": False}})
         assert out == {"topics": {"enabled": False}}
 
     def test_na_equal_override_removed(self, store: Store):
         """写成和 config.toml 一样的值 = 没改，这条覆盖自动清掉。"""
-        from CharTyr_MaiWork import rules
+        from CharTyr_MaiWork.maiwork import rules
 
         base = _base({"delivery": {"push_per_day": 3}})
         out = rules.save_patch(store, {"delivery": {"push_per_day": 3}}, base=base)
@@ -191,14 +191,14 @@ class TestSave:
         assert store.kv_get(rules.KV_OVERRIDE) in (None, {})
 
     def test_unknown_key_in_patch_rejected(self, store: Store):
-        from CharTyr_MaiWork import rules
+        from CharTyr_MaiWork.maiwork import rules
 
         with pytest.raises(ValueError):
             rules.save_patch(store, {"delivery": {"push_per_day": 3, "bogus": 1}})
         assert store.kv_get(rules.KV_OVERRIDE) is None
 
     def test_reset_field(self, store: Store):
-        from CharTyr_MaiWork import rules
+        from CharTyr_MaiWork.maiwork import rules
 
         rules.save_patch(store, {"delivery": {"push_per_day": 5, "quiet_hours": "22:00-07:00"}})
         rules.reset_field(store, "delivery.push_per_day")
@@ -219,7 +219,7 @@ class TestSave:
 
 class TestMerge:
     def test_merge_replaces_named_fields(self, store: Store):
-        from CharTyr_MaiWork import rules
+        from CharTyr_MaiWork.maiwork import rules
 
         base = _base({"delivery": {"push_per_day": 3, "quiet_hours": "23:00-08:00"}})
         over = {"delivery": {"push_per_day": 6}}
@@ -231,7 +231,7 @@ class TestMerge:
         assert base.delivery.push_per_day == 3
 
     def test_merge_all_sections(self, store: Store):
-        from CharTyr_MaiWork import rules
+        from CharTyr_MaiWork.maiwork import rules
 
         base = _base({})
         over = {
@@ -262,7 +262,7 @@ class TestMerge:
 
     def test_merge_ignores_dirty_kv(self, store: Store):
         """kv 被人手改坏了：能用的字段接着用，坏的静默忽略（不能让网页设置把配置搞炸）。"""
-        from CharTyr_MaiWork import rules
+        from CharTyr_MaiWork.maiwork import rules
 
         base = _base({"delivery": {"push_per_day": 3}})
         over = {"delivery": {"push_per_day": "not-a-number", "quiet_hours": "22:00-07:00"}, "bogus": {"x": 1}}
@@ -271,7 +271,7 @@ class TestMerge:
         assert merged.delivery.quiet_hours == "22:00-07:00"
 
     def test_merge_none_override_returns_base(self, store: Store):
-        from CharTyr_MaiWork import rules
+        from CharTyr_MaiWork.maiwork import rules
 
         base = _base({})
         assert rules.effective_settings(base, None) is base
@@ -286,7 +286,7 @@ class TestMerge:
 
 class TestView:
     def test_view_structure_and_overridden(self, store: Store):
-        from CharTyr_MaiWork import rules
+        from CharTyr_MaiWork.maiwork import rules
 
         base = _base({
             "delivery": {"push_per_day": 3, "quiet_hours": "23:00-08:00"},

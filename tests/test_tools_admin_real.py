@@ -22,10 +22,10 @@ import pytest
 
 from fakes import FakeCtx
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.app import MaiWorkApp
-from CharTyr_MaiWork.admin_chat import AdminChat
-from CharTyr_MaiWork.tools import ToolContext
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.admin_chat import AdminChat
+from CharTyr_MaiWork.maiwork.tools import ToolContext
 
 G1 = "900000001"
 G2 = "123456789"
@@ -84,7 +84,7 @@ def _seed(app: MaiWorkApp) -> None:
     p.set_focus(G1, "10003", "add")
 
     # 群聊记录（chatlog.record_messages 是真写入入口，走真路径）
-    from CharTyr_MaiWork import chatlog
+    from CharTyr_MaiWork.maiwork import chatlog
 
     msgs = [
         type("M", (), {"is_bot": False, "text": "有没有地方能白嫖一台临时机器跑下备份迁移",
@@ -189,7 +189,7 @@ def app(tmp_path: Path):
     tools.call / gate.execute 仍由 pytest-asyncio 自己的循环跑（后台派工在测试体
     里发生，不会跨循环）。
     """
-    from CharTyr_MaiWork.tools_admin import _APPROVED_CTX, _CHAT_CTX
+    from CharTyr_MaiWork.maiwork.tools_admin import _APPROVED_CTX, _CHAT_CTX
 
     _CHAT_CTX.set((0, 0))
     _APPROVED_CTX.set(None)
@@ -396,7 +396,7 @@ class TestWriteTools:
     async def test_rss_add_then_remove_confirmed(self, app) -> None:
         r = await _call(app, "rss_add", {"group_id": G1, "url": "https://example.com/feed.xml", "title": "测试源"})
         assert r.ok, r.error
-        from CharTyr_MaiWork import rss as _rss
+        from CharTyr_MaiWork.maiwork import rss as _rss
 
         rows = _rss.list_feeds(app.store, G1)
         assert len(rows) == 1
@@ -477,7 +477,7 @@ class TestDangerTools:
     @pytest.mark.asyncio
     async def test_group_album_upload_confirmed(self, app, tmp_path: Path) -> None:
         # 拿一个绝对存在的目录当 workspace_root 注入（config 的默认根在开发机上建不出来）
-        from CharTyr_MaiWork.config import load_settings
+        from CharTyr_MaiWork.maiwork.config import load_settings
 
         ws_root = tmp_path / "wsroot"
         (ws_root / "tinker").mkdir(parents=True)
@@ -485,6 +485,9 @@ class TestDangerTools:
         raw["environments"] = {"workspace_root": str(ws_root)}
         settings, _ = load_settings(raw)
         app._settings = settings
+        # 换了 settings 就重判一次执行方式（生产走 start/update_config，两条都会重判）；
+        # 不然 get_settings 会把工作区根按上一次判定的结果修正，注入的 ws_root 不生效
+        app._detect_local_capability()
         assert "mw_effective" not in app.__dict__ or app.__dict__.pop("_mw_effective", None) is None
         pic = ws_root / "tinker" / "pic.png"
         pic.write_bytes(b"\x89PNG\r\n\x1a\n")
@@ -500,7 +503,7 @@ class TestDangerTools:
 
     @pytest.mark.asyncio
     async def test_skill_delete_confirmed(self, app) -> None:
-        from CharTyr_MaiWork.skills import Skills
+        from CharTyr_MaiWork.maiwork.skills import Skills
 
         skills = Skills(app.get_settings().data_dir)
         root = Path(app.get_settings().data_dir) / "skills" / "demo-skill"
@@ -712,7 +715,7 @@ class TestCancelStopsSubAgent:
 
     @pytest.mark.asyncio
     async def test_cancel_stops_running_worker_no_new_model_call(self, app) -> None:
-        from CharTyr_MaiWork.workers import Workers
+        from CharTyr_MaiWork.maiwork.workers import Workers
 
         calls = {"n": 0}
 
@@ -740,7 +743,7 @@ class TestCancelStopsSubAgent:
         async def _noop(ctx, args):
             return type("TR", (), {"ok": True, "output": "好", "error": "", "data": None})()
 
-        from CharTyr_MaiWork.tools import Tool
+        from CharTyr_MaiWork.maiwork.tools import Tool
 
         tools.register(Tool(name="noop_tool", description="占位", parameters={"type": "object", "properties": {}},
                             roles=frozenset({"worker"}), handler=_noop))

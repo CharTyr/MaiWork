@@ -17,9 +17,9 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.store import Store
 
 pytestmark = pytest.mark.asyncio
 
@@ -126,7 +126,7 @@ class TestM9TaskExceptionGuards:
     async def test_on_long_job_done_swallows_cancelled(self, tmp_path: Path) -> None:
         from fakes import FakeCtx, FakeProfiles
 
-        from CharTyr_MaiWork.app import MaiWorkApp
+        from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
         raw = {
             "plugin": {"enabled": False},
@@ -153,10 +153,10 @@ class TestM9TaskExceptionGuards:
         """commands._start_task 的 create_task 带 done callback：协程炸了进日志。"""
         from fakes import FakeCtx, FakeProfiles
 
-        from CharTyr_MaiWork.app import MaiWorkApp
-        from CharTyr_MaiWork.commands import Commands
-        from CharTyr_MaiWork.config import load_settings
-        from CharTyr_MaiWork.store import Store
+        from CharTyr_MaiWork.maiwork.app import MaiWorkApp
+        from CharTyr_MaiWork.maiwork.commands import Commands
+        from CharTyr_MaiWork.maiwork.config import load_settings
+        from CharTyr_MaiWork.maiwork.store import Store
 
         store = Store(tmp_path / "t.db")
         store.migrate()

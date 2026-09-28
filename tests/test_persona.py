@@ -11,12 +11,12 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.host import Msg
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.profile import Profiles
-from CharTyr_MaiWork.persona import Personas
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.host import Msg
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.profile import Profiles
+from CharTyr_MaiWork.maiwork.persona import Personas
 
 from fakes import FakeHost, FakeModels, FakeModelsQueue
 
@@ -584,7 +584,7 @@ class TestGroupViewFocusPersona:
         return _Svc(store)
 
     def test_focus_items_have_persona_or_null(self, store: Store, frozen_now: float) -> None:
-        from CharTyr_MaiWork.console import views as view_mod
+        from CharTyr_MaiWork.maiwork.console import views as view_mod
 
         p = Profiles(store, FakeHost([]), FakeModels(False), lambda: SETTINGS)
         p.remember_session(GID, "sess-1", T0)
@@ -612,7 +612,7 @@ class TestGroupViewFocusPersona:
 
     def test_bad_persona_json_gives_null(self, store: Store, frozen_now: float) -> None:
         """库里 persona 是残缺 JSON（或根本不是 JSON）：不顶 view 崩，是 null。"""
-        from CharTyr_MaiWork.console import views as view_mod
+        from CharTyr_MaiWork.maiwork.console import views as view_mod
 
         p = Profiles(store, FakeHost([]), FakeModels(False), lambda: SETTINGS)
         p.remember_session(GID, "sess-1", T0)
@@ -627,7 +627,7 @@ class TestGroupViewFocusPersona:
 
     def test_member_view_real_group_view_drops_focus(self, store: Store, frozen_now: float) -> None:
         """真实 views.group_view（admin=False）→ focus 整个字段被拿走，persona 绝无可能泄露。"""
-        from CharTyr_MaiWork.console import views as view_mod
+        from CharTyr_MaiWork.maiwork.console import views as view_mod
 
         p = Profiles(store, FakeHost([]), FakeModels(False), lambda: SETTINGS)
         p.remember_session(GID, "sess-1", T0)
@@ -674,7 +674,7 @@ class TestAppPersonaRound:
     async def test_app_spawns_at_most_one_refresh_per_group_per_round(
         self, store: Store, frozen_now: float
     ) -> None:
-        from CharTyr_MaiWork.app import MaiWorkApp
+        from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
         # 不用 _app / FakeCtx，直接用 MaiWorkApp 但只验 _persona_round 这一块
         app = MaiWorkApp(ctx=None, raw_config={}, plugin_dir=Path(__file__).resolve().parents[1])
@@ -708,7 +708,7 @@ class TestAppPersonaRound:
         self, store: Store, frozen_now: float
     ) -> None:
         """同一群同刻只跑一个：due=[A,B,C] 时，跑完 A 之前不能又 spawn 一个新的。"""
-        from CharTyr_MaiWork.app import MaiWorkApp
+        from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
         app = MaiWorkApp(ctx=None, raw_config={}, plugin_dir=Path(__file__).resolve().parents[1])
         app._settings = SETTINGS
@@ -743,7 +743,7 @@ class TestAppPersonaRound:
         self, store: Store, frozen_now: float
     ) -> None:
         """personal_profile 关掉时，完全不调 due、不 spawn。"""
-        from CharTyr_MaiWork.app import MaiWorkApp
+        from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
         settings_off = _settings(personal_profile=False)
         app = MaiWorkApp(ctx=None, raw_config={}, plugin_dir=Path(__file__).resolve().parents[1])

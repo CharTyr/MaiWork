@@ -44,11 +44,18 @@ class HostContractTest(unittest.TestCase):
         """宿主 venv 里每个模块都能导入（相对导入、依赖版本）。"""
         import importlib
 
-        names = [f.stem for f in PLUGIN_DIR.glob("*.py") if not f.name.startswith("._")]
-        names += ["console." + f.stem for f in (PLUGIN_DIR / "console").glob("*.py") if not f.name.startswith("._")]
-        for n in names:
-            if n in ("__init__", "console.__init__"):
+        # 入口 plugin.py + maiwork/ 子包里的全部模块（含 console / environments / platforms）
+        importlib.import_module("CharTyr_MaiWork.plugin")
+        src = PLUGIN_DIR / "maiwork"
+        names = []
+        for f in sorted(src.rglob("*.py")):
+            if f.name.startswith("._") or "__pycache__" in f.parts:
                 continue
+            rel = f.relative_to(src).with_suffix("")
+            parts = [p for p in rel.parts if p != "__init__"]
+            names.append(".".join(["maiwork", *parts]))
+        assert len(names) > 40, names
+        for n in names:
             importlib.import_module(f"CharTyr_MaiWork.{n}")
 
     def test_hook_registered(self) -> None:

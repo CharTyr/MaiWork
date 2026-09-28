@@ -6,8 +6,8 @@ import asyncio
 
 import pytest
 
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tools import Tool, ToolContext, ToolResult, Tools
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tools import Tool, ToolContext, ToolResult, Tools
 
 
 @pytest.fixture

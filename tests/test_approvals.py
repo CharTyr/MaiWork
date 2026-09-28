@@ -16,11 +16,11 @@ import json
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.approvals import Approvals
-from CharTyr_MaiWork.goals import Goals
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tasks import Tasks
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.approvals import Approvals
+from CharTyr_MaiWork.maiwork.goals import Goals
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tasks import Tasks
 
 NOW = 1_790_000_000.0
 GID = "900000001"
@@ -336,7 +336,7 @@ class TestCanCancel:
 
     def _mk_task(self, mem_store, gid: str, requester: str = "10001") -> str:
         with mem_store.tx() as conn:
-            from CharTyr_MaiWork.store import next_id
+            from CharTyr_MaiWork.maiwork.store import next_id
             tid = next_id(conn, "T")
             conn.execute(
                 "INSERT INTO tasks (id, group_id, workspace, source, requester_id, requester_name,"
@@ -348,7 +348,7 @@ class TestCanCancel:
 
     def _mk_goal(self, mem_store, gid: str, who: str = "10001") -> str:
         with mem_store.tx() as conn:
-            from CharTyr_MaiWork.store import next_id
+            from CharTyr_MaiWork.maiwork.store import next_id
             gid_ = next_id(conn, "G")
             conn.execute(
                 "INSERT INTO goals (id, group_id, kind, icon, title, who_id, who_name,"

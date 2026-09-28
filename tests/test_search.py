@@ -12,11 +12,11 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.mcp_client import MCPError
-from CharTyr_MaiWork.search import Search, SearchError, SearchUnavailable, _SNIPPET_MAX
-from CharTyr_MaiWork.search_binding import set_binding
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.mcp_client import MCPError
+from CharTyr_MaiWork.maiwork.search import Search, SearchError, SearchUnavailable, _SNIPPET_MAX
+from CharTyr_MaiWork.maiwork.search_binding import set_binding
+from CharTyr_MaiWork.maiwork.store import Store
 
 TAVILY_SCHEMA = {
     "type": "object",
@@ -92,7 +92,7 @@ class FakeExt:
     @property
     def entry(self):
         """status_of 走 extensions_web.merged_entries 用的配置条目。"""
-        from CharTyr_MaiWork.config import McpExtensionSetting
+        from CharTyr_MaiWork.maiwork.config import McpExtensionSetting
 
         return McpExtensionSetting(
             name=self.name, url=self.url, enabled=self.enabled,
@@ -420,7 +420,7 @@ class TestExtract:
 class TestRetry5xx:
     @pytest.mark.asyncio
     async def test_5xx_retried_once(self, store: Store, monkeypatch) -> None:
-        from CharTyr_MaiWork import search as search_mod
+        from CharTyr_MaiWork.maiwork import search as search_mod
 
         monkeypatch.setattr(search_mod, "_MCP_RETRY_DELAY_S", 0.0)
         client = FakeClient([MCPError("MCP 服务返回 HTTP 525"), _text_result({"results": [{"url": "https://e.com", "content": "好"}]})])
@@ -432,7 +432,7 @@ class TestRetry5xx:
 
     @pytest.mark.asyncio
     async def test_5xx_twice_raises(self, store: Store, monkeypatch) -> None:
-        from CharTyr_MaiWork import search as search_mod
+        from CharTyr_MaiWork.maiwork import search as search_mod
 
         monkeypatch.setattr(search_mod, "_MCP_RETRY_DELAY_S", 0.0)
         client = FakeClient([MCPError("MCP 服务返回 HTTP 500"), MCPError("MCP 服务返回 HTTP 525")])

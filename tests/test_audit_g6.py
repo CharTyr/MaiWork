@@ -10,9 +10,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.profile import Profiles
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.profile import Profiles
+from CharTyr_MaiWork.maiwork.store import Store
 
 G1 = "900000001"
 G2 = "123456789"

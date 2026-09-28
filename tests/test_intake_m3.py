@@ -15,8 +15,8 @@ import pytest
 
 from fakes import hook_message
 
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.intake import Intake, Signals
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.intake import Intake, Signals
 
 G1 = "900000001"
 
@@ -425,7 +425,7 @@ class TestM3Resilience:
 @pytest.mark.asyncio
 async def test_at_with_other_plugin_command_is_ignored() -> None:
     """线上实测：`@MaiBot /pic …` 是画图插件的指令，不问 Jev、不进慢路径、不建请求。"""
-    from CharTyr_MaiWork.intake import _is_command
+    from CharTyr_MaiWork.maiwork.intake import _is_command
     assert _is_command("/pic nsfw 猫")
     assert _is_command("  ！remind 明天")
     assert not _is_command("帮我整理一份清单 /pic 在后面也不算指令")
@@ -438,7 +438,7 @@ async def test_at_with_other_plugin_command_is_ignored() -> None:
 
 class TestIdeaRefWithItems:
     def test_parse_wanted_forms(self) -> None:
-        from CharTyr_MaiWork.intake import parse_idea_wanted
+        from CharTyr_MaiWork.maiwork.intake import parse_idea_wanted
         # 没写「要做」→ None（= 全部项目）
         assert parse_idea_wanted("") is None
         assert parse_idea_wanted("，") is None
@@ -455,7 +455,7 @@ class TestIdeaRefWithItems:
 
     @pytest.mark.asyncio
     async def test_idea_request_carries_selected_items(self, tmp_path) -> None:
-        from CharTyr_MaiWork.store import Store
+        from CharTyr_MaiWork.maiwork.store import Store
 
         store = Store(tmp_path / "t.db")
         store.migrate()
@@ -491,7 +491,7 @@ class TestIdeaRefWithItems:
 
     @pytest.mark.asyncio
     async def test_idea_request_without_wanted_means_all(self, tmp_path) -> None:
-        from CharTyr_MaiWork.store import Store
+        from CharTyr_MaiWork.maiwork.store import Store
 
         store = Store(tmp_path / "t.db")
         store.migrate()

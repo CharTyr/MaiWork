@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from CharTyr_MaiWork import clock
+from CharTyr_MaiWork.maiwork import clock
 
 from test_console import G1, PASSWORD, SimpleEnv, env  # noqa: F401  (env 是 fixture)
 
@@ -133,8 +133,8 @@ class TestIdeaTarget:
 # 群里 @MaiBot 带「构想 #N」→ 按构想建待批请求
 # ----------------------------------------------------------------------
 
-from CharTyr_MaiWork.intake import Intake, Signals  # noqa: E402
-from CharTyr_MaiWork.store import Store  # noqa: E402
+from CharTyr_MaiWork.maiwork.intake import Intake, Signals  # noqa: E402
+from CharTyr_MaiWork.maiwork.store import Store  # noqa: E402
 from fakes import hook_message  # noqa: E402
 from test_intake_m3 import _FakeApprovals, _FakeJev, _FakeMentions, _settings  # noqa: E402
 

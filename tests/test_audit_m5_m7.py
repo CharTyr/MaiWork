@@ -17,11 +17,11 @@ import pytest
 
 pytestmark = pytest.mark.asyncio
 
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.feeds import Feeds
-from CharTyr_MaiWork.search import Search, SearchUnavailable
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tools import Tools, ToolContext, ToolResult
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.feeds import Feeds
+from CharTyr_MaiWork.maiwork.search import Search, SearchUnavailable
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tools import Tools, ToolContext, ToolResult
 
 GID = "900000001"
 
@@ -45,7 +45,7 @@ class TestM7SearchCheckBindingOnly:
     @pytest.mark.asyncio
     async def test_real_search_bound_no_network(self, tmp_path: Path) -> None:
         """绑好了：自检只看绑定状态，一次网络请求都不发（client 里埋了断言雷）。"""
-        from CharTyr_MaiWork.search_binding import set_binding
+        from CharTyr_MaiWork.maiwork.search_binding import set_binding
 
         store = Store(tmp_path / "t.db")
         store.migrate()
@@ -103,7 +103,7 @@ class TestM5PersistMasking:
     async def test_summarize_output_masked(self, tmp_path: Path) -> None:
         """工具的 summarize 把密钥直接写进了 output 摘要 → 落库前被遮掉。"""
         tools, store = self._tools(tmp_path, [])
-        from CharTyr_MaiWork.tools import Tool
+        from CharTyr_MaiWork.maiwork.tools import Tool
 
         async def handler(ctx, args):
             return ToolResult(ok=True, output="done")
@@ -122,7 +122,7 @@ class TestM5PersistMasking:
 
     async def test_sk_pattern_masked(self, tmp_path: Path) -> None:
         tools, store = self._tools(tmp_path, [])
-        from CharTyr_MaiWork.tools import Tool
+        from CharTyr_MaiWork.maiwork.tools import Tool
 
         async def handler(ctx, args):
             return ToolResult(ok=True, output=f"token: sk-abcdefghijklmnop")
@@ -139,7 +139,7 @@ class TestM5PersistMasking:
     async def test_known_secrets_masked(self, tmp_path: Path) -> None:
         """get_known_secrets 回调给的密钥（比如模型密钥）出现在摘要里也要遮。"""
         tools, store = self._tools(tmp_path, ["my-model-key-987654"])
-        from CharTyr_MaiWork.tools import Tool
+        from CharTyr_MaiWork.maiwork.tools import Tool
 
         async def handler(ctx, args):
             return ToolResult(ok=True, output="端点鉴权失败 my-model-key-987654 无效")
@@ -158,7 +158,7 @@ class TestM5PersistMasking:
         store = Store(tmp_path / "t.db")
         store.migrate()
         tools = Tools(store)
-        from CharTyr_MaiWork.tools import Tool
+        from CharTyr_MaiWork.maiwork.tools import Tool
 
         async def handler(ctx, args):
             return ToolResult(ok=True, output="用 Bearer xyztoken123456 调的")

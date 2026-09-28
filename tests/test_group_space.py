@@ -19,13 +19,13 @@ import pytest
 
 from fakes import FakeCtx
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.host import Host, HostError
-from CharTyr_MaiWork.outbox import Outbox
-from CharTyr_MaiWork.platforms.qq_onebot import GroupSpace
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tools import ToolContext, Tools
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.host import Host, HostError
+from CharTyr_MaiWork.maiwork.outbox import Outbox
+from CharTyr_MaiWork.maiwork.platforms.qq_onebot import GroupSpace
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tools import ToolContext, Tools
 
 pytestmark = pytest.mark.asyncio
 
@@ -71,14 +71,18 @@ NEW_APIS = OLD_APIS + [
 
 
 class FakeHost:
-    """假的宿主口（群空间用）：预置 api 名单和成员身份，记录 api.call。"""
+    """假的宿主口（群空间用）：预置 api 名单和成员身份，记录 api.call。
 
-    def __init__(self, apis: list[str], role: str = "admin") -> None:
+    results：api_name → 返回值 / 可调用对象（吃 args）；没预置的按空 data 成功返回。
+    """
+
+    def __init__(self, apis: list[str], role: str = "admin", results: dict | None = None) -> None:
         self.apis = list(apis)
         self.role = role
         self.api_calls: list[dict] = []
         self.role_calls: list[tuple[str, str]] = []
         self.fail_names: set[str] = set()  # api_name 在这里面的 call_adapter 抛 HostError
+        self.results: dict = dict(results or {})
 
     async def list_apis(self) -> list[str]:
         return list(self.apis)
@@ -94,7 +98,15 @@ class FakeHost:
         self.api_calls.append({"api_name": str(api_name), "args": dict(args)})
         if str(api_name) in self.fail_names:
             raise HostError("调用宿主能力失败: api.call")
-        return {"status": "ok", "retcode": 0, "data": {}}
+        r = self.results.get(str(api_name))
+        if callable(r):
+            r = r(args)
+        if isinstance(r, BaseException):
+            raise r
+        return r if r is not None else {"status": "ok", "retcode": 0, "data": {}}
+
+    def api_names(self) -> list[str]:
+        return [c["api_name"] for c in self.api_calls]
 
 
 class _Settings:
@@ -254,9 +266,10 @@ async def test_rename_move_own_only(tmp_path: Path) -> None:
     with pytest.raises(PermissionError):
         await gs.move_file(GID, "/f-other", "/folder-1")
     assert host.api_calls == []  # 一个真调用都没发出去
-    # 删文件夹不校验自有（文件夹里可能还有别人的文件，QQ 侧会拒）——能调通就行
-    await gs.delete_folder(GID, "/folder-9")
-    assert host.api_calls[-1]["api_name"] == "adapter.napcat.file.delete_group_folder"
+    # 删文件夹同样只删自己建的（没登记 → 拒绝，且在调适配器之前）
+    with pytest.raises(PermissionError, match="只能删我自己建的文件夹"):
+        await gs.delete_folder(GID, "/folder-9")
+    assert host.api_calls == []
 
 
 async def test_rename_updates_owned_name_and_delete_removes(tmp_path: Path) -> None:
@@ -274,6 +287,237 @@ async def test_rename_updates_owned_name_and_delete_removes(tmp_path: Path) -> N
         "SELECT COUNT(*) AS c FROM group_files_owned WHERE group_id=? AND file_id=?", (GID, "/f-1")
     ).fetchone()
     assert int(row["c"]) == 0  # 删掉后从登记里移除
+
+
+# ----------------------------------------------------------------------
+# 只删自己建的文件夹（插件中心审核整改：delete_folder 归属 + 内容校验）
+# ----------------------------------------------------------------------
+
+
+def _listing(files=(), folders=()) -> dict:
+    """按 NapCat 返回的形状造一份目录清单。
+
+    FakeHost 站在 Host 的位置上，所以这里给的是**已经解包过的 data**
+    （真 Host.call_adapter 会把信封里的 data 拿出来，见 test_host_call_adapter_passthrough）。
+    """
+    return {
+        "files": [
+            {"file_id": fid, "file_name": nm, "file_size": 1} for fid, nm in files
+        ],
+        "folders": [
+            {"folder_id": fid, "folder_name": nm} for fid, nm in folders
+        ],
+    }
+
+
+async def test_delete_folder_not_registered_refused(tmp_path: Path) -> None:
+    """没登记的文件夹（别人建的 / 老版本建的）→ 拒绝，不调适配器。"""
+    host = FakeHost(NEW_APIS, role="admin")
+    gs, _ = _mk_group_space(tmp_path, host)
+    await gs.probe(now=NOW)
+    with pytest.raises(PermissionError, match="只能删我自己建的文件夹"):
+        await gs.delete_folder(GID, "/folder-other")
+    assert host.api_calls == []
+
+
+async def test_delete_folder_with_someone_elses_file_refused(tmp_path: Path) -> None:
+    """文件夹里混了别人的文件 → 拒绝，不调删除接口。"""
+    host = FakeHost(
+        NEW_APIS,
+        role="admin",
+        results={
+            "adapter.napcat.file.get_group_files_by_folder": _listing(
+                files=[("/f-mine", "我的.txt"), ("/f-other", "别人的.txt")]
+            )
+        },
+    )
+    gs, store = _mk_group_space(tmp_path, host)
+    await gs.probe(now=NOW)
+    gs.register_folder_owned(GID, "/folder-mine", "我的文件夹", now=NOW)
+    gs.register_owned(GID, "/f-mine", "我的.txt", now=NOW)
+    with pytest.raises(PermissionError, match="文件夹里有别人"):
+        await gs.delete_folder(GID, "/folder-mine")
+    assert "adapter.napcat.file.delete_group_folder" not in host.api_names()
+    # 登记行原样保留（拒绝之后还能再试）
+    row = store.read().execute(
+        "SELECT COUNT(*) AS c FROM group_folders_owned WHERE group_id=? AND folder_id=?",
+        (GID, "/folder-mine"),
+    ).fetchone()
+    assert int(row["c"]) == 1
+
+
+async def test_delete_folder_with_someone_elses_subfolder_refused(tmp_path: Path) -> None:
+    """子文件夹不是自己建的 → 同样拒绝。"""
+    host = FakeHost(
+        NEW_APIS,
+        role="admin",
+        results={
+            "adapter.napcat.file.get_group_files_by_folder": _listing(
+                folders=[("/sub-other", "别人的子文件夹")]
+            )
+        },
+    )
+    gs, _ = _mk_group_space(tmp_path, host)
+    await gs.probe(now=NOW)
+    gs.register_folder_owned(GID, "/folder-mine", "我的文件夹", now=NOW)
+    with pytest.raises(PermissionError, match="文件夹里有别人"):
+        await gs.delete_folder(GID, "/folder-mine")
+    assert "adapter.napcat.file.delete_group_folder" not in host.api_names()
+
+
+async def test_delete_folder_all_own_allowed(tmp_path: Path) -> None:
+    """文件夹是自己建的、里面的文件和子文件夹也都是自己的 → 放行，删完清登记。"""
+    host = FakeHost(
+        NEW_APIS,
+        role="admin",
+        results={
+            "adapter.napcat.file.get_group_files_by_folder": _listing(
+                files=[("/f-mine", "我的.txt")], folders=[("/sub-mine", "我的子文件夹")]
+            )
+        },
+    )
+    gs, store = _mk_group_space(tmp_path, host)
+    await gs.probe(now=NOW)
+    gs.register_folder_owned(GID, "/folder-mine", "我的文件夹", now=NOW)
+    gs.register_folder_owned(GID, "/sub-mine", "我的子文件夹", now=NOW)
+    gs.register_owned(GID, "/f-mine", "我的.txt", now=NOW)
+    await gs.delete_folder(GID, "/folder-mine")
+    assert host.api_calls[-1]["api_name"] == "adapter.napcat.file.delete_group_folder"
+    assert host.api_calls[-1]["args"]["folder_id"] == "/folder-mine"
+    row = store.read().execute(
+        "SELECT COUNT(*) AS c FROM group_folders_owned WHERE group_id=? AND folder_id=?",
+        (GID, "/folder-mine"),
+    ).fetchone()
+    assert int(row["c"]) == 0  # 删成功后登记行清掉
+    # 事件也记了
+    ev = store.read().execute(
+        "SELECT kind FROM events WHERE kind='group_space.folder_deleted'"
+    ).fetchone()
+    assert ev is not None
+
+
+async def test_delete_folder_empty_allowed(tmp_path: Path) -> None:
+    """自己建的空文件夹 → 放行。"""
+    host = FakeHost(
+        NEW_APIS,
+        role="admin",
+        results={"adapter.napcat.file.get_group_files_by_folder": _listing()},
+    )
+    gs, store = _mk_group_space(tmp_path, host)
+    await gs.probe(now=NOW)
+    gs.register_folder_owned(GID, "/folder-empty", "空文件夹", now=NOW)
+    await gs.delete_folder(GID, "/folder-empty")
+    assert host.api_calls[-1]["api_name"] == "adapter.napcat.file.delete_group_folder"
+
+
+async def test_delete_folder_cannot_list_refused(tmp_path: Path) -> None:
+    """列不出文件夹内容（适配器报错）→ 不敢删，拒绝。"""
+    host = FakeHost(
+        NEW_APIS,
+        role="admin",
+        results={"adapter.napcat.file.get_group_files_by_folder": HostError("调用宿主能力失败: api.call")},
+    )
+    gs, _ = _mk_group_space(tmp_path, host)
+    await gs.probe(now=NOW)
+    gs.register_folder_owned(GID, "/folder-mine", "我的文件夹", now=NOW)
+    with pytest.raises(PermissionError, match="列不出"):
+        await gs.delete_folder(GID, "/folder-mine")
+    assert "adapter.napcat.file.delete_group_folder" not in host.api_names()
+
+
+async def test_create_folder_registers_returned_folder_id(tmp_path: Path) -> None:
+    """适配器返回里带 folder_id → 直接登记。"""
+    host = FakeHost(
+        NEW_APIS,
+        role="admin",
+        results={"adapter.napcat.file.create_group_file_folder": {"folder_id": "/new-1"}},
+    )
+    gs, store = _mk_group_space(tmp_path, host)
+    await gs.probe(now=NOW)
+    await gs.create_folder(GID, "我的文件夹")
+    row = store.read().execute(
+        "SELECT folder_id, name, created_ts FROM group_folders_owned WHERE group_id=?", (GID,)
+    ).fetchone()
+    assert row is not None
+    assert row["folder_id"] == "/new-1"
+    assert row["name"] == "我的文件夹"
+    assert float(row["created_ts"]) > 0
+    # 建之前会先列一次父目录（为「返回值里没 id」那条路做准备），但不该有第二次列目录：
+    # 返回值里有 id 就直接用它，不再建后重列
+    assert host.api_names().count("adapter.napcat.file.get_group_root_files") == 1
+    assert host.api_names().count("adapter.napcat.file.create_group_file_folder") == 1
+
+
+async def test_create_folder_registers_by_before_after_diff(tmp_path: Path) -> None:
+    """返回里没有 folder_id → 建前建后各列一次，取「新出现且同名」的那个。"""
+    calls = {"n": 0}
+
+    def _root_files(args: dict) -> dict:
+        calls["n"] += 1
+        if calls["n"] == 1:  # 建之前：只有一个旧文件夹
+            return _listing(folders=[("/old-1", "旧文件夹")])
+        return _listing(folders=[("/old-1", "旧文件夹"), ("/new-2", "我的文件夹")])
+
+    host = FakeHost(
+        NEW_APIS, role="admin", results={"adapter.napcat.file.get_group_root_files": _root_files}
+    )
+    gs, store = _mk_group_space(tmp_path, host)
+    await gs.probe(now=NOW)
+    await gs.create_folder(GID, "我的文件夹")
+    row = store.read().execute(
+        "SELECT folder_id FROM group_folders_owned WHERE group_id=?", (GID,)
+    ).fetchone()
+    assert row is not None and row["folder_id"] == "/new-2"
+    assert calls["n"] == 2  # 建前一次、建后一次
+
+
+async def test_create_folder_unknown_id_only_logs(tmp_path: Path) -> None:
+    """两次列出都拿不到新 id → 不登记、不抛（最坏后果是这文件夹以后不能删）。"""
+    host = FakeHost(
+        NEW_APIS,
+        role="admin",
+        results={
+            "adapter.napcat.file.get_group_root_files": _listing(folders=[("/old-1", "旧文件夹")]),
+            "adapter.napcat.file.create_group_file_folder": HostError("调用宿主能力失败: api.call"),
+        },
+    )
+    gs, store = _mk_group_space(tmp_path, host)
+    await gs.probe(now=NOW)
+    # create 本身失败会抛（适配器错误照旧往外抛）
+    with pytest.raises(HostError):
+        await gs.create_folder(GID, "我的文件夹")
+    row = store.read().execute(
+        "SELECT COUNT(*) AS c FROM group_folders_owned WHERE group_id=?", (GID,)
+    ).fetchone()
+    assert int(row["c"]) == 0
+
+    # 适配器成功但两边都列不出新文件夹 → 不登记、不抛
+    host2 = FakeHost(
+        NEW_APIS,
+        role="admin",
+        results={"adapter.napcat.file.get_group_root_files": _listing(folders=[("/old-1", "旧文件夹")])},
+    )
+    gs2, store2 = _mk_group_space(tmp_path / "n2", host2)
+    await gs2.probe(now=NOW)
+    assert await gs2.create_folder(GID, "我的文件夹") is None
+    row2 = store2.read().execute(
+        "SELECT COUNT(*) AS c FROM group_folders_owned WHERE group_id=?", (GID,)
+    ).fetchone()
+    assert int(row2["c"]) == 0
+
+
+async def test_create_folder_unserved_group_not_registered(tmp_path: Path) -> None:
+    """只登记服务群：非服务群在建之前就被拒，零写入。"""
+    host = FakeHost(NEW_APIS, role="admin")
+    gs, store = _mk_group_space(tmp_path, host, groups=[GID])
+    await gs.probe(now=NOW)
+    with pytest.raises(PermissionError, match="不服务"):
+        await gs.create_folder(OTHER, "别人的")
+    row = store.read().execute(
+        "SELECT COUNT(*) AS c FROM group_folders_owned"
+    ).fetchone()
+    assert int(row["c"]) == 0
+    assert host.api_calls == []
 
 
 # ----------------------------------------------------------------------
@@ -354,7 +598,7 @@ async def test_notice_member_role_refused(tmp_path: Path) -> None:
 
 def _mk_outbox(tmp_path: Path, store: Store):
     """按 test_outbox 的搭法建一个最小 Outbox（文本/文件两路假 host）。"""
-    from CharTyr_MaiWork.delivery import Mentions, Pushes
+    from CharTyr_MaiWork.maiwork.delivery import Mentions, Pushes
 
     class _Host:
         def __init__(self) -> None:
@@ -428,7 +672,7 @@ async def _mk_tools(tmp_path: Path, host: FakeHost, *,
     tools = Tools(store)
     outbox_sent: list[dict] = []
 
-    from CharTyr_MaiWork.tools_groupspace import register_groupspace_tools
+    from CharTyr_MaiWork.maiwork.tools_groupspace import register_groupspace_tools
 
     settings = _Settings({GID: None}, enabled=enabled)
     gs = GroupSpace(host, store, lambda: settings)
@@ -491,6 +735,35 @@ async def test_tool_manage_not_own_file(tmp_path: Path) -> None:
     assert host.api_calls == []  # 没真调适配器
 
 
+async def test_tool_rmdir_own_folder_only(tmp_path: Path) -> None:
+    """工具层 rmdir：不是自己建的 → 中文拒绝；自己建的 → 放行。"""
+    host = FakeHost(
+        NEW_APIS,
+        role="admin",
+        results={"adapter.napcat.file.get_group_files_by_folder": _listing()},
+    )
+    tools, gs, store, sent = await _mk_tools(tmp_path, host)
+    ctx = ToolContext(group_id=GID, actor="主模型", role="main")
+    res = await tools.call("group_file_manage", {"action": "rmdir", "folder_id": "/not-mine"}, ctx)
+    assert not res.ok
+    assert "只能删我自己建的文件夹" in res.error
+    assert "adapter.napcat.file.delete_group_folder" not in host.api_names()
+    gs.register_folder_owned(GID, "/folder-mine", "我的文件夹", now=NOW)
+    res = await tools.call("group_file_manage", {"action": "rmdir", "folder_id": "/folder-mine"}, ctx)
+    assert res.ok, res.error
+    assert host.api_calls[-1]["api_name"] == "adapter.napcat.file.delete_group_folder"
+
+
+async def test_tool_manage_description_states_folder_rule(tmp_path: Path) -> None:
+    """插件中心审核要求：工具说明写清「只能删自己建的、里面只有自己东西的文件夹」。"""
+    tools, gs, store, sent = await _mk_tools(tmp_path, FakeHost(NEW_APIS, role="owner"))
+    spec = next(s for s in tools.specs("main") if s["function"]["name"] == "group_file_manage")
+    desc = spec["function"]["description"]
+    assert "rmdir" in desc
+    assert "自己建的" in desc
+    assert "里面只有" in desc
+
+
 async def test_tool_roles_main_only(tmp_path: Path) -> None:
     tools, gs, store, sent = await _mk_tools(tmp_path, FakeHost(NEW_APIS, role="owner"))
     # 主模型看得到这 4 个工具，子 agent 看不到
@@ -535,7 +808,7 @@ async def test_unserved_group_zero_calls(tmp_path: Path) -> None:
 
 
 async def test_health_text_old_adapter(tmp_path: Path) -> None:
-    from CharTyr_MaiWork.console import views
+    from CharTyr_MaiWork.maiwork.console import views
 
     store = _mk_store(tmp_path)
     settings = _Settings({GID: None})
@@ -580,7 +853,7 @@ async def test_health_text_old_adapter(tmp_path: Path) -> None:
 
 
 async def test_group_view_group_space_admin_only(tmp_path: Path) -> None:
-    from CharTyr_MaiWork.console import views
+    from CharTyr_MaiWork.maiwork.console import views
 
     store = _mk_store(tmp_path)
     settings = _Settings({GID: None})

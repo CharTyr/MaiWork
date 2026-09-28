@@ -28,7 +28,7 @@ from test_feeds import (  # noqa: F401
     _seed_batch_and_items,
 )
 
-from CharTyr_MaiWork.models import ModelError
+from CharTyr_MaiWork.maiwork.models import ModelError
 
 
 class CountingWorkers:

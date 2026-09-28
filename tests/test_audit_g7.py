@@ -19,10 +19,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.privacy import scrub
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.privacy import scrub
+from CharTyr_MaiWork.maiwork.store import Store
 
 GID = "900000001"
 MEMBER_NAME = "阿帆"
@@ -162,7 +162,7 @@ class TestProfileEntriesScrubbed:
     """2026-09-27 起：名字本身放行，但 note / persona 的片段（私下画像）仍不许进画像条目。"""
 
     def _profiles(self, tmp_path: Path):
-        from CharTyr_MaiWork.profile import Profiles
+        from CharTyr_MaiWork.maiwork.profile import Profiles
 
         store = _store_with_focus(tmp_path)
         settings, _ = load_settings({"groups": {"serve": [{"group": f"qq:{GID}"}]}})
@@ -216,7 +216,7 @@ class TestProfileEntriesScrubbed:
 class TestTopicsOpenerScrubbed:
     def test_opener_with_member_name_now_allowed(self, tmp_path: Path) -> None:
         """topics 的隐私辅助：2026-09-27 起名字本身放行；note 片段仍拦。"""
-        from CharTyr_MaiWork.topics import Topics
+        from CharTyr_MaiWork.maiwork.topics import Topics
 
         store = _store_with_focus(tmp_path)
         settings, _ = load_settings({"groups": {"serve": [{"group": f"qq:{GID}"}]}})
@@ -233,7 +233,7 @@ class TestTopicsOpenerScrubbed:
 
 class TestCoordinatorNoteScrubbed:
     def test_note_with_name_allowed_fragment_falls_back(self, tmp_path: Path) -> None:
-        from CharTyr_MaiWork.coordinator import Coordinator
+        from CharTyr_MaiWork.maiwork.coordinator import Coordinator
 
         store = _store_with_focus(tmp_path)
         settings, _ = load_settings({"groups": {"serve": [{"group": f"qq:{GID}"}]}})
@@ -251,7 +251,7 @@ class TestCoordinatorNoteScrubbed:
 
 class TestFeedsScrubbed:
     def test_feeds_scrub_helper(self, tmp_path: Path) -> None:
-        from CharTyr_MaiWork.feeds import Feeds
+        from CharTyr_MaiWork.maiwork.feeds import Feeds
 
         store = _store_with_focus(tmp_path)
         settings, _ = load_settings({"groups": {"serve": [{"group": f"qq:{GID}"}]}})
@@ -265,7 +265,7 @@ class TestFeedsScrubbed:
 
 class TestProfilePromptFocusGate:
     def _profiles(self, tmp_path: Path, personal: bool, suffix: str = "a"):
-        from CharTyr_MaiWork.profile import Profiles
+        from CharTyr_MaiWork.maiwork.profile import Profiles
 
         store = _store_with_focus(tmp_path / suffix)  # 同 tmp_path 多次造库要分开目录
         settings, _ = load_settings(

@@ -29,9 +29,9 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from fakes import FakeProfiles, FakeCtx
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.app import MaiWorkApp
-from CharTyr_MaiWork.config import MaiWorkConfig
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.config import MaiWorkConfig
 from CharTyr_MaiWork.plugin import MaiWorkPlugin, create_plugin
 
 BJ = timezone(timedelta(hours=8))
@@ -620,6 +620,7 @@ async def _make_world(
     herenow: HereNowStub,
     travel: TravelClock,
     config_overrides: dict | None = None,
+    capability_probe: Any = None,
 ) -> World:
     (tmp_path / "typesafe_key").write_text(JEV_KEY, encoding="utf-8")
     cfg = make_config(tmp_path, **(config_overrides or {}))
@@ -629,6 +630,9 @@ async def _make_world(
     await plugin.on_load()
     app = plugin._app
     assert app is not None, "插件 on_load 后 app 应该启动"
+    # 执行方式判定注入点要在第二次 start 之前设好（start 里才判定）
+    if capability_probe is not None:
+        app.capability_probe = capability_probe
     # 画像跑真 Profiles 会把假模型当提炼模型使唤，端到端里用 FakeProfiles：
     # 链路断言全部落在「宿主收到的调用 / 库里状态」上，FakeProfiles 记录调用
     app.profiles_cls = FakeProfiles
@@ -950,7 +954,7 @@ class TestQuietHoursZeroTopic:
         )
         try:
             # 先把群喂「安静」：候选 + 画像成形 + 距离上次消息足够久
-            from CharTyr_MaiWork import clock as _clk
+            from CharTyr_MaiWork.maiwork import clock as _clk
 
             base = _bj_epoch(2026, 10, 19, 20, 0)
             with world.app.store.tx() as conn:
@@ -1131,6 +1135,92 @@ class TestFileDelivery:
         await world.app.outbox.flush(world.travel())
         await world.app.outbox.flush(world.travel())
         assert len(world.host.uploads) == 0
+
+
+# ---------------------------------------------------------------------------
+# 场景 10：本机受限（macOS / 不是 root / 没 systemd）——不跑命令、工作区在数据目录下
+# ---------------------------------------------------------------------------
+
+
+def _stopped_decision(run_as: str = "maiwork") -> Any:
+    from CharTyr_MaiWork.maiwork.environments import capability
+
+    return capability.Decision(
+        mode="stopped", ok=False, exec_kind="plugin", unit_user="",
+        reason="这台机器不是 Linux（Windows / macOS）", hint="换 Railway",
+        log_line="本机干活：不能用——这台机器不是 Linux",
+    )
+
+
+class TestStoppedMode:
+    @pytest.mark.asyncio
+    async def test_stopped_no_command_tools_root_in_data_dir(
+        self, tmp_path: Path, host: HostResponses, openai: OpenAIStub, jev: JevStub,
+        herenow: HereNowStub, travel: TravelClock,
+    ) -> None:
+        """受限：命令工具没注册、文件工具还在；工作区根=data_dir/workspaces；健康项说明白。"""
+        w = await _make_world(
+            tmp_path, host=host, openai=openai, jev=jev, herenow=herenow, travel=travel,
+            config_overrides={"environments": {"railway": False, "workspace_root": str(tmp_path / "ws-配置了但用不上")}},
+            capability_probe=_stopped_decision,
+        )
+        try:
+            assert w.app.capability.mode == "stopped"
+            for name in ("run_command", "start_process", "check_process", "stop_process"):
+                assert w.app.tools.get(name, "worker") is None, name
+            assert w.app.tools.get("write_file", "worker") is not None
+            s = w.app.get_settings()
+            assert s.environments.workspace_root == s.data_dir / "workspaces"
+            # outbox 的交付闸和 LocalEnv 看到的是同一个根
+            assert w.app.delivery._task_artifact_dir("T-1", SERVE) == (
+                s.data_dir / "workspaces" / f"g{SERVE}" / "artifacts" / "T-1"
+            ).resolve()
+            from CharTyr_MaiWork.maiwork.console.views import _localenv_health
+
+            h = _localenv_health(w.app)
+            assert h["name"] == "本机干活" and h["state"] == "off"
+            assert "没开" in h["text"] and "Railway" in h["text"]
+        finally:
+            await w.plugin.on_unload()
+
+    @pytest.mark.asyncio
+    async def test_stopped_task_needing_command_fails_with_honest_message(
+        self, tmp_path: Path, host: HostResponses, openai: OpenAIStub, jev: JevStub,
+        herenow: HereNowStub, travel: TravelClock,
+    ) -> None:
+        """要跑命令的活：本机受限且没开一次性机器 → 任务判失败，群里说清「做不了」。"""
+        w = await _make_world(
+            tmp_path, host=host, openai=openai, jev=jev, herenow=herenow, travel=travel,
+            config_overrides={"environments": {"railway": False}},
+            capability_probe=_stopped_decision,
+        )
+        try:
+            w.openai.plan_answer = {
+                "criteria": ["在本机跑一条命令"],
+                "deliver_kind": "text",
+                "jobs": [{"brief": "跑 ls 看看目录", "tools": ["run_command"]}],
+                "question": None,
+            }
+            w.jev.set_choice("kind", "prepare", 0.9, ["prepare", "goal", "reminder", "none"])
+            await w.next_message(
+                SERVE, USER1, "帮我跑个命令", message_id="at-cmd", is_at=True,
+                session_id=SESSION, ts=travel(),
+            )
+            rid = w.app.approvals.pending_view(SERVE)[-1]["id"]
+            client = await w.admin_client()
+            try:
+                resp = await client.post(f"/api/requests/{rid}/approve")
+                assert resp.status == 200
+                tid = str((await resp.json())["task_id"])
+            finally:
+                await client.close()
+            t = await w.wait_task(tid, timeout=20)
+            assert t["status"] == "failed", f"该直接判失败：{t}"
+            assert "不能隔离跑命令" in str(t["review"]), t["review"]
+            await w.app.outbox.flush(w.travel())
+            assert any("不能隔离跑命令" in x for x in w.sent_texts()), w.sent_texts()
+        finally:
+            await w.plugin.on_unload()
 
 
 # ---------------------------------------------------------------------------

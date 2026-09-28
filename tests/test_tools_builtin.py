@@ -8,11 +8,11 @@ import sys
 import httpx
 import pytest
 
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.search import Search, SearchUnavailable
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tools import ToolContext, Tools
-from CharTyr_MaiWork.tools_builtin import register_builtin
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.search import Search, SearchUnavailable
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tools import ToolContext, Tools
+from CharTyr_MaiWork.maiwork.tools_builtin import register_builtin
 
 from fakes import FakeProfiles
 

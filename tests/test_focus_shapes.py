@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from CharTyr_MaiWork.feeds import focus_items
+from CharTyr_MaiWork.maiwork.feeds import focus_items
 
 
 def test_standard_shape() -> None:

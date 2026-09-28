@@ -263,16 +263,38 @@ class GroupSpace:
 
     def _require_own(self, group_id: str, file_id: str) -> None:
         """防手滑：file_id 必须在 group_files_owned 表里（机器人自己传的）。"""
-        row = self._store.read().execute(
-            "SELECT 1 FROM group_files_owned WHERE group_id=? AND file_id=? LIMIT 1",
-            (str(group_id), str(file_id)),
-        ).fetchone()
-        if row is None:
+        if not self._file_owned(group_id, file_id):
             raise PermissionError("只能动我自己传的文件：这个文件不是我传的，不动")
 
+    def _file_owned(self, group_id: str, file_id: str) -> bool:
+        return self._owned("group_files_owned", "file_id", group_id, file_id)
+
+    def _folder_owned(self, group_id: str, folder_id: str) -> bool:
+        return self._owned("group_folders_owned", "folder_id", group_id, folder_id)
+
+    def _owned(self, table: str, id_col: str, group_id: str, entity_id: Any) -> bool:
+        """entity_id 在登记的「自有」表里？（table / id_col 都是代码里写死的常量，不是外部输入）"""
+        eid = str(entity_id or "").strip()
+        if not eid:
+            return False
+        row = self._store.read().execute(
+            f"SELECT 1 FROM {table} WHERE group_id=? AND {id_col}=? LIMIT 1",
+            (str(group_id), eid),
+        ).fetchone()
+        return row is not None
+
     # ------------------------------------------------------------------
-    # 自有文件登记
+    # 自有文件 / 文件夹登记
     # ------------------------------------------------------------------
+
+    def _is_served_group(self, group_id: str) -> bool:
+        """这个群在不在服务名单里（登记只管服务群；异常一律当不是）。"""
+        gid = str(group_id)
+        try:
+            settings = self._get_settings()
+            return settings is not None and settings.is_served(gid)
+        except Exception:
+            return False
 
     def register_owned(
         self,
@@ -289,11 +311,7 @@ class GroupSpace:
         不该把发送流程搞挂（最坏后果是这个文件之后不能删/改名/移动）。
         """
         gid = str(group_id)
-        try:
-            settings = self._get_settings()
-            if settings is None or not settings.is_served(gid):
-                return
-        except Exception:
+        if not self._is_served_group(gid):
             return
         fid = str(file_id or "").strip()
         if not fid:
@@ -316,6 +334,43 @@ class GroupSpace:
         except Exception:
             logger.exception("群文件登记失败（群 %s）", gid)
 
+    def register_folder_owned(
+        self,
+        group_id: str,
+        folder_id: str,
+        name: str,
+        *,
+        now: float | None = None,
+    ) -> None:
+        """create_folder 成功后调：登记进 group_folders_owned（delete_folder 的准入）。
+
+        只登记配置里的服务群；任何异常只记日志——登记失败不该把建文件夹搞挂
+        （最坏后果是这个文件夹以后不能删）。
+        """
+        gid = str(group_id)
+        if not self._is_served_group(gid):
+            return
+        fid = str(folder_id or "").strip()
+        if not fid:
+            return
+        ts = clock.now() if now is None else float(now)
+        try:
+            with self._store.tx() as conn:
+                conn.execute(
+                    "INSERT INTO group_folders_owned (group_id, folder_id, name, created_ts)"
+                    " VALUES (?, ?, ?, ?)"
+                    " ON CONFLICT(group_id, folder_id) DO UPDATE SET"
+                    " name=excluded.name, created_ts=excluded.created_ts",
+                    (gid, fid, str(name or ""), ts),
+                )
+                self._store.event(
+                    conn, "group_space.folder_registered", group_id=gid,
+                    entity="group_folder", entity_id=fid,
+                    payload={"name": str(name or "")},
+                )
+        except Exception:
+            logger.exception("群文件夹登记失败（群 %s）", gid)
+
     # ------------------------------------------------------------------
     # 群文件
     # ------------------------------------------------------------------
@@ -323,6 +378,10 @@ class GroupSpace:
     async def list_files(self, group_id: str, folder_id: str | None = None) -> list[dict]:
         """列群文件：folder_id 空 → 根目录；否则列那个文件夹。"""
         await self._require(group_id, "files_list")
+        return await self._list_entries(str(group_id), folder_id)
+
+    async def _list_entries(self, group_id: str, folder_id: str | None) -> list[dict]:
+        """列目录（不再过能力闸；调用方自己负责闸门）。folder_id 空 = 根目录。"""
         gid = str(group_id)
         out: list[dict] = []
         if folder_id:
@@ -335,6 +394,25 @@ class GroupSpace:
             data = await self._host.call_adapter(API_GET_ROOT_FILES, {ARG_GROUP_ID: gid})
             out.extend(self._normalize_file_listing(data, gid))
         return out
+
+    @staticmethod
+    def _folder_ids_of(entries: list[dict]) -> set[str]:
+        return {
+            str(e.get("folder_id") or "").strip()
+            for e in entries
+            if e.get("type") == "folder" and str(e.get("folder_id") or "").strip()
+        }
+
+    @staticmethod
+    def _folder_id_from_result(data: Any) -> str:
+        """适配器建文件夹的返回里可能带新 folder_id（字段名各版本不一，都试一遍）。"""
+        if not isinstance(data, dict):
+            return ""
+        for key in ("folder_id", "folderId", "folder", "id"):
+            value = str(data.get(key) or "").strip()
+            if value:
+                return value
+        return ""
 
     @staticmethod
     def _normalize_file_listing(data: Any, gid: str) -> list[dict]:
@@ -370,13 +448,55 @@ class GroupSpace:
             )
         return out
 
-    async def create_folder(self, group_id: str, name: str, folder_id: str | None = None) -> None:
+    async def create_folder(self, group_id: str, name: str, folder_id: str | None = None) -> str | None:
+        """建文件夹；成功后把新文件夹登记成「自有」（拿不到 id 就只记日志）。
+
+        适配器返回里有 folder_id 就直接用；没有就建之前列一次父目录、建之后再列一次，
+        取「新出现且同名」的那一个。返回新 folder_id（拿不到返回 None）。
+        """
         await self._require(group_id, "files_manage")
-        args: dict[str, Any] = {ARG_GROUP_ID: str(group_id), ARG_NAME: str(name)}
-        if folder_id:
-            args[ARG_FOLDER_ID] = str(folder_id)  # 〔待实测〕父文件夹参数名
-        await self._host.call_adapter(API_CREATE_FOLDER, args)
+        gid = str(group_id)
+        parent = str(folder_id or "")
+        before_ids: set[str] | None = None
+        try:
+            before_ids = self._folder_ids_of(await self._list_entries(gid, parent or None))
+        except Exception:
+            before_ids = None  # 建前列不出来 → 之后不猜（宁可不登记，也不认错文件夹）
+        args: dict[str, Any] = {ARG_GROUP_ID: gid, ARG_NAME: str(name)}
+        if parent:
+            args[ARG_FOLDER_ID] = parent  # 〔待实测〕父文件夹参数名
+        data = await self._host.call_adapter(API_CREATE_FOLDER, args)
+        new_id = self._folder_id_from_result(data)
+        if not new_id and before_ids is not None:
+            new_id = await self._find_new_folder_id(gid, parent, str(name), before_ids)
+        if new_id:
+            self.register_folder_owned(gid, new_id, str(name))
+        else:
+            logger.warning(
+                "建了群文件夹但拿不到它的 folder_id（群 %s，名字 %r）：这次不登记，这个文件夹以后不能删",
+                gid, str(name),
+            )
         self._write_event("group_space.folder_created", group_id, name)
+        return new_id or None
+
+    async def _find_new_folder_id(
+        self, group_id: str, parent: str, name: str, before_ids: set[str]
+    ) -> str:
+        """再列一次父目录，取「新出现且同名」的文件夹 id（拿不到 → ""）。"""
+        try:
+            after = await self._list_entries(group_id, parent or None)
+        except Exception:
+            logger.warning("建完群文件夹后列不出父目录（群 %s），这次不登记", group_id)
+            return ""
+        for entry in after:
+            if entry.get("type") != "folder":
+                continue
+            fid = str(entry.get("folder_id") or "").strip()
+            if not fid or fid in before_ids:
+                continue
+            if str(entry.get("name") or "").strip() == name:
+                return fid
+        return ""
 
     async def delete_file(self, group_id: str, file_id: str) -> None:
         await self._require(group_id, "files_manage")
@@ -415,10 +535,39 @@ class GroupSpace:
         self._write_event("group_space.file_moved", group_id, file_id, {"folder_id": str(folder_id)})
 
     async def delete_folder(self, group_id: str, folder_id: str) -> None:
+        """删文件夹：只删自己建的，且里面只有自己传的文件 / 自己建的子文件夹。
+
+        两道闸都在调适配器之前：
+        (a) 文件夹本身在 group_folders_owned 里（自己建的）；
+        (b) 列一遍里面的东西，每个文件在 group_files_owned、每个子文件夹在
+            group_folders_owned，否则拒绝（不删别人东西）。
+        删成功后删掉登记行。
+        """
         await self._require(group_id, "files_manage")
+        gid = str(group_id)
+        fid = str(folder_id)
+        if not self._folder_owned(gid, fid):
+            raise PermissionError("只能删我自己建的文件夹：这个文件夹不是我建的，不删")
+        try:
+            entries = await self._list_entries(gid, fid)
+        except Exception as e:
+            raise PermissionError(
+                f"列不出这个文件夹里的内容（{type(e).__name__}），不删（免得不小心删了别人的东西）"
+            ) from e
+        for entry in entries:
+            if entry.get("type") == "file":
+                if not self._file_owned(gid, entry.get("file_id")):
+                    raise PermissionError("文件夹里有别人的文件，不删")
+            elif not self._folder_owned(gid, entry.get("folder_id")):
+                raise PermissionError("文件夹里有别人建的子文件夹，不删")
         await self._host.call_adapter(
-            API_DELETE_FOLDER, {ARG_GROUP_ID: str(group_id), ARG_FOLDER_ID: str(folder_id)}
+            API_DELETE_FOLDER, {ARG_GROUP_ID: gid, ARG_FOLDER_ID: fid}
         )
+        with self._store.tx() as conn:
+            conn.execute(
+                "DELETE FROM group_folders_owned WHERE group_id=? AND folder_id=?",
+                (gid, fid),
+            )
         self._write_event("group_space.folder_deleted", group_id, folder_id)
 
     # ------------------------------------------------------------------

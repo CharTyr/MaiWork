@@ -26,7 +26,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from fakes import FakeCtx
 
-from CharTyr_MaiWork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
 PASSWORD = "测试密码-非常显眼-不要出现在日志里"
 G1 = "900000001"

@@ -34,16 +34,22 @@ import asyncio
 import inspect
 import logging
 import os
-import pwd
 import re
 import secrets
 import shlex
 import stat
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from .. import clock
+from . import capability as _cap
+
+try:  # Windows 没有 pwd 模块；固定用户的 chown 在非 POSIX 上安全降级为跳过
+    import pwd
+except ImportError:  # pragma: no cover - Windows
+    pwd = None  # type: ignore[assignment]
 
 logger = logging.getLogger("maiwork.environments.local")
 
@@ -75,9 +81,12 @@ class RunResult:
 class LocalEnv:
     """本机执行环境。读当前 settings 用 get_settings()（配置改了下次调用生效）。"""
 
-    def __init__(self, get_settings: Callable[[], Any], *, runner: Any = None) -> None:
+    def __init__(self, get_settings: Callable[[], Any], *, runner: Any = None, capability: Any = None) -> None:
         self._get_settings = get_settings
         self._runner = runner
+        # capability：app 启动时判定一次的本机执行能力（capability.Decision）；
+        # 没给（测试/老调用）按「fixed 固定用户」处理，行为和老版本完全一致。
+        self._cap = capability
         # direct 模式的后台进程登记：unit -> {"label","proc","log","exit_code"}
         self._procs: dict[str, dict[str, Any]] = {}
 
@@ -143,9 +152,33 @@ class LocalEnv:
                     except PermissionError:
                         continue
 
+    def _exec_user_kind(self) -> str:
+        """systemd 单元里的用户：fixed=run_as（固定用户）；dynamic=自动分配（chown 65534）。"""
+        cap = self._cap
+        if cap is not None and getattr(cap, "mode", "fixed") == "dynamic":
+            return "dynamic"
+        return "fixed"
+
     def _chown_for_run_as(self, path: Path) -> None:
-        """仅 systemd 模式且当前是 root 时 chown 给 run_as 用户（本机非 root 直接跳过）。"""
-        if self._mode() != "systemd" or os.geteuid() != 0:
+        """仅 systemd 模式且当前是 root 时 chown（本机非 root / 非 POSIX 直接跳过）。
+
+        - fixed：chown 给 run_as 用户（系统里没有该用户 → 警告并跳过）；
+        - dynamic：chown 成 65534:65534（nobody）。实测（2026-09-28，systemd 257）：
+          单元下次启动时 systemd 会把 StateDirectory 里的文件属主随目录一起修正成
+          DynamicUser 的 uid——插件（root）写进工作区的成品/brief 不 chown，
+          自动分配的用户改不了（属主 0 的文件追加会被拒）。
+        """
+        if self._mode() != "systemd":
+            return
+        try:
+            if os.geteuid() != 0:  # type: ignore[attr-defined]
+                return
+        except (AttributeError, OSError):  # 非 POSIX 没有 geteuid
+            return
+        if self._exec_user_kind() == "dynamic":
+            self._chown_tree(path, 65534, 65534)
+            return
+        if pwd is None:  # 非 POSIX：没有 pwd 模块就跳过
             return
         try:
             pw = pwd.getpwnam(self._run_as())
@@ -327,12 +360,11 @@ class LocalEnv:
 
         if self._mode() == "systemd":
             unit = f"maiwork-run-{secrets.token_hex(4)}"
-            run_as = self._run_as()
             argv = [
                 "systemd-run",
                 "--wait", "--collect", "--pipe",  # 不加 --quiet：要靠「Finished with result」判断超内存/超时
                 f"--unit={unit}",
-                f"--uid={run_as}", f"--gid={run_as}",
+                *self._unit_user_props(name),
                 *self._systemd_setenv(ws),  # 单元里 HOME=工作区、LANG=C.UTF-8、最小 PATH
                 "-p", f"MemoryMax={memory or self._memory()}",
                 "-p", "MemorySwapMax=0",
@@ -363,10 +395,38 @@ class LocalEnv:
             return self._make_result(-1, "", f"命令超时（超过 {limit} 秒，已强制停止）", started, True)
         return self._make_result(code, out, err, started, False)
 
+    def _unit_user_props(self, name: str) -> list[str]:
+        """systemd 单元的用户属性。
+
+        - fixed：--uid/--gid=<run_as>（固定系统用户，线上就是这个，行为不变）；
+        - dynamic：DynamicUser=yes + User=<固定名> + StateDirectory=maiwork/workspaces/<名>——
+          系统里没建用户时让 systemd 自动分配（同一固定名每次 uid 相同，按名字哈希；
+          工作区由 StateDirectory 提供，实际在 /var/lib/private/ 下，2026-09-28 实测）。
+        """
+        if self._exec_user_kind() == "dynamic":
+            return [
+                "-p", "DynamicUser=yes",
+                "-p", f"User={_cap.DYNAMIC_USER}",
+                "-p", f"StateDirectory=maiwork/workspaces/{name}",
+            ]
+        run_as = self._run_as()
+        return [f"--uid={run_as}", f"--gid={run_as}"]
+
     def _hardening(self, ws: Path) -> list[str]:
-        """隔离：整个系统只读、家目录只读、/tmp 私有、不能提权；
-        工作区根被换成空的临时目录，只把本工作区挂回来——看不到别的群的工作区。
-        线上实测（2026-09-27）：别的工作区「No such file」、/home/maiwork 只读、本工作区可写、能出网。"""
+        """隔离：整个系统只读、家目录只读、/tmp 私有、不能提权。
+
+        - fixed：工作区根被换成空的临时目录，只把本工作区挂回来——看不到别的群的工作区。
+          线上实测（2026-09-27）：别的工作区「No such file」、/home/maiwork 只读、本工作区可写、能出网。
+        - dynamic：不用 BindPaths（工作区是 StateDirectory，systemd 自己挂上、属主自动改对）；
+          ProtectHome=yes 把整个 /home 遮掉（2026-09-28 实测两次运行 uid 相同、能续写、读 /root 被拒）。
+        """
+        if self._exec_user_kind() == "dynamic":
+            return [
+                "-p", "ProtectSystem=strict",
+                "-p", "ProtectHome=yes",
+                "-p", "PrivateTmp=yes",
+                "-p", "NoNewPrivileges=yes",
+            ]
         root = Path(ws).parent
         return [
             "-p", "ProtectSystem=strict",
@@ -422,12 +482,11 @@ class LocalEnv:
         )
 
         if self._mode() == "systemd":
-            run_as = self._run_as()
             argv = [
                 "systemd-run",
                 "--collect", "--quiet",
                 f"--unit={unit}",
-                f"--uid={run_as}", f"--gid={run_as}",
+                *self._unit_user_props(name),
                 *self._systemd_setenv(ws),  # 单元里 HOME=工作区、LANG=C.UTF-8、最小 PATH
                 "-p", f"MemoryMax={self._memory()}",
                 "-p", "MemorySwapMax=0",

@@ -17,12 +17,12 @@ import pytest
 
 from fakes import FakeCtx, FakeProfiles
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.app import MaiWorkApp
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.delivery import Mentions
-from CharTyr_MaiWork.intake import Intake, Signals
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.delivery import Mentions
+from CharTyr_MaiWork.maiwork.intake import Intake, Signals
+from CharTyr_MaiWork.maiwork.store import Store
 
 G1 = "900000001"
 G2 = "123456789"

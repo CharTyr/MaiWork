@@ -24,10 +24,10 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from fakes import FakeCtx, FakeProfiles
 
-from CharTyr_MaiWork import rules as rules_mod
-from CharTyr_MaiWork.app import MaiWorkApp
-from CharTyr_MaiWork.jev import _resolve_key
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import rules as rules_mod
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork.jev import _resolve_key
+from CharTyr_MaiWork.maiwork.store import Store
 
 
 @pytest.fixture
@@ -119,7 +119,7 @@ class TestSchemaCoverage:
     def test_every_config_field_in_schema(self) -> None:
         """config.py 各节字段（models / extensions 节、plugin 节（版本标记和总开关）、弃用的
         feeds.min_score 除外）每一个都要在 CONFIG_SCHEMA 里——防以后加配置忘了加网页项。"""
-        from CharTyr_MaiWork import config as config_mod
+        from CharTyr_MaiWork.maiwork import config as config_mod
 
         schema_keys = {f["key"] for f in rules_mod.CONFIG_SCHEMA}
         missing: list[str] = []
@@ -415,7 +415,7 @@ class TestJevKeyPriority:
     """jev 密钥顺序：环境变量 TYPESAFE_API_KEY → [jev] api_key（网页改的也写进 config.toml）→ key_file → ~/.typesafe_key。"""
 
     def _settings(self, tmp_path: Path, jev: dict | None = None) -> Any:
-        from CharTyr_MaiWork.config import load_settings
+        from CharTyr_MaiWork.maiwork.config import load_settings
 
         raw: dict[str, Any] = {"storage": {"data_dir": str(tmp_path / "data")}}
         if jev is not None:

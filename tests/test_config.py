@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork.config import (
+from CharTyr_MaiWork.maiwork.config import (
     CONFIG_VERSION,
     MaiWorkConfig,
     PluginSectionConfig,
@@ -63,6 +63,16 @@ class TestDefaults:
         assert s.environments.railway_daily_max == 1
         assert s.environments.verify_per_round == 3
         assert s.environments.verify_minutes == 1
+
+    def test_verify_enabled_defaults_off(self) -> None:
+        """[environments] verify_enabled 默认关：备资讯不挑实测、不多调模型、不申请 VM。"""
+        s, _ = settings_of({})
+        assert s.environments.verify_enabled is False
+
+    def test_verify_enabled_parses_true(self) -> None:
+        """配置里写 true → 挑实测开着（当前行为不变）。"""
+        s, _ = settings_of({"environments": {"verify_enabled": True}})
+        assert s.environments.verify_enabled is True
 
     def test_default_settings_have_no_groups(self) -> None:
         settings, problems = settings_of({})

@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork.names import clean_group_name
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork.names import clean_group_name
+from CharTyr_MaiWork.maiwork.store import Store
 
 G1 = "900000001"
 
@@ -79,8 +79,8 @@ class TestStoreWash:
         """host 给的群名带乱码：写进 groups 表的必须是清洗后的。"""
         from fakes import FakeHost
 
-        from CharTyr_MaiWork import clock
-        from CharTyr_MaiWork.profile import Profiles
+        from CharTyr_MaiWork.maiwork import clock
+        from CharTyr_MaiWork.maiwork.profile import Profiles
 
         store = Store(tmp_path / "t.db")
         store.migrate()

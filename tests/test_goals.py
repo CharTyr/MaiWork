@@ -14,9 +14,9 @@ import json
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.goals import Goals
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.goals import Goals
+from CharTyr_MaiWork.maiwork.store import Store
 
 NOW = 1_790_000_000.0
 GID = "900000001"

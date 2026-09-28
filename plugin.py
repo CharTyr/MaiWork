@@ -17,7 +17,7 @@ from typing import Any, Dict
 from maibot_sdk import HookHandler, MaiBotPlugin
 from maibot_sdk.types import ErrorPolicy, HookMode
 
-from .config import (
+from .maiwork.config import (
     CONFIG_VERSION,
     MaiWorkConfig,
     PluginSectionConfig,
@@ -28,7 +28,7 @@ from .config import (
 logger = logging.getLogger("maiwork")
 
 PLUGIN_ID = "chartyr.maiwork"
-PLUGIN_VERSION = "0.4.0"
+PLUGIN_VERSION = "0.4.1"
 
 __all__ = [
     "PLUGIN_ID",
@@ -76,10 +76,17 @@ class MaiWorkPlugin(MaiBotPlugin):
         return {}
 
     async def _start_app(self, config_data: Dict[str, Any]) -> None:
-        from .app import MaiWorkApp
+        from .maiwork.app import MaiWorkApp
 
+        # 没有宿主 ctx 就不启动（只在极端情况出现：测试里直接建插件实例）。
+        # 这里**不用替身**：以前那个动态属性（__getattr__）替身是为了绕自己的源码扫描
+        # （tests/test_host_only.py 不许 host.py 以外出现宿主能力调用方法名），
+        # 审核不接受；没有 ctx 就什么都不干，插件本体照常加载。
+        ctx = self._ctx
+        if ctx is None:
+            logger.warning("宿主上下文还没注入，这次不启动 MaiWork（插件本体照常加载）")
+            return
         raw = self._with_data_dir_override(config_data or {})
-        ctx = self._ctx if self._ctx is not None else _NullCtx()
         app = MaiWorkApp(ctx, raw, plugin_dir=_PLUGIN_DIR)
         try:
             await app.start()
@@ -186,20 +193,6 @@ class MaiWorkPlugin(MaiBotPlugin):
         except Exception:
             logger.exception("MaiWork planner 备忘钩子出错，已吞掉")
             return {"action": "continue"}
-
-
-class _NullCtx:
-    """极端情况（测试直接建插件）没有宿主 ctx 时的替身。
-
-    任何能力调用都会抛错；Host 包一层超时/错误处理变 HostError，不影响插件加载。
-    注意：类里不许出现宿主能力调用方法的名字（源码扫描限制），所以用 __getattr__。
-    """
-
-    def __getattr__(self, name: str) -> Any:
-        async def _missing(*args: Any, **kw: Any) -> Any:
-            raise RuntimeError("宿主上下文还没注入")
-
-        return _missing
 
 
 def create_plugin() -> MaiWorkPlugin:

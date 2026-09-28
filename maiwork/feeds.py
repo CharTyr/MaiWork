@@ -194,6 +194,13 @@ _VERIFY_SUMMARY_MAX = 200
 _VERIFY_STEPS_MAX = 6
 _VERIFY_STEP_MAX_LEN = 80
 
+
+def _verify_on(settings: Any) -> bool:
+    """这轮要不要上 VM 实测：只看 [environments] verify_enabled（缺字段时按关处理）。"""
+    env_cfg = getattr(settings, "environments", None)
+    return bool(getattr(env_cfg, "verify_enabled", False))
+
+
 # 允许模型挑的图标（来自 console/static/assets/icons/ 的名单，固定写死）
 _ICONS = (
     "robot", "newspaper", "bulb", "monitor", "chart", "rocket", "books", "testtube",
@@ -239,6 +246,23 @@ _RECENT_CHAT_IDEA_H = 72    # 构想看「群里最近在聊」的窗口（小�
 _RECENT_CHAT_IDEA_N = 80    # 构想最多看几条最近发言
 _BRIEF_PROFILE_MAX = 12     # 子 agent brief 里的群画像最多几条
 _BRIEF_PROFILE_TEXT_MAX = 60  # brief 里每条画像最多多少字
+# 2026-11 质量修复（线上实测：同一件事反复发、旧商店页当选、话题标签漂移）
+_RECENT_PUBLISHED_MAX = 40   # 打分去重给模型看的「最近发过的」最多几条
+_RECENT_PUBLISHED_SUMMARY = 60  # 「最近发过的」每条带来的摘要前多少字
+_RECENT_TOPICS_DAYS = 14     # 打分提示词列「最近在用的话题标签」看几天
+_TOPIC_SIM_RATIO = 0.6       # 话题标签相似到多少算「同一话题」（涂击队资讯 vs 涂击队动态）
+_TOPIC_ROLLING_CAP = 3       # 同一话题最近 _TOPIC_ROLLING_CAP_H 小时内已发这么多条就不再发
+_TOPIC_ROLLING_CAP_H = 72    # 跨轮话题饱和窗口（小时）
+_NEWS_MAX_AGE_DAYS = 7       # kind=资讯的候选发布时间超过这么多天直接算旧闻
+_SCORE_CHUNK = 8            # 资讯打分每次最多给模型几条（一次给太多会超时，2026-09-28 线上回放实测）
+_SCORE_TIMEOUT_S = 240      # 资讯打分单次调用的超时（秒）
+_RSS_MERGE_CAP = 6           # 每轮直接从 RSS 源并进候选列表的条目上限（跨源轮询，一个源占不满）
+# 回落 keywords 的英文虚词（标题里这些词不当关键词，小写比对）
+_FALLBACK_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "in", "on", "to", "for",
+    "is", "are", "your", "why", "how", "with", "after", "it", "this",
+    "that", "from", "by", "at",
+})
 
 _NEWS_OUTPUT_SCHEMA = {
     "type": "object",
@@ -317,6 +341,11 @@ def _site_of(url: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+def _title_key(title: Any) -> str:
+    """标题去重用的键：去掉所有空白、转小写（「A | B」和「A |B」算同一个）。"""
+    return _re.sub(r"\s+", "", str(title or "")).lower()
+
+
 def _public_http_url(url: str) -> str:
     """洗净的 http(s) 链接；内网 / 本机 IP、解析不了的一律返回 ""。只防常识，不做 DNS。"""
     raw = str(url or "").strip()
@@ -368,6 +397,25 @@ def _parse_published(value: Any) -> float | None:
 
 def _similar(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
+
+
+def _norm_topic_label(raw: Any) -> str:
+    """话题标签规范化：去首尾空白、中间的换行压成空格、拉丁字母转小写（中文不变）。"""
+    text = str(raw or "").strip().replace("\n", " ")
+    if not text:
+        return ""
+    return "".join(c.lower() if "A" <= c <= "Z" else c for c in text)
+
+
+def _same_topic(a: str, b: str) -> bool:
+    """两个话题标签是不是「同一话题」：规范化后相等，或相似度 ≥ _TOPIC_SIM_RATIO
+    （涂击队资讯 vs 涂击队动态 这种差一点字的算同一个）。"""
+    na, nb = _norm_topic_label(a), _norm_topic_label(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    return _similar(na, nb) >= _TOPIC_SIM_RATIO
 
 
 import re as _re
@@ -472,6 +520,7 @@ class Feeds:
         on_start: Callable[[dict], None] | None = None,
         verify_runner: Any = None,
         identity: Any = None,  # identity.py（SOUL/工作记忆注入；None 走老的纯 host 逻辑）
+        rss_transport: Any = None,  # httpx.MockTransport（tests）；None = 真实网络
     ) -> None:
         self._store = store
         self._models = models
@@ -493,12 +542,15 @@ class Feeds:
         # 构想「做这个」的回调：app 接成 _on_idea_started（落成任务并开工）；None = 只记状态。
         self.on_start = on_start
         # RSS 客户端注入（httpx.MockTransport，tests 用；None = 真实网络，接口/备料自己起）
-    async def _collect_rss(self, gid: str, settings: Settings) -> list[dict]:
-        """把本群启用中的 RSS 源取回来，交回「优先看这些链接」的 RSS 条目候选。
+        self._rss_transport: Any = rss_transport
 
-        和搜索子 agent 的候选**走同一套质量门槛**（硬淘汰里「原文打开过」对 RSS：
-        交给子 agent 的 brief 作「优先看这些链接」，由子 agent fetch_page 打开并按原流程
-        交回时带 fetched/quote——不另开绿灯）。sources.site 用源标题（rss.title）代替域名。
+    async def _collect_rss(self, gid: str, settings: Settings) -> list[dict]:
+        """把本群启用中的 RSS 源取回来，交回 RSS 条目候选。
+
+        这些条目有两个去处：写进子 agent 的 brief 当「优先看这些链接」让它打开核对，
+        以及由 prepare_news 直接并进候选池（见 _merge_rss_candidates，≤6 条）——
+        **走同一套质量门槛**（硬淘汰 / 7 天新鲜度 / 打分 / 话题饱和，不另开绿灯）。
+        sources.site 用源标题（rss.title）代替域名。
         全 MockTransport；取失败只记 last_error，不拖垮这轮备料。
         """
         from . import rss as _rss
@@ -522,8 +574,11 @@ class Feeds:
                     now=clock.now(),
                     limit=_CANDIDATE_CAP,
                 )
-            except Exception:
-                result = {"title": "", "items": [], "error": "意外错误"}
+            except Exception as e:
+                # 别只写「意外错误」：排障要看异常类型（2026-11，群 900000001 三个源一直报这个
+                # 就是因为 _rss_transport 没接线，AttributeError 被吞了）
+                logger.exception("RSS 源 %s（群 %s）取回出意外", url, gid)
+                result = {"title": "", "items": [], "error": f"意外错误：{type(e).__name__}"}
             ok_ts: float | None = None
             error = str(result.get("error") or "")
             if not error:
@@ -557,11 +612,84 @@ class Feeds:
                         "image_url": "",
                         "url_key": _normalize_url(url_i),
                         "site": str(entry.get("title") or _rss._site_of(url_i) or url_i.split("/", 3)[2]),
+                        "from_rss": True,  # 候选来自 RSS 源（可见标记，排查用；池里照走同一套门槛）
                         "_rss_feed": url,
                         "_rss_title": str(entry.get("title") or ""),
                     }
                 )
         return out
+
+    def _stored_url_keys(self, gid: str, settings: Settings) -> set[str]:
+        """最近 lookback_days 内已入库（rejected=0）的 url_key；窗口和硬淘汰那道一致。"""
+        lookback_days = max(1, int(getattr(settings.feeds, "lookback_days", 14)))
+        since = clock.now() - lookback_days * 86400.0
+        try:
+            rows = self._store.read().execute(
+                "SELECT url_key FROM news_items WHERE group_id=? AND created>=? AND rejected=0",
+                (gid, since),
+            ).fetchall()
+        except Exception:
+            logger.info("读最近入库的 url_key 失败（群 %s）", gid, exc_info=True)
+            return set()
+        return {str(r["url_key"]) for r in rows if r["url_key"]}
+
+    def _merge_rss_candidates(
+        self, gid: str, settings: Settings, candidates: list[dict], rss_items: list[dict]
+    ) -> int:
+        """把 RSS 取回的条目并进候选列表（原地追加，最多 _RSS_MERGE_CAP 条，返回并了几条）。
+
+        排序：源内新的在前，源之间按各自最新一条的时间轮着来（round-robin），
+        所以一个源再勤也占不满上限。去重按 url_key：和这批候选已有的、和最近已入库的
+        news_items、以及 RSS 之间自己重复的都不并（省下名额给真正新的）。
+        并进来后就是普通候选：同一套硬淘汰 / 7 天新鲜度 / 打分 / 话题饱和照走，不另开绿灯。
+        """
+        if not rss_items:
+            return 0
+        have = {str(c.get("url_key") or "") for c in candidates}
+        have.discard("")
+        have |= self._stored_url_keys(gid, settings)
+        # 标题也去重（线上回放：机核同一篇的文章版和视频版链接不同、标题一样，并进来两条）
+        seen_titles = {_title_key(c.get("title")) for c in candidates}
+        seen_titles.discard("")
+
+        groups: dict[str, list[dict]] = {}
+        for it in rss_items:
+            if not isinstance(it, dict):
+                continue
+            key = str(it.get("url_key") or "")
+            if not key or key in have:
+                continue
+            tkey = _title_key(it.get("title"))
+            if tkey and tkey in seen_titles:
+                continue
+            have.add(key)  # 同一个链接在两个源里都出现：只留先遇到的那条
+            if tkey:
+                seen_titles.add(tkey)
+            groups.setdefault(str(it.get("_rss_feed") or ""), []).append(it)
+        for items in groups.values():
+            items.sort(key=lambda x: float(x.get("published_ts") or 0.0), reverse=True)
+        ordered = sorted(
+            groups.values(), key=lambda items: float(items[0].get("published_ts") or 0.0), reverse=True
+        )
+
+        merged = 0
+        round_no = 0
+        while merged < _RSS_MERGE_CAP:
+            picked = False
+            for items in ordered:
+                if round_no >= len(items):
+                    continue
+                item = items[round_no]
+                item["from_rss"] = True
+                candidates.append(item)
+                merged += 1
+                picked = True
+                if merged >= _RSS_MERGE_CAP:
+                    break
+            if not picked:  # 所有源都取完了
+                break
+            round_no += 1
+        return merged
 
     # ------------------------------------------------------------------
     # 资讯
@@ -596,8 +724,17 @@ class Feeds:
         collect_mark = (
             f"feeds-collect:{gid}:{int(clock.now() * 1000)}:{next(_collect_mark_seq)}"
         )
+        # RSS 源（rss.py）取回一次：① 写进子 agent 的 brief 当「优先看这些链接」，
+        # ② 直接并进候选池参与打分（见 _merge_rss_candidates）。取失败只记 last_error，不拖垮这轮。
         try:
-            candidates = await self._collect(gid, focus, settings, task_id=collect_mark)
+            rss_items = await self._collect_rss(gid, settings)
+        except Exception:
+            logger.exception("RSS 取回意外出错（群 %s），这轮跳过 RSS", gid)
+            rss_items = []
+        try:
+            candidates = await self._collect(
+                gid, focus, settings, task_id=collect_mark, rss_items=rss_items
+            )
         except (ModelError, ValueError) as e:
             logger.info("备资讯-子 agent 失败（群 %s）：%s", gid, e)
             self._skipped_batch(
@@ -610,6 +747,12 @@ class Feeds:
                 gid, f"子 agent 出了意外：{e}", stats=self._collect_stats(collect_mark)
             )
             return 0
+
+        # ②.5 RSS 条目并进候选池（≤_RSS_MERGE_CAP 条，新的在前、跨源轮询）：
+        # 从这里往后和搜索候选完全同一套硬淘汰 / 新鲜度 / 打分 / 话题饱和，不另开绿灯。
+        merged_rss = self._merge_rss_candidates(gid, settings, candidates, rss_items)
+        if merged_rss:
+            logger.info("RSS 并进候选池（群 %s）：%d 条", gid, merged_rss)
 
         # ③ 第一道（代码侧）：没打开过 / 付费 / 屏蔽来源 / URL·标题重复
         survivors = self._hard_reject_code(gid, settings, candidates)
@@ -625,8 +768,10 @@ class Feeds:
                     stats=self._collect_stats(collect_mark),
                 )
                 return 0
-            # 第一道（模型侧）：不扎实 / 垃圾 / 同一件事
+            # 第一道（模型侧）：不扎实 / 垃圾 / 同一件事（含 dup_of 指到已发布的）
             self._hard_reject_model(survivors)
+            # 同一轮里的重复（dup_in_batch 指到前面某条）：那一对里留 avg 高的
+            self._resolve_dup_in_batch(survivors)
 
         # ⑤ 第二道（上网页）：五项分门槛
         web_min_avg = float(getattr(settings.feeds, "web_min_avg", 3.0))
@@ -638,6 +783,9 @@ class Feeds:
                 item["reject"] = ("web", f"相关度 {sc['relevance']:.1f} < 3.0，过不了上网页这道")
             elif sc["avg"] < web_min_avg:
                 item["reject"] = ("web", f"平均分 {sc['avg']:.1f} < {web_min_avg:.1f}，过不了上网页这道")
+            elif item.get("kind") == "news" and sc["timeliness"] < 3.0:
+                # 资讯不够新不放上网页（商店页/旧闻靠高分平均混进来的那类）
+                item["reject"] = ("web", f"不够新（新鲜度 {sc['timeliness']:.1f}）")
         # G7 隐私闸：why 含关注成员注记 / 画像片段的整条丢弃（why 群友可见；名字本身放行）
         for item in survivors:
             if "reject" not in item and self._scrub_item_text(gid, str(item.get("why") or "")) is None:
@@ -655,12 +803,13 @@ class Feeds:
 
         # ⑥ 第二道（去同质化）：同话题 ≤2、同域名 ≤3、敏感 ≤1、diverse ≤2、总数 ≤ max_items；avg 高者留
         max_items = max(1, int(getattr(settings.feeds, "max_items", 10)))
-        self._dedup_homogeneous(survivors, max_items)
+        self._dedup_homogeneous(survivors, max_items, gid)
 
         # ⑥.5 「实测过再发是加分项」（docs/02 §4.1）：对最终入选的条目挑 ≤2 条，
-        # 在 railway.new 一次性 VM 里真试一下（railway=false 整个关掉；拿不到机器照常入库）
+        # 在 railway.new 一次性 VM 里真试一下（verify_enabled=false / railway=false 整个关掉；
+        # 拿不到机器照常入库）
         final_items = [item for item in survivors if "reject" not in item]
-        if final_items and self._verify_runner is not None:
+        if final_items and self._verify_runner is not None and _verify_on(settings):
             try:
                 await self._plan_and_verify(gid, final_items, settings)
             except Exception:
@@ -718,6 +867,8 @@ class Feeds:
         """第一道硬性淘汰里「不调模型」的部分；被筛的打上 item["reject"]=(gate, reason)。
 
         返回幸存列表（candidates 里没打 reject 的；顺序保持子 agent 交回的原序）。
+        资讯的新鲜度硬规则也在这里：发布时间超过 _NEWS_MAX_AGE_DAYS 天的资讯一律算旧闻
+        （拿不到发布时间的不拦，交给模型的新鲜度分）。
         """
         blocked = self._blocked_domains(gid, settings)
         auto_blocked = set(self._auto_blocked_domains(gid))
@@ -747,11 +898,26 @@ class Feeds:
             elif any(_similar(item["title"], t) >= _TITLE_DEDUP_RATIO for t in seen_titles):
                 item["reject"] = ("hard", "和最近出过的重复（标题高度相似）")
             if "reject" not in item:
+                self._news_freshness_reject(item)
+            if "reject" not in item:
                 survivors.append(item)
                 if url_key:
                     seen_urls.add(url_key)
                 seen_titles.append(item["title"])
         return survivors
+
+    @staticmethod
+    def _news_freshness_reject(item: dict) -> None:
+        """资讯新鲜度硬规则：kind=news 且发布时间已知且超过 _NEWS_MAX_AGE_DAYS 天 → 硬拒旧闻。
+        好文不受这条管；发布时间拿不到的也不拦（交给模型的新鲜度分）。"""
+        if item.get("kind") != "news":
+            return
+        published = item.get("published_ts")
+        if not isinstance(published, (int, float)):
+            return
+        age_days = (clock.now() - float(published)) / 86400.0
+        if age_days > _NEWS_MAX_AGE_DAYS:
+            item["reject"] = ("hard", f"旧闻：{int(age_days)} 天前发的")
 
     def _blocked_domains(self, gid: str, settings: Settings) -> set[str]:
         """生效的屏蔽名单（域名 & 其子域在匹配处再展开）。
@@ -813,28 +979,98 @@ class Feeds:
                 item["reject"] = ("hard", f"垃圾：{reason}" if reason else "垃圾：标题党/软文/营销号/纯情绪")
             elif flags.get("same_as_recent"):
                 item["reject"] = ("hard", "和最近出过的是同一件事（重复）")
+            else:
+                # dup_of 指到一条已发布的 → 同一件事，硬拒（理由带那条的标题开头）
+                target = item.get("_dup_target")
+                if target and target[0] == "recent":
+                    that_title = str((target[1] or {}).get("title") or "")[:30]
+                    item["reject"] = (
+                        "hard",
+                        f"和最近发过的「{that_title}」是同一件事" if that_title
+                        else "和最近发过的重复（同一件事）",
+                    )
+
+    def _resolve_dup_in_batch(self, survivors: list[dict]) -> None:
+        """同一轮里被指「和前面某条是同一件事」的：那一对里留 avg 高的，低的拒掉
+        （web 这道，理由带留下的那条标题开头）；指不到的已经在 _score 里忽略。
+
+        指针是单向的（B 说「我和 A 是同一件事」）：B 分低就拒 B；B 分高就反过来拒 A
+        （模型断言了是同一对，低的那个出局）。A 自己已经出局的不再动它。"""
+        for item in survivors:
+            if "reject" in item:
+                continue
+            target = item.get("_dup_target")
+            if not target or target[0] != "batch":
+                continue
+            other = target[1]
+            if not isinstance(other, dict) or other is item:
+                continue
+            if "scores" not in item or "scores" not in other:
+                continue
+            item_avg = float(item["scores"].get("avg") or 0.0)
+            other_avg = float(other["scores"].get("avg") or 0.0)
+            if item_avg < other_avg:
+                # 这条分低：拒这条，留指着的那条
+                that_title = str(other.get("title") or "")[:30]
+                item["reject"] = ("web", f"和这轮另一条「{that_title}」是同一件事，留分高的")
+            elif "reject" not in other:
+                # 指着的那条分更低：反过来拒它，留这条
+                this_title = str(item.get("title") or "")[:30]
+                other["reject"] = ("web", f"和这轮另一条「{this_title}」是同一件事，留分高的")
 
     # ------------------------------------------------------------------
     # 第二道（去同质化）
     # ------------------------------------------------------------------
 
-    def _dedup_homogeneous(self, survivors: list[dict], max_items: int) -> None:
-        """过线的条目按 topic / 域名 / 敏感 / 不同角度上限 + 总数上限去同质化，avg 高者留；
-        落选的打 item["reject"]=("web", 中文原因)。"""
+    def _dedup_homogeneous(self, survivors: list[dict], max_items: int, gid: str = "") -> None:
+        """过线的条目按「跨轮话题饱和」+ topic / 域名 / 敏感 / 不同角度上限 + 总数上限
+        去同质化，avg 高者留；落选的打 item["reject"]=("web", 中文原因)。
+
+        跨轮话题饱和：同一话题最近 _TOPIC_ROLLING_CAP_H 小时已发 _TOPIC_ROLLING_CAP 条的，
+        这轮新的不再发；信息量、新鲜度都 ≥4.5 的重大新进展可破格，但同一话题每轮最多放行 1 条。
+        """
         web = [item for item in survivors if "reject" not in item and "scores" in item]
         # 按 avg 高到低稳定排（同分保持原序）
         ordered = sorted(web, key=lambda it: -float(it["scores"]["avg"]))
+        # 跨轮饱和：最近 3 天已发话题的计数（规范化后的标签 → 条数）
+        recent_counts: dict[str, int] = {}
+        if gid:
+            recent_counts = dict(
+                self.topic_coverage(gid, max(1, _TOPIC_ROLLING_CAP_H // 24))
+            )
         topic_n: dict[str, int] = {}
         domain_n: dict[str, int] = {}
         sensitive_n = 0
         diverse_n = 0
         kept_n = 0
+        exception_n: dict[str, int] = {}  # 这轮每个已饱和话题已放行几条「重大新进展」
         for item in ordered:
             topic = str(item.get("topic") or "")
             site = str(item.get("site") or "")
+            norm_topic = _norm_topic_label(topic)
             if kept_n >= max_items:
                 item["reject"] = ("web", f"超出本轮上限（最多 {max_items} 条）")
                 continue
+            # 跨轮话题饱和：同一话题（含差一点字的近义标签）最近三天已发够数 → 拒
+            saturated_label, saturated_n = "", 0
+            if norm_topic:
+                for label, n in recent_counts.items():
+                    if n >= _TOPIC_ROLLING_CAP and _same_topic(norm_topic, label):
+                        saturated_label, saturated_n = label, n
+                        break
+            if saturated_label:
+                sc = item.get("scores") or {}
+                big_news = (
+                    float(sc.get("info") or 0.0) >= 4.5
+                    and float(sc.get("timeliness") or 0.0) >= 4.5
+                )
+                if not big_news or exception_n.get(saturated_label, 0) >= 1:
+                    item["reject"] = (
+                        "web",
+                        f"「{saturated_label}」最近三天已经发了 {saturated_n} 条，换换别的",
+                    )
+                    continue
+                exception_n[saturated_label] = exception_n.get(saturated_label, 0) + 1
             if topic and topic_n.get(topic, 0) >= _NORM_TOPIC_CAP:
                 item["reject"] = ("web", "同一个话题这轮已经留了两条，留分高的")
                 continue
@@ -1199,6 +1435,19 @@ class Feeds:
             lines.append("最近几轮已经找过的方向（除非有明显新进展，别再重复这些方向，换别的）：")
             lines.extend(f"- {h['query']}" for h in hist)
             lines.append("")
+        # 话题饱和提示：最近 7 天发得最多（≥2 条）的话题，让模型这轮别围着它们转
+        saturated = self._saturated_topics(gid, 7, min_count=2)
+        if saturated:
+            lines.append("最近 7 天发得最多的话题（这些已经饱和，除非有重大新进展，这轮别再找）：")
+            lines.append("、".join(f"{label} ×{n}" for label, n in saturated))
+            lines.append("")
+            sat_req = (
+                f"上面那些已经饱和的话题（{'、'.join(label for label, _ in saturated)}）"
+                "这轮尽量别再找；至少 2 个关注点要落在它们之外，"
+                "那个「拓展」方向（source=explore）必须在它们之外。"
+            )
+        else:
+            sat_req = ""
         lines.append(
             "请给出 3–5 个接下来要去找的关注点，要分散，只回 JSON："
             '{"focus": [{"query": "拿去搜索的关键词（具体一点）", "why": "为什么这个群会在意",'
@@ -1209,22 +1458,62 @@ class Feeds:
             "基于你对这个群的理解推断出来、群里还没直接聊过、但大概率会感兴趣的相邻方向。"
             "另外如果找得到一个「不同角度 / 反方观点」的方向（避免回音壁），就放进 diverse"
             "（最多 1 个，没有合适的就 null）。"
+            + sat_req
         )
+
+        def _parse_out(raw: Any) -> tuple[list[dict], Any]:
+            """从一次模型回复里拿出关注点列表 + 顶层 diverse 对象。"""
+            got = [
+                {**f, "angle": "", "source": _norm_source(f.get("source"))}
+                for f in focus_items(raw)[:5]
+            ]
+            return got, (raw.get("diverse") if isinstance(raw, dict) else None)
+
+        messages = [{"role": "user", "content": "\n".join(lines)}]
         result = await self._models.chat(
             "main",
-            [{"role": "user", "content": "\n".join(lines)}],
+            list(messages),
             json_mode=True,
             purpose="feeds.focus",
             group_id=gid,
         )
         data = json.loads(result.text)
-        out = [
-            {**f, "angle": "", "source": _norm_source(f.get("source"))}
-            for f in focus_items(data)[:5]
-        ]
+        out, diverse = _parse_out(data)
         if not out:
             raise ValueError("模型没给出能用的关注点（返回格式不对或是空的）")
-        diverse = data.get("diverse") if isinstance(data, dict) else None
+        if len(out) < 3:
+            # 模型只回了 1–2 个（线上实测过它有时只回一个裸对象）：带一句追问重试一次；
+            # 两次结果按 query 去重合并（新的在前），最多 5 个；重试还少就用手头有的，不报错。
+            messages.append({"role": "assistant", "content": result.text})
+            messages.append({
+                "role": "user",
+                "content": (
+                    "太少了：我要 3–5 个不同的关注点，严格按上面的 JSON 格式回 "
+                    '{"focus": [{"query": "…", "why": "…", "source": "recent | long | explore"}, …]}'
+                    "（focus 是列表，最少 3 个；diverse 没有就 null）。"
+                ),
+            })
+            retry_result = await self._models.chat(
+                "main",
+                list(messages),
+                json_mode=True,
+                purpose="feeds.focus",
+                group_id=gid,
+            )
+            retry_data = json.loads(retry_result.text)
+            retry_out, retry_diverse = _parse_out(retry_data)
+            before = len(out)
+            seen_q = {f["query"] for f in out}
+            merged: list[dict] = list(out)
+            for f in retry_out:
+                if f["query"] not in seen_q:
+                    seen_q.add(f["query"])
+                    merged.append(f)
+            out = merged[:5]
+            if retry_diverse is not None:
+                diverse = retry_diverse  # 重试也带 diverse 的话用更新的那份
+            if len(out) != before:
+                logger.info("定关注点重试生效（群 %s）：%d → %d 个", gid, before, len(out))
         if isinstance(diverse, dict) and str(diverse.get("query") or "").strip():
             out.append(
                 {
@@ -1246,7 +1535,22 @@ class Feeds:
         )
         return out
 
-    async def _collect(self, gid: str, focus: list[dict], settings: Settings, task_id: str = "") -> list[dict]:
+    def _saturated_topics(self, gid: str, days: int, min_count: int = 2) -> list[tuple[str, int]]:
+        """最近 days 天已发 min_count 条以上的话题（计数多的在前）；给定关注点 / brief 的
+        「这些已经饱和，别再找」提示用。"""
+        return [
+            (label, n) for label, n in self.topic_coverage(gid, days)
+            if n >= max(1, int(min_count))
+        ]
+
+    async def _collect(
+        self,
+        gid: str,
+        focus: list[dict],
+        settings: Settings,
+        task_id: str = "",
+        rss_items: list[dict] | None = None,
+    ) -> list[dict]:
         # 资讯收集子 agent 的时间盒（0.4.0，[feeds] collect_minutes 默认 15）：到点把已找到的交回
         collect_minutes = max(1, int(getattr(settings.feeds, "collect_minutes", 15) or 15))
         lines = []
@@ -1260,9 +1564,10 @@ class Feeds:
         else:
             kind_req = "只找「资讯」（新闻、发布、动态，要最近几天的新东西）；每条的 kind 一律填 news；"
             kind_field = "kind（一律 news）、"
-        # RSS 源（rss.py）：取回后交子 agent 当「优先看这些链接」，由子 agent 打开并按原流程交回——
-        # 和搜索候选走同一套质量门槛（不另开绿灯）。取失败只记 last_error，不拖垮这轮备料。
-        rss_items = await self._collect_rss(gid, settings)
+        # RSS 源（rss.py）：取回后交子 agent 当「优先看这些链接」让子 agent 打开核对；
+        # 条目本身也会被 prepare_news 直接并进候选池（同一套质量门槛，不另开绿灯）。
+        # prepare_news 已经取过一次就传进来复用；单独调 _collect（测试）时自己取。
+        rss_items = await self._collect_rss(gid, settings) if rss_items is None else rss_items
         rss_section = ""
         if rss_items:
             rss_lines = ["下面这些链接是群订阅的 RSS 源给的，**优先看这些链接**（也要用 fetch_page 打开核对，不行就跳过）："]
@@ -1276,6 +1581,15 @@ class Feeds:
             profile_section = (
                 "这个群大致是这样的（给你拓展方向用）：\n" + "\n".join(profile_lines) + "\n\n"
             )
+        # 话题饱和提示：最近 7 天已发得多的话题别再找（除非是有分量的重大新消息）
+        saturated = self._saturated_topics(gid, 7, min_count=2)
+        saturated_section = ""
+        if saturated:
+            saturated_section = (
+                "这些话题最近已经发得很多了，不要再找（除非是有分量的重大新消息）："
+                + "、".join(label for label, _n in saturated)
+                + "\n\n"
+            )
         brief = (
             "帮这个群找值得看的内容。\n"
             + profile_section
@@ -1283,11 +1597,14 @@ class Feeds:
             + "\n".join(lines)
             + "\n\n"
             + rss_section
+            + saturated_section
             + "要求：\n"
-            f"1. {kind_req}资讯用 web_search 搜最近几天（days 填 3–7）；\n"
+            f"1. {kind_req}资讯只收最近 7 天内发生/发布的事——商店页、比价页、"
+            "百科/资料页、产品基本介绍页都不算资讯，别收；资讯用 web_search 搜最近几天"
+            "（days 填 3–7）；\n"
             "2. 每条候选必须用 fetch_page 真打开过原文再看一遍，确实和关注点相关、有信息量才收；\n"
-            "3. 凑数的、旧的、广告软文、营销号都不要；要登录或付费才能看的也别收，"
-            "直接标出来（paywall: true）；\n"
+            "3. 凑数的、旧的（资讯超过 7 天的一律不要）、广告软文、营销号都不要；"
+            "要登录或付费才能看的也别收，直接标出来（paywall: true）；\n"
             f"4. 最多交回 {_CANDIDATE_CAP} 条，宁缺毋滥；\n"
             "5. 每条：title（原标题或大意）、url（原文链接）、summary（2–4 句中文纯文本，别用 Markdown）、"
             f"{kind_field}published（发布时间，ISO 格式或 epoch 秒，实在拿不到就空字符串）、"
@@ -1296,8 +1613,8 @@ class Feeds:
             "image_url（fetch_page 说有封面图就把那个地址抄过来，没有就空字符串）、"
             "explore（这条是你自己按群画像拓展的方向就 true，否则省略）；\n"
             "6. 除了上面的关注点，你也可以根据群画像自己拓展 1–2 个这个群大概率会感兴趣、"
-            "上面没列到的方向去找；这类条目在 JSON 里标 explore: true。总数仍然不超过上限，"
-            "质量要求一样；\n"
+            "上面没列到的方向去找；但前面列的「已经发得很多」的饱和话题不算拓展方向，别碰；"
+            "这类条目在 JSON 里标 explore: true。总数仍然不超过上限，质量要求一样；\n"
             "7. 最后用 submit_result 交回，data 按约定的 JSON Schema；"
             f"你只有大约 {collect_minutes} 分钟，到点前记得把已经找到的交回来（部分结果也算，不会丢）。"
         )
@@ -1379,7 +1696,10 @@ class Feeds:
         """
         entries = self._safe_entries(gid)
         entry_texts = [str(e.get("text") or "") for e in entries[:20]]
-        recent_titles = self._recent_news_titles(gid)
+        # 「同一件事」参考：只列已发布（rejected=0）的，R1.. 编号 + 话题 + 摘要开头
+        recent_published = self._recent_published_for_dedup(gid)
+        # 话题标签复用提示：最近 14 天在用的标签（让同一类游戏用同一个标签，别漂移）
+        recent_topics = [label for label, _n in self.topic_coverage(gid, _RECENT_TOPICS_DAYS)]
         mem_block = self._prompt_block_safe("memory", group_id=gid)
         lines = ([mem_block.strip()] if mem_block else []) + ["这是一个 QQ 群的画像条目（打分时要指出每条对应的条目）："]
         if entry_texts:
@@ -1388,49 +1708,51 @@ class Feeds:
         else:
             lines.append("（画像还是空的；profile 就给 null）")
         lines.append("")
-        if recent_titles:
-            lines.append("最近 14 天已经给这个群出过的（判断「同一件事」用）：")
-            lines.extend(f"- {t}" for t in recent_titles[:15])
+        if recent_published:
+            lines.append("最近 14 天已经给这个群发过的（判断「同一件事」用，编号 R1 起）：")
+            for i, rp in enumerate(recent_published, 1):
+                topic_tag = f"[{rp['topic']}] " if rp["topic"] else ""
+                summary_tag = f" —— {rp['summary']}…" if rp["summary"] else ""
+                lines.append(f"(R{i}) {topic_tag}{rp['title']}{summary_tag}")
             lines.append("")
-        lines.append("下面是一批候选（按编号从 0 开始；kind=news 资讯 / guide 好文；quote 是子 agent 从原文抄的依据）：")
-        for i, c in enumerate(candidates):
-            kind_zh = "资讯" if c.get("kind") == "news" else "好文"
-            quote = str(c.get("quote") or "")
-            pub = c.get("published_raw")
-            pub_text = f"，发布于 {pub}" if pub else ""
+        if recent_topics:
+            lines.append("最近 14 天已经用过的话题标签：")
+            lines.append("、".join(recent_topics[:30]))
             lines.append(
-                f"[{i}]（{kind_zh}）{c['title']} —— {c['summary'][:150]}（{c['url']}{pub_text}）"
-                + (f" 原文依据：{quote[:150]}" if quote else "")
+                "候选如果属于上面这些话题，topic 一律沿用上面那个标签原样（别自己新造近义词），"
+                "不属于再新起标签。"
             )
-        lines.append("")
+            lines.append("")
+        head = lines
         icon_list = "、".join(_ICONS)
-        lines.append(
+        instr = (
             "请给每条打分，只回 JSON："
             '{"scores": [{"i": 编号,'
             ' "info": 信息量 1到5（新事实、有料才高分，旧闻重炒低分）,'
             ' "source": 来源等级 1到5（官方/一手 > 权威媒体 > 个人博客 > 二手转述）,'
             ' "relevance": 和这个群的相关度 1到5（必须对着某条画像条目打）,'
-            ' "timeliness": 资讯=新鲜度 1到5；好文=现在还适用吗 1到5（要核对版本/价格/接口过时没）,'
+            ' "timeliness": 资讯=新鲜度 1到5（发布超过 7 天的资讯一律打到 2 以下）；'
+            '好文=现在还适用吗 1到5（要核对版本/价格/接口过时没）,'
             ' "chat": 值不值得拿到群里聊 1到5,'
             ' "profile": 相关度对应的是上面哪一条画像（回它的编号；没有就说 null）,'
             ' "topic": 这条的话题标签（不超过 8 个字，同一类事给同一个标签）,'
             ' "sensitive": 政治/争议话题吗 true/false,'
             ' "grounded": 上面的摘要能在 quote/原文里找到依据吗 true/false,'
-            ' "junk": 标题党/软文广告/营销号/纯情绪没事实吗 true/false,'
-            ' "junk_reason": junk 是 true 的话写一个简短原因，否则空字符串,'
-            ' "same_as_recent": 是不是和上面「最近出过的」某条讲的是同一件事 true/false,'
+            ' "junk": 标题党/软文广告/营销号/纯情绪没事实吗 true/false；注意：'
+            '对 kind=资讯的候选，商店页、比价页、百科/资料页、「已发售东西的基本介绍」'
+            '都不是新闻，一律 junk: true,'
+            ' "junk_reason": junk 是 true 的话写一个简短原因（商店页/资料页就写'
+            '「不是新闻（商店页/资料页）」），否则空字符串,'
+            ' "same_as_recent": 是不是和上面「最近发过的」某条讲的是同一件事 true/false,'
+            ' "dup_of": 如果这条和上面「最近发过的」某条（R 开头编号）是「同一件事」，'
+            '就回那个编号（例如 "R2"），否则回 null。同一件事指：同一个事件/公告/产品消息，'
+            '哪怕是不同网站、不同语言报道的；也包括内容雷同的同主题指南'
+            '（比如两份同一游戏同一版本的配装指南）,'
+            ' "dup_in_batch": 如果这条和这批候选里编号比它小的另一条讲的是同一件事/同样的内容，'
+            '就回那一条的编号（整数），否则回 null,'
             ' "why": "为什么给这个群（一句话，只说群的事，不许点名任何群友）",'
             f' "icon": "从下面这些挑一个：{icon_list}"}}]}}'
         )
-        result = await self._models.chat(
-            "main",
-            [{"role": "user", "content": "\n".join(lines)}],
-            json_mode=True,
-            purpose="feeds.score",
-            group_id=gid,
-        )
-        data = json.loads(result.text)
-        scores_raw = data.get("scores") if isinstance(data, dict) else None
 
         def _f15(key: str, s: dict) -> float:
             try:
@@ -1443,11 +1765,19 @@ class Feeds:
             icon = str(s.get("icon") or "").strip()
             if icon not in _ICONS:
                 icon = "newspaper"
+            # dup_in_batch 只认「编号比这条小的整数」；指自己 / 指后面 / 不是数 → None（忽略）
+            dup_in_batch: int | None = None
+            try:
+                dup_in_batch = int(s.get("dup_in_batch"))
+            except (TypeError, ValueError):
+                dup_in_batch = None
             flags = {
                 "grounded": bool(s.get("grounded", True)),
                 "junk": bool(s.get("junk", False)),
                 "junk_reason": str(s.get("junk_reason") or "")[:80],
                 "same_as_recent": bool(s.get("same_as_recent", False)),
+                "dup_of": str(s.get("dup_of") or "").strip(),
+                "dup_in_batch": dup_in_batch,
             }
             profile_idx: int | None
             raw_profile = s.get("profile")
@@ -1481,25 +1811,119 @@ class Feeds:
                 "flags": flags,
             }
 
+        # 分批打分（2026-09-28 线上回放：21 条一次性打分每次都超过 120 秒超时，
+        # 白等 13 分钟后全部记 0 分被拒）。每批最多 _SCORE_CHUNK 条，编号用全批统一的编号；
+        # 后面几批带「前面已经评过的」标题，dup_in_batch 照样能指到前面批次。
         by_index: dict[int, dict] = {}
         by_title: dict[str, dict] = {}
-        if isinstance(scores_raw, list):
-            for s in scores_raw:
-                if not isinstance(s, dict):
-                    continue
-                normed = _norm(s)
-                title = str(s.get("title") or "").strip()
-                if title and title not in by_title:
-                    by_title[title] = normed
+        failed: set[int] = set()
+        last_err: Exception | None = None
+        n = len(candidates)
+        for start in range(0, n, _SCORE_CHUNK):
+            chunk_no = start // _SCORE_CHUNK + 1
+            pending = list(range(start, min(n, start + _SCORE_CHUNK)))
+            # 每批最多问两次：第二次只问第一次漏掉的（线上 step-5-preview 常只回一条裸对象）
+            for ask in range(2):
+                if not pending:
+                    break
+                ls = list(head)
+                if start > 0:
+                    ls.append("这批前面已经评过的（判断 dup_in_batch 用，只看不打分）：")
+                    for j in range(start):
+                        ls.append(f"[{j}] {candidates[j]['title']}")
+                    ls.append("")
+                ls.append(
+                    "下面是这一批要打分的候选（编号沿用全批的编号；kind=news 资讯 / guide 好文；"
+                    "quote 是子 agent 从原文抄的依据）："
+                )
+                for i in pending:
+                    c = candidates[i]
+                    kind_zh = "资讯" if c.get("kind") == "news" else "好文"
+                    quote = str(c.get("quote") or "")
+                    pub = c.get("published_raw")
+                    pub_text = f"，发布于 {pub}" if pub else ""
+                    ls.append(
+                        f"[{i}]（{kind_zh}）{c['title']} —— {c['summary'][:150]}（{c['url']}{pub_text}）"
+                        + (f" 原文依据：{quote[:150]}" if quote else "")
+                    )
+                ls.append("")
+                ls.append(instr)
+                ls.append(
+                    f"这一批共 {len(pending)} 条（编号 {'、'.join(str(i) for i in pending)}），"
+                    "每一条都要打分：scores 数组里每个编号各一项，一条都不能漏，别只回一条。"
+                )
                 try:
-                    i = int(s.get("i"))
-                except (TypeError, ValueError):
-                    continue
-                if i in by_index:
-                    continue
-                by_index[i] = normed
+                    result = await self._models.chat(
+                        "main",
+                        [{"role": "user", "content": "\n".join(ls)}],
+                        json_mode=True,
+                        purpose="feeds.score",
+                        group_id=gid,
+                        timeout=_SCORE_TIMEOUT_S,
+                        retries=1,
+                    )
+                    data = json.loads(result.text)
+                except (ModelError, ValueError) as e:
+                    logger.info("备资讯-打分第 %d 批第 %d 次失败（群 %s）：%s", chunk_no, ask + 1, gid, e)
+                    last_err = e
+                    break
+                # 认四种形状：{"scores":[...]} / 裸列表 [...] / 单个裸对象 {"i":..} / 键名写错的对象列表
+                if isinstance(data, dict) and isinstance(data.get("scores"), list):
+                    scores_raw = data["scores"]
+                elif isinstance(data, list):
+                    scores_raw = data
+                elif isinstance(data, dict) and ("i" in data or "title" in data):
+                    scores_raw = [data]
+                else:
+                    # 键名写错（线上见过 {"": [...]}）：取第一个「对象列表」的值
+                    scores_raw = []
+                    if isinstance(data, dict):
+                        for v in data.values():
+                            if isinstance(v, list) and any(isinstance(x, dict) for x in v):
+                                scores_raw = v
+                                break
+                title_pos = {candidates[i]["title"]: i for i in pending}
+                got: set[int] = set()
+                for s in scores_raw:
+                    if not isinstance(s, dict):
+                        continue
+                    normed = _norm(s)
+                    title = str(s.get("title") or "").strip()
+                    if title in title_pos and title not in by_title:
+                        by_title[title] = normed
+                        got.add(title_pos[title])
+                        continue
+                    try:
+                        i = int(s.get("i"))
+                    except (TypeError, ValueError):
+                        continue
+                    if i not in pending or i in by_index:
+                        continue
+                    by_index[i] = normed
+                    got.add(i)
+                if not got:
+                    last_err = ValueError("打分回复里一条都没对上")
+                pending = [i for i in pending if i not in got]
+            if pending:
+                logger.info("备资讯-打分第 %d 批有 %d 条没评上（群 %s）", chunk_no, len(pending), gid)
+                failed.update(pending)
+        if n and len(failed) == n and last_err is not None:
+            raise last_err
         zero_five = {"info": 0.0, "source": 0.0, "relevance": 0.0, "timeliness": 0.0, "chat": 0.0, "avg": 0.0}
         for pos, item in enumerate(candidates):
+            if pos in failed:
+                item["scores"] = dict(zero_five)
+                item.setdefault("why", "")
+                item.setdefault("icon", "newspaper")
+                item.setdefault("topic", "")
+                item.setdefault("sensitive", False)
+                item.setdefault("profile_ref", "")
+                item["_flags"] = {
+                    "grounded": True, "junk": False, "junk_reason": "",
+                    "same_as_recent": False, "dup_of": "", "dup_in_batch": None,
+                }
+                item.setdefault("reject", ("score", "打分没做完（模型超时/出错），这轮没评上"))
+                continue
             s = by_index.get(pos)
             s_titled = by_title.get(item["title"])
             if s_titled is not None:
@@ -1512,7 +1936,10 @@ class Feeds:
                 item.setdefault("topic", "")
                 item.setdefault("sensitive", False)
                 item.setdefault("profile_ref", "")
-                item.setdefault("_flags", {"grounded": True, "junk": False, "junk_reason": "", "same_as_recent": False})
+                item.setdefault("_flags", {
+                    "grounded": True, "junk": False, "junk_reason": "",
+                    "same_as_recent": False, "dup_of": "", "dup_in_batch": None,
+                })
                 continue
             item["scores"] = s["scores"]
             item["why"] = s["why"]
@@ -1521,6 +1948,22 @@ class Feeds:
             item["sensitive"] = s["sensitive"]
             item["profile_ref"] = s["profile_ref"]
             item["_flags"] = s["flags"]
+        # 打分落地之后，把模型给的 dup 索引换算成具体对象存进 _dup_target：
+        # dup_of="R编号" → 那条已发布条目的 dict；dup_in_batch=整数 → candidates 里那条候选。
+        # 无效的（指不到、指自己）不带 _dup_target，后续流程就当没指。
+        for pos, item in enumerate(candidates):
+            flags = item.get("_flags") or {}
+            dup_of = str(flags.get("dup_of") or "").strip().upper()
+            if dup_of.startswith("R"):
+                try:
+                    r_idx = int(dup_of[1:])
+                except ValueError:
+                    r_idx = -1
+                if 1 <= r_idx <= len(recent_published):
+                    item["_dup_target"] = ("recent", recent_published[r_idx - 1])
+            dup_in = flags.get("dup_in_batch")
+            if isinstance(dup_in, int) and 0 <= dup_in < pos and "_dup_target" not in item:
+                item["_dup_target"] = ("batch", candidates[dup_in])
 
     # ------------------------------------------------------------------
     # 身份与工作记忆（identity.py）
@@ -1586,26 +2029,53 @@ class Feeds:
                     return out
         return out
 
-    async def _write_posts(self, gid: str, items: list[dict], settings: Settings) -> None:
-        """对过第二道门槛的每条写帖子（一次模型调用写完全部；失败的条目回落原文）。
+    @staticmethod
+    def _posts_from_data(data: Any) -> list[dict]:
+        """把写帖子的模型回复容忍成帖子列表：约定 {"posts":[...]}，但有的模型会只回
+        一个裸帖子对象（{"i":0,"title":…,"body":…}），或直接回一个裸列表——都认。"""
+        posts: Any = None
+        if isinstance(data, list):
+            posts = data
+        elif isinstance(data, dict):
+            posts = data.get("posts")
+            if not isinstance(posts, list) and ("body" in data or "title" in data):
+                posts = [data]  # 裸的单个帖子对象
+        if not isinstance(posts, list):
+            return []
+        return [p for p in posts if isinstance(p, dict)]
 
-        直接改 item：item["post"] = {"body","reason","refs","audience","keywords"}。
-        """
-        if not items:
-            return
-        # 每条的素材：候选本身 + 群原话
-        per_item: list[dict] = []
-        for item in items:
-            site = str(item.get("site") or _site_of(item["url"]))
-            quotes = self._quotes_for_item(gid, item)
-            per_item.append({"item": item, "site": site, "quotes": quotes})
+    def _apply_posts(self, gid: str, per_item: list[dict], posts: list[dict]) -> None:
+        """按标题（优先）和编号对上每件条目和模型写的帖子，写进 item["post"]。"""
+        by_index: dict[int, dict] = {}
+        by_title: dict[str, dict] = {}
+        for p in posts:
+            try:
+                idx = int(p.get("i"))
+            except (TypeError, ValueError):
+                idx = None
+            if idx is not None and idx not in by_index:
+                by_index[idx] = p
+            t = str(p.get("title") or "").strip()
+            if t and t not in by_title:
+                by_title[t] = p
+        for i, pack in enumerate(per_item):
+            item = pack["item"]
+            if "post" in item:
+                continue
+            raw = by_title.get(item["title"]) or by_index.get(i)
+            if raw is None:
+                continue
+            item["post"] = self._clean_post(gid, raw, pack["quotes"], item)
 
+    async def _posts_prompt_lines(self, gid: str, per_item: list[dict]) -> list[str]:
+        """写帖子提示词（每条的素材 + 写法要求）；每轮一次 + 补漏重试一次共用同一份结构，
+        只是条目清单不同（每次的编号都从 0 起，对回自己这批）。"""
         lines: list[str] = []
         # 有 SOUL（identity.py）→ 用「## MaiWork 的身份」这一份；没有才回落老的人设行
         soul_block = self._prompt_block_safe("soul")
         if soul_block:
             lines.append(soul_block.strip())
-            lines.append(f"写正文和原因都按上面「MaiWork 的身份」的口吻。")
+            lines.append("写正文和原因都按上面「MaiWork 的身份」的口吻。")
             lines.append("")
         else:
             persona = await self._bot_persona_lines()
@@ -1652,52 +2122,87 @@ class Feeds:
             ' "audience": ["可能需要的群友名字，只能来自上面给出的原话发言人"],'
             ' "keywords": ["5–10 个关键词，中英文、同义词都放点"]}]}'
         )
-        try:
-            result = await self._models.chat(
-                "main",
-                [{"role": "user", "content": "\n".join(lines)}],
-                json_mode=True,
-                purpose="feeds.post",
-                group_id=gid,
-            )
-            data = json.loads(result.text)
-        except (ModelError, ValueError) as e:
-            logger.info("写帖子失败（群 %s）：%s；全部回落原文", gid, e)
-            for item in items:
-                self._post_fallback(item)
+        return lines
+
+    async def _write_posts(self, gid: str, items: list[dict], settings: Settings) -> None:
+        """对过第二道门槛的每条写帖子（一次模型调用写完全部；漏写的补一次重试；
+        重试还漏的条目才回落原文）。
+
+        直接改 item：item["post"] = {"body","reason","refs","audience","keywords"}。
+        """
+        if not items:
             return
-        posts = data.get("posts") if isinstance(data, dict) else None
-        if not isinstance(posts, list):
-            posts = []
-        by_index: dict[int, dict] = {}
-        by_title: dict[str, dict] = {}
-        for p in posts:
-            if not isinstance(p, dict):
-                continue
+        # 每条的素材：候选本身 + 群原话
+        per_item: list[dict] = []
+        for item in items:
+            site = str(item.get("site") or _site_of(item["url"]))
+            quotes = self._quotes_for_item(gid, item)
+            per_item.append({"item": item, "site": site, "quotes": quotes})
+
+        async def _call(packs: list[dict]) -> tuple[list[dict], bool]:
+            """给这批条目（编号 0..k-1）调一次写帖子模型。
+
+            返回 (帖子列表, 回复能不能用)：
+            - 模型抛错 / 坏 JSON / 回的东西认不出帖子形态 → ([], False)，值得补一次重试；
+            - 回的是能认的形态（{"posts": [...]} / 裸列表 / 裸单条），哪怕一条都没有 → ([], True)，
+              当「模型就这水平」，不再为它多花一通调用。
+            """
+            prompt = "\n".join(await self._posts_prompt_lines(gid, packs))
             try:
-                idx = int(p.get("i"))
-            except (TypeError, ValueError):
-                idx = None
-            if idx is not None and idx not in by_index:
-                by_index[idx] = p
-            t = str(p.get("title") or "").strip()
-            if t and t not in by_title:
-                by_title[t] = p
-        for i, pack in enumerate(per_item):
+                result = await self._models.chat(
+                    "main",
+                    [{"role": "user", "content": prompt}],
+                    json_mode=True,
+                    purpose="feeds.post",
+                    group_id=gid,
+                )
+            except ModelError as e:
+                logger.info("写帖子失败（群 %s）：%s", gid, e)
+                return [], False
+            try:
+                data = json.loads(result.text)
+            except ValueError as e:
+                logger.info("写帖子回的不是 JSON（群 %s）：%s", gid, e)
+                return [], False
+            posts = self._posts_from_data(data)
+            # 认不出帖子形态才算「不能用」：dict 带 posts 键 / 裸列表 / 裸单条都算能用
+            usable = (
+                (isinstance(data, dict) and isinstance(data.get("posts"), list))
+                or isinstance(data, list)
+                or (isinstance(data, dict) and ("body" in data or "title" in data))
+            )
+            return posts, usable
+
+        posts, usable = await _call(per_item)
+        self._apply_posts(gid, per_item, posts)
+        # 漏写的条目补一次重试（只重试漏的那些，重编 0..k-1，对回自己那批）；
+        # 第一通回复根本不能用（坏 JSON 等）也补一次——但重试重发整批太亏，只补漏下的
+        missing = [p for p in per_item if "post" not in p["item"]]
+        if missing and (not usable or len(missing) < len(per_item)):
+            retry_posts, _usable2 = await _call(missing)
+            self._apply_posts(gid, missing, retry_posts)
+        # 还漏的才回落原文
+        for pack in per_item:
             item = pack["item"]
-            raw = by_title.get(item["title"]) or by_index.get(i)
-            if raw is None:
+            if "post" not in item:
                 self._post_fallback(item)
-                continue
-            item["post"] = self._clean_post(gid, raw, pack["quotes"], item)
 
     def _post_fallback(self, item: dict) -> None:
         """写帖子失败 / 漏了这条的回落：body=summary、reason=why、refs/audience 空、
-        keywords 用话题 + 标题粗拼的兜底，image_url 留着。"""
+        keywords = 话题 + 标题里像样的词（滤掉纯数字、单字、英文虚词），image_url 留着。"""
         keywords: list[str] = []
-        for k in [str(item.get("topic") or ""), *_split_query_words(str(item.get("title") or ""))]:
+        topic = str(item.get("topic") or "").strip()
+        if topic:
+            keywords.append(topic)
+        for k in _split_query_words(str(item.get("title") or "")):
             k = k.strip()
-            if k and k not in keywords:
+            if not (2 <= len(k) <= 30):  # 一个词才算关键词：太短的单字、太长的整句都不要
+                continue
+            if k.isdigit():  # 纯数字没检索价值
+                continue
+            if k.isascii() and k.lower() in _FALLBACK_STOPWORDS:
+                continue
+            if k not in keywords:
                 keywords.append(k)
             if len(keywords) >= _KEYWORDS_MAX:
                 break
@@ -1785,12 +2290,15 @@ class Feeds:
     async def _plan_and_verify(self, gid: str, items: list[dict], settings: Settings) -> None:
         """挑值得实测的条目 → 交给注入的 verify_runner 去一次性 VM 里跑。
 
-        - [environments] railway=false、没接 verify_runner → 整个跳过（不多调一次模型）。
+        - [environments] verify_enabled=false（默认）、railway=false、没接 verify_runner
+          → 整个跳过（一次模型都不调、不申请 VM）。
         - 主模型挑中 0 条 → 跳过；挑多了夹回 [environments] verify_per_round（默认 2）。
         - 实测本身由 verify_runner 干（真机上接 run_railway_verify；测试注入假的），
           直接改写 items[i]["verify"]；runner 拿不到机器就什么都不写，照常入库。
         """
         env_cfg = getattr(settings, "environments", None)
+        if not _verify_on(settings):
+            return
         if env_cfg is None or not bool(getattr(env_cfg, "railway", True)):
             return
         runner = self._verify_runner
@@ -2149,12 +2657,70 @@ class Feeds:
         return [str(r["title"]) for r in rows if r["title"]]
 
     def _recent_news_titles(self, gid: str) -> list[str]:
+        """最近 14 天「已通过、真发出去的」资讯标题（被筛掉的不算——给打分/构想判重复用）。"""
         since = clock.now() - _FEEDBACK_SCAN_DAYS * 86400.0
         rows = self._store.read().execute(
-            "SELECT title FROM news_items WHERE group_id=? AND created>=? ORDER BY created DESC LIMIT 10",
+            "SELECT title FROM news_items WHERE group_id=? AND created>=? AND rejected=0"
+            " ORDER BY created DESC LIMIT 10",
             (gid, since),
         ).fetchall()
         return [str(r["title"]) for r in rows if r["title"]]
+
+    def _recent_published_for_dedup(self, gid: str) -> list[dict]:
+        """打分判「同一件事」参考的最近已发布条目：近 14 天、已通过（rejected=0）、
+        新的在前、最多 _RECENT_PUBLISHED_MAX 条，每条带标题 + 话题 + 摘要开头。
+
+        只给打分提示词用（编号 R1..）；个人向的（target_user_id 非空）不掺进来。
+        """
+        since = clock.now() - _FEEDBACK_SCAN_DAYS * 86400.0
+        try:
+            rows = self._store.read().execute(
+                "SELECT title, topic, summary FROM news_items"
+                " WHERE group_id=? AND created>=? AND rejected=0"
+                " AND COALESCE(target_user_id, '')=''"
+                " ORDER BY created DESC LIMIT ?",
+                (gid, since, _RECENT_PUBLISHED_MAX),
+            ).fetchall()
+        except Exception:
+            logger.debug("读最近已发布资讯失败（群 %s）", gid, exc_info=True)
+            return []
+        out: list[dict] = []
+        for r in rows:
+            title = str(r["title"] or "").strip()
+            if not title:
+                continue
+            out.append(
+                {
+                    "title": title,
+                    "topic": str(r["topic"] or "").strip(),
+                    "summary": str(r["summary"] or "").strip()[:_RECENT_PUBLISHED_SUMMARY],
+                }
+            )
+        return out
+
+    def topic_coverage(self, gid: str, days: int) -> list[tuple[str, int]]:
+        """最近 days 天已发布（rejected=0）条目按话题标签计数，多的在前。
+
+        标签先规范化（去首尾空白、拉丁字母转小写）再合并计数；个人向的不掺进来；
+        空标签不算。给「话题饱和」判断和提示词用。
+        """
+        since = clock.now() - max(1, int(days)) * 86400.0
+        try:
+            rows = self._store.read().execute(
+                "SELECT topic FROM news_items WHERE group_id=? AND created>=? AND rejected=0"
+                " AND COALESCE(target_user_id, '')=''",
+                (gid, since),
+            ).fetchall()
+        except Exception:
+            logger.debug("读话题覆盖失败（群 %s）", gid, exc_info=True)
+            return []
+        counts: dict[str, int] = {}
+        for r in rows:
+            label = _norm_topic_label(r["topic"])
+            if not label:
+                continue
+            counts[label] = counts.get(label, 0) + 1
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
 
     # ------------------------------------------------------------------
     # 反馈

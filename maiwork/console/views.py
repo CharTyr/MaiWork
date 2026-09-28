@@ -797,23 +797,35 @@ def _search_health(svc: Any) -> dict[str, Any]:
 
 
 def _localenv_health(svc: Any) -> dict[str, Any]:
-    """本机执行环境健康项（M3）：systemd → ok「systemd 隔离 · 同时最多 N 个子 agent」；
-    direct → warn「直跑模式没有隔离，只能本地测试用」。"""
+    """本机干活健康项（M3）：按启动时的执行方式判定写大白话。
+
+    - fixed（有 run_as 固定账号）→ ok「隔离运行（固定账号 maiwork）」；
+    - dynamic（没这个账号，systemd 自动分配临时账号）→ ok「隔离运行（自动分配临时账号，不用建用户）」；
+    - stopped（macOS / Windows / 不是 root / 没 systemd）→ off「没开（原因…）；跑命令的活交给 Railway 或做不了」；
+    - 受限时不管 local_mode 写的是什么，都按「没开」说（受限下命令工具根本没注册，
+      写 direct 也只是文件工具用得上）；
+    - 没判定过（老 stub / 没启动）→ 按 local_mode 回落成老文案（direct 仍 warn）。
+    """
     settings = svc.get_settings()
     env = getattr(settings, "environments", None) if settings is not None else None
     mode = str(getattr(env, "local_mode", "") or "").strip() if env is not None else ""
-    n = int(getattr(env, "max_parallel", 2) or 2) if env is not None else 2
-    if mode == "systemd":
-        return {
-            "key": "localenv", "icon": "monitor", "name": "本机执行环境",
-            "state": "ok", "text": f"systemd 隔离 · 同时最多 {n} 个子 agent",
-        }
+    base = {"key": "localenv", "icon": "monitor", "name": "本机干活"}
+    cap = getattr(svc, "capability", None)
+    cap_mode = str(getattr(cap, "mode", "") or "")
+    if cap_mode == "stopped":
+        why = str(getattr(cap, "reason", "") or "这台机器不能隔离跑命令")
+        return {**base, "state": "off", "text": f"没开（{why}）；跑命令的活交给 Railway 或做不了"}
     if mode == "direct":
-        return {
-            "key": "localenv", "icon": "monitor", "name": "本机执行环境",
-            "state": "warn", "text": "直跑模式没有隔离，只能本地测试用",
-        }
-    return {"key": "localenv", "icon": "monitor", "name": "本机执行环境", "state": "off", "text": "还没启用"}
+        return {**base, "state": "warn", "text": "直跑模式没有隔离，只能本地测试用"}
+    if cap_mode == "fixed":
+        run_as = str(getattr(env, "run_as", "") or "maiwork") if env is not None else "maiwork"
+        return {**base, "state": "ok", "text": f"隔离运行（固定账号 {run_as}）"}
+    if cap_mode == "dynamic":
+        return {**base, "state": "ok", "text": "隔离运行（自动分配临时账号，不用建用户）"}
+    if mode == "systemd":
+        n = int(getattr(env, "max_parallel", 2) or 2) if env is not None else 2
+        return {**base, "state": "ok", "text": f"systemd 隔离 · 同时最多 {n} 个子 agent"}
+    return {**base, "state": "off", "text": "还没启用"}
 
 
 def _rss_by_group(svc: Any) -> dict[str, list[dict[str, Any]]]:
@@ -925,13 +937,13 @@ def _bot_info(svc: Any) -> dict[str, str]:
         name = str(getattr(svc.host, "bot_name_cache", "") or "")
     except Exception:
         name = ""
-    avatar = "/static/assets/maimai.png"
+    avatar = "/static/assets/logo.png"
     try:
         av = getattr(svc, "avatar", None)
         if av is not None:
             avatar = av.bot_avatar_url()
     except Exception:
-        avatar = "/static/assets/maimai.png"
+        avatar = "/static/assets/logo.png"
     return {"name": name or "MaiBot", "avatar": avatar}
 
 

@@ -35,15 +35,15 @@ from test_coordinator import (  # noqa: F401
     _review,
 )
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.coordinator import Coordinator, _GROUPSPACE_TOOLS
-from CharTyr_MaiWork.environments.local import LocalEnv
-from CharTyr_MaiWork.goals import Goals
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tasks import Tasks
-from CharTyr_MaiWork.tools import Tools
-from CharTyr_MaiWork.tools_exec import register_exec_tools
-from CharTyr_MaiWork.tools_groupspace import register_groupspace_tools
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.coordinator import Coordinator, _GROUPSPACE_TOOLS
+from CharTyr_MaiWork.maiwork.environments.local import LocalEnv
+from CharTyr_MaiWork.maiwork.goals import Goals
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tasks import Tasks
+from CharTyr_MaiWork.maiwork.tools import Tools
+from CharTyr_MaiWork.maiwork.tools_exec import register_exec_tools
+from CharTyr_MaiWork.maiwork.tools_groupspace import register_groupspace_tools
 
 pytestmark = pytest.mark.asyncio
 

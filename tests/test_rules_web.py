@@ -22,8 +22,8 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from fakes import FakeCtx, FakeProfiles
 
-from CharTyr_MaiWork.app import MaiWorkApp
-from CharTyr_MaiWork import rules as rules_mod
+from CharTyr_MaiWork.maiwork.app import MaiWorkApp
+from CharTyr_MaiWork.maiwork import rules as rules_mod
 
 SECRET = "sk-rules-web-test-显眼Aa1"
 PASSWORD = "规则测试密码-显眼-123"

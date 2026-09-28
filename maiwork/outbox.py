@@ -605,6 +605,50 @@ class Delivery:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    def _workspace_name_of(self, task_id: str, gid: str) -> str:
+        """任务钉的工作区名；查不到回落 settings.workspace_of(gid)（再不行 "g<群号>"）。"""
+        try:
+            row = self._store.read().execute(
+                "SELECT workspace FROM tasks WHERE id=?", (str(task_id),)
+            ).fetchone()
+            if row is not None and str(row["workspace"] or "").strip():
+                return str(row["workspace"]).strip()
+        except Exception:
+            pass
+        try:
+            fn = getattr(self._outbox._get_settings(), "workspace_of", None)
+            if callable(fn):
+                name = str(fn(gid) or "").strip()
+                if name:
+                    return name
+        except Exception:
+            pass
+        return f"g{gid}"
+
+    def _task_artifact_dir(self, task_id: str, gid: str) -> Path:
+        """这个任务的成品目录 <工作区>/artifacts/<task_id>（resolve 后的绝对路径）。"""
+        settings = self._outbox._get_settings()
+        root = Path(getattr(settings, "workspace_root", Path("data/workspaces")))
+        return (root / self._workspace_name_of(task_id, gid) / "artifacts" / str(task_id)).resolve()
+
+    def _check_deliver_path(self, task_id: str, gid: str, path: Path) -> Path:
+        """交付路径第二道闸（插件中心审核整改 6）：path 必须等于或位于本任务的成品目录里。
+
+        用 resolve() 后的真实路径比较（跟符号链接、消 `..`），所以 `artifacts/别的任务/x`、
+        `tasks/...`、`.`、指到外面的符号链接都过不去。不满足抛 ValueError（中文），
+        调用方记日志、任务照常结束。
+        """
+        base = self._task_artifact_dir(task_id, gid)
+        try:
+            real = Path(path).resolve()
+        except OSError as e:
+            raise ValueError(f"交付路径解析失败：{path}（{e}）") from e
+        if real != base and base not in real.parents:
+            raise ValueError(
+                f"交付路径不在本任务的成品目录 artifacts/{task_id}/ 里，不交付：{path}"
+            )
+        return real
+
     async def deliver_task(
         self,
         task_id: str,
@@ -619,6 +663,7 @@ class Delivery:
         gid = self._group_of_task(task_id)
         if not gid:
             raise ValueError(f"找不到任务或任务没有群：{task_id}")
+        path = self._check_deliver_path(task_id, gid, path)
         name = str(name or path.name or "成品")
         note = str(note or "")
 

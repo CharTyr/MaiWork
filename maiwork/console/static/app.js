@@ -496,7 +496,7 @@
             <div class="rej-row">
               <div class="rej-main">
                 <a href="${safeUrl(r.url)}" target="_blank" rel="noopener noreferrer" class="rej-title">${esc(r.title || r.url)}</a>
-                <div class="rej-why"><span class="ntag ${r.gate === "hard" ? "warn" : ""}">${r.gate === "hard" ? "硬性淘汰" : "分数不够"}</span>${esc(r.reason || "")}${r.avg != null ? ` · ${Number(r.avg).toFixed(1)} 分` : ""}</div>
+                <div class="rej-why"><span class="ntag ${r.gate === "hard" || r.gate === "score" ? "warn" : ""}">${r.gate === "hard" ? "硬性淘汰" : r.gate === "score" ? "没评上分" : "分数不够"}</span>${esc(r.reason || "")}${r.avg != null ? ` · ${Number(r.avg).toFixed(1)} 分` : ""}</div>
               </div>
               ${r.site ? `<button class="btn small" data-act="block-domain" data-domain="${esc(r.site)}">屏蔽 ${esc(r.site)}</button>` : ""}
             </div>`
@@ -1917,7 +1917,7 @@
     return `
       <h2 class="h-sub">头像</h2>
       <div class="av-row">
-        <img class="top-avatar av-big" src="${esc((a && a.url) || avatar())}" alt="" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" />
+        <img class="top-avatar av-big" src="${esc((a && a.url) || avatar())}" alt="" onerror="this.onerror=null;this.src='/static/assets/logo.png'" />
         <div class="av-main">
           <div class="set-text">默认和 MaiBot 的头像一样</div>
           ${a ? `<div class="set-text">现在：<b>${esc(src)}</b></div>` : ""}
@@ -2393,7 +2393,7 @@
     if (!String(m.content || "").trim()) return calls ? "" : "";
     return `
       <div class="cm cm-bot">
-        <img class="cm-ava" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="" />
+        <img class="cm-ava" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="" />
         <div class="cm-text md">${mdLite(m.content)}</div>
       </div>`;
   }
@@ -2429,12 +2429,12 @@
     const pend = (C.pending || []).filter((p) => p.status === "pending").map(pendingCard).join("");
     const empty = !C.messages.length
       ? `<div class="chat-empty">
-          <img src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="" />
+          <img src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="" />
           <p>想让我做什么，直接说</p>
           <div class="chat-sugs">${CHAT_SUGGEST.map((t) => `<button class="btn small" data-act="chat-suggest" data-t="${esc(t)}">${esc(t)}</button>`).join("")}</div>
         </div>`
       : "";
-    const typing = C.running ? `<div class="cm cm-bot cm-typing"><img class="cm-ava" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="" /><div class="cm-dots"><i></i><i></i><i></i></div></div>` : "";
+    const typing = C.running ? `<div class="cm cm-bot cm-typing"><img class="cm-ava" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="" /><div class="cm-dots"><i></i><i></i><i></i></div></div>` : "";
     return empty + msgs + pend + typing;
   }
 
@@ -2517,13 +2517,13 @@
 
   /* ───────────── 渲染 ───────────── */
 
-  const avatar = () => (state.me && state.me.bot && state.me.bot.avatar) || "/static/assets/maimai.png";
+  const avatar = () => (state.me && state.me.bot && state.me.bot.avatar) || "/static/assets/logo.png";
   const botName = () => (state.me && state.me.bot && state.me.bot.name) || "MaiBot";
 
   function renderTop() {
     if (state.page === "chat") {
       $("top").innerHTML = `
-        <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="${esc(botName())}" />
+        <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="${esc(botName())}" />
         <div class="chip">和 MaiWork 聊</div>
         <div class="chip-sub">管理员</div>
         <button class="round-btn" data-act="tab" data-tab="${state.tab}" aria-label="回到群">${SVG.close}</button>`;
@@ -2531,7 +2531,7 @@
     }
     if (state.page === "settings") {
       $("top").innerHTML = `
-        <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="${esc(botName())}" />
+        <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="${esc(botName())}" />
         <div class="chip">设置</div>
         <div class="chip-sub">管理员</div>
         <button class="round-btn" data-act="tab" data-tab="${state.tab}" aria-label="回到群">${SVG.close}</button>`;
@@ -2540,7 +2540,7 @@
     const g = grp();
     const q = quiet(g);
     $("top").innerHTML = `
-      <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="${esc(botName())}" />
+      <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="${esc(botName())}" />
       ${admin() && state.groups.length > 1 ? `<button class="chip" data-act="groups" aria-label="切换群，当前：${esc(gname(g))}">${mq(gname(g))}${SVG.down}</button>` : `<div class="chip">${mq(gname(g))}</div>`}
       <div class="chip-sub"><span class="dot ${q.live ? "ok" : ""}"></span>${esc(q.text)}</div>
       ${
@@ -2573,7 +2573,7 @@
     const n = pendingCount(g);
     $("rail").innerHTML = `
       <div class="brand">
-        <img src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="${esc(botName())}" />
+        <img src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="${esc(botName())}" />
         <div class="brand-t"><div class="brand-name">MaiWork</div><div class="brand-sub">${admin() ? "管理员 · 全部群" : isGA() ? "群管理员" : esc(botName()) + "的后台"}</div></div>
       </div>
       ${admin() ? `<div class="rail-label">群</div>` : ""}
@@ -2706,7 +2706,7 @@
     const bad = state.badLink;
     return `
       <div class="landing">
-        <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="" style="width:120px;height:120px" />
+        <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="" style="width:120px;height:120px" />
         <h1 class="h-page" style="margin-top:22px">MaiWork</h1>
         <p class="landing-text">${esc(botName())}在群里的后台：资讯、构想、目标和任务都在这里。</p>
         ${bad ? `<div class="warn-box" style="width:100%;text-align:left">这个链接打不开了：可能是管理员重置过，或者复制时少了几个字。请在群里重新发 <b>/mw 网页</b> 拿新链接。</div>` : ""}
@@ -2721,7 +2721,7 @@
   function noGroups() {
     return `
       <div class="landing">
-        <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" alt="" style="width:120px;height:120px" />
+        <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="" style="width:120px;height:120px" />
         <h1 class="h-page" style="margin-top:22px">还没有服务群</h1>
         <p class="landing-text">在设置里加上要服务的群</p>
         <button class="btn primary" data-act="settings" style="height:48px;padding:0 28px">打开设置</button>
@@ -4002,7 +4002,7 @@
     const bot = (state.me && state.me.bot) || {};
     if (id === "hello")
       return `
-        <div class="onb-hero"><img class="onb-avatar" src="${esc(bot.avatar || "/static/assets/maimai.png")}" alt="" /><span class="onb-spark">${ico("sparkles", "ico")}</span></div>
+        <div class="onb-hero"><img class="onb-avatar" src="${esc(bot.avatar || "/static/assets/logo.png")}" alt="" /><span class="onb-spark">${ico("sparkles", "ico")}</span></div>
         <h1 class="onb-title">欢迎用 MaiWork</h1>
         <p class="onb-lead">花两分钟配好几样东西就能开始</p>
         <ul class="onb-list">
@@ -4067,9 +4067,9 @@
     }
     if (id === "look") {
       const a = state.avatarCfg;
-      const src = (a && a.url) || bot.avatar || "/static/assets/maimai.png";
+      const src = (a && a.url) || bot.avatar || "/static/assets/logo.png";
       return `
-        <div class="onb-hero"><img class="onb-avatar" id="onb-av" src="${esc(src)}" alt="" onerror="this.onerror=null;this.src='/static/assets/maimai.png'" /></div>
+        <div class="onb-hero"><img class="onb-avatar" id="onb-av" src="${esc(src)}" alt="" onerror="this.onerror=null;this.src='/static/assets/logo.png'" /></div>
         <h1 class="onb-title">可选：换个头像</h1>
         <p class="onb-lead">默认和 MaiBot 一样，也可以换一张</p>
         <div class="onb-av-btns">

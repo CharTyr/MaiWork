@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.search_binding import (
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.search_binding import (
     KV_SEARCH,
     clear_binding,
     get_binding,
@@ -21,7 +21,7 @@ from CharTyr_MaiWork.search_binding import (
     set_binding,
     status_of,
 )
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork.store import Store
 
 
 @pytest.fixture

@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from CharTyr_MaiWork import compaction
+from CharTyr_MaiWork.maiwork import compaction
 
 
 def _msg(role, content="", **kw):
@@ -115,7 +115,7 @@ class TestKeepRecentAndCutIntent:
 class TestCompactLooped:
     @pytest.mark.asyncio
     async def test_below_threshold_calls_nothing(self):
-        from CharTyr_MaiWork.models import ChatResult
+        from CharTyr_MaiWork.maiwork.models import ChatResult
 
         class M:
             calls = []
@@ -141,7 +141,7 @@ class TestCompactLooped:
 
     @pytest.mark.asyncio
     async def test_summary_replaces_old_part_and_logged(self):
-        from CharTyr_MaiWork.models import ChatResult
+        from CharTyr_MaiWork.maiwork.models import ChatResult
 
         summary_text = "8 节摘要" * 100
 
@@ -171,7 +171,7 @@ class TestCompactLooped:
 
     @pytest.mark.asyncio
     async def test_summary_failure_keeps_original(self):
-        from CharTyr_MaiWork.models import ModelError
+        from CharTyr_MaiWork.maiwork.models import ModelError
 
         class M:
             async def chat(self, *a, **k):
@@ -183,7 +183,7 @@ class TestCompactLooped:
 
     @pytest.mark.asyncio
     async def test_context_length_error_trim_and_retry_once(self):
-        from CharTyr_MaiWork.models import ChatResult, ModelError
+        from CharTyr_MaiWork.maiwork.models import ChatResult, ModelError
 
         class M:
             def __init__(self):
@@ -204,7 +204,7 @@ class TestCompactLooped:
 
     @pytest.mark.asyncio
     async def test_context_length_error_twice_raises(self):
-        from CharTyr_MaiWork.models import ModelError
+        from CharTyr_MaiWork.maiwork.models import ModelError
 
         class M:
             async def chat(self, *a, **k):

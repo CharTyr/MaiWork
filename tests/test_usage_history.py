@@ -22,9 +22,9 @@ import pytest
 import pytest_asyncio
 from aiohttp.test_utils import TestClient, TestServer
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.store import Store
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.store import Store
 
 G1 = "900000001"     # 服务群一
 G2 = "123456789"     # 服务群二
@@ -93,7 +93,7 @@ class _AppSvc:
 @pytest_asyncio.fixture
 async def usage_client(tmp_path):
     """真 console + 预置 fake 数据：d2（前天）、d1（昨天）、今天、d_old（10 天前）。"""
-    from CharTyr_MaiWork.console.server import ConsoleServer
+    from CharTyr_MaiWork.maiwork.console.server import ConsoleServer
 
     store = Store(tmp_path / "t.db")
     store.migrate()

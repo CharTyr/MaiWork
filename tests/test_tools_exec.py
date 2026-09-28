@@ -10,13 +10,13 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork import clock
-from CharTyr_MaiWork.config import load_settings
-from CharTyr_MaiWork.environments.local import LocalEnv
-from CharTyr_MaiWork.host import Msg
-from CharTyr_MaiWork.store import Store
-from CharTyr_MaiWork.tools import ToolContext, Tools
-from CharTyr_MaiWork.tools_exec import register_exec_tools
+from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.environments.local import LocalEnv
+from CharTyr_MaiWork.maiwork.host import Msg
+from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tools import ToolContext, Tools
+from CharTyr_MaiWork.maiwork.tools_exec import register_exec_tools
 
 from fakes import FakeCtx, FakeHost
 
