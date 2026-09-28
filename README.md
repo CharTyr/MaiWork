@@ -1,11 +1,13 @@
 # MaiWork
 
-### 截图
-
 ![资讯](docs/images/news.png)
 
 ![手机](docs/images/mobile.png)
 
+### 插件的WebUI示例
+https://dewy-vow-gebh.here.now/ 
+
+# MaiWork
 **MaiBot（MaiSaka）的常驻生产力Agent**
 
 补全 MaiBot 的群聊生产力能力：为 MaiBot 提供一个并行的完整 Agent，理解一个群，主动找资讯、提构想、追目标，交付任何工作。
