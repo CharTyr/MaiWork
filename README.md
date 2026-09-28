@@ -14,6 +14,8 @@ https://dewy-vow-gebh.here.now/
 
 无感体验，与MaiBot使用同一套人设，它不抢 MaiBot 的话筒：不改回复频率，不拦 MaiBot 说话。想让群里知道的事，优先交给 MaiBot 在聊天里顺口提。
 
+基本功能已经完成，MaiWork 仍在持续迭代更新，正在做更优化调整。
+
 > MaiWork 是 MaiBot 的插件（插件 ID `chartyr.maiwork`）。
 
 ## 能做什么
