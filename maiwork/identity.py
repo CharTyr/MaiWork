@@ -61,6 +61,13 @@ _AGENTS_DEFAULT = """# MaiWork 做事规矩
 - 交付前自查：完成标准一条条对得上，才算做完。
 - 不编造：查不到就说查不到，做不到就说做不到。
 - 成品放 artifacts/：成品放在工作区 artifacts/<任务ID>/ 下才算数。
+
+## 专用机器（配了才写；名字要和设置里「专用 SSH 机器」的名字一样）
+
+<!-- 例：
+- 小黑：4 核 8G，装好了 Docker 和 Node 20，编译、跑服务用它。
+- 显卡机：有一张 4090，只在要跑模型、处理图片视频时用。
+-->
 """
 
 # 同步 SOUL 时除了 nickname/personality/reply_style，还试着读这些 personality.* 文字字段

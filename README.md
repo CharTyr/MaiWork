@@ -6,14 +6,14 @@
 
 **MaiBot 的常驻生产力 Agent**：理解一个群 · 主动找资讯 · 提构想 · 追目标 · 交付任何工作
 
-[![Version](https://img.shields.io/badge/version-0.4.1-blue.svg)](https://github.com/CharTyr/MaiWork)
+[![Version](https://img.shields.io/badge/version-0.4.2-blue.svg)](https://github.com/CharTyr/MaiWork)
 [![MaiBot](https://img.shields.io/badge/MaiBot-1.2.5%20实测-green.svg)](https://github.com/Mai-with-u/MaiBot)
 [![SDK](https://img.shields.io/badge/插件%20SDK-2.x-green.svg)](https://github.com/Mai-with-u/MaiBot)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-orange.svg)](LICENSE)
 [![Stars](https://img.shields.io/github/stars/CharTyr/MaiWork)](https://github.com/CharTyr/MaiWork/stargazers)
 [![Issues](https://img.shields.io/github/issues/CharTyr/MaiWork)](https://github.com/CharTyr/MaiWork/issues)
 
-[核心特性](#核心特性) • [功能概览](#功能概览) • [运行环境](#运行环境) • [快速开始](#快速开始) • [配置项说明](#配置项说明) • [指令](#指令) • [安全与公开范围](#安全与公开范围) • [常见问题](#常见问题)
+[核心特性](#核心特性) • [功能概览](#功能概览) • [运行环境](#运行环境) • [专用机器](#专用机器自己的-vps--vm可以配多台) • [快速开始](#快速开始) • [配置项说明](#配置项说明) • [指令](#指令) • [安全与公开范围](#安全与公开范围) • [常见问题](#常见问题)
 
 **在线看网页演示：[dewy-vow-gebh.here.now](https://dewy-vow-gebh.here.now/)**
 
@@ -78,16 +78,31 @@
 | Python 依赖 | httpx、tomlkit、aiohttp —— MaiBot 本身已带，**不用另装** |
 | 模型 | 一个 **OpenAI 兼容接口**：「主模型」负责想和验收，「干活模型」负责执行，可以是同一个 |
 | 联网搜索 | 一个能搜索的 **MCP**（如 Tavily、You.com、EXA 的托管 MCP） |
-| 可选 | Jev（TypeSafe）密钥，让快速判断更快更省；[railway.new](https://railway.new) 一次性 VM |
+| 可选 | Jev（TypeSafe）密钥，让快速判断更快更省；自己的 VPS / VM（专用机器，可以配多台）；[railway.new](https://railway.new) 一次性 VM |
 
 **子 agent 在本机跑命令的方式，启动时自动判断，不用你建用户：**
 
 | 你的机器 | MaiWork 怎么干活 |
 |:-----|:-----|
 | Linux + systemd，MaiBot 以 root 运行 | 放进 systemd 隔离单元跑命令：系统目录只读、禁止提权、限内存和时长。已有 `maiwork` 账号就用它；没有就**自动分配临时账号**，不用手动建 |
-| macOS / Windows / 非 root / 没有 systemd（如 Docker） | 本机**不跑命令**（安全起见），查资料、写文件、做网页照常；要跑命令的活交给 Railway 一次性 VM，没开就直说做不了 |
+| macOS / Windows / 非 root / 没有 systemd（如 Docker） | 本机**不跑命令**（安全起见），查资料、写文件、做网页照常；要跑命令的活交给 railway.new 一次性 VM 或者自行配置的其他机器（见下面「专用机器」），都没有就直说做不了 |
 
 自动分配临时账号时，工作区在 `/var/lib/private/maiwork/workspaces`；不跑命令时，工作区在插件数据目录下的 `workspaces/`。启动后在网页设置页「运行状态」里的 **「本机干活」** 一项能看到当前是哪种方式。插件**不提供**「不隔离直接跑」的选项。
+
+### 专用机器（自己的 VPS / VM，可以配多台）
+
+要跑命令、装依赖、编译、跑得久的活，MaiWork 会**优先交给你配置的专用机器**。都在忙或连不上时，改用 railway.new 一次性 VM，再不行才回到本机；本机又不能跑命令的话，就直说做不了。
+
+1. 打开网页设置页「运行状态 → 专用机器」，点「复制公钥」。这是 MaiWork 自己生成的一把 SSH key。
+2. 把公钥加进那台机器的 `~/.ssh/authorized_keys`。建议给 MaiWork 单独开一个普通账号，不要用 root。
+3. 在「设置 → 执行环境 → 专用 SSH 机器」里一行一台，填三样：名字、地址（`user@1.2.3.4:22`）、备注（配置 / 用途）。
+4. 可选：在「做事规矩」（AGENTS.md）里写清每台机器的情况和用途，比如「小黑：4 核 8G，装了 Docker，编译用它」「显卡机：只在跑模型时用」。主模型派活时会按这些说明挑机器。
+5. 回到「运行状态」看每台连不连得上。连不上会写明原因：公钥没加 / 网络不通 / 主机指纹变了。
+
+用法和限制：
+- 每个任务在机器上用自己的目录 `~/maiwork/<任务ID>/`，做完把成品拷回本机再交付；
+- 一台机器同时只接一个任务；
+- 这台机器上的权限和隔离由你自己负责，所以请用专门给 MaiWork 的机器或账号。
 
 ---
 
@@ -185,6 +200,7 @@ MaiBot 会自动加载插件。
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |:------|:-----|:-------|:-----|
+| `environments.ssh` | list | `[]` | 专用机器，每台写 `name` / `host`（`user@地址:端口`）/ `note`，可以多台 |
 | `environments.railway` | bool | `true` | 允许用 railway.new 一次性 VM |
 | `environments.memory_max` | string | `"512M"` | 本机隔离单元内存上限 |
 | `environments.runtime_max_sec` | int | `1800` | 本机隔离单元最长运行秒数 |
@@ -248,7 +264,7 @@ MaiBot 会自动加载插件。
 A：不需要。Linux + systemd 且 MaiBot 以 root 运行时，MaiWork 会自动分配临时账号隔离运行；你已经建了 `maiwork` 账号的话就用它。其他环境本机不跑命令，其余功能照常。
 
 **Q：在 Windows / macOS 上能用吗？**
-A：能装能用：资讯、构想、目标、网页、查资料写文件的任务都正常。只是本机不跑命令（没有能用的隔离方式），这类活可以交给 Railway 一次性 VM。
+A：能装能用：资讯、构想、目标、网页、查资料写文件的任务都正常。只是本机不跑命令（没有能用的隔离方式），这类活可以交给自己配置的专用机器，或者 railway.new 一次性 VM。
 
 **Q：装上之后什么都没发生？**
 A：默认什么都不做。检查 `[plugin] enabled = true`，并且 `[[groups.serve]]` 里写了群号（格式 `qq:群号`）；再到网页里完成首次引导、填好模型。

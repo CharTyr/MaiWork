@@ -161,6 +161,8 @@ _LOCAL_EXEC_TOOLS = ("run_command", "start_process", "check_process", "stop_proc
 _VM_TOOLS = ("vm_run", "vm_put_file", "vm_read_file", "vm_fetch_file")
 # vm_* 之外，本机工作区文件工具在 railway 上也保留（写脚本、收成品）
 _RAILWAY_KEEP_LOCAL = ("read_file", "write_file", "list_files")
+# 专用机器（用户自己的 VPS / VM，environments/ssh.py）上给子 agent 的工具
+_MACHINE_TOOLS = ("machine_run", "machine_put_file", "machine_read_file", "machine_fetch_file")
 
 
 # 主模型验收回合固定给的两个只读核对工具（tools_exec 注册，roles={"main"}）
@@ -310,6 +312,7 @@ class Coordinator:
         *,
         host: Any = None,
         railway: Any = None,
+        ssh: Any = None,
         group_space: Any = None,
         identity: Any = None,
         capability: Any = None,
@@ -332,6 +335,8 @@ class Coordinator:
         self._capability = capability
         # 一次性 VM 执行环境（RailwayEnv；None / railway=false → 不提供 railway 选项）
         self._railway = railway
+        # 专用机器（SshEnv；None / 没配机器 → 不提供 ssh 选项）
+        self._ssh = ssh
         # 群空间（platforms.qq_onebot.GroupSpace；None = 没开 / 没就位 → 交付前不折腾群空间）
         self._group_space = group_space
         # 身份与工作记忆（identity.py；AGENTS/记忆注入计划、验收；验收通过后给一次「记经验」小回合）
@@ -499,6 +504,89 @@ class Coordinator:
         except Exception:
             pass
         return callable(getattr(self._railway, "acquire", None))
+
+    def _ssh_available(self) -> bool:
+        """能不能把专用机器当作可选项：SshEnv 就位 + 配了至少一台地址写对的机器。"""
+        ssh = getattr(self, "_ssh", None)
+        if ssh is None:
+            return False
+        try:
+            return bool(ssh.available())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_ssh_box(box: Any) -> bool:
+        return str(getattr(box, "kind", "") or "") == "ssh"
+
+    @staticmethod
+    def _ssh_env_desc(box: Any) -> str:
+        """任务 env 字段（专用机器）：「专用机器 · 名字」。"""
+        return f"专用机器 · {getattr(box, 'name', '') or '未命名'}"
+
+    def _remote_env_desc(self, box: Any) -> str:
+        return self._ssh_env_desc(box) if self._is_ssh_box(box) else self._railway_env_desc(box)
+
+    @staticmethod
+    def _remote_job_tools(requested: list[str], box: Any) -> list[str]:
+        """按机器种类换工具：专用机器换 machine_*，一次性 VM 换 vm_*；本机命令工具都去掉。"""
+        if str(getattr(box, "kind", "") or "") != "ssh":
+            return Coordinator._railway_job_tools(requested)
+        out: list[str] = []
+        for t in requested:
+            if t in _LOCAL_EXEC_TOOLS or t in _VM_TOOLS:
+                continue
+            if t not in out:
+                out.append(t)
+        for t in (*_MACHINE_TOOLS, *_RAILWAY_KEEP_LOCAL):
+            if t not in out:
+                out.append(t)
+        return out
+
+    def _env_options(self) -> tuple[str, str, set[str]]:
+        """排计划提示词里的 env 选项：(JSON 字段说明, 怎么选的说明, 允许的值)。没就位的不出现。"""
+        ssh_ok = self._ssh_available()
+        railway_ok = self._railway_available()
+        allowed = {"local"} | ({"ssh"} if ssh_ok else set()) | ({"railway"} if railway_ok else set())
+        if allowed == {"local"}:
+            return ' "env": "local"（本机隔离环境干活），', "", allowed
+        opts = "|".join(k for k in ("local", "ssh", "railway") if k in allowed)
+        field = f' "env": "{opts}"（在哪干活，下面有说明）， "env_reason": "一句话说清为什么这么选",'
+        if ssh_ok:
+            field += ' "machine": "选 ssh 时想用哪台专用机器（写名字；无所谓就 null）",'
+        lines = ["怎么选 env：只写写文件、查资料、做网页这类不用跑命令的轻活，选 local（本机隔离环境，快，做完能直接交付）。"]
+        if ssh_ok:
+            names = "、".join(
+                (str(m.get("name") or "") + (f"（{m['note']}）" if str(m.get("note") or "").strip() else ""))
+                for m in (self._ssh.machines() or []) if "error" not in m
+            )
+            lines.append(
+                f"ssh 是管理员给 MaiWork 准备的专用机器（{names}）：要跑命令、装依赖、编译、跑得久、"
+                "要很多内存的活**优先选 ssh**——没有时间限制，一直是同一台；一台机器同时只接一个任务，"
+                "都在忙或连不上会自动换别的地方。有好几台时，按上面「做事规矩」（AGENTS.md）里写的"
+                "各台机器的情况和用途挑一台，写进 machine。"
+            )
+        if railway_ok:
+            lines.append(
+                "railway 是一台一次性机器：60 分钟窗口、2 核 2G、用完即弃；同一时间只有 1 台、每天有限额，"
+                "现在不一定拿得到。要跑不信任的第三方代码、要 root 或 docker、要一台干净系统时选它"
+                + ("（其余要跑命令的活先选 ssh）。" if ssh_ok else "。")
+            )
+        lines.append("不管在哪台机器上做，成品最后都必须拷回本机工作区才能交付。")
+        return field, "".join(lines), allowed
+
+    def _normalize_env_choice(self, raw: Any) -> str:
+        """计划里的 env 规范成可用的值：乱写 → local；要的那种机器没开 → 换另一种机器，都没开 → local。"""
+        choice = str(raw or "").strip().lower()
+        _f, _g, allowed = self._env_options()
+        if choice not in ("local", "ssh", "railway"):
+            return "local"
+        if choice in allowed:
+            return choice
+        if choice in ("ssh", "railway"):
+            other = "railway" if choice == "ssh" else "ssh"
+            return other if other in allowed else "local"
+        return "local"
 
     def _local_can_exec(self) -> bool:
         """本机能不能隔离跑命令（判定 ok；没判定过按能，行为和以前一样）。"""
@@ -671,13 +759,8 @@ class Coordinator:
             prompt_lines.append("")
             prompt_lines.append(f"上一次验收意见：{prior_review}")
 
-        # 执行环境可选项：只有 railway 就位且配置没关才提供 railway 这个选择，
-        # 否则提示词里根本不出现「railway」字样（模型不会瞎选）。
-        railway_ok = self._railway_available()
-        env_field = ' "env": "local"（本机隔离环境干活），'
-        if railway_ok:
-            env_field = ' "env": "local|railway"（在哪干活，下面有说明），'
-            env_field += ' "env_reason": "一句话说清为什么这么选",'
+        # 执行环境可选项：只有就位的才出现在提示词里（模型不会瞎选）
+        env_field, env_guide, _env_allowed = self._env_options()
         prompt_lines.append("")
         prompt_lines.append(
             "只回 JSON，不要输出别的："
@@ -691,15 +774,8 @@ class Coordinator:
             ' "tools": ["子 agent 工具名单里的名字"]}]（1 到 2 个）,'
             ' "question": null | "如果信息不够、不能开工，写一句要在群里问发起人的话；能开工就是 null"}'
         )
-        if railway_ok:
-            prompt_lines.append(
-                "怎么选 env：默认 local（本机隔离环境，快、便宜、做完能直接交付）。"
-                "需要装一堆依赖、要跑不信任的第三方代码、要 root 或 docker、要很多内存或要跑很久、"
-                "或者就是想要一台干净系统时，才选 railway。"
-                "railway 是一台一次性机器：60 分钟窗口、2 核 2G、用完即弃；"
-                "同一时间只有 1 台、每天有限额，所以现在不一定拿得到（拿不到会自动回落本机）。"
-                "成品最后必须拷回本机工作区才能交付。"
-            )
+        if env_guide:
+            prompt_lines.append(env_guide)
         prompt_lines.append(
             "（子 agent 工具名单：" + " / ".join(worker_job_tool_names(self._tools)) + "；"
             "只能从这里挑，别多要）"
@@ -824,11 +900,8 @@ class Coordinator:
         question = data.get("question")
         question = str(question).strip() if question else ""
 
-        env_choice = str(data.get("env") or "").strip().lower()
-        if env_choice not in ("local", "railway"):
-            env_choice = "local"
-        if env_choice == "railway" and not railway_ok:
-            env_choice = "local"  # 选项根本没提供 / 不可用，强扭回本机
+        env_choice = self._normalize_env_choice(data.get("env"))
+        machine = str(data.get("machine") or "").strip()[:64] if env_choice == "ssh" else ""
         env_reason = str(data.get("env_reason") or "").strip()
 
         return {
@@ -837,6 +910,7 @@ class Coordinator:
             "jobs": jobs,
             "question": question,
             "env": env_choice,
+            "machine": machine,
             "env_reason": env_reason,
             # 有子任务被标成调研类 → 验收时做引用核对（交付里没链接就不加那段，见 _review）
             "research": any(j["type"] == "research" for j in jobs),
@@ -976,7 +1050,7 @@ class Coordinator:
         if not on_railway and railway_box is None and not self._local_can_exec():
             cap = getattr(self, "_capability", None)
             why = str(getattr(cap, "reason", "") or "这台机器不能隔离跑命令")
-            msg = f"本机不能隔离跑命令（{why}），也没开一次性机器：这个任务做不了"
+            msg = f"本机不能隔离跑命令（{why}），专用机器和一次性机器也都没拿到：这个任务做不了"
             logger.warning("任务 %s %s", tid, msg)
             self._fail_with_err(tid, attempt_id, msg, gid)
             return "done"
@@ -986,8 +1060,8 @@ class Coordinator:
             reports: list[Any] = await asyncio.gather(
                 *[
                     self._run_job(
-                        brief=self._enrich_brief(j["brief"], tid, plan["deliver_kind"], on_railway),
-                        tools=self._railway_job_tools(j["tools"]) if on_railway else j["tools"],
+                        brief=self._enrich_brief(j["brief"], tid, plan["deliver_kind"], railway_box if on_railway else False),
+                        tools=self._remote_job_tools(j["tools"], railway_box) if on_railway else j["tools"],
                         gid=gid,
                         tid=tid,
                         job_idx=i + 1,
@@ -998,7 +1072,7 @@ class Coordinator:
                 ]
             )
         finally:
-            await self._release_railway(railway_box)
+            await self._release_remote(railway_box)
 
         # 每个 job 返回后先 accept_result：False → 只记历史，结束
         if not self._tasks.accept_result(tid, attempt_id, req_version):
@@ -1126,84 +1200,109 @@ class Coordinator:
     # ------------------------------------------------------------------
 
     async def _setup_exec_env(self, tid: str, plan: dict, gid: str) -> tuple[bool, Any]:
-        """决定这轮在哪干 + 把任务 env 字段写好。返回 (跑在 railway 上?, 拿到的 Box | None)。
+        """决定这轮在哪干 + 把任务 env 字段写好。返回 (跑在别的机器上?, 拿到的机器 | None)。
 
-        - 计划选 local：不走 railway（Box=None），env 字段写本机；
-        - 计划选 local 但本机不能隔离跑命令（受限）：有一次性机器就改去机器上做，
-          没有就把话说明白（env/时间线写原因），返回 (False, None)——调用方据此判失败；
-        - 计划选 railway 且拿到机器：env 字段写一次性机器，返回 (True, Box)；
-        - 计划选 railway 但拿不到（配额用完 / 同时占用 / refused）：回落本机，
-          env 字段和时间线写明「一次性机器拿不到，改在本机做：原因」，返回 (False, None)。
+        机器有两种：专用机器（ssh，用户自己的 VPS / VM）和一次性 VM（railway）。
+        - 选 local 且本机能隔离跑命令：就在本机（不碰机器）；
+        - 选 ssh：专用机器 → 一次性 VM → 本机；
+        - 选 railway：一次性 VM → 专用机器 → 本机；
+        - 选 local 但本机受限（不能隔离跑命令）：专用机器 → 一次性 VM → 做不了。
+        换了地方都在 env 字段 / 时间线写清原因；最后都拿不到且本机受限，返回 (False, None)，
+        调用方据此判失败，不假装开工。
         """
         want = str(plan.get("env") or "local")
-        if want != "railway":
-            if not self._local_can_exec():
-                return await self._stopped_local_fallback(tid)
-            # 本机：把 env 字段写出来（管理员在详情页看得见在哪干的）
+        local_ok = self._local_can_exec()
+        if want not in ("ssh", "railway") and local_ok:
             try:
                 self._tasks.set_env(tid, self._local_env_desc())
             except Exception:
                 logger.exception("写任务 %s 的 env 字段失败", tid)
             return False, None
-        # 选 railway 但当前不可用（理论上 plan 已把不可选的强扭成 local，这里再兜底）
-        if not self._railway_available():
-            note = "一次性机器拿不到，改在本机做：现在没开 railway（配置关了或环境没就位）"
+        order = ["railway", "ssh"] if want == "railway" else ["ssh", "railway"]
+        labels = {"ssh": "专用机器", "railway": "一次性机器"}
+        reasons: list[str] = []
+        for kind in order:
+            box, reason = await self._acquire_remote(kind, tid, str(plan.get("machine") or "").strip())
+            if box is None:
+                if reason:
+                    reasons.append(f"{labels[kind]}：{reason}")
+                continue
+            if not local_ok and want not in ("ssh", "railway"):
+                cap = getattr(self, "_capability", None)
+                why = str(getattr(cap, "reason", "") or "这台机器不能隔离跑命令")
+                note = f"不能隔离跑命令，改在{labels[kind]}上做：{why}"
+            elif kind != want:
+                note = f"{labels.get(want, '指定的机器')}拿不到，改在{labels[kind]}上做：" + "；".join(reasons)
+            else:
+                note = ""
             try:
-                self._tasks.set_env(tid, self._local_env_desc(), note=note)
+                self._tasks.set_env(tid, self._remote_env_desc(box), note=note)
             except Exception:
                 logger.exception("写任务 %s 的 env 字段失败", tid)
-            return False, None
-        # 申请一台（job_id = task_id；只此一台，抢不到就回 None）
-        try:
-            box = await self._railway.acquire(tid)
-        except Exception:
-            logger.exception("申请一次性机器出错（任务 %s）", tid)
-            box = None
-        if box is None:
-            reason = await self._fetch_acquire_reason()
-            note = f"一次性机器拿不到，改在本机做：{reason}"
-            try:
-                self._tasks.set_env(tid, self._local_env_desc(), note=note)
-            except Exception:
-                logger.exception("写任务 %s 的 env 字段失败", tid)
-            return False, None
-        # 拿到了：env 字段写「railway.new 一次性机器 · 2 核 2G · 到期 HH:MM」
-        try:
-            self._tasks.set_env(tid, self._railway_env_desc(box))
-        except Exception:
-            logger.exception("写任务 %s 的 env 字段失败", tid)
-        return True, box
-
-    async def _stopped_local_fallback(self, tid: str) -> tuple[bool, Any]:
-        """本机不能隔离跑命令（受限）：能去一次性机器就去，去不了就把话说明白。
-
-        env 字段 + 时间线都写清原因；返回 (跑在机器上?, Box|None)。调用方看到
-        (False, None) 就知道这活本机干不了，直接判失败，不假装开工。
-        """
-        cap = getattr(self, "_capability", None)
-        why = str(getattr(cap, "reason", "") or "这台机器不能隔离跑命令")
-        if self._railway_available():
-            try:
-                box = await self._railway.acquire(tid)
-            except Exception:
-                logger.exception("申请一次性机器出错（任务 %s）", tid)
-                box = None
-            if box is not None:
-                note = f"不能隔离跑命令，改在一次性机器上做：{why}"
-                try:
-                    self._tasks.set_env(tid, self._railway_env_desc(box), note=note)
-                except Exception:
-                    logger.exception("写任务 %s 的 env 字段失败", tid)
-                return True, box
-            reason = await self._fetch_acquire_reason()
-            note = f"不能隔离跑命令，一次性机器也没拿到，这个活做不了：{reason}"
+            return True, box
+        why_all = "；".join(reasons)
+        if local_ok:
+            note = f"{labels.get(want, '指定的机器')}拿不到，改在本机做：{why_all or '现在没有可用的机器'}"
         else:
-            note = f"不能隔离跑命令，也没开一次性机器，这个活做不了：{why}"
+            cap = getattr(self, "_capability", None)
+            why = str(getattr(cap, "reason", "") or "这台机器不能隔离跑命令")
+            if why_all:
+                note = f"不能隔离跑命令，别的机器也没拿到，这个活做不了：{why}；{why_all}"
+            else:
+                note = f"不能隔离跑命令，也没开专用机器或一次性机器，这个活做不了：{why}"
         try:
             self._tasks.set_env(tid, self._local_env_desc(), note=note)
         except Exception:
             logger.exception("写任务 %s 的 env 字段失败", tid)
         return False, None
+
+    async def _acquire_remote(self, kind: str, tid: str, prefer: str = "") -> tuple[Any, str]:
+        """申请一台机器：返回 (机器 | None, 没拿到的原因)。没开这种机器 → (None, 原因或空)。"""
+        if kind == "ssh":
+            if not self._ssh_available():
+                return None, ""
+            try:
+                box = await (self._ssh.acquire(tid, prefer=prefer) if prefer else self._ssh.acquire(tid))
+            except Exception:
+                logger.exception("申请专用机器出错（任务 %s）", tid)
+                box = None
+            if box is not None:
+                return box, ""
+            try:
+                lf = self._ssh.last_fail()
+                reason = str((lf or {}).get("reason") or "")
+            except Exception:
+                reason = ""
+            return None, reason or "都连不上或都在忙"
+        if not self._railway_available():
+            return None, "现在没开 railway（配置关了或环境没就位）" if getattr(self, "_railway", None) is not None else ""
+        try:
+            box = await self._railway.acquire(tid)
+        except Exception:
+            logger.exception("申请一次性机器出错（任务 %s）", tid)
+            box = None
+        if box is not None:
+            return box, ""
+        return None, await self._fetch_acquire_reason()
+
+    async def _stopped_local_fallback(self, tid: str) -> tuple[bool, Any]:
+        """本机受限时的回落（老入口，等同计划选 local 时的 _setup_exec_env）。"""
+        return await self._setup_exec_env(tid, {"env": "local"}, "")
+
+    async def _release_remote(self, box: Any) -> None:
+        """结束（成功 / 失败 / 取消 / 异常）一定释放机器；自身不再抛错。"""
+        if box is None:
+            return
+        if self._is_ssh_box(box):
+            ssh = getattr(self, "_ssh", None)
+            if ssh is None:
+                return
+            try:
+                await ssh.release(box)
+            except Exception:
+                logger.exception("释放专用机器出错（任务跑完兜底）")
+            return
+        await self._release_railway(box)
 
     async def _release_railway(self, box: Any) -> None:
         """结束（成功 / 失败 / 取消 / 异常）一定释放一次性机器；自身不再抛错。"""
@@ -1224,7 +1323,16 @@ class Coordinator:
             out += "展示类成品做成单页 index.html（手机能看、不依赖外部资源）。"
         elif deliver_kind == "file":
             out += "做成文件给人下载或编辑，文件名起清楚。"
-        if on_railway:
+        if on_railway and self._is_ssh_box(on_railway):
+            out += (
+                f"\n\n这轮在专用机器「{getattr(on_railway, 'name', '')}」上做（用户自己的 VPS / VM，没有时间限制）："
+                "用 machine_run 在机器上跑命令（命令在这次的工作目录里执行）、"
+                "machine_put_file 把工作区里你写的脚本传上去、machine_read_file 看机器上的输出"
+                "（路径都写工作目录下的相对路径）。"
+                "做好的成品不能留在机器上——交付只认本机工作区；"
+                f"最后一定要用 machine_fetch_file 把成品拷回本机工作区 {target_dir}/ 下，拷不回来就等于没做成。"
+            )
+        elif on_railway:
             out += (
                 "\n\n这轮在 railway.new 一次性机器上做（2 核 2G、60 分钟窗口，到点就什么都没了）："
                 "用 vm_run 在机器上跑命令、vm_put_file 把工作区里你写的脚本传上去、"

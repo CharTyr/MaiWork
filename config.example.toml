@@ -181,11 +181,13 @@ public_url = ""
 [environments]
 # 是否允许用 Railway 临时 VM 跑活（ssh railway.new）。
 railway = true
-# 已有的专用 VM/VPS，按列出顺序优先用。
+# 自己的专用 VPS / VM（可以写多台）：要跑命令的活优先用它们，按列出顺序挑连得上、没活的那台。
+# 先把网页「运行状态 → 专用机器」里的 MaiWork 公钥加进机器的 ~/.ssh/authorized_keys。
+# 各台的情况和用途可以写进网页「做事规矩」（AGENTS.md），主模型按它挑（也可以点名）。
 # [[environments.ssh]]
 # name = "vps1"
 # host = "maiwork@1.2.3.4:22"
-# note = "月付的小机器，跑轻活"
+# note = "4 核 8G，装了 Docker"
 # 工作区根目录：每个工作区是它下面的一个子目录，归 maiwork 用户所有。
 workspace_root = "/home/maiwork/workspaces"
 # 单条命令的内存上限。

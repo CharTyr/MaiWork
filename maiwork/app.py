@@ -122,6 +122,11 @@ class MaiWorkApp:
         self.capability_probe: Callable[[str], Any] | None = None
         # 一次性 VM 执行环境（environments/railway.py；railway=false / 模块没就位 → None）
         self.railway: Any = None
+        # 专用 SSH 机器（environments/ssh.py；启动就建，没配机器也先生成 key 给网页展示公钥）
+        self.ssh: Any = None
+        self.ssh_factory: Any = None  # 测试注入点
+        self._ssh_check_ts = 0.0
+        self._ssh_check_sig: Any = None
         self.outbox: Any = None
         self.delivery: Any = None
         self.herenow: Any = None
@@ -404,6 +409,8 @@ class MaiWorkApp:
                 )
             except Exception:
                 logger.exception("注册 vm_fetch_file 出错，railway 派活这次少个拷回工具")
+        # 专用 SSH 机器：建环境 + 注册 machine_* 工具（要在本机 LocalEnv 建好之后，拷回成品用它）
+        self.ssh = self._make_ssh()
         self.herenow = self._make_herenow()
         self.outbox = Outbox(
             self.store, self.host, self.pushes, self.mentions, self.get_settings,
@@ -650,6 +657,7 @@ class MaiWorkApp:
             except Exception:
                 logger.exception("收一次性 VM 环境出错")
             self.railway = None
+        self.ssh = None
         if self.extensions is not None:
             # MCP 扩展缓存着会话和 httpx 连接；热重载/停用时要收掉
             try:
@@ -1381,6 +1389,42 @@ class MaiWorkApp:
             return None
         return env
 
+    def _make_ssh(self) -> Any:
+        """专用 SSH 机器执行环境 + machine_* 工具；建不起来 → None（派活就只剩本机 / 一次性 VM）。"""
+        cls = self.ssh_factory if self.ssh_factory is not None else _import_m2_class("environments.ssh", "SshEnv")
+        if cls is None:
+            return None
+        try:
+            env = cls(self.get_settings, self.get_settings().data_dir)
+        except Exception:
+            logger.exception("建专用机器环境出错，这次不用专用机器")
+            return None
+        try:
+            from .tools_ssh import register_machine_tools
+
+            register_machine_tools(
+                self.tools, get_box=lambda tid: env.box_for(tid), env=env, local_env=self.env,
+            )
+        except Exception:
+            logger.exception("注册 machine 工具出错，这次不用专用机器")
+            return None
+        return env
+
+    def _maybe_check_ssh(self, now: float) -> None:
+        """每 30 分钟（或机器名单变了）在后台把专用机器连一遍，结果给网页「运行状态」。"""
+        ssh = self.ssh
+        if ssh is None:
+            return
+        try:
+            sig = tuple((m.get("name"), m.get("host")) for m in ssh.machines())
+        except Exception:
+            sig = None
+        if sig == self._ssh_check_sig and now - self._ssh_check_ts < 1800:
+            return
+        self._ssh_check_sig = sig
+        self._ssh_check_ts = now
+        self._spawn_bg(ssh.check_all(), name="maiwork-ssh-check")
+
     def _make_herenow(self) -> Any:
         module_cls = _import_m2_class("herenow", "HereNow")
         if module_cls is None:
@@ -1403,8 +1447,21 @@ class MaiWorkApp:
                 self.goals, self.delivery, self.outbox, self.env, self.profiles,
                 self.get_settings, host=self.host, railway=self.railway,
                 group_space=self.group_space, identity=self.identity,
-                capability=self.capability,
+                capability=self.capability, ssh=self.ssh,
             )
+        except TypeError:
+            # 老的 / 测试替身 Coordinator 不认 ssh 参数：不带它再建一次
+            try:
+                return cls(
+                    self.store, self.models, self.workers, self.tools, self.tasks,
+                    self.goals, self.delivery, self.outbox, self.env, self.profiles,
+                    self.get_settings, host=self.host, railway=self.railway,
+                    group_space=self.group_space, identity=self.identity,
+                    capability=self.capability,
+                )
+            except Exception:
+                logger.exception("建 Coordinator 出错，任务执行这次跳过")
+                return None
         except Exception:
             logger.exception("建 Coordinator 出错，任务执行这次跳过")
             return None
@@ -1999,6 +2056,10 @@ class MaiWorkApp:
         if not self._started or self.profiles is None or self._settings is None:
             return
         now = _now()
+        try:
+            self._maybe_check_ssh(now)
+        except Exception:
+            logger.exception("检查专用机器出错")
         # 1) 收消息信号写进 profiles
         try:
             signals = self.signals.take()

@@ -796,6 +796,44 @@ def _search_health(svc: Any) -> dict[str, Any]:
     return {"key": "search", "icon": "search", "name": "搜索", "state": "ok" if ok else "warn", "text": text}
 
 
+def _ssh_health(svc: Any) -> dict[str, Any] | None:
+    """专用机器健康项：每台连不连得上；带上 MaiWork 的公钥（copy 字段，前端给复制按钮）。
+
+    - SshEnv 没就位 → None（不放进列表）；
+    - 没配机器 → off，告诉用户怎么加（公钥照样给，可以先加上）；
+    - 都连得上 → ok「甲、乙 都连得上」；有连不上的 → warn，逐台写原因；还没检查过 → 「正在检查」。
+    """
+    ssh = getattr(svc, "ssh", None)
+    if ssh is None:
+        return None
+    base = {"key": "ssh", "icon": "server", "name": "专用机器"}
+    try:
+        pub = str(ssh.public_key() or "")
+    except Exception:
+        pub = ""
+    if pub:
+        base["copy"] = pub
+    try:
+        st = list(ssh.status() or [])
+    except Exception:
+        st = []
+    if not st:
+        return {**base, "state": "off",
+                "text": "没配置。要用自己的 VPS / VM：在「专用 SSH 机器」里加上，并把下面的公钥加进那台机器的 ~/.ssh/authorized_keys"}
+    bad = [m for m in st if m.get("ok") is False]
+    unknown = [m for m in st if m.get("ok") is None]
+    if bad:
+        text = "；".join(f"{m.get('name')}：{m.get('error') or '连不上'}" for m in bad)
+        return {**base, "state": "warn", "text": text}
+    if unknown:
+        return {**base, "state": "warn", "text": "正在检查：" + "、".join(str(m.get("name")) for m in unknown)}
+    busy = [str(m.get("name")) for m in st if m.get("busy")]
+    text = "、".join(str(m.get("name")) for m in st) + " 都连得上"
+    if busy:
+        text += f"（{'、'.join(busy)} 正在干活）"
+    return {**base, "state": "ok", "text": text}
+
+
 def _localenv_health(svc: Any) -> dict[str, Any]:
     """本机干活健康项（M3）：按启动时的执行方式判定写大白话。
 
@@ -814,7 +852,7 @@ def _localenv_health(svc: Any) -> dict[str, Any]:
     cap_mode = str(getattr(cap, "mode", "") or "")
     if cap_mode == "stopped":
         why = str(getattr(cap, "reason", "") or "这台机器不能隔离跑命令")
-        return {**base, "state": "off", "text": f"没开（{why}）；跑命令的活交给 Railway 或做不了"}
+        return {**base, "state": "off", "text": f"没开（{why}）；跑命令的活交给专用机器或 Railway，都没有就做不了"}
     if mode == "direct":
         return {**base, "state": "warn", "text": "直跑模式没有隔离，只能本地测试用"}
     if cap_mode == "fixed":
@@ -1028,6 +1066,9 @@ def settings_view(svc: Any) -> dict[str, Any]:
         _localenv_health(svc),
         _groupspace_health(svc),
     ]
+    ssh_health = _ssh_health(svc)
+    if ssh_health is not None:
+        health.append(ssh_health)
     railway_health = _railway_health(svc)
     if railway_health is not None:
         health.append(railway_health)

@@ -1275,7 +1275,7 @@
       }
       <p class="fine">${alert ? `每日提醒线 ${tokens(alert)} tokens，今天用了 ${Math.round((used / alert) * 100)}%。` : "没设提醒线。"}${u.errors ? ` 今天有 ${u.errors} 次调用出错。` : ""}</p>
       <h2 class="h-sub">运行状态</h2>
-      ${(s.health || []).map((h) => `<div class="set-row">${ico(h.icon || "gear")}<div><div class="set-name">${esc(h.name)}</div><div class="set-text">${esc(h.text)}</div></div><span class="dot ${h.state === "ok" ? "ok" : h.state === "warn" ? "pending" : ""}"></span></div>`).join("")}
+      ${(s.health || []).map((h) => `<div class="set-row">${ico(h.icon || "gear")}<div><div class="set-name">${esc(h.name)}</div><div class="set-text">${esc(h.text)}</div>${h.copy ? `<div class="set-text mono-link">${esc(h.copy)}</div>` : ""}</div>${h.copy ? `<button class="btn small" data-act="copy" data-link="${esc(h.copy)}" data-what="公钥">复制公钥</button>` : ""}<span class="dot ${h.state === "ok" ? "ok" : h.state === "warn" ? "pending" : ""}"></span></div>`).join("")}
       <div class="actions" style="margin-top:22px"><button class="btn" data-act="onb-restart">重新引导</button><button class="btn" data-act="logout">退出管理员</button></div>`;
   }
 
@@ -1668,7 +1668,7 @@
   }
   const ROWS_COLS = {
     serve_groups: [["group", "qq:群号"], ["workspace", "工作区名（可空）"]],
-    ssh_list: [["name", "名字"], ["host", "root@1.2.3.4"], ["note", "备注（可空）"]],
+    ssh_list: [["name", "名字"], ["host", "user@1.2.3.4:22"], ["note", "配置 / 用途（主模型看得到）"]],
   };
 
   function cfgInput(f) {
@@ -3649,7 +3649,7 @@
       case "copy":
         try {
           await navigator.clipboard.writeText(el.dataset.link);
-          toast("链接复制好了");
+          toast(`${el.dataset.what || "链接"}复制好了`);
         } catch (err) {
           toast("复制不了，手动选中复制吧", true);
         }

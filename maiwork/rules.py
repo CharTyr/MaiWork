@@ -579,6 +579,9 @@ def _check_ssh_list(value: Any) -> list[dict[str, str]]:
         note = str(item.get("note") or "").strip()
         if not name or not host:
             raise ValueError("SSH 机器条目的 name 和 host 都不能为空")
+        from .environments.ssh import parse_host
+
+        parse_host(host)  # 写法不对（- 开头、带空格 / shell 字符、端口越界）直接拒，中文原因
         entry = {"name": name, "host": host, "note": note}
         if entry not in out:
             out.append(entry)
@@ -732,7 +735,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
 
     # ---- environments ----
     _F("environments.railway", "允许用 Railway 临时 VM", "", "bool"),
-    _F("environments.ssh", "专用 SSH 机器", "派活时优先用这些机器", "ssh_list"),
+    _F("environments.ssh", "专用 SSH 机器", "自己的 VPS / VM：要跑命令的活优先用它们。先把「运行状态」里的公钥加进机器的 ~/.ssh/authorized_keys；各台的情况和用途写进「做事规矩」（AGENTS.md），主模型按它挑", "ssh_list"),
     _F("environments.workspace_root", "远端工作区根目录", "", "str", check=_check_workspace_root),
     _F("environments.memory_max", "单条命令内存上限", "比如 512M、1G", "str", check=_check_memory_max),
     _F("environments.runtime_max_sec", "单条命令最长秒数", "", "int", min=10, max=86400),
