@@ -509,3 +509,134 @@ class TestFetchPageExtractFallback:
         tools = _make(store, settings, transport=httpx.MockTransport(handler))
         r = await tools.call("fetch_page", {"url": "https://a.example/x"}, _ctx())
         assert not r.ok and "403" in r.error
+
+
+# ----------------------------------------------------------------------
+# 打开网页的顺序（2026-09-28 用户定）：Jina Reader → 抓网页正文工具 → 服务器直接打开
+# ----------------------------------------------------------------------
+
+from CharTyr_MaiWork.maiwork.reader import ReadResult
+
+
+class _FakeReader:
+    def __init__(self, result: ReadResult | None = None, enabled: bool = True):
+        self.result = result or ReadResult(True, text="《Jina 读到的标题》\n Jina 读到的正文", final_url="")
+        self._enabled = enabled
+        self.calls: list[str] = []
+
+    def enabled(self) -> bool:
+        return self._enabled
+
+    async def read(self, url):
+        self.calls.append(url)
+        return self.result
+
+
+def _make_r(store, settings, *, reader, search=None, transport=None, resolver=None):
+    tools = Tools(store)
+    register_builtin(
+        tools,
+        search=search if search is not None else FakeSearch(),
+        profiles=FakeProfiles(),
+        http_transport=transport,
+        get_settings=lambda: settings,
+        resolver=resolver or _public_dns,
+        reader=reader,
+    )
+    return tools
+
+
+class _Direct:
+    """假「直接打开」：记下有没有被打开过。"""
+
+    def __init__(self, status=200, text="<html><head><title>直接打开的</title></head><body><p>直接打开读到的正文</p></body></html>"):
+        self.hits = 0
+        self.status = status
+        self.text = text
+
+    def __call__(self, request):
+        self.hits += 1
+        return httpx.Response(self.status, text=self.text, headers={"content-type": "text/html; charset=utf-8"})
+
+
+class TestOpenOrder:
+    @pytest.mark.asyncio
+    async def test_jina_first(self, store, settings):
+        rd, direct, s = _FakeReader(), _Direct(), _ExtractSearch(text="抓正文工具的")
+        tools = _make_r(store, settings, reader=rd, search=s, transport=httpx.MockTransport(direct))
+        r = await tools.call("fetch_page", {"url": "https://news.example.com/a"}, _ctx())
+        assert r.ok and "Jina 读到的正文" in r.output
+        assert r.data["via"] == "jina"
+        assert rd.calls == ["https://news.example.com/a"]
+        assert s.extract_calls == [] and direct.hits == 0
+
+    @pytest.mark.asyncio
+    async def test_jina_problem_then_extract_tool(self, store, settings):
+        rd = _FakeReader(ReadResult(False, reason="Jina Reader 限流了"))
+        direct, s = _Direct(), _ExtractSearch(text="抓正文工具读到的正文")
+        tools = _make_r(store, settings, reader=rd, search=s, transport=httpx.MockTransport(direct))
+        r = await tools.call("fetch_page", {"url": "https://news.example.com/a"}, _ctx())
+        assert r.ok and "抓正文工具读到的正文" in r.output
+        assert r.data["via"] == "extract"
+        assert direct.hits == 0
+
+    @pytest.mark.asyncio
+    async def test_no_extract_tool_then_direct(self, store, settings):
+        rd = _FakeReader(ReadResult(False, reason="读到的是验证 / 拦截页，不是正文"))
+        direct = _Direct()
+        tools = _make_r(store, settings, reader=rd, transport=httpx.MockTransport(direct))
+        r = await tools.call("fetch_page", {"url": "https://zhuanlan.example.com/p/1"}, _ctx())
+        assert r.ok and "直接打开读到的正文" in r.output
+        assert r.data["via"] == "direct"
+
+    @pytest.mark.asyncio
+    async def test_extract_empty_then_direct(self, store, settings):
+        rd = _FakeReader(ReadResult(False, reason="Jina Reader 超时"))
+        direct, s = _Direct(), _ExtractSearch(text="")
+        tools = _make_r(store, settings, reader=rd, search=s, transport=httpx.MockTransport(direct))
+        r = await tools.call("fetch_page", {"url": "https://news.example.com/a"}, _ctx())
+        assert r.ok and r.data["via"] == "direct"
+        assert s.extract_calls == ["https://news.example.com/a"]
+
+    @pytest.mark.asyncio
+    async def test_all_fail_says_why_for_each(self, store, settings):
+        rd = _FakeReader(ReadResult(False, reason="Jina Reader 限流了"))
+        s = _ExtractSearch(error=RuntimeError("抽取失败（You）：连不上"))
+        tools = _make_r(store, settings, reader=rd, search=s, transport=httpx.MockTransport(_Direct(status=403)))
+        r = await tools.call("fetch_page", {"url": "https://news.example.com/a"}, _ctx())
+        assert not r.ok
+        assert "Jina" in r.error and "限流" in r.error
+        assert "抓正文" in r.error
+        assert "403" in r.error
+
+    @pytest.mark.asyncio
+    async def test_private_address_never_sent_to_jina(self, store, settings):
+        rd, s = _FakeReader(), _ExtractSearch(text="不该出现")
+        tools = _make_r(store, settings, reader=rd, search=s, resolver=lambda host: ["10.0.0.5"])
+        r = await tools.call("fetch_page", {"url": "http://intranet.example/x"}, _ctx())
+        assert not r.ok
+        assert rd.calls == [] and s.extract_calls == []
+
+    @pytest.mark.asyncio
+    async def test_jina_off_keeps_old_order(self, store, settings):
+        rd, direct = _FakeReader(enabled=False), _Direct()
+        tools = _make_r(store, settings, reader=rd, transport=httpx.MockTransport(direct))
+        r = await tools.call("fetch_page", {"url": "https://news.example.com/a"}, _ctx())
+        assert r.ok and r.data["via"] == "direct"
+        assert rd.calls == []
+
+    @pytest.mark.asyncio
+    async def test_log_line_says_which_way(self, store, settings):
+        """请求日志里的摘要要看得出是哪条路打开的（排查用），最终地址标记照旧能解析。"""
+        from CharTyr_MaiWork.maiwork.tools_builtin import final_url_from_summary
+
+        rd = _FakeReader(ReadResult(True, text="《t》\n正文" * 20, final_url="https://news.example.com/a?final=1"))
+        tools = _make_r(store, settings, reader=rd)
+        await tools.call("fetch_page", {"url": "https://news.example.com/a"}, _ctx())
+        row = store.read().execute("SELECT output FROM tool_calls WHERE tool='fetch_page' ORDER BY id DESC LIMIT 1").fetchone()
+        assert "Jina" in row["output"]
+        assert final_url_from_summary(row["output"]) == "https://news.example.com/a?final=1"
+
+    def test_timeout_leaves_room_for_three_ways(self, store, settings):
+        tools = _make_r(store, settings, reader=_FakeReader())
+        assert tools.get("fetch_page", "worker").timeout_s >= 60

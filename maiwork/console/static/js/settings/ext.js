@@ -27,7 +27,8 @@ export function extPage() {
     ${skills.length ? skills.map((k) => (ed && ed.kind === "skill" && ed.name === k.name ? skillForm(k) : skillRow(k))).join("") : newSkill ? "" : `<p class="h-meta">还没有。</p>`}`;
 }
 
-// 联网搜索：从已接的 MCP 里挑一个工具来用（后端 GET/PUT/DELETE /api/extensions/search）
+// 联网搜索：从已接的 MCP 里挑一个工具来用（后端 GET/PUT/DELETE /api/extensions/search）。
+// 「抓网页正文」可以另选任意一家 MCP 的工具，不必和搜索同一家。
 function searchCard() {
   const sx = state.extSearch;
   if (!sx) return "";
@@ -38,12 +39,13 @@ function searchCard() {
   const head = `<div class="h-sub-row"><h2 class="h-sub">联网搜索</h2>${!editing ? `<span class="row-btns"><button class="btn small" data-act="search-edit">换一个</button></span>` : ""}</div>`;
   const stLine = `<div class="set-text ext-st"><span class="dot ${st.ok ? "ok" : b ? "failed" : ""}"></span>${esc(b ? st.text || "" : "还没选")}</div>`;
   if (!editing) {
+    const exMcp = b.extract_mcp || b.mcp;
     return `${head}
       <div class="ext-row search-now">
         ${ico("magnifier")}
         <div class="ext-main">
           <div class="set-name">${esc(b.mcp)} · <span class="mono">${esc(b.tool)}</span></div>
-          ${b.extract_tool ? `<div class="set-text">抓网页正文：<span class="mono">${esc(b.extract_tool)}</span></div>` : ""}
+          ${b.extract_tool ? `<div class="set-text">抓网页正文：${esc(exMcp)} · <span class="mono">${esc(b.extract_tool)}</span></div>` : ""}
           ${stLine}
         </div>
       </div>
@@ -54,13 +56,20 @@ function searchCard() {
   }
   const all = cands.flatMap((c) => c.tools.map((t) => ({ mcp: c.mcp, ...t })));
   const pick = b ? all.find((t) => t.mcp === b.mcp && t.name === b.tool) : all.find((t) => t.guess === "search") || all[0];
-  const opt = (t, sel) => `<option value="${esc(t.mcp + "\u0000" + t.name)}" ${sel ? "selected" : ""}>${esc(t.mcp)} · ${esc(t.name)}${t.guess === "search" ? "（像搜索）" : ""}</option>`;
+  // 抓正文：有绑定就用绑定的；没有就猜一个「像抓正文」的（同一家优先）
+  let exPick = null;
+  if (b && b.extract_tool) exPick = all.find((t) => t.mcp === (b.extract_mcp || b.mcp) && t.name === b.extract_tool) || null;
+  else if (!b) exPick = all.find((t) => t.guess === "extract" && pick && t.mcp === pick.mcp) || all.find((t) => t.guess === "extract") || null;
+  const same = (t, p) => !!p && t.mcp === p.mcp && t.name === p.name;
+  // 扩展名和工具名分开放在 data-* 里（别拼成一个值：HTML 属性里的 NUL 会被浏览器换掉，拆不开）
+  const opt = (t, sel, hint) =>
+    `<option value="${esc(t.mcp + " · " + t.name)}" data-mcp="${esc(t.mcp)}" data-tool="${esc(t.name)}" ${sel ? "selected" : ""}>${esc(t.mcp)} · ${esc(t.name)}${t.guess === hint ? (hint === "search" ? "（像搜索）" : "（像抓正文）") : ""}</option>`;
   return `${head}${b ? stLine : ""}
     <div class="login ext-form search-form">
       <label for="sx-tool">用哪个工具搜索</label>
-      <select id="sx-tool">${all.map((t) => opt(t, pick && t.mcp === pick.mcp && t.name === pick.name)).join("")}</select>
-      <label for="sx-extract">抓网页正文 <span class="fine-inline">可选</span></label>
-      <select id="sx-extract">${extractOpts(pick ? pick.mcp : "", b ? b.extract_tool : null)}</select>
+      <select id="sx-tool">${all.map((t) => opt(t, same(t, pick), "search")).join("")}</select>
+      <label for="sx-extract">抓网页正文 <span class="fine-inline">可选 · 可以选另一家</span></label>
+      <select id="sx-extract"><option value="" ${exPick ? "" : "selected"}>不用</option>${all.map((t) => opt(t, same(t, exPick), "extract")).join("")}</select>
       <div class="actions">
         <button class="btn primary" data-act="search-save">用这个</button>
         ${b ? `<button class="btn" data-act="search-cancel">取消</button><button class="btn danger" data-act="search-off">不用联网搜索</button>` : ""}
@@ -68,12 +77,11 @@ function searchCard() {
     </div>`;
 }
 
-// 抓正文工具只能从同一个 MCP 里选；cur=null 时按名字猜
-export function extractOpts(mcp, cur) {
-  const c = ((state.extSearch && state.extSearch.candidates) || []).find((x) => x.mcp === mcp);
-  const tools = (c && c.tools) || [];
-  const guess = cur === null ? (tools.find((t) => t.guess === "extract") || {}).name || "" : cur || "";
-  return `<option value="" ${guess ? "" : "selected"}>不用</option>` + tools.map((t) => `<option value="${esc(t.name)}" ${t.name === guess ? "selected" : ""}>${esc(t.name)}${t.guess === "extract" ? "（像抓正文）" : ""}</option>`).join("");
+// 下拉当前选中的 {mcp, tool}（id = sx-tool 搜索 / sx-extract 抓正文；选「不用」→ 两个都是 ""）
+export function pickedTool(id) {
+  const sel = document.getElementById(id);
+  const o = sel && sel.selectedOptions && sel.selectedOptions[0];
+  return { mcp: (o && o.dataset.mcp) || "", tool: (o && o.dataset.tool) || "" };
 }
 
 function mcpRow(m) {

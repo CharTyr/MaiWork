@@ -17,6 +17,7 @@ from CharTyr_MaiWork.maiwork.search_binding import (
     get_binding,
     guess_tool_role,
     save_binding,
+    search_role_of,
     search_view,
     set_binding,
     status_of,
@@ -51,12 +52,12 @@ class TestBindingRoundTrip:
 
     def test_set_and_get(self, store: Store) -> None:
         set_binding(store, {"mcp": "tavily", "tool": "tavily-search", "extract_tool": "tavily-extract"})
-        assert get_binding(store) == {"mcp": "tavily", "tool": "tavily-search", "extract_tool": "tavily-extract"}
+        assert get_binding(store) == {"mcp": "tavily", "tool": "tavily-search", "extract_mcp": "tavily", "extract_tool": "tavily-extract"}
 
     def test_extract_tool_optional(self, store: Store) -> None:
         set_binding(store, {"mcp": "tavily", "tool": "tavily-search"})
         b = get_binding(store)
-        assert b == {"mcp": "tavily", "tool": "tavily-search", "extract_tool": ""}
+        assert b == {"mcp": "tavily", "tool": "tavily-search", "extract_mcp": "", "extract_tool": ""}
 
     def test_garbage_in_kv_is_none(self, store: Store) -> None:
         with store.tx() as conn:
@@ -241,6 +242,123 @@ class TestSearchView:
                 return {"tavily-search": {"name": "tavily-search"}, "tavily-extract": {"name": "tavily-extract"}}
 
         view = search_view(store, settings, lambda name: _Runtime())
-        assert view["binding"] == {"mcp": "tavily", "tool": "tavily-search", "extract_tool": "tavily-extract"}
+        assert view["binding"] == {"mcp": "tavily", "tool": "tavily-search", "extract_mcp": "tavily", "extract_tool": "tavily-extract"}
         assert view["status"]["ok"] is True
         assert "tavily-search" in view["status"]["text"]
+
+
+# ----------------------------------------------------------------------
+# 搜索和抓正文分别用两个不同的 MCP（用户要求：比如搜索用 keenable、抓正文用 You）
+# ----------------------------------------------------------------------
+
+
+def _settings_two(**enabled):
+    raw = {"extensions": {"mcp": [
+        {"name": "keenable", "url": "https://k.example/mcp", "enabled": enabled.get("keenable", True)},
+        {"name": "You", "url": "https://y.example/mcp", "enabled": enabled.get("You", True)},
+    ]}}
+    s, problems = load_settings(raw)
+    assert problems == []
+    return s
+
+
+class _RT:
+    def __init__(self, tools, connected=True):
+        self._tools = tools
+        self.client = object() if connected else None
+
+    def tools_remote(self):
+        return {t: {} for t in self._tools}
+
+
+_RUNTIMES = {
+    "keenable": _RT(["search_web_pages", "fetch_page_content"]),
+    "You": _RT(["you-search", "you-contents"]),
+}
+
+
+def _spec_of(mcp: str, tool: str):
+    rt = _RUNTIMES.get(mcp)
+    return {"name": tool} if rt is not None and tool in rt._tools else None
+
+
+class TestTwoMcps:
+    def test_old_record_extract_follows_search_mcp(self, store: Store) -> None:
+        """老绑定（没有 extract_mcp）：抓正文当成和搜索同一个扩展，行为不变。"""
+        with store.tx() as conn:
+            store.kv_set(conn, KV_SEARCH, {"mcp": "You", "tool": "you-search", "extract_tool": "you-contents"})
+        assert get_binding(store) == {"mcp": "You", "tool": "you-search", "extract_mcp": "You", "extract_tool": "you-contents"}
+
+    def test_save_search_and_extract_from_different_mcps(self, store: Store) -> None:
+        b = save_binding(
+            store, _settings_two(),
+            {"mcp": "keenable", "tool": "search_web_pages", "extract_mcp": "You", "extract_tool": "you-contents"},
+            tool_spec_of=_spec_of,
+        )
+        assert b == {"mcp": "keenable", "tool": "search_web_pages", "extract_mcp": "You", "extract_tool": "you-contents"}
+        assert get_binding(store) == b
+
+    def test_extract_mcp_defaults_to_search_mcp(self, store: Store) -> None:
+        b = save_binding(
+            store, _settings_two(),
+            {"mcp": "keenable", "tool": "search_web_pages", "extract_tool": "fetch_page_content"},
+            tool_spec_of=_spec_of,
+        )
+        assert b["extract_mcp"] == "keenable"
+
+    def test_extract_tool_checked_against_its_own_mcp(self, store: Store) -> None:
+        with pytest.raises(ValueError, match="没有这个工具"):
+            save_binding(
+                store, _settings_two(),
+                {"mcp": "keenable", "tool": "search_web_pages", "extract_mcp": "You", "extract_tool": "fetch_page_content"},
+                tool_spec_of=_spec_of,
+            )
+
+    def test_unknown_extract_mcp(self, store: Store) -> None:
+        with pytest.raises(ValueError, match="没有这个扩展"):
+            save_binding(
+                store, _settings_two(),
+                {"mcp": "keenable", "tool": "search_web_pages", "extract_mcp": "没有这家", "extract_tool": "x"},
+                tool_spec_of=_spec_of,
+            )
+
+    def test_same_tool_name_ok_when_mcps_differ(self, store: Store) -> None:
+        def spec(mcp, tool):
+            return {"name": tool}
+
+        b = save_binding(
+            store, _settings_two(),
+            {"mcp": "keenable", "tool": "search", "extract_mcp": "You", "extract_tool": "search"},
+            tool_spec_of=spec,
+        )
+        assert b["extract_mcp"] == "You"
+
+    def test_status_ok_and_names_both(self, store: Store) -> None:
+        set_binding(store, {"mcp": "keenable", "tool": "search_web_pages", "extract_mcp": "You", "extract_tool": "you-contents"})
+        ok, text = status_of(store, _settings_two(), _RUNTIMES.get)
+        assert ok is True
+        assert "keenable" in text and "search_web_pages" in text
+        assert "You" in text and "you-contents" in text
+
+    def test_extract_mcp_broken_does_not_break_search(self, store: Store) -> None:
+        """抓正文那家关了：搜索照样能用，状态里说明抓正文用不了。"""
+        set_binding(store, {"mcp": "keenable", "tool": "search_web_pages", "extract_mcp": "You", "extract_tool": "you-contents"})
+        ok, text = status_of(store, _settings_two(You=False), _RUNTIMES.get)
+        assert ok is True
+        assert "抓正文" in text and "没启用" in text
+
+    def test_removing_extract_mcp_keeps_search(self, store: Store) -> None:
+        set_binding(store, {"mcp": "keenable", "tool": "search_web_pages", "extract_mcp": "You", "extract_tool": "you-contents"})
+        assert clear_binding(store, mcp="You") is True
+        assert get_binding(store) == {"mcp": "keenable", "tool": "search_web_pages", "extract_mcp": "", "extract_tool": ""}
+
+    def test_removing_search_mcp_clears_all(self, store: Store) -> None:
+        set_binding(store, {"mcp": "keenable", "tool": "search_web_pages", "extract_mcp": "You", "extract_tool": "you-contents"})
+        clear_binding(store, mcp="keenable")
+        assert get_binding(store) is None
+
+    def test_role_badges(self, store: Store) -> None:
+        set_binding(store, {"mcp": "keenable", "tool": "search_web_pages", "extract_mcp": "You", "extract_tool": "you-contents"})
+        assert search_role_of(store, "keenable") == "search"
+        assert search_role_of(store, "You") == "extract"
+        assert search_role_of(store, "别的") == ""

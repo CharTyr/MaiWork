@@ -2,6 +2,10 @@
 
 register_builtin(tools, *, search, profiles, ...) 一次把四个工具注册进 Tools。
 
+fetch_page 打开顺序（2026-09-28 用户定）：Jina Reader（reader.py）→「抓网页正文」工具（联网搜索里
+绑定的 MCP，可以和搜索不是同一家）→ 服务器直接打开。前一条路有任何问题（限流、超时、验证页、空正文…）
+马上换下一条；Jina 关着时退回老顺序：直接打开，被网站拦了再用抓正文工具。
+
 fetch_page 安全规则：
 - 只允许 http/https；
 - 解析主机名（可注入 resolver 方便测试），命中内网/本机/链路本地/保留地址一律拒；
@@ -225,6 +229,18 @@ def _absolute_http_url(raw: str, base: str) -> str:
     return p.geturl()
 
 
+def _url_problem(url: str, resolver: Resolver) -> str:
+    """交给任何一条路之前先查：只收公开的 http(s) 地址；有问题 → 中文原因，没问题 → ""。"""
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme not in ("http", "https"):
+        return f"只支持 http/https 链接，{parsed.scheme or '(没有协议)'} 不支持"
+    if not parsed.hostname:
+        return "链接里没有主机名，打不开"
+    if _host_is_forbidden(parsed.hostname, resolver):
+        return f"{parsed.hostname} 解析到内网/本机地址，不允许打开"
+    return ""
+
+
 def _extract_og_image(html: str, final_url: str) -> str:
     """页面的 og:image（只收 http(s) 绝对地址；相对地址按最终页面 URL 解析）。"""
     parser = _OgImageParser()
@@ -291,6 +307,9 @@ async def _fetch_page_text(
 # 最终地址（验收引用核对要认它；不改 tool_calls 表结构，写在 output 摘要里）
 # ----------------------------------------------------------------------
 
+# 请求日志里标明是哪条路打开的（排查用）
+_VIA_NOTE = {"jina": "（Jina）", "extract": "（抓正文工具）", "direct": "（直接打开）"}
+
 FINAL_URL_LABEL = "最终地址"
 # 到「）」/ 空白为止（标记是我们自己写的「（最终地址：<url>）」）
 _FINAL_URL_RE = re.compile(FINAL_URL_LABEL + r"[:：]\s*([^\s）]+)")
@@ -320,6 +339,7 @@ def register_builtin(
     http_transport: Any = None,        # 测试注入 httpx.MockTransport
     get_settings: Callable[[], Any] | None = None,
     resolver: Resolver | None = None,  # 测试注入 DNS resolver（host -> [ip]）
+    reader: Any = None,                # JinaReader（reader.py）；None / 关着 = 不走 Jina
 ) -> None:
     """把 M2 内置工具注册进 tools。search 可以为 None（届时 web_search 直接报没配）。"""
     resolve = resolver or _default_resolver
@@ -358,30 +378,7 @@ def register_builtin(
             )
         return ToolResult(ok=True, output="\n".join(lines), data=results)
 
-    async def fetch_page(ctx: ToolContext, args: dict) -> ToolResult:
-        url = str(args.get("url") or "").strip()
-        if not url:
-            return ToolResult(ok=False, output="", error="url 不能为空")
-        ok, text, image_url, final_url = await _fetch_page_text(
-            url, transport=http_transport, resolver=resolve
-        )
-        if not ok:
-            # 普通抓取被网站拦了（403 等）→ 改用搜索服务的正文抽取（Tavily extract）再试一次。
-            # 内网 / 非法地址（安全拒绝）绝不走这条路。线上实测约三分之一原文页 403。
-            blocked_for_safety = "内网" in text or "不允许" in text or "只支持" in text
-            extract = getattr(search, "extract", None)
-            if extract is not None and not blocked_for_safety:
-                try:
-                    extracted = str(await extract(url) or "").strip()
-                except Exception as e:  # 抽取也失败：保留原来的错误
-                    logger.info("fetch_page 抽取兜底也失败（%s）：%s", url, type(e).__name__)
-                    extracted = ""
-                if extracted:
-                    host = urlparse(url).hostname or ""
-                    return ToolResult(ok=True, output=extracted[:20000] + "\n\n（网站拦了普通抓取，这是经搜索服务抽取的正文）",
-                                      data={"url": url, "final_url": url, "host": host,
-                                            "image_url": "", "via": "extract"})
-            return ToolResult(ok=False, output="", error=text)
+    def _page_result(url: str, text: str, image_url: str, final_url: str, via: str) -> ToolResult:
         host = urlparse(url).hostname or ""
         if image_url:
             # 拿到封面图就告诉子 agent 一声（交回候选时带 image_url）
@@ -391,8 +388,59 @@ def register_builtin(
             text += f"\n\n（这个链接跳转到了：{final_url}）"
         return ToolResult(
             ok=True, output=text,
-            data={"url": url, "final_url": final_url, "host": host, "image_url": image_url},
+            data={"url": url, "final_url": final_url, "host": host, "image_url": image_url, "via": via},
         )
+
+    async def _try_extract(url: str) -> tuple[str, str]:
+        """抓网页正文工具：(正文, 失败原因)。没配 / 用不了 → ("", 原因)。"""
+        extract = getattr(search, "extract", None)
+        if extract is None:
+            return "", "没配"
+        try:
+            text = str(await extract(url) or "").strip()
+        except Exception as e:  # SearchError 等，message 已去密钥
+            logger.info("fetch_page 抓正文工具失败（%s）：%s", url, type(e).__name__)
+            return "", str(e)[:120] or type(e).__name__
+        return (text, "") if text else ("", "没读到正文（没选工具或那家用不了）")
+
+    def _extracted_result(url: str, text: str) -> ToolResult:
+        return _page_result(url, text[:20000] + "\n\n（这是经「抓网页正文」工具读到的正文）", "", url, "extract")
+
+    async def fetch_page(ctx: ToolContext, args: dict) -> ToolResult:
+        url = str(args.get("url") or "").strip()
+        if not url:
+            return ToolResult(ok=False, output="", error="url 不能为空")
+        use_jina = reader is not None and bool(getattr(reader, "enabled", lambda: False)())
+        if use_jina:
+            # 新顺序：Jina → 抓正文工具 → 直接打开。先做地址安全检查（内网地址哪条路都不走）。
+            problem = _url_problem(url, resolve)
+            if problem:
+                return ToolResult(ok=False, output="", error=problem)
+            got = await reader.read(url)
+            if got.ok:
+                return _page_result(url, got.text, got.image_url, got.final_url or url, "jina")
+            reasons = [f"Jina Reader：{got.reason}"]
+            text, why = await _try_extract(url)
+            if text:
+                return _extracted_result(url, text)
+            reasons.append(f"抓正文工具：{why}")
+            ok, text, image_url, final_url = await _fetch_page_text(url, transport=http_transport, resolver=resolve)
+            if ok:
+                return _page_result(url, text, image_url, final_url, "direct")
+            reasons.append(f"直接打开：{text}")
+            return ToolResult(ok=False, output="", error="打不开这个页面。" + "；".join(reasons))
+
+        # 老顺序（Jina 关着）：直接打开，被网站拦了（403 等）再用抓正文工具。
+        # 内网 / 非法地址（安全拒绝）绝不走抓正文。线上实测约三分之一原文页 403。
+        ok, text, image_url, final_url = await _fetch_page_text(url, transport=http_transport, resolver=resolve)
+        if ok:
+            return _page_result(url, text, image_url, final_url, "direct")
+        blocked_for_safety = "内网" in text or "不允许" in text or "只支持" in text
+        if not blocked_for_safety:
+            extracted, _why = await _try_extract(url)
+            if extracted:
+                return _extracted_result(url, extracted)
+        return ToolResult(ok=False, output="", error=text)
 
     async def read_profile(ctx: ToolContext, args: dict) -> ToolResult:
         gid = str(args.get("group_id") or ctx.group_id or "").strip()
@@ -475,7 +523,7 @@ def register_builtin(
     tools.register(
         Tool(
             name="fetch_page",
-            description="打开一个 http/https 链接，取出正文（截 8000 字）。内网/本机地址打不开。",
+            description="打开一个 http/https 链接，取出正文（截 8000 字）。内网/本机地址打不开。有的页面会带发布时间。",
             parameters={
                 "type": "object",
                 "properties": {"url": {"type": "string", "description": "要打开的 http/https 链接"}},
@@ -487,6 +535,7 @@ def register_builtin(
                 str(args.get("url", "")),
                 (
                     ("取到正文 %d 字" % len(res.output))
+                    + _VIA_NOTE.get(str((res.data or {}).get("via") or ""), "")
                     + (
                         final_url_note(str((res.data or {}).get("final_url") or ""))
                         if (res.data or {}).get("final_url")
@@ -496,7 +545,7 @@ def register_builtin(
                 if res.ok
                 else (res.error or "打不开"),
             ),
-            timeout_s=30.0,
+            timeout_s=75.0,
         )
     )
     tools.register(

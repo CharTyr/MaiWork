@@ -763,6 +763,12 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     # ---- group_space ----
     _F("group_space.enabled", "开群空间", "群文件、公告和相册", "bool"),
     _F("group_space.notice_per_day", "每天群公告上限", "", "int", min=1, max=5),
+
+    # ---- reader ----
+    _F("reader.jina_enabled", "先用 Jina Reader 打开网页",
+       "读不到或限流时马上换「抓网页正文」工具，再不行直接打开", "bool"),
+    _F("reader.jina_api_key", "Jina Reader 密钥",
+       "可选。不填每分钟 20 次（按服务器 IP 算），填了 500 次；在 jina.ai 免费申请", "secret"),
 ]
 
 CONFIG_SECTIONS: list[dict[str, str]] = [
@@ -782,6 +788,7 @@ CONFIG_SECTIONS: list[dict[str, str]] = [
     {"id": "profile", "label": "群画像"},
     {"id": "storage", "label": "数据存储"},
     {"id": "group_space", "label": "群空间"},
+    {"id": "reader", "label": "打开网页"},
 ]
 
 CONFIG_BY_KEY: dict[str, dict[str, Any]] = {f["key"]: f for f in CONFIG_SCHEMA}
@@ -796,6 +803,7 @@ SECRET_FIELDS: dict[str, dict[str, Any]] = {
         "env": ("TYPESAFE_API_KEY", "TYPESAFE_KEY_FILE"),
     },
     "console.password": {"setting": ("console", "password"), "env": ()},
+    "reader.jina_api_key": {"setting": ("reader", "jina_api_key"), "env": ()},
 }
 
 

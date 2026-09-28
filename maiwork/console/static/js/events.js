@@ -2,7 +2,7 @@
 import { $, desktop, state } from "./state.js";
 import { toast } from "./util.js";
 import { api } from "./api.js";
-import { extractOpts, loadExt } from "./settings/ext.js";
+import { loadExt } from "./settings/ext.js";
 import { chipAdd } from "./settings/rules.js";
 import { loadUsageDay } from "./settings/usage.js";
 import { avatarSaved } from "./settings/identity.js";
@@ -12,10 +12,6 @@ import { loadChats } from "./chat.js";
 import { renderSide } from "./render.js";
 
 document.addEventListener("change", async (e) => {
-  if (e.target.id === "sx-tool" && $("sx-extract")) {
-    $("sx-extract").innerHTML = extractOpts(e.target.value.split("\u0000")[0], null);
-    return;
-  }
   if (e.target.classList && e.target.classList.contains("chat-group") && state.chat) {
     try {
       await api("PATCH", `/api/chat/${encodeURIComponent(state.chat.id)}`, { group_id: e.target.value });

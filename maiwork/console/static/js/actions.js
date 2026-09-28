@@ -5,7 +5,7 @@ import { api, grp, gview } from "./api.js";
 import { FB_KEY, VOTE_KEY, myFb, myVotes } from "./pages/news.js";
 import { findIdea, ideaAsk, ideaItems, ideaPicked } from "./pages/ideas.js";
 import { refreshDetail } from "./detail.js";
-import { headerRow, loadExt, readHeaders } from "./settings/ext.js";
+import { headerRow, loadExt, pickedTool, readHeaders } from "./settings/ext.js";
 import { chipAdd, rowsAdd } from "./settings/rules.js";
 import { loadUsage, loadUsageDay } from "./settings/usage.js";
 import { avatarSaved, loadIdentity } from "./settings/identity.js";
@@ -394,10 +394,11 @@ export async function act(el, e) {
       repaintSheet();
       break;
     case "search-save": {
-      const [mcp, tool] = ($("sx-tool").value || "").split("\u0000");
+      const { mcp, tool } = pickedTool("sx-tool");
+      const ex = pickedTool("sx-extract");
       el.disabled = true;
       try {
-        state.extSearch = await api("PUT", "/api/extensions/search", { mcp, tool, extract_tool: $("sx-extract").value || "" });
+        state.extSearch = await api("PUT", "/api/extensions/search", { mcp, tool, extract_mcp: ex.mcp, extract_tool: ex.tool });
         state.searchEdit = false;
         await loadExt();
         if (state.settings) await loadSettings();

@@ -45,7 +45,8 @@ class TestDefaults:
         # 0.3.9：模型重试设置：[models] 加 retries / retry_delay_s
         # 0.3.10：管理员 / 免批名单改成「平台:账号」
         # 0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
-        assert CONFIG_VERSION == "0.4.0"
+        # 0.4.1：[reader] Jina Reader（打开网页首选）
+        assert CONFIG_VERSION == "0.4.1"
         assert MaiWorkConfig().plugin.config_version == CONFIG_VERSION
 
     def test_railway_verify_new_fields_defaults(self) -> None:

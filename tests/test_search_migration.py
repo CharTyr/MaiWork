@@ -86,7 +86,7 @@ class TestTavilyMcp:
         assert store.secret_get("mcp.tavily.Authorization") == "Bearer tvly-迁移密钥-显眼"
         # 绑定按惯例（拿不到工具清单时的默认值）
         binding = get_binding(store)
-        assert binding == {"mcp": "tavily", "tool": "tavily-search", "extract_tool": "tavily-extract"}
+        assert binding == {"mcp": "tavily", "tool": "tavily-search", "extract_mcp": "tavily", "extract_tool": "tavily-extract"}
 
     def test_reuses_existing_extension_same_url(self, tmp_path: Path, store: Store) -> None:
         """数据库里已有同 URL 的 tavily 扩展（URL 带 ?key= 参数、大小写、末尾斜杠差异都算同一个）→ 复用不新建。"""

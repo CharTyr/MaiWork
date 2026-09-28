@@ -796,6 +796,38 @@ def _search_health(svc: Any) -> dict[str, Any]:
     return {"key": "search", "icon": "magnifier", "name": "搜索", "state": "ok" if ok else "warn", "text": text}
 
 
+def _reader_health(svc: Any) -> dict[str, Any]:
+    """「打开网页」健康项：三条路现在的样子（Jina Reader → 抓网页正文工具 → 直接打开）。
+
+    ok：Jina 能用（或关着、走老顺序）；warn：Jina 在冷却（被限流 / 密钥不对 / 额度用完）。
+    """
+    search = getattr(svc, "search", None)
+    ex_ok, ex_text = False, "没选抓正文工具"
+    avail = getattr(search, "extract_available", None)
+    if callable(avail):
+        try:
+            ex_ok, ex_text = avail()
+        except Exception:
+            ex_ok, ex_text = False, "抓正文工具状态读不出来"
+    extract_part = f"抓正文工具（{ex_text}）"
+    reader = getattr(svc, "reader", None)
+    enabled = False
+    if reader is not None:
+        try:
+            enabled = bool(reader.enabled())
+        except Exception:
+            enabled = False
+    if not enabled:
+        text = f"Jina Reader 关着：先直接打开，被网站拦了再用{extract_part}"
+        return {"key": "reader", "icon": "books", "name": "打开网页", "state": "ok", "text": text}
+    try:
+        r_ok, r_text = reader.status()
+    except Exception:
+        r_ok, r_text = False, "Jina Reader 状态读不出来"
+    text = f"{r_text} → {extract_part} → 直接打开"
+    return {"key": "reader", "icon": "books", "name": "打开网页", "state": "ok" if r_ok else "warn", "text": text}
+
+
 def _ssh_health(svc: Any) -> dict[str, Any] | None:
     """专用机器健康项：每台连不连得上；带上 MaiWork 的公钥（copy 字段，前端给复制按钮）。
 
@@ -1063,6 +1095,7 @@ def settings_view(svc: Any) -> dict[str, Any]:
         {"key": "models", "icon": "robot", "name": "模型端点", "state": model_state, "text": model_text},
         _jev_health(svc),
         _search_health(svc),
+        _reader_health(svc),
         _localenv_health(svc),
         _groupspace_health(svc),
     ]

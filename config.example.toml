@@ -241,6 +241,13 @@ enabled = true
 # 每群每天最多发几条群公告（发之前会先在群里说一句预告，防手滑）。
 notice_per_day = 1
 
+[reader]
+# 打开网页读正文的顺序：Jina Reader（r.jina.ai）→「抓网页正文」工具（设置 → 扩展 → 联网搜索里选的）→ 服务器直接打开。
+# 前一条读不到 / 被限流 / 读到验证页，马上换下一条。关掉就退回：直接打开，被网站拦了再用抓正文工具。
+jina_enabled = true
+# 可选：Jina 密钥（jina.ai 免费申请）。不填每分钟 20 次（按服务器 IP 算），填了 500 次。只进不出，不写日志。
+jina_api_key = ""
+
 
 [extensions]
 # 子 agent 的扩展：MCP 端点和 skill。MaiWork 自己加载，只注册进自己的工具表

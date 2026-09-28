@@ -98,6 +98,7 @@ class MaiWorkApp:
         # M2 模块（docs/07 §10）
         self.jev: Any = None
         self.search: Any = None
+        self.reader: Any = None  # JinaReader（reader.py）：打开网页的首选路
         self.tools: Any = None
         self.workers: Any = None
         self.mentions: Any = None
@@ -335,10 +336,14 @@ class MaiWorkApp:
         # kv["extensions.search"] 绑定 + Extensions 的运行状态；扩展在 _start_extensions 才连上，
         # 这里先建好壳子（available() 现查，不缓存）。
         self.search = Search(self.store, lambda: self.extensions)
+        # 打开网页先用 Jina Reader，有问题马上换抓正文工具，再不行直接打开（reader.py / tools_builtin.py）
+        from .reader import JinaReader
+
+        self.reader = JinaReader(self.get_settings)
         # M5：工具落库摘要统一遮密钥——已知密钥（模型 / 搜索）由这个回调给
         self.tools = Tools(self.store, get_known_secrets=self._known_secrets)
         try:
-            register_builtin(self.tools, search=self.search, profiles=self.profiles)
+            register_builtin(self.tools, search=self.search, profiles=self.profiles, reader=self.reader)
         except Exception:
             logger.exception("注册内置工具出错，子 agent 这次没有工具用")
         # remember 工具（roles={"main"}；身份与工作记忆，identity.py）

@@ -174,7 +174,7 @@ class TestConfigApi:
         assert ids == [
             "groups", "focus", "feeds", "goals", "topics", "delivery", "approval",
             "tasks", "models", "jev", "usage", "console", "environments", "profile",
-            "storage", "group_space",
+            "storage", "group_space", "reader",
         ]
         assert data["file"] == "config.toml"
         f = _field(data, "topics.per_day")

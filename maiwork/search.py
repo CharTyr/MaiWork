@@ -16,6 +16,8 @@ Search(store, get_extensions)：
   published_date|page_age|date|age，用 _parse_dt_utc）；实在拿不到结构就把原文本截断当一条。
 - async extract(url) → 正文文本（绑了 extract_tool 才抽；没绑返回 ""）。参数按 schema 决定
   urls（array）还是 url（string）；结果抽 markdown|content|raw_content|text。
+  抓正文可以和搜索分属两个 MCP（绑定里的 extract_mcp）：走抓正文那家自己的连接，
+  只看那家能不能用，搜索那家关了也不影响。
 - 调用复用绑定扩展在 extensions 里的现有 client（runtime_of(name).client），不自己另建连接；
   MCP 报 "HTTP 5xx" 等 _MCP_RETRY_DELAY_S 秒重试一次。
 - 没绑定 / 绑定的扩展不在了、没启用、没连上 → SearchUnavailable（中文提示去 设置 → 扩展 绑定）；
@@ -32,7 +34,7 @@ from typing import Any, Callable
 
 from .mcp_client import MCPError, McpSessionClient
 from . import search_binding
-from .search_binding import get_binding, status_of
+from .search_binding import get_binding, status_of, tool_problem
 
 logger = logging.getLogger("maiwork.search")
 
@@ -474,27 +476,31 @@ class Search:
             binding = get_binding(self._store)
             if binding is None:
                 return out
-            headers: dict = {}
-            runtime = self._runtime(binding["mcp"])
-            rt_headers = getattr(runtime, "headers", None) if runtime is not None else None
-            if isinstance(rt_headers, dict) and rt_headers:
-                headers = rt_headers
-            else:
-                entry = None
-                settings = self._settings()
-                if settings is not None:
-                    from . import extensions_web
+            names = [binding["mcp"]]
+            if binding["extract_mcp"] and binding["extract_mcp"] not in names:
+                names.append(binding["extract_mcp"])
+            for name in names:
+                headers: dict = {}
+                runtime = self._runtime(name)
+                rt_headers = getattr(runtime, "headers", None) if runtime is not None else None
+                if isinstance(rt_headers, dict) and rt_headers:
+                    headers = rt_headers
+                else:
+                    entry = None
+                    settings = self._settings()
+                    if settings is not None:
+                        from . import extensions_web
 
-                    for e in extensions_web.merged_entries(settings, self._store):
-                        if e.name == binding["mcp"]:
-                            entry = e
-                            break
-                if entry is not None:
-                    headers = dict(getattr(entry, "headers", {}) or {})
-            for v in headers.values():
-                for piece in _secret_variants(str(v or "")):
-                    if piece and piece not in out:
-                        out.append(piece)
+                        for e in extensions_web.merged_entries(settings, self._store):
+                            if e.name == name:
+                                entry = e
+                                break
+                    if entry is not None:
+                        headers = dict(getattr(entry, "headers", {}) or {})
+                for v in headers.values():
+                    for piece in _secret_variants(str(v or "")):
+                        if piece and piece not in out:
+                            out.append(piece)
         except Exception:
             pass
         return out
@@ -550,20 +556,37 @@ class Search:
     # ------------------------------------------------------------------
 
     async def extract(self, url: str) -> str:
-        """抽取一个网页的正文（给 fetch_page 被网站拦时兜底）。没绑 extract_tool → ""。"""
-        try:
-            client, binding, runtime = self._client()
-        except SearchUnavailable:
+        """抽取一个网页的正文（fetch_page 的备用路）。没绑 extract_tool / 那家用不了 → ""。"""
+        ok, _text = self.extract_available()
+        if not ok:
             return ""
-        if not binding["extract_tool"]:
-            return ""
-        schema = self._schema_of(runtime, binding["extract_tool"])
+        binding = get_binding(self._store) or {}
+        mcp, tool = binding["extract_mcp"], binding["extract_tool"]
+        runtime = self._runtime(mcp)
+        schema = self._schema_of(runtime, tool)
         arguments = map_extract_arguments(schema, url)
         try:
-            result = await _call_retry_5xx(client, binding["extract_tool"], arguments)
+            result = await _call_retry_5xx(runtime.client, tool, arguments)
         except MCPError as e:
-            raise SearchError(_mask(f"抽取失败（{binding['mcp']}）：{e}", self.known_secrets())) from None
+            raise SearchError(_mask(f"抽取失败（{mcp}）：{e}", self.known_secrets())) from None
         return normalize_extract_text(result)
+
+    def extract_available(self) -> tuple[bool, str]:
+        """抓正文工具现在能不能用：(能用, 中文说明)。只看抓正文那家自己（它可以和搜索不是同一家，
+        搜索那家关了不影响这里）。没绑 → (False, "没选抓正文工具")。"""
+        binding = get_binding(self._store)
+        if binding is None or not binding["extract_tool"]:
+            return False, "没选抓正文工具"
+        try:
+            problem = tool_problem(
+                self._store, self._settings(), self._runtime,
+                binding["extract_mcp"], binding["extract_tool"], role="抓正文",
+            )
+        except Exception:
+            problem = "抓正文扩展状态读不出来"
+        if problem:
+            return False, problem
+        return True, f"{binding['extract_mcp']} 的 {binding['extract_tool']}"
 
 
 def _is_5xx(err: MCPError) -> bool:

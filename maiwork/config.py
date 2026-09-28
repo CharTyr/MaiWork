@@ -42,7 +42,7 @@ def _norm_accounts(values: object, field_zh: str, problems: list[str]) -> tuple[
     return tuple(out)
 
 
-CONFIG_VERSION = "0.4.0"  # 0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
+CONFIG_VERSION = "0.4.1"  # 0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
 
 # 插件目录 = 本文件所在目录；默认数据目录 = 插件目录上两级 / data / maiwork
 # （线上 <MaiBot>/plugins/CharTyr_MaiWork → <MaiBot>/data/maiwork）
@@ -300,6 +300,15 @@ class GroupSpaceSectionConfig(PluginConfigBase):
     notice_per_day: int = Field(default=1, description="每群每天最多发几条群公告（发之前会先在群里说一句预告）")
 
 
+class ReaderSectionConfig(PluginConfigBase):
+    __ui_label__ = "打开网页"
+    __ui_icon__ = "globe"
+    __ui_order__ = 16
+
+    jina_enabled: bool = Field(default=True, description="打开网页读正文先用 Jina Reader（r.jina.ai）；读不到 / 限流就马上换「抓网页正文」工具，再不行直接打开")
+    jina_api_key: str = Field(default="", description="Jina Reader 密钥（可选）：不填每分钟 20 次（按服务器 IP 算），填了 500 次；只进不出，不写日志")
+
+
 class MaiWorkConfig(PluginConfigBase):
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     groups: GroupsSectionConfig = Field(default_factory=GroupsSectionConfig)
@@ -319,6 +328,7 @@ class MaiWorkConfig(PluginConfigBase):
     storage: StorageSectionConfig = Field(default_factory=StorageSectionConfig)
     extensions: ExtensionsSectionConfig = Field(default_factory=ExtensionsSectionConfig)
     group_space: GroupSpaceSectionConfig = Field(default_factory=GroupSpaceSectionConfig)
+    reader: ReaderSectionConfig = Field(default_factory=ReaderSectionConfig)
 
 
 # ----------------------------------------------------------------------
@@ -493,6 +503,12 @@ class GroupSpaceSetting:
 
 
 @dataclass(frozen=True)
+class ReaderSetting:
+    jina_enabled: bool = True
+    jina_api_key: str = ""
+
+
+@dataclass(frozen=True)
 class Settings:
     """规范化后的只读配置快照。groups 键是纯数字群号字符串。"""
 
@@ -515,6 +531,7 @@ class Settings:
     tasks: TasksSetting = TasksSetting()
     extensions: ExtensionsSetting = ExtensionsSetting(mcp=())
     group_space: GroupSpaceSetting = GroupSpaceSetting(enabled=True, notice_per_day=1)
+    reader: ReaderSetting = ReaderSetting()
     problems: tuple[str, ...] = ()
 
     def is_served(self, group_id: str) -> bool:
@@ -865,6 +882,7 @@ _SECTIONS: tuple[tuple[str, type[PluginConfigBase]], ...] = (
     ("storage", StorageSectionConfig),
     ("extensions", ExtensionsSectionConfig),
     ("group_space", GroupSpaceSectionConfig),
+    ("reader", ReaderSectionConfig),
 )
 
 
@@ -946,6 +964,7 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
     storage = sections["storage"]
     extensions = sections["extensions"]
     group_space = sections["group_space"]
+    reader = sections["reader"]
     assert isinstance(plugin, PluginSectionConfig)
     assert isinstance(focus, FocusSectionConfig)
     assert isinstance(feeds, FeedsSectionConfig)
@@ -963,6 +982,7 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
     assert isinstance(storage, StorageSectionConfig)
     assert isinstance(extensions, ExtensionsSectionConfig)
     assert isinstance(group_space, GroupSpaceSectionConfig)
+    assert isinstance(reader, ReaderSectionConfig)
 
     # 扩展：从原始输入解析（像服务群一样逐条容错，坏的丢单条不拖累整节）
     raw_extensions = raw_mapping.get("extensions")
@@ -1048,6 +1068,10 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
         group_space=GroupSpaceSetting(
             enabled=bool(group_space.enabled),
             notice_per_day=max(1, int(group_space.notice_per_day)),
+        ),
+        reader=ReaderSetting(
+            jina_enabled=bool(reader.jina_enabled),
+            jina_api_key=str(reader.jina_api_key or "").strip(),
         ),
         problems=tuple(problems),
     )

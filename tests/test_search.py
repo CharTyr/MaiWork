@@ -491,3 +491,41 @@ class TestErrors:
         await s.search("x")
         await s.aclose()  # 不炸；连接归 extensions 管
         await s.close()
+
+
+class TestExtractFromOtherMcp:
+    """搜索和抓正文分属两个 MCP：抽正文走抓正文那家的连接，只看它自己能不能用。"""
+
+    def _two(self, store: Store, *, search_enabled: bool = True):
+        search_client = FakeClient()
+        extract_client = FakeClient([{"structuredContent": {"items": [{"markdown": "# 另一家抽的正文"}]}}])
+        set_binding(store, {"mcp": "keenable", "tool": "search_web_pages",
+                            "extract_mcp": "You", "extract_tool": "you-contents"})
+        schema = {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}
+        exts = {
+            "keenable": FakeExt("keenable", enabled=search_enabled, tools={
+                "search_web_pages": {"name": "search_web_pages", "inputSchema": YOU_SCHEMA},
+            }, client=search_client, headers={"X-API-Key": "k-SECRET-甲"}),
+            "You": FakeExt("You", tools={
+                "you-contents": {"name": "you-contents", "inputSchema": schema},
+            }, client=extract_client, headers={"Authorization": "Bearer y-SECRET-乙"}),
+        }
+        return search_client, extract_client, _search(store, exts)
+
+    @pytest.mark.asyncio
+    async def test_extract_calls_the_extract_mcp(self, store: Store) -> None:
+        search_client, extract_client, s = self._two(store)
+        text = await s.extract("https://x.com/a")
+        assert "另一家抽的正文" in text
+        assert extract_client.calls and extract_client.calls[0][0] == "you-contents"
+        assert search_client.calls == []
+
+    @pytest.mark.asyncio
+    async def test_extract_works_even_if_search_mcp_is_off(self, store: Store) -> None:
+        _, extract_client, s = self._two(store, search_enabled=False)
+        assert "另一家抽的正文" in await s.extract("https://x.com/a")
+
+    def test_known_secrets_cover_both_mcps(self, store: Store) -> None:
+        _, _, s = self._two(store)
+        secrets = s.known_secrets()
+        assert "k-SECRET-甲" in secrets and "y-SECRET-乙" in secrets

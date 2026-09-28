@@ -57,3 +57,11 @@ def test_every_module_is_short() -> None:
         if n > MAX_LINES:
             long[p.relative_to(JS).as_posix()] = n
     assert not long, f"这些文件太长了，拆一拆（上限 {MAX_LINES} 行）：{long}"
+
+
+def test_no_nul_separator_in_frontend() -> None:
+    """HTML 属性值里的 NUL（\\u0000）会被浏览器换成 U+FFFD：拿它当 option 值的分隔符，
+    读回来就拆不开（线上踩过：联网搜索选了工具却保存报「要给出 mcp 和 tool」，
+    抓正文下拉也只剩「不用」）。前端一律不用 NUL 当分隔符。"""
+    bad = [p.relative_to(JS).as_posix() for p in _modules() if "\\u0000" in p.read_text(encoding="utf-8")]
+    assert not bad, f"这些文件用了 \\u0000 当分隔符：{bad}"
