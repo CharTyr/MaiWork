@@ -2,7 +2,7 @@
 
 用 aiohttp.test_utils 起真的回环服务器；svc 是假的（admin_chat 用假模块，
 同步/异步方法各来一个，逼路由两边都认），不碰 MaiBot 宿主、不碰线上。
-响应字段按 console/static/app.js 的「和 MaiWork 聊」页来断言。
+响应字段按 console/static/js/chat.js 的「和 MaiWork 聊」页来断言。
 """
 
 from __future__ import annotations

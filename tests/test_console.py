@@ -122,7 +122,7 @@ class TestStaticAndMisc:
 
     @pytest.mark.asyncio
     async def test_index_versions_assets(self, env: SimpleEnv) -> None:
-        """部署新版后浏览器不能还用缓存的旧 app.js / style.css：首页给资源带内容版本号。"""
+        """部署新版后浏览器不能还用缓存的旧脚本 / 样式：入口和样式带内容版本号。"""
         import hashlib
         import re as _re
 
@@ -130,19 +130,48 @@ class TestStaticAndMisc:
 
         r = await env.client.get("/")
         html = await r.text()
-        for name in ("app.js", "style.css"):
+        for name in ("js/main.js", "style.css"):
             m = _re.search(r"/static/" + _re.escape(name) + r"\?v=([0-9a-f]{8,})", html)
             assert m, f"{name} 没带版本号"
             digest = hashlib.sha256((_srv._STATIC_DIR / name).read_bytes()).hexdigest()
             assert digest.startswith(m.group(1))
-        r2 = await env.client.get("/static/app.js?v=abc")
+        assert '<script type="module" src="/static/js/main.js?v=' in html
+        r2 = await env.client.get("/static/js/main.js?v=abc")
         assert r2.status == 200
 
     @pytest.mark.asyncio
+    async def test_index_import_map_versions_every_module(self, env: SimpleEnv) -> None:
+        """前端拆成多个模块后，被入口 import 的模块也要带版本号（写在 import map 里），
+        否则部署后浏览器可能拿缓存里的旧模块，新旧代码混用。"""
+        import hashlib
+        import re as _re
+
+        from CharTyr_MaiWork.maiwork.console import server as _srv
+
+        r = await env.client.get("/")
+        html = await r.text()
+        m = _re.search(r'<script type="importmap">(.*?)</script>', html, _re.S)
+        assert m, "首页没有 import map"
+        # import map 必须在第一个模块脚本之前
+        assert html.index('type="importmap"') < html.index('type="module"')
+        imports = json.loads(m.group(1))["imports"]
+        js_dir = _srv._STATIC_DIR / "js"
+        mods = sorted(p for p in js_dir.rglob("*.js") if not p.name.startswith("._"))
+        assert len(mods) > 5
+        for p in mods:
+            url = "/static/" + p.relative_to(_srv._STATIC_DIR).as_posix()
+            assert url in imports, f"{url} 不在 import map 里"
+            ver = hashlib.sha256(p.read_bytes()).hexdigest()[:12]
+            assert imports[url] == f"{url}?v={ver}"
+
+    @pytest.mark.asyncio
     async def test_static_files_served(self, env: SimpleEnv) -> None:
-        r = await env.client.get("/static/app.js")
+        r = await env.client.get("/static/js/api.js")
         assert r.status == 200
         assert "api(" in (await r.text())
+        assert "javascript" in r.headers.get("Content-Type", "")
+        # 旧的单文件已经拆掉，不留两份
+        assert not (Path(__file__).resolve().parent.parent / "maiwork/console/static/app.js").exists()
 
     @pytest.mark.asyncio
     async def test_group_short_link_redirects(self, env: SimpleEnv) -> None:

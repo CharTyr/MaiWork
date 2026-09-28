@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +26,7 @@ logger = logging.getLogger("maiwork.console.server")
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-# 首页里的 app.js / style.css 带内容版本号（?v=前 12 位 sha256）：部署新版后浏览器必定拿新文件，
+# 首页里的 js/main.js / style.css 和 import map 里的每个前端模块都带内容版本号（?v=前 12 位 sha256）：部署新版后浏览器必定拿新文件，
 # 不会用启发式缓存里的旧版。按 (mtime, size) 缓存，文件没变不重算。
 _ASSET_VER_CACHE: dict[str, tuple[tuple[float, int], str]] = {}
 
@@ -47,13 +48,36 @@ def _asset_version(name: str) -> str:
     return ver
 
 
+def _js_modules() -> list[str]:
+    """static/js 下的所有前端模块（相对 static/ 的路径，稳定排序；跳过 macOS 的 ._ 文件）。"""
+    js_dir = _STATIC_DIR / "js"
+    if not js_dir.is_dir():
+        return []
+    return sorted(
+        p.relative_to(_STATIC_DIR).as_posix() for p in js_dir.rglob("*.js") if not p.name.startswith("._")
+    )
+
+
 def _index_html() -> str:
+    """首页：入口脚本和样式带版本号；入口 import 的其余模块经 import map 也带上版本号。
+    这样前端不用编译、拆成多个文件，部署后浏览器也不会新旧模块混用。"""
     html = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    for name in ("app.js", "style.css"):
+    for name in ("js/main.js", "style.css"):
         ver = _asset_version(name)
         if ver:
             html = html.replace(f'"/static/{name}"', f'"/static/{name}?v={ver}"')
+    imports = {}
+    for name in _js_modules():
+        ver = _asset_version(name)
+        if ver:
+            imports[f"/static/{name}"] = f"/static/{name}?v={ver}"
+    at = html.find('<script type="module"')
+    if imports and at != -1:
+        tag = '<script type="importmap">' + json.dumps({"imports": imports}, indent=1) + "</script>\n  "
+        html = html[:at] + tag + html[at:]
     return html
+
+
 _TOKEN_CHARS = frozenset("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789")
 
 Handler = Callable[[web.Request], Awaitable[web.Response]]
@@ -2488,9 +2512,9 @@ class ConsoleServer:
 
         app.router.add_post("/api/identity/soul/sync", self._write(_identity_soul_sync))
 
-        # ---------- 和 MaiWork 聊：管理员对话（只管理员；配套 static/app.js 的对话页） ----------
+        # ---------- 和 MaiWork 聊：管理员对话（只管理员；配套 static/js/chat.js 的对话页） ----------
         #
-        # 返回结构按 static/app.js 的「和 MaiWork 聊」页：
+        # 返回结构按 static/js/chat.js 的「和 MaiWork 聊」页：
         #   GET    /api/chat                     → {"chats": [...]}
         #   POST   /api/chat                     → 新对话（单个 chat）
         #   PATCH  /api/chat/{id}                → 改标题 / 聚焦群 / 归档（单个 chat）

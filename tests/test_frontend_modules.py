@@ -1,0 +1,59 @@
+"""网页前端（console/static/js）的结构检查：不用编译，浏览器直接加载原生 ES 模块。
+
+这里不跑浏览器，只做静态检查，挡住拆文件时最容易出的错：
+- import 的文件不存在 / 引了对方没 export 的名字（浏览器里整页白屏）；
+- 某个模块没人引用（它注册的事件就不会生效）；
+- 单个文件又长回几千行。
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+
+STATIC = Path(__file__).resolve().parent.parent / "maiwork" / "console" / "static"
+JS = STATIC / "js"
+MAX_LINES = 900
+
+_IMPORT = re.compile(r'^import\s+(?:\{([^}]*)\}\s+from\s+)?"([^"]+)";', re.M)
+_EXPORT = re.compile(r"^export\s+(?:async\s+)?(?:function\*?|const|let|class)\s+([A-Za-z_$][\w$]*)", re.M)
+
+
+def _modules() -> list[Path]:
+    if not JS.is_dir():
+        raise AssertionError(f"找不到前端模块目录 {JS}")
+    return sorted(p for p in JS.rglob("*.js") if not p.name.startswith("._"))
+
+
+def test_index_loads_only_the_entry_module() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    assert '<script type="module" src="/static/js/main.js"></script>' in html
+    assert "app.js" not in html
+
+
+def test_imports_resolve_and_names_are_exported() -> None:
+    mods = _modules()
+    exports = {p: set(_EXPORT.findall(p.read_text(encoding="utf-8"))) for p in mods}
+    reached: set[Path] = set()
+    for p in mods:
+        text = p.read_text(encoding="utf-8")
+        for names, spec in _IMPORT.findall(text):
+            assert spec.startswith("./") or spec.startswith("../"), f"{p.name}: 只用相对路径 import（{spec}）"
+            target = (p.parent / spec).resolve()
+            assert target.exists(), f"{p.relative_to(JS)} import 的 {spec} 不存在"
+            reached.add(target)
+            for n in [x.strip() for x in names.split(",") if x.strip()]:
+                assert n in exports[target], f"{p.relative_to(JS)} 引了 {spec} 里没 export 的 {n}"
+    orphans = [p.relative_to(JS).as_posix() for p in mods if p.name != "main.js" and p.resolve() not in reached]
+    assert not orphans, f"这些模块没人 import，不会被加载：{orphans}"
+
+
+def test_every_module_is_short() -> None:
+    long = {}
+    for p in _modules():
+        n = p.read_text(encoding="utf-8").count("\n")
+        if n > MAX_LINES:
+            long[p.relative_to(JS).as_posix()] = n
+    assert not long, f"这些文件太长了，拆一拆（上限 {MAX_LINES} 行）：{long}"
