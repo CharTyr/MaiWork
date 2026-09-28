@@ -1,5 +1,11 @@
 # MaiWork
 
+### 截图
+
+![资讯](docs/images/news.png)
+
+![手机](docs/images/mobile.png)
+
 **MaiBot（MaiSaka）的常驻生产力Agent**
 
 补全 MaiBot 的群聊生产力能力：为 MaiBot 提供一个并行的完整 Agent，理解一个群，主动找资讯、提构想、追目标，交付任何工作。
@@ -73,50 +79,6 @@
 - **设置**：模型、群、派活批准、推送节奏、扩展（MCP 和 skill）、干活用的机器等。
 
 已适配手机、平板、PC端
-
-### 截图
-
-> 截图里的群、成员和内容都是演示用的假数据。
-
-**资讯**：按群里在聊的话题找来的新消息，写明为什么发、可能谁用得上。
-
-![资讯](docs/images/news.png)
-
-**构想**：MaiWork 想到的「我可以帮你们做这个」，列出包含哪几件事，勾选想要的就能开工。
-
-![构想](docs/images/ideas.png)
-
-**目标**：长期推进的事，有完成标准和进度，MaiWork 定期检查。
-
-![目标](docs/images/goals.png)
-
-**任务 · 进行中**：待批准的活、全部任务，以及每一步在做什么。
-
-![任务进行中](docs/images/task-running.png)
-
-**任务 · 已交付**：验收意见和交付结果（群文件、临时网页）。
-
-![任务已交付](docs/images/task-delivered.png)
-
-**群**：群脉搏（什么时候热闹、什么时候冷场）、开话题记录、群画像。
-
-![群](docs/images/group.png)
-
-**和 MaiWork 聊**：直接问进度、让它开任务。
-
-![和 MaiWork 聊](docs/images/chat.png)
-
-**设置 · 总览**：各个群的情况、今天的用量、各部分运行状态。
-
-![设置总览](docs/images/settings.png)
-
-**设置 · 用量**：每天主模型和子 agent 用了多少。
-
-![用量](docs/images/usage.png)
-
-**手机上**
-
-![手机](docs/images/mobile.png)
 
 ## 许可
 
