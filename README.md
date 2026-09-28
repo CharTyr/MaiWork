@@ -13,7 +13,7 @@
 [![Stars](https://img.shields.io/github/stars/CharTyr/MaiWork)](https://github.com/CharTyr/MaiWork/stargazers)
 [![Issues](https://img.shields.io/github/issues/CharTyr/MaiWork)](https://github.com/CharTyr/MaiWork/issues)
 
-[核心特性](#核心特性) • [功能概览](#功能概览) • [运行环境](#运行环境) • [专用机器](#专用机器自己的-vps--vm可以配多台) • [快速开始](#快速开始) • [配置项说明](#配置项说明) • [指令](#指令) • [安全与公开范围](#安全与公开范围) • [常见问题](#常见问题)
+[核心特性](#核心特性) • [功能概览](#功能概览) • [界面一览](#界面一览) • [运行环境](#运行环境) • [专用机器](#专用机器自己的-vps--vm可以配多台) • [快速开始](#快速开始) • [配置项说明](#配置项说明) • [指令](#指令) • [安全与公开范围](#安全与公开范围) • [常见问题](#常见问题)
 
 **在线看网页演示：[dewy-vow-gebh.here.now](https://dewy-vow-gebh.here.now/)**
 
@@ -24,8 +24,7 @@
 > 基本功能已完成，仍在持续迭代。
 
 <div align="center">
-<img src="docs/images/news.png" width="68%" alt="资讯页" />
-<img src="docs/images/mobile.png" width="24%" alt="手机端" />
+<img src="docs/images/news.png" width="92%" alt="资讯页" />
 </div>
 
 ---
@@ -67,6 +66,28 @@
 - **群**：MaiWork 眼里这个群的样子（群画像、关注成员），管理员可以改。
 - **和 MaiWork 聊**：管理员直接问进度、提要求、调整做法。
 - **设置**：模型、群、派活批准、推送节奏、扩展（MCP 和 skill）、干活用的机器等。
+
+---
+
+## 界面一览
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/ideas.png" alt="构想" /><br /><sub><b>构想</b>：从群聊里想到「可以帮你们做这个」，写清包含哪几件事</sub></td>
+<td width="50%"><img src="docs/images/task-delivered.png" alt="任务" /><br /><sub><b>任务</b>：等批准、进行中、交付；每一步谁做了什么都看得到</sub></td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/images/chat.png" alt="和 MaiWork 聊" /><br /><sub><b>和 MaiWork 聊</b>：管理员直接问进度、提要求</sub></td>
+<td width="50%"><img src="docs/images/settings.png" alt="设置" /><br /><sub><b>运行状态</b>：模型、搜索、本机干活、专用机器、一次性 VM 一眼看清</sub></td>
+</tr>
+</table>
+
+<div align="center">
+<img src="docs/images/mobile.png" width="92%" alt="手机端" />
+<br /><sub>手机上也能用：资讯、构想详情、任务批准</sub>
+</div>
+
+截图来自[在线演示](https://dewy-vow-gebh.here.now/)，群、成员和内容都是虚构的。
 
 ---
 

@@ -115,3 +115,13 @@ def test_health_ok_and_warn() -> None:
 
 def test_health_none_when_no_ssh_env() -> None:
     assert _ssh_health(types.SimpleNamespace(ssh=None, get_settings=lambda: None)) is None
+
+
+def test_health_icons_exist_in_icon_set() -> None:
+    """运行状态各项的图标都得是 static/assets/icons 里真有的（不然前端回落成星星）。"""
+    import re
+
+    icons = {p.stem for p in (Path(__file__).resolve().parents[1] / "maiwork" / "console" / "static" / "assets" / "icons").glob("*.png")}
+    src = (Path(__file__).resolve().parents[1] / "maiwork" / "console" / "views.py").read_text(encoding="utf-8")
+    used = set(re.findall(r'"key": "[a-z_]+", "icon": "([a-z]+)"', src))
+    assert used and used <= icons, used - icons

@@ -787,13 +787,13 @@ def _search_health(svc: Any) -> dict[str, Any]:
     """
     search = getattr(svc, "search", None)
     if search is None:
-        return {"key": "search", "icon": "search", "name": "搜索", "state": "warn",
+        return {"key": "search", "icon": "magnifier", "name": "搜索", "state": "warn",
                 "text": "还没选：去「设置 → 扩展」选一个"}
     try:
         ok, text = search.status()
     except Exception:
         ok, text = False, "搜索状态读不出来（扩展还没就位？）"
-    return {"key": "search", "icon": "search", "name": "搜索", "state": "ok" if ok else "warn", "text": text}
+    return {"key": "search", "icon": "magnifier", "name": "搜索", "state": "ok" if ok else "warn", "text": text}
 
 
 def _ssh_health(svc: Any) -> dict[str, Any] | None:
@@ -806,7 +806,7 @@ def _ssh_health(svc: Any) -> dict[str, Any] | None:
     ssh = getattr(svc, "ssh", None)
     if ssh is None:
         return None
-    base = {"key": "ssh", "icon": "server", "name": "专用机器"}
+    base = {"key": "ssh", "icon": "monitor", "name": "专用机器"}
     try:
         pub = str(ssh.public_key() or "")
     except Exception:
@@ -891,7 +891,7 @@ def _groupspace_health(svc: Any) -> dict[str, Any]:
     - 适配器开放了（探测到新版接口）→ ok「能管群文件 / 公告 / 相册（按群看身份）」；
     - 没开放（旧版 0.8.5）→ warn「QQ 适配器是旧版…升级到 v1.0.1 后自动开放」。
     """
-    base = {"key": "group_space", "icon": "folder", "name": "群空间"}
+    base = {"key": "group_space", "icon": "filebox", "name": "群空间"}
     gs = getattr(svc, "group_space", None)
     if gs is None:
         return {**base, "state": "off", "text": "已关闭"}
