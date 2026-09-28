@@ -26,6 +26,9 @@
 <div align="center">
 <img src="docs/images/news.png" width="92%" alt="资讯页" />
 </div>
+<div align="center">
+<img src="docs/images/mobile.png" width="92%" alt="手机端" />
+</div>
 
 ---
 
