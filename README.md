@@ -43,7 +43,8 @@ https://dewy-vow-gebh.here.now/
 1. 一个正在运行的 **MaiBot**（插件 SDK 2.x）。
 2. 一个 **OpenAI 兼容的模型接口**：填一个「主模型」负责想和验收，一个「干活模型」负责执行。可以是同一个。
 3. 一个**能联网搜索的 MCP**（比如 Tavily、You.com、EXA 的托管 MCP）：找资讯和做调研要用。
-4. 可选：Jev（TypeSafe）密钥，让一些快速判断更快更省。
+4. 可选：Jev 模型的（TypeSafe）密钥，让一些快速判断更快更省。
+5. 可选：默认情况下，MaiWork会在本地隔离环境工作，可为 MaiWork 单独准备一台VPS、VM，可选使用 railway.new 的 一次性VM。
 
 ## 安装
 
