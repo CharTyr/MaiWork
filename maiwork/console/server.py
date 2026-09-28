@@ -666,6 +666,11 @@ class ConsoleServer:
             }
             if body.get("api_key"):
                 patch["api_key"] = str(body["api_key"])
+            # 表单里的重试 / 请求频率 / 上下文长度：原样转给 save（它校验范围，越界报 400）；
+            # 没传的保留当前值。以前这里漏转，网页点保存后又显示回旧值。
+            for key in ("retries", "retry_delay_s", "max_concurrency", "max_rpm", "context_window"):
+                if body.get(key) is not None:
+                    patch[key] = body[key]
             try:
                 models = svc.models.save(patch)
             except ValueError as e:

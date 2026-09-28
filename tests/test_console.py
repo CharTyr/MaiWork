@@ -574,6 +574,30 @@ class TestAdminOps:
         assert t["ok"] is False
         assert SECRET not in json.dumps(t)
 
+    @pytest.mark.asyncio
+    async def test_models_save_keeps_retry_rate_and_context(self, env: SimpleEnv) -> None:
+        """网页「模型」表单里的重试、请求频率、上下文长度：点保存后要真的存下，
+        不能被路由丢掉、再显示回原来的值（用户实测踩到）。"""
+        await env.login()
+        body = {
+            "base_url": "https://new.test/v1", "main": "m2", "worker": "w2",
+            "retries": 3, "retry_delay_s": 20, "max_concurrency": 5, "max_rpm": 30, "context_window": 200000,
+        }
+        r = await env.client.put("/api/settings/models", json=body)
+        assert r.status == 200, await r.text()
+        data = await r.json()
+        want = {k: body[k] for k in ("retries", "retry_delay_s", "max_concurrency", "max_rpm", "context_window")}
+        assert {k: data[k] for k in want} == want
+        # 重新拉设置页也是新值
+        s = await (await env.client.get("/api/settings")).json()
+        assert {k: s["models"][k] for k in want} == want
+        # 越界值要报错，不能悄悄吞掉
+        r = await env.client.put("/api/settings/models", json={**body, "max_concurrency": 99})
+        assert r.status == 400
+        # 不传这几项 = 保留当前值
+        r = await env.client.put("/api/settings/models", json={"base_url": "https://new.test/v1", "main": "m2", "worker": "w2"})
+        assert {k: (await r.json())[k] for k in want} == want
+
 
 # ----------------------------------------------------------------------
 # Settings 视图结构
