@@ -44,6 +44,11 @@ class CountingWorkers:
     async def run(self, brief: str, **kwargs: Any) -> Any:
         self.calls.append({"brief": brief, **kwargs})
         mark = str(kwargs.get("task_id") or "")
+        if not mark.startswith("feeds-collect:"):
+            # 补打开的子 agent（news_recheck）：这里只测找资讯那一轮的统计，它不落工具记录
+            if isinstance(self.report, BaseException):
+                raise self.report
+            return self.report
         with self._store.tx() as conn:
             for tool, ok, inp in self.rows:
                 conn.execute(
@@ -60,8 +65,10 @@ def _rows() -> list[tuple[str, bool, str]]:
     return [
         ("web_search", True, "搜 1"),
         ("web_search", False, "搜 2（失败也算搜了一次）"),
-        ("fetch_page", True, "https://a.example/1"),
-        ("fetch_page", True, "https://a.example/2"),
+        # 打开记录要对得上候选的链接：说打开过却没记录的候选会被派去补打开（news_recheck）
+        ("fetch_page", True, "https://example.com/board"),
+        ("fetch_page", True, "https://news.com/llm-deploy"),
+        ("fetch_page", True, "https://food.com/peach"),
         ("fetch_page", False, "https://a.example/3"),  # 没打开的页不算「看过」
     ]
 
@@ -81,11 +88,11 @@ def test_batch_stats_recorded_and_exposed(tmp_path) -> None:
     assert counting.calls and str(counting.calls[0].get("task_id") or "")
     assert len(batches) == 1
     stats = batches[0]["stats"]
-    assert stats == {"searches": 2, "pages": 2, "kept": 2}
+    assert stats == {"searches": 2, "pages": 3, "kept": 2}
 
     # 批次记录上真的落了 kv（按 batch id，不动 store.py 的表结构）
     saved = store.kv_get(f"feeds.batch_stats.{batches[0]['id']}")
-    assert saved == {"searches": 2, "pages": 2, "kept": 2}
+    assert saved == {"searches": 2, "pages": 3, "kept": 2}
 
 
 def test_skipped_batch_stats_all_zero(tmp_path) -> None:
@@ -153,5 +160,5 @@ def test_stats_of_one_batch_do_not_leak_into_another(tmp_path) -> None:
 
     assert len(batches) == 2
     by_id = {b["id"]: b["stats"] for b in batches}
-    assert by_id[1] == {"searches": 2, "pages": 2, "kept": 2}
+    assert by_id[1] == {"searches": 2, "pages": 3, "kept": 2}
     assert by_id[2] == {"searches": 1, "pages": 1, "kept": 1}

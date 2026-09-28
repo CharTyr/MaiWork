@@ -748,6 +748,20 @@ class Feeds:
             )
             return 0
 
+        # ②.2 补打开（2026-09-29）：没真打开过原文的候选，派一个子 agent 一批打开 + 对照原文核对
+        # （news_recheck.py）；出任何错都不拖累这轮，候选原样往下走、照旧按没打开淘汰
+        recheck_mark = collect_mark.replace("feeds-collect:", "feeds-recheck:", 1)
+        try:
+            from . import news_recheck
+
+            await news_recheck.recheck(
+                self._store, self._workers, gid, candidates,
+                collect_mark=collect_mark, recheck_mark=recheck_mark,
+                parse_published=_parse_published, normalize_url=_normalize_url, site_of=_site_of,
+            )
+        except Exception:
+            logger.exception("资讯补打开意外出错（群 %s），这轮跳过补打开", gid)
+
         # ②.5 RSS 条目并进候选池（≤_RSS_MERGE_CAP 条，新的在前、跨源轮询）：
         # 从这里往后和搜索候选完全同一套硬淘汰 / 新鲜度 / 打分 / 话题饱和，不另开绿灯。
         merged_rss = self._merge_rss_candidates(gid, settings, candidates, rss_items)
@@ -765,7 +779,7 @@ class Feeds:
                 logger.info("备资讯-打分失败（群 %s）：%s", gid, e)
                 self._skipped_batch(
                     gid, f"模型打分失败：{e}", found=len(candidates),
-                    stats=self._collect_stats(collect_mark),
+                    stats=self._round_stats(collect_mark),
                 )
                 return 0
             # 第一道（模型侧）：不扎实 / 垃圾 / 同一件事（含 dup_of 指到已发布的）
@@ -834,7 +848,7 @@ class Feeds:
             accepted_items=accepted,
             ttl_h=ttl_h,
             note=note,
-            stats=self._collect_stats(collect_mark),
+            stats=self._round_stats(collect_mark),
         )
         del batch_id  # 目前不对外用
         # 第三道：kind=news、avg≥pool_min_avg、relevance≥4、chat≥4、48 小时内、非敏感；
@@ -885,6 +899,8 @@ class Feeds:
             url_key = item["url_key"]
             site = item.get("site") or _site_of(item["url"])
             item["site"] = site
+            if item.get("reject"):
+                continue  # 补打开核对已经给了淘汰理由（旧闻 / 原文不支持），别覆盖
             if not item.get("fetched") or not str(item.get("quote") or "").strip():
                 item["reject"] = ("hard", "原文没打开过/打不开")
             elif item.get("paywall"):
@@ -1142,6 +1158,13 @@ class Feeds:
     # ------------------------------------------------------------------
     # 每轮统计（搜了几次 / 看了几篇 / 收了几条）
     # ------------------------------------------------------------------
+
+    def _round_stats(self, collect_mark: str) -> dict:
+        """这一轮的工具用量：找资讯的子 agent + 补打开的子 agent 加起来。"""
+        from .news_recheck import merge_stats
+
+        recheck_mark = str(collect_mark or "").replace("feeds-collect:", "feeds-recheck:", 1)
+        return merge_stats(self._collect_stats(collect_mark), self._collect_stats(recheck_mark))
 
     def _collect_stats(self, task_id: str) -> dict:
         """这轮子 agent 的工具用量：searches=web_search 调用数，pages=fetch_page 成功数。
