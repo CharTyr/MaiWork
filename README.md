@@ -48,7 +48,9 @@ https://dewy-vow-gebh.here.now/
 
 ## 安装
 
-1. 把 `plugin/CharTyr_MaiWork` 整个目录放进 MaiBot 的 `plugins/` 目录。
+1. 把插件装进 MaiBot 的 `plugins/` 目录，二选一：
+   - 插件中心收录后：在 MaiBot WebUI 的插件市场搜「MaiWork」安装。
+   - 手动：在 `plugins/` 目录里执行 `git clone https://github.com/CharTyr/MaiWork.git`（或下载 ZIP 解压进去）。本仓库的根目录就是插件目录。
 2. 在这个目录里把 `config.example.toml` 复制一份，改名为 `config.toml`，或在 MaiBot 的 WebUI 插件配置里直接修改 MaiWork 的配置，至少改两处：
 
    ```toml

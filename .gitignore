@@ -1,11 +1,15 @@
-._*
-.DS_Store
+# 运行时文件：由插件生成，含密钥/个人数据，永远不进仓库
+config.toml
+config_back/
+data/
+.maibot-release.json
+.update_backups/
+*.db
+*.db-wal
+*.db-shm
 __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
-# 线上运行时配置含密钥，永远不进仓库
-plugin/CharTyr_MaiWork/config.toml
-*.db
-*.db-wal
-*.db-shm
+.DS_Store
+._*

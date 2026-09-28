@@ -1,0 +1,53 @@
+{
+  "manifest_version": 2,
+  "id": "chartyr.maiwork",
+  "version": "0.4.0",
+  "name": "MaiWork",
+  "description": "MaiBot 群聊生产力 Agent：和 MaiBot 并行运行，理解群、主动找资讯、提构想、追目标，接群友派的活并交付。默认关闭。",
+  "plugin_type": "extension",
+  "author": {
+    "name": "CharTyr",
+    "url": "https://github.com/CharTyr"
+  },
+  "license": "GPL-3.0-or-later",
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "config.get",
+    "message.get_by_time_in_chat",
+    "knowledge.search",
+    "person.get_id",
+    "person.get_value",
+    "chat.get_stream_by_group_id",
+    "chat.get_group_streams",
+    "api.call",
+    "api.list",
+    "send.hybrid",
+    "maisaka.proactive.trigger"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "display": {
+    "icon": {
+      "type": "lucide",
+      "value": "briefcase"
+    }
+  },
+  "urls": {
+    "repository": "https://github.com/CharTyr/MaiWork",
+    "homepage": "https://github.com/CharTyr/MaiWork",
+    "documentation": "https://github.com/CharTyr/MaiWork/blob/main/README.md",
+    "issues": "https://github.com/CharTyr/MaiWork/issues"
+  }
+}
