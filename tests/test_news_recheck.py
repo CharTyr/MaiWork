@@ -257,3 +257,70 @@ def test_batch_stats_count_recheck_pages(tmp_path) -> None:
     batch = store.read().execute("SELECT id FROM news_batches ORDER BY id DESC LIMIT 1").fetchone()
     stats = store.kv_get(f"feeds.batch_stats.{int(batch['id'])}")
     assert stats["pages"] == 1 and stats["searches"] == 1
+
+
+def _log_mcp_fetch(store: Store, task_id: str, url: str, *, ok: bool = True, final: str = "") -> None:
+    import json as _json
+    inp = _json.dumps({"url": url}, ensure_ascii=False)
+    out = f"Title: 标题\nURL: {final or url}\n\n正文……" if ok else ""
+    with store.tx() as conn:
+        conn.execute(
+            "INSERT INTO tool_calls (ts, group_id, task_id, actor, tool, input, output, ok)"
+            " VALUES (?, ?, ?, '子 agent #1', 'mcp_keenable_fetch_page_content', ?, ?, ?)",
+            (NOW, GID, task_id, inp, out, 1 if ok else 0),
+        )
+
+
+def test_mcp_fetch_page_content_counts_as_opened(tmp_path):
+    """资讯收集用扩展抓正文工具 mcp_keenable_fetch_page_content 打开过原文的候选：
+    不再被当成「说打开过但没打开」送去补打开。本地直接对 opened_links 断言。"""
+    from CharTyr_MaiWork.maiwork.news_recheck import opened_links
+
+    store = Store(tmp_path / "t.db")
+    store.migrate()
+    try:
+        tid = "feeds-collect:900000001:1"
+        _log_mcp_fetch(store, tid, "https://mcp.example/news-1")
+        _log_search(store, tid)  # 搜索记录不算打开
+        opened, records = opened_links(store, tid)
+        assert records == 2
+        assert "mcp.example/news-1" in opened
+    finally:
+        store.close()
+
+
+def test_mcp_search_tool_does_not_count_as_opened(tmp_path):
+    from CharTyr_MaiWork.maiwork.news_recheck import opened_links
+
+    store = Store(tmp_path / "t.db")
+    store.migrate()
+    try:
+        tid = "feeds-collect:900000001:2"
+        with store.tx() as conn:
+            conn.execute(
+                "INSERT INTO tool_calls (ts, group_id, task_id, actor, tool, input, output, ok)"
+                " VALUES (?, ?, ?, '子 agent #1', 'mcp_keenable_search_web_pages',"
+                " '{\"query\": \"q\"}', '1. x https://search.example/hit', 1)",
+                (NOW, GID, tid),
+            )
+        opened, records = opened_links(store, tid)
+        assert records == 1
+        assert "search.example/hit" not in opened
+    finally:
+        store.close()
+
+
+def test_mcp_final_url_line_counts_as_opened(tmp_path):
+    """抓正文工具 output 里「URL: <最终地址>」也算打开过（跳转 / 带参数的最终地址）。"""
+    from CharTyr_MaiWork.maiwork.news_recheck import opened_links
+
+    store = Store(tmp_path / "t.db")
+    store.migrate()
+    try:
+        tid = "feeds-collect:900000001:3"
+        _log_mcp_fetch(store, tid, "https://short.example/s", final="https://long.example/final?a=1")
+        opened, records = opened_links(store, tid)
+        assert "short.example/s" in opened
+        assert "long.example/final?a=1" in opened
+    finally:
+        store.close()

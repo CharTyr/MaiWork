@@ -229,11 +229,11 @@ function skillRow(k) {
     <div class="ext-row">
       ${ico("books")}
       <div class="ext-main">
-        <div class="set-name">${esc(k.name)}${k.source === "file" ? `<span class="tag">服务器上放的</span>` : ""}</div>
+        <div class="set-name">${esc(k.name)}${k.source === "file" ? `<span class="tag">服务器上放的</span>` : k.source === "builtin" ? `<span class="tag">内置</span>` : ""}</div>
         <div class="set-text">${esc(k.description || "没写描述")}</div>
         <div class="set-text ext-st">给${esc(roles)}用${k.updated_ts ? ` · ${esc(dayWord(k.updated_ts))}改过` : ""}</div>
       </div>
-      <div class="row-btns ext-btns"><button class="btn small" data-act="ext-edit" data-kind="skill" data-name="${esc(k.name)}">改</button></div>
+      <div class="row-btns ext-btns"><button class="btn small" data-act="ext-edit" data-kind="skill" data-name="${esc(k.name)}">${k.source === "builtin" ? "看" : "改"}</button></div>
     </div>`;
 }
 
@@ -241,6 +241,20 @@ function skillForm(k) {
   const isNew = !k;
   const d = (state.extEdit && state.extEdit.data) || {};
   if (!isNew && !state.extEdit.data) return `<div class="ext-form">${loading()}</div>`;
+  if (d.source === "builtin") {
+    // 内置 skill 随插件发布：只能看，不能改删（要改标准得发新版本）
+    return `
+    <div class="login ext-form">
+      <div class="ext-form-h">${esc(k.name)}<span class="tag">内置</span></div>
+      <p class="fine" style="margin:0">随 MaiWork 一起发布，这里只能看。给${esc(roleText(d.roles))}用。</p>
+      <label>一句话描述</label>
+      <p class="set-text" style="margin:0">${esc(d.description || "")}</p>
+      <label for="k-body">内容</label>
+      <textarea id="k-body" class="mono-area" rows="14" readonly spellcheck="false">${esc(d.body || "")}</textarea>
+      ${(d.files || []).length ? `<p class="fine" style="margin:0">附带文件：${d.files.map(esc).join("、")}</p>` : ""}
+      <div class="actions"><button type="button" class="btn" data-act="ext-cancel">收起</button></div>
+    </div>`;
+  }
   return `
     <form id="skill-form" class="login ext-form" autocomplete="off" data-name="${esc(isNew ? "" : k.name)}">
       <div class="ext-form-h">${isNew ? "加一个 skill" : `改 ${esc(k.name)}`}</div>

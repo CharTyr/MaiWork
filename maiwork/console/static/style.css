@@ -1429,3 +1429,37 @@ body.onb-lock { overflow: hidden; }
 .cm-summary-h svg { flex: none; width: 16px; height: 16px; transition: transform 0.2s var(--ease-out); }
 .cm-summary.open .cm-summary-h svg { transform: rotate(180deg); }
 .cm-summary-b { padding: 0 16px 14px; font-size: 14px; line-height: 1.65; color: var(--ink-2); }
+
+
+/* ───────────── 更新提醒（只给总管理员） ───────────── */
+
+.upd-banner {
+  display: flex; align-items: center; gap: 12px;
+  margin: 0 0 18px; padding: 10px 10px 10px 16px;
+  border-radius: 16px; background: var(--alt-bg); color: var(--ink);
+}
+.upd-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--blue); }
+.upd-t { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; font-size: 14px; line-height: 1.45; }
+.upd-t span { color: var(--gray); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upd-banner .btn.small { flex: none; }
+.upd-x {
+  flex: none; width: 36px; height: 36px; border-radius: 50%;
+  display: grid; place-items: center; color: var(--gray);
+  transition: background 0.2s, transform 0.18s var(--ease-out);
+}
+.upd-x:hover { background: var(--fill); }
+.upd-x:active { transform: scale(0.94); }
+.upd-x svg { width: 16px; height: 16px; }
+.upd-card { margin: 4px 0 8px; padding: 14px 16px; border-radius: 16px; background: var(--alt-bg); }
+.upd-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; font-size: 15px; }
+.upd-head span { color: var(--gray); font-size: 13px; }
+.upd-notes { margin: 8px 0 0; font-size: 14px; line-height: 1.55; }
+.upd-steps { margin: 10px 0 0; padding-left: 20px; font-size: 14px; line-height: 1.6; color: var(--ink); }
+.upd-steps li + li { margin-top: 4px; }
+.upd-card .actions { margin-top: 12px; }
+a.btn { display: inline-flex; align-items: center; text-decoration: none; }
+
+/* 资讯「拓展」：从群的哪条兴趣跳过来的（bridge） */
+.ntag.ex { background: rgba(175, 82, 222, 0.12); color: var(--purple); }
+.n-bridge { display: flex; gap: 6px; margin: 4px 0 2px; font-size: 13px; line-height: 1.5; color: var(--gray); }
+.n-bridge span { flex: none; color: var(--purple); }

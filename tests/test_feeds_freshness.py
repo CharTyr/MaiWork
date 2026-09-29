@@ -682,9 +682,10 @@ class TestNewsFreshness:
         assert _rejected_rows(store) == []
 
     def test_old_guide_not_hard_rejected(self, tmp_path) -> None:
-        """好文（kind=guide）不受 7 天硬规则限制——旧好文只要现在还适用照样收。"""
+        """好文（kind=guide）不受资讯的 7 天硬规则限制——180 天内的文章只要现在还适用照样收
+        （2026-09-29 起文章另有 180 天硬线，见 test_news_guide.py）。"""
         items = [_cand(0, kind="guide", url="https://tut.cn/z", title="经典老教程",
-                       published=NOW - 400 * 86400)]
+                       published=NOW - 100 * 86400)]
         store, settings, feeds, models, workers, topics, _ = _make_feeds(
             tmp_path,
             models=FakeModelsQueue(ready=True, replies=[
@@ -704,7 +705,7 @@ class TestNewsFreshness:
         items = [
             _cand(0, url="https://a.cn/n1", title="量子芯片全新架构发布"),
             _cand(1, kind="guide", url="https://b.cn/g1", title="本地部署实战全记录",
-                  published=NOW - 400 * 86400),
+                  published=NOW - 100 * 86400),
         ]
         store, settings, feeds, models, workers, topics, _ = _make_feeds(
             tmp_path,
@@ -712,7 +713,8 @@ class TestNewsFreshness:
                 _FOCUS_JSON,
                 _scores_json(
                     _score(0, topic="甲", timeliness=2.0),   # 资讯不新鲜 → 拒
-                    _score(1, topic="乙", timeliness=2.0),   # 好文 timeliness 低不关「不够新」的事
+                    # 好文 timeliness 低不关「不够新」的事（info=5 让平均够文章的 3.8 线）
+                    _score(1, topic="乙", timeliness=2.0, info=5),
                 ),
                 _posts_json(_post(0, "本地部署实战全记录")),
             ]),

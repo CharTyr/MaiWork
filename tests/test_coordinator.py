@@ -90,7 +90,7 @@ class FakeWorkers:
         self.before_return = None  # async callable()：返回前执行（用来模拟晚到）
 
     async def run(self, brief, *, group_id, tools, task_id="", actor="", max_steps=12,
-                  output_schema=None, workspace=None, system_extra=""):
+                  output_schema=None, workspace=None, system_extra="", artifact_scope=None):
         self.calls.append(
             {
                 "brief": brief,
@@ -102,6 +102,7 @@ class FakeWorkers:
                 "output_schema": output_schema,
                 "workspace": workspace,
                 "system_extra": system_extra,
+                "artifact_scope": artifact_scope,
             }
         )
         if self.before_return is not None:
@@ -644,7 +645,7 @@ async def test_same_workspace_tasks_serialized(
 
     class _Worker:
         async def run(self, brief, *, group_id, tools, task_id="", actor="", max_steps=12,
-                      output_schema=None, workspace=None, system_extra=""):
+                      output_schema=None, workspace=None, system_extra="", artifact_scope=None):
             entered.append(task_id)
             order.append(f"enter:{task_id}")
             await asyncio.sleep(0.05)

@@ -132,6 +132,7 @@ class MaiWorkApp:
         self.card_push: Any = None  # 资讯卡片（card_push.py）
         self.idea_mention: Any = None  # 构想提一嘴（card_push.py）
         self.news_viz: Any = None  # 资讯图解（news_viz.py）
+        self.update_check: Any = None  # 更新提醒（update_check.py；只提醒不自动更新）
         self.delivery: Any = None
         self.herenow: Any = None
         self.coordinator: Any = None
@@ -497,6 +498,17 @@ class MaiWorkApp:
         except Exception:
             logger.exception("资讯图解模块没建起来，这次不做图解")
             self.news_viz = None
+        # 更新提醒：管理员开网页时顺手查 GitHub 最新版本（update_check.py）
+        try:
+            from .update_check import UpdateCheck, local_version
+
+            self.update_check = UpdateCheck(
+                local_version(),
+                enabled=lambda: bool(self.get_settings().console.update_check),
+            )
+        except Exception:
+            logger.exception("更新提醒模块没建起来，这次不查新版")
+            self.update_check = None
         self.delivery = Delivery(self.store, self.outbox, self.tasks)
         self.coordinator = self._make_coordinator()
         # 按群的管理员（group_admins.py）：密码哈希 / 本群管理员名单只进数据库，

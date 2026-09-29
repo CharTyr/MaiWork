@@ -321,6 +321,92 @@ def final_url_from_summary(text: str) -> str:
     return m.group(1) if m else ""
 
 
+# 扩展抓正文工具的 output 约定：经常开头「Title: …\nURL: <最终地址>」——
+# URL: 行也算这个任务真打开过（验收引用核对 / 资讯补打开都要认）。
+_FINAL_URL_LINE_RE = re.compile(r"(?m)^\s*URL[:：]\s*(https?://\S+)", re.IGNORECASE)
+
+
+def _is_extract_like_mcp(tool_name: str) -> bool:
+    """工具名像「扩展的抓正文工具」：mcp_ 开头、匹配抓正文特征、且不像搜索。
+
+    特征正则和 search_binding 的 _EXTRACT_HINT / _SEARCH_HINT 同一份（那边的用途是
+    给前端排序；这里用来判定「这条调用算不算真打开过原文」）。
+    """
+    from .search_binding import _EXTRACT_HINT, _SEARCH_HINT  # noqa: SLF001 — 同一份特征定义，不复制
+
+    name = str(tool_name or "")
+    if not name.startswith("mcp_"):
+        return False
+    if _SEARCH_HINT.search(name):
+        return False
+    return bool(_EXTRACT_HINT.search(name))
+
+
+def _urls_from_json_input(raw: str) -> list[str]:
+    """tool_calls.input 是 JSON 时取其中的 url / urls（列表）/ link；不是 JSON → 原文当一条。"""
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    if not text.startswith("{"):
+        return [text]
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return [text]
+    if not isinstance(parsed, dict):
+        return [text]
+    out: list[str] = []
+    url = str(parsed.get("url") or parsed.get("link") or "").strip()
+    if url:
+        out.append(url)
+    urls = parsed.get("urls")
+    if isinstance(urls, list):
+        out.extend(str(u).strip() for u in urls if str(u or "").strip())
+    return out
+
+
+def opened_urls_from_rows(rows: Any) -> set[str]:
+    """tool_calls 记录（dict 行，键 tool/input/output/ok）→ 真打开过的 URL 集合（规范化）。
+
+    认两类成功（ok=1）的调用（web_search / mcp 搜索工具的结果只算「见过」，不算打开过）：
+    - fetch_page：请求地址（input 是纯串或 JSON {"url": …}）+ output 里的「最终地址」标记都算；
+    - 扩展的抓正文工具（mcp_ 开头、名字像抓正文、不像搜索，见 _is_extract_like_mcp）：
+      input JSON 里的 url / urls / link + output 里「URL: <最终地址>」那一行都算。
+
+    验收引用核对（coordinator._opened_urls）和资讯补打开（news_recheck.opened_links）共用它。
+    """
+    from .coordinator import normalize_link_for_check  # 延迟导入避免循环引用
+
+    opened: set[str] = set()
+    for row in rows or []:
+        try:
+            tool = str(row["tool"] or "")
+            ok = int(row["ok"] or 0)
+            raw_input = str(row["input"] or "")
+            output = str(row["output"] or "")
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not ok:
+            continue
+        urls: list[str] = []
+        if tool == "fetch_page":
+            urls.extend(_urls_from_json_input(raw_input))
+            final = final_url_from_summary(output)
+            if final:
+                urls.append(final)
+        elif _is_extract_like_mcp(tool):
+            urls.extend(_urls_from_json_input(raw_input))
+            for m in _FINAL_URL_LINE_RE.finditer(output):
+                urls.append(m.group(1))
+        else:
+            continue
+        for one in urls:
+            key = normalize_link_for_check(one)
+            if key:
+                opened.add(key)
+    return opened
+
+
 def final_url_note(url: str) -> str:
     """可解析的最终地址标记（fetch_page 的 tool_calls output 摘要 + 正文提示都用它）。"""
     return f"（{FINAL_URL_LABEL}：{url}）"

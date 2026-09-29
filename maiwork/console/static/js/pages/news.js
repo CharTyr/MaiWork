@@ -136,6 +136,7 @@ function newsItem(it, i, guide) {
   const tags = [
     it.topic ? `<span class="ntag">${esc(it.topic)}</span>` : "",
     it.angle === "diverse" ? `<span class="ntag alt">换个角度</span>` : "",
+    it.angle === "explore" ? `<span class="ntag ex">拓展</span>` : "",
     it.sensitive ? `<span class="ntag warn">争议话题</span>` : "",
     it.verify && it.verify.status === "passed" ? `<span class="ntag ok">实测过</span>` : "",
     admin() && sc && Number(sc.avg) > 0 ? `<span class="ntag score" title="${SCORE_NAMES.map(([k, n]) => `${n} ${sc[k] ?? "-"}`).join(" · ")}">${Number(sc.avg).toFixed(1)} 分</span>` : "",
@@ -151,6 +152,7 @@ function newsItem(it, i, guide) {
       <div>
         ${tags ? `<div class="ntags">${tags}</div>` : ""}
         <h2 class="item-title">${esc(it.title)}</h2>
+        ${it.bridge && it.angle === "explore" ? `<p class="n-bridge"><span aria-hidden="true">↳</span>${esc(it.bridge)}</p>` : ""}
         <p class="item-body">${richText(it.body || it.summary)}</p>
         ${img}
         ${verifyBlock(it.verify)}

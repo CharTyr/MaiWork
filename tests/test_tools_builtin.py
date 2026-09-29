@@ -640,3 +640,114 @@ class TestOpenOrder:
     def test_timeout_leaves_room_for_three_ways(self, store, settings):
         tools = _make_r(store, settings, reader=_FakeReader())
         assert tools.get("fetch_page", "worker").timeout_s >= 60
+
+
+class TestOpenedUrlsFromRows:
+    """验收引用核对 / 资讯补打开共用的「打开记录」解析（2026-10 整改：认扩展的抓正文工具）。
+
+    线上事实：子 agent 实际用扩展的抓正文工具 mcp_keenable_fetch_page_content 成功
+    打开了 31 次（input 是 JSON {"url": "https://..."}，output 开头有
+    「Title: …\\nURL: <最终地址>」），全被当成「没打开过」→ 验收判「37 条链接
+    27 条没打开过」→ 失败。
+    """
+
+    def test_fetch_page_json_input_url_counts(self):
+        from CharTyr_MaiWork.maiwork.tools_builtin import opened_urls_from_rows
+
+        rows = [{"tool": "fetch_page", "input": '{"url": "https://a.example/x"}',
+                 "output": "取到正文 500 字", "ok": 1}]
+        opened = opened_urls_from_rows(rows)
+        assert "a.example/x" in opened
+
+    def test_fetch_page_plain_text_input_counts(self):
+        from CharTyr_MaiWork.maiwork.tools_builtin import opened_urls_from_rows
+
+        rows = [{"tool": "fetch_page", "input": "https://a.example/y",
+                 "output": "取到正文", "ok": 1}]
+        opened = opened_urls_from_rows(rows)
+        assert "a.example/y" in opened
+
+    def test_mcp_extract_tool_json_input_counts(self):
+        """mcp_keenable_fetch_page_content：JSON input 取 url；output 里「URL: <最终地址>」也算。"""
+        from CharTyr_MaiWork.maiwork.tools_builtin import opened_urls_from_rows
+
+        rows = [{
+            "tool": "mcp_keenable_fetch_page_content",
+            "input": '{"url": "https://b.example/story"}',
+            "output": "Title: 童年诡事录后续\nURL: https://b.example/story?full=1\n\n正文……",
+            "ok": 1,
+        }]
+        opened = opened_urls_from_rows(rows)
+        assert "b.example/story" in opened
+        assert "b.example/story?full=1" in opened
+
+    def test_mcp_extract_tool_urls_list_and_link_key(self):
+        """input 兼容 urls 列表和 link 键。"""
+        from CharTyr_MaiWork.maiwork.tools_builtin import opened_urls_from_rows
+
+        rows = [{
+            "tool": "mcp_x_crawl",
+            "input": '{"urls": ["https://c.example/1", "https://c.example/2"]}',
+            "output": "抓好了 2 条", "ok": 1,
+        }, {
+            "tool": "mcp_y_scrape",
+            "input": '{"link": "https://d.example/3"}',
+            "output": "Title: t\nURL: https://d.example/3", "ok": 1,
+        }]
+        opened = opened_urls_from_rows(rows)
+        assert "c.example/1" in opened
+        assert "c.example/2" in opened
+        assert "d.example/3" in opened
+
+    def test_search_tool_does_not_count(self):
+        """搜索类工具（web_search、mcp_xxx_search_web_pages）一律不算打开过。"""
+        from CharTyr_MaiWork.maiwork.tools_builtin import opened_urls_from_rows
+
+        rows = [{
+            "tool": "mcp_keenable_search_web_pages",
+            "input": '{"query": "后续动态"}',
+            "output": "1. 童年诡事录 https://e.example/never", "ok": 1,
+        }, {
+            "tool": "web_search",
+            "input": "搜", "output": "https://e.example/never2", "ok": 1,
+        }, {
+            "tool": "mcp_z_lookup_query",
+            "input": '{"url": "https://e.example/never3"}',
+            "output": "Title: x", "ok": 1,
+        }]
+        opened = opened_urls_from_rows(rows)
+        assert not opened
+
+    def test_failed_mcp_call_does_not_count(self):
+        from CharTyr_MaiWork.maiwork.tools_builtin import opened_urls_from_rows
+
+        rows = [{
+            "tool": "mcp_keenable_fetch_page_content",
+            "input": '{"url": "https://f.example/fail"}',
+            "output": "", "ok": 0,
+        }]
+        assert not opened_urls_from_rows(rows)
+
+    def test_final_url_label_in_output_counts(self):
+        from CharTyr_MaiWork.maiwork.tools_builtin import opened_urls_from_rows
+
+        rows = [{
+            "tool": "fetch_page",
+            "input": "http://short.example/s",
+            "output": "取到正文 500 字（Jina）（最终地址：https://long.example/very/long?a=1）",
+            "ok": 1,
+        }]
+        opened = opened_urls_from_rows(rows)
+        assert "short.example/s" in opened
+        assert "long.example/very/long?a=1" in opened
+
+    def test_non_extract_mcp_tool_ignored(self):
+        """mcp_ 开头但不像抓正文也不像搜索的（例如图片生成）不算。"""
+        from CharTyr_MaiWork.maiwork.tools_builtin import opened_urls_from_rows
+
+        rows = [{
+            "tool": "mcp_img_generate",
+            "input": '{"url": "https://g.example/nope"}',
+            "output": "好了", "ok": 1,
+        }]
+        assert not opened_urls_from_rows(rows)

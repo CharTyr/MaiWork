@@ -249,6 +249,8 @@ MaiBot 会自动加载插件。
 | `console.listen` | string | `"127.0.0.1:18650"` | 网页监听地址 |
 | `console.password` | string | `""` | 管理员密码，空则自动生成 |
 | `console.public_url` | string | `""` | 反向代理后的外网地址 |
+| `console.update_check` | bool | `true` | 管理员打开网页时查 GitHub 上有没有新版（只提醒，更新去 MaiBot 的插件管理点） |
+| `console.maibot_webui_url` | string | `""` | MaiBot 自己网页的地址；填了，更新提醒里有直达按钮 |
 
 ---
 

@@ -14,6 +14,7 @@ import { draft } from "./settings/models.js";
 import { closeSheet, openDetail, openSheet, repaintSheet } from "./sheet.js";
 import { chatPoll, enterChat, loadChat, loadChats, paintChat } from "./chat.js";
 import { renderSide, renderView } from "./render.js";
+import { dismissUpdate } from "./update.js";
 import { enterSettings, go, loadGroups, loadSettings, loadView, reboot, renderTopBits, syncHash } from "./router.js";
 
 /* ───────────── 交互 ───────────── */
@@ -485,6 +486,14 @@ export async function act(el, e) {
       state.loginError = "";
       openSheet("login");
       setTimeout(() => $("pw") && $("pw").focus(), 350);
+      break;
+    case "upd-how":
+      enterSettings("overview");
+      break;
+    case "upd-dismiss":
+      dismissUpdate();
+      ui.flash = false;
+      renderView();
       break;
     case "logout":
       try {

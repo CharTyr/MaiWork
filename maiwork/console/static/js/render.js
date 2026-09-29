@@ -11,6 +11,7 @@ import { viewGroup } from "./pages/group.js";
 import { detailHTML } from "./detail.js";
 import { settingsPage, settingsSide } from "./settings/index.js";
 import { chatPage, chatSide } from "./chat.js";
+import { hasUpdate, updateBanner } from "./update.js";
 
 /* ───────────── 渲染 ───────────── */
 
@@ -97,7 +98,7 @@ export function renderRail() {
       ${admin() ? `<button class="r-item" data-act="chat" title="和 MaiWork 聊" aria-current="${state.page === "chat"}">${SVG.chat}<span class="r-text"><span class="r-name">和 MaiWork 聊</span></span></button>` : ""}
       ${
         admin()
-          ? `<button class="r-item" data-act="settings" title="设置" aria-current="${state.page === "settings"}">${SVG.sliders}<span class="r-text"><span class="r-name">设置</span></span>${state.settings && state.settings.models && !state.settings.models.ready ? `<span class="r-badge">!</span><span class="r-dot"></span>` : ""}</button>`
+          ? `<button class="r-item" data-act="settings" title="设置" aria-current="${state.page === "settings"}">${SVG.sliders}<span class="r-text"><span class="r-name">设置</span></span>${state.settings && state.settings.models && !state.settings.models.ready ? `<span class="r-badge">!</span><span class="r-dot"></span>` : hasUpdate() ? `<span class="r-badge upd">新</span><span class="r-dot upd"></span>` : ""}</button>`
           : `<button class="r-item" data-act="login" title="${isGA() ? "群管理员" : "管理员"}">${SVG.key}<span class="r-text"><span class="r-name">${isGA() ? "群管理员" : "管理员"}</span></span></button>`
       }
     </div>`;
@@ -196,7 +197,7 @@ export function renderView(opts) {
   const v = gview();
   const views = { news: viewNews, ideas: viewIdeas, goals: viewGoals, tasks: viewTasks, group: viewGroup };
   const el = $("view");
-  const html = !v && state.tab !== "group" ? `<h1 class="h-page">${TABS.find((t) => t.id === state.tab).label}</h1>${loading()}` : views[state.tab](g, v);
+  const html = updateBanner() + (!v && state.tab !== "group" ? `<h1 class="h-page">${TABS.find((t) => t.id === state.tab).label}</h1>${loading()}` : views[state.tab](g, v));
   // 定时轮询时内容没变就不重画：不让图解 iframe 重新加载（一闪），也不打断正在看的页面。
   // 只限轮询（opts.poll）：点按钮之后的重画照旧整块重画，按钮状态会复位
   if (opts && opts.poll && html === lastView && !ui.flash) return;

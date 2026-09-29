@@ -869,6 +869,46 @@ async def test_viz_api(env) -> None:
             assert r.status == 401
 
 
+@pytest.mark.asyncio
+async def test_update_api_admin_only_and_background(env) -> None:
+    """GET /api/update：只给总管理员；不等 GitHub，先回缓存、后台查，下次就能看到新版。"""
+    import asyncio as _aio
+    import json as _json
+
+    import httpx
+
+    from CharTyr_MaiWork.maiwork.update_check import UpdateCheck
+
+    hits: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        hits.append(str(req.url))
+        if "raw.githubusercontent.com" in str(req.url):
+            return httpx.Response(200, content=_json.dumps({"id": "chartyr.maiwork", "version": "9.0.0"}).encode())
+        return httpx.Response(404)
+
+    env.app.update_check = UpdateCheck("0.4.4", transport=httpx.MockTransport(handler))
+    token = env.app.token_of(G1)
+    r = await env.client.get("/api/update", headers={"X-MW-Group": token})
+    assert r.status == 403
+    async with aiohttp.ClientSession() as anon:
+        async with anon.get(f"http://127.0.0.1:{env.app.console.port}/api/update") as r:
+            assert r.status == 401
+    assert hits == []  # 没权限的请求不触发出站
+    await env.client.post("/api/login", json={"password": PASSWORD})
+    r = await env.client.get("/api/update")
+    assert r.status == 200
+    first = await r.json()
+    assert first["current"] == "0.4.4" and first["maibot_webui_url"] == ""
+    for _ in range(50):
+        if env.app.update_check.status()["latest"]:
+            break
+        await _aio.sleep(0.02)
+    r = await env.client.get("/api/update")
+    data = await r.json()
+    assert data["latest"] == "9.0.0" and data["newer"] is True
+
+
 def _free_port() -> int:
     """挑一个本机空闲端口：测试别依赖 18650 空着（用户可能正开着 SSH 隧道看网页）。"""
     import socket as _s

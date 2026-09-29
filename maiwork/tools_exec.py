@@ -66,10 +66,90 @@ def register_exec_tools(
         return ctx.workspace.name if ctx.workspace is not None else None
 
     # ------------------------------------------------------------------
+    # 成品目录隔离（2026-10，线上 T-4 整改）：有 artifact_scope 时，
+    # artifacts/ 下但不在 scope 里的路径一律拒绝；list 时 scope 外的目录滤掉不报错。
+    # ------------------------------------------------------------------
+
+    def _norm_scope(scope: Any) -> list[str]:
+        """scope 规范化成 ["artifacts/T-4", …]（剥 ./ 和 . 段、去多余斜杠；无效项丢弃）。"""
+        out: list[str] = []
+        for item in scope or ():
+            text = str(item or "").strip()
+            cand = Path(text)
+            if cand.is_absolute() or ".." in cand.parts:
+                continue
+            parts = [p for p in cand.parts if p not in ("", ".")]
+            if len(parts) >= 2 and parts[0].lower() == "artifacts":
+                out.append("/".join(parts))
+        return out
+
+    def _scope_other_artifacts(ctx: ToolContext, rel: str) -> tuple[bool, str]:
+        """返回 (拒?, scope 文本)。rel 在 artifacts/ 下、不在 scope 任何一个目录里 → 拒。
+
+        artifacts/ 本身（0 段目录名）不算「别的任务的」：列它时过滤即可，不报错。
+        路径先按 env.resolve 的同款剥段规范化（./artifacts/../artifacts/T-2 这类
+        绕法在 resolve 那层已经会按越界拒掉，这里是双保险：即使解析器哪天变宽松，
+        ./ 打头的也一样按规范路径判）。
+        """
+        scope = _norm_scope(getattr(ctx, "artifact_scope", None))
+        if not scope:
+            return False, ""
+        cand = Path(str(rel or ""))
+        if cand.is_absolute():
+            return False, ""  # 绝对路径交给 env.resolve 去拒
+        parts = [p for p in cand.parts if p not in ("", ".")]
+        if not parts:
+            return False, ""
+        if parts[0].lower() != "artifacts" or len(parts) < 2:
+            return False, ""  # artifacts/ 之外（PROFILE-*.md、tools/、tasks/…）不受影响
+        for allowed in scope:
+            a_parts = allowed.split("/")
+            if parts[: len(a_parts)] == a_parts:
+                return False, ""
+        return True, "、".join(f"{a}/" for a in scope)
+
+    def _scope_error(scope_text: str) -> ToolResult:
+        return ToolResult(
+            ok=False, output="",
+            error=f"这是别的任务的文件，和本任务无关，不能读写；你的成品目录是 {scope_text}",
+        )
+
+    def _entry_out_of_scope(ctx: ToolContext, path: str, listed_under: str) -> bool:
+        """目录清单里这一条要不要滤掉（不报错，只是不给看别的任务的目录）。"""
+        scope = _norm_scope(getattr(ctx, "artifact_scope", None))
+        if not scope:
+            return False
+        listed = str(listed_under or "")
+        path_parts = [p for p in Path(str(path or "")).parts if p not in ("", ".")]
+        listed_parts = [p for p in Path(listed).parts if p not in ("", ".")] if listed else []
+        # env.list_files 给的条目路径带被列目录的前缀（列 "artifacts" 出 "artifacts/T-4"）；
+        # 万一不带（别的 env 实现），就把前缀拼上再判。
+        if listed_parts and path_parts[: len(listed_parts)] != listed_parts:
+            parts = listed_parts + path_parts
+        else:
+            parts = path_parts
+        if not parts:
+            return False
+        if parts[0].lower() != "artifacts" or len(parts) < 2:
+            return False
+        sub = "/".join(parts[:2])
+        depth_below = len(parts) - 2
+        for allowed in scope:
+            a0 = str(allowed.split("/")[1]) if len(allowed.split("/")) >= 2 else ""
+            if sub == allowed:
+                return False  # 在放行目录里
+            if depth_below == 0 and a0.startswith(sub + "/"):
+                return False  # 列 artifacts/ 时：放行目录的父目录项要留着，不然进不去
+        return True
+
+    # ------------------------------------------------------------------
     # 文件工具
     # ------------------------------------------------------------------
 
     async def read_file(ctx: ToolContext, args: dict) -> ToolResult:
+        refused, scope_text = _scope_other_artifacts(ctx, str(args.get("path") or ""))
+        if refused:
+            return _scope_error(scope_text)
         path, err = _bound(ctx, str(args.get("path") or ""))
         if err:
             return err
@@ -93,6 +173,9 @@ def register_exec_tools(
         if content is None:
             return ToolResult(ok=False, output="", error="content 不能为空")
         append = bool(args.get("append"))
+        refused, scope_text = _scope_other_artifacts(ctx, rel)
+        if refused:
+            return _scope_error(scope_text)
         try:
             await env.write_file(ctx.workspace.name, rel, str(content), append=append)
         except PermissionError as e:
@@ -103,7 +186,11 @@ def register_exec_tools(
         return ToolResult(ok=True, output=f"已{verb} {rel}（{len(str(content))} 字）", data={"path": rel})
 
     async def list_files(ctx: ToolContext, args: dict) -> ToolResult:
-        path, err = _bound(ctx, str(args.get("path") or ""))
+        listed_rel = str(args.get("path") or "")
+        refused, scope_text = _scope_other_artifacts(ctx, listed_rel)
+        if refused:
+            return _scope_error(scope_text)
+        path, err = _bound(ctx, listed_rel)
         if err:
             return err
         try:
@@ -122,6 +209,10 @@ def register_exec_tools(
             return ToolResult(ok=False, output="", error=f"工作区内没有这个目录：{args.get('path')}")
         except IsADirectoryError:
             return ToolResult(ok=False, output="", error=f"{args.get('path')} 是文件，不是目录")
+        entries = [
+            e for e in entries
+            if isinstance(e, dict) and not _entry_out_of_scope(ctx, str(e.get("path") or ""), listed_rel)
+        ]
         lines = []
         for e in entries:
             suffix = "/" if e["is_dir"] else f"（{e['size']} 字节）"

@@ -21,6 +21,17 @@
   （最多 4 轮工具调用，只给这个群能力允许的那几个工具）。只有任务明确需要时才动
   （整理群文件 / 发公告 / 传相册）；不需要就不调用模型（能力全 False 更是零模型调用）。
 
+2026-10（线上 T-4 三次尝试全败的整改，docs/02 §7.1/§7.2）：
+- 子任务可以声明先后：计划 JSON 的 jobs[] 每项可带 after（前一步 jobs 的 1 基编号）；
+  写了 after 的等依赖跑完才开工，brief 里带上前一步交回的摘要和成品路径（前一步失败
+  也照样开工，但写清「前一步没做成」）；非法 / 自依赖 / 成环 → 当没写（warning，不卡死）。
+- 任务子 agent 的成品目录隔离：Workers.run(..., artifact_scope=(本任务目录 + req 点名
+  的别的 artifacts 目录)) → ToolContext.artifact_scope；tools_exec 的文件工具真拦
+  scope 外的 artifacts/<别的>/，_enrich_brief 同时加一句提醒（命令工具拦不住，提示兜底）。
+- 引用核对认扩展的抓正文工具：_opened_urls 和 news_recheck.opened_links 共用
+  tools_builtin.opened_urls_from_rows——fetch_page 之外，mcp_ 开头、名字像抓正文、
+  不像搜索的工具成功过的也算打开过（input JSON 的 url/urls/link + output「URL: <最终地址>」）。
+
 执行环境（docs/02 §9、docs/09 §7、docs/07 §11.1b）：
 - 主模型按计划 JSON 的 "env" 选「本机隔离环境」（local，默认）还是「railway.new
   一次性 VM」（railway）。快、便宜、能直接交付的活走 local；要装一堆依赖、跑不信任
@@ -787,7 +798,10 @@ class Coordinator:
             '展示类做成单页 index.html（手机能看、不依赖外部资源）",'
             ' "type": "research|build|other"（research=要查资料出结论的活：调研、对比、盘点、「大家怎么看」、找现状/口碑；'
             'build=做东西；other=其它）,'
-            ' "tools": ["子 agent 工具名单里的名字"]}]（1 到 2 个）,'
+            ' "tools": ["子 agent 工具名单里的名字"],'
+            ' "after": ["要用前一步的产出（比如先调研、再按调研做页面）时写这个：'
+            '前一步 jobs 的编号（第 1 个是 1），可以写 1 个或几个；'
+            '互不依赖的不写 after，才会同时跑；写了 after 的会等那几步跑完、把那几步交回的东西给它"]}]（1 到 2 个）,'
             ' "question": null | "如果信息不够、不能开工，写一句要在群里问发起人的话；能开工就是 null"}'
         )
         if env_guide:
@@ -911,7 +925,8 @@ class Coordinator:
                 job_type = str(j.get("type") or "").strip().lower()
                 if job_type not in ("research", "build", "other"):
                     job_type = "research" if looks_like_research_brief(brief) else "other"
-                jobs.append({"brief": brief, "tools": tools_list, "type": job_type})
+                jobs.append({"brief": brief, "tools": tools_list, "type": job_type, "after": list(j.get("after") or []) if isinstance(j.get("after"), list) else []})
+        self._sanitize_jobs_after(jobs)
 
         question = data.get("question")
         question = str(question).strip() if question else ""
@@ -1074,22 +1089,39 @@ class Coordinator:
             self._fail_with_err(tid, attempt_id, msg, gid)
             return "done"
 
-        # 执行 jobs 并发（受信号量）；结束（成功/失败/异常）一定 release 一次性机器
-        try:
-            reports: list[Any] = await asyncio.gather(
-                *[
-                    self._run_job(
-                        brief=self._enrich_brief(j["brief"], tid, plan["deliver_kind"], railway_box if on_railway else False),
-                        tools=self._remote_job_tools(j["tools"], railway_box) if on_railway else j["tools"],
-                        gid=gid,
-                        tid=tid,
-                        job_idx=i + 1,
-                        ws_name=ws_name,
-                        job_type=str(j.get("type") or "other"),
-                    )
-                    for i, j in enumerate(jobs)
-                ]
+        # 执行 jobs：没写 after 的照旧并发（受信号量）；写了 after 的等依赖跑完再开工
+        # （2026-10，线上 T-4：后一步不能用前一步还没写完的产出；reports 顺序仍与 jobs 一致，
+        # 后面的验收代码按下标用）。结束（成功/失败/异常）一定 release 一次性机器。
+        scope = self._task_artifact_scope(tid, str(task.get("req") or ""))
+        reports: list[Any] = [None] * len(jobs)
+
+        async def _job(i: int) -> Any:
+            j = jobs[i]
+            deps = [d for d in (j.get("after") or []) if 1 <= d <= len(jobs)]
+            brief = self._enrich_brief(j["brief"], tid, plan["deliver_kind"], railway_box if on_railway else False)
+            for d in deps:
+                await done[d - 1].wait()
+            if deps:
+                brief = self._add_dep_handoff_to_brief(brief, deps, reports)
+            return await self._run_job(
+                brief=brief,
+                tools=self._remote_job_tools(j["tools"], railway_box) if on_railway else j["tools"],
+                gid=gid,
+                tid=tid,
+                job_idx=i + 1,
+                ws_name=ws_name,
+                job_type=str(j.get("type") or "other"),
+                artifact_scope=scope,
             )
+
+        done: list[asyncio.Event] = [asyncio.Event() for _ in jobs]
+
+        async def _job_marked(i: int) -> None:
+            reports[i] = await _job(i)
+            done[i].set()
+
+        try:
+            await asyncio.gather(*[_job_marked(i) for i in range(len(jobs))])
         finally:
             await self._release_remote(railway_box)
 
@@ -1175,6 +1207,7 @@ class Coordinator:
     async def _run_job(
         self, *, brief: str, tools: list[str], gid: str, tid: str, job_idx: int, ws_name: str,
         job_type: str = "other",
+        artifact_scope: tuple[str, ...] | None = None,
     ) -> Any:
         sem = self._semaphore_for(ws_name)
         async with sem:
@@ -1203,6 +1236,7 @@ class Coordinator:
                     actor=f"子 agent #{job_idx}",
                     workspace=ws_path,
                     system_extra=system_extra,
+                    artifact_scope=artifact_scope,
                 )
             except (ModelError, HostError) as e:
                 from .workers import WorkerReport
@@ -1332,11 +1366,136 @@ class Coordinator:
         except Exception:
             logger.exception("释放一次性机器出错（任务跑完兜底）")
 
+    # jobs[].after（1 基编号，指前一步）：「后一步要用前一步的产出」的声明（2026-10，
+    # 线上 T-4 整改——「先调研写 research.md 再按它做 index.html」两个 job 同时开跑、
+    # 后一步找不到 input 就去翻别的任务的文件）。非法编号（越界 / 非整数 / 0 或负）、
+    # 自己依赖自己、成环 → 当没写 after 并记 warning，不能让任务卡死。
+    @staticmethod
+    def _sanitize_jobs_after(jobs: list[dict]) -> None:
+        n = len(jobs)
+        for i, job in enumerate(jobs):
+            keep: list[int] = []
+            for raw in job.get("after") or []:
+                try:
+                    idx = int(raw)
+                except (TypeError, ValueError):
+                    logger.warning("job #%d 的 after 里有不是整数的编号 %r，忽略", i + 1, raw)
+                    continue
+                if idx < 1 or idx > n or idx == i + 1:
+                    logger.warning("job #%d 的 after 编号 %d 非法（越界或依赖自己），忽略", i + 1, idx)
+                    continue
+                if idx not in keep:
+                    keep.append(idx)
+            job["after"] = keep
+
+        def _deps(i: int, _path: tuple[int, ...] = ()) -> set[int]:
+            if i in _path:
+                raise ValueError("环")
+            out: set[int] = set()
+            for dep in jobs[i].get("after") or []:
+                out.add(dep)
+                out |= _deps(dep - 1, (*_path, i))
+            return out
+
+        for i in range(n):
+            if not (jobs[i].get("after") or []):
+                continue
+            try:
+                _deps(i)
+            except ValueError:
+                logger.warning("job #%d 的 after 成环，按没写 after 处理（不让任务卡死）", i + 1)
+                jobs[i]["after"] = []
+
+    # 成品目录隔离（2026-10）：任务子 agent 只能碰自己的成品目录 + 任务原文点名的
+    # 别的 artifacts 目录（「接着改 T-2 的页面」这种活还做得成）。
+    _NAMED_TASK_RE = re.compile(r"T-\d+")
+    _NAMED_ARTIFACTS_RE = re.compile(r"artifacts/([A-Za-z0-9_.\-]+)")
+
+    def _task_artifact_scope(self, tid: str, req: str) -> tuple[str, ...]:
+        own = self._artifact_dir(tid)
+        extra: list[str] = []
+        text = str(req or "")
+
+        def _add(name: str) -> None:
+            name = str(name or "").strip().strip("/")
+            cand = f"artifacts/{name}"
+            if not name or cand == own or cand in extra:
+                return
+            parts = [p for p in Path(cand).parts]
+            if len(parts) != 2 or ".." in parts or parts[0] != "artifacts":
+                return
+            extra.append(cand)
+
+        for m in self._NAMED_TASK_RE.finditer(text):
+            _add(m.group(0))
+        for m in self._NAMED_ARTIFACTS_RE.finditer(text):
+            _add(m.group(1))
+        extra.sort()
+        return tuple([own] + extra)
+
+    @staticmethod
+    def _extract_artifact_paths(report: Any, ws_prefix: str = "artifacts/") -> list[str]:
+        """前一步交回的成品路径：先看 data.artifacts（约定），再看 evidence 里工作区相对路径。"""
+        out: list[str] = []
+        data = getattr(report, "data", None)
+        if isinstance(data, dict):
+            arts = data.get("artifacts")
+            if isinstance(arts, list):
+                for a in arts:
+                    p = str(a or "").strip().replace("\\", "/").lstrip("./")
+                    if p.startswith(ws_prefix) and ".." not in Path(p).parts:
+                        out.append(p)
+        seen = set(out)
+        for e in getattr(report, "evidence", None) or []:
+            p = str(e or "").strip().replace("\\", "/").lstrip("./")
+            if p.startswith(ws_prefix) and ".." not in Path(p).parts and p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out
+
+    def _add_dep_handoff_to_brief(self, brief: str, deps: list[int], reports: list[Any]) -> str:
+        """把后一步依赖的那（几）步交回的东西追加进它的 brief（2026-10，after 字段配套）。
+
+        每一步给交回摘要（截 600 字）和成品路径（data.artifacts / evidence 里 artifacts/ 下的
+        工作区路径，有就带）。依赖的步失败 / 异常：照样开工，但写清「前一步没做成：<摘要>」——
+        不让它以为前一步做成了，也不让它去别处（别的任务的文件）找替代品。
+        """
+        lines: list[str] = []
+        for d in sorted(set(deps)):
+            rep = reports[d - 1] if d - 1 < len(reports) else None
+            if rep is None:
+                lines.append(f"- 前一步（job #{d}）：没拿到它的交回（顺序被改乱；按自己判断做，别去翻别的任务的文件）。")
+                continue
+            if not bool(getattr(rep, "ok", False)):
+                why = str(getattr(rep, "summary", "") or getattr(rep, "error", "") or "没说原因").strip()[:600]
+                lines.append(
+                    f"- 前一步（job #{d}）没做成：{why or '没说原因'}"
+                    "。它答应给你的东西没有，你别假装有：能做多少做多少，"
+                    "一定别去翻工作区里别的任务的文件当替代品。"
+                )
+                continue
+            summary = str(getattr(rep, "summary", "") or "").strip()[:600] or "（没写摘要）"
+            paths = self._extract_artifact_paths(rep)
+            piece = f"- 前一步（job #{d}）交回的摘要：{summary}"
+            if paths:
+                piece += "；它交付的工作区文件：" + "、".join(paths)
+            lines.append(piece)
+        if not lines:
+            return brief
+        return (
+            brief
+            + "\n\n前一步交回的（只用这些，不要去读别的任务的文件）：\n"
+            + "\n".join(lines)
+        )
+
     def _enrich_brief(self, brief: str, tid: str, deliver_kind: str, on_railway: bool = False) -> str:
         out = str(brief)
         target_dir = self._artifact_dir(tid)
+        out += f"\n\n成品放在工作区 {target_dir}/ 下；"
+        # 2026-10 成品目录隔离的提示（工具层也真拦，这句是让模型少走弯路）：
         out += (
-            f"\n\n成品放在工作区 {target_dir}/ 下；"
+            f"只用本任务目录 {target_dir}/ 和前一步交给你的东西；"
+            "工作区里别的任务的文件和这个任务无关，别读别用。"
         )
         if deliver_kind == "view":
             out += "展示类成品做成单页 index.html（手机能看、不依赖外部资源）。"
@@ -1429,7 +1588,7 @@ class Coordinator:
             prompt_lines.append("")
             prompt_lines.append(
                 "事实核对（代码查的，不是模型判断）：下面这些链接出现在交付内容里，"
-                "但这个任务里没有真正打开过（fetch_page 没成功过；只在搜索结果里出现过不算打开过）："
+                "但这个任务里没有真正打开过（fetch_page / 抓正文工具没成功过；只在搜索结果里出现过不算打开过）："
             )
             for url in link_check["unopened_urls"]:
                 prompt_lines.append(f"- {url}")
@@ -1554,39 +1713,25 @@ class Coordinator:
     # ------------------------------------------------------------------
 
     def _opened_urls(self, tid: str) -> set[str]:
-        """本任务 fetch_page 成功过的 URL（规范化）；web_search 结果里的链接不算打开过。
+        """本任务成功打开过的 URL（规范化）。
 
-        请求地址（tool_calls.input）和跳转后的最终地址都算打开过：交付里常引用最终的长链。
-        最终地址从 fetch_page 的 output 摘要标记里解析（tools_builtin.final_url_from_summary，
-        不改表结构）。
+        fetch_page（请求地址 + 「最终地址」标记）和扩展的抓正文工具（mcp_ 开头、名字像
+        抓正文、不像搜索；input JSON 里的 url/urls/link + output «URL: <最终地址>» 行）
+        成功过的都算打开过——线上 T-4 时子 agent 用 mcp_*_fetch_page_content 真打开了
+        31 次全被漏算；web_search / mcp 搜索工具的结果只算「见过」，照旧不算打开过。
+        解析逻辑在 tools_builtin.opened_urls_from_rows（和 news_recheck.opened_links 共用）。
         """
-        from .tools_builtin import final_url_from_summary
+        from .tools_builtin import opened_urls_from_rows
 
         try:
             rows = self._store.read().execute(
-                "SELECT input, output FROM tool_calls WHERE task_id=? AND tool='fetch_page' AND ok=1",
+                "SELECT tool, input, output, ok FROM tool_calls WHERE task_id=?",
                 (str(tid),),
             ).fetchall()
         except Exception:
-            logger.exception("读 fetch_page 记录失败（任务 %s）", tid)
+            logger.exception("读打开记录失败（任务 %s）", tid)
             return set()
-        opened: set[str] = set()
-        for row in rows:
-            raw = str(row["input"] or "").strip()
-            url = raw
-            if raw.startswith("{"):  # 工具的 summarize 给的是 JSON 摘要时兜底取 url
-                try:
-                    parsed = json.loads(raw)
-                    if isinstance(parsed, dict):
-                        url = str(parsed.get("url") or "")
-                except (ValueError, TypeError):
-                    url = raw
-            final = final_url_from_summary(str(row["output"] or ""))
-            for one in (url, final):
-                key = normalize_link_for_check(one)
-                if key:
-                    opened.add(key)
-        return opened
+        return opened_urls_from_rows(rows)
 
     async def _gather_deliverable_texts(
         self, ws_name: str, listing: list[dict], summary: str, evidence: list[str]

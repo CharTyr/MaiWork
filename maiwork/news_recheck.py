@@ -56,9 +56,12 @@ RECHECK_SCHEMA: dict[str, Any] = {
 
 
 def opened_links(store: Any, task_id: str) -> tuple[set[str], int]:
-    """这个 task_id 下 fetch_page 成功打开过的链接（规范化；请求地址 + 最终地址）和工具记录总数。"""
-    from .coordinator import normalize_link_for_check
-    from .tools_builtin import final_url_from_summary
+    """这个 task_id 下成功打开过的链接（规范化）和工具记录总数。
+
+    fetch_page 和扩展的抓正文工具（mcp_ 开头、名字像抓正文、不像搜索）成功过的都算；
+    和 coordinator 验收引用核对共用一份解析（tools_builtin.opened_urls_from_rows）。
+    """
+    from .tools_builtin import opened_urls_from_rows
 
     try:
         rows = store.read().execute(
@@ -67,15 +70,7 @@ def opened_links(store: Any, task_id: str) -> tuple[set[str], int]:
     except Exception:
         logger.exception("读打开记录失败（%s）", task_id)
         return set(), 0
-    opened: set[str] = set()
-    for r in rows:
-        if str(r["tool"]) != "fetch_page" or not int(r["ok"] or 0):
-            continue
-        for one in (str(r["input"] or ""), final_url_from_summary(str(r["output"] or ""))):
-            key = normalize_link_for_check(one)
-            if key:
-                opened.add(key)
-    return opened, len(rows)
+    return opened_urls_from_rows(rows), len(rows)
 
 
 def pick_unverified(candidates: list[dict], opened: set[str], records: int) -> list[int]:

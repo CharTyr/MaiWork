@@ -13,6 +13,7 @@ import { closeSheet, openSheet, repaintSheet } from "./sheet.js";
 import { enterChat } from "./chat.js";
 import { render, renderRail, renderSide, renderTabbar, renderTop, renderView } from "./render.js";
 import { maybeOnboard, openOnboarding } from "./onboarding.js";
+import { loadUpdate } from "./update.js";
 
 /* ───────────── 路由 ───────────── */
 
@@ -117,6 +118,7 @@ export async function reboot() {
   ui.flash = true;
   render();
   if (grp()) await loadView();
+  if (admin()) pollUpdate(true);
   const settingsReady = admin()
     ? loadSettings().then(async () => {
         if (state.page === "settings" && state.setSub === "extensions") await loadExt();
@@ -176,6 +178,20 @@ export function go(patch) {
   render();
   window.scrollTo({ top: 0 });
   if (gChanged) loadView().then(() => ((ui.flash = true), render()));
+}
+
+/* 更新提醒：开页时拉一次（服务端到点才去 GitHub 查，查在后台）；12 秒后再拉一次拿后台结果，之后 30 分钟一次 */
+let updTimer = null;
+function repaintUpdate() {
+  renderRail();
+  if (state.page === "settings" && state.setSub === "overview") renderView();
+  else if (!state.page && grp()) renderView({ poll: true });
+}
+export function pollUpdate(first) {
+  clearTimeout(updTimer);
+  if (!admin()) return;
+  loadUpdate().then(repaintUpdate);
+  updTimer = setTimeout(() => pollUpdate(false), first ? 12000 : 30 * 60 * 1000);
 }
 
 /* 定时刷新：页面在前台时每 30 秒拉一次当前群 */

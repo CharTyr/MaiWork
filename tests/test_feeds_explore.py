@@ -357,7 +357,7 @@ class TestCollectBrief:
         assert "这个群大致是这样的（给你拓展方向用）" in brief
         assert "长期兴趣A" in brief
         assert "在做的事B" in brief
-        assert "自己拓展" in brief
+        assert "拓展" in brief and "跳一步" in brief  # 2026-09-29 起拓展找法写在资讯标准 skill 里
         assert "explore" in brief
         assert "最近聊的9" in brief
         assert "最近聊的10" not in brief

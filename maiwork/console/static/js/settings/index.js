@@ -10,6 +10,7 @@ import { sourcesPage } from "./sources.js";
 import { identityPage } from "./identity.js";
 import { logsPage } from "./logs.js";
 import { fullLink, modelsPage } from "./models.js";
+import { updateSection } from "../update.js";
 
 /* ───────────── 设置 / 群切换（抽屉） ───────────── */
 
@@ -132,6 +133,7 @@ function settingsOverview(s) {
         : ""
     }
     <p class="fine">${alert ? `每日提醒线 ${tokens(alert)} tokens，今天用了 ${Math.round((used / alert) * 100)}%。` : "没设提醒线。"}${u.errors ? ` 今天有 ${u.errors} 次调用出错。` : ""}</p>
+    ${updateSection()}
     <h2 class="h-sub">运行状态</h2>
     ${(s.health || []).map((h) => `<div class="set-row">${ico(h.icon || "gear")}<div><div class="set-name">${esc(h.name)}</div><div class="set-text">${esc(h.text)}</div>${h.copy ? `<div class="set-text mono-link">${esc(h.copy)}</div><div class="actions" style="margin-top:8px"><button class="btn small" data-act="copy" data-link="${esc(h.copy)}" data-what="公钥">复制公钥</button></div>` : ""}</div><span class="dot ${h.state === "ok" ? "ok" : h.state === "warn" ? "pending" : ""}"></span></div>`).join("")}
     <div class="actions" style="margin-top:22px"><button class="btn" data-act="onb-restart">重新引导</button><button class="btn" data-act="logout">退出管理员</button></div>`;

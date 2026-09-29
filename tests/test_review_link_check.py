@@ -433,3 +433,86 @@ async def test_extract_http_links_dedup_and_trim():
     )
     assert extract_http_links(text) == ["https://a.example/x", "https://b.example/y"]
     assert extract_http_links("没有链接") == []
+
+
+# ---------------------------------------------------------------------------
+# 引用核对：扩展的抓正文工具（mcp_*_fetch_page_content）也算「打开过」（2026-10 整改）
+# ---------------------------------------------------------------------------
+
+
+async def test_review_counts_mcp_fetch_page_content_as_opened(mem_store, settings, env, tools, tasks, goals):
+    """子 agent 用扩展抓正文工具 mcp_keenable_fetch_page_content 打开过原文：
+    input 是 JSON {"url": "…"}，output 开头有「Title: … / URL: <最终地址>」——引用核对必须认。
+    （线上 T-4 验收判「37 条链接 27 条没打开过」，实际那 31 次都是这么打开的。）"""
+    tid = _create_task(tasks)
+    report = "- 来源：https://mcp-opened.example/story\n"
+    _log_tool_call(
+        mem_store, tid=tid,
+        tool="mcp_keenable_fetch_page_content",
+        inp='{"url": "https://mcp-opened.example/story"}',
+        ok=True,
+        output="Title: 童年诡事录后续\nURL: https://mcp-opened.example/story\n\n正文……",
+    )
+    workers = FakeWorkers(reports=[WorkerReport(ok=True, summary="调研完了", evidence=[])])
+    workers.before_return = _write_artifact_hook(env, tasks, tid, {"report.md": report})
+    models = ModelsQueue(replies=[_research_plan(), _review(pass_=True, artifact="", review="过了")])
+    coord = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+                   tasks=tasks, goals=goals, models=models, workers=workers)
+
+    await coord.run_task(tid)
+
+    assert "没有真正打开过" not in _review_prompt(models)
+    saved = mem_store.kv_get(f"task.link_check.{tid}")
+    assert saved["links"] == 1 and saved["unopened"] == 0
+    assert "引用核对：1 条链接，0 条没打开过" in str(tasks.get(tid)["review"])
+
+
+async def test_review_mcp_final_url_line_counts_as_opened(mem_store, settings, env, tools, tasks, goals):
+    """抓正文工具 output 里「URL: <最终地址>」和 input 的请求地址都算打开过：
+    交付里引用最终地址（带参数）也不算「没打开过」。"""
+    tid = _create_task(tasks)
+    report = "- 来源（最终地址）：https://mcp-final.example/story?full=1\n"
+    _log_tool_call(
+        mem_store, tid=tid,
+        tool="mcp_keenable_fetch_page_content",
+        inp='{"url": "https://mcp-final.example/story"}',
+        ok=True,
+        output="Title: t\nURL: https://mcp-final.example/story?full=1\n\n正文……",
+    )
+    workers = FakeWorkers(reports=[WorkerReport(ok=True, summary="调研完了", evidence=[])])
+    workers.before_return = _write_artifact_hook(env, tasks, tid, {"report.md": report})
+    models = ModelsQueue(replies=[_research_plan(), _review(pass_=True, artifact="", review="过了")])
+    coord = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+                   tasks=tasks, goals=goals, models=models, workers=workers)
+
+    await coord.run_task(tid)
+
+    assert "没有真正打开过" not in _review_prompt(models)
+    saved = mem_store.kv_get(f"task.link_check.{tid}")
+    assert saved["links"] == 1 and saved["unopened"] == 0
+
+
+async def test_review_search_tool_still_not_counted_as_opened(mem_store, settings, env, tools, tasks, goals):
+    """扩展的搜索工具（mcp_*_search_web_pages）不算打开过：交付里引用只在搜索结果里
+    出现过的链接，照旧进「没打开」清单。"""
+    tid = _create_task(tasks)
+    report = "- 只在搜索结果里见过：https://search-only.example/hit\n"
+    _log_tool_call(
+        mem_store, tid=tid,
+        tool="mcp_keenable_search_web_pages",
+        inp='{"query": "后续动态"}',
+        ok=True,
+        output="1. 童年诡事录 https://search-only.example/hit\n2. …",
+    )
+    workers = FakeWorkers(reports=[WorkerReport(ok=True, summary="调研完了", evidence=[])])
+    workers.before_return = _write_artifact_hook(env, tasks, tid, {"report.md": report})
+    models = ModelsQueue(replies=[_research_plan(), _review(pass_=True, artifact="", review="过了")])
+    coord = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+                   tasks=tasks, goals=goals, models=models, workers=workers)
+
+    await coord.run_task(tid)
+
+    prompt = _review_prompt(models)
+    assert "search-only.example/hit" in prompt
+    saved = mem_store.kv_get(f"task.link_check.{tid}")
+    assert saved["links"] == 1 and saved["unopened"] == 1

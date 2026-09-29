@@ -423,7 +423,7 @@ def _role_skills(tmp_path: Path) -> Skills:
         body="通用正文\n",
     )
     _make_skill(tmp_path, "bare", body="没 front matter → 默认 worker\n")
-    return Skills(tmp_path)
+    return Skills(tmp_path, builtin_root=None)  # 只看这里造的；内置 skill 另有 test_news_standard
 
 
 def _worker_ctx() -> ToolContext:

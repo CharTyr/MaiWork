@@ -71,6 +71,11 @@ class ToolContext:
     actor: str = "主模型"
     workspace: Path | None = None
     role: str = ""  # "worker" | "main"；空则按 actor 引导式判断（§10.2 没这个字段，见模块 docstring）
+    # 成品目录隔离（2026-10，线上 T-4 串文件整改）：允许碰的 artifacts 目录
+    # （工作区相对路径，不含结尾 /，如 ("artifacts/T-4", "artifacts/T-2")）。
+    # None / 空 = 不限制（管理员对话、资讯等老调用方行为不变）。tools_exec 的
+    # 文件工具（read/write/list）只在它非空时拦「scope 外、artifacts/ 下」的路径。
+    artifact_scope: tuple[str, ...] | None = None
 
     def effective_role(self) -> str:
         """这个上下文实际算哪个角色（role 优先，空则看 actor）。工具 handler 里也用它。"""

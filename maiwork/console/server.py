@@ -107,6 +107,7 @@ class ConsoleServer:
 
     def __init__(self, svc: Any) -> None:
         self._svc = svc
+        self._bg_tasks: set[Any] = set()  # 后台小任务（更新检查）的引用，防被回收
         self.app: web.Application = self._build_app()
         self._runner: web.AppRunner | None = None
         self.port: int | None = None
@@ -343,6 +344,28 @@ class ConsoleServer:
                     "now": clock.now(),
                 }
             )
+
+        # ---------- 更新提醒（只给总管理员；只提醒不自动更新，update_check.py） ----------
+
+        @get("/api/update")
+        async def _update_status(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            chk = getattr(svc, "update_check", None)
+            if chk is None:
+                return web.json_response({"enabled": False, "newer": False})
+            # 到点了就后台查一次（不让这个请求等 GitHub）；这次先回缓存，下次轮询就能看到
+            try:
+                task = asyncio.ensure_future(chk.maybe_refresh())
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
+            except Exception:
+                logger.exception("起更新检查出错")
+            st = dict(chk.status())
+            settings = svc.get_settings()
+            st["maibot_webui_url"] = getattr(getattr(settings, "console", None), "maibot_webui_url", "") or ""
+            return web.json_response(st)
 
         @post("/api/login")
         async def _login(request: web.Request) -> web.Response:
@@ -1842,6 +1865,8 @@ class ConsoleServer:
                 view = skills_web.update(svc.get_settings().data_dir, svc.store, name, body)
             except KeyError:
                 return _err(404, "没有这个 skill")
+            except PermissionError as e:
+                return _err(409, str(e))
             except ValueError as e:
                 return _err(400, str(e))
             return web.json_response(view)

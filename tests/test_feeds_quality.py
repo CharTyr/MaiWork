@@ -268,7 +268,7 @@ def test_brief_asks_news_and_guides_with_fetch_and_paywall(tmp_path) -> None:
     """brief 要同时让子 agent 找资讯和好文，真打开过 + 引用原文，付费的标出来。"""
     items = [
         _cand(0, title="全新的 FPGA TEST 板卡"),
-        _cand(1, kind="guide", url="https://tut.com/aaa-bbb-guide", title="从零开始的部署手册", published=""),
+        _cand(1, kind="guide", url="https://tut.com/aaa-bbb-guide", title="从零开始的部署手册", published=NOW - 30 * 86400),
     ]
     scores = _scores_json(*[_score(i, topic=f"话题{i}") for i in range(2)])
     store, settings, feeds, models, workers, topics, _ = _make_feeds(
@@ -277,7 +277,7 @@ def test_brief_asks_news_and_guides_with_fetch_and_paywall(tmp_path) -> None:
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 2
     brief = _brief(workers)
-    assert "好文" in brief
+    assert "文章" in brief  # 2026-09-29 起 brief 里叫「文章」（kind=guide，从严）
     assert "资讯" in brief
     assert "fetch_page" in brief
     assert "fetched" in brief
@@ -672,7 +672,7 @@ def test_happy_path_pool_gate_and_scores_stored(tmp_path) -> None:
     """正常通过后：rejected=0、scores JSON 带六项、topic/profile_ref/kind 落库。"""
     items = [
         _cand(0, url="https://example.com/board", title="新板子发布", published=NOW - 86400),
-        _cand(1, url="https://tut.com/llm", title="本地部署好文", kind="guide", published=""),
+        _cand(1, url="https://tut.com/llm", title="本地部署好文", kind="guide", published=NOW - 30 * 86400),
     ]
     scores = _scores_json(
         _score(0, info=5, source=5, relevance=5, timeliness=5, chat=5, topic="FPGA", profile=0),

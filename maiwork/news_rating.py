@@ -152,6 +152,33 @@ def summaries(store_or_conn: Any, item_ids: Iterable[int]) -> dict[int, dict]:
     return out
 
 
+def offtopic_examples(store: Any, group_id: Any, now: float, *, days: int = SCAN_DAYS,
+                      max_items: int = 5) -> list[str]:
+    """最近 days 天被群友标了「和本群无关」的资讯标题（新的在前，去重，最多 max_items 条）。
+
+    打分提示词里当反例用（避免相关度放宽后变吵）。没有就 []。
+    """
+    gid = str(group_id or "")
+    since = float(now) - days * 86400.0
+    rows = store.read().execute(
+        "SELECT r.reasons, i.title FROM news_ratings r"
+        " JOIN news_items i ON i.id=r.item_id"
+        " WHERE r.group_id=? AND i.group_id=? AND r.updated>=?"
+        " ORDER BY r.updated DESC, r.id DESC",
+        (gid, gid, since),
+    ).fetchall()
+    out: list[str] = []
+    for r in rows:
+        if "offtopic" not in _rows_reasons(r["reasons"]):
+            continue
+        title = str(r["title"] or "").strip()
+        if title and title not in out:
+            out.append(title)
+        if len(out) >= max_items:
+            break
+    return out
+
+
 def prompt_lines(store: Any, group_id: Any, now: float, *, days: int = SCAN_DAYS,
                  max_items: int = 10) -> list[str]:
     """给找资讯的模型看：最近两周群友对哪些资讯有什么意见 + 反复出现的毛病对应的要求。没有就 []。"""

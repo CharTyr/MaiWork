@@ -127,7 +127,7 @@ def test_no_main_skill_no_main_mcp_is_empty(tmp_path: Path, store: Store) -> Non
     """线上常态：skill 工具总注册着，但没有给主模型的 skill、也没有 main MCP → 空表
     （排计划照旧一次纯 JSON 调用，不白白多轮）。"""
     tools = Tools(store)
-    register_skill_tools(tools, Skills(tmp_path))  # 空 skills 目录
+    register_skill_tools(tools, Skills(tmp_path))  # 空 skills 目录（内置 news-standard 只给 worker，不开主模型的 skill 工具）
     _reg(tools, "mcp_worker_only", {"worker"})
     assert coordinator.main_plan_tool_specs(tools) == []
 

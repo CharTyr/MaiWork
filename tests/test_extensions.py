@@ -647,7 +647,7 @@ class TestSkills:
             body="# 步骤\n先列大纲\n",
         )
         _make_skill(tmp_path, "bare", body="没有 front matter 的正文\n")
-        sk = Skills(tmp_path)
+        sk = Skills(tmp_path, builtin_root=None)
         items = sk.list()
         by_name = {i["name"]: i for i in items}
         assert set(by_name) == {"pptx", "bare"}
@@ -662,7 +662,7 @@ class TestSkills:
         from CharTyr_MaiWork.maiwork.skills import Skills
 
         _make_skill(tmp_path, "dir-name", front="---\nname: 别的名字\ndescription: x\n---\n")
-        sk = Skills(tmp_path)
+        sk = Skills(tmp_path, builtin_root=None)
         assert [i["name"] for i in sk.list()] == ["dir-name"]
 
     def test_list_max_20_and_hint(self, tmp_path: Path) -> None:
@@ -737,7 +737,7 @@ class TestSkills:
     def test_skills_dir_missing_is_empty(self, tmp_path: Path) -> None:
         from CharTyr_MaiWork.maiwork.skills import Skills
 
-        sk = Skills(tmp_path / "不存在")
+        sk = Skills(tmp_path / "不存在", builtin_root=None)
         assert sk.list() == []
         assert sk.read("x") is None
         assert sk.hint() == ""

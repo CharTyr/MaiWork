@@ -170,6 +170,7 @@ class Workers:
         skills_hint: Any = None,
         system_extra: str = "",
         deadline_ts: float | None = None,
+        artifact_scope: tuple[str, ...] | None = None,
     ) -> WorkerReport:
         specs = self._tools.specs("worker", list(tools) + ["submit_result"])
         messages: list[dict] = [
@@ -182,6 +183,7 @@ class Workers:
             actor=actor,
             workspace=workspace,
             role="worker",
+            artifact_scope=artifact_scope,
         )
         steps = 0
         nudges = 0

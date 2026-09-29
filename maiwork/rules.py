@@ -734,6 +734,8 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     _F("console.listen", "网页监听地址", "写成 IP:端口", "str", check=_check_listen),
     _F("console.password", "管理员密码", "", "secret"),
     _F("console.public_url", "网页对外地址", "用来生成群链接，比如 https://maiwork.example.com", "str", check=_check_public_url),
+    _F("console.update_check", "查新版本", "打开网页时看看 GitHub 上有没有 MaiWork 新版，有就提醒（更新去 MaiBot 的插件管理点）", "bool"),
+    _F("console.maibot_webui_url", "MaiBot 网页地址", "填了，更新提醒里有直达按钮，比如 http://127.0.0.1:8001", "str", check=_check_public_url),
 
     # ---- environments ----
     _F("environments.railway", "允许用 Railway 临时 VM", "", "bool"),

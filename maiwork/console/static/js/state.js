@@ -56,6 +56,7 @@ export const state = {
   detail: null, // {type: "task"|"goal", id}
   sheet: null,
   settings: null,
+  update: null, // /api/update 的结果（更新提醒，只有总管理员有）
   tasks: {}, // 任务详情缓存
   badLink: false,
   loginError: "",

@@ -42,7 +42,7 @@ def _norm_accounts(values: object, field_zh: str, problems: list[str]) -> tuple[
     return tuple(out)
 
 
-CONFIG_VERSION = "0.4.3"  # 0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
+CONFIG_VERSION = "0.4.4"  # 0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
 
 # 插件目录 = 本文件所在目录；默认数据目录 = 插件目录上两级 / data / maiwork
 # （线上 <MaiBot>/plugins/CharTyr_MaiWork → <MaiBot>/data/maiwork）
@@ -210,6 +210,8 @@ class ConsoleSectionConfig(PluginConfigBase):
     listen: str = Field(default="127.0.0.1:18650", description="网页监听地址，必须为 IP:端口")
     password: str = Field(default="", description="管理员密码；空则首次启动自动生成")
     public_url: str = Field(default="", description="网页对外的地址（如 https://maiwork.example.com）；用于拼群链接")
+    update_check: bool = Field(default=True, description="管理员打开网页时顺手查 GitHub 上有没有 MaiWork 新版（只提醒，不自动更新）")
+    maibot_webui_url: str = Field(default="", description="MaiBot 自己网页的地址；填了，更新提醒里的按钮直接跳过去")
 
 
 class SSHServerConfig(PluginConfigBase):
@@ -440,12 +442,20 @@ class TasksSetting:
     run_seconds: int = 10800      # 单任务开工时长自动暂停线（秒；0 = 不限）
 
 
+def _http_url_or_empty(v: object) -> str:
+    """只认 http(s):// 开头的地址（去尾部斜杠）；别的一律当没填。"""
+    s = str(v or "").strip().rstrip("/")
+    return s if re.match(r"^https?://[^\s]+$", s) else ""
+
+
 @dataclass(frozen=True)
 class ConsoleSetting:
     # (host, port)；默认 ("127.0.0.1", 18650)
     listen: tuple[str, int]
     password: str
     public_url: str
+    update_check: bool = True
+    maibot_webui_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -1060,6 +1070,8 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
             listen=listen,
             password=str(console.password or ""),
             public_url=str(console.public_url or "").rstrip("/"),
+            update_check=bool(getattr(console, "update_check", True)),
+            maibot_webui_url=_http_url_or_empty(getattr(console, "maibot_webui_url", "")),
         ),
         environments=_parse_environments(env, workspace_root, problems),
         profile=ProfileSetting(

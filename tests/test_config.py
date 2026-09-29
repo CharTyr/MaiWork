@@ -48,7 +48,8 @@ class TestDefaults:
         # 0.4.1：[reader] Jina Reader（打开网页首选）
         # 0.4.2：[models] max_tokens（每次模型调用都带上，缺省 32768）
         # 0.4.3：[feeds] viz_per_day（资讯图解每群每天上限）
-        assert CONFIG_VERSION == "0.4.3"
+        # 0.4.4：[console] update_check、maibot_webui_url（更新提醒）
+        assert CONFIG_VERSION == "0.4.4"
         assert MaiWorkConfig().plugin.config_version == CONFIG_VERSION
 
     def test_railway_verify_new_fields_defaults(self) -> None:

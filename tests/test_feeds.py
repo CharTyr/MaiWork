@@ -888,6 +888,7 @@ def test_news_view_structure_and_order(tmp_path) -> None:
         "id", "icon", "kind", "title", "summary", "why", "sources",
         "published_ts", "scores", "topic", "sensitive", "profile_ref", "status", "feedback",
         "body", "reason", "refs", "audience", "image_url", "verify", "angle", "viz",
+        "bridge",  # 2026-09-29：拓展条目「从哪条兴趣跳过来」
     }
     assert set(item["scores"].keys()) == {"info", "source", "relevance", "timeliness", "chat", "avg"}
     assert item["kind"] == "news" and item["topic"] == "话题" and item["sensitive"] is False

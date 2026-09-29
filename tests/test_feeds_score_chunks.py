@@ -189,7 +189,8 @@ def test_still_missing_after_retry_rejected_as_unfinished(tmp_path) -> None:
         _run(feeds._score(GID, settings, cands))
     assert len(models.calls) == 2
     assert "reject" not in cands[0] and "reject" not in cands[1]
-    assert cands[2]["reject"][0] == "score" and "打分没做完" in cands[2]["reject"][1]
+    # 模型回了但漏了这条（不是出错）→ 2026-09-29 起理由写「打分漏了这条」，别和超时混在一起
+    assert cands[2]["reject"][0] == "score" and "打分漏了这条" in cands[2]["reject"][1]
 
 
 def test_prompt_demands_every_item(tmp_path) -> None:

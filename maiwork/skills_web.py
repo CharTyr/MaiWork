@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from . import clock
-from .skills import _normalize_roles, parse_front_matter
+from .skills import BUILTIN_ROOT, _roles_of, parse_front_matter
 
 logger = logging.getLogger("maiwork.skills_web")
 
@@ -41,6 +41,30 @@ _FILES_LIST_MAX = 50
 
 def _root(data_dir: Path | str) -> Path:
     return Path(data_dir) / "skills"
+
+
+def _builtin_dir(name: str) -> Path | None:
+    """内置 skill（maiwork/builtin_skills/<名字>/，随插件发布、只读）；没有 → None。"""
+    n = str(name or "").strip()
+    if not _NAME_RE.match(n):
+        return None
+    p = BUILTIN_ROOT / n
+    try:
+        if p.is_symlink() or not p.is_dir() or not (p / "SKILL.md").is_file():
+            return None
+    except OSError:
+        return None
+    return p
+
+
+def _builtin_names() -> list[str]:
+    try:
+        return sorted(p.name for p in BUILTIN_ROOT.iterdir() if _builtin_dir(p.name) is not None)
+    except OSError:
+        return []
+
+
+_BUILTIN_READONLY = "内置 skill 随插件发布，网页上不能改或删（要改标准得发新版本）"
 
 
 def _chmod(p: Path, mode: int) -> None:
@@ -127,7 +151,7 @@ def _stat_item(skill_dir: Path, name: str, text: str, source: str) -> dict[str, 
     return {
         "name": name,
         "description": str(front.get("description") or ""),
-        "roles": _normalize_roles(front.get("roles")),
+        "roles": _roles_of(front),
         "source": source,
         "size": int(st.st_size),
         "updated_ts": float(st.st_mtime),
@@ -143,7 +167,7 @@ def _list_files(skill_dir: Path) -> list[str]:
             dirnames[:] = [d for d in dirnames if not (Path(dirpath) / d).is_symlink()]
             for fn in sorted(filenames):
                 p = Path(dirpath) / fn
-                if p.is_symlink():
+                if p.is_symlink() or fn.startswith("._"):  # macOS 在 exFAT 上生成的 AppleDouble 不算
                     continue
                 rel = p.relative_to(skill_dir).as_posix()
                 if rel == "SKILL.md":
@@ -169,13 +193,20 @@ def list_view(data_dir: Path | str, store: Any) -> list[dict[str, Any]]:
     root = _root(data_dir)
     web = set(_web_names(store))
     out: list[dict[str, Any]] = []
+    builtin = _builtin_names()
+    for n in builtin:
+        view = get_view(data_dir, store, n)
+        if view is not None:
+            view.pop("body", None)
+            view.pop("files", None)
+            out.append(view)
     try:
         entries = sorted(root.iterdir(), key=lambda p: p.name)
     except (OSError, FileNotFoundError):
-        return []
+        return out
     for p in entries:
         try:
-            if not p.is_dir() or p.is_symlink():
+            if not p.is_dir() or p.is_symlink() or p.name in builtin:
                 continue
             target = p / "SKILL.md"
             if target.is_symlink() or not target.is_file():
@@ -191,8 +222,9 @@ def get_view(data_dir: Path | str, store: Any, name: str) -> dict[str, Any] | No
     """GET /api/extensions/skills/{name}：{name, description, roles, body, source, files}；
     不存在 / 不合法 / 符号链接 → None。"""
     root = _root(data_dir)
+    builtin = _builtin_dir(name)
     try:
-        skill_dir = _safe_skill_dir(root, name)
+        skill_dir = builtin or _safe_skill_dir(root, name)
     except ValueError:
         return None
     try:
@@ -202,7 +234,8 @@ def get_view(data_dir: Path | str, store: Any, name: str) -> dict[str, Any] | No
         if target.is_symlink() or not target.is_file():
             return None
         text = target.read_bytes()[: _SIZE_MAX_BYTES + 1].decode("utf-8", errors="replace")
-        item = _stat_item(skill_dir, skill_dir.name, text, "web" if skill_dir.name in set(_web_names(store)) else "file")
+        source = "builtin" if builtin else ("web" if skill_dir.name in set(_web_names(store)) else "file")
+        item = _stat_item(skill_dir, skill_dir.name, text, source)
         item["body"] = _split_body(text)[:_SIZE_MAX_BYTES]
         item["files"] = _list_files(skill_dir)
         return item
@@ -249,6 +282,8 @@ def create(data_dir: Path | str, store: Any, body: dict[str, Any]) -> dict[str, 
         raise ValueError("；".join(problems))
     text = _render(name, description, roles if roles is not None else ["worker"], text_body)
     _check_size(text)
+    if _builtin_dir(name) is not None:
+        raise FileExistsError(f"「{name}」是内置 skill 的名字，换一个")
     if skill_dir.exists() or skill_dir.is_symlink():
         raise FileExistsError(f"已经有叫「{name}」的 skill 了（重名）")
     root.mkdir(parents=True, exist_ok=True)
@@ -266,6 +301,8 @@ def update(data_dir: Path | str, store: Any, name: str, body: dict[str, Any]) ->
     """网页修改 skill（description / roles / body 传了才改）。KeyError 不存在。"""
     root = _root(data_dir)
     name = str(name or "").strip()
+    if _builtin_dir(name) is not None:
+        raise PermissionError(_BUILTIN_READONLY)
     skill_dir = _safe_skill_dir(root, name)  # ValueError：名字不合法
     try:
         if skill_dir.is_symlink() or not skill_dir.is_dir():
@@ -307,6 +344,8 @@ def delete(data_dir: Path | str, store: Any, name: str) -> None:
     """
     root = _root(data_dir)
     name = str(name or "").strip()
+    if _builtin_dir(name) is not None:
+        raise PermissionError(_BUILTIN_READONLY)
     # 名字白名单本身就挡掉了 .. / 斜杠等越界形态（_safe_skill_dir 抛 ValueError）
     skill_dir = _safe_skill_dir(root, name)
     try:
@@ -465,6 +504,8 @@ def install_zip(store: Any, data_dir: Path | str, blob: bytes, *, filename: str 
         name = _normalize_uploaded_name(infos, skill_md_rel, filename, zf)
         if not _NAME_RE.match(name):
             raise ValueError(f"skill 名字 {name!r} 不合法（只能用字母、数字、下划线、横线，1~64 个字符）")
+        if _builtin_dir(name) is not None:
+            raise FileExistsError(f"「{name}」是内置 skill 的名字，不能用上传覆盖")
         root = _root(data_dir)
         target = _safe_skill_dir(root, name)  # ValueError：路径不合法
         if (target.exists() or target.is_symlink()) and not replace:
