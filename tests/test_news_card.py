@@ -212,3 +212,61 @@ def test_clip_counts_ascii_narrower():
     en = "Ace Combat 8: Wings of Theve Launch Trailer Arrives Ahead of Release"
     assert news_card._clip(en, 60) == en
     assert news_card._clip("中" * 80, 60).endswith("…")
+
+
+def test_cards_overlap_the_sky_layered():
+    """2026-09-29 用户要：资讯卡片往上压住天空背景的下半截，形成前后层次（视差感）；
+    天体也有一部分被第一张卡片挡住。不再用底部那道白色山丘波浪。"""
+    h = news_card.render_html(_data(), now=NOW)
+    assert news_card._OVERLAP >= 80
+    assert f"margin-top:-{news_card._OVERLAP}px" in h
+    assert 'class="hill"' not in h
+    # 天体底边落进卡片压住的那一截（中午太阳在高处，不算）
+    for word, sky in news_card._SKIES.items():
+        if word == "中午":
+            continue
+        size = news_card._ORB_SIZE[sky["orb"]]
+        orb_bottom = news_card._SKY_H * sky["orb_y"] + size / 2
+        assert orb_bottom > news_card._SKY_H - news_card._OVERLAP, word
+
+
+def test_every_slot_renders_with_light_text():
+    """苹果天气那种做法：五个时段都是白字压在渐变天空上。"""
+    for word in news_card._SKIES:
+        h = news_card.render_html(_data(slot_label=f"9月29日 · {word}"), now=NOW)
+        assert "--ink:#fff" in h, word
+
+
+def test_viz_image_shown_when_no_cover():
+    """没封面、但有图解截图（viz_img）的条目：卡片里画出图解；有封面的仍用封面，不重复画图解。"""
+    img = "data:image/png;base64,iVBORw0KGgo="
+    items = [
+        {"title": "有图解没封面", "summary": "s", "viz_img": img},
+        {"title": "有封面也有图解", "summary": "s", "cover": "data:image/jpeg;base64,/9j/", "viz_img": img},
+        {"title": "外链图解不画", "summary": "s", "viz_img": "https://evil.example/x.png"},
+    ]
+    h = news_card.render_html(_data(items=items), now=NOW)
+    assert h.count('class="viz"') == 1
+    assert "evil.example" not in h
+
+
+def test_viz_pages_selection():
+    """要截图解的：前 3 条里没封面、有图解整页的。"""
+    data = {"items": [
+        {"title": "a", "viz_html": "<html>1</html>"},
+        {"title": "b", "cover": "data:image/jpeg;base64,x", "viz_html": "<html>2</html>"},
+        {"title": "c"},
+    ]}
+    assert [it["title"] for it in news_card._viz_todo(data)] == ["a"]
+
+
+def test_text_not_truncated():
+    """2026-09-29 用户要：卡片上的标题、摘要、「值得看」都显示完整，不截断、不加省略号。"""
+    long_title = "很长的标题" * 20
+    long_sum = "这是一段很长的摘要，" * 30
+    long_why = "值得看的理由很长，" * 15
+    items = [{"title": long_title, "summary": long_sum, "why": long_why, "site": "a.com"},
+             {"title": "二", "summary": long_sum, "why": long_why}]
+    h = news_card.render_html(_data(items=items), now=NOW)
+    assert long_title in h and h.count(long_sum.strip()) == 2 and long_why.strip() in h
+    assert "…" not in h

@@ -295,3 +295,15 @@ def test_feeds_view_flags_viz(tmp_path) -> None:
         fm.clock.now = orig
     assert items[a]["viz"] is True
     assert items[b]["viz"] is False
+
+
+def test_brief_prefers_one_glance_over_interaction():
+    """2026-09-29 用户定：图解以一眼能看完为主，内容实在放不下才做交互（标签页 / 展开）。
+    群里的资讯卡片只截图解最上面一段，藏在别的标签页 / 折叠里的内容卡片上看不到。"""
+    from CharTyr_MaiWork.maiwork.news_viz import NewsViz
+
+    b = NewsViz._brief({"title": "t", "body": "b", "summary": ""}, "原文")
+    assert "一眼能看完" in b
+    i_glance, i_interact = b.index("一眼能看完"), b.index("单选框")
+    assert i_glance < i_interact and "放不下" in b[i_glance:i_interact + 80]
+    assert "480" in b  # 高度建议：卡片截图只截上面一段

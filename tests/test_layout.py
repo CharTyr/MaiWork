@@ -21,6 +21,8 @@ _ALLOWED = {
     "maiwork", "tests", "tests_host",
     # 公开仓库根目录就是插件目录，额外带给人看的 README / logo / 截图（docs/images）
     "README.md", "logo.png", "logo.svg", "docs",
+    # 代码地图（给开发者 / agent 读的说明文字，2026-09-29 用户同意随插件一起部署和公开）
+    "codemap.md",
     # git clone 装的会有 .git（/.github）
     ".git", ".github",
 }

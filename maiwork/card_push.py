@@ -309,6 +309,8 @@ class CardPush:
                 "topic": str(r["topic"] or ""),
                 "kind": str(r["kind"] or "news"),
                 "image_url": str(r["image_url"] or ""),
+                # 核对过的图解整页（没封面时画进卡片，免得连配图都没有；news_card 截成图）
+                "viz_html": self._viz_html(gid, r["id"]),
             })
         return {
             "group_name": str(grow["name"] or "") if grow is not None else "",
@@ -318,6 +320,15 @@ class CardPush:
             "total": int(batch["kept"]) if batch is not None else len(items),
             "items": items,
         }
+
+    def _viz_html(self, gid: str, item_id: Any) -> str:
+        try:
+            from . import news_viz
+
+            return news_viz.html_for(self._store, gid, int(item_id)) or ""
+        except Exception:  # noqa: BLE001  图解是锦上添花，读不到就不画
+            logger.debug("读图解失败（群 %s 条 %s）", gid, item_id, exc_info=True)
+            return ""
 
     @staticmethod
     def _text_fallback(data: dict) -> str:

@@ -403,3 +403,21 @@ async def test_status_for_web(tmp_path):
     assert st["sent_today"] == 1
     assert st["recent"][0]["status"] == "sent"
     assert st["recent"][0]["count"] == 3
+
+
+async def test_card_data_carries_checked_viz_html(tmp_path):
+    """2026-09-29 用户要：上卡片的资讯有核对过的图解，就把图解也画进卡片（免得连配图都没有）。
+    只给 status=ok 的；被拒 / 没做的不给。"""
+    store, _, host, pushes, mentions, renderer, cp = _make(tmp_path)
+    _enable(store, news_card_count=2)
+    _, ids = _batch(store)
+    with store.tx() as conn:
+        conn.execute("INSERT INTO news_viz (item_id, group_id, status, html, reason, created, updated)"
+                     " VALUES (?, ?, 'ok', '<p>图解一</p>', '', ?, ?)", (ids[0], GID, NOON, NOON))
+        conn.execute("INSERT INTO news_viz (item_id, group_id, status, html, reason, created, updated)"
+                     " VALUES (?, ?, 'rejected', '<p>没过</p>', 'x', ?, ?)", (ids[1], GID, NOON, NOON))
+    cp.scan(GID, NOON + 60)
+    await cp.flush(GID, NOON + 60)
+    items = renderer.calls[0]["items"]
+    assert "<p>图解一</p>" in items[0]["viz_html"] and "Content-Security-Policy" in items[0]["viz_html"]
+    assert not items[1].get("viz_html")
