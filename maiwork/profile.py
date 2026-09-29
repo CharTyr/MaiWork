@@ -132,7 +132,8 @@ class Profiles:
     # ------------------------------------------------------------------
 
     # 每批交给主模型的消息条数上限（多批依次提炼，首次回读最多 1500 → 5 批）
-    _REFRESH_BATCH = 300
+    # 2026-09-29：网关约 129 秒断连接（流式也一样），300 条一批 glm 常要想 100~140 秒 → 120
+    _REFRESH_BATCH = 120
     # 连续解析/调用失败多少次就跳过这批（推进游标、记事件，避免卡死）
     _MAX_FAILS = 3
     # 传给单条消息的文本上限（字）
@@ -224,12 +225,20 @@ class Profiles:
         """按区间翻页读消息（不含 start 之前、含两端边界），最多 _PAGE_LIMIT*_MAX_PAGES 条。"""
         out: list = []
         cursor = start
+        seen_ids: set = set()
         for _ in range(_MAX_PAGES):
             page = await self._host.messages(session_id, cursor, end, _PAGE_LIMIT, limit_mode="earliest")
             if not page:
                 break
-            out.extend(page)
-            if len(page) < _PAGE_LIMIT:
+            # 不能按「这页不满 200 条」判读完：host.messages 会滤掉通知 / 缺 id 的记录，
+            # 宿主给了满页也常常拿回来不满（2026-09-29 线上补整理每轮只读一页就停了）。
+            # 改成：这页一条新消息都没有、或时间没往前走，才算读完。
+            fresh = [m for m in page if str(m.id) not in seen_ids]
+            if not fresh:
+                break
+            seen_ids.update(str(m.id) for m in fresh)
+            out.extend(fresh)
+            if page[-1].ts <= cursor and len(page) < _PAGE_LIMIT:
                 break
             cursor = page[-1].ts
         # 分页重叠的同 ts 消息可能重复，按 id 去重
@@ -246,13 +255,34 @@ class Profiles:
     _SPLIT_MIN = 40
     # 整理画像的单次等待上限（秒）：step-5-preview 先在后台「思考」2k–9.5k token（约 70 token/秒），
     # 120 秒不够；超时只重试 1 次（同一批原样重复多次没用，线上 18 次全超时）
-    _REFRESH_TIMEOUT_S = 300
-    _REFRESH_RETRIES = 1
+    # 2026-09-29：glm-5.3-flash 把思考写在正文里，端点默认 8192 token 就截断（半数回答被截）；
+    # 给到 16000，流式约 55 token/秒，总时长放到 420 秒
+    # 网关约 129 秒断连接：同一批原样重试没用，失败直接交给拆半（retries=0）；
+    # 输出上限 12000（够写结果，想太久就截断 → 不带草稿再问一次，比被断强）
+    _REFRESH_TIMEOUT_S = 420
+    _REFRESH_RETRIES = 0
+    _REFRESH_MAX_TOKENS = 12000
     _FORMAT_RETRY_TEXT = (
         "上面的回答读不懂，格式不对。请严格按「一行一件事」的格式重新输出，每行用「|」分段，"
         "例如：新增 | 最近在聊 | 一句话 | 3,5。不要 JSON、不要别的话；"
         "这批消息没有任何新变化就只输出一行：没有变化"
     )
+
+    _TRUNCATED_RETRY_TEXT = (
+        "刚才的回答太长被截断了。这次不要写分析过程，直接按「一行一件事」的格式输出结果，"
+        "每行用「|」分段；这批消息没有任何新变化就只输出一行：没有变化"
+    )
+
+    @staticmethod
+    def _truncated(result) -> bool:
+        return str(getattr(result, "finish_reason", "") or "") == "length"
+
+    def _read_answer(self, result):
+        """解析一次回答；被 max_tokens 截断的一律当读不懂（草稿里夹着「新增 | …」半成品行，
+        2026-09-29 线上这样读进过画像）。"""
+        if self._truncated(result):
+            return None
+        return self._parse_output(result.text)
 
     async def _refine_with_split(self, gid: str, batch_msgs: list, now: float) -> bool:
         """提炼一批；整批失败且够大 → 拆两半各试一次（前半失败就停）；最终失败才记 fail_count。"""
@@ -270,6 +300,7 @@ class Profiles:
         return await self._models.chat(
             "main", messages, json_mode=False, purpose="profile.refresh", group_id=gid,
             timeout=self._REFRESH_TIMEOUT_S, retries=self._REFRESH_RETRIES,
+            max_tokens=self._REFRESH_MAX_TOKENS,
         )
 
     async def _refine_batch(self, gid: str, batch_msgs: list, now: float, *, record_failure: bool = True) -> bool:
@@ -288,19 +319,27 @@ class Profiles:
             result = await self._ask_model(gid, messages)
         except ModelError:
             return failed()
-        parsed = self._parse_output(result.text)
+        parsed = self._read_answer(result)
         if parsed is None:
-            logger.info("整理群画像：回答读不懂，再问一次（群 %s）：%s", gid, str(result.text or "")[:80])
-            retry = [
-                *messages,
-                {"role": "assistant", "content": str(result.text or "")[:2000]},
-                {"role": "user", "content": self._FORMAT_RETRY_TEXT},
-            ]
+            truncated = self._truncated(result)
+            logger.info(
+                "整理群画像：回答%s，再问一次（群 %s）：%s",
+                "被截断" if truncated else "读不懂", gid, str(result.text or "")[:80],
+            )
+            if truncated:
+                # 截断的多半是思考写太长的草稿：不把草稿塞回去（又长又会被照抄），直接要结果
+                retry = [*messages, {"role": "user", "content": self._TRUNCATED_RETRY_TEXT}]
+            else:
+                retry = [
+                    *messages,
+                    {"role": "assistant", "content": str(result.text or "")[:2000]},
+                    {"role": "user", "content": self._FORMAT_RETRY_TEXT},
+                ]
             try:
                 result = await self._ask_model(gid, retry)
             except ModelError:
                 return failed()
-            parsed = self._parse_output(result.text)
+            parsed = self._read_answer(result)
         if parsed is None:
             return failed()
         ops, people, asks = parsed

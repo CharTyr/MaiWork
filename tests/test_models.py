@@ -990,3 +990,24 @@ class TestStreaming:
         row = store.read().execute("SELECT ok, status FROM model_calls").fetchone()
         assert row["ok"] == 0
         await models.close()
+
+
+class TestMaxTokensAndFinish:
+    @pytest.mark.asyncio
+    async def test_max_tokens_sent_only_when_given_and_finish_reason_exposed(self, tmp_path) -> None:
+        bodies = []
+
+        def h(request):
+            bodies.append(json.loads(request.content))
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=_sse([
+                _delta(content="半截"),
+                {"id": "c", "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]},
+            ]))
+
+        store, models = _stream_models(tmp_path, h)
+        r = await models.chat("main", [{"role": "user", "content": "x"}], max_tokens=16000)
+        assert bodies[0]["max_tokens"] == 16000
+        assert r.finish_reason == "length"
+        await models.chat("main", [{"role": "user", "content": "x"}])
+        assert "max_tokens" not in bodies[1]
+        await models.close()

@@ -171,12 +171,12 @@ class AdminChat:
                 logger.exception("从库里取密钥失败")
         settings = self._settings_or_none()
         if settings is not None:
-            try:
-                for val in (settings.models.api_key, settings.search.api_key):
-                    if val:
-                        out.append(_s(val))
-            except Exception:
-                logger.exception("从设置里取密钥失败")
+            # 按现在的配置段逐个取（[search] 段早已删掉，搜索密钥在库里的 mcp.*；
+            # 2026-09-29 线上还读 settings.search 每次报错、模型密钥也跟着漏掉）
+            for section, field in (("models", "api_key"), ("reader", "jina_api_key")):
+                val = getattr(getattr(settings, section, None), field, None)
+                if val:
+                    out.append(_s(val))
         seen: list[str] = []
         for val in out:
             if val and val not in seen:

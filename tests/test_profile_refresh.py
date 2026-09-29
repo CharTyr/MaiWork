@@ -236,7 +236,7 @@ class TestGate:
 
 class TestBatches:
     @pytest.mark.asyncio
-    async def test_first_refresh_splits_into_300_per_call(
+    async def test_first_refresh_splits_into_120_per_call(
         self, store: Store, frozen_now: float, tmp_path: Path
     ) -> None:
         settings = _settings(tmp_path)
@@ -246,7 +246,7 @@ class TestBatches:
         r = await p.tick(GID)
         assert r.read == 1500
         assert r.refreshed is True
-        assert len(models.calls) == 5  # 300 × 5
+        assert len(models.calls) == 13  # 120 × 12 + 60
         row = _group(store)
         assert row["pending_count"] == 0
 
@@ -931,11 +931,12 @@ class TestLineFormat:
             "SELECT evidence FROM profile_entries WHERE text=?", ("在聊新出的掌机",)).fetchone()
         # 第二批窗口含上一批最后那条（m2），序号 1、3 → m2、n1
         assert _j.loads(row["evidence"]) == ["m2", "n1"]
-        # 调用：不开 JSON 模式、等待上限 300 秒、超时只重试 1 次
+        # 调用：不开 JSON 模式、等待上限 420 秒（给到 16000 token）、超时只重试 1 次
         kw = models.calls[0][2]
         assert kw.get("json_mode") is False
-        assert kw.get("timeout") == 300
-        assert kw.get("retries") == 1
+        assert kw.get("timeout") == 420
+        # 网关约 129 秒就断连接（流式也一样）：同一批原样重试没用，失败直接拆半
+        assert kw.get("retries") == 0
 
     @pytest.mark.asyncio
     async def test_prompt_describes_line_format(self, store: Store, frozen_now: float, tmp_path: Path) -> None:
@@ -1031,3 +1032,81 @@ class TestLineFormat:
         assert len(models.calls) == 3
         assert "[31]" not in str(models.calls[1][1]) and "[30]" in str(models.calls[1][1])
         assert _group(store)["pending_count"] == 0 and _group(store)["fail_count"] == 0
+
+
+class TestReadWindowPaging:
+    """2026-09-29 线上补整理：宿主一页 200 条里有通知/缺 id 被过滤，拿回来不满 200 条
+    就被当成「读完了」，每轮只整理约一页，后面几千条卡住等新消息。"""
+
+    def test_short_page_after_filtering_keeps_paging(self, store, tmp_path) -> None:
+        import asyncio
+        from CharTyr_MaiWork.maiwork import profile as profile_mod
+
+        msgs = [_msg(f"m{i}", T0 - 5000 + i) for i in range(500)]
+
+        class FilteringHost(FakeHost):
+            async def messages(self, session_id, start, end, limit, *, limit_mode="latest"):
+                page = await super().messages(session_id, start, end, limit, limit_mode=limit_mode)
+                # 模拟 host.messages 过滤掉通知：每页少几条
+                return [m for m in page if not m.id.endswith("7")]
+
+        host = FilteringHost(msgs)
+        p = _make(store, host, FakeModelsQueue(ready=True), _settings(tmp_path))
+        got = asyncio.run(p._read_window("sess-1", T0 - 6000, T0))
+        want = [m.id for m in msgs if not m.id.endswith("7")]
+        assert [m.id for m in got] == want
+        assert len(host.msg_calls) <= profile_mod._MAX_PAGES
+
+
+class TestTruncatedAnswer:
+    """2026-09-29 线上：glm-5.3-flash 把思考写在正文里，8192 token 截断；截断的草稿里
+    夹着「新增 | …」草稿行，被当成功读进了画像。截断的一律不读，再问一次。"""
+
+    def _prep(self, store, tmp_path, replies):
+        msgs = [_msg(f"m{i}", T0 - 100 + i, text=f"聊游戏{i}") for i in range(3)]
+        host = FakeHost(msgs)
+        models = FakeModelsQueue(ready=True, replies=replies)
+        p = _make(store, host, models, _settings(tmp_path))
+        return p, models
+
+    def _entries(self, store):
+        return store.read().execute(
+            "SELECT text FROM profile_entries WHERE group_id=?", (GID,)
+        ).fetchall()
+
+    def test_truncated_draft_not_applied_then_retry_used(self, store, tmp_path, frozen_now) -> None:
+        import asyncio
+        draft = "Let me think...\n新增 | 最近在聊 | 草稿里的半截话 | 1\nhmm, maybe"
+        p, models = self._prep(store, tmp_path, [
+            {"text": draft, "finish_reason": "length"},
+            "新增 | 最近在聊 | 群友在聊新游戏 | 1,2",
+        ])
+        asyncio.run(p.tick(GID, refresh=False))
+        asyncio.run(p.refresh(GID, force=True))
+        texts = [r["text"] for r in self._entries(store)]
+        assert not any("草稿" in t for t in texts), texts
+        assert any("新游戏" in t for t in texts), texts
+        assert len(models.calls) == 2
+
+    def test_truncated_twice_is_failure(self, store, tmp_path, frozen_now) -> None:
+        import asyncio
+        draft = {"text": "新增 | 最近在聊 | 草稿 | 1", "finish_reason": "length"}
+        p, models = self._prep(store, tmp_path, [draft, draft])
+        asyncio.run(p.tick(GID, refresh=False))
+        asyncio.run(p.refresh(GID, force=True))
+        assert self._entries(store) == []
+        assert int(_group(store)["fail_count"]) == 1
+
+    def test_refresh_asks_for_larger_output_budget(self, store, tmp_path, frozen_now) -> None:
+        import asyncio
+        p, models = self._prep(store, tmp_path, ["没有变化"])
+        asyncio.run(p.tick(GID, refresh=False))
+        asyncio.run(p.refresh(GID, force=True))
+        kw = models.calls[0][2]
+        assert 8000 <= kw.get("max_tokens", 0) <= 12000
+        assert kw.get("timeout", 0) >= 120
+
+
+def test_refresh_batch_small_enough_for_gateway_limit() -> None:
+    """2026-09-29 线上：网关约 129 秒断连接；300 条一批 glm 要想 100~140 秒，常被断。"""
+    assert Profiles._REFRESH_BATCH <= 120

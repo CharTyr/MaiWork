@@ -296,10 +296,17 @@ class FakeModelsQueue:
             item = self.reply_queue.pop(0)
             if isinstance(item, BaseException):
                 raise item
-            text = str(item)
+            if isinstance(item, dict) and "text" in item:
+                # {"text": ..., "finish_reason": "length"}：模拟回答被截断
+                text = str(item["text"])
+                finish = str(item.get("finish_reason") or "stop")
+            else:
+                text = str(item)
+                finish = "stop"
         else:
             text = '{"ops": [], "people": []}'
-        return type("ChatResult", (), {"text": text})()
+            finish = "stop"
+        return type("ChatResult", (), {"text": text, "finish_reason": finish})()
 
 
 # ---------------------------------------------------------------------------

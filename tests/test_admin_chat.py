@@ -964,3 +964,27 @@ class TestHistoryRepair:
         ai = roles.index("assistant")
         assert roles[ai + 1] == "tool"  # 提示不能插在 assistant(tool_calls) 和 tool 中间
         assert "中途的提示" in json.dumps(messages, ensure_ascii=False)
+
+
+def test_fallback_secret_list_uses_current_settings_shape(tmp_path, caplog) -> None:
+    """2026-09-29 线上：兜底清单还在读已删掉的 settings.search → 每次报「从设置里取密钥失败」，
+    模型密钥也跟着没进兜底清单。兜底要读现在的配置段（models / reader），不报错。"""
+    import logging
+
+    settings, _ = load_settings({
+        "models": {"base_url": "https://a.test/v1", "api_key": "model-key-abc123", "main": "m", "worker": "w"},
+        "reader": {"jina_api_key": "jina-key-xyz789"},
+    })
+
+    class _App:
+        store = None
+
+        def get_settings(self):
+            return settings
+
+    chat = AdminChat(_App())
+    with caplog.at_level(logging.ERROR, logger="maiwork.admin_chat"):
+        got = chat._secrets()
+    assert "model-key-abc123" in got
+    assert "jina-key-xyz789" in got
+    assert not [r for r in caplog.records if "取密钥失败" in r.getMessage()]

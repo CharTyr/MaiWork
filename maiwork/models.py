@@ -334,6 +334,8 @@ class ChatResult:
     prompt_tokens: int
     completion_tokens: int
     raw_message: dict
+    # "stop" / "tool_calls" / "length"（被 max_tokens 截断）…；端点没给就空字符串
+    finish_reason: str = ""
 
 
 def _valid_int(value: Any, low: int, high: int) -> bool:
@@ -625,6 +627,7 @@ class Models:
         task_id: str = "",
         timeout: float = 120,
         retries: int | None = None,
+        max_tokens: int | None = None,
     ) -> ChatResult:
         """调一次模型。
 
@@ -703,6 +706,8 @@ class Models:
                 }
                 if tools:
                     body["tools"] = tools
+                if max_tokens:
+                    body["max_tokens"] = int(max_tokens)
                 start = clock.now()
                 status = 0
                 try:
@@ -1051,6 +1056,7 @@ class Models:
             prompt_tokens=int(usage.get("prompt_tokens") or 0),
             completion_tokens=int(usage.get("completion_tokens") or 0),
             raw_message=message,
+            finish_reason=str(choice.get("finish_reason") or "") if isinstance(choice, dict) else "",
         )
 
     # ------------------------------------------------------------------
