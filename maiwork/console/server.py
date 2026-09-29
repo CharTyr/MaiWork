@@ -2023,9 +2023,12 @@ class ConsoleServer:
         app.router.add_route("PUT", "/api/groups/{gid}/feeds-pref", self._write(_feeds_pref_put))
         app.router.add_post("/api/groups/{gid}/news/run", self._write(_news_run))
 
-        async def _news_chat_vote(request: web.Request) -> web.Response:
-            """「想在群里聊」：群友（本群）或管理员，只计数 +1。网页没有身份，
-            重复点由前端自己防；这里只负责累加。够票自动补进开话题候选池。"""
+        async def _news_rate(request: web.Request) -> web.Response:
+            """资讯评价（news_rating）：群友（本群）或管理员给一条资讯挑理由 + 可选一句话。
+
+            body: {"client": 浏览器随机标识, "reasons": ["old"|"useless"|"low"|"offtopic"|"dup"|"wrong"…],
+            "note": 一句话}；同一浏览器再评 = 改评价，理由和一句话都空 = 撤回。
+            个人向资讯（给某位关注成员的）群友不能评（和反馈一样）。"""
             ident, deny = await _ident_for_group_action(request, need_admin=False)
             if deny is not None:
                 return deny
@@ -2045,12 +2048,50 @@ class ConsoleServer:
             if personal_deny is not None:
                 return personal_deny
             try:
-                out = svc.feeds.admin_chat_vote(gid, item_id)
+                body = await request.json()
+            except Exception:
+                return _err(400, "要 JSON")
+            if not isinstance(body, dict):
+                return _err(400, "要 JSON 对象")
+            from .. import news_rating
+
+            try:
+                out = news_rating.rate(
+                    svc.store, gid, item_id,
+                    client=body.get("client"), reasons=body.get("reasons") or [],
+                    note=body.get("note") or "", now=clock.now(),
+                )
             except KeyError:
                 return _err(404, "这条资讯不存在")
+            except ValueError as e:
+                return _err(400, str(e))
             return web.json_response(out)
 
-        app.router.add_post("/api/news/{id}/chat-vote", self._write(_news_chat_vote))
+        app.router.add_post("/api/news/{id}/rate", self._write(_news_rate))
+
+        async def _news_viz(request: web.Request) -> web.Response:
+            """资讯图解（news_viz）：核对过的图解整页（带 CSP，前端放进沙箱 iframe）。
+            本群群友 / 群管理员 / 总管理员都能看；个人向资讯不做图解。"""
+            ident, deny = await _ident_for_group_action(request, need_admin=False)
+            if deny is not None:
+                return deny
+            try:
+                item_id = int(request.match_info["id"])
+            except (ValueError, TypeError):
+                return _err(400, "id 要是数字")
+            gid = _group_of("news", item_id)
+            if gid is None:
+                return _err(404, "这条资讯不存在")
+            if _wrong_group(ident, gid):
+                return _err(403, "只能看自己群的内容")
+            from .. import news_viz
+
+            doc = news_viz.html_for(svc.store, gid, item_id) if svc.store is not None else None
+            if doc is None:
+                return _err(404, "这条资讯没有图解")
+            return web.json_response({"html": doc}, headers={"Cache-Control": "no-store"})
+
+        app.router.add_get("/api/news/{id}/viz", _news_viz)
 
         async def _news_mention_to_member(request: web.Request) -> web.Response:
             """管理员在网页点「在群里提给他」：往本群可提起清单加一句（ttl 6 小时）。

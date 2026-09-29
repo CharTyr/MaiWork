@@ -2,7 +2,7 @@
 import { $, admin, state, ui } from "./state.js";
 import { reveal, toast } from "./util.js";
 import { api, grp, gview } from "./api.js";
-import { FB_KEY, VOTE_KEY, myFb, myVotes } from "./pages/news.js";
+import { FB_KEY, RATE_KEY, clientId, myFb, myRates } from "./pages/news.js";
 import { findIdea, ideaAsk, ideaItems, ideaPicked } from "./pages/ideas.js";
 import { refreshDetail } from "./detail.js";
 import { headerRow, loadExt, pickedTool, readHeaders } from "./settings/ext.js";
@@ -668,24 +668,41 @@ export async function act(el, e) {
       }
       break;
     }
-    case "chat-vote": {
+    case "rate-open": {
       const id = el.dataset.id;
-      const votes = myVotes();
-      if (votes[id]) {
-        toast("已经说过想聊了");
-        break;
-      }
+      const vw = gview() || {};
+      const it = [...(vw.news || []).flatMap((b) => b.items || []), ...(vw.guides || [])].find((x) => String(x.id) === String(id));
+      const mine = myRates()[id] || null;
+      state.editing = { kind: "rate", id, title: (it && it.title) || "", reasons: mine ? [...(mine.reasons || [])] : [], note: mine ? mine.note || "" : "", had: !!mine };
+      openSheet("edit");
+      break;
+    }
+    case "rate-chip": {
+      const ed = state.editing || {};
+      if (ed.kind !== "rate") break;
+      const k = el.dataset.k;
+      const set = new Set(ed.reasons || []);
+      if (set.has(k)) set.delete(k);
+      else set.add(k);
+      ed.reasons = [...set];
+      el.setAttribute("aria-pressed", String(set.has(k)));
+      break;
+    }
+    case "rate-clear": {
+      const ed = state.editing || {};
+      if (ed.kind !== "rate") break;
+      el.disabled = true;
       try {
-        const r = await api("POST", `/api/news/${encodeURIComponent(id)}/chat-vote`, {});
-        votes[id] = 1;
-        localStorage.setItem(VOTE_KEY, JSON.stringify(votes));
-        patchView((vw) => {
-          const it = (vw.news || []).flatMap((b) => b.items || []).find((x) => String(x.id) === String(id));
-          if (it && r) it.chat_votes = r.chat_votes;
-        });
+        await api("POST", `/api/news/${encodeURIComponent(ed.id)}/rate`, { client: clientId(), reasons: [], note: "" });
+        const all = myRates();
+        delete all[ed.id];
+        localStorage.setItem(RATE_KEY, JSON.stringify(all));
+        closeSheet();
+        await loadView(true);
         renderView();
-        toast("记下了：想聊的人多了，MaiBot 会找机会在群里提");
+        toast("撤回了");
       } catch (err) {
+        el.disabled = false;
         toast(err.message, true);
       }
       break;

@@ -47,7 +47,8 @@ class TestDefaults:
         # 0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
         # 0.4.1：[reader] Jina Reader（打开网页首选）
         # 0.4.2：[models] max_tokens（每次模型调用都带上，缺省 32768）
-        assert CONFIG_VERSION == "0.4.2"
+        # 0.4.3：[feeds] viz_per_day（资讯图解每群每天上限）
+        assert CONFIG_VERSION == "0.4.3"
         assert MaiWorkConfig().plugin.config_version == CONFIG_VERSION
 
     def test_railway_verify_new_fields_defaults(self) -> None:

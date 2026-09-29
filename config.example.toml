@@ -58,6 +58,8 @@ pool_min_avg = 4.0
 guides = true
 # 资讯收集子 agent 每轮最多跑多少分钟（默认 15）；到点就把已找到的交回来（不是丢弃）。
 collect_minutes = 15
+# 没配图、数字多的资讯画一张「图解」小图，每群每天最多几张（0 = 不画）
+viz_per_day = 3
 
 
 [goals]

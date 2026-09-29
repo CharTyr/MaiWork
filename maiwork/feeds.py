@@ -23,8 +23,8 @@
    同一域名 ≤3、敏感 ≤1、总数 ≤ [feeds] max_items（默认 10），落选 gate='web'；
 7. 第三道（进话题候选池）：kind=news、avg ≥ [feeds] pool_min_avg（默认 4）、
    relevance ≥4、chat ≥4、published 在 48 小时内（没有 published 不进）、非 sensitive。
-   好文一律不进；chat_votes ≥ 2 的资讯可破格进池（48 小时、非争议等其他条件照旧），
-   破格进池的候选过期时间 24 小时；
+   好文一律不进（原来「想在群里聊」够票可破格进池，2026-09-29 随气泡按钮一起删掉，
+   改成资讯评价 news_rating，汇总进下一轮定关注点的提示词）；
 
 「有人味」（docs/02 §4.1，2026-09-27 与用户定）：打分之后、入库前，对过第二道门槛的
 每条再调一次主模型 json_mode 写「帖子」（body/reason/refs/audience/keywords），
@@ -67,7 +67,7 @@ import re as _re
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
-from . import clock, members
+from . import clock, members, news_rating
 from .config import Settings, normalize_domain as _normalize_domain
 from .models import ModelError
 from .search import SearchUnavailable
@@ -229,8 +229,6 @@ _NORM_TOPIC_CAP = 2         # 去同质化：同一话题最多几条
 _NORM_DOMAIN_CAP = 3        # 去同质化：同一域名最多几条
 _NORM_SENSITIVE_CAP = 1     # 去同质化：敏感话题最多几条
 _NORM_DIVERSE_CAP = 2       # 去同质化：同一轮「不同角度」最多几条
-_CHAT_VOTE_MIN = 2          # 「想在群里聊」几票可以破格进候选池
-_CHAT_VOTE_TTL_H = 24.0     # 破格进池的候选过期时间（小时）
 _PREF_MAX = 300             # 资讯偏好一句话最长（字）
 _BODY_LINK_MAX = 4          # body 里最多留几个嵌入链接
 _REF_TEXT_MAX = 80          # refs 里每条原话最多留多少字
@@ -852,16 +850,14 @@ class Feeds:
         )
         del batch_id  # 目前不对外用
         # 第三道：kind=news、avg≥pool_min_avg、relevance≥4、chat≥4、48 小时内、非敏感；
-        # chat_votes ≥2 可破格进池（其他条件照旧），候选过期 24 小时
         for item in accepted:
-            eligible, voted = self._pool_eligible_check(item, pool_min_avg, now)
-            if not eligible:
+            if not self._pool_eligible(item, pool_min_avg, now):
                 continue
             try:
                 self._topics.add_candidate(
                     gid, kind="news", ref_id=item["_news_id"], title=item["title"],
                     brief=self._pool_brief(item), link=item["url"],
-                    ttl_h=_CHAT_VOTE_TTL_H if voted else None,
+                    ttl_h=None,
                 )
             except Exception:
                 logger.exception("资讯进话题候选池失败（群 %s 条 %s）", gid, item.get("_news_id"))
@@ -1123,32 +1119,6 @@ class Feeds:
         if float(sc.get("avg") or 0.0) < pool_min_avg:
             return False
         if float(sc.get("relevance") or 0.0) < 4.0 or float(sc.get("chat") or 0.0) < 4.0:
-            return False
-        published = item.get("published_ts")
-        if not isinstance(published, (int, float)):
-            return False
-        return now - float(published) <= _POOL_NEWS_MAX_AGE_H * 3600.0
-
-    def _pool_eligible_check(self, item: dict, pool_min_avg: float, now: float) -> tuple[bool, bool]:
-        """(能不能进池, 是不是投票破格进的)。
-
-        chat_votes ≥ _CHAT_VOTE_MIN 的资讯：「pool_min_avg / relevance≥4 / chat≥4」这三条
-        分线可以不用过，但「kind=news / 非争议 / 48 小时内」照旧。
-        """
-        if self._pool_eligible(item, pool_min_avg, now):
-            return True, False
-        if self._pool_eligible_with_votes(item, pool_min_avg, now):
-            return True, True
-        return False, False
-
-    def _pool_eligible_with_votes(self, item: dict, pool_min_avg: float, now: float) -> bool:
-        """投票破格的资格判断：chat_votes ≥2 +（kind=news、非争议、48 小时内）。"""
-        del pool_min_avg  # 投票破格不看分数门槛（48 小时、非争议等照旧）
-        if int(item.get("chat_votes") or 0) < _CHAT_VOTE_MIN:
-            return False
-        if item.get("kind") != "news":
-            return False
-        if item.get("sensitive"):
             return False
         published = item.get("published_ts")
         if not isinstance(published, (int, float)):
@@ -1453,6 +1423,15 @@ class Feeds:
             lines.append("最近这些资讯群友觉得没用（避开这类）：")
             lines.extend(f"- {t}" for t in feedback["down"][:10])
         lines.append("")
+        # 群友评价（news_rating：太旧 / 没用 / 质量低…+ 原话），反复出现的毛病附具体要求
+        try:
+            rating_lines = news_rating.prompt_lines(self._store, gid, clock.now())
+        except Exception:
+            logger.exception("读资讯评价出错（群 %s），这轮不带", gid)
+            rating_lines = []
+        if rating_lines:
+            lines.extend(rating_lines)
+            lines.append("")
         hist = self.focus_history(gid)
         if hist:
             lines.append("最近几轮已经找过的方向（除非有明显新进展，别再重复这些方向，换别的）：")
@@ -2438,79 +2417,6 @@ class Feeds:
             self._store.kv_set(conn, self._pref_key(str(gid)), text)
         return text
 
-    # ------------------------------------------------------------------
-    # 「想在群里聊」投票
-    # ------------------------------------------------------------------
-
-    def admin_chat_vote(self, gid: str, item_id: int) -> dict:
-        """本群条目 chat_votes +1；够 _CHAT_VOTE_MIN 票时补进话题候选池（候选 ttl 24 小时）。
-
-        网页没有身份，谁点都只计数（前端自己防重复）。返回 {"chat_votes": n}。
-        """
-        gid = str(gid)
-        iid = int(item_id)
-        with self._store.tx() as conn:
-            row = conn.execute(
-                "SELECT id, group_id, chat_votes, kind, sensitive, published_ts, scores,"
-                " title, body, summary, sources, rejected"
-                " FROM news_items WHERE id=?",
-                (iid,),
-            ).fetchone()
-            if row is None or str(row["group_id"]) != gid or int(row["rejected"] or 0):
-                raise KeyError(f"找不到这条资讯：#{iid}")
-            votes = int(row["chat_votes"] or 0) + 1
-            conn.execute("UPDATE news_items SET chat_votes=? WHERE id=?", (votes, iid))
-        # 够票 → 补进候选池（只补一次：mark 一条 event，下一次不重复进）
-        if votes >= _CHAT_VOTE_MIN:
-            self._maybe_pool_from_votes(gid, row, votes)
-        return {"chat_votes": votes}
-
-    def _maybe_pool_from_votes(self, gid: str, row: Any, votes: int) -> None:
-        """够了票还没进过池的资讯，补进候选池（候选 ttl 24h；同一条只补一次）。"""
-        iid = int(row["id"])
-        marker = f"候选池补进（投票到 {votes}）"
-        try:
-            with self._store.tx() as conn:
-                hit = conn.execute(
-                    "SELECT id FROM topic_candidates WHERE group_id=? AND kind='news' AND ref_id=?",
-                    (gid, iid),
-                ).fetchone()
-            if hit is not None:
-                return  # 已经在池里（备料时自己进的也算）
-            try:
-                scores = json.loads(row["scores"] or "{}")
-            except (ValueError, TypeError):
-                scores = {}
-            item = {
-                "kind": str(row["kind"] or "news"),
-                "sensitive": bool(row["sensitive"] or 0),
-                "published_ts": row["published_ts"],
-                "scores": scores,
-                "chat_votes": votes,
-                "title": str(row["title"] or ""),
-                "body": str(row["body"] or ""),
-                "summary": str(row["summary"] or ""),
-            }
-            ok, _voted = self._pool_eligible_check(item, 0.0, clock.now())
-            if not ok:
-                logger.info("投票够 %s 票但不满足进池的硬条件（48 小时/非争议），不进（群 %s 条 %s）",
-                            votes, gid, iid)
-                return
-            url = ""
-            try:
-                src = json.loads(row["sources"] or "[]")
-                if isinstance(src, list) and src and isinstance(src[0], dict):
-                    url = str(src[0].get("url") or "")
-            except (ValueError, TypeError):
-                url = ""
-            self._topics.add_candidate(
-                gid, kind="news", ref_id=iid, title=item["title"],
-                brief=self._pool_brief(item), link=url, ttl_h=_CHAT_VOTE_TTL_H,
-            )
-            logger.info("%s：群 %s 条 %s 进候选池", marker, gid, iid)
-        except Exception:
-            logger.info("投票补进候选池失败（群 %s 条 %s）", gid, iid, exc_info=True)
-
     def _skipped_batch(self, gid: str, note: str, *, found: int = 0, stats: dict | None = None) -> None:
         now = clock.now()
         try:
@@ -2880,9 +2786,12 @@ class Feeds:
                 (int(b["id"]),),
             ).fetchall()
             items = [self._news_row_to_view(r, now) for r in rows]
+            self._attach_viz(items)
             if not admin:
                 for it in items:
                     it.pop("keywords", None)
+            else:
+                self._attach_ratings(items)
             rejected_rows = self._store.read().execute(
                 "SELECT id, title, url_key, sources, reject_gate, reject_reason, score"
                 " FROM news_items WHERE batch_id=? AND rejected=1 ORDER BY id ASC",
@@ -3051,7 +2960,6 @@ class Feeds:
             "image_url": str(r["image_url"] or ""),
             "keywords": keywords_out,
             "verify": verify_out,
-            "chat_votes": int(r["chat_votes"] or 0),
             "angle": str(r["angle"] or ""),
             "status": {
                 "kind": status_kind,
@@ -3066,7 +2974,7 @@ class Feeds:
         """好文专栏（§9.3）：最近 30 天通过三道门的 kind=guide 条目，最多 20 条，新的在前。
 
         结构和 news item 一致（scores/topic/sensitive/profile_ref/status/feedback 都有，
-        也带 body/reason/refs/audience/image_url/keywords/verify/chat_votes/angle）。
+        也带 body/reason/refs/audience/image_url/keywords/verify/angle）。
         群友视图（admin=False）去掉每条的 keywords（只给管理员）。
         """
         gid = str(group_id)
@@ -3078,10 +2986,38 @@ class Feeds:
         ).fetchall()
         now = clock.now()
         out = [self._news_row_to_view(r, now) for r in rows]
+        self._attach_viz(out)
         if not admin:
             for it in out:
                 it.pop("keywords", None)
+        else:
+            self._attach_ratings(out)
         return out
+
+    def _attach_viz(self, items: list[dict]) -> None:
+        """每条带 viz：有没有核对过的图解（有就前端按需取 /api/news/{id}/viz）。"""
+        try:
+            from . import news_viz
+
+            st = news_viz.status_of(self._store, [int(it["id"]) for it in items])
+        except Exception:
+            logger.exception("读图解状态出错，视图里先不带")
+            st = {}
+        for it in items:
+            it["viz"] = st.get(int(it["id"])) == "ok"
+
+    def _attach_ratings(self, items: list[dict]) -> None:
+        """管理员视图：每条带群友评价汇总 ratings={counts,total,notes}（没人评的不带）。
+        群友视图不带（原话可能点名道姓；群友自己评了什么由前端 localStorage 记）。"""
+        try:
+            summ = news_rating.summaries(self._store, [int(it["id"]) for it in items])
+        except Exception:
+            logger.exception("读资讯评价汇总出错，视图里先不带")
+            return
+        for it in items:
+            got = summ.get(int(it["id"]))
+            if got:
+                it["ratings"] = got
 
     def ideas_view(self, group_id: str, *, admin: bool = False) -> list[dict]:
         """构想页（群友、管理员都看得到，含「给某个关注成员的」构想，每条带 target_user_id）。

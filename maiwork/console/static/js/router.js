@@ -185,12 +185,12 @@ setInterval(() => {
     if (state.page) return renderRail();
     if (state.sheet && state.sheet !== "detail") return renderTopBits();
     renderTopBits();
-    renderView();
+    renderView({ poll: true });
     if (!state.detail) renderSide();
   });
 }, 30000);
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && grp() && !state.page) loadView(true).then(() => (renderTopBits(), renderView(), renderSide()));
+  if (!document.hidden && grp() && !state.page) loadView(true).then(() => (renderTopBits(), renderView({ poll: true }), renderSide()));
 });
 export function renderTopBits() {
   if (!grp() && !state.page) return;

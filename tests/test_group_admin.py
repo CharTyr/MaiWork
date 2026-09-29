@@ -215,9 +215,6 @@ class _FakeFeeds:
         self.prefs[str(group_id)] = str(text)
         return self.prefs[str(group_id)]
 
-    def admin_chat_vote(self, group_id, item_id):
-        return {"chat_votes": 1}
-
     def news_view(self, group_id, *, days=3):
         return []
 
@@ -646,7 +643,7 @@ class TestItemIdRoutes:
         r2 = await env.client.post(f"/api/news/{pid}/feedback", json={"value": "up", "prev": None})
         assert r2.status == 403, r2.status
         assert "个人画像" in (await r2.json())["error"]
-        r3 = await env.client.post(f"/api/news/{pid}/chat-vote", json={})
+        r3 = await env.client.post(f"/api/news/{pid}/rate", json={"client": "browserA1", "reasons": ["old"]})
         assert r3.status == 403, r3.status
         r4 = await env.client.post(f"/api/news/{pid}/mention-to-member", json={})
         assert r4.status == 403, r4.status

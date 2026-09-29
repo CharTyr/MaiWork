@@ -217,17 +217,12 @@ class TestMatchRules:
         kwargs = _kwargs([("大家聊 m7 了吗", False)])  # 只命中一个关键词
         assert tm.memo_lines(GID, kwargs) == []
 
-    def test_single_keyword_with_votes_relaxes(self, tmp_path):
-        """chat_votes ≥2 时命中 1 个关键词也算接得上。"""
+    def test_single_keyword_votes_no_longer_relax(self, tmp_path):
+        """2026-09-29 删掉「想在群里聊」：老数据里的 chat_votes 不再让单个关键词算接得上。"""
         store, settings, m, tm = _make(tmp_path)
-        _seed_news(store, keywords=("m7", "芯片"), votes=2)
+        _seed_news(store, keywords=("m7", "芯片"), votes=5)
         kwargs = _kwargs([("大家聊 m7 了吗", False)])
-        lines = tm.memo_lines(GID, kwargs)
-        assert len(lines) == 1
-        # 只有 1 票不行
-        _seed_news(store, title="另一篇", keywords=("铝坨坨", "键盘"), votes=1)
-        kwargs2 = _kwargs([("铝坨坨 手感如何", False)])
-        assert tm.memo_lines(GID, kwargs2) == []
+        assert tm.memo_lines(GID, kwargs) == []
 
     def test_keyword_min_len_2(self, tmp_path):
         """单字符关键词不算命中。"""

@@ -882,12 +882,12 @@ def test_news_view_structure_and_order(tmp_path) -> None:
     items = view[0]["items"]
     assert [i["title"] for i in items] == ["高分", "低分"]  # 按分数降序
     item = items[0]
-    # 群友版 item 字段（「有人味」新增 body/reason/refs/audience/image_url/verify/chat_votes/angle；
+    # 群友版 item 字段（「有人味」新增 body/reason/refs/audience/image_url/verify/angle；
     # keywords 只给管理员，群友版没有）
     assert set(item.keys()) == {
         "id", "icon", "kind", "title", "summary", "why", "sources",
         "published_ts", "scores", "topic", "sensitive", "profile_ref", "status", "feedback",
-        "body", "reason", "refs", "audience", "image_url", "verify", "chat_votes", "angle",
+        "body", "reason", "refs", "audience", "image_url", "verify", "angle", "viz",
     }
     assert set(item["scores"].keys()) == {"info", "source", "relevance", "timeliness", "chat", "avg"}
     assert item["kind"] == "news" and item["topic"] == "话题" and item["sensitive"] is False

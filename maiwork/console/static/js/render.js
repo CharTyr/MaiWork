@@ -175,9 +175,10 @@ function centerTabs(was) {
   }
 }
 
-export function renderView() {
+export function renderView(opts) {
   if (state.page === "chat") {
     const typed = $("chat-input") ? $("chat-input").value : "";
+    lastView = null;
     $("view").innerHTML = chatPage();
     if (typed && $("chat-input")) $("chat-input").value = typed;
     ui.flash = false;
@@ -185,6 +186,7 @@ export function renderView() {
   }
   if (state.page === "settings") {
     const was = tabScrolls();
+    lastView = null;
     $("view").innerHTML = settingsPage();
     centerTabs(was);
     ui.flash = false;
@@ -194,10 +196,16 @@ export function renderView() {
   const v = gview();
   const views = { news: viewNews, ideas: viewIdeas, goals: viewGoals, tasks: viewTasks, group: viewGroup };
   const el = $("view");
-  el.innerHTML = !v && state.tab !== "group" ? `<h1 class="h-page">${TABS.find((t) => t.id === state.tab).label}</h1>${loading()}` : views[state.tab](g, v);
+  const html = !v && state.tab !== "group" ? `<h1 class="h-page">${TABS.find((t) => t.id === state.tab).label}</h1>${loading()}` : views[state.tab](g, v);
+  // 定时轮询时内容没变就不重画：不让图解 iframe 重新加载（一闪），也不打断正在看的页面。
+  // 只限轮询（opts.poll）：点按钮之后的重画照旧整块重画，按钮状态会复位
+  if (opts && opts.poll && html === lastView && !ui.flash) return;
+  lastView = html;
+  el.innerHTML = html;
   if (!ui.flash) el.querySelectorAll(".enter").forEach((x) => x.classList.remove("enter"));
   ui.flash = false;
 }
+let lastView = null;
 
 function landing() {
   const bad = state.badLink;

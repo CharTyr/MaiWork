@@ -11,10 +11,9 @@
   reason/body/audience（按片段规则）；
 - 定关注点（_plan_focus）：带资讯偏好；可额外产出 0–1 个「不同角度」关注点，
   产出的条目 angle='diverse'；去同质化每轮最多留 2 条 diverse；
-- chat-vote：admin_chat_vote / 接口计数；chat_votes≥2 的资讯没过「值得聊≥4」也进
-  开话题候选池（48 小时内、非争议照旧），候选过期时间延长到 24 小时；
+- 资讯评价接口（取代原来的 chat-vote）：POST /api/news/{id}/rate；管理员视图带 ratings；
 - 构想：feasibility {level, note} + keywords 入库，ideas_view 带上；
-- 视图：news/guides item 带 body/reason/refs/audience/image_url/keywords/verify/chat_votes/angle，
+- 视图：news/guides item 带 body/reason/refs/audience/image_url/keywords/verify/angle，
   群友版去掉 keywords（verify 解析失败 → null）；GroupView 带 feeds_pref；
 - 资讯偏好接口：GET/PUT /api/groups/{gid}/feeds-pref，群友 403、管理员可读写。
 """
@@ -284,7 +283,7 @@ class TestWritePosts:
         assert item["audience"] == ["阿一"]
         assert item["image_url"] == "https://cdn.example.com/board.jpg"
         assert item["keywords"] == kws
-        assert item["chat_votes"] == 0
+        assert "chat_votes" not in item
         assert item["angle"] == ""
         assert item["verify"] is None
 
@@ -621,108 +620,6 @@ class TestDiverse:
 
 
 # ----------------------------------------------------------------------
-# chat-vote：计数与进池规则
-# ----------------------------------------------------------------------
-
-
-class TestChatVote:
-    def _news_row(self, store: Store) -> Any:
-        return store.read().execute("SELECT * FROM news_items WHERE rejected=0").fetchone()
-
-    def test_admin_chat_vote_counts(self, tmp_path) -> None:
-        store, settings, feeds, *_r = _make_feeds(tmp_path)
-        models = FakeModelsQueue(ready=True, replies=[_FOCUS_JSON, _SCORES_JSON, _post_json()])
-        feeds._models = models
-        with _TimePatch():
-            _run(feeds.prepare_news(GID))
-        row = self._news_row(store)
-        iid = int(row["id"])
-        assert feeds.admin_chat_vote(GID, iid) == {"chat_votes": 1}
-        assert feeds.admin_chat_vote(GID, iid) == {"chat_votes": 2}
-        # 视图也看到
-        with _TimePatch():
-            item = feeds.news_view(GID, admin=True)[0]["items"][0]
-        assert item["chat_votes"] == 2
-        # 别的群 / 不存在的条目
-        with pytest.raises((KeyError, ValueError)):
-            feeds.admin_chat_vote("999", iid)
-        with pytest.raises((KeyError, ValueError)):
-            feeds.admin_chat_vote(GID, 99999)
-
-    def test_chat_votes_two_bypasses_chat4(self, tmp_path) -> None:
-        """chat_votes≥2：即使「值得聊」<4 也进候选池（48h、非争议照旧），候选 ttl 24h。"""
-        low_chat_scores = json.dumps(
-            {"scores": [
-                {"i": 0, "title": "新开源 FPGA 开发板发布", "info": 5, "source": 5, "relevance": 5,
-                 "timeliness": 4, "chat": 2, "profile": 0, "topic": "FPGA", "sensitive": False,
-                 "grounded": True, "junk": False, "junk_reason": "", "same_as_recent": False,
-                 "why": "群里的硬件项目正好用得上", "icon": "tools"},
-            ]},
-            ensure_ascii=False,
-        )
-        models = FakeModelsQueue(ready=True, replies=[_FOCUS_JSON, low_chat_scores, _post_json()])
-        store, settings, feeds, models, workers, topics, profiles = _make_feeds(
-            tmp_path, models=models,
-        )
-        _seed_chat(store)
-        with _TimePatch():
-            got = _run(feeds.prepare_news(GID))
-        assert got == 1
-        assert topics.calls == []  # chat=2 本来进不了池
-
-        row = self._news_row(store)
-        iid = int(row["id"])
-        feeds.admin_chat_vote(GID, iid)
-        feeds.admin_chat_vote(GID, iid)  # → 2 票
-
-        # 再来一轮备料：同一条撞 URL 去重，不再进候选；所以直接检查它之后的进池判断
-        # 简单点：再造一轮新的（URL 不同），先看低 chat 进不了；投票后就能进
-        item_ids = [iid]
-        # 直接调 feeds 的进池逻辑：把这条重新判一次
-        item = dict(row)
-        item["scores"] = json.loads(row["scores"])
-        item["published_ts"] = row["published_ts"]
-        item["chat_votes"] = 2
-        now = NOW
-        pool_min_avg = 4.0
-        ok = feeds._pool_eligible_with_votes(item, pool_min_avg, now)
-        assert ok is True
-
-    def test_pool_candidate_ttl_extended_for_voted(self, tmp_path) -> None:
-        """chat_votes≥2 进候选时，候选过期时间 24 小时（不是默认 12）。"""
-        # 走全流程：先备一条 chat=2 的（进不了池），投 2 票后再让 feeds 补进池
-        low_chat_scores = json.dumps(
-            {"scores": [
-                {"i": 0, "title": "新开源 FPGA 开发板发布", "info": 5, "source": 5, "relevance": 5,
-                 "timeliness": 4, "chat": 2, "profile": 0, "topic": "FPGA", "sensitive": False,
-                 "grounded": True, "junk": False, "junk_reason": "", "same_as_recent": False,
-                 "why": "群里的硬件项目正好用得上", "icon": "tools"},
-            ]},
-            ensure_ascii=False,
-        )
-        models = FakeModelsQueue(ready=True, replies=[_FOCUS_JSON, low_chat_scores, _post_json()])
-        store, settings, feeds, models, workers, topics, profiles = _make_feeds(
-            tmp_path, models=models,
-        )
-        _seed_chat(store)
-        with _TimePatch():
-            _run(feeds.prepare_news(GID))
-            row = self._news_row(store)
-            iid = int(row["id"])
-            feeds.admin_chat_vote(GID, iid)
-            feeds.admin_chat_vote(GID, iid)
-        # 投票到 2：自动补进候选池（ttl 24h）
-        assert len(topics.calls) >= 1
-        voted_call = [c for c in topics.calls if int(c["ref_id"]) == iid]
-        assert voted_call, topics.calls
-        assert voted_call[0]["kind"] == "news"
-        # ttl 传的是 24
-        assert float(voted_call[0]["ttl_h"]) == pytest.approx(24.0)
-
-
-# ----------------------------------------------------------------------
-# 构想：feasibility / keywords
-# ----------------------------------------------------------------------
 
 
 class TestIdeaFeasibility:
@@ -887,10 +784,9 @@ async def test_group_view_has_feeds_pref(env) -> None:
 
 
 @pytest.mark.asyncio
-async def test_chat_vote_api_and_views(env) -> None:
-    """POST /api/news/{id}/chat-vote：群友或管理员都能点，只计本群条目，返回计数。"""
+async def test_rate_api_and_views(env) -> None:
+    """POST /api/news/{id}/rate：群友或管理员都能评，只评本群条目；管理员视图带 ratings，群友视图不带。"""
     await env.client.post("/api/login", json={"password": PASSWORD})
-    # 塞一条本群资讯
     with env.app.store.tx() as conn:
         cur = conn.execute(
             "INSERT INTO news_batches (group_id, slot_ts, found, kept, skipped, note, created)"
@@ -906,21 +802,71 @@ async def test_chat_vote_api_and_views(env) -> None:
         )
         iid = int(cur.lastrowid)
     token = env.app.token_of(G1)
-    # 群友点两次（没身份也允许，只计数）
-    r = await env.client.post(f"/api/news/{iid}/chat-vote", headers={"X-MW-Group": token})
+    body = {"client": "browserAAA1", "reasons": ["old", "low"], "note": "上周就看过"}
+    r = await env.client.post(f"/api/news/{iid}/rate", json=body, headers={"X-MW-Group": token})
     assert r.status == 200
-    assert (await r.json()) == {"chat_votes": 1}
-    r = await env.client.post(f"/api/news/{iid}/chat-vote", headers={"X-MW-Group": token})
-    assert (await r.json()) == {"chat_votes": 2}
-    # 管理员也能点
-    r = await env.client.post(f"/api/news/{iid}/chat-vote")
-    assert (await r.json()) == {"chat_votes": 3}
-    # 匿名（没有任何身份的干净 client）401
+    assert (await r.json()) == {"mine": {"reasons": ["old", "low"], "note": "上周就看过"}}
+    # 不认识的理由 400
+    r = await env.client.post(f"/api/news/{iid}/rate", json={"client": "browserAAA1", "reasons": ["??"]},
+                              headers={"X-MW-Group": token})
+    assert r.status == 400
+    # 管理员视图带 ratings（含原话），群友视图不带
+    r = await env.client.get(f"/api/groups/{G1}")
+    items = [it for b in (await r.json())["news"] for it in b["items"]]
+    assert items[0]["ratings"] == {"counts": {"old": 1, "low": 1}, "total": 1, "notes": ["上周就看过"]}
+    async with aiohttp.ClientSession() as member:
+        async with member.get(f"http://127.0.0.1:{env.app.console.port}/api/groups/{token}",
+                              headers={"X-MW-Group": token}) as r:
+            data = await r.json()
+    mitems = [it for b in data["news"] for it in b["items"]]
+    assert mitems and "ratings" not in mitems[0]
+    # 匿名 401、不存在 404、旧的 chat-vote 接口没了
     async with aiohttp.ClientSession() as anon:
-        async with anon.post(f"http://127.0.0.1:{env.app.console.port}/api/news/{iid}/chat-vote") as r:
+        async with anon.post(f"http://127.0.0.1:{env.app.console.port}/api/news/{iid}/rate", json=body) as r:
             assert r.status == 401
-    r = await env.client.post("/api/news/999999/chat-vote", headers={"X-MW-Group": token})
+    r = await env.client.post("/api/news/999999/rate", json=body, headers={"X-MW-Group": token})
     assert r.status == 404
+    r = await env.client.post(f"/api/news/{iid}/chat-vote", headers={"X-MW-Group": token})
+    assert r.status in (404, 405)
+
+
+@pytest.mark.asyncio
+async def test_viz_api(env) -> None:
+    """GET /api/news/{id}/viz：本群群友 / 管理员拿核对过的图解整页（带 CSP）；别的群 403、没有 404、匿名 401。"""
+    with env.app.store.tx() as conn:
+        cur = conn.execute(
+            "INSERT INTO news_batches (group_id, slot_ts, found, kept, skipped, note, created)"
+            " VALUES (?, ?, 1, 1, 0, '', ?)",
+            (G1, clock.now() - 3600, clock.now() - 3600),
+        )
+        bid = int(cur.lastrowid)
+        cur = conn.execute(
+            "INSERT INTO news_items (batch_id, group_id, title, summary, sources, url_key,"
+            " score, created, kind, rejected) VALUES (?, ?, '有图解', '摘要', '[]', 'a.com/v',"
+            " 4.0, ?, 'news', 0)",
+            (bid, G1, clock.now() - 3000),
+        )
+        iid = int(cur.lastrowid)
+        cur = conn.execute(
+            "INSERT INTO news_items (batch_id, group_id, title, summary, sources, url_key,"
+            " score, created, kind, rejected) VALUES (?, ?, '没图解', '摘要', '[]', 'a.com/w',"
+            " 4.0, ?, 'news', 0)",
+            (bid, G1, clock.now() - 3000),
+        )
+        other = int(cur.lastrowid)
+        conn.execute(
+            "INSERT INTO news_viz (item_id, group_id, status, html, reason, created, updated)"
+            " VALUES (?, ?, 'ok', '<p>图解</p>', '', ?, ?)", (iid, G1, clock.now(), clock.now()))
+    token = env.app.token_of(G1)
+    r = await env.client.get(f"/api/news/{iid}/viz", headers={"X-MW-Group": token})
+    assert r.status == 200
+    doc = (await r.json())["html"]
+    assert "<p>图解</p>" in doc and "Content-Security-Policy" in doc
+    r = await env.client.get(f"/api/news/{other}/viz", headers={"X-MW-Group": token})
+    assert r.status == 404
+    async with aiohttp.ClientSession() as anon:
+        async with anon.get(f"http://127.0.0.1:{env.app.console.port}/api/news/{iid}/viz") as r:
+            assert r.status == 401
 
 
 def _free_port() -> int:

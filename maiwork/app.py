@@ -131,6 +131,7 @@ class MaiWorkApp:
         self.outbox: Any = None
         self.card_push: Any = None  # 资讯卡片（card_push.py）
         self.idea_mention: Any = None  # 构想提一嘴（card_push.py）
+        self.news_viz: Any = None  # 资讯图解（news_viz.py）
         self.delivery: Any = None
         self.herenow: Any = None
         self.coordinator: Any = None
@@ -156,6 +157,8 @@ class MaiWorkApp:
         # 长活（资讯备料 / 构想）：同一群同一种同时只跑一个，不阻塞后台循环
         self._bg_jobs: set[asyncio.Task] = set()
         self._running_jobs: set[tuple[str, str]] = set()
+        # 名册跟 QQ 对名字：每群上次派工时间（30 分钟一轮）
+        self._names_last: dict[str, float] = {}
         # M3 任务派工：同一任务同一时刻只跑一个 coordinator.run_task
         self._running_tasks: set[str] = set()
         # 提问回答恢复（docs/02 §7.2）：intake 钩子只查这张内存表——
@@ -486,6 +489,14 @@ class MaiWorkApp:
             logger.exception("资讯卡片 / 构想提一嘴模块没建起来，这次不发")
             self.card_push = None
             self.idea_mention = None
+        # 资讯图解（没配图、数据多的资讯画一张小图；news_viz.py）
+        try:
+            from .news_viz import NewsViz
+
+            self.news_viz = NewsViz(self.store, self.models, self.workers, self.tools, self.get_settings)
+        except Exception:
+            logger.exception("资讯图解模块没建起来，这次不做图解")
+            self.news_viz = None
         self.delivery = Delivery(self.store, self.outbox, self.tasks)
         self.coordinator = self._make_coordinator()
         # 按群的管理员（group_admins.py）：密码哈希 / 本群管理员名单只进数据库，
@@ -2212,6 +2223,14 @@ class MaiWorkApp:
                 raise
             except Exception:
                 logger.exception("资讯卡片 / 构想提一嘴巡检出错（群 %s）", gid)
+            try:
+                self._member_names_round(gid, now)
+            except Exception:
+                logger.exception("名册对名字巡检出错（群 %s）", gid)
+            try:
+                self._viz_round(gid, now)
+            except Exception:
+                logger.exception("资讯图解巡检出错（群 %s）", gid)
         # 3) M3 巡检：发件箱 / 批准提醒与过期 / 目标到期 / 排队任务派工
         try:
             await self._m3_round(now)
@@ -2587,6 +2606,37 @@ class MaiWorkApp:
             im.scan(gid, now)
             if im.has_due(gid, now) and self._models_ready():
                 self._spawn_long_job(gid, "ideamention", im.flush)
+
+    def _viz_round(self, gid: str, now: float) -> None:
+        """资讯图解：有到期的活（开着、没到当天上限、有没处理过的候选）才派后台长活 kind=viz。"""
+        nv = self.news_viz
+        if nv is None or (str(gid), "viz") in self._running_jobs:
+            return
+        if not self._models_ready():
+            return
+        if nv.has_work(str(gid), now):
+            self._spawn_long_job(str(gid), "viz", nv.run)
+
+    _NAMES_EVERY_S = 30 * 60.0
+
+    def _member_names_round(self, gid: str, now: float) -> None:
+        """名册跟 QQ 对名字（members.refresh_from_host）：每群 30 分钟最多派一轮后台长活。
+
+        只在服务群的循环里调用；问多少人、多久问一次由 members 模块管。
+        """
+        store, host = self.store, self.host
+        if store is None or host is None:
+            return
+        gid = str(gid)
+        last = self._names_last.get(gid)
+        if last is not None and now - last < self._NAMES_EVERY_S:
+            return
+        self._names_last[gid] = now
+
+        async def _refresh(g: str) -> None:
+            await members.refresh_from_host(store, host, g, now)
+
+        self._spawn_long_job(gid, "names", _refresh)
 
     async def _propose_goal_round(self, gid: str) -> None:
         """主动提目标一轮：开关 / 非服务群 / 每日上限都在 GoalProposer 里兜住。"""

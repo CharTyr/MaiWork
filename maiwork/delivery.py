@@ -53,8 +53,8 @@ class TopicMatcher:
       （rejected=0，kind news/guide）+ 最近 7 天未收起的 ideas，带 keywords。
       每群一份内存缓存，60 秒刷新一次；钩子里不做重查询。
     - match(candidates, text)：关键词（≥2 字符，小写）出现在最近消息文本里算命中；
-      同一条命中 ≥2 个不同关键词、或命中 1 个且 chat_votes ≥ 2 → 接得上；
-      按命中数、票数排，调用方取前几条。
+      同一条命中 ≥2 个不同关键词 → 接得上；按命中数、新旧排，调用方取前几条。
+      （原来「想在群里聊」够 2 票时命中 1 个也算，2026-09-29 随气泡按钮删掉。）
     - memo_lines(group_id, kwargs)：命中 → [(文本, key)]，同一条同群 30 分钟内
       最多给 3 轮（record_injected 由调用方在真的注入后记账）。
     全程不调模型、不做网络，候选只有资讯/构想（没有关注成员个人画像）。
@@ -175,7 +175,7 @@ class TopicMatcher:
         gid = str(group_id)
         out: list[dict] = []
         rows = self._store.read().execute(
-            "SELECT id, title, summary, body, keywords, chat_votes, sources, created"
+            "SELECT id, title, summary, body, keywords, sources, created"
             " FROM news_items"
             " WHERE group_id=? AND rejected=0 AND kind IN ('news','guide') AND created>=?"
             " AND target_user_id=''"
@@ -190,7 +190,6 @@ class TopicMatcher:
                     "body": str(r["body"] or "") or str(r["summary"] or ""),
                     "link": self._first_link(r["sources"]),
                     "keywords": self._keywords_of(r["keywords"]),
-                    "votes": int(r["chat_votes"] or 0),
                     "created": float(r["created"] or 0.0),
                 }
             )
@@ -209,7 +208,6 @@ class TopicMatcher:
                     "body": str(r["body"] or ""),
                     "link": "",
                     "keywords": self._keywords_of(r["keywords"]),
-                    "votes": 0,
                     "created": float(r["created"] or 0.0),
                 }
             )
@@ -232,18 +230,17 @@ class TopicMatcher:
 
     @staticmethod
     def match(candidates: list[dict], recent_text_lower: str) -> list[dict]:
-        """命中 ≥2 个不同关键词、或命中 1 个且 chat_votes≥2 → 接得上；按分数排。"""
+        """命中 ≥2 个不同关键词 → 接得上；按命中数、新旧排。"""
         scored: list[tuple[int, int, float, dict]] = []
         for cand in candidates:
             hits = 0
             for kw in cand.get("keywords") or ():
                 if kw in recent_text_lower:
                     hits += 1
-            votes = int(cand.get("votes") or 0)
-            if hits >= 2 or (hits >= 1 and votes >= 2):
-                scored.append((hits, votes, float(cand.get("created") or 0.0), cand))
-        scored.sort(key=lambda t: (-t[0], -t[1], -t[2]))
-        return [c for _, _, _, c in scored]
+            if hits >= 2:
+                scored.append((hits, float(cand.get("created") or 0.0), cand))
+        scored.sort(key=lambda t: (-t[0], -t[1]))
+        return [c for _, _, c in scored]
 
     # ------------------------------------------------------------------
     # 30 分钟 3 轮节制

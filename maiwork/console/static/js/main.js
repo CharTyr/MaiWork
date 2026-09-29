@@ -16,6 +16,7 @@ import { render, renderRail, renderSide, renderView } from "./render.js";
 import { applyHash, loadSettings, loadView, parseHash, reboot, syncHash } from "./router.js";
 import { act } from "./actions.js";
 import { onb, onbAct } from "./onboarding.js";
+import { RATE_KEY, clientId, myRates } from "./pages/news.js";
 import "./events.js"; // 只注册输入类事件，没有导出
 
 document.addEventListener("click", (e) => {
@@ -308,6 +309,34 @@ document.addEventListener("submit", async (e) => {
       closeSheet();
       repaintSheet();
       toast("保存好了");
+    } catch (ex) {
+      err.textContent = ex.message;
+      err.hidden = false;
+    } finally {
+      btn.disabled = false;
+    }
+    return;
+  }
+  if (f.id === "edit" && (state.editing || {}).kind === "rate") {
+    const ed = state.editing;
+    const err = $("ed-err");
+    const note = $("ed-text").value.trim().slice(0, 60);
+    const reasons = ed.reasons || [];
+    if (!reasons.length && !note) {
+      err.textContent = "挑一个理由，或者写一句。";
+      err.hidden = false;
+      return;
+    }
+    btn.disabled = true;
+    try {
+      const r = await api("POST", `/api/news/${encodeURIComponent(ed.id)}/rate`, { client: clientId(), reasons, note });
+      const all = myRates();
+      all[ed.id] = (r && r.mine) || { reasons, note };
+      localStorage.setItem(RATE_KEY, JSON.stringify(all));
+      closeSheet();
+      await loadView(true);
+      renderView();
+      toast("收到，下一轮找资讯会参考");
     } catch (ex) {
       err.textContent = ex.message;
       err.hidden = false;

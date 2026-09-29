@@ -1,7 +1,7 @@
 // MaiWork 网页 · 「资讯」页。
 import { admin, gadmin, state } from "../state.js";
 import { SVG, dayWord, dur, esc, hhmm, ico, now, richText, safeUrl, slotName, when } from "../util.js";
-import { gview } from "../api.js";
+import { api, gview } from "../api.js";
 
 /* ───────────── 各页面 ───────────── */
 
@@ -83,18 +83,56 @@ document.addEventListener(
   true
 );
 
-export const VOTE_KEY = "mw-chatvote";
-export const myVotes = () => {
+// 资讯评价（2026-09-29 取代「想在群里聊」气泡）：挑理由 + 可选一句话，下一轮找资讯照着改
+export const RATE_KEY = "mw-rate";
+export const RATE_REASONS = [
+  ["old", "太旧了"],
+  ["useless", "没什么用"],
+  ["low", "质量不高"],
+  ["offtopic", "和本群无关"],
+  ["dup", "以前发过"],
+  ["wrong", "说得不准"],
+];
+export const myRates = () => {
   try {
-    return JSON.parse(localStorage.getItem(VOTE_KEY) || "{}");
+    return JSON.parse(localStorage.getItem(RATE_KEY) || "{}");
   } catch (e) {
     return {};
   }
 };
+// 这个浏览器的随机标识：服务器靠它让「同一浏览器对同一条只算一份，再评就是改」
+export function clientId() {
+  let id = "";
+  try {
+    id = localStorage.getItem("mw-client") || "";
+  } catch (e) {}
+  if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) {
+    const b = new Uint8Array(12);
+    crypto.getRandomValues(b);
+    id = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+    try {
+      localStorage.setItem("mw-client", id);
+    } catch (e) {}
+  }
+  return id;
+}
+const reasonName = (k) => (RATE_REASONS.find((r) => r[0] === k) || [, k])[1];
+
+// 管理员看得到每条收到的评价（群友只看得到自己评了什么）
+function ratingsBlock(it) {
+  const r = it.ratings;
+  if (!admin() || !r || !r.total) return "";
+  const counts = Object.entries(r.counts || {})
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, n]) => `<span class="ntag warn">${esc(reasonName(k))} ×${n}</span>`)
+    .join("");
+  const notes = (r.notes || []).slice(0, 3).map((n) => `<div class="rating-note">「${esc(n)}」</div>`).join("");
+  return `<div class="ratings"><div class="ratings-h">${r.total} 位群友评价了这条</div>${counts ? `<div class="ntags">${counts}</div>` : ""}${notes}</div>`;
+}
 
 function newsItem(it, i, guide) {
   const sc = it.scores || null;
-  const voted = !!myVotes()[it.id];
+  const rated = !!myRates()[it.id];
   const tags = [
     it.topic ? `<span class="ntag">${esc(it.topic)}</span>` : "",
     it.angle === "diverse" ? `<span class="ntag alt">换个角度</span>` : "",
@@ -102,7 +140,11 @@ function newsItem(it, i, guide) {
     it.verify && it.verify.status === "passed" ? `<span class="ntag ok">实测过</span>` : "",
     admin() && sc && Number(sc.avg) > 0 ? `<span class="ntag score" title="${SCORE_NAMES.map(([k, n]) => `${n} ${sc[k] ?? "-"}`).join(" · ")}">${Number(sc.avg).toFixed(1)} 分</span>` : "",
   ].join("");
-  const img = it.image_url && /^https?:\/\//i.test(it.image_url) ? `<img class="n-img" src="${esc(it.image_url)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()" />` : "";
+  const img = it.image_url && /^https?:\/\//i.test(it.image_url)
+    ? `<img class="n-img" src="${esc(it.image_url)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()" />`
+    : it.viz
+      ? `<iframe class="n-viz" data-viz="${esc(it.id)}" sandbox="allow-scripts" referrerpolicy="no-referrer" title="图解：${esc(it.title)}"></iframe>`
+      : "";
   return `
     <article class="item news-item enter" style="--i:${i}">
       ${ico(it.icon || (guide ? "books" : "newspaper"))}
@@ -113,6 +155,7 @@ function newsItem(it, i, guide) {
         ${img}
         ${verifyBlock(it.verify)}
         ${reasonBlock(it)}
+        ${ratingsBlock(it)}
         ${
           (it.sources || []).length
             ? `<div class="sources">${it.sources
@@ -123,12 +166,53 @@ function newsItem(it, i, guide) {
         <div class="status">
           <span class="dot ${esc((it.status || {}).kind || "")}"></span>
           <span class="status-text">${esc(guide ? guideStatus(it) : newsStatus(it.status))}</span>
-          ${guide ? "" : `<button class="chatvote" data-act="chat-vote" data-id="${it.id}" aria-pressed="${voted}" title="想在群里聊这个">${SVG.chat}${it.chat_votes ? `<i>${it.chat_votes}</i>` : ""}</button>`}
+          <button class="ratebtn" data-act="rate-open" data-id="${it.id}" aria-pressed="${rated}" title="说说这条哪里不好">${SVG.pen}<i>${rated ? "已评价" : "评价"}</i></button>
           ${fbButtons("news", it)}
         </div>
       </div>
     </article>`;
 }
+
+/* ───────────── 图解（news_viz）：沙箱 iframe，按需取、缓存，报高度 ─────────────
+   iframe 只给 allow-scripts（没有 allow-same-origin）：图解页碰不到本页登录信息、不能联网（CSP）、不能跳转本页。
+   页面轮询会整块重画，所以内容和高度都缓存在内存里，重画时不闪、不重新请求。 */
+const vizDoc = {};
+const vizH = {};
+const vizLoading = {};
+function fillViz(frame) {
+  const id = frame.dataset.viz;
+  if (!id || frame.dataset.ready) return;
+  frame.dataset.ready = "1";
+  if (vizH[id]) frame.style.height = vizH[id] + "px"; // 高度不写进 HTML：轮询比对时内容才不会因高度变而重画
+  if (vizDoc[id]) {
+    frame.srcdoc = vizDoc[id];
+    return;
+  }
+  if (vizLoading[id]) {
+    vizLoading[id].then(() => vizDoc[id] && document.contains(frame) && (frame.srcdoc = vizDoc[id]));
+    return;
+  }
+  vizLoading[id] = api("GET", `/api/news/${encodeURIComponent(id)}/viz`)
+    .then((r) => {
+      vizDoc[id] = (r && r.html) || "";
+      if (vizDoc[id] && document.contains(frame)) frame.srcdoc = vizDoc[id];
+      else if (!vizDoc[id]) frame.remove();
+    })
+    .catch(() => frame.remove())
+    .finally(() => delete vizLoading[id]);
+}
+new MutationObserver(() => document.querySelectorAll("iframe.n-viz:not([data-ready])").forEach(fillViz)).observe(document.documentElement, { childList: true, subtree: true });
+window.addEventListener("message", (e) => {
+  const d = e.data;
+  if (!d || d.mwviz !== 1 || typeof d.h !== "number") return;
+  for (const f of document.querySelectorAll("iframe.n-viz")) {
+    if (f.contentWindow === e.source) {
+      const h = Math.max(80, Math.min(1400, Math.ceil(d.h)));
+      vizH[f.dataset.viz] = h;
+      f.style.height = h + "px";
+    }
+  }
+});
 
 function guideStatus(it) {
   const when_ = it.published_ts ? `${dayWord(it.published_ts)}发布 · ` : "";

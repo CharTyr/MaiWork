@@ -737,6 +737,27 @@ def _m_members(conn: sqlite3.Connection) -> None:
     members.seed_from_activity(conn)
 
 
+# 名册跟 QQ 对名字（members.refresh_from_host）：members 加 checked_ts（上次问 QQ 的时间）
+def _m_member_checked(conn: sqlite3.Connection) -> None:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(members)")}
+    if "checked_ts" not in cols:
+        conn.execute("ALTER TABLE members ADD COLUMN checked_ts REAL NOT NULL DEFAULT 0")
+
+
+# 资讯评价（news_rating.py，2026-09-29）：取代「想在群里聊」气泡
+def _m_news_ratings(conn: sqlite3.Connection) -> None:
+    from . import news_rating
+
+    conn.executescript(news_rating.SCHEMA_SQL)
+
+
+# 资讯图解（news_viz.py，2026-09-29）
+def _m_news_viz(conn: sqlite3.Connection) -> None:
+    from . import news_viz
+
+    conn.executescript(news_viz.SCHEMA_SQL)
+
+
 # 资讯卡片 / 构想提一嘴（card_push.py）：每批资讯至多一张卡片（batch_id 唯一），
 # 每个构想至多提一次（idea_id 唯一）；status pending/sending/sent/failed/uncertain/dropped
 def _m_card_push(conn: sqlite3.Connection) -> None:
@@ -775,7 +796,7 @@ def _m_card_push(conn: sqlite3.Connection) -> None:
 
 
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz]
 
 
 class Store:

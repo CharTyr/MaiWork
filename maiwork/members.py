@@ -7,13 +7,18 @@
   快照也没有（或快照就是 id）就返回空字符串，由调用方决定写「群友」之类。
 - 模型写的文字里提到群友用 ``{@平台id}``（``token(uid)``）；任何给人看 / 给群看 / 给别的模块
   看的出口都要过 ``render``，换成当前名字，不认识的换成「某群友」，平台 id 不外漏。
+- 久不说话 / 从没说过话的人：``refresh_from_host`` 在后台直接问 QQ 群名片（没有用 QQ 昵称），
+  名字按「此刻」记进名册（``checked_ts`` 记问过的时间，控制多久问一次）。
 """
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 from typing import Any, Iterable
+
+logger = logging.getLogger(__name__)
 
 UNKNOWN = "某群友"
 TOKEN_RE = re.compile(r"\{@([0-9A-Za-z_\-]{3,40})\}")
@@ -24,6 +29,7 @@ CREATE TABLE IF NOT EXISTS members (
     user_id TEXT NOT NULL,
     name TEXT NOT NULL DEFAULT '',
     ts REAL NOT NULL DEFAULT 0,
+    checked_ts REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (group_id, user_id)
 );
 """
@@ -163,3 +169,98 @@ def tokenize_ids(store_or_conn: Any, group_id: Any, text: Any) -> str:
         s = re.sub(r"QQ\s*[:：号]?\s*" + re.escape(uid) + r"(?!\d)", lambda _m: tok, s)
         s = re.sub(r"(?<![\d@])" + re.escape(uid) + r"(?!\d)", lambda _m: tok, s)
     return s
+
+
+# ----------------------------------------------------------------------
+# 跟 QQ 对名字（后台；app 每群 30 分钟派一轮，只给服务群）
+# ----------------------------------------------------------------------
+
+FOCUS_RECHECK_S = 6 * 3600.0     # 关注成员：6 小时问一次（网页显示「名片（昵称）」）
+MEMBER_RECHECK_S = 24 * 3600.0   # 其他人：24 小时问一次
+
+
+def _refresh_candidates(conn: sqlite3.Connection, gid: str, now: float, limit: int) -> list[str]:
+    """要问的 QQ 号：过期的关注成员 → 被引用但名册里没有的 → 名册里过期的（问得最早的在前）。"""
+    out: list[str] = []
+
+    def add(uid: Any) -> None:
+        u = str(uid or "").strip()
+        if u.isdigit() and u not in out:
+            out.append(u)
+
+    for r in conn.execute(
+        "SELECT user_id FROM focus_members WHERE group_id=? AND removed=0 AND COALESCE(profile_ts,0)<?"
+        " ORDER BY COALESCE(profile_ts,0), user_id",
+        (gid, now - FOCUS_RECHECK_S),
+    ):
+        add(r["user_id"])
+    for sql in (
+        "SELECT DISTINCT target_user_id AS u FROM ideas WHERE group_id=?",
+        "SELECT DISTINCT target_user_id AS u FROM news_items WHERE group_id=?",
+        "SELECT DISTINCT requester_id AS u FROM requests WHERE group_id=?",
+        "SELECT DISTINCT who_id AS u FROM goals WHERE group_id=?",
+    ):
+        try:
+            rows = conn.execute(sql, (gid,)).fetchall()
+        except sqlite3.Error:
+            continue
+        for r in rows:
+            u = str(r["u"] or "").strip()
+            if not u:
+                continue
+            if conn.execute("SELECT 1 FROM members WHERE group_id=? AND user_id=?", (gid, u)).fetchone() is None:
+                add(u)
+    for r in conn.execute(
+        "SELECT user_id FROM members WHERE group_id=? AND checked_ts<? ORDER BY checked_ts, user_id",
+        (gid, now - MEMBER_RECHECK_S),
+    ):
+        add(r["user_id"])
+    return out[: max(0, int(limit))]
+
+
+async def refresh_from_host(store: Any, host: Any, group_id: Any, now: float, *, limit: int = 20) -> int:
+    """问 QQ 这些人在本群的群名片 / 昵称，记进名册（和关注成员的 card / nickname 缓存）。
+
+    - 名字 = 群名片，没有就 QQ 昵称；等于 QQ 号的不算名字。按 ts=now 记：之后的新消息能盖它，旧消息不能。
+    - 不管问没问到都记 checked_ts（退群 / 接口失败也不反复问）；单个人出错跳过。
+    - 调用方保证只对服务群调用。返回拿到名字的人数。日志只写人数。
+    """
+    ask = getattr(host, "group_member_card", None)
+    if store is None or ask is None:
+        return 0
+    gid = str(group_id or "").strip()
+    now = float(now)
+    uids = _refresh_candidates(store.read(), gid, now, limit)
+    got = 0
+    for uid in uids:
+        try:
+            info = await ask(gid, uid)
+        except Exception:
+            logger.debug("问 QQ 群名片出错（群 %s），跳过这个人", gid, exc_info=True)
+            info = {}
+        info = info if isinstance(info, dict) else {}
+        card = _clean(info.get("card"), uid)
+        nick = _clean(info.get("nickname"), uid)
+        name = card or nick
+        with store.tx() as conn:
+            if name:
+                record(conn, gid, uid, name, now)
+                got += 1
+            conn.execute(
+                "INSERT INTO members (group_id, user_id, name, ts, checked_ts) VALUES (?, ?, '', 0, ?)"
+                " ON CONFLICT(group_id, user_id) DO UPDATE SET checked_ts=excluded.checked_ts",
+                (gid, uid, now),
+            )
+            if card or nick:
+                conn.execute(
+                    "UPDATE focus_members SET card=?, nickname=?, profile_ts=? WHERE group_id=? AND user_id=?",
+                    (card, nick, now, gid, uid),
+                )
+            else:
+                conn.execute(
+                    "UPDATE focus_members SET profile_ts=? WHERE group_id=? AND user_id=?",
+                    (now, gid, uid),
+                )
+    if uids:
+        logger.info("群 %s 跟 QQ 对名字：问了 %d 人，拿到 %d 人", gid, len(uids), got)
+    return got

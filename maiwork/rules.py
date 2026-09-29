@@ -683,6 +683,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     _F("feeds.pool_min_avg", "进话题候选池的平均分门槛", "满分 5 分，越高越挑", "float", min=1.0, max=5.0),
     _F("feeds.guides", "同时找文章", "教程、好文章和好用的工具", "bool"),
     _F("feeds.collect_minutes", "每轮找资讯最多几分钟", "到点就把已经找到的交回来，不会白找", "int", min=1, max=60),
+    _F("feeds.viz_per_day", "每天图解上限", "没配图、数字多的资讯，画一张小图放在配图的位置；0 = 不画", "int", min=0, max=10),
 
     # ---- goals ----
     _F("goals.propose", "主动提目标", "MaiWork 觉得群里该长期做件事时，提一个等你批准", "bool"),

@@ -914,11 +914,23 @@ body.booting .app, body.booting .tabbar { visibility: hidden; }
 .verify-steps { margin: 6px 0 0; padding-left: 1.2em; font-size: 13px; color: var(--gray); font-family: var(--mono); }
 .ntag.alt { background: var(--alt-bg); color: var(--blue); }
 .ntag.ok { background: var(--ok-bg); color: var(--ok-ink); }
-.chatvote { display: inline-flex; align-items: center; gap: 4px; height: 34px; min-width: 34px; padding: 0 9px; border-radius: 17px; background: var(--fill-2); color: var(--gray); transition: transform 0.18s var(--ease-out), background 0.2s, color 0.2s; }
-.chatvote svg { width: 17px; height: 17px; }
-.chatvote i { font-style: normal; font-size: 12px; font-family: var(--mono); }
-.chatvote[aria-pressed="true"] { background: var(--blue); color: var(--on-ink); }
-.chatvote:active { transform: scale(0.9); }
+/* 资讯图解：沙箱 iframe，高度由里面报上来 */
+.n-viz { display: block; width: 100%; height: 220px; margin-top: 14px; border: 0; border-radius: 18px; background: transparent; color-scheme: light dark; transition: height 0.25s var(--ease-out); }
+.ratebtn { display: inline-flex; align-items: center; gap: 5px; height: 34px; padding: 0 12px 0 10px; border-radius: 17px; background: var(--fill-2); color: var(--gray); transition: transform 0.18s var(--ease-out), background 0.2s, color 0.2s; }
+.ratebtn svg { width: 15px; height: 15px; }
+.ratebtn i { font-style: normal; font-size: 13px; font-weight: 600; }
+.ratebtn[aria-pressed="true"] { background: var(--ink); color: var(--on-ink); }
+.ratebtn:active { transform: scale(0.94); }
+/* 评价抽屉里的理由：可多选的胶囊 */
+.rate-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 18px; }
+.rate-chip { height: 38px; padding: 0 15px; border-radius: 19px; border: 1px solid var(--line); background: var(--fill-2); color: var(--ink-2); font-size: 14px; font-weight: 600; transition: transform 0.16s var(--ease-out), background 0.2s, color 0.2s, border-color 0.2s; }
+.rate-chip[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--on-ink); }
+.rate-chip:active { transform: scale(0.95); }
+/* 管理员看的评价汇总 */
+.ratings { margin-top: 14px; padding: 12px 14px; border-radius: 16px; border: 1px solid var(--line); background: var(--fill-2); }
+.ratings-h { font-size: 13px; font-weight: 600; color: var(--gray); margin-bottom: 6px; }
+.ratings .ntags { margin: 0 0 2px; }
+.rating-note { font-size: 13.5px; color: var(--ink-2); margin-top: 6px; line-height: 1.5; }
 .pref { margin: 18px 0 0; display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 12px 14px; border-radius: 16px; background: var(--fill-2); border: 1px solid var(--line); font-size: 14px; color: var(--gray); line-height: 1.5; }
 .pref img { width: 20px; height: 20px; }
 .pref b { color: var(--ink-2); }
@@ -1258,7 +1270,7 @@ button[disabled]:active, .btn[disabled]:active { transform: none; opacity: 0.45;
 .link-btn:active { opacity: 0.55; }
 /* 减少动态效果：不缩放，改成轻微变淡 */
 @media (prefers-reduced-motion: reduce) {
-  .btn:active, .chip:active, .round-btn:active, .icon-btn:active, .fb button:active, .filter:active, .set-nav button:active, .chatvote:active, .chat-send:active, .src:active,
+  .btn:active, .chip:active, .round-btn:active, .icon-btn:active, .fb button:active, .filter:active, .set-nav button:active, .ratebtn:active, .rate-chip:active, .chat-send:active, .src:active,
   .seg button:active, .cfg-jump button:active, .role-seg label:active span, .rej-head:active, .cm-tool-h:active, .news-run:active, .chat-list-btn:active,
   .sheet-close:active, .side-close:active, .pf-add:active, .ci-x:active, .gpick:active, .r-item:active, .chat-item:active, .log-head:active, .tab:active svg { transform: none; opacity: 0.7; }
 }

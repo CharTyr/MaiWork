@@ -42,7 +42,7 @@ def _norm_accounts(values: object, field_zh: str, problems: list[str]) -> tuple[
     return tuple(out)
 
 
-CONFIG_VERSION = "0.4.2"  # 0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
+CONFIG_VERSION = "0.4.3"  # 0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
 
 # 插件目录 = 本文件所在目录；默认数据目录 = 插件目录上两级 / data / maiwork
 # （线上 <MaiBot>/plugins/CharTyr_MaiWork → <MaiBot>/data/maiwork）
@@ -105,6 +105,7 @@ class FeedsSectionConfig(PluginConfigBase):
     pool_min_avg: float = Field(default=4.0, description="资讯进群里开话题候选池的平均分门槛（1~5）")
     guides: bool = Field(default=True, description="备资讯时要不要同时找「文章」（教程、好文章、工具介绍）")
     collect_minutes: int = Field(default=15, description="资讯收集子 agent 每轮最多跑多少分钟（到点把已找到的交回来）")
+    viz_per_day: int = Field(default=3, description="每群每天最多给几条没配图、数据多的资讯做「图解」小图（0 = 不做）")
 
 
 class GoalsSectionConfig(PluginConfigBase):
@@ -364,6 +365,7 @@ class FeedsSetting:
     pool_min_avg: float
     guides: bool
     collect_minutes: int = 15  # 资讯收集子 agent 每轮时间盒（到点把已找到的交回）
+    viz_per_day: int = 3       # 资讯图解每群每天上限（0 = 关），news_viz.py
 
 
 @dataclass(frozen=True)
@@ -672,6 +674,7 @@ def _parse_feeds(feeds: FeedsSectionConfig, problems: list[str], *, min_score_ex
         pool_min_avg=_clamp_score("pool_min_avg", feeds.pool_min_avg, 4.0),
         guides=bool(feeds.guides),
         collect_minutes=max(1, min(60, _clamp_int(getattr(feeds, "collect_minutes", 15), 1, 60, 15))),
+        viz_per_day=_clamp_int(getattr(feeds, "viz_per_day", 3), 0, 10, 3),
     )
 
 

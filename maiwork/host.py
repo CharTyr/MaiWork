@@ -407,7 +407,7 @@ class Host:
         """send.hybrid，可选 reply 段 + at 段 + text 段。
 
         at 段形状照宿主 message_utils._component_from_dict（线上源码 2026-09-29 读过）：
-        {"type": "at", "data": {"target_user_id": ...}}；群里实际显示成 @某人 待实测。
+        {"type": "at", "data": {"target_user_id": ...}}；群里显示为真正的 @（2026-09-29 测试群实测）。
         """
         segments: list[dict[str, Any]] = []
         if reply_to:

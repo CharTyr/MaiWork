@@ -1,5 +1,6 @@
 // MaiWork 网页 · 抽屉：登录、编辑表单、打开 / 关闭。
 import { $, CATS, desktop, isGA, state } from "./state.js";
+import { RATE_REASONS } from "./pages/news.js";
 import { SVG, esc } from "./util.js";
 import { gname, grp } from "./api.js";
 import { detailHTML, loadTask } from "./detail.js";
@@ -29,8 +30,28 @@ function loginSheet() {
     </form>`;
 }
 
+function rateSheet(e) {
+  const picked = new Set(e.reasons || []);
+  return `
+    <h1 class="h-page">评价这条资讯</h1>
+    <p class="h-meta sheet-lead">${esc(e.title || "")}</p>
+    <form id="edit" class="login" autocomplete="off">
+      <label>哪里不好（可以多选）</label>
+      <div class="rate-chips">${RATE_REASONS.map(
+        ([k, n]) => `<button type="button" class="rate-chip" data-act="rate-chip" data-k="${k}" aria-pressed="${picked.has(k)}">${esc(n)}</button>`
+      ).join("")}</div>
+      <label for="ed-text">想补一句（可选）</label>
+      <input id="ed-text" maxlength="60" spellcheck="false" placeholder="比如「上周就看过了」" value="${esc(e.note || "")}" />
+      <p class="fine">下一轮找资讯会参考大家的评价。</p>
+      <p class="err" id="ed-err" hidden></p>
+      <button class="btn primary wide" type="submit">提交</button>
+      ${e.had ? `<button class="btn wide" type="button" data-act="rate-clear" style="margin-top:10px">撤回我的评价</button>` : ""}
+    </form>`;
+}
+
 function editSheet() {
   const e = state.editing || {};
+  if (e.kind === "rate") return rateSheet(e);
   if (e.kind === "ga")
     return `
     <h1 class="h-page">群管理员 · ${esc(e.name || "")}</h1>
