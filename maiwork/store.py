@@ -465,7 +465,8 @@ def _m_quality(conn: sqlite3.Connection) -> None:
 
 # 「有人味」的资讯（docs/02-设计.md §4.1「写法」，2026-09-27 与用户定）：
 # - news_items：body（按 MaiBot 口吻写、可带内联链接的正文）、reason（我发这条的原因）、
-#   refs（群里什么时候聊过：[{ts, who, text, message_id}]）、audience（谁可能需要：[名字]）、
+#   refs（群里什么时候聊过：[{ts, who, user_id, text, message_id}]，user_id 用来查当前名）、
+#   audience（谁可能需要：[{"user_id","name"}]，认人靠 user_id；老行是 [名字]）、
 #   image_url（原文封面图）、keywords（给 MaiBot 接话题用的关键词）、verify（railway.new 实测结果 JSON）、
 #   chat_votes（群友点「想在群里聊」的次数）、angle（'diverse' = 刻意放进来的不同角度）
 # - ideas：feasibility（可行性 JSON）、keywords
@@ -728,8 +729,53 @@ def _m_group_folders(conn: sqlite3.Connection) -> None:
     """)
 
 
+# 成员名册（members.py）：按（群, 平台 id）记最新显示名；上线时从 member_activity 补一遍
+def _m_members(conn: sqlite3.Connection) -> None:
+    from . import members
+
+    conn.executescript(members.SCHEMA_SQL)
+    members.seed_from_activity(conn)
+
+
+# 资讯卡片 / 构想提一嘴（card_push.py）：每批资讯至多一张卡片（batch_id 唯一），
+# 每个构想至多提一次（idea_id 唯一）；status pending/sending/sent/failed/uncertain/dropped
+def _m_card_push(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS news_cards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id TEXT NOT NULL,
+        batch_id INTEGER NOT NULL UNIQUE,
+        status TEXT NOT NULL DEFAULT 'pending',
+        item_ids TEXT NOT NULL DEFAULT '[]',
+        created REAL NOT NULL DEFAULT 0,
+        due_ts REAL NOT NULL DEFAULT 0,
+        sent_ts REAL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        mode TEXT NOT NULL DEFAULT '',
+        message_id TEXT NOT NULL DEFAULT '',
+        error TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_news_cards_group ON news_cards(group_id, status);
+    CREATE TABLE IF NOT EXISTS idea_mentions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id TEXT NOT NULL,
+        idea_id INTEGER NOT NULL UNIQUE,
+        status TEXT NOT NULL DEFAULT 'pending',
+        text TEXT NOT NULL DEFAULT '',
+        at_user TEXT NOT NULL DEFAULT '',
+        created REAL NOT NULL DEFAULT 0,
+        due_ts REAL NOT NULL DEFAULT 0,
+        sent_ts REAL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        message_id TEXT NOT NULL DEFAULT '',
+        error TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_idea_mentions_group ON idea_mentions(group_id, status);
+    """)
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push]
 
 
 class Store:

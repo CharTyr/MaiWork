@@ -296,6 +296,7 @@ class ModelSettings:
     max_concurrency: int = 2  # 同一端点同时最多几个在途请求（1~8）
     max_rpm: int = 0          # 同一端点每分钟最多几次（0 = 不限）
     context_window: int = 128000  # 模型上下文长度（tokens，8192~2000000），上下文压缩用
+    max_tokens: int = 32768  # 一次回答最多写多少 token（1024~1000000）；每次调用都带上
 
     def ready(self) -> bool:
         """端点、密钥、主模型、子 agent 模型都有。"""
@@ -319,6 +320,7 @@ class ModelSettings:
             "max_concurrency": self.max_concurrency,
             "max_rpm": self.max_rpm,
             "context_window": self.context_window,
+            "max_tokens": self.max_tokens,
         }
 
 
@@ -380,6 +382,8 @@ def _validate(patch: dict) -> list[str]:
         problems.append("每分钟上限（max_rpm）必须是 0~600 的整数（0 = 不限）")
     if patch.get("context_window") is not None and not _valid_int(patch.get("context_window"), 8192, 2_000_000):
         problems.append("上下文长度必须是 8192~2000000 的整数（tokens）")
+    if patch.get("max_tokens") is not None and not _valid_int(patch.get("max_tokens"), 1024, 1_000_000):
+        problems.append("最大输出（max_tokens）必须是 1024~1000000 的整数（tokens）")
     return problems
 
 
@@ -462,6 +466,9 @@ class Models:
         context_window = cfg.get("context_window")
         if not _int_in(context_window, 8192, 2_000_000):
             context_window = 128000
+        max_tokens = cfg.get("max_tokens")
+        if not _int_in(max_tokens, 1024, 1_000_000):
+            max_tokens = 32768
         return ModelSettings(
             base_url=base_url,
             main=main,
@@ -477,6 +484,7 @@ class Models:
             max_concurrency=int(max_concurrency),
             max_rpm=int(max_rpm),
             context_window=int(context_window),
+            max_tokens=int(max_tokens),
         )
 
     def _current_key(self, settings: Settings) -> str:
@@ -507,8 +515,9 @@ class Models:
             "models.worker": str(patch["worker"]).strip(),
             "models.worker_backup": str(patch.get("worker_backup") or "").strip(),
         }
-        # retries / retry_delay_s / 限流两项：没传保留当前有效值（别把网页上没动的重试清零）
-        for key in ("retries", "retry_delay_s", "max_concurrency", "max_rpm", "context_window"):
+        # retries / retry_delay_s / 限流两项 / 上下文长度 / 最大输出：没传保留当前有效值
+        # （别把网页上没动的重试清零）
+        for key in ("retries", "retry_delay_s", "max_concurrency", "max_rpm", "context_window", "max_tokens"):
             if patch.get(key) is not None:
                 writes[f"models.{key}"] = int(patch[key])
             else:
@@ -637,6 +646,8 @@ class Models:
         没有就按连续 429 次数 10/20/40/60 秒退避、封顶 60 秒，加 ±20% 抖动）；
         用完再换备用模型，备用同样规则。其他 4xx 不重试、不换备用，直接抛。
         retries=None 用设置里的；主循环里直接 await 的调用传 1（别让循环卡几分钟）。
+        max_tokens=None 用设置里的 [models] max_tokens（缺省 32768）；传了以调用方为准。
+        请求体里总是带 max_tokens（有些端点没有它会出错）。
         每次尝试（成功或失败）写一条 usage + 一条 model_calls。
         发请求前过端点限流门：并发上限 max_concurrency（缺省 2）+ 429 冷却 +
         每分钟上限 max_rpm（缺省 0 = 关）；等待可取消，状态只在内存。
@@ -659,13 +670,22 @@ class Models:
         models_cfg = getattr(settings, "models", None)
         max_conc = _limit_from(models_cfg, "max_concurrency", _MAX_CONCURRENCY_DEFAULT, 1, 64)
         max_rpm = _limit_from(models_cfg, "max_rpm", 0, 0, 1_000_000)
+        # 每次调用都带 max_tokens：调用方传了以它为准，没传用设置里的
+        # [models] max_tokens（缺省 32768）。有些端点收不到这个参数会出错，所以标准请求里一直有。
+        configured_max_tokens = int(getattr(s, "max_tokens", 32768) or 32768)
+        if configured_max_tokens <= 0:
+            configured_max_tokens = 32768
+        if max_tokens is not None and int(max_tokens) > 0:
+            body_max_tokens = int(max_tokens)
+        else:
+            body_max_tokens = configured_max_tokens
         endpoint = s.base_url
 
         client = self._get_client()
         url = s.base_url + "/chat/completions"
         last_err: ModelError | None = None
         # 快照一份请求日志底稿：messages 统一截断+遮罩只算一次，每次尝试直接存
-        log_request = self._build_log_request(messages, tools, json_mode, secret_keys)
+        log_request = self._build_log_request(messages, tools, json_mode, secret_keys, body_max_tokens)
         attempt = 0
         for pos, model in enumerate(candidates):
             try_n = 0
@@ -703,11 +723,10 @@ class Models:
                     "messages": send_messages,
                     "stream": True,
                     "stream_options": {"include_usage": True},
+                    "max_tokens": body_max_tokens,
                 }
                 if tools:
                     body["tools"] = tools
-                if max_tokens:
-                    body["max_tokens"] = int(max_tokens)
                 start = clock.now()
                 status = 0
                 try:
@@ -887,10 +906,14 @@ class Models:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_log_request(messages: list[dict], tools: list[dict] | None, json_mode: bool, keys: list[str]) -> str:
+    def _build_log_request(
+        messages: list[dict], tools: list[dict] | None, json_mode: bool, keys: list[str],
+        max_tokens: int | None = None,
+    ) -> str:
         """把这次调用请求底稿拼成 JSON 字符串（只拼一次，每次尝试复用）。
 
-        只存 messages（content 截 _LOG_CONTENT_MAX；tool_calls 只要名字+参数截 _LOG_TOOL_ARGS_MAX）、
+        只存 max_tokens（这次实际带的输出上限，放最前面，整份被截也看得到）、
+        messages（content 截 _LOG_CONTENT_MAX；tool_calls 只要名字+参数截 _LOG_TOOL_ARGS_MAX）、
         工具名列表、json_mode——不存 headers / 模型名中可能带的服务商名之外，一切文本过遮罩。
         整份 JSON 截 _LOG_REQUEST_MAX（截断后不再直接 json.loads，详情接口自己 JSON 修复）。
         """
@@ -925,7 +948,7 @@ class Models:
                 if name:
                     tool_names.append(_redact_full(name, keys))
         payload = json.dumps(
-            {"messages": out_messages, "tools": tool_names, "json_mode": bool(json_mode)},
+            {"max_tokens": max_tokens, "messages": out_messages, "tools": tool_names, "json_mode": bool(json_mode)},
             ensure_ascii=False,
         )
         return payload[:_LOG_REQUEST_MAX]

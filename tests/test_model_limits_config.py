@@ -3,6 +3,8 @@
 - config.toml 能写：max_concurrency 1~8（缺省 2），max_rpm 0~600（缺省 0 = 不限）；越界夹回。
 - 设置 → 模型 的 public() 带这两项；save() 能改、非法值给中文错；没传保留当前值。
 - 端点刚被 429 冷却时，「测试连接 / 列模型」直接报错说还要等几秒，不让网页转圈两分钟。
+- 同一个页面上的 max_tokens（最大输出，缺省 32768）走同一条链路，并且每次 chat 都带上
+  （调用方传了以调用方为准）。见 TestMaxTokensOnModelsPage / TestMaxTokensAlwaysSent。
 """
 
 from __future__ import annotations
@@ -82,6 +84,66 @@ class TestContextWindowOnModelsPage:
         store, models = _make(tmp_path, {}, FakeEndpoint({}))
         with pytest.raises(ValueError):
             models.save(_patch(api_key=SECRET, context_window=bad))
+
+
+class TestMaxTokensOnModelsPage:
+    """「设置 → 模型」也能看/改最大输出（[models] max_tokens，默认 32768）。"""
+
+    def test_default_in_public(self, tmp_path) -> None:
+        store, models = _make(tmp_path, {"models": _chat_payload(api_key=SECRET)}, FakeEndpoint({}))
+        assert models.settings().public()["max_tokens"] == 32768
+
+    def test_config_value_reaches_public(self, tmp_path) -> None:
+        cfg = {"models": _chat_payload(api_key=SECRET, max_tokens=8192)}
+        store, models = _make(tmp_path, cfg, FakeEndpoint({}))
+        assert models.settings().public()["max_tokens"] == 8192
+
+    def test_save_and_keep(self, tmp_path) -> None:
+        store, models = _make(tmp_path, {}, FakeEndpoint({}))
+        models.save(_patch(api_key=SECRET, max_tokens=65536))
+        assert models.settings().max_tokens == 65536
+        # 没传 = 保留当前值，别把网页上没动的那格清零
+        models.save(_patch())
+        assert models.settings().max_tokens == 65536
+
+    @pytest.mark.parametrize("bad", [1023, 1_000_001, "x", True])
+    def test_save_invalid(self, tmp_path, bad) -> None:
+        store, models = _make(tmp_path, {}, FakeEndpoint({}))
+        with pytest.raises(ValueError) as ei:
+            models.save(_patch(api_key=SECRET, max_tokens=bad))
+        assert "max_tokens" in str(ei.value) or "最大输出" in str(ei.value)
+
+
+class TestMaxTokensAlwaysSent:
+    """每次模型调用都带 max_tokens：不传用配置值，传了以调用方为准。"""
+
+    @pytest.mark.asyncio
+    async def test_default_used_when_caller_omits(self, tmp_path) -> None:
+        ep = FakeEndpoint({"m1": [{"kind": "ok"}]})
+        store, models = _make(
+            tmp_path, {"models": _chat_payload(api_key=SECRET, main="m1", worker="w")}, ep
+        )
+        await models.chat("main", [{"role": "user", "content": "x"}])
+        assert ep.calls[0]["body"]["max_tokens"] == 32768
+        await models.close()
+
+    @pytest.mark.asyncio
+    async def test_configured_value_used_when_caller_omits(self, tmp_path) -> None:
+        ep = FakeEndpoint({"m1": [{"kind": "ok"}]})
+        cfg = {"models": _chat_payload(api_key=SECRET, main="m1", worker="w", max_tokens=4096)}
+        store, models = _make(tmp_path, cfg, ep)
+        await models.chat("main", [{"role": "user", "content": "x"}])
+        assert ep.calls[0]["body"]["max_tokens"] == 4096
+        await models.close()
+
+    @pytest.mark.asyncio
+    async def test_caller_override_wins(self, tmp_path) -> None:
+        ep = FakeEndpoint({"m1": [{"kind": "ok"}]})
+        cfg = {"models": _chat_payload(api_key=SECRET, main="m1", worker="w", max_tokens=4096)}
+        store, models = _make(tmp_path, cfg, ep)
+        await models.chat("main", [{"role": "user", "content": "x"}], max_tokens=12000)
+        assert ep.calls[0]["body"]["max_tokens"] == 12000
+        await models.close()
 
 
 class TestListModelsDuringCooldown:

@@ -261,11 +261,13 @@ class TestWritePosts:
         assert "阿一" in row["reason"]
         refs = json.loads(row["refs"])
         assert len(refs) == 1
-        assert set(refs[0].keys()) == {"ts", "who", "text", "message_id"}
+        assert set(refs[0].keys()) == {"ts", "who", "user_id", "text", "message_id"}
         assert refs[0]["who"] == "阿一"
+        assert refs[0]["user_id"] == "u-阿一"     # 认人靠 id，名字只是快照
         assert refs[0]["message_id"] == "c1"
         assert len(refs[0]["text"]) <= 80
-        assert json.loads(row["audience"]) == ["阿一"]
+        # 落库的 audience 是 {"user_id","name"}（显示时再按 id 查当前名）
+        assert json.loads(row["audience"]) == [{"user_id": "u-阿一", "name": "阿一"}]
         kws = json.loads(row["keywords"])
         assert 5 <= len(kws) <= 10 or len(kws) >= 1
         assert "FPGA" in kws
@@ -277,7 +279,8 @@ class TestWritePosts:
         item = view[0]["items"][0]
         assert item["body"] == row["body"]
         assert item["reason"] == row["reason"]
-        assert item["refs"] == refs
+        # 视图里的 refs 不带 user_id（前端只要 who；QQ 号不外漏），其余字段和落库一致
+        assert item["refs"] == [{k: v for k, v in refs[0].items() if k != "user_id"}]
         assert item["audience"] == ["阿一"]
         assert item["image_url"] == "https://cdn.example.com/board.jpg"
         assert item["keywords"] == kws
@@ -297,7 +300,7 @@ class TestWritePosts:
             assert _run(feeds.prepare_news(GID)) == 1
         row = store.read().execute("SELECT audience FROM news_items WHERE rejected=0").fetchone()
         # refs=[1] → 只有第 1 条原话（阿一）；老王没被引用，也不在 audience 里
-        assert json.loads(row["audience"]) == ["阿一"]
+        assert json.loads(row["audience"]) == [{"user_id": "u-阿一", "name": "阿一"}]
 
     def test_body_links_only_https_max4(self, tmp_path) -> None:
         """body 里的链接只留 http(s)，最多 4 个；javascript:/ftp: 被洗掉。"""
@@ -343,7 +346,8 @@ class TestWritePosts:
         assert len(refs) == 1
         assert len(refs[0]["text"]) <= 80
         assert refs[0]["who"] == "长话哥"
-        assert json.loads(row["audience"]) == ["长话哥"]
+        assert refs[0]["user_id"] == "u9"
+        assert json.loads(row["audience"]) == [{"user_id": "u9", "name": "长话哥"}]
 
     def test_post_failure_falls_back(self, tmp_path) -> None:
         """写帖子模型抛错：条目不丢，body=summary、reason=why。"""
@@ -375,6 +379,57 @@ class TestWritePosts:
         row = store.read().execute("SELECT * FROM news_items WHERE rejected=0").fetchone()
         assert row["body"] == row["summary"]
         assert row["reason"] == row["why"]
+
+
+class TestViewCurrentNames:
+    """视图里的 audience / refs 用名册当前名（按 user_id），老字符串行原样输出。"""
+
+    def _prepared_row(self, tmp_path):
+        models = FakeModelsQueue(ready=True, replies=[_FOCUS_JSON, _SCORES_JSON, _post_json()])
+        store, settings, feeds, models, *_r = _make_feeds(tmp_path, models=models)
+        _seed_chat(store)
+        with _TimePatch():
+            assert _run(feeds.prepare_news(GID)) == 1
+        return store, feeds
+
+    def test_audience_and_refs_show_current_name(self, tmp_path) -> None:
+        from CharTyr_MaiWork.maiwork import members
+
+        store, feeds = self._prepared_row(tmp_path)
+        with store.tx() as conn:
+            members.record(conn, GID, "u-阿一", "阿一改了名", 1e10)
+        with _TimePatch():
+            item = feeds.news_view(GID, admin=True)[0]["items"][0]
+        assert item["audience"] == ["阿一改了名"]     # 前端要的还是字符串列表
+        assert item["refs"][0]["who"] == "阿一改了名"
+
+    def test_unknown_id_falls_back_to_snapshot(self, tmp_path) -> None:
+        store, feeds = self._prepared_row(tmp_path)
+        with _TimePatch():
+            item = feeds.news_view(GID, admin=True)[0]["items"][0]
+        assert item["audience"] == ["阿一"]
+        assert item["refs"][0]["who"] == "阿一"
+
+    def test_old_string_audience_passes_through(self, tmp_path) -> None:
+        """老行 audience 是字符串列表：原样输出（不回查、不丢）。"""
+        store, feeds = self._prepared_row(tmp_path)
+        with store.tx() as conn:
+            conn.execute("UPDATE news_items SET audience='[\"老名字\"]'")
+        with _TimePatch():
+            item = feeds.news_view(GID, admin=True)[0]["items"][0]
+        assert item["audience"] == ["老名字"]
+
+    def test_audience_dict_without_name_or_unknown_dropped(self, tmp_path) -> None:
+        """audience 项查不到当前名、回落名也没有 → 丢掉（不写空名、不漏 id）。"""
+        store, feeds = self._prepared_row(tmp_path)
+        with store.tx() as conn:
+            conn.execute(
+                "UPDATE news_items SET audience=?",
+                (json.dumps([{"user_id": "u-无", "name": ""}], ensure_ascii=False),),
+            )
+        with _TimePatch():
+            item = feeds.news_view(GID, admin=True)[0]["items"][0]
+        assert item["audience"] == []
 
     def test_scrub_rejects_note_fragment_in_post(self, tmp_path) -> None:
         """写出的 body/reason 含关注成员 note 片段 → 回落成 summary/why（不丢条目）。"""

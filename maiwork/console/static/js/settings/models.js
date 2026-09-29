@@ -92,8 +92,9 @@ function modelsForm() {
       <p class="fine" style="margin:0 0 4px">填模型能记住的最大长度（tokens）。对话快满时，MaiWork 会把前面的内容整理成摘要再接着做</p>
       <div class="two-col">
         <div><label for="m-ctx">上下文长度（tokens）</label><input id="m-ctx" type="number" min="8192" max="2000000" step="1024" value="${esc(m.context_window ?? 128000)}" /></div>
-        <div></div>
+        <div><label for="m-max-tokens">最大输出（tokens）</label><input id="m-max-tokens" type="number" min="1024" max="1000000" step="1024" value="${esc(m.max_tokens ?? 32768)}" /></div>
       </div>
+      <p class="fine" style="margin:4px 0 0">最大输出 = 模型一次回答最多写多长。每次调用都会带上，有些端点不传会出问题，一般 32768 就行</p>
       <p class="err" id="m-err" hidden></p>
       <button class="btn primary wide" type="submit">保存</button>
       

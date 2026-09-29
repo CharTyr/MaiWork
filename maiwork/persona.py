@@ -25,7 +25,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any, Callable
 
-from . import clock
+from . import clock, members
 
 if TYPE_CHECKING:
     from .config import Settings
@@ -143,7 +143,10 @@ class Personas:
         ).fetchone()
         if member is None or int(member["removed"]):
             return False
-        name = str(member["name"] or "").strip() or uid
+        # 显示名以成员名册为准（改名自动跟上），focus_members.name 只是老快照；
+        # 都查不到（名字空 / 恰好是 id）叫「这位群友」——QQ 号永远不当名字出现在文字里
+        # （提示词里另带「（QQ号 …）」，这不是给人看的名字）
+        name = members.name_of(self._store, gid, uid, member["name"]) or "这位群友"
 
         msgs_rows = self._store.read().execute(
             "SELECT ts, text FROM focus_messages WHERE group_id=? AND user_id=?"

@@ -339,6 +339,33 @@ class TestView:
         assert goals.view(GID)["agent"] == []
 
 
+class TestCurrentNames:
+    """成员目标的显示名按 who_id 查名册当前名；查不到回落 who_name 快照。"""
+
+    def _record(self, mem_store: Store, uid: str, name: str) -> None:
+        from CharTyr_MaiWork.maiwork import members
+
+        with mem_store.tx() as conn:
+            members.record(conn, GID, uid, name, 1e10)
+
+    def test_view_who_uses_current_name(self, goals: Goals, mem_store: Store):
+        _mk_member(goals, who_id="10001", who_name="阿柒")
+        self._record(mem_store, "10001", "阿柒改了名")
+        assert goals.view(GID)["member"][0]["who"] == "阿柒改了名"
+
+    def test_view_who_unknown_id_keeps_snapshot(self, goals: Goals, mem_store: Store):
+        _mk_member(goals, who_id="99999", who_name="老快照")
+        assert goals.view(GID)["member"][0]["who"] == "老快照"
+
+    def test_due_remind_who_name_is_current(self, goals: Goals, mem_store: Store, fixed_clock):
+        _mk_member(goals, who_id="10001", who_name="阿柒", remind_ts=NOW + 100)
+        self._record(mem_store, "10001", "阿柒改了名")
+        fixed_clock[0] = NOW + 200
+        item = next(d for d in goals.due(fixed_clock[0]) if d["type"] == "remind")
+        assert item["goal"]["who_name"] == "阿柒改了名"
+        assert item["goal"]["who_id"] == "10001"   # 调用方仍拿得到 id 自己再查
+
+
 class TestSetCriteria:
     """2026-10：目标第一次检查补验收标准用（整组替换，done 一律 False）。"""
 

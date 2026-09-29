@@ -31,6 +31,9 @@ MARKER = "【MaiWork 备忘】"  # 已注入标记：inject 排重用（不含�
 # 才把待发的本任务成品升级为 awaited_delivery。它与故障及指令回执一样不受
 # 睡觉时段/每日额度限制，仍记发送审计；不要把所有 delivery 都豁免。
 PUSH_EXEMPT_KINDS = frozenset(("error", "command", "admin", "awaited_delivery"))
+# 自带每日上限的推送（card_push.py：资讯卡片 / 构想提一嘴）：留 pushes 记录，但不占
+# delivery.push_per_day（开场白那份额度），节制由它们自己的每群上限管
+SELF_QUOTA_KINDS = frozenset(("news_card", "idea_mention"))
 
 # MaiBot 上下文里聊天消息形如 `<message msg_id="..">文本</message>` 的 text part
 # （出处：reference/jev/processor.py 的 _parse_chat_message）；
@@ -544,19 +547,25 @@ class Pushes:
         if kind in PUSH_EXEMPT_KINDS:
             return True, ""
         settings = self._get_settings()
-        # 睡觉时段
-        quiet = getattr(settings.delivery, "quiet_hours", "") or "23:00-08:00"
-        try:
-            s, e = clock.parse_hhmm_range(quiet)
-        except (ValueError, AttributeError):
-            s, e = 0, 0  # 配错按不限制
-        if s != e and clock.in_range(float(now), (s, e)):
+        if self.in_quiet(now):
             return False, "睡觉时段"
         # 每日上限
         limit = int(getattr(settings.delivery, "push_per_day", 3))
         if limit > 0 and self._count_for_day(group_id, float(now), kind=None) >= limit:
             return False, "今天推够了"
         return True, ""
+
+    def _quiet_range(self) -> tuple[int, int]:
+        quiet = getattr(self._get_settings().delivery, "quiet_hours", "") or "23:00-08:00"
+        try:
+            return clock.parse_hhmm_range(quiet)
+        except (ValueError, AttributeError):
+            return 0, 0  # 配错按不限制
+
+    def in_quiet(self, now: float) -> bool:
+        """now 在不在睡觉时段（delivery.quiet_hours）。"""
+        s, e = self._quiet_range()
+        return s != e and clock.in_range(float(now), (s, e))
 
     def record(self, group_id: str, kind: str, text: str, now: float) -> None:
         """任何 kind 都留发送记录；豁免种类不占每日额度。"""
@@ -570,7 +579,7 @@ class Pushes:
         """ts 所在北京那一天推过几条。kind=None 只算需要节制的推送。"""
         day = clock.day_key(float(ts))
         if kind is None:
-            exempt = tuple(sorted(PUSH_EXEMPT_KINDS))
+            exempt = tuple(sorted(PUSH_EXEMPT_KINDS | SELF_QUOTA_KINDS))
             placeholders = ", ".join("?" for _ in exempt)
             row = self._store.read().execute(
                 "SELECT COUNT(*) AS c FROM pushes"

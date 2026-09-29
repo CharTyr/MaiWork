@@ -534,6 +534,24 @@ async def test_question_moves_to_waiting_input_and_asks(
     assert workers.calls == []
 
 
+async def test_question_asks_current_requester_name(mem_store: Store, settings, env, tools, tasks, goals):
+    """提问 @ 发起人用名册当前名（按 requester_id），不是老快照。"""
+    from CharTyr_MaiWork.maiwork import members
+
+    tid = _create_task(tasks, requester_id="10001", requester_name="阿明")
+    with mem_store.tx() as conn:
+        members.record(conn, GID, "10001", "阿明改了名", 1e10)
+    models = ModelsQueue(replies=[_plan(question="需要确认：要简体还是繁体？")])
+    outbox = FakeOutbox()
+    coordinator = _build(
+        mem_store=mem_store, settings=settings, env=env, tools=tools, tasks=tasks,
+        goals=goals, models=models, workers=FakeWorkers(), outbox=outbox,
+    )
+    await coordinator.run_task(tid)
+    text = [e for e in outbox.enqueued if e["kind"] == "text"][0]["payload"]["text"]
+    assert "@阿明改了名 " in text and "10001" not in text
+
+
 # ---------------------------------------------------------------------------
 # 执行中被取消 → 晚到结果不交付、状态保持 cancelled
 # ---------------------------------------------------------------------------

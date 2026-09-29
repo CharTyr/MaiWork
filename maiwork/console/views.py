@@ -12,7 +12,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from .. import clock
+from .. import clock, members
 from ..names import clean_group_name
 
 logger = logging.getLogger("maiwork.console.views")
@@ -410,6 +410,14 @@ def _attach_idea_targets(svc: Any, group_id: str, ideas: list, focus: list, *, a
     for it in ideas:
         if not isinstance(it, dict):
             continue
+        # basis / reason / why 可能带 {@QQ号} 记号（个人向构想的「因为他是…」）——渲染成当前名字
+        for key in ("basis", "reason", "why"):
+            v = str(it.get(key) or "")
+            if "{@" in v:
+                try:
+                    it[key] = members.render(svc.store, group_id, v)
+                except Exception:
+                    pass
         uid = str(it.pop("target_user_id", "") or "")
         if not uid:
             it["for_member"] = None
@@ -435,10 +443,11 @@ def _attach_idea_targets(svc: Any, group_id: str, ideas: list, focus: list, *, a
         it["for_member"] = {"user_id": uid, "name": name, "avatar": avatar}
 
 
-def _persona_view(raw_persona: Any, raw_ts: Any) -> dict[str, Any] | None:
+def _persona_view(raw_persona: Any, raw_ts: Any, *, gid: str = "", svc: Any = None) -> dict[str, Any] | None:
     """把 focus_members.persona（JSON）转成 GroupView.focus 每项的 persona 字段。
 
     只给管理员看；结构固定五键加 updated_ts；库里没有 / JSON 拿不出来 → None。
+    正文里的 {@QQ号} 一律渲染成名册里的当前名字（QQ 号不当名字给人看）。
     """
     s = str(raw_persona or "").strip()
     if not s:
@@ -449,14 +458,23 @@ def _persona_view(raw_persona: Any, raw_ts: Any) -> dict[str, Any] | None:
         return None
     if not isinstance(parsed, dict):
         return None
+
+    def _r(text: Any) -> str:
+        if svc is None:
+            return str(text or "")
+        try:
+            return members.render(svc.store, gid, text) or str(text or "")
+        except Exception:
+            return str(text or "")
+
     def _str_list(v: Any) -> list[str]:
-        return [str(x) for x in v] if isinstance(v, list) else []
+        return [_r(x) for x in v] if isinstance(v, list) else []
     persona = {
-        "summary": str(parsed.get("summary") or ""),
+        "summary": _r(parsed.get("summary")),
         "doing": _str_list(parsed.get("doing")),
         "cares": _str_list(parsed.get("cares")),
         "asked": _str_list(parsed.get("asked")),
-        "style": str(parsed.get("style") or ""),
+        "style": _r(parsed.get("style")),
         "updated_ts": float(raw_ts or 0.0),
     }
     return persona
@@ -501,17 +519,21 @@ def _member_avatar_path(svc: Any, group_id: str, user_id: str) -> str:
 
 def _focus_list(svc: Any, group_id: str) -> list[dict[str, Any]]:
     try:
-        members = svc.profiles.focus(group_id)
+        people = svc.profiles.focus(group_id)
     except Exception:
-        members = []
+        people = []
     out = []
-    for m in members or []:
+    for m in people or []:
         if not isinstance(m, dict) or m.get("removed"):
             continue
         reasons = m.get("reasons")
-        persona_view = _persona_view(m.get("persona"), m.get("persona_ts"))
+        persona_view = _persona_view(m.get("persona"), m.get("persona_ts"), gid=group_id, svc=svc)
         user_id = str(m.get("user_id") or "")
         display_name = _member_display_name(m, user_id)
+        try:
+            note = members.render(svc.store, group_id, m.get("note") or "")
+        except Exception:
+            note = str(m.get("note") or "")
         out.append(
             {
                 "user_id": user_id,
@@ -520,7 +542,8 @@ def _focus_list(svc: Any, group_id: str) -> list[dict[str, Any]]:
                 "display_name": display_name,
                 "avatar": _member_avatar_path(svc, group_id, user_id),
                 "reasons": [str(r) for r in reasons] if isinstance(reasons, list) else [],
-                "note": str(m.get("note") or ""),
+                # 注记里的 {@QQ号} 渲染成当前名字（管理员看的是人，不是数字）
+                "note": note,
                 "pinned": bool(m.get("pinned")),
                 "persona": persona_view,
                 "personal": _personal_view(svc, group_id, str(m.get("user_id") or "")),
@@ -722,6 +745,13 @@ def group_view(svc: Any, group_id: str, *, admin: bool) -> dict[str, Any]:
             "album_upload": bool(caps.get("album_upload")),
             "role": str(role or ""),
         }
+        # 往群里发（资讯卡片 / 构想提一嘴）的开关：仅管理员 / 本群群管理员
+        try:
+            from .. import card_push as _cp
+
+            view["card_push"] = _cp.web_view(svc, group_id)
+        except Exception:
+            logger.exception("读卡片推送设置失败（群 %s）", group_id)
     else:
         _attach_idea_targets(svc, group_id, ideas, [], admin=False)
         out.pop("token", None)

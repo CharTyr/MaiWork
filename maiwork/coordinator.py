@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
-from . import clock, compaction
+from . import clock, compaction, members
 from .host import HostError
 from .models import ModelError
 from .outbox import report_error as _report_error
@@ -1024,7 +1024,10 @@ class Coordinator:
                 logger.warning("任务 %s →waiting_input 非法：%s", tid, e)
                 return "done"
             text = plan["question"]
-            requester = str(task.get("requester_name") or "").strip()
+            # @ 发起人用名册当前名（按 requester_id），查不到回落 requester_name 老快照
+            requester = members.name_of(
+                self._store, gid, task.get("requester_id"), fallback=task.get("requester_name")
+            ).strip()
             if requester:
                 text = f"@{requester} {text}"
             try:

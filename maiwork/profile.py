@@ -26,7 +26,7 @@ import string
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
-from . import clock
+from . import clock, members
 from .privacy import scrub
 
 if TYPE_CHECKING:  # 只做类型提示，运行时不需要
@@ -258,10 +258,10 @@ class Profiles:
     # 2026-09-29：glm-5.3-flash 把思考写在正文里，端点默认 8192 token 就截断（半数回答被截）；
     # 给到 16000，流式约 55 token/秒，总时长放到 420 秒
     # 网关约 129 秒断连接：同一批原样重试没用，失败直接交给拆半（retries=0）；
-    # 输出上限 12000（够写结果，想太久就截断 → 不带草稿再问一次，比被断强）
+    # 输出上限不再单独卡（曾是 12000）：输出额度含思考，卡低了换个爱想的模型就想不完回空；
+    # 交给 [models] max_tokens（默认 32768，每次调用都带）。被截断照旧当读不懂、不带草稿再问一次
     _REFRESH_TIMEOUT_S = 420
     _REFRESH_RETRIES = 0
-    _REFRESH_MAX_TOKENS = 12000
     _FORMAT_RETRY_TEXT = (
         "上面的回答读不懂，格式不对。请严格按「一行一件事」的格式重新输出，每行用「|」分段，"
         "例如：新增 | 最近在聊 | 一句话 | 3,5。不要 JSON、不要别的话；"
@@ -300,7 +300,6 @@ class Profiles:
         return await self._models.chat(
             "main", messages, json_mode=False, purpose="profile.refresh", group_id=gid,
             timeout=self._REFRESH_TIMEOUT_S, retries=self._REFRESH_RETRIES,
-            max_tokens=self._REFRESH_MAX_TOKENS,
         )
 
     async def _refine_batch(self, gid: str, batch_msgs: list, now: float, *, record_failure: bool = True) -> bool:
@@ -459,6 +458,8 @@ class Profiles:
                 if scrub(gid, text, self._store) is None:
                     continue
                 text = text[: self._TEXT_MAX]
+                # 裸 QQ 号一律换成 {@QQ号} 再入库（给人看的出口统一渲染成当前名字）
+                text = members.tokenize_ids(conn, gid, text)
                 if any(similar(text, str(t["text"])) for t in tombs):
                     continue  # 管理员删过的不许加回
                 dup = next((r for r in live if similar(text, str(r["text"])) and str(r["category"]) == category), None)
@@ -507,11 +508,12 @@ class Profiles:
                 # G7：关注成员的名字 / 注记不能进群画像——更新作废，原文保留
                 if scrub(gid, text, self._store) is None:
                     continue
+                text = members.tokenize_ids(conn, gid, text[: self._TEXT_MAX])
                 conn.execute(
                     "UPDATE profile_entries SET text=?, updated=? WHERE id=?",
-                    (text[: self._TEXT_MAX], now, eid),
+                    (text, now, eid),
                 )
-                row0["text"] = text[: self._TEXT_MAX]
+                row0["text"] = text
                 counts["update"] += 1
             elif kind == "remove":
                 try:
@@ -569,9 +571,11 @@ class Profiles:
             note = str(p.get("note") or "").strip()
             if not uid or not note or uid not in current or uid in with_persona:
                 continue
+            # 注记里写到的裸 QQ 号也换成 {@QQ号}（网页给管理员看时渲染成当前名字）
+            note = members.tokenize_ids(conn, gid, note[:120])
             conn.execute(
                 "UPDATE focus_members SET note=?, updated=? WHERE group_id=? AND user_id=?",
-                (note[:120], now, gid, uid),
+                (note, now, gid, uid),
             )
             wrote = True
         return wrote
@@ -761,6 +765,7 @@ class Profiles:
                 + ("（锁定）" if int(r["locked"]) else "")
                 + stale
             )
+        legend = members.legend(conn, gid, [str(r["text"]) for r in entries_rows])
         prompt = [
             {"role": "system", "content": "你在为 MaiWork 整理一个 QQ 群的画像。只输出 JSON，不要其他话。"},
             {"role": "user", "content": (
@@ -768,7 +773,9 @@ class Profiles:
                 + "\n".join(lines) + "\n\n"
                 "请整理：合并意思重复/重叠的条目（保留的用 update 改成合并后的一句话，"
                 "多余的用 remove 删掉）；删掉已经过时、不再代表群现状的条目（标了「过时」的优先）。\n"
-                "规则：只允许 update 和 remove，不许加新条目；锁定条目不能动；每条一句话不超过 40 字。\n"
+                "规则：只允许 update 和 remove，不许加新条目；锁定条目不能动；每条一句话不超过 40 字；\n"
+                "条目里的 {@QQ号} 是换成名字的记号，原样保留，不要联想成别人"
+                + (f"；对照：{legend}" if legend else "") + "。\n"
                 '输出格式：{"ops":[{"op":"update|remove","id":条目id,"text":"update 时必填"}]}'
                 "（不需要整理就给空 ops）"
             )},
@@ -922,9 +929,11 @@ class Profiles:
         "4. 锁定的条目不能改、不能删。\n"
         "5. 管理员删除过的条目（墓碑）不许再加回来（换个说法也不行）。\n"
         "6. evidence 填支持这条判断的消息序号（方括号里那个数）。\n"
-        "7. 关注成员只写关注成员的注记（他们是群里的关键人物，给管理员一个人看的），"
+        "7. 条目或注记里提到某个群友时，写 {@QQ号} 不要写名字（QQ 号看消息行说话人后面的括号），"
+        "比如「{@123456} 的机器发烫」。\n"
+        "8. 关注成员只写关注成员的注记（他们是群里的关键人物，给管理员一个人看的），"
         "一句话不超过 120 字；没有新观察就空列表。\n"
-        "8. 请求：这批消息里**明确对 MaiBot / 机器人说的请求**（@ 了它、点名它、或明确说"
+        "9. 请求：这批消息里**明确对 MaiBot / 机器人说的请求**（@ 了它、点名它、或明确说"
         "「帮我整理 / 帮我准备 / 提醒我」这类），记一条；"
         "消息序号后面标了「这条 @ 了 MaiBot，Jev 没判出来，请你判断」的，请重点判断那条。"
         "kind 三选一：prepare=请它准备 / 整理 / 调研 / 做一个东西；goal=请它帮忙盯着某件事"
@@ -947,7 +956,11 @@ class Profiles:
     )
 
     def _build_prompt(self, gid: str, batch_msgs: list) -> list:
-        """拼 system + user：当前条目 / 墓碑 / 关注成员（仅 personal_profile 开时）/ 消息。"""
+        """拼 system + user：当前条目 / 墓碑 / 关注成员（仅 personal_profile 开时）/ 消息。
+
+        条目和注记给模型看的都是入库原文（{@QQ号} token 保留），末尾带一行
+        「条目里提到的人」对照表；消息行的说话人写「名字（QQ 号）」给模型对照着写 token。
+        """
         settings = self._get_settings()
         conn = self._store.read()
         current = conn.execute(
@@ -972,24 +985,31 @@ class Profiles:
             "管理员删除过的条目（墓碑，不许再加回来，换说法也不行）：\n"
             + ("\n".join(f"- {r['text']}" for r in tombs) if tombs else "（无）")
         )
+        focus_members = []
         if settings.focus.personal_profile:
-            members = conn.execute(
+            focus_members = conn.execute(
                 "SELECT user_id, name, note FROM focus_members"
                 " WHERE group_id=? AND removed=0",
                 (gid,),
             ).fetchall()
             parts.append(
-                "关注成员（只给他们写 people 注记；名单以外的人不要写）：\n"
+                "关注成员（只给他们写 people 注记；名单以外的人不要写；名字可能与消息里的不一致，以名册为准）：\n"
                 + (
                     "\n".join(
-                        f"- user_id={r['user_id']} 名字={r['name'] or '?'}"
-                        + (f" 现有注记：{r['note']}" if str(r["note"] or "") else "")
-                        for r in members
+                        f"- user_id={r['user_id']} 名字={members.name_of(conn, gid, r['user_id'], r['name']) or '（不认识，可能已退群）'}"
+                        + (f" 现有注记：{members.render(conn, gid, r['note'])}" if str(r["note"] or "") else "")
+                        for r in focus_members
                     )
-                    if members
+                    if focus_members
                     else "（无）"
                 )
             )
+        # 条目 / 注记里提到的人：末尾带一行对照表（{@id}=当前名字），裸 token 不解释模型看不懂
+        legend = members.legend(
+            conn, gid, [str(r["text"]) for r in current] + [str(r["note"]) for r in focus_members]
+        )
+        if legend:
+            parts.append(f"条目里提到的人：{legend}")
         # pending_asks 里还没判的消息（@ 了 MaiBot 但 Jev 没判出来的）在消息行尾标出来
         pending_ask_ids: set[str] = set()
         try:
@@ -1005,7 +1025,8 @@ class Profiles:
         lines = []
         for i, m in enumerate(batch_msgs, 1):
             hhmm = clock.bj(float(m.ts)).strftime("%H:%M")
-            name = "MaiBot" if m.is_bot else str(m.user_name)
+            # 非机器人说话人写「名字（QQ 号）」：提到人要写 {@QQ号}，从这里对
+            name = "MaiBot" if m.is_bot else f"{m.user_name}(QQ {getattr(m, 'user_id', '')})"
             text = str(m.text)[: self._MSG_TEXT_MAX]
             flag = ""
             if str(m.id) in pending_ask_ids:
@@ -1418,6 +1439,17 @@ class Profiles:
                     " count=count+1, name=excluded.name",
                     (gid, str(m.user_id), day, str(m.user_name)),
                 )
+                # 成员名册：记「这个人此刻叫这个名字」（按消息时间新的盖旧的，见 members.py）；
+                # 关注成员的名字也顺手跟上当前名片（名册为准；顺手补上名字是空的旧行，
+                # 比如管理员在网页手动加关注后这人第一次说话）——名字不落 id、不落空
+                members.record(conn, gid, m.user_id, m.user_name, m.ts)
+                _roster_name = members.name_of(conn, gid, m.user_id)
+                if _roster_name:
+                    conn.execute(
+                        "UPDATE focus_members SET name=? WHERE group_id=? AND user_id=?"
+                        " AND COALESCE(name, '')<>?",
+                        (_roster_name, gid, str(m.user_id), _roster_name),
+                    )
                 is_reply_to_bot = bool(m.reply_to) and str(m.reply_to) in known_bot_ids
                 if m.is_at or is_reply_to_bot:
                     conn.execute(
@@ -1531,15 +1563,32 @@ class Profiles:
     # ------------------------------------------------------------------
 
     def entries(self, group_id: str) -> list[dict]:
-        """未删除（deleted=0）的条目，按 category、last_ts 倒序。"""
+        """未删除（deleted=0）的条目，按 category、last_ts 倒序。
+
+        每条两项文字：
+        - ``text``：渲染过的（``{@QQ号}`` → 名册里的当前名字，某群友兜底），给人看用它；
+        - ``raw_text``：入库原文（保留 {@QQ号} token），给模型 / 判重内部用。
+
+        调它的全是「给人 / 给别的模块看」的出口（网页、PROFILE 文件、资讯构想工具、主模型
+        派活提示词）；profile 内部看库的地方（_build_prompt / _maybe_weekly / 判重）照旧
+        以 text 列为原文，不走这里。
+        """
+        gid = str(group_id)
         rows = self._store.read().execute(
             "SELECT id, group_id, category, text, evidence_count, evidence,"
             " first_ts, last_ts, confidence, locked, deleted, source, updated"
             " FROM profile_entries WHERE group_id=? AND deleted=0"
             " ORDER BY category ASC, last_ts DESC, id DESC",
-            (str(group_id),),
+            (gid,),
         ).fetchall()
-        return [dict(r) for r in rows]
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            raw = str(d.get("text") or "")
+            d["raw_text"] = raw
+            d["text"] = members.render(self._store, gid, raw)
+            out.append(d)
+        return out
 
     def add_entry(self, group_id: str, category: str, text: str) -> int:
         """管理员新增条目：source=admin、locked=1；类别必须是五类之一。"""

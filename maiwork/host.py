@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import time
 import logging
 import re
@@ -401,14 +402,44 @@ class Host:
         text: str,
         *,
         reply_to: str = "",
+        at_user: str = "",
     ) -> SendResult:
-        """send.hybrid，可选 reply 段 + text 段。"""
+        """send.hybrid，可选 reply 段 + at 段 + text 段。
+
+        at 段形状照宿主 message_utils._component_from_dict（线上源码 2026-09-29 读过）：
+        {"type": "at", "data": {"target_user_id": ...}}；群里实际显示成 @某人 待实测。
+        """
         segments: list[dict[str, Any]] = []
         if reply_to:
             segments.append(
                 {"type": "reply", "data": {"target_message_id": str(reply_to)}}
             )
-        segments.append({"type": "text", "content": str(text)})
+        body = str(text)
+        if at_user:
+            segments.append({"type": "at", "data": {"target_user_id": str(at_user)}})
+            body = " " + body
+        segments.append({"type": "text", "content": body})
+        return await self._send_segments(session_id, segments, str(text))
+
+    async def send_image(self, session_id: str, png: bytes, *, text: str = "") -> SendResult:
+        """一张图（+ 可选一段文字）作为同一条消息发出：send.hybrid 的 image 段带 base64。
+
+        image 段形状照宿主 capabilities/core.py _normalize_plugin_segment：content = base64
+        → binary_data_base64（线上源码读过）；QQ 里图文同一条的实际效果待实测。
+        """
+        if not png:
+            raise HostError("send_image 没有图片数据")
+        segments: list[dict[str, Any]] = [
+            {"type": "image", "content": base64.b64encode(bytes(png)).decode("ascii")}
+        ]
+        if text:
+            segments.append({"type": "text", "content": str(text)})
+        plain = "[图片]" + (" " + str(text) if text else "")
+        return await self._send_segments(session_id, segments, plain)
+
+    async def _send_segments(
+        self, session_id: str, segments: list[dict[str, Any]], plain: str
+    ) -> SendResult:
         result = await self._call(
             "send.hybrid",
             segments=segments,
@@ -416,7 +447,7 @@ class Host:
             return_details=True,
             sync_to_maisaka_history=True,
             storage_message=True,
-            processed_plain_text=str(text),
+            processed_plain_text=plain,
         )
         if not isinstance(result, dict):
             raise HostError("send.hybrid 返回格式异常")

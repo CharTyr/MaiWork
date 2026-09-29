@@ -42,7 +42,7 @@ def _norm_accounts(values: object, field_zh: str, problems: list[str]) -> tuple[
     return tuple(out)
 
 
-CONFIG_VERSION = "0.4.1"  # 0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
+CONFIG_VERSION = "0.4.2"  # 0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
 
 # 插件目录 = 本文件所在目录；默认数据目录 = 插件目录上两级 / data / maiwork
 # （线上 <MaiBot>/plugins/CharTyr_MaiWork → <MaiBot>/data/maiwork）
@@ -167,6 +167,7 @@ class ModelsSectionConfig(PluginConfigBase):
     max_concurrency: int = Field(default=2, description="同一个端点同时最多几个请求在路上（1~8）；被限流（429）多就调成 1")
     max_rpm: int = Field(default=0, description="同一个端点每分钟最多发几次（0 = 不限，最多 600）")
     context_window: int = Field(default=128000, description="模型的上下文窗口（tokens）；对话快满时先截旧工具结果、再总结旧对话")
+    max_tokens: int = Field(default=32768, description="一次回答最多写多少 token（1024~1000000）；每次调用都会带上，有些端点不传会出问题")
 
 
 class JevSectionConfig(PluginConfigBase):
@@ -412,6 +413,7 @@ class ModelsSetting:
     max_concurrency: int = 2
     max_rpm: int = 0
     context_window: int = 128000  # 模型上下文窗口（tokens），0.4.0 起用于上下文压缩
+    max_tokens: int = 32768  # 一次回答最多写多少 token，0.4.2 起每次模型调用都带上
 
 
 @dataclass(frozen=True)
@@ -1040,6 +1042,7 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
             max_concurrency=_clamp_int(getattr(models, "max_concurrency", 2), 1, 8, 2),
             max_rpm=_clamp_int(getattr(models, "max_rpm", 0), 0, 600, 0),
             context_window=_clamp_int(getattr(models, "context_window", 128000), 8192, 2_000_000, 128000),
+            max_tokens=_clamp_int(getattr(models, "max_tokens", 32768), 1024, 1_000_000, 32768),
         ),
         jev=_parse_jev(jev, problems),
         usage=UsageSetting(

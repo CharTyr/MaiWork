@@ -67,7 +67,7 @@ import re as _re
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
-from . import clock
+from . import clock, members
 from .config import Settings, normalize_domain as _normalize_domain
 from .models import ModelError
 from .search import SearchUnavailable
@@ -2261,21 +2261,34 @@ class Feeds:
                     entry = {
                         "ts": float(hit["ts"]),
                         "who": str(hit["who"]),
+                        # 认人靠平台 id：原话是 chat_log 里查出来的，带 user_id
+                        "user_id": str(hit.get("user_id") or ""),
                         "text": str(hit["text"])[:_REF_TEXT_MAX],
                         "message_id": str(hit["message_id"]),
                     }
                     if entry["message_id"] not in {r["message_id"] for r in refs_out}:
                         refs_out.append(entry)
-        # audience：只留确实出现在引用原话里的名字
-        speakers = {str(h["who"]) for h in quotes}
-        ref_speakers = {r["who"] for r in refs_out}
-        audience: list[str] = []
+        # audience：模型写的是名字；只留确实出现在引用原话里的，按说话人的 user_id 去重，
+        # 落库存 [{"user_id","name"}]——显示时再按 id 查当前名，改名了也不会叫错。
+        speaker_ids: dict[str, str] = {}
+        for r in refs_out:
+            name = str(r["who"])
+            if name and name not in speaker_ids:
+                speaker_ids[name] = str(r.get("user_id") or "")
+        audience: list[dict] = []
+        seen_keys: set[str] = set()
         raw_aud = raw.get("audience")
         if isinstance(raw_aud, list):
             for name in raw_aud:
                 n = str(name or "").strip()
-                if n and n in ref_speakers and n not in audience:
-                    audience.append(n)
+                if not n or n not in speaker_ids:
+                    continue
+                uid = speaker_ids[n]
+                key = uid or n        # 老数据没 user_id：退回按名字去重
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                audience.append({"user_id": uid, "name": n})
                 if len(audience) >= _AUDIENCE_MAX:
                     break
         # keywords
@@ -2292,7 +2305,7 @@ class Feeds:
         if self._scrub_item_text(gid, body) is None or self._scrub_item_text(gid, reason) is None:
             logger.info("帖子含关注成员片段，回落原文（群 %s 条 %r）", gid, item.get("title", "")[:30])
             return self._fallback_post_dict(item)
-        audience = [n for n in audience if self._scrub_item_text(gid, n) is not None]
+        audience = [a for a in audience if self._scrub_item_text(gid, a["name"]) is not None]
         return {
             "body": body,
             "reason": reason[:_REASON_MAX],
@@ -2892,6 +2905,51 @@ class Feeds:
             out.append(entry)
         return out
 
+    def _current_names(
+        self, gid: str, refs_out: list[dict], aud_items: list[Any]
+    ) -> tuple[list[dict], list[str]]:
+        """refs / audience 里的名字换成名册当前名（按 user_id 一次查完）。
+
+        - refs：输出 {ts, who, text, message_id}——who 是当前名（查不到回落快照），
+          不带 user_id（QQ 号不进群友看得见的输出）；
+        - audience：新行 {"user_id","name"} → 当前名（回落 name；都空则丢掉）；
+          老行字符串 → 原样输出。前端要的是字符串列表，形状不变。
+        """
+        uids: list[str] = []
+        for x in refs_out:
+            uid = str(x.get("user_id") or "").strip()
+            if uid:
+                uids.append(uid)
+        for a in aud_items:
+            if isinstance(a, dict):
+                uid = str(a.get("user_id") or "").strip()
+                if uid:
+                    uids.append(uid)
+        names = members.names_of(self._store, gid, uids) if (gid and uids) else {}
+        refs: list[dict] = []
+        for x in refs_out:
+            uid = str(x.get("user_id") or "").strip()
+            refs.append(
+                {
+                    "ts": float(x.get("ts") or 0.0),
+                    "who": names.get(uid) or str(x.get("who") or ""),
+                    "text": str(x.get("text") or "")[:_REF_TEXT_MAX],
+                    "message_id": str(x.get("message_id") or ""),
+                }
+            )
+        audience: list[str] = []
+        for a in aud_items:
+            if isinstance(a, dict):
+                uid = str(a.get("user_id") or "").strip()
+                name = names.get(uid) or str(a.get("name") or "").strip()
+                if name and name not in audience:
+                    audience.append(name)
+            else:
+                s = str(a or "").strip()
+                if s and s not in audience:
+                    audience.append(s)
+        return refs, audience
+
     def _rejected_row_to_view(self, r: Any) -> dict:
         url, site = "", ""
         try:
@@ -2943,19 +3001,22 @@ class Feeds:
                         {
                             "ts": float(x.get("ts") or 0.0),
                             "who": str(x.get("who") or ""),
+                            "user_id": str(x.get("user_id") or ""),
                             "text": str(x.get("text") or "")[:_REF_TEXT_MAX],
                             "message_id": str(x.get("message_id") or ""),
                         }
                     )
         except (ValueError, TypeError):
             refs_out = []
-        audience_out: list[str] = []
+        # audience：新行是 [{"user_id","name"}]，老行是字符串列表
+        aud_items: list[Any] = []
         try:
             aud_raw = json.loads(r["audience"] or "[]")
             if isinstance(aud_raw, list):
-                audience_out = [str(x) for x in aud_raw if str(x or "").strip()]
+                aud_items = list(aud_raw)
         except (ValueError, TypeError):
-            audience_out = []
+            aud_items = []
+        refs_out, audience_out = self._current_names(str(_row_get(r, "group_id", "") or ""), refs_out, aud_items)
         keywords_out: list[str] = []
         try:
             kw_raw = json.loads(r["keywords"] or "[]")

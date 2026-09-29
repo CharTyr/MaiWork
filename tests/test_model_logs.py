@@ -88,6 +88,7 @@ class TestOneRowPerAttempt:
         assert request["messages"][0]["content"] == "打个招呼"
         assert request["json_mode"] is False
         assert request["tools"] == []
+        assert request["max_tokens"] == 32768  # 这次请求实际带的输出上限（没传用设置默认）
         response = json.loads(r["response"])
         assert response["text"] == "你好"
         assert response["finish_reason"] == "stop"
@@ -162,7 +163,17 @@ class TestNoSecretsInLog:
         assert SECRET not in row["request"]
         assert "uthorization" not in row["request"]  # Authorization 这个词都不该出现
         request = json.loads(row["request"])
-        assert sorted(request.keys()) == ["json_mode", "messages", "tools"]
+        assert sorted(request.keys()) == ["json_mode", "max_tokens", "messages", "tools"]
+        await models.close()
+
+    @pytest.mark.asyncio
+    async def test_caller_max_tokens_logged(self, tmp_path) -> None:
+        """调用方传的 max_tokens 以它为准，记录里也是它。"""
+        ep = FakeEndpoint({"m1": [{"kind": "ok"}]})
+        store, models = _make_models(tmp_path, _cfg(), ep)
+        await models.chat("main", [{"role": "user", "content": "x"}], max_tokens=5000)
+        request = json.loads(_call_rows(store)[0]["request"])
+        assert request["max_tokens"] == 5000
         await models.close()
 
     @pytest.mark.asyncio

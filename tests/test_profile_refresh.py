@@ -725,8 +725,8 @@ class TestPeopleAndPrompt:
         assert "锁定示例" in prompt and "（锁定）" in prompt
         # 墓碑文字给出且声明不许加回
         assert "管理员讨厌的" in prompt and "不许再加回来" in prompt
-        # 消息格式 + 机器人叫 MaiBot + 200 字截断
-        assert "[1]" in prompt and "阿一: 短的" in prompt
+        # 消息格式 + 机器人叫 MaiBot + 200 字截断（说话人带平台 id，见成员名册接线测试）
+        assert "[1]" in prompt and "阿一(QQ u1): 短的" in prompt
         assert "MaiBot: 机器人的话" in prompt
         long_line = [ln for ln in prompt.splitlines() if "长" in ln and ": " in ln][0]
         assert len(long_line.split(": ", 1)[1]) == 200
@@ -1097,16 +1097,286 @@ class TestTruncatedAnswer:
         assert self._entries(store) == []
         assert int(_group(store)["fail_count"]) == 1
 
-    def test_refresh_asks_for_larger_output_budget(self, store, tmp_path, frozen_now) -> None:
+    def test_refresh_uses_configured_output_budget(self, store, tmp_path, frozen_now) -> None:
+        """整理画像不再单独卡 12000：输出上限含思考，卡低了会想不完回空；
+        不传 max_tokens，交给 models.chat 用设置里的「最大输出」（默认 32768）。"""
         import asyncio
         p, models = self._prep(store, tmp_path, ["没有变化"])
         asyncio.run(p.tick(GID, refresh=False))
         asyncio.run(p.refresh(GID, force=True))
         kw = models.calls[0][2]
-        assert 8000 <= kw.get("max_tokens", 0) <= 12000
+        assert kw.get("max_tokens") is None
         assert kw.get("timeout", 0) >= 120
 
 
 def test_refresh_batch_small_enough_for_gateway_limit() -> None:
     """2026-09-29 线上：网关约 129 秒断连接；300 条一批 glm 要想 100~140 秒，常被断。"""
     assert Profiles._REFRESH_BATCH <= 120
+
+
+# ----------------------------------------------------------------------
+# 成员名册接线（members.py）：tick 记名字、提示词带 QQ 号、模型输出里的 QQ 号转 {@id}、
+# entries()/PROFILE-*.md/网页给人的文字里永远渲染成当前名字，平台 id 不外漏。
+# ----------------------------------------------------------------------
+
+
+class TestMembersWiring:
+    U = "100000001"  # 一个长得像真 QQ 号的平台 id
+
+    def _member(self, store: Store, uid: str):
+        return store.read().execute(
+            "SELECT name FROM members WHERE group_id=? AND user_id=?", (GID, uid)
+        ).fetchone()
+
+    def _focus_name(self, store: Store, uid: str):
+        row = store.read().execute(
+            "SELECT name FROM focus_members WHERE group_id=? AND user_id=?", (GID, uid)
+        ).fetchone()
+        return row["name"] if row is not None else None
+
+    def _tick_readonly(self, p: Profiles, host: FakeHost) -> None:
+        """本轮 tick 只读消息和统计；提炼由 p.refresh 后台做（和 app 的用法一致）。"""
+        assert asyncio.run(p.tick(GID, refresh=False)).skipped_reason == ""
+        asyncio.run(p.refresh(GID, force=True))
+
+    @pytest.mark.asyncio
+    async def test_tick_records_names_and_keeps_focus_members_name_in_sync(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        """同一个 id 改名片：tick 后名册和 focus_members.name 都跟着当前名字走。
+        顺手修「管理员在网页加关注时名字是空」：消息一来就按当前名片补上。"""
+        settings = _settings(tmp_path)
+        host = FakeHost()
+        p = _make(store, host, FakeModelsQueue(replies=["没有变化"]), settings)
+        # 管理员在网页手动加关注：只有 user_id，名字空着
+        p.set_focus(GID, self.U, "add")
+        assert self._focus_name(store, self.U) == ""
+        host.msgs.append(_msg("a1", T0 - 200, user=self.U, name="旧名片", text="来了"))
+        await p.tick(GID, refresh=False)
+        assert members.name_of(store, GID, self.U) == "旧名片"  # 名册记下了
+        assert self._focus_name(store, self.U) == "旧名片"  # 空名字补上了
+        # 改名：新名片的发言 ts 更新；同轮里夹一条 ts 更老、还是旧名片的发言（补读到的），
+        # 名册按 ts 新的盖旧的，旧名字不许盖新名字
+        host.msgs.extend([
+            _msg("a2", T0 - 100, user=self.U, name="新名片", text="改名了"),
+            _msg("a3", T0 - 150, user=self.U, name="旧名片", text="补读到的旧消息"),
+        ])
+        await p.tick(GID, refresh=False)
+        assert members.name_of(store, GID, self.U) == "新名片"
+        assert self._focus_name(store, self.U) == "新名片"
+
+    @pytest.mark.asyncio
+    async def test_prompt_speaker_lines_carry_qq_and_weekly_rule_mentions_tokens(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        """消息行说话人写成「名字(QQ 12345)」；机器人仍是 MaiBot；规则里点了「写 {@QQ号}」。"""
+        settings = _settings(tmp_path)
+        host = FakeHost([
+            _msg("m0", T0 - 100, user=self.U, name="iBad Bro", text="短的"),
+            _msg("m1", T0 - 90, user="botqq", bot=True, text="机器人的话"),
+            _msg("m2", T0 - 80, user="u2", name="路人", text="嗯"),
+        ])
+        models = FakeModelsQueue(replies=["没有变化"])
+        p = _make(store, host, models, settings)
+        await p.tick(GID)
+        prompt = models.calls[0][1][1]["content"]
+        hhmm = clock.bj(T0 - 100).strftime("%H:%M")
+        assert f"[1] {hhmm} iBad Bro(QQ {self.U}): 短的" in prompt
+        assert "MaiBot: 机器人的话" in prompt
+        assert "路人(QQ u2): 嗯" in prompt
+        assert "{@" in prompt  # 规则里写了「提到群友写 {@QQ号}」
+        assert "关注成员 | QQ号" in prompt
+        # 关注成员名单用名册里的当前名字（focus_members.name 是老快照）
+        with store.tx() as conn:
+            conn.execute(
+                "INSERT INTO focus_members (group_id, user_id, name, pinned, removed)"
+                " VALUES (?, ?, '老快照名', 1, 0)",
+                (GID, self.U),
+            )
+        # 再来一批（攒够 batch=3 才触发提炼），提示词里的关注成员用名册当前名
+        host.msgs.extend(_msg(f"m{n}", T0 - 40 + n, user="u3", name="新人", text=f"第{n}条") for n in (3, 4, 5))
+        models.reply_queue.append("没有变化")
+        await p.tick(GID)
+        prompt2 = models.calls[-1][1][1]["content"]
+        assert f"user_id={self.U} 名字=iBad Bro" in prompt2
+        assert "老快照名" not in prompt2
+
+    @pytest.mark.asyncio
+    async def test_bare_qq_in_model_output_stored_as_token_and_entries_render_current_name(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        """模型偷懒写了「iBad Bro (100000001)」：入库前 tokenize；
+        entries() 的 text 渲染成当前名字（raw_text 保留 {@id} 原文）。"""
+        # 先把人聊进名册
+        settings = _settings(tmp_path)
+        host = FakeHost([_msg("s1", T0 - 300, user=self.U, name="iBad Bro", text="冒泡")])
+        p = _make(store, host, FakeModelsQueue(replies=["没有变化"]), settings)
+        await p.tick(GID, refresh=False)
+        # 第二批消息进来时模型写「iBad Bro (100000001)」
+        host.msgs.extend([
+            _msg("b1", T0 - 200, user="u2", name="路人", text="你那边呢"),
+            _msg("b2", T0 - 190, user=self.U, name="iBad Bro", text="底座发烫"),
+            _msg("b3", T0 - 180, user="u2", name="路人", text="嗯"),
+        ])
+        p._models = FakeModelsQueue(
+            replies=[f"新增 | 最近在聊 | iBad Bro ({self.U}) 的底座发烫 | 2"]
+        )
+        await p.tick(GID)
+        raws = [e["raw_text"] for e in p.entries(GID)]
+        assert raws == ['{@' + self.U + '} 的底座发烫'], raws
+        texts = [e["text"] for e in p.entries(GID)]
+        assert texts == ["iBad Bro 的底座发烫"], texts
+        for t in texts:
+            assert "{@" not in t and self.U not in t
+        # 改名后 entries() 跟着换名字，raw_text 还是 token
+        host.msgs.append(_msg("c1", T0 - 10, user=self.U, name="胡萝卜花之王", text="新名片"))
+        p._models = FakeModelsQueue(replies=["没有变化"])
+        await p.tick(GID)
+        assert [e["text"] for e in p.entries(GID)] == ["胡萝卜花之王 的底座发烫"]
+        assert [e["raw_text"] for e in p.entries(GID)] == ['{@' + self.U + '} 的底座发烫']
+
+    @pytest.mark.asyncio
+    async def test_edit_and_people_note_also_tokenized(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)
+        host = FakeHost([_msg("s1", T0 - 300, user=self.U, name="iBad Bro", text="冒泡")])
+        p = _make(store, host, FakeModelsQueue(replies=["没有变化"]), settings)
+        await p.tick(GID, refresh=False)
+        eid = p.add_entry(GID, "recent", "旧条目")
+        with store.tx() as conn:
+            conn.execute("UPDATE profile_entries SET locked=0 WHERE id=?", (eid,))
+            conn.execute(
+                "INSERT INTO focus_members (group_id, user_id, name, pinned, removed)"
+                " VALUES (?, 'unote', '阿诺', 1, 0)", (GID,)
+            )
+        p._models = FakeModelsQueue(replies=[
+            f"修改 | #{eid} | 改成提一嘴 {self.U} 的掌机\n"
+            f"关注成员 | unote | 和 iBad Bro ({self.U}) 一起折腾硬件"
+        ])
+        host.msgs.extend([_msg(f"b{i}", T0 - 100 + i, text=f"x{i}") for i in range(3)])
+        await p.tick(GID)
+        row = store.read().execute(
+            "SELECT text FROM profile_entries WHERE id=?", (eid,)
+        ).fetchone()
+        assert row["text"] == '改成提一嘴 {@' + self.U + '} 的掌机'
+        note = store.read().execute(
+            "SELECT note FROM focus_members WHERE group_id=? AND user_id='unote'", (GID,)
+        ).fetchone()["note"]
+        assert note == '和 {@' + self.U + '} 一起折腾硬件'
+        # 网页视图里注记渲染成当前名字
+        from CharTyr_MaiWork.maiwork.console import views
+
+        class _SVC:
+            pass
+
+        svc = _SVC()
+        svc.store = store
+        svc.get_settings = lambda: settings
+        svc.profiles = p
+        group = views.group_view(svc, GID, admin=True)
+        focus = {f["user_id"]: f for f in group["focus"]}
+        assert focus["unote"]["note"] == "和 iBad Bro 一起折腾硬件"
+        entries_text = [e["text"] for sec in group["profile"] for e in sec["entries"]]
+        assert '改成提一嘴 iBad Bro 的掌机' in entries_text
+        # 注记里不出现 token / 裸 QQ 号（user_id 字段是身份不是名字，可以有）
+        notes = " ".join(str(f.get("note") or "") for f in group["focus"])
+        assert "100000001" not in notes and "{@" not in notes
+
+    @pytest.mark.asyncio
+    async def test_prompt_shows_raw_tokens_plus_legend(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        """给模型看的条目和注记保留 {@id} 原文，末尾带一行对照表「条目里提到的人」。"""
+        settings = _settings(tmp_path)
+        host = FakeHost([_msg("s1", T0 - 300, user=self.U, name="iBad Bro", text="冒泡")])
+        p = _make(store, host, FakeModelsQueue(replies=["没有变化"]), settings)
+        await p.tick(GID, refresh=False)
+        with store.tx() as conn:
+            conn.execute(
+                "INSERT INTO profile_entries (group_id, category, text, evidence_count,"
+                " first_ts, last_ts, locked, deleted, source, updated)"
+                " VALUES (?, 'recent', ?, 0, 1, 1, 0, 0, 'model', 1)",
+                (GID, '{@' + self.U + '} 的底座又发烫了'),
+            )
+            conn.execute(
+                "INSERT INTO focus_members (group_id, user_id, name, note, pinned, removed)"
+                f" VALUES (?, 'ufan', '阿帆', '关注 {{@{self.U}}} 的进展', 1, 0)", (GID,)
+            )
+        host.msgs.extend([_msg(f"b{i}", T0 - 100 + i, text=f"x{i}") for i in range(3)])
+        p._models = FakeModelsQueue(replies=["没有变化"])
+        await p.tick(GID)
+        prompt = p._models.calls[-1][1][1]["content"]
+        assert '{@' + self.U + '} 的底座又发烫了' in prompt  # 提示词里是 token 原文
+        assert "条目里提到的人：" in prompt
+        assert ('{@' + self.U + '}=iBad Bro') in prompt
+        # 裸 QQ 号只允许出现在「名字(QQ 号)」/「对照表」/「关注成员 user_id=」这些受控位置
+        scrubbed = (prompt.replace(f"(QQ {self.U})", "")
+                          .replace(f"user_id={self.U}", "")
+                          .replace('{@' + self.U + '}', ""))
+        # 对照表那一行整行去掉
+        scrubbed = "\n".join(ln for ln in scrubbed.splitlines() if not ln.startswith("条目里提到的人："))
+        assert self.U not in scrubbed
+
+    @pytest.mark.asyncio
+    async def test_profile_md_has_no_tokens_no_raw_ids(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        """PROFILE-<群号>.md 是给人和子 agent 看的：{@…} 一律渲染成当前名字，QQ 号不外漏。"""
+        settings = _settings(tmp_path)
+        ws_dir = tmp_path / "wsroot" / "tinker"
+        ws_dir.mkdir(parents=True)
+        host = FakeHost([_msg("s1", T0 - 300, user=self.U, name="iBad Bro", text="冒泡")])
+        p = _make(store, host, FakeModelsQueue(replies=["没有变化"]), settings)
+        await p.tick(GID, refresh=False)
+        with store.tx() as conn:
+            conn.execute(
+                "INSERT INTO profile_entries (group_id, category, text, evidence_count,"
+                " first_ts, last_ts, locked, deleted, source, updated)"
+                " VALUES (?, 'recent', ?, 0, 1, 1, 0, 0, 'model', 1)",
+                (GID, '{@' + self.U + '} 的底座又发烫了'),
+            )
+        p._write_profile_md(GID)
+        md = (ws_dir / f"PROFILE-{GID}.md").read_text(encoding="utf-8")
+        assert "iBad Bro 的底座又发烫了" in md
+        assert "{@" not in md
+        assert self.U not in md
+
+    @pytest.mark.asyncio
+    async def test_persona_uses_current_roster_name_and_prompt_keeps_uid(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        """persona 提示词的人名取名册当前名（focus_members.name 是旧快照）；
+        提示词仍可带（QQ号 …）给模型，search 文本用当前名。"""
+        from CharTyr_MaiWork.maiwork.persona import Personas
+        from CharTyr_MaiWork.maiwork import members as _m2
+
+        settings = _settings(tmp_path)
+        host = FakeHost([_msg("s1", T0 - 300, user=self.U, name="新名片", text="冒泡")])
+        p = _make(store, host, FakeModelsQueue(replies=["没有变化"]), settings)
+        await p.tick(GID, refresh=False)
+        with store.tx() as conn:  # focus 行还是旧名字
+            conn.execute(
+                "INSERT INTO focus_members (group_id, user_id, name, pinned, removed)"
+                " VALUES (?, ?, '老名片', 1, 0)", (GID, self.U)
+            )
+        assert _m2.name_of(store, GID, self.U) == "新名片"
+        personas = Personas(store, host, FakeModelsQueue(replies=['{"summary":"s"}']), lambda: settings)
+        # 素材够 5 条发言
+        with store.tx() as conn:
+            for i in range(5):
+                conn.execute(
+                    "INSERT OR IGNORE INTO focus_messages (group_id, user_id, ts, message_id, text)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (GID, self.U, T0 - 200 + i, f"fm{i}", "近况"),
+                )
+        ok = await personas.refresh(GID, self.U)
+        assert ok is True
+        prompt = personas._models.calls[0][1][1]["content"]
+        assert "要整理的人：新名片" in prompt
+        assert f"QQ号 {self.U}" in prompt  # 给模型核对身份用，不给人看
+        assert "老名片" not in prompt
+
+
+import asyncio  # noqa: E402  —— 追加段落用（在文件末尾）
+from CharTyr_MaiWork.maiwork import members  # noqa: E402

@@ -557,6 +557,54 @@ class TestSendText:
         with pytest.raises(HostError, match="send.hybrid"):
             await h.send_text("sid-1", "hello")
 
+    @pytest.mark.asyncio
+    async def test_at_segment_goes_first(self) -> None:
+        """构想提一嘴 @ 本人：at 段在文字前（宿主 message_utils 认 data.target_user_id）。"""
+        ctx = FakeCtx({"send.hybrid": {"sent": True, "message_id": "9"}})
+        h = Host(ctx)
+        await h.send_text("sid-1", "你可能会喜欢", at_user="12345")
+        _, kw = ctx.calls[0]
+        assert kw["segments"][0] == {"type": "at", "data": {"target_user_id": "12345"}}
+        assert kw["segments"][1] == {"type": "text", "content": " 你可能会喜欢"}
+
+
+class TestSendImage:
+    @pytest.mark.asyncio
+    async def test_image_then_text_via_hybrid(self) -> None:
+        import base64
+
+        ctx = FakeCtx({"send.hybrid": {"sent": True, "message_id": "55"}})
+        h = Host(ctx)
+        res = await h.send_image("sid-1", b"\x89PNGdata", text="看全部：https://x/#/t/news")
+        assert res.message_id == "55"
+        name, kw = ctx.calls[0]
+        assert name == "send.hybrid"
+        assert kw["segments"][0] == {"type": "image", "content": base64.b64encode(b"\x89PNGdata").decode()}
+        assert kw["segments"][1] == {"type": "text", "content": "看全部：https://x/#/t/news"}
+        assert kw["storage_message"] is True
+        assert "看全部" in kw["processed_plain_text"]
+
+    @pytest.mark.asyncio
+    async def test_image_only_when_no_text(self) -> None:
+        ctx = FakeCtx({"send.hybrid": {"sent": True, "message_id": "56"}})
+        h = Host(ctx)
+        await h.send_image("sid-1", b"img")
+        _, kw = ctx.calls[0]
+        assert [s["type"] for s in kw["segments"]] == ["image"]
+
+    @pytest.mark.asyncio
+    async def test_failure_raises(self) -> None:
+        ctx = FakeCtx({"send.hybrid": {"sent": False}})
+        h = Host(ctx)
+        with pytest.raises(HostError):
+            await h.send_image("sid-1", b"img")
+
+    @pytest.mark.asyncio
+    async def test_empty_image_rejected(self) -> None:
+        h = Host(FakeCtx({}))
+        with pytest.raises(HostError):
+            await h.send_image("sid-1", b"")
+
 
 # ----------------------------------------------------------------------
 # upload_group_file()

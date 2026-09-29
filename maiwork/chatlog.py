@@ -13,10 +13,10 @@ user_id / user_name，由 store._m_humane 建好）。只读本群的。
 - prune_old(store, group_id, *, now, keep_days=14)：清 14 天前的；每天（北京时间）最多清一次
   （kv 记上次清的日子），tick 每次都调也便宜。
 - search_chat(store, group_id, query, *, days=14, limit=8, now=None)：
-  [{ts, who, text, message_id}]，新的在前；trigram 要 ≥3 个字符，短词自动换 LIKE 兜底；
+  [{ts, who, user_id, text, message_id}]，新的在前；trigram 要 ≥3 个字符，短词自动换 LIKE 兜底；
   只查本群；空查询 / 没命中 → []。
 - recent_chat(store, group_id, *, hours=48, limit=60, now=None)：
-  本群最近 hours 小时内的发言，[{ts, who, text, message_id}]，按时间**从旧到新**
+  本群最近 hours 小时内的发言，[{ts, who, user_id, text, message_id}]，按时间**从旧到新**
   （取最新的 limit 条再正序），单条 text 截 _RESULT_TEXT_MAX；只查本群；
   库错误按「没有」处理 → []。给 _plan_focus / _collect / make_idea 看「群里真实在聊什么」用。
 """
@@ -114,7 +114,7 @@ def recent_chat(
     limit: int = 60,
     now: float | None = None,
 ) -> list[dict]:
-    """本群最近 hours 小时内的发言。返回 [{ts, who, text, message_id}]，按时间从旧到新。
+    """本群最近 hours 小时内的发言。返回 [{ts, who, user_id, text, message_id}]，按时间从旧到新。
 
     最多 limit 条：先取最新的 limit 条，再翻成从旧到新（给提示词看「最近在聊什么」用）。
     单条 text 截 _RESULT_TEXT_MAX。只查本群；任何库错误按「没有」处理（返回 []）。
@@ -126,7 +126,7 @@ def recent_chat(
     limit_i = max(1, min(_RECENT_SCAN_MAX, int(limit)))
     try:
         rows = store.read().execute(
-            "SELECT text, ts, user_name, message_id FROM chat_log"
+            "SELECT text, ts, user_name, user_id, message_id FROM chat_log"
             " WHERE group_id=? AND ts>=? ORDER BY ts DESC LIMIT ?",
             (gid, since, limit_i),
         ).fetchall()
@@ -139,6 +139,7 @@ def recent_chat(
             {
                 "ts": float(r["ts"] or 0.0),
                 "who": str(r["user_name"] or ""),
+                "user_id": str(r["user_id"] or ""),
                 "text": str(r["text"] or "")[:_RESULT_TEXT_MAX],
                 "message_id": str(r["message_id"] or ""),
             }
@@ -156,7 +157,9 @@ def search_chat(
     now: float | None = None,
     uid: str | None = None,
 ) -> list[dict]:
-    """在本群 chat_log 里查相关原话。返回 [{ts, who, text, message_id}]，新的在前。
+    """在本群 chat_log 里查相关原话。返回 [{ts, who, user_id, text, message_id}]，新的在前。
+
+    who 是当时的名字快照，认人看 user_id（显示前再用 members 查当前名）。
 
     查询词 ≥3 个字符走 FTS5（trigram）；更短的词 FTS 匹配不了，走 LIKE 兜底。
     任何库错误按「查不到」处理（返回 []），写帖子那边少了依据照样能写。
@@ -177,14 +180,14 @@ def search_chat(
         if len(q) >= _TRIGRAM_MIN:
             if uid:
                 sql = (
-                    "SELECT text, ts, user_name, message_id FROM chat_log"
+                    "SELECT text, ts, user_name, user_id, message_id FROM chat_log"
                     " WHERE chat_log MATCH ? AND group_id=? AND ts>=? AND user_id=?"
                     " ORDER BY ts DESC LIMIT ?"
                 )
                 rows = store.read().execute(sql, (_fts_escape(q), gid, since, uid, scan_i)).fetchall()
             else:
                 sql = (
-                    "SELECT text, ts, user_name, message_id FROM chat_log"
+                    "SELECT text, ts, user_name, user_id, message_id FROM chat_log"
                     " WHERE chat_log MATCH ? AND group_id=? AND ts>=?"
                     " ORDER BY ts DESC LIMIT ?"
                 )
@@ -193,14 +196,14 @@ def search_chat(
             pat = "%" + _like_escape(q) + "%"
             if uid:
                 sql = (
-                    "SELECT text, ts, user_name, message_id FROM chat_log"
+                    "SELECT text, ts, user_name, user_id, message_id FROM chat_log"
                     " WHERE group_id=? AND ts>=? AND user_id=? AND text LIKE ? ESCAPE '\\'"
                     " ORDER BY ts DESC LIMIT ?"
                 )
                 rows = store.read().execute(sql, (gid, since, uid, pat, scan_i)).fetchall()
             else:
                 sql = (
-                    "SELECT text, ts, user_name, message_id FROM chat_log"
+                    "SELECT text, ts, user_name, user_id, message_id FROM chat_log"
                     " WHERE group_id=? AND ts>=? AND text LIKE ? ESCAPE '\\'"
                     " ORDER BY ts DESC LIMIT ?"
                 )
@@ -215,6 +218,7 @@ def search_chat(
             {
                 "ts": float(r["ts"] or 0.0),
                 "who": str(r["user_name"] or ""),
+                "user_id": str(r["user_id"] or ""),
                 "text": str(r["text"] or "")[:_RESULT_TEXT_MAX],
                 "message_id": str(r["message_id"] or ""),
             }

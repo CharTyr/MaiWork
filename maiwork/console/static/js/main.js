@@ -100,6 +100,7 @@ document.addEventListener("submit", async (e) => {
         max_concurrency: Math.max(1, Math.min(8, parseInt(v("m-conc"), 10) || 2)),
         max_rpm: Math.max(0, Math.min(600, parseInt(v("m-rpm"), 10) || 0)),
         context_window: Math.max(8192, Math.min(2000000, parseInt(v("m-ctx"), 10) || 128000)),
+        max_tokens: Math.max(1024, Math.min(1000000, parseInt(v("m-max-tokens"), 10) || 32768)),
       });
       if (state.settings) state.settings.models = r;
       draft.models = null;

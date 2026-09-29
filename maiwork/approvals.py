@@ -24,7 +24,7 @@ import logging
 import sqlite3
 from typing import Any, Callable, Iterable
 
-from . import clock
+from . import clock, members
 from .goals import Goals
 from .store import Store, next_id
 from .tasks import Tasks
@@ -34,10 +34,16 @@ logger = logging.getLogger("maiwork.approvals")
 _KINDS = ("task", "goal")
 _REMIND_AFTER_S = 24 * 3600
 _EXPIRE_AFTER_S = 7 * 86400
+_WHO_PLACEHOLDER = "群友"     # 名册没有、快照也空 / 就是 QQ 号时的显示名
 
 
 def _norm(s: Any) -> str:
     return str(s or "").strip()
+
+
+def _who(store_or_conn: Any, group_id: Any, requester_id: Any, snapshot: Any) -> str:
+    """发起人当前显示名：按 requester_id 查名册；查不到用老快照；都没有就「群友」。"""
+    return members.name_of(store_or_conn, group_id, requester_id, fallback=snapshot) or _WHO_PLACEHOLDER
 
 
 def _row_get(row: Any, key: str, default: Any = "") -> Any:
@@ -290,7 +296,8 @@ class Approvals:
         kind = str(row["kind"])
         gid = str(row["group_id"])
         requester_name = str(row["requester_name"])
-        by_text = f"{requester_name} 发起 · {'自动批准' if auto else f'{by} 批准'}"
+        # 展示文字（by_text）用名册里的当前名；任务 / 目标行里仍存快照（视图再按 id 查当前名）
+        by_text = f"{_who(conn, gid, _row_get(row, 'requester_id'), requester_name)} 发起 · {'自动批准' if auto else f'{by} 批准'}"
         if row["idea_id"] is not None:
             by_text = f"{by_text} · 来自构想"
 
@@ -459,7 +466,7 @@ class Approvals:
                 "id": str(r["id"]),
                 "icon": str(r["icon"] or "magnifier"),
                 "title": str(r["title"]),
-                "who": str(r["requester_name"]),
+                "who": _who(self._store, r["group_id"], _row_get(r, "requester_id"), _row_get(r, "requester_name")),
                 "ts": float(r["created"]),
                 "quote": str(r["quote"] or ""),
                 "via": str(r["via"] or ""),
@@ -541,7 +548,7 @@ class Approvals:
                 "id": str(r["id"]),
                 "group_id": str(r["group_id"]),
                 "title": str(r["title"]),
-                "who": str(r["requester_name"]),
+                "who": _who(self._store, r["group_id"], _row_get(r, "requester_id"), _row_get(r, "requester_name")),
                 "ts": float(r["created"]),
                 "age_s": max(0, int(float(now) - float(r["created"]))),
             }

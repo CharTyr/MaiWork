@@ -511,6 +511,36 @@ class TestGroupScopedRoutes:
         assert r4.status == 403, r4.status
 
     @pytest.mark.asyncio
+    async def test_card_push_own_ok_other_403(self, env: SimpleEnv) -> None:
+        """资讯卡片 / 构想提一嘴开关：本群群管理员能看能改，别的群 403；群友 / 匿名不行。"""
+        r0 = await env.client.get(f"/api/groups/{G1}/card-push")
+        assert r0.status == 401, r0.status
+        env.set_group_password(G1, G1_PW)
+        await env.login(G1_PW)
+        r = await env.client.get(f"/api/groups/{G1}/card-push")
+        assert r.status == 200, r.status
+        body = await r.json()
+        assert body["config"]["news_card_enabled"] is False
+        assert body["sent_today"] == 0 and body["recent"] == []
+        assert "mention" in body and body["mention"]["sent_today"] == 0
+        r2 = await env.client.put(
+            f"/api/groups/{G1}/card-push", json={"news_card_enabled": True, "news_card_count": 2}
+        )
+        assert r2.status == 200, r2.status
+        assert (await r2.json())["config"]["news_card_count"] == 2
+        r3 = await env.client.put(f"/api/groups/{G1}/card-push", json={"news_card_count": 9})
+        assert r3.status == 400, r3.status
+        r4 = await env.client.put(f"/api/groups/{G2}/card-push", json={"news_card_enabled": True})
+        assert r4.status == 403, r4.status
+        r5 = await env.client.get(f"/api/groups/{G2}/card-push")
+        assert r5.status == 403, r5.status
+        r6 = await env.client.get("/api/groups/999999/card-push")
+        assert r6.status in (403, 404), r6.status
+        rv = await env.client.get(f"/api/groups/{G1}")
+        assert rv.status == 200
+        assert (await rv.json())["card_push"]["config"]["news_card_count"] == 2
+
+    @pytest.mark.asyncio
     async def test_rss_own_ok_other_403(self, env: SimpleEnv) -> None:
         env.set_group_password(G1, G1_PW)
         await env.login(G1_PW)

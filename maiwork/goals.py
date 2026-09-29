@@ -16,7 +16,7 @@ import sqlite3
 from contextlib import nullcontext
 from typing import Any, Callable, Iterable
 
-from . import clock
+from . import clock, members
 from .store import Store, next_id
 
 _AGENT_NEXT_CHECK_S = 3600
@@ -403,6 +403,12 @@ class Goals:
             out = []
         return out if isinstance(out, list) else []
 
+    def _who_name(self, g: dict) -> str:
+        """成员目标的显示名：按 who_id 查名册当前名；查不到回落 who_name 快照。"""
+        return members.name_of(
+            self._store, g.get("group_id"), g.get("who_id"), fallback=g.get("who_name")
+        )
+
     def _agent_dict(self, g: dict) -> dict:
         return {
             "id": str(g["id"]),
@@ -427,7 +433,7 @@ class Goals:
             "icon": str(g["icon"] or "alarm"),
             "title": str(g["title"]),
             "who_id": str(g["who_id"] or ""),
-            "who_name": str(g["who_name"] or ""),
+            "who_name": self._who_name(g),
             "state": str(g["state"]),
             "due_ts": g["due_ts"],
             "remind_ts": g["remind_ts"],
@@ -463,7 +469,7 @@ class Goals:
         return {
             "id": str(g["id"]),
             "icon": str(g["icon"] or "alarm"),
-            "who": str(g["who_name"] or ""),
+            "who": self._who_name(g),
             "title": str(g["title"]),
             "due_ts": g["due_ts"],
             "remind_ts": g["remind_ts"],

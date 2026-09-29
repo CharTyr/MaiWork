@@ -197,6 +197,41 @@ class TestReadTools:
         assert isinstance(r.data, list) and r.data[0]["title"] == "做个东西"
 
     @pytest.mark.asyncio
+    async def test_list_requests_uses_current_name(self, svc: _Svc) -> None:
+        """发起人显示名查名册当前名（按 requester_id），老快照只作回落。"""
+        from CharTyr_MaiWork.maiwork import members
+
+        svc.approvals.create(
+            G1, kind="task", title="做个东西", quote="要个东西", via="消息",
+            requester_id="20002", requester_name="群友甲",
+        )
+        with svc.store.tx() as conn:
+            members.record(conn, G1, "20002", "群友甲改名了", 1e10)
+        r = await svc.tools.call("list_requests", {"status": "pending"}, _ctx())
+        assert r.ok
+        assert "群友甲改名了" in r.output
+        assert "群友甲，" not in r.output and "群友甲）" not in r.output
+        assert r.data[0]["requester_id"] == "20002"   # SELECT 要带上 id
+
+    @pytest.mark.asyncio
+    async def test_read_profile_renders_member_tokens(self, svc: _Svc) -> None:
+        """画像条目文字里的 {@QQ号} 显示成当前名字；不认识的写「某群友」；平台号不外漏。"""
+        from fakes import FakeHost
+
+        from CharTyr_MaiWork.maiwork import members
+        from CharTyr_MaiWork.maiwork.profile import Profiles
+
+        svc.profiles = Profiles(svc.store, FakeHost(), svc.models, svc.get_settings)
+        svc.profiles.add_entry(G1, "ongoing", "在弄 {@20002} 的板子")
+        with svc.store.tx() as conn:
+            members.record(conn, G1, "20002", "蓝莓山竹", 1e10)
+        r = await svc.tools.call("read_profile", {"group_id": G1}, _ctx())
+        assert r.ok, r.error
+        assert "在弄 蓝莓山竹 的板子" in r.output
+        assert "{@" not in r.output and "20002" not in r.output
+        assert r.data[0]["text"] == "在弄 蓝莓山竹 的板子"
+
+    @pytest.mark.asyncio
     async def test_get_rules_and_identity(self, svc: _Svc) -> None:
         r = await svc.tools.call("get_rules", {}, _ctx())
         assert r.ok

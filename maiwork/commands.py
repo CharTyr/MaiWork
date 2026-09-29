@@ -218,25 +218,16 @@ class Commands:
     # ------------------------------------------------------------------
 
     def _web(self, gid: str) -> str:
+        from .card_push import group_link
+
         try:
             settings = self._get_settings()
         except Exception:
             settings = None
-        public_url = ""
-        if settings is not None:
-            public_url = str(getattr(getattr(settings, "console", None), "public_url", "") or "").rstrip("/")
-        if not public_url:
+        link = group_link(self._store, settings, gid) if settings is not None else ""
+        if not link:
             return "网页还没公开，找管理员要"
-        token = ""
-        try:
-            row = self._store.read().execute("SELECT token FROM groups WHERE group_id=?", (gid,)).fetchone()
-            if row is not None and row["token"]:
-                token = str(row["token"])
-        except Exception:
-            logger.exception("/mw 网页读链接码失败（群 %s）", gid)
-        if not token:
-            return "网页还没公开，找管理员要"
-        return f"本群网页：{public_url}/#/{token}/news"
+        return f"本群网页：{link}"
 
     # ------------------------------------------------------------------
     # /mw 批准 / 拒绝 [ID]：只限 bot 管理员

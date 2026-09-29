@@ -37,7 +37,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from . import clock, rules
+from . import clock, members, rules
 from .tools import Tool, ToolContext, ToolResult, Tools
 
 logger = logging.getLogger("maiwork.tools_admin")
@@ -608,6 +608,8 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             "convention": "约定和说法",
             "resource": "常用资源",
         }
+        # 画像条目里提到群友写成 {@平台id}：给人看的文字（含 data）都换成当前名字
+        entries = [dict(e, text=members.render(svc.store, gid, e.get("text", ""))) for e in entries]
         lines: list[str] = []
         cat_now = ""
         for e in entries:
@@ -787,7 +789,8 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         status = str(args.get("status") or "pending").strip() or "pending"
         gid_raw = str(args.get("group_id") or ctx.group_id or "").strip()
         sql = (
-            "SELECT id, group_id, kind, title, quote, requester_name, status, task_id, goal_id, created"
+            "SELECT id, group_id, kind, title, quote, requester_id, requester_name, status,"
+            " task_id, goal_id, created"
             " FROM requests WHERE status=?"
         )
         params: list[Any] = [status]
@@ -815,7 +818,8 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             return _ok(f"没有「{status}」状态的请求", data=[])
         lines = [
             f"- {r['id']} [{r['kind']}] {r['title']}"
-            f"（{r['requester_name'] or '不认识的群友'}，群 {r['group_id']}）"
+            f"（{members.name_of(svc.store, r['group_id'], r['requester_id'], fallback=r['requester_name']) or '不认识的群友'}"
+            f"，群 {r['group_id']}）"
             for r in data
         ]
         return _ok(f"「{status}」请求 {len(data)} 条：\n" + "\n".join(lines), data=data)
@@ -967,7 +971,10 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             return _bad(f"画像条目 #{eid} 不存在")
         if str(row["group_id"]) != gid:
             return _bad(f"画像条目 #{eid} 不属于群 {gid}，不能跨群改")
-        return dict(row)
+        entry = dict(row)
+        # 返回给人的文字里 {@平台id} 换成当前名字（调用方可能把它回显出去）；库里不动原文
+        entry["text"] = members.render(svc.store, gid, entry.get("text", ""))
+        return entry
 
     async def profile_edit(ctx: ToolContext, args: dict) -> ToolResult:
         gid, err = _served(args.get("group_id") or ctx.group_id)

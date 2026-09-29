@@ -32,7 +32,7 @@ import json
 import logging
 from typing import Any, Callable
 
-from . import clock
+from . import clock, members
 from .config import Settings
 from .feeds import clean_step, focus_items
 from .models import ModelError
@@ -752,6 +752,8 @@ class Personal:
                 entry = {
                     "ts": float(hit["ts"]),
                     "who": str(hit["who"]),
+                    # 认人靠平台 id：显示时按它查当前名（这里引用的都是他本人的原话）
+                    "user_id": str(hit.get("user_id") or ""),
                     "text": str(hit["text"])[:_REF_TEXT_MAX],
                     "message_id": str(hit["message_id"]),
                 }
@@ -987,14 +989,20 @@ class Personal:
             refs = json.loads(r["refs"] or "[]")
         except (ValueError, TypeError):
             refs = []
+        ref_items = [x for x in (refs if isinstance(refs, list) else []) if isinstance(x, dict)]
+        # refs 的 who 换成名册当前名（按 user_id）；查不到回落快照；输出不带 user_id
+        gid = str(r["group_id"] or "")
+        names = members.names_of(
+            self._store, gid, [str(x.get("user_id") or "") for x in ref_items]
+        )
         refs_out = [
             {
                 "ts": float(x.get("ts") or 0.0),
-                "who": str(x.get("who") or ""),
+                "who": names.get(str(x.get("user_id") or "")) or str(x.get("who") or ""),
                 "text": str(x.get("text") or "")[:80],
                 "message_id": str(x.get("message_id") or ""),
             }
-            for x in (refs if isinstance(refs, list) else []) if isinstance(x, dict)
+            for x in ref_items
         ]
         try:
             keywords = json.loads(r["keywords"] or "[]")

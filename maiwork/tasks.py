@@ -18,7 +18,7 @@ import sqlite3
 from contextlib import nullcontext
 from typing import Any, Callable, Iterable
 
-from . import clock
+from . import clock, members
 from .store import Store, next_id
 
 _STATUS_KINDS = (
@@ -579,6 +579,11 @@ class Tasks:
                 }
         except Exception:
             paused_reason = None
+        # 发起人只给显示名：按 requester_id 查名册当前名，查不到回落 requester_name 快照。
+        # 绝不把 requester_id（QQ 号）放进列表（群友视图也用 list_view）。
+        requester_name = members.name_of(
+            self._store, row["group_id"], row["requester_id"], fallback=row["requester_name"]
+        )
         return {
             "id": str(row["id"]),
             "icon": str(row["icon"] or "package"),
@@ -589,4 +594,5 @@ class Tasks:
             "updated_ts": float(row["updated"]),
             "undelivered": bool(row["undelivered"]),
             "paused_reason": paused_reason,
+            "requester_name": requester_name,
         }

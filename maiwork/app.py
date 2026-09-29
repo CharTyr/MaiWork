@@ -18,7 +18,7 @@ import secrets
 from pathlib import Path
 from typing import Any, Callable
 
-from . import clock
+from . import clock, members
 from .config import Settings, load_settings
 from .host import Host
 from .intake import Intake, Signals
@@ -129,6 +129,8 @@ class MaiWorkApp:
         self._ssh_check_ts = 0.0
         self._ssh_check_sig: Any = None
         self.outbox: Any = None
+        self.card_push: Any = None  # 资讯卡片（card_push.py）
+        self.idea_mention: Any = None  # 构想提一嘴（card_push.py）
         self.delivery: Any = None
         self.herenow: Any = None
         self.coordinator: Any = None
@@ -467,6 +469,23 @@ class MaiWorkApp:
         recovered = self.outbox.recover()
         if recovered:
             logger.info("发件箱恢复：%d 条「发送中」标成不确定，不自动重发", recovered)
+        # 资讯卡片 / 构想提一嘴（每群开关默认关；card_push.py）
+        try:
+            from .card_push import CardPush, IdeaMention
+
+            self.card_push = CardPush(
+                self.store, self.host, self.pushes, self.mentions, self.get_settings
+            )
+            self.idea_mention = IdeaMention(
+                self.store, self.host, self.models, self.pushes, self.mentions, self.get_settings
+            )
+            n = self.card_push.recover() + self.idea_mention.recover()
+            if n:
+                logger.info("资讯卡片 / 构想提一嘴恢复：%d 条「发送中」标成不确定，不自动重发", n)
+        except Exception:
+            logger.exception("资讯卡片 / 构想提一嘴模块没建起来，这次不发")
+            self.card_push = None
+            self.idea_mention = None
         self.delivery = Delivery(self.store, self.outbox, self.tasks)
         self.coordinator = self._make_coordinator()
         # 按群的管理员（group_admins.py）：密码哈希 / 本群管理员名单只进数据库，
@@ -710,6 +729,8 @@ class MaiWorkApp:
         self.env = None
         self.railway = None
         self.outbox = None
+        self.card_push = None
+        self.idea_mention = None
         self.delivery = None
         self.herenow = None
         self.coordinator = None
@@ -2185,6 +2206,12 @@ class MaiWorkApp:
                 raise
             except Exception:
                 logger.exception("排程巡检出错（群 %s）", gid)
+            try:
+                await self._card_push_round(gid, now)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("资讯卡片 / 构想提一嘴巡检出错（群 %s）", gid)
         # 3) M3 巡检：发件箱 / 批准提醒与过期 / 目标到期 / 排队任务派工
         try:
             await self._m3_round(now)
@@ -2337,7 +2364,10 @@ class MaiWorkApp:
                     continue
                 if not gid or self.outbox is None:
                     continue
-                who = str(goal.get("who_name") or goal.get("who") or "")
+                # @ 的人用名册当前名（按 who_id 查），查不到回落目标里的名字快照
+                who = members.name_of(
+                    self.store, gid, goal.get("who_id"), fallback=goal.get("who_name") or goal.get("who")
+                )
                 title = str(goal.get("title") or "")
                 if etype == "remind":
                     self.outbox.enqueue(
@@ -2540,6 +2570,23 @@ class MaiWorkApp:
                 if self.goal_proposer is None:
                     continue
                 self._spawn_long_job(gid, "goal", self._propose_goal_round)
+
+    async def _card_push_round(self, gid: str, now: float) -> None:
+        """一个群的资讯卡片 / 构想提一嘴：建待发行 + 投递（开关、节制都在模块里）。
+
+        卡片要下配图 + 起浏览器画图（几秒到几十秒），提一嘴要调模型写话：有到点的才丢成
+        后台长活（同群同种同时只跑一个），不卡主循环。
+        """
+        cp = self.card_push
+        if cp is not None:
+            cp.scan(gid, now)
+            if cp.has_due(gid, now):
+                self._spawn_long_job(gid, "newscard", cp.flush)
+        im = self.idea_mention
+        if im is not None:
+            im.scan(gid, now)
+            if im.has_due(gid, now) and self._models_ready():
+                self._spawn_long_job(gid, "ideamention", im.flush)
 
     async def _propose_goal_round(self, gid: str) -> None:
         """主动提目标一轮：开关 / 非服务群 / 每日上限都在 GoalProposer 里兜住。"""

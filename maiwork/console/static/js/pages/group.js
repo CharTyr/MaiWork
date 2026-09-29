@@ -93,6 +93,57 @@ function groupSpaceBlock(v) {
     }`;
 }
 
+// 往群里发：资讯卡片 / 构想提一嘴（每群开关，默认关；管理员 / 本群群管理员能改）
+const CP_STATE = { pending: "等着发", sending: "发送中", sent: "已发", failed: "没发出去", uncertain: "不确定发没发出去", dropped: "没发" };
+
+function cpLast(recent) {
+  const r = (recent || [])[0];
+  if (!r) return "还没发过";
+  const t = r.sent_ts || r.created;
+  const tail = r.status === "dropped" || r.status === "failed" ? (r.error ? `：${r.error}` : "") : "";
+  const what = r.count ? `${r.count} 条` : r.personal ? "给一位群友的" : "";
+  return `上次 ${when(t)}${what ? ` · ${what}` : ""} · ${CP_STATE[r.status] || r.status}${tail}`;
+}
+
+function cpSelect(label, key, val, opts, unit) {
+  return `<label class="cp-pick">${label} <select data-cp="${key}">${opts.map((n) => `<option value="${n}" ${n === val ? "selected" : ""}>${n} ${unit}</option>`).join("")}</select></label>`;
+}
+
+function pushBlock(v) {
+  const cp = v && v.card_push;
+  if (!cp) return "";
+  const c = cp.config || {};
+  const m = cp.mention || {};
+  const card = c.news_card_enabled;
+  const idea = c.idea_mention_enabled;
+  const daily = [1, 2, 3, 4, 5, 6, 8, 12, 24];
+  return `
+    <h2 class="h-sub">往群里发 <small>默认都关 · 睡觉时段不发</small></h2>
+    <div class="cp">
+      <div class="set-row cp-row">
+        ${ico("newspaper")}
+        <div>
+          <div class="set-name">资讯卡片</div>
+          <div class="set-text">每批资讯出来后，挑最值得看的做成一张图发到群里${cp.has_link ? "，附本群网页链接" : ""}。</div>
+          ${card ? `<div class="cp-opts">${cpSelect("每张放", "news_card_count", c.news_card_count, [1, 2, 3], "条")}${cpSelect("每天最多", "news_card_daily_max", c.news_card_daily_max, daily, "张")}</div>` : ""}
+          ${card || (cp.recent || []).length ? `<div class="cp-st">今天发了 ${cp.sent_today || 0} 张 · ${esc(cpLast(cp.recent))}</div>` : ""}
+        </div>
+        <label class="switch" title="${card ? "关掉" : "打开"}资讯卡片"><input type="checkbox" data-cp="news_card_enabled" ${card ? "checked" : ""} aria-label="资讯卡片" /><span></span></label>
+      </div>
+      <div class="set-row cp-row">
+        ${ico("bulb")}
+        <div>
+          <div class="set-name">构想提一嘴</div>
+          <div class="set-text">想到新构想时，在群里用一两句话提一下。给某位群友的构想会 @ ta，但不会说是怎么想到 ta 的。</div>
+          ${idea ? `<div class="cp-opts">${cpSelect("每天最多", "idea_mention_daily_max", c.idea_mention_daily_max, daily, "次")}</div>` : ""}
+          ${idea || (m.recent || []).length ? `<div class="cp-st">今天提了 ${m.sent_today || 0} 次 · ${esc(cpLast(m.recent))}</div>` : ""}
+        </div>
+        <label class="switch" title="${idea ? "关掉" : "打开"}构想提一嘴"><input type="checkbox" data-cp="idea_mention_enabled" ${idea ? "checked" : ""} aria-label="构想提一嘴" /><span></span></label>
+      </div>
+      ${cp.has_link ? "" : `<p class="fine">网页还没设公开地址，发的时候不带链接。</p>`}
+    </div>`;
+}
+
 function focusSection(v) {
   const focus = (v && v.focus) || [];
   let html = `<div class="h-sub-row"><h2 class="h-sub">关注成员 <span class="private">${SVG.lock}只有管理员看得到</span></h2><button class="btn small" data-act="focus-add">加一个人</button></div>`;
@@ -170,13 +221,13 @@ export function viewGroup(g, v) {
   if (!v) return html + loading();
   if (g.fresh) {
     html += emptyState("seedling", "还在熟悉这个群", "");
-    return gadmin() ? html + focusSection(v) : html;
+    return gadmin() ? html + pushBlock(v) + focusSection(v) : html;
   }
   const log = v.topic_log || [];
   html += `<h2 class="h-sub">开话题记录 </h2>`;
   html += log.length ? log.map((t, k) => topicItem(t, k)).join("") : `<p class="h-meta">还没有</p>`;
   html += `<h2 class="h-sub">群画像 </h2>`;
   html += profileSection(v);
-  if (gadmin()) html += groupSpaceBlock(v) + focusSection(v);
+  if (gadmin()) html += pushBlock(v) + groupSpaceBlock(v) + focusSection(v);
   return html;
 }

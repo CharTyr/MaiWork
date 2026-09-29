@@ -994,7 +994,7 @@ class TestStreaming:
 
 class TestMaxTokensAndFinish:
     @pytest.mark.asyncio
-    async def test_max_tokens_sent_only_when_given_and_finish_reason_exposed(self, tmp_path) -> None:
+    async def test_max_tokens_always_sent_and_finish_reason_exposed(self, tmp_path) -> None:
         bodies = []
 
         def h(request):
@@ -1008,6 +1008,7 @@ class TestMaxTokensAndFinish:
         r = await models.chat("main", [{"role": "user", "content": "x"}], max_tokens=16000)
         assert bodies[0]["max_tokens"] == 16000
         assert r.finish_reason == "length"
+        # 0.4.2 起不传 max_tokens 也要带上设置里的值（有些端点缺这个参数会出错）
         await models.chat("main", [{"role": "user", "content": "x"}])
-        assert "max_tokens" not in bodies[1]
+        assert bodies[1]["max_tokens"] == 32768
         await models.close()

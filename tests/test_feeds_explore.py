@@ -179,7 +179,7 @@ class TestRecentChat:
         rows = recent_chat(store, GID, hours=48, limit=60, now=NOW)
         assert [r["text"] for r in rows] == ["第一句", "第二句", "第三句"]
         assert [r["ts"] for r in rows] == sorted(r["ts"] for r in rows)
-        assert set(rows[0]) == {"ts", "who", "text", "message_id"}
+        assert set(rows[0]) == {"ts", "who", "text", "message_id", "user_id"}
 
     def test_limit_takes_newest_then_ascending(self, tmp_path: Path) -> None:
         store = _store(tmp_path)

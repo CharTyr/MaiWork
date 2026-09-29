@@ -1016,6 +1016,31 @@ class TestM3Loop:
             await app.stop()
 
     @pytest.mark.asyncio
+    async def test_goal_reminder_uses_current_member_name(self, tmp_path: Path) -> None:
+        """成员提醒 @ 的人用名册当前名（按 who_id），不是建目标时的名字快照。"""
+        from CharTyr_MaiWork.maiwork import clock, members
+
+        app = _app(tmp_path, raw=_raw_models(tmp_path / "data"))
+        await app.start()
+        try:
+            t = clock.now()
+            app.goals.create_member(
+                G1, who_id="20002", who_name="阿柒", title="吃药",
+                due_ts=t + 3600, remind_ts=t - 10,
+            )
+            with app.store.tx() as conn:
+                members.record(conn, G1, "20002", "阿柒改了名", 1e10)
+            await app.run_loop_once()
+            rows = app.store.read().execute(
+                "SELECT payload FROM outbox WHERE key LIKE 'goal-remind:%'"
+            ).fetchall()
+            assert rows
+            assert "@阿柒改了名 提醒：吃药" in rows[0]["payload"]
+            assert "20002" not in rows[0]["payload"]
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
     async def test_waiting_input_shelved_after_24h(self, tmp_path: Path) -> None:
         app = _app(tmp_path)
         await app.start()

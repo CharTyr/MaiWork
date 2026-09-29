@@ -565,3 +565,56 @@ class TestIdeaItemsLanding:
         view = ap.pending_view(GID)
         assert view[0]["items"] == [2, 3]
         assert r["status"] == "pending"
+
+
+class TestCurrentNames:
+    """发起人名字一律按 requester_id 查名册当前名；查不到回落快照；都没有写「群友」。"""
+
+    def test_pending_view_shows_current_name(self, mem_store, tasks, goals):
+        from CharTyr_MaiWork.maiwork import members
+
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting())
+        ap.create(GID, **_DEFAULTS)
+        with mem_store.tx() as conn:
+            members.record(conn, GID, "10001", "阿柒改了名", 1e10)
+        assert ap.pending_view(GID)[0]["who"] == "阿柒改了名"
+
+    def test_pending_view_unknown_id_keeps_snapshot(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting())
+        ap.create(GID, **dict(_DEFAULTS, requester_id="99999"))
+        assert ap.pending_view(GID)[0]["who"] == "阿柒"
+
+    def test_pending_view_blank_name_is_placeholder(self, mem_store, tasks, goals):
+        """老记录名字快照恰好是 QQ 号（等于 id）：名册也查不到 → 显示「群友」，绝不漏 id。"""
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting())
+        ap.create(GID, **dict(_DEFAULTS, requester_id="10001", requester_name="10001"))
+        who = ap.pending_view(GID)[0]["who"]
+        assert who == "群友" and "10001" not in who
+
+    def test_due_reminders_show_current_name(self, mem_store, tasks, goals, fixed_clock):
+        from CharTyr_MaiWork.maiwork import members
+
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting())
+        fixed_clock[0] = NOW - 25 * 3600
+        ap.create(GID, **_DEFAULTS)
+        with mem_store.tx() as conn:
+            members.record(conn, GID, "10001", "阿柒改了名", 1e10)
+        fixed_clock[0] = NOW
+        assert ap.due_reminders(NOW)[0]["who"] == "阿柒改了名"
+
+    def test_land_by_text_uses_current_name(self, mem_store, tasks, goals):
+        from CharTyr_MaiWork.maiwork import members
+
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=False))
+        with mem_store.tx() as conn:
+            members.record(conn, GID, "10001", "阿柒改了名", 1e10)
+        r = ap.create(GID, kind="goal", title="盯着活动", quote="看活动", via="群里 @",
+                      requester_id="10001", requester_name="阿柒")
+        by_text = goals.get(r["goal_id"])["by_text"]
+        assert by_text.startswith("阿柒改了名 发起")
+
+    def test_land_by_text_blank_name_is_placeholder(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=False))
+        r = ap.create(GID, kind="goal", title="盯着活动", quote="看活动", via="群里 @",
+                      requester_id="99999", requester_name="")
+        assert goals.get(r["goal_id"])["by_text"].startswith("群友 发起")

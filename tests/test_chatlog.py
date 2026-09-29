@@ -222,8 +222,9 @@ class TestSearch:
         hits = search_chat(store, GID, "FPGA", days=14, now=NOW)
         assert len(hits) == 1
         h = hits[0]
-        assert set(h.keys()) == {"ts", "who", "text", "message_id"}
+        assert set(h.keys()) == {"ts", "who", "text", "message_id", "user_id"}
         assert h["who"] == "老王"
+        assert h["user_id"] == "u2"      # 名字只是快照，认人靠 id（显示时再查当前名）
         assert h["message_id"] == "m2"
         assert "FPGA" in h["text"]
 

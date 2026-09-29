@@ -776,6 +776,33 @@ class TestFocusPersonalView:
         assert out["last_ts"] is not None and float(out["last_ts"]) > 0
         assert all("给阿二" not in str(n.get("title") or "") for n in out["news"])
 
+    def test_personal_refs_use_current_name(self, tmp_path) -> None:
+        """个人向 refs 的 who 按 user_id 查当前名；视图不带 user_id。"""
+        from CharTyr_MaiWork.maiwork import members
+
+        store = Store(tmp_path / "t.db")
+        store.migrate()
+        _seed_group(store, GID, ready=True)
+        _add_focus_member(store, UID, GID, name=UNAME)
+        nid = _seed_personal_news(store, UID, GID)
+        with store.tx() as conn:
+            conn.execute(
+                "UPDATE news_items SET refs=? WHERE id=?",
+                (json.dumps([{"ts": NOW - 100, "who": UNAME, "user_id": UID,
+                              "text": "想找个便宜的学习板", "message_id": "m1"}], ensure_ascii=False), nid),
+            )
+            members.record(conn, GID, UID, "阿帆改了名", 1e10)
+        from CharTyr_MaiWork.maiwork.personal import Personal
+
+        personal = Personal(
+            store, FakeModelsQueue(), FakeWorkers(), FakeProfiles(), FakeTopics(), lambda: _settings()
+        )
+        with _time_patch():
+            out = personal.focus_personal_view(GID, UID, days=7)
+        item = next(n for n in out["news"] if n["id"] == nid)
+        assert item["refs"][0]["who"] == "阿帆改了名"
+        assert "user_id" not in item["refs"][0]
+
     def test_personal_empty_for_unknown(self, tmp_path) -> None:
         """没做过画像 / 不是关注成员的人：personal 是空结构，last_ts 为 null。"""
         store = Store(tmp_path / "t.db")

@@ -576,23 +576,26 @@ class TestAdminOps:
 
     @pytest.mark.asyncio
     async def test_models_save_keeps_retry_rate_and_context(self, env: SimpleEnv) -> None:
-        """网页「模型」表单里的重试、请求频率、上下文长度：点保存后要真的存下，
+        """网页「模型」表单里的重试、请求频率、上下文长度、最大输出：点保存后要真的存下，
         不能被路由丢掉、再显示回原来的值（用户实测踩到）。"""
         await env.login()
         body = {
             "base_url": "https://new.test/v1", "main": "m2", "worker": "w2",
-            "retries": 3, "retry_delay_s": 20, "max_concurrency": 5, "max_rpm": 30, "context_window": 200000,
+            "retries": 3, "retry_delay_s": 20, "max_concurrency": 5, "max_rpm": 30,
+            "context_window": 200000, "max_tokens": 8192,
         }
         r = await env.client.put("/api/settings/models", json=body)
         assert r.status == 200, await r.text()
         data = await r.json()
-        want = {k: body[k] for k in ("retries", "retry_delay_s", "max_concurrency", "max_rpm", "context_window")}
+        want = {k: body[k] for k in ("retries", "retry_delay_s", "max_concurrency", "max_rpm", "context_window", "max_tokens")}
         assert {k: data[k] for k in want} == want
         # 重新拉设置页也是新值
         s = await (await env.client.get("/api/settings")).json()
         assert {k: s["models"][k] for k in want} == want
         # 越界值要报错，不能悄悄吞掉
         r = await env.client.put("/api/settings/models", json={**body, "max_concurrency": 99})
+        assert r.status == 400
+        r = await env.client.put("/api/settings/models", json={**body, "max_tokens": 999})
         assert r.status == 400
         # 不传这几项 = 保留当前值
         r = await env.client.put("/api/settings/models", json={"base_url": "https://new.test/v1", "main": "m2", "worker": "w2"})
@@ -1110,6 +1113,7 @@ class TestGroupViewM2Fields:
         view = _views.group_view(svc, G1, admin=False)
         assert view["id"] == G1
         assert "focus" not in view
+        assert "card_push" not in view  # 往群里发的开关只给管理员 / 本群群管理员
         # topic_log 群友也看得到，但不含 verdict
         assert isinstance(view["topic_log"], list) and len(view["topic_log"]) == 2
         assert all("verdict" not in e for e in view["topic_log"])

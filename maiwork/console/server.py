@@ -666,9 +666,9 @@ class ConsoleServer:
             }
             if body.get("api_key"):
                 patch["api_key"] = str(body["api_key"])
-            # 表单里的重试 / 请求频率 / 上下文长度：原样转给 save（它校验范围，越界报 400）；
-            # 没传的保留当前值。以前这里漏转，网页点保存后又显示回旧值。
-            for key in ("retries", "retry_delay_s", "max_concurrency", "max_rpm", "context_window"):
+            # 表单里的重试 / 请求频率 / 上下文长度 / 最大输出：原样转给 save（它校验范围，
+            # 越界报 400）；没传的保留当前值。以前这里漏转，网页点保存后又显示回旧值。
+            for key in ("retries", "retry_delay_s", "max_concurrency", "max_rpm", "context_window", "max_tokens"):
                 if body.get(key) is not None:
                     patch[key] = body[key]
             try:
@@ -1948,6 +1948,42 @@ class ConsoleServer:
             text = svc.feeds.set_pref(resolved, str(body.get("text") or ""))
             return web.json_response({"text": text})
 
+        def _card_push_view(gid: str) -> dict:
+            from .. import card_push as _cp
+
+            return _cp.web_view(svc, gid)
+
+        async def _card_push_get(request: web.Request) -> web.Response:
+            """资讯卡片 / 构想提一嘴的每群开关 + 今天发了几次 + 最近几条记录（管理员 / 本群群管理员）。"""
+            resolved = self._resolve_ref(request.match_info["gid"])
+            if resolved is None:
+                ident = self._identify(request)
+                return _err(404 if ident.role == "admin" else 403, "没有这个群")
+            forbid = self._require_group_admin(request, resolved)
+            if forbid is not None:
+                return forbid
+            return web.json_response(_card_push_view(resolved))
+
+        async def _card_push_put(request: web.Request) -> web.Response:
+            """改开关 / 条数 / 每日上限：{"news_card_enabled": true, "news_card_count": 2, ...}。"""
+            resolved = self._resolve_ref(request.match_info["gid"])
+            if resolved is None:
+                return _err(404, "没有这个群")
+            forbid = self._require_group_admin(request, resolved)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if not isinstance(body, dict):
+                return _err(400, "请求体不是 JSON")
+            from .. import card_push as _cp
+
+            try:
+                _cp.set_config(svc.store, resolved, body)
+            except ValueError as e:
+                return _err(400, str(e))
+            logger.info("群 %s 的卡片 / 提一嘴设置改成：%s", resolved, sorted(body))
+            return web.json_response(_card_push_view(resolved))
+
         async def _news_run(request: web.Request) -> web.Response:
             """管理员 / 本群群管理员「现在就备一批」：后台开跑，立刻返回 {"started", "reason"}。"""
             resolved = self._resolve_ref(request.match_info["gid"])
@@ -1981,6 +2017,8 @@ class ConsoleServer:
             return web.json_response(out)
 
         app.router.add_get("/api/groups/{gid}/feeds-pref", _feeds_pref_get)
+        app.router.add_get("/api/groups/{gid}/card-push", _card_push_get)
+        app.router.add_route("PUT", "/api/groups/{gid}/card-push", self._write(_card_push_put))
         app.router.add_post("/api/groups/{gid}/ideas/run", self._write(_ideas_run))
         app.router.add_route("PUT", "/api/groups/{gid}/feeds-pref", self._write(_feeds_pref_put))
         app.router.add_post("/api/groups/{gid}/news/run", self._write(_news_run))

@@ -489,6 +489,34 @@ class TestDetailView:
         assert d["timeline"] == []
 
 
+class TestCurrentRequesterName:
+    """列表 / 详情里的发起人名字按 requester_id 查名册当前名；查不到回落快照。"""
+
+    def _record(self, mem_store: Store, gid: str, uid: str, name: str) -> None:
+        from CharTyr_MaiWork.maiwork import members
+
+        with mem_store.tx() as conn:
+            members.record(conn, gid, uid, name, 1e10)
+
+    def test_list_item_uses_current_name(self, tasks: Tasks, mem_store: Store):
+        tid = _create(tasks, requester_id="10001", requester_name="阿柒")
+        self._record(mem_store, "900000001", "10001", "阿柒改了名")
+        r = next(x for x in tasks.list_view("900000001") if x["id"] == tid)
+        assert r["requester_name"] == "阿柒改了名"
+
+    def test_unknown_id_keeps_snapshot(self, tasks: Tasks, mem_store: Store):
+        tid = _create(tasks, requester_id="99999", requester_name="老快照")
+        r = next(x for x in tasks.list_view("900000001") if x["id"] == tid)
+        assert r["requester_name"] == "老快照"
+
+    def test_member_detail_keeps_name_but_not_id(self, tasks: Tasks, mem_store: Store):
+        tid = _create(tasks, requester_id="10001", requester_name="阿柒")
+        self._record(mem_store, "900000001", "10001", "阿柒改了名")
+        d = tasks.detail_view(tid, admin=False)
+        assert d["requester_name"] == "阿柒改了名"
+        assert "requester_id" not in d          # 群友看不到 QQ 号
+
+
 class TestRunningCount:
     def test_running_only(self, tasks: Tasks, mem_store: Store):
         _create(tasks, status="running")
