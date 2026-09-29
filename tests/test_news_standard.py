@@ -71,7 +71,10 @@ class TestNumbersMatchCode:
         assert f"平均 ≥{feeds_mod._GUIDE_MIN_AVG:g}" in skill
         assert f"每轮最多 {feeds_mod._GUIDE_ROUND_CAP} 篇" in skill
         assert f"相关度 {feeds_mod._EXPLORE_MIN_RELEVANCE:g} 的资讯" in skill
-        assert f"值得聊 ≥{feeds_mod._EXPLORE_MIN_CHAT:g}" in skill and f"信息量 ≥{feeds_mod._EXPLORE_MIN_INFO:g}" in skill
+        assert f"值得聊 ≥{feeds_mod._EXPLORE_MIN_CHAT:g} 或意外度 ≥{feeds_mod._EXPLORE_MIN_SURPRISE:g}" in skill
+        assert f"信息量 ≥{feeds_mod._EXPLORE_MIN_INFO:g}" in skill
+        assert f"信息量、意外度都要 ≥{feeds_mod._GUIDE_EXPLORE_MIN_INFO:g}" in skill
+        assert feeds_mod._GUIDE_EXPLORE_MIN_INFO == feeds_mod._GUIDE_EXPLORE_MIN_SURPRISE
         assert f"新鲜感 ≤{feeds_mod._NOVELTY_REJECT_MAX:g}" in skill
         assert f"群友大概已经知道的事 ≤{feeds_mod._NOVELTY_REJECT_MAX:g}" in scoring
         assert f"超过 {feeds_mod._NEWS_MAX_AGE_DAYS} 天的一律 2 分以下" in scoring

@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "chartyr.maiwork",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "name": "MaiWork",
   "description": "MaiBot 群聊生产力 Agent：和 MaiBot 并行运行，理解群、主动找资讯、提构想、追目标，接群友派的活并交付。默认关闭。",
   "plugin_type": "extension",
@@ -56,8 +56,9 @@
   },
   "display": {
     "icon": {
-      "type": "lucide",
-      "value": "briefcase"
+      "type": "local",
+      "value": "maiwork/console/static/assets/logo.png",
+      "fallback": "briefcase"
     }
   },
   "urls": {

@@ -100,3 +100,17 @@ def test_suite_runs_under_any_dir_name(tmp_path):
     r = subprocess.run([sys.executable, "-m", "pytest", "tests/test_clock.py", "-q", "-p", "no:cacheprovider"],
                        cwd=dst, capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+
+
+def test_local_icon_follows_host_rules():
+    """插件图标用本地图片（宿主 manifest_validator.ManifestDisplayIcon + webui icon_routes，2026-09-29 读线上源码）：
+    type=local、插件目录内相对路径、不许 ..、后缀 jpg/jpeg/png/svg/webp、文件 ≤512KB；fallback 是 lucide 图标名。"""
+    icon = MANIFEST["display"]["icon"]
+    assert icon["type"] == "local"
+    rel = Path(icon["value"])
+    assert not rel.is_absolute() and ".." not in rel.parts and not icon["value"].startswith(("/", "\\"))
+    assert rel.suffix.lower() in {".jpg", ".jpeg", ".png", ".svg", ".webp"}
+    f = PLUGIN_DIR / rel
+    assert f.is_file(), f
+    assert f.stat().st_size <= 512 * 1024
+    assert re.fullmatch(r"[A-Za-z0-9_-]+", icon.get("fallback", ""))

@@ -223,8 +223,13 @@ _GUIDE_ROUND_CAP = 2          # 每轮最多留几篇文章
 # 「探索感」（2026-09-29）
 _NOVELTY_REJECT_MAX = 2.0     # 资讯新鲜感 ≤2（群友大概已经知道）→ 第二道拒
 _EXPLORE_MIN_RELEVANCE = 2.0  # 拓展名额：相关度 2 也行，但要 chat≥4、info≥4、有桥、非敏感
-_EXPLORE_MIN_CHAT = 4.0
+_EXPLORE_MIN_CHAT = 4.0      # 资讯进拓展名额：值得聊 ≥4 **或** 意外度 ≥4（2026-09-29 用户定；
+_EXPLORE_MIN_SURPRISE = 4.0  #   只看值得聊时，沾边少的模型往往两项一起打低，名额从没用上）
 _EXPLORE_MIN_INFO = 4.0
+# 文章也能用拓展名额，门槛更高：信息量、意外度都 ≥4、有桥（发布时间 180 天内第一道已硬判）；
+# 仍算进每轮最多 _GUIDE_ROUND_CAP 篇
+_GUIDE_EXPLORE_MIN_INFO = 4.0
+_GUIDE_EXPLORE_MIN_SURPRISE = 4.0
 _EXPLORE_QUOTA_DAYS = 14      # 按反馈调拓展名额：看最近这么多天已发的拓展条目
 _EXPLORE_RETRY_DAYS = 7       # 名额降到 0 时，这么多天没发过拓展就再试 1 条
 _SURPRISE_RANK_WEIGHT = 0.1   # 排序加分：avg + 0.1×意外度（不改 avg，第三道不受影响）
@@ -988,8 +993,9 @@ class Feeds:
     def _web_gate(self, gid: str, survivors: list[dict], web_min_avg: float) -> None:
         """第二道分数门槛；被拒的打 item["reject"]=("web", 理由)。
 
-        - 文章（guide）从严：相关度 ≥4、信息量 ≥4、平均 ≥3.8（不吃任何放宽）。
-        - 资讯：相关度 ≥3 正常过；相关度 2 但 chat≥4、info≥4、有桥、非敏感的进「拓展名额」
+        - 文章（guide）从严：相关度 ≥4、信息量 ≥4、平均 ≥3.8；相关度 2–3 的文章只有信息量、意外度都 ≥4
+          且有桥才能进拓展名额（和资讯共用名额，仍算进每轮最多 2 篇）。
+        - 资讯：相关度 ≥3 正常过；相关度 2 但（chat≥4 或 surprise≥4）、info≥4、有桥、非敏感的进「拓展名额」
           （名额数 explore_quota 按反馈 0–2 个；多条时意外度高者优先，其次平均分）；
           新鲜感 ≤2（群友大概已经知道）拒；不够新（新鲜度 <3）拒。
         """
@@ -1000,29 +1006,40 @@ class Feeds:
             sc = item["scores"]
             rel = float(sc.get("relevance") or 0.0)
             avg = float(sc.get("avg") or 0.0)
+            novelty = sc.get("novelty")
+            known = isinstance(novelty, (int, float)) and novelty <= _NOVELTY_REJECT_MAX
+            surprise = float(sc.get("surprise") or 0.0)
             if item.get("kind") == "guide":
-                if rel < _GUIDE_MIN_RELEVANCE:
+                if (
+                    _EXPLORE_MIN_RELEVANCE <= rel < _GUIDE_MIN_RELEVANCE
+                    and float(sc.get("info") or 0.0) >= _GUIDE_EXPLORE_MIN_INFO
+                    and surprise >= _GUIDE_EXPLORE_MIN_SURPRISE
+                    and _bridge_ok(item.get("bridge"))
+                    and not item.get("sensitive")
+                    and not known
+                ):
+                    explore_pool.append(item)
+                elif rel < _GUIDE_MIN_RELEVANCE:
                     item["reject"] = ("web", f"相关度 {rel:.1f} < {_GUIDE_MIN_RELEVANCE:.1f}（文章从严），不上")
                 elif float(sc.get("info") or 0.0) < _GUIDE_MIN_INFO:
                     item["reject"] = ("web", f"信息量 {float(sc.get('info') or 0.0):.1f} 不够（文章从严），不上")
                 elif avg < max(web_min_avg, _GUIDE_MIN_AVG):
                     item["reject"] = ("web", f"平均分 {avg:.1f} < {max(web_min_avg, _GUIDE_MIN_AVG):.1f}（文章从严），不上")
                 continue
-            novelty = sc.get("novelty")
             if rel < 3.0:
                 if (
                     rel >= _EXPLORE_MIN_RELEVANCE
-                    and float(sc.get("chat") or 0.0) >= _EXPLORE_MIN_CHAT
+                    and (float(sc.get("chat") or 0.0) >= _EXPLORE_MIN_CHAT or surprise >= _EXPLORE_MIN_SURPRISE)
                     and float(sc.get("info") or 0.0) >= _EXPLORE_MIN_INFO
                     and _bridge_ok(item.get("bridge"))
                     and not item.get("sensitive")
                     and sc["timeliness"] >= 3.0
-                    and not (isinstance(novelty, (int, float)) and novelty <= _NOVELTY_REJECT_MAX)
+                    and not known
                 ):
                     explore_pool.append(item)
                 else:
                     item["reject"] = ("web", f"相关度 {rel:.1f} < 3.0，过不了上网页这道")
-            elif isinstance(novelty, (int, float)) and novelty <= _NOVELTY_REJECT_MAX:
+            elif known:
                 item["reject"] = ("web", "群里已经聊过这件事（群友大概已经知道），不上")
             elif avg < web_min_avg:
                 item["reject"] = ("web", f"平均分 {avg:.1f} < {web_min_avg:.1f}，过不了上网页这道")
@@ -1037,14 +1054,15 @@ class Feeds:
         )
         for n, item in enumerate(explore_pool):
             rel = float(item["scores"].get("relevance") or 0.0)
+            need = f"{_GUIDE_MIN_RELEVANCE:.1f}（文章从严）" if item.get("kind") == "guide" else "3.0"
             if n < quota:
                 item["angle"] = "explore"
                 item["_explore_slot"] = True
             else:
                 item["reject"] = (
                     "web",
-                    f"相关度 {rel:.1f} < 3.0，这轮拓展名额（{quota} 个）已经用完" if quota
-                    else f"相关度 {rel:.1f} < 3.0，这个群最近不想看拓展的",
+                    f"相关度 {rel:.1f} < {need}，这轮拓展名额（{quota} 个）已经用完" if quota
+                    else f"相关度 {rel:.1f} < {need}，这个群最近不想看拓展的",
                 )
 
     # ------------------------------------------------------------------

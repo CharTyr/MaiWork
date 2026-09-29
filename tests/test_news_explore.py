@@ -442,3 +442,63 @@ class TestSameStoryInRound:
         with _TimePatch():
             got = _run(feeds.prepare_news(GID))
         assert got == 2
+
+
+# ----------------------------------------------------------------------
+# 拓展名额条件（2026-09-29 用户定）：资讯「值得聊 ≥4 或意外度 ≥4」；
+# 文章也能用，门槛更高：信息量、意外度都 ≥4、有桥（发布时间 180 天内由第一道硬判）
+# ----------------------------------------------------------------------
+
+
+def _run_one(tmp_path, cand, score):
+    _store, settings, feeds, models, workers, topics, _p = _make_feeds(
+        tmp_path,
+        models=FakeModelsQueue(ready=True, replies=[
+            _FOCUS_JSON, _scores_json(score), _posts_json(_post(0, cand["title"])),
+        ]),
+        workers=FakeWorkers(_ok_report({"items": [cand]})),
+    )
+    with _TimePatch():
+        got = _run(feeds.prepare_news(GID))
+    rows = _store.read().execute("SELECT rejected, angle, reject_reason FROM news_items").fetchall()
+    return got, rows
+
+
+class TestExploreSlotConditions:
+    def test_news_surprise_4_chat_2_passes(self, tmp_path) -> None:
+        got, rows = _run_one(tmp_path, _cand(0), _score(
+            0, relevance=2, chat=2, info=4, surprise=4, novelty=4, profile=None,
+            bridge="从群在聊的散热问题跳到底座设计的来龙去脉"))
+        assert got == 1 and rows[0]["angle"] == "explore"
+
+    def test_news_chat_3_surprise_3_rejected(self, tmp_path) -> None:
+        got, rows = _run_one(tmp_path, _cand(0), _score(
+            0, relevance=2, chat=3, info=4, surprise=3, novelty=4, profile=None,
+            bridge="从群在聊的散热问题跳到底座设计的来龙去脉"))
+        assert got == 0 and "相关度" in rows[0]["reject_reason"]
+
+    def test_news_known_already_not_explore(self, tmp_path) -> None:
+        got, rows = _run_one(tmp_path, _cand(0), _score(
+            0, relevance=2, chat=5, info=4, surprise=5, novelty=2, profile=None,
+            bridge="从群在聊的散热问题跳到底座设计的来龙去脉"))
+        assert got == 0
+
+    def test_guide_rel3_info4_surprise4_bridge_passes_as_explore(self, tmp_path) -> None:
+        cand = _cand(0, kind="guide", title="廉价推理商其实是 OpenRouter 加价 20 倍", published=NOW - 13 * 86400)
+        got, rows = _run_one(tmp_path, cand, _score(
+            0, relevance=3, chat=5, info=5, surprise=5, novelty=5, profile=None,
+            bridge="从群里聊 Gemini 偷懒调 Qwen 跳到廉价推理商偷换模型"))
+        assert got == 1 and rows[0]["angle"] == "explore"
+
+    def test_guide_surprise_3_still_strict(self, tmp_path) -> None:
+        cand = _cand(0, kind="guide", title="多模型路由自动降级实战", published=NOW - 70 * 86400)
+        got, rows = _run_one(tmp_path, cand, _score(
+            0, relevance=3, chat=5, info=5, surprise=3, novelty=5, profile=None,
+            bridge="从群里聊模型偷换跳到正规的路由降级做法"))
+        assert got == 0 and "文章从严" in rows[0]["reject_reason"]
+
+    def test_guide_without_bridge_still_strict(self, tmp_path) -> None:
+        cand = _cand(0, kind="guide", title="某篇深度分析", published=NOW - 10 * 86400)
+        got, rows = _run_one(tmp_path, cand, _score(
+            0, relevance=3, chat=5, info=5, surprise=5, novelty=5, profile=0, bridge=""))
+        assert got == 0

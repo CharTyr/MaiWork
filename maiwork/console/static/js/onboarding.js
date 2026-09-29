@@ -4,8 +4,8 @@ import { SVG, calm, esc, ico, toast } from "./util.js";
 import { api, gname } from "./api.js";
 import { ROWS_COLS, chipEditor, rowsEditor } from "./settings/rules.js";
 import { AV_SRC } from "./settings/identity.js";
-import { renderRail, renderView } from "./render.js";
-import { loadSettings } from "./router.js";
+import { render } from "./render.js";
+import { applyHash, loadGroups, loadSettings, loadView } from "./router.js";
 
 // ───────────── 首次安装引导 ─────────────
 // 全屏一张卡片，一步一屏：打招呼 → 模型 → 服务的群 → 可选密钥 → 管理员 → 完成。
@@ -319,7 +319,7 @@ async function closeOnboarding(action) {
   if (a) a.finished.then(gone, gone);
   else gone();
   onb.anims = [];
-  loadSettings().then(() => (renderRail(), state.page === "settings" && renderView()));
+  loadSettings().then(() => render());
   if (action === "skip") toast("跳过了，以后在设置概况里可以重新引导");
 }
 
@@ -375,6 +375,11 @@ async function onbSave(id) {
   }
   if (!Object.keys(patch).length) return "";
   onb.cfg = await api("PUT", "/api/settings/config", patch).then(() => api("GET", "/api/settings/config"));
+  if (Object.hasOwn(patch, "groups.serve")) {
+    await loadGroups();
+    applyHash();
+    await loadView();
+  }
   return "";
 }
 

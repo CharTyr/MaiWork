@@ -13,7 +13,7 @@ import { draft } from "./settings/models.js";
 import { closeSheet, repaintSheet } from "./sheet.js";
 import { chatPoll, enterChat, loadChat, paintChat } from "./chat.js";
 import { render, renderRail, renderSide, renderView } from "./render.js";
-import { applyHash, loadSettings, loadView, parseHash, reboot, syncHash } from "./router.js";
+import { applyHash, loadGroups, loadSettings, loadView, parseHash, reboot, syncHash } from "./router.js";
 import { act } from "./actions.js";
 import { onb, onbAct } from "./onboarding.js";
 import { RATE_KEY, clientId, myRates } from "./pages/news.js";
@@ -155,6 +155,13 @@ document.addEventListener("submit", async (e) => {
     try {
       state.rules = await api("PUT", "/api/settings/config", body);
       await loadSettings();
+      if (Object.hasOwn(body, "groups.serve")) {
+        const oldGroup = state.g;
+        await loadGroups();
+        applyHash();
+        if (state.g !== oldGroup) state.view = null;
+        render();
+      }
       repaintSheet();
       toast((state.rules.reload_pending || []).length ? "写进 config.toml 了；标「重载后生效」的要等插件重载" : "写进 config.toml 了，马上生效");
     } catch (ex) {
