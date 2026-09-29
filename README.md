@@ -107,6 +107,7 @@
 | Python 依赖 | httpx、tomlkit、aiohttp —— MaiBot 本身已带，**不用另装** |
 | 模型 | 一个 **OpenAI 兼容接口**：「主模型」负责想和验收，「干活模型」负责执行，可以是同一个 |
 | 联网搜索 | 一个能搜索的 **MCP**（如 Tavily、You.com、EXA 的托管 MCP） |
+| 资讯卡片画图 | 用 MaiBot 环境里的 playwright + Chromium、Pillow 画卡片、处理配图；缺了就自动改发文字列表 |
 | 可选 | Jev（TypeSafe）密钥，让快速判断更快更省；自己的 VPS / VM（专用机器，可以配多台）；[railway.new](https://railway.new) 一次性 VM |
 
 **子 agent 在本机跑命令的方式，启动时自动判断，不用你建用户：**
