@@ -255,6 +255,82 @@ class TestApproveReject:
         assert "request.pending" in kinds and "request.approved" in kinds
 
 
+class TestApprovalAtomicity:
+    def test_failed_task_create_keeps_request_pending_and_retryable(self, mem_store, tasks, goals, monkeypatch):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        rid = ap.create(GID, **_DEFAULTS)["id"]
+        original = tasks.create
+
+        def broken_create(*args, **kwargs):
+            raise RuntimeError("task insert failed")
+
+        monkeypatch.setattr(tasks, "create", broken_create)
+        with pytest.raises(RuntimeError, match="task insert failed"):
+            ap.approve(rid, by="42")
+        row = mem_store.read().execute("SELECT status, task_id, decided_by FROM requests WHERE id=?", (rid,)).fetchone()
+        assert (row["status"], row["task_id"], row["decided_by"]) == ("pending", None, "")
+        assert mem_store.read().execute("SELECT COUNT(*) FROM tasks WHERE request_id=?", (rid,)).fetchone()[0] == 0
+        assert mem_store.read().execute(
+            "SELECT COUNT(*) FROM events WHERE kind='request.approved' AND entity_id=?", (rid,)
+        ).fetchone()[0] == 0
+        monkeypatch.setattr(tasks, "create", original)
+        assert ap.approve(rid, by="42")["task_id"] == "T-1"
+
+    def test_idea_items_all_rollback_if_later_goal_fails(self, mem_store, tasks, goals, monkeypatch):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        items = [{"kind": "task", "title": "A", "desc": "first"},
+                 {"kind": "goal", "title": "B", "desc": "second"}]
+        with mem_store.tx() as conn:
+            idea_id = conn.execute(
+                "INSERT INTO ideas (group_id, title, body, items, state, created, updated)"
+                " VALUES (?, 'idea', 'body', ?, 'pending', 1, 1)",
+                (GID, json.dumps(items)),
+            ).lastrowid
+        rid = ap.create(GID, **dict(_DEFAULTS, idea_id=idea_id))["id"]
+        original = goals.create_agent
+
+        def broken_goal(*args, **kwargs):
+            raise RuntimeError("goal insert failed")
+
+        monkeypatch.setattr(goals, "create_agent", broken_goal)
+        with pytest.raises(RuntimeError, match="goal insert failed"):
+            ap.approve(rid, by="42")
+        assert mem_store.read().execute("SELECT status FROM requests WHERE id=?", (rid,)).fetchone()[0] == "pending"
+        assert mem_store.read().execute("SELECT COUNT(*) FROM tasks WHERE request_id=?", (rid,)).fetchone()[0] == 0
+        assert mem_store.read().execute("SELECT state FROM ideas WHERE id=?", (idea_id,)).fetchone()[0] == "pending"
+        monkeypatch.setattr(goals, "create_agent", original)
+        assert ap.approve(rid, by="42")["task_ids"] == ["T-1"]
+
+    def test_failed_exempt_landing_rolls_back_request(self, mem_store, tasks, goals, monkeypatch):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=False))
+        monkeypatch.setattr(tasks, "create", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("broken")))
+        with pytest.raises(RuntimeError, match="broken"):
+            ap.create(GID, **_DEFAULTS)
+        assert mem_store.read().execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 0
+
+    def test_auto_quota_check_and_all_writes_share_transaction(self, mem_store, tasks, goals, monkeypatch):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        first, second = ap.create(GID, **_DEFAULTS)["id"], ap.create(GID, **_DEFAULTS)["id"]
+        day = clock.day_key(NOW)
+        original = mem_store.kv_set
+
+        def broken_counter(*args, **kwargs):
+            raise RuntimeError("quota write failed")
+
+        monkeypatch.setattr(mem_store, "kv_set", broken_counter)
+        with pytest.raises(RuntimeError, match="quota write failed"):
+            ap.approve(first, by="MaiWork 自动审核", auto_daily=(day, 1))
+        assert ap._get(first)["status"] == "pending"
+        assert mem_store.read().execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        monkeypatch.setattr(mem_store, "kv_set", original)
+        ap.approve(first, by="MaiWork 自动审核", auto_daily=(day, 1))
+        with pytest.raises(ValueError, match="额度"):
+            ap.approve(second, by="MaiWork 自动审核", auto_daily=(day, 1))
+        assert ap._get(second)["status"] == "pending"
+        assert mem_store.kv_get(f"auto_review.day.{GID}") == {"day": day, "n": 1}
+        assert mem_store.read().execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+
+
 class TestPendingView:
     def test_structure_and_order(self, mem_store, tasks, goals, fixed_clock):
         ap = _approvals(mem_store, tasks, goals, _ApprovalSetting())

@@ -500,6 +500,74 @@ class TestPlannerHook:
             await app.stop()
 
     @pytest.mark.asyncio
+    async def test_memo_survives_signal_consumption_and_restart(self, tmp_path: Path) -> None:
+        app = _app(tmp_path)
+        await app.start()
+        try:
+            app._remember_session_row(G1, "sess-memo", 1_790_000_000.0)
+            app.signals.mark(G1, "sess-memo", 1_790_000_000.0)
+            app.signals.take()  # 后台循环消费了易失信号
+            app.mentions.add(G1, "待提起的消息", key="news:survive", ttl_s=3600, turns=3)
+            out = app.on_planner_before_request(self._planner_kwargs("sess-memo"))
+            assert "待提起的消息" in out["modified_kwargs"]["items"][0]["parts"][0]["text"]
+        finally:
+            await app.stop()
+        restarted = _app(tmp_path)
+        await restarted.start()
+        try:
+            out = restarted.on_planner_before_request(self._planner_kwargs("sess-memo"))
+            assert "待提起的消息" in out["modified_kwargs"]["items"][0]["parts"][0]["text"]
+        finally:
+            await restarted.stop()
+
+    @pytest.mark.asyncio
+    async def test_memo_injection_uses_verified_group_not_second_lookup(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """若数据库会话行歧义，钩子已确认的服务群不能被二次查库换成另一群。"""
+        app = _app(tmp_path)
+        await app.start()
+        try:
+            app._remember_session_row(G1, "sess-verified", 1_790_000_000.0)
+            app.signals.take()
+            app.mentions.add(G1, "只属于本群", key="memo:one", ttl_s=3600)
+            app.mentions.add(G2, "属于隔壁群的隐私", key="memo:two", ttl_s=3600)
+            monkeypatch.setattr(app.mentions, "_resolve_group", lambda sid: G2)
+            out = app.on_planner_before_request(self._planner_kwargs("sess-verified"))
+            text = out["modified_kwargs"]["items"][0]["parts"][0]["text"]
+            assert "只属于本群" in text
+            assert "隔壁群的隐私" not in text
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_served_session_ids_do_not_guess_group(self, tmp_path: Path) -> None:
+        app = _app(tmp_path)
+        await app.start()
+        try:
+            with app.store.tx() as conn:
+                conn.execute("UPDATE groups SET session_id='sess-duplicate' WHERE group_id IN (?, ?)", (G1, G2))
+            app._refresh_served_sessions()
+            app.signals.take()
+            app.mentions.add(G1, "第一群内容", key="memo:one", ttl_s=3600)
+            app.mentions.add(G2, "第二群内容", key="memo:two", ttl_s=3600)
+            assert app.on_planner_before_request(self._planner_kwargs("sess-duplicate")) == {"action": "continue"}
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_old_session_of_removed_group_cannot_inject_memo(self, tmp_path: Path) -> None:
+        app = _app(tmp_path)
+        await app.start()
+        try:
+            with app.store.tx() as conn:
+                conn.execute("INSERT INTO groups (group_id, session_id) VALUES (?, ?)",
+                             ("non-served", "sess-removed"))
+            app.mentions.add("non-served", "绝不能注入", key="gone:1", ttl_s=3600)
+            out = app.on_planner_before_request(self._planner_kwargs("sess-removed"))
+            assert out == {"action": "continue"}
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
     async def test_plugin_hook_signature_registered_with_correct_metadata(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """插件层：maiwork_mentions 已按 BLOCKING/1000ms/SKIP/name 注册。"""
         from CharTyr_MaiWork.plugin import MaiWorkPlugin

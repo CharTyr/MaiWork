@@ -1,13 +1,9 @@
 """G2 回归测试：resolve 与读写之间的 TOCTOU。
 
-LocalEnv.read_file / write_file 在 resolve 成功之后才 open()，中间文件可能
-被换成符号链接。修复约定：
-- 用 os.open + O_NOFOLLOW 打开最后一段（写：O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW，
-  追加用 O_APPEND）；最后一段是链接 → 打开失败，
-  抛 PermissionError（和 resolve 的越界同类）；
-- 打开后用 os.fstat + /proc/self/fd/<fd>（Linux）或回落「重 realpath 父目录 +
-  st_dev/st_ino 对比」校验仍在工作区内；
-- 父目录各段逐段 lstat 检查，父目录链上任何一段是符号链接 → PermissionError。
+LocalEnv.read_file / write_file 必须从工作区根目录 fd 逐段 dir_fd +
+O_NOFOLLOW 打开；目录段或文件换成 symlink 必须 fail closed。
+写入先创建全新 inode、校验目标，再通过同目录原子替换；绝不能先对旧文件
+O_TRUNC，也不能覆写外部硬链接。chown 只操作打开的普通 inode，跳过链接。
 """
 
 from __future__ import annotations
@@ -165,3 +161,76 @@ class TestNormalOpsUnaffected:
         env.workspace("ws1")
         with pytest.raises(FileNotFoundError):
             await env.read_file("ws1", "nope.txt")
+
+
+class TestAnchoredDirectorySafety:
+    async def test_workspace_symlink_does_not_create_directories_outside(self, tmp_path: Path) -> None:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (tmp_path / "ws1").symlink_to(outside, target_is_directory=True)
+        env = _env(tmp_path)
+        with pytest.raises(PermissionError):
+            env.workspace("ws1")
+        assert not (outside / "tasks").exists()
+        assert not (outside / "artifacts").exists()
+
+    async def test_write_parent_swapped_at_open_cannot_truncate_outside(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = _env(tmp_path)
+        ws = env.workspace("ws1")
+        parent = ws / "swap"
+        parent.mkdir()
+        (parent / "victim.txt").write_text("inside", encoding="utf-8")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        victim = outside / "victim.txt"
+        victim.write_text("KEEP", encoding="utf-8")
+        original_open = os.open
+        swaps = []
+
+        def swap_before_open(path, flags, *args, **kwargs):
+            # 旧实现：最后一段用绝对路径打开。新实现：父段在 workspace fd 下打开。
+            if not swaps and (str(path) == "swap" or str(path).endswith("/swap/victim.txt")):
+                parent.rename(ws / "old-parent")
+                parent.symlink_to(outside, target_is_directory=True)
+                swaps.append(True)
+            return original_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", swap_before_open)
+        with pytest.raises(PermissionError):
+            await env.write_file("ws1", "swap/victim.txt", "REPLACED")
+        assert swaps, "race 注入必须命中打开边界"
+        assert victim.read_text(encoding="utf-8") == "KEEP"
+
+    async def test_write_rejects_hardlinked_file(self, tmp_path: Path) -> None:
+        env = _env(tmp_path)
+        ws = env.workspace("ws1")
+        outside = tmp_path / "victim.txt"
+        outside.write_text("KEEP", encoding="utf-8")
+        os.link(outside, ws / "victim.txt")
+        with pytest.raises(PermissionError):
+            await env.write_file("ws1", "victim.txt", "REPLACED")
+        assert outside.read_text(encoding="utf-8") == "KEEP"
+
+    async def test_chown_tree_skips_symlinks_and_hardlinks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / "ws1"
+        root.mkdir()
+        (root / "ordinary.txt").write_text("normal", encoding="utf-8")
+        outside = tmp_path / "outside.txt"
+        outside.write_text("KEEP", encoding="utf-8")
+        (root / "symlink.txt").symlink_to(outside)
+        os.link(outside, root / "hardlink.txt")
+        touched: list[tuple[int, int]] = []
+        monkeypatch.setattr(os, "chown", lambda path, uid, gid: touched.append(
+            (os.stat(path).st_dev, os.stat(path).st_ino)))
+        monkeypatch.setattr(os, "fchown", lambda fd, uid, gid: touched.append(
+            (os.fstat(fd).st_dev, os.fstat(fd).st_ino)))
+        LocalEnv._chown_tree(root, 65534, 65534)
+        assert (outside.stat().st_dev, outside.stat().st_ino) not in touched, (
+            "root 不得经由 symlink/hardlink 修改外部 inode"
+        )
+        ordinary = (root / "ordinary.txt").stat()
+        assert (ordinary.st_dev, ordinary.st_ino) in touched

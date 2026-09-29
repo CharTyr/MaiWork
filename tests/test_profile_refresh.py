@@ -562,7 +562,8 @@ class TestParsingAndFailure:
     ) -> None:
         settings = _settings(tmp_path)
         models = FakeModelsQueue(
-            replies=["不是 JSON", '{"ops": [{"op": "add", "category": "recent", "text": "重试成功"}]}']
+            # 读不懂会当场带「格式不对」再问一次（2026-09-29）：两次都读不懂才算这次失败
+            replies=["不是 JSON", "还是看不懂", '{"ops": [{"op": "add", "category": "recent", "text": "重试成功"}]}']
         )
         host = FakeHost([_msg(f"m{i}", T0 - 100 + i) for i in range(3)])
         p = _make(store, host, models, settings)
@@ -598,7 +599,8 @@ class TestParsingAndFailure:
     ) -> None:
         settings = _settings(tmp_path, batch_messages=3)
         models = FakeModelsQueue(
-            replies=["垃圾1", "垃圾2", ModelError("炸了"), '{"ops": []}']
+            # 每次 tick：读不懂的会再问一次，所以一次失败 = 两句垃圾；模型报错不再问
+            replies=["垃圾1", "垃圾2", ModelError("炸了"), "垃圾3", "垃圾4", '{"ops": []}']
         )
         host = FakeHost([_msg(f"m{i}", T0 - 100 + i) for i in range(3)])
         p = _make(store, host, models, settings)
@@ -622,7 +624,7 @@ class TestParsingAndFailure:
         self, store: Store, frozen_now: float, tmp_path: Path
     ) -> None:
         settings = _settings(tmp_path)
-        models = FakeModelsQueue(replies=['{"ops": "不是列表"}'])
+        models = FakeModelsQueue(replies=['{"ops": "不是列表"}', '{"ops": "还不是列表"}'])
         host = FakeHost([_msg(f"m{i}", T0 - 100 + i) for i in range(3)])
         p = _make(store, host, models, settings)
         r = await p.tick(GID)
@@ -885,3 +887,147 @@ class TestProfileMd:
         assert r.refreshed is True  # 提炼照样成功
         assert not (tmp_path / "wsroot" / "tinker").exists()  # 没有顺手建目录
         assert p.entries(GID)[0]["text"] == "有变化"  # 条目正常入库
+
+
+# ----------------------------------------------------------------------
+# 2026-09-29：一行一件事的输出格式；读不懂不算成功；超时 / 失败拆半
+# 线上实测：step-5-preview 开 JSON 模式时 29 次里 26 次没按 {"ops":[…]} 回（只给一条 / 压扁 / 回空 {}），
+# 老代码把「没有 ops 键」当成「没变化」照样收账，群画像一整天几乎没更新；超时同一批原样重试 18 次后整批跳过。
+# ----------------------------------------------------------------------
+
+
+class TestLineFormat:
+    def _host(self, n=3):
+        return FakeHost([_msg(f"m{i}", T0 - 500 + i * 5, user=f"u{i % 3}", text=f"消息{i}") for i in range(n)])
+
+    @pytest.mark.asyncio
+    async def test_lines_applied(self, store: Store, frozen_now: float, tmp_path: Path) -> None:
+        import json as _j
+
+        settings = _settings(tmp_path)
+        host = self._host()
+        models = FakeModelsQueue(replies=["新增 | 长期兴趣 | 喜欢开源硬件 | 1\n新增 | 最近在聊 | 在聊旧话题 | 2"])
+        p = _make(store, host, models, settings)
+        assert (await p.tick(GID)).refreshed is True
+        ids = {e["text"]: e["id"] for e in p.entries(GID)}
+        old, gone = ids["喜欢开源硬件"], ids["在聊旧话题"]
+        # 第二批：新 3 条消息
+        host.msgs.extend(_msg(f"n{i}", T0 - 100 + i * 5, text=f"新消息{i}") for i in range(3))
+        reply = "\n".join([
+            "新增 | 最近在聊 | 在聊新出的掌机 | 1,3",
+            f"修改 | #{old} | 喜欢开源硬件和 FPGA",
+            f"删除 | #{gone}",
+            "新增 | 约定和说法 | A|B 两个方案都叫「快板」 | 2",
+        ])
+        models.reply_queue.append(reply)
+        r = await p.tick(GID)
+        assert r.refreshed is True
+        texts = {e["text"]: e for e in p.entries(GID)}
+        assert "在聊新出的掌机" in texts and texts["在聊新出的掌机"]["category"] == "recent"
+        assert "喜欢开源硬件和 FPGA" in texts
+        assert "在聊旧话题" not in texts
+        assert "A|B 两个方案都叫「快板」" in texts
+        row = store.read().execute(
+            "SELECT evidence FROM profile_entries WHERE text=?", ("在聊新出的掌机",)).fetchone()
+        # 第二批窗口含上一批最后那条（m2），序号 1、3 → m2、n1
+        assert _j.loads(row["evidence"]) == ["m2", "n1"]
+        # 调用：不开 JSON 模式、等待上限 300 秒、超时只重试 1 次
+        kw = models.calls[0][2]
+        assert kw.get("json_mode") is False
+        assert kw.get("timeout") == 300
+        assert kw.get("retries") == 1
+
+    @pytest.mark.asyncio
+    async def test_prompt_describes_line_format(self, store: Store, frozen_now: float, tmp_path: Path) -> None:
+        models = FakeModelsQueue(replies=["没有变化"])
+        p = _make(store, self._host(), models, _settings(tmp_path))
+        await p.tick(GID)
+        text = str(models.calls[0][1])
+        assert "新增 |" in text and "没有变化" in text and "一行一件事" in text
+
+    @pytest.mark.asyncio
+    async def test_no_change_line_is_success(self, store: Store, frozen_now: float, tmp_path: Path) -> None:
+        models = FakeModelsQueue(replies=["没有变化"])
+        p = _make(store, self._host(), models, _settings(tmp_path))
+        r = await p.tick(GID)
+        assert r.refreshed is True
+        assert _group(store)["pending_count"] == 0
+        assert len(models.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_bad_lines_skipped_good_lines_kept(self, store: Store, frozen_now: float, tmp_path: Path) -> None:
+        reply = "好的，结果如下：\n- 新增 | 最近在聊 | 在聊巫师三 | 1\n乱七八糟的一行\n新增 | 不存在的类别 | 这条不认 | 2"
+        models = FakeModelsQueue(replies=[reply])
+        p = _make(store, self._host(), models, _settings(tmp_path))
+        r = await p.tick(GID)
+        assert r.refreshed is True
+        assert [e["text"] for e in p.entries(GID)] == ["在聊巫师三"]
+
+    @pytest.mark.asyncio
+    async def test_people_and_asks_lines(self, store: Store, frozen_now: float, tmp_path: Path) -> None:
+        with store.tx() as conn:
+            conn.execute(
+                "INSERT INTO groups (group_id) VALUES (?) ON CONFLICT(group_id) DO NOTHING", (GID,))
+            conn.execute(
+                "INSERT INTO focus_members (group_id, user_id, name, removed) VALUES (?, 'u1', '阿一', 0)", (GID,))
+        reply = "关注成员 | u1 | 最近在做开源掌机项目\n没有变化"
+        models = FakeModelsQueue(replies=[reply])
+        p = _make(store, self._host(), models, _settings(tmp_path))
+        r = await p.tick(GID)
+        assert r.refreshed is True
+        note = store.read().execute(
+            "SELECT note FROM focus_members WHERE group_id=? AND user_id='u1'", (GID,)).fetchone()["note"]
+        assert "开源掌机" in note
+
+    @pytest.mark.asyncio
+    async def test_old_json_single_op_is_salvaged(self, store: Store, frozen_now: float, tmp_path: Path) -> None:
+        """线上 step-5-preview 常见回法：只给一条 op、没套 {"ops":[…]}——内容是对的，收下。"""
+        reply = '{"op":"add","id":"#38","category":"recent","text":"群友分享战锤40K新武器视频","evidence":[1]}'
+        models = FakeModelsQueue(replies=[reply])
+        p = _make(store, self._host(), models, _settings(tmp_path))
+        r = await p.tick(GID)
+        assert r.refreshed is True
+        assert [e["text"] for e in p.entries(GID)] == ["群友分享战锤40K新武器视频"]
+
+    @pytest.mark.asyncio
+    async def test_unreadable_asks_again_then_applies(self, store: Store, frozen_now: float, tmp_path: Path) -> None:
+        """回空 {} / 压扁成重复键：读不懂 → 带着「格式不对」再问一次。"""
+        flattened = '{"op":"add","category":"recent","text":"甲","op":"add","category":"recent","text":"乙"}'
+        models = FakeModelsQueue(replies=[flattened, "新增 | 最近在聊 | 重问后读懂了 | 1"])
+        p = _make(store, self._host(), models, _settings(tmp_path))
+        r = await p.tick(GID)
+        assert r.refreshed is True
+        assert [e["text"] for e in p.entries(GID)] == ["重问后读懂了"]
+        assert len(models.calls) == 2
+        second = str(models.calls[1][1])
+        assert "格式" in second and "没有变化" in second
+
+    @pytest.mark.asyncio
+    async def test_empty_object_twice_is_failure_not_success(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        models = FakeModelsQueue(replies=["{}", "{}"])
+        p = _make(store, self._host(), models, _settings(tmp_path))
+        r = await p.tick(GID)
+        assert r.refreshed is False
+        row = _group(store)
+        assert row["fail_count"] == 1
+        assert row["pending_count"] == 3  # 没收账，下次还能再整理
+
+    @pytest.mark.asyncio
+    async def test_big_batch_split_in_half_after_failure(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        """一批（≥40 条）整批失败：拆成两半各试一次，而不是原样重复。"""
+        models = FakeModelsQueue(replies=[
+            ModelError("网络错误（ReadTimeout）"),
+            "新增 | 最近在聊 | 前半段的话题 | 1",
+            "新增 | 最近在聊 | 后半段的话题 | 1",
+        ])
+        p = _make(store, self._host(60), models, _settings(tmp_path, batch_messages=3))
+        r = await p.tick(GID)
+        assert r.refreshed is True
+        assert sorted(e["text"] for e in p.entries(GID)) == ["前半段的话题", "后半段的话题"]
+        assert len(models.calls) == 3
+        assert "[31]" not in str(models.calls[1][1]) and "[30]" in str(models.calls[1][1])
+        assert _group(store)["pending_count"] == 0 and _group(store)["fail_count"] == 0

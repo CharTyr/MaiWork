@@ -236,10 +236,33 @@ class TestLifecycle:
         goals.cancel(gid)
         assert goals.get(gid)["state"] == "cancelled"
 
+    def test_repeated_cancel_is_idempotent_without_new_update(self, goals: Goals, fixed_clock):
+        gid = _mk_agent(goals)
+        goals.cancel(gid)
+        updated = goals.get(gid)["updated"]
+        fixed_clock[0] = NOW + 500
+        goals.cancel(gid)
+        assert goals.get(gid)["state"] == "cancelled"
+        assert goals.get(gid)["updated"] == updated
+
     def test_done(self, goals: Goals):
         gid = _mk_agent(goals)
         goals.done(gid)
         assert goals.get(gid)["state"] == "done"
+
+    def test_late_completion_cannot_revive_cancelled_goal(self, goals: Goals):
+        gid = _mk_agent(goals)
+        goals.cancel(gid)
+        with pytest.raises(ValueError, match="cancelled"):
+            goals.done(gid)
+        assert goals.get(gid)["state"] == "cancelled"
+
+    def test_late_completion_cannot_resume_paused_goal(self, goals: Goals):
+        gid = _mk_agent(goals)
+        goals.pause(gid)
+        with pytest.raises(ValueError, match="paused"):
+            goals.done(gid)
+        assert goals.get(gid)["state"] == "paused"
 
     def test_touch(self, goals: Goals, fixed_clock):
         gid = _mk_agent(goals)

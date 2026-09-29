@@ -292,6 +292,28 @@ def test_pushes_admin_unrestricted(tmp_path):
     assert ok2 is False
 
 
+def test_delivery_not_unconditionally_exempt_from_daily_limit_or_quiet_hours(tmp_path):
+    store, settings, p = _make_pushes(tmp_path, cfg={
+        "delivery": {"push_per_day": 1, "quiet_hours": "23:00-08:00"}
+    })
+    noon = datetime(2026, 9, 27, 12, tzinfo=BJ).timestamp()
+    late = datetime(2026, 9, 27, 23, 30, tzinfo=BJ).timestamp()
+    assert p.can_push(GID, "delivery", late) == (False, "睡觉时段")
+    p.record(GID, "delivery", "第一件交付", noon)
+    assert p.can_push(GID, "topic", noon)[0] is False  # 交付也占用当日主动推送额度
+    assert p.can_push(GID, "delivery", noon)[0] is False
+    assert p.can_push(GID, "awaited_delivery", late) == (True, "")  # 明确领取同时豁免两项
+
+
+
+def test_awaited_delivery_only_bypasses_quiet_hours(tmp_path):
+    store, settings, p = _make_pushes(tmp_path, cfg={
+        "delivery": {"push_per_day": 1, "quiet_hours": "23:00-08:00"}
+    })
+    late = datetime(2026, 9, 27, 23, 30, tzinfo=BJ).timestamp()
+    assert p.can_push(GID, "awaited_delivery", late) == (True, "")
+
+
 def test_pushes_sleep_window(tmp_path, monkeypatch):
     """睡觉时段内（23:00-08:00 北京时间）其他推送也不行。"""
     monkeypatch.delenv("TZ", raising=False)

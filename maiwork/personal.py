@@ -310,6 +310,9 @@ class Personal:
     # ------------------------------------------------------------------
 
     async def _collect(self, gid: str, focus_list: list[dict]) -> list[dict]:
+        # 时间盒：和群资讯同一个 [feeds] collect_minutes（2026-09-29 线上一轮跑了一个多小时）
+        settings = self._get_settings()
+        collect_minutes = max(1, int(getattr(settings.feeds, "collect_minutes", 15) or 15))
         lines = []
         for f in focus_list:
             lines.append(f"- {f['query']}" + (f"（原因：{f['why']}）" if f.get("why") else ""))
@@ -324,12 +327,14 @@ class Personal:
             "5. 每条：title、url、summary（2–4 句中文纯文本，别用 Markdown）、kind（一律 news）、"
             "published（ISO 或 epoch，拿不到就空字符串）、fetched（真打开过就 true）、"
             "quote（从原文抄一小段能支撑摘要的依据，≤200 字）、paywall；\n"
-            "6. 最后用 submit_result 交回，data 按约定的 JSON Schema。"
+            "6. 最后用 submit_result 交回，data 按约定的 JSON Schema；"
+            f"你只有大约 {collect_minutes} 分钟，到点前记得把已经找到的交回来（部分结果也算，不会丢）。"
         )
         report = await self._workers.run(
             brief,
             group_id=gid,
             tools=["web_search", "fetch_page"],
+            deadline_ts=clock.now() + collect_minutes * 60,
             output_schema={
                 "type": "object",
                 "properties": {

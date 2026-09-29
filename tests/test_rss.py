@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import socket
+
 import httpx
 import pytest
 
@@ -114,6 +116,15 @@ class TestFetchFeedSource:
         with pytest.raises(rss.RssError, match="DOCTYPE"):
             rss.parse_feed(evil, now=NOW, lookback_days=400)
 
+    def test_doctype_after_long_comment_is_rejected(self):
+        xml = "<!--" + "x" * 4096 + "-->" + "<!DOCTYPE rss>" + "<rss><channel><title>safe?</title></channel></rss>"
+        with pytest.raises(rss.RssError, match="DOCTYPE"):
+            rss.parse_feed(xml, now=NOW, lookback_days=30)
+
+    def test_doctype_text_inside_xml_comment_is_not_a_declaration(self):
+        xml = "<!-- harmless mention: <!DOCTYPE rss> -->" + "<rss><channel><title>ok</title></channel></rss>"
+        assert rss.parse_feed(xml, now=NOW, lookback_days=30)["title"] == "ok"
+
     @pytest.mark.asyncio
     async def test_not_xml_400(self):
         with pytest.raises(rss.RssError):
@@ -151,6 +162,91 @@ class TestFetchFeedSource:
         for bad in ("ftp://x/feed", "file:///etc/passwd", "", "javascript:alert(1)"):
             with pytest.raises(rss.RssError):
                 await rss.fetch_feed_source(bad, transport=None, lookback_days=30, now=NOW, limit=10)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", [
+        "http://127.0.0.1/feed", "https://127.1/feed", "http://2130706433/feed",
+        "http://0x7f000001/feed", "http://[::1]/feed", "http://[::ffff:127.0.0.1]/feed",
+        "http://10.10.0.2/feed", "http://169.254.169.254/latest/meta-data/",
+        "http://[fe80::1]/feed", "http://localhost/feed", "http://node.localhost/feed",
+        "http://user:password@public.example/feed", "http://@public.example/feed",
+    ])
+    async def test_rejects_private_hosts_and_userinfo_without_a_request(self, bad):
+        def must_not_request(_: httpx.Request) -> httpx.Response:
+            pytest.fail("Unsafe URL was sent to the HTTP transport")
+
+        out = await rss.fetch_feed_source(bad, transport=httpx.MockTransport(must_not_request), now=NOW)
+        assert out["items"] == []
+        assert out["error"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_dns_answer_containing_private_address(self, monkeypatch):
+        # No real DNS and no real HTTP client; one unsafe answer among public ones rejects the whole name.
+        def fake_dns(host, port, *args, **kwargs):
+            assert host == "news.example.com"
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.215.14", port)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.8", port)),
+            ]
+
+        monkeypatch.setattr(rss.socket, "getaddrinfo", fake_dns)
+        monkeypatch.setattr(rss.httpx, "AsyncClient", lambda *a, **kw: pytest.fail("No HTTP client for private DNS"))
+        out = await rss.fetch_feed_source("https://news.example.com/feed", now=NOW)
+        assert out["items"] == [] and out["error"]
+
+    @pytest.mark.asyncio
+    async def test_dns_failure_fails_closed(self, monkeypatch):
+        def fake_dns(*args, **kwargs):
+            raise socket.gaierror("DNS unavailable")
+
+        monkeypatch.setattr(rss.socket, "getaddrinfo", fake_dns)
+        monkeypatch.setattr(rss.httpx, "AsyncClient", lambda *a, **kw: pytest.fail("No HTTP client for failed DNS"))
+        out = await rss.fetch_feed_source("https://news.example.com/feed", now=NOW)
+        assert out["items"] == [] and out["error"]
+
+    @pytest.mark.asyncio
+    async def test_dns_encoding_failure_fails_closed(self, monkeypatch):
+        def fake_dns(*args, **kwargs):
+            raise UnicodeError("Invalid international domain")
+
+        monkeypatch.setattr(rss.socket, "getaddrinfo", fake_dns)
+        monkeypatch.setattr(rss.httpx, "AsyncClient", lambda *a, **kw: pytest.fail("No HTTP client for failed DNS"))
+        out = await rss.fetch_feed_source("https://news.example.com/feed", now=NOW)
+        assert out["items"] == [] and out["error"]
+
+    @pytest.mark.asyncio
+    async def test_production_connects_to_checked_ip_without_environment_proxy(self, monkeypatch):
+        seen = {}
+        def fake_dns(host, port, *args, **kwargs):
+            assert host == "news.example.com"
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.215.14", port))]
+
+        def fake_transport(*args, **kwargs):
+            seen["transport_options"] = kwargs
+            def handler(request: httpx.Request) -> httpx.Response:
+                seen["request"] = request
+                return httpx.Response(200, text="<rss><channel><title>ok</title></channel></rss>")
+            return httpx.MockTransport(handler)
+
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:8765")
+        monkeypatch.setattr(rss.socket, "getaddrinfo", fake_dns)
+        monkeypatch.setattr(rss.httpx, "AsyncHTTPTransport", fake_transport)
+        out = await rss.fetch_feed_source("https://news.example.com:444/feed", now=NOW)
+        assert out["title"] == "ok"
+        assert seen["transport_options"]["trust_env"] is False
+        assert seen["request"].url.host == "93.184.215.14"
+        assert seen["request"].headers["host"] == "news.example.com:444"
+        assert seen["request"].extensions["sni_hostname"] == "news.example.com"
+
+    @pytest.mark.asyncio
+    async def test_does_not_follow_redirects(self):
+        seen = []
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(str(request.url))
+            return httpx.Response(302, headers={"Location": "http://127.0.0.1/internal"})
+        out = await rss.fetch_feed_source("https://news.example.com/feed", transport=httpx.MockTransport(handler), now=NOW)
+        assert seen == ["https://news.example.com/feed"]
+        assert "302" in out["error"]
 
     @pytest.mark.asyncio
     async def test_response_too_big(self):
@@ -262,6 +358,13 @@ class TestKv:
         s = self._store(tmp_path)
         with pytest.raises(rss.RssError):
             rss.add_feed(s, "g1", url="ftp://x/feed", title="", feed_id="r1", now=NOW)
+
+    def test_add_rejects_private_hosts_and_userinfo(self, tmp_path):
+        s = self._store(tmp_path)
+        for bad in ("http://127.0.0.1/feed", "http://[::1]/feed", "http://user@public.example/feed"):
+            with pytest.raises(rss.RssError):
+                rss.add_feed(s, "g1", url=bad, title="", feed_id="r1", now=NOW)
+        assert rss.list_feeds(s, "g1") == []
 
     def test_mark_checked(self, tmp_path):
         s = self._store(tmp_path)

@@ -12,6 +12,8 @@ agent 目标（G-n）：群请 MaiWork 盯着或做出来的事，按完成标�
 from __future__ import annotations
 
 import json
+import sqlite3
+from contextlib import nullcontext
 from typing import Any, Callable, Iterable
 
 from . import clock
@@ -23,6 +25,12 @@ _RENEW_BEFORE_S = 1 * 86400
 _DONE_KEEP_S = 3 * 86400
 
 _AGENT_STATES = ("active", "paused", "done", "cancelled")
+_ALLOWED_STATE_CHANGES = {
+    "active": frozenset({"paused", "done", "cancelled"}),
+    "paused": frozenset({"active", "cancelled"}),
+    "done": frozenset(),
+    "cancelled": frozenset(),
+}
 
 # 报平安（docs/02 §4.3）：每次检查写 heartbeat_ts；连续 3 次出错、或超过
 # 2 倍检查间隔没心跳 → stale_reason。模型没配好不算卡住，只标「暂停检查」。
@@ -68,10 +76,12 @@ class Goals:
         by_text: str,
         request_id: str | None = None,
         icon: str = "bullseye",
+        conn: sqlite3.Connection | None = None,
     ) -> str:
+        """Create an agent goal; an optional caller-owned connection joins its transaction."""
         now = clock.now()
         crit = [{"text": str(c), "done": False} for c in criteria]
-        with self._store.tx() as conn:
+        with (self._store.tx() if conn is None else nullcontext(conn)) as conn:
             gid = next_id(conn, "G")
             conn.execute(
                 "INSERT INTO goals (id, group_id, kind, icon, title, body, by_text, criteria,"
@@ -171,6 +181,9 @@ class Goals:
             row = conn.execute("SELECT * FROM goals WHERE id=?", (str(goal_id),)).fetchone()
             if row is None:
                 raise KeyError(f"目标不存在: {goal_id}")
+            # 巡检的结果可能比管理员的暂停/取消晚到，不能再推进它。
+            if str(row["state"]) != "active":
+                return
             updates: dict[str, Any] = {"updated": float(now)}
             if t == "remind":
                 kind = str(row["kind"])
@@ -201,12 +214,18 @@ class Goals:
         if state not in _AGENT_STATES:
             raise ValueError(f"不认识的目标状态「{state}」")
         with self._store.tx() as conn:
-            cur = conn.execute(
-                "UPDATE goals SET state=?, updated=? WHERE id=?",
-                (state, clock.now(), str(goal_id)),
-            )
-            if cur.rowcount == 0:
+            row = conn.execute("SELECT state FROM goals WHERE id=?", (str(goal_id),)).fetchone()
+            if row is None:
                 raise KeyError(f"目标不存在: {goal_id}")
+            previous = str(row["state"])
+            if state == previous:
+                return  # 重复取消/暂停保持幂等，但绝不允许取消/暂停再变成 done
+            if state not in _ALLOWED_STATE_CHANGES.get(previous, frozenset()):
+                raise ValueError(f"目标 {goal_id} 不能从「{previous}」改成「{state}」")
+            conn.execute(
+                "UPDATE goals SET state=?, updated=? WHERE id=? AND state=?",
+                (state, clock.now(), str(goal_id), previous),
+            )
 
     def pause(self, goal_id: str) -> None:
         self._set_state(goal_id, "paused")

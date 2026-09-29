@@ -238,6 +238,86 @@ class TestReconcileOnConfigChange:
         finally:
             await app.stop()
 
+    async def test_removed_group_cancels_already_running_and_reviewing_tasks(self, tmp_path: Path) -> None:
+        app = _app(tmp_path, _raw(tmp_path / "data", groups=[G1, G2]))
+        await app.start()
+        try:
+            now = clock.now()
+            with app.store.tx() as conn:
+                for tid, gid, status in (
+                    ("T-gone-running", G2, "running"),
+                    ("T-gone-reviewing", G2, "reviewing"),
+                    ("T-keep-running", G1, "running"),
+                ):
+                    conn.execute(
+                        "INSERT INTO tasks (id, group_id, workspace, title, status, created, updated)"
+                        " VALUES (?, ?, 'ws', '执行中', ?, ?, ?)",
+                        (tid, gid, status, now, now),
+                    )
+            stopped: list[str] = []
+            app.cancel_task_run = lambda tid: stopped.append(tid) or True
+            await app.update_config(_raw(tmp_path / "data", groups=[G1]))
+            statuses = {r["id"]: r["status"] for r in app.store.read().execute(
+                "SELECT id, status FROM tasks WHERE id LIKE 'T-%-running' OR id='T-gone-reviewing'"
+            )}
+            assert statuses["T-gone-running"] == "cancelled"
+            assert statuses["T-gone-reviewing"] == "cancelled"
+            assert statuses["T-keep-running"] == "running"
+            assert set(stopped) == {"T-gone-running", "T-gone-reviewing"}
+        finally:
+            await app.stop()
+
+    async def test_start_interrupts_orphaned_work_instead_of_replaying(self, tmp_path: Path) -> None:
+        data_dir = tmp_path / "data"
+        db_file = data_dir / "maiwork.db"
+        db_file.parent.mkdir(parents=True)
+        store = Store(db_file)
+        store.migrate()
+        now = clock.now()
+        with store.tx() as conn:
+            for tid, status in (("T-crashed-running", "running"), ("T-crashed-review", "reviewing")):
+                conn.execute(
+                    "INSERT INTO tasks (id, group_id, workspace, title, status, created, updated)"
+                    " VALUES (?, ?, 'ws', '中断的任务', ?, ?, ?)",
+                    (tid, G1, status, now, now),
+                )
+        store.close()
+        app = _app(tmp_path, _raw(data_dir, groups=[G1]))
+        await app.start()
+        try:
+            for tid in ("T-crashed-running", "T-crashed-review"):
+                task = app.tasks.get(tid)
+                assert task["status"] == "paused"
+                events = app.store.read().execute(
+                    "SELECT payload FROM events WHERE entity_id=? AND kind='task.paused'", (tid,)
+                ).fetchall()
+                assert events and "中断" in str(events[-1]["payload"])
+            dispatched: list[str] = []
+            app.spawn_run_task = lambda tid: dispatched.append(tid)
+            app._tasks_round(now)
+            assert not dispatched
+        finally:
+            await app.stop()
+
+    async def test_clean_stop_pauses_running_task_and_stales_attempt(self, tmp_path: Path) -> None:
+        data_dir = tmp_path / "data"
+        app = _app(tmp_path, _raw(data_dir, groups=[G1]))
+        await app.start()
+        tid = app.tasks.create(G1, title="执行中", req="做好", criteria=[], source="test")
+        app.tasks.transition(tid, "running")
+        app.tasks.start_attempt(tid)
+        await app.stop()
+        reopened = Store(data_dir / "maiwork.db")
+        try:
+            task = reopened.read().execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+            attempt = reopened.read().execute(
+                "SELECT status FROM attempts WHERE task_id=? ORDER BY n DESC LIMIT 1", (tid,)
+            ).fetchone()
+            assert task["status"] == "paused"
+            assert attempt["status"] == "stale"
+        finally:
+            reopened.close()
+
     async def test_start_marks_residual_from_earlier_db(self, tmp_path: Path) -> None:
         """冷启动：库里本来就有 G2 残留（上次在配置里、这次不在了），start 时标掉。"""
         data_dir = tmp_path / "data"

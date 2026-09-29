@@ -248,6 +248,13 @@ class TestKeepManual:
         assert h.models.calls == []
 
     @pytest.mark.asyncio
+    async def test_empty_group_never_calls_model(self, tmp_path) -> None:
+        h = _setup(tmp_path, replies=[_OK], serve=(G1,))
+        r = h.create(group_id="")
+        assert await h.reviewer.review(r["id"]) is None
+        assert h.models.calls == []
+
+    @pytest.mark.asyncio
     async def test_review_disabled_calls_nothing(self, tmp_path) -> None:
         h = _setup(tmp_path, replies=[_OK], approval={"auto_review": False, "auto_review_daily": 5})
         r = h.create()
@@ -434,6 +441,51 @@ class TestDailyCap:
         await h.reviewer.review(h.create(group_id=G1)["id"])
         assert await h.reviewer.review(h.create(group_id=G2)["id"]) is not None
         assert len(h.models.calls) == 2
+
+
+    @pytest.mark.asyncio
+    async def test_two_concurrent_approvals_cannot_exceed_cap_one(self, tmp_path) -> None:
+        import asyncio
+        from types import SimpleNamespace
+
+        h = _setup(tmp_path, approval={"auto_review": True, "auto_review_daily": 1})
+        first, second = h.create()["id"], h.create()["id"]
+        entered = 0
+        both_entered = asyncio.Event()
+
+        async def judged(*args, **kwargs):
+            nonlocal entered
+            entered += 1
+            if entered == 2:
+                both_entered.set()
+            await both_entered.wait()
+            return SimpleNamespace(text=_OK)
+
+        h.models.chat = judged
+        results = await asyncio.wait_for(asyncio.gather(
+            h.reviewer.review(first), h.reviewer.review(second)
+        ), timeout=2)
+        assert sum(res is not None for res in results) == 1
+        assert sorted([h.status(first)["status"], h.status(second)["status"]]) == ["approved", "pending"]
+        assert h.kv(f"auto_review.day.{G1}") == {"day": clock.day_key(NOW), "n": 1}
+        assert len(h.started) == 1
+
+    @pytest.mark.asyncio
+    async def test_landing_failure_does_not_use_quota_and_can_retry(self, tmp_path, monkeypatch) -> None:
+        h = _setup(tmp_path, replies=[_OK, _OK], approval={"auto_review_daily": 1})
+        rid = h.create()["id"]
+        original = h.tasks.create
+
+        def broken_task(*args, **kwargs):
+            raise RuntimeError("cannot create task")
+
+        monkeypatch.setattr(h.tasks, "create", broken_task)
+        assert await h.reviewer.review(rid) is None
+        assert h.status(rid)["status"] == "pending"
+        assert h.kv(f"auto_review.day.{G1}") is None
+        monkeypatch.setattr(h.tasks, "create", original)
+        assert await h.reviewer.review(rid) is not None
+        assert h.kv(f"auto_review.day.{G1}")["n"] == 1
 
 
 # ----------------------------------------------------------------------

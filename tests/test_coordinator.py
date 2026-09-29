@@ -296,6 +296,57 @@ def _review(pass_=True, artifact="artifacts/T-1/index.html", review="看着不�
 # ---------------------------------------------------------------------------
 
 
+async def test_run_task_does_not_start_after_group_removed(
+    mem_store: Store, settings, env, tools, tasks, goals
+):
+    tid = _create_task(tasks)
+    settings.is_served = lambda group_id: False
+    models = ModelsQueue(replies=[_plan()])
+    coordinator = _build(
+        mem_store=mem_store, settings=settings, env=env, tools=tools, tasks=tasks,
+        goals=goals, models=models, workers=FakeWorkers(),
+    )
+    await coordinator.run_task(tid)
+    assert tasks.get(tid)["status"] == "queued"
+    assert models.calls == []
+
+
+async def test_review_rejects_artifact_from_other_task_directory(
+    mem_store: Store, settings, env, tools, tasks, goals
+):
+    tid = _create_task(tasks)
+    ws = env.workspace(tasks.get(tid)["workspace"])
+    misplaced = ws / "artifacts" / "T-other" / "index.html"
+    misplaced.parent.mkdir(parents=True, exist_ok=True)
+    misplaced.write_text("<html>不是本任务成品</html>", encoding="utf-8")
+    models = ModelsQueue(replies=[_review(artifact="artifacts/T-other/index.html")])
+    coordinator = _build(
+        mem_store=mem_store, settings=settings, env=env, tools=tools,
+        tasks=tasks, goals=goals, models=models, workers=FakeWorkers(),
+    )
+    review = await coordinator._review(tasks.get(tid), {"criteria": ["真实产物"], "deliver_kind": "view"},
+                                        "完成", ["evidence"], [])
+    assert review["pass"] is False
+    assert "本任务" in review["review"]
+
+
+async def test_handle_passed_missing_artifact_is_not_completed(
+    mem_store: Store, settings, env, tools, tasks, goals
+):
+    tid = _create_task(tasks)
+    tasks.transition(tid, "running")
+    tasks.transition(tid, "reviewing")
+    coordinator = _build(
+        mem_store=mem_store, settings=settings, env=env, tools=tools,
+        tasks=tasks, goals=goals, models=ModelsQueue(), workers=FakeWorkers(),
+    )
+    await coordinator._handle_passed(
+        tid, GID, tasks.get(tid)["workspace"], {"deliver_kind": "file"},
+        {"review": "通过", "note": "好了", "artifact": "artifacts/T-other/missing.txt"},
+    )
+    assert tasks.get(tid)["status"] != "completed"
+
+
 async def test_run_task_success_view_delivered(
     mem_store: Store, settings, env, tools, tasks, goals, tmp_path
 ):
@@ -568,7 +619,7 @@ async def test_same_workspace_tasks_serialized(
     tid1 = _create_task(tasks, title="任务1")
     tid2 = _create_task(tasks, title="任务2")  # 同群 → 同工作区
     models = ModelsQueue(
-        replies=[_plan(), _review(), _plan(), _review()]
+        replies=[_plan(), _review(), _plan(), _review(artifact="artifacts/T-2/index.html")]
     )
     entered: list[str] = []
     order: list[str] = []
@@ -714,6 +765,52 @@ async def test_model_error_marks_failed_and_reports(
     assert len(err_msgs) >= 1
 
 
+@pytest.mark.parametrize("state", ["cancelled", "paused"])
+async def test_late_plan_failure_after_stop_does_not_report_to_group(
+    mem_store: Store, settings, env, tools, tasks, goals, state: str
+):
+    tid = _create_task(tasks)
+
+    class _LateFailure(ModelsQueue):
+        async def chat(self, role, messages, **kwargs):
+            tasks.transition(tid, state, reason="管理员已停止")
+            raise ModelError("晚到的模型异常")
+
+    outbox = FakeOutbox()
+    coordinator = _build(
+        mem_store=mem_store, settings=settings, env=env, tools=tools,
+        tasks=tasks, goals=goals, models=_LateFailure(), workers=FakeWorkers(), outbox=outbox,
+    )
+    await coordinator.run_task(tid)
+    assert tasks.get(tid)["status"] == state
+    assert not outbox.enqueued
+    assert mem_store.read().execute("SELECT COUNT(*) c FROM error_reports").fetchone()["c"] == 0
+    attempt = mem_store.read().execute("SELECT status FROM attempts WHERE task_id=?", (tid,)).fetchone()
+    assert attempt["status"] == "stale"
+
+
+async def test_old_attempt_error_cannot_fail_new_running_attempt(
+    mem_store: Store, settings, env, tools, tasks, goals
+):
+    tid = _create_task(tasks)
+    tasks.transition(tid, "running")
+    tasks.start_attempt(tid)
+    old_id = tasks.current_attempt_id(tid)
+    tasks.transition(tid, "paused")
+    tasks.transition(tid, "queued")
+    tasks.transition(tid, "running")
+    tasks.start_attempt(tid)
+    outbox = FakeOutbox()
+    coordinator = _build(
+        mem_store=mem_store, settings=settings, env=env, tools=tools,
+        tasks=tasks, goals=goals, models=ModelsQueue(), workers=FakeWorkers(), outbox=outbox,
+    )
+    coordinator._fail_with_err(tid, old_id, "旧尝试的晚到错误", GID)
+    assert tasks.get(tid)["status"] == "running"
+    assert mem_store.read().execute("SELECT status FROM attempts WHERE id=?", (old_id,)).fetchone()["status"] == "stale"
+    assert outbox.enqueued == []
+
+
 # ---------------------------------------------------------------------------
 # check_goal：勾选完成标准、新建下级任务、无新信息不发消息、全满足 → done
 # ---------------------------------------------------------------------------
@@ -775,6 +872,60 @@ async def test_check_goal_ticks_criteria_and_creates_task(
     assert len(rows) == 1
     assert rows[0]["title"] == "把测试跑起来"
     assert rows[0]["source"] == "goal"
+
+
+@pytest.mark.parametrize("stopped", ["cancelled", "paused"])
+async def test_check_goal_discards_late_model_result_after_stop(
+    mem_store: Store, settings, env, tools, tasks, goals, stopped
+):
+    goal_id = _seed_goal(goals)
+    models = ModelsQueue()
+    workers = FakeWorkers()
+    outbox = FakeOutbox()
+    coordinator = _build(
+        mem_store=mem_store, settings=settings, env=env, tools=tools,
+        tasks=tasks, goals=goals, models=models, workers=workers, outbox=outbox,
+    )
+
+    async def late_reply(*args, **kwargs):
+        # 模拟主模型请求还在等待时，管理员取消或暂停了目标。
+        (goals.cancel if stopped == "cancelled" else goals.pause)(goal_id)
+        return ReplayChatResult(json.dumps({
+            "done_criteria": [0, 1], "next_check_hours": 1,
+            "progress": "晚到进展", "new_task": {"title": "晚到任务", "req": "不能执行"},
+            "report": "晚到汇报",
+        }, ensure_ascii=False))
+
+    models.chat = late_reply
+    await coordinator.check_goal(goal_id)
+    goal = goals.get(goal_id)
+    assert goal["state"] == stopped
+    assert goal["heartbeat_ts"] is None
+    assert goal["last_text"] in (None, "")
+    assert mem_store.read().execute("SELECT COUNT(*) FROM tasks WHERE goal_id=?", (goal_id,)).fetchone()[0] == 0
+    assert outbox.enqueued == []
+    assert workers.calls == []
+
+
+async def test_check_goal_does_not_report_late_failure_after_cancel(
+    mem_store: Store, settings, env, tools, tasks, goals
+):
+    goal_id = _seed_goal(goals)
+    models = ModelsQueue()
+    outbox = FakeOutbox()
+    coordinator = _build(
+        mem_store=mem_store, settings=settings, env=env, tools=tools,
+        tasks=tasks, goals=goals, models=models, workers=FakeWorkers(), outbox=outbox,
+    )
+
+    async def late_failure(*args, **kwargs):
+        goals.cancel(goal_id)
+        raise ModelError("请求已经取消，模型超时的错误不该进群")
+
+    models.chat = late_failure
+    await coordinator.check_goal(goal_id)
+    assert goals.get(goal_id)["state"] == "cancelled"
+    assert outbox.enqueued == []
 
 
 async def test_check_goal_no_new_info_silences(
@@ -1079,14 +1230,14 @@ async def _deliver_with_artifact(
 async def test_delivery_rejects_outside_task_artifact_dir(
     mem_store: Store, settings, env, tools, tasks, goals, artifact: str
 ):
-    """".", "tasks/x.txt", "artifacts/别的任务/x" → 不交付，任务照常 completed。"""
+    """".", "tasks/x.txt", "artifacts/别的任务/x" → 不交付，也不能标已完成。"""
     tid = _create_task(tasks)
     files = {"tasks/x.txt": "内部草稿", "artifacts/T-其他/index.html": "<html>别人的</html>"}
     task, delivery = await _deliver_with_artifact(
         mem_store, settings, env, tools, tasks, goals, tid, artifact, files
     )
-    assert task["status"] == "completed"          # 任务照常结束（不卡住）
-    assert delivery.delivered == []               # 但一个渠道都没发
+    assert task["status"] == "failed"             # 找不到合规成品不冒充完成
+    assert delivery.delivered == []               # 一个渠道都没发
 
 
 async def test_delivery_rejects_symlink_escape(
@@ -1110,7 +1261,7 @@ async def test_delivery_rejects_symlink_escape(
     await coordinator.run_task(tid)
     assert delivery.delivered == []
     # 1 次不通过后重试 3 次 → failed；关键是**从来没交付**
-    assert tasks.get(tid)["status"] in ("completed", "failed")
+    assert tasks.get(tid)["status"] == "failed"
 
 
 async def test_delivery_allows_file_inside_task_artifact_dir(

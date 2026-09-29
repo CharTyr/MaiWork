@@ -27,11 +27,10 @@ logger = logging.getLogger("maiwork.delivery")
 HEADER = "【MaiWork 备忘】话题相关时可以自然提起，不必每条都说："
 MAX_TEXT_LENGTH = 300  # 备忘总文字 ≤300 字
 MARKER = "【MaiWork 备忘】"  # 已注入标记：inject 排重用（不含「话题相关时可以自然提起」整段）
-# 不受每日上限和睡觉时段限制的推送类型：
-# error=故障报错，command=/mw改造回复，delivery=用户当时正在等的交付（02 §6.4）。
-# admin=管理员在网页对话里当场让发的消息（管理员本人拍板，不该被睡觉/上限拦）。
-# topic / status / reminder 照旧受限。
-_UNLIMITED_KINDS = ("error", "command", "delivery", "admin")
+# 普通交付算主动推送；只有群友用 /mw 领取 <任务号> 当场索取时，
+# 才把待发的本任务成品升级为 awaited_delivery。它与故障及指令回执一样不受
+# 睡觉时段/每日额度限制，仍记发送审计；不要把所有 delivery 都豁免。
+PUSH_EXEMPT_KINDS = frozenset(("error", "command", "admin", "awaited_delivery"))
 
 # MaiBot 上下文里聊天消息形如 `<message msg_id="..">文本</message>` 的 text part
 # （出处：reference/jev/processor.py 的 _parse_chat_message）；
@@ -448,8 +447,11 @@ class Mentions:
     # maisaka.planner.before_request 钩子
     # ------------------------------------------------------------------
 
-    def inject(self, kwargs: dict) -> Optional[dict]:
+    def inject(self, kwargs: dict, *, group_id: str = "") -> Optional[dict]:
         """追加到第一个 SystemMessageItem 最后一个 text part。
+
+        group_id 由已验证服务群的 planner 钩子传入；不再按同一个 session_id
+        二次查库决定群，避免历史/歧义会话映射把隔壁群备忘注入当前群。
 
         - 取 kwargs["items"]（list）；没有 / 不是 list → None。
         - 找第一个 item_type=="SystemMessageItem" 的 item，它最后一个 type=="text" 的 part。
@@ -485,9 +487,17 @@ class Mentions:
             session_id = str(kwargs.get("session_id") or "")
             if not session_id:
                 return None
-            gid = self._resolve_group(session_id)
-            if not gid:
-                return None
+            if group_id:
+                gid = str(group_id)
+                try:
+                    if not self._get_settings().is_served(gid):
+                        return None
+                except Exception:
+                    return None
+            else:
+                gid = self._resolve_group(session_id)
+                if not gid:
+                    return None
             memo = self._memo_with_topics(gid, kwargs)
             if memo is None:
                 return None
@@ -526,12 +536,12 @@ class Pushes:
         self._get_settings = get_settings
 
     def can_push(self, group_id: str, kind: str, now: float) -> tuple[bool, str]:
-        """决定能不能推。kind="error" / "command" 永远 True。
+        """决定能不能推。故障、指令回执和明确领取的成品即时发送。
 
         now 决定「用哪一天的额度」和「是不是在睡觉时段」。
         """
         kind = str(kind or "")
-        if kind in _UNLIMITED_KINDS:
+        if kind in PUSH_EXEMPT_KINDS:
             return True, ""
         settings = self._get_settings()
         # 睡觉时段
@@ -549,7 +559,7 @@ class Pushes:
         return True, ""
 
     def record(self, group_id: str, kind: str, text: str, now: float) -> None:
-        """记一条推送。任何 kind 都记（error / command 也是），只是不算上限。"""
+        """任何 kind 都留发送记录；豁免种类不占每日额度。"""
         with self._store.tx() as conn:
             conn.execute(
                 "INSERT INTO pushes (group_id, ts, day, kind, text) VALUES (?, ?, ?, ?, ?)",
@@ -557,14 +567,15 @@ class Pushes:
             )
 
     def _count_for_day(self, group_id: str, ts: float, kind: Optional[str]) -> int:
-        """ts 所在北京那一天推过几条。kind=None 算所有「受限」推送（不含豁免类型）。"""
+        """ts 所在北京那一天推过几条。kind=None 只算需要节制的推送。"""
         day = clock.day_key(float(ts))
         if kind is None:
-            placeholders = ", ".join("?" for _ in _UNLIMITED_KINDS)
+            exempt = tuple(sorted(PUSH_EXEMPT_KINDS))
+            placeholders = ", ".join("?" for _ in exempt)
             row = self._store.read().execute(
                 "SELECT COUNT(*) AS c FROM pushes"
                 f" WHERE group_id=? AND day=? AND kind NOT IN ({placeholders})",
-                (str(group_id), day, *_UNLIMITED_KINDS),
+                (str(group_id), day, *exempt),
             ).fetchone()
         else:
             row = self._store.read().execute(

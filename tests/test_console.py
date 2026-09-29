@@ -64,7 +64,7 @@ async def env(tmp_path: Path):
     网页改配置会写插件目录下的 config.toml：给每个测试造一个临时插件目录
     （不碰仓库里的真插件目录）。
     """
-    raw = _raw_config(tmp_path / "data")
+    raw = _raw_config(tmp_path / "data", environments={"workspace_root": str(tmp_path / "workspaces")})
     plug_dir = tmp_path / "plug"
     plug_dir.mkdir()
     import tomlkit
@@ -1494,6 +1494,92 @@ class TestM3Routes:
         assert row["status"] == "pending"  # failed 的重新排队
         row = env.app.store.read().execute("SELECT status FROM outbox WHERE key=?", (f"task:{tid}:done",)).fetchone()
         assert row["status"] == "sent"  # sent 的不动
+
+    @pytest.mark.asyncio
+    async def test_task_redeliver_does_not_requeue_removed_group(self, env: SimpleEnv) -> None:
+        from dataclasses import replace
+
+        await env.login()
+        tid = self._make_task(env.app, G1)
+        oid = env.app.outbox.enqueue(
+            f"task:{tid}:deliver", G1, "file",
+            {"path": "missing", "push_kind": "delivery"}, task_id=tid,
+        )
+        with env.app.store.tx() as conn:
+            conn.execute("UPDATE outbox SET status='failed' WHERE id=?", (oid,))
+        before = env.app.base_settings()
+        env.app._settings = replace(before, groups={G2: before.groups[G2]})
+        r = await env.client.post(f"/api/tasks/{tid}/redeliver", json={})
+        assert r.status == 409
+        row = env.app.store.read().execute("SELECT status FROM outbox WHERE id=?", (oid,)).fetchone()
+        assert row["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_task_redeliver_recreates_missing_text_outbox(self, env: SimpleEnv) -> None:
+        await env.login()
+        tid = self._make_task(env.app)
+        env.app.tasks.transition(tid, "running")
+        env.app.tasks.transition(tid, "reviewing")
+        env.app.tasks.transition(tid, "completed", delivery_kind="text")
+        assert env.app.delivery.undelivered(tid)
+        r = await env.client.post(f"/api/tasks/{tid}/redeliver", json={})
+        assert r.status == 200
+        rows = env.app.store.read().execute(
+            "SELECT key, status, payload FROM outbox WHERE task_id=?", (tid,)
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["key"] == f"task:{tid}:deliver:text"
+        assert rows[0]["status"] == "pending"
+        assert "整理资料" in json.loads(rows[0]["payload"])["text"]
+        # 重复点不额外入队，也不能因此重传已经发送的成品。
+        assert (await env.client.post(f"/api/tasks/{tid}/redeliver", json={})).status == 200
+        assert env.app.store.read().execute(
+            "SELECT COUNT(*) c FROM outbox WHERE task_id=?", (tid,)
+        ).fetchone()["c"] == 1
+
+    @pytest.mark.asyncio
+    async def test_task_redeliver_rechecks_missing_file_artifact(self, env: SimpleEnv) -> None:
+        await env.login()
+        tid = self._make_task(env.app)
+        task = env.app.tasks.get(tid)
+        ws = env.app.env.workspace(task["workspace"])
+        artifact = ws / "artifacts" / tid / "report.txt"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text("成品", encoding="utf-8")
+        env.app.tasks.transition(tid, "running")
+        env.app.tasks.start_attempt(tid)
+        env.app.tasks.finish_attempt(
+            env.app.tasks.current_attempt_id(tid), status="passed",
+            artifacts=[f"artifacts/{tid}/report.txt"],
+        )
+        env.app.tasks.transition(tid, "reviewing")
+        env.app.tasks.transition(tid, "completed", delivery_kind="file")
+        r = await env.client.post(f"/api/tasks/{tid}/redeliver", json={})
+        assert r.status == 200
+        row = env.app.store.read().execute(
+            "SELECT status, payload FROM outbox WHERE key=?", (f"task:{tid}:deliver",)
+        ).fetchone()
+        assert row is not None and row["status"] == "pending"
+        assert json.loads(row["payload"])["path"] == str(artifact)
+
+    @pytest.mark.asyncio
+    async def test_task_redeliver_rejects_missing_or_escaped_artifact(self, env: SimpleEnv, tmp_path: Path) -> None:
+        await env.login()
+        tid = self._make_task(env.app)
+        outside = tmp_path / "private.txt"
+        outside.write_text("不许发送", encoding="utf-8")
+        env.app.tasks.transition(tid, "running")
+        env.app.tasks.start_attempt(tid)
+        env.app.tasks.finish_attempt(
+            env.app.tasks.current_attempt_id(tid), status="passed", artifacts=[str(outside)],
+        )
+        env.app.tasks.transition(tid, "reviewing")
+        env.app.tasks.transition(tid, "completed", delivery_kind="file")
+        r = await env.client.post(f"/api/tasks/{tid}/redeliver", json={})
+        assert r.status == 409
+        assert env.app.store.read().execute(
+            "SELECT COUNT(*) c FROM outbox WHERE task_id=?", (tid,)
+        ).fetchone()["c"] == 0
 
     # ---------- 目标操作 ----------
 

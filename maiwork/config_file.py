@@ -78,6 +78,10 @@ def _write_backup(data_dir: Path | str, old_text: str) -> Path:
         raise ConfigFileError(f"建配置备份目录失败（{bdir}）：{e}") from None
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
     path = bdir / f"{CONFIG_FILENAME}-{stamp}-{int(time.time() * 1000) % 1_000_000:06d}"
+    n = 1
+    while path.exists():  # 同一毫秒内连写两次：别互相覆盖（机器忙时实测会撞名）
+        path = bdir / f"{CONFIG_FILENAME}-{stamp}-{int(time.time() * 1000) % 1_000_000:06d}-{n}"
+        n += 1
     try:
         path.write_text(old_text, encoding="utf-8")
         os.chmod(path, stat.S_IMODE(0o600))

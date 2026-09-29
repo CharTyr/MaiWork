@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from typing import Any, Callable, Iterable
 
 from . import clock
@@ -174,8 +175,11 @@ class Approvals:
                 group_id=gid, entity="request", entity_id=rid,
                 payload={"title": _norm(title), "kind": kind_s, "auto": auto, "source": _norm(source)},
             )
+            # 免批路径也必须让请求与其产出的所有任务/目标同生共死。
+            landed = self._land(conn, self._request_row(conn, rid), by="自动批准", auto=True) if auto else None
         if auto:
-            return self._land(rid, by="自动批准", auto=True)
+            assert landed is not None
+            return landed
         self._notify_review(rid, gid)
         return {"id": rid, "status": "pending", "auto": None}
 
@@ -196,21 +200,44 @@ class Approvals:
         except Exception:
             logger.debug("自动审核回调出错（请求 %s），这条留给人批", request_id, exc_info=True)
 
-    def approve(self, request_id: str, *, by: str, auto_reason: str = "") -> dict:
-        """批准一条待批请求（人批和自动审核走的是同一条路）。
+    def approve(
+        self, request_id: str, *, by: str, auto_reason: str = "",
+        auto_daily: tuple[str, int] | None = None,
+    ) -> dict:
+        """Approve and land as one transaction. Auto review additionally reserves its daily slot.
 
-        `auto_reason` 只在自动审核通过时给（存 requests.auto_reason，网页任务里能看到
-        「自动审核通过：<理由>」）；人批留空。
+        ``auto_daily=(Beijing day, cap)`` is for auto review only: quota check,
+        request decision, all work creation and counter increment commit together.
         """
         rid = _norm(request_id)
-        row = self._get(rid)
-        if row is None:
-            raise KeyError(f"请求不存在: {request_id}")
-        if str(row["status"]) != "pending":
-            raise ValueError(f"请求 {rid} 已经在「{row['status']}」状态，不能再批准")
         now = clock.now()
         reason_s = _norm(auto_reason)
         with self._store.tx() as conn:
+            row = self._request_row(conn, rid)
+            if row is None:
+                raise KeyError(f"请求不存在: {request_id}")
+            if str(row["status"]) != "pending":
+                raise ValueError(f"请求 {rid} 已经在「{row['status']}」状态，不能再批准")
+            quota: tuple[str, str, int] | None = None
+            if auto_daily is not None:
+                day, cap = auto_daily
+                if str(row["kind"]) != "task" or row["force_manual"] or row["source"] == "maiwork":
+                    raise ValueError("这条请求必须由管理员批准")
+                if row["idea_id"] is not None and any(
+                    it["kind"] == "goal" for it in self.picked_idea_items(row)
+                ):
+                    raise ValueError("包含目标的构想必须由管理员批准")
+                gid = str(row["group_id"])
+                key = f"auto_review.day.{gid}"
+                old = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+                try:
+                    counter = json.loads(old["value"]) if old is not None else None
+                    n = max(0, int(counter.get("n") or 0)) if isinstance(counter, dict) and counter.get("day") == day else 0
+                except (TypeError, ValueError):
+                    n = 0
+                if not gid or cap <= 0 or n >= cap:
+                    raise ValueError("这个群今天的自动批准额度已满")
+                quota = (key, day, n + 1)
             conn.execute(
                 "UPDATE requests SET status='approved', decided_by=?, decided_ts=?,"
                 " auto_reason=?, updated=? WHERE id=?",
@@ -223,17 +250,21 @@ class Approvals:
                 conn, "request.approved", group_id=str(row["group_id"]),
                 entity="request", entity_id=rid, payload=payload,
             )
-        return self._land(rid, by=_norm(by), auto=False)
+            landed = self._land(conn, row, by=_norm(by), auto=False)
+            if quota is not None:
+                key, day, n = quota
+                self._store.kv_set(conn, key, {"day": day, "n": n})
+        return landed
 
     def reject(self, request_id: str, *, by: str) -> dict:
         rid = _norm(request_id)
-        row = self._get(rid)
-        if row is None:
-            raise KeyError(f"请求不存在: {request_id}")
-        if str(row["status"]) != "pending":
-            raise ValueError(f"请求 {rid} 已经在「{row['status']}」状态，不能再拒绝")
         now = clock.now()
         with self._store.tx() as conn:
+            row = self._request_row(conn, rid)
+            if row is None:
+                raise KeyError(f"请求不存在: {request_id}")
+            if str(row["status"]) != "pending":
+                raise ValueError(f"请求 {rid} 已经在「{row['status']}」状态，不能再拒绝")
             conn.execute(
                 "UPDATE requests SET status='rejected', decided_by=?, decided_ts=?, updated=? WHERE id=?",
                 (_norm(by), now, now, rid),
@@ -250,15 +281,12 @@ class Approvals:
                 )
         return {"id": rid, "status": "rejected", "auto": False, "task_id": None, "goal_id": None}
 
-    def _land(self, request_id: str, *, by: str, auto: bool) -> dict:
-        """把已批准的请求落成 task / goal；把 request.task_id / goal_id 指回去。
+    def _land(self, conn: sqlite3.Connection, row: dict, *, by: str, auto: bool) -> dict:
+        """在批准请求的事务中创建所有 task / goal 并回写引用。
 
-        2026-10：请求来自**带项目的构想**时，按选中的项目逐个建（kind=task → 任务排队、
-        kind=goal → agent 目标）；标题 / 正文用项目的 title + desc，并带上构想上下文。
-        老构想（items 为空）或群友直接派活：照旧建一个。
+        构想选中的项目逐个建，任何一个失败即回滚整条请求与全部项目。
         """
-        row = self._get(request_id)
-        assert row is not None
+        request_id = str(row["id"])
         kind = str(row["kind"])
         gid = str(row["group_id"])
         requester_name = str(row["requester_name"])
@@ -283,6 +311,7 @@ class Approvals:
                             by_text=by_text,
                             request_id=request_id,
                             icon=str(row["icon"] or "bullseye"),
+                            conn=conn,
                         )
                     )
                 else:
@@ -298,6 +327,7 @@ class Approvals:
                             request_id=request_id,
                             icon=str(row["icon"] or "package"),
                             status="queued",
+                            conn=conn,
                         )
                     )
         elif kind == "task":
@@ -313,6 +343,7 @@ class Approvals:
                     request_id=request_id,
                     icon=str(row["icon"] or "package"),
                     status="queued",
+                    conn=conn,
                 )
             )
         else:  # goal
@@ -325,32 +356,23 @@ class Approvals:
                     by_text=by_text,
                     request_id=request_id,
                     icon=str(row["icon"] or "bullseye"),
+                    conn=conn,
                 )
             )
         task_id = task_ids[0] if task_ids else None
         goal_id = goal_ids[0] if goal_ids else None
         now = clock.now()
-        with self._store.tx() as conn:
+        conn.execute(
+            "UPDATE requests SET task_id=?, goal_id=?, task_ids=?, updated=? WHERE id=?",
+            (task_id, goal_id, json.dumps(task_ids, ensure_ascii=False), now, request_id),
+        )
+        if row["idea_id"] is not None and (task_id is not None or goal_id is not None):
+            # 保留已 started 的构想原指向；其它状态和请求一起提交。
             conn.execute(
-                "UPDATE requests SET task_id=?, goal_id=?, task_ids=?, updated=? WHERE id=?",
-                (
-                    task_id,
-                    goal_id,
-                    json.dumps(task_ids, ensure_ascii=False),
-                    now,
-                    request_id,
-                ),
+                "UPDATE ideas SET state='started', task_id=?, updated=?"
+                " WHERE id=? AND state IN ('new', 'wanted', 'pending')",
+                (task_id, now, int(row["idea_id"])),
             )
-            if row["idea_id"] is not None and (task_id is not None or goal_id is not None):
-                # 来自构想的请求被批准（手动批准路径）：构想也要标 started 并回写 task_id。
-                # 目前免批（app.on_idea_want）和网页「做这个」（app._on_idea_started）已经
-                # 各自回写；唯独手动批准漏了——这里是统一兜底（只动 pending/wanted/new 的，
-                # 不覆盖已有 started 构想，防重复批准时乱指）。
-                conn.execute(
-                    "UPDATE ideas SET state='started', task_id=?, updated=?"
-                    " WHERE id=? AND state IN ('new', 'wanted', 'pending')",
-                    (task_id, now, int(row["idea_id"])),
-                )
         return {
             "id": request_id, "status": "approved", "auto": auto,
             "task_id": task_id, "goal_id": goal_id,
@@ -578,11 +600,13 @@ class Approvals:
     # 内部
     # ------------------------------------------------------------------
 
-    def _get(self, request_id: str) -> dict | None:
-        row = self._store.read().execute(
-            "SELECT * FROM requests WHERE id=?", (_norm(request_id),)
-        ).fetchone()
+    @staticmethod
+    def _request_row(conn: sqlite3.Connection, request_id: str) -> dict | None:
+        row = conn.execute("SELECT * FROM requests WHERE id=?", (_norm(request_id),)).fetchone()
         return {k: row[k] for k in row.keys()} if row is not None else None
+
+    def _get(self, request_id: str) -> dict | None:
+        return self._request_row(self._store.read(), request_id)
 
     def _find(self, kind: str, obj_id: str) -> dict | None:
         table = "tasks" if kind == "task" else "goals"

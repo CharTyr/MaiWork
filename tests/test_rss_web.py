@@ -130,6 +130,17 @@ class TestRssApi:
             assert frag in body["error"]
 
     @pytest.mark.asyncio
+    async def test_add_private_url_returns_400_without_fetching_or_saving(self, env: _Env) -> None:
+        await _login(env)
+        def must_not_request(_: httpx.Request) -> httpx.Response:
+            pytest.fail("Private RSS source reached the network transport")
+        env.app.rss_transport = httpx.MockTransport(must_not_request)
+        for bad in ("http://127.0.0.1/good", "http://169.254.169.254/good", "http://user@public.example/good"):
+            r = await env.client.post(f"/api/groups/{G1}/rss", json={"url": bad})
+            assert r.status == 400, bad
+        assert env.app.store.kv_get(rss._key(G1)) is None
+
+    @pytest.mark.asyncio
     async def test_toggle_not_found(self, env: _Env) -> None:
         await _login(env)
         r = await env.client.post(f"/api/groups/{G1}/rss/rX/toggle", json={"enabled": True})

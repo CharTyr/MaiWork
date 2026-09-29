@@ -14,12 +14,14 @@
   本群管理员只能批本群的请求（别的群的请求 ID 直接拒）
 - /mw 拒绝 [ID]  bot 管理员 或本群群管理员：同上
 - /mw 取消 [ID]  发起人 / 群主 / 群管理 / bot 管理员：取消任务（T-）、agent 目标（G-）、提醒（M-）
+- /mw 领取 T-x  本群任何人：明确当场索取已完成且待发的成品（不重复传已发/不确定的文件）
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any, Callable
 
 from . import clock
@@ -28,7 +30,8 @@ logger = logging.getLogger("maiwork.commands")
 
 _USAGE = (
     "MaiWork 指令：/mw 看进度；/mw 网页 拿本群网页链接；"
-    "/mw 批准 [ID]、/mw 拒绝 [ID]（bot 管理员）；/mw 取消 [ID]（发起人 / 群管理 / bot 管理员）"
+    "/mw 领取 T-任务号 当场取成品；/mw 批准 [ID]、/mw 拒绝 [ID]（bot 管理员）；"
+    "/mw 取消 [ID]（发起人 / 群管理 / bot 管理员）"
 )
 
 _ID_PREFIX_KIND = {"T": "task", "G": "goal", "M": "goal"}
@@ -88,6 +91,11 @@ class Commands:
         gid = str(group_id)
         message_id_s = str(message_id or "")
         try:
+            if not self._get_settings().is_served(gid):
+                return  # 不能只依赖 intake；非服务群不读库也不发消息
+        except Exception:
+            return
+        try:
             parts = (str(text or "")).strip().split()
             reply = await self._dispatch(gid, str(user_id or ""), str(user_name or ""), parts)
         except Exception:
@@ -125,7 +133,26 @@ class Commands:
             return await self._decide(gid, user_id, arg, op="reject")
         if sub == "取消":
             return await self._cancel(gid, user_id, arg)
+        if sub == "领取":
+            return self._claim_delivery(gid, arg)
         return _USAGE
+
+    def _claim_delivery(self, gid: str, task_id: str) -> str:
+        """只有明确索取本群指定任务的这条指令能升级待发交付。"""
+        if not re.fullmatch(r"T-\d+", str(task_id or "")):
+            return "把本群任务号带上，例如 /mw 领取 T-3"
+        outcome = self._outbox.claim_delivery(gid, task_id)
+        if outcome == "queued":
+            return f"收到，{task_id} 的成品现在交付；如果发件失败请到本群网页核对"
+        if outcome == "sent":
+            return f"{task_id} 已交付过，请在群文件或本群网页查收，不会重复上传"
+        if outcome == "sending":
+            return f"{task_id} 正在发送中，请稍等，不会重复上传"
+        if outcome == "not_ready":
+            return f"{task_id} 还没完成，请完成后再领"
+        if outcome in ("uncertain", "failed", "broken"):
+            return f"{task_id} 的交付需要管理员到网页核对，不会盲目重复上传"
+        return "本群没有可领取的这份成品，请核对任务号或找管理员查看发件状态"
 
     # ------------------------------------------------------------------
     # /mw：本群进行中的目标、任务、待批（各最多 5 条）

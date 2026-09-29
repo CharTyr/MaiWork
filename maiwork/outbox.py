@@ -4,8 +4,9 @@
 - 每条通知记 待发(pending)/发送中(sending)/已发(sent)/不确定(uncertain)/失败(failed)，
   按 key（对象+版本+事件类型+目标群）去重。发送超时标 uncertain 不盲目重发；
   群文件上传不幂等，绝不自动重试。
-- 睡觉时段：error / command 之外的推送推迟到时段结束后（not_before 推迟，状态仍 pending，
-  原因写 error 字段，网页可见「推迟」）；error / command 不受限。
+- 普通交付也受日限额/睡觉时段约束；群友以 /mw 领取 <任务号> 明确索取时，
+  仅把待发的本任务成品标 awaited_delivery，不受两项节制、不占额度；
+  error / command / admin 即时反馈也不受限。
 - file 传完补一条说明消息（MaiBot 不知道文件是谁发的）；herenow 成功发链接说明。
 - 交付成功都把链接/文件名放进可提起清单（ttl 6 小时）。
 - 首选渠道失败（failed，不含 uncertain）自动回落备选；两条都失败 → 兜底说明
@@ -37,8 +38,14 @@ logger = logging.getLogger("maiwork.outbox")
 
 _DELIVER_MENTION_TTL_S = 6 * 3600  # 交付备忘在可提起清单里留 6 小时
 _ERR_MAX = 300
-_UNLIMITED_PUSH_KINDS = ("error", "command", "delivery", "admin")  # 与 delivery.py 一致：不受睡觉/上限约束
 _DEDUP_WINDOW_S = 600  # report_error 同群同指纹 10 分钟一次
+_DELIVERY_NOTE_SUFFIXES = (":note", ":webonly")
+
+
+def _is_artifact_outbox_row(kind: str, key: str) -> bool:
+    """真实交付项；失败兜底告知和后续说明都不算成品。"""
+    return ((kind in ("file", "herenow") and not key.endswith(_DELIVERY_NOTE_SUFFIXES))
+            or (kind == "text" and key.endswith(":deliver:text")))
 
 _API_KEY_RE = re.compile(r"(?i)(api[_-]?key\s*[=:]\s*)\S+")
 _TOKEN_RE = re.compile(r"\b[A-Za-z0-9_\-]{32,}\b")
@@ -117,6 +124,64 @@ class Outbox:
                 ),
             )
             return int(cur.lastrowid or 0)
+
+    def claim_delivery(self, group_id: str, task_id: str) -> str:
+        """群友当场索取本群已完成任务：仅提升尚未发出的交付，不重传已发/不确定的原件。
+
+        返回 queued/sent/sending/uncertain/failed/missing/not_ready/unserved/broken。
+        在一次事务里复核归属与状态、改待发载荷并清掉旧的推迟时间。
+        """
+        gid, tid = str(group_id), str(task_id)
+        if not self._get_settings().is_served(gid):
+            return "unserved"  # 非服务群零库读取
+        prefix = f"task:{tid}:deliver"
+        with self._store.tx() as conn:
+            task = conn.execute(
+                "SELECT status FROM tasks WHERE id=? AND group_id=?", (tid, gid)
+            ).fetchone()
+            if task is None:
+                return "missing"  # 不透露别的群是否存在同 ID
+            if task["status"] != "completed":
+                return "not_ready"
+            rows = conn.execute(
+                "SELECT id, key, kind, status, payload FROM outbox"
+                " WHERE group_id=? AND task_id=? AND (key=? OR key LIKE ?)",
+                (gid, tid, prefix, f"{prefix}:%"),
+            ).fetchall()
+            artifact = [r for r in rows if _is_artifact_outbox_row(r["kind"], str(r["key"]))]
+            # 兜底的「网页里还有副本」不是成品；只有已发布成品的说明可单独补发。
+            pending = [r for r in artifact if r["status"] == "pending"]
+            if any(r["status"] == "sent" for r in artifact):
+                pending.extend(r for r in rows if r["status"] == "pending"
+                               and str(r["key"]).endswith(":note"))
+            if pending:
+                payloads = []
+                for row in pending:
+                    try:
+                        payload = json.loads(row["payload"] or "{}")
+                    except (TypeError, ValueError):
+                        return "broken"
+                    if not isinstance(payload, dict):
+                        return "broken"
+                    payload["push_kind"] = "awaited_delivery"
+                    payloads.append((row["id"], payload))
+                now = clock.now()
+                for oid, payload in payloads:
+                    conn.execute(
+                        "UPDATE outbox SET payload=?, not_before=0, error='', updated=?"
+                        " WHERE id=? AND status='pending'",
+                        (json.dumps(payload, ensure_ascii=False), now, int(oid)),
+                    )
+                return "queued"
+            if any(r["status"] == "sent" for r in artifact):
+                return "sent"
+            if any(r["status"] == "sending" for r in artifact):
+                return "sending"
+            if any(r["status"] == "uncertain" for r in artifact):
+                return "uncertain"
+            if any(r["status"] == "failed" for r in artifact):
+                return "failed"
+            return "missing"
 
     # ------------------------------------------------------------------
     # flush
@@ -234,6 +299,8 @@ class Outbox:
         gid = row["group_id"]
         key = row["key"]
         tid = row["task_id"]
+        follow_kind = ("awaited_delivery" if payload.get("push_kind") == "awaited_delivery"
+                       else "delivery")
         if kind == "file":
             note = str(payload.get("note") or "").strip()
             name = str(payload.get("name") or "")
@@ -242,7 +309,7 @@ class Outbox:
                     f"{key}:note",
                     gid,
                     "text",
-                    {"text": note, "push_kind": "delivery"},
+                    {"text": note, "push_kind": follow_kind},
                     task_id=tid,
                 )
             text = f"刚在群里发了文件「{name}」，有人问起可以告诉他：{note}" if note \
@@ -261,7 +328,7 @@ class Outbox:
                     f"{key}:note",
                     gid,
                     "text",
-                    {"text": text_out, "push_kind": "delivery"},
+                    {"text": text_out, "push_kind": follow_kind},
                     task_id=tid,
                 )
             memo = f"刚在群里发了网页链接 {url}"
@@ -309,7 +376,7 @@ class Outbox:
                 "text",
                 {
                     "text": "做好了，但发群文件和网页都没成功，成品在 MaiWork 网页里",
-                    "push_kind": "delivery",
+                    "push_kind": str(payload.get("push_kind") or "delivery"),
                 },
                 task_id=tid,
             )
@@ -393,6 +460,39 @@ class Outbox:
                 task_id=tid,
             )
 
+    def _repair_sent_followups(self, served: set[str]) -> None:
+        """发送已成功却在补说明/备忘前崩溃：只补幂等后续，不重发原件。"""
+        rows = []
+        for gid in served:
+            rows.extend(self._store.read().execute(
+                "SELECT id, key, group_id, kind, payload, task_id, status, result, updated FROM outbox"
+                " WHERE group_id=? AND status='sent' AND kind IN ('file', 'herenow', 'text') ORDER BY id",
+                (gid,),
+            ).fetchall())
+        for row in rows:
+            gid = str(row["group_id"])
+            kind = str(row["kind"])
+            key = str(row["key"])
+            if gid not in served or (kind == "text" and not key.endswith(":deliver:text")):
+                continue
+            try:
+                payload = json.loads(row["payload"] or "{}")
+                result = json.loads(row["result"] or "{}")
+                need_note = ((kind == "file" and bool(str(payload.get("note") or "").strip()))
+                             or (kind == "herenow" and bool(result.get("url"))))
+                note_exists = self._store.read().execute(
+                    "SELECT 1 FROM outbox WHERE key=?", (f"{key}:note",)
+                ).fetchone() is not None
+                recent = clock.now() - float(row["updated"] or 0) <= _DELIVER_MENTION_TTL_S
+                memo_exists = self._store.read().execute(
+                    "SELECT 1 FROM mentions WHERE group_id=? AND key=?",
+                    (gid, f"deliver:{int(row['id'])}"),
+                ).fetchone() is not None
+                if (need_note and not note_exists) or (recent and not memo_exists):
+                    self._after_sent(row, payload)
+            except Exception:
+                logger.exception("补交付说明/备忘失败（发件 %s），下轮再试", row["id"])
+
     async def flush(self, now: float, *, allowed_groups: Any = None) -> None:
         """把到期（not_before≤now）的 pending 逐条处理。后台循环调。
 
@@ -408,6 +508,7 @@ class Outbox:
             except Exception:
                 allowed_groups = set()
         served = {str(g) for g in allowed_groups}
+        self._repair_sent_followups(served)
         while True:
             rows = [r for r in self._due_rows(now) if str(r["group_id"]) in served]
             if not rows:
@@ -422,9 +523,9 @@ class Outbox:
                 payload = {}
             push_kind = str(payload.get("push_kind") or "delivery")
 
-            # 节制：error / command 不受限；其余看睡觉时段和每日上限
+            # 单一节制入口：明确领取与故障/指令的豁免由 Pushes 决定。
             ok_push, reason = self._pushes.can_push(gid, push_kind, now)
-            if not ok_push and push_kind not in _UNLIMITED_PUSH_KINDS:
+            if not ok_push:
                 self._postpone(oid, gid, reason or "推送节制", now)
                 continue
 
@@ -710,6 +811,56 @@ class Delivery:
             f"task:{task_id}:deliver", gid, "file", payload, task_id=task_id
         )
 
+    async def reenqueue_missing(self, task_id: str, env: Any) -> bool:
+        """管理员重发：无成品发件行时重建入队；已入队/已发/不确定的成品不碰。"""
+        tid = str(task_id)
+        task = self._store.read().execute(
+            "SELECT group_id, workspace, title, status, delivery_kind FROM tasks WHERE id=?", (tid,)
+        ).fetchone()
+        if task is None or task["status"] != "completed":
+            raise ValueError("只有已完成任务能补建交付记录")
+        gid = str(task["group_id"])
+        settings = self._outbox._get_settings()
+        if not settings.is_served(gid):
+            raise ValueError("这个群已不在服务列表，不能交付")
+        existing = self._store.read().execute(
+            "SELECT key, kind FROM outbox WHERE task_id=?", (tid,)
+        ).fetchall()
+        if any(_is_artifact_outbox_row(r["kind"], str(r["key"])) for r in existing):
+            return False
+        kind = str(task["delivery_kind"] or "")
+        note = f"做好了：{str(task['title'] or '请查看成品')}"[:300]
+        if kind == "text":
+            self._outbox.enqueue(
+                f"task:{tid}:deliver:text", gid, "text",
+                {"text": note, "push_kind": "delivery"}, task_id=tid,
+            )
+            return True
+        if kind not in ("file", "view"):
+            raise ValueError("任务缺少可恢复的交付方式，请先核对成品")
+        attempt = self._store.read().execute(
+            "SELECT artifacts FROM attempts WHERE task_id=? AND status='passed' ORDER BY n DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        try:
+            saved = json.loads(attempt["artifacts"] or "[]") if attempt else []
+        except (TypeError, ValueError):
+            saved = []
+        rel = str(saved[0] or "") if isinstance(saved, list) and saved else ""
+        if not rel:
+            raise ValueError("找不到验收通过时的成品路径，请先人工核对")
+        ws_name = str(task["workspace"] or settings.workspace_of(gid))
+        try:
+            ws = env.workspace(ws_name)
+            path = env.resolve(ws_name, rel)
+        except (ValueError, OSError) as e:
+            raise ValueError("成品路径已失效或越过工作区，不能重发") from e
+        base = ws / "artifacts" / tid
+        if (path != base and base not in path.parents) or not path.exists():
+            raise ValueError("成品不在本任务专属目录内或已不存在，不能重发")
+        await self.deliver_task(tid, kind=kind, path=path, name=path.name or tid, note=note)
+        return True
+
     # ------------------------------------------------------------------
     # 网页视图
     # ------------------------------------------------------------------
@@ -723,9 +874,6 @@ class Delivery:
         "failed": "失败",
         "cancelled": "已取消",
     }
-    # 这些后缀的是说明 / 兜底，不算「成品项」
-    _NOTE_SUFFIXES = (":note", ":webonly")
-
     def delivery_records(self, task_id: str) -> list[dict]:
         """§9.3 任务详情的 delivery：kind「here.now/群文件/网页副本」、text、state 中文、url。"""
         rows = self._store.read().execute(
@@ -770,21 +918,24 @@ class Delivery:
         return records
 
     def undelivered(self, task_id: str) -> bool:
-        """有 failed/uncertain 且没有任何 sent 的成品项（file/herenow，不含 :note 说明）。"""
+        """已完成但没有成品发件、或成品发送失败：网页必须显眼标未交付。"""
+        task = self._store.read().execute(
+            "SELECT status, delivery_kind, undelivered FROM tasks WHERE id=?", (str(task_id),)
+        ).fetchone()
+        if task is None or str(task["status"]) != "completed":
+            return False
         rows = self._store.read().execute(
             "SELECT key, kind, status FROM outbox WHERE task_id=?",
             (str(task_id),),
         ).fetchall()
-        artifact = [
-            r for r in rows
-            if r["kind"] in ("file", "herenow")
-            and not str(r["key"]).endswith(Delivery._NOTE_SUFFIXES)
-        ]
+        artifact = [r for r in rows if _is_artifact_outbox_row(r["kind"], str(r["key"]))]
         if not artifact:
+            return True
+        if any(r["status"] == "sent" for r in artifact):
             return False
-        has_sent = any(r["status"] == "sent" for r in artifact)
-        has_bad = any(r["status"] in ("failed", "uncertain") for r in artifact)
-        return bool(has_bad and not has_sent)
+        if any(r["status"] in ("failed", "uncertain", "cancelled") for r in artifact):
+            return True
+        return bool(task["undelivered"])
 
 
 # ----------------------------------------------------------------------

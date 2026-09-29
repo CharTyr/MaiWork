@@ -367,6 +367,22 @@ class Coordinator:
             self._semaphores[workspace] = sem
         return sem
 
+    def _group_is_served(self, group_id: str) -> bool:
+        """最终派工前复核群范围；旧测试配置没有 is_served 时保持兼容。"""
+        try:
+            check = getattr(self._get_settings(), "is_served", None)
+            return bool(check(str(group_id))) if callable(check) else True
+        except Exception:
+            return False
+
+    def _goal_is_active(self, goal_id: str, group_id: str) -> bool:
+        """模型等待期间群可能被删、目标可能被暂停/取消。"""
+        if not self._group_is_served(group_id):
+            return False
+        goal = self._goals.get(goal_id)
+        return bool(goal and str(goal.get("group_id")) == str(group_id)
+                    and goal.get("kind") == "agent" and goal.get("state") == "active")
+
     def _workspace_name(self, group_id: str) -> str:
         try:
             fn = getattr(self._get_settings(), "workspace_of", None)
@@ -930,7 +946,7 @@ class Coordinator:
         task = self._tasks.get(task_id)
         if task is None:
             return
-        if str(task["status"]) != "queued":
+        if str(task["status"]) != "queued" or not self._group_is_served(str(task["group_id"])):
             return
         if not _models_ready(self._models):
             logger.debug("模型还没配好，任务 %s 保持排队，不开工", task_id)
@@ -946,7 +962,7 @@ class Coordinator:
                 if str(task["status"]) in ("cancelled", "completed", "failed", "rejected"):
                     logger.info("任务 %s 已是「%s」，协调器立刻停", task_id, task["status"])
                     return
-                if str(task["status"]) != "queued":
+                if str(task["status"]) != "queued" or not self._group_is_served(str(task["group_id"])):
                     return
                 if not _models_ready(self._models):
                     logger.debug("跑任务途中模型配置没了，任务 %s 保持排队，下次巡检再说", task_id)
@@ -1491,14 +1507,15 @@ class Coordinator:
                 passed = False
                 review_text = f"（验收说 pass 但 {artifact} 不存在，视为不通过）" + review_text
             else:
-                try:
-                    art_path = self._env.resolve(ws_name, artifact)
-                except (PermissionError, ValueError):
-                    art_path = None
-                problem = self._find_artifact_symlink_escape(art_path) if art_path is not None else None
-                if problem:
+                art_path = self._deliver_path_in_task_dir(ws_name, tid, artifact)
+                if art_path is None:
                     passed = False
-                    review_text = f"（{problem}，视为不通过）" + review_text
+                    review_text = "（交付物不在本任务成品目录，视为不通过）" + review_text
+                else:
+                    problem = self._find_artifact_symlink_escape(art_path)
+                    if problem:
+                        passed = False
+                        review_text = f"（{problem}，视为不通过）" + review_text
 
         # 引用核对留痕：验收意见里带一行「引用核对：N 条链接，M 条没打开过」，
         # 结构化结果存 kv["task.link_check.<任务ID>"]（前端读它做字段）。
@@ -1909,6 +1926,19 @@ class Coordinator:
             await self._remember_round(task_id, gid, ws_name, plan, review)
         except Exception:
             logger.exception("记经验小回合出错（任务 %s，不影响交付）", task_id)
+        kind = plan["deliver_kind"]
+        artifact_path: Path | None = None
+        if kind != "text":
+            # 两次可等待的小回合之后路径可能失效；不能先标完成再发现无法交付。
+            artifact_path = self._deliver_path_in_task_dir(ws_name, task_id, review.get("artifact") or "")
+            if (artifact_path is None or not artifact_path.exists()
+                    or self._find_artifact_symlink_escape(artifact_path)):
+                try:
+                    self._tasks.transition(task_id, "failed", reason="验收通过后成品路径失效或不在本任务目录")
+                except ValueError:
+                    pass  # 取消/暂停期间晚到的结果不改变状态
+                self._write_tokens(task_id)
+                return "done"
         try:
             self._tasks.transition(
                 task_id,
@@ -1921,7 +1951,6 @@ class Coordinator:
             logger.warning("任务 %s →completed 非法：%s", task_id, e)
             return "done"
 
-        kind = plan["deliver_kind"]
         # G7 隐私闸：note 含关注成员信息 → 兜底「做好了：<任务标题>」
         task_title = ""
         try:
@@ -1942,14 +1971,11 @@ class Coordinator:
             except Exception:
                 logger.exception("text 交付入队失败")
         else:
-            artifact = review.get("artifact") or ""
-            path = self._deliver_path_in_task_dir(ws_name, task_id, artifact)
-            if path is None:
-                return "done"
-            name = Path(path).name or Path(path).parent.name or task_id
+            assert artifact_path is not None
+            name = artifact_path.name or artifact_path.parent.name or task_id
             try:
                 await self._delivery.deliver_task(
-                    task_id, kind=kind, path=path, name=name, note=note
+                    task_id, kind=kind, path=artifact_path, name=name, note=note
                 )
             except Exception:
                 logger.exception("deliver_task 失败")
@@ -1994,7 +2020,23 @@ class Coordinator:
         return "done"
 
     def _fail_with_err(self, task_id: str, attempt_id: int | None, msg: str, gid: str) -> None:
-        """故障路径：attempt 标 failed、任务 failed、report_error。"""
+        """仅当前仍在运行的尝试可报故障；旧尝试留历史，不改新状态、不发群。"""
+        try:
+            task = self._tasks.get(task_id)
+            still_current = (attempt_id is None or self._tasks.current_attempt_id(task_id) == attempt_id)
+            active = (task is not None and str(task.get("group_id")) == str(gid)
+                      and task.get("status") in ("running", "reviewing")
+                      and self._group_is_served(gid) and still_current)
+        except Exception:
+            logger.exception("查任务故障归属失败（任务 %s），保守丢弃晚到错误", task_id)
+            active = False
+        if not active:
+            if attempt_id is not None:
+                try:
+                    self._tasks.finish_attempt(attempt_id, status="stale", review=msg)
+                except Exception:
+                    logger.exception("记旧尝试错误失败（任务 %s）", task_id)
+            return
         if attempt_id is not None:
             try:
                 self._tasks.finish_attempt(attempt_id, status="failed", review=msg)
@@ -2044,6 +2086,8 @@ class Coordinator:
         if goal is None or str(goal.get("state")) != "active" or str(goal.get("kind")) != "agent":
             return
         gid = str(goal["group_id"])
+        if not self._group_is_served(gid):
+            return
 
         # 下级任务状态
         rows = self._store.read().execute(
@@ -2103,8 +2147,13 @@ class Coordinator:
                 purpose="coordinator.check_goal",
                 group_id=gid,
             )
+            # 模型等待期间可以发生取消、暂停或删群：晚到结果一律丢弃。
+            if not self._goal_is_active(goal_id, gid):
+                return
             data = json.loads(result.text)
         except (ModelError, HostError) as e:
+            if not self._goal_is_active(goal_id, gid):
+                return
             msg = getattr(e, "message", e)
             try:
                 # 「模型还没配好」类的故障不往群里报，也不算出错（等配置，不算卡住）
@@ -2115,10 +2164,14 @@ class Coordinator:
                 pass
             return
         except (ValueError, TypeError) as e:
+            if not self._goal_is_active(goal_id, gid):
+                return
             logger.warning("目标 %s 检查 JSON 不合法：%s", goal_id, e)
             self._check_goal_fail(goal_id, f"检查返回不合法：{e}")
             return
         except Exception as e:
+            if not self._goal_is_active(goal_id, gid):
+                return
             logger.exception("目标 %s 检查异常", goal_id)
             self._check_goal_fail(goal_id, f"检查异常：{e}")
             return

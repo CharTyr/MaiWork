@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -490,6 +491,48 @@ class TestReadWriteList:
         with pytest.raises(PermissionError):
             await env.list_files("ws", rel="..")
 
+    @pytest.mark.asyncio
+    async def test_list_files_skips_symlinks_without_disclosing_outside_metadata(self, tmp_path: Path) -> None:
+        env = _env(tmp_path)
+        ws = env.workspace("ws")
+        outside = tmp_path / "private"
+        outside.mkdir()
+        (outside / "outside-secret.txt").write_text("绝不能列出", encoding="utf-8")
+        (ws / "tasks" / "outside-dir").symlink_to(outside, target_is_directory=True)
+        (ws / "tasks" / "outside-file").symlink_to(outside / "outside-secret.txt")
+        entries = await env.list_files("ws", "tasks", depth=4)
+        assert entries == []  # 连外部文件的长度也不探测
+        with pytest.raises(PermissionError):
+            await env.list_files("ws", "tasks/outside-dir", depth=1)
+
+    @pytest.mark.asyncio
+    async def test_list_files_does_not_follow_directory_replaced_during_walk(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        env = _env(tmp_path)
+        ws = env.workspace("ws")
+        (ws / "tasks" / "swap").mkdir()
+        outside = tmp_path / "private"
+        outside.mkdir()
+        (outside / "outside-secret.txt").write_text("不许看到", encoding="utf-8")
+        real_stat = os.stat
+        swapped = False
+
+        def swapping_stat(path, *args, **kwargs):
+            nonlocal swapped
+            result = real_stat(path, *args, **kwargs)
+            if path == "swap" and kwargs.get("dir_fd") is not None and not swapped:
+                swapped = True
+                (ws / "tasks" / "swap").rename(ws / "tasks" / "old")
+                (ws / "tasks" / "swap").symlink_to(outside, target_is_directory=True)
+            return result
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "stat", swapping_stat)
+            entries = await env.list_files("ws", "tasks", depth=4)
+        assert swapped
+        assert not any("outside-secret" in e["path"] for e in entries)
+
 
 class TestDirectProcessRegistry:
     """direct 模式的 start/status/logs/stop：内存登记 + 真子进程。"""
@@ -733,14 +776,17 @@ class TestDynamicUserArgv:
         assert f"WorkingDirectory={ws}" in argv
 
     def test_chown_65534_for_plugin_written_files(self, tmp_path: Path, monkeypatch) -> None:
-        """dynamic 下插件写的工作区文件 chown 65534:65534（本地用假 os.chown 验证意图）。"""
-        chowned: list[tuple[str, int, int]] = []
-        monkeypatch.setattr("os.chown", lambda p, u, g: chowned.append((str(p), u, g)))
+        """dynamic 下通过已打开的安全 fd chown 65534:65534。"""
+        chowned: list[tuple[int, int, int, int]] = []
+        monkeypatch.setattr("os.fchown", lambda fd, u, g: chowned.append(
+            (os.fstat(fd).st_dev, os.fstat(fd).st_ino, u, g)))
         monkeypatch.setattr("os.geteuid", lambda: 0, raising=False)
         env = self._dyn_env(tmp_path)
-        env.workspace("ws")
+        ws = env.workspace("ws")
         assert chowned, "root + dynamic 下建工作区应该 chown"
-        assert all(u == 65534 and g == 65534 for _p, u, g in chowned)
+        assert all(u == 65534 and g == 65534 for _dev, _ino, u, g in chowned)
+        ws_st = ws.stat()
+        assert (ws_st.st_dev, ws_st.st_ino) in {(dev, ino) for dev, ino, _u, _g in chowned}
 
     def test_fixed_still_chowns_run_as(self, tmp_path: Path, monkeypatch) -> None:
         """固定用户方式不变：root 时 chown 给 run_as 用户（本机没有 maiwork 用户 → 警告跳过）。"""

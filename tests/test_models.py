@@ -606,7 +606,13 @@ class TestRequestDetails:
             "main", [{"role": "user", "content": "跑个命令"}], tools=tools, json_mode=True, purpose="测试用途"
         )
         body = ep.calls[0]["body"]
-        assert body["response_format"] == {"type": "json_object"}
+        # 2026-09-29 线上对照实验：step-5-preview 开服务端 JSON 模式（response_format=json_object）
+        # 同一请求两次分别缺字段 / 回空 {}，关掉后两次都完整正确。json_mode 改成只在提示里要求 JSON，
+        # 不再发 response_format。
+        assert "response_format" not in body
+        assert any(
+            m["role"] == "system" and "JSON" in m["content"] for m in body["messages"]
+        ), "json_mode 要在提示里明确要求只输出一个完整的 JSON 对象"
         assert body["tools"] == tools
         assert r.text == ""
         assert len(r.tool_calls) == 1
@@ -834,3 +840,153 @@ class TestSaveDetails:
             assert key in pub
         assert pub["key_set"] is True
         assert "api_key" not in pub
+
+
+# ----------------------------------------------------------------------
+# 流式：线上网关（Cloudflare）约 125 秒没字节就 524 掐断；step-5-preview 想得久，
+# 整段等回答会被掐。改成 stream=True，思考过程边想边回来，连接一直有字节。
+# 端点不支持流（回普通 JSON）照旧解析。
+# ----------------------------------------------------------------------
+
+
+def _sse(chunks: list, *, done: bool = True) -> bytes:
+    lines = [f"data: {json.dumps(c, ensure_ascii=False)}\n\n" for c in chunks]
+    if done:
+        lines.append("data: [DONE]\n\n")
+    return "".join(lines).encode()
+
+
+def _delta(**d) -> dict:
+    return {"id": "c", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": d, "finish_reason": None}]}
+
+
+def _stream_models(tmp_path, handler, **model_over):
+    store = Store(tmp_path / "test.db")
+    store.migrate()
+    m = {"base_url": "https://a.test/v1", "api_key": SECRET, "main": "m1", "worker": "w", "retry_delay_s": 0}
+    m.update(model_over)
+    settings = _settings({"models": m})
+    return store, Models(store, lambda: settings, transport=httpx.MockTransport(handler))
+
+
+class TestStreaming:
+    @pytest.mark.asyncio
+    async def test_request_asks_for_stream_with_usage(self, tmp_path) -> None:
+        bodies = []
+
+        def h(request):
+            bodies.append(json.loads(request.content))
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"},
+                content=_sse([_delta(role="assistant", content="好")]),
+            )
+
+        store, models = _stream_models(tmp_path, h)
+        await models.chat("main", [{"role": "user", "content": "x"}])
+        assert bodies[0]["stream"] is True
+        assert bodies[0]["stream_options"] == {"include_usage": True}
+        await models.close()
+
+    @pytest.mark.asyncio
+    async def test_assembles_text_skips_reasoning_and_reads_usage(self, tmp_path) -> None:
+        chunks = [
+            _delta(role="assistant", reasoning_content="先想想"),
+            _delta(reasoning_content="再想想"),
+            _delta(content="新增 | "),
+            _delta(content="梗 | 一句话"),
+            {"id": "c", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            {"id": "c", "choices": [], "usage": {"prompt_tokens": 40, "completion_tokens": 900}},
+        ]
+
+        def h(request):
+            return httpx.Response(200, headers={"content-type": "text/event-stream; charset=utf-8"}, content=_sse(chunks))
+
+        store, models = _stream_models(tmp_path, h)
+        r = await models.chat("main", [{"role": "user", "content": "x"}], purpose="p")
+        assert r.text == "新增 | 梗 | 一句话"
+        assert r.prompt_tokens == 40 and r.completion_tokens == 900
+        assert r.tool_calls == []
+        row = store.read().execute("SELECT ok, status, response FROM model_calls").fetchone()
+        assert row["ok"] == 1 and row["status"] == 200
+        assert json.loads(row["response"])["finish_reason"] == "stop"
+        await models.close()
+
+    @pytest.mark.asyncio
+    async def test_tool_calls_split_across_chunks(self, tmp_path) -> None:
+        chunks = [
+            _delta(role="assistant", content=None, tool_calls=[
+                {"index": 0, "id": "call_a", "type": "function", "function": {"name": "web_search", "arguments": ""}}]),
+            _delta(tool_calls=[{"index": 0, "function": {"arguments": '{"q": '}}]),
+            _delta(tool_calls=[{"index": 0, "function": {"arguments": '"ns2"}'}}]),
+            _delta(tool_calls=[{"index": 1, "id": "call_b", "type": "function",
+                                "function": {"name": "fetch_page", "arguments": '{"url": "https://x.test"}'}}]),
+            {"id": "c", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+             "usage": {"prompt_tokens": 5, "completion_tokens": 6}},
+        ]
+
+        def h(request):
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=_sse(chunks))
+
+        store, models = _stream_models(tmp_path, h)
+        r = await models.chat("worker", [{"role": "user", "content": "x"}])
+        assert [tc["id"] for tc in r.tool_calls] == ["call_a", "call_b"]
+        assert r.tool_calls[0]["function"] == {"name": "web_search", "arguments": '{"q": "ns2"}'}
+        assert r.tool_calls[1]["function"]["name"] == "fetch_page"
+        assert r.tool_calls[0]["type"] == "function"
+        assert r.raw_message["tool_calls"] == r.tool_calls
+        await models.close()
+
+    @pytest.mark.asyncio
+    async def test_error_inside_stream_is_retried(self, tmp_path) -> None:
+        n = {"i": 0}
+
+        def h(request):
+            n["i"] += 1
+            if n["i"] == 1:
+                return httpx.Response(
+                    200, headers={"content-type": "text/event-stream"},
+                    content=_sse([_delta(content="半截"), {"error": {"message": "upstream overloaded"}}], done=False),
+                )
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=_sse([_delta(content="好了")]))
+
+        store, models = _stream_models(tmp_path, h, retries=1)
+        r = await models.chat("main", [{"role": "user", "content": "x"}])
+        assert r.text == "好了"
+        rows = store.read().execute("SELECT ok, error FROM model_calls ORDER BY id").fetchall()
+        assert [x["ok"] for x in rows] == [0, 1]
+        assert "overloaded" in rows[0]["error"]
+        await models.close()
+
+    @pytest.mark.asyncio
+    async def test_stream_cut_without_done_or_finish_is_error(self, tmp_path) -> None:
+        def h(request):
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"},
+                content=_sse([_delta(content="半截话")], done=False),
+            )
+
+        store, models = _stream_models(tmp_path, h, retries=0)
+        with pytest.raises(ModelError):
+            await models.chat("main", [{"role": "user", "content": "x"}])
+        await models.close()
+
+    @pytest.mark.asyncio
+    async def test_total_timeout_even_if_bytes_keep_coming(self, tmp_path) -> None:
+        import asyncio
+
+        class Dribble(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                for _ in range(50):
+                    await asyncio.sleep(0.05)
+                    yield _sse([_delta(reasoning_content="嗯")], done=False)
+
+        def h(request):
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Dribble())
+
+        store, models = _stream_models(tmp_path, h, retries=0)
+        with pytest.raises(ModelError) as ei:
+            await models.chat("main", [{"role": "user", "content": "x"}], timeout=0.4)
+        assert "超时" in str(ei.value) or "Timeout" in str(ei.value)
+        row = store.read().execute("SELECT ok, status FROM model_calls").fetchone()
+        assert row["ok"] == 0
+        await models.close()

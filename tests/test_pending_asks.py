@@ -279,8 +279,8 @@ class TestAskPrompt:
         normal_line = [ln for ln in msg_lines if "随便聊聊" in ln]
         assert normal_line and "Jev 没判出来" not in normal_line[0]
         # 规则里声明了 asks 和输出格式
-        assert '"asks"' in prompt
-        assert "prepare|goal|reminder" in prompt
+        assert "请求 | 消息序号" in prompt  # 2026-09-29 起一行一件事：请求写成「请求 | …」行
+        assert "prepare 或 goal 或 reminder" in prompt
 
 
 class TestAskApply:

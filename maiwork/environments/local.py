@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import inspect
 import logging
 import os
@@ -132,25 +133,92 @@ class LocalEnv:
         return [f"--setenv={k}={v}" for k, v in self._minimal_env(ws).items()]
 
     @staticmethod
-    def _chown_tree(path: Path, uid: int, gid: int) -> None:
-        """chown 单个路径；目录则连内容一起。只动工作区内的东西。"""
+    def _dir_flags() -> int:
+        """目录必须逐段 nofollow；不支持这两个旗标的平台直接拒绝。"""
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory = getattr(os, "O_DIRECTORY", 0)
+        if not nofollow or not directory:
+            raise PermissionError("平台不支持安全的工作区目录打开方式")
+        return os.O_RDONLY | directory | nofollow | getattr(os, "O_CLOEXEC", 0)
+
+    @staticmethod
+    def _open_dir(parent_fd: int, part: str, *, create: bool = False) -> int:
+        """只经已打开的父目录访问一段；链接/非目录一律拒绝。"""
+        if not part or part in (".", "..") or "/" in part or "\\" in part:
+            raise PermissionError(f"目录名不安全：{part!r}")
+        if create:
+            try:
+                os.mkdir(part, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
         try:
-            os.chown(path, uid, gid)
-        except PermissionError:
-            logger.warning("chown %s 失败（非属主？），跳过", path)
+            return os.open(part, LocalEnv._dir_flags(), dir_fd=parent_fd)
+        except FileNotFoundError:
+            raise
+        except OSError:
+            raise PermissionError(f"目录不是普通目录或包含符号链接：{part}") from None
+
+    @staticmethod
+    def _chown_fd_tree(fd: int, uid: int, gid: int) -> None:
+        """固定在目录 fd 上递归 chown；永不跟随 symlink，也不改 hardlink 的外部 inode。"""
+        st = os.fstat(fd)
+        if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
             return
-        if path.is_dir():
-            for root, dirs, files in os.walk(path):
-                for d in dirs:
-                    try:
-                        os.chown(os.path.join(root, d), uid, gid)
-                    except PermissionError:
-                        continue
-                for f in files:
-                    try:
-                        os.chown(os.path.join(root, f), uid, gid)
-                    except PermissionError:
-                        continue
+        if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+            return
+        try:
+            os.fchown(fd, uid, gid)
+        except PermissionError:
+            return
+        if not stat.S_ISDIR(st.st_mode):
+            return
+        for part in os.listdir(fd):
+            try:
+                child = os.open(
+                    part, os.O_RDONLY | LocalEnv._nofollow_flag() | os.O_NONBLOCK
+                    | getattr(os, "O_CLOEXEC", 0), dir_fd=fd,
+                )
+            except OSError:
+                # symlink / 消失的文件 / 不可读节点：不跟随，宁可不 chown。
+                continue
+            try:
+                LocalEnv._chown_fd_tree(child, uid, gid)
+            finally:
+                os.close(child)
+
+    @staticmethod
+    def _chown_tree(path: Path, uid: int, gid: int, *, root: Path | None = None) -> None:
+        """从可信 workspace_root 锚定目录 fd；root 缺省仅供直接调用。"""
+        anchor = root if root is not None else path.parent
+        try:
+            parts = path.relative_to(anchor).parts
+        except ValueError:
+            raise PermissionError(f"chown 路径不在工作区根目录：{path}") from None
+        if not parts:
+            raise PermissionError("不允许 chown 工作区根目录")
+        root_fd = os.open(anchor, LocalEnv._dir_flags())
+        try:
+            parent_fd = os.dup(root_fd)
+            try:
+                for part in parts[:-1]:
+                    child = LocalEnv._open_dir(parent_fd, part)
+                    os.close(parent_fd)
+                    parent_fd = child
+                try:
+                    fd = os.open(
+                        parts[-1], os.O_RDONLY | LocalEnv._nofollow_flag() | os.O_NONBLOCK
+                        | getattr(os, "O_CLOEXEC", 0), dir_fd=parent_fd,
+                    )
+                except OSError:
+                    raise PermissionError(f"chown 目标不安全：{path}") from None
+                try:
+                    LocalEnv._chown_fd_tree(fd, uid, gid)
+                finally:
+                    os.close(fd)
+            finally:
+                os.close(parent_fd)
+        finally:
+            os.close(root_fd)
 
     def _exec_user_kind(self) -> str:
         """systemd 单元里的用户：fixed=run_as（固定用户）；dynamic=自动分配（chown 65534）。"""
@@ -175,8 +243,9 @@ class LocalEnv:
                 return
         except (AttributeError, OSError):  # 非 POSIX 没有 geteuid
             return
+        root = Path(self._get_settings().environments.workspace_root).resolve()
         if self._exec_user_kind() == "dynamic":
-            self._chown_tree(path, 65534, 65534)
+            self._chown_tree(path, 65534, 65534, root=root)
             return
         if pwd is None:  # 非 POSIX：没有 pwd 模块就跳过
             return
@@ -185,7 +254,7 @@ class LocalEnv:
         except KeyError:
             logger.warning("系统里没有用户 %s，chown 跳过", self._run_as())
             return
-        self._chown_tree(path, pw.pw_uid, pw.pw_gid)
+        self._chown_tree(path, pw.pw_uid, pw.pw_gid, root=root)
 
     # ------------------------------------------------------------------
     # workspace / resolve
@@ -201,13 +270,24 @@ class LocalEnv:
             raise ValueError(
                 f"工作区名不合法：{name!r}（只能用字母、数字、下划线、横线，1~64 个字符）"
             )
-        root = Path(self._get_settings().environments.workspace_root)
+        # 配置里的 workspace_root 是可信锚点；其下工作区名和每个子目录都
+        # 在 dir_fd 下 O_NOFOLLOW 打开，拒绝 root/name 被预先换成外部链接。
+        root = Path(self._get_settings().environments.workspace_root).resolve()
+        root.mkdir(parents=True, exist_ok=True)
         ws = root / name
-        ws.mkdir(parents=True, exist_ok=True)
-        for sub in _WS_SUBDIRS:
-            (ws / sub).mkdir(parents=True, exist_ok=True)
+        root_fd = os.open(root, self._dir_flags())
+        try:
+            ws_fd = self._open_dir(root_fd, name, create=True)
+            try:
+                for sub in _WS_SUBDIRS:
+                    sub_fd = self._open_dir(ws_fd, sub, create=True)
+                    os.close(sub_fd)
+            finally:
+                os.close(ws_fd)
+        finally:
+            os.close(root_fd)
         self._chown_for_run_as(ws)
-        return ws.resolve()
+        return ws
 
     def resolve(self, name: str, rel: str) -> Path:
         """工作区内相对路径 → 绝对路径。越界（绝对路径、..、符号链接指出去）→ PermissionError。"""
@@ -465,7 +545,8 @@ class LocalEnv:
         ws = self.workspace(name)
         unit = f"maiwork-{name}-{label}"
         log_dir = ws / "runtime" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
+        with self._parent_fd(name, "runtime/logs/.directory", create=True):
+            pass
         self._chown_for_run_as(log_dir)
         log_path = log_dir / f"{label}.log"
         exit_path = log_dir / f"{label}.exit"
@@ -673,163 +754,205 @@ class LocalEnv:
                 pass
 
     # ------------------------------------------------------------------
-    # 文件读写：插件（root）直接读写工作区，写完 systemd 模式 chown
-    #
-    # TOCTOU（G2）：resolve 与 open 之间文件可能被换成符号链接。防线：
-    # 1. 父目录各段逐段 lstat——父目录链上任何一段是符号链接 → PermissionError；
-    # 2. os.open 带 O_NOFOLLOW 打开最后一段（末段是链接 → OSError(ELOOP) → PermissionError）；
-    # 3. 打开后校验 fd 指回工作区内：Linux 用 /proc/self/fd/<fd> 的 realpath；
-    #    其他平台回落「重新 realpath 父目录 + fstat 与 os.stat 的 st_dev/st_ino 对比」。
+    # 文件读写：可信 workspace_root 锚定 fd，逐段 dir_fd + O_NOFOLLOW。
+    # 写文件先在同一目录创建独立 inode，再原子替换；不对旧 inode 截断/写入。
     # ------------------------------------------------------------------
 
     @staticmethod
     def _nofollow_flag() -> int:
         return getattr(os, "O_NOFOLLOW", 0)
 
-    def _check_parents_no_symlink(self, ws: Path, path: Path) -> None:
-        """path 相对工作区根的父目录链，逐段 lstat；任何一段是符号链接 → PermissionError。"""
+    @contextmanager
+    def _workspace_fd(self, name: str):
+        """从可信工作区根打开目录 fd；遍历期间始终固定同一个工作区 inode。"""
+        ws = self.workspace(name)
+        root = Path(self._get_settings().environments.workspace_root).resolve()
+        root_fd = os.open(root, self._dir_flags())
         try:
-            rel = path.relative_to(ws)
-        except ValueError:
-            raise PermissionError(f"路径不在工作区内：{path}") from None
-        current = ws
-        for part in rel.parts[:-1]:
-            current = current / part
+            ws_fd = self._open_dir(root_fd, name)
             try:
-                st = os.lstat(current)
-            except FileNotFoundError:
-                # 还不存在的目录段（写新文件时是常态）——存在的才需要查
-                break
-            if stat.S_ISLNK(st.st_mode):
-                raise PermissionError(f"父目录段是符号链接，不允许：{current}")
+                yield ws, ws_fd
+            finally:
+                os.close(ws_fd)
+        finally:
+            os.close(root_fd)
+
+    @contextmanager
+    def _parent_fd(self, name: str, rel: str, *, create: bool = False):
+        """打开工作区和目标的每段父目录；直到使用完目标才释放锚定 fd。"""
+        raw = str(rel or "")
+        candidate = Path(raw)
+        if candidate.is_absolute():
+            raise PermissionError(f"路径必须是工作区内的相对路径：{raw!r}")
+        parts = candidate.parts
+        if not parts:
+            raise IsADirectoryError(f"{raw!r} 是目录，不是文件")
+        if any(part in (".", "..") for part in parts):
+            raise PermissionError(f"路径越界（不允许 ..）：{raw!r}")
+        with self._workspace_fd(name) as (ws, ws_fd):
+            parent_fd = os.dup(ws_fd)
+            try:
+                for part in parts[:-1]:
+                    child = self._open_dir(parent_fd, part, create=create)
+                    os.close(parent_fd)
+                    parent_fd = child
+                yield ws, parent_fd, parts[-1]
+            finally:
+                os.close(parent_fd)
 
     @staticmethod
-    def _open_nofollow(path: Path, flags: int) -> int:
-        """os.open 带 O_NOFOLLOW；末段是链接 → PermissionError（ELOOP 等一律按越界拒）。"""
+    def _open_file_at(parent_fd: int, last: str) -> int:
+        """只允许普通非链接文件；缺失由调用方区分读与创建。"""
         try:
-            return os.open(str(path), flags | LocalEnv._nofollow_flag(), 0o644)
-        except PermissionError:
-            raise PermissionError(f"不允许访问（符号链接不允许读写）：{path}") from None
+            fd = os.open(
+                last, os.O_RDONLY | LocalEnv._nofollow_flag() | os.O_NONBLOCK
+                | getattr(os, "O_CLOEXEC", 0), dir_fd=parent_fd,
+            )
         except FileNotFoundError:
             raise
         except OSError:
-            raise PermissionError(f"不允许访问（符号链接不允许读写）：{path}") from None
-
-    def _verify_fd_in_workspace(self, fd: int, path: Path, ws: Path) -> None:
-        """打开之后再校验一次 fd 指向的对象仍在工作区内（挡 resolve→open 之间的替换）。"""
-        procfd = f"/proc/self/fd/{fd}"
-        if os.path.isdir("/proc/self/fd"):
-            # Linux：直接看 fd 指去哪
-            real = os.path.realpath(procfd)
-            ws_real = os.path.realpath(str(ws))
-            if real != ws_real and not real.startswith(ws_real + os.sep):
-                raise PermissionError(f"打开的文件不在工作区内（fd 指向 {real}）")
-            return
-        # 回落：fstat 和重新 stat 路径比对 st_dev/st_ino，再确认 realpath 在区内
-        try:
-            fst = os.fstat(fd)
-            pst = os.stat(path)
-        except OSError:
-            raise PermissionError(f"打开的文件校验失败：{path}") from None
-        if (fst.st_dev, fst.st_ino) != (pst.st_dev, pst.st_ino):
-            raise PermissionError(f"打开期间文件被替换：{path}")
-        ws_real = os.path.realpath(str(ws))
-        parent_real = os.path.realpath(str(path.parent))
-        if parent_real != ws_real and not parent_real.startswith(ws_real + os.sep):
-            raise PermissionError(f"打开的文件不在工作区内：{path}")
+            raise PermissionError(f"文件不是普通文件或为符号链接：{last}") from None
+        st = os.fstat(fd)
+        if stat.S_ISDIR(st.st_mode):
+            os.close(fd)
+            raise IsADirectoryError(f"{last!r} 是目录，不是文件")
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            os.close(fd)
+            raise PermissionError(f"文件不是独立的普通文件：{last}")
+        return fd
 
     async def read_file(self, name: str, rel: str, *, max_bytes: int = _READ_DEFAULT_BYTES) -> str:
-        path = self.resolve(name, rel)
-        ws = Path(self.workspace(name))
-        if not path.exists():
-            raise FileNotFoundError(f"工作区内没有这个文件：{rel!r}")
-        if path.is_dir():
-            raise IsADirectoryError(f"{rel!r} 是目录，不是文件")
-        self._check_parents_no_symlink(ws, path)
         max_bytes = max(1, int(max_bytes))
-        fd = self._open_nofollow(path, os.O_RDONLY)
-        try:
-            self._verify_fd_in_workspace(fd, path, ws)
+        with self._parent_fd(name, rel) as (_ws, parent_fd, last):
+            try:
+                fd = self._open_file_at(parent_fd, last)
+            except FileNotFoundError:
+                raise FileNotFoundError(f"工作区内没有这个文件：{rel!r}") from None
             with os.fdopen(fd, "rb") as f:
                 data = f.read(max_bytes + 1)
-        finally:
-            # fdopen 成功会接管 fd；只有校验阶段抛错时才仍归这里管
-            try:
-                os.close(fd)
-            except OSError:
-                pass
         if len(data) > max_bytes:
             data = data[:max_bytes]
         return data.decode("utf-8", errors="replace")
 
     async def write_file(self, name: str, rel: str, content: str, *, append: bool = False) -> None:
         data = str(content).encode("utf-8")
-        path = self.resolve(name, rel)
-        ws = Path(self.workspace(name))
-        if path.is_dir():
-            raise IsADirectoryError(f"{rel!r} 已存在且是目录")
-        parent = path.parent
-        parent_existed = parent.exists()
-        if not parent_existed:
-            parent.mkdir(parents=True, exist_ok=True)
-        self._check_parents_no_symlink(ws, path)
-        old_total = 0
-        if append and path.exists():
-            old_total = path.stat().st_size
-        if old_total + len(data) > _MAX_FILE_BYTES:
+        if len(data) > _MAX_FILE_BYTES:
             raise ValueError(
                 f"单个文件不能超过 {_MAX_FILE_BYTES // (1024 * 1024)}MB：{rel!r} 写入后会超限"
             )
-        flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
-        fd = self._open_nofollow(path, flags)
-        try:
-            self._verify_fd_in_workspace(fd, path, ws)
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-        finally:
+        with self._parent_fd(name, rel, create=True) as (ws, parent_fd, last):
+            old_fd = None
+            old_stat = None
             try:
-                os.close(fd)
-            except OSError:
+                old_fd = self._open_file_at(parent_fd, last)
+            except FileNotFoundError:
                 pass
-        # systemd 模式且 root 时 chown 给 run_as：新建的父目录链从工作区往下补一次
-        self._chown_for_run_as(self.workspace(name) if not parent_existed else path)
+            if old_fd is not None:
+                try:
+                    old_stat = os.fstat(old_fd)
+                    if append and old_stat.st_size + len(data) > _MAX_FILE_BYTES:
+                        raise ValueError(
+                            f"单个文件不能超过 {_MAX_FILE_BYTES // (1024 * 1024)}MB：{rel!r} 写入后会超限"
+                        )
+                    with os.fdopen(old_fd, "rb") as f:
+                        old_fd = None
+                        prefix = f.read(_MAX_FILE_BYTES + 1) if append else b""
+                    if len(prefix) + len(data) > _MAX_FILE_BYTES:
+                        raise ValueError(f"单个文件不能超过 {_MAX_FILE_BYTES // (1024 * 1024)}MB：{rel!r}")
+                finally:
+                    if old_fd is not None:
+                        os.close(old_fd)
+            else:
+                prefix = b""
+
+            # 独立 inode，永远不对已存在的目标 fd 做 O_TRUNC/ftruncate/write；
+            # 就算旧文件被后续 hardlink 到外面，替换目录项也不会触及其内容。
+            temporary = f".maiwork-write-{secrets.token_hex(12)}"
+            fd = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | self._nofollow_flag()
+                | getattr(os, "O_CLOEXEC", 0), 0o644, dir_fd=parent_fd,
+            )
+            try:
+                if old_stat is not None:
+                    os.fchmod(fd, stat.S_IMODE(old_stat.st_mode))
+                with os.fdopen(fd, "wb") as f:
+                    fd = -1
+                    f.write(prefix)
+                    f.write(data)
+                # 交换前再次检查目标目录项；父目录始终用已打开的 fd 锚定。
+                try:
+                    current = os.stat(last, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    current = None
+                if (old_stat is None) != (current is None) or (
+                    old_stat is not None and current is not None
+                    and (old_stat.st_dev, old_stat.st_ino) != (current.st_dev, current.st_ino)
+                ) or (current is not None and (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1)):
+                    raise PermissionError(f"写入期间文件被替换：{rel}")
+                os.replace(temporary, last, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+                try:
+                    os.unlink(temporary, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+        # 锚定 workspace_root 遍历和 chown；目录被换成链接时 fail closed。
+        self._chown_for_run_as(ws)
 
     async def list_files(self, name: str, rel: str = "", *, depth: int = 2, limit: int = 200) -> list[dict]:
-        """列出工作区（或子目录 rel）下的条目：[{path, size, is_dir}]，path 相对工作区。"""
-        ws = self.workspace(name)
-        base = self.resolve(name, rel)
-        if not base.exists():
-            raise FileNotFoundError(f"工作区内没有这个目录：{rel!r}")
-        if not base.is_dir():
-            raise IsADirectoryError(f"{rel!r} 是文件，不是目录")
+        """只按目录 fd 列工作区；链接不列、不跟随，目录被替换也无法逃逸。"""
+        raw = str(rel or "")
+        candidate = Path(raw)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise PermissionError(f"路径必须在工作区内：{raw!r}")
         depth = max(0, int(depth))
         limit = max(1, int(limit))
         entries: list[dict] = []
 
-        def walk(d: Path, level: int) -> None:
+        def walk(fd: int, parts: tuple[str, ...], level: int) -> None:
             if level >= depth or len(entries) >= limit:
                 return
             try:
-                children = sorted(d.iterdir(), key=lambda p: p.name)
+                children = sorted(os.listdir(fd))
             except PermissionError:
                 return
-            for child in children:
+            for part in children:
                 if len(entries) >= limit:
                     return
-                is_dir = child.is_dir()
                 try:
-                    size = 0 if is_dir else child.stat().st_size
-                except OSError:
-                    size = 0
-                entries.append(
-                    {
-                        "path": str(child.relative_to(ws)),
-                        "size": int(size),
-                        "is_dir": bool(is_dir),
-                    }
-                )
+                    st = os.stat(part, dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(st.st_mode):
+                    continue  # 连链接目标的名字/大小都不探测
+                is_dir = stat.S_ISDIR(st.st_mode)
+                entries.append({
+                    "path": "/".join((*parts, part)),
+                    "size": 0 if is_dir else int(st.st_size),
+                    "is_dir": is_dir,
+                })
                 if is_dir:
-                    walk(child, level + 1)
+                    try:
+                        child_fd = self._open_dir(fd, part)
+                    except (FileNotFoundError, PermissionError):
+                        continue  # 目录已消失或被换成链接，不跟随
+                    try:
+                        walk(child_fd, (*parts, part), level + 1)
+                    finally:
+                        os.close(child_fd)
 
-        walk(base, 0)
+        with self._workspace_fd(name) as (_ws, ws_fd):
+            base_fd = os.dup(ws_fd)
+            try:
+                for part in candidate.parts:
+                    try:
+                        child_fd = self._open_dir(base_fd, part)
+                    except FileNotFoundError:
+                        raise FileNotFoundError(f"工作区内没有这个目录：{rel!r}") from None
+                    os.close(base_fd)
+                    base_fd = child_fd
+                walk(base_fd, candidate.parts, 0)
+            finally:
+                os.close(base_fd)
         return entries

@@ -109,7 +109,7 @@ _LEGAL = {
     "pending_approval": {"queued", "rejected", "cancelled"},
     "queued": {"running", "paused", "cancelled"},
     "running": {"reviewing", "waiting_input", "failed", "paused", "cancelled", "queued"},
-    "reviewing": {"completed", "running", "queued", "failed", "waiting_input", "cancelled"},
+    "reviewing": {"completed", "running", "queued", "failed", "waiting_input", "paused", "cancelled"},
     "waiting_input": {"queued", "running", "shelved", "cancelled"},
     "shelved": {"queued", "cancelled"},
     "paused": {"queued", "cancelled"},

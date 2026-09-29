@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import nullcontext
 from typing import Any, Callable, Iterable
 
 from . import clock
@@ -30,7 +31,7 @@ _LEGAL: dict[str, frozenset[str]] = {
     "pending_approval": frozenset({"queued", "rejected", "cancelled"}),
     "queued": frozenset({"running", "paused", "cancelled"}),
     "running": frozenset({"reviewing", "waiting_input", "failed", "paused", "cancelled", "queued"}),
-    "reviewing": frozenset({"completed", "running", "queued", "failed", "waiting_input", "cancelled"}),
+    "reviewing": frozenset({"completed", "running", "queued", "failed", "waiting_input", "paused", "cancelled"}),
     "waiting_input": frozenset({"queued", "running", "shelved", "cancelled"}),
     "shelved": frozenset({"queued", "cancelled"}),
     "paused": frozenset({"queued", "cancelled"}),
@@ -93,12 +94,14 @@ class Tasks:
         status: str = "queued",
         env: str = "",
         delivery_kind: str = "",
+        conn: sqlite3.Connection | None = None,
     ) -> str:
+        """Create a task; an optional caller-owned connection joins its transaction."""
         gid = str(group_id)
         now = clock.now()
         criteria_l = [str(c) for c in criteria]
         workspace = self._workspace_for(gid)
-        with self._store.tx() as conn:
+        with (self._store.tx() if conn is None else nullcontext(conn)) as conn:
             tid = next_id(conn, "T")
             conn.execute(
                 "INSERT INTO tasks (id, group_id, workspace, source, request_id, goal_id,"
@@ -224,6 +227,33 @@ class Tasks:
                 payload=payload or None,
             )
         return self.get(task_id)  # type: ignore[return-value]
+
+    def interrupt_orphaned(self, *, reason: str = "插件重启中断，保留已有产物；核对后手动继续") -> int:
+        """停机或冷启动时，把失去执行协程的任务暂停，不盲目重跑有副作用的操作。
+
+        状态、正在执行的尝试和时间线在同一事务里修改；queued/waiting_input 不受影响。
+        """
+        now = clock.now()
+        with self._store.tx() as conn:
+            rows = conn.execute(
+                "SELECT id, group_id FROM tasks WHERE status IN ('running', 'reviewing')"
+            ).fetchall()
+            for row in rows:
+                tid = str(row["id"])
+                conn.execute(
+                    "UPDATE tasks SET status='paused', updated=? WHERE id=? AND status IN ('running', 'reviewing')",
+                    (now, tid),
+                )
+                conn.execute(
+                    "UPDATE attempts SET status='stale', finished=COALESCE(finished, ?)"
+                    " WHERE task_id=? AND status='running'",
+                    (now, tid),
+                )
+                self._store.event(
+                    conn, "task.paused", group_id=str(row["group_id"]),
+                    entity="task", entity_id=tid, payload={"reason": str(reason)},
+                )
+        return len(rows)
 
     def set_env(self, task_id: str, env_text: str, *, note: str = "") -> None:
         """把任务在哪做的（本机 / 一次性机器）写进 env 字段；事件的 payload 同时进网页时间线。

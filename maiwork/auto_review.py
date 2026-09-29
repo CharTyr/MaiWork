@@ -94,6 +94,15 @@ class AutoReviewer:
         reason = await self._judge(gid, row)
         if reason is None:
             return None
+        # 模型调用期间，人批、群服务列表、配置和北京日期都可能已经变了。
+        try:
+            fresh = self._pending_row(rid)
+            day = clock.day_key(clock.now())
+            if fresh is None or not self._eligible(gid, fresh, day):
+                return None
+        except Exception:
+            logger.debug("自动审核落地前重查失败（%s），留给人批", rid, exc_info=True)
+            return None
         return self._approve(rid, gid, day, reason)
 
     # ------------------------------------------------------------------
@@ -123,12 +132,13 @@ class AutoReviewer:
         cap = self._daily_cap(approval)
         if cap <= 0:
             return False  # 0 = 关
-        if gid:
-            try:
-                if not settings.is_served(gid):
-                    return False  # 非服务群零模型调用
-            except Exception:
-                return False
+        if not gid:
+            return False  # 空群号不是服务群，也不能调模型
+        try:
+            if not settings.is_served(gid):
+                return False  # 非服务群零模型调用
+        except Exception:
+            return False
         if self._count(gid, day) >= cap:
             return False  # 今天这个群自动批的次数到上限了：连模型都不调
         if self._idea_has_goal(row):
@@ -197,17 +207,6 @@ class AutoReviewer:
         except (TypeError, ValueError):
             return 0
 
-    def _bump(self, gid: str, day: str) -> None:
-        """自动批通过一条才 +1（模型说不批 / 出错 / 已被别人批 → 不计数）。"""
-        if not gid:
-            return
-        n = self._count(gid, day) + 1
-        try:
-            with self._store.tx() as conn:
-                self._store.kv_set(conn, self._day_key(gid), {"day": day, "n": n})
-        except Exception:
-            logger.exception("记今天自动批了几条失败（群 %s）", gid)
-
     # ------------------------------------------------------------------
     # 问主模型
     # ------------------------------------------------------------------
@@ -272,14 +271,16 @@ class AutoReviewer:
 
     def _approve(self, rid: str, gid: str, day: str, reason: str) -> dict | None:
         try:
-            res = self._approvals.approve(rid, by=AUTO_BY, auto_reason=reason)
+            cap = self._daily_cap(self._get_settings().approval)
+            res = self._approvals.approve(
+                rid, by=AUTO_BY, auto_reason=reason, auto_daily=(day, cap),
+            )
         except (KeyError, ValueError):
-            # 请求没了 / 已经被人批过或拒了：什么都不做（不计数）
+            # 已被人处理，或模型等待时额度用完：留给人批，零计数。
             return None
         except Exception:
             logger.exception("自动批准落地出错（请求 %s），留给人批", rid)
             return None
-        self._bump(gid, day)
         tids = [str(t) for t in ((res or {}).get("task_ids") or []) if str(t)]
         tid = str((res or {}).get("task_id") or "")
         if tid and tid not in tids:

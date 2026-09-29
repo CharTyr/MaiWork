@@ -54,6 +54,8 @@ _LOG_RESPONSE_TEXT_MAX = 20000  # response.text
 _LOG_TOOL_OUT_ARGS_MAX = 1000   # 响应里 tool_calls 的 arguments
 _LOG_PRUNE_EVERY = 200      # 每写多少行顺手清一次超量/超期
 _RETRY_AFTER_CAP_S = 120.0  # 429 冷却里 Retry-After 的封顶
+# json_mode 的做法：提示里要求（不发 response_format，见 chat() 里的实验说明）
+_JSON_ONLY_HINT = "只输出一个完整的 JSON 对象（按下面要求的全部字段），不要输出任何别的文字。"
 _RETRY_DELAY_CAP_S = 60.0   # 非 429 重试等待的封顶（retry_delay_s 本身 1~60）
 _COOLDOWN_BACKOFF_S = (10.0, 20.0, 40.0, 60.0)  # 没有 Retry-After 时按连续 429 次数退避
 _COOLDOWN_CAP_S = 60.0      # 退避封顶
@@ -319,6 +321,10 @@ class ModelSettings:
             "context_window": self.context_window,
         }
 
+
+
+class _StreamError(Exception):
+    """流式回答中途出错（流里报错 / 没收完就断）：按可重试的 5xx 处理。"""
 
 @dataclass
 class ChatResult:
@@ -680,60 +686,76 @@ class Models:
                         await _SLEEP(wait)
                 elif pos > 0:
                     logger.warning("模型 %s 失败（%s），换备用 %s 再试", candidates[pos - 1], last_err, model)
-                body: dict[str, Any] = {"model": model, "messages": messages}
+                # json_mode：只在提示里要求 JSON，不发服务端的 response_format=json_object。
+                # 2026-09-29 线上对照实验（step-5-preview，同一个 persona.refresh 请求）：开 JSON 模式
+                # 两次分别缺字段 / 回空 {}，关掉后两次都完整正确；群画像 29 次里 26 次格式坏也是它。
+                # 各处解析本来就会去 ``` 围栏、取第一个 { 到最后一个 }，前后多几句话不怕。
+                send_messages = (
+                    [{"role": "system", "content": _JSON_ONLY_HINT}, *messages] if json_mode else messages
+                )
+                # 流式：线上网关约 125 秒收不到字节就 524 掐断，想得久的模型整段等会被掐；
+                # 流式时思考过程边想边回来，连接一直有字节。端点回普通 JSON 也照旧解析。
+                body: dict[str, Any] = {
+                    "model": model,
+                    "messages": send_messages,
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                }
                 if tools:
                     body["tools"] = tools
-                if json_mode:
-                    body["response_format"] = {"type": "json_object"}
                 start = clock.now()
+                status = 0
                 try:
                     async with self._throttle.slot(endpoint, concurrency=max_conc, max_rpm=max_rpm):
-                        resp = await client.post(
-                            url,
-                            json=body,
-                            headers={"Authorization": f"Bearer {key}"},
-                            timeout=timeout,
+                        status, err_text, data = await asyncio.wait_for(
+                            self._post_stream(client, url, body, key, timeout), timeout=timeout
                         )
-                except httpx.HTTPError as e:
+                except (httpx.HTTPError, asyncio.TimeoutError, _StreamError) as e:
                     ms = int((clock.now() - start) * 1000)
-                    detail = str(e).strip()
-                    last_err = ModelError(_redact(f"网络错误（{type(e).__name__}）{('：' + detail) if detail else ''}", [key]))
+                    if isinstance(e, asyncio.TimeoutError):
+                        detail = f"网络错误（ReadTimeout）：超过 {timeout:.0f} 秒还没回完"
+                    elif isinstance(e, _StreamError):
+                        detail = f"流中断：{e}"
+                    else:
+                        d = str(e).strip()
+                        detail = f"网络错误（{type(e).__name__}）{('：' + d) if d else ''}"
+                    last_err = ModelError(_redact(detail, [key]), status=502 if isinstance(e, _StreamError) else None)
                     self._log_attempt(
-                        model, role, attempt, ok=False, status=0, ms=ms,
+                        model, role, attempt, ok=False, status=status if isinstance(e, _StreamError) else 0, ms=ms,
                         prompt_tokens=0, completion_tokens=0, error=last_err.message,
                         request=log_request, response=None, keys=secret_keys,
                         purpose=purpose, group_id=group_id, task_id=task_id,
                     )
                     continue
                 ms = int((clock.now() - start) * 1000)
-                if resp.status_code >= 500 or resp.status_code in (429, 408):
+                if status >= 500 or status in (429, 408):
                     last_err = ModelError(
-                        _redact(f"端点返回 {resp.status_code}：{resp.text}", [key]),
-                        status=resp.status_code,
+                        _redact(f"端点返回 {status}：{err_text}", [key]),
+                        status=status,
                     )
-                    if resp.status_code == 429:
+                    if status == 429:
                         # 整个端点进冷却：Retry-After（秒数 / HTTP 日期）优先，封顶 120 秒；
                         # 没有就按连续 429 次数退避（10/20/40/60，封顶 60，±20% 抖动）
                         self._throttle.note_429(
                             endpoint,
-                            _parse_retry_after(resp.headers.get("Retry-After"), _NOW()),
+                            _parse_retry_after((data or {}).get("retry_after"), _NOW()),
                             concurrency=max_conc,
                         )
                     self._log_attempt(
-                        model, role, attempt, ok=False, status=resp.status_code, ms=ms,
+                        model, role, attempt, ok=False, status=status, ms=ms,
                         prompt_tokens=0, completion_tokens=0, error=last_err.message,
                         request=log_request, response=None, keys=secret_keys,
                         purpose=purpose, group_id=group_id, task_id=task_id,
                     )
                     continue
-                if resp.status_code != 200:
+                if status != 200:
                     # 其他 4xx：不重试、不换备用，直接抛
                     err = ModelError(
-                        _redact(f"端点返回 {resp.status_code}：{resp.text}", [key]),
-                        status=resp.status_code,
+                        _redact(f"端点返回 {status}：{err_text}", [key]),
+                        status=status,
                     )
                     self._log_attempt(
-                        model, role, attempt, ok=False, status=resp.status_code, ms=ms,
+                        model, role, attempt, ok=False, status=status, ms=ms,
                         prompt_tokens=0, completion_tokens=0, error=err.message,
                         request=log_request, response=None, keys=secret_keys,
                         purpose=purpose, group_id=group_id, task_id=task_id,
@@ -741,7 +763,7 @@ class Models:
                     raise err
                 self._throttle.note_success(endpoint, concurrency=max_conc)
                 try:
-                    result = self._parse_chat(resp.json(), model)
+                    result = self._parse_chat(data, model)
                 except ModelError as e:
                     msg = _redact(str(e), [key])
                     self._log_attempt(
@@ -751,7 +773,7 @@ class Models:
                         purpose=purpose, group_id=group_id, task_id=task_id,
                     )
                     raise
-                log_response = self._build_log_response(resp, result, secret_keys)
+                log_response = self._build_log_response(data, result, secret_keys)
                 self._log_attempt(
                     model, role, attempt, ok=True, status=200, ms=ms,
                     prompt_tokens=result.prompt_tokens, completion_tokens=result.completion_tokens,
@@ -761,6 +783,99 @@ class Models:
                 return result
         assert last_err is not None
         raise last_err
+
+    @staticmethod
+    async def _post_stream(
+        client: httpx.AsyncClient, url: str, body: dict, key: str, timeout: float
+    ) -> tuple[int, str, dict]:
+        """发一次（流式）请求，返回 (状态码, 出错时的响应文本, 拼好的「非流式」形状 data)。
+
+        200 + text/event-stream：逐行读 SSE，拼 content / tool_calls（按 index 拼 arguments）/
+        finish_reason / usage；reasoning_content 只让连接保持有字节，不进结果。
+        流里出现 {"error": ...}、或既没 [DONE] 也没 finish_reason 就断了 → _StreamError（可重试）。
+        200 + 别的类型（端点不支持流）：按普通 JSON 解析。
+        非 200：返回响应文本；429 时 data 里带 retry_after 头。
+        """
+        async with client.stream(
+            "POST", url, json=body, headers={"Authorization": f"Bearer {key}"}, timeout=timeout
+        ) as resp:
+            if resp.status_code != 200:
+                await resp.aread()
+                return resp.status_code, resp.text, {"retry_after": resp.headers.get("Retry-After")}
+            ctype = resp.headers.get("content-type", "")
+            if "text/event-stream" not in ctype:
+                await resp.aread()
+                try:
+                    data = resp.json()
+                except ValueError:
+                    raise ModelError("模型返回格式不对：不是 JSON") from None
+                return 200, "", data if isinstance(data, dict) else {}
+            text_parts: list[str] = []
+            calls: dict[int, dict] = {}
+            finish_reason = ""
+            usage: dict = {}
+            done = False
+            role = "assistant"
+            async for line in resp.aiter_lines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    done = True
+                    break
+                try:
+                    obj = json.loads(payload)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("error"):
+                    err = obj["error"]
+                    msg = err.get("message") if isinstance(err, dict) else err
+                    raise _StreamError(str(msg or err)[:500])
+                if isinstance(obj.get("usage"), dict):
+                    usage = obj["usage"]
+                for ch in obj.get("choices") or []:
+                    if not isinstance(ch, dict):
+                        continue
+                    if ch.get("finish_reason"):
+                        finish_reason = str(ch["finish_reason"])
+                    delta = ch.get("delta") or ch.get("message") or {}
+                    if not isinstance(delta, dict):
+                        continue
+                    if delta.get("role"):
+                        role = str(delta["role"])
+                    if isinstance(delta.get("content"), str):
+                        text_parts.append(delta["content"])
+                    for pos, tc in enumerate(delta.get("tool_calls") or []):
+                        if not isinstance(tc, dict):
+                            continue
+                        idx = tc.get("index")
+                        idx = int(idx) if isinstance(idx, int) else pos
+                        slot = calls.setdefault(
+                            idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                        )
+                        if tc.get("id"):
+                            slot["id"] = str(tc["id"])
+                        if tc.get("type"):
+                            slot["type"] = str(tc["type"])
+                        fn = tc.get("function") or {}
+                        if isinstance(fn, dict):
+                            name = fn.get("name")
+                            if name and name != slot["function"]["name"]:
+                                slot["function"]["name"] += str(name)
+                            if isinstance(fn.get("arguments"), str):
+                                slot["function"]["arguments"] += fn["arguments"]
+            if not done and not finish_reason:
+                raise _StreamError("连接断了，回答没收完")
+            message: dict[str, Any] = {"role": role, "content": "".join(text_parts)}
+            if calls:
+                message["tool_calls"] = [calls[i] for i in sorted(calls)]
+            return 200, "", {
+                "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+                "usage": usage,
+            }
 
     # ------------------------------------------------------------------
     # 请求日志（model_calls）：每次尝试一行，密钥绝不入库
@@ -811,11 +926,10 @@ class Models:
         return payload[:_LOG_REQUEST_MAX]
 
     @staticmethod
-    def _build_log_response(resp: httpx.Response, result: ChatResult, keys: list[str]) -> str:
+    def _build_log_response(data: Any, result: ChatResult, keys: list[str]) -> str:
         """响应 JSON：text（截 _LOG_RESPONSE_TEXT_MAX）/tool_calls（name+arguments 截 1000）/finish_reason。"""
         finish_reason = ""
         try:
-            data = resp.json()
             finish_reason = str((data.get("choices") or [{}])[0].get("finish_reason") or "")
         except Exception:
             finish_reason = ""

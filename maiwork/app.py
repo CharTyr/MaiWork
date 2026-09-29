@@ -160,6 +160,10 @@ class MaiWorkApp:
         # 「群 → [(task_id, question_msg_id, requester_id)]」，30 秒一刷，状态变了主动失效
         self._answer_cache: dict[str, list] = {}
         self._answer_cache_ts: float = 0.0
+        # MaiBot planner 钩子只查这张服务群内存映射；启动时从服务群的库行恢复，
+        # 消息到来时同步更新，不受后台循环 signals.take() 消耗影响。
+        self._session_to_served_group: dict[str, str] = {}
+        self._ambiguous_sessions: set[str] = set()
         # 网页规则覆盖（rules.py：rules.override）缓存：
         # (基础 Settings 对象 id, kv["rules.override"], 合并后的有效 Settings)
         self._effective_cache: tuple[int, Any, Settings] | None = None
@@ -380,6 +384,11 @@ class MaiWorkApp:
         from .tools_exec import register_exec_tools
 
         self.tasks = Tasks(self.store, self.get_settings, self.tools)
+        # 冷启动时上次进程的 running/reviewing 已无人接管；先暂停并保留产物，
+        # 不把可能有外部副作用的任务当作 queued 盲目重做。
+        interrupted = self.tasks.interrupt_orphaned()
+        if interrupted:
+            logger.warning("恢复时发现 %d 个执行中断的任务，已暂停待核对", interrupted)
         self.goals = Goals(self.store, self.get_settings)
         self.approvals = Approvals(self.store, self.get_settings, self.tasks, self.goals)
         # 主动提目标（GoalProposer；[goals] propose 默认开）：到点由后台循环调一次
@@ -479,6 +488,7 @@ class MaiWorkApp:
         self._intake = self._make_intake()
         # 5. 每个服务群建行 + token
         self._ensure_groups()
+        self._refresh_served_sessions()
         # 5.5 管理员对话：只给 admin 角色的工具 + 待确认门闸 + 对话循环（失败不影响其他功能）
         try:
             from .tools_admin import register_admin_tools
@@ -592,6 +602,14 @@ class MaiWorkApp:
             # 这里同步从新集合也删掉，外面读才干净
             self._bg_jobs.discard(t)
             self._running_jobs.discard(self._job_key_of(t))
+        # 所有协程收妥后再标暂停；重载失败或进程意外退出时，启动处也会补做。
+        if self.tasks is not None:
+            try:
+                interrupted = self.tasks.interrupt_orphaned(reason="插件停用或热重载中断，保留产物；核对后手动继续")
+                if interrupted:
+                    logger.warning("停机时暂停 %d 个执行中断的任务", interrupted)
+            except Exception:
+                logger.exception("停机时回收执行中任务失败；下次启动会再补")
         # 管理员对话的在跑回合先收掉（它会调模型和工具）
         chat, self.admin_chat = self.admin_chat, None
         if chat is not None:
@@ -709,6 +727,8 @@ class MaiWorkApp:
                 logger.exception("关闭数据库出错")
             self.store = None
         self._listen = None
+        self._session_to_served_group.clear()
+        self._ambiguous_sessions.clear()
         self.signals.take()  # 清掉残留信号
         self._started = False
 
@@ -751,6 +771,7 @@ class MaiWorkApp:
             logger.exception("配置更新后重判本机执行能力出错")
         self._drop_command_tools_if_stopped(self.tools)
         self._ensure_groups()
+        self._refresh_served_sessions()
         # 配置里删掉的群：残留就地标记（发件 cancelled / 任务 cancelled / 目标 cancelled / 待批 expired）
         try:
             self._reconcile_unserved()
@@ -884,17 +905,18 @@ class MaiWorkApp:
             if not self._started or self.mentions is None:
                 return dict(_CONTINUE)
             session_id = ""
+            gid = ""
             if isinstance(kwargs, dict):
                 session_id = str(kwargs.get("session_id") or "").strip()
             if session_id:
-                # 非服务群：只查内存里的信号表，不读库、不调宿主；
+                # 非服务群：只查内存里的信号/持久会话映射，不读库、不调宿主；
                 # G4：信号可能是热更新删群前的残留，查到群后必须用 is_served 复核
                 gid = self._group_for_session_cached(session_id)
                 if not gid:
                     return dict(_CONTINUE)
                 if self._settings is None or not self._settings.is_served(gid):
                     return dict(_CONTINUE)
-            modified = self.mentions.inject(kwargs)
+            modified = self.mentions.inject(kwargs, group_id=gid)
             if isinstance(modified, dict):
                 return {"action": "continue", "modified_kwargs": modified}
             return dict(_CONTINUE)
@@ -903,25 +925,56 @@ class MaiWorkApp:
             return dict(_CONTINUE)
 
     def _group_for_session_cached(self, session_id: str) -> str:
-        """session_id → 服务群号；只查内存信号表。命中不了返回 ""。
+        """session_id → 服务群号；钩子中只查内存，不查未知群的数据库行。
 
-        掉进 SQL 的路径只在 Mentions.render 里（那时已经确认是服务群）。
-        库里的 groups.session_id 由后台循环每次记信号时补写，供「重启后、
-        新消息进来前」这段空窗用（那时内存里还没有信号）。
+        signals 会被后台循环消费；持久映射只在启动时读服务群的库行、或
+        记录服务群新消息时更新，所以重启和信号消耗之后备忘仍然能注入。
         """
+        if session_id in self._ambiguous_sessions:
+            return ""  # 同一个会话号指向多个服务群，宁可不注入
         try:
             signals = getattr(self.signals, "_map", None)
             if isinstance(signals, dict):
-                for gid, sig in signals.items():
-                    if str(getattr(sig, "session_id", "") or "") == session_id:
-                        return str(gid)
+                matches = {str(gid) for gid, sig in signals.items()
+                           if str(getattr(sig, "session_id", "") or "") == session_id}
+                cached = self._session_to_served_group.get(session_id)
+                if len(matches) > 1 or (matches and cached and cached not in matches):
+                    self._ambiguous_sessions.add(session_id)
+                    self._session_to_served_group.pop(session_id, None)
+                    return ""
+                if matches:
+                    return next(iter(matches))
         except Exception:
             pass
-        return ""
+        return self._session_to_served_group.get(session_id, "")
+
+    def _refresh_served_sessions(self) -> None:
+        """只从配置里的服务群加载会话号；hook 对未知会话不碰数据库。"""
+        self._session_to_served_group = {}
+        self._ambiguous_sessions.clear()
+        if self.store is None or self._settings is None:
+            return
+        for gid in self._settings.groups:
+            try:
+                row = self.store.read().execute(
+                    "SELECT session_id FROM groups WHERE group_id=?", (str(gid),)
+                ).fetchone()
+                if row is not None and row["session_id"]:
+                    sid = str(row["session_id"])
+                    if sid in self._ambiguous_sessions:
+                        continue
+                    previous = self._session_to_served_group.get(sid)
+                    if previous is not None and previous != str(gid):
+                        self._session_to_served_group.pop(sid, None)
+                        self._ambiguous_sessions.add(sid)
+                    else:
+                        self._session_to_served_group[sid] = str(gid)
+            except Exception:
+                logger.exception("恢复服务群会话号失败（群 %s）", gid)
 
     def _remember_session_row(self, gid: str, session_id: str, last_ts: float) -> None:
         """把 session_id / last_msg_ts 记进 groups 表（planner 钩子的回落来源）。"""
-        if self.store is None or not session_id:
+        if self.store is None or not session_id or self._settings is None or not self._settings.is_served(str(gid)):
             return
         try:
             with self.store.tx() as conn:
@@ -929,6 +982,17 @@ class MaiWorkApp:
                     "UPDATE groups SET session_id=?, last_msg_ts=MAX(COALESCE(last_msg_ts,0), ?) WHERE group_id=?",
                     (str(session_id), float(last_ts), str(gid)),
                 )
+            sid = str(session_id)
+            previous = self._session_to_served_group.get(sid)
+            self._session_to_served_group = {
+                old_sid: group for old_sid, group in self._session_to_served_group.items()
+                if group != str(gid)
+            }
+            if previous is not None and previous != str(gid):
+                self._ambiguous_sessions.add(sid)
+                self._session_to_served_group.pop(sid, None)
+            elif sid not in self._ambiguous_sessions:
+                self._session_to_served_group[sid] = str(gid)
         except Exception:
             logger.debug("记 groups.session_id 失败（群 %s）", gid, exc_info=True)
 
@@ -994,7 +1058,7 @@ class MaiWorkApp:
         """配置里不再服务的群：库里残留就地标记（不删数据）。
 
         - pending 发件 → cancelled（error 写「这个群已不在服务列表」）；
-        - queued / waiting_input 任务 → cancelled（同样 reason，走 transition 记事件）；
+        - 所有非终态任务（含 running / reviewing / paused）→ cancelled，停当前执行；
         - active 目标 → cancelled；
         - pending 待批 → expired。
         启动和热更新都跑一遍；非服务群的零派工/零发送由它 + 各巡检入口的
@@ -1024,11 +1088,13 @@ class MaiWorkApp:
                         logger.exception("回收发件箱失败（群 %s）", gid)
             except Exception:
                 logger.exception("回收发件箱查询失败")
-        # 2) 任务 queued / waiting_input → cancelled
+        # 2) 非终态任务全部取消；running/reviewing 的子 agent 协程也要停。
         if self.tasks is not None:
             try:
                 rows = self.store.read().execute(
-                    "SELECT id, group_id FROM tasks WHERE status IN ('queued', 'waiting_input')"
+                    "SELECT id, group_id FROM tasks WHERE status IN "
+                    "('pending_approval', 'queued', 'running', 'reviewing', "
+                    "'waiting_input', 'shelved', 'paused')"
                 ).fetchall()
                 for r in rows:
                     gid = str(r["group_id"])
@@ -1036,6 +1102,7 @@ class MaiWorkApp:
                         continue
                     try:
                         self.tasks.transition(str(r["id"]), "cancelled", reason=reason)
+                        self.cancel_task_run(str(r["id"]))
                         logger.info("群 %s 已不在服务列表：任务 %s 标 cancelled", gid, r["id"])
                     except Exception:
                         logger.exception("回收任务失败（%s）", r["id"])

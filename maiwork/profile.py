@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import re
 import logging
 import math
 import random
@@ -214,7 +215,7 @@ class Profiles:
             return False
         for i in range(0, len(msgs), self._REFRESH_BATCH):
             batch_msgs = msgs[i : i + self._REFRESH_BATCH]
-            ok = await self._refine_batch(gid, batch_msgs, now)
+            ok = await self._refine_with_split(gid, batch_msgs, now)
             if not ok:
                 return False
         return True
@@ -241,20 +242,67 @@ class Profiles:
             uniq.append(m)
         return uniq
 
-    async def _refine_batch(self, gid: str, batch_msgs: list, now: float) -> bool:
-        """调主模型提炼一批消息。成功返回 True；失败（ModelError/解析失败）记 fail_count 返回 False。"""
+    # 一批整批失败时，拆成两半各试一次的门槛（太小的批就不拆了）
+    _SPLIT_MIN = 40
+    # 整理画像的单次等待上限（秒）：step-5-preview 先在后台「思考」2k–9.5k token（约 70 token/秒），
+    # 120 秒不够；超时只重试 1 次（同一批原样重复多次没用，线上 18 次全超时）
+    _REFRESH_TIMEOUT_S = 300
+    _REFRESH_RETRIES = 1
+    _FORMAT_RETRY_TEXT = (
+        "上面的回答读不懂，格式不对。请严格按「一行一件事」的格式重新输出，每行用「|」分段，"
+        "例如：新增 | 最近在聊 | 一句话 | 3,5。不要 JSON、不要别的话；"
+        "这批消息没有任何新变化就只输出一行：没有变化"
+    )
+
+    async def _refine_with_split(self, gid: str, batch_msgs: list, now: float) -> bool:
+        """提炼一批；整批失败且够大 → 拆两半各试一次（前半失败就停）；最终失败才记 fail_count。"""
+        if await self._refine_batch(gid, batch_msgs, now, record_failure=False):
+            return True
+        if len(batch_msgs) >= self._SPLIT_MIN:
+            half = len(batch_msgs) // 2
+            for part in (batch_msgs[:half], batch_msgs[half:]):
+                if not await self._refine_batch(gid, part, now, record_failure=False):
+                    return self._batch_failed(gid, now, part)
+            return True
+        return self._batch_failed(gid, now, batch_msgs)
+
+    async def _ask_model(self, gid: str, messages: list):
+        return await self._models.chat(
+            "main", messages, json_mode=False, purpose="profile.refresh", group_id=gid,
+            timeout=self._REFRESH_TIMEOUT_S, retries=self._REFRESH_RETRIES,
+        )
+
+    async def _refine_batch(self, gid: str, batch_msgs: list, now: float, *, record_failure: bool = True) -> bool:
+        """调主模型提炼一批消息。成功返回 True。
+
+        读不懂（格式不对、回空 {}）不算成功：带着「格式不对」再问一次，还读不懂才算失败。
+        失败时 record_failure=True 记 fail_count；False 交给调用方（拆半重试）决定。
+        """
         from .models import ModelError  # 局部导入，避免和 TYPE_CHECKING 重复
+
+        def failed() -> bool:
+            return self._batch_failed(gid, now, batch_msgs) if record_failure else False
 
         messages = self._build_prompt(gid, batch_msgs)
         try:
-            result = await self._models.chat(
-                "main", messages, json_mode=True, purpose="profile.refresh", group_id=gid
-            )
+            result = await self._ask_model(gid, messages)
         except ModelError:
-            return self._batch_failed(gid, now, batch_msgs)
+            return failed()
         parsed = self._parse_output(result.text)
         if parsed is None:
-            return self._batch_failed(gid, now, batch_msgs)
+            logger.info("整理群画像：回答读不懂，再问一次（群 %s）：%s", gid, str(result.text or "")[:80])
+            retry = [
+                *messages,
+                {"role": "assistant", "content": str(result.text or "")[:2000]},
+                {"role": "user", "content": self._FORMAT_RETRY_TEXT},
+            ]
+            try:
+                result = await self._ask_model(gid, retry)
+            except ModelError:
+                return failed()
+            parsed = self._parse_output(result.text)
+        if parsed is None:
+            return failed()
         ops, people, asks = parsed
         op_counts: dict
         changed = False
@@ -823,7 +871,7 @@ class Profiles:
 
     _PROMPT_SYSTEM = (
         "你在为 MaiWork（QQ 群的后台助手）维护一个群的画像。你的任务：读一段群聊记录，"
-        "更新这个群的画像条目和关注成员注记。只输出 JSON，不要任何解释、Markdown 以外的话。"
+        "更新这个群的画像条目和关注成员注记。按要求的「一行一件事」格式输出，不要写别的话。"
     )
 
     _PROMPT_RULES = (
@@ -831,13 +879,13 @@ class Profiles:
         "1. 只记群「整体」的话题、兴趣、在做的事、约定术语、常用资源这五类；"
         "不记某个人的隐私（手机号、住址、感情私事、不愿公开的个人信息等）。\n"
         "2. 每条一句话，不超过 40 字；每类最多约 8 条。\n"
-        "3. 这批消息没有带来新变化就不动，ops 给空列表。\n"
+        "3. 这批消息没有带来新变化就不动，只输出一行「没有变化」。\n"
         "4. 锁定的条目不能改、不能删。\n"
         "5. 管理员删除过的条目（墓碑）不许再加回来（换个说法也不行）。\n"
         "6. evidence 填支持这条判断的消息序号（方括号里那个数）。\n"
-        "7. people 只写关注成员的注记（他们是群里的关键人物，给管理员一个人看的），"
+        "7. 关注成员只写关注成员的注记（他们是群里的关键人物，给管理员一个人看的），"
         "一句话不超过 120 字；没有新观察就空列表。\n"
-        "8. asks：这批消息里**明确对 MaiBot / 机器人说的请求**（@ 了它、点名它、或明确说"
+        "8. 请求：这批消息里**明确对 MaiBot / 机器人说的请求**（@ 了它、点名它、或明确说"
         "「帮我整理 / 帮我准备 / 提醒我」这类），记一条；"
         "消息序号后面标了「这条 @ 了 MaiBot，Jev 没判出来，请你判断」的，请重点判断那条。"
         "kind 三选一：prepare=请它准备 / 整理 / 调研 / 做一个东西；goal=请它帮忙盯着某件事"
@@ -847,13 +895,16 @@ class Profiles:
         "   泛泛的「谁来整理一下」这种没指明对机器人说的，不要收；拿不准是不是请求的不收。"
         "没有就空列表。机器人自己说的话（名字 MaiBot 的行）永远不收。"
         "以 / ! # 开头的是**别的插件的指令**（比如 /pic 画图），不是请 MaiWork 做事，永远不收。\n"
-        '输出格式（顶层就这三个键）：\n'
-        'category 只能填这五个英文代码之一：recent（最近在聊）、interest（长期兴趣）、'
-        'ongoing（在做的事）、convention（约定和说法）、resource（常用资源）。\n'
-        '{"ops":[{"op":"add|update|remove|touch","id":条目id,"category":"recent|interest|ongoing|convention|resource",'
-        '"text":"一句话","evidence":[消息序号]}],'
-        '"people":[{"user_id":"QQ号","note":"注记"}],'
-        '"asks":[{"i":消息序号,"kind":"prepare|goal|reminder","title":"≤30字","when":""}]}'
+        "输出格式：一行一件事，每行用「|」分成几段，不要编号、不要 JSON、不要别的话。\n"
+        "类别只能写这五个之一：最近在聊（recent）、长期兴趣（interest）、在做的事（ongoing）、"
+        "约定和说法（convention）、常用资源（resource）。\n"
+        "新增 | 类别 | 一句话 | 证据消息序号（逗号分开）\n"
+        "修改 | #条目id | 改成的一句话\n"
+        "删除 | #条目id\n"
+        "还在聊 | #条目id | 证据消息序号（这条又被聊到了）\n"
+        "关注成员 | QQ号 | 注记\n"
+        "请求 | 消息序号 | prepare 或 goal 或 reminder | 不超过 30 字说清要什么 | 提醒时间（没有就空着）\n"
+        "这批消息没有任何新变化，就只输出一行：没有变化"
     )
 
     def _build_prompt(self, gid: str, batch_msgs: list) -> list:
@@ -932,27 +983,113 @@ class Profiles:
     # -- 解析 --
 
     def _parse_output(self, text: str) -> tuple[list, list, list] | None:
-        """宽容解析模型输出：去 ``` 包裹、取首个 { 到末个 }；结构不对返回 None。
+        """解析模型输出，返回 (ops, people, asks)；读不懂返回 None（**不许**当成「没变化」）。
 
-        返回 (ops, people, asks) 三个 list。ops 每项非 dict、people / asks 每项非 dict 时
-        整批算失败（模型乱说话，不拿半成品入库）；缺 asks 键当空列表（向后兼容）。
+        2026-09-29 起主格式是「一行一件事」（见 _PROMPT_RULES）：每行单独读，坏行跳过，好行照收；
+        一行都读不出、也没写「没有变化」→ None。
+        兼容 JSON（老格式 / 别的模型）：{"ops":[…],"people":[…],"asks":[…]}；只给一条 op 的对象、
+        顶层就是 op 列表也收（线上 step-5-preview 常这么回，内容是对的）；回空 {}、压扁成重复键 → None。
         """
         s = str(text or "").strip()
         if s.startswith("```"):
-            # 去掉 ```json / ``` 围栏（首行和同行结尾的 ```）
             s = s.strip("`").strip()
             if s.lower().startswith("json"):
                 s = s[4:].strip()
-        start = s.find("{")
-        end = s.rfind("}")
+        if s[:1] in "{[":
+            return self._parse_json_output(s)
+        return self._parse_lines(s)
+
+    _LINE_KINDS = {
+        "新增": "add", "add": "add", "修改": "update", "update": "update",
+        "删除": "remove", "remove": "remove", "还在聊": "touch", "touch": "touch",
+        "关注成员": "people", "people": "people", "请求": "ask", "ask": "ask",
+    }
+
+    @staticmethod
+    def _evidence_of(field: str) -> list[int]:
+        return [int(x) for x in re.findall(r"\d+", str(field or ""))]
+
+    @staticmethod
+    def _id_of(field: str) -> int | None:
+        m = re.search(r"\d+", str(field or ""))
+        return int(m.group(0)) if m else None
+
+    def _parse_lines(self, s: str) -> tuple[list, list, list] | None:
+        ops: list[dict] = []
+        people: list[dict] = []
+        asks: list[dict] = []
+        no_change = False
+        for raw in s.splitlines():
+            line = raw.strip().strip("`").strip()
+            line = re.sub(r"^(?:[-*•]|\d+[.、)）])\s*", "", line)
+            if not line:
+                continue
+            if line.replace("。", "").strip() in ("没有变化", "无变化", "没变化"):
+                no_change = True
+                continue
+            parts = [x.strip() for x in re.split(r"[|｜]", line)]
+            kind = self._LINE_KINDS.get(parts[0].lower() if parts else "")
+            if kind is None:
+                continue
+            if kind == "add" and len(parts) >= 3:
+                # 文本里可能自带「|」：最后一段像序号列表就当证据，中间都算文本
+                tail_is_ev = len(parts) >= 4 and bool(re.fullmatch(r"[\d,，、\s]*", parts[-1]))
+                body = parts[2:-1] if tail_is_ev else parts[2:]
+                text_ = "|".join(body).strip()
+                if text_:
+                    ops.append({"op": "add", "category": parts[1], "text": text_,
+                                "evidence": self._evidence_of(parts[-1]) if tail_is_ev else []})
+            elif kind == "update" and len(parts) >= 3:
+                eid = self._id_of(parts[1])
+                text_ = "|".join(parts[2:]).strip()
+                if eid is not None and text_:
+                    ops.append({"op": "update", "id": eid, "text": text_})
+            elif kind == "remove" and len(parts) >= 2:
+                eid = self._id_of(parts[1])
+                if eid is not None:
+                    ops.append({"op": "remove", "id": eid})
+            elif kind == "touch" and len(parts) >= 2:
+                eid = self._id_of(parts[1])
+                if eid is not None:
+                    ops.append({"op": "touch", "id": eid,
+                                "evidence": self._evidence_of(parts[2]) if len(parts) >= 3 else []})
+            elif kind == "people" and len(parts) >= 3:
+                uid = parts[1].strip()
+                note = "|".join(parts[2:]).strip()
+                if uid and note:
+                    people.append({"user_id": uid, "note": note})
+            elif kind == "ask" and len(parts) >= 4:
+                idx = self._id_of(parts[1])
+                if idx is not None:
+                    asks.append({"i": idx, "kind": parts[2].strip().lower(), "title": parts[3].strip(),
+                                 "when": parts[4].strip() if len(parts) >= 5 else ""})
+        if not (ops or people or asks or no_change):
+            return None
+        return ops, people, asks
+
+    def _parse_json_output(self, s: str) -> tuple[list, list, list] | None:
+        def no_dup(pairs):
+            keys = [k for k, _ in pairs]
+            if len(keys) != len(set(keys)):
+                raise ValueError("重复键（被压扁的多条）")
+            return dict(pairs)
+
+        start = min([i for i in (s.find("{"), s.find("[")) if i >= 0], default=-1)
+        end = max(s.rfind("}"), s.rfind("]"))
         if start < 0 or end <= start:
             return None
         try:
-            data = json.loads(s[start : end + 1])
+            data = json.loads(s[start : end + 1], object_pairs_hook=no_dup)
         except (ValueError, TypeError):
             return None
+        if isinstance(data, list):
+            data = {"ops": data}
         if not isinstance(data, dict):
             return None
+        if "op" in data and not any(k in data for k in ("ops", "people", "asks")):
+            data = {"ops": [data]}  # 只给了一条 op
+        if not any(k in data for k in ("ops", "people", "asks")):
+            return None  # 回空 {} / 结构对不上：读不懂，不当成「没变化」
         ops = data.get("ops")
         people = data.get("people")
         asks = data.get("asks")

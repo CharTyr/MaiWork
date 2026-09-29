@@ -269,6 +269,30 @@ class TestPersonalPrepare:
         assert got == 0
         assert workers.calls == []
 
+    def test_collect_has_time_box(self, tmp_path) -> None:
+        """子 agent 找资讯要有时间盒（和群资讯同一个 [feeds] collect_minutes）。
+        2026-09-29 线上：个人资讯子 agent 没有时间盒，一轮跑了一个多小时、反复压缩对话。"""
+        from CharTyr_MaiWork.maiwork import clock
+
+        models = FakeModelsQueue(
+            ready=True,
+            replies=[
+                json.dumps({"focus": [{"query": "FPGA 学习板 新出", "why": "在做 FPGA 学习板"}],
+                            "idea": None}, ensure_ascii=False),
+                _personal_scores_json(),
+                json.dumps({"posts": []}, ensure_ascii=False),
+            ],
+        )
+        store, settings, personal, models, workers, topics, _ = _make_personal(tmp_path, models=models)
+        before = clock.now()
+        _run(personal.prepare_personal(GID, UID))
+        assert workers.calls, "应该派了子 agent"
+        dl = workers.calls[0].get("deadline_ts")
+        assert dl is not None, "个人资讯子 agent 必须带 deadline_ts"
+        minutes = int(getattr(settings.feeds, "collect_minutes", 15) or 15)
+        assert before + minutes * 60 - 5 <= dl <= clock.now() + minutes * 60 + 5
+        assert f"{minutes} 分钟" in workers.calls[0]["brief"]
+
     def test_happy_path_writes_target_user_id(self, tmp_path) -> None:
         """全流程：过线的两条入 news_items 且 target_user_id=UID；被筛的一条也入库。"""
         models = FakeModelsQueue(

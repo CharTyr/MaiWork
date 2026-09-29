@@ -1,9 +1,9 @@
 """RSS 资讯源（rss.py）。
 
 - 数据：kv["feeds.rss.<群号>"] = [{id, url, title, enabled, added_ts, last_ok_ts, last_error}]；
-  每群最多 20 个，url 必须 http(s)。
-- 解析：RSS 2.0（channel/item）和 Atom（feed/entry）都认；标准库 xml.etree 解析，
-  **禁用外部实体**：defusedxml 不可用就手动拒绝含 <!DOCTYPE 的文档（守住 XXE，不用引第三方）。
+  每群最多 20 个，url 必须为无 userinfo 的公开 http(s) 地址。
+- 解析：RSS 2.0（channel/item）和 Atom（feed/entry）都认；先用标准库 Expat
+  的 DTD 事件拒绝真正的 DOCTYPE（不误伤注释），再交给 xml.etree 解析。
 - 取最近 lookback_days 内的条目 {title, url, published, summary(去 HTML 截 500)}；
   每源每轮最多 10 条；超时 15s；响应 ≤2MB。
 - 条目并进备料：和搜索子 agent 的候选**合并后走同一套质量门槛**（见 feeds 接线处注释）。
@@ -11,12 +11,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
+import ipaddress
 import logging
 import re
+import socket
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urlsplit
+from xml.parsers import expat
 
 import httpx
 
@@ -68,6 +73,7 @@ def list_feeds(store: Any, gid: str) -> list[dict[str, Any]]:
 def add_feed(store: Any, gid: str, *, url: str, title: str, feed_id: str, now: float | None = None) -> dict[str, Any]:
     """加源（不试取——试取是接口层「先试取，成功才保存」在做）。RssError 拒绝。"""
     url_s = _require_http(url)
+    _public_url(url_s)  # 即使绕过网页接口直接保存，也不能存入明显的内网地址或 userinfo。
     now = float(clock.now() if now is None else now)
     feeds = _load_list(store, gid)
     if len(feeds) >= _GROUP_MAX:
@@ -152,20 +158,87 @@ def _require_http(url: Any) -> str:
     return s
 
 
+def _literal_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """兼容 inet_aton 的 127.1 / 整数 / 十六进制 IPv4 写法，不让它们冒充域名。"""
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            return ipaddress.IPv4Address(socket.inet_aton(host))
+        except (OSError, ValueError):
+            return None
+
+
+def _public_address(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    # IPv4-mapped IPv6 也按里面的 IPv4 判断，拒绝保留/环回/私网/链路本地地址。
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_global
+
+
+def _public_url(url: str) -> httpx.URL:
+    """无网络预检；注入 MockTransport 时不做真实 DNS，生产请求还要在连接前查 DNS。"""
+    try:
+        parsed = httpx.URL(url)
+        authority = urlsplit(url).netloc
+    except (httpx.InvalidURL, ValueError) as e:
+        raise RssError(f"RSS 源地址格式不合法：{e}") from None
+    host = parsed.host or ""
+    if parsed.scheme not in ("http", "https") or not host:
+        raise RssError("RSS 源地址必须有 http(s) 协议和主机名")
+    if "@" in authority or parsed.userinfo:
+        raise RssError("RSS 源地址不能带用户名或密码")
+    if host.rstrip(".").lower().endswith(".localhost") or host.rstrip(".").lower() == "localhost":
+        raise RssError("RSS 源地址不能指向本机或内网")
+    ip = _literal_ip(host)
+    if ip is not None and not _public_address(str(ip)):
+        raise RssError("RSS 源地址不能指向本机或内网")
+    return parsed
+
+
+def _resolve_public_ip(host: str, port: int) -> str:
+    """生产直连：所有 DNS 答案须为公开地址；失败或混有内网地址一律不连接。"""
+    try:
+        answers = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+    except (OSError, ValueError, UnicodeError):
+        raise RssError("RSS 域名解析失败，无法安全取源") from None
+    addresses = [str(answer[4][0]) for answer in answers]
+    if not addresses:
+        raise RssError("RSS 域名解析无结果，无法安全取源")
+    if any(not _public_address(address) for address in addresses):
+        raise RssError("RSS 源域名解析到本机或内网地址，拒绝取源")
+    return addresses[0]
+
+
 # ----------------------------------------------------------------------
 # 解析
 # ----------------------------------------------------------------------
 
-_DOCTYPE_RE = re.compile(r"<!DOCTYPE", re.IGNORECASE)
 _TAG_LIKE_RE = re.compile(r"<[^>]+>")
 _SUMMARY_MAX = 500
 
 
+def _reject_doctype(xml_text: str) -> None:
+    """按 XML 语法识别 DTD，跨越任意长度注释，且不误伤注释中的字面量。"""
+    parser = expat.ParserCreate()
+
+    def on_doctype(*_args: Any) -> None:
+        raise RssError("RSS 文档带 <!DOCTYPE（可能藏外部实体），禁止解析")
+
+    parser.StartDoctypeDeclHandler = on_doctype
+    try:
+        parser.Parse(xml_text, True)
+    except expat.ExpatError as e:
+        raise RssError(f"XML 解析失败：{e}") from None
+
+
 def parse_feed(xml_text: str, *, now: float, lookback_days: int) -> dict[str, Any]:
     """RSS 2.0 / Atom → {"title", "items":[{title,url,published,summary}]}；解析不了抛 RssError。"""
-    head = xml_text[:4096]
-    if _DOCTYPE_RE.search(head):
-        raise RssError("RSS 文档带 <!DOCTYPE（可能藏外部实体），禁止解析")
+    _reject_doctype(xml_text)
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as e:
@@ -333,22 +406,48 @@ async def fetch_feed_source(
     now = float(clock.now() if now is None else now)
     out: dict[str, Any] = {"title": "", "items": [], "error": ""}
     try:
-        async with httpx.AsyncClient(transport=transport) as client:
-            async with client.stream(
-                "GET", url_s, timeout=_TIMEOUT_S, headers={"User-Agent": _UA}, follow_redirects=False
-            ) as resp:
-                if resp.status_code != 200:
-                    out["error"] = f"取 RSS 失败（HTTP {resp.status_code}）"
-                    return out
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in resp.aiter_bytes():
-                    total += len(chunk)
-                    if total > _MAX_BYTES:
-                        out["error"] = "RSS 响应太大了（超过 2MB）"
+        parsed = _public_url(url_s)
+    except RssError as e:
+        # 网页 POST 取源阶段用 error 返回 400；这里直接抛会变成未处理的 500。
+        out["error"] = str(e)
+        return out
+    try:
+        # 全程限时；to_thread 的系统 DNS 调用即使超时仍可能在后台结束，但不会发 HTTP 请求。
+        async with asyncio.timeout(_TIMEOUT_S):
+            request_url = parsed
+            headers = {"User-Agent": _UA}
+            extensions: dict[str, Any] = {}
+            network_transport = transport
+            if transport is None:
+                host = parsed.host or ""
+                port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                address = await asyncio.to_thread(_resolve_public_ip, host, port)
+                # 固定连接到已经审核过的 IP，而非在客户端里对原域名做第二次 DNS 查询。
+                request_url = parsed.copy_with(host=address)
+                headers["Host"] = parsed.netloc.decode("ascii")
+                extensions["sni_hostname"] = parsed.raw_host.decode("ascii").rstrip(".")
+                # 禁止环境 HTTP(S)_PROXY / ALL_PROXY 将安全连接转交给未校验的代理。
+                network_transport = httpx.AsyncHTTPTransport(trust_env=False)
+            async with httpx.AsyncClient(transport=network_transport, trust_env=False) as client:
+                async with client.stream(
+                    "GET", request_url, timeout=_TIMEOUT_S, headers=headers,
+                    extensions=extensions, follow_redirects=False,
+                ) as resp:
+                    if resp.status_code != 200:
+                        out["error"] = f"取 RSS 失败（HTTP {resp.status_code}）"
                         return out
-                    chunks.append(chunk)
-    except httpx.TimeoutException:
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.aiter_bytes():
+                        total += len(chunk)
+                        if total > _MAX_BYTES:
+                            out["error"] = "RSS 响应太大了（超过 2MB）"
+                            return out
+                        chunks.append(chunk)
+    except RssError as e:
+        out["error"] = str(e)
+        return out
+    except (TimeoutError, httpx.TimeoutException):
         out["error"] = f"取 RSS 超时（{_TIMEOUT_S:g} 秒）"
         return out
     except httpx.HTTPError as e:

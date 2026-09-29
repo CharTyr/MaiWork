@@ -2352,7 +2352,13 @@ class ConsoleServer:
                     svc.tasks.transition(tid, "queued", reason="网页重试")
                     _start_approved_task({"task_id": tid})
                 elif op == "redeliver":
+                    if not svc.get_settings().is_served(str(row.get("group_id") or "")):
+                        return _err(409, "这个群已不在服务列表，不能重发")
                     redeliver_result = self._redeliver_failed(svc, tid)
+                    if status == "completed" and getattr(svc, "delivery", None) is not None:
+                        # 入队前就失败的任务没有 failed 行可 retry；由交付层重新核验成品，
+                        # 只补首条成品记录，不重传已经入队或结果不明的文件。
+                        await svc.delivery.reenqueue_missing(tid, svc.env)
                     redeliver_warning = str(redeliver_result.get("warning") or "")
                 else:
                     return _err(404, "没有这个操作")

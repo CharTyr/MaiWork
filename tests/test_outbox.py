@@ -176,10 +176,7 @@ async def test_flush_sleeping_hours_postpones(tmp_path):
     """睡觉时段：受限推送（topic/status/reminder）推迟到时段结束后，状态仍 pending，
     原因写进 error 字段。
 
-    注意（S2 修复）：本测试曾经用 push_kind="delivery" 断言「交付被睡觉时段推迟」——
-    那是错的：02 §6.4 规定用户当时正在等的交付不受睡觉时段和每日上限限制。
-    delivery 豁免的行为在 tests/test_audit_s2.py 覆盖；这里改用 topic 验证
-    「受限推送」的推迟语义本身没变。
+    普通交付同样受睡觉时段约束；只有明确标记为当时有人等待的交付可以即时发。
     """
     store, _, host, _, _, ob = _make(tmp_path)
     ob.enqueue("k1", GID, "text", {"text": "随便聊聊这个", "push_kind": "topic"})
@@ -195,13 +192,15 @@ async def test_flush_sleeping_hours_postpones(tmp_path):
     assert len(host.texts) == 1
 
 
-async def test_flush_sleeping_hours_delivery_not_postponed(tmp_path):
-    """睡觉时段：delivery 照发不推迟（02 §6.4：用户当时正在等的交付不受限）。"""
+async def test_flush_sleeping_hours_delivery_postponed(tmp_path):
+    """普通交付在睡觉时段也要推迟，明确当场有人等的除外。"""
     store, _, host, _, _, ob = _make(tmp_path)
     ob.enqueue("k1", GID, "text", {"text": "成品来了", "push_kind": "delivery"})
+    ob.enqueue("k2", GID, "text", {"text": "当场交付", "push_kind": "awaited_delivery"})
     await ob.flush(SLEEP)
-    assert _rows(store)[0]["status"] == "sent"
-    assert [t["text"] for t in host.texts] == ["成品来了"]
+    assert _rows(store)[0]["status"] == "pending"
+    assert _rows(store)[1]["status"] == "sent"
+    assert [t["text"] for t in host.texts] == ["当场交付"]
 
 
 async def test_flush_sleeping_hours_error_and_command_not_postponed(tmp_path):
@@ -218,9 +217,7 @@ async def test_flush_sleeping_hours_error_and_command_not_postponed(tmp_path):
 async def test_flush_daily_limit_postpones_to_tomorrow(tmp_path):
     """当天配额用完 → 受限推送推到明天 00:00 之后。
 
-    注意（S2 修复）：本测试曾经用 push_kind="delivery" 断言「交付被每日上限推迟」——
-    那是错的：delivery 不受每日上限限制也不计入上限（02 §6.4）。改用 status 验证
-    「受限推送」的推迟语义本身没变。
+    普通交付和 status 一样计入主动推送日限额。
     """
     store, _, host, pushes, _, ob = _make(tmp_path, cfg={"delivery": {"push_per_day": 1}})
     ob.enqueue("k1", GID, "text", {"text": "第一条", "push_kind": "status"})
@@ -234,15 +231,15 @@ async def test_flush_daily_limit_postpones_to_tomorrow(tmp_path):
     assert "上限" in row["error"] or "推够" in row["error"]
 
 
-async def test_flush_daily_limit_delivery_not_limited(tmp_path):
-    """delivery 不受每日上限限制、也不计入上限：先发交付，status 第一条照常能发。"""
+async def test_flush_daily_limit_delivery_counts_as_push(tmp_path):
+    """每日上限 1：交付先发，status 推迟到明天。"""
     store, _, host, pushes, _, ob = _make(tmp_path, cfg={"delivery": {"push_per_day": 1}})
     ob.enqueue("d1", GID, "text", {"text": "成品", "push_kind": "delivery"})
     ob.enqueue("s1", GID, "text", {"text": "状态", "push_kind": "status"})
     await ob.flush(NOON)
     rows = _rows(store)
     assert rows[0]["status"] == "sent"
-    assert rows[1]["status"] == "sent"  # delivery 没占额度
+    assert rows[1]["status"] == "pending"  # delivery 已占用当天额度
 
 
 async def test_flush_timeout_goes_uncertain_and_not_resent(tmp_path):
@@ -475,6 +472,53 @@ async def test_both_channels_failed_sends_final_notice(tmp_path):
     assert webonly[0]["status"] == "sent"
 
 
+async def test_sent_file_recovers_missing_note_without_reupload(tmp_path, monkeypatch):
+    """上传成功但后续入队崩溃：下一轮补说明，不重复上传文件。"""
+    store, _, host, _, _, ob = _make(tmp_path)
+    _seed_task(store)
+    f = _artifact_file(tmp_path, "结果.txt", text="结果")
+    delivery = Delivery(store, ob)
+    await delivery.deliver_task("T-1", kind="file", path=f, name="结果.txt", note="结果已交付")
+    original = ob._after_sent
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("刚上传成功就故障")
+
+    monkeypatch.setattr(ob, "_after_sent", _boom)
+    await ob.flush(NOON)
+    assert _rows(store)[0]["status"] == "sent"
+    assert not [r for r in _rows(store) if r["key"].endswith(":note")]
+    monkeypatch.setattr(ob, "_after_sent", original)
+    await ob.flush(NOON)
+    assert len(host.uploads) == 1
+    notes = [r for r in _rows(store) if r["key"].endswith(":note")]
+    assert len(notes) == 1
+    assert notes[0]["status"] in ("pending", "sent")
+
+
+async def test_sent_file_recovers_memo_after_note_queued(tmp_path, monkeypatch):
+    """说明已入队但写备忘失败：下一轮补备忘，不重复入队说明或上传。"""
+    store, _, host, _, mentions, ob = _make(tmp_path)
+    _seed_task(store)
+    f = _artifact_file(tmp_path, "结果.txt", text="结果")
+    delivery = Delivery(store, ob)
+    await delivery.deliver_task("T-1", kind="file", path=f, name="结果.txt", note="结果已交付")
+    original = mentions.add
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("备忘落库故障")
+
+    monkeypatch.setattr(mentions, "add", _boom)
+    await ob.flush(NOON)
+    assert len([r for r in _rows(store) if r["key"].endswith(":note")]) == 1
+    assert not store.read().execute("SELECT 1 FROM mentions").fetchone()
+    monkeypatch.setattr(mentions, "add", original)
+    await ob.flush(NOON)
+    assert len(host.uploads) == 1
+    assert len([r for r in _rows(store) if r["key"].endswith(":note")]) == 1
+    assert store.read().execute("SELECT 1 FROM mentions WHERE key='deliver:1'").fetchone()
+
+
 async def test_uncertain_does_not_trigger_fallback(tmp_path):
     """超时不确定 → 不回落（可能其实传上去了）。"""
     from CharTyr_MaiWork.maiwork.herenow import HereNowError
@@ -540,6 +584,26 @@ async def test_undelivered_true_when_all_failed(tmp_path):
     assert "失败" in states
     # 兜底说明也算一条记录（中文 kind）
     assert any(r["kind"] == "网页副本" for r in records)
+
+
+async def test_completed_without_any_delivery_record_is_marked_undelivered(tmp_path):
+    store, *_r, ob = _make(tmp_path)
+    delivery = Delivery(store, ob)
+    _seed_task(store)
+    assert delivery.undelivered("T-1") is True
+
+
+async def test_completed_text_delivery_failure_is_marked_undelivered(tmp_path):
+    store, *_r, ob = _make(tmp_path)
+    delivery = Delivery(store, ob)
+    _seed_task(store)
+    oid = ob.enqueue(
+        "task:T-1:deliver:text", GID, "text",
+        {"text": "成品文字", "push_kind": "delivery"}, task_id="T-1",
+    )
+    assert delivery.undelivered("T-1") is False  # 正在排队，暂不报错
+    ob._set(oid, status="failed", error="发送失败")
+    assert delivery.undelivered("T-1") is True
 
 
 async def test_delivery_records_empty_for_unknown_task(tmp_path):
