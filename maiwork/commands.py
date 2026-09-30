@@ -233,12 +233,20 @@ class Commands:
     # /mw 批准 / 拒绝 [ID]：只限 bot 管理员
     # ------------------------------------------------------------------
 
+    def _platform_of(self, gid: str) -> str:
+        """群所在平台（qq / telegram）：管理员名单按「平台:账号」比对。"""
+        try:
+            settings = self._get_settings()
+            return settings.platform_of(str(gid)) if settings is not None else "qq"
+        except Exception:
+            return "qq"
+
     def _is_group_admin(self, gid: str, user_id: str) -> bool:
         """本群群管理员名单里的人（group_admins 没接上 / 读失败都当不是）。"""
         if self._group_admins is None:
             return False
         try:
-            return bool(self._group_admins.is_group_admin(gid, user_id))
+            return bool(self._group_admins.is_group_admin(gid, user_id, platform=self._platform_of(gid)))
         except Exception:
             logger.exception("/mw 判本群管理员失败（群 %s）", gid)
             return False
@@ -246,7 +254,7 @@ class Commands:
     async def _decide(self, gid: str, user_id: str, rid: str, *, op: str) -> str:
         verb = "批准" if op == "approve" else "拒绝"
         try:
-            is_bot_admin = bool(self._approvals.is_admin(user_id))
+            is_bot_admin = bool(self._approvals.is_admin(user_id, platform=self._platform_of(gid)))
         except Exception:
             logger.exception("/mw 判管理员失败")
             return "这条指令处理出错了，日志里有"

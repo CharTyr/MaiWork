@@ -113,11 +113,15 @@ class Approvals:
             return True
         from .config import norm_account
 
-        gkey = norm_account(f"qq:{_norm(group_id)}")
+        try:
+            plat = self._get_settings().platform_of(_norm(group_id))
+        except Exception:
+            plat = "qq"
+        gkey = norm_account(f"{plat}:{_norm(group_id)}")
         if gkey and any(norm_account(g) == gkey for g in getattr(approval, "exempt_groups", ())):
             return True
         rid = _norm(requester_id)
-        ukey = norm_account(f"qq:{rid}") if rid else ""
+        ukey = norm_account(f"{plat}:{rid}") if rid else ""
         if ukey and any(norm_account(u) == ukey for u in getattr(approval, "exempt_users", ())):
             return True
         return False
@@ -591,11 +595,17 @@ class Approvals:
         uid = _norm(user_id)
         if not uid:
             return False
-        if self.is_admin(uid):
+        obj = self._find(kind, obj_id)
+        plat = "qq"
+        if obj is not None:
+            try:
+                plat = self._get_settings().platform_of(str(obj.get("group_id") or ""))
+            except Exception:
+                plat = "qq"
+        if self.is_admin(uid, platform=plat):
             return True
         if _norm(group_role) in ("owner", "admin"):
             return True
-        obj = self._find(kind, obj_id)
         if obj is None:
             return False
         if kind == "task":

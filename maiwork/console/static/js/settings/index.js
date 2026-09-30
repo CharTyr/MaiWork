@@ -1,7 +1,7 @@
 // MaiWork 网页 · 设置：导航、概览、群链接、群管理员。
 import { state } from "../state.js";
 import { SVG, esc, gface, ico, tokens } from "../util.js";
-import { api, gname, mq, quiet } from "../api.js";
+import { api, gname, mq, platTag, quiet } from "../api.js";
 import { loading } from "../pages/news.js";
 import { extPage } from "./ext.js";
 import { rulesPage } from "./rules.js";
@@ -20,7 +20,7 @@ export function groupPicker() {
       (g) => `
     <button class="gpick" data-act="group" data-g="${esc(g.id)}">
       ${gface(g)}
-      <span class="gpick-t"><span class="gpick-name" style="display:block">${mq(gname(g))}</span><span class="gpick-sub">${g.members ? `${g.members} 人 · ` : ""}${esc(quiet(g).text)}</span></span>
+      <span class="gpick-t"><span class="gpick-name" style="display:block">${mq(gname(g))}${platTag(g)}</span><span class="gpick-sub">${g.members ? `${g.members} 人 · ` : ""}${esc(quiet(g).text)}</span></span>
       ${g.id === state.g ? SVG.check : ""}
     </button>`
     )

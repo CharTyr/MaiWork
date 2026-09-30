@@ -129,7 +129,10 @@ export function onbPane(id) {
 // 引导「管理员」一步里的各群群管理员（可选）：网页密码 + 群里能批准的人
 const onbServed = () => {
   const f = onbField("groups.serve");
-  return ((f && f.value) || []).map((r) => String((r && r.group) || "").replace(/^qq:/, "")).filter((x) => /^\d+$/.test(x));
+  // 群 ID：QQ 去掉 qq: 剩数字；Telegram 去掉 telegram:/tg: 剩群 ID（如 -1001234567890）；QQ 官方去掉 qqbot: 剩 openid
+  return ((f && f.value) || [])
+    .map((r) => String((r && r.group) || "").trim().replace(/^(qq|telegram|tg|qqbot):/i, ""))
+    .filter((x) => /^-?[0-9A-Za-z:=_|.]{1,64}$/.test(x));
 };
 function onbGaBlock() {
   const gids = onbServed().filter((gid) => onb.ga && onb.ga[gid]);

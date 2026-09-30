@@ -670,7 +670,9 @@ class IdeaMention:
             attempts = int(row["attempts"] or 0) + 1
             self._set(mid, status="sending", attempts=attempts, text=full)
             try:
-                res = await self._host.send_text(session_id, full, at_user=at_user)
+                # Telegram 没有真正的 @ 段：Host 会把 @ 退成正文「@名字 」，名字这里给
+                at_name = members.name_of(self._store, gid, at_user) if at_user else ""
+                res = await self._host.send_text(session_id, full, at_user=at_user, at_name=at_name)
             except Exception as e:
                 err = str(e)[:_ERR_MAX]
                 if _is_timeout(e):

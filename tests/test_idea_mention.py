@@ -36,7 +36,7 @@ class Host:
     def __init__(self) -> None:
         self.texts: list[dict] = []
 
-    async def send_text(self, session_id, text, *, reply_to="", at_user=""):
+    async def send_text(self, session_id, text, *, reply_to="", at_user="", at_name=""):
         self.texts.append({"session_id": session_id, "text": text, "at_user": at_user})
         return type("R", (), {"sent": True, "message_id": f"t{len(self.texts)}"})()
 

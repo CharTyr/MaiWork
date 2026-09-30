@@ -307,10 +307,17 @@ class MaiWorkApp:
             logger.exception("配置迁移（数据库 → config.toml）出错，按现有配置继续启动")
         # 2. 宿主（预热 bot_qq，失败不致命）
         self.host = Host(self._ctx)
+        # 群号 → 平台（qq / telegram）：Host 里不传 platform 的调用按配置自动认
+        self.host.set_platform_resolver(lambda gid: self.get_settings().platform_of(gid))
+        self.host.set_session_group_resolver(self._group_for_session_cached)
         try:
             await self.host.bot_qq()
         except Exception:
             logger.warning("预热 bot_qq 失败（宿主还没好？），之后用时再取", exc_info=True)
+        try:
+            await self.host._bot_accounts()  # 预热 bot.platforms（Telegram 等的机器人账号）
+        except Exception:
+            logger.warning("预热 bot.platforms 失败，之后用时再取", exc_info=True)
         try:
             nickname = await self.host.config("bot.nickname")
             self.host.bot_name_cache = str(nickname) if nickname else "MaiBot"
@@ -1608,6 +1615,7 @@ class MaiWorkApp:
             commands=self.commands,
             on_reminder=self.on_reminder,
             bot_qq=self._bot_qq_now,
+            bot_account=lambda plat: self.host.cached_bot_account(plat) if self.host else "",
             spawn=self._spawn_bg,
             store=self.store,
             on_answer=self._resume_from_answer,

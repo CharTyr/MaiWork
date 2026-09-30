@@ -1,7 +1,7 @@
 // MaiWork 网页 · 「群」页：话题、群画像、关注成员、群空间。
 import { CATS, TONES, admin, gadmin } from "../state.js";
 import { SVG, dayWord, dur, esc, ico, richText, safeUrl, when } from "../util.js";
-import { gname } from "../api.js";
+import { gname, gplat, platTag } from "../api.js";
 import { pulseCard } from "../pulse.js";
 import { emptyState, loading } from "./news.js";
 
@@ -73,7 +73,12 @@ function profileSection(v) {
   }).join("");
 }
 
-function groupSpaceBlock(v) {
+function groupSpaceBlock(v, g) {
+  const plat = gplat(g, v);
+  if (plat !== "qq") {
+    const who = plat === "telegram" ? "Telegram 群" : "QQ 官方机器人所在的群";
+    return `<h2 class="h-sub">群空间</h2><p class="h-meta">${who}没有群文件、群公告和群相册，成品会用网页链接交付</p>`;
+  }
   const gs = v && v.group_space;
   if (!gs) return "";
   const role = { owner: "群主", admin: "管理员", member: "普通成员" }[gs.role] || "身份未知";
@@ -216,7 +221,7 @@ export function hash(s) {
 
 export function viewGroup(g, v) {
   const members = g.members ? `${g.members} 人 · ` : "";
-  let html = `<h1 class="h-page">${esc(gname(g))}</h1><p class="h-meta">${members}工作区 <span class="mono">${esc((v && v.workspace) || "")}</span></p>`;
+  let html = `<h1 class="h-page">${esc(gname(g))}</h1><p class="h-meta">${platTag(g, v)}${members}工作区 <span class="mono">${esc((v && v.workspace) || "")}</span></p>`;
   html += pulseCard(g, v, false);
   if (!v) return html + loading();
   if (g.fresh) {
@@ -228,6 +233,6 @@ export function viewGroup(g, v) {
   html += log.length ? log.map((t, k) => topicItem(t, k)).join("") : `<p class="h-meta">还没有</p>`;
   html += `<h2 class="h-sub">群画像 </h2>`;
   html += profileSection(v);
-  if (gadmin()) html += pushBlock(v) + groupSpaceBlock(v) + focusSection(v);
+  if (gadmin()) html += pushBlock(v) + groupSpaceBlock(v, g) + focusSection(v);
   return html;
 }

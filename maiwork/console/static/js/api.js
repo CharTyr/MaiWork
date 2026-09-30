@@ -32,6 +32,10 @@ export const grp = () => state.groups.find((x) => x.id === state.g) || null;
 export const gview = () => (state.view && state.view.id === state.g ? state.view : null);
 export const groupRef = (g) => (gadmin() ? g.id : state.ref);
 export const gname = (g) => (g && (g.name || `群 ${g.id}`)) || "";
+// 群所在的聊天平台（后端给 platform："qq" / "telegram" / "qqbot"；老数据没有就当 qq）
+export const gplat = (g, v) => String((g && g.platform) || (v && v.platform) || "qq");
+const PLAT_TAGS = { telegram: `<span class="ptag tg">Telegram</span>`, qqbot: `<span class="ptag qb">QQ 官方</span>` };
+export const platTag = (g, v) => PLAT_TAGS[gplat(g, v)] || "";
 // 太长的名字：平时省略号，鼠标放上去 / 手指按住时滚动显示全名（滚动距离运行时量）
 export const mq = (text) => `<span class="mq" title="${esc(text)}"><span class="mq-in">${esc(text)}</span></span>`;
 

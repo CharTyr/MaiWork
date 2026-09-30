@@ -1463,3 +1463,10 @@ a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 .ntag.ex { background: rgba(175, 82, 222, 0.12); color: var(--purple); }
 .n-bridge { display: flex; gap: 6px; margin: 4px 0 2px; font-size: 13px; line-height: 1.5; color: var(--gray); }
 .n-bridge span { flex: none; color: var(--purple); }
+
+/* 群所在平台的小标签（目前只标 Telegram，QQ 是默认不标） */
+.ptag { display: inline-block; margin: 0 0 0 6px; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 700;
+  letter-spacing: .02em; vertical-align: 2px; background: var(--alt-bg); color: var(--blue); }
+.ptag.tg { background: rgba(42, 171, 238, .14); color: #1c93d1; }
+.ptag.qb { background: rgba(18, 183, 245, .12); color: #0a84c6; }
+.h-meta .ptag { margin: 0 8px 0 0; }

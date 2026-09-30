@@ -17,6 +17,37 @@ from maibot_sdk import Field, PluginConfigBase
 
 _ACCOUNT_RE = re.compile(r"^([a-z][a-z0-9_]{0,15}):(\S{1,64})$")
 
+# 「平台」别名 → 规范名（bot_config 里 Telegram 账号写成 "tg:..."）
+_PLATFORM_ALIASES: dict[str, str] = {
+    "tg": "telegram",
+    "qqofficial": "qqbot",
+    "qq_official": "qqbot",
+}
+
+# MaiWork 内部平台标签 → 宿主里的平台名。qqbot = QQ 官方机器人（社区 qq-official-adapter），
+# 它在宿主里的平台名也是 "qq"，靠群号形态（openid，不是纯数字）和 SnowLuma 的群分开（docs/06）
+_HOST_PLATFORM: dict[str, str] = {
+    "qqbot": "qq",
+}
+
+
+def _norm_platform(platform: str) -> str:
+    """平台名规范化：小写；别名（tg → telegram）换规范名。"""
+    p = str(platform or "").strip().lower()
+    return _PLATFORM_ALIASES.get(p, p)
+
+
+def has_onebot(platform: str) -> bool:
+    """这个平台的群有没有 OneBot / napcat 能力（群文件、公告、相册、成员身份、api.call）。
+    只有 SnowLuma 接的 qq 群有；telegram、qqbot（QQ 官方机器人）等一律没有。"""
+    return str(platform or "qq").strip().lower() == "qq"
+
+
+def host_platform(platform: str) -> str:
+    """MaiWork 内部平台标签 → 宿主（MaiBot）里的平台名（qqbot → qq，其余一一对应）。"""
+    p = str(platform or "qq").strip().lower() or "qq"
+    return _HOST_PLATFORM.get(p, p)
+
 
 def norm_account(raw: object) -> str:
     """账号统一成 MaiBot 的写法「平台:账号」（小写平台）。只写数字的旧写法当 qq。认不出返回 ""。"""
@@ -26,7 +57,7 @@ def norm_account(raw: object) -> str:
     if ":" not in s:
         return f"qq:{s}" if s.isdigit() else ""
     platform, _, acc = s.partition(":")
-    cand = f"{platform.strip().lower()}:{acc.strip()}"
+    cand = f"{_norm_platform(platform)}:{acc.strip()}"
     return cand if _ACCOUNT_RE.match(cand) else ""
 
 
@@ -66,7 +97,13 @@ class ServeGroupConfig(PluginConfigBase):
     __ui_label__ = "服务群"
     __ui_icon__ = "users"
 
-    group: str = Field(default="", description='群号，格式 "qq:号码"，如 "qq:123456789"')
+    group: str = Field(
+        default="",
+        description=(
+            '群号，格式 "qq:号码"、"telegram:群 ID"（tg: 也是 telegram）或 "qqbot:群 openid"（QQ 官方机器人）；'
+            '如 "qq:123456789"、"telegram:-1001234567890"'
+        ),
+    )
     workspace: str = Field(default="", description='工作区名；空则用 "g<群号>"；多个群填同一个值即共享工作区')
 
 
@@ -344,6 +381,7 @@ class MaiWorkConfig(PluginConfigBase):
 class GroupSetting:
     group_id: str
     workspace: str
+    platform: str = "qq"  # 见 _parse_groups：qq / telegram（tg 当 telegram 的别名）
 
 
 @dataclass(frozen=True)
@@ -551,6 +589,11 @@ class Settings:
     def is_served(self, group_id: str) -> bool:
         return isinstance(group_id, str) and group_id in self.groups
 
+    def platform_of(self, group_id: str) -> str:
+        """服务群所在平台「qq」/「telegram」；不认识的群返回 "qq"（老行为）。"""
+        g = self.groups.get(group_id) if isinstance(group_id, str) else None
+        return str(getattr(g, "platform", "") or "qq") if g else "qq"
+
     def workspace_of(self, group_id: str) -> str:
         """没配就是 "g<群号>"。"""
         g = self.groups.get(group_id)
@@ -563,10 +606,62 @@ class Settings:
 
 _LISTEN_RE = re.compile(r"^(?P<host>(?:\d{1,3}\.){3}\d{1,3}):(?P<port>\d{1,5})$")
 _WORKSPACE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Telegram 虚拟群 ID（docs/06）：普通群是负数 chat_id（如 "-1001234567890"），
+# 话题群形如 "<chat_id>::tg-topic::mt=<id>"，所以允许 :、=、_、|、.、-、字母数字。
+_TG_GROUP_ID_RE = re.compile(r"^[-0-9A-Za-z:=_|.]{1,64}$")
+# QQ 官方机器人的群 ID 是 group_openid（字母数字串，docs/06）；纯数字的是 SnowLuma 群号，不收
+_QQBOT_GROUP_ID_RE = re.compile(r"^[0-9A-Za-z_-]{1,64}$")
 
 
 def _default_data_dir() -> Path:
     return _PLUGIN_DIR.parent.parent / "data" / "maiwork"
+
+
+def _sanitize_workspace_name(raw: str) -> str:
+    """Telegram 群 ID 可能带 :、= 等 _WORKSPACE_RE 不允许的字符 → 换成 '_'。
+    保证默认工作区名能过 _WORKSPACE_RE（也仅用于默认生成，用户手填的工作区名
+    有自己的白名单校验）。"""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", str(raw or "")) or "g"
+
+
+def _default_workspace(gid: str, platform: str) -> str:
+    """默认工作区名：QQ 群保持原样 g<群号>；Telegram 群把不合法字符清洗后拼 g。"""
+    gid_s = str(gid or "").strip()
+    if platform == "qq":
+        return f"g{gid_s}"
+    return f"g{_sanitize_workspace_name(gid_s)}"
+
+
+def parse_serve_group(grp: str) -> tuple[str, str]:
+    """一条服务群写法 → (平台, 群 ID)。写错抛 ValueError（中文原因）。
+    config.toml 和网页设置共用这一套规则：
+    - "qq:纯数字"；
+    - "telegram:群 ID" / "tg:群 ID"（负数 chat_id，或话题群 "<chat_id>::tg-topic::mt=<id>"）；
+    - "qqbot:群 openid"（QQ 官方机器人；群 ID 是 openid，不能是纯数字群号）。"""
+    grp = str(grp or "").strip()
+    if not grp:
+        raise ValueError("服务群条目群号为空")
+    if ":" not in grp:
+        raise ValueError(f'服务群 "{grp}" 缺平台前缀（要写成 "qq:号码"、"telegram:群 ID" 或 "qqbot:群 openid"）')
+    platform_raw, _, raw_id = grp.partition(":")
+    platform = _norm_platform(platform_raw)
+    gid = raw_id.strip()
+    if platform == "qq":
+        if not gid.isdigit():
+            raise ValueError(f'服务群 "{grp}" 的 qq 群号不是纯数字')
+    elif platform == "telegram":
+        if not gid or not _TG_GROUP_ID_RE.match(gid):
+            raise ValueError(
+                f'服务群 "{grp}" 的 telegram 群 ID 不合法（只能是字母、数字、横线、下划线、冒号、等号、竖线、点，长度≤64）'
+            )
+    elif platform == "qqbot":
+        if not gid or not _QQBOT_GROUP_ID_RE.match(gid):
+            raise ValueError(f'服务群 "{grp}" 的 QQ 官方群 ID 不合法（是 openid：字母、数字、横线、下划线，长度≤64）')
+        if gid.isdigit():
+            raise ValueError(f'服务群 "{grp}" 是纯数字：QQ 官方机器人的群 ID 是 openid；普通 QQ 群请写 "qq:{gid}"')
+    else:
+        raise ValueError(f'服务群 "{grp}" 是暂不支持的 "{platform}" 平台（目前只支持 qq / telegram / qqbot）')
+    return platform, gid
 
 
 def _parse_groups(raw_sections: Mapping[str, Any], problems: list[str]) -> dict[str, GroupSetting]:
@@ -588,17 +683,18 @@ def _parse_groups(raw_sections: Mapping[str, Any], problems: list[str]) -> dict[
             if not grp:
                 problems.append("服务群条目群号为空，已丢弃")
                 continue
-            if not grp.startswith("qq:"):
-                problems.append(f'服务群 "{grp}" 不是 qq 平台（只支持 "qq:号码"），已丢弃')
-                continue
-            gid = grp[3:].strip()
-            if not gid.isdigit():
-                problems.append(f'服务群 "{grp}" 的号码不是纯数字，已丢弃')
+            try:
+                platform, gid = parse_serve_group(grp)
+            except ValueError as e:
+                problems.append(f"{e}，已丢弃")
                 continue
             if gid in groups:
                 problems.append(f'服务群 "{grp}" 重复出现，只保留第一个，后一个已丢弃')
                 continue
-            ws_str = str(ws or "").strip() or f"g{gid}"
+            if ws is None or str(ws).strip() == "":
+                ws_str = _default_workspace(gid, platform)
+            else:
+                ws_str = str(ws).strip()
             # M11：workspace 名将直接成为目录名拼进 shell 命令，白名单之外的一律
             # 丢这条群配置（不拖垮整节）并记问题
             if not _WORKSPACE_RE.match(ws_str):
@@ -607,7 +703,7 @@ def _parse_groups(raw_sections: Mapping[str, Any], problems: list[str]) -> dict[
                     "（只能用字母、数字、下划线、横线，1~64 个字符），此群配置已丢弃"
                 )
                 continue
-            groups[gid] = GroupSetting(group_id=gid, workspace=ws_str)
+            groups[gid] = GroupSetting(group_id=gid, workspace=ws_str, platform=platform)
         except Exception as e:  # 任何意外都吞掉，记问题
             problems.append(f"服务群条目解析出错（{e}），已丢弃")
     # G6：多个群同一个 workspace（共享工作区），子 agent 能看到所有这些群的画像，

@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from . import clock
-from .config import Settings
+from .config import Settings, _norm_platform, host_platform
 from .host import _parse_reply_to
 
 logger = logging.getLogger("maiwork.intake")
@@ -148,6 +148,7 @@ class Intake:
         store: Any = None,
         on_answer: Callable[[str, str, str], Awaitable[Any]] | None = None,
         waiting_tasks: Callable[[str], list] | None = None,
+        bot_account: Callable[[str], str] | None = None,
     ) -> None:
         self._get_settings = get_settings
         self._signals = signals
@@ -157,6 +158,8 @@ class Intake:
         self._commands = commands
         self._on_reminder = on_reminder
         self._bot_qq_source = bot_qq
+        # 非 qq 平台的机器人自己账号（平台 → 账号；app 给 Host 缓存的 bot.platforms）
+        self._bot_account_source = bot_account
         self._spawn = spawn if spawn is not None else _default_spawn
         self._store = store
         # 提问的回答恢复（docs/02 §7.2）：waiting_tasks(群号) 给缓存的
@@ -182,6 +185,11 @@ class Intake:
             settings = self._get_settings()
             if settings is None or not settings.is_served(group_id):
                 return _CONTINUE
+            # 群号相同但平台不同（比如 qq 群号撞上别的平台的 ID）不算服务群
+            # （qqbot 在宿主里也叫 qq：比宿主平台名；QQ 官方群号是 openid，不会和 SnowLuma 的数字群号撞）
+            platform = settings.platform_of(group_id)
+            if self._platform_of(kwargs) != host_platform(platform):
+                return _CONTINUE
             # 到这一步才允许读消息的其他字段
             if self._is_ignorable(kwargs):
                 return _CONTINUE
@@ -192,7 +200,7 @@ class Intake:
             ts = message.get("timestamp")
             ts_f = float(ts) if isinstance(ts, (int, float)) else 0.0
             self._signals.mark(group_id, session_id, ts_f)
-            await self._m3(settings, group_id, message)
+            await self._m3(settings, group_id, message, platform)
             return _CONTINUE
         except Exception:  # 任何异常都吞掉，钩子永不中止消息
             logger.debug("收消息钩子异常，已吞掉", exc_info=True)
@@ -202,13 +210,13 @@ class Intake:
     # M3：机器人自己 / /mw / @ 识别
     # ------------------------------------------------------------------
 
-    async def _m3(self, settings: Settings, group_id: str, message: dict) -> None:
+    async def _m3(self, settings: Settings, group_id: str, message: dict, platform: str = "qq") -> None:
         user_id, user_name = self._speaker(message)
         message_id = str(message.get("message_id") or "")
         text = str(message.get("processed_plain_text") or "")
         # 1) 机器人自己发的：只记信号，不当请求
-        bot_qq = self._bot_qq()
-        if bot_qq and user_id and user_id == bot_qq:
+        bot_id = self._bot_id(platform)
+        if bot_id and user_id and user_id == bot_id:
             return
         # 2) /mw 指令：交 commands（spawn 后台），给 MaiBot 留个说明
         parts = text.strip().split(maxsplit=1)
@@ -588,6 +596,30 @@ class Intake:
             mentions.add(group_id, text, key=key, ttl_s=ttl_s)
         except Exception:
             logger.exception("写可提起清单出错（群 %s，key %s）", group_id, key)
+
+    def _bot_id(self, platform: str) -> str:
+        """这个平台上机器人自己的账号：qq 用 bot_qq；其它平台问 bot_account，拿不到退回 bot_qq。"""
+        if platform != "qq" and self._bot_account_source is not None:
+            try:
+                acc = str(self._bot_account_source(platform) or "").strip()
+            except Exception:
+                acc = ""
+            if acc:
+                return acc
+        return self._bot_qq()
+
+    @staticmethod
+    def _platform_of(kwargs: Any) -> str:
+        """消息的平台（message.platform，退回 message_info.platform）；缺了当 qq（老消息）。"""
+        try:
+            message = kwargs.get("message") or {}
+            p = message.get("platform")
+            if not p:
+                info = message.get("message_info") or {}
+                p = info.get("platform") if isinstance(info, dict) else ""
+            return _norm_platform(str(p or "")) or "qq"
+        except Exception:
+            return "qq"
 
     def _bot_qq(self) -> str:
         src = self._bot_qq_source

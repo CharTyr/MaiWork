@@ -316,6 +316,20 @@ class TestConfigApi:
         assert env.config_text() == before
 
     @pytest.mark.asyncio
+    async def test_groups_serve_accepts_telegram(self, env: _Env) -> None:
+        """网页设置也能存 Telegram 群（tg: 归一成 telegram:，默认工作区名清洗过）。"""
+        await _login(env)
+        r = await env.client.put(
+            "/api/settings/config",
+            json={"groups.serve": [{"group": "tg:-1001234567890"}, {"group": "telegram:-100123::tg-topic::mt=5"}]},
+        )
+        assert r.status == 200, await r.text()
+        s = env.app.get_settings()
+        assert s.is_served("-1001234567890") and s.platform_of("-1001234567890") == "telegram"
+        assert s.is_served("-100123::tg-topic::mt=5")
+        assert "telegram:-1001234567890" in env.config_text()
+
+    @pytest.mark.asyncio
     async def test_ssh_list_and_time_list(self, env: _Env) -> None:
         await _login(env)
         r = await env.client.put(

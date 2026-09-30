@@ -76,7 +76,8 @@ def group_icons() -> list[str]:
             names = sorted(p.stem for p in icons_dir.glob("*.png"))
         except OSError:
             names = []
-        _icons_cache = [n for n in names if n and n not in _ICON_EXCLUDE]
+        # 隐藏文件（macOS 在 exFAT 上生成的 ._xxx.png）不算图标
+        _icons_cache = [n for n in names if n and not n.startswith(".") and n not in _ICON_EXCLUDE]
     return _icons_cache
 
 
@@ -178,8 +179,14 @@ def _base_summary(svc: Any, group_id: str, row: dict[str, Any], now: float, *, m
     except Exception:
         usual_gap = None
     m3 = _m3_today_counts(svc, group_id)
+    try:
+        settings = svc.get_settings()
+        platform = settings.platform_of(group_id) if settings is not None else "qq"
+    except Exception:
+        platform = "qq"
     return {
         "id": group_id,
+        "platform": platform,  # qq / telegram：网页按它显示平台标签、群空间说明
         # 群名统一清洗（names.py：库里可能还有旧脏行，视图层兜底再洗一遍，老库不用迁移）
         "name": clean_group_name(row.get("name") or "", group_id),
         "icon": icon_for_group(group_id),

@@ -31,7 +31,9 @@ from .config import (
     SSHServer,
     Settings,
     _WORKSPACE_RE,
+    _default_workspace,
     normalize_domain,
+    parse_serve_group,
 )
 
 logger = logging.getLogger("maiwork.rules")
@@ -180,7 +182,8 @@ def _flat_base_value(base: Settings, section: str, field: str) -> Any:
     """
     if section == "groups" and field == "serve":
         # Settings.groups 是顶层字段（{群号: GroupSetting}），不是子节
-        return [{"group": f"qq:{gid}", "workspace": g.workspace} for gid, g in base.groups.items()]
+        return [{"group": f"{getattr(g, 'platform', 'qq') or 'qq'}:{gid}", "workspace": g.workspace}
+                for gid, g in base.groups.items()]
     obj = getattr(base, section, None)
     if obj is None:
         return None
@@ -542,7 +545,7 @@ def _check_local_mode(value: Any) -> str:
 
 
 def _check_serve_groups(value: Any) -> list[dict[str, str]]:
-    """服务群整表校验（语义同 config._parse_groups：qq:纯数字、workspace 白名单、不重复）。"""
+    """服务群整表校验（语义同 config._parse_groups：parse_serve_group 的写法、workspace 白名单、不重复）。"""
     if not isinstance(value, list):
         raise ValueError('服务群列表要写成 [{"group": "qq:号码", "workspace": "工作区名"}, ...]')
     out: list[dict[str, str]] = []
@@ -552,18 +555,14 @@ def _check_serve_groups(value: Any) -> list[dict[str, str]]:
             raise ValueError(f"服务群条目不是表：{item!r}")
         grp = str(item.get("group") or "").strip()
         ws = str(item.get("workspace") or "").strip()
-        if not grp.startswith("qq:"):
-            raise ValueError(f'服务群 "{grp or item!r}" 不是 qq 平台（只支持 "qq:号码"）')
-        gid = grp[3:].strip()
-        if not gid.isdigit():
-            raise ValueError(f'服务群 "{grp}" 的号码不是纯数字')
+        platform, gid = parse_serve_group(grp)  # 写错抛 ValueError（中文原因）
         if gid in seen:
             raise ValueError(f'服务群 "{grp}" 重复出现')
         seen.add(gid)
-        ws = ws or f"g{gid}"
+        ws = ws or _default_workspace(gid, platform)
         if not _WORKSPACE_RE.match(ws):
             raise ValueError(f'服务群 "{grp}" 的工作区名 "{ws}" 不合法（只能用字母、数字、下划线、横线，1~64 个字符）')
-        out.append({"group": f"qq:{gid}", "workspace": ws})
+        out.append({"group": f"{platform}:{gid}", "workspace": ws})
     return out
 
 

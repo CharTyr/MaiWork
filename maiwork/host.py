@@ -17,6 +17,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .config import _norm_platform, has_onebot, host_platform
+
 logger = logging.getLogger("maiwork.host")
 
 _DEFAULT_TIMEOUT_S = 10.0
@@ -121,7 +123,53 @@ class Host:
         self._ctx = ctx
         self._bot_qq: str = bot_qq
         self._bot_qq_cached: bool = bool(bot_qq)
+        # bot.platforms 缓存：解析成 {规范平台名: 账号}（tg: 前缀归一为 telegram:）
+        self._bot_accounts_map: dict[str, str] = {}
+        self._bot_accounts_cached: bool = False
         self._session_cache: dict[str, str] = {}
+        # session_id → 平台（session_for_group 解析时记下），发消息 / 读消息按它认平台
+        self._session_platform: dict[str, str] = {}
+        # 群号 → 平台（app 启动时接上 settings.platform_of）；没接就当 qq（老行为）
+        self._platform_resolver: Any = None
+
+    def set_platform_resolver(self, resolver: Any) -> None:
+        """接上「群号 → 平台」查询（通常是 lambda gid: settings.platform_of(gid)）。
+        之后调用方不传 platform 时，按群号自动认平台，老调用点不用改。"""
+        self._platform_resolver = resolver
+
+    def _plat(self, group_id: str, platform: str | None) -> str:
+        """显式传了用传入的；否则问 resolver；都没有就是 qq。"""
+        if platform:
+            return str(platform).strip().lower()
+        if self._platform_resolver is not None:
+            try:
+                p = self._platform_resolver(str(group_id))
+            except Exception:
+                p = ""
+            if p:
+                return str(p).strip().lower()
+        return "qq"
+
+    def set_session_group_resolver(self, resolver: Any) -> None:
+        """接上「session_id → 服务群号」查询（app 的内存映射）。会话号来自库 / 收消息钩子、
+        不是本 Host 解析出来的时候，靠它认出会话属于哪个平台。"""
+        self._session_group_resolver = resolver
+
+    def platform_of_session(self, session_id: str) -> str:
+        """会话所在平台：先看 session_for_group 记下的；再按「会话 → 群 → 平台」查；都没有当 qq。"""
+        sid = str(session_id)
+        hit = self._session_platform.get(sid)
+        if hit:
+            return hit
+        resolver = getattr(self, "_session_group_resolver", None)
+        if resolver is not None:
+            try:
+                gid = str(resolver(sid) or "")
+            except Exception:
+                gid = ""
+            if gid:
+                return self._plat(gid, None)
+        return "qq"
 
     # ------------------------------------------------------------------
     # 通用调用
@@ -163,6 +211,7 @@ class Host:
         limit: int,
         *,
         limit_mode: str = "latest",
+        bot_id: str = "",
         _timeout_s: float = _DEFAULT_TIMEOUT_S,
     ) -> list[Msg]:
         """读取指定会话在 [start, end] 时间段内的消息，按 ts 升序。
@@ -182,7 +231,14 @@ class Host:
         )
         if not isinstance(raw, list):
             return []
-        bot_qq = self._bot_qq  # 直接用缓存值，避免多余的 RPC
+        # 显式传了用传入的；非 qq 会话用该平台的机器人账号；否则用缓存的 bot_qq
+        sess_plat = self.platform_of_session(session_id)
+        if not bot_id and sess_plat != "qq":
+            try:
+                bot_id = await self.bot_account(sess_plat)
+            except Exception:
+                bot_id = ""
+        bot_qq = str(bot_id or self._bot_qq or "").strip()
         result: list[Msg] = []
         for item in raw:
             if not isinstance(item, dict):
@@ -255,10 +311,10 @@ class Host:
     # person_id / person_value
     # ------------------------------------------------------------------
 
-    async def person_id(self, user_id: str) -> str:
+    async def person_id(self, user_id: str, *, platform: str = "qq") -> str:
         result = await self._call(
             "person.get_id",
-            platform="qq",
+            platform=host_platform(platform),
             user_id=user_id,
         )
         return str(result) if result is not None else ""
@@ -281,7 +337,7 @@ class Host:
         return result
 
     # ------------------------------------------------------------------
-    # bot_qq()
+    # bot_qq() / bot_account(platform)
     # ------------------------------------------------------------------
 
     async def bot_qq(self) -> str:
@@ -292,24 +348,64 @@ class Host:
             self._bot_qq_cached = True
         return self._bot_qq
 
+    async def _bot_accounts(self) -> dict[str, str]:
+        """bot.platforms 解析成 {规范平台名: 账号}（tg: 前缀归一为 telegram:）。"""
+        if not self._bot_accounts_cached:
+            try:
+                val = await self._call("config.get", key="bot.platforms")
+            except Exception:
+                val = None
+            out: dict[str, str] = {}
+            items = val if isinstance(val, (list, tuple)) else ([val] if isinstance(val, str) and val.strip() else [])
+            for raw in items:
+                s = str(raw or "").strip()
+                if ":" not in s:
+                    continue
+                platform, _, acc = s.partition(":")
+                platform = _norm_platform(platform)
+                acc = acc.strip()
+                if platform and acc:
+                    out[platform] = acc
+            self._bot_accounts_map = out
+            self._bot_accounts_cached = True
+        return self._bot_accounts_map
+
+    def cached_bot_account(self, platform: str) -> str:
+        """同步版：只读已缓存的值（收消息钩子里用，不发 RPC）。qq → bot_qq 缓存。"""
+        plat = str(platform or "qq").strip().lower()
+        if plat in ("", "qq"):
+            return self._bot_qq
+        return str(self._bot_accounts_map.get(plat) or "")
+
+    async def bot_account(self, platform: str) -> str:
+        """某个平台的机器人账号：qq → bot.qq_account；别的从 bot.platforms 里取。"""
+        plat = str(platform or "qq").strip().lower()
+        if plat in ("", "qq"):
+            return await self.bot_qq()
+        accounts = await self._bot_accounts()
+        return str(accounts.get(plat) or "")
+
     # ------------------------------------------------------------------
     # session_for_group()
     # ------------------------------------------------------------------
 
-    async def session_for_group(self, group_id: str) -> str:
-        """按 group_id 解析 session_id，带账号路由。按群号缓存。"""
-        if group_id in self._session_cache:
-            return self._session_cache[group_id]
-        botqq = await self.bot_qq()
-        picked = await self._pick_group_session(group_id, botqq)
+    async def session_for_group(self, group_id: str, *, platform: str | None = None) -> str:
+        """按 group_id + platform 解析 session_id，带对应平台的机器人账号路由。按 (platform, 群号) 缓存。
+        platform 不传 → 按 set_platform_resolver 接上的配置认（没接就是 qq）。"""
+        plat = self._plat(group_id, platform)
+        cache_key = f"{plat}:{group_id}"
+        if cache_key in self._session_cache:
+            return self._session_cache[cache_key]
+        picked = await self._pick_group_session(group_id, plat)
         if picked:
-            self._session_cache[group_id] = picked
+            self._remember_session(cache_key, picked, plat)
             return picked
+        bot_id = await self.bot_account(plat)
         stream = await self._call(
             "chat.get_stream_by_group_id",
             group_id=group_id,
-            platform="qq",
-            account_id=botqq,
+            platform=host_platform(plat),
+            account_id=bot_id,
         )
         if not isinstance(stream, dict):
             raise HostError(
@@ -326,26 +422,34 @@ class Host:
             raise HostError(
                 f"chat.get_stream_by_group_id 返回的会话里没有 session_id: {stream}"
             )
-        self._session_cache[group_id] = sid
+        self._remember_session(cache_key, sid, plat)
         return sid
 
-    async def _pick_group_session(self, group_id: str, botqq: str) -> str:
+    def _remember_session(self, cache_key: str, sid: str, plat: str) -> None:
+        self._session_cache[cache_key] = sid
+        self._session_platform[sid] = plat
+
+    async def _group_streams(self, plat: str) -> list[dict[str, Any]]:
+        """chat.get_group_streams(platform=宿主平台名) 的会话列表；拿不到抛 HostError。"""
+        listed = await self._call("chat.get_group_streams", platform=host_platform(plat))
+        raw = listed.get("streams") if isinstance(listed, dict) else listed
+        return [x for x in raw if isinstance(x, dict)] if isinstance(raw, list) else []
+
+    async def _pick_group_session(self, group_id: str, platform: str = "qq") -> str:
         """一个群号可能对应多条会话记录（线上实测：旧记录 account_id 空、没有消息；
-        在用的那条 account_id=机器人 QQ）。chat.get_stream_by_group_id 只回第一条匹配，
+        在用的那条 account_id=机器人本平台的账号）。chat.get_stream_by_group_id 只回第一条匹配，
         可能是旧的，所以这里先列出全部群会话自己挑：
-        1) 只有一条 → 就用它；2) 多条 → 优先 account_id 等于机器人 QQ 的；
+        1) 只有一条 → 就用它；2) 多条 → 优先 account_id 等于机器人本平台账号的；
         3) 还分不出 → 看最近 30 天谁有最新消息。拿不到名单返回 ""（调用方回落单查）。
         """
+        plat = str(platform or "qq").strip().lower()
         try:
-            listed = await self._call("chat.get_group_streams", platform="qq")
+            raw = await self._group_streams(plat)
         except HostError:
-            return ""
-        raw = listed.get("streams") if isinstance(listed, dict) else listed
-        if not isinstance(raw, list):
             return ""
         cands = [
             x for x in raw
-            if isinstance(x, dict) and str(x.get("group_id") or "") == str(group_id)
+            if str(x.get("group_id") or "") == str(group_id)
             and str(x.get("session_id") or x.get("stream_id") or "").strip()
         ]
         sid_of = lambda x: str(x.get("session_id") or x.get("stream_id") or "").strip()  # noqa: E731
@@ -353,7 +457,11 @@ class Host:
             return ""
         if len(cands) == 1:
             return sid_of(cands[0])
-        mine = [x for x in cands if botqq and str(x.get("account_id") or "") == str(botqq)]
+        try:
+            bot_id = await self.bot_account(plat)
+        except HostError:
+            bot_id = ""
+        mine = [x for x in cands if bot_id and str(x.get("account_id") or "") == str(bot_id)]
         if len(mine) == 1:
             return sid_of(mine[0])
         pool = mine or cands
@@ -361,7 +469,7 @@ class Host:
         best, best_ts = sid_of(pool[0]), -1.0
         for x in pool:
             try:
-                msgs = await self.messages(sid_of(x), now - 30 * 86400, now, 1)
+                msgs = await self.messages(sid_of(x), now - 30 * 86400, now, 1, bot_id=bot_id or "-")
             except HostError:
                 continue
             ts = max((m.ts for m in msgs), default=-1.0)
@@ -373,8 +481,20 @@ class Host:
     # group_info()
     # ------------------------------------------------------------------
 
-    async def group_info(self, group_id: str) -> dict[str, Any]:
+    async def group_info(self, group_id: str, *, platform: str | None = None) -> dict[str, Any]:
         """取群名称和人数。拿不到返回 {}，不抛异常。"""
+        plat = self._plat(group_id, platform)
+        if not has_onebot(plat):
+            # 没有 napcat（Telegram 等）：群名从宿主会话列表的 group_name 取，人数拿不到 → 0
+            try:
+                raw = await self._group_streams(plat)
+            except HostError:
+                return {}
+            for x in raw:
+                if str(x.get("group_id") or "") == str(group_id):
+                    name = str(x.get("group_name") or x.get("name") or "")
+                    return {"name": name, "member_count": 0}
+            return {}
         try:
             result = await self._call(
                 "api.call",
@@ -403,12 +523,20 @@ class Host:
         *,
         reply_to: str = "",
         at_user: str = "",
+        at_name: str = "",
+        platform: str | None = None,
     ) -> SendResult:
         """send.hybrid，可选 reply 段 + at 段 + text 段。
 
         at 段形状照宿主 message_utils._component_from_dict（线上源码 2026-09-29 读过）：
         {"type": "at", "data": {"target_user_id": ...}}；群里显示为真正的 @（2026-09-29 测试群实测）。
+        Telegram 适配器完全丢弃 at 段（codecs/outbound.py 的本地段规则——线上事实），
+        所以对 Telegram 群要退回到正文里写「@名字 」（at_name 由调用方传，空了就不发 at）。
+        QQ 官方机器人（qqbot）照发 at 段：适配器会转成 <qqbot-at-user id="openid" />（读源码，未实测）；
+        reply 段它会忽略（官方没有引用回复），不影响发送。
+        platform 不传 → 按 session_for_group 记下的会话平台认。
         """
+        plat = str(platform).strip().lower() if platform else self.platform_of_session(session_id)
         segments: list[dict[str, Any]] = []
         if reply_to:
             segments.append(
@@ -416,8 +544,15 @@ class Host:
             )
         body = str(text)
         if at_user:
-            segments.append({"type": "at", "data": {"target_user_id": str(at_user)}})
-            body = " " + body
+            uid = str(at_user).strip()
+            if plat == "telegram":
+                name = str(at_name or "").strip()
+                if name:
+                    # Telegram：ad-hoc at 段会被直接丢弃；落到正文里
+                    body = f"@{name} {body}"
+            else:
+                segments.append({"type": "at", "data": {"target_user_id": uid}})
+                body = " " + body
         segments.append({"type": "text", "content": body})
         return await self._send_segments(session_id, segments, str(text))
 
@@ -467,8 +602,12 @@ class Host:
         path: str,
         name: str,
         timeout_s: float = 60.0,
+        *,
+        platform: str | None = None,
     ) -> str:
         """上传群文件。上传不幂等：绝不重试。"""
+        if not has_onebot(self._plat(group_id, platform)):
+            raise HostError("这个平台不支持上传群文件（适配器没有群文件接口），走网页链接交付")
         result = await self._call(
             "api.call",
             timeout_s=timeout_s + 5.0,
@@ -496,7 +635,9 @@ class Host:
     # group_file_url()
     # ------------------------------------------------------------------
 
-    async def group_file_url(self, group_id: str, file_id: str) -> str:
+    async def group_file_url(self, group_id: str, file_id: str, *, platform: str | None = None) -> str:
+        if not has_onebot(self._plat(group_id, platform)):
+            raise HostError("这个平台不支持取群文件链接（适配器没有群文件接口），走网页链接交付")
         result = await self._call(
             "api.call",
             api_name="adapter.napcat.file.get_group_file_url",
@@ -569,8 +710,14 @@ class Host:
         api_name: str,
         args: dict[str, Any] | None = None,
         timeout_s: float = _DEFAULT_TIMEOUT_S,
+        *,
+        platform: str | None = None,
     ) -> Any:
-        """api.call 通用透传：返回 data 部分。status!=\"ok\" / retcode 非 0 → HostError。"""
+        """api.call 通用透传：返回 data 部分。status!=\"ok\" / retcode 非 0 → HostError。
+        platform 不传 → 按 args 里的 group_id 认平台；没有 napcat 的平台直接拒。"""
+        gid = str((args or {}).get("group_id") or "")
+        if not has_onebot(self._plat(gid, platform)):
+            raise HostError("这个平台的适配器没有 api.call 接口，不支持这个功能")
         result = await self._call(
             "api.call",
             timeout_s=timeout_s,
@@ -593,8 +740,10 @@ class Host:
     # group_member_role()
     # ------------------------------------------------------------------
 
-    async def group_member_role(self, group_id: str, user_id: str) -> str:
-        """取成员在群里的角色：owner / admin / member / ""（拿不到）。"""
+    async def group_member_role(self, group_id: str, user_id: str, *, platform: str | None = None) -> str:
+        """取成员在群里的角色：owner / admin / member / ""（拿不到）。没有 napcat 的平台直接 ""。"""
+        if not has_onebot(self._plat(group_id, platform)):
+            return ""
         try:
             result = await self._call(
                 "api.call",
@@ -616,12 +765,15 @@ class Host:
     # group_member_card()（关注成员的群名片 / QQ 昵称；console 头像与显示名用）
     # ------------------------------------------------------------------
 
-    async def group_member_card(self, group_id: str, user_id: str) -> dict[str, str]:
+    async def group_member_card(self, group_id: str, user_id: str, *, platform: str | None = None) -> dict[str, str]:
         """取成员的群名片（card）和 QQ 昵称（nickname）。拿不到返回 {}，不抛异常。
 
         和 group_member_role 同一个宿主接口（get_group_member_info），参数沿用
         现有调用的纯数字字符串；解析按「data 子表优先、否则整包」的老规矩。
+        没有 napcat 的平台直接 {}。
         """
+        if not has_onebot(self._plat(group_id, platform)):
+            return {}
         try:
             result = await self._call(
                 "api.call",

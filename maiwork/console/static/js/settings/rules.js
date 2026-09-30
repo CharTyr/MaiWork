@@ -109,7 +109,7 @@ export function rowsAdd(box) {
   if (first) first.focus();
 }
 export const ROWS_COLS = {
-  serve_groups: [["group", "qq:群号"], ["workspace", "工作区名（可空）"]],
+  serve_groups: [["group", "qq:群号 / telegram:群 ID / qqbot:群 openid"], ["workspace", "工作区名（可空）"]],
   ssh_list: [["name", "名字"], ["host", "user@1.2.3.4:22"], ["note", "配置 / 用途（主模型看得到）"]],
 };
 

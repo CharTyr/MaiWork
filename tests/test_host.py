@@ -378,8 +378,8 @@ class TestSessionForGroup:
         h = Host(ctx)
         sid = await h.session_for_group("900000001")
         assert sid == "sess-abc"
-        # 先列群会话（没拿到名单就回落到单查）
-        assert ctx.names() == ["config.get", "chat.get_group_streams", "chat.get_stream_by_group_id"]
+        # 先列群会话；没拿到名单才取机器人账号、回落到单查
+        assert ctx.names() == ["chat.get_group_streams", "config.get", "chat.get_stream_by_group_id"]
         name, kw = ctx.calls[2]
         assert name == "chat.get_stream_by_group_id"
         assert kw["group_id"] == "900000001"
@@ -432,7 +432,7 @@ class TestSessionForGroup:
         sid1 = await h.session_for_group("900000001")
         sid2 = await h.session_for_group("900000001")
         assert sid1 == sid2
-        assert ctx.names() == ["config.get", "chat.get_group_streams", "chat.get_stream_by_group_id"]
+        assert ctx.names() == ["chat.get_group_streams", "config.get", "chat.get_stream_by_group_id"]
 
     # 线上实测（2026-09-27）：同一个群号在 MaiBot 里有两条会话记录——
     # 2025 年的旧记录（account_id 空、没有任何消息）和正在用的（account_id=机器人 QQ）。

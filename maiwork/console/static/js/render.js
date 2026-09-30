@@ -1,7 +1,7 @@
 // MaiWork 网页 · 整页渲染：顶栏、底栏、左栏、右栏、主视图。
 import { $, TABS, admin, desktop, gadmin, isGA, state, ui } from "./state.js";
 import { SVG, calm, esc, gface, ico, when } from "./util.js";
-import { gname, grp, gview, mq, quiet } from "./api.js";
+import { gname, grp, gview, mq, platTag, quiet } from "./api.js";
 import { pulseCard } from "./pulse.js";
 import { loading, viewNews } from "./pages/news.js";
 import { viewIdeas } from "./pages/ideas.js";
@@ -80,7 +80,7 @@ export function renderRail() {
         (x) => `
       <button class="r-item" data-act="group" data-g="${esc(x.id)}" aria-current="${x.id === state.g}" title="${esc(gname(x))}">
         ${gface(x)}
-        <span class="r-text"><span class="r-name">${mq(gname(x))}</span><span class="r-sub">${esc(quiet(x).text)}</span></span>
+        <span class="r-text"><span class="r-name">${mq(gname(x))}${platTag(x)}</span><span class="r-sub">${esc(quiet(x).text)}</span></span>
         ${gadmin() && pendingCount(x) ? `<span class="r-badge">${pendingCount(x)}</span><span class="r-dot"></span>` : ""}
       </button>`
       )

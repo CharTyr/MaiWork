@@ -21,6 +21,7 @@ import logging
 from typing import Any, Awaitable, Callable
 
 from .. import clock
+from ..config import has_onebot
 from ..host import HostError
 from ..store import Store
 
@@ -112,6 +113,8 @@ class GroupSpace:
     async def _role(self, group_id: str, now: float) -> str:
         """机器人在该群的身份（owner/admin/member/""），缓存 1 小时。"""
         gid = str(group_id)
+        if not self._onebot(gid):
+            return ""  # 没有 napcat 的平台（Telegram 等）：不查身份
         hit = self._roles.get(gid)
         if hit is not None and now - hit[0] < ROLE_TTL_S:
             return hit[1]
@@ -164,7 +167,7 @@ class GroupSpace:
         gid = str(group_id)
         try:
             settings = self._get_settings()
-            if settings is None or not settings.is_served(gid):
+            if settings is None or not settings.is_served(gid) or not self._onebot(gid):
                 return {k: False for k in CAPABILITY_KEYS}
         except Exception:
             return {k: False for k in CAPABILITY_KEYS}
@@ -176,7 +179,7 @@ class GroupSpace:
         gid = str(group_id)
         try:
             settings = self._get_settings()
-            if settings is None or not settings.is_served(gid):
+            if settings is None or not settings.is_served(gid) or not self._onebot(gid):
                 return {k: False for k in CAPABILITY_KEYS}
         except Exception:
             return {k: False for k in CAPABILITY_KEYS}
@@ -221,6 +224,15 @@ class GroupSpace:
         if not ok:
             raise PermissionError(f"MaiWork 不服务这个群：{gid}，不做任何操作")
 
+    def _onebot(self, group_id: str) -> bool:
+        """这个群所在平台有没有群文件 / 公告 / 相册（只有 qq 有；Telegram 等没有）。"""
+        try:
+            settings = self._get_settings()
+            plat = settings.platform_of(str(group_id)) if settings is not None else "qq"
+        except Exception:
+            plat = "qq"
+        return has_onebot(plat)
+
     def _enabled(self) -> bool:
         try:
             settings = self._get_settings()
@@ -235,6 +247,8 @@ class GroupSpace:
         if not self._enabled():
             raise PermissionError("群空间功能关着（[group_space] enabled=false）")
         gid = str(group_id)
+        if not self._onebot(gid):
+            raise PermissionError("这个群所在的平台不支持群空间（没有群文件、公告、相册），交付改走网页链接")
         # 身份要现查的（admin 系能力）；先看接口在不在，再查身份——不服务的连查都不查
         apis = self._apis
         needs_admin = capability in ("files_manage", "notice_send", "album_upload")

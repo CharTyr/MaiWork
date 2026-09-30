@@ -461,6 +461,14 @@ class AvatarService:
         _gid, uid = found
         if not uid.isdigit():
             return "none", None
+        # Telegram 的用户 ID 也是纯数字：只有 qq 群的成员才去拿 QQ 头像，不然会拿到陌生 QQ 号的头像
+        plat_of = getattr(self._host, "_plat", None)
+        if callable(plat_of):
+            try:
+                if plat_of(_gid, None) != "qq":
+                    return "none", None
+            except Exception:
+                pass
         stem = f"m_{token}"
         fresh = self._read_cache(stem, CACHE_TTL_S)
         if fresh is not None:
