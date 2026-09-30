@@ -1,6 +1,7 @@
 // MaiWork 网页 · 「任务」页。
 import { DOT, FILTERS, STATUS, gadmin, state } from "../state.js";
 import { SVG, dur, esc, ico, when } from "../util.js";
+import { agentFish } from "../api.js";
 import { emptyState } from "./news.js";
 import { findIdea, ideaItems } from "./ideas.js";
 
@@ -29,7 +30,7 @@ function pendingItems(p) {
 }
 
 export function viewTasks(g, v) {
-  let html = `<h1 class="h-page">任务</h1>`;
+  let html = `<h1 class="h-page h-fish">${agentFish("task", 44)}<span>任务</span></h1>`;
   const tasks = (v && v.tasks) || { pending: [], list: [] };
   const pending = tasks.pending || [];
   const list = tasks.list || [];

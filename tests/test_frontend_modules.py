@@ -98,11 +98,29 @@ def test_specialist_fish_avatar_contract():
     """专岗小鱼：每个岗位用程序生成的小鱼当头像，「换一条」只改这个岗位的 fish_seed。"""
     assert (JS / "fish.js").is_file(), "缺小鱼生成模块 fish.js"
     text = (JS / "settings/agents.js").read_text(encoding="utf-8")
-    assert 'import { fishSvg } from "../fish.js";' in text
+    assert "agentFish" in text and '"../api.js"' in text, "设置页和各页面共用一个取鱼函数"
     assert 'data-act="agent-fish-reroll"' in text
     assert 'case "agent-fish-reroll"' in text
     assert "{ fish_seed: p.fish_seed }" in text, "换一条只提交 fish_seed，不带别的岗位字段"
-    assert "agent:${kind}:" in text, "种子为空时按岗位名固定一条鱼"
+    api = (JS / "api.js").read_text(encoding="utf-8")
+    assert 'import { fishSvg } from "./fish.js";' in api
+    assert "agent:${kind}:" in api, "种子为空时按岗位名固定一条鱼"
+    assert "agent_fish" in api, "群友打开的页面从群视图拿各岗位的鱼种子"
+
+
+def test_specialist_fish_on_pages():
+    """各岗位的小鱼放在对应页面大标题前：资讯鱼在最新一批的标题前（没资讯时在「资讯」标题前），构想 / 目标 / 任务同理。"""
+    news = (JS / "pages/news.js").read_text(encoding="utf-8")
+    taste = news[news.index("function tasteInner"):]
+    taste = taste[: taste.index("\n}\n")]
+    assert "agentFish" not in taste and "teacup" in taste, "口味小结框保持茶杯"
+    view = news[news.index("export function viewNews"):]
+    assert 'b ? "" : agentFish("news"' in view, "只有最新一批的标题前放资讯鱼"
+    assert '<h1 class="h-page">资讯</h1>' not in view, "没资讯时「资讯」标题也带鱼"
+    for page, kind, title in (("ideas", "idea", "构想"), ("goals", "goal", "目标"), ("tasks", "task", "任务")):
+        text = (JS / f"pages/{page}.js").read_text(encoding="utf-8")
+        assert f'agentFish("{kind}"' in text, f"{title}页标题旁放{title}鱼"
+        assert f'<h1 class="h-page">{title}</h1>' not in text, f"{title}页大标题要带鱼"
 
 
 _FISH_CHECK = r"""
@@ -167,3 +185,11 @@ def test_fish_generator_is_deterministic_and_well_formed(tmp_path):
     assert not data["bad"], f"这些种子画出了坏图：{data['bad'][:10]}"
     assert data["species"] == data["nSpecies"], "随机 400 条没覆盖到所有鱼种"
     assert data["eyes"] == data["nEyes"], "随机 400 条没覆盖到所有眼神"
+
+
+def test_guide_only_batch_points_to_articles():
+    """一批只收了文章（没有资讯）时，资讯栏不说「没有值得看的」，而是指向「文章」栏。"""
+    news = (JS / "pages/news.js").read_text(encoding="utf-8")
+    view = news[news.index("export function viewNews"):]
+    assert "在「文章」里" in view
+    assert 'data-act="news-tab" data-t="guides"' in view, "给一个直接去文章栏的按钮"

@@ -1,7 +1,7 @@
 // MaiWork 网页 · 「资讯」页。
 import { admin, gadmin, state } from "../state.js";
 import { SVG, dayWord, dur, esc, hhmm, ico, now, richText, safeUrl, slotName, when } from "../util.js";
-import { api, gview } from "../api.js";
+import { agentFish, api, gview } from "../api.js";
 
 /* ───────────── 各页面 ───────────── */
 
@@ -364,7 +364,7 @@ function newsSwitch() {
 
 export function viewNews(g, v) {
   if (g.fresh) {
-    return `<h1 class="h-page">资讯</h1>` + emptyState("seedling", "还在熟悉这个群", "熟悉之后就开始找资讯。");
+    return `<h1 class="h-page h-fish">${agentFish("news", 44)}<span>资讯</span></h1>` + emptyState("seedling", "还在熟悉这个群", "熟悉之后就开始找资讯。");
   }
   if ((state.newsTab || "news") === "guides") {
     const guides = (v && v.guides) || [];
@@ -374,7 +374,7 @@ export function viewNews(g, v) {
   }
   const news = (v && v.news) || [];
   if (!news.length) {
-    return newsSwitch() + `<h1 class="h-page">资讯</h1>` + emptyState("newspaper", "还没有资讯", "");
+    return newsSwitch() + `<h1 class="h-page h-fish">${agentFish("news", 44)}<span>资讯</span></h1>` + emptyState("newspaper", "还没有资讯", "");
   }
   let i = 0;
   return (
@@ -382,9 +382,14 @@ export function viewNews(g, v) {
     news
       .map((batch, b) => {
         const rc = batch.rejected_count || 0;
-        const head = `<h1 class="h-page" ${b ? 'style="margin-top:46px"' : ""}>${esc(slotName(batch.slot_ts))}</h1><p class="h-meta">${hhmm(batch.slot_ts)} 备料 · ${batchStats(batch)}${rc ? `，筛掉 ${rc} 条` : ""}</p>`;
+        const head = `<h1 class="h-page${b ? "" : " h-fish"}" ${b ? 'style="margin-top:46px"' : ""}>${b ? "" : agentFish("news", 44)}<span>${esc(slotName(batch.slot_ts))}</span></h1><p class="h-meta">${hhmm(batch.slot_ts)} 备料 · ${batchStats(batch)}${rc ? `，筛掉 ${rc} 条` : ""}</p>`;
         if (batch.skipped || !(batch.items || []).length) {
-          return head + `<div class="skipped enter" style="--i:${i++}">${ico("teacup")}<span>${esc(batch.note || "这一批没有值得看的，跳过了。")}</span></div>` + funnelBlock(batch) + rejectedBlock(batch);
+          // 收了东西但资讯栏是空的：收的都是文章，指过去，别说「没有值得看的」
+          const got = Number((batch.stats && batch.stats.kept) || batch.kept || 0);
+          const note = got > 0
+            ? `${ico("books")}<span>这一批收的 ${got} 篇在「文章」里。</span><button class="btn small" data-act="news-tab" data-t="guides">去看</button>`
+            : `${ico("teacup")}<span>${esc(batch.note || "这一批没有值得看的，跳过了。")}</span>`;
+          return head + `<div class="skipped enter${got > 0 ? " to-guides" : ""}" style="--i:${i++}">${note}</div>` + funnelBlock(batch) + rejectedBlock(batch);
         }
         return head + batch.items.map((it) => newsItem(it, i++, false)).join("") + funnelBlock(batch) + rejectedBlock(batch);
       })

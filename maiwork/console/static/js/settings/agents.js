@@ -1,17 +1,13 @@
 // MaiWork 网页 · 专岗：职责、本群提醒、经主流程验收的经验与交接记录。
 import { state, $ } from "../state.js";
-import { api } from "../api.js";
+import { agentFish, api } from "../api.js";
 import { esc, toast } from "../util.js";
 import { repaintSheet } from "../sheet.js";
 import { loading } from "../pages/news.js";
-import { fishSvg } from "../fish.js";
 
 
 // 每个岗位一条程序生成的小鱼；fish_seed 为空时按岗位名固定，「换一条」只改这个岗位的种子。
-function fishOf(kind, size) {
-  const p = ((state.agents && state.agents.profiles) || []).find((x) => x.kind === kind);
-  return fishSvg(`agent:${kind}:${(p && p.fish_seed) || ""}`, { size });
-}
+const fishOf = (kind, size) => agentFish(kind, size);
 const newSeed = () => Math.random().toString(36).slice(2, 10);
 const LABELS = { queued: "排队", running: "进行中", returned: "已交回，等验收", accepted: "已验收", rejected: "未采用", failed: "没跑成", cancelled: "已取消" };
 const SPECIALISTS = new Set(["news", "idea", "goal"]);

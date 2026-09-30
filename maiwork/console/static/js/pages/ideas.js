@@ -1,7 +1,7 @@
 // MaiWork 网页 · 「构想」页。
 import { TONES, gadmin, state } from "../state.js";
 import { SVG, dayWord, esc, ico } from "../util.js";
-import { gview } from "../api.js";
+import { agentFish, gview } from "../api.js";
 import { emptyState, fbButtons } from "./news.js";
 import { hash } from "./group.js";
 
@@ -10,7 +10,7 @@ const ideaDot = (st) => (st === "started" ? "running" : st === "wanted" || st ==
 
 export function viewIdeas(g, v) {
   const ideas = (v && v.ideas) || [];
-  let html = `<h1 class="h-page">构想</h1><p class="h-meta">看中哪个，复制要求到群里 @MaiBot 就能开工</p>`;
+  let html = `<h1 class="h-page h-fish">${agentFish("idea", 44)}<span>构想</span></h1><p class="h-meta">看中哪个，复制要求到群里 @MaiBot 就能开工</p>`;
   if (!ideas.length) {
     return html + emptyState("bulb", "还没有构想", g.fresh ? "熟悉这个群之后就开始提想法。" : "");
   }

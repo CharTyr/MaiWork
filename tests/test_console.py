@@ -1673,6 +1673,75 @@ class TestM3Routes:
         assert pending[0]["title"] == "做个铝价表"
 
 
+class TestGroupViewAgentFish:
+    """群视图 agent_fish：管理员 / 群友都能看到各专岗小鱼种子；agents 缺位不炸视图。"""
+
+    _FISH_KINDS = ("news", "idea", "goal", "task")
+
+    @pytest.mark.asyncio
+    async def test_admin_view_has_agent_fish_with_seed(self, env: SimpleEnv) -> None:
+        await env.login()
+        # 通过 PUT API 给 news 岗位设一个小鱼种子
+        r = await env.client.put("/api/agents/news", json={"fish_seed": "ab12cd34"})
+        assert r.status == 200
+        token = env.app.token_of(G1)
+        r = await env.client.get(f"/api/groups/{token}")
+        assert r.status == 200
+        view = await r.json()
+        assert "agent_fish" in view
+        af = view["agent_fish"]
+        assert isinstance(af, dict)
+        assert sorted(af.keys()) == sorted(self._FISH_KINDS)
+        assert af["news"] == "ab12cd34"
+        assert af["idea"] == ""
+        assert af["goal"] == ""
+        assert af["task"] == ""
+
+    @pytest.mark.asyncio
+    async def test_member_view_has_agent_fish_with_same_seed(self, env: SimpleEnv) -> None:
+        await env.login()
+        r = await env.client.put("/api/agents/idea", json={"fish_seed": "fish-idea01"})
+        assert r.status == 200
+        token = env.app.token_of(G1)
+        # 群友视角：用群链接码打开
+        r = await env.client.get(f"/api/groups/{token}", headers={"X-MW-Group": token})
+        assert r.status == 200
+        view = await r.json()
+        assert "agent_fish" in view
+        af = view["agent_fish"]
+        assert sorted(af.keys()) == sorted(self._FISH_KINDS)
+        assert af["idea"] == "fish-idea01"
+        assert af["news"] == ""
+        # 只有种子，不是岗位详情
+        assert "title" not in af
+        assert "instructions" not in af
+
+    @pytest.mark.asyncio
+    async def test_agent_fish_all_empty_when_agents_missing(self, env: SimpleEnv) -> None:
+        await env.login()
+        env.app.agents = None
+        token = env.app.token_of(G1)
+        r = await env.client.get(f"/api/groups/{token}")
+        assert r.status == 200
+        view = await r.json()
+        assert view["agent_fish"] == {"news": "", "idea": "", "goal": "", "task": ""}
+
+    @pytest.mark.asyncio
+    async def test_agent_fish_all_empty_when_profiles_raises(self, env: SimpleEnv) -> None:
+        await env.login()
+        real = env.app.agents
+        class BrokenAgents:
+            def profiles(self):  # noqa: ANN001
+                raise RuntimeError("boom")
+        env.app.agents = BrokenAgents()
+        token = env.app.token_of(G1)
+        r = await env.client.get(f"/api/groups/{token}")
+        assert r.status == 200
+        view = await r.json()
+        assert view["agent_fish"] == {"news": "", "idea": "", "goal": "", "task": ""}
+        env.app.agents = real
+
+
 _PORT: list[int] = []
 
 

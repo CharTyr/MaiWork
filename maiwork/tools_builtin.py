@@ -525,6 +525,15 @@ def register_builtin(
         url = str(args.get("url") or "").strip()
         if not url:
             return ToolResult(ok=False, output="", error="url 不能为空")
+        # 核验子 agent（feeds-verify:）的代码硬上限：一组的打开页数按组内条数封死
+        # （verify_budget.py，feeds._verify_batch 按组开账）。用完直接拒——提示词劝不住
+        # 「找日期打转」（2026-09-30 线上实录 8 分钟 23 次），要靠代码拦。
+        if str(ctx.task_id or "").startswith("feeds-verify:"):
+            from . import verify_budget
+
+            allowed, note = verify_budget.consume(str(ctx.task_id))
+            if not allowed:
+                return ToolResult(ok=False, output="", error=note)
         use_jina = reader is not None and bool(getattr(reader, "enabled", lambda: False)())
         if use_jina:
             # 新顺序：Jina → 抓正文工具 → 直接打开。先做地址安全检查（内网地址哪条路都不走）。

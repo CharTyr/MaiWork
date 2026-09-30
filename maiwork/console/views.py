@@ -694,6 +694,30 @@ def _upcoming(svc: Any, group_id: str, row: dict[str, Any], now: float) -> list[
     return out
 
 
+_AGENT_FISH_KINDS: tuple[str, ...] = ("news", "idea", "goal", "task")
+
+
+def _agent_fish(svc: Any) -> dict[str, str]:
+    """群视图带上的各专岗小鱼种子：kind → fish_seed 字符串；缺位、报错一律全空串兜底。"""
+    try:
+        agents = getattr(svc, "agents", None)
+        if agents is None:
+            return {k: "" for k in _AGENT_FISH_KINDS}
+        profiles = agents.profiles()
+        if not isinstance(profiles, (list, tuple)):
+            return {k: "" for k in _AGENT_FISH_KINDS}
+        out: dict[str, str] = {k: "" for k in _AGENT_FISH_KINDS}
+        for p in profiles:
+            if not isinstance(p, dict):
+                continue
+            kind = str(p.get("kind") or "")
+            seed = p.get("fish_seed")
+            out[kind] = seed if isinstance(seed, str) else ""
+        return out
+    except Exception:
+        return {k: "" for k in _AGENT_FISH_KINDS}
+
+
 def group_view(svc: Any, group_id: str, *, admin: bool) -> dict[str, Any]:
     settings = svc.get_settings()
     now = clock.now()
@@ -734,6 +758,7 @@ def group_view(svc: Any, group_id: str, *, admin: bool) -> dict[str, Any]:
         "tasks": _tasks_view(svc, group_id),
         "topic_log": topic_log,
         "upcoming": _upcoming(svc, group_id, row, now),
+        "agent_fish": _agent_fish(svc),
     }
     if admin:
         out["focus"] = _focus_list(svc, group_id)

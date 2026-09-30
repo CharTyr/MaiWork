@@ -1,6 +1,7 @@
 // MaiWork 网页 · 接口请求，以及当前群的取值小函数。
 import { gadmin, state } from "./state.js";
 import { dur, esc, now } from "./util.js";
+import { fishSvg } from "./fish.js";
 
 /* ───────────── 接口 ───────────── */
 
@@ -30,6 +31,15 @@ export async function api(method, path, body) {
 
 export const grp = () => state.groups.find((x) => x.id === state.g) || null;
 export const gview = () => (state.view && state.view.id === state.g ? state.view : null);
+// 专岗小鱼：管理员刚「换一条」时以设置页拿到的为准；群友从群视图的 agent_fish 拿；都没有就按岗位名固定一条
+export function agentSeed(kind) {
+  const p = ((state.agents && state.agents.profiles) || []).find((x) => x.kind === kind);
+  if (p) return p.fish_seed || "";
+  const v = gview();
+  const m = v && v.agent_fish;
+  return (m && typeof m[kind] === "string" && m[kind]) || "";
+}
+export const agentFish = (kind, size, opts = {}) => fishSvg(`agent:${kind}:${agentSeed(kind)}`, { size, ...opts });
 export const groupRef = (g) => (gadmin() ? g.id : state.ref);
 export const gname = (g) => (g && (g.name || `群 ${g.id}`)) || "";
 // 群所在的聊天平台（后端给 platform："qq" / "telegram" / "qqbot"；老数据没有就当 qq）

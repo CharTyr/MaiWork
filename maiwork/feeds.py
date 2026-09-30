@@ -356,7 +356,8 @@ PER_FOCUS_MIN_CANDS = 6     # 保底：每个关注点至少要搜出几条候�
 PER_FOCUS_MAX_SHARE = 0.40  # 粗筛均衡：一个方向最多占粗筛结果的比例
 DISCOVER_MINUTES = 6        # 撒网子 agent 的时间盒（分钟）
 VERIFY_WORKERS = 3          # 核验子 agent 最多几个并发
-VERIFY_MINUTES = 8          # 核验子 agent 的时间盒（分钟）
+VERIFY_MINUTES = 4          # 核验子 agent 的时间盒（分钟；2026-09-30 起 8→4：打开页数已有代码硬上限，
+                            # 一组几条 4 分钟够用，拖长的一般是在打转）
 # 每轮备料给子 agent 的 task_id 标记序号（同一毫秒也不会撞；统计就按这个标记点数）
 _collect_mark_seq = itertools.count(1)
 _FEEDBACK_SCAN_DAYS = 14    # 关注点提示 / 打分参考的最近反馈窗口
@@ -532,6 +533,109 @@ def _is_listing_url(url: str) -> bool:
         return True
     # /tag/xxx、/category/xxx、/topic/xxx 这类：分类词后面只跟一个名字
     return len(low) == 2 and low[0] in ("tag", "tags", "category", "categories", "topic", "topics", "channel", "section")
+
+
+# ---- 归档 / 列表页和百科资料页（2026-09-30 线上实录：「Archive for September 2026 - Page 24」、
+# 维基「9 (2009 animated film)」「9 (disambiguation)」混进候选）----
+
+# 路径开头的这些片段 = 这页是归档 / 索引，不是一篇内容
+_ARCHIVE_FIRST_SEGMENTS = frozenset({
+    "archive", "archives", "tag", "tags", "category", "categories", "page",
+})
+# 百科 / 词典 / 资料站的主机名（end 匹配：语言子域也一起算）
+_REFERENCE_HOST_SUFFIXES = (
+    "wikipedia.org", "wiktionary.org", "baike.baidu.com", "zhidao.baidu.com",
+    "baike.sogou.com", "baike.so.com",
+)
+
+
+def _is_archive_or_listing_page(url: str, title: str) -> bool:
+    """归档 / 索引列表页：
+
+    - 路径以 archive(s) / tag(s) / category / categories / page 开头（/archives/2026、/page/24、
+      /tags/switch……，/_is_listing_url 只管得到两层短路径，不管它）；
+    - 路径全是数字段（/2026/09/、/2026/09/30/）：纯日期索引页；
+      真文章（/2026/09/some-slug：最后带 slug）不算；
+    - 标题以「Archive for …」「存档」开头（The Verge 的审美）。
+    """
+    try:
+        parts = urlsplit(str(url or "").strip())
+    except ValueError:
+        parts = None
+    if parts is not None:
+        segs = [s for s in (parts.path or "").split("/") if s]
+        if segs:
+            low = [s.lower() for s in segs]
+            if low[0] in _ARCHIVE_FIRST_SEGMENTS:
+                return True
+            # 纯数字路径：多层（/2026/09/、/2026/09/30/）= 日期索引页；单层 4 位 19/20 开头
+            # （/2026/）= 年归档。单层别的数字多半是帖子 id（/1/、/12345/），不算。
+            # 真文章（/2026/09/some-slug：最后带 slug）不拦。
+            # 最后一段是网页文件：index.* 算目录本身；别的（/0/843/123.htm、/2026/0930/5566.html）
+            # 是一篇文章，不算日期索引（IT之家的文章地址就是纯数字 + .htm）。
+            last_is_file = "." in low[-1] and low[-1].rsplit(".", 1)[-1] in ("html", "htm", "php", "shtml", "asp", "aspx")
+            if last_is_file and not low[-1].startswith("index."):
+                stripped = []
+            else:
+                stripped = low[:-1] if last_is_file else low
+
+            def _digits(s: str) -> bool:  # 只认 ASCII 数字（CJK 数字不是日期段）
+                return bool(s) and all("0" <= ch <= "9" for ch in s)
+
+            def _year(s: str) -> bool:
+                return _digits(s) and len(s) == 4 and s.startswith(("19", "20"))
+
+            if len(stripped) >= 2 and all(_digits(s) for s in stripped) and _year(stripped[0]):
+                return True
+            if (
+                len(stripped) == 1
+                and _digits(stripped[0])
+                and len(stripped[0]) == 4
+                and stripped[0].startswith(("19", "20"))
+            ):
+                return True
+    t = str(title or "").strip().lower()
+    if t.startswith("archive for ") or t.startswith("archives:") or t.startswith("存档"):
+        return True
+    return False
+
+
+def _is_reference_page(url: str, title: str) -> bool:
+    """百科 / 词典 / 资料站的页面，或标题明显是消歧义页（disambiguation / 消歧义）。"""
+    host = _site_of(url)
+    if host:
+        for suffix in _REFERENCE_HOST_SUFFIXES:
+            if host == suffix or host.endswith("." + suffix):
+                return True
+    t = str(title or "").lower()
+    if "disambiguation" in t or "消歧义" in t:
+        return True
+    return False
+
+
+# 「这轮没位子」的淘汰话术里的标志短语（生产文案写死在打 reject 的那几处）：
+# 只怪这轮名额，不怪内容——下次（后面的批次）碰到同一链接照样能进来再评。
+# 反例（内容类，挡后面的轮次）：打不开 / 付费 / 屏蔽 / 垃圾 / 不扎实 / 旧闻 /
+# 相关度、平均分不够 / 政府通讯稿 / 群里已经聊过……
+_QUOTA_REJECT_MARKERS = (
+    "留分高的",     # 「文章这轮已经留了 2 篇」、「和这轮另一条…是同一件事，留分高的」、
+                    # 同话题 / 同域名 / 争议 / 不同角度 / 后续 每轮各留几条 的话术都以它结尾
+    "超出本轮上限",  # 「超出本轮上限（最多 N 条）」
+    "拓展名额",     # 「这轮拓展名额（N 个）已经用完」
+    "换换别的",     # 「『话题』最近三天已经发了 N 条，换换别的」（跨轮话题饱和）
+)
+
+
+def _rejection_is_quota(gate: Any, reason: Any) -> bool:
+    """这条入库淘汰是不是纯「名额 / 配额」类：是 → 不挡后面批次的同一链接。
+
+    只看 reject_reason 的固定话术（写死在打 reject 的地方）；认不出一律按
+    「内容类」处理（宁多挡不误放：空理由也返回 False）。
+    """
+    text = str(reason or "")
+    if not text:
+        return False
+    return any(marker in text for marker in _QUOTA_REJECT_MARKERS)
 
 
 def _title_key(title: Any) -> str:
@@ -882,6 +986,36 @@ class Feeds:
             return set()
         return {str(r["url_key"]) for r in rows if r["url_key"]}
 
+    def _recent_rejected_keys(self, gid: str, settings: Settings) -> set[str]:
+        """最近 lookback_days 内**因内容被拒过**（rejected=1）的 url_key。
+
+        用途：同一链接被内容类理由拒过一次，后面几轮别再并进来、别再打分
+        （2026-09-30 线上实录：RSS 轮询源触乐/游研社/机核的同几篇文章，批次 48/49/52
+        每轮都重新打分、再被同一个理由拒一次）。窗口和 _stored_url_keys 一致。
+        例外：纯名额 / 配额类淘汰（_rejection_is_quota：「留分高的」「超出本轮上限」
+        「拓展名额」「换换别的」）不挡——只怪这轮没位子，内容本身没毛病。
+        """
+        lookback_days = max(1, int(getattr(settings.feeds, "lookback_days", 14)))
+        since = clock.now() - lookback_days * 86400.0
+        try:
+            rows = self._store.read().execute(
+                "SELECT url_key, reject_gate, reject_reason FROM news_items"
+                " WHERE group_id=? AND created>=? AND rejected=1",
+                (gid, since),
+            ).fetchall()
+        except Exception:
+            logger.info("读最近被拒的 url_key 失败（群 %s）", gid, exc_info=True)
+            return set()
+        out: set[str] = set()
+        for r in rows:
+            key = str(r["url_key"] or "")
+            if not key:
+                continue
+            if _rejection_is_quota(_row_get(r, "reject_gate", ""), _row_get(r, "reject_reason", "")):
+                continue
+            out.add(key)
+        return out
+
     def _merge_rss_candidates(
         self, gid: str, settings: Settings, candidates: list[dict], rss_items: list[dict]
     ) -> int:
@@ -897,6 +1031,9 @@ class Feeds:
         have = {str(c.get("url_key") or "") for c in candidates}
         have.discard("")
         have |= self._stored_url_keys(gid, settings)
+        # 被内容类理由拒过的同链接也别再并进来（2026-09-30 线上实测：同一批 RSS 文章
+        # 每轮重新打分再按同一理由拒一次）。名额类淘汰不挡——下轮有位子就能进来。
+        have |= self._recent_rejected_keys(gid, settings)
         # 标题也去重（线上回放：机核同一篇的文章版和视频版链接不同、标题一样，并进来两条）
         seen_titles = {_title_key(c.get("title")) for c in candidates}
         seen_titles.discard("")
@@ -2198,7 +2335,8 @@ class Feeds:
         lines.append("")
         lines.append(
             "请照上面的标准给出 3–5 个接下来要去找的关注点，只回 JSON："
-            '{"focus": [{"query": "拿去搜索的关键词（具体一点）", "why": "为什么这个群会在意（拓展方向写从哪条兴趣跳过来）",'
+            '{"focus": [{"query": "方向名：短短一句，一个核心事物 + 一个角度（2–10 字直接能搜的那种；'
+            '不是一长串关键词串烧）", "why": "为什么这个群会在意（拓展方向写从哪条兴趣跳过来）",'
             ' "source": "recent | long | explore"}],'
             ' "diverse": {"query": "…", "why": "…"} | null}'
             "。source：来自「最近在聊」的填 recent，长期兴趣 / 在做的事 / 常用资源填 long，「跳一步」的拓展方向填 explore；"
@@ -2235,7 +2373,8 @@ class Feeds:
                 "content": (
                     "太少了：我要 3–5 个不同的关注点，严格按上面的 JSON 格式回 "
                     '{"focus": [{"query": "…", "why": "…", "source": "recent | long | explore"}, …]}'
-                    "（focus 是列表，最少 3 个；diverse 没有就 null）。"
+                    "（focus 是列表，最少 3 个；diverse 没有就 null；query 照样是短短一句方向名，"
+                    "别堆成关键词串烧）。"
                 ),
             })
             retry_result = await self._models.chat(
@@ -2296,6 +2435,11 @@ class Feeds:
         """brief 里「怎么搜」一段：多种问法、一手来源、时间由程序管、别同义改写、屏蔽名单。"""
         lines = [
             "怎么搜：",
+            "- **搜索词要短**：一个核心事物 + 一个角度，大约 2–6 个词；"
+            "**别把整条关注点原样当搜索词**（那是让你想几个不同角度的提示，不是成串往搜索框里糊的关键词串烧）。"
+            "好：「生化危机9 战斗系统」「生化危机9 豪华版提前解锁」；"
+            "坏：「鬼武者 剑之道 首发解锁 豪华版提前游玩 通关评价 战斗系统解析」——"
+            "这种一长串什么也搜不准，拆成几个 2–6 词的短词各搜一次。",
             f"- 时间由程序管：找资讯时 web_search 不填 days，程序默认只搜最近 {_NEWS_MAX_AGE_DAYS} 天；"
             f"找文章时把 days 填 {GUIDE_MAX_AGE_DAYS}。别在搜索词里塞年份、月份来求新。",
             "- 每个关注点至少换 4 种问法，其中至少 1 种直奔一手来源。可选的角度：一手来源（官方新闻室、公告、"
@@ -2481,6 +2625,7 @@ class Feeds:
         blocked = self._blocked_domains(gid, settings)
         auto_blocked = set(self._auto_blocked_domains(gid))
         stored = self._stored_url_keys(gid, settings)
+        rejected_keys = self._recent_rejected_keys(gid, settings)
         lookback_days = max(1, int(getattr(settings.feeds, "lookback_days", 14)))
         since = clock.now() - lookback_days * 86400.0
         try:
@@ -2510,9 +2655,24 @@ class Feeds:
             if key and key in stored:
                 dropped.append((url, "和最近出过的重复（同一个链接）"))
                 continue
+            # 因内容被拒过的同链接：以前筛掉过，别再拉回来打分（名额类淘汰不在里面，
+            # 下轮有位子照样能进来。2026-09-30 线上实测：同一链接连续几轮重评重拒）
+            if key and key in rejected_keys:
+                dropped.append((url, "这条最近几轮已经筛掉过（以前拒过），别再评"))
+                continue
             # 网站首页 / 栏目页 / 标签页：不是一篇内容（2026-09-30 线上实测挑中过 nintendolife.com 首页）
             if _is_listing_url(url):
                 dropped.append((url, "网站首页或栏目页，不是一篇内容"))
+                continue
+            # 归档 / 索引列表页（/archives/2026、/page/N、纯日期路径、「Archive for …」标题）：
+            # 不是一篇内容（2026-09-30 线上实录「Archive for September 2026 - Page 24 | The Verge」）
+            if _is_archive_or_listing_page(url, str(c.get("title") or "")):
+                dropped.append((url, "归档或列表页，不是一篇内容"))
+                continue
+            # 百科 / 词典 / 资料页（wikipedia / wiktionary / 百度百科……），或明显是消歧义页：
+            # 不是一条资讯（2026-09-30 线上实录搜「生化危机9」搜出维基「9 (2009 animated film)」）
+            if _is_reference_page(url, str(c.get("title") or "")):
+                dropped.append((url, "百科词条或资料页，不是一条资讯"))
                 continue
             # 屏蔽 / 自动屏蔽来源
             if site and _domain_blocked(site, blocked):
@@ -2654,16 +2814,27 @@ class Feeds:
         return out, True
 
     def _verify_brief(self, gid: str, group: list[tuple[dict, str, str]]) -> str:
-        """核验子 agent 的 brief：资讯标准 + 本组每条（url/title/snippet/kind/hook），只许 fetch_page。"""
+        """核验子 agent 的 brief：资讯标准 + 本组每条（url/title/snippet/kind/hook），只许 fetch_page。
+
+        2026-09-30 线上实录（8 分钟 23 次 fetch_page 的「找日期打转」）后加硬规矩：
+        只开候选链接本身（打不开最多换一个备用地址），不许搜镜像 / 存档站 / API；
+        页面上没有可见发布日期，就用搜索结果自带的日期（下面每条已列出），没有就留空。
+        """
         today = clock.bj(clock.now()).strftime("%Y-%m-%d")
         guides = True  # 核验这步不作「找不找文章」的决定：挑里带 kind，照老格式交回
         lines: list[str] = []
         for n, (c, kind, hook) in enumerate(group):
             hint = f"（同事判断这是 {'资讯' if kind == 'news' else '文章'}）"
             hook_text = f"\n    同事为什么觉得值得打开：{hook}" if hook else ""
+            pub = c.get("published")
+            date_text = (
+                f"\n    搜索结果自带的发布日期：{clock.bj(float(pub)).strftime('%Y-%m-%d')}"
+                "（页面上找不到可见日期就用这条，别为了它在页面上翻来翻去）"
+                if isinstance(pub, (int, float)) and pub else ""
+            )
             lines.append(
                 f"[{n}] 标题：{c.get('title') or ''}{hint}\n    链接：{c.get('url') or ''}\n"
-                f"    搜索摘要：{str(c.get('snippet') or '')[:200]}{hook_text}"
+                f"    搜索摘要：{str(c.get('snippet') or '')[:200]}{hook_text}{date_text}"
             )
         return (
             f"今天是 {today}（北京时间）。下面 {len(group)} 条是同事撒网搜出来、粗筛后挑中要打开的候选。\n"
@@ -2671,12 +2842,20 @@ class Feeds:
             + news_standard.for_collect(guides)
             + "\n\n要求：\n"
             "1. 每条都必须用 fetch_page 真打开过原文（只用 fetch_page，**不要搜索**）；\n"
-            f"2. 每条：title（原标题或大意）、url（原文链接）、summary（2–4 句中文纯文本，别用 Markdown）、"
+            "2. **只开候选链接本身**：打不开最多再换一个备用地址（比如标题链接跳转后的地址）试一次，"
+            "**绝不为了找信息去搜或去开镜像站、存档站（web.archive）、oEmbed / API 之类的接口**——"
+            "候选打不开就标打不开，别硬啃；\n"
+            "3. 发布日期：页面上有直接可见的就用页面上的（它和搜索结果自带的对不上以页面为准），"
+            "页面上找不到可见日期就用「搜索结果自带的发布日期」，没有再留空——"
+            "**不许为了找日期多开任何页面**；\n"
+            f"4. 每条：title（原标题或大意）、url（原文链接）、summary（2–4 句中文纯文本，别用 Markdown）、"
             f"kind（{'news 或 guide，照同事的 hint 填，你判断 hint 明显不对可以改'}）、"
             f"published（发布时间，ISO 格式或 epoch 秒，拿不到空字符串）、"
             f"fetched（确实打开过 true）、quote（从原文抄一小段能支撑摘要的依据，≤{_QUOTE_MAX} 字）、"
             "paywall（要登录/付费 true）、image_url（有封面图就抄过来）；\n"
-            "3. 最后用 submit_result 交回，data 按约定的 JSON Schema；\n"
+            "5. 每条候选的打开次数有限（程序按组封死），次数用完工具会直接拒绝——"
+            "别再找别的页面，用已经打开到的内容按格式交回；\n"
+            "6. 最后用 submit_result 交回，data 按约定的 JSON Schema；\n"
             f"你只有大约 {VERIFY_MINUTES} 分钟，到点前把已经核对完的交回来。\n\n"
             + "\n\n".join(lines)
         )
@@ -2707,10 +2886,17 @@ class Feeds:
         groups = [g for g in groups if g]
 
         async def _one(k: int, group: list[tuple[dict, str, str]]) -> list[dict]:
+            # 这组核验的打开页数账本（代码硬上限；fetch_page handler 按 task_id 查账）。
+            # 宁可按「刚好够用」开（cap_for：条数×2+1、最多 6），防「找日期打转」。
+            from . import verify_budget
+
+            group_mark = f"{verify_mark}:{k}"
+            verify_budget.open_run(group_mark, cap_page_calls=verify_budget.cap_for(len(group)))
+
             async def _inner() -> list[dict]:
                 report = await self._run_stage(
                     gid, phase="verify", brief=self._verify_brief(gid, group),
-                    task_id=f"{verify_mark}:{k}",
+                    task_id=group_mark,
                     tools=["fetch_page"],
                     output_schema=_NEWS_OUTPUT_SCHEMA, deadline_ts=deadline_ts,
                     actor=f"资讯核验 子 agent #{k}", max_steps=0,
@@ -2732,6 +2918,16 @@ class Feeds:
                         item["src_provider"] = str(src.get("provider") or "")
                     if src.get("focus") is not None:
                         item["src_focus"] = src.get("focus")
+                    # 发布日期兜底（2026-09-30 线上实测）：核验没拿到日期时，
+                    # 用撒网候选自带的搜索结果日期补上——搜索结果本身经常带日期，
+                    # 别因为这被「文章没有发布时间，宁缺毋滥不收」硬拒掉。
+                    # （核验自己拿到日期的以它为准，不覆盖。）
+                    if not isinstance(item.get("published_ts"), (int, float)):
+                        cand_pub = src.get("published")
+                        if isinstance(cand_pub, (int, float)) and cand_pub:
+                            item["published_ts"] = float(cand_pub)
+                            if item.get("published_raw") in (None, ""):
+                                item["published_raw"] = float(cand_pub)
                 return items
 
             try:
@@ -2739,6 +2935,8 @@ class Feeds:
             except Exception:
                 self._drop_news_round_records(gid, f"核验组 #{k} 失败，重试被拒")
                 raise
+            finally:
+                verify_budget.close_run(group_mark)
 
         results = await asyncio.gather(
             *[_one(k, g) for k, g in enumerate(groups)], return_exceptions=True

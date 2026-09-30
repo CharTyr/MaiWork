@@ -1,6 +1,7 @@
 // MaiWork 网页 · 「目标」页。
 import { state } from "../state.js";
 import { dur, esc, ico, now, when } from "../util.js";
+import { agentFish } from "../api.js";
 import { emptyState } from "./news.js";
 
 export function nextText(goal) {
@@ -9,7 +10,7 @@ export function nextText(goal) {
 }
 
 export function viewGoals(g, v) {
-  let html = `<h1 class="h-page">目标</h1>`;
+  let html = `<h1 class="h-page h-fish">${agentFish("goal", 44)}<span>目标</span></h1>`;
   const goals = (v && v.goals) || { agent: [], member: [] };
   const agent = goals.agent || [];
   const member = goals.member || [];
