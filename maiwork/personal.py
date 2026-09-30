@@ -34,7 +34,7 @@ from typing import Any, Callable
 
 from . import clock, members
 from .config import Settings
-from .feeds import clean_step, focus_items
+from .feeds import _adopt_title_zh, _localize_title, _titles_with_originals, clean_step, focus_items
 from .models import ModelError
 from .search import SearchUnavailable
 from .store import Store
@@ -406,11 +406,11 @@ class Personal:
         # 对重窗口看「本群个人向 + 群向」最近 lookback_days 天（个人向别和群向出题撞，也别和自己撞）
         since = clock.now() - max(1, int(getattr(settings.feeds, "lookback_days", 14))) * 86400.0
         rows = self._store.read().execute(
-            "SELECT url_key, title FROM news_items WHERE group_id=? AND created>=? AND rejected=0",
+            "SELECT url_key, title, sources FROM news_items WHERE group_id=? AND created>=? AND rejected=0",
             (gid, since),
         ).fetchall()
         seen_urls = {str(r["url_key"]) for r in rows if r["url_key"]}
-        seen_titles = [str(r["title"]) for r in rows if r["title"]]
+        seen_titles = _titles_with_originals(rows)
         survivors: list[dict] = []
         for item in candidates:
             url_key = item["url_key"]
@@ -670,7 +670,9 @@ class Personal:
             lines.append("")
         lines.append(
             "给每条写帖子，只回 JSON："
-            '{"posts": [{"i": 编号, "title": "对应条目标题",'
+            '{"posts": [{"i": 编号, "title": "对应条目标题（原样照抄）",'
+            ' "title_zh": "原标题不是中文时译成简洁自然的中文标题（专有名词、产品名可保留原文），'
+            '不许加原文没有的信息；原标题已是中文就原样照抄",'
             ' "body": "写给他的正文 2–4 句，第二人称，像「你在弄 X，这个可能用得上……」；'
             ' 关键处可用 [文字](https://链接) 嵌原文链接，只许 http(s),'
             ' "reason": "为什么给他；说他提过的事只能用上面引用列表里他本人的原话，别的不编,'
@@ -716,6 +718,7 @@ class Personal:
                 self._post_fallback(item)
                 continue
             item["post"] = self._clean_post(raw, pack["quotes"], item)
+            _adopt_title_zh(item, raw)
 
     def _post_fallback(self, item: dict) -> None:
         keywords: list[str] = []
@@ -795,6 +798,7 @@ class Personal:
             )
             batch_id = int(cur.lastrowid or 0)
             for item in accepted:
+                _localize_title(item)
                 sc = item.get("scores") or {}
                 post = item.get("post") or {}
                 body = scrub(gid, str(post.get("body") or ""), self._store) or ""
@@ -811,7 +815,8 @@ class Personal:
                         batch_id, gid, str(item.get("icon") or "newspaper"), item["title"],
                         item["summary"], str(item.get("why") or ""),
                         json.dumps(
-                            [{"url": item["url"], "site": str(item.get("site") or ""), "title": item["title"]}],
+                            [{"url": item["url"], "site": str(item.get("site") or ""),
+                              "title": item.get("title_orig") or item["title"]}],
                             ensure_ascii=False,
                         ),
                         item["url_key"], item.get("published_ts"),

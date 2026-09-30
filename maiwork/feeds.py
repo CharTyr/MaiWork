@@ -539,6 +539,53 @@ def _title_key(title: Any) -> str:
     return _re.sub(r"\s+", "", str(title or "")).lower()
 
 
+_TITLE_ZH_MAX = 80
+_HAN_RE = _re.compile(r"[\u4e00-\u9fff]")
+_KANA_HANGUL_RE = _re.compile(r"[\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af\u1100-\u11ff]")
+
+
+def _looks_chinese(title: Any) -> bool:
+    """标题算不算中文：有汉字、且没有日文假名 / 韩文（日韩标题也要译）。"""
+    t = str(title or "")
+    return bool(_HAN_RE.search(t)) and not _KANA_HANGUL_RE.search(t)
+
+
+def _adopt_title_zh(item: dict, post: Any) -> None:
+    """写帖子时模型顺带给的中文标题（2026-09-30 用户要求：外文标题群友可能不看）。
+    原标题已经是中文、或译文不像中文 → 不采用。只记 item["title_zh"]，入库时才换。"""
+    if not isinstance(post, dict) or _looks_chinese(item.get("title")):
+        return
+    zh = _re.sub(r"\s+", " ", str(post.get("title_zh") or "")).strip()[:_TITLE_ZH_MAX]
+    if zh and _looks_chinese(zh):
+        item["title_zh"] = zh
+
+
+def _localize_title(item: dict) -> None:
+    """入库前把展示标题换成中文，原标题留在 item["title_orig"]（进 sources[0].title）。"""
+    zh = str(item.get("title_zh") or "")
+    if zh and "title_orig" not in item:
+        item["title_orig"] = item.get("title") or ""
+        item["title"] = zh
+
+
+def _titles_with_originals(rows: Any) -> list[str]:
+    """查重用的已发标题：展示标题 + sources 里的原标题（外文条目入库后标题是中文译名）。"""
+    out: list[str] = []
+    for r in rows:
+        t = str(r["title"] or "")
+        if t:
+            out.append(t)
+        try:
+            srcs = json.loads(r["sources"] or "[]")
+        except (ValueError, TypeError, IndexError, KeyError):
+            continue
+        if isinstance(srcs, list) and srcs and isinstance(srcs[0], dict):
+            o = str(srcs[0].get("title") or "")
+            if o and o != t:
+                out.append(o)
+    return out
+
+
 def _public_http_url(url: str) -> str:
     """洗净的 http(s) 链接；内网 / 本机 IP、解析不了的一律返回 ""。只防常识，不做 DNS。"""
     raw = str(url or "").strip()
@@ -1427,11 +1474,11 @@ class Feeds:
         lookback_days = max(1, int(getattr(settings.feeds, "lookback_days", 14)))
         since = clock.now() - lookback_days * 86400.0
         rows = self._store.read().execute(
-            "SELECT url_key, title FROM news_items WHERE group_id=? AND created>=? AND rejected=0",
+            "SELECT url_key, title, sources FROM news_items WHERE group_id=? AND created>=? AND rejected=0",
             (gid, since),
         ).fetchall()
         seen_urls = {str(r["url_key"]) for r in rows if r["url_key"]}
-        seen_titles = [str(r["title"]) for r in rows if r["title"]]
+        seen_titles = _titles_with_originals(rows)
         survivors: list[dict] = []
         for item in candidates:
             url_key = item["url_key"]
@@ -1908,6 +1955,7 @@ class Feeds:
                 funnel=funnel,
             )
             for item in accepted_items:
+                _localize_title(item)
                 sc = item.get("scores") or {}
                 post = item.get("post") or {}
                 verify_raw = item.get("verify")
@@ -1924,7 +1972,8 @@ class Feeds:
                         batch_id, gid, str(item.get("icon") or "newspaper"), item["title"],
                         item["summary"], str(item.get("why") or ""),
                         json.dumps(
-                            [{"url": item["url"], "site": str(item.get("site") or _site_of(item["url"])), "title": item["title"]}],
+                            [{"url": item["url"], "site": str(item.get("site") or _site_of(item["url"])),
+                              "title": item.get("title_orig") or item["title"]}],
                             ensure_ascii=False,
                         ),
                         item["url_key"], item.get("published_ts"),
@@ -2436,10 +2485,10 @@ class Feeds:
         since = clock.now() - lookback_days * 86400.0
         try:
             rows = self._store.read().execute(
-                "SELECT title FROM news_items WHERE group_id=? AND created>=? AND rejected=0",
+                "SELECT title, sources FROM news_items WHERE group_id=? AND created>=? AND rejected=0",
                 (gid, since),
             ).fetchall()
-            published_titles = [str(r["title"]) for r in rows if r["title"]]
+            published_titles = _titles_with_originals(rows)
         except Exception:
             logger.debug("读最近发过的标题失败（群 %s），这轮粗筛不查重", gid, exc_info=True)
             published_titles = []
@@ -3521,6 +3570,7 @@ class Feeds:
             if raw is None:
                 continue
             item["post"] = self._clean_post(gid, raw, pack["quotes"], item)
+            _adopt_title_zh(item, raw)
 
     async def _posts_prompt_lines(self, gid: str, per_item: list[dict]) -> list[str]:
         """写帖子提示词（每条的素材 + 写法要求）；每轮一次 + 补漏重试一次共用同一份结构，
@@ -3572,7 +3622,9 @@ class Feeds:
             lines.append("")
         lines.append(
             "给每条写帖子，只回 JSON："
-            '{"posts": [{"i": 编号, "title": "对应条目标题",'
+            '{"posts": [{"i": 编号, "title": "对应条目标题（原样照抄）",'
+            ' "title_zh": "原标题不是中文时译成简洁自然的中文标题（专有名词、产品名可保留原文），'
+            '不许加原文没有的信息；原标题已是中文就原样照抄",'
             ' "body": "按 MaiBot 口吻写的正文 2–5 句，像跟熟人讲；关键处可用 [文字](https://链接)'
             ' 嵌原文链接，只许 http(s) 链接,'
             ' "reason": "我发这条的原因，第一人称；落到群里真实聊过的事和时间'
