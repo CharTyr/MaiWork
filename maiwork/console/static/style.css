@@ -1523,3 +1523,18 @@ a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 .taste-meta { margin-left: 8px; font-size: 12px; color: var(--gray); }
 .set-row.is-off .set-name { color: var(--gray); text-decoration: line-through; }
 .ntag.fu { background: var(--ok-bg); color: var(--ok-ink); }
+
+/* 专岗工作册：沿用设置页的克制布局，以记录与交接为主，不做岗位卡片墙。 */
+.agent-journal { margin: 28px 0; padding: 0 0 12px 18px; border-left: 2px solid var(--line); }
+.agent-journal h3 { display: flex; align-items: center; gap: 8px; margin: 0 0 14px; }
+.agent-journal h3 .ico, .ext-form-h .ico { width: 24px; height: 24px; vertical-align: middle; }
+.agent-journal textarea, #agent-group { width: 100%; padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--fill-2); color: var(--ink); font: inherit; line-height: 1.5; }
+.agent-journal textarea { resize: vertical; margin-top: 6px; }
+.agent-journal textarea:focus-visible, #agent-group:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.agent-journal details { margin-top: 14px; }
+.agent-journal summary { cursor: pointer; font-size: 14px; font-weight: 650; line-height: 1.7; }
+.agent-entry { padding: 12px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.agent-entry p { font-size: 14px; line-height: 1.6; white-space: pre-wrap; margin: 6px 0; }
+.agent-entry p.fine { color: var(--gray); font-size: 12px; }
+.agent-refs { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; margin-bottom: 4px; }
+#agent-skills { display: grid; gap: 10px; }

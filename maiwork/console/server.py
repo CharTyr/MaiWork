@@ -2885,6 +2885,146 @@ class ConsoleServer:
 
         app.router.add_post("/api/identity/soul/sync", self._write(_identity_soul_sync))
 
+        # ---------- 专岗（agents.py；契约 /tmp/maiwork-specialists-contract.md A 部分） ----------
+        #
+        # 路由（结构严格按契约 §24-29）：
+        #   GET /api/agents                          → {"profiles": [news/idea/goal/task]}（只总管理员）
+        #   PUT /api/agents/{kind}                   → profile（只总管理员；同源 guard 在 _write）
+        #   GET /api/groups/{gid}/agents             → {"group_id", "agents": [{kind,title,notes,learned,recent_handoffs}]}
+        #                                             （总管理员或本群 group_admin；成员 403 / 匿名 401 / 非服务群 404）
+        #   PUT /api/groups/{gid}/agents/{kind}/memory {notes} → memory（同上权限；task 拒 400）
+        #   GET /api/groups/{gid}/agents/handoffs?kind=... → {"items": [...]}（同上权限）
+        # svc.agents（Agents 实例）没就位 → 503；字段严格：未知键 / 坏类型 / 超长 → 400。
+
+        def _agents_ready() -> tuple[Any, web.Response | None]:
+            mod = getattr(svc, "agents", None)
+            if mod is None:
+                return None, _err(503, "这个功能还没开")
+            return mod, None
+
+        @get("/api/agents")
+        async def _agents_profiles(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            mod, not_ready = _agents_ready()
+            if not_ready is not None:
+                return not_ready
+            return web.json_response({"profiles": mod.profiles()})
+
+        async def _agents_profile_put(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            mod, not_ready = _agents_ready()
+            if not_ready is not None:
+                return not_ready
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            try:
+                profile = mod.update_profile(str(request.match_info["kind"]), body)
+            except ValueError as e:
+                return _err(400, str(e) or "这个值改不了")
+            except Exception:
+                logger.exception("改岗位配置出错")
+                return _err(500, "服务器出错了")
+            return web.json_response(profile)
+
+        app.router.add_route("PUT", "/api/agents/{kind}", self._write(_agents_profile_put))
+
+        def _agents_group_view(mod: Any, gid: str) -> dict[str, Any]:
+            """本群岗位快照：四种齐全（task 只读交接记录——notes='' / learned=[]）。"""
+            agents_out: list[dict[str, Any]] = []
+            profiles = {p["kind"]: p for p in mod.profiles()}
+            for kind in ("news", "idea", "goal", "task"):
+                p = profiles.get(kind) or {"title": kind}
+                if kind == "task":
+                    mem = {"notes": "", "learned": []}
+                else:
+                    mem = mod.memory(gid, kind)
+                agents_out.append(
+                    {
+                        "kind": kind,
+                        "title": str(p.get("title") or kind),
+                        "enabled": bool(p.get("enabled", True)),
+                        "notes": mem["notes"],
+                        "learned": mem["learned"],
+                        "recent_handoffs": mod.handoffs(gid, kind=kind, limit=5),
+                    }
+                )
+            return {"group_id": gid, "agents": agents_out}
+
+        @get("/api/groups/{gid}/agents")
+        async def _group_agents(request: web.Request) -> web.Response:
+            gid = self._resolve_ref(str(request.match_info["gid"]))
+            if gid is None or not svc.get_settings().is_served(gid):
+                return _err(404, "没有这个群（只支持服务群）")
+            forbid = self._require_group_admin(request, gid)
+            if forbid is not None:
+                return forbid
+            mod, not_ready = _agents_ready()
+            if not_ready is not None:
+                return not_ready
+            try:
+                return web.json_response(_agents_group_view(mod, gid))
+            except ValueError as e:
+                return _err(404, str(e))
+            except Exception:
+                logger.exception("读本群岗位快照出错")
+                return _err(500, "服务器出错了")
+
+        async def _group_agents_memory_put(request: web.Request) -> web.Response:
+            gid = self._resolve_ref(str(request.match_info["gid"]))
+            if gid is None or not svc.get_settings().is_served(gid):
+                return _err(404, "没有这个群（只支持服务群）")
+            forbid = self._require_group_admin(request, gid)
+            if forbid is not None:
+                return forbid
+            mod, not_ready = _agents_ready()
+            if not_ready is not None:
+                return not_ready
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            notes = body.get("notes")
+            if not isinstance(notes, str):
+                return _err(400, "notes 要是字符串")
+            kind = str(request.match_info["kind"])
+            try:
+                mem = mod.set_notes(gid, kind, notes)
+            except ValueError as e:
+                return _err(400, str(e) or "这个值改不了")
+            except Exception:
+                logger.exception("写岗位工作册出错")
+                return _err(500, "服务器出错了")
+            return web.json_response(mem)
+
+        app.router.add_route(
+            "PUT", "/api/groups/{gid}/agents/{kind}/memory", self._write(_group_agents_memory_put)
+        )
+
+        @get("/api/groups/{gid}/agents/handoffs")
+        async def _group_agents_handoffs(request: web.Request) -> web.Response:
+            gid = self._resolve_ref(str(request.match_info["gid"]))
+            if gid is None or not svc.get_settings().is_served(gid):
+                return _err(404, "没有这个群（只支持服务群）")
+            forbid = self._require_group_admin(request, gid)
+            if forbid is not None:
+                return forbid
+            mod, not_ready = _agents_ready()
+            if not_ready is not None:
+                return not_ready
+            kind = str(request.rel_url.query.get("kind") or "").strip() or None
+            try:
+                items = mod.handoffs(gid, kind=kind, limit=20)
+            except ValueError as e:
+                return _err(404, str(e))
+            except Exception:
+                logger.exception("读本群交接单出错")
+                return _err(500, "服务器出错了")
+            return web.json_response({"items": items})
+
         # ---------- 和 MaiWork 聊：管理员对话（只管理员；配套 static/js/chat.js 的对话页） ----------
         #
         # 返回结构按 static/js/chat.js 的「和 MaiWork 聊」页：

@@ -144,6 +144,12 @@ class MaiWorkApp:
         # skill + MCP 扩展（docs/02 §10；skills.py 只读数据目录、extensions.py 连 MCP；不挂 MaiBot planner）
         self.skills: Any = None
         self.extensions: Any = None
+        # 专岗（agents.py / specialists.py；没就位 → None，各注入点走老路，server 503）
+        self.agents: Any = None
+        self.specialists: Any = None
+        # 测试注入点：专岗组件构造工厂（默认 _make_agents/_make_specialists 的懒加载）
+        self.agents_factory: Callable[..., Any] | None = None
+        self.specialists_factory: Callable[..., Any] | None = None
         # 群空间（docs/02 §10；platforms/qq_onebot.py；[group_space] enabled=false → None）
         self.group_space: Any = None
         # 身份与工作记忆（identity.py；start 时建，模块出错 → None，注入点自动跳过）
@@ -528,6 +534,13 @@ class MaiWorkApp:
             logger.exception("建群管理员存储出错，群管理员这次不可用")
             self.group_admins = None
         self.commands = self._make_commands()
+        # 3.66 专岗（agents.py + specialists.py）：要在 Workers / Tools / Skills / 扩展全部
+        # 就位之后建（Specialists 要它们），在 Feeds/GoalProposer/Coordinator 全部就位之后挂
+        # （它们都吃 `_specialists` 注入点）。没就位 → None，网页 API（server.py）503、
+        # 业务走老路并记一行日志——绝不静默换成「通才 worker」。
+        self.agents = self._make_agents()
+        self.specialists = self._make_specialists()
+        self._wire_specialists()
         # 3.7 回收上次配置里删掉、库里残留的群数据（就地标记，不删）
         try:
             self._reconcile_unserved()
@@ -743,6 +756,8 @@ class MaiWorkApp:
             self.extensions = None
         self.skills = None
         self.identity = None
+        self.specialists = None
+        self.agents = None
         self.search = None
         self.tools = None
         self.workers = None
@@ -1303,6 +1318,73 @@ class MaiWorkApp:
         except Exception:
             logger.exception("建 GoalProposer 出错，主动提目标这次跳过")
             return None
+
+    def _make_agents(self) -> Any:
+        """Agents（agents.py，A 负责）；模块没就位 / 构造失败 → None（server 503、专岗全停）。"""
+        try:
+            factory = getattr(self, "agents_factory", None)
+            if factory is not None:
+                return factory(self.store, self.get_settings)
+        except Exception:
+            logger.exception("用 agents_factory 建 Agents 出错")
+            return None
+        try:
+            from .agents import Agents
+
+            return Agents(self.store, self.get_settings)
+        except Exception:
+            logger.info("专岗 Agents 还没就位（模块未提供或构造出错），专岗功能这次跳过")
+            return None
+
+    def _make_specialists(self) -> Any:
+        """Specialists（specialists.py，B 负责）；agents 没就位也不能建 → None。"""
+        agents = self.agents
+        if agents is None or self.workers is None:
+            return None
+        try:
+            factory = getattr(self, "specialists_factory", None)
+            if factory is not None:
+                return factory(agents, self.workers, self.skills)
+        except Exception:
+            logger.exception("用 specialists_factory 建 Specialists 出错")
+            return None
+        try:
+            from .specialists import Specialists
+
+            return Specialists(agents, self.workers, self.skills)
+        except Exception:
+            logger.info("专岗 Specialists 还没就位（模块未提供或构造出错），专岗功能这次跳过")
+            return None
+
+    def _wire_specialists(self) -> None:
+        """把同一份 Specialists 挂到使用它的三个管线（feeds / goal_proposer / coordinator）。
+
+        没就位 → 三处保持 None（老路）；就位 → 生产强制使用专岗，不静默换通才。
+        """
+        specialists = self.specialists
+        if specialists is None:
+            return
+        wired = []
+        try:
+            if self.feeds is not None:
+                self.feeds._specialists = specialists  # noqa: SLF001
+                wired.append("feeds")
+        except Exception:
+            logger.exception("给 feeds 挂 specialists 出错")
+        try:
+            if self.goal_proposer is not None:
+                self.goal_proposer._specialists = specialists  # noqa: SLF001
+                wired.append("goal_proposer")
+        except Exception:
+            logger.exception("给 goal_proposer 挂 specialists 出错")
+        try:
+            if self.coordinator is not None:
+                self.coordinator._specialists = specialists  # noqa: SLF001
+                wired.append("coordinator")
+        except Exception:
+            logger.exception("给 coordinator 挂 specialists 出错")
+        if wired:
+            logger.info("专岗已接线（%s）", ",".join(wired))
 
     def _make_auto_review(self) -> Any:
         """自动审核（auto_review.py）；模块没就位 / 构造失败就 None，这块功能跳过。

@@ -5,6 +5,7 @@ import { api, groupRef, grp } from "./api.js";
 import { loadTask } from "./detail.js";
 import { SET_SUBS, loadGA } from "./settings/index.js";
 import { loadExt } from "./settings/ext.js";
+import { loadAgents } from "./settings/agents.js";
 import { loadRules } from "./settings/rules.js";
 import { loadUsage } from "./settings/usage.js";
 import { loadIdentity } from "./settings/identity.js";
@@ -104,6 +105,10 @@ export async function loadSettings() {
 export async function reboot() {
   state.view = null;
   state.settings = null;
+  state.agents = null;
+  state.agentSnapshot = null;
+  state.agentEdit = null;
+  state.agentLoadSeq = (state.agentLoadSeq || 0) + 1;
   state.tasks = {};
   try {
     await loadMe();
@@ -122,6 +127,7 @@ export async function reboot() {
   const settingsReady = admin()
     ? loadSettings().then(async () => {
         if (state.page === "settings" && state.setSub === "extensions") await loadExt();
+        if (state.page === "settings" && state.setSub === "agents") await loadAgents();
         if (state.page === "settings" && state.setSub === "rules") await loadRules();
         if (state.page === "settings" && state.setSub === "usage") await loadUsage();
         if (state.page === "settings" && state.setSub === "identity") await loadIdentity();
@@ -157,6 +163,7 @@ export async function enterSettings(sub) {
   go({ page: "settings", setSub: sub || state.setSub || "overview", detail: null });
   if (!state.settings) await loadSettings();
   if (state.setSub === "extensions") await loadExt();
+  if (state.setSub === "agents") await loadAgents();
   if (state.setSub === "rules") await loadRules();
   if (state.setSub === "usage") await loadUsage();
   if (state.setSub === "identity") await loadIdentity();

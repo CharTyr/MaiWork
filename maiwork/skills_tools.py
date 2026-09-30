@@ -27,6 +27,16 @@ def register_skill_tools(tools: Tools, skills: Skills) -> None:
     except Exception:
         pass
 
+    def _allowed_skills(ctx: ToolContext) -> tuple[str, ...] | None:
+        """专岗（specialists.py）给的本轮 skill 白名单；None = 通才不过滤."""
+        allowed = getattr(ctx, "allowed_skills", None)
+        if allowed is None:
+            return None
+        try:
+            return tuple(str(x) for x in allowed)
+        except Exception:
+            return None
+
     async def list_skills(ctx: ToolContext, args: dict) -> ToolResult:
         role = role_of(ctx)
         try:
@@ -34,6 +44,11 @@ def register_skill_tools(tools: Tools, skills: Skills) -> None:
         except Exception:
             logger.exception("list_skills 读目录出错")
             return ToolResult(ok=False, output="", error="读 skill 目录出错了")
+        # 岗位白名单（专岗）：只列交集；roles/全局开关已由 skills.list 处理。
+        allowed = _allowed_skills(ctx)
+        if allowed is not None:
+            allowed_set = set(allowed)
+            items = [i for i in items if str(i.get("name") or "") in allowed_set]
         if not items:
             return ToolResult(
                 ok=True,
@@ -58,6 +73,12 @@ def register_skill_tools(tools: Tools, skills: Skills) -> None:
         # 角色对不上的 skill 当「没有」——不 leak 名字，也不给读（附属文件同理）
         skill_roles = skills.roles(name)
         if skill_roles is None or role not in skill_roles:
+            return ToolResult(
+                ok=False, output="", error=f"没有叫「{name}」的 skill（先用 list_skills 看有哪些）"
+            )
+        # 岗位白名单（专岗）：不在白名单当成「没有」；模型不能凭名字猜读。
+        allowed = _allowed_skills(ctx)
+        if allowed is not None and name not in allowed:
             return ToolResult(
                 ok=False, output="", error=f"没有叫「{name}」的 skill（先用 list_skills 看有哪些）"
             )

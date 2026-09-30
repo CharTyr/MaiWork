@@ -35,6 +35,12 @@ _SENSITIVE_WORDS = ("key", "token", "password", "secret")
 _SUMMARY_MAX = 500
 # 管理员对话的角色名（tools_admin.ROLE 同值）；这个角色的工具单独注册表
 ADMIN_ROLE = "admin"
+# 群绑工具（worker 角色时 args.group_id 不允许越 ctx.group_id）：这些工具读「本群的资料」
+# （画像 / 群聊消息 / 语义搜群 / 群记忆）。worker 拿 args 伪造 group_id 越群读别群资料，
+# 在 handler 之前就被拦；admin / main 不变（主模型/管理员可指定群——比如验收时正群查资料）。
+_GROUP_BOUND_TOOLS = frozenset({
+    "read_profile", "read_chat_history", "search_chat", "search_memory",
+})
 # M5：摘要文本统一再过一遍的密钥形式
 _FINAL_BEARER_RE = re.compile(r"(?i)Bearer\s+\S+")
 _FINAL_SK_RE = re.compile(r"sk-[A-Za-z0-9_\-]{3,}")
@@ -76,6 +82,17 @@ class ToolContext:
     # None / 空 = 不限制（管理员对话、资讯等老调用方行为不变）。tools_exec 的
     # 文件工具（read/write/list）只在它非空时拦「scope 外、artifacts/ 下」的路径。
     artifact_scope: tuple[str, ...] | None = None
+    # 专岗（specialists.py）注入的执行身份与硬权限（2026-09-30 专岗契约 B 部分）：
+    # - agent_type：这次 worker 回合的执行身份（"task" 默认；"news"/"idea"/"goal" 专岗）。
+    #   只读标识，工具 handler 可以据它调行为；绝不能用工具 args 伪造（args 进不了 ctx）。
+    # - allowed_tools：本轮**硬权限**工具名单（tuple of 工具名）。给了（非 None）就只许
+    #   调用名单内的工具——模型回传未提供的工具名直接拒绝执行（不是只给 spec 提示）。
+    #   None = 不加这层名单（老调用方行为不变，仅角色门控）。
+    # - allowed_skills：本轮允许 read_skill/list_skills 的 skill 白名单（tuple of 名）。
+    #   None = 通才（不加岗位滤网，仅 roles/全局开关过滤）。
+    agent_type: str = "task"
+    allowed_tools: tuple[str, ...] | None = None
+    allowed_skills: tuple[str, ...] | None = None
 
     def effective_role(self) -> str:
         """这个上下文实际算哪个角色（role 优先，空则看 actor）。工具 handler 里也用它。"""
@@ -196,6 +213,17 @@ class Tools:
                 return result
             args = parsed
         role = self._role_of(ctx)
+        # 硬权限：本轮工具名单（专岗/时间盒收尾强约束）。模型捏造未提供的工具名
+        # 到这里直接拒绝——落库保留痕迹，不调 handler。args 伪造 role/group/agent_type
+        # 没用：这些只由 ToolContext 提供，进不了调用参数。
+        allowed_tools = getattr(ctx, "allowed_tools", None)
+        if allowed_tools is not None and str(name) not in allowed_tools:
+            result = ToolResult(
+                ok=False, output="",
+                error=f"工具「{name}」不在本轮允许使用的名单里，不能调用",
+            )
+            self._persist(name, args, result, ctx, start)
+            return result
         tool = self._table(role).get(name)
         if tool is None:
             # 另一格里有同名工具：说清楚是「角色不允许」，而不是「不认识」
@@ -216,6 +244,22 @@ class Tools:
             result = ToolResult(ok=False, output="", error=f"工具「{name}」只有{allowed}能用，当前角色不允许")
             self._persist(name, args, result, ctx, start)
             return result
+        # 群绑闸（worker 专属）：读「本群资料」的工具不许用 args.group_id 越群。
+        # handler 自己也可能再用 ctx.group_id 兜底，这一层是它的防线——模型用 args 伪造
+        # group_id 时 handler 根本没机会被调。main / admin 不在闸内（主模型/管理员可跨群）。
+        if (
+            role == "worker"
+            and str(name) in _GROUP_BOUND_TOOLS
+            and isinstance(args, dict)
+        ):
+            requested_gid = str(args.get("group_id") or "").strip()
+            if requested_gid and requested_gid != str(ctx.group_id or ""):
+                result = ToolResult(
+                    ok=False, output="",
+                    error=f"工具「{name}」只能读当前群的资料，不能跨群（你给了别的群号）",
+                )
+                self._persist(name, args, result, ctx, start)
+                return result
         if not isinstance(args, dict):
             result = ToolResult(ok=False, output="", error="工具参数必须是一个 JSON 对象")
             self._persist(name, args, result, ctx, start)

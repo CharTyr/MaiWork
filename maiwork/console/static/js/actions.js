@@ -7,6 +7,7 @@ import { findIdea, ideaAsk, ideaItems, ideaPicked } from "./pages/ideas.js";
 import { refreshDetail } from "./detail.js";
 import { checkedProviders, headerRow, loadExt, pickedTool, readHeaders } from "./settings/ext.js";
 import { actNews } from "./actions_news.js";
+import { actAgents } from "./settings/agents.js";
 import { chipAdd, rowsAdd } from "./settings/rules.js";
 import { loadUsage, loadUsageDay } from "./settings/usage.js";
 import { avatarSaved, loadIdentity } from "./settings/identity.js";
@@ -33,6 +34,7 @@ function findEntry(id) {
 export async function act(el, e) {
   const a = el.dataset.act;
   if (await actNews(a, el)) return;
+  if (await actAgents(a, el)) return;
   const g = grp();
   switch (a) {
     case "tab":

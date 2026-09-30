@@ -75,3 +75,20 @@ def test_skill_activation_controls():
     assert 'k.manual_enabled' in ext
     assert 'case "skill-toggle"' in actions
     assert '/toggle`' in actions and '/api/extensions/skills/' in actions
+
+
+def test_specialist_admin_interface_contract():
+    page = JS / "settings/agents.js"
+    assert page.is_file(), "专岗管理页未实现"
+    text = page.read_text(encoding="utf-8")
+    assert "export function agentsPage" in text
+    assert "export async function loadAgents" in text
+    assert "export async function actAgents" in text
+    assert "agent-memory-save" in text
+    assert "agent-profile-save" in text
+    assert "/api/agents" in text and "/agents/" in text
+    assert "state.agentLoadSeq" in text, "切群时必须防止旧请求覆盖当前群"
+    assert "gid !== state.agentGroup" in text, "旧群按钮不能保存当前群的提醒"
+    assert 'a.kind === "task"' in text, "通用任务也应有只读交接记录"
+    router = (JS / "router.js").read_text(encoding="utf-8")
+    assert router.count('state.setSub === "agents"') >= 2

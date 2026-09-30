@@ -59,6 +59,9 @@ class WorkerReport:
     evidence: list[str] = field(default_factory=list)
     steps: int = 0
     error: str = ""
+    # 专岗（specialists.py）：这次回合在 Agents 里登记的交接单 id。
+    # 默认 '' 向后兼容（Workers.run 直出的 report 没有交接单，老调用方不用动）。
+    handoff_id: str = ""
 
 
 def _system_prompt(actor: str, group_id: str, output_schema: dict | None, skills_hint: str = "", identity: Any = None, extra_system: str = "") -> str:
@@ -171,8 +174,27 @@ class Workers:
         system_extra: str = "",
         deadline_ts: float | None = None,
         artifact_scope: tuple[str, ...] | None = None,
+        # 专岗（specialists.py）注入：执行身份与本论硬权限。None 向后兼容。
+        agent_type: str = "task",
+        allowed_tools: tuple[str, ...] | list[str] | None = None,
+        allowed_skills: tuple[str, ...] | list[str] | None = None,
     ) -> WorkerReport:
-        specs = self._tools.specs("worker", list(tools) + ["submit_result"])
+        # 本轮硬权限工具名单：默认 = 请求 tools + submit_result（每轮都硬门）；
+        # allowed_tools 给了再收窄成「请求 ∩ allowed_tools」（submit_result 保底）。
+        # 这不是 spec 提示：模型捏造名单外工具 Tools.call 直接拒绝落库。
+        requested = [str(t) for t in (tools or []) if str(t or "").strip()]
+        base: list[str] = list(requested)
+        if "submit_result" not in base:
+            base.append("submit_result")
+        if allowed_tools is None:
+            hard_tools: tuple[str, ...] = tuple(base)
+        else:
+            allowed_set = set(str(x) for x in allowed_tools)
+            narrowed = [n for n in base if n in allowed_set]
+            if "submit_result" not in narrowed:
+                narrowed.append("submit_result")
+            hard_tools = tuple(narrowed)
+        specs = self._tools.specs("worker", list(hard_tools))
         messages: list[dict] = [
             {"role": "system", "content": _system_prompt(actor, group_id, output_schema, self._hint(skills_hint), identity=self._identity, extra_system=system_extra)},
             {"role": "user", "content": str(brief)},
@@ -184,6 +206,11 @@ class Workers:
             workspace=workspace,
             role="worker",
             artifact_scope=artifact_scope,
+            agent_type=str(agent_type or "task"),
+            allowed_tools=hard_tools,
+            allowed_skills=(
+                tuple(str(x) for x in allowed_skills) if allowed_skills is not None else None
+            ),
         )
         steps = 0
         nudges = 0
@@ -236,6 +263,8 @@ class Workers:
                         x for x in (specs or [])
                         if (x.get("function") or {}).get("name") == "submit_result"
                     ] or specs
+                # 硬权限同步收紧：到期后只剩 submit_result 可调（Tools.call 层也会拦）。
+                ctx.allowed_tools = ("submit_result",)
                 messages.append(
                     {
                         "role": "user",

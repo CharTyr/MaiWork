@@ -4,6 +4,7 @@ import { SVG, esc, gface, ico, tokens } from "../util.js";
 import { api, gname, mq, platTag, quiet } from "../api.js";
 import { loading } from "../pages/news.js";
 import { extPage } from "./ext.js";
+import { agentsPage } from "./agents.js";
 import { rulesPage } from "./rules.js";
 import { usagePage } from "./usage.js";
 import { sourcesPage } from "./sources.js";
@@ -32,6 +33,7 @@ export const SET_SUBS = [
   ["identity", "身份", "lotus", "性格、规矩和记忆"],
   ["models", "模型", "robot", "用哪些模型"],
   ["extensions", "扩展", "tools", "联网搜索、MCP 和 skill"],
+  ["agents", "专岗", "robot", "职责、各群经验和工作交接"],
   ["usage", "用量", "chart", "每天用了多少"],
   ["sources", "资讯来源", "newspaper", "RSS、优质来源和屏蔽的"],
   ["links", "群链接", "link", "群友看到的专属链接"],
@@ -50,7 +52,7 @@ export function settingsPage() {
   const sub = SET_SUBS.find((x) => x[0] === state.setSub) || SET_SUBS[0];
   const head = `<h1 class="h-page">${sub[0] === "overview" ? "设置" : esc(sub[1])}</h1>${setNav()}`;
   if (!s) return head + loading();
-  const body = { overview: settingsOverview, models: modelsPage, extensions: extPage, usage: usagePage, sources: sourcesPage, links: linksPage, rules: rulesPage, identity: identityPage, logs: logsPage }[sub[0]];
+  const body = { overview: settingsOverview, models: modelsPage, extensions: extPage, agents: agentsPage, usage: usagePage, sources: sourcesPage, links: linksPage, rules: rulesPage, identity: identityPage, logs: logsPage }[sub[0]];
   return head + `<div class="set-body">${body(s)}</div>`;
 }
 
