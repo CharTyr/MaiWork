@@ -98,7 +98,9 @@ def test_score_prompt_explains_relation(tmp_path):
     store, settings, feeds, models, *_ = _feeds(tmp_path, _scores_json(_score(0)), [_cand(0)], [_posts_json(_post(0, "t"))])
     with _TimePatch():
         _run(feeds.prepare_news(GID))
-    prompt = models.calls[1][1][0]["content"]
+    # 打分那次调用的提示词（两阶段后队列里隔着 feeds.pick，不能按下标 1 拿）
+    score_call = next(c for c in models.calls if str(c[2].get("purpose") or "") == "feeds.score")
+    prompt = str(score_call[1][0]["content"])
     assert "relation" in prompt and "new_fact" in prompt and "update" in prompt
 
 

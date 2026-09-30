@@ -4,7 +4,9 @@
 1. 群画像没成形（groups.profile_ready_ts == 0）→ 0，什么都不做；
 2. 主模型没配好 → 0；搜索没配（SearchUnavailable）→ 记一条 skipped 批次；
 3. 主模型（json_mode）按画像条目 + 最近 14 天反馈标题出 3–5 个关注点；
-4. 交给 Workers.run（web_search / fetch_page）同时找「资讯」（最近几天的新闻/发布/动态）
+4. 找候选恒走两阶段（「广撒网再挑着打开」，2026-09-30 用户决定对所有群生效，不再有开关）：
+   撒网（只用 web_search）→ 代码保底补搜 → 程序粗筛 → 主模型挑 8–12 条 → 核验子 agent
+   （只用 fetch_page）真打开原文核对，同时找「资讯」（最近几天的新闻/发布/动态）
    和「好文」（教程、好文章、工具介绍，不看新不新；[feeds] guides=false 就只找资讯）。
    每条候选必须真用 fetch_page 打开过（交回 fetched=true + quote≤200 字原文依据），
    要登录/付费的标 paywall=true；每条带 kind（news|guide）；
@@ -900,8 +902,8 @@ class Feeds:
     async def _collect_rss(self, gid: str, settings: Settings) -> list[dict]:
         """把本群启用中的 RSS 源取回来，交回 RSS 条目候选。
 
-        这些条目有两个去处：写进子 agent 的 brief 当「优先看这些链接」让它打开核对，
-        以及由 prepare_news 直接并进候选池（见 _merge_rss_candidates，≤6 条）——
+        这些条目由 prepare_news 直接并进候选池（见 _merge_rss_candidates，≤6 条）——
+        （两阶段恒生效后不再写进子 agent 的 brief；老 _collect 那条「优先看这些链接」已随它删掉）
         **走同一套质量门槛**（硬淘汰 / 7 天新鲜度 / 打分 / 话题饱和，不另开绿灯）。
         sources.site 用源标题（rss.title）代替域名。
         全 MockTransport；取失败只记 last_error，不拖垮这轮备料。
@@ -1323,8 +1325,8 @@ class Feeds:
         collect_mark = (
             f"feeds-collect:{gid}:{int(clock.now() * 1000)}:{next(_collect_mark_seq)}"
         )
-        # RSS 源（rss.py）取回一次：① 写进子 agent 的 brief 当「优先看这些链接」，
-        # ② 直接并进候选池参与打分（见 _merge_rss_candidates）。取失败只记 last_error，不拖垮这轮。
+        # RSS 源（rss.py）取回一次：直接并进候选池参与打分（见 _merge_rss_candidates）；
+        # 撒网空了但 RSS 有货时这轮照常走。取失败只记 last_error，不拖垮这轮。
         try:
             rss_items = await self._collect_rss(gid, settings)
         except Exception:
@@ -1332,29 +1334,25 @@ class Feeds:
             rss_items = []
         two_phase_stats: dict = {}
         try:
-            if self.two_phase_on(gid):
-                # 两阶段（「广撒网再挑着打开」）：撒网 → 保底 → 粗筛 → 挑 → 核验；
-                # 候选按老格式交回（下游补打开 / 第一道 / 打分照旧）。专岗接上时本轮
-                # 的撒网/核验都走一轮 ContextVar（结论由主模型验收后再 review）。
-                candidates = await self._stage_isolated(
-                    self._collect_two_phase(
-                        gid, focus, settings,
-                        collect_mark=collect_mark, stats_out=two_phase_stats,
-                    ),
-                    gid,
+            # 两阶段（「广撒网再挑着打开」）恒生效（2026-09-30 用户决定，不再有每群开关）：
+            # 撒网 → 保底 → 粗筛 → 挑 → 核验；候选按老格式交回（下游补打开 / 第一道 /
+            # 打分照旧）。专岗接上时本轮的撒网/核验都走一轮 ContextVar（结论由主模型验收后再 review）。
+            candidates = await self._stage_isolated(
+                self._collect_two_phase(
+                    gid, focus, settings,
+                    collect_mark=collect_mark, stats_out=two_phase_stats,
+                ),
+                gid,
+            )
+            if not candidates and not rss_items:
+                self._drop_news_round_records(gid, "撒网没搜出能用的候选")
+                self._skipped_batch(
+                    gid, "撒网没搜出能用的候选",
+                    stats=self._round_stats(collect_mark, two_phase_stats.get("funnel")),
                 )
-                if not candidates:
-                    self._drop_news_round_records(gid, "撒网没搜出能用的候选")
-                    self._skipped_batch(
-                        gid, "撒网没搜出能用的候选",
-                        stats=self._round_stats(collect_mark, two_phase_stats.get("funnel")),
-                    )
-                    return 0
-            else:
-                candidates = await self._stage_isolated(
-                    self._collect(gid, focus, settings, task_id=collect_mark, rss_items=rss_items),
-                    gid,
-                )
+                return 0
+            # 撒网空了但 RSS 有货：照常往下走（下面 _merge_rss_candidates 并进候选池，
+            # 和搜索候选同一套门槛）——老路本来就支持 RSS-only 的轮。
         except (ModelError, ValueError) as e:
             self._drop_news_round_records(gid, f"子 agent 没找到东西：{e}")
             logger.info("备资讯-子 agent 失败（群 %s）：%s", gid, e)
@@ -1939,7 +1937,7 @@ class Feeds:
     def _round_stats(self, collect_mark: str, funnel: dict | None = None, *, kept: int | None = None) -> dict:
         """这一轮的工具用量：找资讯的子 agent + 补打开的子 agent 加起来。
 
-        两阶段（开关开的群）：searches/pages = 撒网 + 核验 + 补打开几个标记各自的工具调用数。
+        两阶段（恒生效）：searches/pages = 撒网 + 核验 + 补打开几个标记各自的工具调用数。
         funnel 非空就原样带上（kept 由最终入库数在这里补——调用方在入库时才数得出来）。
         """
         from .news_recheck import merge_stats
@@ -2524,7 +2522,7 @@ class Feeds:
     def _parse_news_items(self, raw_items: Any) -> list[dict]:
         """把子 agent（找资讯 / 核验 / 补打开之外的交回）的 items 解析成候选 dict。
 
-        老 _collect 和两阶段核验（feeds-verify）共用这一套：title/url/summary 非空才收、
+        两阶段核验（feeds-verify）用这一套：title/url/summary 非空才收、
         kind 不是 news|guide 按 news、quote 去换行截 _QUOTE_MAX、url_key 规范化。
         """
         items: list[dict] = []
@@ -2560,7 +2558,7 @@ class Feeds:
         return items
 
     # ------------------------------------------------------------------
-    # 两阶段找资讯（「广撒网再挑着打开」，开关 kv["feeds.two_phase"]）
+    # 两阶段找资讯（「广撒网再挑着打开」；2026-09-30 用户决定恒生效，不再有开关）
     #
     # ① 撒网：一个只用 web_search 的子 agent 铺大量搜索，候选由程序侧的
     #    撒网登记簿（discovery.py：web_search handler 记进去的）收集，不信子 agent 交回；
@@ -2592,11 +2590,29 @@ class Feeds:
                 else "（拓展：跳一步找群友没想到、但会眼前一亮的东西）" if f.get("source") == "explore" else ""
             )
             lines.append(f"{i}. {f['query']}{tag}")
+        # 话题饱和提示（老 _collect brief 的规矩，2026-09-30 起两阶段恒生效后挪这里）：
+        # 最近 7 天发得最多（≥2 条）的话题，让撒网的别围着它们转。
+        saturated = self._saturated_topics(gid, 7, min_count=2)
+        saturated_line = ""
+        if saturated:
+            saturated_line = (
+                "这些话题最近 7 天已经发得很多了（除非有重大新进展，**不要再找**）："
+                + "、".join(f"{label} ×{n}" for label, n in saturated)
+                + "\n\n"
+            )
+        # [feeds] guides=false：只找资讯。两阶段恒生效后这里是对这个开关唯一的交代
+        # （老路 _collect 的 brief 限制随开关删除一起没了；核验那步不作找不找文章的决定）。
+        guides_line = (
+            "" if bool(getattr(settings.feeds, "guides", True))
+            else "这轮**只找资讯**（新闻 / 发布 / 动态），**不找文章**（教程、评测、工具介绍都别搜）；"
+        )
         return (
             "帮这个群**撒网搜**值得看的内容——这一步只搜，不打开页面。\n"
+            + guides_line
             + "关注点如下（编号 1 起；**每次搜索都要带 focus=<关注点编号>**）：\n"
             + "\n".join(lines)
             + "\n\n"
+            + saturated_line
             + self._search_guide_section(gid, settings)
             + "要求：\n"
             f"1. 全程只用 web_search，**不要打开任何页面**（不调 fetch_page，后面有别的同事打开核对）；"
@@ -2947,6 +2963,12 @@ class Feeds:
                 logger.info("核验子 agent 一组失败（群 %s），只丢它那一组：%s", gid, res)
                 continue
             out.extend(res)
+        # 轮循分组会把顺序打散（组 0 拿第 0/3/6… 条）；交回前按挑（picks）的顺序排回去，
+        # 让下游「第 i 条候选」和打分模型的编号在老用例口径下始终对得上。
+        order = {
+            _normalize_url(c.get("url") or ""): idx for idx, (c, _kind, _hook) in enumerate(picks)
+        }
+        out.sort(key=lambda it: order.get(str(it.get("url_key") or ""), len(order)))
         opened = sum(1 for it in out if it.get("fetched"))
         return out, opened
 
@@ -2979,6 +3001,7 @@ class Feeds:
         # ① 撒网（只 web_search；候选从登记簿拿）
         t0 = clock.now()
         discovery.open_run(discover_mark)
+        discover_bad: Exception | str = ""  # 撒网垮了：最后一条都没搜到才向上报（老 _collect 的句式）
         try:
             report = await self._run_stage(
                 gid_s, phase="discover", brief=self._discover_brief(gid_s, focus, settings),
@@ -2989,9 +3012,12 @@ class Feeds:
             )
             if not getattr(report, "ok", False):
                 # 撒网子 agent 交不出备注不拦这轮：登记簿里已经搜出来的照用；一条没有再算
-                logger.info("撒网子 agent 没交备注（群 %s）：%s", gid_s,
-                            getattr(report, "error", "") or getattr(report, "summary", ""))
-        except Exception:
+                discover_bad = str(
+                    getattr(report, "error", "") or getattr(report, "summary", "") or "未交回结果"
+                )
+                logger.info("撒网子 agent 没交备注（群 %s）：%s", gid_s, discover_bad)
+        except Exception as e:
+            discover_bad = e
             logger.exception("撒网子 agent 出错（群 %s），靠登记簿已有候选继续", gid_s)
         candidates = discovery.close_run(discover_mark)
         if not candidates:
@@ -3016,8 +3042,14 @@ class Feeds:
             logger.exception("保底补搜意外出错（群 %s），跳过保底", gid_s)
         funnel["timings_s"]["floor"] = max(0.0, clock.now() - t1)
         funnel["discovered"] = len(candidates)
-        # 撒网/保底没搜出任何东西 → 交空列表，让 prepare_news 按「子 agent 没找到」跳过
+        # 撒网/保底真的一条都没搜出，而且撒网本身还垮了（报错 / 主动认失败）：
+        # 向上抛，让 prepare_news 落成「子 agent 没找到东西 / 出了意外」（老 _collect 句式）；
+        # 哪怕只是登记簿空、撒网没垮，也照旧交空列表跳过这轮。
         if not candidates:
+            if isinstance(discover_bad, Exception):
+                raise discover_bad
+            if isinstance(discover_bad, str) and discover_bad:
+                raise ValueError(discover_bad)
             return []
 
         # ③ 粗筛（不调模型）
@@ -3063,6 +3095,22 @@ class Feeds:
             )
         except Exception:
             pass
+        # 「不同角度 / 拓展」标记（老 _collect 的规矩，两阶段恒生效后挪这里）：
+        # 候选来自哪个方向看 src_focus（挑的时候接回来的撒网方向编号），
+        # 那个方向是 diverse → angle='diverse'；该方向 source=explore 或条目标了
+        # explore:true（且没判成 diverse）→ angle='explore'。explore 不设上限，
+        # diverse 去同质化每轮最多 2 条（老口径）。
+        for item in items:
+            focus_no = item.get("src_focus")
+            src = None
+            if isinstance(focus_no, int) and 1 <= focus_no <= len(focus):
+                src = focus[focus_no - 1]
+            if src is not None and str(src.get("angle") or "") == "diverse":
+                item["angle"] = "diverse"
+            elif str(item.get("angle") or "") != "diverse" and (
+                item.get("explore") or (src is not None and str(src.get("source") or "") == "explore")
+            ):
+                item["angle"] = "explore"
         return items
 
     async def _floor_searches(
@@ -3183,118 +3231,6 @@ class Feeds:
             for i, f in enumerate(focus, 1)
         ]
         return added
-
-    async def _collect(
-        self,
-        gid: str,
-        focus: list[dict],
-        settings: Settings,
-        task_id: str = "",
-        rss_items: list[dict] | None = None,
-    ) -> list[dict]:
-        # 资讯收集子 agent 的时间盒（0.4.0，[feeds] collect_minutes 默认 15）：到点把已找到的交回
-        collect_minutes = max(1, int(getattr(settings.feeds, "collect_minutes", 15) or 15))
-        lines = []
-        for f in focus:
-            tag = (
-                "（不同角度：找对这个话题的反方 / 批评 / 另一种看法的观点或分析文章，不要同话题的另一条新闻）"
-                if f.get("angle") == "diverse"
-                else "（拓展：跳一步找群友没想到、但会眼前一亮的东西）" if f.get("source") == "explore" else ""
-            )
-            lines.append(f"- {f['query']}{tag}（原因：{f['why']}）" if f.get("why") else f"- {f['query']}{tag}")
-        guides = bool(getattr(settings.feeds, "guides", True))
-        if guides:
-            kind_req = "资讯和文章两类都找，每条用 kind 标明（news=资讯，guide=文章）；文章找不到好的就一篇都不交；"
-            kind_field = "kind（news 或 guide）、"
-        else:
-            kind_req = "只找资讯，每条的 kind 一律填 news；"
-            kind_field = "kind（一律 news）、"
-        # RSS 源（rss.py）：取回后交子 agent 当「优先看这些链接」让子 agent 打开核对；
-        # 条目本身也会被 prepare_news 直接并进候选池（同一套质量门槛，不另开绿灯）。
-        # prepare_news 已经取过一次就传进来复用；单独调 _collect（测试）时自己取。
-        rss_items = await self._collect_rss(gid, settings) if rss_items is None else rss_items
-        rss_section = ""
-        if rss_items:
-            rss_lines = ["下面这些链接是群订阅的 RSS 源给的，**优先看这些链接**（也要用 fetch_page 打开核对，不行就跳过）："]
-            for it in rss_items[:20]:
-                rss_lines.append(f"- （RSS：{it.get('_rss_title') or 'rss'}）{it['title']} —— {it['url']}")
-            rss_section = "\n".join(rss_lines) + "\n\n"
-        # 精简群画像：给子 agent 拓展方向用（≤12 条，优先长期兴趣 / 在做的事，每条截 60 字）。
-        profile_lines = self._brief_profile_lines(gid)
-        profile_section = ""
-        if profile_lines:
-            profile_section = (
-                "这个群大致是这样的（给你拓展方向用）：\n" + "\n".join(profile_lines) + "\n\n"
-            )
-        # 话题饱和提示：最近 7 天已发得多的话题别再找（除非是有分量的重大新消息）
-        saturated = self._saturated_topics(gid, 7, min_count=2)
-        saturated_section = ""
-        if saturated:
-            saturated_section = (
-                "这些话题最近已经发得很多了，不要再找（除非是有分量的重大新消息）："
-                + "、".join(label for label, _n in saturated)
-                + "\n\n"
-            )
-        brief = (
-            "帮这个群找值得看的内容。\n"
-            + profile_section
-            + "关注点如下：\n"
-            + "\n".join(lines)
-            + "\n\n"
-            + rss_section
-            + saturated_section
-            + self._search_guide_section(gid, settings)
-            # 收什么、不收什么、怎么找只写在资讯标准 skill 里（skills/news-standard）
-            + "资讯标准（照这个找；MaiWork 的程序会按同一套标准验收，不合格的交了也会被筛掉）：\n"
-            + news_standard.for_collect(guides)
-            + "\n\n要求：\n"
-            f"1. {kind_req}\n"
-            "2. 每条候选必须用 fetch_page 真打开过原文再看一遍，确实和关注点相关、有信息量才收；"
-            "要登录或付费才能看的别收，直接标出来（paywall: true）；\n"
-            f"3. 最多交回 {_CANDIDATE_CAP} 条，宁缺毋滥；\n"
-            "4. 每条：title（原标题或大意）、url（原文链接）、summary（2–4 句中文纯文本，别用 Markdown）、"
-            f"{kind_field}published（发布时间，ISO 格式或 epoch 秒，实在拿不到就空字符串）、"
-            f"fetched（确实用 fetch_page 打开过就 true）、quote（从原文里抄一小段能支撑摘要的依据，≤{_QUOTE_MAX} 字）、"
-            "paywall（要登录/付费就 true）、"
-            "image_url（fetch_page 说有封面图就把那个地址抄过来，没有就空字符串）、"
-            "explore（这条是你自己按群画像「跳一步」拓展的方向就 true，否则省略；前面列的饱和话题不算）；\n"
-            "5. 最后用 submit_result 交回，data 按约定的 JSON Schema；"
-            f"你只有大约 {collect_minutes} 分钟，到点前记得把已经找到的交回来（部分结果也算，不会丢）。"
-            + self._provider_skill_section(settings)
-        )
-        deadline_ts = clock.now() + collect_minutes * 60
-        report = await self._run_stage(
-            gid, phase="collect", brief=brief, task_id=task_id,
-            tools=["web_search", "fetch_page"],
-            output_schema=_NEWS_OUTPUT_SCHEMA, deadline_ts=deadline_ts,
-            actor="资讯找料",
-        )
-        if not getattr(report, "ok", False):
-            raise ValueError(str(getattr(report, "error", "") or getattr(report, "summary", "") or "子 agent 没干成"))
-        data = report.data
-        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
-            raise ValueError("子 agent 交回的格式不对")
-        items = self._parse_news_items(data["items"][:_CANDIDATE_CAP])
-        # 「不同角度」：这轮定关注点带了 diverse 的，凡是从这个方向找回来的都打上 angle。
-        # 启发式：首先按子 agent 抄回的原话（query 写在标题或 summary 里难判），
-        # 保守做法——diverse 只有一个方向时，「和常规关注点文本不重叠的关键词」命中的
-        # 都算 diverse；判不了的一律不打（宁缺毋滥）。当前实现：标题或摘要里出现
-        # diverse 查询词 ≥3 字符片段的算 diverse，全打不上时按顺序从后往前给一两名额外的，
-        # 反正去同质化只留前两条。
-        diverse_queries = [f["query"] for f in focus if f.get("angle") == "diverse"]
-        if diverse_queries:
-            q = diverse_queries[0]
-            words = [w for w in _split_query_words(q) if len(w) >= 3]
-            for item in items:
-                haystack = f"{item['title']} {item['summary']}"
-                if any(w in haystack for w in words):
-                    item["angle"] = "diverse"
-        # 「自己拓展」的方向：子 agent 标了 explore、又没被判成 diverse 的条目 angle='explore'。
-        # explore 只作记录：去同质化不给它设上限（只有 diverse 有上限）。
-        for item in items:
-            if item.get("explore") and str(item.get("angle") or "") != "diverse":
-                item["angle"] = "explore"
-        return items
 
     async def _score(self, gid: str, settings: Settings, candidates: list[dict]) -> None:
         """给每条幸存者打五项分等信息（直接改 item）。
@@ -4141,40 +4077,6 @@ class Feeds:
             if len(picks) >= cap:
                 break
         return picks
-
-    # ------------------------------------------------------------------
-    # 两阶段找资讯（「广撒网再挑着打开」）的每群开关：kv["feeds.two_phase"] = [群号...]
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _two_phase_key() -> str:
-        return "feeds.two_phase"
-
-    def two_phase_on(self, gid: str) -> bool:
-        """这个群用不用「广撒网再挑着打开」的新路；默认关（走老的单个子 agent 那套）。"""
-        try:
-            raw = self._store.kv_get(self._two_phase_key(), [])
-        except Exception:
-            return False
-        if not isinstance(raw, list):
-            return False
-        return str(gid) in {str(x) for x in raw}
-
-    def set_two_phase(self, gid: str, on: bool) -> bool:
-        """写开关；返回存下去的状态。"""
-        gid = str(gid)
-        with self._store.tx() as conn:
-            try:
-                raw = self._store.kv_get(self._two_phase_key(), [])
-            except Exception:
-                raw = []
-            cur = {str(x) for x in raw} if isinstance(raw, list) else set()
-            if on:
-                cur.add(gid)
-            else:
-                cur.discard(gid)
-            self._store.kv_set(conn, self._two_phase_key(), sorted(cur))
-        return bool(on)
 
     # ------------------------------------------------------------------
     # 资讯偏好

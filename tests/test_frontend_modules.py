@@ -193,3 +193,31 @@ def test_guide_only_batch_points_to_articles():
     view = news[news.index("export function viewNews"):]
     assert "在「文章」里" in view
     assert 'data-act="news-tab" data-t="guides"' in view, "给一个直接去文章栏的按钮"
+
+
+def test_settings_agents_nav_uses_fish_emoji():
+    """设置里「专岗」的图标是 🐟（Fluent 3D，和其他图标同一套），不是机器人。"""
+    idx = (JS / "settings/index.js").read_text(encoding="utf-8")
+    assert '["agents", "专岗", "fish",' in idx
+    util = (JS / "util.js").read_text(encoding="utf-8")
+    icons = util[util.index("const ICONS"):].split("\n", 1)[0]
+    assert " fish " in icons or " fish\"" in icons
+    assert (STATIC / "assets/icons/fish.png").is_file()
+
+
+def test_news_page_has_no_two_phase_switch():
+    """新找法对所有群默认生效（2026-09-30 用户决定），网页上不再有开关。"""
+    for rel in ("pages/news.js", "actions_news.js"):
+        src = (JS / rel).read_text(encoding="utf-8")
+        assert "two-phase" not in src and "twoPhase" not in src, rel
+    assert ".two-phase" not in (STATIC / "style.css").read_text(encoding="utf-8")
+
+
+def test_fish_icon_not_in_group_avatar_pool():
+    """🐟 是专岗专用图标：不进群头像候选，否则加一张图会让所有群的图标整体错位。"""
+    from CharTyr_MaiWork.maiwork.console import views
+
+    views._icons_cache = None
+    icons = views.group_icons()
+    assert "fish" not in icons
+    assert "robot" in icons and "teacup" in icons

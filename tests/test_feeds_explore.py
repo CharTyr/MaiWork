@@ -32,7 +32,14 @@ from CharTyr_MaiWork.maiwork.config import load_settings
 from CharTyr_MaiWork.maiwork.feeds import Feeds
 from CharTyr_MaiWork.maiwork.store import Store
 
-from fakes import FakeModelsQueue, FakeProfiles, focus_reply
+from fakes import (
+    PICK_FALLBACK_REPLY,
+    FakeModelsQueue,
+    FakeProfiles,
+    ensure_pick_fallback,
+    focus_reply,
+    two_phase_workers_run,
+)
 
 NOW = 1_790_000_000.0
 GID = "111"
@@ -79,15 +86,15 @@ class M:
 
 
 class FakeWorkers:
+    """预置一份 WorkerReport 或 Exception；两阶段恒生效：discover 种登记簿、verify 按链接交回。"""
+
     def __init__(self, report: Any = None) -> None:
         self.report = report
         self.calls: List[Dict[str, Any]] = []
 
     async def run(self, brief: str, **kwargs: Any) -> Any:
         self.calls.append({"brief": brief, **kwargs})
-        if isinstance(self.report, BaseException):
-            raise self.report
-        return self.report
+        return await two_phase_workers_run(self.report, brief, kwargs)
 
 
 class FakeTopics:
@@ -129,7 +136,9 @@ def _feeds(
 ) -> tuple:
     store = _store(tmp_path, seed=seed)
     settings = _settings()
-    models = FakeModelsQueue(ready=True, replies=list(replies or [_FOCUS_JSON]))
+    models = ensure_pick_fallback(
+        FakeModelsQueue(ready=True, replies=list(replies or [_FOCUS_JSON]))
+    )
     workers = FakeWorkers()
     profiles = FakeProfiles()
     profiles.entries_map[GID] = (
@@ -341,42 +350,52 @@ class TestPlanFocusPrompt:
 
 
 # ----------------------------------------------------------------------
-# _collect：群画像段 + explore 要求 + angle
+# 群画像段（挑候选的提示词）+ explore / diverse 的 angle 标记
 # ----------------------------------------------------------------------
 
 
-class TestCollectBrief:
-    def test_brief_has_profile_section_and_explore_request(self, tmp_path: Path) -> None:
+class TestPickBriefAndAngle:
+    def test_pick_prompt_has_profile_section(self, tmp_path: Path) -> None:
+        """两阶段恒生效后，「给拓展方向用的精简群画像」在挑候选（feeds.pick）的提示词里。"""
         entries = [{"category": "recent", "text": f"最近聊的{i}"} for i in range(15)]
         entries += [{"category": "interest", "text": "长期兴趣A"}, {"category": "ongoing", "text": "在做的事B"}]
         store, settings, feeds, models, workers, profiles, topics = _feeds(tmp_path, entries=entries)
-        workers.report = _ok_report({"items": [_cand_item(0, explore=True)]})
-        focus = [{"query": "FPGA 新动态", "why": "群里在做硬件", "angle": "", "source": "long"}]
-        out = _run(feeds._collect(GID, focus, settings))
-        brief = str(workers.calls[0]["brief"])
-        assert "这个群大致是这样的（给你拓展方向用）" in brief
-        assert "长期兴趣A" in brief
-        assert "在做的事B" in brief
-        assert "拓展" in brief and "跳一步" in brief  # 2026-09-29 起拓展找法写在资讯标准 skill 里
-        assert "explore" in brief
-        assert "最近聊的9" in brief
-        assert "最近聊的10" not in brief
-        assert out and out[0]["angle"] == "explore"
+        kept = [{"title": "拓展候选0", "url": "https://example.com/e0", "focus": 1,
+                 "published": NOW - 3600, "snippet": "s"}]
+        _run(feeds._pick(GID, [{"query": "FPGA 新动态"}], kept))
+        prompt = str(models.calls[-1][1][0]["content"])
+        assert "这个群大致是这样的" in prompt
+        assert "长期兴趣A" in prompt and "在做的事B" in prompt
+        assert "最近聊的9" in prompt and "最近聊的10" not in prompt  # ≤12 条
 
     def test_profile_lines_truncated_to_60(self, tmp_path: Path) -> None:
         store, settings, feeds, models, workers, profiles, topics = _feeds(
             tmp_path, entries=[{"category": "interest", "text": "长" * 90}]
         )
-        workers.report = _ok_report({"items": [_cand_item(0)]})
-        _run(feeds._collect(GID, [{"query": "q", "why": "w", "angle": "", "source": ""}], settings))
-        brief = str(workers.calls[0]["brief"])
-        assert "长" * 60 in brief
-        assert "长" * 61 not in brief
+        kept = [{"title": "t", "url": "https://example.com/x", "focus": 1,
+                 "published": NOW - 3600, "snippet": "s"}]
+        _run(feeds._pick(GID, [{"query": "q"}], kept))
+        prompt = str(models.calls[-1][1][0]["content"])
+        assert "长" * 60 in prompt
+        assert "长" * 61 not in prompt
+
+    def test_discover_brief_marks_explore_request(self, tmp_path: Path) -> None:
+        """撒网 brief：source=explore 的方向带「拓展 / 跳一步」标记（2026-09-29 起）。"""
+        store, settings, feeds, models, workers, profiles, topics = _feeds(tmp_path)
+        brief = feeds._discover_brief(
+            GID,
+            [{"query": "FPGA 新动态", "source": "long"}, {"query": "冷门好板", "source": "explore"}],
+            settings,
+        )
+        assert "拓展" in brief and "跳一步" in brief
 
     def test_explore_item_keeps_angle_explore(self, tmp_path: Path) -> None:
         store, settings, feeds, models, workers, profiles, topics = _feeds(tmp_path)
         workers.report = _ok_report({"items": [_cand_item(0, explore=True), _cand_item(1, explore=False)]})
-        out = _run(feeds._collect(GID, [{"query": "q", "why": "w", "angle": "", "source": ""}], settings))
+        out = _run(feeds._collect_two_phase(
+            GID, [{"query": "q", "why": "w", "angle": "", "source": ""}], settings,
+            collect_mark="feeds-collect:t", stats_out={},
+        ))
         # 没标 explore、也没判成 diverse 的条目不带 angle 键（_write_posts 等地方 .get("angle") 兜底）
         assert [it.get("angle") or "" for it in out] == ["explore", ""]
 
@@ -392,8 +411,11 @@ class TestCollectBrief:
         ]
         workers.report = _ok_report({"items": items})
         focus = [{"query": "FPGA 厂商宣传水分", "why": "反方", "angle": "diverse", "source": ""}]
-        out = _run(feeds._collect(GID, focus, settings))
+        out = _run(feeds._collect_two_phase(
+            GID, focus, settings, collect_mark="feeds-collect:t", stats_out={},
+        ))
         assert out and out[0]["angle"] == "diverse"
+
 
     def test_explore_not_capped_by_dedup(self, tmp_path: Path) -> None:
         store, settings, feeds, models, workers, profiles, topics = _feeds(tmp_path)

@@ -29,8 +29,9 @@ CATEGORIES: tuple[tuple[str, str], ...] = (
 )
 CATEGORY_KEYS = {k for k, _ in CATEGORIES}
 
-# 不适合当群图标的：设置、锁、睡觉
-_ICON_EXCLUDE = {"gear", "lock", "sleeping"}
+# 不适合当群图标的：设置、锁、睡觉；fish 是设置里「专岗」专用（2026-09-30 加的），
+# 也不进群头像候选——否则多一张图，所有群按群号取模挑到的图标会整体错位。
+_ICON_EXCLUDE = {"gear", "lock", "sleeping", "fish"}
 
 # 模型调用目的（models.chat 的 purpose）→ 网页显示的中文名（docs/07 §9.4）
 # 代码里实际出现的全列上；没认出来的 purpose 在接口里原样返回（前端拿原名当备用）。

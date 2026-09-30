@@ -38,7 +38,15 @@ from CharTyr_MaiWork.maiwork.config import load_settings
 from CharTyr_MaiWork.maiwork.feeds import Feeds
 from CharTyr_MaiWork.maiwork.store import Store
 
-from fakes import FakeCtx, FakeModelsQueue, FakeProfiles, focus_reply
+from fakes import (
+    PICK_FALLBACK_REPLY,
+    FakeCtx,
+    FakeModelsQueue,
+    FakeProfiles,
+    ensure_pick_fallback,
+    focus_reply,
+    two_phase_workers_run,
+)
 
 BJ = timezone(timedelta(hours=8))
 NOW = 1_790_000_000.0
@@ -79,15 +87,15 @@ class _TimePatch:
 
 
 class FakeWorkers:
+    """预置一份 WorkerReport 或 Exception；两阶段恒生效：discover 种登记簿、verify 按链接交回。"""
+
     def __init__(self, report: Any = None) -> None:
         self.report = report
         self.calls: List[Dict[str, Any]] = []
 
     async def run(self, brief: str, **kwargs: Any) -> Any:
         self.calls.append({"brief": brief, **kwargs})
-        if isinstance(self.report, BaseException):
-            raise self.report
-        return self.report
+        return await two_phase_workers_run(self.report, brief, kwargs)
 
 
 class FakeTopics:
@@ -192,6 +200,7 @@ def _make_feeds(
     settings = _settings(cfg)
     if models is None:
         models = FakeModelsQueue(ready=True)
+    ensure_pick_fallback(models)
     if workers is None:
         workers = FakeWorkers(_ok_report(_WORKER_ITEMS))
     if topics is None:
@@ -246,9 +255,9 @@ class TestWritePosts:
             got = _run(feeds.prepare_news(GID))
         assert got == 1
 
-        # 写帖子是第三次主模型调用；prompt 里带原话、人设、偏好
-        assert len(models.calls) == 4  # 含写完帖子后对原文自检
-        prompt = models.calls[2][1][-1]["content"]
+        # 写帖子是第四次主模型调用（定关注点 / 挑 / 打分之后）；prompt 里带原话、人设、偏好
+        assert len(models.calls) == 5  # 含「挑」和写完帖子后对原文自检（两阶段后 +1）
+        prompt = models.calls[3][1][-1]["content"]
         assert "新出的 FPGA 板子要不要上" in prompt  # 群原话（chat_log 搜出来的）
         assert "阿一" in prompt
         assert "小麦" in prompt and "热心肠" in prompt  # MaiBot 人设
@@ -540,7 +549,7 @@ class TestViewCurrentNames:
             got = _run(feeds.prepare_news(GID))
         assert got == 1  # 桃子没过第二道
         # 写帖子只调一次
-        assert len(models.calls) == 4  # 含写完帖子后对原文自检
+        assert len(models.calls) == 5  # 含「挑」和写完帖子后对原文自检（两阶段后 +1）
         row = store.read().execute(
             "SELECT body, reason FROM news_items WHERE rejected=0").fetchone()
         assert "开法很轻" in row["body"]
@@ -582,7 +591,10 @@ class TestDiverse:
                  "summary": f"反方第{i}条。FPGA 宣传里的水分。", "kind": "news",
                  "published": NOW - 3600, "fetched": True, "quote": _QUOTE, "paywall": False}
                 for i in range(4)
-            ]
+            ],
+            # 这 4 条假装都是「不同角度」方向（第 4 个 focus）搜出来的 —
+            # 两阶段恒生效：angle 按候选来自哪个方向标
+            "seed_focus": 4,
         }
         scores = json.dumps(
             {"scores": [

@@ -302,7 +302,6 @@ def test_verify_fills_published_from_discovery_candidate(tmp_path) -> None:
     workers = FillWorkers()
     store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path, workers=workers)
     feeds._search = FakeBroadSearch()
-    feeds.set_two_phase(GID, True)
 
     orig_run = workers.run
 

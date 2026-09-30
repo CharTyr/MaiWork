@@ -21,7 +21,15 @@ from typing import Any, Dict, List
 import httpx
 import pytest
 
-from fakes import FakeCtx, FakeModelsQueue, FakeProfiles, focus_reply
+from fakes import (
+    PICK_FALLBACK_REPLY,
+    FakeCtx,
+    FakeModelsQueue,
+    FakeProfiles,
+    ensure_pick_fallback,
+    focus_reply,
+    two_phase_workers_run,
+)
 
 from CharTyr_MaiWork.maiwork import rss
 from CharTyr_MaiWork.maiwork.app import MaiWorkApp
@@ -54,7 +62,10 @@ class _TimePatch:
 
 
 class FakeWorkers:
-    """假的 workers.run：预置一份 WorkerReport，并记录 brief。"""
+    """假的 workers.run：预置一份 WorkerReport，并记录 brief。
+
+    两阶段恒生效：feeds-discover 把预置 items 种进撒网登记簿、feeds-verify 按 brief 链接交回。
+    """
 
     def __init__(self, report: Any = None) -> None:
         self.report = report
@@ -62,7 +73,7 @@ class FakeWorkers:
 
     async def run(self, brief: str, **kwargs: Any) -> Any:
         self.calls.append({"brief": brief, **kwargs})
-        return self.report
+        return await two_phase_workers_run(self.report, brief, kwargs)
 
 
 class FakeTopics:
@@ -159,6 +170,7 @@ def _make_feeds(tmp_path, *, models=None, workers=None) -> tuple:
     settings = _settings()
     if models is None:
         models = FakeModelsQueue(ready=True)
+    ensure_pick_fallback(models)
     if workers is None:
         workers = FakeWorkers(_ok_report([]))
     profiles = FakeProfiles()
@@ -347,8 +359,10 @@ class TestRssInPipeline:
             kept = await feeds.prepare_news(G1)
 
         assert kept == 2, "搜索候选和 RSS 候选都过门槛"
-        # 打分提示词里两条都在（RSS 那条排在被追加的后面）
-        score_prompt = str(models.calls[1][1][0]["content"])
+        # 打分提示词里两条都在（RSS 那条排在被追加的后面；
+        # 两阶段后队列里隔着 feeds.pick，不能按下标 1 拿，按 purpose 找）
+        score_call = next(c for c in models.calls if str(c[2].get("purpose") or "") == "feeds.score")
+        score_prompt = str(score_call[1][0]["content"])
         assert "搜索来的候选" in score_prompt and "RSS 新鲜资讯" in score_prompt
         assert "https://ok.example.com/fresh" in score_prompt
         accepted = {r["title"]: r for r in _accepted_rows(store)}

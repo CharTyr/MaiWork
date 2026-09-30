@@ -67,7 +67,12 @@ class TestGuideAgeCap:
         assert "没有发布时间" in rows[0]["reject_reason"]
 
     def test_guide_181_days_rejected(self, tmp_path) -> None:
-        """guide 发布 181 天 → 硬拒「文章太旧：181 天前发的」。"""
+        """guide 发布 181 天 → 拒「太旧」。
+
+        两阶段恒生效后这道在预筛：连打分都不进、不落 news_items，
+        理由进漏斗「预筛刷掉的」。
+        暗线变化：老 gate 的「文章太旧：N 天前发的」文案不再能拦到这类（题目到不了 gate）。
+        """
         _store, settings, feeds, models, workers, topics, _p = _make_feeds(
             tmp_path,
             models=FakeModelsQueue(ready=True, replies=[_FOCUS_JSON]),
@@ -78,11 +83,14 @@ class TestGuideAgeCap:
         with _TimePatch():
             got = _run(feeds.prepare_news(GID))
         assert got == 0
-        rows = _rejected_rows(_store)
-        assert len(rows) == 1
-        assert rows[0]["reject_gate"] == "hard"
-        assert "文章太旧" in rows[0]["reject_reason"]
-        assert "181" in rows[0]["reject_reason"]
+        assert _rejected_rows(_store) == []
+        batch = _store.read().execute(
+            "SELECT * FROM news_batches ORDER BY id DESC LIMIT 1").fetchone()
+        stats = _store.kv_get(f"feeds.batch_stats.{batch['id']}") or {}
+        rejects = (stats.get("funnel") or {}).get("rejects") or {}
+        assert any("太旧" in k for k in rejects), f"预筛刷掉的应记太旧：{rejects}"
+        # 根本没走到打分
+        assert not any(str(c[2].get("purpose") or "") == "feeds.score" for c in models.calls)
 
     def test_guide_179_days_passes_age_gate(self, tmp_path) -> None:
         """guide 发布 179 天 → 过年龄硬门槛（其他门槛照常打）。"""
@@ -103,7 +111,7 @@ class TestGuideAgeCap:
         assert _rejected_rows(_store) == []
 
     def test_guide_age_uses_guide_not_news_line(self, tmp_path) -> None:
-        """guide 超过 180 天用 guide 的理由文案（不是 news 的「旧闻」）。"""
+        """guide 超过 180 天照样在预筛挡下（口径「太旧：超过半年」，guide/news 共用一条文案）。"""
         _store, settings, feeds, models, workers, topics, _p = _make_feeds(
             tmp_path,
             models=FakeModelsQueue(ready=True, replies=[_FOCUS_JSON]),
@@ -113,9 +121,12 @@ class TestGuideAgeCap:
         )
         with _TimePatch():
             _run(feeds.prepare_news(GID))
-        rows = _rejected_rows(_store)
-        # 理由要走 guide 的文案，不是 news 的「旧闻：N 天前发的」
-        assert "文章太旧" in rows[0]["reject_reason"]
+        assert _rejected_rows(_store) == []
+        batch = _store.read().execute(
+            "SELECT * FROM news_batches ORDER BY id DESC LIMIT 1").fetchone()
+        stats = _store.kv_get(f"feeds.batch_stats.{batch['id']}") or {}
+        rejects = (stats.get("funnel") or {}).get("rejects") or {}
+        assert any("太旧" in k for k in rejects), f"预筛刷掉的应记太旧：{rejects}"
 
 
 # ----------------------------------------------------------------------

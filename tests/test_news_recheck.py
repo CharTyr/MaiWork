@@ -53,23 +53,47 @@ def _log_search(store: Store, task_id: str) -> None:
 
 
 class SeqWorkers:
-    """按顺序回放：第一次是找资讯的子 agent，第二次是补打开的子 agent。
-    每一步可以顺带「打开」一些网址（往 tool_calls 写这次 task_id 的 fetch_page 记录）。"""
+    """按顺序回放：两阶段恒生效后，第一波（撒网 + 核验）由「找资讯那一步」供数，
+    第二步才是补打开的子 agent。每一步可以顺带「打开」一些网址
+    （往 tool_calls 写这次 task_id 的 fetch_page 记录）。"""
 
     def __init__(self, store_ref: list, steps: list) -> None:
         self.store_ref = store_ref
         self.steps = list(steps)
         self.calls: List[Dict[str, Any]] = []
+        self._collect_step: Dict[str, Any] | None = None  # 第一步（找资讯）回放缓存
 
-    async def run(self, brief: str, **kwargs: Any) -> Any:
-        self.calls.append({"brief": brief, **kwargs})
-        step = self.steps.pop(0)
+    def _log(self, step: Dict[str, Any], tid: str) -> None:
         store = self.store_ref[0]
-        tid = str(kwargs.get("task_id") or "")
         for url in step.get("open", []):
             _log_fetch(store, tid, url)
         if step.get("search"):
             _log_search(store, tid)
+        # 「找资讯这轮还顺带打开了这些链接」记录挂在 collect 名义下
+        # （补打开的 probe — opened_links(store, collect_mark) — 只查这个名义）。
+        collect_mark = tid.replace("feeds-discover:", "feeds-collect:", 1) if tid.startswith("feeds-discover:") else None
+        if collect_mark:
+            for url in step.get("collect_open", []):
+                _log_fetch(store, collect_mark, url)
+
+    async def run(self, brief: str, **kwargs: Any) -> Any:
+        self.calls.append({"brief": brief, **kwargs})
+        tid = str(kwargs.get("task_id") or "")
+        from fakes import two_phase_workers_run
+
+        if tid.startswith("feeds-discover:"):
+            # 第一步 = 老路的「找资讯」：种登记簿 + 记搜索次数 + 缓存给后面核验用
+            assert self.steps, "用例步骤不够用：撒网就空了"
+            self._collect_step = self.steps.pop(0)
+            self._log(self._collect_step, tid)
+            return await two_phase_workers_run(self._collect_step["report"], brief, kwargs)
+        if tid.startswith("feeds-verify:") and self._collect_step is not None:
+            # 核验交回「找资讯」那步的预置 items（按 brief 里列的链接分）
+            return await two_phase_workers_run(self._collect_step["report"], brief, kwargs)
+        # 补打开等后续步骤：按原顺序回放
+        assert self.steps, "用例步骤不够用"
+        step = self.steps.pop(0)
+        self._log(step, tid)
         if isinstance(step.get("report"), BaseException):
             raise step["report"]
         return step["report"]
@@ -111,9 +135,10 @@ def test_unopened_item_is_opened_checked_and_kept(tmp_path) -> None:
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 2
     assert len(_accepted(_rows(store))) == 2
-    # 补打开只派了一次，只带没打开过的那条
-    assert len(workers.calls) == 2
-    rc = workers.calls[1]
+    # 补打开只派了一次，只带没打开过的那条（两阶段恒生效：前面还多撒网 + 核验两个环节）
+    recheck_calls = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-recheck:")]
+    assert len(recheck_calls) == 1
+    rc = recheck_calls[0]
     assert str(rc["task_id"]).startswith("feeds-recheck:")
     assert set(rc["tools"]) == {"fetch_page", "web_search"}
     assert rc["deadline_ts"] and rc["deadline_ts"] > NOW
@@ -187,14 +212,18 @@ def test_claimed_opened_but_no_record_gets_rechecked(tmp_path) -> None:
         _cand(1, title="真打开过", url="https://news.b.com/2", fetched=True),
     ]
     steps = [
-        {"report": _ok({"items": items}), "open": ["https://news.b.com/2"], "search": True},
+        {"report": _ok({"items": items}), "open": ["https://news.b.com/2"], "search": True,
+         # 真打开过的那条，把「这轮打开过」记到 collect 名义下（补打开的 probe 只查它）
+         "collect_open": ["https://news.b.com/2"]},
         {"report": _ok({"items": [_verdict(0, "https://news.a.com/1")]}), "open": ["https://news.a.com/1"]},
     ]
     store, feeds, workers, _ = _setup(tmp_path, items, steps)
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 2
-    assert len(workers.calls) == 2
-    assert "https://news.a.com/1" in workers.calls[1]["brief"]
+    # 嘴上说 opened、没留记录的也照样派去补打开
+    recheck_calls = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-recheck:")]
+    assert len(recheck_calls) == 1
+    assert "https://news.a.com/1" in str(recheck_calls[0]["brief"])
 
 
 def test_final_url_counts_as_opened(tmp_path) -> None:
@@ -217,7 +246,7 @@ def test_final_url_counts_as_opened(tmp_path) -> None:
     workers.run = run_with_redirect
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 1
-    assert len(workers.calls) == 1  # 没派补打开
+    assert not [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-recheck:")]  # 没派补打开
 
 
 def test_all_opened_no_recheck(tmp_path) -> None:
@@ -226,7 +255,7 @@ def test_all_opened_no_recheck(tmp_path) -> None:
     store, feeds, workers, _ = _setup(tmp_path, items, steps)
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 2
-    assert len(workers.calls) == 1
+    assert not [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-recheck:")]
 
 
 def test_recheck_failure_does_not_break_the_round(tmp_path) -> None:

@@ -2267,38 +2267,6 @@ class ConsoleServer:
                 return _err(409, str(out.get("reason") or "现在开不了"))
             return web.json_response(out)
 
-        async def _feeds_two_phase_get(request: web.Request) -> web.Response:
-            """两阶段找资讯（「广撒网再挑着打开」）的每群开关：GET 管理员 / 本群群管理员。"""
-            resolved = self._resolve_ref(request.match_info["gid"])
-            if resolved is None:
-                return _err(404, "没有这个群")
-            forbid = self._require_group_admin(request, resolved)
-            if forbid is not None:
-                return forbid
-            not_ready = _m2_ready(svc.feeds)
-            if not_ready is not None:
-                return not_ready
-            return web.json_response({"on": svc.feeds.two_phase_on(resolved)})
-
-        async def _feeds_two_phase_put(request: web.Request) -> web.Response:
-            """两阶段找资讯开关：PUT 管理员或本群群管理员。body {"on": true/false} → {"on": bool}。"""
-            resolved = self._resolve_ref(request.match_info["gid"])
-            if resolved is None:
-                return _err(404, "没有这个群")
-            forbid = self._require_group_admin(request, resolved)
-            if forbid is not None:
-                return forbid
-            not_ready = _m2_ready(svc.feeds)
-            if not_ready is not None:
-                return not_ready
-            body = await _json_body(request)
-            if not isinstance(body, dict):
-                return _err(400, "请求体不是 JSON")
-            on = svc.feeds.set_two_phase(resolved, bool(body.get("on")))
-            return web.json_response({"on": on})
-
-        app.router.add_get("/api/groups/{gid}/feeds-two-phase", _feeds_two_phase_get)
-        app.router.add_route("PUT", "/api/groups/{gid}/feeds-two-phase", self._write(_feeds_two_phase_put))
         app.router.add_get("/api/groups/{gid}/feeds-pref", _feeds_pref_get)
         app.router.add_get("/api/groups/{gid}/card-push", _card_push_get)
         app.router.add_route("PUT", "/api/groups/{gid}/card-push", self._write(_card_push_put))

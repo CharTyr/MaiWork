@@ -554,3 +554,86 @@ def focus_reply(*queries: str) -> str:
         ]},
         ensure_ascii=False,
     )
+
+
+# ---------------------------------------------------------------------------
+# feeds 两阶段恒生效（2026-09-30 用户决定）后的通用假 workers 派发
+# ---------------------------------------------------------------------------
+
+# 挑（feeds.pick）那一次的模型回复：不真挑，让 _pick 走「回落前 10 条」。
+# 插在各测试模型队列里「定关注点」之后，防止挑把打分回复吃掉（队列错位）。
+PICK_FALLBACK_REPLY = '{"note": "测试不挑，全要"}'
+
+
+def ensure_pick_fallback(models: Any) -> Any:
+    """两阶段恒生效后，老路用例的模型队列 ([focus, score, post, …]) 需要在
+    focus 之后插一条「挑」的占位回复，否则挑会把打分回复吃掉。幂等：
+    已是占位回复就不重复插。返回原对象（就地改 reply_queue）。"""
+    q = getattr(models, "reply_queue", None)
+    if not isinstance(q, list) or not q:
+        return models
+    first = q[0]
+    if not isinstance(first, str) or '"focus"' not in first:
+        return models
+    if len(q) >= 2 and q[1] == PICK_FALLBACK_REPLY:
+        return models
+    # 队列本身就是给「定关注点（含追问重试）」用的：第二条还是 focus 回复时别插队
+    if len(q) >= 2 and isinstance(q[1], str) and '"focus"' in q[1]:
+        return models
+    q.insert(1, PICK_FALLBACK_REPLY)
+    return models
+
+
+async def two_phase_workers_run(report: Any, brief: str, kwargs: Dict[str, Any]) -> Any:
+    """「预置一份老路 report」的假 workers 接上两阶段流水线的通用派发。
+
+    - task_id 以 feeds-discover: 开头：把预置 report.data["items"] 当搜索结果
+      记进撒网登记簿（discovery.record），回一条 ok 的备注 report；
+    - task_id 以 feeds-verify: 开头：只把 brief 里列出的链接（「链接：<url>」行）
+      对应的预置条目回给这一组核验（几组并发各回各的，不会重复交全量）；
+    - 其他 task_id（feeds-recheck: 等）：老行为——预置是异常就抛，否则原样回。
+    """
+    from CharTyr_MaiWork.maiwork.workers import WorkerReport
+
+    task_id = str(kwargs.get("task_id") or "")
+    if isinstance(report, BaseException):
+        raise report
+    data = getattr(report, "data", None)
+    preset_items = list(data.get("items") or []) if isinstance(data, dict) else []
+    if task_id.startswith("feeds-discover:"):
+        from CharTyr_MaiWork.maiwork import discovery
+
+        if getattr(report, "ok", True) is False:
+            # 预置一份「撒网子 agent 坏了」的：登记簿空着，照坏原样报回去
+            return report
+        results = []
+        for it in preset_items:
+            if not isinstance(it, dict) or not it.get("url"):
+                continue
+            pub = it.get("published")
+            results.append(
+                {
+                    "title": str(it.get("title") or ""),
+                    "url": str(it.get("url") or ""),
+                    "snippet": str(it.get("summary") or ""),
+                    "published": float(pub) if isinstance(pub, (int, float)) and pub else None,
+                }
+            )
+        if results:
+            # 预置可选 "seed_focus"：这批候选假装是从第 N 个关注点搜出来的
+            # （diverse/explore 末尾方向打 angle 用）。缺省 1。
+            seed_focus = data.get("seed_focus", 1) if isinstance(data, dict) else 1
+            try:
+                seed_focus = int(seed_focus)
+            except (TypeError, ValueError):
+                seed_focus = 1
+            discovery.record(task_id, query="测试关注点", focus=seed_focus, provider="main", results=results)
+        return WorkerReport(ok=True, summary="撒好了", data={"note": "撒好了"}, evidence=[], steps=1)
+    if task_id.startswith("feeds-verify:"):
+        kept = [
+            dict(it)
+            for it in preset_items
+            if isinstance(it, dict) and str(it.get("url") or "") and str(it.get("url") or "") in str(brief)
+        ]
+        return WorkerReport(ok=True, summary="核验好", data={"items": kept}, evidence=[], steps=2)
+    return report

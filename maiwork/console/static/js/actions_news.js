@@ -1,4 +1,4 @@
-// MaiWork 网页 · 点击动作（资讯找法相关）：预设搜索服务、口味小结、优质来源、新找法开关、漏斗展开。
+// MaiWork 网页 · 点击动作（资讯找法相关）：预设搜索服务、口味小结、优质来源、漏斗展开。
 // 从 actions.js 拆出来（单文件 900 行上限）；act() 先问这里，处理了返回 true。
 import { $, state } from "./state.js";
 import { reveal, toast } from "./util.js";
@@ -79,23 +79,6 @@ export async function actNews(a, el) {
       renderView();
       reveal(`.funnel .rej-head[data-id="${el.dataset.id}"]`);
       return true;
-    case "two-phase": {
-      const gid = state.g;
-      const on = !(state.twoPhase && state.twoPhase[gid]);
-      if (on && !confirm("这个群改用新找法？先只看搜索结果广撒网，再挑最有希望的几条打开核对。下一批资讯开始生效，随时可以关。")) break;
-      el.disabled = true;
-      try {
-        const r = await api("PUT", `/api/groups/${encodeURIComponent(gid)}/feeds-two-phase`, { on });
-        state.twoPhase = state.twoPhase || {};
-        state.twoPhase[gid] = !!(r && r.on);
-        renderView();
-        toast(state.twoPhase[gid] ? "这个群改用新找法了，下一批开始生效" : "改回老找法了");
-      } catch (e2) {
-        el.disabled = false;
-        toast(e2.message, true);
-      }
-      return true;
-    }
     default:
       return false;
   }

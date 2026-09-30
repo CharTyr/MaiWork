@@ -307,27 +307,7 @@ function prefBox(v) {
 function newsRunBtn() {
   if (!gadmin()) return "";
   const running = state.newsRunning === state.g;
-  return `${twoPhaseBtn()}<button class="btn small news-run" data-act="news-run" ${running ? "disabled" : ""}>${running ? "在备料…" : "现在就备一批"}</button>`;
-}
-
-// 新找法（先广撒网、再挑着打开）：按群开关，只给管理员；状态懒加载进 state.twoPhase[群]
-function twoPhaseBtn() {
-  if (!admin() || !state.g) return "";
-  const tp = (state.twoPhase = state.twoPhase || {});
-  if (!(state.g in tp)) {
-    tp[state.g] = null;
-    const gid = state.g;
-    api("GET", `/api/groups/${encodeURIComponent(gid)}/feeds-two-phase`)
-      .then((r) => {
-        tp[gid] = !!(r && r.on);
-        document.querySelectorAll(".two-phase").forEach((b) => b.replaceWith(Object.assign(document.createElement("span"), { innerHTML: twoPhaseBtn() }).firstElementChild || b));
-      })
-      .catch(() => (tp[gid] = undefined));
-    return "";
-  }
-  const on = tp[state.g];
-  if (on == null) return "";
-  return `<button class="btn small two-phase${on ? " on" : ""}" data-act="two-phase" aria-pressed="${on}" title="先只看搜索结果广撒网，再挑最有希望的几条打开核对">${on ? "新找法：开" : "新找法：关"}</button>`;
+  return `<button class="btn small news-run" data-act="news-run" ${running ? "disabled" : ""}>${running ? "在备料…" : "现在就备一批"}</button>`;
 }
 
 // 口味小结（只给管理员）：MaiWork 每天从群友反馈里总结；懒加载进 state.taste[群]

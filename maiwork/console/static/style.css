@@ -1519,8 +1519,6 @@ a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 .fn-n { flex: none; color: var(--gray); font-variant-numeric: tabular-nums; }
 .fn-tags { display: flex; flex-wrap: wrap; gap: 6px; }
 .rej-src { margin-top: 3px; font-size: 12.5px; color: var(--gray); }
-.two-phase { margin-right: 6px; }
-.two-phase.on { background: var(--alt-bg); color: var(--blue); border-color: transparent; }
 .taste-meta { margin-left: 8px; font-size: 12px; color: var(--gray); }
 .set-row.is-off .set-name { color: var(--gray); text-decoration: line-through; }
 .ntag.fu { background: var(--ok-bg); color: var(--ok-ink); }

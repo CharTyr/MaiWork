@@ -27,7 +27,7 @@ from CharTyr_MaiWork.maiwork.feeds import Feeds, run_railway_verify
 from CharTyr_MaiWork.maiwork.store import Store
 from CharTyr_MaiWork.maiwork.workers import WorkerReport
 
-from fakes import FakeModelsQueue, FakeProfiles, focus_reply
+from fakes import PICK_FALLBACK_REPLY, FakeModelsQueue, FakeProfiles, focus_reply, two_phase_workers_run
 
 BJ = timezone(timedelta(hours=8))
 NOW = 1_790_000_000.0
@@ -82,15 +82,28 @@ _VERIFY_PICK_JSON = json.dumps(
 
 
 class FakeWorkers:
-    """假 workers.run：索引第几次调用，按队列回 WorkerReport。"""
+    """假 workers.run：索引第几次调用，按队列回 WorkerReport。
+
+    两阶段恒生效：feeds-discover 时弹一条（这条当作「老路收上来的候选」记住，
+    种进撒网登记簿）；feeds-verify 时按 brief 里列出的链接交回这份的子集。
+    """
 
     def __init__(self, reports: list[Any] | None = None, default: Any = None) -> None:
         self.reports = list(reports or [])
         self.default = default
         self.calls: list[dict] = []
+        self._collect_report: Any = None
 
     async def run(self, brief: str, **kwargs: Any) -> Any:
         self.calls.append({"brief": str(brief), **kwargs})
+        task_id = str(kwargs.get("task_id") or "")
+        if task_id.startswith(("feeds-discover:", "feeds-verify:")):
+            if task_id.startswith("feeds-discover:"):
+                r = self.reports.pop(0) if self.reports else self.default
+                if isinstance(r, BaseException):
+                    raise r
+                self._collect_report = r
+            return await two_phase_workers_run(self._collect_report, brief, kwargs)
         if self.reports:
             r = self.reports.pop(0)
             if isinstance(r, BaseException):
@@ -174,7 +187,7 @@ def _accepted_verify(tmp_path: Path, store: Store) -> list[dict]:
 def test_no_pick_means_no_vm_and_normal_insert(tmp_path: Path) -> None:
     """主模型说没有值得实测的（verify 键缺失/null）→ 不申请 VM，照常入库。"""
     models = FakeModelsQueue(ready=True, replies=[
-        _FOCUS_JSON, _SCORES_JSON,
+        _FOCUS_JSON, PICK_FALLBACK_REPLY, _SCORES_JSON,
         '{"posts": []}',
         '{"verify": null}',
     ])
@@ -192,7 +205,7 @@ def test_no_pick_means_no_vm_and_normal_insert(tmp_path: Path) -> None:
 
 def test_railway_off_means_whole_verify_disabled(tmp_path: Path) -> None:
     """[environments] railway=false → 实测整个关掉：不挑条、不调 runner、甚至不多调一次模型。"""
-    models = FakeModelsQueue(ready=True, replies=[_FOCUS_JSON, _SCORES_JSON, '{"posts": []}'])
+    models = FakeModelsQueue(ready=True, replies=[_FOCUS_JSON, PICK_FALLBACK_REPLY, _SCORES_JSON, '{"posts": []}'])
     runner = RecordingVerifyRunner({0: {"status": "passed"}})
     store, _settings, feeds = _make_feeds(
         tmp_path, models=models, workers=FakeWorkers([_worker_report_items()]),
@@ -201,8 +214,8 @@ def test_railway_off_means_whole_verify_disabled(tmp_path: Path) -> None:
     got = asyncio.run(feeds.prepare_news(GID))
     assert got == 2
     assert runner.calls == []
-    # 主模型只被问了 3 次（focus/score/post），没有第 4 次挑实测的调用
-    assert len(models.calls) == 3
+    # 主模型被问 4 次（focus/挑候选/score/post），没有第 5 次挑实测的调用
+    assert len(models.calls) == 4
     for row in _accepted_verify(tmp_path, store):
         assert row["verify"] == ""
 
@@ -211,7 +224,7 @@ def test_verify_enabled_off_skips_pick_and_runner(tmp_path: Path) -> None:
     """[environments] verify_enabled=false（默认）→ 整个挑实测跳过：
     不调模型挑条、不调 runner、不多一次模型调用；出资讯照常。"""
     models = FakeModelsQueue(ready=True, replies=[
-        _FOCUS_JSON, _SCORES_JSON, '{"posts": []}', _VERIFY_PICK_JSON,
+        _FOCUS_JSON, PICK_FALLBACK_REPLY, _SCORES_JSON, '{"posts": []}', _VERIFY_PICK_JSON,
     ])
     runner = RecordingVerifyRunner({0: {"status": "passed"}})
     store, _settings, feeds = _make_feeds(
@@ -221,8 +234,8 @@ def test_verify_enabled_off_skips_pick_and_runner(tmp_path: Path) -> None:
     got = asyncio.run(feeds.prepare_news(GID))
     assert got == 2
     assert runner.calls == []  # 一次都没申请 VM
-    # 主模型只被问了 3 次（focus/score/post），没有第 4 次挑实测的调用
-    assert len(models.calls) == 3
+    # 主模型被问 4 次（focus/挑候选/score/post），没有第 5 次挑实测的调用
+    assert len(models.calls) == 4
     for row in _accepted_verify(tmp_path, store):
         assert row["verify"] == ""
 
@@ -230,7 +243,7 @@ def test_verify_enabled_off_skips_pick_and_runner(tmp_path: Path) -> None:
 def test_verify_enabled_on_keeps_existing_behavior(tmp_path: Path) -> None:
     """[environments] verify_enabled=true → 老实测：先调模型挑条，再交给 runner。"""
     models = FakeModelsQueue(ready=True, replies=[
-        _FOCUS_JSON, _SCORES_JSON, '{"posts": []}', _VERIFY_PICK_JSON,
+        _FOCUS_JSON, PICK_FALLBACK_REPLY, _SCORES_JSON, '{"posts": []}', _VERIFY_PICK_JSON,
     ])
     runner = RecordingVerifyRunner({0: {"status": "passed"}})
     store, _settings, feeds = _make_feeds(
@@ -239,7 +252,7 @@ def test_verify_enabled_on_keeps_existing_behavior(tmp_path: Path) -> None:
     )
     got = asyncio.run(feeds.prepare_news(GID))
     assert got == 2
-    assert len(models.calls) == 4  # 第 4 次是挑实测
+    assert len(models.calls) == 5  # 第 2 次是挑候选、第 5 次是挑实测
     assert len(runner.calls) == 1
     assert [int(p["index"]) for p in runner.calls[0]["plans"]] == [0]
     rows = _accepted_verify(tmp_path, store)
@@ -249,7 +262,7 @@ def test_verify_enabled_on_keeps_existing_behavior(tmp_path: Path) -> None:
 def test_vm_unavailable_still_inserts_normally(tmp_path: Path) -> None:
     """runner 表示拿不到 VM（什么都不写就回来）→ 照常入库、返回入选数不变。"""
     models = FakeModelsQueue(ready=True, replies=[
-        _FOCUS_JSON, _SCORES_JSON, '{"posts": []}', _VERIFY_PICK_JSON,
+        _FOCUS_JSON, PICK_FALLBACK_REPLY, _SCORES_JSON, '{"posts": []}', _VERIFY_PICK_JSON,
     ])
     runner = RecordingVerifyRunner()  # 不写任何 verify = 没拿到机器
     store, _settings, feeds = _make_feeds(
@@ -277,7 +290,7 @@ def test_passed_and_failed_both_written_to_verify(tmp_path: Path) -> None:
         ensure_ascii=False,
     )
     models = FakeModelsQueue(ready=True, replies=[
-        _FOCUS_JSON, _SCORES_JSON, '{"posts": []}', pick_two,
+        _FOCUS_JSON, PICK_FALLBACK_REPLY, _SCORES_JSON, '{"posts": []}', pick_two,
     ])
     runner = RecordingVerifyRunner({0: v_pass, 1: v_fail})
     store, _settings, feeds = _make_feeds(
@@ -309,7 +322,7 @@ def test_per_round_cap_is_two(tmp_path: Path) -> None:
         ensure_ascii=False,
     )
     models = FakeModelsQueue(ready=True, replies=[
-        _FOCUS_JSON, _SCORES_JSON, '{"posts": []}', pick_three,
+        _FOCUS_JSON, PICK_FALLBACK_REPLY, _SCORES_JSON, '{"posts": []}', pick_three,
     ])
     runner = RecordingVerifyRunner()
     _store, _settings, feeds = _make_feeds(
@@ -332,7 +345,7 @@ def test_pick_out_of_range_dropped(tmp_path: Path) -> None:
         ensure_ascii=False,
     )
     models = FakeModelsQueue(ready=True, replies=[
-        _FOCUS_JSON, _SCORES_JSON, '{"posts": []}', pick_bad,
+        _FOCUS_JSON, PICK_FALLBACK_REPLY, _SCORES_JSON, '{"posts": []}', pick_bad,
     ])
     runner = RecordingVerifyRunner()
     _store, _settings, feeds = _make_feeds(
@@ -516,7 +529,7 @@ def test_verify_full_chain_end_to_end(tmp_path: Path) -> None:
     v = {"status": "passed", "summary": "装上跑通了", "steps": ["装", "跑"],
          "minutes": 4, "ts": NOW}
     models = FakeModelsQueue(ready=True, replies=[
-        _FOCUS_JSON, _SCORES_JSON, '{"posts": []}', _VERIFY_PICK_JSON,
+        _FOCUS_JSON, PICK_FALLBACK_REPLY, _SCORES_JSON, '{"posts": []}', _VERIFY_PICK_JSON,
     ])
     runner = RecordingVerifyRunner({0: v})
     store, _settings, feeds = _make_feeds(

@@ -1,9 +1,10 @@
-"""两阶段找资讯（「广撒网再挑着打开」）测试：开关、撒网、保底、粗筛、挑着打开、验收、漏斗统计。
+"""两阶段找资讯（「广撒网再挑着打开」）测试：撒网、保底、粗筛、挑着打开、验收、漏斗统计。
 
-开关：kv key feeds.two_phase = 用新路的群号列表；Feeds.two_phase_on(gid) / set_two_phase(gid, on)；
-管理员接口 GET/PUT /api/groups/{gid}/feeds-two-phase。
+2026-09-30 用户决定：新找法对**所有服务群**恒生效，不再有每群开关
+（kv feeds.two_phase 的旧行留着不管，但任何代码都不再读它；Feeds 上没有
+two_phase_on / set_two_phase；GET/PUT /api/groups/{gid}/feeds-two-phase 已删）。
 
-开关开着时 prepare_news 的第 ② 步换成：
+prepare_news 的第 ② 步固定为：
 1. 撒网（子 agent，只用 web_search，task_id feeds-discover: 开头）——候选从**程序侧的
    撒网登记簿**（discovery.py：web_search 工具 handler 记进去的搜索结果）拿，不信子 agent 交回；
 2. 保底（代码）：某个方向搜不够（<2 次问 / <6 条候选）→ 代码直接补搜；
@@ -43,7 +44,7 @@ from test_feeds_quality import (
 from fakes import FakeCtx, FakeModelsQueue, FakeProfiles
 from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 from CharTyr_MaiWork.maiwork import discovery
-from CharTyr_MaiWork.maiwork.feeds import Feeds, _normalize_url
+from CharTyr_MaiWork.maiwork.feeds import _normalize_url
 from CharTyr_MaiWork.maiwork.store import Store
 from CharTyr_MaiWork.maiwork.tools import ToolContext, Tools
 from CharTyr_MaiWork.maiwork.tools_builtin import register_builtin
@@ -187,7 +188,10 @@ def _verify_item(url: str, *, title: str = "", kind: str = "news", published=NOW
 
 
 def _ready_two_phase_feeds(tmp_path, *, discover=None, verify=None, search=None, models=None):
-    """开关打开 + 假 workers（按 task_id 分派）；返回常用几个对象。"""
+    """假 workers（按 task_id 分派）+ 假搜索；返回常用几个对象。
+
+    2026-09-30 起两阶段恒生效，不需要也不允许再拨开关；这里特意不碰 kv。
+    """
     workers = SeqWorkers(discover=discover, verify=verify)
     kw: Dict[str, Any] = {"workers": workers}
     if models is not None:
@@ -196,36 +200,52 @@ def _ready_two_phase_feeds(tmp_path, *, discover=None, verify=None, search=None,
     if search is None:
         search = FakeBroadSearch()
     feeds._search = search
-    feeds.set_two_phase(GID, True)
     return store, settings, feeds, models, workers, topics
 
 
 # ----------------------------------------------------------------------
-# 开关本身
+# 恒生效（2026-09-30 用户决定：不再有每群开关）
 # ----------------------------------------------------------------------
 
 
-def test_two_phase_switch_default_off(tmp_path) -> None:
-    store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path)
-    assert feeds.two_phase_on(GID) is False
-    feeds.set_two_phase(GID, True)
-    assert feeds.two_phase_on(GID) is True
-    feeds.set_two_phase(GID, False)
-    assert feeds.two_phase_on(GID) is False
-    # 关掉后不留痕迹：另起一个实例读同一份库也是关
-    feeds2 = Feeds(store, models, workers, FakeProfiles(), topics, lambda: settings)
-    assert feeds2.two_phase_on(GID) is False
+def test_feeds_no_longer_has_two_phase_switch(tmp_path) -> None:
+    """开关整体删除：Feeds 上没有 two_phase_on / set_two_phase / _two_phase_key。"""
+    _store, _settings, feeds, _m, _w, _t, _p = _make_feeds(tmp_path)
+    assert not hasattr(feeds, "two_phase_on")
+    assert not hasattr(feeds, "set_two_phase")
+    assert not hasattr(feeds, "_two_phase_key")
 
 
-def test_switch_off_uses_classic_collect_worker(tmp_path) -> None:
-    """开关关着 = 老路不变：一个子 agent，web_search + fetch_page 一起，task_id feeds-collect:。"""
-    store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path)
-    with _TimePatch():
-        assert _run(feeds.prepare_news(GID)) == 1
-    collects = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-collect:")]
-    assert len(collects) == 1, workers.calls
-    assert sorted(collects[0]["tools"]) == ["fetch_page", "web_search"]
-    assert not any(str(c.get("task_id") or "").startswith("feeds-discover:") for c in workers.calls)
+def test_two_phase_always_on_even_with_stale_kv(tmp_path) -> None:
+    """不设 kv（以及留了旧 kv 行）都一样：prepare_news 恒走两阶段，不再有老单子 agent。"""
+    for write_stale_kv in (False, True):
+        store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
+            tmp_path / f"case{int(write_stale_kv)}",
+            discover=_ok_report({"note": "撒好了"}),
+            verify=[_ok_report({"items": [_verify_item("https://a.com/1")]})],
+            search=FakeBroadSearch(results=[
+                {"title": "A", "url": "https://a.com/1", "snippet": "s", "published": None},
+            ]),
+        )
+        if write_stale_kv:
+            with store.tx() as conn:
+                store.kv_set(conn, "feeds.two_phase", ["999"])  # 旧行残留：不许再有人读
+        models.reply_queue = [
+            _FOCUS_JSON,
+            json.dumps({"picks": [{"i": 0, "kind": "news", "hook": "值得打开"}]}, ensure_ascii=False),
+            _scores_json(_score(0)),
+        ]
+        with _TimePatch():
+            kept = _run(feeds.prepare_news(GID))
+        assert kept == 1, write_stale_kv
+        discovers = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-discover:")]
+        verifies = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-verify:")]
+        assert len(discovers) == 1 and discovers[0]["tools"] == ["web_search"], workers.calls
+        assert verifies and all(v["tools"] == ["fetch_page"] for v in verifies), workers.calls
+        # 老路的标志：一个 web_search+fetch_page 一把梭、task_id feeds-collect: 的子 agent——不再存在
+        collects = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-collect:")]
+        assert collects == [], workers.calls
+    assert not hasattr(feeds, "two_phase_on")
 
 
 # ----------------------------------------------------------------------
@@ -532,6 +552,26 @@ def test_verify_workers_concurrent_and_fail_isolated(tmp_path) -> None:
     assert rows[0]["src_provider"] != ""
 
 
+def test_verify_output_order_follows_picks(tmp_path) -> None:
+    """并发核验按轮循分组会把候选顺序打散；交回入库前按挑的顺序排回去，
+    让「打分的 i ↔ 候选的 i」在老用例口径下稳定（顺序就是子 agent 看到的顺序）。"""
+    picks = [
+        (_candidate(f"https://o.com/{i}", title=f"顺序{i}"), "news", f"理由{i}")
+        for i in range(6)
+    ]
+    r0 = _ok_report({"items": [_verify_item("https://o.com/3"), _verify_item("https://o.com/0")]})
+    r1 = _ok_report({"items": [_verify_item("https://o.com/4"), _verify_item("https://o.com/1")]})
+    r2 = _ok_report({"items": [_verify_item("https://o.com/5"), _verify_item("https://o.com/2")]})
+    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
+        tmp_path, verify=[r0, r1, r2],
+    )
+    items, opened = _run(feeds._verify_batch(
+        GID, picks, verify_mark="feeds-verify:order:1", deadline_ts=NOW + 60,
+    ))
+    assert [it["url"] for it in items] == [f"https://o.com/{i}" for i in range(6)]
+    assert opened == 6
+
+
 def test_verify_picks_without_hook_dropped(tmp_path) -> None:
     """模型挑的条目没有具体 hook（或编号越界）→ 丢掉不打开。"""
     discover = _ok_report({"note": "ok"})
@@ -654,10 +694,15 @@ def test_funnel_stats_written_and_readable(tmp_path) -> None:
 
 
 def test_old_batch_stats_without_funnel_still_read(tmp_path) -> None:
-    """老批次（没有 funnel 的）照读：funnel 键不存在、不炸。"""
+    """老批次（两阶段恒生效之前跑的、统计里没有 funnel 的）照读：funnel 键不存在、不炸。"""
     store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path)
-    with _TimePatch():
-        assert _run(feeds.prepare_news(GID)) == 1
+    with store.tx() as conn:
+        cur = conn.execute(
+            "INSERT INTO news_batches (group_id, slot_ts, found, kept, skipped, note, created)"
+            " VALUES (?, ?, 1, 1, 0, '', ?)",
+            (GID, NOW, NOW),
+        )
+        store.kv_set(conn, f"feeds.batch_stats.{int(cur.lastrowid)}", {"searches": 2, "pages": 1, "kept": 1})
     batch = store.read().execute("SELECT id FROM news_batches ORDER BY id DESC LIMIT 1").fetchone()
     stats = feeds._batch_stats(int(batch["id"]))
     assert stats is not None and "funnel" not in stats
@@ -665,7 +710,7 @@ def test_old_batch_stats_without_funnel_still_read(tmp_path) -> None:
 
 
 # ----------------------------------------------------------------------
-# 接口：GET/PUT /api/groups/{gid}/feeds-two-phase（管理员）
+# 接口：feeds-two-phase 两个路由已删（2026-09-30 用户决定新找法恒生效，不再开关）
 # ----------------------------------------------------------------------
 
 
@@ -698,33 +743,26 @@ async def env(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_two_phase_api_admin_rw(env) -> None:
+async def test_two_phase_api_routes_gone_admin(env) -> None:
+    """路由删掉后：管理员 GET/PUT 都是 404（不再是能拨的开关）。"""
     await env.client.post("/api/login", json={"password": PASSWORD})
     r = await env.client.get(f"/api/groups/{G1}/feeds-two-phase")
-    assert r.status == 200
-    assert (await r.json()) == {"on": False}
+    assert r.status == 404, r.status
     r = await env.client.put(f"/api/groups/{G1}/feeds-two-phase", json={"on": True})
-    assert r.status == 200
-    assert (await r.json()) == {"on": True}
-    r = await env.client.get(f"/api/groups/{G1}/feeds-two-phase")
-    assert (await r.json()) == {"on": True}
-    r = await env.client.put(f"/api/groups/{G1}/feeds-two-phase", json={"on": False})
-    assert (await r.json()) == {"on": False}
+    assert r.status == 404, r.status
 
 
 @pytest.mark.asyncio
-async def test_two_phase_api_member_403_anon_401(env) -> None:
+async def test_two_phase_api_routes_gone_member_and_anon(env) -> None:
+    """群友 / 匿名同样 404——任何身份都拨不了这个不存在的开关。"""
     token = env.app.token_of(G1)
     r = await env.client.put(
         f"/api/groups/{G1}/feeds-two-phase", json={"on": True},
         headers={"X-MW-Group": token},
     )
-    assert r.status == 403
-    r = await env.client.put(f"/api/groups/{G1}/feeds-two-phase", json={"on": True})
-    assert r.status == 401
-    # 群友 GET 也读不到（开关是管理员的事）
-    r = await env.client.get(f"/api/groups/{G1}/feeds-two-phase", headers={"X-MW-Group": token})
-    assert r.status == 403
+    assert r.status == 404, r.status
+    r = await env.client.get(f"/api/groups/{G1}/feeds-two-phase")
+    assert r.status == 404, r.status
 
 
 # ----------------------------------------------------------------------

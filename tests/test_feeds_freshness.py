@@ -25,7 +25,14 @@ from CharTyr_MaiWork.maiwork.config import load_settings
 from CharTyr_MaiWork.maiwork.feeds import Feeds
 from CharTyr_MaiWork.maiwork.store import Store
 
-from fakes import FakeModelsQueue, FakeProfiles, focus_reply
+from fakes import (
+    PICK_FALLBACK_REPLY,
+    FakeModelsQueue,
+    FakeProfiles,
+    ensure_pick_fallback,
+    focus_reply,
+    two_phase_workers_run,
+)
 
 NOW = 1_790_000_000.0
 GID = "111"
@@ -64,7 +71,10 @@ class _TimePatch:
 
 
 class FakeWorkers:
-    """假的 workers.run：预置一份 WorkerReport 或 Exception，并记录 brief。"""
+    """假的 workers.run：预置一份 WorkerReport 或 Exception，并记录 brief。
+
+    两阶段恒生效：feeds-discover 把预置 items 种进撒网登记簿、feeds-verify 按 brief 链接交回。
+    """
 
     def __init__(self, report: Any = None) -> None:
         self.report = report
@@ -72,9 +82,7 @@ class FakeWorkers:
 
     async def run(self, brief: str, **kwargs: Any) -> Any:
         self.calls.append({"brief": brief, **kwargs})
-        if isinstance(self.report, BaseException):
-            raise self.report
-        return self.report
+        return await two_phase_workers_run(self.report, brief, kwargs)
 
 
 class FakeTopics:
@@ -185,6 +193,7 @@ def _make_feeds(tmp_path, *, models: FakeModelsQueue | None = None,
     settings = _settings()
     if models is None:
         models = FakeModelsQueue(ready=True)
+    ensure_pick_fallback(models)
     if workers is None:
         workers = FakeWorkers(_ok_report({"items": []}))
     topics = FakeTopics()
@@ -195,7 +204,11 @@ def _make_feeds(tmp_path, *, models: FakeModelsQueue | None = None,
 
 
 def _score_prompt(models: FakeModelsQueue) -> str:
-    return str(models.calls[1][1][0]["content"])
+    """打分那次的提示词（两阶段后队列里隔着 feeds.pick，不能按下标 1 拿）。"""
+    for _role, messages, kwargs in models.calls:
+        if str(kwargs.get("purpose") or "") == "feeds.score":
+            return str(messages[0]["content"])
+    raise AssertionError("打分模型没被调用")
 
 
 def _rejected_rows(store: Store) -> list:
@@ -261,7 +274,7 @@ class TestRecentPublishedForDedup:
         assert "同一件事" in rows[0]["reject_reason"]
         assert published_title[:30] in rows[0]["reject_reason"]
         # 被 dup 拒的条目在打分这道就出局，不该走到写帖子
-        assert len(models.calls) == 2
+        assert len(models.calls) == 3  # 两阶段后 +「挑」：focus + pick + score
 
     def test_dup_of_backward_compat_same_as_recent_still_rejects(self, tmp_path) -> None:
         """老字段 same_as_recent=true 照拒（向后兼容）。"""
@@ -646,7 +659,7 @@ class TestNewsFreshness:
         assert rows[0]["reject_gate"] == "hard"
         assert "旧闻" in rows[0]["reject_reason"]
         assert "62" in rows[0]["reject_reason"]
-        assert len(models.calls) == 1  # 只调了定关注点，没调打分
+        assert len(models.calls) == 2  # 两阶段后只调了定关注点 +「挑」，没调打分
 
     def test_news_within_7_days_passes(self, tmp_path) -> None:
         """6 天前发的资讯：新鲜度这关不拦（其他门槛照常过）。"""
@@ -755,16 +768,19 @@ class TestNewsFreshness:
         prompt = _score_prompt(models)
         assert "商店页" in prompt
         assert "不是新闻" in prompt
-        # 子 agent brief：规则里写「最近 7 天」+「商店页这一类的页面不算资讯」
-        brief = str(workers.calls[0]["brief"])
-        assert "7 天" in brief
-        assert "商店页" in brief
+        # 核验子 agent 的 brief（两阶段恒生效后「看那类页面算不算资讯」在这里）：「最近 7 天」+「商店页不算资讯」
+        briefs = "\n".join(
+            str(c["brief"]) for c in workers.calls
+            if str(c.get("task_id") or "").startswith("feeds-verify:")
+        )
+        assert "7 天" in briefs
+        assert "商店页" in briefs
         rows = _rejected_rows(store)
         assert len(rows) == 1
         assert rows[0]["reject_gate"] == "hard"
         assert "不是新闻" in rows[0]["reject_reason"]
-        # 被拒在打分这道，没走到写帖子
-        assert len(models.calls) == 2
+        # 被拒在打分这道，没走到写帖子（两阶段后 +「挑」= 3 次调用）
+        assert len(models.calls) == 3
 
 
 # ----------------------------------------------------------------------
@@ -810,8 +826,8 @@ class TestWritePostsRobust:
         assert by_title["本地部署实战全记录"] == "裸对象正文"
         # 漏掉的另一条走了补写重试（第二轮只写它一条）
         assert by_title["量子芯片全新架构发布"] == "重试补写的正文"
-        assert len(models.calls) == 5  # focus + score + post + 补写 + 对原文自检
-        retry_prompt = str(models.calls[3][1][-1]["content"])
+        assert len(models.calls) == 6  # 两阶段后 +「挑」：focus + pick + score + post + 补写 + 对原文自检
+        retry_prompt = str(models.calls[4][1][-1]["content"])
         assert "量子芯片全新架构发布" in retry_prompt
         assert "本地部署实战全记录" not in retry_prompt  # 只补漏写的
 
@@ -830,7 +846,7 @@ class TestWritePostsRobust:
         rows = store.read().execute(
             "SELECT title, body FROM news_items WHERE rejected=0 ORDER BY id").fetchall()
         assert [r["body"] for r in rows] == ["正文零", "正文一"]
-        assert len(models.calls) == 4  # 都写上了，不用补（+ 对原文自检）
+        assert len(models.calls) == 5  # 都写上了，不用补（+「挑」+ 对原文自检）
 
     def test_retry_only_missing_and_fallback_for_still_missing(self, tmp_path) -> None:
         """第一回漏写，重试又只补了一条；还漏的那条才走 _post_fallback（body=summary）。"""
@@ -841,7 +857,7 @@ class TestWritePostsRobust:
         )
         with _TimePatch():
             assert _run(feeds.prepare_news(GID)) == 2
-        assert len(models.calls) == 5  # 含对原文自检
+        assert len(models.calls) == 6  # 含「挑」和对原文自检（两阶段后 +1）
         rows = store.read().execute(
             "SELECT title, body FROM news_items WHERE rejected=0 ORDER BY id").fetchall()
         by_title = {r["title"]: r["body"] for r in rows}

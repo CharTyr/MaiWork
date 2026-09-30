@@ -171,7 +171,9 @@ class _FakeWorkers:
 
     async def run(self, brief: str, **kwargs: Any) -> Any:
         self.calls.append({"brief": brief, **kwargs})
-        return self.report
+        from fakes import two_phase_workers_run
+
+        return await two_phase_workers_run(self.report, brief, kwargs)
 
 
 def _worker_report(items: list[dict]) -> Any:
@@ -193,48 +195,65 @@ class _FakeTopics:
         self.calls.append((a, kw))
 
 
-def _make_feeds(store: Store, workers: Any) -> Feeds:
+def _make_feeds(store: Store, workers: Any, models: Any = None) -> Feeds:
     settings, _ = load_settings({})
     profiles = FakeProfiles()
-    focus_json = '{"focus": [{"query": "FPGA", "why": "群里在做"}]}'
-    models = FakeModelsQueue(ready=True, replies=[focus_json])
+    profiles.entries_map[G1] = [{"category": "interest", "text": "FPGA"}]
+    if models is None:
+        focus_json = '{"focus": [{"query": "FPGA", "why": "群里在做"}]}'
+        models = FakeModelsQueue(ready=True, replies=[focus_json])
     return Feeds(store, models, workers, profiles, _FakeTopics(), lambda: settings, search=_EmptySearch())
 
 
-_GOOD_XML = """<?xml version="1.0"?><rss version="2.0"><channel><title>好博客</title>
-<item><title>RSS 好文</title><link>https://ok.example.com/rss1</link>
-<pubDate>Mon, 20 Sep 2026 08:00:00 GMT</pubDate><description>内容</description></item>
-</channel></rss>"""
+def _good_xml() -> str:
+    """一条新鲜的 RSS 条目（pubDate = 现在前一小时；新鲜度门槛按真实时钟算）。"""
+    import time as _time
+    from email.utils import formatdate as _fmt
+
+    return (
+        '<?xml version="1.0"?><rss version="2.0"><channel><title>好博客</title>'
+        '<item><title>RSS 好文</title><link>https://ok.example.com/rss1</link>'
+        f'<pubDate>{_fmt(_time.time() - 3600, usegmt=True)}</pubDate>'
+        '<description>内容</description></item></channel></rss>'
+    )
 
 
 def _rss_handler(request: httpx.Request) -> httpx.Response:
     if "good" in str(request.url):
-        return httpx.Response(200, text=_GOOD_XML)
+        return httpx.Response(200, text=_good_xml())
     return httpx.Response(404, text="no")
 
 
 class TestRssPipeline:
     @pytest.mark.asyncio
-    async def test_rss_items_briefed_to_worker(self, tmp_path: Path):
-        """RSS 条目交给子 agent 的 brief 做「优先看这些链接」，走完与搜索同一套硬门槛+落库。"""
+    async def test_rss_items_flow_when_search_finds_nothing(self, tmp_path: Path):
+        """两阶段恒生效后：撒网一无所获时，RSS 订阅的条目照常并进候选池、
+        走完同一套硬门槛 + 落库（老路本来就支持 RSS-only 的轮）。"""
         store = Store(tmp_path / "t.db")
         store.migrate()
         with store.tx() as conn:
             conn.execute("INSERT INTO groups (group_id, profile_ready_ts) VALUES (?, ?)", (G1, 1_700_000_000.0))
         rss.add_feed(store, G1, url="https://good.example.com/feed", title="好博客", feed_id="rGood", now=NOW)
-        rss.add_feed(store, G1, url="https://dead.example.com/feed", title="坏死站", feed_id="rDead", now=NOW)
 
-        workers = _FakeWorkers(_worker_report([]))
-        feeds = _make_feeds(store, workers)
+        score = json.dumps({"scores": [{
+            "i": 0, "title": "RSS 好文", "info": 5, "source": 5, "relevance": 5,
+            "timeliness": 5, "chat": 5, "profile": 0, "topic": "RSS", "sensitive": False,
+            "grounded": True, "junk": False, "junk_reason": "", "relation": "unrelated",
+            "same_as_recent": False, "novelty": 5, "surprise": 3, "why": "正好对口", "icon": "newspaper",
+        }]}, ensure_ascii=False)
+        models = FakeModelsQueue(ready=True, replies=[
+            '{"focus": [{"query": "FPGA", "why": "群里在做"}, {"query": "本地大模型", "why": "长期"}, {"query": "掌机", "why": "拓展"}]}',
+            '{"note": "测试不挑"}', score, '{"posts": []}',
+        ])
+        workers = _FakeWorkers(_worker_report([]))  # 撒网一无所获（搜索也空）
+        feeds = _make_feeds(store, workers, models)
         feeds._rss_transport = httpx.MockTransport(_rss_handler)  # 见 feeds.py：_collect_rss 注入点
 
         kept = await feeds.prepare_news(G1)
-        assert kept >= 0
-        # 子 agent brief 里带上了 RSS 条目（优先看这些链接；site 显示源标题）
-        assert workers.calls, "应该派过子 agent"
-        brief = workers.calls[0]["brief"]
-        assert "优先看这些" in brief and "https://ok.example.com/rss1" in brief
-        assert "RSS：好博客" in brief
+        assert kept == 1
+        rows = store.read().execute("SELECT * FROM news_items").fetchall()
+        assert [r["url_key"] for r in rows] == ["ok.example.com/rss1"]
+        assert json.loads(rows[0]["sources"])[0]["site"] == "好博客"
         store.close()
 
     @pytest.mark.asyncio

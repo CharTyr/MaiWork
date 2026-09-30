@@ -35,7 +35,14 @@ from CharTyr_MaiWork.maiwork.config import CONFIG_VERSION, load_settings
 from CharTyr_MaiWork.maiwork.feeds import Feeds, _normalize_domain
 from CharTyr_MaiWork.maiwork.store import Store
 
-from fakes import FakeCtx, FakeModelsQueue, FakeProfiles, focus_reply
+from fakes import (
+    PICK_FALLBACK_REPLY,
+    FakeCtx,
+    FakeModelsQueue,
+    FakeProfiles,
+    focus_reply,
+    two_phase_workers_run,
+)
 
 BJ = timezone(timedelta(hours=8))
 NOW = 1_790_000_000.0
@@ -78,7 +85,11 @@ class _TimePatch:
 
 
 class FakeWorkers:
-    """假的 workers.run：预置一份 WorkerReport 或 Exception，并记录 brief。"""
+    """假的 workers.run：预置一份 WorkerReport 或 Exception，并记录 brief。
+
+    2026-09-30 起两阶段恒生效：feeds-discover: 时把预置的 items 种进撒网登记簿，
+    feeds-verify: 时按 brief 里列出的链接交回，其余 task_id 原样回预置。
+    """
 
     def __init__(self, report: Any = None) -> None:
         self.report = report
@@ -86,9 +97,7 @@ class FakeWorkers:
 
     async def run(self, brief: str, **kwargs: Any) -> Any:
         self.calls.append({"brief": brief, **kwargs})
-        if isinstance(self.report, BaseException):
-            raise self.report
-        return self.report
+        return await two_phase_workers_run(self.report, brief, kwargs)
 
 
 class FakeTopics:
@@ -203,7 +212,8 @@ def _make_feeds(
         if scores is None:
             scores = _scores_json(_score(0, topic="默认话题"))
         reply_list = [scores] if isinstance(scores, str) else list(scores)
-        models = FakeModelsQueue(ready=True, replies=[_FOCUS_JSON, *reply_list])
+        # 两阶段恒生效后定关注点之后多一次「挑」调用：用回落回复占住，不让它吃掉打分回复。
+        models = FakeModelsQueue(ready=True, replies=[_FOCUS_JSON, PICK_FALLBACK_REPLY, *reply_list])
     if workers is None:
         if items is None:
             items = [_cand(0, url="https://example.com/board", title="新开源 FPGA 开发板发布")]
@@ -248,8 +258,11 @@ def _brief(workers: FakeWorkers) -> str:
 
 
 def _score_prompt(models: FakeModelsQueue) -> str:
-    assert len(models.calls) >= 2, "打分模型没被调用"
-    return str(models.calls[1][1][0]["content"])
+    """打分那次的提示词（两阶段后队列里隔着 feeds.pick，不能直接按下标 1 拿）。"""
+    for _role, messages, kwargs in models.calls:
+        if str(kwargs.get("purpose") or "") == "feeds.score":
+            return str(messages[0]["content"])
+    raise AssertionError("打分模型没被调用")
 
 
 # ----------------------------------------------------------------------
@@ -264,8 +277,15 @@ def test_prepare_news_not_ready_returns_0(tmp_path) -> None:
     assert _rows(store) == []
 
 
+def _verify_briefs(workers: FakeWorkers) -> str:
+    """两阶段恒生效后，「怎么打开 / 每条交什么」的规矩都在核验（feeds-verify:）brief 里。"""
+    texts = [str(c["brief"]) for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-verify:")]
+    assert texts, "核验子 agent 没被调用"
+    return "\n".join(texts)
+
+
 def test_brief_asks_news_and_guides_with_fetch_and_paywall(tmp_path) -> None:
-    """brief 要同时让子 agent 找资讯和好文，真打开过 + 引用原文，付费的标出来。"""
+    """核验 brief 要同时认资讯和好文，真打开过 + 引用原文，付费的标出来。"""
     items = [
         _cand(0, title="全新的 FPGA TEST 板卡"),
         _cand(1, kind="guide", url="https://tut.com/aaa-bbb-guide", title="从零开始的部署手册", published=NOW - 30 * 86400),
@@ -276,7 +296,9 @@ def test_brief_asks_news_and_guides_with_fetch_and_paywall(tmp_path) -> None:
     )
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 2
-    brief = _brief(workers)
+    rows = _rows(store)
+    assert {r["kind"] for r in _accepted(rows)} == {"news", "guide"}
+    brief = _verify_briefs(workers)
     assert "文章" in brief  # 2026-09-29 起 brief 里叫「文章」（kind=guide，从严）
     assert "资讯" in brief
     assert "fetch_page" in brief
@@ -286,12 +308,13 @@ def test_brief_asks_news_and_guides_with_fetch_and_paywall(tmp_path) -> None:
 
 
 def test_guides_off_brief_keeps_news_only(tmp_path) -> None:
-    """[feeds] guides = false：brief 不再找好文，只找资讯。"""
+    """[feeds] guides = false：撒网 brief 只找资讯、明说不找文章。"""
     cfg = {"feeds": {"guides": False}}
     store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path, cfg=cfg)
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 1
-    assert "好文" not in _brief(workers)
+    discover_brief = _brief(workers)
+    assert "不找文章" in discover_brief or "只找资讯" in discover_brief
 
 
 # ----------------------------------------------------------------------
@@ -320,11 +343,13 @@ def test_not_fetched_candidates_rejected(tmp_path) -> None:
     assert {r["reject_gate"] for r in hard} == {"hard"}
     for r in hard:
         assert "原文没打开过" in r["reject_reason"]
-    # 打分只招呼到幸存的那 1 条；「有人味」写帖子是第三次模型调用（过第二道门槛的才写）；
-    # 2026-11 起写帖子一回没落着的会补一次重试（本用例队列里没备帖子回复 → 重试也落空回落），所以共 4 次
-    assert len(models.calls) == 4
-    assert models.calls[2][2].get("purpose") == "feeds.post"
-    assert models.calls[3][2].get("purpose") == "feeds.post"
+    # 打分只招呼到幸存的那 1 条；「有人味」写帖子是过第二道门槛才写；
+    # 2026-11 起写帖子一回没落着的会补一次重试（本用例队列里没备帖子回复 → 重试也落空回落）。
+    # 两阶段恒生效后中间多一次「挑」（feeds.pick）：定关注点 → 挑 → 打分 → 写帖子 ×2，共 5 次。
+    assert len(models.calls) == 5
+    assert [c[2].get("purpose") for c in models.calls] == [
+        "feeds.focus", "feeds.pick", "feeds.score", "feeds.post", "feeds.post",
+    ]
     assert "摘要3" in _score_prompt(models)
 
 
@@ -340,11 +365,22 @@ def test_paywall_rejected(tmp_path) -> None:
     assert rows[0]["rejected"] == 1
     assert rows[0]["reject_gate"] == "hard"
     assert "付费" in rows[0]["reject_reason"] or "登录" in rows[0]["reject_reason"]
-    assert len(models.calls) == 1  # 只调了定关注点，没调打分
+    assert len(models.calls) == 2  # 定关注点 + 挑；没调打分
+
+
+def _last_funnel_rejects(store) -> dict:
+    """最新一批（含 skipped）漏斗里的「预筛刷掉的」理由计数；没有漏斗 → {}。"""
+    batch = store.read().execute("SELECT id FROM news_batches ORDER BY id DESC LIMIT 1").fetchone()
+    assert batch is not None, "一批都没跑（连 skipped 都没记）"
+    stats = store.kv_get(f"feeds.batch_stats.{int(batch['id'])}") or {}
+    return dict((stats.get("funnel") or {}).get("rejects") or {})
 
 
 def test_dup_url_rejected_before_scoring(tmp_path) -> None:
-    """规范化后撞最近已出的 URL → 第一道淘汰，理由含「重复」。"""
+    """规范化后撞最近已出的 URL → 淘汰，理由含「重复」。
+
+    两阶段恒生效后这一步在粗筛做：候选直接丢、不进核验也不入库，理由记进漏斗。
+    """
     store, settings, feeds, models, workers, topics, _ = _make_feeds(
         tmp_path,
         items=[_cand(0, url="https://Example.com/board/?utm_source=x", title="板子再度发布")],
@@ -363,15 +399,15 @@ def test_dup_url_rejected_before_scoring(tmp_path) -> None:
                 (int(cur.lastrowid or 0), GID, NOW - 86400),
             )
         assert _run(feeds.prepare_news(GID)) == 0
-    rows = _rows(store, "SELECT * FROM news_items WHERE title='板子再度发布'")
-    assert len(rows) == 1
-    assert rows[0]["rejected"] == 1
-    assert rows[0]["reject_gate"] == "hard"
-    assert "重复" in rows[0]["reject_reason"]
-    assert len(models.calls) == 1  # 没有打分调用
+    # 这条根本没进库（粗筛就丢了），published 那轮一个活口没有 → skipped 批次 + 漏斗记下理由
+    assert _rows(store, "SELECT * FROM news_items WHERE title='板子再度发布'") == []
+    rejects = _last_funnel_rejects(store)
+    assert any("重复" in reason for reason in rejects), rejects
+    assert not any(c[2].get("purpose") == "feeds.score" for c in models.calls)
 
 
 def test_dup_title_rejected(tmp_path) -> None:
+    """标题和最近发过的高度近似 → 粗筛丢（漏斗记理由），不进库、不打分。"""
     store, settings, feeds, models, workers, topics, _ = _make_feeds(
         tmp_path,
         items=[_cand(0, title="小模型本地部署教程", url="https://y.com/1")],
@@ -390,13 +426,14 @@ def test_dup_title_rejected(tmp_path) -> None:
                 (int(cur.lastrowid or 0), GID, NOW - 5 * 86400),
             )
         assert _run(feeds.prepare_news(GID)) == 0  # difflib >= 0.8
-    row = _rows(store, "SELECT * FROM news_items WHERE url_key='y.com/1'")[0]
-    assert row["rejected"] == 1 and row["reject_gate"] == "hard"
-    assert "重复" in row["reject_reason"]
+    assert _rows(store, "SELECT * FROM news_items WHERE url_key='y.com/1'") == []
+    rejects = _last_funnel_rejects(store)
+    assert any("相似" in reason or "重复" in reason for reason in rejects), rejects
+    assert not any(c[2].get("purpose") == "feeds.score" for c in models.calls)
 
 
 def test_blocked_domain_config_rejected(tmp_path) -> None:
-    """[feeds] blocked_domains 命中（含子域 / www.）→ 第一道淘汰。"""
+    """[feeds] blocked_domains 命中（含子域 / www.）→ 粗筛丢（漏斗记理由），不进库。"""
     cfg = {"feeds": {"blocked_domains": ["Spam.com"]}}
     items = [
         _cand(0, url="https://www.spam.com/x", title="配置屏蔽A"),
@@ -411,8 +448,9 @@ def test_blocked_domain_config_rejected(tmp_path) -> None:
         assert _run(feeds.prepare_news(GID)) == 1
     rows = _rows(store)
     assert len(_accepted(rows)) == 1
-    assert "屏蔽" in _rej_reason(rows, "www.spam.com")
-    assert "屏蔽" in _rej_reason(rows, "m.spam.com")
+    assert "spam.com" not in "\n".join(str(r["url_key"]) for r in rows)
+    rejects = _last_funnel_rejects(store)
+    assert rejects.get("来源在屏蔽名单里", 0) == 2, rejects
 
 
 def test_blocked_domain_web_rejected(tmp_path) -> None:
@@ -426,12 +464,13 @@ def test_blocked_domain_web_rejected(tmp_path) -> None:
         store.kv_set(conn, "feeds.blocked_domains", ["bad-web.com"])
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 0
-    row = _rows(store)[0]
-    assert row["rejected"] == 1 and "屏蔽" in row["reject_reason"]
+    assert _rows(store) == []  # 粗筛丢完，连被拒行都不落库
+    rejects = _last_funnel_rejects(store)
+    assert any("屏蔽" in reason for reason in rejects), rejects
 
 
 def test_auto_blocked_domain_rejected(tmp_path) -> None:
-    """某域名被标「没用」净值（down-up）累计 >= 3 → 自动屏蔽。"""
+    """某域名被标「没用」净值（down-up）累计 >= 3 → 自动屏蔽（粗筛丢、漏斗记理由）。"""
     store, settings, feeds, models, workers, topics, _ = _make_feeds(
         tmp_path,
         items=[_cand(0, url="https://noisy.com/a", title="自动屏蔽")],
@@ -457,9 +496,9 @@ def test_auto_blocked_domain_rejected(tmp_path) -> None:
     assert feeds._auto_blocked_domains(GID) == ["noisy.com"]
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 0
-    row = _rows(store, "SELECT * FROM news_items WHERE title='自动屏蔽'")[0]
-    assert row["rejected"] == 1
-    assert "没用太多次" in row["reject_reason"]
+    assert _rows(store, "SELECT * FROM news_items WHERE title='自动屏蔽'") == []
+    rejects = _last_funnel_rejects(store)
+    assert any("没用太多次" in reason for reason in rejects), rejects
 
 
 def test_grounded_false_rejected(tmp_path) -> None:
@@ -716,14 +755,16 @@ def test_pool_gate_requires_high_scores_and_fresh_news(tmp_path) -> None:
         _cand(5, title="没时间", url="https://pf.com/6", published=""),
         _cand(6, title="敏感高分", url="https://pg.com/7", published=NOW - 3600),
     ]
+    # 粗筛排序把「7 天内有发布日期的」放前面、没法判断日期的放最后，所以打分看到的
+    # 顺序里「没时间」排在「敏感高分」后面——i=5 是敏感高分、i=6 是没时间。
     scores = _scores_json(
         _score(0, info=5, topic="p0"),                                          # avg 4.4，全过 → 进池
         _score(1, info=4, source=4, relevance=4, timeliness=4, chat=4, topic="p1"),   # avg 4.0 → 进池
         _score(2, info=5, source=5, relevance=3, timeliness=5, chat=5, topic="p2"),   # relevance 3 → 不进
         _score(3, info=5, source=5, relevance=5, timeliness=5, chat=2, topic="p3"),   # chat 2 → 不进
         _score(4, info=5, topic="p4"),                                          # 超过 48 小时 → 不进
-        _score(5, info=5, topic="p5"),                                          # 没 published → 不进
-        _score(6, info=5, topic="p6", sensitive=True),                          # 敏感 → 不进
+        _score(5, info=5, topic="p5", sensitive=True),                          # 敏感高分：敏感 → 不进
+        _score(6, info=5, topic="p6"),                                          # 没时间：没 published → 不进
     )
     store, settings, feeds, models, workers, topics, _ = _make_feeds(
         tmp_path, items=items, scores=scores

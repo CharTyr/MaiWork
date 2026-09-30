@@ -31,7 +31,14 @@ from CharTyr_MaiWork.maiwork.config import load_settings
 from CharTyr_MaiWork.maiwork.feeds import Feeds, _normalize_url
 from CharTyr_MaiWork.maiwork.store import Store
 
-from fakes import FakeModelsQueue, FakeProfiles, focus_reply
+from fakes import (
+    PICK_FALLBACK_REPLY,
+    FakeModelsQueue,
+    FakeProfiles,
+    ensure_pick_fallback,
+    focus_reply,
+    two_phase_workers_run,
+)
 
 BJ = timezone(timedelta(hours=8))
 NOW = 1_790_000_000.0  # 测试里的「现在」
@@ -77,7 +84,10 @@ class UnavailableSearch:
 
 
 class FakeWorkers:
-    """假的 workers.run：预置一份 WorkerReport 或 Exception，并记录 brief。"""
+    """假的 workers.run：预置一份 WorkerReport 或 Exception，并记录 brief。
+
+    两阶段恒生效：feeds-discover 把预置 items 种进撒网登记簿、feeds-verify 按 brief 链接交回。
+    """
 
     def __init__(self, report: Any = None) -> None:
         self.report = report
@@ -85,9 +95,7 @@ class FakeWorkers:
 
     async def run(self, brief: str, **kwargs: Any) -> Any:
         self.calls.append({"brief": brief, **kwargs})
-        if isinstance(self.report, BaseException):
-            raise self.report
-        return self.report
+        return await two_phase_workers_run(self.report, brief, kwargs)
 
 
 def _ok_report(data: dict) -> Any:
@@ -170,6 +178,7 @@ def _make_feeds(
     settings = _settings(cfg)
     if models is None:
         models = FakeModelsQueue(ready=True)
+    ensure_pick_fallback(models)
     if workers is None:
         workers = FakeWorkers(_ok_report(_WORKER_ITEMS))
     if topics is None:
@@ -386,7 +395,8 @@ def test_prepare_news_worker_returns_no_items_marks_skipped(tmp_path) -> None:
         assert _run(feeds.prepare_news(GID)) == 0
         row = store.read().execute("SELECT * FROM news_batches").fetchone()
         assert row["skipped"] == 1
-        assert "没找到" in row["note"] or "没有" in row["note"]
+        # 两阶段恒生效：撒网 OK 但一条都没搜出 → 「撒网没搜出能用的候选」
+        assert "撒网" in row["note"] or "没找到" in row["note"] or "没有" in row["note"]
 
     # items 不是列表也算失败
     store2 = Store(tmp_path / "t2.db")
@@ -441,16 +451,25 @@ def test_prepare_news_dedup_url_and_title(tmp_path) -> None:
             "SELECT * FROM news_batches ORDER BY id DESC LIMIT 1"
         ).fetchone()
         assert batch["skipped"] == 1
+        # 两阶段恒生效：撞存量 URL 的候选在撒网登记簿之后的预筛就丢了（只记漏斗理由）；
+        # 标题近似的过了预筛（0.85）但被第一道（0.8）拦下入库行；分不过的在打分后入库。
         rows = store.read().execute(
             "SELECT * FROM news_items WHERE batch_id=?", (batch["id"],)
         ).fetchall()
-        assert len(rows) == 3  # 被筛掉的也入库
+        assert len(rows) == 2, [dict(r) for r in rows]
         assert all(r["rejected"] == 1 for r in rows)
-        gates = [r["reject_gate"] for r in rows]
-        assert gates.count("hard") == 2  # URL / 标题重复都在第一道
-        assert gates.count("web") == 1   # 分数不过的在第二道
-        hard_reasons = [r["reject_reason"] for r in rows if r["reject_gate"] == "hard"]
-        assert all("重复" in reason for reason in hard_reasons)
+        gates = sorted(r["reject_gate"] for r in rows)
+        assert gates == ["hard", "web"]
+        hard = next(r for r in rows if r["reject_gate"] == "hard")
+        assert "重复" in hard["reject_reason"]
+        # 撞存量链接的那条连打分都没到 → 只在漏斗里
+        stats = store.kv_get(f"feeds.batch_stats.{batch['id']}") or {}
+        rejects = (stats.get("funnel") or {}).get("rejects") or {}
+        assert any("重复" in k for k in rejects), f"漏斗应见撞链接的理由：{rejects}"
+        # 撞存量链接的那条根本没进分数映射：分数字典里找不到它的标题
+        assert all(
+            "新开源 FPGA 开发板发布" not in str(r["scores"]) for r in rows
+        )
 
 
 def test_prepare_news_dedup_other_group_not_affected(tmp_path) -> None:
@@ -496,11 +515,15 @@ def test_prepare_news_dedup_within_batch(tmp_path) -> None:
         rows = store.read().execute("SELECT title, rejected, reject_gate, reject_reason FROM news_items ORDER BY id").fetchall()
         accepted = [r["title"] for r in rows if not r["rejected"]]
         assert sorted(accepted) == ["另一件事", "板子发布新闻稿"]
-        dropped = [r for r in rows if r["rejected"]]
-        assert len(dropped) == 1
-        assert dropped[0]["title"] == "板子上手体验"
-        assert dropped[0]["reject_gate"] == "hard"
-        assert "重复" in dropped[0]["reject_reason"]
+        # 两阶段恒生效：批内撞 url 的先撞在撒网登记簿（同 url_key 只留先见的），
+        # 根本不变成候选 —— 不落 news_items，漏斗的 discovered 也只有 2 条。
+        assert all(not r["rejected"] for r in rows)
+        batch = store.read().execute(
+            "SELECT * FROM news_batches ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        stats = store.kv_get(f"feeds.batch_stats.{batch['id']}") or {}
+        funnel = stats.get("funnel") or {}
+        assert int(funnel.get("discovered") or 0) == 2, f"登记簿该去重：{funnel}"
 
 
 def test_prepare_news_scoring_missing_index_dropped(tmp_path) -> None:

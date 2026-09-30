@@ -45,7 +45,13 @@ function pausedBlock(t) {
     r.kind === "tokens"
       ? `这个任务的用量到了上限（用了约 ${wan(r.used)} token，上限 ${wan(r.limit)}），先自动停下，等你决定。`
       : `这个任务已经做了 ${dur(r.used)}，到了时长上限（${dur(r.limit)}），先自动停下，等你决定。`;
-  const tail = gadmin() ? "想接着做就点「继续」，用量和时长从那一刻重新算；不想做了就「取消」。上限在「设置 → 全部配置 → 任务安全网」里改。" : "管理员决定要不要接着做。";
+  // 群管理员进不了设置页：上限在哪改只告诉总管理员
+  const act = "想接着做就点「继续」，用量和时长从那一刻重新算；不想做了就「取消」。";
+  const tail = admin()
+    ? act + "上限在「设置 → 全部配置 → 任务安全网」里改。"
+    : gadmin()
+      ? act + "上限由总管理员设。"
+      : "管理员决定要不要接着做。";
   return `<div class="dt-sec"><div class="dt-label">为什么停了</div><div class="dt-text">${esc(text)}${esc(tail)}</div></div>`;
 }
 

@@ -33,7 +33,7 @@ export const SET_SUBS = [
   ["identity", "身份", "lotus", "性格、规矩和记忆"],
   ["models", "模型", "robot", "用哪些模型"],
   ["extensions", "扩展", "tools", "联网搜索、MCP 和 skill"],
-  ["agents", "专岗", "robot", "职责、各群经验和工作交接"],
+  ["agents", "专岗", "fish", "职责、各群经验和工作交接"],
   ["usage", "用量", "chart", "每天用了多少"],
   ["sources", "资讯来源", "newspaper", "RSS、优质来源和屏蔽的"],
   ["links", "群链接", "link", "群友看到的专属链接"],
