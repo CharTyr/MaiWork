@@ -117,7 +117,7 @@ for (const sp of Object.keys(FISH_SPECIES)) {
   let hMax = 0, tMax = 0, fast = 0, slow = 1e9;
   for (let t = 0; t < 12; t += 0.05) {
     const p = swimPose(g, t), nums = p.d.match(/-?[\d.]+/g).map(Number);
-    if (nums.some((v) => !Number.isFinite(v)) || /NaN/.test(p.body + p.head + p.shadow)) { bend.ok = false; bend.bad.push(sp + ":坏数字"); break; }
+    if (nums.some((v) => !Number.isFinite(v)) || /NaN/.test(p.body + p.head)) { bend.ok = false; bend.bad.push(sp + ":坏数字"); break; }
     const pt = (i) => i === 0 ? [nums[0], nums[1]] : [nums[2 + (i - 1) * 6 + 4], nums[2 + (i - 1) * 6 + 5]];
     const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
     hMax = Math.max(hMax, dist(pt(head), g.pts[head])); tMax = Math.max(tMax, dist(pt(tail), g.pts[tail]));
@@ -125,7 +125,7 @@ for (const sp of Object.keys(FISH_SPECIES)) {
   if (!(tMax > 4 * hMax && tMax > 1.5)) { bend.ok = false; bend.bad.push(`${sp}:头${hMax.toFixed(2)} 尾${tMax.toFixed(2)}`); }
 }
 const g0 = swimOf("agent:news:");
-const out = { swim: !!g0 && !fishSvg("a", { still: true }).includes("fish-swim") && !/<rect/.test(fishSvg("a"))
+const out = { swim: !!g0 && !fishSvg("a", { still: true }).includes("fish-swim") && !/<rect|<ellipse class="fish-shadow"/.test(fishSvg("a"))
     && swimPose(g0, 3.3).d === swimPose(g0, 3.3).d && swimPose(g0, 3.3).d !== swimPose(g0, 3.5).d,
   bend,
   same: fishSvg("agent:news:") === fishSvg("agent:news:"), differ: 0, bad: [], species: new Set(), eyes: new Set() };
@@ -161,7 +161,7 @@ def test_fish_generator_is_deterministic_and_well_formed(tmp_path):
     assert res.returncode == 0, res.stderr
     data = json.loads(res.stdout.strip().splitlines()[-1])
     assert data["same"], "同一个种子两次画出来不一样"
-    assert data["swim"], "小鱼要默认会游（姿态随时间变、同一时刻固定、still 可关），而且透明底不画底框"
+    assert data["swim"], "小鱼要默认会游（姿态随时间变、同一时刻固定、still 可关），而且透明底、不画底框、不带影子（用户 2026-09-30 去掉了影子）"
     assert data["bend"]["ok"], f"游动要像真鱼：鱼头几乎不动、尾巴摆得最大：{data['bend']['bad']}"
     assert data["differ"] >= 390, f"换种子几乎没变化：{data['differ']}/400"
     assert not data["bad"], f"这些种子画出了坏图：{data['bad'][:10]}"

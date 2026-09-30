@@ -1,5 +1,5 @@
 // MaiWork 网页 · 程序生成的小鱼头像。
-// 同一个种子永远画出同一条鱼：一整块圆润纯色 + 一对白色眼睛 + 很淡的影子，透明底，默认像真鱼一样游（见文件末尾）。
+// 同一个种子永远画出同一条鱼：一整块圆润纯色 + 一对白色眼睛，透明底、不带影子，默认像真鱼一样游（见文件末尾）。
 // 做法：按鱼种在轮廓上撒点（身体、尾巴、鳍），各点随机偏一点，再用平滑曲线连成一圈。
 
 export const FISH_COLORS = [
@@ -216,12 +216,12 @@ export function fishSvg(seed, opts = {}) {
   pts = pts.map(rt); eye = rt(eye);
   if (lure) lure = { root: rt(lure.root), tip: rt(lure.tip) };
 
-  // 缩放进 100×100 的画布，底下留出影子的位置
+  // 缩放进 100×100 的画布，居中
   const all = lure ? [...pts, [lure.tip[0] + 5, lure.tip[1] - 5], [lure.tip[0] - 5, lure.tip[1] + 5]] : pts;
   const xs = all.map((p) => p[0]), ys = all.map((p) => p[1]);
   const minx = Math.min(...xs), maxx = Math.max(...xs), miny = Math.min(...ys), maxy = Math.max(...ys);
   const sc = Math.min(84 / (maxx - minx), 76 / (maxy - miny));
-  const tx = 50 - ((minx + maxx) / 2) * sc, ty = 45 - ((miny + maxy) / 2) * sc;
+  const tx = 50 - ((minx + maxx) / 2) * sc, ty = 50 - ((miny + maxy) / 2) * sc;
   const T = (p) => [p[0] * sc + tx, p[1] * sc + ty];
   pts = pts.map(T);
 
@@ -238,8 +238,6 @@ export function fishSvg(seed, opts = {}) {
   const e2 = [ex - gap * cr, ey - gap * sr];
   const eyesSvg = place(ex, ey, drawn[0]) + place(e2[0], e2[1], drawn[1]);
 
-  const shadowW = ((maxx - minx) * sc) * 0.36;
-  const shadowY = Math.min(94, (maxy * sc + ty) + 7);
   const size = opts.size || 64;
   let lureSvg = "";
   if (lure) {
@@ -256,13 +254,12 @@ export function fishSvg(seed, opts = {}) {
   const M = rng(`${seed}#swim`);   // 节奏另用一串随机数，不影响鱼身；每条鱼快慢、起步不同
   const geom = {
     pts, ts: ss.map((s) => (sHead - s) / span), n: nrm, eyeT: (sHead - along([ex, ey])) / span,
-    style: SWIM[species] || SWIM.classic, cx: 50, cy: 45, shadowY,
+    style: SWIM[species] || SWIM.classic, cx: 50, cy: 50,
     beat: 0.9 + M() * 0.35, bob: 2.8 + M() * 1.4, surge: 5.5 + M() * 3, lag: M() * 20,
   };
   const id = opts.still ? 0 : registerSwim(`${seed}|${opts.species || ""}|${opts.eyes || ""}`, geom);
   if (id) startSwimLoop();
   return `<svg class="fish${id ? " fish-swim" : ""}"${id ? ` data-fish-id="${id}"` : ""} viewBox="0 0 100 100" width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg" role="img" aria-hidden="${opts.title ? "false" : "true"}">${label}`
-    + `<ellipse class="fish-shadow" cx="50" cy="${f(shadowY)}" rx="${f(shadowW)}" ry="3.2" fill="#1d2433" opacity="0.08"/>`
     + `<g class="fish-bob">`
     + (lureSvg ? `<g class="fish-head">${lureSvg}</g>` : "")
     + `<path class="fish-body" d="${smoothPath(pts)}" fill="${color}"/>`
@@ -272,7 +269,7 @@ export function fishSvg(seed, opts = {}) {
 
 // ---------------------------------------------------------------------------
 // 游动：不是整块晃，而是像真鱼一样——一道波从头传到尾，鱼头几乎不动、越往尾巴摆得越大；
-// 时快时慢（摆几下、再滑行一会儿），游快时尾巴摆得更大；身体随上浮下沉微微抬头低头，影子跟着一缩一放。
+// 时快时慢（摆几下、再滑行一会儿），游快时尾巴摆得更大；身体随上浮下沉微微抬头低头。
 // 不同鱼种游法不同：长条鳗整条身子扭，箱鲀、河豚、翻车鱼只有尾巴扑腾。
 // amp 尾巴摆幅（画布单位）、pow 摆幅从头到尾的增长曲线、waves 身上同时有几成波、hz 每秒摆几次。
 const SWIM = {
@@ -308,13 +305,10 @@ export function swimPose(g, time) {
   // 上浮下沉 + 抬头低头（上浮时鼻尖微微朝上），用力游时往前送一点
   const b = (TAU * t) / g.bob;
   const y = 1.8 * Math.sin(b), pitch = 2.2 * Math.cos(b), x = 0.9 * (effort - 0.5);
-  const sx = 1 + 0.08 * Math.sin(b);                    // 鱼浮高（y 变小）时影子变小变淡
   return {
     d: smoothPath(pts, 2),
     head: `translate(${(g.n[0] * hw).toFixed(2)} ${(g.n[1] * hw).toFixed(2)})`,
     body: `translate(${x.toFixed(2)} ${y.toFixed(2)}) rotate(${pitch.toFixed(2)} ${g.cx} ${g.cy})`,
-    shadow: `translate(50 ${g.shadowY.toFixed(1)}) scale(${sx.toFixed(3)} 1) translate(-50 ${(-g.shadowY).toFixed(1)})`,
-    shadowOpacity: (0.08 + 0.025 * Math.sin(b)).toFixed(3),
   };
 }
 
@@ -342,7 +336,7 @@ function startSwimLoop() {
       lastScan = now;
       items = [...document.querySelectorAll("svg.fish-swim[data-fish-id]")].map((el) => ({
         g: swimGeom(el.dataset.fishId), body: el.querySelector(".fish-body"), bob: el.querySelector(".fish-bob"),
-        heads: [...el.querySelectorAll(".fish-head")], shadow: el.querySelector(".fish-shadow"),
+        heads: [...el.querySelectorAll(".fish-head")],
       })).filter((x) => x.g && x.body);
       empty = items.length ? 0 : empty + 1;
       if (empty > 5) { swimOn = false; return; }
@@ -353,7 +347,6 @@ function startSwimLoop() {
       x.body.setAttribute("d", p.d);
       x.bob && x.bob.setAttribute("transform", p.body);
       for (const h of x.heads) h.setAttribute("transform", p.head);
-      if (x.shadow) { x.shadow.setAttribute("transform", p.shadow); x.shadow.setAttribute("opacity", p.shadowOpacity); }
     }
     requestAnimationFrame(tick);
   };
