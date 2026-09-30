@@ -69,7 +69,7 @@ class ModelsQueue:
 
         return _S()
 
-    async def chat(self, role, messages, **kwargs):
+    async def chat(self, role=None, messages=None, **kwargs):
         # 深拷贝 messages 快照
         snap = [dict(m) for m in messages]
         self.calls.append((role, snap, kwargs))
@@ -705,7 +705,7 @@ async def test_review_inspect_calls_logged(
     models = ModelsQueue(replies=[_plan()])
     # 第一次验收返回带 tool_call；之后主模型再发一条结论
     class _MixedModels(ModelsQueue):
-        async def chat(self, role, messages, **kwargs):
+        async def chat(self, role=None, messages=None, **kwargs):
             # 记录
             self.calls.append((role, [dict(m) for m in messages], kwargs))
             n = len(self.calls)
@@ -791,7 +791,7 @@ async def test_late_plan_failure_after_stop_does_not_report_to_group(
     tid = _create_task(tasks)
 
     class _LateFailure(ModelsQueue):
-        async def chat(self, role, messages, **kwargs):
+        async def chat(self, role=None, messages=None, **kwargs):
             tasks.transition(tid, state, reason="管理员已停止")
             raise ModelError("晚到的模型异常")
 

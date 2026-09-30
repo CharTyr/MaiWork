@@ -326,7 +326,7 @@ class NewsViz:
         lines += ["", '只回 JSON：{"pick": 编号（都不适合就 -1）, "why": "一句话理由"}']
         try:
             res = await self._models.chat(
-                "main", [{"role": "user", "content": "\n".join(lines)}],
+                agent="news", messages=[{"role": "user", "content": "\n".join(lines)}],
                 json_mode=True, purpose="news_viz.pick", group_id=gid,
             )
             data = json.loads(str(getattr(res, "text", "") or ""))

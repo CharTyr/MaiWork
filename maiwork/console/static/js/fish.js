@@ -7,6 +7,12 @@ export const FISH_COLORS = [
   "#3F7CF2", "#1FA3F5", "#F2609A", "#F2B92B", "#9BC63B", "#FF8A70",
   "#5A5FD6", "#2FC4B2", "#B98150", "#B18CF5", "#E84B5A", "#4BA3C7",
 ];
+// 颜色的中文名（定制时读屏 / 提示用），和上面一一对应
+export const FISH_COLOR_NAMES = [
+  "草绿", "橙", "橘红", "紫", "灰", "青绿",
+  "蓝", "天蓝", "粉", "金黄", "黄绿", "珊瑚",
+  "靛蓝", "碧绿", "棕", "淡紫", "红", "湖蓝",
+];
 
 // 字符串 → 32 位整数（cyrb53 的简化版），再喂给 mulberry32 做可复现的随机数。
 function hashSeed(str) {
@@ -187,18 +193,39 @@ function eyeTraits(seed, opts = {}) {
   return { eyes, E };
 }
 
-// 种子 → 鱼的特征（种类、颜色等），不画图。opts.species 可以指定鱼种（预览用）。
+// 定制的鱼（管理员在设置 → 专岗里挑的）：种子末尾是 c-<鱼种>-<颜色序号>-<眼神>-<底子>，
+// 例如 agent:news:c-shark-3-dots-ab12。底子决定鳍的大小、歪头这些细节；
+// 鱼身的随机数只看「前缀 + 底子」，所以只换颜色 / 眼神时鱼的样子不变。
+const CUSTOM_RE = /(^|:)c-([a-z]+)-(\d{1,2})-([a-z]+)-([A-Za-z0-9_]{0,10})$/;
+export const FISH_BASE_RE = /^[A-Za-z0-9_]{0,10}$/;
+export function parseCustom(seed) {
+  const s = String(seed == null ? "" : seed);
+  const m = s.match(CUSTOM_RE);
+  if (!m || !SPECIES[m[2]] || !EYES[m[4]] || Number(m[3]) >= FISH_COLORS.length) return null;
+  return { species: m[2], color: Number(m[3]), eyes: m[4], base: m[5], baseSeed: s.slice(0, m.index + m[1].length) + m[5] };
+}
+export const customSeed = ({ species, color, eyes, base = "" }) => `c-${species}-${Number(color) || 0}-${eyes}-${base}`;
+
+// 种子 → 鱼的特征（种类、颜色等），不画图。opts.species / opts.eyes 可以指定（预览用）。
 export function fishTraits(seed, opts = {}) {
-  const R = rng(seed);
+  const c = parseCustom(seed);
+  const base = c ? c.baseSeed : seed;
+  const R = rng(base);
   const keys = Object.keys(SPECIES);
-  const species = opts.species && SPECIES[opts.species] ? opts.species : keys[Math.floor(R() * keys.length)];
-  const color = FISH_COLORS[Math.floor(R() * FISH_COLORS.length)];
-  const { eyes } = eyeTraits(seed, opts);
-  return { species, name: SPECIES[species].name, color, eyes, eyeName: EYES[eyes].name, R };
+  let species;
+  if (c) { R(); species = c.species; }   // 照样抽一次，和没定制时同一串随机数，原样保存不变样
+  else species = opts.species && SPECIES[opts.species] ? opts.species : keys[Math.floor(R() * keys.length)];
+  if (c && opts.species && SPECIES[opts.species]) species = opts.species;
+  let color = FISH_COLORS[Math.floor(R() * FISH_COLORS.length)];
+  if (c) color = FISH_COLORS[c.color];
+  const { eyes } = eyeTraits(base, c && !opts.eyes ? { ...opts, eyes: c.eyes } : opts);
+  return { species, name: SPECIES[species].name, color, eyes, eyeName: EYES[eyes].name, R, base, custom: !!c };
 }
 
 export function fishSvg(seed, opts = {}) {
-  const { species, color, R } = fishTraits(seed, opts);
+  const { species, color, R, base, custom } = fishTraits(seed, opts);
+  const c = custom ? parseCustom(seed) : null;
+  const eyeOpts = c && !opts.eyes ? { ...opts, eyes: c.eyes } : opts;
   const u = (lo, hi) => lo + (hi - lo) * R();
   const ok = (p) => R() < p;
   const spec = SPECIES[species].make(u, ok);
@@ -228,7 +255,7 @@ export function fishSvg(seed, opts = {}) {
   // 眼睛：白色、大小固定（不随鱼身缩放），像同一家族；神态另用一串随机数，换眼神不影响鱼身
   const f = (v) => v.toFixed(1);
   const [ex, ey] = T(eye);
-  const { eyes: eyeStyle, E } = eyeTraits(seed, opts);
+  const { eyes: eyeStyle, E } = eyeTraits(base, eyeOpts);
   const ev = (lo, hi) => lo + (hi - lo) * E();
   const gap = ev(9, 11.5) * (eyeStyle === "dots" || eyeStyle === "beads" ? 0.95 : 1);
   const one = EYES[eyeStyle].draw(ev);
@@ -251,7 +278,7 @@ export function fishSvg(seed, opts = {}) {
   const ax = [cr, sr], nrm = [-sr, cr];
   const along = (p) => p[0] * ax[0] + p[1] * ax[1];
   const ss = pts.map(along), sHead = Math.max(...ss), sTail = Math.min(...ss), span = sHead - sTail || 1;
-  const M = rng(`${seed}#swim`);   // 节奏另用一串随机数，不影响鱼身；每条鱼快慢、起步不同
+  const M = rng(`${base}#swim`);   // 节奏另用一串随机数，不影响鱼身；每条鱼快慢、起步不同
   const geom = {
     pts, ts: ss.map((s) => (sHead - s) / span), n: nrm, eyeT: (sHead - along([ex, ey])) / span,
     style: SWIM[species] || SWIM.classic, cx: 50, cy: 50,

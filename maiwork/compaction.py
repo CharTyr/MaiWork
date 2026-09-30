@@ -320,12 +320,14 @@ async def summarize_messages(
     *,
     models: Any,
     role: str,
+    agent: str | None = None,
     purpose: str,
     group_id: str = "",
     task_id: str = "",
 ) -> str:
     """公开版：把一段 OpenAI messages 总结成 8 节中文摘要文本（失败抛 ModelError）。"""
-    return await _summarize_piece(piece, models=models, role=role, purpose=purpose, group_id=group_id, task_id=task_id)
+    return await _summarize_piece(piece, models=models, role=role, agent=agent, purpose=purpose,
+                                  group_id=group_id, task_id=task_id)
 
 
 async def _summarize_piece(
@@ -333,11 +335,16 @@ async def _summarize_piece(
     *,
     models: Any,
     role: str,
+    agent: str | None = None,
     purpose: str,
     group_id: str = "",
     task_id: str = "",
 ) -> str:
-    """调模型总结一段对话；返回 8 节格式的中文摘要文本。失败抛 ModelError。"""
+    """调模型总结一段对话；返回 8 节格式的中文摘要文本。失败抛 ModelError。
+
+    role 只是后兼容口（没传 agent 时 models.chat 自己映射 main⇒main / worker⇒task）；
+    1b 起各调用方经 compaction 的 role= 照旧传，真正的岗位有专门的 agent 时走 agent 参数。
+    """
     body = _serialize_cut(piece)
     prompt = (
         "把下面这段模型和工具的对话压成一份「站用摘要」，之后新看这段摘要的人 / 模型\n"
@@ -349,6 +356,7 @@ async def _summarize_piece(
     result = await models.chat(
         role,
         [{"role": "user", "content": prompt}],
+        agent=agent,
         purpose=f"{purpose or 'chat'}:compact" if not str(purpose or "").endswith(":compact") else str(purpose),
         group_id=str(group_id or ""),
         task_id=str(task_id or ""),
@@ -361,6 +369,7 @@ async def maybe_compact(
     *,
     models: Any,
     role: str,
+    agent: str | None = None,
     context_window: int,
     output_reserve: int | None = None,
     purpose: str = "",
@@ -393,7 +402,7 @@ async def maybe_compact(
         return stage1
     try:
         summary_text = await _summarize_piece(
-            cut, models=models, role=role, purpose=purpose,
+            cut, models=models, role=role, agent=agent, purpose=purpose,
             group_id=group_id, task_id=task_id,
         )
     except ModelError as e:
@@ -454,17 +463,19 @@ async def chat_with_retry_on_long_context(
     *,
     models: Any,
     role: str,
+    agent: str | None = None,
     purpose: str = "",
     on_trim: Any = None,
     **chat_kwargs: Any,
 ) -> Any:
     """调一次 models.chat；撞上「上下文超长」类错误把最旧一段裁掉一次再重试一次。
 
+    agent 传给 models.chat 的岗位 kind（比如专岗回合的 news）；没给就照 role 的旧映射。
     其他错误（包括非上下文类的 4xx）原样抛出。返回成功的结果。
     on_trim: 可选同步回调（messages -> None），裁剪发生时通知调用方（日志 / 时间线）。
     """
     try:
-        return await models.chat(role, messages, purpose=purpose, **chat_kwargs)
+        return await models.chat(role, messages, agent=agent, purpose=purpose, **chat_kwargs)
     except ModelError as e:
         if not looks_like_context_length(e.message if hasattr(e, "message") else str(e)):
             raise
@@ -476,7 +487,7 @@ async def chat_with_retry_on_long_context(
                 on_trim(trimmed)
         except Exception:
             logger.exception("on_trim 回调出错")
-        return await models.chat(role, trimmed, purpose=purpose, **chat_kwargs)
+        return await models.chat(role, trimmed, agent=agent, purpose=purpose, **chat_kwargs)
 
 
 # ---------------------------------------------------------------------------

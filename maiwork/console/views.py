@@ -695,7 +695,7 @@ def _upcoming(svc: Any, group_id: str, row: dict[str, Any], now: float) -> list[
     return out
 
 
-_AGENT_FISH_KINDS: tuple[str, ...] = ("news", "idea", "goal", "task")
+_AGENT_FISH_KINDS: tuple[str, ...] = ("main", "news", "idea", "goal", "task")  # 1b：主模型的小鱼也进群视图
 
 
 def _agent_fish(svc: Any) -> dict[str, str]:
@@ -712,6 +712,8 @@ def _agent_fish(svc: Any) -> dict[str, str]:
             if not isinstance(p, dict):
                 continue
             kind = str(p.get("kind") or "")
+            if kind not in out:  # 只带已知岗位（main + 4 个执行岗；自定义岗 1b+ 再议）
+                continue
             seed = p.get("fish_seed")
             out[kind] = seed if isinstance(seed, str) else ""
         return out

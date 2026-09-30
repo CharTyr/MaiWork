@@ -97,13 +97,18 @@ class TestWebSearch:
 
     @pytest.mark.asyncio
     async def test_news_collect_defaults_days_to_7(self, store, settings):
-        """找资讯的子 agent（task_id 以 feeds-collect: / feeds-discover: 开头）没填 days → 程序补 7 天。"""
-        for mark in ("feeds-collect:1:2:3", "feeds-discover:1:2:3"):
-            search = FakeSearch([])
-            tools = _make(store, settings, search=search)
-            r = await tools.call("web_search", {"query": "x"}, _ctx(task_id=mark))
-            assert r.ok
-            assert search.calls[0][2] == 7, mark
+        """老路找资讯子 agent（task_id 以 feeds-collect: 开头）没填 days → 程序补 7 天；
+        feeds-discover: 已退役（撒网改代码按计划搜）不再享受默认 7 天。"""
+        search = FakeSearch([])
+        tools = _make(store, settings, search=search)
+        r = await tools.call("web_search", {"query": "x"}, _ctx(task_id="feeds-collect:1:2:3"))
+        assert r.ok
+        assert search.calls[0][2] == 7
+        search2 = FakeSearch([])
+        tools2 = _make(store, settings, search=search2)
+        r2 = await tools2.call("web_search", {"query": "x"}, _ctx(task_id="feeds-discover:1:2:3"))
+        assert r2.ok
+        assert search2.calls[0][2] is None
 
     @pytest.mark.asyncio
     async def test_news_collect_keeps_explicit_days(self, store, settings):

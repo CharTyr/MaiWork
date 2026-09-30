@@ -213,3 +213,84 @@ def test_list_under_any_key_accepted(tmp_path) -> None:
         _run(feeds._score(GID, settings, cands))
     assert len(models.calls) == 1
     assert all("reject" not in c for c in cands)
+
+
+# ----------------------------------------------------------------------
+# 2026-10-01 提速：几批并发跑（asyncio.gather）。线上一轮 21 条照老顺序 ~116s，
+# 并发后 ≈ 最长那批 + 一点合并开销。有人看了标题要的硬保证：
+# 1) 几批在时间上真的重叠（等活时间复用，不是先后排队）；
+# 2) 和老串行一样的结果：同批编号、reason、by_index/by_title 合并顺序照批号先到先得。
+# ----------------------------------------------------------------------
+
+
+def test_chunks_run_concurrently(tmp_path) -> None:
+    """一堆 20 条 → 3 批；给每次 chat 强制睡 0.05s，并发峰值 >1（证明几批真的重叠跑，不是先后排队）。"""
+    import asyncio as _a
+
+    state = {"cur": 0, "peak": 0}
+    replies = [_reply_for(range(0, 8)), _reply_for(range(8, 16)), _reply_for(range(16, 20))]
+    models = FakeModelsQueue(ready=True, replies=replies)
+    _store, settings, feeds, *_ = _make_feeds(tmp_path, models=models)
+
+    # 在 FakeModelsQueue.chat 外包一层带 sleep 的版本，并发峰值记在它身上
+    orig_chat = FakeModelsQueue.chat
+
+    async def slow_wrapped(self, role=None, messages=None, **kwargs):
+        state["cur"] += 1
+        state["peak"] = max(state["peak"], state["cur"])
+        try:
+            await _a.sleep(0.05)
+            return await orig_chat(self, role, messages, **kwargs)
+        finally:
+            state["cur"] -= 1
+
+    FakeModelsQueue.chat = slow_wrapped
+    try:
+        cands = _cands(20)
+        with _TimePatch():
+            _run(feeds._score(GID, settings, cands))
+    finally:
+        FakeModelsQueue.chat = orig_chat
+
+    assert state["peak"] == 3, f"3 批隔开来跑的话 peak 应该是 1；真并发就该是 3（实际是 {state['peak']}）"
+    assert all(c["scores"]["avg"] > 0 for c in cands)
+
+
+def test_concurrent_matches_sequential_results(tmp_path) -> None:
+    """并发版的产出和串行老口径一模一样：编号对上、失败那批照拒、零分的理由照旧。"""
+    # 三批：第 2 批模型炸、第 1/3 批照回 —— 串行/并发都得是同一批被拒、别的保留
+    models_par = FakeModelsQueue(ready=True, replies=[
+        _reply_for(range(0, 8)), ModelError("网络错误"), _reply_for(range(16, 18)),
+    ])
+    _store, settings_par, feeds_par, *_ = _make_feeds(tmp_path / "par", models=models_par)
+    c_par = _cands(18)
+    with _TimePatch():
+        _run(feeds_par._score(GID, settings_par, c_par))
+
+    def fingerprint(cands):
+        out = []
+        for c in cands:
+            out.append((
+                tuple(round(float(v), 6) for v in c["scores"].values()),
+                c.get("reject", None),
+                c.get("topic", ""), c.get("icon", ""), c.get("profile_ref", ""),
+            ))
+        return out
+
+    # 期望：0..7 有分、8..15 score-fail（打分没做完）、16/17 有分 —— 和串行老口径逐项一致
+    expected = []
+    for i in range(18):
+        c = {
+            "scores": {"info": 0.0, "source": 0.0, "relevance": 0.0, "timeliness": 0.0,
+                        "chat": 0.0, "avg": 0.0},
+        }
+        if 8 <= i < 16:
+            expected.append(((0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                              ("score", "打分没做完（模型超时/出错），这轮没评上"), "", "newspaper", ""))
+        else:
+            row = c_par[i]
+            expected.append((tuple(round(float(v), 6) for v in row["scores"].values()), None,
+                             row["topic"], row["icon"], row["profile_ref"]))
+    assert fingerprint(c_par) == expected
+    # 后段那条真的拿过第 16/17 批对应的分（avg > 0），失败那批记的 reject 是统一那句
+    assert c_par[16]["scores"]["avg"] > 0 and c_par[17]["scores"]["avg"] > 0

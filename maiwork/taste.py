@@ -179,8 +179,8 @@ async def refresh(
         lines.append(f"上一版小结（可以在它基础上改）：{rec['text']}")
     try:
         result = await models.chat(
-            "main",
-            [{"role": "user", "content": "\n".join(lines)}],
+            agent="news",
+            messages=[{"role": "user", "content": "\n".join(lines)}],
             json_mode=True,
             purpose="feeds.taste",
             group_id=gid,

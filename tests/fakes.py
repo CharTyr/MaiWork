@@ -290,7 +290,7 @@ class FakeModelsQueue:
 
         return _S()
 
-    async def chat(self, role: str, messages: List[dict], **kwargs: Any) -> Any:
+    async def chat(self, role: str | None = None, messages: List[dict] | None = None, **kwargs: Any) -> Any:
         self.calls.append((role, messages, kwargs))
         if self.reply_queue:
             item = self.reply_queue.pop(0)
@@ -557,6 +557,179 @@ def focus_reply(*queries: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 撒网改成「代码按计划搜」（2026-10-01）后：预置「discover」候选改由假搜索服务供给
+# ---------------------------------------------------------------------------
+
+
+class FakePlannedSearch:
+    """代码撒网（Feeds._run_planned_searches）用的假搜索：按计划种预置候选、记录调用。
+
+    - items: {focus_index(1 起): [item...]}；代码撒网搜到这个方向的计划时，
+      把这些预置 item 当 search.py 归一化后的结果交回（title/url/snippet=summmary/published/provider 字段）。
+      方向也有 planned_searches 预算时按计划逐条回放；没给计划的（缺省回退成 focus["query"]
+      那一搜）整份交回。兜底：没给 items / 没对上的方向，整份交回 items_flat（缺省=全部）。
+    - planned_searches: {focus_index: [{"q","site","news","kind"}, …]}；
+      set_planned(True) 后（Feeds 不再派 feeds-discover: 子 agent 就算撒网按计划跑了）
+      自动按老习惯给 3 个关注点各造 2 条 ordinary 计划。
+    - fail_all=True：每搜都抛（测「撒网全挂 → 整轮照老句式跳过」）。
+    - broad_providers(): 保底补搜用（缺省 ["main"]）：第一个算主家，其余走 search_with。
+    """
+
+    def __init__(
+        self,
+        items: Any = None,
+        *,
+        broad: List[str] | None = None,
+        with_results: Any = None,
+        fail_all: bool = False,
+        delay_s: float = 0.0,
+    ) -> None:
+        # items 可以是 callable（跑的时候再取——有些用例在 _feeds 之后才改 workers.report）
+        self._items_callable: Any = items if callable(items) else None
+        items0 = None if callable(items) else items
+        if isinstance(items0, dict) and all(isinstance(k, int) for k in items0):
+            self.items_by_focus: Dict[int, List[dict]] = {int(k): list(v or []) for k, v in items0.items()}
+        elif isinstance(items0, list):
+            self.items_by_focus = {1: list(items0)}
+        else:
+            self.items_by_focus = {}
+        # 兜底那份：没标方向时每搜都整份给；有方向标时空（日志/兜底都走 items_by_focus）
+        self._flat_explicit: List[dict] = (
+            [it for _k in sorted(self.items_by_focus) for it in self.items_by_focus[_k]]
+            if self._items_callable is None
+            else []
+        )
+        self._broad = list(broad) if broad is not None else ["main"]
+        self.with_results: Dict[str, List[dict]] = dict(with_results or {})
+        self.fail_all = fail_all
+        self.delay_s = delay_s
+        self.calls: List[Dict[str, Any]] = []
+        self.with_calls: List[tuple] = []
+        self.planned_searches: Dict[int, List[dict]] = {}
+        self._planned_on = False
+        self.max_parallel = 0
+        self._cur = 0
+
+    def _current_items(self) -> Any:
+        """items 的最新货：callable（比如懒取 workers.report.data 的那份）就跑一下再归一。"""
+        if self._items_callable is None:
+            return self.items_by_focus
+        try:
+            return self._items_callable()
+        except Exception as exc:  # 预置的是「垮」就让这次搜索抛（老用例语义）
+            raise RuntimeError(str(exc)) from exc
+
+    def _as_focus_map(self, items: Any) -> Dict[int, List[dict]]:
+        if isinstance(items, dict) and all(isinstance(k, int) for k in items):
+            return {int(k): list(v or []) for k, v in items.items()}
+        if isinstance(items, list):
+            return {1: list(items)}
+        return {}
+
+    def set_planned(self, on: bool = True) -> "FakePlannedSearch":
+        self._planned_on = bool(on)
+        if on and not self.planned_searches:
+            known = list(self.items_by_focus) if self.items_by_focus else [1, 2, 3]
+            for i in known:
+                if self.items_by_focus and not self.items_by_focus.get(i):
+                    continue
+                self.planned_searches[int(i)] = [
+                    {"q": f"方向{i} 新进展", "site": "", "news": True, "kind": "news"},
+                    {"q": f"方向{i} 分析", "site": "", "news": False, "kind": "news"},
+                ]
+        return self
+
+    def _seed_focus(self) -> int:
+        if self._items_callable is None:
+            return min(self.items_by_focus) if self.items_by_focus else 1
+        return 1
+
+    def planned_focus_reply(self, *queries: str) -> str:
+        """造定关注点回复：focus 的 searches 按 planned_searches 填；diverse/其他方向整份兜底。
+
+        方向次序（focus_reply 缺省 explore 在第三）：全都给 planned_searches 里有的计划；
+        多出的方向（diverse 常是第 4 个）不带 searches——代码会回退成那条 query 单搜，
+        这时兜底把整份 items 记在它名下（模拟线上「最后看到这条链接」），保老用例口径。
+        """
+        import json as _json
+
+        qs = list(queries) or ["FPGA 新动态", "本地大模型新玩法", "开源掌机社区风向"]
+        srcs = ["recent", "long", "explore"]
+        whys = ["群里最近在聊", "长期兴趣", "拓展方向"]
+        focus = []
+        for i, q in enumerate(qs, 1):
+            item = {"query": q, "why": whys[(i - 1) % len(whys)], "source": srcs[(i - 1) % len(srcs)]}
+            planned = self.planned_searches.get(i)
+            if planned:
+                item["searches"] = [dict(p) for p in planned]
+            focus.append(item)
+        return _json.dumps({"focus": focus}, ensure_ascii=False)
+
+    def _main_provider(self) -> str:
+        return str(self._broad[0]) if self._broad else "main"
+
+    def _plans_for(self, query: str) -> tuple:
+        """这个搜索词属于哪份计划的第几搜（(focus_index, ordinal)）；对不上 → (None, None)。"""
+        for fi, planned in self.planned_searches.items():
+            for j, p in enumerate(planned):
+                if str(p.get("q") or "") == str(query):
+                    return int(fi), int(j)
+        return None, None
+
+    def _results_for_entry(self, fi: int | None, _map: Any = None) -> List[dict]:
+        m = _map if _map is not None else self._as_focus_map(self._current_items())
+        focus_no = self._seed_focus() if fi is None else int(fi)
+        return list(m.get(focus_no) or [])
+
+    def _norm(self, results: List[dict], provider: str) -> List[dict]:
+        out: List[dict] = []
+        for it in results:
+            if not isinstance(it, dict) or not it.get("url"):
+                continue
+            pub = it.get("published")
+            out.append({
+                "title": str(it.get("title") or ""),
+                "url": str(it.get("url") or ""),
+                "snippet": str(it.get("summary") or it.get("snippet") or ""),
+                "published": float(pub) if isinstance(pub, (int, float)) and pub else None,
+                "provider": str(it.get("provider") or provider or ""),
+            })
+        return out
+
+    async def search(self, query: str, *, limit: int = 8, days: Any = None, site: str = "", news: bool = False) -> List[dict]:
+        if self.delay_s > 0:
+            self._cur += 1
+            self.max_parallel = max(self.max_parallel, self._cur)
+            try:
+                await asyncio.sleep(self.delay_s)
+            finally:
+                self._cur -= 1
+        self.calls.append({"q": str(query), "limit": limit, "days": days, "site": str(site or ""), "news": bool(news)})
+        if str(query).startswith("__配置自检__"):
+            return []  # feeds._ensure_search 的探测，一律放行
+        if self.fail_all:
+            raise RuntimeError("FakePlannedSearch 被要求全挂")
+        provider = self._main_provider()
+        items_map = self._as_focus_map(self._current_items())
+        flat = [it for _k in sorted(items_map) for it in items_map[_k]]
+        fi, j = self._plans_for(query)
+        if fi is not None:
+            # 同方向第一条计划：整份（保持预置顺序，登记簿按见序留）；
+            # 后面的换法想象成「没搜出新东西」
+            share = self._results_for_entry(fi, items_map) if int(j) == 0 else []
+            return self._norm(share, provider)
+        # 计划外的搜索（缺省回退的 focus["query"]、保底补搜）：整份兜底
+        return self._norm(flat, provider)
+
+    async def search_with(self, name: str, query: str, *, limit: int = 8, days: Any = None, site: str = "", news: bool = False) -> List[dict]:
+        self.with_calls.append((name, query, limit, days))
+        return self._norm(list(self.with_results.get(str(name), [])), str(name))
+
+    def broad_providers(self) -> List[str]:
+        return list(self._broad)
+
+
+# ---------------------------------------------------------------------------
 # feeds 两阶段恒生效（2026-09-30 用户决定）后的通用假 workers 派发
 # ---------------------------------------------------------------------------
 
@@ -587,8 +760,8 @@ def ensure_pick_fallback(models: Any) -> Any:
 async def two_phase_workers_run(report: Any, brief: str, kwargs: Dict[str, Any]) -> Any:
     """「预置一份老路 report」的假 workers 接上两阶段流水线的通用派发。
 
-    - task_id 以 feeds-discover: 开头：把预置 report.data["items"] 当搜索结果
-      记进撒网登记簿（discovery.record），回一条 ok 的备注 report；
+    2026-10-01 起撒网不再派子 agent（代码按计划搜；预置「discover」候选由
+    FakePlannedSearch 出，见 patch_two_phase_feeds / *_make_feeds）。剩下的派发：
     - task_id 以 feeds-verify: 开头：只把 brief 里列出的链接（「链接：<url>」行）
       对应的预置条目回给这一组核验（几组并发各回各的，不会重复交全量）；
     - 其他 task_id（feeds-recheck: 等）：老行为——预置是异常就抛，否则原样回。
@@ -598,37 +771,12 @@ async def two_phase_workers_run(report: Any, brief: str, kwargs: Dict[str, Any])
     task_id = str(kwargs.get("task_id") or "")
     if isinstance(report, BaseException):
         raise report
+    assert not task_id.startswith("feeds-discover:"), (
+        "撒网子 agent 已删除（2026-10-01 代码按计划搜）；"
+        "这个用例还在指望 feeds-discover: 派工——改用 FakePlannedSearch + patch_two_phase_feeds"
+    )
     data = getattr(report, "data", None)
     preset_items = list(data.get("items") or []) if isinstance(data, dict) else []
-    if task_id.startswith("feeds-discover:"):
-        from CharTyr_MaiWork.maiwork import discovery
-
-        if getattr(report, "ok", True) is False:
-            # 预置一份「撒网子 agent 坏了」的：登记簿空着，照坏原样报回去
-            return report
-        results = []
-        for it in preset_items:
-            if not isinstance(it, dict) or not it.get("url"):
-                continue
-            pub = it.get("published")
-            results.append(
-                {
-                    "title": str(it.get("title") or ""),
-                    "url": str(it.get("url") or ""),
-                    "snippet": str(it.get("summary") or ""),
-                    "published": float(pub) if isinstance(pub, (int, float)) and pub else None,
-                }
-            )
-        if results:
-            # 预置可选 "seed_focus"：这批候选假装是从第 N 个关注点搜出来的
-            # （diverse/explore 末尾方向打 angle 用）。缺省 1。
-            seed_focus = data.get("seed_focus", 1) if isinstance(data, dict) else 1
-            try:
-                seed_focus = int(seed_focus)
-            except (TypeError, ValueError):
-                seed_focus = 1
-            discovery.record(task_id, query="测试关注点", focus=seed_focus, provider="main", results=results)
-        return WorkerReport(ok=True, summary="撒好了", data={"note": "撒好了"}, evidence=[], steps=1)
     if task_id.startswith("feeds-verify:"):
         kept = [
             dict(it)
@@ -637,3 +785,48 @@ async def two_phase_workers_run(report: Any, brief: str, kwargs: Dict[str, Any])
         ]
         return WorkerReport(ok=True, summary="核验好", data={"items": kept}, evidence=[], steps=2)
     return report
+
+
+def patch_two_phase_feeds(
+    feeds: Any,
+    models: Any = None,
+    items: Any = None,
+    *,
+    fail_all: bool = False,
+    **search_kw: Any,
+) -> "FakePlannedSearch":
+    """把 feeds 接到「代码撒网」的假搜索上：返回建好的 FakePlannedSearch（feeds._search 已换）。
+
+    - items：FakePlannedSearch 同款（{focus: [item]} 或 [item]）。
+    - models 给了且它的 reply_queue 第一条是定关注点回复 → 就地换成带 searches 计划的版本
+      （用回复里原本的方向名）；该方向没 prefill 计划就不带 searches——走缺省回退。
+    - fail_all=True → 每搜都抛（测 skipped 句式用），不 prefill 计划也不动回复。
+    """
+    fake = FakePlannedSearch(items, fail_all=fail_all, **search_kw)
+    feeds._search = fake
+    if fail_all:
+        return fake
+    fake.set_planned(True)
+    if models is not None:
+        q = getattr(models, "reply_queue", None)
+        if isinstance(q, list) and q and isinstance(q[0], str) and '"focus"' in q[0]:
+            import json as _json
+
+            try:
+                parsed = _json.loads(q[0])
+                focus = parsed.get("focus")
+                if isinstance(focus, list):
+                    # 原样保留 query / why / source（含乱填的 source——有测试专测归一化），
+                    # 只给 prefill 了计划的方向补 searches；没计划的方向不带 → 走缺省回退。
+                    changed = False
+                    for i, f in enumerate(focus, 1):
+                        if isinstance(f, dict) and f.get("query") and not f.get("searches"):
+                            planned = fake.planned_searches.get(i)
+                            if planned:
+                                f["searches"] = [dict(p) for p in planned]
+                                changed = True
+                    if changed:
+                        q[0] = _json.dumps(parsed, ensure_ascii=False)
+            except Exception:
+                pass
+    return fake

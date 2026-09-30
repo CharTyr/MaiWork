@@ -4,11 +4,13 @@ import { SVG, calm, esc, ico, toast } from "./util.js";
 import { api, gname } from "./api.js";
 import { ROWS_COLS, chipEditor, rowsEditor } from "./settings/rules.js";
 import { AV_SRC } from "./settings/identity.js";
+import { PROTOCOLS, loadModels } from "./settings/models.js";
+import { loadAgents } from "./settings/agents.js";
 import { render } from "./render.js";
 import { applyHash, loadGroups, loadSettings, loadView } from "./router.js";
 
 // ───────────── 首次安装引导 ─────────────
-// 全屏一张卡片，一步一屏：打招呼 → 模型 → 服务的群 → 可选密钥 → 联网搜索 → 管理员 → 完成。
+// 全屏一张卡片，一步一屏：打招呼 → 模型（端点 + 主模型 / 专岗模型）→ 服务的群 → 可选密钥 → 联网搜索 → 管理员 → 头像 → 完成。
 // 每一步「下一步」时保存这一步；任何一步都能「跳过引导」。动画只动 transform / opacity，
 // 换步时正在播的动画会被立刻收尾（连点不会卡住、不会叠在一起）。
 export const ONB_STEPS = [
@@ -23,6 +25,11 @@ export const ONB_STEPS = [
 ];
 export const onb = { open: false, i: 0, busy: false, cfg: null, models: null, info: null, done: {}, anims: [], presets: null, sxPicked: null };
 const EASE_SPRING = "cubic-bezier(0.34, 1.4, 0.64, 1)";
+document.addEventListener("change", (event) => {
+  if (event.target && event.target.id === "onb-proto" && $("onb-url")) $("onb-url").placeholder = (PROTOCOLS[event.target.value] || PROTOCOLS.openai).ph;
+});
+// 引导里用的端点：模型库里的第一个；还没有就是个空的「default」
+const onbEndpoint = () => (((state.mdl && state.mdl.endpoints) || [])[0]) || { id: "default", name: "默认端点", protocol: "openai" };
 
 const onbField = (key) => {
   for (const s of (onb.cfg && onb.cfg.sections) || []) for (const f of s.fields) if (f.key === key) return f;
@@ -38,32 +45,40 @@ export function onbPane(id) {
       <h1 class="onb-title">欢迎用 MaiWork</h1>
       <p class="onb-lead">花两分钟配好几样东西就能开始</p>
       <ul class="onb-list">
-        <li>${ico("robot")}<div><b>模型</b><span>必填</span></div></li>
+        <li>${ico("robot")}<div><b>模型</b><span>必填：连一个端点，挑主模型</span></div></li>
         <li>${ico("speech")}<div><b>服务的群</b><span>MaiWork 在哪些群工作</span></div></li>
         <li>${ico("lock")}<div><b>管理员和密钥</b><span>可以之后再填</span></div></li>
       </ul>`;
   if (id === "models") {
-    const list = onb.models || m.available || [];
+    // 2026-10：端点 + 模型库。引导里只加一个端点、挑主模型和专岗用的模型；细项去「模型」页调
+    const ep = onbEndpoint();
+    const list = onb.models || ep.available || [];
+    const byId = (mid) => { const x = ((state.mdl && state.mdl.models) || []).find((y) => y.id === mid); return x ? x.model : ""; };
+    const prof = (k) => (((state.agents && state.agents.profiles) || []).find((p) => p.kind === k) || {});
+    const curMain = byId(prof("main").model), curWork = byId(prof("task").model);
     const sel = (sid, v, empty) =>
-      `<select id="${sid}">${[empty ? `<option value="">不用备用</option>` : `<option value="" disabled ${v ? "" : "selected"}>${list.length ? "选一个模型" : "先测试连接"}</option>`]
+      `<select id="${sid}">${[empty ? `<option value="">${esc(empty)}</option>` : `<option value="" disabled ${v ? "" : "selected"}>${list.length ? "选一个模型" : "先测试连接"}</option>`]
         .concat(list.map((x) => `<option value="${esc(x)}" ${x === v ? "selected" : ""}>${esc(x)}</option>`))
         .concat(v && !list.includes(v) ? [`<option value="${esc(v)}" selected>${esc(v)}</option>`] : [])
         .join("")}</select>`;
+    const proto = ep.protocol || "openai";
     return `
       <div class="onb-step-ico">${ico("robot")}</div>
       <h1 class="onb-title">连上模型</h1>
-      <p class="onb-lead">填一个 OpenAI 兼容的地址和密钥，再选模型</p>
+      <p class="onb-lead">先连一个端点，再挑主模型。更多端点、思考强度这些，之后在「模型」和「专岗」页里调</p>
       <div class="login onb-form">
+        <label for="onb-proto">接口格式</label>
+        <select id="onb-proto">${Object.entries(PROTOCOLS).map(([k, v]) => `<option value="${k}"${k === proto ? " selected" : ""}>${esc(v.name)}</option>`).join("")}</select>
         <label for="onb-url">端点地址</label>
-        <input id="onb-url" type="url" inputmode="url" spellcheck="false" value="${esc(m.base_url || "")}" placeholder="https://…/v1" />
+        <input id="onb-url" type="url" inputmode="url" spellcheck="false" value="${esc(ep.base_url || "")}" placeholder="${esc((PROTOCOLS[proto] || PROTOCOLS.openai).ph)}" />
         <label for="onb-key">API 密钥</label>
-        <input id="onb-key" type="password" autocomplete="new-password" placeholder="${m.key_set ? "已填写 · 留空就不改" : "粘贴密钥"}" />
+        <input id="onb-key" type="password" autocomplete="new-password" placeholder="${ep.key_set ? "已填写 · 留空就不改" : "粘贴密钥"}" />
         <div class="onb-test"><button class="btn" type="button" data-act="onb-test">测试连接</button><span class="onb-status" id="onb-status">${list.length ? `<i class="onb-ok">${SVG.check}</i>找到 ${list.length} 个模型` : ""}</span></div>
         <div class="onb-picks ${list.length ? "" : "is-off"}">
-          <label for="onb-main">主模型 <span class="fine-inline">选聪明的</span></label>
-          ${sel("onb-main", m.main)}
-          <label for="onb-worker">子 agent 模型 <span class="fine-inline">选便宜耐用的</span></label>
-          ${sel("onb-worker", m.worker)}
+          <label for="onb-main">主模型 <span class="fine-inline">负责想和验收，选聪明的</span></label>
+          ${sel("onb-main", onb.pickMain || curMain)}
+          <label for="onb-worker">各专岗用的模型 <span class="fine-inline">负责动手，选便宜耐用的</span></label>
+          ${sel("onb-worker", onb.pickWork || (curWork && curWork !== curMain ? curWork : ""), "跟主模型一样")}
         </div>
       </div>`;
   }
@@ -312,7 +327,10 @@ export async function openOnboarding(info) {
   onb.i = 0;
   onb.info = info || null;
   onb.models = null;
+  onb.pickMain = onb.pickWork = "";
   if (!state.settings) await loadSettings();
+  // 模型那一步要知道已有的端点、模型库和各专岗现在用的模型
+  await Promise.all([loadModels(), state.agents ? null : loadAgents()]).catch(() => null);
   try {
     onb.cfg = await api("GET", "/api/settings/config");
   } catch (_) {
@@ -366,19 +384,31 @@ async function closeOnboarding(action) {
 async function onbSave(id) {
   const v = (x) => ($(x) ? $(x).value.trim() : "");
   if (id === "models") {
-    const m = (state.settings && state.settings.models) || {};
+    const ep = onbEndpoint();
     if (!/^https?:\/\/\S+$/.test(v("onb-url"))) return "端点地址要以 http:// 或 https:// 开头。";
-    if (!m.key_set && !v("onb-key")) return "还没填密钥。";
-    if (!v("onb-main") || !v("onb-worker")) return "先点「测试连接」，再选主模型和子 agent 模型。";
-    const r = await api("PUT", "/api/settings/models", {
-      base_url: v("onb-url"),
-      api_key: v("onb-key") || undefined,
-      main: v("onb-main"),
-      main_backup: m.main_backup || "",
-      worker: v("onb-worker"),
-      worker_backup: m.worker_backup || "",
+    if (!ep.key_set && !v("onb-key")) return "还没填密钥。";
+    if (!v("onb-main")) return "先点「测试连接」，再选主模型。";
+    const epId = ep.id || "default";
+    await api("PUT", `/api/settings/endpoints/${encodeURIComponent(epId)}`, {
+      name: ep.name || "默认端点", protocol: v("onb-proto") || "openai", base_url: v("onb-url"), api_key: v("onb-key") || undefined,
+      retries: ep.retries ?? 5, retry_delay_s: ep.retry_delay_s ?? 10, max_concurrency: ep.max_concurrency ?? 2, max_rpm: ep.max_rpm ?? 0,
     });
-    if (state.settings) state.settings.models = r;
+    await loadModels();
+    // 模型库里这个端点已有同名模型就复用，没有就加一条（能力参数用默认值，之后在「模型」页细调）
+    const ensure = async (name) => {
+      if (!name) return "";
+      const hit = ((state.mdl && state.mdl.models) || []).find((x) => x.endpoint === epId && x.model === name);
+      if (hit) return hit.id;
+      const mid = "m" + Math.random().toString(36).slice(2, 8);
+      await api("PUT", `/api/settings/model-list/${mid}`, { endpoint: epId, model: name, name, efforts: [], vision: false, context_window: 128000, max_tokens: 32768 });
+      await loadModels();
+      return mid;
+    };
+    const mainId = await ensure(v("onb-main"));
+    const workId = (await ensure(v("onb-worker"))) || "";
+    await api("PUT", "/api/agents/main", { model: mainId, effort: "" });
+    for (const k of ["news", "idea", "goal", "task"]) await api("PUT", `/api/agents/${k}`, { model: workId, effort: "" });
+    await loadSettings().catch(() => null);
     return "";
   }
   const patch = {};
@@ -502,14 +532,14 @@ export async function onbAct(el) {
     const out = $("onb-status");
     const url = $("onb-url").value.trim();
     const key = $("onb-key").value.trim();
-    const m = (state.settings && state.settings.models) || {};
+    const ep = onbEndpoint();
     if (!/^https?:\/\/\S+$/.test(url)) return onbError("地址要以 http:// 或 https:// 开头。");
-    if (!m.key_set && !key) return onbError("先填密钥再测。");
+    if (!ep.key_set && !key) return onbError("先填密钥再测。");
     $("onb-err").hidden = true;
     el.disabled = true;
     out.innerHTML = `<i class="onb-spin"></i>正在连…`;
     try {
-      const r = await api("POST", "/api/settings/models/test", { base_url: url, api_key: key || undefined });
+      const r = await api("POST", `/api/settings/endpoints/${encodeURIComponent(ep.id || "default")}/test`, { base_url: url, api_key: key || undefined, protocol: $("onb-proto").value });
       if (!r.ok) {
         out.textContent = "";
         onbError(r.error || "没连上");
@@ -517,13 +547,10 @@ export async function onbAct(el) {
       }
       onb.models = r.models || [];
       // 只重画模型下拉，保留已经填的地址和密钥
-      const keep = { main: $("onb-main").value, worker: $("onb-worker").value };
+      onb.pickMain = $("onb-main").value || onb.pickMain;
+      onb.pickWork = $("onb-worker").value || onb.pickWork;
       const tmp = document.createElement("div");
-      const mm = Object.assign({}, m, { main: keep.main || m.main, worker: keep.worker || m.worker });
-      const saved = state.settings && state.settings.models;
-      if (state.settings) state.settings.models = mm;
       tmp.innerHTML = onbPane("models");
-      if (state.settings) state.settings.models = saved;
       const picks = el.closest(".onb-pane").querySelector(".onb-picks");
       picks.replaceWith(tmp.querySelector(".onb-picks"));
       const np = el.closest(".onb-pane").querySelector(".onb-picks");

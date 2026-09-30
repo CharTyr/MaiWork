@@ -216,8 +216,8 @@ class AutoReviewer:
         prompt = self._build_prompt(row)
         try:
             result = await self._models.chat(
-                "main",
-                [{"role": "user", "content": prompt}],
+                agent="main",
+                messages=[{"role": "user", "content": prompt}],
                 json_mode=True,
                 purpose=_PURPOSE,
                 group_id=gid,

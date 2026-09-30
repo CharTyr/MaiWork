@@ -40,6 +40,7 @@ class _Settings:
     def __init__(self, served=(G1,), password: str = ""):
         self.served = set(served)
         self.console = _Console(password)
+        self.model_list = ()  # 2026-10：岗位模型选择要对着模型库校验
 
     def is_served(self, gid):
         return str(gid) in self.served
@@ -110,7 +111,7 @@ class TestGlobalAgentsApi:
         assert r.status == 200
         data = await r.json()
         assert "profiles" in data
-        assert [p["kind"] for p in data["profiles"]] == ["news", "idea", "goal", "task"]
+        assert [p["kind"] for p in data["profiles"]] == ["main", "news", "idea", "goal", "task"]
 
     @pytest.mark.asyncio
     async def test_put_profile(self, env) -> None:
@@ -128,12 +129,56 @@ class TestGlobalAgentsApi:
         assert r.status == 200
         data = await r.json()
         by_kind = {p["kind"]: p for p in data["profiles"]}
+        assert by_kind["main"]["title"] == "主模型"
         assert by_kind["news"]["title"] == "资讯"
         assert by_kind["idea"]["title"] == "构想"
         assert by_kind["goal"]["title"] == "目标"
         assert by_kind["task"]["title"] == "通用任务"
         for p in data["profiles"]:
             assert p["fish_seed"] == ""
+            assert p["model"] == "" and p["effort"] == "" and p["backup"] == ""
+
+    @pytest.mark.asyncio
+    async def test_put_main_profile_fish_and_model(self, env) -> None:
+        """main（主模型）也能走 PUT /api/agents/{kind}；模型字段对着模型库校验（2026-10 改版 1a）。"""
+        from CharTyr_MaiWork.maiwork.config import load_settings
+
+        env.settings.model_list = load_settings(
+            {
+                "endpoints": [{"id": "default", "base_url": "https://api.test/v1", "api_key": "sk-x"}],
+                "model_list": [
+                    {"id": "m1", "endpoint": "default", "model": "gpt-main", "efforts": ["low", "high"]},
+                    {"id": "m2", "endpoint": "default", "model": "gpt-bak"},
+                ],
+            }
+        )[0].model_list
+        await env.login()
+        r = await env.client.put("/api/agents/main", json={"fish_seed": "koi-main"})
+        assert r.status == 200
+        data = await r.json()
+        assert data["kind"] == "main" and data["fish_seed"] == "koi-main"
+        # 挑模型 + 强度 + 备用
+        r = await env.client.put("/api/agents/main", json={"model": "m1", "effort": "high", "backup": "m2"})
+        assert r.status == 200
+        data = await r.json()
+        assert (data["model"], data["effort"], data["backup"]) == ("m1", "high", "m2")
+        # 模型库没有的 id → 400
+        r = await env.client.put("/api/agents/main", json={"model": "ghost"})
+        assert r.status == 400
+        # 强度不在所选模型的 efforts 里 → 400
+        r = await env.client.put("/api/agents/main", json={"effort": "max"})
+        assert r.status == 400
+        # 备用 = 模型 → 400
+        r = await env.client.put("/api/agents/main", json={"backup": "m1"})
+        assert r.status == 400
+
+    @pytest.mark.asyncio
+    async def test_put_main_rejects_memory_write_via_group_route(self, env) -> None:
+        """main 没有工作册；/api/groups/{gid}/agents/{kind}/memory 一律 400。"""
+        await env.login()
+        r = await env.client.put(f"/api/groups/{G1}/agents/main/memory", json={"notes": "x"})
+        assert r.status == 400
+
 
     @pytest.mark.asyncio
     async def test_put_fish_seed_roundtrip(self, env) -> None:

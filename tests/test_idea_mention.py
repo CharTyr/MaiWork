@@ -46,7 +46,7 @@ class Models:
         self.replies = list(replies or [])
         self.calls: list[dict] = []
 
-    async def chat(self, role, messages, **kw):
+    async def chat(self, role=None, messages=None, **kw):
         self.calls.append({"role": role, "messages": messages, **kw})
         r = self.replies.pop(0) if self.replies else json.dumps({"text": "想到个点子，要不要一起试试？"})
         if isinstance(r, Exception):

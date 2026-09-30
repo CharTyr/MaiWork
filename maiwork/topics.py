@@ -337,8 +337,8 @@ class Topics:
             # 开场白在主循环（run_loop_once → _topics_round → topics.check）里直接 await：
             # 不能按设置里默认的 5 次 ×10 秒重试把循环卡几分钟→ retries=1（现实两秒内出结果，不行就下轮）
             chat_result = await self._models.chat(
-                "main",
-                opener_prompt,
+                agent="main",
+                messages=opener_prompt,
                 json_mode=False,
                 purpose="opener",
                 group_id=gid,

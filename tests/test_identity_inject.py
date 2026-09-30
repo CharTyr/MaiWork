@@ -182,16 +182,21 @@ async def test_topics_opener_injects_soul(tmp_path: Path) -> None:
 
 
 async def test_workers_system_prompt_carries_agents(tmp_path: Path) -> None:
-    """子 agent 的 system 提示带 AGENTS 规矩（## 做事规矩 + 内容）。"""
+    """子 agent 的 system 提示带它自己 kind 的 AGENTS 规矩（## 做事规矩 + 内容）。
+    （2026-10 改版 3/4：跑 task 就注 task 那份；main 那份只进主模型，不往子 agent 口里塞。）"""
     from CharTyr_MaiWork.maiwork.workers import _system_prompt
 
     store = Store(tmp_path / "t.db")
     store.migrate()
     identity = await _identity(tmp_path, store)
-    identity.write("agents", "规矩甲：先想清楚再动手。")
+    # sub agent 默认跑 task 岗：改 task 的 AGENTS.md，应该进提示词；
+    # main 的（全局 API 写过去那份）不动子 agent 这口
+    identity.agent_write("task", "agents", "规矩甲：先想清楚再动手。")
+    identity.write("agents", "主模型的规矩不能漏给子 agent。")
     sys_prompt = _system_prompt("子 agent #1", GID, None, "", identity=identity)
     assert "## 做事规矩" in sys_prompt
     assert "规矩甲：先想清楚再动手" in sys_prompt
+    assert "主模型的规矩不能漏" not in sys_prompt
 
 
 # ----------------------------------------------------------------------
@@ -301,7 +306,7 @@ async def test_coordinator_remember_round_after_review(tmp_path: Path) -> None:
     }]
 
     class ModelsSeq(ModelsQueue):
-        async def chat(self, role, messages, **kwargs):
+        async def chat(self, role=None, messages=None, **kwargs):
             snap = [dict(m) for m in messages]
             self.calls.append((role, snap, kwargs))
             if not self.reply_queue:

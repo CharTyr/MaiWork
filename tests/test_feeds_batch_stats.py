@@ -35,8 +35,9 @@ class CountingWorkers:
     """假 workers：先把这轮的工具调用按 kwargs["task_id"] 落进 tool_calls（模拟真 workers
     的落库），再按两阶段派发出报告——用来验证 feeds 真的把每轮的工具用量算成统计。
 
-    两阶段恒生效：web_search 记录挂在撒网（feeds-discover:）名下，
-    fetch_page 记录挂在第一组核验（feeds-verify: 的 :0 后缀）名下。
+    2026-10-01 起撒网是代码按计划搜（不再派子 agent）：web_search 记录由这些用例
+    挂在 collect 标记（feeds-collect:）名下模拟代码真搜了这么多次；fetch_page 记录
+    照旧挂在第一组核验（feeds-verify: 的 :0 后缀）名下。
     """
 
     def __init__(self, store, report: Any, rows: list[tuple[str, bool, str]]) -> None:
@@ -59,9 +60,7 @@ class CountingWorkers:
     async def run(self, brief: str, **kwargs: Any) -> Any:
         self.calls.append({"brief": brief, **kwargs})
         mark = str(kwargs.get("task_id") or "")
-        if mark.startswith("feeds-discover:"):
-            self._record(mark, "web_search")
-        elif mark.startswith("feeds-verify:") and mark.endswith(":0"):
+        if mark.startswith("feeds-verify:") and mark.endswith(":0"):
             self._record(mark, "fetch_page")
         return await two_phase_workers_run(self.report, brief, kwargs)
 
@@ -83,14 +82,23 @@ def test_batch_stats_recorded_and_exposed(tmp_path) -> None:
     store, settings, feeds, models, workers, topics, _profiles = _make_feeds(tmp_path, models=models)
     counting = CountingWorkers(store, _ok_report(_WORKER_ITEMS), _rows())
     feeds._workers = counting  # 换成会落 tool_calls 的假 workers（真 workers 也这么落）
+    # 撒网（代码按计划搜）这轮真搜了这么多次，按老 collect 标记落库（统计按它点数）
+    orig_two_phase = feeds._collect_two_phase
+
+    async def _seeded_two_phase(gid, focus, _settings, *, collect_mark, stats_out):
+        counting._record(collect_mark, "web_search")
+        return await orig_two_phase(gid, focus, _settings, collect_mark=collect_mark, stats_out=stats_out)
+
+    feeds._collect_two_phase = _seeded_two_phase
 
     with _TimePatch():
         got = _run(feeds.prepare_news(GID))
         assert got == 2
         batches = feeds.news_view(GID)
 
-    # 撒网子 agent 这轮拿到了带标记的 task_id（统计就按它算）
-    assert counting.calls and str(counting.calls[0].get("task_id") or "").startswith("feeds-discover:")
+    # 2026-10-01 起撒网不再派子 agent：全程没有任何 feeds-discover: 派工
+    assert counting.calls
+    assert not any(str(c.get("task_id") or "").startswith("feeds-discover:") for c in counting.calls)
     assert len(batches) == 1
     stats = batches[0]["stats"]
     # 两阶段恒生效后 stats 还带漏斗（funnel）；basic 三个数按老口径对
@@ -117,10 +125,18 @@ def test_skipped_batch_stats_all_zero(tmp_path) -> None:
 
 
 def test_score_failure_keeps_collected_counts(tmp_path) -> None:
-    """子 agent 收集成功、打分失败 → 这轮记 skipped，但已经搜过/看过的次数保留。"""
+    """收集成功、打分失败 → 这轮记 skipped，但已经搜过/看过的次数保留。"""
     models = FakeModelsQueue(ready=True, replies=[_FOCUS_JSON, ModelError("打分端点挂了")])
     store, settings, feeds, models, workers, topics, _profiles = _make_feeds(tmp_path, models=models)
-    feeds._workers = CountingWorkers(store, _ok_report(_WORKER_ITEMS), _rows()[:3])
+    counting = CountingWorkers(store, _ok_report(_WORKER_ITEMS), _rows()[:3])
+    feeds._workers = counting
+    orig_two_phase = feeds._collect_two_phase
+
+    async def _seeded_two_phase(gid, focus, _settings, *, collect_mark, stats_out):
+        counting._record(collect_mark, "web_search")
+        return await orig_two_phase(gid, focus, _settings, collect_mark=collect_mark, stats_out=stats_out)
+
+    feeds._collect_two_phase = _seeded_two_phase
 
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 0
@@ -157,14 +173,32 @@ def test_stats_of_one_batch_do_not_leak_into_another(tmp_path) -> None:
         "published": NOW - 3600, "fetched": True, "quote": "原文里写着这件事", "paywall": False,
     }]}
     store, settings, feeds, models, workers, topics, _profiles = _make_feeds(tmp_path, models=_models())
-    feeds._workers = CountingWorkers(store, _ok_report(_WORKER_ITEMS), _rows())
 
+    orig_two_phase = feeds._collect_two_phase
+
+    def _wire(counting_rows, report):
+        feeds._workers = CountingWorkers(store, report, counting_rows)
+        # 这一轮「代码撒网」要找的东西也换（假搜索是从 workers 预置供的，换回合得跟着换）
+        from fakes import FakePlannedSearch
+
+        if isinstance(feeds._search, FakePlannedSearch):
+            data = getattr(report, "data", None) or {}
+            feeds._search._items_callable = None  # 不再懒取旧 workers 的 report
+            feeds._search.items_by_focus = {1: list(data.get("items") or [])}
+            feeds._search.planned_searches = {}
+            feeds._search.set_planned(False)
+
+        async def _seeded(gid, focus, _settings, *, collect_mark, stats_out):
+            feeds._workers._record(collect_mark, "web_search")
+            return await orig_two_phase(gid, focus, _settings, collect_mark=collect_mark, stats_out=stats_out)
+
+        feeds._collect_two_phase = _seeded
+
+    _wire(_rows(), _ok_report(_WORKER_ITEMS))
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 2
         feeds._models = _models()
-        feeds._workers = CountingWorkers(
-            store, _ok_report(solo), [("web_search", True, "q"), ("fetch_page", True, "u")]
-        )
+        _wire([("web_search", True, "q"), ("fetch_page", True, "u")], _ok_report(solo))
         assert _run(feeds.prepare_news(GID)) == 1
         batches = feeds.news_view(GID)
 

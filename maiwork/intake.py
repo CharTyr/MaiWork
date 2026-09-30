@@ -47,15 +47,18 @@ _AT_QUESTIONS: Dict[str, Any] = {
         "type": "choice",
         "instructions": "群里有人 @ MaiBot，这条消息是在请 MaiBot 做什么？",
         "criteria": {
-            "prepare": "请 MaiBot 准备/整理/调研/做一个东西",
-            "goal": "请 MaiBot 帮忙盯着或把某件事做成",
+            "prepare": "请 MaiBot 准备/整理/调研/做一个能在网上做出来的东西（资料、清单、文档等）",
+            "goal": "请 MaiBot 在网上帮忙盯着某件事，或把一件它在线上能做成的事做成",
             "reminder": "请 MaiBot 到时间提醒自己",
-            "none": "都不是（闲聊、提问、玩笑）",
+            "none": "都不是（闲聊、提问、玩笑、整人，或要它办现实里办不到的事，比如改别人的假期、管人）",
         },
     }
 }
 
 _CONFIDENCE_MIN = 0.6
+# 「准备 / 盯着」直接建待批要更有把握：线上有条玩笑请求以 0.61 混了进去（2026-09-30）。
+# 0.6~0.7 之间的进慢路径，让主模型读群时再判（和 Jev 没判出来同一条路）。
+_REQUEST_CONFIDENCE_MIN = 0.7
 _STATE_TEXT_MAX = 500
 _TITLE_MAX = 30
 # 可提起清单的存活期
@@ -369,7 +372,7 @@ class Intake:
                 confidence_f = 0.0
         else:
             label, confidence_f = "", 0.0
-        if label in ("prepare", "goal") and confidence_f >= _CONFIDENCE_MIN:
+        if label in ("prepare", "goal") and confidence_f >= _REQUEST_CONFIDENCE_MIN:
             _spawn_safely(self._spawn, self._create_request(group_id, label, confidence_f, user_id, user_name, message_id, text))
             return
         if label == "reminder" and confidence_f >= _CONFIDENCE_MIN:
@@ -434,6 +437,7 @@ class Intake:
                 requester_id=user_id,
                 requester_name=user_name,
                 message_id=message_id,
+                screen=True,
             )
         except Exception:
             logger.exception("记待批请求出错（群 %s，消息 %s）", group_id, message_id)

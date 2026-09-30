@@ -566,7 +566,7 @@ async def test_model_forged_tool_not_executed(store, skills, tmp_path):
     turn = {"n": 0}
 
     class Models:
-        async def chat(self, role, messages, **kwargs):
+        async def chat(self, role=None, messages=None, **kwargs):
             turn["n"] += 1
             if turn["n"] == 1:
                 return type("R", (), {"text": "",

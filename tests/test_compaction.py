@@ -73,7 +73,7 @@ class _FakeModels:
         self.error = error
         self.calls = []
 
-    async def chat(self, role, messages, **kw):
+    async def chat(self, role=None, messages=None, **kw):
         self.calls.append((role, [dict(m) for m in messages], kw))
         if self.error is not None:
             raise self.error
@@ -149,7 +149,7 @@ class TestCompactLooped:
             def __init__(self):
                 self.calls = []
 
-            async def chat(self, role, messages, **kw):
+            async def chat(self, role=None, messages=None, **kw):
                 self.calls.append(kw)
                 return ChatResult(text=summary_text, tool_calls=[], model="m", prompt_tokens=1, completion_tokens=1, raw_message={})
 
@@ -189,7 +189,7 @@ class TestCompactLooped:
             def __init__(self):
                 self.calls = []
 
-            async def chat(self, role, messages, **kw):
+            async def chat(self, role=None, messages=None, **kw):
                 self.calls.append([dict(x) for x in messages])
                 if len(self.calls) == 1:
                     raise ModelError("context_length_exceeded prompt too long", status=400)

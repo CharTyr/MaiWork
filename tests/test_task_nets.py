@@ -124,7 +124,7 @@ class TestCoordinatorNet:
             def settings(self):
                 return _Ready()
 
-            async def chat(self, role, messages, **kw):
+            async def chat(self, role=None, messages=None, **kw):
                 # 回一次 plan JSON，但 usage 已超线（在 chat 内部写 usage 的测试桩直接插库）
                 tid = kw.get("task_id") or ""
                 if tid:
@@ -185,7 +185,7 @@ class TestCoordinatorNet:
             def settings(self):
                 return _Ready()
 
-            async def chat(self, role, messages, **kw):
+            async def chat(self, role=None, messages=None, **kw):
                 return ChatResult(
                     text='{"criteria":["c1"], "deliver_kind":"text", "jobs": [], "question": null, "env": "local"}',
                     tool_calls=[], model="m", prompt_tokens=1, completion_tokens=1, raw_message={},

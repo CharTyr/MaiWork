@@ -336,3 +336,158 @@ def migrate_search_config_to_extension(
     except Exception:
         logger.exception("[search] 迁移：删 config.toml 的 [search] 段出错（绑定已迁好，这段忽略不影响运行）")
     return did_something
+
+
+# ----------------------------------------------------------------------
+# 旧 [models] → [[endpoints]] + [[model_list]] + 专岗选择（2026-10 改版 1a）
+# ----------------------------------------------------------------------
+
+# 旧 [models] 里要删掉的键（迁移成功后整节从文件消失）
+_OLD_MODELS_KEYS = (
+    "base_url", "api_key", "main", "main_backup", "worker", "worker_backup",
+    "retries", "retry_delay_s", "max_concurrency", "max_rpm",
+    "context_window", "max_tokens",
+)
+
+# 「主模型」岗位（main）跟着旧 main 槽；四个执行岗位跟着旧 worker 槽
+_WORKER_KINDS = ("news", "idea", "goal", "task")
+
+
+def _clamp_or_default(value: Any, low: int, high: int, default: int) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return n if low <= n <= high else default
+
+
+def migrate_models_config_to_endpoints(store: Any, plugin_dir: Path | str, data_dir: Path | str) -> bool:
+    """旧 [models] 一次搬走（幂等）：端点 + 模型库 + 专岗 model/backup，删旧 [models]。
+
+    - 触发条件：config.toml 的 [models] base_url 非空，且还没有 [[endpoints]]（有了 = 迁过）。
+    - 顺序：先写 kv["agents.profiles"] 的岗位选择（读路径容错，写砸了旧四槽照样兜底），
+      再通过 config_file 备份+重写 config.toml。第二遍跑（旧 [models] 已删 / 无 base_url）→ False。
+    - 密钥只写进 [[endpoints]] api_key，日志绝不打值。
+    返回 True = 这次真迁移了。
+    """
+    import tomlkit
+
+    # 1. 判定 + 取旧值（文件坏了 / 没 base_url / 已有 endpoints → 不动）
+    try:
+        text = config_file.read_text(plugin_dir)
+    except config_file.ConfigFileError:
+        logger.warning("模型配置迁移：读不到 config.toml，跳过")
+        return False
+    try:
+        doc = tomlkit.parse(text)
+    except Exception:
+        logger.warning("模型配置迁移：config.toml 解析失败（文件坏了？），跳过")
+        return False
+    # 有真条目才算迁过；空的 endpoints = []（按 schema 补齐的默认值）照样搬
+    if doc.get("endpoints"):
+        return False
+    models_sec = doc.get("models")
+    if not isinstance(models_sec, dict):
+        return False
+    base_url = str(models_sec.get("base_url") or "").strip()
+    if not base_url:
+        return False
+    api_key = str(models_sec.get("api_key") or "").strip()
+    slots = {
+        name: str(models_sec.get(name) or "").strip()
+        for name in ("main", "main_backup", "worker", "worker_backup")
+    }
+    retries = _clamp_or_default(models_sec.get("retries"), 0, 10, 5)
+    retry_delay_s = _clamp_or_default(models_sec.get("retry_delay_s"), 1, 60, 10)
+    max_concurrency = _clamp_or_default(models_sec.get("max_concurrency"), 1, 8, 2)
+    max_rpm = _clamp_or_default(models_sec.get("max_rpm"), 0, 600, 0)
+    context_window = _clamp_or_default(models_sec.get("context_window"), 8192, 2_000_000, 128000)
+    max_tokens = _clamp_or_default(models_sec.get("max_tokens"), 1024, 1_000_000, 32768)
+    # context_window/max_tokens 要满足「最大输出 < 上下文窗口」，不然 load_settings 会丢条目
+    if max_tokens >= context_window:
+        max_tokens = max(1024, context_window - 1024)
+
+    # 2. 模型库条目：四个槽按名字去重（同名共用一条，id = m1/m2/...）
+    ids_by_model: dict[str, str] = {}
+    model_ids: dict[str, str] = {}  # 槽名 → 模型库条目 id（空槽没有）
+    for slot in ("main", "main_backup", "worker", "worker_backup"):
+        name = slots[slot]
+        if not name:
+            continue
+        if name not in ids_by_model:
+            ids_by_model[name] = f"m{len(ids_by_model) + 1}"
+        model_ids[slot] = ids_by_model[name]
+
+    # 3. 岗位选择先写 kv（容错读；此刻文件还没动，写砸也只当是「没选过」）
+    try:
+        raw_profiles = store.kv_get("agents.profiles", {})
+        if not isinstance(raw_profiles, dict):
+            raw_profiles = {}
+        profiles = {k: (dict(v) if isinstance(v, dict) else {}) for k, v in raw_profiles.items()}
+        main_patch = {"model": model_ids.get("main", ""), "backup": model_ids.get("main_backup", "")}
+        worker_patch = {"model": model_ids.get("worker", ""), "backup": model_ids.get("worker_backup", "")}
+        profiles.setdefault("main", {}).update(main_patch)
+        # 旧值兜底：主备同条目时读路径会把 backup 清掉（备用不许=首选），这里也就不写同值
+        if main_patch["backup"] == main_patch["model"]:
+            profiles["main"]["backup"] = ""
+        for kind in _WORKER_KINDS:
+            profiles.setdefault(kind, {}).update(worker_patch)
+            if worker_patch["backup"] == worker_patch["model"]:
+                profiles[kind]["backup"] = ""
+        with store.tx() as conn:
+            store.kv_set(conn, "agents.profiles", profiles)
+        logger.info(
+            "模型配置迁移：岗位选择已写好（主模型=%s 备=%s；资讯/构想/目标/任务=%s 备=%s）",
+            main_patch["model"] or "（无）", profiles["main"].get("backup") or "（无）",
+            worker_patch["model"] or "（无）", profiles["task"].get("backup") or "（无）",
+        )
+    except Exception:
+        logger.exception("模型配置迁移：写岗位选择出错，但继续搬 config.toml（岗位选择之后可在网页补）")
+
+    # 4. 重写 config.toml：加 [[endpoints]] / [[model_list]]，删旧 [models]
+    endpoint = tomlkit.table()
+    endpoint.add("id", "default")
+    endpoint.add("name", "默认端点")
+    endpoint.add("protocol", "openai")
+    endpoint.add("base_url", base_url)
+    endpoint.add("api_key", api_key)
+    endpoint.add("retries", retries)
+    endpoint.add("retry_delay_s", retry_delay_s)
+    endpoint.add("max_concurrency", max_concurrency)
+    endpoint.add("max_rpm", max_rpm)
+    endpoints_aot = tomlkit.aot()
+    endpoints_aot.append(endpoint)
+    doc["endpoints"] = endpoints_aot
+
+    model_aot = tomlkit.aot()
+    for model_name, entry_id in ids_by_model.items():
+        item = tomlkit.table()
+        item.add("id", entry_id)
+        item.add("endpoint", "default")
+        item.add("model", model_name)
+        item.add("context_window", context_window)
+        item.add("max_tokens", max_tokens)
+        model_aot.append(item)
+    doc["model_list"] = model_aot
+
+    if doc.get("models") is not None:
+        for key in list(_OLD_MODELS_KEYS):
+            try:
+                if key in doc["models"]:
+                    del doc["models"][key]
+            except Exception:
+                pass
+        try:
+            if len(doc["models"]) == 0:
+                del doc["models"]
+        except Exception:
+            pass
+
+    new_text = tomlkit.dumps(doc)
+    config_file._write_back(plugin_dir, data_dir, new_text, old_text=text)  # 内部先备份
+    logger.info(
+        "模型配置迁移：旧 [models] 已搬成 [[endpoints]]（1 个）+ [[model_list]]（%d 条），"
+        "旧 [models] 已从 config.toml 删除（备份在数据目录 config-backups/）",
+        len(ids_by_model),
+    )
+    return True

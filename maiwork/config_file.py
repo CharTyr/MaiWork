@@ -40,6 +40,13 @@ _AOT_FIELDS: dict[str, tuple[str, ...]] = {
     "environments.ssh": ("name", "host", "note"),
 }
 
+# 顶层「整段就是表数组」的两节（2026-10 模型改版）：只能整段重写（增删改都在内存里
+# 算好整段再写），键顺序固定；空串/空列表的键不写进文件（读回时按默认补全）。
+_AOT_TOP_FIELDS: dict[str, tuple[str, ...]] = {
+    "endpoints": ("id", "name", "protocol", "base_url", "api_key", "retries", "retry_delay_s", "max_concurrency", "max_rpm"),
+    "model_list": ("id", "endpoint", "model", "name", "efforts", "vision", "context_window", "max_tokens"),
+}
+
 
 class ConfigFileError(Exception):
     """config.toml 读 / 写失败；message 是中文，给网页 400/500 用。"""
@@ -228,6 +235,48 @@ def _write_back(plugin_dir: Path | str, data_dir: Path | str, text: str, *, old_
         os.chmod(path, stat.S_IMODE(0o600))
     except OSError as e:
         raise ConfigFileError(f"写 {CONFIG_FILENAME} 失败（{path}）：{e}") from None
+
+
+def write_aot_section(plugin_dir: Path | str, data_dir: Path | str, section: str, entries: Iterable[dict]) -> str:
+    """整段重写 [[endpoints]] / [[model_list]]（2026-10 模型改版）。
+
+    - section 必须在 _AOT_TOP_FIELDS 里登记（键顺序固定）；
+    - 每条目空字符串 / 空列表的键不写（读回时按默认补；api_key 空串自然不写）；
+    - 空列表 → tomlkit 空 aot 落不进文本，等于这节从文件里去掉（一个都没有）；
+    - 和 write_fields 同一条备份+0600 链路；返回写完后的文件全文。
+    """
+    if section not in _AOT_TOP_FIELDS:
+        raise ConfigFileError(f"{section} 不是登记过的「整段表数组」节（{_AOT_TOP_FIELDS.keys()}）")
+    order = _AOT_TOP_FIELDS[section]
+    items = [dict(e) for e in entries]
+    aot = tomlkit.aot()
+    for item in items:
+        t = tomlkit.table()
+        for k in order:
+            v = item.get(k)
+            if v is None:
+                continue
+            if isinstance(v, str) and not v:
+                continue
+            if isinstance(v, (list, tuple)) and not v:
+                continue
+            t[k] = list(v) if isinstance(v, (list, tuple)) else v
+        aot.append(t)
+    with _LOCK:
+        old_text = read_text(plugin_dir)
+        try:
+            doc = tomlkit.parse(old_text)
+        except Exception as e:
+            raise ConfigFileError(f"{CONFIG_FILENAME} 解析失败（文件坏了？）：{e}") from None
+        if aot:
+            doc[section] = aot
+        else:
+            # 空列表：tomlkit 空 aot dumps 不进文本，等于这节从文件去掉（一个都没有）
+            if doc.get(section) is not None:
+                del doc[section]
+        new_text = tomlkit.dumps(doc)
+        _write_back(plugin_dir, data_dir, new_text, old_text=old_text)
+        return new_text
 
 
 def write_fields(plugin_dir: Path | str, data_dir: Path | str, flat: dict[str, Any]) -> str:

@@ -41,6 +41,7 @@ from fakes import (
     FakeModelsQueue,
     FakeProfiles,
     focus_reply,
+    patch_two_phase_feeds,
     two_phase_workers_run,
 )
 
@@ -230,6 +231,25 @@ def _make_feeds(
         ]
     )
     feeds = Feeds(store, models, workers, profiles, topics, lambda: settings)
+    if workers is not None:
+        # 2026-10-01 撒网改代码按计划搜：FakeWorkers 预置的 items 挪给假搜索出；
+        # 懒取 report——有用例在建好 _feeds 之后才换 report（出错→撒网全挂）
+        def _live_items():
+            if isinstance(getattr(workers, "report", None), BaseException):
+                raise RuntimeError("预置：撒网全挂")
+            r = getattr(workers, "report", None)
+            if r is not None and not getattr(r, "ok", True):
+                raise RuntimeError("预置：子 agent 没跑成")
+            data = getattr(r, "data", None)
+            if isinstance(data, dict):
+                items = list(data.get("items") or [])
+                sf = data.get("seed_focus")  # 老用例：假装都是某方向（diverse 4）搜出来的
+                if isinstance(sf, int) and sf >= 1:
+                    return {sf: items}
+                return items
+            return []
+
+        patch_two_phase_feeds(feeds, models, _live_items)
     return store, settings, feeds, models, workers, topics, profiles
 
 
@@ -308,13 +328,13 @@ def test_brief_asks_news_and_guides_with_fetch_and_paywall(tmp_path) -> None:
 
 
 def test_guides_off_brief_keeps_news_only(tmp_path) -> None:
-    """[feeds] guides = false：撒网 brief 只找资讯、明说不找文章。"""
+    """[feeds] guides = false：定关注点提示词明说只找资讯、不找文章（2026-10-01 起搜的东西由代码跑）。"""
     cfg = {"feeds": {"guides": False}}
     store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path, cfg=cfg)
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 1
-    discover_brief = _brief(workers)
-    assert "不找文章" in discover_brief or "只找资讯" in discover_brief
+    focus_prompt = models.calls[0][1][0]["content"]
+    assert "不找文章" in focus_prompt or "只找资讯" in focus_prompt
 
 
 # ----------------------------------------------------------------------

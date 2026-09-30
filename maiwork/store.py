@@ -819,8 +819,18 @@ def _m_card_push(conn: sqlite3.Connection) -> None:
     """)
 
 
+# 模型改版 1b（docs/12 阶段 1）：usage / model_calls 各加一列 agent（岗位 kind：
+# main / news / idea / goal / task / c_xxx）。role 不动（还当「主模型 / 子 agent」
+# 两桶账的分桶键）；旧行 agent 一律 = ''（= 不知道哪个岗位）。
+def _m_model_agent(conn: sqlite3.Connection) -> None:
+    for table in ("usage", "model_calls"):
+        cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if "agent" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN agent TEXT NOT NULL DEFAULT ''")
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent]
 
 
 class Store:

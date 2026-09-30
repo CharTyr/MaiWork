@@ -80,7 +80,7 @@ class _Models:
     def settings(self) -> Any:
         return _Ready(self._ready)
 
-    async def chat(self, role: str, messages: list[dict], **kwargs: Any) -> ChatResult:
+    async def chat(self, role: str | None = None, messages: list[dict] | None = None, **kwargs: Any) -> ChatResult:
         self.calls.append((role, [dict(m) for m in messages], dict(kwargs)))
         if self.gate is not None:
             await self.gate.wait()

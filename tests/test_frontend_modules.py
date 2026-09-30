@@ -164,6 +164,28 @@ console.log(JSON.stringify({ ...out, species: out.species.size, eyes: out.eyes.s
 """
 
 
+def test_every_module_parses_as_es_module(tmp_path):
+    """每个前端文件按 ES 模块语法过一遍 node --check。
+
+    2026-10 教训：同一个文件里留了两个同名 function——普通脚本模式允许，
+    ES 模块里是语法错，浏览器整页白屏；`node --check x.js` 按脚本模式查不出来，
+    所以这里复制成 .mjs 再查。"""
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("本机没有 node，跑不了模块语法检查")
+    bad = []
+    for p in _modules():
+        copy = tmp_path / (p.relative_to(JS).as_posix().replace("/", "__") + ".mjs")
+        copy.write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
+        res = subprocess.run([node, "--check", str(copy)], capture_output=True, text=True, timeout=60)
+        if res.returncode != 0:
+            bad.append(f"{p.relative_to(JS)}: {res.stderr.strip().splitlines()[-1] if res.stderr.strip() else '?'}")
+    assert not bad, "这些前端文件按 ES 模块解析不过：\n" + "\n".join(bad)
+
+
 def test_fish_generator_is_deterministic_and_well_formed(tmp_path):
     """同一个种子永远画出同一条鱼；换种子会变；每种鱼 × 每种眼神都画得出来、没有坏数字。"""
     import json
@@ -221,3 +243,71 @@ def test_fish_icon_not_in_group_avatar_pool():
     icons = views.group_icons()
     assert "fish" not in icons
     assert "robot" in icons and "teacup" in icons
+
+
+_FISH_CUSTOM_CHECK = r"""
+import { fishSvg, fishTraits, FISH_SPECIES, FISH_EYES, FISH_COLORS, FISH_COLOR_NAMES, customSeed, parseCustom } from %s;
+const body = (svg) => svg.match(/class="fish-body" d="([^"]+)"/)[1];
+const out = { bad: [], len: 0 };
+// 1) 挑什么就画什么
+for (const sp of Object.keys(FISH_SPECIES)) for (const e of Object.keys(FISH_EYES)) {
+  const c = FISH_COLORS.length - 1;
+  const s = customSeed({ species: sp, color: c, eyes: e, base: "abcdefghij" });
+  out.len = Math.max(out.len, s.length);
+  if (!/^[A-Za-z0-9_-]{1,32}$/.test(s)) out.bad.push("seed:" + s);
+  const t = fishTraits("agent:news:" + s);
+  if (t.species !== sp || t.eyes !== e || t.color !== FISH_COLORS[c]) out.bad.push("traits:" + s);
+  const p = parseCustom("agent:news:" + s);
+  if (!p || p.species !== sp || p.eyes !== e || p.color !== c || p.base !== "abcdefghij") out.bad.push("parse:" + s);
+  if (/NaN|undefined|Infinity/.test(fishSvg("agent:news:" + s))) out.bad.push("svg:" + s);
+}
+// 2) 只换颜色：身形不动
+const a = fishSvg("agent:idea:" + customSeed({ species: "shark", color: 1, eyes: "dots", base: "k9" }), { still: true });
+const b = fishSvg("agent:idea:" + customSeed({ species: "shark", color: 5, eyes: "dots", base: "k9" }), { still: true });
+out.colorKeepsShape = body(a) === body(b) && a !== b;
+// 3) 打开定制时按原来那条鱼填好：原样保存画出来一模一样
+out.identity = [];
+for (const seed of ["", "ab12cd34", "x_1"]) {
+  const orig = "agent:goal:" + seed;
+  const t = fishTraits(orig);
+  const s = customSeed({ species: t.species, color: FISH_COLORS.indexOf(t.color), eyes: t.eyes, base: seed });
+  out.identity.push(fishSvg(orig, { still: true }) === fishSvg("agent:goal:" + s, { still: true }));
+}
+// 4) 乱写的 / 不认识的不当定制
+out.junk = [parseCustom("agent:news:c-whale-1-dots-a"), parseCustom("agent:news:c-shark-99-dots-a"), parseCustom("agent:news:c-shark-1-lol-a"), parseCustom("agent:news:ab12")].every((x) => x === null);
+out.names = FISH_COLOR_NAMES.length === FISH_COLORS.length && new Set(FISH_COLOR_NAMES).size === FISH_COLORS.length;
+console.log(JSON.stringify(out));
+"""
+
+
+def test_fish_custom_seed_picks_species_color_eyes(tmp_path):
+    """专岗小鱼可以定制（2026-09-30 用户要）：鱼种 / 颜色 / 眼神由管理员挑，写进 fish_seed，后端不用改。"""
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("本机没有 node，跑不了小鱼定制检查")
+    script = tmp_path / "custom.mjs"
+    script.write_text(_FISH_CUSTOM_CHECK % json.dumps((JS / "fish.js").as_uri()), encoding="utf-8")
+    res = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=60)
+    assert res.returncode == 0, res.stderr
+    data = json.loads(res.stdout.strip().splitlines()[-1])
+    assert not data["bad"], data["bad"][:10]
+    assert data["len"] <= 32, "定制种子要放得进 fish_seed（≤32 字符）"
+    assert data["colorKeepsShape"], "只换颜色时鱼的样子不能跟着变"
+    assert all(data["identity"]), "打开定制原样保存，鱼要和原来一模一样"
+    assert data["junk"], "不认识的鱼种 / 颜色 / 眼神不能当成定制"
+    assert data["names"], "每个颜色要有中文名（读屏和提示用）"
+
+
+def test_fish_custom_picker_contract():
+    """设置 → 专岗：每条鱼有「定制」，挑鱼种 / 颜色 / 眼神，有预览，只提交 fish_seed。"""
+    text = (JS / "settings/agents.js").read_text(encoding="utf-8")
+    for act in ("agent-fish-custom", "agent-fish-pick", "agent-fish-shape", "agent-fish-save", "agent-fish-cancel"):
+        assert f'data-act="{act}"' in text and f'case "{act}"' in text, act
+    assert "customSeed" in text and "aria-pressed" in text
+    assert "{ fish_seed: seed }" in text, "定制保存只提交 fish_seed"
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    assert ".fish-swatch" in css and ".fish-opt" in css

@@ -53,7 +53,8 @@ def _log_search(store: Store, task_id: str) -> None:
 
 
 class SeqWorkers:
-    """按顺序回放：两阶段恒生效后，第一波（撒网 + 核验）由「找资讯那一步」供数，
+    """按顺序回放：两阶段恒生效后，「找资讯那一步」的预置由 seed_collect 挪给
+    假搜索（2026-10-01 起撒网是代码按计划搜，不再派子 agent），核验按链接交回；
     第二步才是补打开的子 agent。每一步可以顺带「打开」一些网址
     （往 tool_calls 写这次 task_id 的 fetch_page 记录）。"""
 
@@ -65,38 +66,56 @@ class SeqWorkers:
 
     def _log(self, step: Dict[str, Any], tid: str) -> None:
         store = self.store_ref[0]
-        for url in step.get("open", []):
-            _log_fetch(store, tid, url)
+        for entry in step.get("open", []):
+            if isinstance(entry, (tuple, list)) and entry:  # (url, final)：跳转后的最终地址
+                _log_fetch(store, tid, entry[0], final=str(entry[1]) if len(entry) > 1 else "")
+            else:
+                _log_fetch(store, tid, entry)
         if step.get("search"):
             _log_search(store, tid)
-        # 「找资讯这轮还顺带打开了这些链接」记录挂在 collect 名义下
-        # （补打开的 probe — opened_links(store, collect_mark) — 只查这个名义）。
-        collect_mark = tid.replace("feeds-discover:", "feeds-collect:", 1) if tid.startswith("feeds-discover:") else None
-        if collect_mark:
-            for url in step.get("collect_open", []):
-                _log_fetch(store, collect_mark, url)
 
     async def run(self, brief: str, **kwargs: Any) -> Any:
         self.calls.append({"brief": brief, **kwargs})
         tid = str(kwargs.get("task_id") or "")
-        from fakes import two_phase_workers_run
+        from fakes import patch_two_phase_feeds, two_phase_workers_run
 
-        if tid.startswith("feeds-discover:"):
-            # 第一步 = 老路的「找资讯」：种登记簿 + 记搜索次数 + 缓存给后面核验用
-            assert self.steps, "用例步骤不够用：撒网就空了"
-            self._collect_step = self.steps.pop(0)
-            self._log(self._collect_step, tid)
-            return await two_phase_workers_run(self._collect_step["report"], brief, kwargs)
         if tid.startswith("feeds-verify:") and self._collect_step is not None:
             # 核验交回「找资讯」那步的预置 items（按 brief 里列的链接分）
             return await two_phase_workers_run(self._collect_step["report"], brief, kwargs)
-        # 补打开等后续步骤：按原顺序回放
+        # 补打开等后续步骤：按原顺序回放（2026-10-01 起撒网不派子 agent，第一步直接落到这）
         assert self.steps, "用例步骤不够用"
         step = self.steps.pop(0)
         self._log(step, tid)
         if isinstance(step.get("report"), BaseException):
             raise step["report"]
         return step["report"]
+
+    def seed_collect(self, feeds: Any, models: Any = None) -> None:
+        """把「找资讯那一步」的预置挪成现在的两步：登记簿候选由假搜索出 + 顺带记录落库。
+
+        2026-10-01 前：第一步是派 feeds-discover: 子 agent；现在代码撒网不派工，
+        预置 report.data["items"] 交给 FakePlannedSearch 出（patch_two_phase_feeds），
+        「顺带打开 / 搜过」的记录仍挂 collect_mark 名义（补打开 probe 只查它）。
+        collect_mark 只有运行时才知道 → 落库延后到 seeds 那一刻（patch feeds._collect_two_phase）。
+        """
+        from fakes import patch_two_phase_feeds
+
+        step = self.steps.pop(0)
+        self._collect_step = step
+        data = getattr(step["report"], "data", None) or {}
+        items = list(data.get("items") or [])
+        patch_two_phase_feeds(feeds, models, items)
+        store = self.store_ref[0]
+
+        orig = feeds._collect_two_phase
+
+        async def _seeded(gid, focus, settings, *, collect_mark, stats_out):
+            self._log(step, collect_mark)
+            for url in step.get("collect_open", []):
+                _log_fetch(store, collect_mark, url)
+            return await orig(gid, focus, settings, collect_mark=collect_mark, stats_out=stats_out)
+
+        feeds._collect_two_phase = _seeded
 
 
 def _ok(data: dict) -> WorkerReport:
@@ -119,6 +138,8 @@ def _setup(tmp_path, items, steps, *, scores=None):
         tmp_path, items=items, scores=scores, workers=workers
     )
     ref[0] = store
+    # 「找资讯那一步」从 workers 回放挪成假搜索供给（撒网不再派子 agent），顺带记录照挂 collect 名义
+    workers.seed_collect(feeds, models)
     return store, feeds, workers, models
 
 
@@ -230,20 +251,16 @@ def test_final_url_counts_as_opened(tmp_path) -> None:
     """交回的是跳转后的地址：打开记录里的「最终地址」也算打开过，不用补。"""
     items = [_cand(0, title="跳转过的", url="https://news.a.com/final", fetched=True)]
     ref: list = [None]
-    workers = SeqWorkers(ref, [{"report": _ok({"items": items}), "search": True}])
+    # 找资讯那轮的 task_id 要等 prepare_news 生成：collect 那步的「打开记录」顺带写成
+    # 「短链 → 最终地址」（(url, final) 元组，见 SeqWorkers._log）
+    workers = SeqWorkers(ref, [{"report": _ok({"items": items}), "search": True,
+                                 "open": [("https://short.a.com/x", "https://news.a.com/final")]}])
     store, settings, feeds, models, _w, topics, _ = _make_feeds(
         tmp_path, items=items, scores=_scores_json(_score(0)), workers=workers
     )
     ref[0] = store
+    workers.seed_collect(feeds, models)
     _log_fetch(store, "占位", "x")  # 不相干的记录
-    # 找资讯那轮的 task_id 要等 prepare_news 生成：让第一步顺带写「短链 → 最终地址」
-    orig = workers.run
-
-    async def run_with_redirect(brief, **kw):
-        _log_fetch(store, kw["task_id"], "https://short.a.com/x", final="https://news.a.com/final")
-        return await orig(brief, **kw)
-
-    workers.run = run_with_redirect
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 1
     assert not [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-recheck:")]  # 没派补打开

@@ -160,12 +160,16 @@ def test_search_guide_asks_for_short_queries_with_examples(tmp_path) -> None:
     assert "鬼武者" in guide  # 坏例子取自线上实录的关键词串烧
 
 
-def test_discover_brief_carries_short_query_section(tmp_path) -> None:
-    """撒网 brief（新找法）带的「怎么搜」就是同一段：核验它确实在。"""
+def test_focus_prompt_carries_short_query_section(tmp_path) -> None:
+    """定关注点提示词（撒网改代码按计划搜后）带的「怎么搜」就是同一段：核验它确实在。"""
+    from test_feeds_quality import _run
+
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path)
-    brief = feeds._discover_brief(GID, [{"query": "方向一"}], settings)
-    assert "2–6" in brief or "2-6" in brief
-    assert "整条关注点" in brief
+    with _TimePatch():
+        _run(feeds._plan_focus(GID, settings))
+    prompt = models.calls[0][1][0]["content"]
+    assert "2–6" in prompt or "2-6" in prompt
+    assert "整条关注点" in prompt
 
 
 def test_focus_prompt_asks_for_short_direction_phrase(tmp_path) -> None:

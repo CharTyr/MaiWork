@@ -8,8 +8,9 @@ import { loadExt, parseMcpConfig, readHeaders, readRoles } from "./settings/ext.
 import { loadRules, readRules } from "./settings/rules.js";
 import { loadUsage } from "./settings/usage.js";
 import { loadIdentity } from "./settings/identity.js";
+import { loadAgents } from "./settings/agents.js";
 import { loadLogs } from "./settings/logs.js";
-import { draft } from "./settings/models.js";
+import { loadModels } from "./settings/models.js";
 import { closeSheet, repaintSheet } from "./sheet.js";
 import { chatPoll, enterChat, loadChat, paintChat } from "./chat.js";
 import { render, renderRail, renderSide, renderView } from "./render.js";
@@ -63,54 +64,6 @@ document.addEventListener("submit", async (e) => {
       p.textContent = state.loginError;
       p.hidden = false;
       $("pw").select();
-    } finally {
-      btn.disabled = false;
-    }
-    return;
-  }
-  if (f.id === "models") {
-    const v = (id) => $(id).value.trim();
-    const err = $("m-err");
-    const m = (state.settings && state.settings.models) || {};
-    const problem = !/^https?:\/\/\S+$/.test(v("m-url"))
-      ? "端点地址要以 http:// 或 https:// 开头。"
-      : !m.key_set && !v("m-key")
-        ? "还没填密钥。"
-        : !v("m-main") || !v("m-worker")
-          ? "主模型和子 agent 模型都要选。"
-          : (v("m-main-b") && v("m-main-b") === v("m-main")) || (v("m-worker-b") && v("m-worker-b") === v("m-worker"))
-            ? "备用模型不能和原来的一样。"
-            : "";
-    if (problem) {
-      err.textContent = problem;
-      err.hidden = false;
-      return;
-    }
-    btn.disabled = true;
-    const newKey = !!v("m-key");
-    try {
-      const r = await api("PUT", "/api/settings/models", {
-        base_url: v("m-url"),
-        api_key: newKey ? v("m-key") : undefined,
-        main: v("m-main"),
-        main_backup: v("m-main-b"),
-        worker: v("m-worker"),
-        worker_backup: v("m-worker-b"),
-        retries: Math.max(0, Math.min(10, parseInt(v("m-retries"), 10) || 0)),
-        retry_delay_s: Math.max(1, Math.min(60, parseInt(v("m-retry-delay"), 10) || 10)),
-        max_concurrency: Math.max(1, Math.min(8, parseInt(v("m-conc"), 10) || 2)),
-        max_rpm: Math.max(0, Math.min(600, parseInt(v("m-rpm"), 10) || 0)),
-        context_window: Math.max(8192, Math.min(2000000, parseInt(v("m-ctx"), 10) || 128000)),
-        max_tokens: Math.max(1024, Math.min(1000000, parseInt(v("m-max-tokens"), 10) || 32768)),
-      });
-      if (state.settings) state.settings.models = r;
-      draft.models = null;
-      repaintSheet();
-      loadSettings().then(() => (repaintSheet(), renderRail()));
-      toast(newKey ? "保存好了，新密钥已替换旧的" : "保存好了，下一次调用就用新设置");
-    } catch (ex) {
-      err.textContent = ex.message;
-      err.hidden = false;
     } finally {
       btn.disabled = false;
     }
@@ -410,7 +363,9 @@ window.addEventListener("hashchange", () => {
       state.setSub === "extensions" && !state.ext ? loadExt() : null,
       state.setSub === "rules" ? loadRules() : null,
       state.setSub === "usage" ? loadUsage() : null,
-      state.setSub === "identity" ? loadIdentity() : null,
+      ["memory", "agents"].includes(state.setSub) ? loadIdentity() : null,
+      state.setSub === "models" ? loadModels() : null,
+      state.setSub === "agents" && !state.agents ? loadAgents() : null,
       state.setSub === "logs" ? loadLogs() : null,
       state.setSub === "links" ? loadGA() : null,
     ]).then(() => render());

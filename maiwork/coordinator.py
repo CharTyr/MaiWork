@@ -408,7 +408,16 @@ class Coordinator:
         return f"g{group_id}"
 
     def _context_window(self) -> int:
-        """主模型上下文窗口（tokens）；取不到配置就用默认 128000。"""
+        """主模型上下文窗口（tokens）：2026-10 改版起认主模型所选模型的窗口
+        （models.limits_for("main")）；取不到配置回落旧全局值/默认 128000。"""
+        try:
+            fn = getattr(self._models, "limits_for", None)
+            if callable(fn):
+                v = int((fn("main") or {}).get("context_window") or 0)
+                if v > 0:
+                    return v
+        except Exception:
+            pass
         try:
             settings = self._get_settings()
             return int(getattr(getattr(settings, "models", None), "context_window", None) or 128000)
@@ -438,6 +447,7 @@ class Coordinator:
                 messages,
                 models=self._models,
                 role="main",
+                agent="main",
                 context_window=self._context_window(),
                 purpose=purpose,
                 group_id=group_id,
@@ -457,6 +467,7 @@ class Coordinator:
             messages,
             models=self._models,
             role="main",
+            agent="main",
             purpose=purpose,
             **kwargs,
         )
@@ -736,6 +747,48 @@ class Coordinator:
     # 主模型 JSON 调用（计划 / 验收）
     # ------------------------------------------------------------------
 
+    def _custom_agents_prompt_lines(self) -> list[str]:
+        """主模型提示词用的「当前有哪些自定义专岗」清单（标题+kind；没有就 []）。
+
+        配合主模型自己 AGENTS.md 里「新建的专岗」那几行判断什么时候派活给谁；
+        specialists 不在（启动早期/测试里只挂 workers）就 []，别破启动。
+        """
+        try:
+            spec = self._specialists
+            agents_mod = getattr(spec, "agents", None) if spec is not None else None
+            if agents_mod is None:
+                return []
+            kinds = [str(k) for k in (agents_mod.custom_kinds() or []) if str(k or "").strip()]
+        except Exception:
+            return []
+        if not kinds:
+            return []
+        out: list[str] = []
+        for k in kinds:
+            try:
+                p = agents_mod.profile(k)
+                title = str(p.get("title") or k).strip() or k
+                enabled = bool(p.get("enabled", True))
+            except Exception:
+                title, enabled = k, True
+            if not enabled:
+                continue  # 停用的就别在主模型面前露脸（主模型误以为能派）
+            out.append(f"- 「{title}」kind={k}")
+        return out
+
+    def _known_dispatch_kinds(self) -> frozenset[str]:
+        """主模型 jobs[].agent 能被派给哪些岗：内建 four + kv 里的自定义（不含 main）。"""
+        base = frozenset(("news", "idea", "goal", "task"))
+        try:
+            spec = self._specialists
+            agents_mod = getattr(spec, "agents", None) if spec is not None else None
+            if agents_mod is None:
+                return base
+            extra = {str(k) for k in (agents_mod.custom_kinds() or []) if str(k or "").strip()}
+        except Exception:
+            return base
+        return base | frozenset(extra)
+
     def _identity_prefix(self, gid: str, *, with_memory: bool) -> str:
         """AGENTS（做事规矩）+ 可选工作记忆；没 identity / 空 → ""。主模型提示词的最前面。"""
         identity = self._identity
@@ -792,6 +845,17 @@ class Coordinator:
 
         # 执行环境可选项：只有就位的才出现在提示词里（模型不会瞎选）
         env_field, env_guide, _env_allowed = self._env_options()
+        # 专岗改版 4/4：jobs[].agent 的 JSON 说明是动态的（没有自定义专岗就不提这个键），
+        # 免得主模型老想着填一个不存在的名词。
+        custom_agent_lines = self._custom_agents_prompt_lines()
+        if custom_agent_lines:
+            agent_field_doc = (
+                ' "agent": "派给哪个专岗跑这条；默认 task（通用执行者）。下面这些自定义专岗在册：\n'
+                + "\n".join(custom_agent_lines)
+                + "\n（别的名字不许写；想派给内建的 news/idea/goal 也行，但调研类的活还是优先走 task）\","
+            )
+        else:
+            agent_field_doc = ""
         prompt_lines.append("")
         prompt_lines.append(
             "只回 JSON，不要输出别的："
@@ -803,7 +867,8 @@ class Coordinator:
             ' "type": "research|build|other"（research=要查资料出结论的活：调研、对比、盘点、「大家怎么看」、找现状/口碑；'
             'build=做东西；other=其它）,'
             ' "tools": ["子 agent 工具名单里的名字"],'
-            ' "after": ["要用前一步的产出（比如先调研、再按调研做页面）时写这个：'
+            + agent_field_doc
+            + ' "after": ["要用前一步的产出（比如先调研、再按调研做页面）时写这个：'
             '前一步 jobs 的编号（第 1 个是 1），可以写 1 个或几个；'
             '互不依赖的不写 after，才会同时跑；写了 after 的会等那几步跑完、把那几步交回的东西给它"]}]（1 到 2 个）,'
             ' "question": null | "如果信息不够、不能开工，写一句要在群里问发起人的话；能开工就是 null"}'
@@ -929,7 +994,17 @@ class Coordinator:
                 job_type = str(j.get("type") or "").strip().lower()
                 if job_type not in ("research", "build", "other"):
                     job_type = "research" if looks_like_research_brief(brief) else "other"
-                jobs.append({"brief": brief, "tools": tools_list, "type": job_type, "after": list(j.get("after") or []) if isinstance(j.get("after"), list) else []})
+                # 专岗改版 4/4：jobs[].agent——要派给哪个专岗跑这条。默认 task；主模型
+                # 挑的岗位不在册（笔误 / 已删）就当没写（warning + 回落 task）。
+                job_agent = str(j.get("agent") or "task").strip() or "task"
+                if job_agent not in self._known_dispatch_kinds():
+                    logger.warning("主模型挑的专岗 %r 不在册，这条活仍派给 task", job_agent)
+                    job_agent = "task"
+                jobs.append({
+                    "brief": brief, "tools": tools_list, "type": job_type,
+                    "after": list(j.get("after") or []) if isinstance(j.get("after"), list) else [],
+                    "agent": job_agent,
+                })
         self._sanitize_jobs_after(jobs)
 
         question = data.get("question")
@@ -1128,6 +1203,7 @@ class Coordinator:
                 ws_name=ws_name,
                 job_type=str(j.get("type") or "other"),
                 artifact_scope=scope,
+                agent=str(j.get("agent") or "task"),
             )
 
         done: list[asyncio.Event] = [asyncio.Event() for _ in jobs]
@@ -1240,6 +1316,7 @@ class Coordinator:
         self, *, brief: str, tools: list[str], gid: str, tid: str, job_idx: int, ws_name: str,
         job_type: str = "other",
         artifact_scope: tuple[str, ...] | None = None,
+        agent: str = "task",
     ) -> Any:
         sem = self._semaphore_for(ws_name)
         async with sem:
@@ -1274,8 +1351,11 @@ class Coordinator:
                     )
                 if system_extra:
                     brief = brief + "\n\n" + system_extra
+                # 专岗改版 4/4：这条活是主模型挑的「哪个岗」就跑哪个岗（kind = plan.jobs[].agent；
+                # 没挑 / 不在册都在 _plan 里落网成 task）。该岗自己的 SOUL/AGENTS/
+                # 模型/skills 由 specialists → workers 按 kind 各自注/挑。
                 return await specialists.run(
-                    "task", brief,
+                    str(agent or "task"), brief,
                     group_id=gid, task_id=tid,
                     tools=list(tools or []),
                     actor=f"子 agent #{job_idx}",

@@ -143,6 +143,50 @@ def _usage_rows(store: Store) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+# ----------------------------------------------------------------------
+# 2026-10 改版 1a：端点 + 模型库 + 各专岗自选（profile.model/backup）
+# ----------------------------------------------------------------------
+
+
+class _FakeAgents:
+    """Models 只调 agents.profile(kind)：用小假对象替（duck type）。"""
+
+    def __init__(self, mapping: dict | None = None) -> None:
+        self._m = mapping or {}
+
+    def profile(self, kind: str) -> dict:
+        d = {"kind": kind, "title": kind, "model": "", "effort": "", "backup": "", "enabled": True}
+        d.update(self._m.get(kind, {}))
+        return dict(d)
+
+
+def _new_cfg(**over):
+    cfg = {
+        "endpoints": [
+            {"id": "default", "name": "默认端点", "protocol": "openai",
+             "base_url": "https://a.test/v1", "api_key": SECRET},
+        ],
+        "model_list": [
+            {"id": "m1", "endpoint": "default", "model": "m-main", "name": "主模型展示"},
+            {"id": "m2", "endpoint": "default", "model": "m-bak"},
+            {"id": "w1", "endpoint": "default", "model": "m-worker"},
+        ],
+    }
+    cfg.update(over)
+    return cfg
+
+
+def _make_new(tmp_path, ep=None, agents=None, cfg=None):
+    store = Store(tmp_path / "test.db")
+    store.migrate()
+    holder = {"settings": _settings(cfg if cfg is not None else _new_cfg())}
+    models = Models(
+        store, lambda: holder["settings"], transport=_transport(ep) if ep else None,
+        agents=agents if agents is not None else _FakeAgents({"main": {"model": "m1"}, "task": {"model": "w1"}}),
+    )
+    return store, holder, models
+
+
 def _chat_payload(**over) -> dict:
     data = {"base_url": "https://api.test/v1", "main": "main-a", "main_backup": "", "worker": "w-a", "worker_backup": ""}
     data.update(over)
@@ -840,6 +884,268 @@ class TestSaveDetails:
             assert key in pub
         assert pub["key_set"] is True
         assert "api_key" not in pub
+
+
+# ----------------------------------------------------------------------
+# 改版 1a：settings()/ready/public 端点 + 模型库 + 专岗自选
+# ----------------------------------------------------------------------
+
+
+class TestNewShapeSettings:
+    def test_ready_when_profiles_assigned(self, tmp_path) -> None:
+        store, holder, models = _make_new(tmp_path)
+        s = models.settings()
+        assert s.ready() is True
+        assert s.main == "m-main" and s.worker == "m-worker"
+        assert s.main_backup == "" and s.worker_backup == ""
+        assert s.key_set is True
+        assert s.source == "config"
+        assert s.base_url == "https://a.test/v1"  # 主模型端点
+
+    def test_display_name_in_public(self, tmp_path) -> None:
+        store, holder, models = _make_new(tmp_path)
+        pub = models.settings().public()
+        assert pub["ready"] is True
+        assert pub["main_label"] == "主模型展示"
+        assert SECRET not in json.dumps(pub, ensure_ascii=False)
+        assert "api_key" not in pub
+
+    def test_unassigned_main_not_ready(self, tmp_path) -> None:
+        store, holder, models = _make_new(tmp_path, agents=_FakeAgents({"main": {}, "task": {"model": "w1"}}))
+        s = models.settings()
+        assert s.ready() is False
+        assert s.main == ""
+
+    def test_missing_key_on_main_endpoint_not_ready(self, tmp_path) -> None:
+        cfg = _new_cfg()
+        cfg["endpoints"][0]["api_key"] = ""
+        store, holder, models = _make_new(tmp_path, cfg=cfg)
+        assert models.settings().ready() is False
+        assert models.settings().key_set is False
+
+    def test_backup_reflected(self, tmp_path) -> None:
+        store, holder, models = _make_new(
+            tmp_path, agents=_FakeAgents({"main": {"model": "m1", "backup": "m2"}, "task": {"model": "w1"}})
+        )
+        s = models.settings()
+        assert s.main_backup == "m-bak"
+
+    def test_none_when_nothing_configured(self, tmp_path) -> None:
+        store = Store(tmp_path / "t.db")
+        store.migrate()
+        settings = _settings({})
+        models = Models(store, lambda: settings, agents=_FakeAgents())
+        s = models.settings()
+        assert s.source == "none" and s.ready() is False
+
+    def test_checked_kv_merged_when_base_url_matches(self, tmp_path) -> None:
+        store, holder, models = _make_new(tmp_path)
+        with store.tx() as conn:
+            store.kv_set(conn, "models.checked", {"base_url": "https://a.test/v1", "available": ["m-main"], "checked_at": 111.0})
+        s = models.settings()
+        assert s.available == ["m-main"] and s.checked_at == 111.0
+
+
+class TestNewShapeChat:
+    @pytest.mark.asyncio
+    async def test_chat_main_uses_assigned_entry(self, tmp_path) -> None:
+        ep = FakeEndpoint({"m-main": [{"kind": "ok", "content": "主模型回了"}]})
+        store, holder, models = _make_new(tmp_path, ep)
+        r = await models.chat("main", [{"role": "user", "content": "x"}])
+        assert r.text == "主模型回了"
+        assert ep.calls[0]["model"] == "m-main"
+        assert ep.calls[0]["auth"] == f"Bearer {SECRET}"
+        await models.close()
+
+    @pytest.mark.asyncio
+    async def test_chat_worker_uses_task_profile(self, tmp_path) -> None:
+        ep = FakeEndpoint({"m-worker": [{"kind": "ok", "content": "干活模型回了"}]})
+        store, holder, models = _make_new(tmp_path, ep)
+        r = await models.chat("worker", [{"role": "user", "content": "x"}])
+        assert r.text == "干活模型回了"
+        assert ep.calls[0]["model"] == "m-worker"
+        rows = _usage_rows(store)
+        assert rows[0]["role"] == "worker"
+        await models.close()
+
+    @pytest.mark.asyncio
+    async def test_backup_across_endpoints(self, tmp_path) -> None:
+        """主挂（500，retries=0）换备用——备用挂在另一个端点上，用另一个密钥。"""
+        cfg = {
+            "endpoints": [
+                {"id": "e1", "base_url": "https://e1.test/v1", "api_key": SECRET, "retries": 0},
+                {"id": "e2", "base_url": "https://e2.test/v1", "api_key": OTHER_SECRET},
+            ],
+            "model_list": [
+                {"id": "m1", "endpoint": "e1", "model": "main-a"},
+                {"id": "m2", "endpoint": "e2", "model": "main-b"},
+                {"id": "w1", "endpoint": "e1", "model": "w-a"},
+            ],
+        }
+        ep = FakeEndpoint({
+            "main-a": [{"kind": "status", "status": 500, "body": {"error": {"message": "挂"}}}],
+            "main-b": [{"kind": "ok", "content": "B 端点救场"}],
+        })
+        store, holder, models = _make_new(
+            tmp_path, ep,
+            agents=_FakeAgents({"main": {"model": "m1", "backup": "m2"}, "task": {"model": "w1"}}),
+            cfg=cfg,
+        )
+        r = await models.chat("main", [{"role": "user", "content": "x"}])
+        assert r.text == "B 端点救场"
+        assert [c["model"] for c in ep.calls] == ["main-a", "main-b"]
+        assert ep.calls[0]["auth"] == f"Bearer {SECRET}"
+        assert ep.calls[1]["auth"] == f"Bearer {OTHER_SECRET}"
+        await models.close()
+
+    @pytest.mark.asyncio
+    async def test_unassigned_profile_raises_friendly(self, tmp_path) -> None:
+        store, holder, models = _make_new(tmp_path, agents=_FakeAgents({"main": {}, "task": {}}))
+        with pytest.raises(ModelError, match="还没配好"):
+            await models.chat("main", [{"role": "user", "content": "x"}])
+
+    @pytest.mark.asyncio
+    async def test_max_tokens_comes_from_model_entry(self, tmp_path) -> None:
+        """阶段 1a：每次调用的默认 max_tokens 用所选模型条目的值，不再是全局值。"""
+        cfg = _new_cfg()
+        cfg["model_list"][0]["max_tokens"] = 16000
+        cfg["model_list"][0]["context_window"] = 200000
+        ep = FakeEndpoint({"m-main": [{"kind": "ok"}]})
+        store, holder, models = _make_new(tmp_path, ep, cfg=cfg)
+        await models.chat("main", [{"role": "user", "content": "x"}])
+        assert ep.calls[0]["body"]["max_tokens"] == 16000
+        # 显式传了以调用方为准
+        await models.chat("main", [{"role": "user", "content": "x"}], max_tokens=1234)
+        assert ep.calls[1]["body"]["max_tokens"] == 1234
+        await models.close()
+
+    @pytest.mark.asyncio
+    async def test_unknown_protocol_endpoint_skipped(self, tmp_path) -> None:
+        """协议不认识（配置校验漏网）的端点：跳过尝下一个候选，最后抛的是中文错。"""
+        cfg = {
+            "endpoints": [{"id": "weird", "protocol": "openai", "base_url": "https://w.test/v1", "api_key": SECRET}],
+            "model_list": [{"id": "m1", "endpoint": "weird", "model": "x"}],
+        }
+        store, holder, models = _make_new(tmp_path, agents=_FakeAgents({"main": {"model": "m1"}, "task": {"model": "m1"}}), cfg=cfg)
+        # 手动把端点协议改成不认识的（走配置校验过不去的那一档）
+        raw = holder["settings"]
+        import dataclasses
+        messed = dataclasses.replace(raw.endpoints[0], protocol="grpc")
+        holder["settings"] = dataclasses.replace(raw, endpoints=(messed,))
+        with pytest.raises(ModelError, match=r"协议「grpc」不认识"):
+            await models.chat("main", [{"role": "user", "content": "x"}])
+        await models.close()
+
+
+class TestLimitsFor:
+    def test_limits_from_main_entry(self, tmp_path) -> None:
+        cfg = _new_cfg()
+        cfg["model_list"][0]["context_window"] = 222222
+        cfg["model_list"][0]["max_tokens"] = 11111
+        store, holder, models = _make_new(tmp_path, cfg=cfg)
+        lim = models.limits_for()
+        assert lim["context_window"] == 222222
+        assert lim["max_tokens"] == 11111
+
+    def test_limits_fallback_without_assignment(self, tmp_path) -> None:
+        cfg = _new_cfg()
+        cfg["models"] = {"context_window": 64000, "max_tokens": 8192}
+        store, holder, models = _make_new(tmp_path, agents=_FakeAgents(), cfg=cfg)
+        lim = models.limits_for()
+        assert lim["context_window"] == 64000
+        assert lim["max_tokens"] == 8192
+
+    def test_limits_default(self, tmp_path) -> None:
+        store = Store(tmp_path / "t.db")
+        store.migrate()
+        settings = _settings({})
+        models = Models(store, lambda: settings, agents=_FakeAgents())
+        lim = models.limits_for()
+        assert lim["context_window"] == 128000
+        assert lim["max_tokens"] == 32768
+
+
+class TestListModelsProtocols:
+    @pytest.mark.asyncio
+    async def test_openai_get_models(self, tmp_path) -> None:
+        seen: dict = {}
+
+        def handler(request):
+            seen["url"] = str(request.url)
+            seen["auth"] = request.headers.get("authorization", "")
+            return httpx.Response(200, json={"object": "list", "data": [{"id": "a"}]})
+
+        store = Store(tmp_path / "t.db")
+        store.migrate()
+        settings = _settings({})
+        models = Models(store, lambda: settings, transport=httpx.MockTransport(handler))
+        out = await models.list_models("https://api.test/v1", api_key=SECRET)
+        assert out == ["a"]
+        assert seen["url"] == "https://api.test/v1/models"
+        assert seen["auth"] == f"Bearer {SECRET}"
+        await models.close()
+
+    @pytest.mark.asyncio
+    async def test_anthropic_headers_and_v1_join(self, tmp_path) -> None:
+        seen: list[dict] = []
+
+        def handler(request):
+            seen.append({
+                "url": str(request.url),
+                "x_api_key": request.headers.get("x-api-key", ""),
+                "anthropic_version": request.headers.get("anthropic-version", ""),
+                "auth": request.headers.get("authorization", ""),
+            })
+            return httpx.Response(200, json={"data": [{"id": "claude-a"}]})
+
+        store = Store(tmp_path / "t.db")
+        store.migrate()
+        settings = _settings({})
+        models = Models(store, lambda: settings, transport=httpx.MockTransport(handler))
+        out = await models.list_models("https://anth.test", api_key=SECRET, protocol="anthropic")
+        assert out == ["claude-a"]
+        assert seen[0]["url"] == "https://anth.test/v1/models"
+        assert seen[0]["x_api_key"] == SECRET
+        assert seen[0]["anthropic_version"] == "2023-06-01"
+        assert seen[0]["auth"] == ""
+        # base_url 已经带 /v1：不再叠
+        out = await models.list_models("https://anth.test/v1", api_key=SECRET, protocol="anthropic")
+        assert seen[1]["url"] == "https://anth.test/v1/models"
+        await models.close()
+
+    @pytest.mark.asyncio
+    async def test_responses_protocol_uses_openai_shape(self, tmp_path) -> None:
+        seen: dict = {}
+
+        def handler(request):
+            seen["url"] = str(request.url)
+            seen["auth"] = request.headers.get("authorization", "")
+            return httpx.Response(200, json={"object": "list", "data": [{"id": "gpt-5"}]})
+
+        store = Store(tmp_path / "t.db")
+        store.migrate()
+        settings = _settings({})
+        models = Models(store, lambda: settings, transport=httpx.MockTransport(handler))
+        out = await models.list_models("https://api.test/v1", api_key=SECRET, protocol="responses")
+        assert out == ["gpt-5"]
+        assert seen["url"] == "https://api.test/v1/models"
+        assert seen["auth"] == f"Bearer {SECRET}"
+        await models.close()
+
+    @pytest.mark.asyncio
+    async def test_anthropic_models_key_shape(self, tmp_path) -> None:
+        """有的端点回 {"models": [{"name"/"id"}]} 也认。"""
+
+        def handler(request):
+            return httpx.Response(200, json={"models": [{"name": "claude-b"}, {"id": "claude-c"}]})
+
+        store = Store(tmp_path / "t.db")
+        store.migrate()
+        settings = _settings({})
+        models = Models(store, lambda: settings, transport=httpx.MockTransport(handler))
+        out = await models.list_models("https://anth.test", api_key=SECRET, protocol="anthropic")
+        assert out == ["claude-b", "claude-c"]
+        await models.close()
 
 
 # ----------------------------------------------------------------------

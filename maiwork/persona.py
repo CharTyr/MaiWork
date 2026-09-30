@@ -177,7 +177,7 @@ class Personas:
 
         try:
             result = await self._models.chat(
-                "main", messages, json_mode=True, purpose="persona.refresh", group_id=gid
+                agent="main", messages=messages, json_mode=True, purpose="persona.refresh", group_id=gid
             )
         except ModelError:
             logger.info("群 %s 成员 %s 的画像调主模型失败，下轮再说", gid, uid[:8])

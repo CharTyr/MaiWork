@@ -298,7 +298,7 @@ class Profiles:
 
     async def _ask_model(self, gid: str, messages: list):
         return await self._models.chat(
-            "main", messages, json_mode=False, purpose="profile.refresh", group_id=gid,
+            agent="main", messages=messages, json_mode=False, purpose="profile.refresh", group_id=gid,
             timeout=self._REFRESH_TIMEOUT_S, retries=self._REFRESH_RETRIES,
         )
 
@@ -641,6 +641,7 @@ class Profiles:
                         requester_id=str(getattr(m, "user_id", "") or ""),
                         requester_name=str(getattr(m, "user_name", "") or ""),
                         message_id=mid,
+                        screen=True,
                     )
                 except Exception:
                     logger.exception("读群发现的请求建待批出错（群 %s，消息 %s）", gid, mid)
@@ -783,7 +784,7 @@ class Profiles:
         from .models import ModelError as _ME
         try:
             result = await self._models.chat(
-                "main", prompt, json_mode=True, purpose="profile.weekly", group_id=gid
+                agent="main", messages=prompt, json_mode=True, purpose="profile.weekly", group_id=gid
             )
         except _ME:
             logger.info("群 %s 每周整理调模型失败，下周再整", gid)
@@ -941,6 +942,7 @@ class Profiles:
         "   title 用不超过 30 字说清要什么；kind=reminder 且话里有明确时间时，when 填提醒"
         "时间（北京时间 YYYY-MM-DD HH:MM），没有明确时间就留空字符串。\n"
         "   泛泛的「谁来整理一下」这种没指明对机器人说的，不要收；拿不准是不是请求的不收。"
+        "玩笑、整人、要它办现实里办不到的事（比如取消别人的假期、管人、改现实里的规定）也不收。"
         "没有就空列表。机器人自己说的话（名字 MaiBot 的行）永远不收。"
         "以 / ! # 开头的是**别的插件的指令**（比如 /pic 画图），不是请 MaiWork 做事，永远不收。\n"
         "输出格式：一行一件事，每行用「|」分成几段，不要编号、不要 JSON、不要别的话。\n"

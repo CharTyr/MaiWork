@@ -284,8 +284,8 @@ class Personal:
             '"effort": "大概多久"} | null}'
         )
         result = await self._models.chat(
-            "main",
-            [{"role": "user", "content": "\n".join(lines)}],
+            agent="main",
+            messages=[{"role": "user", "content": "\n".join(lines)}],
             json_mode=True,
             purpose="personal.focus",
             group_id=gid,
@@ -513,8 +513,8 @@ class Personal:
             f' "icon": "从下面这些挑一个：{icon_list}"}}]}}'
         )
         result = await self._models.chat(
-            "main",
-            [{"role": "user", "content": "\n".join(lines)}],
+            agent="main",
+            messages=[{"role": "user", "content": "\n".join(lines)}],
             json_mode=True,
             purpose="personal.score",
             group_id=gid,
@@ -682,8 +682,8 @@ class Personal:
         )
         try:
             result = await self._models.chat(
-                "main",
-                [{"role": "user", "content": "\n".join(lines)}],
+                agent="main",
+                messages=[{"role": "user", "content": "\n".join(lines)}],
                 json_mode=True,
                 purpose="personal.post",
                 group_id=gid,

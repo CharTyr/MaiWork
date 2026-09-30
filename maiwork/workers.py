@@ -1,6 +1,6 @@
 """子 agent 执行器（M2，docs/07-代码接口.md §10.3、需求 R9）。
 
-主模型不亲自干长活：派给子 agent，子 agent 用 models.chat("worker", …) 自己
+主模型不亲自干长活：派给子 agent，子 agent 用 models.chat(agent=<岗位>, …) 自己
 多轮循环，只能用名单里的工具（外加 submit_result），**只能通过 submit_result
 交回**（summary、data、evidence）——不能自己宣布完成，由调用方（主模型 / feeds）验收。
 
@@ -15,6 +15,8 @@
 - 重复调用提醒：同一工具 + 规范化参数连用第 3 / 5 / 8 次往对话里加一句提醒
   （只提醒，不拦截）；有新的 user 消息进来计数清零。
 - 模型调用 ModelError：ok=False，error 带原因。
+- 模型岗位（1b）：run(agent=<kind>) 决定 models.chat 的候选链；默认 = agent_type
+  （specialists 派来的回合自动用所在岗位的模型选择：model/effort/backup）。
 - 任务安全网（app.schedule_task_net / Coordinator 侧，不是这个文件）：暂停时
   workers 下一步开头看到 paused 就停手返回。
 """
@@ -64,13 +66,29 @@ class WorkerReport:
     handoff_id: str = ""
 
 
-def _system_prompt(actor: str, group_id: str, output_schema: dict | None, skills_hint: str = "", identity: Any = None, extra_system: str = "") -> str:
+def _system_prompt(
+    actor: str,
+    group_id: str,
+    output_schema: dict | None,
+    skills_hint: str = "",
+    identity: Any = None,
+    extra_system: str = "",
+    agent: str = "",
+) -> str:
+    """子 agent 的 system 提示。专岗改版 3/4：agent 这一岗（kind）自己的 SOUL.md +
+    AGENTS.md 注入（不再是旧的全局 AGENTS=main 那份）；agent 空 = task（默认通用）。"""
     prefix = ""
+    kind_s = str(agent or "task").strip() or "task"
     if identity is not None:
-        try:
-            prefix = identity.prompt_block("agents")
-        except Exception:
-            prefix = ""
+        blocks: list[str] = []
+        for which in ("soul", "agents"):
+            try:
+                block = identity.agent_prompt_block(kind_s, which)
+            except Exception:
+                block = ""
+            if block:
+                blocks.append(str(block).rstrip("\n"))
+        prefix = ("\n\n".join(blocks) + "\n\n") if blocks else ""
     lines = [
         f"你是 MaiWork 的子 agent（{actor}），在一个 QQ 群（群号 {group_id}）的后台干活。",
         "规则：",
@@ -136,8 +154,18 @@ class Workers:
             logger.exception("skills_hint_fn 出错，这次不带 skill 清单")
             return ""
 
-    def _context_window(self) -> int:
-        """上下文窗口（tokens）；取不到设置就用默认 128000。"""
+    def _context_window(self, kind: str = "task") -> int:
+        """上下文窗口（tokens）：2026-10 改版起认「所选模型」的窗口
+        （models.limits_for(<岗位>)，岗位是 task / news / goal / c_xxx…，跟本轮 agent 走）；
+        取不到回落旧全局值，再用默认 128000。"""
+        try:
+            fn = getattr(self._models, "limits_for", None)
+            if callable(fn):
+                v = int((fn(str(kind or "task") or "task") or {}).get("context_window") or 0)
+                if v > 0:
+                    return v
+        except Exception:
+            pass
         try:
             getter = self._get_settings
             if getter is None:
@@ -178,6 +206,9 @@ class Workers:
         agent_type: str = "task",
         allowed_tools: tuple[str, ...] | list[str] | None = None,
         allowed_skills: tuple[str, ...] | list[str] | None = None,
+        # 1b：模型侧的岗位 kind（默认等于 agent_type——专岗回合就用专岗自己的模型；
+        # 只涉及执行身份、不涉及模型选型的调用方不用动）
+        agent: str | None = None,
     ) -> WorkerReport:
         # 本轮硬权限工具名单：默认 = 请求 tools + submit_result（每轮都硬门）；
         # allowed_tools 给了再收窄成「请求 ∩ allowed_tools」（submit_result 保底）。
@@ -196,7 +227,11 @@ class Workers:
             hard_tools = tuple(narrowed)
         specs = self._tools.specs("worker", list(hard_tools))
         messages: list[dict] = [
-            {"role": "system", "content": _system_prompt(actor, group_id, output_schema, self._hint(skills_hint), identity=self._identity, extra_system=system_extra)},
+            # system 提示按这一岗（agent_type）拿：它自己的 SOUL/AGENTS 注入
+            {"role": "system", "content": _system_prompt(
+                actor, group_id, output_schema, self._hint(skills_hint),
+                identity=self._identity, extra_system=system_extra, agent=str(agent_type or "task"),
+            )},
             {"role": "user", "content": str(brief)},
         ]
         ctx = ToolContext(
@@ -216,7 +251,10 @@ class Workers:
         nudges = 0
         progress: list[str] = []  # 已有进展（失败 / 交回不了时汇报用）
         nudger = compaction.RepeatCallNudger()
-        context_window = self._context_window()
+        # 模型岗位 = 干活身份（agent=… 没给就用 agent_type）：岗位自己的模型/强度/备用
+        # 自动生效；没配该岗候选的在 Models 侧兜底主模型链。
+        agent_kind = str(agent or agent_type or "task")
+        context_window = self._context_window(agent_kind)
         wrapped_up = False  # 到期强制交回的标记（一次：append 提示 + 只给 submit_result）
         spill_dir = None
         if workspace is not None and task_id:
@@ -301,6 +339,7 @@ class Workers:
                     messages,
                     models=self._models,
                     role="worker",
+                    agent=agent_kind,
                     context_window=context_window,
                     output_reserve=compaction.DEFAULT_OUTPUT_RESERVE,
                     purpose="worker",
@@ -315,6 +354,7 @@ class Workers:
                     messages,
                     models=self._models,
                     role="worker",
+                    agent=agent_kind,
                     tools=specs or None,
                     purpose="worker",
                     group_id=str(group_id),

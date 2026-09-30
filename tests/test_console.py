@@ -411,8 +411,12 @@ class TestMemberAccess:
         token = env.app.token_of(G1)
         checks = [
             ("GET", f"/api/settings"),
-            ("PUT", f"/api/settings/models"),
-            ("POST", f"/api/settings/models/test"),
+            ("GET", f"/api/settings/endpoints"),
+            ("PUT", f"/api/settings/endpoints/e1"),
+            ("DELETE", f"/api/settings/endpoints/e1"),
+            ("POST", f"/api/settings/endpoints/e1/test"),
+            ("PUT", f"/api/settings/model-list/m1"),
+            ("DELETE", f"/api/settings/model-list/m1"),
             ("POST", f"/api/groups/{G1}/profile"),
             ("POST", f"/api/groups/{G1}/focus"),
             ("POST", f"/api/groups/{G1}/token"),
@@ -438,22 +442,19 @@ class TestSecretNeverLeaves:
         for path in ("/api/settings", "/api/me", "/api/groups", f"/api/groups/{G1}"):
             r = await env.client.get(path)
             bodies.append(await r.text())
+        # 2026-10 改版 1a：模型走端点+模型库；密钥只进不出
         r = await env.client.put(
-            "/api/settings/models",
-            json={
-                "base_url": "https://ep.test/v1",
-                "main": "m1",
-                "worker": "w1",
-                "main_backup": "",
-                "worker_backup": "",
-            },
+            "/api/settings/endpoints/e1",
+            json={"id": "e1", "base_url": "https://ep2.test/v1", "api_key": SECRET},
         )
         assert r.status == 200
         bodies.append(await r.text())
-        r = await env.client.post(
-            "/api/settings/models/test",
-            json={"base_url": "https://ep.test/v1"},
-        )
+        r = await env.client.get("/api/settings/endpoints")
+        assert r.status == 200
+        bodies.append(await r.text())
+        r = await env.client.post("/api/settings/endpoints/e1/test", json={"base_url": "https://ep2.test/v1"})
+        bodies.append(await r.text())
+        r = await env.client.put("/api/settings/model-list/m9", json={"endpoint": "e1", "model": "mm"})
         bodies.append(await r.text())
         for body in bodies:
             assert SECRET not in body
@@ -552,23 +553,32 @@ class TestAdminOps:
 
     @pytest.mark.asyncio
     async def test_models_save_and_test_endpoint(self, env: SimpleEnv) -> None:
+        """2026-10 改版 1a：网页建端点 + 模型条目 + 岗位选择；test 端点失败消息不带密钥。"""
         await env.login()
         r = await env.client.put(
-            "/api/settings/models",
-            json={"base_url": "https://new.test/v1", "main": "m2", "worker": "w2"},
+            "/api/settings/endpoints/e1",
+            json={"id": "e1", "base_url": "https://new.test/v1", "api_key": "k-1"},
         )
         assert r.status == 200
         data = await r.json()
-        assert data["base_url"] == "https://new.test/v1"
-        # 网页保存 = 写进 config.toml，source 恒 "config"（不再有 "web"）
-        assert data["source"] == "config"
-        assert data["ready"] is True
+        e1 = next(e for e in data["endpoints"] if e["id"] == "e1")
+        assert e1["base_url"] == "https://new.test/v1"
+        assert e1["key_set"] is True
+        # 建模型条目并给「主模型」「任务」选上 → 整体就绪
+        r = await env.client.put("/api/settings/model-list/m1", json={"endpoint": "e1", "model": "gpt-x"})
+        assert r.status == 200
+        r = await env.client.put("/api/agents/main", json={"model": "m1"})
+        assert r.status == 200
+        r = await env.client.put("/api/agents/task", json={"model": "m1"})
+        assert r.status == 200
+        s = await (await env.client.get("/api/settings")).json()
+        assert s["models"]["ready"] is True
         # 校验失败
-        r = await env.client.put("/api/settings/models", json={"base_url": "notaurl", "main": "", "worker": ""})
+        r = await env.client.put("/api/settings/endpoints/bad", json={"id": "bad", "base_url": "notaurl"})
         assert r.status == 400
         assert (await r.json())["error"]
         # test 端点：端点连不上时 ok=False 且错误信息不带密钥
-        r = await env.client.post("/api/settings/models/test", json={"base_url": "http://127.0.0.1:9/x"})
+        r = await env.client.post("/api/settings/endpoints/e1/test", json={"base_url": "http://127.0.0.1:9/x"})
         assert r.status == 200
         t = await r.json()
         assert t["ok"] is False
@@ -576,30 +586,40 @@ class TestAdminOps:
 
     @pytest.mark.asyncio
     async def test_models_save_keeps_retry_rate_and_context(self, env: SimpleEnv) -> None:
-        """网页「模型」表单里的重试、请求频率、上下文长度、最大输出：点保存后要真的存下，
-        不能被路由丢掉、再显示回原来的值（用户实测踩到）。"""
+        """网页端点表单里的重试、请求频率，模型条目里的上下文长度、最大输出：保存后要真的存下，
+        不能被路由丢掉、再显示回原来的值（用户实测踩到旧表单同款问题）。"""
         await env.login()
-        body = {
-            "base_url": "https://new.test/v1", "main": "m2", "worker": "w2",
-            "retries": 3, "retry_delay_s": 20, "max_concurrency": 5, "max_rpm": 30,
-            "context_window": 200000, "max_tokens": 8192,
-        }
-        r = await env.client.put("/api/settings/models", json=body)
+        body = {"id": "e1", "base_url": "https://new.test/v1", "api_key": "k-1",
+                "retries": 3, "retry_delay_s": 20, "max_concurrency": 5, "max_rpm": 30}
+        r = await env.client.put("/api/settings/endpoints/e1", json=body)
         assert r.status == 200, await r.text()
-        data = await r.json()
-        want = {k: body[k] for k in ("retries", "retry_delay_s", "max_concurrency", "max_rpm", "context_window", "max_tokens")}
-        assert {k: data[k] for k in want} == want
-        # 重新拉设置页也是新值
-        s = await (await env.client.get("/api/settings")).json()
-        assert {k: s["models"][k] for k in want} == want
+        want = {k: body[k] for k in ("retries", "retry_delay_s", "max_concurrency", "max_rpm")}
+        ep = next(e for e in (await r.json())["endpoints"] if e["id"] == "e1")
+        assert {k: ep[k] for k in want} == want
+        # 重新拉也是新值
+        s = await (await env.client.get("/api/settings/endpoints")).json()
+        ep = next(e for e in s["endpoints"] if e["id"] == "e1")
+        assert {k: ep[k] for k in want} == want
+        # 模型条目的上下文 / 最大输出同样存下
+        r = await env.client.put(
+            "/api/settings/model-list/m1",
+            json={"endpoint": "e1", "model": "gpt-x", "context_window": 200000, "max_tokens": 8192},
+        )
+        assert r.status == 200
+        m1 = next(m for m in (await r.json())["models"] if m["id"] == "m1")
+        assert {k: m1[k] for k in ("context_window", "max_tokens")} == \
+               {"context_window": 200000, "max_tokens": 8192}
         # 越界值要报错，不能悄悄吞掉
-        r = await env.client.put("/api/settings/models", json={**body, "max_concurrency": 99})
+        r = await env.client.put("/api/settings/endpoints/e1", json={**body, "max_concurrency": 99})
         assert r.status == 400
-        r = await env.client.put("/api/settings/models", json={**body, "max_tokens": 999})
+        r = await env.client.put(
+            "/api/settings/model-list/m1", json={"context_window": 200000, "max_tokens": 999}
+        )
         assert r.status == 400
         # 不传这几项 = 保留当前值
-        r = await env.client.put("/api/settings/models", json={"base_url": "https://new.test/v1", "main": "m2", "worker": "w2"})
-        assert {k: (await r.json())[k] for k in want} == want
+        r = await env.client.put("/api/settings/endpoints/e1", json={"id": "e1", "base_url": "https://new.test/v1"})
+        ep = next(e for e in (await r.json())["endpoints"] if e["id"] == "e1")
+        assert {k: ep[k] for k in want} == want
 
 
 # ----------------------------------------------------------------------
@@ -1676,7 +1696,7 @@ class TestM3Routes:
 class TestGroupViewAgentFish:
     """群视图 agent_fish：管理员 / 群友都能看到各专岗小鱼种子；agents 缺位不炸视图。"""
 
-    _FISH_KINDS = ("news", "idea", "goal", "task")
+    _FISH_KINDS = ("main", "news", "idea", "goal", "task")
 
     @pytest.mark.asyncio
     async def test_admin_view_has_agent_fish_with_seed(self, env: SimpleEnv) -> None:
@@ -1724,7 +1744,7 @@ class TestGroupViewAgentFish:
         r = await env.client.get(f"/api/groups/{token}")
         assert r.status == 200
         view = await r.json()
-        assert view["agent_fish"] == {"news": "", "idea": "", "goal": "", "task": ""}
+        assert view["agent_fish"] == {"main": "", "news": "", "idea": "", "goal": "", "task": ""}
 
     @pytest.mark.asyncio
     async def test_agent_fish_all_empty_when_profiles_raises(self, env: SimpleEnv) -> None:
@@ -1738,7 +1758,7 @@ class TestGroupViewAgentFish:
         r = await env.client.get(f"/api/groups/{token}")
         assert r.status == 200
         view = await r.json()
-        assert view["agent_fish"] == {"news": "", "idea": "", "goal": "", "task": ""}
+        assert view["agent_fish"] == {"main": "", "news": "", "idea": "", "goal": "", "task": ""}
         env.app.agents = real
 
 

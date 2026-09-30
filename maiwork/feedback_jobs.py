@@ -39,7 +39,7 @@ def _model_judge(models: Any, gid: str) -> Callable:
             for m in c["messages"][:10]:
                 lines.append(f"  - {str(m.get('text') or '')[:120]}")
         result = await models.chat(
-            "main", [{"role": "user", "content": "\n".join(lines)}],
+            agent="news", messages=[{"role": "user", "content": "\n".join(lines)}],
             json_mode=True, purpose="feeds.mention_judge", group_id=gid,
         )
         data = json.loads(result.text)

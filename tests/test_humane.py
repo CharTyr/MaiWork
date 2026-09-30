@@ -45,6 +45,7 @@ from fakes import (
     FakeProfiles,
     ensure_pick_fallback,
     focus_reply,
+    patch_two_phase_feeds,
     two_phase_workers_run,
 )
 
@@ -209,6 +210,25 @@ def _make_feeds(
     profiles.entries_map[GID] = [{"category": "ongoing", "text": "在做开源硬件项目"}]
     feeds = Feeds(store, models, workers, profiles, topics, lambda: settings,
                   search=search, host=host)
+    if search is None and workers is not None:
+        # 2026-10-01 撒网改代码按计划搜：FakeWorkers 预置的 items 挪给假搜索出；
+        # 懒取 report——有用例在建好 _feeds 之后才换 report（出错→撒网全挂）
+        def _live_items():
+            if isinstance(getattr(workers, "report", None), BaseException):
+                raise RuntimeError("预置：撒网全挂")
+            r = getattr(workers, "report", None)
+            if r is not None and not getattr(r, "ok", True):
+                raise RuntimeError("预置：子 agent 没跑成")
+            data = getattr(r, "data", None)
+            if isinstance(data, dict):
+                items = list(data.get("items") or [])
+                sf = data.get("seed_focus")  # 老用例：假装都是某方向（diverse 4）搜出来的
+                if isinstance(sf, int) and sf >= 1:
+                    return {sf: items}
+                return items
+            return []
+
+        patch_two_phase_feeds(feeds, models, _live_items)
     return store, settings, feeds, models, workers, topics, profiles
 
 
@@ -566,16 +586,16 @@ class TestViewCurrentNames:
 
 class TestDiverse:
     def test_focus_can_ask_diverse_angle(self, tmp_path) -> None:
-        """定关注点返回带 diverse：它进搜索，产出的条目 angle='diverse'。"""
+        """定关注点返回带 diverse：代码撒网连它的方向也搜（回退单搜）。"""
         models = FakeModelsQueue(ready=True, replies=[_FOCUS_DIVERSE_JSON, _SCORES_JSON, _post_json()])
         store, settings, feeds, models, workers, *_r = _make_feeds(tmp_path, models=models)
         _seed_chat(store)
         with _TimePatch():
             _run(feeds.prepare_news(GID))
-        # 子 agent 的 brief 里两个关注点都有（含不同角度那句）
-        brief = workers.calls[0]["brief"]
-        assert "FPGA 新动态" in brief
-        assert "FPGA 厂商宣传水分" in brief
+        # 2026-10-01 起撒网不改派子 agent：diverse 方向由前面的环节直接搜（没计划 → 回退按方向名单搜）
+        qs = [c["q"] for c in feeds._search.calls]
+        assert "方向1 新进展" in qs         # focus 1 计划的第一条（respond 里 prefill 的）
+        assert "FPGA 厂商宣传水分" in qs    # diverse 方向（没计划 → 回退按方向名单搜）
 
     def test_diverse_items_get_angle_and_cap2(self, tmp_path) -> None:
         """去同质化：一轮最多留 2 条 diverse，超出的筛掉；留下的 angle='diverse'。"""

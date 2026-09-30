@@ -61,21 +61,27 @@ def agents(store, settings):
 
 class TestProfiles:
     def test_four_kinds_in_order(self, agents):
+        """跑交接单的四个岗位在 KINDS 里；profiles() 还会多带一个「main」（主模型，
+        2026-10 改版），它只挂模型选择、不跑交接单。"""
+        from CharTyr_MaiWork.maiwork.agents import KINDS
+
         profiles = agents.profiles()
-        assert [p["kind"] for p in profiles] == ["news", "idea", "goal", "task"]
+        assert list(KINDS) == ["news", "idea", "goal", "task"]
+        assert [p["kind"] for p in profiles] == ["main", "news", "idea", "goal", "task"]
 
     def test_default_shape(self, agents):
         for p in agents.profiles():
-            assert set(p.keys()) == {"kind", "title", "instructions", "skills", "enabled", "tools", "fish_seed"}
+            assert set(p.keys()) == {"kind", "title", "instructions", "skills", "enabled", "tools", "fish_seed", "model", "effort", "backup"}
             assert isinstance(p["title"], str) and p["title"]
             assert isinstance(p["instructions"], str)
             assert isinstance(p["fish_seed"], str)
+            assert isinstance(p["model"], str) and isinstance(p["effort"], str) and isinstance(p["backup"], str)
             assert p["enabled"] is True
 
     def test_default_titles_are_short_names(self, agents):
-        """出厂名字：资讯 / 构想 / 目标（task「通用任务」不动）。"""
+        """出厂名字：主模型 / 资讯 / 构想 / 目标（task「通用任务」不动）。"""
         titles = {p["kind"]: p["title"] for p in agents.profiles()}
-        assert titles == {"news": "资讯", "idea": "构想", "goal": "目标", "task": "通用任务"}
+        assert titles == {"main": "主模型", "news": "资讯", "idea": "构想", "goal": "目标", "task": "通用任务"}
 
     def test_news_default_tools_readonly(self, agents):
         tools = agents.profile("news")["tools"]
@@ -407,7 +413,9 @@ class TestPrompt:
         agents.remember(G1, "news", "上次 AI 新闻反响好", now=1.0)
         text = agents.prompt(G1, "news")
         assert "资讯小队" in text
-        assert "先看画像再搜" in text
+        # 专岗改版 3/4：instructions 不再单独注入（搬进各 kind 的 AGENTS.md 由 workers
+        # 注入；这里只剩「数据」段，避免双重注入）。profile.title、工作册、既往验收都在。
+        assert "先看画像再搜" not in text
         assert "群喜欢硬件" in text
         assert "上次 AI 新闻反响好" in text
 

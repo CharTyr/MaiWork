@@ -298,6 +298,15 @@ class MaiWorkApp:
             except Exception:
                 logger.exception("搜索配置迁移（[search] → 扩展绑定）出错，按现状继续启动")
             moved = _mig.migrate_db_config_to_file(self.store, self.plugin_dir, settings.data_dir)
+            # 1.2 一次性迁移（幂等）：旧 [models] → [[endpoints]] + [[model_list]] + 专岗选择。
+            # 热应用走同一套：文件变了下面重读一份，宿主文件监控随后发的 on_config_update
+            # 幂等跳过；Models.settings() 缓存键含 Settings 对象 id，换了 Settings 自动重算。
+            try:
+                if _mig.migrate_models_config_to_endpoints(self.store, self.plugin_dir, settings.data_dir):
+                    moved = True
+                    logger.info("旧 [models] 模型配置已迁成端点 + 模型库 + 专岗选择")
+            except Exception:
+                logger.exception("模型配置迁移（[models] → 端点/模型库）出错，按现状继续启动")
             if moved:
                 import tomlkit as _tk
 
@@ -539,6 +548,12 @@ class MaiWorkApp:
         # （它们都吃 `_specialists` 注入点）。没就位 → None，网页 API（server.py）503、
         # 业务走老路并记一行日志——绝不静默换成「通才 worker」。
         self.agents = self._make_agents()
+        # 2026-10 模型改版 1a：模型路由读岗位 profile（model/backup）；挂上即生效（清缓存）
+        if self.agents is not None and self.models is not None:
+            try:
+                self.models.set_agents(self.agents)
+            except Exception:
+                logger.exception("给 Models 挂专岗 Agents 出错，模型路由这次按旧 [models] 四槽走")
         self.specialists = self._make_specialists()
         self._wire_specialists()
         # 3.7 回收上次配置里删掉、库里残留的群数据（就地标记，不删）
@@ -1821,12 +1836,17 @@ class MaiWorkApp:
                         out.append(v)
             if self._settings is not None:
                 for v in (
-                    self._settings.models.api_key,
+                    getattr(self._settings.models, "api_key", ""),
                     getattr(self._settings.jev, "api_key", ""),
                     self._settings.console.password,
                 ):
                     v_s = str(v or "")
                     if v_s:
+                        out.append(v_s)
+                # 2026-10 模型改版：所有 [[endpoints]] 的 api_key 也进遮罩（绝不进日志）
+                for ep in (getattr(self._settings, "endpoints", ()) or ()):
+                    v_s = str(getattr(ep, "api_key", "") or "")
+                    if v_s and v_s not in out:
                         out.append(v_s)
                 # [[extensions.mcp]] headers 的值：密钥只进不出，摘要统一遮罩
                 mcp_entries = getattr(getattr(self._settings, "extensions", None), "mcp", ()) or ()
@@ -2214,8 +2234,8 @@ class MaiWorkApp:
                 "remind_ts 默认等于 due_ts。解析不出时间、或时间早于现在 → 只输出 {\"ok\": false}。"
             )
             result = await self.models.chat(
-                "main",
-                [{"role": "user", "content": prompt}],
+                agent="main",
+                messages=[{"role": "user", "content": prompt}],
                 json_mode=True, purpose="reminder_parse", group_id=gid, timeout=60,
                 # 提醒解析在 @ 消息的处理链上直接 await：不能按默认 5 次 ×10 秒重试把
                 # 消息处理卡几分钟，失败这轮就算了（群友可以再发一次）

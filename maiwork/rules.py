@@ -721,9 +721,8 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     _F("usage.alert_daily_tokens", "每日 token 提醒线", "0 = 不提醒", "int", min=0, max=10**9),
     _F("usage.alert_task_tokens", "单任务 token 提醒线", "0 = 不提醒", "int", min=0, max=10**9),
 
-    # ---- models ----
-    _F("models.context_window", "上下文长度（tokens）", "模型一次能记住多长。快满时 MaiWork 会先精简旧内容，再把更早的对话整理成摘要", "int", min=8192, max=2_000_000),
-    _F("models.max_tokens", "最大输出（tokens）", "模型一次回答最多写多长。有些端点不传这个会出问题，一般 32768 就行", "int", min=1024, max=1_000_000),
+    # ---- models（2026-10 改版 1a：端点/模型库走 /api/settings/endpoints*、/api/settings/model-list*；
+    #      [models].* 从「全部配置」拿掉，这里不登记） ----
 
     # ---- tasks ----
     _F("tasks.token_limit", "单个任务最多用多少 token", "超过就自动暂停等你决定（0 = 不限）；点「继续」后重新计算", "int", min=0, max=10**9),

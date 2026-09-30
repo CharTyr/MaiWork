@@ -89,6 +89,19 @@ _FEEDBACK_LOOKBACK_DAYS = 90
 
 _SOUL_KINDS = ("soul", "agents", "memory")
 
+# 专岗改版 3/4：每个专岗自己的 SOUL.md / AGENTS.md。
+# 存储在 <data_dir>/identity/agents/<kind>/ 下；内建 five 个（main/news/idea/goal/task）
+# + 自定义（kind 以 c_ 开头）。旧的全局 SOUL.md / AGENTS.md / MEMORY.md / memory/<gid>.md
+# 留在原处不动：全局 MEMORY 和每群记忆 API 不变；旧的全局 SOUL/AGENTS 首启动时拷给 main
+# （不删，不丢数据）。agent_presets/<kind>.md 是「恢复默认 / 首次内建」的模板；
+# 自定义专岗用 agent_presets/custom.md（preset 找不到的 kind 也回落到它）。
+_BUILTIN_AGENT_KINDS: tuple[str, ...] = ("main", "news", "idea", "goal", "task")
+_AGENT_KIND_RE = re.compile(r"^(?:main|news|idea|goal|task|c_[0-9a-z]{6,32})$")
+_PRESET_DIR = Path(__file__).resolve().parent / "agent_presets"
+_MIGRATION_MARK = "agents/.migrated"  # 相对 identity 根；存在 = 已经迁过
+_CUSTOM_STUB_HEADING = "## 新建的专岗"  # 主模型 AGENTS.md 里登记新建专岗的位置
+_CUSTOM_TRASH_DIRNAME = ".trash"       # 删除专岗时身份文件挪这里（相对 agents/）
+
 
 class Identity:
     """身份与工作记忆。data_dir 是插件数据目录（identity/ 建在下面）。"""
@@ -199,8 +212,22 @@ class Identity:
     # ------------------------------------------------------------------
 
     def read(self, kind: str) -> dict:
+        """读全局身份文件（旧 API）。kind="soul"/"agents"：专岗改版 3/4 起真源是 main 的
+        专岗文档（identity/agents/main/{SOUL,AGENTS}.md）；它还不在/是空 → 回旧全局文件
+        （很老的部署 ensure_started 刚跑完迁移那一会儿就两边都齐了）。"""
         if kind not in _SOUL_KINDS:
             raise ValueError(f"read 只认 {('/'.join(_SOUL_KINDS))}，收到 {kind!r}")
+        if kind in ("soul", "agents"):
+            try:
+                main_doc = self.agent_read("main", kind)
+            except KeyError:
+                main_doc = None
+            legacy_text = self._read_text_or_empty(self._path_of(kind))
+            if main_doc is not None and (
+                str(main_doc.get("text") or "").strip()
+                or not legacy_text.strip()
+            ):
+                return main_doc
         path = self._path_of(kind)
         out: dict[str, Any] = {"text": "", "updated_ts": 0.0}
         try:
@@ -229,6 +256,9 @@ class Identity:
             pass
 
     def write(self, kind: str, text: str) -> dict:
+        """写全局身份文件（旧 API）。kind="soul"/"agents"：旧文件（identity/{SOUL,AGENTS}.md）
+        和 main 的专岗文档一起写——AGENTS.md 的真源已经是 main 那一份，旧 API 改全局也要让
+        专岗文档跟着变（不然前端改完看不见）。"""
         if kind not in _SOUL_KINDS:
             raise ValueError(f"write 只认 {('/'.join(_SOUL_KINDS))}，收到 {kind!r}")
         text = str(text if text is not None else "")
@@ -237,6 +267,11 @@ class Identity:
             raise ValueError(f"超过单个文件上限（{limit} 字节）：请删减到 {limit // 1024}KB 以内")
         self._ensure_dirs()
         self._write_file(self._path_of(kind), text)
+        if kind in ("soul", "agents"):
+            try:
+                self.agent_write("main", kind, text)
+            except KeyError:
+                pass  # 迁移还没跑（极端老部署启动早期）：只落旧全局
         if kind == "soul":
             self._set_soul_synced(False)  # 手动改过的不再是「从 MaiBot 同步」
         return self.read(kind)
@@ -276,14 +311,20 @@ class Identity:
     # ------------------------------------------------------------------
 
     def prompt_block(self, kind: str, group_id: Optional[str] = None) -> str:
-        """注入提示词的统一出口。空文件不出块；各块按 UTF-8 截到上限；块与块空行隔开。"""
+        """注入提示词的统一出口（旧路径：全局 SOUL/AGENTS 等价于 main 的专岗文档）。
+
+        kind = "soul" / "agents"：等价于 agent_prompt_block("main", kind)——主模型
+        （含调用方没分专岗的老代码，比如 feeds 写帖子）读的就是 main 的 SOUL/AGENTS。
+        kind = "memory"：全局 MEMORY.md + 可选本群记忆（这块不移到 agents/ 下，
+        「记忆」页还在用全局路径）。
+        """
         parts: list[str] = []
         if kind == "soul":
-            text = self._cut_utf8(self.read("soul")["text"], self._limit_of("soul")).strip()
+            text = self._cut_utf8(self.agent_read("main", "soul")["text"], self._limit_of("soul")).strip()
             if text:
                 parts.append(f"## MaiWork 的身份\n{text}\n\n")
         elif kind == "agents":
-            text = self._cut_utf8(self.read("agents")["text"], self._limit_of("agents")).strip()
+            text = self._cut_utf8(self.agent_read("main", "agents")["text"], self._limit_of("agents")).strip()
             if text:
                 parts.append(f"## 做事规矩\n{text}\n\n")
         elif kind == "memory":
@@ -298,11 +339,325 @@ class Identity:
         return "".join(parts)
 
     # ------------------------------------------------------------------
+    # 专岗 SOUL / AGENTS（阶段 3：identity/agents/<kind>/）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _agent_kind_ok(kind: Any) -> bool:
+        """专岗 kind 合法：内建 five 个或 c_<2–32 位小写字母数字>；绝不许路径穿越。"""
+        k = str(kind or "").strip()
+        return bool(_AGENT_KIND_RE.match(k))
+
+    def _agent_dir(self, kind: str) -> Path:
+        """这个 kind 的专岗文档目录 identity/agents/<kind>/；不认识的 kind → KeyError。"""
+        k = str(kind or "").strip()
+        if not self._agent_kind_ok(k):
+            raise KeyError(f"没有这个专岗：{k or '(空)'}")
+        return self._root / "agents" / k
+
+    def _agent_path(self, kind: str, which: str) -> Path:
+        w = str(which or "").strip()
+        if w not in ("soul", "agents"):
+            raise KeyError(f"不认识的专岗文档：{w or '(空)'}")
+        return self._agent_dir(kind) / ("SOUL.md" if w == "soul" else "AGENTS.md")
+
+    @staticmethod
+    def _agent_preset_path(kind: str) -> Path:
+        """岗位预设：agent_presets/<kind>.md；自定义 kind（或预设文件没有）回落 custom.md。"""
+        p = _PRESET_DIR / f"{kind}.md"
+        if p.is_file():
+            return p
+        return _PRESET_DIR / "custom.md"
+
+    @staticmethod
+    def _agent_preset_text(kind: str) -> str:
+        try:
+            return Identity._agent_preset_path(kind).read_text(encoding="utf-8")
+        except OSError:
+            return ""
+
+    def agent_read(self, kind: str, which: str) -> dict[str, Any]:
+        """这一个专岗的 SOUL.md 或 AGENTS.md：{"text","updated_ts"}；soul 多带 synced_from_maibot。"""
+        path = self._agent_path(kind, which)
+        out: dict[str, Any] = {"text": "", "updated_ts": 0.0}
+        try:
+            st = path.stat()
+            out["text"] = path.read_text(encoding="utf-8")
+            out["updated_ts"] = float(st.st_mtime)
+        except OSError:
+            pass
+        if str(which) == "soul":
+            out["synced_from_maibot"] = self._agent_soul_synced_flag(kind)
+        return out
+
+    def agent_read_all(self, kind: str) -> dict[str, Any]:
+        """GET /api/agents/{kind}/docs 要的形状：{"soul":…,"agents":…,"limits":{"soul":…,"agents":…}}。"""
+        k = str(kind or "").strip()
+        if not self._agent_kind_ok(k):
+            raise KeyError(f"没有这个专岗：{k or '(空)'}")
+        return {
+            "soul": self.agent_read(k, "soul"),
+            "agents": self.agent_read(k, "agents"),
+            "limits": {"soul": int(self.limits["soul"]), "agents": int(self.limits["agents"])},
+        }
+
+    def agent_write(self, kind: str, which: str, text: str) -> dict[str, Any]:
+        """写这一份专岗文档；超 16KB ValueError；手动改 SOUL 之后 synced_from_maibot 落 False。"""
+        path = self._agent_path(kind, which)
+        text_s = str(text if text is not None else "")
+        limit = self._limit_of(str(which))
+        if len(text_s.encode("utf-8")) > limit:
+            raise ValueError(f"超过单个文件上限（{limit} 字节）：请删减到 {limit // 1024}KB 以内")
+        self._ensure_dirs()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._chmod(path.parent, 0o700)
+        self._write_file(path, text_s)
+        if str(which) == "soul":
+            self._agent_set_soul_synced(kind, False)
+        return self.agent_read(kind, which)
+
+    async def agent_sync_soul(self, kind: str) -> dict[str, Any]:
+        """从 MaiBot 同步生成这一份 SOUL（协程）。旧版存 SOUL.md.bak；内容没变就不覆盖；
+        MaiBot 完全没人格 → 写空串（让子 agent 的 SOUL 真留空，不塞占位人格模板）。
+        返回 {"text","updated_ts","synced_from_maibot":True,"preview_changed":bool}。"""
+        path = self._agent_path(kind, "soul")
+        got: dict[str, str] = {}
+        host = self._host
+        if host is not None:
+            keys = ["bot.nickname", "personality.personality", "personality.reply_style", *_EXTRA_PERSONALITY_KEYS]
+            for key in keys:
+                try:
+                    val = await host.config(key)
+                except Exception:
+                    val = None
+                if val is not None and str(val).strip():
+                    got[key] = str(val).strip()
+        new_text = self._render_soul(got, {}) if got else ""
+        # 有人格才用模板渲染；完全没人格就留空（别给子 agent 灌一堆「# 我是谁 / 边界」的占位文字）
+        old_text = ""
+        try:
+            old_text = path.read_text(encoding="utf-8")
+        except OSError:
+            old_text = ""
+        self._ensure_dirs()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._chmod(path.parent, 0o700)
+        kind_s = str(kind).strip()
+        if not path.exists():
+            # 文件压根还没建（新 kind 首次同步）：落盘（哪怕空串）让「就位」成立
+            self._write_file(path, new_text)
+            self._agent_set_soul_synced(kind, True)
+            out = self.agent_read(kind, "soul")
+            out["preview_changed"] = bool(new_text.strip())
+            return out
+        if self._normalize(old_text) != self._normalize(new_text):
+            self._write_file(path.with_suffix(".md.bak"), old_text)
+            self._write_file(path, new_text)
+            self._agent_set_soul_synced(kind, True)
+            if kind_s == "main":
+                # 主模型那一份也镜像回旧全局 SOUL.md：admin_chat 等还在 prompt_block("soul")
+                # / read("soul") 的调用方走的就是 main 的专岗文档，两边本来就是一回事
+                try:
+                    self._write_file(self._root / "SOUL.md.bak", self._read_text_or_empty(self._path_of("soul")))
+                    self._write_file(self._path_of("soul"), new_text)
+                    self._set_soul_synced(True)
+                except OSError:
+                    pass
+            out = self.agent_read(kind, "soul")
+            out["preview_changed"] = True
+            return out
+        if not self._agent_synced_mark_path(kind).exists():
+            self._agent_set_soul_synced(kind, True)
+        out = self.agent_read(kind, "soul")
+        out["preview_changed"] = False
+        return out
+
+    def agent_reset_agents(self, kind: str) -> dict[str, Any]:
+        """把 AGENTS.md 换回 agent_presets/<kind>.md 的内容（自定义专岗回落 custom.md）。
+        预设文件本身读不到 → ValueError（别默默写空）。返回 {"text","updated_ts"}。"""
+        path = self._agent_path(kind, "agents")
+        preset = self._agent_preset_text(str(kind).strip())
+        if not preset:
+            raise ValueError(f"找不倒这个专岗的预设：{kind}")
+        self._ensure_dirs()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._chmod(path.parent, 0o700)
+        self._write_file(path, preset)
+        return self.agent_read(kind, "agents")
+
+    # ------------------------------------------------------------------
+    # 自定义专岗：建 / 删（专岗改版 4/4）
+    # ------------------------------------------------------------------
+
+    async def agent_init_custom(self, kind: str, title: str) -> None:
+        """新建自定义专岗（POST /api/agents 的落点）：identity/agents/<kind>/ 就位。
+        - SOUL 从 MaiBot 同步（没人格就空，和 _migrate_agent_docs_once 的规矩一致）；
+        - AGENTS 用 custom.md 预设；
+        - 然后在 main 的 AGENTS.md 里自动加一行 stub（「新建的专岗」小节），
+          提示主模型「什么时候派给它」还没写。
+        """
+        kind_s = str(kind or "").strip()
+        if not self._agent_kind_ok(kind_s) or kind_s in _BUILTIN_AGENT_KINDS:
+            raise KeyError(f"不能这样建专岗：{kind_s or '(空)'}")
+        title_s = str(title or "").strip()[:40]
+        # SOUL：从 MaiBot 同步（沿用 agent_sync_soul 的「覆盖前存 .bak」流程没意义——
+        # 新 kind 一定是空目录；直接走 got 渲染更省事，而且行为一致）
+        await self.agent_sync_soul(kind_s)
+        # AGENTS：custom 预设
+        self.agent_reset_agents(kind_s)
+        # main AGENTS.md 加一行 stub（幂等：同一 kind 不重复加）
+        self._append_custom_stub_to_main_agents(kind_s, title_s)
+
+    def _append_custom_stub_to_main_agents(self, kind: str, title: str) -> None:
+        """在 main 的 AGENTS.md「新建的专岗」小节里补一行 stub（管理员可再改）。
+        位置：优先找既有的「## 新建的专岗」小节；没有就挂在文末（新建这一节）。"""
+        try:
+            path = self._agent_path("main", "agents")
+        except KeyError:
+            return
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        stub = f"- 「{title}」({kind})：什么时候派给它？（请补上）"
+        # 幂等：已经有一行 (kind) 就不重复（管理员改过名字行还在）
+        if f"({kind})" in text:
+            return
+        new_text = self._insert_stub_under_heading(text, _CUSTOM_STUB_HEADING, stub)
+        self._ensure_dirs()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._chmod(path.parent, 0o700)
+        self._write_file(path, new_text)
+
+    @staticmethod
+    def _insert_stub_under_heading(text: str, heading: str, stub: str) -> str:
+        """把 stub 插在「## 新建的专岗」那一段末尾；没有这段就追加在文末（新建这一节）。"""
+        lines = str(text or "").splitlines()
+        # 1) 优先挂在「## 新建的专岗」小节的最后一行（小节末尾或下一个 ## 前）
+        anchor_idx: int | None = None
+        for i, ln in enumerate(lines):
+            if ln.strip().startswith("##") and heading in ln:
+                anchor_idx = i
+                break
+            # main.md 预设的小节名可能写的是「## 派给哪个专岗」+注释；抓那个「下面是你新建的专岗」
+            # 提示行也可以当作同一小节的末尾（插在那一行后面）
+            if "下面是你新建的专岗" in ln or "新建的专岗" in ln and ln.strip().startswith("-"):
+                anchor_idx = i
+        if anchor_idx is not None:
+            # 小节从 anchor 往下，找到下一个 ## 或文末尾；stub 插在前面
+            j = anchor_idx + 1
+            end = len(lines)
+            while j < len(lines):
+                if lines[j].strip().startswith("## ") and j > anchor_idx:
+                    end = j
+                    break
+                # 预设的注释块（<!-- … -->）里的「例如」是说明，不是 stub；stub 插在注释块后面
+                if lines[j].strip() == "-->":
+                    end = j + 1
+                    break
+                j += 1
+            # 往上找最后一行非空
+            while end > anchor_idx + 1 and not lines[end - 1].strip():
+                end -= 1
+            lines.insert(end, stub)
+            return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+        # 2) 没找到小节：追加在文末，自带小节标题
+        parts = [str(text or "").rstrip("\n"), "", heading, "", stub, ""]
+        return "\n".join(parts)
+
+    def _remove_custom_stub_from_main_agents(self, kind: str) -> bool:
+        """DELETE 时把 main AGENTS.md 里「(<kind>)」那一行删掉——只删「还没被管理员改过」
+        的（还是 stub 原型的那行）；管理员已经在前面/后面写过什么时候派给它，就保留不动
+        （他的判断可能比软件更准）。返回 True=删过一行；False=没动（行不在 / 已被改过）。"""
+        try:
+            path = self._agent_path("main", "agents")
+        except KeyError:
+            return False
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        lines = str(text or "").splitlines()
+        stub_mark = f"({kind})"
+        proto_mark = "什么时候派给它？（请补上）"
+        for i, ln in enumerate(lines):
+            if stub_mark in ln and proto_mark in ln:
+                # 还是 stub 原型（管理员没动）→ 删整行
+                lines.pop(i)
+                self._ensure_dirs()
+                self._write_file(path, "\n".join(lines) + ("\n" if text.endswith("\n") else ""))
+                return True
+        return False
+
+    def agent_trash_custom(self, kind: str) -> Path | None:
+        """删专岗时把它的文档目录挪到 identity/agents/.trash/<时间戳>_<kind>/（不硬删）。
+        返回挪到的新位置；源目录本来就不在（已删过 / 没建过）返回 None。"""
+        kind_s = str(kind or "").strip()
+        if not self._agent_kind_ok(kind_s):
+            raise KeyError(f"没有这个专岗：{kind_s or '(空)'}")
+        src = self._root / "agents" / kind_s
+        if not src.is_dir():
+            return None
+        self._remove_custom_stub_from_main_agents(kind_s)
+        trash = self._root / "agents" / _CUSTOM_TRASH_DIRNAME
+        trash.mkdir(parents=True, exist_ok=True)
+        self._chmod(trash, 0o700)
+        # 名字带时间戳，删了再建同 kind 不撞
+        ts = clock.bj(clock.now()).strftime("%Y%m%d-%H%M%S")
+        dst = trash / f"{ts}_{kind_s}"
+        n = 0
+        while dst.exists():
+            n += 1
+            dst = trash / f"{ts}_{kind_s}.{n}"
+        try:
+            src.rename(dst)
+        except OSError:
+            logger.exception("挪专岗 %s 的文档到 .trash 失败（留着不硬删）", kind_s)
+            return None
+        return dst
+
+    def _agent_synced_mark_path(self, kind: str) -> Path:
+        return self._agent_dir(kind) / ".soul_synced"
+
+    def _agent_soul_synced_flag(self, kind: str) -> bool:
+        try:
+            return self._agent_synced_mark_path(kind).read_text(encoding="utf-8").strip() == "1"
+        except OSError:
+            return False
+
+    def _agent_set_soul_synced(self, kind: str, flag: bool) -> None:
+        try:
+            self._write_file(self._agent_synced_mark_path(kind), "1" if flag else "0")
+        except OSError:
+            pass
+
+    def agent_prompt_block(self, kind: str, which: str) -> str:
+        """专岗的 SOUL / AGENTS 提示词块（标题和全局版一致；空文件出空串）。
+
+        which 只认 "soul" / "agents"；其他 ValueError。大小同 prompt_block：«## MaiWork 的身份»
+        或 «## 做事规矩»，按 UTF-8 截 16KB，末尾空行。
+        """
+        w = str(which or "").strip()
+        if w == "soul":
+            text = self._cut_utf8(self.agent_read(kind, "soul")["text"], self._limit_of("soul")).strip()
+            return f"## MaiWork 的身份\n{text}\n\n" if text else ""
+        if w == "agents":
+            text = self._cut_utf8(self.agent_read(kind, "agents")["text"], self._limit_of("agents")).strip()
+            return f"## 做事规矩\n{text}\n\n" if text else ""
+        raise ValueError(f"agent_prompt_block 只认 soul / agents，收到 {w or '(空)'}")
+
+    # ------------------------------------------------------------------
     # 首次启动 + 从 MaiBot 同步
     # ------------------------------------------------------------------
 
     async def ensure_started(self) -> None:
-        """插件启动时调一次：建目录；缺的文件补默认；SOUL 不存在则从 MaiBot 同步生成一次。"""
+        """插件启动时调一次：
+        - 旧的全局 SOUL.md / AGENTS.md / MEMORY.md / memory/ 就位（兼容老部署）；
+        - 每个内建专岗（main/news/idea/goal/task）的 identity/agents/<kind>/SOUL.md、
+          AGENTS.md 就位——main 拷旧全局；其余 SOUL 从 MaiBot 同步、AGENTS 用岗位预设
+          （预设 + 旧 instructions 非空时附加「## 原职责」一节），迁移只做一次
+          （identity/agents/.migrated），之后管理员改过不再被覆盖。
+        """
         self._ensure_dirs()
         agents = self._path_of("agents")
         if not agents.exists():
@@ -321,6 +676,96 @@ class Identity:
         else:
             # 兜底：老部署可能只有空文件/半截文件——不自动覆盖，只保证文件存在
             self._chmod(soul, 0o600)
+        # 专岗文档迁移：只做一次；标记文件存在即跳过
+        mark = self._root / _MIGRATION_MARK
+        if not mark.exists():
+            try:
+                await self._migrate_agent_docs_once()
+            except Exception:
+                logger.exception("专岗 SOUL/AGENTS 首次迁移出错（下轮启动再试）")
+                return  # 不写标记：下轮重启再迁
+            try:
+                mark.parent.mkdir(parents=True, exist_ok=True)
+                self._chmod(mark.parent, 0o700)
+                self._write_file(mark, "1")
+            except OSError:
+                pass
+
+    async def _migrate_agent_docs_once(self) -> None:
+        """identity/agents/<内建 kind>/ 就位（只做一次）。可重入安全：单文件已存在就不覆盖。"""
+        # 1) MaiBot 人格只拉一次，五个内建专岗共用（main 不需要——它优先用旧全局 SOUL）
+        got: dict[str, str] = {}
+        host = self._host
+        if host is not None:
+            keys = ["bot.nickname", "personality.personality", "personality.reply_style", *_EXTRA_PERSONALITY_KEYS]
+            for key in keys:
+                try:
+                    val = await host.config(key)
+                except Exception:
+                    val = None
+                if val is not None and str(val).strip():
+                    got[key] = str(val).strip()
+        persona_text = self._render_soul(got, {}) if got else ""
+
+        root_agents = self._root / "agents"
+        root_agents.mkdir(parents=True, exist_ok=True)
+        self._chmod(root_agents, 0o700)
+
+        # 旧的全局 SOUL / AGENTS（可能不存在，给 main 拷贝用）
+        global_soul = self._read_text_or_empty(self._path_of("soul"))
+        global_agents = self._read_text_or_empty(self._path_of("agents"))
+
+        for kind in _BUILTIN_AGENT_KINDS:
+            d = root_agents / kind
+            d.mkdir(parents=True, exist_ok=True)
+            self._chmod(d, 0o700)
+            soul_p = d / "SOUL.md"
+            agents_p = d / "AGENTS.md"
+            # 幂等：文件已存在就不动（管理员改过也保留）
+            if not soul_p.exists():
+                if kind == "main" and global_soul.strip():
+                    self._write_file(soul_p, global_soul)
+                elif persona_text:
+                    self._write_file(soul_p, persona_text)
+                else:
+                    self._write_file(soul_p, "")
+                # 迁移来的不算「从 MaiBot 同步出来的」（main 那份内容其实是管理员维护过的）
+                # 但首次没有主管理员动过，标 synced 让前端「已和 MaiBot 同步」不闪——main
+                # 若真来自旧全局就给 False，否则（用了 MaiBot 人格或空兜底）给 True
+                self._agent_set_soul_synced(kind, not (kind == "main" and global_soul.strip()))
+            if not agents_p.exists():
+                # main：老部署管理员改过的全局 AGENTS.md 拷过来；但全局还是出厂默认模板
+                # （没人维护过）时别拷那份旧的，直接用 main 岗位预设（它含「派给哪个专岗」
+                # 和「新建的专岗」提示小节，是给主模型量身写的）。
+                if kind == "main" and global_agents.strip() and global_agents.strip() != _AGENTS_DEFAULT.strip():
+                    text = global_agents
+                else:
+                    text = self._agent_preset_text(kind)
+                    # 旧 instructions 非空就附在末尾「## 原职责」小节；预设已经涵盖的就跳过重复
+                    old_instr = self._old_agent_instructions(kind)
+                    if old_instr and old_instr not in text:
+                        text = (text.rstrip("\n") + "\n\n## 原职责\n\n" + old_instr.strip() + "\n")
+                self._write_file(agents_p, text)
+
+    @staticmethod
+    def _read_text_or_empty(path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _old_agent_instructions(kind: str) -> str:
+        """内建专岗「旧 instructions / 职责」字段的默认文案（agents.py 出厂值）。迁移时
+        附到 AGENTS.md 末尾（只对确实装过这条职责的岗位；main / task 的预设已经包含
+        「干什么」的话，就不再重复附加）。admin 真改过的 instructions 走 agents.py 的
+        kv（agents.profiles），identity 看不到；老的出厂值足够代表「原来的职责」。"""
+        return {
+            "news": "为群找值得看的资讯：先读画像与关注点，再撒网搜索、逐条打开核对。",
+            "idea": "为群出可落地的构想：结合画像与聊天线索做调研，给出依据和下一步。",
+            "goal": "为群推进目标：调查进展、核验收依据，绝不自己立目标或改进度。",
+            "task": "既有的派活流程：主模型派子 agent、验收、交付——专岗不替代它。",
+        }.get(kind, "")
 
     async def sync_soul_from_maibot(self) -> dict:
         """从 MaiBot 重新生成 SOUL。覆盖前旧版存 SOUL.md.bak；生成内容没变就不覆盖。
@@ -351,6 +796,15 @@ class Identity:
             self._write_file(bak, old_text)  # 覆盖前旧版存 .bak（首次为空也留档）
             self._write_file(soul_path, new_text)
             self._set_soul_synced(True)
+            # 专岗改版 3/4：main 的专岗 SOUL 跟着一起同步（前端「主模型」页点同步走的就是它）
+            try:
+                main_path = self._agent_path("main", "soul")
+                main_path.parent.mkdir(parents=True, exist_ok=True)
+                self._chmod(main_path.parent, 0o700)
+                self._write_file(main_path, new_text)
+                self._agent_set_soul_synced("main", True)
+            except (KeyError, OSError):
+                pass
             out = self.read("soul")
             out["preview_changed"] = True
             return out

@@ -788,7 +788,7 @@ class ReplayModels:
         self.queue = list(results)
         self.calls = []
 
-    async def chat(self, role, messages, **kwargs):
+    async def chat(self, role=None, messages=None, **kwargs):
         self.calls.append((role, [dict(m) for m in messages], kwargs))
         if not self.queue:
             return type("R", (), {"text": "", "tool_calls": []})()

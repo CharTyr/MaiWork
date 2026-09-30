@@ -71,7 +71,9 @@ def _make(tmp_path: Path, store: Store, *, host: Any = None, cfg: dict | None = 
 
 def test_first_start_files_created_and_dir_perms(tmp_path: Path, store: Store) -> None:
     """首次启动：identity/ 目录就位、SOUL 三节的兜底版（没 host 也有）、
-    AGENTS 默认模板（交付前自查/不编造/做不到就说/成品放 artifacts）、MEMORY 空。"""
+    main 的 AGENTS 用主模型预设（不编造/做不到就说/成品放 artifacts/派给哪个专岗）、MEMORY 空。
+    （2026-10 专岗改版 3/4：旧 AGENTS 出厂模板让位给 agent_presets/main.md，
+    里面同样覆盖不编造、做不到就说、artifacts 约定，就不再老钉「交付前自查」四字。）"""
     identity = _make(tmp_path, store)
     _run(identity.ensure_started())
     root = tmp_path / "data" / "identity"
@@ -88,8 +90,10 @@ def test_first_start_files_created_and_dir_perms(tmp_path: Path, store: Store) -
     soul = identity.read("soul")["text"]
     assert "# 我是谁" in soul and "# 说话方式" in soul and "# 边界" in soul
     agents = identity.read("agents")["text"]
-    assert "交付前自查" in agents and "不编造" in agents and "做不到就说" in agents
+    # main 预设（agent_presets/main.md）：给主模型看的那份
+    assert "不编造" in agents and "做不到就说" in agents
     assert "artifacts" in agents
+    assert "派给哪个专岗" in agents
     assert identity.read("memory")["text"] == ""
 
 

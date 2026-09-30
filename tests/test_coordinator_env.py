@@ -68,7 +68,7 @@ class ModelsQueue:
 
         return _S()
 
-    async def chat(self, role, messages, **kwargs):
+    async def chat(self, role=None, messages=None, **kwargs):
         snap = [dict(m) for m in messages]
         self.calls.append((role, snap, kwargs))
         if not self.reply_queue:

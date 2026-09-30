@@ -27,7 +27,14 @@ from CharTyr_MaiWork.maiwork.feeds import Feeds, run_railway_verify
 from CharTyr_MaiWork.maiwork.store import Store
 from CharTyr_MaiWork.maiwork.workers import WorkerReport
 
-from fakes import PICK_FALLBACK_REPLY, FakeModelsQueue, FakeProfiles, focus_reply, two_phase_workers_run
+from fakes import (
+    PICK_FALLBACK_REPLY,
+    FakeModelsQueue,
+    FakeProfiles,
+    focus_reply,
+    patch_two_phase_feeds,
+    two_phase_workers_run,
+)
 
 BJ = timezone(timedelta(hours=8))
 NOW = 1_790_000_000.0
@@ -84,8 +91,8 @@ _VERIFY_PICK_JSON = json.dumps(
 class FakeWorkers:
     """假 workers.run：索引第几次调用，按队列回 WorkerReport。
 
-    两阶段恒生效：feeds-discover 时弹一条（这条当作「老路收上来的候选」记住，
-    种进撒网登记簿）；feeds-verify 时按 brief 里列出的链接交回这份的子集。
+    2026-10-01 起撒网不再派子 agent：_make_feeds 在建好时先把「找资讯那一步」的
+    预置退出队列挪给假搜索（seed_collect）；feeds-verify 按 brief 里列出的链接交回这份的子集。
     """
 
     def __init__(self, reports: list[Any] | None = None, default: Any = None) -> None:
@@ -94,15 +101,20 @@ class FakeWorkers:
         self.calls: list[dict] = []
         self._collect_report: Any = None
 
+    def seed_collect(self, feeds: Any, models: Any = None) -> None:
+        """弹出第一步的预置（老路收上来的候选那一份），交给假搜索出。"""
+        r = self.reports.pop(0) if self.reports else self.default
+        if isinstance(r, BaseException):
+            patch_two_phase_feeds(feeds, models, [], fail_all=True)
+        else:
+            self._collect_report = r
+            data = getattr(r, "data", None) or {}
+            patch_two_phase_feeds(feeds, models, list(data.get("items") or []))
+
     async def run(self, brief: str, **kwargs: Any) -> Any:
         self.calls.append({"brief": str(brief), **kwargs})
         task_id = str(kwargs.get("task_id") or "")
-        if task_id.startswith(("feeds-discover:", "feeds-verify:")):
-            if task_id.startswith("feeds-discover:"):
-                r = self.reports.pop(0) if self.reports else self.default
-                if isinstance(r, BaseException):
-                    raise r
-                self._collect_report = r
+        if task_id.startswith("feeds-verify:") and self._collect_report is not None:
             return await two_phase_workers_run(self._collect_report, brief, kwargs)
         if self.reports:
             r = self.reports.pop(0)
@@ -169,6 +181,8 @@ def _make_feeds(
     topics = FakeTopics()
     feeds = Feeds(store, models, workers, profiles, topics, lambda: settings,
                   search=None, verify_runner=verify_runner)
+    if hasattr(workers, "seed_collect"):
+        workers.seed_collect(feeds, models)
     return store, settings, feeds
 
 

@@ -767,8 +767,11 @@ class TestGlobalRoutesDenied:
         "/api/groups/" + G1 + "/group-admin",
     )
     GLOBAL_WRITE = (
-        ("PUT", "/api/settings/models", {"base_url": "x"}),
-        ("POST", "/api/settings/models/test", {"base_url": "https://x"}),
+        ("PUT", "/api/settings/endpoints/e1", {"id": "e1", "base_url": "https://x"}),
+        ("POST", "/api/settings/endpoints/e1/test", {"base_url": "https://x"}),
+        ("DELETE", "/api/settings/endpoints/e1", None),
+        ("PUT", "/api/settings/model-list/m1", {"endpoint": "e1", "model": "x"}),
+        ("DELETE", "/api/settings/model-list/m1", None),
         ("PUT", "/api/settings/rules", {}),
         ("POST", "/api/settings/rules/reset", {"field": "quiet_hours"}),
         ("PUT", "/api/settings/config", {}),

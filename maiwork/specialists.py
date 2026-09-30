@@ -25,6 +25,8 @@ logger = logging.getLogger("maiwork.specialists")
 # news / idea / goal 专岗的默认硬白名单（契约 §8）：只读调研工具 + 交回。
 # 「实际存在的才用」：交集时若名字未注册被 Tools.specs 自然剔除；task 岗位 tools=None
 # 代表不受这份岗位名单限制，调用方本次给什么用什么。
+# 专岗改版 4/4：自定义专岗（c_xxx）也走 task 这一条——调用方给的 tools 是什么用什么，
+# 不套专岗调研的只读白名单（它的「谁是自定义专岗」由 agents.is_custom_kind 把关）。
 _SPECIALIST_DEFAULT_TOOLS: dict[str, tuple[str, ...] | None] = {
     "news": ("web_search", "fetch_page", "read_profile", "search_chat",
              "read_chat_history", "list_skills", "read_skill", "submit_result"),
@@ -34,7 +36,6 @@ _SPECIALIST_DEFAULT_TOOLS: dict[str, tuple[str, ...] | None] = {
              "read_chat_history", "list_skills", "read_skill", "submit_result"),
     "task": None,
 }
-_VALID_KINDS = frozenset(_SPECIALIST_DEFAULT_TOOLS)
 
 
 class Specialists:
@@ -110,26 +111,30 @@ class Specialists:
     def _resolve_allowed_skills(self, kind: str, profile: dict | None = None) -> tuple[str, ...] | None:
         """岗位 skill 白名单 ∩ 当前生效的 skill（动态开关已在 skills.list 内处理）。
 
-        - task 且 profile.skills 为 None：保持旧行为（None = 通才）。
-        - 非 task 岗位：profile.skills 为 None / 类型坏 / 读 skills 目录出错 → ()
-          （这岗位目前不给 skill；fail-closed，profile 坏了不放大成「全部 skill」）。
+        - task / 自定义专岗（c_xxx）且 profile.skills 为 None：保持旧行为（None = 通才）。
+        - 其余专岗（news/idea/goal，都是调研岗）：profile.skills 为 None / 类型坏 /
+          读 skills 目录出错 → ()（这岗位目前不给 skill；fail-closed）。
         """
+        try:
+            is_generalist = kind == "task" or bool(self._agents.is_custom_kind(kind))
+        except Exception:
+            is_generalist = kind == "task"
         if profile is None:
             try:
                 profile = self._agents.profile(kind)
             except Exception:
-                return () if kind != "task" else None
+                return None if is_generalist else ()
         profile_skills = profile.get("skills")
         if profile_skills is None:
-            return None if kind == "task" else ()
+            return None if is_generalist else ()
         try:
             if isinstance(profile_skills, (list, tuple)):
                 wanted = [str(x).strip() for x in profile_skills if str(x or "").strip()]
             else:
                 # 坏类型（写成了 str / dict / int 等）→ fail-closed
-                return () if kind != "task" else None
+                return None if is_generalist else ()
         except Exception:
-            return () if kind != "task" else None
+            return None if is_generalist else ()
         if not wanted:
             return ()
         try:
@@ -183,9 +188,11 @@ class Specialists:
         gid = str(group_id or "")
         kind_s = str(kind or "").strip()
 
-        # 1) 岗位合法
-        if kind_s not in _VALID_KINDS:
-            return WorkerReport(ok=False, summary="", error=f"未知岗位：{kind_s}")
+        # 1) main 不跑交接单（它是主模型，不是能跑活的专岗）——早拒；
+        #    其他 kind = Agents 认（内建或 kv 里的自定义；专岗改版 4/4 起不锁死四个
+        #    名字——_kind_known 自己不认识的 kind 会 ValueError，下游一致当 404）。
+        if kind_s == "main":
+            return WorkerReport(ok=False, summary="", error="主模型不是专岗，不能跑交接单")
         # 2) 先验证服务群（读全局 / profile 之前）——Agents.memory 顺带把「非服务群
         #    零读库拒绝」当了哨子。
         try:

@@ -1553,3 +1553,35 @@ a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 /* 专岗小鱼放在对应页面的大标题前：资讯（最新一批）/ 构想 / 目标 / 任务 */
 .h-fish { display: flex; align-items: center; gap: 10px; }
 .h-fish > svg { flex: none; width: 1.2em; height: 1.2em; margin-left: -0.12em; }
+
+/* 小鱼定制：鱼种 / 眼神是带缩略图的小格子，颜色是圆色块；选中的描一圈 */
+.fish-preview { display: flex; align-items: center; gap: 14px; margin: 4px 0 8px; }
+.fish-preview > svg { flex: none; width: 96px; height: 96px; }
+.fish-opts { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 8px; }
+.fish-opt { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 6px 4px; border-radius: 14px; background: var(--fill); font-size: 12px; color: var(--ink); border: 2px solid transparent; transition: border-color 0.15s, transform 0.15s; }
+.fish-opt svg { width: 40px; height: 40px; }
+.fish-opt[aria-pressed="true"] { border-color: var(--ink); background: var(--card); }
+.fish-swatches { display: flex; flex-wrap: wrap; gap: 10px; }
+.fish-swatch { width: 32px; height: 32px; border-radius: 50%; background: var(--c); border: 3px solid var(--card); box-shadow: 0 0 0 1px var(--line); transition: box-shadow 0.15s, transform 0.15s; }
+.fish-swatch[aria-pressed="true"] { box-shadow: 0 0 0 2px var(--ink); }
+.fish-opt:active, .fish-swatch:active { transform: scale(0.94); }
+.fish-opt:focus-visible, .fish-swatch:focus-visible { outline: 2px solid var(--blue, #3F7CF2); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { .fish-opt, .fish-swatch { transition: none; } }
+
+/* 模型页（2026-10）：每个端点一块，下面挂它的模型 */
+.mdl-ep-box { margin: 10px 0 18px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+.mdl-ep-box .set-name .tag { margin-left: 8px; }
+.mdl-list { padding-left: 18px; border-left: 2px solid var(--fill); margin: 4px 0 8px 22px; display: grid; gap: 2px; }
+.mdl-list > .btn { justify-self: start; margin: 6px 0; }
+.mdl-efforts { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.mdl-more { margin-top: 8px; }
+.mdl-more summary { cursor: pointer; color: var(--gray); font-size: 14px; }
+@media (max-width: 560px) { .mdl-list { margin-left: 4px; padding-left: 10px; } }
+
+/* 专岗页（2026-10）：主模型下面挂头像；设置里 SOUL / AGENTS 两个大框 */
+.agent-avatar { margin: -4px 0 12px 64px; }
+.agent-avatar .h-sub { font-size: 15px; margin-top: 4px; }
+.agent-doc { margin-top: 14px; }
+.agent-doc .mono-area { width: 100%; }
+.btn.danger { color: var(--red); }
+@media (max-width: 560px) { .agent-avatar { margin-left: 0; } }

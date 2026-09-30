@@ -28,6 +28,7 @@ from fakes import (
     FakeProfiles,
     ensure_pick_fallback,
     focus_reply,
+    patch_two_phase_feeds,
     two_phase_workers_run,
 )
 
@@ -351,6 +352,11 @@ class TestRssInPipeline:
                 _search_item(0, title="搜索来的候选", url="https://s.example.com/one"),
             ])),
         )
+        # 2026-10-01 撒网改代码按计划搜：「搜索回来的候选」挪给假搜索出（替换 _EmptySearch）
+        patch_two_phase_feeds(feeds, models, [{
+            "title": "搜索来的候选", "url": "https://s.example.com/one", "summary": "摘要",
+            "kind": "news", "published": NOW - 3600, "quote": _QUOTE,
+        }])
         feeds._rss_transport = httpx.MockTransport(lambda req: httpx.Response(200, text=xml))
         rss.add_feed(store, G1, url="https://good.example.com/feed", title="好博客",
                      feed_id="rG", now=NOW)

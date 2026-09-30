@@ -725,7 +725,7 @@ class TestCancelStopsSubAgent:
             def settings(self):
                 return type("S", (), {"ready": lambda self: True})()
 
-            async def chat(self, role, messages, **kw):
+            async def chat(self, role=None, messages=None, **kw):
                 calls["n"] += 1
                 return type(
                     "R",

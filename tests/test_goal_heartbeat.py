@@ -51,7 +51,7 @@ class FakeModels:
 
         return _S()
 
-    async def chat(self, role, messages, **kwargs):
+    async def chat(self, role=None, messages=None, **kwargs):
         if not self.replies:
             return SimpleNamespace(text="{}", tool_calls=[])
         item = self.replies.pop(0)

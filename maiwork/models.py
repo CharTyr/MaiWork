@@ -1,21 +1,46 @@
-"""OpenAI 兼容客户端 + 模型设置（网页可改）+ 用量统计 + 最近请求日志。
+"""模型客户端 + 模型设置（网页可改）+ 用量统计 + 最近请求日志。
 
-- 设置来源：config.toml 的 [models]（网页「设置 → 模型」改的也是它——直写文件，
-  数据库不再存配置覆盖层）；都没有 source="none"。checked_at / available
-  （测试连接的结果）不是配置，存 kv["models.checked"]，GET 时并回来显示。
+2026-10 改版 1a（计划见 docs/12）：
+
+- 三层配置：config.toml 的 `[[endpoints]]` 端点 + `[[model_list]]` 模型库 +
+  专岗自选（kv `agents.profiles` 的 model/effort/backup，main/news/idea/goal/task）。
+  旧 `[models]` 四槽是过渡兜底：model_list 空且旧四槽有值时按旧规则干
+  （启动迁移一次搬走；写新配置的网页不再落 `[models]`）。
+- chat()（1b 起）：三种协议各有适配层（请求拼装 / 响应解析都是纯函数，
+  _build_openai_request / _build_responses_request / _build_anthropic_request +
+  _parse_chat / _parse_responses_response / _parse_anthropic_response）：
+  openai 走 /chat/completions（流式）；responses 走 /responses；anthropic 走
+  /v1/messages（非流式）。干活岗位由 chat(agent=<kind>) 定：候选链 = 该岗位
+  profile 的 model→backup；岗位没解析出候选时用主模型（main）的链兜底
+  （强度也跟着读主模型的）。旧口 role 保住：不传 agent 时 role="main" ⇒
+  agent="main"，role="worker" ⇒ agent="task"（聊主对话 / 搬运的话永远 main）。
+- 思考强度：岗位 profile.effort 只在所选条目的 efforts 里勾了才发（条目空 =
+  永不发）；按协议映射（openai/responses：max 夹 high；anthropic：xhigh 夹 high、
+  output_config.effort——各家的 xhigh/max 覆盖面待实测）。
+- 用量：usage / model_calls 各多一列 agent（岗位 kind）；role 维持
+  「主模型 / 子 agent」两桶账（兜底用主模型链的调用也记 main 桶）。
+- 就绪 = 「主模型」+「任务」岗位各自解析出至少 1 个候选（岗位选了条目、条目端点
+  在、端点有 base_url + api_key）；旧四槽模式照旧（base_url/key/main/worker 齐）。
+- settings() 缓存键 = （Settings 对象本身 `is` 判等 + kv["models.checked"] 当前值）：
+  Settings 对象换新（配置热更新）必然重算，不能光记 id()——旧对象回收后
+  新对象复用同地址会吃到上一次的摘要。
 - 密钥只进不出：返回网页的任何结构都不含密钥（用 key_set 布尔值代替）；错误消息、
   日志、usage.error、model_calls 里都不许出现密钥（_redact 统一遮掉）。
 - chat() 可重试错误（网络错误、429、408、5xx）同一模型最多「1 + retries」次；
   非 429 的两次之间等 retry_delay_s 秒；429 改由端点级冷却决定等待
   （Retry-After 秒数 / HTTP 日期，封顶 120 秒；没有就按连续 429 次数
   10/20/40/60 秒退避、封顶 60 秒，加 ±20% 抖动）；
-  用完再换备用模型，备用同样规则；其他 4xx 不重试、不换备用，直接抛。
+  用完再尝候选里的下一条，同样规则；其他 4xx 不重试、不换，直接抛。
   chat(retries=n) 可临时覆盖设置里的重试次数（后台主循环里直接 await 的调用传 1）。
-- 端点级限流（EndpointThrottle，状态只在进程内存、不落库）：同一 base_url
-  （规范化：小写、去末尾斜杠）同一时刻最多 max_concurrency 个在途请求
-  （[models] 可选字段，缺省 2），超出的排队不报错；任何一次 429 → 整个端点冷却，
-  冷却期同端点的新请求和重试都先等到冷却结束；成功一次后连续 429 计数清零；
-  [models] 可选字段 max_rpm > 0 时按端点做 60 秒滑动窗口限速（缺省 0 = 关）。
+- 端点级限流（EndpointThrottle，状态只在进程内存、不落库）：按
+  `{端点 id}|{normalize(base_url)}` 分门（同一端点条目改地址自然隔两门）；
+  同步发上限 max_concurrency / 429 冷却 / max_rpm（0 = 关）都按候选端点读。
+- list_models(base_url, api_key, protocol="openai")：网页「测试连接」；
+  openai/responses 走 `{base}/models` 带 Bearer；anthropic 走 `{base}/v1/models`
+  （`{base}` 已含 /v1 时不重加）带 `x-api-key` + `anthropic-version: 2023-06-01`；
+  结果的可用模型列表存 `kv["endpoints.checked.<id>"]`（console/server 路由记 id）。
+- 上下文窗口 / 最大输出：`limits_for(kind)` = 岗位首选候选条目的值；旧四槽兜底
+  用 `Settings.models` 的旧全局值。压缩（workers/coordinator/admin_chat）先问它。
 - 每次尝试（含失败）写一条 usage + 一条 model_calls（管理员网页看，docs/07 §9）。
 """
 
@@ -62,6 +87,8 @@ _COOLDOWN_CAP_S = 60.0      # 退避封顶
 _COOLDOWN_JITTER = 0.2      # 退避 ±20% 抖动
 _RPM_WINDOW_S = 60.0        # 每分钟上限的滑动窗口
 _MAX_CONCURRENCY_DEFAULT = 2  # 每个端点同一时刻最多几个在途请求
+# 思考强度合法档位（与 config.py 的 EFFORT_LEVELS 一致；独立拷贝防导入环）
+_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
 
 async def _SLEEP(seconds: float) -> None:
@@ -282,8 +309,16 @@ class ModelError(Exception):
 
 @dataclass
 class ModelSettings:
+    """模型设置摘要（给网页总览/徽标用；不含密钥）。
+
+    2026-10 改版 1a：真身在 [[endpoints]] + [[model_list]]（配置）+ 专岗档案的
+    model/effort/backup（kv["agents.profiles"]）。这里的主备/数值字段 = 主模型
+    （main / worker 两个视角各自的「首选」）解析结果。没接 agents（老链路）时按
+    旧 [models] 四槽砖块算。
+    """
+
     base_url: str
-    main: str
+    main: str            # 主模型服务商模型名（旧调用方的习惯）
     main_backup: str
     worker: str
     worker_backup: str
@@ -291,16 +326,19 @@ class ModelSettings:
     source: str  # "config" | "none"（网页改的也写 config.toml，所以只有这两种）
     checked_at: float = 0.0
     available: list[str] = field(default_factory=list)
-    retries: int = 5         # 同一模型可重试失败最多几次（0~10）
-    retry_delay_s: int = 10  # 两次重试之间等几秒（1~60）
-    max_concurrency: int = 2  # 同一端点同时最多几个在途请求（1~8）
-    max_rpm: int = 0          # 同一端点每分钟最多几次（0 = 不限）
-    context_window: int = 128000  # 模型上下文长度（tokens，8192~2000000），上下文压缩用
-    max_tokens: int = 32768  # 一次回答最多写多少 token（1024~1000000）；每次调用都带上
+    retries: int = 5         # 主模型端点的重试设置（0~10）
+    retry_delay_s: int = 10  # 主模型端点两次重试间隔（1~60）
+    max_concurrency: int = 2  # 主模型端点并发上限（1~8）
+    max_rpm: int = 0          # 主模型端点每分钟上限（0 = 不限）
+    context_window: int = 128000  # 主模型所选条目的上下文（tokens），上下文压缩用
+    max_tokens: int = 32768  # 主模型所选条目的最大输出（tokens）
+    main_label: str = ""    # 主模型显示名（模型库的 name；网页摘要用）
+    worker_label: str = ""
+    _ready: bool = False
 
     def ready(self) -> bool:
-        """端点、密钥、主模型、子 agent 模型都有。"""
-        return bool(self.base_url and self.key_set and self.main and self.worker)
+        """主模型能用、子 agent 模型也能用（主模型端点地址 + 密钥齐全）。"""
+        return bool(self._ready)
 
     def public(self) -> dict:
         """给网页的字典（不含密钥）。"""
@@ -311,6 +349,8 @@ class ModelSettings:
             "main_backup": self.main_backup,
             "worker": self.worker,
             "worker_backup": self.worker_backup,
+            "main_label": self.main_label,
+            "worker_label": self.worker_label,
             "source": self.source,
             "checked_at": self.checked_at,
             "available": list(self.available),
@@ -324,9 +364,500 @@ class ModelSettings:
         }
 
 
+@dataclass
+class _Candidate:
+    """一次调用的候选（首选 / 备用）：模型库条目 + 它挂的端点 + 这个候选能发的思考强度。"""
+
+    service_model: str     # 发给端点的模型名
+    label: str             # 日志/摘要显示用
+    endpoint: Any          # config.EndpointSetting
+    context_window: int
+    max_tokens: int        # 这个条目的默认输出上限（调用方没传用它）
+    efforts: tuple = ()    # 条目 efforts（agent profile 的强度只在它勾了才发）
+
+
 
 class _StreamError(Exception):
     """流式回答中途出错（流里报错 / 没收完就断）：按可重试的 5xx 处理。"""
+
+
+def _effort_for_protocol(effort: str, protocol: str | None) -> str:
+    """岗位强度 → 这个协议真发出去的值；不能发（没请求强度 / 没指名协议）返回 ""。
+
+    - openai /responses：reasoning_effort / reasoning.effort。OpenAI 文档写过
+      minimal/low/medium/high，新模型（gpt-5.1 那代起）加了 xhigh——xhigh 原样发，
+      端点不收就用自己的 rejection 说话（上限两侧的「max」没有这值，夹成 high 最接近）。
+    - anthropic：output_config.effort（放行 low/medium/high/max；xhigh 不是官方值，
+      夹成 high）。「max 只部分模型支持」「output_config 的写法」待实测。
+    映射只按协议，不看具体模型名——同一端点代发多家模型时没法猜，靠条目的 efforts
+    勾选先把了一层关（没勾根本不走这里）。
+    """
+    e = str(effort or "").strip().lower()
+    if not e or not protocol:
+        return ""
+    p = str(protocol or "").strip().lower()
+    if p in ("openai", "responses"):
+        return "high" if e == "max" else e
+    if p == "anthropic":
+        return "high" if e == "xhigh" else e
+    return ""
+
+
+# ----------------------------------------------------------------------
+# 协议层请求拼装（纯函数，单测直接对形状）
+# ----------------------------------------------------------------------
+
+
+def _content_text(content: Any) -> str:
+    """OpenAI 消息的 content（str 或 [{'type':'text','text':…}]）拿成纯文本；别的给 ""。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(str(part.get("text") or ""))
+        return "".join(parts)
+    return ""
+
+
+def _json_messages(messages: list[dict], json_mode: bool) -> list[dict]:
+    """json_mode 的「在提示里要求」前置一条 system 提示（2026-09-29 线上对照实验的规矩，
+    见 chat() 里的说明）。"""
+    return [{"role": "system", "content": _JSON_ONLY_HINT}, *messages] if json_mode else list(messages)
+
+
+def _build_openai_request(
+    model: str,
+    messages: list[dict],
+    *,
+    tools: list[dict] | None,
+    json_mode: bool,
+    max_tokens: int,
+    effort: str = "",
+) -> dict[str, Any]:
+    """OpenAI 兼容 /chat/completions 的请求体（流式 + 带 usage）。"""
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": _json_messages(messages, json_mode),
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "max_tokens": int(max_tokens),
+    }
+    if tools:
+        body["tools"] = tools
+    mapped = _effort_for_protocol(effort, "openai")
+    if mapped:
+        body["reasoning_effort"] = mapped
+    return body
+
+
+def _build_responses_request(
+    model: str,
+    messages: list[dict],
+    *,
+    tools: list[dict] | None,
+    json_mode: bool,
+    max_tokens: int,
+    effort: str = "",
+) -> dict[str, Any]:
+    """OpenAI Responses /responses 的请求体（非流式；stream 仍发 True——端点回普通 JSON 也行）：
+
+    - system 消息进 instructions + system-role input items（两者都给，老/新端点兼容度更高）；
+    - user/assistant 文本 → {"role", content: [{input_text|output_text}]}；
+    - assistant 的 tool_calls → function_call（call_id/name/arguments）；待实测部分端点收 flat message；
+    - role=tool 的结果 → function_call_output（同一 call_id 的连续多条合并成一条 output）；
+    - tools → {"type":"function", name, description, parameters}（顶层，不是包一层 function）。
+    """
+    system_parts: list[str] = []
+    input_items: list[dict[str, Any]] = []
+    for m in messages if isinstance(messages, list) else []:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "")
+        text = _content_text(m.get("content"))
+        if role == "system":
+            if text:
+                system_parts.append(text)
+            continue
+        if role == "user":
+            if json_mode and not system_parts:
+                system_parts.append(_JSON_ONLY_HINT)  # 没有 system 就把 JSON 要求塞 instructions
+            if text:
+                input_items.append({"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]})
+            continue
+        if role == "assistant":
+            if text:
+                input_items.append({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]})
+            for tc in m.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                call_id = str(tc.get("id") or "")
+                name = str(fn.get("name") or "")
+                if not name:
+                    continue
+                input_items.append({
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": str(fn.get("arguments") or ""),
+                })
+            continue
+        if role == "tool":
+            call_id = str(m.get("tool_call_id") or "")
+            parts = [text]
+            # 连续多条 tool（同一 call_id）：后面兄弟并进来时设了 _merged_into 就不再出条目
+            out = {"type": "function_call_output", "call_id": call_id, "output": text}
+            input_items.append(out)
+            continue
+        # 别的角色（developer 等）：当 user 文本兜底
+        if text:
+            input_items.append({"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]})
+    # 同 call_id 的连续 function_call_output 合并（保持序）：相邻才并
+    merged: list[dict[str, Any]] = []
+    for item in input_items:
+        if (
+            item.get("type") == "function_call_output"
+            and merged
+            and merged[-1].get("type") == "function_call_output"
+            and merged[-1].get("call_id") == item.get("call_id")
+        ):
+            merged[-1]["output"] = f'{merged[-1]["output"]}\n{item.get("output") or ""}'
+        else:
+            merged.append(dict(item))
+    body: dict[str, Any] = {
+        "model": model,
+        "input": merged,
+        "stream": True,
+        "max_output_tokens": int(max_tokens),
+    }
+    if system_parts:
+        body["instructions"] = "\n\n".join(str(p) for p in system_parts if p)
+    out_tools: list[dict[str, Any]] = []
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") or t
+        name = str(fn.get("name") or "")
+        if not name:
+            continue
+        spec: dict[str, Any] = {"type": "function", "name": name}
+        if fn.get("description"):
+            spec["description"] = str(fn["description"])
+        if fn.get("parameters") is not None:
+            spec["parameters"] = fn["parameters"]
+        out_tools.append(spec)
+    if out_tools:
+        body["tools"] = out_tools
+    if json_mode:
+        body["text"] = {"format": {"type": "json_object"}}
+    mapped = _effort_for_protocol(effort, "responses")
+    if mapped:
+        body["reasoning"] = {"effort": mapped}
+    return body
+
+
+def _anthropic_messages_url(base_url: str) -> str:
+    """messages 的地址：{base}/v1/messages；base 已带 /v1 时不叠（同 _anthropic_models_url）。"""
+    base = str(base_url or "").strip().rstrip("/")
+    if base.lower().endswith("/v1"):
+        return base + "/messages"
+    return base + "/v1/messages"
+
+
+def _build_anthropic_request(
+    model: str,
+    messages: list[dict],
+    *,
+    tools: list[dict] | None,
+    json_mode: bool,
+    max_tokens: int,
+    effort: str = "",
+) -> dict[str, Any]:
+    """Anthropic Messages /v1/messages 的请求体：
+
+    - system 消息（可能多条）合成顶层 system 字符串；json_mode 没原生开关，
+      在 system 末尾追加「只输出 JSON」的硬要求；
+    - assistant 的文本 + tool_calls → content 里 text + tool_use 块（input 要真对象）；
+    - role=tool → user 消息里的 tool_result 块（is_error 不发——我们拿到的都是「
+      工具给回来的内容」）；连续的 tool 消息并进同一条 user；同名 tool_use_id 的
+      连续结果合并成一个块；
+    - tools → {name, description, input_schema}；max_tokens 必填（调用方保证带上）；
+    - effort → output_config（文档写法，待实测）；绝不发 thinking（budget 那套我们不用）。
+    """
+    system_parts: list[str] = []
+    out_messages: list[dict[str, Any]] = []
+    i = 0
+    seq = list(messages if isinstance(messages, list) else [])
+    n = len(seq)
+    while i < n:
+        m = seq[i]
+        if not isinstance(m, dict):
+            i += 1
+            continue
+        role = str(m.get("role") or "")
+        if role == "system":
+            text = _content_text(m.get("content"))
+            if text:
+                system_parts.append(text)
+            i += 1
+            continue
+        if role == "user":
+            out_messages.append({"role": "user", "content": [{"type": "text", "text": _content_text(m.get("content")) or ""}]})
+            i += 1
+            continue
+        if role == "assistant":
+            blocks: list[dict[str, Any]] = []
+            text = _content_text(m.get("content"))
+            if text:
+                blocks.append({"type": "text", "text": text})
+            for tc in m.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                name = str(fn.get("name") or "")
+                if not name:
+                    continue
+                raw_args = fn.get("arguments")
+                if isinstance(raw_args, dict):
+                    tool_input: Any = raw_args
+                else:
+                    try:
+                        parsed = json.loads(str(raw_args or ""))
+                    except (TypeError, ValueError):
+                        parsed = None
+                    tool_input = parsed if isinstance(parsed, dict) else {"arguments": str(raw_args or "")}
+                blocks.append({
+                    "type": "tool_use",
+                    "id": str(tc.get("id") or ""),
+                    "name": name,
+                    "input": tool_input,
+                })
+            out_messages.append({"role": "assistant", "content": blocks})
+            i += 1
+            continue
+        if role == "tool":
+            # 连续的 tool 消息收成一条 user：同 call_id 的合并成一个 tool_result
+            blocks: list[dict[str, Any]] = []
+            j = i
+            while j < n and isinstance(seq[j], dict) and seq[j].get("role") == "tool":
+                tm = seq[j]
+                call_id = str(tm.get("tool_call_id") or "") or f"tool_{j + 1}"
+                content = _content_text(tm.get("content"))
+                if blocks and blocks[-1].get("tool_use_id") == call_id:
+                    blocks[-1]["content"] = f'{blocks[-1]["content"]}\n{content}'
+                else:
+                    blocks.append({"type": "tool_result", "tool_use_id": call_id, "content": content})
+                j += 1
+            out_messages.append({"role": "user", "content": blocks})
+            i = j
+            continue
+        # 别的角色：当 user 文本兜底
+        out_messages.append({"role": "user", "content": [{"type": "text", "text": _content_text(m.get("content")) or ""}]})
+        i += 1
+    if json_mode:
+        system_parts.append(_JSON_ONLY_HINT)
+    body: dict[str, Any] = {"model": model, "max_tokens": int(max_tokens)}
+    if system_parts:
+        body["system"] = "\n\n".join(str(p) for p in system_parts if p)
+    # 兜底合相邻同角色（用户 history 一般不规整，anthropic 官方要求严格交替）；
+    # 但 user（纯文本）和 user（tool_result 块）不能混进同一条——那是两种事
+    smoothed: list[dict[str, Any]] = []
+    for msg in out_messages:
+        is_tool_result = any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in msg["content"]
+        )
+        if smoothed and smoothed[-1]["role"] == msg["role"] and smoothed[-1]["_tr"] == is_tool_result:
+            smoothed[-1]["content"].extend(msg["content"])
+        else:
+            smoothed.append({"role": msg["role"], "content": list(msg["content"]), "_tr": is_tool_result})
+    for msg in smoothed:
+        msg.pop("_tr", None)
+    body["messages"] = smoothed
+    out_tools: list[dict[str, Any]] = []
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") or t
+        name = str(fn.get("name") or "")
+        if not name:
+            continue
+        spec: dict[str, Any] = {"name": name, "input_schema": fn.get("parameters") or {"type": "object"}}
+        if fn.get("description"):
+            spec["description"] = str(fn["description"])
+        out_tools.append(spec)
+    if out_tools:
+        body["tools"] = out_tools
+    mapped = _effort_for_protocol(effort, "anthropic")
+    if mapped:
+        # 文档写法（platform.claude.com 的 Effort 页）；「output_config 这层壳、
+        # max 只部分模型收」都待实测——模型不收会是 400，像别的 4xx 一样直接抛出来。
+        body["output_config"] = {"effort": mapped}
+    return body
+
+
+# ----------------------------------------------------------------------
+# 协议层响应解析（纯函数）：统一收成 ChatResult 的料（text/tool_calls/usage/finish）
+# ----------------------------------------------------------------------
+
+
+def _finish_from_stop_reason(reason: Any) -> str:
+    """Anthropic stop_reason → 我们的 finish_reason（跟 openai 的词对齐）。"""
+    return {
+        "end_turn": "stop",
+        "stop_sequence": "stop",
+        "tool_use": "tool_calls",
+        "max_tokens": "length",
+        "pause_turn": "stop",
+        "refusal": "stop",
+    }.get(str(reason or ""), str(reason or ""))
+
+
+def _parse_anthropic_response(data: Any, model: str) -> "ChatResult":
+    """Anthropic /v1/messages 的响应：content 里 text + tool_use 块；usage 的 input/output_tokens。"""
+    if not isinstance(data, dict):
+        raise ModelError("模型返回格式不对：不是 JSON 对象")
+    content = data.get("content")
+    if content is None:
+        content = []
+    if not isinstance(content, list):
+        raise ModelError("模型返回格式不对：content 不是数组")
+    texts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    raw_blocks: list[dict[str, Any]] = []
+    for i, block in enumerate(content):
+        if not isinstance(block, dict):
+            continue
+        btype = str(block.get("type") or "")
+        raw_blocks.append(block)
+        if btype == "text":
+            texts.append(str(block.get("text") or ""))
+        elif btype == "tool_use":
+            name = str(block.get("name") or "")
+            if not name:
+                continue
+            inp = block.get("input")
+            args = inp if isinstance(inp, str) else json.dumps(inp if inp is not None else {}, ensure_ascii=False)
+            tool_calls.append({
+                "id": str(block.get("id") or f"callu_{i}"),
+                "type": "function",
+                "function": {"name": name, "arguments": args},
+            })
+        # thinking / redacted_thinking / 别的块：不进结果（跟 openai 那条 reasoning_content 一个处理）
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    message: dict[str, Any] = {"role": "assistant", "content": "".join(texts)}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    if raw_blocks:
+        message["_blocks"] = raw_blocks  # 留底（含 thinking），谁也不读也不回显
+    return ChatResult(
+        text="".join(texts),
+        tool_calls=tool_calls,
+        model=model,
+        prompt_tokens=int(usage.get("input_tokens") or 0),
+        completion_tokens=int(usage.get("output_tokens") or 0),
+        raw_message=message,
+        finish_reason=_finish_from_stop_reason(data.get("stop_reason")),
+    )
+
+
+def _parse_responses_response(data: Any, model: str) -> "ChatResult":
+    """Responses 的响应：output 数组里 message（output_text 文本）+ function_call。"""
+    if not isinstance(data, dict):
+        raise ModelError("模型返回格式不对：不是 JSON 对象")
+    output = data.get("output")
+    if output is None:
+        output = []
+    if not isinstance(output, list):
+        raise ModelError("模型返回格式不对：output 不是数组")
+    texts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    for i, item in enumerate(output):
+        if not isinstance(item, dict):
+            continue
+        itype = str(item.get("type") or "")
+        if itype == "message":
+            for part in item.get("content") or []:
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    texts.append(str(part.get("text") or ""))
+        elif itype == "function_call":
+            name = str(item.get("name") or "")
+            if not name:
+                continue
+            tool_calls.append({
+                "id": str(item.get("call_id") or item.get("id") or f"call_{i}"),
+                "type": "function",
+                "function": {"name": name, "arguments": str(item.get("arguments") or "")},
+            })
+        # reasoning / refusal 等其它 item 不进结果
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    status = str(data.get("status") or "")
+    finish = "tool_calls" if tool_calls else ("length" if status == "incomplete" else "")
+    message: dict[str, Any] = {"role": "assistant", "content": "".join(texts)}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return ChatResult(
+        text="".join(texts),
+        tool_calls=tool_calls,
+        model=model,
+        prompt_tokens=int(usage.get("input_tokens") or 0),
+        completion_tokens=int(usage.get("output_tokens") or 0),
+        raw_message=message,
+        finish_reason=finish,
+    )
+
+
+def _responses_from_events(events: list[dict]) -> dict:
+    """Responses 的 SSE 事件流收成「非流式形状」：拿 response.completed 里那份整的
+    （在里面没有/坏了才从零散 delta 拼——想流式省等的端点才走这条路）。"""
+    completed: dict = {}
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("type") == "response.completed" and isinstance(ev.get("response"), dict):
+            completed = ev["response"]
+        elif ev.get("type") == "response.failed":
+            err = ev.get("response") or ev.get("error") or {}
+            msg = err.get("message") if isinstance(err, dict) else str(err or "response.failed")
+            raise _StreamError(str(msg)[:500])
+    if completed:
+        return completed
+    # 没有 completed：从 output_text.delta / output_item 事件自己拼（保底，待实测哪些端点这样回）
+    texts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    status = ""
+    usage: dict = {}
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        t = str(ev.get("type") or "")
+        if t == "response.output_text.delta":
+            texts.append(str(ev.get("delta") or ""))
+        elif t in ("response.output_item.done",) and isinstance(ev.get("item"), dict):
+            item = ev["item"]
+            if item.get("type") == "function_call":
+                tool_calls.append({
+                    "id": str(item.get("call_id") or item.get("id") or f"call_{len(tool_calls)}"),
+                    "type": "function",
+                    "function": {"name": str(item.get("name") or ""), "arguments": str(item.get("arguments") or "")},
+                })
+        elif t in ("response.in_progress", "response.created"):
+            resp = ev.get("response")
+            if isinstance(resp, dict) and resp.get("status"):
+                status = str(resp["status"])
+    out: dict[str, Any] = {
+        "status": status or "completed",
+        "output": [],
+        "usage": usage,
+    }
+    if texts:
+        out["output"].append({"type": "message", "content": [{"type": "output_text", "text": "".join(texts)}]})
+    out["output"].extend({"type": "function_call", **tc, "call_id": tc["id"],
+                          "name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}
+                         for tc in tool_calls)
+    return out
+
 
 @dataclass
 class ChatResult:
@@ -387,6 +918,55 @@ def _validate(patch: dict) -> list[str]:
     return problems
 
 
+@dataclass
+class _LegacyBrick:
+    """旧 [models] 四槽砖块（迁移前的过渡读口；clamp 规则和 0.4.4 一致）。"""
+
+    base_url: str = ""
+    api_key: str = ""
+    main: str = ""
+    main_backup: str = ""
+    worker: str = ""
+    worker_backup: str = ""
+    retries: Any = 5
+    retry_delay_s: Any = 10
+    max_concurrency: Any = 2
+    max_rpm: Any = 0
+    context_window: Any = 128000
+    max_tokens: Any = 32768
+
+    def __post_init__(self) -> None:
+        self.retries = self._clamped(self.retries, 0, 10, 5)
+        self.retry_delay_s = self._clamped(self.retry_delay_s, 1, 60, 10)
+        self.max_concurrency = self._clamped(self.max_concurrency, 1, 8, 2)
+        self.max_rpm = self._clamped(self.max_rpm, 0, 600, 0)
+        self.context_window = self._clamped(self.context_window, 8192, 2_000_000, 128000)
+        self.max_tokens = self._clamped(self.max_tokens, 1024, 1_000_000, 32768)
+
+    @staticmethod
+    def _clamped(value: Any, low: int, high: int, default: int) -> int:
+        if not _int_in(value, low, high):
+            return default
+        return int(value)
+
+    def any_value(self) -> bool:
+        return bool(
+            self.base_url or self.api_key or self.main or self.main_backup
+            or self.worker or self.worker_backup
+        )
+
+    def to_endpoint(self) -> Any:
+        """老链路：把砖块装成一个 endpoint id 为 __legacy__ 的端点。"""
+        from . import config as _cfg
+
+        return _cfg.EndpointSetting(
+            id="__legacy__", name="旧配置", protocol="openai",
+            base_url=self.base_url, api_key=self.api_key,
+            retries=int(self.retries), retry_delay_s=int(self.retry_delay_s),
+            max_concurrency=int(self.max_concurrency), max_rpm=int(self.max_rpm),
+        )
+
+
 class Models:
     def __init__(
         self,
@@ -395,6 +975,7 @@ class Models:
         *,
         transport=None,
         config_writer: Any = None,
+        agents: Any = None,
     ) -> None:
         self._store = store
         self._get_settings = get_settings
@@ -407,89 +988,295 @@ class Models:
         # 写 config.toml 的钩子：app 注入（保存 → 写文件 → 立刻在本进程应用）；
         # 测试没注入时保存直接报错（网页链路一定有 app 注入）。
         self._config_writer = config_writer
+        # 专岗（agents.py）：2026-10 改版 1a 起「谁用哪个模型」读岗位 profile
+        # （kv["agents.profiles"] 的 model/backup）。没接（老测试/启动早期）→ 旧 [models] 四槽。
+        self._agents = agents
+
+    def set_agents(self, agents: Any) -> None:
+        """app 在 Agents 就位后挂上（Models 建得比 Agents 早）；同时清缓存重算。"""
+        self._agents = agents
+        self._cache = None
 
     # ------------------------------------------------------------------
     # 设置
     # ------------------------------------------------------------------
 
     def settings(self) -> ModelSettings:
-        """config.toml 的 [models] 是唯一来源（网页保存也写它）；结果内存缓存。
+        """config.toml 的 [models] / [[endpoints]]+[[model_list]]+岗位选择是唯一来源
+        （网页保存也写它）；结果内存缓存。
 
         get_settings 回调返回的 Settings 对象变了（配置热更新）就重算；
         kv["models.checked"]（测试连接的回写）变了也重算。
+        缓存钉住 **Settings 对象本身**（`is` 判等）——光记 id() 会在旧对象被回收后
+        新对象复用同一地址时吃到上一次的摘要（出现过：写端点热应用后 ready 还是 False）。
         """
         settings = self._get_settings()
         try:
             checked = self._store.kv_get("models.checked")
         except Exception:
             checked = None
-        if self._cache is not None and self._cache[0] == id(settings) and self._cache[1] == checked:
+        if self._cache is not None and self._cache[0] is settings and self._cache[1] == checked:
             return self._cache[2]
         computed = self._compute(settings, checked)
-        self._cache = (id(settings), checked, computed)
+        self._cache = (settings, checked, computed)
         return computed
 
     def _compute(self, settings: Settings, checked: Any) -> ModelSettings:
         cfg = settings.models.__dict__ if settings.models else {}
-        base_url = str(cfg.get("base_url") or "").strip().rstrip("/")
-        main = str(cfg.get("main") or "").strip()
-        main_backup = str(cfg.get("main_backup") or "").strip()
-        worker = str(cfg.get("worker") or "").strip()
-        worker_backup = str(cfg.get("worker_backup") or "").strip()
-        source = "config"
-        if not (base_url or main or worker or main_backup or worker_backup or str(cfg.get("api_key") or "")):
-            source = "none"
+        old = _LegacyBrick(
+            base_url=str(cfg.get("base_url") or "").strip().rstrip("/"),
+            api_key=str(cfg.get("api_key") or ""),
+            main=str(cfg.get("main") or "").strip(),
+            main_backup=str(cfg.get("main_backup") or "").strip(),
+            worker=str(cfg.get("worker") or "").strip(),
+            worker_backup=str(cfg.get("worker_backup") or "").strip(),
+            retries=cfg.get("retries"), retry_delay_s=cfg.get("retry_delay_s"),
+            max_concurrency=cfg.get("max_concurrency"), max_rpm=cfg.get("max_rpm"),
+            context_window=cfg.get("context_window"), max_tokens=cfg.get("max_tokens"),
+        )
+        endpoints = tuple(getattr(settings, "endpoints", ()) or ())
+        model_list = tuple(getattr(settings, "model_list", ()) or ())
+        agents = self._agents
+
+        if agents is not None:
+            main_cs = self._resolve_candidates("main", endpoints, model_list, old, agents)
+            worker_cs = self._resolve_candidates("task", endpoints, model_list, old, agents)
+            primary_ep = main_cs[0].endpoint if main_cs else None
+            first = main_cs[0] if main_cs else None
+            first_w = worker_cs[0] if worker_cs else None
+            source = "config" if (endpoints or old.any_value()) else "none"
+            base_url = primary_ep.base_url if primary_ep else old.base_url
+            ready = bool(first and first_w)
+            out = ModelSettings(
+                base_url=base_url,
+                main=first.service_model if first else "",
+                main_backup=main_cs[1].service_model if len(main_cs) > 1 else "",
+                worker=first_w.service_model if first_w else "",
+                worker_backup=worker_cs[1].service_model if len(worker_cs) > 1 else "",
+                key_set=bool(primary_ep and primary_ep.api_key),
+                source=source,
+                retries=int(getattr(primary_ep, "retries", old.retries)) if primary_ep else old.retries,
+                retry_delay_s=int(getattr(primary_ep, "retry_delay_s", old.retry_delay_s)) if primary_ep else old.retry_delay_s,
+                max_concurrency=int(getattr(primary_ep, "max_concurrency", old.max_concurrency)) if primary_ep else old.max_concurrency,
+                max_rpm=int(getattr(primary_ep, "max_rpm", old.max_rpm)) if primary_ep else old.max_rpm,
+                context_window=int(first.context_window) if first else old.context_window,
+                max_tokens=int(first.max_tokens) if first else old.max_tokens,
+                main_label=str(first.label if first else ""),
+                worker_label=str(first_w.label if first_w else ""),
+                _ready=ready,
+            )
+        else:
+            # 老链路（没接 agents）：按旧 [models] 四槽砖块算
+            source = "config" if old.any_value() else "none"
+            out = ModelSettings(
+                base_url=old.base_url,
+                main=old.main,
+                main_backup=old.main_backup,
+                worker=old.worker,
+                worker_backup=old.worker_backup,
+                key_set=bool(old.api_key),
+                source=source,
+                retries=old.retries,
+                retry_delay_s=old.retry_delay_s,
+                max_concurrency=old.max_concurrency,
+                max_rpm=old.max_rpm,
+                context_window=old.context_window,
+                max_tokens=old.max_tokens,
+                main_label=old.main,
+                worker_label=old.worker,
+                _ready=bool(old.base_url and old.api_key and old.main and old.worker),
+            )
         # checked_at / available：测试连接的回写（不是配置，存 kv），端点一致才并进来显示
-        checked_at = 0.0
-        available: list[str] = []
         if isinstance(checked, dict):
-            if str(checked.get("base_url") or "").strip().rstrip("/") == base_url and base_url:
+            if str(checked.get("base_url") or "").strip().rstrip("/") == out.base_url and out.base_url:
                 try:
-                    checked_at = float(checked.get("checked_at") or 0)
+                    out.checked_at = float(checked.get("checked_at") or 0)
                 except (TypeError, ValueError):
-                    checked_at = 0.0
+                    out.checked_at = 0.0
                 raw_available = checked.get("available")
                 if isinstance(raw_available, list):
-                    available = [str(x) for x in raw_available]
-        retries = cfg.get("retries")
-        if not _int_in(retries, 0, 10):
-            retries = 5
-        retry_delay_s = cfg.get("retry_delay_s")
-        if not _int_in(retry_delay_s, 1, 60):
-            retry_delay_s = 10
-        max_concurrency = cfg.get("max_concurrency")
-        if not _int_in(max_concurrency, 1, 8):
-            max_concurrency = 2
-        max_rpm = cfg.get("max_rpm")
-        if not _int_in(max_rpm, 0, 600):
-            max_rpm = 0
-        context_window = cfg.get("context_window")
-        if not _int_in(context_window, 8192, 2_000_000):
-            context_window = 128000
-        max_tokens = cfg.get("max_tokens")
-        if not _int_in(max_tokens, 1024, 1_000_000):
-            max_tokens = 32768
-        return ModelSettings(
-            base_url=base_url,
-            main=main,
-            main_backup=main_backup,
-            worker=worker,
-            worker_backup=worker_backup,
-            key_set=bool(self._current_key(settings)),
-            source=source,
-            checked_at=checked_at,
-            available=available,
-            retries=int(retries),
-            retry_delay_s=int(retry_delay_s),
-            max_concurrency=int(max_concurrency),
-            max_rpm=int(max_rpm),
-            context_window=int(context_window),
-            max_tokens=int(max_tokens),
+                    out.available = [str(x) for x in raw_available]
+        return out
+
+    # ------------------------------------------------------------------
+    # 候选解析（2026-10 改版 1a）：岗位 profile.model/backup → 模型库条目 + 端点
+    # ------------------------------------------------------------------
+
+    def _resolve_candidates(
+        self,
+        kind: str,
+        endpoints: tuple,
+        model_list: tuple,
+        old: "_LegacyBrick",
+        agents: Any,
+    ) -> list[_Candidate]:
+        """把这个岗位（"main" / "task" 等）解析成候选链（首选 + 备用）。
+
+        - profile.model 空 / 模型库里没有 / 端点没了 / 端点缺 base_url 或 api_key →
+          这个候选不算数（ready 判定会跟着变 False——和旧「缺一项不干活」的规矩一致）；
+        - agents.profile 抛错 / 值不对：直接当没选（读路径容错，不拦启动）；
+        - 阶段 1a：只返回候选，不区分协议；chat 里用非 openai 协议的端点会给中文错（1b 接）。
+        """
+        try:
+            profile = agents.profile(kind)
+        except Exception:
+            profile = None
+        if not isinstance(profile, dict):
+            profile = {}
+        by_id = {str(getattr(m, "id", "") or ""): m for m in model_list}
+        ep_by_id = {str(getattr(e, "id", "") or ""): e for e in endpoints}
+        out: list[_Candidate] = []
+        for raw_id in (profile.get("model"), profile.get("backup")):
+            entry_id = str(raw_id or "").strip()
+            if not entry_id:
+                continue
+            entry = by_id.get(entry_id)
+            if entry is None:
+                continue
+            ep = ep_by_id.get(str(getattr(entry, "endpoint", "") or ""))
+            if ep is None:
+                continue
+            if not str(getattr(ep, "base_url", "") or "").strip():
+                continue
+            if not str(getattr(ep, "api_key", "") or "").strip():
+                continue
+            service_model = str(getattr(entry, "model", "") or "").strip()
+            if not service_model:
+                continue
+            out.append(
+                _Candidate(
+                    service_model=service_model,
+                    label=str(getattr(entry, "name", "") or service_model),
+                    endpoint=ep,
+                    context_window=int(getattr(entry, "context_window", 128000) or 128000),
+                    max_tokens=int(getattr(entry, "max_tokens", 32768) or 32768),
+                    efforts=tuple(
+                        str(v) for v in (getattr(entry, "efforts", ()) or ()) if str(v) in _EFFORT_LEVELS
+                    ),
+                )
+            )
+        if not out and not model_list and old.any_value():
+            # 迁移前的过渡：库里还没 [[model_list]] 也没有岗位选择，旧 [models] 四槽还在
+            # → 按老规矩用四槽（迁移把岗位选好之后自动走开上面那条）
+            ep = old.to_endpoint() if old.base_url else None
+            if ep is not None:
+                names = (old.main, old.main_backup) if kind == "main" else (old.worker, old.worker_backup)
+                for name in names:
+                    if name:
+                        out.append(
+                            _Candidate(
+                                service_model=name, label=name, endpoint=ep,
+                                context_window=old.context_window, max_tokens=old.max_tokens,
+                            )
+                        )
+        return out
+
+    def _current_candidates(self, kind: str) -> list[_Candidate]:
+        """chat/limits_for 用：传岗位 kind（"main" / "news" / "task" / c_xxx…）。
+
+        岗位自己没解析出候选（没选模型 / 选的条目失效）→ 主模型（"main"）的链兜底
+        （docs/12：找不到就用主模型兜底）；主模型也没有 → 空列表，chat 给中文错。
+        """
+        settings = self._get_settings()
+        old = self._legacy_brick(settings)
+        agents = self._agents
+        kind_s = str(kind or "").strip() or "main"
+        if agents is not None:
+            endpoints = tuple(getattr(settings, "endpoints", ()) or ())
+            model_list = tuple(getattr(settings, "model_list", ()) or ())
+            out = self._resolve_candidates(kind_s, endpoints, model_list, old, agents)
+            if not out and kind_s != "main":
+                out = self._resolve_candidates("main", endpoints, model_list, old, agents)
+            return out
+        # 老链路：旧 [models] 四槽 → 一个假端点 + 四槽候选
+        ep = old.to_endpoint()
+        out: list[_Candidate] = []
+        names = (old.main, old.main_backup) if kind_s == "main" else (old.worker, old.worker_backup)
+        for name in names:
+            if name:
+                out.append(
+                    _Candidate(
+                        service_model=name, label=name, endpoint=ep,
+                        context_window=old.context_window, max_tokens=old.max_tokens,
+                    )
+                )
+        return out
+
+    def _profile_effort(self, kind: str) -> str:
+        """这个岗位 profile 里选的思考强度（读坏了 / 没选 = ""）。
+
+        兜底的强度跟着链走：调用方传过来的是「实际干活链路」的岗位（自己的链成了=自己，
+        兜底=主模型），所以这里永远只读这一个 kind。
+        """
+        agents = self._agents
+        if agents is None:
+            return ""
+        try:
+            profile = agents.profile(str(kind or ""))
+        except Exception:
+            return ""
+        if isinstance(profile, dict):
+            v = str(profile.get("effort") or "").strip().lower()
+            if v in _EFFORT_LEVELS:
+                return v
+        return ""
+
+    def limits_for(self, kind: str | None = None) -> dict:
+        """这个岗位（空 = 主模型）用哪个模型的上下文窗口 / 最大输出（上下文压缩、
+        画像摘要这些从「settings.models 全局值」改成「所选模型条目」的读口）。
+
+        与 chat() 同一条解析路：岗位没选模型时用主模型的条目兜底。
+        读不到（没接 agents / 都没选）回落旧 [models] 全局值，再不行系统默认。
+        """
+        kind_s = str(kind or "").strip() or "main"
+        try:
+            cands = self._current_candidates(kind_s)
+        except Exception:
+            cands = []
+        if cands:
+            return {"context_window": cands[0].context_window, "max_tokens": cands[0].max_tokens}
+        settings = self._get_settings()
+        old = self._legacy_brick(settings)
+        return {"context_window": old.context_window, "max_tokens": old.max_tokens}
+
+    def _legacy_brick(self, settings: Settings) -> "_LegacyBrick":
+        cfg = getattr(settings, "models", None)
+        cfg_d = cfg.__dict__ if cfg else {}
+        return _LegacyBrick(
+            base_url=str(cfg_d.get("base_url") or "").strip().rstrip("/"),
+            api_key=str(cfg_d.get("api_key") or ""),
+            main=str(cfg_d.get("main") or "").strip(),
+            main_backup=str(cfg_d.get("main_backup") or "").strip(),
+            worker=str(cfg_d.get("worker") or "").strip(),
+            worker_backup=str(cfg_d.get("worker_backup") or "").strip(),
+            retries=cfg_d.get("retries"), retry_delay_s=cfg_d.get("retry_delay_s"),
+            max_concurrency=cfg_d.get("max_concurrency"), max_rpm=cfg_d.get("max_rpm"),
+            context_window=cfg_d.get("context_window"), max_tokens=cfg_d.get("max_tokens"),
         )
 
     def _current_key(self, settings: Settings) -> str:
         """密钥只认 config.toml 的 [models] api_key（数据库覆盖层已废弃）。"""
         return str(settings.models.api_key or "")
+
+    def _all_endpoint_keys(self, settings: Settings) -> list[str]:
+        """本次调用可能用到的全部密钥（遮罩名单；绝不落日志值本身）。"""
+        out: list[str] = []
+        legacy = self._current_key(settings)
+        if legacy:
+            out.append(legacy)
+        for ep in (getattr(settings, "endpoints", ()) or ()):
+            k = str(getattr(ep, "api_key", "") or "")
+            if k and k not in out:
+                out.append(k)
+        return out
+
+    def endpoint_key(self, endpoint_id: str) -> str:
+        """给网页「测试连接」用：按端点 id 取密钥（不给密钥值出网页，只进请求头）。"""
+        settings = self._get_settings()
+        for ep in (getattr(settings, "endpoints", ()) or ()):
+            if str(getattr(ep, "id", "") or "") == str(endpoint_id or ""):
+                return str(getattr(ep, "api_key", "") or "")
+        return ""
 
     def save(self, patch: dict) -> ModelSettings:
         """保存网页设置 = 写进 config.toml 的 [models]（明文密钥，用户明确同意）。
@@ -577,16 +1364,36 @@ class Models:
             await self._client.aclose()
             self._client = None
 
-    async def list_models(self, base_url: str, api_key: str = "") -> list[str]:
-        """GET {base_url}/models，返回 data[].id。api_key 空则用已存的。
+    @staticmethod
+    def _anthropic_models_url(base_url: str) -> str:
+        """anthropic：GET {base}/v1/models；base 已以 /v1 结尾时不叠两个 v1。"""
+        base = str(base_url or "").strip().rstrip("/")
+        if base.lower().endswith("/v1"):
+            return base + "/models"
+        return base + "/v1/models"
 
-        没有密钥抛 ModelError。成功时不自动保存。
+    async def list_models(self, base_url: str, api_key: str = "", protocol: str = "openai") -> list[str]:
+        """列端点上的模型（「测试连接」也用它）。三种协议：
+
+        - openai / responses：GET {base}/models（Authorization: Bearer key）
+        - anthropic：GET {base}/v1/models（x-api-key + anthropic-version: 2023-06-01；
+          base 已带 /v1 时不叠）
+        返回模型 id 字符串列表（{"data":[...]}；{"models":[...]} 认 name/id）。
+        api_key 空则用已存的（旧 [models] 密钥；新链路调用方会传端点密钥）。没有密钥抛
+        ModelError。成功时不自动保存。端点在 429 冷却里直接报「约 N 秒后再试」。
         """
-        key = api_key or self._current_key(self._get_settings())
+        key = str(api_key or "") or self._current_key(self._get_settings())
         if not key:
             raise ModelError("没有可用的模型密钥")
-        url = str(base_url or "").strip().rstrip("/") + "/models"
-        endpoint = self._throttle.normalize(base_url)
+        proto = str(protocol or "openai").strip().lower()
+        base = str(base_url or "").strip().rstrip("/")
+        if proto == "anthropic":
+            url = self._anthropic_models_url(base)
+            headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+        else:
+            url = base + "/models"
+            headers = {"Authorization": f"Bearer {key}"}
+        endpoint = self._throttle.normalize(base)
         conc = _limit_from(
             getattr(self._get_settings(), "models", None), "max_concurrency", _MAX_CONCURRENCY_DEFAULT, 1, 64
         )
@@ -597,7 +1404,7 @@ class Models:
             raise ModelError(f"这个端点刚被限流（429），约 {max(1, round(left))} 秒后再试")
         client = self._get_client()
         try:
-            resp = await client.get(url, headers={"Authorization": f"Bearer {key}"}, timeout=30)
+            resp = await client.get(url, headers=headers, timeout=30)
         except httpx.HTTPError as e:
             raise ModelError(_redact(f"请求模型列表失败：{e}", [key])) from None
         if resp.status_code == 429:
@@ -613,10 +1420,19 @@ class Models:
             )
         try:
             data = resp.json()
-            items = data.get("data") if isinstance(data, dict) else None
+            if not isinstance(data, dict):
+                raise ValueError
+            items = data.get("data") or data.get("models")
             if not isinstance(items, list):
                 raise ValueError
-            return [str(item["id"]) for item in items if isinstance(item, dict) and "id" in item]
+            out: list[str] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                mid = str(item.get("id") or item.get("name") or "").strip()
+                if mid:
+                    out.append(mid)
+            return out
         except ValueError:
             raise ModelError("模型列表返回格式不对") from None
 
@@ -626,9 +1442,10 @@ class Models:
 
     async def chat(
         self,
-        role: Literal["main", "worker"],
-        messages: list[dict],
+        role: Literal["main", "worker"] | None = None,
+        messages: list[dict] | None = None,
         *,
+        agent: str | None = None,
         tools: list[dict] | None = None,
         json_mode: bool = False,
         purpose: str = "",
@@ -640,15 +1457,21 @@ class Models:
     ) -> ChatResult:
         """调一次模型。
 
+        干活岗位由 agent 决定（kind：main / news / idea / goal / task / c_xxx…）：
+        它的 profile.model→backup 是候选链；它自己没解析出候选时用主模型（"main"）
+        的链兜底（计划的规矩），此时强度也读主模型的。旧调用口 role 保住：
+        role="main" 没给 agent ⇒ agent="main"；role="worker" 没给 agent ⇒ agent="task"。
+
         重试规则：可重试的错误 = 网络错误（httpx.HTTPError）、429、408、5xx。
         同一个模型最多「1 + retries」次；非 429 的两次之间等 retry_delay_s 秒；
         429 由端点级冷却决定等待（Retry-After 秒数 / HTTP 日期，封顶 120 秒；
         没有就按连续 429 次数 10/20/40/60 秒退避、封顶 60 秒，加 ±20% 抖动）；
         用完再换备用模型，备用同样规则。其他 4xx 不重试、不换备用，直接抛。
         retries=None 用设置里的；主循环里直接 await 的调用传 1（别让循环卡几分钟）。
-        max_tokens=None 用设置里的 [models] max_tokens（缺省 32768）；传了以调用方为准。
-        请求体里总是带 max_tokens（有些端点没有它会出错）。
-        每次尝试（成功或失败）写一条 usage + 一条 model_calls。
+        max_tokens=None 用所选条目的 max_tokens（缺省 32768）；传了以调用方为准。
+        请求体里总是带 max_tokens（有些端点没有它会出错；anthropic 必填）。
+        每次尝试（成功或失败）写一条 usage + 一条 model_calls；usage 的 role 记
+        实际干活链路分桶（主模型兜底也记 main），agent 记调用方报的岗位。
         发请求前过端点限流门：并发上限 max_concurrency（缺省 2）+ 429 冷却 +
         每分钟上限 max_rpm（缺省 0 = 关）；等待可取消，状态只在内存。
         """
@@ -656,38 +1479,75 @@ class Models:
         s = self.settings()
         if not s.ready():
             raise ModelError("模型还没配好")
-        key = self._current_key(settings)
 
-        if role == "main":
-            candidates = [m for m in (s.main, s.main_backup) if m]
-        else:
-            candidates = [m for m in (s.worker, s.worker_backup) if m]
+        msgs = list(messages or [])
+        agent_kind = str(agent or "").strip()
+        if not agent_kind:
+            agent_kind = "main" if str(role or "") == "main" else "task"
+        candidates = self._current_candidates(agent_kind)
+        if not candidates:
+            if agent_kind == "main":
+                raise ModelError("「主模型」还没挑模型：到网页「专岗」页给它选一个模型")
+            raise ModelError(f"「{agent_kind}」专岗还没挑模型，连主模型也没选好：到网页「专岗」页先选一个模型")
 
-        max_tries = 1 + (s.retries if retries is None else max(0, int(retries)))
-        delay_s = float(s.retry_delay_s)
-        secret_keys = [k for k in (key,) if k]
-        # 可选设置（字段由 config 提供，可能还没有）：端点并发上限 / 每分钟上限
-        models_cfg = getattr(settings, "models", None)
-        max_conc = _limit_from(models_cfg, "max_concurrency", _MAX_CONCURRENCY_DEFAULT, 1, 64)
-        max_rpm = _limit_from(models_cfg, "max_rpm", 0, 0, 1_000_000)
-        # 每次调用都带 max_tokens：调用方传了以它为准，没传用设置里的
-        # [models] max_tokens（缺省 32768）。有些端点收不到这个参数会出错，所以标准请求里一直有。
-        configured_max_tokens = int(getattr(s, "max_tokens", 32768) or 32768)
-        if configured_max_tokens <= 0:
-            configured_max_tokens = 32768
-        if max_tokens is not None and int(max_tokens) > 0:
-            body_max_tokens = int(max_tokens)
-        else:
-            body_max_tokens = configured_max_tokens
-        endpoint = s.base_url
+        # 记录桶（两桶账不变）：自己的链成了 = 它自己（main 桶 / 别的都 worker 桶）；
+        # 岗位没候选兜底到主模型链 = 主模型桶
+        role_kind = agent_kind
+        if self._agents is not None and agent_kind != "main":
+            try:
+                own = self._resolve_candidates(
+                    agent_kind,
+                    tuple(getattr(settings, "endpoints", ()) or ()),
+                    tuple(getattr(settings, "model_list", ()) or ()),
+                    self._legacy_brick(settings),
+                    self._agents,
+                )
+            except Exception:
+                own = []
+            if not own:
+                role_kind = "main"
+        role_effective = "main" if role_kind == "main" else "worker"
+        # 思考强度：跟「用谁的链」一致——用它自己的 profile 强度；兜底用主模型的
+        requested_effort = self._profile_effort(role_kind)
 
-        client = self._get_client()
-        url = s.base_url + "/chat/completions"
+        # 所有端点的密钥都进遮罩名单（备用在另一个端点时也可能泄进错误文本）
+        secret_keys = self._all_endpoint_keys(settings)
         last_err: ModelError | None = None
-        # 快照一份请求日志底稿：messages 统一截断+遮罩只算一次，每次尝试直接存
-        log_request = self._build_log_request(messages, tools, json_mode, secret_keys, body_max_tokens)
         attempt = 0
-        for pos, model in enumerate(candidates):
+        client = self._get_client()
+        for pos, cand in enumerate(candidates):
+            model = cand.service_model
+            ep = cand.endpoint
+            key = str(getattr(ep, "api_key", "") or "")
+            base_url = str(getattr(ep, "base_url", "") or "").rstrip("/")
+            protocol = str(getattr(ep, "protocol", "openai") or "openai").strip().lower()
+            ep_retries = _limit_from(ep, "retries", 5, 0, 10)
+            ep_delay_s = float(_limit_from(ep, "retry_delay_s", 10, 1, 60))
+            max_conc = _limit_from(ep, "max_concurrency", _MAX_CONCURRENCY_DEFAULT, 1, 64)
+            max_rpm = _limit_from(ep, "max_rpm", 0, 0, 1_000_000)
+            # 三种协议的地址 + 请求头；不认识的（防配置漏校验）跳过这个候选尝下一个
+            if protocol == "openai":
+                url = base_url + "/chat/completions"
+                headers = {"Authorization": f"Bearer {key}"}
+            elif protocol == "responses":
+                url = base_url + "/responses"
+                headers = {"Authorization": f"Bearer {key}"}
+            elif protocol == "anthropic":
+                url = _anthropic_messages_url(base_url)
+                headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+            else:
+                last_err = ModelError(f"端点「{getattr(ep, 'name', '')}」的协议「{protocol}」不认识（只能 openai / responses / anthropic）")
+                continue
+            # 这个候选能发的强度：岗位请求的强度得在这个条目的 efforts 里勾了才发；
+            # 条目没勾任何 efforts（空）= 不支持思考强度 → 永不发
+            effort_send = requested_effort if requested_effort in cand.efforts else ""
+            # 限流键：端点 id + 规范化地址（同一 id 换地址也不串冷却）
+            endpoint = f"{getattr(ep, 'id', '')}|{self._throttle.normalize(base_url)}"
+            max_tries = 1 + (ep_retries if retries is None else max(0, int(retries)))
+            body_max_tokens = int(max_tokens) if (max_tokens is not None and int(max_tokens) > 0) else int(cand.max_tokens or 32768)
+            if body_max_tokens <= 0:
+                body_max_tokens = 32768
+            log_request = self._build_log_request(msgs, tools, json_mode, secret_keys, body_max_tokens)
             try_n = 0
             while try_n < max_tries:
                 try_n += 1
@@ -701,38 +1561,31 @@ class Models:
                             self._throttle.cooldown_remaining(endpoint), try_n, max_tries,
                         )
                     else:
-                        wait = min(max(delay_s, 0.0), _RETRY_DELAY_CAP_S)
+                        wait = min(max(ep_delay_s, 0.0), _RETRY_DELAY_CAP_S)
                         logger.warning(
                             "模型 %s 第 %d 次尝试失败（%s），%.0f 秒后重试（%d/%d）",
                             model, try_n - 1, last_err, wait, try_n, max_tries,
                         )
                         await _SLEEP(wait)
                 elif pos > 0:
-                    logger.warning("模型 %s 失败（%s），换备用 %s 再试", candidates[pos - 1], last_err, model)
-                # json_mode：只在提示里要求 JSON，不发服务端的 response_format=json_object。
-                # 2026-09-29 线上对照实验（step-5-preview，同一个 persona.refresh 请求）：开 JSON 模式
-                # 两次分别缺字段 / 回空 {}，关掉后两次都完整正确；群画像 29 次里 26 次格式坏也是它。
-                # 各处解析本来就会去 ``` 围栏、取第一个 { 到最后一个 }，前后多几句话不怕。
-                send_messages = (
-                    [{"role": "system", "content": _JSON_ONLY_HINT}, *messages] if json_mode else messages
-                )
-                # 流式：线上网关约 125 秒收不到字节就 524 掐断，想得久的模型整段等会被掐；
-                # 流式时思考过程边想边回来，连接一直有字节。端点回普通 JSON 也照旧解析。
-                body: dict[str, Any] = {
-                    "model": model,
-                    "messages": send_messages,
-                    "stream": True,
-                    "stream_options": {"include_usage": True},
-                    "max_tokens": body_max_tokens,
-                }
-                if tools:
-                    body["tools"] = tools
+                    logger.warning("模型 %s 失败（%s），换备用 %s 再试", candidates[pos - 1].service_model, last_err, model)
+                # 请求体按协议拼（纯函数，各自注释里有 json_mode / effort 的规矩）
+                body: dict[str, Any]
+                if protocol == "openai":
+                    body = _build_openai_request(model, msgs, tools=tools, json_mode=json_mode,
+                                                 max_tokens=body_max_tokens, effort=effort_send)
+                elif protocol == "responses":
+                    body = _build_responses_request(model, msgs, tools=tools, json_mode=json_mode,
+                                                    max_tokens=body_max_tokens, effort=effort_send)
+                else:  # anthropic
+                    body = _build_anthropic_request(model, msgs, tools=tools, json_mode=json_mode,
+                                                    max_tokens=body_max_tokens, effort=effort_send)
                 start = clock.now()
                 status = 0
                 try:
                     async with self._throttle.slot(endpoint, concurrency=max_conc, max_rpm=max_rpm):
                         status, err_text, data = await asyncio.wait_for(
-                            self._post_stream(client, url, body, key, timeout), timeout=timeout
+                            self._post_protocol(client, protocol, url, body, headers, timeout), timeout=timeout
                         )
                 except (httpx.HTTPError, asyncio.TimeoutError, _StreamError) as e:
                     ms = int((clock.now() - start) * 1000)
@@ -745,10 +1598,10 @@ class Models:
                         detail = f"网络错误（{type(e).__name__}）{('：' + d) if d else ''}"
                     last_err = ModelError(_redact(detail, [key]), status=502 if isinstance(e, _StreamError) else None)
                     self._log_attempt(
-                        model, role, attempt, ok=False, status=status if isinstance(e, _StreamError) else 0, ms=ms,
+                        model, role_effective, attempt, ok=False, status=status if isinstance(e, _StreamError) else 0, ms=ms,
                         prompt_tokens=0, completion_tokens=0, error=last_err.message,
                         request=log_request, response=None, keys=secret_keys,
-                        purpose=purpose, group_id=group_id, task_id=task_id,
+                        purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
                     )
                     continue
                 ms = int((clock.now() - start) * 1000)
@@ -766,10 +1619,10 @@ class Models:
                             concurrency=max_conc,
                         )
                     self._log_attempt(
-                        model, role, attempt, ok=False, status=status, ms=ms,
+                        model, role_effective, attempt, ok=False, status=status, ms=ms,
                         prompt_tokens=0, completion_tokens=0, error=last_err.message,
                         request=log_request, response=None, keys=secret_keys,
-                        purpose=purpose, group_id=group_id, task_id=task_id,
+                        purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
                     )
                     continue
                 if status != 200:
@@ -779,38 +1632,125 @@ class Models:
                         status=status,
                     )
                     self._log_attempt(
-                        model, role, attempt, ok=False, status=status, ms=ms,
+                        model, role_effective, attempt, ok=False, status=status, ms=ms,
                         prompt_tokens=0, completion_tokens=0, error=err.message,
                         request=log_request, response=None, keys=secret_keys,
-                        purpose=purpose, group_id=group_id, task_id=task_id,
+                        purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
                     )
                     raise err
                 self._throttle.note_success(endpoint, concurrency=max_conc)
                 try:
-                    result = self._parse_chat(data, model)
+                    if protocol == "openai":
+                        result = self._parse_chat(data, model)
+                    elif protocol == "responses":
+                        result = _parse_responses_response(data, model)
+                    else:
+                        result = _parse_anthropic_response(data, model)
                 except ModelError as e:
                     msg = _redact(str(e), [key])
                     self._log_attempt(
-                        model, role, attempt, ok=False, status=200, ms=ms,
+                        model, role_effective, attempt, ok=False, status=200, ms=ms,
                         prompt_tokens=0, completion_tokens=0, error=msg,
                         request=log_request, response=None, keys=secret_keys,
-                        purpose=purpose, group_id=group_id, task_id=task_id,
+                        purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
                     )
                     raise
                 log_response = self._build_log_response(data, result, secret_keys)
                 self._log_attempt(
-                    model, role, attempt, ok=True, status=200, ms=ms,
+                    model, role_effective, attempt, ok=True, status=200, ms=ms,
                     prompt_tokens=result.prompt_tokens, completion_tokens=result.completion_tokens,
                     error="", request=log_request, response=log_response, keys=secret_keys,
-                    purpose=purpose, group_id=group_id, task_id=task_id,
+                    purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
                 )
                 return result
         assert last_err is not None
         raise last_err
 
+    async def _post_protocol(
+        self,
+        client: httpx.AsyncClient,
+        protocol: str,
+        url: str,
+        body: dict,
+        headers: dict | None,
+        timeout: float,
+    ) -> tuple[int, str, dict]:
+        """按协议发一次请求，统一回 (状态码, 出错时响应文本, 拼好的「非流式」形状 data)。
+
+        - openai：/chat/completions 流式（缘由见 _stream_openai）；data 是 openai 形状；
+        - responses：/responses。stream=True 发出去，端点回 SSE 就把事件收成整份
+          （_responses_from_events），回普通 JSON 直接用；
+        - anthropic：/v1/messages 非流式。
+        """
+        if protocol == "openai":
+            return await self._stream_openai(client, url, body, headers or {}, timeout)
+        if protocol == "anthropic":
+            return await self._post_json(client, url, body, headers or {}, timeout)
+        return await self._post_responses(client, url, body, headers or {}, timeout)
+
     @staticmethod
-    async def _post_stream(
-        client: httpx.AsyncClient, url: str, body: dict, key: str, timeout: float
+    async def _post_json(
+        client: httpx.AsyncClient, url: str, body: dict, headers: dict, timeout: float
+    ) -> tuple[int, str, dict]:
+        """非流式 POST（anthropic messages 走它）；非 200 回响应文本，429 带 retry_after。"""
+        resp = await client.post(url, json=body, headers=headers, timeout=timeout)
+        if resp.status_code != 200:
+            return resp.status_code, resp.text, {"retry_after": resp.headers.get("Retry-After")}
+        try:
+            data = resp.json()
+        except ValueError:
+            raise ModelError("模型返回格式不对：不是 JSON") from None
+        return 200, "", data if isinstance(data, dict) else {}
+
+    @classmethod
+    async def _post_responses(
+        cls,
+        client: httpx.AsyncClient, url: str, body: dict, headers: dict, timeout: float
+    ) -> tuple[int, str, dict]:
+        """Responses：响是 SSE 就收事件拼整份；不是 SSE（多数兼容端点）当 JSON 直接解析。"""
+        async with client.stream("POST", url, json=body, headers=headers, timeout=timeout) as resp:
+            if resp.status_code != 200:
+                await resp.aread()
+                return resp.status_code, resp.text, {"retry_after": resp.headers.get("Retry-After")}
+            ctype = resp.headers.get("content-type", "")
+            if "text/event-stream" not in ctype:
+                await resp.aread()
+                try:
+                    data = resp.json()
+                except ValueError:
+                    raise ModelError("模型返回格式不对：不是 JSON") from None
+                return 200, "", data if isinstance(data, dict) else {}
+            events: list[dict] = []
+            done = False
+            completed_seen = False
+            async for line in resp.aiter_lines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    done = True
+                    break
+                try:
+                    obj = json.loads(payload)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("error"):
+                    err = obj["error"]
+                    msg = err.get("message") if isinstance(err, dict) else str(err)
+                    raise _StreamError(str(msg)[:500])
+                events.append(obj)
+                if obj.get("type") == "response.completed":
+                    completed_seen = True
+            if not done and not completed_seen:
+                raise _StreamError("连接断了，回答没收完")
+            return 200, "", _responses_from_events(events)
+
+    @staticmethod
+    async def _stream_openai(
+        client: httpx.AsyncClient, url: str, body: dict, headers: dict, timeout: float
     ) -> tuple[int, str, dict]:
         """发一次（流式）请求，返回 (状态码, 出错时的响应文本, 拼好的「非流式」形状 data)。
 
@@ -821,7 +1761,7 @@ class Models:
         非 200：返回响应文本；429 时 data 里带 retry_after 头。
         """
         async with client.stream(
-            "POST", url, json=body, headers={"Authorization": f"Bearer {key}"}, timeout=timeout
+            "POST", url, json=body, headers=headers, timeout=timeout
         ) as resp:
             if resp.status_code != 200:
                 await resp.aread()
@@ -961,6 +1901,8 @@ class Models:
             finish_reason = str((data.get("choices") or [{}])[0].get("finish_reason") or "")
         except Exception:
             finish_reason = ""
+        if not finish_reason:
+            finish_reason = str(result.finish_reason or "")
         out_tcs: list[dict] = []
         for tc in result.tool_calls:
             fn = tc.get("function") if isinstance(tc, dict) else None
@@ -997,21 +1939,24 @@ class Models:
         purpose: str,
         group_id: str,
         task_id: str,
+        agent: str = "",
     ) -> None:
         """每次尝试写两条账：usage（原有）+ model_calls（管理员网页看）。写失败只记日志。"""
         now = clock.now()
         error_db = _redact_full(error, keys)[:_LOG_ERR_MAX]
-        # 1) usage（原路）
+        agent_s = str(agent or "")
+        # 1) usage（原路；agent 列是 1b 新增的岗位账，role 两桶不变）
         try:
             with self._store.tx() as conn:
                 conn.execute(
-                    "INSERT INTO usage (ts, day, role, model, purpose, group_id, task_id,"
+                    "INSERT INTO usage (ts, day, role, agent, model, purpose, group_id, task_id,"
                     " prompt_tokens, completion_tokens, ok, ms, error)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         now,
                         clock.day_key(now),
                         str(role),
+                        agent_s,
                         str(model),
                         str(purpose or ""),
                         str(group_id or ""),
@@ -1029,13 +1974,14 @@ class Models:
         try:
             with self._store.tx() as conn:
                 conn.execute(
-                    "INSERT INTO model_calls (ts, purpose, role, model, group_id, task_id, attempt, ok,"
+                    "INSERT INTO model_calls (ts, purpose, role, agent, model, group_id, task_id, attempt, ok,"
                     " status, ms, prompt_tokens, completion_tokens, error, request, response)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         now,
                         str(purpose or ""),
                         str(role),
+                        agent_s,
                         str(model),
                         str(group_id or ""),
                         str(task_id or ""),

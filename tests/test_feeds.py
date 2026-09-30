@@ -37,6 +37,7 @@ from fakes import (
     FakeProfiles,
     ensure_pick_fallback,
     focus_reply,
+    patch_two_phase_feeds,
     two_phase_workers_run,
 )
 
@@ -189,6 +190,26 @@ def _make_feeds(
         {"category": "interest", "text": "本地大模型"},
     ]
     feeds = Feeds(store, models, workers, profiles, topics, lambda: settings, search=search)
+    if search is None and workers is not None:
+        # 2026-10-01 撒网改代码按计划搜：把 FakeWorkers 预置的 items 挪给假搜索出
+        # （skip / 出错类用例会显式传 search / workers=Exception，走不到这里）；
+        # 懒取 report——有用例在 _feeds(_make_feeds) 之后才换 report
+        def _live_items():
+            if isinstance(getattr(workers, "report", None), BaseException):
+                raise RuntimeError("预置：撒网全挂")
+            r = getattr(workers, "report", None)
+            if r is not None and not getattr(r, "ok", True):
+                raise RuntimeError("预置：子 agent 没跑成")
+            data = getattr(r, "data", None)
+            if isinstance(data, dict):
+                items = list(data.get("items") or [])
+                sf = data.get("seed_focus")  # 老用例：假装都是某方向（diverse 4）搜出来的
+                if isinstance(sf, int) and sf >= 1:
+                    return {sf: items}
+                return items
+            return []
+
+        patch_two_phase_feeds(feeds, models, _live_items)
     return store, settings, feeds, models, workers, topics, profiles
 
 

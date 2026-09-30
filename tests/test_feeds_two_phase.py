@@ -5,8 +5,8 @@
 two_phase_on / set_two_phase；GET/PUT /api/groups/{gid}/feeds-two-phase 已删）。
 
 prepare_news 的第 ② 步固定为：
-1. 撒网（子 agent，只用 web_search，task_id feeds-discover: 开头）——候选从**程序侧的
-   撒网登记簿**（discovery.py：web_search 工具 handler 记进去的搜索结果）拿，不信子 agent 交回；
+1. 撒网（2026-10-01 起：主模型在定关注点时一并给出每个方向的搜索计划 searches；
+   代码照单并发搜——没有子 agent、没有工具调用；候选照旧落进撒网登记簿 discovery）；
 2. 保底（代码）：某个方向搜不够（<2 次问 / <6 条候选）→ 代码直接补搜；
 3. 粗筛（代码，不调模型）：已入库链接 / 屏蔽来源 / 太旧 / 标题近似撞掉，再按方向均衡（40% 上限）留 ≤24 条；
 4. 挑（主模型一次 json_mode）：挑 8–12 条真去打开，每条带一句话理由（hook），失败回落前 10 条；
@@ -60,10 +60,10 @@ G1 = "900000001"
 
 
 class SeqWorkers:
-    """按 task_id 分派的假 workers：撒网 / 每个核验子 agent 各回各的，全程记录调用。"""
+    """按 task_id 分派的假 workers：每个核验子 agent 各回各的，全程记录调用。
+    2026-10-01 起撒网不再派子 agent（代码按计划搜）——还收到 feeds-discover: 派工算 bug。"""
 
-    def __init__(self, discover: Any = None, verify: list | None = None, others: Any = None) -> None:
-        self.discover = discover
+    def __init__(self, verify: list | None = None, others: Any = None) -> None:
         self.verify = list(verify or [])
         self.others = others  # 传给老路调用（一般用不到）
         self.calls: List[Dict[str, Any]] = []
@@ -77,11 +77,7 @@ class SeqWorkers:
         call = {"brief": brief, **kwargs}
         self.calls.append(call)
 
-        if task_id.startswith("feeds-discover:"):
-            rep = self.discover
-            if isinstance(rep, BaseException):
-                raise rep
-            return rep
+        assert not task_id.startswith("feeds-discover:"), "撒网子 agent 已删除（2026-10-01）"
         if task_id.startswith("feeds-verify:"):
             # 并发度记录：进一个 +1，出来 -1
             self._cur += 1
@@ -132,14 +128,15 @@ class FakeBroadSearch:
 
 
 class ToolSearch:
-    """给 web_search 工具用的假搜索：结果带 provider 字段（search.py 的真实口径）。"""
+    """给 web_search 工具用的假搜索：结果带 provider 字段（search.py 的真实口径）。
+    calls 记 (query, limit, days, site, news)——2026-10-01 起代码撒网也用它（五元组）。"""
 
     def __init__(self, results=None) -> None:
         self.results = list(results or [])
         self.calls: List[tuple] = []
 
     async def search(self, query, *, limit=8, days=None, site="", news=False):
-        self.calls.append((query, limit, days))
+        self.calls.append((query, limit, days, site, news))
         return [dict(r) for r in self.results]
 
 
@@ -187,16 +184,49 @@ def _verify_item(url: str, *, title: str = "", kind: str = "news", published=NOW
     }
 
 
+_PLANNED_SEARCHES_FOR_FOCUS = (
+    lambda q, i: [
+        {"q": f"{q} 新进展", "site": "", "news": True, "kind": "news"},
+        {"q": f"{q} 分析", "site": "", "news": False, "kind": "news"},
+    ]
+)
+
+
+def _add_plans_to_focus_reply(reply: str) -> str:
+    """给一份定关注点回复补上每个方向 2 条 searches（2026-10-01 起撒网照计划搜，
+    让饿不着的方向保底不插手；解析不出的回复原样返回）。"""
+    try:
+        parsed = json.loads(reply)
+    except Exception:
+        return reply
+    focus = parsed.get("focus") if isinstance(parsed, dict) else None
+    if not isinstance(focus, list):
+        return reply
+    for i, f in enumerate(focus, 1):
+        if isinstance(f, dict) and f.get("query"):
+            q = str(f["query"])
+            f.setdefault("searches", _PLANNED_SEARCHES_FOR_FOCUS(q, i))
+    return json.dumps(parsed, ensure_ascii=False)
+
+
 def _ready_two_phase_feeds(tmp_path, *, discover=None, verify=None, search=None, models=None):
     """假 workers（按 task_id 分派）+ 假搜索；返回常用几个对象。
 
     2026-09-30 起两阶段恒生效，不需要也不允许再拨开关；这里特意不碰 kv。
+    2026-10-01 起撒网是代码按计划搜，不再派子 agent：discover 参数已废弃。
+    定关注点回复就地补上 searches 计划（让饿不着的方向保底不插手）。
     """
-    workers = SeqWorkers(discover=discover, verify=verify)
+    assert discover is None, "撒网子 agent 已删除：改用 search= 预设结果（代码按计划搜）"
+    workers = SeqWorkers(verify=verify)
     kw: Dict[str, Any] = {"workers": workers}
     if models is not None:
         kw["models"] = models
     store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path, **kw)
+    if isinstance(models.reply_queue, list):
+        models.reply_queue = [
+            _add_plans_to_focus_reply(r) if isinstance(r, str) and '"focus"' in r else r
+            for r in models.reply_queue
+        ]
     if search is None:
         search = FakeBroadSearch()
     feeds._search = search
@@ -217,11 +247,11 @@ def test_feeds_no_longer_has_two_phase_switch(tmp_path) -> None:
 
 
 def test_two_phase_always_on_even_with_stale_kv(tmp_path) -> None:
-    """不设 kv（以及留了旧 kv 行）都一样：prepare_news 恒走两阶段，不再有老单子 agent。"""
+    """不设 kv（以及留了旧 kv 行）都一样：prepare_news 恒走两阶段，不再有老单子 agent、
+    也没有 feeds-discover: 的撒网子 agent（2026-10-01 起撒网是代码按计划搜）。"""
     for write_stale_kv in (False, True):
         store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
             tmp_path / f"case{int(write_stale_kv)}",
-            discover=_ok_report({"note": "撒好了"}),
             verify=[_ok_report({"items": [_verify_item("https://a.com/1")]})],
             search=FakeBroadSearch(results=[
                 {"title": "A", "url": "https://a.com/1", "snippet": "s", "published": None},
@@ -239,8 +269,8 @@ def test_two_phase_always_on_even_with_stale_kv(tmp_path) -> None:
             kept = _run(feeds.prepare_news(GID))
         assert kept == 1, write_stale_kv
         discovers = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-discover:")]
+        assert discovers == [], workers.calls  # 撒网不再派子 agent
         verifies = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-verify:")]
-        assert len(discovers) == 1 and discovers[0]["tools"] == ["web_search"], workers.calls
         assert verifies and all(v["tools"] == ["fetch_page"] for v in verifies), workers.calls
         # 老路的标志：一个 web_search+fetch_page 一把梭、task_id feeds-collect: 的子 agent——不再存在
         collects = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-collect:")]
@@ -283,9 +313,9 @@ def test_discovery_registry_records_and_dedupes():
 
 
 @pytest.mark.asyncio
-async def test_web_search_tool_records_into_registry(tmp_path) -> None:
-    """真实 web_search 工具 handler：task_id 有开着的撒网 run → 结果顺手记进登记簿；
-    另外接受 focus 参数（整数，撒网之外的上下文里忽略）。"""
+async def test_web_search_tool_no_registry_recording_anymore(tmp_path) -> None:
+    """2026-10-01 起撒网登记由代码撒网自己做（feeds._run_planned_searches），
+    web_search 工具不再往登记簿记；focus 参数也随之从工具声明里拿掉。"""
     store = Store(tmp_path / "t.db")
     store.migrate()
     settings = _settings({"groups": {"serve": [{"group": f"qq:{GID}"}]}})
@@ -294,19 +324,18 @@ async def test_web_search_tool_records_into_registry(tmp_path) -> None:
         {"title": "甲", "url": "https://a.com/1", "snippet": "s", "published": None, "provider": "keenable"},
     ])
     register_builtin(tools, search=search, profiles=FakeProfiles(), get_settings=lambda: settings)
-    tid = "feeds-discover:tool:1:1"
+    tid = "feeds-discover:tool:1:1"  # 同名的 run 开着也不记（登记只剩代码撒网一个写口）
     discovery.open_run(tid)
     try:
         r = await tools.call("web_search", {"query": "测试词", "focus": 3}, _ctx(task_id=tid))
         assert r.ok
     finally:
         out = discovery.close_run(tid)
-    assert len(out) == 1
-    assert out[0]["query"] == "测试词" and out[0]["focus"] == 3 and out[0]["provider"] == "keenable"
-    # focus 参数进了工具声明（模型看得见）
+    assert out == []
+    # focus 参数已不在工具声明里（模型不再被要求标 focus=<编号>）
     tool = tools._tools["web_search"]
-    assert "focus" in (tool.parameters.get("properties") or {})
-    # 撒网之外的 task_id 传 focus 也不炸、不记
+    assert "focus" not in (tool.parameters.get("properties") or {})
+    # 任何 task_id 传 focus 也不炸
     r2 = await tools.call("web_search", {"query": "别的", "focus": "不是数字"}, _ctx(task_id="T-9"))
     assert r2.ok
 
@@ -316,49 +345,190 @@ async def test_web_search_tool_records_into_registry(tmp_path) -> None:
 # ----------------------------------------------------------------------
 
 
-def test_discover_worker_searches_only(tmp_path) -> None:
-    """撒网子 agent：工具只有 web_search；brief 带编号关注点 / 「只搜不开」/ focus=<编号>。"""
-    discover = _ok_report({"note": "撒好了"})
-    # 登记簿里零候选 → 保底会补；假搜索给 2 条，让流程能开到核验
-    search = FakeBroadSearch(results=[
-        {"title": "A", "url": "https://a.com/1", "snippet": "s", "published": None},
-        {"title": "B", "url": "https://b.com/2", "snippet": "s", "published": None},
-    ])
-    verify = [_ok_report({"items": [_verify_item("https://a.com/1")]})]
-    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
-        tmp_path, discover=discover, verify=verify, search=search,
-    )
-    # 模型队列：定关注点 → 挑（就挑第 0 条）→ 打分
-    models.reply_queue = [
-        _FOCUS_JSON,
-        json.dumps({"picks": [{"i": 0, "kind": "news", "hook": "和群画像直接对得上"}]}, ensure_ascii=False),
-        _scores_json(_score(0)),
+def test_planned_searches_run_exactly_as_planned(tmp_path) -> None:
+    """定关注点给的 searches 就照单执行：q/site/news/days（news 7 天、guide 180 天）映射，
+    同一方向的结果带 1 起的 focus 编号落登记簿；不再有任何 feeds-discover: 派工。"""
+
+    class ByQuerySearch:
+        """和线上一致的回放：每一次搜索出的链接都不同（真的这么散）。"""
+
+        def __init__(self) -> None:
+            self.calls: List[tuple] = []
+
+        async def search(self, query, *, limit=8, days=None, site="", news=False):
+            self.calls.append((query, limit, days, site, news))
+            return [{"title": query, "url": f"https://a.com/{len(self.calls)}",
+                     "snippet": "s", "published": None, "provider": "keenable"}]
+
+    search = ByQuerySearch()
+    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path, search=search)
+    focus = [
+        {"query": "生化危机 9", "why": "", "angle": "", "source": "recent", "searches": [
+            {"q": "生化危机9 战斗系统", "site": "", "news": True, "kind": "news"},
+            {"q": "生化危机9 豪华版提前解锁", "site": "", "news": False, "kind": "news"},
+            {"q": "生化危机9 官方公告", "site": "capcom.com", "news": False, "kind": "news"},
+            {"q": "生化危机9 通关评测", "site": "", "news": False, "kind": "guide"},
+        ]},
+        {"query": "开源掌机", "why": "", "angle": "", "source": "long", "searches": [
+            {"q": "开源掌机 新品", "site": "", "news": True, "kind": "news"},
+        ]},
     ]
-    with _TimePatch():
-        kept = _run(feeds.prepare_news(GID))
-    assert kept == 1
-    discovers = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-discover:")]
-    assert len(discovers) == 1
-    assert discovers[0]["tools"] == ["web_search"]
-    assert str(discovers[0]["task_id"]).startswith("feeds-discover:")
-    assert discovers[0]["output_schema"] == {
-        "type": "object",
-        "properties": {"note": {"type": "string"}},
-        "required": ["note"],
+    funnel: dict = {"queries": 0, "providers": {}, "per_focus": [], "timings_s": {}}
+    discovery.open_run("feeds-discover:t:1:1")
+    err = _run(feeds._run_planned_searches(GID, focus, settings, "feeds-discover:t:1:1", funnel))
+    assert err is None
+    got = discovery.close_run("feeds-discover:t:1:1")
+    by_q = {c[0]: c for c in search.calls}
+    # 照计划各搜一次：site / news / days 映射（guide 放宽到 180 天）
+    assert set(by_q) == {"生化危机9 战斗系统", "生化危机9 豪华版提前解锁", "生化危机9 官方公告", "生化危机9 通关评测", "开源掌机 新品"}
+    assert by_q["生化危机9 战斗系统"] == ("生化危机9 战斗系统", 10, 7, "", True)
+    assert by_q["生化危机9 豪华版提前解锁"] == ("生化危机9 豪华版提前解锁", 10, 7, "", False)
+    assert by_q["生化危机9 官方公告"] == ("生化危机9 官方公告", 10, 7, "capcom.com", False)
+    assert by_q["生化危机9 通关评测"] == ("生化危机9 通关评测", 10, 180, "", False)
+    # 方向 1 的四搜出的 4 条链接都在登记簿（focus=1）；方向 2 的在 focus=2
+    f1 = [c for c in got if c["focus"] == 1]
+    f2 = [c for c in got if c["focus"] == 2]
+    assert len(f1) == 4 and len(f2) == 1
+    # 同一条链接被同方向多搜碰到时，问法全攒进先见那条的 queries（登记簿按链接去重）
+    assert {q for c in f1 for q in c["queries"]} == {
+        "生化危机9 战斗系统", "生化危机9 豪华版提前解锁", "生化危机9 官方公告", "生化危机9 通关评测",
     }
-    brief = discovers[0]["brief"]
-    assert "1." in brief and "FPGA 新动态" in brief  # 编号关注点
-    assert "不要打开" in brief or "别打开" in brief
-    assert "focus=" in brief
-    # 核验子 agent 只用 fetch_page
-    verifies = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-verify:")]
-    assert verifies, workers.calls
-    assert all(v["tools"] == ["fetch_page"] for v in verifies)
+    assert funnel["queries"] == 5
+
+
+def test_planned_searches_fall_back_to_focus_query(tmp_path) -> None:
+    """searches 没了 / 给得不对（不是列表 / 空列表 / 全不合法）→ 回退成 focus["query"] 一搜。"""
+    search = ToolSearch(results=[
+        {"title": "甲", "url": "https://a.com/1", "snippet": "s", "published": None, "provider": "m"},
+    ])
+    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path, search=search)
+    focus = [
+        {"query": "方向名一句", "why": "", "angle": "", "source": "", "searches": []},
+        {"query": "另一个方向", "why": "", "angle": "", "source": "",
+         "searches": [{"q": "  "}, {"q": ""}, "不是对象"]},
+    ]
+    funnel: dict = {"queries": 0, "providers": {}, "per_focus": [], "timings_s": {}}
+    discovery.open_run("feeds-discover:t:2:2")
+    err = _run(feeds._run_planned_searches(GID, focus, settings, "feeds-discover:t:2:2", funnel))
+    out = discovery.close_run("feeds-discover:t:2:2")
+    assert err is None
+    assert [c[0] for c in search.calls] == ["方向名一句", "另一个方向"]
+    assert all(c[2] == 7 for c in search.calls)  # 回退一律按资讯 7 天
+    # 两条都进了登记簿（同链接去重留先见），focus 各记各的
+    assert out and out[0]["focus"] == 1
+
+
+def test_planned_searches_capped_and_deduped(tmp_path) -> None:
+    """一轮计划总数封顶 + 同 (q, site, news, kind) 去重；方向里给多了也最多 5 条。"""
+    search = ToolSearch(results=[])
+    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path, search=search)
+    many = [
+        {"q": f"词{i}", "site": "", "news": False, "kind": "news"} for i in range(9)
+    ]
+    dup = [
+        {"q": "同一句", "site": "", "news": True, "kind": "news"},
+        {"q": "同一句", "site": "", "news": True, "kind": "news"},
+        {"q": "同一句", "site": "x.com", "news": True, "kind": "news"},
+    ]
+    focus = [
+        {"query": "A", "why": "", "angle": "", "source": "", "searches": many},
+        {"query": "B", "why": "", "angle": "", "source": "", "searches": dup},
+        *[
+            # 方向名前缀防「同一搜索词去重」跨方向不生效（不同方向的同一句各搜各的）
+            {"query": f"C{i}", "why": "", "angle": "", "source": "",
+             "searches": [dict(s, q=f"C{i}-{s['q']}") for s in many]}
+            for i in range(4)
+        ],
+    ]
+    funnel: dict = {"queries": 0}
+    discovery.open_run("feeds-discover:t:3:3")
+    err = _run(feeds._run_planned_searches(GID, focus, settings, "feeds-discover:t:3:3", funnel))
+    assert err is None
+    # 方向 A 给 9 条砍到 5；方向 B 去重后 2 条；再加 4 个方向各 5 条 = 27 ≤ 30 的帽
+    assert funnel["queries"] == len(search.calls) == 5 + 2 + 20
+
+
+def test_planned_searches_concurrency_bounded(tmp_path) -> None:
+    """代码撒网并发受信号量限流：峰值 <= 并发上限常数。"""
+    import asyncio as _asyncio
+
+    from CharTyr_MaiWork.maiwork import feeds as feeds_mod
+
+    search = ToolSearch(
+        results=[{"title": "t", "url": "https://a.com/1", "snippet": "s", "published": None, "provider": "m"}],
+    )
+    cur, peak = 0, 0
+    lock = _asyncio.Lock()
+
+    async def slow_search(query, *, limit=8, days=None, site="", news=False):
+        nonlocal cur, peak
+        async with lock:
+            cur += 1
+            peak = max(peak, cur)
+        await _asyncio.sleep(0.01)
+        async with lock:
+            cur -= 1
+        search.calls.append((query, limit, days, site, news))
+        return [dict(r) for r in search.results]
+
+    search.search = slow_search
+    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path, search=search)
+    # 7 个方向、各 5 条互不相同的计划 = 35 条 → 一轮 30 条的帽会封顶
+    focus = [
+        {"query": f"方向{n}", "why": "", "angle": "", "source": "",
+         "searches": [{"q": f"方向{n}-词{i}", "site": "", "news": False, "kind": "news"} for i in range(5)]}
+        for n in range(7)
+    ]
+    funnel: dict = {"queries": 0}
+    discovery.open_run("feeds-discover:t:4:4")
+    err = _run(feeds._run_planned_searches(GID, focus, settings, "feeds-discover:t:4:4", funnel))
+    assert err is None
+    assert funnel["queries"] == 30  # 一轮 30 条的帽
+    assert 1 < peak <= feeds_mod.PLANNED_SEARCH_CONCURRENCY, peak
+
+
+def test_planned_searches_all_fail_raises_like_before(tmp_path) -> None:
+    """每一搜都挂（含保底）+ 一条都没搜出 = 撒网垮：照老句式「子 agent 没找到东西」跳过这轮。"""
+
+    class FailingSearch:
+        async def search(self, query, **kw):
+            if str(query).startswith("__配置自检__"):
+                return []  # 配自检放行（走到撒网那步才算全挂）
+            raise RuntimeError("搜索全挂")
+
+        def broad_providers(self):
+            return []
+
+    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
+        tmp_path, search=FailingSearch(),
+    )
+    models.reply_queue = [_FOCUS_JSON]
+    with _TimePatch():
+        got = _run(feeds.prepare_news(GID))
+    assert got == 0
+    row = store.read().execute("SELECT note FROM news_batches ORDER BY id DESC LIMIT 1").fetchone()
+    assert row is not None
+    assert "子 agent 没找到东西" in str(row["note"]) or "子 agent 出了意外" in str(row["note"])
+
+
+def test_planned_no_search_object_means_skip(tmp_path) -> None:
+    """self._search 是 None（测试没注入）：一搜不发、不算垮（候选空照旧按老路回落）。"""
+    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path)
+    feeds._search = None
+    funnel: dict = {"queries": 0}
+    discovery.open_run("feeds-discover:t:5:5")
+    err = _run(feeds._run_planned_searches(
+        GID, [{"query": "方向", "why": "", "angle": "", "source": ""}], settings,
+        "feeds-discover:t:5:5", funnel,
+    ))
+    discovery.close_run("feeds-discover:t:5:5")
+    assert err is None
+    assert funnel["queries"] == 0
 
 
 def test_per_focus_floor_triggers_code_searches(tmp_path) -> None:
-    """某个方向没被撒网搜到（0 次问 / 0 条）→ 代码直接补搜：主家一次 + 撒网多一家各一次。"""
-    discover = _ok_report({"note": "ok"})
+    """计划里没有几条独特的问法（或者计划都搜不出东西）→ 饿着（问 <2 次 / 候选 <6 条）
+    的方向由保底代码补搜：主家一次 + 撒网多一家各一次。"""
     search = FakeBroadSearch(
         results=[{"title": "X", "url": "https://x.com/1", "snippet": "s", "published": None}],
         broad=["main", "extra"],
@@ -366,18 +536,18 @@ def test_per_focus_floor_triggers_code_searches(tmp_path) -> None:
     )
     verify = [_ok_report({"items": [_verify_item("https://x.com/1")]})]
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
-        tmp_path, discover=discover, verify=verify, search=search,
+        tmp_path, verify=verify, search=search,
     )
     models.reply_queue = [
-        _FOCUS_JSON,
+        _FOCUS_JSON,  # 3 个方向、不带 searches → 每方向只搜 1 条（饿着） → 保底补 1 主家 + 1 extra
         json.dumps({"picks": [{"i": 0, "kind": "news", "hook": "值得打开"}]}, ensure_ascii=False),
         _scores_json(_score(0)),
     ]
     with _TimePatch():
         _run(feeds.prepare_news(GID))
-    # 三个关注点每个都饿着：每个主家补一次（days=7；配自检探测那条不算）
+    # 三个方向各回退搜 1 次（days=7），再各被保底补 1 次主家（days=7；配自检探测那条不算）
     real_calls = [c for c in search.calls if c[0] != "__配置自检__"]
-    assert len(real_calls) >= 3, search.calls
+    assert len(real_calls) == 3 + 3, search.calls
     assert all(call[2] == 7 for call in real_calls)
     # 撒网多一家：每个饿着的方向也用 search_with 各补一次
     assert len(search.with_calls) >= 3
@@ -385,39 +555,28 @@ def test_per_focus_floor_triggers_code_searches(tmp_path) -> None:
 
 
 def test_floor_errors_ignored(tmp_path) -> None:
-    """保底补搜全部出错也不拖累这轮：还靠撒网登记簿那几条往下走。"""
+    """保底补搜全部出错也不拖累这轮：还靠计划搜到的那几条往下走。"""
 
     class BadSearch:
         async def search(self, query, **kw):
             if str(query).startswith("__配置自检__"):
-                return []  # 自检探测放行（让它走进保底，保底里才全挂）
-            raise RuntimeError("搜索全挂")
+                return []  # 自检探测放行
+            if "FPGA" in str(query):  # 计划搜那条放行（登记簿能收一条往下走）
+                return [{"title": "好", "url": "https://good.com/1", "snippet": "s", "published": None}]
+            raise RuntimeError("保底补搜全挂")
 
         def broad_providers(self):
             return []
 
-    discover = _ok_report({"note": "ok"})
     verify = [_ok_report({"items": [_verify_item("https://good.com/1")]})]
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
-        tmp_path, discover=discover, verify=verify, search=BadSearch(),
+        tmp_path, verify=verify, search=BadSearch(),
     )
     models.reply_queue = [
         _FOCUS_JSON,
         json.dumps({"picks": [{"i": 0, "kind": "news", "hook": "值得打开"}]}, ensure_ascii=False),
         _scores_json(_score(0)),
     ]
-
-    orig_run = workers.run
-
-    async def run_and_record(brief, **kwargs):
-        tid = str(kwargs.get("task_id") or "")
-        if tid.startswith("feeds-discover:"):
-            discovery.record(tid, query="q", focus=1, provider="main", results=[
-                {"title": "好", "url": "https://good.com/1", "snippet": "s", "published": None},
-            ])
-        return await orig_run(brief, **kwargs)
-
-    workers.run = run_and_record
     with _TimePatch():
         kept = _run(feeds.prepare_news(GID))
     assert kept == 1
@@ -497,13 +656,12 @@ def test_prefilter_caps_focus_share(tmp_path) -> None:
 
 def test_pick_model_failure_falls_back(tmp_path) -> None:
     """挑的模型调炸了 → 前 10 条粗筛结果直接进核验，不报错。"""
-    discover = _ok_report({"note": "ok"})
     search = FakeBroadSearch(results=[
         {"title": f"S{i}", "url": f"https://s.com/{i}", "snippet": "s", "published": None} for i in range(12)
     ])
     verify = [_ok_report({"items": [_verify_item("https://s.com/0")]})]
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
-        tmp_path, discover=discover, verify=verify, search=search,
+        tmp_path, verify=verify, search=search,
     )
     from CharTyr_MaiWork.maiwork.models import ModelError
     models.reply_queue = [_FOCUS_JSON, ModelError("模型炸了"), _scores_json(_score(0))]
@@ -523,7 +681,6 @@ def test_pick_model_failure_falls_back(tmp_path) -> None:
 
 def test_verify_workers_concurrent_and_fail_isolated(tmp_path) -> None:
     """核验子 agent 并发跑（max ≥2）；一个炸了只丢它自己那份，别人的照收。"""
-    discover = _ok_report({"note": "ok"})
     search = FakeBroadSearch(results=[
         {"title": f"S{i}", "url": f"https://s.com/{i}", "snippet": "s", "published": None} for i in range(12)
     ])
@@ -532,7 +689,7 @@ def test_verify_workers_concurrent_and_fail_isolated(tmp_path) -> None:
         _ok_report({"items": [_verify_item("https://s.com/4")]}),  # 第 2 组回 1 条
     ]
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
-        tmp_path, discover=discover, verify=verify, search=search,
+        tmp_path, verify=verify, search=search,
     )
     picks = [{"i": i, "kind": "news", "hook": f"理由{i}"} for i in range(12)]
     models.reply_queue = [
@@ -574,13 +731,12 @@ def test_verify_output_order_follows_picks(tmp_path) -> None:
 
 def test_verify_picks_without_hook_dropped(tmp_path) -> None:
     """模型挑的条目没有具体 hook（或编号越界）→ 丢掉不打开。"""
-    discover = _ok_report({"note": "ok"})
     search = FakeBroadSearch(results=[
         {"title": f"S{i}", "url": f"https://s.com/{i}", "snippet": "s", "published": None} for i in range(6)
     ])
     verify = [_ok_report({"items": [_verify_item("https://s.com/1")]})]
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
-        tmp_path, discover=discover, verify=verify, search=search,
+        tmp_path, verify=verify, search=search,
     )
     picks = [
         {"i": 0, "kind": "news", "hook": "   "},  # 空 hook → 丢
@@ -614,34 +770,37 @@ def test_items_carry_src_into_news_items(tmp_path) -> None:
     assert "src_query" in cols and "src_provider" in cols
     store.close()
 
-    discover = _ok_report({"note": "ok"})
-    search = FakeBroadSearch()  # 保底给空：候选只从登记簿来
+    # 模拟线上：每条计划各自出的结果不同，保底补搜什么都搜不到
+    # （否则多条计划/保底碰到同一条链接会把 src 抢去）
+    class PlannedOnly:
+        def __init__(self) -> None:
+            self.calls: List[tuple] = []
+
+        async def search(self, query, *, limit=8, days=None, site="", news=False):
+            self.calls.append((query, limit, days, site, news))
+            if str(query) == "FPGA 新动态 新进展":  # 方向 1 计划的第一条（见 _add_plans_to_focus_reply）
+                return [{"title": "开源掌机周报", "url": "https://src.com/a", "snippet": "s",
+                         "published": None, "provider": "keenable"}]
+            return []
+
     verify = [_ok_report({"items": [_verify_item("https://src.com/a")]})]
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
-        tmp_path, discover=discover, verify=verify, search=search,
+        tmp_path, verify=verify, search=PlannedOnly(),
     )
+    # 定关注点回复换成「带搜索计划」的版本：方向 1 计划第一条 q="FPGA 新动态 新进展"
     models.reply_queue = [
-        _FOCUS_JSON,
+        _add_plans_to_focus_reply(_FOCUS_JSON),
+        # 方向列表里只有 1 条候选（粗筛留它的那条） → 挑第 0 条即那条
         json.dumps({"picks": [{"i": 0, "kind": "news", "hook": "值得一开"}]}, ensure_ascii=False),
         _scores_json(_score(0)),
     ]
-    orig_run = workers.run
-
-    async def run_and_record(brief, **kwargs):
-        tid = str(kwargs.get("task_id") or "")
-        if tid.startswith("feeds-discover:"):
-            discovery.record(tid, query="开源掌机新进展", focus=1, provider="keenable", results=[
-                {"title": "开源掌机周报", "url": "https://src.com/a", "snippet": "s", "published": None},
-            ])
-        return await orig_run(brief, **kwargs)
-
-    workers.run = run_and_record
     with _TimePatch():
         kept = _run(feeds.prepare_news(GID))
     assert kept == 1
     row = store.read().execute("SELECT src_query, src_provider FROM news_items WHERE rejected=0").fetchone()
     assert row is not None
-    assert row["src_query"] == "开源掌机新进展"
+    # 这条候选被每一搜都碰到：登记簿留先见的那条——方向 1 计划的第一条搜索词
+    assert row["src_query"] == "FPGA 新动态 新进展"
     assert row["src_provider"] == "keenable"
     # 管理员视图带 src；群友视图不带（时间冻结在入库那一刻的 3 天窗口里读）
     with _TimePatch():
@@ -649,7 +808,7 @@ def test_items_carry_src_into_news_items(tmp_path) -> None:
         view_member = feeds.news_view(GID, days=3, admin=False)
     assert view_admin and view_admin[0]["items"], view_admin
     item = view_admin[0]["items"][0]
-    assert item.get("src") == {"query": "开源掌机新进展", "provider": "keenable"}
+    assert item.get("src") == {"query": "FPGA 新动态 新进展", "provider": "keenable"}
     assert "src" not in view_member[0]["items"][0]
 
 
@@ -660,7 +819,6 @@ def test_items_carry_src_into_news_items(tmp_path) -> None:
 
 def test_funnel_stats_written_and_readable(tmp_path) -> None:
     """批次统计带 funnel：各环节计数 + 每方向的计数，读的回来；老字段还在。"""
-    discover = _ok_report({"note": "ok"})
     search = FakeBroadSearch(
         results=[{"title": f"S{i}", "url": f"https://s.com/{i}", "snippet": "s", "published": None} for i in range(6)],
         broad=["main", "extra"],
@@ -668,7 +826,7 @@ def test_funnel_stats_written_and_readable(tmp_path) -> None:
     )
     verify = [_ok_report({"items": [_verify_item("https://s.com/0")]})]
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
-        tmp_path, discover=discover, verify=verify, search=search,
+        tmp_path, verify=verify, search=search,
     )
     models.reply_queue = [
         _FOCUS_JSON,
@@ -683,7 +841,8 @@ def test_funnel_stats_written_and_readable(tmp_path) -> None:
     assert stats is not None
     funnel = stats.get("funnel")
     assert funnel is not None, stats
-    assert funnel["discovered"] >= 6
+    assert funnel["discovered"] >= 3
+    assert funnel["queries"] >= 3  # 计划（回退）的 3 次搜索计数
     assert funnel["prefiltered"] >= 1
     assert funnel["picked"] >= 1
     assert funnel["returned"] >= 1
@@ -824,8 +983,59 @@ async def test_app_feeds_gets_search(tmp_path) -> None:
         await app.stop()
 
 
-def test_discover_brief_says_call_web_search_directly(tmp_path) -> None:
-    """线上实测：撒网子 agent 开头 4 次调了不存在的「invoke」工具。brief 里写明直接调 web_search。"""
+def test_focus_prompt_plans_searches_with_all_guidance(tmp_path) -> None:
+    """2026-10-01 起撒网是代码按计划搜：搜索的「怎么搜」全套规矩都进定关注点（feeds.focus）
+    的提示词（原撒网 brief 的口径搬走）；提示词不带 fetch_page / 工具调用那套。"""
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path)
-    brief = feeds._discover_brief(GID, [{"query": "方向一"}], settings)
-    assert "直接调用 web_search" in brief
+    with _TimePatch():
+        _run(feeds._plan_focus(GID, settings))
+    prompt = models.calls[0][1][0]["content"]
+    for word in ("一手来源", "社区", "反面", "后续进展", "site"):
+        assert word in prompt, word
+    assert "同义" in prompt  # 禁止同义改写刷搜索
+    assert "2–6" in prompt  # 搜索词要短的口径
+    assert "7 天" in prompt and "180" in prompt  # 时间由程序管
+    assert "search" in prompt and "searches" in prompt  # 要让模型给搜索计划
+    assert "news" in prompt and "kind" in prompt
+    assert "fetch_page" not in prompt and "web_search" not in prompt  # 工具话术不落在这
+    # guides 开着（默认）：kind 允许 guide
+    assert "guide" in prompt
+
+
+def test_focus_prompt_guides_off_says_news_only(tmp_path) -> None:
+    """[feeds] guides=false：定关注点提示词写明这轮只找资讯（别给 guide 计划/kind）。"""
+    cfg = {"feeds": {"guides": False}}
+    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path)
+    # 重配 settings：_make_feeds 的 _settings 只接受 cfg 参数，这里直接改 feeds 的设置闭包
+    from test_feeds_quality import _settings as _mk_settings
+
+    settings2 = _mk_settings(cfg)
+    feeds._get_settings = lambda: settings2
+    focus_json = json.dumps({
+        "focus": [
+            {"query": "A", "why": "", "source": "recent",
+             "searches": [{"q": "a", "site": "", "news": True, "kind": "guide"},
+                          {"q": "b", "site": "", "news": True, "kind": "news"}]},
+            {"query": "B", "why": "", "source": "long"},
+            {"query": "C", "why": "", "source": "explore"},
+        ]
+    }, ensure_ascii=False)
+    models.reply_queue = [focus_json]
+    with _TimePatch():
+        focus = _run(feeds._plan_focus(GID, settings2))
+    prompt = models.calls[0][1][0]["content"]
+    assert "只找资讯" in prompt
+    # guides=false 时计划的 kind=guide 一律按 news 归一
+    assert focus[0]["searches"][0]["kind"] == "news"
+
+
+def test_focus_prompt_saturated_topics_and_blocked_listed(tmp_path) -> None:
+    """话题饱和提示 + 屏蔽名单（手动+自动）都进定关注点提示词。"""
+    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path)
+    with store.tx() as conn:
+        store.kv_set(conn, "feeds.blocked_domains", ["spam-news.example"])
+    with _TimePatch():
+        _run(feeds._plan_focus(GID, settings))
+    prompt = models.calls[0][1][0]["content"]
+    assert "spam-news.example" in prompt
+    # 直接发够 2 条的饱和话题会列出来（库里没数据时这块没有，只验手动屏蔽名单）

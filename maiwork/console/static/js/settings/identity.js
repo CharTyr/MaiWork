@@ -1,4 +1,4 @@
-// MaiWork 网页 · 设置 ·「身份」：头像、SOUL / AGENTS / 工作记忆。
+// MaiWork 网页 · 设置 ·「记忆」页 + 头像小块（头像放在专岗页「主模型」那一栏）。
 import { state } from "../state.js";
 import { dayWord, esc, toast } from "../util.js";
 import { api } from "../api.js";
@@ -9,7 +9,7 @@ import { ONB_STEPS, onb, onbPane } from "../onboarding.js";
 
 /* ───── 身份：SOUL / AGENTS / 工作记忆 ───── */
 export const AV_SRC = { custom: "你自定义的", qq: "跟 MaiBot 的 QQ 头像同步", platform: "跟 MaiBot 在其他平台的头像同步", default: "默认头像（MaiBot 没有 QQ 账号可同步）" };
-function avatarBlock() {
+export function avatarBlock() {
   const a = state.avatarCfg;
   const src = a ? AV_SRC[a.source] || "" : "";
   return `
@@ -42,7 +42,7 @@ export async function avatarSaved(a) {
 
 export async function loadIdentity() {
   api("GET", "/api/settings/avatar")
-    .then((a) => ((state.avatarCfg = a), state.setSub === "identity" && repaintSheet()))
+    .then((a) => ((state.avatarCfg = a), ["memory", "agents"].includes(state.setSub) && repaintSheet()))
     .catch(() => (state.avatarCfg = null));
   try {
     state.identity = await api("GET", "/api/identity");
@@ -64,20 +64,18 @@ function idBlock(kind, title, lead, item, limit, extra) {
     </form>`;
 }
 
-export function identityPage(s) {
+// 「记忆」页（2026-10：身份页撤掉，SOUL / AGENTS 搬到各专岗；这里只放记忆）
+export function memoryPage(s) {
   const d = state.identity;
   if (!d) return loading();
   const lim = d.limits || {};
   const gm = d.group_memory || {};
   const groups = s.groups || [];
   return `
-    
-    ${avatarBlock()}
-    ${idBlock("soul", "SOUL.md", "说话的口吻和性格" + (d.soul && d.soul.synced_from_maibot ? " · 已和 MaiBot 同步" : ""), d.soul, lim.soul, `<button type="button" class="btn small" data-act="soul-sync">从 MaiBot 同步</button>`)}
-    ${idBlock("agents", "AGENTS.md", "做事的规矩和偏好", d.agents, lim.agents)}
+    <p class="h-meta">MaiWork 做事时记下的经验。主模型会自己往里记，你也可以直接改。</p>
     ${idBlock("memory", "工作记忆（全局）", "所有群通用的经验，不写具体的群和人", d.memory, lim.memory)}
-    <h2 class="h-sub">每个群的工作记忆</h2>
-    <p class="h-meta" style="margin-top:-6px">每个群各自的经验，只在那个群里用</p>
+    <h2 class="h-sub">每个群的偏好</h2>
+    <p class="h-meta" style="margin-top:-6px">每个群各自的偏好和经验，只在那个群里用，不会带到别的群</p>
     ${
       groups.length
         ? groups

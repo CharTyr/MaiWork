@@ -68,7 +68,7 @@ class _ModelsOK:
         self.calls: list[dict] = []
         self._payload_map = payload_map or {}
 
-    async def chat(self, role, messages, **kwargs):
+    async def chat(self, role=None, messages=None, **kwargs):
         purpose = str(kwargs.get("purpose") or "")
         self.calls.append({
             "role": role, "messages": messages, "purpose": purpose,
@@ -90,7 +90,7 @@ class _ModelsOK:
 
 
 class _ModelsNotReady:
-    async def chat(self, role, messages, **kwargs):
+    async def chat(self, role=None, messages=None, **kwargs):
         raise AssertionError("模型没配好时不许被调")
 
     def settings(self):
@@ -323,14 +323,13 @@ def _mk_coordinator(store, models, workers, tasks, goals, settings, specialists=
 class TestNewsStageDispatch:
     @pytest.mark.asyncio
     async def test_two_phase_dispatch_collect_verify_tools(self, store):
-        """两阶段：撒网 sp.run tools=["web_search"]，核验 sp.run tools=["fetch_page"] 且
-        agent_type kind=news、不再走 workers.run。"""
+        """两阶段（2026-10-01 起撒网是代码按计划搜，不再派子 agent）：撒网阶段一次专岗/worker
+        派工都不发生，核验照旧走 sp.run tools=["fetch_page"] 且 agent_type kind=news。"""
         with store.tx() as conn:
             store.kv_set(conn, "feeds.two_phase", [G1])
         workers = FakeWorkersQueue()
         agents = FakeAgents()
         sp = FakeSpecialists(agents, results=[
-            WorkerReport(ok=True, summary="撒网交回", data={"note": "done"}),
             # 核验阶段：3 组份可能并发；把同格式带回放在队列里足够
             WorkerReport(ok=True, summary="v1", data={"items": [{
                 "title": "x", "url": "https://a.com/x1", "summary": "s", "kind": "news",
@@ -342,32 +341,27 @@ class TestNewsStageDispatch:
         })
         settings = _Settings()
         feeds = _mk_feeds(store, models=models, workers=workers, settings=settings, specialists=sp)
-        # 伪候选进撒网登记簿：走 discovery.open_run 手动播种太重，直接调 _collect_two_phase
-        from CharTyr_MaiWork.maiwork import discovery
-        discover_mark = "feeds-discover:test"
-        real_open = discovery.open_run
 
-        def _open_and_seed(task_id):
-            real_open(task_id)
-            discovery.record(task_id, query="q", focus=1, provider="t", results=[
-                {"title": "x", "url": "https://a.com/x1", "snippet": "s", "published": None, "provider": "t"},
-            ])
+        class _SearchOK:
+            """代码撒网用的假搜索（search.py 归一化后的结果形状）。"""
 
-        discovery.open_run = _open_and_seed
+            async def search(self, query, *, limit=8, days=None, site="", news=False):
+                return [
+                    {"title": "x", "url": "https://a.com/x1", "snippet": "s",
+                     "published": None, "provider": "t"},
+                ]
+
+            def broad_providers(self):
+                return ["t"]
+
+        feeds._search = _SearchOK()  # 代码撒网：预设链接完整的搜索结果 → 登记簿有候选
         focus = [{"query": "test", "why": "", "angle": "", "source": ""}]
-        try:
-            items = await feeds._collect_two_phase(G1, focus, settings, collect_mark="feeds-collect:test", stats_out={})
-        finally:
-            discovery.open_run = real_open
-            discovery.close_run(discover_mark)
+        items = await feeds._collect_two_phase(G1, focus, settings, collect_mark="feeds-collect:test", stats_out={})
         assert sp.runs_of("news")
-        # 撒网阶段只给了 web_search；核验阶段只给了 fetch_page
-        phases = [r["phase"] for r in sp.runs_of("news")]
-        assert "collect" not in phases or True  # 两阶段撒网本身记 phase=discover/collect 均可
-        assert any(r.get("tools") == ["web_search"] for r in sp.runs_of("news")) or \
-            any(set(r.get("tools") or []) == {"web_search"} for r in sp.runs_of("news"))
-        assert any(set(r.get("tools") or []) == {"fetch_page"} for r in sp.runs_of("news"))
+        # 撒网阶段一派工都没发生（没有 web_search 的专岗/worker 调用）；核验阶段只给了 fetch_page
+        assert all(set(r.get("tools") or []) == {"fetch_page"} for r in sp.runs_of("news"))
         assert workers.calls == []
+        assert items and items[0]["url"] == "https://a.com/x1"
         # 每条 eff_tools 都不含 mcp_*
         for r in sp.runs_of("news"):
             assert not any(str(t).startswith("mcp_") for t in r["eff_tools"])

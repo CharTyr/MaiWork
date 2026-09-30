@@ -115,7 +115,7 @@ class ScriptedModels:
 
         return _S()
 
-    async def chat(self, role, messages, **kwargs):
+    async def chat(self, role=None, messages=None, **kwargs):
         self.calls.append((role, [dict(m) for m in messages], kwargs))
         if not self.script:
             return ReplayChatResult("{}")

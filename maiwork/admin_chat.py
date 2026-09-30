@@ -665,6 +665,7 @@ class AdminChat:
                     messages,
                     models=models,
                     role="main",
+                    agent="main",
                     tools=spec_list or None,
                     json_mode=False,
                     purpose="admin_chat",
@@ -1053,6 +1054,16 @@ class AdminChat:
     # ------------------------------------------------------------------
 
     def _context_window(self) -> int:
+        # 2026-10 改版：上下文压缩用「主模型所选模型」的窗口（models.limits_for("main")）
+        try:
+            models = self.models
+            fn = getattr(models, "limits_for", None)
+            if callable(fn):
+                v = int((fn("main") or {}).get("context_window") or 0)
+                if v > 0:
+                    return v
+        except Exception:
+            pass
         settings = self._settings_or_none()
         try:
             return int(getattr(getattr(settings, "models", None), "context_window", None) or 128000)
@@ -1073,6 +1084,7 @@ class AdminChat:
             cut,
             models=self.models,
             role="main",
+            agent="main",
             purpose="admin_chat",
             group_id=gid,
         )

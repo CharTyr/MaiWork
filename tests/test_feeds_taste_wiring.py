@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 
-from test_feeds_quality import _TimePatch, _brief, _make_feeds, _run, GID, NOW
+from test_feeds_quality import _TimePatch, _make_feeds, _run, GID, NOW
 
 from CharTyr_MaiWork.maiwork import news_feedback, taste
 
@@ -43,7 +43,8 @@ def test_auto_positive_feedback_in_focus_prompt(tmp_path):
     assert "被回复过的那条资讯" in focus and "有人回复卡片" in focus
 
 
-def test_trusted_sources_in_brief(tmp_path):
+def test_trusted_sources_in_focus_prompt(tmp_path):
+    """本群优质来源：定关注点提示词带（2026-10-01 起撒网由代码按计划搜，这段从子 agent brief 挪这）。"""
     store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path)
     with store.tx() as conn:
         for i in range(2):
@@ -54,5 +55,5 @@ def test_trusted_sources_in_brief(tmp_path):
             )
     with _TimePatch():
         _run(feeds.prepare_news(GID))
-    brief = _brief(workers)
-    assert "gcores.com" in brief and "三分之一" in brief
+    focus = _prompts(models)["feeds.focus"]
+    assert "gcores.com" in focus and "三分之一" in focus

@@ -170,10 +170,11 @@ class TestConfigApi:
         ids = [s["id"] for s in data["sections"]]
         # 「启用 MaiWork」总开关不上网页（关了网页自己就没了），整个「插件」分区不列
         assert "plugin.enabled" not in {f["key"] for sec in data["sections"] for f in sec["fields"]}
-        # 0.4.0：模型上下文窗口（models 节）+ 任务安全网（tasks 节）也上网页「全部配置」
+        # 0.4.0：任务安全网（tasks 节）上网页「全部配置」；2026-10 改版 1a：models 节拿掉
+        # （端点/模型库走 /api/settings/endpoints*、/api/settings/model-list*）
         assert ids == [
             "groups", "focus", "feeds", "goals", "topics", "delivery", "approval",
-            "tasks", "models", "jev", "usage", "console", "environments", "profile",
+            "tasks", "jev", "usage", "console", "environments", "profile",
             "storage", "group_space", "reader",
         ]
         assert data["file"] == "config.toml"

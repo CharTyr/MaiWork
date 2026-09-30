@@ -183,13 +183,12 @@ async def test_fetch_page_unlimited_outside_verify(tmp_path) -> None:
 def test_verify_batch_opens_budget_per_group(tmp_path) -> None:
     """挑 12 条 → 3 个核验组，每组 4 条 → 每组上限 min(4×2+1, 6)=6；
     跑完账本全部关掉（不残留）。"""
-    discover = _ok_report({"note": "ok"})
     search = FakeBroadSearch(results=[
         {"title": f"S{i}", "url": f"https://s.com/{i}", "snippet": "s", "published": None} for i in range(12)
     ])
     verify = [_ok_report({"items": [_verify_item("https://s.com/0")]}) for _ in range(3)]
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
-        tmp_path, discover=discover, verify=verify, search=search,
+        tmp_path, verify=verify, search=search,
     )
     picks = [{"i": i, "kind": "news", "hook": f"理由{i}"} for i in range(12)]
     models.reply_queue = [
@@ -278,8 +277,6 @@ def test_verify_fills_published_from_discovery_candidate(tmp_path) -> None:
         async def run(self, brief: str, **kwargs: Any) -> Any:
             self.calls.append({"brief": brief, **kwargs})
             tid = str(kwargs.get("task_id") or "")
-            if tid.startswith("feeds-discover:"):
-                return _ok_report({"note": "ok"})
             if tid.startswith("feeds-verify:"):
                 # 本真核验子 agent 只交回自己这一组的条目（brief 里有自己的候选链接）
                 pool = [
@@ -301,22 +298,13 @@ def test_verify_fills_published_from_discovery_candidate(tmp_path) -> None:
 
     workers = FillWorkers()
     store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path, workers=workers)
-    feeds._search = FakeBroadSearch()
-
-    orig_run = workers.run
-
-    async def run_and_record(brief, **kwargs):
-        tid = str(kwargs.get("task_id") or "")
-        if tid.startswith("feeds-discover:"):
-            discovery.record(tid, query="生化危机 9 评测", focus=1, provider="main",
-                             results=[{"title": "生化危机 9 评测", "url": "https://v.com/no-date",
-                                       "snippet": "s", "published": NOW - 3 * 86400}])
-            discovery.record(tid, query="生化危机 9 指南", focus=1, provider="main",
-                             results=[{"title": "另一篇自带日期", "url": "https://v.com/with-date",
-                                       "snippet": "s", "published": NOW - 5 * 86400}])
-        return await orig_run(brief, **kwargs)
-
-    workers.run = run_and_record
+    # 2026-10-01 起撒网是代码按计划搜：候选由假搜索的预设 items 出（带搜索结果自带的日期）
+    feeds._search = FakeBroadSearch(results=[
+        {"title": "生化危机 9 评测", "url": "https://v.com/no-date", "snippet": "s",
+         "published": NOW - 3 * 86400},
+        {"title": "另一篇自带日期", "url": "https://v.com/with-date", "snippet": "s",
+         "published": NOW - 5 * 86400},
+    ])
 
     seen_items: list[dict] = []
     orig_verify_batch = feeds._verify_batch
@@ -362,13 +350,12 @@ def test_verify_fills_published_from_discovery_candidate(tmp_path) -> None:
 
 def test_verify_deadline_is_tight_box(tmp_path) -> None:
     """核验整体不该拖：每组的时间盒 4 分钟（原来 8），brief 与 deadline_ts 同步。"""
-    discover = _ok_report({"note": "ok"})
     search = FakeBroadSearch(results=[
         {"title": "S0", "url": "https://s.com/0", "snippet": "s", "published": None},
     ])
     verify = [_ok_report({"items": [_verify_item("https://s.com/0")]})]
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
-        tmp_path, discover=discover, verify=verify, search=search,
+        tmp_path, verify=verify, search=search,
     )
     models.reply_queue = [
         _FOCUS_JSON,

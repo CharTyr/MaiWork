@@ -608,8 +608,8 @@ class IdeaMention:
         ]
         try:
             res = await self._models.chat(
-                "main",
-                [{"role": "user", "content": "\n".join(rules)}],
+                agent="idea",
+                messages=[{"role": "user", "content": "\n".join(rules)}],
                 json_mode=True,
                 purpose="card_push.idea_mention",
                 group_id=gid,

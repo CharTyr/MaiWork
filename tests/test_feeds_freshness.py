@@ -31,6 +31,7 @@ from fakes import (
     FakeProfiles,
     ensure_pick_fallback,
     focus_reply,
+    patch_two_phase_feeds,
     two_phase_workers_run,
 )
 
@@ -200,6 +201,25 @@ def _make_feeds(tmp_path, *, models: FakeModelsQueue | None = None,
     profiles = FakeProfiles()
     profiles.entries_map[GID] = [{"category": "ongoing", "text": "在做开源硬件项目"}]
     feeds = Feeds(store, models, workers, profiles, topics, lambda: settings)
+    if workers is not None:
+        # 2026-10-01 撒网改代码按计划搜：FakeWorkers 预置的 items 挪给假搜索出；
+        # 懒取 report——有用例在建好 _feeds 之后才换 report（出错→撒网全挂）
+        def _live_items():
+            if isinstance(getattr(workers, "report", None), BaseException):
+                raise RuntimeError("预置：撒网全挂")
+            r = getattr(workers, "report", None)
+            if r is not None and not getattr(r, "ok", True):
+                raise RuntimeError("预置：子 agent 没跑成")
+            data = getattr(r, "data", None)
+            if isinstance(data, dict):
+                items = list(data.get("items") or [])
+                sf = data.get("seed_focus")  # 老用例：假装都是某方向（diverse 4）搜出来的
+                if isinstance(sf, int) and sf >= 1:
+                    return {sf: items}
+                return items
+            return []
+
+        patch_two_phase_feeds(feeds, models, _live_items)
     return store, settings, feeds, models, workers, topics, profiles
 
 
@@ -574,7 +594,8 @@ class TestSaturatedHints:
         assert "单机游戏" not in prompt  # 只发过 1 条，不算饱和
 
     def test_collect_brief_lists_saturated_topics(self, tmp_path) -> None:
-        """子 agent brief：带「这些话题最近已经发得很多了，不要再找」一行。"""
+        """定关注点提示词：带「这些话题最近已经发得很多了，不要再找」一行
+        （2026-10-01 起撒网改代码按计划搜，饱和话题从那一段挪这里）。"""
         store, settings, feeds, models, workers, topics, _ = _make_feeds(
             tmp_path,
             models=FakeModelsQueue(ready=True, replies=[
@@ -593,9 +614,9 @@ class TestSaturatedHints:
                     url_key=f"old.cn/{i}", created=NOW - (i + 1) * 86400,
                 )
             assert _run(feeds.prepare_news(GID)) == 1
-        brief = str(workers.calls[0]["brief"])
-        assert "涂击队资讯" in brief
-        assert "发得很多" in brief or "不要再找" in brief
+        prompt = models.calls[0][1][0]["content"]
+        assert "涂击队资讯" in prompt
+        assert "发得很多" in prompt or "不要再找" in prompt or "别再找" in prompt
 
 
 class TestFocusRetry:

@@ -18,13 +18,18 @@ class TestContextWindow:
         assert settings.models.context_window == 2_000_000
 
     def test_web_save_schema(self):
+        """2026-10 改版 1a：context_window 搬到 [[model_list]] 条目（不进「全部配置」），
+        网页在「设置 → 模型 → 建/改模型条目」改；老 settings.models 的夹取语义照旧（兜底 / 迁移读数用）。"""
         from CharTyr_MaiWork.maiwork.rules import CONFIG_BY_KEY
 
-        assert "models.context_window" in CONFIG_BY_KEY
-        spec = CONFIG_BY_KEY["models.context_window"]
-        assert spec["type"] == "int"
-        assert spec["label"]
-        assert spec["help"] or spec.get("label")
+        assert "models.context_window" not in CONFIG_BY_KEY
+        # 模型条目越界值：整条被丢（不坏插件），问题列表里说明原因
+        settings, problems = load_settings({
+            "endpoints": [{"id": "e1", "base_url": "https://x.test/v1", "api_key": "k"}],
+            "model_list": [{"id": "m1", "endpoint": "e1", "model": "m", "context_window": 10**9, "max_tokens": 8192}],
+        })
+        assert settings.model_list == ()
+        assert any("context_window" in p for p in problems)
 
 
 class TestMaxTokens:
@@ -49,15 +54,25 @@ class TestMaxTokens:
         assert settings.models.max_tokens == 32768
 
     def test_web_save_schema(self):
+        """2026-10 改版 1a：max_tokens 搬进 [[model_list]] 条目（不进「全部配置」），
+        且必须 < context_window（不然条目被丢）；老 settings.models 的夹子照旧（兜底 / 迁移读数用）。"""
         from CharTyr_MaiWork.maiwork.rules import CONFIG_BY_KEY
 
-        assert "models.max_tokens" in CONFIG_BY_KEY
-        spec = CONFIG_BY_KEY["models.max_tokens"]
-        assert spec["type"] == "int"
-        assert spec["min"] == 1024
-        assert spec["max"] == 1_000_000
-        assert spec["label"]
-        assert spec["help"] or spec.get("label")
+        assert "models.max_tokens" not in CONFIG_BY_KEY
+        # 越界（10 < 1024）：整条被丢，问题列表里说明原因
+        settings, problems = load_settings({
+            "endpoints": [{"id": "e1", "base_url": "https://x.test/v1", "api_key": "k"}],
+            "model_list": [{"id": "m1", "endpoint": "e1", "model": "m", "context_window": 128000, "max_tokens": 10}],
+        })
+        assert settings.model_list == ()
+        assert any("max_tokens" in p for p in problems)
+        # max_tokens >= context_window 的条目读配置时丢掉并记问题
+        settings, problems = load_settings({
+            "endpoints": [{"id": "e1", "base_url": "https://x.test/v1", "api_key": "k"}],
+            "model_list": [{"id": "m1", "endpoint": "e1", "model": "m", "context_window": 8192, "max_tokens": 8192}],
+        })
+        assert settings.model_list == ()
+        assert problems
 
 
 class TestTaskNets:

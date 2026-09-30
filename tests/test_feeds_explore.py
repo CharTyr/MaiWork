@@ -38,6 +38,7 @@ from fakes import (
     FakeProfiles,
     ensure_pick_fallback,
     focus_reply,
+    patch_two_phase_feeds,
     two_phase_workers_run,
 )
 
@@ -148,6 +149,25 @@ def _feeds(
     )
     topics = FakeTopics()
     feeds = Feeds(store, models, workers, profiles, topics, lambda: settings)
+    if workers is not None:
+        # 2026-10-01 撒网改代码按计划搜：FakeWorkers.report 的 items 挪给假搜索出；
+        # 懒取 report——有用例在建好 _feeds 之后才换 report（出错→撒网全挂）
+        def _live_items():
+            if isinstance(getattr(workers, "report", None), BaseException):
+                raise RuntimeError("预置：撒网全挂")
+            r = getattr(workers, "report", None)
+            if r is not None and not getattr(r, "ok", True):
+                raise RuntimeError("预置：子 agent 没跑成")
+            data = getattr(r, "data", None)
+            if isinstance(data, dict):
+                items = list(data.get("items") or [])
+                sf = data.get("seed_focus")  # 老用例：假装都是某方向（diverse 4）搜出来的
+                if isinstance(sf, int) and sf >= 1:
+                    return {sf: items}
+                return items
+            return []
+
+        patch_two_phase_feeds(feeds, models, _live_items)
     return store, settings, feeds, models, workers, profiles, topics
 
 
@@ -379,15 +399,16 @@ class TestPickBriefAndAngle:
         assert "长" * 60 in prompt
         assert "长" * 61 not in prompt
 
-    def test_discover_brief_marks_explore_request(self, tmp_path: Path) -> None:
-        """撒网 brief：source=explore 的方向带「拓展 / 跳一步」标记（2026-09-29 起）。"""
+    def test_focus_prompt_requests_search_plan(self, tmp_path: Path) -> None:
+        """定关注点提示词（撒网改代码按计划搜后）写明：每个方向要给出 searches 计划。"""
         store, settings, feeds, models, workers, profiles, topics = _feeds(tmp_path)
-        brief = feeds._discover_brief(
-            GID,
-            [{"query": "FPGA 新动态", "source": "long"}, {"query": "冷门好板", "source": "explore"}],
-            settings,
-        )
-        assert "拓展" in brief and "跳一步" in brief
+        with _TimePatch():
+            _run(feeds._plan_focus(GID, settings))
+        prompt = _prompt(models, 0)
+        assert "searches" in prompt
+        assert "q" in prompt and "\"kind\"" in prompt.replace(" ", "")
+        # 「拓展」和「不同角度」方向怎么定搜索词也写明
+        assert "拓展" in prompt and "一手来源" in prompt
 
     def test_explore_item_keeps_angle_explore(self, tmp_path: Path) -> None:
         store, settings, feeds, models, workers, profiles, topics = _feeds(tmp_path)

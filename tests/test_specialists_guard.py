@@ -32,7 +32,7 @@ class ReplayModels:
         self.queue = list(results)
         self.calls = []
 
-    async def chat(self, role, messages, **kwargs):
+    async def chat(self, role=None, messages=None, **kwargs):
         self.calls.append((role, [dict(m) for m in messages], kwargs))
         if not self.queue:
             return FakeChatResult(text="（队列空了）")
@@ -269,7 +269,7 @@ async def test_workers_cancelled_error_reraises_not_report(store):
     t = _mk_tools(store)
 
     class CancelModels:
-        async def chat(self, role, messages, **kwargs):
+        async def chat(self, role=None, messages=None, **kwargs):
             raise asyncio.CancelledError("取消")
 
     w = Workers(CancelModels(), t)

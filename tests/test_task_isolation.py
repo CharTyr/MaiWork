@@ -582,7 +582,7 @@ async def test_coordinator_passes_scope_to_workers(mem_store, settings, env, too
         def __init__(self):
             self._n = 0
 
-        async def chat(self, role, messages, **kw):
+        async def chat(self, role=None, messages=None, **kw):
             self._n += 1
             name = "submit_result" if self._n >= 2 else "read_file"
             return type("R", (), {"text": "", "tool_calls": [
@@ -630,7 +630,7 @@ async def test_coordinator_scope_defaults_when_req_names_nothing(mem_store, sett
         def __init__(self):
             self._n = 0
 
-        async def chat(self, role, messages, **kw):
+        async def chat(self, role=None, messages=None, **kw):
             self._n += 1
             name = "submit_result" if self._n >= 2 else "read_file"
             return type("R", (), {"text": "", "tool_calls": [

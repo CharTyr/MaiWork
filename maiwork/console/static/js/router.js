@@ -9,6 +9,7 @@ import { loadAgents } from "./settings/agents.js";
 import { loadRules } from "./settings/rules.js";
 import { loadUsage } from "./settings/usage.js";
 import { loadIdentity } from "./settings/identity.js";
+import { loadModels } from "./settings/models.js";
 import { loadLogs } from "./settings/logs.js";
 import { closeSheet, openSheet, repaintSheet } from "./sheet.js";
 import { enterChat } from "./chat.js";
@@ -128,9 +129,10 @@ export async function reboot() {
     ? loadSettings().then(async () => {
         if (state.page === "settings" && state.setSub === "extensions") await loadExt();
         if (state.page === "settings" && state.setSub === "agents") await loadAgents();
+        if (state.page === "settings" && state.setSub === "models") await loadModels();
         if (state.page === "settings" && state.setSub === "rules") await loadRules();
         if (state.page === "settings" && state.setSub === "usage") await loadUsage();
-        if (state.page === "settings" && state.setSub === "identity") await loadIdentity();
+        if (state.page === "settings" && ["memory", "agents"].includes(state.setSub)) await loadIdentity();
         if (state.page === "settings" && state.setSub === "logs") await loadLogs();
         if (state.page === "settings" && state.setSub === "links") await loadGA();
         renderRail();
@@ -164,9 +166,10 @@ export async function enterSettings(sub) {
   if (!state.settings) await loadSettings();
   if (state.setSub === "extensions") await loadExt();
   if (state.setSub === "agents") await loadAgents();
+  if (state.setSub === "models") await loadModels();
   if (state.setSub === "rules") await loadRules();
   if (state.setSub === "usage") await loadUsage();
-  if (state.setSub === "identity") await loadIdentity();
+  if (["memory", "agents"].includes(state.setSub)) await loadIdentity();
   if (state.setSub === "logs") await loadLogs();
   if (state.setSub === "links") await loadGA();
   if (state.page === "settings") {

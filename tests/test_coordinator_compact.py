@@ -31,7 +31,7 @@ class _Models:
     def settings(self):
         return type("S", (), {"ready": lambda: True, "context_window": 8192})()
 
-    async def chat(self, role, messages, **kw):
+    async def chat(self, role=None, messages=None, **kw):
         self.calls.append((role, [dict(m) for m in messages], dict(kw)))
         if str(kw.get("purpose") or "").endswith(":compact"):
             from CharTyr_MaiWork.maiwork.models import ChatResult

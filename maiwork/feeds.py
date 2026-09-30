@@ -69,6 +69,7 @@ guides 走好文专栏），前端字段名一个都不能变。
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import difflib
 import ipaddress
@@ -199,6 +200,9 @@ def focus_items(data: Any) -> list[dict]:
             src = str(f.get("source") or "").strip()
             if src:
                 item["source"] = src
+            searches = f.get("searches")
+            if isinstance(searches, list) and searches:
+                item["searches"] = searches  # 2026-10-01：这个方向的搜索计划（规约在 _plan_focus）
             out.append(item)
     return out
 
@@ -350,13 +354,16 @@ _ICONS = (
 
 _CANDIDATE_CAP = 12         # 子 agent 最多交回多少条（brief 里也这么要求）
 # 两阶段找资讯（「广撒网再挑着打开」；先做成模块级常量，将来要配置化再动）：
-DISCOVER_TARGET = (40, 80)  # 撒网目标：这轮一共要凑到多少条不重复候选
+# 2026-10-01 起撒网不再派子 agent：定关注点（feeds.focus）一次就把每个方向的
+# 搜索计划（searches）想好，代码按计划并发搜（_run_planned_searches）——
+# 原「撒网子 agent 6 轮 LLM 递进到 ~156k prompt tokens」这一步省掉。
 PREFILTER_KEEP = (18, 24)   # 粗筛后留多少条（下界只是参考；上界是硬上限）
 FETCH_PICK = (8, 12)        # 主模型从粗筛里挑多少条真去打开
 PER_FOCUS_MIN_QUERIES = 2   # 保底：每个关注点至少要被问过几次
 PER_FOCUS_MIN_CANDS = 6     # 保底：每个关注点至少要搜出几条候选
 PER_FOCUS_MAX_SHARE = 0.40  # 粗筛均衡：一个方向最多占粗筛结果的比例
-DISCOVER_MINUTES = 6        # 撒网子 agent 的时间盒（分钟）
+PLANNED_SEARCHES_PER_ROUND = 30  # 撒网计划每轮最多真搜几次（模型给多了截断）
+PLANNED_SEARCH_CONCURRENCY = 4   # 代码撒网的并发上限
 VERIFY_WORKERS = 3          # 核验子 agent 最多几个并发
 VERIFY_MINUTES = 4          # 核验子 agent 的时间盒（分钟；2026-09-30 起 8→4：打开页数已有代码硬上限，
                             # 一组几条 4 分钟够用，拖长的一般是在打转）
@@ -1950,10 +1957,10 @@ class Feeds:
             else:
                 m = mark.replace("feeds-collect:", prefix, 1)
             out = merge_stats(out, self._collect_stats(m))
-        # 两阶段标记：撒网（feeds-discover:）+ 核验（feeds-verify: 一组一个后缀）
+        # 两阶段标记：核验（feeds-verify: 一组一个后缀）。
+        # 2026-10-01 起撒网是代码按计划搜，没有 tool_calls 可点：搜索次数在 funnel["queries"] 里。
         if funnel is not None:
             base = mark.replace("feeds-collect:", "", 1)
-            out = merge_stats(out, self._collect_stats(f"feeds-discover:{base}"))
             out = merge_stats(out, self._collect_prefix_stats(f"feeds-verify:{base}:"))
             f = dict(funnel)
             if kept is not None:
@@ -2248,13 +2255,17 @@ class Feeds:
         return out
 
     async def _plan_focus(self, gid: str, settings: Settings) -> list[dict]:
-        """定关注点。返回 [{"query", "why", "angle", "source"}]。
+        """定关注点 + 顺带定本轮的搜索计划。返回 [{"query", "why", "angle", "source", searches}]。
 
         angle='diverse' 的是「不同角度/反方观点」；source 是 recent|long|explore（缺省 ""）。
+        searches 是这个方向的搜索计划（3–5 条 {"q","site","news","kind"}；kind=guide 只在
+        [feeds] guides=true 时让找），2026-10-01 起由代码直接照单并发搜（_run_planned_searches），
+        不再派撒网子 agent；没给 / 给得不对就回退成把 query 当唯一一条搜索。
         提示词里带：群画像 + 群里最近两天真实在聊的（recent_chat）+ 最近反馈 + 资讯偏好
         （kv["feeds.pref.<群号>"]）+ 最近几轮已经找过的方向（kv["feeds.focus_hist.<群号>"]，
-        要求别再重复、换别的），并要求 3–5 个分散的关注点（recent ≤2、至少 1 个 long、
-        再加 1 个 explore）。
+        要求别再重复、换别的）+「怎么搜」一段（搜索词长短、一手来源、屏蔽名单、优质来源、
+        搜索服务的官方用法）+ 饱和话题提示（原来在撒网 brief 里，挪到这），并要求
+        3–5 个分散的关注点（recent ≤2、至少 1 个 long、再加 1 个 explore）。
         模型可额外给 0–1 个不同角度关注点（顶层 "diverse" 键），进搜索列表，产出条目
         带 angle='diverse'；去同质化时每轮最多留 2 条。
         只给 1 个关注点也照样返回（不报错），日志记一下数量。
@@ -2331,29 +2342,80 @@ class Feeds:
         lines.append("资讯标准（定关注点照这个来）：")
         lines.append(news_standard.for_focus())
         lines.append("")
+        # 「怎么搜」一段（原撒网子 agent brief 的规矩，撒网改代码照计划搜后挪给主模型定计划）；
+        # 不写 fetch_page / 工具调用那套——计划由代码执行，模型只出搜索词。
+        lines.append(self._search_guide_section(gid, settings, for_plan=True).strip())
+        lines.append("")
+        guides_on = bool(getattr(settings.feeds, "guides", True))
+        lines.append("接下来每个关注点的搜索由代码按你给的计划直接跑（不会再去想怎么搜），所以"
+                     "顺便把本轮的搜索计划也定好：")
+        lines.append(
+            "- **每个关注点 3–5 条 searches**，每条就是一次真搜索："
+            '{"q": "2–6 个词的短搜索词（照上面「怎么搜」的规矩；'+ "**别把整条关注点原样当搜索词**"
+            "，也别几条 q 是同一句话换个说法）\", "
+            '"site": "只搜这个域名（可留空）", "news": 要不要新闻类结果 true/false, '
+            '"kind": "' + ('news 资讯 | guide 文章' if guides_on else "news（这轮只找资讯，别给 guide）") + '"}。'
+        )
+        lines.append(
+            "- 换个角度搜：技术细节 / 社区讨论 / 反面意见 / 本地语言的来源 / 后续进展都算；"
+            "**至少一条用 site 直奔一手来源**（官方新闻室、公告、GitHub、文档站）。"
+            "「不同角度」方向（diverse）有几条要找反方 / 批评 / 深度分析；"
+            "「拓展」方向（explore）从跳过去的那条兴趣上想搜索词。"
+        )
+        lines.append("")
         lines.append(
             "请照上面的标准给出 3–5 个接下来要去找的关注点，只回 JSON："
             '{"focus": [{"query": "方向名：短短一句，一个核心事物 + 一个角度（2–10 字直接能搜的那种；'
             '不是一长串关键词串烧）", "why": "为什么这个群会在意（拓展方向写从哪条兴趣跳过来）",'
-            ' "source": "recent | long | explore"}],'
-            ' "diverse": {"query": "…", "why": "…"} | null}'
+            ' "source": "recent | long | explore", "searches": [{"q": "…", "site": "", "news": true, "kind": "news"}, …（3–5 条）]}],'
+            ' "diverse": {"query": "…", "why": "…", "searches": […（同样 3–5 条）]} | null}'
             "。source：来自「最近在聊」的填 recent，长期兴趣 / 在做的事 / 常用资源填 long，「跳一步」的拓展方向填 explore；"
-            "「不同角度」放进 diverse，没有合适的就 null。"
+            "「不同角度」放进 diverse（也带上自己的 3–5 条 searches），没有合适的就 null。"
             + sat_req
+            + self._provider_skill_section(settings)
         )
 
+        guides_ok = bool(getattr(settings.feeds, "guides", True))
+
+        def _parse_searches(raw: Any) -> list[dict]:
+            """从模型回的 searches 数组里挑出能执行的（非法的丢；dedupe / 上限在撒网那步）。"""
+            out: list[dict] = []
+            if not isinstance(raw, list):
+                return out
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                q = str(item.get("q") or "").strip()
+                if not q:
+                    continue
+                kind = str(item.get("kind") or "news").strip().lower()
+                if kind not in ("news", "guide") or (kind == "guide" and not guides_ok):
+                    kind = "news"
+                out.append(
+                    {
+                        "q": q[:100],
+                        "site": str(item.get("site") or "").strip()[:100],
+                        "news": bool(item.get("news")),
+                        "kind": kind,
+                    }
+                )
+            return out
+
         def _parse_out(raw: Any) -> tuple[list[dict], Any]:
-            """从一次模型回复里拿出关注点列表 + 顶层 diverse 对象。"""
-            got = [
-                {**f, "angle": "", "source": _norm_source(f.get("source"))}
-                for f in focus_items(raw)[:5]
-            ]
+            """从一次模型回复里拿出关注点列表（各带 searches）+ 顶层 diverse 对象。"""
+            got = []
+            for f in focus_items(raw)[:5]:
+                item = {**f, "angle": "", "source": _norm_source(f.get("source"))}
+                searches = _parse_searches(f.get("searches"))
+                if searches:
+                    item["searches"] = searches
+                got.append(item)
             return got, (raw.get("diverse") if isinstance(raw, dict) else None)
 
         messages = [{"role": "user", "content": "\n".join(lines)}]
         result = await self._models.chat(
-            "main",
-            list(messages),
+            agent="news",
+            messages=list(messages),
             json_mode=True,
             purpose="feeds.focus",
             group_id=gid,
@@ -2370,14 +2432,15 @@ class Feeds:
                 "role": "user",
                 "content": (
                     "太少了：我要 3–5 个不同的关注点，严格按上面的 JSON 格式回 "
-                    '{"focus": [{"query": "…", "why": "…", "source": "recent | long | explore"}, …]}'
+                    '{"focus": [{"query": "…", "why": "…", "source": "recent | long | explore", '
+                    '"searches": [{"q": "…", "site": "", "news": true, "kind": "news"}, …（3–5 条）]}, …]}'
                     "（focus 是列表，最少 3 个；diverse 没有就 null；query 照样是短短一句方向名，"
                     "别堆成关键词串烧）。"
                 ),
             })
             retry_result = await self._models.chat(
-                "main",
-                list(messages),
+                agent="news",
+                messages=list(messages),
                 json_mode=True,
                 purpose="feeds.focus",
                 group_id=gid,
@@ -2397,14 +2460,16 @@ class Feeds:
             if len(out) != before:
                 logger.info("定关注点重试生效（群 %s）：%d → %d 个", gid, before, len(out))
         if isinstance(diverse, dict) and str(diverse.get("query") or "").strip():
-            out.append(
-                {
-                    "query": str(diverse["query"]).strip(),
-                    "why": str(diverse.get("why") or ""),
-                    "angle": "diverse",
-                    "source": "",
-                }
-            )
+            diverse_item = {
+                "query": str(diverse["query"]).strip(),
+                "why": str(diverse.get("why") or ""),
+                "angle": "diverse",
+                "source": "",
+            }
+            diverse_searches = _parse_searches(diverse.get("searches"))
+            if diverse_searches:
+                diverse_item["searches"] = diverse_searches
+            out.append(diverse_item)
         self._append_focus_history(gid, out)
         logger.info(
             "定关注点（群 %s）：%d 个（recent=%d long=%d explore=%d diverse=%d）",
@@ -2429,8 +2494,24 @@ class Feeds:
     # 「怎么搜」（2026-09-30，docs/10 第七节第 2 步）
     # ------------------------------------------------------------------
 
-    def _search_guide_section(self, gid: str, settings: Settings) -> str:
-        """brief 里「怎么搜」一段：多种问法、一手来源、时间由程序管、别同义改写、屏蔽名单。"""
+    def _search_guide_section(self, gid: str, settings: Settings, *, for_plan: bool = False) -> str:
+        """「怎么搜」一段：多种问法、一手来源、时间由程序管、别同义改写、屏蔽名单。
+
+        for_plan=True：给主模型定搜索计划用（2026-10-01 起搜索由代码照计划跑，
+        不提 web_search / fetch_page 这些工具名）；False：给会用工具的子 agent。
+        """
+        if for_plan:
+            time_line = (
+                f"- 时间由程序管：kind=news 的搜索程序一律只搜最近 {_NEWS_MAX_AGE_DAYS} 天，"
+                f"kind=guide 的放宽到 {GUIDE_MAX_AGE_DAYS} 天。别在搜索词里塞年份、月份来求新。"
+            )
+            last_line = "- 搜索结果只是线索：你只管给计划，打开核对由后面的环节做。"
+        else:
+            time_line = (
+                f"- 时间由程序管：找资讯时 web_search 不填 days，程序默认只搜最近 {_NEWS_MAX_AGE_DAYS} 天；"
+                f"找文章时把 days 填 {GUIDE_MAX_AGE_DAYS}。别在搜索词里塞年份、月份来求新。"
+            )
+            last_line = "- 搜索结果只是线索，用 fetch_page 打开过才算数。"
         lines = [
             "怎么搜：",
             "- **搜索词要短**：一个核心事物 + 一个角度，大约 2–6 个词；"
@@ -2438,13 +2519,12 @@ class Feeds:
             "好：「生化危机9 战斗系统」「生化危机9 豪华版提前解锁」；"
             "坏：「鬼武者 剑之道 首发解锁 豪华版提前游玩 通关评价 战斗系统解析」——"
             "这种一长串什么也搜不准，拆成几个 2–6 词的短词各搜一次。",
-            f"- 时间由程序管：找资讯时 web_search 不填 days，程序默认只搜最近 {_NEWS_MAX_AGE_DAYS} 天；"
-            f"找文章时把 days 填 {GUIDE_MAX_AGE_DAYS}。别在搜索词里塞年份、月份来求新。",
+            time_line,
             "- 每个关注点至少换 4 种问法，其中至少 1 种直奔一手来源。可选的角度：一手来源（官方新闻室、公告、"
             "发布说明、GitHub、论文——用 site 限定网站，如 site=\"nintendo.com\"）、技术细节、社区讨论（论坛、"
             "Reddit、贴吧）、反面意见 / 批评、本地语言的来源、已知事件的后续进展；要新闻就把 news 设成 true。",
             "- 别用同义改写反复搜同一句（换一两个词通常搜不出新东西）；连续两次搜不出新东西，就换下一种问法或下一个关注点。",
-            "- 搜索结果只是线索，用 fetch_page 打开过才算数。",
+            last_line,
         ]
         blocked = sorted(set(self._blocked_domains(gid, settings)) | set(self._auto_blocked_domains(gid)))
         if blocked:
@@ -2558,10 +2638,12 @@ class Feeds:
         return items
 
     # ------------------------------------------------------------------
-    # 两阶段找资讯（「广撒网再挑着打开」；2026-09-30 用户决定恒生效，不再有开关）
+    # 两阶段找资讯（「广撒网再挑着打开」；2026-09-30 用户决定恒生效，不再有开关；
+    # 2026-10-01 起撒网从子 agent 改成代码按计划搜）
     #
-    # ① 撒网：一个只用 web_search 的子 agent 铺大量搜索，候选由程序侧的
-    #    撒网登记簿（discovery.py：web_search handler 记进去的）收集，不信子 agent 交回；
+    # ① 撒网：定关注点（_plan_focus）时主模型一并给出每个方向的搜索计划
+    #    （searches 3–5 条，没给 / 给得不对就回退成方向名一条），代码照单并发搜
+    #    （_run_planned_searches，信号量限流），结果照旧记进撒网登记簿收集；
     # ② 保底：饿着的方向（搜不够 2 次问 / 6 条候选）由代码直接补搜（主家 + 撒网多一家）；
     # ③ 粗筛（不调模型）：撞已入库 / 屏蔽来源 / 太旧 / 标题近似的丢掉，按方向均衡（40% 上限）留 ≤24 条；
     # ④ 挑：主模型一次 json_mode 挑 8–12 条带一句话理由（hook）的去真打开，失败回落前 10 条；
@@ -2570,59 +2652,73 @@ class Feeds:
     # ⑥ 之后完全走老路（补打开 recheck 不动 / 第一道 / 打分 / 帖子 / 入库）。
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _discover_schema() -> dict:
-        """撒网子 agent 交回的 schema：只要一句「撒完了」的备注（候选在登记簿里，不在这）。"""
-        return {
-            "type": "object",
-            "properties": {"note": {"type": "string"}},
-            "required": ["note"],
-        }
+    async def _run_planned_searches(
+        self, gid: str, focus: list[dict], settings: Settings, run_mark: str, funnel: dict
+    ) -> Exception | None:
+        """按定关注点给出的搜索计划并发搜（2026-10-01：替代原「撒网子 agent」）。
 
-    def _discover_brief(self, gid: str, focus: list[dict], settings: Settings) -> str:
-        """撒网 brief：编号关注点（1..n，搜索时 focus=<编号>）+「怎么搜」+ 搜索服务 skill。
-        只搜，不要打开页面；目标一共 DISCOVER_TARGET 条不重复候选；每个关注点至少 2 种问法。"""
-        lines = []
-        for i, f in enumerate(focus, 1):
-            tag = (
-                "（不同角度：找对这个话题的反方 / 批评 / 另一种看法的观点或分析文章，不要同话题的另一条新闻）"
-                if f.get("angle") == "diverse"
-                else "（拓展：跳一步找群友没想到、但会眼前一亮的东西）" if f.get("source") == "explore" else ""
+        - 每个方向最多 5 条计划（没给 / 给得不对 → 回退成方向名 query 一条），
+          整轮（含保底在内会先除开）最多 PLANNED_SEARCHES_PER_ROUND 次，同 (q, site, news, kind) 去重；
+        - 并发上限 PLANNED_SEARCH_CONCURRENCY（asyncio 信号量）；一次出错不拖累别的搜，
+          每一个都出错才算「撒网垮了」（返回最后一个异常，调用方在一条都没搜出时照老句式向上抛）；
+        - 结果照旧记进撒网登记簿（discovery.record）：query=q、focus=方向编号（1 起）、
+          provider=""（各结果的 provider 由 search.py 标）；
+        - kind=guide → days=GUIDE_MAX_AGE_DAYS、news 取计划值；news → days=_NEWS_MAX_AGE_DAYS（7 天）。
+        - self._search 为 None（测试没注入）→ 一搜也不发，不算垮（返回 None）。
+        """
+        from . import discovery
+
+        search = self._search
+        if search is None:
+            logger.info("撒网没有可用的搜索对象（群 %s），这轮跳过计划搜索", gid)
+            return None
+        jobs: list[tuple[int, str, str, bool, str]] = []  # (focus_no, q, site, news, kind)
+        seen: set[tuple[int, str, str, bool, str]] = set()  # 同一方向内去重：给不同方向的同一句各搜各的
+        for fi, f in enumerate(focus, 1):
+            planned = f.get("searches")
+            entries: list[dict] = [
+                s for s in (planned if isinstance(planned, list) else []) if isinstance(s, dict)
+            ][:5]
+            # 没给 / 给的数组全是不合法的 → 回退成方向名当唯一一条搜索
+            if not any(str(s.get("q") or "").strip() for s in entries):
+                entries = [{"q": f.get("query")}]
+            for s in entries:
+                q = str(s.get("q") or "").strip()
+                if not q:
+                    continue
+                kind = str(s.get("kind") or "news").strip().lower()
+                if kind != "guide":
+                    kind = "news"
+                site = str(s.get("site") or "").strip()
+                news = bool(s.get("news"))
+                key = (fi, q, site, news, kind)
+                if key in seen:
+                    continue
+                seen.add(key)
+                jobs.append((fi, q, site, news, kind))
+        jobs = jobs[:PLANNED_SEARCHES_PER_ROUND]  # 一轮的计划搜索总数封顶
+        sem = asyncio.Semaphore(PLANNED_SEARCH_CONCURRENCY)
+
+        async def _one(focus_no: int, q: str, site: str, news: bool, kind: str) -> None:
+            days = GUIDE_MAX_AGE_DAYS if kind == "guide" else _NEWS_MAX_AGE_DAYS
+            async with sem:
+                results = await search.search(q, limit=10, days=days, site=site, news=news)
+            funnel["queries"] = int(funnel.get("queries") or 0) + 1
+            discovery.record(
+                run_mark, query=q, focus=focus_no, provider="", results=results or []
             )
-            lines.append(f"{i}. {f['query']}{tag}")
-        # 话题饱和提示（老 _collect brief 的规矩，2026-09-30 起两阶段恒生效后挪这里）：
-        # 最近 7 天发得最多（≥2 条）的话题，让撒网的别围着它们转。
-        saturated = self._saturated_topics(gid, 7, min_count=2)
-        saturated_line = ""
-        if saturated:
-            saturated_line = (
-                "这些话题最近 7 天已经发得很多了（除非有重大新进展，**不要再找**）："
-                + "、".join(f"{label} ×{n}" for label, n in saturated)
-                + "\n\n"
-            )
-        # [feeds] guides=false：只找资讯。两阶段恒生效后这里是对这个开关唯一的交代
-        # （老路 _collect 的 brief 限制随开关删除一起没了；核验那步不作找不找文章的决定）。
-        guides_line = (
-            "" if bool(getattr(settings.feeds, "guides", True))
-            else "这轮**只找资讯**（新闻 / 发布 / 动态），**不找文章**（教程、评测、工具介绍都别搜）；"
+
+        gathered = await asyncio.gather(
+            *(_one(fi, q, site, news, kind) for fi, q, site, news, kind in jobs),
+            return_exceptions=True,
         )
-        return (
-            "帮这个群**撒网搜**值得看的内容——这一步只搜，不打开页面。\n"
-            + guides_line
-            + "关注点如下（编号 1 起；**每次搜索都要带 focus=<关注点编号>**）：\n"
-            + "\n".join(lines)
-            + "\n\n"
-            + saturated_line
-            + self._search_guide_section(gid, settings)
-            + "要求：\n"
-            f"1. 全程只用 web_search，**不要打开任何页面**（不调 fetch_page，后面有别的同事打开核对）；"
-            "直接调用 web_search 这个工具本身，别把它包在别的工具名里（没有 invoke 之类的工具）；\n"
-            f"2. 目标是攒到 {DISCOVER_TARGET[0]}–{DISCOVER_TARGET[1]} 条不同的候选链接，越分散越好；\n"
-            f"3. 每个关注点至少用 {PER_FOCUS_MIN_QUERIES} 种不同的问法搜过（换角度，不是同义改写）；\n"
-            "4. 搜完最后用 submit_result 交回一句话备注（note：撒了多少、每个关注点大概几条）；\n"
-            f"你只有大约 {DISCOVER_MINUTES} 分钟，到点前记得把已经搜完的交回来。"
-            + self._provider_skill_section(settings)
-        )
+        failures = [g for g in gathered if isinstance(g, BaseException)]
+        for f_ in failures:
+            logger.info("计划搜索失败（群 %s）：%s", gid, f_)
+        if jobs and len(failures) == len(jobs):
+            # 每一搜都挂了才算撒网垮（一个没搜出来但搜是通的，不算垮）
+            return failures[-1]
+        return None
 
     def _source_prior(self, gid: str, site: str) -> float:
         """来源先验分（0–1；source_stats.source_stats 的名单分；读不到 / 出错按 0，不挡流程）。"""
@@ -2790,7 +2886,7 @@ class Feeds:
         )
         try:
             result = await self._models.chat(
-                "main", [{"role": "user", "content": prompt}],
+                agent="news", messages=[{"role": "user", "content": prompt}],
                 json_mode=True, purpose="feeds.pick", group_id=gid,
             )
             data = json.loads(result.text)
@@ -2981,10 +3077,10 @@ class Feeds:
         collect_mark: str,
         stats_out: dict,
     ) -> list[dict]:
-        """两阶段的主编排：撒网 → 保底 → 粗筛 → 挑 → 核验 → 候选（老格式，下游照旧）。
+        """两阶段的主编排：撒网（代码按计划搜）→ 保底 → 粗筛 → 挑 → 核验 → 候选（老格式，下游照旧）。
 
-        collect_mark 是这轮的「老标记」（feeds-collect:...）：撒网 / 核验用各自的
-        feeds-discover: / feeds-verify: 标记（统计 _round_stats 按标记点数，见那里）。
+        collect_mark 是这轮的「老标记」（feeds-collect:...）：撒网登记簿沿用 feeds-discover:
+        同一个 base 的 run id（统计 _round_stats 按标记点数，见那里）。
         stats_out["funnel"] 由这里填（环节计数 / 每方向 / 每家搜索 / 耗时）。
         """
         from . import discovery
@@ -2998,27 +3094,11 @@ class Feeds:
         discover_mark = f"feeds-discover:{base}"
         verify_mark = f"feeds-verify:{base}"
 
-        # ① 撒网（只 web_search；候选从登记簿拿）
+        # ① 撒网（2026-10-01 起：定关注点顺带定的搜索计划由代码并发跑，候选照旧从登记簿拿）
         t0 = clock.now()
         discovery.open_run(discover_mark)
-        discover_bad: Exception | str = ""  # 撒网垮了：最后一条都没搜到才向上报（老 _collect 的句式）
-        try:
-            report = await self._run_stage(
-                gid_s, phase="discover", brief=self._discover_brief(gid_s, focus, settings),
-                task_id=discover_mark, tools=["web_search"],
-                output_schema=self._discover_schema(),
-                deadline_ts=clock.now() + DISCOVER_MINUTES * 60,
-                actor="资讯撒网",
-            )
-            if not getattr(report, "ok", False):
-                # 撒网子 agent 交不出备注不拦这轮：登记簿里已经搜出来的照用；一条没有再算
-                discover_bad = str(
-                    getattr(report, "error", "") or getattr(report, "summary", "") or "未交回结果"
-                )
-                logger.info("撒网子 agent 没交备注（群 %s）：%s", gid_s, discover_bad)
-        except Exception as e:
-            discover_bad = e
-            logger.exception("撒网子 agent 出错（群 %s），靠登记簿已有候选继续", gid_s)
+        discover_err: Exception | None = await self._run_planned_searches(gid_s, focus, settings, discover_mark, funnel)
+        discover_bad: Exception | str = discover_err or ""  # 撒网垮了：最后一条都没搜到才向上报（老 _collect 的句式）
         candidates = discovery.close_run(discover_mark)
         if not candidates:
             self._drop_news_round_records(gid_s, "撒网登记簿没搜出候选")
@@ -3088,13 +3168,8 @@ class Feeds:
         funnel["timings_s"]["verify"] = max(0.0, clock.now() - t4)
         funnel["opened"] = opened
         funnel["returned"] = len(items)
-        # 搜索次数合计：撒网子 agent 的 web_search 工具调用（tool_calls 表）+ 代码保底补搜的次数
-        try:
-            funnel["queries"] = int(funnel.get("queries") or 0) + int(
-                self._collect_stats(discover_mark).get("searches") or 0
-            )
-        except Exception:
-            pass
+        # 搜索次数合计：代码撒网在 _run_planned_searches 里逐次计数 + 保底补搜的次数，
+        # 都在这里 funnel["queries"] 里（2026-10-01 起撒网不再派子 agent，没有 tool_calls 要补）
         # 「不同角度 / 拓展」标记（老 _collect 的规矩，两阶段恒生效后挪这里）：
         # 候选来自哪个方向看 src_focus（挑的时候接回来的撒网方向编号），
         # 那个方向是 diverse → angle='diverse'；该方向 source=explore 或条目标了
@@ -3419,8 +3494,9 @@ class Feeds:
         # 分批打分（2026-09-28 线上回放：21 条一次性打分每次都超过 120 秒超时，
         # 白等 13 分钟后全部记 0 分被拒）。每批最多 _SCORE_CHUNK 条，编号用全批统一的编号；
         # 后面几批带「前面已经评过的」标题，dup_in_batch 照样能指到前面批次。
-        by_index: dict[int, dict] = {}
-        by_title: dict[str, dict] = {}
+        # 2026-10-01 提速：几批并发跑（asyncio.gather）——有一批需要参考的「前面批次的标题」
+        # 在跑之前就齐全（candidates 的顺序不变），行里互不等待；
+        # 每批本地记录，全部回来后按批号从小到大合并（保持 title 先到先得的老口径）。
         failed: set[int] = set()
         last_err: Exception | None = None
         # E（2026-11）：每批第二问就是「只对漏的补打一次」；出错/超时没评上的记 errored，
@@ -3428,7 +3504,8 @@ class Feeds:
         errored: set[int] = set()
         n = len(candidates)
 
-        def _apply_scores(scores_raw: Any, pending_scope: set[int]) -> set[int]:
+        def _apply_scores(scores_raw: Any, pending_scope: set[int],
+                          by_index: dict, by_title: dict) -> set[int]:
             """把一次模型回复的 scores 数组对到候选上，返回这次新对上的编号集合。"""
             if isinstance(scores_raw, dict) and isinstance(scores_raw.get("scores"), list):
                 items_list = scores_raw["scores"]
@@ -3464,9 +3541,19 @@ class Feeds:
                 got.add(i)
             return got
 
-        for start in range(0, n, _SCORE_CHUNK):
+        async def _score_chunk(start: int) -> dict:
+            """跑一批（最多 _SCORE_CHUNK 条）：带 2 问重试循环，返回本地结果（不共享 by_index）。
+
+            并发安全：本批的 by_index / by_title 是自己的，「前面批次的标题」直接从
+            candidates 里按编号拿（跑之前就齐全），等所有批跑完再按批号合并。
+            """
             chunk_no = start // _SCORE_CHUNK + 1
             pending = list(range(start, min(n, start + _SCORE_CHUNK)))
+            by_index: dict[int, dict] = {}
+            by_title: dict[str, dict] = {}
+            failed_local: set[int] = set()
+            errored_local: set[int] = set()
+            err: Exception | None = None
             # 每批最多问两次：第二次只问第一次漏掉的（线上 step-5-preview 常只回一条裸对象）
             for ask in range(2):
                 if not pending:
@@ -3501,8 +3588,8 @@ class Feeds:
                 )
                 try:
                     result = await self._models.chat(
-                        "main",
-                        [{"role": "user", "content": "\n".join(ls)}],
+                        agent="news",
+                        messages=[{"role": "user", "content": "\n".join(ls)}],
                         json_mode=True,
                         purpose="feeds.score",
                         group_id=gid,
@@ -3512,16 +3599,36 @@ class Feeds:
                     data = json.loads(result.text)
                 except (ModelError, ValueError) as e:
                     logger.info("备资讯-打分第 %d 批第 %d 次失败（群 %s）：%s", chunk_no, ask + 1, gid, e)
-                    last_err = e
-                    errored.update(pending)
+                    err = e
+                    errored_local.update(pending)
                     break
-                got = _apply_scores(data, set(pending))
+                got = _apply_scores(data, set(pending), by_index, by_title)
                 if not got:
-                    last_err = ValueError("打分回复里一条都没对上")
+                    err = ValueError("打分回复里一条都没对上")
                 pending = [i for i in pending if i not in got]
             if pending:
                 logger.info("备资讯-打分第 %d 批有 %d 条没评上（群 %s）", chunk_no, len(pending), gid)
-                failed.update(pending)
+                failed_local.update(pending)
+            return {
+                "by_index": by_index,
+                "by_title": by_title,
+                "failed": failed_local,
+                "errored": errored_local,
+                "err": err,
+            }
+
+        by_index: dict[int, dict] = {}
+        by_title: dict[str, dict] = {}
+        chunks = await asyncio.gather(*(_score_chunk(start) for start in range(0, n, _SCORE_CHUNK)))
+        for res in chunks:
+            by_index.update(res["by_index"])
+            # title 先到先得（按批号）：老顺序是批次顺序，照它合并
+            for title, normed in res["by_title"].items():
+                by_title.setdefault(title, normed)
+            failed.update(res["failed"])
+            errored.update(res["errored"])
+            if res["err"] is not None:
+                last_err = res["err"]
         if n and len(failed) == n and last_err is not None:
             raise last_err
         zero_five = {"info": 0.0, "source": 0.0, "relevance": 0.0, "timeliness": 0.0, "chat": 0.0, "avg": 0.0}
@@ -3795,8 +3902,8 @@ class Feeds:
             prompt = "\n".join(await self._posts_prompt_lines(gid, packs))
             try:
                 result = await self._models.chat(
-                    "main",
-                    [{"role": "user", "content": prompt}],
+                    agent="news",
+                    messages=[{"role": "user", "content": prompt}],
                     json_mode=True,
                     purpose="feeds.post",
                     group_id=gid,
@@ -3857,7 +3964,7 @@ class Feeds:
             lines.append(f"    原文依据：{str(it.get('quote') or '')[:300]}")
             lines.append(f"    原文摘要：{str(it.get('summary') or '')[:300]}")
         result = await self._models.chat(
-            "main", [{"role": "user", "content": "\n".join(lines)}],
+            agent="news", messages=[{"role": "user", "content": "\n".join(lines)}],
             json_mode=True, purpose="feeds.post_check", group_id=gid,
         )
         data = json.loads(result.text)
@@ -4039,8 +4146,8 @@ class Feeds:
             "\"what\": \"要验证什么（一句话）\", \"expect\": \"预期看到什么结果（一句话）\"}]}"
         )
         result = await self._models.chat(
-            "main",
-            [{"role": "user", "content": "\n".join(lines)}],
+            agent="task",
+            messages=[{"role": "user", "content": "\n".join(lines)}],
             json_mode=True,
             purpose="feeds.verify_plan",
             group_id=gid,
@@ -4242,8 +4349,8 @@ class Feeds:
         )
         try:
             result = await self._models.chat(
-                "main",
-                [{"role": "user", "content": "\n".join(lines)}],
+                agent="idea",
+                messages=[{"role": "user", "content": "\n".join(lines)}],
                 json_mode=True,
                 purpose="feeds.idea",
                 group_id=gid,

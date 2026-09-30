@@ -96,8 +96,8 @@ class GoalProposer:
         prompt = self._build_prompt(gid)
         try:
             result = await self._models.chat(
-                "main",
-                [{"role": "user", "content": prompt}],
+                agent="goal",
+                messages=[{"role": "user", "content": prompt}],
                 json_mode=True,
                 purpose="goals.propose",
                 group_id=gid,

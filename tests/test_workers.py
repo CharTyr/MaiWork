@@ -32,7 +32,7 @@ class ReplayModels:
         self.queue = list(results)
         self.calls = []
 
-    async def chat(self, role, messages, **kwargs):
+    async def chat(self, role=None, messages=None, **kwargs):
         # 深拷贝 messages 的快照（后面会被 workers 继续追加）
         self.calls.append((role, [dict(m) for m in messages], kwargs))
         if not self.queue:
@@ -427,7 +427,7 @@ class TestWorkersCompaction:
         ])
         orig_chat = models.chat
 
-        async def chat(role, messages, **kw):
+        async def chat(role=None, messages=None, **kw):
             if str(kw.get("purpose") or "").endswith(":compact"):
                 return FakeChatResult(text="Primary Request and Intent：干活；…8 节摘要…")
             return await orig_chat(role, messages, **kw)
@@ -472,7 +472,7 @@ class TestWorkersContextCompaction:
         orig_chat = models.chat
         compact_calls: list[dict] = []
 
-        async def chat(role, messages, **kw):
+        async def chat(role=None, messages=None, **kw):
             if str(kw.get("purpose") or "").endswith(":compact"):
                 compact_calls.append(kw)
                 return FakeChatResult(text="Primary Request and Intent：找资讯；…8 节摘要…")
@@ -575,7 +575,7 @@ class TestDeadlineWrapUp:
         # 简化：第一步后立刻把时间推到超过 deadline
         orig_chat = models.chat
 
-        async def chat_then_expire(role, messages, **kwargs):
+        async def chat_then_expire(role=None, messages=None, **kwargs):
             out = await orig_chat(role, messages, **kwargs)
             if len(models.calls) == 2:
                 t[0] = 1000.0 + 120  # 第二步后过期
@@ -613,3 +613,25 @@ class TestDeadlineWrapUp:
         # 强制交回这一轮模型还想继续调工具 → fail（步数自由、到点硬收）
         assert report.ok is False
         assert "submit_result" in report.summary or "交回" in models.calls or report.error
+
+
+class TestWorkerAgentKind:
+    """1b：Workers.run 把 agent_kind 传给 models.chat；默认 = agent_type。"""
+
+    @pytest.mark.asyncio
+    async def test_agent_defaults_to_agent_type(self, tools) -> None:
+        w = Workers(models=None, tools=tools)
+        models = ReplayModels([FakeChatResult(text="完工")])
+        w._models = models
+        await w.run("测", group_id="1", tools=[], actor="子 agent #1", agent_type="c_abc123")
+        assert models.calls
+        assert models.calls[0][2].get("agent") == "c_abc123"
+
+    @pytest.mark.asyncio
+    async def test_explicit_agent_overrides(self, tools) -> None:
+        w = Workers(models=None, tools=tools)
+        models = ReplayModels([FakeChatResult(text="完工")])
+        w._models = models
+        await w.run("测", group_id="1", tools=[], actor="子 agent #1",
+                    agent_type="task", agent="news")
+        assert models.calls[0][2].get("agent") == "news"

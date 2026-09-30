@@ -312,6 +312,27 @@ class TestAskApply:
         assert row["status"] == "pending"  # 默认要批准，未批准不开工
 
     @pytest.mark.asyncio
+    async def test_ask_similar_to_repeated_rejections_is_screened(self, store: Store, frozen_now: float) -> None:
+        """读群发现的请求也走「类似的被拒过 3 次就不再收」这道筛（和 @ 快路径同一规则）。"""
+        settings = _settings()
+        reply = '{"ops": [], "asks": [{"i": 1, "kind": "goal", "title": "取消群友的元旦假期"}]}'
+        models = FakeModelsQueue(replies=[reply])
+        host = FakeHost([_msg("m0", T0 - 100, text="@東雪蓮 帮我取消群友的元旦假期")]
+                        + [_msg(f"m{i}", T0 - 90 + i, text=f"消息{i}") for i in range(1, 3)])
+        g = _Graph(store, host, models, settings)
+        for i, t in enumerate(["帮我取消群友的国庆七天假期", "帮我取消群友的春节假期", "取消群友的中秋假期"]):
+            r = g.approvals.create(
+                GID, kind="goal", title=t, quote=t, via="群里 @", requester_id="u1",
+                requester_name="阿一", message_id=f"old{i}",
+            )
+            g.approvals.reject(r["id"], by="42")
+        await g.profiles.tick(GID)
+        n = store.read().execute(
+            "SELECT COUNT(*) AS c FROM requests WHERE message_id='m0'"
+        ).fetchone()["c"]
+        assert n == 0
+
+    @pytest.mark.asyncio
     async def test_other_plugin_command_never_becomes_request(self, store: Store, frozen_now: float) -> None:
         """线上实测（2026-09-27）：群友发 `/pic nsfw …`（MaiBot 画图插件的指令），
         主模型读群时把它当成了请求，建出一条待批。别的插件的 / 指令一律不当 MaiWork 的活。"""

@@ -19,8 +19,10 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
+import re
 import sqlite3
 from typing import Any, Callable, Iterable
 
@@ -44,6 +46,24 @@ def _norm(s: Any) -> str:
 def _who(store_or_conn: Any, group_id: Any, requester_id: Any, snapshot: Any) -> str:
     """发起人当前显示名：按 requester_id 查名册；查不到用老快照；都没有就「群友」。"""
     return members.name_of(store_or_conn, group_id, requester_id, fallback=snapshot) or _WHO_PLACEHOLDER
+
+
+# 「类似的请求被拒多了就不再收」（2026-09-30）：线上有人 @ 机器人「帮我取消群友的国庆假期」，
+# 被判成目标进了待批——这是玩笑 / 办不到的事。管理员拒了几次同类的，就别再往待批里放。
+_SCREEN_MIN_REJECTS = 3          # 本群近期有这么多条「像」的被拒，就挡
+_SCREEN_WINDOW_S = 60 * 86400    # 只看近 60 天的拒绝
+_SCREEN_SIMILAR = 0.6            # difflib 相似度线（整理国庆假期攻略 vs 取消国庆假期 = 0.5，不算像）
+_SCREEN_ROWS_MAX = 200
+_MENTION_RE = re.compile(r"@\S+")
+_LEAD_FILLER_RE = re.compile(r"^(?:请你?|麻烦你?|帮我|帮忙|给我|你能不能|能不能|可不可以|可以)+")
+_NON_WORD_RE = re.compile(r"[\W_]+", re.UNICODE)
+
+
+def _screen_text(text: Any) -> str:
+    """比较用的文字：去 @人名、标点空白、开头的客套话（帮我 / 麻烦 / 请）。"""
+    s = _MENTION_RE.sub("", str(text or ""))
+    s = _NON_WORD_RE.sub("", s)
+    return _LEAD_FILLER_RE.sub("", s)
 
 
 def _row_get(row: Any, key: str, default: Any = "") -> Any:
@@ -146,9 +166,12 @@ class Approvals:
         items: list[int] | None = None,
         source: str = "",
         force_manual: bool = False,
+        screen: bool = False,
     ) -> dict:
         """记一条待批请求。
 
+        - `screen=True`（群友 @ / 主模型读群发现的请求用）：本群近 60 天被拒过 ≥3 条「像」的
+          → 不建请求，返回 `{"id": "", "status": "screened", "auto": None}` 并记 `request.screened` 事件；
         - `items`：从构想转来的请求里，群友点名要做的项目序号（None / [] = 全部项目）；
         - `source`：来源标记（`"idea"` = 来自构想、`"maiwork"` = MaiWork 主动提议、空 = 群友 @）；
         - `force_manual=True`：**永远**要管理员批准（免批群 / 免批人 / required=False 一律不生效）。
@@ -164,6 +187,19 @@ class Approvals:
         now = clock.now()
         auto = False if force_manual else self._is_auto(gid, requester_id)
         item_nos = _norm_item_nos(items)
+        if screen and not _norm(source):
+            matched = self._similar_rejected(gid, quote or title)
+            if len(matched) >= _SCREEN_MIN_REJECTS:
+                logger.info("群 %s：请求「%s」和 %d 条被拒过的相似，不建待批", gid, _norm(title)[:30], len(matched))
+                try:
+                    with self._store.tx() as conn:
+                        self._store.event(
+                            conn, "request.screened", group_id=gid, entity="request", entity_id="",
+                            payload={"title": _norm(title), "similar_rejected": matched[:5], "message_id": _norm(message_id)},
+                        )
+                except Exception:
+                    logger.debug("记 request.screened 事件失败（群 %s）", gid, exc_info=True)
+                return {"id": "", "status": "screened", "auto": None}
         with self._store.tx() as conn:
             rid = next_id(conn, "R")
             conn.execute(
@@ -192,6 +228,29 @@ class Approvals:
             return landed
         self._notify_review(rid, gid)
         return {"id": rid, "status": "pending", "auto": None}
+
+    def _similar_rejected(self, gid: str, text: Any) -> list[str]:
+        """本群近 60 天被拒过、且和 text 相似的群友 @ 请求 id（构想 / MaiWork 自提的不算）。"""
+        norm = _screen_text(text)
+        if len(norm) < 2:
+            return []
+        try:
+            rows = self._store.read().execute(
+                "SELECT id, quote, title FROM requests WHERE group_id=? AND status='rejected'"
+                " AND (source IS NULL OR source='') AND decided_ts>=? ORDER BY decided_ts DESC LIMIT ?",
+                (gid, clock.now() - _SCREEN_WINDOW_S, _SCREEN_ROWS_MAX),
+            ).fetchall()
+        except Exception:
+            logger.debug("查被拒请求失败（群 %s）", gid, exc_info=True)
+            return []
+        out: list[str] = []
+        for r in rows:
+            other = _screen_text(r["quote"] or r["title"])
+            if len(other) < 2:
+                continue
+            if difflib.SequenceMatcher(None, norm, other, autojunk=False).ratio() >= _SCREEN_SIMILAR:
+                out.append(str(r["id"]))
+        return out
 
     def set_review_hook(self, hook: Callable[[str, str], Any] | None) -> None:
         """接上「刚记下一条待批请求」的回调（app 注入；hook(请求 id, 群号)）。

@@ -8,11 +8,11 @@ import { refreshDetail } from "./detail.js";
 import { checkedProviders, headerRow, loadExt, pickedTool, readHeaders } from "./settings/ext.js";
 import { actNews } from "./actions_news.js";
 import { actAgents } from "./settings/agents.js";
+import { actModels } from "./settings/models.js";
 import { chipAdd, rowsAdd } from "./settings/rules.js";
 import { loadUsage, loadUsageDay } from "./settings/usage.js";
 import { avatarSaved, loadIdentity } from "./settings/identity.js";
 import { loadLogs } from "./settings/logs.js";
-import { draft } from "./settings/models.js";
 import { closeSheet, openDetail, openSheet, repaintSheet } from "./sheet.js";
 import { chatPoll, enterChat, loadChat, loadChats, paintChat } from "./chat.js";
 import { renderSide, renderView } from "./render.js";
@@ -35,6 +35,7 @@ export async function act(el, e) {
   const a = el.dataset.act;
   if (await actNews(a, el)) return;
   if (await actAgents(a, el)) return;
+  if (await actModels(a, el)) return;
   const g = grp();
   switch (a) {
     case "tab":
@@ -448,48 +449,6 @@ export async function act(el, e) {
         toast("删掉了");
       } catch (err) {
         toast(err.message, true);
-      }
-      break;
-    }
-    case "models-test": {
-      const url = $("m-url").value.trim();
-      const out = $("m-check");
-      const m = (state.settings && state.settings.models) || {};
-      const key = $("m-key").value.trim();
-      if (!/^https?:\/\/\S+$/.test(url)) {
-        out.textContent = "地址要以 http:// 或 https:// 开头";
-        out.style.color = "var(--red)";
-        break;
-      }
-      if (!m.key_set && !key) {
-        out.textContent = "先填密钥再测";
-        out.style.color = "var(--red)";
-        break;
-      }
-      el.disabled = true;
-      out.style.color = "";
-      out.textContent = "正在连…";
-      try {
-        const r = await api("POST", "/api/settings/models/test", { base_url: url, api_key: key || undefined });
-        if (r.ok) {
-          draft.models = r.models || [];
-          // 重画下拉，保留已经填的地址和密钥
-          const keep = { url, key, main: $("m-main").value, mb: $("m-main-b").value, w: $("m-worker").value, wb: $("m-worker-b").value };
-          repaintSheet();
-          $("m-url").value = keep.url;
-          $("m-key").value = keep.key;
-          for (const [id, val] of [["m-main", keep.main], ["m-main-b", keep.mb], ["m-worker", keep.w], ["m-worker-b", keep.wb]]) if (val) $(id).value = val;
-          toast(`连上了，找到 ${draft.models.length} 个模型`);
-        } else {
-          out.textContent = r.error || "没连上";
-          out.style.color = "var(--red)";
-        }
-      } catch (err) {
-        out.textContent = err.message;
-        out.style.color = "var(--red)";
-      } finally {
-        const b = document.querySelector('[data-act="models-test"]');
-        if (b) b.disabled = false;
       }
       break;
     }

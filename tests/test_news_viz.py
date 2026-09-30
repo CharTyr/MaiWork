@@ -123,7 +123,7 @@ class FakeModels:
     def settings(self):
         return SimpleNamespace(ready=lambda: True)
 
-    async def chat(self, role, messages, **kw):
+    async def chat(self, role=None, messages=None, **kw):
         self.calls.append((role, messages, kw))
         return SimpleNamespace(text=json.dumps(self.reply))
 

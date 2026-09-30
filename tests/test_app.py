@@ -852,7 +852,7 @@ class TestM3Loop:
 
                     return _S()
 
-                async def chat(self, role, messages, **kwargs):
+                async def chat(self, role=None, messages=None, **kwargs):
                     return type("R", (), {"text": '{"approve": true, "reason": "查资料的小活"}'})()
 
             app.auto_review._models = _FakeModels()
@@ -1543,7 +1543,7 @@ class _RetryCapturingModels:
     async def close(self) -> None:
         return None
 
-    async def chat(self, role, messages, **kwargs):
+    async def chat(self, role=None, messages=None, **kwargs):
         self.calls.append({"role": role, "kwargs": kwargs})
 
         class _R:

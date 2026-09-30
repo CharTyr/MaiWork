@@ -73,7 +73,7 @@ def _norm_accounts(values: object, field_zh: str, problems: list[str]) -> tuple[
     return tuple(out)
 
 
-CONFIG_VERSION = "0.4.4"  # 0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
+CONFIG_VERSION = "0.4.5"  # 0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）；0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
 
 # 插件目录 = 本文件所在目录；默认数据目录 = 插件目录上两级 / data / maiwork
 # （线上 <MaiBot>/plugins/CharTyr_MaiWork → <MaiBot>/data/maiwork）
@@ -206,6 +206,48 @@ class ModelsSectionConfig(PluginConfigBase):
     max_rpm: int = Field(default=0, description="同一个端点每分钟最多发几次（0 = 不限，最多 600）")
     context_window: int = Field(default=128000, description="模型的上下文窗口（tokens）；对话快满时先截旧工具结果、再总结旧对话")
     max_tokens: int = Field(default=32768, description="一次回答最多写多少 token（1024~1000000）；每次调用都会带上，有些端点不传会出问题")
+
+
+class EndpointItemConfig(PluginConfigBase):
+    """一个 [[endpoints]] 条目（2026-10 模型改版阶段 1a）。
+
+    端点 = 一个模型服务商：base_url + api_key（只进不出）+ 协议 + 重试 / 限流。
+    校验在 load_settings 的 _parse_endpoints 里逐条做（坏条目丢条目、记问题，
+    不拖垮整段），这里只收留字段。
+    """
+
+    __ui_label__ = "模型端点"
+    __ui_icon__ = "server"
+
+    id: str = Field(default="", description="端点 id（字母、数字、_、-，1~24 个字符，不能重复）")
+    name: str = Field(default="", description="显示名（≤40 字）；空 = 用 id")
+    protocol: str = Field(default="openai", description="协议：openai（/chat/completions）/ anthropic（/v1/messages）/ responses（/v1/responses）")
+    base_url: str = Field(default="", description="端点地址，http(s):// 开头")
+    api_key: str = Field(default="", description="端点密钥；只进不出，不写日志")
+    retries: int = Field(default=5, description="同一模型调用失败最多重试几次（0~10）")
+    retry_delay_s: int = Field(default=10, description="两次重试之间等几秒（1~60）")
+    max_concurrency: int = Field(default=2, description="这个端点同时最多几个请求在路上（1~8）")
+    max_rpm: int = Field(default=0, description="这个端点每分钟最多发几次（0 = 不限，最多 600）")
+
+
+class ModelListItemConfig(PluginConfigBase):
+    """一个 [[model_list]] 条目（2026-10 模型改版阶段 1a）。
+
+    模型库里的一条：挂在某个端点下，写清服务商的模型名 + 能力参数。
+    校验在 _parse_model_list 里逐条做（endpoint 必须指向存在的端点）。
+    """
+
+    __ui_label__ = "模型库条目"
+    __ui_icon__ = "robot"
+
+    id: str = Field(default="", description="模型条目 id（字母、数字、_、-，1~24 个字符，不能重复）")
+    endpoint: str = Field(default="", description="这个模型属于哪个端点（端点 id）")
+    model: str = Field(default="", description="服务商的模型名（非空，≤200 字）")
+    name: str = Field(default="", description="显示名（≤60 字）；空 = 用模型名")
+    efforts: list[str] = Field(default_factory=list, description="支持的思考强度（low / medium / high / xhigh / max 里挑几个，保序；空 = 不支持思考强度）")
+    vision: bool = Field(default=False, description="支不支持图片输入")
+    context_window: int = Field(default=128000, description="上下文窗口（tokens，8192~2000000）")
+    max_tokens: int = Field(default=32768, description="一次回答最多写多少 token（1024~1000000，必须小于上下文窗口）")
 
 
 class JevSectionConfig(PluginConfigBase):
@@ -360,6 +402,8 @@ class MaiWorkConfig(PluginConfigBase):
     delivery: DeliverySectionConfig = Field(default_factory=DeliverySectionConfig)
     approval: ApprovalSectionConfig = Field(default_factory=ApprovalSectionConfig)
     models: ModelsSectionConfig = Field(default_factory=ModelsSectionConfig)
+    endpoints: list[EndpointItemConfig] = Field(default_factory=list, description="模型端点列表（2026-10 改版：替代旧 [models] 的单一端点）")
+    model_list: list[ModelListItemConfig] = Field(default_factory=list, description="模型库（挂在端点下；各专岗从这里挑模型）")
     jev: JevSectionConfig = Field(default_factory=JevSectionConfig)
     usage: UsageSectionConfig = Field(default_factory=UsageSectionConfig)
     tasks: TasksSectionConfig = Field(default_factory=TasksSectionConfig)
@@ -456,6 +500,43 @@ class ModelsSetting:
     max_rpm: int = 0
     context_window: int = 128000  # 模型上下文窗口（tokens），0.4.0 起用于上下文压缩
     max_tokens: int = 32768  # 一次回答最多写多少 token，0.4.2 起每次模型调用都带上
+
+
+# 思考强度的合法取值（保序放在 [[model_list]] efforts 里；空 = 不支持思考强度）
+EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
+ENDPOINT_PROTOCOLS: tuple[str, ...] = ("openai", "anthropic", "responses")
+
+_ID_RE = re.compile(r"^[a-z0-9_-]{1,24}$")
+
+
+@dataclass(frozen=True)
+class EndpointSetting:
+    """一个 [[endpoints]] 规范化后的快照（2026-10 模型改版阶段 1a）。"""
+
+    id: str
+    name: str
+    protocol: str  # openai / anthropic / responses
+    base_url: str
+    api_key: str
+    retries: int = 5
+    retry_delay_s: int = 10
+    max_concurrency: int = 2
+    max_rpm: int = 0
+
+
+@dataclass(frozen=True)
+class ModelEntry:
+    """一个 [[model_list]] 规范化后的快照（2026-10 模型改版阶段 1a）。"""
+
+    id: str
+    endpoint: str       # 端点 id（解析时已确认存在）
+    model: str          # 服务商的模型名
+    name: str
+    efforts: tuple[str, ...] = ()
+    vision: bool = False
+    context_window: int = 128000
+    max_tokens: int = 32768
 
 
 @dataclass(frozen=True)
@@ -580,6 +661,9 @@ class Settings:
     console: ConsoleSetting
     environments: EnvironmentsSetting
     profile: ProfileSetting
+    # 2026-10 模型改版阶段 1a：端点 + 模型库（替代旧 [models] 的单一端点/四槽）
+    endpoints: tuple[EndpointSetting, ...] = ()
+    model_list: tuple[ModelEntry, ...] = ()
     tasks: TasksSetting = TasksSetting()
     extensions: ExtensionsSetting = ExtensionsSetting(mcp=())
     group_space: GroupSpaceSetting = GroupSpaceSetting(enabled=True, notice_per_day=1)
@@ -974,6 +1058,181 @@ def _parse_extensions(raw_extensions: Any, problems: list[str]) -> ExtensionsSet
     return ExtensionsSetting(mcp=tuple(out))
 
 
+def _require_int(value: Any, low: int, high: int, what: str) -> int:
+    """[[endpoints]]/[[model_list]] 里的整数：bool / 非整数 / 越界一律 ValueError（中文）。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{what} 要是 {low}~{high} 的整数")
+    if not low <= value <= high:
+        raise ValueError(f"{what} = {value} 超出 {low}~{high} 的范围")
+    return value
+
+
+def _as_item_mapping(item: Any, cls: type[PluginConfigBase]) -> Mapping[str, Any] | None:
+    """[[endpoints]]/[[model_list]] 单条一律成映射；不是表 → None（调用方丢条目记问题）。"""
+    if isinstance(item, cls):
+        return item.model_dump(mode="python")
+    if isinstance(item, Mapping):
+        return item
+    return None
+
+
+def _parse_endpoints(raw: Any, problems: list[str]) -> tuple[EndpointSetting, ...]:
+    """[[endpoints]] 逐条规范化：坏条目丢弃记中文问题，绝不抛异常。"""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        problems.append("[[endpoints]] 必须是表数组，本次整段忽略")
+        return ()
+    out: list[EndpointSetting] = []
+    seen: set[str] = set()
+    for item in raw:
+        try:
+            entry = _as_item_mapping(item, EndpointItemConfig)
+            if entry is None:
+                problems.append(f"端点条目不是表：{str(item)[:60]}，已丢弃")
+                continue
+            eid = str(entry.get("id") or "").strip()
+            if not _ID_RE.match(eid):
+                problems.append(
+                    f'端点 id "{eid or str(entry.get("id"))}" 不合法（只能用小写字母、数字、_、-，1~24 个字符），此条已丢弃'
+                )
+                continue
+            if eid in seen:
+                problems.append(f'端点 id "{eid}" 重复出现，只保留第一个，后一个已丢弃')
+                continue
+            protocol = str(entry.get("protocol") or "openai").strip().lower()
+            if protocol not in ENDPOINT_PROTOCOLS:
+                problems.append(
+                    f'端点 "{eid}" 的协议 "{protocol}" 不认识（只能是 openai / anthropic / responses），此条已丢弃'
+                )
+                continue
+            base_url = str(entry.get("base_url") or "").strip().rstrip("/")
+            if not re.match(r"^https?://[^\s]+$", base_url):
+                problems.append(f'端点 "{eid}" 的地址必须是 http(s) 开头的网址，此条已丢弃')
+                continue
+            name = str(entry.get("name") or "").strip()
+            if len(name) > 40:
+                problems.append(f'端点 "{eid}" 的名字太长（上限 40 字），此条已丢弃')
+                continue
+            if not name:
+                name = eid
+            api_key = str(entry.get("api_key") or "").strip()
+            retries = _require_int(entry.get("retries", 5), 0, 10, f'端点 "{eid}" 的 retries')
+            retry_delay_s = _require_int(entry.get("retry_delay_s", 10), 1, 60, f'端点 "{eid}" 的 retry_delay_s')
+            max_concurrency = _require_int(entry.get("max_concurrency", 2), 1, 8, f'端点 "{eid}" 的 max_concurrency')
+            max_rpm = _require_int(entry.get("max_rpm", 0), 0, 600, f'端点 "{eid}" 的 max_rpm')
+            out.append(
+                EndpointSetting(
+                    id=eid, name=name, protocol=protocol, base_url=base_url, api_key=api_key,
+                    retries=retries, retry_delay_s=retry_delay_s,
+                    max_concurrency=max_concurrency, max_rpm=max_rpm,
+                )
+            )
+            seen.add(eid)
+        except Exception as e:
+            label = ""
+            try:
+                label = str(item.get("id") or "")  # type: ignore[union-attr]
+            except Exception:
+                label = ""
+            where = f"「{label}」" if label else ""
+            problems.append(f"端点条目{where}解析出错（{e}），已丢弃")
+    return tuple(out)
+
+
+def _parse_model_list(
+    raw: Any, endpoints: tuple[EndpointSetting, ...], problems: list[str]
+) -> tuple[ModelEntry, ...]:
+    """[[model_list]] 逐条规范化：endpoint 必须指向存在的端点；坏条目丢弃记问题。"""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        problems.append("[[model_list]] 必须是表数组，本次整段忽略")
+        return ()
+    endpoint_ids = {e.id for e in endpoints}
+    out: list[ModelEntry] = []
+    seen: set[str] = set()
+    for item in raw:
+        try:
+            entry = _as_item_mapping(item, ModelListItemConfig)
+            if entry is None:
+                problems.append(f"模型库条目不是表：{str(item)[:60]}，已丢弃")
+                continue
+            mid = str(entry.get("id") or "").strip()
+            if not _ID_RE.match(mid):
+                problems.append(
+                    f'模型库条目 id "{mid or str(entry.get("id"))}" 不合法（只能用小写字母、数字、_、-，1~24 个字符），此条已丢弃'
+                )
+                continue
+            if mid in seen:
+                problems.append(f'模型库条目 id "{mid}" 重复出现，只保留第一个，后一个已丢弃')
+                continue
+            endpoint = str(entry.get("endpoint") or "").strip()
+            if endpoint not in endpoint_ids:
+                shown = endpoint or "（空）"
+                problems.append(f'模型库条目 "{mid}" 指的端点 "{shown}" 不存在，此条已丢弃')
+                continue
+            model = str(entry.get("model") or "").strip()
+            if not model:
+                problems.append(f'模型库条目 "{mid}" 的模型名不能为空，此条已丢弃')
+                continue
+            if len(model) > 200:
+                problems.append(f'模型库条目 "{mid}" 的模型名太长（上限 200 字），此条已丢弃')
+                continue
+            name = str(entry.get("name") or "").strip()
+            if len(name) > 60:
+                problems.append(f'模型库条目 "{mid}" 的显示名太长（上限 60 字），此条已丢弃')
+                continue
+            if not name:
+                name = model
+            efforts: list[str] = []
+            raw_efforts = entry.get("efforts")
+            if raw_efforts is None:
+                raw_efforts = []
+            if not isinstance(raw_efforts, (list, tuple)):
+                problems.append(f'模型库条目 "{mid}" 的 efforts 不是列表，本次按没有处理')
+            else:
+                for v in raw_efforts:
+                    v_s = str(v or "").strip().lower()
+                    if v_s in EFFORT_LEVELS:
+                        if v_s not in efforts:
+                            efforts.append(v_s)
+                    elif v_s:
+                        problems.append(f'模型库条目 "{mid}" 的思考强度 "{v_s}" 不认识（只能是 low / medium / high / xhigh / max），已去掉这一项')
+            vision_raw = entry.get("vision", False)
+            if not isinstance(vision_raw, bool):
+                problems.append(f'模型库条目 "{mid}" 的 vision 必须是 true/false，此条已丢弃')
+                continue
+            context_window = _require_int(
+                entry.get("context_window", 128000), 8192, 2_000_000, f'模型库条目 "{mid}" 的 context_window'
+            )
+            max_tokens = _require_int(
+                entry.get("max_tokens", 32768), 1024, 1_000_000, f'模型库条目 "{mid}" 的 max_tokens'
+            )
+            if max_tokens >= context_window:
+                problems.append(
+                    f'模型库条目 "{mid}" 的 max_tokens（{max_tokens}）必须小于 context_window（{context_window}），此条已丢弃'
+                )
+                continue
+            out.append(
+                ModelEntry(
+                    id=mid, endpoint=endpoint, model=model, name=name,
+                    efforts=tuple(efforts), vision=vision_raw,
+                    context_window=context_window, max_tokens=max_tokens,
+                )
+            )
+            seen.add(mid)
+        except Exception as e:
+            label = ""
+            try:
+                label = str(item.get("id") or "")  # type: ignore[union-attr]
+            except Exception:
+                label = ""
+            where = f"「{label}」" if label else ""
+            problems.append(f"模型库条目{where}解析出错（{e}），已丢弃")
+    return tuple(out)
+
+
 _SECTIONS: tuple[tuple[str, type[PluginConfigBase]], ...] = (
     ("plugin", PluginSectionConfig),
     ("groups", GroupsSectionConfig),
@@ -1100,6 +1359,10 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
     if not isinstance(raw_extensions, Mapping):
         raw_extensions = {}
 
+    # 端点 + 模型库（2026-10 模型改版阶段 1a）：从原始输入逐条解析（坏条目丢单条记问题）
+    endpoints_parsed = _parse_endpoints(raw_mapping.get("endpoints"), problems)
+    model_list_parsed = _parse_model_list(raw_mapping.get("model_list"), endpoints_parsed, problems)
+
     # data_dir：空 = 默认位置
     data_dir_str = str(storage.data_dir or "").strip()
     data_dir = Path(data_dir_str) if data_dir_str else _default_data_dir()
@@ -1169,6 +1432,8 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
             update_check=bool(getattr(console, "update_check", True)),
             maibot_webui_url=_http_url_or_empty(getattr(console, "maibot_webui_url", "")),
         ),
+        endpoints=endpoints_parsed,
+        model_list=model_list_parsed,
         environments=_parse_environments(env, workspace_root, problems),
         profile=ProfileSetting(
             batch_messages=int(profile.batch_messages),

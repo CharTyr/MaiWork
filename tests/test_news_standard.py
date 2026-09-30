@@ -122,15 +122,16 @@ class TestInjectedIntoPrompts:
         )
         with _TimePatch():
             _run(feeds.prepare_news(GID))
-        # 两阶段恒生效：文章/资讯的分寸在核验子 agent 的 brief 里，
-        # 「怎么找候选」在撒网子 agent 的搜索指南小节里。
+        # 两阶段恒生效：文章/资讯的分寸在核验子 agent 的 brief 里；撒网（2026-10-01 起
+        # 代码按计划搜）不再派子 agent——「怎么找」那套在定关注点的提示词里。
         by_mark = lambda p: "\n".join(
             str(c["brief"]) for c in workers.calls if str(c.get("task_id") or "").startswith(p))
         verify_briefs = by_mark("feeds-verify:")
-        discover_brief = by_mark("feeds-discover:")
+        assert by_mark("feeds-discover:") == ""  # 撒网不再派子 agent
         assert news_standard.section("criteria", "文章") in verify_briefs
         assert news_standard.section("finding", "找候选") in verify_briefs
-        assert "web_search" in discover_brief  # 撒网那步只搜，标准交给核验
+        focus_prompt = str(models.calls[0][1][0]["content"])
+        assert news_standard.section("finding", "跳一步") in focus_prompt
 
     def test_score_prompt_uses_standard(self, tmp_path) -> None:
         from fakes import FakeModelsQueue
