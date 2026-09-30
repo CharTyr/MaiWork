@@ -1,0 +1,91 @@
+{
+ "content": [
+  {
+   "type": "text",
+   "text": "{\"success\": true, \"data\": {\"web\": [{\"url\": \"https://www.youtube.com/watch?v=y3JE9OE9PbY\", \"title\": \"NEW Nintendo Switch Online Feature Just LEAKED! ...\", \"description\": \"Join me as we discuss all the newest Nintendo Switch 2 news and updates being talked about online! Nintendo's Switch 2 Plans Leak Early? & Sony Backs Out of A ...\", \"position\": 1}, {\"url\": \"https://www.nintendolife.com/news/2026/09/nintendo-switch-2-welcome-tour-updated-to-ver-1-1-1-here-are-the-patch-notes\", \"title\": \"Nintendo Switch 2 Welcome Tour Updated To Ver. 1.1.1, ...\", \"description\": \"### Nintendo Switch 2 Welcome Tour: Ver. 1.1.1 (23rd September 2026)\\n- _Several issues have been addressed to improve the gameplay experience._\", \"position\": 2}, {\"url\": \"https://www.facebook.com/GameRant/posts/the-latest-firmware-update-for-nintendo-switch-2-consoles-brings-some-new-settin/1673809390972063/\", \"title\": \"The latest firmware update for Nintendo Switch 2 consoles ...\", \"description\": \"Nintendo Switch 2 and Nintendo Switch System Update 21.0.0 out now ▪️ Added ability to disable 'Redownload Software' and 'Transfer Album Data' when performing a ...\", \"position\": 3}, {\"url\": \"https://www.cnet.com/tech/gaming/nintendo-switch-exploit-fixable-with-update/\", \"title\": \"Original Nintendo Switch Owners Should Apply the Latest ...\", \"description\": \"Nintendo released update 23.0.0 on Sept. 9, which fixes the exploit. It's recorded as CVE-2026-82079, which is “a stock-based buffer overflow vulnerability”\", \"position\": 4}, {\"url\": \"https://www.youtube.com/watch?v=-vZJVWRafPY\", \"title\": \"Nintendo Reveals Their BIG PLAN For Switch 2's Future!?\", \"description\": \"Nintendo Seems to Be Implementing a Rewards System 10:12 - Switch 2 is Cheapest EVER in the UK! 11:46 - TCG Returns to Mcdonalds 12:43 - Winds & Waves Leaks! ...\", \"position\": 5}], \"news\": [{\"title\": \"Original Nintendo Switch Owners Should Apply the Latest Firmware Update Now\", \"url\": \"https://www.cnet.com/tech/gaming/nintendo-switch-exploit-fixable-with-update/\", \"snippet\": \"The problem does not affect the Nintendo Switch 2.\", \"date\": \"2 days ago\", \"imageUrl\": \"https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQqrTAkFngNGL8cFMtEqHkDBgqsiyyiMZIhyWros_cTum_hUUJ__yvroBI&usqp=CAI&s\", \"position\": 1}, {\"title\": \"Nintendo Switch 2 Welcome Tour Updated To Ver. 1.1.1, Here Are The Patch Notes\", \"url\": \"https://www.nintendolife.com/news/2026/09/nintendo-switch-2-welcome-tour-updated-to-ver-1-1-1-here-are-the-patch-notes\", \"snippet\": \"### Nintendo Switch 2 Welcome Tour: Ver. 1.1.1 (23rd September 2026)\\n- _Several issues have been addressed to improve the gameplay experience._\", \"date\": \"6 days ago\", \"imageUrl\": \"https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQ5Keyfg2Yo9cgH7LXjP4FcpLFarg2IqLpbefndft75XNN9Qz9QfXrHQYk&usqp=CAI&s\", \"position\": 2}, {\"title\": \"Gather the crew—a free update is taking off in Star Fox! – News – Nintendo Official Site\", \"url\": \"https://www.nintendo.com/us/whatsnew/blast-off-into-high-octane-adventure-with-added-multiplayer-content-for-star-fox-available-now-on-nintendo-switch-2/\", \"snippet\": \"# Blast off into high-octane adventure with added multiplayer content for Star Fox, available now on Nintendo Switch 2!\\nClose in on a free update for the [Star Fox™](https://www.nintendo.com/us/store/products/star-fox-switch-2/) game—exclusively for the [Nintendo Switch™ 2](https://www.nintendo.com/us/gaming-systems/switch-2/) system!\\n\\n## **New intel**\\n- **Battle Mode**: Gather a crew of up to four players* in local split-screen Battle Mode!\\n- **Three additional stages**: Complete objectives in three more stages, Katina, Sector X, and Venom.\\n- **Battle online—together!**: Up to four players can form a team and join online** battles using a single Nintendo Switch 2.\\n\\n# More News\\n[![](https://assets.nintendo.com/image/upload/ar_16:9,b_auto:border,c_lpad/b_white/f_auto/q_auto/dpr_1.5/c_scale,w_1500/ncom/en_US/articles/2026/maximize-your-game-with-nba-2k27-on-nintendo-switch-2/NBA2K27_KA_WEMBY_HORIZ_RGB_BR-1920x1080_1)\\\\\\n\\\\\\n09/25/26\\\\\\n\\\\\\n**Maximize your game with NBA 2K27 on the Nintendo Switch 2 system!**\\\\\\n\\\\\\nRead more](https://www.nintendo.com/us/whatsnew/maximize-your-game-with-nba-2k27-on-the-nintendo-switch-2-system/)\", \"date\": \"5 hours ago\", \"imageUrl\": \"https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTMTMkiJo6uxe2q_NV14uIcc6kPEJfzNHjtICvrsw6E7-OWJIkyX5sDO4s&usqp=CAI&s\", \"position\": 3}, {\"title\": \"The 18 best Nintendo Switch 2 games in 2026\", \"url\": \"https://www.techradar.com/gaming/nintendo/best-nintendo-switch-2-games\", \"snippet\": \"There was a problem.\", \"date\": \"6 days ago\", \"imageUrl\": \"https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRX8dB9EhHDJn0k0oBZ1kewAGjiwaVQENV6AhL25hy0gU7qpdyLFbUzNoW7&usqp=CAI&s\", \"position\": 4}, {\"title\": \"5 Nintendo Games That Still Need a Switch 2 Edition\", \"url\": \"https://www.polygon.com/nintendo-games-no-switch-2-edition/\", \"snippet\": \"The Nintendo Switch 2 is already on one heck of a run. Though it has yet to see new installments of some heavy-hitter franchises, Nintendo's latest console...\", \"date\": \"3 days ago\", \"imageUrl\": \"https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcT8aMjrNmC8ND3OthOMPgfm54ITmAaiD8ioQE65sK2X99ChweBYRcNxoyc&usqp=CAI&s\", \"position\": 5}]}, \"creditsUsed\": 2, \"agent_hints\": [\"All 5 web results are excerpts only (#1 \\\"https://www.youtube.com/watch?v=y3JE9OE9PbY\\\", #2 \\\"https://www.nintendolife.com/news/2026/09/nintendo-switch-2-welcome-tour-updated-to-ver-1-1-1-here-are-the-patch-notes\\\", #3 \\\"https://www.facebook.com/GameRant/posts/the-latest-firmware-update-for-nintendo-switch-2-consoles-brings-some-new-settin/1673809390972063/\\\" and 2 more). If you need more than an excerpt, use firecrawl_scrape with {\\\"url\\\":\\\"<one of these URLs>\\\",\\\"formats\\\":[\\\"markdown\\\"]}. Retrieve only needed pages; do not re-scrape results that already contain the required content.\"]}"
+  }
+ ],
+ "structuredContent": {
+  "agent_hints": [
+   "All 5 web results are excerpts only (#1 \"https://www.youtube.com/watch?v=y3JE9OE9PbY\", #2 \"https://www.nintendolife.com/news/2026/09/nintendo-switch-2-welcome-tour-updated-to-ver-1-1-1-here-are-the-patch-notes\", #3 \"https://www.facebook.com/GameRant/posts/the-latest-firmware-update-for-nintendo-switch-2-consoles-brings-some-new-settin/1673809390972063/\" and 2 more). If you need more than an excerpt, use firecrawl_scrape with {\"url\":\"<one of these URLs>\",\"formats\":[\"markdown\"]}. Retrieve only needed pages; do not re-scrape results that already contain the required content."
+  ],
+  "success": true,
+  "data": {
+   "web": [
+    {
+     "url": "https://www.youtube.com/watch?v=y3JE9OE9PbY",
+     "title": "NEW Nintendo Switch Online Feature Just LEAKED! ...",
+     "description": "Join me as we discuss all the newest Nintendo Switch 2 news and updates being talked about online! Nintendo's Switch 2 Plans Leak Early? & Sony Backs Out of A ...",
+     "position": 1
+    },
+    {
+     "url": "https://www.nintendolife.com/news/2026/09/nintendo-switch-2-welcome-tour-updated-to-ver-1-1-1-here-are-the-patch-notes",
+     "title": "Nintendo Switch 2 Welcome Tour Updated To Ver. 1.1.1, ...",
+     "description": "### Nintendo Switch 2 Welcome Tour: Ver. 1.1.1 (23rd September 2026)\n- _Several issues have been addressed to improve the gameplay experience._",
+     "position": 2
+    },
+    {
+     "url": "https://www.facebook.com/GameRant/posts/the-latest-firmware-update-for-nintendo-switch-2-consoles-brings-some-new-settin/1673809390972063/",
+     "title": "The latest firmware update for Nintendo Switch 2 consoles ...",
+     "description": "Nintendo Switch 2 and Nintendo Switch System Update 21.0.0 out now ▪️ Added ability to disable 'Redownload Software' and 'Transfer Album Data' when performing a ...",
+     "position": 3
+    },
+    {
+     "url": "https://www.cnet.com/tech/gaming/nintendo-switch-exploit-fixable-with-update/",
+     "title": "Original Nintendo Switch Owners Should Apply the Latest ...",
+     "description": "Nintendo released update 23.0.0 on Sept. 9, which fixes the exploit. It's recorded as CVE-2026-82079, which is “a stock-based buffer overflow vulnerability”",
+     "position": 4
+    },
+    {
+     "url": "https://www.youtube.com/watch?v=-vZJVWRafPY",
+     "title": "Nintendo Reveals Their BIG PLAN For Switch 2's Future!?",
+     "description": "Nintendo Seems to Be Implementing a Rewards System 10:12 - Switch 2 is Cheapest EVER in the UK! 11:46 - TCG Returns to Mcdonalds 12:43 - Winds & Waves Leaks! ...",
+     "position": 5
+    }
+   ],
+   "news": [
+    {
+     "title": "Original Nintendo Switch Owners Should Apply the Latest Firmware Update Now",
+     "url": "https://www.cnet.com/tech/gaming/nintendo-switch-exploit-fixable-with-update/",
+     "snippet": "The problem does not affect the Nintendo Switch 2.",
+     "date": "2 days ago",
+     "imageUrl": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQqrTAkFngNGL8cFMtEqHkDBgqsiyyiMZIhyWros_cTum_hUUJ__yvroBI&usqp=CAI&s",
+     "position": 1
+    },
+    {
+     "title": "Nintendo Switch 2 Welcome Tour Updated To Ver. 1.1.1, Here Are The Patch Notes",
+     "url": "https://www.nintendolife.com/news/2026/09/nintendo-switch-2-welcome-tour-updated-to-ver-1-1-1-here-are-the-patch-notes",
+     "snippet": "### Nintendo Switch 2 Welcome Tour: Ver. 1.1.1 (23rd September 2026)\n- _Several issues have been addressed to improve the gameplay experience._",
+     "date": "6 days ago",
+     "imageUrl": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQ5Keyfg2Yo9cgH7LXjP4FcpLFarg2IqLpbefndft75XNN9Qz9QfXrHQYk&usqp=CAI&s",
+     "position": 2
+    },
+    {
+     "title": "Gather the crew—a free update is taking off in Star Fox! – News – Nintendo Official Site",
+     "url": "https://www.nintendo.com/us/whatsnew/blast-off-into-high-octane-adventure-with-added-multiplayer-content-for-star-fox-available-now-on-nintendo-switch-2/",
+     "snippet": "# Blast off into high-octane adventure with added multiplayer content for Star Fox, available now on Nintendo Switch 2!\nClose in on a free update for the [Star Fox™](https://www.nintendo.com/us/store/products/star-fox-switch-2/) game—exclusively for the [Nintendo Switch™ 2](https://www.nintendo.com/us/gaming-systems/switch-2/) system!\n\n## **New intel**\n- **Battle Mode**: Gather a crew of up to four players* in local split-screen Battle Mode!\n- **Three additional stages**: Complete objectives in three more stages, Katina, Sector X, and Venom.\n- **Battle online—together!**: Up to four players can form a team and join online** battles using a single Nintendo Switch 2.\n\n# More News\n[![](https://assets.nintendo.com/image/upload/ar_16:9,b_auto:border,c_lpad/b_white/f_auto/q_auto/dpr_1.5/c_scale,w_1500/ncom/en_US/articles/2026/maximize-your-game-with-nba-2k27-on-nintendo-switch-2/NBA2K27_KA_WEMBY_HORIZ_RGB_BR-1920x1080_1)\\\n\\\n09/25/26\\\n\\\n**Maximize your game with NBA 2K27 on the Nintendo Switch 2 system!**\\\n\\\nRead more](https://www.nintendo.com/us/whatsnew/maximize-your-game-with-nba-2k27-on-the-nintendo-switch-2-system/)",
+     "date": "5 hours ago",
+     "imageUrl": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTMTMkiJo6uxe2q_NV14uIcc6kPEJfzNHjtICvrsw6E7-OWJIkyX5sDO4s&usqp=CAI&s",
+     "position": 3
+    },
+    {
+     "title": "The 18 best Nintendo Switch 2 games in 2026",
+     "url": "https://www.techradar.com/gaming/nintendo/best-nintendo-switch-2-games",
+     "snippet": "There was a problem.",
+     "date": "6 days ago",
+     "imageUrl": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRX8dB9EhHDJn0k0oBZ1kewAGjiwaVQENV6AhL25hy0gU7qpdyLFbUzNoW7&usqp=CAI&s",
+     "position": 4
+    },
+    {
+     "title": "5 Nintendo Games That Still Need a Switch 2 Edition",
+     "url": "https://www.polygon.com/nintendo-games-no-switch-2-edition/",
+     "snippet": "The Nintendo Switch 2 is already on one heck of a run. Though it has yet to see new installments of some heavy-hitter franchises, Nintendo's latest console...",
+     "date": "3 days ago",
+     "imageUrl": "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcT8aMjrNmC8ND3OthOMPgfm54ITmAaiD8ioQE65sK2X99ChweBYRcNxoyc&usqp=CAI&s",
+     "position": 5
+    }
+   ]
+  },
+  "creditsUsed": 2
+ }
+}

@@ -18,7 +18,7 @@ import logging
 import re
 from typing import Any, Callable
 
-from . import extensions_web
+from . import extensions_web, search_presets
 
 logger = logging.getLogger("maiwork.search_binding")
 
@@ -32,10 +32,24 @@ _BINDING_KEYS = ("mcp", "tool", "extract_mcp", "extract_tool")
 # ----------------------------------------------------------------------
 
 
-def _norm_binding(raw: Any) -> dict[str, str] | None:
-    """kv 里读出来的东西规范化成 {"mcp","tool","extract_mcp","extract_tool"}；不合法 → None。
+def _norm_names(raw: Any) -> list[str]:
+    """fallback/broad 名单规范化：只收字符串、去空白去重、保序；不是列表 → []。"""
+    out: list[str] = []
+    if not isinstance(raw, list):
+        return out
+    for n in raw:
+        s = str(n or "").strip()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def _norm_binding(raw: Any) -> dict[str, Any] | None:
+    """kv 里读出来的东西规范化成 {"mcp","tool","extract_mcp","extract_tool",
+    "fallback":[名字], "broad":[名字]}；不合法 → None。
 
     extract_tool 为空 → extract_mcp 也为空；有 extract_tool 但没写 extract_mcp（老记录）→ 同搜索那家。
+    老记录没有 fallback/broad → 空列表。
     """
     if not isinstance(raw, dict):
         return None
@@ -45,7 +59,11 @@ def _norm_binding(raw: Any) -> dict[str, str] | None:
         return None
     extract_tool = str(raw.get("extract_tool") or "").strip()
     extract_mcp = (str(raw.get("extract_mcp") or "").strip() or mcp) if extract_tool else ""
-    return {"mcp": mcp, "tool": tool, "extract_mcp": extract_mcp, "extract_tool": extract_tool}
+    return {
+        "mcp": mcp, "tool": tool, "extract_mcp": extract_mcp, "extract_tool": extract_tool,
+        "fallback": _norm_names(raw.get("fallback")),
+        "broad": _norm_names(raw.get("broad")),
+    }
 
 
 def get_binding(store: Any) -> dict[str, str] | None:
@@ -75,9 +93,21 @@ def clear_binding(store: Any, *, mcp: str | None = None) -> bool:
     if current is None:
         return False
     if mcp is not None and current["mcp"] != str(mcp):
+        changed = False
+        updated = dict(current)
         if current["extract_tool"] and current["extract_mcp"] == str(mcp):
-            set_binding(store, {**current, "extract_mcp": "", "extract_tool": ""})
+            updated["extract_mcp"] = ""
+            updated["extract_tool"] = ""
             logger.info("抓正文绑定已解除（原绑定：%s 的 %s）", current["extract_mcp"], current["extract_tool"])
+            changed = True
+        # 被删/改名的扩展也要从 fallback / broad 名单里剔掉，名单不留死名字
+        name = str(mcp)
+        for key in ("fallback", "broad"):
+            if name in current.get(key, []):
+                updated[key] = [n for n in current.get(key, []) if n != name]
+                changed = True
+        if changed:
+            set_binding(store, updated)
             return True
         return False
     with store.tx() as conn:
@@ -95,7 +125,10 @@ def save_binding(
 ) -> dict[str, str]:
     """校验 + 写绑定。tool_spec_of(扩展名, 工具名) → 工具的 spec（含 inputSchema）或 None。
 
-    ValueError（中文）：扩展不存在 / 工具不存在 / 搜索和抓正文是同一个工具。
+    可选 "fallback" / "broad"：扩展名列表（主家挂了递补 / 撒大网多搜几家），
+    只收存在且 url 被搜索预设认得出的扩展。
+    ValueError（中文）：扩展不存在 / 工具不存在 / 搜索和抓正文是同一个工具 /
+    fallback/broad 名单不合法。
     """
     if not isinstance(body, dict):
         raise ValueError("请求体要写成 {\"mcp\": 扩展名, \"tool\": 搜索工具名, \"extract_mcp\": 可选, \"extract_tool\": 可选}")
@@ -116,7 +149,24 @@ def save_binding(
             raise ValueError("搜索和抓正文不能是同一个工具")
         if tool_spec_of(extract_mcp, extract_tool) is None:
             raise ValueError(f"扩展 {extract_mcp} 没有这个工具「{extract_tool}」——先 reload 一下扩展拿最新工具清单")
-    return set_binding(store, {"mcp": mcp, "tool": tool, "extract_mcp": extract_mcp, "extract_tool": extract_tool})
+    # fallback（主家挂了递补）/ broad（撒大网多搜几家）名单：只收存在、且 url 被
+    # 搜索预设（search_presets）认得出的扩展——别家参数我们定不死，递补/撒网都用不了。
+    entries = extensions_web.merged_entries(settings, store)
+    url_of = {e.name: e.url for e in entries}
+    fallback = _norm_names(body.get("fallback"))
+    broad = _norm_names(body.get("broad"))
+    for label, lst in (("递补搜索", fallback), ("撒网搜索", broad)):
+        for name in lst:
+            if name not in names:
+                raise ValueError(f"{label}名单里的「{name}」不是已有的扩展——先去 设置 → 扩展 里添加")
+            if name == mcp:
+                raise ValueError(f"{label}名单不用写主搜索家自己（{name}）")
+            if search_presets.preset_of_url(url_of.get(name, "")) is None:
+                raise ValueError(
+                    f"扩展「{name}」的地址不是已知搜索服务（预设认不出），{label}用不了它"
+                )
+    return set_binding(store, {"mcp": mcp, "tool": tool, "extract_mcp": extract_mcp, "extract_tool": extract_tool,
+                               "fallback": fallback, "broad": broad})
 
 
 # ----------------------------------------------------------------------

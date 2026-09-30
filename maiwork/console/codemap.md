@@ -2,7 +2,7 @@
 
 ## Responsibility
 
-MaiWork 的网页控制台后端（Presentation / HTTP Adapter 层）：一个 aiohttp 服务，把 `app.py` 的服务对象 `svc`（store / models / profiles / feeds / tasks / approvals / goals / extensions …）暴露成浏览器可用的 JSON API + 静态前端。相关接口约定见 `docs/07-代码接口.md` §9、§10；实际路由以 `server.py` 为准。本目录不写业务决策——`views.py` / `usage_history.py` 是纯函数拼返回；`server.py` 只做身份闸、校验、接线。前端（`static/`）由主会话维护，见 [static/codemap.md](static/codemap.md)。父模块见 [../codemap.md](../codemap.md)。
+MaiWork 的网页控制台后端（Presentation / HTTP Adapter 层）：一个 aiohttp 服务，把 `app.py` 的服务对象 `svc`（store / models / profiles / feeds / tasks / approvals / goals / extensions …）暴露成浏览器可用的 JSON API + 静态前端。相关接口约定见 [代码接口文档](<../../../../docs/07-代码接口.md>) §9、§10；实际路由以 `server.py` 为准。本目录不写业务决策——`views.py` / `usage_history.py` 是纯函数拼返回；`server.py` 只做身份闸、校验、接线。前端（`static/`）由主会话维护，见 [static/codemap.md](static/codemap.md)。父模块见 [../codemap.md](../codemap.md)。
 
 ## Design
 

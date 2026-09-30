@@ -224,14 +224,17 @@ def _pick_tools(tool_specs: list[dict] | None, *, provider: str) -> tuple[str, s
             search_tool = name
         elif guess == "extract" and not extract_tool:
             extract_tool = name
+    # 官方 MCP 工具名 2026-10 实测：tavily_search / tavily_extract（下划线版）；
+    # 老的连字符版（tavily-search）只存在于旧文档。这里只影响「还没迁过」的老配置
+    # 首次迁移时写进绑定的名字（幂等键，迁移过的库不会再来一次）——改成下划线是安全的。
     if not search_tool:
         search_tool = {
-            "tavily_mcp": "tavily-search", "tavily": "tavily-search",
+            "tavily_mcp": "tavily_search", "tavily": "tavily_search",
             "exa": "web_search_exa", "you": "you-search",
         }.get(provider, "")
     if not extract_tool:
         extract_tool = {
-            "tavily_mcp": "tavily-extract", "tavily": "tavily-extract", "you": "you-contents",
+            "tavily_mcp": "tavily_extract", "tavily": "tavily_extract", "you": "you-contents",
         }.get(provider, "")
     return search_tool, extract_tool
 

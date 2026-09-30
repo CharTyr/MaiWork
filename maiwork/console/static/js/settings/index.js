@@ -33,7 +33,7 @@ export const SET_SUBS = [
   ["models", "模型", "robot", "用哪些模型"],
   ["extensions", "扩展", "tools", "联网搜索、MCP 和 skill"],
   ["usage", "用量", "chart", "每天用了多少"],
-  ["sources", "资讯来源", "newspaper", "RSS 和屏蔽的来源"],
+  ["sources", "资讯来源", "newspaper", "RSS、优质来源和屏蔽的"],
   ["links", "群链接", "link", "群友看到的专属链接"],
   ["rules", "全部配置", "moon", "所有设置项"],
   ["logs", "请求日志", "memo", "出问题时看这里"],

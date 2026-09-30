@@ -14,7 +14,7 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 
 **单一配置出口**：`app.get_settings()` 是所有模块读配置的唯一入口，三层合并——`config.toml` 原始 Settings（frozen dataclass）× `kv["rules.override"]` 网页规则覆盖（`rules.effective_settings`，一层缓存）× 执行能力判定后的实际工作区根（`_ws_root`，dynamic 落 `/var/lib/private/maiwork/workspaces`）。`Settings` 是 frozen dataclass，覆盖用 `dataclasses.replace` 只换子节。
 
-**数据层纯数据**：`store.py`（SQLite，单写入者 `threading.RLock` + `BEGIN IMMEDIATE`）、`tasks.py`、`goals.py`、`approvals.py` 只放数据和规则：不调模型、不调宿主、不发消息。状态机转移严格按 docs/02 §7.2 表，非法转移抛 `ValueError`，转移在一个事务里完成（改状态 + 写事件）。取消/终态后晚到的结果一律不接（`accept_result=False`），任务状态绝不复活。
+**数据层纯数据**：`store.py`（SQLite，单写入者 `threading.RLock` + `BEGIN IMMEDIATE`）、`tasks.py`、`goals.py`、`approvals.py` 只放数据和规则：不调模型、不调宿主、不发消息。状态机转移严格按 [设计文档](<../../../docs/02-设计.md>) §7.2 表，非法转移抛 `ValueError`，转移在一个事务里完成（改状态 + 写事件）。取消/终态后晚到的结果一律不接（`accept_result=False`），任务状态绝不复活。
 
 **主模型协调器 — 子 agent 执行**（`coordinator.py` + `workers.py`）：主模型不亲自干长活。`Coordinator.run_task(task_id)` 拥有任务整个生命周期：`asyncio.Lock` per workspace（同一工作区同一时刻一个主模型回合）、`asyncio.Semaphore` per workspace 限子 agent 并发（`[environments] max_parallel`）。一轮尝试 = `_plan`（json_mode 出 criteria/deliver_kind/jobs/env，或用 ≤6 轮只读工具查资料再定）→ 派 `Workers.run(brief, tools=[...])`（子 agent 多轮循环，只能 `submit_result` 交回，不能宣布完成）→ `_review`（验收：deliver_kind≠text 时 artifact 必须真实存在于 `artifacts/<task_id>/`，调研类任务做引用核对）→ 交付/重来/失败。执行环境三选一：`local`（本机隔离）/`ssh`（专用机器 `machine_*` 工具）/`railway`（一次性 VM `vm_*` 工具），远端成品必须拷回本机工作区才算数。
 
@@ -42,7 +42,7 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 
 ## Integration
 
-- **MaiBot 宿主**：唯一通道 `host.py`（`Host(ctx)`，`call_capability` 统一超时、返回统一 dataclass、异常包装 `HostError`）。用的宿主事实都查自 docs/06：bot_qq、chat 消息读取、knowledge.search（长期记忆）、send_text/传群文件、proactive_trigger。绝不改 MaiBot planner、不改群回复频率（红线）。
+- **MaiBot 宿主**：唯一通道 `host.py`（`Host(ctx)`，`call_capability` 统一超时、返回统一 dataclass、异常包装 `HostError`）。用的宿主事实都查自 [宿主接口事实](<../../../docs/06-宿主接口事实.md>)：bot_qq、chat 消息读取、knowledge.search（长期记忆）、send_text/传群文件、proactive_trigger。绝不改 MaiBot planner、不改群回复频率（红线）。
 - **console/**（子目录，详图见 <console/codemap.md>）：`ConsoleServer`（aiohttp，监听 `[console] listen`）+ `views.py`（GroupSummary/GroupView/Settings 纯函数拼装）+ `auth.py`（管理员/群管理员 cookie、群友链接码、登录限流）+ `avatar.py`（头像缓存与签发）+ `usage_history.py`（用量历史）。app 在 `_start_stack` 第 6 步建 avatar 再 start console。
 - **environments/**（子目录，详图见 <environments/codemap.md>）：执行环境三件套——`capability.probe` 判定 fixed/dynamic/stopped → `local.LocalEnv`（systemd-run 固定用户或 DynamicUser 隔离；direct 模式仅供本机开发）、`railway.RailwayEnv`（railway.new 一次性 VM，每天限额、同时 1 台）、`ssh.SshEnv`（用户 VPS，ed25519 key 部署）。`Coordinator` 按计划 JSON 的 `env` 字段选择；`tools_exec/tools_railway/tools_ssh` 的工具落点都由对应 env 的 resolve 校验防越界。
 - **platforms/**（子目录，详图见 <platforms/codemap.md>）：`qq_onebot.GroupSpace`（群空间：群文件/公告/相册/群相册上传），启动 `probe()` 探测适配器能力（`host.list_apis()`）+ 机器人群身份缓存；防手滑登记 `group_files_owned` 表（outbox 上传成功 → `register_owned`），只许动机器人自己传的文件。
@@ -160,4 +160,4 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 7. **成品必须回本机工作区** `artifacts/<task_id>/` 才能交付；远端（railway/ssh）产物用 fetch 工具拷回；交付路径闸要求解析后的真实路径在本任务成品目录内。
 8. **exFAT 兼容**：数据目录可能在 exFAT 上——chmod 失败静默放行；不依赖原子 rename/临时文件 link（skills_web 新建先 touch 再写）；config.toml 在插件目录（ext 分区）用 open(path,"w") 直接覆盖写。
 9. **非服务群零读取**：intake/planner 钩子/排程/群空间，第一步永远是 `is_served` 判断。
-10. 改 manifest、插件类、组件注册后必须跑宿主契约测试（docs/04 第二节）。
+10. 改 manifest、插件类、组件注册后必须跑宿主契约测试（[部署与验证](<../../../docs/04-部署与验证.md>) 第二节）。

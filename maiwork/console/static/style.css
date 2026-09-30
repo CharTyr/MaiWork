@@ -977,6 +977,22 @@ body.booting .app, body.booting .tabbar { visibility: hidden; }
 .ext-tools .ntag { font-family: var(--mono); font-weight: 500; font-size: 11.5px; }
 .ext-btns { flex-wrap: wrap; justify-content: flex-end; }
 @media (max-width: 759px) { .ext-row { grid-template-columns: 36px minmax(0, 1fr); } .ext-btns { grid-column: 2; justify-content: flex-start; } }
+/* 预设搜索服务：各家彩色 logo 放进统一的圆角小方块（和 .ico 同尺寸，带细描边免得白底 logo 糊进卡片） */
+.ext-row .ext-logo { width: 28px; height: 28px; border-radius: 8px; object-fit: cover; filter: none; box-shadow: 0 0 0 1px var(--line), 0 2px 6px rgba(0, 0, 0, 0.06); background: #fff; }
+.preset-row .set-name .ntag { margin-left: 6px; }
+.preset-row .set-name .tag + .tag, .preset-row .set-name .tag { margin-left: 6px; }
+.preset-form.login { display: grid; gap: 6px; margin-top: 12px; padding: 14px; border-radius: 16px; border: 1px solid var(--line); background: var(--fill-2); max-width: 460px; }
+.preset-form input { background: var(--card); }
+.preset-form .actions { margin-top: 4px; }
+.preset-get { margin: 0; }
+.preset-get a { color: var(--blue); text-decoration: none; font-weight: 600; }
+.preset-get a:hover { text-decoration: underline; }
+.prov-checks { display: flex; flex-wrap: wrap; gap: 8px; }
+.prov-chk { display: inline-flex; align-items: center; gap: 7px; padding: 6px 12px 6px 7px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); font-size: 13px; font-weight: 600; cursor: pointer; transition: border-color 0.15s, background 0.15s; }
+.prov-chk input { position: absolute; opacity: 0; pointer-events: none; }
+.prov-chk:has(input:checked) { border-color: var(--blue); background: var(--alt-bg); color: var(--blue); }
+.prov-chk:has(input:focus-visible) { outline: 2px solid var(--blue); outline-offset: 2px; }
+.prov-logo { width: 20px; height: 20px; border-radius: 6px; object-fit: cover; box-shadow: 0 0 0 1px var(--line); background: #fff; }
 .ext-form { margin: 12px 0 18px; padding: 18px; border-radius: 20px; border: 1px solid var(--line); background: var(--fill-2); gap: 8px; }
 .ext-form-h { font-size: 17px; font-weight: 800; margin-bottom: 2px; }
 .ext-form input, .ext-form textarea { background: var(--card); }
@@ -1470,3 +1486,40 @@ a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 .ptag.tg { background: rgba(42, 171, 238, .14); color: #1c93d1; }
 .ptag.qb { background: rgba(18, 183, 245, .12); color: #0a84c6; }
 .h-meta .ptag { margin: 0 8px 0 0; }
+
+/* 引导「联网搜索」：一家一行，勾上才展开填密钥 */
+.onb-sx-list { display: grid; gap: 8px; margin-top: 4px; text-align: left; }
+.onb-sx { border: 1px solid var(--line); border-radius: 16px; background: var(--card); transition: border-color 0.18s, background 0.18s, box-shadow 0.18s; }
+.onb-sx.on { border-color: var(--blue); box-shadow: 0 0 0 3px var(--alt-bg); }
+.onb-sx-head { display: grid; grid-template-columns: 18px 32px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 10px 12px; cursor: pointer; }
+.onb-sx-head input { width: 18px; height: 18px; margin: 0; accent-color: var(--blue); }
+.onb-sx-logo { width: 32px; height: 32px; border-radius: 9px; object-fit: cover; background: #fff; box-shadow: 0 0 0 1px var(--line); }
+.onb-sx-name { display: grid; min-width: 0; }
+.onb-sx-name b { font-size: 15px; }
+.onb-sx-name span { font-size: 12.5px; color: var(--ink-2); line-height: 1.4; }
+.onb-sx-key.login { display: none; gap: 6px; margin: 0; padding: 0 12px 12px 72px; }
+.onb-sx.on .onb-sx-key { display: grid; }
+.onb-sx-key input { background: var(--fill-2); }
+.onb-sx-key a { font-size: 12.5px; color: var(--blue); font-weight: 600; text-decoration: none; }
+.onb-sx-key a:hover { text-decoration: underline; }
+@media (max-width: 520px) { .onb-sx-head { grid-template-columns: 18px 28px minmax(0, 1fr); } .onb-sx-head .ntag { grid-column: 3; justify-self: start; } .onb-sx-key { padding-left: 12px; } }
+
+/* 这一轮怎么找的（两段式漏斗，只给管理员） */
+.funnel { margin-bottom: 4px; }
+.fn-box { padding: 14px 16px; display: grid; gap: 8px; }
+.fn-steps { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.fn-step { display: inline-grid; justify-items: center; min-width: 64px; padding: 8px 10px; border-radius: 14px; background: var(--fill-2); }
+.fn-step b { font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.fn-step small { font-size: 11.5px; color: var(--gray); font-weight: 600; }
+.fn-arrow { color: var(--gray); font-size: 13px; }
+.fn-h { margin-top: 6px; font-size: 13px; font-weight: 700; color: var(--ink-2); }
+.fn-row { display: flex; justify-content: space-between; gap: 12px; font-size: 13.5px; padding: 3px 0; }
+.fn-q { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fn-n { flex: none; color: var(--gray); font-variant-numeric: tabular-nums; }
+.fn-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.rej-src { margin-top: 3px; font-size: 12.5px; color: var(--gray); }
+.two-phase { margin-right: 6px; }
+.two-phase.on { background: var(--alt-bg); color: var(--blue); border-color: transparent; }
+.taste-meta { margin-left: 8px; font-size: 12px; color: var(--gray); }
+.set-row.is-off .set-name { color: var(--gray); text-decoration: line-through; }
+.ntag.fu { background: var(--ok-bg); color: var(--ok-ink); }

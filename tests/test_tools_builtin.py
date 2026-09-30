@@ -25,7 +25,8 @@ class FakeSearch:
         self.error = error
         self.calls = []
 
-    async def search(self, query, *, limit=8, days=None):
+    async def search(self, query, *, limit=8, days=None, site="", news=False):
+        # site / news 是 2026-10 给内置 web_search 加的可选参数（预设路才生效）
         self.calls.append((query, limit, days))
         if self.error is not None:
             raise self.error
@@ -93,6 +94,30 @@ class TestWebSearch:
         r = await tools.call("web_search", {"query": "x", "days": 7, "limit": 5}, _ctx())
         assert r.ok
         assert search.calls[0] == ("x", 5, 7)
+
+    @pytest.mark.asyncio
+    async def test_news_collect_defaults_days_to_7(self, store, settings):
+        """找资讯的子 agent（task_id 以 feeds-collect: / feeds-discover: 开头）没填 days → 程序补 7 天。"""
+        for mark in ("feeds-collect:1:2:3", "feeds-discover:1:2:3"):
+            search = FakeSearch([])
+            tools = _make(store, settings, search=search)
+            r = await tools.call("web_search", {"query": "x"}, _ctx(task_id=mark))
+            assert r.ok
+            assert search.calls[0][2] == 7, mark
+
+    @pytest.mark.asyncio
+    async def test_news_collect_keeps_explicit_days(self, store, settings):
+        search = FakeSearch([])
+        tools = _make(store, settings, search=search)
+        await tools.call("web_search", {"query": "x", "days": 180}, _ctx(task_id="feeds-collect:1:2:3"))
+        assert search.calls[0][2] == 180
+
+    @pytest.mark.asyncio
+    async def test_other_tasks_no_default_days(self, store, settings):
+        search = FakeSearch([])
+        tools = _make(store, settings, search=search)
+        await tools.call("web_search", {"query": "x"}, _ctx(task_id="T-9"))
+        assert search.calls[0][2] is None
 
     @pytest.mark.asyncio
     async def test_search_unavailable_returns_not_ok(self, store, settings):

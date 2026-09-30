@@ -810,7 +810,7 @@ class TestWritePostsRobust:
         assert by_title["本地部署实战全记录"] == "裸对象正文"
         # 漏掉的另一条走了补写重试（第二轮只写它一条）
         assert by_title["量子芯片全新架构发布"] == "重试补写的正文"
-        assert len(models.calls) == 4  # focus + score + post + 补写
+        assert len(models.calls) == 5  # focus + score + post + 补写 + 对原文自检
         retry_prompt = str(models.calls[3][1][-1]["content"])
         assert "量子芯片全新架构发布" in retry_prompt
         assert "本地部署实战全记录" not in retry_prompt  # 只补漏写的
@@ -830,7 +830,7 @@ class TestWritePostsRobust:
         rows = store.read().execute(
             "SELECT title, body FROM news_items WHERE rejected=0 ORDER BY id").fetchall()
         assert [r["body"] for r in rows] == ["正文零", "正文一"]
-        assert len(models.calls) == 3  # 都写上了，不用补
+        assert len(models.calls) == 4  # 都写上了，不用补（+ 对原文自检）
 
     def test_retry_only_missing_and_fallback_for_still_missing(self, tmp_path) -> None:
         """第一回漏写，重试又只补了一条；还漏的那条才走 _post_fallback（body=summary）。"""
@@ -841,7 +841,7 @@ class TestWritePostsRobust:
         )
         with _TimePatch():
             assert _run(feeds.prepare_news(GID)) == 2
-        assert len(models.calls) == 4
+        assert len(models.calls) == 5  # 含对原文自检
         rows = store.read().execute(
             "SELECT title, body FROM news_items WHERE rejected=0 ORDER BY id").fetchall()
         by_title = {r["title"]: r["body"] for r in rows}

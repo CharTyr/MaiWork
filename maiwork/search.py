@@ -33,13 +33,15 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from .mcp_client import MCPError, McpSessionClient
-from . import search_binding
+from . import extensions_web, search_binding, search_presets
 from .search_binding import get_binding, status_of, tool_problem
 
 logger = logging.getLogger("maiwork.search")
 
 _MCP_RETRY_DELAY_S = 2.0  # MCP 端点 5xx 时隔几秒重试（只重试一次）
-_SNIPPET_MAX = 500
+# 摘要截断：Keenable 的单条 Snippets 普遍 500~900 字（tests/fixtures/search_presets/
+# keenable_search.json 实测），500 会砍掉一半——抬到 800 覆盖大多数，喂子 agent 也够。
+_SNIPPET_MAX = 800
 _EXTRACT_MAX = 20000
 
 # 参数名候选（按优先级）
@@ -226,11 +228,96 @@ def _mcp_tool_json(result: dict[str, Any]) -> dict | None:
     first = content[0]
     if not isinstance(first, dict) or not isinstance(first.get("text"), str):
         return None
+    text = first["text"]
     try:
-        payload = json.loads(first["text"])
+        payload = json.loads(text)
     except (ValueError, TypeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _parse_titled_blocks(text: str) -> list[dict]:
+    """Keenable 等直接把结果打成纯文本块的格式（2026-09-30 实测）：
+
+        Title: ...\nURL: ...\nPublished: 2026-09-24\nAcquired: ...\nSnippets:\n<多行摘要>
+        \n---\n  再下一条
+
+    通用识别（不只 keenable）：任意一家打成 Title:/URL: 键值块的都拆。
+    拆出一条就算成功（调用方决定用不用）；URL 至少要像 http(s) 才算数。
+    """
+    out: list[dict] = []
+    for block in str(text or "").split("\n\n---\n\n"):
+        lines = block.splitlines()
+        if not any(l.startswith("Title:") for l in lines[:8]):
+            continue
+        header: dict[str, str] = {}
+        snippet_lines: list[str] = []
+        in_snippets = False
+        for line in lines:
+            if not in_snippets:
+                m = line.split(":", 1)
+                if (
+                    len(m) == 2
+                    and m[0].strip() in ("Title", "URL", "Published", "Acquired")
+                ):
+                    key = m[0].strip()
+                    value = m[1].strip()
+                    if key == "Title":
+                        header["title"] = value
+                    elif key == "URL":
+                        header["url"] = value
+                    elif key == "Published":
+                        header["published"] = value
+                    # Acquired 是「抓进索引的时间」，不当发布时间
+                elif line.strip() == "Snippets:":
+                    in_snippets = True
+            else:
+                snippet_lines.append(line)
+        if not str(header.get("url") or "").startswith("http"):
+            continue
+        out.append({
+            "title": header.get("title", ""),
+            "url": header["url"],
+            "snippet": "\n".join(snippet_lines).strip()[:_SNIPPET_MAX],
+            "published": _parse_dt_utc(header.get("published", "")),
+        })
+    return out
+
+
+def _split_title_url_text(text: str) -> tuple[str, str] | None:
+    """「Title: ...\\nURL: ...\\n\\n正文」的纯文本 → (标题, 正文)；不是这个形状 → None。
+
+    Exa 的 web_fetch_exa 还会在标题前加 markdown 的「# 标题」行——# 行优先当标题，
+    不然用 Title: 那行（keenable 格式）。
+    """
+    lines = str(text or "").splitlines()
+    if len(lines) < 3:
+        return None
+    url_idx = -1
+    for i in range(min(3, len(lines))):
+        if lines[i].startswith("URL: ") and lines[i][5:].strip().startswith("http"):
+            url_idx = i
+            break
+    if url_idx < 0:
+        return None
+    heading = ""
+    title = ""
+    for i in range(url_idx):
+        line = lines[i].strip()
+        if line.startswith("# ") and not heading:
+            heading = line[2:].strip()
+        if line.startswith("Title:") and not title:
+            title = line[6:].strip()
+    title = heading or title
+    if not title:
+        return None
+    first_body = url_idx + 1
+    if first_body < len(lines) and not lines[first_body].strip():
+        first_body += 1  # 跳过 URL 和正文之间的空行
+    body = "\n".join(lines[first_body:]).strip()
+    if not body:
+        return None
+    return title, body
 
 
 def _mcp_structured(result: dict[str, Any]) -> dict | None:
@@ -299,16 +386,54 @@ def _snippet_of(item: dict) -> str:
 
 
 def _published_of(item: dict) -> float | None:
-    for k in ("published", "published_date", "publishedDate", "page_age", "date", "age"):
+    for k in ("published", "published_at", "published_date", "publishedDate", "page_age", "date", "age"):
         v = item.get(k)
         if v is None or v == "":
             continue
         if isinstance(v, (int, float)):
-            return float(v)
+            f = float(v)
+            # 只认秒级 epoch（约 2001~2033 年）；毫秒值 / 相对计数不瞎转成时间
+            return f if 1_000_000_000 <= f <= 2_000_000_000 else None
         ts = _parse_dt_utc(v)
         if ts is not None:
             return ts
+        # "3 days ago" 之类相对话解析不了 → None（不许编时间）
     return None
+
+
+def _check_mcp_error(result: Any, role: str) -> None:
+    """MCP result.isError=True → SearchError（中文；Tavily 免密钥月度上限给专门话术）。
+
+    2026-09-30 实测 Tavily 的月度上限回包「isError 被透出成 False」、错误码塞在
+    structuredContent/text 里——对 monthly_cap_reached 这类明显是配额的，
+    即便 isError 丢真也照样当错误报。
+    """
+    if not isinstance(result, dict):
+        return
+    is_error = bool(result.get("isError"))
+    if not is_error:
+        # cap 探测：structuredContent.code 或 content 文本里写明的配额错误
+        text = _content_text(result)
+        sc = result.get("structuredContent")
+        code = sc.get("code") if isinstance(sc, dict) else ""
+        if "monthly_cap_reached" in str(code or "") or "monthly_cap_reached" in text:
+            raise SearchError(
+                "Tavily 免密钥额度这个月用完了：去 https://app.tavily.com 拿一个免费密钥填上"
+            )
+        return
+    body = ""
+    sc = result.get("structuredContent")
+    if isinstance(sc, dict) and isinstance(sc.get("message"), str):
+        body = sc["message"]
+    if not body:
+        body = _content_text(result)
+    # 空 content 的 isError 也别漏：给个兜底词
+    body = body.strip() or "（没给原因）"
+    if "monthly_cap_reached" in body:
+        raise SearchError(
+            "Tavily 免密钥额度这个月用完了：去 https://app.tavily.com 拿一个免费密钥填上"
+        )
+    raise SearchError(f"{role}端返回错误：{_mask(body, [])}")
 
 
 def normalize_search_results(result: dict[str, Any]) -> list[dict]:
@@ -318,7 +443,12 @@ def normalize_search_results(result: dict[str, Any]) -> list[dict]:
     （取最长的一份，You.com 的 results.web/news 会被拼成一份）；实在拿不到结构，
     把原文本截断当一条（url 空）返回。
     """
+    _check_mcp_error(result, "搜索")
     payload = _mcp_structured(result)
+    # Keenable 等纯文本块（Title:/URL:/Snippets:）——先按块拆，拆得出来就不走 dict 列表那套
+    blocks = _parse_titled_blocks(_content_text(result))
+    if blocks:
+        return blocks
     lists: list[list[dict]] = []
     if payload is not None:
         _find_url_lists(payload, lists)
@@ -354,7 +484,13 @@ def normalize_extract_text(result: dict[str, Any]) -> str:
     """extract 工具的 result → 正文文本（截 _EXTRACT_MAX）。
 
     在结构化结果里找 markdown|raw_content|content|text 里最长的一段；找不到退回 content 的纯文本。
+    Keenable / Exa 的抓正文是「Title: ...\\nURL: ...\\n\\n正文」纯文本——标题提出来按《标题》带上。
     """
+    _check_mcp_error(result, "抓正文")
+    titled = _split_title_url_text(_content_text(result))
+    if titled is not None:
+        title, body = titled
+        return ((f"《{title}》\n" if title else "") + body)[:_EXTRACT_MAX]
     payload = _mcp_structured(result) or {}
     candidates: list[str] = []
 
@@ -541,15 +677,150 @@ class Search:
     # 搜索
     # ------------------------------------------------------------------
 
-    async def search(self, query: str, *, limit: int = 8, days: int | None = None) -> list[dict]:
-        client, binding, runtime = self._client()
-        schema = self._schema_of(runtime, binding["tool"])
-        arguments = map_search_arguments(schema, query, limit=limit, days=days)
+    async def search(
+        self,
+        query: str,
+        *,
+        limit: int = 8,
+        days: int | None = None,
+        site: str = "",
+        news: bool = False,
+    ) -> list[dict]:
+        """主绑定先搜；失败（MCPError / isError 的 SearchError / 超时）按 binding["fallback"]
+        里认得出的预设家一个个递补；全挂抛最后一个错误。site/news 只在预设路上生效。
+        每条结果带 "provider" = 实际出结果的扩展名（多provider拼接时认来源用）。"""
+        settings = self._settings()
+        entries = {e.name: e for e in extensions_web.merged_entries(settings, self._store)}
+        errors: list[Exception] = []
+        names = self._fallback_chain(entries)
+        for name in names:
+            try:
+                out = await self._search_one(name, query, limit=limit, days=days, site=site, news=news,
+                                             entries=entries)
+            except SearchUnavailable:
+                raise  # 主绑定本身没配好（没绑定/扩展没了）：不递补，直接报
+            except (SearchError, MCPError, asyncio.TimeoutError, TimeoutError) as e:
+                errors.append(e)
+                logger.info("搜索家 %s 没搜成（%s），试下一家", name, type(e).__name__)
+                continue
+            return out
+        if errors:
+            raise errors[-1]
+        raise SearchUnavailable("还没指定联网搜索：去 设置 → 扩展 里选一个 MCP 用作联网搜索")  # 理论到不了
+
+    def _fallback_chain(self, entries: dict[str, Any]) -> list[str]:
+        """搜索要试的扩展顺序：[主绑定] + [fallback 名单里认得出预设且启用的]。"""
+        binding = get_binding(self._store)
+        if binding is None:
+            raise SearchUnavailable("还没指定联网搜索：去 设置 → 扩展 里选一个 MCP 用作联网搜索")
+        chain = [binding["mcp"]]
+        for name in binding.get("fallback") or []:
+            entry = entries.get(name)
+            if entry is None or not getattr(entry, "enabled", False):
+                continue
+            if search_presets.preset_of_url(getattr(entry, "url", "")) is None:
+                logger.info("fallback 的 %s 不是预设认得出的搜索服务，跳过", name)
+                continue
+            if name not in chain:
+                chain.append(name)
+        return chain
+
+    async def search_with(
+        self,
+        name: str,
+        query: str,
+        *,
+        limit: int = 8,
+        days: int | None = None,
+        site: str = "",
+        news: bool = False,
+    ) -> list[dict]:
+        """指定一家（启用中且预设认得出的）扩展搜一次——撒大网多provider搜用。"""
+        settings = self._settings()
+        entries = {e.name: e for e in extensions_web.merged_entries(settings, self._store)}
+        if name not in entries:
+            raise SearchUnavailable(f"没有这个扩展「{name}」")
+        entry = entries[name]
+        if search_presets.preset_of_url(getattr(entry, "url", "")) is None:
+            raise SearchUnavailable(f"扩展「{name}」不是预设认得出的搜索服务，撒网搜不了")
+        return await self._search_one(name, query, limit=limit, days=days, site=site, news=news,
+                                      entries=entries)
+
+    def broad_providers(self) -> list[str]:
+        """撒大网要搜哪几家：[主绑定] + binding["broad"] 里启用、预设认得出的。"""
+        settings = self._settings()
         try:
-            result = await _call_retry_5xx(client, binding["tool"], arguments)
+            entries = {e.name: e for e in extensions_web.merged_entries(settings, self._store)}
+        except Exception:
+            entries = {}
+        binding = get_binding(self._store)
+        if binding is None:
+            return []
+        out = [binding["mcp"]]
+        for name in binding.get("broad") or []:
+            entry = entries.get(name)
+            if entry is None or not getattr(entry, "enabled", False):
+                continue
+            if search_presets.preset_of_url(getattr(entry, "url", "")) is None:
+                continue
+            if name not in out:
+                out.append(name)
+        return out
+
+    async def _search_one(
+        self,
+        name: str,
+        query: str,
+        *,
+        limit: int,
+        days: int | None,
+        site: str,
+        news: bool,
+        entries: dict[str, Any],
+    ) -> list[dict]:
+        """用指定扩展搜一次。url 被预设认出 → 预设参数（site/news 生效）；
+        否则通用 schema 映射（site/news 忽略，保持老行为）。结果带 provider。"""
+        binding = get_binding(self._store)
+        if binding is None:
+            raise SearchUnavailable("还没指定联网搜索：去 设置 → 扩展 里选一个 MCP 用作联网搜索")
+        if name == binding["mcp"]:
+            # 主绑定：复用 _client() 的状态判断 + 绑定里记的工具名
+            client, _, runtime = self._client()
+            tool = binding["tool"]
+        else:
+            entry = entries.get(name)
+            if entry is None:
+                raise SearchError(f"搜索家「{name}」不在了")
+            runtime = self._runtime(name)
+            client = getattr(runtime, "client", None) if runtime is not None else None
+            preset = search_presets.preset_of_url(getattr(entry, "url", ""))
+            if preset is None:
+                raise SearchError(f"搜索家「{name}」不是预设认得出的，补不上")
+            if client is None:
+                raise SearchError(f"搜索家「{name}」还没连上，补不上")
+            tool = preset.search_tool
+        schema = self._schema_of(runtime, tool)
+        entry = entries.get(name)
+        preset = search_presets.preset_of_url(getattr(entry, "url", "")) if entry is not None else None
+        if preset is not None:
+            arguments = search_presets.filter_to_schema(
+                search_presets.search_args(preset.id, query, limit=limit, days=days, site=site, news=news),
+                schema,
+            )
+        else:
+            arguments = map_search_arguments(schema, query, limit=limit, days=days)
+        try:
+            result = await _call_retry_5xx(client, tool, arguments)
         except MCPError as e:
-            raise SearchError(_mask(f"搜索失败（{binding['mcp']}）：{e}", self.known_secrets())) from None
-        return normalize_search_results(result)[: max(1, int(limit))]
+            raise SearchError(_mask(f"搜索失败（{name}）：{e}", self.known_secrets())) from None
+        try:
+            out = normalize_search_results(result)
+        except SearchError as e:
+            # isError 也算这家没搜成；带是谁家的好递补/交差
+            raise SearchError(f"{name}：{e}") from None
+        for item in out:
+            item["provider"] = name
+        return out[: max(1, int(limit))]
 
     # ------------------------------------------------------------------
     # 抓正文
@@ -564,12 +835,34 @@ class Search:
         mcp, tool = binding["extract_mcp"], binding["extract_tool"]
         runtime = self._runtime(mcp)
         schema = self._schema_of(runtime, tool)
-        arguments = map_extract_arguments(schema, url)
+        arguments = self._extract_arguments(mcp, url, schema)
         try:
             result = await _call_retry_5xx(runtime.client, tool, arguments)
         except MCPError as e:
             raise SearchError(_mask(f"抽取失败（{mcp}）：{e}", self.known_secrets())) from None
         return normalize_extract_text(result)
+
+    def _extract_arguments(self, mcp: str, url: str, schema: dict) -> dict:
+        """抓正文参数：扩展 url 被预设认出 → 预设参数（滤运行时 schema）；
+        预设没给固定参数（如 you-contents）/ 认不出 → 通用映射。"""
+        try:
+            from .config import load_settings  # 无需时早早返回；真要用时兜底的最小空配置也一样走
+
+            settings = self._settings()
+            for e in extensions_web.merged_entries(settings, self._store):
+                if e.name != mcp:
+                    continue
+                preset = search_presets.preset_of_url(getattr(e, "url", ""))
+                if preset is None:
+                    break
+                preset_args = search_presets.extract_args(preset.id, url, keyed=bool(
+                    getattr(e, "headers", None)))
+                if preset_args is None:
+                    break  # you-contents 那种 schema 待核实的 → 通用
+                return search_presets.filter_to_schema(preset_args, schema)
+        except Exception:
+            logger.debug("抓正文预设参数读不出来，走通用映射", exc_info=True)
+        return map_extract_arguments(schema, url)
 
     def extract_available(self) -> tuple[bool, str]:
         """抓正文工具现在能不能用：(能用, 中文说明)。只看抓正文那家自己（它可以和搜索不是同一家，

@@ -162,6 +162,9 @@ class Intake:
         self._bot_account_source = bot_account
         self._spawn = spawn if spawn is not None else _default_spawn
         self._store = store
+        from .news_feedback import CardIndex
+
+        self._card_index = CardIndex()
         # 提问的回答恢复（docs/02 §7.2）：waiting_tasks(群号) 给缓存的
         # [(task_id, question_msg_id, requester_id)]（app 提供，30 秒一刷）；
         # 命中后 spawn on_answer(group_id, task_id, text)（app 挂 coordinator.resume）
@@ -229,6 +232,13 @@ class Intake:
             )
             _spawn_safely(self._spawn, self._run_command(group_id, user_id, user_name, text, message_id))
             return
+        # 2.5) 回复 / 引用了 MaiWork 发的资讯卡片 → 记一次自动好评（news_feedback；卡片清单 60 秒缓存）
+        if self._store is not None:
+            reply_to = str(message.get("reply_to") or "").strip() or _parse_reply_to(message.get("raw_message"))
+            if reply_to:
+                ts = message.get("timestamp")
+                at = float(ts) if isinstance(ts, (int, float)) and ts > 0 else clock.now()
+                self._card_index.on_message(self._store, group_id, user_id, message_id, reply_to, at)
         # 3) 提问的回答（docs/02 §7.2）：回复了 waiting_input/shelved 任务那条提问，
         #    或发起人 @ 机器人而且这个群里只有这一个等待任务 → 后台恢复任务。
         #    纯内存查（app 给的 30 秒缓存），不做重查询。

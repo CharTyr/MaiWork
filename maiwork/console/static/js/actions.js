@@ -5,7 +5,8 @@ import { api, grp, gview } from "./api.js";
 import { FB_KEY, RATE_KEY, clientId, myFb, myRates } from "./pages/news.js";
 import { findIdea, ideaAsk, ideaItems, ideaPicked } from "./pages/ideas.js";
 import { refreshDetail } from "./detail.js";
-import { headerRow, loadExt, pickedTool, readHeaders } from "./settings/ext.js";
+import { checkedProviders, headerRow, loadExt, pickedTool, readHeaders } from "./settings/ext.js";
+import { actNews } from "./actions_news.js";
 import { chipAdd, rowsAdd } from "./settings/rules.js";
 import { loadUsage, loadUsageDay } from "./settings/usage.js";
 import { avatarSaved, loadIdentity } from "./settings/identity.js";
@@ -31,6 +32,7 @@ function findEntry(id) {
 
 export async function act(el, e) {
   const a = el.dataset.act;
+  if (await actNews(a, el)) return;
   const g = grp();
   switch (a) {
     case "tab":
@@ -399,7 +401,14 @@ export async function act(el, e) {
       const ex = pickedTool("sx-extract");
       el.disabled = true;
       try {
-        state.extSearch = await api("PUT", "/api/extensions/search", { mcp, tool, extract_mcp: ex.mcp, extract_tool: ex.tool });
+        state.extSearch = await api("PUT", "/api/extensions/search", {
+          mcp,
+          tool,
+          extract_mcp: ex.mcp,
+          extract_tool: ex.tool,
+          fallback: checkedProviders("sx-fb", mcp),
+          broad: checkedProviders("sx-br", mcp),
+        });
         state.searchEdit = false;
         await loadExt();
         if (state.settings) await loadSettings();

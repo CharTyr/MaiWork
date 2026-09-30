@@ -2592,6 +2592,18 @@ class MaiWorkApp:
             if row is not None:
                 last_msg_ts = float(row["last_msg_ts"] or 0.0)
         due = self.scheduler.due(gid, now, last_msg_ts=last_msg_ts)
+        # 反馈 + 口味（feedback_jobs）：每群每小时最多一轮，群画像成形后才跑；不往群里发东西
+        try:
+            from . import feedback_jobs
+
+            if self.store is not None and self.models is not None and feedback_jobs.due(gid, now):
+                row = self.store.read().execute(
+                    "SELECT profile_ready_ts FROM groups WHERE group_id=?", (gid,)
+                ).fetchone()
+                if row is not None and float(row["profile_ready_ts"] or 0) > 0:
+                    self._spawn_long_job(gid, "feedback", self._feedback_round)
+        except Exception:
+            logger.exception("排反馈 / 口味这一轮出错（群 %s）", gid)
         for job in due or []:
             if job == "news":
                 if self.feeds is None:
@@ -2609,6 +2621,17 @@ class MaiWorkApp:
                 if self.goal_proposer is None:
                     continue
                 self._spawn_long_job(gid, "goal", self._propose_goal_round)
+
+    async def _feedback_round(self, gid: str) -> None:
+        from . import feedback_jobs
+        from .privacy import scrub
+
+        out = await feedback_jobs.run(
+            self.store, self.models, gid, _now(), profiles=self.profiles,
+            scrub=lambda g, text: scrub(g, text, self.store),
+        )
+        if out.get("mentions") or out.get("taste"):
+            logger.info("反馈 / 口味（群 %s）：%s", gid, out)
 
     async def _card_push_round(self, gid: str, now: float) -> None:
         """一个群的资讯卡片 / 构想提一嘴：建待发行 + 投递（开关、节制都在模块里）。

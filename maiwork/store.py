@@ -765,6 +765,23 @@ def _m_news_bridge(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE news_items ADD COLUMN bridge TEXT NOT NULL DEFAULT ''")
 
 
+# 两阶段找资讯（「广撒网再挑着打开」）的可追溯：news_items 加 src_query / src_provider——
+# 这条是撒网时哪个搜索词、哪家搜索服务带回来的（老批次 / 老路 = 空字符串）。
+def _m_news_src(conn: sqlite3.Connection) -> None:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(news_items)")}
+    if "src_query" not in cols:
+        conn.execute("ALTER TABLE news_items ADD COLUMN src_query TEXT NOT NULL DEFAULT ''")
+    if "src_provider" not in cols:
+        conn.execute("ALTER TABLE news_items ADD COLUMN src_provider TEXT NOT NULL DEFAULT ''")
+
+
+def _m_news_followup(conn: sqlite3.Connection) -> None:
+    """「后续」（2026-09-30）：同一件事的新进展，存 {of_title, new_fact} JSON；不是后续 = 空串。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(news_items)")}
+    if "followup" not in cols:
+        conn.execute("ALTER TABLE news_items ADD COLUMN followup TEXT NOT NULL DEFAULT ''")
+
+
 # 资讯卡片 / 构想提一嘴（card_push.py）：每批资讯至多一张卡片（batch_id 唯一），
 # 每个构想至多提一次（idea_id 唯一）；status pending/sending/sent/failed/uncertain/dropped
 def _m_card_push(conn: sqlite3.Connection) -> None:
@@ -803,7 +820,7 @@ def _m_card_push(conn: sqlite3.Connection) -> None:
 
 
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup]
 
 
 class Store:

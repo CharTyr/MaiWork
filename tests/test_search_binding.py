@@ -52,12 +52,12 @@ class TestBindingRoundTrip:
 
     def test_set_and_get(self, store: Store) -> None:
         set_binding(store, {"mcp": "tavily", "tool": "tavily-search", "extract_tool": "tavily-extract"})
-        assert get_binding(store) == {"mcp": "tavily", "tool": "tavily-search", "extract_mcp": "tavily", "extract_tool": "tavily-extract"}
+        assert get_binding(store) == {"mcp": "tavily", "tool": "tavily-search", "extract_mcp": "tavily", "extract_tool": "tavily-extract", "fallback": [], "broad": []}
 
     def test_extract_tool_optional(self, store: Store) -> None:
         set_binding(store, {"mcp": "tavily", "tool": "tavily-search"})
         b = get_binding(store)
-        assert b == {"mcp": "tavily", "tool": "tavily-search", "extract_mcp": "", "extract_tool": ""}
+        assert b == {"mcp": "tavily", "tool": "tavily-search", "extract_mcp": "", "extract_tool": "", "fallback": [], "broad": []}
 
     def test_garbage_in_kv_is_none(self, store: Store) -> None:
         with store.tx() as conn:
@@ -242,7 +242,7 @@ class TestSearchView:
                 return {"tavily-search": {"name": "tavily-search"}, "tavily-extract": {"name": "tavily-extract"}}
 
         view = search_view(store, settings, lambda name: _Runtime())
-        assert view["binding"] == {"mcp": "tavily", "tool": "tavily-search", "extract_mcp": "tavily", "extract_tool": "tavily-extract"}
+        assert view["binding"] == {"mcp": "tavily", "tool": "tavily-search", "extract_mcp": "tavily", "extract_tool": "tavily-extract", "fallback": [], "broad": []}
         assert view["status"]["ok"] is True
         assert "tavily-search" in view["status"]["text"]
 
@@ -287,7 +287,7 @@ class TestTwoMcps:
         """老绑定（没有 extract_mcp）：抓正文当成和搜索同一个扩展，行为不变。"""
         with store.tx() as conn:
             store.kv_set(conn, KV_SEARCH, {"mcp": "You", "tool": "you-search", "extract_tool": "you-contents"})
-        assert get_binding(store) == {"mcp": "You", "tool": "you-search", "extract_mcp": "You", "extract_tool": "you-contents"}
+        assert get_binding(store) == {"mcp": "You", "tool": "you-search", "extract_mcp": "You", "extract_tool": "you-contents", "fallback": [], "broad": []}
 
     def test_save_search_and_extract_from_different_mcps(self, store: Store) -> None:
         b = save_binding(
@@ -295,7 +295,7 @@ class TestTwoMcps:
             {"mcp": "keenable", "tool": "search_web_pages", "extract_mcp": "You", "extract_tool": "you-contents"},
             tool_spec_of=_spec_of,
         )
-        assert b == {"mcp": "keenable", "tool": "search_web_pages", "extract_mcp": "You", "extract_tool": "you-contents"}
+        assert b == {"mcp": "keenable", "tool": "search_web_pages", "extract_mcp": "You", "extract_tool": "you-contents", "fallback": [], "broad": []}
         assert get_binding(store) == b
 
     def test_extract_mcp_defaults_to_search_mcp(self, store: Store) -> None:
@@ -350,7 +350,7 @@ class TestTwoMcps:
     def test_removing_extract_mcp_keeps_search(self, store: Store) -> None:
         set_binding(store, {"mcp": "keenable", "tool": "search_web_pages", "extract_mcp": "You", "extract_tool": "you-contents"})
         assert clear_binding(store, mcp="You") is True
-        assert get_binding(store) == {"mcp": "keenable", "tool": "search_web_pages", "extract_mcp": "", "extract_tool": ""}
+        assert get_binding(store) == {"mcp": "keenable", "tool": "search_web_pages", "extract_mcp": "", "extract_tool": "", "fallback": [], "broad": []}
 
     def test_removing_search_mcp_clears_all(self, store: Store) -> None:
         set_binding(store, {"mcp": "keenable", "tool": "search_web_pages", "extract_mcp": "You", "extract_tool": "you-contents"})

@@ -21,7 +21,9 @@ export function extPage() {
     <div class="h-sub-row"><h2 class="h-sub">MCP</h2>${newMcp || pasting ? "" : `<span class="row-btns"><button class="btn small" data-act="mcp-paste">粘贴配置</button><button class="btn small" data-act="ext-new" data-kind="mcp">加一个</button></span>`}</div>
     ${pasting ? mcpPasteForm() : ""}
     ${newMcp ? mcpForm(null) : ""}
-    ${mcp.length ? mcp.map((m) => (ed && ed.kind === "mcp" && ed.name === m.name ? mcpForm(m) : mcpRow(m))).join("") : newMcp ? "" : `<p class="h-meta">还没有。</p>`}
+    ${mcp.map((m) => (ed && ed.kind === "mcp" && ed.name === m.name ? mcpForm(m) : mcpRow(m))).join("")}
+    ${presetsNotAdded().map(presetRow).join("")}
+    ${!mcp.length && !presetsNotAdded().length && !newMcp ? `<p class="h-meta">还没有。</p>` : ""}
     <div class="h-sub-row"><h2 class="h-sub">skill</h2>${newSkill ? "" : `<span class="row-btns"><label class="btn small file-btn">上传 zip<input type="file" id="skill-zip" accept=".zip,application/zip" hidden /></label><button class="btn small" data-act="ext-new" data-kind="skill">加一个</button></span>`}</div>
     ${newSkill ? skillForm(null) : ""}
     ${skills.length ? skills.map((k) => (ed && ed.kind === "skill" && ed.name === k.name ? skillForm(k) : skillRow(k))).join("") : newSkill ? "" : `<p class="h-meta">还没有。</p>`}`;
@@ -42,17 +44,18 @@ function searchCard() {
     const exMcp = b.extract_mcp || b.mcp;
     return `${head}
       <div class="ext-row search-now">
-        ${ico("magnifier")}
+        ${presetByEntry(b.mcp) ? logoImg(presetByEntry(b.mcp)) : ico("magnifier")}
         <div class="ext-main">
-          <div class="set-name">${esc(b.mcp)} · <span class="mono">${esc(b.tool)}</span></div>
+          <div class="set-name">${esc(labelOf(b.mcp))} · <span class="mono">${esc(b.tool)}</span></div>
           ${b.extract_tool ? `<div class="set-text">抓网页正文：${esc(exMcp)} · <span class="mono">${esc(b.extract_tool)}</span></div>` : ""}
+          ${extraProviders(b)}
           ${stLine}
         </div>
       </div>
       <p class="fine search-agents">搜索偏好可以写进「身份 → AGENTS.md」</p>`;
   }
   if (!cands.length) {
-    return `${head}${stLine}<p class="h-meta">先在下面接一个能搜索的 MCP，比如 Tavily、Exa</p>`;
+    return `${head}${stLine}<p class="h-meta">先在下面的 MCP 里打开一个搜索服务，比如 Keenable（免密钥就能用）</p>`;
   }
   const all = cands.flatMap((c) => c.tools.map((t) => ({ mcp: c.mcp, ...t })));
   const pick = b ? all.find((t) => t.mcp === b.mcp && t.name === b.tool) : all.find((t) => t.guess === "search") || all[0];
@@ -70,12 +73,48 @@ function searchCard() {
       <select id="sx-tool">${all.map((t) => opt(t, same(t, pick), "search")).join("")}</select>
       <label for="sx-extract">抓网页正文 <span class="fine-inline">可选 · 可以选另一家</span></label>
       <select id="sx-extract"><option value="" ${exPick ? "" : "selected"}>不用</option>${all.map((t) => opt(t, same(t, exPick), "extract")).join("")}</select>
+      <label>备用 <span class="fine-inline">可选 · 主搜索出错或额度用完时按顺序换</span></label>
+      ${providerChecks("sx-fb", b && b.fallback, "")}
+      <label>广撒网时一起搜 <span class="fine-inline">可选 · 找资讯时这几家也搜一遍，候选更多样，搜索次数会翻倍</span></label>
+      ${providerChecks("sx-br", b && b.broad, "")}
       <div class="actions">
         <button class="btn primary" data-act="search-save">用这个</button>
         ${b ? `<button class="btn" data-act="search-cancel">取消</button><button class="btn danger" data-act="search-off">不用联网搜索</button>` : ""}
       </div>
     </div>`;
 }
+
+// 备用 / 广撒网：只认已打开的预设服务（后端按预设写死工具和参数）
+const searchBinding = () => (state.extSearch && state.extSearch.binding) || null;
+function searchRoleTags(name) {
+  const b = searchBinding();
+  if (!b) return "";
+  const out = [];
+  if ((b.fallback || []).includes(name)) out.push(`<span class="tag">备用</span>`);
+  if ((b.broad || []).includes(name)) out.push(`<span class="tag">广撒网</span>`);
+  return out.join("");
+}
+const enabledPresets = () => presetList().filter((p) => p.entry && p.enabled);
+const labelOf = (name) => {
+  const p = presetByEntry(name);
+  return p ? p.label : name;
+};
+function extraProviders(b) {
+  const fb = (b.fallback || []).map(labelOf);
+  const br = (b.broad || []).map(labelOf);
+  return `${fb.length ? `<div class="set-text">备用（主搜索出错或额度用完时按顺序换）：${esc(fb.join("、"))}</div>` : ""}${br.length ? `<div class="set-text">广撒网时一起搜：${esc(br.join("、"))}</div>` : ""}`;
+}
+function providerChecks(cls, picked, hint) {
+  const list = enabledPresets();
+  if (!list.length) return `<p class="fine" style="margin:0">先在下面打开几个预设的搜索服务</p>`;
+  return `<div class="prov-checks">${list
+    .map(
+      (p) =>
+        `<label class="prov-chk"><input type="checkbox" class="${cls}" value="${esc(p.entry)}" ${(picked || []).includes(p.entry) ? "checked" : ""} />${logoImg(p, "prov-logo")}<span>${esc(p.label)}</span></label>`
+    )
+    .join("")}</div>${hint ? `<p class="fine" style="margin:0">${hint}</p>` : ""}`;
+}
+export const checkedProviders = (cls, main) => [...document.querySelectorAll(`input.${cls}:checked`)].map((i) => i.value).filter((v) => v && v !== main);
 
 // 下拉当前选中的 {mcp, tool}（id = sx-tool 搜索 / sx-extract 抓正文；选「不用」→ 两个都是 ""）
 export function pickedTool(id) {
@@ -84,7 +123,50 @@ export function pickedTool(id) {
   return { mcp: (o && o.dataset.mcp) || "", tool: (o && o.dataset.tool) || "" };
 }
 
+// ───────── 预设的搜索服务（后端 GET /api/extensions/presets）─────────
+// 已经接上的预设就是 MCP 列表里的普通一行（换成各家 logo、多一个「密钥」按钮）；
+// 还没接的也列在 MCP 列表里，点「打开」就接上，免费的密钥可填可不填，要密钥的给官网链接。
+const presetList = () => (state.extPresets && state.extPresets.presets) || [];
+export const presetByEntry = (name) => presetList().find((p) => p.entry === name) || null;
+const presetsNotAdded = () => presetList().filter((p) => !p.entry);
+const logoImg = (p, cls = "ico ext-logo") => `<img class="${cls}" src="${esc(p.logo)}" alt="" loading="lazy" />`;
+const freeTag = (p) => (p.free ? `<span class="ntag ok">免密钥可用</span>` : `<span class="ntag warn">要密钥</span>`);
+
+function presetRow(p) {
+  const editing = state.presetEdit === p.id;
+  return `
+    <div class="ext-row preset-row${editing ? " is-open" : ""}">
+      ${logoImg(p)}
+      <div class="ext-main">
+        <div class="set-name">${esc(p.label)}<span class="tag">预设</span>${freeTag(p)}</div>
+        <div class="set-text">${esc(p.free_note || "")}</div>
+        <div class="set-text ext-st"><span class="dot"></span>没打开 · 联网搜索服务</div>
+        ${editing ? presetKeyForm(p) : ""}
+      </div>
+      <div class="row-btns ext-btns">${editing ? "" : `<button class="btn small" data-act="preset-open" data-id="${esc(p.id)}">${p.free ? "打开" : "填密钥打开"}</button>`}</div>
+    </div>`;
+}
+
+// 填密钥的小表单：已接上的改密钥 / 没接上的打开时填（免费的可以不填）
+function presetKeyForm(p) {
+  const added = !!p.entry;
+  const ph = p.key_set ? "已填 · 留空就不改" : p.free ? "可以不填 · 不填就用免费额度" : "粘贴 API 密钥";
+  return `
+    <div class="preset-form login" data-id="${esc(p.id)}">
+      <label for="pk-key">API 密钥 ${p.free ? `<small class="lbl-hint">可选</small>` : ""}</label>
+      <input id="pk-key" type="password" autocomplete="new-password" spellcheck="false" placeholder="${esc(ph)}" />
+      <p class="fine preset-get">${p.free ? "想要更高额度：" : "要先注册拿一个密钥："}<a href="${esc(p.key_page_url)}" target="_blank" rel="noopener noreferrer">去 ${esc(p.label)} 官网拿密钥 ↗</a></p>
+      <p class="err" id="pk-err" hidden></p>
+      <div class="actions">
+        <button type="button" class="btn primary small" data-act="preset-save" data-id="${esc(p.id)}">${added ? "保存" : "打开"}</button>
+        <button type="button" class="btn small" data-act="preset-cancel">取消</button>
+        ${added && p.free && p.key_set ? `<button type="button" class="btn small ghost" data-act="preset-clear-key" data-id="${esc(p.id)}">不用密钥了</button>` : ""}
+      </div>
+    </div>`;
+}
+
 function mcpRow(m) {
+  const p = presetByEntry(m.name);
   const st = !m.enabled
     ? `<span class="dot"></span>关着`
     : m.ok
@@ -93,12 +175,13 @@ function mcpRow(m) {
   const roles = roleText(m.roles);
   const hdrs = (m.header_names || []).length ? ` · 请求头 ${m.header_names.map(esc).join("、")}（已填）` : "";
   return `
-    <div class="ext-row">
-      ${ico("link")}
+    <div class="ext-row${p ? " preset-row" : ""}">
+      ${p ? logoImg(p) : ico("link")}
       <div class="ext-main">
-        <div class="set-name">${esc(m.name)}${m.source === "config" ? `<span class="tag">配置文件里的</span>` : ""}${m.search_role === "search" ? `<span class="tag">联网搜索</span>` : m.search_role === "extract" ? `<span class="tag">抓正文</span>` : ""}</div>
-        <div class="set-text mono-link">${esc(m.url || "")}</div>
-        <div class="set-text ext-st">${st} · 给${esc(roles)}用${hdrs}</div>
+        <div class="set-name">${p ? esc(p.label) : esc(m.name)}${p ? `<span class="tag">预设</span>` : ""}${m.source === "config" ? `<span class="tag">配置文件里的</span>` : ""}${m.search_role === "search" ? `<span class="tag">联网搜索</span>` : m.search_role === "extract" ? `<span class="tag">抓正文</span>` : ""}${searchRoleTags(m.name)}</div>
+        ${p ? `<div class="set-text">${p.key_set ? "用自己的密钥" : esc(p.free_note || "")}</div>` : `<div class="set-text mono-link">${esc(m.url || "")}</div>`}
+        <div class="set-text ext-st">${st} · 给${esc(roles)}用${p ? "" : hdrs}</div>
+        ${p && state.presetEdit === p.id ? presetKeyForm(p) : ""}
         ${
           (m.tool_names || []).length
             ? `<div class="ext-tools">${m.tool_names.slice(0, 12).map((t) => `<span class="ntag">${esc(t)}</span>`).join("")}${m.tool_names.length > 12 ? `<span class="ntag">共 ${m.tool_names.length} 个</span>` : ""}</div>`
@@ -108,6 +191,7 @@ function mcpRow(m) {
       <div class="row-btns ext-btns">
         <button class="btn small" data-act="mcp-toggle" data-name="${esc(m.name)}" data-on="${m.enabled ? "0" : "1"}">${m.enabled ? "关掉" : "打开"}</button>
         ${m.enabled ? `<button class="btn small" data-act="mcp-reload" data-name="${esc(m.name)}">重连</button>` : ""}
+        ${p && m.source !== "config" && state.presetEdit !== p.id ? `<button class="btn small" data-act="preset-open" data-id="${esc(p.id)}">密钥</button>` : ""}
         ${m.source === "config" ? "" : `<button class="btn small" data-act="ext-edit" data-kind="mcp" data-name="${esc(m.name)}">改</button>`}
       </div>
     </div>`;
@@ -306,5 +390,10 @@ export async function loadExt() {
     state.extSearch = await api("GET", "/api/extensions/search");
   } catch (e) {
     state.extSearch = null;
+  }
+  try {
+    state.extPresets = await api("GET", "/api/extensions/presets");
+  } catch (e) {
+    state.extPresets = null;
   }
 }

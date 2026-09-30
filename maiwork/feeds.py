@@ -102,6 +102,16 @@ _IDEA_ITEM_DESC_MAX = 200
 _IDEA_ITEM_KINDS = ("task", "goal")
 
 
+def _followup_view(raw: Any) -> dict | None:
+    try:
+        v = json.loads(raw) if raw else None
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(v, dict) or not v.get("new_fact"):
+        return None
+    return {"of_title": str(v.get("of_title") or ""), "new_fact": str(v.get("new_fact") or "")}
+
+
 def _row_get(row: Any, key: str, default: Any = "") -> Any:
     """行里有这个列就取，没有（老库 schema / 测试里的假行）→ 给默认值，不抛。"""
     try:
@@ -336,6 +346,16 @@ _ICONS = (
 )
 
 _CANDIDATE_CAP = 12         # 子 agent 最多交回多少条（brief 里也这么要求）
+# 两阶段找资讯（「广撒网再挑着打开」；先做成模块级常量，将来要配置化再动）：
+DISCOVER_TARGET = (40, 80)  # 撒网目标：这轮一共要凑到多少条不重复候选
+PREFILTER_KEEP = (18, 24)   # 粗筛后留多少条（下界只是参考；上界是硬上限）
+FETCH_PICK = (8, 12)        # 主模型从粗筛里挑多少条真去打开
+PER_FOCUS_MIN_QUERIES = 2   # 保底：每个关注点至少要被问过几次
+PER_FOCUS_MIN_CANDS = 6     # 保底：每个关注点至少要搜出几条候选
+PER_FOCUS_MAX_SHARE = 0.40  # 粗筛均衡：一个方向最多占粗筛结果的比例
+DISCOVER_MINUTES = 6        # 撒网子 agent 的时间盒（分钟）
+VERIFY_WORKERS = 3          # 核验子 agent 最多几个并发
+VERIFY_MINUTES = 8          # 核验子 agent 的时间盒（分钟）
 # 每轮备料给子 agent 的 task_id 标记序号（同一毫秒也不会撞；统计就按这个标记点数）
 _collect_mark_seq = itertools.count(1)
 _FEEDBACK_SCAN_DAYS = 14    # 关注点提示 / 打分参考的最近反馈窗口
@@ -856,20 +876,35 @@ class Feeds:
         except Exception:
             logger.exception("RSS 取回意外出错（群 %s），这轮跳过 RSS", gid)
             rss_items = []
+        two_phase_stats: dict = {}
         try:
-            candidates = await self._collect(
-                gid, focus, settings, task_id=collect_mark, rss_items=rss_items
-            )
+            if self.two_phase_on(gid):
+                # 两阶段（「广撒网再挑着打开」）：撒网 → 保底 → 粗筛 → 挑 → 核验；
+                # 候选按老格式交回（下游补打开 / 第一道 / 打分照旧）。
+                candidates = await self._collect_two_phase(
+                    gid, focus, settings,
+                    collect_mark=collect_mark, stats_out=two_phase_stats,
+                )
+                if not candidates:
+                    self._skipped_batch(
+                        gid, "撒网没搜出能用的候选",
+                        stats=self._round_stats(collect_mark, two_phase_stats.get("funnel")),
+                    )
+                    return 0
+            else:
+                candidates = await self._collect(
+                    gid, focus, settings, task_id=collect_mark, rss_items=rss_items
+                )
         except (ModelError, ValueError) as e:
             logger.info("备资讯-子 agent 失败（群 %s）：%s", gid, e)
             self._skipped_batch(
-                gid, f"子 agent 没找到东西：{e}", stats=self._collect_stats(collect_mark)
+                gid, f"子 agent 没找到东西：{e}", stats=self._round_stats(collect_mark, two_phase_stats.get("funnel"))
             )
             return 0
         except Exception as e:  # 兜底：任何意外都不能炸后台循环
             logger.exception("备资讯-子 agent 意外错误（群 %s）", gid)
             self._skipped_batch(
-                gid, f"子 agent 出了意外：{e}", stats=self._collect_stats(collect_mark)
+                gid, f"子 agent 出了意外：{e}", stats=self._round_stats(collect_mark, two_phase_stats.get("funnel"))
             )
             return 0
 
@@ -904,13 +939,15 @@ class Feeds:
                 logger.info("备资讯-打分失败（群 %s）：%s", gid, e)
                 self._skipped_batch(
                     gid, f"模型打分失败：{e}", found=len(candidates),
-                    stats=self._round_stats(collect_mark),
+                    stats=self._round_stats(collect_mark, two_phase_stats.get("funnel")),
                 )
                 return 0
             # 第一道（模型侧）：不扎实 / 垃圾 / 同一件事（含 dup_of 指到已发布的）
             self._hard_reject_model(survivors)
             # 同一轮里的重复（dup_in_batch 指到前面某条）：那一对里留 avg 高的
             self._resolve_dup_in_batch(survivors)
+            # 同一件事这轮最多放一条「后续」（留分高的）
+            self._limit_followups(survivors)
 
         # ⑤ 第二道（上网页）：五项分门槛
         web_min_avg = float(getattr(settings.feeds, "web_min_avg", 3.0))
@@ -963,7 +1000,7 @@ class Feeds:
             accepted_items=accepted,
             ttl_h=ttl_h,
             note=note,
-            stats=self._round_stats(collect_mark),
+            stats=self._round_stats(collect_mark, two_phase_stats.get("funnel"), kept=kept),
         )
         del batch_id  # 目前不对外用
         # 第三道：kind=news、avg≥pool_min_avg、relevance≥4、chat≥4、48 小时内、非敏感；
@@ -1186,17 +1223,38 @@ class Feeds:
     # 第一道（模型侧）
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _followup_of(item: dict) -> dict | None:
+        """模型判这条是「和最近发过的某条同一件事的后续进展」且说得出多了什么 → {of_title, new_fact}；否则 None。"""
+        flags = item.get("_flags") or {}
+        if flags.get("relation") != "update" or not flags.get("new_fact"):
+            return None
+        target = item.get("_dup_target")
+        of_title = ""
+        if target and target[0] == "recent":
+            of_title = str((target[1] or {}).get("title") or "")[:60]
+        return {"of_title": of_title, "new_fact": str(flags["new_fact"])}
+
     def _hard_reject_model(self, survivors: list[dict]) -> None:
         for item in survivors:
             if "reject" in item:
                 continue
             flags = item.get("_flags") or {}
+            relation = str(flags.get("relation") or "")
+            target = item.get("_dup_target")
+            points_recent = bool(flags.get("same_as_recent")) or bool(target and target[0] == "recent")
+            # 「重复」和「进展」分开（2026-09-30）：同一件事有新进展（说得出多了什么）→ 放行并标「后续」；
+            # 只是补背景（context）→ 不算重复；其余照旧按重复拒
+            followup = self._followup_of(item) if points_recent else None
+            if followup is not None:
+                item["followup"] = followup
+            skip_dup = followup is not None or (points_recent and relation == "context")
             if not flags.get("grounded", True):
                 item["reject"] = ("hard", "摘要在原文找不到依据（不扎实）")
             elif flags.get("junk"):
                 reason = str(flags.get("junk_reason") or "").strip()
                 item["reject"] = ("hard", f"垃圾：{reason}" if reason else "垃圾：标题党/软文/营销号/纯情绪")
-            elif flags.get("same_as_recent"):
+            elif flags.get("same_as_recent") and not skip_dup and not (target and target[0] == "recent"):
                 item["reject"] = ("hard", "和最近出过的是同一件事（重复）")
             elif item.get("kind") == "guide" and flags.get("not_article"):
                 reason = str(flags.get("not_article_reason") or "").strip()
@@ -1206,16 +1264,33 @@ class Feeds:
                 and float((item.get("scores") or {}).get("relevance") or 0.0) >= 4.0
             ):
                 item["reject"] = ("hard", "政府通讯稿，和群无关")
-            else:
+            elif target and target[0] == "recent" and not skip_dup:
                 # dup_of 指到一条已发布的 → 同一件事，硬拒（理由带那条的标题开头）
-                target = item.get("_dup_target")
-                if target and target[0] == "recent":
-                    that_title = str((target[1] or {}).get("title") or "")[:30]
-                    item["reject"] = (
-                        "hard",
-                        f"和最近发过的「{that_title}」是同一件事" if that_title
-                        else "和最近发过的重复（同一件事）",
-                    )
+                that_title = str((target[1] or {}).get("title") or "")[:30]
+                item["reject"] = (
+                    "hard",
+                    f"和最近发过的「{that_title}」是同一件事" if that_title
+                    else "和最近发过的重复（同一件事）",
+                )
+
+    def _limit_followups(self, survivors: list[dict]) -> None:
+        """同一件事（指向同一条已发布的）这轮最多放一条后续：留 avg 高的，其余拒（web 这道）。"""
+        best: dict[int, dict] = {}
+        for item in survivors:
+            if "reject" in item or not item.get("followup"):
+                continue
+            target = item.get("_dup_target")
+            key = id(target[1]) if target and target[0] == "recent" else id(item)
+            cur = best.get(key)
+            if cur is None:
+                best[key] = item
+                continue
+            avg = float((item.get("scores") or {}).get("avg") or 0.0)
+            cur_avg = float((cur.get("scores") or {}).get("avg") or 0.0)
+            loser = item if avg <= cur_avg else cur
+            if loser is cur:
+                best[key] = item
+            loser["reject"] = ("web", "同一件事的后续这轮已经留了一条，留分高的")
 
     def _resolve_dup_in_batch(self, survivors: list[dict]) -> None:
         """同一轮里被指「和前面某条是同一件事」的：那一对里留 avg 高的，低的拒掉
@@ -1368,12 +1443,50 @@ class Feeds:
     # 每轮统计（搜了几次 / 看了几篇 / 收了几条）
     # ------------------------------------------------------------------
 
-    def _round_stats(self, collect_mark: str) -> dict:
-        """这一轮的工具用量：找资讯的子 agent + 补打开的子 agent 加起来。"""
+    def _round_stats(self, collect_mark: str, funnel: dict | None = None, *, kept: int | None = None) -> dict:
+        """这一轮的工具用量：找资讯的子 agent + 补打开的子 agent 加起来。
+
+        两阶段（开关开的群）：searches/pages = 撒网 + 核验 + 补打开几个标记各自的工具调用数。
+        funnel 非空就原样带上（kept 由最终入库数在这里补——调用方在入库时才数得出来）。
+        """
         from .news_recheck import merge_stats
 
-        recheck_mark = str(collect_mark or "").replace("feeds-collect:", "feeds-recheck:", 1)
-        return merge_stats(self._collect_stats(collect_mark), self._collect_stats(recheck_mark))
+        mark = str(collect_mark or "")
+        out = {"searches": 0, "pages": 0}
+        for prefix in ("feeds-collect:", "feeds-recheck:"):
+            if prefix == "feeds-collect:":
+                m = mark
+            else:
+                m = mark.replace("feeds-collect:", prefix, 1)
+            out = merge_stats(out, self._collect_stats(m))
+        # 两阶段标记：撒网（feeds-discover:）+ 核验（feeds-verify: 一组一个后缀）
+        if funnel is not None:
+            base = mark.replace("feeds-collect:", "", 1)
+            out = merge_stats(out, self._collect_stats(f"feeds-discover:{base}"))
+            out = merge_stats(out, self._collect_prefix_stats(f"feeds-verify:{base}:"))
+            f = dict(funnel)
+            if kept is not None:
+                f["kept"] = int(kept)
+            out["funnel"] = f
+        return out
+
+    def _collect_prefix_stats(self, task_id_prefix: str) -> dict:
+        """按前缀点数一组子 agent 的工具用量（核验子 agent 一组一个 :k 后缀）。"""
+        prefix = str(task_id_prefix or "")
+        if not prefix:
+            return {"searches": 0, "pages": 0}
+        try:
+            rows = self._store.read().execute(
+                "SELECT tool, ok FROM tool_calls WHERE task_id LIKE ?"
+                " AND tool IN ('web_search', 'fetch_page')",
+                (prefix + "%",),
+            ).fetchall()
+        except Exception:
+            logger.exception("读资讯收集统计失败（前缀 %s）", prefix)
+            return {"searches": 0, "pages": 0}
+        searches = sum(1 for r in rows if str(r["tool"]) == "web_search")
+        pages = sum(1 for r in rows if str(r["tool"]) == "fetch_page" and int(r["ok"] or 0) == 1)
+        return {"searches": searches, "pages": pages}
 
     def _collect_stats(self, task_id: str) -> dict:
         """这轮子 agent 的工具用量：searches=web_search 调用数，pages=fetch_page 成功数。
@@ -1401,20 +1514,33 @@ class Feeds:
     def _batch_stats_key(batch_id: Any) -> str:
         return f"feeds.batch_stats.{int(batch_id)}"
 
-    def _write_batch_stats(self, conn: Any, batch_id: Any, *, searches: int, pages: int, kept: int) -> None:
-        """把这一轮的 {searches, pages, kept} 挂在批次上（kv，不动 store.py 的表结构）。"""
+    def _write_batch_stats(
+        self, conn: Any, batch_id: Any, *, searches: int, pages: int, kept: int,
+        funnel: dict | None = None,
+    ) -> None:
+        """把这一轮的 {searches, pages, kept} 挂在批次上（kv，不动 store.py 的表结构）。
+
+        两阶段（「广撒网再挑着打开」）额外带 funnel：各环节计数 / 每方向 / 每家搜索 /
+        耗时 / 各环节拒绝计数；老路没有 → 不落这个键。
+        """
+        data: dict[str, Any] = {
+            "searches": max(0, int(searches or 0)),
+            "pages": max(0, int(pages or 0)),
+            "kept": max(0, int(kept or 0)),
+        }
+        if isinstance(funnel, dict) and funnel:
+            data["funnel"] = funnel
         self._store.kv_set(
             conn,
             self._batch_stats_key(batch_id),
-            {
-                "searches": max(0, int(searches or 0)),
-                "pages": max(0, int(pages or 0)),
-                "kept": max(0, int(kept or 0)),
-            },
+            data,
         )
 
     def _batch_stats(self, batch_id: Any) -> dict | None:
-        """读这一轮的统计；老批次（这功能之前落的）没有 → None，前端显示「没统计」。"""
+        """读这一轮的统计；老批次（这功能之前落的）没有 → None，前端显示「没统计」。
+
+        有 funnel（两阶段落的）原样带上，前端「这一轮怎么找的」按它画。
+        """
         try:
             saved = self._store.kv_get(self._batch_stats_key(batch_id))
         except Exception:
@@ -1422,11 +1548,14 @@ class Feeds:
             return None
         if not isinstance(saved, dict):
             return None
-        return {
+        out = {
             "searches": int(saved.get("searches") or 0),
             "pages": int(saved.get("pages") or 0),
             "kept": int(saved.get("kept") or 0),
         }
+        if isinstance(saved.get("funnel"), dict) and saved["funnel"]:
+            out["funnel"] = saved["funnel"]
+        return out
 
     # ------------------------------------------------------------------
     # 落库
@@ -1459,11 +1588,15 @@ class Feeds:
                 (gid, now, int(found), int(kept), 1 if not kept else 0, str(note)[:300], now),
             )
             batch_id = int(cur.lastrowid or 0)
+            funnel = (stats or {}).get("funnel")
+            if not isinstance(funnel, dict) or not funnel:
+                funnel = None
             self._write_batch_stats(
                 conn, batch_id,
                 searches=int((stats or {}).get("searches") or 0),
                 pages=int((stats or {}).get("pages") or 0),
                 kept=int(kept),
+                funnel=funnel,
             )
             for item in accepted_items:
                 sc = item.get("scores") or {}
@@ -1475,9 +1608,9 @@ class Feeds:
                     " url_key, published_ts, score, status_kind, status_at, replies, expires_ts,"
                     " up, down, created, kind, scores, topic, sensitive, profile_ref, rejected,"
                     " reject_gate, reject_reason, body, reason, refs, audience, image_url,"
-                    " keywords, chat_votes, angle, verify, bridge)"
+                    " keywords, chat_votes, angle, verify, bridge, src_query, src_provider, followup)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pool', NULL, 0, ?, 0, 0, ?,"
-                    " ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         batch_id, gid, str(item.get("icon") or "newspaper"), item["title"],
                         item["summary"], str(item.get("why") or ""),
@@ -1500,6 +1633,9 @@ class Feeds:
                         str(item.get("angle") or ""),
                         verify_json,
                         str(item.get("bridge") or "")[:200],
+                        str(item.get("src_query") or "")[:300],
+                        str(item.get("src_provider") or "")[:120],
+                        json.dumps(item["followup"], ensure_ascii=False) if item.get("followup") else "",
                     ),
                 )
                 item["_news_id"] = int(cur.lastrowid or 0)
@@ -1510,9 +1646,9 @@ class Feeds:
                     "INSERT INTO news_items (batch_id, group_id, icon, title, summary, why, sources,"
                     " url_key, published_ts, score, status_kind, status_at, replies, expires_ts,"
                     " up, down, created, kind, scores, topic, sensitive, profile_ref, rejected,"
-                    " reject_gate, reject_reason, angle, image_url, bridge)"
+                    " reject_gate, reject_reason, angle, image_url, bridge, src_query, src_provider)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', NULL, 0, NULL, 0, 0, ?,"
-                    " ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
+                    " ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         batch_id, gid, str(item.get("icon") or "newspaper"), item["title"],
                         item["summary"], str(item.get("why") or ""),
@@ -1529,6 +1665,8 @@ class Feeds:
                         str(reason) if reason else None,
                         str(item.get("angle") or ""), str(item.get("image_url") or ""),
                         str(item.get("bridge") or "")[:200],
+                        str(item.get("src_query") or "")[:300],
+                        str(item.get("src_provider") or "")[:120],
                     ),
                 )
         return batch_id
@@ -1657,9 +1795,14 @@ class Feeds:
         if pref:
             lines.append(f"管理员对这个群的资讯偏好（每轮都要照着办）：{pref}")
             lines.append("")
-        if feedback["up"]:
+        taste_line = self._taste_line(gid)
+        if taste_line:
+            lines.append(taste_line)
+            lines.append("")
+        if feedback["up"] or feedback.get("auto"):
             lines.append("最近这些资讯群友觉得有用（可以多往这方向找）：")
             lines.extend(f"- {t}" for t in feedback["up"][:10])
+            lines.extend(f"- {t}" for t in (feedback.get("auto") or [])[:10])
         if feedback["down"]:
             lines.append("最近这些资讯群友觉得没用（避开这类）：")
             lines.extend(f"- {t}" for t in feedback["down"][:10])
@@ -1787,6 +1930,656 @@ class Feeds:
             if n >= max(1, int(min_count))
         ]
 
+    # ------------------------------------------------------------------
+    # 「怎么搜」（2026-09-30，docs/10 第七节第 2 步）
+    # ------------------------------------------------------------------
+
+    def _search_guide_section(self, gid: str, settings: Settings) -> str:
+        """brief 里「怎么搜」一段：多种问法、一手来源、时间由程序管、别同义改写、屏蔽名单。"""
+        lines = [
+            "怎么搜：",
+            f"- 时间由程序管：找资讯时 web_search 不填 days，程序默认只搜最近 {_NEWS_MAX_AGE_DAYS} 天；"
+            f"找文章时把 days 填 {GUIDE_MAX_AGE_DAYS}。别在搜索词里塞年份、月份来求新。",
+            "- 每个关注点至少换 4 种问法，其中至少 1 种直奔一手来源。可选的角度：一手来源（官方新闻室、公告、"
+            "发布说明、GitHub、论文——用 site 限定网站，如 site=\"nintendo.com\"）、技术细节、社区讨论（论坛、"
+            "Reddit、贴吧）、反面意见 / 批评、本地语言的来源、已知事件的后续进展；要新闻就把 news 设成 true。",
+            "- 别用同义改写反复搜同一句（换一两个词通常搜不出新东西）；连续两次搜不出新东西，就换下一种问法或下一个关注点。",
+            "- 搜索结果只是线索，用 fetch_page 打开过才算数。",
+        ]
+        blocked = sorted(set(self._blocked_domains(gid, settings)) | set(self._auto_blocked_domains(gid)))
+        if blocked:
+            lines.append("- 这些来源会被直接筛掉，别搜也别打开：" + "、".join(blocked[:40]))
+        try:
+            from . import source_stats
+
+            trusted = source_stats.trusted_domains(self._store, gid, clock.now(), blocked=blocked)
+        except Exception:
+            trusted = []
+        if trusted:
+            lines.append(
+                "- 这个群的优质来源（以前出过好几条高分的）：" + "、".join(trusted)
+                + "。可以用 site 直奔它们，但最多约三分之一的搜索这样做，其余照常广撒网，给新来源留机会。"
+            )
+        return "\n".join(lines) + "\n\n"
+
+    def _provider_skill_section(self, settings: Settings) -> str:
+        """绑定的搜索服务是预设的一家 → 附上那家的 skill（官方用法）；认不出 / 读不到 → ""。"""
+        try:
+            from . import extensions_web, search_binding
+            from .search_presets import preset_of_url
+
+            binding = search_binding.get_binding(self._store)
+            if binding is None:
+                return ""
+            entry = next(
+                (e for e in extensions_web.merged_entries(settings, self._store) if e.name == binding["mcp"]), None
+            )
+            preset = preset_of_url(entry.url) if entry is not None else None
+            if preset is None:
+                return ""
+            from .skills import BUILTIN_ROOT
+
+            text = (BUILTIN_ROOT / preset.skill / "SKILL.md").read_text(encoding="utf-8")
+        except Exception:
+            logger.debug("读搜索服务的 skill 失败，这轮不带", exc_info=True)
+            return ""
+        if text.startswith("---"):
+            end = text.find("\n---", 3)
+            if end >= 0:
+                text = text[end + 4:]
+        text = text.strip()
+        if not text:
+            return ""
+        return f"\n\n搜索服务的用法（{preset.label}，官方建议，照着写搜索词）：\n{text}"
+
+    def _parse_news_items(self, raw_items: Any) -> list[dict]:
+        """把子 agent（找资讯 / 核验 / 补打开之外的交回）的 items 解析成候选 dict。
+
+        老 _collect 和两阶段核验（feeds-verify）共用这一套：title/url/summary 非空才收、
+        kind 不是 news|guide 按 news、quote 去换行截 _QUOTE_MAX、url_key 规范化。
+        """
+        items: list[dict] = []
+        if not isinstance(raw_items, list):
+            return items
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            title = str(raw.get("title") or "").strip()
+            url = _public_http_url(raw.get("url"))
+            summary = str(raw.get("summary") or "").strip()
+            if not title or not url or not summary:
+                continue
+            kind = str(raw.get("kind") or "news").strip().lower()
+            if kind not in ("news", "guide"):
+                kind = "news"
+            items.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "summary": summary,
+                    "kind": kind,
+                    "published_raw": raw.get("published"),
+                    "published_ts": _parse_published(raw.get("published")),
+                    "fetched": bool(raw.get("fetched")),
+                    "quote": str(raw.get("quote") or "").replace("\n", " ").strip()[:_QUOTE_MAX],
+                    "paywall": bool(raw.get("paywall")),
+                    "image_url": _public_http_url(raw.get("image_url")),
+                    "explore": bool(raw.get("explore")),
+                    "url_key": _normalize_url(url),
+                }
+            )
+        return items
+
+    # ------------------------------------------------------------------
+    # 两阶段找资讯（「广撒网再挑着打开」，开关 kv["feeds.two_phase"]）
+    #
+    # ① 撒网：一个只用 web_search 的子 agent 铺大量搜索，候选由程序侧的
+    #    撒网登记簿（discovery.py：web_search handler 记进去的）收集，不信子 agent 交回；
+    # ② 保底：饿着的方向（搜不够 2 次问 / 6 条候选）由代码直接补搜（主家 + 撒网多一家）；
+    # ③ 粗筛（不调模型）：撞已入库 / 屏蔽来源 / 太旧 / 标题近似的丢掉，按方向均衡（40% 上限）留 ≤24 条；
+    # ④ 挑：主模型一次 json_mode 挑 8–12 条带一句话理由（hook）的去真打开，失败回落前 10 条；
+    # ⑤ 核验：最多 VERIFY_WORKERS 个只用 fetch_page 的子 agent 并发，按老格式交回 items；
+    #    回来的条目把撒网端的 query/provider/focus 接回去（src_query/src_provider 入库）；
+    # ⑥ 之后完全走老路（补打开 recheck 不动 / 第一道 / 打分 / 帖子 / 入库）。
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _discover_schema() -> dict:
+        """撒网子 agent 交回的 schema：只要一句「撒完了」的备注（候选在登记簿里，不在这）。"""
+        return {
+            "type": "object",
+            "properties": {"note": {"type": "string"}},
+            "required": ["note"],
+        }
+
+    def _discover_brief(self, gid: str, focus: list[dict], settings: Settings) -> str:
+        """撒网 brief：编号关注点（1..n，搜索时 focus=<编号>）+「怎么搜」+ 搜索服务 skill。
+        只搜，不要打开页面；目标一共 DISCOVER_TARGET 条不重复候选；每个关注点至少 2 种问法。"""
+        lines = []
+        for i, f in enumerate(focus, 1):
+            tag = (
+                "（不同角度：找对这个话题的反方 / 批评 / 另一种看法的观点或分析文章，不要同话题的另一条新闻）"
+                if f.get("angle") == "diverse"
+                else "（拓展：跳一步找群友没想到、但会眼前一亮的东西）" if f.get("source") == "explore" else ""
+            )
+            lines.append(f"{i}. {f['query']}{tag}")
+        return (
+            "帮这个群**撒网搜**值得看的内容——这一步只搜，不打开页面。\n"
+            + "关注点如下（编号 1 起；**每次搜索都要带 focus=<关注点编号>**）：\n"
+            + "\n".join(lines)
+            + "\n\n"
+            + self._search_guide_section(gid, settings)
+            + "要求：\n"
+            f"1. 全程只用 web_search，**不要打开任何页面**（不调 fetch_page，后面有别的同事打开核对）；\n"
+            f"2. 目标是攒到 {DISCOVER_TARGET[0]}–{DISCOVER_TARGET[1]} 条不同的候选链接，越分散越好；\n"
+            f"3. 每个关注点至少用 {PER_FOCUS_MIN_QUERIES} 种不同的问法搜过（换角度，不是同义改写）；\n"
+            "4. 搜完最后用 submit_result 交回一句话备注（note：撒了多少、每个关注点大概几条）；\n"
+            f"你只有大约 {DISCOVER_MINUTES} 分钟，到点前记得把已经搜完的交回来。"
+            + self._provider_skill_section(settings)
+        )
+
+    def _source_prior(self, gid: str, site: str) -> float:
+        """来源先验分（0–1；source_stats.source_stats 的名单分；读不到 / 出错按 0，不挡流程）。"""
+        try:
+            from . import source_stats
+
+            return float(source_stats.source_prior(self._store, gid, site, clock.now()))
+        except Exception:
+            return 0.0
+
+    def _prefilter(
+        self, gid: str, settings: Settings, candidates: list[dict]
+    ) -> tuple[list[dict], list[tuple[str, str]], dict]:
+        """粗筛（不调模型）。返回 (kept, dropped[(url, reason)], {per 方向均衡信息})。"""
+        dropped: list[tuple[str, str]] = []
+        blocked = self._blocked_domains(gid, settings)
+        auto_blocked = set(self._auto_blocked_domains(gid))
+        stored = self._stored_url_keys(gid, settings)
+        lookback_days = max(1, int(getattr(settings.feeds, "lookback_days", 14)))
+        since = clock.now() - lookback_days * 86400.0
+        try:
+            rows = self._store.read().execute(
+                "SELECT title FROM news_items WHERE group_id=? AND created>=? AND rejected=0",
+                (gid, since),
+            ).fetchall()
+            published_titles = [str(r["title"]) for r in rows if r["title"]]
+        except Exception:
+            logger.debug("读最近发过的标题失败（群 %s），这轮粗筛不查重", gid, exc_info=True)
+            published_titles = []
+        max_age_s = GUIDE_MAX_AGE_DAYS * 86400.0
+        now = clock.now()
+
+        alive: list[dict] = []
+        seen_titles_keep: list[str] = []
+        for c in candidates:
+            url = str(c.get("url") or "").strip()
+            key = _normalize_url(url)
+            site = _site_of(url)
+            c["site"] = site
+            # 非公开地址（内网 / 不像链接）：直接丢
+            if not _public_http_url(url):
+                dropped.append((url, "链接不是公开可打开的"))
+                continue
+            # 已入库链接（lookback 内 rejected=0）
+            if key and key in stored:
+                dropped.append((url, "和最近出过的重复（同一个链接）"))
+                continue
+            # 屏蔽 / 自动屏蔽来源
+            if site and _domain_blocked(site, blocked):
+                dropped.append((url, "来源在屏蔽名单里"))
+                continue
+            if site and _domain_blocked(site, auto_blocked):
+                dropped.append((url, "这个来源被标没用太多次"))
+                continue
+            # 有已知发布日期且超 GUIDE_MAX_AGE_DAYS 天的
+            published = c.get("published")
+            if isinstance(published, (int, float)) and published and (now - float(published)) > max_age_s:
+                dropped.append((url, "太旧：超过半年"))
+                continue
+            # 标题近似：撞候选里已留的（留先见的），或撞最近已发过的
+            title = str(c.get("title") or "")
+            if title and any(_similar(title, t) >= 0.85 for t in seen_titles_keep):
+                dropped.append((url, "标题和这轮的另一条高度相似"))
+                continue
+            if title and any(_similar(title, t) >= 0.85 for t in published_titles):
+                dropped.append((url, "标题和最近发过的高度相似"))
+                continue
+            alive.append(c)
+            if title:
+                seen_titles_keep.append(title)
+
+        # ------------------------------
+        # 方向均衡（2026-09-30）：一个方向再能搜也不能吃掉全部名额——
+        # 每方向最多 ceil(PREFILTER_KEEP[1] * PER_FOCUS_MAX_SHARE) 条，小方向永远全留。
+        # 方向内排序：7 天内有发布日期的优先 → 来源先验分（source_stats）高者优先 → 原序。
+        # ------------------------------
+        cap_total = PREFILTER_KEEP[1]
+        share_limit = max(1, -(-cap_total * PER_FOCUS_MAX_SHARE // 1))  # ceil
+        share_limit = int(share_limit)
+        # 按方向分桶（保原序）
+        order_idx: dict[int, int] = {id(c): i for i, c in enumerate(candidates)}
+
+        def _rank(c: dict) -> tuple:
+            pub = c.get("published")
+            recent = 1 if isinstance(pub, (int, float)) and pub and (now - float(pub)) <= 7 * 86400.0 else 0
+            prior = self._source_prior(gid, str(c.get("site") or ""))
+            return (-recent, -prior, order_idx.get(id(c), 0))
+
+        buckets: list[list[dict]] = []
+        by_focus: dict[Any, list[dict]] = {}
+        for c in alive:
+            by_focus.setdefault(c.get("focus"), []).append(c)
+        for _f, bucket in by_focus.items():
+            bucket.sort(key=_rank)
+            buckets.append(bucket)
+        # 先各方向越过 share_limit 之前轮着拿（保证小方向进得来），再按需放宽
+        kept: list[dict] = []
+        for bucket in buckets:
+            take = bucket[:share_limit]
+            kept.extend(take)
+        # 全部都没超上限时很可能没凑满；也绝不会超 cap_total（桶数 × 上限，超过时截断按各桶轮）
+        if len(kept) > cap_total:
+            # 超了：按「越晚越不让多拿」轮着截 —— 简单按桶轮转截到 cap_total
+            rr: list[dict] = []
+            idx = 0
+            pools = [list(b[:share_limit]) for b in buckets]
+            while len(rr) < cap_total and any(pools):
+                pool = pools[idx % len(pools)]
+                if pool:
+                    rr.append(pool.pop(0))
+                idx += 1
+            kept = rr
+        return kept[:cap_total], dropped, {}
+
+    async def _pick(self, gid: str, focus: list[dict], kept: list[dict]) -> tuple[list[tuple[dict, str, str]], bool]:
+        """挑（协程版；本体）。失败回落前 10 条（hook 空 → 不拦）。"""
+        from .models import ModelError
+
+        if not kept:
+            return [], False
+        profile_lines = self._brief_profile_lines(gid)
+        lines: list[str] = [f"{i}. {f['query']}" for i, f in enumerate(focus, 1)]
+        cand_lines: list[str] = []
+        for idx, c in enumerate(kept):
+            pub = c.get("published")
+            date_text = clock.bj(float(pub)).strftime("%Y-%m-%d") if isinstance(pub, (int, float)) and pub else ""
+            snippet = str(c.get("snippet") or "").replace("\n", " ")[:200]
+            cand_lines.append(
+                f"[{idx}] {c.get('title') or ''} —— {c.get('site') or ''}"
+                + (f"（{date_text}）" if date_text else "")
+                + f"\n    摘要：{snippet}\n    方向：{c.get('focus') if c.get('focus') is not None else '无'}"
+            )
+        prompt = (
+            "帮这个群从候选里挑出真正值得打开看的。\n"
+            + ("这个群大致是这样的：\n" + "\n".join(profile_lines) + "\n" if profile_lines else "")
+            + "关注点如下：\n" + "\n".join(lines)
+            + f"\n\n候选共 {len(kept)} 条：\n" + "\n".join(cand_lines)
+            + f"\n\n挑 {FETCH_PICK[0]}–{FETCH_PICK[1]} 条，只回 JSON："
+            + '{"picks": [{"i": 候选编号, "kind": "news|guide", "hook": "一句话：只看摘要，为什么值得打开"}]}'
+            + "。尽量每个关注点至少挑一条（实在没有就算了）；一手来源（官方、原文）优先；"
+            + "hook 要写具体理由（这条和群有什么关系），写不出来具体理由的别挑。"
+        )
+        try:
+            result = await self._models.chat(
+                "main", [{"role": "user", "content": prompt}],
+                json_mode=True, purpose="feeds.pick", group_id=gid,
+            )
+            data = json.loads(result.text)
+        except (ModelError, ValueError, TypeError, KeyError) as e:
+            logger.info("挑候选失败（群 %s）：%s，回落前 10 条", gid, e)
+            return [(c, "news", "") for c in kept[:10]], False
+        except Exception as e:
+            logger.exception("挑候选意外出错（群 %s），回落前 10 条", gid)
+            return [(c, "news", "") for c in kept[:10]], False
+        picks_raw = data.get("picks") if isinstance(data, dict) else None
+        if not isinstance(picks_raw, list):
+            return [(c, "news", "") for c in kept[:10]], False
+        out: list[tuple[dict, str, str]] = []
+        used = kept if len(kept) <= FETCH_PICK[1] else kept[: FETCH_PICK[1]]
+        seen_i: set[int] = set()
+        for p in picks_raw:
+            if not isinstance(p, dict):
+                continue
+            try:
+                i = int(p.get("i"))
+            except (TypeError, ValueError):
+                continue
+            hook = str(p.get("hook") or "").strip()
+            if i < 0 or i >= len(kept) or i in seen_i:
+                continue
+            if not hook:
+                continue  # 没具体理由的不开
+            kind = str(p.get("kind") or "news").strip().lower()
+            if kind not in ("news", "guide"):
+                kind = "news"
+            out.append((kept[i], kind, hook))
+            seen_i.add(i)
+            if len(out) >= FETCH_PICK[1]:
+                break
+        if not out:
+            return [(c, "news", "") for c in used[:10]], False
+        return out, True
+
+    def _verify_brief(self, gid: str, group: list[tuple[dict, str, str]]) -> str:
+        """核验子 agent 的 brief：资讯标准 + 本组每条（url/title/snippet/kind/hook），只许 fetch_page。"""
+        today = clock.bj(clock.now()).strftime("%Y-%m-%d")
+        guides = True  # 核验这步不作「找不找文章」的决定：挑里带 kind，照老格式交回
+        lines: list[str] = []
+        for n, (c, kind, hook) in enumerate(group):
+            hint = f"（同事判断这是 {'资讯' if kind == 'news' else '文章'}）"
+            hook_text = f"\n    同事为什么觉得值得打开：{hook}" if hook else ""
+            lines.append(
+                f"[{n}] 标题：{c.get('title') or ''}{hint}\n    链接：{c.get('url') or ''}\n"
+                f"    搜索摘要：{str(c.get('snippet') or '')[:200]}{hook_text}"
+            )
+        return (
+            f"今天是 {today}（北京时间）。下面 {len(group)} 条是同事撒网搜出来、粗筛后挑中要打开的候选。\n"
+            "请逐条用 fetch_page 打开原文核对：\n"
+            + news_standard.for_collect(guides)
+            + "\n\n要求：\n"
+            "1. 每条都必须用 fetch_page 真打开过原文（只用 fetch_page，**不要搜索**）；\n"
+            f"2. 每条：title（原标题或大意）、url（原文链接）、summary（2–4 句中文纯文本，别用 Markdown）、"
+            f"kind（{'news 或 guide，照同事的 hint 填，你判断 hint 明显不对可以改'}）、"
+            f"published（发布时间，ISO 格式或 epoch 秒，拿不到空字符串）、"
+            f"fetched（确实打开过 true）、quote（从原文抄一小段能支撑摘要的依据，≤{_QUOTE_MAX} 字）、"
+            "paywall（要登录/付费 true）、image_url（有封面图就抄过来）；\n"
+            "3. 最后用 submit_result 交回，data 按约定的 JSON Schema；\n"
+            f"你只有大约 {VERIFY_MINUTES} 分钟，到点前把已经核对完的交回来。\n\n"
+            + "\n\n".join(lines)
+        )
+
+    async def _verify_batch(
+        self,
+        gid: str,
+        picks: list[tuple[dict, str, str]],
+        verify_mark: str,
+        deadline_ts: float,
+    ) -> tuple[list[dict], int]:
+        """把挑中的候选均分给最多 VERIFY_WORKERS 个子 agent 并发核验。
+
+        返回 (items, opened)：items 是老格式候选 dict（query/provider/focus 已从挑的候选接回）；
+        opened = 交回时报 fetched=true 的条数。一个子 agent 炸了只丢它自己那份（别的照收）。
+        """
+        import asyncio
+
+        if not picks:
+            return [], 0
+        n_workers = max(1, min(VERIFY_WORKERS, len(picks)))
+        groups: list[list[tuple[dict, str, str]]] = [[] for _ in range(n_workers)]
+        for k, pick in enumerate(picks):
+            groups[k % n_workers].append(pick)
+        groups = [g for g in groups if g]
+
+        async def _one(k: int, group: list[tuple[dict, str, str]]) -> list[dict]:
+            report = await self._workers.run(
+                self._verify_brief(gid, group),
+                group_id=gid,
+                tools=["fetch_page"],
+                output_schema=_NEWS_OUTPUT_SCHEMA,
+                task_id=f"{verify_mark}:{k}",
+                deadline_ts=deadline_ts,
+            )
+            data = getattr(report, "data", None)
+            if not getattr(report, "ok", False):
+                raise ValueError(str(getattr(report, "error", "") or getattr(report, "summary", "") or "核验子 agent 没干成"))
+            if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+                raise ValueError("核验子 agent 交回的格式不对")
+            by_key = {_normalize_url(c.get("url") or ""): c for c in (g[0] for g in group)}
+            items = self._parse_news_items(data["items"])
+            for item in items:
+                src = by_key.get(str(item.get("url_key") or ""))
+                if src is None:
+                    continue
+                if src.get("query"):
+                    item["src_query"] = str(src.get("query") or "")
+                if src.get("provider"):
+                    item["src_provider"] = str(src.get("provider") or "")
+                if src.get("focus") is not None:
+                    item["src_focus"] = src.get("focus")
+            return items
+
+        results = await asyncio.gather(
+            *[_one(k, g) for k, g in enumerate(groups)], return_exceptions=True
+        )
+        out: list[dict] = []
+        for res in results:
+            if isinstance(res, BaseException):
+                logger.info("核验子 agent 一组失败（群 %s），只丢它那一组：%s", gid, res)
+                continue
+            out.extend(res)
+        opened = sum(1 for it in out if it.get("fetched"))
+        return out, opened
+
+    async def _collect_two_phase(
+        self,
+        gid: str,
+        focus: list[dict],
+        settings: Settings,
+        *,
+        collect_mark: str,
+        stats_out: dict,
+    ) -> list[dict]:
+        """两阶段的主编排：撒网 → 保底 → 粗筛 → 挑 → 核验 → 候选（老格式，下游照旧）。
+
+        collect_mark 是这轮的「老标记」（feeds-collect:...）：撒网 / 核验用各自的
+        feeds-discover: / feeds-verify: 标记（统计 _round_stats 按标记点数，见那里）。
+        stats_out["funnel"] 由这里填（环节计数 / 每方向 / 每家搜索 / 耗时）。
+        """
+        from . import discovery
+
+        funnel: dict = {"queries": 0, "discovered": 0, "prefiltered": 0, "picked": 0,
+                        "opened": 0, "returned": 0, "kept": 0, "providers": {}, "per_focus": [],
+                        "timings_s": {}, "rejects": {}}
+        stats_out["funnel"] = funnel
+        gid_s = str(gid)
+        base = collect_mark.replace("feeds-collect:", "", 1)  # 时间戳+序号段
+        discover_mark = f"feeds-discover:{base}"
+        verify_mark = f"feeds-verify:{base}"
+
+        # ① 撒网（只 web_search；候选从登记簿拿）
+        t0 = clock.now()
+        discovery.open_run(discover_mark)
+        try:
+            report = await self._workers.run(
+                self._discover_brief(gid_s, focus, settings),
+                group_id=gid_s,
+                tools=["web_search"],
+                output_schema=self._discover_schema(),
+                task_id=discover_mark,
+                deadline_ts=clock.now() + DISCOVER_MINUTES * 60,
+            )
+            if not getattr(report, "ok", False):
+                # 撒网子 agent 交不出备注不拦这轮：登记簿里已经搜出来的照用；一条没有再算
+                logger.info("撒网子 agent 没交备注（群 %s）：%s", gid_s,
+                            getattr(report, "error", "") or getattr(report, "summary", ""))
+        except Exception:
+            logger.exception("撒网子 agent 出错（群 %s），靠登记簿已有候选继续", gid_s)
+        candidates = discovery.close_run(discover_mark)
+        funnel["timings_s"]["discover"] = max(0.0, clock.now() - t0)
+        funnel["discovered"] = len(candidates)
+        # ② 保底（代码补搜；出错不拖累；每方向计数 / 每家搜索数也由它填）
+        t1 = clock.now()
+        try:
+            added = await self._floor_searches(gid_s, focus, candidates, funnel)
+            if added:
+                # 按链接去重并进候选（登记簿那批优先）
+                have = {_normalize_url(c.get("url") or "") for c in candidates}
+                have.discard("")
+                for c in added:
+                    key = _normalize_url(c.get("url") or "")
+                    if not key or key in have:
+                        continue
+                    have.add(key)
+                    candidates.append(c)
+        except Exception:
+            logger.exception("保底补搜意外出错（群 %s），跳过保底", gid_s)
+        funnel["timings_s"]["floor"] = max(0.0, clock.now() - t1)
+        funnel["discovered"] = len(candidates)
+        # 撒网/保底没搜出任何东西 → 交空列表，让 prepare_news 按「子 agent 没找到」跳过
+        if not candidates:
+            return []
+
+        # ③ 粗筛（不调模型）
+        t2 = clock.now()
+        try:
+            kept, dropped, _ = self._prefilter(gid_s, settings, candidates)
+        except Exception:
+            logger.exception("粗筛意外出错（群 %s），候选全放行进挑", gid_s)
+            kept, dropped = list(candidates), []
+        funnel["timings_s"]["prefilter"] = max(0.0, clock.now() - t2)
+        funnel["prefiltered"] = len(kept)
+        # 预筛刷掉的原因排行（网页漏斗「预筛刷掉的」用；原因取冒号 / 括号前的短语）
+        for _url, reason in dropped:
+            key = _re.split(r"[：:（(]", str(reason or "其他"), maxsplit=1)[0].strip()[:16] or "其他"
+            funnel["rejects"][key] = int(funnel["rejects"].get(key, 0)) + 1
+
+        # ④ 挑（一次主模型；失败回落前 10 条）
+        t3 = clock.now()
+        try:
+            picks, _used_model = await self._pick(gid_s, focus, kept)
+        except Exception:
+            logger.exception("挑候选意外出错（群 %s），回落前 10 条", gid_s)
+            picks = [(c, "news", "") for c in kept[:10]]
+        funnel["timings_s"]["pick"] = max(0.0, clock.now() - t3)
+        funnel["picked"] = len(picks)
+        if not picks:
+            return []
+
+        # ⑤ 核验（并发；一组炸只丢一组）
+        t4 = clock.now()
+        items, opened = await self._verify_batch(
+            gid_s, picks, verify_mark=verify_mark,
+            deadline_ts=clock.now() + VERIFY_MINUTES * 60,
+        )
+        funnel["timings_s"]["verify"] = max(0.0, clock.now() - t4)
+        funnel["opened"] = opened
+        funnel["returned"] = len(items)
+        # 搜索次数合计：撒网子 agent 的 web_search 工具调用（tool_calls 表）+ 代码保底补搜的次数
+        try:
+            funnel["queries"] = int(funnel.get("queries") or 0) + int(
+                self._collect_stats(discover_mark).get("searches") or 0
+            )
+        except Exception:
+            pass
+        return items
+
+    async def _floor_searches(
+        self, gid: str, focus: list[dict], candidates: list[dict], funnel: dict
+    ) -> list[dict]:
+        """保底：饿着（问 < PER_FOCUS_MIN_QUERIES 或候选 < PER_FOCUS_MIN_CANDS）的方向由代码直接补搜。
+
+        主家 + 「撒网」（broad_providers 里其他的家）各搜一次；像需要一手来源的方向
+        （site/官方/公告/repo/文档 之类词眼）多用主家再搜一次宽口径（news=False）。
+        出错一律记日志不抛（这步只是补）。
+        返回：新补的候选列表（focus/query/provider 按补的填；并进去重由调用方做）。
+        """
+        search = self._search
+        if search is None:
+            return []
+        # 先数现有：每个方向被问了几问（queries 去重）、搜到几条
+        per_focus_queries: dict[int, set[str]] = {i: set() for i in range(1, len(focus) + 1)}
+        per_focus_cands: dict[int, int] = {i: 0 for i in range(1, len(focus) + 1)}
+        providers: dict[str, int] = dict(funnel.get("providers") or {})
+        for c in candidates:
+            fi = c.get("focus")
+            if isinstance(fi, int) and fi in per_focus_cands:
+                per_focus_cands[fi] += 1
+                for q in c.get("queries") or []:
+                    if q:
+                        per_focus_queries[fi].add(str(q))
+            p = str(c.get("provider") or "")
+            if p:
+                providers[p] = providers.get(p, 0) + 1
+        # 撒网多几家（主家之外启用中的预设搜索服务）；broad 第一个按主家算
+        broad: list[str] = []
+        bp = getattr(search, "broad_providers", None)
+        if callable(bp):
+            try:
+                broad = [str(x) for x in (bp() or [])]
+            except Exception:
+                broad = []
+        main_provider = broad[0] if broad else ""
+        extras = [x for x in broad if x != main_provider]
+
+        def _need_primary(query: str) -> bool:
+            q = str(query or "").lower()
+            return any(w in q for w in ("site:", "官方", "公告", "新闻室", "发布说明", "github", "文档", "release", "press"))
+
+        added: list[dict] = []
+
+        def _record(query: str, focus_i: int, provider: str, results: Any) -> int:
+            n = 0
+            if not isinstance(results, list):
+                return 0
+            for raw in results:
+                if not isinstance(raw, dict):
+                    continue
+                url = str(raw.get("url") or "").strip()
+                if not url:
+                    continue
+                published = raw.get("published")
+                added.append(
+                    {
+                        "title": str(raw.get("title") or "").strip(),
+                        "url": url,
+                        "snippet": str(raw.get("snippet") or "").strip(),
+                        "published": float(published) if isinstance(published, (int, float)) and published else None,
+                        "query": query,
+                        "focus": focus_i,
+                        "provider": str(raw.get("provider") or provider or "").strip(),
+                        "queries": [query] if query else [],
+                    }
+                )
+                n += 1
+            return n
+
+        for i, f in enumerate(focus, 1):
+            if len(per_focus_queries.get(i, set())) >= PER_FOCUS_MIN_QUERIES and per_focus_cands.get(i, 0) >= PER_FOCUS_MIN_CANDS:
+                continue
+            query = str(f.get("query") or "").strip()
+            if not query:
+                continue
+            # 主家补搜（days=7，像要一手来源的再补一次 news=False 宽口径）
+            attempts = 2 if _need_primary(query) else 1
+            for _attempt in range(attempts):
+                funnel["queries"] = int(funnel.get("queries") or 0) + 1
+                try:
+                    got = await search.search(query, limit=10, days=7)
+                except Exception as e:  # noqa: BLE001（保底只补，出错不拖累这轮）
+                    logger.info("保底补搜失败（群 %s 方向 %d：%s）：%s", gid, i, query[:40], type(e).__name__)
+                    break
+                n = _record(query, i, main_provider, got)
+                per_focus_cands[i] = per_focus_cands.get(i, 0) + n
+                per_focus_queries[i].add(query)
+                prov = main_provider or (str(got[0].get("provider") or "") if isinstance(got, list) and got and isinstance(got[0], dict) else "")
+                if n and prov:
+                    providers[prov] = providers.get(prov, 0) + n
+            # 撒网多一家各补一次
+            sw = getattr(search, "search_with", None)
+            if callable(sw):
+                for name in extras:
+                    funnel["queries"] = int(funnel.get("queries") or 0) + 1
+                    try:
+                        got = await sw(name, query, limit=10, days=7)
+                    except Exception as e:  # noqa: BLE001
+                        logger.info("保底撒网补搜失败（群 %s 方向 %d：%s，%s）：%s",
+                                    gid, i, name, query[:40], type(e).__name__)
+                        continue
+                    n = _record(query, i, name, got)
+                    per_focus_cands[i] = per_focus_cands.get(i, 0) + n
+                    if n:
+                        providers[name] = providers.get(name, 0) + n
+        funnel["providers"] = providers
+        funnel["per_focus"] = [
+            {
+                "query": str(f.get("query") or ""),
+                "queries": len(per_focus_queries.get(i, set())),
+                "cands": per_focus_cands.get(i, 0),
+            }
+            for i, f in enumerate(focus, 1)
+        ]
+        return added
+
     async def _collect(
         self,
         gid: str,
@@ -1846,6 +2639,7 @@ class Feeds:
             + "\n\n"
             + rss_section
             + saturated_section
+            + self._search_guide_section(gid, settings)
             # 收什么、不收什么、怎么找只写在资讯标准 skill 里（skills/news-standard）
             + "资讯标准（照这个找；MaiWork 的程序会按同一套标准验收，不合格的交了也会被筛掉）：\n"
             + news_standard.for_collect(guides)
@@ -1862,6 +2656,7 @@ class Feeds:
             "explore（这条是你自己按群画像「跳一步」拓展的方向就 true，否则省略；前面列的饱和话题不算）；\n"
             "5. 最后用 submit_result 交回，data 按约定的 JSON Schema；"
             f"你只有大约 {collect_minutes} 分钟，到点前记得把已经找到的交回来（部分结果也算，不会丢）。"
+            + self._provider_skill_section(settings)
         )
         deadline_ts = clock.now() + collect_minutes * 60
         report = await self._workers.run(
@@ -1877,34 +2672,7 @@ class Feeds:
         data = report.data
         if not isinstance(data, dict) or not isinstance(data.get("items"), list):
             raise ValueError("子 agent 交回的格式不对")
-        items = []
-        for raw in data["items"][:_CANDIDATE_CAP]:
-            if not isinstance(raw, dict):
-                continue
-            title = str(raw.get("title") or "").strip()
-            url = _public_http_url(raw.get("url"))
-            summary = str(raw.get("summary") or "").strip()
-            if not title or not url or not summary:
-                continue
-            kind = str(raw.get("kind") or "news").strip().lower()
-            if kind not in ("news", "guide"):
-                kind = "news"
-            items.append(
-                {
-                    "title": title,
-                    "url": url,
-                    "summary": summary,
-                    "kind": kind,
-                    "published_raw": raw.get("published"),
-                    "published_ts": _parse_published(raw.get("published")),
-                    "fetched": bool(raw.get("fetched")),
-                    "quote": str(raw.get("quote") or "").replace("\n", " ").strip()[:_QUOTE_MAX],
-                    "paywall": bool(raw.get("paywall")),
-                    "image_url": _public_http_url(raw.get("image_url")),
-                    "explore": bool(raw.get("explore")),
-                    "url_key": _normalize_url(url),
-                }
-            )
+        items = self._parse_news_items(data["items"][:_CANDIDATE_CAP])
         # 「不同角度」：这轮定关注点带了 diverse 的，凡是从这个方向找回来的都打上 angle。
         # 启发式：首先按子 agent 抄回的原话（query 写在标题或 summary 里难判），
         # 保守做法——diverse 只有一个方向时，「和常规关注点文本不重叠的关键词」命中的
@@ -1987,6 +2755,10 @@ class Feeds:
             lines.append("下面这些资讯最近被群友标了「和本群无关」——别再找这类的（反例）：")
             lines.extend(f"- {t}" for t in offtopic_lines)
             lines.append("")
+        taste_line = self._taste_line(gid)
+        if taste_line:
+            lines.append(taste_line + "（打相关度、值得聊时参考）")
+            lines.append("")
         if recent_topics:
             lines.append("最近 14 天已经用过的话题标签：")
             lines.append("、".join(recent_topics[:30]))
@@ -2020,6 +2792,10 @@ class Feeds:
             '就回那个编号（例如 "R2"），否则回 null。同一件事指：同一个事件/公告/产品消息，'
             '哪怕是不同网站、不同语言报道的；也包括内容雷同的同主题指南'
             '（比如两份同一游戏同一版本的配装指南）,'
+            ' "relation": 只在它和上面「最近发过的」某条讲的是同一个事件时填：'
+            '"duplicate"（同样的事实换个标题 / 换家网站再报）/ "update"（这件事有了新进展：新版本、新数字、'
+            '新决定、新结果）/ "context"（补背景、机制、影响，事实本身没变）；无关就给 "unrelated",'
+            ' "new_fact": relation 是 update 时必填——一句话说清比上次多了什么事实；说不出就说明它其实是 duplicate，给空字符串,'
             ' "dup_in_batch": 如果这条和这批候选里编号比它小的另一条讲的是同一件事/同样的内容，'
             '就回那一条的编号（整数），否则回 null,'
             ' "why": "为什么给这个群（一句话，只说群的事，不许点名任何群友）",'
@@ -2050,6 +2826,8 @@ class Feeds:
                 "same_as_recent": bool(s.get("same_as_recent", False)),
                 "dup_of": str(s.get("dup_of") or "").strip(),
                 "dup_in_batch": dup_in_batch,
+                "relation": str(s.get("relation") or "").strip().lower(),
+                "new_fact": str(s.get("new_fact") or "").strip().replace("\n", " ")[:120],
             }
             profile_idx: int | None
             raw_profile = s.get("profile")
@@ -2408,6 +3186,10 @@ class Feeds:
         if pref:
             lines.append(f"管理员对这个群的资讯偏好：{pref}")
             lines.append("")
+        taste_line = self._taste_line(gid)
+        if taste_line:
+            lines.append(taste_line + "（写法和角度往这上面靠，但不许因此编事实）")
+            lines.append("")
         entries = self._safe_entries(gid)
         if entries:
             lines.append("群画像条目（写「我发这条的原因」时对得上哪条就说哪条）：")
@@ -2508,6 +3290,47 @@ class Feeds:
             item = pack["item"]
             if "post" not in item:
                 self._post_fallback(item)
+        # 写完再对一遍原文（2026-09-30）：原文撑不住的说法 → 那条正文回落原摘要；自检失败不拖累出资讯
+        try:
+            await self._check_posts(gid, [p["item"] for p in per_item])
+        except Exception:
+            logger.info("帖子对原文自检出错（群 %s），这轮不改", gid, exc_info=True)
+
+    async def _check_posts(self, gid: str, items: list[dict]) -> None:
+        """一次主模型调用：逐条对照原文依据（quote）和摘要，找帖子正文里原文撑不住的说法。"""
+        todo = [
+            it for it in items
+            if str((it.get("post") or {}).get("body") or "") and (it.get("post") or {}).get("body") != it.get("summary")
+        ]
+        if not todo:
+            return
+        lines = [
+            "下面每条是一篇给群友看的帖子，后面是它的原文依据（从原文抄的一段）和原文摘要。",
+            "逐条检查帖子正文：有没有原文依据和摘要都撑不住的事实说法（编出来的数字、日期、结论、「首个 / 最快」这类绝对化说法、",
+            "把推测说成事实）。口吻、比喻、个人感受不算。",
+            '只回 JSON：{"unsupported": [{"i": 编号, "phrases": ["撑不住的那几个词或短句"]}]}；全都没问题就给空列表。',
+            "",
+        ]
+        for k, it in enumerate(todo):
+            lines.append(f"[{k}] 帖子：{str(it['post']['body'])[:600]}")
+            lines.append(f"    原文依据：{str(it.get('quote') or '')[:300]}")
+            lines.append(f"    原文摘要：{str(it.get('summary') or '')[:300]}")
+        result = await self._models.chat(
+            "main", [{"role": "user", "content": "\n".join(lines)}],
+            json_mode=True, purpose="feeds.post_check", group_id=gid,
+        )
+        data = json.loads(result.text)
+        bad = data.get("unsupported") if isinstance(data, dict) else None
+        for x in bad or []:
+            try:
+                k = int((x or {}).get("i"))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            phrases = [str(p) for p in ((x or {}).get("phrases") or []) if str(p).strip()]
+            if 0 <= k < len(todo) and phrases:
+                it = todo[k]
+                logger.info("帖子有原文撑不住的说法，正文回落摘要（群 %s）：%s", gid, "、".join(phrases)[:80])
+                it["post"]["body"] = str(it.get("summary") or "")
 
     def _post_fallback(self, item: dict) -> None:
         """写帖子失败 / 漏了这条的回落：body=summary、reason=why、refs/audience 空、
@@ -2715,6 +3538,40 @@ class Feeds:
         return picks
 
     # ------------------------------------------------------------------
+    # 两阶段找资讯（「广撒网再挑着打开」）的每群开关：kv["feeds.two_phase"] = [群号...]
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _two_phase_key() -> str:
+        return "feeds.two_phase"
+
+    def two_phase_on(self, gid: str) -> bool:
+        """这个群用不用「广撒网再挑着打开」的新路；默认关（走老的单个子 agent 那套）。"""
+        try:
+            raw = self._store.kv_get(self._two_phase_key(), [])
+        except Exception:
+            return False
+        if not isinstance(raw, list):
+            return False
+        return str(gid) in {str(x) for x in raw}
+
+    def set_two_phase(self, gid: str, on: bool) -> bool:
+        """写开关；返回存下去的状态。"""
+        gid = str(gid)
+        with self._store.tx() as conn:
+            try:
+                raw = self._store.kv_get(self._two_phase_key(), [])
+            except Exception:
+                raw = []
+            cur = {str(x) for x in raw} if isinstance(raw, list) else set()
+            if on:
+                cur.add(gid)
+            else:
+                cur.discard(gid)
+            self._store.kv_set(conn, self._two_phase_key(), sorted(cur))
+        return bool(on)
+
+    # ------------------------------------------------------------------
     # 资讯偏好
     # ------------------------------------------------------------------
 
@@ -2748,11 +3605,13 @@ class Feeds:
                 )
                 # 跳过的轮也记一份统计（默认全 0）：前端能按同一套字段读；收集之后才失败的
                 # 轮（打分失败等）传 stats 保留已经发生的搜索 / 打开次数，kept 一律 0。
+                funnel = (stats or {}).get("funnel")
                 self._write_batch_stats(
                     conn, int(cur.lastrowid or 0),
                     searches=int((stats or {}).get("searches") or 0),
                     pages=int((stats or {}).get("pages") or 0),
                     kept=0,
+                    funnel=funnel if isinstance(funnel, dict) and funnel else None,
                 )
         except Exception:
             logger.exception("记 skipped 批次失败（群 %s）", gid)
@@ -2766,7 +3625,32 @@ class Feeds:
         ).fetchall()
         up = [str(r["title"]) for r in rows if int(r["up"]) > int(r["down"])]
         down = [str(r["title"]) for r in rows if int(r["down"]) > int(r["up"])]
-        return {"up": up, "down": down}
+        # 自动好评（news_feedback：回复卡片 / 点开原文 / 群里接着聊，加权 ≥2 才算；沉默不算差评）
+        auto: list[str] = []
+        try:
+            from . import news_feedback
+
+            summ = news_feedback.summary(self._store, gid, clock.now(), days=_FEEDBACK_SCAN_DAYS)["items"]
+            good = sorted(((iid, s) for iid, s in summ.items() if s["score"] >= 2.0), key=lambda x: -x[1]["score"])
+            for iid, s in good[:10]:
+                row = self._store.read().execute("SELECT title FROM news_items WHERE id=?", (int(iid),)).fetchone()
+                if row is None or str(row["title"]) in up:
+                    continue
+                why = "、".join(news_feedback.LABELS[k] for k in ("reply", "mention", "click") if s.get(k))
+                auto.append(f"{row['title']}（{why}）")
+        except Exception:
+            logger.debug("读自动反馈失败（群 %s）", gid, exc_info=True)
+        return {"up": up, "down": down, "auto": auto}
+
+    def _taste_line(self, gid: str) -> str:
+        """口味小结一行（taste.py；管理员偏好另有专门一行，这里只带小结本身）；没有 → ""。"""
+        try:
+            from . import taste
+
+            text = taste.text(self._store, gid)
+        except Exception:
+            return ""
+        return f"这个群的口味小结（从群友反馈和最近在聊的话题总结的）：{text}" if text else ""
 
     # ------------------------------------------------------------------
     # 构想
@@ -3110,10 +3994,11 @@ class Feeds:
             if not admin:
                 for it in items:
                     it.pop("keywords", None)
+                    it.pop("src", None)
             else:
                 self._attach_ratings(items)
             rejected_rows = self._store.read().execute(
-                "SELECT id, title, url_key, sources, reject_gate, reject_reason, score"
+                "SELECT id, title, url_key, sources, reject_gate, reject_reason, score, src_query, src_provider"
                 " FROM news_items WHERE batch_id=? AND rejected=1 ORDER BY id ASC",
                 (int(b["id"]),),
             ).fetchall()
@@ -3196,6 +4081,11 @@ class Feeds:
             "gate": str(r["reject_gate"] or ""),
             "reason": str(r["reject_reason"] or ""),
             "avg": float(r["score"] or 0.0),
+            # 这条是哪个搜索词 / 哪家搜索带回来的（两阶段落的；老批次空串）——只管理员（rejected 本就管理员可见）
+            "src": {
+                "query": str(_row_get(r, "src_query", "") or ""),
+                "provider": str(_row_get(r, "src_provider", "") or ""),
+            },
         }
 
     def _news_row_to_view(self, r: Any, now: float) -> dict:
@@ -3286,6 +4176,11 @@ class Feeds:
             "verify": verify_out,
             "angle": str(r["angle"] or ""),
             "bridge": str(_row_get(r, "bridge", "") or ""),
+            # 这条是哪个搜索词 / 哪家搜索带回来的（两阶段落的；老批次空串）——只给管理员看
+            "src": {
+                "query": str(_row_get(r, "src_query", "") or ""),
+                "provider": str(_row_get(r, "src_provider", "") or ""),
+            },
             "status": {
                 "kind": status_kind,
                 "at": float(r["status_at"]) if r["status_at"] is not None else None,
@@ -3293,6 +4188,8 @@ class Feeds:
                 "expires_ts": float(expires_ts) if expires_ts is not None else None,
             },
             "feedback": {"up": int(r["up"] or 0), "down": int(r["down"] or 0)},
+            # 「后续」：同一件事的新进展（{of_title, new_fact}）；不是后续 → None
+            "followup": _followup_view(_row_get(r, "followup", "")),
         }
 
     def guides_view(self, group_id: str, *, days: int = _GUIDES_VIEW_DAYS, admin: bool = False) -> list[dict]:

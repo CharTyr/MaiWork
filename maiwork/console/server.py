@@ -1823,6 +1823,93 @@ class ConsoleServer:
         app.router.add_route("PUT", "/api/extensions/search", self._write(_search_binding_put))
         app.router.add_route("DELETE", "/api/extensions/search", self._write(_search_binding_delete))
 
+        # ---------- 预设搜索服务（search_presets / search_presets_web；只管理员；密钥只进不出） ----------
+
+        def _presets_payload() -> dict:
+            from .. import search_presets_web
+
+            return {"presets": search_presets_web.presets_view(svc.get_settings(), svc.store, _runtime_of)}
+
+        @get("/api/extensions/presets")
+        async def _presets_get(request: web.Request) -> web.Response:
+            """六家预设搜索服务 + 各自状态：{presets: [{id, label, free, free_note, key_page_url, docs_url,
+            logo, entry, source, enabled, ok, key_set}]}。"""
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            try:
+                return web.json_response(_presets_payload())
+            except Exception:
+                logger.exception("拼预设搜索服务清单出错")
+                return _err(500, "读预设搜索服务出错了")
+
+        async def _preset_activate(request: web.Request) -> web.Response:
+            """POST /api/extensions/presets/{id}：打开这家 / 换密钥（{key}）/ 改回免密钥（{clear_key: true}）。
+            还没有搜索绑定时顺手设成主搜索。返回 {presets, name, bound, label}。"""
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            not_ready = _ext_ready()
+            if not_ready is not None:
+                return not_ready
+            body = await _json_body(request)
+            if body is None:
+                body = {}
+            if not isinstance(body, dict):
+                return _err(400, "请求体要写成 {\"key\": 可选密钥, \"clear_key\": 可选}")
+            from .. import search_presets_web
+            from ..search_presets import PRESETS
+
+            pid = str(request.match_info["id"])
+            key = body.get("key")
+            if key is not None and not isinstance(key, str):
+                return _err(400, "key 要是字符串")
+            try:
+                name, bound = search_presets_web.activate(
+                    svc.store, svc.get_settings(), pid, key=key, clear_key=bool(body.get("clear_key"))
+                )
+            except KeyError:
+                return _err(404, "没有这个预设搜索服务")
+            except ValueError as e:
+                return _err(400, str(e))
+            try:
+                await svc.reload_mcp(name)  # 立即连接一次（换了地址 / 密钥也要重连）
+            except Exception:
+                logger.exception("打开预设搜索服务 %s 后连接出错", pid)
+            out = _presets_payload()
+            out.update({"name": name, "bound": bound, "label": PRESETS[pid].label})
+            return web.json_response(out)
+
+        async def _presets_setup(request: web.Request) -> web.Response:
+            """POST /api/extensions/presets-setup：首次引导一次配好 {items: [{id, key?}]}；
+            第一家当主搜索，其余当备用。返回 {presets, search}。"""
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            not_ready = _ext_ready()
+            if not_ready is not None:
+                return not_ready
+            body = await _json_body(request)
+            if not isinstance(body, dict):
+                return _err(400, "请求体要写成 {\"items\": [{\"id\": 预设, \"key\": 可选密钥}]}")
+            from .. import search_binding, search_presets_web
+
+            try:
+                names = search_presets_web.setup(svc.store, svc.get_settings(), body.get("items"))
+            except ValueError as e:
+                return _err(400, str(e))
+            for name in names:
+                try:
+                    await svc.reload_mcp(name)
+                except Exception:
+                    logger.exception("引导打开预设搜索服务 %s 后连接出错", name)
+            out = _presets_payload()
+            out["search"] = search_binding.search_view(svc.store, svc.get_settings(), _runtime_of)
+            return web.json_response(out)
+
+        app.router.add_post("/api/extensions/presets/{id}", self._write(_preset_activate))
+        app.router.add_post("/api/extensions/presets-setup", self._write(_presets_setup))
+
         @get("/api/extensions/skills/{name}")
         async def _skill_get(request: web.Request) -> web.Response:
             forbid = self._require_admin(request)
@@ -1973,6 +2060,113 @@ class ConsoleServer:
             text = svc.feeds.set_pref(resolved, str(body.get("text") or ""))
             return web.json_response({"text": text})
 
+        # ---------- 口味小结 / 优质来源（taste.py / source_stats.py；管理员或本群群管理员） ----------
+
+        async def _taste_get(request: web.Request) -> web.Response:
+            resolved = self._resolve_ref(request.match_info["gid"])
+            if resolved is None:
+                return _err(404, "没有这个群")
+            forbid = self._require_group_admin(request, resolved)
+            if forbid is not None:
+                return forbid
+            from .. import taste
+
+            return web.json_response(taste.view(svc.store, resolved))
+
+        async def _taste_put(request: web.Request) -> web.Response:
+            """管理员手改口味小结（空 = 清掉，恢复自动）；7 天内自动总结不覆盖。"""
+            resolved = self._resolve_ref(request.match_info["gid"])
+            if resolved is None:
+                return _err(404, "没有这个群")
+            forbid = self._require_group_admin(request, resolved)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from .. import taste
+
+            text = str(body.get("text") or "")
+            scrubbed = svc.feeds._scrub_item_text(resolved, text) if (svc.feeds is not None and text) else text
+            if text and scrubbed is None:
+                return _err(400, "这段话里有关注成员的个人信息，口味小结只写群整体的喜好")
+            return web.json_response(taste.set_manual(svc.store, resolved, text, clock.now()))
+
+        def _blocked_for(gid: str) -> list[str]:
+            try:
+                settings = svc.get_settings()
+                from ..feeds import blocked_domains_effective
+
+                return blocked_domains_effective(svc.store, tuple(getattr(settings.feeds, "blocked_domains", ()) or ()))
+            except Exception:
+                return []
+
+        async def _trusted_get(request: web.Request) -> web.Response:
+            resolved = self._resolve_ref(request.match_info["gid"])
+            if resolved is None:
+                return _err(404, "没有这个群")
+            forbid = self._require_group_admin(request, resolved)
+            if forbid is not None:
+                return forbid
+            from .. import source_stats
+
+            return web.json_response(source_stats.view(svc.store, resolved, clock.now(), blocked=_blocked_for(resolved)))
+
+        async def _trusted_post(request: web.Request) -> web.Response:
+            """{domain, removed: true|false}：把某个域名移出 / 放回本群优质来源。"""
+            resolved = self._resolve_ref(request.match_info["gid"])
+            if resolved is None:
+                return _err(404, "没有这个群")
+            forbid = self._require_group_admin(request, resolved)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from .. import source_stats
+
+            try:
+                source_stats.set_removed(svc.store, resolved, str(body.get("domain") or ""), bool(body.get("removed")))
+            except ValueError as e:
+                return _err(400, str(e))
+            return web.json_response(source_stats.view(svc.store, resolved, clock.now(), blocked=_blocked_for(resolved)))
+
+        async def _go(request: web.Request) -> web.Response:
+            """GET /go/{item_id}?c=浏览器标识：网页上点开资讯原文——记一次点击（news_feedback），
+            再 302 到库里存的原链接（不接受外来链接，防开放跳转）。只能点自己看得到的群的条目。"""
+            ident = self._identify(request)
+            if ident.role == "none":
+                # 群友是用群链接看的：链接跳转带不了请求头，群链接码放在 g 参数里
+                tok_gid = views.group_id_by_token(svc, request.query.get("g", ""))
+                if tok_gid is not None:
+                    ident = Identity(role="member", group_id=tok_gid)
+            if ident.role not in ("admin", "member", "group_admin"):
+                return _err(401, "先登录管理员，或用群链接打开")
+            try:
+                item_id = int(request.match_info["id"])
+            except (ValueError, TypeError):
+                return _err(404, "这条资讯不存在")
+            gid = _group_of("news", item_id)
+            if gid is None:
+                return _err(404, "这条资讯不存在")
+            if _wrong_group(ident, gid):
+                return _err(403, "只能看自己群的内容")
+            personal_deny = _personal_deny(ident, "news", item_id)
+            if personal_deny is not None:
+                return personal_deny
+            from .. import news_feedback
+
+            url = news_feedback.click(svc.store, gid, item_id, client=request.query.get("c", ""), now=clock.now())
+            if not url:
+                return _err(404, "这条资讯不存在")
+            raise web.HTTPFound(url)
+
+        app.router.add_get("/go/{id}", _go)
+        app.router.add_get("/api/groups/{gid}/taste", _taste_get)
+        app.router.add_route("PUT", "/api/groups/{gid}/taste", self._write(_taste_put))
+        app.router.add_get("/api/groups/{gid}/trusted-sources", _trusted_get)
+        app.router.add_post("/api/groups/{gid}/trusted-sources", self._write(_trusted_post))
+
         def _card_push_view(gid: str) -> dict:
             from .. import card_push as _cp
 
@@ -2041,6 +2235,38 @@ class ConsoleServer:
                 return _err(409, str(out.get("reason") or "现在开不了"))
             return web.json_response(out)
 
+        async def _feeds_two_phase_get(request: web.Request) -> web.Response:
+            """两阶段找资讯（「广撒网再挑着打开」）的每群开关：GET 管理员 / 本群群管理员。"""
+            resolved = self._resolve_ref(request.match_info["gid"])
+            if resolved is None:
+                return _err(404, "没有这个群")
+            forbid = self._require_group_admin(request, resolved)
+            if forbid is not None:
+                return forbid
+            not_ready = _m2_ready(svc.feeds)
+            if not_ready is not None:
+                return not_ready
+            return web.json_response({"on": svc.feeds.two_phase_on(resolved)})
+
+        async def _feeds_two_phase_put(request: web.Request) -> web.Response:
+            """两阶段找资讯开关：PUT 管理员或本群群管理员。body {"on": true/false} → {"on": bool}。"""
+            resolved = self._resolve_ref(request.match_info["gid"])
+            if resolved is None:
+                return _err(404, "没有这个群")
+            forbid = self._require_group_admin(request, resolved)
+            if forbid is not None:
+                return forbid
+            not_ready = _m2_ready(svc.feeds)
+            if not_ready is not None:
+                return not_ready
+            body = await _json_body(request)
+            if not isinstance(body, dict):
+                return _err(400, "请求体不是 JSON")
+            on = svc.feeds.set_two_phase(resolved, bool(body.get("on")))
+            return web.json_response({"on": on})
+
+        app.router.add_get("/api/groups/{gid}/feeds-two-phase", _feeds_two_phase_get)
+        app.router.add_route("PUT", "/api/groups/{gid}/feeds-two-phase", self._write(_feeds_two_phase_put))
         app.router.add_get("/api/groups/{gid}/feeds-pref", _feeds_pref_get)
         app.router.add_get("/api/groups/{gid}/card-push", _card_push_get)
         app.router.add_route("PUT", "/api/groups/{gid}/card-push", self._write(_card_push_put))

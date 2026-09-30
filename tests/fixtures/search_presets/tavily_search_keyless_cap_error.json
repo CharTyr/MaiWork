@@ -1,0 +1,40 @@
+{
+ "content": [
+  {
+   "text": "{\"code\": \"monthly_cap_reached_bonus_eligible\", \"message\": \"You reached the monthly keyless Tavily limit. To continue immediately, pay via x402 agentic payment (https://docs.tavily.com/documentation/machine-payments/x402) or sign up at https://tavily.com for a Tavily API key. You can also earn 36 more keyless credits by answering 2 short questions about this agent — POST your answers to /keyless/bonus.\", \"next_actions\": [{\"type\": \"agentic_payment\", \"resource\": \"https://docs.tavily.com/documentation/machine-payments/x402\", \"instruction\": \"Pay for this request using the x402 agentic payment protocol to continue immediately.\"}, {\"type\": \"signup\", \"resource\": \"https://tavily.com\", \"instruction\": \"Ask the user to sign up at tavily.com and retry with the API key in the Authorization header as: Bearer tvly-YOUR_API_KEY\"}, {\"type\": \"bonus_credits\", \"resource\": \"/keyless/bonus\", \"instruction\": \"Earn 36 more keyless credits by POSTing to /keyless/bonus. Answer each question briefly (1-2 sentences). Body shape: {\\\"answers\\\": [\\\"<answer to question 1>\\\", \\\"<answer to question 2>\\\"]} (ordered to match the 'questions' list).\", \"params\": {\"questions\": [\"What are you building?\", \"What domain or use case are you evaluating?\"], \"credits_on_completion\": 36}}], \"window\": \"month\", \"retry_after_seconds\": 555, \"auth_mode\": \"keyless\"}",
+   "type": "text"
+  }
+ ],
+ "isError": false,
+ "structuredContent": {
+  "code": "monthly_cap_reached_bonus_eligible",
+  "message": "You reached the monthly keyless Tavily limit. To continue immediately, pay via x402 agentic payment (https://docs.tavily.com/documentation/machine-payments/x402) or sign up at https://tavily.com for a Tavily API key. You can also earn 36 more keyless credits by answering 2 short questions about this agent — POST your answers to /keyless/bonus.",
+  "next_actions": [
+   {
+    "type": "agentic_payment",
+    "resource": "https://docs.tavily.com/documentation/machine-payments/x402",
+    "instruction": "Pay for this request using the x402 agentic payment protocol to continue immediately."
+   },
+   {
+    "type": "signup",
+    "resource": "https://tavily.com",
+    "instruction": "Ask the user to sign up at tavily.com and retry with the API key in the Authorization header as: Bearer tvly-YOUR_API_KEY"
+   },
+   {
+    "type": "bonus_credits",
+    "resource": "/keyless/bonus",
+    "instruction": "Earn 36 more keyless credits by POSTing to /keyless/bonus. Answer each question briefly (1-2 sentences). Body shape: {\"answers\": [\"<answer to question 1>\", \"<answer to question 2>\"]} (ordered to match the 'questions' list).",
+    "params": {
+     "questions": [
+      "What are you building?",
+      "What domain or use case are you evaluating?"
+     ],
+     "credits_on_completion": 36
+    }
+   }
+  ],
+  "window": "month",
+  "retry_after_seconds": 555,
+  "auth_mode": "keyless"
+ }
+}

@@ -8,7 +8,7 @@ import { render } from "./render.js";
 import { applyHash, loadGroups, loadSettings, loadView } from "./router.js";
 
 // ───────────── 首次安装引导 ─────────────
-// 全屏一张卡片，一步一屏：打招呼 → 模型 → 服务的群 → 可选密钥 → 管理员 → 完成。
+// 全屏一张卡片，一步一屏：打招呼 → 模型 → 服务的群 → 可选密钥 → 联网搜索 → 管理员 → 完成。
 // 每一步「下一步」时保存这一步；任何一步都能「跳过引导」。动画只动 transform / opacity，
 // 换步时正在播的动画会被立刻收尾（连点不会卡住、不会叠在一起）。
 export const ONB_STEPS = [
@@ -16,11 +16,12 @@ export const ONB_STEPS = [
   { id: "models", name: "模型" },
   { id: "groups", name: "群" },
   { id: "keys", name: "可选" },
+  { id: "search", name: "搜索" },
   { id: "admins", name: "管理员" },
   { id: "look", name: "头像" },
   { id: "done", name: "完成" },
 ];
-export const onb = { open: false, i: 0, busy: false, cfg: null, models: null, info: null, done: {}, anims: [] };
+export const onb = { open: false, i: 0, busy: false, cfg: null, models: null, info: null, done: {}, anims: [], presets: null, sxPicked: null };
 const EASE_SPRING = "cubic-bezier(0.34, 1.4, 0.64, 1)";
 
 const onbField = (key) => {
@@ -87,6 +88,7 @@ export function onbPane(id) {
       </div>
       `;
   }
+  if (id === "search") return onbSearchPane();
   if (id === "admins") {
     const f = onbField("approval.admins");
     return `
@@ -124,6 +126,40 @@ export function onbPane(id) {
       ${row(c.search, "联网搜索", c.search ? "开了" : "没开", 3)}
       ${row(c.admins, "管理员", c.admins ? "已填" : "还没填", 4)}
     </ul>`;
+}
+
+// 引导「联网搜索」一步：挑要用的搜索服务（预设，后端 /api/extensions/presets）。
+// 勾上的第一家当主搜索，其余当备用；免费的密钥可填可不填，要密钥的给官网链接。
+function onbSearchPane() {
+  const list = onb.presets || [];
+  if (!onb.sxPicked) {
+    const on = list.filter((p) => p.entry && p.enabled).map((p) => p.id);
+    onb.sxPicked = on.length ? on : list.some((p) => p.id === "keenable") ? ["keenable"] : [];
+  }
+  const rows = list
+    .map((p) => {
+      const on = onb.sxPicked.includes(p.id);
+      const ph = p.key_set ? "已填 · 留空就不改" : p.free ? "可以不填 · 不填就用免费额度" : "粘贴 API 密钥";
+      return `
+      <div class="onb-sx${on ? " on" : ""}" data-id="${esc(p.id)}">
+        <label class="onb-sx-head">
+          <input type="checkbox" class="onb-sx-chk" value="${esc(p.id)}" ${on ? "checked" : ""} data-act="onb-sx-toggle" />
+          <img class="onb-sx-logo" src="${esc(p.logo)}" alt="" />
+          <span class="onb-sx-name"><b>${esc(p.label)}</b><span>${esc(p.free_note || "")}</span></span>
+          ${p.free ? `<span class="ntag ok">免密钥可用</span>` : `<span class="ntag warn">要密钥</span>`}
+        </label>
+        <div class="onb-sx-key login">
+          <input id="onb-sx-key-${esc(p.id)}" type="password" autocomplete="new-password" spellcheck="false" placeholder="${esc(ph)}" />
+          <a href="${esc(p.key_page_url)}" target="_blank" rel="noopener noreferrer">${p.free ? "想要更高额度？去官网拿密钥 ↗" : `还没有密钥？去 ${esc(p.label)} 官网拿 ↗`}</a>
+        </div>
+      </div>`;
+    })
+    .join("");
+  return `
+    <div class="onb-step-ico">${ico("magnifier")}</div>
+    <h1 class="onb-title">联网搜索</h1>
+    <p class="onb-lead">MaiWork 找资讯、干活要上网搜。勾上要用的，第一个当主搜索，其余当备用</p>
+    <div class="onb-sx-list">${list.length ? rows : `<p class="fine">读不到搜索服务清单，先跳过这步，之后在「设置 → 扩展」里打开。</p>`}</div>`;
 }
 
 // 引导「管理员」一步里的各群群管理员（可选）：网页密码 + 群里能批准的人
@@ -174,7 +210,7 @@ function onbShell() {
 function onbFoot() {
   const id = ONB_STEPS[onb.i].id;
   const back = onb.i > 0 && id !== "done" ? `<button class="btn ghost" type="button" data-act="onb-back">上一步</button>` : `<span></span>`;
-  const later = ["keys", "admins", "groups", "look"].includes(id) ? `<button class="btn" type="button" data-act="onb-later">这步先不填</button>` : id === "models" ? `<button class="btn" type="button" data-act="onb-later">稍后再配</button>` : "";
+  const later = ["keys", "search", "admins", "groups", "look"].includes(id) ? `<button class="btn" type="button" data-act="onb-later">这步先不填</button>` : id === "models" ? `<button class="btn" type="button" data-act="onb-later">稍后再配</button>` : "";
   const next = id === "hello" ? "开始配置" : id === "done" ? "进入 MaiWork" : "保存，下一步";
   return `${back}<div class="onb-foot-r">${later}<button class="btn primary" type="button" data-act="onb-next">${next}</button></div>`;
 }
@@ -354,6 +390,19 @@ async function onbSave(id) {
   if (id === "keys") {
     if (v("onb-jev")) patch["jev.api_key"] = v("onb-jev");
   }
+  if (id === "search" && onb.presets) {
+    const picked = (onb.presets || []).filter((p) => (onb.sxPicked || []).includes(p.id));
+    if (!picked.length) return "";
+    const items = [];
+    for (const p of picked) {
+      const key = v(`onb-sx-key-${p.id}`);
+      if (!p.free && !key && !p.key_set) return `${p.label} 要先填 API 密钥（勾上后输入框下方有去官网拿密钥的链接），或者不勾它。`;
+      items.push(key ? { id: p.id, key } : { id: p.id });
+    }
+    const r = await api("POST", "/api/extensions/presets-setup", { items });
+    onb.presets = (r && r.presets) || onb.presets;
+    return "";
+  }
   if (id === "admins" && onb.ga) {
     for (const gid of Object.keys(onb.ga)) {
       const box = $(`onb-ga-${gid}`);
@@ -400,6 +449,13 @@ async function onbGo(delta) {
       )
     );
   }
+  if (ONB_STEPS[to].id === "search" && !onb.presets) {
+    try {
+      onb.presets = ((await api("GET", "/api/extensions/presets")) || {}).presets || [];
+    } catch (_) {
+      onb.presets = [];
+    }
+  }
   if (ONB_STEPS[to].id === "look" && !state.avatarCfg) {
     try {
       state.avatarCfg = await api("GET", "/api/settings/avatar");
@@ -427,6 +483,19 @@ export async function onbAct(el) {
     }
   }
   if (a === "onb-skip") return closeOnboarding("skip");
+  if (a === "onb-sx-toggle") {
+    const pid = el.value;
+    const set = new Set(onb.sxPicked || []);
+    if (el.checked) set.add(pid);
+    else set.delete(pid);
+    // 保持清单顺序（第一个勾上的当主搜索）
+    onb.sxPicked = (onb.presets || []).map((p) => p.id).filter((x) => set.has(x));
+    const row = el.closest(".onb-sx");
+    if (row) row.classList.toggle("on", el.checked);
+    if (el.checked && row) row.scrollIntoView({ block: "nearest", behavior: calm() ? "auto" : "smooth" });
+    if (el.checked && row) setTimeout(() => row.querySelector(".onb-sx-key input") && !matchMedia("(pointer: coarse)").matches && row.querySelector(".onb-sx-key input").focus({ preventScroll: true }), 60);
+    return;
+  }
   if (a === "onb-back") return onbGo(-1);
   if (a === "onb-later") return onbGo(1);
   if (a === "onb-test") {

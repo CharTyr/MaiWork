@@ -1,12 +1,12 @@
 # plugin/CharTyr_MaiWork/maiwork/platforms/
 
-上级地图：[../codemap.md](../codemap.md)。平台差异设计依据：docs/02-设计.md §10、docs/06-宿主接口事实.md「QQ 适配器与群空间接口」。
+上级地图：[../codemap.md](../codemap.md)。平台差异设计依据：[设计文档](<../../../../docs/02-设计.md>) §10、[宿主接口事实](<../../../../docs/06-宿主接口事实.md>)「QQ 适配器与群空间接口」。
 
 ## Responsibility
 
 平台档案层：把「某个平台/协议端的差异」隔离在这一层，核心代码（app/coordinator/tools）只跟平台无关的接口打交道。目前只有一个平台档案：
 
-- `__init__.py` — 只有一行 docstring，声明这层是各平台/协议端差异的安放处（docs/02-设计.md §10）。
+- `__init__.py` — 只有一行 docstring，声明这层是各平台/协议端差异的安放处（[设计文档](<../../../../docs/02-设计.md>) §10）。
 - `qq_onebot.py` — QQ / NapCat-OneBot 平台档案，唯一实现：`GroupSpace` 类（群文件管理、群公告、群相册）。`GroupSpace` 被 `app.py` 构造、被 `tools_groupspace.py` 包成主模型工具、被 `coordinator.py` 在交付前的小回合里用，被网页 GroupView / 健康检查读能力。
 
 ## Design
@@ -61,4 +61,4 @@
 - `api.call` 各接口的参数名（`ARG_FOLDER` 与 `ARG_FOLDER_ID` 之别、相册上传的 `image` vs `file`）、建文件夹返回体字段名（代码试 `folder_id/folderId/folder/id` 四个）、相册列表返回结构——均按 NapCat 通行写法写成常量并标〔待实测〕，升级 v1.0.1 后需实测核对。
 - `refresh_role()`（「网页 GroupView 在拿缓存前先调一次」）在仓库内**没有调用方**（仅有定义和 `capabilities` docstring 里的一处提及）：要么前端尚未接，要么属遗留接口，待确认。
 - `role_of()` 里有一行不可达代码（`return self._role_cached(group_id)` 之后的 `return hit[1] ...`，hit 未定义，永不会执行）——无害但属死代码。
-- 适配器版本阈值（v1.0.1「44 个 API」）来自文件 docstring 引用的 docs/06，未在本仓库代码中验证。
+- 适配器版本阈值（v1.0.1「44 个 API」）来自文件 docstring 引用的[宿主接口事实](<../../../../docs/06-宿主接口事实.md>)，未在本仓库代码中验证。

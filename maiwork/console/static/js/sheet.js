@@ -65,11 +65,11 @@ function editSheet() {
       <button class="btn primary wide" type="submit">保存</button>
       ${e.password_set ? `<button class="btn wide" type="button" data-act="ga-clear" style="margin-top:10px">清掉网页密码</button>` : ""}
     </form>`;
-  const title = e.kind === "focus" ? "加一个关注成员" : e.kind === "pref" ? "这个群想看什么（可选）" : e.id ? "改这一条" : `加到「${(CATS.find((c) => c[0] === e.cat) || [, ""])[1]}」`;
+  const title = e.kind === "focus" ? "加一个关注成员" : e.kind === "pref" ? "这个群想看什么（可选）" : e.kind === "taste" ? "这个群的口味小结" : e.id ? "改这一条" : `加到「${(CATS.find((c) => c[0] === e.cat) || [, ""])[1]}」`;
   const isFocus = e.kind === "focus";
   return `
     <h1 class="h-page">${esc(title)}</h1>
-    <p class="h-meta sheet-lead">${isFocus ? "个人画像只有管理员看得到" : e.kind === "pref" ? "比如「多找自部署和开源硬件的，少一点手机评测」" : "改过的条目 MaiWork 不会再动"}</p>
+    <p class="h-meta sheet-lead">${isFocus ? "个人画像只有管理员看得到" : e.kind === "pref" ? "比如「多找自部署和开源硬件的，少一点手机评测」" : e.kind === "taste" ? "MaiWork 每天从群友的反馈里自动总结；你改过的 7 天内不会被覆盖，清空就恢复自动" : "改过的条目 MaiWork 不会再动"}</p>
     <form id="edit" class="login" autocomplete="off">
       ${
         isFocus

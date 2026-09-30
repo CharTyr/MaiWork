@@ -845,7 +845,7 @@ def test_news_view_only_accepted_news_with_new_fields(tmp_path) -> None:
     rejected = admin_batch["rejected"]
     assert len(rejected) == 1
     r0 = rejected[0]
-    assert set(r0.keys()) == {"id", "title", "url", "site", "gate", "reason", "avg"}
+    assert set(r0.keys()) == {"id", "title", "url", "site", "gate", "reason", "avg", "src"}
     assert r0["title"] == "被筛掉的"
     assert r0["gate"] == "hard"
     assert r0["reason"] == "垃圾：标题党"

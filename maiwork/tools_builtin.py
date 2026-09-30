@@ -417,6 +417,10 @@ def final_url_note(url: str) -> str:
 # ----------------------------------------------------------------------
 
 
+_NEWS_SEARCH_MARKS = ("feeds-collect:", "feeds-discover:")  # 找资讯子 agent 的 task_id 前缀
+_NEWS_DEFAULT_DAYS = 7
+
+
 def register_builtin(
     tools: Tools,
     *,
@@ -441,14 +445,39 @@ def register_builtin(
             days_i = int(days) if days is not None else None
         except (TypeError, ValueError):
             days_i = None
+        # 找资讯的子 agent 没填 days → 程序补「最近 7 天」（2026-09-30：时间条件写在提示词里会被打折，
+        # 改由代码兜底；要找文章它会显式填 180）。其他任务不动。
+        if days_i is None and str(ctx.task_id or "").startswith(_NEWS_SEARCH_MARKS):
+            days_i = _NEWS_DEFAULT_DAYS
         try:
             limit_i = max(1, min(20, int(args.get("limit") or 8)))
         except (TypeError, ValueError):
             limit_i = 8
+        site_s = str(args.get("site") or "").strip()
+        news_b = bool(args.get("news") or False)
         try:
-            results = await search.search(query, limit=limit_i, days=days_i)
+            # site/news 只在搜索家被预设（search_presets）认出时生效；别家忽略不报错
+            results = await search.search(query, limit=limit_i, days=days_i, site=site_s, news=news_b)
         except Exception as e:  # SearchUnavailable / SearchError 等，message 已去密钥
             return ToolResult(ok=False, output="", error=f"搜索失败：{e}")
+        # 撒网登记簿（两阶段找资讯）：这个 task_id 有开着的 run → 结果顺手记一份。
+        # focus 参数只有撒网时用（关注点编号）；别的上下文传了也收下但不用。
+        focus_i: int | None = None
+        try:
+            focus_i = int(args.get("focus")) if args.get("focus") is not None else None
+        except (TypeError, ValueError):
+            focus_i = None
+        if str(ctx.task_id or "").startswith("feeds-discover:"):
+            try:
+                from . import discovery
+
+                discovery.record(
+                    str(ctx.task_id or ""), query=query, focus=focus_i,
+                    provider="",  # 每条结果自带 provider（search.py 标的实际出结果那家）
+                    results=results or [],
+                )
+            except Exception:
+                logger.debug("撒网登记失败（%s）", ctx.task_id, exc_info=True)
         if not results:
             return ToolResult(ok=True, output="没搜到相关结果", data=[])
         lines: list[str] = []
@@ -594,6 +623,9 @@ def register_builtin(
                     "query": {"type": "string", "description": "搜索词，具体一点"},
                     "days": {"type": "integer", "description": "只看最近多少天的（可选）"},
                     "limit": {"type": "integer", "description": "最多几条，默认 8，上限 20"},
+                    "site": {"type": "string", "description": "只搜这个域名（可选，如 \"nintendo.com\"）"},
+                    "news": {"type": "boolean", "description": "想要新闻类结果（可选，默认否）"},
+                    "focus": {"type": "integer", "description": "撒网任务专用：这条搜索属于第几个关注点（别的任务不用填）"},
                 },
                 "required": ["query"],
             },

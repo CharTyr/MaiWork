@@ -164,7 +164,7 @@ class TestSearchApi:
         r = await env.client.put("/api/extensions/search", json={"mcp": "tavily", "tool": "tavily-search", "extract_tool": "tavily-extract"})
         assert r.status == 200, await r.text()
         data = await r.json()
-        assert data["binding"] == {"mcp": "tavily", "tool": "tavily-search", "extract_mcp": "tavily", "extract_tool": "tavily-extract"}
+        assert data["binding"] == {"mcp": "tavily", "tool": "tavily-search", "extract_mcp": "tavily", "extract_tool": "tavily-extract", "fallback": [], "broad": []}
         assert data["status"]["ok"] is True
         assert "tavily-search" in data["status"]["text"]
 

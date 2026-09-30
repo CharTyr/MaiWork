@@ -247,7 +247,7 @@ class TestWritePosts:
         assert got == 1
 
         # 写帖子是第三次主模型调用；prompt 里带原话、人设、偏好
-        assert len(models.calls) == 3
+        assert len(models.calls) == 4  # 含写完帖子后对原文自检
         prompt = models.calls[2][1][-1]["content"]
         assert "新出的 FPGA 板子要不要上" in prompt  # 群原话（chat_log 搜出来的）
         assert "阿一" in prompt
@@ -540,7 +540,7 @@ class TestViewCurrentNames:
             got = _run(feeds.prepare_news(GID))
         assert got == 1  # 桃子没过第二道
         # 写帖子只调一次
-        assert len(models.calls) == 3
+        assert len(models.calls) == 4  # 含写完帖子后对原文自检
         row = store.read().execute(
             "SELECT body, reason FROM news_items WHERE rejected=0").fetchone()
         assert "开法很轻" in row["body"]
