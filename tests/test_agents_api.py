@@ -115,11 +115,55 @@ class TestGlobalAgentsApi:
     @pytest.mark.asyncio
     async def test_put_profile(self, env) -> None:
         await env.login()
-        r = await env.client.put("/api/agents/news", json={"title": "资讯专员", "enabled": False})
+        r = await env.client.put("/api/agents/news", json={"title": "资讯小队", "enabled": False})
         assert r.status == 200
         data = await r.json()
-        assert data["title"] == "资讯专员"
+        assert data["title"] == "资讯小队"
         assert data["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_get_profiles_default_titles_and_fish_seed(self, env) -> None:
+        await env.login()
+        r = await env.client.get("/api/agents")
+        assert r.status == 200
+        data = await r.json()
+        by_kind = {p["kind"]: p for p in data["profiles"]}
+        assert by_kind["news"]["title"] == "资讯"
+        assert by_kind["idea"]["title"] == "构想"
+        assert by_kind["goal"]["title"] == "目标"
+        assert by_kind["task"]["title"] == "通用任务"
+        for p in data["profiles"]:
+            assert p["fish_seed"] == ""
+
+    @pytest.mark.asyncio
+    async def test_put_fish_seed_roundtrip(self, env) -> None:
+        await env.login()
+        r = await env.client.put("/api/agents/news", json={"fish_seed": "koi-01"})
+        assert r.status == 200
+        data = await r.json()
+        assert data["fish_seed"] == "koi-01"
+        r = await env.client.get("/api/agents")
+        data = await r.json()
+        by_kind = {p["kind"]: p for p in data["profiles"]}
+        assert by_kind["news"]["fish_seed"] == "koi-01"
+        # task 也能改
+        r = await env.client.put("/api/agents/task", json={"fish_seed": "task_fish"})
+        assert r.status == 200
+        data = await r.json()
+        assert data["fish_seed"] == "task_fish"
+        assert data["title"] == "通用任务"  # 其它字段没被动到
+
+    @pytest.mark.asyncio
+    async def test_put_fish_seed_rejects_invalid(self, env) -> None:
+        await env.login()
+        r = await env.client.put("/api/agents/news", json={"fish_seed": "a" * 33})
+        assert r.status == 400
+        r = await env.client.put("/api/agents/news", json={"fish_seed": "a b"})
+        assert r.status == 400
+        r = await env.client.put("/api/agents/news", json={"fish_seed": "鱼"})
+        assert r.status == 400
+        r = await env.client.put("/api/agents/news", json={"fish_seed": 123})
+        assert r.status == 400
 
     @pytest.mark.asyncio
     async def test_put_rejects_unknown_field(self, env) -> None:

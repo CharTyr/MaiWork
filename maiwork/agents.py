@@ -69,7 +69,15 @@ _HANDOFFS_LIMIT_DEFAULT = 20
 _HANDOFFS_LIMIT_HARD = 50
 _API_LIST_DATA_MAX = 1000       # 列表/详情里的 data 截断到这个量级（不进 raw）
 
-_PROFILE_FIELDS = ("title", "instructions", "skills", "enabled")  # 网页可改；tools 不行
+_PROFILE_FIELDS = ("title", "instructions", "skills", "enabled", "fish_seed")  # 网页可改；tools 不行
+
+_FISH_SEED_MAX = 32
+# 旧名迁移表：kv 里存的还是本岗位旧出厂名 → 当默认看待（显示新出厂名）
+_OLD_FACTORY_TITLES: dict[str, str] = {
+    "news": "资讯专员",
+    "idea": "构想专员",
+    "goal": "目标专员",
+}
 
 # 交接单状态机：from_status -> {允许的动作}
 _TERMINAL = frozenset(("accepted", "rejected", "failed", "cancelled"))
@@ -89,27 +97,30 @@ def _default_profiles() -> dict[str, dict[str, Any]]:
     return {
         "news": {
             "kind": "news",
-            "title": "资讯专员",
+            "title": "资讯",
             "instructions": "为群找值得看的资讯：先读画像与关注点，再撒网搜索、逐条打开核对。",
             "skills": ["news-standard", *_SEARCH_SKILLS],
             "enabled": True,
             "tools": list(_SPECIALIST_TOOLS),
+            "fish_seed": "",
         },
         "idea": {
             "kind": "idea",
-            "title": "构想专员",
+            "title": "构想",
             "instructions": "为群出可落地的构想：结合画像与聊天线索做调研，给出依据和下一步。",
             "skills": list(_SEARCH_SKILLS),
             "enabled": True,
             "tools": list(_SPECIALIST_TOOLS),
+            "fish_seed": "",
         },
         "goal": {
             "kind": "goal",
-            "title": "目标专员",
+            "title": "目标",
             "instructions": "为群推进目标：调查进展、核验收依据，绝不自己立目标或改进度。",
             "skills": list(_SEARCH_SKILLS),
             "enabled": True,
             "tools": list(_SPECIALIST_TOOLS),
+            "fish_seed": "",
         },
         "task": {
             "kind": "task",
@@ -118,6 +129,7 @@ def _default_profiles() -> dict[str, dict[str, Any]]:
             "skills": None,   # None = 当前已启用 worker 技能（通才）
             "enabled": True,
             "tools": None,    # None = 本次任务工具名单（仍受 worker role/审批限制）
+            "fish_seed": "",
         },
     }
 
@@ -212,9 +224,14 @@ class Agents:
                 p = merged[kind]
                 # 只叠契约允许的字段；坏值忽略（读路径容错，写路径已严格）
                 if isinstance(entry.get("title"), str) and entry["title"]:
-                    p["title"] = entry["title"][:_TITLE_MAX]
+                    title = entry["title"][:_TITLE_MAX]
+                    # 旧出厂名迁移：存的还是本岗位旧默认名 → 当默认看待（显示新名）
+                    if title != _OLD_FACTORY_TITLES.get(kind):
+                        p["title"] = title
                 if isinstance(entry.get("instructions"), str):
                     p["instructions"] = entry["instructions"][:_INSTRUCTIONS_MAX]
+                if isinstance(entry.get("fish_seed"), str) and _fish_seed_ok(entry["fish_seed"]):
+                    p["fish_seed"] = entry["fish_seed"].strip()
                 if isinstance(entry.get("enabled"), bool):
                     p["enabled"] = entry["enabled"]
                 if "skills" in entry:
@@ -619,7 +636,15 @@ def _copy_profile(p: dict[str, Any]) -> dict[str, Any]:
     out = dict(p)
     out["skills"] = None if p.get("skills") is None else list(p["skills"])
     out["tools"] = None if p.get("tools") is None else list(p["tools"])
+    out["fish_seed"] = str(p.get("fish_seed") or "")
     return out
+
+
+def _fish_seed_ok(value: str) -> bool:
+    """fish_seed 合法：≤32 且仅 [A-Za-z0-9_-]；空串合法（= 用默认小鱼）。"""
+    if len(value) > _FISH_SEED_MAX:
+        return False
+    return all(("A" <= c <= "Z") or ("a" <= c <= "z") or ("0" <= c <= "9") or c in "_-" for c in value)
 
 
 def _validate_profile_patch(patch: dict[str, Any]) -> dict[str, Any]:
@@ -646,6 +671,14 @@ def _validate_profile_patch(patch: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(v, bool):
             raise ValueError("enabled 要是 true/false")
         clean["enabled"] = v
+    if "fish_seed" in patch:
+        v = patch["fish_seed"]
+        if not isinstance(v, str):
+            raise ValueError("fish_seed 要是字符串")
+        v = v.strip()
+        if v and not _fish_seed_ok(v):
+            raise ValueError("fish_seed 只能含字母、数字、_ 和 -，且不超过 32 个字符")
+        clean["fish_seed"] = v
     if "skills" in patch:
         v = patch["skills"]
         if v is None:

@@ -92,3 +92,78 @@ def test_specialist_admin_interface_contract():
     assert 'a.kind === "task"' in text, "通用任务也应有只读交接记录"
     router = (JS / "router.js").read_text(encoding="utf-8")
     assert router.count('state.setSub === "agents"') >= 2
+
+
+def test_specialist_fish_avatar_contract():
+    """专岗小鱼：每个岗位用程序生成的小鱼当头像，「换一条」只改这个岗位的 fish_seed。"""
+    assert (JS / "fish.js").is_file(), "缺小鱼生成模块 fish.js"
+    text = (JS / "settings/agents.js").read_text(encoding="utf-8")
+    assert 'import { fishSvg } from "../fish.js";' in text
+    assert 'data-act="agent-fish-reroll"' in text
+    assert 'case "agent-fish-reroll"' in text
+    assert "{ fish_seed: p.fish_seed }" in text, "换一条只提交 fish_seed，不带别的岗位字段"
+    assert "agent:${kind}:" in text, "种子为空时按岗位名固定一条鱼"
+
+
+_FISH_CHECK = r"""
+import { fishSvg, fishTraits, FISH_SPECIES, FISH_EYES, swimPose, swimGeom } from %s;
+// 游动：像真鱼——鱼头几乎不动、尾巴摆得最大；时快时慢；同一时刻姿态固定；still 关掉
+const swimOf = (seed, o = {}) => { const m = fishSvg(seed, o).match(/data-fish-id="(\d+)"/); return m && swimGeom(m[1]); };
+const bend = { ok: true, bad: [] };
+for (const sp of Object.keys(FISH_SPECIES)) {
+  const g = swimOf("swim-" + sp, { species: sp });
+  if (!g) { bend.ok = false; bend.bad.push(sp + ":无几何"); continue; }
+  const head = g.ts.indexOf(Math.min(...g.ts)), tail = g.ts.indexOf(Math.max(...g.ts));
+  let hMax = 0, tMax = 0, fast = 0, slow = 1e9;
+  for (let t = 0; t < 12; t += 0.05) {
+    const p = swimPose(g, t), nums = p.d.match(/-?[\d.]+/g).map(Number);
+    if (nums.some((v) => !Number.isFinite(v)) || /NaN/.test(p.body + p.head + p.shadow)) { bend.ok = false; bend.bad.push(sp + ":坏数字"); break; }
+    const pt = (i) => i === 0 ? [nums[0], nums[1]] : [nums[2 + (i - 1) * 6 + 4], nums[2 + (i - 1) * 6 + 5]];
+    const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+    hMax = Math.max(hMax, dist(pt(head), g.pts[head])); tMax = Math.max(tMax, dist(pt(tail), g.pts[tail]));
+  }
+  if (!(tMax > 4 * hMax && tMax > 1.5)) { bend.ok = false; bend.bad.push(`${sp}:头${hMax.toFixed(2)} 尾${tMax.toFixed(2)}`); }
+}
+const g0 = swimOf("agent:news:");
+const out = { swim: !!g0 && !fishSvg("a", { still: true }).includes("fish-swim") && !/<rect/.test(fishSvg("a"))
+    && swimPose(g0, 3.3).d === swimPose(g0, 3.3).d && swimPose(g0, 3.3).d !== swimPose(g0, 3.5).d,
+  bend,
+  same: fishSvg("agent:news:") === fishSvg("agent:news:"), differ: 0, bad: [], species: new Set(), eyes: new Set() };
+for (let i = 0; i < 400; i++) {
+  const seed = "s" + i;
+  const svg = fishSvg(seed);
+  if (/NaN|undefined|Infinity/.test(svg) || !svg.includes("<path")) out.bad.push(seed);
+  if (svg !== fishSvg("t" + i)) out.differ++;
+  const t = fishTraits(seed);
+  out.species.add(t.species); out.eyes.add(t.eyes);
+}
+for (const sp of Object.keys(FISH_SPECIES)) for (const e of Object.keys(FISH_EYES)) {
+  const svg = fishSvg("x", { species: sp, eyes: e });
+  if (/NaN|undefined|Infinity/.test(svg)) out.bad.push(sp + "/" + e);
+}
+console.log(JSON.stringify({ ...out, species: out.species.size, eyes: out.eyes.size,
+  nSpecies: Object.keys(FISH_SPECIES).length, nEyes: Object.keys(FISH_EYES).length }));
+"""
+
+
+def test_fish_generator_is_deterministic_and_well_formed(tmp_path):
+    """同一个种子永远画出同一条鱼；换种子会变；每种鱼 × 每种眼神都画得出来、没有坏数字。"""
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("本机没有 node，跑不了小鱼生成检查")
+    script = tmp_path / "check.mjs"
+    script.write_text(_FISH_CHECK % json.dumps((JS / "fish.js").as_uri()), encoding="utf-8")
+    res = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=60)
+    assert res.returncode == 0, res.stderr
+    data = json.loads(res.stdout.strip().splitlines()[-1])
+    assert data["same"], "同一个种子两次画出来不一样"
+    assert data["swim"], "小鱼要默认会游（姿态随时间变、同一时刻固定、still 可关），而且透明底不画底框"
+    assert data["bend"]["ok"], f"游动要像真鱼：鱼头几乎不动、尾巴摆得最大：{data['bend']['bad']}"
+    assert data["differ"] >= 390, f"换种子几乎没变化：{data['differ']}/400"
+    assert not data["bad"], f"这些种子画出了坏图：{data['bad'][:10]}"
+    assert data["species"] == data["nSpecies"], "随机 400 条没覆盖到所有鱼种"
+    assert data["eyes"] == data["nEyes"], "随机 400 条没覆盖到所有眼神"

@@ -1,11 +1,18 @@
 // MaiWork 网页 · 专岗：职责、本群提醒、经主流程验收的经验与交接记录。
 import { state, $ } from "../state.js";
 import { api } from "../api.js";
-import { esc, ico, toast } from "../util.js";
+import { esc, toast } from "../util.js";
 import { repaintSheet } from "../sheet.js";
 import { loading } from "../pages/news.js";
+import { fishSvg } from "../fish.js";
 
-const ICONS = { news: "newspaper", idea: "bulb", goal: "bullseye", task: "tools" };
+
+// 每个岗位一条程序生成的小鱼；fish_seed 为空时按岗位名固定，「换一条」只改这个岗位的种子。
+function fishOf(kind, size) {
+  const p = ((state.agents && state.agents.profiles) || []).find((x) => x.kind === kind);
+  return fishSvg(`agent:${kind}:${(p && p.fish_seed) || ""}`, { size });
+}
+const newSeed = () => Math.random().toString(36).slice(2, 10);
 const LABELS = { queued: "排队", running: "进行中", returned: "已交回，等验收", accepted: "已验收", rejected: "未采用", failed: "没跑成", cancelled: "已取消" };
 const SPECIALISTS = new Set(["news", "idea", "goal"]);
 const PHASES = { discover: "撒网搜索", verify: "打开核验", collect: "收集候选", research: "调查", propose: "目标提案调查", check: "目标进展调查", execute: "任务执行", "idea.research": "构想调查", "goal.propose": "目标提案调查", "goal.check": "目标进展调查", "task.execute": "任务执行" };
@@ -30,11 +37,12 @@ export function agentsPage() {
 
 function profileRow(p) {
   const task = p.kind === "task";
-  return `<div class="set-row">${ico(ICONS[p.kind] || "robot")}<div>
+  const fresh = state.agentFishNew === p.kind;
+  return `<div class="set-row agent-row"><span class="agent-fish${fresh ? " is-new" : ""}" data-fish="${esc(p.kind)}">${fishOf(p.kind, 48)}</span><div>
     <div class="set-name">${esc(p.title)}${task ? `<span class="tag">通用执行</span>` : ""}</div>
     <div class="set-text">${esc(p.instructions || "")}</div>
     <div class="set-text ext-st"><span class="dot ${p.enabled !== false ? "ok" : ""}"></span>${task ? "按本次批准范围执行，不积累跨任务记忆" : p.enabled !== false ? "已启用 · 沿用现有时段和事件触发" : "已停用"}</div>
-    </div>${task ? "" : `<button class="btn small" data-act="agent-profile-edit" data-kind="${esc(p.kind)}">改职责</button>`}</div>`;
+    </div><div class="agent-row-acts"><button class="btn small ghost" data-act="agent-fish-reroll" data-kind="${esc(p.kind)}" title="给这个岗位换一条小鱼">换一条</button>${task ? "" : `<button class="btn small" data-act="agent-profile-edit" data-kind="${esc(p.kind)}">改职责</button>`}</div></div>`;
 }
 
 function profileForm(p) {
@@ -42,7 +50,7 @@ function profileForm(p) {
   const catalog = state.agentSkills || [];
   const names = [...new Set([...catalog.map((k) => k.name), ...selected])];
   return `<div class="login ext-form">
-    <div class="ext-form-h">${ico(ICONS[p.kind] || "robot")}改 ${esc(p.title)}</div>
+    <div class="ext-form-h"><span class="agent-fish sm">${fishOf(p.kind, 28)}</span>改 ${esc(p.title)}</div>
     <label for="agent-title">岗位名称</label><input id="agent-title" maxlength="40" value="${esc(p.title)}" />
     <label for="agent-instructions">职责和工作要求</label><textarea id="agent-instructions" rows="6" maxlength="3000">${esc(p.instructions || "")}</textarea>
     <label class="chk"><input id="agent-enabled" type="checkbox"${p.enabled !== false ? " checked" : ""} />启用这个专岗</label>
@@ -59,13 +67,13 @@ function memorySection(a) {
   const learned = a.learned || [];
   const handoffs = a.recent_handoffs || [];
   if (a.kind === "task") return `<section class="agent-journal">
-    <h3 class="set-name">${ico("tools")}${esc(a.title)}</h3>
+    <h3 class="set-name"><span class="agent-fish sm">${fishOf(a.kind, 30)}</span>${esc(a.title)}</h3>
     <p class="fine">只记录本次任务的交接与验收，不积累跨任务经验。</p>
     <details><summary>最近的交接 · ${handoffs.length}</summary>${handoffs.map(handoffEntry).join("") || `<p class="fine">还没有交接记录。获批任务开始执行后会显示在这里。</p>`}</details>
   </section>`;
   const hint = { news: "例如：优先看有原始资料的开发访谈，不追充值活动。", idea: "例如：先提一个周末能做出样品的点子。", goal: "例如：有新证据才更新进展，缺资源时先问。" }[a.kind] || "写一句本群工作要求";
   return `<section class="agent-journal">
-    <h3 class="set-name">${ico(ICONS[a.kind] || "robot")}${esc(a.title)}</h3>
+    <h3 class="set-name"><span class="agent-fish sm">${fishOf(a.kind, 30)}</span>${esc(a.title)}</h3>
     <label class="fine" for="agent-notes-${esc(a.kind)}">本群提醒</label>
     <textarea id="agent-notes-${esc(a.kind)}" rows="3" maxlength="2000" placeholder="${esc(hint)}">${esc(a.notes || "")}</textarea>
     <div class="actions"><button class="btn small" data-act="agent-memory-save" data-kind="${esc(a.kind)}" data-g="${esc(state.agentGroup)}">保存本群提醒</button></div>
@@ -138,6 +146,27 @@ export async function actAgents(action, el) {
     case "agent-profile-edit": state.agentEdit = el.dataset.kind; repaintSheet(); return true;
     case "agent-profile-cancel": state.agentEdit = null; repaintSheet(); return true;
     case "agent-reload": await loadAgents(); repaintSheet(); return true;
+    case "agent-fish-reroll": {
+      // 先换上新鱼（乐观更新），保存失败再换回来
+      const kind = el.dataset.kind;
+      const p = ((state.agents && state.agents.profiles) || []).find((x) => x.kind === kind);
+      if (!p) return true;
+      const old = p.fish_seed || "";
+      p.fish_seed = newSeed();
+      state.agentFishNew = kind;
+      repaintSheet();
+      setTimeout(() => { if (state.agentFishNew === kind) state.agentFishNew = null; }, 700);
+      try {
+        const saved = await api("PUT", `/api/agents/${encodeURIComponent(kind)}`, { fish_seed: p.fish_seed });
+        if (saved && typeof saved.fish_seed === "string") p.fish_seed = saved.fish_seed;
+      } catch (err) {
+        p.fish_seed = old;
+        state.agentFishNew = null;
+        repaintSheet();
+        toast(err.message, true);
+      }
+      return true;
+    }
     case "agent-profile-save": {
       el.disabled = true;
       try {

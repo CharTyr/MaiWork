@@ -66,10 +66,16 @@ class TestProfiles:
 
     def test_default_shape(self, agents):
         for p in agents.profiles():
-            assert set(p.keys()) == {"kind", "title", "instructions", "skills", "enabled", "tools"}
+            assert set(p.keys()) == {"kind", "title", "instructions", "skills", "enabled", "tools", "fish_seed"}
             assert isinstance(p["title"], str) and p["title"]
             assert isinstance(p["instructions"], str)
+            assert isinstance(p["fish_seed"], str)
             assert p["enabled"] is True
+
+    def test_default_titles_are_short_names(self, agents):
+        """出厂名字：资讯 / 构想 / 目标（task「通用任务」不动）。"""
+        titles = {p["kind"]: p["title"] for p in agents.profiles()}
+        assert titles == {"news": "资讯", "idea": "构想", "goal": "目标", "task": "通用任务"}
 
     def test_news_default_tools_readonly(self, agents):
         tools = agents.profile("news")["tools"]
@@ -113,12 +119,12 @@ class TestProfiles:
 
 class TestUpdateProfile:
     def test_update_title_instructions_enabled(self, agents):
-        out = agents.update_profile("news", {"title": "资讯专员", "instructions": "先看画像", "enabled": False})
-        assert out["title"] == "资讯专员"
+        out = agents.update_profile("news", {"title": "资讯小队", "instructions": "先看画像", "enabled": False})
+        assert out["title"] == "资讯小队"
         assert out["instructions"] == "先看画像"
         assert out["enabled"] is False
         again = agents.profile("news")
-        assert again["title"] == "资讯专员"
+        assert again["title"] == "资讯小队"
         assert again["enabled"] is False
 
     def test_update_skills(self, agents):
@@ -161,6 +167,105 @@ class TestUpdateProfile:
         agents.update_profile("task", {"enabled": False})
         p = agents.profile("task")
         assert p["enabled"] is False
+
+
+class TestOldFactoryTitleMigration:
+    """默认名改名迁移：kv 里存的旧出厂名（资讯专员/构想专员/目标专员）当默认看待，
+    显示新出厂名；其他任何自定义名保留。"""
+
+    OLD = {"news": "资讯专员", "idea": "构想专员", "goal": "目标专员"}
+
+    def test_stored_old_factory_title_shows_new_default(self, agents):
+        for kind, old_title in self.OLD.items():
+            agents.update_profile(kind, {"title": old_title})
+        titles = {p["kind"]: p["title"] for p in agents.profiles()}
+        assert titles["news"] == "资讯"
+        assert titles["idea"] == "构想"
+        assert titles["goal"] == "目标"
+        assert titles["task"] == "通用任务"
+
+    def test_custom_title_kept(self, agents):
+        agents.update_profile("news", {"title": "资讯小队"})
+        agents.update_profile("idea", {"title": "点子王"})
+        assert agents.profile("news")["title"] == "资讯小队"
+        assert agents.profile("idea")["title"] == "点子王"
+
+    def test_old_title_only_matches_own_kind(self, agents):
+        """旧出厂名只对本岗位算默认：news 存「构想专员」是自定义名，要保留。"""
+        agents.update_profile("news", {"title": "构想专员"})
+        assert agents.profile("news")["title"] == "构想专员"
+
+    def test_other_fields_still_apply_with_old_title(self, agents):
+        agents.update_profile("news", {"title": "资讯专员", "enabled": False})
+        p = agents.profile("news")
+        assert p["title"] == "资讯"
+        assert p["enabled"] is False
+
+
+class TestFishSeed:
+    """fish_seed：小鱼头像种子。默认 ""；字符串、去空白、允许空、≤32、仅 [A-Za-z0-9_-]。"""
+
+    def test_default_empty(self, agents):
+        for p in agents.profiles():
+            assert p["fish_seed"] == ""
+        assert agents.profile("news")["fish_seed"] == ""
+
+    def test_set_and_read_back_all_kinds(self, agents):
+        for kind in ("news", "idea", "goal", "task"):
+            out = agents.update_profile(kind, {"fish_seed": f"fish_{kind}-1"})
+            assert out["fish_seed"] == f"fish_{kind}-1"
+        for kind in ("news", "idea", "goal", "task"):
+            assert agents.profile(kind)["fish_seed"] == f"fish_{kind}-1"
+
+    def test_strip_and_empty_resets(self, agents):
+        out = agents.update_profile("news", {"fish_seed": "  koi-01  "})
+        assert out["fish_seed"] == "koi-01"
+        back = agents.update_profile("news", {"fish_seed": ""})
+        assert back["fish_seed"] == ""
+        assert agents.profile("news")["fish_seed"] == ""
+
+    def test_max_length_ok(self, agents):
+        out = agents.update_profile("news", {"fish_seed": "a" * 32})
+        assert out["fish_seed"] == "a" * 32
+
+    def test_invalid_rejected(self, agents):
+        with pytest.raises(ValueError):
+            agents.update_profile("news", {"fish_seed": "a" * 33})
+        with pytest.raises(ValueError):
+            agents.update_profile("news", {"fish_seed": "a b"})
+        with pytest.raises(ValueError):
+            agents.update_profile("news", {"fish_seed": "鱼"})
+        with pytest.raises(ValueError):
+            agents.update_profile("news", {"fish_seed": 123})
+
+    def test_invalid_rejected_for_task_too(self, agents):
+        with pytest.raises(ValueError):
+            agents.update_profile("task", {"fish_seed": "a b"})
+        out = agents.update_profile("task", {"fish_seed": "task_fish"})
+        assert out["fish_seed"] == "task_fish"
+
+    def test_bad_stored_value_ignored(self, store, settings):
+        """读路径容错：kv 里坏 fish_seed（非字符串 / 非法字符）按 "" 对待。"""
+        raw = {
+            "news": {"fish_seed": 123},
+            "idea": {"fish_seed": "a b"},
+            "goal": {"fish_seed": "x" * 40},
+            "task": {"fish_seed": "ok_fish"},
+        }
+        with store.tx() as conn:
+            store.kv_set(conn, "agents.profiles", raw)
+        ag = Agents(store, lambda: settings)
+        assert ag.profile("news")["fish_seed"] == ""
+        assert ag.profile("idea")["fish_seed"] == ""
+        assert ag.profile("goal")["fish_seed"] == ""
+        assert ag.profile("task")["fish_seed"] == "ok_fish"
+
+    def test_fish_seed_only_patch_keeps_other_fields(self, agents):
+        agents.update_profile("news", {"title": "资讯小队", "enabled": False})
+        out = agents.update_profile("news", {"fish_seed": "koi"})
+        assert out["fish_seed"] == "koi"
+        assert out["title"] == "资讯小队"
+        assert out["enabled"] is False
 
 
 # ----------------------------------------------------------------------
@@ -297,11 +402,11 @@ class TestMemory:
 
 class TestPrompt:
     def test_prompt_contains_profile_and_memory(self, agents):
-        agents.update_profile("news", {"title": "资讯专员", "instructions": "先看画像再搜"})
+        agents.update_profile("news", {"title": "资讯小队", "instructions": "先看画像再搜"})
         agents.set_notes(G1, "news", "群喜欢硬件")
         agents.remember(G1, "news", "上次 AI 新闻反响好", now=1.0)
         text = agents.prompt(G1, "news")
-        assert "资讯专员" in text
+        assert "资讯小队" in text
         assert "先看画像再搜" in text
         assert "群喜欢硬件" in text
         assert "上次 AI 新闻反响好" in text
