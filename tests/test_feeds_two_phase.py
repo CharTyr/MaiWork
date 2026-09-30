@@ -431,7 +431,7 @@ def test_prefilter_drops_stored_blocked_old_and_near_dup(tmp_path) -> None:
             )
         candidates = [
             _candidate("https://seen.com/post", title="这个链接已经出过"),              # 撞已入库链接
-            _candidate("https://bad.example/news", title="屏蔽来源的"),                   # 屏蔽域名
+            _candidate("https://bad.example/news/1", title="屏蔽来源的"),                   # 屏蔽域名
             _candidate("https://old.com/1", title="太旧的", published=NOW - 200 * 86400),  # 超 180 天
             _candidate("https://fresh.com/1", title="量子芯片全新架构发布", published=NOW - 100),
             _candidate("https://fresh.com/2", title="量子芯片全新架构发布", published=NOW - 100),  # 标题和候选撞
@@ -725,3 +725,69 @@ async def test_two_phase_api_member_403_anon_401(env) -> None:
     # 群友 GET 也读不到（开关是管理员的事）
     r = await env.client.get(f"/api/groups/{G1}/feeds-two-phase", headers={"X-MW-Group": token})
     assert r.status == 403
+
+
+# ----------------------------------------------------------------------
+# 2026-09-30 线上第一批实测后的修正
+# ----------------------------------------------------------------------
+
+
+def test_prefilter_drops_homepages_and_listing_pages(tmp_path) -> None:
+    """网站首页 / 栏目页 / 标签页不是一篇内容，挑了也打不开有用的东西（线上实测挑中了 nintendolife.com 首页）。"""
+    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path)
+    candidates = [
+        _candidate("http://nintendolife.com", title="Nintendo Life"),
+        _candidate("https://example.com/", title="首页"),
+        _candidate("https://example.com/news/", title="新闻栏目"),
+        _candidate("https://example.com/tag/switch-2", title="标签页"),
+        _candidate("https://example.com/category/games/", title="分类页"),
+        _candidate("https://example.com/news/2026/09/switch-update", title="真正的一篇"),
+    ]
+    with _TimePatch():
+        kept, drops, _ = feeds._prefilter(GID, settings, candidates)
+    assert [c["url"] for c in kept] == ["https://example.com/news/2026/09/switch-update"]
+    assert all("首页" in d[1] or "栏目" in d[1] for d in drops)
+
+
+def test_pick_prompt_asks_for_source_quality(tmp_path) -> None:
+    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path)
+    models.reply_queue = [json.dumps({"picks": [{"i": 0, "kind": "news", "hook": "官方公告，群里在等这个"}]}, ensure_ascii=False)]
+    kept = [_candidate("https://www.nintendo.com/news/2026/update", title="官方更新说明")]
+    _run(feeds._pick(GID, [{"query": "Switch 2 更新"}], kept))
+    prompt = models.calls[-1][1][0]["content"]
+    for word in ("SEO", "采购", "聚合", "首页", "nintendo.com/news/2026/update"):
+        assert word in prompt, word
+
+
+def test_funnel_counts_focus_and_providers_without_floor_search(tmp_path) -> None:
+    """没有可用的 search 对象（保底补搜跳过）时，漏斗的「各个关注点」「各家搜索服务」也要从撒网结果里数出来。"""
+    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path)
+    feeds._search = None
+    cands = [_candidate(f"https://a.com/{i}", focus=1, query="q1", provider="keenable") for i in range(3)]
+    cands += [_candidate(f"https://b.com/{i}", focus=2, query="q2", provider="exa") for i in range(2)]
+    funnel: dict = {"queries": 0, "providers": {}, "per_focus": []}
+    added = _run(feeds._floor_searches(GID, [{"query": "方向一"}, {"query": "方向二"}], cands, funnel))
+    assert added == []
+    assert funnel["providers"] == {"keenable": 3, "exa": 2}
+    assert [(x["query"], x["queries"], x["cands"]) for x in funnel["per_focus"]] == [("方向一", 1, 3), ("方向二", 1, 2)]
+
+
+@pytest.mark.asyncio
+async def test_app_feeds_gets_search(tmp_path) -> None:
+    """线上实测：app 建 Feeds 时没把 Search 传进去，保底补搜和「搜索没配好就跳过」都没生效。"""
+    from test_app import _app
+
+    app = _app(tmp_path)
+    await app.start()
+    try:
+        assert app.search is not None
+        assert app.feeds is not None and app.feeds._search is app.search
+    finally:
+        await app.stop()
+
+
+def test_discover_brief_says_call_web_search_directly(tmp_path) -> None:
+    """线上实测：撒网子 agent 开头 4 次调了不存在的「invoke」工具。brief 里写明直接调 web_search。"""
+    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path)
+    brief = feeds._discover_brief(GID, [{"query": "方向一"}], settings)
+    assert "直接调用 web_search" in brief

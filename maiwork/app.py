@@ -1283,7 +1283,7 @@ class MaiWorkApp:
         try:
             return cls(
                 self.store, self.models, self.workers, self.profiles, self.topics,
-                self.get_settings, host=self.host, on_start=self._on_idea_started,
+                self.get_settings, search=self.search, host=self.host, on_start=self._on_idea_started,
                 verify_runner=self._make_verify_runner(), identity=self.identity,
                 rss_transport=self.rss_transport,
             )

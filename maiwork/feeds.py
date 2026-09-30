@@ -486,6 +486,31 @@ def _site_of(url: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+_LISTING_SEGMENTS = {
+    "news", "blog", "blogs", "articles", "article", "posts", "post", "category", "categories", "tag", "tags",
+    "topic", "topics", "search", "archive", "archives", "latest", "home", "index", "page", "zh", "en", "cn",
+    "zh-cn", "zh-hans", "en-us", "games", "reviews", "guides", "channel", "section", "list",
+}
+
+
+def _is_listing_url(url: str) -> bool:
+    """网站首页、栏目页、标签页（不是一篇具体内容）：路径为空，或只剩栏目词 / 分类·标签后面跟一个名字。"""
+    try:
+        parts = urlsplit(str(url or "").strip())
+    except ValueError:
+        return False
+    segs = [s for s in (parts.path or "").split("/") if s]
+    if segs and segs[-1].lower() in ("index.html", "index.htm", "index.php", "default.aspx"):
+        segs = segs[:-1]
+    if not segs:
+        return not parts.query  # 纯首页（带查询串的可能是文章 ?id=…，放过）
+    low = [s.lower() for s in segs]
+    if all(s in _LISTING_SEGMENTS for s in low):
+        return True
+    # /tag/xxx、/category/xxx、/topic/xxx 这类：分类词后面只跟一个名字
+    return len(low) == 2 and low[0] in ("tag", "tags", "category", "categories", "topic", "topics", "channel", "section")
+
+
 def _title_key(title: Any) -> str:
     """标题去重用的键：去掉所有空白、转小写（「A | B」和「A |B」算同一个）。"""
     return _re.sub(r"\s+", "", str(title or "")).lower()
@@ -2070,7 +2095,8 @@ class Feeds:
             + "\n\n"
             + self._search_guide_section(gid, settings)
             + "要求：\n"
-            f"1. 全程只用 web_search，**不要打开任何页面**（不调 fetch_page，后面有别的同事打开核对）；\n"
+            f"1. 全程只用 web_search，**不要打开任何页面**（不调 fetch_page，后面有别的同事打开核对）；"
+            "直接调用 web_search 这个工具本身，别把它包在别的工具名里（没有 invoke 之类的工具）；\n"
             f"2. 目标是攒到 {DISCOVER_TARGET[0]}–{DISCOVER_TARGET[1]} 条不同的候选链接，越分散越好；\n"
             f"3. 每个关注点至少用 {PER_FOCUS_MIN_QUERIES} 种不同的问法搜过（换角度，不是同义改写）；\n"
             "4. 搜完最后用 submit_result 交回一句话备注（note：撒了多少、每个关注点大概几条）；\n"
@@ -2123,6 +2149,10 @@ class Feeds:
             # 已入库链接（lookback 内 rejected=0）
             if key and key in stored:
                 dropped.append((url, "和最近出过的重复（同一个链接）"))
+                continue
+            # 网站首页 / 栏目页 / 标签页：不是一篇内容（2026-09-30 线上实测挑中过 nintendolife.com 首页）
+            if _is_listing_url(url):
+                dropped.append((url, "网站首页或栏目页，不是一篇内容"))
                 continue
             # 屏蔽 / 自动屏蔽来源
             if site and _domain_blocked(site, blocked):
@@ -2204,8 +2234,9 @@ class Feeds:
             pub = c.get("published")
             date_text = clock.bj(float(pub)).strftime("%Y-%m-%d") if isinstance(pub, (int, float)) and pub else ""
             snippet = str(c.get("snippet") or "").replace("\n", " ")[:200]
+            url_show = str(c.get("url") or "").split("://", 1)[-1][:90]
             cand_lines.append(
-                f"[{idx}] {c.get('title') or ''} —— {c.get('site') or ''}"
+                f"[{idx}] {c.get('title') or ''} —— {url_show}"
                 + (f"（{date_text}）" if date_text else "")
                 + f"\n    摘要：{snippet}\n    方向：{c.get('focus') if c.get('focus') is not None else '无'}"
             )
@@ -2216,8 +2247,10 @@ class Feeds:
             + f"\n\n候选共 {len(kept)} 条：\n" + "\n".join(cand_lines)
             + f"\n\n挑 {FETCH_PICK[0]}–{FETCH_PICK[1]} 条，只回 JSON："
             + '{"picks": [{"i": 候选编号, "kind": "news|guide", "hook": "一句话：只看摘要，为什么值得打开"}]}'
-            + "。尽量每个关注点至少挑一条（实在没有就算了）；一手来源（官方、原文）优先；"
-            + "hook 要写具体理由（这条和群有什么关系），写不出来具体理由的别挑。"
+            + "。尽量每个关注点至少挑一条（实在没有就算了）；hook 要写具体理由（这条和群有什么关系），写不出来具体理由的别挑。\n"
+            + "看来源挑，宁可少挑也别挑这些：SEO 内容农场（泛泛的「什么是 / 怎么选 / 十大推荐」、站名像 xxx-digest、xxxgear、"
+            + "xxx-today 这类没名气的站）、电商和采购指南页、转载聚合站、网站首页 / 栏目页 / 标签页、论坛首页。"
+            + "优先：官方新闻室 / 公告 / 发布说明 / GitHub、长期跟这个领域的专业媒体、有真实细节的社区讨论帖。"
         )
         try:
             result = await self._models.chat(
@@ -2474,9 +2507,7 @@ class Feeds:
         返回：新补的候选列表（focus/query/provider 按补的填；并进去重由调用方做）。
         """
         search = self._search
-        if search is None:
-            return []
-        # 先数现有：每个方向被问了几问（queries 去重）、搜到几条
+        # 先数现有：每个方向被问了几问（queries 去重）、搜到几条（没有 search 对象也要数，漏斗要用）
         per_focus_queries: dict[int, set[str]] = {i: set() for i in range(1, len(focus) + 1)}
         per_focus_cands: dict[int, int] = {i: 0 for i in range(1, len(focus) + 1)}
         providers: dict[str, int] = dict(funnel.get("providers") or {})
@@ -2500,6 +2531,10 @@ class Feeds:
                 broad = []
         main_provider = broad[0] if broad else ""
         extras = [x for x in broad if x != main_provider]
+        if search is None:
+            focus_iter: list = []  # 没有 search 对象：不补搜，只把漏斗计数写好
+        else:
+            focus_iter = list(enumerate(focus, 1))
 
         def _need_primary(query: str) -> bool:
             q = str(query or "").lower()
@@ -2533,7 +2568,7 @@ class Feeds:
                 n += 1
             return n
 
-        for i, f in enumerate(focus, 1):
+        for i, f in focus_iter:
             if len(per_focus_queries.get(i, set())) >= PER_FOCUS_MIN_QUERIES and per_focus_cands.get(i, 0) >= PER_FOCUS_MIN_CANDS:
                 continue
             query = str(f.get("query") or "").strip()
