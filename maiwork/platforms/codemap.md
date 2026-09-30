@@ -11,11 +11,12 @@
 
 ## Design
 
-**能力开关模型（接口 × 身份两道闸）。** 线上适配器可能还是旧版（0.8.5，无群文件/公告/相册接口），所以 GroupSpace 不假设接口存在：
+**能力开关模型（平台 × 接口 × 身份三道闸）。** 线上适配器可能还是旧版（0.8.5，无群文件/公告/相册接口），所以 GroupSpace 不假设接口存在：
 
+- 平台闸 `_onebot(gid)`（Telegram 群支持时的并行改动）：`settings.platform_of(gid)` 经 `config.has_onebot` 判定——只有 SnowLuma 接的 **qq** 平台有群文件/公告/相册及成员身份；telegram、qqbot 等平台一律没有。不支持的群 `capabilities*` 直接全 False、`_role` 不查身份返回空串、写路径 `_require` 抛「这个群所在的平台不支持群空间（没有群文件、公告、相册），交付改走网页链接」。
 - 启动时 `probe()` 调 `host.list_apis()`（宿主 `api.list`）拿适配器已开放的 API 名集合，缓存 6 小时（`PROBE_TTL_S`）；探测失败只记日志不抛（不影响启动），且失败也记探测时间，6 小时内不重试，避免宿主未就绪时反复打。
-- 机器人在某群的身份（owner/admin/member）经 `host.bot_qq()` + `host.group_member_role()` 现查，缓存 1 小时（`ROLE_TTL_S`）。
-- 能力键 `CAPABILITY_KEYS = files_list / files_manage / notice_read / notice_send / album_list / album_upload`：各键 = 「适配器接口在名单里」且（管理系还需）「身份 ∈ {owner, admin}」。两种 API 都满足才开放，error message 一律中文，对管理员可读。
+- 机器人在某群的身份（owner/admin/member）经 `host.bot_qq()` + `host.group_member_role()` 现查，缓存 1 小时（`ROLE_TTL_S`）；非 OneBot 平台的群不打听宿主、直接当无身份。
+- 能力键 `CAPABILITY_KEYS = files_list / files_manage / notice_read / notice_send / album_list / album_upload`：各键 = 「平台有 OneBot」且「适配器接口在名单里」且（管理系还需）「身份 ∈ {owner, admin}」。三道闸都满足才开放，error message 一律中文，对管理员可读。
 - 适配器 API 名是模块级常量（`API_*`，如 `adapter.napcat.file.get_group_root_files`）；`api.call` 的参数名（`group_id` / `file_id` 等）也是可配置常量并标〔待实测〕——升到 v1.0.1 后只对 constants，不动逻辑。
 
 **防手滑（只动自己传的）。** 删除/改名/移动只许动机器人自己上传的文件、只删自己建且内容全自有的文件夹：
@@ -34,7 +35,7 @@
 
 **主模型用群空间（coordinator._groupspace_round）**：验收通过、交付前，若 group_space 存在且 `capabilities_async(gid)` 有任一键为真，给主模型开一个至多 `_GROUPSPACE_TOOL_LIMIT = 4` 轮工具调用的小回合；只给该群能力允许的工具（`_GROUPSPACE_TOOL_CAPS` 映射 tool→cap 键）；全 False → 连模型都不叫。小回合出错不影响交付。
 
-**操作三道闸（每条写路径）**：`_require(group, cap)` = 服务群闸 + `[group_space] enabled` 总开关 + 接口在名单（admin 系再查身份）；写操作前再过 `_require_own` / 内容校验。公告特殊：`send_notice` 先经 `announce` 回调（app 接 `outbox.enqueue`，`push_kind="status"`，受推送节制且按群+内容 sha1 去重）在群里说「我要发一条群公告：<前 30 字>」，再调适配器；每群每天上限由 `_notice_limit()`（`[group_space] notice_per_day`，默认 1）按 `group_space.notice_sent` 事件数（北京时间 day_key 比对）控制。
+**操作四道闸（每条写路径）**：`_require(group, cap)` = 服务群闸 + `[group_space] enabled` 总开关 + 平台闸 `_onebot` + 接口在名单（admin 系再查身份）；写操作前再过 `_require_own` / 内容校验。公告特殊：`send_notice` 先经 `announce` 回调（app 接 `outbox.enqueue`，`push_kind="status"`，受推送节制且按群+内容 sha1 去重）在群里说「我要发一条群公告：<前 30 字>」，再调适配器；每群每天上限由 `_notice_limit()`（`[group_space] notice_per_day`，默认 1）按 `group_space.notice_sent` 事件数（北京时间 day_key 比对）控制。
 
 **事件留痕**：每个写操作调 `_write_event(kind, ...)` 写 `events` 表（`entity="group_space"`），kind 形如 `group_space.file_registered / file_deleted / notice_sent / album_uploaded …`。事件写入失败只记日志，不做挂已完成的主操作；公告计数那条走「调用方传当时的 ts」的专用 INSERT 路径，保证每日上限数得准。
 
@@ -46,7 +47,7 @@
 - **outbox.py**：`set_group_file_hook(register_owned)`——群文件上传成功后登记 `group_files_owned`。
 - **tools_groupspace.py**：把 GroupSpace 包成 `group_files_list / group_file_manage(delete/rename/move/mkdir/rmdir) / group_notice_send / group_album_upload` 四个工具，`roles={"main"}`（子 agent 拿不到）；PermissionError 原样返回中文错误给主模型；`group_album_upload` 的 path 经 `tools_admin._check_upload_path` 校验必须在该群工作区内、非符号链接（防路径注入把服务器任意文件传进群相册）。
 - **coordinator.py**：交付前小回合（见 Flow）。
-- **config.py**：`[group_space]` 节（`enabled` 默认 true、`notice_per_day` 默认 1，rules.py 网页可改，上限 5/天）。热更时 app `_reconcile_group_space` 关掉就摘组件、打开就重建并重挂 hook/probe/tools。
+- **config.py**：`[group_space]` 节（`enabled` 默认 true、`notice_per_day` 默认 1，rules.py 网页可改，上限 5/天）。热更时 app `_reconcile_group_space` 关掉就摘组件、打开就重建并重挂 hook/probe/tools。平台判定 `settings.platform_of(gid)` + `has_onebot(platform)`（只有 `qq` 为真），GroupSpace 的平台闸靠它。
 - **store.py**：表 `group_files_owned` / `group_folders_owned`（migration 建），事件表 `events`。
 - **console/views.py**：GroupView（仅管理员）与健康页读取（见 Flow）。
 

@@ -24,7 +24,15 @@ from pathlib import Path
 from typing import Any
 
 from . import clock
-from .skills import BUILTIN_ROOT, _roles_of, parse_front_matter
+from .skills import (
+    BUILTIN_ROOT,
+    KV_SKILLS_DISABLED,
+    _roles_of,
+    _search_preset_for,
+    effective_status,
+    parse_front_matter,
+    set_disabled,
+)
 
 logger = logging.getLogger("maiwork.skills_web")
 
@@ -145,9 +153,20 @@ def _split_body(text: str) -> str:
     return str(text or "")
 
 
-def _stat_item(skill_dir: Path, name: str, text: str, source: str) -> dict[str, Any]:
+def _stat_item(
+    skill_dir: Path,
+    name: str,
+    text: str,
+    source: str,
+    settings: Any = None,
+    store: Any = None,
+) -> dict[str, Any]:
     front = parse_front_matter(text)
     st = os.stat(skill_dir / "SKILL.md")
+    # effective 开关态（manual / service gate）现查；settings/store 没给按全开兜。
+    # 服务闸只给内置那份 search-<preset>（source==builtin 且 preset 认得出）。
+    preset = _search_preset_for(name) if source == "builtin" else None
+    status = effective_status(name, store, settings, search_preset=preset)
     return {
         "name": name,
         "description": str(front.get("description") or ""),
@@ -155,6 +174,9 @@ def _stat_item(skill_dir: Path, name: str, text: str, source: str) -> dict[str, 
         "source": source,
         "size": int(st.st_size),
         "updated_ts": float(st.st_mtime),
+        "enabled": bool(status.get("enabled", True)),
+        "manual_enabled": bool(status.get("manual_enabled", True)),
+        "disabled_reason": str(status.get("disabled_reason") or ""),
     }
 
 
@@ -185,8 +207,9 @@ def _list_files(skill_dir: Path) -> list[str]:
 # ----------------------------------------------------------------------
 
 
-def list_view(data_dir: Path | str, store: Any) -> list[dict[str, Any]]:
-    """GET /api/extensions 的 skills 段：[{name, description, roles, source, size, updated_ts}]。
+def list_view(data_dir: Path | str, store: Any, settings: Any = None) -> list[dict[str, Any]]:
+    """GET /api/extensions 的 skills 段：[{name, description, roles, source, size, updated_ts,
+    enabled, manual_enabled, disabled_reason}]。
 
     每次现读目录（没有缓存，改完下一次就是新的）。
     """
@@ -195,7 +218,7 @@ def list_view(data_dir: Path | str, store: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     builtin = _builtin_names()
     for n in builtin:
-        view = get_view(data_dir, store, n)
+        view = get_view(data_dir, store, n, settings)
         if view is not None:
             view.pop("body", None)
             view.pop("files", None)
@@ -212,15 +235,21 @@ def list_view(data_dir: Path | str, store: Any) -> list[dict[str, Any]]:
             if target.is_symlink() or not target.is_file():
                 continue
             text = target.read_bytes()[: _SIZE_MAX_BYTES + 1].decode("utf-8", errors="replace")
-            out.append(_stat_item(p, p.name, text, "web" if p.name in web else "file"))
+            out.append(_stat_item(p, p.name, text, "web" if p.name in web else "file", settings=settings, store=store))
         except OSError:
             continue
     return out
 
 
-def get_view(data_dir: Path | str, store: Any, name: str) -> dict[str, Any] | None:
-    """GET /api/extensions/skills/{name}：{name, description, roles, body, source, files}；
-    不存在 / 不合法 / 符号链接 → None。"""
+def get_view(
+    data_dir: Path | str,
+    store: Any,
+    name: str,
+    settings: Any = None,
+) -> dict[str, Any] | None:
+    """GET /api/extensions/skills/{name}：{name, description, roles, body, source, files,
+    enabled, manual_enabled, disabled_reason}；
+    不存在 / 不合法 / 符号链接 → None。被停用的也照常返回（管理员要看）。"""
     root = _root(data_dir)
     builtin = _builtin_dir(name)
     try:
@@ -235,7 +264,7 @@ def get_view(data_dir: Path | str, store: Any, name: str) -> dict[str, Any] | No
             return None
         text = target.read_bytes()[: _SIZE_MAX_BYTES + 1].decode("utf-8", errors="replace")
         source = "builtin" if builtin else ("web" if skill_dir.name in set(_web_names(store)) else "file")
-        item = _stat_item(skill_dir, skill_dir.name, text, source)
+        item = _stat_item(skill_dir, skill_dir.name, text, source, settings=settings, store=store)
         item["body"] = _split_body(text)[:_SIZE_MAX_BYTES]
         item["files"] = _list_files(skill_dir)
         return item
@@ -370,6 +399,24 @@ def delete(data_dir: Path | str, store: Any, name: str) -> None:
 
 def _now_ts() -> float:
     return clock.now()
+
+
+# ----------------------------------------------------------------------
+# 开关（POST /api/extensions/skills/{name}/toggle）
+# ----------------------------------------------------------------------
+
+
+def toggle(data_dir: Path | str, store: Any, name: str, enabled: bool) -> None:
+    """网页把 skill 开关拨成 开/关：存 kv["extensions.skills.disabled"] 名单。
+
+    任何来源（builtin / web / file）都能拨——builtin 那份不改文件，只改开关 kv。
+    KeyError 没有这个 skill；ValueError 名字不合法。
+    """
+    name = str(name or "").strip()
+    if get_view(data_dir, store, name) is None:
+        raise KeyError(name)
+    set_disabled(store, name, not enabled)
+    logger.info("网页把 skill %s 开关拨成 %s", name, "开" if enabled else "关")
 
 
 # ----------------------------------------------------------------------

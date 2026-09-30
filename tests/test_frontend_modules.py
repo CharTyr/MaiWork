@@ -65,3 +65,13 @@ def test_no_nul_separator_in_frontend() -> None:
     抓正文下拉也只剩「不用」）。前端一律不用 NUL 当分隔符。"""
     bad = [p.relative_to(JS).as_posix() for p in _modules() if "\\u0000" in p.read_text(encoding="utf-8")]
     assert not bad, f"这些文件用了 \\u0000 当分隔符：{bad}"
+
+
+def test_skill_activation_controls():
+    ext = (JS / "settings/ext.js").read_text(encoding="utf-8")
+    actions = (JS / "actions_news.js").read_text(encoding="utf-8")
+    assert 'data-act="skill-toggle"' in ext
+    assert 'k.disabled_reason' in ext
+    assert 'k.manual_enabled' in ext
+    assert 'case "skill-toggle"' in actions
+    assert '/toggle`' in actions and '/api/extensions/skills/' in actions

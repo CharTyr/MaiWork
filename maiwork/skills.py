@@ -36,26 +36,161 @@ _READ_MAX_BYTES = 40 * 1024          # SKILL.md / 附属文件一次最多读 40
 _FRONT_KEYS = ("name", "description", "roles")
 BUILTIN_ROOT = Path(__file__).resolve().parent / "builtin_skills"   # 插件自带的 skill（只读）
 
+KV_SKILLS_DISABLED = "extensions.skills.disabled"  # 手动停用的 skill 名单（网页 toggle 写入）
+
+
+def _disabled_names(store: Any) -> list[str]:
+    """kv 里手动停用的 skill 名单。store 没给（None）→ 空。"""
+    if store is None:
+        return []
+    raw = store.kv_get(KV_SKILLS_DISABLED)
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for n in raw:
+        n_s = str(n or "").strip()
+        if n_s and n_s not in out:
+            out.append(n_s)
+    return out
+
+
+def set_disabled(store: Any, name: str, disabled: bool) -> None:
+    """把 skill 名写进 / 摘出手动停用名单（不分来源；先幂等归一，再落库）。"""
+    name = str(name or "").strip()
+    if not name:
+        raise ValueError("skill 名字不能为空")
+    if store is None:
+        raise ValueError("skill 开关需要 Store（没接库时改不了）")
+    names = _disabled_names(store)
+    if disabled and name not in names:
+        names.append(name)
+    elif not disabled:
+        names = [n for n in names if n != name]
+    with store.tx() as conn:
+        store.kv_set(conn, KV_SKILLS_DISABLED, names)
+
+
+def _search_preset_for(name: str) -> Any:
+    """名字对应哪家搜索预设 → Preset；不认得 → None。只看名字，不管这名字是不是真内置。"""
+    n = str(name or "").strip()
+    if not n:
+        return None
+    try:
+        from .search_presets import PRESETS
+    except Exception:
+        return None
+    for p in PRESETS.values():
+        if getattr(p, "skill", "") == n:
+            return p
+    return None
+
+
+def _search_service_on(preset: Any, store: Any, settings: Any) -> bool:
+    """「这家搜索服务开着吗」：merged MCP 里至少一条 preset 认得出 + enabled；
+    store/settings 没给齐 → False（判不了就当没开，宁愿不注入/不泄露也不当开着）。
+    判定中出错一律按关（保守，防 store 假故障时把停用 skill 漏给模型）。"""
+    if store is None or settings is None:
+        return False
+    try:
+        from .extensions_web import merged_entries
+        from .search_presets import preset_of_url
+    except Exception:
+        return False
+    try:
+        for entry in merged_entries(settings, store):
+            if not getattr(entry, "enabled", False):
+                continue
+            if preset_of_url(getattr(entry, "url", "")) is preset:
+                return True
+    except Exception:
+        logger.exception("判定搜索服务 %s 的开关出错，按关", getattr(preset, "id", "?"))
+        return False
+    return False
+
+
+def effective_status(
+    name: str,
+    store: Any,
+    settings: Any,
+    *,
+    search_preset: Any = None,
+) -> dict[str, Any]:
+    """一个 skill 的「effective 生效态」+ 三个网页字段。
+
+    - manual_enabled：没手动停用就是 True（store=None 的旧构造按 True 兜——不接库
+      时保持旧的全开行为；**store 给了但读坏了**按“保守停用”，防假故障时泄露）。
+    - enabled：通才 skill = manual_enabled；search skill（调用方按 search_preset 传入
+      对应预设，且已核过这名字真是内置那份）= manual_enabled AND 对应搜索服务开着。
+    - disabled_reason：enabled=False 时的中文一句；空串 = 开着。
+
+    名字本身不检查「存在不存在」——那是 get_view/list_view 的事；这里只管策略。
+    """
+    if store is None:
+        manual = True
+    else:
+        try:
+            manual = str(name or "").strip() not in set(_disabled_names(store))
+        except Exception:
+            logger.exception("读 skill 手动停名单出错，按停用（保守，不泄露）")
+            manual = False
+    if not manual:
+        return {"enabled": False, "manual_enabled": False, "disabled_reason": "已手动停用"}
+    if search_preset is not None and not _search_service_on(search_preset, store, settings):
+        return {"enabled": False, "manual_enabled": True, "disabled_reason": "对应的搜索服务未开启"}
+    return {"enabled": True, "manual_enabled": True, "disabled_reason": ""}
+
 
 class Skills:
-    """<数据目录>/skills/ 的只读视图。data_dir 传 settings.data_dir 即可。"""
+    """<数据目录>/skills/ 的只读视图。data_dir 传 settings.data_dir 即可。
 
-    def __init__(self, data_dir: Path | str, builtin_root: Path | str | None = BUILTIN_ROOT) -> None:
+    store / settings 给了就接「skill 开关」（kv + MCP 扩展开关）：
+    - 手动停用的 skill 不再列 / 读 / 给 hint；
+    - search-<preset> 的还看「对应搜索服务开没开」（MCP 扩展 enabled）；
+    没给保持旧行为（全部看得见，不引入依赖）。
+    """
+
+    def __init__(
+        self,
+        data_dir: Path | str,
+        builtin_root: Path | str | None = BUILTIN_ROOT,
+        store: Any = None,
+        settings: Any = None,
+    ) -> None:
         self._root = Path(data_dir) / "skills"
         self._builtin_root = Path(builtin_root) if builtin_root else None
+        self._store = store
+        self._settings = settings
+
+    def _settings_now(self) -> Any:
+        """settings 可以是 Settings 对象或一个无参返回 Settings 的可调用（
+        MaiWorkApp 的 get_settings 会跟着规则覆盖变化；每次都现判，不许缓存）。"""
+        s = self._settings
+        if s is None:
+            return None
+        if callable(s):
+            try:
+                return s()
+            except Exception:
+                logger.exception("取 settings 出错，按没配（search skill 当服务未开）")
+                return None
+        return s
 
     # ------------------------------------------------------------------
     # 列表
     # ------------------------------------------------------------------
 
     def list(self, role: str | None = None) -> list[dict[str, Any]]:
-        """[{name, description, roles, path}]，按名字排序，最多 20 个。
+        """[{name, description, roles, path}]，按名字排序，最多 20 个；被停用的不出现。
 
         role 给了就只要 roles 含这个角色的（主模型 role="main"、子 agent role="worker"）；
-        不给（None）返回全部——网页 / 调试要看全量。
+        不给（None）返回全部角色——但这是**模型/工具视角的全量**：手动停用或服务未开启
+        的 skill 照样不出现（要「管理视角看全部 + 开关字段」走 skills_web.list_view，
+        它带 enabled / manual_enabled / disabled_reason，不过滤）。
         """
         out: list[dict[str, Any]] = []
         for name, path, builtin in self._skill_dirs():
+            if not self.is_effectively_active(name):
+                continue
             text = self._read_head(path / "SKILL.md")
             if text is None:
                 continue
@@ -90,7 +225,9 @@ class Skills:
         return "\n".join(lines)
 
     def roles(self, name: str) -> list[str] | None:
-        """某个 skill 的 roles（没这个 skill / 读不到 → None）；坏值回落 worker。"""
+        """某个 skill 的 roles（没这个 skill / 读不到 / 被停用 → None）；坏值回落 worker。"""
+        if not self.is_effectively_active(name):
+            return None
         path = self._skill_path(name)
         if path is None:
             return None
@@ -103,15 +240,52 @@ class Skills:
     # 读取
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # 开关状态（effective / manual / disabled_reason）
+    # ------------------------------------------------------------------
+
+    def status_of(self, name: str) -> dict[str, Any]:
+        """一个 skill 的开关状态：{enabled, manual_enabled, disabled_reason}。
+        只查策略不读盘；name 不存在也照算（存在性由调用方判）。
+        没接 store/settings 时按「全开着」兜（旧行为）。
+        服务闸只给「内置那份 search-<preset>」上——用户在数据目录起个同名 skill
+        （内置 优先规则下根本轮不到它）不吃服务闸，和普通通才 skill 一样默认开。
+        """
+        n = str(name or "")
+        preset = None
+        if _search_preset_for(n) is not None and self._skill_path_in(self._builtin_root, n) is not None:
+            preset = _search_preset_for(n)
+        return effective_status(n, self._store, self._settings_now(), search_preset=preset)
+
+    def is_effectively_active(self, name: str) -> bool:
+        """effective 生效态：模型能不能看到 / 读到这个 skill。
+
+        异常路径（store/settings 假故障）fail-closed 返回 False：宁岂这轮不给模型用，
+        也不要把「真被停了」的 skill 漏出去。
+        """
+        try:
+            return bool(self.status_of(name).get("enabled", True))
+        except Exception:
+            logger.exception("判 skill %s 开关状态出错，按停用", name)
+            return False
+
+    # ------------------------------------------------------------------
+    # 读取
+    # ------------------------------------------------------------------
+
     def read(self, name: str) -> str | None:
-        """SKILL.md 全文（≤40KB）；不存在 / 名字不合法 / 符号链接 → None。"""
+        """SKILL.md 全文（≤40KB）；不存在 / 名字不合法 / 符号链接 / 被停用 → None。"""
+        if not self.is_effectively_active(name):
+            return None
         path = self._skill_path(name)
         if path is None:
             return None
         return self._read_head(path / "SKILL.md", full=True)
 
     def read_file(self, name: str, rel: str) -> str | None:
-        """skill 目录内的附属文件（≤40KB）；越界 / 绝对路径 / 符号链接 → None。"""
+        """skill 目录内的附属文件（≤40KB）；越界 / 绝对路径 / 符号链接 / 被停用 → None。"""
+        if not self.is_effectively_active(name):
+            return None
         path = self._skill_path(name)
         if path is None:
             return None

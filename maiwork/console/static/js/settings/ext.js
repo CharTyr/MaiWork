@@ -309,15 +309,18 @@ function mcpForm(m) {
 
 function skillRow(k) {
   const roles = roleText(k.roles);
+  const active = k.enabled !== false;
+  const manual = k.manual_enabled !== false;
+  const status = active ? "已启用" : k.disabled_reason || "已停用";
   return `
     <div class="ext-row">
       ${ico("books")}
       <div class="ext-main">
         <div class="set-name">${esc(k.name)}${k.source === "file" ? `<span class="tag">服务器上放的</span>` : k.source === "builtin" ? `<span class="tag">内置</span>` : ""}</div>
         <div class="set-text">${esc(k.description || "没写描述")}</div>
-        <div class="set-text ext-st">给${esc(roles)}用${k.updated_ts ? ` · ${esc(dayWord(k.updated_ts))}改过` : ""}</div>
+        <div class="set-text ext-st"><span class="dot ${active ? "ok" : ""}"></span>${esc(status)} · 给${esc(roles)}用${k.updated_ts ? ` · ${esc(dayWord(k.updated_ts))}改过` : ""}</div>
       </div>
-      <div class="row-btns ext-btns"><button class="btn small" data-act="ext-edit" data-kind="skill" data-name="${esc(k.name)}">${k.source === "builtin" ? "看" : "改"}</button></div>
+      <div class="row-btns ext-btns"><button class="btn small" data-act="skill-toggle" data-name="${esc(k.name)}" data-on="${manual ? "0" : "1"}">${manual ? "停用" : "启用"}</button><button class="btn small" data-act="ext-edit" data-kind="skill" data-name="${esc(k.name)}">${k.source === "builtin" ? "看" : "改"}</button></div>
     </div>`;
 }
 

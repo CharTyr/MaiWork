@@ -446,10 +446,12 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         data_dir = getattr(settings, "data_dir", None) or getattr(svc, "data_dir", None)
         if data_dir is None:
             return None
+        store = getattr(svc, "store", None)
         try:
             from .skills import Skills
 
-            return Skills(data_dir)
+            # 接 store/settings 后，停用的 skill 在管理员工具里同样 read/list 不到
+            return Skills(data_dir, store=store, settings=_settings)
         except Exception:
             logger.exception("管理员工具建 Skills 失败")
             return None

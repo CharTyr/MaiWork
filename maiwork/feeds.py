@@ -709,6 +709,8 @@ class Feeds:
         # 没有 SOUL 内容仍回落 host 这套老逻辑。
         self._host = host
         self._identity = identity
+        # 搜索服务 skill 提示 / 开关（Skills 实例，app 启动后设上；None=没接、抛带）
+        self._skills: Any = None
         # 构想「做这个」的回调：app 接成 _on_idea_started（落成任务并开工）；None = 只记状态。
         self.on_start = on_start
         # RSS 客户端注入（httpx.MockTransport，tests 用；None = 真实网络，接口/备料自己起）
@@ -1988,10 +1990,16 @@ class Feeds:
         return "\n".join(lines) + "\n\n"
 
     def _provider_skill_section(self, settings: Settings) -> str:
-        """绑定的搜索服务是预设的一家 → 附上那家的 skill（官方用法）；认不出 / 读不到 → ""。"""
+        """绑定的搜索服务是预设的一家 → 附上那家的 skill（官方用法）；认不出 / 读不到 → ""。
+
+        effective 态跟 Skills 是同一套（manual_enabled AND preset 名下至少一条
+        enabled MCP）：手动停用 / 服务未开启都不往 brief 里塞——跟 list/read/hint
+        同一个策略入口（Skills.status_of 现查，不缓存）。
+        """
         try:
             from . import extensions_web, search_binding
             from .search_presets import preset_of_url
+            from .skills import BUILTIN_ROOT, _search_preset_for, effective_status
 
             binding = search_binding.get_binding(self._store)
             if binding is None:
@@ -1999,11 +2007,32 @@ class Feeds:
             entry = next(
                 (e for e in extensions_web.merged_entries(settings, self._store) if e.name == binding["mcp"]), None
             )
-            preset = preset_of_url(entry.url) if entry is not None else None
+            # 选中的绑定这条本身必须 enabled：同 provider 别的 enabled 条目不算数——
+            # 绑定这条被关，搜索就走不了它，官方用法也不该塞。
+            if entry is None or not bool(getattr(entry, "enabled", False)):
+                return ""
+            preset = preset_of_url(entry.url)
             if preset is None:
                 return ""
-            from .skills import BUILTIN_ROOT
+            # 同一个策略入口：手动停掉了、或者绑定这条被关了（对应预设查询不到 enabled MCP），
+            # 就不往子 agent 提示里塞官方用法。builtin search skill 的服务闸按 preset 传；
+            # 别的（不存在的）不吃闸。store/settings 坏了保守按停用，不泄露用法。
+            skills_obj = getattr(self, "_skills", None)
+            if skills_obj is None:
+                data_dir = getattr(settings, "data_dir", None)
+                if data_dir is not None:
+                    try:
+                        from .skills import Skills as _SkillsCls
 
+                        skills_obj = _SkillsCls(data_dir, store=self._store, settings=lambda s=settings: s)
+                    except Exception:
+                        skills_obj = None
+            # fail-closed：没有判定对象（settings 假数据等，正常不会到这）就按停用，不注
+            if skills_obj is None:
+                return ""
+            if not skills_obj.is_effectively_active(preset.skill):
+                logger.debug("搜索服务 %s 的 skill 被停用（或服务未开），这轮不注 skill 块", preset.skill)
+                return ""
             text = (BUILTIN_ROOT / preset.skill / "SKILL.md").read_text(encoding="utf-8")
         except Exception:
             logger.debug("读搜索服务的 skill 失败，这轮不带", exc_info=True)

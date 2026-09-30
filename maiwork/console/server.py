@@ -1569,7 +1569,7 @@ class ConsoleServer:
                 logger.exception("拼 MCP 扩展清单出错")
                 mcp = []
             try:
-                skills = skills_web.list_view(svc.get_settings().data_dir, svc.store)
+                skills = skills_web.list_view(svc.get_settings().data_dir, svc.store, svc.get_settings())
             except Exception:
                 logger.exception("拼 skill 清单出错")
                 skills = []
@@ -1762,7 +1762,7 @@ class ConsoleServer:
         def _skill_view_or_404(name: str) -> tuple[dict | None, web.Response | None]:
             from .. import skills_web
 
-            view = skills_web.get_view(svc.get_settings().data_dir, svc.store, name)
+            view = skills_web.get_view(svc.get_settings().data_dir, svc.store, name, svc.get_settings())
             if view is None:
                 return None, _err(404, "没有这个 skill")
             return view, None
@@ -1975,6 +1975,37 @@ class ConsoleServer:
                 return _err(400, str(e))
             return web.json_response({"ok": True})
 
+        # ---------- skill 开关（POST /api/extensions/skills/{name}/toggle） ----------
+
+        async def _skill_toggle(request: web.Request) -> web.Response:
+            """开关 skill（任何来源，包括 builtin）——只存 kv["extensions.skills.disabled"] 名单。
+
+            search-<preset> 的 effective 态除了这个手动开关，还看「对应搜索服务开没开」
+            （至少一条 preset 认得出的 MCP enabled）；这条只改手动开关。
+            """
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            enabled_v = body.get("enabled")
+            if not isinstance(enabled_v, bool):
+                return _err(400, "enabled 要是 true / false")
+            from .. import skills_web
+
+            name = str(request.match_info["name"])
+            try:
+                skills_web.toggle(svc.get_settings().data_dir, svc.store, name, enabled_v)
+            except KeyError:
+                return _err(404, "没有这个 skill")
+            except ValueError as e:
+                return _err(400, str(e))
+            view, not_found = _skill_view_or_404(name)
+            if not_found is not None:
+                return not_found
+            return web.json_response(view)
+
         # ---------- skill zip 上传（POST /api/extensions/skills/upload） ----------
         #
         # 请求体两种都支持：
@@ -2022,6 +2053,7 @@ class ConsoleServer:
             return web.json_response(view)
 
         app.router.add_post("/api/extensions/skills/upload", self._write(_skill_upload))
+        app.router.add_post("/api/extensions/skills/{name}/toggle", self._write(_skill_toggle))
 
         app.router.add_route("PUT", "/api/extensions/mcp/{name}", self._write(_mcp_update))
         app.router.add_route("DELETE", "/api/extensions/mcp/{name}", self._write(_mcp_delete))

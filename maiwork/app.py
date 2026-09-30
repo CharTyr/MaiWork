@@ -1777,7 +1777,8 @@ class MaiWorkApp:
             from .skills import Skills
             from .skills_tools import register_skill_tools
 
-            self.skills = Skills(settings.data_dir)
+            # 接 store/settings 后，Skills 会跟着 kv / MCP enabled 变化自动带走/回来 skill
+            self.skills = Skills(settings.data_dir, store=self.store, settings=self.get_settings)
             try:
                 register_skill_tools(self.tools, self.skills)
             except Exception:
@@ -1786,6 +1787,12 @@ class MaiWorkApp:
             # Workers 没法全局设置时用构造参数 skills_hint_fn
             if self.workers is not None and getattr(self.workers, "_skills_hint_fn", None) is None:
                 self.workers._skills_hint_fn = lambda: self.skills.hint() if self.skills is not None else ""  # noqa: SLF001
+            # feeds 的搜索服务 skill（brief 注入）吃同一套开关
+            try:
+                if self.feeds is not None:
+                    self.feeds._skills = self.skills  # noqa: SLF001
+            except Exception:
+                logger.exception("给 feeds 接 skills 出错，搜索 skill 提示这次照带")
         except Exception:
             logger.exception("skill 扩展就位出错，这次没有 skill 用")
             self.skills = None

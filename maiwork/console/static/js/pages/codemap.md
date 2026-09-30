@@ -6,11 +6,14 @@
 
 ## Design
 
-- `news.js`：`viewNews(g, v)` 按时段展示资讯批次、被淘汰的候选与文章；复用 `emptyState()`、`loading()`、`fbButtons()`。`RATE_KEY` / `FB_KEY` 和 `clientId()` 管理本浏览器的评价/反馈标识，实际提交在上级的 `main.js` / `actions.js`。图解通过 `GET /api/news/{id}/viz` 按需取 HTML，装入仅 `allow-scripts` 的沙箱 iframe；`MutationObserver` 填充、`postMessage` 校正高度，内存缓存避免刷新时重取。
+- `news.js`：`viewNews(g, v)` 按时段展示资讯批次、被淘汰的候选与文章；复用 `emptyState()`、`loading()`、`fbButtons()`。`RATE_KEY` / `FB_KEY` 和 `clientId()` 管理本浏览器的评价/反馈标识，实际提交在上级的 `main.js` / `actions.js`。首个来源链接走 `/go/{id}?c={clientId}`，群友链接另带 `g` token，由服务端鉴权、记点击并重定向；其他来源仍直链。
+- 资讯 `followup` 显示「后续」、旧标题 `of_title` 和新增事实 `new_fact`；淘汰候选的 `src.query/provider` 显示搜索出处。`batchStats()` 兼容旧批次和 `stats.funnel`；`funnelBlock()` 仅全局管理员可展开搜索→线索→预筛→挑选→打开→核对→上网页各步计数，并列出 `per_focus`、`providers`、`rejects`、`timings_s`，包括保底补搜耗时。没有留下资讯的批次也可看漏斗。
+- `twoPhaseBtn()` 按群懒加载 `feeds-two-phase`，只全局管理员显示；`tasteBox()` / `tasteInner()` 按群懒加载 `taste`，群管理员也可看和手写口味。点击交给上级 `actions_news.js`，编辑提交交给 `main.js`；开新找法要确认，下一批生效。
+- 图解通过 `GET /api/news/{id}/viz` 按需取 HTML，装入仅 `allow-scripts` 的沙箱 iframe；`MutationObserver` 填充、`postMessage` 校正高度，内存缓存避免刷新时重取。
 - `ideas.js`：`viewIdeas()` 和 `ideaDetail()` 展示构想及选项；`ideaAsk()` 拼出复制到群内交给 MaiBot 的要求，`findIdea()` 从当前群视图找构想。
 - `goals.js`：`viewGoals()` 区分 MaiWork 推进的目标与群友的提醒，`nextText()` 解释下次检查时间。
 - `tasks.js`：`viewTasks()` 展示待批、已开工和按状态筛选的任务；`taskRow()` 供列表与详情复用；待批构想项通过 `findIdea()` 交叉引用。
-- `group.js`：`viewGroup()` 组织群状态、开话题记录、群画像、群空间能力及关注成员；管理员视图提供「往群里发」的每群开关。个人画像只在管理视图渲染，服务器仍需独立执行鉴权。
+- `group.js`：`viewGroup()` 组织群状态、开话题记录、群画像、群空间能力及关注成员；管理员视图提供「往群里发」的每群开关。通过 `gplat()` / `platTag()` 区分平台；非 `qq` 群的 `groupSpaceBlock(v, g)` 不画 OneBot 群文件/公告/相册控件，而说明成品走网页链接。个人画像只在管理视图渲染，服务器仍需独立执行鉴权。
 
 ## Flow
 

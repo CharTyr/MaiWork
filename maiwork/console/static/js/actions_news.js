@@ -9,6 +9,20 @@ import { renderView } from "./render.js";
 
 export async function actNews(a, el) {
   switch (a) {
+    case "skill-toggle": {
+      el.disabled = true;
+      try {
+        await api("POST", `/api/extensions/skills/${encodeURIComponent(el.dataset.name)}/toggle`, { enabled: el.dataset.on === "1" });
+        await loadExt();
+        repaintSheet();
+        const skill = ((state.ext || {}).skills || []).find((k) => k.name === el.dataset.name);
+        toast(el.dataset.on !== "1" ? "已停用，模型将不再使用这份 skill" : skill && skill.enabled === false ? skill.disabled_reason || "已设为启用，等待配套服务开启" : "已启用，模型现在可以使用这份 skill");
+      } catch (err) {
+        el.disabled = false;
+        toast(err.message, true);
+      }
+      return true;
+    }
     case "preset-open":
       state.presetEdit = el.dataset.id;
       repaintSheet();
