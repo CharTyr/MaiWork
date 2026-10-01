@@ -472,6 +472,10 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .dt-sec { margin-top: 26px; }
 .dt-label { font-size: 13px; font-weight: 700; color: var(--gray); margin-bottom: 8px; }
 .dt-text { font-size: 16px; line-height: 1.6; color: var(--ink-2); }
+/* 长文字先收到 4 行（要做什么 / 验收意见）；保留换行，展开看全文 */
+.dt-text.fold { white-space: pre-line; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.dt-text.fold.open { display: block; -webkit-line-clamp: unset; overflow: visible; }
+.dt-more { margin-top: 6px; min-height: 32px; font-size: 14px; }
 .dt-list { margin: 0; padding-left: 1.1em; font-size: 16px; line-height: 1.7; color: var(--ink-2); }
 
 .tl { list-style: none; margin: 0; padding: 0; position: relative; }

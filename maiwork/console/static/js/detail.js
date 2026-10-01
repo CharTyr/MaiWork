@@ -20,12 +20,36 @@ function findTaskRow(id) {
   return v && v.tasks ? (v.tasks.list || []).find((x) => x.id === id) : null;
 }
 
+// 长文字先收到 4 行，点「展开」看全文（2026-10-01 用户：「任务写的好长」）。
+// 展开状态记在内存里，轮询重画后不会自己合上；直接改 class，不用整块重画。
+const FOLD_CHARS = 140;
+const FOLD_LINES = 4;
+const foldOpen = {};
+function foldText(key, text) {
+  const s = String(text || "");
+  const long = s.length > FOLD_CHARS || s.split("\n").length > FOLD_LINES;
+  if (!long) return `<div class="dt-text">${esc(s)}</div>`;
+  const open = !!foldOpen[key];
+  return `<div class="dt-text fold${open ? " open" : ""}" data-fold="${esc(key)}">${esc(s)}</div><button class="link-btn dt-more" data-fold-btn="${esc(key)}" aria-expanded="${open}">${open ? "收起" : "展开全文"}</button>`;
+}
+document.addEventListener("click", (e) => {
+  const btn = e.target && e.target.closest && e.target.closest("[data-fold-btn]");
+  if (!btn) return;
+  const key = btn.dataset.foldBtn;
+  const open = !foldOpen[key];
+  foldOpen[key] = open;
+  const box = btn.previousElementSibling;
+  if (box && box.dataset.fold === key) box.classList.toggle("open", open);
+  btn.setAttribute("aria-expanded", String(open));
+  btn.textContent = open ? "收起" : "展开全文";
+});
+
 // 验收意见 + 引用核对：结构化结果在 link_check，意见文本里同一行去掉免得重复
 function reviewBlock(t) {
   const lc = t.link_check && typeof t.link_check === "object" ? t.link_check : null;
   let text = String(t.review || "");
   if (lc) text = text.split("\n").filter((l) => !/^\s*引用核对：/.test(l)).join("\n").trim();
-  let html = text ? `<div class="dt-sec"><div class="dt-label">验收意见</div><div class="dt-text">${esc(text)}</div></div>` : "";
+  let html = text ? `<div class="dt-sec"><div class="dt-label">验收意见</div>${foldText(`review:${t.id}`, text)}</div>` : "";
   if (lc && lc.links) {
     const bad = lc.unopened || 0;
     const urls = (lc.unopened_urls || []).slice(0, 10);
@@ -81,7 +105,7 @@ function taskDetail(id) {
         <div class="dt-state"><span class="dot ${dot}"></span>${STATUS[st] || esc(st)} · <span class="mono">${esc(t.id)}</span></div>
       </div>
     </div>
-    <div class="dt-sec"><div class="dt-label">要做什么</div><div class="dt-text">${esc(t.req || t.meta || "")}</div></div>
+    <div class="dt-sec"><div class="dt-label">要做什么</div>${foldText(`req:${t.id}`, t.req || t.meta || "")}</div>
     ${pausedBlock(t)}
     ${t.auto_reason ? `<div class="dt-sec"><div class="dt-label">谁批的</div><div class="dt-text">MaiWork 自动审核通过：${esc(t.auto_reason)}</div></div>` : ""}
     ${t.question ? `<div class="dt-sec"><div class="dt-label">在等回答</div><div class="quote">${esc(t.question)}</div></div>` : ""}

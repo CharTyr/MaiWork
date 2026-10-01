@@ -65,6 +65,7 @@ from .tools import ToolContext
 logger = logging.getLogger("maiwork.coordinator")
 
 _MAX_ATTEMPTS = 3
+_CRITERIA_MAX = 5  # 完成标准最多留 5 条（2026-10-01 用户：网页任务详情太长）
 _PLAN_TOOL_LIMIT = 6  # 排计划阶段主模型最多用 6 轮只读工具（查资料 / 读 skill）
 _REVIEW_TOOL_LIMIT = 6  # 验收阶段主模型最多用 6 轮只读工具
 _REMEMBER_TOOL_LIMIT = 2  # 「记经验」小回合最多 2 次工具调用（验收通过、交付之前）
@@ -842,6 +843,15 @@ class Coordinator:
         if prior_review:
             prompt_lines.append("")
             prompt_lines.append(f"上一次验收意见：{prior_review}")
+            prompt_lines.append(
+                "（这次要返工的点写进 jobs 的 brief 里交代给子 agent，不要写进完成标准。）"
+            )
+        # 网页任务详情要一眼看完（2026-10-01 用户：「任务写的好长」）
+        prompt_lines.append("")
+        prompt_lines.append(
+            "完成标准写 3 到 5 条，每条一句话、不超过 30 字，只写一个能检查的点"
+            "（例：「每张图注明出处链接」），不写理由、例子和返工说明。"
+        )
 
         # 执行环境可选项：只有就位的才出现在提示词里（模型不会瞎选）
         env_field, env_guide, _env_allowed = self._env_options()
@@ -967,7 +977,7 @@ class Coordinator:
         criteria = data.get("criteria")
         if not isinstance(criteria, list):
             criteria = []
-        criteria = [str(c).strip() for c in criteria if str(c).strip()]
+        criteria = [str(c).strip() for c in criteria if str(c).strip()][:_CRITERIA_MAX]
         if not criteria and not crit:
             # 原本为空而这次也没给 → 必须给（§11.4：原来为空时必须给）
             raise ModelError("主模型计划没给完成标准，任务原本又没有，没法验收")
@@ -1781,7 +1791,8 @@ class Coordinator:
         prompt_lines.append("")
         prompt_lines.append(
             "只回 JSON："
-            '{"pass": true|false, "review": "中文验收意见，说清楚哪里过哪里不过",'
+            '{"pass": true|false, "review": "中文验收意见：第一句先写结论（「通过」或「没过：……」），'
+            '只说没过的地方，全段不超过 150 字；通过就一两句话，别列一遍过了的项",'
             ' "missing": ["还缺什么"], "artifact": "要交付的成品在工作区里的相对路径（'
             '如 artifacts/T-1/index.html；text 交付可以留空）", "note": "交付时在群里说的一句话（'
             '不点名关注成员、不暴露工具细节）"}'
@@ -2468,7 +2479,7 @@ class Coordinator:
                 ' "progress": "一句话的新进展，没有新进展就 null",'
                 ' "new_task": {"title","req","criteria":["…"]} | null,'
                 ' "report": "有阶段性结果想发到群里说的一句话，没有就 null"'
-                + (',' + ' "criteria": ["第一次检查补出的完成标准（3–5 条，一句话一条）"]'
+                + (',' + ' "criteria": ["第一次检查补出的完成标准（3–5 条，一句话一条，每条不超过 30 字）"]'
                    if need_criteria else '')
                 + "}",
             ]
