@@ -239,9 +239,10 @@ class TestMatchRules:
 
     def test_top_score_max_2(self, tmp_path):
         store, settings, m, tm = _make(tmp_path)
+        # 2026-10-01：4 条都有的词算泛词，所以每条各带一个自己的具体词
         for i in range(4):
-            _seed_news(store, title=f"第{i}篇", keywords=("m7", "芯片"))
-        kwargs = _kwargs([("m7 芯片", False)])
+            _seed_news(store, title=f"第{i}篇", keywords=("m7", f"芯片{i}号"))
+        kwargs = _kwargs([("m7 芯片0号 芯片1号 芯片2号 芯片3号", False)])
         lines = tm.memo_lines(GID, kwargs)
         assert len(lines) == 2  # 最多 2 条
 
@@ -285,7 +286,8 @@ class TestMatchRules:
         _seed_news(store, keywords=("m7", "芯片"), url="https://example.com/m7")
         kwargs = _kwargs([("m7 芯片", False)])
         lines = tm.memo_lines(GID, kwargs)
-        assert "（https://example.com/m7）" in lines[0][0]
+        # 2026-10-01：链接留着，但交代成「有人问出处再给」
+        assert "（有人问出处再给：https://example.com/m7）" in lines[0][0]
 
     def test_snippet_capped_60_chars(self, tmp_path):
         store, settings, m, tm = _make(tmp_path)
@@ -352,7 +354,7 @@ class TestInjectIntegration:
         assert out is not None
         text = out["items"][0]["parts"][0]["text"]
         assert "【MaiWork 备忘】" in text
-        assert "可以自然接一句" in text
+        assert "自然接一句" in text
         assert "M7 芯片发布" in text
         assert "普通备忘条目" in text
         # 话题接龙排在已有备忘前面

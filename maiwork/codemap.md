@@ -143,6 +143,7 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 | `topics.py` | 冷场开话题：代码门槛 → Jev 判 → 主模型写开场白（人设走 `voice.persona`，只认 SOUL；自我介绍 / 寒暄 → `rejected:self_intro`；news 候选「随口一提」，idea 候选**关心式问法**，按候选 ref_id 从 `ideas` 读 origin/title/body，不读 basis）；candidate 池/follow_up |
 | `voice.py` | 开口时的人设：`persona(identity) → Persona`（只读 identity 的 main SOUL，不回退读 MaiBot 人格）；`Persona.section()` = SOUL + 「不自我介绍 / 不寒暄、直接说事」规矩，`system()`；`is_self_intro(text)` 生成结果护栏。读不到一律当空、绝不抛。开场白和构想提一嘴共用 |
 | `delivery.py` | Mentions 可提起清单（inject 进 planner 请求）、TopicMatcher 关键词接话、Pushes 推送节制 |
+| `chat_feed.py` | 资讯反哺闲聊的零件：关键词过滤 / 整词匹配 / 问「新鲜事」识别；`chat_feeds` 账（递了什么、MaiBot 聊到没有） |
 | `outbox.py` | 发件箱（状态机 pending/sending/sent/uncertain/failed，按 key 去重，recover 不重放）、任务交付 Delivery（view/file/text 三渠道+回落）、report_error |
 | `herenow.py` | here.now 匿名发布客户端（publish/upload/finalize 三步） |
 | `scheduler.py` | 什么时辰干什么事（资讯时段偏移/构想/提目标窗口；只读 kv+groups，不调模型） |

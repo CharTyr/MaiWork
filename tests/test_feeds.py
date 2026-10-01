@@ -943,6 +943,7 @@ def test_news_view_structure_and_order(tmp_path) -> None:
         "body", "reason", "refs", "audience", "image_url", "verify", "angle", "viz",
         "bridge",  # 2026-09-29：拓展条目「从哪条兴趣跳过来」
         "followup",  # 2026-09-30：同一件事的新进展（「后续」），不是后续为 None
+        "chat_feed",  # 2026-10-01：递给 MaiBot 几次、哪次聊到了
     }
     assert set(item["scores"].keys()) == {"info", "source", "relevance", "timeliness", "chat", "avg"}
     assert item["kind"] == "news" and item["topic"] == "话题" and item["sensitive"] is False
@@ -1199,3 +1200,22 @@ def test_make_idea_origin_cleaned(tmp_path) -> None:
     got2 = _run(feeds2.make_idea(GID))
     row2 = store2.read().execute("SELECT origin FROM ideas WHERE id=?", (got2,)).fetchone()
     assert row2["origin"] == ""
+
+
+def test_news_view_carries_chat_feed_stats(tmp_path) -> None:
+    """资讯反哺闲聊（2026-10-01）：每条带 chat_feed={times, said_ts}——递给 MaiBot 几次、哪次聊到了。"""
+    _, _, feeds, *_ = _make_feeds(tmp_path)
+    store = feeds._store
+    with _TimePatch():
+        _seed_batch_and_items(store, GID, created=NOW - 100, items=[("甲", "a.com/1", 0.9), ("乙", "a.com/2", 0.8)])
+        ids = [int(r["id"]) for r in store.read().execute("SELECT id FROM news_items ORDER BY id")]
+        with store.tx() as conn:
+            conn.execute(
+                "INSERT INTO chat_feeds (group_id, key, mode, title, hit, words, link, rounds, first_ts, last_ts, said_ts, said_text)"
+                " VALUES (?, ?, 'topic', '甲', '[]', '[]', '', 2, ?, ?, ?, '聊到了')",
+                (GID, f"news:{ids[0]}", NOW - 50, NOW - 40, NOW - 30),
+            )
+        view = feeds.news_view(GID)
+    by_title = {it["title"]: it for b in view for it in b["items"]}
+    assert by_title["甲"]["chat_feed"] == {"times": 1, "said_ts": NOW - 30}
+    assert by_title["乙"]["chat_feed"] == {"times": 0, "said_ts": None}

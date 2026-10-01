@@ -27,14 +27,16 @@ export function fbButtons(kind, it) {
   </span>`;
 }
 
-function newsStatus(s) {
+function newsStatus(s, cf) {
   s = s || {};
   const k = s.kind || "new";
-  if (k === "used") return `${when(s.at)} 冷场时拿来开了话题${s.replies ? ` · ${s.replies} 人接话` : " · 没人接"}`;
   if (k === "mentioned") return `${when(s.at)} MaiBot 在聊天里提过`;
-  if (k === "pool") return s.expires_ts ? `在话题候选里 · 还能放 ${dur(s.expires_ts - now())}` : "在话题候选里";
-  if (k === "expired") return "没找到合适的时机，已过期";
-  return "刚备好";
+  // 资讯反哺闲聊：群里聊到相关话题时递给了 MaiBot，它还没接
+  const fed = cf && cf.times ? ` · 递给 MaiBot ${cf.times} 次，还没聊到` : "";
+  if (k === "used") return `${when(s.at)} 冷场时拿来开了话题${s.replies ? ` · ${s.replies} 人接话` : " · 没人接"}${fed}`;
+  if (k === "pool") return (s.expires_ts ? `在话题候选里 · 还能放 ${dur(s.expires_ts - now())}` : "在话题候选里") + fed;
+  if (k === "expired") return "没找到合适的时机，已过期" + fed;
+  return "刚备好" + fed;
 }
 
 const SCORE_NAMES = [["info", "信息量"], ["source", "来源"], ["relevance", "相关"], ["timeliness", "时效"], ["chat", "可聊"]];
@@ -169,7 +171,7 @@ function newsItem(it, i, guide) {
         }
         <div class="status">
           <span class="dot ${esc((it.status || {}).kind || "")}"></span>
-          <span class="status-text">${esc(guide ? guideStatus(it) : newsStatus(it.status))}</span>
+          <span class="status-text">${esc(guide ? guideStatus(it) : newsStatus(it.status, it.chat_feed))}</span>
           <button class="ratebtn" data-act="rate-open" data-id="${it.id}" aria-pressed="${rated}" title="说说这条哪里不好">${SVG.pen}<i>${rated ? "已评价" : "评价"}</i></button>
           ${fbButtons("news", it)}
         </div>

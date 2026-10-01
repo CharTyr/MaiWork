@@ -18,7 +18,7 @@ import logging
 import re
 from typing import Any, Callable, Optional
 
-from . import clock
+from . import chat_feed, clock
 from .config import Settings
 from .store import Store
 
@@ -68,6 +68,8 @@ class TopicMatcher:
     IDEA_DAYS = 7
     SNIPPET_LEN = 60
     TAKE = 2
+    GENERIC_DF = 3   # 本群这么多条候选都有的词算泛词
+    ASK_DAYS = 2     # 有人问「最近有啥新鲜事」时只递近 2 天的
 
     def __init__(self, store: Store) -> None:
         self._store = store
@@ -139,22 +141,9 @@ class TopicMatcher:
 
     @staticmethod
     def _keywords_of(raw: Any) -> list[str]:
-        """JSON 关键词列表 → 小写、去空白、只留 ≥2 字符的；去重。"""
-        try:
-            data = json.loads(raw) if isinstance(raw, str) else raw
-        except (TypeError, ValueError):
-            return []
-        if not isinstance(data, list):
-            return []
-        out: list[str] = []
-        seen: set[str] = set()
-        for kw in data:
-            s = str(kw or "").strip().lower()
-            if len(s) < 2 or s in seen:
-                continue
-            seen.add(s)
-            out.append(s)
-        return out
+        """JSON 关键词列表 → 小写、去重、只留能用的（2026-10-01：纯数字 / 日期、两个字母的英文、
+        英文常用词不要，见 chat_feed.usable）。"""
+        return chat_feed.keywords(raw)
 
     @staticmethod
     def _first_link(raw: Any) -> str:
@@ -175,7 +164,7 @@ class TopicMatcher:
         gid = str(group_id)
         out: list[dict] = []
         rows = self._store.read().execute(
-            "SELECT id, title, summary, body, keywords, sources, created"
+            "SELECT id, title, summary, body, keywords, sources, created, score, up, down"
             " FROM news_items"
             " WHERE group_id=? AND rejected=0 AND kind IN ('news','guide') AND created>=?"
             " AND target_user_id=''"
@@ -191,6 +180,8 @@ class TopicMatcher:
                     "link": self._first_link(r["sources"]),
                     "keywords": self._keywords_of(r["keywords"]),
                     "created": float(r["created"] or 0.0),
+                    "score": float(r["score"] or 0.0),
+                    "liked": int(r["down"] or 0) <= int(r["up"] or 0),
                 }
             )
         rows = self._store.read().execute(
@@ -211,6 +202,13 @@ class TopicMatcher:
                     "created": float(r["created"] or 0.0),
                 }
             )
+        # 本群 ≥GENERIC_DF 条候选都有的词是泛词（935 群的 llm / prompt 这种），不能当「具体词」
+        df: dict[str, int] = {}
+        for c in out:
+            for kw in c["keywords"]:
+                df[kw] = df.get(kw, 0) + 1
+        for c in out:
+            c["spec"] = {kw for kw in c["keywords"] if chat_feed.specific(kw) and df.get(kw, 0) < self.GENERIC_DF}
         return out
 
     def candidates_for(self, group_id: str, now: Optional[float] = None) -> list[dict]:
@@ -229,18 +227,31 @@ class TopicMatcher:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def match(candidates: list[dict], recent_text_lower: str) -> list[dict]:
-        """命中 ≥2 个不同关键词 → 接得上；按命中数、新旧排。"""
-        scored: list[tuple[int, int, float, dict]] = []
+    def match_hits(candidates: list[dict], recent_text: str, latest: Optional[str] = None) -> list[tuple[dict, list[str]]]:
+        """接得上 = 命中 ≥2 个不同关键词，其中至少一个是本条的「具体词」（spec），
+        且至少一个出现在最新两条群友消息里（latest；不给就不卡）。英文按整词对；
+        网址、[事件-…] 系统提示先洗掉。按命中数、新旧排。"""
+        text = chat_feed.clean(recent_text)
+        last = chat_feed.clean(latest) if latest is not None else None
+        scored: list[tuple[int, float, dict, list[str]]] = []
         for cand in candidates:
-            hits = 0
-            for kw in cand.get("keywords") or ():
-                if kw in recent_text_lower:
-                    hits += 1
-            if hits >= 2:
-                scored.append((hits, float(cand.get("created") or 0.0), cand))
+            hits = [kw for kw in cand.get("keywords") or () if chat_feed.contains(kw, text)]
+            if len(hits) < 2:
+                continue
+            spec = cand.get("spec")
+            if spec is None:
+                spec = {kw for kw in cand.get("keywords") or () if chat_feed.specific(kw)}
+            if not any(kw in spec for kw in hits):
+                continue
+            if last is not None and not any(chat_feed.contains(kw, last) for kw in hits):
+                continue
+            scored.append((len(hits), float(cand.get("created") or 0.0), cand, hits))
         scored.sort(key=lambda t: (-t[0], -t[1]))
-        return [c for _, _, c in scored]
+        return [(c, h) for _, _, c, h in scored]
+
+    @staticmethod
+    def match(candidates: list[dict], recent_text_lower: str) -> list[dict]:
+        return [c for c, _ in TopicMatcher.match_hits(candidates, recent_text_lower)]
 
     # ------------------------------------------------------------------
     # 30 分钟 3 轮节制
@@ -273,37 +284,87 @@ class TopicMatcher:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _format_line(cand: dict) -> str:
+    def _format_line(cand: dict, mode: str = "topic") -> str:
+        """2026-10-01：写成 MaiBot 自己看到过的事，不提 MaiWork；链接只在有人追问出处时给。"""
         snippet = str(cand.get("body") or "")[: TopicMatcher.SNIPPET_LEN]
         link = str(cand.get("link") or "")
-        link_part = f"（{link}）" if link else ""
-        return (
-            "群里正在聊的话题和 MaiWork 之前找过的东西对上了，可以自然接一句："
-            f"{cand.get('title') or ''}——{snippet}{link_part}"
-        )
+        link_part = f"（有人问出处再给：{link}）" if link else ""
+        what = f"{cand.get('title') or ''}——{snippet}{link_part}"
+        if str(cand.get("key") or "").startswith("idea:"):
+            return f"群里在聊的和你之前想到的一个点子有关，想接就自然接一句：{what}"
+        if mode == "ask":
+            return f"群里有人在问最近有什么新鲜事，你最近看到过这条，想说就挑着说、别照念：{what}"
+        return f"你最近看到过这条，和群里在聊的有关，想接就自然接一句、别照念：{what}"
 
-    def memo_lines(self, group_id: str, kwargs: Any, now: Optional[float] = None) -> list[tuple[str, str]]:
-        """命中 → [(行文本, 候选 key)]，最多 TAKE 条。调用方注入后要 record_injected。"""
+    def chat_bodies(self, kwargs: Any) -> tuple[list[str], list[str]]:
+        """kwargs["items"] → (群友发言, MaiBot 自己的发言)，都按时间从旧到新。"""
+        users: list[str] = []
+        selfs: list[str] = []
+        try:
+            items = kwargs.get("items") if isinstance(kwargs, dict) else None
+            for item in items if isinstance(items, list) else ():
+                parts = item.get("parts") if isinstance(item, dict) else None
+                for part in parts if isinstance(parts, list) else ():
+                    if not isinstance(part, dict) or part.get("type") != "text":
+                        continue
+                    text = part.get("text")
+                    if not isinstance(text, str):
+                        continue
+                    for is_self, body in self._parse_chat_bodies(text):
+                        (selfs if is_self else users).append(body[:1200])
+        except Exception:
+            return [], []
+        return users, selfs
+
+    def _ask_candidates(self, cands: list[dict], ts: float) -> list[dict]:
+        news = [
+            c for c in cands
+            if str(c["key"]).startswith("news:") and c.get("liked", True)
+            and float(c.get("created") or 0.0) >= ts - self.ASK_DAYS * 86400
+        ]
+        news.sort(key=lambda c: (-float(c.get("score") or 0.0), -float(c.get("created") or 0.0)))
+        return news
+
+    def memo_entries(self, group_id: str, kwargs: Any, now: Optional[float] = None) -> list[dict]:
+        """命中 → [{text, key, mode, title, hit, words, link}]，最多 TAKE 条（话题在前、问新鲜事在后）。"""
         gid = str(group_id)
         ts = clock.now() if now is None else float(now)
         try:
-            text = self.recent_chat_text(kwargs)
-            if not text:
+            users, _ = self.chat_bodies(kwargs)
+            users = users[-self.RECENT_LIMIT:]
+            if not users:
                 return []
             cands = self.candidates_for(gid, ts)
             if not cands:
                 return []
-            out: list[tuple[str, str]] = []
-            for cand in self.match(cands, text):
+            latest = "\n".join(users[-2:])
+            picked: list[tuple[dict, str, list[str]]] = [
+                (c, "topic", h) for c, h in self.match_hits(cands, "\n".join(users), latest)
+            ]
+            if chat_feed.is_ask(latest):
+                picked += [(c, "ask", []) for c in self._ask_candidates(cands, ts)]
+            out: list[dict] = []
+            seen: set[str] = set()
+            for cand, mode, hits in picked:
+                key = str(cand["key"])
                 if len(out) >= self.TAKE:
                     break
-                if self._jab_count(gid, str(cand["key"]), ts) >= self.JAB_MAX:
+                if key in seen or self._jab_count(gid, key, ts) >= self.JAB_MAX:
                     continue
-                out.append((self._format_line(cand), str(cand["key"])))
+                seen.add(key)
+                out.append({
+                    "text": self._format_line(cand, mode), "key": key, "mode": mode,
+                    "title": str(cand.get("title") or ""), "hit": hits,
+                    "words": list(cand.get("keywords") or ()), "link": str(cand.get("link") or ""),
+                })
             return out
         except Exception:
-            logger.exception("TopicMatcher.memo_lines 异常，已吞掉（群 %s）", gid)
+            logger.exception("TopicMatcher.memo_entries 异常，已吞掉（群 %s）", gid)
             return []
+
+    def memo_lines(self, group_id: str, kwargs: Any, now: Optional[float] = None) -> list[tuple[str, str]]:
+        """命中 → [(行文本, 候选 key)]，最多 TAKE 条。调用方注入后要 record_injected。"""
+        return [(e["text"], e["key"]) for e in self.memo_entries(group_id, kwargs, now)]
 
 
 class Mentions:
@@ -319,6 +380,8 @@ class Mentions:
         self._store = store
         self._get_settings = get_settings
         self._topics = TopicMatcher(store)
+        # 每群见过的 MaiBot 发言（判「聊到了」只看新发言；重载后第一次只当底）
+        self._seen_self: dict[str, set[str]] = {}
 
     @staticmethod
     def _served_group_id_for_session(store: Store, session_id: str) -> str:
@@ -388,19 +451,42 @@ class Mentions:
         self._decrement_turns(used_ids, group_id)
         return HEADER + "\n" + "\n".join(lines)
 
+    def _check_said(self, group_id: str, kwargs: Any) -> None:
+        """MaiBot 的新发言里提到了刚递过的资讯 → chat_feeds 记「聊到了」（chat_feed.check_said）。"""
+        gid = str(group_id)
+        try:
+            _, selfs = self._topics.chat_bodies(kwargs)
+            seen = self._seen_self.get(gid)
+            if seen is None:
+                self._seen_self[gid] = set(selfs)
+                return
+            new = [b for b in selfs if b not in seen]
+            if not new:
+                return
+            seen.update(new)
+            if len(seen) > 500:
+                self._seen_self[gid] = set(selfs)
+            with self._store.tx() as conn:
+                chat_feed.check_said(conn, gid, new, clock.now())
+        except Exception:
+            logger.exception("资讯反哺：判「聊到了」失败（group=%s）", gid)
+
     def _memo_with_topics(self, group_id: str, kwargs: Any) -> Optional[str]:
         """话题接龙行排前面 + 已存备忘，共用同一个 300 字总上限；没货 → None。"""
-        topic_entries = self._topics.memo_lines(group_id, kwargs)
+        self._check_said(group_id, kwargs)
+        topic_entries = self._topics.memo_entries(group_id, kwargs)
         lines: list[str] = []
         used_ids: list[int] = []
         used_keys: list[str] = []
+        used_entries: list[dict] = []
         remaining = MAX_TEXT_LENGTH - len(HEADER)
-        for text, key in topic_entries:
-            line = f"- {text}"
+        for entry in topic_entries:
+            line = f"- {entry['text']}"
             if len(line) > remaining:
                 continue
             lines.append(line)
-            used_keys.append(key)
+            used_keys.append(entry["key"])
+            used_entries.append(entry)
             remaining -= len(line) + 1
         for r in self._mention_rows(group_id):
             line = f"- {r['text']}"
@@ -417,6 +503,11 @@ class Mentions:
                 self._topics.record_injected(group_id, used_keys)
             except Exception:
                 logger.exception("话题接龙记账失败（group=%s）", group_id)
+            try:
+                with self._store.tx() as conn:
+                    chat_feed.record(conn, str(group_id), used_entries, clock.now())
+            except Exception:
+                logger.exception("资讯反哺记账失败（group=%s）", group_id)
         return HEADER + "\n" + "\n".join(lines)
 
     def _resolve_group(self, session_id: str) -> str:

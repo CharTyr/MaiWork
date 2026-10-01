@@ -80,7 +80,7 @@ import re as _re
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
-from . import clock, members, news_rating, news_standard
+from . import chat_feed, clock, members, news_rating, news_standard
 from .config import Settings, normalize_domain as _normalize_domain
 from .models import ModelError
 from .search import SearchUnavailable
@@ -5101,6 +5101,8 @@ class Feeds:
             "feedback": {"up": int(r["up"] or 0), "down": int(r["down"] or 0)},
             # 「后续」：同一件事的新进展（{of_title, new_fact}）；不是后续 → None
             "followup": _followup_view(_row_get(r, "followup", "")),
+            # 资讯反哺闲聊（2026-10-01）：群里聊到相关话题时递给 MaiBot 几次、哪次它聊到了
+            "chat_feed": chat_feed.item_stats(self._store.read(), str(_row_get(r, "group_id", "") or ""), f"news:{int(r['id'])}"),
         }
 
     def guides_view(self, group_id: str, *, days: int = _GUIDES_VIEW_DAYS, admin: bool = False) -> list[dict]:
