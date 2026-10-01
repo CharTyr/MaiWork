@@ -382,6 +382,8 @@ class Approvals:
                             request_id=request_id,
                             icon=str(row["icon"] or "bullseye"),
                             conn=conn,
+                            who_id=str(row["requester_id"] or ""),
+                            who_name=requester_name,
                         )
                     )
                 else:
@@ -427,6 +429,8 @@ class Approvals:
                     request_id=request_id,
                     icon=str(row["icon"] or "bullseye"),
                     conn=conn,
+                    who_id=str(row["requester_id"] or ""),
+                    who_name=requester_name,
                 )
             )
         task_id = task_ids[0] if task_ids else None
@@ -669,7 +673,8 @@ class Approvals:
             return False
         if kind == "task":
             return _norm(obj.get("requester_id")) == uid
-        # goal：agent 目标用 who_id 记发起人；成员目标是本人的事，本人可取消
+        # goal：agent 目标用 who_id 记发起人（批准落地时写，见 Approvals._land；老目标由迁移
+        # _m_goal_requester 从请求补）；成员目标是本人的事，本人可取消
         return _norm(obj.get("who_id")) == uid
 
     # ------------------------------------------------------------------

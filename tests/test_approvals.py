@@ -618,3 +618,55 @@ class TestCurrentNames:
         r = ap.create(GID, kind="goal", title="盯着活动", quote="看活动", via="群里 @",
                       requester_id="99999", requester_name="")
         assert goals.get(r["goal_id"])["by_text"].startswith("群友 发起")
+
+
+class TestGoalRequesterCanCancel:
+    """2026-10-01 用户发现：群友发起的 agent 目标，本人 /mw 取消 被拒——
+    建目标时没存发起人（who_id），取消权限却只认它。走真实路径：派活 → 批准 → 本人取消。"""
+
+    @pytest.fixture
+    def ap(self, mem_store, tasks, goals) -> Approvals:
+        return _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True, admins=("42",)))
+
+    def test_requester_cancels_own_goal_after_approval(self, ap, goals):
+        r = ap.create(GID, **dict(_DEFAULTS, kind="goal", title="帮我们盯着活动日历"))
+        out = ap.approve(r["id"], by="42")
+        gid_ = out["goal_id"]
+        g = goals.get(gid_)
+        assert g["who_id"] == "10001" and g["who_name"] == "阿柒"
+        assert ap.can_cancel("goal", gid_, "10001", group_role="member") is True
+        assert ap.can_cancel("goal", gid_, "99999", group_role="member") is False
+
+    def test_requester_cancels_goal_item_from_idea(self, ap, mem_store, goals):
+        with mem_store.tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO ideas (group_id, icon, title, body, items, state, created, updated)"
+                " VALUES (?, 'books', '铝价表', '整理铝价', ?, 'new', 1, 1)",
+                (GID, json.dumps([{"kind": "goal", "title": "每周更新铝价表", "desc": "盯着"}], ensure_ascii=False)),
+            )
+            idea_id = int(cur.lastrowid or 0)
+        r = ap.create(GID, **dict(_DEFAULTS, idea_id=idea_id, via="来自构想"))
+        gid_ = ap.approve(r["id"], by="42")["goal_id"]
+        assert goals.get(gid_)["who_id"] == "10001"
+        assert ap.can_cancel("goal", gid_, "10001", group_role="member") is True
+
+    def test_old_goal_without_who_backfilled_from_request(self, ap, mem_store, goals):
+        """老库里已经建好、没存发起人的目标：迁移按 request_id 从请求里补回来。"""
+        from CharTyr_MaiWork.maiwork import store as store_mod
+
+        r = ap.create(GID, **dict(_DEFAULTS, kind="goal", title="盯着"))
+        gid_ = ap.approve(r["id"], by="42")["goal_id"]
+        with mem_store.tx() as conn:
+            conn.execute("UPDATE goals SET who_id='', who_name='' WHERE id=?", (gid_,))
+            store_mod._m_goal_requester(conn)
+        g = goals.get(gid_)
+        assert g["who_id"] == "10001" and g["who_name"] == "阿柒"
+        assert ap.can_cancel("goal", gid_, "10001", group_role="member") is True
+
+    def test_goal_without_requester_still_needs_admin(self, ap, goals):
+        """管理员对话 / 网页直接立的目标没有发起人：群友不能取消，管理员仍能。"""
+        gid_ = goals.create_agent(GID, title="t", body="b", criteria=["c"], by_text="bot 管理员")
+        assert goals.get(gid_)["who_id"] == ""
+        assert ap.can_cancel("goal", gid_, "", group_role="member") is False
+        assert ap.can_cancel("goal", gid_, "10001", group_role="member") is False
+        assert ap.can_cancel("goal", gid_, "42", group_role="member") is True

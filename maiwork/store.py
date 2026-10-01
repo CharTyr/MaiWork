@@ -864,8 +864,24 @@ def _m_idea_origin(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE ideas ADD COLUMN origin TEXT NOT NULL DEFAULT ''")
 
 
+# 2026-10-01 修：群友派的 agent 目标批准落地时没存发起人（who_id），`/mw 取消` 的
+# 「发起人能取消」只认它 → 本人取消不了。新建的已在落地时写上；老目标按 request_id
+# 从请求里补回发起人（只补空的，不覆盖）。
+def _m_goal_requester(conn: sqlite3.Connection) -> None:
+    tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if not {"goals", "requests"} <= tables:
+        return
+    conn.execute(
+        "UPDATE goals SET"
+        " who_id=(SELECT r.requester_id FROM requests r WHERE r.id=goals.request_id),"
+        " who_name=(SELECT r.requester_name FROM requests r WHERE r.id=goals.request_id)"
+        " WHERE kind='agent' AND who_id='' AND request_id IS NOT NULL AND request_id!=''"
+        " AND EXISTS (SELECT 1 FROM requests r WHERE r.id=goals.request_id AND r.requester_id!='')"
+    )
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester]
 
 
 class Store:

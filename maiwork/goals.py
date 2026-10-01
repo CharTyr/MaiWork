@@ -77,18 +77,25 @@ class Goals:
         request_id: str | None = None,
         icon: str = "bullseye",
         conn: sqlite3.Connection | None = None,
+        who_id: str = "",
+        who_name: str = "",
     ) -> str:
-        """Create an agent goal; an optional caller-owned connection joins its transaction."""
+        """Create an agent goal; an optional caller-owned connection joins its transaction.
+
+        who_id / who_name = 发起人（群友派的活批准落地时传；管理员直接立的留空）。
+        `/mw 取消` 的「发起人可以取消」只认 who_id（approvals.can_cancel）。
+        """
         now = clock.now()
         crit = [{"text": str(c), "done": False} for c in criteria]
         with (self._store.tx() if conn is None else nullcontext(conn)) as conn:
             gid = next_id(conn, "G")
             conn.execute(
-                "INSERT INTO goals (id, group_id, kind, icon, title, body, by_text, criteria,"
+                "INSERT INTO goals (id, group_id, kind, icon, title, body, who_id, who_name, by_text, criteria,"
                 " state, next_check_ts, request_id, created, updated)"
-                " VALUES (?, ?, 'agent', ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
+                " VALUES (?, ?, 'agent', ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
                 (
                     gid, str(group_id), str(icon or "bullseye"), str(title), str(body or ""),
+                    str(who_id or ""), str(who_name or ""),
                     str(by_text or ""), json.dumps(crit, ensure_ascii=False),
                     now + _AGENT_NEXT_CHECK_S, request_id, now, now,
                 ),
