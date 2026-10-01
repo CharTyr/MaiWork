@@ -549,6 +549,15 @@ class MaiWorkApp:
         # （它们都吃 `_specialists` 注入点）。没就位 → None，网页 API（server.py）503、
         # 业务走老路并记一行日志——绝不静默换成「通才 worker」。
         self.agents = self._make_agents()
+        # 上个进程没收尾的交接单（验收都在同一进程里紧接着做，进程换了就没人收了）→ cancelled；
+        # 和上面 interrupt_orphaned 收任务 / 尝试是同一个道理（外部审查 2026-10-02）
+        if self.agents is not None:
+            try:
+                n = self.agents.cancel_unsettled(why="插件重启，上一轮没人接手")
+                if n:
+                    logger.info("收掉上次没收尾的交接单 %d 张", n)
+            except Exception:
+                logger.exception("启动时收残留交接单出错，继续")
         # 2026-10 模型改版 1a：模型路由读岗位 profile（model/backup）；挂上即生效（清缓存）
         if self.agents is not None and self.models is not None:
             try:
@@ -1985,6 +1994,13 @@ class MaiWorkApp:
             except Exception:
                 logger.exception("停任务 %s 的后台协程出错", tid)
         self._running_tasks.discard(tid)
+        # 被停掉的协程不会再来验收：它名下没收尾的交接单收成 cancelled（尝试由
+        # Tasks.transition(→cancelled) 同一事务里作废）——外部审查 2026-10-02
+        if self.agents is not None:
+            try:
+                self.agents.cancel_unsettled(task_id=tid, why="任务已取消")
+            except Exception:
+                logger.exception("收任务 %s 的交接单出错", tid)
         return stopped
 
     async def _run_task_guarded(self, task_id: str) -> None:

@@ -44,7 +44,7 @@ import stat
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from . import clock
+from . import clock, privacy
 from .privacy import scrub as _privacy_scrub
 
 logger = logging.getLogger("maiwork.identity")
@@ -417,60 +417,79 @@ class Identity:
         return self.agent_read(kind, which)
 
     async def agent_sync_soul(self, kind: str) -> dict[str, Any]:
-        """从 MaiBot 同步生成这一份 SOUL（协程）。旧版存 SOUL.md.bak；内容没变就不覆盖；
-        MaiBot 完全没人格 → 写空串（让子 agent 的 SOUL 真留空，不塞占位人格模板）。
-        返回 {"text","updated_ts","synced_from_maibot":True,"preview_changed":bool}。"""
+        """从 MaiBot 同步生成这一份专岗 SOUL（协程）；规则见 _sync_soul_file。
+        专岗的兜底是空串（别给子 agent 灌「# 我是谁 / 边界」的占位模板）。
+        返回 {"text","updated_ts","synced_from_maibot","preview_changed"[, "persona_missing"]}。"""
         path = self._agent_path(kind, "soul")
-        got: dict[str, str] = {}
-        host = self._host
-        if host is not None:
-            keys = ["bot.nickname", "personality.personality", "personality.reply_style", *_EXTRA_PERSONALITY_KEYS]
-            for key in keys:
-                try:
-                    val = await host.config(key)
-                except Exception:
-                    val = None
-                if val is not None and str(val).strip():
-                    got[key] = str(val).strip()
-        new_text = self._render_soul(got, {}) if got else ""
-        # 有人格才用模板渲染；完全没人格就留空（别给子 agent 灌一堆「# 我是谁 / 边界」的占位文字）
-        old_text = ""
-        try:
-            old_text = path.read_text(encoding="utf-8")
-        except OSError:
-            old_text = ""
+        kind_s = str(kind).strip()
         self._ensure_dirs()
         path.parent.mkdir(parents=True, exist_ok=True)
         self._chmod(path.parent, 0o700)
-        kind_s = str(kind).strip()
-        if not path.exists():
-            # 文件压根还没建（新 kind 首次同步）：落盘（哪怕空串）让「就位」成立
-            self._write_file(path, new_text)
-            self._agent_set_soul_synced(kind, True)
-            out = self.agent_read(kind, "soul")
-            out["preview_changed"] = bool(new_text.strip())
-            return out
-        if self._normalize(old_text) != self._normalize(new_text):
-            self._write_file(path.with_suffix(".md.bak"), old_text)
-            self._write_file(path, new_text)
-            self._agent_set_soul_synced(kind, True)
-            if kind_s == "main":
-                # 主模型那一份也镜像回旧全局 SOUL.md：admin_chat 等还在 prompt_block("soul")
-                # / read("soul") 的调用方走的就是 main 的专岗文档，两边本来就是一回事
-                try:
-                    self._write_file(self._root / "SOUL.md.bak", self._read_text_or_empty(self._path_of("soul")))
-                    self._write_file(self._path_of("soul"), new_text)
-                    self._set_soul_synced(True)
-                except OSError:
-                    pass
-            out = self.agent_read(kind, "soul")
-            out["preview_changed"] = True
-            return out
-        if not self._agent_synced_mark_path(kind).exists():
-            self._agent_set_soul_synced(kind, True)
+        changed, missing = await self._sync_soul_file(
+            path, fallback="", set_flag=lambda f: self._agent_set_soul_synced(kind_s, f),
+        )
+        if changed and kind_s == "main":
+            # 主模型那一份也镜像回旧全局 SOUL.md：admin_chat 等还在 prompt_block("soul")
+            # / read("soul") 的调用方走的就是 main 的专岗文档，两边本来就是一回事
+            try:
+                self._overwrite_with_bak(self._path_of("soul"), path.read_text(encoding="utf-8"))
+                self._set_soul_synced(True)
+            except OSError:
+                pass
         out = self.agent_read(kind, "soul")
-        out["preview_changed"] = False
+        out["preview_changed"] = changed
+        if missing:
+            out["persona_missing"] = True
         return out
+
+    async def _maibot_persona(self) -> dict[str, str]:
+        """读 MaiBot 的昵称 / 人格文字字段；读不到的键跳过，一个都没有就是空 dict。"""
+        got: dict[str, str] = {}
+        host = self._host
+        if host is None:
+            return got
+        keys = ["bot.nickname", "personality.personality", "personality.reply_style", *_EXTRA_PERSONALITY_KEYS]
+        for key in keys:
+            try:
+                val = await host.config(key)
+            except Exception:
+                val = None
+            if val is not None and str(val).strip():
+                got[key] = str(val).strip()
+        return got
+
+    def _overwrite_with_bak(self, path: Path, new_text: str) -> None:
+        """写新内容；旧内容非空才先存 <name>.bak（被覆盖的是空文件就没有可备份的）。"""
+        old_text = self._read_text_or_empty(path)
+        if old_text.strip():
+            self._write_file(path.with_suffix(".md.bak"), old_text)
+        self._write_file(path, new_text)
+
+    async def _sync_soul_file(
+        self, path: Path, *, fallback: str, set_flag: Callable[[bool], None],
+    ) -> tuple[bool, bool]:
+        """全局 SOUL 和专岗 SOUL 共用的「从 MaiBot 同步」规则，返回 (改没改, 没读到人格)。
+
+        - 读到人格：渲染出新内容，和现在不同才覆盖（旧内容非空才存 .bak），标「已同步」；
+        - 没读到人格：绝不覆盖已有内容；文件不存在或是空的才写兜底（全局 = 带边界三条的
+          模板，专岗 = 空），标「未同步」——不把兜底冒充成同步来的（外部审查 2026-10-02）。
+        """
+        got = await self._maibot_persona()
+        old_text = self._read_text_or_empty(path)
+        if not got:
+            changed = False
+            if not path.exists() or (not old_text.strip() and fallback.strip()):
+                self._write_file(path, fallback)
+                changed = bool(fallback.strip())
+                set_flag(False)
+            return changed, True
+        new_text = self._render_soul(got, {})
+        if not path.exists() or self._normalize(old_text) != self._normalize(new_text):
+            self._overwrite_with_bak(path, new_text)
+            set_flag(True)
+            return True, False
+        set_flag(True)  # 内容和 MaiBot 现在的人格一致：就是同步的
+        return False, False
 
     def agent_reset_agents(self, kind: str) -> dict[str, Any]:
         """把 AGENTS.md 换回 agent_presets/<kind>.md 的内容（自定义专岗回落 custom.md）。
@@ -672,7 +691,7 @@ class Identity:
             except Exception:
                 logger.exception("首次从 MaiBot 同步 SOUL 出错，用兜底版")
                 self._write_file(soul, self._render_soul({}, {}))
-                self._set_soul_synced(True)  # 兜底版也算「来自 MaiBot 同步流程」的默认份
+                self._set_soul_synced(False)  # 兜底模板不是从 MaiBot 来的，标「未同步」
         else:
             # 兜底：老部署可能只有空文件/半截文件——不自动覆盖，只保证文件存在
             self._chmod(soul, 0o600)
@@ -732,7 +751,10 @@ class Identity:
                 # 迁移来的不算「从 MaiBot 同步出来的」（main 那份内容其实是管理员维护过的）
                 # 但首次没有主管理员动过，标 synced 让前端「已和 MaiBot 同步」不闪——main
                 # 若真来自旧全局就给 False，否则（用了 MaiBot 人格或空兜底）给 True
-                self._agent_set_soul_synced(kind, not (kind == "main" and global_soul.strip()))
+                # 没读到人格写的空份也不算同步（外部审查 2026-10-02：别冒充「已同步」）
+                self._agent_set_soul_synced(
+                    kind, not (kind == "main" and global_soul.strip()) and bool(persona_text),
+                )
             if not agents_p.exists():
                 # main：老部署管理员改过的全局 AGENTS.md 拷过来；但全局还是出厂默认模板
                 # （没人维护过）时别拷那份旧的，直接用 main 岗位预设（它含「派给哪个专岗」
@@ -768,51 +790,29 @@ class Identity:
         }.get(kind, "")
 
     async def sync_soul_from_maibot(self) -> dict:
-        """从 MaiBot 重新生成 SOUL。覆盖前旧版存 SOUL.md.bak；生成内容没变就不覆盖。
+        """从 MaiBot 重新生成全局 SOUL；规则见 _sync_soul_file（兜底是带边界三条的模板）。
+        改了就把 main 的专岗 SOUL 跟着同步（前端「主模型」页点同步走的就是它）。
 
-        返回单项 {"text","updated_ts","synced_from_maibot":True,"preview_changed":bool}。
+        返回单项 {"text","updated_ts","synced_from_maibot","preview_changed"[, "persona_missing"]}。
         """
-        got: dict[str, str] = {}
-        host = self._host
-        if host is not None:
-            keys = ["bot.nickname", "personality.personality", "personality.reply_style", *_EXTRA_PERSONALITY_KEYS]
-            for key in keys:
-                try:
-                    val = await host.config(key)
-                except Exception:
-                    val = None
-                if val is not None and str(val).strip():
-                    got[key] = str(val).strip()
-        new_text = self._render_soul(got, {})
-        soul_path = self._path_of("soul")
-        old_text = ""
-        try:
-            old_text = soul_path.read_text(encoding="utf-8")
-        except OSError:
-            old_text = ""
         self._ensure_dirs()
-        if self._normalize(old_text) != self._normalize(new_text):
-            bak = self._root / "SOUL.md.bak"
-            self._write_file(bak, old_text)  # 覆盖前旧版存 .bak（首次为空也留档）
-            self._write_file(soul_path, new_text)
-            self._set_soul_synced(True)
-            # 专岗改版 3/4：main 的专岗 SOUL 跟着一起同步（前端「主模型」页点同步走的就是它）
+        soul_path = self._path_of("soul")
+        changed, missing = await self._sync_soul_file(
+            soul_path, fallback=self._render_soul({}, {}), set_flag=self._set_soul_synced,
+        )
+        if changed and not missing:
             try:
                 main_path = self._agent_path("main", "soul")
                 main_path.parent.mkdir(parents=True, exist_ok=True)
                 self._chmod(main_path.parent, 0o700)
-                self._write_file(main_path, new_text)
+                self._overwrite_with_bak(main_path, soul_path.read_text(encoding="utf-8"))
                 self._agent_set_soul_synced("main", True)
             except (KeyError, OSError):
                 pass
-            out = self.read("soul")
-            out["preview_changed"] = True
-            return out
-        # 没变：不覆盖，也不动 .bak；但若从来没同步过（手动建的文件），标记位不动
-        if not (self._root / ".soul_synced").exists():
-            self._set_soul_synced(True)
         out = self.read("soul")
-        out["preview_changed"] = False
+        out["preview_changed"] = changed
+        if missing:
+            out["persona_missing"] = True
         return out
 
     @staticmethod
@@ -922,13 +922,17 @@ class Identity:
             if cleaned is None:
                 return "这段含私下画像的细节，不宜记下来（连本群记忆也不写）"
             return None
-        # global：一、不许写长数字（群号/QQ 号）
-        if re.search(rf"\d{{{_GLOBAL_NUMBER_RUN},}}", text):
+        # global：先归一化（拆空格 / 零宽 / 全角 / 中文数字 / 大小写都还原），再过闸。
+        # 日期里的「-」不去，所以「2026-10-02」不会被当成长数字。
+        folded = privacy.fold(text)
+        # 一、不许写长数字（群号/QQ 号）
+        if re.search(rf"\d{{{_GLOBAL_NUMBER_RUN},}}", folded):
             return "全局记忆里不能写具体的群和人（不许带 QQ 号 / 群号），改记到本群记忆"
         # 二、不许点名：全部服务群关注成员 + 「名字数>3」的群成员名单
         names = self._global_forbidden_names()
         for name in names:
-            if name and len(name) >= 2 and name in text:
+            key = privacy.fold(name)
+            if len(key) >= 2 and key in folded:
                 return f"全局记忆里不能写具体的群和人（「{name}」是某个群的人），改记到本群记忆"
         # 三、全部服务群的 privacy.scrub 各过一遍（别的群的画像细节也不能写进全局）
         for g in self._served_groups():

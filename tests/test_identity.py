@@ -323,6 +323,57 @@ def test_remember_scrub_rejects_persona_fragments(tmp_path: Path, store: Store) 
     assert "不宜" in out2.get("error", "") or "私下" in out2.get("error", "")
 
 
+def test_remember_global_gate_sees_through_disguised_numbers(tmp_path: Path, store: Store) -> None:
+    """外部审查 2026-10-02：拆空格 / 中文数字 / 全角 / 零宽字符写的群号也得拦。"""
+    identity = _make(tmp_path, store)
+    _run(identity.ensure_started())
+    for text in (
+        "群 90 21 06 喜欢短视频",
+        "记得九零二一零六的人爱看番",
+        "群９０２１０６喜欢短视频",
+        "群 90\u200b2106 喜欢短视频",
+        "记得玖零贰壹零陆的人爱看番",
+    ):
+        out = identity.remember_sync(scope="global", text=text, reason="x")
+        assert out["ok"] is False, text
+        assert "全局记忆" in out.get("error", "")
+    # 日期、小数字照常能记
+    ok = identity.remember_sync(scope="global", text="2026-10-02 起周报改周五发，一两句就够", reason="x")
+    assert ok["ok"] is True
+
+
+def test_remember_global_gate_sees_through_disguised_names(tmp_path: Path, store: Store) -> None:
+    """名字中间插空格 / 零宽字符、英文名换大小写，也算点名。"""
+    with store.tx() as conn:
+        conn.execute(
+            "INSERT INTO focus_members (group_id, user_id, name, note, removed) VALUES (?, ?, ?, ?, 0)",
+            (GID, "42", "阿帆", ""),
+        )
+        conn.execute(
+            "INSERT INTO focus_members (group_id, user_id, name, note, removed) VALUES (?, ?, ?, ?, 0)",
+            (GID, "43", "Leo", ""),
+        )
+    identity = _make(tmp_path, store)
+    _run(identity.ensure_started())
+    for text in ("阿 帆说深科技视频别推了", "阿\u200d帆说深科技视频别推了", "LEO 说表格看着累"):
+        out = identity.remember_sync(scope="global", text=text, reason="x")
+        assert out["ok"] is False, text
+
+
+def test_privacy_scrub_sees_through_spacing(tmp_path: Path, store: Store) -> None:
+    """画像片段中间插空格 / 零宽字符照样拦。"""
+    with store.tx() as conn:
+        conn.execute(
+            "INSERT INTO focus_members (group_id, user_id, name, note, removed) VALUES (?, ?, ?, ?, 0)",
+            (GID, "42", "阿帆", "他偷偷在学钢琴所以晚上常不在线"),
+        )
+    from maiwork import privacy
+
+    assert privacy.scrub(GID, "听说他偷偷 在学钢 琴所以 晚上常不 在线", store) is None
+    assert privacy.scrub(GID, "听说他偷偷在学\u200b钢琴所以\u200b晚上常不在线", store) is None
+    assert privacy.scrub(GID, "今天天气不错", store) == "今天天气不错"
+
+
 def test_remember_evicts_oldest_when_over_limit(tmp_path: Path, store: Store) -> None:
     """写满 16KB 后最旧的被淘汰；先写不满的条目一条都不能少（守住「不过度淘汰」）。"""
     identity = _make(tmp_path, store)
@@ -537,5 +588,6 @@ async def test_identity_api_soul_sync_and_bak(web_env: Any) -> None:
     assert data["soul"]["synced_from_maibot"] is True
     assert data["soul"]["text"] != "管理员自写 SOUL"
     assert data["preview_changed"] is True
+    assert data["persona_missing"] is False
     bak = (Path(web_env.app.get_settings().data_dir) / "identity" / "SOUL.md.bak").read_text(encoding="utf-8")
     assert bak == "管理员自写 SOUL"

@@ -18,11 +18,25 @@ from __future__ import annotations
 
 import json
 import logging
+import unicodedata
 from typing import Any, Optional
 
 logger = logging.getLogger("maiwork.privacy")
 
 _NOTE_FRAGMENT = 8
+
+# 中文数字（含大写）→ 阿拉伯数字；不含「十 / 百 / 两」——那些是量词，换了反而改意思
+_CN_DIGITS = str.maketrans("〇零一二三四五六七八九壹贰叁肆伍陆柒捌玖", "00123456789123456789")
+
+
+def fold(text: str) -> str:
+    """比对前的归一化（外部审查 2026-10-02）：拆空格、零宽字符、全角、中文数字、大小写都不算换了写法。
+
+    只用于「是不是含某段文字 / 长数字」的判断，不改要存或要发的原文。
+    """
+    s = unicodedata.normalize("NFKC", str(text or ""))
+    s = "".join(ch for ch in s if not ch.isspace() and unicodedata.category(ch) != "Cf")
+    return s.translate(_CN_DIGITS).casefold()
 
 
 def _focus_rows(store: Any, group_id: str) -> list[dict]:
@@ -57,7 +71,14 @@ def _focus_rows(store: Any, group_id: str) -> list[dict]:
 
 
 def _contains_note_fragment(text: str, note: str) -> bool:
-    """note 的任何长度≥8 连续片段出现在 text 里 → True。"""
+    """note 的任何长度≥8 连续片段出现在 text 里 → True。
+
+    原文比一次、fold 后再比一次：插空格 / 零宽躲不过，原来能拦的也照样拦（只会更严）。
+    """
+    return _has_fragment(text, note) or _has_fragment(fold(text), fold(note))
+
+
+def _has_fragment(text: str, note: str) -> bool:
     n = len(note)
     if n < _NOTE_FRAGMENT:
         return False

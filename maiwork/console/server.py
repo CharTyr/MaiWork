@@ -3178,7 +3178,8 @@ class ConsoleServer:
                 return not_ready
             out = await ident.sync_soul_from_maibot()
             changed = bool(out.pop("preview_changed", False))
-            return web.json_response({"soul": out, "preview_changed": changed})
+            missing = bool(out.pop("persona_missing", False))
+            return web.json_response({"soul": out, "preview_changed": changed, "persona_missing": missing})
 
         app.router.add_post("/api/identity/soul/sync", self._write(_identity_soul_sync))
 

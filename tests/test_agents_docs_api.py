@@ -185,20 +185,27 @@ class TestPutDocs:
 class TestSyncAndReset:
     @pytest.mark.asyncio
     async def test_soul_sync_empty_persona_returns_empty(self, env) -> None:
-        """MaiBot 没人格（host=None）：同步后 SOUL 是空的，不报错。"""
+        """MaiBot 没人格（host=None）：不报错，也不把管理员写的内容清空、不标「已同步」
+        （外部审查 2026-10-02：以前会把旧内容换成空串）。"""
         await env.login()
         # 先塞点旧内容
         await env.client.put("/api/agents/news/docs/soul", json={"text": "旧版"})
         r = await env.client.post("/api/agents/news/docs/soul/sync", json={})
         assert r.status == 200
         data = await r.json()
-        # host=None → 渲染出的就是空模板人格部分的兜底版，含「# 我是谁」结构
-        assert isinstance(data["text"], str)
-        assert data["synced_from_maibot"] is True
+        assert data["text"] == "旧版"
+        assert data["synced_from_maibot"] is False
+        assert data["persona_missing"] is True
 
     @pytest.mark.asyncio
     async def test_soul_sync_saves_bak(self, env) -> None:
         await env.login()
+
+        class _Host:
+            async def config(self, key, default=None):
+                return {"bot.nickname": "小麻", "personality.personality": "慢热"}.get(key, default)
+
+        env.identity._host = _Host()  # noqa: SLF001 —— 有人格才会覆盖（才有备份）
         await env.client.put("/api/agents/news/docs/soul", json={"text": "我改过的版本"})
         r = await env.client.post("/api/agents/news/docs/soul/sync", json={})
         assert r.status == 200

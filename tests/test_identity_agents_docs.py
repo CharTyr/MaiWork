@@ -235,3 +235,48 @@ def test_agent_prompt_block_empty_when_doc_empty(tmp_path: Path, store: Store) -
     # 把 idea 的 SOUL 清空
     identity.agent_write("idea", "soul", "")
     assert identity.agent_prompt_block("idea", "soul") == ""
+
+
+# ----------------------------------------------------------------------
+# 外部审查 2026-10-02：读不到人格时两条同步路径行为一致；.bak 只在覆盖旧内容时写
+# ----------------------------------------------------------------------
+
+
+def test_sync_without_persona_never_claims_synced_or_wipes(tmp_path: Path, store: Store) -> None:
+    identity = _make(tmp_path, store, host=FakeHost({}))  # MaiBot 没配人格 / 读不到
+    _run(identity.ensure_started())
+    root = tmp_path / "data" / "identity"
+    # 首次：全局用兜底模板（带边界三条），专岗留空——但都不标「已同步」
+    assert "# 边界" in identity.read("soul")["text"]
+    assert identity.read("soul")["synced_from_maibot"] is False
+    assert identity.agent_read("news", "soul")["text"] == ""
+    assert identity.agent_read("news", "soul")["synced_from_maibot"] is False
+    # 管理员写了自己的；再点同步（还是读不到人格）：不覆盖、不写 .bak、明说没读到
+    identity.write("soul", "管理员的全局人格")
+    identity.agent_write("news", "soul", "管理员的 news 人格")
+    g = _run(identity.sync_soul_from_maibot())
+    a = _run(identity.agent_sync_soul("news"))
+    for out, text in ((g, "管理员的全局人格"), (a, "管理员的 news 人格")):
+        assert out["text"] == text
+        assert out["preview_changed"] is False
+        assert out["persona_missing"] is True
+        assert out["synced_from_maibot"] is False
+    assert not (root / "SOUL.md.bak").exists()
+    assert not (root / "agents" / "news" / "SOUL.md.bak").exists()
+
+
+def test_first_sync_over_empty_soul_writes_no_bak(tmp_path: Path, store: Store) -> None:
+    host = FakeHost({})
+    identity = _make(tmp_path, store, host=host)
+    _run(identity.ensure_started())
+    root = tmp_path / "data" / "identity"
+    (root / "SOUL.md").write_text("", encoding="utf-8")
+    host._config.update({"bot.nickname": "小麻", "personality.personality": "慢热"})  # 后来配上了人格
+    g = _run(identity.sync_soul_from_maibot())
+    a = _run(identity.agent_sync_soul("news"))
+    assert "小麻" in g["text"] and "小麻" in a["text"]
+    assert g["synced_from_maibot"] is True and a["synced_from_maibot"] is True
+    assert "persona_missing" not in g or g["persona_missing"] is False
+    # 被覆盖的旧内容是空的：没有可备份的，不留 0 字节 .bak
+    assert not (root / "SOUL.md.bak").exists()
+    assert not (root / "agents" / "news" / "SOUL.md.bak").exists()

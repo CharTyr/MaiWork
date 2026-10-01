@@ -497,6 +497,19 @@ async def test_cancelled_reraises_and_marks_cancelled(store, skills):
 
 
 @pytest.mark.asyncio
+async def test_worker_stopped_by_task_state_marks_cancelled_not_failed(store, skills):
+    """外部审查 2026-10-02：子 agent 因任务取消/暂停自己停手 → 交接单记 cancelled（不是 failed）。"""
+    agents = FakeAgents()
+    workers = FakeWorkers([WorkerReport(ok=False, summary="任务已是「cancelled」，子 agent 停手",
+                                        error="任务已取消或结束", stopped=True)])
+    sp = _mk_specialists(agents, workers, skills)
+    report = await sp.run("task", "干活", group_id="900000001", task_id="T-1")
+    assert report.ok is False and report.stopped is True
+    h = agents.handoffs("900000001", "task")[0]
+    assert h["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_report_default_handoff_id_is_empty_string():
     """老调用方 Workers 直接返回的 report 没有 handoff_id 也不炸（默认 ''）。"""
     r = WorkerReport(ok=True, summary="s")

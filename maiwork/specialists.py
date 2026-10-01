@@ -296,9 +296,11 @@ class Specialists:
         if not isinstance(report, WorkerReport):
             report = WorkerReport(ok=False, summary="", error="Workers.run 返回值不是 WorkerReport")
 
-        # returned / fail
+        # returned / fail（因任务停了而停手的：cancelled，不算它干砸）
         try:
-            if report.ok:
+            if report.stopped:
+                self._agents.fail(gid, handoff_id, str(report.error or "任务已停"), state="cancelled")
+            elif report.ok:
                 self._agents.returned(
                     gid, handoff_id, report.summary,
                     data=report.data, evidence=tuple(report.evidence or ()),

@@ -290,7 +290,9 @@ export async function act(el, e) {
         const r = await api("POST", "/api/identity/soul/sync", {});
         await loadIdentity();
         repaintSheet();
-        toast(r && r.preview_changed === false ? "和 MaiBot 现在的人格一样，没变" : "同步好了");
+        toast(r && r.persona_missing
+          ? "没读到 MaiBot 的人格设置，SOUL.md 没改"
+          : (r && r.preview_changed === false ? "和 MaiBot 现在的人格一样，没变" : "同步好了"));
       } catch (err) {
         el.disabled = false;
         toast(err.message, true);

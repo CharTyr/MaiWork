@@ -20,7 +20,7 @@ import socket
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 from xml.parsers import expat
 
 import httpx
@@ -192,7 +192,12 @@ def _public_url(url: str) -> httpx.URL:
         raise RssError("RSS 源地址必须有 http(s) 协议和主机名")
     if "@" in authority or parsed.userinfo:
         raise RssError("RSS 源地址不能带用户名或密码")
-    if host.rstrip(".").lower().endswith(".localhost") or host.rstrip(".").lower() == "localhost":
+    # 先规范化再判断：百分号解码、去掉结尾的点、小写。「127.0.0.1.」「%31%32%37.0.0.1」
+    # 这类写法以前能存进库（真去取时 DNS 那道会拦）；加源时就拦住（外部审查 2026-10-02）
+    host = unquote(host).rstrip(".").lower()
+    if not host:
+        raise RssError("RSS 源地址必须有 http(s) 协议和主机名")
+    if host.endswith(".localhost") or host == "localhost":
         raise RssError("RSS 源地址不能指向本机或内网")
     ip = _literal_ip(host)
     if ip is not None and not _public_address(str(ip)):

@@ -742,3 +742,55 @@ class TestStoreLockUsed:
             store.tx = orig_tx  # type: ignore[assignment]
         # 每一次写都必须进过 tx（≥8 次）
         assert len(entered) >= 8, f"写路径没都走 Store.tx：{entered}"
+
+
+class TestSettleLeftovers:
+    """外部审查 2026-10-02：取消 / 重载后没人收尾的交接单要收成 cancelled。"""
+
+    def test_cancel_unsettled_for_one_task(self, agents):
+        a = agents.begin(G1, "task", "a", task_id="T-1")
+        agents.running(G1, a)
+        agents.returned(G1, a, "交回了但没验收", ok=True)
+        b = agents.begin(G1, "task", "b", task_id="T-1")  # queued
+        other = agents.begin(G1, "task", "c", task_id="T-2")
+        agents.running(G1, other)
+        done = agents.begin(G1, "task", "d", task_id="T-1")
+        agents.running(G1, done)
+        agents.returned(G1, done, "s", ok=True)
+        agents.review(G1, done, True, "ok", learn=False)
+
+        n = agents.cancel_unsettled(task_id="T-1", why="任务已取消")
+        assert n == 2
+        assert agents.handoff(G1, a)["status"] == "cancelled"
+        assert agents.handoff(G1, b)["status"] == "cancelled"
+        assert agents.handoff(G1, a)["error"] == "任务已取消"
+        assert agents.handoff(G1, other)["status"] == "running"  # 别的任务不动
+        assert agents.handoff(G1, done)["status"] == "accepted"  # 终态不动
+
+    def test_cancel_unsettled_all_on_startup(self, agents):
+        a = agents.begin(G1, "news", "a", task_id="feeds-recheck:x")
+        agents.running(G1, a)
+        agents.returned(G1, a, "s", ok=True)
+        b = agents.begin(G2, "goal", "b")
+        assert agents.cancel_unsettled(why="插件重启，没人接手") == 2
+        assert agents.handoff(G1, a)["status"] == "cancelled"
+        assert agents.handoff(G2, b)["status"] == "cancelled"
+
+    def test_cancelled_custom_kind_can_be_deleted(self, agents):
+        kind = agents.create_custom("临时专岗")["kind"]
+        h = agents.begin(G1, kind, "x", task_id="T-9")
+        agents.running(G1, h)
+        agents.returned(G1, h, "s", ok=True)
+        with pytest.raises(ValueError):
+            agents.delete_custom(kind)
+        agents.cancel_unsettled(task_id="T-9", why="任务已取消")
+        assert agents.delete_custom(kind) == kind
+
+    def test_fail_same_state_twice_is_quiet(self, agents):
+        """收尾和协程自己的 CancelledError 处理会撞车：已是 cancelled 再落 cancelled 不报错。"""
+        h = agents.begin(G1, "task", "x", task_id="T-1")
+        agents.cancel_unsettled(task_id="T-1", why="任务已取消")
+        agents.fail(G1, h, "已取消", state="cancelled")  # 不抛
+        assert agents.handoff(G1, h)["status"] == "cancelled"
+        with pytest.raises(ValueError):
+            agents.fail(G1, h, "x", state="failed")  # 终态仍然不许改成别的

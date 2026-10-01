@@ -15,8 +15,12 @@
   （强度也跟着读主模型的）。旧口 role 保住：不传 agent 时 role="main" ⇒
   agent="main"，role="worker" ⇒ agent="task"（聊主对话 / 搬运的话永远 main）。
 - 思考强度：岗位 profile.effort 只在所选条目的 efforts 里勾了才发（条目空 =
-  永不发）；按协议映射（openai/responses：max 夹 high；anthropic：xhigh 夹 high、
-  output_config.effort——各家的 xhigh/max 覆盖面待实测）。
+  永不发）；原样发（openai reasoning_effort / responses reasoning.effort /
+  anthropic output_config.effort），端点 400 说不收就降到条目勾了的下一档重发，
+  同端点同模型在内存里记住（2026-10-02 外部审查）。
+- 适配（同样记在内存 _adapt）：OpenAI 官方推理模型 400 点名要 max_completion_tokens
+  时换参数名重发；HTTP 200 但响应体是错误（_embedded_error）按真实错误重试 / 换备用；
+  Responses 流的 response.incomplete 是合法终态，response.failed / error 事件带原因失败。
 - 用量：usage / model_calls 各多一列 agent（岗位 kind）；role 维持
   「主模型 / 子 agent」两桶账（兜底用主模型链的调用也记 main 桶）。
 - 就绪 = 「主模型」+「任务」岗位各自解析出至少 1 个候选（岗位选了条目、条目端点
@@ -385,25 +389,67 @@ class _StreamError(Exception):
 
 
 def _effort_for_protocol(effort: str, protocol: str | None) -> str:
-    """岗位强度 → 这个协议真发出去的值；不能发（没请求强度 / 没指名协议）返回 ""。
+    """岗位强度 → 这个协议真发出去的值；不能发（没请求强度 / 没指名协议 / 不认识）返回 ""。
 
-    - openai /responses：reasoning_effort / reasoning.effort。OpenAI 文档写过
-      minimal/low/medium/high，新模型（gpt-5.1 那代起）加了 xhigh——xhigh 原样发，
-      端点不收就用自己的 rejection 说话（上限两侧的「max」没有这值，夹成 high 最接近）。
-    - anthropic：output_config.effort（放行 low/medium/high/max；xhigh 不是官方值，
-      夹成 high）。「max 只部分模型支持」「output_config 的写法」待实测。
-    映射只按协议，不看具体模型名——同一端点代发多家模型时没法猜，靠条目的 efforts
-    勾选先把了一层关（没勾根本不走这里）。
+    2026-10-02 起原样发（外部审查 docs/16）：OpenAI（reasoning_effort / reasoning.effort）
+    和 Anthropic（output_config.effort，已 GA、不要 beta 头）现在都有 low/medium/high/xhigh/max，
+    支持哪几档看模型。以前「openai 的 max 夹 high、anthropic 的 xhigh 夹 high」已过时。
+    不看模型名猜：条目的 efforts 勾选先把一层关；端点真不收，chat() 按 400 降一档重发
+    （_effort_step_down），同端点同模型记住。
     """
     e = str(effort or "").strip().lower()
-    if not e or not protocol:
-        return ""
     p = str(protocol or "").strip().lower()
-    if p in ("openai", "responses"):
-        return "high" if e == "max" else e
-    if p == "anthropic":
-        return "high" if e == "xhigh" else e
+    if e not in _EFFORT_LEVELS or p not in ("openai", "responses", "anthropic"):
+        return ""
+    return e
+
+
+def _effort_step_down(rejected: str, ticked: Any) -> str:
+    """端点拒了 rejected 这一档：回条目勾了的、比它低的最高一档；没有就回 ""（不发强度）。"""
+    if rejected not in _EFFORT_LEVELS:
+        return ""
+    below = _EFFORT_LEVELS[: _EFFORT_LEVELS.index(rejected)]
+    for level in reversed(below):
+        if level in (ticked or ()):
+            return level
     return ""
+
+
+def _effort_capped(effort: str, cap: str | None) -> str:
+    """之前被拒过、降到 cap 的：这次请求的强度不超过 cap（cap="" = 这个模型不发强度）。"""
+    if cap is None or not effort:
+        return effort
+    if not cap:
+        return ""
+    if _EFFORT_LEVELS.index(effort) > _EFFORT_LEVELS.index(cap):
+        return cap
+    return effort
+
+
+def _embedded_error(data: Any) -> tuple[int, str] | None:
+    """HTTP 200 但响应体其实是错误（中转站故障时常见，外部审查 docs/16）。
+
+    认 OpenAI/NewAPI 的 {"error": {...}}、Responses 的 {"status":"failed","error":{...}}、
+    Anthropic 的 {"type":"error","error":{...}}；正常回答（含 Responses 的 "error": null）回 None。
+    回 (按什么状态码处理, 错误文字)：错误体里带 400~599 的数字码就用它，否则按 502（可重试、能换备用）。
+    """
+    if not isinstance(data, dict):
+        return None
+    err = data.get("error")
+    if not err and data.get("type") != "error":
+        return None
+    err = err or data
+    code: Any = None
+    if isinstance(err, dict):
+        msg = str(err.get("message") or err.get("type") or err.get("code") or "")
+        for k in ("status", "code"):
+            if isinstance(err.get(k), int):
+                code = err[k]
+                break
+    else:
+        msg = str(err)
+    status = code if isinstance(code, int) and 400 <= code <= 599 else 502
+    return status, (msg or json.dumps(err, ensure_ascii=False))[:_ERR_MAX]
 
 
 # ----------------------------------------------------------------------
@@ -438,14 +484,20 @@ def _build_openai_request(
     json_mode: bool,
     max_tokens: int,
     effort: str = "",
+    completion_tokens_param: bool = False,
 ) -> dict[str, Any]:
-    """OpenAI 兼容 /chat/completions 的请求体（流式 + 带 usage）。"""
+    """OpenAI 兼容 /chat/completions 的请求体（流式 + 带 usage）。
+
+    completion_tokens_param=True：上限字段叫 max_completion_tokens（OpenAI 官方推理模型
+    只认这个；中转站多数只认 max_tokens，所以默认还是 max_tokens，被 400 点名才换）。
+    """
+    token_key = "max_completion_tokens" if completion_tokens_param else "max_tokens"
     body: dict[str, Any] = {
         "model": model,
         "messages": _json_messages(messages, json_mode),
         "stream": True,
         "stream_options": {"include_usage": True},
-        "max_tokens": int(max_tokens),
+        token_key: int(max_tokens),
     }
     if tools:
         body["tools"] = tools
@@ -694,8 +746,8 @@ def _build_anthropic_request(
         body["tools"] = out_tools
     mapped = _effort_for_protocol(effort, "anthropic")
     if mapped:
-        # 文档写法（platform.claude.com 的 Effort 页）；「output_config 这层壳、
-        # max 只部分模型收」都待实测——模型不收会是 400，像别的 4xx 一样直接抛出来。
+        # 文档写法（platform.claude.com 的 Effort 页，2026-10 已 GA、不用 beta 头）；
+        # 哪档哪个模型收看模型——不收是 400，chat() 降一档重发。
         body["output_config"] = {"effort": mapped}
     return body
 
@@ -824,6 +876,20 @@ def _parse_responses_response(data: Any, model: str) -> "ChatResult":
     )
 
 
+# Responses 流的终态事件：completed 正常收完；incomplete 写到上限被截（已生成的内容要留住）
+_RESPONSES_TERMINAL = ("response.completed", "response.incomplete")
+
+
+def _stream_error_text(obj: dict) -> str:
+    """流里报错事件的原因：{"error":…} / {"type":"error","message":…} / response.failed 的 response.error。"""
+    err = obj.get("error")
+    if not err and isinstance(obj.get("response"), dict):
+        err = obj["response"].get("error")
+    err = err or obj
+    msg = err.get("message") if isinstance(err, dict) else err
+    return str(msg or obj.get("type") or "出错")[:500]
+
+
 def _responses_from_events(events: list[dict]) -> dict:
     """Responses 的 SSE 事件流收成「非流式形状」：拿 response.completed 里那份整的
     （在里面没有/坏了才从零散 delta 拼——想流式省等的端点才走这条路）。"""
@@ -831,12 +897,11 @@ def _responses_from_events(events: list[dict]) -> dict:
     for ev in events:
         if not isinstance(ev, dict):
             continue
-        if ev.get("type") == "response.completed" and isinstance(ev.get("response"), dict):
+        # incomplete（写到上限 / 被截）也是终态：整份 response 照收，status 让解析标成 length
+        if ev.get("type") in _RESPONSES_TERMINAL and isinstance(ev.get("response"), dict):
             completed = ev["response"]
         elif ev.get("type") == "response.failed":
-            err = ev.get("response") or ev.get("error") or {}
-            msg = err.get("message") if isinstance(err, dict) else str(err or "response.failed")
-            raise _StreamError(str(msg)[:500])
+            raise _StreamError(f"模型报错：{_stream_error_text(ev)}")
     if completed:
         return completed
     # 没有 completed：从 output_text.delta / output_item 事件自己拼（保底，待实测哪些端点这样回）
@@ -1041,6 +1106,10 @@ class Models:
         # 专岗（agents.py）：2026-10 改版 1a 起「谁用哪个模型」读岗位 profile
         # （kv["agents.profiles"] 的 model/backup）。没接（老测试/启动早期）→ 旧 [models] 四槽。
         self._agents = agents
+        # 端点+模型被 400 点名后学到的适配（只在内存，重载清零重新学）：
+        # {"<限流键>|<模型>": {"mct": True（上限字段换 max_completion_tokens）,
+        #                      "effort_cap": "high"（强度最多发到这档；"" = 不发）}}
+        self._adapt: dict[str, dict[str, Any]] = {}
 
     def set_agents(self, agents: Any) -> None:
         """app 在 Agents 就位后挂上（Models 建得比 Agents 早）；同时清缓存重算。"""
@@ -1930,16 +1999,22 @@ class Models:
             effort_send = requested_effort if requested_effort in cand.efforts else ""
             # 限流键：端点 id + 规范化地址（同一 id 换地址也不串冷却）
             endpoint = f"{getattr(ep, 'id', '')}|{self._throttle.normalize(base_url)}"
+            # 这个端点+模型以前被 400 点名学到的适配（强度封顶 / 上限字段名）
+            adapt_key = f"{endpoint}|{model}"
+            effort_send = _effort_capped(effort_send, self._adapt.get(adapt_key, {}).get("effort_cap"))
             max_tries = 1 + (ep_retries if retries is None else max(0, int(retries)))
             body_max_tokens = int(max_tokens) if (max_tokens is not None and int(max_tokens) > 0) else int(cand.max_tokens or 32768)
             if body_max_tokens <= 0:
                 body_max_tokens = 32768
             log_request = self._build_log_request(msgs, tools, json_mode, secret_keys, body_max_tokens)
             try_n = 0
+            resend = False  # 刚按 400 的点名改了请求：立刻重发，不等、不占重试次数
             while try_n < max_tries:
                 try_n += 1
                 attempt += 1
-                if try_n > 1:
+                if resend:
+                    resend = False
+                elif try_n > 1:
                     if getattr(last_err, "status", None) == 429:
                         # 429 的等待交给端点冷却门（本端点所有请求一起等，别各等各的）
                         logger.warning(
@@ -1959,8 +2034,10 @@ class Models:
                 # 请求体按协议拼（纯函数，各自注释里有 json_mode / effort 的规矩）
                 body: dict[str, Any]
                 if protocol == "openai":
-                    body = _build_openai_request(model, msgs, tools=tools, json_mode=json_mode,
-                                                 max_tokens=body_max_tokens, effort=effort_send)
+                    body = _build_openai_request(
+                        model, msgs, tools=tools, json_mode=json_mode, max_tokens=body_max_tokens,
+                        effort=effort_send, completion_tokens_param=bool(self._adapt.get(adapt_key, {}).get("mct")),
+                    )
                 elif protocol == "responses":
                     body = _build_responses_request(model, msgs, tools=tools, json_mode=json_mode,
                                                     max_tokens=body_max_tokens, effort=effort_send)
@@ -1993,9 +2070,16 @@ class Models:
                     )
                     continue
                 ms = int((clock.now() - start) * 1000)
+                http_status = status  # 记日志用真实 HTTP 码
+                shown = str(status)
+                embedded = _embedded_error(data) if status == 200 else None
+                if embedded is not None:
+                    # 200 但响应体是错误：按错误体里的码（没有按 502）走下面同一套重试 / 换备用 / 抛
+                    status, err_text = embedded
+                    shown = "200 但内容是错误"
                 if status >= 500 or status in (429, 408):
                     last_err = ModelError(
-                        _redact(f"端点返回 {status}：{err_text}", [key]),
+                        _redact(f"端点返回 {shown}：{err_text}", [key]),
                         status=status,
                     )
                     if status == 429:
@@ -2007,7 +2091,7 @@ class Models:
                             concurrency=max_conc,
                         )
                     self._log_attempt(
-                        model, role_effective, attempt, ok=False, status=status, ms=ms,
+                        model, role_effective, attempt, ok=False, status=http_status, ms=ms,
                         prompt_tokens=0, completion_tokens=0, error=last_err.message,
                         request=log_request, response=None, keys=secret_keys,
                         purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
@@ -2016,18 +2100,28 @@ class Models:
                     )
                     continue
                 if status != 200:
-                    # 其他 4xx：不重试、不换备用，直接抛
+                    # 其他 4xx：不重试、不换备用，直接抛——除非 400 点名了能改的参数（改了立刻重发）
                     err = ModelError(
-                        _redact(f"端点返回 {status}：{err_text}", [key]),
+                        _redact(f"端点返回 {shown}：{err_text}", [key]),
                         status=status,
                     )
                     self._log_attempt(
-                        model, role_effective, attempt, ok=False, status=status, ms=ms,
+                        model, role_effective, attempt, ok=False, status=http_status, ms=ms,
                         prompt_tokens=0, completion_tokens=0, error=err.message,
                         request=log_request, response=None, keys=secret_keys,
                         purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
                         usage_src="none",  # 其他 4xx：请求被拒，确定没生成
                     )
+                    adapted = self._adapt_after_reject(
+                        adapt_key, protocol, status, err_text, effort_send, cand.efforts,
+                    )
+                    if adapted is not None:
+                        logger.info("模型 %s 不收这次的参数（%s），改了重发", model, err.message[:120])
+                        effort_send = adapted
+                        try_n -= 1
+                        resend = True
+                        last_err = err
+                        continue
                     raise err
                 self._throttle.note_success(endpoint, concurrency=max_conc)
                 try:
@@ -2060,6 +2154,28 @@ class Models:
                 return result
         assert last_err is not None
         raise last_err
+
+    def _adapt_after_reject(
+        self, key: str, protocol: str, status: int, err_text: str, effort: str, ticked: Any,
+    ) -> str | None:
+        """400/422 点名了我们能改的参数 → 记住适配、回这次重发要用的强度；别的拒绝回 None（照常抛）。
+
+        - openai 说要 max_completion_tokens（OpenAI 官方推理模型）：以后这个端点+模型换字段名；
+        - 说思考强度不收：降到条目勾了的下一档（max→xhigh→high…；没了就不发强度）。
+        每种适配只会往一个方向走，重发次数有上限，不会来回打转。
+        """
+        if status not in (400, 422):
+            return None
+        text = str(err_text or "").lower()
+        learned = self._adapt.get(key, {})
+        if protocol == "openai" and "max_completion_tokens" in text and not learned.get("mct"):
+            self._adapt[key] = {**learned, "mct": True}
+            return effort
+        if effort and "effort" in text:
+            lower = _effort_step_down(effort, ticked)
+            self._adapt[key] = {**learned, "effort_cap": lower}
+            return lower
+        return None
 
     async def _post_protocol(
         self,
@@ -2132,12 +2248,11 @@ class Models:
                     continue
                 if not isinstance(obj, dict):
                     continue
-                if obj.get("error"):
-                    err = obj["error"]
-                    msg = err.get("message") if isinstance(err, dict) else str(err)
-                    raise _StreamError(str(msg)[:500])
+                etype = obj.get("type")
+                if obj.get("error") or etype in ("error", "response.failed"):
+                    raise _StreamError(f"模型报错：{_stream_error_text(obj)}")
                 events.append(obj)
-                if obj.get("type") == "response.completed":
+                if etype in _RESPONSES_TERMINAL:
                     completed_seen = True
             if not done and not completed_seen:
                 raise _StreamError("连接断了，回答没收完")

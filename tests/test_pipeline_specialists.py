@@ -322,6 +322,19 @@ def _mk_coordinator(store, models, workers, tasks, goals, settings, specialists=
 
 class TestNewsStageDispatch:
     @pytest.mark.asyncio
+    async def test_recheck_handoff_gets_settled(self, store):
+        """外部审查 2026-10-02：补打开的交接单交回后要验收收尾，不能永远停在 returned（线上 2 张）。"""
+        agents = FakeAgents()
+        sp = FakeSpecialists(agents, results=[WorkerReport(ok=True, summary="重看完", data={"items": []})])
+        feeds = _mk_feeds(store, specialists=sp)
+        report = await feeds._recheck_run(G1, "feeds-recheck:x", "重看这几条", group_id=G1)
+        assert report.ok is True
+        assert sp.runs_of("news")[0]["phase"] == "recheck"
+        assert sp.runs_of("news")[0]["tools"] == ["fetch_page", "web_search"]
+        assert [r["id"] for r in sp.reviews] == [report.handoff_id]
+        assert agents.calls["review"] and agents.calls["review"][0][2] is True
+
+    @pytest.mark.asyncio
     async def test_two_phase_dispatch_collect_verify_tools(self, store):
         """两阶段（2026-10-01 起撒网是代码按计划搜，不再派子 agent）：撒网阶段一次专岗/worker
         派工都不发生，核验照旧走 sp.run tools=["fetch_page"] 且 agent_type kind=news。"""

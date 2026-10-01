@@ -73,7 +73,7 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 | `names.py` | QQ 群名乱码清洗（进库/进视图统一过 clean_group_name） |
 | `chatlog.py` | 最近 14 天群发言只读副本（FTS5 trigram，search_chat 给资讯写原话依据） |
 | `persona.py` | 关注成员个人画像（只给管理员；refresh/due；永不出现在群消息里） |
-| `privacy.py` | 隐私闸：关注成员 note/persona 片段不得进群友可见文字 |
+| `privacy.py` | 隐私闸：关注成员 note/persona 片段不得进群友可见文字；`fold()` 折叠空白/零宽/全角/中文数字，全局记忆闸和片段比对都用它 |
 
 ### 主模型与子 agent 执行
 | 文件 | 职责 |
@@ -81,7 +81,7 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 | `coordinator.py` | 主模型协调器：计划/派活/验收/交付、执行环境选择、任务生命周期、agent 目标检查 |
 | `workers.py` | 子 agent 执行器：多轮工具循环、submit_result 交回、时间盒强制交回、上下文压缩接线 |
 | `compaction.py` | 上下文压缩（估算截 tool 结果 → 摘要最老一段）+ RepeatCallNudger + 大结果落盘 spill |
-| `models.py` | OpenAI 兼容客户端：重试/备用/端点限流、用量落库、密钥只进不出（_redact 统一遮） |
+| `models.py` | 三协议（openai / responses / anthropic）客户端：重试/备用/端点限流、用量落库、密钥只进不出（_redact 统一遮）；「200 但内容是错误」按错误码走重试/备用；端点拒 effort / 要 max_completion_tokens 时自适应重发（`_adapt`，进程内存） |
 | `jev.py` | TypeSafe Jev HTTP 客户端：密钥读取顺序、答案校验、熔断、judgments 落库 |
 | `admin_chat.py` | 管理员与主模型的网页对话循环（聚焦群、工具小票待确认） |
 | `usage_alerts.py` | token 超阈值提醒（只在网页设置页展示，不往群里发、不暂停） |
@@ -113,7 +113,7 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 ### 任务、目标、批准（M3 数据层）
 | 文件 | 职责 |
 |---|---|
-| `tasks.py` | 任务状态机、尝试记录、net_check 安全网（token/时长线）、interrupt_orphaned |
+| `tasks.py` | 任务状态机、尝试记录（取消时同事务作废开着的尝试）、net_check 安全网（token/时长线）、interrupt_orphaned（顺带收残留 running 尝试） |
 | `goals.py` | agent 目标（G-n）/成员目标（M-n）：提醒、问进展、循环续期 |
 | `approvals.py` | 派活待批：免批判断、approve/reject、pending 提醒/过期、取消权限（取消权限的群主/管理员判断按 `settings.platform_of` 认平台，`is_admin(uid, platform=...)`） |
 | `auto_review.py` | 低风险轻活主模型自动批（每群每日上限；goal 类/构想含 goal 永远留人批） |

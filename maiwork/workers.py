@@ -64,6 +64,8 @@ class WorkerReport:
     # 专岗（specialists.py）：这次回合在 Agents 里登记的交接单 id。
     # 默认 '' 向后兼容（Workers.run 直出的 report 没有交接单，老调用方不用动）。
     handoff_id: str = ""
+    # 因为任务被取消 / 暂停 / 挂起而停手（不是自己干砸了）：交接单记 cancelled 不记 failed
+    stopped: bool = False
 
 
 def _system_prompt(
@@ -323,6 +325,7 @@ class Workers:
                         summary=f"任务已是「{status}」，子 agent 停手，不再调模型",
                         steps=steps,
                         error="任务已取消或结束",
+                        stopped=True,
                     )
                 if status in ("paused", "waiting_input", "shelved"):
                     return WorkerReport(
@@ -330,6 +333,7 @@ class Workers:
                         summary=f"任务已「{status}」，子 agent 先停手；任务恢复后再来",
                         steps=steps,
                         error="任务已暂停" if status == "paused" else "任务已挂起",
+                        stopped=True,
                     )
             steps += 1
             # 上下文压缩：估算超触发线先截旧 tool 结果（不调模型），仍超再摘要最老一段。

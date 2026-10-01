@@ -214,6 +214,14 @@ class Tasks:
 
             cols = ", ".join(f"{k}=?" for k in updates)
             conn.execute(f"UPDATE tasks SET {cols} WHERE id=?", [*updates.values(), str(task_id)])
+            if to_s == "cancelled":
+                # 取消后没人再收这一轮（协程被直接停掉）：还开着的尝试同一事务里作废，
+                # 不留「任务取消了、尝试还在跑」的残留（外部审查 2026-10-02，线上 T-3）
+                conn.execute(
+                    "UPDATE attempts SET status='stale', finished=COALESCE(finished, ?)"
+                    " WHERE task_id=? AND status IN ('running', 'waiting')",
+                    (now, str(task_id)),
+                )
             payload: dict[str, Any] = {}
             if reason:
                 payload["reason"] = str(reason)
@@ -232,6 +240,7 @@ class Tasks:
         """停机或冷启动时，把失去执行协程的任务暂停，不盲目重跑有副作用的操作。
 
         状态、正在执行的尝试和时间线在同一事务里修改；queued/waiting_input 不受影响。
+        这时不可能有协程还在跑，所以别的任务上残留的 running 尝试（修复前取消留下的）也一并作废。
         """
         now = clock.now()
         with self._store.tx() as conn:
@@ -253,6 +262,10 @@ class Tasks:
                     conn, "task.paused", group_id=str(row["group_id"]),
                     entity="task", entity_id=tid, payload={"reason": str(reason)},
                 )
+            conn.execute(
+                "UPDATE attempts SET status='stale', finished=COALESCE(finished, ?) WHERE status='running'",
+                (now,),
+            )
         return len(rows)
 
     def set_env(self, task_id: str, env_text: str, *, note: str = "") -> None:

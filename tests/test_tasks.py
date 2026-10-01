@@ -524,3 +524,58 @@ class TestRunningCount:
         _create(tasks, status="queued")
         assert tasks.running_count("900000001") == 2
         assert tasks.running_count("0") == 0
+
+
+# ---------------------------------------------------------------------------
+# 外部审查 2026-10-02：取消 / 重载后 attempt 要收尾，不能永远挂 running
+# ---------------------------------------------------------------------------
+
+
+def _attempt_status(mem_store: Store, task_id: str) -> list[str]:
+    rows = mem_store.read().execute(
+        "SELECT status FROM attempts WHERE task_id=? ORDER BY n", (task_id,)
+    ).fetchall()
+    return [str(r["status"]) for r in rows]
+
+
+def test_cancel_closes_running_attempt(tasks: Tasks, mem_store: Store) -> None:
+    tid = _create(tasks)
+    tasks.transition(tid, "running")
+    tasks.start_attempt(tid)
+    tasks.transition(tid, "cancelled", reason="发起人取消")
+    assert _attempt_status(mem_store, tid) == ["stale"]
+    row = mem_store.read().execute("SELECT finished FROM attempts WHERE task_id=?", (tid,)).fetchone()
+    assert row["finished"] == NOW
+
+
+def test_cancel_from_waiting_input_closes_waiting_attempt(tasks: Tasks, mem_store: Store) -> None:
+    tid = _create(tasks)
+    tasks.transition(tid, "running")
+    aid = tasks.start_attempt(tid) and tasks.current_attempt_id(tid)
+    tasks.finish_attempt(aid, status="waiting", summary="等回答")
+    tasks.transition(tid, "waiting_input")
+    tasks.transition(tid, "cancelled")
+    assert _attempt_status(mem_store, tid) == ["stale"]
+
+
+def test_cancel_keeps_finished_attempts(tasks: Tasks, mem_store: Store) -> None:
+    tid = _create(tasks)
+    tasks.transition(tid, "running")
+    aid = tasks.start_attempt(tid) and tasks.current_attempt_id(tid)
+    tasks.finish_attempt(aid, status="failed", review="没过")
+    tasks.transition(tid, "failed")
+    tasks.transition(tid, "queued")
+    tasks.transition(tid, "cancelled")
+    assert _attempt_status(mem_store, tid) == ["failed"]
+
+
+def test_startup_sweep_closes_leftover_running_attempt_of_cancelled_task(tasks: Tasks, mem_store: Store) -> None:
+    """线上 T-3：任务早就 cancelled，attempt 还挂 running（修复前的老数据）。启动收尾要把它收掉。"""
+    tid = _create(tasks)
+    tasks.transition(tid, "running")
+    tasks.start_attempt(tid)
+    with mem_store.tx() as conn:  # 模拟修复前的老数据：任务取消了但 attempt 没收
+        conn.execute("UPDATE tasks SET status='cancelled' WHERE id=?", (tid,))
+    assert tasks.interrupt_orphaned() == 0  # 没有要暂停的任务
+    assert _attempt_status(mem_store, tid) == ["stale"]
+    assert _status(tasks, tid) == "cancelled"

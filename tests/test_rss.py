@@ -366,6 +366,19 @@ class TestKv:
                 rss.add_feed(s, "g1", url=bad, title="", feed_id="r1", now=NOW)
         assert rss.list_feeds(s, "g1") == []
 
+    def test_add_rejects_disguised_private_hosts(self, tmp_path):
+        """外部审查 2026-10-02：尾点、百分号编码的内网地址在加源时就拦，不进数据库。"""
+        s = self._store(tmp_path)
+        for bad in (
+            "http://127.0.0.1./feed", "http://127.1./feed", "http://0x7f.1./feed",
+            "http://10.0.0.1../feed", "http://%31%32%37.0.0.1/feed", "http://localhost%2e/feed",
+        ):
+            with pytest.raises(rss.RssError):
+                rss.add_feed(s, "g1", url=bad, title="", feed_id="r1", now=NOW)
+        assert rss.list_feeds(s, "g1") == []
+        # 正常的带尾点公网域名照收
+        rss.add_feed(s, "g1", url="https://a.example.com./feed", title="a", feed_id="r1", now=NOW)
+
     def test_mark_checked(self, tmp_path):
         s = self._store(tmp_path)
         gid = "g1"

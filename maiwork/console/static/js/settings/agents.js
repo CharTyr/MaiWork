@@ -309,7 +309,9 @@ export async function actAgents(action, el) {
       try {
         const r = await api("POST", `/api/agents/${encodeURIComponent(kind)}/docs/soul/sync`, {});
         setDocText(kind, "soul", r);
-        toast(r && r.text ? "已从 MaiBot 同步（还没保存到别处，直接生效）" : "MaiBot 没有人格设置，SOUL.md 留空");
+        toast(r && r.persona_missing
+          ? (r.text ? "没读到 MaiBot 的人格设置，SOUL.md 没改" : "没读到 MaiBot 的人格设置，SOUL.md 先留空")
+          : "已从 MaiBot 同步（直接生效）");
       } catch (err) { toast(err.message, true); }
       finally { el.disabled = false; }
       return true;

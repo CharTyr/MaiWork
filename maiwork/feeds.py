@@ -1193,6 +1193,27 @@ class Feeds:
                 bucket.append(report)
         return report
 
+    async def _recheck_run(self, gid: str, recheck_mark: str, brief: str, **kwargs: Any) -> Any:
+        """补打开（news_recheck）派一个子 agent：专岗接上时跑 news 角色的重看工具。
+
+        走 _run_stage + _stage_isolated：交回的报告登记进本轮、结束时统一验收。以前直接调
+        specialists.run，报告没登记，交接单永远停在 returned（外部审查 2026-10-02）。
+        """
+        if getattr(self, "_specialists", None) is None:
+            return await self._workers.run(brief, **kwargs)
+        gid_b = str(kwargs.get("group_id") or gid)
+        return await self._stage_isolated(
+            self._run_stage(
+                gid_b, phase="recheck", brief=brief,
+                task_id=str(kwargs.get("task_id") or recheck_mark),
+                tools=["fetch_page", "web_search"],
+                output_schema=kwargs.get("output_schema"),
+                deadline_ts=kwargs.get("deadline_ts"),
+                actor="资讯重看",
+            ),
+            gid_b,
+        )
+
     async def _stage_isolated(self, coro: Any, gid: str) -> Any:
         """把 coro 包进 rounds 隔离：结束统一 settle 本轮登记的专岗 report。
 
@@ -1438,21 +1459,7 @@ class Feeds:
                 from . import news_recheck
 
                 async def _recheck_runner(brief, **kwargs):
-                    specialists = getattr(self, "_specialists", None)
-                    if specialists is not None:
-                        gid_b = str(kwargs.get("group_id") or gid)
-                        return await self._stage_isolated(
-                            specialists.run(
-                                "news", brief, group_id=gid_b, phase="recheck",
-                                task_id=str(kwargs.get("task_id") or recheck_mark),
-                                tools=["fetch_page", "web_search"],
-                                output_schema=kwargs.get("output_schema"),
-                                deadline_ts=kwargs.get("deadline_ts"),
-                                actor="资讯重看",
-                            ),
-                            gid_b,
-                        )
-                    return await self._workers.run(brief, **kwargs)
+                    return await self._recheck_run(gid, recheck_mark, brief, **kwargs)
 
                 await news_recheck.recheck(
                     self._store, _RecheckRunnerProxy(self._workers, _recheck_runner), gid, candidates,

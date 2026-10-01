@@ -299,6 +299,38 @@ class TestReconcileOnConfigChange:
         finally:
             await app.stop()
 
+    async def test_cancel_task_run_settles_its_handoffs(self, tmp_path: Path) -> None:
+        """外部审查 2026-10-02：取消任务后，它名下交回了没验收的交接单收成 cancelled。"""
+        app = _app(tmp_path, _raw(tmp_path / "data", groups=[G1]))
+        await app.start()
+        try:
+            assert app.agents is not None
+            tid = app.tasks.create(G1, title="执行中", req="做好", criteria=[], source="test")
+            hid = app.agents.begin(G1, "task", "子活", task_id=tid)
+            app.agents.running(G1, hid)
+            app.agents.returned(G1, hid, "交回了", ok=True)
+            app.tasks.transition(tid, "cancelled", reason="发起人取消")
+            app.cancel_task_run(tid)
+            assert app.agents.handoff(G1, hid)["status"] == "cancelled"
+        finally:
+            await app.stop()
+
+    async def test_start_settles_handoffs_left_by_previous_process(self, tmp_path: Path) -> None:
+        """线上残留：资讯补打开的交接单停在 returned。重启后没人会来验收，启动时收成 cancelled。"""
+        data_dir = tmp_path / "data"
+        app = _app(tmp_path, _raw(data_dir, groups=[G1]))
+        await app.start()
+        hid = app.agents.begin(G1, "news", "重看", task_id="feeds-recheck:x")
+        app.agents.running(G1, hid)
+        app.agents.returned(G1, hid, "s", ok=True)
+        await app.stop()
+        app2 = _app(tmp_path, _raw(data_dir, groups=[G1]))
+        await app2.start()
+        try:
+            assert app2.agents.handoff(G1, hid)["status"] == "cancelled"
+        finally:
+            await app2.stop()
+
     async def test_clean_stop_pauses_running_task_and_stales_attempt(self, tmp_path: Path) -> None:
         data_dir = tmp_path / "data"
         app = _app(tmp_path, _raw(data_dir, groups=[G1]))

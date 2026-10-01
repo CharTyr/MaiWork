@@ -263,13 +263,14 @@ class TestEffortMapping:
         "proto,effort,expected",
         [
             (None, "low", ""),          # 没指名协议不做映射
-            ("openai", "xhigh", "xhigh"),   # 新模型（gpt-5.x）收；端点自己拒
-            ("openai", "max", "high"),
+            ("openai", "xhigh", "xhigh"),   # 原样发；端点不收 chat() 降档重发
+            ("openai", "max", "max"),       # 2026-10 起 OpenAI 有 max 档（外部审查 docs/16）
             ("openai", "medium", "medium"),
             ("responses", "xhigh", "xhigh"),
-            ("responses", "max", "high"),
-            ("anthropic", "xhigh", "high"),
+            ("responses", "max", "max"),
+            ("anthropic", "xhigh", "xhigh"),  # Anthropic 也有 xhigh 了
             ("anthropic", "max", "max"),
+            ("openai", "turbo", ""),          # 不认识的不发
             ("anthropic", "low", "low"),
             ("anthropic", "", ""),
         ],

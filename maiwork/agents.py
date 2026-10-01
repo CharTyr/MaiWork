@@ -711,7 +711,25 @@ class Agents:
         target = "cancelled" if str(state) == "cancelled" else "failed"
         error_s = str(error or "")[:_ERROR_MAX]
         gid_s, hid, cur = self._load_for_transition(gid, id)
+        if target == "cancelled" and str(cur["status"]) == "cancelled":
+            return  # 取消收尾（cancel_unsettled）先一步落了 cancelled，协程自己再落一次不算错
         self._apply_transition(cur, target, update={"error": error_s}, gid=gid_s, hid=hid)
+
+    def cancel_unsettled(self, *, task_id: str | None = None, why: str) -> int:
+        """把没收尾的交接单（queued / running / returned）收成 cancelled，返回收了几张。
+
+        - 给 task_id：任务被取消时收它名下的（app.cancel_task_run）；
+        - 不给：插件启动时收全部——验收都在同一进程里紧接着做，进程换了就没人会来收了。
+        不按群过滤（收尾不对外、不读群内容）；已是终态的一张不动。
+        """
+        self._ensure_schema()
+        sql = "UPDATE agent_handoffs SET status='cancelled', error=?, updated=? WHERE status IN ('queued','running','returned')"
+        params: list[Any] = [str(why or "")[:_ERROR_MAX], clock.now()]
+        if task_id is not None:
+            sql += " AND task_id=?"
+            params.append(str(task_id))
+        with self._store.tx() as conn:
+            return int(conn.execute(sql, tuple(params)).rowcount or 0)
 
     def handoffs(self, gid: str, kind: str | None = None, limit: int = _HANDOFFS_LIMIT_DEFAULT) -> list[dict[str, Any]]:
         gid_s = self._verify_served(gid)
