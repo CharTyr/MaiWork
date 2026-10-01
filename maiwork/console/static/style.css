@@ -669,12 +669,23 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
   color: var(--on-ink);
   font-size: 14px;
   font-weight: 600;
-  white-space: nowrap;
+  /* 长错误（端点报错原文）在手机上要能读全：限宽、折行，最多占半屏后内部滚动 */
+  width: max-content;
+  max-width: min(560px, calc(100vw - 32px));
+  max-height: 50vh;
+  overflow-y: auto;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+  text-align: center;
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.25s, transform 0.35s var(--ease);
 }
 .toast.on { opacity: 1; transform: translate(-50%, 0); }
+/* 错误提示：圆角块（多行不再是胶囊），可点掉、可选中复制 */
+.toast.bad { border-radius: 16px; text-align: left; user-select: text; }
+.toast.bad.on { pointer-events: auto; }
 
 /* ───────────── 动效 ───────────── */
 
@@ -1360,6 +1371,9 @@ body.onb-lock { overflow: hidden; }
 .onb-done-mark.drawn circle, .onb-done-mark.drawn path { stroke-dashoffset: 0; }
 .onb-mark { display: grid; flex: none; place-items: center; width: 26px; height: 26px; border-radius: 50%; border: 2px solid var(--line); color: #fff; }
 .onb-mark.ok { background: var(--green); border-color: var(--green); }
+.onb-mark.warn { background: var(--orange, #f5a623); border-color: var(--orange, #f5a623); font-weight: 800; font-size: 14px; }
+.onb-mark.wait { border-color: var(--gray-2); color: var(--gray-2); font-weight: 800; font-size: 13px; line-height: 1; }
+.onb-summary b .link-btn { margin-left: 8px; font-size: 13px; font-weight: 600; }
 .onb-mark svg { width: 15px; height: 15px; }
 .onb-summary li { grid-template-columns: 30px 1fr; }
 @media (max-width: 559px) {

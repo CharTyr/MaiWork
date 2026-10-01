@@ -391,6 +391,73 @@ class TestPersonalPrepare:
         ).fetchone()["c"]
         assert n == 1
 
+    def test_write_posts_only_after_keep_top(self, tmp_path) -> None:
+        """C01：个人向先截前 per_day 条再写帖——注定被截掉的条目不写帖（不进写帖请求）。
+
+        5 条全过线、personal_per_day=3 → 写帖模型请求的提示词里只出现留下的 3 条；
+        被截的 2 条仍落库、带「超出这次上限」的原因、body 为空。
+        """
+        titles = [
+            "国产 FPGA 学习板社区发布新品", "本地大模型量化部署教程",
+            "开源硬件周报第两百期", "单板机新手引导系统镜像", "相机传感器选购实测笔记",
+        ]
+        items5 = {
+            "items": [
+                {"title": titles[i], "url": f"https://site{i}.com/{i}",
+                 "summary": f"{titles[i]}。内容不错。值得看。", "kind": "news",
+                 "published": NOW - 86400, "fetched": True, "quote": _QUOTE, "paywall": False}
+                for i in range(5)
+            ]
+        }
+        # 打分：编号越小分越高 → 留下前 3 条（0,1,2）
+        scores = {"scores": [
+            {"i": i, "title": titles[i], "info": 5, "source": 5, "relevance": 5,
+             "timeliness": 5, "chat": 5.0 - i * 0.1, "profile": 0, "topic": f"T{i}",
+             "sensitive": False, "grounded": True, "junk": False, "junk_reason": "",
+             "same_as_recent": False, "why": "他在做", "icon": "tools"}
+            for i in range(5)
+        ]}
+        posts = {"posts": [
+            {"i": k, "title": titles[k], "body": "你可能用得上……",
+             "reason": "你在弄这个", "refs": [], "audience": [], "keywords": ["FPGA"]}
+            for k in range(3)
+        ]}
+        models = FakeModelsQueue(ready=True, replies=[
+            json.dumps({"focus": [{"query": "FPGA", "why": "在做"}], "idea": None}, ensure_ascii=False),
+            json.dumps(scores, ensure_ascii=False),
+            json.dumps(posts, ensure_ascii=False),
+        ])
+        store, settings, personal, models, workers, topics, _ = _make_personal(
+            tmp_path, models=models, workers=FakeWorkers(_ok_report(items5))
+        )
+        with _time_patch():
+            got = _run(personal.prepare_personal(GID, UID))
+
+        assert got == 3
+        kept_titles = set(titles[:3])
+        dropped_titles = set(titles[3:])
+        # 写帖（personal.post）请求里只能出现留下的 3 条标题
+        post_calls = [m for _r, m, k in models.calls
+                      if str(k.get("purpose") or "") == "personal.post"]
+        assert post_calls, "写帖模型要被调用"
+        for messages in post_calls:
+            text = "\n".join(str(mm.get("content") or "") for mm in messages)
+            for t in dropped_titles:
+                assert t not in text, f"注定被截掉的条目不该进写帖请求：{t}"
+        # 被截的仍落库、带名额原因、没写正文
+        rows = store.read().execute(
+            "SELECT title, rejected, reject_reason, body FROM news_items"
+            " WHERE target_user_id=? ORDER BY id", (UID,)
+        ).fetchall()
+        assert len(rows) == 5
+        accepted = [r for r in rows if not r["rejected"]]
+        rejected = [r for r in rows if r["rejected"]]
+        assert {r["title"] for r in accepted} == kept_titles
+        assert len(rejected) == 2
+        for r in rejected:
+            assert "上限" in str(r["reject_reason"])
+            assert not str(r["body"] or "").strip()
+
     def test_once_per_day(self, tmp_path) -> None:
         """每人每天（北京时间）最多 1 次：当天跑过一次，再跑直接 0、不调模型。"""
         models = FakeModelsQueue(ready=True, replies=[

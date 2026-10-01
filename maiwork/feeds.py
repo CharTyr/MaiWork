@@ -1,8 +1,9 @@
 """feeds.py（M2，docs/07-代码接口.md §10.4）：资讯和构想。
 
 资讯流程（prepare_news，按 docs/02-设计.md §4.1「质量标准（2026-09-27 与用户定）」三道门槛）：
-1. 群画像没成形（groups.profile_ready_ts == 0）→ 0，什么都不做；
-2. 主模型没配好 → 0；搜索没配（SearchUnavailable）→ 记一条 skipped 批次；
+1. 开工前提（`news_precheck`：画像没成形 / news 专岗停用 / 主模型没配好）→ 记一条 skipped 批次
+   （中文原因）后返回 0，不静默退出；
+2. 搜索没配（SearchUnavailable）→ 记一条 skipped 批次；
 3. 主模型（json_mode）按画像条目 + 最近 14 天反馈标题出 3–5 个关注点；
 4. 找候选恒走两阶段（「广撒网再挑着打开」，2026-09-30 用户决定对所有群生效，不再有开关）：
    撒网（只用 web_search）→ 代码保底补搜 → 程序粗筛 → 主模型挑 8–12 条 → 核验子 agent
@@ -906,6 +907,16 @@ class Feeds:
             "feeds_round_reports", default=None
         )
 
+    def _rss_subscribed(self, gid: str) -> bool:
+        """本群有没有启用中的 RSS 源（A06：RSS-only 入口判断用；读失败按没有算）。"""
+        from . import rss as _rss
+
+        try:
+            return any(bool(e.get("enabled")) for e in _rss.list_feeds(self._store, gid))
+        except Exception:
+            logger.debug("读 RSS 订阅失败（群 %s）", gid, exc_info=True)
+            return False
+
     async def _collect_rss(self, gid: str, settings: Settings) -> list[dict]:
         """把本群启用中的 RSS 源取回来，交回 RSS 条目候选。
 
@@ -1301,37 +1312,50 @@ class Feeds:
     async def prepare_news(self, group_id: str) -> int:
         gid = str(group_id)
         settings = self._get_settings()
-        if not self._profile_ready(gid):
+        # 开工前提（画像成形 / news 专岗启停 / 模型就绪）：和手动「现在就备一批」共用同一个
+        # `news_precheck`，拒绝原因一字不差；不通过也要留一条 skipped 批次记录（A11：不静默退出）。
+        precheck = self.news_precheck(gid)
+        if precheck:
+            self._skipped_batch(gid, precheck)
             return 0
-        try:
-            if not self._models_ready():
-                return 0
-        except Exception:
-            return 0
-        # 专岗挂上时：news 岗位停用 → 在任何 worker / 模型工作之前就停（做都不做），
-        # 绝不默默回落到通才子 agent。老测试（没接 specialists）走原分支不受影响。
-        if getattr(self, "_specialists", None) is not None and not self._role_enabled(gid, "news"):
-            self._skipped_batch(gid, "资讯专岗（news）已停用或未就位")
-            return 0
+        # 搜索和 RSS 是两条候选入口，分别判断（A06，2026-10 修正）：
+        # 搜索不可用（SearchUnavailable：没配置或暂时坏）但本群有启用的 RSS 源 →
+        # 照常取 RSS 走 RSS-only 一轮（跳过撒网和补打开，后面的硬淘汰 / 打分 / 隐私 /
+        # 去重一律不放宽）；两者都不可用 → 仍跳过，原因要说准。
+        search_error: SearchUnavailable | None = None
         try:
             await self._ensure_search()
         except SearchUnavailable as e:
-            self._skipped_batch(gid, str(e) or "搜索没配置")
+            search_error = e
+        rss_mode = search_error is not None and self._rss_subscribed(gid)
+        if search_error is not None and not rss_mode:
+            note = str(search_error) or "搜索没配置"
+            if not self._rss_subscribed(gid):
+                note = f"{note}；也没订 RSS 源，这轮没有候选入口"
+            self._skipped_batch(gid, note)
             return 0
 
-        # ① 关注点
-        try:
-            focus = await self._plan_focus(gid, settings)
-        except (ModelError, ValueError) as e:
-            logger.info("备资讯-定关注点失败（群 %s）：%s", gid, e)
-            self._skipped_batch(gid, f"模型出关注点失败：{e}")
-            return 0
-
-        # ② 子 agent 找候选（资讯 + 好文；每条必须真打开过）
-        # 这轮子 agent 的 task_id 标记：工具调用按它落库，统计（搜了几次/看了几篇）按它点数
+        # 这轮的 task_id 标记：子 agent 的工具调用按它落库，统计（搜了几次/看了几篇）按它点数；
+        # C03 起这轮的主要模型调用（定关注点/挑/打分/写帖/自检/挑实测）也带它落进 usage 表，
+        # 批次「这轮的模型用量」按它点数——所以要赶在这轮第一次模型调用之前生成。
         collect_mark = (
             f"feeds-collect:{gid}:{int(clock.now() * 1000)}:{next(_collect_mark_seq)}"
         )
+
+        # ① 关注点（只服务撒网：prepare_news 里 focus 只传给 _collect_two_phase——
+        # RSS-only 轮跳过它，省下这次模型调用；打分 / 写帖都不读 focus）
+        focus: list[dict] = []
+        if not rss_mode:
+            try:
+                focus = await self._plan_focus(gid, settings, task_id=collect_mark)
+            except (ModelError, ValueError) as e:
+                logger.info("备资讯-定关注点失败（群 %s）：%s", gid, e)
+                self._skipped_batch(gid, f"模型出关注点失败：{e}")
+                return 0
+        else:
+            logger.info("搜索不可用，走 RSS-only（群 %s）：%s", gid, search_error)
+
+        # ② 子 agent 找候选（资讯 + 好文；每条必须真打开过）
         # RSS 源（rss.py）取回一次：直接并进候选池参与打分（见 _merge_rss_candidates）；
         # 撒网空了但 RSS 有货时这轮照常走。取失败只记 last_error，不拖垮这轮。
         try:
@@ -1340,72 +1364,86 @@ class Feeds:
             logger.exception("RSS 取回意外出错（群 %s），这轮跳过 RSS", gid)
             rss_items = []
         two_phase_stats: dict = {}
-        try:
-            # 两阶段（「广撒网再挑着打开」）恒生效（2026-09-30 用户决定，不再有每群开关）：
-            # 撒网 → 保底 → 粗筛 → 挑 → 核验；候选按老格式交回（下游补打开 / 第一道 /
-            # 打分照旧）。专岗接上时本轮的撒网/核验都走一轮 ContextVar（结论由主模型验收后再 review）。
-            candidates = await self._stage_isolated(
-                self._collect_two_phase(
-                    gid, focus, settings,
-                    collect_mark=collect_mark, stats_out=two_phase_stats,
-                ),
-                gid,
-            )
-            if not candidates and not rss_items:
-                self._drop_news_round_records(gid, "撒网没搜出能用的候选")
+        candidates: list[dict] = []
+        if rss_mode:
+            # RSS-only：不撒网（搜索本来就用不了）；RSS 空了 → 跳过，原因说准
+            if not rss_items:
                 self._skipped_batch(
-                    gid, "撒网没搜出能用的候选",
-                    stats=self._round_stats(collect_mark, two_phase_stats.get("funnel")),
+                    gid,
+                    f"搜索用不了（{search_error}），RSS 这轮也没取到新条目",
+                    stats=self._round_stats(collect_mark, None, source_mode="rss_only"),
                 )
                 return 0
-            # 撒网空了但 RSS 有货：照常往下走（下面 _merge_rss_candidates 并进候选池，
-            # 和搜索候选同一套门槛）——老路本来就支持 RSS-only 的轮。
-        except (ModelError, ValueError) as e:
-            self._drop_news_round_records(gid, f"子 agent 没找到东西：{e}")
-            logger.info("备资讯-子 agent 失败（群 %s）：%s", gid, e)
-            self._skipped_batch(
-                gid, f"子 agent 没找到东西：{e}", stats=self._round_stats(collect_mark, two_phase_stats.get("funnel"))
-            )
-            return 0
-        except Exception as e:  # 兜底：任何意外都不能炸后台循环
-            self._drop_news_round_records(gid, f"子 agent 出了意外：{e}")
-            logger.exception("备资讯-子 agent 意外错误（群 %s）", gid)
-            self._skipped_batch(
-                gid, f"子 agent 出了意外：{e}", stats=self._round_stats(collect_mark, two_phase_stats.get("funnel"))
-            )
-            return 0
+        else:
+            try:
+                # 两阶段（「广撒网再挑着打开」）恒生效（2026-09-30 用户决定，不再有每群开关）：
+                # 撒网 → 保底 → 粗筛 → 挑 → 核验；候选按老格式交回（下游补打开 / 第一道 /
+                # 打分照旧）。专岗接上时本轮的撒网/核验都走一轮 ContextVar（结论由主模型验收后再 review）。
+                candidates = await self._stage_isolated(
+                    self._collect_two_phase(
+                        gid, focus, settings,
+                        collect_mark=collect_mark, stats_out=two_phase_stats,
+                    ),
+                    gid,
+                )
+                if not candidates and not rss_items:
+                    self._drop_news_round_records(gid, "撒网没搜出能用的候选")
+                    self._skipped_batch(
+                        gid, "撒网没搜出能用的候选",
+                        stats=self._round_stats(collect_mark, two_phase_stats.get("funnel")),
+                    )
+                    return 0
+                # 撒网空了但 RSS 有货：照常往下走（下面 _merge_rss_candidates 并进候选池，
+                # 和搜索候选同一套门槛）——老路本来就支持 RSS-only 的轮。
+            except (ModelError, ValueError) as e:
+                self._drop_news_round_records(gid, f"子 agent 没找到东西：{e}")
+                logger.info("备资讯-子 agent 失败（群 %s）：%s", gid, e)
+                self._skipped_batch(
+                    gid, f"子 agent 没找到东西：{e}", stats=self._round_stats(collect_mark, two_phase_stats.get("funnel"))
+                )
+                return 0
+            except Exception as e:  # 兜底：任何意外都不能炸后台循环
+                self._drop_news_round_records(gid, f"子 agent 出了意外：{e}")
+                logger.exception("备资讯-子 agent 意外错误（群 %s）", gid)
+                self._skipped_batch(
+                    gid, f"子 agent 出了意外：{e}", stats=self._round_stats(collect_mark, two_phase_stats.get("funnel"))
+                )
+                return 0
 
         # ②.2 补打开（2026-09-29）：没真打开过原文的候选，派一个子 agent 一批打开 + 对照原文核对
         # （news_recheck.py）；出任何错都不拖累这轮，候选原样往下走、照旧按没打开淘汰。
         # 专岗接上时跑 news 角色的重看工具（fetch_page+web_search），不是通才 workers.run。
+        # RSS-only 轮（搜索不可用）：补打开要用 web_search 找替代来源，整个跳过——
+        # RSS 候选本就带 from_rss（pick_unverified 会跳过它们），跳过只是更早、更省。
         recheck_mark = collect_mark.replace("feeds-collect:", "feeds-recheck:", 1)
-        try:
-            from . import news_recheck
+        if not rss_mode:
+            try:
+                from . import news_recheck
 
-            async def _recheck_runner(brief, **kwargs):
-                specialists = getattr(self, "_specialists", None)
-                if specialists is not None:
-                    gid_b = str(kwargs.get("group_id") or gid)
-                    return await self._stage_isolated(
-                        specialists.run(
-                            "news", brief, group_id=gid_b, phase="recheck",
-                            task_id=str(kwargs.get("task_id") or recheck_mark),
-                            tools=["fetch_page", "web_search"],
-                            output_schema=kwargs.get("output_schema"),
-                            deadline_ts=kwargs.get("deadline_ts"),
-                            actor="资讯重看",
-                        ),
-                        gid_b,
-                    )
-                return await self._workers.run(brief, **kwargs)
+                async def _recheck_runner(brief, **kwargs):
+                    specialists = getattr(self, "_specialists", None)
+                    if specialists is not None:
+                        gid_b = str(kwargs.get("group_id") or gid)
+                        return await self._stage_isolated(
+                            specialists.run(
+                                "news", brief, group_id=gid_b, phase="recheck",
+                                task_id=str(kwargs.get("task_id") or recheck_mark),
+                                tools=["fetch_page", "web_search"],
+                                output_schema=kwargs.get("output_schema"),
+                                deadline_ts=kwargs.get("deadline_ts"),
+                                actor="资讯重看",
+                            ),
+                            gid_b,
+                        )
+                    return await self._workers.run(brief, **kwargs)
 
-            await news_recheck.recheck(
-                self._store, _RecheckRunnerProxy(self._workers, _recheck_runner), gid, candidates,
-                collect_mark=collect_mark, recheck_mark=recheck_mark,
-                parse_published=_parse_published, normalize_url=_normalize_url, site_of=_site_of,
-            )
-        except Exception:
-            logger.exception("资讯补打开意外出错（群 %s），这轮跳过补打开", gid)
+                await news_recheck.recheck(
+                    self._store, _RecheckRunnerProxy(self._workers, _recheck_runner), gid, candidates,
+                    collect_mark=collect_mark, recheck_mark=recheck_mark,
+                    parse_published=_parse_published, normalize_url=_normalize_url, site_of=_site_of,
+                )
+            except Exception:
+                logger.exception("资讯补打开意外出错（群 %s），这轮跳过补打开", gid)
 
         # ②.5 RSS 条目并进候选池（≤_RSS_MERGE_CAP 条，新的在前、跨源轮询）：
         # 从这里往后和搜索候选完全同一套硬淘汰 / 新鲜度 / 打分 / 话题饱和，不另开绿灯。
@@ -1419,7 +1457,7 @@ class Feeds:
         # ④ 打分（幸存者为空就不调模型，省额度）
         if survivors:
             try:
-                await self._score(gid, settings, survivors)
+                await self._score(gid, settings, survivors, task_id=collect_mark)
             except (ModelError, ValueError) as e:
                 logger.info("备资讯-打分失败（群 %s）：%s", gid, e)
                 self._skipped_batch(
@@ -1442,19 +1480,21 @@ class Feeds:
             if "reject" not in item and self._scrub_item_text(gid, str(item.get("why") or "")) is None:
                 item["reject"] = ("web", "和群友相关的细节不宜公开，这条不上")
 
-        # ⑤.5 「有人味」：对过第二道门槛的每条写帖子（失败回落不丢条目）
+        # ⑥ 第二道（去同质化）：同话题 ≤2、同域名 ≤3、敏感 ≤1、diverse ≤2、总数 ≤ max_items；avg 高者留
+        # （2026-10，C01：从写帖之后挪到写帖之前——确定会被名额刷掉的条目不再花写帖/自检的钱；
+        # 被淘汰的照落库、原因照留）
+        max_items = max(1, int(getattr(settings.feeds, "max_items", 10)))
+        self._dedup_homogeneous(survivors, max_items, gid)
+
+        # ⑤.5 「有人味」：只对去同质化后最终要发的条目写帖子（失败回落不丢条目）
         posting = [item for item in survivors if "reject" not in item]
         if posting:
             try:
-                await self._write_posts(gid, posting, settings)
+                await self._write_posts(gid, posting, settings, task_id=collect_mark)
             except Exception:
                 logger.exception("写帖子意外出错（群 %s），全部回落原文", gid)
                 for item in posting:
                     self._post_fallback(item)
-
-        # ⑥ 第二道（去同质化）：同话题 ≤2、同域名 ≤3、敏感 ≤1、diverse ≤2、总数 ≤ max_items；avg 高者留
-        max_items = max(1, int(getattr(settings.feeds, "max_items", 10)))
-        self._dedup_homogeneous(survivors, max_items, gid)
 
         # ⑥.5 「实测过再发是加分项」（docs/02 §4.1）：对最终入选的条目挑 ≤2 条，
         # 在 railway.new 一次性 VM 里真试一下（verify_enabled=false / railway=false 整个关掉；
@@ -1462,7 +1502,7 @@ class Feeds:
         final_items = [item for item in survivors if "reject" not in item]
         if final_items and self._verify_runner is not None and _verify_on(settings):
             try:
-                await self._plan_and_verify(gid, final_items, settings)
+                await self._plan_and_verify(gid, final_items, settings, task_id=collect_mark)
             except Exception:
                 # 实测是加分项不是门槛：这步炸了什么都不能拖累出资讯
                 logger.exception("实测环节意外出错（群 %s），这轮跳过实测", gid)
@@ -1485,7 +1525,10 @@ class Feeds:
             accepted_items=accepted,
             ttl_h=ttl_h,
             note=note,
-            stats=self._round_stats(collect_mark, two_phase_stats.get("funnel"), kept=kept),
+            stats=self._round_stats(
+                collect_mark, two_phase_stats.get("funnel"), kept=kept,
+                source_mode="rss_only" if rss_mode else "",
+            ),
         )
         # 专岗挂上时：批次入库（成绩已定）→ 写一条「已验收」的新闻本岗记忆。
         # ref 指到 batch / handoff / 条目 id，绝不存候选 / 原始聊天；同批次幂等（source_id）。
@@ -1941,11 +1984,16 @@ class Feeds:
     # 每轮统计（搜了几次 / 看了几篇 / 收了几条）
     # ------------------------------------------------------------------
 
-    def _round_stats(self, collect_mark: str, funnel: dict | None = None, *, kept: int | None = None) -> dict:
+    def _round_stats(self, collect_mark: str, funnel: dict | None = None, *,
+                     kept: int | None = None, source_mode: str = "") -> dict:
         """这一轮的工具用量：找资讯的子 agent + 补打开的子 agent 加起来。
 
         两阶段（恒生效）：searches/pages = 撒网 + 核验 + 补打开几个标记各自的工具调用数。
         funnel 非空就原样带上（kept 由最终入库数在这里补——调用方在入库时才数得出来）。
+        source_mode（2026-10，A06）：RSS-only 轮传 "rss_only"，网页能看出这轮没走搜索；
+        正常轮留空、不落这个键（不改老批次的形状）。
+        usage（C03）：这轮的模型用量（usage 表按本轮 task_id 标记点数），
+        一行都没有 → 不落这个键（网页按老批次显示）。
         """
         from .news_recheck import merge_stats
 
@@ -1966,7 +2014,56 @@ class Feeds:
             if kept is not None:
                 f["kept"] = int(kept)
             out["funnel"] = f
+        if source_mode:
+            out["source_mode"] = str(source_mode)
+        usage = self._round_usage(mark)
+        if usage is not None:
+            out["usage"] = usage
         return out
+
+    def _round_usage(self, collect_mark: str) -> dict | None:
+        """这一轮的模型用量（C03）：按本轮的 task_id 标记在 usage 表里点数。
+
+        覆盖：task_id = feeds-collect / feeds-recheck / feeds-verify:<同一个 base> 的调用
+        （定关注点、挑候选、核验/补打开子 agent、打分、写帖、自检、挑实测都带这个标记）。
+        只加服务商实报的 token；usage_src='' 的老行一律不进统计（不能猜）。
+        一行都没有 / 读不到 → None（前端按「没有这轮的模型用量」处理；备料不被统计搞挂）。
+        """
+        mark = str(collect_mark or "")
+        if not mark:
+            return None
+        if mark.startswith("feeds-collect:"):
+            base = mark.replace("feeds-collect:", "", 1)
+            esc = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            # 三个前缀的冒号后接同一个 base，互不撞前缀；LIKE 只兜核验组的 :k 后缀
+            where = ("task_id=? OR task_id=? OR task_id LIKE ? ESCAPE '\\'")
+            params: tuple = (mark, f"feeds-recheck:{base}", f"feeds-verify:{esc}:%")
+        else:
+            where = "task_id=?"
+            params = (mark,)
+        try:
+            row = self._store.read().execute(
+                "SELECT COALESCE(SUM(CASE WHEN usage_src='reported' THEN prompt_tokens + completion_tokens END), 0) AS reported,"
+                " COALESCE(SUM(CASE WHEN usage_src='reported' THEN 1 ELSE 0 END), 0) AS calls,"
+                " COALESCE(SUM(CASE WHEN usage_src='reported' THEN cache_read ELSE 0 END), 0) AS cache_read,"
+                " COALESCE(SUM(CASE WHEN usage_src='reported' THEN cache_write ELSE 0 END), 0) AS cache_write,"
+                " COALESCE(SUM(CASE WHEN usage_src='unknown' THEN 1 ELSE 0 END), 0) AS unknown_calls,"
+                " COUNT(*) AS total"
+                f" FROM usage WHERE {where}",
+                params,
+            ).fetchone()
+        except Exception:
+            logger.exception("读本轮模型用量失败（%s）", mark)
+            return None
+        if row is None or int(row["total"] or 0) == 0:
+            return None
+        return {
+            "reported": int(row["reported"]),
+            "calls": int(row["calls"]),
+            "cache_read": int(row["cache_read"]),
+            "cache_write": int(row["cache_write"]),
+            "unknown_calls": int(row["unknown_calls"]),
+        }
 
     def _collect_prefix_stats(self, task_id_prefix: str) -> dict:
         """按前缀点数一组子 agent 的工具用量（核验子 agent 一组一个 :k 后缀）。"""
@@ -2014,12 +2111,16 @@ class Feeds:
 
     def _write_batch_stats(
         self, conn: Any, batch_id: Any, *, searches: int, pages: int, kept: int,
-        funnel: dict | None = None,
+        funnel: dict | None = None, source_mode: str = "", usage: dict | None = None,
     ) -> None:
         """把这一轮的 {searches, pages, kept} 挂在批次上（kv，不动 store.py 的表结构）。
 
         两阶段（「广撒网再挑着打开」）额外带 funnel：各环节计数 / 每方向 / 每家搜索 /
         耗时 / 各环节拒绝计数；老路没有 → 不落这个键。
+        source_mode="rss_only"（2026-10，A06）：这轮只走了 RSS 入口（搜索不可用）；
+        正常轮留空、不落这个键。
+        usage（C03）：{reported, calls, cache_read, cache_write, unknown_calls}，只收
+        服务商实报的 token；没有就不落这个键。
         """
         data: dict[str, Any] = {
             "searches": max(0, int(searches or 0)),
@@ -2028,6 +2129,16 @@ class Feeds:
         }
         if isinstance(funnel, dict) and funnel:
             data["funnel"] = funnel
+        if source_mode:
+            data["source_mode"] = str(source_mode)
+        if isinstance(usage, dict) and usage:
+            data["usage"] = {
+                "reported": max(0, int(usage.get("reported") or 0)),
+                "calls": max(0, int(usage.get("calls") or 0)),
+                "cache_read": max(0, int(usage.get("cache_read") or 0)),
+                "cache_write": max(0, int(usage.get("cache_write") or 0)),
+                "unknown_calls": max(0, int(usage.get("unknown_calls") or 0)),
+            }
         self._store.kv_set(
             conn,
             self._batch_stats_key(batch_id),
@@ -2038,6 +2149,7 @@ class Feeds:
         """读这一轮的统计；老批次（这功能之前落的）没有 → None，前端显示「没统计」。
 
         有 funnel（两阶段落的）原样带上，前端「这一轮怎么找的」按它画。
+        source_mode 同理原样带上（RSS-only 轮 = "rss_only"）。
         """
         try:
             saved = self._store.kv_get(self._batch_stats_key(batch_id))
@@ -2053,6 +2165,17 @@ class Feeds:
         }
         if isinstance(saved.get("funnel"), dict) and saved["funnel"]:
             out["funnel"] = saved["funnel"]
+        if saved.get("source_mode"):
+            out["source_mode"] = str(saved["source_mode"])
+        # 这轮的模型用量（C03）：老批次没有这个键 → 不带，前端按「没统计」显示
+        if isinstance(saved.get("usage"), dict) and saved["usage"]:
+            out["usage"] = {
+                "reported": int(saved["usage"].get("reported") or 0),
+                "calls": int(saved["usage"].get("calls") or 0),
+                "cache_read": int(saved["usage"].get("cache_read") or 0),
+                "cache_write": int(saved["usage"].get("cache_write") or 0),
+                "unknown_calls": int(saved["usage"].get("unknown_calls") or 0),
+            }
         return out
 
     # ------------------------------------------------------------------
@@ -2095,6 +2218,8 @@ class Feeds:
                 pages=int((stats or {}).get("pages") or 0),
                 kept=int(kept),
                 funnel=funnel,
+                source_mode=str((stats or {}).get("source_mode") or ""),
+                usage=(stats or {}).get("usage") if isinstance((stats or {}).get("usage"), dict) else None,
             )
             for item in accepted_items:
                 _localize_title(item)
@@ -2254,13 +2379,14 @@ class Feeds:
                 out.append(f"- {text[:_BRIEF_PROFILE_TEXT_MAX]}")
         return out
 
-    async def _plan_focus(self, gid: str, settings: Settings) -> list[dict]:
+    async def _plan_focus(self, gid: str, settings: Settings, *, task_id: str = "") -> list[dict]:
         """定关注点 + 顺带定本轮的搜索计划。返回 [{"query", "why", "angle", "source", searches}]。
 
         angle='diverse' 的是「不同角度/反方观点」；source 是 recent|long|explore（缺省 ""）。
         searches 是这个方向的搜索计划（3–5 条 {"q","site","news","kind"}；kind=guide 只在
         [feeds] guides=true 时让找），2026-10-01 起由代码直接照单并发搜（_run_planned_searches），
         不再派撒网子 agent；没给 / 给得不对就回退成把 query 当唯一一条搜索。
+        task_id（C03）：本轮资讯的标记（feeds-collect:…），落进 usage 表算这轮的模型用量。
         提示词里带：群画像 + 群里最近两天真实在聊的（recent_chat）+ 最近反馈 + 资讯偏好
         （kv["feeds.pref.<群号>"]）+ 最近几轮已经找过的方向（kv["feeds.focus_hist.<群号>"]，
         要求别再重复、换别的）+「怎么搜」一段（搜索词长短、一手来源、屏蔽名单、优质来源、
@@ -2419,6 +2545,7 @@ class Feeds:
             json_mode=True,
             purpose="feeds.focus",
             group_id=gid,
+            task_id=task_id,
         )
         data = json.loads(result.text)
         out, diverse = _parse_out(data)
@@ -2444,6 +2571,7 @@ class Feeds:
                 json_mode=True,
                 purpose="feeds.focus",
                 group_id=gid,
+                task_id=task_id,
             )
             retry_data = json.loads(retry_result.text)
             retry_out, retry_diverse = _parse_out(retry_data)
@@ -2853,8 +2981,9 @@ class Feeds:
             kept = rr
         return kept[:cap_total], dropped, {}
 
-    async def _pick(self, gid: str, focus: list[dict], kept: list[dict]) -> tuple[list[tuple[dict, str, str]], bool]:
-        """挑（协程版；本体）。失败回落前 10 条（hook 空 → 不拦）。"""
+    async def _pick(self, gid: str, focus: list[dict], kept: list[dict], *, task_id: str = "") -> tuple[list[tuple[dict, str, str]], bool]:
+        """挑（协程版；本体）。失败回落前 10 条（hook 空 → 不拦）。
+        task_id（C03）：本轮资讯的标记，落进 usage 表算这轮的模型用量。"""
         from .models import ModelError
 
         if not kept:
@@ -2888,6 +3017,7 @@ class Feeds:
             result = await self._models.chat(
                 agent="news", messages=[{"role": "user", "content": prompt}],
                 json_mode=True, purpose="feeds.pick", group_id=gid,
+                task_id=task_id,
             )
             data = json.loads(result.text)
         except (ModelError, ValueError, TypeError, KeyError) as e:
@@ -3149,7 +3279,7 @@ class Feeds:
         # ④ 挑（一次主模型；失败回落前 10 条）
         t3 = clock.now()
         try:
-            picks, _used_model = await self._pick(gid_s, focus, kept)
+            picks, _used_model = await self._pick(gid_s, focus, kept, task_id=collect_mark)
         except Exception:
             logger.exception("挑候选意外出错（群 %s），回落前 10 条", gid_s)
             picks = [(c, "news", "") for c in kept[:10]]
@@ -3307,7 +3437,7 @@ class Feeds:
         ]
         return added
 
-    async def _score(self, gid: str, settings: Settings, candidates: list[dict]) -> None:
+    async def _score(self, gid: str, settings: Settings, candidates: list[dict], *, task_id: str = "") -> None:
         """给每条幸存者打五项分等信息（直接改 item）。
 
         模型给：info / source / relevance / timeliness / chat（1–5）、
@@ -3316,6 +3446,7 @@ class Feeds:
         junk（标题党/软文/营销号/纯情绪）、same_as_recent（和最近 14 天已出的是同一件事吗）。
         代码侧算 avg（五项平均）、profile 编号换文字（对不上 → relevance 封顶 2）、
         topic 截 8 字。模型漏给某条 → 五项记 0（第二道自然筛掉，理由走相关度）。
+        task_id（C03）：本轮资讯的标记，落进 usage 表算这轮的模型用量。
 
         编号：prompt 里按 candidates 的顺序写成 0..n-1；模型回 i 就按 i 对，
         回了 title 就对 title（编号对不上时的兜底）。
@@ -3595,6 +3726,7 @@ class Feeds:
                         group_id=gid,
                         timeout=_SCORE_TIMEOUT_S,
                         retries=1,
+                        task_id=task_id,
                     )
                     data = json.loads(result.text)
                 except (ModelError, ValueError) as e:
@@ -3876,11 +4008,12 @@ class Feeds:
         )
         return lines
 
-    async def _write_posts(self, gid: str, items: list[dict], settings: Settings) -> None:
+    async def _write_posts(self, gid: str, items: list[dict], settings: Settings, *, task_id: str = "") -> None:
         """对过第二道门槛的每条写帖子（一次模型调用写完全部；漏写的补一次重试；
         重试还漏的条目才回落原文）。
 
         直接改 item：item["post"] = {"body","reason","refs","audience","keywords"}。
+        task_id（C03）：本轮资讯的标记，落进 usage 表算这轮的模型用量（自检那通也算）。
         """
         if not items:
             return
@@ -3907,6 +4040,7 @@ class Feeds:
                     json_mode=True,
                     purpose="feeds.post",
                     group_id=gid,
+                    task_id=task_id,
                 )
             except ModelError as e:
                 logger.info("写帖子失败（群 %s）：%s", gid, e)
@@ -3940,11 +4074,11 @@ class Feeds:
                 self._post_fallback(item)
         # 写完再对一遍原文（2026-09-30）：原文撑不住的说法 → 那条正文回落原摘要；自检失败不拖累出资讯
         try:
-            await self._check_posts(gid, [p["item"] for p in per_item])
+            await self._check_posts(gid, [p["item"] for p in per_item], task_id=task_id)
         except Exception:
             logger.info("帖子对原文自检出错（群 %s），这轮不改", gid, exc_info=True)
 
-    async def _check_posts(self, gid: str, items: list[dict]) -> None:
+    async def _check_posts(self, gid: str, items: list[dict], *, task_id: str = "") -> None:
         """一次主模型调用：逐条对照原文依据（quote）和摘要，找帖子正文里原文撑不住的说法。"""
         todo = [
             it for it in items
@@ -3966,6 +4100,7 @@ class Feeds:
         result = await self._models.chat(
             agent="news", messages=[{"role": "user", "content": "\n".join(lines)}],
             json_mode=True, purpose="feeds.post_check", group_id=gid,
+            task_id=task_id,
         )
         data = json.loads(result.text)
         bad = data.get("unsupported") if isinstance(data, dict) else None
@@ -4093,7 +4228,7 @@ class Feeds:
     # 实测（railway.new 一次性 VM，docs/02 §4.1「实测过再发是加分项，不是门槛」）
     # ------------------------------------------------------------------
 
-    async def _plan_and_verify(self, gid: str, items: list[dict], settings: Settings) -> None:
+    async def _plan_and_verify(self, gid: str, items: list[dict], settings: Settings, *, task_id: str = "") -> None:
         """挑值得实测的条目 → 交给注入的 verify_runner 去一次性 VM 里跑。
 
         - [environments] verify_enabled=false（默认）、railway=false、没接 verify_runner
@@ -4101,6 +4236,7 @@ class Feeds:
         - 主模型挑中 0 条 → 跳过；挑多了夹回 [environments] verify_per_round（默认 2）。
         - 实测本身由 verify_runner 干（真机上接 run_railway_verify；测试注入假的），
           直接改写 items[i]["verify"]；runner 拿不到机器就什么都不写，照常入库。
+        task_id（C03）：本轮资讯的标记，挑实测那通调用落进 usage 表算这轮的模型用量。
         """
         env_cfg = getattr(settings, "environments", None)
         if not _verify_on(settings):
@@ -4112,7 +4248,7 @@ class Feeds:
             return
         per_round = max(1, int(getattr(env_cfg, "verify_per_round", 2) or 2))
         try:
-            picks = await self._plan_verify_picks(gid, items, per_round)
+            picks = await self._plan_verify_picks(gid, items, per_round, task_id=task_id)
         except (ModelError, ValueError) as e:
             logger.info("挑实测条目失败（群 %s）：%s；这轮跳过实测", gid, e)
             return
@@ -4120,7 +4256,7 @@ class Feeds:
             return
         await runner(items, picks, gid, settings)
 
-    async def _plan_verify_picks(self, gid: str, items: list[dict], cap: int) -> list[dict]:
+    async def _plan_verify_picks(self, gid: str, items: list[dict], cap: int, *, task_id: str = "") -> list[dict]:
         """主模型（json_mode）挑「值得实测」的条目，回 [{"index","title","what","expect"}]。
 
         值得实测 = 工具 / 命令 / 开源项目 / 一行命令就能复现的说法；
@@ -4151,6 +4287,7 @@ class Feeds:
             json_mode=True,
             purpose="feeds.verify_plan",
             group_id=gid,
+            task_id=task_id,
         )
         data = json.loads(result.text)
         raw = data.get("verify") if isinstance(data, dict) else None
@@ -4226,6 +4363,8 @@ class Feeds:
                     pages=int((stats or {}).get("pages") or 0),
                     kept=0,
                     funnel=funnel if isinstance(funnel, dict) and funnel else None,
+                    source_mode=str((stats or {}).get("source_mode") or ""),
+                    usage=(stats or {}).get("usage") if isinstance((stats or {}).get("usage"), dict) else None,
                 )
         except Exception:
             logger.exception("记 skipped 批次失败（群 %s）", gid)
@@ -5084,6 +5223,35 @@ class Feeds:
     # ------------------------------------------------------------------
     # 前提检查
     # ------------------------------------------------------------------
+
+    def news_precheck(self, gid: str) -> str:
+        """备一件资讯的开工前提；空串 = 可以开工，否则返回中文原因。
+
+        手动「现在就备一批」（app.run_news_now / 管理员工具）和定时 `prepare_news` 共用这一个
+        检查，免得一个入口说能跑、另一个入口立刻静默退出。
+
+        覆盖三件事：画像还没成形、资讯专岗（news）已停用或未就位、模型没配好。
+        **搜索 / RSS 是否可用不在这里**：那是每轮的真实能力，`prepare_news` 自己会按实际
+        情况写准确的跳过批次（A11 的另一半由别人负责）。
+        """
+        gid = str(gid)
+        try:
+            if not self._profile_ready(gid):
+                return "这个群还没熟悉完（画像还没成形）：等它先聊一阵，或让管理员在网页上点一次「重新整理画像」再来"
+        except Exception:
+            logger.exception("读画像是否成形出错（群 %s）", gid)
+            return "读不出这个群的画像状态，这次先不备料"
+        # 专岗挂上时：news 岗位停用 → 在任何 worker / 模型工作之前就停（做都不做），
+        # 绝不默默回落到通才子 agent。老测试（没接 specialists）走原分支不受影响。
+        if getattr(self, "_specialists", None) is not None and not self._role_enabled(gid, "news"):
+            return "资讯专岗（news）已停用或未就位：去网页 设置 → 专岗 里打开它再来"
+        try:
+            if not self._models_ready():
+                return "模型还没配好：去网页 设置 → 模型 里配好一个能用的模型再来"
+        except Exception:
+            logger.exception("读模型是否配好出错（群 %s）", gid)
+            return "模型设置读不出来，这次先不备料"
+        return ""
 
     def _profile_ready(self, gid: str) -> bool:
         row = self._store.read().execute(

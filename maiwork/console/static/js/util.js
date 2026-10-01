@@ -65,7 +65,17 @@ export function toast(text, bad) {
       { duration: 160, easing: "cubic-bezier(0.2, 0.8, 0.2, 1)" }
     );
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => t.classList.remove("on"), 2400);
+  // 错误按长度多留一会（至少 6 秒，长的最多 15 秒），点一下就关；成功提示照旧 2.4 秒
+  const ms = bad ? Math.min(15000, Math.max(6000, String(text || "").length * 90)) : 2400;
+  toast.timer = setTimeout(() => t.classList.remove("on"), ms);
+  if (!t.dataset.tapClose) {
+    t.dataset.tapClose = "1";
+    t.addEventListener("click", () => {
+      if (window.getSelection && String(window.getSelection())) return; // 正在选字复制，别关
+      clearTimeout(toast.timer);
+      t.classList.remove("on");
+    });
+  }
 }
 
 /* ───────────── 时间（一律按北京时间显示） ───────────── */

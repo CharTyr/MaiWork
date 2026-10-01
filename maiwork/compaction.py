@@ -12,6 +12,11 @@
 2. 仍超：把对话里最老的一段总结成**一条** user 摘要消息（固定 8 个小节），
    最近约 16%（按 W−O 计）原样保留；assistant(tool_calls) 和它的 tool 结果成组
    切分，绝不拆开；system prompt 永不进摘要、永不删。
+   摘要输入按重要性分配预算（A07）：user / assistant 决定性文字优先原样保留，
+   超长 tool 结果各自截头尾（spill 路径说明保留），不再整体 head/tail 一刀切；
+   优先内容本身仍超预算时按组切块分段摘要（≤4 块，工具调用与结果不拆散），
+   再把块摘要合并成最终 8 节；块数到顶后单条仍超长的做头尾截断（user 开头至少
+   保住第一段，截断处写明「此处省略 N 字」）。
    摘要调模型照常用量记账（purpose 追加 ":compact"）；摘要失败：原样返回，不抛。
 
 另外三件事也在这里：
@@ -266,26 +271,291 @@ def pick_cut_point(
 # 差一条 user 摘要替换最老一段
 # ---------------------------------------------------------------------------
 
+SERIALIZE_MAX_CHARS = 32000        # 摘要输入总预算（字符）
+MAX_SUMMARY_CHUNKS = 4             # 分段摘要的块数上限（块摘要 + 1 次合并）
+_TOOL_TRUNC_CHARS = 6000           # 序列化时单条 tool 结果超过它就先各自截头尾
+_TOOL_TRUNC_HEAD = 3600
+_TOOL_TRUNC_TAIL = 1600
+_MSG_TRUNC_HEAD = 6000             # 块数到顶后单条 user/assistant 的头保留（user 开头至少留一段）
+_MSG_TRUNC_TAIL = 2000
 
-def _serialize_cut(cut: list[dict], *, max_chars: int = 32000) -> str:
-    """把要被总结的那一段摊成纯文本给摘要模型看。"""
-    lines: list[str] = []
-    for m in cut:
-        if not isinstance(m, dict):
-            continue
-        role = str(m.get("role") or "?")
-        content = str(m.get("content") or "")
-        if m.get("tool_calls"):
-            names = []
-            for tc in m.get("tool_calls") or ():
-                if isinstance(tc, dict):
-                    names.append(str((tc.get("function") or {}).get("name") or ""))
-            content = content + f"（调用工具：{'、'.join(x for x in names if x)}）"
-        lines.append(f"[{role}] {content}")
+
+_SUMMARY_RULES = (
+    "特别要求：用户 / 管理员给出的约束、禁止事项（比如「不要发布」「不许碰线上」）、\n"
+    "批准范围、还没做完的事项，必须**原样逐条列出**，放在 Primary Request and Intent 或\n"
+    "Pending Jobs 那一节；这些是继续工作的红线，一条都不能丢、不能改写口气。\n"
+)
+
+
+def _summary_prompt(body: str, *, part: int = 0, parts: int = 0) -> str:
+    """摘要提示。part/parts > 0 时表示这是分段摘要的第 part 块（共 parts 块）。"""
+    chunk_note = ""
+    if parts > 1:
+        chunk_note = (
+            f"注意：对话太长，这是第 {part}/{parts} 段。只总结这一段的内容；\n"
+            "约束、禁止事项、批准范围照样原样列出（后面会有人把各段摘要合并）。\n"
+        )
+    return (
+        "把下面这段模型和工具的对话压成一份「站用摘要」，之后新看这段摘要的人 / 模型\n"
+        "要能完全接续原来的工作。用中文写，只写事实，怎么做的就怎么写，别评价。\n"
+        + _SUMMARY_RULES
+        + "必须写齐这 8 个小节，每个小节开头写上这一节的标题（照抄下面的标题，可只写中文）：\n"
+        + sections_prompt()
+        + "\n\n写得详细一些，每节 1–5 句；没有内容的小节写「无」。\n\n"
+        + chunk_note
+        + "对话：\n" + body
+    )
+
+
+def _merge_prompt(chunk_summaries: list[str]) -> str:
+    """把各段摘要合并成最终一份 8 节摘要的提示。"""
+    joined = "\n\n".join(
+        f"【第 {i + 1} 段摘要】\n{s}" for i, s in enumerate(chunk_summaries)
+    )
+    return (
+        "下面是一段长对话分几段做出的摘要。把它们合并成一份「站用摘要」，之后新看这份\n"
+        "摘要的人 / 模型要能完全接续原来的工作。用中文写，只写事实，别评价；重复的合并，\n"
+        "冲突的以最新的为准。\n"
+        + _SUMMARY_RULES
+        + "必须写齐这 8 个小节，每个小节开头写上这一节的标题（照抄下面的标题，可只写中文）：\n"
+        + sections_prompt()
+        + "\n\n写得详细一些，每节 1–5 句；没有内容的小节写「无」。\n\n"
+        + "各段摘要：\n" + joined
+    )
+
+
+def _chunk_groups(groups: list[list[dict]], *, max_chars: int, max_chunks: int) -> list[list[dict]]:
+    """把 _split_groups 的组按「每块序列化后 ≤ max_chars」装进最多 max_chunks 块。
+
+    组不可拆（assistant(tool_calls) 和它的 tool 结果永远同块）。组数多于块数上限时
+    往后合并（后面的组更靠近当前工作，优先挤在一起；块内序列化时超长的单条由
+    _serialize_cut 的按条截断兜底）。
+    """
+    if not groups:
+        return []
+    # 组数不超上限：按预算装
+    chunks: list[list[dict]] = []
+    current: list[dict] = []
+
+    def _fits(candidate: list[dict]) -> bool:
+        return len(_serialize_cut(candidate, max_chars=max_chars)) <= max_chars
+
+    if len(groups) <= max_chunks:
+        for g in groups:
+            candidate = current + g
+            if current and not _fits(candidate):
+                chunks.append(current)
+                current = list(g)
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+        if len(chunks) <= max_chunks:
+            return chunks
+        # 装完超了上限：退回下面的均分路径
+        chunks = []
+        current = []
+
+    # 组数超上限（或按预算装完仍超上限）：均分成 max_chunks 块，组不拆
+    n = len(groups)
+    k = min(max_chunks, n)
+    per = math.ceil(n / k)
+    out: list[list[dict]] = []
+    for i in range(0, n, per):
+        out.append([m for g in groups[i:i + per] for m in g])
+    return out[:max_chunks]
+
+
+async def summarize_messages(
+    piece: list[dict],
+    *,
+    models: Any,
+    role: str,
+    agent: str | None = None,
+    purpose: str,
+    group_id: str = "",
+    task_id: str = "",
+) -> str:
+    """公开版：把一段 OpenAI messages 总结成 8 节中文摘要文本（失败抛 ModelError）。"""
+    return await _summarize_piece(piece, models=models, role=role, agent=agent, purpose=purpose,
+                                  group_id=group_id, task_id=task_id)
+
+
+async def _chat_once(
+    prompt: str,
+    *,
+    models: Any,
+    role: str,
+    agent: str | None,
+    purpose: str,
+    group_id: str,
+    task_id: str,
+) -> str:
+    """摘要专用的一次 models.chat（purpose 记账追加 ":compact"）。"""
+    result = await models.chat(
+        role,
+        [{"role": "user", "content": prompt}],
+        agent=agent,
+        purpose=f"{purpose or 'chat'}:compact" if not str(purpose or "").endswith(":compact") else str(purpose),
+        group_id=str(group_id or ""),
+        task_id=str(task_id or ""),
+    )
+    return str(result.text or "").strip()
+
+
+async def _summarize_piece(
+    piece: list[dict],
+    *,
+    models: Any,
+    role: str,
+    agent: str | None = None,
+    purpose: str,
+    group_id: str = "",
+    task_id: str = "",
+) -> str:
+    """调模型总结一段对话；返回 8 节格式的中文摘要文本。失败抛 ModelError。
+
+    role 只是后兼容口（没传 agent 时 models.chat 自己映射 main⇒main / worker⇒task）；
+    1b 起各调用方经 compaction 的 role= 照旧传，真正的岗位有专门的 agent 时走 agent 参数。
+
+    优先内容本身仍超预算时：按 _split_groups 的成组规则把 cut 切成若干块
+    （≤ MAX_SUMMARY_CHUNKS，工具调用与结果不拆散），逐块摘要后再合并成最终 8 节摘要。
+    块数到顶后单条仍超长的，由 _serialize_cut 对单条做头尾截断（user 保住开头第一段、
+    写明「此处省略 N 字」）。
+    """
+    body = _serialize_cut(piece)
+    if len(body) <= SERIALIZE_MAX_CHARS:
+        return await _chat_once(
+            _summary_prompt(body), models=models, role=role, agent=agent,
+            purpose=purpose, group_id=group_id, task_id=task_id,
+        )
+
+    # 分段摘要：按组装块（组不可拆），每块序列化后 ≤ 预算，最多 MAX_SUMMARY_CHUNKS 块
+    groups = _split_groups([m for m in piece if isinstance(m, dict)])
+    chunks = _chunk_groups(groups, max_chars=SERIALIZE_MAX_CHARS, max_chunks=MAX_SUMMARY_CHUNKS)
+    if len(chunks) <= 1:
+        # 一块装不下也只是一块（单条巨长）：直接摘要（_serialize_cut 已按条截断）
+        return await _chat_once(
+            _summary_prompt(body), models=models, role=role, agent=agent,
+            purpose=purpose, group_id=group_id, task_id=task_id,
+        )
+    chunk_summaries: list[str] = []
+    for i, chunk in enumerate(chunks):
+        chunk_body = _serialize_cut(chunk)
+        text = await _chat_once(
+            _summary_prompt(chunk_body, part=i + 1, parts=len(chunks)),
+            models=models, role=role, agent=agent,
+            purpose=purpose, group_id=group_id, task_id=task_id,
+        )
+        chunk_summaries.append(text or f"（第 {i + 1} 段摘要为空）")
+    # 合并成最终 8 节摘要
+    return await _chat_once(
+        _merge_prompt(chunk_summaries), models=models, role=role, agent=agent,
+        purpose=purpose, group_id=group_id, task_id=task_id,
+    )
+
+
+def _serialize_one(m: dict) -> str:
+    """一条消息摊成一行「[role] 内容」（assistant 带工具调用名）。"""
+    role = str(m.get("role") or "?")
+    content = str(m.get("content") or "")
+    if m.get("tool_calls"):
+        names = []
+        for tc in m.get("tool_calls") or ():
+            if isinstance(tc, dict):
+                names.append(str((tc.get("function") or {}).get("name") or ""))
+        content = content + f"（调用工具：{'、'.join(x for x in names if x)}）"
+    return f"[{role}] {content}"
+
+
+def _truncate_message_text(text: str, *, head: int, tail: int, keep_first_paragraph: bool) -> str:
+    """单条消息头尾截断，中间明确写「此处省略 N 字」。
+
+    keep_first_paragraph=True（user 消息用）：开头至少保住第一段（第一个换行之前的
+    内容），哪怕第一段比 head 还长——任务要求 / 管理员指令往往就写在开头。
+    """
+    if len(text) <= head + tail:
+        return text
+    real_head = head
+    if keep_first_paragraph:
+        first_para_end = text.find("\n")
+        if 0 < first_para_end < len(text) - tail:
+            real_head = max(head, first_para_end)
+    real_head = min(real_head, len(text) - tail)
+    omitted = len(text) - real_head - tail
+    return (
+        text[:real_head]
+        + f"\n\n……（此处省略 {omitted} 字）……\n\n"
+        + text[-tail:]
+    )
+
+
+def _truncate_tool_for_serialize(text: str) -> str:
+    """超长 tool 结果各自截头尾；spill 落盘的路径说明行必须留住。"""
+    if len(text) <= _TOOL_TRUNC_CHARS:
+        return text
+    out = _truncate_message_text(text, head=_TOOL_TRUNC_HEAD, tail=_TOOL_TRUNC_TAIL,
+                                 keep_first_paragraph=False)
+    # spill 落盘的路径说明（「（完整输出在：…）」）可能不在头尾窗口里：找出来补上
+    for line in text.splitlines():
+        s = line.strip()
+        if ("完整输出在" in s or "完整内容已存到" in s) and s not in out:
+            out += f"\n{s}"
+    return out
+
+
+def _serialize_cut(cut: list[dict], *, max_chars: int = SERIALIZE_MAX_CHARS) -> str:
+    """把要被总结的那一段摊成纯文本给摘要模型看。
+
+    按重要性分配预算（不再整体 head/tail 一刀切）：
+    - user（任务要求、批准范围、管理员指令）与 assistant 的决定性文字优先原样保留；
+    - 超长的 tool 结果先各自截头尾（spill 落盘的路径说明保留）；
+    - 仍然超预算：对超长的 user/assistant 单条做头尾截断，user 开头至少保住第一段，
+      截断处明确写「此处省略 N 字」。
+    """
+    msgs = [m for m in cut if isinstance(m, dict)]
+    lines = [_serialize_one(m) for m in msgs]
     text = "\n".join(lines).strip()
-    if len(text) > max_chars:
-        text = _head_tail(text, int(max_chars * 0.6), int(max_chars * 0.2))
-    return text
+    if len(text) <= max_chars:
+        return text
+
+    # 第一步：只动超长 tool 结果（低优先内容），user/assistant 不动
+    lines = []
+    for m in msgs:
+        if m.get("role") == "tool":
+            body = _truncate_tool_for_serialize(str(m.get("content") or ""))
+            line = f"[tool] {body}"
+            if m.get("tool_calls"):
+                line = _serialize_one(m)  # 防御：tool 一般不带 tool_calls
+            lines.append(line)
+        else:
+            lines.append(_serialize_one(m))
+    text = "\n".join(lines).strip()
+    if len(text) <= max_chars:
+        return text
+
+    # 第二步：优先内容本身也超长 → 对超长 user/assistant 单条头尾截断
+    # （user 保住开头第一段；截断处写明省略字数）。tool 已在第一步处理。
+    lines = []
+    for m in msgs:
+        role = str(m.get("role") or "?")
+        if role == "tool":
+            body = _truncate_tool_for_serialize(str(m.get("content") or ""))
+            lines.append(f"[tool] {body}")
+            continue
+        content = str(m.get("content") or "")
+        suffix = ""
+        if m.get("tool_calls"):
+            names = [str((tc.get("function") or {}).get("name") or "")
+                     for tc in m.get("tool_calls") or () if isinstance(tc, dict)]
+            suffix = f"（调用工具：{'、'.join(x for x in names if x)}）"
+        if len(content) > _MSG_TRUNC_HEAD + _MSG_TRUNC_TAIL:
+            content = _truncate_message_text(
+                content, head=_MSG_TRUNC_HEAD, tail=_MSG_TRUNC_TAIL,
+                keep_first_paragraph=(role == "user"),
+            )
+        lines.append(f"[{role}] {content}{suffix}")
+    return "\n".join(lines).strip()
 
 
 def ensure_sections(text: str) -> str:
@@ -313,55 +583,6 @@ def summary_to_message(text: str) -> dict:
 def sections_prompt() -> str:
     """给摘要模型看的 8 个小节清单（中英对照，模型只回内容，不用自带标题也行）。"""
     return "、".join(_SUMMARY_SECTIONS)
-
-
-async def summarize_messages(
-    piece: list[dict],
-    *,
-    models: Any,
-    role: str,
-    agent: str | None = None,
-    purpose: str,
-    group_id: str = "",
-    task_id: str = "",
-) -> str:
-    """公开版：把一段 OpenAI messages 总结成 8 节中文摘要文本（失败抛 ModelError）。"""
-    return await _summarize_piece(piece, models=models, role=role, agent=agent, purpose=purpose,
-                                  group_id=group_id, task_id=task_id)
-
-
-async def _summarize_piece(
-    piece: list[dict],
-    *,
-    models: Any,
-    role: str,
-    agent: str | None = None,
-    purpose: str,
-    group_id: str = "",
-    task_id: str = "",
-) -> str:
-    """调模型总结一段对话；返回 8 节格式的中文摘要文本。失败抛 ModelError。
-
-    role 只是后兼容口（没传 agent 时 models.chat 自己映射 main⇒main / worker⇒task）；
-    1b 起各调用方经 compaction 的 role= 照旧传，真正的岗位有专门的 agent 时走 agent 参数。
-    """
-    body = _serialize_cut(piece)
-    prompt = (
-        "把下面这段模型和工具的对话压成一份「站用摘要」，之后新看这段摘要的人 / 模型\n"
-        "要能完全接续原来的工作。用中文写，只写事实，怎么做的就怎么写，别评价。\n"
-        "必须写齐这 8 个小节，每个小节开头写上这一节的标题（照抄下面的标题，可只写中文）：\n"
-        + sections_prompt()
-        + "\n\n写得详细一些，每节 1–5 句；没有内容的小节写「无」。\n\n对话：\n" + body
-    )
-    result = await models.chat(
-        role,
-        [{"role": "user", "content": prompt}],
-        agent=agent,
-        purpose=f"{purpose or 'chat'}:compact" if not str(purpose or "").endswith(":compact") else str(purpose),
-        group_id=str(group_id or ""),
-        task_id=str(task_id or ""),
-    )
-    return str(result.text or "").strip()
 
 
 async def maybe_compact(

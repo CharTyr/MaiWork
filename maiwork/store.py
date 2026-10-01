@@ -829,8 +829,33 @@ def _m_model_agent(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN agent TEXT NOT NULL DEFAULT ''")
 
 
+# C03（docs/13 用量如实显示）：usage 加四列——usage_src（reported 服务商实报 /
+# unknown 不知道：成功但没报用量、或网络错误·超时·流中断·5xx·408 请求可能已被处理 /
+# none 确定没生成：429 和其他 4xx 被拒）、cache_read、cache_write（缓存读/写 token，
+# 不进 prompt/completion，另记）、attempt（同一次调用第几次尝试，旧行 0 = 老数据）；
+# model_calls 同步加 usage_src / cache_read / cache_write（attempt 它本来就有）。
+# 旧行 usage_src='' = 这功能之前落的，只能当老数据，不能猜。
+def _m_usage_src(conn: sqlite3.Connection) -> None:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(usage)")}
+    if "usage_src" not in cols:
+        conn.execute("ALTER TABLE usage ADD COLUMN usage_src TEXT NOT NULL DEFAULT ''")
+    if "cache_read" not in cols:
+        conn.execute("ALTER TABLE usage ADD COLUMN cache_read INTEGER NOT NULL DEFAULT 0")
+    if "cache_write" not in cols:
+        conn.execute("ALTER TABLE usage ADD COLUMN cache_write INTEGER NOT NULL DEFAULT 0")
+    if "attempt" not in cols:
+        conn.execute("ALTER TABLE usage ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0")
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(model_calls)")}
+    if "usage_src" not in cols:
+        conn.execute("ALTER TABLE model_calls ADD COLUMN usage_src TEXT NOT NULL DEFAULT ''")
+    if "cache_read" not in cols:
+        conn.execute("ALTER TABLE model_calls ADD COLUMN cache_read INTEGER NOT NULL DEFAULT 0")
+    if "cache_write" not in cols:
+        conn.execute("ALTER TABLE model_calls ADD COLUMN cache_write INTEGER NOT NULL DEFAULT 0")
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src]
 
 
 class Store:

@@ -745,7 +745,9 @@ def _parse_anthropic_response(data: Any, model: str) -> "ChatResult":
                 "function": {"name": name, "arguments": args},
             })
         # thinking / redacted_thinking / 别的块：不进结果（跟 openai 那条 reasoning_content 一个处理）
-    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    usage_raw = data.get("usage")
+    usage = usage_raw if isinstance(usage_raw, dict) else {}
+    u = _usage_fields(usage_raw, "input_tokens", "output_tokens")
     message: dict[str, Any] = {"role": "assistant", "content": "".join(texts)}
     if tool_calls:
         message["tool_calls"] = tool_calls
@@ -755,10 +757,15 @@ def _parse_anthropic_response(data: Any, model: str) -> "ChatResult":
         text="".join(texts),
         tool_calls=tool_calls,
         model=model,
-        prompt_tokens=int(usage.get("input_tokens") or 0),
-        completion_tokens=int(usage.get("output_tokens") or 0),
+        # anthropic 的 input_tokens 本来就不含缓存部分（prompt 保持原值，不改语义）；
+        # 缓存读/写另记两列——缓存不是免费，只是另算
+        prompt_tokens=u["prompt"],
+        completion_tokens=u["completion"],
         raw_message=message,
         finish_reason=_finish_from_stop_reason(data.get("stop_reason")),
+        usage_known=u["known"],
+        cache_read_tokens=int(usage.get("cache_read_input_tokens") or 0),
+        cache_write_tokens=int(usage.get("cache_creation_input_tokens") or 0),
     )
 
 
@@ -791,7 +798,10 @@ def _parse_responses_response(data: Any, model: str) -> "ChatResult":
                 "function": {"name": name, "arguments": str(item.get("arguments") or "")},
             })
         # reasoning / refusal 等其它 item 不进结果
-    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    usage_raw = data.get("usage")
+    u = _usage_fields(usage_raw, "input_tokens", "output_tokens")
+    details = usage_raw.get("input_tokens_details") if isinstance(usage_raw, dict) else None
+    cached = int(details.get("cached_tokens") or 0) if isinstance(details, dict) else 0
     status = str(data.get("status") or "")
     finish = "tool_calls" if tool_calls else ("length" if status == "incomplete" else "")
     message: dict[str, Any] = {"role": "assistant", "content": "".join(texts)}
@@ -801,10 +811,13 @@ def _parse_responses_response(data: Any, model: str) -> "ChatResult":
         text="".join(texts),
         tool_calls=tool_calls,
         model=model,
-        prompt_tokens=int(usage.get("input_tokens") or 0),
-        completion_tokens=int(usage.get("output_tokens") or 0),
+        prompt_tokens=u["prompt"],
+        completion_tokens=u["completion"],
         raw_message=message,
         finish_reason=finish,
+        usage_known=u["known"],
+        cache_read_tokens=cached,
+        cache_write_tokens=0,
     )
 
 
@@ -869,6 +882,31 @@ class ChatResult:
     raw_message: dict
     # "stop" / "tool_calls" / "length"（被 max_tokens 截断）…；端点没给就空字符串
     finish_reason: str = ""
+    # 端点有没有实报 usage：False = token 那两栏是「不知道」，不是「真没花」（C03）
+    usage_known: bool = True
+    # 缓存读/写 token（服务商实报才算）：不进 prompt/completion，另记——缓存不是免费
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+
+
+def _usage_fields(usage: Any, prompt_key: str, completion_key: str) -> dict[str, Any]:
+    """从端点的 usage 对象收成统一的记账字段（三协议共用规则）。
+
+    - usage 缺失 / 不是对象 / 输入输出两个计数都缺 → usage_known=False（token 给 0，
+      但那是「不知道」，记账按 unknown，不是真的 0）；
+    - 只有 prompt_key / completion_key 才算「报了」；别的键（total_tokens 等）不算数。
+    """
+    if not isinstance(usage, dict):
+        return {"known": False, "prompt": 0, "completion": 0}
+    prompt = usage.get(prompt_key)
+    completion = usage.get(completion_key)
+    if prompt is None and completion is None:
+        return {"known": False, "prompt": 0, "completion": 0}
+    return {
+        "known": True,
+        "prompt": int(prompt or 0),
+        "completion": int(completion or 0),
+    }
 
 
 def _valid_int(value: Any, low: int, high: int) -> bool:
@@ -967,6 +1005,15 @@ class _LegacyBrick:
         )
 
 
+def _mentions_max_tokens(text: str) -> bool:
+    t = str(text or "").lower()
+    return any(k in t for k in ("max_tokens", "max_output_tokens", "max_completion_tokens", "max tokens", "maximum output", "output tokens"))
+
+
+def _join_note(a: str, b: str) -> str:
+    return f"{a}；{b}" if a else b
+
+
 class Models:
     def __init__(
         self,
@@ -1015,11 +1062,26 @@ class Models:
             checked = self._store.kv_get("models.checked")
         except Exception:
             checked = None
-        if self._cache is not None and self._cache[0] is settings and self._cache[1] == checked:
+        # 岗位模型选择存在数据库（kv["agents.profiles"]），不在 Settings 里：它也进缓存键，
+        # 改了专岗模型（网页 / 管理员工具 / 迁移）下一次读立刻重算（docs/13 A02）
+        stamp = (checked, self._agents_stamp())
+        if self._cache is not None and self._cache[0] is settings and self._cache[1] == stamp:
             return self._cache[2]
         computed = self._compute(settings, checked)
-        self._cache = (settings, checked, computed)
+        self._cache = (settings, stamp, computed)
         return computed
+
+    def _agents_stamp(self) -> Any:
+        agents = self._agents
+        if agents is None:
+            return None
+        fn = getattr(agents, "config_stamp", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn()
+        except Exception:
+            return None
 
     def _compute(self, settings: Settings, checked: Any) -> ModelSettings:
         cfg = settings.models.__dict__ if settings.models else {}
@@ -1039,14 +1101,17 @@ class Models:
         agents = self._agents
 
         if agents is not None:
-            main_cs = self._resolve_candidates("main", endpoints, model_list, old, agents)
-            worker_cs = self._resolve_candidates("task", endpoints, model_list, old, agents)
+            # 就绪 / 显示 / 实际调用读同一条「有效候选链」（docs/13 A01）：
+            # 岗位自己没选（「跟主模型一样」）= 用主模型的链，这是正常可用状态，不是错误
+            main_cs, _ = self._effective_candidates("main", endpoints, model_list, old, agents)
+            worker_cs, _ = self._effective_candidates("task", endpoints, model_list, old, agents)
             primary_ep = main_cs[0].endpoint if main_cs else None
             first = main_cs[0] if main_cs else None
             first_w = worker_cs[0] if worker_cs else None
             source = "config" if (endpoints or old.any_value()) else "none"
             base_url = primary_ep.base_url if primary_ep else old.base_url
-            ready = bool(first and first_w)
+            # 主模型有候选就能干活：别的岗位没选都会兜底到它
+            ready = bool(first)
             out = ModelSettings(
                 base_url=base_url,
                 main=first.service_model if first else "",
@@ -1171,6 +1236,24 @@ class Models:
                         )
         return out
 
+    def _effective_candidates(
+        self,
+        kind: str,
+        endpoints: tuple,
+        model_list: tuple,
+        old: "_LegacyBrick",
+        agents: Any,
+    ) -> tuple[list[_Candidate], bool]:
+        """唯一出口：岗位 kind 实际会用的候选链 + 是不是它自己的（False = 主模型兜底）。
+
+        就绪摘要（_compute）、chat、limits_for、用量分桶都读它，不再各算一遍。
+        """
+        kind_s = str(kind or "").strip() or "main"
+        own = self._resolve_candidates(kind_s, endpoints, model_list, old, agents)
+        if own or kind_s == "main":
+            return own, True
+        return self._resolve_candidates("main", endpoints, model_list, old, agents), False
+
     def _current_candidates(self, kind: str) -> list[_Candidate]:
         """chat/limits_for 用：传岗位 kind（"main" / "news" / "task" / c_xxx…）。
 
@@ -1184,9 +1267,7 @@ class Models:
         if agents is not None:
             endpoints = tuple(getattr(settings, "endpoints", ()) or ())
             model_list = tuple(getattr(settings, "model_list", ()) or ())
-            out = self._resolve_candidates(kind_s, endpoints, model_list, old, agents)
-            if not out and kind_s != "main":
-                out = self._resolve_candidates("main", endpoints, model_list, old, agents)
+            out, _ = self._effective_candidates(kind_s, endpoints, model_list, old, agents)
             return out
         # 老链路：旧 [models] 四槽 → 一个假端点 + 四槽候选
         ep = old.to_endpoint()
@@ -1351,6 +1432,119 @@ class Models:
         return out
 
     # ------------------------------------------------------------------
+    # 验证所选模型（docs/13 A03）
+    # ------------------------------------------------------------------
+
+    _VERIFY_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "maiwork_ping",
+            "description": "连通性测试用的空工具，没有任何副作用",
+            "parameters": {
+                "type": "object",
+                "properties": {"word": {"type": "string", "description": "随便一个词"}},
+                "required": ["word"],
+            },
+        },
+    }
+
+    async def verify_entry(self, entry_id: str, *, timeout: float = 60) -> dict[str, Any]:
+        """验证模型库里的一个条目真能干活：一次短回答 + 一次无副作用工具往返（最多 3 次请求，
+        外加最多 2 次「最大输出」降档重试）。用条目真实的 max_tokens 发（实际干活就这么发），
+        不重试网络错误（retries=0），用量照常记账（purpose=verify）。
+
+        返回 {ok, chat_ok, tools_ok, error, note, suggested_max_tokens, calls}：
+        - ok = 能正常回答（工具不行只是警告——主模型对话还能用，子 agent 干活会受限）；
+        - 400 且错误提到最大输出 → 依次试 8192、4096，成功就给 suggested_max_tokens；
+        - 其他 4xx（401/403/404/参数错）如实停下，不乱试。
+        """
+        out: dict[str, Any] = {
+            "ok": False, "chat_ok": False, "tools_ok": False, "error": "", "note": "",
+            "suggested_max_tokens": 0, "calls": 0,
+        }
+        settings = self._get_settings()
+        entry = next(
+            (m for m in (getattr(settings, "model_list", ()) or ()) if str(getattr(m, "id", "")) == str(entry_id)),
+            None,
+        )
+        if entry is None:
+            out["error"] = "模型库里没有这个条目"
+            return out
+        ep = next(
+            (e for e in (getattr(settings, "endpoints", ()) or ())
+             if str(getattr(e, "id", "")) == str(getattr(entry, "endpoint", ""))),
+            None,
+        )
+        if ep is None or not str(getattr(ep, "base_url", "") or "").strip() or not str(getattr(ep, "api_key", "") or "").strip():
+            out["error"] = "这个模型挂的端点不在了，或者还没填地址 / 密钥"
+            return out
+        max_tokens = int(getattr(entry, "max_tokens", 32768) or 32768)
+
+        def cand(mt: int) -> _Candidate:
+            return _Candidate(
+                service_model=str(getattr(entry, "model", "") or ""),
+                label=str(getattr(entry, "name", "") or getattr(entry, "model", "")),
+                endpoint=ep, context_window=int(getattr(entry, "context_window", 128000) or 128000),
+                max_tokens=mt,
+            )
+
+        async def call(messages: list[dict], mt: int, tools: list[dict] | None = None) -> ChatResult:
+            out["calls"] += 1
+            return await self.chat(
+                messages=messages, tools=tools, purpose="verify", retries=0, timeout=timeout,
+                _candidates=[cand(mt)],
+            )
+
+        # ① 短回答（必要时最大输出降档）
+        tries = [max_tokens] + [x for x in (8192, 4096) if x < max_tokens]
+        hello = [{"role": "user", "content": "这是连通性测试。只回复两个字母：OK"}]
+        used_mt = max_tokens
+        for i, mt in enumerate(tries):
+            try:
+                r0 = await call(hello, mt)
+            except ModelError as e:
+                msg = str(e.message or e)
+                param_err = e.status == 400 and _mentions_max_tokens(msg)
+                if param_err and i + 1 < len(tries):
+                    continue
+                out["error"] = msg
+                return out
+            # 回了 200 但一个字都没有（真实中转站上某些「格式 × 模型」组合就这样）：不算能回答
+            if not str(r0.text or "").strip() and not r0.tool_calls:
+                out["error"] = (
+                    "端点回了「成功」，但回答是空的（一个字都没有）：这个接口格式和模型的组合在这个端点上用不了，"
+                    "换一种接口格式或换个模型再试"
+                )
+                return out
+            used_mt = mt
+            out["chat_ok"] = True
+            break
+        if used_mt != max_tokens:
+            out["suggested_max_tokens"] = used_mt
+            out["note"] = f"这个模型不接受 {max_tokens} 的最大输出，用 {used_mt} 能正常回答，建议把「最大输出」改成 {used_mt}"
+        out["ok"] = True
+
+        # ② 工具往返：要它调空工具 → 把结果递回去 → 再回一句
+        try:
+            ask = [{"role": "user", "content": "这是工具连通性测试：请调用 maiwork_ping 工具，word 填 hi。"}]
+            r1 = await call(ask, used_mt, [self._VERIFY_TOOL])
+            calls = list(r1.tool_calls or [])
+            if not calls:
+                out["note"] = _join_note(out["note"], "这个模型没调用工具：主模型对话能用，但子 agent 干活要靠工具，建议换一个支持工具调用的模型")
+                return out
+            tc = calls[0]
+            tc_id = str(tc.get("id") or "call_0")
+            follow = ask + [
+                {"role": "assistant", "content": r1.text or "", "tool_calls": [tc]},
+                {"role": "tool", "tool_call_id": tc_id, "content": "pong"},
+            ]
+            await call(follow, used_mt, [self._VERIFY_TOOL])
+            out["tools_ok"] = True
+        except ModelError as e:
+            out["note"] = _join_note(out["note"], f"工具调用没走通（{e.message}）：子 agent 干活会受限")
+        return out
+
+    # ------------------------------------------------------------------
     # HTTP
     # ------------------------------------------------------------------
 
@@ -1454,6 +1648,7 @@ class Models:
         timeout: float = 120,
         retries: int | None = None,
         max_tokens: int | None = None,
+        _candidates: list[_Candidate] | None = None,
     ) -> ChatResult:
         """调一次模型。
 
@@ -1475,27 +1670,20 @@ class Models:
         发请求前过端点限流门：并发上限 max_concurrency（缺省 2）+ 429 冷却 +
         每分钟上限 max_rpm（缺省 0 = 关）；等待可取消，状态只在内存。
         """
-        settings = self._get_settings()  # 缓存判热更新用
-        s = self.settings()
-        if not s.ready():
-            raise ModelError("模型还没配好")
-
+        settings = self._get_settings()
         msgs = list(messages or [])
         agent_kind = str(agent or "").strip()
         if not agent_kind:
             agent_kind = "main" if str(role or "") == "main" else "task"
-        candidates = self._current_candidates(agent_kind)
-        if not candidates:
-            if agent_kind == "main":
-                raise ModelError("「主模型」还没挑模型：到网页「专岗」页给它选一个模型")
-            raise ModelError(f"「{agent_kind}」专岗还没挑模型，连主模型也没选好：到网页「专岗」页先选一个模型")
-
-        # 记录桶（两桶账不变）：自己的链成了 = 它自己（main 桶 / 别的都 worker 桶）；
-        # 岗位没候选兜底到主模型链 = 主模型桶
+        # 就绪与实际调用读同一条有效候选链（docs/13 A01）：不再先过一道全局 ready 闸
         role_kind = agent_kind
-        if self._agents is not None and agent_kind != "main":
+        if _candidates is not None:
+            # 内部口：验证某个模型库条目（verify_entry），不走岗位路由
+            candidates = list(_candidates)
+            role_kind = "main"
+        elif self._agents is not None:
             try:
-                own = self._resolve_candidates(
+                candidates, own = self._effective_candidates(
                     agent_kind,
                     tuple(getattr(settings, "endpoints", ()) or ()),
                     tuple(getattr(settings, "model_list", ()) or ()),
@@ -1503,9 +1691,18 @@ class Models:
                     self._agents,
                 )
             except Exception:
-                own = []
+                candidates, own = [], True
+            # 记录桶（两桶账不变）：自己的链 = 它自己；兜底到主模型链 = 主模型桶
             if not own:
                 role_kind = "main"
+        else:
+            if not self.settings().ready():
+                raise ModelError("模型还没配好")
+            candidates = self._current_candidates(agent_kind)
+        if not candidates:
+            if agent_kind == "main" or role_kind == "main":
+                raise ModelError("模型还没配好：「主模型」还没挑模型，到网页「专岗」页给它选一个模型")
+            raise ModelError(f"模型还没配好：「{agent_kind}」专岗还没挑模型，连主模型也没选好，到网页「专岗」页先选一个模型")
         role_effective = "main" if role_kind == "main" else "worker"
         # 思考强度：跟「用谁的链」一致——用它自己的 profile 强度；兜底用主模型的
         requested_effort = self._profile_effort(role_kind)
@@ -1602,6 +1799,7 @@ class Models:
                         prompt_tokens=0, completion_tokens=0, error=last_err.message,
                         request=log_request, response=None, keys=secret_keys,
                         purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
+                        usage_src="unknown",  # 网络错误/超时/断流：请求可能已在服务端生成，按「不知道」记
                     )
                     continue
                 ms = int((clock.now() - start) * 1000)
@@ -1623,6 +1821,8 @@ class Models:
                         prompt_tokens=0, completion_tokens=0, error=last_err.message,
                         request=log_request, response=None, keys=secret_keys,
                         purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
+                        # 429 是限流拒了，确定没生成；5xx/408 可能已经在服务端处理 → 不知道
+                        usage_src="none" if status == 429 else "unknown",
                     )
                     continue
                 if status != 200:
@@ -1636,6 +1836,7 @@ class Models:
                         prompt_tokens=0, completion_tokens=0, error=err.message,
                         request=log_request, response=None, keys=secret_keys,
                         purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
+                        usage_src="none",  # 其他 4xx：请求被拒，确定没生成
                     )
                     raise err
                 self._throttle.note_success(endpoint, concurrency=max_conc)
@@ -1653,6 +1854,7 @@ class Models:
                         prompt_tokens=0, completion_tokens=0, error=msg,
                         request=log_request, response=None, keys=secret_keys,
                         purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
+                        usage_src="unknown",  # 200 但解析炸：响应收到了，真实用量不知道
                     )
                     raise
                 log_response = self._build_log_response(data, result, secret_keys)
@@ -1661,6 +1863,9 @@ class Models:
                     prompt_tokens=result.prompt_tokens, completion_tokens=result.completion_tokens,
                     error="", request=log_request, response=log_response, keys=secret_keys,
                     purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
+                    # 成功但端点没报用量：那两栏 0 是「不知道」，不是真没花
+                    usage_src="reported" if result.usage_known else "unknown",
+                    cache_read=result.cache_read_tokens, cache_write=result.cache_write_tokens,
                 )
                 return result
         assert last_err is not None
@@ -1940,18 +2145,29 @@ class Models:
         group_id: str,
         task_id: str,
         agent: str = "",
+        usage_src: str = "",
+        cache_read: int = 0,
+        cache_write: int = 0,
     ) -> None:
-        """每次尝试写两条账：usage（原有）+ model_calls（管理员网页看）。写失败只记日志。"""
+        """每次尝试写两条账：usage（原有）+ model_calls（管理员网页看）。写失败只记日志。
+
+        usage_src（C03）：reported = 服务商实报；unknown = 不知道（成功但没报用量、
+        或请求可能已在服务端处理：网络错误 / 超时 / 流中断 / 5xx / 408）；
+        none = 确定没生成（429 和其他 4xx 被拒）。旧行 '' = 老数据。
+        """
         now = clock.now()
         error_db = _redact_full(error, keys)[:_LOG_ERR_MAX]
         agent_s = str(agent or "")
+        usage_src_s = str(usage_src or "")
+        cache_read_i = max(0, int(cache_read or 0))
+        cache_write_i = max(0, int(cache_write or 0))
         # 1) usage（原路；agent 列是 1b 新增的岗位账，role 两桶不变）
         try:
             with self._store.tx() as conn:
                 conn.execute(
                     "INSERT INTO usage (ts, day, role, agent, model, purpose, group_id, task_id,"
-                    " prompt_tokens, completion_tokens, ok, ms, error)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " prompt_tokens, completion_tokens, ok, ms, error, usage_src, cache_read, cache_write, attempt)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         now,
                         clock.day_key(now),
@@ -1966,6 +2182,10 @@ class Models:
                         1 if ok else 0,
                         int(ms),
                         str(error or ""),
+                        usage_src_s,
+                        cache_read_i,
+                        cache_write_i,
+                        int(attempt),
                     ),
                 )
         except Exception:
@@ -1975,8 +2195,9 @@ class Models:
             with self._store.tx() as conn:
                 conn.execute(
                     "INSERT INTO model_calls (ts, purpose, role, agent, model, group_id, task_id, attempt, ok,"
-                    " status, ms, prompt_tokens, completion_tokens, error, request, response)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " status, ms, prompt_tokens, completion_tokens, error, request, response,"
+                    " usage_src, cache_read, cache_write)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         now,
                         str(purpose or ""),
@@ -1994,6 +2215,9 @@ class Models:
                         error_db,
                         str(request or "{}"),
                         str(response) if response else "{}",
+                        usage_src_s,
+                        cache_read_i,
+                        cache_write_i,
                     ),
                 )
                 row = conn.execute("SELECT COUNT(*) AS c FROM model_calls").fetchone()
@@ -2007,7 +2231,7 @@ class Models:
 
     @staticmethod
     def _parse_chat(data: dict, model: str) -> ChatResult:
-        """解析 choices[0].message 的 content / tool_calls，usage 的 tokens（缺就 0）。"""
+        """解析 choices[0].message 的 content / tool_calls；usage 缺了记「不知道」，不装成 0。"""
         try:
             choice = data["choices"][0]
             message = choice["message"]
@@ -2017,15 +2241,21 @@ class Models:
             raise ModelError("模型返回格式不对：message 不是对象")
         content = message.get("content")
         tool_calls = message.get("tool_calls")
-        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        usage_raw = data.get("usage")
+        u = _usage_fields(usage_raw, "prompt_tokens", "completion_tokens")
+        details = usage_raw.get("prompt_tokens_details") if isinstance(usage_raw, dict) else None
+        cached = int(details.get("cached_tokens") or 0) if isinstance(details, dict) else 0
         return ChatResult(
             text=str(content) if content is not None else "",
             tool_calls=[dict(t) for t in tool_calls] if isinstance(tool_calls, list) else [],
             model=model,
-            prompt_tokens=int(usage.get("prompt_tokens") or 0),
-            completion_tokens=int(usage.get("completion_tokens") or 0),
+            prompt_tokens=u["prompt"],
+            completion_tokens=u["completion"],
             raw_message=message,
             finish_reason=str(choice.get("finish_reason") or "") if isinstance(choice, dict) else "",
+            usage_known=u["known"],
+            cache_read_tokens=cached,
+            cache_write_tokens=0,
         )
 
     # ------------------------------------------------------------------
@@ -2033,13 +2263,22 @@ class Models:
     # ------------------------------------------------------------------
 
     def usage_today(self) -> dict:
-        """按北京时间今天汇总 {"main", "worker", "calls", "errors"}。"""
+        """按北京时间今天汇总 {main, worker, calls, errors, unknown_calls, retries, cache_read, cache_write}。
+
+        main/worker 口径不变：照旧按 role 把 token 加起来（没报用量的行就是 0，不加、
+        也不当「真没花」——unknown_calls 单列）。usage_src='' 的老行不参与新统计。
+        retries = attempt>1 的尝试数（重试放大看得见）。
+        """
         day = clock.day_key(clock.now())
         row = self._store.read().execute(
             "SELECT COALESCE(SUM(CASE WHEN role='main' THEN prompt_tokens + completion_tokens END), 0) AS main_tokens,"
             " COALESCE(SUM(CASE WHEN role='worker' THEN prompt_tokens + completion_tokens END), 0) AS worker_tokens,"
             " COUNT(*) AS calls,"
-            " COALESCE(SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END), 0) AS errors"
+            " COALESCE(SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END), 0) AS errors,"
+            " COALESCE(SUM(CASE WHEN usage_src='unknown' THEN 1 ELSE 0 END), 0) AS unknown_calls,"
+            " COALESCE(SUM(CASE WHEN attempt>1 THEN 1 ELSE 0 END), 0) AS retries,"
+            " COALESCE(SUM(cache_read), 0) AS cache_read,"
+            " COALESCE(SUM(cache_write), 0) AS cache_write"
             " FROM usage WHERE day = ?",
             (day,),
         ).fetchone()
@@ -2048,4 +2287,8 @@ class Models:
             "worker": int(row["worker_tokens"]),
             "calls": int(row["calls"]),
             "errors": int(row["errors"]),
+            "unknown_calls": int(row["unknown_calls"]),
+            "retries": int(row["retries"]),
+            "cache_read": int(row["cache_read"]),
+            "cache_write": int(row["cache_write"]),
         }

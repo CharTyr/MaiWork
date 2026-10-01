@@ -231,29 +231,38 @@ def test_normalize_url_strips_tracking_and_case() -> None:
 # ----------------------------------------------------------------------
 
 
-def test_prepare_news_not_ready_returns_0_and_no_calls(tmp_path) -> None:
+def test_prepare_news_not_ready_returns_0_and_records_skipped(tmp_path) -> None:
+    """画像没成形：返回 0、不调模型 / 子 agent；但要留一条 skipped 批次说明原因（A11 不静默）。"""
     store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path, ready=False)
     got = _run(feeds.prepare_news(GID))
     assert got == 0
     assert models.calls == []
     assert workers.calls == []
-    assert store.read().execute("SELECT COUNT(*) c FROM news_batches").fetchone()["c"] == 0
+    row = store.read().execute("SELECT * FROM news_batches").fetchone()
+    assert row is not None, "画像没成形也要写一条 skipped 批次（A11：不静默退出）"
+    assert row["skipped"] == 1
+    assert "画像" in row["note"] or "熟悉" in row["note"], row["note"]
 
 
 def test_prepare_news_not_ready_unknown_group(tmp_path) -> None:
-    """库里没有这个群也按没成形处理：返回 0、不写批次。"""
+    """库里没有这个群也按没成形处理：返回 0，并留一条 skipped 批次说明画像没成形。"""
     store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path, seed=False)
     assert _run(feeds.prepare_news("999")) == 0
-    assert store.read().execute("SELECT COUNT(*) c FROM news_batches").fetchone()["c"] == 0
+    row = store.read().execute("SELECT * FROM news_batches").fetchone()
+    assert row is not None and row["skipped"] == 1
+    assert "画像" in row["note"] or "熟悉" in row["note"], row["note"]
 
 
 def test_prepare_news_models_not_ready(tmp_path) -> None:
+    """模型没配好：返回 0、不派子 agent；也留一条 skipped 批次说清是模型没配。"""
     store, settings, feeds, models, workers, topics, _ = _make_feeds(
         tmp_path, models=FakeModelsQueue(ready=False)
     )
     assert _run(feeds.prepare_news(GID)) == 0
     assert workers.calls == []
-    assert store.read().execute("SELECT COUNT(*) c FROM news_batches").fetchone()["c"] == 0
+    row = store.read().execute("SELECT * FROM news_batches").fetchone()
+    assert row is not None and row["skipped"] == 1
+    assert "模型" in row["note"], row["note"]
 
 
 def test_prepare_news_search_unavailable_marks_skipped(tmp_path) -> None:

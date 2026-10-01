@@ -298,35 +298,40 @@ export async function act(el, e) {
       break;
     }
     case "news-run": {
+      // 后端给运行编号和真实状态（docs/13 A11）：开不了当场说原因；开了就看状态，不靠时间猜
       const gid = state.g;
       el.disabled = true;
       try {
-        await api("POST", `/api/groups/${encodeURIComponent(gid)}/news/run`, {});
+        const r = await api("POST", `/api/groups/${encodeURIComponent(gid)}/news/run`, {});
+        const runId = (r && r.run_id) || "";
         state.newsRunning = gid;
         renderView();
         toast("开始备料了，一般几分钟，好了会自己出现在这里");
-        // 每 20 秒看一眼，最多 15 分钟
-        const before = ((gview() || {}).news || []).length ? (gview().news[0].id || 0) : 0;
         let n = 0;
         const tick = async () => {
           n += 1;
-          await loadView(true);
-          const v = gview();
-          const top = v && (v.news || []).length ? v.news[0].id || 0 : 0;
-          if (top && top !== before) {
+          let st = null;
+          try {
+            st = await api("GET", `/api/groups/${encodeURIComponent(gid)}/news/run`);
+          } catch (_) {}
+          const mine = st && (!runId || st.run_id === runId);
+          if (mine && st.state !== "running") {
             state.newsRunning = null;
+            if (state.g === gid) await loadView(true);
             renderView();
-            toast("新的一批资讯到了");
+            if (st.state === "done") toast(st.reason || "新的一批资讯到了");
+            else if (st.state === "skipped") toast(`这轮没出新资讯：${st.reason || "没有能用的候选"}`);
+            else toast(`备料没成：${st.reason || "出错了"}`, true);
             return;
           }
-          if (n >= 45 || state.g !== gid) {
+          if (n >= 90 || state.g !== gid) {
             state.newsRunning = null;
-            renderView();
+            if (state.g === gid) renderView();
             return;
           }
-          setTimeout(tick, 20000);
+          setTimeout(tick, 10000);
         };
-        setTimeout(tick, 20000);
+        setTimeout(tick, 5000);
       } catch (err) {
         el.disabled = false;
         toast(err.message, true);

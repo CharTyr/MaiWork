@@ -20,8 +20,11 @@ Search(store, get_extensions)：
   只看那家能不能用，搜索那家关了也不影响。
 - 调用复用绑定扩展在 extensions 里的现有 client（runtime_of(name).client），不自己另建连接；
   MCP 报 "HTTP 5xx" 等 _MCP_RETRY_DELAY_S 秒重试一次。
-- 没绑定 / 绑定的扩展不在了、没启用、没连上 → SearchUnavailable（中文提示去 设置 → 扩展 绑定）；
-  调用失败 → SearchError（已遮扩展 headers 里的密钥）。
+- **没绑定**（kv 里没有 extensions.search）→ SearchUnavailable（中文提示去 设置 → 扩展 绑定），
+  零联网调用；**绑定了但主家暂时坏了**（扩展不存在/没启用/没连上/初始化失败留下空工具清单/
+  工具清单里没这个工具）也按 fallback 名单递补，和调用失败（超时 / 429 / 5xx）一个口径——
+  全链都挂了才抛最后一个错（A05）。
+- 调用失败 → SearchError（已遮扩展 headers 里的密钥）。
 """
 
 from __future__ import annotations
@@ -595,7 +598,7 @@ class Search:
         return status_of(self._store, settings, self._runtime)
 
     def available(self) -> bool:
-        """有绑定且该扩展已启用、连得上、工具在。"""
+        """有效搜索链能不能用：主家用得了，或主家坏了但备用名单里有一家能用（A05）。"""
         try:
             ok, _ = self.status()
             return ok
@@ -653,14 +656,19 @@ class Search:
     # ------------------------------------------------------------------
 
     def _client(self) -> tuple[Any, dict[str, str], Any]:
-        """(client, binding, runtime)；不可用抛 SearchUnavailable（中文）。"""
+        """(client, binding, runtime)；主绑定自己不能用抛 SearchUnavailable（中文）。
+
+        只看主家（不看备用递补）：调用方（search 的主家那一步）拿它失败去换备用，
+        整条链可不可用由 status_of / status() 判，别在这里提前下结论。
+        """
         binding = get_binding(self._store)
         if binding is None:
             raise SearchUnavailable("还没指定联网搜索：去 设置 → 扩展 里选一个 MCP 用作联网搜索")
-        settings = self._settings()
-        ok, text = status_of(self._store, settings, self._runtime)
-        if not ok:
-            raise SearchUnavailable(text)
+        problem = tool_problem(
+            self._store, self._settings(), self._runtime, binding["mcp"], binding["tool"], role="搜索"
+        )
+        if problem:
+            raise SearchUnavailable(problem)
         runtime = self._runtime(binding["mcp"])
         return runtime.client, binding, runtime
 
@@ -686,19 +694,28 @@ class Search:
         site: str = "",
         news: bool = False,
     ) -> list[dict]:
-        """主绑定先搜；失败（MCPError / isError 的 SearchError / 超时）按 binding["fallback"]
-        里认得出的预设家一个个递补；全挂抛最后一个错误。site/news 只在预设路上生效。
+        """主绑定先搜；主家「坏了」（没连上 / 初始化失败留下空工具清单 / 工具清单里没这个工具）
+        或调用失败（MCPError / isError 的 SearchError / 超时 / 429 / 5xx）都按 binding["fallback"]
+        里认得出的预设家一个个递补；全挂抛最后一个错误。
+
+        没绑定 → 直接 SearchUnavailable（不打网络）。site/news 只在预设路上生效。
         每条结果带 "provider" = 实际出结果的扩展名（多provider拼接时认来源用）。"""
         settings = self._settings()
         entries = {e.name: e for e in extensions_web.merged_entries(settings, self._store)}
+        binding = get_binding(self._store)
+        if binding is None:
+            raise SearchUnavailable("还没指定联网搜索：去 设置 → 扩展 里选一个 MCP 用作联网搜索")
         errors: list[Exception] = []
-        names = self._fallback_chain(entries)
+        names = self._fallback_chain(entries, binding)
         for name in names:
             try:
                 out = await self._search_one(name, query, limit=limit, days=days, site=site, news=news,
                                              entries=entries)
-            except SearchUnavailable:
-                raise  # 主绑定本身没配好（没绑定/扩展没了）：不递补，直接报
+            except SearchUnavailable as e:
+                # 主家绑定了但这家暂时用不了：记下来接着试备用（A05），不再直接抛
+                errors.append(e)
+                logger.info("搜索家 %s 现在用不了（%s），试下一家", name, e)
+                continue
             except (SearchError, MCPError, asyncio.TimeoutError, TimeoutError) as e:
                 errors.append(e)
                 logger.info("搜索家 %s 没搜成（%s），试下一家", name, type(e).__name__)
@@ -708,9 +725,10 @@ class Search:
             raise errors[-1]
         raise SearchUnavailable("还没指定联网搜索：去 设置 → 扩展 里选一个 MCP 用作联网搜索")  # 理论到不了
 
-    def _fallback_chain(self, entries: dict[str, Any]) -> list[str]:
+    def _fallback_chain(self, entries: dict[str, Any], binding: dict[str, Any] | None = None) -> list[str]:
         """搜索要试的扩展顺序：[主绑定] + [fallback 名单里认得出预设且启用的]。"""
-        binding = get_binding(self._store)
+        if binding is None:
+            binding = get_binding(self._store)
         if binding is None:
             raise SearchUnavailable("还没指定联网搜索：去 设置 → 扩展 里选一个 MCP 用作联网搜索")
         chain = [binding["mcp"]]

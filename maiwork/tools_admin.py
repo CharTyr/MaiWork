@@ -1605,8 +1605,19 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                 return _bad(f"开备料失败：{e}")
             if isinstance(out, dict) and not out.get("started", True):
                 return _bad(str(out.get("reason") or "这个群现在备不了料"))
-            return _ok(f"已经让群 {gid} 现在备一批资讯（后台跑，好了会在网页上出现）")
-        # 没有现成入口（老服务包 / 测试）：自己起一个后台任务跑
+            rid = str(out.get("run_id") or "") if isinstance(out, dict) else ""
+            tail = f"（运行编号 {rid}）" if rid else ""
+            return _ok(f"已经让群 {gid} 现在备一批资讯（后台跑，好了会在网页上出现）{tail}")
+        # 没有现成入口（老服务包 / 测试）：自己起一个后台任务跑。
+        # 开工前提照样先过一遍，别嘴上说开工、后台立刻静默退出（A11）。
+        precheck = getattr(feeds, "news_precheck", None)
+        if callable(precheck):
+            try:
+                why = str(precheck(gid) or "")
+            except Exception as e:
+                return _bad(f"检查备料开工前提出错：{e}")
+            if why:
+                return _bad(why)
         prepare = getattr(feeds, "prepare_news", None)
         if not callable(prepare):
             return _bad("这个 MaiWork 的资讯模块没有备料入口")

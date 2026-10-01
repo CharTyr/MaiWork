@@ -260,13 +260,22 @@ export async function actModels(action, el) {
       return true;
     }
     case "mdl-avail": {
+      // 只换列表数据，不重建表单（docs/13 A09）：先把整张表单收进 draft，成功 / 失败都不丢未保存的字段
       el.disabled = true;
+      if (state.mdlEdit && state.mdlEdit.type === "model") {
+        const cur = readModel();
+        Object.assign(state.mdlEdit.draft, cur, { name: cur.name === cur.model ? "" : cur.name });
+      }
       try {
         const ok = await testEndpoint(el.dataset.ep, {}, null);
-        const keep = readModel();
-        repaintSheet();
-        if ($("mo-model")) { $("mo-model").value = keep.model; $("mo-name").value = keep.name === keep.model ? "" : keep.name; }
-        toast(ok ? `找到 ${((state.mdlAvail || {})[el.dataset.ep] || []).length} 个模型` : "没连上，检查一下端点的地址和密钥", !ok);
+        const dl = $("mo-avail");
+        const list = (state.mdlAvail || {})[el.dataset.ep] || [];
+        if (ok && dl) {
+          dl.innerHTML = list.map((x) => `<option value="${esc(x)}"></option>`).join("");
+          if (el.parentElement) el.parentElement.hidden = true; // 有列表了，提示行收起
+        }
+        el.disabled = false;
+        toast(ok ? `找到 ${list.length} 个模型，在「模型 ID」框里可以直接选` : "没连上，检查一下端点的地址和密钥", !ok);
       } catch (err) { toast(err.message, true); el.disabled = false; }
       return true;
     }

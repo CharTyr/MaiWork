@@ -6,14 +6,14 @@
 
 **MaiBot 的常驻生产力 Agent**：理解一个群 · 主动找资讯 · 提构想 · 追目标 · 交付任何工作
 
-[![Version](https://img.shields.io/badge/version-0.4.2-blue.svg)](https://github.com/CharTyr/MaiWork)
+[![Version](https://img.shields.io/badge/version-0.7.1-blue.svg)](https://github.com/CharTyr/MaiWork)
 [![MaiBot](https://img.shields.io/badge/MaiBot-1.2.5%20实测-green.svg)](https://github.com/Mai-with-u/MaiBot)
 [![SDK](https://img.shields.io/badge/插件%20SDK-2.x-green.svg)](https://github.com/Mai-with-u/MaiBot)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-orange.svg)](LICENSE)
 [![Stars](https://img.shields.io/github/stars/CharTyr/MaiWork)](https://github.com/CharTyr/MaiWork/stargazers)
 [![Issues](https://img.shields.io/github/issues/CharTyr/MaiWork)](https://github.com/CharTyr/MaiWork/issues)
 
-[核心特性](#核心特性) • [功能概览](#功能概览) • [界面一览](#界面一览) • [运行环境](#运行环境) • [专用机器](#专用机器自己的-vps--vm可以配多台) • [快速开始](#快速开始) • [配置项说明](#配置项说明) • [指令](#指令) • [安全与公开范围](#安全与公开范围) • [常见问题](#常见问题)
+[核心特性](#核心特性) • [功能概览](#功能概览) • [界面一览](#界面一览) • [运行环境](#运行环境) • [专用机器](#专用机器自己的-vps--vm可以配多台) • [快速开始](#快速开始) • [配置项说明](#配置项说明) • [从旧版本升级](#从旧版本升级) • [指令](#指令) • [安全与公开范围](#安全与公开范围) • [常见问题](#常见问题)
 
 **在线看网页演示：[dewy-vow-gebh.here.now](https://dewy-vow-gebh.here.now/)**
 
@@ -77,7 +77,7 @@
 - **资讯 / 构想 / 目标 / 任务**：群友用本群链接就能看，管理员能批准、反馈有没有用。
 - **群**：MaiWork 眼里这个群的样子（群画像、关注成员），管理员可以改。
 - **和 MaiWork 聊**：管理员直接问进度、提要求、调整做法。
-- **设置**：模型、群、派活批准、推送节奏、扩展（MCP 和 skill）、干活用的机器等。
+- **设置**：模型（端点 + 模型库）、专岗、群、派活批准、推送节奏、扩展（搜索 / MCP / skill）、干活用的机器等。
 
 ---
 
@@ -109,8 +109,8 @@
 |:-----|:-----|
 | MaiBot | 插件 SDK 2.x；在 **MaiBot 1.2.5** 上实测 |
 | Python 依赖 | httpx、tomlkit、aiohttp —— MaiBot 本身已带，**不用另装** |
-| 模型 | 一个 **OpenAI 兼容接口**：「主模型」负责想和验收，「干活模型」负责执行，可以是同一个 |
-| 联网搜索 | 一个能搜索的 **MCP**（如 Tavily、You.com、EXA 的托管 MCP） |
+| 模型 | 一个**模型服务端点**（OpenAI / Anthropic / Responses 三种接口格式都行）+ 一个**模型库**：「主模型」负责想和验收，各专岗负责动手；专岗没单独选就跟主模型一样 |
+| 联网搜索 | 在首次引导里直接勾选搜索服务预设（免密钥的可以直接用）；主搜索坏了备用会自动接上 |
 | 资讯卡片画图 | 用 MaiBot 环境里的 playwright + Chromium、Pillow 画卡片、处理配图；缺了就自动改发文字列表 |
 | 可选 | Jev（TypeSafe）密钥，让快速判断更快更省；自己的 VPS / VM（专用机器，可以配多台）；[railway.new](https://railway.new) 一次性 VM |
 
@@ -142,6 +142,8 @@
 
 ## 快速开始
 
+最短的一条路：**装好 → 打开插件 → 打开网页跟着引导走完 → 完成页看清单**。下面是每一步。
+
 ### 第一步：安装
 
 二选一：
@@ -152,7 +154,7 @@
   ```
   本仓库根目录就是插件目录。
 
-### 第二步：最少配置
+### 第二步：打开插件，写上服务的群
 
 把 `config.example.toml` 复制为 `config.toml`（或在 MaiBot WebUI 的插件配置里改），至少改两处：
 
@@ -161,27 +163,42 @@
 enabled = true
 
 [[groups.serve]]
-group = "qq:你的群号"
+group = "qq:123456789"   # 换成你自己的群号；telegram / qqbot 群见下面「多平台」
 ```
 
 MaiBot 会自动加载插件。
 
-### 第三步：打开网页控制台
+### 第三步：打开网页，跟着引导走完
 
 1. 管理员密码在 `<MaiBot>/data/maiwork/console_password.txt`（也可以在 `config.toml` 的 `[console] password` 自己设）。
 2. 打开 `http://127.0.0.1:18650`，用管理员密码登录。
-3. **首次引导**会带你填完：模型、群、可选密钥、管理员和群管理员、头像。
-4. 在「设置 → 扩展」里加一个搜索 MCP，点「用作联网搜索」。
-5. 同一页的 skill 可以单独启用或停用。预设搜索服务的配套 skill 只在对应服务开启时生效；你手动停用过的，不会因为重开服务而自动恢复。停用后模型不能再读取，但管理员仍可查看内容。
-
-想让群友从外网访问网页，需要自己做反向代理，并把地址填到 `[console] public_url`。
+3. **首次引导**一步一屏，依次走：
+   - **开始** → **模型**：连一个端点（选接口格式、填地址和密钥），模型可以从列表里选，也可以直接手填模型名；保存时会用一句很短的问话加一次空工具测试验证这个模型，会用掉一点点 token
+   - **服务的群**：MaiWork 只在写进去的群里工作
+   - **可选**：Jev 密钥（不填也能用，填了快速判断更快更省）
+   - **联网搜索**：直接勾选要用的搜索服务预设，免密钥的不用填就能用；勾的第一个当主搜索，其余当备用
+   - **管理员**：群友派的活由谁批准（填你自己的账号）
+   - **头像** → **完成**
+4. **完成页**会把「模型 / 群 / 搜索 / 干活 / 交付 / 第一件小事」逐项列出来，写清哪一项能用、哪一项受限、还差什么。缺模型或群只会「先存下」，不算配好；中途刷新页面会接着上次那一步继续。
 
 ### 第四步：在群里用
 
 - 发 `/mw` 看本群进度，发 `/mw 网页` 拿本群网页链接
 - 直接 @MaiBot 派活，比如「@MaiBot 帮我对比一下这三款键盘」
 
-> 所有设置都有默认值，默认什么都不做。网页上改的设置会直接写回 `config.toml`。
+> 所有设置都有默认值，默认什么都不做。网页上改的设置会直接写回 `config.toml`（专岗选了哪个模型、搜索绑定这类存在数据库里），改完不用重启。
+
+### 这几样分别是怎么配的
+
+**模型：端点 → 模型库 → 专岗。** 一个**端点**就是一家模型服务商（地址 + 密钥，接口格式支持 `openai` / `anthropic` / `responses`）；**模型库**里登记这个端点下有哪些模型；至于主模型和资讯 / 构想 / 目标 / 任务这些**专岗**各用哪个模型，在网页「设置 → 专岗」里挑（存在数据库里）。**专岗没单独选，就跟主模型一样**——这是正常能用的状态，不是没配好。想加第二家端点、调思考强度、改上下文窗口，都在「设置 → 模型」页。
+
+**联网搜索。** 首次引导里直接勾搜索服务预设，免密钥的可以先拿来用；勾的第一个当主搜索，其余当备用——主搜索暂时坏了，备用会自动接上。之后在「设置 → 扩展」里也能改。同一页的 skill 可以单独启用或停用；预设搜索服务配套的 skill 只在对应服务开启时生效，你手动停用过的不会因为重开服务自动恢复。**没配搜索但订了 RSS 时，资讯只用 RSS 也能出。**
+
+**记忆。** MaiWork 会把干活学到的经验记下来：一份全局的、一份每个群单独的，在网页「设置 → 记忆」页可以看和改；每个群的记忆只进那个群的提示词，不跨群。群画像和关注成员的私下画像只给管理员看，不出现在群消息里。
+
+**多平台。** 服务群支持 `qq:`（NapCat / OneBot）、`telegram:`（写 `tg:` 也行）和 `qqbot:`（QQ 官方机器人，群号是 openid）。群文件 / 群公告 / 群相册这些群空间操作目前只有 QQ（OneBot）能用，其他平台的交付走网页链接。
+
+想让群友从外网访问网页，需要自己做反向代理，并把地址填到 `[console] public_url`；不填的话只有管理员在这台机器上能打开，群友拿不到链接。
 
 ---
 
@@ -194,7 +211,7 @@ MaiBot 会自动加载插件。
 | 配置项 | 类型 | 默认值 | 说明 |
 |:------|:-----|:-------|:-----|
 | `plugin.enabled` | bool | `false` | 总开关，必须显式写 `true` |
-| `groups.serve` | list | `[]` | 服务群列表，每项 `group = "qq:群号"`，可选 `workspace` 共享工作区 |
+| `groups.serve` | list | `[]` | 服务群列表，每项 `group = "平台:群 ID"`（`qq:` / `telegram:` / `tg:` / `qqbot:`），可选 `workspace` 共享工作区 |
 | `focus.max_members` | int | `5` | 每群最多关注几个人 |
 | `focus.personal_profile` | bool | `true` | 给关注成员建个人画像（只给管理员看） |
 
@@ -215,7 +232,7 @@ MaiBot 会自动加载插件。
 | 配置项 | 类型 | 默认值 | 说明 |
 |:------|:-----|:-------|:-----|
 | `approval.required` | bool | `true` | 群友派的活要 bot 管理员批准 |
-| `approval.admins` | list | — | bot 管理员，格式 `qq:号码` |
+| `approval.admins` | list | — | bot 管理员，正式写法 `平台:账号`（如 `qq:123456789`）；只写数字也认，当作 qq |
 | `approval.auto_review` | bool | `true` | 低风险小活由主模型审一眼直接开工 |
 | `approval.auto_review_daily` | int | `5` | 每群每天最多自动放行几件，`0` = 关 |
 | `tasks.token_limit` | int | `2000000` | 单任务 token 上限，到了自动暂停 |
@@ -223,14 +240,26 @@ MaiBot 会自动加载插件。
 
 ### 模型
 
+模型分三层：先有**端点**（一家模型服务商：地址 + 密钥），再把能用的模型登记进**模型库**，最后在网页「设置 → 专岗」页给主模型和各专岗挑用哪个（这一层存在数据库里，不在 `config.toml`）。
+
 | 配置项 | 类型 | 默认值 | 说明 |
 |:------|:-----|:-------|:-----|
-| `models.base_url` | string | `""` | OpenAI 兼容端点 |
-| `models.api_key` | string | `""` | 端点密钥（网页上只进不出） |
-| `models.main` / `main_backup` | string | `""` | 主模型 / 备用 |
-| `models.worker` / `worker_backup` | string | `""` | 干活模型 / 备用 |
-| `models.max_concurrency` | int | `2` | 同时最多几个请求 |
-| `models.max_tokens` | int | `32768` | 一次回答最多写多少 token（1024~1000000），每次调用都带上 |
+| `[[endpoints]] id` | string | — | 端点 id（小写字母、数字、`_`、`-`，1~24 字），重名只留第一个 |
+| `[[endpoints]] protocol` | string | `"openai"` | 接口格式：`openai` / `anthropic` / `responses` |
+| `[[endpoints]] base_url` | string | `""` | 端点地址，必须 `http(s)://` 开头 |
+| `[[endpoints]] api_key` | string | `""` | 端点密钥（网页上只进不出） |
+| `[[endpoints]] retries` / `retry_delay_s` | int | `5` / `10` | 调用失败最多重试几次 / 两次之间等几秒 |
+| `[[endpoints]] max_concurrency` / `max_rpm` | int | `2` / `0` | 这个端点同时最多几个请求 / 每分钟最多几次（`0` = 不限） |
+| `[[model_list]] id` | string | — | 模型条目 id（规则同上） |
+| `[[model_list]] endpoint` | string | — | 挂在哪个端点（写端点 id，必须存在） |
+| `[[model_list]] model` | string | — | 服务商那边的模型名 |
+| `[[model_list]] name` | string | `""` | 网页上的显示名；空 = 用模型名 |
+| `[[model_list]] efforts` | list | `[]` | 支持的思考强度（`low` / `medium` / `high` / `xhigh` / `max`，可多选） |
+| `[[model_list]] vision` | bool | `false` | 支不支持图片输入 |
+| `[[model_list]] context_window` | int | `128000` | 上下文窗口（tokens） |
+| `[[model_list]] max_tokens` | int | `32768` | 一次回答最多写多少 token，必须小于上下文窗口 |
+
+主模型和资讯 / 构想 / 目标 / 任务这五个岗位，各自选哪个模型条目、什么思考强度、备用是哪个，都在网页「设置 → 专岗」里改；**没单独选的岗位跟主模型一样**，这是正常可用状态。旧的 `[models]` 四槽会自动迁移，见下面的「从旧版本升级」。
 
 ### 干活环境
 
@@ -252,6 +281,18 @@ MaiBot 会自动加载插件。
 | `console.public_url` | string | `""` | 反向代理后的外网地址 |
 | `console.update_check` | bool | `true` | 管理员打开网页时查 GitHub 上有没有新版（只提醒，更新去 MaiBot 的插件管理点） |
 | `console.maibot_webui_url` | string | `""` | MaiBot 自己网页的地址；填了，更新提醒里有直达按钮 |
+
+---
+
+## 从旧版本升级
+
+老版本升上来基本不用手动改，插件启动时会自己迁移；只有想手写配置时才需要看新写法。
+
+- **模型（0.7.0 起）**：旧 `[models]` 那套四槽（`base_url` / `api_key` / `main` / `main_backup` / `worker` / `worker_backup`，加重试和限流）会在启动时**自动迁移**成「一个默认端点 + 模型库 + 各岗位的选择」；迁移成功后旧 `[models]` 才从 `config.toml` 里删掉，旧文件会先备份到 `<数据目录>/config-backups/`。新写法是 `[[endpoints]]` + `[[model_list]]`（见上面「模型」表）。
+- **没迁完也不停摆**：模型库还是空的、旧四槽有值时，按旧规则继续干。
+- **搜索**：老的 `[search]` 段不再读了，搜索改成在网页里绑定搜索服务（存数据库）；首次引导里直接勾预设就行。
+- **管理员账号**：早期注释写的「纯数字」还能认，当 qq 号处理；正式写法是 `平台:账号`（如 `qq:123456789`）。公开示例里写的是占位号码，**请换成你自己的**。
+- **版本号**：`config.toml` 里的 `config_version` 是给程序比对默认值用的标记，一般不用手改。
 
 ---
 
@@ -305,10 +346,10 @@ A：不需要。Linux + systemd 且 MaiBot 以 root 运行时，MaiWork 会自�
 A：能装能用：资讯、构想、目标、网页、查资料写文件的任务都正常。只是本机不跑命令（没有能用的隔离方式），这类活可以交给自己配置的专用机器，或者 railway.new 一次性 VM。
 
 **Q：装上之后什么都没发生？**
-A：默认什么都不做。检查 `[plugin] enabled = true`，并且 `[[groups.serve]]` 里写了群号（格式 `qq:群号`）；再到网页里完成首次引导、填好模型。
+A：默认什么都不做。检查 `[plugin] enabled = true`，并且 `[[groups.serve]]` 里写了群（格式 `平台:群 ID`，如 `qq:123456789`）；再到网页里走完首次引导、把模型配好。
 
 **Q：资讯一直是空的？**
-A：找资讯要联网搜索。到网页「设置 → 扩展」加一个搜索 MCP 并点「用作联网搜索」；RSS 源只是补充。
+A：找资讯要联网搜索。首次引导的「联网搜索」一步里勾一个搜索服务就行（免密钥的可直接用），主搜索坏了备用会接管；没配搜索但订了 RSS 时，资讯只用 RSS 也能出。之后在「设置 → 扩展」里也能改。
 
 **Q：会不会在群里刷屏？**
 A：不会。主动推送每群每天有上限（默认 3 条，含开话题），睡觉时段不开话题；大多数内容只放在网页上，想让群知道的事优先交给 MaiBot 顺口提。

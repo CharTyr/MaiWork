@@ -985,6 +985,35 @@ class ConsoleServer:
         app.router.add_route("PUT", "/api/settings/model-list/{id}", self._write(_model_put))
         app.router.add_route("DELETE", "/api/settings/model-list/{id}", self._write(_model_delete))
 
+        async def _model_verify(request: web.Request) -> web.Response:
+            """验证所选模型（docs/13 A03）：一次短回答 + 一次无副作用工具往返，结果存
+            kv["models.verified.<id>"] 给引导完成页 / 设置页显示。会真的花一点点 token。"""
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            path_id = str(request.match_info["id"]).strip()
+            try:
+                result = await svc.models.verify_entry(path_id)
+            except Exception as e:  # 兜底：验证本身出意外也要如实说
+                result = {"ok": False, "chat_ok": False, "tools_ok": False, "error": str(e) or "验证出错",
+                          "note": "", "suggested_max_tokens": 0, "calls": 0}
+            settings = svc.get_settings()
+            entry = next((m for m in (getattr(settings, "model_list", ()) or ()) if str(getattr(m, "id", "")) == path_id), None)
+            if entry is not None:
+                try:
+                    with svc.store.tx() as conn:
+                        svc.store.kv_set(conn, f"models.verified.{path_id}", {
+                            "model": str(getattr(entry, "model", "")), "endpoint": str(getattr(entry, "endpoint", "")),
+                            "ok": bool(result.get("ok")), "tools_ok": bool(result.get("tools_ok")),
+                            "note": str(result.get("note") or "")[:300], "error": str(result.get("error") or "")[:300],
+                            "ts": clock.now(),
+                        })
+                except Exception:
+                    logger.debug("验证结果没存下", exc_info=True)
+            return web.json_response(result)
+
+        app.router.add_route("POST", "/api/settings/model-list/{id}/verify", self._write(_model_verify))
+
         # ---------- 规则（网页可改的设置；存 kv["rules.override"]，不写 config.toml） ----------
 
         def _rules_view() -> Any:
@@ -1134,7 +1163,9 @@ class ConsoleServer:
             from .. import onboarding as _onb
 
             try:
-                return web.json_response(_onb.act(svc, str(body.get("action") or "")))
+                return web.json_response(
+                    _onb.act(svc, str(body.get("action") or ""), str(body.get("step") or ""))
+                )
             except ValueError as e:
                 return _err(400, str(e))
 
@@ -2484,7 +2515,11 @@ class ConsoleServer:
             return web.json_response(_card_push_view(resolved))
 
         async def _news_run(request: web.Request) -> web.Response:
-            """管理员 / 本群群管理员「现在就备一批」：后台开跑，立刻返回 {"started", "reason"}。"""
+            """管理员 / 本群群管理员「现在就备一批」：后台开跑，立刻返回 {"started", "reason", "run_id"}。
+
+            开工前提（画像成形 / news 专岗启停 / 模型就绪）不过 → 409 中文原因，不会再「回了
+            开始却立刻静默退出」；跑完的状态读 GET 同路径（A11）。
+            """
             resolved = self._resolve_ref(request.match_info["gid"])
             if resolved is None:
                 return _err(404, "没有这个群")
@@ -2497,6 +2532,28 @@ class ConsoleServer:
             out = fn(resolved)
             if not out.get("started"):
                 return _err(409, str(out.get("reason") or "现在开不了"))
+            return web.json_response(out)
+
+        async def _news_run_get(request: web.Request) -> web.Response:
+            """这次手动备料跑到哪了（运行记录）：管理员 / 本群群管理员，和 POST 同权限。
+
+            `{"run_id","state":"none|running|done|skipped|failed","started_ts","ended_ts",
+            "reason","items"}`；服务器重启后残留的 running 会被报成 failed「中断了」。
+            """
+            resolved = self._resolve_ref(request.match_info["gid"])
+            if resolved is None:
+                return _err(404, "没有这个群")
+            forbid = self._require_group_admin(request, resolved)
+            if forbid is not None:
+                return forbid
+            fn = getattr(svc, "news_manual_run_status", None)
+            if fn is None:
+                return _err(503, "资讯模块没开")
+            try:
+                out = fn(resolved)
+            except Exception:
+                logger.exception("读手动备料运行记录出错（群 %s）", resolved)
+                return _err(500, "服务器出错了")
             return web.json_response(out)
 
         async def _ideas_run(request: web.Request) -> web.Response:
@@ -2521,6 +2578,7 @@ class ConsoleServer:
         app.router.add_post("/api/groups/{gid}/ideas/run", self._write(_ideas_run))
         app.router.add_route("PUT", "/api/groups/{gid}/feeds-pref", self._write(_feeds_pref_put))
         app.router.add_post("/api/groups/{gid}/news/run", self._write(_news_run))
+        app.router.add_get("/api/groups/{gid}/news/run", _news_run_get)
 
         async def _news_rate(request: web.Request) -> web.Response:
             """资讯评价（news_rating）：群友（本群）或管理员给一条资讯挑理由 + 可选一句话。

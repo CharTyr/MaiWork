@@ -255,6 +255,10 @@ class Agents:
         custom.sort()
         return list(PROFILES_KINDS) + custom
 
+    def config_stamp(self) -> Any:
+        """岗位配置的版本标记（Models 的就绪摘要缓存键用；改了任何岗位就会变）。"""
+        return self._store.kv_get(_KV_PROFILES)
+
     def custom_kinds(self) -> list[str]:
         """只列自定义专岗 kind（给「删除名单」/调度排除这类判断用）。"""
         return [k for k in self._all_kinds() if _CUSTOM_KIND_RE.match(k)]

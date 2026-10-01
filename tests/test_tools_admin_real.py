@@ -82,6 +82,10 @@ def _seed(app: MaiWorkApp) -> None:
     p.add_entry(G1, "convention", "周五晚上是「分享夜」，大家贴本周的折腾成果")
     p.add_entry(G1, "interest", "自部署服务和家里的服务器")
     p.set_focus(G1, "10003", "add")
+    # 这个群已经有画像条目 → 记成「画像已成形」：A11 起手动备料会核对画像是否成形，
+    # 没成形会明确拒绝（那条路径在 tests/test_news_manual_run.py 里专测）。
+    with app.store.tx() as _c:
+        _c.execute("UPDATE groups SET profile_ready_ts=? WHERE group_id=?", (NOW, G1))
 
     # 群聊记录（chatlog.record_messages 是真写入入口，走真路径）
     from CharTyr_MaiWork.maiwork import chatlog

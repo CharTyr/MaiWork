@@ -1,6 +1,6 @@
 // MaiWork 网页 · 「资讯」页。
 import { admin, gadmin, state } from "../state.js";
-import { SVG, dayWord, dur, esc, hhmm, ico, now, richText, safeUrl, slotName, when } from "../util.js";
+import { SVG, dayWord, dur, esc, hhmm, ico, now, richText, safeUrl, slotName, tokens, when } from "../util.js";
 import { agentFish, api, gview } from "../api.js";
 
 /* ───────────── 各页面 ───────────── */
@@ -239,6 +239,18 @@ const secs = (v) => {
   const s = Math.max(0, Math.round(Number(v) || 0));
   return s < 60 ? `${s} 秒` : `${(s / 60).toFixed(1)} 分钟`;
 };
+// 这轮的模型用量（C03，只给管理员）：只算服务商实报的；没报用量的次数单列，不显示金额
+function usageLine(batch) {
+  const u = batch.stats && batch.stats.usage;
+  if (!u || typeof u !== "object") return "";
+  const kept = (batch.stats && batch.stats.kept != null ? batch.stats.kept : 0) || batch.kept || 0;
+  let s = `这一轮模型实报 ${tokens(u.reported || 0)} tokens`;
+  if (u.cache_read) s += `（其中缓存读 ${tokens(u.cache_read)}）`;
+  if (u.unknown_calls) s += `；有 ${u.unknown_calls} 次没报用量`;
+  if (kept > 0) s += `；入选 ${kept} 条，平均每条约 ${tokens(Math.round((u.reported || 0) / kept))}`;
+  return s;
+}
+
 function funnelBlock(batch) {
   const f = batch.stats && batch.stats.funnel;
   if (!admin() || !f || typeof f !== "object") return "";
@@ -250,6 +262,7 @@ function funnelBlock(batch) {
   const provs = kv(f.providers).map(([k, v]) => `<span class="ntag">${esc(k)} ${v}</span>`).join("");
   const rejects = kv(f.rejects).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<span class="ntag warn">${esc(k)} ${v}</span>`).join("");
   const times = kv(f.timings_s).map(([k, v]) => `<span class="ntag">${esc(TIMING_NAMES[k] || k)} ${secs(v)}</span>`).join("");
+  const usageTxt = usageLine(batch);
   return `
     <div class="rej funnel">
       <button class="rej-head" data-act="funnel-toggle" data-id="${batch.id}" aria-expanded="${open}">
@@ -263,6 +276,7 @@ function funnelBlock(batch) {
           ${provs ? `<div class="fn-h">各家搜索服务给的结果</div><div class="fn-tags">${provs}</div>` : ""}
           ${rejects ? `<div class="fn-h">预筛刷掉的</div><div class="fn-tags">${rejects}</div>` : ""}
           ${times ? `<div class="fn-h">各段花的时间</div><div class="fn-tags">${times}</div>` : ""}
+          ${usageTxt ? `<div class="fn-h">这轮的模型用量</div><p class="fine" style="margin:0">${esc(usageTxt)}</p>` : ""}
         </div>`
           : ""
       }

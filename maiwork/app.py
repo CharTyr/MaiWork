@@ -2809,17 +2809,171 @@ class MaiWorkApp:
 
         不记 scheduler.done（kind 用 news_manual）：否则最近的时段会被当成已做过而跳过；
         和定时备料互斥——同一群已经有一批在跑就不再开。
+
+        开工前先过 `feeds.news_precheck`（画像成形 / news 专岗启停 / 模型就绪）：不通过就
+        明确回 {"started": False, "reason": 中文原因}，不再出现「回了开始、后台立刻静默退出」。
+        通过则给一个运行编号 run_id，并往 kv 写一条运行记录（running → done / skipped / failed），
+        网页用 GET /api/groups/{gid}/news/run 读它（A11）。
         """
         gid = str(gid)
         settings = self._settings
         if settings is None or self.feeds is None or not settings.is_served(gid):
             return {"started": False, "reason": "这个群现在备不了料（不是服务群，或资讯模块没开）"}
+        precheck = getattr(self.feeds, "news_precheck", None)
+        if callable(precheck):
+            try:
+                why = str(precheck(gid) or "")
+            except Exception:
+                logger.exception("备料开工前提检查出错（群 %s）", gid)
+                why = "开工前提检查出错，这次先不备料（详细原因看日志）"
+            if why:
+                return {"started": False, "reason": why}
         if not self._models_ready():
-            return {"started": False, "reason": "模型还没配好"}
-        if (gid, "news") in self._running_jobs or (gid, "news_manual") in self._running_jobs:
+            return {"started": False, "reason": "模型还没配好：去网页 设置 → 模型 里配好一个能用的模型再来"}
+        if (gid, "news") in self._running_jobs or (gid, self._MANUAL_NEWS_KIND) in self._running_jobs:
             return {"started": False, "reason": "这个群已经在备料了，等这一批出来"}
-        self._spawn_long_job(gid, "news_manual", self.feeds.prepare_news)
-        return {"started": True, "reason": ""}
+        run_id = secrets.token_hex(6)
+        started = _now()
+        self._write_manual_news_record(
+            gid,
+            {
+                "run_id": run_id,
+                "state": "running",
+                "started_ts": started,
+                "ended_ts": 0.0,
+                "reason": "",
+                "items": 0,
+            },
+        )
+
+        async def _run_manual(g: str) -> int:
+            try:
+                items = int(await self.feeds.prepare_news(g) or 0)
+            except asyncio.CancelledError:
+                self._finish_manual_news(g, run_id, "failed", "这批备料跑到一半就中断了（服务停了或重启了）", 0)
+                raise
+            except Exception as e:
+                logger.exception("手动备料长活出错（群 %s）", g)
+                self._finish_manual_news(g, run_id, "failed", f"备料出错了：{e}", 0)
+                return 0
+            if items > 0:
+                self._finish_manual_news(g, run_id, "done", self._manual_news_done_reason(g, started, items), items)
+            else:
+                note = self._latest_news_batch_note(g, started)
+                self._finish_manual_news(g, run_id, "skipped", note or "这一轮没有可发的资讯（没有留下具体原因）", 0)
+            return items
+
+        self._spawn_long_job(gid, self._MANUAL_NEWS_KIND, _run_manual)
+        return {"started": True, "reason": "", "run_id": run_id}
+
+    # ---- 手动备料的运行记录（A11） ------------------------------------------------
+
+    _MANUAL_NEWS_KIND = "news_manual"
+
+    @staticmethod
+    def _manual_news_key(gid: str) -> str:
+        return f"news.manual_run.{gid}"
+
+    def _manual_news_record(self, gid: str) -> dict | None:
+        """读这条手动备料的运行记录；没写过 / 结构坏了 → None。"""
+        store = self.store
+        if store is None:
+            return None
+        try:
+            got = store.kv_get(self._manual_news_key(gid))
+        except Exception:
+            logger.exception("读手动备料运行记录出错（群 %s）", gid)
+            return None
+        return got if isinstance(got, dict) else None
+
+    def _write_manual_news_record(self, gid: str, rec: dict) -> None:
+        store = self.store
+        if store is None:
+            return
+        try:
+            with store.tx() as conn:
+                store.kv_set(conn, self._manual_news_key(gid), rec)
+        except Exception:
+            logger.exception("写手动备料运行记录出错（群 %s）", gid)
+
+    def _finish_manual_news(self, gid: str, run_id: str, state: str, reason: str, items: int = 0) -> None:
+        """给这轮手动备料落终态；新一轮已经开了（run_id 对不上）就不覆盖。"""
+        rec = self._manual_news_record(gid)
+        if rec is None or str(rec.get("run_id") or "") != str(run_id):
+            return
+        out = dict(rec)
+        out["state"] = str(state)
+        out["ended_ts"] = _now()
+        out["reason"] = str(reason or "")
+        out["items"] = int(items or 0)
+        self._write_manual_news_record(gid, out)
+
+    def _latest_news_batch_note(self, gid: str, since: float) -> str:
+        """本轮之后最新一条 news_batches 的 note——跳过原因就写在 note 字段。
+
+        （`feeds._skipped_batch` / `_insert_batch_and_items` 都写 `note`。）
+        """
+        store = self.store
+        if store is None:
+            return ""
+        try:
+            row = store.read().execute(
+                "SELECT note FROM news_batches WHERE group_id=? AND created>=? ORDER BY id DESC LIMIT 1",
+                (str(gid), float(since)),
+            ).fetchone()
+        except Exception:
+            logger.exception("读最近一批资讯的备注出错（群 %s）", gid)
+            return ""
+        return str(row["note"] or "") if row is not None else ""
+
+    def _manual_news_done_reason(self, gid: str, since: float, items: int) -> str:
+        """done 的中文说明：只出了文章（kind=guide）没出资讯也算 done，但要说明白。"""
+        store = self.store
+        if store is None or items <= 0:
+            return f"备料完成：这一轮入选 {items} 条"
+        try:
+            row = store.read().execute(
+                "SELECT id FROM news_batches WHERE group_id=? AND created>=? ORDER BY id DESC LIMIT 1",
+                (str(gid), float(since)),
+            ).fetchone()
+            if row is not None:
+                news_n = int(
+                    store.read().execute(
+                        "SELECT COUNT(*) c FROM news_items WHERE batch_id=? AND rejected=0 AND kind='news'",
+                        (int(row["id"]),),
+                    ).fetchone()["c"]
+                )
+                if news_n == 0:
+                    return f"这轮只出了文章（好文）{items} 篇、没有新资讯——不算失败"
+        except Exception:
+            logger.exception("看这轮出的是资讯还是文章出错（群 %s）", gid)
+        return f"备料完成：这一轮入选 {items} 条"
+
+    def news_manual_run_status(self, gid: str) -> dict:
+        """这条手动备料的运行记录（GET /api/groups/{gid}/news/run）。
+
+        - 没写过：state="none"（网页显示「还没手动备过料」）；
+        - 记录还写着 running，但后台已经没有这个长活（服务器重启 / 服务停过）→ 当场改成
+          failed「中断了」并落库，不让网页永远显示「进行中」。
+        """
+        gid = str(gid)
+        rec = self._manual_news_record(gid)
+        if rec is None:
+            return {"run_id": "", "state": "none", "started_ts": 0.0, "ended_ts": 0.0, "reason": "", "items": 0}
+        out = {
+            "run_id": str(rec.get("run_id") or ""),
+            "state": str(rec.get("state") or "none"),
+            "started_ts": float(rec.get("started_ts") or 0.0),
+            "ended_ts": float(rec.get("ended_ts") or 0.0),
+            "reason": str(rec.get("reason") or ""),
+            "items": int(rec.get("items") or 0),
+        }
+        if out["state"] == "running" and (gid, self._MANUAL_NEWS_KIND) not in self._running_jobs:
+            out["state"] = "failed"
+            out["ended_ts"] = out["ended_ts"] or _now()
+            out["reason"] = "上一次手动备料跑到一半就中断了（服务器重启或服务停了），这批没跑完"
+            self._write_manual_news_record(gid, out)
+        return out
 
     def make_idea_now(self, gid: str) -> dict:
         """管理员（网页 / 管理员对话）点「现在就想一个构想」。后台跑，不等结果。

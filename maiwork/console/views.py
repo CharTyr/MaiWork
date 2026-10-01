@@ -1195,7 +1195,21 @@ def settings_view(svc: Any) -> dict[str, Any]:
         },
         "extensions": _extensions_view(svc),
         "problems": problems,
+        "onboarding": _onboarding_brief(svc),
     }
+
+
+def _onboarding_brief(svc: Any) -> dict[str, Any]:
+    """设置概况用：引导走到哪了（没走完 / 先存下 → 概况顶上给「接着引导」）。不算能力清单。"""
+    try:
+        from .. import onboarding as _onb
+
+        rec = svc.store.kv_get(_onb.KV_KEY, None) or {}
+        checks = _onb._checks(svc)
+        missing = [k for k in _onb.REQUIRED if not checks.get(k)]
+        return {"state": str(rec.get("state") or ""), "usable": not missing, "missing": missing}
+    except Exception:
+        return {"state": "", "usable": True, "missing": []}
 
 
 def _extensions_view(svc: Any) -> dict[str, Any]:

@@ -383,3 +383,26 @@ class TestM2Sections:
         assert "[search]" not in example.read_text(encoding="utf-8")  # 搜索走扩展绑定，不进配置文件
         assert s.jev.api_url == "https://api.typesafe.ai/v1/systemone"
         assert s.feeds.min_score == 0.6
+
+    def test_example_toml_uses_new_model_structure(self, plugin_dir: Path) -> None:
+        """docs/13 A12：示例必须是新结构（[[endpoints]] + [[model_list]]），不能退回旧 [models] 四槽。"""
+        text = (Path(plugin_dir) / "config.example.toml").read_text(encoding="utf-8")
+        try:
+            import tomllib
+        except ImportError:  # pragma: no cover - py<3.11 才有
+            pytest.skip("tomllib 需要 py3.11+")
+        raw = tomllib.loads(text)
+        # 版本标记和代码里的 CONFIG_VERSION 对齐
+        assert raw["plugin"]["config_version"] == CONFIG_VERSION
+        # 新结构：端点 + 模型库都在，条目能挂上
+        assert raw["endpoints"] and raw["model_list"]
+        s, problems = load_settings(raw)
+        assert problems == []
+        ep_ids = {e.id for e in s.endpoints}
+        assert all(m.endpoint in ep_ids for m in s.model_list)
+        # 旧的 [models] 四槽不该再出现在示例里（注释里的迁移说明不算）
+        assert "models" not in raw
+        # 示例里不能有看起来像真的账号 / 密钥 / 地址，统一用占位
+        assert s.approval.admins == ("qq:123456789",)
+        assert all(e.api_key == "" or "填" in e.api_key for e in s.endpoints)
+        assert all("example.com" in e.base_url for e in s.endpoints)

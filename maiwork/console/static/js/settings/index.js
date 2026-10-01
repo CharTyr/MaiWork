@@ -99,12 +99,28 @@ export async function loadGA() {
   );
 }
 
+// 引导没走完 / 先存下了：概况顶上给「接着引导」（回到第一项没配好的必要步骤）
+function onbBanner(o) {
+  if (!o || !["in_progress", "later"].includes(o.state)) return "";
+  const miss = (o.missing || []).map((k) => ({ models: "模型", groups: "服务的群" })[k] || k);
+  const text = o.usable ? "首次引导还没走完，剩下的都是可选项" : `首次引导还没走完，还差：${miss.join("、")}`;
+  return `<div class="warn-box" style="margin-top:18px">${esc(text)}<button class="btn small" data-act="onb-continue" style="margin-left:8px">接着引导</button></div>`;
+}
+
+// 今天用量的补充说明：没报用量的调用、缓存命中、重试——只在数不是 0 时才说，不显示金额
+function usageExtra(u) {
+  const bits = [];
+  if (u.unknown_calls) bits.push(`今天有 ${u.unknown_calls} 次调用服务商没报用量，没算进上面的数`);
+  if (u.cache_read) bits.push(`缓存命中读回 ${tokens(u.cache_read)} tokens`);
+  if (u.retries) bits.push(`重试了 ${u.retries} 次`);
+  return bits.length ? " " + bits.join("；") + "。" : "";
+}
+
 function settingsOverview(s) {
   const u = (s.usage && s.usage.today) || {};
   const alert = (s.usage && s.usage.alert_daily_tokens) || 0;
   const used = (u.main || 0) + (u.worker || 0);
-  const r = s.rules || {};
-  return `
+  const r = s.rules || {};  return `
     ${(s.problems || []).length ? `<div class="warn-box"><b>配置里有几处问题，已经先跳过：</b><br />${s.problems.map(esc).join("<br />")}</div>` : ""}
     <h2 class="h-sub" style="margin-top:20px">各个群</h2>
     ${
@@ -122,6 +138,7 @@ function settingsOverview(s) {
             .join("")
         : `<p class="h-meta">还没有服务群 <button type="button" class="link-btn" data-act="cfg-goto" data-s="groups">去添加</button></p>`
     }
+    ${onbBanner(s.onboarding)}
     ${s.models && !s.models.ready ? `<div class="warn-box" style="margin-top:18px">还没配好模型，MaiWork 暂时不会工作<button class="btn small" data-act="set-sub" data-sub="models" style="margin-left:8px">去配</button></div>` : ""}
     <div class="h-sub-row"><h2 class="h-sub">今天的用量</h2><button class="btn small" data-act="set-sub" data-sub="usage">看以前的</button></div>
     <div class="usage">
@@ -134,7 +151,7 @@ function settingsOverview(s) {
         ? `<div class="warn-box"><b>今天超过提醒线了：</b><br />${s.usage.alerts.map((a) => esc(a.text)).join("<br />")}</div>`
         : ""
     }
-    <p class="fine">${alert ? `每日提醒线 ${tokens(alert)} tokens，今天用了 ${Math.round((used / alert) * 100)}%。` : "没设提醒线。"}${u.errors ? ` 今天有 ${u.errors} 次调用出错。` : ""}</p>
+    <p class="fine">${alert ? `每日提醒线 ${tokens(alert)} tokens，今天用了 ${Math.round((used / alert) * 100)}%。` : "没设提醒线。"}${u.errors ? ` 今天有 ${u.errors} 次调用出错。` : ""}${usageExtra(u)}</p>
     ${updateSection()}
     <h2 class="h-sub">运行状态</h2>
     ${(s.health || []).map((h) => `<div class="set-row">${ico(h.icon || "gear")}<div><div class="set-name">${esc(h.name)}</div><div class="set-text">${esc(h.text)}</div>${h.copy ? `<div class="set-text mono-link">${esc(h.copy)}</div><div class="actions" style="margin-top:8px"><button class="btn small" data-act="copy" data-link="${esc(h.copy)}" data-what="公钥">复制公钥</button></div>` : ""}</div><span class="dot ${h.state === "ok" ? "ok" : h.state === "warn" ? "pending" : ""}"></span></div>`).join("")}

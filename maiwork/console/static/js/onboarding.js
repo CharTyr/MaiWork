@@ -56,11 +56,9 @@ export function onbPane(id) {
     const byId = (mid) => { const x = ((state.mdl && state.mdl.models) || []).find((y) => y.id === mid); return x ? x.model : ""; };
     const prof = (k) => (((state.agents && state.agents.profiles) || []).find((p) => p.kind === k) || {});
     const curMain = byId(prof("main").model), curWork = byId(prof("task").model);
+    // 下拉 + 手填二合一（docs/13 A03）：列表接口 404 的端点也能直接填模型 ID
     const sel = (sid, v, empty) =>
-      `<select id="${sid}">${[empty ? `<option value="">${esc(empty)}</option>` : `<option value="" disabled ${v ? "" : "selected"}>${list.length ? "选一个模型" : "先测试连接"}</option>`]
-        .concat(list.map((x) => `<option value="${esc(x)}" ${x === v ? "selected" : ""}>${esc(x)}</option>`))
-        .concat(v && !list.includes(v) ? [`<option value="${esc(v)}" selected>${esc(v)}</option>`] : [])
-        .join("")}</select>`;
+      `<input id="${sid}" list="onb-model-list" spellcheck="false" autocomplete="off" value="${esc(v || "")}" placeholder="${esc(empty || (list.length ? "从列表选，或手填模型 ID" : "手填模型 ID，或先测试连接拉列表"))}" />`;
     const proto = ep.protocol || "openai";
     return `
       <div class="onb-step-ico">${ico("robot")}</div>
@@ -74,11 +72,13 @@ export function onbPane(id) {
         <label for="onb-key">API 密钥</label>
         <input id="onb-key" type="password" autocomplete="new-password" placeholder="${ep.key_set ? "已填写 · 留空就不改" : "粘贴密钥"}" />
         <div class="onb-test"><button class="btn" type="button" data-act="onb-test">测试连接</button><span class="onb-status" id="onb-status">${list.length ? `<i class="onb-ok">${SVG.check}</i>找到 ${list.length} 个模型` : ""}</span></div>
-        <div class="onb-picks ${list.length ? "" : "is-off"}">
+        <div class="onb-picks">
+          <datalist id="onb-model-list">${list.map((x) => `<option value="${esc(x)}"></option>`).join("")}</datalist>
           <label for="onb-main">主模型 <span class="fine-inline">负责想和验收，选聪明的</span></label>
           ${sel("onb-main", onb.pickMain || curMain)}
           <label for="onb-worker">各专岗用的模型 <span class="fine-inline">负责动手，选便宜耐用的</span></label>
-          ${sel("onb-worker", onb.pickWork || (curWork && curWork !== curMain ? curWork : ""), "跟主模型一样")}
+          ${sel("onb-worker", onb.pickWork || (curWork && curWork !== curMain ? curWork : ""), "留空 = 跟主模型一样")}
+          <p class="fine" id="onb-verify-note">保存时会验证所选模型：发一句很短的问话、做一次空工具测试（共 2~6 次小请求，会用掉一点点 token）</p>
         </div>
       </div>`;
   }
@@ -127,20 +127,27 @@ export function onbPane(id) {
       </div>
       <p class="fine">${a ? esc(AV_SRC[a.source] || "") : ""}${a ? " · " : ""}png / jpg / webp / gif，最大 2MB。</p>`;
   }
-  const c = (onb.info && onb.info.checks) || {};
-  const row = (ok, name, text, i) =>
-    `<li class="onb-sum" style="--i:${i}"><span class="onb-mark ${ok ? "ok" : ""}">${ok ? SVG.check : ""}</span><div><b>${name}</b><span>${text}</span></div></li>`;
+  return onbDonePane();
+}
+
+// 完成页（docs/13 A08/G01/G02）：按后端给的能力清单逐项说「能用 / 受限 / 在等 / 没开」；
+// 必要条件（模型、群）缺了，大标题不说「准备好了」，只说「先存下」，并给可点的「去补」。
+const MARK = { ok: "ok", warn: "warn", wait: "wait", off: "" };
+function onbDonePane() {
+  const info = onb.info || {};
+  const items = info.items || [];
+  const usable = !!info.usable;
+  const miss = (info.missing || []).map((k) => ({ models: "模型", groups: "服务的群" })[k] || k);
+  const row = (it, i) => {
+    const goto = it.state !== "ok" && it.step && it.step !== "done" ? `<button type="button" class="link-btn" data-act="onb-goto" data-step="${esc(it.step)}">去补</button>` : "";
+    const copy = it.copy ? `<button type="button" class="link-btn" data-act="copy" data-link="${esc(it.copy)}" data-what="链接">复制链接</button>` : "";
+    return `<li class="onb-sum" style="--i:${i}"><span class="onb-mark ${MARK[it.state] || ""}">${it.state === "ok" ? SVG.check : it.state === "wait" ? "…" : it.state === "warn" ? "!" : ""}</span><div><b>${esc(it.title)}${goto}${copy}</b><span>${esc(it.text)}</span></div></li>`;
+  };
   return `
-    <div class="onb-done-mark"><svg viewBox="0 0 52 52"><circle cx="26" cy="26" r="24"/><path d="M15 27l7.5 7.5L37.5 19"/></svg></div>
-    <h1 class="onb-title">都准备好了</h1>
-    <p class="onb-lead">没配的随时可以在「设置」里补</p>
-    <ul class="onb-list onb-summary">
-      ${row(c.models, "模型", c.models ? "配好了" : "还没配，MaiWork 暂时不会做要用模型的事", 0)}
-      ${row(c.groups, "服务的群", c.groups ? "已有群" : "还没有", 1)}
-      ${row(c.jev, "Jev 快速判断", c.jev ? "密钥已填" : "没填，判断会走主模型（慢一些）", 2)}
-      ${row(c.search, "联网搜索", c.search ? "开了" : "没开", 3)}
-      ${row(c.admins, "管理员", c.admins ? "已填" : "还没填", 4)}
-    </ul>`;
+    ${usable ? `<div class="onb-done-mark"><svg viewBox="0 0 52 52"><circle cx="26" cy="26" r="24"/><path d="M15 27l7.5 7.5L37.5 19"/></svg></div>` : `<div class="onb-step-ico">${ico("floppy")}</div>`}
+    <h1 class="onb-title">${usable ? "可以开始用了" : "先存下了，还差一点"}</h1>
+    <p class="onb-lead">${usable ? "下面是现在各项能做到哪一步；标了感叹号的能用但有限制，随时可以在「设置」里补" : `还没配好：${esc(miss.join("、"))}。MaiWork 要这些才能干活，点「去补」接着填`}</p>
+    <ul class="onb-list onb-summary">${items.map(row).join("")}</ul>`;
 }
 
 // 引导「联网搜索」一步：挑要用的搜索服务（预设，后端 /api/extensions/presets）。
@@ -226,7 +233,8 @@ function onbFoot() {
   const id = ONB_STEPS[onb.i].id;
   const back = onb.i > 0 && id !== "done" ? `<button class="btn ghost" type="button" data-act="onb-back">上一步</button>` : `<span></span>`;
   const later = ["keys", "search", "admins", "groups", "look"].includes(id) ? `<button class="btn" type="button" data-act="onb-later">这步先不填</button>` : id === "models" ? `<button class="btn" type="button" data-act="onb-later">稍后再配</button>` : "";
-  const next = id === "hello" ? "开始配置" : id === "done" ? "进入 MaiWork" : "保存，下一步";
+  const usable = !!(onb.info && onb.info.usable);
+  const next = id === "hello" ? "开始配置" : id === "done" ? (usable ? "进入 MaiWork" : "先存下，稍后继续") : "保存，下一步";
   return `${back}<div class="onb-foot-r">${later}<button class="btn primary" type="button" data-act="onb-next">${next}</button></div>`;
 }
 
@@ -324,8 +332,10 @@ function onbError(msg) {
 export async function openOnboarding(info) {
   if (onb.open || !admin()) return;
   onb.open = true;
-  onb.i = 0;
   onb.info = info || null;
+  // 接着上次的那一步（in_progress 记了步）；没记就从头
+  const resume = info && info.state === "in_progress" ? ONB_STEPS.findIndex((s) => s.id === info.step) : -1;
+  onb.i = resume > 0 ? resume : 0;
   onb.models = null;
   onb.pickMain = onb.pickWork = "";
   if (!state.settings) await loadSettings();
@@ -348,7 +358,28 @@ export async function openOnboarding(info) {
     duration: quiet ? 200 : 520,
     easing: "cubic-bezier(0.32, 0.72, 0, 1)",
   });
-  onbPaint(0);
+  if (onb.i > 0) {
+    onb.i -= 1;
+    await onbGo(1); // 走一遍进入那步要加载的东西（搜索清单、群管理员…）
+  } else onbPaint(0);
+  root.addEventListener("keydown", onbTrapFocus);
+}
+
+// 模态里循环焦点：Tab 不跑到背后的页面上（design.md 8.4 待补齐项）
+function onbTrapFocus(e) {
+  if (e.key !== "Tab") return;
+  const card = document.querySelector("#onb .onb-card");
+  if (!card) return;
+  const els = [...card.querySelectorAll("button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])")].filter((x) => !x.disabled && x.offsetParent !== null && !x.closest(".leaving"));
+  if (!els.length) return;
+  const first = els[0], last = els[els.length - 1];
+  if (e.shiftKey && (document.activeElement === first || !card.contains(document.activeElement))) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && (document.activeElement === last || !card.contains(document.activeElement))) {
+    e.preventDefault();
+    first.focus();
+  }
 }
 
 async function closeOnboarding(action) {
@@ -378,6 +409,7 @@ async function closeOnboarding(action) {
   onb.anims = [];
   loadSettings().then(() => render());
   if (action === "skip") toast("跳过了，以后在设置概况里可以重新引导");
+  else if (action === "done" && onb.info && !onb.info.usable) toast("先存下了，设置概况里可以接着引导");
 }
 
 // 这一步要保存的东西；返回错误文字（空 = 过）
@@ -387,7 +419,7 @@ async function onbSave(id) {
     const ep = onbEndpoint();
     if (!/^https?:\/\/\S+$/.test(v("onb-url"))) return "端点地址要以 http:// 或 https:// 开头。";
     if (!ep.key_set && !v("onb-key")) return "还没填密钥。";
-    if (!v("onb-main")) return "先点「测试连接」，再选主模型。";
+    if (!v("onb-main")) return "先选或手填主模型 ID（点「测试连接」可以拉出列表）。";
     const epId = ep.id || "default";
     await api("PUT", `/api/settings/endpoints/${encodeURIComponent(epId)}`, {
       name: ep.name || "默认端点", protocol: v("onb-proto") || "openai", base_url: v("onb-url"), api_key: v("onb-key") || undefined,
@@ -409,7 +441,9 @@ async function onbSave(id) {
     await api("PUT", "/api/agents/main", { model: mainId, effort: "" });
     for (const k of ["news", "idea", "goal", "task"]) await api("PUT", `/api/agents/${k}`, { model: workId, effort: "" });
     await loadSettings().catch(() => null);
-    return "";
+    // 验证所选模型（docs/13 A03）：连上了 ≠ 选中的模型能干活
+    const bad = await onbVerify([mainId, workId].filter((x, i, a) => x && a.indexOf(x) === i));
+    return bad;
   }
   const patch = {};
   if (id === "groups" && $("onb-serve"))
@@ -465,6 +499,43 @@ async function onbSave(id) {
   return "";
 }
 
+// 逐个验证所选模型：能回答才放行；工具不通、最大输出被降档只提示不拦
+async function onbVerify(ids) {
+  const out = $("onb-status");
+  const notes = [];
+  for (const mid of ids) {
+    const entry = ((state.mdl && state.mdl.models) || []).find((x) => x.id === mid) || {};
+    if (out) out.innerHTML = `<i class="onb-spin"></i>正在验证 ${esc(entry.model || mid)}（一句短问话 + 一次空工具测试）…`;
+    let r;
+    try {
+      r = await api("POST", `/api/settings/model-list/${encodeURIComponent(mid)}/verify`, {});
+    } catch (e) {
+      r = { ok: false, error: e.message };
+    }
+    if (!r.ok) {
+      if (out) out.textContent = "";
+      return `${entry.model || mid} 没能正常回答：${r.error || "验证没通过"}。可以换个模型，或先「稍后再配」。`;
+    }
+    if (r.suggested_max_tokens) {
+      try {
+        await api("PUT", `/api/settings/model-list/${encodeURIComponent(mid)}`, Object.assign({}, entry, { max_tokens: r.suggested_max_tokens }));
+        await loadModels();
+      } catch (_) {}
+    }
+    if (r.note) notes.push(`${entry.model || mid}：${r.note}`);
+  }
+  if (out) out.innerHTML = `<i class="onb-ok">${SVG.check}</i>验证通过`;
+  onb.verifyNotes = notes;
+  return "";
+}
+
+// 记下走到了哪一步（docs/13 A04）：刷新 / 关页重进回到这里；失败不拦人
+function onbRemember() {
+  const step = ONB_STEPS[onb.i].id;
+  if (step === "hello") return;
+  api("POST", "/api/onboarding", { action: "progress", step }).catch(() => null);
+}
+
 async function onbGo(delta) {
   const to = Math.max(0, Math.min(ONB_STEPS.length - 1, onb.i + delta));
   if (to === onb.i) return;
@@ -496,6 +567,7 @@ async function onbGo(delta) {
       onb.info = await api("GET", "/api/onboarding");
     } catch (_) {}
   }
+  onbRemember();
   onbPaint(delta);
 }
 
@@ -527,6 +599,22 @@ export async function onbAct(el) {
     return;
   }
   if (a === "onb-back") return onbGo(-1);
+  if (a === "onb-goto") {
+    const to = ONB_STEPS.findIndex((s) => s.id === el.dataset.step);
+    if (to >= 0) return onbGo(to - onb.i);
+    return;
+  }
+  if (a === "onb-continue") {
+    if (onb.open) return;
+    try {
+      const cur = await api("GET", "/api/onboarding");
+      const step = cur.next_step || cur.step || "models";
+      const info = await api("POST", "/api/onboarding", { action: "progress", step: step === "done" ? "models" : step });
+      return openOnboarding(info);
+    } catch (e) {
+      return toast(e.message, true);
+    }
+  }
   if (a === "onb-later") return onbGo(1);
   if (a === "onb-test") {
     const out = $("onb-status");
@@ -542,7 +630,7 @@ export async function onbAct(el) {
       const r = await api("POST", `/api/settings/endpoints/${encodeURIComponent(ep.id || "default")}/test`, { base_url: url, api_key: key || undefined, protocol: $("onb-proto").value });
       if (!r.ok) {
         out.textContent = "";
-        onbError(r.error || "没连上");
+        onbError(`${r.error || "没连上"}（有的服务不提供模型列表：地址和密钥没错的话，直接在下面手填模型 ID，保存时会真的发一句话验证）`);
         return;
       }
       onb.models = r.models || [];
@@ -575,9 +663,11 @@ export async function onbAct(el) {
     const label = el.textContent;
     el.innerHTML = `<i class="onb-spin"></i>保存中`;
     try {
+      onb.verifyNotes = [];
       const bad = await onbSave(id);
       if (bad) return onbError(bad);
       await onbGo(1);
+      if ((onb.verifyNotes || []).length) toast(onb.verifyNotes.join("；"));
     } catch (e) {
       onbError(e.message);
     } finally {

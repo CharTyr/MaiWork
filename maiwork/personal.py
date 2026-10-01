@@ -217,7 +217,12 @@ class Personal:
             elif sc["avg"] < web_min_avg:
                 item["reject"] = ("web", f"平均分 {sc['avg']:.1f} < {web_min_avg:.1f}，过不了这道")
 
-        # ⑤ 写帖子（写给他本人；原话只取他自己的）
+        # ⑥ 每次最多 personal_per_day 条（2026-10，C01：从写帖之后挪到写帖之前——
+        # 确定会被截掉的条目不再花写帖的钱；被截的照落库、带「超出这次上限」的原因）
+        per_day = max(1, int(getattr(focus, "personal_per_day", 3)))
+        kept = self._keep_top(survivors, per_day)
+
+        # ⑤ 写帖子（写给他本人；原话只取他自己的）——只写最终留下的这几条
         posting = [item for item in survivors if "reject" not in item]
         if posting:
             try:
@@ -226,10 +231,6 @@ class Personal:
                 logger.exception("个人向写帖子意外出错（群 %s），全部回落原文", gid)
                 for item in posting:
                     self._post_fallback(item)
-
-        # ⑥ 每次最多 personal_per_day 条
-        per_day = max(1, int(getattr(focus, "personal_per_day", 3)))
-        kept = self._keep_top(survivors, per_day)
 
         # ⑦ 落库（含被筛的）+ 标今天做过
         kept_n = self._insert_items(gid, uid, now, candidates)

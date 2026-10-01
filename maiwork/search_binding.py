@@ -7,8 +7,11 @@
   **只存数据库，不进 config.toml**（网页保存的东西不写回 plugins/，会触发全部插件重载）。
 - 候选清单：所有已启用 MCP 扩展的工具，按名字/描述猜哪个像搜索、哪个像抓正文（guess_tool_role），
   前端据此给下拉排序和标徽章。
-- 状态（status_of）：没绑定 / 绑定的扩展不在了 / 扩展没启用 / 扩展没连上 / 工具不在了 / 好了——
+- 状态（status_of）：没绑定 / 绑定的扩展不在了 / 扩展没启用 / 扩展没连上 / 初始化失败 / 工具不在了 / 好了——
   中文说明，设置总览的健康项和 GET /api/extensions/search 都用它。
+  **可用性按「有效搜索链」算**（A05）：主家暂时坏了、fallback 名单里有一家能用 → 仍算可用，
+  说明写成「主搜索 X 暂时不可用（原因）——正在用备用 Y」；只有根本没绑定（或者全链都不能用）
+  才返回不可用。tool_state / tool_problem 是单家判断，status_of 是整条链判断。
 - 扩展被删除 / 改名：调用方（console 路由）调 clear_binding(store, mcp=名字) 跟着清掉。
 """
 
@@ -181,6 +184,61 @@ def _entry_of(settings: Any, store: Any, name: str) -> Any | None:
     return None
 
 
+def _extract_note(
+    store: Any, settings: Any, runtime_of: Callable[[str], Any], binding: dict[str, Any]
+) -> str:
+    """抓正文那家的说明尾注（接在搜索说明后面）；没绑抓正文 → ""。"""
+    if not binding.get("extract_tool"):
+        return ""
+    eproblem = tool_problem(
+        store, settings, runtime_of, binding["extract_mcp"], binding["extract_tool"], role="抓正文"
+    )
+    if eproblem:
+        return f"（{eproblem}）"
+    if binding["extract_mcp"] == binding["mcp"]:
+        return f"（抓正文 {binding['extract_tool']}）"
+    return f"（抓正文用 {binding['extract_mcp']} 的 {binding['extract_tool']}）"
+
+
+def _fallback_problem(
+    store: Any, settings: Any, runtime_of: Callable[[str], Any], name: str
+) -> str:
+    """备用名单里的一家现在能不能顶：能 → ""，不能 → 短语原因（用于状态文案）。
+
+    备用必须地址被搜索预设认得出——递补要按预设参数调，认不出的家补不上（同 search.py）。
+    """
+    entry = _entry_of(settings, store, name)
+    if entry is None:
+        return "扩展不在了"
+    if not entry.enabled:
+        return "扩展没启用"
+    preset = search_presets.preset_of_url(getattr(entry, "url", ""))
+    if preset is None:
+        return "地址不是已知搜索服务"
+    runtime = runtime_of(name)
+    client = getattr(runtime, "client", None) if runtime is not None else None
+    if client is None:
+        return "扩展还没连上"
+    if getattr(runtime, "ok", None) is False:
+        return str(getattr(runtime, "error", "") or "").strip() or "扩展连不上"
+    tools_remote = runtime.tools_remote() if hasattr(runtime, "tools_remote") else {}
+    if preset.search_tool not in tools_remote:
+        return f"没有工具「{preset.search_tool}」"
+    return ""
+
+
+def first_usable_fallback(
+    store: Any, settings: Any, runtime_of: Callable[[str], Any], binding: dict[str, Any]
+) -> str:
+    """fallback 名单里第一家现在能顶的扩展名；没有 → ""。"""
+    for name in binding.get("fallback") or []:
+        if name == binding.get("mcp"):
+            continue
+        if not _fallback_problem(store, settings, runtime_of, name):
+            return str(name)
+    return ""
+
+
 def status_of(
     store: Any,
     settings: Any,
@@ -188,45 +246,75 @@ def status_of(
 ) -> tuple[bool, str]:
     """(可用, 中文说明)。runtime_of(扩展名) → 扩展运行状态（extensions.runtime_of）或 None。
 
-    「可用」只看搜索那家；抓正文那家有问题不影响搜索，只在说明里带一句。
+    「可用」按有效搜索链算（A05）：主家能用就算可用；主家暂时坏了但 fallback 名单里
+    有一家能用，也算可用，说明写成「主搜索 X 暂时不可用（原因）——正在用备用 Y」。
+    只有「根本没绑定」或整条链都不能用才返回 False（后者给主家的原因，让人知道去修哪家）。
+    抓正文那家有问题不影响搜索可用性，只在说明里带一句。
     """
     binding = get_binding(store)
     if binding is None:
         return False, "还没指定联网搜索：去 设置 → 扩展 里选一个 MCP 用作联网搜索"
-    problem = tool_problem(store, settings, runtime_of, binding["mcp"], binding["tool"], role="搜索")
-    if problem:
-        return False, problem
-    text = f"用 {binding['mcp']} 的 {binding['tool']}"
-    if binding["extract_tool"]:
-        eproblem = tool_problem(
-            store, settings, runtime_of, binding["extract_mcp"], binding["extract_tool"], role="抓正文"
+    usable, problem, reason = tool_state(
+        store, settings, runtime_of, binding["mcp"], binding["tool"], role="搜索"
+    )
+    if usable:
+        return True, f"用 {binding['mcp']} 的 {binding['tool']}" + _extract_note(store, settings, runtime_of, binding)
+    fallback = first_usable_fallback(store, settings, runtime_of, binding)
+    if fallback:
+        preset = search_presets.preset_of_url(_url_of(settings, store, fallback))
+        tool = preset.search_tool if preset is not None else "搜索工具"
+        text = f"主搜索 {binding['mcp']} 暂时不可用（{reason}）——正在用备用 {fallback} 的 {tool}"
+        return True, text + _extract_note(store, settings, runtime_of, binding)
+    return False, problem
+
+
+def _url_of(settings: Any, store: Any, name: str) -> str:
+    entry = _entry_of(settings, store, name)
+    return str(getattr(entry, "url", "") or "")
+
+
+def tool_state(
+    store: Any, settings: Any, runtime_of: Callable[[str], Any], mcp: str, tool: str, *, role: str
+) -> tuple[bool, str, str]:
+    """(能不能用, 不能用时的完整中文说明, 短语原因)。
+
+    扩展初始化失败时会留下 client 壳 + 空工具清单（initialize 被拒）：真运行体给
+    ok=False + error，这里按「连不上（原因）」说，不误报成「没有这个工具」骗人去重绑。
+    老假运行体没有 ok 属性时退回「client 在不在 + 工具清单里有没有」老口径。
+    """
+    entry = _entry_of(settings, store, mcp)
+    if entry is None:
+        return False, f"{role}绑定的扩展「{mcp}」不在了：去 设置 → 扩展 重新选一个", "扩展不在了"
+    if not entry.enabled:
+        return False, f"{role}绑定的扩展「{mcp}」没启用：去 设置 → 扩展 打开它", "扩展没启用"
+    runtime = runtime_of(mcp)
+    client = getattr(runtime, "client", None) if runtime is not None else None
+    if client is None:
+        return False, f"{role}绑定的扩展「{mcp}」还没连上：去 设置 → 扩展 里 reload 一下", "还没连上"
+    if getattr(runtime, "ok", None) is False:
+        err = str(getattr(runtime, "error", "") or "").strip() or "连不上"
+        return (
+            False,
+            f"{role}绑定的扩展「{mcp}」连不上（{err}）：去 设置 → 扩展 里 reload 一下",
+            err,
         )
-        if eproblem:
-            text += f"（{eproblem}）"
-        elif binding["extract_mcp"] == binding["mcp"]:
-            text += f"（抓正文 {binding['extract_tool']}）"
-        else:
-            text += f"（抓正文用 {binding['extract_mcp']} 的 {binding['extract_tool']}）"
-    return True, text
+    tools_remote = runtime.tools_remote() if hasattr(runtime, "tools_remote") else {}
+    if tool not in tools_remote:
+        # 空清单也走这句：真运行体的初始化失败靠上面的 ok=False 先认出来，
+        # 老假对象（没有 ok）保持老口径，不许把绑定填错说成别的。
+        return (
+            False,
+            f"扩展「{mcp}」没有这个工具「{tool}」：去 设置 → 扩展 重新绑定",
+            f"没有工具「{tool}」",
+        )
+    return True, "", ""
 
 
 def tool_problem(
     store: Any, settings: Any, runtime_of: Callable[[str], Any], mcp: str, tool: str, *, role: str
 ) -> str:
     """某家扩展的某个工具现在能不能用；能用 → ""，不能用 → 中文说明（role：搜索 / 抓正文）。"""
-    entry = _entry_of(settings, store, mcp)
-    if entry is None:
-        return f"{role}绑定的扩展「{mcp}」不在了：去 设置 → 扩展 重新选一个"
-    if not entry.enabled:
-        return f"{role}绑定的扩展「{mcp}」没启用：去 设置 → 扩展 打开它"
-    runtime = runtime_of(mcp)
-    client = getattr(runtime, "client", None) if runtime is not None else None
-    if client is None:
-        return f"{role}绑定的扩展「{mcp}」还没连上：去 设置 → 扩展 里 reload 一下"
-    tools_remote = runtime.tools_remote() if hasattr(runtime, "tools_remote") else {}
-    if tool not in tools_remote:
-        return f"扩展「{mcp}」没有这个工具「{tool}」：去 设置 → 扩展 重新绑定"
-    return ""
+    return tool_state(store, settings, runtime_of, mcp, tool, role=role)[1]
 
 
 # ----------------------------------------------------------------------

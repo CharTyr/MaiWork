@@ -98,10 +98,11 @@ async def test_skip_then_hidden_and_reset(fresh) -> None:
 
 
 async def test_done_recorded(fresh) -> None:
+    """2026-10（docs/13 A08）：模型没配时点完成只记「先存下」（later），不记 done。"""
     _app, client = fresh
     await _login(client)
     d = await (await client.post("/api/onboarding", json={"action": "done"})).json()
-    assert d["state"] == "done" and d["show"] is False and d["ts"] > 0
+    assert d["state"] == "later" and d["show"] is False and d["ts"] > 0 and d["usable"] is False
 
 
 async def test_bad_action(fresh) -> None:
