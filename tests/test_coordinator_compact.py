@@ -109,8 +109,8 @@ class TestMainCompaction:
         # 至少存在一条带摘要标记的 user 消息
         assert any("前面对话的摘要" in str(m.get("content") or "") for _r, msgs, _k in models.calls for m in msgs)
 
-    async def test_context_length_error_trims_and_retries(self):
-        """模型返回上下文超长 -> 裁掉最旧一段重试一次。"""
+    async def test_context_length_error_preserves_requirements_and_fails(self):
+        """模型窗口不足也不许删最旧要求重试，主模型路径必须真实报失败。"""
         from CharTyr_MaiWork.maiwork.models import ChatResult, ModelError
 
         state = {"n": 0}
@@ -128,8 +128,9 @@ class TestMainCompaction:
             {"role": "assistant", "content": "回答1" + "y" * 4000},
             {"role": "user", "content": "第二问"},
         ]
-        result = await coord._chat_main(messages, purpose="t", json_mode=False)
-        assert state["n"] == 2
-        assert result.text
-        # 第二次调用的 messages 少了最旧一段
-        assert len(models.calls[1][1]) < len(models.calls[0][1])
+        original = [dict(m) for m in messages]
+        with pytest.raises(ModelError, match="未丢弃"):
+            await coord._chat_main(messages, purpose="t", json_mode=False)
+        assert state["n"] == 1
+        assert messages == original
+        assert models.calls[0][1] == original

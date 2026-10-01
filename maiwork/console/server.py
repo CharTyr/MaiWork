@@ -928,6 +928,10 @@ class ConsoleServer:
             entries = [_model_public(m) for m in (getattr(settings, "model_list", ()) or ())]
             path_id = str(request.match_info["id"]).strip()
             old = next((m for m in entries if m["id"] == path_id), None)
+            expected = body.get("if_fingerprint")
+            if expected is not None:
+                if not isinstance(expected, str) or not expected or svc.models.verification_stamp(path_id) != expected:
+                    return _err(409, "验证期间模型配置已经改变：请重新验证后再保存建议，未覆盖你的新配置")
             if old is None:
                 problems: list[str] = []
                 _cfg._parse_model_list([{"id": path_id, "endpoint": "__x__", "model": "y"}], endpoints, problems)
@@ -992,24 +996,36 @@ class ConsoleServer:
             if forbid is not None:
                 return forbid
             path_id = str(request.match_info["id"]).strip()
+            before = svc.models.verification_stamp(path_id)
             try:
                 result = await svc.models.verify_entry(path_id)
-            except Exception as e:  # 兜底：验证本身出意外也要如实说
+            except Exception as e:  # 意外失败仍绑定请求开始时配置，不误绑定热更新后的配置
                 result = {"ok": False, "chat_ok": False, "tools_ok": False, "error": str(e) or "验证出错",
-                          "note": "", "suggested_max_tokens": 0, "calls": 0}
+                          "note": "", "suggested_max_tokens": 0, "calls": 0,
+                          "fingerprint": before, "requested_fingerprint": before}
+            result["error"] = _redact_secret(str(result.get("error") or ""), _secret_list())
+            result["note"] = _redact_secret(str(result.get("note") or ""), _secret_list())
             settings = svc.get_settings()
             entry = next((m for m in (getattr(settings, "model_list", ()) or ()) if str(getattr(m, "id", "")) == path_id), None)
+            current = svc.models.verification_stamp(path_id)
+            tested = str(result.get("fingerprint") or before)
+            requested = str(result.get("requested_fingerprint") or before)
+            result["stale"] = bool(tested) and current not in (tested, requested)
             if entry is not None:
                 try:
                     with svc.store.tx() as conn:
                         svc.store.kv_set(conn, f"models.verified.{path_id}", {
                             "model": str(getattr(entry, "model", "")), "endpoint": str(getattr(entry, "endpoint", "")),
                             "ok": bool(result.get("ok")), "tools_ok": bool(result.get("tools_ok")),
+                            "fingerprint": str(result.get("fingerprint") or before),
+                            "requested_fingerprint": str(result.get("requested_fingerprint") or before),
+                            "suggested_max_tokens": int(result.get("suggested_max_tokens") or 0),
                             "note": str(result.get("note") or "")[:300], "error": str(result.get("error") or "")[:300],
                             "ts": clock.now(),
                         })
                 except Exception:
-                    logger.debug("验证结果没存下", exc_info=True)
+                    logger.exception("验证结果没存下")
+                    return _err(500, "模型测试已结束，但验证结果没能保存：请重试，暂未标记为已验证")
             return web.json_response(result)
 
         app.router.add_route("POST", "/api/settings/model-list/{id}/verify", self._write(_model_verify))
@@ -1164,7 +1180,10 @@ class ConsoleServer:
 
             try:
                 return web.json_response(
-                    _onb.act(svc, str(body.get("action") or ""), str(body.get("step") or ""))
+                    _onb.act(
+                        svc, str(body.get("action") or ""), str(body.get("step") or ""),
+                        run_id=body.get("run_id", ""), sequence=body.get("sequence"),
+                    )
                 )
             except ValueError as e:
                 return _err(400, str(e))
@@ -1235,6 +1254,10 @@ class ConsoleServer:
                     v = str(getattr(settings.models, "api_key", "") or "")
                     if v:
                         secrets.append(v)
+                    for endpoint in getattr(settings, "endpoints", ()) or ():
+                        value = str(getattr(endpoint, "api_key", "") or "")
+                        if value:
+                            secrets.append(value)
             except Exception:
                 pass
             return secrets

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -97,6 +98,21 @@ def parse_idea_wanted(text: Any) -> list[int] | None:
         if len(nums) >= _IDEA_ITEM_NO_MAX:
             break
     return nums or None
+
+
+def _ts_of(value: Any) -> float:
+    """钩子载荷里的消息时间 → 秒；认不出来给 0.0。
+
+    宿主给的是字符串（message_utils.py `timestamp=str(...timestamp())`，docs/06）；
+    以前只认数字，结果每条都记成 0.0，「最近一条消息」只能等后台读消息才更新（最多晚 10 分钟）。
+    """
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return ts if math.isfinite(ts) and ts > 0 else 0.0
 
 
 @dataclass
@@ -203,9 +219,7 @@ class Intake:
             if not isinstance(message, dict):
                 return _CONTINUE
             session_id = str(message.get("session_id") or "")
-            ts = message.get("timestamp")
-            ts_f = float(ts) if isinstance(ts, (int, float)) else 0.0
-            self._signals.mark(group_id, session_id, ts_f)
+            self._signals.mark(group_id, session_id, _ts_of(message.get("timestamp")))
             await self._m3(settings, group_id, message, platform)
             return _CONTINUE
         except Exception:  # 任何异常都吞掉，钩子永不中止消息
@@ -239,8 +253,7 @@ class Intake:
         if self._store is not None:
             reply_to = str(message.get("reply_to") or "").strip() or _parse_reply_to(message.get("raw_message"))
             if reply_to:
-                ts = message.get("timestamp")
-                at = float(ts) if isinstance(ts, (int, float)) and ts > 0 else clock.now()
+                at = _ts_of(message.get("timestamp")) or clock.now()
                 self._card_index.on_message(self._store, group_id, user_id, message_id, reply_to, at)
         # 3) 提问的回答（docs/02 §7.2）：回复了 waiting_input/shelved 任务那条提问，
         #    或发起人 @ 机器人而且这个群里只有这一个等待任务 → 后台恢复任务。

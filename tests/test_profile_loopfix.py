@@ -204,6 +204,31 @@ class TestReadInterval:
         assert len(host.msg_calls) > calls_after_first
 
     @pytest.mark.asyncio
+    async def test_throttled_signal_is_not_forgotten(
+        self, store: Store, movable_now
+    ) -> None:
+        """2026-10-01 线上：消息刚好在上次读后几十秒到，这一轮被 60 秒节流挡掉，
+        信号又已被取走，下一轮按「没信号」等了 10 分钟才读到。被挡下的信号要留到下一轮。"""
+        settings = _settings(read_interval_minutes=10)
+        host = FakeHost([_msg("m0", T0 - 100)])
+        p = Profiles(store, host, FakeModelsQueue(ready=False), lambda: settings)
+        await p.tick(GID, refresh=False, has_signal=True)
+        calls_after_first = len(host.msg_calls)
+        movable_now["t"] = T0 + 46
+        host.msgs.append(_msg("m1", T0 + 20))
+        r = await p.tick(GID, refresh=False, has_signal=True)  # 被挡
+        assert r.read == 0
+        movable_now["t"] = T0 + 76
+        r = await p.tick(GID, refresh=False, has_signal=False)  # 信号已取走，但上次被挡的要补读
+        assert r.read == 1
+        assert len(host.msg_calls) > calls_after_first
+        # 补读过后回到正常节流
+        calls = len(host.msg_calls)
+        movable_now["t"] = T0 + 140
+        r = await p.tick(GID, refresh=False, has_signal=False)
+        assert len(host.msg_calls) == calls
+
+    @pytest.mark.asyncio
     async def test_no_signal_uses_read_interval_minutes(
         self, store: Store, movable_now
     ) -> None:

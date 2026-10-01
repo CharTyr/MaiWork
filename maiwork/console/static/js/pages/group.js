@@ -1,21 +1,25 @@
 // MaiWork 网页 · 「群」页：话题、群画像、关注成员、群空间。
 import { CATS, TONES, admin, gadmin } from "../state.js";
-import { SVG, dayWord, dur, esc, ico, richText, safeUrl, when } from "../util.js";
+import { SVG, dayIndex, dayWord, dur, esc, hhmm, ico, now, richText, safeUrl, when } from "../util.js";
+import { daySummary, judgeText, stretches } from "../topiclog.js";
 import { gname, gplat, platTag } from "../api.js";
 import { pulseCard } from "../pulse.js";
 import { emptyState, loading } from "./news.js";
 
-function topicItem(t, i) {
-  const opened = !!t.opener;
+// 一段冷场一张卡：同一段里判了几次合在一起，Jev 那句用这段的代表（开了的那条 / 最新一次）。
+function topicItem(s, i) {
+  const t = s.rep;
+  const opened = s.opened;
   const j = t.jev;
-  const jevText = j ? `${j.ok ? "适合开" : `不适合 · ${j.reason || ""}`}${j.confidence != null ? ` · 把握 ${Number(j.confidence).toFixed(2)}` : ""}${j.detail ? `（${j.detail}）` : ""}` : "没问 Jev";
+  const span = s.n > 1 ? `${when(s.first.ts)}–${hhmm(s.rows[0].ts)}` : when(t.ts);
+  const times = s.n > 1 ? `这段判了 ${s.n} 次${s.bestOk != null && !opened ? `，适合开最高 ${s.bestOk.toFixed(2)}` : ""}。` : "";
   const r = t.result;
   return `
     <article class="item ruled enter" style="--i:${i}">
       ${ico(opened ? "speech" : "hourglass")}
       <div>
-        <h3 class="item-title">${esc(when(t.ts))} · ${opened ? "开了话题" : "忍住了没开"}</h3>
-        <p class="item-body soft">安静了 ${esc(dur(t.quiet_s))}${t.usual_gap_s ? `，平时这个点 ${esc(dur(t.usual_gap_s))}一条` : ""}。Jev：${esc(jevText)}。${t.pick && opened ? `挑的是「${esc(t.pick.title)}」。` : ""}</p>
+        <h3 class="item-title">${esc(span)} · ${opened ? "开了话题" : "忍住了没开"}</h3>
+        <p class="item-body soft">安静了 ${esc(dur(t.quiet_s))}${t.usual_gap_s ? `，平时这个点 ${esc(dur(t.usual_gap_s))}一条` : ""}。${esc(times)}Jev：${esc(judgeText(t))}${j && j.detail ? `（${esc(j.detail)}）` : ""}。${t.pick && t.pick.title && opened ? `挑的是「${esc(t.pick.title)}」。` : ""}</p>
         ${opened ? `<div class="opener">${esc(t.opener)}</div>` : ""}
         ${opened ? `<div class="status"><span class="dot ${r && r.replies ? "used" : ""}"></span><span class="status-text">${r ? (r.replies ? `${r.replies} 人接话${r.followups ? `，MaiBot 接着聊了 ${r.followups} 句` : ""}` : "10 分钟内没人接，下次隔久一点") : "等着看有没有人接"}</span></div>` : ""}
         ${
@@ -230,7 +234,9 @@ export function viewGroup(g, v) {
   }
   const log = v.topic_log || [];
   html += `<h2 class="h-sub">开话题记录 </h2>`;
-  html += log.length ? log.map((t, k) => topicItem(t, k)).join("") : `<p class="h-meta">还没有</p>`;
+  const today = daySummary(log, (ts) => dayIndex(ts) === dayIndex(now()));
+  if (today) html += `<p class="h-meta">${esc(today)}</p>`;
+  html += log.length ? stretches(log).map((s, k) => topicItem(s, k)).join("") : `<p class="h-meta">还没有</p>`;
   html += `<h2 class="h-sub">群画像 </h2>`;
   html += profileSection(v);
   if (gadmin()) html += pushBlock(v) + groupSpaceBlock(v, g) + focusSection(v);

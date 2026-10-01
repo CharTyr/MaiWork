@@ -219,24 +219,36 @@ class TestChunkedSummarization:
 
     @pytest.mark.asyncio
     async def test_chunk_count_capped(self):
-        """分段数有上限（≤4）：超长内容再多，块摘要调用次数不能无限涨。"""
-        piece = [_msg("user", f"块{i}" + "z" * 25000) for i in range(10)]
+        """分段数有上限（≤4）：装得下的长内容，块摘要调用次数不能无限涨。"""
+        piece = [_msg("user", f"块{i}" + "z" * 29000) for i in range(4)]
         models = _RecordingModels(replies=[_summary_stub() for _ in range(64)])
         await compaction.summarize_messages(piece, models=models, role="main", purpose="t")
         # 块摘要调用 ≤ 4 次 + 1 次合并 = 最多 5 次
         assert len(models.calls) <= 5
 
     @pytest.mark.asyncio
-    async def test_capped_chunks_still_keep_user_openings(self):
-        """块数到顶后对单条做头尾截断时：每条 user 开头至少留一段，且写明省略字数。"""
+    async def test_over_capacity_raises_and_keeps_history(self):
+        """块数到顶也装不下（10 条 × 25k ≈ 250k > 4×32k）：明确失败，不调模型、不丢内容。
+
+        R05 收紧：超出承载量不再「截断后照样摘要」，而是在调模型之前抛 ModelError；
+        maybe_compact 吞掉后原 history 一条不动，用户看到的是「整理没成功」。
+        """
         markers = [f"USER_OPENING_{i}" for i in range(10)]
         piece = [_msg("user", markers[i] + " " + "z" * 25000) for i in range(10)]
         models = _RecordingModels(replies=[_summary_stub() for _ in range(64)])
-        await compaction.summarize_messages(piece, models=models, role="main", purpose="t")
-        text = _all_prompt_text(models)
-        for mk in markers:
-            assert mk in text, f"user 消息开头 {mk} 丢了"
-        assert "省略" in text  # 明确写了「此处省略 N 字」之类的说明
+        with pytest.raises(ModelError):
+            await compaction.summarize_messages(piece, models=models, role="main", purpose="t")
+        # 一次模型调用都不许发：没有模型拿到缺片输入
+        assert models.calls == []
+        # maybe_compact 路径：原 history 完整保留，不替成缺料的假摘要
+        models2 = _RecordingModels(replies=[_summary_stub() for _ in range(64)])
+        msgs = [_msg("system", "sys")] + piece
+        out = await compaction.maybe_compact(
+            msgs, models=models2, role="main", context_window=8192,
+            output_reserve=256, purpose="t",
+        )
+        assert out == msgs
+        assert not any("【前面对话的摘要】" in str(m.get("content") or "") for m in out)
 
     @pytest.mark.asyncio
     async def test_chunk_summaries_merged_into_eight_sections(self):

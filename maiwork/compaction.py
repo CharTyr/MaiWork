@@ -14,16 +14,21 @@
    切分，绝不拆开；system prompt 永不进摘要、永不删。
    摘要输入按重要性分配预算（A07）：user / assistant 决定性文字优先原样保留，
    超长 tool 结果各自截头尾（spill 路径说明保留），不再整体 head/tail 一刀切；
-   优先内容本身仍超预算时按组切块分段摘要（≤4 块，工具调用与结果不拆散），
-   再把块摘要合并成最终 8 节；块数到顶后单条仍超长的做头尾截断（user 开头至少
-   保住第一段，截断处写明「此处省略 N 字」）。
+   优先内容本身仍超预算时切块分段摘要（≤4 块，工具调用与结果不拆散），
+   再把块摘要合并成最终 8 节。R05 起分段在丢内容之前发生：单条超长的
+   user/assistant 会被切成「消息内连续片段」进不同的块（带「第 k/n 段」接续
+   标记），中段约束不再被预截丢掉；每次完整 prompt（含模板、[role] 和接续
+   标记）都不超过 SERIALIZE_MAX_CHARS。装不进 4 块时在调用前抛 ModelError；
+   分段/最终摘要为空或合并输入超预算时，也明确拒绝替换原对话
+   （summarize_messages 抛、maybe_compact 吞掉后原 history 一条不动），
+   不把 head/tail 截过的缺片输入发给模型再宣称摘要成功。
    摘要调模型照常用量记账（purpose 追加 ":compact"）；摘要失败：原样返回，不抛。
 
 另外三件事也在这里：
 - 超大工具结果落盘（spill_big_output）：单条工具输出超过约 5 万字时，完整内容写到
   该任务/对话归属目录下的一个文件，对话里只放「开头 + 结尾 + 路径说明」。
 - 「上下文超长」类错误（looks_like_context_length）：chat_with_retry_on_long_context
-  把最旧一段裁掉一次再重试一次；再失败原样抛出。
+  保留旧调用签名，但窗口不足时明确报错，不删掉最旧要求来伪装成功。
 - 重复调用提醒（RepeatCallNudger）：同一工具 + 规范化参数连用第 3/5/8 次给一句提醒；
   新的 user 消息进来计数清零。
 """
@@ -59,6 +64,23 @@ SPILL_HEAD_CHARS = 4000
 SPILL_TAIL_CHARS = 1200
 KEEP_RECENT_TOOL_RESULTS = 1      # 第一阶段里「最近 1 条」tool 结果不算旧
 MIN_SUMMARIZE_PIECE = 2           # 可切的「最早一段」至少要几条才有意义
+
+# ---------------------------------------------------------------------------
+# R05 改动总览（docs/14-0.7.1整改复核.md R05；2026-10-01 收紧为硬失败语义）
+#
+# 1. 分段在丢内容之前发生：_serialize_cut 不再对超长 user/assistant 做 head/tail
+#    预截；序列化只动超长 tool 结果（有 spill 完整归档可回读），user/assistant
+#    全文保留。超预算由分段摘要按「消息内连续片段」切块兜底，48k/52k 单条消息
+#    的中段约束随所在块原样进摘要输入。
+# 2. 预算硬保障：任何一次发给摘要模型的「对话：」正文 ≤ SERIALIZE_MAX_CHARS
+#    （含 [role] 前缀和分段接续标记）。装不进 MAX_SUMMARY_CHUNKS 块（承载量
+#    ≈ 4 × 32k 字符）= 摘要做不了——**在任何模型调用之前抛 ModelError**，
+#    不靠端点 context_length 报错，更不把 head/tail 截过的缺片输入发给模型
+#    再宣称摘要成功。合并输入超预算同样抛 ModelError，不悄悄裁掉某段摘要。
+# 3. 失败语义：summarize_messages 抛 ModelError；maybe_compact 吞掉后**原样
+#    返回完整 history**（不替成缺料的假摘要），admin_chat 手动整理给 400。
+#    超承载量时用户看到的是「整理没成功」，不是一份丢了约束的假摘要。
+# ---------------------------------------------------------------------------
 
 _SUMMARY_SECTIONS = (
     "Primary Request and Intent（最主要的目标）",
@@ -276,8 +298,7 @@ MAX_SUMMARY_CHUNKS = 4             # 分段摘要的块数上限（块摘要 + 1
 _TOOL_TRUNC_CHARS = 6000           # 序列化时单条 tool 结果超过它就先各自截头尾
 _TOOL_TRUNC_HEAD = 3600
 _TOOL_TRUNC_TAIL = 1600
-_MSG_TRUNC_HEAD = 6000             # 块数到顶后单条 user/assistant 的头保留（user 开头至少留一段）
-_MSG_TRUNC_TAIL = 2000
+_FIRST_PARA_MAX = 8000             # _truncate_message_text 保首段的硬上限（防御，不许突破预算）
 
 
 _SUMMARY_RULES = (
@@ -324,46 +345,50 @@ def _merge_prompt(chunk_summaries: list[str]) -> str:
     )
 
 
-def _chunk_groups(groups: list[list[dict]], *, max_chars: int, max_chunks: int) -> list[list[dict]]:
-    """把 _split_groups 的组按「每块序列化后 ≤ max_chars」装进最多 max_chunks 块。
+def _body_text(msgs: list[dict]) -> str:
+    """一组消息（可含消息内片段）序列化后的正文（和摘要调用实际发出去的一致）。"""
+    return _serialize_cut(msgs)
 
-    组不可拆（assistant(tool_calls) 和它的 tool 结果永远同块）。组数多于块数上限时
-    往后合并（后面的组更靠近当前工作，优先挤在一起；块内序列化时超长的单条由
-    _serialize_cut 的按条截断兜底）。
+
+def _chunk_groups(groups: list[list[dict]], *, max_chars: int, max_chunks: int) -> list[list[dict]]:
+    """把 _split_groups 的组按「每块序列化后 ≤ max_chars」切块。
+
+    - 工具组（assistant(tool_calls) + tool 结果）不可拆，整块进同一块；
+    - 普通单条 user / assistant 超长按 _split_message_parts 切成「消息内连续片段」，
+      片段可以分进不同的块——分段在丢内容之前发生，中段约束不再被预截丢掉；
+    - 返回空列表 = 装不进 max_chunks 块（超出承载量），调用方必须在调模型之前
+      抛 ModelError，不许拿截断过的缺片输入去摘要。
     """
     if not groups:
         return []
-    # 组数不超上限：按预算装
+
     chunks: list[list[dict]] = []
     current: list[dict] = []
 
-    def _fits(candidate: list[dict]) -> bool:
-        return len(_serialize_cut(candidate, max_chars=max_chars)) <= max_chars
-
-    if len(groups) <= max_chunks:
-        for g in groups:
-            candidate = current + g
-            if current and not _fits(candidate):
-                chunks.append(current)
-                current = list(g)
-            else:
-                current = candidate
+    def _flush() -> None:
+        nonlocal current
         if current:
             chunks.append(current)
-        if len(chunks) <= max_chunks:
-            return chunks
-        # 装完超了上限：退回下面的均分路径
-        chunks = []
-        current = []
+            current = []
 
-    # 组数超上限（或按预算装完仍超上限）：均分成 max_chunks 块，组不拆
-    n = len(groups)
-    k = min(max_chunks, n)
-    per = math.ceil(n / k)
-    out: list[list[dict]] = []
-    for i in range(0, n, per):
-        out.append([m for g in groups[i:i + per] for m in g])
-    return out[:max_chunks]
+    for g in groups:
+        atomic = any(m.get("tool_calls") or m.get("role") == "tool" for m in g)
+        if atomic:
+            # 工具组不拆：整块进同一块（超长 tool 结果序列化时已各自截头尾）
+            if current and len(_body_text(current + g)) > max_chars:
+                _flush()
+            current.extend(g)
+            continue
+        # 普通消息：按消息内片段切，片段可分进不同的块
+        for part in _fit_parts(g, max_chars=max_chars):
+            if current and len(_body_text(current + [part])) > max_chars:
+                _flush()
+            current.append(part)
+    _flush()
+
+    if len(chunks) > max_chunks:
+        return []  # 超出承载量：调用方明确失败，不静默丢
+    return chunks
 
 
 async def summarize_messages(
@@ -400,7 +425,10 @@ async def _chat_once(
         group_id=str(group_id or ""),
         task_id=str(task_id or ""),
     )
-    return str(result.text or "").strip()
+    text = str(result.text or "").strip()
+    if not text or getattr(result, "tool_calls", None):
+        raise ModelError("摘要未完成：模型回了空摘要或仍要调用工具，原对话未替换", status=0)
+    return text
 
 
 async def _summarize_piece(
@@ -419,44 +447,66 @@ async def _summarize_piece(
     1b 起各调用方经 compaction 的 role= 照旧传，真正的岗位有专门的 agent 时走 agent 参数。
 
     优先内容本身仍超预算时：按 _split_groups 的成组规则把 cut 切成若干块
-    （≤ MAX_SUMMARY_CHUNKS，工具调用与结果不拆散），逐块摘要后再合并成最终 8 节摘要。
-    块数到顶后单条仍超长的，由 _serialize_cut 对单条做头尾截断（user 保住开头第一段、
-    写明「此处省略 N 字」）。
+    （≤ MAX_SUMMARY_CHUNKS，工具调用与结果不拆散；单条超长 user/assistant
+    切成消息内连续片段，分段在丢内容之前发生），逐块摘要后再合并成最终 8 节摘要。
+    预算按**实际 prompt 全长**算（含摘要模板，模板开销用 len(_summary_prompt(""))
+    动态实测，不用估算）：每一次发给模型的 user content 都 ≤ SERIALIZE_MAX_CHARS。
+    装不进 4 块（超出承载量）或合并输入超预算：**在调模型之前**
+    抛 ModelError——不把 head/tail 截过的缺片输入发给模型再宣称摘要成功；
+    maybe_compact 吞掉后原 history 一条不动。
     """
+    # 单发预算 = 总预算 − 实际模板开销（动态实测）
+    single_budget = SERIALIZE_MAX_CHARS - len(_summary_prompt(""))
     body = _serialize_cut(piece)
-    if len(body) <= SERIALIZE_MAX_CHARS:
+    if len(body) <= single_budget:
         return await _chat_once(
             _summary_prompt(body), models=models, role=role, agent=agent,
             purpose=purpose, group_id=group_id, task_id=task_id,
         )
 
-    # 分段摘要：按组装块（组不可拆），每块序列化后 ≤ 预算，最多 MAX_SUMMARY_CHUNKS 块
+    # 分段摘要：工具组不拆；普通消息按消息内片段切。
+    # 块预算 = 总预算 − 分段模板的实际开销（part/parts 只占个位数，长度按上限实测）。
+    # 装不进 MAX_SUMMARY_CHUNKS 块 = 超出承载量：在调模型之前抛 ModelError，
+    # 不许拿 head/tail 截过的缺片输入去摘要再宣称成功（R05 收紧）。
+    chunk_budget = SERIALIZE_MAX_CHARS - len(
+        _summary_prompt("", part=MAX_SUMMARY_CHUNKS, parts=MAX_SUMMARY_CHUNKS)
+    )
     groups = _split_groups([m for m in piece if isinstance(m, dict)])
-    chunks = _chunk_groups(groups, max_chars=SERIALIZE_MAX_CHARS, max_chunks=MAX_SUMMARY_CHUNKS)
-    if len(chunks) <= 1:
-        # 一块装不下也只是一块（单条巨长）：直接摘要（_serialize_cut 已按条截断）
-        return await _chat_once(
-            _summary_prompt(body), models=models, role=role, agent=agent,
-            purpose=purpose, group_id=group_id, task_id=task_id,
+    chunks = _chunk_groups(groups, max_chars=chunk_budget, max_chunks=MAX_SUMMARY_CHUNKS)
+    if not chunks:
+        raise ModelError(
+            f"待摘要内容超出承载量（{MAX_SUMMARY_CHUNKS} 块 × 每块预算 {chunk_budget} 字），"
+            "摘要没做成，原对话一条没动",
+            status=0,
         )
     chunk_summaries: list[str] = []
     for i, chunk in enumerate(chunks):
         chunk_body = _serialize_cut(chunk)
+        prompt = _summary_prompt(chunk_body, part=i + 1, parts=len(chunks))
+        if len(prompt) > SERIALIZE_MAX_CHARS:  # 防御：预算算法失灵也不许发超预算 prompt
+            raise ModelError("分段摘要输入超预算，摘要没做成，原对话一条没动", status=0)
         text = await _chat_once(
-            _summary_prompt(chunk_body, part=i + 1, parts=len(chunks)),
-            models=models, role=role, agent=agent,
+            prompt, models=models, role=role, agent=agent,
             purpose=purpose, group_id=group_id, task_id=task_id,
         )
-        chunk_summaries.append(text or f"（第 {i + 1} 段摘要为空）")
-    # 合并成最终 8 节摘要
+        chunk_summaries.append(text)
+    if len(chunk_summaries) == 1:
+        return chunk_summaries[0]
+    # 合并成最终 8 节摘要；合并输入按实际长度 ≤ 预算，超了明确失败，不悄悄裁某段摘要
+    merge_prompt = _merge_prompt(chunk_summaries)
+    if len(merge_prompt) > SERIALIZE_MAX_CHARS:
+        raise ModelError(
+            "各段摘要拼起来超出合并输入预算，摘要没做成，原对话一条没动",
+            status=0,
+        )
     return await _chat_once(
-        _merge_prompt(chunk_summaries), models=models, role=role, agent=agent,
+        merge_prompt, models=models, role=role, agent=agent,
         purpose=purpose, group_id=group_id, task_id=task_id,
     )
 
 
 def _serialize_one(m: dict) -> str:
-    """一条消息摊成一行「[role] 内容」（assistant 带工具调用名）。"""
+    """一条消息摊成一行「[role] 内容」（assistant 带工具调用名；消息内片段带接续标记）。"""
     role = str(m.get("role") or "?")
     content = str(m.get("content") or "")
     if m.get("tool_calls"):
@@ -465,14 +515,18 @@ def _serialize_one(m: dict) -> str:
             if isinstance(tc, dict):
                 names.append(str((tc.get("function") or {}).get("name") or ""))
         content = content + f"（调用工具：{'、'.join(x for x in names if x)}）"
+    part, part_of = m.get("part"), m.get("part_of")
+    if part and part_of and int(part_of) > 1:
+        content = f"（第 {int(part)}/{int(part_of)} 段，接上一段）" + content
     return f"[{role}] {content}"
 
 
 def _truncate_message_text(text: str, *, head: int, tail: int, keep_first_paragraph: bool) -> str:
-    """单条消息头尾截断，中间明确写「此处省略 N 字」。
+    """单段文本头尾截断，中间明确写「此处省略 N 字」。
 
-    keep_first_paragraph=True（user 消息用）：开头至少保住第一段（第一个换行之前的
-    内容），哪怕第一段比 head 还长——任务要求 / 管理员指令往往就写在开头。
+    现在只用于超长 tool 结果（user/assistant 一律不截——分段在丢内容之前发生，
+    装不下就抛 ModelError）。keep_first_paragraph 是保留的防御口：保第一段也有
+    硬上限 _FIRST_PARA_MAX，绝不允许「保首段」把输出顶到预算之外。
     """
     if len(text) <= head + tail:
         return text
@@ -480,7 +534,7 @@ def _truncate_message_text(text: str, *, head: int, tail: int, keep_first_paragr
     if keep_first_paragraph:
         first_para_end = text.find("\n")
         if 0 < first_para_end < len(text) - tail:
-            real_head = max(head, first_para_end)
+            real_head = max(head, min(first_para_end, _FIRST_PARA_MAX))
     real_head = min(real_head, len(text) - tail)
     omitted = len(text) - real_head - tail
     return (
@@ -508,54 +562,81 @@ def _serialize_cut(cut: list[dict], *, max_chars: int = SERIALIZE_MAX_CHARS) -> 
     """把要被总结的那一段摊成纯文本给摘要模型看。
 
     按重要性分配预算（不再整体 head/tail 一刀切）：
-    - user（任务要求、批准范围、管理员指令）与 assistant 的决定性文字优先原样保留；
-    - 超长的 tool 结果先各自截头尾（spill 落盘的路径说明保留）；
-    - 仍然超预算：对超长的 user/assistant 单条做头尾截断，user 开头至少保住第一段，
-      截断处明确写「此处省略 N 字」。
+    - user / assistant 决定性文字原样保留（R05：不再对它们做 head/tail 预截，
+      分段在丢内容之前发生——超预算由分段摘要按消息内片段切块，见 _fit_parts；
+      片段也装不进 4 块时 _summarize_piece 直接抛 ModelError，不在这里偷截）；
+    - 超长的 tool 结果各自截头尾（spill 落盘的路径说明保留，完整内容可回读）。
     """
     msgs = [m for m in cut if isinstance(m, dict)]
-    lines = [_serialize_one(m) for m in msgs]
-    text = "\n".join(lines).strip()
+    text = "\n".join(_serialize_one(m) for m in msgs).strip()
     if len(text) <= max_chars:
         return text
 
-    # 第一步：只动超长 tool 结果（低优先内容），user/assistant 不动
+    # 只动超长 tool 结果（低优先内容，有 spill 归档）；user/assistant 不动
     lines = []
     for m in msgs:
-        if m.get("role") == "tool":
-            body = _truncate_tool_for_serialize(str(m.get("content") or ""))
-            line = f"[tool] {body}"
-            if m.get("tool_calls"):
-                line = _serialize_one(m)  # 防御：tool 一般不带 tool_calls
-            lines.append(line)
-        else:
-            lines.append(_serialize_one(m))
-    text = "\n".join(lines).strip()
-    if len(text) <= max_chars:
-        return text
-
-    # 第二步：优先内容本身也超长 → 对超长 user/assistant 单条头尾截断
-    # （user 保住开头第一段；截断处写明省略字数）。tool 已在第一步处理。
-    lines = []
-    for m in msgs:
-        role = str(m.get("role") or "?")
-        if role == "tool":
+        if m.get("role") == "tool" and not m.get("tool_calls"):
             body = _truncate_tool_for_serialize(str(m.get("content") or ""))
             lines.append(f"[tool] {body}")
-            continue
-        content = str(m.get("content") or "")
-        suffix = ""
-        if m.get("tool_calls"):
-            names = [str((tc.get("function") or {}).get("name") or "")
-                     for tc in m.get("tool_calls") or () if isinstance(tc, dict)]
-            suffix = f"（调用工具：{'、'.join(x for x in names if x)}）"
-        if len(content) > _MSG_TRUNC_HEAD + _MSG_TRUNC_TAIL:
-            content = _truncate_message_text(
-                content, head=_MSG_TRUNC_HEAD, tail=_MSG_TRUNC_TAIL,
-                keep_first_paragraph=(role == "user"),
-            )
-        lines.append(f"[{role}] {content}{suffix}")
+        else:
+            lines.append(_serialize_one(m))
     return "\n".join(lines).strip()
+
+
+# ---------------------------------------------------------------------------
+# R05：消息内分段——单条超长 user/assistant 切成「连续片段」，分段在丢内容之前
+# ---------------------------------------------------------------------------
+
+
+def _split_message_parts(m: dict, *, max_chars: int) -> list[dict]:
+    """一条消息按序列化长度切成若干「片段消息」（content 连续切片，不丢字）。
+
+    - 片段是 content 的连续切片，拼起来就是原文；只有长度原因才切；
+    - 切了多段的片段带 part/part_of（「第 k/n 段」），序列化时写成接续标记；
+    - tool 消息不切（tool 结果序列化时已各自截头尾，且有 spill 完整归档）；
+    - max_chars 是整条序列化行的上限（含 [role] 前缀和接续标记），调用方给
+      预算时要把这两样算进去。
+    """
+    line = _serialize_one(m)
+    if len(line) <= max_chars:
+        return [m]
+    if m.get("role") == "tool":
+        return [m]
+    prefix = f"[{m.get('role') or '?'}] "
+    suffix = ""
+    if m.get("tool_calls"):
+        names = [str((tc.get("function") or {}).get("name") or "")
+                 for tc in m.get("tool_calls") or () if isinstance(tc, dict)]
+        suffix = f"（调用工具：{'、'.join(x for x in names if x)}）"
+    content = str(m.get("content") or "")
+    # 每段正文预算：行上限 − 前缀 − 工具调用名后缀 − 接续标记（≈ 22 字）
+    per = max(200, max_chars - len(prefix) - len(suffix) - 32)
+    slices = [content[i:i + per] for i in range(0, len(content), per)] or [""]
+    out: list[dict] = []
+    n = len(slices)
+    for k, piece_text in enumerate(slices):
+        part = dict(m)
+        part["content"] = piece_text
+        if k != n - 1:
+            part.pop("tool_calls", None)  # 工具调用名只挂在最后一段（_serialize_one 拼）
+        if n > 1:
+            part["part"] = k + 1
+            part["part_of"] = n
+        out.append(part)
+    return out
+
+
+def _fit_parts(msgs: list[dict], *, max_chars: int) -> list[dict]:
+    """把一组消息逐条切成片段（_split_message_parts），使整组序列化 ≤ max_chars。
+
+    返回的片段列表顺序不变、内容不丢（tool 除外：序列化层已截头尾）。
+    整组仍超预算时由调用方继续按片段切分块。
+    """
+    out: list[dict] = []
+    for m in msgs:
+        if isinstance(m, dict):
+            out.extend(_split_message_parts(m, max_chars=max_chars))
+    return out
 
 
 def ensure_sections(text: str) -> str:
@@ -654,29 +735,8 @@ def _merge_keep(keep: list[dict], summary_msg: dict) -> list[Any]:
 
 
 # ---------------------------------------------------------------------------
-# 「上下文超长」错误：把最旧一段裁掉一次再重试一次
+# 「上下文超长」错误：明确报错，不绕行丢弃任务约束
 # ---------------------------------------------------------------------------
-
-
-def drop_oldest_piece(messages: list[dict]) -> list[dict]:
-    """裁掉对话里「最老的一段」（system gravity）：
-
-    按 pick_cut_point 的简化版：直接去掉 system 之后第一个组（组不可拆）。
-    如果 system 后面什么都没有，返回原样。
-    """
-    if not messages:
-        return messages
-    groups = _split_groups(messages)
-    if len(groups) <= 1:
-        return messages
-    # 跳过第一个组（一般是 system）；从第二个组里再跳过 system（防御）→ 去掉下一个组
-    idx = 0
-    if groups and all(m.get("role") == "system" for m in groups[0]):
-        idx = 1
-    if idx >= len(groups):
-        return messages
-    kept_groups = groups[:idx] + groups[idx + 1:]
-    return [m for g in kept_groups for m in g]
 
 
 async def chat_with_retry_on_long_context(
@@ -689,26 +749,23 @@ async def chat_with_retry_on_long_context(
     on_trim: Any = None,
     **chat_kwargs: Any,
 ) -> Any:
-    """调一次 models.chat；撞上「上下文超长」类错误把最旧一段裁掉一次再重试一次。
+    """保留旧调用口，超长时安全失败，不静默删除要求/批准范围后再试。
 
-    agent 传给 models.chat 的岗位 kind（比如专岗回合的 news）；没给就照 role 的旧映射。
-    其他错误（包括非上下文类的 4xx）原样抛出。返回成功的结果。
-    on_trim: 可选同步回调（messages -> None），裁剪发生时通知调用方（日志 / 时间线）。
+    无损摘要由 maybe_compact 提前执行；摘要不能承载或端点窗口仍不足时，
+    不允许退回整组丢弃历史的旧路径。on_trim 保留为调用兼容参数，但不再调用。
+    非上下文错误原样抛出；原 messages 不变，不发第二次被删改内容的请求。
     """
     try:
         return await models.chat(role, messages, agent=agent, purpose=purpose, **chat_kwargs)
     except ModelError as e:
-        if not looks_like_context_length(e.message if hasattr(e, "message") else str(e)):
+        if not looks_like_context_length(e.message):
             raise
-        trimmed = drop_oldest_piece(messages)
-        if trimmed == messages or len(trimmed) < len(messages) == 0:
-            raise
-        try:
-            if callable(on_trim):
-                on_trim(trimmed)
-        except Exception:
-            logger.exception("on_trim 回调出错")
-        return await models.chat(role, trimmed, agent=agent, purpose=purpose, **chat_kwargs)
+        raise ModelError(
+            "这个模型的上下文放不下当前对话，本次未丢弃任务要求或批准范围。"
+            "请先整理对话、把大段材料拆开，或修正模型的实际上下文设置后再试。"
+            f"（端点原因：{e.message}）",
+            status=e.status,
+        ) from e
 
 
 # ---------------------------------------------------------------------------

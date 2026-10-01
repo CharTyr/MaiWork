@@ -51,7 +51,8 @@ def hook_message(
     return {
         "message": {
             "message_id": message_id,
-            "timestamp": ts,
+            # 宿主真载荷是字符串：message_utils.py `timestamp=str(...timestamp())`（docs/06）
+            "timestamp": str(ts),
             "platform": "qq",
             "message_info": info,
             "raw_message": text,

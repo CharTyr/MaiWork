@@ -348,11 +348,28 @@ def _pulse_topics(topic_log: list[Any], now: float) -> tuple[list[dict[str, Any]
     return topics, buckets
 
 
+_SPELL_SAME_S = 90.0  # 两次判断的「最近消息时间」相差这么多以内 = 同一段冷场
+
+
+def _spell_start(e: dict[str, Any], ts: float, quiet_s: float) -> float:
+    """这段冷场从哪开始：新记录有 jev.stretch_ts；旧记录用 ts - quiet_s。"""
+    j = e.get("jev")
+    if isinstance(j, dict) and j.get("stretch_ts") is not None:
+        try:
+            return float(j["stretch_ts"])
+        except (TypeError, ValueError):
+            pass
+    return ts - quiet_s
+
+
 def _pulse_spells(topic_log: list[Any], now: float) -> list[dict[str, Any]]:
-    """topic_log 每条记录生成一个冷场段：{from: ts-quiet_s, to: ts, note}。"""
-    out: list[dict[str, Any]] = []
+    """topic_log → 冷场段 {from, to, note}。同一段冷场判了好几次只画一段（写明判了几次）。
+
+    线上 2026-10-01：每 30 秒判一次，一段冷场 40 条记录，脉搏上叠了 40 段。
+    """
     step = 900.0
     span = 96 * step
+    rows: list[tuple[float, float, bool]] = []  # (段起点, 判断时刻, 开了没)
     for e in topic_log or []:
         if not isinstance(e, dict):
             continue
@@ -366,10 +383,24 @@ def _pulse_spells(topic_log: list[Any], now: float) -> list[dict[str, Any]]:
             quiet_s = max(0.0, float(e.get("quiet_s") or 0.0))
         except (TypeError, ValueError):
             quiet_s = 0.0
-        minutes = int(quiet_s // 60)
-        opened = bool(str(e.get("opener") or ""))
-        note = f"冷场 {minutes} 分钟 · {'开了话题' if opened else '没开'}"
-        out.append({"from": ts - quiet_s, "to": ts, "note": note})
+        rows.append((_spell_start(e, ts, quiet_s), ts, bool(str(e.get("opener") or ""))))
+    rows.sort(key=lambda r: r[0])
+    groups: list[dict[str, Any]] = []
+    for start, ts, opened in rows:
+        g = groups[-1] if groups else None
+        if g is not None and abs(start - g["key"]) <= _SPELL_SAME_S:
+            g["to"] = max(g["to"], ts)
+            g["opened"] = g["opened"] or opened
+            g["n"] += 1
+            continue
+        groups.append({"key": start, "from": start, "to": ts, "opened": opened, "n": 1})
+    out: list[dict[str, Any]] = []
+    for g in groups:
+        minutes = int(max(0.0, g["to"] - g["from"]) // 60)
+        note = f"冷场 {minutes} 分钟 · {'开了话题' if g['opened'] else '没开'}"
+        if g["n"] > 1:
+            note += f" · 判了 {g['n']} 次"
+        out.append({"from": g["from"], "to": g["to"], "note": note})
     out.sort(key=lambda x: float(x["from"]))
     return out
 
@@ -1086,11 +1117,13 @@ def settings_view(svc: Any) -> dict[str, Any]:
     settings = svc.get_settings()
     now = clock.now()
     models = svc.models.settings()
-    model_state = "ok" if models.ready() else "off"
-    model_text = "配好了，能用" if models.ready() else "还没配好，MaiWork 暂时不会工作"
-    if models.ready() and _recent_model_errors(svc.store, now):
+    from ..onboarding import models_status
+
+    status = models_status(svc)
+    model_state, model_text = status["state"], status["text"]
+    if model_state == "ok" and _recent_model_errors(svc.store, now):
         model_state = "warn"
-        model_text = "最近 1 小时有调用出错"
+        model_text += "；最近 1 小时有调用出错"
     usage_today = svc.models.usage_today()
     jev_today = 0
     try:

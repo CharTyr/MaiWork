@@ -21,6 +21,10 @@ READY_MODELS = {"base_url": "https://ep.test/v1", "api_key": "sk-t", "main": "m"
 
 
 async def _post(client, **body):
+    if body.get("action") in ("progress", "done", "skip") and "run_id" not in body:
+        current = await (await client.get("/api/onboarding")).json()
+        if current.get("run_id"):
+            body.update(run_id=current["run_id"], sequence=current["sequence"] + 1)
     r = await client.post("/api/onboarding", json=body)
     return r.status, await r.json()
 
@@ -113,18 +117,18 @@ async def test_items_checklist(tmp_path: Path) -> None:
         await client.close(); await app.stop()
 
 
-async def test_verified_model_shows_verified(tmp_path: Path) -> None:
+async def test_name_only_legacy_record_is_unverified(tmp_path: Path) -> None:
     app, client = await _start(tmp_path, READY_MODELS)
     try:
         await _login(client)
         s = app.models.settings()
-        # 旧四槽过渡链路下也能记验证结果（按服务端模型名对得上就算）
+        # 旧按名字记录没有配置签名：只说未验证，不猜它属于当前候选或当前端点。
         with app.store.tx() as conn:
             app.store.kv_set(conn, "models.verified.x", {"model": s.main, "ok": True, "tools_ok": True, "ts": 1.0})
         d = await (await client.get("/api/onboarding")).json()
         by = {i["key"]: i for i in d["items"]}
-        assert by["models"]["state"] == "ok"
-        assert "已验证" in by["models"]["text"]
+        assert by["models"]["state"] == "warn"
+        assert "未验证" in by["models"]["text"]
     finally:
         await client.close(); await app.stop()
 

@@ -156,3 +156,214 @@ async def test_verify_empty_reply_is_not_ok(tmp_path: Path) -> None:
     assert r["ok"] is False and r["chat_ok"] is False
     assert "空" in r["error"]
     assert r["calls"] == 1
+
+
+# ----------------------------------------------------------------------
+# docs/14 R04（2026-10）：工具验证不许假通过
+# ----------------------------------------------------------------------
+
+
+async def test_wrong_tool_name_is_not_tools_ok(tmp_path: Path) -> None:
+    """调了根本没提供的工具 → 不算工具通过（普通回答能力照给）。"""
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content)
+        if body.get("tools") and not any(m.get("role") == "tool" for m in body["messages"]):
+            return _reply("", [{"id": "c1", "type": "function",
+                                "function": {"name": "nonexistent_review_tool", "arguments": "{\"word\":\"hi\"}"}}])
+        return _reply("OK")
+
+    store, models = _mk(tmp_path, handler)
+    try:
+        r = await models.verify_entry("m1")
+    finally:
+        await models.close(); store.close()
+    assert r["ok"] is True and r["chat_ok"] is True and r["tools_ok"] is False
+    assert "maiwork_ping" in r["note"]
+
+
+async def test_bad_arguments_json_is_not_tools_ok(tmp_path: Path) -> None:
+    """工具参数不是合法 JSON → 不算工具通过，不能把破参数递回去装成功。"""
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content)
+        if body.get("tools") and not any(m.get("role") == "tool" for m in body["messages"]):
+            return _reply("", [{"id": "c1", "type": "function",
+                                "function": {"name": "maiwork_ping", "arguments": "{oops"}}])
+        return _reply("OK")
+
+    store, models = _mk(tmp_path, handler)
+    try:
+        r = await models.verify_entry("m1")
+    finally:
+        await models.close(); store.close()
+    assert r["ok"] is True and r["tools_ok"] is False
+    assert "参数" in r["note"]
+    assert r["calls"] == 2  # 没有第三次请求
+
+
+async def test_word_must_be_string(tmp_path: Path) -> None:
+    """参数是 JSON 对象但 word 不是字符串（或压根没有）→ 不算工具通过。"""
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content)
+        if body.get("tools") and not any(m.get("role") == "tool" for m in body["messages"]):
+            return _reply("", [{"id": "c1", "type": "function",
+                                "function": {"name": "maiwork_ping", "arguments": "{\"word\": 42}"}}])
+        return _reply("OK")
+
+    store, models = _mk(tmp_path, handler)
+    try:
+        r = await models.verify_entry("m1")
+    finally:
+        await models.close(); store.close()
+    assert r["ok"] is True and r["tools_ok"] is False
+    assert r["calls"] == 2
+
+
+async def test_empty_final_answer_after_tool_is_not_tools_ok(tmp_path: Path) -> None:
+    """R04 实测例：工具结果递回去后回了空文本 200 → 不许判工具通过。"""
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content)
+        if body.get("tools"):
+            if not any(m.get("role") == "tool" for m in body["messages"]):
+                return _reply("", [{"id": "c1", "type": "function",
+                                    "function": {"name": "maiwork_ping", "arguments": "{\"word\":\"hi\"}"}}])
+            return _reply("")  # 第三次：空文本
+        return _reply("OK")
+
+    store, models = _mk(tmp_path, handler)
+    try:
+        r = await models.verify_entry("m1")
+    finally:
+        await models.close(); store.close()
+    assert r["ok"] is True and r["tools_ok"] is False
+    assert "空" in r["note"]
+    assert r["calls"] == 3
+
+
+async def test_tool_call_again_after_result_is_not_tools_ok(tmp_path: Path) -> None:
+    """第三次还继续调工具（没有最终答复）→ 不算工具通过。"""
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content)
+        if body.get("tools"):
+            return _reply("", [{"id": "c2", "type": "function",
+                                "function": {"name": "maiwork_ping", "arguments": "{\"word\":\"again\"}"}}])
+        return _reply("OK")
+
+    store, models = _mk(tmp_path, handler)
+    try:
+        r = await models.verify_entry("m1")
+    finally:
+        await models.close(); store.close()
+    assert r["ok"] is True and r["tools_ok"] is False
+    assert r["calls"] == 3
+
+
+async def test_multiple_mixed_tool_calls_are_not_verified(tmp_path: Path) -> None:
+    """合法调用不能掩盖同批未提供的工具，不用错误结果来假装全部通过。"""
+    seen: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content)
+        seen.append(body)
+        if body.get("tools") and not any(m.get("role") == "tool" for m in body["messages"]):
+            return _reply("", [
+                {"id": "cA", "type": "function",
+                 "function": {"name": "some_other_tool", "arguments": "{}"}},
+                {"id": "cB", "type": "function",
+                 "function": {"name": "maiwork_ping", "arguments": "{\"word\":\"hi\"}"}},
+                {"id": "cC", "type": "function",
+                 "function": {"name": "maiwork_ping", "arguments": "{\"word\":\"ho\"}"}},
+            ])
+        return _reply("都收到了")
+
+    store, models = _mk(tmp_path, handler)
+    try:
+        r = await models.verify_entry("m1")
+    finally:
+        await models.close(); store.close()
+    assert r["ok"] is True and r["tools_ok"] is False
+    assert "工具" in r["note"]
+    assert len(seen) == 2  # 混入没提供的工具，不用某个合法调用掩盖非法调用
+
+
+async def test_hello_tool_calls_only_is_not_an_answer(tmp_path: Path) -> None:
+    """第一次短答一个字都没有、只有 tool_calls → 不算「能正常回答」。"""
+    def handler(req: httpx.Request) -> httpx.Response:
+        return _reply("", [{"id": "c1", "type": "function",
+                            "function": {"name": "maiwork_ping", "arguments": "{\"word\":\"hi\"}"}}])
+
+    store, models = _mk(tmp_path, handler)
+    try:
+        r = await models.verify_entry("m1")
+    finally:
+        await models.close(); store.close()
+    assert r["ok"] is False and r["chat_ok"] is False
+    assert "空" in r["error"]
+    assert r["calls"] == 1
+
+
+async def test_stamp_follows_settings_swap(tmp_path: Path) -> None:
+    """verification_stamp 每次实时读当前配置：换成新 Settings 对象（热更新）后签名立刻跟上。"""
+    store = Store(tmp_path / "db.sqlite3")
+    store.migrate()
+    v1 = _settings()
+    v2, problems = load_settings(
+        {
+            "plugin": {"enabled": True},
+            "endpoints": [{"id": "default", "base_url": "https://api.changed/v1", "api_key": "sk-test"}],
+            "model_list": [{"id": "m1", "endpoint": "default", "model": "gpt-x", "max_tokens": 32768}],
+        }
+    )
+    assert problems == []
+    box = {"settings": v1}
+    agents = Agents(store, lambda: box["settings"])
+    models = Models(store, lambda: box["settings"], agents=agents,
+                    transport=httpx.MockTransport(lambda req: _reply()))
+    try:
+        a = models.verification_stamp("m1")
+        box["settings"] = v2
+        assert models.verification_stamp("m1") != a
+    finally:
+        await models.close(); store.close()
+
+
+async def test_verify_result_carries_fingerprints(tmp_path: Path) -> None:
+    """结果带 requested_fingerprint / fingerprint；降档通过时两者不同，fingerprint 对应建议值。"""
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content)
+        mt = body.get("max_tokens") or body.get("max_completion_tokens") or 0
+        if mt > 8192:
+            return httpx.Response(400, json={"error": {"message": "max_tokens must be <= 8192"}})
+        if body.get("tools") and not any(m.get("role") == "tool" for m in body["messages"]):
+            return _reply("", [{"id": "c1", "type": "function",
+                                "function": {"name": "maiwork_ping", "arguments": "{\"word\":\"hi\"}"}}])
+        return _reply("OK")
+
+    store, models = _mk(tmp_path, handler)
+    try:
+        r = await models.verify_entry("m1")
+        assert r["ok"] is True and r["suggested_max_tokens"] == 8192
+        assert r["requested_fingerprint"] and r["fingerprint"]
+        assert r["fingerprint"] != r["requested_fingerprint"]
+        assert r["requested_fingerprint"] == models.verification_stamp("m1")
+        assert r["fingerprint"] == models.verification_stamp("m1", max_tokens=8192)
+    finally:
+        await models.close(); store.close()
+
+
+async def test_all_valid_parallel_pings_receive_results(tmp_path):
+    def handler(req):
+        body = json.loads(req.content)
+        if body.get('tools'):
+            results = [m for m in body['messages'] if m.get('role') == 'tool']
+            if not results:
+                return _reply('', [{'id':i,'type':'function','function':{'name':'maiwork_ping','arguments':'{"word":"hi"}'}} for i in ('p1','p2')])
+            if [(m['tool_call_id'],m['content']) for m in results] != [('p1','pong'),('p2','pong')]:
+                return httpx.Response(400,json={'error':{'message':'missing tool results'}})
+        return _reply('OK')
+    store, models = _mk(tmp_path,handler)
+    try:
+        result = await models.verify_entry('m1')
+        assert result['ok'] is True and result['tools_ok'] is True
+        assert result['calls'] == 3
+    finally:
+        await models.close(); store.close()

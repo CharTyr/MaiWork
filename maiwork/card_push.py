@@ -25,7 +25,7 @@ import json
 import logging
 from typing import Any, Awaitable, Callable, Optional
 
-from . import clock, members
+from . import clock, members, voice
 from .store import Store
 
 logger = logging.getLogger("maiwork.card_push")
@@ -480,8 +480,18 @@ _LEAK_WORDS = (
     "画像", "注意到", "根据你", "观察", "了解到", "记得你", "平时", "经常", "一直在", "总是",
     "你最近", "看你", "听说你", "据说",
 )
+# 推销腔（2026-10 用户定：构想提一嘴要关心式问法，不许推销）：命中就换模板
+_PITCH_WORDS = (
+    "我可以帮", "给大家带来", "推荐给大家", "安利", "感兴趣的话", "点进去看看",
+)
 _MENTION_MAX = 90
 _IDEA_LIVE_STATES = ("new", "wanted")
+# 没由头时从标题里剥掉的开头（标题是「我可以……」式的推销句，群里说的话不要这个头）
+_PITCH_HEADS = ("帮你们", "帮大家", "帮你", "帮群里", "帮")
+_IDEA_TITLE_HEAD = "我可以"
+# 通用兜底问句（模板最后一道保险：不带任何具体内容，也就不可能泄漏）
+_GENERIC_GROUP = "突然想到一件事，要不要我来弄？"
+_GENERIC_PERSONAL = "突然想到一件事，要不要我帮你搭把手？"
 
 
 def _leaky(text: str, at_user: str) -> bool:
@@ -493,20 +503,56 @@ def _leaky(text: str, at_user: str) -> bool:
     return "{@" in t or "@" in t
 
 
-def _template(title: str, personal: bool, at_user: str) -> str:
-    title = str(title or "").strip().rstrip("。.")
-    if title and not _leaky(title, at_user):
-        head = "想到一个可能适合你的点子" if personal else "刚想到一个点子"
-        return f"{head}——{title}。感兴趣的话点进去看看"
-    return "想到一个可能适合你的点子，点进去看看" if personal else "刚想到一个点子，点进去看看"
+def _pitchy(text: str) -> bool:
+    """推销腔：命中任一个就换模板（「我可以帮」「感兴趣的话」这类）。"""
+    t = str(text or "")
+    return any(w in t for w in _PITCH_WORDS)
+
+
+def _idea_rest(title: str) -> str:
+    """标题去掉「我可以（帮你们/帮大家/帮你/帮群里/帮）」后的内容；剥不出 → ""。"""
+    t = str(title or "").strip().rstrip("。.")
+    if not t.startswith(_IDEA_TITLE_HEAD):
+        return ""
+    rest = t[len(_IDEA_TITLE_HEAD):].lstrip("，,、:： ")
+    for head in _PITCH_HEADS:
+        if rest.startswith(head):
+            rest = rest[len(head):]
+            break
+    return rest.strip("，,、:：。. ")
+
+
+def _template(title: str, personal: bool, at_user: str, origin: str = "") -> str:
+    """固定模板：关心式问法（一两句、以问句结尾，不推销、不露画像）。
+
+    - 有由头（origin，已过隐私闸）→「话说之前大家聊的那个 X 后来怎么样了？要我帮忙吗？」
+      （个人向：「话说你之前想弄的那个 X 怎么样了？要我搭把手吗？」）
+    - 没由头 → 标题剥掉「我可以帮…」的头，拼成「突然想到，X 这事要不要我来弄？」
+    - 由头/标题本身命中词表 → 用不带具体内容的通用问句。
+    """
+    o = str(origin or "").strip()
+    text = ""
+    if o and not _leaky(o, at_user):
+        if personal:
+            text = f"话说你之前想弄的那个{o}怎么样了？要我搭把手吗？"
+        else:
+            text = f"话说之前大家聊的那个{o}后来怎么样了？要我帮忙吗？"
+    if not text:
+        rest = _idea_rest(title)
+        if rest and not _leaky(rest, at_user):
+            text = f"突然想到，{rest}这事要不要我来弄？"
+    if not text or _leaky(text, at_user):
+        text = _GENERIC_PERSONAL if personal else _GENERIC_GROUP
+    return text
 
 
 class IdeaMention:
-    """出了新构想（群构想 / 个人向构想）→ 用 MaiWork 的口吻说一两句 + 构想链接。
+    """出了新构想（群构想 / 个人向构想）→ 按人设关心地问一句 + 构想链接。
 
-    个人向构想（ideas.target_user_id 非空）会 @ 本人。给模型的材料只有标题 + 正文 + 可行性，
-    **不给 basis**（「为什么适合」那句会引画像）；写出来的话再过一遍 _leaky，命中就用模板。
-    flush 里要调模型（可能几十秒），app 把它当后台长活跑，不卡主循环。
+    个人向构想（ideas.target_user_id 非空）会 @ 本人。给模型的材料只有标题 + 正文 + 可行性
+    + 由头（origin），**不给 basis**（「为什么适合」那句会引画像）；写出来的话再过一遍
+    _leaky / _pitchy，命中就用模板。flush 里要调模型（可能几十秒），app 把它当后台长活跑，
+    不卡主循环。
     """
 
     def __init__(
@@ -517,6 +563,8 @@ class IdeaMention:
         pushes: Any,
         mentions: Any,
         get_settings: Callable[[], Any],
+        *,
+        identity: Any = None,  # identity.py（读 SOUL）；None 就是没人设（不回退读 MaiBot 人格）
     ) -> None:
         self._store = store
         self._host = host
@@ -524,6 +572,7 @@ class IdeaMention:
         self._pushes = pushes
         self._mentions = mentions
         self._get_settings = get_settings
+        self._identity = identity
 
     def scan(self, group_id: Any, now: float) -> int:
         gid = str(group_id)
@@ -573,32 +622,49 @@ class IdeaMention:
     async def _write(self, gid: str, idea: Any, personal: bool, at_user: str) -> str:
         title = str(idea["title"] or "").strip()
         body = members.render(self._store, gid, idea["body"] or "")
+        origin = ""
+        try:
+            origin = str(idea["origin"] or "").strip() if "origin" in idea.keys() else ""
+        except (KeyError, IndexError, TypeError):
+            origin = ""
         feas = ""
         try:
             f = json.loads(idea["feasibility"] or "{}") if "feasibility" in idea.keys() else {}
             feas = str(f.get("note") or "") if isinstance(f, dict) else ""
         except (TypeError, ValueError):
             feas = ""
+        # 人设只认 SOUL（2026-10-01 用户定）：不读 MaiBot 人格、不拿它的发言当样例
+        persona = voice.persona(self._identity)
         rules = [
-            "你是 MaiWork，这个 QQ 群里帮大家找资讯、想点子、干活的助手。你刚想到一个构想，"
-            "要在群里顺口提一句，让感兴趣的人点链接去看（链接由程序附在后面，你不用写）。",
+            persona.section(),
+            "",
+            "你刚想到一个构想，要在群里顺口关心地问一句（链接由程序附在后面，你不用写）。",
             "",
             f"构想标题：{title}",
             f"构想内容：{body[:300]}",
         ]
+        if origin:
+            who = ("这件事接的是**他自己之前在群里说过想做的那件事**"
+                   if personal else "这件事接的是**群里之前聊过的那件事**")
+            rules.append(f"{who}（由头）：{origin}")
         if feas:
             rules.append(f"能不能做：{feas[:120]}")
         rules += [
             "",
             "要求：",
-            "- 一到两句，总共不超过 60 个字，口语、自然、不做作，不用表情符号堆砌。",
-            "- 说清楚这是个什么点子、为什么可能有意思；别复述标题全文。",
+            "- 用关心、顺口问一句的口吻，像「话说之前大家聊的那个 X 后来怎么样了？要我帮忙吗？」"
+            "「话说你之前想弄的那个 X 怎么样了？要我搭把手吗？」这种问法。",
+            "- 一两句，总共不超过 60 个字；口语、自然，结尾必须是问句。",
+            "- 别推销、别邀功：不许写「我可以帮」「给大家带来」「推荐给大家」「安利」"
+            "「感兴趣的话」「点进去看看」这类话。",
+            "- 有由头就顺着由头问；没有就按构想内容自然地问一句要不要帮忙。别说「我刚想到」。",
+            "- 别复述标题全文，不写链接、不写 QQ 号、不写 @，不用表情符号堆砌。",
         ]
         if personal:
             rules.append(
-                "- 这个点子是想给某一位群友的（程序会在前面 @ 他）。直接对他说「你」就行，"
-                "但绝对不能说你怎么知道他的情况：不许出现「根据你的画像」「我注意到你」「看你平时」"
-                "「你最近在…」这类话，不许提到他的任何个人情况、经历、习惯。"
+                "- 这个构想是给某一位群友的（程序会在前面 @ 他）。直接对他说「你」就行；"
+                "只许提他自己在群里说过想做的那件事本身，**绝对不许**提他的画像、习惯、经历，"
+                "不许出现「根据你的画像」「我注意到你」「看你平时」「你最近在…」「记得你」这类话。"
             )
         else:
             rules.append("- 是给全群的，不要点名任何人。")
@@ -619,10 +685,11 @@ class IdeaMention:
         except Exception as e:  # 模型出错 / JSON 坏了 → 模板
             logger.info("构想提一嘴写话失败，用模板（群 %s）：%s", gid, e)
             text = ""
-        if not text or len(text) > _MENTION_MAX or _leaky(text, at_user):
+        if (not text or len(text) > _MENTION_MAX or _leaky(text, at_user)
+                or _pitchy(text) or voice.is_self_intro(text)):
             if text:
-                logger.info("构想提一嘴的话不合规，换模板（群 %s）", gid)
-            text = _template(title, personal, at_user)
+                logger.info("构想提一嘴的话不合规（泄漏 / 推销腔 / 自我介绍 / 太长），换模板（群 %s）", gid)
+            text = _template(title, personal, at_user, origin)
         return text
 
     async def flush(self, group_id: Any, now: Optional[float] = None) -> None:

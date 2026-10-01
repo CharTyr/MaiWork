@@ -503,7 +503,8 @@ class MaiWorkApp:
                 self.store, self.host, self.pushes, self.mentions, self.get_settings
             )
             self.idea_mention = IdeaMention(
-                self.store, self.host, self.models, self.pushes, self.mentions, self.get_settings
+                self.store, self.host, self.models, self.pushes, self.mentions, self.get_settings,
+                identity=self.identity,  # 读 SOUL：提一嘴要按人设说话（voice.py）
             )
             n = self.card_push.recover() + self.idea_mention.recover()
             if n:

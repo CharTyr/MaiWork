@@ -640,7 +640,8 @@ class TestSettingsView:
         assert s["usage"]["today"]["jev"] == 0
         assert s["usage"]["alert_daily_tokens"] == 0
         states = {h["key"]: h for h in s["health"]}
-        assert states["models"]["state"] == "ok"
+        assert states["models"]["state"] == "warn"
+        assert "未验证" in states["models"]["text"]  # 配置已选好 ≠ 当前配置已经验证
         # 测试机没有 Jev 密钥文件 →「没找到密钥」warn
         assert states["jev"]["state"] == "warn"
         assert states["jev"]["text"] == "没找到密钥"
@@ -1154,6 +1155,42 @@ class TestGroupViewM2Fields:
         # 时段排序
         starts = [s["from"] for s in spells]
         assert starts == sorted(starts)
+
+    @pytest.mark.asyncio
+    async def test_pulse_spells_merge_rejudges_of_one_quiet_stretch(self, m2_client) -> None:
+        """同一段冷场（最近消息时间相同）判了好几次 → 群脉搏只画一段，写明判了几次。
+
+        线上 2026-10-01：每 30 秒判一次，一段冷场 40 条记录，脉搏上叠了 40 段。
+        新记录用 jev.stretch_ts 认段；旧记录没有就用 ts - quiet_s（相差 90 秒内算同一段）。
+        """
+        from CharTyr_MaiWork.maiwork import clock as _clock
+        from CharTyr_MaiWork.maiwork.console import views as _views
+
+        now = _clock.now()
+        start = now - 3000  # 最近一条消息的时刻
+        svc = m2_client.app
+        rows = []
+        for k in range(5):  # 旧记录：同一段里每 30 秒一条（没 stretch_ts）
+            ts = now - 1500 + k * 30
+            rows.append({"id": 10 + k, "ts": ts, "quiet_s": ts - start + (k % 2), "usual_gap_s": 84,
+                         "jev": {"ok": False, "reason": "气氛不对", "confidence": 0.4, "detail": ""},
+                         "pick": {}, "opener": "", "result": None, "verdict": None})
+        other_start = now - 9000  # 另一段（新记录，带 stretch_ts）
+        rows.append({"id": 3, "ts": other_start + 1300, "quiet_s": 1300, "usual_gap_s": 84,
+                     "jev": {"ok": False, "reason": "可以开", "confidence": 0.2, "detail": "",
+                             "ok_p": 0.5, "stretch_ts": other_start},
+                     "pick": {}, "opener": "", "result": None, "verdict": None})
+        rows.sort(key=lambda e: -e["ts"])
+        svc.topics.log_view = lambda gid, *, days=3: rows
+        view = _views.group_view(svc, G1, admin=True)
+        spells = view["pulse"]["spells"]
+        assert len(spells) == 2, spells
+        merged = [s for s in spells if abs(s["from"] - start) < 2][0]
+        assert merged["to"] == pytest.approx(now - 1500 + 4 * 30)
+        assert "判了 5 次" in merged["note"] and "没开" in merged["note"]
+        single = [s for s in spells if abs(s["from"] - other_start) < 2][0]
+        assert "判了" not in single["note"]
+        assert [s["from"] for s in spells] == sorted(s["from"] for s in spells)
 
     @pytest.mark.asyncio
     async def test_admin_view_keeps_verdict(self, m2_client) -> None:

@@ -280,7 +280,8 @@ class TestWritePosts:
         prompt = models.calls[3][1][-1]["content"]
         assert "新出的 FPGA 板子要不要上" in prompt  # 群原话（chat_log 搜出来的）
         assert "阿一" in prompt
-        assert "小麦" in prompt and "热心肠" in prompt  # MaiBot 人设
+        # 人设只认 SOUL.md（2026-10-01 用户定）：这里没接 identity，MaiBot 的人格不许混进来
+        assert "小麦" not in prompt and "热心肠" not in prompt
         assert "多找硬件折腾的，少来软文" in prompt   # 资讯偏好
 
         row = store.read().execute("SELECT * FROM news_items WHERE rejected=0").fetchone()

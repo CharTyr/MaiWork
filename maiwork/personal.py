@@ -34,7 +34,14 @@ from typing import Any, Callable
 
 from . import clock, members
 from .config import Settings
-from .feeds import _adopt_title_zh, _localize_title, _titles_with_originals, clean_step, focus_items
+from .feeds import (
+    _adopt_title_zh,
+    _localize_title,
+    _titles_with_originals,
+    clean_idea_origin,
+    clean_step,
+    focus_items,
+)
 from .models import ModelError
 from .search import SearchUnavailable
 from .store import Store
@@ -282,7 +289,9 @@ class Personal:
             '顺带想 0–1 个「我可以帮他……」的小忙（想不出就 idea 给 null）。只回 JSON：'
             '{"focus": [{"query": "搜索关键词", "why": "对着他哪件事"}],'
             ' "idea": {"title": "我可以帮你……", "body": "帮什么（一两句）", "step": "第一步", '
-            '"effort": "大概多久"} | null}'
+            '"effort": "大概多久",'
+            ' "origin": "这件事接的是**他自己在群里说过想做的那件事**，用一个短名词短语'
+            '（≤16 字，不含他的名字、QQ 号，比如「FPGA 小板子」）；想不出就空字符串"} | null}'
         )
         result = await self._models.chat(
             agent="main",
@@ -303,6 +312,8 @@ class Personal:
                 "body": str(idea.get("body") or "").strip()[:200],
                 "step": str(idea.get("step") or "").strip()[:120],
                 "effort": str(idea.get("effort") or "").strip()[:60],
+                # 由头 = 他自己在群里说过想做的那件事（短名词短语，清洗 + 限 16 字）
+                "origin": clean_idea_origin(idea.get("origin")),
             }
         return {"focus": out_focus, "idea": out_idea}
 
@@ -451,7 +462,7 @@ class Personal:
         """每次最多 per_day 条：avg 高者留，其余标 reject。返回留下的。"""
         ok = [it for it in survivors if "reject" not in it and "scores" in it]
         ordered = sorted(ok, key=lambda x: -float(x["scores"]["avg"]))
-        for it in ok[per_day:]:
+        for it in ordered[per_day:]:
             it["reject"] = ("web", f"超出这次上限（每人每次最多 {per_day} 条）")
         return ordered[:per_day]
 
@@ -877,15 +888,19 @@ class Personal:
         if any(_similar(title, str(r["title"])) >= _IDEA_DEDUP_RATIO for r in rows):
             return
         body = scrub(gid, str(idea.get("body") or ""), self._store) or ""
+        # 由头也过隐私闸：含他的注记 / 画像片段 → 只把 origin 置空，不丢整条构想
+        origin = clean_idea_origin(idea.get("origin"))
+        if origin and scrub(gid, origin, self._store) is None:
+            origin = ""
         now = clock.now()
         with self._store.tx() as conn:
             conn.execute(
-                "INSERT INTO ideas (group_id, icon, title, body, basis, step, effort, state,"
+                "INSERT INTO ideas (group_id, icon, title, body, origin, basis, step, effort, state,"
                 " requested_by, task_id, up, down, created, updated, feasibility, keywords,"
                 " target_user_id)"
-                " VALUES (?, 'bulb', ?, ?, ?, ?, ?, 'new', NULL, NULL, 0, 0, ?, ?, '', '[]', ?)",
+                " VALUES (?, 'bulb', ?, ?, ?, ?, ?, ?, 'new', NULL, NULL, 0, 0, ?, ?, '', '[]', ?)",
                 (
-                    gid, title, body,
+                    gid, title, body, origin,
                     str(persona.get("summary") or "")[:120],  # basis：只给管理员参考，不进任何群文字
                     str(idea.get("step") or "").strip(),
                     str(idea.get("effort") or "").strip(),

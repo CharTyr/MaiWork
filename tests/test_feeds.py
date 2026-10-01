@@ -1105,3 +1105,97 @@ def _run(coro):
     import asyncio
 
     return asyncio.run(coro)
+
+
+# ----------------------------------------------------------------------
+# 构想「由头」（ideas.origin，2026-10 与用户定）
+# ----------------------------------------------------------------------
+
+_IDEA_WITH_ORIGIN = json.dumps(
+    {
+        "idea": {
+            "title": "我可以帮群把百层挑战的战报汇总成一页",
+            "body": "每周自动汇总一次战报",
+            "basis": "群里最近一直在打这个挑战",
+            "origin": "涂击队百层挑战",
+            "icon": "books",
+            "chat_worthy": False,
+            "feasibility": {"level": "ok", "note": "能做"},
+            "keywords": ["战报"],
+            "items": [],
+        }
+    },
+    ensure_ascii=False,
+)
+
+
+def test_make_idea_prompt_asks_origin(tmp_path) -> None:
+    """出构想的 JSON 格式要带 origin（由头）：短名词短语、≤16 字、想不出给空串。"""
+    models = FakeModelsQueue(ready=True, replies=[_IDEA_JSON])
+    store, settings, feeds, models, *_ = _make_feeds(tmp_path, models=models)
+    _run(feeds.make_idea(GID))
+    prompt = models.calls[0][1][-1]["content"]
+    assert '"origin"' in prompt
+    assert "16" in prompt
+    assert "想不出就空字符串" in prompt
+
+
+def test_make_idea_stores_origin(tmp_path) -> None:
+    models = FakeModelsQueue(ready=True, replies=[_IDEA_WITH_ORIGIN])
+    store, settings, feeds, *_ = _make_feeds(tmp_path, models=models)
+    got = _run(feeds.make_idea(GID))
+    row = store.read().execute("SELECT origin FROM ideas WHERE id=?", (got,)).fetchone()
+    assert row["origin"] == "涂击队百层挑战"
+
+
+def test_idea_material_section_carries_origin(tmp_path) -> None:
+    """专岗候选的由头也带进主模型提示词的素材段。"""
+    store, settings, feeds, *_ = _make_feeds(tmp_path)
+    section = feeds._idea_material_section(
+        GID, {"title": "t", "body": "b", "basis": "r", "origin": "涂击队百层挑战"}
+    )
+    assert "涂击队百层挑战" in section
+    section2 = feeds._idea_material_section(GID, {"title": "t", "body": "b", "basis": "r"})
+    assert "由头" not in section2
+
+
+def test_make_idea_origin_privacy_blanked_not_dropped(tmp_path) -> None:
+    """origin 含关注成员信息 → 只把 origin 置空，整条构想照样入库（不整条丢）。"""
+    models = FakeModelsQueue(ready=True, replies=[_IDEA_WITH_ORIGIN])
+    store, settings, feeds, *_ = _make_feeds(tmp_path, models=models)
+    with store.tx() as conn:
+        conn.execute(
+            "INSERT INTO focus_members (group_id, user_id, name, note, removed, updated)"
+            " VALUES (?, ?, ?, ?, 0, ?)",
+            (GID, "u1", "阿帆", "他最近在准备考研", NOW),
+        )
+    idea = json.loads(_IDEA_WITH_ORIGIN)
+    idea["idea"]["origin"] = "他最近在准备考研"
+    idea["idea"]["body"] = "整一页资料"
+    idea["idea"]["basis"] = "群里问的人多"
+    models.reply_queue = [json.dumps(idea, ensure_ascii=False)]
+    got = _run(feeds.make_idea(GID))
+    assert isinstance(got, int) and got > 0
+    row = store.read().execute("SELECT origin, body FROM ideas WHERE id=?", (got,)).fetchone()
+    assert row["origin"] == ""
+    assert row["body"] == "整一页资料"
+
+
+def test_make_idea_origin_cleaned(tmp_path) -> None:
+    """由头清洗：≤16 字；带长数字（QQ 号）的整条不要。"""
+    long_origin = "一二三四五六七八九十十一十二十三十四十五十六十七"
+    idea = json.loads(_IDEA_WITH_ORIGIN)
+    idea["idea"]["origin"] = long_origin
+    models = FakeModelsQueue(ready=True, replies=[json.dumps(idea, ensure_ascii=False)])
+    store, settings, feeds, *_ = _make_feeds(tmp_path, models=models)
+    got = _run(feeds.make_idea(GID))
+    row = store.read().execute("SELECT origin FROM ideas WHERE id=?", (got,)).fetchone()
+    assert row["origin"] == long_origin[:16]
+
+    idea2 = json.loads(_IDEA_WITH_ORIGIN)
+    idea2["idea"]["origin"] = "QQ123456789 的手册"
+    models2 = FakeModelsQueue(ready=True, replies=[json.dumps(idea2, ensure_ascii=False)])
+    store2, settings2, feeds2, *_ = _make_feeds(tmp_path / "b", models=models2)
+    got2 = _run(feeds2.make_idea(GID))
+    row2 = store2.read().execute("SELECT origin FROM ideas WHERE id=?", (got2,)).fetchone()
+    assert row2["origin"] == ""

@@ -91,8 +91,8 @@ async def test_feeds_write_posts_uses_soul_when_present(tmp_path: Path) -> None:
     assert item.get("post", {}).get("body") == "b"
 
 
-async def test_feeds_write_posts_falls_back_without_soul(tmp_path: Path) -> None:
-    """SOUL 为空：回落原人设逻辑（host.config）——老行为不能变。"""
+async def test_feeds_write_posts_no_maibot_fallback_without_soul(tmp_path: Path) -> None:
+    """SOUL 为空：不带人设，**不再**回落去读 MaiBot 人格（2026-10-01 用户定：人设只认 SOUL.md）。"""
     from CharTyr_MaiWork.maiwork.feeds import Feeds
 
     store, profiles = _feeds_fixtures(tmp_path)
@@ -107,8 +107,8 @@ async def test_feeds_write_posts_falls_back_without_soul(tmp_path: Path) -> None
     item = {"title": "t", "url": "https://x.com/a", "summary": "s", "kind": "news", "quote": "q"}
     await feeds._write_posts(GID, [item], settings)
     prompt = models.calls[0][1][-1]["content"]
-    assert "你（MaiBot）的人设" in prompt
-    assert "老麻" in prompt
+    assert "你（MaiBot）的人设" not in prompt
+    assert "老麻" not in prompt and "热心肠" not in prompt
 
 
 async def test_feeds_focus_and_score_and_idea_inject_memory(tmp_path: Path) -> None:

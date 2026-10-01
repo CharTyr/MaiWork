@@ -123,6 +123,28 @@ class TestServedGroup:
         assert await intake.handle(msg) == {"action": "continue"}
         assert signals.take() == {}
 
+    @pytest.mark.parametrize(
+        ("raw", "want"),
+        [
+            ("1790000123.5", 1790000123.5),  # 宿主真载荷：字符串（2026-10-01 线上实测漏算安静时长的根因）
+            (1790000123, 1790000123.0),
+            (1790000123.5, 1790000123.5),
+            ("不是数字", 0.0),
+            ("nan", 0.0),
+            ("inf", 0.0),
+            ("-5", 0.0),
+            (True, 0.0),
+            (None, 0.0),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_timestamp_string_from_host_is_parsed(self, raw, want) -> None:
+        intake, signals = _make()
+        msg = hook_message()
+        msg["message"]["timestamp"] = raw
+        assert await intake.handle(msg) == {"action": "continue"}
+        assert signals.last_ts("900000001") == want
+
     @pytest.mark.asyncio
     async def test_bot_own_message_still_counts_for_now(self) -> None:
         # 没配 bot_qq 时无法识别「机器人自己」，消息照样记信号，不能崩

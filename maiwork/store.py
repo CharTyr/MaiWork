@@ -215,6 +215,7 @@ CREATE TABLE IF NOT EXISTS ideas (
     icon TEXT NOT NULL DEFAULT 'bulb',
     title TEXT NOT NULL,
     body TEXT NOT NULL DEFAULT '',
+    origin TEXT NOT NULL DEFAULT '',
     basis TEXT NOT NULL DEFAULT '',
     step TEXT NOT NULL DEFAULT '',
     effort TEXT NOT NULL DEFAULT '',
@@ -854,8 +855,17 @@ def _m_usage_src(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE model_calls ADD COLUMN cache_write INTEGER NOT NULL DEFAULT 0")
 
 
+# 构想「由头」（2026-10 与用户定）：「这个构想接的是群里之前聊过 / 有人说想做的哪件事」——
+# 一个短名词短语（≤16 字、不含人名 / QQ 号），提一嘴和开场白都靠它把话说得像顺口一问
+# （「话说之前大家聊的那个 {origin} 后来怎么样了？」）。想不出 / 含关注成员信息 = 空串。
+def _m_idea_origin(conn: sqlite3.Connection) -> None:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ideas)")}
+    if "origin" not in cols:
+        conn.execute("ALTER TABLE ideas ADD COLUMN origin TEXT NOT NULL DEFAULT ''")
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin]
 
 
 class Store:

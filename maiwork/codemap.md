@@ -60,7 +60,7 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 | `config_file.py` | config.toml 读写层（tomlkit 保注释；写前备份到数据目录；绝不在插件目录建临时文件） |
 | `rules.py` | kv["rules.override"] 网页规则覆盖层 + `effective_settings` 合并 + 字段校验 |
 | `migrations.py` | 启动时一次性迁移（幂等）：数据库旧覆盖层/secrets → config.toml；搜索配置 → 扩展绑定（2026-10 修正：tavily 官方 MCP 工具名是下划线版 tavily_search/tavily_extract，老的连字符版只存在于旧文档） |
-| `store.py` | SQLite 存储：连接、表迁移（_m1 起一串；`_m_news_src` 加 src_query/src_provider 撒网可追溯、`_m_news_followup` 加 followup 后续进展列；news_feedback 表不走迁移清单，由模块按库对象标记惰性建）、事务、kv/secrets/events 助手 |
+| `store.py` | SQLite 存储：连接、表迁移（_m1 起一串；`_m_news_src` 加 src_query/src_provider 撒网可追溯、`_m_news_followup` 加 followup 后续进展列、`_m_idea_origin` 加 ideas.origin 构想由头；news_feedback 表不走迁移清单，由模块按库对象标记惰性建）、事务、kv/secrets/events 助手 |
 | `clock.py` | epoch/北京时间换算、睡觉时段判断（存库一律 epoch 秒） |
 | `onboarding.py` | 首次安装引导状态（kv["onboarding"]） |
 
@@ -123,7 +123,7 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 ### 资讯与构想
 | 文件 | 职责 |
 |---|---|
-| `feeds.py` | 资讯/构想流水线：关注点（`_plan_focus`，提示词带口味小结/近 14 天反馈/资讯评价/饱和话题/历史方向）→ 找候选 → 三道门槛（打分时口味小结当相关度/值得聊参考；写帖子时当写法/角度参考但不许编事实）→ 写帖子 → 入库。找候选两条路：老单子 agent `_collect`；每群开关的两段式 `_collect_two_phase`（kv["feeds.two_phase"] 名单，`two_phase_on`/`set_two_phase`，默认关）：①一个只用 web_search 的撒网子 agent（`_discover_brief`，候选程序从 `discovery` 登记簿 `close_run` 拿，不信交回）→ ②`_floor_searches` 代码保底补搜（饿着 = 问 <2 种问法或候选 <6 条的方向；主家 + broad 多家各补；需要一手来源的方向主家多补一次（当前调用参数相同））→ ③`_prefilter` 不调模型粗筛（非公开链接/重复/首页栏目页/屏蔽/太旧/标题近似；方向均衡每方向 ≤40%，留 ≤24 条，排序看 7 天内发布日期 + 优质来源先验分 `source_prior`）→ ④`_pick` 主模型一次挑 8~12 条带一句话理由（hook；失败回落前 10 条；提示词避开 SEO 站/采购指南/聚合站）→ ⑤`_verify_batch` 最多 3 个只用 fetch_page 的核验子 agent 并发打开核对，回来的条目接回 src_query/src_provider（漏斗 funnel：各环节计数/每方向/每家搜索/耗时/预筛拒因排行，随批次统计 kv["feeds.batch_stats.<id>"] 落库，网页「这一轮怎么找的」用）|
+| `feeds.py` | 资讯/构想流水线：关注点（`_plan_focus`，提示词带口味小结/近 14 天反馈/资讯评价/饱和话题/历史方向）→ 找候选 → 三道门槛（打分时口味小结当相关度/值得聊参考；写帖子时当写法/角度参考但不许编事实）→ 写帖子 → 入库（构想还要一个「由头」`origin`：接的是群里之前聊过的哪件事，`clean_idea_origin` 清洗 ≤16 字、无 QQ 号，入库前过隐私闸、命中只置空 origin，进话题候选池给开场白用）。找候选两条路：老单子 agent `_collect`；每群开关的两段式 `_collect_two_phase`（kv["feeds.two_phase"] 名单，`two_phase_on`/`set_two_phase`，默认关）：①一个只用 web_search 的撒网子 agent（`_discover_brief`，候选程序从 `discovery` 登记簿 `close_run` 拿，不信交回）→ ②`_floor_searches` 代码保底补搜（饿着 = 问 <2 种问法或候选 <6 条的方向；主家 + broad 多家各补；需要一手来源的方向主家多补一次（当前调用参数相同））→ ③`_prefilter` 不调模型粗筛（非公开链接/重复/首页栏目页/屏蔽/太旧/标题近似；方向均衡每方向 ≤40%，留 ≤24 条，排序看 7 天内发布日期 + 优质来源先验分 `source_prior`）→ ④`_pick` 主模型一次挑 8~12 条带一句话理由（hook；失败回落前 10 条；提示词避开 SEO 站/采购指南/聚合站）→ ⑤`_verify_batch` 最多 3 个只用 fetch_page 的核验子 agent 并发打开核对，回来的条目接回 src_query/src_provider（漏斗 funnel：各环节计数/每方向/每家搜索/耗时/预筛拒因排行，随批次统计 kv["feeds.batch_stats.<id>"] 落库，网页「这一轮怎么找的」用）|
 | `discovery.py` | 撒网登记簿（两段式第一阶段）：`open_run(task_id)` 开本 / `record(...)` 由 web_search handler 顺手记 / `close_run` 取走关掉；按规范化链接去重，同链留先见、别的问法攒进 queries；没开着的 task_id 忽略 |
 | `news_feedback.py` | 自动收的资讯反馈（显式反馈近零的实测后加）：表 news_feedback（`ensure_schema`/`_ensure` 按库对象标记惰性建，不走 store 迁移清单，老库直接用），(kind,item_id,actor,message_id) 唯一幂等；三种——`CardIndex.on_message`（回复/引用资讯卡片，卡片清单每群 60 秒缓存）、`click`（网页 /go/<条目> 点开原文，302 到库里存的原链接；同浏览器同条一天一次、每分钟超 30 次不记）、`mention_round`（群里接着聊：关键词命中候选交 judge 判，判过的 kv 记 7 天，每轮每群最多 5 条/30 句）；actor 一律「群号:账号」sha256 前 16 位；沉默不记负分；`summary` 汇总按条目/总数 |
 | `feedback_jobs.py` | 每小时一轮的后台活（app `_feedback_round` 调；`due` 判断）：①mention_round 用主模型当 judge（feeds.mention_judge，json_mode {"yes":[...]}）②`taste.refresh` 每天最多一次；模型没配好就只跳过要模型的部分 |
@@ -134,20 +134,21 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 | `news_rating.py` | 群友评价资讯（理由+一句话；汇总进下一轮找资讯提示词） |
 | `news_viz.py` | 资讯图解：挑数据多的资讯让子 agent 写纯 CSS HTML 小图（程序严格校验） |
 | `news_card.py` | 资讯卡片 HTML/PNG 渲染（playwright 截图；cover 配图补齐） |
-| `card_push.py` | 往群里发的两种小推送：资讯卡片（CardPush；没封面但有图解的条目把图解截图画进卡片）/ 构想提一嘴（IdeaMention），每群开关默认关；Telegram 没有真 @ 段，发消息带 `at_name` 让 @ 退成正文名字 |
+| `card_push.py` | 往群里发的两种小推送：资讯卡片（CardPush；没封面但有图解的条目把图解截图画进卡片）/ 构想提一嘴（IdeaMention：按人设**关心式问一句**「话说之前那个……怎么样了？要我帮忙吗？」、≤60 字、结尾问句、不推销；有 `ideas.origin` 就用由头，没有就把标题剥掉「我可以帮…」的头；过 `_leaky` / `_pitchy`（`_PITCH_WORDS`）双词表 + `_template` 兜底），每群开关默认关；Telegram 没有真 @ 段，发消息带 `at_name` 让 @ 退成正文名字 |
 | `update_check.py` | 查 GitHub 最新版本提醒（只提醒不自动更新） |
 
 ### 开话题与交付
 | 文件 | 职责 |
 |---|---|
-| `topics.py` | 冷场开话题：代码门槛 → Jev 判 → 主模型写开场白；candidate 池/follow_up |
+| `topics.py` | 冷场开话题：代码门槛 → Jev 判 → 主模型写开场白（人设走 `voice.persona`，只认 SOUL；自我介绍 / 寒暄 → `rejected:self_intro`；news 候选「随口一提」，idea 候选**关心式问法**，按候选 ref_id 从 `ideas` 读 origin/title/body，不读 basis）；candidate 池/follow_up |
+| `voice.py` | 开口时的人设：`persona(identity) → Persona`（只读 identity 的 main SOUL，不回退读 MaiBot 人格）；`Persona.section()` = SOUL + 「不自我介绍 / 不寒暄、直接说事」规矩，`system()`；`is_self_intro(text)` 生成结果护栏。读不到一律当空、绝不抛。开场白和构想提一嘴共用 |
 | `delivery.py` | Mentions 可提起清单（inject 进 planner 请求）、TopicMatcher 关键词接话、Pushes 推送节制 |
 | `outbox.py` | 发件箱（状态机 pending/sending/sent/uncertain/failed，按 key 去重，recover 不重放）、任务交付 Delivery（view/file/text 三渠道+回落）、report_error |
 | `herenow.py` | here.now 匿名发布客户端（publish/upload/finalize 三步） |
 | `scheduler.py` | 什么时辰干什么事（资讯时段偏移/构想/提目标窗口；只读 kv+groups，不调模型） |
 | `commands.py` | /mw 群指令（纯代码固定回复：状态/网页/批准/取消/领取/帮助） |
 | `identity.py` | 身份与工作记忆：SOUL.md/AGENTS.md/MEMORY.md/memory/<群号>.md，prompt_block 注入，remember 工具 |
-| `personal.py` | 关注成员个人向资讯/构想（第二人称写法；绝不进群视图） |
+| `personal.py` | 关注成员个人向资讯/构想（第二人称写法；绝不能进群视图）；个人向构想的由头 `origin` = **他自己在群里说过想做的那件事**，入库前过 privacy.scrub、命中只置空 origin |
 
 #### 子目录
 | 目录 | 职责 | 详图 |

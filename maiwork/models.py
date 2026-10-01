@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import email.utils
+import hashlib
 import json
 import logging
 import random
@@ -56,7 +57,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import timezone
 from typing import Any, Callable, Literal
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -87,6 +88,7 @@ _COOLDOWN_CAP_S = 60.0      # 退避封顶
 _COOLDOWN_JITTER = 0.2      # 退避 ±20% 抖动
 _RPM_WINDOW_S = 60.0        # 每分钟上限的滑动窗口
 _MAX_CONCURRENCY_DEFAULT = 2  # 每个端点同一时刻最多几个在途请求
+_VERIFY_MAX_TOOL_CALLS = 8  # 验证时一次回答里允许的工具调用上限（超出直接不算工具通过）
 # 思考强度合法档位（与 config.py 的 EFFORT_LEVELS 一致；独立拷贝防导入环）
 _EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
@@ -374,6 +376,7 @@ class _Candidate:
     context_window: int
     max_tokens: int        # 这个条目的默认输出上限（调用方没传用它）
     efforts: tuple = ()    # 条目 efforts（agent profile 的强度只在它勾了才发）
+    entry_id: str = ""     # 模型库条目 id（验证记录按它绑定；旧四槽链是 ""）
 
 
 
@@ -1218,6 +1221,7 @@ class Models:
                     efforts=tuple(
                         str(v) for v in (getattr(entry, "efforts", ()) or ()) if str(v) in _EFFORT_LEVELS
                     ),
+                    entry_id=entry_id,
                 )
             )
         if not out and not model_list and old.any_value():
@@ -1448,6 +1452,137 @@ class Models:
         },
     }
 
+    # ------------------------------------------------------------------
+    # 验证记录绑定（docs/14 R03）：验证结果绑定「条目 + 配置版本」，不按名字串
+    # ------------------------------------------------------------------
+
+    def _stamp_material(
+        self, entry_id: str, ep: Any, entry: Any, *, max_tokens: int | None = None
+    ) -> dict[str, Any] | None:
+        """把身份/能力相关字段收成签名的料（密钥只放原文进函数，出函数前已经哈希）。"""
+        service_model = str(getattr(entry, "model", "") or "").strip()
+        base_url = str(getattr(ep, "base_url", "") or "").strip()
+        api_key = str(getattr(ep, "api_key", "") or "")
+        if not service_model or not base_url or not api_key:
+            return None
+        parts = urlsplit(base_url)
+        credentials, separator, host = parts.netloc.rpartition("@")
+        netloc = (credentials + separator + host.lower()) if separator else parts.netloc.lower()
+        normalized_url = urlunsplit((parts.scheme.lower(), netloc, parts.path.rstrip("/"), parts.query, parts.fragment))
+        if max_tokens is None:
+            mt = int(getattr(entry, "max_tokens", 32768) or 32768)
+        else:
+            try:
+                mt = int(max_tokens)
+            except (TypeError, ValueError):
+                return None
+            if mt <= 0:
+                return None
+        efforts = sorted(
+            str(v) for v in (getattr(entry, "efforts", ()) or ()) if str(v) in _EFFORT_LEVELS
+        )
+        return {
+            "v": 1,
+            "entry_id": str(entry_id or ""),
+            "endpoint_id": str(getattr(ep, "id", "") or ""),
+            "service_model": service_model,
+            "protocol": str(getattr(ep, "protocol", "openai") or "openai").strip().lower(),
+            "base_url": normalized_url,
+            "key_hash": hashlib.sha256(api_key.encode("utf-8")).hexdigest(),
+            "context_window": int(getattr(entry, "context_window", 128000) or 128000),
+            "max_tokens": mt,
+            "efforts": efforts,
+            "vision": bool(getattr(entry, "vision", False)),
+        }
+
+    def verification_stamp(
+        self, entry_id: str, *, max_tokens: int | None = None, _caps: tuple | None = None
+    ) -> str:
+        """条目「身份 + 能力相关配置」的稳定签名（sha256 十六进制，64 字符）。
+
+        签名料：条目 id、端点 id、服务模型、协议、规范化 base_url、密钥哈希、
+        上下文窗口、最大输出、efforts/vision。显示名（name）不进签名——改名字不用重验。
+        密钥只以哈希进签名，返回值是固定长度的十六进制摘要，绝不含密钥或明文地址。
+        max_tokens=None 用条目当前值；调用方显式传（降档建议值）以调用方为准。
+        条目不存在 / 端点缺地址密钥 / 上限非法 → ""（签不出）。
+        _caps：内部口，verify_entry 在请求开始时捕获的 (entry, ep)，防请求结束后
+        读到被热更新换掉的新配置（并发换代不许误绑定）。
+        """
+        if _caps is not None:
+            entry, ep = _caps
+        else:
+            settings = self._get_settings()
+            entry = next(
+                (m for m in (getattr(settings, "model_list", ()) or ())
+                 if str(getattr(m, "id", "")) == str(entry_id)),
+                None,
+            )
+            if entry is None:
+                return ""
+            ep = next(
+                (e for e in (getattr(settings, "endpoints", ()) or ())
+                 if str(getattr(e, "id", "")) == str(getattr(entry, "endpoint", ""))),
+                None,
+            )
+            if ep is None:
+                return ""
+        material = self._stamp_material(entry_id, ep, entry, max_tokens=max_tokens)
+        if material is None:
+            return ""
+        return hashlib.sha256(
+            json.dumps(material, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    def verification_for(self, kind: str = "main") -> dict[str, Any] | None:
+        """这个岗位「真实首选候选」的验证记录；只有绑定当前配置版本才返回，否则 None。
+
+        - 候选链照旧读 `_current_candidates`（岗位没选模型 → 主模型兜底；旧四槽链
+          entry_id 是 ""，没法绑定 → None）；
+        - 记录读 kv["models.verified.<条目id>"]：缺签名（旧安装按名字存的老记录）→
+          None（未验证，既不声明已验证、也不把旧记录当成「当前配置的明确失败」）；
+        - requested_fingerprint 与当前配置签名不符（换了地址/协议/密钥/条目/上限…）→ None；
+        - 降档通过但建议值还没存进配置（requested 相符、fingerprint 不同且
+          suggested_max_tokens > 0）→ 返回派生记录 ok=False，error 明确
+          「建议最大输出尚未保存」——绝不声称当前配置已通过；
+        - 存好建议值后 fingerprint 与当前签名一致 → 原记录自动有效。
+        返回的是记录拷贝，调用方改不坏库里那份。
+        """
+        try:
+            cands = self._current_candidates(str(kind or "").strip() or "main")
+        except Exception:
+            return None
+        if not cands:
+            return None
+        cand = cands[0]
+        entry_id = str(getattr(cand, "entry_id", "") or "")
+        if not entry_id:
+            return None  # 旧四槽链：没有条目 id 可绑定
+        stamp = self.verification_stamp(entry_id)
+        if not stamp:
+            return None
+        try:
+            rec = self._store.kv_get(f"models.verified.{entry_id}", None)
+        except Exception:
+            return None
+        if not isinstance(rec, dict):
+            return None
+        req_fp = str(rec.get("requested_fingerprint") or "")
+        fp = str(rec.get("fingerprint") or "")
+        if not req_fp and not fp:
+            return None  # 旧格式记录（按名字存的）：不算数
+        suggested = int(rec.get("suggested_max_tokens") or 0)
+        if fp != stamp:
+            if req_fp == stamp and suggested > 0:
+                derived = dict(rec)
+                derived["ok"] = False
+                derived["error"] = (
+                    f"验证时这个模型只接受更小的最大输出（建议 {suggested}），"
+                    "但建议值尚未保存进配置，当前配置不算验证通过"
+                )
+                return derived
+            return None  # 配置换过：旧记录绑定的是旧版本
+        return dict(rec)
+
     async def verify_entry(self, entry_id: str, *, timeout: float = 60) -> dict[str, Any]:
         """验证模型库里的一个条目真能干活：一次短回答 + 一次无副作用工具往返（最多 3 次请求，
         外加最多 2 次「最大输出」降档重试）。用条目真实的 max_tokens 发（实际干活就这么发），
@@ -1460,8 +1595,10 @@ class Models:
         """
         out: dict[str, Any] = {
             "ok": False, "chat_ok": False, "tools_ok": False, "error": "", "note": "",
-            "suggested_max_tokens": 0, "calls": 0,
+            "suggested_max_tokens": 0, "calls": 0, "fingerprint": "", "requested_fingerprint": "",
         }
+        # 身份/配置在请求开始时一次捕获（docs/14 R03）：验证进行中被热更新换掉，
+        # 结果里的签名仍然属于「开始时的那份配置」，不在请求结束后读新配置
         settings = self._get_settings()
         entry = next(
             (m for m in (getattr(settings, "model_list", ()) or ()) if str(getattr(m, "id", "")) == str(entry_id)),
@@ -1479,6 +1616,8 @@ class Models:
             out["error"] = "这个模型挂的端点不在了，或者还没填地址 / 密钥"
             return out
         max_tokens = int(getattr(entry, "max_tokens", 32768) or 32768)
+        out["requested_fingerprint"] = self.verification_stamp(entry_id, _caps=(entry, ep))
+        out["fingerprint"] = out["requested_fingerprint"]
 
         def cand(mt: int) -> _Candidate:
             return _Candidate(
@@ -1486,6 +1625,7 @@ class Models:
                 label=str(getattr(entry, "name", "") or getattr(entry, "model", "")),
                 endpoint=ep, context_window=int(getattr(entry, "context_window", 128000) or 128000),
                 max_tokens=mt,
+                entry_id=str(entry_id),
             )
 
         async def call(messages: list[dict], mt: int, tools: list[dict] | None = None) -> ChatResult:
@@ -1509,8 +1649,9 @@ class Models:
                     continue
                 out["error"] = msg
                 return out
-            # 回了 200 但一个字都没有（真实中转站上某些「格式 × 模型」组合就这样）：不算能回答
-            if not str(r0.text or "").strip() and not r0.tool_calls:
+            # 回了 200 但一个字都没有（真实中转站上某些「格式 × 模型」组合就这样）：
+            # 不算能回答——哪怕带 tool_calls 也一样，短答不是工具测试（docs/14 R04）
+            if not str(r0.text or "").strip():
                 out["error"] = (
                     "端点回了「成功」，但回答是空的（一个字都没有）：这个接口格式和模型的组合在这个端点上用不了，"
                     "换一种接口格式或换个模型再试"
@@ -1522,9 +1663,13 @@ class Models:
         if used_mt != max_tokens:
             out["suggested_max_tokens"] = used_mt
             out["note"] = f"这个模型不接受 {max_tokens} 的最大输出，用 {used_mt} 能正常回答，建议把「最大输出」改成 {used_mt}"
+        # fingerprint = 实际验证通过的输出上限的签名（降档过 ≠ 当前配置的签名，靠它认出
+        # 「8192 能跑但配置还写着 32768」——verification_for 会如实派生成「建议值尚未保存」）
+        out["fingerprint"] = self.verification_stamp(entry_id, max_tokens=used_mt, _caps=(entry, ep))
         out["ok"] = True
 
-        # ② 工具往返：要它调空工具 → 把结果递回去 → 再回一句
+        # ② 工具往返（docs/14 R04：不再只看「有 tool_calls」就放行）：
+        # 要它调我们提供的空工具 → 校验调用合法 → 把结果递回去 → 必须得到非空最终答复
         try:
             ask = [{"role": "user", "content": "这是工具连通性测试：请调用 maiwork_ping 工具，word 填 hi。"}]
             r1 = await call(ask, used_mt, [self._VERIFY_TOOL])
@@ -1532,13 +1677,58 @@ class Models:
             if not calls:
                 out["note"] = _join_note(out["note"], "这个模型没调用工具：主模型对话能用，但子 agent 干活要靠工具，建议换一个支持工具调用的模型")
                 return out
-            tc = calls[0]
-            tc_id = str(tc.get("id") or "call_0")
+            if len(calls) > _VERIFY_MAX_TOOL_CALLS:
+                out["note"] = _join_note(
+                    out["note"],
+                    f"这个模型一次要调 {len(calls)} 个工具（太多，不受控）：工具验证不算通过，子 agent 干活会受限",
+                )
+                return out
+            # 所有调用都必须符合给定空工具；允许合法并行调用，不借一项合法掩盖非法项。
+            invalid: list[str] = []
+            ids: set[str] = set()
+            for tc in calls:
+                fn = tc.get("function") if isinstance(tc, dict) else None
+                if not isinstance(fn, dict) or fn.get("name") != "maiwork_ping":
+                    invalid.append("调用了未提供的工具")
+                    continue
+                tc_id = str(tc.get("id") or "")
+                if not tc_id or tc_id in ids:
+                    invalid.append("工具调用标识缺失或重复")
+                    continue
+                ids.add(tc_id)
+                try:
+                    args = json.loads(str(fn.get("arguments") or ""))
+                except (TypeError, ValueError):
+                    invalid.append("maiwork_ping 参数不是合法 JSON")
+                    continue
+                if not isinstance(args, dict) or not isinstance(args.get("word"), str):
+                    invalid.append("maiwork_ping 参数里 word 必须是字符串")
+            if invalid:
+                detail = "、".join(dict.fromkeys(invalid))
+                out["note"] = _join_note(
+                    out["note"],
+                    f"这个模型没有按要求调用提供的 maiwork_ping 工具（{detail}）：工具验证不算通过，子 agent 干活会受限",
+                )
+                return out
+            results = [{"role": "tool", "tool_call_id": str(tc["id"]), "content": "pong"} for tc in calls]
             follow = ask + [
-                {"role": "assistant", "content": r1.text or "", "tool_calls": [tc]},
-                {"role": "tool", "tool_call_id": tc_id, "content": "pong"},
+                {"role": "assistant", "content": r1.text or "", "tool_calls": calls},
+                *results,
             ]
-            await call(follow, used_mt, [self._VERIFY_TOOL])
+            r2 = await call(follow, used_mt, [self._VERIFY_TOOL])
+            # 工具结果递回去之后：必须回一句非空的最终答复；空文本或继续调工具都不算过
+            if r2.tool_calls:
+                out["note"] = _join_note(
+                    out["note"],
+                    "工具结果递回去后它还要继续调工具，没有给出最终答复：工具验证不算通过，子 agent 干活会受限",
+                )
+                return out
+            if not str(r2.text or "").strip():
+                out["note"] = _join_note(
+                    out["note"],
+                    "工具结果递回去后它回了一句空答复（200 但一个字都没有）：工具验证不算通过，子 agent 干活会受限",
+                )
+                return out
             out["tools_ok"] = True
         except ModelError as e:
             out["note"] = _join_note(out["note"], f"工具调用没走通（{e.message}）：子 agent 干活会受限")

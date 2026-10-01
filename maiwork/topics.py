@@ -2,25 +2,32 @@
 
 第 1 层（代码，不调模型）：睡觉时段、开关、候选池、每日上限、推送额度、
 最小间隔（含退避倍数）、安静时长（≥ max(3×usual_gap, 20 分钟)）、
-这个钟点平时有人（usual_gap ≤ 30 分钟）。
+这个钟点平时有人（usual_gap ≤ 30 分钟）、夜里的安静不算冷场（醒来后要有人说过话）、
+安静超过 90 分钟不开。
 
-第 2 层（Jev）：ok ≥ 0.6 且 reason == fine 且至少一条 fit ≥ 0.5 → 开。
+第 2 层（Jev）：state 带时间（安静了多少分钟、平时多久一条、每条消息几分钟前），
+过滤掉图片/事件/空合并转发这些杂音；ok ≥ 0.6 且 reason == fine 且至少一条 fit ≥ 0.5 → 开。
 Jev 不可用 → 这次不开（不写 topic_log）。
+
+同一段冷场（最近一条消息时刻 + 候选 id 列表算指纹）判过一次后 30 分钟内不重复问，
+指纹变了或满 30 分钟才重问（2026-10-01 线上实测：一天判 343 次、开 0 次）。
 
 开：主模型按人设写开场白，speaker="maiwork" 走 send_text，
 speaker="maibot" 走 proactive_trigger。10 分钟后 follow_up。
 播报腔整条作废。每发出一次压缩候选、写 news_items.replies、
-加进 mentions、写 topic_log。
+加进 mentions、写 topic_log（jev 里带真实分数和卡在哪一层）。
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from . import clock
+from . import clock, voice
 from .config import Settings
 from .delivery import Mentions, Pushes
 from .host import Host, HostError, Msg
@@ -52,9 +59,32 @@ _MIN_QUIET_S = 20 * 60  # 20 分钟
 # usual_gap 上限（秒）：>30 分钟 视为「这个钟点平时没人」
 _USUAL_GAP_MAX_S = 30 * 60
 
+# 安静太久（秒）：超过这个时长不开（群已经凉透了，这时候开对不上节奏；
+# 也避免一小时前的判断被当成本刻的情况反复问 Jev）
+_MAX_QUIET_S = 90 * 60
+
+# 同一段冷场重复判断的最小间隔（秒）：指纹没变时，判过一次后这么久内不重问 Jev
+_REJUDGE_S = 30 * 60
+
 # Jev 判定阈值
 _OK_THRESHOLD = 0.6
 _FIT_THRESHOLD = 0.5
+
+# 读给 Jev 看的群消息：多读一些（可能有图片/事件/合并转发占位），过滤后留最近 20 条
+_MSG_SCAN_LIMIT = 60
+_MSG_KEEP = 20
+
+# 候选：多取一些按画像兴趣排序，再取前 5 条
+_CANDIDATE_SCAN = 30
+
+# 算「和群画像兴趣对得上」时看的画像类别（兴趣、最近在聊、在做的事）
+_INTEREST_CATEGORIES = ("interest", "recent", "ongoing")
+
+# 无描述的图片 / 表情包：这些不是「群里在说话」
+_PLAIN_NOISE = frozenset(("[图片]", "[image]", "[表情包]"))
+
+# 合并转发的格式骨架：包装词、方括号、名字、冒号、破折号、空白
+_FORWARD_SKELETON = re.compile(r"合并转发消息|【[^】]*】|[\[\]【】:：\-—–\s]")
 
 # 判断态（topic_log.jev 字段 JSON）的 reason 中文化映射
 _REASON_ZH = {
@@ -63,6 +93,80 @@ _REASON_ZH = {
     "open_question": "有问题还没人回",
     "mood": "气氛不对",
 }
+
+
+# ---------------------------------------------------------------------------
+# 纯函数辅助（不读库、不调模型，方便单测）
+# ---------------------------------------------------------------------------
+
+
+def _is_noise(text: Any) -> bool:
+    """这条群消息值不值得给 Jev 看（纯函数）。
+
+    2026-10-01 线上实测：给 Jev 的 20 条里很多是这些占位，模型把「刷了个表情包」
+    当成群里正在聊天，判出「气氛不对」：
+    - 去空白后为空；
+    - 恰好是无描述的图片 / 表情包（"[图片]" / "[image]" / "[表情包]"）；
+    - 事件行（"[事件-群消息撤回] …" / "[事件-群消息表情回应] …"）；
+    - 合并转发，但去掉格式骨架（"【合并转发消息:"、"-- 【名字】:"、"】"）后没剩实际文字。
+    带描述的表情包（"[表情包: 无语,呆滞]"）和 "[视频]" 保留——那是真实内容。
+    """
+    s = str(text or "").strip()
+    if not s:
+        return True
+    if s.lower() in _PLAIN_NOISE:
+        return True
+    if s.startswith("[事件-"):
+        return True
+    if "【合并转发消息" in s:
+        return not _FORWARD_SKELETON.sub("", s)
+    return False
+
+
+def _last_wakeup_ts(now: float, end_min: int) -> float:
+    """最近一次睡觉时段结束的时刻（北京时间今天或昨天那个钟点）。
+
+    跨午夜（"23:00-08:00"）和当天（"00:00-07:00"）都适用：结束钟点每天固定，
+    取「不晚于 now 的那一个」。北京时间固定 UTC+8、没有夏令时，直接算即可。
+    """
+    em = int(end_min) % 1440
+    t = clock.bj(float(now)).replace(hour=em // 60, minute=em % 60, second=0, microsecond=0)
+    if t.timestamp() > float(now):
+        t = t - timedelta(days=1)
+    return float(t.timestamp())
+
+
+def _fingerprint(quiet_ts: float, candidates: List[dict]) -> dict:
+    """同一段冷场的指纹：最近一条群消息的时刻 + 候选 id 排序后的列表。
+
+    两个都没变才算「情况没变」（候选的排序是算出来的，不算变化，所以 id 先排序）。
+    """
+    return {
+        "quiet_ts": float(quiet_ts),
+        "cands": sorted(int(c["id"]) for c in candidates),
+    }
+
+
+def _bigrams(text: str) -> set:
+    """去空白、转小写后的字符二元组（中文也适用；太短就整串当一个）。"""
+    s = re.sub(r"\s+", "", str(text or "").lower())
+    if len(s) < 2:
+        return {s} if s else set()
+    return {s[i:i + 2] for i in range(len(s) - 1)}
+
+
+def _interest_score(cand: dict, interests: List[str]) -> float:
+    """候选 title+brief 的二元组有多大比例出现在画像兴趣条目里（0~1，纯代码）。
+
+    和 delivery.TopicMatcher 的关键词命中思路一致（都是「≥2 字符的重合」），
+    只是方向反过来：那边是群友聊起来时找候选，这里是给候选找画像兴趣。
+    """
+    blob = "".join(interests)
+    grams = _bigrams(f"{cand.get('title') or ''}{cand.get('brief') or ''}")
+    if not grams:
+        return 0.0
+    hit = sum(1 for g in grams if g in blob)
+    return hit / float(len(grams))
 
 
 class Topics:
@@ -79,7 +183,7 @@ class Topics:
         pushes: Pushes,
         get_settings: Callable[[], Settings],
         signals: Any,  # intake.Signals，测试里用 SignalsStub（含 last_ts / session_id）
-        identity: Any = None,  # identity.py（开场白注入 SOUL；None 走老的人设逻辑）
+        identity: Any = None,  # identity.py（开场白人设只认 SOUL；None 就是没人设，不回退读 MaiBot 人格）
     ) -> None:
         self._store = store
         self._host = host
@@ -217,6 +321,17 @@ class Topics:
         group_ts = float(group_row["last_msg_ts"]) if group_row is not None else 0.0
         quiet_ts = max(signal_ts, group_ts)
         quiet_s = float(now) - quiet_ts if quiet_ts > 0 else 0.0
+
+        # 7a) 夜里的安静不算冷场：最近一条消息早于最近一次睡觉时段结束
+        #     （今天或昨天那个结束钟点）→ 醒来后还没人说话，不判。
+        #     线上实测：07:00 一到就把前一晚的安静算成冷场，立刻开始判。
+        if quiet_ts > 0 and s != e and quiet_ts < _last_wakeup_ts(float(now), e):
+            return "skip:no_activity_since_wakeup"
+
+        # 7b) 安静太久（>90 分钟）→ 不开（群已经凉透了，这时候开对不上节奏）
+        if quiet_s > _MAX_QUIET_S:
+            return "skip:too_long_quiet"
+
         if usual_gap is None:
             # 这个钟点平时没人 → 不开
             return "skip:no_usual_audience"
@@ -230,41 +345,78 @@ class Topics:
         if not self._jev.available():
             return "skip:jev_unavailable"
 
-        # 9) 读最近 20 条消息 + 候选（最多 5 条）
-        msgs: List[Msg] = []
-        sid = self._session_id_for(gid)
-        if sid:
-            try:
-                msgs = await self._host.messages(sid, now - 3600.0 * 6, now, 20)
-            except HostError:
-                msgs = []  # 读不到也照样判
+        # 9) 候选（未过期未用；按和群画像兴趣的对得上程度排序后取 5 条）
         candidates = self._list_candidates(gid, now, limit=5)
         if not candidates:
             return "skip:no_candidate"
 
-        # 10) 问 Jev
+        # 9a) 同一段冷场不重复问 Jev：指纹 =（最近一条消息时刻, 候选 id 列表）。
+        #     指纹没变且上次真判过不到 _REJUDGE_S → 输入几乎一样，问了也是同一个答案，
+        #     白花 Jev 调用、白写重复日志（线上实测：一段冷场里每 30 秒问一次）。
+        #     满了 _REJUDGE_S 也重问，让「有问题还没人回」这类判断随时间过期。
+        fp = _fingerprint(quiet_ts, candidates)
+        judged = self._store.kv_get(f"topics.judged.{gid}", default=None)
+        if isinstance(judged, dict) and judged.get("fingerprint") == fp:
+            age = float(now) - float(judged.get("ts") or 0.0)
+            if 0.0 <= age < _REJUDGE_S:
+                return "skip:same_as_last"
+
+        # 9b) 读最近消息：多读一些（60 条），滤掉杂音后留最近 20 条给 Jev
+        msgs: List[Msg] = []
+        sid = self._session_id_for(gid)
+        if sid:
+            try:
+                raw_msgs = await self._host.messages(sid, now - 3600.0 * 6, now, _MSG_SCAN_LIMIT)
+            except HostError:
+                raw_msgs = []  # 读不到也照样判
+            msgs = [m for m in raw_msgs if not _is_noise(m.text)][-_MSG_KEEP:]
+
+        # 10) 问 Jev（把「安静了多久、平时多久一条、每条消息几分钟前」写进 state / 问题里，
+        #     不然 Jev 只看到一堆没时间的消息，会把 50 分钟前的问题当刚提的）
+        quiet_minutes = int(quiet_s // 60)
+        usual_gap_minutes = round(float(usual_gap) / 60.0, 1)
         questions: Dict[str, Any] = {
-            "ok": {"type": "noul", "instructions": "群里现在适合抛出一个新话题吗？"},
+            "ok": {
+                "type": "noul",
+                "instructions": (
+                    f"群里已经安静了 {quiet_minutes} 分钟"
+                    f"（平时这个点大约 {usual_gap_minutes} 分钟一条）。现在抛出一个新话题合适吗？"
+                ),
+            },
             "reason": {
                 "type": "choice",
                 "instructions": "现在不适合开新话题的原因？选一个最贴切的。",
                 "criteria": {
                     "fine": "可以开",
                     "left": "人都走了，没人会接",
-                    "open_question": "有问题还没人回，不适合岔开",
+                    "open_question": (
+                        "最近有人提的问题还没人回、而且问题还不算太久"
+                        "（看每条消息的 minutes_ago，太久的就不算「还没人回」了），不适合岔开"
+                    ),
                     "mood": "气氛不对（争执、严肃事），再说就不合时宜",
                 },
             },
         }
         for i, cand in enumerate(candidates):
-            questions[f"fit_{i}"] = {
-                "type": "noul",
-                "instructions": f"候选{i}能不能自然接上最近的聊天、这个群会不会感兴趣？",
-            }
+            if str(cand.get("kind") or "") == "idea":
+                # 构想类候选是「回头问一句群里之前聊过的事、问大家要不要帮忙」
+                instr = (
+                    f"候选{i} 是回头问一句群里之前聊过的事、问大家要不要帮忙："
+                    "能自然接上最近的聊天吗、大家会愿意接吗？"
+                )
+            else:
+                instr = f"候选{i}能不能自然接上最近的聊天、这个群会不会感兴趣？"
+            questions[f"fit_{i}"] = {"type": "noul", "instructions": instr}
         state = {
+            "quiet_minutes": quiet_minutes,
+            "usual_gap_minutes": usual_gap_minutes,
             "messages": [
-                {"speaker": "BOT" if m.is_bot else m.user_name, "text": m.text}
-                for m in msgs[-20:]
+                {
+                    "speaker": "BOT" if m.is_bot else m.user_name,
+                    "text": m.text,
+                    "minutes_ago": int(max(0.0, float(now) - float(m.ts)) // 60),
+                }
+                for m in msgs
             ],
             "candidates": [
                 {"title": cand["title"], "brief": cand["brief"], "link": cand["link"]}
@@ -276,6 +428,14 @@ class Topics:
         )
         if answers is None:
             return "skip:jev_unavailable"
+
+        # Jev 真答了才记指纹：没答（超时/熔断）下一轮照问。
+        with self._store.tx() as conn:
+            self._store.kv_set(
+                conn,
+                f"topics.judged.{gid}",
+                {"fingerprint": fp, "ts": float(now)},
+            )
 
         # 11) 判定（Jev 判了，不管开不开都写 topic_log）
         ok_p = float(answers.get("ok", 0.0))
@@ -289,6 +449,8 @@ class Topics:
         # 排序：fit 高的优先
         fit_arr.sort(key=lambda t: t[1], reverse=True)
         pass_judge = ok_p >= _OK_THRESHOLD and reason_label == "fine"
+        fit_best = float(fit_arr[0][1]) if fit_arr else None
+        fit_title = str(candidates[fit_arr[0][0]]["title"]) if fit_arr else ""
 
         pick: Optional[Dict[str, Any]] = None
         candidate_idx: Optional[int] = None
@@ -314,6 +476,10 @@ class Topics:
             pick=pick,
             answers=answers,
             questions=questions,
+            quiet_ts=quiet_ts,
+            fit_best=fit_best,
+            fit_title=fit_title,
+            opened=candidate is not None,
         )
 
         if candidate is None:
@@ -354,6 +520,11 @@ class Topics:
         if not opener_text:
             self._update_log(topic_id, {"opener": "", "result": json.dumps({"rejected": "开场白为空"}, ensure_ascii=False)})
             return "skip:empty_opener"
+
+        # 自我介绍 / 寒暄（2026-10-01 用户定：不要自我介绍和废话）→ 这次不开
+        if voice.is_self_intro(opener_text):
+            self._update_log(topic_id, {"opener": "", "result": json.dumps({"rejected": "开场白在自我介绍 / 寒暄，不发"}, ensure_ascii=False)})
+            return "rejected:self_intro"
 
         # 清洗
         cleaned = self._clean_opener(opener_text)
@@ -579,14 +750,49 @@ class Topics:
     # ------------------------------------------------------------------
 
     def _list_candidates(self, gid: str, now: float, limit: int = 5) -> List[dict]:
+        """未过期未用的候选；按和群画像兴趣的对得上程度排序后取 limit 条。
+
+        2026-10-01 起不再单纯按 created DESC：线上实测候选池里「和群里长期兴趣贴边」
+        和「完全不沾边」的混在一起，只按时间取 5 条会让 Jev 看到的全是后者。
+        做法：先多取 _CANDIDATE_SCAN 条，用「候选 title+brief 与画像兴趣类条目文本的
+        字符二元组重合度」排序（纯代码，不调模型、不多打一次网络）；拿不到画像条目
+        （没有 / 读失败）就退回按 created DESC。同分保持 created DESC（稳定排序）。
+        """
         rows = self._store.read().execute(
-            "SELECT id, kind, ref_id, title, brief, link, expires_ts"
+            "SELECT id, kind, ref_id, title, brief, link, expires_ts, created"
             " FROM topic_candidates"
             " WHERE group_id=? AND used_ts IS NULL AND expires_ts>?"
             " ORDER BY created DESC LIMIT ?",
-            (gid, now, int(limit)),
+            (gid, now, int(_CANDIDATE_SCAN)),
         ).fetchall()
-        return [dict(r) for r in rows]
+        cands = [dict(r) for r in rows]
+        if not cands:
+            return []
+        interests = self._interest_texts(gid)
+        if not interests:
+            return cands[: int(limit)]
+        return sorted(cands, key=lambda c: -_interest_score(c, interests))[: int(limit)]
+
+    def _interest_texts(self, gid: str) -> List[str]:
+        """群画像里「兴趣类」条目的文字（兴趣 / 最近在聊 / 在做的事）。
+
+        读不到就返回空表——调用方退回按时间排，绝不因为画像出问题就不开话题。
+        """
+        try:
+            entries = self._profiles.entries(gid)
+        except Exception:
+            logger.info("读画像条目失败，候选退回按时间排（group=%s）", gid, exc_info=True)
+            return []
+        out: List[str] = []
+        for e in entries or []:
+            if not isinstance(e, dict):
+                continue
+            if str(e.get("category") or "") not in _INTEREST_CATEGORIES:
+                continue
+            text = str(e.get("text") or "").strip()
+            if text:
+                out.append(text)
+        return out
 
     def _session_id_for(self, gid: str) -> str:
         # 优先 SignalsStub / intake.Signals 里的（收过新消息）
@@ -616,13 +822,37 @@ class Topics:
         pick: dict | None,
         answers: dict,
         questions: dict,
+        quiet_ts: float = 0.0,
+        fit_best: float | None = None,
+        fit_title: str = "",
+        opened: bool = False,
     ) -> int:
+        ok = bool(answers.get("ok") is not None and float(answers.get("ok", 0.0)) >= _OK_THRESHOLD and reason == "fine")
+        # stuck：这轮没开是卡在哪一层——时机不过关（ok 分不够或 reason 不是 fine）
+        # 还是时机过了但候选都不够贴；真开了就是 null。
+        # （开场白之后被打回（播报腔/隐私/发送失败）记在 result 里，不算这两层。）
+        if opened:
+            stuck: Optional[str] = None
+        elif float(ok_p) < _OK_THRESHOLD or reason != "fine":
+            stuck = "timing"
+        else:
+            stuck = "candidate"
         jev_obj = {
-            "ok": bool(answers.get("ok") is not None and float(answers.get("ok", 0.0)) >= _OK_THRESHOLD and reason == "fine"),
+            "ok": ok,
             "reason": _REASON_ZH.get(reason, reason),
             "confidence": float(reason_conf),
             "detail": "",
+            # 2026-10-01 起把真实分数也落库：原来只存了 reason 那道选择题的把握，
+            # 网页上看不出「没开」是卡在时机、还是候选都不够贴。
+            "ok_p": float(ok_p),
+            "ok_need": float(_OK_THRESHOLD),
+            "fit_best": (float(fit_best) if fit_best is not None else None),
+            "fit_need": float(_FIT_THRESHOLD),
+            "fit_title": str(fit_title or ""),
+            "stuck": stuck,
+            "stretch_ts": float(quiet_ts),
         }
+
         jev_json = json.dumps(jev_obj, ensure_ascii=False)
         pick_json = json.dumps(pick or {}, ensure_ascii=False)
         with self._store.tx() as conn:
@@ -693,39 +923,13 @@ class Topics:
         candidate: dict,
         recent_msgs: List[Msg],
     ) -> List[dict]:
-        """按 docs/02-设计.md §4.4 第 1 条组 prompt。"""
-        # 人设：读 host.config；读不到略过
-        nickname = ""
-        personality = ""
-        reply_style = ""
-        try:
-            v = await self._host.config("bot.nickname")
-            nickname = str(v or "").strip() if v is not None else ""
-        except Exception:
-            pass
-        try:
-            v = await self._host.config("personality.personality")
-            personality = str(v or "").strip() if v is not None else ""
-        except Exception:
-            pass
-        try:
-            v = await self._host.config("personality.reply_style")
-            reply_style = str(v or "").strip() if v is not None else ""
-        except Exception:
-            pass
-        # MaiBot 最近在本群的 5 条发言（找语气）
-        maibot_recent: List[str] = []
-        if sid:
-            try:
-                # 近 24 小时限 30 条，反向找 is_bot
-                msgs = await self._host.messages(sid, clock.now() - 86400.0, clock.now(), 30)
-                for m in reversed(msgs):
-                    if m.is_bot and m.text.strip():
-                        maibot_recent.append(m.text.strip()[:80])
-                        if len(maibot_recent) >= 5:
-                            break
-            except HostError:
-                pass
+        """按 docs/02-设计.md §4.4 第 1 条组 prompt；人设只认 SOUL（voice.persona）。
+
+        kind == "idea" 的候选按「关心式问法」写（有由头就顺着由头问一句要不要帮忙）；
+        news 候选保持原来的写法。不自我介绍、不寒暄（规矩在 persona.section() 里）。
+        """
+        del sid  # 不再读 MaiBot 最近发言当语气样例（人设只认 SOUL）
+        persona = voice.persona(self._identity)
         # 最近 15 条群消息
         recent_lines: List[str] = []
         for m in recent_msgs[-15:]:
@@ -733,34 +937,14 @@ class Topics:
             txt = m.text.strip()[:80]
             if txt:
                 recent_lines.append(f"{who}: {txt}")
-        # 人设
-        persona_lines: List[str] = []
-        if nickname:
-            persona_lines.append(f"名字：{nickname}")
-        if personality:
-            persona_lines.append(f"性格：{personality}")
-        if reply_style:
-            persona_lines.append(f"回复风格：{reply_style}")
-        persona = ("\n".join(persona_lines)) if persona_lines else "（没有）"
-        # 样例
-        examples = "\n".join(f"- {t}" for t in maibot_recent) if maibot_recent else "（没有）"
-        # 最近群消息
         recent_text = "\n".join(recent_lines) if recent_lines else "（没有）"
-        link = str(candidate.get("link") or "")
-        # 身份与工作记忆（identity.py）：有 SOUL 就按 SOUL 的口吻（身份块在最前面）
-        soul_block = ""
-        if self._identity is not None:
-            try:
-                soul_block = str(self._identity.prompt_block("soul") or "")
-            except Exception:
-                soul_block = ""
-        user_prompt = f"""你扮演 {nickname or "群里的 AI 助手"}。群里冷场了一段时间，你随手起个话头。
+        if str(candidate.get("kind") or "") == "idea":
+            user_prompt = self._idea_opener_prompt(gid, candidate, persona, recent_text)
+        else:
+            link = str(candidate.get("link") or "")
+            user_prompt = f"""群里冷场了一段时间，你随手起个话头。
 
-# 人设
-{persona}
-
-# 你最近在群里说过的话（找语气）
-{examples}
+{persona.section()}
 
 # 群里最近的对话
 {recent_text}
@@ -778,9 +962,72 @@ class Topics:
 
 只回开场白本身，不要别的解释。"""
         return [
-            {"role": "system", "content": (soul_block + f"你是 {nickname or '群里的 AI 助手'}。") if soul_block else f"你是 {nickname or '群里的 AI 助手'}。"},
+            {"role": "system", "content": persona.system()},
             {"role": "user", "content": user_prompt},
         ]
+
+    def _idea_material(self, gid: str, candidate: dict) -> dict:
+        """idea 候选的素材：按 ref_id 从 ideas 表读 origin / title / body。
+
+        读不到（老库没补列 / 行没了 / 假行）就用候选自己的标题和简报，绝不抛。
+        **不读 basis**——那句是「为什么适合」的画像依据，不能进要发进群的话。
+        """
+        out = {
+            "origin": "",
+            "title": str(candidate.get("title") or "").strip(),
+            "body": str(candidate.get("brief") or "").strip(),
+        }
+        ref_id = candidate.get("ref_id")
+        if not ref_id:
+            return out
+        try:
+            row = self._store.read().execute(
+                "SELECT origin, title, body FROM ideas WHERE id=? AND group_id=?",
+                (int(ref_id), str(gid)),
+            ).fetchone()
+        except Exception:
+            logger.debug("读构想由头失败（群 %s 条 %s）", gid, ref_id, exc_info=True)
+            return out
+        if row is None:
+            return out
+        out["origin"] = str(row["origin"] or "").strip()
+        out["title"] = str(row["title"] or "").strip() or out["title"]
+        out["body"] = str(row["body"] or "").strip() or out["body"]
+        return out
+
+    def _idea_opener_prompt(
+        self, gid: str, candidate: dict, persona: Any, recent_text: str,
+    ) -> str:
+        """构想候选的开场白：关心式问一句（有由头顺着由头问），不推销、不点名任何人。"""
+        material = self._idea_material(gid, candidate)
+        origin = material["origin"]
+        if origin:
+            head = (
+                f"由头（群里之前聊过的那件事）：{origin}\n"
+                f"写成「话说之前大家聊的那个{origin}后来怎么样了？要我帮忙吗？」这种问法。"
+            )
+        else:
+            head = "这件事没有由头（想不起接的是哪件事），就按下面的标题 / 想法自然地问一句要不要帮忙。"
+        return f"""群里冷场了一段时间，你想顺着之前聊过的一件事问一句。
+
+{persona.section()}
+
+# 群里最近的对话
+{recent_text}
+
+# 想聊的事（群里之前有人提过想做）
+{head}
+标题：{material["title"]}
+想法：{material["body"]}
+
+写一两句口语化的开场白：
+- 用关心、顺口问一句的口吻（「……后来怎么样了？要我帮忙吗？」），结尾是问句
+- 只提这件事本身，不点名任何群友，不提任何人的个人情况、习惯、经历
+- 别推销：不许写「我可以帮」「给大家带来」「推荐给大家」「安利」「感兴趣的话」「点进去看看」
+- 别写「据报道」「以下是」「今日资讯」「新闻速报」这种播报腔
+- 最多一个链接（也可以不带，自然就行）；别超过 120 字
+
+只回开场白本身，不要别的解释。"""
 
     def _scrub_group_text(self, gid: str, text: str) -> Optional[str]:
         """G7 隐私闸：开场白要发进群，不能含关注成员的名字 / 注记。"""

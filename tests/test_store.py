@@ -92,6 +92,42 @@ class TestIdeaItemsMigration:
         assert req["item_nos"] == "[]" and req["source"] == ""
 
 
+class TestIdeaOriginMigration:
+    """2026-10：构想「由头」列（store._m_idea_origin）——新库建表有、老库启动补列。"""
+
+    def test_new_db_has_origin(self, store: Store) -> None:
+        cols = {r["name"] for r in store.read().execute("PRAGMA table_info(ideas)")}
+        assert "origin" in cols
+
+    def test_old_db_gets_column_added(self, tmp_path: Path) -> None:
+        """老库（ideas 没有 origin、user_version 停在迁移前）启动后自动补列，老行读作空串。"""
+        from CharTyr_MaiWork.maiwork import store as store_mod
+
+        db = tmp_path / "old" / "m.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE ideas (id INTEGER PRIMARY KEY AUTOINCREMENT, group_id TEXT NOT NULL,"
+            " title TEXT NOT NULL, created REAL NOT NULL DEFAULT 0, updated REAL NOT NULL DEFAULT 0)"
+        )
+        conn.execute(
+            "INSERT INTO ideas (group_id, title, created, updated) VALUES ('g1', '老构想', 0, 0)"
+        )
+        # 停在「该跑 _m_idea_origin 了」的前一步
+        conn.execute(f"PRAGMA user_version={store_mod._MIGRATIONS.index(store_mod._m_idea_origin)}")
+        conn.commit()
+        conn.close()
+
+        s = Store(db)
+        s.migrate()
+        cols = {r["name"] for r in s.read().execute("PRAGMA table_info(ideas)")}
+        assert "origin" in cols
+        row = s.read().execute("SELECT title, origin FROM ideas").fetchone()
+        assert row["title"] == "老构想" and row["origin"] == ""
+        s.close()
+
+
 class TestTx:
     def test_tx_commits(self, store: Store) -> None:
         with store.tx() as conn:

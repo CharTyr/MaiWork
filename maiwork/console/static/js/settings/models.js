@@ -43,6 +43,7 @@ export async function loadModels() {
   try {
     const [cat, agents] = await Promise.all([api("GET", "/api/settings/endpoints"), api("GET", "/api/agents").catch(() => null)]);
     state.mdl = { endpoints: cat.endpoints || [], models: cat.models || [] };
+    state.mdlVerification = {}; // 刷新配置后不复用界面里上一次的验证/待保存建议
     if (agents) state.agents = agents;
   } catch (err) {
     state.mdlError = err.message;
@@ -96,20 +97,34 @@ function endpointBlock(ep) {
   </section>`;
 }
 
-function modelRow(x) {
-  const edit = state.mdlEdit;
-  if (edit && edit.type === "model" && !edit.isNew && edit.id === x.id) return modelForm(edit.draft, false);
-  const users = usersOf(x.id);
-  const chips = [
+function modelMeta(x) {
+  return [
     (x.efforts || []).length ? `思考强度 ${x.efforts.map((e) => EFFORT_NAMES[e] || e).join(" / ")}` : "不调思考强度",
     x.vision ? "能看图" : "",
     `上下文 ${kTok(x.context_window)}`,
     `最大输出 ${kTok(x.max_tokens)}`,
-  ].filter(Boolean);
+  ].filter(Boolean).join(" · ");
+}
+
+function verificationMessage(r) {
+  if (r.stale) return "验证期间配置已改变，这次结果已过期，请重新验证。";
+  if (!r.ok) return `验证没通过：${r.error || "模型没能正常回答"}`;
+  if (r.suggested_max_tokens) return `用 ${r.suggested_max_tokens} 最大输出能正常回答；建议值尚未保存，当前配置不算通过。${r.note || ""}`;
+  return r.tools_ok ? "已验证：能回答、能调用工具" : `能回答，但工具受限：${r.note || "工具往返未通过"}`;
+}
+
+function modelRow(x) {
+  const edit = state.mdlEdit;
+  if (edit && edit.type === "model" && !edit.isNew && edit.id === x.id) return modelForm(edit.draft, false);
+  const users = usersOf(x.id);
+  const result = (state.mdlVerification || {})[x.id];
   return `<div class="set-row mdl-model">${ico("robot")}<div>
       <div class="set-name">${esc(x.name || x.model)}${x.name && x.name !== x.model ? ` <span class="fine mono">${esc(x.model)}</span>` : ""}</div>
-      <div class="set-text">${chips.map(esc).join(" · ")}</div>
+      <div class="set-text mdl-meta">${esc(modelMeta(x))}</div>
       <div class="set-text">${users.length ? `在用：${esc(users.join("、"))}` : "还没有专岗在用"}</div>
+      <button type="button" class="btn small" style="min-height:44px;margin-top:8px" data-act="mdl-model-verify" data-id="${esc(x.id)}">验证模型</button>
+      <span class="fine">短回答 + 空工具往返，会用一点 token</span>
+      <div class="set-text mdl-verify-result" role="status" aria-live="polite"${result ? "" : " hidden"}>${result ? esc(verificationMessage(result)) : ""}</div>
     </div><span class="row-btns"><button class="btn small" data-act="mdl-model-edit" data-id="${esc(x.id)}">改</button><button class="btn small ghost" data-act="mdl-model-del" data-id="${esc(x.id)}">删</button></span></div>`;
 }
 
@@ -302,6 +317,68 @@ export async function actModels(action, el) {
         await reloadAll();
         toast(wasNew ? "模型加好了，去「专岗」页分给要用它的专岗" : "模型改好了");
       } catch (err) { el.disabled = false; showErr("mo-err", err.message); }
+      return true;
+    }
+    case "mdl-model-verify": {
+      const id = el.dataset.id;
+      const row = el.closest(".mdl-model");
+      const out = row && row.querySelector(".mdl-verify-result");
+      const label = el.textContent;
+      el.disabled = true;
+      el.textContent = "验证中…";
+      if (out) out.hidden = true;
+      try {
+        const r = await api("POST", `/api/settings/model-list/${encodeURIComponent(id)}/verify`, {});
+        if (!el.isConnected || !out) return true;
+        state.mdlVerification = { ...(state.mdlVerification || {}), [id]: r };
+        out.textContent = verificationMessage(r);
+        out.hidden = false;
+        if (r.ok && !r.stale && r.suggested_max_tokens) {
+          const save = document.createElement("button");
+          save.className = "btn small";
+          save.style.minHeight = "44px";
+          save.style.margin = "8px 0";
+          save.dataset.act = "mdl-model-apply-limit";
+          save.dataset.id = id;
+          save.textContent = `保存建议最大输出 ${r.suggested_max_tokens}`;
+          out.appendChild(document.createElement("br"));
+          out.appendChild(save);
+        }
+      } catch (e) {
+        if (out && el.isConnected) { out.textContent = `验证未完成：${e.message}。请重试`; out.hidden = false; }
+      } finally {
+        if (el.isConnected) { el.disabled = false; el.textContent = label; }
+      }
+      return true;
+    }
+    case "mdl-model-apply-limit": {
+      const id = el.dataset.id;
+      const r = (state.mdlVerification || {})[id];
+      const row = el.closest(".mdl-model");
+      const out = row && row.querySelector(".mdl-verify-result");
+      if (!r || !r.suggested_max_tokens) return toast("这份建议已过期，请重新验证", true), true;
+      el.disabled = true;
+      try {
+        await api("PUT", `/api/settings/model-list/${encodeURIComponent(id)}`, {
+          max_tokens: r.suggested_max_tokens, if_fingerprint: r.requested_fingerprint,
+        });
+        await loadModels();
+        const saved = state.mdl && state.mdl.models.find((x) => x.id === id);
+        if (!saved || Number(saved.max_tokens) !== Number(r.suggested_max_tokens)) throw new Error("未能确认新参数已生效");
+        const applied = { ...r, suggested_max_tokens: 0 };
+        state.mdlVerification = { ...(state.mdlVerification || {}), [id]: applied };
+        if (out) { out.textContent = `最大输出已保存为 ${saved.max_tokens}。${verificationMessage(applied)}`; out.hidden = false; }
+        if (row) row.querySelector(".mdl-meta").textContent = modelMeta(saved);
+      } catch (e) {
+        if (out) {
+          // 保留建议按钮，失败原因就在当前区域，不擦掉其他模型的未保存表单。
+          const error = document.createElement("div");
+          error.textContent = `建议没有保存：${e.message}。请重试`;
+          out.appendChild(error);
+          out.hidden = false;
+        }
+        if (el.isConnected) el.disabled = false;
+      }
       return true;
     }
     case "mdl-model-del": {

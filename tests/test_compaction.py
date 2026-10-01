@@ -182,7 +182,7 @@ class TestCompactLooped:
         assert out == msgs  # 原样继续
 
     @pytest.mark.asyncio
-    async def test_context_length_error_trim_and_retry_once(self):
+    async def test_context_length_error_does_not_drop_requirements(self):
         from CharTyr_MaiWork.maiwork.models import ChatResult, ModelError
 
         class M:
@@ -197,10 +197,9 @@ class TestCompactLooped:
 
         msgs = [_msg("system", "s")] + [_msg("user", f"第{i}" + "z" * 3000) for i in range(6)]
         m = M()
-        out = await compaction.chat_with_retry_on_long_context(msgs, models=m, role="main", purpose="p")
-        assert len(m.calls) == 2
-        # 第二次的 messages 比第一次短（最旧一段被裁）
-        assert len(m.calls[1]) < len(m.calls[0])
+        with pytest.raises(ModelError, match="未丢弃"):
+            await compaction.chat_with_retry_on_long_context(msgs, models=m, role="main", purpose="p")
+        assert m.calls == [msgs]  # 只发原对话，不因下一次可能成功就删要求重试
 
     @pytest.mark.asyncio
     async def test_context_length_error_twice_raises(self):

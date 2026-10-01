@@ -33,12 +33,37 @@ SLEEP = _ts(23, 30)
 
 
 class Host:
-    def __init__(self) -> None:
+    def __init__(self, persona=None, msgs=None) -> None:
         self.texts: list[dict] = []
+        self.persona = dict(persona or {})
+        self.msgs = list(msgs or [])
 
     async def send_text(self, session_id, text, *, reply_to="", at_user="", at_name=""):
         self.texts.append({"session_id": session_id, "text": text, "at_user": at_user})
         return type("R", (), {"sent": True, "message_id": f"t{len(self.texts)}"})()
+
+    async def config(self, key, default=None):
+        return self.persona.get(key, default)
+
+    async def messages(self, session_id, start, end, limit, **kw):
+        return list(self.msgs)
+
+
+class BotMsg:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.is_bot = True
+        self.user_name = "机器人"
+
+
+class Identity:
+    """假的 identity（voice.persona 用它读 SOUL）。"""
+
+    def __init__(self, blocks=None) -> None:
+        self.blocks = dict(blocks or {})
+
+    def prompt_block(self, kind, **kw):
+        return self.blocks.get(kind, "")
 
 
 class Models:
@@ -54,18 +79,20 @@ class Models:
         return type("C", (), {"text": r})()
 
 
-def _make(tmp_path, *, replies=None, public_url="https://mw.example"):
+def _make(tmp_path, *, replies=None, public_url="https://mw.example", persona=None, msgs=None,
+          identity=None):
     store = Store(tmp_path / "t.db")
     store.migrate()
     cfg = {"groups": {"serve": [{"group": f"qq:{GID}"}]}}
     if public_url:
         cfg["console"] = {"public_url": public_url}
     settings, _ = load_settings(cfg)
-    host = Host()
+    host = Host(persona, msgs)
     models = Models(replies)
     pushes = Pushes(store, lambda: settings)
     mentions = Mentions(store, lambda: settings)
-    im = card_push.IdeaMention(store, host, models, pushes, mentions, lambda: settings)
+    im = card_push.IdeaMention(store, host, models, pushes, mentions, lambda: settings,
+                               identity=identity)
     with store.tx() as conn:
         for g in (GID, OTHER):
             conn.execute(
@@ -75,12 +102,14 @@ def _make(tmp_path, *, replies=None, public_url="https://mw.example"):
     return store, host, models, pushes, im
 
 
-def _idea(store, gid=GID, *, created=NOON, target="", title="我可以帮群里做个番剧追更表", state="new"):
+def _idea(store, gid=GID, *, created=NOON, target="", title="我可以帮群里做个番剧追更表", state="new",
+          origin=""):
     with store.tx() as conn:
         cur = conn.execute(
-            "INSERT INTO ideas (group_id, title, body, basis, state, created, updated, target_user_id)"
-            " VALUES (?, ?, '每周自动汇总更新', '画像里说他最近在考研', ?, ?, ?, ?)",
-            (gid, title, state, created, created, target),
+            "INSERT INTO ideas (group_id, title, body, basis, state, created, updated,"
+            " target_user_id, origin)"
+            " VALUES (?, ?, '每周自动汇总更新', '画像里说他最近在考研', ?, ?, ?, ?, ?)",
+            (gid, title, state, created, created, target, origin),
         )
         return int(cur.lastrowid)
 
@@ -224,3 +253,92 @@ async def test_has_due_and_status(tmp_path):
     assert im.has_due(GID, NOON + 20) is False
     st = im.status(GID, now=NOON + 20)
     assert st["sent_today"] == 1 and st["recent"][0]["status"] == "sent"
+
+
+# ----------------------------------------------------------------------
+# 关心式问法 + 由头（2026-10 与用户定）
+# ----------------------------------------------------------------------
+
+
+async def test_prompt_carries_persona_and_origin(tmp_path):
+    """提示词只按 SOUL 说话（不读 MaiBot 人格、不拿它的发言当样例），并带上由头。"""
+    store, host, models, _p, im = _make(
+        tmp_path,
+        persona={
+            "bot.nickname": "小麦",
+            "personality.personality": "热心肠",
+            "personality.reply_style": "随口一聊",
+        },
+        msgs=[BotMsg("这块板子的事我记着呢")],
+        identity=Identity({"soul": "## MaiWork 的身份\n你是这群的老熟人。"}),
+    )
+    _enable(store)
+    _idea(store, origin="涂击队百层挑战")
+    im.scan(GID, NOON + 10)
+    await im.flush(GID, NOON + 10)
+    prompt = json.dumps(models.calls[0]["messages"], ensure_ascii=False)
+    assert "小麦" not in prompt and "热心肠" not in prompt and "随口一聊" not in prompt
+    assert "这块板子的事我记着呢" not in prompt  # 不拿 MaiBot 的发言当样例
+    assert "老熟人" in prompt                    # SOUL
+    assert "不自我介绍" in prompt and "不寒暄" in prompt
+    # 不给它塞「助手」身份（会引出「作为助手…」）
+    assert "的助手。" not in prompt and "群里的 AI 助手" not in prompt
+    assert "涂击队百层挑战" in prompt            # 由头（origin）
+    assert "关心" in prompt                      # 要求关心式问法
+    assert "问句" in prompt                      # 结尾要是问句
+    assert "别推销" in prompt and "感兴趣的话" in prompt  # 推销腔被点名禁止
+
+
+async def test_caring_reply_is_kept(tmp_path):
+    """模型写出的关心式问句照用（不被当成推销腔换掉）。"""
+    good = json.dumps(
+        {"text": "话说之前大家聊的那个涂击队百层挑战后来怎么样了？要我帮忙吗？"},
+        ensure_ascii=False,
+    )
+    store, host, models, _p, im = _make(tmp_path, replies=[good])
+    _enable(store)
+    _idea(store, origin="涂击队百层挑战")
+    im.scan(GID, NOON + 10)
+    await im.flush(GID, NOON + 10)
+    first_line = host.texts[0]["text"].split("\n")[0]
+    assert first_line == "话说之前大家聊的那个涂击队百层挑战后来怎么样了？要我帮忙吗？"
+
+
+@pytest.mark.parametrize("bad", [
+    "我可以帮你们搓一份极乐迪斯科防翻车手册，感兴趣的话点进去看看",
+    "给大家带来一个好东西，安利一下",
+    "推荐给大家一个小工具，点进去看看",
+])
+async def test_pitch_talk_replaced_by_template(tmp_path, bad):
+    """推销腔（我可以帮 / 给大家带来 / 推荐给大家 / 安利 / 感兴趣的话 / 点进去看看）→ 换模板。"""
+    store, host, models, _p, im = _make(
+        tmp_path, replies=[json.dumps({"text": bad}, ensure_ascii=False)]
+    )
+    _enable(store)
+    _idea(store, origin="涂击队百层挑战")
+    im.scan(GID, NOON + 10)
+    await im.flush(GID, NOON + 10)
+    text = host.texts[0]["text"]
+    for w in card_push._PITCH_WORDS:
+        assert w not in text, w
+    assert "涂击队百层挑战" in text
+    assert "要我帮忙吗" in text
+
+
+@pytest.mark.parametrize("bad", [
+    "我是小麦，话说之前那个涂击队百层挑战后来怎么样了？",
+    "大家好，之前那个涂击队百层挑战还在搞吗？",
+    "作为群助手，想问问百层挑战后来怎么样了？",
+])
+async def test_self_intro_replaced_by_template(tmp_path, bad):
+    """自我介绍 / 寒暄（2026-10-01 用户定：不要自我介绍和废话）→ 换模板。"""
+    store, host, models, _p, im = _make(
+        tmp_path, replies=[json.dumps({"text": bad}, ensure_ascii=False)]
+    )
+    _enable(store)
+    _idea(store, origin="涂击队百层挑战")
+    im.scan(GID, NOON + 10)
+    await im.flush(GID, NOON + 10)
+    first_line = host.texts[0]["text"].split("\n")[0]
+    assert first_line == "话说之前大家聊的那个涂击队百层挑战后来怎么样了？要我帮忙吗？"
+

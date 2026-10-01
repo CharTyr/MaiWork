@@ -501,6 +501,58 @@ class TestPersonalPrepare:
         assert "帮你" in rows[0]["title"] or "帮你" in rows[0]["body"]
         assert all(c.get("kind") != "idea" for c in topics.calls)
 
+    def test_idea_origin_stored(self, tmp_path) -> None:
+        """个人向构想的 origin = 他自己在群里说过想做的那件事，落 ideas.origin。"""
+        models = FakeModelsQueue(ready=True, replies=[
+            json.dumps({
+                "focus": [{"query": "FPGA", "why": "在做"}],
+                "idea": {"title": "我可以帮你把这块板的例程理一下",
+                         "body": "我可以帮你把例程整理成一页",
+                         "origin": "FPGA 小板子",
+                         "step": "先列出要跑的例程", "effort": "半天"},
+            }, ensure_ascii=False),
+            _personal_scores_json(),
+            json.dumps({"posts": []}, ensure_ascii=False),
+        ])
+        store, settings, personal, models, workers, topics, _ = _make_personal(
+            tmp_path, models=models
+        )
+        with _time_patch():
+            _run(personal.prepare_personal(GID, UID))
+        rows = store.read().execute(
+            "SELECT * FROM ideas WHERE target_user_id=?", (UID,)
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["origin"] == "FPGA 小板子"
+        # 提示词里要 origin（他自己在群里说过想做的那件事）
+        prompt = models.calls[0][1][-1]["content"]
+        assert '"origin"' in prompt
+        assert "16" in prompt
+
+    def test_idea_origin_privacy_blanked_not_dropped(self, tmp_path) -> None:
+        """origin 含画像/注记片段 → 置空，构想照样入库。"""
+        models = FakeModelsQueue(ready=True, replies=[
+            json.dumps({
+                "focus": [{"query": "FPGA", "why": "在做"}],
+                "idea": {"title": "我可以帮他把例程理一下",
+                         "body": "我可以帮你把例程整理成一页",
+                         "origin": "我在折腾 FPGA 呢",
+                         "step": "", "effort": ""},
+            }, ensure_ascii=False),
+            _personal_scores_json(),
+            json.dumps({"posts": []}, ensure_ascii=False),
+        ])
+        store, settings, personal, models, workers, topics, _ = _make_personal(
+            tmp_path, models=models
+        )
+        with _time_patch():
+            _run(personal.prepare_personal(GID, UID))
+        rows = store.read().execute(
+            "SELECT * FROM ideas WHERE target_user_id=?", (UID,)
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["origin"] == ""
+
     def test_reason_only_quotes_himself(self, tmp_path) -> None:
         """reason 里能引用的原话只来自他本人（chatlog.search_chat 只取该 user_id 的发言）。"""
         from CharTyr_MaiWork.maiwork import chatlog

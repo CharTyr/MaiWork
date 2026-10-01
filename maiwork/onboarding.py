@@ -19,13 +19,14 @@ checks（老字段，布尔）保留给旧前端；items 是给完成页 / 设�
 
 from __future__ import annotations
 
-import json
+import secrets
 from typing import Any
 
 from . import clock
 
 KV_KEY = "onboarding"
-ACTIONS = ("done", "skip", "reset", "progress")
+ACTIONS = ("done", "skip", "reset", "start", "progress")
+_TERMINAL = ("done", "skipped", "later")
 # 和前端 ONB_STEPS 同一份名单（前端改步骤要一起改）
 STEPS = ("hello", "models", "groups", "keys", "search", "admins", "look", "done")
 # 必要条件：缺了就不算「可用」；其余（Jev、头像、管理员、搜索）可选
@@ -36,7 +37,7 @@ def _checks(svc: Any) -> dict[str, bool]:
     settings = svc.get_settings()
     out = {"models": False, "groups": False, "jev": False, "search": False, "admins": False}
     try:
-        out["models"] = bool(svc.models.settings().ready())
+        out["models"] = models_status(svc)["state"] != "off"
     except Exception:
         out["models"] = False
     if settings is not None:
@@ -68,50 +69,58 @@ def _item(key: str, state: str, title: str, text: str, step: str = "", sub: str 
     return {"key": key, "state": state, "title": title, "text": text, "step": step, "sub": sub}
 
 
-def _verified_for(svc: Any, service_model: str) -> dict[str, Any] | None:
-    """kv["models.verified.<条目id>"] 里找服务端模型名对得上的那条（最新的）。"""
-    if not service_model:
+def _verified_for(svc: Any, kind: str = "main") -> dict[str, Any] | None:
+    """只认模型 Module 对当前真实候选和配置版本确认过的记录。"""
+    lookup = getattr(svc.models, "verification_for", None)
+    if not callable(lookup):
         return None
     try:
-        rows = svc.store.read().execute(
-            "SELECT value FROM kv WHERE key LIKE 'models.verified.%' ORDER BY updated DESC"
-        ).fetchall()
+        rec = lookup(kind)
     except Exception:
         return None
-    for row in rows:
-        try:
-            rec = json.loads(row[0])
-        except (ValueError, TypeError):
-            continue
-        if isinstance(rec, dict) and str(rec.get("model") or "") == service_model:
-            return rec
+    return rec if isinstance(rec, dict) and isinstance(rec.get("ok"), bool) else None
+
+
+def _model_failure(svc: Any) -> tuple[str, dict[str, Any]] | None:
+    """必要模型链的明确失败；未验证和工具受限不是明确不可用。"""
+    for kind, label in (("main", "主模型"), ("task", "任务岗模型")):
+        rec = _verified_for(svc, kind)
+        if rec is not None and rec["ok"] is False:
+            return label, rec
     return None
 
 
-def _models_item(svc: Any) -> dict[str, Any]:
+def models_status(svc: Any) -> dict[str, Any]:
+    """模型能力的共享只读出口：配置缺失/明确失败 off，未知或工具受限 warn。"""
     try:
         s = svc.models.settings()
         ready = bool(s.ready())
         main = str(getattr(s, "main_label", "") or getattr(s, "main", "") or "")
-        service = str(getattr(s, "main", "") or "")
     except Exception:
-        ready, main, service = False, "", ""
+        ready, main = False, ""
     if not ready:
         return _item("models", "off", "模型", "还没配：MaiWork 现在不会做任何要模型的事", step="models", sub="models")
-    rec = _verified_for(svc, service)
+    failure = _model_failure(svc)
+    if failure is not None:
+        label, failed = failure
+        why = str(failed.get("error") or "没通过")
+        return _item("models", "off", "模型", f"{label}验证没通过：{why}", step="models", sub="models")
+    rec = _verified_for(svc, "main")
     if rec is None:
         return _item(
             "models", "warn", "模型",
             f"主模型 {main} 已选好，但还没验证过能不能正常回答和调用工具（未验证）",
             step="models", sub="models",
         )
-    if not rec.get("ok"):
-        why = str(rec.get("error") or "没通过")
-        return _item("models", "off", "模型", f"主模型 {main} 验证没通过：{why}", step="models", sub="models")
     if not rec.get("tools_ok"):
         note = str(rec.get("note") or "工具调用没走通")
         return _item("models", "warn", "模型", f"主模型 {main} 已验证能回答；{note}", step="models", sub="models")
-    return _item("models", "ok", "模型", f"主模型 {main} 已验证：能回答、能调用工具；其他专岗没单独选就跟它一样")
+    task_rec = _verified_for(svc, "task")
+    if task_rec is None:
+        return _item("models", "warn", "模型", f"主模型 {main} 已验证；任务岗当前模型还没验证（未验证）", step="models", sub="models")
+    if not task_rec.get("tools_ok"):
+        return _item("models", "warn", "模型", f"主模型 {main} 已验证；任务岗工具受限：{task_rec.get('note') or '工具调用没走通'}", step="models", sub="models")
+    return _item("models", "ok", "模型", f"主模型 {main} 已验证：能回答、能调用工具；任务岗当前模型也已验证")
 
 
 def _group_rows(svc: Any, gids: list[str]) -> list[dict[str, Any]]:
@@ -250,7 +259,7 @@ def items(svc: Any, checks: dict[str, bool] | None = None) -> list[dict[str, Any
     except Exception:
         gids = []
     return [
-        _models_item(svc),
+        models_status(svc),
         _groups_item(svc, gids),
         _search_item(svc, gids),
         _exec_item(svc),
@@ -292,6 +301,8 @@ def view(svc: Any) -> dict[str, Any]:
         "state": state,
         "step": step,
         "ts": float(rec.get("ts") or 0),
+        "run_id": str(rec.get("run_id") or ""),
+        "sequence": int(rec.get("sequence") or 0),
         "checks": checks,
         "usable": not missing,
         "missing": missing,
@@ -301,23 +312,53 @@ def view(svc: Any) -> dict[str, Any]:
     }
 
 
-def act(svc: Any, action: str, step: str = "") -> dict[str, Any]:
+def act(
+    svc: Any, action: str, step: str = "", *, run_id: str = "", sequence: int | None = None,
+) -> dict[str, Any]:
+    """原子地更新一轮引导；旧轮/旧序号/终态后的进度只读返回，不再写回。"""
     if action not in ACTIONS:
-        raise ValueError("action 只能是 done / skip / reset / progress")
-    now = clock.now()
-    if action == "reset":
-        value: Any = {}
-    elif action == "skip":
-        value = {"state": "skipped", "step": str(_record(svc).get("step") or ""), "ts": now}
-    elif action == "progress":
-        step_s = str(step or "").strip()
-        if step_s not in STEPS:
-            raise ValueError(f"step 只能是 {' / '.join(STEPS)}")
-        value = {"state": "in_progress", "step": step_s, "ts": now}
-    else:  # done：必要条件齐了才算完成，否则只是「先存下」
-        checks = _checks(svc)
-        usable = all(checks.get(k) for k in REQUIRED)
-        value = {"state": "done" if usable else "later", "step": "done", "ts": now}
+        raise ValueError("action 只能是 done / skip / reset / start / progress")
+    step_s = str(step or "").strip()
+    if (action == "progress" or (action == "start" and step_s)) and step_s not in STEPS:
+        raise ValueError(f"step 只能是 {' / '.join(STEPS)}")
+    if not isinstance(run_id, str):
+        raise ValueError("run_id 必须是字符串")
+    if sequence is not None and (isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0):
+        raise ValueError("sequence 必须是非负整数")
     with svc.store.tx() as conn:
+        rec = _record(svc)
+        current_run = str(rec.get("run_id") or "")
+        current_sequence = int(rec.get("sequence") or 0)
+        if action not in ("reset", "start"):
+            # 旧记录仍兼容没有 run_id 的请求；新轮次必须携带匹配的标识。
+            if (current_run or run_id) and run_id != current_run:
+                return view(svc)
+            if action == "progress" and rec.get("state") in _TERMINAL:
+                return view(svc)
+            if sequence is not None and sequence <= current_sequence:
+                return view(svc)
+        now = clock.now()
+        if action in ("reset", "start"):
+            remembered = str(rec.get("step") or "") if rec.get("state") == "in_progress" else ""
+            value: dict[str, Any] = {
+                "state": "in_progress" if action == "start" else "",
+                "step": (step_s or remembered or "hello") if action == "start" else "",
+                "run_id": secrets.token_hex(8), "sequence": 0, "ts": now,
+            }
+        else:
+            value = {
+                "state": str(rec.get("state") or ""),
+                "step": str(rec.get("step") or ""),
+                "run_id": current_run,
+                "sequence": sequence if sequence is not None else current_sequence + 1,
+                "ts": now,
+            }
+            if action == "skip":
+                value["state"] = "skipped"
+            elif action == "progress":
+                value.update(state="in_progress", step=step_s)
+            else:
+                checks = _checks(svc)
+                value.update(state="done" if all(checks.get(k) for k in REQUIRED) else "later", step="done")
         svc.store.kv_set(conn, KV_KEY, value)
     return view(svc)

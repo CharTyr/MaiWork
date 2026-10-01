@@ -112,6 +112,8 @@ class Profiles:
         self._get_settings = get_settings
         # 上次真去宿主读消息的时刻（群 → epoch）：只有 tick 传 has_signal 时才做频率限制
         self._last_read: dict[str, float] = {}
+        # 有信号但被 60 秒节流挡下的群：下一轮即使没新信号也按有信号算，读到为止
+        self._held_signal: set[str] = set()
         # 主模型读群发现请求（asks）的落地依赖：profiles 比 approvals/goals/outbox 先建，
         # app 启动时用 set_request_deps 接上；缺哪个，那一种 asks 就不落地（不报错）
         self._approvals: Any = None
@@ -1277,11 +1279,16 @@ class Profiles:
         # 读消息的频率（read_interval_minutes 生效）：
         # 本轮有信号（来了新消息）最多每 60 秒读一次宿主；没信号按 read_interval_minutes。
         if has_signal is not None:
+            # 上一轮有信号却被 60 秒节流挡下（信号已被 take 取走）：这一轮仍按有信号算，
+            # 不然要等满 read_interval_minutes 才读到（2026-10-01 线上实测晚了 10 分钟）
+            has_signal = bool(has_signal) or gid in self._held_signal
             interval = _READ_WITH_SIGNAL_SECONDS if has_signal else (
                 max(1, int(settings.profile.read_interval_minutes)) * 60.0
             )
             last = float(self._last_read.get(gid, 0.0))
             if last > 0.0 and now - last < interval:
+                if has_signal:
+                    self._held_signal.add(gid)
                 row0 = self._store.read().execute(
                     "SELECT pending_count FROM groups WHERE group_id=?", (gid,)
                 ).fetchone()
@@ -1319,6 +1326,7 @@ class Profiles:
 
         # 真要读宿主这一轮：记下读取时刻（节流只挡下一次）
         self._last_read[gid] = clock.now()
+        self._held_signal.discard(gid)
         now = clock.now()
         fresh = row is None or float(row["read_since"] or 0) == 0
         if fresh:

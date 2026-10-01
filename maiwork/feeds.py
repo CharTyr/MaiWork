@@ -39,8 +39,7 @@
 「有人味」（docs/02 §4.1，2026-09-27 与用户定）：打分之后、入库前，对过第二道门槛的
 每条再调一次主模型 json_mode 写「帖子」（body/reason/refs/audience/keywords），
 输入带候选标题/摘要/quote/来源、群画像、search_chat 查到的本群相关原话
-（最多 6 条带时间和名字）、MaiBot 人设（host.config 读 bot.nickname /
-personality.personality / personality.reply_style，读不到就略过）和
+（最多 6 条带时间和名字）、人设（只认 SOUL.md；空就不带，不回退读 MaiBot 人格）和
 kv["feeds.pref.<群号>"] 资讯偏好。代码侧：refs 序号换真实 {ts, who, text(截 80),
 message_id}；audience 只留确实出现在引用原话里的名字；body 链接只留 http(s) 最多 4 个；
 reason/body/audience 过 privacy.scrub（按 note/persona 片段规则，名字本身放行）；
@@ -105,6 +104,26 @@ _IDEA_ITEM_TITLE_MAX = 40
 _IDEA_ITEM_DESC_MAX = 200
 
 _IDEA_ITEM_KINDS = ("task", "goal")
+
+# 构想「由头」（2026-10 与用户定）：接的是群里之前聊过 / 有人说想做的哪件事
+# （短名词短语，≤16 字，不含人名 / QQ 号）；想不出 = 空串。
+_IDEA_ORIGIN_MAX = 16
+_QQ_LIKE_RE = _re.compile(r"\d{5,}")
+
+
+def clean_idea_origin(value: Any) -> str:
+    """构想由头清洗：去空白 / 引号、限 16 字；带长数字串（像 QQ 号）的整条不要。
+
+    只做「形状」清洗；含关注成员信息的那道闸由 feeds（_scrub_item_text）/ personal
+    （privacy.scrub）在入库前过——命中的是**把 origin 置空**，不丢整条构想。
+    """
+    s = " ".join(str(value or "").split()).strip()
+    s = s.strip("「」『』“”\"'。.，,、:：;；!！?？")
+    if not s:
+        return ""
+    if _QQ_LIKE_RE.search(s):
+        return ""
+    return s[:_IDEA_ORIGIN_MAX]
 
 
 def _followup_view(raw: Any) -> dict | None:
@@ -887,10 +906,8 @@ class Feeds:
         # 契约：async verify_runner(items, picks, gid, settings)；直接改 items[i]["verify"]。
         # None = 这轮没有实测能力（没接线 / railway=false），跳过实测，照常出资讯。
         self._verify_runner = verify_runner
-        # 「有人味」：写帖子要按 MaiBot 人设口吻（host.config 读 bot.nickname 等），
-        # 没有 host（老测试 / 特殊部署）就跳过人设，读不到单项就略过。
-        # identity（identity.py）在时有 SOUL 就优先按 SOUL 的口吻（身份与工作记忆），
-        # 没有 SOUL 内容仍回落 host 这套老逻辑。
+        # 「有人味」：写帖子按 SOUL 的口吻（identity.py）；人设只认 SOUL（2026-10-01 用户定），
+        # SOUL 空就不带人设，不回退去读 MaiBot 的人格设定。host 留着给别的用途。
         self._host = host
         self._identity = identity
         # 搜索服务 skill 提示 / 开关（Skills 实例，app 启动后设上；None=没接、抛带）
@@ -3861,32 +3878,6 @@ class Feeds:
     # 「有人味」：写帖子（body / reason / refs / audience / keywords）
     # ------------------------------------------------------------------
 
-    async def _bot_persona_lines(self) -> list[str]:
-        """MaiBot 人设（host.config 读 bot.nickname / personality.*）；读不到就 []。"""
-        if self._host is None:
-            return []
-        got: dict[str, str] = {}
-        for key in ("bot.nickname", "personality.personality", "personality.reply_style"):
-            try:
-                val = await self._host.config(key)
-            except Exception:
-                val = None
-            if val is not None and str(val).strip():
-                got[key] = str(val).strip()
-        if not got:
-            return []
-        lines = ["你（MaiBot）的人设，写正文和原因都按这个口吻："]
-        name = got.get("bot.nickname")
-        if name:
-            lines.append(f"- 名字：{name}")
-        personality = got.get("personality.personality")
-        if personality:
-            lines.append(f"- 人格：{personality}")
-        style = got.get("personality.reply_style")
-        if style:
-            lines.append(f"- 说话风格：{style}")
-        return lines
-
     def _quotes_for_item(self, gid: str, item: dict) -> list[dict]:
         """按候选关键词查本群相关原话（最多 _SEARCH_QUOTES 条，带时间和名字）。"""
         from .chatlog import search_chat
@@ -3949,17 +3940,13 @@ class Feeds:
         """写帖子提示词（每条的素材 + 写法要求）；每轮一次 + 补漏重试一次共用同一份结构，
         只是条目清单不同（每次的编号都从 0 起，对回自己这批）。"""
         lines: list[str] = []
-        # 有 SOUL（identity.py）→ 用「## MaiWork 的身份」这一份；没有才回落老的人设行
+        # 人设只认 SOUL（2026-10-01 用户定）：有就用「## MaiWork 的身份」；没有就不带人设，
+        # 不回退去读 MaiBot 的人格设定
         soul_block = self._prompt_block_safe("soul")
         if soul_block:
             lines.append(soul_block.strip())
-            lines.append("写正文和原因都按上面「MaiWork 的身份」的口吻。")
+            lines.append("写正文和原因都按上面「MaiWork 的身份」的口吻；不自我介绍、不寒暄，直接说事。")
             lines.append("")
-        else:
-            persona = await self._bot_persona_lines()
-            if persona:
-                lines.extend(persona)
-                lines.append("")
         pref = self.pref(gid)
         if pref:
             lines.append(f"管理员对这个群的资讯偏好：{pref}")
@@ -4474,6 +4461,9 @@ class Feeds:
             "想一个值得这个群试试的点子，想不到合适的就 null。只回 JSON："
             '{"idea": {"title": "我可以……（一句话）", "body": "想法是什么（两三句）",'
             ' "basis": "为什么适合这个群（引用画像，不点名群友）",'
+            ' "origin": "这个构想接的是群里之前聊过 / 有人说想做的哪件事，'
+            '用一个短名词短语（≤16 字，不含人名、QQ 号），比如「涂击队百层挑战」；'
+            '想不出就空字符串",'
             f' "icon": "从下面这些挑一个：{icon_list}",'
             ' "chat_worthy": 适不适合拿到群里聊一聊 true/false,'
             ' "feasibility": {"level": "ok"|"maybe"|"need", "note": "一句话：'
@@ -4512,6 +4502,11 @@ class Feeds:
         if self._scrub_item_text(gid, body_s) is None or self._scrub_item_text(gid, basis_s) is None:
             logger.info("构想含关注成员信息，整条丢弃（群 %s）", gid)
             return None
+        # 由头（origin）也过隐私闸：含关注成员信息 → 只为这一项置空，不丢整条构想
+        origin_s = clean_idea_origin(idea.get("origin"))
+        if origin_s and self._scrub_item_text(gid, origin_s) is None:
+            logger.info("构想由头含关注成员信息，置空（群 %s）", gid)
+            origin_s = ""
         icon = str(idea.get("icon") or "").strip()
         if icon not in _ICONS:
             icon = "bulb"
@@ -4539,12 +4534,13 @@ class Feeds:
         now = clock.now()
         with self._store.tx() as conn:
             cur = conn.execute(
-                "INSERT INTO ideas (group_id, icon, title, body, basis, step, effort, state,"
+                "INSERT INTO ideas (group_id, icon, title, body, origin, basis, step, effort, state,"
                 " requested_by, task_id, up, down, created, updated, feasibility, keywords, items)"
-                " VALUES (?, ?, ?, ?, ?, '', '', 'new', NULL, NULL, 0, 0, ?, ?, ?, ?, ?)",
+                " VALUES (?, ?, ?, ?, ?, ?, '', '', 'new', NULL, NULL, 0, 0, ?, ?, ?, ?, ?)",
                 (
                     gid, icon, title,
                     str(idea.get("body") or "").strip(),
+                    origin_s,
                     str(idea.get("basis") or "").strip(),
                     now, now, feasibility_json, keywords_json, items_json,
                 ),
@@ -4620,7 +4616,9 @@ class Feeds:
             "搜不到就用本群给的素材，离线也要能交回；",
             "4. 用 submit_result 交回："
             'summary 一句话；data = {"idea": {"title": "我可以……（一句话）", '
-            '"body": "想法是什么（两三句）", "basis": "为什么适合这个群（引用画像，不点名群友）"}} 或 '
+            '"body": "想法是什么（两三句）", "basis": "为什么适合这个群（引用画像，不点名群友）", '
+            '"origin": "这个构想接的是群里之前聊过 / 有人说想做的哪件事（短名词短语，'
+            '≤16 字，不含人名、QQ 号），想不出就空字符串"}} 或 '
             '{"idea": null}。',
         ])
         brief = "\n".join(parts)
@@ -4646,6 +4644,7 @@ class Feeds:
         title = str(candidate.get("title") or "").strip()[:100]
         body = str(candidate.get("body") or "").strip()[:400]
         basis = str(candidate.get("basis") or "").strip()[:200]
+        origin = clean_idea_origin(candidate.get("origin"))
         if not (title or body or basis):
             return ""
         lines = [
@@ -4657,6 +4656,8 @@ class Feeds:
             lines.append(f"- 标题草稿：{title}")
         if body:
             lines.append(f"- 想法草稿：{body}")
+        if origin:
+            lines.append(f"- 由头草稿（群里之前聊过的哪件事）：{origin}")
         if basis:
             lines.append(f"- 它给的理由：{basis}")
         lines.append("可以原样采用、改一改再提，也可以完全不参考它提别的；判断权全在你。")

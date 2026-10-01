@@ -23,7 +23,7 @@ export const ONB_STEPS = [
   { id: "look", name: "头像" },
   { id: "done", name: "完成" },
 ];
-export const onb = { open: false, i: 0, busy: false, cfg: null, models: null, info: null, done: {}, anims: [], presets: null, sxPicked: null };
+export const onb = { open: false, i: 0, busy: false, cfg: null, models: null, info: null, sequence: 0, done: {}, anims: [], presets: null, sxPicked: null };
 const EASE_SPRING = "cubic-bezier(0.34, 1.4, 0.64, 1)";
 document.addEventListener("change", (event) => {
   if (event.target && event.target.id === "onb-proto" && $("onb-url")) $("onb-url").placeholder = (PROTOCOLS[event.target.value] || PROTOCOLS.openai).ph;
@@ -324,6 +324,7 @@ function onbPaint(dir) {
 
 function onbError(msg) {
   const err = $("onb-err");
+  if (!err) return;
   err.textContent = msg;
   err.hidden = false;
   if (!calm()) onbAnim(err, [{ transform: "translateX(0)" }, { transform: "translateX(-6px)" }, { transform: "translateX(5px)" }, { transform: "translateX(-3px)" }, { transform: "translateX(0)" }], { duration: 320, easing: "ease-out" });
@@ -332,7 +333,15 @@ function onbError(msg) {
 export async function openOnboarding(info) {
   if (onb.open || !admin()) return;
   onb.open = true;
-  onb.info = info || null;
+  // 打开/刷新都是一轮明确的继续操作：新轮次使旧页面仍在途的请求失效。
+  try {
+    info = await api("POST", "/api/onboarding", { action: "start", step: (info && info.step) || "hello" });
+  } catch (e) {
+    onb.open = false;
+    return toast(`引导没能打开：${e.message}。请重试`, true);
+  }
+  onb.info = info;
+  onb.sequence = Number(info.sequence) || 0;
   // 接着上次的那一步（in_progress 记了步）；没记就从头
   const resume = info && info.state === "in_progress" ? ONB_STEPS.findIndex((s) => s.id === info.step) : -1;
   onb.i = resume > 0 ? resume : 0;
@@ -385,10 +394,22 @@ function onbTrapFocus(e) {
 async function closeOnboarding(action) {
   const root = $("onb");
   if (!root) return;
+  if (onb.busy && action !== "skip") return;
+  const wasBusy = onb.busy;
+  let finished = false;
+  onb.busy = true;
   try {
-    onb.info = await api("POST", "/api/onboarding", { action });
+    const runId = (onb.info && onb.info.run_id) || "";
+    const result = await api("POST", "/api/onboarding", { action, run_id: runId, sequence: ++onb.sequence });
+    if (result.run_id !== runId || result.state === "in_progress") {
+      return onbError("引导已被另一个页面更新，这次没有结束：请刷新后接着填");
+    }
+    onb.info = result;
+    finished = true;
   } catch (e) {
-    toast(e.message, true);
+    return onbError(`引导结束状态没能保存：${e.message}。请重试`);
+  } finally {
+    onb.busy = finished ? false : wasBusy;
   }
   onbSettle();
   onb.open = false;
@@ -512,15 +533,26 @@ async function onbVerify(ids) {
     } catch (e) {
       r = { ok: false, error: e.message };
     }
+    if (r.stale) {
+      if (out) out.textContent = "";
+      return "验证期间模型配置已经改变：请重新验证，本步尚未完成。";
+    }
     if (!r.ok) {
       if (out) out.textContent = "";
       return `${entry.model || mid} 没能正常回答：${r.error || "验证没通过"}。可以换个模型，或先「稍后再配」。`;
     }
     if (r.suggested_max_tokens) {
       try {
-        await api("PUT", `/api/settings/model-list/${encodeURIComponent(mid)}`, Object.assign({}, entry, { max_tokens: r.suggested_max_tokens }));
+        await api("PUT", `/api/settings/model-list/${encodeURIComponent(mid)}`, {
+          max_tokens: r.suggested_max_tokens, if_fingerprint: r.requested_fingerprint,
+        });
         await loadModels();
-      } catch (_) {}
+        const saved = ((state.mdl && state.mdl.models) || []).find((x) => x.id === mid);
+        if (!saved || Number(saved.max_tokens) !== Number(r.suggested_max_tokens)) throw new Error("未能确认新参数已经生效");
+      } catch (e) {
+        if (out) out.textContent = "";
+        return `${entry.model || mid} 用 ${r.suggested_max_tokens} 能回答，但建议最大输出没能保存：${e.message}。请重试；本步尚未完成。`;
+      }
     }
     if (r.note) notes.push(`${entry.model || mid}：${r.note}`);
   }
@@ -529,14 +561,21 @@ async function onbVerify(ids) {
   return "";
 }
 
-// 记下走到了哪一步（docs/13 A04）：刷新 / 关页重进回到这里；失败不拦人
+// 进度可以后台保存，但绑定轮次/序号；晚到的更新不能复活已完成或较新的引导。
 function onbRemember() {
   const step = ONB_STEPS[onb.i].id;
   if (step === "hello") return;
-  api("POST", "/api/onboarding", { action: "progress", step }).catch(() => null);
+  const runId = (onb.info && onb.info.run_id) || "";
+  api("POST", "/api/onboarding", { action: "progress", step, run_id: runId, sequence: ++onb.sequence })
+    .catch((e) => {
+      if (onb.open && onb.info && onb.info.run_id === runId) onbError(`配置已保存，但引导进度没能记录：${e.message}。可继续，或重新打开引导重试`);
+    });
 }
 
 async function onbGo(delta) {
+  if (!onb.open) return;
+  const runId = (onb.info && onb.info.run_id) || "";
+  const from = onb.i;
   const to = Math.max(0, Math.min(ONB_STEPS.length - 1, onb.i + delta));
   if (to === onb.i) return;
   onb.i = to;
@@ -564,9 +603,22 @@ async function onbGo(delta) {
   }
   if (ONB_STEPS[to].id === "done") {
     try {
-      onb.info = await api("GET", "/api/onboarding");
-    } catch (_) {}
+      const info = await api("GET", "/api/onboarding");
+      if (!onb.open || !onb.info || onb.info.run_id !== runId) return;
+      if (info.run_id !== runId) {
+        onb.i = from;
+        return onbError("引导已被另一个页面更新，请刷新后继续");
+      }
+      onb.info = info;
+    } catch (e) {
+      if (onb.open && onb.info && onb.info.run_id === runId) {
+        onb.i = from;
+        onbError(`能力状态没能读到：${e.message}。请重试`);
+      }
+      return;
+    }
   }
+  if (!onb.open || !onb.info || onb.info.run_id !== runId) return;
   onbRemember();
   onbPaint(delta);
 }
@@ -574,6 +626,26 @@ async function onbGo(delta) {
 export async function onbAct(el) {
   const a = el.dataset.act;
   if (onb.busy && a !== "onb-skip") return;
+  // 只在新的用户导航动作接手当前活跃轮次；旧后台回调不会自行重开或夺回引导。
+  if (["onb-next", "onb-later", "onb-back", "onb-goto"].includes(a)) {
+    const runId = (onb.info && onb.info.run_id) || "";
+    let ownedRunId = runId;
+    onb.busy = true;
+    try {
+      const current = await api("GET", "/api/onboarding");
+      if (!onb.open || !onb.info || onb.info.run_id !== runId) return;
+      if (current.run_id !== runId) {
+        if (current.state !== "in_progress") return onbError("这一轮引导已经在其他页面结束或更新，请重新打开后继续");
+        onb.info = current;
+        ownedRunId = current.run_id;
+        onb.sequence = Number(current.sequence) || 0;
+      } else onb.sequence = Math.max(onb.sequence, Number(current.sequence) || 0);
+    } catch (e) {
+      return onbError(`当前引导状态没能读到：${e.message}。请重试`);
+    } finally {
+      if (onb.info && onb.info.run_id === ownedRunId) onb.busy = false;
+    }
+  }
   const id = ONB_STEPS[onb.i].id;
   if (a === "onb-restart") {
     if (onb.open) return;
@@ -609,8 +681,7 @@ export async function onbAct(el) {
     try {
       const cur = await api("GET", "/api/onboarding");
       const step = cur.next_step || cur.step || "models";
-      const info = await api("POST", "/api/onboarding", { action: "progress", step: step === "done" ? "models" : step });
-      return openOnboarding(info);
+      return openOnboarding({ ...cur, step: step === "done" ? "models" : step });
     } catch (e) {
       return toast(e.message, true);
     }
@@ -661,17 +732,19 @@ export async function onbAct(el) {
     onb.busy = true;
     el.disabled = true;
     const label = el.textContent;
+    const runId = (onb.info && onb.info.run_id) || "";
     el.innerHTML = `<i class="onb-spin"></i>保存中`;
     try {
       onb.verifyNotes = [];
       const bad = await onbSave(id);
+      if (!onb.open || !onb.info || onb.info.run_id !== runId) return;
       if (bad) return onbError(bad);
       await onbGo(1);
       if ((onb.verifyNotes || []).length) toast(onb.verifyNotes.join("；"));
     } catch (e) {
-      onbError(e.message);
+      if (onb.open && onb.info && onb.info.run_id === runId) onbError(e.message);
     } finally {
-      onb.busy = false;
+      if (onb.info && onb.info.run_id === runId) onb.busy = false;
       if (el.isConnected) {
         el.disabled = false;
         el.textContent = label;
