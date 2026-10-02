@@ -35,8 +35,12 @@ from typing import Any, Callable
 from . import clock, members
 from .config import Settings
 from .feeds import (
+    _POST_ACCURACY_RULES,
     _adopt_title_zh,
     _localize_title,
+    _looks_chinese,
+    _pub_date,
+    check_post_bodies,
     _titles_with_originals,
     clean_idea_origin,
     clean_step,
@@ -56,6 +60,10 @@ _VIEW_NEWS_CAP = 5
 _VIEW_IDEAS_CAP = 2
 # 一轮个人向备料子 agent 最多交回几条
 _COLLECT_CAP = 6
+# 一次找料的搜索 / 打开页数硬上限（代码拦，verify_budget；2026-10-03 线上巡检后）：
+# 实测便宜的几次 9~11 次搜索、8~9 次打开就交回；贵的搜 32~44 次，一次 45~78 万 token
+PERSONAL_SEARCH_CAP = 10
+PERSONAL_PAGE_CAP = 8
 # 写帖子每条最多带几条他自己的原话
 _SEARCH_QUOTES = 6
 # 入网门槛（第二道）：相关度 ≥3 且平均分 ≥3
@@ -66,6 +74,23 @@ def in_personal_window(ts: float) -> bool:
     """这个时间戳（北京时间）是不是在 9:00–22:00 之间（含 9:00、不含 22:00）。"""
     hour = clock.bj(float(ts)).hour
     return _WINDOW_START_H <= hour < _WINDOW_END_H
+
+
+# 错开启动（2026-10-03，线上巡检后）：每人一个固定的最早开始时间，散在 9:00 起的这么多分钟里
+_STAGGER_MINUTES = 180
+
+
+def personal_start_ts(group_id: str, user_id: str, ts: float) -> float:
+    """这个人在 ts 所在那天（北京时间）最早几点开始跑个人向：9:00 + 按 (群, 人) 固定的 0~179 分钟。
+
+    线上 2026-10-02：3 个群 9 个人全挤在 09:01–09:35，和 09:00 收消息钩子超时撞在同一刻。
+    用稳定哈希（不是 Python 自带 hash，那个每次启动会变）。
+    """
+    import hashlib
+
+    day = clock.bj(float(ts)).replace(hour=_WINDOW_START_H, minute=0, second=0, microsecond=0)
+    h = int(hashlib.sha1(f"{group_id}:{user_id}".encode("utf-8")).hexdigest()[:8], 16)
+    return day.timestamp() + (h % _STAGGER_MINUTES) * 60.0
 
 
 class Personal:
@@ -101,7 +126,7 @@ class Personal:
     def due(self, group_id: str, now: float) -> list[str]:
         """本轮该给谁跑个人向产出（最多 1 个 user_id；没有 → []）。
 
-        挑人条件：personal_feeds 开、personal_profile 开、在 9:00–22:00 时间窗里、
+        挑人条件：personal_feeds 开、personal_profile 开、在 9:00–22:00 时间窗里、到了他今天的开始时间（personal_start_ts）、
         是当前关注成员（removed=0）、persona 已存在、今天（北京时间）还没跑过。
         """
         gid = str(group_id)
@@ -131,6 +156,8 @@ class Personal:
                 continue  # 画像还没建出来
             if self._done_today(gid, uid, day):
                 continue  # 今天已跑过
+            if float(now) < personal_start_ts(gid, uid, float(now)):
+                continue  # 还没到他今天的开始时间（错开启动）
             return [uid]  # 每群每轮最多 1 个
         return []
 
@@ -195,7 +222,7 @@ class Personal:
 
         # ② 子 agent 找候选
         try:
-            candidates = await self._collect(gid, focus_pts)
+            candidates = await self._collect(gid, focus_pts, uid)
         except (ModelError, ValueError) as e:
             logger.info("个人向备料-子 agent 失败（群 %s 人 %s）：%s", gid, uid[:8], e)
             return 0
@@ -238,6 +265,11 @@ class Personal:
                 logger.exception("个人向写帖子意外出错（群 %s），全部回落原文", gid)
                 for item in posting:
                     self._post_fallback(item)
+            # 写完对一遍原文（和群资讯同一道，线上巡检 2026-10-02 后补）
+            try:
+                await check_post_bodies(self._models, gid, posting, agent="main", purpose="personal.post_check")
+            except Exception:
+                logger.exception("个人向帖子对原文自检意外出错（群 %s）", gid)
 
         # ⑦ 落库（含被筛的）+ 标今天做过
         kept_n = self._insert_items(gid, uid, now, candidates)
@@ -321,7 +353,19 @@ class Personal:
     # 子 agent 找候选
     # ------------------------------------------------------------------
 
-    async def _collect(self, gid: str, focus_list: list[dict]) -> list[dict]:
+    async def _collect(self, gid: str, focus_list: list[dict], uid: str = "") -> list[dict]:
+        """派一个找料子 agent。带标记 personal-collect:<群>:<人前 8 位>:<毫秒> 归账，
+        并开搜索 / 打开页数硬上限的账本（跑完必关）。"""
+        from . import verify_budget
+
+        mark = f"personal-collect:{gid}:{str(uid)[:8]}:{int(clock.now() * 1000)}"
+        verify_budget.open_run(mark, cap_page_calls=PERSONAL_PAGE_CAP, cap_search_calls=PERSONAL_SEARCH_CAP)
+        try:
+            return await self._collect_inner(gid, focus_list, mark)
+        finally:
+            verify_budget.close_run(mark)
+
+    async def _collect_inner(self, gid: str, focus_list: list[dict], mark: str) -> list[dict]:
         # 时间盒：和群资讯同一个 [feeds] collect_minutes（2026-09-29 线上一轮跑了一个多小时）
         settings = self._get_settings()
         collect_minutes = max(1, int(getattr(settings.feeds, "collect_minutes", 15) or 15))
@@ -340,11 +384,14 @@ class Personal:
             "published（ISO 或 epoch，拿不到就空字符串）、fetched（真打开过就 true）、"
             "quote（从原文抄一小段能支撑摘要的依据，≤200 字）、paywall；\n"
             "6. 最后用 submit_result 交回，data 按约定的 JSON Schema；"
-            f"你只有大约 {collect_minutes} 分钟，到点前记得把已经找到的交回来（部分结果也算，不会丢）。"
+            f"你只有大约 {collect_minutes} 分钟，到点前记得把已经找到的交回来（部分结果也算，不会丢）；\n"
+            f"7. 这次最多搜 {PERSONAL_SEARCH_CAP} 次、打开 {PERSONAL_PAGE_CAP} 个页面（用完工具会拒绝）："
+            "先想好几个准的搜索词再搜，别换着说法反复搜同一件事；够 3 条好的就可以交回。"
         )
         report = await self._workers.run(
             brief,
             group_id=gid,
+            task_id=mark,
             tools=["web_search", "fetch_page"],
             deadline_ts=clock.now() + collect_minutes * 60,
             output_schema={
@@ -662,11 +709,18 @@ class Personal:
             lines.append("他最近的情况（写「为什么给他」时对得上就提一句）：")
             lines.extend(p_lines)
         lines.append("")
+        lines.append(f"今天是 {clock.bj(clock.now()).strftime('%Y-%m-%d')}（北京时间）。")
+        lines.extend(_POST_ACCURACY_RULES)
+        lines.append("")
         for i, pack in enumerate(per_item):
             item = pack["item"]
+            pub = _pub_date(item)
+            need_zh = "" if _looks_chinese(item.get("title")) else "【标题以外文为主，title_zh 必须给中文译名】"
             lines.append(
-                f"[{i}] {item['title']} —— {str(item['summary'] or '')[:150]}"
-                f"（来源 {str(item.get('site') or '')}，{item['url']}）"
+                f"[{i}] {item['title']}{need_zh} —— {str(item['summary'] or '')[:150]}"
+                f"（来源 {str(item.get('site') or '')}，{item['url']}"
+                + (f"，原文发布于 {pub}" if pub else "，发布日期不明")
+                + "）"
             )
             quote = str(item.get("quote") or "")[:150]
             if quote:

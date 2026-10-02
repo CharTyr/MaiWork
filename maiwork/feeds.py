@@ -678,9 +678,100 @@ _KANA_HANGUL_RE = _re.compile(r"[\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af\u1100-\
 
 
 def _looks_chinese(title: Any) -> bool:
-    """标题算不算中文：有汉字、且没有日文假名 / 韩文（日韩标题也要译）。"""
+    """标题算不算中文：以汉字为主（汉字数 ×4 ≥ 拉丁字母数）、且没有日文假名 / 韩文（日韩标题也要译）。
+
+    只看「有没有汉字」不够：线上 2026-10-02 「INVESTIGATION: …（… 官方论坛调查帖）」
+    这种外文长标题只在括号里带几个汉字，被当成中文没翻译就进了卡片。
+    中文为主夹专有名词（「ChatGPT 推出工作区智能体 workspace agents」）仍算中文。
+    """
     t = str(title or "")
-    return bool(_HAN_RE.search(t)) and not _KANA_HANGUL_RE.search(t)
+    if _KANA_HANGUL_RE.search(t):
+        return False
+    han = len(_HAN_RE.findall(t))
+    latin = len(_re.findall(r"[A-Za-z]", t))
+    return han > 0 and han * 4 >= latin
+
+
+def _pub_date(item: dict) -> str:
+    """条目发布日期（北京时间 YYYY-MM-DD）；不知道就空字符串。"""
+    ts = item.get("published_ts")
+    if not isinstance(ts, (int, float)) or ts <= 0:
+        return ""
+    try:
+        return clock.bj(float(ts)).strftime("%Y-%m-%d")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+# 写帖子 / 自检共用的「最容易改错」清单（线上巡检 2026-10-02 核实过的四类错）
+_POST_ACCURACY_RULES = (
+    "事实准确比口吻重要，下面几类错最常见，一定避开：",
+    "- 相对日期：别写「今天 / 昨天 / 刚刚 / 本周」，除非原文发布日期就是那天；拿不准就写原文里的具体日期（如 9 月 29 日）。",
+    "- 来源拔高：来源网站是媒体报道、转载、商店新闻页或聚合站时，不许说成「官方公告 / 官方确认」；"
+    "只有原文确实是官方发布的才说官方，并说清是谁发的。",
+    "- 漏掉限定：原文说的是模拟 / 演示 / 教学示例 / 预览 / 传闻 / 作者自述 / 尚未上线时，这些限定词必须保留，"
+    "不许把示例的特点安到正式产品上。",
+    "- 意思写反：允许 / 禁止、放行 / 拦截、增加 / 减少、有 / 没有、支持 / 不支持这类关系照原文写，不许反过来。",
+)
+
+
+async def check_post_bodies(
+    models: Any, gid: str, items: list[dict], *,
+    agent: str = "news", purpose: str = "feeds.post_check", task_id: str = "",
+) -> None:
+    """群资讯 / 个人向共用：一次模型调用，逐条对照原文依据（quote）、摘要、发布日期和来源网站，找帖子正文里原文撑不住的说法。
+
+    自检本身失败（模型报错 / JSON 坏）：没核对过的改写不放出去，这些条正文一律回落摘要
+    （线上巡检 2026-10-02：改写会添错，摘要通常更准）。
+    """
+    todo = [
+        it for it in items
+        if str((it.get("post") or {}).get("body") or "") and (it.get("post") or {}).get("body") != it.get("summary")
+    ]
+    if not todo:
+        return
+    lines = [
+        f"今天是 {clock.bj(clock.now()).strftime('%Y-%m-%d')}（北京时间）。",
+        "下面每条是一篇给群友看的帖子，后面是它的标题、来源网站、原文发布日期、原文依据（从原文抄的一段）和原文摘要。",
+        "逐条检查帖子正文：有没有原文依据和摘要都撑不住的事实说法（编出来的数字、日期、结论、「首个 / 最快」这类绝对化说法、",
+        "把推测说成事实）。口吻、比喻、个人感受不算。下面四类要特别查：",
+        "- 相对日期：正文写「今天 / 昨天 / 刚刚 / 本周」等，但和原文发布日期、今天日期对不上；",
+        "- 来源拔高：来源网站是媒体、转载、商店新闻页或聚合站，正文却说成「官方公告 / 官方确认」；",
+        "- 漏掉限定：原文是模拟 / 演示 / 教学示例 / 预览 / 传闻 / 作者自述 / 尚未上线，正文丢了这层限定，说成了正式产品的事实；",
+        "- 意思写反：允许 / 禁止、放行 / 拦截、增 / 减、有 / 没有、支持 / 不支持与原文相反。",
+        '只回 JSON：{"unsupported": [{"i": 编号, "phrases": ["撑不住的那几个词或短句"]}]}；全都没问题就给空列表。',
+        "",
+    ]
+    for k, it in enumerate(todo):
+        site = str(it.get("site") or _site_of(str(it.get("url") or "")))
+        pub = _pub_date(it) or "不明"
+        lines.append(f"[{k}] 帖子：{str(it['post']['body'])[:600]}")
+        lines.append(f"    标题：{str(it.get('title') or '')[:150]}；来源网站：{site}；原文发布日期：{pub}")
+        lines.append(f"    原文依据：{str(it.get('quote') or '')[:300]}")
+        lines.append(f"    原文摘要：{str(it.get('summary') or '')[:300]}")
+    try:
+        result = await models.chat(
+            agent=agent, messages=[{"role": "user", "content": "\n".join(lines)}],
+            json_mode=True, purpose=purpose, group_id=gid,
+            task_id=task_id,
+        )
+        data = json.loads(result.text)
+    except (ModelError, ValueError) as e:
+        logger.info("帖子对原文自检失败（群 %s），%d 条正文回落摘要：%s", gid, len(todo), e)
+        for it in todo:
+            it["post"]["body"] = str(it.get("summary") or "")
+        return
+    bad = data.get("unsupported") if isinstance(data, dict) else None
+    for x in bad or []:
+        try:
+            k = int((x or {}).get("i"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        phrases = [str(p) for p in ((x or {}).get("phrases") or []) if str(p).strip()]
+        if 0 <= k < len(todo) and phrases:
+            it = todo[k]
+            logger.info("帖子有原文撑不住的说法，正文回落摘要（群 %s）：%s", gid, "、".join(phrases)[:80])
+            it["post"]["body"] = str(it.get("summary") or "")
 
 
 def _adopt_title_zh(item: dict, post: Any) -> None:
@@ -3756,6 +3847,10 @@ class Feeds:
                 except (ModelError, ValueError) as e:
                     logger.info("备资讯-打分第 %d 批第 %d 次失败（群 %s）：%s", chunk_no, ask + 1, gid, e)
                     err = e
+                    if isinstance(e, ValueError) and not isinstance(e, ModelError) and ask == 0:
+                        # 模型回了话但 JSON 坏：再问一次（线上 2026-10-02 因此丢过一整批已核验候选）；
+                        # ModelError 是模型层重试 / 换备用都用完了，不再加问
+                        continue
                     errored_local.update(pending)
                     break
                 got = _apply_scores(data, set(pending), by_index, by_title)
@@ -3968,13 +4063,20 @@ class Feeds:
             for e in entries[:20]:
                 lines.append(f"- [{e.get('category', '')}] {e.get('text', '')}")
             lines.append("")
+        lines.append(f"今天是 {clock.bj(clock.now()).strftime('%Y-%m-%d')}（北京时间）。")
+        lines.extend(_POST_ACCURACY_RULES)
+        lines.append("")
         lines.append("下面是这轮要给这个群发的内容（每条附候选信息和本群里聊过的相关原话）：")
         for i, pack in enumerate(per_item):
             item = pack["item"]
             kind_zh = "资讯" if item.get("kind") == "news" else "好文"
+            pub = _pub_date(item)
+            need_zh = "" if _looks_chinese(item.get("title")) else "【标题以外文为主，title_zh 必须给中文译名】"
             lines.append(
-                f"[{i}]（{kind_zh}）{item['title']} —— {str(item['summary'] or '')[:150]}"
-                f"（来源 {pack['site']}，{item['url']}）"
+                f"[{i}]（{kind_zh}）{item['title']}{need_zh} —— {str(item['summary'] or '')[:150]}"
+                f"（来源 {pack['site']}，{item['url']}"
+                + (f"，原文发布于 {pub}" if pub else "，发布日期不明")
+                + "）"
             )
             quote = str(item.get("quote") or "")[:150]
             if quote:
@@ -4066,48 +4168,16 @@ class Feeds:
             item = pack["item"]
             if "post" not in item:
                 self._post_fallback(item)
-        # 写完再对一遍原文（2026-09-30）：原文撑不住的说法 → 那条正文回落原摘要；自检失败不拖累出资讯
+        # 写完再对一遍原文（2026-09-30）：原文撑不住的说法 → 那条正文回落原摘要；
+        # 自检自己出错时 _check_posts 已把改写过的正文回落摘要，这里只兜意外
         try:
             await self._check_posts(gid, [p["item"] for p in per_item], task_id=task_id)
         except Exception:
-            logger.info("帖子对原文自检出错（群 %s），这轮不改", gid, exc_info=True)
+            logger.info("帖子对原文自检意外出错（群 %s）", gid, exc_info=True)
 
     async def _check_posts(self, gid: str, items: list[dict], *, task_id: str = "") -> None:
-        """一次主模型调用：逐条对照原文依据（quote）和摘要，找帖子正文里原文撑不住的说法。"""
-        todo = [
-            it for it in items
-            if str((it.get("post") or {}).get("body") or "") and (it.get("post") or {}).get("body") != it.get("summary")
-        ]
-        if not todo:
-            return
-        lines = [
-            "下面每条是一篇给群友看的帖子，后面是它的原文依据（从原文抄的一段）和原文摘要。",
-            "逐条检查帖子正文：有没有原文依据和摘要都撑不住的事实说法（编出来的数字、日期、结论、「首个 / 最快」这类绝对化说法、",
-            "把推测说成事实）。口吻、比喻、个人感受不算。",
-            '只回 JSON：{"unsupported": [{"i": 编号, "phrases": ["撑不住的那几个词或短句"]}]}；全都没问题就给空列表。',
-            "",
-        ]
-        for k, it in enumerate(todo):
-            lines.append(f"[{k}] 帖子：{str(it['post']['body'])[:600]}")
-            lines.append(f"    原文依据：{str(it.get('quote') or '')[:300]}")
-            lines.append(f"    原文摘要：{str(it.get('summary') or '')[:300]}")
-        result = await self._models.chat(
-            agent="news", messages=[{"role": "user", "content": "\n".join(lines)}],
-            json_mode=True, purpose="feeds.post_check", group_id=gid,
-            task_id=task_id,
-        )
-        data = json.loads(result.text)
-        bad = data.get("unsupported") if isinstance(data, dict) else None
-        for x in bad or []:
-            try:
-                k = int((x or {}).get("i"))
-            except (TypeError, ValueError, AttributeError):
-                continue
-            phrases = [str(p) for p in ((x or {}).get("phrases") or []) if str(p).strip()]
-            if 0 <= k < len(todo) and phrases:
-                it = todo[k]
-                logger.info("帖子有原文撑不住的说法，正文回落摘要（群 %s）：%s", gid, "、".join(phrases)[:80])
-                it["post"]["body"] = str(it.get("summary") or "")
+        """写完对一遍原文：见模块级 check_post_bodies（个人向也用它）。"""
+        await check_post_bodies(self._models, gid, items, agent="news", purpose="feeds.post_check", task_id=task_id)
 
     def _post_fallback(self, item: dict) -> None:
         """写帖子失败 / 漏了这条的回落：body=summary、reason=why、refs/audience 空、
@@ -4457,6 +4527,11 @@ class Feeds:
             lines.append("")
             lines.append("最近已经提过的构想（别再提类似的）：")
             lines.extend(f"- {t}" for t in recent_ideas[:20])
+        recent_tasks = self._recent_task_titles(gid)
+        if recent_tasks:
+            lines.append("")
+            lines.append("这个群最近已经做过 / 正在做的任务（别再提这些事，除非是明显的下一步）：")
+            lines.extend(f"- {t}" for t in recent_tasks)
         if idea_candidate is not None:
             material = self._idea_material_section(gid, idea_candidate)
             if material:
@@ -4719,6 +4794,24 @@ class Feeds:
             (gid, since),
         ).fetchall()
         return [str(r["title"]) for r in rows if r["title"]]
+
+    def _recent_task_titles(self, gid: str) -> list[str]:
+        """本群最近 _IDEA_DEDUP_DAYS 天的任务标题（取消 / 驳回的不算），最多 15 条。
+        线上巡检 2026-10-02：构想提议帮找提丰的图，前一天已有任务做过。"""
+        since = clock.now() - _IDEA_DEDUP_DAYS * 86400.0
+        try:
+            rows = self._store.read().execute(
+                "SELECT title, status FROM tasks WHERE group_id=? AND created>=?"
+                " AND status NOT IN ('cancelled', 'rejected') ORDER BY created DESC LIMIT 15",
+                (gid, since),
+            ).fetchall()
+        except Exception:
+            return []
+        done = {"completed": "已完成", "failed": "没做成"}
+        return [
+            f"{str(r['title'])[:60]}（{done.get(str(r['status']), '进行中')}）"
+            for r in rows if r["title"]
+        ]
 
     def _recent_news_titles(self, gid: str) -> list[str]:
         """最近 14 天「已通过、真发出去的」资讯标题（被筛掉的不算——给打分/构想判重复用）。"""

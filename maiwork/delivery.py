@@ -81,6 +81,18 @@ class TopicMatcher:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _item_text(item: Any) -> str:
+        """一个 item 里的 text part 拼成一段（线上 2026-10-02：带图 / 表情 / @ 的消息，
+        第一个 part 只有 `<message …>` 前缀或「(@了你)」，正文在后面的 part；
+        只看第一个 part 会丢掉约四分之一群友消息的正文）。"""
+        parts = item.get("parts") if isinstance(item, dict) else None
+        texts = [
+            p["text"] for p in (parts if isinstance(parts, list) else ())
+            if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str)
+        ]
+        return "\n".join(texts)
+
+    @staticmethod
     def _parse_chat_bodies(text: str) -> list[tuple[bool, str]]:
         """一段 text part → [(是否机器人自己, 正文)]。兼容整块和一个 part 只有一条。"""
         out: list[tuple[bool, str]] = []
@@ -113,23 +125,13 @@ class TopicMatcher:
                 return ""
             bodies: list[str] = []
             for item in items:
-                if not isinstance(item, dict):
+                text = self._item_text(item)
+                if not text:
                     continue
-                parts = item.get("parts")
-                if not isinstance(parts, list):
-                    continue
-                for part in parts:
-                    if not isinstance(part, dict):
+                for is_self, body in self._parse_chat_bodies(text):
+                    if is_self:
                         continue
-                    if part.get("type") != "text":
-                        continue
-                    text = part.get("text")
-                    if not isinstance(text, str):
-                        continue
-                    for is_self, body in self._parse_chat_bodies(text):
-                        if is_self:
-                            continue
-                        bodies.append(body[:1200])
+                    bodies.append(body[:1200])
             bodies = bodies[-self.RECENT_LIMIT:]
             return "\n".join(bodies).lower()
         except Exception:
@@ -303,15 +305,11 @@ class TopicMatcher:
         try:
             items = kwargs.get("items") if isinstance(kwargs, dict) else None
             for item in items if isinstance(items, list) else ():
-                parts = item.get("parts") if isinstance(item, dict) else None
-                for part in parts if isinstance(parts, list) else ():
-                    if not isinstance(part, dict) or part.get("type") != "text":
-                        continue
-                    text = part.get("text")
-                    if not isinstance(text, str):
-                        continue
-                    for is_self, body in self._parse_chat_bodies(text):
-                        (selfs if is_self else users).append(body[:1200])
+                text = self._item_text(item)
+                if not text:
+                    continue
+                for is_self, body in self._parse_chat_bodies(text):
+                    (selfs if is_self else users).append(body[:1200])
         except Exception:
             return [], []
         return users, selfs

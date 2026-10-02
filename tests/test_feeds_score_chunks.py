@@ -104,6 +104,27 @@ def test_chunk_with_no_matching_scores_counts_as_failed(tmp_path) -> None:
     assert cands[8]["reject"][0] == "score" and cands[9]["reject"][0] == "score"
 
 
+def test_bad_json_once_is_asked_again_not_whole_batch_lost(tmp_path) -> None:
+    """线上巡检 2026-10-02：打分回了解析不了的内容，整批已核验候选全丢。
+    JSON 坏（模型有回话但不是合法 JSON）再问一次；第二次好了照常打分。"""
+    models = FakeModelsQueue(ready=True, replies=["这不是 JSON", _reply_for(range(0, 5))])
+    _store, settings, feeds, *_ = _make_feeds(tmp_path, models=models)
+    cands = _cands(5)
+    with _TimePatch():
+        _run(feeds._score(GID, settings, cands))
+    assert len(models.calls) == 2
+    assert all("reject" not in c and c["scores"]["avg"] > 0 for c in cands)
+
+
+def test_model_error_is_not_asked_again(tmp_path) -> None:
+    """模型层已经重试 / 换备用过才抛 ModelError：打分这层不再加问，免得一轮卡太久。"""
+    models = FakeModelsQueue(ready=True, replies=[ModelError("超时"), _reply_for(range(0, 5))])
+    _store, settings, feeds, *_ = _make_feeds(tmp_path, models=models)
+    with _TimePatch(), pytest.raises(ModelError):
+        _run(feeds._score(GID, settings, _cands(5)))
+    assert len(models.calls) == 1
+
+
 def test_all_chunks_failed_raises(tmp_path) -> None:
     models = FakeModelsQueue(ready=True, replies=[ModelError("超时"), "不是 JSON"])
     _store, settings, feeds, *_ = _make_feeds(tmp_path, models=models)

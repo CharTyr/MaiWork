@@ -10,6 +10,10 @@ oEmbed……），提示词劝不住。所以上限做进代码：
 - 任务结束 close_run，不残留；
 - 没开账本的 task_id（普通任务、老模式 feeds-collect: 找资讯）一律放行。
 
+2026-10-03 起个人向找料（personal-collect:）也用这本账：打开页数 + 搜索次数各一条上限
+（线上实测贵的一次搜了 44 次，每步重发整段对话，一次就 78 万 token）。
+搜索上限只在 open_run 给了 cap_search_calls 时生效；核验组不设，照旧只管打开页数。
+
 账本只活在本进程里（内存 + 锁）：核验组几分钟就结束，重启后旧标记本来也不会再用。
 """
 
@@ -18,7 +22,7 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-# task_id -> {"cap": int, "used": int}
+# task_id -> {"cap": int, "used": int, "search_cap": int(0=不限), "search_used": int}
 _RUNS: dict[str, dict[str, int]] = {}
 _LOCK = threading.Lock()
 
@@ -46,8 +50,19 @@ def cap_for(items_in_group: int) -> int:
     return max(1, min(n * 2 + 1, _CAP_MAX))
 
 
-def open_run(task_id: str, *, cap_page_calls: int) -> None:
-    """给一个核验任务开账本（同名再开 = 清掉重来）。cap≤0 当 1。"""
+_SEARCH_REFUSE_NOTE = (
+    "这次的搜索次数已经用完，别再搜了——"
+    "用已经搜到、打开过的内容按格式交回（部分结果也算）。"
+)
+
+_PERSONAL_PAGE_REFUSE_NOTE = (
+    "这次的打开页面次数已经用完，别再打开新页面了——"
+    "用已经打开到的内容按格式交回（部分结果也算）。"
+)
+
+
+def open_run(task_id: str, *, cap_page_calls: int, cap_search_calls: int = 0) -> None:
+    """给一个任务开账本（同名再开 = 清掉重来）。打开页数 cap≤0 当 1；搜索上限 0 = 不限。"""
     tid = str(task_id or "")
     if not tid:
         return
@@ -55,8 +70,12 @@ def open_run(task_id: str, *, cap_page_calls: int) -> None:
         cap = max(1, int(cap_page_calls))
     except (TypeError, ValueError):
         cap = 1
+    try:
+        search_cap = max(0, int(cap_search_calls or 0))
+    except (TypeError, ValueError):
+        search_cap = 0
     with _LOCK:
-        _RUNS[tid] = {"cap": cap, "used": 0}
+        _RUNS[tid] = {"cap": cap, "used": 0, "search_cap": search_cap, "search_used": 0}
 
 
 def close_run(task_id: str) -> None:
@@ -79,8 +98,23 @@ def consume(task_id: str) -> tuple[bool, str]:
         if run is None:
             return True, ""
         if run["used"] >= run["cap"]:
-            return False, _REFUSE_NOTE
+            return False, (_PERSONAL_PAGE_REFUSE_NOTE if tid.startswith("personal-collect:") else _REFUSE_NOTE)
         run["used"] += 1
+        return True, ""
+
+
+def consume_search(task_id: str) -> tuple[bool, str]:
+    """记一次搜索。没开账本 / 没设搜索上限 → 放行；超上限 → (False, 拒绝话)。"""
+    tid = str(task_id or "")
+    if not tid:
+        return True, ""
+    with _LOCK:
+        run = _RUNS.get(tid)
+        if run is None or not run.get("search_cap"):
+            return True, ""
+        if run["search_used"] >= run["search_cap"]:
+            return False, _SEARCH_REFUSE_NOTE
+        run["search_used"] += 1
         return True, ""
 
 

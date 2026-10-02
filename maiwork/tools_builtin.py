@@ -418,7 +418,7 @@ def final_url_note(url: str) -> str:
 
 
 # 找资讯子 agent（老路 feeds-collect:；2026-10-01 起撒网是代码按计划搜，不再有子 agent 标记）
-_NEWS_SEARCH_MARKS = ("feeds-collect:",)
+_NEWS_SEARCH_MARKS = ("feeds-collect:", "personal-collect:")  # 个人向找料同样默认只看最近 7 天
 _NEWS_DEFAULT_DAYS = 7
 
 
@@ -441,6 +441,13 @@ def register_builtin(
         query = str(args.get("query") or "").strip()
         if not query:
             return ToolResult(ok=False, output="", error="query 不能为空")
+        # 个人向找料的搜索次数硬上限（verify_budget；线上实测一次搜 44 次、78 万 token）
+        if str(ctx.task_id or "").startswith("personal-collect:"):
+            from . import verify_budget
+
+            allowed, note = verify_budget.consume_search(str(ctx.task_id))
+            if not allowed:
+                return ToolResult(ok=False, output="", error=note)
         days = args.get("days")
         try:
             days_i = int(days) if days is not None else None
@@ -511,7 +518,8 @@ def register_builtin(
         # 核验子 agent（feeds-verify:）的代码硬上限：一组的打开页数按组内条数封死
         # （verify_budget.py，feeds._verify_batch 按组开账）。用完直接拒——提示词劝不住
         # 「找日期打转」（2026-09-30 线上实录 8 分钟 23 次），要靠代码拦。
-        if str(ctx.task_id or "").startswith("feeds-verify:"):
+        # 个人向找料（personal-collect:）同一本账（2026-10-03，线上巡检后）。
+        if str(ctx.task_id or "").startswith(("feeds-verify:", "personal-collect:")):
             from . import verify_budget
 
             allowed, note = verify_budget.consume(str(ctx.task_id))

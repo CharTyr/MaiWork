@@ -54,6 +54,9 @@ _HAS_DIGIT = re.compile(r"\d")
 _CJK = re.compile(r"[\u3400-\u9fff]")
 _URL = re.compile(r"https?://\S+|www\.\S+", re.I)
 _EVENT = re.compile(r"\[事件-[^\]]*\][^\n]*")
+# 表情包 / 图片的自动描述不算群友在聊什么（线上 2026-10-02 回放：图片描述带来的命中
+# 大多是误撞，「探索」+「switch」撞上不相干的游戏，甚至撞上群友转发的 MaiWork 自己的资讯卡截图）
+_EMOJI = re.compile(r"\[(?:表情包|图片)[:：][^\]]*(?:\]|$)")  # 截断的长描述没有右括号，抹到行尾
 
 # 问「最近有什么新鲜事」：时间词 + 新闻词，或 有什么/有啥/来点 + 新闻词
 _ASK_NOUN = r"(新闻|新鲜事|资讯|大事|热点|瓜|好玩的事)"
@@ -100,7 +103,7 @@ def keywords(raw: Any) -> list[str]:
 
 
 def clean(text: str) -> str:
-    return _URL.sub(" ", _EVENT.sub(" ", str(text or ""))).lower()
+    return _URL.sub(" ", _EMOJI.sub(" ", _EVENT.sub(" ", str(text or "")))).lower()
 
 
 def contains(kw: str, text_lower: str) -> bool:

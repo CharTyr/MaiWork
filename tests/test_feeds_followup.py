@@ -118,10 +118,14 @@ def test_faithfulness_check_falls_back_unsupported_post(tmp_path):
     assert any(c[2].get("purpose") == "feeds.post_check" for c in models.calls)
 
 
-def test_faithfulness_check_failure_keeps_posts(tmp_path):
+def test_faithfulness_check_failure_keeps_item_but_body_falls_back_to_summary(tmp_path):
+    """自检失败不拖累出资讯（条目照留），但没核对过的改写不放出去：正文回落摘要
+    （线上巡检 2026-10-02：改写会添错，摘要通常更准）。"""
     items = [_cand(0, url="https://a.com/1", title="甲")]
     posts = _posts_json(_post(0, "甲", body="甲的帖子正文"))
     store, settings, feeds, models, *_ = _feeds(tmp_path, _scores_json(_score(0)), items, [posts, "不是 JSON"])
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 1
-    assert _accepted(store)[0]["body"] == "甲的帖子正文"
+    row = _accepted(store)[0]
+    assert row["body"] != "甲的帖子正文"
+    assert row["body"] == items[0]["summary"]

@@ -2142,6 +2142,24 @@ class Models:
                     )
                     raise
                 log_response = self._build_log_response(data, result, secret_keys)
+                if not (result.text or "").strip() and not result.tool_calls:
+                    # 200 但回答是空的（没文字也没工具调用）：调用方拿去解析必炸（线上 2026-10-02
+                    # feeds.score 因此丢了一整轮已核验候选）。算这次失败，按 5xx 同样重试 / 换备用；
+                    # token 真花了 → 用量照记，不当没花
+                    last_err = ModelError(
+                        f"端点返回 200 但回答为空（没有文字也没有工具调用，finish_reason="
+                        f"{result.finish_reason or '无'}）",
+                        status=502,
+                    )
+                    self._log_attempt(
+                        model, role_effective, attempt, ok=False, status=200, ms=ms,
+                        prompt_tokens=result.prompt_tokens, completion_tokens=result.completion_tokens,
+                        error=last_err.message, request=log_request, response=log_response, keys=secret_keys,
+                        purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
+                        usage_src="reported" if result.usage_known else "unknown",
+                        cache_read=result.cache_read_tokens, cache_write=result.cache_write_tokens,
+                    )
+                    continue
                 self._log_attempt(
                     model, role_effective, attempt, ok=True, status=200, ms=ms,
                     prompt_tokens=result.prompt_tokens, completion_tokens=result.completion_tokens,
