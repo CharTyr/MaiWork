@@ -5,7 +5,7 @@
 # 是否启用 MaiWork；默认关闭。宿主在没写 enabled 时会当成开启，所以这里必须显式写。
 enabled = false
 # 配置版本；改默认值时会升。一般不用手改。
-config_version = "0.4.5"
+config_version = "0.4.6"
 
 
 [groups]
@@ -136,6 +136,11 @@ protocol = "openai"
 base_url = "https://api.example.com/v1"
 # 端点密钥；只进不出（接口只回 key_set: true/false），不写日志。这里填你自己的密钥。
 api_key = "sk-填你的端点密钥"
+# 高级设置：请求头覆盖（可选），同一端点下所有模型、试连与验证共用；名称不分大小写。
+# 默认空，不改变原行为。例：headers = { "User-Agent" = "MaiWork/1.0" }
+# 头值可能含凭据：和 api_key 一样只进不出，不放仓库、不写运行日志。
+# 最多 32 项，名称 128/值 8192 字符；只用 ASCII、不带换行；Host/Content-Length 等传输头不可覆盖。
+headers = {}
 # 同一模型调用失败（网络错误、429、408、5xx）最多重试几次（0~10）。
 retries = 5
 # 两次重试之间等几秒（1~60）；429（被限流）不按这个等，改成整个端点先歇一会儿：

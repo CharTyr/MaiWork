@@ -9,7 +9,7 @@
 | 文件 | 主要职责 |
 |---|---|
 | `index.js` | `SET_SUBS`、`settingsPage()` / `settingsSide()` 分发九个子页；`loadGA()` 拉取群管理员资料，`groupPicker()` 供抽屉复用；总览读取 `state.settings` / `state.groups`。 |
-| `models.js` | 模型选择与只进不出的密钥表单，`draft.models` 暂存测试连接返回的模型列表；`fullLink()` 组群链接。`feedsSettings()` 被资讯来源页复用。 |
+| `models.js` | 端点/模型库管理、连接测试与模型验证，`draft.models` 保留旧引导共用列表；端点默认收起的「高级设置」按行编辑请求头覆盖，只取 `header_names`、值用 password 且不回显，已存行留空保留/删行移除；保存与测试同读 `readEndpointHeaders()`（大小写去重、非法字符/传输头校验），增删行局部更新不丢其他未保存输入。`fullLink()` 组群链接，`feedsSettings()` 被资讯来源页复用。 |
 | `rules.js` | `loadRules()` 取 `/api/settings/config` 的分节字段元数据；`rulesPage()` 按字段类型渲染开关、账号 chips、服务群/SSH 行表格及密钥输入；`readRules()` 只提交变更字段。与 `onboarding.js` 共用 `chipEditor()` / `rowsEditor()`。 |
 | `ext.js` | `loadExt()` 加载 MCP、skill、搜索绑定及 `/api/extensions/presets`；`extPage()` 将未打开的预设与普通 MCP 同列，已打开预设显示 logo、密钥入口、备用/广撒网标签。`searchCard()` 配主搜索、可另选的正文抓取、备用顺序和广撒网服务；后二者只列已启用预设，`checkedProviders()` 读勾选并排除主搜索。`parseMcpConfig()` 抽取粘贴的远程 HTTPS MCP；`readHeaders()` 和 `readRoles()` 读取表单。 |
 | `identity.js` | 管理头像、SOUL、AGENTS、全局与每群工作记忆；`loadIdentity()` 取 API，`avatarSaved()` 更新界面。 |

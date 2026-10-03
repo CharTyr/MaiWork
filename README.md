@@ -6,7 +6,7 @@
 
 **MaiBot 的常驻生产力 Agent**：理解一个群 · 主动找资讯 · 提构想 · 追目标 · 交付任何工作
 
-[![Version](https://img.shields.io/badge/version-0.7.1-blue.svg)](https://github.com/CharTyr/MaiWork)
+[![Version](https://img.shields.io/badge/version-0.7.8-blue.svg)](https://github.com/CharTyr/MaiWork)
 [![MaiBot](https://img.shields.io/badge/MaiBot-1.2.5%20实测-green.svg)](https://github.com/Mai-with-u/MaiBot)
 [![SDK](https://img.shields.io/badge/插件%20SDK-2.x-green.svg)](https://github.com/Mai-with-u/MaiBot)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-orange.svg)](LICENSE)
@@ -192,6 +192,8 @@ MaiBot 会自动加载插件。
 
 **模型：端点 → 模型库 → 专岗。** 一个**端点**就是一家模型服务商（地址 + 密钥，接口格式支持 `openai` / `anthropic` / `responses`）；**模型库**里登记这个端点下有哪些模型；至于主模型和资讯 / 构想 / 目标 / 任务这些**专岗**各用哪个模型，在网页「设置 → 专岗」里挑（存在数据库里）。**专岗没单独选，就跟主模型一样**——这是正常能用的状态，不是没配好。想加第二家端点、调思考强度、改上下文窗口，都在「设置 → 模型」页。
 
+**端点高级设置。** 在「设置 → 模型」里新增或编辑端点，展开「高级设置」，可按行添加请求头覆盖，例如 `User-Agent`、`Authorization` 或服务商要求的自定义头。同一端点下所有模型共用，测试连接和模型验证也会带上；名称不分大小写，同名会覆盖默认值。不填保持原行为。头值可能含凭据，保存后只显示已填、不回显；原有项留空就保留，删掉该行再保存即可取消覆盖。`Host`、`Content-Length` 等传输头不能手动覆盖。
+
 **联网搜索。** 首次引导里直接勾搜索服务预设，免密钥的可以先拿来用；勾的第一个当主搜索，其余当备用——主搜索暂时坏了，备用会自动接上。之后在「设置 → 扩展」里也能改。同一页的 skill 可以单独启用或停用；预设搜索服务配套的 skill 只在对应服务开启时生效，你手动停用过的不会因为重开服务自动恢复。**没配搜索但订了 RSS 时，资讯只用 RSS 也能出。**
 
 **记忆。** MaiWork 会把干活学到的经验记下来：一份全局的、一份每个群单独的，在网页「设置 → 记忆」页可以看和改；每个群的记忆只进那个群的提示词，不跨群。群画像和关注成员的私下画像只给管理员看，不出现在群消息里。
@@ -248,6 +250,7 @@ MaiBot 会自动加载插件。
 | `[[endpoints]] protocol` | string | `"openai"` | 接口格式：`openai` / `anthropic` / `responses` |
 | `[[endpoints]] base_url` | string | `""` | 端点地址，必须 `http(s)://` 开头 |
 | `[[endpoints]] api_key` | string | `""` | 端点密钥（网页上只进不出） |
+| `[[endpoints]] headers` | table | `{}` | 高级请求头覆盖，名称不分大小写；最多 32 项，值只进不出，不能带换行或非 ASCII 字符 |
 | `[[endpoints]] retries` / `retry_delay_s` | int | `5` / `10` | 调用失败最多重试几次 / 两次之间等几秒 |
 | `[[endpoints]] max_concurrency` / `max_rpm` | int | `2` / `0` | 这个端点同时最多几个请求 / 每分钟最多几次（`0` = 不限） |
 | `[[model_list]] id` | string | — | 模型条目 id（规则同上） |
@@ -288,6 +291,7 @@ MaiBot 会自动加载插件。
 
 老版本升上来基本不用手动改，插件启动时会自己迁移；只有想手写配置时才需要看新写法。
 
+- **请求头覆盖（0.7.8 起）**：端点的高级设置新增可选 `headers`，默认空。升级时宿主会自动规范化配置版本（`0.4.6`），保留原有端点、密钥和群设置；没有设置覆盖时，请求行为不变。覆盖插件文件时务必保留自己的 `config.toml`。
 - **模型（0.7.0 起）**：旧 `[models]` 那套四槽（`base_url` / `api_key` / `main` / `main_backup` / `worker` / `worker_backup`，加重试和限流）会在启动时**自动迁移**成「一个默认端点 + 模型库 + 各岗位的选择」；迁移成功后旧 `[models]` 才从 `config.toml` 里删掉，旧文件会先备份到 `<数据目录>/config-backups/`。新写法是 `[[endpoints]]` + `[[model_list]]`（见上面「模型」表）。
 - **没迁完也不停摆**：模型库还是空的、旧四槽有值时，按旧规则继续干。
 - **搜索**：老的 `[search]` 段不再读了，搜索改成在网页里绑定搜索服务（存数据库）；首次引导里直接勾预设就行。

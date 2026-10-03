@@ -685,6 +685,10 @@ class ConsoleServer:
                 "base_url": str(ep.base_url), "key_set": bool(str(getattr(ep, "api_key", "") or "")),
                 "retries": int(ep.retries), "retry_delay_s": int(ep.retry_delay_s),
                 "max_concurrency": int(ep.max_concurrency), "max_rpm": int(ep.max_rpm),
+                # 网页「按行加头」用：只回名字，绝不回值（值是凭据）
+                "header_names": [
+                    str(k) for k in (getattr(ep, "headers", None) or {}).keys() if str(k or "").strip()
+                ],
             }
             checked = svc.store.kv_get(f"endpoints.checked.{ep.id}") if svc.store is not None else None
             if isinstance(checked, dict):
@@ -725,11 +729,52 @@ class ConsoleServer:
                 return forbid
             return web.json_response(_endpoints_view())
 
+        def _validate_endpoint_headers(raw: Any, saved: Any) -> dict[str, str]:
+            """保存与试连共用：完整名称集合；已存同名空值保留，其余删除。"""
+            if not isinstance(raw, dict):
+                raise ValueError("headers 要是对象（名字→值）")
+            if len(raw) > 32:
+                raise ValueError("请求头个数超了（最多 32 个）")
+            old_ci = {name.lower(): value for name, value in dict(saved or {}).items()}
+            out: dict[str, str] = {}
+            seen: set[str] = set()
+            for raw_name, value in raw.items():
+                error, _ = _cfg.validate_endpoint_header_name(raw_name)
+                if error:
+                    raise ValueError(error)
+                name = raw_name.strip()
+                low = name.lower()
+                if low in seen:
+                    raise ValueError("请求头同名不同大小写重复（名字大小写不敏感）")
+                seen.add(low)
+                if value is not None:
+                    if not isinstance(value, str):
+                        raise ValueError("新请求头的值要填非空字符串")
+                    error = _cfg.validate_endpoint_header_value(value)
+                    if error:
+                        raise ValueError(error)
+                # 先校验再判断空值，换行/控制/超长空白不能被当成「保留」。
+                if value is None or not value.strip():
+                    if low not in old_ci:
+                        raise ValueError("新请求头的值要填非空字符串")
+                    out[name] = old_ci[low]
+                else:
+                    out[name] = value.strip()
+            return out
+
         def _validate_endpoint_payload(
             body: dict[str, Any], path_id: str, existing: dict[str, Any] | None,
         ) -> dict[str, Any]:
             """把网页 body 合出一份端点字典；域名格式错误直接抛 ValueError(中文)。
-            api_key：空串/没给 = 保持 old 值（新建=空），非空串 = 覆盖。"""
+            api_key：空串/没给 = 保持 old 值（新建=空），非空串 = 覆盖。
+
+            headers（只给 PUT / 新建）：没给「headers」键 → 原样保留；给了（对象）= 完整名单
+            覆盖校验只允许可打印 ASCII 头名（名字 ≤128）、值只允许可打印 ASCII + TAB（值 ≤8192；
+            总数 ≤32；禁 Host / Content-Length / Transfer-Encoding / Connection /
+            Proxy-Authorization 等传输/代理头）。已存同名（大小写不敏感）且新值是空串 / null
+            → 保留旧值；不在对象里的删掉（{} = 清空）。同名大小写重复 / 在禁名单里的，
+            错误文案带中文原因，绝不透传值本身。
+            """
             raw_patch: dict[str, Any] = {}
             for key in ("name", "protocol", "base_url"):
                 if key in body:
@@ -749,6 +794,13 @@ class ConsoleServer:
                     cand["api_key"] = str(key_v)
             elif "api_key" not in cand:
                 cand["api_key"] = ""
+
+            saved_headers = dict(cand.get("headers") or {})
+            cand["headers"] = (
+                _validate_endpoint_headers(body["headers"], saved_headers)
+                if "headers" in body else saved_headers
+            )
+
             problems: list[str] = []
             parsed = _cfg._parse_endpoints([cand], problems)
             if problems:
@@ -760,6 +812,7 @@ class ConsoleServer:
                 "id": e.id, "name": e.name, "protocol": e.protocol, "base_url": e.base_url,
                 "api_key": e.api_key, "retries": e.retries, "retry_delay_s": e.retry_delay_s,
                 "max_concurrency": e.max_concurrency, "max_rpm": e.max_rpm,
+                "headers": dict(e.headers or {}),
             }
 
         async def _endpoints_save(
@@ -772,12 +825,16 @@ class ConsoleServer:
             if body is None:
                 return _err(400, "请求体不是 JSON")
             settings = svc.get_settings()
-            entries = [dict(
-                id=str(ep.id), name=str(ep.name), protocol=str(ep.protocol), base_url=str(ep.base_url),
-                api_key=str(getattr(ep, "api_key", "") or ""), retries=int(ep.retries),
-                retry_delay_s=int(ep.retry_delay_s), max_concurrency=int(ep.max_concurrency),
-                max_rpm=int(ep.max_rpm),
-            ) for ep in (getattr(settings, "endpoints", ()) or ())]
+            entries = [
+                dict(
+                    id=str(ep.id), name=str(ep.name), protocol=str(ep.protocol), base_url=str(ep.base_url),
+                    api_key=str(getattr(ep, "api_key", "") or ""), retries=int(ep.retries),
+                    retry_delay_s=int(ep.retry_delay_s), max_concurrency=int(ep.max_concurrency),
+                    max_rpm=int(ep.max_rpm),
+                    headers=dict(getattr(ep, "headers", None) or {}),
+                )
+                for ep in (getattr(settings, "endpoints", ()) or ())
+            ]
             path_id = str(request.match_info["id"]).strip()
             old = next((e for e in entries if e["id"] == path_id), None)
             if create_or_update and old is None:
@@ -815,12 +872,16 @@ class ConsoleServer:
                 return forbid
             settings = svc.get_settings()
             path_id = str(request.match_info["id"]).strip()
-            entries = [dict(
-                id=str(ep.id), name=str(ep.name), protocol=str(ep.protocol), base_url=str(ep.base_url),
-                api_key=str(getattr(ep, "api_key", "") or ""), retries=int(ep.retries),
-                retry_delay_s=int(ep.retry_delay_s), max_concurrency=int(ep.max_concurrency),
-                max_rpm=int(ep.max_rpm),
-            ) for ep in (getattr(settings, "endpoints", ()) or ())]
+            entries = [
+                dict(
+                    id=str(ep.id), name=str(ep.name), protocol=str(ep.protocol), base_url=str(ep.base_url),
+                    api_key=str(getattr(ep, "api_key", "") or ""), retries=int(ep.retries),
+                    retry_delay_s=int(ep.retry_delay_s), max_concurrency=int(ep.max_concurrency),
+                    max_rpm=int(ep.max_rpm),
+                    headers=dict(getattr(ep, "headers", None) or {}),
+                )
+                for ep in (getattr(settings, "endpoints", ()) or ())
+            ]
             if not any(e["id"] == path_id for e in entries):
                 return _err(404, "没有这个端点")
             users = [m for m in (getattr(settings, "model_list", ()) or ()) if str(getattr(m, "endpoint", "")) == path_id]
@@ -871,13 +932,32 @@ class ConsoleServer:
             api_key = str(body.get("api_key") or "")
             if not api_key and ep is not None:
                 api_key = svc.models.endpoint_key(path_id)
+            # 临时 headers（高级设置）：只作用这一次，绝不保存进配置 / kv；和保存接口同一套校验
+            # （名字可打印 ASCII ≤128、值非空可打印 ASCII + TAB ≤8192、禁传输/代理头、
+            # 同名大小写重复拒、总数 ≤32）。body 没带「headers」键 → 不覆盖，走端点已存的
+            # headers（和真实调用一个口径）；带了对象（含空对象）→ 这次只按它，不进名单的
+            # 已存头这次不带上。error 文案不透传值。
+            temp_headers: dict[str, str] = dict(getattr(ep, "headers", {}) or {})
+            temp_secret_values: list[str] = []
+            if "headers" in body:
+                try:
+                    temp_headers = _validate_endpoint_headers(body["headers"], getattr(ep, "headers", {}))
+                except ValueError as e:
+                    return _err(400, str(e))
+                temp_secret_values = list(temp_headers.values())
             try:
-                available = await svc.models.list_models(base_url, api_key, protocol=protocol)
+                available = await svc.models.list_models(
+                    base_url, api_key, protocol=protocol,
+                    headers=temp_headers, endpoint_id=path_id if ep is not None else "",
+                    extra_secrets=temp_secret_values,
+                )
             except Exception as e:
                 message = str(e) or "连接失败"
+                message = _redact_secret(message, _secret_list())
+                message = _redact_secret(message, temp_secret_values)
                 logger.info("端点「%s」测试失败：%s", path_id, message[:120])
                 return web.json_response({"ok": False, "models": [], "error": message})
-            # 存「测试连接」结果（按端点；不是配置）
+            # 存「测试连接」结果（按端点；不是配置）：只记 checked_at / available，绝不放临时头值
             if ep is not None:
                 self._save_endpoint_checked(path_id, base_url, available, protocol)
             return web.json_response({"ok": True, "models": available})
@@ -1258,6 +1338,9 @@ class ConsoleServer:
                         value = str(getattr(endpoint, "api_key", "") or "")
                         if value:
                             secrets.append(value)
+                        for value in dict(getattr(endpoint, "headers", {}) or {}).values():
+                            if value:
+                                secrets.append(str(value))
             except Exception:
                 pass
             return secrets

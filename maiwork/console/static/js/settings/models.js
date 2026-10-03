@@ -128,6 +128,16 @@ function modelRow(x) {
     </div><span class="row-btns"><button class="btn small" data-act="mdl-model-edit" data-id="${esc(x.id)}">改</button><button class="btn small ghost" data-act="mdl-model-del" data-id="${esc(x.id)}">删</button></span></div>`;
 }
 
+let headerSeq = 0;
+function endpointHeaderRow(name = "", old = false) {
+  const id = `ep-hdr-${++headerSeq}`;
+  return `<div class="mdl-header-row" data-old="${old ? "1" : "0"}">
+    <div class="mdl-header-field"><label for="${id}-name">请求头名称</label><input id="${id}-name" class="ep-header-name mono" maxlength="128" spellcheck="false" autocomplete="off" value="${esc(name)}" placeholder="如 User-Agent"${old ? " readonly" : ""} /></div>
+    <div class="mdl-header-field"><label for="${id}-value">值${old ? " · 已填写" : ""}</label><input id="${id}-value" class="ep-header-value" type="password" maxlength="8192" spellcheck="false" autocomplete="new-password" aria-describedby="ep-headers-help" placeholder="${old ? "留空就保留原值" : "填写要发送的值"}" /></div>
+    <button class="btn small ghost" type="button" data-act="mdl-header-del" aria-label="删除${name ? `请求头 ${esc(name)}` : "这个请求头"}">删除</button>
+  </div>`;
+}
+
 function endpointForm(d, isNew) {
   const proto = PROTOCOLS[d.protocol] || PROTOCOLS.openai;
   const avail = (state.mdlAvail || {})[d.id];
@@ -149,7 +159,18 @@ function endpointForm(d, isNew) {
       </div>
       <p class="fine">出错时隔一会儿再试，还不行就换备用模型；经常提示请求太多，就把频率调小。</p>
     </details>
-    <p class="err" id="ep-err" hidden></p>
+    <details class="mdl-more mdl-advanced" id="ep-advanced">
+      <summary>高级设置${(d.header_names || []).length ? ` · ${(d.header_names || []).length} 个请求头覆盖` : ""}</summary>
+      <div class="mdl-advanced-body">
+        <div class="set-name">请求头覆盖</div>
+        <p class="fine">同一端点下的所有模型、测试连接和模型验证都会使用。名称不分大小写；如 User-Agent、Authorization，同名默认头会被覆盖。不设置就沿用默认值。</p>
+        <p class="fine" id="ep-headers-help">值按密钥处理，保存后不回显。已有项留空就保留原值；删除该项即可取消覆盖，恢复默认头。改名称请删掉后重新添加。</p>
+        <div id="ep-headers">${(d.header_names || []).map((h) => endpointHeaderRow(h, true)).join("")}</div>
+        <button type="button" class="btn small" data-act="mdl-header-add">加一个请求头</button>
+        <p class="fine">最多 32 项，只填英文字符，不能带换行。Host、Content-Length 等传输头由程序管理，不能覆盖。</p>
+      </div>
+    </details>
+    <p class="err" id="ep-err" role="alert" hidden></p>
     <div class="actions"><button class="btn primary" type="button" data-act="mdl-ep-save">保存端点</button><button class="btn" type="button" data-act="mdl-cancel">取消</button></div>
   </div>`;
 }
@@ -186,10 +207,33 @@ function showErr(id, text) {
   e.hidden = false;
 }
 
+const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$/;
+const TRANSPORT_HEADERS = new Set(["host", "content-length", "transfer-encoding", "connection", "proxy-authorization", "proxy-authenticate", "proxy-connection", "keep-alive", "te", "trailer", "upgrade", "via"]);
+function readEndpointHeaders() {
+  const headers = Object.create(null);
+  const names = new Set();
+  const rows = [...document.querySelectorAll("#ep-headers .mdl-header-row")];
+  if (rows.length > 32) throw new Error("请求头最多设置 32 项。");
+  for (const row of rows) {
+    const name = row.querySelector(".ep-header-name").value.trim();
+    const value = row.querySelector(".ep-header-value").value;
+    if (!HEADER_NAME.test(name)) throw new Error("请求头名称要填写英文名称，不能带空格或换行，最多 128 个字符。");
+    const lower = name.toLowerCase();
+    if (names.has(lower)) throw new Error("请求头名称重复了（不分大小写），每个名称只保留一项。");
+    if (TRANSPORT_HEADERS.has(lower)) throw new Error("Host、Content-Length 等传输头由程序管理，不能覆盖。");
+    if (value.length > 8192 || /[^\t\x20-\x7e]/.test(value)) throw new Error("请求头值只能包含英文字符，不能带换行或控制字符，最多 8192 个字符。");
+    if (!value && row.dataset.old !== "1") throw new Error("新增的请求头需要填写值；不需要的项请删除。");
+    names.add(lower);
+    headers[name] = value; // 已存行空值由服务端保留；缺失的名称由服务端删除
+  }
+  return headers;
+}
+
 function readEndpoint() {
   const v = (id) => ($(id) ? $(id).value.trim() : "");
   return {
     name: v("ep-name"), protocol: v("ep-proto") || "openai", base_url: v("ep-url"), api_key: v("ep-key") || undefined,
+    headers: readEndpointHeaders(),
     retries: intIn(v("ep-retries"), 0, 10, 5), retry_delay_s: intIn(v("ep-delay"), 1, 60, 10),
     max_concurrency: intIn(v("ep-conc"), 1, 8, 2), max_rpm: intIn(v("ep-rpm"), 0, 600, 0),
   };
@@ -237,14 +281,30 @@ export async function actModels(action, el) {
       state.mdlEdit = { type: "ep", isNew: false, id: ep.id, draft: { ...ep } };
       repaintSheet(); return true;
     }
+    case "mdl-header-add": {
+      const list = $("ep-headers");
+      if (!list) return true;
+      if (list.querySelectorAll(".mdl-header-row").length >= 32) return showErr("ep-err", "请求头最多设置 32 项。"), true;
+      list.insertAdjacentHTML("beforeend", endpointHeaderRow());
+      list.lastElementChild.querySelector(".ep-header-name").focus();
+      return true;
+    }
+    case "mdl-header-del": {
+      const row = el.closest(".mdl-header-row");
+      if (row) row.remove();
+      return true;
+    }
     case "mdl-ep-test": {
       const d = state.mdlEdit && state.mdlEdit.draft;
-      const body = readEndpoint();
+      let body;
+      if ($("ep-err")) $("ep-err").hidden = true;
+      try { body = readEndpoint(); }
+      catch (err) { showErr("ep-err", err.message); return true; }
       const out = $("ep-check");
       if (!/^https?:\/\/\S+$/.test(body.base_url)) { out.textContent = "地址要以 http:// 或 https:// 开头"; out.style.color = "var(--red)"; return true; }
       if (!(d && d.key_set) && !body.api_key) { out.textContent = "先填密钥再测"; out.style.color = "var(--red)"; return true; }
       el.disabled = true; out.style.color = ""; out.textContent = "正在连…";
-      try { await testEndpoint(d.id, { base_url: body.base_url, api_key: body.api_key, protocol: body.protocol }, out); }
+      try { await testEndpoint(d.id, { base_url: body.base_url, api_key: body.api_key, protocol: body.protocol, headers: body.headers }, out); }
       catch (err) { out.textContent = err.message; out.style.color = "var(--red)"; }
       finally { el.disabled = false; }
       return true;
@@ -252,7 +312,10 @@ export async function actModels(action, el) {
     case "mdl-ep-save": {
       const edit = state.mdlEdit;
       if (!edit) return true;
-      const body = readEndpoint();
+      let body;
+      if ($("ep-err")) $("ep-err").hidden = true;
+      try { body = readEndpoint(); }
+      catch (err) { showErr("ep-err", err.message); return true; }
       const problem = !body.name ? "给端点起个名字。" : !/^https?:\/\/\S+$/.test(body.base_url) ? "地址要以 http:// 或 https:// 开头。" : !edit.draft.key_set && !body.api_key ? "还没填密钥。" : "";
       if (problem) return showErr("ep-err", problem), true;
       el.disabled = true;

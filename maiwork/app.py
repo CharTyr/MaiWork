@@ -1853,11 +1853,16 @@ class MaiWorkApp:
                     v_s = str(v or "")
                     if v_s:
                         out.append(v_s)
-                # 2026-10 模型改版：所有 [[endpoints]] 的 api_key 也进遮罩（绝不进日志）
+                # 所有端点的 api_key 与高级请求头值都进遮罩（绝不进日志/工具摘要）
                 for ep in (getattr(self._settings, "endpoints", ()) or ()):
-                    v_s = str(getattr(ep, "api_key", "") or "")
-                    if v_s and v_s not in out:
-                        out.append(v_s)
+                    values = [getattr(ep, "api_key", ""), *dict(getattr(ep, "headers", {}) or {}).values()]
+                    for value in values:
+                        v_s = str(value or "")
+                        if v_s and v_s not in out:
+                            out.append(v_s)
+                        scheme, sep, token = v_s.partition(" ")
+                        if sep and scheme.lower() in ("bearer", "basic") and token.strip() and token.strip() not in out:
+                            out.append(token.strip())
                 # [[extensions.mcp]] headers 的值：密钥只进不出，摘要统一遮罩
                 mcp_entries = getattr(getattr(self._settings, "extensions", None), "mcp", ()) or ()
                 for entry in mcp_entries:

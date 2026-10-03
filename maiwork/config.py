@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -73,7 +73,7 @@ def _norm_accounts(values: object, field_zh: str, problems: list[str]) -> tuple[
     return tuple(out)
 
 
-CONFIG_VERSION = "0.4.5"  # 0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）；0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
+CONFIG_VERSION = "0.4.6"  # 0.4.6：每端点高级请求头 headers（默认空）；0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）；0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
 
 # 插件目录 = 本文件所在目录；默认数据目录 = 插件目录上两级 / data / maiwork
 # （线上 <MaiBot>/plugins/CharTyr_MaiWork → <MaiBot>/data/maiwork）
@@ -224,6 +224,7 @@ class EndpointItemConfig(PluginConfigBase):
     protocol: str = Field(default="openai", description="协议：openai（/chat/completions）/ anthropic（/v1/messages）/ responses（/v1/responses）")
     base_url: str = Field(default="", description="端点地址，http(s):// 开头")
     api_key: str = Field(default="", description="端点密钥；只进不出，不写日志")
+    headers: dict[str, str] = Field(default_factory=dict, description="高级请求头覆盖；名称不分大小写，值只进不出，不写日志")
     retries: int = Field(default=5, description="同一模型调用失败最多重试几次（0~10）")
     retry_delay_s: int = Field(default=10, description="两次重试之间等几秒（1~60）")
     max_concurrency: int = Field(default=2, description="这个端点同时最多几个请求在路上（1~8）")
@@ -510,6 +511,123 @@ ENDPOINT_PROTOCOLS: tuple[str, ...] = ("openai", "anthropic", "responses")
 _ID_RE = re.compile(r"^[a-z0-9_-]{1,24}$")
 
 
+# 端点请求头覆盖（高级设置）：可打印 ASCII 头名，禁传/代理头（RFC 7230 的
+# connection-specific 传输字段 + 隧道验证类头不该让管理员填，会破坏传输层或经代理走错路）。
+_BLOCKED_HEADER_NAMES: frozenset[str] = frozenset(
+    {
+        "host", "content-length", "transfer-encoding", "connection",
+        "keep-alive", "te", "trailer", "upgrade",
+        "proxy-authorization", "proxy-authenticate", "proxy-connection", "via",
+    }
+)
+
+_HEADER_NAME_MAX = 128
+_HEADER_VALUE_MAX = 8192
+_ENDPOINT_HEADERS_MAX = 32
+
+
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+
+def validate_endpoint_header_name(name: Any) -> tuple[str, int]:
+    """校验一个端点请求头名（规则同 docs/02 设计；RFC 7230 的 token 语法）。
+
+    回 (中文错误, 违例处下标)；通过 = ("", -1)。错误文案只说规则，不携带头名本身
+    （头名走网页「按行加头」时也会进错误提示，不带更保稳）。
+    """
+    s = str(name or "").strip(" \t")
+    if not s:
+        return "请求头名不能为空", -1
+    if len(s) > _HEADER_NAME_MAX:
+        return f"请求头名太长（上限 {_HEADER_NAME_MAX} 个字符）", -1
+    if not _HEADER_NAME_RE.fullmatch(s):
+        # 仅可打印 ASCII + HTTP token 字符（!#$%&'*+-.^_`|~ 和字母数字）；冒号 / 空格 /
+        # 控制字符 / 非 ASCII / 别的标点一律拒
+        return (
+            "请求头名不合法（只能是 HTTP token 字符：字母数字和 !#$%&'*+-.^_`|~，"
+            "不含空格、冒号、非 ASCII）",
+            -1,
+        )
+    if s.lower() in _BLOCKED_HEADER_NAMES:
+        return (
+            f"请求头 {s} 是传输 / 代理专用头：让它随便盖会破坏 HTTP 传输（分块、长度、连接）"
+            "，或经代理走错验证，这类头一律不收",
+            -1,
+        )
+    return "", -1
+
+
+def validate_endpoint_header_value(value: Any) -> str:
+    """校验一个端点请求头值；通过 = ""。允许可打印 ASCII + TAB；禁换行 / 控制 / DEL /
+    非 ASCII。错误文案只说规则，绝不携带值（value 常是密钥）。"""
+    s = str(value) if value is not None else ""
+    if len(s) > _HEADER_VALUE_MAX:
+        return f"请求头值太长（上限 {_HEADER_VALUE_MAX} 个字符）"
+    for ch in s:
+        o = ord(ch)
+        if ch == "\t":
+            continue
+        if o < 0x20 or o > 0x7E:
+            return (
+                "请求头值含不合法字符（只能用可打印 ASCII 和 TAB；不含换行、控制字符、"
+                "DEL、非 ASCII）"
+            )
+    return ""
+
+
+def validate_endpoint_headers_pairs(raw: Any, eid_obj: Any) -> tuple[list[tuple[str, str]], list[str]]:
+    """把「名字→值」对象收成成对清单（保序）；不合法的条目逐个丢，记中文问题。
+
+    - 名字长度 ≤128、可打印 ASCII（禁空格 / 冒号 / 控制 / 非 ASCII）、传输/代理头拒；
+    - 值必须是非空 string（空串 / None / 别的类型 = 丢条目）；
+    - 同名大小写重复报错；数量 ≤32。
+    错误文案只说规则 + 永远带 headers 标签（不落明文值），成对清单里放
+    (规范化名字, 去首尾空白的值)。
+    """
+    pairs: list[tuple[str, str]] = []
+    problems: list[str] = []
+    if raw is None:
+        return pairs, problems
+    eid = str(eid_obj or "").strip() or "?"
+    if not isinstance(raw, Mapping):
+        problems.append(f'端点 headers 解析：端点 "{eid}" 的 headers 不是表，整份 headers 丢弃')
+        return pairs, problems
+    for k, v in raw.items():
+        err, _ = validate_endpoint_header_name(k)
+        if err:
+            problems.append(f'端点 headers 解析（"{eid}"）：{err}，这条头丢弃')
+            continue
+        if not isinstance(v, str):
+            problems.append(
+                f'端点 headers 解析（"{eid}"）：一个请求头的值不是字符串（类型不对），这条头丢弃'
+            )
+            continue
+        err_v = validate_endpoint_header_value(v)
+        if err_v:
+            problems.append(f'端点 headers 解析（"{eid}"）：{err_v}，这条头丢弃')
+            continue
+        pairs.append((str(k).strip(), str(v).strip()))
+    # 同名大小写重复整份丢（不让「两个同名不同大小写」蒙混过；网页/配置共用一条规则）
+    lowered: dict[str, str] = {}
+    duplicate = False
+    for name, _ in pairs:
+        low = name.lower()
+        if low in lowered:
+            duplicate = True
+        lowered[low] = name
+    if duplicate:
+        problems.append(
+            f'端点 headers 解析（"{eid}"）：请求头同名不同大小写重复（大小写不敏感），整份 headers 丢弃改前请先排开'
+        )
+        return [], problems
+    if len(pairs) > _ENDPOINT_HEADERS_MAX:
+        problems.append(
+            f'端点 headers 解析（"{eid}"）：请求头个数超了（最多 {_ENDPOINT_HEADERS_MAX} 个），整份 headers 丢弃'
+        )
+        return [], problems
+    return pairs, problems
+
+
 @dataclass(frozen=True)
 class EndpointSetting:
     """一个 [[endpoints]] 规范化后的快照（2026-10 模型改版阶段 1a）。"""
@@ -523,6 +641,9 @@ class EndpointSetting:
     retry_delay_s: int = 10
     max_concurrency: int = 2
     max_rpm: int = 0
+    # 请求头覆盖（高级设置）：内部 MappingProxyType，外部当 Mapping 用；
+    # 名字保留原始大小写（大小写不敏感合并时按它替代默认头），值是凭据（只进不出）
+    headers: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
 
 
 @dataclass(frozen=True)
@@ -1121,11 +1242,16 @@ def _parse_endpoints(raw: Any, problems: list[str]) -> tuple[EndpointSetting, ..
             retry_delay_s = _require_int(entry.get("retry_delay_s", 10), 1, 60, f'端点 "{eid}" 的 retry_delay_s')
             max_concurrency = _require_int(entry.get("max_concurrency", 2), 1, 8, f'端点 "{eid}" 的 max_concurrency')
             max_rpm = _require_int(entry.get("max_rpm", 0), 0, 600, f'端点 "{eid}" 的 max_rpm')
+            # 请求头覆盖（高级设置）：非法条目逐个丢记问题，合法（名字, 值）对 MappingProxyType
+            headers_pairs, headers_problems = validate_endpoint_headers_pairs(entry.get("headers"), eid)
+            for msg in headers_problems:
+                problems.append(msg)
             out.append(
                 EndpointSetting(
                     id=eid, name=name, protocol=protocol, base_url=base_url, api_key=api_key,
                     retries=retries, retry_delay_s=retry_delay_s,
                     max_concurrency=max_concurrency, max_rpm=max_rpm,
+                    headers=MappingProxyType(dict(headers_pairs)),
                 )
             )
             seen.add(eid)

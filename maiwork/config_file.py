@@ -43,7 +43,7 @@ _AOT_FIELDS: dict[str, tuple[str, ...]] = {
 # 顶层「整段就是表数组」的两节（2026-10 模型改版）：只能整段重写（增删改都在内存里
 # 算好整段再写），键顺序固定；空串/空列表的键不写进文件（读回时按默认补全）。
 _AOT_TOP_FIELDS: dict[str, tuple[str, ...]] = {
-    "endpoints": ("id", "name", "protocol", "base_url", "api_key", "retries", "retry_delay_s", "max_concurrency", "max_rpm"),
+    "endpoints": ("id", "name", "protocol", "base_url", "api_key", "retries", "retry_delay_s", "max_concurrency", "max_rpm", "headers"),
     "model_list": ("id", "endpoint", "model", "name", "efforts", "vision", "context_window", "max_tokens"),
 }
 

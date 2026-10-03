@@ -1594,6 +1594,21 @@ a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 .mdl-efforts { display: flex; flex-wrap: wrap; gap: 6px 16px; }
 .mdl-more { margin-top: 8px; }
 .mdl-more summary { cursor: pointer; color: var(--gray); font-size: 14px; }
+.mdl-advanced > summary { color: var(--ink-2); min-height: 44px; padding: 12px 0; }
+.mdl-advanced > summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 6px; }
+.mdl-advanced-body { display: grid; gap: 12px; padding: 12px 0 4px; border-top: 1px solid var(--line); }
+.mdl-advanced-body .fine { margin: 0; color: var(--ink-2); }
+.mdl-advanced-body > .btn { justify-self: start; min-height: 44px; }
+.mdl-header-row { display: grid; grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr) auto; gap: 8px; align-items: end; margin-bottom: 12px; }
+.mdl-header-field { display: grid; gap: 6px; min-width: 0; }
+.mdl-header-field input { min-width: 0; width: 100%; }
+.mdl-header-field input[readonly] { color: var(--ink-2); background: var(--fill); }
+.mdl-header-row > .btn { min-height: 44px; }
+@media (max-width: 759px) {
+  .mdl-header-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .mdl-header-field { grid-column: 1; }
+  .mdl-header-row > .btn { grid-column: 2; grid-row: 1 / span 2; align-self: center; }
+}
 @media (max-width: 560px) { .mdl-list { margin-left: 4px; padding-left: 10px; } }
 
 /* 专岗页（2026-10）：主模型下面挂头像；设置里 SOUL / AGENTS 两个大框 */

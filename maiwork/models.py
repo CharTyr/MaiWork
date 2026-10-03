@@ -155,15 +155,62 @@ def _limit_from(models_cfg: Any, name: str, default: int, low: int, high: int) -
 
 def _redact(text: str, secrets: list[str]) -> str:
     """把错误原文里的密钥遮掉：已知密钥、"Bearer xxx"、"sk-..." 形式；截断到 300 字。"""
-    out = str(text or "")
-    for s in secrets:
-        if s:
-            out = out.replace(s, "***")
-    out = _BEARER_RE.sub("Bearer ***", out)
-    out = _SK_RE.sub("sk-***", out)
-    if len(out) > _ERR_MAX:
-        out = out[:_ERR_MAX]
+    return _redact_full(text, secrets)[:_ERR_MAX]
+
+
+def _endpoint_headers(entries: Any) -> dict[str, str]:
+    """端点条目/配置影子上的 headers 字段收成普通 dict（缺/不是表/坏值 → 空）。
+
+    headers 是凭据字段：本函数只负责规范化成 dict[str, str]，绝不记日志、不截值。
+    """
+    out: dict[str, str] = {}
+    if entries is None:
+        return out
+    items = getattr(entries, "items", None)
+    if not callable(items):
+        return out
+    try:
+        for k, v in items():
+            name = str(k or "").strip()
+            val = str(v) if v is not None else ""
+            if name:
+                out[name] = val
+    except Exception:
+        return out
     return out
+
+
+def _candidate_secrets(ep: Any) -> list[str]:
+    """这个候选（或一句话端点）要遮的凭据：api_key + 全部请求头值。
+
+    错一句话里可能出现「环境里回显的头 / Authorization / 自定义头」；只要有值一律进
+    遮罩名单，不只在 HTTP 错误节点遮。
+    """
+    secrets: list[str] = []
+    k = str(getattr(ep, "api_key", "") or "")
+    if k:
+        secrets.append(k)
+    for v in _endpoint_headers(getattr(ep, "headers", None)).values():
+        if v and v not in secrets:
+            secrets.append(v)
+    return secrets
+
+
+def _merge_headers(base: dict[str, str], override: Any) -> dict[str, str]:
+    """合并默认头 + 端点覆盖头（大小写不敏感）：同名覆盖（替），不追加重复。
+
+    回一堆新头（含没被覆盖的原默认 + 全部覆盖项）；
+    先优覆盖顺序 = 覆盖项的原始列序，名字沿用覆盖项保留的大小写。
+    """
+    merged: dict[str, str] = dict(base or {})
+    seen = {str(k).lower(): k for k in merged if k}
+    for name, value in _endpoint_headers(override).items():
+        low = name.lower()
+        if low in seen:
+            merged.pop(seen[low], None)
+        seen[low] = name
+        merged[name] = value
+    return merged
 
 
 def _redact_full(text: Any, secrets: list[str]) -> str:
@@ -172,6 +219,9 @@ def _redact_full(text: Any, secrets: list[str]) -> str:
     for s in secrets:
         if s:
             out = out.replace(s, "***")
+            scheme, sep, token = s.partition(" ")
+            if sep and scheme.lower() in ("bearer", "basic") and token.strip():
+                out = out.replace(token.strip(), "***")
     out = _BEARER_RE.sub("Bearer ***", out)
     out = _SK_RE.sub("sk-***", out)
     return out
@@ -1424,6 +1474,23 @@ class Models:
                 out.append(k)
         return out
 
+    def _all_header_values(self, settings: Settings) -> list[str]:
+        """全部端点的请求头值（遮罩名单；和密钥一样，绝不进日志/错误/网页）。"""
+        out: list[str] = []
+        for ep in (getattr(settings, "endpoints", ()) or ()):
+            for v in _endpoint_headers(getattr(ep, "headers", None)).values():
+                if v and v not in out:
+                    out.append(v)
+        return out
+
+    def _all_secret_values(self, settings: Settings) -> list[str]:
+        """密钥 + 头值合在一起的遮罩名单（一次去重）。"""
+        out = self._all_endpoint_keys(settings)
+        for v in self._all_header_values(settings):
+            if v and v not in out:
+                out.append(v)
+        return out
+
     def endpoint_key(self, endpoint_id: str) -> str:
         """给网页「测试连接」用：按端点 id 取密钥（不给密钥值出网页，只进请求头）。"""
         settings = self._get_settings()
@@ -1550,7 +1617,10 @@ class Models:
         efforts = sorted(
             str(v) for v in (getattr(entry, "efforts", ()) or ()) if str(v) in _EFFORT_LEVELS
         )
-        return {
+        headers_pairs = sorted(
+            (str(k), str(v)) for k, v in _endpoint_headers(getattr(ep, "headers", None)).items()
+        )
+        material = {
             "v": 1,
             "entry_id": str(entry_id or ""),
             "endpoint_id": str(getattr(ep, "id", "") or ""),
@@ -1563,6 +1633,13 @@ class Models:
             "efforts": efforts,
             "vision": bool(getattr(entry, "vision", False)),
         }
+        # 头非空时才进签名（只放散列后的指纹，不放明文）：老配置（没配过头）签名不动；
+        # 改任何一个头（名/值），挂件那条记录的签名立马变 → 旧验证失效
+        if headers_pairs:
+            material["headers_fp"] = hashlib.sha256(
+                json.dumps({"h": headers_pairs}, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+        return material
 
     def verification_stamp(
         self, entry_id: str, *, max_tokens: int | None = None, _caps: tuple | None = None
@@ -1825,7 +1902,42 @@ class Models:
             return base + "/models"
         return base + "/v1/models"
 
-    async def list_models(self, base_url: str, api_key: str = "", protocol: str = "openai") -> list[str]:
+    def _matched_endpoint_headers(
+        self, settings: Settings, base: str, protocol: str, endpoint_id: str = "", api_key: str = ""
+    ) -> dict[str, str]:
+        """优先按端点 id 取头；没指名时按地址、协议、密钥唯一匹配（不猜第一条）。
+
+        网页试连显式指定端点；其他列模型调用只在唯一匹配时继承覆盖，
+        同地址的两个端点不能混用凭据或请求头。
+        """
+        eid = str(endpoint_id or "").strip()
+        if eid:
+            for ep in (getattr(settings, "endpoints", ()) or ()):
+                if str(getattr(ep, "id", "") or "") == eid:
+                    return _endpoint_headers(getattr(ep, "headers", None))
+            return {}
+        want_url = str(base or "").strip().rstrip("/").lower()
+        want_proto = str(protocol or "openai").strip().lower()
+        matches = []
+        for ep in (getattr(settings, "endpoints", ()) or ()):
+            url = str(getattr(ep, "base_url", "") or "").strip().rstrip("/").lower()
+            proto = str(getattr(ep, "protocol", "openai") or "openai").strip().lower()
+            key = str(getattr(ep, "api_key", "") or "")
+            if url == want_url and proto == want_proto and key == api_key:
+                matches.append(ep)
+        # 同地址/协议/密钥仍有多条时无法分清，必须显式指定端点，不猜第一条。
+        return _endpoint_headers(getattr(matches[0], "headers", None)) if len(matches) == 1 else {}
+
+    async def list_models(
+        self,
+        base_url: str,
+        api_key: str = "",
+        protocol: str = "openai",
+        *,
+        headers: Any = None,
+        endpoint_id: str = "",
+        extra_secrets: list[str] | None = None,
+    ) -> list[str]:
         """列端点上的模型（「测试连接」也用它）。三种协议：
 
         - openai / responses：GET {base}/models（Authorization: Bearer key）
@@ -1834,21 +1946,42 @@ class Models:
         返回模型 id 字符串列表（{"data":[...]}；{"models":[...]} 认 name/id）。
         api_key 空则用已存的（旧 [models] 密钥；新链路调用方会传端点密钥）。没有密钥抛
         ModelError。成功时不自动保存。端点在 429 冷却里直接报「约 N 秒后再试」。
+
+        headers：调用方给的「这次测试用」临时请求头覆盖（只作用这一次，绝不落配置/落库）。
+        没传临时头又没指 endpoint_id 时，会按 (地址, 协议, 密钥) 唯一匹配这个端点的
+        已存 headers 来盖（测试连接 / 拉模型列表和真实调用同样吃端点覆盖头）。遮罩名单
+        = key + 配置端点头值 + extra_secrets（临时头值）。
         """
-        key = str(api_key or "") or self._current_key(self._get_settings())
+        settings = self._get_settings()
+        key = str(api_key or "") or self._current_key(settings)
         if not key:
             raise ModelError("没有可用的模型密钥")
         proto = str(protocol or "openai").strip().lower()
         base = str(base_url or "").strip().rstrip("/")
+        mask: list[str] = self._all_secret_values(settings) + [key]
+        for v in (extra_secrets or []):
+            s = str(v or "")
+            if s and s not in mask:
+                mask.append(s)
         if proto == "anthropic":
             url = self._anthropic_models_url(base)
-            headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+            base_headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
         else:
             url = base + "/models"
-            headers = {"Authorization": f"Bearer {key}"}
+            base_headers = {"Authorization": f"Bearer {key}"}
+        stored = self._matched_endpoint_headers(settings, base, proto, endpoint_id=endpoint_id, api_key=key)
+        if headers is None:
+            override = stored
+        else:
+            override = _endpoint_headers(headers)
+        # 名字沿覆盖项替换默认头（大小写不敏感），绝不追加重复
+        merged = _merge_headers(base_headers, override)
+        for v in [*stored.values(), *override.values()]:
+            if v and v not in mask:
+                mask.append(v)
         endpoint = self._throttle.normalize(base)
         conc = _limit_from(
-            getattr(self._get_settings(), "models", None), "max_concurrency", _MAX_CONCURRENCY_DEFAULT, 1, 64
+            getattr(settings, "models", None), "max_concurrency", _MAX_CONCURRENCY_DEFAULT, 1, 64
         )
         # 列模型 / 测连接：端点还在 429 冷却就直接说还要等几秒（别马上再打，也别让网页干转圈）；
         # 不占并发名额、不算每分钟额度
@@ -1857,9 +1990,9 @@ class Models:
             raise ModelError(f"这个端点刚被限流（429），约 {max(1, round(left))} 秒后再试")
         client = self._get_client()
         try:
-            resp = await client.get(url, headers=headers, timeout=30)
+            resp = await client.get(url, headers=merged, timeout=30)
         except httpx.HTTPError as e:
-            raise ModelError(_redact(f"请求模型列表失败：{e}", [key])) from None
+            raise ModelError(_redact(f"请求模型列表失败：{e}", mask)) from None
         if resp.status_code == 429:
             self._throttle.note_429(
                 endpoint, _parse_retry_after(resp.headers.get("Retry-After"), _NOW()), concurrency=conc
@@ -1868,7 +2001,7 @@ class Models:
             self._throttle.note_success(endpoint, concurrency=conc)
         if resp.status_code != 200:
             raise ModelError(
-                _redact(f"模型列表接口返回 {resp.status_code}：{resp.text}", [key]),
+                _redact(f"模型列表接口返回 {resp.status_code}：{resp.text}", mask),
                 status=resp.status_code,
             )
         try:
@@ -1884,7 +2017,8 @@ class Models:
                     continue
                 mid = str(item.get("id") or item.get("name") or "").strip()
                 if mid:
-                    out.append(mid)
+                    # 端点在模型 id / 名字里回显凭据：一项值一个不漏全遮（凭据只进不出）
+                    out.append(_redact_full(mid, mask))
             return out
         except ValueError:
             raise ModelError("模型列表返回格式不对") from None
@@ -1966,8 +2100,9 @@ class Models:
         # 思考强度：跟「用谁的链」一致——用它自己的 profile 强度；兜底用主模型的
         requested_effort = self._profile_effort(role_kind)
 
-        # 所有端点的密钥都进遮罩名单（备用在另一个端点时也可能泄进错误文本）
-        secret_keys = self._all_endpoint_keys(settings)
+        # 所有端点的密钥 + 全部请求头值都进遮罩名单（备用在另一个端点时也可能泄进错误文本）
+        secret_keys = self._all_secret_values(settings)
+        secret_keys = [s for s in secret_keys if s]
         last_err: ModelError | None = None
         attempt = 0
         client = self._get_client()
@@ -1981,19 +2116,25 @@ class Models:
             ep_delay_s = float(_limit_from(ep, "retry_delay_s", 10, 1, 60))
             max_conc = _limit_from(ep, "max_concurrency", _MAX_CONCURRENCY_DEFAULT, 1, 64)
             max_rpm = _limit_from(ep, "max_rpm", 0, 0, 1_000_000)
-            # 三种协议的地址 + 请求头；不认识的（防配置漏校验）跳过这个候选尝下一个
+            cand_secrets = _candidate_secrets(ep)
+            for s in cand_secrets:
+                if s and s not in secret_keys:
+                    secret_keys.append(s)
+            # 三种协议的地址 + 请求头；端点 headers 覆盖（大小写不敏感替换，不追加重复）后
+            # 再发；不认识的（防配置漏校验）跳过这个候选尝下一个
             if protocol == "openai":
                 url = base_url + "/chat/completions"
-                headers = {"Authorization": f"Bearer {key}"}
+                base_headers = {"Authorization": f"Bearer {key}"}
             elif protocol == "responses":
                 url = base_url + "/responses"
-                headers = {"Authorization": f"Bearer {key}"}
+                base_headers = {"Authorization": f"Bearer {key}"}
             elif protocol == "anthropic":
                 url = _anthropic_messages_url(base_url)
-                headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+                base_headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
             else:
                 last_err = ModelError(f"端点「{getattr(ep, 'name', '')}」的协议「{protocol}」不认识（只能 openai / responses / anthropic）")
                 continue
+            headers = _merge_headers(base_headers, _endpoint_headers(getattr(ep, "headers", None)))
             # 这个候选能发的强度：岗位请求的强度得在这个条目的 efforts 里勾了才发；
             # 条目没勾任何 efforts（空）= 不支持思考强度 → 永不发
             effort_send = requested_effort if requested_effort in cand.efforts else ""
@@ -2060,7 +2201,8 @@ class Models:
                     else:
                         d = str(e).strip()
                         detail = f"网络错误（{type(e).__name__}）{('：' + d) if d else ''}"
-                    last_err = ModelError(_redact(detail, [key]), status=502 if isinstance(e, _StreamError) else None)
+                    cand_mask = secret_keys
+                    last_err = ModelError(_redact(detail, cand_mask), status=502 if isinstance(e, _StreamError) else None)
                     self._log_attempt(
                         model, role_effective, attempt, ok=False, status=status if isinstance(e, _StreamError) else 0, ms=ms,
                         prompt_tokens=0, completion_tokens=0, error=last_err.message,
@@ -2079,7 +2221,7 @@ class Models:
                     shown = "200 但内容是错误"
                 if status >= 500 or status in (429, 408):
                     last_err = ModelError(
-                        _redact(f"端点返回 {shown}：{err_text}", [key]),
+                        _redact(f"端点返回 {shown}：{err_text}", secret_keys),
                         status=status,
                     )
                     if status == 429:
@@ -2102,7 +2244,7 @@ class Models:
                 if status != 200:
                     # 其他 4xx：不重试、不换备用，直接抛——除非 400 点名了能改的参数（改了立刻重发）
                     err = ModelError(
-                        _redact(f"端点返回 {shown}：{err_text}", [key]),
+                        _redact(f"端点返回 {shown}：{err_text}", secret_keys),
                         status=status,
                     )
                     self._log_attempt(
@@ -2132,7 +2274,7 @@ class Models:
                     else:
                         result = _parse_anthropic_response(data, model)
                 except ModelError as e:
-                    msg = _redact(str(e), [key])
+                    msg = _redact(str(e), secret_keys)
                     self._log_attempt(
                         model, role_effective, attempt, ok=False, status=200, ms=ms,
                         prompt_tokens=0, completion_tokens=0, error=msg,
@@ -2504,7 +2646,7 @@ class Models:
                         int(completion_tokens),
                         1 if ok else 0,
                         int(ms),
-                        str(error or ""),
+                        error_db,
                         usage_src_s,
                         cache_read_i,
                         cache_write_i,

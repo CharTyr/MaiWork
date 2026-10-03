@@ -50,7 +50,8 @@ class TestDefaults:
         # 0.4.3：[feeds] viz_per_day（资讯图解每群每天上限）
         # 0.4.4：[console] update_check、maibot_webui_url（更新提醒）
         # 0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）
-        assert CONFIG_VERSION == "0.4.5"
+        # 0.4.6：每端点高级请求头覆盖 headers（默认空）
+        assert CONFIG_VERSION == "0.4.6"
         assert MaiWorkConfig().plugin.config_version == CONFIG_VERSION
 
     def test_railway_verify_new_fields_defaults(self) -> None:
