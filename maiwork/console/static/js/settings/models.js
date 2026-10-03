@@ -165,8 +165,19 @@ function endpointForm(d, isNew) {
         <div class="set-name">请求头覆盖</div>
         <p class="fine">同一端点下的所有模型、测试连接和模型验证都会使用。名称不分大小写；如 User-Agent、Authorization，同名默认头会被覆盖。不设置就沿用默认值。</p>
         <p class="fine" id="ep-headers-help">值按密钥处理，保存后不回显。已有项留空就保留原值；删除该项即可取消覆盖，恢复默认头。改名称请删掉后重新添加。</p>
-        <div id="ep-headers">${(d.header_names || []).map((h) => endpointHeaderRow(h, true)).join("")}</div>
-        <button type="button" class="btn small" data-act="mdl-header-add">加一个请求头</button>
+        <div class="seg mdl-header-modes" role="group" aria-label="请求头填写方式">
+          <button type="button" data-act="mdl-header-mode" data-mode="rows" aria-pressed="true">按行填写</button>
+          <button type="button" data-act="mdl-header-mode" data-mode="json" aria-pressed="false">JSON</button>
+        </div>
+        <div id="ep-headers-rowsbox">
+          <div id="ep-headers">${(d.header_names || []).map((h) => endpointHeaderRow(h, true)).join("")}</div>
+          <button type="button" class="btn small" data-act="mdl-header-add">加一个请求头</button>
+        </div>
+        <div id="ep-headers-jsonbox" hidden>
+          <label for="ep-headers-json">请求头 JSON</label>
+          <textarea id="ep-headers-json" class="mono-area" rows="8" spellcheck="false" autocomplete="off" autocapitalize="off" aria-describedby="ep-headers-json-help">${esc(headersJsonText(d.header_names || []))}</textarea>
+          <p class="fine" id="ep-headers-json-help">写成 {"名称": "值"}。已保存的项，值写 "" 或 null 就保留原值；不写的名称会被取消覆盖；写 {} 清空全部。值在这里是明文，粘贴时留意周围有没有旁人。</p>
+        </div>
         <p class="fine">最多 32 项，只填英文字符，不能带换行。Host、Content-Length 等传输头由程序管理，不能覆盖。</p>
       </div>
     </details>
@@ -209,24 +220,58 @@ function showErr(id, text) {
 
 const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$/;
 const TRANSPORT_HEADERS = new Set(["host", "content-length", "transfer-encoding", "connection", "proxy-authorization", "proxy-authenticate", "proxy-connection", "keep-alive", "te", "trailer", "upgrade", "via"]);
-function readEndpointHeaders() {
+const HEADER_JSON_ERR = "JSON 格式不对：要写成 {\"名称\": \"值\"} 这样的对象，注意引号和逗号。";
+const savedHeaderNames = () => {
+  const d = state.mdlEdit && state.mdlEdit.draft;
+  return new Set(((d && d.header_names) || []).map((n) => String(n).toLowerCase()));
+};
+const jsonMode = () => { const box = $("ep-headers-jsonbox"); return !!(box && !box.hidden); };
+// 默认 JSON：只列已存名称、值留空（= 保留原值），绝不带出已存的值
+const headersJsonText = (names) => JSON.stringify(Object.fromEntries(names.map((n) => [n, ""])), null, 2);
+
+// 两种填写方式共用一套检查：entries = [[名称, 值, 是否已保存]]
+function checkedHeaders(entries) {
+  if (entries.length > 32) throw new Error("请求头最多设置 32 项。");
   const headers = Object.create(null);
   const names = new Set();
-  const rows = [...document.querySelectorAll("#ep-headers .mdl-header-row")];
-  if (rows.length > 32) throw new Error("请求头最多设置 32 项。");
-  for (const row of rows) {
-    const name = row.querySelector(".ep-header-name").value.trim();
-    const value = row.querySelector(".ep-header-value").value;
+  for (const [rawName, rawValue, isSaved] of entries) {
+    const name = String(rawName).trim();
+    const value = rawValue || "";
     if (!HEADER_NAME.test(name)) throw new Error("请求头名称要填写英文名称，不能带空格或换行，最多 128 个字符。");
     const lower = name.toLowerCase();
     if (names.has(lower)) throw new Error("请求头名称重复了（不分大小写），每个名称只保留一项。");
     if (TRANSPORT_HEADERS.has(lower)) throw new Error("Host、Content-Length 等传输头由程序管理，不能覆盖。");
     if (value.length > 8192 || /[^\t\x20-\x7e]/.test(value)) throw new Error("请求头值只能包含英文字符，不能带换行或控制字符，最多 8192 个字符。");
-    if (!value && row.dataset.old !== "1") throw new Error("新增的请求头需要填写值；不需要的项请删除。");
+    if (!value && !isSaved) throw new Error("新增的请求头需要填写值；不需要的项请删除。");
     names.add(lower);
-    headers[name] = value; // 已存行空值由服务端保留；缺失的名称由服务端删除
+    headers[name] = value; // 已存项空值由服务端保留；缺失的名称由服务端删除
   }
   return headers;
+}
+
+// JSON 文本 → [[名称, 值或 null]]；错误提示不带 JSON 原文和值
+function parseHeadersJson(text) {
+  if (!String(text).trim()) throw new Error("JSON 不能留空：要清空全部请求头请写 {}。");
+  let data;
+  try { data = JSON.parse(text); } catch { throw new Error(HEADER_JSON_ERR); }
+  if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error(HEADER_JSON_ERR);
+  return Object.keys(data).map((key) => {
+    const value = data[key];
+    if (value !== null && typeof value !== "string") throw new Error("请求头的值要写成字符串（用英文引号括起来），不能是数字、true/false 或嵌套对象。");
+    return [key, value];
+  });
+}
+
+const headerRows = () => [...document.querySelectorAll("#ep-headers .mdl-header-row")];
+const rowName = (row) => row.querySelector(".ep-header-name").value.trim();
+const rowValue = (row) => row.querySelector(".ep-header-value").value;
+
+function readEndpointHeaders() {
+  if (jsonMode()) {
+    const saved = savedHeaderNames();
+    return checkedHeaders(parseHeadersJson($("ep-headers-json").value).map(([name, value]) => [name, value, saved.has(name.trim().toLowerCase())]));
+  }
+  return checkedHeaders(headerRows().map((row) => [rowName(row), rowValue(row), row.dataset.old === "1"]));
 }
 
 function readEndpoint() {
@@ -292,6 +337,35 @@ export async function actModels(action, el) {
     case "mdl-header-del": {
       const row = el.closest(".mdl-header-row");
       if (row) row.remove();
+      return true;
+    }
+    case "mdl-header-mode": {
+      const toJson = el.dataset.mode === "json";
+      const jsonBox = $("ep-headers-jsonbox"), rowsBox = $("ep-headers-rowsbox"), text = $("ep-headers-json"), list = $("ep-headers");
+      if (!jsonBox || !rowsBox || !text || !list || toJson === !jsonBox.hidden) return true;
+      if ($("ep-err")) $("ep-err").hidden = true;
+      try {
+        if (toJson) {
+          // 按行 → JSON：带上已输入的值；空白行跳过，同名重复不悄悄合并
+          const pairs = Object.create(null);
+          for (const row of headerRows()) {
+            const name = rowName(row), value = rowValue(row);
+            if (!name && !value) continue;
+            if (name in pairs) throw new Error("请求头名称重复了，先改成不同名称再切换。");
+            pairs[name] = value;
+          }
+          text.value = JSON.stringify(pairs, null, 2);
+        } else {
+          // JSON → 按行：已保存的名称（不分大小写）当作已存项，名称只读、值留空 = 保留
+          const saved = savedHeaderNames();
+          const entries = parseHeadersJson(text.value);
+          list.innerHTML = entries.map(([name]) => endpointHeaderRow(name, saved.has(name.trim().toLowerCase()))).join("");
+          headerRows().forEach((row, i) => { row.querySelector(".ep-header-value").value = entries[i][1] || ""; });
+        }
+      } catch (err) { showErr("ep-err", err.message); return true; }
+      jsonBox.hidden = !toJson;
+      rowsBox.hidden = toJson;
+      document.querySelectorAll('[data-act="mdl-header-mode"]').forEach((b) => b.setAttribute("aria-pressed", String((b.dataset.mode === "json") === toJson)));
       return true;
     }
     case "mdl-ep-test": {

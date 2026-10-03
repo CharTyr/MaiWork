@@ -1604,6 +1604,13 @@ a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 .mdl-header-field input { min-width: 0; width: 100%; }
 .mdl-header-field input[readonly] { color: var(--ink-2); background: var(--fill); }
 .mdl-header-row > .btn { min-height: 44px; }
+.mdl-header-modes { margin: 0; justify-self: start; }
+.mdl-header-modes button { min-height: 44px; }
+.mdl-header-modes button[aria-pressed="true"] { background: var(--card); color: var(--ink); box-shadow: 0 2px 8px rgba(var(--sh), 0.08); }
+.mdl-header-modes button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.mdl-advanced-body .mono-area { width: 100%; min-height: 160px; resize: vertical; }
+#ep-headers-jsonbox { display: grid; gap: 8px; }
+#ep-headers-jsonbox[hidden], #ep-headers-rowsbox[hidden] { display: none; }
 @media (max-width: 759px) {
   .mdl-header-row { grid-template-columns: minmax(0, 1fr) auto; }
   .mdl-header-field { grid-column: 1; }
