@@ -3,9 +3,12 @@
 红线（02 §5）：群友派的活（任务、agent 目标、构想转成的活）按配置要 bot 管理员批准，
 **未批准不开工**。免批的就直接落地。
 
-规则：
-- 免批条件：`approval.required=False`，或群号出现在 `exempt_groups`（配置里写 "qq:123" 或 "123" 都认），
-  或发起人出现在 `exempt_users`。
+规则（0.8.0 归一，docs/18 §五「每群一个谁能批本群的活（含免批）」）：
+- 免批条件只看**本群**那份记录 `kv["group_approval.<群号>"]`：`required=False`、或
+  `exempt_group=True`、或发起人在 `exempt_users`；`is_admin(user_id, platform, group_id=群号)`
+  也只看这份记录的 `approvers`。首次访问从旧来源（全局 `approval.*` ∪ 旧
+  `kv["group_admins.<群号>"]`）惰性种一次，之后不再和全局名单动态并集
+  （见 group_approval.py）。
 - 非免批 → pending；approve/reject 只能处理 pending，重复操作抛 ValueError。
 - 落地：kind="task" → Tasks.create(status="queued", source="request", request_id=…)，
   把 request.task_id 指回去；kind="goal" → Goals.create_agent(...)。
@@ -28,6 +31,7 @@ from typing import Any, Callable, Iterable
 
 from . import clock, members
 from .goals import Goals
+from .group_approval import GroupApprovals
 from .store import Store, next_id
 from .tasks import Tasks
 
@@ -101,11 +105,20 @@ def _parse_item_nos(raw: Any) -> list[int]:
 
 
 class Approvals:
-    def __init__(self, store: Store, get_settings: Callable[[], Any], tasks: Tasks, goals: Goals) -> None:
+    def __init__(
+        self,
+        store: Store,
+        get_settings: Callable[[], Any],
+        tasks: Tasks,
+        goals: Goals,
+        group_approvals: GroupApprovals | None = None,
+    ) -> None:
         self._store = store
         self._get_settings = get_settings
         self._tasks = tasks
         self._goals = goals
+        # 每群批准名单（group_approval.py）；默认自己建一份，接线不用改 app.py
+        self._group_approvals = group_approvals or GroupApprovals(store, get_settings=get_settings)
         # 自动审核回调（auto_review.py；app 注入）：刚记下一条要人批的请求 → hook(请求 id, 群号)。
         # 只登记、不在这里做慢活（审核是异步的，绝不卡住收消息钩子）。
         self._review_hook: Callable[[str, str], Any] | None = None
@@ -114,37 +127,33 @@ class Approvals:
     # 规则
     # ------------------------------------------------------------------
 
-    def is_admin(self, user_id: Any, platform: str = "qq") -> bool:
-        """按「平台:账号」比对（MaiBot 标准写法）；目前服务的都是 qq 群，platform 默认 qq。"""
+    def is_admin(self, user_id: Any, platform: str = "qq", *, group_id: str | None = None) -> bool:
+        """这个账号能不能批**这个群**的活。
+
+        - `group_id` 有值（生产路径全走这条）：只看本群 `group_approval.<群号>.approvers`，
+          种下以后不再回全局名单并集（commands / can_cancel 必须传 gid）。
+        - `group_id` 缺省：兼容老的纯数据层测试，退回全局 `approval.admins`；
+          **真实路径不许用这条**（会跨群、会绕过每群名单）。
+        """
         from .config import norm_account
 
         uid = _norm(user_id)
         if not uid:
             return False
         target = norm_account(f"{platform or 'qq'}:{uid}")
-        return bool(target) and any(norm_account(a) == target for a in self._approval().admins)
+        if not target:
+            return False
+        gid = _norm(group_id)
+        if gid:
+            return target in self._group_approvals.get(gid).approvers
+        return any(norm_account(a) == target for a in self._approval().admins)
 
     def _approval(self) -> Any:
         return self._get_settings().approval
 
     def _is_auto(self, group_id: str, requester_id: Any) -> bool:
-        approval = self._approval()
-        if not bool(getattr(approval, "required", True)):
-            return True
-        from .config import norm_account
-
-        try:
-            plat = self._get_settings().platform_of(_norm(group_id))
-        except Exception:
-            plat = "qq"
-        gkey = norm_account(f"{plat}:{_norm(group_id)}")
-        if gkey and any(norm_account(g) == gkey for g in getattr(approval, "exempt_groups", ())):
-            return True
-        rid = _norm(requester_id)
-        ukey = norm_account(f"{plat}:{rid}") if rid else ""
-        if ukey and any(norm_account(u) == ukey for u in getattr(approval, "exempt_users", ())):
-            return True
-        return False
+        """本群记录说免批 → True（force_manual 在 create 里另行挡下）。"""
+        return self._group_approvals.is_exempt(_norm(group_id), requester_id)
 
     # ------------------------------------------------------------------
     # create / approve / reject
@@ -654,18 +663,26 @@ class Approvals:
     # 取消的权限（发起人 / 群主 / 群管理 / bot 管理员；网页上由管理员账号登入，另行校验）
     # ------------------------------------------------------------------
 
-    def can_cancel(self, kind: str, obj_id: str, user_id: Any, *, group_role: str = "") -> bool:
+    def can_cancel(
+        self, kind: str, obj_id: str, user_id: Any, *, group_role: str = "", group_id: str | None = None
+    ) -> bool:
+        """发起人 / 群主 / 群管理 / 本群批准人 能取消。
+
+        `group_id` 显式给就用它，否则从对象身上取（任务 / 目标都带 group_id）；
+        批准人判断一律按**那个群**的名单（`is_admin(..., group_id=gid)`），不跨群。
+        """
         uid = _norm(user_id)
         if not uid:
             return False
         obj = self._find(kind, obj_id)
+        gid = _norm(group_id) or _norm((obj or {}).get("group_id"))
         plat = "qq"
-        if obj is not None:
+        if gid:
             try:
-                plat = self._get_settings().platform_of(str(obj.get("group_id") or ""))
+                plat = self._get_settings().platform_of(gid)
             except Exception:
                 plat = "qq"
-        if self.is_admin(uid, platform=plat):
+        if gid and self.is_admin(uid, platform=plat, group_id=gid):
             return True
         if _norm(group_role) in ("owner", "admin"):
             return True

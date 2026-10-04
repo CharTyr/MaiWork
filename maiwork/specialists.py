@@ -5,7 +5,9 @@
 - 岗位与群闸：调用前经 Agents.profile/is_served 校验；禁用岗位返回失败 report，不静默换通才。
 - 工具：task 用调用方本次 tools（NULL = 不加岗位裁剪）；news/idea/goal 必做「岗位硬白名单
   ∩ 调用方请求（或空则岗位默认）」交集。交集即为传给 Workers 的 allowed_tools（硬权限，
-  Tools.call 层会拒掉模型捏造的名字）和展示的 tools（specs）。
+  Tools.call 层会拒掉模型捏造的名字）和展示的 tools（specs）。**这份交集只在本文件的
+  `effective_tools` 里算一次**：coordinator 的开工前能力自检也调它，不许另写一套
+  （2026-10 复核：两套分叉会得出「补了执行工具」的假结论）。
 - 技能：allowed_skills = 岗位 skills ∩ skills.list （动态开关已在 list 内处理）。模型不能
   凭名字猜读 skill。
 - handoff：begin/running/returned/fail 自动记录，绝不 auto accept；review 只能由主调用者显式调。
@@ -87,9 +89,17 @@ class Specialists:
         default_set = set(default)
         return tuple(n for n in as_tuple if n in default_set)
 
-    def _resolve_tools(self, kind: str, requested: Any, profile: dict | None = None) -> list[str]:
-        """本次模型可见 tools（specs）。task/白名单 None → 用请求 tools（没给 = 空）；
-        专岗 → 请求 tools（没给 = 岗位白名单）与岗位白名单取交集。"""
+    def effective_tools(self, kind: str, requested: Any, profile: dict | None = None) -> list[str]:
+        """本次 Workers **真正会拿到**的工具名单（角色门控后的）——唯一解析入口。
+
+        外面（`run` 和 coordinator 的开工前能力自检）都从这里拿名单，别再各写一套
+        「岗位上限 ∩ 请求」的交集规则：2026-10 复核发现自检曾经只看计划里的原始
+        `job["tools"]`，把被岗位过滤掉的 `run_command` 当成「已经有执行工具」，
+        于是记了「已补」，子 agent 实际一个执行工具都没有（线上 T-7 白烧 token 的成因）。
+
+        规则：task / 白名单 None → 用请求 tools（没给 = 空）；专岗 → 请求 tools
+        （没给 = 岗位白名单）与岗位白名单取交集。`submit_result` 永远保底。
+        """
         if requested is None:
             requested_list: list[str] = []
         else:
@@ -107,6 +117,30 @@ class Specialists:
         if "submit_result" not in base:
             base = list(base) + ["submit_result"]
         return base
+
+    def _resolve_tools(self, kind: str, requested: Any, profile: dict | None = None) -> list[str]:
+        """旧名字，兼容保留；唯一实现是 effective_tools（run / 能力自检共用它）。"""
+        return self.effective_tools(kind, requested, profile)
+
+    def role_usable(self, kind: str) -> bool:
+        """这个岗位现在能不能真的跑起来（在册 + enabled）；读不到一律当不可用（fail-closed）。
+
+        只判「岗位在不在、开没开」这一层，不重复查服务群 / is_served（那由 coordinator
+        的 run_task 在更前面把关）。开工前能力自检靠它区分两种「没执行工具」：
+        - 岗位自己不可用 → 这条活根本不会跑，别往它身上补工具；
+        - 岗位可用但上限里没有执行工具 → 补就越权，只能明说做不成。
+        """
+        kind_s = str(kind or "").strip()
+        if not kind_s or kind_s == "main":
+            return False
+        try:
+            profile = self._agents.profile(kind_s)
+        except Exception:
+            return False
+        try:
+            return bool(profile.get("enabled", True))
+        except Exception:
+            return False
 
     def _resolve_allowed_skills(self, kind: str, profile: dict | None = None) -> tuple[str, ...] | None:
         """岗位 skill 白名单 ∩ 当前生效的 skill（动态开关已在 skills.list 内处理）。
@@ -212,15 +246,22 @@ class Specialists:
             )
 
         # 4) 工具 / 技能名单（profile 只能收窄默认上限，不能放大）
-        effective_tools = self._resolve_tools(kind_s, tools, profile)
+        effective_tools = self.effective_tools(kind_s, tools, profile)
         allowed_skills = self._resolve_allowed_skills(kind_s, profile)
         skills_hint = self._skills_hint(allowed_skills)
 
-        # 4) 记忆当数据注入（system_extra）：数据不是指令
+        # 4) 传统「工作册 + 最近做过的」之外再统一注入「本群规矩 + 本群做法」（每群三份）；
+        # 记忆当数据注入（system_extra）：数据不是指令
         try:
             memory_text = str(self._agents.prompt(gid, kind_s) or "").strip()
         except Exception:
             memory_text = ""
+        try:
+            from . import group_context as _gc
+
+            gc_text = str(_gc.group_context(self._agents, gid, kind_s) or "").strip()
+        except Exception:
+            gc_text = ""
         extra_parts: list[str] = [
             (
                 "你这次是被 MaiWork 派来干这个岗位的活（" + kind_s + "）。"
@@ -231,6 +272,9 @@ class Specialists:
         ]
         if memory_text:
             extra_parts.append(memory_text)
+        # 每群三份（docs/17 §八.2）：本群规矩（硬规矩）+ 本群<岗>的做法（参考）
+        if gc_text:
+            extra_parts.append(gc_text)
         system_extra = "\n\n".join(extra_parts)
 
         # 5) 登记交接单（begin → running → returned/fail；绝不 auto accept）

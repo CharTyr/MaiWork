@@ -69,18 +69,8 @@ export function memoryPage(s) {
   const d = state.identity;
   if (!d) return loading();
   const lim = d.limits || {};
-  const gm = d.group_memory || {};
-  const groups = s.groups || [];
   return `
     <p class="h-meta">MaiWork 做事时记下的经验。主模型会自己往里记，你也可以直接改。</p>
     ${idBlock("memory", "工作记忆（全局）", "所有群通用的经验，不写具体的群和人", d.memory, lim.memory)}
-    <h2 class="h-sub">每个群的偏好</h2>
-    <p class="h-meta" style="margin-top:-6px">每个群各自的偏好和经验，只在那个群里用，不会带到别的群</p>
-    ${
-      groups.length
-        ? groups
-            .map((g) => idBlock(`group:${g.id}`, esc(g.name || `群 ${g.id}`), "", gm[g.id], lim.group_memory || 16384))
-            .join("")
-        : `<p class="h-meta">还没有服务群。</p>`
-    }`;
+    <p class="fine">每个群自己的规矩和做法在群页的「这个群」区。</p>`;
 }

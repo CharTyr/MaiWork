@@ -23,7 +23,6 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from . import clock
 from .skills import (
     BUILTIN_ROOT,
     KV_SKILLS_DISABLED,
@@ -397,15 +396,6 @@ def delete(data_dir: Path | str, store: Any, name: str) -> None:
     logger.info("网页删除 skill %s", name)
 
 
-def _now_ts() -> float:
-    return clock.now()
-
-
-# ----------------------------------------------------------------------
-# 开关（POST /api/extensions/skills/{name}/toggle）
-# ----------------------------------------------------------------------
-
-
 def toggle(data_dir: Path | str, store: Any, name: str, enabled: bool) -> None:
     """网页把 skill 开关拨成 开/关：存 kv["extensions.skills.disabled"] 名单。
 
@@ -465,16 +455,6 @@ def _zipfilename_to_name(filename: str) -> str:
     return base.strip()
 
 
-def _pick_skill_name(infos: list[Any], skill_md_rel: str, fallback_names: list[str]) -> str:
-    """优先级：front matter name > 顶层目录名 > zip 文件名。非法抛 ValueError。"""
-    # front matter
-    for info in infos:
-        if info.filename == skill_md_rel:
-            text = info  # placeholder replaced below
-            break
-    return ""  # 由 install_zip 内联做完（zip 读内容要用 zf.read，不在这一层）
-
-
 def _normalize_uploaded_name(infos: Any, skill_md_rel: str, filename: str, zip_file: Any) -> str:
     """front matter name → 顶层目录 → zip 文件名。"""
     raw_text = zip_file.read(skill_md_rel)[:_ZIP_SKILL_MD_MAX].decode("utf-8", errors="replace")
@@ -494,18 +474,6 @@ def _atomic_replace_dir(src: Path, dst: Path) -> None:
     if dst.exists() or dst.is_symlink():
         shutil.rmtree(os.path.realpath(str(dst)))
     src.rename(dst)
-
-
-def _zip_common_top(infos: list[Any]) -> str:
-    """所有文件都挂在同一个顶层目录下 → 返回那个目录名；否则 ""（根/SKILL.md）。"""
-    tops: set[str] = set()
-    for info in infos:
-        rel = _safe_zip_member(info.filename)
-        first = rel.split("/", 1)[0]
-        tops.add(first)
-    if len(tops) == 1:
-        return next(iter(tops))
-    return ""
 
 
 def install_zip(store: Any, data_dir: Path | str, blob: bytes, *, filename: str = "", replace: bool = False) -> dict[str, Any]:

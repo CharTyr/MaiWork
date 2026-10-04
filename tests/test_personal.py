@@ -965,6 +965,7 @@ class _fake_clock:
         self._ts = ts
 
     def __enter__(self):
+        self._clock_orig = clock.now
         clock.now = lambda: self._ts
         import CharTyr_MaiWork.maiwork.app as app_mod
 
@@ -974,6 +975,7 @@ class _fake_clock:
         return self
 
     def __exit__(self, *exc):
+        clock.now = self._clock_orig
         self._app_mod._now = self._app_orig
 
 

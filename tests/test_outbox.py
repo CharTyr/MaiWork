@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork import clock, group_push
 from CharTyr_MaiWork.maiwork.config import load_settings
 from CharTyr_MaiWork.maiwork.delivery import Mentions, Pushes
 from CharTyr_MaiWork.maiwork.host import HostError
@@ -37,21 +37,32 @@ MORNING = _ts(8, 30, day=16)  # 时段结束后（推迟到次日 08:00）
 
 
 class OutboxHost:
-    """假的宿主发送口：记录 send_text / upload_group_file，可预置错误队列。"""
+    """假的宿主发送口：记录 send_text / send_image / upload_group_file，可预置错误队列。"""
 
     def __init__(self) -> None:
         self.texts: list[dict] = []
+        self.images: list[dict] = []
         self.uploads: list[dict] = []
         self.text_errors: list[Exception] = []
+        self.image_errors: list[Exception] = []
         self.upload_errors: list[Exception] = []
         self.msg_seq = 0
 
-    async def send_text(self, session_id: str, text: str, *, reply_to: str = "") -> object:
-        self.texts.append({"session_id": session_id, "text": text, "reply_to": reply_to})
+    async def send_text(self, session_id: str, text: str, *, reply_to: str = "",
+                        at_user: str = "", at_name: str = "") -> object:
+        self.texts.append({"session_id": session_id, "text": text, "reply_to": reply_to,
+                           "at_user": at_user, "at_name": at_name})
         if self.text_errors:
             raise self.text_errors.pop(0)
         self.msg_seq += 1
         return type("SendResult", (), {"sent": True, "message_id": f"m{self.msg_seq}"})()
+
+    async def send_image(self, session_id: str, png: bytes, *, text: str = "") -> object:
+        self.images.append({"session_id": session_id, "png": png, "text": text})
+        if self.image_errors:
+            raise self.image_errors.pop(0)
+        self.msg_seq += 1
+        return type("SendResult", (), {"sent": True, "message_id": f"i{self.msg_seq}"})()
 
     async def upload_group_file(self, group_id: str, path: str, name: str) -> str:
         self.uploads.append({"group_id": group_id, "path": path, "name": name})
@@ -264,31 +275,49 @@ async def test_flush_hosterror_timeout_text_goes_uncertain(tmp_path):
     assert _rows(store)[0]["status"] == "uncertain"
 
 
-async def test_flush_other_error_goes_failed_and_redacts_secrets(tmp_path):
-    """其他异常 → failed；error 去密钥截断。"""
+async def test_flush_other_error_retries_once_then_failed_and_redacts_secrets(tmp_path):
+    """非超时的安全失败：自动重试一次；两次都失败 → failed，error 去密钥截断。"""
     store, _, host, _, _, ob = _make(tmp_path)
+    host.text_errors.append(RuntimeError("无效密钥 sk-abcdefghijklmnop Bearer toptoken123"))
     host.text_errors.append(RuntimeError("无效密钥 sk-abcdefghijklmnop Bearer toptoken123"))
     ob.enqueue("k1", GID, "text", {"text": "你好", "push_kind": "delivery"})
     await ob.flush(NOON)
     row = _rows(store)[0]
+    assert row["status"] == "pending"            # 排了一次重试
+    assert int(row["attempts"]) == 1
+    assert float(row["not_before"]) == NOON + 300
+    assert "重试" in row["error"]
+    assert "sk-abcdefghijklmnop" not in row["error"]
+    assert "toptoken123" not in row["error"]
+    await ob.flush(NOON + 400)
+    row = _rows(store)[0]
     assert row["status"] == "failed"
+    assert int(row["attempts"]) == 2             # 首发 + 重试一次，就两次，不再自动发
     assert "sk-abcdefghijklmnop" not in row["error"]
     assert "toptoken123" not in row["error"]
     assert len(row["error"]) <= 320
+    assert len(host.texts) == 2
+    # 失败不算发出去：不占额度、没留痕
+    assert store.read().execute("SELECT COUNT(*) c FROM pushes").fetchone()["c"] == 0
 
 
 async def test_retry_failed_back_to_pending(tmp_path):
+    """手动重发：自动重试用完判 failed 之后，管理员还能手动再来一次。"""
     store, _, host, _, _, ob = _make(tmp_path)
+    host.text_errors.append(RuntimeError("boom"))
     host.text_errors.append(RuntimeError("boom"))
     oid = ob.enqueue("k1", GID, "text", {"text": "你好", "push_kind": "delivery"})
     await ob.flush(NOON)
+    assert _rows(store)[0]["status"] == "pending"     # 自动重试一次
+    await ob.flush(NOON + 400)
     assert _rows(store)[0]["status"] == "failed"
     ob.retry(oid)
     row = _rows(store)[0]
     assert row["status"] == "pending"
-    assert row["attempts"] == 1
-    await ob.flush(NOON + 10)
+    assert row["attempts"] == 3                        # 两次自动 + 这次手动
+    await ob.flush(NOON + 500)
     assert _rows(store)[0]["status"] == "sent"
+    assert store.read().execute("SELECT COUNT(*) c FROM pushes").fetchone()["c"] == 1
 
 
 async def test_retry_only_failed_or_uncertain(tmp_path):
@@ -753,3 +782,68 @@ async def test_deliver_task_accepts_file_and_dir_inside_artifact_dir(tmp_path):
     rows = _rows(store)
     assert len(rows) == 2
     assert rows[0]["id"] == oid1 and rows[1]["id"] == oid2
+
+
+# ----------------------------------------------------------------------
+# 0.8.0 归一：at 透传、image 载荷闸、结果 hook、结果不明的额度保留
+# ----------------------------------------------------------------------
+
+
+async def test_text_passes_at_user_and_at_name(tmp_path):
+    """text 载荷里的 at_user / at_name 真实透传给 host（Telegram 退正文是 host 的事）。"""
+    store, settings, host, *_r, ob = _make(tmp_path)
+    group_push.set_config(store, GID, {"idea_mention_enabled": True}, settings, now=NOON - 10)
+    ob.enqueue("k1", GID, "text", {"text": "话说你之前那个怎么样了？", "push_kind": "idea_mention",
+                                   "at_user": "31415926", "at_name": "阿柒"})
+    ob.enqueue("k2", GID, "text", {"text": "普通一条", "push_kind": "delivery"})
+    await ob.flush(NOON)
+    assert host.texts[0]["at_user"] == "31415926" and host.texts[0]["at_name"] == "阿柒"
+    assert host.texts[1]["at_user"] == "" and host.texts[1]["at_name"] == ""
+
+
+async def test_image_kind_sends_png_and_rejects_bad_payload_without_retry(tmp_path):
+    """image：真 PNG 才发；载荷本身不合法（符号链接 / 越界 / 不是 PNG）直接 failed，不浪费重试。"""
+    store, settings, host, *_r, ob = _make(tmp_path)
+    group_push.set_config(store, GID, {"news_card_enabled": True}, settings, now=NOON - 10)
+    png = tmp_path / "card.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"data")
+    ob.enqueue("img1", GID, "image", {"path": str(png), "text": "看全部资讯", "push_kind": "news_card"})
+    await ob.flush(NOON)
+    row = _rows(store)[0]
+    assert row["status"] == "sent"
+    assert host.images[0]["png"] == b"\x89PNG\r\n\x1a\ndata"
+    assert host.images[0]["text"] == "看全部资讯"
+    # 不是 PNG：判失败，而且 attempts 只有 1（没有自动重试）
+    bad = tmp_path / "bad.png"
+    bad.write_bytes(b"GIF89a")
+    ob.enqueue("img2", GID, "image", {"path": str(bad), "text": "", "push_kind": "news_card"})
+    await ob.flush(NOON + 1)
+    row = [r for r in _rows(store) if r["key"] == "img2"][0]
+    assert row["status"] == "failed" and int(row["attempts"]) == 1
+    assert "PNG" in row["error"] and len(host.images) == 1
+
+
+async def test_uncertain_reserves_quota_but_is_not_recorded_as_sent(tmp_path):
+    """超时 → uncertain：不写 pushes（不算已发），但额度按「可能已发出」保留。"""
+    store, _, host, pushes, _, ob = _make(tmp_path, cfg={"delivery": {"push_per_day": 1}})
+    host.text_errors.append(asyncio.TimeoutError())
+    ob.enqueue("k1", GID, "text", {"text": "开场白", "push_kind": "topic"})
+    await ob.flush(NOON)
+    assert _rows(store)[0]["status"] == "uncertain"
+    assert store.read().execute("SELECT COUNT(*) c FROM pushes").fetchone()["c"] == 0
+    assert pushes.count_used(GID, NOON) == 1
+    assert pushes.can_push(GID, "topic", NOON + 1) == (False, "今天推够了")
+    await ob.flush(NOON + 600)
+    assert len(host.texts) == 1          # 不重发
+
+
+async def test_result_hook_gets_outcome_and_ts(tmp_path):
+    """结果 hook：发出去才 sent（带 message_id），并带上这一轮 flush 的时间。"""
+    seen: list[dict] = []
+    store, _, host, *_r, ob = _make(tmp_path)
+    ob.add_result_hook(seen.append)
+    ob.enqueue("k1", GID, "text", {"text": "好了", "push_kind": "delivery"})
+    await ob.flush(NOON)
+    assert seen and seen[0]["outcome"] == "sent"
+    assert seen[0]["key"] == "k1" and seen[0]["result"]["message_id"]
+    assert float(seen[0]["ts"]) == NOON

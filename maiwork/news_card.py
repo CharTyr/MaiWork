@@ -271,17 +271,6 @@ def _e(s: Any) -> str:
     return html.escape(str(s or "").strip())
 
 
-def _clip(s: Any, n: int) -> str:
-    """按「显示宽度」截：中文算 1，英文数字算 0.55（英文标题同样字数占的地方少一半）。"""
-    s = " ".join(str(s or "").split())
-    width = 0.0
-    for i, ch in enumerate(s):
-        width += 0.55 if ord(ch) < 128 else 1.0
-        if width > n:
-            return s[: max(0, i - 1)].rstrip("，。、；：,.;: ") + "…"
-    return s
-
-
 def _squash(s: Any) -> str:
     return " ".join(str(s or "").split())
 

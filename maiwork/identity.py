@@ -1,7 +1,7 @@
 """identity.py（身份与工作记忆，2026-10 新增）。
 
-MaiWork 自己的「长期记忆」分三层，都在 <data_dir>/identity/ 下（目录 0700，周边文件 0600；
-exFAT 不支持 chmod 就静默放行）：
+MaiWork 自己的「长期记忆」分调度后只剩全局这份 <data_dir>/identity/ 下（目录 0700，
+周边文件 0600；exFAT 不支持 chmod 就静默放行）：
 
 - SOUL.md      —— MaiWork 说话的口吻和性格。首次启动从 MaiBot（host.config 读
                  bot.nickname / personality.personality / personality.reply_style 以及
@@ -10,33 +10,39 @@ exFAT 不支持 chmod 就静默放行）：
 - AGENTS.md    —— 给主模型和子 agent 的做事规矩（管理员维护；默认给一份简短模板）。
 - MEMORY.md    —— 全局工作记忆：**只放和具体群、具体人无关的经验**（管理员偏好、
                  工具/来源好坏、做事方法的教训）。
-- memory/<群号>.md —— 每群工作记忆：主模型自动记本群相关的经验（这个群喜欢什么交付、
-                 哪类资讯被点没用、约定俗成的做法）。**只注入本群的提示词，绝不跨群**。
 
-注入由 prompt_block(kind, group_id) 统一出，分块标题固定（前端/测试都认这几行）：
-「## MaiWork 的身份」「## 做事规矩」「## 工作记忆（全局）」「## 这个群的工作记忆」；
-各块内容按 UTF-8 编码截到上限（默认 16KB）。
+每群那份 2026-10-03 起换成 docs/17 §八.1 的「本群规矩 + 本群做法 skill」：老
+memory/<群号>.md 文件由 app 启动迁移（migrations.migrate_group_context_to_rules_and_skills）
+拼进 `group_rules`（原文一段），备份到 identity/mem.bak/<群号>.md 后清空。
+identity 只读 / 写全局文件；remember(scope=group) 的落点也换成 group_rules（这条规矩
+是管理员 / 管理员对话「写」的，remember 是把那句话追加进规矩文本，自动流程永不改）。
+**自动流程的硬闸（2026-10-03 最终接线）**：主模型那份 remember 工具（roles={"main"}）
+只能 scope=global；传 group 一律拒且零写入。写本群规矩只走受信任的管理员入口
+（tools_admin 的 remember，roles={"admin"}，同一 Tools 里另一张表，args 伪造不了）。
 
-自动记忆入口 remember_sync（工具 remember 的 handler 也走它）：
-- 追加格式「- YYYY-MM-DD 文本（原因）」；同一句（去空白后相同，不看日期和原因）不重复记；
-- 写满上限时从最旧的一条开始删，删到放得下；
+注入由 prompt_block(kind) 统一出（分块标题固定、各块 UTF-8 截到上限 16KB）：
+「## MaiWork 的身份」「## 做事规矩」「## 工作记忆（全局）」；
+每群段（规矩+做法）另走 group_context(gid, kind)，调用方 feeds / coordinator /
+admin_chat / personal / topics / specialists（Agents.prompt）等统一喝那段。
+
+自动记忆入口 remember_sync（管理员工具 remember 的 handler 走它；主模型那份 remember
+工具只许 scope=global，见 register_remember_tool 的硬闸）：
+- scope=group（只给受信任的管理员入口）：落 group_rules 的最后追加一行
+  「- YYYY-MM-DD 文本（原因）」；同一句（去空白后相同，不看日期和原因）不重复记；
+  写满报超长（硬上限 3000 字是规矩的设计上限；管理员自己先写满的要管理员写脚本
+  自己改）；updated_by 记 admin_chat（和网页 groupctx.js 的 WHO 映射一致）；
+- scope=global：追加进 MEMORY.md（同款行格式）；写满上限（默认 16KB）时从最旧
+  的一条开始删，删到放得下；
 - scope=group：过本群 privacy.scrub（关注成员 note/persona 片段拒）；
 - scope=global：① 不许写 ≥5 位连续数字（群号/QQ 号）；② 不许点名——所有服务群
   关注成员名字、以及「这个群名字数 > 3」的成员名单里的名字；③ 过完名单闸还要把
   每个服务群的 privacy.scrub 各过一遍。全局被拦的话术固定带「全局记忆」四个字，
-  提醒模型「改记到本群记忆」；
+  提醒模型「本群经验由复盘沉淀成 skill，别写进全局」；
 - 每次真正写进去都落 events 事件 memory.write（scope、群号、文本前 40 字），网页可追溯。
-
-note_useless_feedback(gid, item_id)：资讯被标「没用」后由 console/feeds 调一次（纯代码、
-不调模型）：同一 topic 里 down>up 累计 ≥3 条 → 记一条「XX 类资讯本群不感兴趣」；
-同一来源（sources[0].site，回落 url_key 主机）有 ≥3 条各自被标过没用 → 记一条
-「来自 XX 的资讯本群不感兴趣」。两类都只在累计确实够 3 的那个时刻落一条（当时不够以后
-不再翻旧账），且和 remember 一样按句去重。
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -84,8 +90,6 @@ _REMEMBER_TEXT_MAX = 200
 _REMEMBER_REASON_MAX = 60
 _GLOBAL_NUMBER_RUN = 5  # ≥N 位连续数字当群号/QQ 号
 _MEMBER_NAMES_MIN_GROUP = 3  # 成员名单超过这个数才启用「点这个名字」闸（小群误伤太大）
-_USELESS_DOWN_MIN = 3  # 被标没用累计几次才自动记
-_FEEDBACK_LOOKBACK_DAYS = 90
 
 _SOUL_KINDS = ("soul", "agents", "memory")
 
@@ -125,10 +129,11 @@ class Identity:
 
     @property
     def limits(self) -> dict[str, int]:
-        return {"soul": 16384, "agents": 16384, "memory": 16384, "group_memory": 16384}
+        # 「每群记忆」2026-10-03 退役：只剩全局三份；老 memory/<群号>.md 交给启动迁移
+        return {"soul": 16384, "agents": 16384, "memory": 16384}
 
     def _limit_of(self, kind: str) -> int:
-        return self.limits["group_memory" if kind == "group" else kind]
+        return self.limits[kind]
 
     def _path_of(self, kind: str, group_id: Optional[str] = None) -> Path:
         if kind == "soul":
@@ -137,9 +142,6 @@ class Identity:
             return self._root / "AGENTS.md"
         if kind == "memory":
             return self._root / "MEMORY.md"
-        if kind == "group":
-            assert group_id is not None
-            return self._root / "memory" / f"{group_id}.md"
         raise ValueError(f"不认识的身份文件种类：{kind!r}")
 
     # ------------------------------------------------------------------
@@ -189,11 +191,18 @@ class Identity:
 
     @classmethod
     def _line_key(cls, line: str) -> str:
-        """单条记忆的去重键：去「- 」前缀、去 YYYY-MM-DD、去结尾（原因），再折叠空白。"""
+        """单条记忆的去重键：剥掉「- 」「YYYY-MM-DD（原因）」等行首行尾噪声，再去空白折叠。
+
+        两类写法都要能压成同一句：
+        - identity 自己 append 的「- YYYY-MM-DD 文本（原因）」；
+        - group_rules 里管理员手写的「文本（原因）」「- 文本」等没有日期的行。
+        """
         s = str(line or "").strip()
         s = re.sub(r"^-\s*", "", s)
         s = re.sub(r"^\d{4}-\d{2}-\d{2}\s*", "", s)
         s = re.sub(r"（[^（）]*）\s*$", "", s)
+        # 管理员手写行可能只写了一串「文字」（没（原因）尾）：再盖一层「结尾只有一段」
+        # 不必再剥，全文折叠空白就够了。
         return cls._normalize(s)
 
     def _served_groups(self) -> list[str]:
@@ -276,36 +285,6 @@ class Identity:
             self._set_soul_synced(False)  # 手动改过的不再是「从 MaiBot 同步」
         return self.read(kind)
 
-    def group_read(self, group_id: str) -> dict:
-        gid = str(group_id)
-        if gid not in self._served_groups():
-            raise KeyError(f"非服务群：{gid}")
-        path = self._path_of("group", gid)
-        out: dict[str, Any] = {"text": "", "updated_ts": 0.0}
-        try:
-            st = path.stat()
-            out["text"] = path.read_text(encoding="utf-8")
-            out["updated_ts"] = float(st.st_mtime)
-        except OSError:
-            pass
-        return out
-
-    def group_write(self, group_id: str, text: str) -> dict:
-        gid = str(group_id)
-        if gid not in self._served_groups():
-            raise KeyError(f"非服务群：{gid}")
-        text = str(text if text is not None else "")
-        limit = self._limit_of("group")
-        if len(text.encode("utf-8")) > limit:
-            raise ValueError(f"超过单个文件上限（{limit} 字节）：请删减到 {limit // 1024}KB 以内")
-        self._ensure_dirs()
-        self._write_file(self._path_of("group", gid), text)
-        return self.group_read(gid)
-
-    def group_memory_map(self) -> dict[str, dict]:
-        """GET /api/identity 的 group_memory：只列服务群（没写过的群给空文本）。"""
-        return {gid: self.group_read(gid) for gid in self._served_groups()}
-
     # ------------------------------------------------------------------
     # prompt_block（注入）
     # ------------------------------------------------------------------
@@ -315,8 +294,9 @@ class Identity:
 
         kind = "soul" / "agents"：等价于 agent_prompt_block("main", kind)——主模型
         （含调用方没分专岗的老代码，比如 feeds 写帖子）读的就是 main 的 SOUL/AGENTS。
-        kind = "memory"：全局 MEMORY.md + 可选本群记忆（这块不移到 agents/ 下，
-        「记忆」页还在用全局路径）。
+        kind = "memory"：全局 MEMORY.md；2026-10-03 起本群内容不在这里出——本群
+        规矩 + 本群做法由 group_context(gid, kind) 统一注入（接线早就把两份都喝上）。
+        group_id 参数保留为兼容签名，不再读每群文件。
         """
         parts: list[str] = []
         if kind == "soul":
@@ -331,11 +311,6 @@ class Identity:
             g_text = self._cut_utf8(self.read("memory")["text"], self._limit_of("memory")).strip()
             if g_text:
                 parts.append(f"## 工作记忆（全局）\n{g_text}\n\n")
-            gid = str(group_id or "").strip()
-            if gid and gid in self._served_groups():
-                l_text = self._cut_utf8(self.group_read(gid)["text"], self._limit_of("group")).strip()
-                if l_text:
-                    parts.append(f"## 这个群的工作记忆\n{l_text}\n\n")
         return "".join(parts)
 
     # ------------------------------------------------------------------
@@ -671,7 +646,7 @@ class Identity:
 
     async def ensure_started(self) -> None:
         """插件启动时调一次：
-        - 旧的全局 SOUL.md / AGENTS.md / MEMORY.md / memory/ 就位（兼容老部署）；
+        - 旧的全局 SOUL.md / AGENTS.md / MEMORY.md 就位（兼容老部署）；
         - 每个内建专岗（main/news/idea/goal/task）的 identity/agents/<kind>/SOUL.md、
           AGENTS.md 就位——main 拷旧全局；其余 SOUL 从 MaiBot 同步、AGENTS 用岗位预设
           （预设 + 旧 instructions 非空时附加「## 原职责」一节），迁移只做一次
@@ -856,7 +831,11 @@ class Identity:
         reason: str,
         group_id: str = "",
     ) -> dict:
-        """主模型记经验（工具 remember 的落点）。返回 {"ok": bool, ...}；拒绝带中文 error。"""
+        """记经验（受信任入口的落点）。返回 {"ok": bool, ...}；拒绝带中文 error。
+
+        scope=group 只由管理员工具（tools_admin 的 remember）调用；主模型那份 remember
+        工具只许 scope=global，在它自己的 handler 里就挡住 group，到不了这里。
+        """
         scope = str(scope or "").strip()
         text = str(text or "").strip()
         reason = str(reason or "").strip()
@@ -878,28 +857,40 @@ class Identity:
         err = self._remember_gate(scope, gid, text)
         if err is not None:
             return {"ok": False, "error": err}
-        # 追加
-        kind = "group" if scope == "group" else "memory"
-        path = self._path_of("group", gid) if scope == "group" else self._path_of("memory")
-        try:
-            content = path.read_text(encoding="utf-8")
-        except OSError:
-            content = ""
-        lines = self._mem_lines(content)
-        key = self._normalize(text)
-        for ln in lines:
-            if self._line_key(ln) == key:
-                return {"ok": True, "deduped": True, "text": text}
+        # 追加（scope=group：进本群规矩，不碰 identity 自带文件；scope=global：进 MEMORY.md）
         day = clock.bj(clock.now()).strftime("%Y-%m-%d")
         suffix = f"（{reason}）" if reason else ""
-        lines.append(f"- {day} {text}{suffix}")
-        limit = self._limit_of(kind)
-        self._ensure_dirs()
-        content = "\n".join(lines) + "\n"
-        while lines and len(content.encode("utf-8")) > limit:
-            lines.pop(0)  # 满了从最旧的删
-            content = "\n".join(lines) + ("\n" if lines else "")
-        self._write_file(path, content)
+        line_text = f"- {day} {text}{suffix}"
+        if scope == "group":
+            # docs/17 §八.1：管理员对话 remember(scope=group) 写本群规矩（append 一行；
+            # 不许覆盖管理员已写的内容）。这条类方法只由受信任的管理员入口调用——
+            # tools_admin 的 remember（roles={"admin"}）；主模型那份 remember 工具
+            # （roles={"main"}）在 handler 里就被挡，group 到不了这里。规矩本身是
+            # 「硬规矩」的承载，管理员确实是在「改规矩」，这正是这条路径的本意。
+            dedup_hit, body_out = self._append_line_into_group_rules(gid, text, line_text)
+            if dedup_hit:
+                return {"ok": True, "deduped": True, "text": text}
+            if body_out is None:
+                return {"ok": False, "error": "本群规矩落了这条加上去就超 3000 字上限，先到网页「本群规矩」里清几条再记"}
+        else:
+            path = self._path_of("memory")
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError:
+                content = ""
+            lines = self._mem_lines(content)
+            key = self._normalize(text)
+            for ln in lines:
+                if self._line_key(ln) == key:
+                    return {"ok": True, "deduped": True, "text": text}
+            lines.append(line_text)
+            limit = self._limit_of("memory")
+            self._ensure_dirs()
+            content = "\n".join(lines) + "\n"
+            while lines and len(content.encode("utf-8")) > limit:
+                lines.pop(0)  # 满了从最旧的删
+                content = "\n".join(lines) + ("\n" if lines else "")
+            self._write_file(path, content)
         # 事件落库（网页可追溯）
         try:
             with self._store.tx() as conn:
@@ -915,6 +906,26 @@ class Identity:
             logger.exception("memory.write 事件落库失败")
         return {"ok": True, "deduped": False, "text": text}
 
+    def _append_line_into_group_rules(self, gid: str, text_key_src: str, line_text: str) -> tuple[bool, str | None]:
+        """scope=group 的落点：一行追加到 group_rules.body（只给管理员入口）。
+        返回 (deduped, appended_body)：deduped=True 时不改规矩；appended_body=None 且
+        deduped=False = 超规矩长度上限。updated_by 记 admin_chat——写这段的是管理员对话
+        （网页 groupctx.js 的 WHO 映射认这个值），不是自动流程。"""
+        from .agents import Agents  # 局部导入防环（agents 拿 identity 也是文件级引用）
+
+        agents = Agents(self._store, self._get_settings)
+        cur = agents.group_rules_get(gid)
+        body = str(cur.get("body") or "")
+        key = self._normalize(text_key_src)
+        for ln in self._mem_lines(body):
+            if self._line_key(ln) == key:
+                return True, cur
+        new_body = (body.rstrip("\n") + "\n" + line_text + "\n") if body.strip() else (line_text + "\n")
+        if len(new_body) > 3000:
+            return False, None
+        agents.group_rules_set(gid, new_body, updated_by="admin_chat")
+        return False, new_body
+
     def _remember_gate(self, scope: str, gid: str, text: str) -> Optional[str]:
         """写入前的闸；要拦就回中文原因，放行回 None。"""
         if scope == "group":
@@ -927,13 +938,13 @@ class Identity:
         folded = privacy.fold(text)
         # 一、不许写长数字（群号/QQ 号）
         if re.search(rf"\d{{{_GLOBAL_NUMBER_RUN},}}", folded):
-            return "全局记忆里不能写具体的群和人（不许带 QQ 号 / 群号），改记到本群记忆"
+            return "全局记忆里不能写具体的群和人（不许带 QQ 号 / 群号）；这条就别记了"
         # 二、不许点名：全部服务群关注成员 + 「名字数>3」的群成员名单
         names = self._global_forbidden_names()
         for name in names:
             key = privacy.fold(name)
             if len(key) >= 2 and key in folded:
-                return f"全局记忆里不能写具体的群和人（「{name}」是某个群的人），改记到本群记忆"
+                return f"全局记忆里不能写具体的群和人（「{name}」是某个群的人）；这条就别记了"
         # 三、全部服务群的 privacy.scrub 各过一遍（别的群的画像细节也不能写进全局）
         for g in self._served_groups():
             if _privacy_scrub(g, text, self._store) is None:
@@ -970,118 +981,15 @@ class Identity:
         uniq = sorted({n for n in out if len(n) >= 2}, key=len, reverse=True)
         return uniq
 
-    # ------------------------------------------------------------------
-    # 反馈自动记（纯代码；console 的反馈接口触发）
-    # ------------------------------------------------------------------
-
-    def note_useless_feedback(self, group_id: str, item_id: int) -> None:
-        """资讯被标「没用」后调一次：累计够 3 就记进本群记忆（不重复记、绝不跨群）。"""
-        gid = str(group_id)
-        if gid not in self._served_groups():
-            return
-        try:
-            iid = int(item_id)
-        except (TypeError, ValueError):
-            return
-        try:
-            row = self._store.read().execute(
-                "SELECT id, group_id, topic, sources, url_key FROM news_items WHERE id=?",
-                (iid,),
-            ).fetchone()
-        except Exception:
-            return
-        if row is None or str(row["group_id"]) != gid:
-            return
-        since = clock.now() - _FEEDBACK_LOOKBACK_DAYS * 86400.0
-        try:
-            rows = self._store.read().execute(
-                "SELECT topic, sources, url_key, up, down FROM news_items"
-                " WHERE group_id=? AND created>=? AND rejected=0 AND (down>0 OR up>0)",
-                (gid, since),
-            ).fetchall()
-        except Exception:
-            return
-
-        # topic 级：被标没用的条数（down>up）≥3
-        topic = str(row["topic"] or "").strip()
-        if topic:
-            n = sum(
-                1 for r in rows
-                if str(r["topic"] or "").strip() == topic and int(r["down"] or 0) > int(r["up"] or 0)
-            )
-            if n >= _USELESS_DOWN_MIN:
-                self._remember_direct(gid, f"{topic} 类资讯本群不感兴趣", "被标没用累计 3 次")
-
-        # 来源级：同一来源有 ≥3 条各自被标没用
-        site = self._site_of_row(row)
-        if site:
-            def _same_site(r: Any) -> bool:
-                return self._site_of_row(r) == site
-
-            n = sum(
-                1 for r in rows
-                if _same_site(r) and int(r["down"] or 0) > int(r["up"] or 0)
-            )
-            if n >= _USELESS_DOWN_MIN:
-                self._remember_direct(gid, f"来自 {site} 的资讯本群不感兴趣", "被标没用累计 3 次")
-
-    @staticmethod
-    def _site_of_row(row: Any) -> str:
-        try:
-            src = json.loads(row["sources"] or "[]")
-            if isinstance(src, list) and src and isinstance(src[0], dict):
-                site = str(src[0].get("site") or "").strip()
-                if site:
-                    return site
-        except (ValueError, TypeError):
-            pass
-        url_key = str(row["url_key"] or "")
-        return url_key.split("/", 1)[0].strip() if url_key else ""
-
-    def _remember_direct(self, gid: str, text: str, reason: str) -> None:
-        """代码直写本群记忆：和 remember 一样的追加/淘汰/去重，但不走模型闸、
-        字段以代码拼好的为准（内容不含人和隐私片段，不必再过名单闸；仍过本群 scrub 兜底）。"""
-        text = str(text or "").strip()[:_REMEMBER_TEXT_MAX]
-        reason = str(reason or "").strip()[:_REMEMBER_REASON_MAX]
-        if not text:
-            return
-        if _privacy_scrub(gid, text, self._store) is None:
-            return  # 兜底：万一文本凑巧撞上画像细节就不记
-        path = self._path_of("group", gid)
-        try:
-            content = path.read_text(encoding="utf-8")
-        except OSError:
-            content = ""
-        lines = self._mem_lines(content)
-        key = self._normalize(text)
-        for ln in lines:
-            if self._line_key(ln) == key:
-                return  # 已有同一句
-        day = clock.bj(clock.now()).strftime("%Y-%m-%d")
-        lines.append(f"- {day} {text}（{reason}）" if reason else f"- {day} {text}")
-        self._ensure_dirs()
-        content = "\n".join(lines) + "\n"
-        limit = self._limit_of("group")
-        while lines and len(content.encode("utf-8")) > limit:
-            lines.pop(0)
-            content = "\n".join(lines) + ("\n" if lines else "")
-        self._write_file(path, content)
-        try:
-            with self._store.tx() as conn:
-                self._store.event(
-                    conn,
-                    "memory.write",
-                    group_id=gid,
-                    entity="memory",
-                    entity_id="feedback",
-                    payload={"scope": "group", "group_id": gid, "text": text[:40], "via": "feedback"},
-                )
-        except Exception:
-            logger.exception("feedback→memory.write 事件落库失败")
-
-
 def register_remember_tool(tools: Any, identity: Identity) -> None:
-    """把 remember 工具注册进 Tools（roles={"main"}；子 agent 不能记）。"""
+    """把 remember 工具注册进 Tools（roles={"main"}；子 agent 不能记）。
+
+    **红线硬闸（2026-10-03 最终接线）**：这份只给主模型的 remember 只能 scope=global
+    （通用、无群无人的 MEMORY.md）——自动流程永不改「本群规矩」。本群经验由复盘
+    （lessons）沉淀成「本群做法」skill；写本群规矩只有受信任的管理员入口
+    （tools_admin 的 remember，roles={"admin"}，Tools 里另一张表；模型用 args 伪造
+    admin / role / source 都进不了那张表）。
+    """
     from .tools import Tool, ToolResult
 
     def _summarize(args: dict, result: ToolResult) -> tuple[str, str]:
@@ -1090,11 +998,25 @@ def register_remember_tool(tools: Any, identity: Identity) -> None:
         return f"{scope}: {text[:40]}", result.output[:120]
 
     async def _handler(ctx: Any, args: dict) -> ToolResult:
+        del ctx  # 主模型这份不看 ctx：它没有「管理员授权」这条通道
+        scope = str(args.get("scope") or "").strip()
+        # 硬闸：真调 scope=group 一律拒且零写入（schema 只列 global，这里再挡一层——
+        # 模型不按 schema 传、或旧提示词残留时也进不去 group_rules）。
+        if scope != "global":
+            return ToolResult(
+                ok=False,
+                output="",
+                error=(
+                    "remember 只能记全局（scope=global）：只放和具体群、具体人无关的通用经验"
+                    "（不许写群号、QQ 号、任何人的名字）。本群的做法由复盘沉淀成「本群做法」"
+                    "skill，本群规矩只有管理员能定——自动流程不许改"
+                ),
+            )
         out = identity.remember_sync(
-            scope=str(args.get("scope") or ""),
+            scope="global",
             text=str(args.get("text") or ""),
             reason=str(args.get("reason") or ""),
-            group_id=str(getattr(ctx, "group_id", "") or ""),
+            group_id="",
         )
         if out.get("ok"):
             if out.get("deduped"):
@@ -1106,15 +1028,15 @@ def register_remember_tool(tools: Any, identity: Identity) -> None:
         Tool(
             name="remember",
             description=(
-                "记一条干活学到的经验。scope=group 记本群相关的（这个群喜欢什么交付、"
-                "哪类资讯不受欢迎，最多 200 字）；scope=global 只记和具体群、具体人无关的"
-                "通用经验（不许写群号、QQ 号、任何人的名字——那种请记本群记忆）。"
-                "reason 一句话说为什么值得记（最多 60 字）。没有值得记的就别调。"
+                "记一条干活学到的通用经验，写进全局 MEMORY.md——只放和具体群、具体人无关的"
+                "经验（不许写群号、QQ 号、任何人的名字）。本群的做法/规矩不在这里写：本群"
+                "做法由复盘沉淀成 skill，规矩只有管理员能定。reason 一句话说为什么值得记"
+                "（最多 60 字）。没有值得记的就别调。"
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "scope": {"type": "string", "enum": ["group", "global"]},
+                    "scope": {"type": "string", "enum": ["global"]},
                     "text": {"type": "string"},
                     "reason": {"type": "string"},
                 },

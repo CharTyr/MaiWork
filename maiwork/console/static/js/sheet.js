@@ -5,7 +5,6 @@ import { SVG, esc } from "./util.js";
 import { gname, grp } from "./api.js";
 import { detailHTML, loadTask } from "./detail.js";
 import { groupPicker } from "./settings/index.js";
-import { chipEditor } from "./settings/rules.js";
 import { draft } from "./settings/models.js";
 import { chatSide } from "./chat.js";
 import { renderRail, renderSide, renderView } from "./render.js";
@@ -15,7 +14,7 @@ function loginSheet() {
   if (isGA())
     return `
     <h1 class="h-page">群管理员</h1>
-    <p class="h-meta sheet-lead">你管的是「${esc(gname(grp()))}」：能批准本群派的活、改群画像和资讯偏好。关注成员的个人画像只能看。</p>
+    <p class="h-meta sheet-lead">你管的是「${esc(gname(grp()))}」：能批准本群派的活、改群画像、本群规矩和做法。关注成员的个人画像只能看。</p>
     <div class="actions" style="margin-top:22px"><button class="btn" data-act="logout">退出</button></div>
     <p class="fine" style="margin-top:22px">要用别的密码登录，先退出。</p>`;
   return `
@@ -55,21 +54,20 @@ function editSheet() {
   if (e.kind === "ga")
     return `
     <h1 class="h-page">群管理员 · ${esc(e.name || "")}</h1>
-    <p class="h-meta sheet-lead">能批准本群派的活、改群画像和资讯偏好；看不到别的群和全局设置</p>
+    <p class="h-meta sheet-lead">能批准本群派的活、改群画像、本群规矩和做法；看不到别的群和全局设置</p>
     <form id="edit" class="login" autocomplete="off">
       <label for="ga-pw">网页密码</label>
       <input id="ga-pw" type="password" autocomplete="new-password" placeholder="${e.password_set ? "已设置 · 留空就不改" : "至少 8 位 · 可以不填"}" />
-      <label>群里能批准的人</label>
-      ${chipEditor("ga-accs", "accounts", e.accounts || [])}
+      <p class="fine">批准与免批名单在群页「谁能批本群的活」里设置，这里只改网页密码。</p>
       <p class="err" id="ed-err" hidden></p>
       <button class="btn primary wide" type="submit">保存</button>
       ${e.password_set ? `<button class="btn wide" type="button" data-act="ga-clear" style="margin-top:10px">清掉网页密码</button>` : ""}
     </form>`;
-  const title = e.kind === "focus" ? "加一个关注成员" : e.kind === "pref" ? "这个群想看什么（可选）" : e.kind === "taste" ? "这个群的口味小结" : e.id ? "改这一条" : `加到「${(CATS.find((c) => c[0] === e.cat) || [, ""])[1]}」`;
+  const title = e.kind === "focus" ? "加一个关注成员" : e.id ? "改这一条" : `加到「${(CATS.find((c) => c[0] === e.cat) || [, ""])[1]}」`;
   const isFocus = e.kind === "focus";
   return `
     <h1 class="h-page">${esc(title)}</h1>
-    <p class="h-meta sheet-lead">${isFocus ? "个人画像只有管理员看得到" : e.kind === "pref" ? "比如「多找自部署和开源硬件的，少一点手机评测」" : e.kind === "taste" ? "MaiWork 每天从群友的反馈里自动总结；你改过的 7 天内不会被覆盖，清空就恢复自动" : "改过的条目 MaiWork 不会再动"}</p>
+    <p class="h-meta sheet-lead">${isFocus ? "个人画像只有管理员看得到" : "改过的条目 MaiWork 不会再动"}</p>
     <form id="edit" class="login" autocomplete="off">
       ${
         isFocus

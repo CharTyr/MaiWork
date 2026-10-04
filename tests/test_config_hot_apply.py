@@ -76,20 +76,24 @@ async def _login(env) -> None:
 class TestApplyNow:
     @pytest.mark.asyncio
     async def test_put_applies_immediately(self, env) -> None:
-        """PUT 返回时 get_settings() 已是新值（不等宿主文件监控）。"""
+        """PUT 返回时 get_settings() 已是新值（不等宿主文件监控）。
+
+        用仍归全局的 `topics.min_gap_hours`：`topics.per_day` / `delivery.quiet_hours`
+        这类 0.8.0 起每群一份，网页写它们会被明确 400（见 test_group_controls_migration）。
+        """
         await _login(env)
-        r = await env.client.put("/api/settings/config", json={"topics.per_day": 9})
+        r = await env.client.put("/api/settings/config", json={"topics.min_gap_hours": 9})
         assert r.status == 200
-        assert env.app.get_settings().topics.per_day == 9
+        assert env.app.get_settings().topics.min_gap_hours == 9
 
     @pytest.mark.asyncio
     async def test_host_duplicate_update_is_idempotent(self, env, caplog) -> None:
         """宿主文件监控随后发一次同内容的 on_config_update：幂等跳过（不再刷日志、
         不重启控制台、不重新探测群空间）。"""
         await _login(env)
-        r = await env.client.put("/api/settings/config", json={"topics.per_day": 9})
+        r = await env.client.put("/api/settings/config", json={"topics.min_gap_hours": 9})
         assert r.status == 200
-        assert env.app.get_settings().topics.per_day == 9
+        assert env.app.get_settings().topics.min_gap_hours == 9
         listen_before = env.app._listen
         caplog.clear()
         with caplog.at_level(logging.INFO, logger="maiwork.app"):
@@ -103,9 +107,9 @@ class TestApplyNow:
         """内容真变了（宿主那边手改了文件）→ 照常更新。"""
         await _login(env)
         raw = dict(env.app._raw_config)
-        raw["topics"] = {"per_day": 4}
+        raw["topics"] = {"min_gap_hours": 4}
         await env.app.update_config(raw)
-        assert env.app.get_settings().topics.per_day == 4
+        assert env.app.get_settings().topics.min_gap_hours == 4
 
 
 class TestGroupSpaceHotToggle:

@@ -64,7 +64,12 @@ function reviewBlock(t) {
 const wan = (n) => (n >= 1e4 ? `${Math.round(n / 1e4)} 万` : String(n || 0));
 function pausedBlock(t) {
   const r = t.status === "paused" && t.paused_reason;
-  if (!r || !r.kind) return "";
+  if (!r || !["tokens", "time", "capability"].includes(r.kind)) return "";
+  if (r.kind === "capability") {
+    if (!r.text) return "";
+    const tail = gadmin() ? "工具和做法对上后，点「继续」再试；不想做了就点「取消」。" : "管理员决定要不要接着做。";
+    return `<div class="dt-sec"><div class="dt-label">为什么停了</div><div class="dt-text">${esc(r.text)}${esc(tail)}</div></div>`;
+  }
   const text =
     r.kind === "tokens"
       ? `这个任务的用量到了上限（用了约 ${wan(r.used)} token，上限 ${wan(r.limit)}），先自动停下，等你决定。`

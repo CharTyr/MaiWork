@@ -1,7 +1,7 @@
 // MaiWork 网页 · 表单输入类事件：change / input / keydown，长名字滚动。
 import { $, desktop, state } from "./state.js";
 import { toast } from "./util.js";
-import { api, grp, gview } from "./api.js";
+import { api } from "./api.js";
 import { loadExt } from "./settings/ext.js";
 import { chipAdd } from "./settings/rules.js";
 import { loadUsageDay } from "./settings/usage.js";
@@ -12,29 +12,6 @@ import { loadChats } from "./chat.js";
 import { renderSide, renderView } from "./render.js";
 
 document.addEventListener("change", async (e) => {
-  // 群页「往群里发」：开关 / 条数 / 每日上限，改了立刻存
-  if (e.target.dataset && e.target.dataset.cp) {
-    const el = e.target;
-    const key = el.dataset.cp;
-    const val = el.type === "checkbox" ? el.checked : Number(el.value);
-    const g = grp();
-    const v = gview();
-    if (!g || !v) return;
-    el.disabled = true;
-    try {
-      v.card_push = await api("PUT", `/api/groups/${encodeURIComponent(g.id)}/card-push`, { [key]: val });
-      renderView();
-      if (key === "news_card_enabled") toast(val ? "打开了：下一批资讯出来就发卡片" : "关掉了，不再发资讯卡片");
-      else if (key === "idea_mention_enabled") toast(val ? "打开了：下次想到构想就在群里提一嘴" : "关掉了，不再在群里提构想");
-      else toast("改好了");
-    } catch (err) {
-      if (el.type === "checkbox") el.checked = !val;
-      toast(err.message, true);
-    } finally {
-      el.disabled = false;
-    }
-    return;
-  }
   if (e.target.classList && e.target.classList.contains("chat-group") && state.chat) {
     try {
       await api("PATCH", `/api/chat/${encodeURIComponent(state.chat.id)}`, { group_id: e.target.value });

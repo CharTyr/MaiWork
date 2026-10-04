@@ -6,8 +6,7 @@ export const desktop = window.matchMedia("(min-width: 1180px)");
 export const TABS = [
   { id: "news", label: "资讯" },
   { id: "ideas", label: "构想" },
-  { id: "goals", label: "目标" },
-  { id: "tasks", label: "任务" },
+  { id: "tasks", label: "在做的事" },
   { id: "group", label: "群" },
 ];
 export const STATUS = {

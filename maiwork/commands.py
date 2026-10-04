@@ -9,11 +9,11 @@
 指令表（02 §5.3）：
 - /mw            任何人：本群进行中的目标、任务、待批请求（简短，各最多 5 条）
 - /mw 网页       任何人：本群网页链接（没配 public_url 就回「网页还没公开，找管理员要」）
-- /mw 批准 [ID]  bot 管理员 或**本群**群管理员（kv["group_admins.<群号>"] 名单里的人）：
-  批准待批请求；不带 ID 时本群只有一个待批直接处理，多个列出让人选；
-  本群管理员只能批本群的请求（别的群的请求 ID 直接拒）
-- /mw 拒绝 [ID]  bot 管理员 或本群群管理员：同上
-- /mw 取消 [ID]  发起人 / 群主 / 群管理 / bot 管理员：取消任务（T-）、agent 目标（G-）、提醒（M-）
+- /mw 批准 [ID]  本群批准人（`kv["group_approval.<群号>"].approvers`，含全局管理员从旧
+  名单种进来的那份）：批准**本群**的待批请求；不带 ID 时本群只有一个待批直接处理，多个列出
+  让人选；请求属于别的群一律拒（群命令只管本群，bot 管理员也不例外）
+- /mw 拒绝 [ID]  同上
+- /mw 取消 [ID]  发起人 / 群主 / 群管理 / 本群批准人：取消任务（T-）、agent 目标（G-）、提醒（M-）
 - /mw 领取 T-x  本群任何人：明确当场索取已完成且待发的成品（不重复传已发/不确定的文件）
 """
 
@@ -30,8 +30,8 @@ logger = logging.getLogger("maiwork.commands")
 
 _USAGE = (
     "MaiWork 指令：/mw 看进度；/mw 网页 拿本群网页链接；"
-    "/mw 领取 T-任务号 当场取成品；/mw 批准 [ID]、/mw 拒绝 [ID]（bot 管理员）；"
-    "/mw 取消 [ID]（发起人 / 群管理 / bot 管理员）"
+    "/mw 领取 T-任务号 当场取成品；/mw 批准 [ID]、/mw 拒绝 [ID]（本群批准人）；"
+    "/mw 取消 [ID]（发起人 / 群管理 / 本群批准人）"
 )
 
 _ID_PREFIX_KIND = {"T": "task", "G": "goal", "M": "goal"}
@@ -76,7 +76,8 @@ class Commands:
         self._host = host
         self._get_settings = get_settings
         self._coordinator = coordinator
-        # 按群的管理员（group_admins.py）；没接上就只有 bot 管理员能批
+        # 旧接线残留：名单已并进 approvals 的每群批准名单（group_approval），这里只留个引用，
+        # 不再作为第二个鉴权来源（单来源，避免两套名单各说各话）
         self._group_admins = group_admins
         # 开工任务的回调（app 提供，保证同一任务不并发；没有就用兜底 spawn）
         self._run_task_starter = run_task_starter
@@ -230,7 +231,7 @@ class Commands:
         return f"本群网页：{link}"
 
     # ------------------------------------------------------------------
-    # /mw 批准 / 拒绝 [ID]：只限 bot 管理员
+    # /mw 批准 / 拒绝 [ID]：只限本群批准人
     # ------------------------------------------------------------------
 
     def _platform_of(self, gid: str) -> str:
@@ -241,25 +242,17 @@ class Commands:
         except Exception:
             return "qq"
 
-    def _is_group_admin(self, gid: str, user_id: str) -> bool:
-        """本群群管理员名单里的人（group_admins 没接上 / 读失败都当不是）。"""
-        if self._group_admins is None:
-            return False
-        try:
-            return bool(self._group_admins.is_group_admin(gid, user_id, platform=self._platform_of(gid)))
-        except Exception:
-            logger.exception("/mw 判本群管理员失败（群 %s）", gid)
-            return False
-
     async def _decide(self, gid: str, user_id: str, rid: str, *, op: str) -> str:
         verb = "批准" if op == "approve" else "拒绝"
         try:
-            is_bot_admin = bool(self._approvals.is_admin(user_id, platform=self._platform_of(gid)))
+            # 只认本群那份名单（全局管理员是种进来的，删了就批不了；不再回全局并集）
+            is_approver = bool(
+                self._approvals.is_admin(user_id, platform=self._platform_of(gid), group_id=gid)
+            )
         except Exception:
-            logger.exception("/mw 判管理员失败")
+            logger.exception("/mw 判批准人失败")
             return "这条指令处理出错了，日志里有"
-        is_group_admin = (not is_bot_admin) and self._is_group_admin(gid, user_id)
-        if not (is_bot_admin or is_group_admin):
+        if not is_approver:
             return "只有 bot 管理员或本群管理员能批准 / 拒绝"
         rid_s = str(rid or "").strip()
         if not rid_s:
@@ -279,17 +272,16 @@ class Commands:
             rid_s = str(pending[0].get("id") or "")
         if not rid_s:
             return "现在没有待批的请求"
-        if is_group_admin and not is_bot_admin:
-            # 本群管理员只能批本群的请求：先查出这条请求属于哪个群
-            try:
-                req_gid = self._approvals.group_of(rid_s)
-            except Exception:
-                logger.exception("/mw 查请求归属失败（%s）", rid_s)
-                return "这条指令处理出错了，日志里有"
-            if req_gid is None:
-                return f"没找到请求 {rid_s}"
-            if str(req_gid) != str(gid):
-                return f"请求 {rid_s} 不在本群，管不了"
+        # 群命令只管本群：先查出这条请求属于哪个群（bot 管理员跨群批也不许）
+        try:
+            req_gid = self._approvals.group_of(rid_s)
+        except Exception:
+            logger.exception("/mw 查请求归属失败（%s）", rid_s)
+            return "这条指令处理出错了，日志里有"
+        if req_gid is None:
+            return f"没找到请求 {rid_s}"
+        if str(req_gid) != str(gid):
+            return f"请求 {rid_s} 不在本群，管不了"
         try:
             if op == "approve":
                 res = self._approvals.approve(rid_s, by=user_id)
@@ -380,7 +372,9 @@ class Commands:
             logger.exception("/mw 取消读群角色失败（群 %s，人 %s）", gid, user_id)
             role = ""
         try:
-            allowed = self._approvals.can_cancel(kind, ident_s, user_id, group_role=str(role or ""))
+            allowed = self._approvals.can_cancel(
+                kind, ident_s, user_id, group_role=str(role or ""), group_id=gid
+            )
         except Exception:
             logger.exception("/mw 取消判权限失败")
             allowed = False

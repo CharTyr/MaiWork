@@ -5,7 +5,7 @@
 ——等于一次静默的全军覆没。修法：
 - 每次最多给模型 _SCORE_CHUNK=8 条，编号用全批统一的编号；后面几批带上「前面已评过的」
   标题清单，dup_in_batch 照样能指到前面批次的候选；
-- 打分调用超时放宽（timeout=240），重试次数收一点（retries=1），别一轮卡十几分钟；
+- 打分调用超时放宽（timeout=240），每个候选模型只试一次（retries=0；2026-10-04 起），别一轮卡十几分钟；
 - 某一批失败（模型报错 / JSON 坏 / 一条都没对上）：前面批次的分照留，这批候选
   明确拒掉并写清「打分没做完」，不再冒充「相关度 0」；所有批次都失败才整轮跳过。
 """
@@ -62,7 +62,7 @@ def test_twenty_candidates_three_calls_global_indices_and_earlier_reference(tmp_
     # 超时放宽、重试收紧
     for _role, _msgs, kw in models.calls:
         assert kw.get("timeout") == 240
-        assert kw.get("retries") == 1
+        assert kw.get("retries") == 0
     assert all(c["scores"]["avg"] > 0 for c in cands)
     assert not any("reject" in c for c in cands)
 

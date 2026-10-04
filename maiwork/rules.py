@@ -1,18 +1,12 @@
-"""网页可改的规则（docs/02 相关节）：kv["rules.override"] 存「改过的字段」，有效设置 = config.toml 被它覆盖。
+"""网页可改的配置（docs/02 相关节）：唯一真实来源是 config.toml，数据库不再存覆盖层。
 
-- 可改项（白名单）：
-  [delivery] quiet_hours、push_per_day；[topics] enabled、per_day、min_gap_hours；
-  [approval] required、admins、exempt_groups、exempt_users、remind；
-  [feeds] news_slots、max_items、web_min_avg、pool_min_avg、guides。
-- 存法：只存改过的字段（{节: {字段: 值}}），写成和 config.toml 一样的值 = 自动清掉这条覆盖；
-  一个字段校验不过，整次 patch 不落库（ValueError 中文原因）。**网页保存的设置存数据库，
-  不写 config.toml**（写 plugins/ 会让全部插件重载）。
-- 合并：app 在「Settings 的唯一出口」（get_settings）之后挂这一层——effective_settings 用
-  dataclasses.replace 只换掉被覆盖的子节（基础 Settings 是 frozen dataclass，绝不能改它），
-  并缓存：kv 的值作为缓存键的一部分，override 一变就重建；不改就和基础对象热更新一样零开销。
-  所有模块读到的都是合并后的有效值（topics 开关关掉下一轮立刻停，靠的就是这里）。
+- 「全部配置」（/api/settings/config）和「管理员对话 set_rules 工具」都走
+  save_config_patch / reset_config_field 直写 config.toml（config_file.py 保注释、
+  先备份到 <data_dir>/config-backups、写完 0600），写完立刻热生效（app.apply_config_text）。
 - 校验和 config.toml 同一套语义：睡觉时段 HH:MM-HH:MM、news_slots 每项 HH:MM、
-  QQ 号纯数字、数值范围按 config 的语义（越界在网页是 400 拒绝，不是夹值）。
+  「平台:账号」名单、数值范围按 CONFIG_SCHEMA 的类型和 min/max（越界在网页是 400 拒绝，不是夹值）。
+- 2026-10 之前曾有一层 kv["rules.override"] 盖过文件值（「网页改了不生效」的坑）：
+  已在启动迁移里把值搬进 config.toml 后删键（migrations.migrate_rules_override_to_file）。
 """
 
 from __future__ import annotations
@@ -20,7 +14,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import fields as _dataclass_fields
 from dataclasses import is_dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -28,7 +21,6 @@ from typing import Any
 
 from .config import (
     GroupSetting,
-    SSHServer,
     Settings,
     _WORKSPACE_RE,
     _default_workspace,
@@ -38,10 +30,7 @@ from .config import (
 
 logger = logging.getLogger("maiwork.rules")
 
-KV_OVERRIDE = "rules.override"  # kv 键：{节: {字段: 值}}，只存改过的
-
 _HHMM_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
-_QQ_RE = re.compile(r"^\d+$")
 
 
 # ----------------------------------------------------------------------
@@ -106,22 +95,6 @@ def _check_news_slots(value: Any) -> list[str]:
     return out
 
 
-def _check_qq_list(field_zh: str) -> Any:
-    def check(value: Any) -> list[str]:
-        if not isinstance(value, list):
-            raise ValueError(f'{field_zh}要填 QQ 号列表（纯数字），如 ["10001"]')
-        out: list[str] = []
-        for raw in value:
-            s = raw.strip() if isinstance(raw, str) else str(raw)
-            if not s or not _QQ_RE.match(s):
-                raise ValueError(f"{field_zh}里的 {raw!r} 不是纯数字 QQ 号")
-            if s not in out:
-                out.append(s)
-        return out
-
-    return check
-
-
 def _check_account_list(field_zh: str) -> Any:
     """「平台:账号」列表（MaiBot 标准写法）；只写数字当 qq；统一成小写平台、去重。"""
     from .config import norm_account
@@ -139,40 +112,6 @@ def _check_account_list(field_zh: str) -> Any:
         return out
 
     return check
-
-
-# 节 -> 字段 -> 校验函数。不在表里的字段一律「不认识的规则」拒掉。
-_FIELDS: dict[str, dict[str, Any]] = {
-    "delivery": {
-        "quiet_hours": _check_quiet_hours,
-        "push_per_day": _int_range("每天推送上限", 1, 10),
-    },
-    "topics": {
-        "enabled": _bool_of("开话题开关"),
-        "per_day": _int_range("每天开话题上限", 1, 10),
-        "min_gap_hours": _int_range("开话题最小间隔（小时）", 1, 24),
-    },
-    "approval": {
-        "required": _bool_of("派活批准开关"),
-        "admins": _check_account_list("管理员"),
-        "exempt_groups": _check_account_list("免批的群"),
-        "exempt_users": _check_account_list("免批的人"),
-        "remind": _bool_of("待批提醒开关"),
-        "auto_review": _bool_of("自动审核开关"),
-        "auto_review_daily": _int_range("每群每天最多自动批", 0, 50),
-    },
-    "feeds": {
-        "news_slots": _check_news_slots,
-        "max_items": _int_range("每批资讯上限", 1, 20),
-        "web_min_avg": _float_range("上网页的五项平均门槛", 1.0, 5.0),
-        "pool_min_avg": _float_range("进话题候选池的平均门槛", 1.0, 5.0),
-        "guides": _bool_of("找文章开关"),
-    },
-}
-
-# 网页写进来的「节: {字段: 值}」形态限制
-_PATCH_SECTIONS_MAX = 4
-_PATCH_FIELDS_MAX = 20
 
 
 def _flat_base_value(base: Settings, section: str, field: str) -> Any:
@@ -208,202 +147,6 @@ def _jsonish(value: Any) -> Any:
     return value
 
 
-def _field_list_zh() -> str:
-    return "、".join(f"{s}.{f}" for s, checks in _FIELDS.items() for f in checks)
-
-
-def validate_patch(key: str, value: Any) -> tuple[str, Any]:
-    """校验单个字段：("节.字段", 规范化后的值)；不合格抛 ValueError(中文)。"""
-    key_s = str(key or "").strip()
-    if key_s.count(".") != 1:
-        raise ValueError(f'规则名要写成 "节.字段"，如 delivery.quiet_hours；收到 "{key_s}"')
-    section, _, field = key_s.partition(".")
-    checks = _FIELDS.get(section)
-    if checks is None or field not in checks:
-        raise ValueError(f'不认识的规则 "{key_s}"（能改的只有：{_field_list_zh()}）')
-    return key_s, checks[field](value)
-
-
-def _flatten_patch(body: Any) -> dict[str, Any]:
-    """网页的 {节: {字段: 值}} → {"节.字段": 值}；形态不对抛 ValueError（中文）。"""
-    if not isinstance(body, dict) or not body:
-        raise ValueError('请求体要是 {节: {字段: 值}}，如 {"delivery": {"push_per_day": 5}}')
-    if len(body) > _PATCH_SECTIONS_MAX:
-        raise ValueError("一次最多改 4 个节的规则")
-    flat: dict[str, Any] = {}
-    for section, fields in body.items():
-        s = str(section or "").strip()
-        if s not in _FIELDS:
-            raise ValueError(f'不认识的节 "{s}"（能改的只有：delivery、topics、approval、feeds）')
-        if not isinstance(fields, dict) or not fields:
-            continue
-        for field, value in fields.items():
-            flat[f"{s}.{str(field or '').strip()}"] = value
-    if len(flat) > _PATCH_FIELDS_MAX:
-        raise ValueError("一次最多改 20 个字段")
-    return flat
-
-
-# ----------------------------------------------------------------------
-# 读 / 写 / 重置
-# ----------------------------------------------------------------------
-
-
-def read_override(store: Any) -> dict[str, dict[str, Any]]:
-    """kv 里的覆盖（{节: {字段: 值}}）；没有或不是表 → {}。"""
-    try:
-        raw = store.kv_get(KV_OVERRIDE)
-    except Exception:
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    out: dict[str, dict[str, Any]] = {}
-    for section, fields in raw.items():
-        if isinstance(fields, dict) and str(section) in _FIELDS:
-            out[str(section)] = dict(fields)
-    return out
-
-
-def save_patch(store: Any, body: Any, *, base: Settings | None = None) -> dict[str, dict[str, Any]]:
-    """校验 → 写 kv（和已有覆盖合并）。返回写库后的完整覆盖。
-
-    - 全部字段校验通过才落库（一个失败整次不动）；
-    - base 给了时：值和 config.toml 一样的字段视为「没改」，这条覆盖不写/清掉。
-    """
-    flat = _flatten_patch(body)
-    validated: dict[str, dict[str, Any]] = {}
-    for key, value in flat.items():
-        key_s, v = validate_patch(key, value)
-        section, _, field = key_s.partition(".")
-        validated.setdefault(section, {})[field] = v
-    # 值和 config.toml 一样 =「没改」：这条覆盖不写，已有的也清掉（恢复成文件值）。
-    to_clear: list[str] = []
-    if base is not None:
-        for section in list(validated.keys()):
-            for field in list(validated[section].keys()):
-                if validated[section][field] == _base_value(base, section, field):
-                    to_clear.append(f"{section}.{field}")
-                    del validated[section][field]
-            if not validated[section]:
-                del validated[section]
-    override = read_override(store)
-    for key in to_clear:
-        sec, _, fld = key.partition(".")
-        if sec in override and fld in override.get(sec, {}):
-            del override[sec][fld]
-            if not override[sec]:
-                del override[sec]
-    for section, fields in validated.items():
-        override.setdefault(section, {}).update(fields)
-    override = {s: f for s, f in override.items() if f}
-    with store.tx() as conn:
-        store.kv_set(conn, KV_OVERRIDE, override)
-    logger.info("规则覆盖已保存：%s", "、".join(f"{s}.{f}" for s in override for f in override[s]) or "（空）")
-    return override
-
-
-def reset_field(store: Any, key: str) -> dict[str, dict[str, Any]]:
-    """清掉一个字段的覆盖（恢复用 config.toml 的值）。不存在也幂等；名字不认识抛 ValueError。"""
-    key_s = str(key or "").strip()
-    if key_s.count(".") != 1:
-        raise ValueError(f'规则名要写成 "节.字段"，如 delivery.quiet_hours；收到 "{key_s}"')
-    section, _, field = key_s.partition(".")
-    if section not in _FIELDS or field not in _FIELDS[section]:
-        raise ValueError(f'不认识的规则 "{key_s}"（能改的只有：{_field_list_zh()}）')
-    override = read_override(store)
-    fields = override.get(section)
-    if fields is not None and field in fields:
-        del fields[field]
-        if not fields:
-            del override[section]
-        with store.tx() as conn:
-            store.kv_set(conn, KV_OVERRIDE, override)
-        logger.info("规则覆盖已重置：%s（恢复用 config.toml 的值）", key_s)
-    return override
-
-
-# ----------------------------------------------------------------------
-# 合并（有效设置）
-# ----------------------------------------------------------------------
-
-# 合并时列表型字段换成 tuple（Settings 的字段类型是 tuple）
-_LIST_FIELDS: dict[str, frozenset[str]] = {
-    "approval": frozenset({"admins", "exempt_groups", "exempt_users"}),
-    "feeds": frozenset({"news_slots"}),
-}
-
-
-def _base_value(base: Settings, section: str, field: str) -> Any:
-    """config.toml 里这个字段的值（列表型转 list 方便和网页的 JSON 比对）。"""
-    value = getattr(getattr(base, section), field)
-    if isinstance(value, tuple):
-        return list(value)
-    return value
-
-
-def effective_settings(base: Settings, override: Any) -> Settings:
-    """base 被 override 覆盖后的有效设置（新对象或 base 本身）。
-
-    只换掉被覆盖的子节（dataclasses.replace，一层；基础 Settings 是 frozen，绝不改它）。
-    kv 里混进不认识的 / 坏掉的字段静默忽略（只用网页自己写过的白名单形状，
-    容不得把有效设置搞炸）。
-    """
-    if not isinstance(override, dict) or not override:
-        return base
-    kwargs: dict[str, Any] = {}
-    for section, fields in override.items():
-        checks = _FIELDS.get(section)
-        if checks is None or not isinstance(fields, dict):
-            continue
-        changes: dict[str, Any] = {}
-        for field, value in fields.items():
-            if field not in checks:
-                continue
-            try:
-                v = checks[field](value)
-            except ValueError:
-                continue
-            if field in _LIST_FIELDS.get(section, frozenset()):
-                v = tuple(v)
-            changes[field] = v
-        if not changes:
-            continue
-        section_obj = getattr(base, section, None)
-        if section_obj is None:
-            continue
-        kwargs[section] = replace(section_obj, **changes)
-    if not kwargs:
-        return base
-    return replace(base, **kwargs)
-
-
-# ----------------------------------------------------------------------
-# 响应结构（GET /api/settings/rules 的数据层）
-# ----------------------------------------------------------------------
-
-
-def rules_view(base: Settings, store: Any, *, effective: Settings | None = None) -> dict[str, Any]:
-    """{"values": 有效值, "overridden": [改过的"节.字段"], "defaults_from_file": config 值}。"""
-    override = read_override(store)
-    eff = effective if effective is not None else effective_settings(base, override)
-
-    def _dump_section(setting_obj: Any, section: str) -> dict[str, Any]:
-        out: dict[str, Any] = {}
-        for field in _FIELDS[section]:
-            value = getattr(setting_obj, field)
-            if isinstance(value, tuple):
-                value = list(value)
-            out[field] = value
-        return out
-
-    overridden = sorted(f"{s}.{f}" for s, fields in override.items() for f in fields)
-    return {
-        "values": {s: _dump_section(getattr(eff, s), s) for s in _FIELDS},
-        "overridden": overridden,
-        "defaults_from_file": {s: _dump_section(getattr(base, s), s) for s in _FIELDS},
-    }
-
-
 # ======================================================================
 # 通用配置表（/api/settings/config，2026-10 新增；2026-10 改成直写 config.toml）
 #
@@ -423,6 +166,12 @@ def rules_view(base: Settings, store: Any, *, effective: Settings | None = None)
 # 生效：写完文件立刻在本进程应用（app.apply_config_text，走和
 # on_config_update 一样的 update_config 路径），不等宿主的文件监控；
 # 宿主随后再发一次 on_config_update 是同样内容，幂等。
+#
+# 0.8.0 群控归一：有几项以前是全局、现在**每个群自己一份**（谁能批本群的活 / 免批、
+# 冷场开话题、往群里发多少 / 几点不打扰）。它们仍留在 CONFIG_SCHEMA 里（schema 覆盖面
+# 检查 + 老种子的校验口径，规格别丢），但标了 group_managed：不在「全部配置」页面出现、
+# 不能 PUT / reset，POST/PUT 会明确回一句「到群页管理」。config.toml 里那几行只作
+# **新群第一次的迁移种子**（migrations.migrate_group_controls），不是第二个运行来源。
 # ======================================================================
 
 
@@ -638,12 +387,55 @@ def _validate_generic(spec: dict[str, Any], value: Any) -> Any:
 # 字段声明表
 # ----------------------------------------------------------------------
 
+# 用户常调的留在基础项；实现节奏、机器资源和服务地址归高级。
+_ADVANCED_KEYS = frozenset({
+    "feeds.news_jitter_minutes", "feeds.lookback_days", "feeds.web_min_avg",
+    "feeds.pool_min_avg", "feeds.collect_minutes", "topics.min_gap_hours",
+    "topics.candidate_ttl_hours", "console.listen",
+    "tasks.token_limit", "tasks.run_seconds", "storage.data_dir",
+    "jev.timeout_ms", "jev.key_file", "jev.api_url", "jev.model",
+    "environments.workspace_root", "environments.memory_max", "environments.runtime_max_sec",
+    "environments.local_mode", "environments.run_as", "environments.max_parallel",
+    "environments.command_timeout_s", "environments.railway_daily_max",
+    "environments.verify_per_round", "environments.verify_minutes",
+    "profile.batch_messages", "profile.max_interval_hours", "profile.backfill_days",
+    "profile.backfill_max_messages", "profile.weekly_day", "profile.read_interval_minutes",
+})
+
+
+# 0.8.0：以前全局一份、现在每个群自己一份的键 → 到哪个群页面改（给网页/工具的错误提示）。
+# 值还从 config.toml 读（Settings 里那些字段留着），但只当**新群第一次的迁移种子**；
+# 运行时的真源是 kv["group_approval.<群号>"] / kv["group_push.<群号>"]。
+GROUP_MANAGED_KEYS: dict[str, str] = {
+    "approval.required": "群 → 派活批准（谁能批 / 要不要批 / 免批，每个群一份）",
+    "approval.admins": "群 → 派活批准（谁能批 / 要不要批 / 免批，每个群一份）",
+    "approval.exempt_groups": "群 → 派活批准（谁能批 / 要不要批 / 免批，每个群一份）",
+    "approval.exempt_users": "群 → 派活批准（谁能批 / 要不要批 / 免批，每个群一份）",
+    "topics.enabled": "群 → 往群里发（开话题 / 资讯卡 / 提一嘴 / 每日上限 / 睡觉时段，每个群一份）",
+    "topics.speaker": "已退役：开话题现在都由 MaiWork 自己说一句，不用再设",
+    "topics.per_day": "群 → 往群里发（开话题 / 资讯卡 / 提一嘴 / 每日上限 / 睡觉时段，每个群一份）",
+    "delivery.push_per_day": "群 → 往群里发（开话题 / 资讯卡 / 提一嘴 / 每日上限 / 睡觉时段，每个群一份）",
+    "delivery.quiet_hours": "群 → 往群里发（开话题 / 资讯卡 / 提一嘴 / 每日上限 / 睡觉时段，每个群一份）",
+}
+
+
+def is_group_managed(key: Any) -> bool:
+    """这个键是不是已经归「每个群自己一份」管（不再从全局网页 / set_rules 改）。"""
+    return str(key or "") in GROUP_MANAGED_KEYS
+
+
+def group_managed_hint(key: Any) -> str:
+    """归群管的键：给用户的中文去处说明；不归群管返回 ""。"""
+    return GROUP_MANAGED_KEYS.get(str(key or ""), "")
+
+
 def _F(key: str, label: str, help: str, ftype: str, *, applies: str = "now",
        min: Any = None, max: Any = None, options: Any = None,
        readonly: bool = False, readonly_reason: str = "", check: Any = None) -> dict[str, Any]:
     spec: dict[str, Any] = {
         "key": key, "label": label, "help": help, "type": ftype, "applies": applies,
-        "readonly": bool(readonly),
+        "readonly": bool(readonly), "advanced": key in _ADVANCED_KEYS,
+        "group_managed": key in GROUP_MANAGED_KEYS,
     }
     if readonly_reason:
         spec["readonly_reason"] = readonly_reason
@@ -674,10 +466,8 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     # ---- feeds ----
     _F("feeds.news_slots", "每天备资讯的时段", "每天这几个时间去找资讯（北京时间），比如 09:00", "time_list"),
     _F("feeds.news_jitter_minutes", "时段随机浮动（分钟）", "", "int", min=0, max=120),
-    _F("feeds.ideas_per_day", "每天构想上限", "", "int", min=0, max=10),
     _F("feeds.max_items", "每批资讯上限", "", "int", min=1, max=20),
     _F("feeds.lookback_days", "去重回看天数", "和最近这么多天的资讯去重", "int", min=1, max=90),
-    _F("feeds.blocked_domains", "来源屏蔽名单", "这些网站的内容不再出现", "list_str", check=_check_domain_list("来源屏蔽名单")),
     _F("feeds.web_min_avg", "上网页的平均分门槛", "满分 5 分，越高越挑", "float", min=1.0, max=5.0),
     _F("feeds.pool_min_avg", "进话题候选池的平均分门槛", "满分 5 分，越高越挑", "float", min=1.0, max=5.0),
     _F("feeds.guides", "同时找文章", "教程、好文章和好用的工具", "bool"),
@@ -685,25 +475,29 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     _F("feeds.viz_per_day", "每天图解上限", "没配图、数字多的资讯，画一张小图放在配图的位置；0 = 不画", "int", min=0, max=10),
 
     # ---- goals ----
-    _F("goals.propose", "主动提目标", "MaiWork 觉得群里该长期做件事时，提一个等你批准", "bool"),
 
     # ---- topics ----
-    _F("topics.enabled", "冷场开话题", "群里冷场时开个话题", "bool"),
-    _F("topics.speaker", "开话题谁说", "maiwork = MaiWork 直接说一句；maibot = 请 MaiBot 开口", "enum", options=["maiwork", "maibot"]),
-    _F("topics.per_day", "每天开话题上限", "", "int", min=1, max=10),
+    # 0.8.0：enabled / speaker / per_day 归每个群自己一份（group_managed，不在网页列出、
+    # 不能改）；config.toml 里那几行只作新群第一次的迁移种子（migrations.migrate_group_controls）。
+    _F("topics.enabled", "冷场开话题", "群里冷场时开个话题（现在每个群自己一份，到群页改）", "bool"),
+    _F("topics.speaker", "开话题谁说", "maiwork = MaiWork 直接说一句；maibot = 请 MaiBot 开口（已退役/每群自己一份）", "enum", options=["maiwork", "maibot"]),
+    _F("topics.per_day", "每天开话题上限", "现在并进每群的每日总上限（到群页改）", "int", min=1, max=10),
     _F("topics.min_gap_hours", "两次开话题最小间隔（小时）", "", "int", min=1, max=24),
     _F("topics.candidate_ttl_hours", "话题候选有效期（小时）", "", "int", min=1, max=72),
 
     # ---- delivery ----
-    _F("delivery.push_per_day", "每天推送上限", "包括开话题", "int", min=1, max=10),
-    _F("delivery.quiet_hours", "睡觉时段", "这段时间不打扰群，比如 23:00-08:00", "str", check=_check_quiet_hours),
-    _F("delivery.mention_ttl_minutes", "可提起清单有效期（分钟）", "MaiBot 聊天时可以顺口提起的时限", "int", min=1, max=1440),
+    # 0.8.0：push_per_day / quiet_hours 归每个群自己一份（group_managed），只作迁移种子。
+    _F("delivery.push_per_day", "每天推送上限", "并进每群的每日总上限（到群页改）", "int", min=1, max=10),
+    _F("delivery.quiet_hours", "睡觉时段", "现在每个群自己一份（到群页改），比如 23:00-08:00", "str", check=_check_quiet_hours),
 
     # ---- approval ----
-    _F("approval.required", "派活要批准", "群友派的活，管理员批准后才开工", "bool"),
-    _F("approval.admins", "bot 管理员", "写成 qq:账号", "list_str", check=_check_account_list("管理员")),
-    _F("approval.exempt_groups", "免批的群", "这些群派的活不用批准。写成 qq:群号", "list_str", check=_check_account_list("免批的群")),
-    _F("approval.exempt_users", "免批的人", "这些人派的活不用批准。写成 qq:账号", "list_str", check=_check_account_list("免批的人")),
+    # 0.8.0：required / admins / exempt_groups / exempt_users 归每个群自己一份
+    # （kv["group_approval.<群号>"]，group_managed），只作迁移种子；这里保留规格是为了
+    # schema 覆盖面检查与老种子的校验口径。
+    _F("approval.required", "派活要批准", "现在每个群自己一份（到群页改）", "bool"),
+    _F("approval.admins", "bot 管理员", "谁能批本群的活（现在每个群自己一份，到群页改）；写成 qq:账号", "list_str", check=_check_account_list("管理员")),
+    _F("approval.exempt_groups", "免批的群", "现在每个群自己一份（到群页改）：写成 qq:群号", "list_str", check=_check_account_list("免批的群")),
+    _F("approval.exempt_users", "免批的人", "现在每个群自己一份（到群页改）：写成 qq:账号", "list_str", check=_check_account_list("免批的人")),
     _F("approval.remind", "待批提醒", "超过 24 小时没人批，在群里提醒一次", "bool"),
     _F("approval.auto_review", "自动审核轻活", "调研、找东西、做个小网页这类低风险小活，直接开工", "bool"),
     _F("approval.auto_review_daily", "每群每天最多自动批", "0 = 关掉自动审核；要花钱、对外发消息、大工程照旧等你批",
@@ -842,6 +636,9 @@ def save_config_patch(store: Any, body: Any, *, base: Settings, plugin_dir: Any 
 
     - 全部字段先校验，一个不过整次不写文件（ValueError 中文原因）；
     - readonly 字段、不认识的字段一律 400；
+    - 0.8.0 归每个群自己管的字段（approval.required/admins/exempt_*、topics.enabled/
+      speaker/per_day、delivery.push_per_day/quiet_hours）也一律 400，并明确说去哪改——
+      绝不写进文件让 runtime 不听（旧配置那几行只作新群的迁移种子）；
     - 普通字段：写进 config.toml 对应键；
     - secret 字段：没给 / 给 "" = 不改；给 null = 清空（文件里写 ""）；
       给非空字符串 = 写进 config.toml（明文）。console.password 额外要 body 里
@@ -851,7 +648,7 @@ def save_config_patch(store: Any, body: Any, *, base: Settings, plugin_dir: Any 
     from . import config_file
 
     if not isinstance(body, dict):
-        raise ValueError('请求体要写成 {"节.字段": 值}，如 {"topics.per_day": 5}')
+        raise ValueError('请求体要写成 {"节.字段": 值}，如 {"feeds.max_items": 12}')
     items = {k: v for k, v in body.items() if _norm_key(k) != "current_password"}
     if not items:
         raise ValueError("没有要改的字段")
@@ -865,6 +662,10 @@ def save_config_patch(store: Any, body: Any, *, base: Settings, plugin_dir: Any 
         if spec is None:
             raise ValueError(f'不认识或不能在这里改的字段 "{key}"（[models] 走「设置 → 模型」、'
                              "[extensions] 走「设置 → 扩展」、plugin.config_version 不可改）")
+        hint = group_managed_hint(key)
+        if hint:
+            raise ValueError(f"「{spec['label']}」现在每个群自己一份，到「{hint}」里改；"
+                             "config.toml 里那一行只作新群的迁移种子，不再从网页改")
         if spec.get("readonly"):
             raise ValueError(f"{spec['label']}不能从网页改：{spec.get('readonly_reason') or '只能改 config.toml 文件'}")
         if spec["type"] == "secret":
@@ -921,6 +722,10 @@ def reset_config_field(store: Any, key: Any, *, base: Settings | None = None, pl
     spec = CONFIG_BY_KEY.get(key_s)
     if spec is None:
         raise ValueError(f'不认识或不能在这里改的字段 "{key_s}"')
+    hint = group_managed_hint(key_s)
+    if hint:
+        raise ValueError(f"「{spec['label']}」现在每个群自己一份，到「{hint}」里改；"
+                         "config.toml 里那一行只作新群的迁移种子，不再从网页改")
     if spec.get("readonly"):
         raise ValueError(f"{spec['label']}不能从网页改：{spec.get('readonly_reason') or '只能改 config.toml 文件'}")
     p_dir, d_dir = _ctx_of(base, plugin_dir=plugin_dir)
@@ -996,7 +801,12 @@ def config_view(base: Settings, store: Any, *, effective: Settings | None = None
             "type": spec["type"],
             "applies": spec["applies"],
             "readonly": bool(spec.get("readonly")),
+            "advanced": bool(spec.get("advanced")),
         }
+        if spec.get("group_managed"):
+            # 0.8.0 归每个群自己管：不在「全部配置」列出（网页/工具改了也一律 400）
+            out["group_managed"] = True
+            out["group_managed_hint"] = group_managed_hint(key)
         if spec.get("readonly_reason"):
             out["readonly_reason"] = spec["readonly_reason"]
         if "min" in spec:
@@ -1018,7 +828,10 @@ def config_view(base: Settings, store: Any, *, effective: Settings | None = None
     sections: list[dict[str, Any]] = []
     for meta in CONFIG_SECTIONS:
         sid = meta["id"]
-        fields = [_field_view(spec) for spec in CONFIG_SCHEMA if spec["key"].split(".", 1)[0] == sid]
+        fields = [
+            _field_view(spec) for spec in CONFIG_SCHEMA
+            if spec["key"].split(".", 1)[0] == sid and not spec.get("group_managed")
+        ]
         if fields:
             sections.append({"id": sid, "label": meta["label"], "fields": fields})
     return {"file": "config.toml", "sections": sections, "reload_pending": []}

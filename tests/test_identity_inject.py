@@ -111,37 +111,50 @@ async def test_feeds_write_posts_no_maibot_fallback_without_soul(tmp_path: Path)
     assert "老麻" not in prompt and "热心肠" not in prompt
 
 
-async def test_feeds_focus_and_score_and_idea_inject_memory(tmp_path: Path) -> None:
-    """定关注点 / 打分 / 构想提示带「## 工作记忆（全局）」和本群那份；别的群的不带。"""
+async def test_feeds_focus_and_score_inject_memory(tmp_path: Path) -> None:
+    """定关注点 / 打分提示带「## 工作记忆（全局）」+ 本群三份（规矩 + 做法 skill）。
+
+    「每群三份」收尾：每群内容只走 group_context(gid, kind)——所以 prompt 里要出现
+    本群规矩（【本群规矩（管理员定的，必须照做）】）和本群<资讯>做法
+    （【本群资讯的做法（MaiWork 总结的，是参考）】），别群的规矩/skill 一律不带。
+    """
+    from CharTyr_MaiWork.maiwork.agents import Agents
     from CharTyr_MaiWork.maiwork.feeds import Feeds
 
     store, profiles = _feeds_fixtures(tmp_path)
     identity = await _identity(tmp_path, store)
     identity.write("memory", "- 管理员偏好表格交付")
-    identity.group_write(GID, "- 这个群讨厌深科技长视频")
-    identity.group_write(GID_OTHER, "- 别群的秘密经验")
     settings = _settings()
+    # 业务里 group_context 靠 agents 拿规矩 / skill；这里提前填好两个群各自一份
+    agents = Agents(store, lambda: settings)
+    agents.group_rules_set(GID, "这个群讨厌深科技长视频", updated_by="admin")
+    agents.skill_add(GID, "news", description="", body="这个群爱看开源硬件", source="admin")
+    agents.group_rules_set(GID_OTHER, "别群的秘密规矩", updated_by="admin")
+    agents.skill_add(GID_OTHER, "news", description="", body="别群的秘密做法", source="admin")
     models = FakeModelsQueue(ready=True, replies=[
         focus_reply("q1", "q2", "q3"),  # _plan_focus（给 3 个免得触发追问重试）
         # _score（给一条对得上的：打分分批后「一条都没对上」算失败会抛错）
         '{"scores": [{"i": 0, "info": 3, "source": 3, "relevance": 3, "timeliness": 3, "chat": 3}]}',
-        '{"idea": null}',  # make_idea
     ])
     feeds = Feeds(store, models, None, profiles, _NoTopics(), lambda: settings, identity=identity)
+    # 挂上 specialists 给 group_context 走（老代码 feeds._specialists 就是 fake 这么走的）
+    feeds._specialists = type("SP", (), {"agents": agents})()
     focus = await feeds._plan_focus(GID, settings)
     assert focus and focus[0]["query"] == "q1"
     await feeds._score(GID, settings, [
         {"title": "t", "url": "https://x.com/a", "summary": "s", "kind": "news", "quote": "q"}
     ])
-    await feeds.make_idea(GID)
-    assert len(models.calls) == 3
-    for i in range(3):
+    assert len(models.calls) == 2
+    for i in range(2):
         prompt = models.calls[i][1][-1]["content"]
         assert "## 工作记忆（全局）" in prompt
         assert "管理员偏好表格交付" in prompt
-        assert "## 这个群的工作记忆" in prompt
+        # 本群三份：规矩 + （资讯岗的）做法，别群的绝不出现
+        assert "本群规矩" in prompt
         assert "讨厌深科技长视频" in prompt
-        assert "别群的秘密经验" not in prompt
+        assert "本群资讯的做法" in prompt or "爱看开源硬件" in prompt
+        assert "别群的秘密规矩" not in prompt
+        assert "别群的秘密做法" not in prompt
 
 
 # ----------------------------------------------------------------------
@@ -222,6 +235,20 @@ class _CoordSettings:
         return f"g{group_id}"
 
 
+class _AgentsSettingsShim:
+    """给 Agents 用的 settings：需要 is_served；包装 _CoordSettings 但保持窄——
+    每群三份的 Agents 阶级（group_rules_set / skill_add）都要求这个口。"""
+
+    def __init__(self, base: _CoordSettings):
+        self._base = base
+
+    def is_served(self, gid: object) -> bool:
+        return str(gid or "") in (self._base.groups or {})
+
+    def __getattr__(self, name: str):
+        return getattr(self._base, name)
+
+
 def _coord_fixtures(tmp_path: Path, with_groups: bool = True) -> tuple:
     from CharTyr_MaiWork.maiwork.environments.local import LocalEnv
     from CharTyr_MaiWork.maiwork.goals import Goals
@@ -257,12 +284,18 @@ async def test_coordinator_plan_and_review_inject_blocks(tmp_path: Path) -> None
     from test_coordinator import ModelsQueue, FakeWorkers, _create_task, _plan, _review, GID as TC_GID
 
     store, settings, env, tools, tasks, goals = _coord_fixtures(tmp_path)
-    identity = Identity(tmp_path / "data", store, lambda: settings)
+    shim = _AgentsSettingsShim(settings)
+    identity = Identity(tmp_path / "data", store, lambda: shim)
     await identity.ensure_started()
     identity.write("agents", "规矩乙：交付前自查完成标准。")
     identity.write("memory", "- 全局经验：图表比长段文字受欢迎")
-    identity.group_write(str(TC_GID), "- 本群经验：别在晚上十点后 @ 人")
-    identity.group_write(GID_OTHER, "- 别群的秘密")
+    # 「每群三份」收尾：每群内容（本群规矩 + 本群做法）由 group_context 注入。
+    # 这里把 Agents 挂出来给 coordinator 的 _group_context_safe 用。
+    from CharTyr_MaiWork.maiwork.agents import Agents
+    agents = Agents(store, lambda: shim)
+    agents.group_rules_set(str(TC_GID), "本群规矩：别在晚上十点后 @ 人", updated_by="admin")
+    agents.group_rules_set(GID_OTHER, "别群的秘密规矩", updated_by="admin")
+    agents.skill_add(GID_OTHER, "task", name="别群做法", description="d", body="secret", source="admin")
 
     models = ModelsQueue(replies=[_plan(), _review(pass_=True), '{"done": true}'])
     workers = FakeWorkers()
@@ -274,7 +307,22 @@ async def test_coordinator_plan_and_review_inject_blocks(tmp_path: Path) -> None
         (ws / "artifacts" / tid / "index.html").write_text("<html>ok</html>", encoding="utf-8")
 
     workers.before_return = _write_real
-    coordinator = _new_coordinator(store, models, workers, tools, tasks, goals, env, settings, identity=identity)
+    coordinator = _new_coordinator(store, models, workers, tools, tasks, goals, env, shim, identity=identity)
+    # 假 Specialists：能 run（拿到 brief 直接回报 ok），又能给 _group_context_safe
+    # 拿 agents（这才是把本群规矩塞进计划 / 验收提示的口子）
+    from CharTyr_MaiWork.maiwork.workers import WorkerReport
+
+    captured_briefs: list[str] = []
+
+    class _FakeSpecialists:
+        def __init__(self, agents) -> None:
+            self.agents = agents
+
+        async def run(self, kind, brief, **kw):
+            captured_briefs.append(brief)
+            return WorkerReport(ok=True, summary="收工", data={"items": []})
+
+    coordinator._specialists = _FakeSpecialists(agents)
     await coordinator.run_task(tid)
 
     plan_prompt = models.calls[0][1][-1]["content"]
@@ -284,21 +332,28 @@ async def test_coordinator_plan_and_review_inject_blocks(tmp_path: Path) -> None
         assert "规矩乙：交付前自查完成标准" in p
         assert "## 工作记忆（全局）" in p
         assert "图表比长段文字受欢迎" in p
-        assert "## 这个群的工作记忆" in p
+        # 每群三份：本群规矩注入，别群的绝不漏
+        assert "本群规矩" in p
         assert "别在晚上十点后 @ 人" in p
-        assert "别群的秘密" not in p
+        assert "别群的秘密规矩" not in p
+        assert "secret" not in p
 
 
 async def test_coordinator_remember_round_after_review(tmp_path: Path) -> None:
-    """验收 pass 后、交付前给主模型一次「记经验」小回合：带 remember 工具；调过一次后记进本群。"""
+    """验收后只记与群、人无关的全局方法；自动记忆回合不得修改本群规矩。"""
     from test_coordinator import ModelsQueue, FakeWorkers, ReplayChatResult, _create_task, _plan, _review, GID as TC_GID
 
     store, settings, env, tools, tasks, goals = _coord_fixtures(tmp_path)
-    identity = Identity(tmp_path / "data", store, lambda: settings)
+    shim = _AgentsSettingsShim(settings)
+    identity = Identity(tmp_path / "data", store, lambda: shim)
     await identity.ensure_started()
     register_remember_tool(tools, identity)
 
-    remember_args = {"scope": "group", "text": "这个群喜欢先看结论再看过程", "reason": "交付表单反馈"}
+    remember_args = {"scope": "global", "text": "验收前逐项对照完成标准", "reason": "通用验收方法"}
+    from CharTyr_MaiWork.maiwork.agents import Agents
+    group_agents = Agents(store, lambda: shim)
+    original_rules = group_agents.group_rules_set(str(TC_GID), "本群不要发广告", updated_by="admin")
+    original_versions = group_agents.group_rules_versions(str(TC_GID))
     remember_tc = [{
         "id": "rc-1",
         "type": "function",
@@ -328,13 +383,13 @@ async def test_coordinator_remember_round_after_review(tmp_path: Path) -> None:
         (ws / "artifacts" / tid / "index.html").write_text("<html>ok</html>", encoding="utf-8")
 
     workers.before_return = _write_real
-    coordinator = _new_coordinator(store, models, workers, tools, tasks, goals, env, settings, identity=identity)
+    coordinator = _new_coordinator(store, models, workers, tools, tasks, goals, env, shim, identity=identity)
     await coordinator.run_task(tid)
 
-    # 记进本群文件，全局没有
-    text = identity.group_read(str(TC_GID))["text"]
-    assert "先看结论再看过程" in text
-    assert "先看结论再看过程" not in identity.read("memory")["text"]
+    # 自动回合只记全局通用方法，规矩正文、来源、时间和历史均不得变化。
+    assert group_agents.group_rules_get(str(TC_GID)) == original_rules
+    assert group_agents.group_rules_versions(str(TC_GID)) == original_versions
+    assert "逐项对照完成标准" in identity.read("memory")["text"]
     # events 有一条 memory.write
     row = store.read().execute("SELECT COUNT(*) c FROM events WHERE kind='memory.write'").fetchone()
     assert int(row["c"]) == 1

@@ -70,6 +70,13 @@ _SEARCH_QUOTES = 6
 _WEB_MIN_AVG = 3.0
 
 
+def _join_blocks(*blocks: str) -> str:
+    """把几段统一注入拼成一段（空段丢掉、两段中间空一行）。用来把
+    「规矩+资讯做法」和「构想做法（不带规矩）」合成一次注入，规矩只出现一份。"""
+    parts = [str(b or "").strip() for b in blocks]
+    return "\n\n".join(p for p in parts if p)
+
+
 def in_personal_window(ts: float) -> bool:
     """这个时间戳（北京时间）是不是在 9:00–22:00 之间（含 9:00、不含 22:00）。"""
     hour = clock.bj(float(ts)).hour
@@ -118,6 +125,8 @@ class Personal:
         self._search = search
         self._host = host
         self._identity = identity
+        # 每群三份统一注入（docs/17 §八.2）：app._wire_specialists 挂上后生效
+        self._agents: Any = None
 
     # ------------------------------------------------------------------
     # 调度（app 后台循环）：到期的人（每群每轮最多 1 个）、记做过
@@ -308,7 +317,15 @@ class Personal:
         AGENTS.md（做事规矩，含管理员写的搜索要求）在定关注点时就生效。
         """
         agents_block = self._prompt_block_safe("agents")
+        # 每群三份（docs/17 §八.2）：这一步同时产出「news 关注点」和 0–1 条 idea，
+        # 两种产出类型都要注。规矩只在 news 段拼一次，idea 段只要做法（include_rules=False），
+        # 免得整段规矩在提示词里出现两遍。
+        gc = _join_blocks(
+            self._group_context_safe(gid, "news"),
+            self._group_context_safe(gid, "idea", include_rules=False),
+        )
         lines = ([agents_block] if agents_block else [])
+        lines += ([gc] if gc else [])
         lines += [f"要给 {name}（就这个人，不是整个群）挑他个人会感兴趣的资讯。他最近的画像："]
         p_lines = self._persona_lines(persona)
         if p_lines:
@@ -372,9 +389,13 @@ class Personal:
         lines = []
         for f in focus_list:
             lines.append(f"- {f['query']}" + (f"（原因：{f['why']}）" if f.get("why") else ""))
+        # 找料也是「资讯」这一步（docs/17 §八.2）：本群规矩 + 本群资讯做法一起给子 agent
+        gc = self._group_context_safe(gid, "news")
+        gc_part = f"\n{gc}" if gc else ""
         brief = (
             "给一位群成员挑他个人会感兴趣的「资讯」（最近几天的新闻/发布/动态）。关注点：\n"
             + "\n".join(lines)
+            + gc_part
             + "\n\n要求：\n"
             "1. 用 web_search 搜最近几天（days 填 3–7）；\n"
             "2. 每条候选必须用 fetch_page 真打开过原文再看一遍，确实和关注点相关、有信息量才收；\n"
@@ -456,12 +477,10 @@ class Personal:
 
     def _hard_reject_code(self, gid: str, candidates: list[dict]) -> list[dict]:
         """不调模型的第一道硬性淘汰；返回幸存列表（原序）。"""
-        from .feeds import _similar, _site_of, _TITLE_DEDUP_RATIO, _domain_blocked, blocked_domains_effective
+        from .feeds import _similar, _site_of, _TITLE_DEDUP_RATIO, _domain_blocked, blocked_domains
 
         settings = self._get_settings()
-        blocked = set(blocked_domains_effective(
-            self._store, tuple(getattr(settings.feeds, "blocked_domains", ()) or ())
-        ))
+        blocked = set(blocked_domains(self._store, gid))
         # 对重窗口看「本群个人向 + 群向」最近 lookback_days 天（个人向别和群向出题撞，也别和自己撞）
         since = clock.now() - max(1, int(getattr(settings.feeds, "lookback_days", 14))) * 86400.0
         rows = self._store.read().execute(
@@ -527,7 +546,10 @@ class Personal:
             for x in persona.get(k, [])[:5]:
                 entry_texts.append(str(x))
         entry_texts = entry_texts[:20]
-        lines = [f"这是 {name}（一个人，不是群）在做/关心/提过的事，相关度对着它们打："]
+        # 打分这一步的产出类型是 news（docs/17 §八.2）：规矩 + 本群资讯做法
+        gc = self._group_context_safe(gid, "news")
+        lines = ([gc] if gc else [])
+        lines.append(f"这是 {name}（一个人，不是群）在做/关心/提过的事，相关度对着它们打：")
         if entry_texts:
             for i, t in enumerate(entry_texts):
                 lines.append(f"[{i}] {t}")
@@ -703,6 +725,11 @@ class Personal:
 
         lines = [f"下面这轮内容只给 {name} 一个人看。写正文要用「写给他本人」的第二人称，"
                  "像当面跟他说，别用第三人称称呼他；reason 想说他自己提过的事，只能用给出的他本人的原话。"]
+        # 写帖子这一步的产出类型是 news（docs/17 §八.2）：规矩 + 本群资讯做法
+        gc = self._group_context_safe(gid, "news")
+        if gc:
+            lines.append("")
+            lines.append(gc)
         p_lines = self._persona_lines(persona)
         if p_lines:
             lines.append("")
@@ -874,9 +901,9 @@ class Personal:
                     " url_key, published_ts, score, status_kind, status_at, replies, expires_ts,"
                     " up, down, created, kind, scores, topic, sensitive, profile_ref, rejected,"
                     " reject_gate, reject_reason, body, reason, refs, audience, image_url,"
-                    " keywords, chat_votes, angle, verify, target_user_id)"
+                    " keywords, angle, verify, target_user_id)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', NULL, 0, NULL, 0, 0, ?,"
-                    " 'news', ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, ?, '', ?, 0, '', ?, ?)",
+                    " 'news', ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, ?, '', ?, '', ?, ?)",
                     (
                         batch_id, gid, str(item.get("icon") or "newspaper"), item["title"],
                         item["summary"], str(item.get("why") or ""),
@@ -1174,6 +1201,39 @@ class Personal:
         probe = getattr(self._search, "search", None)
         if callable(probe):
             await probe("__配置自检__", limit=1)
+
+    def _group_context_safe(
+        self,
+        gid: str,
+        kind: str,
+        *,
+        include_rules: bool = True,
+        include_skill: bool = True,
+    ) -> str:
+        """统一注入（docs/17 §八.2）：本群规矩 + 本群<岗>的做法；没接线 / 出错 → ""。
+
+        include_* 透传给 group_context：同一个环节要一次注两种产出类型时，
+        第二段用 include_rules=False 只要做法，规矩不重复拼。
+        """
+        agents = getattr(self, "_agents", None)
+        if agents is None:
+            return ""
+        try:
+            from . import group_context as _gc
+
+            return str(
+                _gc.group_context(
+                    agents,
+                    str(gid),
+                    kind,
+                    include_rules=bool(include_rules),
+                    include_skill=bool(include_skill),
+                )
+                or ""
+            ).strip()
+        except Exception:
+            logger.warning("读本群规矩 / 做法出错（群 %s 岗 %s），这次不注入", gid, kind, exc_info=True)
+            return ""
 
     def _prompt_block_safe(self, kind: str, group_id: str | None = None) -> str:
         """identity.prompt_block；没有 identity / 它出错 / 内容空 → 都 ""。各注入点靠这个回落。"""

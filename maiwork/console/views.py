@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -752,6 +753,170 @@ def _agent_fish(svc: Any) -> dict[str, str]:
         return {k: "" for k in _AGENT_FISH_KINDS}
 
 
+# ----------------------------------------------------------------------
+# 出网遮罩：发件视图（往群里发 / 卡片 / 提一嘴）的三条出口共用这一份
+# ----------------------------------------------------------------------
+#
+# 同一份发件数据有三条出口：GET /api/groups/{gid}/push（新接口）、
+# GET /api/groups/{gid}/card-push（老接口，card_push.web_view）、
+# GET /api/groups/{gid} 群快照（views.group_view → card_push.group_push）。
+# 前端只读轮询走的是第三条，所以遮罩必须是这三条共用的同一份实现，
+# **只在这里定义一次**（server 的群路由从本模块取，不再自己抄一份正则）。
+#
+# 只动「发件数据」这几个子字段（recent[].text / error，卡片 / 提一嘴的 error）：
+# 群名、批准账号、has_link、config 这些正常的管理内容原样。
+
+# 本机绝对路径（工作区 / 数据目录长什么样）不外发给群管理员 / 群友。
+# 只认 ASCII 的绝对路径段，且不在 URL / 相对路径里：`https://a/b`、`开/关` 不动。
+_ABS_PATH_RE = re.compile(r"(?<![A-Za-z0-9_:/])/(?:[A-Za-z0-9._@+-]+/)*[A-Za-z0-9._@+-]+")
+
+# 已知密钥之外的一道兜底（和 models 的遮罩合同同风格）：`api_key=...` / `token: ...`
+# 这种「键名 + 值」形态。前面的 (?<![A-Za-z0-9]) 让 `OPENAI_API_KEY=...` 这种后缀命中，
+# 又不把 `myapi_key` 里的片段当键名；值只认凭据里会出现的 ASCII 字符，遇到中文 / 空格 /
+# 引号就停，免得把后面的正常说明（含全角标点）一起吃掉。
+_SECRET_ASSIGN_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])"
+    r"(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|password|passwd)\b"
+    r"(\s*[:=]\s*)([A-Za-z0-9._~+/\-]+)"
+)
+
+
+def secret_list(svc: Any) -> list[str]:
+    """目前已知的密钥值：secrets 表 + 旧 [models].api_key + 各 [[endpoints]] 的密钥 / 头值。
+
+    只读、只用来遮罩；值本身绝不外发、不写日志。读不到就是空表（照常出网，只是少一道遮罩）。
+    """
+    secrets: list[str] = []
+
+    def _add(value: Any, *, max_len: int = 0) -> None:
+        text = str(value or "")
+        if not text or (max_len and len(text) > max_len) or text in secrets:
+            return
+        secrets.append(text)
+
+    try:
+        store = getattr(svc, "store", None)
+        if store is not None:
+            # 表里的值（含群管理员口令哈希）可能是超长脏数据，超 4096 的不进遮罩名单（老行为）
+            for row in store.read().execute("SELECT value FROM secrets").fetchall():
+                _add(row["value"], max_len=4096)
+    except Exception:
+        pass
+    try:
+        settings = svc.get_settings()
+        if settings is not None:
+            _add(getattr(settings.models, "api_key", ""))
+            for endpoint in getattr(settings, "endpoints", ()) or ():
+                _add(getattr(endpoint, "api_key", ""))
+                for header_value in dict(getattr(endpoint, "headers", {}) or {}).values():
+                    _add(header_value)
+    except Exception:
+        pass
+    # svc 自己那份「已知密钥」（app.MaiWorkApp.known_secrets 公开方法）：搜索绑定 / Jev 密钥 /
+    # 网页总密码 / [[extensions.mcp]] 请求头……工具摘要吃这一份，控制台三个出口也必须吃同一份
+    # （否则「工具遮了、网页没遮」）。拿不到 / 方法炸了 → 保住上面已取到的，绝不因此返回空表；
+    # 非字符串项按 models._redact_full 的合同先过滤（它只吃 str）。
+    getter = getattr(svc, "known_secrets", None)
+    if not callable(getter):
+        getter = getattr(svc, "_known_secrets", None)
+    if callable(getter):
+        try:
+            extra = getter()
+        except Exception:
+            extra = None
+        if isinstance(extra, (list, tuple)):
+            for value in extra:
+                if isinstance(value, str):
+                    _add(value)
+    return secrets
+
+
+def redact_free_text(text: Any, secrets: list[str] | None = None) -> str:
+    """发件自由文本（text / error）出网前统一遮罩：已知密钥 + `键=值` 形态 + 本机绝对路径。"""
+    from .. import models as _models  # 局部导入：models 是重模块，避免 import 环
+
+    out = _models._redact_full("" if text is None else str(text), list(secrets or []))
+    out = _SECRET_ASSIGN_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}***", out)
+    return _ABS_PATH_RE.sub("[路径已略]", out)
+
+
+def redact_push_view(payload: Any, secrets: list[str] | None = None) -> dict[str, Any]:
+    """`group_push.view` 的输出过遮罩：只有 recent 里的 text / error 变，其它字段原样。"""
+    raw = payload if isinstance(payload, dict) else {}
+    out = {k: v for k, v in raw.items() if k != "recent"}
+    recent = raw.get("recent")
+    out["recent"] = [
+        {
+            **r,
+            "text": redact_free_text(r.get("text"), secrets),
+            "error": redact_free_text(r.get("error"), secrets),
+        }
+        for r in (recent if isinstance(recent, list) else [])
+        if isinstance(r, dict)
+    ]
+    return out
+
+
+def redact_card_push_view(view: Any, secrets: list[str] | None = None) -> dict[str, Any]:
+    """`card_push.web_view` 的输出过遮罩。
+
+    - 嵌套的 `group_push` 子视图走 `redact_push_view`（同一份）；
+    - 卡片 `recent[].error` 与提一嘴 `mention.recent[].error` 也走同一份自由文本遮罩；
+    - `has_link` / `config` / recent 的其它字段（id / status / count / ts / mode / …）原样。
+    """
+    raw = view if isinstance(view, dict) else {}
+    out = dict(raw)
+    gp = raw.get("group_push")
+    if isinstance(gp, dict):
+        out["group_push"] = redact_push_view(gp, secrets)
+    # 形状有两种：card_push.web_view 顶层的 recent 是**列表**（card_push.status 的输出），
+    # mention 是**带自己 recent 的表**（idea_mention.status 的输出）；两种都过同一份遮罩。
+    for key in ("recent", "mention"):
+        block = raw.get(key)
+        if isinstance(block, list):
+            out[key] = [
+                {**r, "error": redact_free_text(r.get("error"), secrets)}
+                for r in block
+                if isinstance(r, dict)
+            ]
+        elif isinstance(block, dict):
+            fresh = dict(block)
+            rows = block.get("recent")
+            if isinstance(rows, list):
+                fresh["recent"] = [
+                    {**r, "error": redact_free_text(r.get("error"), secrets)}
+                    for r in rows
+                    if isinstance(r, dict)
+                ]
+            out[key] = fresh
+    return out
+
+
+def _group_quiet_hours(svc: Any, group_id: str, settings: Any) -> str:
+    """这个群的睡觉时段（唯一真源 `kv["group_push.<群号>"].quiet_hours`）。
+
+    0.8.0：`[delivery] quiet_hours` 只是新群第一次的迁移种子，不再当第二来源——
+    一个群改了几点睡，别的群页不许跟着变。读不到每群那份才回落老全局值显示。
+    """
+    from .. import group_push
+
+    store = getattr(svc, "store", None)
+    try:
+        if store is not None:
+            cfg = group_push.get_config(store, str(group_id), settings)
+            quiet = str(cfg.get("quiet_hours") or "").strip()
+            if quiet:
+                return quiet
+    except Exception:
+        logger.exception("读这个群的睡觉时段出错（群 %s），按老全局值显示", group_id)
+    if settings is not None:
+        try:
+            return str(settings.delivery.quiet_hours or "") or "23:00-08:00"
+        except Exception:
+            pass
+    return "23:00-08:00"
+
+
 def group_view(svc: Any, group_id: str, *, admin: bool) -> dict[str, Any]:
     settings = svc.get_settings()
     now = clock.now()
@@ -763,19 +928,14 @@ def group_view(svc: Any, group_id: str, *, admin: bool) -> dict[str, Any]:
     except Exception:
         bins = []
     bins_list = [int(x) for x in bins] if isinstance(bins, (list, tuple)) else []
-    sleep = settings.delivery.quiet_hours if settings is not None else "23:00-08:00"
+    sleep = _group_quiet_hours(svc, group_id, settings)
     read_since = float(row.get("read_since") or 0.0)
     news, guides, ideas, topic_log, pulse_topics, pulse_spells = _m2_lists(svc, group_id, now, admin=admin)
-    feeds_pref = ""
-    try:
-        if getattr(svc, "feeds", None) is not None:
-            feeds_pref = str(svc.feeds.pref(group_id) or "")
-    except Exception:
-        feeds_pref = ""
+    # 「资讯偏好」2026-10-10 已删（feeds.pref.<群>）；换成本群规矩 body 放在自己的 /rules 路由，
+    # 不再挂在 /api/groups 视图里。
     view: dict[str, Any] = {
         "workspace": workspace,
         "read_since": read_since if read_since > 0 else None,
-        "feeds_pref": feeds_pref,
         "pulse": {
             "end": now,
             "step": 900,
@@ -811,13 +971,19 @@ def group_view(svc: Any, group_id: str, *, admin: bool) -> dict[str, Any]:
             "album_upload": bool(caps.get("album_upload")),
             "role": str(role or ""),
         }
-        # 往群里发（资讯卡片 / 构想提一嘴）的开关：仅管理员 / 本群群管理员
+        # 往群里发（资讯卡片 / 构想提一嘴）的开关：仅管理员 / 本群群管理员。
+        # 出网前统一遮罩（和 /push、/card-push 用同一份 helper）：前端只读轮询读的就是这里的
+        # card_push.group_push，不遮等于新接口白遮。
         try:
             from .. import card_push as _cp
 
-            view["card_push"] = _cp.web_view(svc, group_id)
+            view["card_push"] = redact_card_push_view(
+                _cp.web_view(svc, group_id), secret_list(svc)
+            )
         except Exception:
             logger.exception("读卡片推送设置失败（群 %s）", group_id)
+        # 第二批 §六.2 请你过目 2026-10-03 整个删掉：做事经验已废、换成 skill（agent_skills），
+        # 「自动流程学过的」不再单独计数提醒——规矩/做法的查看和回退走 /api/groups/{gid}/{rules,skills}。
     else:
         _attach_idea_targets(svc, group_id, ideas, [], admin=False)
         out.pop("token", None)
@@ -1149,10 +1315,20 @@ def settings_view(svc: Any) -> dict[str, Any]:
                 "link": public_url + path if public_url else path,
             }
         )
-    feeds_config: tuple[str, ...] = ()
     if settings is not None:
-        feeds_config = tuple(getattr(settings.feeds, "blocked_domains", ()) or ())
+        # 0.8.0 群控归一：这几项（批准名单 / 开话题 / 每日上限 / 睡觉时段）现在每个群
+        # 自己一份，设置页不再拿它们当全局可改项展示。这里保留兼容字段，但**明确标成
+        # 迁移种子**（值只作新群第一次的默认，不代表任何群的实际运行值），前端不读
+        # `s.rules` 也不要紧；真要改到「群 → 往群里发 / 派活批准」里改。
         rules = {
+            "group_managed": True,
+            "seed_only": True,
+            "note": (
+                "「谁能批 / 免批」和「往群里发（开话题 / 资讯卡 / 提一嘴 / 每日上限 / "
+                "睡觉时段）」现在每个群自己一份，到「群 → 往群里发 / 派活批准」里改；"
+                "下面几项只是新群第一次的迁移种子，不是任何群的实际值。"
+            ),
+            "group_page": "每个群页面 → 往群里发 / 派活批准",
             "quiet_hours": settings.delivery.quiet_hours,
             "topics_per_day": settings.topics.per_day,
             "topics_min_gap_hours": settings.topics.min_gap_hours,
@@ -1164,6 +1340,10 @@ def settings_view(svc: Any) -> dict[str, Any]:
         problems = list(settings.problems)
     else:
         rules = {
+            "group_managed": True,
+            "seed_only": True,
+            "note": "看不到配置：这几项（开话题 / 每日上限 / 睡觉时段 / 批准）每个群自己一份，到群页里改。",
+            "group_page": "每个群页面 → 往群里发 / 派活批准",
             "quiet_hours": "23:00-08:00",
             "topics_per_day": 2,
             "topics_min_gap_hours": 3,
@@ -1173,21 +1353,32 @@ def settings_view(svc: Any) -> dict[str, Any]:
         }
         alert = 0
         problems = []
-    # feeds 段（2026-09-27 质量标准）：生效屏蔽名单（网页改过一次就以网页为准）+ 自动屏蔽的
+    # feeds 段：屏蔽名单 2026-10 起按群（kv["feeds.blocked.<gid>"] 唯一来源），
+    # 网页 / 管理员对话改的只影响这个群；自动屏蔽本来就是按群算的，也按群给。
+    blocked_by_group: dict[str, list[str]] = {}
+    auto_blocked_by_group: dict[str, list[str]] = {}
     try:
-        from ..feeds import blocked_domains_effective
+        from ..feeds import blocked_domains as _blocked_domains
 
-        merged_blocked = blocked_domains_effective(svc.store, feeds_config)
-    except Exception:
-        merged_blocked = sorted(feeds_config)
-    auto_blocked_all: set[str] = set()
-    try:
+        gids = list(_served_group_ids(svc) or [])
+        for gid in gids:
+            try:
+                blocked_by_group[str(gid)] = list(_blocked_domains(svc.store, str(gid)))
+            except Exception:
+                blocked_by_group[str(gid)] = []
         feeds_mod = getattr(svc, "feeds", None)
         if feeds_mod is not None:
-            for gid in _served_group_ids(svc):
-                auto_blocked_all.update(feeds_mod._auto_blocked_domains(gid) or [])
+            for gid in gids:
+                try:
+                    auto_blocked_by_group[str(gid)] = sorted(set(feeds_mod._auto_blocked_domains(str(gid)) or []))
+                except Exception:
+                    auto_blocked_by_group[str(gid)] = []
+        else:
+            for gid in gids:
+                auto_blocked_by_group[str(gid)] = []
     except Exception:
-        auto_blocked_all = set()
+        blocked_by_group = {}
+        auto_blocked_by_group = {}
     # 健康项：railway 那条老 stub 里没有 environments 节时返回 None，不放进列表
     health = [
         {"key": "models", "icon": "robot", "name": "模型端点", "state": model_state, "text": model_text},
@@ -1221,8 +1412,8 @@ def settings_view(svc: Any) -> dict[str, Any]:
         "rules": rules,
         "groups": groups,
         "feeds": {
-            "blocked_domains": merged_blocked,
-            "auto_blocked": sorted(auto_blocked_all),
+            "blocked_domains": blocked_by_group,
+            "auto_blocked": auto_blocked_by_group,
             # 每群 RSS 源列表（settings 视图共用；结构 = rss.list_feeds 的单条）
             "rss": _rss_by_group(svc),
         },

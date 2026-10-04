@@ -12,7 +12,8 @@ grounded/junk/same_as_recent；被筛掉的也入库 rejected=1。
   子 agent 失败 → skipped。
 - make_idea：正常入库 + chat_worthy 进候选池；重复返回 None；chat_worthy=False 不进池。
 - feedback：加减计数、不为负、prev 切换、id 不存在 KeyError。
-- idea_action：状态机 new/wanted/dismissed/started；非法操作 ValueError(中文)。
+- idea_action：状态机 new/wanted/dismissed/started，只剩 do / dismiss 两个操作
+  （「想要这个」已删：网页从来没有过这个按钮，是条死路）；非法操作 ValueError(中文)。
 - news_view / guides_view / ideas_view：字段和 §9.3 一致（news 只含过线的 kind=news 条目，
   每条带 kind/scores/topic/sensitive/profile_ref；rejected 一栏只给管理员）；
   pool 过期显示 expired；dismissed 3 天后不显示。
@@ -827,20 +828,33 @@ def test_feedback_bad_kind_raises_valueerror(tmp_path) -> None:
 # ----------------------------------------------------------------------
 
 
-def test_idea_action_want_do_dismiss_flow(tmp_path) -> None:
+def test_idea_action_do_and_dismiss_no_want(tmp_path) -> None:
+    """只剩 do / dismiss：「想要这个」（want）已删，传进来直接 ValueError。"""
     store, settings, feeds, *_ = _make_feeds(tmp_path)
     idea_id = _seed_idea(store, GID, title="我可以做个小工具", created=NOW)
-    v1 = feeds.idea_action(idea_id, "want", by="阿柒")
-    assert v1["state"] == "wanted"
-    assert v1["requested_by"] == "阿柒"
-    assert v1["id"] == idea_id
-    assert set(v1.keys()) >= {
+    with pytest.raises(ValueError):
+        feeds.idea_action(idea_id, "want", by="阿柒")  # 不再是合法操作（网页从没有过这个按钮）
+    row = store.read().execute("SELECT state FROM ideas WHERE id=?", (idea_id,)).fetchone()
+    assert row["state"] == "new"  # 拒了就不许动状态
+    v2 = feeds.idea_action(idea_id, "do", by="管理员")
+    assert v2["state"] == "started"
+    assert v2["requested_by"] == "管理员"
+    assert v2["id"] == idea_id
+    assert set(v2.keys()) >= {
         "id", "icon", "title", "body", "basis", "step", "effort",
         "state", "requested_by", "task_id", "created_ts", "feedback",
     }
-    v2 = feeds.idea_action(idea_id, "do", by="管理员")
-    assert v2["state"] == "started"
-    assert v2["requested_by"] == "阿柒"  # 保留想要的人名
+
+
+def test_idea_action_do_from_legacy_wanted_keeps_requester(tmp_path) -> None:
+    """存量 wanted（老数据 / 群里 @ 过）还能开工：requested_by 保留原来那个人。"""
+    store, settings, feeds, *_ = _make_feeds(tmp_path)
+    idea_id = _seed_idea(store, GID, title="我可以做个小工具", created=NOW, state="wanted")
+    with store.tx() as conn:
+        conn.execute("UPDATE ideas SET requested_by='阿柒' WHERE id=?", (idea_id,))
+    v = feeds.idea_action(idea_id, "do", by="管理员")
+    assert v["state"] == "started"
+    assert v["requested_by"] == "阿柒"
 
 
 def test_idea_action_dismiss_from_new(tmp_path) -> None:
@@ -852,8 +866,7 @@ def test_idea_action_dismiss_from_new(tmp_path) -> None:
 
 def test_idea_action_dismiss_from_wanted(tmp_path) -> None:
     store, settings, feeds, *_ = _make_feeds(tmp_path)
-    idea_id = _seed_idea(store, GID, title="我可以做个小工具", created=NOW)
-    feeds.idea_action(idea_id, "want", by="阿柒")
+    idea_id = _seed_idea(store, GID, title="我可以做个小工具", created=NOW, state="wanted")
     v = feeds.idea_action(idea_id, "dismiss", by="管理员")
     assert v["state"] == "dismissed"
 
@@ -865,23 +878,27 @@ def test_idea_action_illegal_transitions(tmp_path) -> None:
     with pytest.raises(ValueError) as e:
         feeds.idea_action(idea_id, "do", by="管理员")
     assert str(e.value)  # 中文说明
-    with pytest.raises(ValueError):
-        feeds.idea_action(idea_id, "want", by="阿柒")
+    # want 已不是操作；不认识的词也一样拒
+    for op in ("want", "like"):
+        with pytest.raises(ValueError):
+            feeds.idea_action(idea_id, op, by="阿柒")
 
 
 def test_idea_action_started_no_more_ops(tmp_path) -> None:
     store, settings, feeds, *_ = _make_feeds(tmp_path)
     idea_id = _seed_idea(store, GID, title="我可以做个小工具", created=NOW)
     feeds.idea_action(idea_id, "do", by="管理员")
-    for op in ("want", "do", "dismiss"):
+    for op in ("do", "dismiss"):
         with pytest.raises(ValueError):
-            feeds.idea_action(idea_id, op, by="管理员" if op != "want" else "阿柒")
+            feeds.idea_action(idea_id, op, by="管理员")
+    with pytest.raises(ValueError):
+        feeds.idea_action(idea_id, "want", by="阿柒")
 
 
 def test_idea_action_missing_idea_raises_valueerror(tmp_path) -> None:
     store, settings, feeds, *_ = _make_feeds(tmp_path)
     with pytest.raises(ValueError):
-        feeds.idea_action(424242, "want", by="阿柒")
+        feeds.idea_action(424242, "do", by="管理员")
 
 
 def test_idea_action_on_start_callback_called(tmp_path) -> None:
@@ -943,7 +960,7 @@ def test_news_view_structure_and_order(tmp_path) -> None:
         "body", "reason", "refs", "audience", "image_url", "verify", "angle", "viz",
         "bridge",  # 2026-09-29：拓展条目「从哪条兴趣跳过来」
         "followup",  # 2026-09-30：同一件事的新进展（「后续」），不是后续为 None
-        "chat_feed",  # 2026-10-01：递给 MaiBot 几次、哪次聊到了
+        # chat_feed 字段 2026-10 docs/18 已删（那条记账路径下线，表都 DROP 了）
     }
     assert set(item["scores"].keys()) == {"info", "source", "relevance", "timeliness", "chat", "avg"}
     assert item["kind"] == "news" and item["topic"] == "话题" and item["sensitive"] is False
@@ -1200,22 +1217,3 @@ def test_make_idea_origin_cleaned(tmp_path) -> None:
     got2 = _run(feeds2.make_idea(GID))
     row2 = store2.read().execute("SELECT origin FROM ideas WHERE id=?", (got2,)).fetchone()
     assert row2["origin"] == ""
-
-
-def test_news_view_carries_chat_feed_stats(tmp_path) -> None:
-    """资讯反哺闲聊（2026-10-01）：每条带 chat_feed={times, said_ts}——递给 MaiBot 几次、哪次聊到了。"""
-    _, _, feeds, *_ = _make_feeds(tmp_path)
-    store = feeds._store
-    with _TimePatch():
-        _seed_batch_and_items(store, GID, created=NOW - 100, items=[("甲", "a.com/1", 0.9), ("乙", "a.com/2", 0.8)])
-        ids = [int(r["id"]) for r in store.read().execute("SELECT id FROM news_items ORDER BY id")]
-        with store.tx() as conn:
-            conn.execute(
-                "INSERT INTO chat_feeds (group_id, key, mode, title, hit, words, link, rounds, first_ts, last_ts, said_ts, said_text)"
-                " VALUES (?, ?, 'topic', '甲', '[]', '[]', '', 2, ?, ?, ?, '聊到了')",
-                (GID, f"news:{ids[0]}", NOW - 50, NOW - 40, NOW - 30),
-            )
-        view = feeds.news_view(GID)
-    by_title = {it["title"]: it for b in view for it in b["items"]}
-    assert by_title["甲"]["chat_feed"] == {"times": 1, "said_ts": NOW - 30}
-    assert by_title["乙"]["chat_feed"] == {"times": 0, "said_ts": None}

@@ -125,9 +125,10 @@ def test_main_plan_tool_table_without_main_mcp_is_only_skills(
 
 def test_no_main_skill_no_main_mcp_is_empty(tmp_path: Path, store: Store) -> None:
     """线上常态：skill 工具总注册着，但没有给主模型的 skill、也没有 main MCP → 空表
-    （排计划照旧一次纯 JSON 调用，不白白多轮）。"""
+    （排计划照旧一次纯 JSON 调用，不白白多轮）。这里隔离内置 skill（builtin_root=None）：
+    2026-10 起内置 find-skills 是 roles=main，真实内置目录会让工具表非空（另有用例）。"""
     tools = Tools(store)
-    register_skill_tools(tools, Skills(tmp_path))  # 空 skills 目录（内置 news-standard 只给 worker，不开主模型的 skill 工具）
+    register_skill_tools(tools, Skills(tmp_path, builtin_root=None))
     _reg(tools, "mcp_worker_only", {"worker"})
     assert coordinator.main_plan_tool_specs(tools) == []
 
@@ -137,7 +138,7 @@ def test_worker_only_skill_does_not_open_skill_tools(tmp_path: Path, store: Stor
     d.mkdir(parents=True)
     (d / "SKILL.md").write_text("---\nname: wk\nroles: [worker]\n---\nx\n", encoding="utf-8")
     tools = Tools(store)
-    register_skill_tools(tools, Skills(tmp_path))
+    register_skill_tools(tools, Skills(tmp_path, builtin_root=None))
     _reg(tools, "mcp_main_only", {"main"})
     names = [s["function"]["name"] for s in coordinator.main_plan_tool_specs(tools)]
     assert names == ["mcp_main_only"]

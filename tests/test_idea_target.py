@@ -98,15 +98,22 @@ class TestIdeaTarget:
         assert "target_user_id" not in by_id[t]
 
     @pytest.mark.asyncio
-    async def test_member_can_want_targeted_idea_but_not_personal_news(self, env: SimpleEnv) -> None:
+    async def test_member_can_feedback_targeted_idea_but_not_personal_news(self, env: SimpleEnv) -> None:
+        """群友能对（个人向）构想点反馈，但碰不到个人向资讯；开工仍然只有管理员能做。
+
+        「想要这个」（want）已删（docs/18：网页从来没有过这个按钮，是条死路）——
+        feeds.idea_action 不再认 want，/api/ideas/{id}/want 路由由父会话另外摘掉；
+        这里只保还成立的两条边界：群友反馈 200、个人向资讯 404。
+        """
         t = _idea(env.app, title="帮阿帆整理清单", uid=UID)
         nid = _personal_news(env.app)
         token = env.app.token_of(G1)
         h = {"X-MW-Group": token}
         r = await env.client.post(f"/api/ideas/{t}/feedback", json={"value": "up"}, headers=h)
         assert r.status == 200
-        r = await env.client.post(f"/api/ideas/{t}/want", json={}, headers=h)
-        assert r.status == 200
+        # 群友网页上没有能让构想开工的路（do / dismiss 都要管理员）
+        r = await env.client.post(f"/api/ideas/{t}/do", json={}, headers=h)
+        assert r.status in (401, 403)
         r = await env.client.post(f"/api/news/{nid}/feedback", json={"value": "up"}, headers=h)
         assert r.status == 404
 

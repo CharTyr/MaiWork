@@ -27,16 +27,13 @@ export function fbButtons(kind, it) {
   </span>`;
 }
 
-function newsStatus(s, cf) {
+function newsStatus(s) {
   s = s || {};
   const k = s.kind || "new";
-  if (k === "mentioned") return `${when(s.at)} MaiBot 在聊天里提过`;
-  // 资讯反哺闲聊：群里聊到相关话题时递给了 MaiBot，它还没接
-  const fed = cf && cf.times ? ` · 递给 MaiBot ${cf.times} 次，还没聊到` : "";
-  if (k === "used") return `${when(s.at)} 冷场时拿来开了话题${s.replies ? ` · ${s.replies} 人接话` : " · 没人接"}${fed}`;
-  if (k === "pool") return (s.expires_ts ? `在话题候选里 · 还能放 ${dur(s.expires_ts - now())}` : "在话题候选里") + fed;
-  if (k === "expired") return "没找到合适的时机，已过期" + fed;
-  return "刚备好" + fed;
+  if (k === "used") return `${when(s.at)} 冷场时拿来开了话题${s.replies ? ` · ${s.replies} 人接话` : " · 没人接"}`;
+  if (k === "pool") return s.expires_ts ? `在话题候选里 · 还能放 ${dur(s.expires_ts - now())}` : "在话题候选里";
+  if (k === "expired") return "没找到合适的时机，已过期";
+  return "刚备好";
 }
 
 const SCORE_NAMES = [["info", "信息量"], ["source", "来源"], ["relevance", "相关"], ["timeliness", "时效"], ["chat", "可聊"]];
@@ -171,7 +168,7 @@ function newsItem(it, i, guide) {
         }
         <div class="status">
           <span class="dot ${esc((it.status || {}).kind || "")}"></span>
-          <span class="status-text">${esc(guide ? guideStatus(it) : newsStatus(it.status, it.chat_feed))}</span>
+          <span class="status-text">${esc(guide ? guideStatus(it) : newsStatus(it.status))}</span>
           <button class="ratebtn" data-act="rate-open" data-id="${it.id}" aria-pressed="${rated}" title="说说这条哪里不好">${SVG.pen}<i>${rated ? "已评价" : "评价"}</i></button>
           ${fbButtons("news", it)}
         </div>
@@ -253,6 +250,20 @@ function usageLine(batch) {
   return s;
 }
 
+// 中文 / 外文各多少（资讯偏中文的整改，docs/18）：问法按 zh/en，线索和上网页按 zh/foreign；旧批次没有就不显示
+const LANG_ROWS = [["query_langs", "搜索问法", "en", "英文"], ["discovered_langs", "找到的线索", "foreign", "外文"], ["kept_langs", "上网页的", "foreign", "外文"]];
+export function langMix(f) {
+  if (!f || typeof f !== "object") return "";
+  return LANG_ROWS.map(([key, name, other, otherName]) => {
+    const m = f[key];
+    if (!m || typeof m !== "object") return "";
+    const zh = Number(m.zh) || 0;
+    const fo = Number(m[other]) || 0;
+    if (!zh && !fo) return "";
+    return `<div class="fn-row"><span class="fn-q">${name}</span><span class="fn-n">中文 ${zh} · ${otherName} ${fo}</span></div>`;
+  }).join("");
+}
+
 function funnelBlock(batch) {
   const f = batch.stats && batch.stats.funnel;
   if (!admin() || !f || typeof f !== "object") return "";
@@ -265,6 +276,7 @@ function funnelBlock(batch) {
   const rejects = kv(f.rejects).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<span class="ntag warn">${esc(k)} ${v}</span>`).join("");
   const times = kv(f.timings_s).map(([k, v]) => `<span class="ntag">${esc(TIMING_NAMES[k] || k)} ${secs(v)}</span>`).join("");
   const usageTxt = usageLine(batch);
+  const langs = langMix(f);
   return `
     <div class="rej funnel">
       <button class="rej-head" data-act="funnel-toggle" data-id="${batch.id}" aria-expanded="${open}">
@@ -275,6 +287,7 @@ function funnelBlock(batch) {
           ? `<div class="rej-list fn-box">
           <div class="fn-steps">${steps.map(([n, v], i) => `${i ? `<span class="fn-arrow">→</span>` : ""}<span class="fn-step"><b>${v || 0}</b><small>${n}</small></span>`).join("")}</div>
           ${perFocus ? `<div class="fn-h">各个关注点</div>${perFocus}` : ""}
+          ${langs ? `<div class="fn-h">中文和外文来源</div>${langs}` : ""}
           ${provs ? `<div class="fn-h">各家搜索服务给的结果</div><div class="fn-tags">${provs}</div>` : ""}
           ${rejects ? `<div class="fn-h">预筛刷掉的</div><div class="fn-tags">${rejects}</div>` : ""}
           ${times ? `<div class="fn-h">各段花的时间</div><div class="fn-tags">${times}</div>` : ""}
@@ -314,45 +327,15 @@ function rejectedBlock(batch) {
     </div>`;
 }
 
-function prefBox(v) {
-  const pref = (v && v.feeds_pref) || "";
-  if (!pref && !gadmin()) return "";
-  return `<div class="pref">${ico("pushpin", "")}<div class="pref-t">${pref ? `<b>这个群想看：</b>${esc(pref)}` : `想看什么、不想看什么，可以写一句`}</div>${gadmin() ? `<button class="btn small" data-act="pref-edit">${pref ? "改" : "写一句"}</button>` : ""}</div>`;
-}
-
 function newsRunBtn() {
   if (!gadmin()) return "";
   const running = state.newsRunning === state.g;
   return `<button class="btn small news-run" data-act="news-run" ${running ? "disabled" : ""}>${running ? "在备料…" : "现在就备一批"}</button>`;
 }
 
-// 口味小结（只给管理员）：MaiWork 每天从群友反馈里总结；懒加载进 state.taste[群]
-function tasteBox() {
-  if (!gadmin() || !state.g) return "";
-  const all = (state.taste = state.taste || {});
-  const gid = state.g;
-  if (!(gid in all)) {
-    all[gid] = null;
-    api("GET", `/api/groups/${encodeURIComponent(gid)}/taste`)
-      .then((r) => {
-        all[gid] = r || { text: "" };
-        document.querySelectorAll(".taste-slot").forEach((el) => (el.innerHTML = tasteInner()));
-      })
-      .catch(() => (all[gid] = undefined));
-    return `<div class="taste-slot"></div>`;
-  }
-  return `<div class="taste-slot">${tasteInner()}</div>`;
-}
-function tasteInner() {
-  const t = (state.taste || {})[state.g];
-  if (!t) return "";
-  const meta = t.manual ? "你改过" : t.ts ? `${dayWord(t.ts)}自动总结` : "";
-  return `<div class="pref taste">${ico("teacup", "")}<div class="pref-t">${t.text ? `<b>口味小结：</b>${esc(t.text)}${meta ? `<span class="taste-meta">${esc(meta)}</span>` : ""}` : "还没攒够群友反馈，口味小结会自动总结出来"}</div><button class="btn small" data-act="taste-edit">${t.text ? "改" : "写一段"}</button></div>`;
-}
-
 function newsSwitch() {
   const t = state.newsTab || "news";
-  return prefBox(gview()) + tasteBox() + `<div class="news-bar"><div class="seg" role="tablist">
+  return `<div class="news-bar"><div class="seg" role="tablist">
     <button role="tab" data-act="news-tab" data-t="news" aria-selected="${t === "news"}">资讯</button>
     <button role="tab" data-act="news-tab" data-t="guides" aria-selected="${t === "guides"}">文章</button>
   </div>${newsRunBtn()}</div>`;

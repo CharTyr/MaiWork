@@ -53,7 +53,6 @@ class _Settings:
         self.feeds = feeds
         self.topics = type("Topics", (), {"candidate_ttl_hours": 12})()
         self.environments = type("Env", (), {"max_parallel": 2, "railway": False, "verify_minutes": 10})()
-        self.goals = type("Goals", (), {"propose": True})()
         self.models = type("Models", (), {"context_window": 128000})()
 
     def is_served(self, gid) -> bool:
@@ -291,17 +290,6 @@ def _mk_feeds(store, models=None, workers=None, settings=None, specialists=None,
     return feeds
 
 
-def _mk_proposer(store, models, goals, approvals, settings, specialists=None):
-    from CharTyr_MaiWork.maiwork.goal_proposal import GoalProposer
-
-    proposer = GoalProposer(
-        store, models, goals, approvals, lambda: settings,
-    )
-    if specialists is not None:
-        proposer._specialists = specialists  # noqa: SLF001
-    return proposer
-
-
 def _mk_coordinator(store, models, workers, tasks, goals, settings, specialists=None):
     from CharTyr_MaiWork.maiwork.coordinator import Coordinator
 
@@ -414,9 +402,9 @@ class TestNewsStageDispatch:
 
 class TestAppComposition:
     @pytest.mark.asyncio
-    async def test_app_wires_specialists_into_feeds_goalproposer_coordinator(self, tmp_path):
-        """真实 _start_stack：app.agents / app.specialists 建好；feeds / goal_proposer /
-        coordinator 都挂上同一份 _specialists；stop 后全部置 None。"""
+    async def test_app_wires_specialists_into_feeds_coordinator(self, tmp_path):
+        """真实 _start_stack：app.agents / app.specialists 建好；feeds / coordinator
+        都挂上同一份 _specialists；stop 后全部置 None（主动提目标 2026-10 已删）。"""
         from fakes import FakeCtx, FakeProfiles
 
         from CharTyr_MaiWork.maiwork.app import MaiWorkApp
@@ -449,7 +437,6 @@ class TestAppComposition:
             assert made["args"][1] is app.workers
             # skills 可能为 None（skills 模块 ok 时非 None），不强断
             assert getattr(app.feeds, "_specialists", None) is app.specialists
-            assert getattr(app.goal_proposer, "_specialists", None) is app.specialists
             assert getattr(app.coordinator, "_specialists", None) is app.specialists
         finally:
             await app.stop()
@@ -482,7 +469,6 @@ class TestAppComposition:
             assert app.agents is None
             assert app.specialists is None
             assert getattr(app.feeds, "_specialists", None) is None
-            assert getattr(app.goal_proposer, "_specialists", None) is None
             assert getattr(app.coordinator, "_specialists", None) is None
         finally:
             await app.stop()
@@ -627,78 +613,11 @@ class TestIdeaTwoLevel:
 
 
 # ==============================================================================
-# goal：force_manual only + 调查失败主流照出 + 记忆只写待批
+# goal（成员/agent 目标的巡检；2026-10 删的是「MaiWork 主动提目标」，这个在）
 # ==============================================================================
 
 
-class TestGoalTwoLevel:
-    @pytest.mark.asyncio
-    async def test_propose_force_manual_review_after_approval_with_specialist(self, store):
-        """propose：goal 专岗调查在 approvals.create 之前；调记忆一条「待批目标提议…」，
-        不钩 goals.create、不调 goals.done。force_manual=True 恒为真。"""
-        agents = FakeAgents()
-        sp = FakeSpecialists(agents, results=[
-            WorkerReport(ok=True, summary="调查交回", data={
-                "assessment": "值得长期追：群里反复问同一个问题",
-                "plan": ["先盘点最近一个月的问题热点", "再列出可行教案"],
-                "questions": ["群主是想做教程还是想做制度？"],
-            }),
-        ])
-        models = _ModelsOK({"goals.propose": json.dumps(
-            {"goal": {"title": "把常问问题沉淀成 FAQ", "body": "每周整理", "why": "群里反复问"}},
-            ensure_ascii=False)})
-        goals, approvals = _Goals(), _ApprovalsRec()
-        proposer = _mk_proposer(store, models, goals, approvals, _Settings(), specialists=sp)
-        res = await proposer.propose(G1)
-        assert res is not None and res.get("force_manual") is True
-        assert sp.runs_of("goal")
-        assert len(sp.reviews) == 1 and sp.reviews[0]["accepted"] is True
-        rem = [r for r in agents.remembers if r["kind"] == "goal"]
-        assert len(rem) == 1
-        assert "待批" in rem[0]["text"] or "proposal" in rem[0]["source_id"]
-        assert any(str(x).startswith("handoff:H-") for x in rem[0]["refs"])
-        # 没创建任何 goal / 任务
-        assert goals._rows == {}
-        assert goals.events == []
-        assert approvals.creates and approvals.creates[0]["kwargs"].get("force_manual") is True
-
-    @pytest.mark.asyncio
-    async def test_propose_specialist_failure_main_flow_still_creates(self, store):
-        """goal 专岗调查失败：propose 照旧；quote 不含专岗段；review 记 rejected。"""
-        agents = FakeAgents()
-        sp = FakeSpecialists(agents, results=[
-            WorkerReport(ok=False, summary="", error="模型调用失败"),
-        ])
-        models = _ModelsOK({"goals.propose": json.dumps(
-            {"goal": {"title": "给新来的写一个上手贴", "body": "一页", "why": "频繁重复"}},
-            ensure_ascii=False)})
-        goals, approvals = _Goals(), _ApprovalsRec()
-        proposer = _mk_proposer(store, models, goals, approvals, _Settings(), specialists=sp)
-        res = await proposer.propose(G1)
-        assert res is not None
-        assert approvals.creates
-        quote = approvals.creates[0]["kwargs"].get("quote") or ""
-        assert "专岗调查" not in quote and "assessment" not in quote
-        assert len(sp.reviews) == 1 and sp.reviews[0]["accepted"] is False
-        rem = [r for r in agents.remembers if r["kind"] == "goal"]
-        assert rem == []
-
-    @pytest.mark.asyncio
-    async def test_propose_disabled_goal_role_skips_specialist_but_still_proposes(self, store):
-        """goal 角色停用：调查跳过但主流照跑；没有 sp.run、没有 review、没有记忆。"""
-        agents = FakeAgents(enabled_kinds={"goal": False})
-        sp = FakeSpecialists(agents)
-        models = _ModelsOK({"goals.propose": json.dumps(
-            {"goal": {"title": "收集群名片的自我介绍", "body": "一张表", "why": "老问"}},
-            ensure_ascii=False)})
-        goals, approvals = _Goals(), _ApprovalsRec()
-        proposer = _mk_proposer(store, models, goals, approvals, _Settings(), specialists=sp)
-        res = await proposer.propose(G1)
-        assert res is not None and res.get("force_manual") is True
-        assert sp.runs == []
-        assert sp.reviews == []
-        assert agents.remembers == []
-
+class TestGoalCheck:
     @pytest.mark.asyncio
     async def test_check_goal_specialist_investigates_but_main_decides_everything(self, store):
         """check_goal：goal 专岗调查（「只调查不改状态」）→ 主模型照旧判定 all_done。criteria
@@ -724,7 +643,6 @@ class TestGoalTwoLevel:
         coord = _mk_coordinator(store, models, workers, tasks, goals, _Settings(), specialists=sp)
         outbox = type("Outbox", (), {"enqueue": lambda self, *a, **k: None})()
         coord._outbox = outbox  # noqa: SLF001
-        # goals 用真实现（少量）：我们用的是 _Goals 群实现——就调 coordinator 上
         await coord.check_goal(gid)
         assert sp.runs_of("goal")
         dis = sp.runs_of("goal")[0]

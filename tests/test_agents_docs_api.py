@@ -244,7 +244,8 @@ class TestSyncAndReset:
 class TestLegacyAliases:
     @pytest.mark.asyncio
     async def test_old_identity_get_still_works(self, env) -> None:
-        """老前端（记忆页除外）读的 /api/identity：soul/agents 返回 main 的，memory 照常。"""
+        """老前端读的 /api/identity：soul/agents 返回 main 的，memory 照常；
+        「每群三份」收尾后 group_memory 字段不再出现。"""
         await env.login()
         r = await env.client.get("/api/identity")
         assert r.status == 200
@@ -252,5 +253,6 @@ class TestLegacyAliases:
         # soul / agents 落的是 main 的文档
         assert data["soul"]["text"] == env.identity.agent_read("main", "soul")["text"]
         assert data["agents"]["text"] == env.identity.agent_read("main", "agents")["text"]
-        # memory / group_memory 不动
-        assert "memory" in data and "group_memory" in data
+        # memory 留着；group_memory 2026-10-03 退役（每群内容走 /api/groups/{gid}/rules）
+        assert "memory" in data
+        assert "group_memory" not in data

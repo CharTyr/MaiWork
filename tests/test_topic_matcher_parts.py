@@ -8,8 +8,7 @@
 
 from __future__ import annotations
 
-from CharTyr_MaiWork.maiwork.delivery import TopicMatcher
-from CharTyr_MaiWork.maiwork import chat_feed
+from CharTyr_MaiWork.maiwork.delivery import TopicMatcher, clean_chat_text
 
 
 def _item(*texts: str, self_msg: bool = False) -> dict:
@@ -45,12 +44,12 @@ def test_single_part_unchanged() -> None:
 
 
 def test_emoji_tags_do_not_match() -> None:
-    assert "无语" not in chat_feed.clean("[表情包: 无语,震惊] 真的吗")
-    assert "真的吗" in chat_feed.clean("[表情包: 无语,震惊] 真的吗")
+    assert "无语" not in clean_chat_text("[表情包: 无语,震惊] 真的吗")
+    assert "真的吗" in clean_chat_text("[表情包: 无语,震惊] 真的吗")
 
 
 def test_image_descriptions_do_not_match() -> None:
-    t = chat_feed.clean("[图片：Switch 主界面截图，星之卡比 探索发现] 早知道下午就撕了")
+    t = clean_chat_text("[图片：Switch 主界面截图，星之卡比 探索发现] 早知道下午就撕了")
     assert "switch" not in t and "探索" not in t and "早知道下午就撕了" in t
     # 截断的长描述（没有右括号）也抹掉
-    assert "超级地球" not in chat_feed.clean("[图片：新闻聚合页面截图，超级地球……")
+    assert "超级地球" not in clean_chat_text("[图片：新闻聚合页面截图，超级地球……")

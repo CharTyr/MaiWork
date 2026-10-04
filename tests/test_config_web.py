@@ -2,8 +2,8 @@
 
 2026-10：网页改配置 = 直写插件目录下的 config.toml（测试用临时插件目录+临时 config.toml）。
 覆盖：
-- schema 覆盖面：config.py 各节配置字段（除 models / extensions / plugin.config_version /
-  feeds.min_score 弃用字段外）每个都在 rules.py 的 CONFIG_SCHEMA 里——防以后加配置忘了加网页项；
+- schema 覆盖面：config.py 各节配置字段（除 models / extensions / plugin.config_version 外）
+  每个都在 rules.py 的 CONFIG_SCHEMA 里——防以后加配置忘了加网页项；
 - GET 形状：file/sections/fields 各字段齐全（value/default/changed），secret 不给值只给 set/source；
 - 校验：坏值 400 且 config.toml 不变；readonly 拒绝；local_mode=direct 拒绝；改密码要旧密码；
 - 写文件：PUT 后 config.toml 里能看到新值（注释保留）、get_settings() 立刻生效；
@@ -117,8 +117,8 @@ def _field(data: dict, key: str) -> dict:
 
 class TestSchemaCoverage:
     def test_every_config_field_in_schema(self) -> None:
-        """config.py 各节字段（models / extensions 节、plugin 节（版本标记和总开关）、弃用的
-        feeds.min_score 除外）每一个都要在 CONFIG_SCHEMA 里——防以后加配置忘了加网页项。"""
+        """config.py 各节字段（models / extensions 节、plugin 节（版本标记和总开关）除外）
+        每一个都要在 CONFIG_SCHEMA 里——防以后加配置忘了加网页项。"""
         from CharTyr_MaiWork.maiwork import config as config_mod
 
         schema_keys = {f["key"] for f in rules_mod.CONFIG_SCHEMA}
@@ -131,8 +131,6 @@ class TestSchemaCoverage:
                     continue
                 if section == "plugin" and name == "enabled":
                     continue  # 总开关不上网页（关了网页自己就没了；2026-09-28 用户要求拿掉）
-                if section == "feeds" and name == "min_score":
-                    continue  # 已弃用（2026-09-27 起改看 web_min_avg）
                 key = f"{section}.{name}"
                 if key not in schema_keys:
                     missing.append(key)
@@ -157,8 +155,8 @@ class TestConfigApi:
     @pytest.mark.asyncio
     async def test_get_requires_admin(self, env: _Env) -> None:
         assert (await env.client.get("/api/settings/config")).status == 401
-        assert (await env.client.put("/api/settings/config", json={"topics.per_day": 3})).status == 401
-        assert (await env.client.post("/api/settings/config/reset", json={"field": "topics.per_day"})).status == 401
+        assert (await env.client.put("/api/settings/config", json={"topics.min_gap_hours": 3})).status == 401
+        assert (await env.client.post("/api/settings/config/reset", json={"field": "topics.min_gap_hours"})).status == 401
 
     @pytest.mark.asyncio
     async def test_get_shape(self, env: _Env) -> None:
@@ -171,18 +169,47 @@ class TestConfigApi:
         # 「启用 MaiWork」总开关不上网页（关了网页自己就没了），整个「插件」分区不列
         assert "plugin.enabled" not in {f["key"] for sec in data["sections"] for f in sec["fields"]}
         # 0.4.0：任务安全网（tasks 节）上网页「全部配置」；2026-10 改版 1a：models 节拿掉
-        # （端点/模型库走 /api/settings/endpoints*、/api/settings/model-list*）
+        # （端点/模型库走 /api/settings/endpoints*、/api/settings/model-list*）；
+        # goals 节 2026-10 docs/18 第一步整节删掉（唯一的键 propose 随主动提目标退休）；
+        # 0.8.0：delivery 节整个不上网页（push_per_day / quiet_hours 归每群自己一份），
+        # topics / approval 节只剩还归全局的键。
         assert ids == [
-            "groups", "focus", "feeds", "goals", "topics", "delivery", "approval",
+            "groups", "focus", "feeds", "topics", "approval",
             "tasks", "jev", "usage", "console", "environments", "profile",
             "storage", "group_space", "reader",
         ]
         assert data["file"] == "config.toml"
-        f = _field(data, "topics.per_day")
-        assert f["value"] == 2 and f["default"] == 2 and f["changed"] is False
+        f = _field(data, "topics.min_gap_hours")
+        assert f["value"] == 3 and f["default"] == 3 and f["changed"] is False
         assert "file_value" not in f and "overridden" not in f
         assert f["type"] == "int" and f["applies"] == "now"
-        assert f["min"] == 1 and f["max"] == 10
+        assert f["min"] == 1 and f["max"] == 24
+
+    @pytest.mark.asyncio
+    async def test_group_managed_keys_not_listed_and_400(self, env: _Env) -> None:
+        """0.8.0：全局老键（批准名单 / 推送 / 开话题）不再出现在「全部配置」，也改不了；
+        旧 API 明确 400 说「到群页管理」，不是写进文件让 runtime 不听。"""
+        await _login(env)
+        data = await (await env.client.get("/api/settings/config")).json()
+        keys = {f["key"] for sec in data["sections"] for f in sec["fields"]}
+        for key in (
+            "approval.required", "approval.admins", "approval.exempt_groups", "approval.exempt_users",
+            "topics.enabled", "topics.speaker", "topics.per_day",
+            "delivery.push_per_day", "delivery.quiet_hours",
+        ):
+            assert key not in keys, key
+        before = env.config_text()
+        for key, value in (
+            ("approval.admins", ["qq:10001"]),
+            ("topics.per_day", 5),
+            ("delivery.quiet_hours", "22:00-07:00"),
+        ):
+            r = await env.client.put("/api/settings/config", json={key: value})
+            assert r.status == 400, key
+            assert "群" in (await r.json())["error"], key
+        r = await env.client.post("/api/settings/config/reset", json={"field": "approval.admins"})
+        assert r.status == 400
+        assert env.config_text() == before
 
     @pytest.mark.asyncio
     async def test_secret_never_echoed(self, env: _Env) -> None:
@@ -226,7 +253,7 @@ class TestConfigApi:
         before = env.config_text()
         r = await env.client.put(
             "/api/settings/config",
-            json={"topics.per_day": 99, "delivery.push_per_day": 7},
+            json={"feeds.max_items": 99, "topics.min_gap_hours": 99},
         )
         assert r.status == 400
         # 校验失败：config.toml 一个字节都没动，数据库也没有覆盖层
@@ -245,16 +272,16 @@ class TestConfigApi:
         await _login(env)
         r = await env.client.put(
             "/api/settings/config",
-            json={"topics.per_day": 5, "profile.read_interval_minutes": 30, "usage.alert_daily_tokens": 1000},
+            json={"topics.min_gap_hours": 5, "profile.read_interval_minutes": 30, "usage.alert_daily_tokens": 1000},
         )
         assert r.status == 200
         data = await r.json()
-        assert _field(data, "topics.per_day")["value"] == 5
-        assert _field(data, "topics.per_day")["changed"] is True
-        assert _field(data, "topics.per_day")["default"] == 2
+        assert _field(data, "topics.min_gap_hours")["value"] == 5
+        assert _field(data, "topics.min_gap_hours")["changed"] is True
+        assert _field(data, "topics.min_gap_hours")["default"] == 3
         # config.toml 里真的写进去了（注释也还在）
         text = env.config_text()
-        assert "per_day = 5" in text
+        assert "min_gap_hours = 5" in text
         assert "read_interval_minutes = 30" in text
         assert "alert_daily_tokens = 1000" in text
         assert "注释不许丢" in text
@@ -262,13 +289,13 @@ class TestConfigApi:
         assert env.app.store.kv_get(rules_mod.KV_CONFIG_OVERRIDE) is None
         # 立刻生效（不重启）
         settings = env.app.get_settings()
-        assert settings.topics.per_day == 5
+        assert settings.topics.min_gap_hours == 5
         assert settings.profile.read_interval_minutes == 30
         assert settings.usage.alert_daily_tokens == 1000
         # 再写一次别的值 = 覆盖同一个键
-        r = await env.client.put("/api/settings/config", json={"topics.per_day": 2})
+        r = await env.client.put("/api/settings/config", json={"topics.min_gap_hours": 3})
         assert r.status == 200
-        assert env.app.get_settings().topics.per_day == 2
+        assert env.app.get_settings().topics.min_gap_hours == 3
         # 备份写到了数据目录
         backups = list((env.data_dir / "config-backups").glob("config.toml-*"))
         assert backups
@@ -369,7 +396,7 @@ class TestConfigApi:
         # 有效设置立刻跟上
         assert env.app.get_settings().jev.api_key == "jev-web-key-显眼"
         # PUT 不给这个键 / 给空串 = 不改
-        r = await env.client.put("/api/settings/config", json={"topics.per_day": 3})
+        r = await env.client.put("/api/settings/config", json={"feeds.max_items": 3})
         assert r.status == 200
         assert 'api_key = "jev-web-key-显眼"' in env.config_text()
         r = await env.client.put("/api/settings/config", json={"jev.api_key": ""})

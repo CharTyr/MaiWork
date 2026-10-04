@@ -150,6 +150,31 @@ function cfgShow(v) {
   return v === "" || v == null ? "（空）" : String(v);
 }
 
+function cfgRow(f) {
+  const kind = cfgKind(f);
+  const wide = ["accounts", "groups", "times", "serve_groups", "ssh_list", "list_str"].includes(kind);
+  const over = kind !== "secret" && f.changed;
+  return `
+    <div class="rule-row${kind === "bool" && !f.readonly ? " is-bool" : ""}${wide ? " is-list" : ""}">
+      <div class="rule-l">
+        <label for="${cfgId(f.key)}" class="set-name">${esc(f.label || f.key)}${over ? `<span class="tag">改过</span>` : ""}${f.applies === "reload" ? `<span class="tag tag-warn">重载后生效</span>` : ""}</label>
+        ${f.help ? `<div class="set-text" id="${cfgId(f.key)}-help">${esc(f.help)}</div>` : ""}
+        ${f.readonly ? `<div class="set-text">${SVG.lock} 只能在服务器上改</div>` : ""}
+        ${over && !f.readonly ? `<div class="set-text">默认是：<span class="mono">${esc(cfgShow(f.default))}</span> <button type="button" class="link-btn" data-act="rule-reset" data-f="${esc(f.key)}">恢复默认</button></div>` : ""}
+      </div>
+      <div class="rule-r">${cfgInput(f)}</div>
+    </div>`;
+}
+
+function cfgSection(s) {
+  const fields = s.fields || [];
+  const basic = fields.filter(f => !f.advanced);
+  const advanced = fields.filter(f => f.advanced);
+  return `<h2 class="h-sub" id="cfg-${esc(s.id)}">${esc(s.label)}</h2>` +
+    basic.map(cfgRow).join("") + (advanced.length ?
+      `<details class="cfg-advanced"><summary>高级 · ${advanced.length} 项</summary><p class="fine">机器资源、处理节奏和服务地址，一般不用改。</p>${advanced.map(cfgRow).join("")}</details>` : "");
+}
+
 export function rulesPage() {
   const r = state.rules;
   if (!r) return loading();
@@ -163,29 +188,7 @@ export function rulesPage() {
     <div class="cfg-jump" role="tablist"><button type="button" role="tab" aria-selected="${!jump}" data-act="cfg-sec" data-s="">全部</button>${secs.map((s) => `<button type="button" role="tab" aria-selected="${jump === s.id}" data-act="cfg-sec" data-s="${esc(s.id)}">${esc(s.label)}</button>`).join("")}</div>
     <datalist id="mw-platforms">${Object.keys(PLATFORM_NAMES).map((p) => `<option value="${p}">${PLATFORM_NAMES[p]}</option>`).join("")}</datalist>
     <form id="rules-form" class="rules-form" autocomplete="off">
-      ${shown
-        .map(
-          (s) => `
-        <h2 class="h-sub" id="cfg-${esc(s.id)}">${esc(s.label)}</h2>
-        ${(s.fields || [])
-          .map((f) => {
-            const kind = cfgKind(f);
-            const wide = ["accounts", "groups", "times", "serve_groups", "ssh_list", "list_str"].includes(kind);
-            const over = kind !== "secret" && f.changed;
-            return `
-            <div class="rule-row${kind === "bool" && !f.readonly ? " is-bool" : ""}${wide ? " is-list" : ""}">
-              <div class="rule-l">
-                <label for="${cfgId(f.key)}" class="set-name">${esc(f.label || f.key)}${over ? `<span class="tag">改过</span>` : ""}${f.applies === "reload" ? `<span class="tag tag-warn">重载后生效</span>` : ""}</label>
-                ${f.help ? `<div class="set-text">${esc(f.help)}</div>` : ""}
-                ${f.readonly ? `<div class="set-text">${SVG.lock} 只能在服务器上改</div>` : ""}
-                ${over && !f.readonly ? `<div class="set-text">默认是：<span class="mono">${esc(cfgShow(f.default))}</span> <button type="button" class="link-btn" data-act="rule-reset" data-f="${esc(f.key)}">恢复默认</button></div>` : ""}
-              </div>
-              <div class="rule-r">${cfgInput(f)}</div>
-            </div>`;
-          })
-          .join("")}`
-        )
-        .join("")}
+      ${shown.map(cfgSection).join("")}
       <p class="err" id="r-err" hidden></p>
       <div class="actions sticky-actions"><button class="btn primary" type="submit">保存</button></div>
     </form>`;

@@ -84,11 +84,10 @@ def test_specialist_admin_interface_contract():
     assert "export function agentsPage" in text
     assert "export async function loadAgents" in text
     assert "export async function actAgents" in text
-    assert "agent-memory-save" in text
+    assert "agent-memory-save" not in text, "本群提醒搬进群页「这个群」的本群规矩"
     assert "agent-profile-save" in text
     assert "/api/agents" in text and "/agents/" in text
     assert "state.agentLoadSeq" in text, "切群时必须防止旧请求覆盖当前群"
-    assert "gid !== state.agentGroup" in text, "旧群按钮不能保存当前群的提醒"
     assert 'a.kind === "task"' in text, "通用任务也应有只读交接记录"
     router = (JS / "router.js").read_text(encoding="utf-8")
     assert router.count('state.setSub === "agents"') >= 2
@@ -111,9 +110,7 @@ def test_specialist_fish_avatar_contract():
 def test_specialist_fish_on_pages():
     """各岗位的小鱼放在对应页面大标题前：资讯鱼在最新一批的标题前（没资讯时在「资讯」标题前），构想 / 目标 / 任务同理。"""
     news = (JS / "pages/news.js").read_text(encoding="utf-8")
-    taste = news[news.index("function tasteInner"):]
-    taste = taste[: taste.index("\n}\n")]
-    assert "agentFish" not in taste and "teacup" in taste, "口味小结框保持茶杯"
+    assert "tasteInner" not in news and "feeds-pref" not in news, "口味小结、这个群想看已并进本群做法 / 本群规矩"
     view = news[news.index("export function viewNews"):]
     assert 'b ? "" : agentFish("news"' in view, "只有最新一批的标题前放资讯鱼"
     assert '<h1 class="h-page">资讯</h1>' not in view, "没资讯时「资讯」标题也带鱼"

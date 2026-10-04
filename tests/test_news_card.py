@@ -208,12 +208,6 @@ def test_layouts_with_cover():
     assert 'class="cover"' not in h2 and 'class="thumb"' in h2
 
 
-def test_clip_counts_ascii_narrower():
-    en = "Ace Combat 8: Wings of Theve Launch Trailer Arrives Ahead of Release"
-    assert news_card._clip(en, 60) == en
-    assert news_card._clip("中" * 80, 60).endswith("…")
-
-
 def test_cards_overlap_the_sky_layered():
     """2026-09-29 用户要：资讯卡片往上压住天空背景的下半截，形成前后层次（视差感）；
     天体也有一部分被第一张卡片挡住。不再用底部那道白色山丘波浪。"""

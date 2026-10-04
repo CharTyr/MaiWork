@@ -64,6 +64,12 @@ def _make(tmp_path: Path, store: Store, *, host: Any = None, cfg: dict | None = 
     return Identity(tmp_path / "data", store, lambda: settings, host=host)
 
 
+def _agents_of(identity: Identity) -> Any:
+    """从 identity 的 settings 拿一份 Agents（顺手用同一个 store）。"""
+    from CharTyr_MaiWork.maiwork.agents import Agents
+    return Agents(identity._store, identity._get_settings)
+
+
 # ----------------------------------------------------------------------
 # 首次启动 / 同步
 # ----------------------------------------------------------------------
@@ -145,22 +151,23 @@ def test_sync_overwrite_saves_bak_and_reports_change(tmp_path: Path, store: Stor
     assert identity.read("soul")["synced_from_maibot"] is False
 
 
-def test_write_limit_and_group_served_check(tmp_path: Path, store: Store) -> None:
-    """超限 ValueError（接口 400）；非服务群 KeyError（接口 404）。"""
+def test_write_limit_and_global_files_round_trip(tmp_path: Path, store: Store) -> None:
+    """超限 ValueError（接口 400）；「每群三份」收尾后只剩全局三份能写读。"""
     identity = _make(tmp_path, store)
     _run(identity.ensure_started())
     with pytest.raises(ValueError):
         identity.write("soul", "x" * (16384 * 2))  # UTF-8 编码后明显超 16KB
-    with pytest.raises(KeyError):
-        identity.group_write("999", "别的群不能写")
-    with pytest.raises(KeyError):
-        identity.group_read("999")
+    # 每群身份接口（group_read / group_write）2026-10-03 已删（内容进了 group_rules / skills）
+    assert not hasattr(identity, "group_read")
+    assert not hasattr(identity, "group_write")
+    assert not hasattr(identity, "group_memory_map")
     # 正常写读
     got = identity.write("memory", "- 2026-10-01 全局经验（原因）")
     assert got["text"].endswith("全局经验（原因）")
     assert got["updated_ts"] > 0
-    g = identity.group_write(GID, "- 2026-10-01 本群经验（原因）")
-    assert "本群经验" in g["text"]
+    # 超限分支同样拦
+    with pytest.raises(ValueError):
+        identity.write("memory", "长" * (16384 * 2))
 
 
 # ----------------------------------------------------------------------
@@ -169,37 +176,39 @@ def test_write_limit_and_group_served_check(tmp_path: Path, store: Store) -> Non
 
 
 def test_prompt_block_titles_and_empty(tmp_path: Path, store: Store) -> None:
-    """分块标题固定；空文件不出块；整个块以空行收尾，拼起来不会糊在一起。"""
+    """分块标题固定；空文件不出块；整个块以空行收尾，拼起来不会糊在一起。
+    「每群三份」收尾后（2026-10-03）只剩全局三块；每群内容另走 group_context。"""
     identity = _make(tmp_path, store)
     _run(identity.ensure_started())
     identity.write("soul", "我是小麻，说话慢一点。")
     identity.write("agents", "规矩一：先想再做。")
     identity.write("memory", "- 全局经验")
-    identity.group_write(GID, "- 本群经验")
     soul = identity.prompt_block("soul")
     assert soul.startswith("## MaiWork 的身份\n") and soul.endswith("\n\n")
     assert "我是小麻" in soul
     assert identity.prompt_block("agents").startswith("## 做事规矩\n")
     block = identity.prompt_block("memory", group_id=GID)
-    assert "## 工作记忆（全局）" in block and "## 这个群的工作记忆" in block
-    # 空 MEMORY：写空后只剩本群块
+    assert "## 工作记忆（全局）" in block
+    # 每群段退役：带 group_id 也不再拼「这个群的工作记忆」
+    assert "这个群的工作记忆" not in block
+    # 空 MEMORY：写空后整块都不出
     identity.write("memory", "")
     block2 = identity.prompt_block("memory", group_id=GID)
     assert "工作记忆（全局）" not in block2
-    assert "这个群的工作记忆" in block2
 
 
-def test_prompt_block_group_memory_never_crosses(tmp_path: Path, store: Store) -> None:
-    """本群记忆只进本群提示词：另一个群的 group_id / 不传 group_id 一律不带。"""
+def test_prompt_block_group_content_never_leaks_across_groups(tmp_path: Path, store: Store) -> None:
+    """收尾后 prompt_block 只出全局；每群内容永不出现在它——要在别群也看不见、本群也
+    从这个口子看不见（group_context 才是每群内容的注入口子，那个另有测试守）。"""
     identity = _make(tmp_path, store)
     _run(identity.ensure_started())
-    identity.group_write(GID, "- 这个群喜欢表格交付（上次表格没人有意见）")
+    # 任何「每群」调用都不再读文件，哪怕是本群
     mine = identity.prompt_block("memory", group_id=GID)
     other = identity.prompt_block("memory", group_id=GID_OTHER)
     none = identity.prompt_block("memory")
-    assert "喜欢表格交付" in mine
-    assert "喜欢表格交付" not in other
-    assert "喜欢表格交付" not in none
+    assert "这个群的工作记忆" not in mine
+    assert "这个群的工作记忆" not in other
+    assert "这个群的工作记忆" not in none
 
 
 def test_prompt_block_truncates_to_limit(tmp_path: Path, store: Store) -> None:
@@ -223,27 +232,31 @@ def _remember_ok(out: dict) -> dict:
 
 
 def test_remember_appends_with_date_and_reason(tmp_path: Path, store: Store) -> None:
-    """成功追加：「- YYYY-MM-DD 文本（原因）」落进目标文件，网页 read 看得见。"""
+    """成功追加：「- YYYY-MM-DD 文本（原因）」落进目标（group → 本群规矩；global → MEMORY.md）。"""
     identity = _make(tmp_path, store)
     _run(identity.ensure_started())
     _remember_ok(identity.remember_sync(scope="group", group_id=GID, text="这个群喜欢先看结论", reason="交付表单反馈"))
     day = clock.bj(clock.now()).strftime("%Y-%m-%d")
-    text = identity.group_read(GID)["text"]
-    assert f"- {day} 这个群喜欢先看结论（交付表单反馈）" in text
-    # 全局也一样
+    rules = _agents_of(identity).group_rules_get(GID)
+    assert f"- {day} 这个群喜欢先看结论（交付表单反馈）" in rules["body"]
+    # 全局也一样——只进 MEMORY.md
     _remember_ok(identity.remember_sync(scope="global", text="管理员偏好：少发群文件多走网页", reason="管理员口头说过"))
     assert "少发群文件多走网页" in identity.read("memory")["text"]
+    assert "少发群文件多走网页" not in rules["body"]
+
+
 
 
 def test_remember_dedup_by_normalized_text(tmp_path: Path, store: Store) -> None:
-    """同一句（去空白后相同）不重复记：文件里只留一份。"""
+    """同一句（去空白后相同）不重复记：规矩里只留一份。"""
     identity = _make(tmp_path, store)
     _run(identity.ensure_started())
     _remember_ok(identity.remember_sync(scope="group", group_id=GID, text="别在群里刷链接", reason="a"))
     out = identity.remember_sync(scope="group", group_id=GID, text=" 别在群里刷链接 ", reason="b")
     assert out.get("ok") is True
-    text = identity.group_read(GID)["text"]
-    assert text.count("别在群里刷链接") == 1
+    assert out.get("deduped") is True
+    body = _agents_of(identity).group_rules_get(GID)["body"]
+    assert body.count("别在群里刷链接") == 1
 
 
 def test_remember_rejects_oversized_and_bad_scope(tmp_path: Path, store: Store) -> None:
@@ -299,10 +312,10 @@ def test_remember_global_rejects_focus_and_member_names(tmp_path: Path, store: S
     assert "全局记忆" in out.get("error", "")
     out2 = identity.remember_sync(scope="global", text="老周头反馈那个表格看着累", reason="x")
     assert out2["ok"] is False
-    # 本群记忆可以提（注入不出群）
+    # 本群规矩可以提（注入不出群）
     ok = identity.remember_sync(scope="group", group_id=GID, text="阿帆说深科技视频别推了", reason="x")
     assert ok["ok"] is True
-    assert "别推了" in identity.group_read(GID)["text"]
+    assert "别推了" in _agents_of(identity).group_rules_get(GID)["body"]
     assert "别推了" not in identity.read("memory")["text"]
 
 
@@ -424,57 +437,19 @@ def test_remember_writes_event(tmp_path: Path, store: Store) -> None:
 
 
 # ----------------------------------------------------------------------
-# 反馈自动记（不调模型，代码直接写）
+# 「每群三份」收尾删掉的旧口子（2026-10-03，docs/17 §八）：
+# - identity.note_useless_feedback（自动反馈进记忆）整个删；
+# - 每群身份文件读写（group_read / group_write / group_memory_map）删；
+# - 每群内容另走 group_context + /api/groups/{gid}/{rules,skills}。
 # ----------------------------------------------------------------------
 
 
-def _seed_news(store: Store, gid: str, title: str, topic: str, site: str, down: int = 0) -> int:
-    with store.tx() as conn:
-        cur = conn.execute(
-            "INSERT INTO news_batches (group_id, slot_ts, found, kept, skipped, note, created)"
-            " VALUES (?, ?, 1, 1, 0, '', ?)",
-            (gid, clock.now(), clock.now()),
-        )
-        bid = int(cur.lastrowid or 0)
-        sources = json.dumps([{"url": f"https://{site}/x", "site": site, "title": title}], ensure_ascii=False)
-        cur = conn.execute(
-            "INSERT INTO news_items (batch_id, group_id, title, summary, why, sources, url_key,"
-            " published_ts, score, status_kind, replies, expires_ts, up, down, created, kind, topic)"
-            " VALUES (?, ?, ?, '', '', ?, '', ?, 4.0, 'new', 0, NULL, 0, ?, ?, 'news', ?)",
-            (bid, gid, title, sources, clock.now(), down, clock.now(), topic),
-        )
-        return int(cur.lastrowid or 0)
-
-
-def test_feedback_auto_memory_three_downs(tmp_path: Path, store: Store) -> None:
-    """百科类资讯被标没用累计 3 次 → 本群记忆自动记一条（不进别的群、不重复记）。"""
+def test_note_useless_feedback_removed(tmp_path: Path, store: Store) -> None:
     identity = _make(tmp_path, store)
-    _run(identity.ensure_started())
-    _seed_news(store, GID, "百科：甲", topic="百科", site="a.com", down=1)
-    _seed_news(store, GID, "百科：乙", topic="百科", site="b.com", down=1)
-    third = _seed_news(store, GID, "百科：丙", topic="百科", site="c.com", down=1)
-    identity.note_useless_feedback(GID, third)
-    text = identity.group_read(GID)["text"]
-    assert "百科" in text and "不感兴趣" in text
-    assert identity.group_read(GID_OTHER)["text"] == ""
-    # 再标一次不重复（去重后还是一条）
-    identity.note_useless_feedback(GID, third)
-    assert identity.group_read(GID)["text"].count("百科") == 1
-    # 不足 3 次的没事
-    _seed_news(store, GID, "硬件：一", topic="硬件", site="h.com", down=2)
-    assert "硬件" not in identity.group_read(GID)["text"]
-
-
-def test_feedback_auto_memory_source_three_items(tmp_path: Path, store: Store) -> None:
-    """同一来源 ≥3 条都被标没用 → 记「这个来源本群不感兴趣」。"""
-    identity = _make(tmp_path, store)
-    _run(identity.ensure_started())
-    _seed_news(store, GID, "八卦一", topic="八卦", site="junk.com", down=1)
-    _seed_news(store, GID, "八卦二", topic="八卦", site="junk.com", down=1)
-    third = _seed_news(store, GID, "八卦三", topic="八卦", site="junk.com", down=1)
-    identity.note_useless_feedback(GID, third)
-    text = identity.group_read(GID)["text"]
-    assert "junk.com" in text and "不感兴趣" in text
+    assert not hasattr(identity, "note_useless_feedback")
+    assert not hasattr(identity, "group_read")
+    assert not hasattr(identity, "group_write")
+    assert not hasattr(identity, "group_memory_map")
 
 
 # ----------------------------------------------------------------------
@@ -517,7 +492,7 @@ async def _login(client: Any) -> None:
 
 @pytest.mark.asyncio
 async def test_identity_api_auth_and_structure(web_env: Any) -> None:
-    """匿名 401、群友 403、管理员 200；结构带 limits、四个文件、group_memory 只列服务群。"""
+    """匿名 401、群友 403、管理员 200；只剩全局三份（「每群三份」收尾后 group_memory 退役）。"""
     client = web_env.client
     r = await client.get("/api/identity")
     assert r.status == 401
@@ -531,17 +506,16 @@ async def test_identity_api_auth_and_structure(web_env: Any) -> None:
     assert data["limits"]["soul"] == 16384
     assert data["limits"]["agents"] == 16384
     assert data["limits"]["memory"] == 16384
-    assert data["limits"]["group_memory"] == 16384
+    assert "group_memory" not in data["limits"]  # 每群上限的口子跟着退役
     for key in ("soul", "agents", "memory"):
         assert "text" in data[key] and "updated_ts" in data[key]
     assert data["soul"]["synced_from_maibot"] is True  # 首次启动已自动同步过（host 假回 987654321）
-    assert GID in data["group_memory"]
-    assert "999" not in data["group_memory"]
+    assert "group_memory" not in data  # 每群内容进 /api/groups/{gid}/rules + /skills
     assert "# 我是谁" in data["soul"]["text"]  # 兜底三节都在
 
 
 @pytest.mark.asyncio
-async def test_identity_api_put_limit_and_group_404(web_env: Any) -> None:
+async def test_identity_api_put_limit_and_group_memory_gone(web_env: Any) -> None:
     client = web_env.client
     await _login(client)
     # 超限 400
@@ -553,16 +527,15 @@ async def test_identity_api_put_limit_and_group_404(web_env: Any) -> None:
     one = await r.json()
     assert one["text"] == "- 全局经验一"
     assert one["updated_ts"] > 0
-    # 非服务群 404
-    r = await client.put("/api/identity/group-memory/999", json={"text": "abc"})
-    assert r.status == 404
-    r = await client.put(f"/api/identity/group-memory/{GID}", json={"text": "本群经验"})
-    assert r.status == 200
-    # 写完 GET 看得见
+    # 「每群三份」收尾：/api/identity/group-memory/{gid}（服务群 / 非服务群）一律 404
+    assert (await client.put("/api/identity/group-memory/999", json={"text": "abc"})).status == 404
+    assert (await client.put(f"/api/identity/group-memory/{GID}", json={"text": "本群经验"})).status == 404
+    assert (await client.get(f"/api/identity/group-memory/{GID}")).status == 404
+    # 写完 GET 看得见（只剩全局）
     r = await client.get("/api/identity")
     data = await r.json()
     assert data["memory"]["text"] == "- 全局经验一"
-    assert data["group_memory"][GID]["text"] == "本群经验"
+    assert "group_memory" not in data
     # 写接口群友 403（全新无 cookie 会话，只带群链接头）
     import aiohttp as _a
 
@@ -571,23 +544,17 @@ async def test_identity_api_put_limit_and_group_404(web_env: Any) -> None:
         token = web_env.app.token_of(GID)
         async with s.put(f"{base}/api/identity/memory", json={"text": "x"}, headers={"X-MW-Group": token}) as resp:
             assert resp.status == 403
+        # 2026-10 docs/18 第一步：soul sync 端点已删，全站 404
         async with s.post(f"{base}/api/identity/soul/sync", headers={"X-MW-Group": token}) as resp:
-            assert resp.status == 403
+            assert resp.status == 404
 
 
 @pytest.mark.asyncio
-async def test_identity_api_soul_sync_and_bak(web_env: Any) -> None:
+async def test_identity_put_soul_agents_removed(web_env: Any) -> None:
+    """2026-10 docs/18 第一步：PUT /api/identity/soul /agents 退役 → 404；memory 照旧。"""
     client = web_env.client
     await _login(client)
-    r = await client.put("/api/identity/soul", json={"text": "管理员自写 SOUL"})
-    assert r.status == 200
-    assert (await r.json())["synced_from_maibot"] is False
-    r = await client.post("/api/identity/soul/sync")
-    assert r.status == 200
-    data = await r.json()
-    assert data["soul"]["synced_from_maibot"] is True
-    assert data["soul"]["text"] != "管理员自写 SOUL"
-    assert data["preview_changed"] is True
-    assert data["persona_missing"] is False
-    bak = (Path(web_env.app.get_settings().data_dir) / "identity" / "SOUL.md.bak").read_text(encoding="utf-8")
-    assert bak == "管理员自写 SOUL"
+    assert (await client.put("/api/identity/soul", json={"text": "x"})).status == 404
+    assert (await client.put("/api/identity/agents", json={"text": "x"})).status == 404
+    assert (await client.put("/api/identity/memory", json={"text": "- 还能改"})).status == 200
+    assert (await client.post("/api/identity/soul/sync")).status == 404

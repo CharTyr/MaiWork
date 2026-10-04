@@ -5,7 +5,6 @@ import { gname, grp, gview, mq, platTag, quiet } from "./api.js";
 import { pulseCard } from "./pulse.js";
 import { loading, viewNews } from "./pages/news.js";
 import { viewIdeas } from "./pages/ideas.js";
-import { viewGoals } from "./pages/goals.js";
 import { viewTasks } from "./pages/tasks.js";
 import { viewGroup } from "./pages/group.js";
 import { detailHTML } from "./detail.js";
@@ -51,6 +50,7 @@ export function renderTop() {
 const pendingCount = (g) => (g && g.today ? g.today.pending || 0 : 0);
 
 export function renderTabbar() {
+  $("tabbar").style.setProperty("--tab-count", TABS.length);
   const g = grp();
   const idx = state.page ? -1 : TABS.findIndex((t) => t.id === state.tab);
   const n = pendingCount(g);
@@ -176,6 +176,27 @@ function centerTabs(was) {
   }
 }
 
+// 同一群编辑时，刷新可以更新内容，但不能把键盘焦点和光标赶走。
+function captureGroupInput(el) {
+  const active = document.activeElement;
+  if (!active || !active.id || !el.contains(active) || !active.matches("input, textarea, select")) return null;
+  const scope = active.closest(".groupctl-slot, .gctx-slot");
+  if (!scope || scope.dataset.g !== state.g) return null;
+  let start = null, end = null;
+  try { start = active.selectionStart; end = active.selectionEnd; } catch (_) { /* number / checkbox 没文字光标 */ }
+  return { id: active.id, start, end };
+}
+
+function restoreGroupInput(saved, el) {
+  if (!saved) return;
+  const input = $(saved.id);
+  if (!input || !el.contains(input) || input.disabled) return;
+  input.focus({ preventScroll: true });
+  if (typeof saved.start === "number" && typeof saved.end === "number") {
+    try { input.setSelectionRange(saved.start, saved.end); } catch (_) { /* 不支持文字光标的字段 */ }
+  }
+}
+
 export function renderView(opts) {
   if (state.page === "chat") {
     const typed = $("chat-input") ? $("chat-input").value : "";
@@ -195,14 +216,16 @@ export function renderView(opts) {
   }
   const g = grp();
   const v = gview();
-  const views = { news: viewNews, ideas: viewIdeas, goals: viewGoals, tasks: viewTasks, group: viewGroup };
+  const views = { news: viewNews, ideas: viewIdeas, tasks: viewTasks, group: viewGroup };
   const el = $("view");
   const html = updateBanner() + (!v && state.tab !== "group" ? `<h1 class="h-page">${TABS.find((t) => t.id === state.tab).label}</h1>${loading()}` : views[state.tab](g, v));
   // 定时轮询时内容没变就不重画：不让图解 iframe 重新加载（一闪），也不打断正在看的页面。
   // 只限轮询（opts.poll）：点按钮之后的重画照旧整块重画，按钮状态会复位
   if (opts && opts.poll && html === lastView && !ui.flash) return;
+  const focused = captureGroupInput(el);
   lastView = html;
   el.innerHTML = html;
+  restoreGroupInput(focused, el);
   if (!ui.flash) el.querySelectorAll(".enter").forEach((x) => x.classList.remove("enter"));
   ui.flash = false;
 }
@@ -214,7 +237,7 @@ function landing() {
     <div class="landing">
       <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="" style="width:120px;height:120px" />
       <h1 class="h-page" style="margin-top:22px">MaiWork</h1>
-      <p class="landing-text">${esc(botName())}在群里的后台：资讯、构想、目标和任务都在这里。</p>
+      <p class="landing-text">${esc(botName())}在群里的后台：资讯、构想和在做的事都在这里。</p>
       ${bad ? `<div class="warn-box" style="width:100%;text-align:left">这个链接打不开了：可能是管理员重置过，或者复制时少了几个字。请在群里重新发 <b>/mw 网页</b> 拿新链接。</div>` : ""}
       <div class="landing-box">
         <div class="landing-t">群友</div>

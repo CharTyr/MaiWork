@@ -35,19 +35,15 @@ _PER_SOURCE_LIMIT = 10
 _GROUP_MAX = 20
 _UA = "MaiWork-RSS/1.0"
 
-
 class RssError(ValueError):
     """中文网名为准的 RSS 业务拒绝（URL 不合法、解析不了、DOCTYPE、太大等）。"""
-
 
 # ----------------------------------------------------------------------
 # kv 存取
 # ----------------------------------------------------------------------
 
-
 def _key(gid: str) -> str:
     return f"feeds.rss.{gid}"
-
 
 def _load_list(store: Any, gid: str) -> list[dict[str, Any]]:
     raw = store.kv_get(_key(gid))
@@ -59,16 +55,13 @@ def _load_list(store: Any, gid: str) -> list[dict[str, Any]]:
             out.append(dict(e))
     return out
 
-
 def _save_list(store: Any, gid: str, feeds: list[dict[str, Any]]) -> None:
     with store.tx() as conn:
         store.kv_set(conn, _key(gid), feeds)
 
-
 def list_feeds(store: Any, gid: str) -> list[dict[str, Any]]:
     """按 added_ts/id 稳定排序返回已加源（管理员视图）。"""
     return sorted(_load_list(store, gid), key=lambda e: (float(e.get("added_ts") or 0.0), str(e.get("id") or "")))
-
 
 def add_feed(store: Any, gid: str, *, url: str, title: str, feed_id: str, now: float | None = None) -> dict[str, Any]:
     """加源（不试取——试取是接口层「先试取，成功才保存」在做）。RssError 拒绝。"""
@@ -88,7 +81,6 @@ def add_feed(store: Any, gid: str, *, url: str, title: str, feed_id: str, now: f
     _save_list(store, gid, feeds)
     return entry
 
-
 def remove_feed(store: Any, gid: str, feed_id: str) -> dict[str, Any] | None:
     """删源；返回删掉的条目，没有返回 None。"""
     fid = str(feed_id or "")
@@ -98,7 +90,6 @@ def remove_feed(store: Any, gid: str, feed_id: str) -> dict[str, Any] | None:
         return None
     _save_list(store, gid, [e for e in feeds if str(e.get("id")) != fid])
     return victim
-
 
 def toggle_feed(store: Any, gid: str, feed_id: str, *, enabled: bool) -> dict[str, Any]:
     """开关。没有抛 RssError。"""
@@ -110,7 +101,6 @@ def toggle_feed(store: Any, gid: str, feed_id: str, *, enabled: bool) -> dict[st
     victim["enabled"] = bool(enabled)
     _save_list(store, gid, feeds)
     return victim
-
 
 def mark_checked(store: Any, gid: str, feed_id: str, *, ok_ts: float | None, error: str) -> None:
     """记一次取源结果：ok_ts 非空记 last_ok_ts；error 非空记 last_error（保留上次成功时间）。"""
@@ -127,7 +117,6 @@ def mark_checked(store: Any, gid: str, feed_id: str, *, ok_ts: float | None, err
         victim["last_error"] = ""
     _save_list(store, gid, feeds)
 
-
 def _plain(feed_id: str, url: str, title: str, enabled: bool, added_ts: float, last_ok_ts: float, last_error: str) -> dict[str, Any]:
     return {
         "id": str(feed_id),
@@ -139,7 +128,6 @@ def _plain(feed_id: str, url: str, title: str, enabled: bool, added_ts: float, l
         "last_error": str(last_error or ""),
     }
 
-
 def _new_id(existing: list[dict[str, Any]]) -> str:
     import secrets
 
@@ -150,13 +138,11 @@ def _new_id(existing: list[dict[str, Any]]) -> str:
             return fid
     raise RssError("分配 RSS 源 id 失败")
 
-
 def _require_http(url: Any) -> str:
     s = str(url or "").strip()
     if not s.startswith(("http://", "https://")):
         raise RssError("RSS 源地址必须以 http:// 或 https:// 开头")
     return s
-
 
 def _literal_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     """兼容 inet_aton 的 127.1 / 整数 / 十六进制 IPv4 写法，不让它们冒充域名。"""
@@ -168,7 +154,6 @@ def _literal_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | No
         except (OSError, ValueError):
             return None
 
-
 def _public_address(address: str) -> bool:
     try:
         ip = ipaddress.ip_address(address)
@@ -178,7 +163,6 @@ def _public_address(address: str) -> bool:
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
     return ip.is_global
-
 
 def _public_url(url: str) -> httpx.URL:
     """无网络预检；注入 MockTransport 时不做真实 DNS，生产请求还要在连接前查 DNS。"""
@@ -204,7 +188,6 @@ def _public_url(url: str) -> httpx.URL:
         raise RssError("RSS 源地址不能指向本机或内网")
     return parsed
 
-
 def _resolve_public_ip(host: str, port: int) -> str:
     """生产直连：所有 DNS 答案须为公开地址；失败或混有内网地址一律不连接。"""
     try:
@@ -218,14 +201,12 @@ def _resolve_public_ip(host: str, port: int) -> str:
         raise RssError("RSS 源域名解析到本机或内网地址，拒绝取源")
     return addresses[0]
 
-
 # ----------------------------------------------------------------------
 # 解析
 # ----------------------------------------------------------------------
 
 _TAG_LIKE_RE = re.compile(r"<[^>]+>")
 _SUMMARY_MAX = 500
-
 
 def _reject_doctype(xml_text: str) -> None:
     """按 XML 语法识别 DTD，跨越任意长度注释，且不误伤注释中的字面量。"""
@@ -239,7 +220,6 @@ def _reject_doctype(xml_text: str) -> None:
         parser.Parse(xml_text, True)
     except expat.ExpatError as e:
         raise RssError(f"XML 解析失败：{e}") from None
-
 
 def parse_feed(xml_text: str, *, now: float, lookback_days: int) -> dict[str, Any]:
     """RSS 2.0 / Atom → {"title", "items":[{title,url,published,summary}]}；解析不了抛 RssError。"""
@@ -263,18 +243,11 @@ def parse_feed(xml_text: str, *, now: float, lookback_days: int) -> dict[str, An
             break
     return {"title": title, "items": out}
 
-
 def _strip_ns(tag: str) -> str:
     return tag.split("}", 1)[-1]
 
-
-def _children(node: Any, local: str) -> list[Any]:
-    return [c for c in node if _strip_ns(c.tag) == local]
-
-
 def _text(node: Any) -> str:
     return "".join(node.itertext()).strip() if node is not None else ""
-
 
 def _feed_title(root: Any) -> str:
     tag = _strip_ns(root.tag)
@@ -290,7 +263,6 @@ def _feed_title(root: Any) -> str:
                 return _text(c)
     return ""
 
-
 def _item_nodes(root: Any) -> list[Any]:
     tag = _strip_ns(root.tag)
     if tag == "rss":
@@ -302,12 +274,10 @@ def _item_nodes(root: Any) -> list[Any]:
         return [c for c in root if _strip_ns(c.tag) == "entry"]
     return []
 
-
 def _strip_html(s: str) -> str:
     s = html.unescape(str(s or ""))
     s = _TAG_LIKE_RE.sub(" ", s)
     return re.sub(r"\s+", " ", s).strip()[:_SUMMARY_MAX]
-
 
 def _parse_published(raw: Any) -> float | None:
     if raw is None or raw == "":
@@ -334,7 +304,6 @@ def _parse_published(raw: Any) -> float | None:
         return parsedate_to_datetime(text).timestamp()
     except (TypeError, ValueError):
         return None
-
 
 def _item_of(node: Any) -> dict[str, Any] | None:
     tag = _strip_ns(node.tag)
@@ -391,11 +360,9 @@ def _item_of(node: Any) -> dict[str, Any] | None:
         }
     return None
 
-
 # ----------------------------------------------------------------------
 # 取源
 # ----------------------------------------------------------------------
-
 
 async def fetch_feed_source(
     url: str,

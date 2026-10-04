@@ -1,8 +1,8 @@
-// MaiWork 网页 · 专岗：主模型和各专岗（模型、SOUL / AGENTS、小鱼）、本群提醒、经验与交接记录。
+// MaiWork 网页 · 专岗：主模型和各专岗（模型、SOUL / AGENTS、小鱼）、每个群的工作记录（只读）。
 import { state, $ } from "../state.js";
 import { agentFish, agentSeed, api } from "../api.js";
 import { fishSvg, fishTraits, parseCustom, customSeed, FISH_SPECIES, FISH_EYES, FISH_COLORS, FISH_COLOR_NAMES, FISH_BASE_RE } from "../fish.js";
-import { esc, toast } from "../util.js";
+import { esc, toast, SVG } from "../util.js";
 import { repaintSheet } from "../sheet.js";
 import { loading } from "../pages/news.js";
 import { avatarBlock } from "./identity.js";
@@ -14,7 +14,7 @@ const fishOf = (kind, size) => agentFish(kind, size);
 const newSeed = () => Math.random().toString(36).slice(2, 10);
 const LABELS = { queued: "排队", running: "进行中", returned: "已交回，等验收", accepted: "已验收", rejected: "未采用", failed: "没跑成", cancelled: "已取消" };
 const SPECIALISTS = new Set(["news", "idea", "goal"]);
-const PHASES = { discover: "撒网搜索", verify: "打开核验", collect: "收集候选", research: "调查", propose: "目标提案调查", check: "目标进展调查", execute: "任务执行", "idea.research": "构想调查", "goal.propose": "目标提案调查", "goal.check": "目标进展调查", "task.execute": "任务执行" };
+const PHASES = { discover: "撒网搜索", verify: "打开核验", collect: "收集候选", research: "调查", check: "目标进展调查", execute: "任务执行", "idea.research": "构想调查", "goal.check": "目标进展调查", "task.execute": "任务执行" };
 
 const ORDER = ["main", "news", "idea", "goal", "task"];
 const TAGS = { main: "主模型", task: "通用执行" };
@@ -43,12 +43,12 @@ export function agentsPage() {
     <div class="h-sub-row"><h2 class="h-sub">专岗</h2><button class="btn small" data-act="agent-new">新建专岗</button></div>
     ${state.agentNew ? newAgentForm() : ""}
     ${profiles.map((p) => state.agentEdit === p.kind ? profileForm(p) : state.agentFishEdit === p.kind ? fishForm(p) : profileRow(p) + (p.kind === "main" ? `<div class="agent-avatar">${avatarBlock()}</div>` : "")).join("")}
-    <h2 class="h-sub">这个群的工作册</h2>
-    ${groups.length ? `<label for="agent-group" class="fine">选择服务群</label><select id="agent-group">${groups.map((g) => `<option value="${esc(g.id)}"${state.agentGroup === g.id ? " selected" : ""}>${esc(g.name || `群 ${g.id}`)}</option>`).join("")}</select>` : `<p class="fine">先在设置中添加服务群，再记录专岗经验。</p>`}
-    <p class="fine">本群提醒由你填写；经验只在主流程验收后积累。未验收的候选不会变成已确认的事实。</p>
+    <h2 class="h-sub">这个群的工作记录</h2>
+    ${groups.length ? `<label for="agent-group" class="fine">选择服务群</label><select id="agent-group">${groups.map((g) => `<option value="${esc(g.id)}"${state.agentGroup === g.id ? " selected" : ""}>${esc(g.name || `群 ${g.id}`)}</option>`).join("")}</select>` : `<p class="fine">先在设置中添加服务群。</p>`}
+    <p class="fine">各专岗在这个群最近做过什么、交接和验收记录。本群规矩和本群做法在群页的「这个群」区改。</p>
     ${state.agentError ? `<p class="err" role="alert">${esc(state.agentError)}</p><button class="btn small" data-act="agent-reload">重新加载</button>` : ""}
     ${groups.length && !snapshot && !state.agentError ? loading() : ""}
-    ${snapshot && snapshot.group_id === state.agentGroup ? (snapshot.agents || []).filter((a) => a.kind !== "main").map(memorySection).join("") : ""}`;
+    ${snapshot && snapshot.group_id === state.agentGroup ? (snapshot.agents || []).filter((a) => a.kind !== "main").map(journalSection).join("") : ""}`;
 }
 
 function newAgentForm() {
@@ -165,25 +165,18 @@ function repaintFishForm(kind, focusSel) {
   if (focusSel) { const el = document.querySelector(focusSel); if (el) el.focus(); }
 }
 
-function memorySection(a) {
+// 这个群的工作记录（只读）：最近做过的 + 交接。本群规矩和本群做法搬到了群页「这个群」区（docs/17 §八.4）
+function journalSection(a) {
   const learned = a.learned || [];
   const handoffs = a.recent_handoffs || [];
-  if (a.kind === "task") return `<section class="agent-journal">
-    <h3 class="set-name"><span class="agent-fish sm">${fishOf(a.kind, 30)}</span>${esc(a.title)}</h3>
-    <p class="fine">只记录本次任务的交接与验收，不积累跨任务经验。</p>
-    <details><summary>最近的交接 · ${handoffs.length}</summary>${handoffs.map(handoffEntry).join("") || `<p class="fine">还没有交接记录。获批任务开始执行后会显示在这里。</p>`}</details>
-  </section>`;
-  const hint = { news: "例如：优先看有原始资料的开发访谈，不追充值活动。", idea: "例如：先提一个周末能做出样品的点子。", goal: "例如：有新证据才更新进展，缺资源时先问。" }[a.kind] || "写一句本群工作要求";
   return `<section class="agent-journal">
     <h3 class="set-name"><span class="agent-fish sm">${fishOf(a.kind, 30)}</span>${esc(a.title)}</h3>
-    <label class="fine" for="agent-notes-${esc(a.kind)}">本群提醒</label>
-    <textarea id="agent-notes-${esc(a.kind)}" rows="3" maxlength="2000" placeholder="${esc(hint)}">${esc(a.notes || "")}</textarea>
-    <div class="actions"><button class="btn small" data-act="agent-memory-save" data-kind="${esc(a.kind)}" data-g="${esc(state.agentGroup)}">保存本群提醒</button></div>
-    <details><summary>已验收积累的经验 · ${learned.length}</summary>
-      ${learned.map((m) => `<div class="agent-entry"><p>${esc(m.text || "")}</p>${referenceLinks(m.refs)}${m.source_id ? `<span class="fine">依据：${esc(m.source_id)}</span>` : ""}</div>`).join("") || `<p class="fine">还没有。这个专岗完成工作并经主流程验收后，会在这里留下经验。</p>`}
-    </details>
+    ${a.kind === "task" ? "" : `<details><summary>最近做过的 · ${learned.length}</summary>
+      <p class="fine">只用来提醒专岗别重复做同样的事。</p>
+      ${learned.map((m) => `<div class="agent-entry"><p>${esc(m.text || "")}</p>${referenceLinks(m.refs)}${m.source_id ? `<span class="fine">依据：${esc(m.source_id)}</span>` : ""}</div>`).join("") || `<p class="fine">还没有。这个专岗完成工作并经主流程验收后，会在这里留下记录。</p>`}
+    </details>`}
     <details><summary>最近的交接 · ${handoffs.length}</summary>
-      ${handoffs.map(handoffEntry).join("") || `<p class="fine">还没有交接记录。到现有时段或收到工作请求时，专岗才会启动，不会一直空转。</p>`}
+      ${handoffs.map(handoffEntry).join("") || `<p class="fine">还没有交接记录。${a.kind === "task" ? "获批任务开始执行后会显示在这里。" : "到现有时段或收到工作请求时，专岗才会启动，不会一直空转。"}</p>`}
     </details>
   </section>`;
 }
@@ -422,22 +415,6 @@ export async function actAgents(action, el) {
         await loadSettings().catch(() => null);
         repaintSheet(); toast("保存好了，下次工作时生效");
       } catch (e) { el.disabled = false; fail(e.message); }
-      return true;
-    }
-    case "agent-memory-save": {
-      el.disabled = true;
-      const kind = el.dataset.kind;
-      const gid = el.dataset.g;
-      if (gid !== state.agentGroup) {
-        el.disabled = false;
-        toast("群已经切换，请在当前群重新填写提醒", true);
-        return true;
-      }
-      try {
-        await api("PUT", `/api/groups/${encodeURIComponent(gid)}/agents/${encodeURIComponent(kind)}/memory`, { notes: $(`agent-notes-${kind}`).value });
-        if (gid === state.agentGroup) await loadAgentGroup(gid);
-        toast("本群提醒已保存，只供这个群的专岗使用");
-      } catch (err) { el.disabled = false; toast(err.message, true); }
       return true;
     }
     default: return false;

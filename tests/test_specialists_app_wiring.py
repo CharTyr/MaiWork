@@ -19,9 +19,10 @@ async def test_real_app_wires_specialists_and_injects_own_group_memory(tmp_path:
         assert isinstance(app.agents, Agents)
         sp = app.feeds._specialists
         assert isinstance(sp, Specialists)
-        assert app.coordinator._specialists is sp and app.goal_proposer._specialists is sp
-        app.agents.set_notes(G1, "news", "本群只看开源硬件")
-        app.agents.set_notes(G2, "news", "另一个群的秘密口味")
+        assert app.coordinator._specialists is sp
+        assert not hasattr(app, "goal_proposer")  # 主动提目标 2026-10 已删
+        app.agents.group_rules_set(G1, "本群只看开源硬件", updated_by="admin")
+        app.agents.group_rules_set(G2, "另一个群的秘密口味", updated_by="admin")
         app.agents.remember(G1, "news", "已验收：官方博客可靠", source_id="t1")
         seen: dict = {}
 

@@ -37,6 +37,25 @@ def register_skill_tools(tools: Tools, skills: Skills) -> None:
         except Exception:
             return None
 
+    def _group_kinds(ctx: ToolContext) -> tuple[str, ...]:
+        """本群能看到 / 能读的 skill 类别：通用执行 task + 当前岗。
+
+        当前岗从真实 ToolContext 字段 `agent_type` 读（老代码读的 `ctx.kind` 是
+        空想字段，实际根本不存在——所以本岗做法一直没列出来）；
+        main / task 没有专岗做法，只留 task。别的岗 / 别的群的做法一律不可见。
+        """
+        kinds = ["task"]
+        agent_type = str(getattr(ctx, "agent_type", "") or "").strip()
+        if agent_type and agent_type not in ("task", "main"):
+            kinds.append(agent_type)
+        return tuple(kinds)
+
+    def _group_not_found(name: str) -> ToolResult:
+        """跨群 / 归档 / 没服务 / 名单外：一律当「没有」，不 leak 名字也不计 uses。"""
+        return ToolResult(
+            ok=False, output="", error=f"没有叫「{name}」的 skill（先用 list_skills 看有哪些）"
+        )
+
     async def list_skills(ctx: ToolContext, args: dict) -> ToolResult:
         role = role_of(ctx)
         try:
@@ -44,6 +63,21 @@ def register_skill_tools(tools: Tools, skills: Skills) -> None:
         except Exception:
             logger.exception("list_skills 读目录出错")
             return ToolResult(ok=False, output="", error="读 skill 目录出错了")
+        # 本群两份（§七.2）：本群 task skill（≤12） + 调用方**本岗**专岗 skill —— 只在
+        # ctx.group_id 绑定且 svc._agents 接上了才列；每个都搭载「本群/<name>」格式。
+        # 岗位从真实 ToolContext.agent_type 读（不是不存在的 ctx.kind）；只列 active。
+        _agents_obj_list = getattr(tools, "_agents", None)
+        _gid_list = str(getattr(ctx, "group_id", "") or "").strip()
+        if _agents_obj_list is not None and _gid_list:
+            try:
+                for _kind in _group_kinds(ctx):
+                    for _it in _agents_obj_list.skills(_gid_list, _kind, include_archived=False):
+                        items.append({
+                            "name": f"本群/{_it['name']}",
+                            "description": str(_it.get("description") or "").strip(),
+                        })
+            except Exception:
+                logger.debug("list_skills 本群部分报错（群 %s）", _gid_list, exc_info=True)
         # 岗位白名单（专岗）：只列交集；roles/全局开关已由 skills.list 处理。
         allowed = _allowed_skills(ctx)
         if allowed is not None:
@@ -69,19 +103,55 @@ def register_skill_tools(tools: Tools, skills: Skills) -> None:
         name = str(args.get("name") or "").strip()
         if not name:
             return ToolResult(ok=False, output="", error="name 不能为空")
+        # 本群两份（§七.2）：「本群/<name>」读的是本群 skill；只在 ctx.group_id 对得上且
+        # svc._agents 接上了才读得到；跨群 / 没群号 / 未服务群 / 归档 / 别的岗一律当「没有」
+        # （不 leak 名字，也不计 uses）。
+        if name.startswith("本群/"):
+            base = name[len("本群/"):].strip()
+            if not base:
+                return _group_not_found(name)
+            # 岗位白名单（专岗）也管本群做法：不在名单里当「没有」，更不许计 uses。
+            allowed_group = _allowed_skills(ctx)
+            if allowed_group is not None and name not in allowed_group:
+                return _group_not_found(name)
+            file_rel_group = str(args.get("file") or "").strip()
+            if file_rel_group:
+                # 本群做法只有一份正文、没有附属文件；不许拿 file 参数悄悄把正文回给模型。
+                return ToolResult(
+                    ok=False,
+                    output="",
+                    error=f"「{name}」是本群做事做法，只有正文、没有附件（不要传 file）",
+                )
+            _agents_obj = getattr(tools, "_agents", None)
+            _gid = str(getattr(ctx, "group_id", "") or "").strip()
+            if not _gid or _agents_obj is None:
+                return _group_not_found(name)
+            try:
+                for _kind in _group_kinds(ctx):
+                    for candidate in _agents_obj.skills(_gid, _kind, include_archived=False):
+                        if str(candidate.get("name") or "") == base:
+                            try:
+                                _agents_obj.skill_touch_use(
+                                    _gid, str(candidate.get("kind") or _kind), base
+                                )
+                            except Exception:
+                                logger.debug("touch use 失败（名 %s）", base, exc_info=True)
+                            return ToolResult(
+                                ok=True, output=str(candidate.get("body") or ""), data={"name": name}
+                            )
+            except Exception:
+                # 未服务群 / 库读坏：当「没有」，不 leak、不报内部错误
+                logger.debug("read_skill 本群查不到（群 %s 名 %s）", _gid, base, exc_info=True)
+            return _group_not_found(name)
         role = role_of(ctx)
         # 角色对不上的 skill 当「没有」——不 leak 名字，也不给读（附属文件同理）
         skill_roles = skills.roles(name)
         if skill_roles is None or role not in skill_roles:
-            return ToolResult(
-                ok=False, output="", error=f"没有叫「{name}」的 skill（先用 list_skills 看有哪些）"
-            )
+            return _group_not_found(name)
         # 岗位白名单（专岗）：不在白名单当成「没有」；模型不能凭名字猜读。
         allowed = _allowed_skills(ctx)
         if allowed is not None and name not in allowed:
-            return ToolResult(
-                ok=False, output="", error=f"没有叫「{name}」的 skill（先用 list_skills 看有哪些）"
-            )
+            return _group_not_found(name)
         file_rel = str(args.get("file") or "").strip()
         try:
             if file_rel:

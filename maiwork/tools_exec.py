@@ -62,9 +62,6 @@ def register_exec_tools(
         except ValueError as e:
             return None, ToolResult(ok=False, output="", error=str(e))
 
-    def _ws_name(ctx: ToolContext) -> str | None:
-        return ctx.workspace.name if ctx.workspace is not None else None
-
     # ------------------------------------------------------------------
     # 成品目录隔离（2026-10，线上 T-4 整改）：有 artifact_scope 时，
     # artifacts/ 下但不在 scope 里的路径一律拒绝；list 时 scope 外的目录滤掉不报错。

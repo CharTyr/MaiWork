@@ -581,7 +581,7 @@ class TestPlannerHook:
 
 
 # ----------------------------------------------------------------------
-# M3：构想 → 活（「做这个」on_start / 「想要这个」on_idea_want）
+# M3：构想 → 活（「做这个」on_start；「想要这个」死路 2026-10 已删）
 # ----------------------------------------------------------------------
 
 
@@ -634,61 +634,16 @@ class TestM3IdeaHooks:
         finally:
             await app.stop()
 
-    @pytest.mark.asyncio
-    async def test_on_idea_want_pending_marks_idea_pending(self, tmp_path: Path) -> None:
-        """要批准的部署里 want → 待批请求（via=来自构想），构想卡标 pending。"""
-        app = _app(tmp_path)
-        app.coordinator_factory = lambda *a, **kw: None
-        await app.start()
-        try:
-            idea_id = self._insert_idea(app)
-            view = self._idea_view(app, idea_id)
-            view["state"] = "wanted"
-            view["requested_by"] = "阿柒"
-            app.on_idea_want(view, G1)
-            row = app.store.read().execute(
-                "SELECT state FROM ideas WHERE id=?", (idea_id,)
-            ).fetchone()
-            assert row["state"] == "pending"
-            pending = app.approvals.pending_view(G1)
-            assert len(pending) == 1
-            assert pending[0]["via"] == "来自构想"
-            assert pending[0]["title"] == "做个铝价表"
-        finally:
-            await app.stop()
+    def test_on_idea_want_gone(self) -> None:
+        """「想要这个」是条死路（docs/18 §五）：on_idea_want 死方法已删，路由也摘了。
 
-    @pytest.mark.asyncio
-    async def test_on_idea_want_auto_approves_and_starts(self, tmp_path: Path) -> None:
-        """免批的部署里 want → 直接落地：构想卡标 started、回写 task_id、spawn run_task。"""
-        from fakes import FakeCoordinator
-
-        raw = _raw(tmp_path / "data")
-        raw["approval"] = {"required": False}
-        ctx = FakeCtx({})
-        app = MaiWorkApp(ctx, raw, plugin_dir=Path(__file__).resolve().parents[1])
-        app.profiles_cls = FakeProfiles
-        coord = FakeCoordinator()
-        app.coordinator_factory = lambda *a, **kw: coord
-        await app.start()
-        try:
-            idea_id = self._insert_idea(app)
-            view = self._idea_view(app, idea_id)
-            view["state"] = "wanted"
-            view["requested_by"] = "阿柒"
-            app.on_idea_want(view, G1)
-            row = app.store.read().execute(
-                "SELECT state, task_id FROM ideas WHERE id=?", (idea_id,)
-            ).fetchone()
-            assert row["state"] == "started"
-            tid = str(row["task_id"] or "")
-            assert tid.startswith("T-")
-            for _ in range(30):
-                if tid in coord.run_calls:
-                    break
-                await asyncio.sleep(0.02)
-            assert tid in coord.run_calls
-        finally:
-            await app.stop()
+        免批直接落地走「做这个」`_on_idea_started`；个人点「想要」由网页那条路
+        （feeds.idea_action 的 want 已退役）不再存在——别再把它接回来。
+        """
+        assert not hasattr(MaiWorkApp, "on_idea_want")
+        # 真正直接开工 / 拼请求文字的两个入口还在（这次不许连带删掉）
+        assert hasattr(MaiWorkApp, "_on_idea_started")
+        assert hasattr(MaiWorkApp, "_idea_request_text")
 
     @pytest.mark.asyncio
     async def test_on_idea_started_with_items_lands_each_item(self, tmp_path: Path) -> None:
@@ -1345,40 +1300,8 @@ class TestM2Loop:
             await app.stop()
 
     @pytest.mark.asyncio
-    async def test_goal_due_routes_to_proposer(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """scheduler 报 goal → 调 GoalProposer.propose（一天一次由它自己兜），并记 scheduler.done。"""
-        from fakes import FakeFeeds, FakeScheduler
-
-        calls: list[str] = []
-
-        class _Proposer:
-            async def propose(self, gid: str):
-                calls.append(str(gid))
-                return None
-
-        feeds = FakeFeeds()
-        scheduler = FakeScheduler()
-        scheduler.due_map[G2] = [["goal"]]
-        app = _app(tmp_path)
-        app.feeds_factory = lambda *a, **kw: feeds
-        app.scheduler_factory = lambda *a, **kw: scheduler
-        await app.start()
-        app.goal_proposer = _Proposer()
-        try:
-            await app.run_loop_once()
-            for _ in range(40):
-                if G2 in calls:
-                    break
-                await asyncio.sleep(0.02)
-            assert G2 in calls
-            assert G2 not in feeds.make_idea_calls
-            assert any(c[0] == G2 and c[1] == "goal" for c in scheduler.done_calls)
-        finally:
-            await app.stop()
-
-    @pytest.mark.asyncio
-    async def test_goal_due_without_proposer_is_skipped(self, tmp_path: Path) -> None:
-        """GoalProposer 没就位（模块缺）→ 这轮跳过，不炸。"""
+    async def test_goal_job_ignored_since_feature_removed(self, tmp_path: Path) -> None:
+        """主动提目标已删（2026-10 docs/18）：scheduler 递来的 goal 场合什么都不做，不炸。"""
         from fakes import FakeFeeds, FakeScheduler
 
         feeds = FakeFeeds()
@@ -1388,11 +1311,12 @@ class TestM2Loop:
         app.feeds_factory = lambda *a, **kw: feeds
         app.scheduler_factory = lambda *a, **kw: scheduler
         await app.start()
-        app.goal_proposer = None
         try:
             await app.run_loop_once()
             await asyncio.sleep(0.05)
             assert feeds.make_idea_calls == []
+            # app 里没有 goal_proposer 这个东西（本来就没建好；连属性都不该有）
+            assert not hasattr(app, "goal_proposer")
         finally:
             await app.stop()
 

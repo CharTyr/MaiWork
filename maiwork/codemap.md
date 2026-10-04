@@ -6,13 +6,13 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 
 - **装配与生命周期** — `app.py` 的 `MaiWorkApp` 把约 50 个组件接起来：`start()`（load_settings → Store → Host → Models → 各模块 → 控制台 → 后台循环）、`stop()`、`update_config()`（热更新：关→开整 app 重启；开→关全收；开着改配置更新 settings，`console.listen` 变了重启控制台）。`enabled=false` 时什么都不起（不开库、不开端口、不跑循环）。
 - **收消息** — `plugin.py` 的 `maiwork_intake` 钩子（`chat.receive.after_process`，BLOCKING，1500ms）转发给 `app.on_message()` → `intake.Intake.handle`；`maiwork_mentions` 钩子（`maisaka.planner.before_request`）转发给 `app.on_planner_before_request()` → `Mentions.inject`。两个钩子永远返回 `{"action": "continue"}`，任何异常吞掉。
-- **后台调度** — `app.run_loop_once()`（默认 30 秒一圈）对每个服务群串行跑：profiles.tick（读消息+统计）→ persona/personal 巡检 → topics 开话题 → 排程（资讯/构想/提目标；画像成形的群顺带排「反馈+口味」小时轮 `_feedback_round` → feedback_jobs）→ card_push → 名册对名字 → 资讯图解；长活（画像提炼、备资讯、构想、图解、反馈轮）spawn 成独立后台任务（`_spawn_long_job`，同群同种同时只跑一个）；随后 M3 巡检（发件箱 flush、批准提醒/过期、目标到期、queued 任务派工、任务安全网）、用量提醒。
+- **后台调度** — `app.run_loop_once()`（默认 30 秒一圈）对每个服务群串行跑：profiles.tick（读消息+统计）→ persona/personal 巡检 → topics 开话题 → 排程（资讯/构想；画像成形的群顺带排「反馈 + 本群做法复盘」小时轮 `_feedback_round` → feedback_jobs）→ card_push → 名册对名字 → 资讯图解 → 构想七天收起；长活（画像提炼、备资讯、构想、图解、反馈轮）spawn 成独立后台任务（`_spawn_long_job`，同群同种同时只跑一个）；随后 M3 巡检（发件箱 flush、批准提醒/过期、目标到期、queued 任务派工、任务安全网）、用量提醒。
 
 ## Design
 
 **装配模式（Composition Root）**：`MaiWorkApp.__init__` 声明全部组件槽位，`_start_stack()` 按依赖顺序装配（库 → 宿主 → 模型/画像 → M2 模块 → M3 模块 → 收消息 → 控制台 → 后台循环）。模块级可选组件用 `_import_m2_class` 惰性导入——feeds/scheduler/coordinator/profile 等没写好时返回 None，不拖垮 app（对应线并行开发的遗留保护）。测试注入点成排暴露（`profiles_cls/feeds_factory/http_transport/jev_transport/...`），外部 HTTP 全部可换 `httpx.MockTransport`。
 
-**单一配置出口**：`app.get_settings()` 是所有模块读配置的唯一入口，三层合并——`config.toml` 原始 Settings（frozen dataclass）× `kv["rules.override"]` 网页规则覆盖（`rules.effective_settings`，一层缓存）× 执行能力判定后的实际工作区根（`_ws_root`，dynamic 落 `/var/lib/private/maiwork/workspaces`）。`Settings` 是 frozen dataclass，覆盖用 `dataclasses.replace` 只换子节。
+**单一配置出口**：`app.get_settings()` 是所有模块读配置的唯一入口：`config.toml` 原始 Settings（frozen dataclass，热更新后直接换对象）× 执行能力判定后的实际工作区根（`_ws_root`，dynamic 落 `/var/lib/private/maiwork/workspaces`）。2026-10 之前还有一层 `kv["rules.override"]` 网页覆盖会赢过文件值，已在 docs/18 第一步删掉（启动迁移把 kv 值搬进 config.toml 后删键）——配置只有 config.toml 一个真实来源。`Settings` 是 frozen dataclass，修正用 `dataclasses.replace` 只换子节。
 
 **数据层纯数据**：`store.py`（SQLite，单写入者 `threading.RLock` + `BEGIN IMMEDIATE`）、`tasks.py`、`goals.py`、`approvals.py` 只放数据和规则：不调模型、不调宿主、不发消息。状态机转移严格按 [设计文档](<../../../docs/02-设计.md>) §7.2 表，非法转移抛 `ValueError`，转移在一个事务里完成（改状态 + 写事件）。取消/终态后晚到的结果一律不接（`accept_result=False`），任务状态绝不复活。
 
@@ -30,14 +30,16 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 
 **主动产出（后台循环一圈）**：
 1. `profiles.tick(gid)` 增量读群消息、维护统计；needs_refresh → spawn 画像提炼（主模型）。
-2. `scheduler.check` 报时辰：资讯时段（`[feeds] news_slots` + 按「群号+日期+时段」播种的固定随机偏移，45 分钟内有效）、构想时段、主动提目标时段；睡觉时段静默，画像没成形永远空。
-3. 到点 → spawn 长活 `feeds.prepare_news(gid)`：主模型按画像出 3–5 关注点（提示词带口味小结、近 14 天反馈、资讯评价、饱和话题、历史方向）→ 找候选两条路二选一：老单子 agent（`_collect`，web_search+fetch_page 一把梭）或每群开关的两段式（`_collect_two_phase`：撒网→保底→粗筛→挑→核验，候选从程序侧 `discovery` 登记簿拿，不信子 agent 交回）；RSS 源从 `rss.py` 并入同走质量门槛，没真打开的经 `news_recheck` 补打开 → 三道门槛（硬性淘汰/打分上网页/进话题候选池；「重复」和「后续进展」分开判，后续标 `followup` 放行、同一件事每轮限一条）→「有人味」写帖子（写完对原文自检撑不住的回落摘要）→ 入库 `news_batches/news_items`（批次带工具用量统计，两段式再带漏斗 funnel），过第三道的进 `topics` 候选池。构想 `feeds.make_idea` 类似。
-4. 「反馈+口味」小时轮（feedback_jobs.run，画像成形后每群每小时最多一轮）：`news_feedback.mention_round` 挑候选交主模型判「群里接着聊」→ `taste.refresh` 每天最多蒸馏一次口味小结（只喂摘要，不读原始聊天，过隐私闸）；不往群里发任何东西。
-5. `topics.check(gid)` 冷场开话题：代码第一层（时段/上限/安静时长）→ Jev 第二层（ok≥0.6 且 fit≥0.5）→ 主模型按人设写开场白发出去。
-6. `card_push.scan/flush` 发资讯卡片图（`news_card.render_png` playwright 截图）和构想提一嘴。
-7. M3 巡检：`outbox.flush`（发件箱投递，失败重试、超时标 uncertain）、`approvals` 提醒/过期、`goals` 到期提醒（成员目标）和 `Coordinator.check_goal`（agent 目标周期验收）、queued 任务 `Coordinator.run_task` 派工、`tasks.net_check` 任务安全网（token/时长超线自动 paused）。
+2. `scheduler.check` 报时辰：资讯时段（`[feeds] news_slots` + 按「群号+日期+时段」播种的固定随机偏移，45 分钟内有效）、构想时段；睡觉时段读**每群** `group_push.<群号>.quiet_hours` 静默，画像没成形永远空。（主动提目标 2026-10 已删，时段表里不再有它。）
+3. 到点 → spawn 长活 `feeds.prepare_news(gid)`：主模型按画像出 3–5 关注点（提示词带本群规矩 + 本群资讯做法（`group_context`）、近 14 天反馈、资讯评价、饱和话题、历史方向）→ 找候选走两段式（`_collect_two_phase`：撒网→保底→粗筛→挑→核验，候选从程序侧 `discovery` 登记簿拿，不信子 agent 交回；2026-09-30 起这是唯一的路——老单子 agent `_collect` 和「每群开关」都没了，配置里的 `[feeds] two_phase` 已删）；RSS 源从 `rss.py` 并入同走质量门槛，没真打开的经 `news_recheck` 补打开 → 三道门槛（硬性淘汰/打分上网页/进话题候选池；「重复」和「后续进展」分开判，后续标 `followup` 放行、同一件事每轮限一条）→「有人味」写帖子（写完对原文自检撑不住的回落摘要）→ 入库 `news_batches/news_items`（批次带工具用量统计，两段式再带漏斗 funnel），过第三道的进 `topics` 候选池。构想 `feeds.make_idea`：先过「堆积闸」（本群未处理的 new/wanted/pending ≥3 就不调模型）、模型自报 `worth=low` 跳过，产出一条通常 0–1 个构想。
+   - 2026-10-04 晚间故障修复（22:59 已部署 `583b77c`）：资讯的关注点 / 挑选 / 打分 / 写帖 / 原文自检用 `_parse_model_json` 兼容完整外层 JSON 或无语言代码围栏；不提取任意片段、不修补坏 JSON、原有校验不变。关注点（含补问）/ 挑选 / 打分传 `retries=0`，每个候选模型只试一次，网络失败走已有备用链；打分 240 秒、内容坏或漏项的一次补问仍保留，其他岗位与全局端点设置不改。
+4. 「反馈 + 本群做法」小时轮（feedback_jobs.run，画像成形后每群每小时最多一轮）：`news_feedback.mention_round` 挑候选交主模型判「群里接着聊」→ `lessons.run` 做每群每岗的**本群做法复盘**（有新的验收 / 反馈信号才调模型）+ 每周整理（专岗 ≥800 字只 patch；task ≥4 份未锁定做法带原文合并）/ 30 天未用自动归档；不往群里发任何东西。（口味小结 2026-10-03 已删：迁进本群 news 做法 skill 正文。）
+5. `topics.check(gid)` 冷场开话题：代码第一层（每群的时段/额度/开关 + 安静时长）→ Jev 第二层（ok≥0.6 且 fit≥0.5；给 Jev 的消息里机器人自己的话标 `[机器人自己]`、另报 `last_message_is_bot` / `last_human_minutes_ago` / `note`，`reason` 那题问「现在群里的状态是哪一种」；门槛数字没动）→ 主模型按人设写开场白，**只 enqueue 进发件箱**（不再自己直接发）。
+6. 构想七天收起巡检：`feeds.shelve_ignored_ideas` 每个服务群每轮一次，把 7 天没人理（`created` 算、无任务、非个人向、没有 pending/approved 请求）的 new/wanted 构想改成 dismissed，只改状态不删行、不往群里发、不学沉默。
+7. `card_push.scan`（资讯卡片）+ `idea_mention.scan`（构想提一嘴）只建待发行并 enqueue；画图（`news_card.render_png` playwright 截图）与投递都走发件箱 `flush`。
+8. M3 巡检：`outbox.flush`（发件箱统一投递：TTL/开关/每群额度/每群睡觉时段，安全失败重试一次、超时标 uncertain）、`approvals` 提醒/过期、`goals` 到期提醒（成员目标）和 `Coordinator.check_goal`（agent 目标周期验收）、queued 任务 `Coordinator.run_task` 派工、`tasks.net_check` 任务安全网（token/时长超线自动 paused）。
 
-**派活（M3 全链路）**：群友 @ 派的活 → `approvals.create` →（低风险轻活 `auto_review` 自动批，否则等管理员在网页或 `/mw 批准`）→ `Tasks.create(status=queued)` → `Coordinator.run_task`：`_plan` 定完成标准/交付形态/子任务/执行环境 → `tasks.transition(running)` + `start_attempt` → 子 agent 干活（成品写工作区 `artifacts/<task_id>/`）→ `submit_result` 交回 → `_review` 验收（只读工具 inspect_file(s) 核对，真实存在闸、引用核对、符号链接逃逸检查）→ 通过 → `Delivery.deliver` 经 `Outbox` 交付（view=here.now 发布网页 / file=群文件+说明 / text=群文字），渠道失败时回落备选方式，成功进可提起清单（ttl 6 小时）。
+**派活（M3 全链路）**：群友 @ 派的活 → `approvals.create`（读**每群**批准名单；低风险轻活 `auto_review` 自动批，否则等管理员在网页或 `/mw 批准`）→ `Tasks.create(status=queued)` → `Coordinator.run_task`：`_plan` 定完成标准/交付形态/子任务/执行环境 → **开工前能力自检**（按岗位实际工具核对；缺执行工具先补、补不了有界重排一次、再不行暂停不扣尝试）→ `tasks.transition(running)` + `start_attempt` → 子 agent 干活（成品写工作区 `artifacts/<task_id>/`）→ `submit_result` 交回 → `_review` 验收（只读工具 inspect_file(s) 核对，真实存在闸、引用核对、符号链接逃逸检查）→ 通过 → `Delivery.deliver` 经 `Outbox` 交付（view=here.now 发布网页 / file=群文件+说明 / text=群文字），渠道失败时回落备选方式，成功进可提起清单（ttl 6 小时）。
 
 **配置热更新**：宿主文件监控/`on_config_update` 或网页「全部配置」保存（`config_file.write_fields` 直写 config.toml，`apply_config_text` 立刻本进程应用）→ `update_config`：幂等比较 → 重判执行能力 → `_ensure_groups` → `_reconcile_unserved`（删掉的服务群残留就地标记：发件 cancelled/任务 cancelled/待批 expired）→ console.listen 变了重启控制台 → 群空间开关热生效。
 
@@ -58,9 +60,9 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 | `app.py` | MaiWorkApp 装配、生命周期、后台循环、热更新、planner 钩子、长活派工；Feeds 构造时注入 `search=self.search`（保底补搜/撒网多家要吃它）；`_feedback_round` 起 feedback_jobs 小时轮 |
 | `config.py` | pydantic 配置模型 + `load_settings` 规范化成 Settings（非法条目丢弃记中文问题，绝不抛）；多平台：服务群写成「平台:群号」——`parse_serve_group`（qq / telegram / tg 别名 / qqbot）、`Settings.platform_of(gid)`（不认得的群按 qq 老行为）、`has_onebot`（只有 qq 有 OneBot 群空间）、`host_platform`、工作区名按平台清洗（`_default_workspace`，Telegram 群 ID 的 `:、=` 等字符换 `_`） |
 | `config_file.py` | config.toml 读写层（tomlkit 保注释；写前备份到数据目录；绝不在插件目录建临时文件） |
-| `rules.py` | kv["rules.override"] 网页规则覆盖层 + `effective_settings` 合并 + 字段校验 |
-| `migrations.py` | 启动时一次性迁移（幂等）：数据库旧覆盖层/secrets → config.toml；搜索配置 → 扩展绑定（2026-10 修正：tavily 官方 MCP 工具名是下划线版 tavily_search/tavily_extract，老的连字符版只存在于旧文档） |
-| `store.py` | SQLite 存储：连接、表迁移（_m1 起一串；`_m_news_src` 加 src_query/src_provider 撒网可追溯、`_m_news_followup` 加 followup 后续进展列、`_m_idea_origin` 加 ideas.origin 构想由头；news_feedback 表不走迁移清单，由模块按库对象标记惰性建）、事务、kv/secrets/events 助手 |
+| `rules.py` | 「全部配置」表单表（`CONFIG_SCHEMA`）+ 通用校验 + `save_config_patch` / `reset_config_field` 直写 config.toml（旧 kv 覆盖层 2026-10 已删） |
+| `migrations.py` | 启动时一次性迁移（幂等）：数据库旧覆盖层/secrets → config.toml；kv["rules.override"] → config.toml（值一致只删键）；搜索配置 → 扩展绑定（2026-10 修正：tavily 官方 MCP 工具名是下划线版 tavily_search/tavily_extract，老的连字符版只存在于旧文档） |
+| `store.py` | SQLite 存储：连接、表迁移（_m1 起一串，**库号到 34**：第 31 步 `_m_chat_feeds` / 第 2 步 `_m_profile` 保持 0.7.9 原文，第 32/33 步 drop `member_interactions` / `chat_feeds`，第 34 步 `_m_agent_skills_group_rules` 建 skill / 规矩表并 DROP 从没上线的 `agent_lessons`；**不 DROP `agent_memory_notes`**——它是每群规矩启动迁移的输入）、事务、kv/secrets/events 助手 |
 | `clock.py` | epoch/北京时间换算、睡觉时段判断（存库一律 epoch 秒） |
 | `onboarding.py` | 首次安装引导状态（kv["onboarding"]） |
 
@@ -68,7 +70,7 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 | 文件 | 职责 |
 |---|---|
 | `intake.py` | 钩子逻辑：Signal 记录、/mw 分流、@ 识别（Jev）、pending_asks、回复/引用资讯卡片记自动好评（`news_feedback.CardIndex`，任何错误吞掉）；永不中止消息 |
-| `profile.py` | 群画像：增量读消息、活跃度统计、主模型提炼画像（攒批/到点/每周整理）、PROFILE-<群号>.md 同步、关注成员管理 |
+| `profile.py` | 群画像：增量读消息、活跃度统计、主模型提炼画像（攒批/到点/每周整理）、PROFILE-<群号>.md 同步、关注成员管理。群友对机器人下的指令原文不写进画像（提示词 + `_is_bot_command_verbatim` 兜底，2026-10） |
 | `members.py` | 成员名册（平台 id 认人、显示名跟进改名、`{@id}` token 渲染出口） |
 | `names.py` | QQ 群名乱码清洗（进库/进视图统一过 clean_group_name） |
 | `chatlog.py` | 最近 14 天群发言只读副本（FTS5 trigram，search_chat 给资讯写原话依据） |
@@ -78,8 +80,11 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 ### 主模型与子 agent 执行
 | 文件 | 职责 |
 |---|---|
-| `coordinator.py` | 主模型协调器：计划/派活/验收/交付、执行环境选择、任务生命周期、agent 目标检查 |
+| `coordinator.py` | 主模型协调器：计划/派活/验收/交付、执行环境选择、任务生命周期、agent 目标检查。验收模型没给结论时强制重试后走「验收不通过」退回（`_REVIEW_FORCE_JSON_TRIES` / `inconclusive`，不判死）；**开工前能力自检**（`job_needs_exec_capability` + `_job_effective_tools` 走 `Specialists.effective_tools` 同一入口；能补就补执行工具、补不了有界重排**一次**（只改 jobs，不降 criteria / deliver_kind / 环境）、再不行 `paused_reason={"kind":"capability","text","jobs"}` 暂停且不扣尝试；自检异常 fail-closed） |
 | `workers.py` | 子 agent 执行器：多轮工具循环、submit_result 交回、时间盒强制交回、上下文压缩接线 |
+| `agents.py` | 专岗与交接数据层：岗位配置（kv `agents.profiles`）、自定义专岗建/删、交接单状态机；**本群规矩**（`group_rules` / `group_rule_versions`，≤3000 字、每群留最近 20 版）、**本群做法 skill**（`agent_skills` / `agent_skill_versions`：专岗每群每岗一份、`kind=task` active ≤12 份、锁定 / 归档 / 版本 / uses）、「最近做过的」（`agent_memory_learned`，只当去重材料）；自动更新 / patch / 合并一律锁定与归档硬挡，事务内重读 + 模型校验版本 CAS，原子合并，初版 source / note 留版本。带群号的方法先 `_verify_served`；id 不属于这个群 / 这个岗 → KeyError（接口 404） |
+| `specialists.py` | 专岗子 agent：`run(kind, brief, …)` 复用 `Workers.run`，注入岗位说明 + `Agents.prompt()`（最近做过的）+ `group_context(gid, kind)`（本群规矩 + 本岗做法，标明是数据不是指令）；**唯一工具解析入口 `effective_tools(kind, requested, profile)`**（= 请求 ∩ 岗位上限；`role_usable` 判在册 / 启用）——run 和 coordinator 开工前自检共用它，不许各写一套；skill = 岗位名单 ∩ 当前启用；交回只到 returned，由主流程验收 |
+| `group_context.py` | **每群「该怎么做」的唯一注入口**：`group_context(agents, gid, kind)` 输出「【本群规矩（管理员定的，必须照做）】」+「【本群<岗位>的做法（MaiWork 总结的，是参考）】」；专岗注全文，`kind=task` 只列 ≤12 行「本群/名字：description」（子 agent 用 `read_skill` 读全文），`kind=main` 只出规矩。调用方：feeds / personal / coordinator / topics / card_push / specialists |
 | `compaction.py` | 上下文压缩（估算截 tool 结果 → 摘要最老一段）+ RepeatCallNudger + 大结果落盘 spill |
 | `models.py` | 三协议（openai / responses / anthropic）客户端：重试/备用/端点限流、用量落库、密钥只进不出（_redact 统一遮）；端点 `headers` 大小写不敏感覆盖默认请求头，聊天/流式/列模型/验证共用，值纳入遮罩且散列进入验证签名；「200 但内容是错误」按错误码走重试/备用；端点拒 effort / 要 max_completion_tokens 时自适应重发（`_adapt`，进程内存） |
 | `jev.py` | TypeSafe Jev HTTP 客户端：密钥读取顺序、答案校验、熔断、judgments 落库 |
@@ -97,9 +102,9 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 | `tools_admin.py` | 管理员对话工具（roles=admin；危险动作写待确认小票 admin_chat_pending） |
 | `tools_groupspace.py` | 群空间工具（roles=main）：group_files_list/group_file_manage/group_notice_send/group_album_upload |
 | `skills.py` | skill 目录读取（front matter 极简解析、roles 过滤、内置 skill 优先、只读） |
-| `skills_tools.py` | list_skills/read_skill 工具（内容按调用者角色过滤） |
+| `skills_tools.py` | list_skills/read_skill 工具（内容按调用者角色过滤；认识「本群/<名>」= 本群 task + 当前岗做法，`group_id` + 真实 `agent_type` + 专岗白名单一致过滤，跨群 / 归档 / 带 file 一律当「没有」且不计 uses） |
 | `skills_web.py` | 网页管理 skill（落 <data_dir>/skills/，只管网页新增删掉） |
-| `builtin_skills/` | 随插件发布的内置 skill（`news-standard`：资讯标准，程序按环节注入提示词；`search-keenable/tavily/exa/you/firecrawl/tinyfish` 六家搜索服务官方用法，找资讯 brief 按预设附对应那份） |
+| `builtin_skills/` | 随插件发布的内置 skill（`news-standard`：资讯标准，程序按环节注入提示词；`search-keenable/tavily/exa/you/firecrawl/tinyfish` 六家搜索服务官方用法，找资讯 brief 按预设附对应那份；`find-skills`：只给主模型排计划的找技能导航，`metadata.maiwork-roles=main`，只推荐不自动装、不强制外搜） |
 | `extensions.py` | MCP 扩展加载器：[[extensions.mcp]] → McpSessionClient → tools/list → 注册 mcp_* 工具 |
 | `mcp_client.py` | MCP Streamable HTTP 最小客户端（initialize/initialized/tools/call，会话失效重连） |
 | `extensions_web.py` | 网页管理 MCP 扩展（kv 存配置不含密钥值，密钥存 secrets["mcp.*"]） |
@@ -115,40 +120,40 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 |---|---|
 | `tasks.py` | 任务状态机、尝试记录（取消时同事务作废开着的尝试）、net_check 安全网（token/时长线）、interrupt_orphaned（顺带收残留 running 尝试） |
 | `goals.py` | agent 目标（G-n）/成员目标（M-n）：提醒、问进展、循环续期 |
-| `approvals.py` | 派活待批：免批判断、approve/reject、pending 提醒/过期、取消权限（取消权限的群主/管理员判断按 `settings.platform_of` 认平台，`is_admin(uid, platform=...)`） |
+| `approvals.py` | 派活待批：免批判断（读**每群**批准名单 `group_approval`）、approve/reject、pending 提醒/过期、取消权限（取消权限的群主/管理员判断按 `settings.platform_of` 认平台，`is_admin(uid, platform=..., group_id=gid)`；群命令只管本群） |
 | `auto_review.py` | 低风险轻活主模型自动批（每群每日上限；goal 类/构想含 goal 永远留人批） |
-| `goal_proposal.py` | MaiWork 主动提目标（每日一次，永远要管理员批准） |
-| `group_admins.py` | 按群管理员：密码哈希/本群名单只进库（/mw 批准 要用） |
+| `group_admins.py` | 按群管理员：密码哈希只进库（`/mw 批准` 要用）；名单转发到 `group_approval.approvers`，不再自己存第二份 |
+| `group_push.py` | 每群「往群里发」的**唯一真源**（`kv["group_push.<群号>"]`）：三个自动群发开关 + 一个每日总上限 `daily_max` + 每群 `quiet_hours`；第一次读惰性迁移旧 `kv["cardpush.<群号>"]` 并删源；非服务群 / 坏记录零读零写 + 保守默认；退役字段所有调用口都拒 |
+| `group_approval.py` | 每群批准名单的**唯一真源**（`kv["group_approval.<群号>"]`）：`approvers / exempt_users / exempt_group / required`；PUT 必须四字段全给；惰性从全局 `approval.*` ∪ 旧 `kv["group_admins.<群号>"]` 种一次并删源；坏记录 / 读失败按「要批、无批准人」fail-closed |
 
 ### 资讯与构想
 | 文件 | 职责 |
 |---|---|
-| `feeds.py` | 资讯/构想流水线：关注点（`_plan_focus`，提示词带口味小结/近 14 天反馈/资讯评价/饱和话题/历史方向）→ 找候选 → 三道门槛（打分时口味小结当相关度/值得聊参考；写帖子时当写法/角度参考但不许编事实）→ 写帖子 → 入库（构想还要一个「由头」`origin`：接的是群里之前聊过的哪件事，`clean_idea_origin` 清洗 ≤16 字、无 QQ 号，入库前过隐私闸、命中只置空 origin，进话题候选池给开场白用）。找候选两条路：老单子 agent `_collect`；每群开关的两段式 `_collect_two_phase`（kv["feeds.two_phase"] 名单，`two_phase_on`/`set_two_phase`，默认关）：①一个只用 web_search 的撒网子 agent（`_discover_brief`，候选程序从 `discovery` 登记簿 `close_run` 拿，不信交回）→ ②`_floor_searches` 代码保底补搜（饿着 = 问 <2 种问法或候选 <6 条的方向；主家 + broad 多家各补；需要一手来源的方向主家多补一次（当前调用参数相同））→ ③`_prefilter` 不调模型粗筛（非公开链接/重复/首页栏目页/屏蔽/太旧/标题近似；方向均衡每方向 ≤40%，留 ≤24 条，排序看 7 天内发布日期 + 优质来源先验分 `source_prior`）→ ④`_pick` 主模型一次挑 8~12 条带一句话理由（hook；失败回落前 10 条；提示词避开 SEO 站/采购指南/聚合站）→ ⑤`_verify_batch` 最多 3 个只用 fetch_page 的核验子 agent 并发打开核对，回来的条目接回 src_query/src_provider（漏斗 funnel：各环节计数/每方向/每家搜索/耗时/预筛拒因排行，随批次统计 kv["feeds.batch_stats.<id>"] 落库，网页「这一轮怎么找的」用）|
+| `feeds.py` | 资讯/构想流水线：关注点（`_plan_focus`，提示词带「本群规矩 + 本群资讯做法」（`group_context`）/近 14 天反馈/资讯评价/饱和话题/历史方向；每个方向可带 `intl` 标记，国际话题要求至少 2 条英文问法，模型没给按 `_looks_intl_focus` 兜底）→ 找候选 → 三道门槛（打分时本群资讯做法当相关度/值得聊参考；写帖子时当写法/角度参考但不许编事实）→ 写帖子 → 入库（构想还要一个「由头」`origin`：接的是群里之前聊过的哪件事，`clean_idea_origin` 清洗 ≤16 字、无 QQ 号，入库前过隐私闸、命中只置空 origin，进话题候选池给开场白用）。找候选一条两段式 `_collect_two_phase`（2026-09-30 起唯一的路；老 `_collect` 和 kv["feeds.two_phase"] 名单开关已删）：①`_run_planned_searches` 代码照关注点里定好的搜索计划直接并发搜（2026-10-01 起不再派撒网子 agent；结果进 `discovery` 登记簿；一轮 ≤30 条、同 (q,site,news,kind) 去重、并发 4 路）→ ②`_floor_searches` 代码保底补搜（饿着 = 问 <2 种问法或候选 <6 条的方向；主家 + broad 多家各补；需要一手来源的方向主家多补一次；`intl=true` 而英文问法 <2 条的方向另补一次英文搜索）→ ③`_prefilter` 不调模型粗筛（非公开链接/重复/首页栏目页/屏蔽/太旧/标题近似；方向均衡每方向 ≤40%，留 ≤24 条，排序看 7 天内发布日期 + 优质来源先验分 `source_prior`）→ ④`_pick` 主模型一次挑 8~12 条带一句话理由（hook；失败回落前 10 条；提示词避开 SEO 站/采购指南/聚合站）→ ⑤`_verify_batch` 最多 3 个只用 fetch_page 的核验子 agent 并发打开核对：按**内容**判水文/低质转载/洗稿（`quality=false` 直接拒）、转载认得出原始出处交 `original_url`（必须先打开确认），回来的条目接回 src_query/src_provider，链接被改写立刻用 `_dup_url_key_check` 对最近已发布∪最近被拒再查一次重（入库前还有最后一道）（漏斗 funnel：各环节计数/每方向/每家搜索/耗时/预筛拒因排行/**中外比例 `query_langs`·`discovered_langs`·`kept_langs`**，随批次统计 kv["feeds.batch_stats.<id>"] 落库，网页「这一轮怎么找的」用）|
 | `discovery.py` | 撒网登记簿（两段式第一阶段）：`open_run(task_id)` 开本 / `record(...)` 由 web_search handler 顺手记 / `close_run` 取走关掉；按规范化链接去重，同链留先见、别的问法攒进 queries；没开着的 task_id 忽略 |
 | `news_feedback.py` | 自动收的资讯反馈（显式反馈近零的实测后加）：表 news_feedback（`ensure_schema`/`_ensure` 按库对象标记惰性建，不走 store 迁移清单，老库直接用），(kind,item_id,actor,message_id) 唯一幂等；三种——`CardIndex.on_message`（回复/引用资讯卡片，卡片清单每群 60 秒缓存）、`click`（网页 /go/<条目> 点开原文，302 到库里存的原链接；同浏览器同条一天一次、每分钟超 30 次不记）、`mention_round`（群里接着聊：关键词命中候选交 judge 判，判过的 kv 记 7 天，每轮每群最多 5 条/30 句）；actor 一律「群号:账号」sha256 前 16 位；沉默不记负分；`summary` 汇总按条目/总数 |
-| `feedback_jobs.py` | 每小时一轮的后台活（app `_feedback_round` 调；`due` 判断）：①mention_round 用主模型当 judge（feeds.mention_judge，json_mode {"yes":[...]}）②`taste.refresh` 每天最多一次；模型没配好就只跳过要模型的部分 |
-| `taste.py` | 本群口味小结：kv["feeds.taste.<群号>"]；`refresh` 信号 = 有用/没用标题 + 资讯评价 + news_feedback 自动反应 + 画像「最近在聊」摘要（不读原始聊天）+ 管理员偏好；每天（北京时间）最多一次、无信号不调模型、手改 7 天不覆盖、过不了隐私闸作废旧留；结果截 300 字；`set_manual`/`view` 网页用；喂给找资讯的定关注点/打分/写帖子（feeds `_taste_line`）、`prompt_block` 给其他提示词（管理员偏好在前）；只写群整体不点名任何人 |
+| `feedback_jobs.py` | 每小时一轮的后台活（app `_feedback_round` 调；`due` 判断）：①mention_round 用主模型当 judge（feeds.mention_judge，json_mode {"yes":[...]}）②**本群做法复盘 + 整理**：调 `lessons.run`（`self.agents` 传进去；画像「最近在聊」`recent_topics` 顺路传进去做话题对照；炸一次不拖垮本轮）；返回 dict 带 `lessons` 计数（本轮改动数）。口味小结 2026-10-03 已删：迁进本群 news 做法 skill 正文，本文件不再刷新 |
+| `lessons.py` | 每群做法的复盘 + 整理（docs/17 §七.3–§七.5、§八）：挂在 `feedback_jobs.run` 后，不另起循环不往群里发。**专岗复盘**（`purpose="skills_reflect.<kind>"`）——每群每岗（news / idea / goal / 自定义）距上次 ≥20h 且自上次起有 ≥1 条新信号才调一次 json_mode 主模型（首次回看 7 天）；信号只取摘要（交接单被打回/失败/通过带意见、资讯点踩快照/评价/自动反应、构想驳回/开工/点赞点踩、目标提议批驳），外加**管理员原话**（聚焦本群、截 200 字、≤10 条；有新原话且那段对话安静 ≥30 分钟 → 门降到 ≥1h）和**群聊话题对照**（只给 news/idea，画像「最近在聊」指纹变了且 ≥72h，本身算一条新信号）。模型回 `{"patch":[{old,new}×≤4]} / {"write":整篇（只在正文空时）} / {"skip"} / {"pass"}`：old 必须恰好出现一处，否则整批作废；改完过隐私闸 + 可疑指令过滤 + 长度上限。**通用执行复盘**（`skills_reflect.task`，每天每群一次）：材料是上次复盘之后结束的 task 交接单（brief / 验收要求 / 交回摘要各截 300、验收意见、用过的工具名，≤8 条；只有用过 ≥3 种工具 / 被打回过 / 失败的算「不简单」），和这批活最像的 ≤2 份做法直接带全文（只能改带了全文的），可以 patch 或 create（名字是一类活；满 12 份不能新建）。**每周整理**（`skills_curate.task`）：距上次 ≥7 天且自动未锁定的 task 做法 ≥4 份才调模型；另外 30 天没被读过的自动归档（不调模型）。写库走 `agents.skill_patch_body` / `skill_add`（锁定的 / 已归档的自动流程一律不碰）。状态 kv `lessons.state.<群>.<岗>` = {last_reflect, last_curate, votes, topics_fp, last_topics, last_attempt, last_curate_attempt}；模型失败 / 非 JSON 一律不推进；每个实际改动记真实 `skills.change` 事件（自动归档不因同轮模型失败丢审计）。系统提示写明「没人回应不代表不需要：不许凭没人理写「别发 X」」（用户 2026-10-03 定） |
 | `source_stats.py` | 本群优质来源名单：近 30 天上网页且五项平均 ≥4 分的条目按域名（去 www.）计数，半衰期 15 天衰减，「有用」净值每票再 +0.5 条；至少 2 条高分才上名单（样本少不算），管理员移出的（kv["feeds.trusted_removed.<群号>"]，`set_removed`）和屏蔽名单不上；`trusted_domains`（≤8 个）喂找资讯 brief（site 直奔最多约三分之一，给新来源留位置）、`source_prior`（第 1 名 1.0 递减到最低 0.3，不在名单 0）给两段式预筛 `_prefilter` 方向内排序用；`view` 给网页 |
 | `rss.py` | RSS 源：订阅管理、解析（RSS2.0/Atom，拒 DOCTYPE）、条目并入同一质量门槛 |
 | `news_recheck.py` | 「补打开」子 agent：没真打开过的候选重新打开核对（drop/stale/重写摘要） |
 | `news_rating.py` | 群友评价资讯（理由+一句话；汇总进下一轮找资讯提示词） |
 | `news_viz.py` | 资讯图解：挑数据多的资讯让子 agent 写纯 CSS HTML 小图（程序严格校验） |
 | `news_card.py` | 资讯卡片 HTML/PNG 渲染（playwright 截图；cover 配图补齐） |
-| `card_push.py` | 往群里发的两种小推送：资讯卡片（CardPush；没封面但有图解的条目把图解截图画进卡片）/ 构想提一嘴（IdeaMention：按人设**关心式问一句**「话说之前那个……怎么样了？要我帮忙吗？」、≤60 字、结尾问句、不推销；有 `ideas.origin` 就用由头，没有就把标题剥掉「我可以帮…」的头；过 `_leaky` / `_pitchy`（`_PITCH_WORDS`）双词表 + `_template` 兜底），每群开关默认关；Telegram 没有真 @ 段，发消息带 `at_name` 让 @ 退成正文名字 |
+| `card_push.py` | 往群里发的两种小推送（0.8.0 起设置转发 `group_push`、**只 enqueue 进发件箱**、真发出由结果 hook 回写）：资讯卡片（CardPush；没封面但有图解的条目把图解截图画进卡片；`prune_card_cache` 每日清 7 天前的旧卡片图）/ 构想提一嘴（IdeaMention：按人设**关心式问一句**「话说之前那个……怎么样了？要我帮忙吗？」、≤60 字、结尾问句、不推销；有 `ideas.origin` 就用由头，没有就把标题剥掉「我可以帮…」的头；过 `_leaky` / `_pitchy`（`_PITCH_WORDS`）双词表 + `_template` 兜底），每群开关默认关；Telegram 没有真 @ 段，发消息带 `at_name` 让 @ 退成正文名字 |
 | `update_check.py` | 查 GitHub 最新版本提醒（只提醒不自动更新） |
 
 ### 开话题与交付
 | 文件 | 职责 |
 |---|---|
-| `topics.py` | 冷场开话题：代码门槛 → Jev 判 → 主模型写开场白（人设走 `voice.persona`，只认 SOUL；自我介绍 / 寒暄 → `rejected:self_intro`；news 候选「随口一提」，idea 候选**关心式问法**，按候选 ref_id 从 `ideas` 读 origin/title/body，不读 basis）；candidate 池/follow_up |
+| `topics.py` | 冷场开话题：代码门槛（0.8.0 起开关 / 每日额度 / 睡觉时段都读每群 `group_push`）→ Jev 判（给足判断材料：`speaker` 标 `[机器人自己]`、`last_message_is_bot` / `last_human_minutes_ago` / `note`，机器人自己没人接的话不算「有人在等」；`reason` 题面改成问群里的状态）→ 主模型写开场白（人设走 `voice.persona`，只认 SOUL；自我介绍 / 寒暄 → `rejected:self_intro`；news 候选「随口一提」，idea 候选**关心式问法**，按候选 ref_id 从 `ideas` 读 origin/title/body，不读 basis）→ **只 enqueue 进发件箱**（`push_kind="topic"` + `expires_ts`；`speaker="maibot"` 请 MaiBot 开口那条已退役），真发出由结果 hook 回写 opener / 候选；candidate 池/follow_up |
 | `voice.py` | 开口时的人设：`persona(identity) → Persona`（只读 identity 的 main SOUL，不回退读 MaiBot 人格）；`Persona.section()` = SOUL + 「不自我介绍 / 不寒暄、直接说事」规矩，`system()`；`is_self_intro(text)` 生成结果护栏。读不到一律当空、绝不抛。开场白和构想提一嘴共用 |
-| `delivery.py` | Mentions 可提起清单（inject 进 planner 请求）、TopicMatcher 关键词接话、Pushes 推送节制 |
-| `chat_feed.py` | 资讯反哺闲聊的零件：关键词过滤 / 整词匹配 / 问「新鲜事」识别；`chat_feeds` 账（递了什么、MaiBot 聊到没有） |
-| `outbox.py` | 发件箱（状态机 pending/sending/sent/uncertain/failed，按 key 去重，recover 不重放）、任务交付 Delivery（view/file/text 三渠道+回落）、report_error |
+| `delivery.py` | Mentions 可提起清单（inject 进 planner 请求）、TopicMatcher 关键词接话、Pushes 推送节制（0.8.0 起每群一个每日总上限 + 每群睡觉时段，都从 `group_push` 读；`PUSH_EXEMPT_KINDS` = error/command/admin/awaited_delivery 永远放行；结果不明安全保留额度）。<br/>（原 `chat_feed.py` 已删 2026-10 docs/18：关键词 / 清洗 / 新鲜事问话助手挪回本文件，接得上照旧，只是不再记 `chat_feeds` 表、不再认「聊到了」） |
+| `outbox.py` | 发件箱（**0.8.0 起是唯一发送路径**：三种自制消息都只 enqueue；状态机 pending/sending/sent/uncertain/failed/dropped，按 key 去重；发送前 TTL 过期作废 + 生产者 preflight + `pushes.can_push`；图片载荷严格闸（工作区路径 + PNG 魔数 + 1B~8MB）；安全失败隔 300 秒只重试一次、超时 / recover 标 uncertain 不重放；`follow_up_of` 的说明不占第二份额度、不过第二道闸）、任务交付 Delivery（view/file/text 三渠道+回落）、report_error |
 | `herenow.py` | here.now 匿名发布客户端（publish/upload/finalize 三步） |
-| `scheduler.py` | 什么时辰干什么事（资讯时段偏移/构想/提目标窗口；只读 kv+groups，不调模型） |
-| `commands.py` | /mw 群指令（纯代码固定回复：状态/网页/批准/取消/领取/帮助） |
-| `identity.py` | 身份与工作记忆：SOUL.md/AGENTS.md/MEMORY.md/memory/<群号>.md，prompt_block 注入，remember 工具 |
+| `scheduler.py` | 什么时辰干什么事（资讯时段偏移 / 构想窗口；睡觉时段读**每群**那份 `kv["group_push.<群号>"].quiet_hours`，`[delivery] quiet_hours` 只作新群种子；只读 kv+groups，不调模型） |
+| `commands.py` | /mw 群指令（纯代码固定回复：状态/网页/批准/取消/领取/帮助）。批准 / 拒绝只认**本群**批准名单，请求不属于本群一律拒（群命令只管本群，总管理员也不跨群批）；取消判权限也带 `group_id` |
+| `identity.py` | 身份与工作记忆（专岗改版 3/4 + 每群三份收尾）：`agents/<kind>/SOUL.md` / `AGENTS.md`、全局 `MEMORY.md`，`agent_prompt_block()` / `prompt_block()` 注入，「记忆」页只放全局那份。**每群身份层整层退役**（`group_read` / `group_write` / `group_memory_map`、每群记忆段、`note_useless_feedback`）；每群内容归本群规矩 / 本群做法（见 `group_context.py`）。主模型那份 `remember`（roles={"main"}）**只认 `scope=global`，传 group 一律拒且零写入**；写本群规矩只走管理员对话那条独立工具（`tools_admin.remember`，落 `updated_by=admin_chat`） |
 | `personal.py` | 关注成员个人向资讯/构想（第二人称写法；绝不能进群视图）；个人向构想的由头 `origin` = **他自己在群里说过想做的那件事**，入库前过 privacy.scrub、命中只置空 origin |
 
 #### 子目录
@@ -157,7 +162,7 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 | `console/` | MaiWork 网页控制台（aiohttp）：路由/鉴权/视图拼装/头像/用量历史/静态前端 | [console/codemap.md](console/codemap.md) |
 | `environments/` | 执行环境：能力判定 + 本机 systemd-run 隔离 + railway.new 一次性 VM + 专用 SSH 机器 | [environments/codemap.md](environments/codemap.md) |
 | `platforms/` | 平台档案：QQ/NapCat-OneBot 群空间（群文件/公告/相册） | [platforms/codemap.md](platforms/codemap.md) |
-| `builtin_skills/` | 内置 skill（news-standard + 六家搜索服务 search-*），随插件发布、只读 | （单目录 skill，无子图） |
+| `builtin_skills/` | 内置 skill（news-standard + 六家搜索服务 search-* + 只给主模型排计划的 find-skills），随插件发布、只读 | （单目录 skill，无子图） |
 
 ## 边界规则（改动时必读）
 

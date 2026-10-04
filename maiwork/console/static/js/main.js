@@ -9,7 +9,7 @@ import { loadRules, readRules } from "./settings/rules.js";
 import { loadUsage } from "./settings/usage.js";
 import { loadIdentity } from "./settings/identity.js";
 import { loadAgents } from "./settings/agents.js";
-import { loadLogs } from "./settings/logs.js";
+import { loadLogSummary } from "./settings/logs.js";
 import { loadModels } from "./settings/models.js";
 import { closeSheet, repaintSheet } from "./sheet.js";
 import { chatPoll, enterChat, loadChat, paintChat } from "./chat.js";
@@ -150,8 +150,7 @@ document.addEventListener("submit", async (e) => {
     if (new Blob([text]).size > limit) return toast(`太长了，最多 ${limit} 字节`, true);
     btn.disabled = true;
     try {
-      const path = kind.startsWith("group:") ? `/api/identity/group-memory/${encodeURIComponent(kind.slice(6))}` : `/api/identity/${kind}`;
-      await api("PUT", path, { text });
+      await api("PUT", `/api/identity/${kind}`, { text });
       await loadIdentity();
       repaintSheet();
       toast("保存好了");
@@ -257,7 +256,6 @@ document.addEventListener("submit", async (e) => {
     const ed = state.editing;
     const err = $("ed-err");
     const pw = $("ga-pw").value;
-    const accounts = [...$("ga-accs").querySelectorAll(".ci")].map((c) => c.dataset.v);
     if (pw && pw.length < 8) {
       err.textContent = "密码至少 8 位。";
       err.hidden = false;
@@ -265,7 +263,7 @@ document.addEventListener("submit", async (e) => {
     }
     btn.disabled = true;
     try {
-      state.ga[ed.gid] = await api("PUT", `/api/groups/${encodeURIComponent(ed.gid)}/group-admin`, { password: pw || undefined, accounts });
+      state.ga[ed.gid] = await api("PUT", `/api/groups/${encodeURIComponent(ed.gid)}/group-admin`, { password: pw || undefined });
       closeSheet();
       repaintSheet();
       toast("保存好了");
@@ -309,7 +307,7 @@ document.addEventListener("submit", async (e) => {
     const ed = state.editing || {};
     const text = $("ed-text").value.trim();
     const err = $("ed-err");
-    if (!text && ed.kind !== "pref" && ed.kind !== "taste") {
+    if (!text) {
       err.textContent = ed.kind === "focus" ? "填一个 QQ 号。" : "内容不能是空的。";
       err.hidden = false;
       return;
@@ -317,12 +315,7 @@ document.addEventListener("submit", async (e) => {
     btn.disabled = true;
     try {
       const g = grp();
-      if (ed.kind === "taste") {
-        state.taste = state.taste || {};
-        state.taste[g.id] = await api("PUT", `/api/groups/${encodeURIComponent(g.id)}/taste`, { text });
-      } else if (ed.kind === "pref") {
-        await api("PUT", `/api/groups/${encodeURIComponent(g.id)}/feeds-pref`, { text });
-      } else if (ed.kind === "focus") {
+      if (ed.kind === "focus") {
         if (!/^\d{5,12}$/.test(text)) throw new Error("QQ 号应该是 5 到 12 位数字。");
         await api("POST", `/api/groups/${encodeURIComponent(g.id)}/focus`, { user_id: text, action: "add" });
       } else if (ed.id) {
@@ -333,7 +326,7 @@ document.addEventListener("submit", async (e) => {
       closeSheet();
       await loadView(true);
       renderView();
-      toast(ed.kind === "taste" ? (text ? "记下了，7 天内按你写的来" : "清空了，明天起自动总结") : ed.kind === "focus" ? "加上了" : ed.kind === "pref" ? (text ? "记下了，下一轮备料就照这个找" : "清空了，按群里平时聊的来找") : "保存好了，这条已锁定");
+      toast(ed.kind === "focus" ? "加上了" : "保存好了，这条已锁定");
     } catch (ex) {
       err.textContent = ex.message;
       err.hidden = false;
@@ -366,7 +359,7 @@ window.addEventListener("hashchange", () => {
       ["memory", "agents"].includes(state.setSub) ? loadIdentity() : null,
       state.setSub === "models" ? loadModels() : null,
       state.setSub === "agents" && !state.agents ? loadAgents() : null,
-      state.setSub === "logs" ? loadLogs() : null,
+      state.setSub === "usage" ? loadLogSummary() : null,
       state.setSub === "links" ? loadGA() : null,
     ]).then(() => render());
     return;

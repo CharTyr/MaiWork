@@ -35,8 +35,22 @@ class _ApprovalSetting:
 
 
 class _Settings:
-    def __init__(self, approval):
+    """假设置，但**有真 served 证据**（0.8.0 起每群批准名单按服务群惰性种一份）。
+
+    0.8.0 把「谁能批 / 免批」归一到 `kv["group_approval.<群号>"]`，第一份从全局种子父
+    种出来。没有服务群证据时 GroupApprovals 按 fail-closed（不放行）——那不是要测的
+    行为，所以这里给 `groups` + `is_served` / `platform_of`，让真迁移路径跑起来。
+    """
+
+    def __init__(self, approval, served=(GID,)):
         self.approval = approval
+        self.groups = {str(g): None for g in served}
+
+    def is_served(self, group_id: str) -> bool:
+        return str(group_id) in self.groups
+
+    def platform_of(self, group_id: str) -> str:
+        return "qq"
 
     def workspace_of(self, group_id: str) -> str:
         return "ws-demo"

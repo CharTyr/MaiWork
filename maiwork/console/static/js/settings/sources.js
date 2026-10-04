@@ -39,7 +39,7 @@ export function sourcesPage(s) {
     <p class="h-meta">从每个群最近上了网页的高分资讯里自动攒出来的，找资讯时会优先去这些站看；不想要的可以移出</p>
     ${groups.map((g) => trustedGroup(g)).join("")}
     <h2 class="h-sub">屏蔽的来源</h2>
-    ${feedsSettings(s.feeds, true)}`;
+    ${feedsSettings(s.feeds, groups)}`;
 }
 
 // 优质来源（source_stats.py）：每个群懒加载进 state.trusted[群]

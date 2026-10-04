@@ -2,7 +2,7 @@
 
 第一部分（本文件目前范围）：不调模型的部分——
 - 增量读群消息（游标 + 分页 + 首次回读），维护 member_activity / activity_bins /
-  bot_messages / member_interactions 统计；
+  bot_messages 统计；
 - 群画像条目的管理员操作（entries / add_entry / edit_entry / delete_entry）；
 - 关注成员（focus / set_focus）；
 - 群脉搏（pulse）和平时发言间隔（usual_gap）。
@@ -374,6 +374,16 @@ class Profiles:
     # 单条文本一句话上限（字）；超了截断（不拒整条，模型啰嗦不至于废掉整批）
     _TEXT_MAX = 40
 
+    @staticmethod
+    def _is_bot_command_verbatim(text: str) -> bool:
+        """群友对机器人下的指令原文（/今日运势、/今日猪猪 这类斜杠命令）：画像不写原文。
+
+        提示词里已经要求不记（_PROMPT_RULES 第 10 条），这里是代码兜底：以 / 开头
+        的条目整条滤掉（2026-10 线上 T-1 整改：「/今日运势」进了 convention 被验收打回）。
+        概括说法（「群里常用机器人的娱乐指令」）不以 / 开头，不受影响。
+        """
+        return str(text or "").strip().startswith("/")
+
     def _apply_ops(self, conn, gid: str, ops: list, batch_msgs: list, now: float) -> dict:
         """整批在一个事务里应用 add/update/remove/touch；返回各类实际生效的计数。
 
@@ -456,6 +466,10 @@ class Profiles:
                     if text:
                         logger.info("群 %s 画像条目类别认不出（%r），这条跳过", gid, op.get("category"))
                     continue
+                # 「群友对机器人下的指令原文」不进画像（/今日运势 这类）——整条滤掉
+                if self._is_bot_command_verbatim(text):
+                    logger.info("群 %s 画像条目是对机器人的指令原文（%r），这条滤掉", gid, text[:40])
+                    continue
                 # G7：关注成员的名字 / 注记不能进群画像（群友能看到画像）——整条丢弃
                 if scrub(gid, text, self._store) is None:
                     continue
@@ -506,6 +520,10 @@ class Profiles:
                     continue
                 text = str(op.get("text") or "").strip()
                 if not text:
+                    continue
+                # 「群友对机器人下的指令原文」不进画像（/今日运势 这类）——更新作废，原文保留
+                if self._is_bot_command_verbatim(text):
+                    logger.info("群 %s 画像更新是对机器人的指令原文（%r），这次更新作废", gid, text[:40])
                     continue
                 # G7：关注成员的名字 / 注记不能进群画像——更新作废，原文保留
                 if scrub(gid, text, self._store) is None:
@@ -947,6 +965,9 @@ class Profiles:
         "玩笑、整人、要它办现实里办不到的事（比如取消别人的假期、管人、改现实里的规定）也不收。"
         "没有就空列表。机器人自己说的话（名字 MaiBot 的行）永远不收。"
         "以 / ! # 开头的是**别的插件的指令**（比如 /pic 画图），不是请 MaiWork 做事，永远不收。\n"
+        "10. 画像条目里**不要记录群友对机器人下的指令原文**（/今日运势、/今日猪猪、"
+        "@机器人 + 指令 这类）。这类行为只能概括成不含原文的说法，"
+        "比如「群里常用机器人的娱乐指令」；指令原文一个字都不要写进条目。\n"
         "输出格式：一行一件事，每行用「|」分成几段，不要编号、不要 JSON、不要别的话。\n"
         "类别只能写这五个之一：最近在聊（recent）、长期兴趣（interest）、在做的事（ongoing）、"
         "约定和说法（convention）、常用资源（resource）。\n"
@@ -1267,7 +1288,6 @@ class Profiles:
         统计（同一事务和游标一起提交）：
         - 非机器人消息 → member_activity（北京日）+ activity_bins（15 分钟桶）；
         - 机器人消息只计 activity_bins，并记进 bot_messages（保留 7 天，顺手清旧）；
-        - is_at 或 reply_to 在 bot_messages 里 → member_interactions（北京日）+1；
         - 本轮新消息数累加进 groups.pending_count。
         """
         settings = self._get_settings()
@@ -1403,12 +1423,6 @@ class Profiles:
                     "DELETE FROM focus_messages WHERE group_id=? AND ts<?",
                     (gid, now - _FOCUS_MSG_KEEP_SECONDS),
                 )
-            known_bot_ids = {
-                str(r["message_id"])
-                for r in conn.execute(
-                    "SELECT message_id FROM bot_messages WHERE group_id=?", (gid,)
-                )
-            }
             for m in new_msgs:
                 conn.execute(
                     "INSERT INTO activity_bins (group_id, bin_ts, count) VALUES (?, ?, 1)"
@@ -1421,7 +1435,6 @@ class Profiles:
                         " VALUES (?, ?, ?)",
                         (gid, str(m.id), m.ts),
                     )
-                    known_bot_ids.add(str(m.id))
                     continue
                 # 关注成员的发言留一份做个人画像素材（personal_profile 开时）
                 if focus_msg_targets and str(m.user_id) in focus_msg_targets:
@@ -1459,14 +1472,6 @@ class Profiles:
                         "UPDATE focus_members SET name=? WHERE group_id=? AND user_id=?"
                         " AND COALESCE(name, '')<>?",
                         (_roster_name, gid, str(m.user_id), _roster_name),
-                    )
-                is_reply_to_bot = bool(m.reply_to) and str(m.reply_to) in known_bot_ids
-                if m.is_at or is_reply_to_bot:
-                    conn.execute(
-                        "INSERT INTO member_interactions (group_id, user_id, day, count)"
-                        " VALUES (?, ?, ?, 1)"
-                        " ON CONFLICT(group_id, user_id, day) DO UPDATE SET count=count+1",
-                        (gid, str(m.user_id), day),
                     )
             read_since = (
                 min(m.ts for m in new_msgs)
@@ -1741,7 +1746,6 @@ class Profiles:
     # ------------------------------------------------------------------
 
     _REASON_ACTIVE = "最活跃"
-    _REASON_CHAT = "和 MaiBot 聊得多"  # 已退役：不再用来挑人；member_interactions 数据保留
     _REASON_REQ = "提过请求"
     _REASON_PIN = "管理员加的"
 
@@ -1753,8 +1757,7 @@ class Profiles:
         """重算关注成员并同步 focus_members 表。
 
         候选：近 30 天发言前 3（最活跃）、requesters 里的（提过请求）、管理员
-        pinned 的（管理员加的）。removed 排除。member_interactions 的互动计数
-        数据保留（不删），但不再用来挑人（2026-09-27 起）。
+        pinned 的（管理员加的）。removed 排除。
         最多 settings.focus.max_members 个；落选且非 pinned 的删行（个人画像
         persona 和发言留存 focus_messages 随之删除）。
         personal_profile=False 时清空所有 note / persona、删掉所有 focus_messages。

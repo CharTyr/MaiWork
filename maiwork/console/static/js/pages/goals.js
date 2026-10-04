@@ -1,25 +1,24 @@
-// MaiWork 网页 · 「目标」页。
+// MaiWork 网页 · 「在做的事」里的持续目标与提醒。
 import { state } from "../state.js";
 import { dur, esc, ico, now, when } from "../util.js";
 import { agentFish } from "../api.js";
-import { emptyState } from "./news.js";
 
 export function nextText(goal) {
   if (goal.state === "paused") return "暂停中";
   return goal.next_check_ts ? `${when(goal.next_check_ts)} 检查` : "等新消息";
 }
 
-export function viewGoals(g, v) {
-  let html = `<h1 class="h-page h-fish">${agentFish("goal", 44)}<span>目标</span></h1>`;
+export function goalSections(g, v) {
+  let html = "";
   const goals = (v && v.goals) || { agent: [], member: [] };
   const agent = goals.agent || [];
   const member = goals.member || [];
   if (!agent.length && !member.length) {
-    return html + emptyState("bullseye", "还没有目标", "在群里说「提醒我……」或「帮我们盯着……」试试");
+    return "";
   }
   let i = 0;
   if (agent.length) {
-    html += `<h2 class="h-sub">我在推进 <small>${agent.length} 个</small></h2>`;
+    html += `<h2 class="h-sub h-fish">${agentFish("goal", 28)}<span>我在推进 <small>${agent.length} 个</small></span></h2>`;
     html += agent
       .map((goal) => {
         const crit = goal.criteria || [];

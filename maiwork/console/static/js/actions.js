@@ -7,12 +7,14 @@ import { findIdea, ideaAsk, ideaItems, ideaPicked } from "./pages/ideas.js";
 import { refreshDetail } from "./detail.js";
 import { checkedProviders, headerRow, loadExt, pickedTool, readHeaders } from "./settings/ext.js";
 import { actNews } from "./actions_news.js";
+import { actCtx } from "./pages/groupctx.js";
+import { actControls } from "./pages/groupcontrols.js";
 import { actAgents } from "./settings/agents.js";
 import { actModels } from "./settings/models.js";
 import { chipAdd, rowsAdd } from "./settings/rules.js";
 import { loadUsage, loadUsageDay } from "./settings/usage.js";
-import { avatarSaved, loadIdentity } from "./settings/identity.js";
-import { loadLogs } from "./settings/logs.js";
+import { avatarSaved } from "./settings/identity.js";
+import { loadLogs, loadLogSummary } from "./settings/logs.js";
 import { closeSheet, openDetail, openSheet, repaintSheet } from "./sheet.js";
 import { chatPoll, enterChat, loadChat, loadChats, paintChat } from "./chat.js";
 import { renderSide, renderView } from "./render.js";
@@ -34,6 +36,8 @@ function findEntry(id) {
 export async function act(el, e) {
   const a = el.dataset.act;
   if (await actNews(a, el)) return;
+  if (await actCtx(a, el)) return;
+  if (await actControls(a, el)) return;
   if (await actAgents(a, el)) return;
   if (await actModels(a, el)) return;
   const g = grp();
@@ -155,6 +159,11 @@ export async function act(el, e) {
       if (first) first.focus({ preventScroll: false });
       break;
     }
+    case "log-expand":
+      state.logs.expanded = !state.logs.expanded;
+      if (state.logs.expanded) await loadLogs();
+      repaintSheet();
+      break;
     case "log-tab":
       state.logs.tab = el.dataset.t;
       state.logs.open = {};
@@ -162,8 +171,9 @@ export async function act(el, e) {
       repaintSheet();
       break;
     case "log-refresh":
-      state.logs.open = {};
-      await loadLogs();
+      if (state.logs) state.logs.open = {};
+      if (state.logs && state.logs.expanded) await loadLogs();
+      else await loadLogSummary();
       repaintSheet();
       break;
     case "log-more":
@@ -279,22 +289,6 @@ export async function act(el, e) {
         await loadSettings();
         repaintSheet();
       } catch (err) {
-        toast(err.message, true);
-      }
-      break;
-    }
-    case "soul-sync": {
-      if (!confirm("用 MaiBot 现在的人格重新生成 SOUL.md？现在这份会先存一个备份。")) break;
-      el.disabled = true;
-      try {
-        const r = await api("POST", "/api/identity/soul/sync", {});
-        await loadIdentity();
-        repaintSheet();
-        toast(r && r.persona_missing
-          ? "没读到 MaiBot 的人格设置，SOUL.md 没改"
-          : (r && r.preview_changed === false ? "和 MaiBot 现在的人格一样，没变" : "同步好了"));
-      } catch (err) {
-        el.disabled = false;
         toast(err.message, true);
       }
       break;
@@ -498,7 +492,7 @@ export async function act(el, e) {
       const gid = el.dataset.g;
       try {
         const r = state.ga[gid] || (state.ga[gid] = await api("GET", `/api/groups/${encodeURIComponent(gid)}/group-admin`));
-        state.editing = { kind: "ga", gid, name: el.dataset.name, password_set: !!r.password_set, accounts: r.accounts || [] };
+        state.editing = { kind: "ga", gid, name: el.dataset.name, password_set: !!r.password_set };
         openSheet("edit");
       } catch (err) {
         toast(err.message, true);
@@ -577,7 +571,7 @@ export async function act(el, e) {
         renderView();
         renderSide();
         refreshDetail();
-        toast(op === "do" ? "已开工，排进任务了" : op === "want" ? "已经告诉管理员了" : "收起了，以后不再提");
+        toast(op === "do" ? "已开工，排进任务了" : "收起了，以后不再提");
       } catch (err) {
         el.disabled = false;
         toast(err.message, true);
@@ -693,11 +687,6 @@ export async function act(el, e) {
       }
       break;
     }
-    case "pref-edit":
-      state.editing = { kind: "pref", text: (gview() || {}).feeds_pref || "" };
-      openSheet("edit");
-      setTimeout(() => $("ed-text") && $("ed-text").focus(), 350);
-      break;
     case "news-tab":
       state.newsTab = el.dataset.t;
       ui.flash = true;
@@ -710,10 +699,13 @@ export async function act(el, e) {
       break;
     case "block-domain":
     case "unblock-domain": {
+      // 屏蔽名单按群（docs/18 第一步）：资讯页按当前群，设置页的行自带群号
       const blocked = a === "block-domain";
-      if (blocked && !confirm(`以后不再从 ${el.dataset.domain} 找资讯？可以在设置里解除。`)) break;
+      const bg = el.dataset.g || state.g;
+      if (!bg) break;
+      if (blocked && !confirm(`这个群以后不再从 ${el.dataset.domain} 找资讯？可以在设置里解除。`)) break;
       try {
-        await api("POST", "/api/feeds/domains", { domain: el.dataset.domain, blocked });
+        await api("POST", `/api/groups/${encodeURIComponent(bg)}/feeds/domains`, { domain: el.dataset.domain, blocked });
         if (state.settings) await loadSettings();
         repaintSheet();
         toast(blocked ? `屏蔽了 ${el.dataset.domain}` : `解除了 ${el.dataset.domain}`);

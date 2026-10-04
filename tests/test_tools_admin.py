@@ -50,6 +50,21 @@ class _Svc:
         self._settings, _ = load_settings(self._raw)
         self.data_dir = tmp_path / "data"
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        # 临时插件目录 + 真 config.toml：set_rules 工具 2026-10 起直写文件
+        # （和网页「全部配置」一条路径），不能让测试动仓库里真那份。
+        import tomlkit as _tk
+
+        self.plug_dir = tmp_path / "plug"
+        self.plug_dir.mkdir(parents=True, exist_ok=True)
+        doc = _tk.document()
+        for section, values in self._raw.items():
+            if not isinstance(values, dict):
+                continue
+            tab = _tk.table()
+            for k, v in values.items():
+                tab[k] = v
+            doc[section] = tab
+        (self.plug_dir / "config.toml").write_text(_tk.dumps(doc), encoding="utf-8")
         self.store = Store(self.data_dir / "maiwork.db")
         self.store.migrate()
         self.models = Models(self.store, self.get_settings)
@@ -66,6 +81,15 @@ class _Svc:
     def base_settings(self):
         return self._settings
 
+    def config_file_ops(self):
+        return self.plug_dir, self.data_dir
+
+    async def apply_config_text(self, text: str) -> None:
+        import tomllib as _tl
+
+        self._raw = dict(_tl.loads(text))
+        self._settings, _ = load_settings(self._raw)
+
     def spawn_run_task(self, tid: str) -> None:
         self.spawns.append(str(tid))
 
@@ -75,6 +99,17 @@ class _Svc:
 
 def _ctx(gid: str = G1, role: str = "admin") -> ToolContext:
     return ToolContext(group_id=gid, actor="主模型（管理员对话）", role=role)
+
+
+def _config_raw(svc: "_Svc") -> dict:
+    """测试的临时插件 config.toml（set_rules 2026-10 起直写这里，不落 kv）。"""
+    import tomllib
+
+    return tomllib.loads((svc.plug_dir / "config.toml").read_text(encoding="utf-8"))
+
+
+def _config_field(svc: "_Svc", section: str, field: str, default=None):
+    return _config_raw(svc).get(section, {}).get(field, default)
 
 
 def _pending_rows(store: Store) -> list[dict]:
@@ -142,7 +177,6 @@ class TestRolesAndGuards:
             ("group_overview", {"group_id": "99999"}),
             ("read_chat", {"group_id": "99999"}),
             ("profile_edit", {"group_id": "99999", "action": "add", "category": "recent", "text": "x"}),
-            ("set_feeds_pref", {"group_id": "99999", "text": "x"}),
             ("send_group_message", {"group_id": "99999", "text": "hi"}),
             ("create_task", {"group_id": "99999", "title": "t", "request": "r"}),
         ):
@@ -233,9 +267,14 @@ class TestReadTools:
 
     @pytest.mark.asyncio
     async def test_get_rules_and_identity(self, svc: _Svc) -> None:
+        """0.8.0：get_rules 只列仍归全局的项，每群那几项给「到群页改」的说明。"""
         r = await svc.tools.call("get_rules", {}, _ctx())
         assert r.ok
-        assert "push_per_day" in r.output
+        assert "topics.min_gap_hours=3" in r.output     # 仍归全局的照列
+        assert "push_per_day" not in r.output           # 归每群管的不再当全局值列出来
+        assert "per_day" not in r.output
+        assert "approval.admins" not in r.output
+        assert "每个群自己的页面" in r.output
         r2 = await svc.tools.call("get_identity", {}, _ctx())
         assert r2.ok  # identity 没建 → 中文兜底，不炸
 
@@ -253,11 +292,6 @@ class TestWriteTools:
         svc.profiles = Profiles(svc.store, FakeHost(), svc.models, svc.get_settings)
 
     @pytest.mark.asyncio
-    async def test_set_feeds_pref(self, svc: _Svc) -> None:
-        r = await svc.tools.call("set_feeds_pref", {"group_id": G1, "text": "多看本地生活"}, _ctx())
-        assert r.ok
-        assert svc.store.kv_get(f"feeds.pref.{G1}") == "多看本地生活"
-
     @pytest.mark.asyncio
     async def test_profile_edit_add_and_lock(self, svc: _Svc) -> None:
         self._wire_profiles(svc)
@@ -278,38 +312,43 @@ class TestWriteTools:
 
     @pytest.mark.asyncio
     async def test_block_domain(self, svc: _Svc) -> None:
+        from CharTyr_MaiWork.maiwork import feeds as _feeds
+
         r = await svc.tools.call("block_domain", {"domain": "Bad-Site.COM", "blocked": True}, _ctx())
         assert r.ok, r.error
-        assert "bad-site.com" in (svc.store.kv_get("feeds.blocked_domains") or [])
+        assert "bad-site.com" in _feeds.blocked_domains(svc.store, G1)
         r2 = await svc.tools.call("block_domain", {"domain": "bad-site.com", "blocked": False}, _ctx())
         assert r2.ok
-        assert "bad-site.com" not in (svc.store.kv_get("feeds.blocked_domains") or [])
+        assert "bad-site.com" not in _feeds.blocked_domains(svc.store, G1)
+        # 另一个群不受影响
+        assert _feeds.blocked_domains(svc.store, G2) == []
 
     @pytest.mark.asyncio
     async def test_set_rules_apply(self, svc: _Svc) -> None:
-        # 收紧类的改动不用确认（默认 3 → 2），直接生效
-        r = await svc.tools.call("set_rules", {"patch": {"delivery": {"push_per_day": 2}}}, _ctx())
+        # 仍归全局、不涉及放宽的字段直接生效（默认 12 → 20）
+        r = await svc.tools.call("set_rules", {"patch": {"topics": {"candidate_ttl_hours": 20}}}, _ctx())
         assert r.ok, r.error
-        assert svc.get_settings().delivery.push_per_day == 2
+        assert svc.get_settings().topics.candidate_ttl_hours == 20
         # 回执用中文名（管理员点开工具卡片能看到），不露「节.字段」
-        assert "每天推送上限 → 2" in r.output
-        assert "delivery." not in r.output and "push_per_day" not in r.output
+        assert "话题候选有效期（小时） → 20" in r.output
+        assert "topics." not in r.output and "candidate_ttl_hours" not in r.output
 
     @pytest.mark.asyncio
     async def test_set_rules_bad_value(self, svc: _Svc) -> None:
-        r = await svc.tools.call("set_rules", {"patch": {"delivery": {"push_per_day": 99}}}, _ctx())
+        r = await svc.tools.call("set_rules", {"patch": {"topics": {"candidate_ttl_hours": 999}}}, _ctx())
         assert not r.ok
         assert r.error
 
     @pytest.mark.asyncio
-    async def test_set_rules_needs_confirm_when_loosening_approval(self, svc: _Svc) -> None:
-        r = await svc.tools.call("set_rules", {"patch": {"approval": {"required": False}}}, _ctx())
-        assert r.ok
+    async def test_set_rules_needs_confirm_when_loosening_gap(self, svc: _Svc) -> None:
+        """仍归全局的放宽项（开话题最小间隔缩短）要先写小票，同意前不写文件。"""
+        r = await svc.tools.call("set_rules", {"patch": {"topics": {"min_gap_hours": 2}}}, _ctx())
+        assert r.ok, r.error
         assert "已请求管理员确认" in r.output
         rows = _pending_rows(svc.store)
         assert len(rows) == 1
         assert rows[0]["tool"] == "set_rules"
-        assert rules.read_override(svc.store) == {}  # 没落库
+        assert _config_field(svc, "topics", "min_gap_hours", 3) == 3  # 没同意前不写文件
 
     @pytest.mark.asyncio
     async def test_create_task_needs_confirm_then_creates(self, svc: _Svc) -> None:
@@ -456,10 +495,10 @@ class TestConfirmGate:
     async def test_model_cannot_forge_approved_arg(self, svc: _Svc) -> None:
         """模型参数不可信：伪造 _approved=true 绝不能跳过管理员确认。"""
         r = await svc.tools.call(
-            "set_rules", {"patch": {"approval": {"required": False}}, "_approved": True}, _ctx()
+            "set_rules", {"patch": {"topics": {"min_gap_hours": 1}}, "_approved": True}, _ctx()
         )
         assert r.ok and "已请求管理员确认" in r.output
-        assert rules.read_override(svc.store) == {}
+        assert _config_field(svc, "topics", "min_gap_hours", 3) == 3   # 规则没改
         assert len(_pending_rows(svc.store)) == 1
 
     @pytest.mark.asyncio
@@ -569,68 +608,69 @@ class TestH1SetRulesLoosen:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "patch,frag",
+        "patch",
         (
-            ({"approval": {"admins": ["qq:10001", "qq:666666"]}}, "bot 管理员"),
-            ({"approval": {"exempt_groups": [f"qq:{G1}"]}}, "免批的群"),
-            ({"approval": {"exempt_users": ["qq:666666"]}}, "免批的人"),
+            {"approval": {"admins": ["qq:10001", "qq:666666"]}},
+            {"approval": {"exempt_groups": [f"qq:{G1}"]}},
+            {"approval": {"exempt_users": ["qq:666666"]}},
+            {"approval": {"required": False}},
+            {"topics": {"enabled": True}},
+            {"topics": {"per_day": 3}},
+            {"topics": {"speaker": "maiwork"}},
+            {"delivery": {"push_per_day": 4}},
+            {"delivery": {"quiet_hours": "23:30-07:30"}},
         ),
     )
-    async def test_approval_lists_need_confirm(self, svc: _Svc, patch: dict, frag: str) -> None:
+    async def test_retired_global_keys_rejected_with_group_hint(self, svc: _Svc, patch: dict) -> None:
+        """退役的全局键（归每群管）从 set_rules 一律拒，并说清去群页——绝不静默假保存。"""
+        before = _config_raw(svc)
         r = await svc.tools.call("set_rules", {"patch": patch}, _ctx())
-        assert r.ok, r.error
-        assert "已请求管理员确认" in r.output
-        rows = _pending_rows(svc.store)
-        assert len(rows) == 1 and rows[0]["tool"] == "set_rules"
-        assert frag in rows[0]["summary"]
-        assert "approval." not in rows[0]["summary"]  # 小票全中文，不露英文键名
-        assert rules.read_override(svc.store) == {}  # 没同意前不落库
+        assert not r.ok, patch
+        assert "每个群" in r.error and "群" in r.error, (patch, r.error)
+        assert _pending_rows(svc.store) == []      # 拒了就不该再记一张执行不了的小票
+        assert _config_raw(svc) == before
 
     @pytest.mark.asyncio
-    async def test_delivery_topics_loosen_need_confirm(self, svc: _Svc) -> None:
-        # 推送上限「变大」才要确认（默认 3；>5 无条件要，<=5 但比当前大也要）
+    async def test_gap_loosen_or_tighten_need_confirm(self, svc: _Svc) -> None:
+        # 开话题最小间隔：变小（更勤 = 放宽）要小票；变大不用
         cases = [
-            ({"delivery": {"push_per_day": 4}}, True),
-            ({"delivery": {"quiet_hours": "23:30-07:30"}}, True),  # 睡觉变窄
-            ({"delivery": {"quiet_hours": "22:00-08:00"}}, False),  # 变长不算放宽
-            ({"topics": {"per_day": 3}}, True),
             ({"topics": {"min_gap_hours": 2}}, True),
-            ({"topics": {"enabled": True}}, False),  # 和默认值一样，不算改
+            ({"topics": {"min_gap_hours": 6}}, False),
+            ({"topics": {"candidate_ttl_hours": 20}}, False),
         ]
         for patch, want_ticket in cases:
             with svc.store.tx() as conn:
                 conn.execute("DELETE FROM admin_chat_pending")
-                svc.store.kv_set(conn, "rules.override", {})  # 每个用例从默认规则起算
             r = await svc.tools.call("set_rules", {"patch": patch}, _ctx())
             assert r.ok, (patch, r.error)
             rows = _pending_rows(svc.store)
             if want_ticket:
                 assert len(rows) == 1, patch
-                assert rules.read_override(svc.store) == {}
+                # 没同意前不写文件：循环里这是第一条 patch，只有它可能被写
+                assert _config_field(svc, "delivery", "push_per_day", 3) == 3
             else:
                 assert rows == [], patch
 
     @pytest.mark.asyncio
     async def test_approved_ticket_applies(self, svc: _Svc) -> None:
-        patch = {"approval": {"admins": ["qq:10001", "qq:666666"]}}
+        patch = {"topics": {"min_gap_hours": 2}}
         r = await svc.tools.call("set_rules", {"patch": patch}, _ctx())
         assert r.ok
         pid = int(_pending_rows(svc.store)[0]["id"])
-        assert svc.approvals.is_admin("666666") is False
+        assert _config_field(svc, "topics", "min_gap_hours", 3) == 3
         out = await svc.admin_pending.execute(pid, True)
         assert out.ok, out.error
-        assert rules.read_override(svc.store).get("approval", {}).get("admins") == ["qq:10001", "qq:666666"]
-        assert svc.approvals.is_admin("666666") is True
+        assert _config_field(svc, "topics", "min_gap_hours") == 2
 
     @pytest.mark.asyncio
     async def test_rejected_ticket_leaves_rules_untouched(self, svc: _Svc) -> None:
-        patch = {"approval": {"exempt_users": ["qq:666666"]}}
+        patch = {"topics": {"min_gap_hours": 2}}
         await svc.tools.call("set_rules", {"patch": patch}, _ctx())
         pid = int(_pending_rows(svc.store)[0]["id"])
         out = await svc.admin_pending.execute(pid, False)
         assert out.ok
-        assert rules.read_override(svc.store) == {}
-        assert "666666" not in svc.get_settings().approval.exempt_users
+        assert _config_field(svc, "topics", "min_gap_hours", "没写过") == "没写过"
+        assert svc.get_settings().topics.min_gap_hours == 3
 
 
 class TestAutoReviewRulesConfirm:
@@ -651,7 +691,7 @@ class TestAutoReviewRulesConfirm:
         r = await svc.tools.call("set_rules", {"patch": {"approval": {"auto_review": False}}}, _ctx())
         assert r.ok, r.error
         assert _pending_rows(svc.store) == []
-        assert rules.read_override(svc.store)["approval"]["auto_review"] is False
+        assert _config_field(svc, "approval", "auto_review") is False
 
     @pytest.mark.asyncio
     async def test_turn_on_auto_review_needs_ticket_with_chinese_label(self, svc: _Svc) -> None:
@@ -664,7 +704,7 @@ class TestAutoReviewRulesConfirm:
         summary = rows[0]["summary"]
         assert "自动审核轻活" in summary
         assert "approval.auto_review" not in summary
-        assert rules.read_override(svc.store) == {}  # 没同意前不落库
+        assert _config_field(svc, "approval", "auto_review", "没写过") == "没写过"
 
     @pytest.mark.asyncio
     async def test_raise_auto_review_daily_needs_ticket_with_chinese_label(self, svc: _Svc) -> None:
@@ -682,7 +722,7 @@ class TestAutoReviewRulesConfirm:
         r = await svc.tools.call("set_rules", {"patch": {"approval": {"auto_review_daily": 2}}}, _ctx())
         assert r.ok, r.error
         assert _pending_rows(svc.store) == []
-        assert rules.read_override(svc.store)["approval"]["auto_review_daily"] == 2
+        assert _config_field(svc, "approval", "auto_review_daily") == 2
 
 
 class TestM1SummaryListsAllFields:
@@ -694,36 +734,33 @@ class TestM1SummaryListsAllFields:
 
     @pytest.mark.asyncio
     async def test_mixed_patch_summary_shows_every_field(self, svc: _Svc) -> None:
-        patch = {"delivery": {"push_per_day": 6}, "approval": {"admins": ["qq:10001", "qq:666666"]}}
+        patch = {"topics": {"min_gap_hours": 2}, "approval": {"auto_review_daily": 8}}
         r = await svc.tools.call("set_rules", {"patch": patch}, _ctx())
-        assert r.ok
+        assert r.ok, r.error
         rows = _pending_rows(svc.store)
         assert len(rows) == 1
         summary = rows[0]["summary"]
-        assert "bot 管理员" in summary
-        assert "qq:666666" in summary
-        assert "每天推送上限 → 6" in summary
-        assert "approval." not in summary and "delivery." not in summary
+        assert "两次开话题最小间隔（小时） → 2" in summary
+        assert "每群每天最多自动批 → 8" in summary
+        assert "topics." not in summary and "approval." not in summary
 
     @pytest.mark.asyncio
     async def test_long_summary_truncated_with_count(self, svc: _Svc) -> None:
+        # 都是仍归全局的字段（够多才会超 200 字）；min_gap_hours 变小负责触发小票
         patch = {
-            "delivery": {"push_per_day": 6, "quiet_hours": "23:30-07:30"},
-            "topics": {"per_day": 9, "min_gap_hours": 1},
-            "approval": {
-                "required": False,
-                "remind": False,
-                # 中文名比英文键名短，名单放长一点才会超 200 字、走截断
-                "admins": ["qq:10001", "qq:222222", "qq:333333", "qq:777777", "qq:888888"],
-                "exempt_groups": [f"qq:{G1}", f"qq:{G2}"],
-                "exempt_users": ["qq:444444", "qq:555555", "qq:999999", "qq:121212"],
-            },
+            "topics": {"min_gap_hours": 2, "candidate_ttl_hours": 20},
+            "approval": {"auto_review_daily": 8, "remind": True, "auto_review": True},
+            "feeds": {"max_items": 12, "news_jitter_minutes": 20, "collect_minutes": 5,
+                      "lookback_days": 4, "viz_per_day": 3},
+            "tasks": {"token_limit": 500000, "run_seconds": 3600},
+            "jev": {"timeout_ms": 900},
+            "environments": {"max_parallel": 4, "command_timeout_s": 300, "runtime_max_sec": 7200},
         }
         r = await svc.tools.call("set_rules", {"patch": patch}, _ctx())
         assert r.ok, r.error
         summary = _pending_rows(svc.store)[0]["summary"]
         assert len(summary) <= 200
-        assert "共改 9 项" in summary
+        assert "共改 16 项" in summary
 
 
 class TestM2ApprovalFingerprint:

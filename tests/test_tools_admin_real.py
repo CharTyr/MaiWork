@@ -39,7 +39,7 @@ ALL_ADMIN_TOOLS = {
     "list_ideas", "list_tasks", "task_detail", "list_goals", "list_requests",
     "read_chat", "read_logs", "get_rules", "get_identity", "list_extensions",
     # 写类
-    "profile_edit", "profile_bulk_delete", "focus_edit", "set_feeds_pref",
+    "profile_edit", "profile_bulk_delete", "focus_edit",
     "rss_add", "rss_remove", "block_domain", "set_rules", "identity_edit", "remember",
     # 危险 / 对外
     "send_group_message", "group_notice_send", "group_file_manage", "group_album_upload",
@@ -180,7 +180,8 @@ def _seed(app: MaiWorkApp) -> None:
         via="群里 @ · Jev 判断是「请求准备东西」", requester_id="10003", requester_name="Kiriko",
     )
     app.identity.remember_sync(scope="global", text="测试要记住的事：回读验证", reason="测试")
-    app.identity.group_write(G1, "这个群最近爱在周五晚上分享折腾成果。")
+    # 「每群三份」收尾 2026-10-03：每群内容进 group_rules（不是 identity.group_write）
+    app.agents.group_rules_set(G1, "这个群最近爱在周五晚上分享折腾成果。", updated_by="admin")
 
     app._seeded = {"tid": tid, "tid_running": t2, "tid_queued": t3, "goal_id": gid_agent}
 
@@ -197,7 +198,23 @@ def app(tmp_path: Path):
 
     _CHAT_CTX.set((0, 0))
     _APPROVED_CTX.set(None)
-    a = MaiWorkApp(FakeCtx({}), _raw(tmp_path / "data", _free_port()), plugin_dir=Path(__file__).resolve().parents[1])
+    raw = _raw(tmp_path / "data", _free_port())
+    # 2026-10：set_rules 之类的工具直写 config.toml——给临时插件目录一份可写文件，
+    # 绝不能碰仓库里那份（没有就不能测写路径鉴权流）。
+    import tomlkit as _tk
+
+    plug_dir = tmp_path / "plug"
+    plug_dir.mkdir(parents=True, exist_ok=True)
+    doc = _tk.document()
+    for section, values in raw.items():
+        if not isinstance(values, dict):
+            continue
+        tab = _tk.table()
+        for k, v in values.items():
+            tab[k] = v
+        doc[section] = tab
+    (plug_dir / "config.toml").write_text(_tk.dumps(doc), encoding="utf-8")
+    a = MaiWorkApp(FakeCtx({}), raw, plugin_dir=plug_dir)
     # app 内部把 asyncio.get_event_loop() 记在对象上，start/stop 必须在同一条
     # 事件循环上跑；用 set_event_loop 让它落到这条专属循环（stop 时内部也靠它）。
     loop = asyncio.new_event_loop()
@@ -347,7 +364,13 @@ class TestReadTools:
     @pytest.mark.asyncio
     async def test_get_rules(self, app) -> None:
         r = await _call(app, "get_rules", {})
-        assert r.ok and "delivery.push_per_day" in r.output
+        assert r.ok, r.error
+        # 0.8.0：归每群自己管的几项（批准名单 / 推送 / 开话题开关）不再当全局规则列出，
+        # 要明确说去群页面管——不静默无效。
+        assert "delivery.push_per_day" not in r.output
+        assert "approval.admins" not in r.output
+        assert "群" in r.output and "种子" in r.output
+        assert "approval.auto_review" in r.output  # 还归全局的照样在
 
     @pytest.mark.asyncio
     async def test_get_identity(self, app) -> None:
@@ -391,12 +414,6 @@ class TestWriteTools:
         assert rows, "10005 要被设成关注"
 
     @pytest.mark.asyncio
-    async def test_set_feeds_pref(self, app) -> None:
-        r = await _call(app, "set_feeds_pref", {"group_id": G1, "text": "只要硬件相关"})
-        assert r.ok and "只要硬件相关" in r.output
-        assert app.feeds.pref(G1) == "只要硬件相关"
-
-    @pytest.mark.asyncio
     async def test_rss_add_then_remove_confirmed(self, app) -> None:
         r = await _call(app, "rss_add", {"group_id": G1, "url": "https://example.com/feed.xml", "title": "测试源"})
         assert r.ok, r.error
@@ -413,28 +430,53 @@ class TestWriteTools:
     @pytest.mark.asyncio
     async def test_block_domain(self, app) -> None:
         r = await _call(app, "block_domain", {"domain": "spam.example.com", "blocked": True})
-        assert r.ok and "已屏蔽 spam.example.com" in r.output
+        assert r.ok and "屏蔽 spam.example.com" in r.output
         r2 = await _call(app, "block_domain", {"domain": "spam.example.com", "blocked": False})
         assert r2.ok and "取消屏蔽" in r2.output
 
     @pytest.mark.asyncio
     async def test_set_rules_safe_and_loosen(self, app) -> None:
-        # 收紧：不确认直接生效
-        r = await _call(app, "set_rules", {"patch": {"delivery": {"push_per_day": 2}}})
+        # 收紧（间隔拉长）：不确认直接生效
+        r = await _call(app, "set_rules", {"patch": {"topics": {"min_gap_hours": 6}}})
         assert r.ok, r.error
         assert "已请求管理员确认" not in r.output
-        # 放宽：要确认，同意后才生效
-        r2, ticket = await _call_confirmed(app, "set_rules", {"patch": {"delivery": {"push_per_day": 9}}})
+        assert app.get_settings().topics.min_gap_hours == 6
+        # 放宽（间隔缩短 = 开话题更勤）：要确认，同意后才生效
+        r2, ticket = await _call_confirmed(app, "set_rules", {"patch": {"topics": {"min_gap_hours": 1}}})
         assert r2.ok, r2.error
-        assert "每天推送上限 → 9" in ticket["summary"] and "push_per_day" not in ticket["summary"]
-        assert app.get_settings().delivery.push_per_day == 9
+        assert "开话题最小间隔" in ticket["summary"] and "min_gap_hours" not in ticket["summary"]
+        assert app.get_settings().topics.min_gap_hours == 1
 
     @pytest.mark.asyncio
-    async def test_identity_edit_group(self, app) -> None:
+    async def test_set_rules_group_managed_keys_refused(self, app) -> None:
+        """0.8.0：批准名单 / 推送上限 / 开话题开关归每群自己管，管理员工具也不能绕过、
+        更不能悄悄写一份没人听的全局值——明确回「到群页管理」。"""
+        before_settings = app.get_settings()
+        before_admins = before_settings.approval.admins
+        for patch in (
+            {"approval": {"admins": ["qq:10001"]}},
+            {"approval": {"required": False}},
+            {"approval": {"exempt_users": ["qq:20001"]}},
+            {"delivery": {"push_per_day": 9}},
+            {"topics": {"enabled": False}},
+        ):
+            r = await _call(app, "set_rules", {"patch": patch})
+            assert not r.ok, patch
+            assert "群" in (r.error or ""), patch
+        # 全局设置和每群那份都没被这些调用动过
+        assert app.get_settings().approval.admins == before_admins
+        from CharTyr_MaiWork.maiwork import group_approval
+
+        gv = group_approval.GroupApprovals(app.store, get_settings=app.get_settings)
+        assert "qq:10001" not in gv.get(G1).approvers
+
+    @pytest.mark.asyncio
+    async def test_identity_edit_group_kind_gone(self, app) -> None:
+        """「每群三份」收尾：identity_edit 不再接受 kind=\"group\"（每群内容走
+        /api/groups/{gid}/rules 或 set_rules；identity 只剩 soul/agents/memory）。"""
         r = await _call(app, "identity_edit", {"kind": "group", "group_id": G1, "text": "新的群工作记忆"})
-        assert r.ok, r.error
-        got = app.identity.group_read(G1)
-        assert "新的群工作记忆" in str(got or "")
+        assert not r.ok
+        assert "soul" in (r.error or "") and ("agents" in (r.error or ""))
 
     @pytest.mark.asyncio
     async def test_remember(self, app) -> None:

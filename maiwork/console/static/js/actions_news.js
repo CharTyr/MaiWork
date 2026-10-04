@@ -1,4 +1,4 @@
-// MaiWork 网页 · 点击动作（资讯找法相关）：预设搜索服务、口味小结、优质来源、漏斗展开。
+// MaiWork 网页 · 点击动作（资讯找法相关）：预设搜索服务、优质来源、漏斗展开。
 // 从 actions.js 拆出来（单文件 900 行上限）；act() 先问这里，处理了返回 true。
 import { $, state } from "./state.js";
 import { reveal, toast } from "./util.js";
@@ -55,11 +55,6 @@ export async function actNews(a, el) {
       }
       return true;
     }
-    case "taste-edit":
-      state.editing = { kind: "taste", text: ((state.taste || {})[state.g] || {}).text || "" };
-      openSheet("edit");
-      setTimeout(() => $("ed-text") && $("ed-text").focus(), 350);
-      return true;
     case "trusted-toggle": {
       const gid = el.dataset.g;
       el.disabled = true;

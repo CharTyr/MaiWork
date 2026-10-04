@@ -1,9 +1,10 @@
-// MaiWork 网页 · 「任务」页。
+// MaiWork 网页 · 「在做的事」：待批准、任务、持续目标与提醒。
 import { DOT, FILTERS, STATUS, gadmin, state } from "../state.js";
 import { SVG, dur, esc, ico, when } from "../util.js";
 import { agentFish } from "../api.js";
 import { emptyState } from "./news.js";
 import { findIdea, ideaItems } from "./ideas.js";
+import { goalSections } from "./goals.js";
 
 export function taskRow(t, i) {
   const sel = state.detail && state.detail.id === t.id ? " selected" : "";
@@ -30,13 +31,14 @@ function pendingItems(p) {
 }
 
 export function viewTasks(g, v) {
-  let html = `<h1 class="h-page h-fish">${agentFish("task", 44)}<span>任务</span></h1>`;
+  let html = `<h1 class="h-page h-fish">${agentFish("task", 44)}<span>在做的事</span></h1>`;
   const tasks = (v && v.tasks) || { pending: [], list: [] };
   const pending = tasks.pending || [];
   const list = tasks.list || [];
   const botName = (state.me && state.me.bot && state.me.bot.name) || "MaiBot";
-  if (!pending.length && !list.length) {
-    return html + emptyState("package", "还没有任务", `在群里 @${botName} 请它做点什么试试`);
+  const goalsHtml = goalSections(g, v);
+  if (!pending.length && !list.length && !goalsHtml) {
+    return html + emptyState("package", "还没有在做的事", `在群里 @${botName} 派活，或说「提醒我……」试试`);
   }
   let i = 0;
   if (pending.length) {
@@ -72,7 +74,7 @@ export function viewTasks(g, v) {
     }).join("")}</div>`;
     const f = FILTERS.find((x) => x.id === state.filter) || FILTERS[0];
     const rows = list.filter(f.match);
-    html += rows.length ? `<div>${rows.map((t) => taskRow(t, i++)).join("")}</div>` : `<p class="h-meta" style="margin-top:18px">空的</p>`;
+    html += rows.length ? `<div>${rows.map((t) => taskRow(t, i++)).join("")}</div>` : `<p class="h-meta" style="margin-top:18px">这个状态下没有任务，换个筛选看看。</p>`;
   }
-  return html;
+  return html + goalsHtml;
 }

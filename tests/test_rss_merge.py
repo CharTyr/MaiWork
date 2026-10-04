@@ -262,7 +262,9 @@ class TestMergeRssCandidates:
             _rss_cand("https://b.example.com/feed", "从别的源又给一遍", "https://a.example.com/new", NOW - 400),
         ]
 
-        merged = feeds._merge_rss_candidates(G1, settings, candidates, rss_items)
+        # 候选和入库时间都围着 NOW 造；判重窗口也必须用同一测试时钟。
+        with _TimePatch():
+            merged = feeds._merge_rss_candidates(G1, settings, candidates, rss_items)
 
         assert merged == 1, "只有一条真正新的能并进来"
         assert len(candidates) == 2

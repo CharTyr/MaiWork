@@ -55,6 +55,9 @@ def _make_settings(gids: tuple[str, ...] = (G1, G2)):
             "plugin": {"enabled": True},
             "groups": {"serve": [{"group": f"qq:{g}"} for g in gids]},
             "console": {"password": ADMIN_PW},
+            # 0.8.0：批准人名单归一到每群一份（group_approval）；这里要测「名单接口本身」，
+            # 所以全局种子留空，免得把默认管理员种进每个群。
+            "approval": {"admins": []},
         }
     )
     assert not problems, problems
@@ -493,19 +496,6 @@ class TestGroupScopedRoutes:
         r2 = await env.client.post(f"/api/groups/{G2}/token", json={})
         assert r2.status == 403, r2.status
 
-    @pytest.mark.asyncio
-    async def test_feeds_pref_own_ok_other_403(self, env: SimpleEnv) -> None:
-        env.set_group_password(G1, G1_PW)
-        await env.login(G1_PW)
-        r = await env.client.put(f"/api/groups/{G1}/feeds-pref", json={"text": "想看开源"})
-        assert r.status == 200, r.status
-        assert (await r.json())["text"] == "想看开源"
-        r2 = await env.client.get(f"/api/groups/{G1}/feeds-pref")
-        assert r2.status == 200
-        r3 = await env.client.put(f"/api/groups/{G2}/feeds-pref", json={"text": "别的群"})
-        assert r3.status == 403, r3.status
-        r4 = await env.client.get(f"/api/groups/{G2}/feeds-pref")
-        assert r4.status == 403, r4.status
 
     @pytest.mark.asyncio
     async def test_card_push_own_ok_other_403(self, env: SimpleEnv) -> None:
@@ -549,13 +539,20 @@ class TestGroupScopedRoutes:
         assert r3.status == 403, r3.status
 
     @pytest.mark.asyncio
-    async def test_identity_group_memory_own_ok_other_403(self, env: SimpleEnv) -> None:
+    async def test_identity_group_memory_routes_gone_404(self, env: SimpleEnv) -> None:
+        """「每群三份」收尾：/api/identity/group-memory/{gid}（GET / PUT）整条退役——
+        每群内容换成 /api/groups/{gid}/rules + /skills。老端点不再鉴权、也读不到，一律 404。"""
         env.set_group_password(G1, G1_PW)
         await env.login(G1_PW)
-        r = await env.client.put(f"/api/identity/group-memory/{G1}", json={"text": "这个群爱聊开源"})
-        assert r.status != 403, r.status
-        r2 = await env.client.put(f"/api/identity/group-memory/{G2}", json={"text": "别的群"})
-        assert r2.status == 403, r2.status
+        assert (await env.client.get(f"/api/identity/group-memory/{G1}")).status == 404
+        assert (await env.client.put(f"/api/identity/group-memory/{G1}", json={"text": "x"})).status == 404
+        # 群管理员的新本群接口还是能区分本群/别群
+        r = await env.client.put(f"/api/groups/{G1}/rules", json={"body": "G1 爱聊开源"})
+        assert r.status == 200
+        r2 = await env.client.get(f"/api/groups/{G1}/rules")
+        assert (await r2.json())["body"] == "G1 爱聊开源"
+        r3 = await env.client.put(f"/api/groups/{G2}/rules", json={"body": "别的群"})
+        assert r3.status == 403
 
     @pytest.mark.asyncio
     async def test_ideas_run_own_ok_other_403(self, env: SimpleEnv) -> None:
@@ -565,18 +562,6 @@ class TestGroupScopedRoutes:
         assert r.status != 403, r.status
         r2 = await env.client.post(f"/api/groups/{G2}/ideas/run", json={})
         assert r2.status == 403, r2.status
-
-    @pytest.mark.asyncio
-    async def test_identity_group_memory_read_write(self, env: SimpleEnv) -> None:
-        env.set_group_password(G1, G1_PW)
-        await env.login(G1_PW)
-        r = await env.client.put(f"/api/identity/group-memory/{G1}", json={"text": "这个群爱聊开源"})
-        assert r.status != 403, r.status
-        r2 = await env.client.get(f"/api/identity/group-memory/{G1}")
-        assert r2.status == 200, r2.status
-        assert (await r2.json())["text"] == "这个群爱聊开源"
-        r3 = await env.client.get(f"/api/identity/group-memory/{G2}")
-        assert r3.status == 403, r3.status
 
     @pytest.mark.asyncio
     async def test_news_run_own_ok_other_403(self, env: SimpleEnv) -> None:
@@ -751,7 +736,6 @@ class TestGlobalRoutesDenied:
 
     GLOBAL_GET = (
         "/api/settings",
-        "/api/settings/rules",
         "/api/settings/config",
         "/api/onboarding",
         "/api/logs/model-calls",
@@ -772,17 +756,14 @@ class TestGlobalRoutesDenied:
         ("DELETE", "/api/settings/endpoints/e1", None),
         ("PUT", "/api/settings/model-list/m1", {"endpoint": "e1", "model": "x"}),
         ("DELETE", "/api/settings/model-list/m1", None),
-        ("PUT", "/api/settings/rules", {}),
-        ("POST", "/api/settings/rules/reset", {"field": "quiet_hours"}),
         ("PUT", "/api/settings/config", {}),
         ("POST", "/api/settings/config/reset", {"field": "x"}),
         ("POST", "/api/onboarding", {"action": "next"}),
-        ("POST", "/api/feeds/domains", {"domain": "example.com", "blocked": True}),
+        ("POST", "/api/groups/" + G2 + "/feeds/domains", {"domain": "example.com", "blocked": True}),
         ("POST", "/api/extensions/mcp/test", {"url": "https://x"}),
         ("POST", "/api/extensions/mcp", {"name": "x", "url": "https://x"}),
         ("POST", "/api/extensions/skills", {"name": "x"}),
-        ("POST", "/api/identity/soul/sync", {}),
-        ("PUT", "/api/identity/soul", {"text": "x"}),
+        ("PUT", "/api/identity/memory", {"text": "x"}),
         ("POST", "/api/chat", {}),
         ("POST", "/api/settings/avatar", {}),
         ("DELETE", "/api/settings/avatar", None),
@@ -825,7 +806,8 @@ class TestGroupAdminManageApi:
         await env.login()
         r = await env.client.get(f"/api/groups/{G1}/group-admin")
         assert r.status == 200
-        assert await r.json() == {"password_set": False, "accounts": []}
+        # 0.8.0：账户名单和每群批准名单同一份 → 首次读到的是从全局 approval.admins 种进来的
+        assert await r.json() == {"password_set": False, "accounts": ["qq:10001"]}
         r2 = await env.client.put(
             f"/api/groups/{G1}/group-admin",
             json={"password": G1_PW, "accounts": [G1_ADMIN_QQ, "qq:40004"]},

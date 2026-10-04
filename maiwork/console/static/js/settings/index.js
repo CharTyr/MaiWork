@@ -6,10 +6,9 @@ import { loading } from "../pages/news.js";
 import { extPage } from "./ext.js";
 import { agentsPage } from "./agents.js";
 import { rulesPage } from "./rules.js";
-import { usagePage } from "./usage.js";
+import { usageAndLogsPage } from "./usage.js";
 import { sourcesPage } from "./sources.js";
 import { memoryPage } from "./identity.js";
-import { logsPage } from "./logs.js";
 import { fullLink, modelsPage } from "./models.js";
 import { updateSection } from "../update.js";
 
@@ -33,12 +32,11 @@ export const SET_SUBS = [
   ["models", "模型", "robot", "用哪些模型"],
   ["extensions", "扩展", "tools", "联网搜索、MCP 和 skill"],
   ["agents", "专岗", "fish", "主模型和各专岗：模型、性格、规矩"],
-  ["memory", "记忆", "books", "全局工作记忆和各群偏好"],
-  ["usage", "用量", "chart", "每天用了多少"],
+  ["memory", "记忆", "books", "全局工作记忆"],
+  ["usage", "用量与日志", "chart", "每天用了多少；调用摘要和故障明细"],
   ["sources", "资讯来源", "newspaper", "RSS、优质来源和屏蔽的"],
   ["links", "群链接", "link", "群友看到的专属链接"],
   ["rules", "全部配置", "moon", "所有设置项"],
-  ["logs", "请求日志", "memo", "出问题时看这里"],
 ];
 
 function setNav() {
@@ -52,7 +50,7 @@ export function settingsPage() {
   const sub = SET_SUBS.find((x) => x[0] === state.setSub) || SET_SUBS[0];
   const head = `<h1 class="h-page">${sub[0] === "overview" ? "设置" : esc(sub[1])}</h1>${setNav()}`;
   if (!s) return head + loading();
-  const body = { overview: settingsOverview, models: modelsPage, extensions: extPage, agents: agentsPage, usage: usagePage, sources: sourcesPage, links: linksPage, rules: rulesPage, memory: memoryPage, logs: logsPage }[sub[0]];
+  const body = { overview: settingsOverview, models: modelsPage, extensions: extPage, agents: agentsPage, usage: usageAndLogsPage, sources: sourcesPage, links: linksPage, rules: rulesPage, memory: memoryPage }[sub[0]];
   return head + `<div class="set-body">${body(s)}</div>`;
 }
 
@@ -83,9 +81,7 @@ function linksPage(s) {
 // 群管理员一行的状态文字
 function gaText(x) {
   if (!x) return "…";
-  const n = (x.accounts || []).length;
-  if (!x.password_set && !n) return "没设置";
-  return [x.password_set ? "网页密码已设置" : "没有网页密码", n ? `群里 ${n} 人能批准` : ""].filter(Boolean).join(" · ");
+  return x.password_set ? "网页密码已设置" : "还没设置网页密码";
 }
 
 export async function loadGA() {
@@ -120,7 +116,7 @@ function settingsOverview(s) {
   const u = (s.usage && s.usage.today) || {};
   const alert = (s.usage && s.usage.alert_daily_tokens) || 0;
   const used = (u.main || 0) + (u.worker || 0);
-  const r = s.rules || {};  return `
+  return `
     ${(s.problems || []).length ? `<div class="warn-box"><b>配置里有几处问题，已经先跳过：</b><br />${s.problems.map(esc).join("<br />")}</div>` : ""}
     <h2 class="h-sub" style="margin-top:20px">各个群</h2>
     ${
@@ -140,12 +136,8 @@ function settingsOverview(s) {
     }
     ${onbBanner(s.onboarding)}
     ${s.models && !s.models.ready ? `<div class="warn-box" style="margin-top:18px">还没配好模型，MaiWork 暂时不会工作<button class="btn small" data-act="set-sub" data-sub="models" style="margin-left:8px">去配</button></div>` : ""}
-    <div class="h-sub-row"><h2 class="h-sub">今天的用量</h2><button class="btn small" data-act="set-sub" data-sub="usage">看以前的</button></div>
-    <div class="usage">
-      <div><b>${tokens(u.main)}</b><span>主模型 · tokens</span></div>
-      <div><b>${tokens(u.worker)}</b><span>子 agent · tokens</span></div>
-      <div><b>${u.jev || 0}</b><span>Jev 判断 · 次</span></div>
-    </div>
+    <div class="h-sub-row"><h2 class="h-sub">用量与日志</h2><button class="btn small" data-act="set-sub" data-sub="usage">查看</button></div>
+    <p class="h-meta">每日用量、调用摘要和故障明细放在一起，出问题时再展开看。</p>
     ${
       ((s.usage && s.usage.alerts) || []).length
         ? `<div class="warn-box"><b>今天超过提醒线了：</b><br />${s.usage.alerts.map((a) => esc(a.text)).join("<br />")}</div>`

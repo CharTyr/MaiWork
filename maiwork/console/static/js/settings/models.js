@@ -7,20 +7,27 @@ import { api } from "../api.js";
 import { repaintSheet } from "../sheet.js";
 import { loading } from "../pages/news.js";
 
-export function feedsSettings(f, page) {
+// 屏蔽名单按群（docs/18 第一步）：blocked_domains / auto_blocked 都是 {群号: [域名]}
+export function feedsSettings(f, groups) {
   if (!f) return "";
-  const manual = f.blocked_domains || [];
-  const auto = f.auto_blocked || [];
-  return `
-    ${page ? `` : `<h2 class="h-sub">屏蔽的资讯来源</h2>`}
-    ${
-      manual.length || auto.length
-        ? [
-            ...manual.map((d) => `<div class="set-row">${ico("lock")}<div><div class="set-name mono">${esc(d)}</div><div class="set-text">你屏蔽的</div></div><button class="btn small" data-act="unblock-domain" data-domain="${esc(d)}">解除</button></div>`),
-            ...auto.map((d) => `<div class="set-row">${ico("lock")}<div><div class="set-name mono">${esc(d)}</div><div class="set-text">自动屏蔽</div></div><span></span></div>`),
-          ].join("")
-        : `<p class="h-meta">还没有</p>`
-    }`;
+  const pick = (m, gid) => (m && !Array.isArray(m) && Array.isArray(m[gid]) ? m[gid] : []);
+  const list = groups || [];
+  if (!list.length) return `<p class="h-meta">还没有服务群。</p>`;
+  return list
+    .map((g) => {
+      const manual = pick(f.blocked_domains, g.id);
+      const auto = pick(f.auto_blocked, g.id);
+      const rows = [
+        ...manual.map((d) => `<div class="set-row">${ico("lock")}<div><div class="set-name mono">${esc(d)}</div><div class="set-text">你屏蔽的</div></div><button class="btn small" data-act="unblock-domain" data-g="${esc(g.id)}" data-domain="${esc(d)}">解除</button></div>`),
+        ...auto.map((d) => `<div class="set-row">${ico("lock")}<div><div class="set-name mono">${esc(d)}</div><div class="set-text">自动屏蔽</div></div><span></span></div>`),
+      ].join("");
+      return `
+    <div class="rss-group">
+      <div class="rss-gname">${esc(g.name || `群 ${g.id}`)}</div>
+      ${rows || `<p class="fine">还没有</p>`}
+    </div>`;
+    })
+    .join("");
 }
 
 export const fullLink = (g) => (g.link && /^https?:/.test(g.link) ? g.link : `${location.origin}/#/${g.token}/news`);

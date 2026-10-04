@@ -106,7 +106,6 @@ class MaiWorkApp:
         self.topics: Any = None
         self.feeds: Any = None
         self.scheduler: Any = None
-        self.goal_proposer: Any = None
         # M3 模块（docs/07 §11）
         self.tasks: Any = None
         self.goals: Any = None
@@ -119,6 +118,16 @@ class MaiWorkApp:
         self.capability: Any = None
         # 判定后的实际工作区根（None = 还没判定，get_settings 不套修正）
         self._ws_root: Path | None = None
+        # get_settings 的派生快照缓存：(base Settings 对象, 工作区根, 派生后的 Settings)。
+        # 反复调用返回**同一个对象**，避免每次都 dataclasses.replace 把 Models 的
+        # 「按 Settings 对象钉住的缓存」抖掉（缓存键是 is 判等，见 models.settings）。
+        self._effective_cache: tuple[Any, Any, Settings] | None = None
+        # 群控归一的「种子就绪」门（App 私有 Flag，不是配置键、不暴露 SDK）：
+        # 启动时先 False，只有「旧配置覆盖层物化成功 + 有效重读成功 + migrate_group_controls
+        # 没报问题」才开（_open_group_controls_seed_gate）。门关着时每群批准名单 /
+        # 往群里发读缺失记录只回安全默认、绝不惰性播种；已有合法记录照旧可读。
+        # 普通 update_config / 热应用不许把它重置成 True（每次重载都把当前值带过去）。
+        self._group_controls_seed_ready: bool = False
         # 测试注入点：替换探测（默认走 capability.probe 真探测）
         self.capability_probe: Callable[[str], Any] | None = None
         # 一次性 VM 执行环境（environments/railway.py；railway=false / 模块没就位 → None）
@@ -176,9 +185,6 @@ class MaiWorkApp:
         # 消息到来时同步更新，不受后台循环 signals.take() 消耗影响。
         self._session_to_served_group: dict[str, str] = {}
         self._ambiguous_sessions: set[str] = set()
-        # 网页规则覆盖（rules.py：rules.override）缓存：
-        # (基础 Settings 对象 id, kv["rules.override"], 合并后的有效 Settings)
-        self._effective_cache: tuple[int, Any, Settings] | None = None
 
     # ------------------------------------------------------------------
     # 属性
@@ -196,65 +202,104 @@ class MaiWorkApp:
     def intake(self) -> Intake | None:
         return self._intake
 
-    def _effective_settings(self) -> Settings:
-        """有效配置（config.toml + 网页规则覆盖），**不**套执行方式判定的工作区根修正。
-
-        给 _workspace_root_for 用：它要读用户配置的根再决定实际根，套了修正会自循环。
-        """
-        assert self._settings is not None
-        base = self._settings
-        if self.store is None:
-            return base
-        from . import rules as _rules
-
-        override = _rules.read_override(self.store)
-        cache = self._effective_cache
-        if (
-            cache is not None
-            and cache[0] == id(base)
-            and cache[1] == override
-        ):
-            return cache[2]
-        merged = _rules.effective_settings(base, override)
-        self._effective_cache = (id(base), override, merged)
-        return merged
-
     def get_settings(self) -> Settings:
-        """各模块用这个方法拿**有效**配置（config.toml + 网页规则覆盖 + 实际工作区根）。
+        """各模块用这个方法拿**有效**配置（config.toml + 实际工作区根）。
 
-        Settings 的唯一出口：网页存的 kv["rules.override"] 在这里做一次合并
-        （rules.effective_settings，新对象一层缓存，override 变了才重建），
-        所有模块读到的都是合并后的值——topics 开关关掉下一轮立刻停靠的就是这里。
-        没开库（没启动 / enabled=false）给 config 原值。
-        （2026-10：「全部配置」网页改的直接写 config.toml，走 update_config 热更新
-        到 base Settings，不再有 kv["config.override"] 这一层。）
+        Settings 的唯一出口：网页「全部配置」/ 管理员对话写配置 = 直写 config.toml，
+        走 update_config 热更新到 self._settings，这里直接读它（2026-10 起不再有
+        kv 覆盖层）。没开库（没启动 / enabled=false）给 config 原值。
         再套一层「执行方式判定后的工作区根」（启动时算出，见 _detect_local_capability）：
         dynamic 落在 /var/lib/private/maiwork/workspaces、受限落在数据目录下的 workspaces/。
         这样 LocalEnv 读写文件、outbox 校验交付路径、coordinator 算成品目录看到的是同一个根。
         Settings 里两处都要换：environments.workspace_root（LocalEnv 读）和顶层
         workspace_root（outbox 的交付闸 / 暂存目录读）。
         """
-        s = self._effective_settings()
+        assert self._settings is not None
+        s = self._settings
         root = self._ws_root
         if root is None:
             return s
+        cached = self._effective_cache
+        if cached is not None and cached[0] is s and cached[1] == root:
+            return cached[2]
         try:
             env = s.environments
             ws = Path(root)
             if Path(env.workspace_root) == ws and Path(s.workspace_root) == ws:
-                return s
+                derived = s
+            else:
+                derived = dataclasses.replace(
+                    s,
+                    workspace_root=ws,
+                    environments=dataclasses.replace(env, workspace_root=ws),
+                )
+        except Exception:
+            derived = s
+        self._effective_cache = (s, root, derived)
+        return derived
+
+    def _apply_seed_gate(self, settings: Settings) -> Settings:
+        """把当前的群控种子门值套到一份新读进来的 Settings 上（缺字段 / replace 失败就原样）。
+
+        `load_settings` 的字段缺省是 True（老合同），这里显式覆盖成 App 的当前值——
+        普通 update_config / 迁移后重读**都不许**把门重新打开。
+        """
+        try:
+            if not hasattr(settings, "group_controls_seed_ready"):
+                return settings
+            if settings.group_controls_seed_ready == self._group_controls_seed_ready:
+                return settings
             return dataclasses.replace(
-                s,
-                workspace_root=ws,
-                environments=dataclasses.replace(env, workspace_root=ws),
+                settings, group_controls_seed_ready=self._group_controls_seed_ready
             )
         except Exception:
-            return s
+            return settings
+
+    def _open_group_controls_seed_gate(self) -> None:
+        """群控归一这轮真成功了：开门，允许「缺失就惰性播种」（只开一次）。"""
+        if self._group_controls_seed_ready:
+            return
+        self._group_controls_seed_ready = True
+        if self._settings is not None:
+            try:
+                self._settings = dataclasses.replace(
+                    self._settings, group_controls_seed_ready=True
+                )
+            except Exception:
+                logger.exception("开群控种子门时更新 settings 出错，沿用当前这份")
+        self._effective_cache = None
+        logger.info("群控归一迁移成功：每群配置的惰性播种门已打开")
 
     def base_settings(self) -> Settings:
-        """config.toml 的原始配置（不含网页规则覆盖）；只在「和文件值比 / 展示 defaults」时用。"""
+        """config.toml 的原始配置（与 get_settings 只差工作区根修正）；给「全部配置」
+        展示 defaults / 和文件值比时用。"""
         assert self._settings is not None
         return self._settings
+
+    def _reload_settings_from_file(self) -> Settings | None:
+        """按插件目录里的 config.toml 重读一份配置（迁移改过文件之后调用）。
+
+        返回新的 Settings；文件读不了 / 解析失败 → None（调用方沿用当前这份，不把启动搞炸）。
+        旧代码末尾那段「moved → 重读」和这里同一套语义，抽出来给「物化后 / 迁移后」两处共用。
+        """
+        import tomlkit
+
+        try:
+            raw_config = dict(
+                tomlkit.parse((self.plugin_dir / "config.toml").read_text(encoding="utf-8"))
+            )
+        except Exception:
+            logger.exception("迁移后重读 config.toml 失败，沿用当前这份配置")
+            return None
+        new_settings, problems = load_settings(raw_config)
+        new_settings = self._apply_seed_gate(new_settings)
+        self._raw_config = raw_config
+        self._settings = new_settings
+        self._effective_cache = None
+        self.problems = problems
+        for prob in problems:
+            logger.warning("配置问题：%s", prob)
+        return new_settings
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -262,6 +307,10 @@ class MaiWorkApp:
 
     async def start(self) -> None:
         settings, problems = load_settings(self._raw_config)
+        # 每次 start 都从「种子门关着」开始：只有本轮 _start_stack 里群控归一真成功才开。
+        self._group_controls_seed_ready = False
+        self._effective_cache = None
+        settings = self._apply_seed_gate(settings)
         self._settings = settings
         self.problems = problems
         if problems:
@@ -283,41 +332,155 @@ class MaiWorkApp:
         settings.data_dir.mkdir(parents=True, exist_ok=True)
         self.store = Store(settings.data_dir / "maiwork.db")
         self.store.migrate()
-        # 1.1 一次性迁移（幂等）：数据库里的旧网页配置覆盖层 → config.toml。
-        # 迁移会改 config.toml 内容；宿主文件监控随后发的 on_config_update 和
-        # 下面重读的文件是同一份，update_config 里有幂等比较。
+        # 1.1 一次性迁移（幂等）。顺序有讲究（0.8.0 收尾复审修的两个真坑）：
+        #   a) 先把旧的「网页配置覆盖层」**完整物化**进 config.toml：kv["rules.override"]
+        #      在前、kv["config.override"] + secrets + kv["models.settings"] 在后——和
+        #      0.8.0 之前的真实读取顺序一致（get_settings 先合并 rules.override，再套
+        #      config.override；两者撞同一个键时 config.override 赢；migrations 文档
+        #      第 10 行也是「文件已有非空值且不同 → 以数据库为准」）。物化完按新文件
+        #      **重读一份配置**：下面每群种子用的才是「旧网页覆盖后的有效值」，不是文件里
+        #      那行默认值（旧顺序拿 bare 文件种 cap=3，把网页设的 cap=5 永久弄丢）。
+        #   b) 群控归一（全局那几行种成每群一份，种成功才删旧键）必须在 (a) 之后、
+        #      **deadclean 之前**。
+        #   c) 死键清理 / [search] / feeds.blocked_domains / 旧 [models] 这些「退役来源」的
+        #      迁移一律放在 (a) 之后：旧 config.override 里若带着 [search] /
+        #      feeds.blocked_domains，先物化再退役，才不会被重新写回文件变成第二份死配置。
+        #   d) 物化失败（写不了）、或物化写成功但后面**有效重读失败**（文件读不了 / 解析失败）
+        #      → 手上这份 settings 可能还是 bare 文件值：不拿它播错种子、不删任何旧源。
+        #      本轮跳过所有「退役旧源」的清理，旧源（含已成功物化的 config.toml）原样留着
+        #      下次启动再迁（不阻启动）。
+        #   e) 每个迁移都**显式调用**，不用 `moved = bool(moved) or bool(fn())` 这种短路——
+        #      否则前面的 True 会把后面的调用整个吞掉（模型设置 / secrets 永远迁不过来）。
         try:
             from . import migrations as _mig
 
-            # [search] 段（老配置）→ MCP 扩展 + kv 搜索绑定（2026-10；幂等，日志不打密钥）。
-            # 跑在 Extensions 连接之前没关系：绑定只存「扩展名 + 工具名」，不必当场验证工具
-            # 在不在——扩展连上后 search.available() 现查现验。
-            try:
-                if _mig.migrate_search_config_to_extension(self.store, self.plugin_dir, settings.data_dir):
-                    logger.info("老的 [search] 配置已迁成 MCP 扩展 + 搜索绑定")
-            except Exception:
-                logger.exception("搜索配置迁移（[search] → 扩展绑定）出错，按现状继续启动")
-            moved = _mig.migrate_db_config_to_file(self.store, self.plugin_dir, settings.data_dir)
-            # 1.2 一次性迁移（幂等）：旧 [models] → [[endpoints]] + [[model_list]] + 专岗选择。
-            # 热应用走同一套：文件变了下面重读一份，宿主文件监控随后发的 on_config_update
-            # 幂等跳过；Models.settings() 缓存键含 Settings 对象 id，换了 Settings 自动重算。
-            try:
-                if _mig.migrate_models_config_to_endpoints(self.store, self.plugin_dir, settings.data_dir):
-                    moved = True
-                    logger.info("旧 [models] 模型配置已迁成端点 + 模型库 + 专岗选择")
-            except Exception:
-                logger.exception("模型配置迁移（[models] → 端点/模型库）出错，按现状继续启动")
-            if moved:
-                import tomlkit as _tk
+            moved = False
+            legacy_ok = True
+            # 群控种子门的三道前置：旧覆盖物化成功、物化后**有效重读成功**、群控归一**没报问题**。
+            # 三道全过才允许「拿这份 settings 当种子父」跑群控归一 / 清退役旧源。
+            controls_ok = False
+            eff_read_ok = True
 
-                raw_config = dict(_tk.parse((self.plugin_dir / "config.toml").read_text(encoding="utf-8")))
-                new_settings, problems = load_settings(raw_config)
-                self._raw_config = raw_config
-                self._settings = new_settings
-                self.problems = problems
-                settings = new_settings
-                for prob in problems:
-                    logger.warning("配置问题：%s", prob)
+            # (a1) 旧规则覆盖（弱）→ config.toml；写失败抛错就留 kv 下回再迁。
+            try:
+                if _mig.migrate_rules_override_to_file(self.store, self.plugin_dir, settings.data_dir):
+                    moved = True
+                    logger.info("旧规则覆盖已搬进 config.toml")
+            except Exception:
+                legacy_ok = False
+                logger.exception("旧规则覆盖没搬进 config.toml（kv 原样留着，下次启动再试）")
+            # (a2) 数据库里的网页配置覆盖 + secrets + kv["models.settings"]（强）→ config.toml。
+            try:
+                if _mig.migrate_db_config_to_file(self.store, self.plugin_dir, settings.data_dir):
+                    moved = True
+                    logger.info("数据库里的网页配置（含密钥 / 模型设置）已搬进 config.toml")
+            except Exception:
+                legacy_ok = False
+                logger.exception("数据库里的网页配置没搬进 config.toml（旧源原样留着，下次启动再试）")
+            # 物化完（或有东西没搬成）重读：下面种每群 / 后面的迁移都要看「旧覆盖后的有效值」
+            if moved or not legacy_ok:
+                _fresh = self._reload_settings_from_file()
+                if _fresh is not None:
+                    settings = _fresh
+                else:
+                    # 旧覆盖写进了文件却重读不出来 → live settings 可能还是 bare 的，门不许开
+                    eff_read_ok = False
+
+            # 物化失败、或物化成功但有效重读失败 → 手上这份 settings 可能还是 bare 文件值
+            # （旧覆盖后的有效值在文件里没读回内存）。此时**绝不许**拿它当种子父跑群控归一 /
+            # 清退役旧源：`migrate_group_controls` 会主动打开惰性种子门，把 bare 的
+            # required=false / cap=12 / topics=true 永久落进每群 canonical，还顺手删掉文件里
+            # 的旧全局键——旧覆盖那套更严的约束（要批 / cap=1 / topics=false）就再也回不来了。
+            # 所以这一轮「不播种、不清源」，全留给下一次启动（重读正常）再迁。
+            if not legacy_ok or not eff_read_ok:
+                logger.warning(
+                    "旧覆盖物化或有效重读失败（物化成功=%s 有效重读=%s）：跳过所有「退役旧源」"
+                    "的清理（不种每群配置、不删旧键、不删死键），下次启动再试",
+                    legacy_ok, eff_read_ok,
+                )
+            else:
+                # (b) 群控归一（0.8.0 docs/18）：把全局那几行（批准名单 / 开话题开关 /
+                # 每日总上限 / 睡觉时段）种成「每群一份」，**种成功了才**从 config.toml 删旧键。
+                # 必须跑在 deadclean **之前**，而且要用**旧覆盖后的有效 settings** 当种子父——
+                # 否则服务群原来的「开不开 / 上限多少 / 几点睡」就丢了。
+                # 真删了键（deleted 非空）→ moved=True：下面按新文件重读一份配置。
+                try:
+                    _controls = _mig.migrate_group_controls(
+                        self.store, settings, self.plugin_dir, settings.data_dir
+                    )
+                    if _controls.get("deleted"):
+                        moved = True
+                        logger.info(
+                            "群控归一迁移：旧全局键已从 config.toml 删掉（%s）",
+                            "、".join(_controls["deleted"]),
+                        )
+                    elif _controls.get("problem"):
+                        logger.warning("群控归一迁移没做完：%s", _controls["problem"])
+                    # 没报问题才算「这次真种好了」；有 problem（哪一群没落库 / 推送接口没对上）
+                    # → 种子门保持关着，缺失记录只回安全默认，绝不拿 bare 值播种。
+                    controls_ok = not _controls.get("problem")
+                except Exception:
+                    logger.exception("群控归一迁移出错，按现状继续启动")
+                    controls_ok = False
+                # (c) 死配置键清理（docs/18 第一步）：存量 config.toml 里的退役键删掉，
+                # 有改动才重写文件（ConfigFileError 兜住记日志，不拖垮启动）。
+                try:
+                    if _mig.migrate_dead_config_keys(self.plugin_dir, settings.data_dir):
+                        moved = True
+                except Exception:
+                    logger.exception("死配置键清理出错，按现状继续启动")
+
+                # (d) [search] 段（老配置）→ MCP 扩展 + kv 搜索绑定（2026-10；幂等，日志不打密钥）。
+                # 跑在 Extensions 连接之前没关系：绑定只存「扩展名 + 工具名」，不必当场验证工具
+                # 在不在——扩展连上后 search.available() 现查现验。
+                try:
+                    if _mig.migrate_search_config_to_extension(self.store, self.plugin_dir, settings.data_dir):
+                        moved = True
+                        logger.info("老的 [search] 配置已迁成 MCP 扩展 + 搜索绑定")
+                except Exception:
+                    logger.exception("搜索配置迁移（[search] → 扩展绑定）出错，按现状继续启动")
+                # (e) 屏蔽域名归一成按群 kv：文件 + 全局 kv 并集 → 每个服务群自己的
+                # kv["feeds.blocked.<gid>"]，然后清两处来源（文件键删了要重读配置）。
+                try:
+                    migrated_blocked = _mig.migrate_blocked_domains_to_groups(
+                        self.store, self.plugin_dir, settings.data_dir, list((settings.groups or {}).keys())
+                    )
+                    if migrated_blocked is not None:
+                        moved = True
+                except Exception:
+                    logger.exception("屏蔽名单按群迁移出错，按现状继续启动")
+                # (f) 主动提目标（2026-10 已删）的残留 kv：goals.propose_day.<群号>、
+                # sched.<群号>.goal。只删键不改文件，不需要重读配置。
+                try:
+                    _mig.migrate_goal_proposal_kv(self.store)
+                except Exception:
+                    logger.exception("主动提目标残留 kv 清理出错，按现状继续启动")
+                # (g) 旧 [models] → [[endpoints]] + [[model_list]] + 专岗选择（幂等）。
+                # 热应用走同一套：文件变了下面重读一份，宿主文件监控随后发的 on_config_update
+                # 幂等跳过；Models.settings() 缓存键含 Settings 对象 id，换了 Settings 自动重算。
+                try:
+                    if _mig.migrate_models_config_to_endpoints(self.store, self.plugin_dir, settings.data_dir):
+                        moved = True
+                        logger.info("旧 [models] 模型配置已迁成端点 + 模型库 + 专岗选择")
+                except Exception:
+                    logger.exception("模型配置迁移（[models] → 端点/模型库）出错，按现状继续启动")
+            if moved:
+                _fresh = self._reload_settings_from_file()
+                if _fresh is not None:
+                    settings = _fresh
+                else:
+                    eff_read_ok = False
+            # 群控种子门：三道全过才开——旧覆盖物化成功、有效重读成功、群控归一没报问题。
+            # 门关着时每群批准名单 / 往群里发读缺失记录只回安全默认、绝不惰性播种；
+            # 已有合法记录照旧可读可听（见 group_approval / group_push）。
+            if legacy_ok and eff_read_ok and controls_ok:
+                self._open_group_controls_seed_gate()
+            else:
+                logger.warning(
+                    "群控种子门这轮没打开（物化成功=%s 有效重读=%s 群控归一=%s）："
+                    "每群批准名单 / 往群里发的缺失记录只回安全默认、不落库，旧源保留下次再迁",
+                    legacy_ok, eff_read_ok, controls_ok,
+                )
         except Exception:
             logger.exception("配置迁移（数据库 → config.toml）出错，按现有配置继续启动")
         # 2. 宿主（预热 bot_qq，失败不致命）
@@ -362,6 +525,22 @@ class MaiWorkApp:
                 await self.identity.ensure_started()  # 首次启动自动生成 SOUL / AGENTS 默认模板
             except Exception:
                 logger.exception("身份文件首次建立出错，本轮身份注入跳过")
+
+        # 每群三份（docs/17 §八）数据迁移：拼旧散件（口味小结 / 资讯偏好 / 每岗工作册
+        # agent_memory_notes / 每群记忆 memory/<gid>.md）进「本群规矩 group_rules」+
+        # 「资讯 skill」，旧来源清掉。幂等（起两次只迁一次；管理员后来手改过的绝不覆盖），
+        # 在任何 feeds/personal/coordinator/topics/复盘读数据前跑完。
+        try:
+            from . import migrations as _mig2
+
+            _out = _mig2.migrate_group_context_to_rules_and_skills(
+                self.store, self.get_settings(), self.identity,
+            )
+            if _out.get("rules_updated") or _out.get("skills_created"):
+                logger.info("每群三份启动迁移完成：规矩补 %s 群，skill 建 %s 群",
+                            _out.get("rules_updated"), _out.get("skills_created"))
+        except Exception:
+            logger.exception("每群三份启动迁移出错，按现状继续启动（旧来源留到下次再迁）")
 
         self.jev = Jev(self.store, self.get_settings, transport=self.jev_transport)
         # 搜索（2026-10）：内置服务全删，只走「扩展」里绑定的那个 MCP——Search 现读
@@ -419,8 +598,6 @@ class MaiWorkApp:
             logger.warning("恢复时发现 %d 个执行中断的任务，已暂停待核对", interrupted)
         self.goals = Goals(self.store, self.get_settings)
         self.approvals = Approvals(self.store, self.get_settings, self.tasks, self.goals)
-        # 主动提目标（GoalProposer；[goals] propose 默认开）：到点由后台循环调一次
-        self.goal_proposer = self._make_goal_proposer()
         # 派活自动审核（auto_review.py）：Approvals 每落一条待批请求就回调一次，
         # 这里把判断 spawn 到后台（调模型是慢活，绝不卡住收消息钩子）
         self.auto_review = self._make_auto_review()
@@ -463,6 +640,15 @@ class MaiWorkApp:
             self.outbox.set_ask_hook(self._on_ask_sent)
         except Exception:
             logger.exception("挂提问回执 hook 出错")
+        # 三种「MaiWork 自己往群里发」的消息统一接上发件箱（0.8.0：唯一发送路径）。
+        # Topics 建得比 Outbox 早（上面 3.5），这里补接线；卡片 / 提一嘴在下面建好后立刻接。
+        # 结果 hook 由各自 attach_outbox 内部登记（真发出去才回写 opener / 候选 / 账本），
+        # 这里**不要**再调 outbox.add_result_hook，否则同一个回调会登记两遍。
+        try:
+            if self.topics is not None:
+                self.topics.attach_outbox(self.outbox)
+        except Exception:
+            logger.exception("开话题接发件箱出错，这次不开话题")
         # 主模型读群发现请求（docs/02 §3.1/§5.1）：profiles 建得比这三样早，这里补接线
         try:
             self.profiles.set_request_deps(
@@ -506,6 +692,10 @@ class MaiWorkApp:
                 self.store, self.host, self.models, self.pushes, self.mentions, self.get_settings,
                 identity=self.identity,  # 读 SOUL：提一嘴要按人设说话（voice.py）
             )
+            # 统一接发件箱（唯一发送路径）：只入队，真发出去了由 attach 内部登记的结果
+            # hook 回写。别在这里再 add_result_hook（模块 attach 已经登记过）。
+            self.card_push.attach_outbox(self.outbox)
+            self.idea_mention.attach_outbox(self.outbox)
             n = self.card_push.recover() + self.idea_mention.recover()
             if n:
                 logger.info("资讯卡片 / 构想提一嘴恢复：%d 条「发送中」标成不确定，不自动重发", n)
@@ -545,7 +735,7 @@ class MaiWorkApp:
             self.group_admins = None
         self.commands = self._make_commands()
         # 3.66 专岗（agents.py + specialists.py）：要在 Workers / Tools / Skills / 扩展全部
-        # 就位之后建（Specialists 要它们），在 Feeds/GoalProposer/Coordinator 全部就位之后挂
+        # 就位之后建（Specialists 要它们），在 Feeds/Coordinator 全部就位之后挂
         # （它们都吃 `_specialists` 注入点）。没就位 → None，网页 API（server.py）503、
         # 业务走老路并记一行日志——绝不静默换成「通才 worker」。
         self.agents = self._make_agents()
@@ -618,6 +808,7 @@ class MaiWorkApp:
     async def stop(self) -> None:
         await self._stop_stack()
         self._settings = None
+        self._effective_cache = None
         self.problems = []
         self._started = False
 
@@ -795,7 +986,6 @@ class MaiWorkApp:
         self.goals = None
         self.approvals = None
         self.auto_review = None
-        self.goal_proposer = None
         self.env = None
         self.railway = None
         self.outbox = None
@@ -825,6 +1015,8 @@ class MaiWorkApp:
 
     async def update_config(self, raw_config: Any) -> None:
         new_settings, problems = load_settings(raw_config)
+        # 热应用不许把群控种子门重新打开：把当前门值带过去（幂等比较也因此稳定）。
+        new_settings = self._apply_seed_gate(new_settings)
         if (
             self._started
             and self._settings is not None
@@ -839,6 +1031,7 @@ class MaiWorkApp:
             # 没启动（包括从未启动、或启动失败）：新配置 enabled → 直接按它 start
             self._raw_config = raw_config
             self._settings = new_settings
+            self._effective_cache = None
             if new_settings.enabled:
                 await self.start()
             return
@@ -852,6 +1045,7 @@ class MaiWorkApp:
         old_settings = self._settings
         self._raw_config = raw_config
         self._settings = new_settings
+        self._effective_cache = None
         for p in problems:
             logger.warning("配置问题：%s", p)
         # 执行方式跟着配置变（run_as / workspace_root）：重判一次，工作区根跟着换
@@ -1331,19 +1525,6 @@ class MaiWorkApp:
             logger.exception("建 Feeds 出错，资讯/构想这次跳过")
             return None
 
-    def _make_goal_proposer(self) -> Any:
-        """GoalProposer（主动提目标）；模块没就位 / 构造失败就 None，这块功能跳过。"""
-        try:
-            from .goal_proposal import GoalProposer
-
-            return GoalProposer(
-                self.store, self.models, self.goals, self.approvals, self.get_settings,
-                profiles=self.profiles, identity=self.identity,
-            )
-        except Exception:
-            logger.exception("建 GoalProposer 出错，主动提目标这次跳过")
-            return None
-
     def _make_agents(self) -> Any:
         """Agents（agents.py，A 负责）；模块没就位 / 构造失败 → None（server 503、专岗全停）。"""
         try:
@@ -1382,34 +1563,41 @@ class MaiWorkApp:
             return None
 
     def _wire_specialists(self) -> None:
-        """把同一份 Specialists 挂到使用它的三个管线（feeds / goal_proposer / coordinator）。
+        """把同一份 Specialists 挂到使用它的两个管线（feeds / coordinator）。
 
-        没就位 → 三处保持 None（老路）；就位 → 生产强制使用专岗，不静默换通才。
+        没就位 → 两处保持 None（老路）；就位 → 生产强制使用专岗，不静默换通才。
+        （主动提目标 GoalProposer 2026-10 已删，不再是第三条接线。）
+        每群三份（docs/17 §八）：另把 Agents 挂到要「本群三份」的卡片点上
+        （topics 开场白 / personal 个人向 / idea_mention 构想提一嘴），统一走 group_context。
+        工具表（self.tools）也要认这份 Agents：skills_tools 的 list_skills / read_skill
+        （「本群/<做法>」）和 coordinator 的排计划门控（_group_has_task_skills）都从
+        `getattr(tools, "_agents", None)` 查本群做法，所以这里一并挂上——专岗没就位也照挂。
         """
-        specialists = self.specialists
-        if specialists is None:
-            return
+        # 所有纯提示词 / 技能读取入口都认 app 的同一份 Agents。
+        # 不依赖 Specialists 构造成功；提一嘴是 idea_mention，不是 card_push。
         wired = []
-        try:
-            if self.feeds is not None:
-                self.feeds._specialists = specialists  # noqa: SLF001
-                wired.append("feeds")
-        except Exception:
-            logger.exception("给 feeds 挂 specialists 出错")
-        try:
-            if self.goal_proposer is not None:
-                self.goal_proposer._specialists = specialists  # noqa: SLF001
-                wired.append("goal_proposer")
-        except Exception:
-            logger.exception("给 goal_proposer 挂 specialists 出错")
-        try:
-            if self.coordinator is not None:
-                self.coordinator._specialists = specialists  # noqa: SLF001
-                wired.append("coordinator")
-        except Exception:
-            logger.exception("给 coordinator 挂 specialists 出错")
+        agents_obj = self.agents
+        for mod_name in ("tools", "topics", "personal", "card_push", "idea_mention",
+                         "feeds", "coordinator"):
+            try:
+                mod = getattr(self, mod_name, None)
+                if mod is not None and agents_obj is not None:
+                    mod._agents = agents_obj  # noqa: SLF001
+                    wired.append(mod_name + "(agents)")
+            except Exception:
+                logger.exception("给 %s 挂 agents 出错", mod_name)
+        specialists = self.specialists
+        if specialists is not None:
+            for mod_name in ("feeds", "coordinator"):
+                try:
+                    mod = getattr(self, mod_name, None)
+                    if mod is not None:
+                        mod._specialists = specialists  # noqa: SLF001
+                        wired.append(mod_name)
+                except Exception:
+                    logger.exception("给 %s 挂 specialists 出错", mod_name)
         if wired:
-            logger.info("专岗已接线（%s）", ",".join(wired))
+            logger.info("专岗/本群三份已接线（%s）", ",".join(wired))
 
     def _make_auto_review(self) -> Any:
         """自动审核（auto_review.py）；模块没就位 / 构造失败就 None，这块功能跳过。
@@ -1460,16 +1648,6 @@ class MaiWorkApp:
         except Exception:
             logger.exception("建 Identity 出错，身份/工作记忆这次跳过")
             return None
-
-    def note_useless_feedback(self, group_id: str, item_id: int) -> None:
-        """console 的「没用」反馈钩子：有 Identity 就检查「累计 3 次 → 记进本群记忆」。"""
-        identity = self.identity
-        if identity is None:
-            return
-        try:
-            identity.note_useless_feedback(str(group_id), int(item_id))
-        except Exception:
-            logger.exception("反馈自动记出错（群 %s 条 %s，不影响反馈本身）", group_id, item_id)
 
     def _make_verify_runner(self) -> Any:
         """资讯实测的注入闭包（Feeds 的 verify_runner 契约：async (items, picks, gid, settings)）。
@@ -1544,11 +1722,12 @@ class MaiWorkApp:
     def _workspace_root_for(self, dec: Any) -> Path:
         """按判定结果定工作区根（受限→数据目录下；dynamic→/var/lib/private；fixed→配置）。
 
-        读的是**没套修正**的有效配置（_effective_settings），套了会自循环。
+        读的是**没套修正**的配置（self._settings），套了会自循环。
         """
         from .environments import capability as _cap
 
-        settings = self._effective_settings()
+        assert self._settings is not None
+        settings = self._settings
         cfg_root = Path(getattr(getattr(settings, "environments", None), "workspace_root", "") or "")
         data_dir = Path(getattr(settings, "data_dir", "") or ".")
         return _cap.resolve_workspace_root(cfg_root, dec, data_dir=data_dir)
@@ -1826,53 +2005,71 @@ class MaiWorkApp:
         except Exception:
             logger.exception("回答恢复任务出错（群 %s，任务 %s）", group_id, task_id)
 
-    def _known_secrets(self) -> list[str]:
-        """目前已知会被写进运行文本的密钥：模型 + 搜索 + MCP 扩展 headers 的值。每次现读（热更新后跟着变）。"""
+    @staticmethod
+    def _add_secret(out: list[str], value: Any) -> None:
+        """把一个凭据值并进遮罩名单（去重；`Bearer xxx` / `Basic xxx` 连 token 部分一起）。"""
+        v_s = str(value or "")
+        if not v_s:
+            return
+        if v_s not in out:
+            out.append(v_s)
+        scheme, sep, token = v_s.partition(" ")
+        token = token.strip()
+        if sep and scheme.lower() in ("bearer", "basic") and token and token not in out:
+            out.append(token)
+
+    def known_secrets(self) -> list[str]:
+        """目前已知会被写进运行文本的密钥（公开方法，给控制台各出口共用）。
+
+        来源：模型 api_key / Jev api_key / 网页总密码 / [[endpoints]] 的 api_key 与高级
+        请求头 / [[extensions.mcp]] 的请求头 / secrets 表里的 mcp.<扩展名>.<头名> /
+        搜索绑定那家扩展的请求头。每次现读（热更新后跟着变）。
+
+        每个来源各自兜错：搜索模块炸了不该把模型密钥 / 网页密码的遮罩一起丢光
+        （这正是「工具摘要有遮罩、网页出口没遮罩」的根因）。
+        """
         out: list[str] = []
+        # 1) 网页加的 MCP 扩展头值（secrets 表 mcp.<扩展名>.<头名>）：只进不出，并进遮罩
         try:
-            # 网页加的 MCP 扩展头值（secrets 表 mcp.<扩展名>.<头名>）：只进不出，并进遮罩
             if self.store is not None:
-                rows = self.store.read().execute("SELECT value FROM secrets WHERE name LIKE 'mcp.%'").fetchall()
+                rows = self.store.read().execute(
+                    "SELECT value FROM secrets WHERE name LIKE 'mcp.%'"
+                ).fetchall()
                 for row in rows:
-                    v_s = str(row["value"] or "")
-                    if v_s:
-                        out.append(v_s)
+                    self._add_secret(out, row["value"])
         except Exception:
-            pass
+            logger.debug("取 MCP 扩展头密钥失败（遮罩名单照常往下取）", exc_info=True)
+        # 2) 搜索绑定那家（kv 绑定 + 运行状态里的请求头；Search 现读，不缓存）
         try:
             if self.search is not None:
-                for v in self.search.known_secrets():
-                    if v and v not in out:
-                        out.append(v)
-            if self._settings is not None:
-                for v in (
-                    getattr(self._settings.models, "api_key", ""),
-                    getattr(self._settings.jev, "api_key", ""),
-                    self._settings.console.password,
-                ):
-                    v_s = str(v or "")
-                    if v_s:
-                        out.append(v_s)
-                # 所有端点的 api_key 与高级请求头值都进遮罩（绝不进日志/工具摘要）
-                for ep in (getattr(self._settings, "endpoints", ()) or ()):
-                    values = [getattr(ep, "api_key", ""), *dict(getattr(ep, "headers", {}) or {}).values()]
-                    for value in values:
-                        v_s = str(value or "")
-                        if v_s and v_s not in out:
-                            out.append(v_s)
-                        scheme, sep, token = v_s.partition(" ")
-                        if sep and scheme.lower() in ("bearer", "basic") and token.strip() and token.strip() not in out:
-                            out.append(token.strip())
-                # [[extensions.mcp]] headers 的值：密钥只进不出，摘要统一遮罩
-                mcp_entries = getattr(getattr(self._settings, "extensions", None), "mcp", ()) or ()
-                for entry in mcp_entries:
-                    for v in dict(getattr(entry, "headers", {}) or {}).values():
-                        v_s = str(v or "")
-                        if v_s:
-                            out.append(v_s)
+                for value in self.search.known_secrets():
+                    self._add_secret(out, value)
         except Exception:
-            pass
+            logger.debug("取搜索密钥失败（遮罩名单照常往下取）", exc_info=True)
+        # 3) config.toml / Settings 里的明文密钥（模型、Jev、网页总密码、端点与扩展请求头）
+        try:
+            settings = self._settings
+            if settings is not None:
+                self._add_secret(out, getattr(getattr(settings, "models", None), "api_key", ""))
+                self._add_secret(out, getattr(getattr(settings, "jev", None), "api_key", ""))
+                self._add_secret(out, getattr(getattr(settings, "console", None), "password", ""))
+                # 所有端点的 api_key 与高级请求头值都进遮罩（绝不进日志/工具摘要）
+                for ep in (getattr(settings, "endpoints", ()) or ()):
+                    self._add_secret(out, getattr(ep, "api_key", ""))
+                    for value in dict(getattr(ep, "headers", {}) or {}).values():
+                        self._add_secret(out, value)
+                # [[extensions.mcp]] headers 的值：密钥只进不出，摘要统一遮罩
+                mcp_entries = getattr(getattr(settings, "extensions", None), "mcp", ()) or ()
+                for entry in mcp_entries:
+                    for value in dict(getattr(entry, "headers", {}) or {}).values():
+                        self._add_secret(out, value)
+        except Exception:
+            logger.debug("取配置里的密钥失败（遮罩名单照常返回已取到的）", exc_info=True)
         return out
+
+    def _known_secrets(self) -> list[str]:
+        """老调用口（Tools / admin_chat 的回调）：等价于公开的 known_secrets()。"""
+        return self.known_secrets()
 
     # ------------------------------------------------------------------
     # skill + MCP 扩展（docs/02 §10：MaiWork 自己加载，不挂 MaiBot planner）
@@ -2151,51 +2348,6 @@ class MaiWorkApp:
         desc = str(item.get("desc") or "").strip()
         return f"{desc}\n\n{ctx}".strip() if desc else ctx
 
-    def on_idea_want(self, view: dict, group_id: str) -> None:
-        """构想「想要这个」（网页 want 路由在 idea_action 之后调）：落成待批请求。
-
-        免批的直接落地（approved + 任务 queued）→ 构想卡标 started、回写 task_id、开工；
-        要批的构想卡标 pending（等批准），批准时由 Approvals 落成任务。
-        """
-        try:
-            if self.approvals is None or self.store is None or not isinstance(view, dict):
-                return
-            idea_id = int(view.get("id") or 0)
-            gid = str(group_id or "")
-            if idea_id <= 0 or not gid:
-                return
-            res = self.approvals.create(
-                gid,
-                kind="task",
-                title=str(view.get("title") or "构想"),
-                quote=self._idea_request_text(view),
-                via="来自构想",
-                requester_id="",
-                requester_name=str(view.get("requested_by") or "群友（网页）"),
-                idea_id=idea_id,
-                icon=str(view.get("icon") or "magnifier"),
-                source="idea",
-            )
-            if not isinstance(res, dict):
-                return
-            tid = str(res.get("task_id") or "")
-            if tid:
-                with self.store.tx() as conn:
-                    conn.execute(
-                        "UPDATE ideas SET state='started', task_id=? WHERE id=? AND state IN ('new', 'wanted')",
-                        (tid, int(idea_id)),
-                    )
-                self.spawn_run_task(tid)
-                logger.info("构想 #%s 免批落地任务 %s（群 %s）", idea_id, tid, gid)
-            elif str(res.get("status") or "") == "pending":
-                with self.store.tx() as conn:
-                    conn.execute(
-                        "UPDATE ideas SET state='pending' WHERE id=? AND state IN ('new', 'wanted')",
-                        (int(idea_id),),
-                    )
-        except Exception:
-            logger.exception("构想「想要这个」落成待批出错（view=%s）", view)
-
     @staticmethod
     def _idea_request_text(view: dict) -> str:
         body = str(view.get("body") or "")
@@ -2382,6 +2534,10 @@ class MaiWorkApp:
                 self._viz_round(gid, now)
             except Exception:
                 logger.exception("资讯图解巡检出错（群 %s）", gid)
+            try:
+                self._ideas_shelve_round(gid, now)
+            except Exception:
+                logger.exception("构想自动收起巡检出错（群 %s）", gid)
         # 3) M3 巡检：发件箱 / 批准提醒与过期 / 目标到期 / 排队任务派工
         try:
             await self._m3_round(now)
@@ -2418,7 +2574,7 @@ class MaiWorkApp:
             )
 
     def _prune_round(self, now: float) -> None:
-        """每天一次 store.prune（按北京日去重；启动后第一轮就跑）。"""
+        """每天一次 store.prune（按北京日去重；启动后第一轮就跑）+ 卡片图缓存清理。"""
         if self.store is None:
             return
         today = clock.day_key(now)
@@ -2427,8 +2583,16 @@ class MaiWorkApp:
         counts = self.store.prune(now)
         with self.store.tx() as conn:
             self.store.kv_set(conn, "prune.last_day", today)
-        if any(counts.values()):
-            logger.info("每日数据清理：%s", counts)
+        # 卡片图缓存（card_push）：只删 7 天前就已发完 / 失败 / 作废的那一份 card-<id>.png
+        removed = 0
+        try:
+            from .card_push import prune_card_cache
+
+            removed = prune_card_cache(self.store, self.get_settings, now)
+        except Exception:
+            logger.exception("卡片图缓存清理出错")
+        if any(counts.values()) or removed:
+            logger.info("每日数据清理：%s（卡片图 %d 张）", counts, removed)
 
     # ------------------------------------------------------------------
     # M3 后台巡检（每轮一次；各项互不影响、异常记日志）
@@ -2697,17 +2861,34 @@ class MaiWorkApp:
     async def _topics_round(self, gid: str, now: float) -> None:
         """一个群的冷场开话题巡检：先 check（到点开话题），再 follow_up（到点记效果）。
 
-        开话题开关关掉要立刻停（网页规则覆盖，rules.py）：这里读合并后的有效值，
-        关掉起下一轮就不开话题（开关在 kv 里，get_settings 合并层拾得到）。
+        开话题开关只有一个来源：每群那份 `kv["group_push.<群号>"].topics_enabled`
+        （0.8.0 起 `[topics] enabled` 只是新群第一次的迁移种子，**不再**在这里挡每群开关）。
+        真正的开关判定在 `Topics.check` 内部（它先判睡觉时段、再判开关、再查候选），
+        这里只做一次便宜的预筛；拿不到每群那份就 fail-closed（这轮先不开）。
         """
         if self.topics is None:
             return
-        if not self._topics_effective_on():
+        if not self._topics_effective_on(gid):
             return
         result = await self.topics.check(gid, now)
         if not str(result).startswith("skip:"):
             logger.info("开话题巡检（群 %s）：%s", gid, result)
         await self.topics.follow_up(gid, now)
+
+    def _ideas_shelve_round(self, gid: str, now: float) -> None:
+        """7 天没人理的构想自动收起（`Feeds.shelve_ignored_ideas`）。
+
+        - 每个服务群每轮跑一次：里面就一条便宜 SELECT，没有到期的构想什么都不做；
+          7 天窗口最多晚一轮（分钟级），不影响观感。
+        - **不发任何消息**：只把构想状态改成「已收起」，网页上不再占位子。
+        - 个人向 / 已开工 / 关联待批请求还没结果的，模块自己不动（口径在 feeds.py）。
+        - 配置读不出来时模块 fail-closed（一行都不写），这里不兜错误。
+        """
+        feeds = self.feeds
+        fn = getattr(feeds, "shelve_ignored_ideas", None)
+        if not callable(fn):
+            return
+        fn(gid, now)
 
     async def _schedule_round(self, gid: str, now: float, sig: Any) -> None:
         """一个群的排程巡检：scheduler.due 到点的事 → spawn 长活。"""
@@ -2748,11 +2929,6 @@ class MaiWorkApp:
                 if (gid, "idea_manual") in self._running_jobs:
                     continue  # 手动点的那个还在跑，这次先不开（下一轮再看）
                 self._spawn_long_job(gid, "idea", self.feeds.make_idea)
-            elif job == "goal":
-                if self.goal_proposer is None:
-                    continue
-                self._spawn_long_job(gid, "goal", self._propose_goal_round)
-
     async def _feedback_round(self, gid: str) -> None:
         from . import feedback_jobs
         from .privacy import scrub
@@ -2760,9 +2936,10 @@ class MaiWorkApp:
         out = await feedback_jobs.run(
             self.store, self.models, gid, _now(), profiles=self.profiles,
             scrub=lambda g, text: scrub(g, text, self.store),
+            agents=self.agents,
         )
-        if out.get("mentions") or out.get("taste"):
-            logger.info("反馈 / 口味（群 %s）：%s", gid, out)
+        if out.get("mentions") or out.get("taste") or out.get("lessons"):
+            logger.info("反馈 / 口味 / 做事经验（群 %s）：%s", gid, out)
 
     async def _card_push_round(self, gid: str, now: float) -> None:
         """一个群的资讯卡片 / 构想提一嘴：建待发行 + 投递（开关、节制都在模块里）。
@@ -2812,19 +2989,24 @@ class MaiWorkApp:
 
         self._spawn_long_job(gid, "names", _refresh)
 
-    async def _propose_goal_round(self, gid: str) -> None:
-        """主动提目标一轮：开关 / 非服务群 / 每日上限都在 GoalProposer 里兜住。"""
-        proposer = self.goal_proposer
-        if proposer is None:
-            return
-        await proposer.propose(gid)
+    def _topics_effective_on(self, gid: str) -> bool:
+        """这个群的开话题开关开没开（只认每群那份，参数 gid 必要）。
 
-    def _topics_effective_on(self) -> bool:
-        """有效设置里开话题开没开（网页规则覆盖后）。"""
-        try:
-            return bool(self.get_settings().topics.enabled)
-        except Exception:
+        0.8.0：开关归 `group_push.<群号>`；`[topics] enabled` 只是新群第一次的迁移种子，
+        **不再**拿它当全局闸（否则一个群的设置会按住所有群）。真实判定在
+        `Topics.check` 里；这里读不到每群那份就 fail-closed（这轮先不开）。
+        """
+        from . import group_push
+
+        gid_s = str(gid or "").strip()
+        if not gid_s:
             return False
+        try:
+            cfg = group_push.get_config(self.store, gid_s, self.get_settings())
+        except Exception:
+            logger.exception("读每群开话题开关出错（群 %s），这轮先不开", gid_s)
+            return False
+        return bool(cfg.get("topics_enabled", True))
 
     def run_news_now(self, gid: str) -> dict:
         """管理员在网页上点「现在就备一批」。后台跑，不等结果。

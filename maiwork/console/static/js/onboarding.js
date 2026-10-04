@@ -2,7 +2,7 @@
 import { $, admin, state } from "./state.js";
 import { SVG, calm, esc, ico, toast } from "./util.js";
 import { api, gname } from "./api.js";
-import { ROWS_COLS, chipEditor, rowsEditor } from "./settings/rules.js";
+import { ROWS_COLS, rowsEditor } from "./settings/rules.js";
 import { AV_SRC } from "./settings/identity.js";
 import { PROTOCOLS, loadModels } from "./settings/models.js";
 import { loadAgents } from "./settings/agents.js";
@@ -105,12 +105,11 @@ export function onbPane(id) {
   }
   if (id === "search") return onbSearchPane();
   if (id === "admins") {
-    const f = onbField("approval.admins");
     return `
-      <div class="onb-step-ico">${ico("bell")}</div>
-      <h1 class="onb-title">谁是管理员</h1>
-      <p class="onb-lead">群友派的活要管理员批准才开工</p>
-      <div class="login onb-form">${f ? chipEditor("onb-admins", "accounts", f.value) : `<p class="fine">读不到配置，先跳过这步。</p>`}</div>
+      <div class="onb-step-ico">${ico("lock")}</div>
+      <h1 class="onb-title">各群的网页管理员</h1>
+      <p class="onb-lead">可选：给每个群设置单独的网页密码，只能管自己的群。</p>
+      <p class="fine">群里谁能批准、谁免批，统一在群页「谁能批本群的活」里设置，不再另填一份全局名单。</p>
       ${onbGaBlock()}`;
   }
   if (id === "look") {
@@ -206,8 +205,6 @@ function onbGaBlock() {
         <div class="onb-ga-name">${esc(gname(g) || `群 ${gid}`)}</div>
         <label for="onb-ga-pw-${gid}">网页密码</label>
         <input id="onb-ga-pw-${gid}" type="password" autocomplete="new-password" placeholder="${x.password_set ? "已设置 · 留空就不改" : "至少 8 位 · 可以不填"}" />
-        <label>群里能批准的人</label>
-        ${chipEditor(`onb-ga-${gid}`, "accounts", x.accounts || [])}
       </div>`;
       })
       .join("")}`;
@@ -490,21 +487,18 @@ async function onbSave(id) {
   }
   if (id === "admins" && onb.ga) {
     for (const gid of Object.keys(onb.ga)) {
-      const box = $(`onb-ga-${gid}`);
-      if (!box) continue;
-      const pw = ($(`onb-ga-pw-${gid}`) || {}).value || "";
-      const accounts = [...box.querySelectorAll(".ci")].map((c) => c.dataset.v);
-      if (pw && pw.length < 8) return "群管理员密码至少 8 位。";
-      const same = JSON.stringify(accounts) === JSON.stringify(onb.ga[gid].accounts || []);
-      if (!pw && same) continue;
+      const field = $(`onb-ga-pw-${gid}`);
+      if (!field) continue;
+      const pw = field.value || "";
+      if (!pw) continue;
+      if (pw.length < 8) return "群管理员密码至少 8 位。";
       try {
-        onb.ga[gid] = await api("PUT", `/api/groups/${encodeURIComponent(gid)}/group-admin`, { password: pw || undefined, accounts });
+        onb.ga[gid] = await api("PUT", `/api/groups/${encodeURIComponent(gid)}/group-admin`, { password: pw });
       } catch (e) {
         return `群 ${gid}：${e.message}`;
       }
     }
   }
-  if (id === "admins" && $("onb-admins")) patch["approval.admins"] = [...$("onb-admins").querySelectorAll(".ci")].map((c) => c.dataset.v);
   // 没变的不提交，免得把「要重载」标记白白点亮
   for (const k of Object.keys(patch)) {
     const f = onbField(k);

@@ -555,32 +555,39 @@ class TestConfig:
         assert "自动批" in g["label"]
         assert g["min"] == 0
 
-    def test_validate_patch_accepts_both(self) -> None:
-        from CharTyr_MaiWork.maiwork.rules import validate_patch
+    def test_config_schema_accept_both_types(self) -> None:
+        """两键的合法性/范围由 CONFIG_SCHEMA 的类型 + min/max 表达（validate_patch 已删）。"""
+        from CharTyr_MaiWork.maiwork.rules import CONFIG_BY_KEY, _validate_generic
 
-        assert validate_patch("approval.auto_review", True) == ("approval.auto_review", True)
-        assert validate_patch("approval.auto_review_daily", 3) == ("approval.auto_review_daily", 3)
+        assert _validate_generic(CONFIG_BY_KEY["approval.auto_review"], True) is True
+        assert _validate_generic(CONFIG_BY_KEY["approval.auto_review_daily"], 3) == 3
         with pytest.raises(ValueError):
-            validate_patch("approval.auto_review", 1)
+            _validate_generic(CONFIG_BY_KEY["approval.auto_review"], 1)
         with pytest.raises(ValueError):
-            validate_patch("approval.auto_review_daily", -1)
+            _validate_generic(CONFIG_BY_KEY["approval.auto_review_daily"], -1)
 
-    def test_hot_apply_override(self, tmp_path) -> None:
-        from CharTyr_MaiWork.maiwork.rules import effective_settings
+    def test_hot_apply_settings_toggle(self, tmp_path) -> None:
+        """热改自动审核（网页 / 工具写 config.toml → 新 Settings）→ reviewer 读到关。
 
+        旧版靠 kv["rules.override"] 合并层；2026-10 起唯一真实来源是 config.toml，
+        热应用就是换新 Settings 对象（本测试直接换 lambda 返回的对象模拟这步）。
+        """
+        from CharTyr_MaiWork.maiwork.config import load_settings
+
+        off_settings, _ = load_settings({"plugin": {"enabled": True},
+                                          "approval": {"auto_review": False, "auto_review_daily": 2}})
+        assert off_settings.approval.auto_review is False
+        assert off_settings.approval.auto_review_daily == 2
+        # 基础设置本身不被动（新对象）
         base = _settings()
-        merged = effective_settings(base, {"approval": {"auto_review": False, "auto_review_daily": 2}})
-        assert merged.approval.auto_review is False
-        assert merged.approval.auto_review_daily == 2
-        # 基础设置不被改
         assert base.approval.auto_review is True
 
     @pytest.mark.asyncio
     async def test_hot_apply_changes_reviewer_behaviour(self, tmp_path) -> None:
         h = _setup(tmp_path, replies=[_OK])
-        from CharTyr_MaiWork.maiwork import rules as _rules
+        from CharTyr_MaiWork.maiwork.config import load_settings as _ls
 
-        off = _rules.effective_settings(h.settings, {"approval": {"auto_review": False}})
+        off, _ = _ls({"plugin": {"enabled": True}, "approval": {"auto_review": False}})
         reviewer = AutoReviewer(h.store, h.models, h.approvals, lambda: off)
         r = h.create()
         assert await reviewer.review(r["id"]) is None

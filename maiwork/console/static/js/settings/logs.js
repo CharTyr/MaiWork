@@ -5,8 +5,25 @@ import { api } from "../api.js";
 import { loading } from "../pages/news.js";
 
 /* ───── 请求日志（管理员） ───── */
+function logState() {
+  return (state.logs = state.logs || { tab: "model", failed: false, items: [], next: null, summary: null, open: {}, expanded: false });
+}
+
+// 进入用量页只拉摘要，完整提示词和工具参数等用户明确展开后再取。
+export async function loadLogSummary() {
+  const L = logState();
+  try {
+    L.summary = await api("GET", "/api/logs/summary");
+    L.error = "";
+  } catch (e) {
+    L.error = e.message;
+    toast(e.message, true);
+  }
+}
+
 export async function loadLogs(more) {
-  const L = (state.logs = state.logs || { tab: "model", failed: false, items: [], next: null, summary: null, open: {} });
+  const L = logState();
+  L.expanded = true;
   const base = L.tab === "model" ? "/api/logs/model-calls" : "/api/logs/tool-calls";
   const q = new URLSearchParams({ limit: "50" });
   if (L.failed) q.set("failed", "1");
@@ -30,17 +47,20 @@ const hms = (ts) => {
 
 export function logsPage() {
   const L = state.logs;
-  if (!L || !L.summary) return loading();
+  if (!L || !L.summary) return L && L.error ? `<div class="warn-box">${esc(L.error)}<button class="btn small" data-act="log-refresh">重试</button></div>` : loading();
   const t = (L.summary && L.summary.today) || {};
   const lf = L.summary.last_failure;
-  return `
-    <p class="h-meta">最近 3 天的模型和工具调用</p>
+  const summary = `
+    <p class="h-meta">最近 3 天的模型和工具调用。默认只看摘要；出问题时再展开明细。</p>
     <div class="usage" style="margin-top:14px">
       <div><b>${t.calls || 0}</b><span>今天调用模型 · 次</span></div>
       <div><b class="${t.failed ? "bad-t" : ""}">${t.failed || 0}</b><span>失败 · 次</span></div>
       <div><b>${t.retried || 0}</b><span>重试 · 次</span></div>
     </div>
     ${lf ? `<div class="warn-box" style="margin-top:12px"><b>最近一次失败：</b>${esc(hms(lf.ts))} · ${esc(lf.purpose_name || lf.purpose || "")} · ${esc(lf.model || "")}<br />${esc(lf.error || "")}</div>` : ""}
+    <div class="actions"><button class="btn small" data-act="log-expand" aria-expanded="${!!L.expanded}">${L.expanded ? "收起明细" : "展开调用明细"}</button></div>`;
+  if (!L.expanded) return summary;
+  return summary + `
     <div class="log-bar">
       <div class="seg" role="tablist">
         <button role="tab" data-act="log-tab" data-t="model" aria-selected="${L.tab === "model"}">模型调用</button>
@@ -89,6 +109,7 @@ function modelLogDetail(d) {
   return `
     ${d.error ? `<div class="warn-box">${esc(d.error)}${d.status ? `（HTTP ${d.status}）` : ""}</div>` : ""}
     <div class="ld-meta">${req.json_mode ? "要求返回 JSON · " : ""}${(req.tools || []).length ? `可用工具：${req.tools.map(esc).join("、")}` : "没给工具"}</div>
+    <details class="log-raw"><summary>查看完整请求与回复</summary>
     <h3 class="ld-h">请求</h3>
     ${msgs || `<p class="h-meta">（没记下）</p>`}
     <h3 class="ld-h">回复</h3>
@@ -96,7 +117,7 @@ function modelLogDetail(d) {
       d.ok
         ? `${res.text ? `<pre class="lm-text">${esc(res.text)}</pre>` : ""}${(res.tool_calls || []).map((tc) => `<pre class="lm-text lm-tc">调用 ${esc(tc.name || "")}：${esc(tc.arguments || "")}</pre>`).join("")}${!res.text && !(res.tool_calls || []).length ? `<p class="h-meta">（空）</p>` : ""}`
         : `<p class="h-meta">这次没拿到回复。</p>`
-    }`;
+    }</details>`;
 }
 
 function toolLogRow(it) {

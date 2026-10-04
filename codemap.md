@@ -10,7 +10,7 @@ MaiWork 的插件根目录。包含宿主插件声明、生命周期入口、示
 - `plugin.py`：`MaiWorkPlugin(MaiBotPlugin)`，`config_model = MaiWorkConfig`；`create_plugin()` 是实例工厂。`on_load()` 仅在 `plugin.enabled` 时构建并启动 `MaiWorkApp`，`on_unload()` 调 `stop()`，`on_config_update(scope="self")` 热应用配置或首次启动。缺少宿主上下文或启动失败时记录日志，不影响插件加载。
 - 两个 `@HookHandler` 钩子：`chat.receive.after_process` 将消息交 `app.on_message()`；`maisaka.planner.before_request` 将可提起备忘交 `app.on_planner_before_request()`。**这里的 planner 专指 MaiBot 回复管线，不是 MaiWork 内部规划器**；两钩子出错均返回 `{"action":"continue"}`，不抢宿主消息。
 - `__init__.py` 暴露插件类和版本；兼容只导入包内模块的测试环境。
-- `config.example.toml` 是默认关闭的配置样本：服务群以 `[[groups.serve]] group = "qq:号码"` 配置；生产密钥写运行时配置，`config.toml` 不进仓库，也不纳入地图扫描。
+- `config.example.toml` 是默认关闭的配置样本：服务群以 `[[groups.serve]] group = "qq:号码"` 配置；**「往群里发」和「谁能批本群的活」不在这里**（0.8.0 每群一份，存数据库、在网页群页里改）；旧的 `[topics] enabled / per_day`、`[delivery] push_per_day / quiet_hours`、`[approval] required / admins / exempt_*` 只作**新群第一次的迁移种子**。生产密钥写运行时配置，`config.toml` 不进仓库，也不纳入地图扫描。
 
 ## Flow
 

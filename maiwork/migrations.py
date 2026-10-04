@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -339,6 +340,247 @@ def migrate_search_config_to_extension(
 
 
 # ----------------------------------------------------------------------
+# 死配置键清理（2026-10 docs/18 第一步）
+# ----------------------------------------------------------------------
+
+# 已从配置模型里删掉的键：启动时把存量 config.toml 里的这几行一并清掉，
+# 省得管理员看到「问题清单」式困惑。只清键本身，节里的其他行一字不动。
+_DEAD_CONFIG_KEYS: tuple[str, ...] = (
+    "feeds.min_score",             # 0.3.4 起已不看它（改看 web_min_avg）
+    "feeds.ideas_per_day",         # 从来没人消费的构想上限
+    "delivery.mention_ttl_minutes",  # 「可提起清单」机制已随新鲜事递料一起退役
+    "goals.propose",               # 主动提目标 2026-10 docs/18 第一步删掉（节删空后连节一起清）
+)
+
+
+def migrate_dead_config_keys(plugin_dir: Path | str, data_dir: Path | str) -> list[str]:
+    """把 _DEAD_CONFIG_KEYS 从存量 config.toml 里删掉（一次备份、一次覆盖写）。
+
+    幂等：一个死键都没有 → []、文件不动（不备份、不重写）；有就重写一次。
+    文件不存在 / 解析失败 → []、什么都不动（不拖垮启动）。
+    返回实际删掉的「节.字段」清单。
+    """
+    import tomlkit
+
+    try:
+        text = config_file.read_text(plugin_dir)
+    except config_file.ConfigFileError:
+        return []
+    try:
+        doc = tomlkit.parse(text)
+    except Exception:
+        return []
+    deleted: list[str] = []
+    for full_key in _DEAD_CONFIG_KEYS:
+        section, _, field = full_key.partition(".")
+        sec = doc.get(section)
+        if isinstance(sec, dict) and field in sec:
+            del sec[field]
+            deleted.append(full_key)
+    # 删完某个键后这节一个键都不剩 → 连节一起删（比如 [goals] 只有 propose 那一项）
+    for key in list(doc.keys()):
+        sec = doc.get(key)
+        if isinstance(sec, dict) and not sec and any(d.startswith(key + ".") for d in deleted):
+            del doc[key]
+    if not deleted:
+        return []
+    config_file._write_back(plugin_dir, data_dir, tomlkit.dumps(doc), old_text=text)
+    logger.info("死配置键已从 config.toml 删掉：%s", "、".join(deleted))
+    return sorted(deleted)
+
+
+# ----------------------------------------------------------------------
+# kv["rules.override"] → config.toml（docs/18 第一步；这层旧覆盖赢文件值的坑没了）
+# ----------------------------------------------------------------------
+
+KV_RULES_OVERRIDE = "rules.override"  # 旧网页覆盖层的 kv 键（值 {节: {字段: 值}}）
+
+
+def migrate_rules_override_to_file(store: Any, plugin_dir: Path | str, data_dir: Path | str) -> list[str]:
+    """把 kv["rules.override"] 的值写进 config.toml，写成功才删 kv 键。
+
+    幂等；失败（文件坏了 / 写不了）抛 ConfigFileError，kv 键留着下次启动再迁。
+    日志只打改过的键名，绝不打值。
+    返回实际写进文件的「节.字段」清单（值和文件一样的键也清 kv，但不算进清单）。
+    """
+    import tomlkit
+
+    try:
+        raw = store.kv_get(KV_RULES_OVERRIDE)
+    except Exception:
+        raw = None
+    if not isinstance(raw, dict) or not raw:
+        return []
+    items: dict[str, Any] = {}
+    try:
+        for section, fields in raw.items():
+            if not isinstance(fields, dict):
+                continue
+            for field, value in fields.items():
+                key = f"{section}.{field}"
+                if isinstance(value, (dict,)):  # 只收标量/列表/布尔/数字（防御：不写 tables 进文件）
+                    continue
+                items[key] = value
+    except Exception:
+        items = {}
+    if not items:
+        # 形状全坏：直接清掉 kv 键（这层规则已认不出任何东西）
+        try:
+            with store.tx() as conn:
+                store.kv_delete(conn, KV_RULES_OVERRIDE)
+        except Exception:
+            logger.exception("清空 rules.override 出错")
+        return []
+    try:
+        text = config_file.read_text(plugin_dir)
+    except config_file.ConfigFileError:
+        raise
+    try:
+        doc = tomlkit.parse(text)
+    except Exception as e:
+        raise config_file.ConfigFileError(f"config.toml 解析失败（文件坏了？）：{e}") from None
+    file_values: dict[str, Any] = {}
+    for key in items:
+        section, _, field = key.partition(".")
+        sec = doc.get(section)
+        if isinstance(sec, dict) and field in sec:
+            file_values[key] = sec[field]
+    same_keys = {k for k, v in items.items() if k in file_values and _toml_same(file_values[k], v)}
+    write_keys = [k for k in sorted(items) if k not in same_keys]
+    if write_keys:
+        config_file.write_fields(plugin_dir, data_dir, {k: items[k] for k in write_keys})
+    try:
+        with store.tx() as conn:
+            store.kv_delete(conn, KV_RULES_OVERRIDE)
+    except Exception:
+        logger.exception("rules.override 写文件成功后清 kv 键出错")
+    if write_keys:
+        logger.info("规则覆盖已搬进 config.toml：%s；kv[" "rules.override" "] 已删除", "、".join(write_keys))
+    else:
+        logger.info("规则覆盖和 config.toml 值一致，不用写文件；kv[" "rules.override" "] 已删除")
+    return write_keys
+
+
+def _toml_same(file_value: Any, kv_value: Any) -> bool:
+    """tomlkit 解析出的文件值和 kv 里的 JSON 值算不算同一个（列表逐项比）。"""
+    try:
+        fv = list(file_value) if isinstance(file_value, (list, tuple)) or type(file_value).__name__ in ("Array",) else file_value
+        if isinstance(fv, list):
+            return [str(x) for x in fv] == [str(x) for x in (kv_value if isinstance(kv_value, list) else [])]
+        return fv == kv_value or str(fv) == str(kv_value)
+    except Exception:
+        return False
+
+
+# ----------------------------------------------------------------------
+# 主动提目标残留 kv（docs/18 第一步；功能已删，几天的标记留着没用了）
+# ----------------------------------------------------------------------
+
+_GOAL_LEFTOVER_PREFIXES = ("goals.propose_day.",)  # 每个群一条「今天提没提过」
+_GOAL_LEFTOVER_SUFFIXES = (".goal",)              # sched.<群号>.goal
+
+
+def migrate_goal_proposal_kv(store: Any) -> list[str]:
+    """删掉主动提目标留下的 kv 行（goals.propose_day.<群号>、sched.<群号>.goal）。
+
+    幂等：一行都没有 → []；有 → 删掉并返回删掉的键清单（只打键名不打值——值只
+    是日期字符串，没敏感信息，但习惯上也就这么办）。出错整批不动、下次再试。
+    """
+    try:
+        keys: list[str] = []
+        with store.tx() as conn:
+            rows = conn.execute("SELECT key FROM kv").fetchall()
+            for row in rows:
+                key = str(row[0] if not isinstance(row, sqlite3.Row) else row["key"])
+                if any(key.startswith(p) for p in _GOAL_LEFTOVER_PREFIXES) or (
+                    key.startswith("sched.") and any(key.endswith(s) for s in _GOAL_LEFTOVER_SUFFIXES)
+                ):
+                    keys.append(key)
+            for key in keys:
+                store.kv_delete(conn, key)
+    except Exception:
+        logger.exception("清主动提目标残留 kv 出错，下次启动再试")
+        return []
+    if keys:
+        logger.info("主动提目标残留 kv 已清：%d 条（%s …）", len(keys), "、".join(sorted(keys)[:8]))
+    return sorted(keys)
+
+
+# ----------------------------------------------------------------------
+# 屏蔽域名归一成按群 kv（docs/18 第一步；原来 config.toml / 全局 kv 两份）
+# ----------------------------------------------------------------------
+
+KV_BLOCKED_GLOBAL = "feeds.blocked_domains"  # 旧全局屏蔽名单 kv 键
+
+
+def migrate_blocked_domains_to_groups(
+    store: Any, plugin_dir: Path | str, data_dir: Path | str, serve_gids: list[str] | tuple[str, ...]
+) -> list[str] | None:
+    """把「config.toml [feeds] blocked_domains ∪ 全局 kv["feeds.blocked_domains"]」
+    拷进每个服务群的 kv["feeds.blocked.<gid>"]，然后删来源：全局 kv 键 + 文件里的键。
+
+    幂等：两个来源键都没了 → 什么都不动（不重写文件），免得把管理员
+    后来在某个群里改的名单盖回去。全空（生产现状）时只清两处来源，不给群写空名单。
+    域名不是密钥，日志可以打名单。
+    返回：这次实际迁掉的并集（空 = 只清来源不写群）；None = 已迁过，什么都没动。
+    """
+    from .config import normalize_domain
+    import tomlkit
+
+    def _norm(names: Any) -> list[str]:
+        if not isinstance(names, (list, tuple)):
+            return []
+        out: set[str] = set()
+        for n in names:
+            d = normalize_domain(n)
+            if d:
+                out.add(d)
+        return sorted(out)
+
+    try:
+        text = config_file.read_text(plugin_dir)
+    except config_file.ConfigFileError as e:
+        if "找不到" in str(e):
+            text = ""  # 文件不存在 = 文件侧没东西可迁，只清 kv；不写文件
+        else:
+            raise
+    try:
+        doc = tomlkit.parse(text)
+    except Exception as e:
+        raise config_file.ConfigFileError(f"config.toml 解析失败（文件坏了？）：{e}") from None
+    sec = doc.get("feeds")
+    file_names: list[str] = []
+    new_text: str | None = None
+    if isinstance(sec, dict) and "blocked_domains" in sec:
+        file_names = _norm(sec.get("blocked_domains"))
+        del sec["blocked_domains"]
+        new_text = tomlkit.dumps(doc)
+
+    kv_raw = store.kv_get(KV_BLOCKED_GLOBAL, None)
+    has_kv = isinstance(kv_raw, list)
+    kv_names = _norm(kv_raw)
+    if not file_names and not kv_names and new_text is None and not has_kv:
+        return None  # 已迁过 / 从来没有过 → 不动
+
+    union = sorted(set(file_names) | set(kv_names))
+    if union:
+        for gid in serve_gids:
+            if not gid:
+                continue
+            with store.tx() as conn:
+                store.kv_set(conn, f"feeds.blocked.{gid}", union)
+        logger.info("屏蔽名单已按群迁好（共 %d 个域名，进了 %d 个服务群）", len(union), len(list(serve_gids)))
+    if new_text is not None:
+        config_file._write_back(plugin_dir, data_dir, new_text, old_text=text)
+    if has_kv:
+        with store.tx() as conn:
+            store.kv_delete(conn, KV_BLOCKED_GLOBAL)
+    if union:
+        logger.info("按群屏蔽名单来源已清：%s", "、".join(union[:50]))
+    return union
+
+
+# ----------------------------------------------------------------------
 # 旧 [models] → [[endpoints]] + [[model_list]] + 专岗选择（2026-10 改版 1a）
 # ----------------------------------------------------------------------
 
@@ -491,3 +733,511 @@ def migrate_models_config_to_endpoints(store: Any, plugin_dir: Path | str, data_
         len(ids_by_model),
     )
     return True
+
+
+# ----------------------------------------------------------------------
+# 每群三份（docs/17 §八.1 + A 节，2026-10）启动迁移
+# ----------------------------------------------------------------------
+# 幂等判定：
+#   - 本群规矩（group_rules）的 row：已迁过 = row 存在且有 group_rule_versions 里
+#     任何一条；第一次拼的内容来自 notes/pref/memory，拼完马上写规矩（留一版 migrate
+#     版本记录）。下一次再启动：row 在 + updated_by=migrate → 仅补「上次之后新出来的
+#     那段」，不覆盖管理员后来手改的内容（updated_by 不是 migrate 时跳过拼接）。
+#   - 资讯 skill：已迁过 = kind=news 的 agent_skills 里已有 name=news-本群做法 那一份。
+#     还没建好就新建并把口味正文本进 body；已建好就不动。
+#
+# 删除旧来源（成功拼完才删）：
+#   - agent_memory_notes（每群每岗 rows）、kv["feeds.pref.<gid>"]、kv["feeds.taste.<gid>"]；
+#   - identity/memory/<gid>.md：先备份到 <data_dir>/identity/mem.bak/<gid>.md，再清空
+#     （identity.Identity 用文件字路径读，这里走文件操作，不上 Identity 类本身，避开循环依赖）。
+#
+# 参数：get_data_dir(gid) 给 identity 的 data_dir（其实全局一个）；identity 参数没被用到
+# 的文义只是占位（调用方可以先不传，这里读 Path(settings.data_dir)）。
+
+
+def _gc_served_gids(settings: Any, store: Any = None) -> list[str]:
+    """服务群名单：settings.groups 优先；没有（测试里 settings 只给 is_served）回退到
+    agent_memory_notes / kv feeds.pref / feeds.taste 里出现过的群号 + is_served 过滤。"""
+    out: set[str] = set()
+    try:
+        groups = getattr(settings, "groups", None) or {}
+        if hasattr(groups, "keys"):
+            for k in groups.keys():
+                ks = str(k or "").strip()
+                if ks:
+                    out.add(ks)
+    except Exception:
+        pass
+    if not out and store is not None:
+        try:
+            rows = store.read().execute(
+                "SELECT DISTINCT group_id FROM agent_memory_notes").fetchall()
+            for r in rows:
+                ks = str(r["group_id"] or "").strip()
+                if ks:
+                    out.add(ks)
+        except Exception:
+            pass
+        try:
+            rows = store.read().execute(
+                "SELECT key FROM kv WHERE key LIKE 'feeds.pref.%' OR key LIKE 'feeds.taste.%'").fetchall()
+            for r in rows:
+                k = str(r["key"] or "")
+                for prefix in ("feeds.pref.", "feeds.taste."):
+                    if k.startswith(prefix):
+                        out.add(k[len(prefix):])
+                        break
+        except Exception:
+            pass
+    # 最后过 is_served（测试里的 settings 没有 groups 属性但能给 is_served）
+    ok: list[str] = []
+    for gid in sorted(out):
+        try:
+            fn = getattr(settings, "is_served", None)
+            if callable(fn) and fn(gid):
+                ok.append(gid)
+        except Exception:
+            continue
+    return ok
+
+
+def _write_backup_once(bak: Path, text: str) -> bool:
+    """把 text 存到 `bak`：**绝不覆写**最早那份原件。
+
+    - `bak` 已有同样内容 → True（不用写）；
+    - `bak` 已存在但内容不同（管理员后来手写过新内容）→ 另存唯一后缀档
+      `<名>.1.md`、`<名>.2.md` …（已存在同内容的档也算备份过），绝不盖掉原件；
+    - 任何写失败 → False（调用方据此**不清原文件**，下次再试）。
+    """
+    try:
+        bak.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        logger.exception("备份每群记忆失败（%s），这条跳过清空", bak)
+        return False
+    candidates: list[Path] = [bak]
+    if bak.exists():
+        try:
+            if bak.read_text(encoding="utf-8") == text:
+                return True
+        except OSError:
+            pass
+        n = 1
+        while n <= 1000:
+            alt = bak.with_name(f"{bak.stem}.{n}{bak.suffix}")
+            if not alt.exists():
+                candidates = [alt]
+                break
+            try:
+                if alt.read_text(encoding="utf-8") == text:
+                    return True  # 这份新内容早就单独备份过
+            except OSError:
+                pass
+            n += 1
+        else:
+            logger.warning("每群记忆备份后缀档太多（%s），本次不备份", bak)
+            return False
+    target = candidates[0]
+    try:
+        target.write_text(text, encoding="utf-8")
+    except OSError:
+        logger.exception("备份每群记忆失败（%s），这条跳过清空", target)
+        return False
+    return True
+
+
+def _gc_backup_memory_file(mem_file: Path, backup_root: Path) -> None:
+    """把 memory/<gid>.md 旧内容备份到 identity/mem.bak/，再把原文件清空。
+
+    幂等 / 保真：备份**先写成功再清原文件**；最早那份原件绝不覆写（新内容另存唯一
+    后缀档）；备份写失败 → 原文件一个字不动（源保留，下次再试）。
+    """
+    if not mem_file.exists():
+        return
+    try:
+        text = mem_file.read_text(encoding="utf-8")
+    except OSError:
+        return
+    if not str(text or "").strip():
+        # 本来就是空的，只顺手删（备份意义不大）
+        try:
+            mem_file.unlink()
+        except OSError:
+            pass
+        return
+    if not _write_backup_once(backup_root / mem_file.name, text):
+        return
+    try:
+        mem_file.write_text("", encoding="utf-8")
+    except OSError:
+        logger.exception("清空每群记忆失败（%s）", mem_file)
+
+
+def _gc_collect_notes_text(store: Any, gid: str) -> str:
+    """本群提醒 agent_memory_notes 合一段：每岗按 alphabetical 拼，空的跳过。"""
+    try:
+        rows = store.read().execute(
+            "SELECT kind, notes FROM agent_memory_notes WHERE group_id=? ORDER BY kind",
+            (gid,),
+        ).fetchall()
+    except Exception:
+        return ""
+    parts: list[str] = []
+    title_of = {"news": "资讯", "idea": "构想", "goal": "目标", "task": "通用"}
+    for r in rows:
+        notes = str(r["notes"] or "").strip()
+        if not notes:
+            continue
+        title = title_of.get(str(r["kind"] or ""), str(r["kind"] or ""))
+        parts.append(f"【{title}岗的工作册（管理员写的）】\n{notes}")
+    return "\n\n".join(parts)
+
+
+def migrate_group_context_to_rules_and_skills(
+    store: Any,
+    settings: Any,
+    identity: Any,
+    get_data_dir: Any = None,
+) -> dict[str, Any]:
+    """把旧 6 处「这个群该怎么做」的散件拼进每群三份；返回 {rules_updated:[gid], skills_created:[gid]}。
+
+    幂等：已迁过的群 / 已经建起 skill 的群再来一次什么都不做；
+    非服务群一律不碰。"""
+    from .agents import Agents  # 局部导入以防环
+    from .clock import now as _now
+
+    agents = Agents(store, lambda: settings)
+    out: dict[str, Any] = {"rules_updated": [], "skills_created": []}
+    try:
+        gids = _gc_served_gids(settings, store=store)
+    except Exception:
+        gids = []
+    if not gids:
+        return out
+    if get_data_dir is None:
+        dd = getattr(settings, "data_dir", None)
+        get_data_dir = lambda _g: str(dd) if dd is not None else ""  # noqa: E731
+    for gid in gids:
+        try:
+            _migrate_one_group(store, settings, agents, gid, get_data_dir, out, _now())
+        except Exception:
+            logger.exception("每群三份迁移失败（群 %s），跳过这个群", gid)
+    return out
+
+
+def _migrate_one_group(
+    store: Any,
+    settings: Any,
+    agents: Any,
+    gid: str,
+    get_data_dir: Any,
+    out: dict[str, Any],
+    now: float,
+) -> None:
+    pref = str(store.kv_get(f"feeds.pref.{gid}", "") or "").strip()
+    taste_raw = store.kv_get(f"feeds.taste.{gid}", None) or {}
+    taste_text = str(taste_raw.get("text") or "").strip() if isinstance(taste_raw, dict) else ""
+    notes_block = _gc_collect_notes_text(store, gid)
+    dd_str = str(get_data_dir(gid) or "").strip()
+    mem_file = (Path(dd_str) / "identity" / "memory" / f"{gid}.md") if dd_str else None
+    mem_text = ""
+    if mem_file is not None and mem_file.exists():
+        try:
+            mem_text = mem_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            mem_text = ""
+
+    # 1) 资讯 skill：把口味小结拼成初始正文（只在没有那份时）
+    skill_exists = bool(agents.skills(gid, "news", include_archived=True))
+    if not skill_exists:
+        try:
+            agents.skill_add(gid, "news", description="", body=taste_text,
+                             source="migrate", note="开迁移：口味小结进本群做法")
+            if taste_text:
+                out["skills_created"].append(gid)
+            skill_exists = True
+        except FileExistsError:
+            skill_exists = True  # 别人先建了；口味当已迁过
+    if skill_exists:
+        # skill 已就位 → 口味 kv 已经迁过，清掉（它以后不会再被读）
+        try:
+            if store.kv_get(f"feeds.taste.{gid}") is not None:
+                with store.tx() as conn:
+                    store.kv_delete(conn, f"feeds.taste.{gid}")
+        except Exception:
+            pass
+
+    # 2) 本群规矩：拼 notes + pref + memory（原文原段）；只在没有、或上一次是我们 migrate 来的时候才补。
+    #    幂等口径：**按整段内容精确判重**（不用标题 marker 粗判）——正文里已经有这一整段
+    #    就跳过，不再重复 append（清理失败重跑时不会越拼越长）；真正新出现的段才补一次。
+    cur = agents.group_rules_get(gid)
+    body = str(cur.get("body") or "")
+    owns_body = (not body) or cur.get("updated_by") == "migrate"   # 管理员手改权威不动
+
+    pref_part = f"【管理员写的资讯偏好】\n{pref}" if pref else ""
+    notes_part = notes_block or ""
+    mem_part = f"【群里之前的工作记忆】\n{mem_text}" if mem_text else ""
+
+    new_parts: list[str] = []
+    if owns_body:
+        for part in (notes_part, pref_part, mem_part):
+            if part and part not in body:
+                new_parts.append(part)
+
+    final_body = body
+    if new_parts:
+        candidate = (body + "\n\n" if body else "") + "\n\n".join(new_parts)
+        if len(candidate) <= 3000:
+            try:
+                agents.group_rules_set(gid, candidate, updated_by="migrate")
+                out["rules_updated"].append(gid)
+                final_body = candidate
+            except ValueError:
+                logger.warning("本群规矩迁移后超长不覆盖（群 %s），内容保留在旧处", gid)
+        else:
+            logger.warning("本群规矩迁移后超长不覆盖（群 %s），内容保留在旧处", gid)
+
+    # 3) 删旧来源：只有正文归我们管（空 / 上次 migrate 来的）、且这段内容确实已在正文里
+    #    才删；超长写不下 / 管理员手改过 → 源一律留着。逐项独立重试（一项失败不拖累其他），
+    #    所以「已经迁进去、只是清理失败」的下一轮还能接着清。
+    if owns_body:
+        for part, clearer in (
+            (notes_part, lambda: _gc_try_clear_notes(store, gid)),
+            (pref_part, lambda: _gc_try_clear_pref(store, gid)),
+        ):
+            if not part or part in final_body:
+                clearer()
+        if mem_file is not None and (not mem_part or mem_part in final_body):
+            try:
+                bak_root = (Path(dd_str) / "identity" / "mem.bak") if dd_str else None
+                if bak_root is not None:
+                    _gc_backup_memory_file(mem_file, bak_root)
+                else:
+                    mem_file.write_text("", encoding="utf-8")
+            except Exception:
+                logger.exception("备份每群记忆出错（群 %s）", gid)
+
+
+def _gc_try_clear_pref(store: Any, gid: str) -> None:
+    """清 kv["feeds.pref.<gid>"] 旧来源；失败只记日志（下次启动再清）。"""
+    try:
+        with store.tx() as conn:
+            store.kv_delete(conn, f"feeds.pref.{gid}")
+    except Exception:
+        logger.exception("清资讯偏好旧来源出错（群 %s）", gid)
+
+
+def _gc_try_clear_notes(store: Any, gid: str) -> None:
+    """清 agent_memory_notes 里本群的行（**不 DROP 表**）；失败只记日志。"""
+    try:
+        with store.tx() as conn:
+            conn.execute("DELETE FROM agent_memory_notes WHERE group_id=?", (gid,))
+    except Exception:
+        logger.debug("清本群提醒旧来源表出错（群 %s，表可能还没建）", gid, exc_info=True)
+
+
+# ----------------------------------------------------------------------
+# 群控归一（0.8.0 docs/18 §五 + 往群里发）：全局旧键 → 每个服务群一份
+# ----------------------------------------------------------------------
+#
+# 以前「谁能批本群的活 / 免批」「冷场开话题 / 往群里发多少 / 几点不打扰」是全局一份
+# （config.toml）。0.8.0 起每个服务群自己一份（kv["group_approval.<群号>"] /
+# kv["group_push.<群号>"]），全局这几行只作**新群第一次的迁移种子**——先按服务群把
+# 每群那份种好（用还没清过的 settings），确认真落库了，才把全局旧键从 config.toml 删掉。
+# 失败就一个都不删（源保留，下次启动再迁）。
+#
+# 注意：这几个键**不能**进 _DEAD_CONFIG_KEYS——deadclean 是启动第一步，会先把它删了，
+# 那样就没种子可迁了。父会话（app.py）把本函数接在 deadclean **之前**。
+#
+# 日志只打键名 / 群号，绝不打值（可能含密钥或账号）。
+
+# 旧的全局「谁能批 / 免批」四键（group_approval.py 的种子；种好删）
+GROUP_APPROVAL_SEED_KEYS: tuple[str, ...] = (
+    "approval.required",
+    "approval.admins",
+    "approval.exempt_groups",
+    "approval.exempt_users",
+)
+
+# 旧的全局「开话题 / 往群里发多少 / 几点不打扰」五键（group_push.py 的种子；种好删）
+GROUP_PUSH_SEED_KEYS: tuple[str, ...] = (
+    "topics.enabled",
+    "topics.speaker",
+    "topics.per_day",
+    "delivery.push_per_day",
+    "delivery.quiet_hours",
+)
+
+
+def _served_group_ids(settings: Any) -> list[str]:
+    """配置里的服务群（稳定排序）；认不出 / 一个都没有 → []。"""
+    groups = getattr(settings, "groups", None)
+    keys = getattr(groups, "keys", None)
+    if not callable(keys):
+        return []
+    try:
+        raw = list(keys())
+    except Exception:
+        return []
+    return sorted({str(g).strip() for g in raw if str(g or "").strip()})
+
+
+def _resolve_push_module(explicit: Any = None) -> Any:
+    """拿 group_push 模块；合同对不上（没有 get_config / KV_PREFIX）→ None（降级只迁批准）。
+
+    只要求 get_config(store, gid, settings)：种每群那一条就是它的本职。别的接口
+    （set_config / view …）本迁移不用，模块还没长好也不该把启动拖下水。
+    """
+    if explicit is not None:
+        if callable(getattr(explicit, "get_config", None)) and isinstance(getattr(explicit, "KV_PREFIX", None), str):
+            return explicit
+        return None
+    try:
+        from . import group_push
+    except Exception:
+        logger.warning("往群里发模块没就位，本次只迁批准名单（推送旧键先留着）")
+        return None
+    if not callable(getattr(group_push, "get_config", None)):
+        return None
+    if not isinstance(getattr(group_push, "KV_PREFIX", None), str):
+        return None
+    return group_push
+
+
+def _seed_ready_settings(settings: Any) -> Any:
+    """给群控归一用的「允许播种」settings 副本。
+
+    这个函数**就是**旧全局设置 → 每群一份的物化动作：helper 的惰性种子门
+    （`group_controls_seed_ready`）对 App 的普通读取是关着的，但迁移这一步必须能种。
+    真 Settings 才 replace（顺带把门打开）；假 settings / 没有这个字段的照原样传。
+    """
+    import dataclasses
+
+    if not dataclasses.is_dataclass(settings):
+        return settings
+    if getattr(settings, "group_controls_seed_ready", True) is True:
+        return settings
+    try:
+        return dataclasses.replace(settings, group_controls_seed_ready=True)
+    except Exception:
+        return settings
+
+
+def migrate_group_controls(
+    store: Any,
+    settings: Any,
+    plugin_dir: Path | str,
+    data_dir: Path | str,
+    *,
+    push_module: Any = None,
+) -> dict[str, Any]:
+    """0.8.0 群控归一的启动迁移（幂等）。返回一次运行的报告：
+
+    {
+      "seeded_approval": [群号…],   # 这次真种下的每群批准名单（已有记录不算）
+      "seeded_push":     [群号…],   # 这次真种下的每群推送设置
+      "deleted":         ["approval.admins", …],  # 真从 config.toml 删掉的旧键
+      "push_available":  bool,      # 往群里发那部分这次种成功、可迁
+      "problem":         "",        # 非空 = 有东西没做完，旧键一律保留
+    }
+    """
+    result: dict[str, Any] = {
+        "seeded_approval": [],
+        "seeded_push": [],
+        "deleted": [],
+        "push_available": False,
+        "problem": "",
+    }
+    if store is None or settings is None:
+        return result
+    groups = _served_group_ids(settings)
+    if not groups:
+        # 一个服务群都没有：没有「每群一份」可种，全局键留着（以后加的群还要靠它当种子）
+        return result
+
+    # 1) 每群批准名单（group_approval）：先种，确认落库
+    try:
+        from .group_approval import KV_PREFIX as _approval_kv
+        from .group_approval import GroupApprovals
+    except Exception:
+        logger.exception("每群批准名单模块没就位，本次不迁（旧键全部保留）")
+        result["problem"] = "每群批准名单模块没就位，旧键先留着"
+        return result
+    # 迁移这一步本身就是「旧全局 → 每群一份」的物化：显式把 helper 的惰性种子门打开
+    # （App 的普通读取门是关着的），保证这次真能种下去。
+    seed_settings = _seed_ready_settings(settings)
+    approvals = GroupApprovals(store, get_settings=lambda: seed_settings)
+    for gid in groups:
+        try:
+            before = store.kv_get(_approval_kv + gid, None)
+            approvals.get(gid)  # 惰性种（已有记录不动）
+            after = store.kv_get(_approval_kv + gid, None)
+            if not isinstance(after, dict):
+                raise RuntimeError("每群批准名单没落库")
+            if not isinstance(before, dict):
+                result["seeded_approval"].append(gid)
+        except Exception:
+            logger.exception("群 %s 的批准名单迁移失败（旧的全局键先留着，下次启动再试）", gid)
+            result["problem"] = f"群 {gid} 的批准名单没能落库，旧的全局键先留着"
+            return result
+
+    # 2) 每群「往群里发」（group_push，接口对上才做）：同样先种、确认落库
+    push = _resolve_push_module(push_module)
+    if push is None:
+        result["problem"] = result["problem"] or "往群里发模块接口没对上，推送旧键先留着"
+    else:
+        ok = True
+        for gid in groups:
+            try:
+                before = store.kv_get(push.KV_PREFIX + gid, None)
+                push.get_config(store, gid, seed_settings)
+                after = store.kv_get(push.KV_PREFIX + gid, None)
+                if not isinstance(after, dict):
+                    raise RuntimeError("每群推送设置没落库")
+                if not isinstance(before, dict):
+                    result["seeded_push"].append(gid)
+            except Exception:
+                logger.exception("群 %s 的往群里发设置迁移失败（推送旧键先留着，下次启动再试）", gid)
+                ok = False
+                break
+        result["push_available"] = bool(ok)
+        if not ok:
+            result["problem"] = result["problem"] or "往群里发设置没能全部落库，推送旧键先留着"
+
+    # 3) 都种好了才清源：读一次文件、一次备份、一次覆盖写
+    import tomlkit
+
+    if not config_file.config_path(plugin_dir).exists():
+        # 没有配置文件 = 文件里也没有旧键可删；每群记录已种好，这轮算做完
+        return result
+    try:
+        text = config_file.read_text(plugin_dir)
+        doc = tomlkit.parse(text)
+    except Exception:
+        logger.exception("读 / 解析 config.toml 失败，旧全局键一个不删（下次启动再试）")
+        result["problem"] = result["problem"] or "config.toml 读不了或解析失败，旧键先留着"
+        return result
+
+    want = list(GROUP_APPROVAL_SEED_KEYS)
+    if result["push_available"]:
+        want.extend(GROUP_PUSH_SEED_KEYS)
+    deletions: list[str] = []
+    for full_key in want:
+        section, _, field = full_key.partition(".")
+        sec = doc.get(section)
+        if isinstance(sec, dict) and field in sec:
+            del sec[field]
+            deletions.append(full_key)
+    # 刚删空的节连节一起删（比如 [delivery] 只有那两个键）；还有别的键的节留
+    for name in list(doc.keys()):
+        sec = doc.get(name)
+        if isinstance(sec, dict) and not sec and any(k.startswith(name + ".") for k in deletions):
+            del doc[name]
+    if not deletions:
+        return result
+    config_file._write_back(plugin_dir, data_dir, tomlkit.dumps(doc), old_text=text)
+    result["deleted"] = sorted(deletions)
+    logger.info(
+        "群控归一迁移：%d 个服务群的每群配置已就位，旧全局键已从 config.toml 删掉：%s",
+        len(groups), "、".join(result["deleted"]),
+    )
+    return result

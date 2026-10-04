@@ -15,7 +15,10 @@
 - 工具角色（roles）：主模型挑活时给的「子 agent 工具名单」按 roles 现查注册表
   （worker_job_tool_names），roles 含 main 的 MCP 工具不在里面；排计划回合
   （main_plan_tool_specs，只读：roles 含 main 的 MCP 工具 + list_skills / read_skill）
-  和验收回合（main_review_tool_specs）会带上 roles 含 main 的 MCP 工具。
+  和验收回合（main_review_tool_specs）会带上 roles 含 main 的 MCP 工具。这两个只读
+  回合还会把这份工具表写进 ToolContext.allowed_tools（spec_tool_names，本轮硬权限）：
+  模型捏造表外的工具名（remember / 群空间工具 / 别的角色）在 Tools.call 就被拒、落审计，
+  摸不到 handler——光给 specs 提示挡不住。
 - 群空间（tools_groupspace.py，roles={"main"}）：验收通过、交付之前，如果 app 有
   group_space 且这个群 capabilities 里有任一能力为真，给主模型开一个「群空间」小回合
   （最多 4 轮工具调用，只给这个群能力允许的那几个工具）。只有任务明确需要时才动
@@ -51,6 +54,7 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -68,6 +72,10 @@ _MAX_ATTEMPTS = 3
 _CRITERIA_MAX = 5  # 完成标准最多留 5 条（2026-10-01 用户：网页任务详情太长）
 _PLAN_TOOL_LIMIT = 6  # 排计划阶段主模型最多用 6 轮只读工具（查资料 / 读 skill）
 _REVIEW_TOOL_LIMIT = 6  # 验收阶段主模型最多用 6 轮只读工具
+# 验收 6 轮用完还没吐出可解析 JSON 时，再强制重试的轮数（追加一句「请只输出 JSON
+# 结论」，tools=None + json_mode=True）。仍不行不判死——退回队列重跑一轮（走「验收
+# 不通过」同一套机制，计入 _MAX_ATTEMPTS；2026-10 线上 T-2 白烧约 119 万 token 的整改）。
+_REVIEW_FORCE_JSON_TRIES = 2
 _REMEMBER_TOOL_LIMIT = 2  # 「记经验」小回合最多 2 次工具调用（验收通过、交付之前）
 _GROUPSPACE_TOOL_LIMIT = 4  # 群空间小回合最多 4 轮工具调用（验收通过、交付之前）
 _TEXT_DELIVER_FALLBACK_NOTE = "做好了，请查收"
@@ -167,6 +175,106 @@ def looks_like_research_brief(brief: str) -> bool:
     text = str(brief or "")
     return any(word in text for word in _RESEARCH_JOB_WORDS)
 
+# 开工前能力自检（2026-10 线上 T-7 整改）：验收标准要「图片本地存放」、交接单
+# tools 却只有 read/write/list，子 agent 下载不了，验收连打回 3 轮、烧约 1410 万
+# prompt token。规则（写清楚、可测）：交接单 / 完成标准文本里出现下面这些词，
+# 判定需要「下载 / 执行」能力（本地存图、下载文件、压缩包、跑代码）：
+_NEED_EXEC_WORDS = (
+    "下载",            # 下载图片 / 下载文件 / 下载下来
+    "保存到本地", "存到本地", "本地存",  # 图片/文件本地存放
+    "压缩包", "打包成",
+    "运行代码", "跑代码", "执行脚本", "跑脚本", "跑一下",
+    "截图",
+)
+# 「有执行能力」的工具名：本机命令工具 + 远端机器的执行工具。名字只是候选——
+# 2026-10 复核：还要过「岗位角色门控 + 注册表真有」才算数（见 _job_effective_tools）。
+_EXEC_TOOL_NAMES = frozenset({"run_command", "start_process", "vm_run", "machine_run"})
+
+
+def job_needs_exec_capability(text: str) -> bool:
+    """交接单 / 完成标准文本里有没有「要下载 / 本地存图 / 压缩包 / 跑代码」的字样。
+
+    命中 → 这个活儿没有执行类工具多半做不成（下载图片到本地、解压、跑脚本都要
+    run_command 一类工具；fetch_page 只能拿网页正文，存不了二进制文件）。
+    """
+    body = str(text or "")
+    return any(word in body for word in _NEED_EXEC_WORDS)
+
+
+# 开工前能力闸（2026-10 复核收口）：发现「这条活要执行工具、子 agent 实际拿不到」时，
+# 把说明反馈给主模型重排计划的**上限**——全流程不会无限重 plan（每次尝试最多 1 次）。
+_CAPABILITY_REPLAN_LIMIT = 1
+
+
+@dataclass(frozen=True)
+class ExecFinding:
+    """一条活的能力自检结论（只有要执行工具、且真出问题的活才进 findings）。
+
+    status：filled（按岗位允许的范围补上了执行工具）/ unavailable（拿不到，做不成）；
+    本来就拿得到执行工具的活不进 findings（省得报告被无关的活撑长）。
+    """
+
+    job: int
+    agent: str
+    brief: str
+    status: str
+    tool: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ExecCheckReport:
+    """`_exec_capability_self_check` 的返回结构。
+
+    给 run_attempt 用：`blocked` → 先做一次有界重排；重排后还 blocked → 暂停
+    （不是失败）。这里只装**正常诊断出来的结论**：查不到 / 岗位不可用 / 工具没注册 /
+    名单解析不出来都走 `_job_effective_tools` 的空名单 + why，绝不因为查不到就把活当成
+    能做。自检过程中的**意外**异常不在这里吞掉——必须冒到 run_attempt 外层既有的
+    fail-closed（按「能力检查没完成」安全暂停），否则「检查自己炸了」会被当成「检查
+    通过」照样派 Workers（2026-10 复核，硬 fail-open）。
+    """
+
+    findings: tuple[ExecFinding, ...] = ()
+
+    @property
+    def blocked(self) -> bool:
+        return any(f.status == "unavailable" for f in self.findings)
+
+    @property
+    def blocked_findings(self) -> tuple[ExecFinding, ...]:
+        return tuple(f for f in self.findings if f.status == "unavailable")
+
+    @property
+    def filled_tools(self) -> tuple[str, ...]:
+        return tuple(f.tool for f in self.findings if f.status == "filled" and f.tool)
+
+    def replan_note(self) -> str:
+        """反馈给主模型的重排说明：哪条活、派给谁、为什么拿不到、只许改什么。"""
+        parts = [
+            f"第 {f.job} 条活「{f.brief}」：{f.reason or '子 agent 拿不到执行工具'}"
+            for f in self.blocked_findings
+        ]
+        head = "；".join(parts) if parts else "有条活要执行工具，但子 agent 拿不到"
+        return (
+            f"{head}。只许改 jobs：把这条活改派给能拿到执行工具的岗位"
+            "（例如 task 这类通用执行岗），或者改成不需要下载落盘/跑命令的做法"
+            "（例如给出来源页链接+出处署名）；岗位上限里没有的工具不要硬塞给子 agent，"
+            "真做不到就别硬派。"
+        )
+
+    def pause_reason(self) -> str:
+        """暂停原因（大白话，给管理员看）：说清哪条活、为什么、下一步怎么办。"""
+        parts = [
+            f"第 {f.job} 条活「{f.brief}」{f.reason or '子 agent 拿不到执行工具'}"
+            for f in self.blocked_findings
+        ]
+        head = "；".join(parts) if parts else "这条活要执行工具，但子 agent 拿不到"
+        return (
+            f"开工前对不上：{head}。已经把说明反馈给主模型重排过一次计划，还是做不到，"
+            "先停下等你决定（一个子 agent 都没派出去）。点「继续」会再试一次；"
+            "也可以把「本地存图/下载」改成给出来源页链接+出处署名，或取消。"
+        )[:400]
+
 # 本机命令类工具（选 railway 时从子 agent 工具名单里换成 vm_*）
 _LOCAL_EXEC_TOOLS = ("run_command", "start_process", "check_process", "stop_process")
 # railway 一次性机器上给子 agent 的工具（vm_fetch_file 把成品拷回本机工作区）
@@ -218,6 +326,22 @@ def worker_job_tool_names(tools: Any) -> list[str]:
     return names or list(_BUILTIN_WORKER_TOOLS)
 
 
+def spec_tool_names(specs: Any) -> tuple[str, ...]:
+    """从工具表（Tools.specs 的 OpenAI 结构）里取工具名，按出现顺序去重。
+
+    给排计划 / 验收这两个只读回合当**本轮硬权限**名单（ToolContext.allowed_tools）用：
+    模型只能调这个回合真给出去的工具；名字不在表里的（remember / 群空间工具 / 别的角色）
+    在 Tools.call 那层直接拒，不会摸到 handler。结构认不出的条目跳过。
+    """
+    names: list[str] = []
+    for spec in specs or []:
+        fn = spec.get("function") if isinstance(spec, dict) else None
+        name = str((fn or {}).get("name") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return tuple(names)
+
+
 def main_review_tool_specs(tools: Any) -> list[dict]:
     """主模型验收回合的工具表：两个只读核对工具 + roles 含 main 的 MCP 工具。
 
@@ -238,16 +362,17 @@ def main_review_tool_specs(tools: Any) -> list[dict]:
     return tools.specs("main", names)
 
 
-def main_plan_tool_specs(tools: Any) -> list[dict]:
-    """主模型「排计划」回合的工具表：list_skills / read_skill（只在有 roles 含 main 的
-    skill 时给）+ roles 含 main 的 MCP 工具。两样都没有 → 空表，排计划照旧一次纯 JSON 调用。
+def main_plan_tool_specs(tools: Any, *, group_id: str = "") -> list[dict]:
+    """主模型「排计划」回合的工具表：list_skills / read_skill（有 main 通用 skill，或
+    本群有 kind=task 的 active 做法时给）+ roles 含 main 的 MCP 工具。两样都没有 →
+    空表，排计划照旧一次纯 JSON 调用。
 
     只给查资料 / 读 skill 用的工具：群空间工具、remember、inspect_file(s)、exec 工具
     都有各自的回合或用途，不混进排计划（工具只用来查，不拿来把活干了）。
     MCP 的 roles 在这里真生效：只含 worker 的 MCP 工具不出现。查注册表出错 → 记日志、
     返回空表（排计划退回「一次 json_mode 调用」的老行为）。
     """
-    names = list(_PLAN_SKILL_TOOLS) if _has_main_skills(tools) else []
+    names = list(_PLAN_SKILL_TOOLS) if _plan_skill_tools_on(tools, group_id) else []
     try:
         specs = tools.specs("main")
     except Exception:
@@ -262,8 +387,8 @@ def main_plan_tool_specs(tools: Any) -> list[dict]:
 
 
 def _has_main_skills(tools: Any) -> bool:
-    """有没有 roles 含 main 的 skill。没有就不给排计划回合 skill 工具——
-    否则 list_skills / read_skill 总是注册着，每次排计划都会白白变成多轮工具回合。
+    """有没有 roles 含 main 的 skill（当前生效的；手动停用的不算）。
+
     认不出 skill 注册表（测试桩等）→ 按「有」算，交给 Tools 自己决定。"""
     registry = getattr(tools, "skill_registry", None)
     if registry is None:
@@ -273,6 +398,63 @@ def _has_main_skills(tools: Any) -> bool:
     except Exception:
         logger.exception("查主模型 skill 出错，这次排计划不给 skill 工具")
         return False
+
+
+def _group_has_task_skills(tools: Any, group_id: str) -> bool:
+    """**这个群**有没有给主模型看的做事做法（kind=task 的 active skill）。
+
+    只看调用方给的那个群：别的群有做法不算（不能因为别群有做法就开工具）；
+    非服务群 / 读库出错 → False（不开工具，也不泄露别的群）。"""
+    gid = str(group_id or "").strip()
+    agents_obj = getattr(tools, "_agents", None)
+    if not gid or agents_obj is None:
+        return False
+    try:
+        return bool(agents_obj.skills(gid, "task", include_archived=False))
+    except Exception:
+        logger.debug("查本群 task skill 出错（群 %s），这次排计划不给 skill 工具", gid, exc_info=True)
+        return False
+
+
+def _plan_skill_tools_on(tools: Any, group_id: str = "") -> bool:
+    """排计划要不要给 list_skills / read_skill。
+
+    - 有 roles 含 main 的通用 skill（如内置 find-skills）→ 给；
+    - 或本群有 kind=task 的做事做法 → 给（此时即使没有通用 main skill、导航 skill
+      被停用，本群做法也让主模型读得到）；
+    - 都没有 → 不给（排计划保持一次纯 JSON 调用，不白白多轮）。"""
+    if _has_main_skills(tools):
+        return True
+    return _group_has_task_skills(tools, group_id)
+
+
+_PLAN_SKILL_HINT_MAX = 120  # 排计划提示里每条 skill 的触发说明最多这么长（不塞全文）
+
+
+def main_skill_hint(tools: Any) -> str:
+    """排计划提示里的「可用技能」清单：一行一条「名字：触发说明」。
+
+    只列 roles 含 main 且当前生效的通用 skill（全局开关已在 registry.list 里过滤）；
+    没有 → 空串。本群做法不在这里（已由 group_context 的「本群做法」段注入），
+    也不塞 SKILL.md 全文、不在这里跑任何外部查找。"""
+    registry = getattr(tools, "skill_registry", None)
+    if registry is None:
+        return ""
+    try:
+        items = registry.list("main")
+    except Exception:
+        logger.exception("查主模型 skill 清单出错，这次不提示")
+        return ""
+    lines: list[str] = []
+    for item in items:
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        desc = " ".join(str(item.get("description") or "").split())
+        if len(desc) > _PLAN_SKILL_HINT_MAX:
+            desc = desc[:_PLAN_SKILL_HINT_MAX].rstrip() + "…"
+        lines.append(f"- {name}：{desc}" if desc else f"- {name}")
+    return "\n".join(lines)
 
 
 def _parse_plan_json(text: Any) -> Any:
@@ -790,8 +972,24 @@ class Coordinator:
             return base
         return base | frozenset(extra)
 
+    def _group_context_safe(self, gid: str, kind: str) -> str:
+        """统一注入（docs/17 §八.2）：本群规矩 + 本群<岗>的做法；没接线 / 出错 → ""。"""
+        try:
+            specialists = getattr(self, "_specialists", None)
+            agents = self._sp_agents_of(specialists)
+            if agents is None:
+                agents = getattr(self, "_agents", None)  # 专岗没就位时用 app 挂的同一份
+            if agents is None:
+                return ""
+            from . import group_context as _gc
+
+            return str(_gc.group_context(agents, str(gid), kind) or "").strip()
+        except Exception:
+            logger.warning("读本群规矩 / 做法出错（群 %s 岗 %s），这次不注入", gid, kind, exc_info=True)
+            return ""
+
     def _identity_prefix(self, gid: str, *, with_memory: bool) -> str:
-        """AGENTS（做事规矩）+ 可选工作记忆；没 identity / 空 → ""。主模型提示词的最前面。"""
+        """AGENTS（做事规矩）+ 可选工作记忆 + 统一注入（规矩 + 通用执行做法）。"""
         identity = self._identity
         if identity is None:
             return ""
@@ -809,10 +1007,21 @@ class Coordinator:
                     parts.append(str(block).rstrip("\n"))
             except Exception:
                 pass
+            # 本群三份统一注入（§八.2）：规矩 + 「通用执行」skill 清单（主模型排计划/验收要看）
+            gc = self._group_context_safe(gid, "task")
+            if gc:
+                parts.append(gc.rstrip("\n"))
         return ("\n\n".join(parts) + "\n\n") if parts else ""
 
-    async def _plan(self, task: dict, prior_review: str = "") -> dict:
-        """主模型计划：决定 criteria / deliver_kind / jobs / question。"""
+    async def _plan(
+        self, task: dict, prior_review: str = "", capability_note: str = ""
+    ) -> dict:
+        """主模型计划：决定 criteria / deliver_kind / jobs / question。
+
+        `capability_note` 非空 = 这是「开工前对不上」之后的一次**有界重排**（只可能发生
+        一次）：说明里写清哪条活拿不到执行工具，并明说这一轮只许改 jobs——完成标准 /
+        交付形式 / 机器 / 提问都不许动，免得主模型顺手把用户定的验收口径降下来。
+        """
         gid = str(task["group_id"])
         entries = []
         try:
@@ -845,6 +1054,15 @@ class Coordinator:
             prompt_lines.append(f"上一次验收意见：{prior_review}")
             prompt_lines.append(
                 "（这次要返工的点写进 jobs 的 brief 里交代给子 agent，不要写进完成标准。）"
+            )
+        if capability_note:
+            prompt_lines.append("")
+            prompt_lines.append("开工前发现的问题（这一轮必须解决）：")
+            prompt_lines.append(str(capability_note))
+            prompt_lines.append(
+                "这一轮**只改 jobs**（每条活派给谁、怎么做）：完成标准一个字都不要改，"
+                "不要为了让活好做就降低标准；交付形式、用哪台机器、要不要问发起人也都不要改。"
+                "想不出真能做到的办法就别硬派——我们宁可停下来，也不派一条注定做不成的活。"
             )
         # 网页任务详情要一眼看完（2026-10-01 用户：「任务写的好长」）
         prompt_lines.append("")
@@ -889,11 +1107,19 @@ class Coordinator:
             "（子 agent 工具名单：" + " / ".join(worker_job_tool_names(self._tools)) + "；"
             "只能从这里挑，别多要）"
         )
+        role_lines = self._role_tools_hint_lines()
+        if role_lines:
+            prompt_lines.append("")
+            prompt_lines.append(
+                "每个岗位实际能拿到的工具（派活前先看这个：别把要下载落盘 / 跑命令的活"
+                "派给拿不到的岗）："
+            )
+            prompt_lines.extend(role_lines)
 
         prefix = self._identity_prefix(gid, with_memory=True)
         tid = str(task["id"])
         ws_name = str(task.get("workspace") or self._workspace_name(gid))
-        specs = main_plan_tool_specs(self._tools)
+        specs = main_plan_tool_specs(self._tools, group_id=gid)
         if not specs:
             # 一个排计划能用的工具都没有（roles 含 main 的 MCP / skill 工具全没注册）：
             # 行为完全不变——一次 json_mode=True 的纯 JSON 调用，不带 tools。
@@ -909,6 +1135,12 @@ class Coordinator:
             except (ValueError, TypeError) as e:
                 raise ModelError(f"主模型计划返回不是合法 JSON：{e}") from None
         else:
+            skill_hint = main_skill_hint(self._tools)
+            if skill_hint:
+                prompt_lines.append(
+                    "可用技能（要细看就 read_skill 读全文；只在这条活确实用得上时才读，不用每条都读）："
+                )
+                prompt_lines.append(skill_hint)
             prompt_lines.append(
                 "你可以先用这些工具查资料 / 读 skill 再定计划；工具只用来查，"
                 "不要用它们直接把活干了；查完只回上面的 JSON。"
@@ -920,8 +1152,11 @@ class Coordinator:
                 ws_path = self._env.workspace(ws_name)
             except Exception:
                 ws_path = None
+            # 本轮硬权限：只有 specs 里真给出去的工具能调。模型捏造 remember /
+            # 群空间工具（role=main 但不在这一回合）在 Tools.call 就被拒，摸不到 handler。
             ctx = ToolContext(
-                group_id=gid, task_id=tid, actor="主模型", workspace=ws_path, role="main"
+                group_id=gid, task_id=tid, actor="主模型", workspace=ws_path, role="main",
+                allowed_tools=spec_tool_names(specs),
             )
             data = None
             for _round in range(_PLAN_TOOL_LIMIT):
@@ -1188,6 +1423,50 @@ class Coordinator:
             msg = f"本机不能隔离跑命令（{why}），专用机器和一次性机器也都没拿到：这个任务做不了"
             logger.warning("任务 %s %s", tid, msg)
             self._fail_with_err(tid, attempt_id, msg, gid)
+            return "done"
+
+        # 开工前能力闸（2026-10 线上 T-7；2026-10 复核收口）：验收要「下载/本地存图/跑代码」
+        # 时，按子 agent **实际会拿到的工具**（环境换名 + 岗位角色门控 + 注册表真伪）判。
+        # 能补就补；补不了先把说明反馈给主模型**重排一次**计划（只改 jobs，有界）；重排后
+        # 复查还不行 → 暂停（不是失败）：Workers 零执行、明确 reason、不扣尝试资源、
+        # 已经拿到的一次性机器释放掉。远端一样要过岗位门控：vm_* / machine_* 会被
+        # news/idea/goal 的只读上限压掉，不能因为「在远端」就当成有执行能力。
+        # 自检**内部**的意外异常一律向上抛（自检自己不再吞），所以要靠下面这条 except 兜：
+        # 它才是「检查没完成 → 安全暂停」的唯一出口（2026-10 复核，之前内层吞成空 report，
+        # 这条 except 永远收不到，属于硬 fail-open）。
+        on_remote = bool(on_railway or railway_box)
+        try:
+            report = self._exec_capability_self_check(
+                tid, gid, plan, on_remote=on_remote, box=railway_box,
+            )
+            replans = 0
+            while report.blocked and replans < _CAPABILITY_REPLAN_LIMIT:
+                replans += 1
+                fixed = await self._replan_for_capability(
+                    tid, gid, plan, report, on_remote=on_remote, prior_review=review_text,
+                )
+                if fixed is None:
+                    break
+                plan = fixed
+                jobs = plan["jobs"]
+                report = self._exec_capability_self_check(
+                    tid, gid, plan, on_remote=on_remote, box=railway_box,
+                )
+            if report.blocked:
+                await self._release_remote(railway_box)
+                self._pause_for_capability(tid, gid, plan, report, attempt_id=attempt_id)
+                return "done"
+        except Exception:
+            # 闸本身出意外：不许 fail-open（「记一笔照老行为继续开工」等于能力闸形同不存在，
+            # 最坏照旧白烧 token），也不许把任务卡在 running（人工 raise 会让卡片一直转）。
+            # 口径：安全暂停 reason「能力检查没完成」——Workers 零执行、一次性 / 专用机器先
+            # 释放、不记 failed；晚到的取消优先（CancelledError 不是 Exception，这里不吞）。
+            # 2026-10 复核：自检内部的意外异常已改成向上抛（内层不再吞），这条 except 才真的
+            # 覆盖「自检自己出错」，而且无论第几条活出错都停在这里——前面已经 filled 过的活
+            # 也不会被派出去。
+            logger.exception("开工前能力闸出错（任务 %s），按「能力检查没完成」安全暂停", tid)
+            await self._release_remote(railway_box)
+            self._pause_check_incomplete(tid, gid, plan, attempt_id=attempt_id)
             return "done"
 
         # 执行 jobs：没写 after 的照旧并发（受信号量）；写了 after 的等依赖跑完再开工
@@ -1472,9 +1751,465 @@ class Coordinator:
             return box, ""
         return None, await self._fetch_acquire_reason()
 
-    async def _stopped_local_fallback(self, tid: str) -> tuple[bool, Any]:
-        """本机受限时的回落（老入口，等同计划选 local 时的 _setup_exec_env）。"""
-        return await self._setup_exec_env(tid, {"env": "local"}, "")
+    def _worker_tool_registered(self, name: Any) -> bool:
+        """这个工具名在注册表里现在真的给子 agent 用吗（没注册 / 被摘掉 = 用不了）。
+
+        「受限」时 app 会把 run_command 一类从 worker 工具表摘掉；计划里留着这个名字
+        也调不通（Tools.call 会回「不认识」）。所以「有执行工具」必须按注册表现查，
+        不能只看名单里有没有这个字符串。
+        """
+        n = str(name or "").strip()
+        if not n:
+            return False
+        try:
+            return self._tools.get(n, "worker") is not None
+        except Exception:
+            logger.exception("查工具 %s 有没有注册出错，按「没有」处理", n)
+            return False
+
+    def _job_effective_tools(
+        self, job: dict, *, on_remote: bool, box: Any
+    ) -> tuple[list[str], str, str]:
+        """一条活**实际**会交给子 agent 的工具名单——和 `_run_job` 走同一条解析路。
+
+        顺序和真实执行严格一致，改这里必须同时改 `_job` 里的调用（两处顺序一样）：
+        1. 环境换名：远端用 `_remote_job_tools`（railway → vm_*，ssh → machine_*，
+           本机命令工具都去掉）；
+        2. 岗位角色门控：`Specialists.effective_tools`——和 `specialists.run` 内部
+           同一份解析（唯一入口），news/idea/goal 的只读上限会把 run_command / vm_run
+           这类越权名字压掉。specialists 没挂（老调用 / 启动早期 / 单测直连 Workers）
+           就按换名后的请求名单，等于 `_run_job` 直连 workers.run 的行为。
+
+        **fail-closed**（2026-10 复核）：换名 / 角色门控 / 解析任何一步出错、或者根本
+        没有解析入口时，返回**空名单 + 原因**，绝不把没解析过的请求名单当成「子 agent
+        真拿得到什么」——那正是「计划里写着 run_command、实际拿不到」这类假能力的来源。
+
+        返回 (名单, 岗位 kind, 没解析出来的原因或 "")。
+        """
+        requested = [str(t) for t in (job.get("tools") or []) if str(t or "").strip()]
+        kind = str(job.get("agent") or "task").strip() or "task"
+        if on_remote:
+            try:
+                requested = list(self._remote_job_tools(requested, box))
+            except Exception:
+                logger.exception("按远端机器换工具名单出错，按「没解析出来」处理")
+                return [], kind, "按远端机器换工具名单出错，没法确认子 agent 真拿得到什么工具"
+        specialists = getattr(self, "_specialists", None)
+        if specialists is None:
+            return requested, kind, ""
+        usable = getattr(specialists, "role_usable", None)
+        if callable(usable):
+            try:
+                if not usable(kind):
+                    return [], kind, f"派给岗位「{kind}」，它现在不可用（已停用或不在册）"
+            except Exception:
+                logger.exception("读岗位 %s 能不能跑出错，按「没解析出来」处理", kind)
+                return [], kind, f"岗位「{kind}」能不能跑读不出来，没法确认它拿得到什么工具"
+        resolve = getattr(specialists, "effective_tools", None)
+        if not callable(resolve):
+            resolve = getattr(specialists, "_resolve_tools", None)  # 旧名字兼容
+        if not callable(resolve):
+            return [], kind, f"岗位「{kind}」的工具名单解析入口缺失，没法确认它实际拿得到什么工具"
+        try:
+            return [str(x) for x in resolve(kind, requested)], kind, ""
+        except Exception:
+            logger.exception("按岗位解析工具名单出错（%s），按「没解析出来」处理", kind)
+            return [], kind, f"岗位「{kind}」的工具名单解析出错，没法确认它实际拿得到什么工具"
+
+    def _exec_fill_plan(self, *, on_remote: bool, box: Any) -> tuple[str, tuple[str, ...]]:
+        """这个环境**真具备**的执行工具 + 一起补的配套工具（搬文件 / 回传）。
+
+        只有执行类工具算「有执行能力」：railway 的 vm_put_file / vm_fetch_file 只是
+        搬文件，不能被当成「能下载 / 能跑命令」（2026-10 复核）。配套工具补不补只看
+        注册表；执行工具本身还要过岗位角色门控才算数（见 `_try_fill_exec_tool`）。
+        """
+        if on_remote:
+            if str(getattr(box, "kind", "") or "") == "ssh":
+                return "machine_run", ("machine_put_file", "machine_read_file", "machine_fetch_file")
+            return "vm_run", ("vm_put_file", "vm_read_file", "vm_fetch_file")
+        if self._local_can_exec():
+            return "run_command", ()
+        return "", ()
+
+    def _try_fill_exec_tool(self, job: dict, *, on_remote: bool, box: Any) -> str:
+        """在「岗位允许 + 环境具备 + 注册表真有」三条同时满足时，给这条活补一个执行工具。
+
+        补法是写进 `job["tools"]`，再走**同一个解析入口**确认它真的活了下来
+        （岗位上限没压掉、环境换名没丢）；活不下来就返回 ""——绝不留下一个
+        「计划里写着、子 agent 实际拿不到」的假工具。执行工具之外，把环境干活需要的
+        配套工具（本机没有；远端是搬文件 / 回传）也一起补上，前提是注册表里真有。
+        """
+        exec_tool, companions = self._exec_fill_plan(on_remote=on_remote, box=box)
+        if not exec_tool:
+            return ""
+        if not self._worker_tool_registered(exec_tool):
+            return ""
+        requested = [str(t) for t in (job.get("tools") or []) if str(t or "").strip()]
+        add = [exec_tool]
+        for c in companions:
+            if c not in add and c not in requested and self._worker_tool_registered(c):
+                add.append(c)
+        trial_tools = requested + [t for t in add if t not in requested]
+        effective, _kind, _why = self._job_effective_tools(
+            {"tools": trial_tools, "agent": job.get("agent")}, on_remote=on_remote, box=box
+        )
+        if exec_tool not in effective:
+            return ""  # 岗位上限 / 环境换名把它压掉了：补不上，也不留假名字
+        keep = set(effective)
+        job["tools"] = [t for t in trial_tools if t in keep]
+        return exec_tool
+
+    def _exec_capability_self_check(
+        self, tid: str, gid: str, plan: dict, *, on_remote: bool, box: Any = None
+    ) -> ExecCheckReport:
+        """开工前能力自检（2026-10 线上 T-7 整改；2026-10 复核收口）。
+
+        交付物要「下载 / 本地存图 / 压缩包 / 跑代码」（关键词规则
+        job_needs_exec_capability，写在代码里、可测），而这条活的**实际**工具名单里
+        一个真的执行类工具都没有时：
+
+        - 有真执行工具（岗位角色放行 + 环境换名后还在 + 注册表真的注册了）→ 不动；
+        - 能在「岗位允许 + 环境具备 + 注册表真有」范围内补 → 补一个（本机补
+          run_command；远端 vm_run / machine_run，另带搬文件的配套工具），记一句大白话；
+        - 补不了（岗位上限里没有执行工具 / 岗位不可用 / 环境受限 / 工具没注册 /
+          名单解析不出来）→ **不假装可执行**：不往计划里塞假工具，记一条说得清的
+          `task.exec_unavailable`，并把结论放进返回结构——run_attempt 据此先做一次
+          有界重排，重排后还不行就暂停（不是当成能开工）。
+
+        判据是「子 agent 真拿到的工具」，不是计划里的原始字符串。不越权扩大岗位上限，
+        也不改门槛。
+
+        **失败口径**（2026-10 复核）：这里只有两种结果——拿到结论（findings / filled /
+        unavailable），或者**内部意外把异常原样抛出去**。绝不 `except Exception` 吞掉后
+        返回空 report：那等于「检查炸了」被当成「检查通过」，run_attempt 外层的 fail-closed
+        永远收不到异常，照旧派 Workers 白烧 token（这正是实测出来的硬 fail-open）。
+        正常查不到 / 岗位不可用 / 工具没注册 / 名单解析不出来**都不抛**：那几步已经由
+        `_job_effective_tools` 收成空名单 + why，照旧记 `task.exec_unavailable` 并
+        blocked，诊断一点不少。纯审计事件写库失败（`_record_exec_event` 自己吞）不算
+        检查失败，不挡开工。
+        """
+        findings: list[ExecFinding] = []
+        try:
+            jobs = plan.get("jobs") or []
+            if not isinstance(jobs, list) or not jobs:
+                return ExecCheckReport()
+            criteria_text = " ".join(str(c) for c in (plan.get("criteria") or []))
+            for idx, job in enumerate(jobs):
+                if not isinstance(job, dict):
+                    continue
+                text = f"{job.get('brief') or ''} {criteria_text}"
+                if not job_needs_exec_capability(text):
+                    continue
+                short = " ".join(str(text).split())[:40]
+                effective, kind, why = self._job_effective_tools(
+                    job, on_remote=on_remote, box=box
+                )
+                real_exec = [
+                    t for t in effective
+                    if t in _EXEC_TOOL_NAMES and self._worker_tool_registered(t)
+                ]
+                if real_exec:
+                    continue  # 角色放行、环境换名后还在、注册表真有 → 本来就能做
+                filled = "" if why else self._try_fill_exec_tool(
+                    job, on_remote=on_remote, box=box
+                )
+                if filled:
+                    note = (
+                        f"开工前自检：这条活要下载/本地存文件/跑命令（{short}…），"
+                        f"子 agent 实际拿到的工具里没有能跑的，已按岗位允许的范围补上"
+                        f" {filled}（第 {idx + 1} 条活）"
+                    )
+                    logger.info("任务 %s %s", tid, note)
+                    self._record_exec_event(
+                        tid, gid, "task.exec_autofill", note,
+                        job=idx + 1, tool=filled, agent=kind,
+                    )
+                    findings.append(ExecFinding(
+                        job=idx + 1, agent=kind, brief=short, status="filled", tool=filled,
+                    ))
+                    continue
+                reason = why or (
+                    f"按岗位「{kind}」的实际上限加上现在这台机器，子 agent 拿不到真的"
+                    "执行工具（岗位上限里没有 / 环境受限 / 没注册）"
+                )
+                note = (
+                    f"开工前自检：这条活要下载/本地存文件/跑命令（{short}…），{reason}，"
+                    "照现在的计划做不成；别硬做——把标准改成可达的"
+                    "（例如给出来源页链接+出处署名），或改派能给执行工具的岗位"
+                    f"（第 {idx + 1} 条活）"
+                )
+                logger.warning("任务 %s %s", tid, note)
+                self._record_exec_event(
+                    tid, gid, "task.exec_unavailable", note, job=idx + 1, agent=kind
+                )
+                findings.append(ExecFinding(
+                    job=idx + 1, agent=kind, brief=short, status="unavailable", reason=reason,
+                ))
+        except Exception:
+            # 内部意外（补工具 / 环境探测 / 计划字段处理等）：**原样往上抛**，交给
+            # run_attempt 外层那条 fail-closed 安全暂停。这里绝不再吞成空 report——
+            # 吞掉就成了「检查炸了 = 检查通过」，外层永远收不到异常，照旧派 Workers
+            # （2026-10 复核实测的硬 fail-open）。也不重排：内部出错不是「做不到」，
+            # 不该花那次重排调用，更不该误说「已经重排过一次」。
+            logger.exception("开工前能力自检内部出错（任务 %s），异常向上抛给 run_attempt 安全暂停", tid)
+            raise
+        return ExecCheckReport(findings=tuple(findings))
+
+    def _record_exec_event(
+        self, tid: str, gid: str, kind: str, note: str, **payload: Any
+    ) -> None:
+        """把能力自检的结论写进任务事件（纯审计：写不进去也不挡开工，不算检查失败）。"""
+        data = {"note": note}
+        data.update(payload)
+        try:
+            with self._store.tx() as conn:
+                self._store.event(
+                    conn, kind, group_id=gid, entity="task", entity_id=tid, payload=data,
+                )
+        except Exception:
+            logger.exception("记能力自检事件失败（任务 %s）", tid)
+
+    def _role_tools_hint_lines(self) -> list[str]:
+        """排计划提示：每个在册岗位**实际**能拿到的子 agent 工具 + 干活环境。
+
+        2026-10 复核（用户：「开工前对不上先补工具或改标准」）：主模型以前只看到一份全局
+        「子 agent 工具名单」，看不到岗位自己的上限——把「下载落盘 / 跑命令」的活派给
+        news/idea/goal，当场被只读上限压掉，只能等开工自检再补救。这里在排计划时就把每个
+        岗的实际上限写清楚（和真跑活同一份解析 `Specialists.effective_tools`），让第一次
+        计划就尽量对得上。读不出来的岗位不瞎写；没有解析入口（老调用 / 测试桩）就整段不写。
+        """
+        spec = getattr(self, "_specialists", None)
+        resolve = getattr(spec, "effective_tools", None) if spec is not None else None
+        if not callable(resolve):
+            return []
+        try:
+            extra = sorted(
+                str(k) for k in (
+                    self._known_dispatch_kinds() - frozenset(("news", "idea", "goal", "task"))
+                )
+            )
+        except Exception:
+            extra = []
+        usable = getattr(spec, "role_usable", None)
+        lines: list[str] = []
+        for k in ("task", "news", "idea", "goal", *extra):
+            if callable(usable):
+                try:
+                    if not usable(k):
+                        continue  # 停用 / 不在册的岗位不在提示里露脸，主模型别误派
+                except Exception:
+                    continue
+            try:
+                names = [str(t) for t in resolve(k, None) if str(t or "").strip()]
+            except Exception:
+                logger.exception("读岗位 %s 的工具上限出错，提示里不写它", k)
+                continue
+            shown = [
+                t for t in names
+                if t != "submit_result" and self._worker_tool_registered(t)
+            ]
+            # task / 没设上限的自定义专岗：解析出来只有保底的 submit_result → 通才
+            if k not in ("news", "idea", "goal") and not shown:
+                lines.append(
+                    f"- {k}（通用执行岗）：这条活的 tools 里你给什么它就用什么——"
+                    "要下载落盘 / 跑命令 / 截图的活派给这类岗，并把执行工具写进这条活的 tools"
+                )
+                continue
+            tools_txt = " / ".join(shown) if shown else "（只读工具）"
+            if any(t in _EXEC_TOOL_NAMES for t in shown):
+                lines.append(f"- {k}：能拿到 {tools_txt}")
+            else:
+                label = "只读调研岗" if k in ("news", "idea", "goal") else "只读上限"
+                lines.append(
+                    f"- {k}（{label}）：能拿到 {tools_txt}；没有执行工具"
+                    "（不能下载落盘、不能跑命令、不能截图）——要这类能力的活别派给它"
+                )
+        if not lines:
+            return []
+        env_note = "本机能隔离跑命令" if self._local_can_exec() else "本机不能隔离跑命令"
+        lines.append(
+            f"- 干活环境：{env_note}；在别的机器（专用机器 / 一次性机器）上干活时，"
+            "本机命令工具会换成那台机器的执行工具，岗位上限一样先过一遍。"
+        )
+        return lines
+
+    def _unconsume_attempt(self, task_id: str, attempt_id: int | None) -> None:
+        """能力闸暂停前把这一次尝试「不算数」：标 stale + 尝试计数退回 1。
+
+        这条活一个子 agent 都没跑（Workers 零执行），卡在开工前的准备上，不该占掉
+        「最多 3 次尝试」里的一次；管理员点「继续」后仍按原来的次数接着试。
+
+        回退只在任务**确实还停在 paused** 时做——同一事务里先复核状态：晚到的取消 /
+        终态（cancelled / completed / failed / rejected）绝不被这条回退路径复活，
+        也不去动它们的尝试计数。
+        """
+        now = clock.now()
+        try:
+            with self._store.tx() as conn:
+                row = conn.execute(
+                    "SELECT status FROM tasks WHERE id=?", (str(task_id),)
+                ).fetchone()
+                now_status = str(row["status"]) if row is not None else "?"
+                if row is None or now_status != "paused":
+                    logger.info(
+                        "任务 %s 现在「%s」，不是 paused：尝试计数不动（不复活取消 / 终态）",
+                        task_id, now_status,
+                    )
+                    return
+                if attempt_id is not None:
+                    conn.execute(
+                        "UPDATE attempts SET status='stale', finished=COALESCE(finished, ?)"
+                        " WHERE id=? AND status IN ('running', 'waiting')",
+                        (now, int(attempt_id)),
+                    )
+                conn.execute(
+                    "UPDATE tasks SET attempts = CASE WHEN attempts > 0 THEN attempts - 1"
+                    " ELSE 0 END, updated=? WHERE id=? AND status='paused'",
+                    (now, str(task_id)),
+                )
+        except Exception:
+            logger.exception("能力闸暂停回退尝试计数失败（任务 %s）", task_id)
+
+    def _pause_for_capability(
+        self, tid: str, gid: str, plan: dict, report: ExecCheckReport, *,
+        attempt_id: int | None,
+    ) -> bool:
+        """能力闸最后一步：开工前对不上、有界重排也做不到 → 暂停（不是失败），等管理员。
+
+        - Workers 零执行：这条路径在派活之前就停，一个子 agent 都不会跑；
+        - 不直接 failed（用户 2026-10 口径：做不到 → paused + 明确 reason），也不往群里发
+          「没做成」；
+        - 不扣任务尝试资源：这次尝试标 stale，tasks.attempts 退回 1（一个子 agent 都没跑）；
+        - 原因写进 **真实 paused_reason**（kind="capability"，带安全中文 text + 出问题的活
+          序号）+ task.paused 事件；不再借 env 的注记夹带理由；
+        - 取消 / 安全网暂停优先：状态一旦不是 running/reviewing 就什么都不改
+          （晚到的取消不能被这条路径复活）。
+        """
+        return self._pause_with_capability_reason(
+            tid, gid, plan, report.pause_reason(),
+            jobs=[f.job for f in report.blocked_findings],
+            attempt_id=attempt_id, event_kind="task.exec_paused",
+        )
+
+    def _pause_check_incomplete(
+        self, tid: str, gid: str, plan: dict, *, attempt_id: int | None,
+    ) -> bool:
+        """能力检查本身出意外（异常）时的安全暂停：fail-closed，不 fail-open 照常开工。"""
+        text = (
+            "开工前的能力检查没完成（检查本身出错了），不敢就这么把活派出去：先停下等你决定"
+            "（一个子 agent 都没派出去）。点「继续」会重查一次；也可以取消。"
+        )
+        return self._pause_with_capability_reason(
+            tid, gid, plan, text, jobs=[],
+            attempt_id=attempt_id, event_kind="task.exec_check_incomplete",
+        )
+
+    def _pause_with_capability_reason(
+        self, tid: str, gid: str, plan: dict, reason_text: str, *,
+        jobs: Any, attempt_id: int | None, event_kind: str,
+    ) -> bool:
+        """能力类暂停的统一出口：状态复核 → 写 paused_reason → 退尝试计数 → 记事件。
+
+        原因一定是非空的一句中文（模型给的原因可能为空，兜一句），绝不让「原因不合法」
+        把任务留在 running：暂停这件事本身不许失败在格式上。
+        """
+        text = str(reason_text or "").strip() or (
+            "开工前对不上：先停下等你决定（一个子 agent 都没派出去）。"
+        )
+        try:
+            cur = self._tasks.get(tid)
+        except Exception:
+            cur = None
+        status = str((cur or {}).get("status") or "")
+        if status not in ("running", "reviewing"):
+            logger.info("任务 %s 已经「%s」，能力闸不再改状态（不复活取消/暂停）", tid, status or "?")
+            return False
+        paused: dict[str, Any] = {"kind": "capability", "text": text}
+        clean_jobs: list[int] = []
+        for j in jobs or ():
+            try:
+                n = int(j)
+            except (TypeError, ValueError):
+                continue
+            if n > 0 and n not in clean_jobs:
+                clean_jobs.append(n)
+        if clean_jobs:
+            paused["jobs"] = clean_jobs
+        try:
+            self._tasks.transition(tid, "paused", reason=text, paused_reason=paused)
+        except (KeyError, ValueError) as e:
+            logger.warning("任务 %s 能力闸暂停失败：%s", tid, e)
+            return False
+        except Exception:
+            # 写原因时出别的意外：退回不带结构化原因的安全暂停，绝不把任务留在 running
+            logger.exception("任务 %s 能力闸写 paused_reason 出错，退回纯文本暂停", tid)
+            try:
+                self._tasks.transition(tid, "paused", reason=text)
+            except Exception:
+                logger.exception("任务 %s 能力闸暂停仍失败（不再改状态）", tid)
+                return False
+        self._unconsume_attempt(tid, attempt_id)
+        self._record_exec_event(
+            tid, gid, event_kind, text,
+            jobs=list(paused.get("jobs") or []),
+            criteria=list(plan.get("criteria") or []),  # 审计：标准按原样保留，没被降
+        )
+        self._write_tokens(tid)
+        logger.warning("任务 %s 能力闸暂停：%s", tid, text)
+        return True
+
+    async def _replan_for_capability(
+        self, tid: str, gid: str, plan: dict, report: ExecCheckReport, *,
+        on_remote: bool, prior_review: str = "",
+    ) -> dict | None:
+        """把「哪条活拿不到执行工具」反馈给主模型，**只重排一次**计划（有界修正）。
+
+        只认新计划里的 jobs（每条活派给谁、怎么做）：完成标准 / 交付形式 / 用哪台机器 /
+        要不要问发起人全部沿用原计划——不许为了好做而降低用户定的验收口径，也不许把岗位
+        上限里没有的工具硬塞给子 agent（`on_remote` 只用来复查时保持同一台机器）。
+
+        返回新 plan；没改成（模型没给可用计划 / 重排期间任务被取消或暂停 / 空 jobs）
+        返回 None，由调用方按「还是做不到」处理（暂停）。
+        """
+        note = report.replan_note()
+        try:
+            fresh = await self._plan(
+                self._tasks.get(tid), prior_review=prior_review, capability_note=note,
+            )
+        except Exception as e:
+            logger.warning("任务 %s 能力重排失败：%s", tid, getattr(e, "message", e) or e)
+            self._record_exec_event(
+                tid, gid, "task.exec_replanned",
+                f"开工前对不上：让主模型重排计划没成功（{getattr(e, 'message', e) or e}），"
+                "保持原计划",
+                ok=False,
+            )
+            return None
+        cur = self._tasks.get(tid)
+        status = str((cur or {}).get("status") or "")
+        if status not in ("running", "reviewing"):
+            logger.info("任务 %s 重排期间变成「%s」，不改计划（不复活取消/暂停）", tid, status or "?")
+            return None
+        new_jobs = list(fresh.get("jobs") or [])
+        if not new_jobs:
+            self._record_exec_event(
+                tid, gid, "task.exec_replanned",
+                "开工前对不上：让主模型重排了一次计划，但它没派任何活（还是做不到）",
+                ok=False,
+            )
+            return None
+        out = dict(plan)
+        out["jobs"] = new_jobs
+        out["research"] = any(str(j.get("type") or "") == "research" for j in new_jobs)
+        question = str(fresh.get("question") or "").strip()
+        tail = f"；主模型这轮还想问：{question}" if question else ""
+        self._record_exec_event(
+            tid, gid, "task.exec_replanned",
+            "开工前对不上：已把说明反馈给主模型重排了一次计划（只改派活，完成标准不变）"
+            + tail,
+            ok=True, jobs=[str(j.get("agent") or "task") for j in new_jobs],
+        )
+        return out
 
     async def _release_remote(self, box: Any) -> None:
         """结束（成功 / 失败 / 取消 / 异常）一定释放机器；自身不再抛错。"""
@@ -1726,7 +2461,13 @@ class Coordinator:
         evidence: list[str],
         reports: list[Any],
     ) -> dict:
-        """主模型验收；最多 _REVIEW_TOOL_LIMIT 轮工具调用（只读 inspect_）。"""
+        """主模型验收；最多 _REVIEW_TOOL_LIMIT 轮工具调用（只读 inspect_）。
+
+        模型一直没吐出可解析 JSON（6 轮工具 + _REVIEW_FORCE_JSON_TRIES 次强制重试
+        都拿不到结论）时不抛 ModelError：返回 {"pass": False, "inconclusive": True,
+        ...}，调用方走「验收不通过」的退回机制（退回 queued 重跑，计入 _MAX_ATTEMPTS），
+        而不是直接 failed（2026-10 线上 T-2 整改）。
+        """
         tid = str(task["id"])
         gid = str(task["group_id"])
         ws_name = str(task.get("workspace") or self._workspace_name(gid))
@@ -1805,8 +2546,11 @@ class Coordinator:
             ws_path = self._env.workspace(ws_name)
         except Exception:
             ws_path = None
+        # 本轮硬权限：inspect_file(s) + 合法 main MCP；别的（remember / 群空间）不在这轮，
+        # 捏造名字会被 Tools.call 拒掉（落审计，不调 handler）。
         ctx = ToolContext(
-            group_id=gid, task_id=tid, actor="主模型", workspace=ws_path, role="main"
+            group_id=gid, task_id=tid, actor="主模型", workspace=ws_path, role="main",
+            allowed_tools=spec_tool_names(specs),
         )
         review_data: dict | None = None
         for _round in range(_REVIEW_TOOL_LIMIT):
@@ -1843,7 +2587,51 @@ class Coordinator:
             )
 
         if review_data is None:
-            raise ModelError("验收阶段主模型没给出结论")
+            # 6 轮用完还没给出可解析 JSON：先强制重试（追加一句「请只输出 JSON 结论」，
+            # tools=None + json_mode=True 把 JSON 拿回来）；仍不行不当终态失败——
+            # 返回 inconclusive，调用方按「验收不通过」退回队列重跑一轮（计入
+            # _MAX_ATTEMPTS），不直接 failed 白烧 token（2026-10 线上 T-2 整改）。
+            for _try in range(_REVIEW_FORCE_JSON_TRIES):
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "请只输出 JSON 结论，字段按上面说的来；不要再调用工具，不要写别的话。",
+                    }
+                )
+                result = await self._chat_main(
+                    messages,
+                    tools=None,
+                    json_mode=True,
+                    purpose="coordinator.review",
+                    group_id=gid,
+                    task_id=tid,
+                )
+                try:
+                    parsed = json.loads(result.text)
+                except (ValueError, TypeError):
+                    messages.append({"role": "assistant", "content": str(result.text or "")[:2000]})
+                    logger.info(
+                        "任务 %s 验收强制重试第 %d 次仍不是 JSON：%s",
+                        tid, _try + 1, str(result.text or "")[:80],
+                    )
+                    continue
+                if isinstance(parsed, dict):
+                    review_data = parsed
+                    break
+            if review_data is None:
+                attempt_n2 = int(task.get("attempts") or 0)
+                return {
+                    "pass": False,
+                    "inconclusive": True,
+                    "review": (
+                        f"验收模型没给结论（第 {attempt_n2} 次尝试，工具轮和强制重试都没吐出"
+                        "可解析 JSON），退回重跑"
+                    ),
+                    "artifact": "",
+                    "note": "",
+                    "missing": [],
+                    "link_check": link_check,
+                }
 
         passed = bool(review_data.get("pass"))
         review_text = str(review_data.get("review") or "").strip() or ("通过" if passed else "不通过")
@@ -2140,6 +2928,8 @@ class Coordinator:
     async def _remember_round(self, task_id: str, gid: str, ws_name: str, plan: dict, review: dict) -> None:
         """验收通过后问一句主模型「有没有值得记的经验？」，有就让它调 remember（最多 2 次）。
 
+        - 只能记全局（scope=global）：自动流程永不改「本群规矩」；本群经验由复盘沉淀成
+          「本群做法」skill（remember 工具自己在 handler 就拒 group）；
         - 没 identity / remember 工具没注册 / 模型没配好 → 什么都不做（零额外模型调用）；
         - 模型不回调工具、给的又不是 {"done": true} → 提醒一次；再不行就收工；
         - 这一回合出任何岔子都不影响交付（尽力而为，只记日志）。
@@ -2165,9 +2955,11 @@ class Coordinator:
         prompt_lines.append("")
         prompt_lines.append(
             "规则："
-            "- 值得记就调用 remember 工具：scope=group 记「这个群」的经验（喜欢这个群怎么交付、"
-            "哪类事别做；最多 200 字）；scope=global 只记和具体群、具体人无关的通用经验"
-            "（全局里不许写群号、QQ 号、任何人的名字）。最多调 2 次，值得记才调，没有值得记的就别调；"
+            "- 只记**全局**的通用经验：调 remember 时 scope=global（最多 2 次，值得记才调，"
+              "没有值得记的就别调），写进全局 MEMORY.md——只放和具体群、具体人无关的东西"
+              "（不许写群号、QQ 号、任何人的名字）；"
+            "- 这个群的做法/规矩不许在这里记：scope=group 会被直接拒（本群经验由复盘沉淀成"
+              "「本群做法」skill，规矩只有管理员能定）；"
             "- 调完（或不调）就回答 {\"done\": true}；不要输出别的。"
         )
         messages: list[dict] = [{"role": "user", "content": "\n".join(prompt_lines)}]
@@ -2176,7 +2968,10 @@ class Coordinator:
         except Exception:
             ws_path = None
         ctx = ToolContext(
-            group_id=gid, task_id=task_id, actor="主模型", workspace=ws_path, role="main"
+            group_id=gid, task_id=task_id, actor="主模型", workspace=ws_path, role="main",
+            # 本轮硬权限：只放 remember 一个（和 _plan/_review 的只读回合同款做法）。
+            # remember 这份工具本身也只许 scope=global，group 在 handler 就被拒。
+            allowed_tools=("remember",),
         )
         used = 0
         for _round in range(_REMEMBER_TOOL_LIMIT + 2):  # 工具配额 2 次 + 收尾/提醒各一次机会
@@ -2452,7 +3247,10 @@ class Coordinator:
         chat_lines = self._goal_chat_lines(gid)
         need_criteria = not crit
 
-        prompt_lines = [
+        gc_goal = self._group_context_safe(str(goal.get("group_id") or ""), "goal")
+        prompt_lines = (
+            [gc_goal.strip()] if gc_goal else []
+        ) + [
             "你是 MaiWork 的主模型，在检查一个 agent 目标的进展。",
             f"目标标题：{goal['title']}",
             f"目标内容：{str(goal.get('body') or '')}",

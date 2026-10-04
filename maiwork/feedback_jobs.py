@@ -3,9 +3,11 @@
 app 的排程巡检每群每小时最多调一次 run（due 判断）：
 1. 群里接着聊（news_feedback.mention_round）：关键词命中的候选交主模型判一次
    （{"yes": [条目编号]}；回的不是 JSON / 模型出错 → 这轮不记）；
-2. 口味小结（taste.refresh）：每天最多蒸馏一次；「最近在聊」只取画像里 category=recent 的几条摘要，
-   不读原始聊天。
-不往群里发任何东西。模型没配好就只跳过要模型的部分。
+2. （口味小结已删：已迁进 news 岗位 skill 正文，feedback_jobs 不再刷新——见 docs/17 §七.5）
+   不读原始聊天；
+3. 做事经验（lessons.run，docs/17 §三.3–三.4）：每群每岗每日复盘 + 每周整理，出门计数记进返回 dict
+   的 `lessons` 键；炸一次不拖垮本轮。
+不往群里发任何东西。模型没配好就只跳过要模型的部分（三步一起跳过）。
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ import json
 import logging
 from typing import Any, Callable
 
-from . import news_feedback, taste
+from . import lessons, news_feedback
 
 logger = logging.getLogger("maiwork.feedback_jobs")
 
@@ -73,19 +75,26 @@ def _models_ready(models: Any) -> bool:
 async def run(
     store: Any, models: Any, gid: str, now: float, *, profiles: Any = None,
     scrub: Callable[[str, str], str | None] | None = None,
+    agents: Any = None,
 ) -> dict[str, Any]:
     gid = str(gid)
     _last[gid] = now
-    out: dict[str, Any] = {"mentions": 0, "taste": False}
+    out: dict[str, Any] = {"mentions": 0, "lessons": 0}
     if not _models_ready(models):
         return out
     try:
         out["mentions"] = await news_feedback.mention_round(store, gid, now, judge=_model_judge(models, gid))
     except Exception:
         logger.exception("群里接着聊这一轮出错（群 %s）", gid)
-    try:
-        got = await taste.refresh(store, models, gid, now, recent_topics=_recent_topics(profiles, gid), scrub=scrub)
-        out["taste"] = bool(got)
-    except Exception:
-        logger.exception("口味小结这一轮出错（群 %s）", gid)
+    # 自我学习「本群做法 skill」（docs/17 §七.3–§七.5）：每日复盘 + 每周整理；
+    # 第二批 §六.3：画像「最近在聊」顺路传给 lessons.run 做话题对照。
+    if agents is not None:
+        try:
+            lessons_out = await lessons.run(
+                store, models, agents, gid, now, scrub=scrub,
+                recent_topics=_recent_topics(profiles, gid) if profiles is not None else None,
+            )
+            out["lessons"] = int((lessons_out or {}).get("changes", 0) or 0)
+        except Exception:
+            logger.exception("本群做法 skill 复盘这一轮出错（群 %s）", gid)
     return out

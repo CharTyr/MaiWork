@@ -1,7 +1,7 @@
 """topics.py 单元测试：睡觉时段零调用零发送、不够安静不问 Jev、
 今日上限、最短间隔、退避翻倍与清零、Jev 说不合适→记录但不发、
 通过→发送一次且参数 sync 进 MaiBot（看 FakeCtx 或 FakeHost 记录）、
-播报腔被拦、speaker=maibot 走 proactive_trigger、follow_up 统计、候选过期不用。
+播报腔被拦、开场白只入队（发件箱真发出去后才回写）、follow_up 统计、候选过期不用。
 
 睡觉时段测试用 datetime 构造一个固定"北京 23:30"等时刻；运行环境当日时刻没关系。
 """
@@ -14,10 +14,11 @@ from typing import Any, Dict, List, Tuple
 
 import pytest
 
-from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork import clock, group_push
 from CharTyr_MaiWork.maiwork.config import load_settings
 from CharTyr_MaiWork.maiwork.delivery import Mentions, Pushes
 from CharTyr_MaiWork.maiwork.host import Msg
+from CharTyr_MaiWork.maiwork.outbox import Outbox
 from CharTyr_MaiWork.maiwork.store import Store
 from CharTyr_MaiWork.maiwork.topics import Topics
 
@@ -30,7 +31,11 @@ NOW = 1_790_000_000.0  # 测试里的"现在"
 
 
 def _settings(cfg: dict | None = None) -> object:
-    settings, _ = load_settings(cfg or {})
+    # GID 是服务群（发件箱只发服务群；每群推送设置也按服务群校验）
+    merged = {"groups": {"serve": [{"group": f"qq:{GID}"}]}}
+    if cfg:
+        merged.update(cfg)
+    settings, _ = load_settings(merged)
     return settings
 
 
@@ -55,6 +60,7 @@ def _make_topics(
     jev=None,
     profiles=None,
     signals=None,
+    with_outbox: bool = True,
 ):
     store = Store(tmp_path / "t.db")
     store.migrate()
@@ -77,11 +83,14 @@ def _make_topics(
         signals = SignalsStub()
     mentions = Mentions(store, lambda: settings)
     pushes = Pushes(store, lambda: settings)
+    # 真发件箱：0.8.0 起开场白只入队，发送 / 节制 / 回写都在发件箱（不许直发第二路）
+    outbox = Outbox(store, host, pushes, mentions, lambda: settings)
     topics = Topics(
         store, host, models, jev, profiles, mentions, pushes,
         lambda: settings, signals,
+        outbox=outbox if with_outbox else None,
     )
-    return store, settings, topics, host, models, jev, profiles, signals
+    return store, settings, topics, host, models, jev, profiles, signals, outbox
 
 
 class _UnavailableJev:
@@ -172,7 +181,7 @@ async def test_sleep_hours_zero_call_zero_send(tmp_path):
     """睡觉时段（23:30 北京时间）→ 零 Jev 调用、零发送。"""
     fake_jev = _Jev()
     host = FakeHost(msgs=[], session_id=SID)
-    store, settings, topics, _, _, jev, _, _ = _make_topics(
+    store, settings, topics, _, _, jev, *_ = _make_topics(
         tmp_path,
         host=host,
         jev=fake_jev,
@@ -235,24 +244,39 @@ async def test_expired_candidate_skip(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_per_day_limit(tmp_path):
-    """当日已开过 per_day 个话题 → skip。"""
+async def test_per_day_kind_cap_retired_shared_cap_applies(tmp_path):
+    """旧 topics.per_day 退役：不再按 kind 卡；每群一个总上限（三种一起数）顶上。"""
     fake_jev = _Jev()
-    store, settings, topics, *_ = _make_topics(
+    T = _bj_ts(2026, 9, 27, 15, 0)
+    store, settings, topics, host, models, jev, profiles, signals, outbox = _make_topics(
         tmp_path,
         jev=fake_jev,
+        signals=(lambda sig: (sig.mark(GID, SID, T - 3600.0), sig)[1])(SignalsStub()),
         cfg={"topics": {"enabled": True, "per_day": 1, "min_gap_hours": 0}},
     )
-    # 已开过 1 个（opener 非空才算「已开」）
+    # 每群一个总上限（这里设 1）——代替退役的 topics.per_day
+    group_push.set_config(store, GID, {"daily_max": 1}, settings)
+    # 今天已经开过 1 个话题（老代码按 per_day=1 这里会 skip:per_day_limit）
     with store.tx() as conn:
         conn.execute(
             "INSERT INTO topic_log (group_id, ts, quiet_s, usual_gap_s, jev, pick, candidate_id, opener, message_id, followup_due_ts, result, verdict)"
             " VALUES (?, ?, 0, NULL, NULL, NULL, NULL, 'x', 'mid', NULL, NULL, NULL)",
             (GID, _bj_ts(2026, 9, 27, 9, 0)),
         )
-    _seed_candidate(store, check_now=_bj_ts(2026, 9, 27, 15, 0), title="测试候选")
-    out = await topics.check(GID, _bj_ts(2026, 9, 27, 15, 0))
-    assert "limit" in out or "per_day" in out
+    _seed_candidate(store, check_now=T, title="测试候选")
+    out = await topics.check(GID, T)
+    assert "per_day" not in out
+    assert out.startswith("queued:topic_id="), out
+    # 真发出去：占掉总上限（1）
+    await outbox.flush(T)
+    assert store.read().execute(
+        "SELECT COUNT(*) c FROM pushes WHERE kind='topic'"
+    ).fetchone()["c"] == 1
+    # 再判：候选还有一条，但今天这个群的额度用完了 → 卡在推送闸
+    _seed_candidate(store, check_now=T, title="测试候选二")
+    out2 = await topics.check(GID, T + 60)
+    assert out2.startswith("skip:push:"), out2
+    assert "推够" in out2 or "上限" in out2
 
 
 @pytest.mark.asyncio
@@ -386,64 +410,72 @@ async def test_jev_says_no_log_but_no_send(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_pass_sends_via_send_text(tmp_path):
-    """Jev 说开 → host.send_text 被调用一次，sync_to_maisaka_history=True。"""
+async def test_pass_enqueues_then_outbox_sends(tmp_path):
+    """Jev 说开 → 开场白只入队；发件箱真发出去之后才写 opener / 用候选 / 记 pushes。"""
     signals = SignalsStub()
     # 安静 1 小时：够冷场、又没到新的「安静过久（>90 分钟）不开」那条线
     signals.mark(GID, SID, _bj_ts(2026, 9, 27, 14, 0))
     fake = _Jev()
     host = FakeHost(msgs=[], session_id=SID)
-    store, settings, topics, host_obj, models_obj, *_ = _make_topics(
+    T = _bj_ts(2026, 9, 27, 15, 0)
+    store, settings, topics, host_obj, models_obj, *_r, outbox = _make_topics(
         tmp_path,
         signals=signals,
         jev=fake,
         host=host,
         cfg={"topics": {"enabled": True, "per_day": 10, "min_gap_hours": 0, "speaker": "maiwork"}},
     )
-    _seed_candidate(store, check_now=_bj_ts(2026, 9, 27, 15, 0), title="测试候选")
+    _seed_candidate(store, check_now=T, title="测试候选")
     # FakeModelsQueue 默认 reply 一句干净的开场白
-    out = await topics.check(GID, _bj_ts(2026, 9, 27, 15, 0))
+    out = await topics.check(GID, T)
     assert fake.calls, "Jev 应该被问过一次"
-    # 开话题前读消息（用作 Jev 的 state），这条断言不再是「零 msg_calls」
-    # host.send_text 被调一次
-    if hasattr(host, "send_text_calls"):
-        assert host.send_text_calls, "应该调 send_text 发开场白"
-        call = host.send_text_calls[0]
-        # 内部走 send.hybrid 时带 sync_to_maisaka_history=True（host.py 这样写的）
-        assert "开场白" in call["text"] or "好话题" in call["text"] or len(call["text"]) > 0
-    # topic_log 有一行（judgment + 发送后回写）
-    rows = store.read().execute("SELECT * FROM topic_log WHERE group_id=?", (GID,)).fetchall()
-    assert len(rows) == 1
-    # candidate 被标记 used
-    cand_rows = store.read().execute("SELECT used_ts FROM topic_candidates WHERE group_id=?", (GID,)).fetchall()
-    assert cand_rows and cand_rows[0]["used_ts"] is not None
-    # pushes 记了一条 topic
-    assert dict(store.read().execute("SELECT COUNT(*) AS c FROM pushes WHERE group_id=? AND kind='topic'", (GID,)).fetchone())["c"] == 1
+    assert out.startswith("queued:topic_id="), out
+    # 只入队：opener 还是空的、候选没用、没发消息、没记推送
+    log = store.read().execute("SELECT id, opener, message_id FROM topic_log").fetchone()
+    assert log["opener"] == "" and log["message_id"] == ""
+    assert store.read().execute(
+        "SELECT used_ts FROM topic_candidates WHERE group_id=?", (GID,)
+    ).fetchone()["used_ts"] is None
+    assert store.read().execute(
+        "SELECT COUNT(*) c FROM pushes WHERE group_id=? AND kind='topic'", (GID,)
+    ).fetchone()["c"] == 0
+    assert not getattr(host, "send_text_calls", [])
+    row = store.read().execute("SELECT key, status FROM outbox").fetchone()
+    assert row["key"] == f"topic:{int(log['id'])}" and row["status"] == "pending"
+    # 发件箱真发出去 → 回写 opener / message_id / 候选 used / 留痕
+    await outbox.flush(T)
+    log = store.read().execute("SELECT opener, message_id FROM topic_log").fetchone()
+    assert log["opener"] == "好话题，来聊聊？"
+    assert log["message_id"] == "fake-msg-id"
+    assert store.read().execute(
+        "SELECT used_ts FROM topic_candidates WHERE group_id=?", (GID,)
+    ).fetchone()["used_ts"] is not None
+    assert store.read().execute(
+        "SELECT COUNT(*) c FROM pushes WHERE group_id=? AND kind='topic'", (GID,)
+    ).fetchone()["c"] == 1
+    assert getattr(host, "send_text_calls", []), "应该调 send_text 发开场白"
 
 
 @pytest.mark.asyncio
-async def test_pass_speaker_maibot_via_proactive_trigger(tmp_path):
-    """speaker="maibot" → 走 proactive_trigger，不走 send_text。"""
+async def test_speaker_maibot_retired_goes_through_outbox(tmp_path):
+    """speaker="maibot" 退役：一律走发件箱的 send_text，不再请 MaiBot 主动开口。"""
     signals = SignalsStub()
-    # 安静 1 小时：够冷场、又没到新的「安静过久（>90 分钟）不开」那条线
     signals.mark(GID, SID, _bj_ts(2026, 9, 27, 14, 0))
     fake = _Jev()
     host = FakeHost(msgs=[], session_id=SID)
-    store, settings, topics, host_obj, *_ = _make_topics(
+    T = _bj_ts(2026, 9, 27, 15, 0)
+    store, settings, topics, host_obj, *_r, outbox = _make_topics(
         tmp_path,
         signals=signals,
         jev=fake,
         host=host,
         cfg={"topics": {"enabled": True, "per_day": 10, "min_gap_hours": 0, "speaker": "maibot"}},
     )
-    _seed_candidate(store, check_now=_bj_ts(2026, 9, 27, 15, 0), title="测试候选")
-    await topics.check(GID, _bj_ts(2026, 9, 27, 15, 0))
-    if hasattr(host, "send_text_calls"):
-        assert host.send_text_calls == []
-    if hasattr(host, "proactive_trigger_calls"):
-        assert host.proactive_trigger_calls, "proactive_trigger 应该被调"
-    else:
-        pytest.skip("FakeHost 没有 proactive_trigger 记录")
+    _seed_candidate(store, check_now=T, title="测试候选")
+    assert (await topics.check(GID, T)).startswith("queued:")
+    await outbox.flush(T)
+    assert getattr(host, "send_text_calls", []), "应该走 send_text"
+    assert getattr(host, "proactive_trigger_calls", []) == [], "不该再请 MaiBot 主动开口"
 
 
 @pytest.mark.asyncio
@@ -1048,5 +1080,5 @@ async def test_jev_log_stuck_null_when_opened(tmp_path):
     store, settings, topics, *_ = _make_topics(tmp_path, signals=signals, jev=fake, cfg=_QUIET_CFG)
     _seed_candidate(store, check_now=t, title="测试候选")
     out = await topics.check(GID, t)
-    assert out.startswith("opened:")
+    assert out.startswith("queued:topic_id=")
     assert _read_jev(store)["stuck"] is None

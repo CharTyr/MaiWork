@@ -358,13 +358,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
     # ------------------------------------------------------------------
 
     def _settings() -> Any:
-        """有效设置（config + 网页规则覆盖）。
-
-        优先用 svc.get_settings()；它还没把规则覆盖合进来时（例如只给了基础
-        Settings 的场景），这里自己按 rules.effective_settings 合一次并缓存在
-        服务包上，保证「刚改完的规则」下一次读就是新值。合不出来就用原值，
-        绝不把设置读挂。
-        """
+        """有效设置（config.toml 热更新后的值）；读不到就用服务包的原始设置兜底。"""
         getter = getattr(svc, "get_settings", None)
         base = None
         if callable(getter):
@@ -374,32 +368,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                 logger.exception("管理员工具读设置失败")
         if base is None:
             return getattr(svc, "_settings", None)
-        store = getattr(svc, "store", None)
-        if store is None:
-            return base
-        try:
-            override = rules.read_override(store)
-            if not override:
-                return base
-            cached = getattr(svc, "_mw_effective", None)
-            if isinstance(cached, tuple) and len(cached) == 3 and cached[0] is base and cached[1] == override:
-                return cached[2]
-            merged = rules.effective_settings(base, override)
-            try:
-                setattr(svc, "_mw_effective", (base, override, merged))
-            except Exception:
-                pass
-            # 服务包的 get_settings() 还没把规则覆盖合进来时（只返回基础 Settings 的场景，
-            # 例如测试里的最小服务包），把基础设置换成合并后的——这样「刚改完的规则」
-            # 立刻对所有读设置的地方生效，和线上 app.get_settings() 的行为一致。
-            if merged is not base and getattr(svc, "_settings", None) is base:
-                try:
-                    setattr(svc, "_settings", merged)
-                except Exception:
-                    pass
-            return merged
-        except Exception:
-            return base
+        return base
 
     def _served(gid: Any) -> tuple[str, ToolResult | None]:
         """返回 (群号, None) 或 ("", 中文错误)。非服务群一律挡住。"""
@@ -514,19 +483,8 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             return gate.queue(tool, _norm_args(args), summary)
         return None
 
-    # 群的「安静/睡觉时段」在这个窗口里，MaiWork 不主动往群里发东西；
-    # 窗口越窄 = 能发的时间段越长（跨午夜按 24 小时折回）。
-    def _quiet_minutes(value: Any) -> int | None:
-        """"HH:MM-HH:MM" → 这段一天里占多少分钟；解析不了 → None（不参与比较）。"""
-        try:
-            start, end = clock.parse_hhmm_range(str(value))
-        except Exception:
-            return None
-        if end > start:
-            return end - start
-        if end < start:
-            return 1440 - start + end
-        return 1440  # 起止一样 = 全天都算安静
+    # 群的「安静/睡觉时段」0.8.0 起每个群自己一份（group_push，群页面管）；
+    # 全局推送上限 / 睡觉时段不再从这里改，_quiet_minutes 也随之删掉。
 
     def _workspace_root_of(gid: str) -> Path | None:
         """这个群的工作区根目录（workspace_root / 工作区名）；取不到 → None。"""
@@ -572,7 +530,6 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         if feed_obj is not None:
             try:
                 parts.append(f"资讯 {len(feed_obj.news_view(gid))} 条 / 构想 {len(feed_obj.ideas_view(gid))} 条")
-                parts.append(f"资讯偏好：{feed_obj.pref(gid) or '（还没写）'}")
             except Exception:
                 pass
         try:
@@ -886,14 +843,20 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         return _ok(f"最近 {len(data)} 条模型调用：\n" + "\n".join(lines), data=data)
 
     def _flat_rules(settings: Any) -> list[str]:
+        """全局还能改的规则（节.字段=值）。
+
+        0.8.0 起「谁能批本群的活 / 免批」「冷场开话题 / 往群里发多少 / 几点不打扰」是
+        每个群自己一份（kv["group_approval.<群号>"] / kv["group_push.<群号>"]），这里
+        不再列全局那几行——列了会让人以为还能从全局改；去群页面看/改。
+        """
         out: list[str] = []
-        for section in ("delivery", "topics", "approval", "feeds"):
+        for section in ("topics", "approval", "feeds"):
             obj = getattr(settings, section, None)
             if obj is None:
                 continue
             for field in (
-                "quiet_hours", "push_per_day", "enabled", "per_day", "min_gap_hours",
-                "required", "admins", "exempt_groups", "exempt_users", "remind",
+                "min_gap_hours", "candidate_ttl_hours",
+                "remind", "auto_review", "auto_review_daily",
                 "news_slots", "max_items", "web_min_avg", "pool_min_avg", "guides",
             ):
                 if hasattr(obj, field):
@@ -902,17 +865,13 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
 
     async def get_rules(ctx: ToolContext, args: dict) -> ToolResult:
         settings = _settings()
-        store = getattr(svc, "store", None)
         if settings is None:
             return _bad("读不到规则：设置没就位")
-        view: dict = {}
-        if store is not None:
-            try:
-                view = rules.rules_view(settings, store)
-            except Exception:
-                logger.exception("rules_view 失败，退回有效设置")
         lines = _flat_rules(settings)
-        return _ok("现在的规则：\n" + "\n".join(lines), data=view or {"flat": lines})
+        tail = ("每群的「谁能批 / 免批」和「往群里发（开话题 / 资讯卡 / 每日上限 / 睡觉时段）」"
+                "在每个群自己的页面里管（这里不再从全局改；config.toml 里那几行只作新群第一次的种子）。")
+        return _ok("现在的规则：\n" + "\n".join(lines) + "\n" + tail,
+                   data={"flat": lines, "group_page_note": tail})
 
     async def get_identity(ctx: ToolContext, args: dict) -> ToolResult:
         ident = _identity()
@@ -1076,23 +1035,6 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         word = {"add": "已设成一直关注", "remove": "已取消关注", "auto": "已改回自动挑"}[action]
         return _ok(f"{word}（{uid}）", data={"user_id": uid, "action": action})
 
-    async def set_feeds_pref(ctx: ToolContext, args: dict) -> ToolResult:
-        gid, err = _served(args.get("group_id") or ctx.group_id)
-        if err is not None:
-            return err
-        text = str(args.get("text") or "").strip()
-        try:
-            feed_obj = _feeds()
-            if feed_obj is not None:
-                saved = feed_obj.set_pref(gid, text)
-            else:
-                saved = text[:300]
-                with svc.store.tx() as conn:
-                    svc.store.kv_set(conn, f"feeds.pref.{gid}", saved)
-        except Exception as e:
-            return _bad(f"写资讯偏好失败：{e}")
-        return _ok(f"群 {gid} 的资讯偏好已更新：{saved or '（清空了）'}", data={"pref": saved})
-
     async def rss_add(ctx: ToolContext, args: dict) -> ToolResult:
         gid, err = _served(args.get("group_id") or ctx.group_id)
         if err is not None:
@@ -1137,50 +1079,61 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         return _ok(f"已从群 {gid} 删掉 RSS 源 {feed_id}")
 
     async def block_domain(ctx: ToolContext, args: dict) -> ToolResult:
+        from . import feeds as _feeds
+
         raw = str(args.get("domain") or "").strip().lower().strip(".")
         domain = raw[4:] if raw.startswith("www.") else raw
         if not _DOMAIN_RE.match(domain):
             return _bad(f"「{raw}」不像一个域名（要像 example.com）")
         blocked = bool(args.get("blocked", True))
-        settings = _settings()
-        config_blocked = list(getattr(getattr(settings, "feeds", None), "blocked_domains", ()) or ())
-        try:
-            kv = svc.store.kv_get("feeds.blocked_domains", None)
-            current = {str(d).lower() for d in kv} if isinstance(kv, list) else set(config_blocked)
-        except Exception:
-            current = set(config_blocked)
+        gid, err = _served(args.get("group_id") or ctx.group_id)
+        if err is not None:
+            return err
+        current = set(_feeds.blocked_domains(svc.store, gid))
         if blocked:
             current.add(domain)
         else:
             current.discard(domain)
-        names = sorted(current)
         try:
-            with svc.store.tx() as conn:
-                svc.store.kv_set(conn, "feeds.blocked_domains", names)
+            names = _feeds.blocked_domains_set(svc.store, gid, sorted(current))
         except Exception as e:
             return _bad(f"写屏蔽名单失败：{e}")
         return _ok(
-            f"已{'屏蔽' if blocked else '取消屏蔽'} {domain}；现在屏蔽名单共 {len(names)} 个域名",
-            data={"blocked_domains": names},
+            f"已对群 {gid}{'屏蔽' if blocked else '取消屏蔽'} {domain}；这个群的屏蔽名单共 {len(names)} 个域名",
+            data={"group_id": gid, "blocked_domains": names},
         )
 
     def _validated_patch(patch: Any) -> dict[str, dict[str, Any]] | ToolResult:
         """先把 patch 逐字段验一遍（返回 {节: {字段: 规范值}} 或错误结果）。
 
         先验再问：值本身就不合法（比如推送上限 99）时直接报错，不该记一张
-        「待确认」小票让管理员去点一个根本执行不了的动作。
+        「待确认」小票让管理员去点一个根本执行不了的动作。校验跟网页「全部配置」
+        同一套（rules.CONFIG_SCHEMA），不是旧白名单了。
+        0.8.0：归每个群自己管的键（approval.required/admins/exempt_*、topics.enabled/
+        speaker/per_day、delivery.push_per_day/quiet_hours）直接拒，并说清「到群页管理」——
+        绝不悄悄写一份没人听的全局值。
         """
         if not isinstance(patch, dict) or not patch:
-            return _bad('要给 patch，形如 {"delivery": {"push_per_day": 5}}')
+            return _bad('要给 patch，形如 {"feeds": {"max_items": 12}}')
         out: dict[str, dict[str, Any]] = {}
         try:
             for section, fields in patch.items():
                 if not isinstance(fields, dict):
                     continue
                 for field, value in fields.items():
-                    key, normalized = rules.validate_patch(f"{section}.{field}", value)
-                    sec, _, fld = key.partition(".")
-                    out.setdefault(sec, {})[fld] = normalized
+                    key = f"{section}.{field}"
+                    spec = rules.CONFIG_BY_KEY.get(key)
+                    if spec is None:
+                        raise ValueError(f'不认识或不能在这里改的字段 "{key}"')
+                    hint = rules.group_managed_hint(key)
+                    if hint:
+                        raise ValueError(f"「{spec['label']}」现在每个群自己一份，到「{hint}」里改，"
+                                         "不从全局改（config.toml 里那一行只作新群的种子）")
+                    if spec.get("readonly"):
+                        raise ValueError(f"{spec['label']}不能从这里改：{spec.get('readonly_reason') or '只能改 config.toml 文件'}")
+                    if spec["type"] == "secret":
+                        raise ValueError(f"{spec['label']}是密钥，这里不许动（到网页「全部配置」里改）")
+                    out.setdefault(str(section), {})[str(field)] = rules._validate_generic(spec, value)
         except ValueError as e:
             return _bad(str(e))
         if not out:
@@ -1191,23 +1144,18 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         """验过的 patch 里有没有「放宽安全 / 让 MaiWork 更常往群里发东西」的；返回中文说明（没有 → ""）。
 
         判定口径（宁可多确认一次，不让模型绕过确认）：
-        - approval 节里除了下面两个「自动审核」键，**任何字段**（管理员名单、免批群 / 免批人、
-          批准开关、提醒开关）都是权限边界，一律要管理员点头；
+        - approval.remind：提醒开关（关掉 = 权限边界变松）一律要管理员点头；
         - approval.auto_review：从「关」变「开」= 放宽（要确认）；关掉不用；
         - approval.auto_review_daily：上限调大 = 放宽（要确认）；调低不用；
-        - delivery.push_per_day：比现在大（或 >5）= 推送变多；
-        - delivery.quiet_hours：安静窗口变窄 = 能发的时间段变长；
-        - topics.per_day 变大、min_gap_hours 变小、enabled 从关到开 = 开话题更勤。
+        - topics.min_gap_hours 变小 = 开话题更勤（要确认）。
+        0.8.0：管理员名单 / 免批 / 批准开关、推送上限 / 睡觉时段、开话题开关与上限都归
+        每个群自己管了，根本进不到这里（_validated_patch 已拒）；这里只剩仍归全局的几项。
         比「现在值」时以有效设置为准；读不到当前值时，但凡沾边一律算放宽（要确认）。
         """
         out: list[str] = []
         approval = validated.get("approval") or {}
         _APPROVAL_ZH = {
-            "required": "派活批准开关",
             "remind": "待批提醒开关",
-            "admins": "bot 管理员名单",
-            "exempt_groups": "免批准的群",
-            "exempt_users": "免批准的人",
             "auto_review": "自动审核轻活",
             "auto_review_daily": "每群每天最多自动批",
         }
@@ -1233,44 +1181,18 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                 ):
                     out.append(f"每天最多自动批放宽到 {value}")
                 continue
-            if field in ("required", "remind"):
-                if value is False:
-                    out.append(f"关掉{label}")
-                else:
-                    out.append(f"打开{label}")
+            if field == "remind":
+                out.append(f"关掉{label}" if value is False else f"打开{label}")
             else:
                 members = "、".join(str(m) for m in value) if isinstance(value, list) else str(value)
                 out.append(f"改动{label}（{members or '清空'}）")
-        delivery = validated.get("delivery") or {}
-        if "push_per_day" in delivery:
-            new_push = delivery["push_per_day"]
-            now_push = getattr(getattr(current, "delivery", None), "push_per_day", None)
-            if not isinstance(now_push, int) or isinstance(now_push, bool):
-                now_push = None
-            if isinstance(new_push, int) and not isinstance(new_push, bool):
-                if now_push is None or new_push > 5 or new_push > now_push:
-                    out.append(f"每天推送上限放宽到 {new_push}")
-        if "quiet_hours" in delivery:
-            new_q = _quiet_minutes(delivery["quiet_hours"])
-            now_q = _quiet_minutes(getattr(getattr(current, "delivery", None), "quiet_hours", ""))
-            if new_q is None or now_q is None or new_q < now_q:
-                out.append(f"安静时段收窄成 {delivery['quiet_hours']}（能发东西的时间段变长）")
         topics = validated.get("topics") or {}
         now_topics = getattr(current, "topics", None)
-        if "per_day" in topics:
-            new_pd = topics["per_day"]
-            now_pd = getattr(now_topics, "per_day", None)
-            if not isinstance(now_pd, int) or (isinstance(new_pd, int) and new_pd > now_pd):
-                out.append(f"每天开话题上限放宽到 {new_pd}")
         if "min_gap_hours" in topics:
             new_gap = topics["min_gap_hours"]
             now_gap = getattr(now_topics, "min_gap_hours", None)
             if not isinstance(now_gap, int) or (isinstance(new_gap, int) and new_gap < now_gap):
                 out.append(f"开话题最小间隔缩到 {new_gap} 小时")
-        if "enabled" in topics:
-            now_on = getattr(now_topics, "enabled", None)
-            if topics["enabled"] is True and now_on is not True:
-                out.append("打开冷场开话题")
 
         # 去重保序
         seen: set[str] = set()
@@ -1328,43 +1250,56 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             pending = _need_confirm("set_rules", args, _patch_summary(validated, loosen))
             if pending is not None:
                 return pending
+        # 2026-10 docs/18 第一步：不再写 kv 覆盖层，和网页「全部配置」走同一条
+        # save_config_patch 直写 config.toml 的路径，写完立刻热生效。
+        flat: dict[str, Any] = {}
+        for section, fields in validated.items():
+            for field, value in fields.items():
+                flat[f"{section}.{field}"] = value
         try:
-            override = rules.save_patch(svc.store, patch, base=base)
+            plugin_dir, data_dir = svc.config_file_ops()
+        except Exception:
+            return _bad("这台机器拿不到 config.toml 的位置，改不了（去网页「全部配置」里改）")
+        try:
+            changed = rules.save_config_patch(svc.store, flat, base=base, plugin_dir=plugin_dir)
         except ValueError as e:
             return _bad(str(e))
         except Exception as e:
-            return _bad(f"存规则失败：{e}")
-        settings = _settings()
+            return _bad(f"写 config.toml 失败：{e}")
+        # 热生效（网页路径同款；失败微博页面对齐：文件已写，宿主文件监控会补一次）
+        try:
+            from . import config_file as _cf
+
+            apply_fn = getattr(svc, "apply_config_text", None)
+            if callable(apply_fn):
+                await apply_fn(_cf.read_text(plugin_dir))
+        except Exception:
+            logger.exception("set_rules 写后应用出错（文件已写，宿主文件监控会补一次）")
         lines: list[str] = []
-        for section, fields in override.items():
-            for field in fields:
-                value = getattr(getattr(settings, section, None), field, fields[field])
-                key = f"{section}.{field}"
-                name = str((rules.CONFIG_BY_KEY.get(key) or {}).get("label") or key)
-                if isinstance(value, bool):
-                    value = "开" if value else "关"
-                elif isinstance(value, (list, tuple)):
-                    value = "、".join(str(m) for m in value) or "（清空）"
-                lines.append(f"{name} → {value}")
+        for key in changed:
+            sec, _, fld = key.partition(".")
+            value = flat.get(sec + "." + fld, validated.get(sec, {}).get(fld))
+            name = str((rules.CONFIG_BY_KEY.get(key) or {}).get("label") or key)
+            if isinstance(value, bool):
+                value = "开" if value else "关"
+            elif isinstance(value, (list, tuple)):
+                value = "、".join(str(m) for m in value) or "（清空）"
+            lines.append(f"{name} → {value}")
         if not lines:
-            return _ok("这些值和配置文件里一样，等于没改", data=override)
-        return _ok("规则已改：\n" + "\n".join(lines), data=override)
+            return _ok("这些值和配置文件里一样，等于没改", data=flat)
+        return _ok("规则已写进 config.toml 并立刻生效：\n" + "\n".join(lines), data=flat)
 
     async def identity_edit(ctx: ToolContext, args: dict) -> ToolResult:
         kind = str(args.get("kind") or "").strip().lower()
         text = str(args.get("text") or "")
-        if kind not in ("soul", "agents", "memory", "group"):
-            return _bad("kind 只能是 soul / agents / memory / group")
+        # 「每群三份」收尾 2026-10-03：kind=group 整条退役（每群内容换成本群规矩
+        # /api/groups/{gid}/rules + 本群做法 /api/groups/{gid}/skills；本工具现在只管全局三份）
+        if kind not in ("soul", "agents", "memory"):
+            return _bad("kind 只能是 soul / agents / memory（每群内容走网页「本群规矩 / 本群做法」）")
         ident = _identity()
         if ident is None:
             return _bad("身份文件没就位，这次改不了")
         try:
-            if kind == "group":
-                gid, err = _served(args.get("group_id") or ctx.group_id)
-                if err is not None:
-                    return err
-                ident.group_write(gid, text)
-                return _ok(f"已更新群 {gid} 的工作记忆（{len(text)} 字）")
             ident.write(kind, text)
         except ValueError as e:
             return _bad(str(e))
@@ -2116,21 +2051,6 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         ),
         (
             {
-                "name": "set_feeds_pref",
-                "description": "写一个服务群的资讯偏好（一句话：这个群想看什么、不想看什么）。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "group_id": {"type": "string", "description": "群号（可选）"},
-                        "text": {"type": "string", "description": "一句话偏好；空 = 清掉"},
-                    },
-                    "required": ["text"],
-                },
-            },
-            set_feeds_pref,
-        ),
-        (
-            {
                 "name": "rss_add",
                 "description": "给一个服务群加一个 RSS 源。",
                 "parameters": {
@@ -2163,10 +2083,11 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         (
             {
                 "name": "block_domain",
-                "description": "屏蔽 / 取消屏蔽一个来源域名（全服务群生效）。",
+                "description": "屏蔽 / 取消屏蔽一个来源域名（只对这个服务群生效，不写 group_id 就用当前对话的群）。",
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "group_id": {"type": "string", "description": "群号（可选，不给 = 当前群）"},
                         "domain": {"type": "string", "description": "域名，如 example.com"},
                         "blocked": {"type": "boolean", "description": "true 屏蔽 / false 取消屏蔽"},
                     },
@@ -2178,11 +2099,11 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         (
             {
                 "name": "set_rules",
-                "description": '改规则（推送 / 开话题 / 派活批准 / 资讯），形如 {"delivery": {"push_per_day": 5}}。放宽安全设置时要管理员确认。',
+                "description": '改规则（推送 / 开话题 / 派活批准 / 资讯），形如 {"delivery": {"push_per_day": 5}}。直接写进 config.toml 立刻生效；放宽安全设置时要管理员确认。',
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "patch": {"type": "object", "description": "{节: {字段: 值}}，节只能是 delivery / topics / approval / feeds"},
+                        "patch": {"type": "object", "description": "{节: {字段: 值}}，配置里的任意可改字段"},
                     },
                     "required": ["patch"],
                 },
@@ -2192,13 +2113,12 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         (
             {
                 "name": "identity_edit",
-                "description": "改身份与工作记忆：kind 取 soul / agents / memory（全局）或 group（某个群的工作记忆）。",
+                "description": "改身份与工作记忆（只全局三份）：kind 取 soul / agents / memory。每群内容请走网页「本群规矩 / 本群做法」。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "kind": {"type": "string", "enum": ["soul", "agents", "memory", "group"]},
+                        "kind": {"type": "string", "enum": ["soul", "agents", "memory"]},
                         "text": {"type": "string", "description": "新的全文"},
-                        "group_id": {"type": "string", "description": "kind=group 时的群号"},
                     },
                     "required": ["kind", "text"],
                 },
@@ -2208,7 +2128,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         (
             {
                 "name": "remember",
-                "description": "让 MaiWork 记住一件事（写进工作记忆，去重与隐私规则照旧生效）。",
+                "description": "让 MaiWork 记住一件事：带 group_id 进本群「本群规矩」（append 一行；规矩超上限要管理员先去网页清）；不带 group_id 进全局 MEMORY.md。去重与隐私闸照旧生效。",
                 "parameters": {
                     "type": "object",
                     "properties": {

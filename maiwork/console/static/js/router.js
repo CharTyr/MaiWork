@@ -10,7 +10,7 @@ import { loadRules } from "./settings/rules.js";
 import { loadUsage } from "./settings/usage.js";
 import { loadIdentity } from "./settings/identity.js";
 import { loadModels } from "./settings/models.js";
-import { loadLogs } from "./settings/logs.js";
+import { loadLogSummary } from "./settings/logs.js";
 import { closeSheet, openSheet, repaintSheet } from "./sheet.js";
 import { enterChat } from "./chat.js";
 import { render, renderRail, renderSide, renderTabbar, renderTop, renderView } from "./render.js";
@@ -40,8 +40,10 @@ export function syncHash() {
 export function parseHash() {
   const parts = location.hash.replace(/^#\/?/, "").split("/");
   if (parts[0] === "chat") return { chat: true, id: parts[1] || "", ref: "", tab: "", sub: "" };
-  if (parts[0] === "settings") return { settings: true, sub: parts[1] || "overview", ref: "", tab: "", id: "" };
-  return { ref: decodeURIComponent(parts[0] || ""), tab: parts[1] || "", id: decodeURIComponent(parts[2] || "") };
+  if (parts[0] === "settings") return { settings: true, sub: parts[1] === "logs" ? "usage" : parts[1] || "overview", ref: "", tab: "", id: "" };
+  // 旧的目标页链接仍能打开原目标详情，只是落到「在做的事」。
+  const tab = parts[1] === "goals" ? "tasks" : parts[1] || "";
+  return { ref: decodeURIComponent(parts[0] || ""), tab, id: decodeURIComponent(parts[2] || "") };
 }
 
 export function applyHash() {
@@ -106,6 +108,7 @@ export async function loadSettings() {
 export async function reboot() {
   state.view = null;
   state.settings = null;
+  state.groupControls = null;
   state.agents = null;
   state.agentSnapshot = null;
   state.agentEdit = null;
@@ -131,9 +134,8 @@ export async function reboot() {
         if (state.page === "settings" && state.setSub === "agents") await loadAgents();
         if (state.page === "settings" && state.setSub === "models") await loadModels();
         if (state.page === "settings" && state.setSub === "rules") await loadRules();
-        if (state.page === "settings" && state.setSub === "usage") await loadUsage();
+        if (state.page === "settings" && state.setSub === "usage") await Promise.all([loadUsage(), loadLogSummary()]);
         if (state.page === "settings" && ["memory", "agents"].includes(state.setSub)) await loadIdentity();
-        if (state.page === "settings" && state.setSub === "logs") await loadLogs();
         if (state.page === "settings" && state.setSub === "links") await loadGA();
         renderRail();
         repaintSheet();
@@ -168,9 +170,8 @@ export async function enterSettings(sub) {
   if (state.setSub === "agents") await loadAgents();
   if (state.setSub === "models") await loadModels();
   if (state.setSub === "rules") await loadRules();
-  if (state.setSub === "usage") await loadUsage();
+  if (state.setSub === "usage") await Promise.all([loadUsage(), loadLogSummary()]);
   if (["memory", "agents"].includes(state.setSub)) await loadIdentity();
-  if (state.setSub === "logs") await loadLogs();
   if (state.setSub === "links") await loadGA();
   if (state.page === "settings") {
     renderView();

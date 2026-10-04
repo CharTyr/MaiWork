@@ -269,8 +269,20 @@ class TestWritePosts:
             tmp_path, models=models, host=host,
         )
         _seed_chat(store)
-        with store.tx() as conn:
-            store.kv_set(conn, f"feeds.pref.{GID}", "多找硬件折腾的，少来软文")
+        from types import SimpleNamespace
+
+        from CharTyr_MaiWork.maiwork.agents import Agents
+
+        class _Settings:
+            served_groups = (GID,)
+
+            def is_served(self, g):
+                return str(g) in self.served_groups
+
+        agents_stub = Agents(store, lambda: _Settings())
+        agents_stub._ensure_schema()
+        feeds._agents = agents_stub  # noqa: SLF001  # feeds._group_context_safe 在 _specialists=None 时回落到 _agents
+        agents_stub.skill_add(GID, "news", description="", body="多找硬件折腾的，少来软文")
         with _TimePatch():
             got = _run(feeds.prepare_news(GID))
         assert got == 1
@@ -282,7 +294,7 @@ class TestWritePosts:
         assert "阿一" in prompt
         # 人设只认 SOUL.md（2026-10-01 用户定）：这里没接 identity，MaiBot 的人格不许混进来
         assert "小麦" not in prompt and "热心肠" not in prompt
-        assert "多找硬件折腾的，少来软文" in prompt   # 资讯偏好
+        assert "多找硬件折腾的，少来软文" in prompt   # 本群做法 skill 正文（已替换原来的「资讯偏好」）
 
         row = store.read().execute("SELECT * FROM news_items WHERE rejected=0").fetchone()
         assert row is not None
@@ -729,24 +741,16 @@ class TestIdeaFeasibility:
 
 
 class TestFeedsPref:
-    def test_prefs_text_trimmed_and_300(self, tmp_path) -> None:
-        store, settings, feeds, *_r = _make_feeds(tmp_path)
-        feeds.set_pref(GID, "  多找硬件的  ")
-        assert feeds.pref(GID) == "多找硬件的"
-        long_text = "长" * 500
-        feeds.set_pref(GID, long_text)
-        assert len(feeds.pref(GID)) == 300
-        feeds.set_pref(GID, "")
-        assert feeds.pref(GID) == ""
+    """原本的「资讯偏好」（kv feeds.pref.<群> + PUT /api/groups/{gid}/feeds-pref）已删，
+    统一迁成「本群规矩」（group_rules，API /api/groups/{gid}/rules）。剩下这几个契约也搬去
+    tests/test_group_rules_api 一起留。"""
 
-    def test_focus_prompt_carries_pref(self, tmp_path) -> None:
-        models = FakeModelsQueue(ready=True, replies=[_FOCUS_JSON])
-        store, settings, feeds, models, *_r = _make_feeds(tmp_path, models=models)
-        with store.tx() as conn:
-            store.kv_set(conn, f"feeds.pref.{GID}", "这个群想看国产硬件")
-        _run(feeds._plan_focus(GID, settings))
-        prompt = models.calls[0][1][-1]["content"]
-        assert "这个群想看国产硬件" in prompt
+    def test_pref_and_set_pref_gone(self) -> None:
+        """feeds.pref / feeds.set_pref 已删（不剩 FAT 路径）。"""
+        from CharTyr_MaiWork.maiwork import feeds as _feeds_mod
+
+        assert not hasattr(_feeds_mod.Feeds, "pref")
+        assert not hasattr(_feeds_mod.Feeds, "set_pref")
 
 
 def _raw_config(data_dir: Path) -> dict:
@@ -775,45 +779,6 @@ async def env(tmp_path: Path):
     finally:
         await client.close()
         await app.stop()
-
-
-@pytest.mark.asyncio
-async def test_feeds_pref_api_admin_rw(env) -> None:
-    await env.client.post("/api/login", json={"password": PASSWORD})
-    r = await env.client.get(f"/api/groups/{G1}/feeds-pref")
-    assert r.status == 200
-    assert (await r.json()) == {"text": ""}
-    r = await env.client.put(f"/api/groups/{G1}/feeds-pref", json={"text": "多找开源硬件"})
-    assert r.status == 200
-    assert (await r.json())["text"] == "多找开源硬件"
-    r = await env.client.get(f"/api/groups/{G1}/feeds-pref")
-    assert (await r.json())["text"] == "多找开源硬件"
-    # 超长截到 300
-    r = await env.client.put(f"/api/groups/{G1}/feeds-pref", json={"text": "长" * 500})
-    assert r.status == 200
-    assert len((await r.json())["text"]) == 300
-
-
-@pytest.mark.asyncio
-async def test_feeds_pref_member_403_anon_401(env) -> None:
-    token = env.app.token_of(G1)
-    r = await env.client.put(
-        f"/api/groups/{G1}/feeds-pref", json={"text": "x"},
-        headers={"X-MW-Group": token},
-    )
-    assert r.status == 403
-    r = await env.client.put(f"/api/groups/{G1}/feeds-pref", json={"text": "x"})
-    assert r.status == 401
-
-
-@pytest.mark.asyncio
-async def test_group_view_has_feeds_pref(env) -> None:
-    await env.client.post("/api/login", json={"password": PASSWORD})
-    r = await env.client.put(f"/api/groups/{G1}/feeds-pref", json={"text": "想看硬件"})
-    assert r.status == 200
-    r = await env.client.get(f"/api/groups/{G1}")
-    data = await r.json()
-    assert data["feeds_pref"] == "想看硬件"
 
 
 @pytest.mark.asyncio

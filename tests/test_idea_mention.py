@@ -1,6 +1,9 @@
 """card_push.IdeaMention：出了新构想，MaiWork 在群里提一嘴（每群开关默认关）。
 
 个人向构想 @ 本人；话里绝不能露画像（「根据你的画像 / 我注意到你…」）也不能写 QQ 号。
+
+0.8.0 归一之后：提一嘴只「写好话 + 入队」（默认模板 / SOUL 人设那套没变），
+真正发出去、睡觉时段、共用的每日总上限都在发件箱；发出之后由结果 hook 回写 idea_mentions。
 """
 
 from __future__ import annotations
@@ -10,10 +13,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from CharTyr_MaiWork.maiwork import card_push
+from CharTyr_MaiWork.maiwork import card_push, group_push
 from CharTyr_MaiWork.maiwork.config import load_settings
 from CharTyr_MaiWork.maiwork.delivery import Mentions, Pushes
 from CharTyr_MaiWork.maiwork.models import ModelError
+from CharTyr_MaiWork.maiwork.outbox import Outbox
 from CharTyr_MaiWork.maiwork.store import Store
 
 pytestmark = pytest.mark.asyncio
@@ -80,10 +84,11 @@ class Models:
 
 
 def _make(tmp_path, *, replies=None, public_url="https://mw.example", persona=None, msgs=None,
-          identity=None):
+          identity=None, outbox=True):
     store = Store(tmp_path / "t.db")
     store.migrate()
-    cfg = {"groups": {"serve": [{"group": f"qq:{GID}"}]}}
+    cfg = {"groups": {"serve": [{"group": f"qq:{GID}"}]},
+           "environments": {"workspace_root": str(tmp_path)}}
     if public_url:
         cfg["console"] = {"public_url": public_url}
     settings, _ = load_settings(cfg)
@@ -91,15 +96,17 @@ def _make(tmp_path, *, replies=None, public_url="https://mw.example", persona=No
     models = Models(replies)
     pushes = Pushes(store, lambda: settings)
     mentions = Mentions(store, lambda: settings)
+    # 真发件箱：提一嘴只入队，发送 / 节制 / 回写都在这里
+    ob = Outbox(store, host, pushes, mentions, lambda: settings)
     im = card_push.IdeaMention(store, host, models, pushes, mentions, lambda: settings,
-                               identity=identity)
+                               identity=identity, outbox=ob if outbox else None)
     with store.tx() as conn:
         for g in (GID, OTHER):
             conn.execute(
                 "INSERT INTO groups (group_id, session_id, name, token) VALUES (?, ?, '测试群', ?)",
                 (g, f"sess-{g}", f"tok{g}"),
             )
-    return store, host, models, pushes, im
+    return store, host, models, pushes, im, ob
 
 
 def _idea(store, gid=GID, *, created=NOON, target="", title="我可以帮群里做个番剧追更表", state="new",
@@ -124,8 +131,12 @@ def _rows(store):
     return store.read().execute("SELECT * FROM idea_mentions ORDER BY id").fetchall()
 
 
+def _boxes(store):
+    return store.read().execute("SELECT * FROM outbox ORDER BY id").fetchall()
+
+
 async def test_off_by_default(tmp_path):
-    store, host, models, _p, im = _make(tmp_path)
+    store, host, models, _p, im, ob = _make(tmp_path)
     _idea(store)
     assert im.scan(GID, NOON + 10) == 0
     await im.flush(GID, NOON + 10)
@@ -133,41 +144,53 @@ async def test_off_by_default(tmp_path):
 
 
 async def test_unserved_group_nothing(tmp_path):
-    store, host, models, _p, im = _make(tmp_path)
-    _enable(store, OTHER)
+    """非服务群：设置都不给改（group_push 按服务群校验）；就算有残留配置也扫 / 发全零。"""
+    store, host, models, _p, im, ob = _make(tmp_path)
+    settings = im._get_settings()
+    with pytest.raises(ValueError):
+        group_push.set_config(store, OTHER, {"idea_mention_enabled": True}, settings)
+    _enable(store, OTHER)                      # 老调用口（settings=None）仍能写，但发不出去
     _idea(store, OTHER)
     assert im.scan(OTHER, NOON + 10) == 0
     await im.flush(OTHER, NOON + 10)
-    assert host.texts == [] and models.calls == []
+    assert host.texts == [] and models.calls == [] and _boxes(store) == []
 
 
 async def test_group_idea_mentioned_once_with_link(tmp_path):
-    store, host, models, pushes, im = _make(tmp_path)
+    """只入队（不标 sent），发件箱真发出去之后才算提过一次 + 留痕。"""
+    store, host, models, pushes, im, ob = _make(tmp_path)
     _enable(store)
     iid = _idea(store)
     assert im.scan(GID, NOON + 10) == 1
     assert im.scan(GID, NOON + 11) == 0
     await im.flush(GID, NOON + 10)
     await im.flush(GID, NOON + 20)
+    assert host.texts == []
+    row = _rows(store)[0]
+    assert row["status"] == "queued" and row["sent_ts"] is None
+    assert "想到个点子" in row["text"]          # 写好话落库，等发件箱发
+    box = _boxes(store)[0]
+    assert box["status"] == "pending" and str(box["key"]) == f"idea_mention:{int(row['id'])}"
+    await ob.flush(NOON + 30)
     assert len(host.texts) == 1
     t = host.texts[0]
     assert t["at_user"] == ""
     assert "想到个点子" in t["text"]
     assert f"https://mw.example/#/tok{GID}/ideas/I-{iid}" in t["text"]
-    assert _rows(store)[0]["status"] == "sent"
+    row = _rows(store)[0]
+    assert row["status"] == "sent" and row["message_id"]
     n = store.read().execute("SELECT COUNT(*) c FROM pushes WHERE kind='idea_mention'").fetchone()["c"]
     assert n == 1
-    ok, why = pushes.can_push(GID, "topic", NOON + 30)
-    assert ok, why
 
 
 async def test_prompt_never_gets_basis(tmp_path):
     """basis 里是「为什么适合（引画像）」——根本不给模型，从源头防泄露。"""
-    store, host, models, _p, im = _make(tmp_path)
+    store, host, models, _p, im, ob = _make(tmp_path)
     _enable(store)
     _idea(store, target=UID)
     im.scan(GID, NOON + 10)
     await im.flush(GID, NOON + 10)
+    await ob.flush(NOON + 11)
     prompt = json.dumps(models.calls[0]["messages"], ensure_ascii=False)
     assert "考研" not in prompt
     assert UID not in prompt
@@ -175,11 +198,14 @@ async def test_prompt_never_gets_basis(tmp_path):
 
 
 async def test_personal_idea_ats_member(tmp_path):
-    store, host, models, _p, im = _make(tmp_path)
+    store, host, models, _p, im, ob = _make(tmp_path)
     _enable(store)
     _idea(store, target=UID)
     im.scan(GID, NOON + 10)
     await im.flush(GID, NOON + 10)
+    payload = json.loads(_boxes(store)[0]["payload"])
+    assert payload["at_user"] == UID and UID not in payload["text"]
+    await ob.flush(NOON + 11)
     assert host.texts[0]["at_user"] == UID
     assert UID not in host.texts[0]["text"]
 
@@ -191,11 +217,12 @@ async def test_personal_idea_ats_member(tmp_path):
     f"@{UID} 来看看",
 ])
 async def test_leaky_text_replaced_by_safe_template(tmp_path, bad):
-    store, host, models, _p, im = _make(tmp_path, replies=[json.dumps({"text": bad})])
+    store, host, models, _p, im, ob = _make(tmp_path, replies=[json.dumps({"text": bad})])
     _enable(store)
     _idea(store, target=UID)
     im.scan(GID, NOON + 10)
     await im.flush(GID, NOON + 10)
+    await ob.flush(NOON + 11)
     text = host.texts[0]["text"]
     for w in ("画像", "注意到", "平时", UID):
         assert w not in text
@@ -203,48 +230,93 @@ async def test_leaky_text_replaced_by_safe_template(tmp_path, bad):
 
 
 async def test_model_failure_uses_template(tmp_path):
-    store, host, models, _p, im = _make(tmp_path, replies=[ModelError("down")])
+    store, host, models, _p, im, ob = _make(tmp_path, replies=[ModelError("down")])
     _enable(store)
     _idea(store)
     im.scan(GID, NOON + 10)
     await im.flush(GID, NOON + 10)
+    await ob.flush(NOON + 11)
     assert len(host.texts) == 1 and "番剧追更表" in host.texts[0]["text"]
 
 
-async def test_sleep_defer_and_daily_cap(tmp_path):
-    store, host, models, _p, im = _make(tmp_path)
-    _enable(store, now=SLEEP - 7200, idea_mention_daily_max=1)
+async def test_sleep_hours_no_prepare_no_model(tmp_path):
+    """睡觉时段不备料不发（连模型都不叫）；醒来后备料入队再发。"""
+    store, host, models, _p, im, ob = _make(tmp_path)
+    _enable(store, now=SLEEP - 7200)
     _idea(store, created=SLEEP - 60)
-    _idea(store, created=SLEEP - 30, title="我可以做个群聊周报")
     im.scan(GID, SLEEP)
     await im.flush(GID, SLEEP)
-    assert host.texts == [] and models.calls == []
-    await im.flush(GID, _ts(8, 5, day=16))
+    await ob.flush(SLEEP)
+    assert host.texts == [] and models.calls == []      # 睡觉时段连模型都不叫
+    assert _boxes(store) == []                          # 也还没备料入队
+    wake = _ts(8, 5, day=16)
+    await im.flush(GID, wake)
+    await ob.flush(wake)
+    assert len(host.texts) == 1
+    assert [r["status"] for r in _rows(store)] == ["sent"]
+
+
+async def test_shared_cap_defers_extra_idea_instead_of_dropping(tmp_path):
+    """每日总上限（1）：第二条留到次日额度回来（还在 12 小时窗口里）再发。"""
+    store, host, models, _p, im, ob = _make(tmp_path)
+    afternoon = _ts(13, 0, day=16)
+    _enable(store, now=afternoon - 600)
+    group_push.set_config(store, GID, {"daily_max": 1, "quiet_hours": "00:00-00:00"})
+    _idea(store, created=afternoon - 60)
+    _idea(store, created=afternoon - 30, title="我可以做个群聊周报")
+    im.scan(GID, afternoon)
+    await im.flush(GID, afternoon)
+    await ob.flush(afternoon + 60)
+    assert len(host.texts) == 1
+    assert [r["status"] for r in _rows(store)] == ["sent", "queued"]
+    second = _boxes(store)[1]
+    assert second["status"] == "pending" and float(second["not_before"]) > afternoon
+    # 次日凌晨额度回来（离构想出来还没到 12 小时）：第二条接着发
+    await im.flush(GID, _ts(0, 30, day=17))
+    await ob.flush(_ts(0, 35, day=17))
+    assert len(host.texts) == 2
+    assert [r["status"] for r in _rows(store)] == ["sent", "sent"]
+
+
+async def test_queued_idea_past_window_dropped_instead_of_sent_next_day(tmp_path):
+    """已入队（queued）的提一嘴被推到 12 小时窗口之外 → 发件箱作废，不发陈旧的话。"""
+    store, host, models, _p, im, ob = _make(tmp_path)
+    _enable(store, now=NOON - 600)
+    group_push.set_config(store, GID, {"daily_max": 1})
+    _idea(store, created=NOON - 60)
+    _idea(store, created=NOON - 30, title="我可以做个群聊周报")
+    im.scan(GID, NOON)
+    await im.flush(GID, NOON)
+    await ob.flush(NOON + 60)
+    assert len(host.texts) == 1
+    # 第二天早上额度回来了，但第二条已经过了 12 小时 → 作废，不补发
+    await ob.flush(_ts(9, 0, day=16))
     assert len(host.texts) == 1
     assert [r["status"] for r in _rows(store)] == ["sent", "dropped"]
+    assert "有效期限" in str(_rows(store)[1]["error"])
 
 
 async def test_dismissed_idea_not_mentioned(tmp_path):
-    store, host, models, _p, im = _make(tmp_path)
+    store, host, models, _p, im, ob = _make(tmp_path)
     _enable(store)
     iid = _idea(store)
     im.scan(GID, NOON + 10)
     with store.tx() as conn:
         conn.execute("UPDATE ideas SET state='dismissed' WHERE id=?", (iid,))
     await im.flush(GID, NOON + 10)
-    assert host.texts == []
+    assert host.texts == [] and _boxes(store) == []
     assert _rows(store)[0]["status"] == "dropped"
 
 
 async def test_ideas_before_enable_ignored(tmp_path):
-    store, host, models, _p, im = _make(tmp_path)
+    store, host, models, _p, im, ob = _make(tmp_path)
     _idea(store, created=NOON - 7200)
     _enable(store, now=NOON - 3600)
     assert im.scan(GID, NOON) == 0
 
 
 async def test_has_due_and_status(tmp_path):
-    store, host, models, _p, im = _make(tmp_path)
+    store, host, models, _p, im, ob = _make(tmp_path)
     _enable(store)
     _idea(store)
     im.scan(GID, NOON + 10)
@@ -252,6 +324,9 @@ async def test_has_due_and_status(tmp_path):
     await im.flush(GID, NOON + 10)
     assert im.has_due(GID, NOON + 20) is False
     st = im.status(GID, now=NOON + 20)
+    assert st["sent_today"] == 0 and st["recent"][0]["status"] == "queued"
+    await ob.flush(NOON + 21)
+    st = im.status(GID, now=NOON + 22)
     assert st["sent_today"] == 1 and st["recent"][0]["status"] == "sent"
 
 
@@ -262,7 +337,7 @@ async def test_has_due_and_status(tmp_path):
 
 async def test_prompt_carries_persona_and_origin(tmp_path):
     """提示词只按 SOUL 说话（不读 MaiBot 人格、不拿它的发言当样例），并带上由头。"""
-    store, host, models, _p, im = _make(
+    store, host, models, _p, im, ob = _make(
         tmp_path,
         persona={
             "bot.nickname": "小麦",
@@ -295,11 +370,12 @@ async def test_caring_reply_is_kept(tmp_path):
         {"text": "话说之前大家聊的那个涂击队百层挑战后来怎么样了？要我帮忙吗？"},
         ensure_ascii=False,
     )
-    store, host, models, _p, im = _make(tmp_path, replies=[good])
+    store, host, models, _p, im, ob = _make(tmp_path, replies=[good])
     _enable(store)
     _idea(store, origin="涂击队百层挑战")
     im.scan(GID, NOON + 10)
     await im.flush(GID, NOON + 10)
+    await ob.flush(NOON + 11)
     first_line = host.texts[0]["text"].split("\n")[0]
     assert first_line == "话说之前大家聊的那个涂击队百层挑战后来怎么样了？要我帮忙吗？"
 
@@ -311,13 +387,14 @@ async def test_caring_reply_is_kept(tmp_path):
 ])
 async def test_pitch_talk_replaced_by_template(tmp_path, bad):
     """推销腔（我可以帮 / 给大家带来 / 推荐给大家 / 安利 / 感兴趣的话 / 点进去看看）→ 换模板。"""
-    store, host, models, _p, im = _make(
+    store, host, models, _p, im, ob = _make(
         tmp_path, replies=[json.dumps({"text": bad}, ensure_ascii=False)]
     )
     _enable(store)
     _idea(store, origin="涂击队百层挑战")
     im.scan(GID, NOON + 10)
     await im.flush(GID, NOON + 10)
+    await ob.flush(NOON + 11)
     text = host.texts[0]["text"]
     for w in card_push._PITCH_WORDS:
         assert w not in text, w
@@ -332,13 +409,14 @@ async def test_pitch_talk_replaced_by_template(tmp_path, bad):
 ])
 async def test_self_intro_replaced_by_template(tmp_path, bad):
     """自我介绍 / 寒暄（2026-10-01 用户定：不要自我介绍和废话）→ 换模板。"""
-    store, host, models, _p, im = _make(
+    store, host, models, _p, im, ob = _make(
         tmp_path, replies=[json.dumps({"text": bad}, ensure_ascii=False)]
     )
     _enable(store)
     _idea(store, origin="涂击队百层挑战")
     im.scan(GID, NOON + 10)
     await im.flush(GID, NOON + 10)
+    await ob.flush(NOON + 11)
     first_line = host.texts[0]["text"].split("\n")[0]
     assert first_line == "话说之前大家聊的那个涂击队百层挑战后来怎么样了？要我帮忙吗？"
 

@@ -664,6 +664,144 @@ class ConsoleServer:
             "DELETE", "/api/groups/{gid}/group-admin/password", self._write(_group_admin_delete_password)
         )
 
+        # ---------- 每群批准名单：谁能批本群的活（含免批）（docs/18 §五，0.8.0） ----------
+        # 一个群一份 kv["group_approval.<群号>"]：{approvers, exempt_users, exempt_group, required}。
+        # 读：总管理员 + 本群群管理员；写：只有总管理员（群管理员只能看，不能改批准人）。
+
+        def _group_approvals_obj() -> Any:
+            gv = getattr(svc, "group_approvals", None)
+            if gv is None:
+                ga_ref = getattr(svc, "group_admins", None) or group_admins
+                gv = getattr(ga_ref, "approvals", None) if ga_ref is not None else None
+            if gv is None:
+                store = getattr(svc, "store", None)
+                if store is None:
+                    return None
+                from ..group_approval import GroupApprovals
+
+                gv = GroupApprovals(store, get_settings=getattr(svc, "get_settings", None))
+            return gv
+
+        @get("/api/groups/{gid}/approval")
+        async def _group_approval_get(request: web.Request) -> web.Response:
+            gid = self._resolve_ref(request.match_info["gid"])
+            if gid is None or not svc.get_settings().is_served(gid):
+                return _err(404, "没有这个群（只支持服务群）")
+            # 总管理员或本群群管理员可读；群友 403、匿名 401
+            forbid = self._require_group_admin(request, gid)
+            if forbid is not None:
+                return forbid
+            gv = _group_approvals_obj()
+            if gv is None:
+                return _err(503, "批准名单还没开")
+            return web.json_response(gv.view(gid))
+
+        async def _group_approval_put(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            gid = self._resolve_ref(request.match_info["gid"])
+            if gid is None or not svc.get_settings().is_served(gid):
+                return _err(404, "没有这个群（只支持服务群）")
+            gv = _group_approvals_obj()
+            if gv is None:
+                return _err(503, "批准名单还没开")
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from ..group_approval import GroupApprovals
+
+            try:
+                rec = GroupApprovals.parse_payload(body)  # 全量校验（未知键 / 账号 / 类型）在前
+            except ValueError as e:
+                return _err(400, str(e))
+            try:
+                gv.save(gid, rec)
+            except ValueError as e:
+                return _err(400, str(e))
+            return web.json_response(gv.view(gid))
+
+        app.router.add_route(
+            "PUT", "/api/groups/{gid}/approval", self._write(_group_approval_put)
+        )
+
+        # ---------- 每群「往群里发」（group_push：唯一真源 kv["group_push.<群号>"]） ----------
+        # 读 + 写都只给本群群管理员（总管理员随便）；群友 403 / 匿名 401 / 非服务群 404；
+        # PUT 走同源守卫。旧 /api/groups/{gid}/card-push 是同一份数据的别名（card_push 薄壳），
+        # 不是第二处存储。
+        #
+        # 遮罩只有一份实现：views.redact_push_view / views.redact_card_push_view
+        # （已知密钥 + `键=值` 形态 + 本机绝对路径；群快照那条出口在 views.group_view 里用同一份）。
+
+        def _push_view(gid: str) -> dict:
+            from .. import group_push as _gp
+
+            return views.redact_push_view(
+                _gp.view(svc.store, gid, svc.get_settings()), views.secret_list(svc)
+            )
+
+        def _push_field_error(body: dict) -> str:
+            """PUT 的字段闸：退役字段明确拒（说清去群页），不认识的也拒；"" = 过。"""
+            from .. import group_push as _gp
+
+            for raw_key in body:
+                key = str(raw_key)
+                if key in _gp.RETIRED_FIELDS:
+                    return (
+                        f"「{key}」已经退役：每类每日上限并成了一个「每天主动发送总上限」，"
+                        "到「群 → 往群里发（开话题 / 资讯卡 / 提一嘴 / 每日上限 / 睡觉时段）」里改，"
+                        "不从全局改"
+                    )
+                if key not in _gp.SETTABLE:
+                    return f"不认识的字段：{key}"
+            return ""
+
+        @get("/api/groups/{gid}/push")
+        async def _push_get(request: web.Request) -> web.Response:
+            """这个群「往群里发」的设置 + 今天发了 / 占了多少额度 + 最近几条。
+
+            读：总管理员 + 本群群管理员；群友 403、匿名 401、非服务群 404。
+            """
+            gid = self._resolve_ref(request.match_info["gid"])
+            if gid is None or not svc.get_settings().is_served(gid):
+                return _err(404, "没有这个群（只支持服务群）")
+            forbid = self._require_group_admin(request, gid)
+            if forbid is not None:
+                return forbid
+            try:
+                return web.json_response(_push_view(gid))
+            except Exception:
+                logger.exception("读群 %s 的往群里发设置出错", gid)
+                return _err(500, "服务器出错了")
+
+        async def _push_put(request: web.Request) -> web.Response:
+            """改这个群的「往群里发」设置：只认新字段；退役字段明确 400，绝不静默假保存。"""
+            gid = self._resolve_ref(request.match_info["gid"])
+            if gid is None or not svc.get_settings().is_served(gid):
+                return _err(404, "没有这个群（只支持服务群）")
+            forbid = self._require_group_admin(request, gid)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from .. import group_push as _gp
+
+            why = _push_field_error(body)
+            if why:
+                return _err(400, why)
+            try:
+                _gp.set_config(svc.store, gid, body, svc.get_settings(), now=clock.now())
+            except ValueError as e:
+                return _err(400, str(e))
+            except Exception:
+                logger.exception("写群 %s 的往群里发设置出错", gid)
+                return _err(500, "服务器出错了")
+            logger.info("群 %s 的往群里发设置改成：%s", gid, sorted(body))
+            return web.json_response(_push_view(gid))
+
+        app.router.add_route("PUT", "/api/groups/{gid}/push", self._write(_push_put))
+
         # ---------- 设置（管理员） ----------
 
         @get("/api/settings")
@@ -1110,55 +1248,6 @@ class ConsoleServer:
 
         app.router.add_route("POST", "/api/settings/model-list/{id}/verify", self._write(_model_verify))
 
-        # ---------- 规则（网页可改的设置；存 kv["rules.override"]，不写 config.toml） ----------
-
-        def _rules_view() -> Any:
-            from .. import rules as _rules
-
-            base = svc.base_settings() if callable(getattr(svc, "base_settings", None)) else svc.get_settings()
-            return _rules.rules_view(base, svc.store, effective=svc.get_settings())
-
-        @get("/api/settings/rules")
-        async def _rules_get(request: web.Request) -> web.Response:
-            forbid = self._require_admin(request)
-            if forbid is not None:
-                return forbid
-            return web.json_response(_rules_view())
-
-        async def _rules_put(request: web.Request) -> web.Response:
-            forbid = self._require_admin(request)
-            if forbid is not None:
-                return forbid
-            body = await _json_body(request)
-            if body is None:
-                return _err(400, "请求体不是 JSON")
-            from .. import rules as _rules
-
-            base = svc.base_settings() if callable(getattr(svc, "base_settings", None)) else svc.get_settings()
-            try:
-                _rules.save_patch(svc.store, body, base=base)
-            except ValueError as e:
-                return _err(400, str(e))
-            return web.json_response(_rules_view())
-
-        app.router.add_route("PUT", "/api/settings/rules", self._write(_rules_put))
-
-        @post("/api/settings/rules/reset")
-        async def _rules_reset(request: web.Request) -> web.Response:
-            forbid = self._require_admin(request)
-            if forbid is not None:
-                return forbid
-            body = await _json_body(request)
-            if body is None:
-                return _err(400, "请求体不是 JSON")
-            from .. import rules as _rules
-
-            try:
-                _rules.reset_field(svc.store, body.get("field"))
-            except ValueError as e:
-                return _err(400, str(e))
-            return web.json_response(_rules_view())
-
         # ---------- 通用设置（管理员；直写 config.toml，数据库不再存覆盖层） ----------
 
         def _config_view() -> Any:
@@ -1320,30 +1409,8 @@ class ConsoleServer:
             return {gid: clean_group_name(n, gid) for gid, n in names.items()}
 
         def _secret_list() -> list[str]:
-            secrets = []
-            try:
-                for row in svc.store.read().execute("SELECT value FROM secrets").fetchall():
-                    v = str(row["value"] or "")
-                    if v and len(v) <= 4096:
-                        secrets.append(v)
-            except Exception:
-                pass
-            try:
-                settings = svc.get_settings()
-                if settings is not None:
-                    v = str(getattr(settings.models, "api_key", "") or "")
-                    if v:
-                        secrets.append(v)
-                    for endpoint in getattr(settings, "endpoints", ()) or ():
-                        value = str(getattr(endpoint, "api_key", "") or "")
-                        if value:
-                            secrets.append(value)
-                        for value in dict(getattr(endpoint, "headers", {}) or {}).values():
-                            if value:
-                                secrets.append(str(value))
-            except Exception:
-                pass
-            return secrets
+            """已知密钥名单（唯一实现在 views.secret_list）：secrets 表 + 旧 models + 各端点。"""
+            return views.secret_list(svc)
 
         _LIST_TEXT_MAX = 300
         _DETAIL_TEXT_MAX = 20000
@@ -1732,14 +1799,6 @@ class ConsoleServer:
                 out = svc.feeds.feedback("news", item_id, body.get("value"), body.get("prev"))
             except KeyError:
                 return _err(404, "这条资讯不存在")
-            # 身份与工作记忆：被标「没用」累计 3 次的来源/话题 → 自动记进本群记忆（不调模型）
-            try:
-                if body.get("value") == "down":
-                    hook = getattr(svc, "note_useless_feedback", None)
-                    if callable(hook):
-                        hook(gid, item_id)
-            except Exception:
-                logger.exception("反馈自动记 hook 出错（群 %s 条 %s，不影响反馈）", gid, item_id)
             return web.json_response(out)
 
         async def _ideas_feedback(request: web.Request) -> web.Response:
@@ -1810,22 +1869,6 @@ class ConsoleServer:
                     return _err(404, "这条构想不存在")
                 except ValueError as e:
                     return _err(400, str(e))
-                # 「想要这个」→ 待批请求：在路由这里接（feeds 不感知批准；do 走 app 的 on_start 回调）
-                if op == "want":
-                    hook = getattr(svc, "on_idea_want", None)
-                    if callable(hook):
-                        try:
-                            hook(dict(out), gid)
-                        except Exception:
-                            logger.exception("构想「想要这个」接线出错（构想 %s）", item_id)
-                    # want 之后状态可能变成 pending / started：回一次新的 view 给前端
-                    try:
-                        for item in svc.feeds.ideas_view(gid) or []:
-                            if isinstance(item, dict) and int(item.get("id") or 0) == item_id:
-                                out = item
-                                break
-                    except Exception:
-                        pass
                 return web.json_response(out)
 
             return _handler
@@ -1855,27 +1898,47 @@ class ConsoleServer:
 
         app.router.add_post("/api/news/{id}/feedback", self._write(_news_feedback))
         app.router.add_post("/api/ideas/{id}/feedback", self._write(_ideas_feedback))
-        app.router.add_post("/api/ideas/{id}/want", self._write(_idea_action("want")))
+        # 「想要这个」（/api/ideas/{id}/want）已删（docs/18 §五：网页从来没有过这个按钮，是条死路）
         app.router.add_post("/api/ideas/{id}/do", self._write(_idea_action("do")))
         app.router.add_post("/api/ideas/{id}/dismiss", self._write(_idea_action("dismiss")))
         app.router.add_post("/api/topics/{id}/verdict", self._write(_topics_verdict))
 
-        async def _feeds_domains(request: web.Request) -> web.Response:
-            """管理员加减来源屏蔽名单（2026-09-27 质量标准 §4.1）。
+        # ---------- 屏蔽域名（按群，2026-10 docs/18；唯一来源 kv["feeds.blocked.<gid>"]） ----------
 
-            请求体 {domain, blocked: true|false}；域名规范化（小写、去 www.、
-            只允许合法域名字符）后写 kv["feeds.blocked_domains"]——kv 存「当时生效名单」
-            的全量（首次改动前 = 配置；改过一次之后以网页为准，见 feeds.blocked_domains_effective）。
-            返回 {"blocked_domains": [...]}（生效名单，稳定排序）。
-            """
-            forbid = self._require_admin(request)
+        def _feeds_domains_group(request: web.Request) -> tuple[str | None, web.Response | None]:
+            """解析群号 + 权限；ok 返回 (gid, Response)。"""
+            gid = self._resolve_ref(str(request.match_info["gid"]))
+            if gid is None or not svc.get_settings().is_served(gid):
+                return None, _err(404, "没有这个群（只支持服务群）")
+            # 总管理员或本群群管理员（member 403 / 匿名 401 — _require_group_admin 内部分好了）
+            forbid = self._require_group_admin(request, gid)
             if forbid is not None:
-                return forbid
+                return None, forbid
+            return gid, None
+
+        @get("/api/groups/{gid}/feeds/domains")
+        async def _feeds_domains_get(request: web.Request) -> web.Response:
+            gid, resp = _feeds_domains_group(request)
+            if resp is not None:
+                return resp
+            from .. import feeds as _feeds
+
+            try:
+                return web.json_response({"blocked_domains": _feeds.blocked_domains(svc.store, str(gid))})
+            except Exception:
+                logger.exception("读屏蔽名单出错（群 %s）", gid)
+                return _err(500, "服务器出错了")
+
+        async def _feeds_domains_post(request: web.Request) -> web.Response:
+            """body {domain, blocked: bool}；返回 {"blocked_domains": [...]}（生效名单，稳定排序）。"""
+            gid, resp = _feeds_domains_group(request)
+            if resp is not None:
+                return resp
             body = await _json_body(request)
             if body is None:
                 return _err(400, "请求体不是 JSON")
             from ..config import normalize_domain
-            from ..feeds import blocked_domains_effective
+            from .. import feeds as _feeds
 
             domain = normalize_domain(body.get("domain"))
             if not domain:
@@ -1883,19 +1946,291 @@ class ConsoleServer:
             blocked_v = body.get("blocked")
             if not isinstance(blocked_v, bool):
                 return _err(400, "blocked 要是 true / false")
-            settings = svc.get_settings()
-            config_blocked: tuple = tuple(getattr(settings.feeds, "blocked_domains", ()) or ()) if settings is not None else ()
-            merged: set[str] = set(blocked_domains_effective(svc.store, config_blocked))
+            current = set(_feeds.blocked_domains(svc.store, str(gid)))
             if blocked_v:
-                merged.add(domain)
+                current.add(domain)
             else:
-                merged.discard(domain)
-            out_list = sorted(merged)
-            with svc.store.tx() as conn:
-                svc.store.kv_set(conn, "feeds.blocked_domains", out_list)
+                current.discard(domain)
+            out_list = _feeds.blocked_domains_set(svc.store, str(gid), sorted(current))
             return web.json_response({"blocked_domains": out_list})
 
-        app.router.add_post("/api/feeds/domains", self._write(_feeds_domains))
+        app.router.add_post("/api/groups/{gid}/feeds/domains", self._write(_feeds_domains_post))
+
+
+        # ---------- 本群规矩 + 本群做法 skill（docs/17 §八.1 + §七；权限同 feeds.domains） ----------
+        def _rules_group(request: web.Request) -> tuple[str | None, web.Response | None]:
+            gid = self._resolve_ref(str(request.match_info["gid"]))
+            if gid is None or not svc.get_settings().is_served(gid):
+                return None, _err(404, "没有这个群（只支持服务群）")
+            forbid = self._require_group_admin(request, gid)
+            if forbid is not None:
+                return None, forbid
+            return gid, None
+
+        @get("/api/groups/{gid}/rules")
+        async def _rules_get(request: web.Request) -> web.Response:
+            gid, resp = _rules_group(request)
+            if resp is not None:
+                return resp
+            agents_obj = getattr(getattr(svc, "specialists", None), "agents", None)
+            if agents_obj is None:
+                return _err(503, "本群做法没接上")
+            try:
+                row = agents_obj.group_rules_get(gid)
+                return web.json_response({
+                    "body": str(row.get("body") or ""),
+                    "updated": float(row.get("updated") or 0.0),
+                    "updated_by": str(row.get("updated_by") or ""),
+                })
+            except Exception:
+                logger.exception("读本群规矩出错（群 %s）", gid)
+                return _err(500, "服务器出错了")
+
+        async def _rules_put(request: web.Request) -> web.Response:
+            gid, resp = _rules_group(request)
+            if resp is not None:
+                return resp
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            agents_obj = getattr(getattr(svc, "specialists", None), "agents", None)
+            if agents_obj is None:
+                return _err(503, "本群做法没接上")
+            try:
+                updated = agents_obj.group_rules_set(gid, str(body.get("body") or ""), updated_by="admin")
+                return web.json_response({
+                    "body": str(updated.get("body") or ""),
+                    "updated": float(updated.get("updated") or 0.0),
+                    "updated_by": str(updated.get("updated_by") or ""),
+                })
+            except ValueError as e:
+                return _err(400, str(e))
+            except Exception:
+                logger.exception("写本群规矩出错（群 %s）", gid)
+                return _err(500, "服务器出错了")
+
+        @get("/api/groups/{gid}/rules/versions")
+        async def _rules_versions(request: web.Request) -> web.Response:
+            gid, resp = _rules_group(request)
+            if resp is not None:
+                return resp
+            agents_obj = getattr(getattr(svc, "specialists", None), "agents", None)
+            if agents_obj is None:
+                return _err(503, "本群做法没接上")
+            try:
+                rows = agents_obj.group_rules_versions(gid)
+                return web.json_response({"versions": rows})
+            except Exception:
+                logger.exception("读本群规矩版本出错（群 %s）", gid)
+                return _err(500, "服务器出错了")
+
+        async def _rules_restore(request: web.Request) -> web.Response:
+            gid, resp = _rules_group(request)
+            if resp is not None:
+                return resp
+            vid = int(request.match_info["vid"])
+            agents_obj = getattr(getattr(svc, "specialists", None), "agents", None)
+            if agents_obj is None:
+                return _err(503, "本群做法没接上")
+            try:
+                row = agents_obj.group_rules_restore(gid, vid)
+                return web.json_response({
+                    "body": str(row.get("body") or ""),
+                    "updated": float(row.get("updated") or 0.0),
+                    "updated_by": str(row.get("updated_by") or ""),
+                })
+            except KeyError:
+                return _err(404, "没有这一版")
+            except Exception:
+                logger.exception("回退本群规矩出错（群 %s）", gid)
+                return _err(500, "服务器出错了")
+
+        # ---------- skills（kind-scoped） ----------
+        @get("/api/groups/{gid}/skills")
+        async def _skills_get(request: web.Request) -> web.Response:
+            gid, resp = _rules_group(request)
+            if resp is not None:
+                return resp
+            agents_obj = getattr(getattr(svc, "specialists", None), "agents", None)
+            if agents_obj is None:
+                return _err(503, "本群做法没接上")
+            kind_q = str(request.rel_url.query.get("kind") or "").strip() or None
+            try:
+                rows = agents_obj.skills(gid, kind_q, include_archived=True)
+                out_rows = []
+                for it in rows:
+                    out_rows.append({
+                        "id": int(it["id"]), "kind": str(it["kind"]), "name": str(it["name"]),
+                        "description": str(it.get("description") or ""),
+                        "body": str(it.get("body") or ""),
+                        "locked": bool(it.get("locked")),
+                        "status": str(it.get("status") or "active"),
+                        "uses": int(it.get("uses") or 0),
+                        "last_used": float(it.get("last_used") or 0.0),
+                        "created": float(it.get("created") or 0.0),
+                        "updated": float(it.get("updated") or 0.0),
+                    })
+                return web.json_response({"skills": out_rows})
+            except ValueError as e:
+                return _err(400, str(e))
+            except Exception:
+                logger.exception("读本群做法出错（群 %s）", gid)
+                return _err(500, "服务器出错了")
+
+        async def _skills_post(request: web.Request) -> web.Response:
+            gid, resp = _rules_group(request)
+            if resp is not None:
+                return resp
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            agents_obj = getattr(getattr(svc, "specialists", None), "agents", None)
+            if agents_obj is None:
+                return _err(503, "本群做法没接上")
+            try:
+                sid = agents_obj.skill_add(
+                    gid, str(body.get("kind") or ""), name=str(body.get("name") or ""),
+                    description=str(body.get("description") or ""),
+                    body=str(body.get("body") or ""),
+                    source="admin", note="管理员加",
+                )
+                # 返回 kind=这一岗 active+archived 全部
+                rows = agents_obj.skills(gid, str(body.get("kind") or ""), include_archived=True)
+                return web.json_response({"id": int(sid), "skills": rows}, status=201)
+            except FileExistsError as e:
+                return _err(409, str(e))
+            except ValueError as e:
+                return _err(400, str(e))
+            except Exception:
+                logger.exception("新加本群做法出错（群 %s）", gid)
+                return _err(500, "服务器出错了")
+
+        async def _skills_patch(request: web.Request) -> web.Response:
+            gid, resp = _rules_group(request)
+            if resp is not None:
+                return resp
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            agents_obj = getattr(getattr(svc, "specialists", None), "agents", None)
+            if agents_obj is None:
+                return _err(503, "本群做法没接上")
+            sid = request.match_info["id"]
+            try:
+                patch_fields = {}
+                if "description" in body:
+                    patch_fields["description"] = body.get("description")
+                if "body" in body:
+                    patch_fields["body"] = body.get("body")
+                if "locked" in body:
+                    patch_fields["locked"] = body.get("locked")
+                if "status" in body:
+                    patch_fields["status"] = body.get("status")
+                updated = agents_obj.skill_update(gid, int(sid), source="admin", note="管理员改", **patch_fields)
+                rows = agents_obj.skills(gid, str(updated["kind"]), include_archived=True)
+                return web.json_response({"skill": updated, "skills": rows})
+            except KeyError:
+                return _err(404, "没有这份 skill")
+            except ValueError as e:
+                return _err(400, str(e))
+            except Exception:
+                logger.exception("改本群做法出错（群 %s）", gid)
+                return _err(500, "服务器出错了")
+
+        async def _skills_delete(request: web.Request) -> web.Response:
+            gid, resp = _rules_group(request)
+            if resp is not None:
+                return resp
+            agents_obj = getattr(getattr(svc, "specialists", None), "agents", None)
+            if agents_obj is None:
+                return _err(503, "本群做法没接上")
+            sid = request.match_info["id"]
+            try:
+                # deleted 之前记 kind 才回得来 skills 列表
+                cur = agents_obj.skill_get(gid, int(sid))
+                kind_of = str(cur["kind"])
+                agents_obj.skill_delete(gid, kind_of, int(sid))
+                rows = agents_obj.skills(gid, kind_of, include_archived=True)
+                return web.json_response({"deleted": int(sid), "skills": rows})
+            except KeyError:
+                return _err(404, "没有这份 skill")
+            except Exception:
+                logger.exception("删本群做法出错（群 %s）", gid)
+                return _err(500, "服务器出错了")
+
+        def _skill_kind_of(agents_obj: Any, gid: str, sid_raw: Any, kind_q: str) -> tuple[int, str] | None:
+            """路径里的 skill id 已经唯一：先 skill_get 拿真实 kind，再拿它去调下游。
+
+            - 这份 skill 不在本群 / 没有 → None（调用方回 404，不泄漏别群）；
+            - 旧接口的 ?kind= 兼容：给了就必须和真实 kind 相符，否则 None（不跨岗越群）。
+            """
+            try:
+                sid = int(str(sid_raw))
+            except (TypeError, ValueError):
+                return None
+            try:
+                cur = agents_obj.skill_get(gid, sid)
+            except KeyError:
+                return None
+            kind_real = str(cur.get("kind") or "")
+            if kind_q and kind_q != kind_real:
+                return None
+            return sid, kind_real
+
+        @get("/api/groups/{gid}/skills/{id}/versions")
+        async def _skills_versions(request: web.Request) -> web.Response:
+            gid, resp = _rules_group(request)
+            if resp is not None:
+                return resp
+            agents_obj = getattr(getattr(svc, "specialists", None), "agents", None)
+            if agents_obj is None:
+                return _err(503, "本群做法没接上")
+            kind_q = str(request.rel_url.query.get("kind") or "").strip()
+            resolved = _skill_kind_of(agents_obj, gid, request.match_info["id"], kind_q)
+            if resolved is None:
+                return _err(404, "没有这份 skill")
+            sid, kind_real = resolved
+            try:
+                rows = agents_obj.skill_versions(gid, kind_real, sid)
+                return web.json_response({"versions": rows})
+            except KeyError:
+                return _err(404, "没有这份 skill")
+            except ValueError as e:
+                return _err(400, str(e))
+            except Exception:
+                logger.exception("读本群做法版本出错（群 %s）", gid)
+                return _err(500, "服务器出错了")
+
+        async def _skills_restore(request: web.Request) -> web.Response:
+            gid, resp = _rules_group(request)
+            if resp is not None:
+                return resp
+            agents_obj = getattr(getattr(svc, "specialists", None), "agents", None)
+            if agents_obj is None:
+                return _err(503, "本群做法没接上")
+            kind_q = str(request.rel_url.query.get("kind") or "").strip()
+            resolved = _skill_kind_of(agents_obj, gid, request.match_info["id"], kind_q)
+            if resolved is None:
+                return _err(404, "没有这份 skill")
+            sid, kind_real = resolved
+            try:
+                row = agents_obj.skill_restore_version(gid, kind_real, sid, request.match_info["vid"])
+                rows = agents_obj.skills(gid, kind_real, include_archived=True)
+                return web.json_response({"skill": row, "skills": rows})
+            except KeyError:
+                return _err(404, "没有这一版")
+            except ValueError as e:
+                return _err(400, str(e))
+            except Exception:
+                logger.exception("回本群做法出错（群 %s）", gid)
+                return _err(500, "服务器出错了")
+
+        app.router.add_post("/api/groups/{gid}/rules/versions/{vid}/restore", self._write(_rules_restore))
+        app.router.add_route("PUT", "/api/groups/{gid}/rules", self._write(_rules_put))
+        app.router.add_route("POST", "/api/groups/{gid}/skills", self._write(_skills_post))
+        app.router.add_route("PATCH", "/api/groups/{gid}/skills/{id}", self._write(_skills_patch))
+        app.router.add_route("DELETE", "/api/groups/{gid}/skills/{id}", self._write(_skills_delete))
+        app.router.add_route("POST", "/api/groups/{gid}/skills/{id}/versions/{vid}/restore", self._write(_skills_restore))
 
         # ---------- 扩展：MCP（docs/02 §10；只管理员；不回显 headers） ----------
 
@@ -2445,76 +2780,12 @@ class ConsoleServer:
         app.router.add_route("PUT", "/api/extensions/skills/{name}", self._write(_skill_update))
         app.router.add_route("DELETE", "/api/extensions/skills/{name}", self._write(_skill_delete))
 
-        async def _feeds_pref_get(request: web.Request) -> web.Response:
-            """资讯偏好：GET 对所有人可见（含群友 / 本群群管理员，只读）。"""
-            ident = self._identify(request)
-            if ident.role not in ("admin", "member", "group_admin"):
-                return _err(401, "先登录管理员，或用群链接打开")
-            resolved = self._resolve_ref(request.match_info["gid"])
-            if resolved is None:
-                return _err(404, "没有这个群")
-            if _wrong_group(ident, resolved):
-                return _err(403, "只能看自己群的内容")
-            not_ready = _m2_ready(svc.feeds)
-            if not_ready is not None:
-                return not_ready
-            return web.json_response({"text": svc.feeds.pref(resolved)})
-
-        async def _feeds_pref_put(request: web.Request) -> web.Response:
-            """资讯偏好：PUT 管理员或本群群管理员。"""
-            resolved = self._resolve_ref(request.match_info["gid"])
-            if resolved is None:
-                return _err(404, "没有这个群")
-            forbid = self._require_group_admin(request, resolved)
-            if forbid is not None:
-                return forbid
-            not_ready = _m2_ready(svc.feeds)
-            if not_ready is not None:
-                return not_ready
-            body = await _json_body(request)
-            if body is None:
-                return _err(400, "请求体不是 JSON")
-            text = svc.feeds.set_pref(resolved, str(body.get("text") or ""))
-            return web.json_response({"text": text})
-
-        # ---------- 口味小结 / 优质来源（taste.py / source_stats.py；管理员或本群群管理员） ----------
-
-        async def _taste_get(request: web.Request) -> web.Response:
-            resolved = self._resolve_ref(request.match_info["gid"])
-            if resolved is None:
-                return _err(404, "没有这个群")
-            forbid = self._require_group_admin(request, resolved)
-            if forbid is not None:
-                return forbid
-            from .. import taste
-
-            return web.json_response(taste.view(svc.store, resolved))
-
-        async def _taste_put(request: web.Request) -> web.Response:
-            """管理员手改口味小结（空 = 清掉，恢复自动）；7 天内自动总结不覆盖。"""
-            resolved = self._resolve_ref(request.match_info["gid"])
-            if resolved is None:
-                return _err(404, "没有这个群")
-            forbid = self._require_group_admin(request, resolved)
-            if forbid is not None:
-                return forbid
-            body = await _json_body(request)
-            if body is None:
-                return _err(400, "请求体不是 JSON")
-            from .. import taste
-
-            text = str(body.get("text") or "")
-            scrubbed = svc.feeds._scrub_item_text(resolved, text) if (svc.feeds is not None and text) else text
-            if text and scrubbed is None:
-                return _err(400, "这段话里有关注成员的个人信息，口味小结只写群整体的喜好")
-            return web.json_response(taste.set_manual(svc.store, resolved, text, clock.now()))
-
+        # ---------- 优质来源（source_stats.py；管理员或本群群管理员） ----------
         def _blocked_for(gid: str) -> list[str]:
             try:
-                settings = svc.get_settings()
-                from ..feeds import blocked_domains_effective
+                from ..feeds import blocked_domains
 
-                return blocked_domains_effective(svc.store, tuple(getattr(settings.feeds, "blocked_domains", ()) or ()))
+                return blocked_domains(svc.store, gid)
             except Exception:
                 return []
 
@@ -2579,15 +2850,13 @@ class ConsoleServer:
             raise web.HTTPFound(url)
 
         app.router.add_get("/go/{id}", _go)
-        app.router.add_get("/api/groups/{gid}/taste", _taste_get)
-        app.router.add_route("PUT", "/api/groups/{gid}/taste", self._write(_taste_put))
         app.router.add_get("/api/groups/{gid}/trusted-sources", _trusted_get)
         app.router.add_post("/api/groups/{gid}/trusted-sources", self._write(_trusted_post))
 
         def _card_push_view(gid: str) -> dict:
             from .. import card_push as _cp
 
-            return _cp.web_view(svc, gid)
+            return views.redact_card_push_view(_cp.web_view(svc, gid), views.secret_list(svc))
 
         async def _card_push_get(request: web.Request) -> web.Response:
             """资讯卡片 / 构想提一嘴的每群开关 + 今天发了几次 + 最近几条记录（管理员 / 本群群管理员）。"""
@@ -2678,11 +2947,9 @@ class ConsoleServer:
                 return _err(409, str(out.get("reason") or "现在开不了"))
             return web.json_response(out)
 
-        app.router.add_get("/api/groups/{gid}/feeds-pref", _feeds_pref_get)
         app.router.add_get("/api/groups/{gid}/card-push", _card_push_get)
         app.router.add_route("PUT", "/api/groups/{gid}/card-push", self._write(_card_push_put))
         app.router.add_post("/api/groups/{gid}/ideas/run", self._write(_ideas_run))
-        app.router.add_route("PUT", "/api/groups/{gid}/feeds-pref", self._write(_feeds_pref_put))
         app.router.add_post("/api/groups/{gid}/news/run", self._write(_news_run))
         app.router.add_get("/api/groups/{gid}/news/run", _news_run_get)
 
@@ -3184,7 +3451,6 @@ class ConsoleServer:
                     "soul": ident.read("soul"),
                     "agents": ident.read("agents"),
                     "memory": ident.read("memory"),
-                    "group_memory": ident.group_memory_map(),
                     "limits": dict(limits),
                 }
             )
@@ -3197,8 +3463,10 @@ class ConsoleServer:
             if not_ready is not None:
                 return not_ready
             kind = request.match_info["kind"]
-            if kind not in ("soul", "agents", "memory"):
-                return _err(404, "没有这个身份文件（只支持 soul / agents / memory）")
+            # 2026-10 docs/18 第一步：soul / agents 的全局直写端点退役（没人调），只剩「记忆」；
+            # 人格文件走 /api/agents/{kind}/docs/*。
+            if kind != "memory":
+                return _err(404, "没有这个身份文件（这里只支持 memory；SOUL / AGENTS 走专岗 docs 接口）")
             body = await _json_body(request)
             if body is None:
                 return _err(400, "请求体不是 JSON")
@@ -3210,61 +3478,9 @@ class ConsoleServer:
 
         app.router.add_route("PUT", "/api/identity/{kind}", self._write(_identity_put))
 
-        @get("/api/identity/group-memory/{gid}")
-        async def _identity_group_memory_get(request: web.Request) -> web.Response:
-            """本群工作记忆（读）：总管理员或本群群管理员。"""
-            gid = self._resolve_ref(str(request.match_info["gid"]))
-            if gid is None:
-                return _err(404, "没有这个群（只支持服务群）")
-            forbid = self._require_group_admin(request, gid)
-            if forbid is not None:
-                return forbid
-            ident, not_ready = _identity_ready()
-            if not_ready is not None:
-                return not_ready
-            try:
-                return web.json_response(ident.group_read(gid))
-            except KeyError:
-                return _err(404, "没有这个群（只支持服务群）")
-
-        async def _identity_group_memory_put(request: web.Request) -> web.Response:
-            gid = self._resolve_ref(str(request.match_info["gid"]))
-            if gid is None:
-                return _err(404, "没有这个群（只支持服务群）")
-            forbid = self._require_group_admin(request, gid)
-            if forbid is not None:
-                return forbid
-            ident, not_ready = _identity_ready()
-            if not_ready is not None:
-                return not_ready
-            body = await _json_body(request)
-            if body is None:
-                return _err(400, "请求体不是 JSON")
-            try:
-                out = ident.group_write(gid, str(body.get("text") or ""))
-            except KeyError:
-                return _err(404, "没有这个群（只支持服务群）")
-            except ValueError as e:
-                return _err(400, str(e))
-            return web.json_response(out)
-
-        app.router.add_route(
-            "PUT", "/api/identity/group-memory/{gid}", self._write(_identity_group_memory_put)
-        )
-
-        async def _identity_soul_sync(request: web.Request) -> web.Response:
-            forbid = self._require_admin(request)
-            if forbid is not None:
-                return forbid
-            ident, not_ready = _identity_ready()
-            if not_ready is not None:
-                return not_ready
-            out = await ident.sync_soul_from_maibot()
-            changed = bool(out.pop("preview_changed", False))
-            missing = bool(out.pop("persona_missing", False))
-            return web.json_response({"soul": out, "preview_changed": changed, "persona_missing": missing})
-
-        app.router.add_post("/api/identity/soul/sync", self._write(_identity_soul_sync))
+        # 2026-10-03 「每群三份」收尾：/api/identity/group-memory/{gid}（GET / PUT）整条退役。
+        # 每群内容已由 group_context(gid, kind) 统一注入（本群规矩 + 本群做法 skill）；
+        # 规矩和 skill 各自的写口在 /api/groups/{gid}/rules、/api/groups/{gid}/skills。
 
         # ---------- 专岗 SOUL / AGENTS（专岗改版 3/4：identity.agents.<kind>） ----------
         # 路由（前端 settings/agents.js 已按这套写）：
@@ -3353,15 +3569,13 @@ class ConsoleServer:
 
         app.router.add_post("/api/agents/{kind}/docs/agents/reset", self._write(_agent_docs_agents_reset))
 
-        # ---------- 专岗（agents.py；契约 /tmp/maiwork-specialists-contract.md A 部分） ----------
+        # ---------- 专岗（agents.py） ----------
         #
-        # 路由（结构严格按契约 §24-29）：
-        #   GET /api/agents                          → {"profiles": [news/idea/goal/task]}（只总管理员）
-        #   PUT /api/agents/{kind}                   → profile（只总管理员；同源 guard 在 _write）
-        #   GET /api/groups/{gid}/agents             → {"group_id", "agents": [{kind,title,notes,learned,recent_handoffs}]}
-        #                                             （总管理员或本群 group_admin；成员 403 / 匿名 401 / 非服务群 404）
-        #   PUT /api/groups/{gid}/agents/{kind}/memory {notes} → memory（同上权限；task 拒 400）
-        #   GET /api/groups/{gid}/agents/handoffs?kind=... → {"items": [...]}（同上权限）
+        # 路由（「每群三份」收尾后还剩这些；memory/lessons* 旧路径 2026-10-03 退役）：
+        #   GET /api/agents                     → {"profiles": [news/idea/goal/task]}（只总管理员）
+        #   PUT /api/agents/{kind}              → profile（只总管理员；同源 guard 在 _write）
+        #   GET /api/groups/{gid}/agents        → {"group_id", "agents":[{kind,title,enabled,recent_handoffs}]}
+        #                                        （总管理员或本群 group_admin；成员 403 / 匿名 401 / 非服务群 404）
         # svc.agents（Agents 实例）没就位 → 503；字段严格：未知键 / 坏类型 / 超长 → 400。
 
         def _agents_ready() -> tuple[Any, web.Response | None]:
@@ -3468,7 +3682,15 @@ class ConsoleServer:
         app.router.add_delete("/api/agents/{kind}", self._write(_agents_custom_delete))
 
         def _agents_group_view(mod: Any, gid: str) -> dict[str, Any]:
-            """本群岗位快照：内建四种 + 全部自定义专岗（task 只读交接记录——notes='' / learned=[]）。"""
+            """本群岗位快照：内建四种 + 全部自定义专岗。
+
+            「每群三份」收尾（2026-10-03，docs/17 §八.5）裁剪字段：
+            - notes / lessons / lessons_state / skills / skills_state 全部挪走（工作册
+              进本群规矩 /api/groups/{gid}/rules；skill 调度走 /api/groups/{gid}/skills?kind=…）；
+            - learned（「最近做过的」既往验收）保留为**只读的去重材料**：网页「最近做过的」
+              展示它，自动流程拿它避免重复；它没有写接口（写只由验收后主流程内部走
+              Agents.remember），不跟着 notes 一起退役。
+            """
             agents_out: list[dict[str, Any]] = []
             profiles = {p["kind"]: p for p in mod.profiles()}
             # 内建固定顺序在前；自定义按 kind 字典序在后（profiles() 也是这个顺序）
@@ -3477,17 +3699,13 @@ class ConsoleServer:
             ]
             for kind in all_kinds:
                 p = profiles.get(kind) or {"title": kind}
-                if kind == "task":
-                    mem = {"notes": "", "learned": []}
-                else:
-                    mem = mod.memory(gid, kind)
                 agents_out.append(
                     {
                         "kind": kind,
                         "title": str(p.get("title") or kind),
                         "enabled": bool(p.get("enabled", True)),
-                        "notes": mem["notes"],
-                        "learned": mem["learned"],
+                        # 只读去重材料（list）；按群按岗取，绝不跨群
+                        "learned": list((mod.memory(gid, kind) or {}).get("learned") or []),
                         "recent_handoffs": mod.handoffs(gid, kind=kind, limit=5),
                     }
                 )
@@ -3512,56 +3730,13 @@ class ConsoleServer:
                 logger.exception("读本群岗位快照出错")
                 return _err(500, "服务器出错了")
 
-        async def _group_agents_memory_put(request: web.Request) -> web.Response:
-            gid = self._resolve_ref(str(request.match_info["gid"]))
-            if gid is None or not svc.get_settings().is_served(gid):
-                return _err(404, "没有这个群（只支持服务群）")
-            forbid = self._require_group_admin(request, gid)
-            if forbid is not None:
-                return forbid
-            mod, not_ready = _agents_ready()
-            if not_ready is not None:
-                return not_ready
-            body = await _json_body(request)
-            if body is None:
-                return _err(400, "请求体不是 JSON")
-            notes = body.get("notes")
-            if not isinstance(notes, str):
-                return _err(400, "notes 要是字符串")
-            kind = str(request.match_info["kind"])
-            try:
-                mem = mod.set_notes(gid, kind, notes)
-            except ValueError as e:
-                return _err(400, str(e) or "这个值改不了")
-            except Exception:
-                logger.exception("写岗位工作册出错")
-                return _err(500, "服务器出错了")
-            return web.json_response(mem)
-
-        app.router.add_route(
-            "PUT", "/api/groups/{gid}/agents/{kind}/memory", self._write(_group_agents_memory_put)
-        )
-
-        @get("/api/groups/{gid}/agents/handoffs")
-        async def _group_agents_handoffs(request: web.Request) -> web.Response:
-            gid = self._resolve_ref(str(request.match_info["gid"]))
-            if gid is None or not svc.get_settings().is_served(gid):
-                return _err(404, "没有这个群（只支持服务群）")
-            forbid = self._require_group_admin(request, gid)
-            if forbid is not None:
-                return forbid
-            mod, not_ready = _agents_ready()
-            if not_ready is not None:
-                return not_ready
-            kind = str(request.rel_url.query.get("kind") or "").strip() or None
-            try:
-                items = mod.handoffs(gid, kind=kind, limit=20)
-            except ValueError as e:
-                return _err(404, str(e))
-            except Exception:
-                logger.exception("读本群交接单出错")
-                return _err(500, "服务器出错了")
-            return web.json_response({"items": items})
+        # 2026-10-03 「每群三份」收尾（docs/17 §八.5）：
+        # - PUT /api/groups/{gid}/agents/{kind}/memory 退役——「工作册 notes」整体废弃，
+        #   原有内容已由启动迁移拼进本群规矩（/api/groups/{gid}/rules）；
+        # - /api/groups/{gid}/agents/{kind}/lessons*（POST/PATCH/DELETE）退役——逐条
+        #   agent_lessons 第一批从没上线，docs/17 §七 起换成「本群做法 skill」：
+        #   相同属主、相同岗位的写法在 /api/groups/{gid}/skills；管理员对话 skill 看
+        #   /api/groups/{gid}/skills?kind=…。
 
         # ---------- 和 MaiWork 聊：管理员对话（只管理员；配套 static/js/chat.js 的对话页） ----------
         #

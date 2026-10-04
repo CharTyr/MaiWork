@@ -32,6 +32,8 @@ export const SVG = {
   lock: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2.5"/><path d="M8.5 11V8a3.5 3.5 0 0 1 7 0v3"/></svg>`,
   key: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><circle cx="8" cy="15" r="4"/><path d="M11 12l8-8M16 7l2.5 2.5M14 9l2 2"/></svg>`,
   trash: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><path d="M4.5 7h15M10 7V5h4v2M6.8 7l.9 12.2h8.6l.9-12.2"/></svg>`,
+  pin: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><path d="M9 4.5h6M10 4.5v5L7 13.5h10L14 9.5v-5M12 13.5v6"/></svg>`,
+  archive: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><rect x="3.5" y="5" width="17" height="4" rx="1.5"/><path d="M5.5 9v9a1.5 1.5 0 0 0 1.5 1.5h10a1.5 1.5 0 0 0 1.5-1.5V9M10 13h4"/></svg>`,
   pen: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><path d="M14.5 5.5l4 4M4.5 19.5l1-4.5L16 4.5a1.4 1.4 0 0 1 2 0l1.5 1.5a1.4 1.4 0 0 1 0 2L9 18.5z"/></svg>`,
   plus: `<svg viewBox="0 0 24 24" ${P} stroke-width="2.2"><path d="M12 5v14M5 12h14"/></svg>`,
   send: `<svg viewBox="0 0 24 24" ${P} stroke-width="2.2"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5"/></svg>`,

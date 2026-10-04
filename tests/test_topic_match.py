@@ -63,7 +63,6 @@ def _seed_news(
     gid: str = GID,
     title: str = "M7 芯片发布",
     keywords=("m7", "芯片"),
-    votes: int = 0,
     created: float | None = None,
     rejected: int = 0,
     kind: str = "news",
@@ -76,12 +75,11 @@ def _seed_news(
         bid = int(conn.execute("SELECT MAX(id) AS m FROM news_batches").fetchone()["m"])
         cur = conn.execute(
             "INSERT INTO news_items (batch_id, group_id, title, summary, body, keywords,"
-            " chat_votes, sources, rejected, kind, created)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " sources, rejected, kind, created)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 bid, gid, title, summary, body,
                 json.dumps(list(keywords), ensure_ascii=False),
-                int(votes),
                 json.dumps([{"url": url}]) if url else "[]",
                 int(rejected), kind,
                 (float(created) if created is not None else clock.now()),
@@ -211,23 +209,16 @@ class TestMatchRules:
         assert len(lines) == 1
         assert "M7 芯片发布" in lines[0][0]
 
-    def test_single_keyword_no_votes_no_match(self, tmp_path):
+    def test_single_keyword_no_match(self, tmp_path):
         store, settings, m, tm = _make(tmp_path)
-        _seed_news(store, keywords=("m7", "芯片"), votes=0)
+        _seed_news(store, keywords=("m7", "芯片"))
         kwargs = _kwargs([("大家聊 m7 了吗", False)])  # 只命中一个关键词
-        assert tm.memo_lines(GID, kwargs) == []
-
-    def test_single_keyword_votes_no_longer_relax(self, tmp_path):
-        """2026-09-29 删掉「想在群里聊」：老数据里的 chat_votes 不再让单个关键词算接得上。"""
-        store, settings, m, tm = _make(tmp_path)
-        _seed_news(store, keywords=("m7", "芯片"), votes=5)
-        kwargs = _kwargs([("大家聊 m7 了吗", False)])
         assert tm.memo_lines(GID, kwargs) == []
 
     def test_keyword_min_len_2(self, tmp_path):
         """单字符关键词不算命中。"""
         store, settings, m, tm = _make(tmp_path)
-        _seed_news(store, keywords=("x", "xy"), votes=9)
+        _seed_news(store, keywords=("x", "xy"))
         kwargs = _kwargs([("x 到处都是 x", False)])
         assert tm.memo_lines(GID, kwargs) == []
 

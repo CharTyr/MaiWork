@@ -32,6 +32,19 @@ G1 = "900000001"
 NOW = 1_790_000_000.0
 
 
+@pytest.fixture(autouse=True)
+def _frozen_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """本文件所有用例把 clock.now 冻结在 NOW（北京时间 2026-09-21 22:13，不在默认睡觉时段 23:00-08:00）。
+
+    产品按真实墙钟判断睡觉时段：不冻结的话，在 23:00-08:00 之间跑这份测试，
+    ask: 的 text 会被 Pushes 正确推迟（outbox 仍 pending、不回写 question_msg_id），
+    断言就会「假红」，看着像消息回写坏了，其实产品行为是对的。
+    冻结后 question_ts / flush 的 now / 模拟消息时间（_hook_reply 也用 NOW）三者一致，
+    结果不再随墙钟变化。monkeypatch 每个用例自动还原，不泄漏到别的测试文件。
+    """
+    monkeypatch.setattr(clock, "now", lambda: NOW)
+
+
 # ---------------------------------------------------------------------------
 # intake 层：答案识别（注入 waiting_tasks 缓存 + on_answer 回调 + 录 spawn）
 # ---------------------------------------------------------------------------

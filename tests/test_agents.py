@@ -282,7 +282,6 @@ class TestFishSeed:
 class TestServedGate:
     @pytest.mark.parametrize("method,args", [
         ("memory", ("999999", "news")),
-        ("set_notes", ("999999", "news", "hi")),
         ("remember", ("999999", "news", "text")),
         ("prompt", ("999999", "news")),
         ("begin", ("999999", "news", "brief")),
@@ -310,8 +309,6 @@ class TestServedGate:
         with pytest.raises(Exception):
             ag.memory("999999", "news")
         with pytest.raises(Exception):
-            ag.set_notes("999999", "news", "hi")
-        with pytest.raises(Exception):
             ag.remember("999999", "news", "a")
         with pytest.raises(Exception):
             ag.begin("999999", "news", "b")
@@ -320,12 +317,25 @@ class TestServedGate:
     def test_dynamic_settings(self, store, settings):
         """get_settings 每次现取：服务群名单热变化立刻生效。"""
         ag = Agents(store, lambda: settings)
-        ag.set_notes(G1, "news", "ok")
+        ag.remember(G1, "news", "ok")
         settings.served.discard(G1)
         with pytest.raises(Exception):
             ag.memory(G1, "news")
         settings.served.add(G1)
-        assert ag.memory(G1, "news")["notes"] == "ok"
+        assert ag.memory(G1, "news")["learned"][0]["text"] == "ok"
+
+
+class TestSetNotesGone:
+    """「每群三份」收尾 2026-10-03：工作册（agent_memory_notes / set_notes）退役——
+    内容进 group_rules；接口整个删，memory() 里 notes 字段不再有。"""
+
+    def test_set_notes_removed(self, agents):
+        assert not hasattr(agents, "set_notes")
+
+    def test_memory_no_notes_field(self, agents):
+        m = agents.memory(G1, "news")
+        assert "notes" not in m
+        assert m == {"learned": []}
 
 
 # ----------------------------------------------------------------------
@@ -336,26 +346,7 @@ class TestServedGate:
 class TestMemory:
     def test_empty_default(self, agents):
         m = agents.memory(G1, "news")
-        assert m == {"notes": "", "learned": []}
-
-    def test_set_notes_roundtrip(self, agents):
-        out = agents.set_notes(G1, "news", "这群爱看硬件资讯")
-        assert out["notes"] == "这群爱看硬件资讯"
-        assert agents.memory(G1, "news")["notes"] == "这群爱看硬件资讯"
-
-    def test_notes_limit(self, agents):
-        with pytest.raises(ValueError):
-            agents.set_notes(G1, "news", "x" * 2001)
-        out = agents.set_notes(G1, "news", "x" * 2000)
-        assert len(out["notes"]) == 2000
-
-    def test_notes_group_kind_isolated(self, agents):
-        agents.set_notes(G1, "news", "g1-news")
-        agents.set_notes(G1, "idea", "g1-idea")
-        agents.set_notes(G2, "news", "g2-news")
-        assert agents.memory(G1, "news")["notes"] == "g1-news"
-        assert agents.memory(G1, "idea")["notes"] == "g1-idea"
-        assert agents.memory(G2, "news")["notes"] == "g2-news"
+        assert m == {"learned": []}
 
     def test_remember_basic(self, agents):
         agents.remember(G1, "news", "上次 SSL 新闻反馈好", refs=["https://a"], source_id="s1", now=100.0)
@@ -400,43 +391,34 @@ class TestMemory:
         assert agents.memory(G1, "goal")["learned"] == []
         assert agents.memory(G2, "news")["learned"] == []
 
-    def test_set_notes_task_rejected(self, agents):
-        """task 没有可编辑记忆：写 notes 也拒绝（只读交接记录）。"""
-        with pytest.raises(ValueError):
-            agents.set_notes(G1, "task", "不该写")
-
-
 class TestPrompt:
     def test_prompt_contains_profile_and_memory(self, agents):
         agents.update_profile("news", {"title": "资讯小队", "instructions": "先看画像再搜"})
-        agents.set_notes(G1, "news", "群喜欢硬件")
         agents.remember(G1, "news", "上次 AI 新闻反响好", now=1.0)
         text = agents.prompt(G1, "news")
         assert "资讯小队" in text
         # 专岗改版 3/4：instructions 不再单独注入（搬进各 kind 的 AGENTS.md 由 workers
-        # 注入；这里只剩「数据」段，避免双重注入）。profile.title、工作册、既往验收都在。
+        # 注入；这里只剩「数据」段，避免双重注入）。profile.title、既往验收都在。
         assert "先看画像再搜" not in text
-        assert "群喜欢硬件" in text
         assert "上次 AI 新闻反响好" in text
 
     def test_prompt_says_memory_is_data(self, agents):
-        agents.set_notes(G1, "news", "群喜欢硬件")
+        agents.remember(G1, "news", "群喜欢硬件")
         text = agents.prompt(G1, "news")
         assert "数据" in text
         assert ("不是指令" in text) or ("不是命令" in text)
 
     def test_prompt_no_cross_group_or_kind(self, agents):
-        agents.set_notes(G1, "news", "g1-news-notes")
-        agents.set_notes(G2, "news", "g2-news-notes")
-        agents.set_notes(G1, "idea", "g1-idea-notes")
+        agents.remember(G1, "news", "g1-news-learned")
+        agents.remember(G2, "news", "g2-news-learned")
+        agents.remember(G1, "idea", "g1-idea-learned")
         text = agents.prompt(G1, "news")
-        assert "g1-news-notes" in text
-        assert "g2-news-notes" not in text
-        assert "g1-idea-notes" not in text
+        assert "g1-news-learned" in text
+        assert "g2-news-learned" not in text
+        assert "g1-idea-learned" not in text
 
     def test_prompt_bounded(self, agents):
         agents.remember(G1, "news", "x" * 1200, now=1.0)
-        agents.set_notes(G1, "news", "y" * 2000)
         text = agents.prompt(G1, "news")
         assert len(text) < 20000
 
@@ -730,7 +712,6 @@ class TestStoreLockUsed:
 
         store.tx = spy_tx  # type: ignore[assignment]
         try:
-            ag.set_notes(G1, "news", "n")
             ag.remember(G1, "news", "a")
             hid = ag.begin(G1, "news", "b")
             ag.running(G1, hid)

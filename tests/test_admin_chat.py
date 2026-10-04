@@ -701,7 +701,8 @@ class TestSystemPrompt:
         svc.identity.write("soul", "SOUL：我是 MaiWork 的脑子。")
         svc.identity.write("agents", "AGENTS：先查证据再动手。")
         svc.identity.write("memory", "全局记忆：管理员喜欢短句。")
-        svc.identity.group_write(G1, f"本群记忆：{G1} 的人在折腾小工具。")
+        # 「每群三份」收尾：管理台对话不带每群记忆（每群内容→group_context，
+        # 注入只在业务流程里发生）；这里只写全局三份。
 
     @pytest.mark.asyncio
     async def test_prompt_has_identity_and_boundaries(self, svc: _Svc) -> None:
@@ -711,8 +712,11 @@ class TestSystemPrompt:
         assert await chat.wait_idle(cid)
         system = svc.models.calls[0][1][0]
         assert system["role"] == "system"
-        for frag in ("SOUL：我是 MaiWork 的脑子。", "AGENTS：先查证据再动手。", "全局记忆", "本群记忆"):
+        for frag in ("SOUL：我是 MaiWork 的脑子。", "AGENTS：先查证据再动手。", "全局记忆"):
             assert frag in system["content"], frag
+        # 每群字段不再并进；网页「本群规矩 / 本群做法」管理员自己看
+        assert "本群记忆" not in system["content"]
+        assert "这个群的工作记忆" not in system["content"]
         for frag in ("服务群", "管理员", "确认"):
             assert frag in system["content"], frag
         assert G1 in system["content"]

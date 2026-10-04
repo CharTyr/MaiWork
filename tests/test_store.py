@@ -212,3 +212,50 @@ class TestFilePermission:
         conn = store.read()
         assert isinstance(conn, sqlite3.Connection)
         assert conn.row_factory is sqlite3.Row
+
+
+def test_chat_feeds_table_dropped_on_fresh_and_legacy(tmp_path) -> None:
+    """chat_feeds 表 2026-10 已删：新库跑到库号 31 会按当年的历史 SQL 建出来
+    （第 31 步不许动），再由第 33 步 DROP 掉——终态没有；老库（user_version 停在
+    它前面）启动后也一样被 DROP 掉。"""
+    from CharTyr_MaiWork.maiwork.store import Store, _MIGRATIONS, _m_drop_member_interactions
+
+    p = tmp_path / "data" / "m.db"
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    # 老库：先把版本停在「还没 _m_drop_member_interactions」那个点，
+    # 手工建出 chat_feeds 表，模仿 2026-10-01 到 2026-10 这段线上跑过的样子
+    pre = sqlite3.connect(p)
+    pre.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated REAL NOT NULL DEFAULT 0)")
+    pre.executescript("""
+    CREATE TABLE IF NOT EXISTS chat_feeds (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        mode TEXT NOT NULL DEFAULT 'topic',
+        title TEXT NOT NULL DEFAULT '',
+        hit TEXT NOT NULL DEFAULT '[]',
+        words TEXT NOT NULL DEFAULT '[]',
+        link TEXT NOT NULL DEFAULT '',
+        rounds INTEGER NOT NULL DEFAULT 1,
+        first_ts REAL NOT NULL DEFAULT 0,
+        last_ts REAL NOT NULL DEFAULT 0,
+        said_ts REAL,
+        said_text TEXT NOT NULL DEFAULT ''
+    );
+    """)
+    # 停在需要连跑 _m_drop_member_interactions 和 _m_drop_chat_feeds 两个的版本
+    pre.execute(f"PRAGMA user_version={_MIGRATIONS.index(_m_drop_member_interactions)}")
+    pre.commit()
+    pre.close()
+
+    s = Store(p)
+    s.migrate()
+    rows = s.read().execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chat_feeds'").fetchall()
+    assert rows == [], "chat_feeds 表应该已被 DROP"
+
+    # 全新库：第 31 步的历史 SQL 会建，最后也被第 33 步 DROP——终态同样没有
+    s2 = Store(tmp_path / "data" / "m2.db")
+    s2.migrate()
+    rows2 = s2.read().execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chat_feeds'").fetchall()
+    assert rows2 == []

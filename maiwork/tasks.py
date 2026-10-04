@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import nullcontext
 from typing import Any, Callable, Iterable
@@ -56,6 +57,132 @@ def _load_json(s: Any, default: Any) -> Any:
         return json.loads(s) if s else default
     except (ValueError, TypeError):
         return default
+
+
+# ---------------------------------------------------------------------------
+# 暂停原因（paused_reason）结构化 schema（0.4.0 安全网 + 2026-10 能力闸收口）
+#
+# 为什么要有 schema：暂停原因会进网页的任务列表和详情（总管理员 / 群管理员 / 群友
+# 三种身份都看得到），所以只留「说得清 + 不泄密」的最小结构，写入时严格校验、限长：
+#   {"kind": "tokens"|"time", "limit": int>0, "used": int>=0}   安全网自动暂停
+#   {"kind": "capability", "text": "中文一句", "jobs": [int, ...]} 开工前能力闸暂停
+# 三处视图（list_view / 管理员详情 / 群友详情）都从这里派生一句安全中文 `text`。
+# 手动暂停（网页 / /mw 点「暂停」）没有原因：paused_reason 为空，视图不编造
+# 「时长 0」这类假原因。
+# ---------------------------------------------------------------------------
+_PAUSED_KINDS = frozenset({"tokens", "time", "capability"})
+_PAUSED_TEXT_MAX = 400   # 中文一句话的硬上限（能力闸原因本来就写成大白话，超长一律截断）
+_PAUSED_JOBS_MAX = 8     # 最多记 8 条出问题的活（只用来指路，不记 job 详情）
+_SECRET_IN_TEXT = re.compile(
+    r"(?i)(api[_-]?key|access[_-]?key|token|secret|password|passwd|credential)"
+    r"\s*[=:：]\s*[^\s，。；、）】\"']+"
+)
+_ABSPATH_IN_TEXT = re.compile(r"(?<![\w.])~(?:/[\w.\-]+)+|(?<![\w.])/(?:[\w.\-]+/)+[\w.\-]+")
+_ACCOUNT_IN_TEXT = re.compile(r"\d{6,}")
+
+# 「为什么停」的一句话（列表 meta 用；详情直接用带数字/原话的 text）
+_PAUSED_META = {
+    "tokens": "自动暂停：用量到上限了，等你决定",
+    "time": "自动暂停：做得太久了，等你决定",
+    "capability": "自动暂停：开工前对不上，等你决定",
+}
+
+
+def _safe_paused_text(text: Any, *, limit: int = _PAUSED_TEXT_MAX) -> str:
+    """把一句暂停原因洗成能公开给群友看的中文。
+
+    - 折叠空白、截断到 limit；
+    - 隐去明显的密钥 / 口令（`api_key=xxx`）、内部绝对路径（`/root/.typesafe_key`）
+      和长数字（QQ 号这类账号）：暂停原因里只该有「哪条活、为什么、下一步怎么办」。
+    """
+    s = " ".join(str(text or "").split())
+    s = _SECRET_IN_TEXT.sub(lambda m: f"{m.group(1)}=[已隐去]", s)
+    s = _ABSPATH_IN_TEXT.sub("[路径]", s)
+    s = _ACCOUNT_IN_TEXT.sub("[已隐去]", s)
+    return s[: max(1, int(limit))]
+
+
+def _clean_paused_reason(value: Any) -> dict | None:
+    """校验并清洗一条暂停原因；不合法（kind 不认识 / 缺关键信息）返回 None。"""
+    if not isinstance(value, dict):
+        return None
+    kind = str(value.get("kind") or "").strip()
+    if kind not in _PAUSED_KINDS:
+        return None
+    if kind in ("tokens", "time"):
+        try:
+            limit = int(value.get("limit") or 0)
+            used = int(value.get("used") or 0)
+        except (TypeError, ValueError):
+            return None
+        if limit <= 0 or used < 0:
+            # 没上限 / 负数的「暂停原因」是脏数据：宁可不显示，也不编一个 0 时长
+            return None
+        return {"kind": kind, "limit": limit, "used": used}
+    text = _safe_paused_text(value.get("text") or value.get("reason") or "")
+    if not text:
+        return None
+    out: dict[str, Any] = {"kind": "capability", "text": text}
+    jobs = value.get("jobs")
+    clean_jobs: list[int] = []
+    if isinstance(jobs, (list, tuple)):
+        for item in jobs:
+            if len(clean_jobs) >= _PAUSED_JOBS_MAX:
+                break
+            try:
+                n = int(item)
+            except (TypeError, ValueError):
+                continue
+            if n > 0 and n not in clean_jobs:
+                clean_jobs.append(n)
+    if clean_jobs:
+        out["jobs"] = clean_jobs
+    return out
+
+
+def _paused_reason_for_store(value: Any) -> Any:
+    """transition 用：dict → 清洗后的 dict；None / 空串 → ""；其它 / 不合法 → ValueError。"""
+    if value is None or value == "":
+        return ""
+    cleaned = _clean_paused_reason(value)
+    if cleaned is None:
+        raise ValueError(
+            "暂停原因不合法：kind 只认 tokens / time / capability，"
+            "且要带够最小信息（tokens/time 要有正的 limit，capability 要有 text）"
+        )
+    return cleaned
+
+
+def _row_paused_reason(row: Any) -> dict | None:
+    """从任务行里读暂停原因：老库没有这列、脏 JSON、脏结构一律当「没有」。"""
+    try:
+        raw = row["paused_reason"] if "paused_reason" in row.keys() else None
+    except Exception:
+        try:
+            raw = row["paused_reason"]
+        except Exception:
+            raw = None
+    return _clean_paused_reason(_load_json(raw, None))
+
+
+def paused_reason_text(reason: dict | None) -> str:
+    """给网页（列表 / 详情、管理员 / 群友）看的一句安全中文。"""
+    if not isinstance(reason, dict):
+        return ""
+    kind = str(reason.get("kind") or "")
+    if kind == "capability":
+        return _safe_paused_text(reason.get("text") or "")
+    if kind == "tokens":
+        return (
+            f"自动暂停：用量到上限了（用了约 {int(reason.get('used') or 0)} token，"
+            f"上限 {int(reason.get('limit') or 0)}），先停下等你决定"
+        )
+    if kind == "time":
+        return (
+            f"自动暂停：做得太久了（已跑 {int(reason.get('used') or 0)} 秒，"
+            f"上限 {int(reason.get('limit') or 0)} 秒），先停下等你决定"
+        )
+    return ""
 
 
 class Tasks:
@@ -161,6 +288,9 @@ class Tasks:
             raise ValueError(f"不能更新的字段: {sorted(unknown)}")
         if to_s not in _LEGAL:
             raise ValueError(f"不认识的任务状态「{to_s}」")
+        if "paused_reason" in fields:
+            # 严格校验 + 清洗（限长 / 只留最小字段）：脏原因当场报错，绝不写进库给人看
+            fields["paused_reason"] = _paused_reason_for_store(fields["paused_reason"])
         now = clock.now()
         with self._store.tx() as conn:
             row = conn.execute("SELECT * FROM tasks WHERE id=?", (str(task_id),)).fetchone()
@@ -181,13 +311,18 @@ class Tasks:
                 elif key == "undelivered":
                     updates[key] = 1 if value else 0
                 elif key == "paused_reason":
-                    # 安全网原因：dict 序列化成 JSON；None/"" 表示清空
+                    # 已经过 _paused_reason_for_store 清洗：dict 序列化成 JSON；"" 表示清空
                     if isinstance(value, dict):
                         updates[key] = json.dumps(value, ensure_ascii=False)
                     else:
                         updates[key] = str(value) if value else ""
                 else:
                     updates[key] = value
+
+            # 从 paused 出去（继续 / 取消）：暂停原因一并清掉，不留过期的「为什么停」
+            #（继续那条在下面的恢复分支里本来就会清，这里补上取消等其它出口）
+            if src == "paused" and to_s != "paused":
+                updates["paused_reason"] = ""
 
             # 从 paused/shelved 恢复（→ queued）：清掉暂停原因 + 记安全网基线
             # （tokens 基线 = 当前 usage 总量；时长基线 = resume 时刻）。本轮继续后，
@@ -555,13 +690,10 @@ class Tasks:
         if status == "queued":
             return "排队中"
         if status == "paused":
-            # 安全网自动暂停（0.4.0）：原因进 meta，网页直接显示
-            pr = _load_json(row["paused_reason"] if "paused_reason" in row.keys() else None, None) if hasattr(row, "keys") else _load_json(row["paused_reason"], None)
-            if isinstance(pr, dict) and pr.get("kind"):
-                if pr["kind"] == "tokens":
-                    return "自动暂停：用量到上限了，等你决定"
-                return "自动暂停：做得太久了，等你决定"
-            return "已暂停"
+            # 自动暂停（安全网 / 开工前能力闸）：原因进 meta，网页直接显示；
+            # 手动暂停没有原因，只说「已暂停」，不编造时长 / 用量
+            pr = _row_paused_reason(row)
+            return _PAUSED_META.get(str((pr or {}).get("kind") or ""), "") or "已暂停"
         if status == "cancelled":
             return "已取消"
         if status == "rejected":
@@ -579,19 +711,16 @@ class Tasks:
         return ""
 
     def _list_item(self, row: sqlite3.Row) -> dict:
-        # 安全网自动暂停原因（0.4.0）：task row 有没有这列按 sqlite Row 的 keys 判断（老库容差）；
-        # 手动暂停 / 正常运行都是 None（前端只对它显示「自动暂停原因」徽章）
+        # 自动暂停原因（0.4.0 安全网 / 2026-10 能力闸）：老库没这列、脏数据一律当没有；
+        # 手动暂停 / 正常运行都是 None。三种身份（总管理员 / 群管理员 / 群友）共用这条，
+        # 所以这里只给最小结构 + 一句安全中文 text（能力闸那句在写入时已洗过，读时再洗一遍）。
         paused_reason = None
-        try:
-            pr = _load_json(row["paused_reason"] if "paused_reason" in row.keys() else None, None)
-            if isinstance(pr, dict) and pr.get("kind"):
-                paused_reason = {
-                    "kind": str(pr["kind"]),
-                    "limit": int(pr.get("limit") or 0),
-                    "used": int(pr.get("used") or 0),
-                }
-        except Exception:
-            paused_reason = None
+        pr = _row_paused_reason(row)
+        if pr is not None:
+            paused_reason = dict(pr)
+            text = paused_reason_text(pr)
+            if text:
+                paused_reason["text"] = text
         # 发起人只给显示名：按 requester_id 查名册当前名，查不到回落 requester_name 快照。
         # 绝不把 requester_id（QQ 号）放进列表（群友视图也用 list_view）。
         requester_name = members.name_of(

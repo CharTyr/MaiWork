@@ -4,7 +4,7 @@ import { esc, toast, tokens } from "../util.js";
 import { api } from "../api.js";
 import { loading } from "../pages/news.js";
 import { ROLE_NAMES } from "./ext.js";
-import { fmtMs } from "./logs.js";
+import { fmtMs, logsPage } from "./logs.js";
 
 /* ───── 用量：按天看历史 ───── */
 export async function loadUsage(days) {
@@ -37,6 +37,10 @@ const md = (day) => {
   const m = String(day || "").match(/^\d{4}-(\d{2})-(\d{2})$/);
   return m ? `${Number(m[1])}/${Number(m[2])}` : String(day || "");
 };
+
+export function usageAndLogsPage() {
+  return usagePage() + `<h2 class="h-sub">请求日志</h2>` + logsPage();
+}
 
 export function usagePage() {
   const u = state.usage;

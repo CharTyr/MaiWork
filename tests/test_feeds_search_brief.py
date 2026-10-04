@@ -42,8 +42,11 @@ def test_brief_says_time_is_handled_by_code(tmp_path) -> None:
 
 
 def test_brief_lists_blocked_domains(tmp_path) -> None:
-    cfg = {"feeds": {"blocked_domains": ["spam-news.example"]}}
-    store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path, cfg=cfg)
+    """屏蔽名单进定关注点提示词（2026-10 起从 kv["feeds.blocked.<gid>"] 按群读）。"""
+    from CharTyr_MaiWork.maiwork import feeds as _feeds
+
+    store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path)
+    _feeds.blocked_domains_set(store, GID, ["spam-news.example"])
     with _TimePatch():
         _run(feeds.prepare_news(GID))
     assert "spam-news.example" in _focus_prompt(models)

@@ -121,6 +121,11 @@ def _m1(conn: sqlite3.Connection) -> None:
 
 # profile.py 第一部分（群活跃统计）新增：bot_messages / member_interactions 两张表，
 # groups 加 pending_count（攒批计数）和 info_ts（群信息最后更新时间）两列。
+#
+# 历史 SQL 只供迁移、不许再改（docs/07 §四：迁移是有序列表，新阶段只能往后加）：
+# 这段就是 0.7.9（库号 31）当年跑过的原文，恢复原样，让新库跟存量库在同一个库号
+# 上结构一致。member_interactions 的运行时代码 2026-09-27 起已退役（不再写入、
+# 不再用来挑人），表由后面追加的第 32 步 _m_drop_member_interactions 拆掉。
 _M_PROFILE_SQL = """
 CREATE TABLE IF NOT EXISTS bot_messages (
     group_id TEXT NOT NULL,
@@ -469,7 +474,8 @@ def _m_quality(conn: sqlite3.Connection) -> None:
 #   refs（群里什么时候聊过：[{ts, who, user_id, text, message_id}]，user_id 用来查当前名）、
 #   audience（谁可能需要：[{"user_id","name"}]，认人靠 user_id；老行是 [名字]）、
 #   image_url（原文封面图）、keywords（给 MaiBot 接话题用的关键词）、verify（railway.new 实测结果 JSON）、
-#   chat_votes（群友点「想在群里聊」的次数）、angle（'diverse' = 刻意放进来的不同角度）
+#   angle（'diverse' = 刻意放进来的不同角度）
+#   （chat_votes 列是「想在群里聊」时代的残留，2026-09-29 起不再读、2026-10 起不再写）
 # - ideas：feasibility（可行性 JSON）、keywords
 # - chat_log：服务群最近 14 天发言的只读副本（全文检索，trigram 支持中文），
 #   用来找「什么时候聊过」和让 MaiBot 在群友聊起时接上对应内容
@@ -668,7 +674,8 @@ def _m_focus_names(conn: sqlite3.Connection) -> None:
 #   老的构想默认 `[]`（读取时按「没有项目」走老逻辑，不报错）；step/effort 两列留着不删，
 #   只为读得动老数据，新构想不再生成。
 # - requests.item_nos：从构想转来的请求里，群友点名要做的项目序号 JSON（`[]` = 全部项目）。
-# - requests.source：请求来源标记（`""` = 群友 @ / 网页发起，`"maiwork"` = MaiWork 主动提议）。
+# - requests.source：请求来源标记（`""` = 群友 @ / 网页发起，`"maiwork"` = MaiWork 主动提议——
+#   主动提目标 2026-10 docs/18 第一步删了，不再产生新行，仅历史行存在，批准/展示照旧）。
 def _m_idea_items(conn: sqlite3.Connection) -> None:
     def _cols(table: str) -> set[str]:
         return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -880,15 +887,119 @@ def _m_goal_requester(conn: sqlite3.Connection) -> None:
     )
 
 
-# 资讯反哺 MaiBot 闲聊的账（chat_feed.py，2026-10-01）
-def _m_chat_feeds(conn: sqlite3.Connection) -> None:
-    from . import chat_feed
+# 「资讯反哺 MaiBot 闲聊」的账（2026-10-01 上线，库号 31）。
+#
+# 历史 SQL 只供迁移、不许再改（docs/07 §四）：这里内联当年 chat_feed.py::SCHEMA_SQL
+# 的原文（表 + 两个索引，一字不改），让新库跑到库号 31 时跟线上存量库当年的结构
+# 一致。chat_feed 运行模块 2026-10 整条路径已退役、不再 import（import 会把死模块
+# 复活到运行路径上）；这条账本身由后面追加的第 33 步 _m_drop_chat_feeds 收尾。
+_M_CHAT_FEEDS_SQL = """
+CREATE TABLE IF NOT EXISTS chat_feeds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'topic',
+    title TEXT NOT NULL DEFAULT '',
+    hit TEXT NOT NULL DEFAULT '[]',
+    words TEXT NOT NULL DEFAULT '[]',
+    link TEXT NOT NULL DEFAULT '',
+    rounds INTEGER NOT NULL DEFAULT 1,
+    first_ts REAL NOT NULL DEFAULT 0,
+    last_ts REAL NOT NULL DEFAULT 0,
+    said_ts REAL,
+    said_text TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_chat_feeds_group ON chat_feeds(group_id, last_ts);
+CREATE INDEX IF NOT EXISTS idx_chat_feeds_key ON chat_feeds(group_id, key);
+"""
 
-    conn.executescript(chat_feed.SCHEMA_SQL)
+
+def _m_chat_feeds(conn: sqlite3.Connection) -> None:
+    conn.executescript(_M_CHAT_FEEDS_SQL)
+
+
+# 死数据清理（docs/18 第一步，2026-10）：member_interactions 互动计数表（第 2 步
+# 建的）彻底退役。2026-09-27 起已不写入、不用来挑人；这个 DROP 是往后追加的清理
+# 步骤，第 2 步的历史 SQL 照旧不动（线上实测没人读它，丢了无感）。
+def _m_drop_member_interactions(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP TABLE IF EXISTS member_interactions")
+
+
+# 「资讯反哺 MaiBot 闲聊」这条路径 2026-10 删了（docs/18 第一步）：chat_feeds 表
+# 本来只记「递给 MaiBot 几次、哪次聊到」的流水；关键词接话（TopicMatcher）继续
+# 工作，只是不再记账、不再记「聊到了」。表由第 31 步的历史 SQL 建、这里跟着拆
+# （历史步骤不动）。DROP + IF EXISTS 幂等。
+def _m_drop_chat_feeds(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP TABLE IF EXISTS chat_feeds")
+
+
+# 每群三份（docs/17 §七.1 + §八.1，2026-10）：
+# - agent_skills / agent_skill_versions：本群做法 skill（替换从未上线的 agent_lessons；
+#   不走迁移数据，agent_lessons 直接 DROP——线上从没建过这张表，这里只为防本地开发库残留）；
+# - group_rules / group_rule_versions：本群规矩（管理员定的，必须照做），改一次留一版，只留最近 20 版。
+# 这里只 DROP agent_lessons（线上从没建过）。**不 DROP agent_memory_notes**：它是
+# 「每群规矩」启动迁移的输入（migrations.py 要读老提醒合进 group_rules），在这里拆
+# 会把迁移输入丢掉；怎么处置由那条迁移自己决定。
+def _m_agent_skills_group_rules(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP TABLE IF EXISTS agent_lessons")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_skills ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " group_id TEXT NOT NULL,"
+        " kind TEXT NOT NULL,"
+        " name TEXT NOT NULL,"
+        " description TEXT NOT NULL DEFAULT '',"
+        " body TEXT NOT NULL DEFAULT '',"
+        " locked INTEGER NOT NULL DEFAULT 0,"
+        " status TEXT NOT NULL DEFAULT 'active',"
+        " uses INTEGER NOT NULL DEFAULT 0,"
+        " last_used REAL NOT NULL DEFAULT 0,"
+        " created REAL NOT NULL DEFAULT 0,"
+        " updated REAL NOT NULL DEFAULT 0,"
+        " UNIQUE(group_id, kind, name)"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_skills ON agent_skills(group_id, kind, status)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_skill_versions ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " skill_id INTEGER NOT NULL,"
+        " body TEXT NOT NULL DEFAULT '',"
+        " description TEXT NOT NULL DEFAULT '',"
+        " source TEXT NOT NULL DEFAULT 'auto',"
+        " note TEXT NOT NULL DEFAULT '',"
+        " ts REAL NOT NULL DEFAULT 0"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_skill_versions ON agent_skill_versions(skill_id, ts)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS group_rules ("
+        " group_id TEXT PRIMARY KEY,"
+        " body TEXT NOT NULL DEFAULT '',"
+        " updated REAL NOT NULL DEFAULT 0,"
+        " updated_by TEXT NOT NULL DEFAULT ''"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS group_rule_versions ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " group_id TEXT NOT NULL,"
+        " body TEXT NOT NULL DEFAULT '',"
+        " updated_by TEXT NOT NULL DEFAULT '',"
+        " ts REAL NOT NULL DEFAULT 0"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_group_rule_versions ON group_rule_versions(group_id, ts)"
+    )
 
 
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules]
 
 
 class Store:
@@ -990,6 +1101,10 @@ class Store:
             " ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated=excluded.updated",
             (key, json.dumps(value, ensure_ascii=False), clock.now()),
         )
+
+    def kv_delete(self, conn: sqlite3.Connection, key: str) -> None:
+        """删掉一条 kv（不存在也幂等）。"""
+        conn.execute("DELETE FROM kv WHERE key=?", (str(key),))
 
     def secret_get(self, name: str) -> str:
         row = self._conn.execute("SELECT value FROM secrets WHERE name=?", (name,)).fetchone()

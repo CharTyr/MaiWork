@@ -84,12 +84,9 @@ class TestMainNotRunnable:
     def test_memory_main_rejected(self, agents) -> None:
         a, _ = agents
         mem = a.memory(G1, "main")
-        assert mem["notes"] == "" and mem["learned"] == []
-
-    def test_set_notes_main_rejected(self, agents) -> None:
-        a, _ = agents
-        with pytest.raises(ValueError):
-            a.set_notes(G1, "main", "x")
+        # 「每群三份」收尾：memory() 不再返回 notes；main 是不落经验的，learned 也空
+        assert "notes" not in mem
+        assert mem["learned"] == []
 
     def test_remember_main_no_persist(self, agents) -> None:
         a, _ = agents

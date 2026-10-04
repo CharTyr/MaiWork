@@ -8,14 +8,14 @@
 
 | 文件 | 主要职责 |
 |---|---|
-| `index.js` | `SET_SUBS`、`settingsPage()` / `settingsSide()` 分发九个子页；`loadGA()` 拉取群管理员资料，`groupPicker()` 供抽屉复用；总览读取 `state.settings` / `state.groups`。 |
-| `models.js` | 端点/模型库管理、连接测试与模型验证，`draft.models` 保留旧引导共用列表；端点默认收起的「高级设置」按行编辑请求头覆盖，只取 `header_names`、值用 password 且不回显，已存行留空保留/删行移除；也可切到 JSON 方式（`mdl-header-mode`，默认只列已存名称且值为空；`parseHeadersJson()` 只收字符串/null 值，错误不带原文）；保存与测试同读 `readEndpointHeaders()`，两种方式共用 `checkedHeaders()`（大小写去重、非法字符/传输头校验）；增删行和切换方式都局部更新，不丢其他未保存输入。`fullLink()` 组群链接，`feedsSettings()` 被资讯来源页复用。 |
-| `rules.js` | `loadRules()` 取 `/api/settings/config` 的分节字段元数据；`rulesPage()` 按字段类型渲染开关、账号 chips、服务群/SSH 行表格及密钥输入；`readRules()` 只提交变更字段。与 `onboarding.js` 共用 `chipEditor()` / `rowsEditor()`。 |
+| `index.js` | `SET_SUBS`、`settingsPage()` / `settingsSide()` 分发九个设置子页（用量 / 日志同页）；`loadGA()` 拉取群管理员资料，`groupPicker()` 供抽屉复用；总览读取 `state.settings` / `state.groups`。 |
+| `models.js` | 端点/模型库管理、连接测试与模型验证，`draft.models` 保留旧引导共用列表；端点默认收起的「高级设置」按行编辑请求头覆盖，只取 `header_names`、值用 password 且不回显，已存行留空保留/删行移除；也可切到 JSON 方式（`mdl-header-mode`，默认只列已存名称且值为空；`parseHeadersJson()` 只收字符串/null 值，错误不带原文）；保存与测试同读 `readEndpointHeaders()`，两种方式共用 `checkedHeaders()`（大小写去重、非法字符/传输头校验）；增删行和切换方式都局部更新，不丢其他未保存输入。`fullLink()` 组群链接；`feedsSettings(feeds, groups)` 被资讯来源页复用——屏蔽名单 2026-10 起按群（`blocked_domains` / `auto_blocked` 都是 `{群号: [域名]}`），按群分行渲染、解除按钮带 `data-g`。 |
+| `rules.js` | `loadRules()` 取 `/api/settings/config` 的分节字段元数据；`rulesPage()` 根据后端 `advanced` 标记把技术参数折进默认关闭的「高级」，再按字段类型渲染开关、账号 chips、服务群/SSH 行表格及密钥输入；`readRules()` 只提交变更字段。与 `onboarding.js` 共用 `chipEditor()` / `rowsEditor()`。 |
 | `ext.js` | `loadExt()` 加载 MCP、skill、搜索绑定及 `/api/extensions/presets`；`extPage()` 将未打开的预设与普通 MCP 同列，已打开预设显示 logo、密钥入口、备用/广撒网标签。`searchCard()` 配主搜索、可另选的正文抓取、备用顺序和广撒网服务；后二者只列已启用预设，`checkedProviders()` 读勾选并排除主搜索。`parseMcpConfig()` 抽取粘贴的远程 HTTPS MCP；`readHeaders()` 和 `readRoles()` 读取表单。 |
-| `identity.js` | 管理头像、SOUL、AGENTS、全局与每群工作记忆；`loadIdentity()` 取 API，`avatarSaved()` 更新界面。 |
-| `sources.js` | RSS、优质来源与来源屏蔽界面。`trustedGroup(g)` 懒加载 `GET /api/groups/{id}/trusted-sources` 到 `state.trusted[id]`，显示高分条数、有用反馈和手动移出项；移出/放回由 `actions_news.js` 发 POST 并更新缓存。RSS 保留增删/启停按钮。 |
-| `usage.js` | `loadUsage()` / `loadUsageDay()` 拉近 7/14/30 天与单日用量并画柱形/明细表。 |
-| `logs.js` | `loadLogs()` 分页读取模型/工具调用记录及摘要，按失败筛选；`logsPage()` 展示请求、回复和错误。 |
+| `identity.js` | 「记忆」页 + 头像小块（头像画在专岗页「主模型」栏）：`loadIdentity()` 取 `/api/identity`，只显示全局工作记忆（每群偏好已并进群页「这个群」的本群规矩）；`avatarBlock()` / `avatarSaved()` 管头像。SOUL / AGENTS 已搬到 `agents.js`（专岗页） |
+| `sources.js` | RSS、优质来源与来源屏蔽界面。`trustedGroup(g)` 懒加载 `GET /api/groups/{id}/trusted-sources` 到 `state.trusted[id]`，显示高分条数、有用反馈和手动移出项；移出/放回由 `actions_news.js` 发 POST 并更新缓存。来源屏蔽复用 `models.js::feedsSettings(feeds, groups)`（按群列，解除走 `POST /api/groups/{gid}/feeds/domains`）。RSS 保留增删/启停按钮。 |
+| `usage.js` | `loadUsage()` / `loadUsageDay()` 拉近 7/14/30 天与单日用量并画柱形/明细表；`usageAndLogsPage()` 在同页接上日志摘要。 |
+| `logs.js` | `loadLogSummary()` 进页只取摘要；显式展开后 `loadLogs()` 分页读取模型 / 工具记录，按失败筛选；完整请求与回复再折叠一层，不默认展示原文。 |
 
 ## Flow
 

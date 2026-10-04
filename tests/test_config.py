@@ -37,8 +37,9 @@ class TestDefaults:
         assert PluginSectionConfig().enabled is False
 
     def test_config_version_bumped(self) -> None:
-        # 0.3.4：资讯质量标准（docs/02 §4.1）：feeds 加 blocked_domains / web_min_avg /
-        # pool_min_avg / guides，max_items 默认 3→10，min_score 退役（字段保留兼容）。
+        # 0.3.4：资讯质量标准（docs/02 §4.1）：feeds 加 web_min_avg /
+        # pool_min_avg / guides，max_items 默认 3→10；min_score / blocked_domains
+        # 2026-10 已删（屏蔽名单挪成按群 kv）。
         # 0.3.5：railway.new 资讯实测：environments 加 railway_daily_max /
         # verify_per_round / verify_minutes
         # 0.3.8：关注成员个人向产出：focus 加 personal_feeds / personal_per_day
@@ -97,8 +98,7 @@ class TestDefaults:
         assert s.focus.personal_profile is True
         assert s.feeds.news_slots == ("08:30", "14:00", "19:00")
         assert s.feeds.news_jitter_minutes == 30
-        assert s.feeds.ideas_per_day == 1
-        assert s.goals.propose is True  # 主动提目标默认开
+        assert not hasattr(s, "goals")  # [goals] 节已删（主动提目标 2026-10 退役）
         assert s.topics.enabled is True
         assert s.topics.speaker == "maiwork"
         assert s.topics.per_day == 2
@@ -106,7 +106,6 @@ class TestDefaults:
         assert s.topics.candidate_ttl_hours == 12
         assert s.delivery.push_per_day == 3
         assert s.delivery.quiet_hours == "23:00-08:00"
-        assert s.delivery.mention_ttl_minutes == 120
         assert s.approval.required is True
         assert s.approval.admins == ("qq:100000001",)  # 默认含部署人的 QQ；要加人往后写
         assert s.approval.exempt_groups == ()
@@ -311,32 +310,23 @@ class TestM2Sections:
     def test_feeds_new_fields_defaults(self) -> None:
         s, problems = settings_of({})
         assert problems == []
-        assert s.feeds.min_score == 0.6
         assert s.feeds.max_items == 10  # 0.3.4 起：质量标准 max_items 默认 10
         assert s.feeds.lookback_days == 14
         # 0.3.4 新字段（docs/02 §4.1 质量标准）
-        assert s.feeds.blocked_domains == ()
         assert s.feeds.web_min_avg == pytest.approx(3.0)
         assert s.feeds.pool_min_avg == pytest.approx(4.0)
         assert s.feeds.guides is True
 
-    def test_feeds_min_score_default_written_by_host_no_note(self) -> None:
-        """线上实测：宿主生成 config.toml 时会把 min_score = 0.6 也写进去。
-        默认值不算用户改过，不该每次都在设置页报「已不用」。"""
-        _, problems = settings_of(_raw(feeds={"min_score": 0.6}))
-        assert not any("min_score" in p for p in problems)
-
-    def test_feeds_min_score_legacy_note(self) -> None:
-        """0.3.4 起 min_score 不再使用：显式写了 → 问题清单提示；没写 → 不提示。"""
-        s, problems = settings_of(_raw(feeds={"min_score": 0.8}))
-        assert s.feeds.min_score == 0.8  # 值尊重，但不参与任何筛选
-        assert any("min_score" in p and "已不用" in p for p in problems)
-
     def test_feeds_custom_values(self) -> None:
-        s, _ = settings_of(_raw(feeds={"min_score": 0.8, "max_items": 5, "lookback_days": 30}))
-        assert s.feeds.min_score == 0.8
+        s, _ = settings_of(_raw(feeds={"max_items": 5, "lookback_days": 30}))
         assert s.feeds.max_items == 5
         assert s.feeds.lookback_days == 30
+
+    def test_blocked_domains_key_ignored(self) -> None:
+        """[feeds] blocked_domains 已删：存量的写了也静默忽略；屏蔽名单只读按群 kv。"""
+        s, problems = settings_of(_raw(feeds={"blocked_domains": ["bad.com"]}))
+        assert not hasattr(s.feeds, "blocked_domains")
+        assert all("blocked_domains" not in p for p in problems)
 
     def test_environments_m3_defaults(self) -> None:
         """M3 新增字段：local_mode / run_as / max_parallel / command_timeout_s 默认值。"""
@@ -383,7 +373,6 @@ class TestM2Sections:
         assert problems == []
         assert "[search]" not in example.read_text(encoding="utf-8")  # 搜索走扩展绑定，不进配置文件
         assert s.jev.api_url == "https://api.typesafe.ai/v1/systemone"
-        assert s.feeds.min_score == 0.6
 
     def test_example_toml_uses_new_model_structure(self, plugin_dir: Path) -> None:
         """docs/13 A12：示例必须是新结构（[[endpoints]] + [[model_list]]），不能退回旧 [models] 四槽。"""
@@ -403,7 +392,8 @@ class TestM2Sections:
         assert all(m.endpoint in ep_ids for m in s.model_list)
         # 旧的 [models] 四槽不该再出现在示例里（注释里的迁移说明不算）
         assert "models" not in raw
-        # 示例里不能有看起来像真的账号 / 密钥 / 地址，统一用占位
-        assert s.approval.admins == ("qq:123456789",)
+        # 示例里不能有看起来像真的密钥 / 地址，统一用占位；
+        # 第一位管理员和代码默认对齐（2026-10 docs/18 文档漂移修正）
+        assert s.approval.admins == ("qq:100000001",)
         assert all(e.api_key == "" or "填" in e.api_key for e in s.endpoints)
         assert all("example.com" in e.base_url for e in s.endpoints)

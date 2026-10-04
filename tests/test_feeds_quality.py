@@ -13,7 +13,7 @@
 被筛掉的也入库（rejected=1 + reject_gate/reject_reason），news_view 的管理员版能看到；
 群友视图没有 rejected 一栏。好文走单独的 guides_view（30 天、最多 20 条）。
 
-管理员接口：POST /api/feeds/domains（屏蔽/解除），GET /api/settings 带 feeds 段。
+屏蔽域名接口（2026-10 起按群）：GET/POST /api/groups/{gid}/feeds/domains；GET /api/settings 带 feeds 段。
 """
 
 from __future__ import annotations
@@ -453,8 +453,12 @@ def test_dup_title_rejected(tmp_path) -> None:
 
 
 def test_blocked_domain_config_rejected(tmp_path) -> None:
-    """[feeds] blocked_domains 命中（含子域 / www.）→ 粗筛丢（漏斗记理由），不进库。"""
-    cfg = {"feeds": {"blocked_domains": ["Spam.com"]}}
+    """按群屏蔽名单命中（含子域 / www.）→ 粗筛丢（漏斗记理由），不进库。
+
+    名单 2026-10 起只认 kv["feeds.blocked.<gid>"]（配置里的键已删）。
+    """
+    from CharTyr_MaiWork.maiwork import feeds as _feeds
+
     items = [
         _cand(0, url="https://www.spam.com/x", title="配置屏蔽A"),
         _cand(1, url="https://m.spam.com/y", title="配置屏蔽B（子域）"),
@@ -462,8 +466,9 @@ def test_blocked_domain_config_rejected(tmp_path) -> None:
     ]
     scores = _scores_json(_score(0, topic="唯一话题"))
     store, settings, feeds, models, workers, topics, _ = _make_feeds(
-        tmp_path, items=items, scores=scores, cfg=cfg
+        tmp_path, items=items, scores=scores
     )
+    _feeds.blocked_domains_set(store, GID, ["spam.com"])
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 1
     rows = _rows(store)
@@ -474,14 +479,15 @@ def test_blocked_domain_config_rejected(tmp_path) -> None:
 
 
 def test_blocked_domain_web_rejected(tmp_path) -> None:
-    """kv["feeds.blocked_domains"]（管理员在网页上维护的）也算数。"""
+    """kv["feeds.blocked.<gid>"]（管理员在网页 / 对话上按群维护的）也算数。"""
+    from CharTyr_MaiWork.maiwork import feeds as _feeds
+
     store, settings, feeds, models, workers, topics, _ = _make_feeds(
         tmp_path,
         items=[_cand(0, url="https://bad-web.com/a", title="网页屏蔽")],
         scores="{}",
     )
-    with store.tx() as conn:
-        store.kv_set(conn, "feeds.blocked_domains", ["bad-web.com"])
+    _feeds.blocked_domains_set(store, GID, ["bad-web.com"])
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 0
     assert _rows(store) == []  # 粗筛丢完，连被拒行都不落库
@@ -999,7 +1005,7 @@ def test_auto_blocked_domains_uses_net_down_and_recent_window(tmp_path) -> None:
 
 
 # ----------------------------------------------------------------------
-# 管理员接口：/api/feeds/domains、/api/settings.feeds
+# 屏蔽域名接口（按群）：/api/groups/{gid}/feeds/domains、/api/settings.feeds
 # ----------------------------------------------------------------------
 
 
@@ -1019,7 +1025,7 @@ def _raw_config(data_dir: Path, **over) -> dict:
 
 @pytest_asyncio.fixture
 async def env(tmp_path: Path):
-    raw = _raw_config(tmp_path / "data", feeds={"blocked_domains": ["cfg-bad.com"]})
+    raw = _raw_config(tmp_path / "data")
     ctx = FakeCtx({"config.get": "987654321"})
     app = MaiWorkApp(ctx, raw, plugin_dir=Path(__file__).resolve().parents[1])
     app.profiles_cls = FakeProfiles
@@ -1064,40 +1070,48 @@ async def test_settings_feeds_shape(env) -> None:
     r = await env.client.get("/api/settings")
     assert r.status == 200
     data = await r.json()
-    feeds = data["feeds"]
-    # 2026-09 追加：feeds 段加 rss（{群号: [{id,url,title,enabled,added_ts,last_ok_ts,last_error}]}）
+    from CharTyr_MaiWork.maiwork import feeds as _feeds
+
+    _feeds.blocked_domains_set(env.app.store, G1, ["cfg-bad.com"])
+    r = await env.client.get("/api/settings")
+    feeds = (await r.json())["feeds"]
+    # 2026-10 起按群：blocked_domains / auto_blocked 都是 {群号: [域名...]}
     assert set(feeds.keys()) == {"blocked_domains", "auto_blocked", "rss"}
     assert feeds["rss"] == {G1: []}
-    assert feeds["blocked_domains"] == ["cfg-bad.com"]
-    assert feeds["auto_blocked"] == ["noisy.com"]
+    assert feeds["blocked_domains"] == {G1: ["cfg-bad.com"]}
+    assert feeds["auto_blocked"] == {G1: ["noisy.com"]}
 
 
 @pytest.mark.asyncio
 async def test_feeds_domains_admin_block_unblock(env) -> None:
     await env.client.post("/api/login", json={"password": PASSWORD})
-    # 屏蔽（大小写 / www 会被规范化）
-    r = await env.client.post("/api/feeds/domains", json={"domain": "WWW.Bad-Example.COM", "blocked": True})
+    # GET：初始空名单
+    r = await env.client.get(f"/api/groups/{G1}/feeds/domains")
     assert r.status == 200
-    data = await r.json()
-    assert data["blocked_domains"] == ["bad-example.com", "cfg-bad.com"]
+    assert (await r.json())["blocked_domains"] == []
+    # 屏蔽（大小写 / www 会被规范化）
+    r = await env.client.post(f"/api/groups/{G1}/feeds/domains", json={"domain": "WWW.Bad-Example.COM", "blocked": True})
+    assert r.status == 200
+    assert (await r.json())["blocked_domains"] == ["bad-example.com"]
     # 再来一个
-    r = await env.client.post("/api/feeds/domains", json={"domain": "other.org", "blocked": True})
-    assert (await r.json())["blocked_domains"] == ["bad-example.com", "cfg-bad.com", "other.org"]
-    # 解除（配置里的也能从合并列表里拿掉：kv 覆盖整份列表）
-    r = await env.client.post("/api/feeds/domains", json={"domain": "cfg-bad.com", "blocked": False})
-    data = await r.json()
-    assert data["blocked_domains"] == ["bad-example.com", "other.org"]
-    # settings 里也同步
+    r = await env.client.post(f"/api/groups/{G1}/feeds/domains", json={"domain": "other.org", "blocked": True})
+    assert (await r.json())["blocked_domains"] == ["bad-example.com", "other.org"]
+    # 解除
+    r = await env.client.post(f"/api/groups/{G1}/feeds/domains", json={"domain": "bad-example.com", "blocked": False})
+    assert (await r.json())["blocked_domains"] == ["other.org"]
+    # GET 看得到；settings 里也同步（按群结构）
+    r = await env.client.get(f"/api/groups/{G1}/feeds/domains")
+    assert (await r.json())["blocked_domains"] == ["other.org"]
     r = await env.client.get("/api/settings")
     feeds = (await r.json())["feeds"]
-    assert feeds["blocked_domains"] == ["bad-example.com", "other.org"]
+    assert feeds["blocked_domains"] == {G1: ["other.org"]}
 
 
 @pytest.mark.asyncio
 async def test_feeds_domains_invalid_domain_400(env) -> None:
     await env.client.post("/api/login", json={"password": PASSWORD})
     for bad in ("", "not a domain", "exa mple.com", "a..com", "-bad-.com", "x_com"):
-        r = await env.client.post("/api/feeds/domains", json={"domain": bad, "blocked": True})
+        r = await env.client.post(f"/api/groups/{G1}/feeds/domains", json={"domain": bad, "blocked": True})
         assert r.status == 400, (bad, r.status)
         body = await r.json()
         assert body["error"]
@@ -1108,37 +1122,64 @@ async def test_feeds_domains_member_403_anonymous_401(env) -> None:
     token = env.app.token_of(G1)
     # 群友 → 403
     r = await env.client.post(
-        "/api/feeds/domains", json={"domain": "evil.com", "blocked": True},
+        f"/api/groups/{G1}/feeds/domains", json={"domain": "evil.com", "blocked": True},
         headers={"X-MW-Group": token},
     )
     assert r.status == 403
     # 匿名 → 401
-    r = await env.client.post("/api/feeds/domains", json={"domain": "evil.com", "blocked": True})
+    r = await env.client.post(f"/api/groups/{G1}/feeds/domains", json={"domain": "evil.com", "blocked": True})
     assert r.status == 401
 
 
+@pytest.mark.asyncio
+async def test_feeds_domains_non_served_group_404(env) -> None:
+    await env.client.post("/api/login", json={"password": PASSWORD})
+    r = await env.client.post("/api/groups/999999/feeds/domains", json={"domain": "evil.com", "blocked": True})
+    assert r.status == 404
+    r = await env.client.get("/api/groups/999999/feeds/domains")
+    assert r.status == 404
+
+
+@pytest.mark.asyncio
+async def test_feeds_domains_group_admin_own_group_ok(env) -> None:
+    """本群群管理员可读写本群名单；拿别群 → 403。"""
+    env.app.group_admins.set_password(G1, "群密-abc123")
+    r = await env.client.post("/api/login", json={"password": "群密-abc123"})
+    assert r.status == 200
+    r = await env.client.post(f"/api/groups/{G1}/feeds/domains", json={"domain": "evil.com", "blocked": True})
+    assert r.status == 200, await r.json()
+    r = await env.client.get(f"/api/groups/{G1}/feeds/domains")
+    assert (await r.json())["blocked_domains"] == ["evil.com"]
+    # 不存在的群 → 拿群管理员身份打也一样 404（先查群存不存在，跟其他按群端点同一口径）
+    r = await env.client.post("/api/groups/999999/feeds/domains", json={"domain": "x.com", "blocked": True})
+    assert r.status == 404, r.status
+
+# 7) config 默认/规范化用例跟着字段删
+
+
+
 # ----------------------------------------------------------------------
-# config 0.3.4：默认值 & min_score 提示
+# config 0.3.4：默认值
 # ----------------------------------------------------------------------
 
 
 def test_config_defaults_quality_settings() -> None:
     settings, problems = load_settings({})
     assert settings.feeds.max_items == 10
-    assert tuple(settings.feeds.blocked_domains) == ()
+    # blocked_domains 已删（2026-10 docs/18 第一步）：写了也静默忽略，屏蔽名单看按群 kv
+    assert not hasattr(settings.feeds, "blocked_domains")
+    _, problems2 = load_settings({"feeds": {"blocked_domains": ["bad.com"]}})
+    assert problems2 == []
     assert settings.feeds.guides is True
     assert settings.feeds.web_min_avg == pytest.approx(3.0)
     assert settings.feeds.pool_min_avg == pytest.approx(4.0)
     assert tuple(int(x) for x in CONFIG_VERSION.split(".")) >= (0, 3, 9)  # 0.3.5 起含 railway 实测配置；0.3.8 起含关注成员个人向产出；0.3.9 起含模型重试设置
-    # min_score 还在（兼容）；显式写了 → 问题清单提示不再用它
-    assert hasattr(settings.feeds, "min_score")
+    # 死键 min_score 已删（2026-10 docs/18 第一步）：写了也静默忽略
+    assert not hasattr(settings.feeds, "min_score")
     _, problems2 = load_settings({"feeds": {"min_score": 0.8}})
-    assert any("min_score" in p and "不" in p for p in problems2)
+    assert problems2 == []
 
 
-def test_config_blocked_domains_normalized() -> None:
-    settings, _problems = load_settings({"feeds": {"blocked_domains": ["Spam.com", "WWW.evil.org"]}})
-    assert set(settings.feeds.blocked_domains) == {"spam.com", "evil.org"}
 
 
 def _free_port() -> int:

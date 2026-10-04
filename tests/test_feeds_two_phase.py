@@ -545,10 +545,16 @@ def test_per_focus_floor_triggers_code_searches(tmp_path) -> None:
     ]
     with _TimePatch():
         _run(feeds.prepare_news(GID))
-    # 三个方向各回退搜 1 次（days=7），再各被保底补 1 次主家（days=7；配自检探测那条不算）
+    # 三个方向各回退搜 1 次（days=7），再各被保底补 1 次主家（days=7；配自检探测那条不算）；
+    # 「FPGA 新动态」按代码兜底算国际方向（名字带英文词）且问法全中文 → 额外补 1 次英文（=7 主家搜）。
     real_calls = [c for c in search.calls if c[0] != "__配置自检__"]
-    assert len(real_calls) == 3 + 3, search.calls
+    assert len(real_calls) == 3 + 3 + 1, search.calls
     assert all(call[2] == 7 for call in real_calls)
+    # 补的英文搜索用的是方向的英文名（纯英文、无汉字）
+    qs = [str(c[0]) for c in real_calls]
+    english_patches = [q for q in qs if any("a" <= ch <= "z" or "A" <= ch <= "Z" for ch in q)
+                       and not any("一" <= ch <= "鿿" for ch in q)]
+    assert english_patches == ["FPGA"], qs
     # 撒网多一家：每个饿着的方向也用 search_with 各补一次
     assert len(search.with_calls) >= 3
     assert all(name == "extra" for name, *_ in search.with_calls)
@@ -592,7 +598,7 @@ def test_prefilter_drops_stored_blocked_old_and_near_dup(tmp_path) -> None:
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path)
     with _TimePatch():
         with store.tx() as conn:
-            store.kv_set(conn, "feeds.blocked_domains", ["bad.example"])
+            store.kv_set(conn, f"feeds.blocked.{GID}", ["bad.example"])
             cur = conn.execute(
                 "INSERT INTO news_batches (group_id, slot_ts, found, kept, skipped, note, created)"
                 " VALUES (?, ?, 1, 1, 0, '', ?)",
@@ -1033,7 +1039,7 @@ def test_focus_prompt_saturated_topics_and_blocked_listed(tmp_path) -> None:
     """话题饱和提示 + 屏蔽名单（手动+自动）都进定关注点提示词。"""
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path)
     with store.tx() as conn:
-        store.kv_set(conn, "feeds.blocked_domains", ["spam-news.example"])
+        store.kv_set(conn, f"feeds.blocked.{GID}", ["spam-news.example"])
     with _TimePatch():
         _run(feeds._plan_focus(GID, settings))
     prompt = models.calls[0][1][0]["content"]

@@ -3,7 +3,20 @@
 设计依据 docs/02-设计.md §6：
 - 每条通知记 待发(pending)/发送中(sending)/已发(sent)/不确定(uncertain)/失败(failed)，
   按 key（对象+版本+事件类型+目标群）去重。发送超时标 uncertain 不盲目重发；
-  群文件上传不幂等，绝不自动重试。
+  群文件上传不幂等，绝不自动重试；文本 / 图片这类「重发一次也不会更糟」的推送，
+  非超时的安全失败自动重试一次（attempts 与下次时间都落库，重启后接着算，不重复发）。
+- 四种载荷：text（可选 reply_to / at_user / at_name）、file（群文件）、image（PNG 文件，
+  严格路径闸：非符号链接、resolve 后在工作区根下、大小与类型按内容判）、herenow（网页）。
+- 发送前再查一遍：这个群还在服务名单里吗、这条推送的每群开关还开着吗（关了直接作废，
+  不发陈旧的）、睡觉时段与每日总上限（group_push 一份数据，**按这个群**那份算；
+  读不到就只延 5 分钟再试，绝不按默认钟点误停到明天）。失败不占额度、不算已发；
+  结果不明（uncertain）安全保留额度，网页视图也绝不写成「已发」。
+- 自动消息（开场白 / 资讯卡片 / 构想提一嘴）的载荷带 `expires_ts`：过了期限还没发出去
+  的那条直接作废，不把陈旧内容发进群。生产者还能挂 `add_preflight_hook`（同步、纯代码、
+  generic 发件箱不替它读群 / 不调模型）做发送前新鲜度复核：开场白排队 / 重试期间群里又
+  有人说话了，就不再当成冷场开口（Topics.on_before_send）。
+- 发送结果统一走结果 hook（add_result_hook）：生产者（冷场开场白 / 资讯卡片 / 构想提一嘴）
+  只负责 enqueue，真正发出去（或失败 / 不确定 / 作废）之后才回写自己的表。
 - 普通交付也受日限额/睡觉时段约束；群友以 /mw 领取 <任务号> 明确索取时，
   仅把待发的本任务成品标 awaited_delivery，不受两项节制、不占额度；
   error / command / admin 即时反馈也不受限。
@@ -28,8 +41,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from . import clock
-from .delivery import Mentions, Pushes
+from . import clock, group_push
+from .delivery import UNREADABLE_REASON, Mentions, Pushes
 from .host import HostError
 from .models import _redact
 from .store import Store
@@ -41,11 +54,43 @@ _ERR_MAX = 300
 _DEDUP_WINDOW_S = 600  # report_error 同群同指纹 10 分钟一次
 _DELIVERY_NOTE_SUFFIXES = (":note", ":webonly")
 
+# 失败的发送：能安全重发的 kind + 有界重试（首发 + 一次）
+_RETRY_SAFE_KINDS = frozenset(("text", "image"))
+_MAX_ATTEMPTS = 2
+_RETRY_DELAY_S = 300.0
+_DROP_REASON = "开关已关"
+# 读不到本群那份设置时的推迟步长（秒）：只延 5 分钟再试，绝不按默认钟点误停到明天
+_POSTPONE_RETRY_S = 300.0
+# 自动消息过了 payload.expires_ts 还没发出去 → 作废（不发陈旧内容）
+_TTL_EXPIRED_REASON = "超过有效期限，作废"
+
+# 图片载荷的严格闸（docs/02 §6.5：发进群的东西必须在工作区里、是真 PNG）
+_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+class OutboxPayloadError(HostError):
+    """这条载荷本身不合法（路径 / 类型 / 大小）：重试多少次都一样，直接判失败。"""
+
 
 def _is_artifact_outbox_row(kind: str, key: str) -> bool:
     """真实交付项；失败兜底告知和后续说明都不算成品。"""
     return ((kind in ("file", "herenow") and not key.endswith(_DELIVERY_NOTE_SUFFIXES))
             or (kind == "text" and key.endswith(":deliver:text")))
+
+
+def _ttl_expired(payload: dict, now: float) -> str:
+    """自动消息的 payload.expires_ts 过了吗；过了返回作废原因（没有期限 → ""）。"""
+    raw = (payload or {}).get("expires_ts")
+    if raw is None:
+        return ""
+    try:
+        expires = float(raw)
+    except (TypeError, ValueError):
+        return ""
+    if expires <= 0:
+        return ""
+    return _TTL_EXPIRED_REASON if float(now) > expires else ""
 
 _API_KEY_RE = re.compile(r"(?i)(api[_-]?key\s*[=:]\s*)\S+")
 _TOKEN_RE = re.compile(r"\b[A-Za-z0-9_\-]{32,}\b")
@@ -75,6 +120,41 @@ class Outbox:
         # 提问回执（docs/02 §7.2）：key 以 "ask:" 开头的 text 发送成功后，
         # 把 QQ 消息 ID 交给 app 回写任务的 question_msg_id（回复那条提问 → 恢复任务）
         self._ask_hook: Any = None
+        # 发送结果回调（0.8.0 归一）：生产者自己挂上来，真发出去之后才回写自己的表。
+        # 见 add_result_hook；出错的 hook 只记日志，绝不影响发送。
+        self._result_hooks: list[Any] = []
+        # 发送前新鲜度检查（0.8.0 收口）：生产者自己挂上来，同步、纯代码；
+        # 见 add_preflight_hook。generic 发件箱不读群消息、不调模型。
+        self._preflight_hooks: list[Any] = []
+        # 并发收口（2026-10 复审）：同一实例的 flush 串行（asyncio 锁）；
+        # 不同实例 / 跨进程靠 `_claim` 的数据库 CAS（status='pending' 条件）兜底。
+        self._flush_lock: Optional[asyncio.Lock] = None
+        self._flush_lock_loop: Any = None
+
+    def add_result_hook(self, hook: Any) -> None:
+        """挂发送结果回调（可挂多个）：fn(info) -> None。
+
+        info = {outbox_id, key, group_id, kind, push_kind, payload, task_id,
+                outcome, error, result, ts}（ts = 这一轮 flush 的时间）
+        outcome ∈ sent / uncertain / failed / retrying / dropped（retrying = 已排一次自动重试）。
+        生产者据此把「真的发出去了」写回自己的表——只 enqueue 不算发过。
+        """
+        if callable(hook):
+            self._result_hooks.append(hook)
+
+    def add_preflight_hook(self, hook: Any) -> None:
+        """挂发送前的**新鲜度**检查（可挂多个）：fn(info) -> Optional[str]。
+
+        在真正发送之前（还没抢 sending）同步调用一次；`info` 和 add_result_hook 的
+        形状一样，外加 `now`（这一轮 flush 的时间）。返回空（None / ""）= 放行；
+        返回原因字符串 = 这条已经不再新鲜，作废（dropped），绝不发陈旧内容。
+
+        约定：同步、纯代码——生产者可以在里面读**自己**那份数据（比如本群最后消息
+        时刻），但 generic 发件箱不替它读群消息、不调模型。hook 抛异常 → 失败关闭
+        （作废），宁可少发一条，不可放任陈旧内容发进群。
+        """
+        if callable(hook):
+            self._preflight_hooks.append(hook)
 
     def set_group_file_hook(self, hook: Any) -> None:
         """挂群文件上传成功登记回调（fn(group_id, file_id, name, task_id)）。"""
@@ -195,10 +275,10 @@ class Outbox:
         ).fetchall()
 
     def _set(self, oid: int, *, status: str, error: str = "", result: Optional[dict] = None,
-             not_before: Optional[float] = None) -> None:
+             not_before: Optional[float] = None, moment: Optional[float] = None) -> None:
         with self._store.tx() as conn:
             fields = ["status=?", "error=?", "updated=?"]
-            params: list[Any] = [status, error, clock.now()]
+            params: list[Any] = [status, error, float(moment) if moment is not None else clock.now()]
             if result is not None:
                 fields.append("result=?")
                 params.append(json.dumps(result, ensure_ascii=False))
@@ -208,25 +288,144 @@ class Outbox:
             params.append(int(oid))
             conn.execute(f"UPDATE outbox SET {', '.join(fields)} WHERE id=?", params)
 
-    def _postpone(self, oid: int, group_id: str, reason: str, now: float) -> None:
-        """推到睡觉时段结束 / 明天 00:00（取更近的），原因写 error，状态仍 pending。"""
-        settings = self._get_settings()
-        quiet = getattr(settings.delivery, "quiet_hours", "") or "23:00-08:00"
+    def _claim(self, oid: int, *, moment: Optional[float] = None) -> int:
+        """pending → sending 的数据库 CAS：抢到返回累计尝试次数，抢不到返回 0。
+
+        `WHERE id=? AND status='pending' AND not_before<=?`：另一个 flush（同一／
+        另一个实例、另一个进程）已经把它改成 sending / sent / uncertain，或还没到点，
+        都命中 0 行——调用方据此**明确跳过**，不发、不记账、不触发 hook。
+
+        先落库再执行（崩了 recover 能捡到）；attempts 与状态一次事务写完，重启后接着算，
+        不会出现「已经试过两次却还当成首发」这种重复发。
+        """
+        now = float(moment) if moment is not None else clock.now()
+        with self._store.tx() as conn:
+            cur = conn.execute(
+                "UPDATE outbox SET status='sending', attempts=attempts+1, updated=?"
+                " WHERE id=? AND status='pending' AND not_before<=?",
+                (now, int(oid), now),
+            )
+            if int(cur.rowcount or 0) != 1:
+                return 0
+            row = conn.execute("SELECT attempts FROM outbox WHERE id=?", (int(oid),)).fetchone()
+        return int(row["attempts"]) if row is not None else 0
+
+    def _fire_result(self, row: Any, payload: dict, *, outcome: str,
+                     error: str = "", result: Optional[dict] = None,
+                     now: Optional[float] = None) -> None:
+        """把发送结果交给生产者（挂上来的 hook）；任何 hook 出错都只记日志。"""
+        if not self._result_hooks or row is None:
+            return
         try:
-            s, e = clock.parse_hhmm_range(quiet)
-        except (ValueError, AttributeError):
-            s, e = 0, 0
-        nb: float
-        if reason == "睡觉时段" and s != e:
+            info = {
+                "outbox_id": int(row["id"]),
+                "key": str(row["key"]),
+                "group_id": str(row["group_id"]),
+                "kind": str(row["kind"]),
+                "push_kind": str((payload or {}).get("push_kind") or ""),
+                "payload": dict(payload or {}),
+                "task_id": row["task_id"],
+                "outcome": str(outcome),
+                "error": str(error or ""),
+                "result": dict(result or {}),
+                # 这一轮 flush 的时间：生产者回写时间戳用它，跟发件箱记额度算的是同一天
+                "ts": float(now) if now is not None else clock.now(),
+            }
+        except Exception:
+            logger.exception("组装发送结果失败（发件 %s）", row["id"] if "id" in row.keys() else "?")
+            return
+        for hook in list(self._result_hooks):
+            try:
+                hook(info)
+            except Exception:
+                logger.exception("发送结果 hook 出错（key=%s，outcome=%s）", info["key"], outcome)
+
+    def _quiet_hours_of(self, group_id: str) -> tuple[str, bool]:
+        """这个群那份睡觉时段（group_push 真源）；读不到 → ("", False)。"""
+        try:
+            settings = self._get_settings()
+        except Exception:
+            logger.debug("读配置失败（推迟时间按 5 分钟后重试，群 %s）", group_id, exc_info=True)
+            return "", False
+        if settings is None:
+            return "", False
+        try:
+            cfg = group_push.get_config(self._store, str(group_id), settings)
+        except Exception:
+            logger.debug("读每群推送设置失败（群 %s），推迟时间按 5 分钟后重试", group_id,
+                         exc_info=True)
+            return "", False
+        quiet = str((cfg or {}).get("quiet_hours") or "")
+        return (quiet, True) if quiet else ("", False)
+
+    def _postpone_soon(self, oid: int, reason: str, now: float, why: str) -> None:
+        """读不到可信设置：只延 5 分钟再试，不猜钟点（绝不停到明天）。"""
+        self._set(oid, status="pending", error=f"推迟：{reason}（{why}，5 分钟后再试）",
+                  not_before=float(now) + _POSTPONE_RETRY_S, moment=now)
+
+    def _preflight(self, row: Any, payload: dict, now: float) -> str:
+        """发送前新鲜度检查：返回非空原因 = 作废。hook 出错 → 失败关闭（作废）。"""
+        if not self._preflight_hooks or row is None:
+            return ""
+        try:
+            info = {
+                "outbox_id": int(row["id"]),
+                "key": str(row["key"]),
+                "group_id": str(row["group_id"]),
+                "kind": str(row["kind"]),
+                "push_kind": str((payload or {}).get("push_kind") or ""),
+                "payload": dict(payload or {}),
+                "task_id": row["task_id"],
+                "now": float(now),
+            }
+        except Exception:
+            logger.exception("组装发送前检查材料失败（发件 %s），按不新鲜作废",
+                             row["id"] if "id" in row.keys() else "?")
+            return "发送前检查材料拼不出来，作废"
+        for hook in list(self._preflight_hooks):
+            try:
+                reason = hook(info)
+            except Exception:
+                logger.exception("发送前检查出错（key=%s），按不新鲜作废", info["key"])
+                return "发送前检查出错，作废"
+            if reason:
+                return str(reason)
+        return ""
+
+    def _postpone(self, oid: int, group_id: str, reason: str, now: float) -> None:
+        """推到睡觉时段结束 / 明天 00:00（取更近的），原因写 error，状态仍 pending。
+
+        睡觉时段用**这个群**那份（group_push）：每个群的醒来钟点可以不一样，
+        绝不能拿全局 `delivery.quiet_hours` 的默认钟点去算（会把某些群误停到明天）。
+        读不到那份设置 → 只延 5 分钟再试。
+        """
+        now = float(now)
+        reason_s = str(reason or "推送节制")
+        if reason_s == "睡觉时段":
+            quiet, known = self._quiet_hours_of(group_id)
+            if not known:
+                self._postpone_soon(oid, reason_s, now, "读不到设置")
+                return
+            try:
+                s, e = clock.parse_hhmm_range(quiet)
+            except (ValueError, AttributeError):
+                s, e = 0, 0
+            if s == e:
+                self._postpone_soon(oid, reason_s, now, "睡觉时段配错")
+                return
             t = clock.bj(now)
             end = t.replace(hour=e // 60, minute=e % 60, second=0, microsecond=0)
             if end.timestamp() <= now:
                 end = end + timedelta(days=1)
-            nb = end.timestamp()
-        else:
-            t = clock.bj(now)
-            nb = t.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() + 86400.0
-        self._set(oid, status="pending", error=f"推迟：{reason}", not_before=nb)
+            self._set(oid, status="pending", error=f"推迟：{reason_s}",
+                      not_before=end.timestamp(), moment=now)
+            return
+        if reason_s == UNREADABLE_REASON:
+            self._postpone_soon(oid, reason_s, now, "读不到设置")
+            return
+        t = clock.bj(now)
+        nb = t.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() + 86400.0
+        self._set(oid, status="pending", error=f"推迟：{reason_s}", not_before=nb, moment=now)
 
     def _session_for_group(self, group_id: str) -> str:
         row = self._store.read().execute(
@@ -263,6 +462,46 @@ class Outbox:
             raise HostError(f"群文件路径不在工作区根目录下，不传：{raw_path}")
         return resolved
 
+    def _check_image_path(self, raw_path: str) -> Path:
+        """图片发送前检查：不能是符号链接、resolve 后必须在 workspace_root 下、是普通文件、
+        大小在 1 字节 ~ 8MB 之间、按内容（PNG 魔数）判类型。
+
+        不合法抛 OutboxPayloadError（中文）：这种错误重试多少次都一样，直接判失败，
+        不浪费那次自动重试。
+        """
+        text = str(raw_path or "").strip()
+        if not text:
+            raise OutboxPayloadError("图片条目没写路径，不发")
+        p = Path(text)
+        if p.is_symlink():
+            raise OutboxPayloadError(f"图片路径是符号链接，不发：{text}")
+        try:
+            resolved = p.resolve()
+        except OSError as e:
+            raise OutboxPayloadError(f"图片路径解析失败：{text}（{e}）") from None
+        try:
+            root = Path(getattr(self._get_settings(), "workspace_root", "")).resolve()
+        except Exception:
+            root = Path("").resolve()
+        if resolved != root and root not in resolved.parents:
+            raise OutboxPayloadError(f"图片路径不在工作区根目录下，不发：{text}")
+        if not resolved.is_file():
+            raise OutboxPayloadError(f"图片不是普通文件（或不存在），不发：{text}")
+        try:
+            size = resolved.stat().st_size
+        except OSError as e:
+            raise OutboxPayloadError(f"图片读不到大小：{text}（{e}）") from None
+        if size <= 0 or size > _IMAGE_MAX_BYTES:
+            raise OutboxPayloadError(f"图片大小不合适（{size} 字节，上限 {_IMAGE_MAX_BYTES}），不发")
+        try:
+            with resolved.open("rb") as fh:
+                head = fh.read(len(_PNG_MAGIC))
+        except OSError as e:
+            raise OutboxPayloadError(f"图片读不出来：{text}（{e}）") from None
+        if head != _PNG_MAGIC:
+            raise OutboxPayloadError(f"图片不是 PNG（按内容判），不发：{text}")
+        return resolved
+
     async def _execute(self, row: Any) -> dict:
         """执行一条；成功返回 result dict；失败抛异常。"""
         kind = row["kind"]
@@ -270,10 +509,29 @@ class Outbox:
         gid = row["group_id"]
         if kind == "text":
             session_id = self._session_for_group(gid)
+            # at 透传：群里有真正的 @（Telegram 由 host 退成正文「@名字 」）。
+            # 空的时候不传这两个参数，保持老调用形状（只想发一条普通文字时不多给参数）。
+            extra = {}
+            at_user = str(payload.get("at_user") or "")
+            at_name = str(payload.get("at_name") or "")
+            if at_user or at_name:
+                extra = {"at_user": at_user, "at_name": at_name}
             res = await self._host.send_text(
                 session_id,
                 str(payload.get("text") or ""),
                 reply_to=str(payload.get("reply_to") or ""),
+                **extra,
+            )
+            return {"message_id": str(getattr(res, "message_id", "") or "")}
+        if kind == "image":
+            safe = self._check_image_path(str(payload.get("path") or ""))
+            try:
+                data = safe.read_bytes()
+            except OSError as e:
+                raise OutboxPayloadError(f"图片读不出来：{safe}（{e}）") from None
+            session_id = self._session_for_group(gid)
+            res = await self._host.send_image(
+                session_id, data, text=str(payload.get("text") or "")
             )
             return {"message_id": str(getattr(res, "message_id", "") or "")}
         if kind == "file":
@@ -309,7 +567,9 @@ class Outbox:
                     f"{key}:note",
                     gid,
                     "text",
-                    {"text": note, "push_kind": follow_kind},
+                    # follow_up_of：这条是同一件交付自动补的说明，不是新的一次主动推送
+                    # （不占第二份额度、也不再过一遍推送闸）
+                    {"text": note, "push_kind": follow_kind, "follow_up_of": int(row["id"])},
                     task_id=tid,
                 )
             text = f"刚在群里发了文件「{name}」，有人问起可以告诉他：{note}" if note \
@@ -328,7 +588,7 @@ class Outbox:
                     f"{key}:note",
                     gid,
                     "text",
-                    {"text": text_out, "push_kind": follow_kind},
+                    {"text": text_out, "push_kind": follow_kind, "follow_up_of": int(row["id"])},
                     task_id=tid,
                 )
             memo = f"刚在群里发了网页链接 {url}"
@@ -493,24 +753,43 @@ class Outbox:
             except Exception:
                 logger.exception("补交付说明/备忘失败（发件 %s），下轮再试", row["id"])
 
+    def _lock(self) -> asyncio.Lock:
+        """本实例的 flush 锁：按当前事件循环懒建（换循环就换一把，避免跨循环复用）。"""
+        loop = asyncio.get_running_loop()
+        if self._flush_lock is None or self._flush_lock_loop is not loop:
+            self._flush_lock = asyncio.Lock()
+            self._flush_lock_loop = loop
+        return self._flush_lock
+
     async def flush(self, now: float, *, allowed_groups: Any = None) -> None:
         """把到期（not_before≤now）的 pending 逐条处理。后台循环调。
 
         allowed_groups：只发这些群的（None = 现查 settings.is_served）。
         非服务群的 pending 留在原地（由 app 的回收逻辑标 cancelled，不删数据）——
         非服务群零发送是红线。
+
+        并发（2026-10 复审）：同一实例的 flush 串行（asyncio 锁）；跨实例 / 跨进程
+        由 `_claim` 的数据库 CAS 兜底——同一个 key 全场只发一次。
         """
-        now = float(now)
+        async with self._lock():
+            await self._flush_locked(float(now), allowed_groups=allowed_groups)
+
+    async def _flush_locked(self, now: float, *, allowed_groups: Any = None) -> None:
         if allowed_groups is None:
             try:
                 settings = self._get_settings()
                 allowed_groups = set(getattr(settings, "groups", {}) or {})
             except Exception:
+                # 读配置失败：一个群都不发（也不 seed），不猜服务群
+                logger.debug("读配置失败（flush 本轮不发任何群）", exc_info=True)
                 allowed_groups = set()
         served = {str(g) for g in allowed_groups}
         self._repair_sent_followups(served)
+        # 抢不到（CAS 0 行）的行：这一轮不再碰，避免反复重试同一行
+        skipped: set[int] = set()
         while True:
-            rows = [r for r in self._due_rows(now) if str(r["group_id"]) in served]
+            rows = [r for r in self._due_rows(now)
+                    if str(r["group_id"]) in served and int(r["id"]) not in skipped]
             if not rows:
                 return
             row = rows[0]
@@ -522,26 +801,73 @@ class Outbox:
             except Exception:
                 payload = {}
             push_kind = str(payload.get("push_kind") or "delivery")
+            # 同一件交付自动补的说明（file → note）：跟着已经出去的那条走，
+            # 不占第二份额度、也不再过一遍闸（不然说明会被推到第二天）。
+            follow_up = bool(payload.get("follow_up_of"))
 
-            # 单一节制入口：明确领取与故障/指令的豁免由 Pushes 决定。
-            ok_push, reason = self._pushes.can_push(gid, push_kind, now)
-            if not ok_push:
-                self._postpone(oid, gid, reason or "推送节制", now)
+            # 自动消息的期限：到点还没发出去（睡觉时段 / 每日上限推迟了几天）就作废，
+            # 绝不把陈旧的开场白 / 资讯卡片 / 提一嘴发进群。
+            ttl_reason = _ttl_expired(payload, now)
+            if ttl_reason:
+                self._set(oid, status="dropped", error=f"作废：{ttl_reason}", moment=now)
+                self._fire_result(_row_after(self._store, oid), payload,
+                                  outcome="dropped", error=ttl_reason, now=now)
                 continue
 
-            # 先落库 sending，再执行（崩了 recover 能捡到）
-            self._set(oid, status="sending")
+            # 生产者自己的新鲜度检查（打开场白：排队期间群里又有人说话 → 作废）。
+            stale_reason = self._preflight(row, payload, now)
+            if stale_reason:
+                self._set(oid, status="dropped", error=f"作废：{stale_reason}", moment=now)
+                self._fire_result(_row_after(self._store, oid), payload,
+                                  outcome="dropped", error=stale_reason, now=now)
+                continue
+
+            # 单一节制入口：明确领取与故障/指令的豁免由 Pushes 决定；
+            # 每群开关也在这里查（待发期间关开关 → 直接作废，不发陈旧的）。
+            if not follow_up:
+                ok_push, reason = self._pushes.can_push(gid, push_kind, now)
+                if not ok_push:
+                    if reason == _DROP_REASON:
+                        self._set(oid, status="dropped", error=f"作废：{reason}", moment=now)
+                        self._fire_result(_row_after(self._store, oid), payload,
+                                          outcome="dropped", error=reason, now=now)
+                        continue
+                    self._postpone(oid, gid, reason or "推送节制", now)
+                    continue
+
+            # 先落库 sending（CAS：只有仍是 pending 且到点的行才抢得到），再执行（崩了 recover 能捡到）
+            attempts = self._claim(oid, moment=now)
+            if attempts <= 0:
+                # 另一个 flush / 另一个发件箱实例已经把它拿走或改过状态：明确跳过，
+                # 不发、不记账、不触发结果 hook（同一 key 全场只发一次）
+                logger.debug("发件 %s 已被其它 flush 抢先处理，本轮跳过", oid)
+                skipped.add(oid)
+                continue
             try:
                 result = await self._execute(row)
             except Exception as exc:
+                err = _redact(str(exc), [])
                 if self._is_timeout(exc):
-                    self._set(oid, status="uncertain", error=_redact(str(exc), []))
-                else:
-                    self._set(oid, status="failed", error=_redact(str(exc), []))
-                    if kind in ("file", "herenow"):
-                        self._enqueue_fallback(_row_after(self._store, oid))
+                    # 超时：可能已经发出去了，绝不重发
+                    self._set(oid, status="uncertain", error=err, moment=now)
+                    self._fire_result(_row_after(self._store, oid), payload,
+                                      outcome="uncertain", error=err, now=now)
+                    continue
+                if (kind in _RETRY_SAFE_KINDS and not isinstance(exc, OutboxPayloadError)
+                        and attempts < _MAX_ATTEMPTS):
+                    # 安全失败（不是超时、载荷也没毛病）：有界地重试一次
+                    self._set(oid, status="pending", error=f"发送失败，稍后重试一次：{err}",
+                              not_before=now + _RETRY_DELAY_S, moment=now)
+                    self._fire_result(_row_after(self._store, oid), payload,
+                                      outcome="retrying", error=err, now=now)
+                    continue
+                self._set(oid, status="failed", error=err, moment=now)
+                if kind in ("file", "herenow"):
+                    self._enqueue_fallback(_row_after(self._store, oid))
+                self._fire_result(_row_after(self._store, oid), payload,
+                                  outcome="failed", error=err, now=now)
                 continue
-            self._set(oid, status="sent", result=result)
+            self._set(oid, status="sent", result=result, moment=now)
             fresh = _row_after(self._store, oid)
             # 提问回执：ask:{task_id}:{attempt} 的提问发出去了，把 QQ 消息 ID 交回
             # （回复那条提问 → 恢复 waiting_input / shelved 任务；app 挂了钩子才有动作）
@@ -562,14 +888,21 @@ class Outbox:
                         )
                 except Exception:
                     logger.exception("群文件登记 hook 出错（群 %s），不影响发送", gid)
-            try:
-                self._pushes.record(gid, push_kind, str(payload.get("text") or payload.get("note") or kind), now)
-            except Exception:
-                logger.exception("pushes.record 失败")
+            if not follow_up:
+                try:
+                    self._pushes.record(
+                        gid, push_kind,
+                        str(payload.get("text") or payload.get("note") or kind), now,
+                    )
+                except Exception:
+                    logger.exception("pushes.record 失败")
             try:
                 self._after_sent(_RowWithResult(fresh, result), payload)
             except Exception:
                 logger.exception("交付后续动作失败（说明/备忘）")
+            # 真的发出去了：生产者（开场白 / 资讯卡片 / 构想提一嘴）在这里回写自己的表
+            self._fire_result(_RowWithResult(fresh, result), payload, outcome="sent",
+                              result=result, now=now)
 
     # ------------------------------------------------------------------
     # retry / recover / cancel_group_pending
@@ -872,6 +1205,7 @@ class Delivery:
         "sent": "已发",
         "uncertain": "不确定",
         "failed": "失败",
+        "dropped": "已作废",
         "cancelled": "已取消",
     }
     def delivery_records(self, task_id: str) -> list[dict]:

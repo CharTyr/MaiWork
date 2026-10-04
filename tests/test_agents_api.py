@@ -1,4 +1,4 @@
-"""专岗 API 测试（契约 A 的 server.py 部分）：/api/agents* 与 /api/groups/{gid}/agents*。
+"""专岗 API 测试（server.py 部分）：/api/agents* 与 /api/groups/{gid}/agents*。
 
 起真 aiohttp 服务器；svc 用轻量假对象（真实 Store + 真 Agents），登录走真 ConsoleAuth
 （config 密码路径：settings.console.password）。
@@ -7,8 +7,9 @@
 - /api/agents GET/PUT 只给总管理员（匿名 401）。
 - PUT 严格：未知字段 400、布尔严格 400、超长 400、未知 kind 400；同源 guard（跨源 403）。
 - /api/groups/{gid}/agents GET：管理员或本群 group_admin；成员 403，匿名 401，非服务群 404。
-- GET 快照含四种岗位（task 也在：notes='' / learned=[] / 只有 recent_handoffs）。
-- PUT memory notes：news 能写（返回 memory），task 拒绝 400；超长 / 非字符串 400。
+- GET 快照保留 kind/title/enabled/learned/recent_handoffs；learned 是只读的「最近做过的」。
+  notes/lessons/skills 挪走（工作册进 /api/groups/{gid}/rules，skill 走 /skills）。
+- PUT memory notes / lessons* 老路径 2026-10-03 收尾全部退役 → 一律 404。
 - handoffs 列表：kind 过滤 / 有界 / 跨群不行。
 - svc.agents 缺位 → 503。
 """
@@ -173,11 +174,11 @@ class TestGlobalAgentsApi:
         assert r.status == 400
 
     @pytest.mark.asyncio
-    async def test_put_main_rejects_memory_write_via_group_route(self, env) -> None:
-        """main 没有工作册；/api/groups/{gid}/agents/{kind}/memory 一律 400。"""
+    async def test_put_main_memory_route_gone_404(self, env) -> None:
+        """「每群三份」收尾：工作册（set_notes）废弃、路由退役——老路径一律 404。"""
         await env.login()
         r = await env.client.put(f"/api/groups/{G1}/agents/main/memory", json={"notes": "x"})
-        assert r.status == 400
+        assert r.status == 404
 
 
     @pytest.mark.asyncio
@@ -292,10 +293,11 @@ class TestGroupAgentsApi:
         assert kinds == ["news", "idea", "goal", "task"]
         for a in data["agents"]:
             assert "kind" in a and "title" in a
-            assert "notes" in a and "learned" in a and "recent_handoffs" in a
-        task = next(a for a in data["agents"] if a["kind"] == "task")
-        assert task["notes"] == ""
-        assert task["learned"] == []
+            assert "enabled" in a and "recent_handoffs" in a
+            assert isinstance(a.get("learned"), list)  # 只读工作记录仍供网页展示
+            # 「每群三份」收尾：已迁走的字段不该再出现
+            for gone in ("notes", "lessons", "lessons_state", "skills", "skills_state"):
+                assert gone not in a, f"{a['kind']} 还带已迁走字段 {gone}"
 
     @pytest.mark.asyncio
     async def test_get_cross_group_with_admin_ok(self, env) -> None:
@@ -327,106 +329,56 @@ class TestGroupAgentsApi:
         assert r.status == 503
 
 
-class TestGroupMemoryApi:
+class TestGroupMemoryApiGone:
+    """「每群三份」收尾 2026-10-03：PUT /api/groups/{gid}/agents/{kind}/memory 退役——
+    工作册（agent_memory_notes）已废，老路由一律 404；数据进本群规矩（路由换成
+    /api/groups/{gid}/rules），调用方校验由新接口担（另有 test_group_rules_and_skills_api）。"""
+
     @pytest.mark.asyncio
-    async def test_put_notes(self, env) -> None:
+    async def test_put_memory_gone_404(self, env) -> None:
         await env.login()
         r = await env.client.put(f"/api/groups/{G1}/agents/news/memory", json={"notes": "爱看硬件"})
-        assert r.status == 200
-        data = await r.json()
-        assert data["notes"] == "爱看硬件"
-        # 真的写进去了
-        assert env.agents.memory(G1, "news")["notes"] == "爱看硬件"
+        assert r.status == 404
 
     @pytest.mark.asyncio
-    async def test_put_notes_task_rejected(self, env) -> None:
-        """task 岗位没记忆可写。"""
+    async def test_put_memory_task_gone_404(self, env) -> None:
         await env.login()
         r = await env.client.put(f"/api/groups/{G1}/agents/task/memory", json={"notes": "x"})
-        assert r.status == 400
+        assert r.status == 404
 
     @pytest.mark.asyncio
-    async def test_put_notes_too_long(self, env) -> None:
-        await env.login()
-        r = await env.client.put(f"/api/groups/{G1}/agents/news/memory", json={"notes": "x" * 2001})
-        assert r.status == 400
+    async def test_put_memory_anonymous_also_404(self, env) -> None:
+        # 路由没注册：匿名打过来也是 404（不是鉴权层的 401）
+        r = await env.client.put(f"/api/groups/{G1}/agents/news/memory", json={"notes": "x"})
+        assert r.status == 404
 
     @pytest.mark.asyncio
-    async def test_put_notes_non_string(self, env) -> None:
-        await env.login()
-        r = await env.client.put(f"/api/groups/{G1}/agents/news/memory", json={"notes": 123})
-        assert r.status == 400
-
-    @pytest.mark.asyncio
-    async def test_put_notes_unknown_group_404(self, env) -> None:
+    async def test_put_memory_unknown_group_gone_404(self, env) -> None:
         await env.login()
         r = await env.client.put("/api/groups/999999/agents/news/memory", json={"notes": "x"})
         assert r.status == 404
 
-    @pytest.mark.asyncio
-    async def test_put_notes_anonymous_401(self, env) -> None:
-        r = await env.client.put(f"/api/groups/{G1}/agents/news/memory", json={"notes": "x"})
-        assert r.status == 401
+
+class TestGroupHandoffsApiRemoved:
+    """GET /api/groups/{gid}/agents/handoffs 2026-10 docs/18 第一步退役（没人调）。"""
 
     @pytest.mark.asyncio
-    async def test_put_notes_origin_guard(self, env) -> None:
-        await env.login()
-        host = env.base.split("://", 1)[1]
-        r = await env.client.put(
-            f"/api/groups/{G1}/agents/news/memory",
-            json={"notes": "ok"},
-            headers={"Origin": "http://evil.example", "Host": host},
-        )
-        assert r.status == 403
-
-
-class TestGroupHandoffsApi:
-    async def _mk_handoffs(self, env) -> list[str]:
-        ids = []
-        ids.append(env.agents.begin(G1, "news", "news-b1"))
-        ids.append(env.agents.begin(G1, "news", "news-b2"))
-        ids.append(env.agents.begin(G1, "idea", "idea-b1"))
-        env.agents.begin(G2, "news", "g2-b1")
-        return ids
-
-    @pytest.mark.asyncio
-    async def test_handoffs_list(self, env) -> None:
-        await self._mk_handoffs(env)
+    async def test_handoffs_gone_404(self, env) -> None:
+        env.agents.begin(G1, "news", "news-b1")
         await env.login()
         r = await env.client.get(f"/api/groups/{G1}/agents/handoffs")
-        assert r.status == 200
-        data = await r.json()
-        assert "items" in data
-        assert len(data["items"]) == 3  # 只本群
-
-    @pytest.mark.asyncio
-    async def test_handoffs_kind_filter(self, env) -> None:
-        await self._mk_handoffs(env)
-        await env.login()
-        r = await env.client.get(f"/api/groups/{G1}/agents/handoffs?kind=news")
-        assert r.status == 200
-        data = await r.json()
-        assert len(data["items"]) == 2
-        assert all(i["kind"] == "news" for i in data["items"])
-
-    @pytest.mark.asyncio
-    async def test_handoffs_fields(self, env) -> None:
-        await self._mk_handoffs(env)
-        await env.login()
-        r = await env.client.get(f"/api/groups/{G1}/agents/handoffs")
-        data = await r.json()
-        item = data["items"][0]
-        for f in ("id", "group_id", "kind", "task_id", "phase", "parent_id",
-                  "status", "brief", "created", "updated"):
-            assert f in item, f"缺字段 {f}"
-
-    @pytest.mark.asyncio
-    async def test_handoffs_anonymous_401(self, env) -> None:
-        r = await env.client.get(f"/api/groups/{G1}/agents/handoffs")
-        assert r.status == 401
-
-    @pytest.mark.asyncio
-    async def test_handoffs_unknown_group_404(self, env) -> None:
-        await env.login()
-        r = await env.client.get("/api/groups/999999/agents/handoffs")
         assert r.status == 404
+        r = await env.client.get(f"/api/groups/{G1}/agents/handoffs?kind=news")
+        assert r.status == 404
+
+    @pytest.mark.asyncio
+    async def test_handoffs_anonymous_404(self, env) -> None:
+        # 路由没注册，匿名打过来也是 404（不是鉴权层的 401）
+        r = await env.client.get(f"/api/groups/{G1}/agents/handoffs")
+        assert r.status == 404
+
+    @pytest.mark.asyncio
+    async def test_agents_handoffs_api_still_alive_in_groups_agents(self, env) -> None:
+        # 交接单数据层还在（agents.begin / handoffs() 本身没删），只是少了这个 HTTP 出口
+        env.agents.begin(G1, "news", "news-b1")
+        assert len(env.agents.handoffs(G1)) == 1

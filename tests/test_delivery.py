@@ -7,6 +7,7 @@ Mentions 的注入走 docs/06 的 maisaka.planner.before_request 载荷
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
 
@@ -14,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 from CharTyr_MaiWork.maiwork import clock
 from CharTyr_MaiWork.maiwork.config import load_settings
-from CharTyr_MaiWork.maiwork.delivery import Mentions, Pushes
+from CharTyr_MaiWork.maiwork.delivery import UNSERVED_REASON, Mentions, Pushes
 from CharTyr_MaiWork.maiwork.store import Store
 
 BJ = timezone(timedelta(hours=8))
@@ -376,3 +377,76 @@ def test_pushes_count_today(tmp_path):
     p.record(GID, "topic", "z", t0)
     assert p.count_today(GID) == 3
     assert p.count_today(GID, kind="topic") == 2
+
+
+# ----------------------------------------------------------------------
+# 0.8.0 归一：每群一份设置（group_push）+ 三种自制消息共用一个总上限
+# ----------------------------------------------------------------------
+
+
+def _uncertain_row(store, key: str, group_id: str, payload: dict, ts: float) -> None:
+    """造一条「结果不明」的发件行（超时那种）：留痕不写 pushes，但保留额度。"""
+    with store.tx() as conn:
+        conn.execute(
+            "INSERT INTO outbox (key, group_id, kind, payload, status, attempts, result, error,"
+            " not_before, created, updated) VALUES (?, ?, 'text', ?, 'uncertain', 1, '{}', '超时', 0, ?, ?)",
+            (key, group_id, json.dumps(payload, ensure_ascii=False), ts, ts),
+        )
+
+
+def test_pushes_three_kinds_share_one_daily_cap(tmp_path):
+    """三种自制消息一起数同一个 daily_max：前两条发得出去，第三条卡住。"""
+    from CharTyr_MaiWork.maiwork import group_push
+
+    store, settings, p = _make_pushes(tmp_path, cfg={"delivery": {"push_per_day": 2}})
+    t0 = _noon_epoch()
+    group_push.set_config(store, GID, {"news_card_enabled": True, "idea_mention_enabled": True},
+                          settings, now=t0)
+    p.record(GID, "topic", "开场白", t0)
+    assert p.can_push(GID, "news_card", t0)[0] is True
+    p.record(GID, "news_card", "资讯卡片", t0)
+    ok, why = p.can_push(GID, "idea_mention", t0)
+    assert ok is False and why == "今天推够了"
+    assert p.count_used(GID, t0) == 2
+
+
+def test_pushes_switch_off_has_its_own_reason(tmp_path):
+    """每群开关关着 → 「开关已关」（调用方据此把待发的作废，不是推迟）。"""
+    from CharTyr_MaiWork.maiwork import group_push
+
+    store, settings, p = _make_pushes(tmp_path)
+    t0 = _noon_epoch()
+    assert p.can_push(GID, "news_card", t0) == (False, "开关已关")
+    group_push.set_config(store, GID, {"news_card_enabled": True}, settings, now=t0)
+    assert p.can_push(GID, "news_card", t0) == (True, "")
+    # 不归这三个开关管的 kind 照旧
+    assert p.can_push(GID, "delivery", t0) == (True, "")
+
+
+def test_pushes_quiet_hours_come_from_group_push_per_group(tmp_path):
+    """睡觉时段也是每群一份（group_push）：改了 A 群不影响别处。"""
+    from CharTyr_MaiWork.maiwork import group_push
+
+    store, settings, p = _make_pushes(tmp_path)
+    t0 = datetime(2026, 10, 15, 21, 0, tzinfo=BJ).timestamp()
+    assert p.in_quiet(t0, GID) is False           # 默认 23:00-08:00，21:00 还醒着
+    group_push.set_config(store, GID, {"quiet_hours": "20:00-08:00"}, settings, now=t0)
+    assert p.in_quiet(t0, GID) is True
+    assert p.can_push(GID, "topic", t0) == (False, "睡觉时段")
+    # 别的群号没改过、也不在服务名单：按保守默认（默认睡觉时段），绝不放行推送
+    assert p.in_quiet(t0, "999") is False
+    assert p.can_push("999", "topic", t0) == (False, UNSERVED_REASON)
+
+
+def test_pushes_count_used_reserves_uncertain_and_skips_followups(tmp_path):
+    """结果不明保留额度（防后续刷群）；同一件交付的自动说明不占第二份。"""
+    store, settings, p = _make_pushes(tmp_path, cfg={"delivery": {"push_per_day": 1}})
+    t0 = _noon_epoch()
+    _uncertain_row(store, "k1", GID, {"push_kind": "topic", "text": "可能已经发了"}, t0)
+    # 没当成 sent 记账（pushes 一条都没有），但额度按「可能已经发了」保留
+    assert store.read().execute("SELECT COUNT(*) c FROM pushes").fetchone()["c"] == 0
+    assert p.count_used(GID, t0) == 1
+    assert p.can_push(GID, "topic", t0) == (False, "今天推够了")
+    # 自动补的说明（follow_up_of）不算新的一条推送
+    _uncertain_row(store, "k1:note", GID, {"push_kind": "delivery", "follow_up_of": 1}, t0)
+    assert p.count_used(GID, t0) == 1

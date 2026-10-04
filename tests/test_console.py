@@ -219,7 +219,6 @@ class TestStaticAndMisc:
                 for path in (
                     "/api/news/1/feedback",
                     "/api/ideas/1/feedback",
-                    "/api/ideas/1/want",
                     "/api/ideas/1/do",
                     "/api/ideas/1/dismiss",
                 ):
@@ -651,8 +650,9 @@ class TestSettingsView:
         # M3：启动时判定成 fixed（conftest 的假探测）→ ok「隔离运行（固定账号 maiwork）」
         assert states["localenv"]["state"] == "ok"
         assert states["localenv"]["text"] == "隔离运行（固定账号 maiwork）"
-        assert s["rules"]["approval_required"] is True
-        assert s["rules"]["admins"] == 2
+        assert s["rules"]["seed_only"] is True
+        assert s["rules"]["group_managed"] is True
+        assert "每个群" in s["rules"]["note"]
         assert len(s["groups"]) == 2
         g = next(x for x in s["groups"] if x["id"] == G1)
         assert g["link"].startswith(f"/#/{g['token']}/news")
@@ -1023,17 +1023,13 @@ class TestM2RoutesAuth:
             assert r.status == 403, (path, r.status)
 
     @pytest.mark.asyncio
-    async def test_member_can_want_own_group_idea(self, m2_client) -> None:
-        r = await m2_client.client.post("/api/ideas/11/want", json={}, headers={"X-MW-Group": "tok-g1"})
-        assert r.status == 200, r.status
-        data = await r.json()
-        assert data["state"] == "wanted"
-        assert m2_client.app.feeds.idea_calls[0] == (11, "want", "群友（网页）", None)
-
-    @pytest.mark.asyncio
-    async def test_member_cannot_want_other_group_idea(self, m2_client) -> None:
-        r = await m2_client.client.post("/api/ideas/22/want", json={}, headers={"X-MW-Group": "tok-g1"})
-        assert r.status == 403, r.status
+    async def test_member_want_route_removed(self, m2_client) -> None:
+        # 「想要这个」已删（docs/18 §五）：/api/ideas/{id}/want 路由摘掉，member 也拿不到
+        for iid in (11, 22):
+            r = await m2_client.client.post(
+                f"/api/ideas/{iid}/want", json={}, headers={"X-MW-Group": "tok-g1"}
+            )
+            assert r.status == 404, (iid, r.status)
 
     @pytest.mark.asyncio
     async def test_admin_can_do_dismiss(self, m2_client) -> None:
@@ -1708,26 +1704,14 @@ class TestM3Routes:
             await tc.close()
             await app.stop()
 
-    # ---------- 构想「想要这个」→ 待批请求（路由接线，二选一：这里接） ----------
+    # ---------- 构想「想要这个」已删（docs/18 §五）：路由摘掉、不再落待批 ----------
 
     @pytest.mark.asyncio
-    async def test_idea_want_creates_pending_request(self, env: SimpleEnv) -> None:
+    async def test_idea_want_route_removed(self, env: SimpleEnv) -> None:
         token = env.app.token_of(G1)
-        with env.app.store.tx() as conn:
-            cur = conn.execute(
-                "INSERT INTO ideas (group_id, icon, title, body, state, created, updated)"
-                " VALUES (?, 'bulb', '做个铝价表', '把最近铝价整理成表', 'new', ?, ?)",
-                (G1, clock.now(), clock.now()),
-            )
-            idea_id = int(cur.lastrowid or 0)
-        r = await env.client.post(f"/api/ideas/{idea_id}/want", json={}, headers={"X-MW-Group": token})
-        assert r.status == 200
-        idea = await r.json()
-        assert idea["state"] == "pending"  # want → 待批：构想卡标 pending
-        pending = env.app.approvals.pending_view(G1)
-        assert len(pending) == 1
-        assert pending[0]["via"] == "来自构想"
-        assert pending[0]["title"] == "做个铝价表"
+        r = await env.client.post("/api/ideas/1/want", json={}, headers={"X-MW-Group": token})
+        assert r.status == 404, r.status
+        assert env.app.approvals.pending_view(G1) == []
 
 
 class TestGroupViewAgentFish:

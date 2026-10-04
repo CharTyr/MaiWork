@@ -75,6 +75,22 @@ def _norm_accounts(values: object, field_zh: str, problems: list[str]) -> tuple[
 
 CONFIG_VERSION = "0.4.6"  # 0.4.6：每端点高级请求头 headers（默认空）；0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）；0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
 
+# 0.8.0 群控归一（docs/18 §五 + 往群里发）：下面这些全局键**只作新群第一次的迁移种子**
+# （migrations.migrate_group_controls 按服务群种进 kv["group_approval.<群号>"] /
+# kv["group_push.<群号>"]），运行时的唯一真源是每群那一份。字段留在配置模型里只为
+# 兼容旧 config.toml 不报错 / 迁移读得到旧值；网页与 set_rules 都不再能改它们。
+SEED_ONLY_GLOBAL_KEYS: tuple[str, ...] = (
+    "approval.required",
+    "approval.admins",
+    "approval.exempt_groups",
+    "approval.exempt_users",
+    "topics.enabled",
+    "topics.speaker",
+    "topics.per_day",
+    "delivery.push_per_day",
+    "delivery.quiet_hours",
+)
+
 # 插件目录 = 本文件所在目录；默认数据目录 = 插件目录上两级 / data / maiwork
 # （线上 <MaiBot>/plugins/CharTyr_MaiWork → <MaiBot>/data/maiwork）
 # 插件根目录（plugins/CharTyr_MaiWork）：代码在 maiwork/ 子包里，所以往上两级
@@ -133,11 +149,8 @@ class FeedsSectionConfig(PluginConfigBase):
 
     news_slots: list[str] = Field(default_factory=lambda: ["08:30", "14:00", "19:00"], description='每天备资讯的时段，"HH:MM"（北京时间）')
     news_jitter_minutes: int = Field(default=30, description="每个时段随机提前/推后多少分钟以内")
-    ideas_per_day: int = Field(default=1, description="每群每天最多出几个构想")
-    min_score: float = Field(default=0.6, description="（已不用，2026-09-27 起改看 web_min_avg）旧的资讯入选总分门槛")
     max_items: int = Field(default=10, description="每批最多入选几条资讯")
     lookback_days: int = Field(default=14, description="和最近多少天已出的资讯去重")
-    blocked_domains: list[str] = Field(default_factory=list, description="来源屏蔽名单（域名，含其子域）")
     web_min_avg: float = Field(default=3.0, description="资讯/文章上网页的五项平均分门槛（1~5）")
     pool_min_avg: float = Field(default=4.0, description="资讯进群里开话题候选池的平均分门槛（1~5）")
     guides: bool = Field(default=True, description="备资讯时要不要同时找「文章」（教程、好文章、工具介绍）")
@@ -145,22 +158,16 @@ class FeedsSectionConfig(PluginConfigBase):
     viz_per_day: int = Field(default=3, description="每群每天最多给几条没配图、数据多的资讯做「图解」小图（0 = 不做）")
 
 
-class GoalsSectionConfig(PluginConfigBase):
-    __ui_label__ = "目标"
-    __ui_icon__ = "bullseye"
-    __ui_order__ = 6
-
-    propose: bool = Field(default=True, description="MaiWork 觉得群里缺个长期目标时，主动提一个等管理员批准（每群每天最多一次）")
-
-
 class TopicsSectionConfig(PluginConfigBase):
     __ui_label__ = "冷场开话题"
     __ui_icon__ = "message-circle"
     __ui_order__ = 4
 
-    enabled: bool = Field(default=True, description="冷场时是否开话题")
-    speaker: str = Field(default="maiwork", description='谁说：maiwork=按人设直接发；maibot=请 MaiBot 自己开口（它可能不说）')
-    per_day: int = Field(default=2, description="每群每天最多开几个话题")
+    # enabled / speaker / per_day：0.8.0 起每群一份（group_push.topics_enabled / daily_max；
+    # speaker 已退役）——这里只作**新群第一次的迁移种子**，不是第二个运行来源。
+    enabled: bool = Field(default=True, description="冷场时是否开话题（种子；现在每群一份）")
+    speaker: str = Field(default="maiwork", description='谁说：maiwork=按人设直接发；maibot=请 MaiBot 自己开口（已退役）')
+    per_day: int = Field(default=2, description="每群每天最多开几个话题（种子；现在并进每群每日总上限）")
     min_gap_hours: int = Field(default=3, description="同一群两次开话题的最小间隔（小时）")
     candidate_ttl_hours: int = Field(default=12, description="话题候选池里一条资讯多少小时后过期")
 
@@ -170,9 +177,9 @@ class DeliverySectionConfig(PluginConfigBase):
     __ui_icon__ = "send"
     __ui_order__ = 5
 
-    push_per_day: int = Field(default=3, description="每群每天主动推到群里的上限（含开话题）")
-    quiet_hours: str = Field(default="23:00-08:00", description="睡觉时段（北京时间），不开话题，其他主动推送推迟")
-    mention_ttl_minutes: int = Field(default=120, description="「可提起清单」里一条的有效期（分钟）")
+    # 0.8.0 起每群一份（group_push.daily_max / quiet_hours）——只作新群的迁移种子。
+    push_per_day: int = Field(default=3, description="每群每天主动推到群里的上限（种子；现在归每群 daily_max）")
+    quiet_hours: str = Field(default="23:00-08:00", description="睡觉时段（北京时间）（种子；现在每群一份）")
 
 
 class ApprovalSectionConfig(PluginConfigBase):
@@ -180,10 +187,12 @@ class ApprovalSectionConfig(PluginConfigBase):
     __ui_icon__ = "shield-check"
     __ui_order__ = 6
 
-    required: bool = Field(default=True, description="群友派的活是否要 bot 管理员批准后才能开工")
-    admins: list[str] = Field(default_factory=lambda: ["qq:100000001"], description="bot 管理员，写成「平台:账号」，如 qq:100000001（只写数字当 qq）")
-    exempt_groups: list[str] = Field(default_factory=list, description="免批的群，写成「平台:群号」，如 qq:900000001")
-    exempt_users: list[str] = Field(default_factory=list, description="派活免批的人，写成「平台:账号」，如 qq:10001")
+    # required / admins / exempt_groups / exempt_users：0.8.0 起每群一份
+    # （kv["group_approval.<群号>"]，group_approval.py）——只作新群的迁移种子。
+    required: bool = Field(default=True, description="群友派的活是否要 bot 管理员批准后才能开工（种子；现在每群一份）")
+    admins: list[str] = Field(default_factory=lambda: ["qq:100000001"], description="bot 管理员，写成「平台:账号」（种子；现在每群一份）")
+    exempt_groups: list[str] = Field(default_factory=list, description="免批的群（种子；现在每群一份），写成「平台:群号」")
+    exempt_users: list[str] = Field(default_factory=list, description="派活免批的人（种子；现在每群一份），写成「平台:账号」")
     remind: bool = Field(default=True, description="待批超过 24 小时没人处理时，在群里提醒管理员一次（可关）")
     auto_review: bool = Field(default=True, description="低风险的小活（调研、找东西、做个小网页、出个 PDF）由主模型看过就直接开工；高风险 / 大工程 / 说不清的仍然等你批")
     auto_review_daily: int = Field(default=5, description="每个群每天最多这样自动开工几件；0 = 关掉自动审核")
@@ -398,7 +407,6 @@ class MaiWorkConfig(PluginConfigBase):
     groups: GroupsSectionConfig = Field(default_factory=GroupsSectionConfig)
     focus: FocusSectionConfig = Field(default_factory=FocusSectionConfig)
     feeds: FeedsSectionConfig = Field(default_factory=FeedsSectionConfig)
-    goals: GoalsSectionConfig = Field(default_factory=GoalsSectionConfig)
     topics: TopicsSectionConfig = Field(default_factory=TopicsSectionConfig)
     delivery: DeliverySectionConfig = Field(default_factory=DeliverySectionConfig)
     approval: ApprovalSectionConfig = Field(default_factory=ApprovalSectionConfig)
@@ -441,21 +449,14 @@ class FocusSetting:
 class FeedsSetting:
     news_slots: tuple[str, ...]
     news_jitter_minutes: int
-    ideas_per_day: int
-    min_score: float         # 已不用（2026-09-27 质量标准），留做兼容
     max_items: int
     lookback_days: int
-    blocked_domains: tuple[str, ...]
     web_min_avg: float
     pool_min_avg: float
     guides: bool
     collect_minutes: int = 15  # 资讯收集子 agent 每轮时间盒（到点把已找到的交回）
     viz_per_day: int = 3       # 资讯图解每群每天上限（0 = 关），news_viz.py
 
-
-@dataclass(frozen=True)
-class GoalsSetting:
-    propose: bool = True
 
 
 @dataclass(frozen=True)
@@ -471,7 +472,6 @@ class TopicsSetting:
 class DeliverySetting:
     push_per_day: int
     quiet_hours: str
-    mention_ttl_minutes: int
 
 
 @dataclass(frozen=True)
@@ -772,7 +772,6 @@ class Settings:
     workspace_root: Path
     focus: FocusSetting
     feeds: FeedsSetting
-    goals: GoalsSetting
     topics: TopicsSetting
     delivery: DeliverySetting
     approval: ApprovalSetting
@@ -789,6 +788,13 @@ class Settings:
     extensions: ExtensionsSetting = ExtensionsSetting(mcp=())
     group_space: GroupSpaceSetting = GroupSpaceSetting(enabled=True, notice_per_day=1)
     reader: ReaderSetting = ReaderSetting()
+    # 内部派生运行时字段（**不是** SDK / config.toml 可编辑键，不参与 schema / config_version）：
+    # 群控归一（全局旧键 → 每群一份）这一轮是否已经「物化成功 + 有效重读成功」。
+    # True（缺省）= 老合同：直接拿 load_settings 结果的数据层调用照旧惰性播种；
+    # App 启动时先设 False，只有 migrate_group_controls 真跑成功才开（见
+    # app._open_group_controls_seed_gate）。门关着时 GroupApprovals / group_push
+    # 读**已有**合法记录照旧尊重，但缺失记录只回安全默认、绝不播种。
+    group_controls_seed_ready: bool = True
     problems: tuple[str, ...] = ()
 
     def is_served(self, group_id: str) -> bool:
@@ -931,7 +937,7 @@ _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za
 def normalize_domain(raw: Any) -> str:
     """域名规范化：小写、去 www. 前缀、去首尾空白；明显不合法 → 空串。
 
-    feeds 的屏蔽名单（[feeds] blocked_domains 和 kv）、/api/feeds/domains 入参都走这里。
+    每群屏蔽名单（kv["feeds.blocked.<gid>"]）、/api/groups/{gid}/feeds/domains 入参都走这里。
     """
     s = str(raw or "").strip().lower()
     if s.startswith("www."):
@@ -941,22 +947,13 @@ def normalize_domain(raw: Any) -> str:
     return s
 
 
-def _parse_feeds(feeds: FeedsSectionConfig, problems: list[str], *, min_score_explicit: bool = False) -> FeedsSetting:
+def _parse_feeds(feeds: FeedsSectionConfig, problems: list[str]) -> FeedsSetting:
     """[feeds] 节规范化。
 
-    - blocked_domains 逐个规范化（小写、去 www.、和子域匹配用同一串）；不合法的丢弃记问题。
     - web_min_avg / pool_min_avg 夹到 1~5。
-    - min_score 于 2026-09-27 的质量标准起不再使用（改看 web_min_avg）：字段保留兼容；
-      用户在配置里显式写了 min_score 时，问题清单里点一句不再用它。
+    -（2026-10：屏蔽名单挪成按群 kv，blocked_domains 不再是配置项；存量的随启动
+      migrate_blocked_domains_to_groups 迁进每个群的 kv，文件里的键删掉。）
     """
-    blocked: list[str] = []
-    for raw in feeds.blocked_domains or []:
-        d = normalize_domain(raw)
-        if not d:
-            problems.append(f"[feeds] blocked_domains 里的 {str(raw)!r} 不是合法域名，已忽略")
-            continue
-        if d not in blocked:
-            blocked.append(d)
 
     def _clamp_score(name: str, value: float, default: float) -> float:
         try:
@@ -970,17 +967,11 @@ def _parse_feeds(feeds: FeedsSectionConfig, problems: list[str], *, min_score_ex
             return vv
         return v
 
-    # 宿主生成 config.toml 时会把默认值 0.6 也写进去（线上实测），默认值不算「改过」
-    if min_score_explicit and abs(float(feeds.min_score) - 0.6) > 1e-9:
-        problems.append("[feeds] min_score 已不用（2026-09-27 起改看 web_min_avg），可以删掉这一行")
     return FeedsSetting(
         news_slots=tuple(str(s) for s in feeds.news_slots),
         news_jitter_minutes=int(feeds.news_jitter_minutes),
-        ideas_per_day=int(feeds.ideas_per_day),
-        min_score=float(feeds.min_score),
         max_items=max(1, int(feeds.max_items)),
         lookback_days=max(1, int(feeds.lookback_days)),
-        blocked_domains=tuple(blocked),
         web_min_avg=_clamp_score("web_min_avg", feeds.web_min_avg, 3.0),
         pool_min_avg=_clamp_score("pool_min_avg", feeds.pool_min_avg, 4.0),
         guides=bool(feeds.guides),
@@ -1364,7 +1355,6 @@ _SECTIONS: tuple[tuple[str, type[PluginConfigBase]], ...] = (
     ("groups", GroupsSectionConfig),
     ("focus", FocusSectionConfig),
     ("feeds", FeedsSectionConfig),
-    ("goals", GoalsSectionConfig),
     ("topics", TopicsSectionConfig),
     ("delivery", DeliverySectionConfig),
     ("approval", ApprovalSectionConfig),
@@ -1404,19 +1394,10 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
     problems: list[str] = []
 
     raw_mapping: dict[str, Any]
-    min_score_explicit = False
     if isinstance(raw, MaiWorkConfig):
         raw_mapping = raw.model_dump(mode="python")
-        # 模型实例：pydantic 的 fields_set 记了验证时显式给过的字段（默认 dump 什么都有，
-        # 不能靠「键在不在」判断）
-        try:
-            min_score_explicit = "min_score" in raw.feeds.model_fields_set
-        except Exception:
-            min_score_explicit = False
     elif isinstance(raw, Mapping):
         raw_mapping = dict(raw)
-        raw_feeds = raw_mapping.get("feeds")
-        min_score_explicit = isinstance(raw_feeds, Mapping) and "min_score" in raw_feeds
     else:
         problems.append(f"配置不是字典/配置模型（{type(raw).__name__}），整体用默认值")
         raw_mapping = {}
@@ -1446,7 +1427,6 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
     plugin = sections["plugin"]
     focus = sections["focus"]
     feeds = sections["feeds"]
-    goals = sections["goals"]
     topics = sections["topics"]
     delivery = sections["delivery"]
     approval = sections["approval"]
@@ -1464,7 +1444,6 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
     assert isinstance(plugin, PluginSectionConfig)
     assert isinstance(focus, FocusSectionConfig)
     assert isinstance(feeds, FeedsSectionConfig)
-    assert isinstance(goals, GoalsSectionConfig)
     assert isinstance(topics, TopicsSectionConfig)
     assert isinstance(delivery, DeliverySectionConfig)
     assert isinstance(approval, ApprovalSectionConfig)
@@ -1508,8 +1487,7 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
             personal_feeds=bool(getattr(focus, "personal_feeds", True)),
             personal_per_day=max(1, int(getattr(focus, "personal_per_day", 3))),
         ),
-        feeds=_parse_feeds(feeds, problems, min_score_explicit=min_score_explicit),
-        goals=GoalsSetting(propose=bool(getattr(goals, "propose", True))),
+        feeds=_parse_feeds(feeds, problems),
         topics=TopicsSetting(
             enabled=bool(topics.enabled), speaker=str(topics.speaker or "maiwork"),
             per_day=int(topics.per_day), min_gap_hours=int(topics.min_gap_hours),
@@ -1518,7 +1496,6 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
         delivery=DeliverySetting(
             push_per_day=int(delivery.push_per_day),
             quiet_hours=str(delivery.quiet_hours or "23:00-08:00"),
-            mention_ttl_minutes=int(delivery.mention_ttl_minutes),
         ),
         approval=ApprovalSetting(
             required=bool(approval.required),

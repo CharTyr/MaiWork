@@ -101,8 +101,13 @@ def _brief(candidates: list[dict], picked: list[int]) -> str:
         f"今天是 {today}（北京时间）。下面 {len(picked)} 条是同事找资讯时交回、但原文还没核对过的候选"
         "（多半只看过搜索摘要）。请逐条：\n"
         "1. 用 fetch_page 打开链接读原文；打不开的，可以用 web_search 找同一件事的别的可靠来源并用 fetch_page 打开，"
-        "换了来源就把 url 改成新链接。只打开文章本身，别去开网站首页、新闻列表页；\n"
-        "2. 对照原文核对：原文支持不支持同事的摘要——不支持、对不上、是营销软文就 verdict=drop，reason 写原因；\n"
+        "换了来源就把 url 改成新链接（页面上认得出原始出处的，优先换成原文链接）。"
+        "只打开文章本身，别去开网站首页、新闻列表页；\n"
+        "2. 对照原文核对：原文支持不支持同事的摘要——不支持、对不上、是营销软文就 verdict=drop，reason 写原因；"
+        "按内容卡质量（不看站点）：这篇是水文（没有新信息、凑字数、标题党）/"
+        "低质转载（整段搬运、没注明或丢了原始出处）/洗稿（换说法重写别人的报道、没有自己的东西）"
+        "的，verdict=drop，reason 用中文大白话写清"
+        "（例如「低质转载：整段搬运，没注明出处」「洗稿：改写自 IGN 的报道」）；\n"
         "3. 支持的 verdict=keep：按原文重写 summary（2–4 句中文纯文本）；quote 从原文里抄一小段能支撑摘要的原话"
         f"（≤{_QUOTE_MAX} 字）；published 填原文的发布时间（ISO 日期，拿不到就空字符串）；\n"
         "4. 判旧闻：原文说的事已经过去了（比如写「争取 9 月 20 日上线」而今天已经过了那天），或原文发布超过 7 天，"
@@ -125,6 +130,7 @@ async def recheck(
     parse_published: Callable[[Any], Any],
     normalize_url: Callable[[str], str],
     site_of: Callable[[str], str],
+    dup_check: Callable[[str], bool] | None = None,
 ) -> int:
     """补打开 + 核对；原地改 candidates。返回核对通过（keep 且真打开过）的条数。出错不抛。"""
     from .coordinator import normalize_link_for_check
@@ -181,6 +187,12 @@ async def recheck(
             item["url"] = url
             item["url_key"] = normalize_url(url)
             item["site"] = site_of(url)
+            # 换链接后立刻再查一次重（2026-10-03 用户定，不花模型调用）：
+            # 换到的新链接撞「最近已发布 / 最近被拒（内容类）」立刻拒，不再往下打分
+            # （线上实录：howtovideogame 同一条被反复打开 7 次、发两次）。
+            if dup_check is not None and dup_check(str(item.get("url_key") or "")):
+                item["reject"] = ("hard", "和最近出过的重复（同一个链接）")
+                continue
         summary = str(res.get("summary") or "").strip()
         if summary:
             item["summary"] = summary

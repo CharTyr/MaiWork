@@ -105,15 +105,6 @@ def _bins_total(store: Store, gid: str = GID) -> int:
     return int(row["c"])
 
 
-def _interaction(store: Store, user_id: str, gid: str = GID) -> int:
-    row = store.read().execute(
-        "SELECT COALESCE(SUM(count), 0) AS c FROM member_interactions"
-        " WHERE group_id=? AND user_id=?",
-        (gid, user_id),
-    ).fetchone()
-    return int(row["c"])
-
-
 # ----------------------------------------------------------------------
 # remember_session / ensure_group
 # ----------------------------------------------------------------------
@@ -370,36 +361,6 @@ class TestStats:
             "SELECT message_id FROM bot_messages WHERE group_id=?", (GID,)
         ).fetchall()
         assert [r["message_id"] for r in rows] == ["b1"]
-
-    @pytest.mark.asyncio
-    async def test_reply_to_bot_and_at_count_as_interactions(
-        self, store: Store, frozen_now: float
-    ) -> None:
-        host = FakeHost(
-            [
-                _msg("b1", T0 - 100, user="bot", name="MaiBot", bot=True),
-                _msg("r1", T0 - 90, user="u1", reply="b1"),  # 回复机器人 → 互动
-                _msg("a1", T0 - 80, user="u2", at=True),  # @ → 互动
-                _msg("n1", T0 - 70, user="u3"),  # 普通 → 不算
-                _msg("n2", T0 - 60, user="u4", reply="r1"),  # 回复人的消息 → 不算
-            ]
-        )
-        p = _make(store, host)
-        await p.tick(GID)
-        assert _interaction(store, "u1") == 1
-        assert _interaction(store, "u2") == 1
-        assert _interaction(store, "u3") == 0
-        assert _interaction(store, "u4") == 0
-
-    @pytest.mark.asyncio
-    async def test_reply_to_bot_across_ticks(self, store: Store, frozen_now: float) -> None:
-        host = FakeHost([_msg("b1", T0 - 100, user="bot", bot=True)])
-        p = _make(store, host)
-        await p.tick(GID)
-        # 下一次 tick 里回复上次那条机器人消息，照样算互动
-        host.msgs.append(_msg("r1", T0 - 50, user="u1", reply="b1"))
-        await p.tick(GID)
-        assert _interaction(store, "u1") == 1
 
     @pytest.mark.asyncio
     async def test_member_activity_day_uses_beijing(self, store: Store, frozen_now: float) -> None:
@@ -678,7 +639,6 @@ class TestUsualGap:
 # ----------------------------------------------------------------------
 
 REASON_ACTIVE = "最活跃"
-REASON_CHAT = "和 MaiBot 聊得多"  # 已退役：不再用来挑人（member_interactions 数据仍保留）
 REASON_REQ = "提过请求"
 REASON_PIN = "管理员加的"
 
@@ -722,8 +682,6 @@ class TestFocus:
         # 互动多的人不再自动入选
         assert "ux" not in by_user
         assert "ud" not in by_user
-        # 互动计数数据本身还在（没删数据，只是不再用来挑人）
-        assert _interaction(store, "ux") == 3
         assert all("note" in m and "pinned" in m for m in got)
 
     @pytest.mark.asyncio
@@ -955,3 +913,34 @@ class TestLastMsgTs:
         await p.tick(GID)
         got = p.focus(GID)
         assert got[0]["name"] == "新名字"
+
+
+class TestMemberInteractionsDropped:
+    def test_table_dropped_by_migration(self, store: Store) -> None:
+        """2026-10 docs/18 第一步：互动计数彻底退役，表在库迁移里 DROP。"""
+        tables = {r["name"] for r in store.read().execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "member_interactions" not in tables
+
+    def test_upgrade_drops_table_with_rows(self, tmp_path) -> None:
+        """老库（表还在、且有数据）→ migrate 完表没了。"""
+        import sqlite3
+
+        path = tmp_path / "old.db"
+        conn = sqlite3.connect(str(path))
+        conn.execute(
+            "CREATE TABLE member_interactions (group_id TEXT, user_id TEXT, day TEXT,"
+            " count INTEGER, PRIMARY KEY (group_id, user_id, day))"
+        )
+        conn.execute("INSERT INTO member_interactions VALUES ('g1', 'u1', '2026-10-01', 3)")
+        conn.execute("PRAGMA user_version=31")
+        conn.commit()
+        conn.close()
+        s = Store(path)
+        try:
+            s.migrate()
+            tables = {r["name"] for r in s.read().execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            assert "member_interactions" not in tables
+        finally:
+            s.close()

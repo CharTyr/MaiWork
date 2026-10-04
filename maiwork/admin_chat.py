@@ -863,15 +863,6 @@ class AdminChat:
     # 消息流读写
     # ------------------------------------------------------------------
 
-    def _rows(self, chat_id: int) -> list[dict]:
-        store = self.store
-        if store is None:
-            return []
-        rows = store.read().execute(
-            "SELECT * FROM admin_chat_msgs WHERE chat_id=? ORDER BY id ASC", (int(chat_id),)
-        ).fetchall()
-        return [dict(r) for r in rows]
-
     def _add_msg(
         self,
         chat_id: int,

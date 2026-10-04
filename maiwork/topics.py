@@ -1,21 +1,31 @@
 """topics.py（M2）：冷场开话题。
 
-第 1 层（代码，不调模型）：睡觉时段、开关、候选池、每日上限、推送额度、
+第 1 层（代码，不调模型）：**第一道闸是服务群**（拿不到配置 / 认不出服务名单 / 非服务群
+一律跳过：在任何 SQL / 画像 / Jev / 模型之前），然后是睡觉时段、开关、候选池、
+推送额度（每群一个每日总上限，三种自制消息共用；原来的 topics.per_day 已退役）、
 最小间隔（含退避倍数）、安静时长（≥ max(3×usual_gap, 20 分钟)）、
 这个钟点平时有人（usual_gap ≤ 30 分钟）、夜里的安静不算冷场（醒来后要有人说过话）、
 安静超过 90 分钟不开。
 
 第 2 层（Jev）：state 带时间（安静了多少分钟、平时多久一条、每条消息几分钟前），
-过滤掉图片/事件/空合并转发这些杂音；ok ≥ 0.6 且 reason == fine 且至少一条 fit ≥ 0.5 → 开。
+过滤掉图片/事件/空合并转发这些杂音；机器人自己（MaiBot / MaiWork 同一个 bot 账号）
+发的话标成「[机器人自己]」，并说明机器人自己没人接的追问/资讯卡/提醒不算
+「有人在等回复」；reason 那题问「现在群里的状态是哪一种」（不再问「不适合的原因」）。
+ok ≥ 0.6 且 reason == fine 且至少一条 fit ≥ 0.5 → 开（门槛数字没动）。
 Jev 不可用 → 这次不开（不写 topic_log）。
 
 同一段冷场（最近一条消息时刻 + 候选 id 列表算指纹）判过一次后 30 分钟内不重复问，
 指纹变了或满 30 分钟才重问（2026-10-01 线上实测：一天判 343 次、开 0 次）。
 
-开：主模型按人设写开场白，speaker="maiwork" 走 send_text，
-speaker="maibot" 走 proactive_trigger。10 分钟后 follow_up。
-播报腔整条作废。每发出一次压缩候选、写 news_items.replies、
-加进 mentions、写 topic_log（jev 里带真实分数和卡在哪一层）。
+开：主模型按人设写开场白，**只 enqueue 进发件箱**（docs/18 第三步归一：往群里发只有
+发件箱一条路，speaker="maibot" 请 MaiBot 主动开口那条退役）。入队载荷带 `expires_ts`
+（保守 ≤30 分钟）和 `cold_since_ts`（当时的冷场快照）；发件箱发送前会调本模块挂在
+`attach_outbox` 里的 `on_before_send` 复核：排队 / 重试期间群里又有人说话就作废，
+不再当成冷场开口（拿不到快照 → 失败关闭）。发件箱真发出去之后用结果 hook 回来
+（on_result）：写 topic_log.opener / message_id / followup_due_ts、候选标 used、
+news_items 标 used、加进 mentions。只入队不算发过。
+10 分钟后 follow_up。播报腔整条作废。
+写 topic_log 时 jev 里带真实分数和卡在哪一层。
 """
 
 from __future__ import annotations
@@ -27,7 +37,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from . import clock, voice
+from . import clock, group_push, voice
 from .config import Settings
 from .delivery import Mentions, Pushes
 from .host import Host, HostError, Msg
@@ -47,11 +57,18 @@ _BROADCAST_WORDS = ("据报道", "以下是", "今日资讯", "今日热点", "�
 # 开场白最长（清洗后）
 _OPENER_MAX_CHARS = 120
 
+# 回写 topic_log 时的错误文本上限
+_ERR_MAX = 300
+
 # 退避倍数上限（min_gap_hours × 2^n，n 最多 3 → ×8）
 _BACKOFF_MAX = 8
 
 # follow_up：开场白发出多少秒后数 replies / followups
 _FOLLOW_UP_DELAY_S = 600
+
+# 自动开场白的有效期（秒）：保守 ≤30 分钟。入队到真发出去之间可能被睡觉时段 /
+# 每日上限推迟；过了这个期限这条开场白已经对不上「当时的冷场」，发件箱直接作废。
+_OPENER_TTL_S = 30 * 60
 
 # 安静时长下限（秒）：max(3×usual_gap, MIN_QUIET)
 _MIN_QUIET_S = 20 * 60  # 20 分钟
@@ -85,6 +102,19 @@ _PLAIN_NOISE = frozenset(("[图片]", "[image]", "[表情包]"))
 
 # 合并转发的格式骨架：包装词、方括号、名字、冒号、破折号、空白
 _FORWARD_SKELETON = re.compile(r"合并转发消息|【[^】]*】|[\[\]【】:：\-—–\s]")
+
+# 机器人自己发的话，在给 Jev 的消息里用的标记（2026-10-03 实测：机器人自己没人接的
+# 追问 / 资讯卡 / 提醒被 Jev 判成「有问题还没人回」，冷场开话题 365 次判 0 次开）。
+# 机器人自己 = MaiBot 自身 / MaiWork 发送用的同一个 bot 账号
+# （host.py：`user_id == bot_qq` → `Msg.is_bot`，不另猜身份）。
+_BOT_SPEAKER = "[机器人自己]"
+
+# 给 Jev 的说明：这个标记是什么意思（写进 state.note；题目里也会再提一次）
+_BOT_NOTE = (
+    "messages 里 speaker 写成 [机器人自己] 的，是机器人自己发的话（追问、资讯卡、"
+    "提醒、开场白）。机器人自己发的没人接不算「有人在等回复」，"
+    "只有群友提的问题还没人回才算。"
+)
 
 # 判断态（topic_log.jev 字段 JSON）的 reason 中文化映射
 _REASON_ZH = {
@@ -184,6 +214,8 @@ class Topics:
         get_settings: Callable[[], Settings],
         signals: Any,  # intake.Signals，测试里用 SignalsStub（含 last_ts / session_id）
         identity: Any = None,  # identity.py（开场白人设只认 SOUL；None 就是没人设，不回退读 MaiBot 人格）
+        *,
+        outbox: Any = None,  # 发件箱（0.8.0：唯一的发送路径）；没接 = 不开话题
     ) -> None:
         self._store = store
         self._host = host
@@ -195,6 +227,28 @@ class Topics:
         self._get_settings = get_settings
         self._signals = signals
         self._identity = identity
+        # 每群三份统一注入（docs/17 §八.2）：app._wire_specialists 挂上后生效
+        self._agents: Any = None
+        # 发件箱：接了才有发送这条路（attach_outbox / 构造参数）
+        self._outbox: Any = None
+        if outbox is not None:
+            self.attach_outbox(outbox)
+
+    def attach_outbox(self, outbox: Any) -> None:
+        """接上发件箱（app 建好 Outbox 之后调一次）：开场白只入队，发出去之后回写。
+
+        同时在**这里**（公开 attach，不在 app 里手补私有线）登记发送前新鲜度检查：
+        排队 / 重试期间群里又有人说话，这条开场白就作废，不再当成冷场开口。
+        """
+        self._outbox = outbox
+        add_hook = getattr(outbox, "add_result_hook", None)
+        if callable(add_hook):
+            add_hook(self.on_result)
+        else:
+            logger.warning("发件箱没有 add_result_hook，开场白发出后回写不了（群日志会缺 opener）")
+        add_preflight = getattr(outbox, "add_preflight_hook", None)
+        if callable(add_preflight):
+            add_preflight(self.on_before_send)
 
     # ------------------------------------------------------------------
     # 候选池
@@ -254,10 +308,22 @@ class Topics:
     async def check(self, group_id: str, now: float) -> str:
         """cold-start 判断；返回做了什么（给日志 / 测试）。"""
         gid = str(group_id)
-        settings = self._get_settings()
+        try:
+            settings = self._get_settings()
+        except Exception:
+            logger.debug("读配置失败（群 %s 本轮跳过，不种任何设置）", gid, exc_info=True)
+            settings = None
+        # 第一道闸：不是**明确的服务群**就什么都不做——在任何 SQL / 画像 / Jev / 模型之前。
+        # 拿不到配置 / 认不出服务名单 / 非服务群，一律拒：非服务群零读取、零 Jev、零模型
+        # 是红线，上游误传群号也不能放行。
+        if settings is None or not group_push.served(settings, gid):
+            return "skip:unserved"
+
+        # 每群一份「往群里发」设置（group_push：睡觉时段 / 开关 / 每日总上限的唯一真源）
+        cfg = group_push.get_config(self._store, gid, settings)
 
         # 1) 睡觉时段第一个判断，直接返回（连库都尽量少读）
-        quiet = getattr(settings.delivery, "quiet_hours", "") or "23:00-08:00"
+        quiet = str(cfg.get("quiet_hours") or "") or "23:00-08:00"
         try:
             s, e = clock.parse_hhmm_range(quiet)
         except (ValueError, AttributeError):
@@ -265,9 +331,17 @@ class Topics:
         if s != e and clock.in_range(now, (s, e)):
             return "skip:quiet_hours"
 
-        # 2) topics.enabled 关
-        if not getattr(settings.topics, "enabled", True):
+        # 2) 这个群的开话题开关关着
+        if not cfg.get("topics_enabled", True):
             return "skip:disabled"
+
+        # 2b) 发件箱没接上（app 没接线 / 直接构造没给）：明确拒绝，绝不直发第二路
+        if self._outbox is None:
+            return "skip:no_outbox"
+
+        # 2c) 上一条开场白还在发件箱里排队 / 正在发：等它落地再判，别一次冷场发两条
+        if self._opener_in_flight(gid):
+            return "skip:opener_in_flight"
 
         # 3) 候选池非空（只看未过期、未用过的）
         row = self._store.read().execute(
@@ -279,25 +353,12 @@ class Topics:
         if row is None:
             return "skip:no_candidate"
 
-        # 4) 今日已开话题数 < per_day
-        # 「已开」= topic_log 写过 judgment（opener 空也是一次「已判定」；
-        #  但每日上限关心的是真的发出去的——按 opener!='' 算）
-        per_day = int(getattr(settings.topics, "per_day", 2))
-        day = clock.day_key(float(now))
-        rows = self._store.read().execute(
-            "SELECT ts FROM topic_log WHERE group_id=? AND opener!=''",
-            (gid,),
-        ).fetchall()
-        opened_today = sum(1 for r in rows if clock.day_key(float(r["ts"])) == day)
-        if per_day > 0 and opened_today >= per_day:
-            return "skip:per_day_limit"
-
-        # 5) 推送额度够
+        # 4) 推送额度够（每群一个每日总上限：三种自制消息一起数，见 group_push / Pushes）
         ok, why = self._pushes.can_push(gid, "topic", now)
         if not ok:
             return f"skip:push:{why}"
 
-        # 6) 最小间隔 × 退避倍数（上次没人接 → 倍数 ×2，最多 ×8）
+        # 5) 最小间隔 × 退避倍数（上次没人接 → 倍数 ×2，最多 ×8）
         last_open = self._store.read().execute(
             "SELECT ts FROM topic_log"
             " WHERE group_id=? AND opener!=''"
@@ -375,23 +436,54 @@ class Topics:
         #     不然 Jev 只看到一堆没时间的消息，会把 50 分钟前的问题当刚提的）
         quiet_minutes = int(quiet_s // 60)
         usual_gap_minutes = round(float(usual_gap) / 60.0, 1)
+
+        # 10a) 最后一条是不是机器人自己发的；是的话另给 Jev 一句「群友最后一次发言在
+        #      几分钟前」。只多给一句判断材料，不动第 1 层闸门：quiet_minutes 仍按原来的
+        #      quiet_ts 算（改了会动到「醒来后没人说话就跳过」「安静过久不开」这些闸门
+        #      的语义，2026-10-03 决定不在这一步动）。
+        last_message_is_bot = bool(msgs) and bool(msgs[-1].is_bot)
+        last_human = next((m for m in reversed(msgs) if not m.is_bot), None)
+        last_human_minutes = (
+            int(max(0.0, float(now) - float(last_human.ts)) // 60)
+            if last_human is not None else None
+        )
+        ok_head = (
+            f"群里已经安静了 {quiet_minutes} 分钟"
+            f"（平时这个点大约 {usual_gap_minutes} 分钟一条）。"
+        )
+        if last_message_is_bot and last_human_minutes is not None:
+            ok_head += (
+                f"最后一条是机器人自己发的，群友最后一次发言在 {last_human_minutes} 分钟前。"
+            )
+        elif last_message_is_bot:
+            ok_head += "最后一条是机器人自己发的。"
+
         questions: Dict[str, Any] = {
             "ok": {
                 "type": "noul",
                 "instructions": (
-                    f"群里已经安静了 {quiet_minutes} 分钟"
-                    f"（平时这个点大约 {usual_gap_minutes} 分钟一条）。现在抛出一个新话题合适吗？"
+                    ok_head
+                    + "现在抛出一个新话题合适吗？"
+                    "（messages 里 speaker 写成 [机器人自己] 的是机器人自己发的话；"
+                    "机器人自己的追问、资讯卡、提醒没人接，不算「有人在等回复」，"
+                    "只有群友提的问题还没人回才算。）"
                 ),
             },
             "reason": {
                 "type": "choice",
-                "instructions": "现在不适合开新话题的原因？选一个最贴切的。",
+                # 2026-10-03：原来问「现在不适合开新话题的原因？」，选项里却放着
+                # 「可以开(fine)」——实测选 fine 时 ok 总在 0.49~0.55，两问从没同时过关。
+                # 改成问「现在群里的状态是哪一种」，choice 的 key（fine/left/open_question/
+                # mood）不变，判定代码和日志照旧兼容。
+                "instructions": "现在群里的状态是哪一种？选一个最贴切的。",
                 "criteria": {
-                    "fine": "可以开",
+                    "fine": "可以开新话题（安静下来了、没有群友在等人的回复、气氛也合适）",
                     "left": "人都走了，没人会接",
                     "open_question": (
-                        "最近有人提的问题还没人回、而且问题还不算太久"
-                        "（看每条消息的 minutes_ago，太久的就不算「还没人回」了），不适合岔开"
+                        "有群友提的问题还没人回、而且问题还不算太久"
+                        "（看每条消息的 minutes_ago，太久的就不算「还没人回」了）；"
+                        "[机器人自己] 发的追问、资讯卡、提醒没人接不算，"
+                        "那只是机器人自己在等，不是群友在等"
                     ),
                     "mood": "气氛不对（争执、严肃事），再说就不合时宜",
                 },
@@ -412,12 +504,19 @@ class Topics:
             "usual_gap_minutes": usual_gap_minutes,
             "messages": [
                 {
-                    "speaker": "BOT" if m.is_bot else m.user_name,
+                    # 机器人自己（MaiBot 自身 / MaiWork 发送用的同一个 bot 账号，
+                    # host.py 用 `user_id == bot_qq` 判 `Msg.is_bot`）发的话明确标出来，
+                    # 不然 Jev 会把机器人自己没人接的追问 / 资讯卡当成「群友在等人回」。
+                    "speaker": _BOT_SPEAKER if m.is_bot else (m.user_name or "群友"),
                     "text": m.text,
                     "minutes_ago": int(max(0.0, float(now) - float(m.ts)) // 60),
                 }
                 for m in msgs
             ],
+            # 最后一条是机器人自己发的吗、群友最后一次发言是几分钟前（判断材料，不参与闸门）
+            "last_message_is_bot": last_message_is_bot,
+            "last_human_minutes_ago": last_human_minutes,
+            "note": _BOT_NOTE,
             "candidates": [
                 {"title": cand["title"], "brief": cand["brief"], "link": cand["link"]}
                 for cand in candidates
@@ -485,12 +584,7 @@ class Topics:
         if candidate is None:
             return f"skip:judged_no(ok={ok_p:.2f},reason={reason_label},fit={fit_arr[0][1] if fit_arr else 0:.2f})"
 
-        # 12) 决定 speaker / 生成开场白
-        speaker = str(getattr(settings.topics, "speaker", "maiwork") or "maiwork").lower()
-        if speaker not in ("maiwork", "maibot"):
-            speaker = "maiwork"
-
-        # 生成开场白（models.chat main / purpose="opener"）
+        # 12) 生成开场白（models.chat main / purpose="opener"）
         # 模型没配好 → 不开
         model_settings = self._models.settings()
         if not model_settings.ready():
@@ -538,80 +632,34 @@ class Topics:
             self._update_log(topic_id, {"opener": "", "result": json.dumps({"rejected": "开场白含关注成员信息，不发"}, ensure_ascii=False)})
             return "rejected:privacy"
 
-        # 13) 发送
-        reject_reason = ""
-        message_id = ""
+        # 13) 只入队（唯一发送路径 = 发件箱）：不写 opener、不用候选、不记 pushes——
+        #     那些都要等真发出去之后由发件箱的结果 hook 回来做（on_result）。
+        outbox = self._outbox
+        if outbox is None:  # 2b 已经挡过一次；这里再挡一次，绝不直发
+            return "skip:no_outbox"
         try:
-            if speaker == "maiwork":
-                send_result = await self._host.send_text(
-                    sid, cleaned,
-                    # send.hybrid 内部带 sync_to_maisaka_history=True, storage_message=True
-                )
-                message_id = str(getattr(send_result, "message_id", "") or "")
-            else:  # maibot
-                resp = await self._host.proactive_trigger(
-                    sid,
-                    intent=f"开场白：{cleaned}",
-                    reason=f"群冷场 {_insight(quiet_s)}，话题 {candidate['title']}",
-                    priority="normal",
-                    metadata={"candidate_id": int(candidate["id"]), "pick_fit": fit_arr[0][1]},
-                )
-                message_id = ""  # proactive_trigger 不知道 message_id
-                if not (isinstance(resp, dict) and resp.get("success")):
-                    raise HostError("proactive_trigger 返回 success=False")
-        except Exception as exc:
-            logger.exception("开话题发送失败（group=%s speaker=%s）", gid, speaker)
-            reject_reason = str(type(exc).__name__)
-            self._update_log(
-                topic_id,
+            outbox.enqueue(
+                f"topic:{topic_id}",
+                gid,
+                "text",
                 {
-                    "opener": cleaned,
-                    "message_id": "",
-                    "result": json.dumps({"error": reject_reason}, ensure_ascii=False),
+                    "text": cleaned,
+                    "push_kind": "topic",
+                    # 自动开场白的期限（保守 ≤30 分钟）：过了就别把陈旧内容发进群
+                    "expires_ts": float(now) + _OPENER_TTL_S,
+                    # 入队那一刻的冷场快照（当时本群最后一条消息时刻）：发送前复核群里
+                    # 是不是又有人说话了；拿不到这份证据 → 失败关闭作废。
+                    "cold_since_ts": float(quiet_ts),
                 },
             )
-            return f"send_failed:{reject_reason}"
-
-        # 14) 记发送成功：候选 used_ts / news_items.replies=0 / mentions / topic_log
-        now_send = clock.now()
-        self._mark_candidate_used(candidate, now_send)
-        # news_items（kind=="news" 时 ref_id）status_kind="used", status_at
-        if str(candidate.get("kind") or "") == "news" and candidate.get("ref_id"):
-            try:
-                with self._store.tx() as conn:
-                    conn.execute(
-                        "UPDATE news_items SET status_kind='used', status_at=? WHERE id=?",
-                        (now_send, int(candidate["ref_id"])),
-                    )
-            except Exception:
-                logger.exception("news_items 状态更新失败")
-        # 加进 mentions（可提起清单，4 小时）
-        try:
-            brief = str(candidate.get("brief") or candidate["title"])
-            link = str(candidate.get("link") or "")
-            mention_text = brief
-            if link:
-                mention_text += f" {link}"
-            self._mentions.add(
-                gid, mention_text,
-                key=f"topic:{topic_id}",
-                ttl_s=4 * 3600.0,
-                turns=5,
-            )
-        except Exception:
-            logger.exception("mentions.add 失败")
-        # 推送记账
-        self._pushes.record(gid, "topic", f"开场白：{cleaned[:80]}", now_send)
-        # 更新 topic_log
-        self._update_log(
-            topic_id,
-            {
-                "opener": cleaned,
-                "message_id": message_id,
-                "followup_due_ts": now_send + _FOLLOW_UP_DELAY_S,
-            },
-        )
-        return f"opened:topic_id={topic_id}"
+        except Exception as exc:
+            logger.exception("开场白入队失败（group=%s）", gid)
+            self._update_log(topic_id, {
+                "opener": "",
+                "result": json.dumps({"error": f"入队失败: {type(exc).__name__}"}, ensure_ascii=False),
+            })
+            return f"enqueue_failed:{type(exc).__name__}"
+        return f"queued:topic_id={topic_id}"
 
     # ------------------------------------------------------------------
     # follow_up：10 分钟后数 replies / followups
@@ -879,6 +927,141 @@ class Topics:
         with self._store.tx() as conn:
             conn.execute(f"UPDATE topic_log SET {', '.join(sets)} WHERE id=?", vals)
 
+    def _opener_in_flight(self, gid: str) -> bool:
+        """这个群有还没落地的开场白（发件箱里 pending / sending）吗。"""
+        row = self._store.read().execute(
+            "SELECT 1 FROM outbox WHERE group_id=? AND key LIKE 'topic:%'"
+            " AND status IN ('pending', 'sending') LIMIT 1",
+            (str(gid),),
+        ).fetchone()
+        return row is not None
+
+    def _candidate_of_log(self, topic_id: int) -> Optional[dict]:
+        """topic_log.candidate_id → 候选行（含 title / brief / link）。"""
+        row = self._store.read().execute(
+            "SELECT candidate_id FROM topic_log WHERE id=?", (int(topic_id),)
+        ).fetchone()
+        if row is None or row["candidate_id"] is None:
+            return None
+        cand = self._store.read().execute(
+            "SELECT id, kind, ref_id, title, brief, link FROM topic_candidates WHERE id=?",
+            (int(row["candidate_id"]),),
+        ).fetchone()
+        return dict(cand) if cand is not None else None
+
+    def on_before_send(self, info: dict) -> Optional[str]:
+        """发件箱发送前的新鲜度检查（挂 add_preflight_hook；同步、纯代码、不调模型）。
+
+        只在开场白（key 以 `topic:` 开头）上生效：入队时快照了 `cold_since_ts`
+        （= 当时本群最后一条消息时刻）。发送前再读一次本群最后消息时刻（intake 信号 +
+        groups.last_msg_ts），比快照新 → 群里又有人说话了，这条开场白已经不再是「冷场
+        开口」，返回原因让发件箱作废（dropped），绝不当成冷场硬发。
+
+        拿不到冷场快照、或读不到本群最新消息 → 失败关闭（作废）。
+        """
+        key = str((info or {}).get("key") or "")
+        if not key.startswith("topic:"):
+            return None
+        payload = (info or {}).get("payload") or {}
+        try:
+            snapshot = float(payload.get("cold_since_ts"))
+        except (TypeError, ValueError):
+            return "拿不到冷场快照，作废"
+        gid = str((info or {}).get("group_id") or "")
+        latest = self._latest_msg_ts(gid)
+        if latest is None:
+            return "读不到群里最新消息，作废"
+        if latest > snapshot + 1e-6:
+            return "群里又有新消息了，不再是冷场"
+        return None
+
+    def _latest_msg_ts(self, gid: str) -> Optional[float]:
+        """本群最新一条消息的时刻（信号 + groups.last_msg_ts 取大）；读不到库 → None。"""
+        latest = 0.0
+        try:
+            fn = getattr(self._signals, "last_ts", None)
+            if callable(fn):
+                latest = max(latest, float(fn(gid) or 0.0))
+        except Exception:
+            logger.debug("读本群信号时刻失败（群 %s）", gid, exc_info=True)
+        try:
+            row = self._store.read().execute(
+                "SELECT last_msg_ts FROM groups WHERE group_id=?", (str(gid),)
+            ).fetchone()
+        except Exception:
+            logger.debug("读本群最后消息时刻失败（群 %s）", gid, exc_info=True)
+            return None
+        if row is not None:
+            latest = max(latest, float(row["last_msg_ts"] or 0.0))
+        return latest
+
+    def on_result(self, info: dict) -> None:
+        """发件箱的结果回调（attach_outbox 时自动挂上）：真发出去了才回写这个话题。
+
+        - sent：写 opener / message_id / followup_due_ts，候选标 used，资讯标 used，加备忘。
+        - uncertain：可能已经说了——候选按「已用」保留（不再重复挑它），但 **opener 不写**、
+          额度由发件箱保留，网页上这条就是「不确定」。
+        - failed / dropped：什么都不占（候选还留着，下次可以再来一次）。
+        - retrying：还没定，不动。
+        """
+        key = str((info or {}).get("key") or "")
+        if not key.startswith("topic:"):
+            return
+        try:
+            topic_id = int(key.split(":", 1)[1])
+        except (TypeError, ValueError):
+            return
+        gid = str(info.get("group_id") or "")
+        payload = info.get("payload") or {}
+        text = str(payload.get("text") or "")
+        outcome = str(info.get("outcome") or "")
+        err = str(info.get("error") or "")[:_ERR_MAX]
+        try:
+            if outcome == "sent":
+                now_send = float(info.get("ts") or 0.0) or clock.now()
+                result = info.get("result") or {}
+                self._update_log(topic_id, {
+                    "opener": text,
+                    "message_id": str(result.get("message_id") or ""),
+                    "followup_due_ts": now_send + _FOLLOW_UP_DELAY_S,
+                })
+                cand = self._candidate_of_log(topic_id)
+                if cand is not None:
+                    self._mark_candidate_used(cand, now_send)
+                    if str(cand.get("kind") or "") == "news" and cand.get("ref_id"):
+                        try:
+                            with self._store.tx() as conn:
+                                conn.execute(
+                                    "UPDATE news_items SET status_kind='used', status_at=? WHERE id=?",
+                                    (now_send, int(cand["ref_id"])),
+                                )
+                        except Exception:
+                            logger.exception("news_items 状态更新失败")
+                    try:
+                        brief = str(cand.get("brief") or cand.get("title") or "")
+                        link = str(cand.get("link") or "")
+                        mention_text = brief + (f" {link}" if link else "")
+                        self._mentions.add(gid, mention_text, key=f"topic:{topic_id}",
+                                           ttl_s=4 * 3600.0, turns=5)
+                    except Exception:
+                        logger.exception("mentions.add 失败")
+            elif outcome == "uncertain":
+                # 可能已经发出去了：候选保留成「已用」，避免下一条开场白又挑它
+                self._update_log(topic_id, {
+                    "result": json.dumps(
+                        {"uncertain": "发送超时，可能已发出，不重发"}, ensure_ascii=False
+                    ),
+                })
+                cand = self._candidate_of_log(topic_id)
+                if cand is not None:
+                    self._mark_candidate_used(cand, float(info.get("ts") or 0.0) or clock.now())
+            elif outcome in ("failed", "dropped"):
+                self._update_log(topic_id, {
+                    "result": json.dumps({outcome: err or "没发出去"}, ensure_ascii=False),
+                })
+        except Exception:
+            logger.exception("开场白结果回写失败（topic_log %s，outcome=%s）", topic_id, outcome)
+
     def _mark_candidate_used(self, candidate: dict, now: float) -> None:
         with self._store.tx() as conn:
             conn.execute(
@@ -916,6 +1099,23 @@ class Topics:
     # 开场白
     # ------------------------------------------------------------------
 
+    def _group_context_safe(self, gid: str, kind: str) -> str:
+        """统一注入（docs/17 §八.2）：本群规矩 + 本群<岗>的做法；没接线 / 出错 → ""。
+
+        开场白只要规矩（注入表里「做法」一栏是 —），所以调用方一律传 kind="main"：
+        group_context 对 main 只出规矩段，不注 learned skill。
+        """
+        agents = getattr(self, "_agents", None)
+        if agents is None:
+            return ""
+        try:
+            from . import group_context as _gc
+
+            return str(_gc.group_context(agents, str(gid), kind) or "").strip()
+        except Exception:
+            logger.warning("读本群规矩 / 做法出错（群 %s 岗 %s），这次不注入", gid, kind, exc_info=True)
+            return ""
+
     async def _build_opener_prompt(
         self,
         gid: str,
@@ -942,11 +1142,13 @@ class Topics:
             user_prompt = self._idea_opener_prompt(gid, candidate, persona, recent_text)
         else:
             link = str(candidate.get("link") or "")
+            # 开场白只要规矩（不给 learned skill，不学任何岗的做法）；人格走 persona.section()
+            gc_text = self._group_context_safe(gid, "main")
+            gc_part = f"\n# 这个群的规矩（管理员定的，必须照做）\n{gc_text}\n\n" if gc_text else ""
             user_prompt = f"""群里冷场了一段时间，你随手起个话头。
 
 {persona.section()}
-
-# 群里最近的对话
+{gc_part}# 群里最近的对话
 {recent_text}
 
 # 想聊的话题（候选素材）
@@ -1008,11 +1210,12 @@ class Topics:
             )
         else:
             head = "这件事没有由头（想不起接的是哪件事），就按下面的标题 / 想法自然地问一句要不要帮忙。"
+        gc_text = self._group_context_safe(gid, "main")
+        gc_part = f"\n# 这个群的规矩（管理员定的，必须照做）\n{gc_text}\n\n" if gc_text else ""
         return f"""群里冷场了一段时间，你想顺着之前聊过的一件事问一句。
 
 {persona.section()}
-
-# 群里最近的对话
+{gc_part}# 群里最近的对话
 {recent_text}
 
 # 想聊的事（群里之前有人提过想做）
