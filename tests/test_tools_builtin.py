@@ -438,6 +438,22 @@ class TestSubmitResult:
         assert r.data["evidence"] == ["https://a.com/1"]
 
     @pytest.mark.asyncio
+    async def test_submit_result_keeps_challenge(self, store, settings):
+        """docs/20 第三步：干活的对说明有异议时写 challenge，原样交回给领队。"""
+        tools = _make(store, settings)
+        ch = {"reason": "官方下载页已经下线", "evidence": ["https://a.com/404"], "suggestion": "改用镜像站"}
+        r = await tools.call("submit_result", {"summary": "做了能做的", "challenge": ch}, _ctx())
+        assert r.ok and r.data["challenge"] == ch
+
+    @pytest.mark.asyncio
+    async def test_submit_result_drops_empty_challenge(self, store, settings):
+        tools = _make(store, settings)
+        r = await tools.call("submit_result", {"summary": "好了", "challenge": {"reason": "  "}}, _ctx())
+        assert r.ok and r.data.get("challenge") is None
+        r = await tools.call("submit_result", {"summary": "好了", "challenge": "不是对象"}, _ctx())
+        assert r.ok and r.data.get("challenge") is None
+
+    @pytest.mark.asyncio
     async def test_submit_data_as_json_string_is_parsed(self, store, settings):
         """线上实测（2026-09-28，step-5-preview）：模型把 data 写成 JSON 字符串交回，
         以前原样透传 → 调用方判「格式不对」整轮作废。现在字符串能解析成对象就当对象用。"""

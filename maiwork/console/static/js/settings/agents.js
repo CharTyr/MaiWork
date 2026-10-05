@@ -113,6 +113,8 @@ function profileForm(p) {
     <label for="agent-model">用哪个模型</label><select id="agent-model">${modelOptions(p.model, main ? "选一个模型" : "跟主模型一样")}</select>
     <label for="agent-effort">思考强度</label><select id="agent-effort">${effortOptions(p.model, p.effort)}</select>
     <label for="agent-backup">出错时换用</label><select id="agent-backup">${modelOptions(p.backup, "不用备用")}</select>
+    ${main ? "" : `<label for="agent-escalate">做不动时换用</label><select id="agent-escalate">${modelOptions(p.escalate, "用主模型的")}</select>
+    <p class="fine">派给它的活被打回两次，第三次换这个模型接着改（带着前面做过的）。和现在用的是同一个，就不再试第三次。</p>`}
     ${main ? "" : `<label class="chk"><input id="agent-enabled" type="checkbox"${p.enabled !== false ? " checked" : ""} />启用这个专岗</label>`}
     ${main ? "" : `<label>可用 skill</label><div id="agent-skills">${names.map((name) => {
       const k = catalog.find((x) => x.name === name);
@@ -392,6 +394,7 @@ export async function actAgents(action, el) {
       if (!body.title) return fail("名称不能空着。"), true;
       if (kind === "main" && !body.model) return fail("主模型一定要选一个模型。"), true;
       if (body.backup && body.backup === body.model) return fail("备用模型不能和原来的一样。"), true;
+      if ($("agent-escalate")) body.escalate = $("agent-escalate").value;
       if ($("agent-enabled")) body.enabled = $("agent-enabled").checked;
       if ($("agent-skills")) body.skills = [...document.querySelectorAll("#agent-skills input:checked")].map((x) => x.value);
       const docs = (state.agentDocs || {})[kind];

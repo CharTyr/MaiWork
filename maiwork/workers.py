@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import clock, compaction
+from . import clock, compaction, lanes
 from .models import ModelError
 from .tools import ToolContext, Tools
 
@@ -66,6 +66,8 @@ class WorkerReport:
     handoff_id: str = ""
     # 因为任务被取消 / 暂停 / 挂起而停手（不是自己干砸了）：交接单记 cancelled 不记 failed
     stopped: bool = False
+    # 任务双岗协作第三步（docs/20 §四）：对说明本身的异议 {reason, evidence, suggestion}；没提 = None
+    challenge: dict | None = None
 
 
 def _system_prompt(
@@ -171,14 +173,18 @@ class Workers:
             logger.exception("skills_hint_fn 出错，这次不带 skill 清单")
             return ""
 
-    def _context_window(self, kind: str = "task") -> int:
+    def _context_window(self, kind: str = "task", *, escalate: bool = False) -> int:
         """上下文窗口（tokens）：2026-10 改版起认「所选模型」的窗口
         （models.limits_for(<岗位>)，岗位是 task / news / goal / c_xxx…，跟本轮 agent 走）；
         取不到回落旧全局值，再用默认 128000。"""
         try:
             fn = getattr(self._models, "limits_for", None)
             if callable(fn):
-                v = int((fn(str(kind or "task") or "task") or {}).get("context_window") or 0)
+                if escalate:
+                    lim = fn(str(kind or "task") or "task", escalate=True)
+                else:
+                    lim = fn(str(kind or "task") or "task")
+                v = int((lim or {}).get("context_window") or 0)
                 if v > 0:
                     return v
         except Exception:
@@ -227,6 +233,11 @@ class Workers:
         # 只涉及执行身份、不涉及模型选型的调用方不用动）
         agent: str | None = None,
         used_tools: set[str] | None = None,
+        # 任务双岗协作（docs/20 §6.2）：lane 的持久对话（不含 system）。给了就接着上次干，
+        # 跑完原地换成这一轮结束时的对话；None = 老做法（每次全新对话，资讯/构想/目标用）。
+        history: list[dict] | None = None,
+        # 第 2 次没过换升级模型（docs/20 §5.3）：原样透传给 models.chat
+        escalate: bool = False,
     ) -> WorkerReport:
         # 本轮硬权限工具名单：默认 = 请求 tools + submit_result（每轮都硬门）；
         # allowed_tools 给了再收窄成「请求 ∩ allowed_tools」（submit_result 保底）。
@@ -250,8 +261,10 @@ class Workers:
                 actor, group_id, output_schema, self._hint(skills_hint),
                 identity=self._identity, extra_system=system_extra, agent=str(agent_type or "task"),
             )},
-            {"role": "user", "content": str(brief)},
         ]
+        if history:
+            messages.extend(lanes.prepare_history(history, allowed=hard_tools))
+        messages.append({"role": "user", "content": str(brief)})
         ctx = ToolContext(
             group_id=str(group_id),
             task_id=str(task_id),
@@ -266,167 +279,176 @@ class Workers:
                 tuple(str(x) for x in allowed_skills) if allowed_skills is not None else None
             ),
         )
-        steps = 0
-        nudges = 0
-        progress: list[str] = []  # 已有进展（失败 / 交回不了时汇报用）
-        nudger = compaction.RepeatCallNudger()
-        # 模型岗位 = 干活身份（agent=… 没给就用 agent_type）：岗位自己的模型/强度/备用
-        # 自动生效；没配该岗候选的在 Models 侧兜底主模型链。
-        agent_kind = str(agent or agent_type or "task")
-        context_window = self._context_window(agent_kind)
-        wrapped_up = False  # 到期强制交回的标记（一次：append 提示 + 只给 submit_result）
-        spill_dir = None
-        if workspace is not None and task_id:
-            try:
-                spill_dir = Path(workspace) / "tool_spill" / str(task_id)
-            except Exception:
-                spill_dir = None
-
-        while True:
-            # 0 = 不限；给了正的 max_steps 还按老规矩收尾（兼容）
-            if max_steps and steps >= max_steps:
-                break
-            # 安全网：单任务 token / 时长超限 → 自动 paused（不再调模型）。
-            # coordinator 的 _chat_main 同样会查；子 agent 长跑的那段时间靠这里兜底。
-            if task_id and self._tasks is not None:
+        try:
+            steps = 0
+            nudges = 0
+            progress: list[str] = []  # 已有进展（失败 / 交回不了时汇报用）
+            nudger = compaction.RepeatCallNudger()
+            # 模型岗位 = 干活身份（agent=… 没给就用 agent_type）：岗位自己的模型/强度/备用
+            # 自动生效；没配该岗候选的在 Models 侧兜底主模型链。
+            agent_kind = str(agent or agent_type or "task")
+            context_window = self._context_window(agent_kind, escalate=escalate)
+            wrapped_up = False  # 到期强制交回的标记（一次：append 提示 + 只给 submit_result）
+            spill_dir = None
+            if workspace is not None and task_id:
                 try:
-                    reason = self._tasks.net_check(task_id)
+                    spill_dir = Path(workspace) / "tool_spill" / str(task_id)
                 except Exception:
-                    reason = None
-                if reason:
-                    return WorkerReport(
-                        ok=False,
-                        summary=(
-                            "任务被安全网自动暂停（{}），子 agent 停手，没跑完的从恢复那刻接着干"
-                        ).format(
-                            "token 超线" if reason.get("kind") == "tokens" else "时长超线"
-                        ),
-                        steps=steps,
-                        error="任务被安全网自动暂停",
-                    )
-            # 时间盒（feeds 资讯收集 15 分钟这类）：到点把「已找到的」立即交回，
-            # 不是丢弃——一次强制交回机会（只给 submit_result），交不成按失败收场。
-            if deadline_ts is not None and clock.now() >= deadline_ts:
-                if wrapped_up:
-                    return WorkerReport(
-                        ok=False,
-                        summary=f"到点了，子 agent 没能用 submit_result 把已找到的交回。已有进展：{self._progress_text(progress)}",
-                        steps=steps,
-                        error="时间到，子 agent 没交回",
-                    )
-                wrapped_up = True
-                if specs:
-                    specs = [
-                        x for x in (specs or [])
-                        if (x.get("function") or {}).get("name") == "submit_result"
-                    ] or specs
-                # 硬权限同步收紧：到期后只剩 submit_result 可调（Tools.call 层也会拦）。
-                ctx.allowed_tools = ("submit_result",)
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "时间到了：请立刻用 submit_result 把已经找到的东西交回"
-                            "（summary 必填；部分结果也算；没找到合格的就如实交回空结果并说明原因）。"
-                        ),
-                    }
-                )
-                nudger.note_user_message()
-            # 每一步开头查一次任务状态：终态 / 暂停 / 挂起等到不该继续的状态立刻停——
-            # 不再调模型、不再交付（线上踩过「取消了子 agent 还跑 40 秒」）
-            status = self._task_status(task_id)
-            if task_id and status:
-                if status in ("cancelled", "completed", "failed", "rejected"):
-                    return WorkerReport(
-                        ok=False,
-                        summary=f"任务已是「{status}」，子 agent 停手，不再调模型",
-                        steps=steps,
-                        error="任务已取消或结束",
-                        stopped=True,
-                    )
-                if status in ("paused", "waiting_input", "shelved"):
-                    return WorkerReport(
-                        ok=False,
-                        summary=f"任务已「{status}」，子 agent 先停手；任务恢复后再来",
-                        steps=steps,
-                        error="任务已暂停" if status == "paused" else "任务已挂起",
-                        stopped=True,
-                    )
-            steps += 1
-            # 上下文压缩：估算超触发线先截旧 tool 结果（不调模型），仍超再摘要最老一段。
-            # 摘要失败原样继续（maybe_compact 内部吞掉，不抛）。
-            try:
-                messages = await compaction.maybe_compact(
-                    messages,
-                    models=self._models,
-                    role="worker",
-                    agent=agent_kind,
-                    context_window=context_window,
-                    output_reserve=compaction.DEFAULT_OUTPUT_RESERVE,
-                    purpose="worker",
-                    group_id=str(group_id),
-                    task_id=str(task_id),
-                    keep_recent_n=1,
-                )
-            except Exception:
-                logger.exception("上下文压缩失败（%s），原样继续", actor)
-            try:
-                result = await compaction.chat_with_retry_on_long_context(
-                    messages,
-                    models=self._models,
-                    role="worker",
-                    agent=agent_kind,
-                    tools=specs or None,
-                    purpose="worker",
-                    group_id=str(group_id),
-                    task_id=str(task_id),
-                    on_trim=lambda trimmed: messages.__setitem__(slice(None), list(trimmed)),
-                )
-            except ModelError as e:
-                logger.warning("子 agent（%s）模型调用失败：%s", actor, e.message)
-                return WorkerReport(ok=False, summary="", steps=steps, error=f"模型调用失败：{e.message}")
+                    spill_dir = None
 
-            # 记录 assistant 这一轮（有文本留作进展参考）
-            if result.text.strip():
-                progress.append(result.text.strip()[:200])
-
-            tool_calls = result.tool_calls or []
-            if not tool_calls:
-                if result.text.strip() and nudges < _MAX_NUDGES:
-                    nudges += 1
-                    messages.append({"role": "assistant", "content": result.text})
+            while True:
+                # 0 = 不限；给了正的 max_steps 还按老规矩收尾（兼容）
+                if max_steps and steps >= max_steps:
+                    break
+                # 安全网：单任务 token / 时长超限 → 自动 paused（不再调模型）。
+                # coordinator 的 _chat_main 同样会查；子 agent 长跑的那段时间靠这里兜底。
+                if task_id and self._tasks is not None:
+                    try:
+                        reason = self._tasks.net_check(task_id)
+                    except Exception:
+                        reason = None
+                    if reason:
+                        return WorkerReport(
+                            ok=False,
+                            summary=(
+                                "任务被安全网自动暂停（{}），子 agent 停手，没跑完的从恢复那刻接着干"
+                            ).format(
+                                "token 超线" if reason.get("kind") == "tokens" else "时长超线"
+                            ),
+                            steps=steps,
+                            error="任务被安全网自动暂停",
+                        )
+                # 时间盒（feeds 资讯收集 15 分钟这类）：到点把「已找到的」立即交回，
+                # 不是丢弃——一次强制交回机会（只给 submit_result），交不成按失败收场。
+                if deadline_ts is not None and clock.now() >= deadline_ts:
+                    if wrapped_up:
+                        return WorkerReport(
+                            ok=False,
+                            summary=f"到点了，子 agent 没能用 submit_result 把已找到的交回。已有进展：{self._progress_text(progress)}",
+                            steps=steps,
+                            error="时间到，子 agent 没交回",
+                        )
+                    wrapped_up = True
+                    if specs:
+                        specs = [
+                            x for x in (specs or [])
+                            if (x.get("function") or {}).get("name") == "submit_result"
+                        ] or specs
+                    # 硬权限同步收紧：到期后只剩 submit_result 可调（Tools.call 层也会拦）。
+                    ctx.allowed_tools = ("submit_result",)
                     messages.append(
                         {
                             "role": "user",
-                            "content": "请调用 submit_result 工具把成果交回（summary 必填）；没干完就继续用工具干活。",
+                            "content": (
+                                "时间到了：请立刻用 submit_result 把已经找到的东西交回"
+                                "（summary 必填；部分结果也算；没找到合格的就如实交回空结果并说明原因）。"
+                            ),
                         }
                     )
                     nudger.note_user_message()
-                    continue
-                # 不调工具也没东西可催了 → 判失败
-                return WorkerReport(
-                    ok=False,
-                    summary=f"子 agent 一直没调用 submit_result 交回，催促两次后还是只说话不调工具。已有进展：{self._progress_text(progress)}",
-                    steps=steps,
-                    error="子 agent 没有通过 submit_result 交回",
-                )
+                # 每一步开头查一次任务状态：终态 / 暂停 / 挂起等到不该继续的状态立刻停——
+                # 不再调模型、不再交付（线上踩过「取消了子 agent 还跑 40 秒」）
+                status = self._task_status(task_id)
+                if task_id and status:
+                    if status in ("cancelled", "completed", "failed", "rejected"):
+                        return WorkerReport(
+                            ok=False,
+                            summary=f"任务已是「{status}」，子 agent 停手，不再调模型",
+                            steps=steps,
+                            error="任务已取消或结束",
+                            stopped=True,
+                        )
+                    if status in ("paused", "waiting_input", "shelved"):
+                        return WorkerReport(
+                            ok=False,
+                            summary=f"任务已「{status}」，子 agent 先停手；任务恢复后再来",
+                            steps=steps,
+                            error="任务已暂停" if status == "paused" else "任务已挂起",
+                            stopped=True,
+                        )
+                steps += 1
+                # 上下文压缩：估算超触发线先截旧 tool 结果（不调模型），仍超再摘要最老一段。
+                # 摘要失败原样继续（maybe_compact 内部吞掉，不抛）。
+                try:
+                    compacted = await compaction.maybe_compact(
+                        messages,
+                        models=self._models,
+                        role="worker",
+                        agent=agent_kind,
+                        context_window=context_window,
+                        output_reserve=compaction.DEFAULT_OUTPUT_RESERVE,
+                        purpose="worker",
+                        group_id=str(group_id),
+                        task_id=str(task_id),
+                        keep_recent_n=1,
+                    )
+                    if compacted is not messages:
+                        # 原地替换：外层 finally 要拿同一个列表写回 lane 的 history
+                        messages[:] = list(compacted)
+                except Exception:
+                    logger.exception("上下文压缩失败（%s），原样继续", actor)
+                try:
+                    result = await compaction.chat_with_retry_on_long_context(
+                        messages,
+                        models=self._models,
+                        role="worker",
+                        agent=agent_kind,
+                        tools=specs or None,
+                        purpose="worker",
+                        group_id=str(group_id),
+                        task_id=str(task_id),
+                        on_trim=lambda trimmed: messages.__setitem__(slice(None), list(trimmed)),
+                        **({"escalate": True} if escalate else {}),
+                    )
+                except ModelError as e:
+                    logger.warning("子 agent（%s）模型调用失败：%s", actor, e.message)
+                    return WorkerReport(ok=False, summary="", steps=steps, error=f"模型调用失败：{e.message}")
 
-            # OpenAI 规范：tool 结果前面必须先有这条 assistant(tool_calls)，否则严格的端点直接 400
-            # （线上实测踩到：子 agent 一步都走不下去，资讯一批都出不来）
-            messages.append({"role": "assistant", "content": result.text or "", "tool_calls": tool_calls})
-            submitted = await self._run_tool_calls(tool_calls, ctx, messages, nudger, spill_dir)
-            if submitted is not None:
-                report = submitted
-                report.steps = steps
-                return report
+                # 记录 assistant 这一轮（有文本留作进展参考）
+                if result.text.strip():
+                    progress.append(result.text.strip()[:200])
 
-        # 给了 max_steps（>0）且用完：兼容的老失败路径
-        return WorkerReport(
-            ok=False,
-            summary=f"步数用完（{max_steps} 步）：子 agent 没能交回。已有进展：{self._progress_text(progress)}",
-            steps=steps,
-            error="步数用完",
-        )
+                tool_calls = result.tool_calls or []
+                if not tool_calls:
+                    if result.text.strip() and nudges < _MAX_NUDGES:
+                        nudges += 1
+                        messages.append({"role": "assistant", "content": result.text})
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": "请调用 submit_result 工具把成果交回（summary 必填）；没干完就继续用工具干活。",
+                            }
+                        )
+                        nudger.note_user_message()
+                        continue
+                    # 不调工具也没东西可催了 → 判失败
+                    return WorkerReport(
+                        ok=False,
+                        summary=f"子 agent 一直没调用 submit_result 交回，催促两次后还是只说话不调工具。已有进展：{self._progress_text(progress)}",
+                        steps=steps,
+                        error="子 agent 没有通过 submit_result 交回",
+                    )
+
+                # OpenAI 规范：tool 结果前面必须先有这条 assistant(tool_calls)，否则严格的端点直接 400
+                # （线上实测踩到：子 agent 一步都走不下去，资讯一批都出不来）
+                messages.append({"role": "assistant", "content": result.text or "", "tool_calls": tool_calls})
+                submitted = await self._run_tool_calls(tool_calls, ctx, messages, nudger, spill_dir)
+                if submitted is not None:
+                    report = submitted
+                    report.steps = steps
+                    return report
+
+            # 给了 max_steps（>0）且用完：兼容的老失败路径
+            return WorkerReport(
+                ok=False,
+                summary=f"步数用完（{max_steps} 步）：子 agent 没能交回。已有进展：{self._progress_text(progress)}",
+                steps=steps,
+                error="步数用完",
+            )
+        finally:
+            if history is not None:
+                # 写回这一轮结束时的对话（不含 system；悬着的工具调用补回复），由调用方落库
+                history[:] = lanes.close_dangling_tool_calls(messages[1:])
 
     @staticmethod
     def _progress_text(progress: list[str]) -> str:
@@ -470,6 +492,7 @@ class Workers:
                     summary=str(data.get("summary") or ""),
                     data=data.get("data"),
                     evidence=[str(x) for x in evidence] if isinstance(evidence, list) else [],
+                    challenge=data.get("challenge") if isinstance(data.get("challenge"), dict) else None,
                 )
 
             # 其余（或 submit 失败）→ 把结果作为 role=tool 消息回给模型继续

@@ -217,12 +217,14 @@ class TestStep31ChatFeedsHistory:
 
 
 # ----------------------------------------------------------------------
-# 全量迁移：库号 34，两张历史表由追加的 DROP 步骤收尾
+# 全量迁移：库号 35（34 之后加 task_lanes），两张历史表由追加的 DROP 步骤收尾
 # ----------------------------------------------------------------------
 
 class TestFullMigrate:
-    def test_latest_version_is_34(self) -> None:
-        assert LATEST == 34, "库号不能变：只是把历史步骤恢复原样，没有新增/删除步骤"
+    def test_latest_version_is_35(self) -> None:
+        # 34 = 历史步骤恢复原样后的库号；35 = 任务双岗协作的 task_lanes（docs/20）
+        assert LATEST == 35, "库号只因 docs/20 新增 task_lanes 一步"
+        assert store_mod._MIGRATIONS[34].__name__ == "_m_task_lanes"
 
     def test_fresh_db_has_no_history_tables_at_34(self, store: Store) -> None:
         """新库一路迁到最新：两张历史表建了又被后面的 DROP 拆掉，终态干净。"""
@@ -254,7 +256,7 @@ class TestFullMigrate:
         启动迁移的输入（migrations.py 要读老提醒），在这里拆掉就丢数据了。"""
         s = Store(tmp_path / "keep.db")
         try:
-            _run_steps(s, LATEST - 1)  # 跑到第 33 步
+            _run_steps(s, 33)  # 跑到第 33 步
             with s.tx() as conn:
                 conn.execute(
                     "CREATE TABLE agent_memory_notes"
@@ -263,8 +265,8 @@ class TestFullMigrate:
                 conn.execute(
                     "INSERT INTO agent_memory_notes VALUES ('900000001', 'news', '老提醒', 1.0)"
                 )
-            assert store_mod._MIGRATIONS[-1].__name__ == "_m_agent_skills_group_rules"
-            store_mod._MIGRATIONS[-1](s.read())  # 只跑第 34 步
+            assert store_mod._MIGRATIONS[33].__name__ == "_m_agent_skills_group_rules"
+            store_mod._MIGRATIONS[33](s.read())  # 只跑第 34 步
             rows = s.read().execute("SELECT notes FROM agent_memory_notes").fetchall()
             assert [r["notes"] for r in rows] == ["老提醒"], "第 34 步不该动迁移输入表"
         finally:

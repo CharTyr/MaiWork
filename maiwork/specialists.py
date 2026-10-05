@@ -219,6 +219,10 @@ class Specialists:
         max_steps: int = 0,
         artifact_scope: Any = None,
         criteria: Any = None,
+        # 任务双岗协作（docs/20 §5.3）：干活 lane 的前情（同一个列表透传，Workers 原地写回）
+        # 和「换升级模型」；没给就不传，资讯/构想/目标照旧每次全新对话。
+        history: list[dict] | None = None,
+        escalate: bool = False,
     ) -> WorkerReport:
         gid = str(group_id or "")
         kind_s = str(kind or "").strip()
@@ -276,6 +280,11 @@ class Specialists:
         # 每群三份（docs/17 §八.2）：本群规矩（硬规矩）+ 本群<岗>的做法（参考）
         if gc_text:
             extra_parts.append(gc_text)
+        if history is not None:
+            # 任务双岗协作：带 lane 的活（只有任务流程会给 history）可以对说明提异议
+            from .lanes import LANE_WORKER_RULES
+
+            extra_parts.append(LANE_WORKER_RULES)
         system_extra = "\n\n".join(extra_parts)
 
         # 5) 登记交接单（begin → running → returned/fail；绝不 auto accept）
@@ -308,6 +317,11 @@ class Specialists:
         actor_s = str(actor or "").strip() or f"{kind_s} 专岗"
         used_tools: set[str] = set()
         telemetry = {"used_tools": used_tools} if kind_s == "task" else {}
+        lane_kw: dict[str, Any] = {}
+        if history is not None:
+            lane_kw["history"] = history
+        if escalate:
+            lane_kw["escalate"] = True
         try:
             report = await self._workers.run(
                 str(brief),
@@ -326,6 +340,7 @@ class Specialists:
                 allowed_tools=tuple(effective_tools),
                 allowed_skills=allowed_skills,
                 **telemetry,
+                **lane_kw,
             )
         except asyncio.CancelledError:
             try:

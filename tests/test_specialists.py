@@ -705,3 +705,53 @@ async def test_task_profile_tools_none_keeps_unrestricted(store, skills):
                  tools=["read_file", "run_command", "submit_result"])
     # task 的全部请求 tools 通过（但 workers 那层还会把它们当硬名单，所以这是上限）
     assert set(workers.calls[0].tools) == {"read_file", "run_command", "submit_result"}
+
+
+# ----------------------------------------------------------------------
+# 任务双岗协作（docs/20 §5.3）：lane 前情 / 升级模型透传给 Workers
+# ----------------------------------------------------------------------
+
+
+class _LaneWorkers(FakeWorkers):
+    def __init__(self):
+        super().__init__()
+        self.lane_kw: list[dict] = []
+
+    async def run(self, brief, *, history=None, escalate=None, **kw):
+        self.lane_kw.append({"history": history, "escalate": escalate, "system_extra": kw.get("system_extra", "")})
+        if history is not None:
+            history.append({"role": "user", "content": brief})
+        return await super().run(brief, **kw)
+
+
+@pytest.mark.asyncio
+async def test_lane_history_and_escalate_passthrough(store, skills):
+    agents = FakeAgents()
+    workers = _LaneWorkers()
+    sp = _mk_specialists(agents, workers, skills)
+    history: list[dict] = [{"role": "user", "content": "上一轮"}]
+    await sp.run("task", "返工", group_id="900000001", task_id="T-1", history=history, escalate=True)
+    assert workers.lane_kw[0]["history"] is history, "同一个列表透传，Workers 原地写回"
+    assert workers.lane_kw[0]["escalate"] is True
+    assert history[-1] == {"role": "user", "content": "返工"}
+
+
+@pytest.mark.asyncio
+async def test_no_lane_kwargs_by_default(store, skills):
+    agents = FakeAgents()
+    workers = _LaneWorkers()
+    sp = _mk_specialists(agents, workers, skills)
+    await sp.run("news", "找资讯", group_id="900000001")
+    assert {k: workers.lane_kw[0][k] for k in ("history", "escalate")} == {"history": None, "escalate": None}
+
+
+@pytest.mark.asyncio
+async def test_lane_rules_only_for_lane_runs(store, skills):
+    """docs/20 第三步：带 lane 的活告诉子 agent 可以对说明提异议（challenge）；别的岗位不变。"""
+    agents = FakeAgents()
+    workers = _LaneWorkers()
+    sp = _mk_specialists(agents, workers, skills)
+    await sp.run("task", "做页", group_id="900000001", task_id="T-1", history=[])
+    await sp.run("news", "找资讯", group_id="900000001")
+    assert "challenge" in workers.lane_kw[0]["system_extra"]
+    assert "challenge" not in workers.lane_kw[1]["system_extra"]

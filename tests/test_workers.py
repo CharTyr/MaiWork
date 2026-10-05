@@ -68,7 +68,8 @@ def tools(store):
         return ToolResult(
             ok=True,
             output=args.get("summary", ""),
-            data={"summary": args.get("summary", ""), "data": args.get("data"), "evidence": args.get("evidence", [])},
+            data={"summary": args.get("summary", ""), "data": args.get("data"), "evidence": args.get("evidence", []),
+                  **({"challenge": args["challenge"]} if isinstance(args.get("challenge"), dict) else {})},
         )
 
     from CharTyr_MaiWork.maiwork.tools import Tool

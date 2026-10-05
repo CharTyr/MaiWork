@@ -111,6 +111,7 @@ _API_LIST_DATA_MAX = 1000       # 列表/详情里的 data 截断到这个量级
 _PROFILE_FIELDS = (
     "title", "instructions", "skills", "enabled", "fish_seed",
     "model", "effort", "backup",  # 2026-10 改版：每个岗位（含 main）自己挑模型
+    "escalate",  # 任务双岗协作（docs/20 §5.3）：做不动时换用的模型；空 = 主模型的链
 )  # 网页可改；tools 不行
 
 _FISH_SEED_MAX = 32
@@ -160,6 +161,7 @@ def _default_profiles() -> dict[str, dict[str, Any]]:
             "model": "",
             "effort": "",
             "backup": "",
+            "escalate": "",
         },
         "news": {
             "kind": "news",
@@ -172,6 +174,7 @@ def _default_profiles() -> dict[str, dict[str, Any]]:
             "model": "",
             "effort": "",
             "backup": "",
+            "escalate": "",
         },
         "idea": {
             "kind": "idea",
@@ -184,6 +187,7 @@ def _default_profiles() -> dict[str, dict[str, Any]]:
             "model": "",
             "effort": "",
             "backup": "",
+            "escalate": "",
         },
         "goal": {
             "kind": "goal",
@@ -196,6 +200,7 @@ def _default_profiles() -> dict[str, dict[str, Any]]:
             "model": "",
             "effort": "",
             "backup": "",
+            "escalate": "",
         },
         "task": {
             "kind": "task",
@@ -208,6 +213,7 @@ def _default_profiles() -> dict[str, dict[str, Any]]:
             "model": "",
             "effort": "",
             "backup": "",
+            "escalate": "",
         },
     }
 
@@ -315,6 +321,8 @@ class Agents:
             raise ValueError(f"不允许改的字段：{sorted(bad)}")
         current = self.profile(kind_s)
         model_entries = _model_entries_of(self._settings())
+        if kind_s == "main" and "escalate" in patch:
+            raise ValueError("主模型岗没有「做不动时换用」：它只排计划和验收，不亲自干活")
         clean = _validate_profile_patch(patch, model_entries=model_entries, current=current)
         self._ensure_schema()
         with self._store.tx() as conn:
@@ -382,6 +390,10 @@ class Agents:
                 p["model"] = model_id
                 p["effort"] = effort
                 p["backup"] = backup
+                esc = entry.get("escalate")
+                p["escalate"] = (
+                    esc if kind != "main" and isinstance(esc, str) and esc in model_entries else ""
+                )
         return merged
 
     # ------------------------------------------------------------------
@@ -434,6 +446,7 @@ class Agents:
                 "model": "",
                 "effort": "",
                 "backup": "",
+                "escalate": "",
             }
             self._store.kv_set(conn, _KV_PROFILES, raw)
         return self.profile(kind)
@@ -1624,6 +1637,7 @@ def _copy_profile(p: dict[str, Any]) -> dict[str, Any]:
     out["model"] = str(p.get("model") or "")
     out["effort"] = str(p.get("effort") or "")
     out["backup"] = str(p.get("backup") or "")
+    out["escalate"] = str(p.get("escalate") or "")
     return out
 
 
@@ -1761,6 +1775,14 @@ def _validate_profile_patch(
         if v and v not in model_entries:
             raise ValueError(f"模型库里没有 id 是「{v}」的条目（先在「模型」页加进来）")
         clean["backup"] = v
+    if "escalate" in patch:
+        v = patch["escalate"]
+        if not isinstance(v, str):
+            raise ValueError("escalate 要是字符串（模型库里条目的 id）")
+        v = v.strip()
+        if v and v not in model_entries:
+            raise ValueError(f"模型库里没有 id 是「{v}」的条目（先在「模型」页加进来）")
+        clean["escalate"] = v
     if "effort" in patch:
         v = patch["effort"]
         if not isinstance(v, str):

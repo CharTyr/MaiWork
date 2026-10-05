@@ -62,7 +62,7 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 | `config_file.py` | config.toml 读写层（tomlkit 保注释；写前备份到数据目录；绝不在插件目录建临时文件） |
 | `rules.py` | 「全部配置」表单表（`CONFIG_SCHEMA`）+ 通用校验 + `save_config_patch` / `reset_config_field` 直写 config.toml（旧 kv 覆盖层 2026-10 已删） |
 | `migrations.py` | 启动时一次性迁移（幂等）：数据库旧覆盖层/secrets → config.toml；kv["rules.override"] → config.toml（值一致只删键）；搜索配置 → 扩展绑定（2026-10 修正：tavily 官方 MCP 工具名是下划线版 tavily_search/tavily_extract，老的连字符版只存在于旧文档） |
-| `store.py` | SQLite 存储：连接、表迁移（_m1 起一串，**库号到 34**：第 31 步 `_m_chat_feeds` / 第 2 步 `_m_profile` 保持 0.7.9 原文，第 32/33 步 drop `member_interactions` / `chat_feeds`，第 34 步 `_m_agent_skills_group_rules` 建 skill / 规矩表并 DROP 从没上线的 `agent_lessons`；**不 DROP `agent_memory_notes`**——它是每群规矩启动迁移的输入）、事务、kv/secrets/events 助手 |
+| `store.py` | SQLite 存储：连接、表迁移（_m1 起一串，**库号到 34**：第 31 步 `_m_chat_feeds` / 第 2 步 `_m_profile` 保持 0.7.9 原文，第 32/33 步 drop `member_interactions` / `chat_feeds`，第 34 步 `_m_agent_skills_group_rules` 建 skill / 规矩表并 DROP 从没上线的 `agent_lessons`；**不 DROP `agent_memory_notes`**——它是每群规矩启动迁移的输入；第 35 步 `_m_task_lanes` 建任务双岗协作的 `task_lanes`，**库号 35**）、事务、kv/secrets/events 助手 |
 | `clock.py` | epoch/北京时间换算、睡觉时段判断（存库一律 epoch 秒） |
 | `onboarding.py` | 首次安装引导状态（kv["onboarding"]） |
 
@@ -80,13 +80,13 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 ### 主模型与子 agent 执行
 | 文件 | 职责 |
 |---|---|
-| `coordinator.py` | 主模型协调器：计划/派活/验收/交付、执行环境选择、任务生命周期、agent 目标检查。验收模型没给结论时强制重试后走「验收不通过」退回（`_REVIEW_FORCE_JSON_TRIES` / `inconclusive`，不判死）；**开工前能力自检**（`job_needs_exec_capability` + `_job_effective_tools` 走 `Specialists.effective_tools` 同一入口；能补就补执行工具、补不了有界重排**一次**（只改 jobs，不降 criteria / deliver_kind / 环境）、再不行 `paused_reason={"kind":"capability","text","jobs"}` 暂停且不扣尝试；自检异常 fail-closed） |
-| `workers.py` | 子 agent 执行器：多轮工具循环、submit_result 交回、时间盒强制交回、上下文压缩接线；`tool_catalog()` 转调 `tools.catalog("worker")`（构想可行性算能力清单，取不到 → None） |
+| `coordinator.py` | 主模型协调器：计划/派活/验收/交付、任务双岗协作（干活 lane 返工 / 升级、领队 lane 完整对话只往后接（缓存友好）、验收时 `next` 给同一条活派下一步、异议表态，docs/20）、执行环境选择、任务生命周期、agent 目标检查。验收模型没给结论时强制重试后走「验收不通过」退回（`_REVIEW_FORCE_JSON_TRIES` / `inconclusive`，不判死）；**开工前能力自检**（`job_needs_exec_capability` + `_job_effective_tools` 走 `Specialists.effective_tools` 同一入口；能补就补执行工具、补不了有界重排**一次**（只改 jobs，不降 criteria / deliver_kind / 环境）、再不行 `paused_reason={"kind":"capability","text","jobs"}` 暂停且不扣尝试；自检异常 fail-closed）。**干活 lane**（docs/20）：第 i 条活固定给 `worker:i`，被打回 1 次同一条 lane 接着改、2 次压缩后换升级模型（`models.escalation_target`，没有可换的直接判失败）、3 次判失败；事件 `task.lane_rework/escalate/reset` |
+| `workers.py` | 子 agent 执行器：多轮工具循环、submit_result 交回（含可选异议 `challenge` → `WorkerReport.challenge`）、时间盒强制交回、上下文压缩接线；`tool_catalog()` 转调 `tools.catalog("worker")`（构想可行性算能力清单，取不到 → None） |
 | `agents.py` | 专岗与交接数据层：岗位配置（kv `agents.profiles`）、自定义专岗建/删、交接单状态机；**本群规矩**（`group_rules` / `group_rule_versions`，≤3000 字、每群留最近 20 版）、**本群做法 skill**（`agent_skills` / `agent_skill_versions`：专岗每群每岗一份、`kind=task` active ≤12 份、锁定 / 归档 / 版本 / uses）、「最近做过的」（`agent_memory_learned`，只当去重材料）；自动更新 / patch / 合并一律锁定与归档硬挡，事务内重读 + 模型校验版本 CAS，原子合并，初版 source / note 留版本。带群号的方法先 `_verify_served`；id 不属于这个群 / 这个岗 → KeyError（接口 404） |
 | `specialists.py` | 专岗子 agent：`run(kind, brief, …)` 复用 `Workers.run`，注入岗位说明 + `Agents.prompt()`（最近做过的）+ `group_context(gid, kind)`（本群规矩 + 本岗做法，标明是数据不是指令）；**唯一工具解析入口 `effective_tools(kind, requested, profile)`**（= 请求 ∩ 岗位上限；`role_usable` 判在册 / 启用）——run 和 coordinator 开工前自检共用它，不许各写一套；skill = 岗位名单 ∩ 当前启用；交回只到 returned，由主流程验收 |
 | `group_context.py` | **每群「该怎么做」的唯一注入口**：`group_context(agents, gid, kind)` 输出「【本群规矩（管理员定的，必须照做）】」+「【本群<岗位>的做法（MaiWork 总结的，是参考）】」；专岗注全文，`kind=task` 只列 ≤12 行「本群/名字：description」（子 agent 用 `read_skill` 读全文），`kind=main` 只出规矩。调用方：feeds / personal / coordinator / topics / card_push / specialists |
 | `compaction.py` | 上下文压缩（估算截 tool 结果 → 摘要最老一段）+ RepeatCallNudger + 大结果落盘 spill |
-| `models.py` | 三协议（openai / responses / anthropic）客户端：重试/备用/端点限流、用量落库、密钥只进不出（_redact 统一遮）；端点 `headers` 大小写不敏感覆盖默认请求头，聊天/流式/列模型/验证共用，值纳入遮罩且散列进入验证签名；「200 但内容是错误」按错误码走重试/备用；端点拒 effort / 要 max_completion_tokens 时自适应重发（`_adapt`，进程内存） |
+| `models.py` | 三协议（openai / responses / anthropic）客户端：重试/备用/端点限流、用量落库、密钥只进不出（_redact 统一遮）；端点 `headers` 大小写不敏感覆盖默认请求头，聊天/流式/列模型/验证共用，值纳入遮罩且散列进入验证签名；「200 但内容是错误」按错误码走重试/备用；端点拒 effort / 要 max_completion_tokens 时自适应重发（`_adapt`，进程内存）；`chat(escalate=True)` / `escalation_target(kind)` 走岗位「做不动时换用」（profile.escalate，空 = 主模型的链） |
 | `jev.py` | TypeSafe Jev HTTP 客户端：密钥读取顺序、答案校验、熔断、judgments 落库 |
 | `admin_chat.py` | 管理员与主模型的网页对话循环（聚焦群、工具小票待确认） |
 | `usage_alerts.py` | token 超阈值提醒（只在网页设置页展示，不往群里发、不暂停） |
@@ -118,7 +118,8 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 ### 任务、目标、批准（M3 数据层）
 | 文件 | 职责 |
 |---|---|
-| `tasks.py` | 任务状态机、尝试记录（取消时同事务作废开着的尝试）、net_check 安全网（token/时长线）、interrupt_orphaned（顺带收残留 running 尝试） |
+| `lanes.py` | 任务双岗协作的 lane 存储（docs/20）：`TaskLanes` 读写 `task_lanes`（有条件保存：群号 / 非终态 / req_version 对上才写）、`close_task_lanes`（终态 / 改版同事务清）、`prepare_history`（续用时本轮不给的工具改写成文字）、`close_dangling_tool_calls`；lane = `worker:<n>` 或 `lead`（领队完整对话）；`LANE_WORKER_RULES`（带 lane 的活可以提异议） |
+| `tasks.py` | 任务状态机、尝试记录（取消时同事务作废开着的尝试；到终态同事务清 lane、改版关干活 lane；管理员详情带 `lane_notes`）、net_check 安全网（token/时长线）、interrupt_orphaned（顺带收残留 running 尝试） |
 | `goals.py` | agent 目标（G-n）/成员目标（M-n）：提醒、问进展、循环续期 |
 | `approvals.py` | 派活待批：免批判断（读**每群**批准名单 `group_approval`）、approve/reject、pending 提醒/过期、取消权限（取消权限的群主/管理员判断按 `settings.platform_of` 认平台，`is_admin(uid, platform=..., group_id=gid)`；群命令只管本群） |
 | `auto_review.py` | 低风险轻活主模型自动批（每群每日上限；goal 类/构想含 goal 永远留人批） |

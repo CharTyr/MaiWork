@@ -998,8 +998,34 @@ def _m_agent_skills_group_rules(conn: sqlite3.Connection) -> None:
     )
 
 
+# 任务双岗协作（docs/20）：每个任务的领队 / 干活 lane 各一份持久对话。
+# - 只在同一个任务内部记前情：任务到终态由 Tasks.transition 同一事务清空 messages 并 closed；
+# - messages 不含 system（system 每轮按当时的规矩 / 权限现算）；
+# - req_version 钉住需求版本：需求改版后旧版本的晚到保存不算数。
+def _m_task_lanes(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS task_lanes (
+        task_id TEXT NOT NULL,
+        lane TEXT NOT NULL,
+        group_id TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT '',
+        model TEXT NOT NULL DEFAULT '',
+        req_version INTEGER NOT NULL DEFAULT 1,
+        messages TEXT NOT NULL DEFAULT '[]',
+        snapshot TEXT NOT NULL DEFAULT '',
+        escalated INTEGER NOT NULL DEFAULT 0,
+        handoff_id TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'open',
+        created REAL NOT NULL DEFAULT 0,
+        updated REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (task_id, lane)
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_lanes_group ON task_lanes(group_id, updated);
+    """)
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes]
 
 
 class Store:

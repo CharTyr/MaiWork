@@ -74,7 +74,7 @@ class TestSchema:
             "CREATE TABLE agent_lessons (id INTEGER PRIMARY KEY, group_id TEXT, kind TEXT, text TEXT)")
         # 再跑一遍 migrate：迁移函数幂等、版本已到 → 不重复跑；直接调迁移函数验 DROP
         from CharTyr_MaiWork.maiwork import store as store_mod
-        fn = store_mod._MIGRATIONS[-1]
+        fn = store_mod._MIGRATIONS[33]  # 第 34 步（之后 docs/20 加了第 35 步 task_lanes）
         assert fn.__name__ == "_m_agent_skills_group_rules"
         fn(s.read())
         names = {r["name"] for r in s.read().execute(

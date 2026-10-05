@@ -20,6 +20,7 @@ from contextlib import nullcontext
 from typing import Any, Callable, Iterable
 
 from . import clock, members
+from .lanes import close_task_lanes
 from .store import Store, next_id
 
 _STATUS_KINDS = (
@@ -269,6 +270,8 @@ class Tasks:
                 "INSERT INTO task_versions (task_id, version, req, criteria, ts) VALUES (?, ?, ?, ?, ?)",
                 (str(task_id), v, str(req or ""), json.dumps(criteria_l, ensure_ascii=False), now),
             )
+            # 需求改版：干活 lane 的前情可能已经不对，全部关掉重开（docs/20 §6.1）
+            close_task_lanes(conn, str(task_id), lanes="workers", now=now)
             if str(row["status"]) in ("running", "reviewing"):
                 conn.execute("UPDATE tasks SET status='queued', updated=? WHERE id=?", (now, str(task_id)))
                 self._store.event(
@@ -349,6 +352,9 @@ class Tasks:
 
             cols = ", ".join(f"{k}=?" for k in updates)
             conn.execute(f"UPDATE tasks SET {cols} WHERE id=?", [*updates.values(), str(task_id)])
+            if to_s in _TERMINAL or to_s == "failed":
+                # 任务双岗协作（docs/20 §6.1）：lane 前情只在任务内部有效，到终态同一事务清掉
+                close_task_lanes(conn, str(task_id), now=now)
             if to_s == "cancelled":
                 # 取消后没人再收这一轮（协程被直接停掉）：还开着的尝试同一事务里作废，
                 # 不留「任务取消了、尝试还在跑」的残留（外部审查 2026-10-02，线上 T-3）
@@ -551,11 +557,31 @@ class Tasks:
         if admin:
             item["env"] = str(row["env"] or "")
             item["timeline"] = calls
+            # 任务双岗协作（docs/20 §八）：返工 / 换模型 / 重开的大白话记录
+            item["lane_notes"] = self._lane_notes(str(task_id))
         else:
             # G3：群友看不到 token 数 / 工作区 / 来源 / 请求 ID / 发起人 QQ
             for key in ("tokens", "workspace", "source", "request_id", "requester_id"):
                 item.pop(key, None)
         return item
+
+    def _lane_notes(self, task_id: str) -> list[dict]:
+        rows = self._store.read().execute(
+            "SELECT ts, kind, payload FROM events WHERE entity='task' AND entity_id=?"
+            " AND kind LIKE 'task.lane_%' ORDER BY id LIMIT 50",
+            (str(task_id),),
+        ).fetchall()
+        out = []
+        for r in rows:
+            data = _load_json(r["payload"], {})
+            if not isinstance(data, dict):
+                data = {}
+            out.append({
+                "ts": r["ts"],
+                "kind": str(r["kind"]).removeprefix("task.lane_"),
+                "note": str(data.get("note") or "")[:300],
+            })
+        return out
 
     def running_count(self, group_id: str) -> int:
         row = self._store.read().execute(

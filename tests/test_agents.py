@@ -71,7 +71,7 @@ class TestProfiles:
 
     def test_default_shape(self, agents):
         for p in agents.profiles():
-            assert set(p.keys()) == {"kind", "title", "instructions", "skills", "enabled", "tools", "fish_seed", "model", "effort", "backup"}
+            assert set(p.keys()) == {"kind", "title", "instructions", "skills", "enabled", "tools", "fish_seed", "model", "effort", "backup", "escalate"}
             assert isinstance(p["title"], str) and p["title"]
             assert isinstance(p["instructions"], str)
             assert isinstance(p["fish_seed"], str)

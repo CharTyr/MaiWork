@@ -121,7 +121,8 @@ class FakeSpecialists:
 
     async def run(self, kind, brief, *, group_id, phase="", task_id="",
                   tools=None, output_schema=None, actor="", deadline_ts=None,
-                  parent_id="", workspace=None, max_steps=0, artifact_scope=None, criteria=None):
+                  parent_id="", workspace=None, max_steps=0, artifact_scope=None, criteria=None,
+                  history=None, escalate=False):
         try:
             profile = self._agents.profile(kind)
         except Exception:

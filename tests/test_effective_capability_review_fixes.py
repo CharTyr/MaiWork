@@ -106,6 +106,7 @@ class CaptureWorkers:
         output_schema=None, workspace=None, skills_hint="", system_extra="",
         deadline_ts=None, artifact_scope=None, agent_type="task",
         allowed_tools=None, allowed_skills=None, agent=None, used_tools=None,
+        history=None, escalate=False,
     ):
         self.calls.append({
             "brief": brief,

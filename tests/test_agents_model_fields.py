@@ -239,3 +239,51 @@ class TestMainNotInSpecialists:
         )
         assert report.ok is False
         assert "主模型" in (report.error or "")
+
+
+class TestEscalateField:
+    """任务双岗协作（docs/20 §5.3）：每个干活岗位的「做不动时换用」模型 escalate。
+
+    空串 = 没选 = 用主模型的链（用户 2026-10-05 定）；主模型岗没有这个选项。
+    """
+
+    def test_default_empty(self, agents) -> None:
+        a, _ = agents
+        for p in a.profiles():
+            assert p["escalate"] == ""
+
+    def test_set_and_clear(self, agents) -> None:
+        a, _ = agents
+        p = a.update_profile("task", {"model": "w1", "escalate": "m2"})
+        assert p["escalate"] == "m2"
+        p = a.update_profile("task", {"escalate": ""})
+        assert p["escalate"] == ""
+
+    def test_must_exist(self, agents) -> None:
+        a, _ = agents
+        with pytest.raises(ValueError, match="模型库"):
+            a.update_profile("task", {"escalate": "ghost"})
+
+    def test_type_strict(self, agents) -> None:
+        a, _ = agents
+        with pytest.raises(ValueError):
+            a.update_profile("task", {"escalate": 3})
+
+    def test_main_rejects_escalate(self, agents) -> None:
+        a, _ = agents
+        with pytest.raises(ValueError, match="主模型"):
+            a.update_profile("main", {"escalate": "m2"})
+
+    def test_custom_kind_takes_escalate(self, agents) -> None:
+        a, _ = agents
+        kind = a.create_custom("制图师")["kind"]
+        assert a.profile(kind)["escalate"] == ""
+        assert a.update_profile(kind, {"escalate": "m1"})["escalate"] == "m1"
+
+    def test_stored_bad_value_cleared(self, agents) -> None:
+        a, store = agents
+        with store.tx() as conn:
+            store.kv_set(conn, "agents.profiles", {"task": {"model": "w1", "escalate": "ghost"},
+                                                   "main": {"escalate": "m1"}})
+        assert a.profile("task")["escalate"] == ""
+        assert a.profile("main")["escalate"] == ""

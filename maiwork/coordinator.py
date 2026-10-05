@@ -61,6 +61,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from . import clock, compaction, members
 from .host import HostError
+from .lanes import TaskLanes, prepare_history
 from .models import ModelError
 from .outbox import report_error as _report_error
 from .store import Store
@@ -69,6 +70,15 @@ from .tools import ToolContext
 logger = logging.getLogger("maiwork.coordinator")
 
 _MAX_ATTEMPTS = 3
+# 任务双岗协作（docs/20 §5.3，用户 2026-10-05 定）：这一版被打回几次之后换升级模型
+_ESCALATE_AFTER_REJECTIONS = 2
+# 任务双岗协作第二步（docs/20 §5.2）：一轮里领队看了交回的结果、最多再给同一条活派 2 步；
+# 领队 lane 存完整对话、只往后接（用户 2026-10-05 定「做缓存，换别的主模型会用上」）：
+# 每次请求都是上一次请求的原样延长；估算超过这么多 token 先压成一条提要再接。
+_MAX_NEXT_STEPS = 2
+_LEAD_LANE = "lead"
+_LEAD_COMPACT_TOKENS = 32000
+_LEAD_SAME_PREFIX = "（你的身份、规矩和本群记忆和本任务前面的提示一样，没变。）\n"
 _CRITERIA_MAX = 5  # 完成标准最多留 5 条（2026-10-01 用户：网页任务详情太长）
 _PLAN_TOOL_LIMIT = 6  # 排计划阶段主模型最多用 6 轮只读工具（查资料 / 读 skill）
 _REVIEW_TOOL_LIMIT = 6  # 验收阶段主模型最多用 6 轮只读工具
@@ -1014,7 +1024,10 @@ class Coordinator:
         return ("\n\n".join(parts) + "\n\n") if parts else ""
 
     async def _plan(
-        self, task: dict, prior_review: str = "", capability_note: str = ""
+        self, task: dict, prior_review: str = "", capability_note: str = "",
+        rework_same_worker: bool = False,
+        lead: bool = False,
+        worker_note: str = "",
     ) -> dict:
         """主模型计划：决定 criteria / deliver_kind / jobs / question。
 
@@ -1023,6 +1036,18 @@ class Coordinator:
         交付形式 / 机器 / 提问都不许动，免得主模型顺手把用户定的验收口径降下来。
         """
         gid = str(task["group_id"])
+        tid = str(task["id"])
+        req_version = int(task.get("req_version") or 1)
+        # 任务双岗协作第二步：领队 lane 的前情（完整对话，只往后接）
+        lead_prior: list[dict] = []
+        req_note = ""
+        if lead:
+            lead_prior, lead_ver = await self._lead_begin(tid, gid)
+            if lead_prior and lead_ver is not None and lead_ver != req_version:
+                req_note = (
+                    f"注意：需求改过——在你上次排计划之后从第 {lead_ver} 版改成了第 {req_version} 版，"
+                    "前情是按旧需求做的；以上面的新需求为准，旧活不对的地方要重排。"
+                )
         entries = []
         try:
             entries = (self._profiles.entries(gid) or [])[:20]
@@ -1039,6 +1064,13 @@ class Coordinator:
             "",
             "当前完成标准（criteria）：",
         ]
+        if lead_prior:
+            prompt_lines.insert(
+                0, "（上面是你在这个任务里前几轮排计划、验收的经过；规矩和现状以这一条为准。）"
+            )
+        if req_note:
+            prompt_lines[prompt_lines.index("当前完成标准（criteria）：") - 1:
+                         prompt_lines.index("当前完成标准（criteria）：") - 1] = ["", str(req_note)]
         crit = self._safe_json_list(task.get("criteria"))
         if crit:
             for c in crit:
@@ -1055,6 +1087,13 @@ class Coordinator:
             prompt_lines.append(
                 "（这次要返工的点写进 jobs 的 brief 里交代给子 agent，不要写进完成标准。）"
             )
+            if rework_same_worker:
+                # 任务双岗协作（docs/20 §5.3）：干活 lane 记得上一轮的前情
+                prompt_lines.append(
+                    "（返工的活会交回给上一轮**同一编号**的子 agent 接着改：第 1 条活还给第 1 个，"
+                    "依此类推。它记得自己上一轮查过、做过什么，brief 里写清这次要改哪里就行，"
+                    "不用从头交代；真要换个做法，就在 brief 里明说。）"
+                )
         if capability_note:
             prompt_lines.append("")
             prompt_lines.append("开工前发现的问题（这一轮必须解决）：")
@@ -1064,6 +1103,9 @@ class Coordinator:
                 "不要为了让活好做就降低标准；交付形式、用哪台机器、要不要问发起人也都不要改。"
                 "想不出真能做到的办法就别硬派——我们宁可停下来，也不派一条注定做不成的活。"
             )
+        if worker_note:
+            prompt_lines.append("")
+            prompt_lines.append(str(worker_note))
         # 网页任务详情要一眼看完（2026-10-01 用户：「任务写的好长」）
         prompt_lines.append("")
         prompt_lines.append(
@@ -1116,15 +1158,18 @@ class Coordinator:
             )
             prompt_lines.extend(role_lines)
 
-        prefix = self._identity_prefix(gid, with_memory=True)
-        tid = str(task["id"])
+        prefix = self._lead_prefix(self._identity_prefix(gid, with_memory=True), lead_prior)
         ws_name = str(task.get("workspace") or self._workspace_name(gid))
-        specs = main_plan_tool_specs(self._tools, group_id=gid)
+        # 领队 lane：计划和验收用同一张工具表（工具表在请求最前面，变了缓存就全断）
+        specs = self._lead_tool_specs(gid) if lead else main_plan_tool_specs(self._tools, group_id=gid)
+        messages: list[dict] = lead_prior + [
+            {"role": "user", "content": prefix + "\n".join(prompt_lines)}
+        ]
         if not specs:
             # 一个排计划能用的工具都没有（roles 含 main 的 MCP / skill 工具全没注册）：
             # 行为完全不变——一次 json_mode=True 的纯 JSON 调用，不带 tools。
             result = await self._chat_main(
-                [{"role": "user", "content": prefix + "\n".join(prompt_lines)}],
+                messages,
                 json_mode=True,
                 purpose="coordinator.plan",
                 group_id=gid,
@@ -1145,9 +1190,7 @@ class Coordinator:
                 "你可以先用这些工具查资料 / 读 skill 再定计划；工具只用来查，"
                 "不要用它们直接把活干了；查完只回上面的 JSON。"
             )
-            messages: list[dict] = [
-                {"role": "user", "content": prefix + "\n".join(prompt_lines)}
-            ]
+            messages[-1] = {"role": "user", "content": prefix + "\n".join(prompt_lines)}
             try:
                 ws_path = self._env.workspace(ws_name)
             except Exception:
@@ -1208,6 +1251,9 @@ class Coordinator:
                     raise ModelError(f"主模型计划返回不是合法 JSON：{e}") from None
         if not isinstance(data, dict):
             raise ModelError("主模型计划返回不是 JSON 对象")
+        if lead:
+            messages.append({"role": "assistant", "content": str(result.text or "")})
+            self._lane_save(tid, gid, _LEAD_LANE, "main", messages, req_version)
 
         criteria = data.get("criteria")
         if not isinstance(criteria, list):
@@ -1341,12 +1387,21 @@ class Coordinator:
         attempt_n = self._tasks.start_attempt(tid)
         attempt_id = self._tasks.current_attempt_id(tid)
         req_version = int(self._tasks.get(tid)["req_version"]) if self._tasks.get(tid) else 1
+        # 任务双岗协作（docs/20）：这一版需求已经被打回几次（决定接着改 / 换升级模型）
+        lanes_on = getattr(self, "_specialists", None) is not None
+        rejections = self._rejections(tid, req_version)
 
         review_text = ""
         try:
             # 最近一次历史评审意见（给下一轮计划参考）
             review_text = str(self._tasks.get(tid).get("review") or "")
-            plan = await self._plan(self._tasks.get(tid), prior_review=review_text)
+            # 任务双岗协作第二步：领队在自己的 lane 里接着排计划（需求改过会明说）
+            plan = await self._plan(
+                self._tasks.get(tid), prior_review=review_text,
+                rework_same_worker=bool(lanes_on and rejections >= 1),
+                lead=lanes_on,
+                worker_note=self._worker_model_note(rejections >= _ESCALATE_AFTER_REJECTIONS) if lanes_on else "",
+            )
         except (ModelError, HostError) as e:
             self._fail_with_err(tid, attempt_id, f"主模型计划失败：{getattr(e, 'message', e)}", gid)
             return "done"
@@ -1494,6 +1549,9 @@ class Coordinator:
                 artifact_scope=scope,
                 agent=str(j.get("agent") or "task"),
                 criteria=tuple(plan["criteria"]),
+                lane=f"worker:{i + 1}" if lanes_on else "",
+                escalate=rejections >= _ESCALATE_AFTER_REJECTIONS,
+                req_version=req_version,
             )
 
         done: list[asyncio.Event] = [asyncio.Event() for _ in jobs]
@@ -1507,70 +1565,135 @@ class Coordinator:
         finally:
             await self._release_remote(railway_box)
 
-        # 每个 job 返回后先 accept_result：False → 只记历史，结束
-        if not self._tasks.accept_result(tid, attempt_id, req_version):
-            self._settle_job_specialist_handoffs(
-                gid, reports, accepted=False,
-                why="任务中途被取消/终态：accept_result 已到 False",
-            )
-            self._tasks.finish_attempt(
-                attempt_id,
-                status="stale",
-                summary="；".join(r.summary for r in reports if r and r.summary)[:500],
-                evidence=[e for r in reports if r for e in (r.evidence or [])],
-            )
-            return "done"
-
-        # 子 agent 都交回了，但任务可能刚被取消 / 被安全网暂停：终态和暂停都立刻停，
-        # 不再验收、不交付、不往群里发（安全网恢复后 run_task 会从 queued 重新开工）
-        task_now = self._tasks.get(tid)
-        if task_now is not None and str(task_now["status"]) in (
-            "cancelled", "completed", "failed", "rejected", "paused", "waiting_input", "shelved",
-        ):
-            logger.info("任务 %s 已是「%s」，不验收不交付", tid, task_now["status"])
-            self._settle_job_specialist_handoffs(
-                gid, reports, accepted=False,
-                why=f"任务已「{task_now['status']}」：不验收不交付",
-            )
-            return "done"
-
-        # 汇总 summary / evidence
-        summary_parts = []
+        # 子 agent 交回之后：收尾检查 → 验收（领队带着自己的精简记录）。None = 停（取消 / 暂停 / 出错已处理）
+        summary = ""
         evidence: list[str] = []
-        for r in reports:
-            if r is None:
-                continue
-            if r.summary:
-                summary_parts.append(str(r.summary))
-            evidence.extend([str(x) for x in (r.evidence or [])])
-        summary = "；".join(summary_parts)[:500]
 
-        # transition → reviewing
-        try:
-            self._tasks.transition(tid, "reviewing", reason="子 agent 交回")
-        except ValueError as e:
-            logger.warning("任务 %s →reviewing 非法：%s", tid, e)
-            return "done"
+        async def _collect_and_review(allow_next: bool) -> dict | None:
+            nonlocal summary, evidence
+            # 每个 job 返回后先 accept_result：False → 只记历史，结束
+            if not self._tasks.accept_result(tid, attempt_id, req_version):
+                self._settle_job_specialist_handoffs(
+                    gid, reports, accepted=False,
+                    why="任务中途被取消/终态：accept_result 已到 False",
+                )
+                self._tasks.finish_attempt(
+                    attempt_id,
+                    status="stale",
+                    summary="；".join(r.summary for r in reports if r and r.summary)[:500],
+                    evidence=[e for r in reports if r for e in (r.evidence or [])],
+                )
+                return None
 
-        # 验收
-        try:
-            review = await self._review(
-                self._tasks.get(tid), plan, summary, evidence, reports
-            )
-        except (ModelError, HostError) as e:
-            self._fail_with_err(
-                tid, attempt_id, f"验收失败：{getattr(e, 'message', e)}", gid
-            )
-            return "done"
-        except Exception as e:
-            logger.exception("任务 %s 验收阶段异常", tid)
-            self._fail_with_err(tid, attempt_id, f"验收失败：{e}", gid)
-            return "done"
+            # 子 agent 都交回了，但任务可能刚被取消 / 被安全网暂停：终态和暂停都立刻停，
+            # 不再验收、不交付、不往群里发（安全网恢复后 run_task 会从 queued 重新开工）
+            task_now = self._tasks.get(tid)
+            if task_now is not None and str(task_now["status"]) in (
+                "cancelled", "completed", "failed", "rejected", "paused", "waiting_input", "shelved",
+            ):
+                logger.info("任务 %s 已是「%s」，不验收不交付", tid, task_now["status"])
+                self._settle_job_specialist_handoffs(
+                    gid, reports, accepted=False,
+                    why=f"任务已「{task_now['status']}」：不验收不交付",
+                )
+                return None
 
-        _now2 = self._tasks.get(tid)
-        if _now2 is None or str(_now2.get("status") or "") not in ("running", "reviewing"):
-            logger.info("任务 %s 验收后状态已变（安全网暂停或终态），不再写结果", tid)
+            # 汇总 summary / evidence
+            summary_parts = []
+            evidence = []
+            for r in reports:
+                if r is None:
+                    continue
+                if r.summary:
+                    summary_parts.append(str(r.summary))
+                evidence.extend([str(x) for x in (r.evidence or [])])
+            summary = "；".join(summary_parts)[:500]
+
+            # transition → reviewing
+            try:
+                self._tasks.transition(tid, "reviewing", reason="子 agent 交回")
+            except ValueError as e:
+                logger.warning("任务 %s →reviewing 非法：%s", tid, e)
+                return None
+
+            # 验收
+            try:
+                review = await self._review(
+                    self._tasks.get(tid), plan, summary, evidence, reports,
+                    lead=lanes_on,
+                    allow_next=allow_next,
+                )
+            except (ModelError, HostError) as e:
+                self._fail_with_err(
+                    tid, attempt_id, f"验收失败：{getattr(e, 'message', e)}", gid
+                )
+                return None
+            except Exception as e:
+                logger.exception("任务 %s 验收阶段异常", tid)
+                self._fail_with_err(tid, attempt_id, f"验收失败：{e}", gid)
+                return None
+
+            _now2 = self._tasks.get(tid)
+            if _now2 is None or str(_now2.get("status") or "") not in ("running", "reviewing"):
+                logger.info("任务 %s 验收后状态已变（安全网暂停或终态），不再写结果", tid)
+                return None
+            if lanes_on:
+                self._challenge_events(tid, gid, review)
+            return review
+
+        # 任务双岗协作第二步（docs/20 §5.2）：领队看了结果可以给同一条活派下一步（不算没过），
+        # 一轮最多 _MAX_NEXT_STEPS 步。一次性 / 专用机器上不派（干完活机器就释放了）。
+        can_step = bool(lanes_on and not on_remote)
+        steps = 0
+        review = await _collect_and_review(can_step)
+        if review is None:
             return "done"
+        while can_step and not review["pass"] and review.get("next") and steps < _MAX_NEXT_STEPS:
+            steps += 1
+            nexts = list(review["next"])
+            try:
+                self._tasks.transition(tid, "running", reason="领队按交回的结果派下一步")
+            except ValueError as e:
+                logger.warning("任务 %s →running（下一步）非法：%s", tid, e)
+                return "done"
+            for nx in nexts:
+                self._lane_event(
+                    tid, gid, "task.lane_next",
+                    f"第 {nx['job']} 条活交回了，领队按结果派下一步：{nx['brief'][:60]}",
+                    lane=f"worker:{nx['job']}",
+                )
+
+            async def _step(nx: dict) -> Any:
+                i = int(nx["job"]) - 1
+                j = jobs[i]
+                return await self._run_job(
+                    brief=self._enrich_brief(nx["brief"], tid, plan["deliver_kind"], False),
+                    tools=j["tools"],
+                    gid=gid,
+                    tid=tid,
+                    job_idx=i + 1,
+                    ws_name=ws_name,
+                    job_type=str(j.get("type") or "other"),
+                    artifact_scope=scope,
+                    agent=str(j.get("agent") or "task"),
+                    criteria=tuple(plan["criteria"]),
+                    lane=f"worker:{i + 1}",
+                    escalate=rejections >= _ESCALATE_AFTER_REJECTIONS,
+                    req_version=req_version,
+                    step=True,
+                )
+
+            outs = await asyncio.gather(*[_step(nx) for nx in nexts])
+            for nx, out in zip(nexts, outs):
+                i = int(nx["job"]) - 1
+                # 上一步的交接单：领队收下了、接着派下一步
+                self._settle_job_specialist_handoffs(
+                    gid, [reports[i]], accepted=True, why="领队收下这一步，接着派下一步",
+                )
+                reports[i] = out
+            review = await _collect_and_review(steps < _MAX_NEXT_STEPS)
+            if review is None:
+                return "done"
 
         # 专岗挂上时：仅限经 `kind="task"` 跑的子 agent report（handoff_id 非空那批）
         # 把本轮的交接按**主模型的验收结果**收尾；交接资料永不进主模型学习（learn=False）。
@@ -1608,6 +1731,10 @@ class Coordinator:
         artifact_scope: tuple[str, ...] | None = None,
         agent: str = "task",
         criteria: Any = None,
+        lane: str = "",
+        escalate: bool = False,
+        req_version: int = 1,
+        step: bool = False,
     ) -> Any:
         sem = self._semaphore_for(ws_name)
         async with sem:
@@ -1645,15 +1772,39 @@ class Coordinator:
                 # 专岗改版 4/4：这条活是主模型挑的「哪个岗」就跑哪个岗（kind = plan.jobs[].agent；
                 # 没挑 / 不在册都在 _plan 里落网成 task）。该岗自己的 SOUL/AGENTS/
                 # 模型/skills 由 specialists → workers 按 kind 各自注/挑。
-                return await specialists.run(
-                    str(agent or "task"), brief,
+                kind = str(agent or "task")
+                lane_kw: dict[str, Any] = {}
+                history: list[dict] = []
+                esc = False
+                snapshot: str | None = None
+                if lane:
+                    # 任务双岗协作（docs/20 §5.3）：同一条干活 lane 带着前情接着干
+                    history, esc, snapshot, parent = await self._lane_open(
+                        tid, gid, lane, kind, escalate=escalate, quiet=step,
+                    )
+                    lane_kw["history"] = history
+                    if esc:
+                        lane_kw["escalate"] = True
+                    if parent:
+                        # §八：同一 lane 的返工交接单指向上一轮
+                        lane_kw["parent_id"] = parent
+                report = await specialists.run(
+                    kind, brief,
                     group_id=gid, task_id=tid,
                     criteria=criteria,
                     tools=list(tools or []),
                     actor=f"子 agent #{job_idx}",
                     workspace=ws_path,
                     artifact_scope=artifact_scope,
+                    **lane_kw,
                 )
+                if lane:
+                    self._lane_save(
+                        tid, gid, lane, kind, history, req_version,
+                        escalated=True if esc else None, snapshot=snapshot,
+                        handoff_id=str(getattr(report, "handoff_id", "") or "") or None,
+                    )
+                return report
             except (ModelError, HostError) as e:
                 from .workers import WorkerReport
 
@@ -2178,6 +2329,7 @@ class Coordinator:
         try:
             fresh = await self._plan(
                 self._tasks.get(tid), prior_review=prior_review, capability_note=note,
+                lead=getattr(self, "_specialists", None) is not None,
             )
         except Exception as e:
             logger.warning("任务 %s 能力重排失败：%s", tid, getattr(e, "message", e) or e)
@@ -2463,6 +2615,8 @@ class Coordinator:
         summary: str,
         evidence: list[str],
         reports: list[Any],
+        lead: bool = False,
+        allow_next: bool = False,
     ) -> dict:
         """主模型验收；最多 _REVIEW_TOOL_LIMIT 轮工具调用（只读 inspect_）。
 
@@ -2532,6 +2686,21 @@ class Coordinator:
                 "请据此判断：只是少量、且不是关键结论的依据 → 可以 pass，但要在 review 里点出来；"
                 "关键结论只靠这些没打开过的链接撑着 → pass 必须 false，并在 review 里点名要求打开核实或删掉。"
             )
+        # 任务双岗协作第三步（docs/20 §四）：子 agent 对说明的异议，领队必须表态
+        challenges = [
+            (i + 1, r.challenge) for i, r in enumerate(reports or [])
+            if r is not None and isinstance(getattr(r, "challenge", None), dict)
+        ]
+        if challenges:
+            prompt_lines.append("")
+            prompt_lines.append("子 agent 对说明本身提了异议（它先做了能做的部分）：")
+            for job, ch in challenges:
+                line = f"- 第 {job} 条活：{ch.get('reason', '')}"
+                if ch.get("evidence"):
+                    line += "；依据：" + "、".join(str(x) for x in ch["evidence"])
+                if ch.get("suggestion"):
+                    line += f"；建议：{ch['suggestion']}"
+                prompt_lines.append(line)
         prompt_lines.append("")
         prompt_lines.append(
             "只回 JSON："
@@ -2541,10 +2710,34 @@ class Coordinator:
             '如 artifacts/T-1/index.html；text 交付可以留空）", "note": "交付时在群里说的一句话（'
             '不点名关注成员、不暴露工具细节）"}'
         )
+        if challenges:
+            prompt_lines.append(
+                '有异议就必须表态：JSON 里再加 "challenge_ok": true|false（采纳 / 不采纳）。'
+                "采纳就按它的意见改（还没到验收用 next 派下一步，要返工就 pass=false 写进 review）；"
+                "不采纳在 review 里说一句为什么。"
+            )
+        if allow_next:
+            # 任务双岗协作第二步（docs/20 §5.2）：看了结果再派下一步，同一条活接着干
+            prompt_lines.append(
+                "（可选）还没到验收的时候、要按这次交回的结果给某条活派下一步（比如先调研、"
+                '看了结果再派做页面）：pass 写 false，再加 "next": [{"job": 活的编号（第 1 个是 1）, '
+                '"brief": "下一步具体做什么"}]。那条活的子 agent 记得自己这一步做过什么，接着干；'
+                "这不算没过。真没过、要返工就别写 next，把问题写进 review。"
+            )
+        lead_prior: list[dict] = []
+        if lead:
+            lead_prior, _ver = await self._lead_begin(tid, gid)
+        if lead_prior:
+            prompt_lines.insert(
+                0, "（上面是你在这个任务里排计划、验收的经过；这次验收以这一条为准。）"
+            )
 
-        prefix = self._identity_prefix(gid, with_memory=True)
-        messages: list[dict] = [{"role": "user", "content": prefix + "\n".join(prompt_lines)}]
-        specs = main_review_tool_specs(self._tools)
+        prefix = self._lead_prefix(self._identity_prefix(gid, with_memory=True), lead_prior)
+        messages: list[dict] = lead_prior + [
+            {"role": "user", "content": prefix + "\n".join(prompt_lines)}
+        ]
+        lead_ver = int(task.get("req_version") or 1)
+        specs = self._lead_tool_specs(gid) if lead else main_review_tool_specs(self._tools)
         try:
             ws_path = self._env.workspace(ws_name)
         except Exception:
@@ -2622,6 +2815,8 @@ class Coordinator:
                     review_data = parsed
                     break
             if review_data is None:
+                if lead:
+                    self._lane_save(tid, gid, _LEAD_LANE, "main", messages, lead_ver)
                 attempt_n2 = int(task.get("attempts") or 0)
                 return {
                     "pass": False,
@@ -2634,9 +2829,31 @@ class Coordinator:
                     "note": "",
                     "missing": [],
                     "link_check": link_check,
+                    "next": [],
+                    "challenges": challenges,
+                    "challenge_ok": None,
                 }
 
+        if lead:
+            messages.append({"role": "assistant", "content": str(result.text or "")})
+            self._lane_save(tid, gid, _LEAD_LANE, "main", messages, lead_ver)
+
         passed = bool(review_data.get("pass"))
+        nexts: list[dict] = []
+        if allow_next and not passed:
+            raw_next = review_data.get("next")
+            seen_jobs: set[int] = set()
+            for item in raw_next if isinstance(raw_next, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                job = item.get("job")
+                brief = str(item.get("brief") or "").strip()
+                if (
+                    isinstance(job, int) and not isinstance(job, bool)
+                    and 1 <= job <= len(plan.get("jobs") or []) and brief and job not in seen_jobs
+                ):
+                    seen_jobs.add(job)
+                    nexts.append({"job": job, "brief": brief[:2000]})
         review_text = str(review_data.get("review") or "").strip() or ("通过" if passed else "不通过")
         artifact = str(review_data.get("artifact") or "").strip()
         note = str(review_data.get("note") or "").strip()
@@ -2690,6 +2907,12 @@ class Coordinator:
             "note": note,
             "missing": missing,
             "link_check": link_check,
+            "next": nexts,
+            "challenges": challenges,
+            "challenge_ok": (
+                review_data.get("challenge_ok")
+                if challenges and isinstance(review_data.get("challenge_ok"), bool) else None
+            ),
         }
 
     # ------------------------------------------------------------------
@@ -3121,10 +3344,282 @@ class Coordinator:
         self._write_tokens(task_id)
         return "done"
 
+    # ------------------------------------------------------------------
+    # 任务双岗协作：干活 lane（docs/20 §5.3 / §六）
+    # ------------------------------------------------------------------
+
+    def _lane_store(self) -> TaskLanes:
+        lanes = getattr(self, "_task_lanes", None)
+        if lanes is None:
+            lanes = TaskLanes(self._store)
+            self._task_lanes = lanes
+        return lanes
+
+    def _rejections(self, tid: str, req_version: int | None = None) -> int:
+        """这一版需求被打回过几次（验收没过 / 没派活 的尝试数）。"""
+        try:
+            if req_version is None:
+                row = self._store.read().execute(
+                    "SELECT req_version FROM tasks WHERE id=?", (str(tid),)
+                ).fetchone()
+                req_version = int(row["req_version"]) if row is not None else 1
+            row = self._store.read().execute(
+                "SELECT COUNT(*) AS n FROM attempts WHERE task_id=? AND req_version=? AND status='failed'",
+                (str(tid), int(req_version)),
+            ).fetchone()
+            return int(row["n"]) if row is not None else 0
+        except Exception:
+            logger.exception("数打回次数失败（任务 %s）", tid)
+            return 0
+
+    def _escalation_target(self, kind: str) -> dict | None:
+        fn = getattr(self._models, "escalation_target", None)
+        if not callable(fn):
+            return None
+        try:
+            target = fn(str(kind or "task"))
+        except Exception:
+            logger.exception("查升级模型失败（%s）", kind)
+            return None
+        return target if isinstance(target, dict) else None
+
+    def _lane_event(self, tid: str, gid: str, kind: str, note: str, **payload: Any) -> None:
+        data: dict[str, Any] = {"note": note}
+        data.update(payload)
+        try:
+            with self._store.tx() as conn:
+                self._store.event(conn, kind, group_id=gid, entity="task", entity_id=tid, payload=data)
+        except Exception:
+            logger.exception("记 lane 事件失败（任务 %s）", tid)
+
+    async def _lane_open(
+        self, tid: str, gid: str, lane: str, kind: str, *, escalate: bool, quiet: bool = False,
+    ) -> tuple[list[dict], bool, str | None, str]:
+        """开这条干活 lane：返回 (接着用的前情, 这一轮换没换升级模型, 新的前情提要或 None,
+        上一轮交接单 id)。
+
+        - 有前情且还是同一个岗 → 接着用（task.lane_rework）；换了岗 → 从零（task.lane_reset）；
+        - escalate（这一版已被打回 2 次）且有可升级的：第一次换时先把前情压缩成提要再换
+          （task.lane_escalate）；压缩没做成 → 从零 + 上次的前情提要（有的话）接着干
+          （task.lane_reset）。
+        """
+        lanes = self._lane_store()
+        try:
+            row = lanes.load(tid, lane, group_id=gid)
+        except Exception:
+            logger.exception("读 lane 失败（%s %s），这一轮从零开始", tid, lane)
+            row = None
+        n = lane.split(":", 1)[-1]
+        history: list[dict] = []
+        same_kind = row is not None and row["status"] == "open" and row["kind"] == kind
+        parent = str(row.get("handoff_id") or "") if same_kind and row is not None else ""
+        if row is not None and row["status"] == "open" and row["messages"]:
+            if same_kind:
+                history = list(row["messages"])
+            else:
+                try:
+                    lanes.reset(tid, lane, group_id=gid)
+                except Exception:
+                    logger.exception("清 lane 失败（%s %s）", tid, lane)
+                self._lane_event(
+                    tid, gid, "task.lane_reset",
+                    f"第 {n} 条活这次派给了别的岗位，上一轮的前情不是它的，从零开始",
+                    lane=lane, why="kind_changed",
+                )
+        esc = False
+        snapshot: str | None = None
+        if escalate:
+            target = self._escalation_target(kind)
+            if target is not None:
+                esc = True
+                if not (same_kind and row is not None and row["escalated"]):
+                    if history:
+                        try:
+                            text = await compaction.summarize_messages(
+                                history, models=self._models, role="worker", agent=kind,
+                                purpose="worker.lane_escalate", group_id=gid, task_id=tid,
+                            )
+                            history = [compaction.summary_to_message(text)]
+                            snapshot = text
+                        except Exception as e:
+                            logger.warning("任务 %s %s 换模型前压缩没做成：%s", tid, lane, e)
+                            old_snap = str((row or {}).get("snapshot") or "") if same_kind else ""
+                            history = [compaction.summary_to_message(old_snap)] if old_snap else []
+                            self._lane_event(
+                                tid, gid, "task.lane_reset",
+                                f"第 {n} 条活换模型前，前情压缩没做成：从零开始"
+                                + ("，带上上次的前情提要" if old_snap else "") + "，按这次的说明接着干",
+                                lane=lane, why="compact_failed",
+                            )
+                    label = str(target.get("label") or target.get("entry_id") or "")
+                    self._lane_event(
+                        tid, gid, "task.lane_escalate",
+                        f"第 {n} 条活已经被打回两次：换成「{label}」接着改"
+                        + ("（先把前情压缩成提要）" if snapshot else ""),
+                        lane=lane, to=label, entry_id=str(target.get("entry_id") or ""),
+                    )
+                    return history, esc, snapshot, parent
+        if history and not quiet:
+            self._lane_event(
+                tid, gid, "task.lane_rework",
+                f"第 {n} 条活被打回：交给同一个子 agent 带着上一轮的前情接着改",
+                lane=lane,
+            )
+        return history, esc, snapshot, parent
+
+    def _worker_model_note(self, escalated: bool) -> str:
+        """排计划时告诉领队这一轮干活的是哪个模型（docs/20 第三步：按模型组合调说明写多细）。"""
+        fn = getattr(self._models, "model_label", None)
+        if not callable(fn):
+            return ""
+        try:
+            label = str(fn("task", escalate=escalated) or "")
+        except Exception:
+            logger.exception("取干活模型名失败")
+            return ""
+        if not label:
+            return ""
+        note = f"这一轮干活的子 agent（通用任务岗）用的模型：「{label}」"
+        if escalated:
+            note += "（这一版需求已经被打回两次，换成了它接着改）"
+        return note + (
+            "。说明写多细看模型：快而弱的模型要把步骤、文件名、怎么检查都写细；"
+            "强模型写清目标和标准就够。"
+        )
+
+    def _lead_load(self, tid: str, gid: str) -> tuple[list[dict], int | None]:
+        """领队 lane 的精简记录（docs/20 第二步）：(消息, 记录时的需求版本)；没有 → ([], None)。"""
+        try:
+            row = self._lane_store().load(tid, _LEAD_LANE, group_id=gid)
+        except Exception:
+            logger.exception("读领队记录失败（%s）", tid)
+            return [], None
+        if row is None or row["status"] != "open" or not row["messages"]:
+            return [], None
+        return list(row["messages"]), int(row["req_version"])
+
+    async def _lead_begin(self, tid: str, gid: str) -> tuple[list[dict], int | None]:
+        """领队这次请求要接的前情（完整对话，原样往后接，开头不动才吃得上缓存）。
+
+        估算超过 _LEAD_COMPACT_TOKENS（或主模型窗口的 40%）→ 先压成一条前情提要存回去
+        （task.lane_compact，缓存断一次，之后接着接）；压缩没做成 → 从零 + 上次的提要（有的话）
+        （task.lane_reset）。返回 (前情, 记录时的需求版本)。
+        """
+        history, ver = self._lead_load(tid, gid)
+        if not history:
+            return [], ver
+        history = prepare_history(history, allowed=spec_tool_names(self._lead_tool_specs(gid)))
+        budget = min(_LEAD_COMPACT_TOKENS, int(self._context_window() * 0.4))
+        if compaction.estimate_tokens_in_messages(history) <= budget:
+            return history, ver
+        row = None
+        try:
+            row = self._lane_store().load(tid, _LEAD_LANE, group_id=gid)
+        except Exception:
+            logger.exception("读领队 lane 失败（%s）", tid)
+        try:
+            text = await compaction.summarize_messages(
+                history, models=self._models, role="main", agent="main",
+                purpose="coordinator.lead", group_id=gid, task_id=tid,
+            )
+            history = [compaction.summary_to_message(text)]
+            self._lane_save(tid, gid, _LEAD_LANE, "main", history, int(ver or 1), snapshot=text)
+            self._lane_event(
+                tid, gid, "task.lane_compact",
+                "领队这个任务的前情太长了：压成一条提要接着用", lane=_LEAD_LANE,
+            )
+        except Exception as e:
+            logger.warning("任务 %s 领队前情压缩没做成：%s", tid, e)
+            old_snap = str((row or {}).get("snapshot") or "")
+            history = [compaction.summary_to_message(old_snap)] if old_snap else []
+            self._lane_save(tid, gid, _LEAD_LANE, "main", history, int(ver or 1))
+            self._lane_event(
+                tid, gid, "task.lane_reset",
+                "领队这个任务的前情太长、压缩没做成：从零开始"
+                + ("，带上上次的前情提要" if old_snap else "") + "（上一次验收意见仍写在提示里）",
+                lane=_LEAD_LANE, why="compact_failed",
+            )
+        return history, ver
+
+    @staticmethod
+    def _lead_prefix(prefix: str, history: list[dict]) -> str:
+        """身份 / 规矩 / 本群记忆那一大段：前情里原样出现过就不再发一遍（变了就发新的）。"""
+        p = str(prefix or "")
+        if not p or not history:
+            return p
+        for m in history:
+            if m.get("role") == "user" and p in str(m.get("content") or ""):
+                return _LEAD_SAME_PREFIX
+        return p
+
+    def _lead_tool_specs(self, gid: str) -> list[dict]:
+        """领队 lane 的工具表：验收的核对工具 + 排计划的 skill 工具 + 主模型 MCP，计划和验收共用一张。
+
+        都是只读的；本轮硬权限就是这张表（Tools.call 照拦表外的）。
+        """
+        names: list[str] = []
+        for specs in (main_review_tool_specs(self._tools), main_plan_tool_specs(self._tools, group_id=gid)):
+            for n in spec_tool_names(specs):
+                if n not in names:
+                    names.append(n)
+        if not names:
+            return []
+        try:
+            return self._tools.specs("main", names)
+        except Exception:
+            logger.exception("查领队工具表出错")
+            return []
+
+    def _challenge_events(self, tid: str, gid: str, review: dict) -> None:
+        """每条异议记一条 task.lane_challenge（带领队表态；异议被采纳的比例靠它算）。"""
+        ok = review.get("challenge_ok")
+        verdict = "采纳了" if ok is True else ("没采纳" if ok is False else "没表态")
+        for job, ch in review.get("challenges") or []:
+            self._lane_event(
+                tid, gid, "task.lane_challenge",
+                f"第 {job} 条活对说明提了异议：{str(ch.get('reason') or '')[:60]}；领队{verdict}",
+                lane=f"worker:{job}", accepted=ok,
+            )
+
+    def _lane_save(
+        self, tid: str, gid: str, lane: str, kind: str, history: list[dict], req_version: int,
+        *, escalated: bool | None = None, snapshot: str | None = None,
+        handoff_id: str | None = None,
+    ) -> None:
+        try:
+            self._lane_store().save(
+                tid, lane, group_id=gid, kind=kind, messages=list(history or []),
+                req_version=int(req_version), escalated=escalated, snapshot=snapshot,
+                handoff_id=handoff_id,
+            )
+        except Exception:
+            logger.exception("存 lane 失败（%s %s）", tid, lane)
+
+    def _lane_kinds(self, tid: str, gid: str) -> list[str]:
+        try:
+            rows = self._lane_store().list(tid, group_id=gid)
+        except Exception:
+            rows = []
+        kinds = [r["kind"] for r in rows if r["lane"].startswith("worker:") and r["kind"]]
+        return kinds or ["task"]
+
     def _handle_unpassed(
         self, task_id: str, attempt: int, gid: str, review: str, deliver_kind: str
     ) -> str:
-        """不通过：尝试数 < 3 → 回 queued 立刻再来；否则 failed + 固定话。"""
+        """不通过：尝试数 < 3 → 回 queued 立刻再来；否则 failed + 固定话。
+
+        任务双岗协作（docs/20 §5.3，专岗挂上时）：这一版第 2 次没过、却没有可升级的模型
+        （升级模型和现在的一样）→ 直接判失败，不拿同一个模型再耗一轮。
+        """
+        if (
+            attempt < _MAX_ATTEMPTS
+            and getattr(self, "_specialists", None) is not None
+            and self._rejections(task_id) >= _ESCALATE_AFTER_REJECTIONS
+            and not any(self._escalation_target(k) for k in self._lane_kinds(task_id, gid))
+        ):
+            logger.info("任务 %s 第 2 次没过，没有可升级的模型：直接判失败", task_id)
+            review = (review or "没通过") + "（已经返工过一次，也没有更强的模型可换）"
+            attempt = _MAX_ATTEMPTS
         if attempt < _MAX_ATTEMPTS:
             try:
                 self._tasks.transition(

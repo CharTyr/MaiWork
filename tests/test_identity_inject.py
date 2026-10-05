@@ -326,8 +326,11 @@ async def test_coordinator_plan_and_review_inject_blocks(tmp_path: Path) -> None
     await coordinator.run_task(tid)
 
     plan_prompt = models.calls[0][1][-1]["content"]
-    review_prompt = models.calls[1][1][-1]["content"]
-    for p in (plan_prompt, review_prompt):
+    # 领队 lane（docs/20）：验收请求接在排计划那段对话后面，身份那一大段只发一次——
+    # 看整次请求里有没有（别群的照样一个字都不能有）
+    review_request = "\n".join(str(m.get("content") or "") for m in models.calls[1][1])
+    assert "没变" in models.calls[1][1][-1]["content"]
+    for p in (plan_prompt, review_request):
         assert "## 做事规矩" in p
         assert "规矩乙：交付前自查完成标准" in p
         assert "## 工作记忆（全局）" in p

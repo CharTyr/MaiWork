@@ -134,6 +134,13 @@ function taskDetail(id) {
             .join("")}</ol></div>`
         : ""
     }
+    ${
+      admin() && (t.lane_notes || []).length
+        ? `<div class="dt-sec"><div class="dt-label">返工和换手</div><ul class="dt-list">${t.lane_notes
+            .map((n) => `<li><span class="fine">${esc(when(n.ts))}</span> ${esc(n.note)}</li>`)
+            .join("")}</ul></div>`
+        : ""
+    }
     ${reviewBlock(t)}
     ${
       (t.delivery || []).length

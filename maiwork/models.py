@@ -1310,10 +1310,33 @@ class Models:
             profile = None
         if not isinstance(profile, dict):
             profile = {}
+        out = self._entries_to_candidates(
+            (profile.get("model"), profile.get("backup")), endpoints, model_list
+        )
+        if not out and not model_list and old.any_value():
+            # 迁移前的过渡：库里还没 [[model_list]] 也没有岗位选择，旧 [models] 四槽还在
+            # → 按老规矩用四槽（迁移把岗位选好之后自动走开上面那条）
+            ep = old.to_endpoint() if old.base_url else None
+            if ep is not None:
+                names = (old.main, old.main_backup) if kind == "main" else (old.worker, old.worker_backup)
+                for name in names:
+                    if name:
+                        out.append(
+                            _Candidate(
+                                service_model=name, label=name, endpoint=ep,
+                                context_window=old.context_window, max_tokens=old.max_tokens,
+                            )
+                        )
+        return out
+
+    def _entries_to_candidates(
+        self, entry_ids: Any, endpoints: tuple, model_list: tuple
+    ) -> list[_Candidate]:
+        """按模型库条目 id 列表解析候选（条目没了 / 端点缺地址密钥的跳过）。"""
         by_id = {str(getattr(m, "id", "") or ""): m for m in model_list}
         ep_by_id = {str(getattr(e, "id", "") or ""): e for e in endpoints}
         out: list[_Candidate] = []
-        for raw_id in (profile.get("model"), profile.get("backup")):
+        for raw_id in entry_ids:
             entry_id = str(raw_id or "").strip()
             if not entry_id:
                 continue
@@ -1343,21 +1366,69 @@ class Models:
                     entry_id=entry_id,
                 )
             )
-        if not out and not model_list and old.any_value():
-            # 迁移前的过渡：库里还没 [[model_list]] 也没有岗位选择，旧 [models] 四槽还在
-            # → 按老规矩用四槽（迁移把岗位选好之后自动走开上面那条）
-            ep = old.to_endpoint() if old.base_url else None
-            if ep is not None:
-                names = (old.main, old.main_backup) if kind == "main" else (old.worker, old.worker_backup)
-                for name in names:
-                    if name:
-                        out.append(
-                            _Candidate(
-                                service_model=name, label=name, endpoint=ep,
-                                context_window=old.context_window, max_tokens=old.max_tokens,
-                            )
-                        )
         return out
+
+    def _escalation_candidates(self, kind: str) -> list[_Candidate]:
+        """任务双岗协作（docs/20 §5.3）：岗位「做不动时换用」的候选链。
+
+        profile.escalate 选了条目就用它；没选 = 主模型的链（用户 2026-10-05 定）。
+        升级后的首选和岗位现在的首选是同一个条目 → 没有可升级的（返回空）。
+        这只是换干活的**模型**：调用仍是干活 lane、受同样的工具和权限限制，
+        不是主模型亲自干活。
+        """
+        if self._agents is None:
+            return []
+        settings = self._get_settings()
+        endpoints = tuple(getattr(settings, "endpoints", ()) or ())
+        model_list = tuple(getattr(settings, "model_list", ()) or ())
+        old = self._legacy_brick(settings)
+        kind_s = str(kind or "").strip() or "task"
+        try:
+            own, _ = self._effective_candidates(kind_s, endpoints, model_list, old, self._agents)
+        except Exception:
+            own = []
+        try:
+            profile = self._agents.profile(kind_s)
+        except Exception:
+            profile = None
+        esc_id = str((profile or {}).get("escalate") or "").strip() if isinstance(profile, dict) else ""
+        if esc_id:
+            cands = self._entries_to_candidates((esc_id,), endpoints, model_list)
+        else:
+            cands = self._resolve_candidates("main", endpoints, model_list, old, self._agents)
+        if not cands:
+            return []
+        own_first = own[0] if own else None
+        if own_first is not None and (
+            (cands[0].entry_id and cands[0].entry_id == own_first.entry_id)
+            or (not cands[0].entry_id and cands[0].service_model == own_first.service_model)
+        ):
+            return []
+        return cands
+
+    def escalation_target(self, kind: str) -> dict | None:
+        """这个岗位做不动时会换成谁：{"entry_id", "label"}；没有可升级的 → None。"""
+        try:
+            cands = self._escalation_candidates(kind)
+        except Exception:
+            logger.exception("解析升级模型失败（%s）", kind)
+            return None
+        if not cands:
+            return None
+        return {"entry_id": cands[0].entry_id, "label": cands[0].label}
+
+    def model_label(self, kind: str, *, escalate: bool = False) -> str:
+        """这个岗位这一轮实际用的模型叫什么（排计划时告诉领队，docs/20 第三步）；取不到 → ""。"""
+        try:
+            if escalate:
+                target = self.escalation_target(kind)
+                if target is not None:
+                    return str(target.get("label") or target.get("entry_id") or "")
+            cands = self._current_candidates(kind)
+        except Exception:
+            logger.exception("取模型名失败（%s）", kind)
+            return ""
+        return str(cands[0].label) if cands else ""
 
     def _effective_candidates(
         self,
@@ -1425,7 +1496,7 @@ class Models:
                 return v
         return ""
 
-    def limits_for(self, kind: str | None = None) -> dict:
+    def limits_for(self, kind: str | None = None, *, escalate: bool = False) -> dict:
         """这个岗位（空 = 主模型）用哪个模型的上下文窗口 / 最大输出（上下文压缩、
         画像摘要这些从「settings.models 全局值」改成「所选模型条目」的读口）。
 
@@ -1433,10 +1504,17 @@ class Models:
         读不到（没接 agents / 都没选）回落旧 [models] 全局值，再不行系统默认。
         """
         kind_s = str(kind or "").strip() or "main"
-        try:
-            cands = self._current_candidates(kind_s)
-        except Exception:
-            cands = []
+        cands: list[_Candidate] = []
+        if escalate:
+            try:
+                cands = self._escalation_candidates(kind_s)
+            except Exception:
+                cands = []
+        if not cands:
+            try:
+                cands = self._current_candidates(kind_s)
+            except Exception:
+                cands = []
         if cands:
             return {"context_window": cands[0].context_window, "max_tokens": cands[0].max_tokens}
         settings = self._get_settings()
@@ -2042,6 +2120,7 @@ class Models:
         retries: int | None = None,
         max_tokens: int | None = None,
         _candidates: list[_Candidate] | None = None,
+        escalate: bool = False,
     ) -> ChatResult:
         """调一次模型。
 
@@ -2074,6 +2153,10 @@ class Models:
             # 内部口：验证某个模型库条目（verify_entry），不走岗位路由
             candidates = list(_candidates)
             role_kind = "main"
+        elif escalate and self._agents is not None and self._escalation_candidates(agent_kind):
+            # 任务双岗协作：这条干活 lane 换升级模型接着干（docs/20 §5.3）。记账仍记在
+            # 这个岗位的干活桶里（是干活 lane 在用，不是主模型亲自干）；强度读岗位自己的。
+            candidates = self._escalation_candidates(agent_kind)
         elif self._agents is not None:
             try:
                 candidates, own = self._effective_candidates(

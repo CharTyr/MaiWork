@@ -59,6 +59,25 @@ Resolver = Callable[[str], list[str]]
 
 
 
+def _clean_challenge(raw: Any) -> dict | None:
+    """submit_result 的 challenge：只认带理由的对象；字段截短（理由 / 建议 500 字，依据 ≤5 条各 300 字）。"""
+    if isinstance(raw, str):
+        parsed, bad = _maybe_json(raw)
+        raw = None if bad else parsed
+    if not isinstance(raw, dict):
+        return None
+    reason = str(raw.get("reason") or "").strip()
+    if not reason:
+        return None
+    ev = raw.get("evidence")
+    ev_list = [str(x)[:300] for x in ev[:5]] if isinstance(ev, list) else ([str(ev)[:300]] if ev else [])
+    return {
+        "reason": reason[:500],
+        "evidence": ev_list,
+        "suggestion": str(raw.get("suggestion") or "").strip()[:500],
+    }
+
+
 def _maybe_json(text: str) -> tuple[Any, bool]:
     """字符串看着像 JSON（去掉 ```json 围栏后以 { 或 [ 开头）就解析。
 
@@ -630,11 +649,12 @@ def register_builtin(
             evidence_list = [str(x) for x in evidence]
         else:
             evidence_list = [str(evidence)]
-        return ToolResult(
-            ok=True,
-            output=f"已交回：{summary}",
-            data={"summary": summary, "data": data, "evidence": evidence_list},
-        )
+        out = {"summary": summary, "data": data, "evidence": evidence_list}
+        # 任务双岗协作第三步（docs/20 §四）：对说明本身有异议 → challenge 原样交回给领队
+        challenge = _clean_challenge(args.get("challenge"))
+        if challenge is not None:
+            out["challenge"] = challenge
+        return ToolResult(ok=True, output=f"已交回：{summary}", data=out)
 
     tools.register(
         Tool(
@@ -719,6 +739,16 @@ def register_builtin(
                     "summary": {"type": "string", "description": "这次干完的一句话总结"},
                     "data": {"type": "object", "description": "结构化成果（可选）"},
                     "evidence": {"type": "array", "items": {"type": "string"}, "description": "证据链接列表（可选）"},
+                    "challenge": {
+                        "type": "object",
+                        "description": "（可选）觉得这次的说明本身有问题（做不到、自相矛盾、有明显更好的做法）时填，由上级决定",
+                        "properties": {
+                            "reason": {"type": "string", "description": "哪里不对、为什么"},
+                            "evidence": {"type": "array", "items": {"type": "string"}, "description": "依据（链接 / 文件 / 报错）"},
+                            "suggestion": {"type": "string", "description": "建议怎么改"},
+                        },
+                        "required": ["reason"],
+                    },
                 },
                 "required": ["summary"],
             },
