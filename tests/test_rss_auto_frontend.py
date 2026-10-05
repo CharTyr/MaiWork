@@ -72,6 +72,9 @@ AUTO_VIEW = {"g1": {
          "feed_url": "https://www.gcores.com/rss", "status": "verified", "reason": "", "origin": "model"},
         {"name": "某聚合站", "url": "https://agg.example.com/", "why": "w", "label": "agg.example.com",
          "feed_url": "", "status": "rejected", "reason": "找不到订阅地址", "origin": "model"},
+        {"name": "found.example.com", "url": "https://found.example.com/", "why": "找来源搜索「独立游戏 blog」搜到",
+         "label": "found.example.com", "feed_url": "https://found.example.com/feed", "status": "verified",
+         "reason": "", "origin": "search"},
     ]},
     "auto": {"quota": {"trusted": {"used": 1, "max": 3}, "map": {"used": 0, "max": 3}, "total": {"used": 2, "max": 20}},
              "push": [], "rule": "近 30 天 ≥4 条 4 分以上", "origins": {"trusted": "门槛", "map": "来源地图", "push": "固定清单"},
@@ -106,6 +109,9 @@ def test_auto_log_and_source_map_in_collapsed_details(tmp_path):
     assert "中文游戏媒体一手" in html
     assert "agg.example.com" in html and "找不到订阅地址" in html
     assert "近 30 天 ≥4 条 4 分以上" in html
+    # 每周「找来源」搜索搜到的网站在来源地图里标出来（模型列的不标）
+    assert html.count("ra-found") == 1
+    assert '搜到的</span>' in html and "找来源搜索「独立游戏 blog」搜到" in html
 
 
 def test_no_auto_details_before_data_loads(tmp_path):

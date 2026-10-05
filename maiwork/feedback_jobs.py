@@ -80,14 +80,18 @@ async def run(
     scrub: Callable[[str, str], str | None] | None = None,
     agents: Any = None,
     transport: Any = None,
+    search: Any = None,
 ) -> dict[str, Any]:
     gid = str(gid)
     _last[gid] = now
     out: dict[str, Any] = {"mentions": 0, "lessons": 0}
-    # 自动订阅 / 退订 + 来源地图（docs/10 §九 第二步）：**放在「模型没配好就返回」之前**——
+    # 自动订阅 / 退订 + 来源地图 + 找来源搜索（docs/10 §九 第二步）：**放在「模型没配好就返回」之前**——
     # 自动退订和门槛订阅不需要模型，模型没配好也要照跑（模块内部自己节流、自己兜异常）。
+    # search 是 feeds 那套搜索适配层，只给每周的「找来源」搜索用，不占资讯搜索名额。
     try:
-        auto_out = await auto_sources.run(store, models, gid, now, profiles=profiles, transport=transport)
+        auto_out = await auto_sources.run(
+            store, models, gid, now, profiles=profiles, transport=transport, search=search
+        )
         if any(auto_out.get(k) for k in ("subscribed", "unsubscribed", "map", "push")):
             out["auto"] = auto_out
     except Exception:

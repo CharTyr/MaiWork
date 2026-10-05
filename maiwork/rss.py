@@ -25,7 +25,7 @@ import socket
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 from xml.parsers import expat
 
 import httpx
@@ -36,6 +36,8 @@ logger = logging.getLogger("maiwork.rss")
 
 _TIMEOUT_S = 15.0
 _MAX_BYTES = 2 * 1024 * 1024  # 2MB
+_MAX_REDIRECTS = 3  # 最多跟几跳（每跳重新做公网校验 + DNS 固定 IP；总时限 / 字节上限共用）
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 _PER_SOURCE_LIMIT = 10
 _GROUP_MAX = 20
 _UA = "MaiWork-RSS/1.0"
@@ -444,59 +446,84 @@ async def fetch_bytes(
 ) -> dict[str, Any]:
     """安全取一次字节（全模块唯一一处出网请求；第二步取首页 HTML 也走这里）。
 
-    和取 RSS 同一套限制：生产先把域名解析成公开 IP 再连固定 IP（不在客户端里做第二次
-    DNS）、不跟随重定向（302 也只当失败）、trust_env=False（禁环境代理）、全程限时、
-    响应限字节。**别在别处另写一套 httpx 调用**。
-    返回 {"body": bytes|None, "status": int, "content_type": str, "error": str}；
-    url 不是合法的公开 http(s) 地址 → 抛 RssError（调用方自己决定 400 还是记 error）。
+    限制：生产先把域名解析成公开 IP 再连固定 IP（不在客户端里做第二次 DNS）、
+    trust_env=False（禁环境代理）、全程一个总时限、响应限字节。
+    **跟随少量重定向**（2026-10-05 用户：「安全的跟随少量跳转」）：最多 ``_MAX_REDIRECTS`` 跳，
+    httpx 自己不跟（follow_redirects=False），由这里逐跳处理——每一跳的目标都重新过
+    ``_public_url``（协议 / 用户名密码 / 字面内网 IP / localhost）并在生产里重新解析 DNS、
+    固定连到审过的 IP；跳到不安全地址、跳太多、绕圈都当失败，那一跳不发请求。
+    **别在别处另写一套 httpx 调用**。
+    返回 {"body": bytes|None, "status": int, "content_type": str, "error": str, "url": 终点地址}；
+    起始 url 不是合法的公开 http(s) 地址 → 抛 RssError（调用方自己决定 400 还是记 error）。
     """
     url_s = _require_http(url)
     parsed = _public_url(url_s)
+    start = current = str(parsed)
+
+    def fail(error: str, status: int = 0, content_type: str = "") -> dict[str, Any]:
+        return {"body": None, "status": status, "content_type": content_type, "error": error, "url": current}
+
+    visited: set[str] = set()
     try:
-        # 全程限时；to_thread 的系统 DNS 调用即使超时仍可能在后台结束，但不会发 HTTP 请求。
+        # 全程限时（所有跳共用）；to_thread 的系统 DNS 调用即使超时仍可能在后台结束，但不会发 HTTP 请求。
         async with asyncio.timeout(timeout_s):
-            request_url = parsed
-            headers = {"User-Agent": _UA}
-            extensions: dict[str, Any] = {}
-            network_transport = transport
-            if transport is None:
-                host = parsed.host or ""
-                port = parsed.port or (443 if parsed.scheme == "https" else 80)
-                address = await asyncio.to_thread(_resolve_public_ip, host, port)
-                # 固定连接到已经审核过的 IP，而非在客户端里对原域名做第二次 DNS 查询。
-                request_url = parsed.copy_with(host=address)
-                headers["Host"] = parsed.netloc.decode("ascii")
-                extensions["sni_hostname"] = parsed.raw_host.decode("ascii").rstrip(".")
-                # 禁止环境 HTTP(S)_PROXY / ALL_PROXY 将安全连接转交给未校验的代理。
-                network_transport = httpx.AsyncHTTPTransport(trust_env=False)
-            async with httpx.AsyncClient(transport=network_transport, trust_env=False) as client:
-                async with client.stream(
-                    "GET", request_url, timeout=timeout_s, headers=headers,
-                    extensions=extensions, follow_redirects=False,
-                ) as resp:
-                    content_type = str(resp.headers.get("content-type") or "")
-                    status = int(resp.status_code)
-                    if status != 200:
-                        return {"body": None, "status": status, "content_type": content_type,
-                                "error": f"取 {what} 失败（HTTP {status}）"}
-                    chunks: list[bytes] = []
-                    total = 0
-                    async for chunk in resp.aiter_bytes():
-                        total += len(chunk)
-                        if total > max_bytes:
-                            mb = max(1, int(max_bytes // (1024 * 1024)))
-                            return {"body": None, "status": status, "content_type": content_type,
-                                    "error": f"{what} 响应太大了（超过 {mb}MB）"}
-                        chunks.append(chunk)
+            for hop in range(_MAX_REDIRECTS + 1):
+                visited.add(current)
+                request_url = parsed
+                headers = {"User-Agent": _UA}
+                extensions: dict[str, Any] = {}
+                network_transport = transport
+                if transport is None:
+                    host = parsed.host or ""
+                    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                    address = await asyncio.to_thread(_resolve_public_ip, host, port)
+                    # 固定连接到已经审核过的 IP，而非在客户端里对原域名做第二次 DNS 查询。
+                    request_url = parsed.copy_with(host=address)
+                    headers["Host"] = parsed.netloc.decode("ascii")
+                    extensions["sni_hostname"] = parsed.raw_host.decode("ascii").rstrip(".")
+                    # 禁止环境 HTTP(S)_PROXY / ALL_PROXY 将安全连接转交给未校验的代理。
+                    network_transport = httpx.AsyncHTTPTransport(trust_env=False)
+                async with httpx.AsyncClient(transport=network_transport, trust_env=False) as client:
+                    async with client.stream(
+                        "GET", request_url, timeout=timeout_s, headers=headers,
+                        extensions=extensions, follow_redirects=False,
+                    ) as resp:
+                        content_type = str(resp.headers.get("content-type") or "")
+                        status = int(resp.status_code)
+                        location = str(resp.headers.get("location") or "").strip()
+                        if status in _REDIRECT_CODES and location:
+                            if hop >= _MAX_REDIRECTS:
+                                return fail(f"取 {what} 失败：跳转太多（超过 {_MAX_REDIRECTS} 次）", status, content_type)
+                            target = urljoin(current, location)
+                            try:
+                                parsed = _public_url(_require_http(target))
+                            except RssError as e:
+                                return fail(f"取 {what} 失败：跳转到了不安全的地址（{e}）", status, content_type)
+                            if str(parsed) in visited:
+                                return fail(f"取 {what} 失败：跳转绕圈了", status, content_type)
+                            current = str(parsed)
+                            continue
+                        if status != 200:
+                            return fail(f"取 {what} 失败（HTTP {status}）", status, content_type)
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in resp.aiter_bytes():
+                            total += len(chunk)
+                            if total > max_bytes:
+                                mb = max(1, int(max_bytes // (1024 * 1024)))
+                                return fail(f"{what} 响应太大了（超过 {mb}MB）", status, content_type)
+                            chunks.append(chunk)
+                        return {"body": b"".join(chunks), "status": 200, "content_type": content_type,
+                                "error": "", "url": current}
     except RssError as e:
-        return {"body": None, "status": 0, "content_type": "", "error": str(e)}
+        if current != start:  # 跳转后的那一跳 DNS 解析到内网 / 解析失败
+            return fail(f"取 {what} 失败：跳转到了不安全的地址（{e}）")
+        return fail(str(e))
     except (TimeoutError, httpx.TimeoutException):
-        return {"body": None, "status": 0, "content_type": "",
-                "error": f"取 {what} 超时（{timeout_s:g} 秒）"}
+        return fail(f"取 {what} 超时（{timeout_s:g} 秒）")
     except httpx.HTTPError as e:
-        return {"body": None, "status": 0, "content_type": "",
-                "error": f"取 {what} 失败：{type(e).__name__}"}
-    return {"body": b"".join(chunks), "status": 200, "content_type": content_type, "error": ""}
+        return fail(f"取 {what} 失败：{type(e).__name__}")
+    return fail(f"取 {what} 失败：跳转太多（超过 {_MAX_REDIRECTS} 次）")
 
 
 async def fetch_feed_source(
@@ -507,17 +534,18 @@ async def fetch_feed_source(
     now: float | None = None,
     limit: int = _PER_SOURCE_LIMIT,
 ) -> dict[str, Any]:
-    """取一次并解析。返回 {"title", "items", "error"}；业务/网络失败走 error（不抛）。
-    url 不合法抛 RssError（接口层要 400）。"""
+    """取一次并解析。返回 {"title", "items", "error", "url"}（url = 跟完跳转后的终点地址）；
+    业务/网络失败走 error（不抛）。url 不合法抛 RssError（接口层要 400）。"""
     url_s = _require_http(url)
     now = float(clock.now() if now is None else now)
-    out: dict[str, Any] = {"title": "", "items": [], "error": ""}
+    out: dict[str, Any] = {"title": "", "items": [], "error": "", "url": url_s}
     try:
         got = await fetch_bytes(url_s, transport=transport)
     except RssError as e:
         # 网页 POST 取源阶段用 error 返回 400；这里直接抛会变成未处理的 500。
         out["error"] = str(e)
         return out
+    out["url"] = str(got.get("url") or url_s)
     if got.get("error"):
         out["error"] = str(got["error"])
         return out

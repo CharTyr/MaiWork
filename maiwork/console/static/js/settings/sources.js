@@ -52,8 +52,17 @@ function trustedGroup(g) {
   return `
     <div class="rss-group trusted-g" data-g="${esc(g.id)}">
       <div class="rss-gname">${mq(g.name || `群 ${g.id}`)}</div>
+      ${v ? shareLine(v.share) : ""}
       ${v == null ? `<p class="fine">读取中…</p>` : rows || `<p class="fine">还没攒出来：同一个站至少要有 2 条高分资讯</p>`}
     </div>`;
+}
+
+// 近 14 天入选里来自优质来源的占几条（source_stats.source_share；三类互斥：RSS 带来的先算 RSS）
+function shareLine(sh) {
+  if (!sh || !sh.total) return "";
+  const n = (k) => Number(sh[k]) || 0;
+  const pct = Math.round((n("trusted") / n("total")) * 100);
+  return `<p class="fine trusted-share">近 ${esc(n("days") || 14)} 天入选 ${esc(n("total"))} 条：来自优质来源 ${esc(n("trusted"))} 条（${esc(pct)}%）、订阅 RSS 带来 ${esc(n("rss"))} 条、其他 ${esc(n("other"))} 条</p>`;
 }
 
 // RSS 一个群：源列表 + 自动订阅说明（自动订阅记录 / 来源地图 / 命中率按群懒加载进 state.rssAuto[群]，
@@ -119,7 +128,9 @@ function autoDetails(v) {
   const mapHtml = map.length
     ? `<ul>${map
         .map(
-          (m) => `<li><span class="ra-title">${esc(m.name || m.label)}${m.label && m.label !== m.name ? ` <span class="ra-label">${esc(m.label)}</span>` : ""}</span><span class="ra-why">${
+          (m) => `<li><span class="ra-title">${esc(m.name || m.label)}${m.label && m.label !== m.name ? ` <span class="ra-label">${esc(m.label)}</span>` : ""}${
+            m.origin === "search" ? ` <span class="tag ra-found">搜到的</span>` : ""
+          }</span><span class="ra-why">${
             m.status === "verified" ? `能订 · ${esc(m.why || "")}` : `没订：${esc(m.reason || "没通过检查")}`
           }</span></li>`
         )

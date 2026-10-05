@@ -80,7 +80,7 @@ import re as _re
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
-from . import clock, idea_feasibility, members, news_rating, news_standard
+from . import clock, idea_feasibility, members, news_rating, news_standard, search_stats
 from . import page_date, source_name
 from .config import Settings, normalize_domain as _normalize_domain
 from .models import ModelError
@@ -2794,6 +2794,16 @@ class Feeds:
             )
         else:
             sat_req = ""
+        # 近 14 天各类问法的成绩（中文/英文 × 资讯/文章）：只是参考，让模型多用成绩好的问法
+        # （2026-10-05 用户拍板，docs/10 §「第二步剩下三项」第 1 项）。
+        try:
+            style_lines = search_stats.style_prompt_lines(self._store, gid, clock.now())
+        except Exception:
+            logger.exception("读搜索问法成绩出错（群 %s），这轮不带", gid)
+            style_lines = []
+        if style_lines:
+            lines.extend(style_lines)
+            lines.append("")
         # 定关注点的标准只写在资讯标准 skill 里（skills/news-standard，finding.md「定关注点」「跳一步」）
         lines.append("资讯标准（定关注点照这个来）：")
         lines.append(news_standard.for_focus())
@@ -3819,6 +3829,16 @@ class Feeds:
                 broad = []
         main_provider = broad[0] if broad else ""
         extras = [x for x in broad if x != main_provider]
+        # 按成绩软倾斜（2026-10-05 用户拍板，docs/10 §「第二步剩下三项」第 1 项）：候选够多、
+        # 进网页率不到主家一半的「其他家」这轮不补搜（每周仍放一次试试有没有变好）；主家不动。
+        if self._store is not None and extras:
+            kept_extras, skipped = search_stats.filter_extras(
+                self._store, gid, clock.now(), main_provider, extras
+            )
+            if skipped:
+                logger.info("保底撒网这轮不让成绩差的搜索服务补搜（群 %s）：%s", gid, skipped)
+                funnel["weak_providers"] = skipped
+            extras = kept_extras
         if search is None:
             focus_iter: list = []  # 没有 search 对象：不补搜，只把漏斗计数写好
         else:

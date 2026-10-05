@@ -1078,3 +1078,25 @@ class TestReviewFixes:
 
         monkeypatch.setattr(mod, "_is_listing_url", boom)
         assert auto_sources._is_real_article("https://a.example.com/post/1", "一篇文章") is False
+
+
+class TestCommentFeeds:
+    """线上（2026-10-05 服务器实测）nimdzi.com 找到的是 WordPress 的评论订阅 /comments/feed/——不是文章。"""
+
+    def test_comment_feeds_skipped_in_homepage_links(self):
+        html = (
+            '<link rel="alternate" type="application/rss+xml" title="Nimdzi &raquo; Comments Feed" href="https://www.nimdzi.com/comments/feed/">'
+            '<link rel="alternate" type="application/rss+xml" title="某站 » 评论 Feed" href="/blog/comments/rss">'
+            '<link rel="alternate" type="application/rss+xml" title="Post X Comments" href="/p/x/feed/">'
+            '<link rel="alternate" type="application/rss+xml" title="Nimdzi &raquo; Feed" href="https://www.nimdzi.com/feed/">'
+        )
+        assert auto_sources.parse_feed_links(html, "https://www.nimdzi.com/") == ["https://www.nimdzi.com/feed/"]
+
+    @pytest.mark.asyncio
+    async def test_discover_never_settles_on_comment_feed(self):
+        home = '<link rel="alternate" type="application/rss+xml" href="https://c.example.com/comments/feed/">'
+        xml = _rss_doc([("Comment on 某文 by 某人", "https://c.example.com/p/1#comment-9", 1)])
+        got = await auto_sources.discover_feed("c.example.com", transport=_transport({
+            "https://c.example.com/": home, "https://c.example.com/comments/feed/": xml,
+        }), now=NOW)
+        assert got["url"] == ""

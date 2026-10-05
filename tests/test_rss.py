@@ -239,14 +239,15 @@ class TestFetchFeedSource:
         assert seen["request"].extensions["sni_hostname"] == "news.example.com"
 
     @pytest.mark.asyncio
-    async def test_does_not_follow_redirects(self):
+    async def test_does_not_follow_redirect_to_internal_address(self):
+        # 0.9.x 起会安全地跟随少量跳转（tests/test_rss_redirects.py），但跳到内网的那一跳绝不发出
         seen = []
         def handler(request: httpx.Request) -> httpx.Response:
             seen.append(str(request.url))
             return httpx.Response(302, headers={"Location": "http://127.0.0.1/internal"})
         out = await rss.fetch_feed_source("https://news.example.com/feed", transport=httpx.MockTransport(handler), now=NOW)
         assert seen == ["https://news.example.com/feed"]
-        assert "302" in out["error"]
+        assert out["error"] and "跳转" in out["error"]
 
     @pytest.mark.asyncio
     async def test_response_too_big(self):

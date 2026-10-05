@@ -1104,6 +1104,7 @@ body.booting .app, body.booting .tabbar { visibility: hidden; }
 .rss-add input { height: 40px; padding: 0 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--fill-2); font: inherit; font-size: 14px; color: var(--ink); }
 .rss-add input:focus { outline: none; border-color: var(--ink); background: var(--card); }
 .rss-auto-tag { margin-left: 6px; vertical-align: 1px; }
+.ra-found { margin-left: 4px; vertical-align: 1px; }
 .rss-auto { margin-top: 10px; }
 .rss-auto > summary { display: flex; align-items: center; gap: 8px; min-height: 44px; list-style: none; cursor: pointer; font-size: 13.5px; font-weight: 600; color: var(--ink-2); }
 .rss-auto > summary::-webkit-details-marker { display: none; }

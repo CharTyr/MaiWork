@@ -2935,12 +2935,14 @@ class MaiWorkApp:
 
         # 自动订阅 / 退订 + 来源地图（docs/10 §九 第二步）要取 RSS / 首页，复用 feeds 的
         # rss_transport（测试里是 MockTransport；线上 None = 真实网络，走 rss.py 的安全取法）。
+        # search 只给每周的「找来源」搜索用（不占资讯搜索名额）。
         rss_transport = getattr(getattr(self, "feeds", None), "_rss_transport", None)
         out = await feedback_jobs.run(
             self.store, self.models, gid, _now(), profiles=self.profiles,
             scrub=lambda g, text: scrub(g, text, self.store),
             agents=self.agents,
             transport=rss_transport,
+            search=getattr(self, "search", None),
         )
         if out.get("mentions") or out.get("taste") or out.get("lessons") or out.get("auto"):
             logger.info("反馈 / 口味 / 做事经验 / 自动订阅（群 %s）：%s", gid, out)

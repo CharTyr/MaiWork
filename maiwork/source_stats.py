@@ -11,7 +11,10 @@
 - 上名单：至少 MIN_HIGH 条高分（不衰减的原始条数，样本少不算数）；管理员移出的（kv
   「feeds.trusted_removed.<群号>」）和屏蔽名单里的不上；按衰减后的分数从高到低，最多 limit 个。
 - source_prior：在名单里 → 按名次给 1.0 往下递减（最低 0.3）；不在名单 → 0。
-- view：给网页管理员看的名单明细 + 被移出的。
+- view：给网页管理员看的名单明细 + 被移出的 + share（近 SHARE_DAYS 天入选里来自优质来源的占几条）。
+- source_share（docs/10 §九 第二步剩下三项之 3，2026-10-05 用户选「设置页一行」）：近 14 天上了网页的群向条目，
+  三类互斥——订阅 RSS 带来的（src_provider="rss:…"）先算 RSS；其余来源名在网页显示的那份名单里算「优质来源」；
+  剩下「其他」。名单本身也是从这些高分条目攒的，所以这个比例是「好来源出了多少」的参考，不是独立指标。
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ HIGH_AVG = 4.0
 MIN_HIGH = 2
 UP_BONUS = 0.5
 DEFAULT_LIMIT = 8
+SHARE_DAYS = 14
 
 
 def _removed_key(gid: str) -> str:
@@ -166,10 +170,35 @@ def source_prior(store: Any, gid: str, site: str, now: float, *, blocked: Iterab
     return max(0.3, 1.0 - 0.1 * ranked.index(d))
 
 
+def source_share(store: Any, gid: str, now: float, *, blocked: Iterable[str] = ()) -> dict[str, int]:
+    """近 SHARE_DAYS 天入选（上了网页、群向）的条目里：来自优质来源 / 订阅 RSS 带来 / 其他 各几条。读坏了 → 全 0。"""
+    out = {"days": SHARE_DAYS, "total": 0, "trusted": 0, "rss": 0, "other": 0}
+    try:
+        names = {d["domain"] for d in _ranked(store, gid, now, blocked=blocked)[:DEFAULT_LIMIT]}
+        rows = store.read().execute(
+            "SELECT sources, url_key, src_provider FROM news_items"
+            " WHERE group_id=? AND rejected=0 AND COALESCE(target_user_id,'')='' AND created>=?",
+            (str(gid), float(now) - SHARE_DAYS * 86400.0),
+        ).fetchall()
+    except Exception:
+        logger.debug("优质来源占比统计失败（群 %s）", gid, exc_info=True)
+        return out
+    for r in rows:
+        out["total"] += 1
+        if str(r["src_provider"] or "").startswith("rss:"):
+            out["rss"] += 1
+        elif _site_of_row(r) in names:
+            out["trusted"] += 1
+        else:
+            out["other"] += 1
+    return out
+
+
 def view(store: Any, gid: str, now: float, *, blocked: Iterable[str] = ()) -> dict[str, Any]:
-    """网页管理员看的：{trusted: [{domain, high, up, score}], removed: [...], rule: 一句话口径}。"""
+    """网页管理员看的：{trusted: [{domain, high, up, score}], removed: [...], share: {...}, rule: 一句话口径}。"""
     return {
         "trusted": _ranked(store, gid, now, blocked=blocked)[:DEFAULT_LIMIT],
         "removed": removed(store, gid),
+        "share": source_share(store, gid, now, blocked=blocked),
         "rule": f"近 {WINDOW_DAYS} 天至少 {MIN_HIGH} 条 {HIGH_AVG:g} 分以上的来源；越近越算数，群友点「有用」加分",
     }
