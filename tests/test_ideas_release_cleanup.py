@@ -132,6 +132,9 @@ def _plain_idea() -> dict:
         "basis": "群里每周都在复盘",
         "icon": "books",
         "chat_worthy": False,
+        # 合格样例（docs/18 §八；_feeds() 不接 workers → 基本能力 search/chat/write/watch）
+        "feasibility": {"level": "ok", "note": "能做",
+                        "uses": ["search", "write"], "deliver": "doc", "needs_members": False},
     }
 
 

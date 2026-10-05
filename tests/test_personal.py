@@ -41,6 +41,9 @@ def _bj_ts(y: int, m: int, d: int, hh: int, mm: int = 0) -> float:
 
 
 NOW = _bj_ts(2026, 8, 31, 15)  # 北京时间 2026-08-31 15:00，落在 9:00–22:00 调度窗里
+# 个人向构想的合格 feasibility（docs/18 §八；FakeWorkers 没有 tool_catalog → 基本能力）
+_FEAS_OK = {"level": "ok", "note": "能做",
+            "uses": ["search", "write"], "deliver": "doc", "needs_members": False}
 GID = "111"
 UID = "10001"
 UID2 = "10002"
@@ -484,7 +487,7 @@ class TestPersonalPrepare:
                 "focus": [{"query": "FPGA", "why": "在做"}],
                 "idea": {"title": "我可以帮你把这块板的上手例程跑一遍",
                          "body": "我可以帮你把这板子的例程整理成一页", "step": "先列出要跑的例程",
-                         "effort": "半天"},
+                         "effort": "半天", "feasibility": _FEAS_OK},
             }, ensure_ascii=False),
             _personal_scores_json(),
             json.dumps({"posts": []}, ensure_ascii=False),
@@ -508,7 +511,7 @@ class TestPersonalPrepare:
                 "focus": [{"query": "FPGA", "why": "在做"}],
                 "idea": {"title": "我可以帮你把这块板的例程理一下",
                          "body": "我可以帮你把例程整理成一页",
-                         "origin": "FPGA 小板子",
+                         "origin": "FPGA 小板子", "feasibility": _FEAS_OK,
                          "step": "先列出要跑的例程", "effort": "半天"},
             }, ensure_ascii=False),
             _personal_scores_json(),
@@ -536,7 +539,7 @@ class TestPersonalPrepare:
                 "focus": [{"query": "FPGA", "why": "在做"}],
                 "idea": {"title": "我可以帮他把例程理一下",
                          "body": "我可以帮你把例程整理成一页",
-                         "origin": "我在折腾 FPGA 呢",
+                         "origin": "我在折腾 FPGA 呢", "feasibility": _FEAS_OK,
                          "step": "", "effort": ""},
             }, ensure_ascii=False),
             _personal_scores_json(),

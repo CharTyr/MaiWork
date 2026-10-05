@@ -4,14 +4,14 @@
 Last Epoch 构建模拟器工具页还被 timeliness 打了 4）、新闻类的（Switch2 Pro 手柄 IGN 8 分
 评测报道、巫师3 重制版上线、Steam 新品节公告）、非文章页（GitHub 仓库首页、官方文档
 入门页、工具页）。修法：
-1. 硬门槛（第一道，代码判）：guide 必须有发布时间且在 180 天内（GUIDE_MAX_AGE_DAYS=180）；
+1. 硬门槛（第一道，代码判）：guide 必须有发布时间且在 60 天内（GUIDE_MAX_AGE_DAYS；原 180，2026-10-05 用户改 60）；
    没有发布时间一律不收「文章没有发布时间，宁缺毋滥不收」，太旧「文章太旧：N 天前发的」。
 2. 打分提示给 guide 加判断字段 not_article + not_article_reason：文章只收教程/指南/攻略/
    经验复盘/深度分析/横向对比实测；新闻、商店页/产品页/工具页/构建器/代码仓库首页/
    官方文档入口页/百科资料页、纯观点短评一律 not_article=true → 第一道淘汰
    「不是文章（新闻/工具页…）」。
 3. 门槛提高：guide 过第二道要 relevance≥4 且 info≥4 且 avg≥3.8；拓展名额和 B 项
-   relevance=3 的放宽都不适用于 guide；每轮 guide 最多 2 条。
+   relevance=3 的放宽都不适用于 guide；每轮 guide 最多 1 条（原 2，2026-10-05 用户改）。
 4. 子 agent brief 同步写明这些标准。
 """
 
@@ -38,7 +38,7 @@ from test_feeds_freshness import (
 )
 
 
-def _guide(idx: int, *, published=NOW - 60 * 86400, title: str = "经典老教程", **kw) -> dict:
+def _guide(idx: int, *, published=NOW - 30 * 86400, title: str = "经典老教程", **kw) -> dict:
     return _cand(idx, kind="guide", title=title, published=published,
                  url=kw.pop("url", f"https://tut.com/g{idx}"), **kw)
 
@@ -66,8 +66,8 @@ class TestGuideAgeCap:
         assert rows[0]["reject_gate"] == "hard"
         assert "没有发布时间" in rows[0]["reject_reason"]
 
-    def test_guide_181_days_rejected(self, tmp_path) -> None:
-        """guide 发布 181 天 → 拒「太旧」。
+    def test_guide_61_days_rejected(self, tmp_path) -> None:
+        """guide 发布 61 天 → 拒「太旧」（上限 60 天）。
 
         两阶段恒生效后这道在预筛：连打分都不进、不落 news_items，
         理由进漏斗「预筛刷掉的」。
@@ -77,7 +77,7 @@ class TestGuideAgeCap:
             tmp_path,
             models=FakeModelsQueue(ready=True, replies=[_FOCUS_JSON]),
             workers=FakeWorkers(_ok_report({"items": [
-                _guide(0, published=NOW - 181 * 86400),
+                _guide(0, published=NOW - 61 * 86400),
             ]})),
         )
         with _TimePatch():
@@ -92,8 +92,8 @@ class TestGuideAgeCap:
         # 根本没走到打分
         assert not any(str(c[2].get("purpose") or "") == "feeds.score" for c in models.calls)
 
-    def test_guide_179_days_passes_age_gate(self, tmp_path) -> None:
-        """guide 发布 179 天 → 过年龄硬门槛（其他门槛照常打）。"""
+    def test_guide_59_days_passes_age_gate(self, tmp_path) -> None:
+        """guide 发布 59 天 → 过年龄硬门槛（其他门槛照常打）。"""
         _store, settings, feeds, models, workers, topics, _p = _make_feeds(
             tmp_path,
             models=FakeModelsQueue(ready=True, replies=[
@@ -102,7 +102,7 @@ class TestGuideAgeCap:
                 _posts_json(_post(0, "经典老教程")),
             ]),
             workers=FakeWorkers(_ok_report({"items": [
-                _guide(0, published=NOW - 179 * 86400),
+                _guide(0, published=NOW - 59 * 86400),
             ]})),
         )
         with _TimePatch():
@@ -111,7 +111,7 @@ class TestGuideAgeCap:
         assert _rejected_rows(_store) == []
 
     def test_guide_age_uses_guide_not_news_line(self, tmp_path) -> None:
-        """guide 超过 180 天照样在预筛挡下（口径「太旧：超过半年」，guide/news 共用一条文案）。"""
+        """guide 远超上限照样在预筛挡下（口径「太旧：超过 60 天」，guide/news 共用一条文案）。"""
         _store, settings, feeds, models, workers, topics, _p = _make_feeds(
             tmp_path,
             models=FakeModelsQueue(ready=True, replies=[_FOCUS_JSON]),
@@ -169,7 +169,7 @@ class TestNotArticle:
                 _posts_json(),
             ]),
             workers=FakeWorkers(_ok_report({"items": [
-                _guide(0, title="unjs/untracing", published=NOW - 100 * 86400),
+                _guide(0, title="unjs/untracing", published=NOW - 40 * 86400),
             ]})),
         )
         with _TimePatch():
@@ -273,8 +273,8 @@ class TestGuideSecondGate:
             got = _run(feeds.prepare_news(GID))
         assert got == 1
 
-    def test_guide_max_2_per_round(self, tmp_path) -> None:
-        """每轮 guide 最多 2 条（第 3 条被拒，理由说明上限）。"""
+    def test_guide_max_1_per_round(self, tmp_path) -> None:
+        """每轮 guide 最多 1 条（第 2、3 条被拒，理由说明上限；2026-10-05 由 2 改 1）。"""
         items = [_guide(i, title=f"老教程{i}", url=f"https://tut.com/g{i}") for i in range(3)]
         _store, settings, feeds, models, workers, topics, _p = _make_feeds(
             tmp_path,
@@ -291,11 +291,12 @@ class TestGuideSecondGate:
         )
         with _TimePatch():
             got = _run(feeds.prepare_news(GID))
-        assert got == 2
+        assert got == 1
         rows = _rejected_rows(_store)
-        assert len(rows) == 1
-        assert rows[0]["reject_gate"] == "web"
-        assert "好文" in rows[0]["reject_reason"] or "文章" in rows[0]["reject_reason"]
+        assert len(rows) == 2
+        for row in rows:
+            assert row["reject_gate"] == "web"
+            assert "文章这轮已经留了 1 篇" in row["reject_reason"]
 
 
 # ----------------------------------------------------------------------
@@ -305,7 +306,7 @@ class TestGuideSecondGate:
 
 class TestGuideBrief:
     def test_collect_brief_mentions_guide_criteria(self, tmp_path) -> None:
-        """子 agent brief 里写明 guide 的收录标准（教程/指南/深度分析才收，180 天内）。"""
+        """子 agent brief 里写明 guide 的收录标准（教程/指南/深度分析才收，60 天内）。"""
         _store, settings, feeds, models, workers, topics, _p = _make_feeds(
             tmp_path,
             models=FakeModelsQueue(ready=True, replies=[
@@ -318,7 +319,7 @@ class TestGuideBrief:
         with _TimePatch():
             _run(feeds.prepare_news(GID))
         brief = str(workers.calls[0]["brief"])
-        assert "180" in brief or "天" in brief
+        assert "60" in brief or "天" in brief
         assert "教程" in brief or "指南" in brief or "文章" in brief
 
 

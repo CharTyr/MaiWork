@@ -8,7 +8,7 @@ SKILL.md + references/）。资讯流水线的四个环节是固定的，所以�
 - 找候选（子 agent）      ← criteria.md（资讯 / 文章 / 拓展 / 同一件事）+ finding.md「跳一步」「找候选」
 - 打分（主模型）          ← criteria.md 全文 + scoring.md 全文
 
-程序硬判的数字（7 天、180 天、3.8 …）仍是 feeds.py 的常量；skill 文本里写的数字由
+程序硬判的数字（7 天、60 天、3.8 …）仍是 feeds.py 的常量；skill 文本里写的数字由
 tests/test_news_standard.py 对照常量，改一边忘了另一边会红。
 skill 同时挂进 skills 列表（内置、只读、roles=worker），任务子 agent 可以 read_skill 读全文；
 不给主模型（给了会让排计划回合每次都带 skill 工具、多一轮调用）。

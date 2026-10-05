@@ -5,8 +5,9 @@
 
 改后：RSS 和搜索是两条候选入口，分别判断。
 - 搜索不可用（SearchUnavailable：没配置或暂时坏）但本群有启用的 RSS 源 → 照常取 RSS，
-  跳过撒网（_collect_two_phase）和补打开，走 RSS-only 一轮；硬淘汰 / 打分 / 隐私 / 去重不放宽；
+  跳过撒网（_collect_two_phase），走 RSS-only 一轮；硬淘汰 / 打分 / 隐私 / 去重不放宽；
   定关注点（_plan_focus 只服务撒网）跳过省 token；
+  补打开照走（2026-10-05 §九 第一步 3：RSS 条目也要过内容核验，只派这一个子 agent）；
   批次统计里带 source_mode="rss_only"，网页能看出这一轮是 RSS-only。
 - 搜索可用 → 原逻辑。
 - 两者都不可用（没搜索且没订 RSS）→ 仍 _skipped_batch，原因准确；
@@ -77,7 +78,7 @@ class _BrokenSearch:
 
 
 class FakeWorkers:
-    """假 workers.run：记录调用；RSS-only 轮里撒网 / 补打开都不该派工。"""
+    """假 workers.run：记录调用；RSS-only 轮里只该派补打开（撒网 / 核验都不派）。"""
 
     def __init__(self) -> None:
         self.calls: List[Dict[str, Any]] = []
@@ -198,7 +199,7 @@ def _batch_stats(store: Store, batch_id: int) -> Any:
 @pytest.mark.asyncio
 async def test_rss_only_without_search_configured(tmp_path) -> None:
     """搜索完全未配（available()=False）+ 订了 RSS → 照常取 RSS、打分、写帖、入库；
-    不定关注点、不撒网、不补打开；批次统计带 source_mode="rss_only"。"""
+    不定关注点、不撒网，只派一次补打开（RSS 条目也要过内容核验）；批次统计带 source_mode="rss_only"。"""
     store, settings, feeds, models, workers, topics = _make_feeds(
         tmp_path,
         models=FakeModelsQueue(ready=True, replies=[
@@ -226,8 +227,11 @@ async def test_rss_only_without_search_configured(tmp_path) -> None:
     purposes = [str(k.get("purpose") or "") for _r, _m, k in models.calls]
     assert "feeds.focus" not in purposes, "RSS-only 不该花定关注点的 token"
     assert "feeds.pick" not in purposes, "RSS-only 不该有挑这步"
-    # 不撒网、不补打开：workers 一次都没派
-    assert workers.calls == [], "RSS-only 不该派任何子 agent"
+    # 不撒网 / 不定关注点 / 不核验，只派一次补打开（2026-10-05 §九 第一步 3：
+    # RSS 条目的 quote 只是源摘要，没真打开过原文核对）
+    assert len(workers.calls) == 1, f"RSS-only 只该派一次补打开：{workers.calls}"
+    assert str(workers.calls[0]["task_id"]).startswith("feeds-recheck:")
+    assert "https://ok.example.com/fresh" in str(workers.calls[0]["brief"])
     # 打分、写帖照走（不放宽）
     assert "feeds.score" in purposes and "feeds.post" in purposes
     # 批次统计看得出这一轮是 RSS-only

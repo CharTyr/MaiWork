@@ -24,4 +24,4 @@
 - 上游：[JS 控制层](../codemap.md)（`state.js`、`router.js`、`render.js`、`actions.js`）；数据来自服务端 `GET /api/groups` 和 `GET /api/groups/{ref}`，不是此目录自行生成。
 - 设置页的加载态、部分反馈组件复用 `news.js`；群页复用上级 `pulse.js`。
 - 服务端路由与鉴权：[控制台后端](../../../codemap.md)；源码在 `console/server.py` 与 `console/views.py`。
-- `groupctx.js`：群页「这个群」区（docs/17 §八.4）。`ctxSection(gid)` 懒加载 `GET /api/groups/{gid}/rules` + `/skills`，先放 `.gctx-slot` 占位，回来后 `repaintCtx()` 原地填；状态在 `state.gctx`（换群整份换掉，编辑中的文字存 `drafts`，整页重画不丢）。本群规矩：看 / 改（PUT，≤3000 字）/ 历史回退；本群做法：资讯 / 构想 / 目标 / 自定义岗每岗一份 + 通用执行列表，改、锁定、归档 / 恢复、删除、历史回退。`actCtx()` 处理 `gctx-*` 点击，写之前核对群没换。
+- `groupctx.js`：群页「这个群」区（docs/17 §八.4）。`ctxSection(gid)` 懒加载 `GET /api/groups/{gid}/rules` + `/skills`，先放 `.gctx-slot` 占位，回来后 `repaintCtx()` 原地填；状态在 `state.gctx`（换群整份换掉，编辑中的文字存 `drafts`，整页重画不丢）。本群规矩：看 / 改（PUT，≤3000 字）/ 历史回退；本群做法：资讯 / 构想 / 目标 / 自定义岗每岗一份 + 通用执行列表，改、锁定、归档 / 恢复、删除、历史回退。`actCtx()` 处理 `gctx-*` 点击，写前与成功 / 失败回包均核对当前群及缓存对象，旧群错误不会碰新表单；本地校验关联具体名字 / 用途 / 正文输入并清除上一轮标记，通用服务端失败只提示、不误标字段。群控的本地字段错误用 `errorField` 渲染到对应输入，错误说明有稳定 id；「这个群」小按钮最小 44×44px。本轮修复已于 2026-10-05 08:42 部署并核对线上静态资源摘要，公开副本仍未推送本修复。

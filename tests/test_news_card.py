@@ -264,3 +264,16 @@ def test_text_not_truncated():
     h = news_card.render_html(_data(items=items), now=NOW)
     assert long_title in h and h.count(long_sum.strip()) == 2 and long_why.strip() in h
     assert "…" not in h
+
+
+def test_guide_items_hide_publish_date_news_items_keep_it():
+    """2026-10-05 用户：发群的资讯卡片上，文章（kind=guide）不显示发布日期；资讯照旧显示「N 天前」。"""
+    items = [
+        {"title": "资讯一条", "summary": "s", "site": "a.com", "published_ts": NOW - 7200, "kind": "news"},
+        {"title": "老文章一篇", "summary": "s", "site": "b.com", "published_ts": NOW - 40 * 86400, "kind": "guide"},
+    ]
+    h = news_card.render_html(_data(items=items, total=2), now=NOW)
+    assert "2 小时前" in h
+    guide_part = h[h.index("老文章一篇"):]
+    assert "b.com" in guide_part
+    assert "天前" not in guide_part and "月" not in guide_part.split("b.com", 1)[1].split("</div>", 1)[0]

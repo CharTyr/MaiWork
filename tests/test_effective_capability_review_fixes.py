@@ -105,7 +105,7 @@ class CaptureWorkers:
         self, brief, *, group_id, tools=None, task_id="", actor="", max_steps=0,
         output_schema=None, workspace=None, skills_hint="", system_extra="",
         deadline_ts=None, artifact_scope=None, agent_type="task",
-        allowed_tools=None, allowed_skills=None, agent=None,
+        allowed_tools=None, allowed_skills=None, agent=None, used_tools=None,
     ):
         self.calls.append({
             "brief": brief,
@@ -724,7 +724,7 @@ class TestCancellationAndInconclusivePreserved:
             _plan(jobs=[exec_job]),
             not_json, not_json, not_json, not_json, not_json, not_json,
             not_json, not_json,
-            _plan(jobs=[exec_job]),
+            _plan(jobs=[exec_job], criteria=["第二轮验收标准-marker"]),
             _review(pass_=True, artifact=f"artifacts/{tid}/index.html"),
         ])
         coord = _coordinator(
@@ -735,3 +735,8 @@ class TestCancellationAndInconclusivePreserved:
 
         assert tasks.get(tid)["status"] == "completed"
         assert len(workers.calls) == 2  # 第一轮 + 退回重跑的第二轮
+        handoffs = agents.handoffs(GID, 'task', limit=10)
+        assert [h['criteria'] for h in handoffs] == [
+            ['第二轮验收标准-marker'], ['每张图都落到本地，附出处链接'],
+        ]
+        assert json.loads(handoffs[0]['review'])['summary'] == '看着不错'

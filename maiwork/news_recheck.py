@@ -13,7 +13,11 @@
    按原文重写摘要和原文依据、填发布时间、判旧闻（stale：正文说的事已经过去 / 发布超过 7 天）。
 3. 代码只认它**这次真打开过**的链接（查补打开这轮的 fetch_page 记录）；说 keep 但没打开 → 不动，
    后面第一道照旧按「原文没打开过」淘汰。drop / stale → 直接打上第一道淘汰理由。
+4. 模型没填日期时，用代码在打开网页那一步读到的发布日期补上（page_date；docs/10 §九 第一步 2）。
 补打开出任何错都不拖累这轮：记日志，候选原样往下走。
+
+2026-10-05（docs/10 §九 第一步 3）：RSS 条目也走这道（`pick_unverified` 不再跳过 `from_rss`）——
+它们的 quote 只是源里的摘要、fetched 是取回时写死的 true，等于没核对过。
 """
 
 from __future__ import annotations
@@ -74,18 +78,60 @@ def opened_links(store: Any, task_id: str) -> tuple[set[str], int]:
 
 
 def pick_unverified(candidates: list[dict], opened: set[str], records: int) -> list[int]:
-    """要补打开的候选下标（按原序）：没打开过的；说打开过但记录里没有的（有记录时才查）。"""
+    """要补打开的候选下标：RSS 条目排最前，然后是没打开过的 / 说打开过但记录里没有的（有记录时才查）。
+
+    RSS 条目排最前（2026-10-05 §九 第一步 3）：它们的 quote 只是 RSS 源里的摘要、
+    `fetched` 是取回时写死的 true，从没真打开过原文核对——所以排在最前，RSS 条目先核对；
+    总量仍由调用方按 `_RECHECK_CAP` 截断（不多派子 agent、不超预算）。
+    同一组内部保持原序。
+    """
     from .coordinator import normalize_link_for_check
 
+    from_rss: list[int] = []
     out: list[int] = []
     for i, item in enumerate(candidates):
-        if item.get("reject") or item.get("from_rss"):
+        if item.get("reject"):
+            continue
+        if item.get("from_rss"):
+            from_rss.append(i)
             continue
         if not item.get("fetched") or not str(item.get("quote") or "").strip():
             out.append(i)
         elif records and normalize_link_for_check(str(item.get("url") or "")) not in opened:
             out.append(i)
-    return out
+    return from_rss + out
+
+
+def _fill_code_dates(store: Any, task_id: str, items: list[dict], parse_published: Callable[[Any], Any]) -> int:
+    """模型没给日期时，用代码从网页读到的发布日期补上（docs/10 §九 第一步 2）；返回补了几条。"""
+    from . import page_date
+    from .coordinator import normalize_link_for_check
+
+    try:
+        dates = page_date.page_dates(store, task_id)
+    except Exception:
+        logger.debug("读补打开这轮的页面日期失败（%s）", task_id, exc_info=True)
+        return 0
+    if not dates:
+        return 0
+    filled = 0
+    for item in items:
+        if not isinstance(item, dict) or item.get("reject"):
+            continue
+        if isinstance(item.get("published_ts"), (int, float)):
+            continue
+        key = normalize_link_for_check(str(item.get("url") or ""))
+        date = dates.get(key) if key else ""
+        if not date:
+            continue
+        ts = parse_published(date)
+        if not ts:
+            continue
+        item["published_ts"] = ts
+        if item.get("published_raw") in (None, ""):
+            item["published_raw"] = date
+        filled += 1
+    return filled
 
 
 def _brief(candidates: list[dict], picked: list[int]) -> str:
@@ -206,6 +252,8 @@ async def recheck(
         item["fetched"] = True
         item["rechecked"] = True
         kept += 1
+    # 模型没填日期 → 用代码这次从网页读到的补上（「必须有日期」不放宽，只救「页面上没看见」的误杀）
+    _fill_code_dates(store, recheck_mark, [candidates[i] for i in picked], parse_published)
     logger.info("资讯补打开（群 %s）：送去 %d 条，核对通过 %d 条", gid, len(picked), kept)
     return kept
 

@@ -133,6 +133,7 @@ document.addEventListener("submit", async (e) => {
     btn.textContent = "在取…";
     try {
       const r = await api("POST", `/api/groups/${encodeURIComponent(f.dataset.g)}/rss`, { url });
+      if (state.rssAuto) delete state.rssAuto[f.dataset.g];
       await loadSettings();
       repaintSheet();
       toast(`加上了：${r.title || url}${r.items_count != null ? `，现在有 ${r.items_count} 篇` : ""}`);

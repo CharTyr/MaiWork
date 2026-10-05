@@ -446,7 +446,7 @@ class TestSameStoryInRound:
 
 # ----------------------------------------------------------------------
 # 拓展名额条件（2026-09-29 用户定）：资讯「值得聊 ≥4 或意外度 ≥4」；
-# 文章也能用，门槛更高：信息量、意外度都 ≥4、有桥（发布时间 180 天内由第一道硬判）
+# 文章也能用，门槛更高：信息量、意外度都 ≥4、有桥（发布时间 60 天内由第一道硬判）
 # ----------------------------------------------------------------------
 
 
@@ -491,7 +491,7 @@ class TestExploreSlotConditions:
         assert got == 1 and rows[0]["angle"] == "explore"
 
     def test_guide_surprise_3_still_strict(self, tmp_path) -> None:
-        cand = _cand(0, kind="guide", title="多模型路由自动降级实战", published=NOW - 70 * 86400)
+        cand = _cand(0, kind="guide", title="多模型路由自动降级实战", published=NOW - 40 * 86400)
         got, rows = _run_one(tmp_path, cand, _score(
             0, relevance=3, chat=5, info=5, surprise=3, novelty=5, profile=None,
             bridge="从群里聊模型偷换跳到正规的路由降级做法"))

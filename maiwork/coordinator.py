@@ -1493,6 +1493,7 @@ class Coordinator:
                 job_type=str(j.get("type") or "other"),
                 artifact_scope=scope,
                 agent=str(j.get("agent") or "task"),
+                criteria=tuple(plan["criteria"]),
             )
 
         done: list[asyncio.Event] = [asyncio.Event() for _ in jobs]
@@ -1576,7 +1577,7 @@ class Coordinator:
         # 注：reports 是对齐 jobs 的 list，包含 task 专岗一份也不多（_run_job 内已换通才）。
         self._settle_job_specialist_handoffs(
             gid, reports, accepted=bool(review["pass"]),
-            why="主模型验收过" if review["pass"] else "主模型验收不过（重试被拒）",
+            why=str(review.get("review") or ("主模型验收过" if review["pass"] else "主模型验收不过（重试被拒）")),
         )
 
         # 汇总 attempt 结果先写（无论过不过）
@@ -1606,6 +1607,7 @@ class Coordinator:
         job_type: str = "other",
         artifact_scope: tuple[str, ...] | None = None,
         agent: str = "task",
+        criteria: Any = None,
     ) -> Any:
         sem = self._semaphore_for(ws_name)
         async with sem:
@@ -1646,6 +1648,7 @@ class Coordinator:
                 return await specialists.run(
                     str(agent or "task"), brief,
                     group_id=gid, task_id=tid,
+                    criteria=criteria,
                     tools=list(tools or []),
                     actor=f"子 agent #{job_idx}",
                     workspace=ws_path,
@@ -2434,7 +2437,7 @@ class Coordinator:
                 if accepted:
                     specialists.review(
                         str(gid), report, True,
-                        str(getattr(report, "summary", "") or "")[:300] or "子 agent 交回",
+                        str(why or "验收通过")[:300],
                         refs=(), learn=False,
                     )
                 else:

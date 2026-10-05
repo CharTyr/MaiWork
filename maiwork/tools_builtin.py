@@ -13,7 +13,9 @@ fetch_page 安全规则：
   防止「外网 URL 302 到 169.254.169.254 元数据接口」这种内网穿透；
 - 响应体最多读 200KB；只处理 text/html、text/plain、application/json；
 - HTML 提取优先用 trafilatura（宿主有，本地测试机未必有，try/except 兜底），
-  否则用标准库 html.parser 去 script/style/nav 等再压缩空白；同时抽 <title>。
+  否则用标准库 html.parser 去 script/style/nav 等再压缩空白；同时抽 <title>；
+- 顺手用 page_date 从原始 HTML 读发布日期（meta / JSON-LD / <time>），写进正文和
+  tool_calls 摘要（docs/10 §九 第一步 2）——子 agent 看不到日期时，下游代码还能拿到。
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from . import page_date
 from .tools import Tool, ToolContext, ToolResult, Tools
 
 logger = logging.getLogger("maiwork.tools_builtin")
@@ -254,53 +257,56 @@ def _extract_og_image(html: str, final_url: str) -> str:
 
 async def _fetch_page_text(
     url: str, *, transport: Any, resolver: Resolver
-) -> tuple[bool, str, str, str]:
-    """跟随跳转抓页面，返回 (ok, 文本或错误原因, og:image 或 "", 最终地址)。
+) -> tuple[bool, str, str, str, str]:
+    """跟随跳转抓页面，返回 (ok, 文本或错误原因, og:image 或 "", 最终地址, 页面发布日期)。
 
     最终地址 = 跟随跳转后真正取到正文的那个 URL（没跳转就等于请求地址）；失败时是 ""。
     交付里引用的常是跳转后的长链，验收引用核对要把它也算作「打开过」。
+    页面发布日期 = 代码从原始 HTML 里读到的（page_date；读不到 ""）。
     错误文本面向子 agent（中文）。
     """
     current = str(url or "").strip()
     for hop in range(_MAX_REDIRECTS + 1):
         parsed = urlparse(current)
         if parsed.scheme not in ("http", "https"):
-            return False, f"只支持 http/https 链接，{parsed.scheme or '(没有协议)'} 不支持", "", ""
+            return False, f"只支持 http/https 链接，{parsed.scheme or '(没有协议)'} 不支持", "", "", ""
         if not parsed.hostname:
-            return False, "链接里没有主机名，打不开", "", ""
+            return False, "链接里没有主机名，打不开", "", "", ""
         if _host_is_forbidden(parsed.hostname, resolver):
-            return False, f"{parsed.hostname} 解析到内网/本机地址，不允许打开", "", ""
+            return False, f"{parsed.hostname} 解析到内网/本机地址，不允许打开", "", "", ""
         try:
             async with httpx.AsyncClient(transport=transport, timeout=20.0) as client:
                 resp = await client.get(current, follow_redirects=False)
         except httpx.HTTPError as e:
-            return False, f"打开页面失败：{e}", "", ""
+            return False, f"打开页面失败：{e}", "", "", ""
         if resp.status_code in (301, 302, 303, 307, 308):
             if hop >= _MAX_REDIRECTS:
-                return False, f"跳转超过 {_MAX_REDIRECTS} 次，放弃", "", ""
+                return False, f"跳转超过 {_MAX_REDIRECTS} 次，放弃", "", "", ""
             location = resp.headers.get("location") or ""
             if not location:
-                return False, f"页面返回 {resp.status_code} 但没给跳转到哪", "", ""
+                return False, f"页面返回 {resp.status_code} 但没给跳转到哪", "", "", ""
             current = urljoin(current, location)
             continue
         if resp.status_code != 200:
-            return False, f"页面返回 {resp.status_code}", "", ""
+            return False, f"页面返回 {resp.status_code}", "", "", ""
         ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
         if ctype and not any(ctype.startswith(p) for p in _ALLOWED_PREFIXES):
-            return False, f"页面类型是 {ctype}，只支持网页/纯文本/JSON", "", ""
+            return False, f"页面类型是 {ctype}，只支持网页/纯文本/JSON", "", "", ""
         raw = resp.content[: _MAX_BODY_BYTES + 1]
         if len(raw) > _MAX_BODY_BYTES:
             raw = raw[:_MAX_BODY_BYTES]
         text = raw.decode(resp.encoding or "utf-8", errors="replace")
         image_url = ""
+        published = ""
         if ctype.startswith("text/html") or (not ctype and text.lstrip().startswith("<")):
             image_url = _extract_og_image(text, current)
+            published = page_date.published_from_html(text)  # 原始 HTML 里读日期（读完再提正文）
             title, body = _extract_html(text)
             text = (f"《{title}》\n{body}" if title else body) or text
         if len(text) > _TEXT_MAX_CHARS:
             text = text[:_TEXT_MAX_CHARS] + " …（后面还有，已截断）"
-        return True, text, image_url, current
-    return False, "跳转次数太多，放弃", "", ""
+        return True, text, image_url, current, published
+    return False, "跳转次数太多，放弃", "", "", ""
 
 
 # ----------------------------------------------------------------------
@@ -483,7 +489,9 @@ def register_builtin(
             )
         return ToolResult(ok=True, output="\n".join(lines), data=results)
 
-    def _page_result(url: str, text: str, image_url: str, final_url: str, via: str) -> ToolResult:
+    def _page_result(
+        url: str, text: str, image_url: str, final_url: str, via: str, published: str = ""
+    ) -> ToolResult:
         host = urlparse(url).hostname or ""
         if image_url:
             # 拿到封面图就告诉子 agent 一声（交回候选时带 image_url）
@@ -491,9 +499,14 @@ def register_builtin(
         if final_url and final_url != url:
             # 跳转后的最终地址也告诉子 agent：交付里常引用它，验收引用核对要认
             text += f"\n\n（这个链接跳转到了：{final_url}）"
+        if published:
+            # 代码从网页读到的发布日期：子 agent 直接看得到（提示词要它填 published），
+            # 也写进 tool_calls 摘要给下游兜底（docs/10 §九 第一步 2）
+            text += f"\n\n（代码从页面读到发布时间：{published}）"
         return ToolResult(
             ok=True, output=text,
-            data={"url": url, "final_url": final_url, "host": host, "image_url": image_url, "via": via},
+            data={"url": url, "final_url": final_url, "host": host, "image_url": image_url,
+                  "via": via, "published": published},
         )
 
     async def _try_extract(url: str) -> tuple[str, str]:
@@ -509,7 +522,10 @@ def register_builtin(
         return (text, "") if text else ("", "没读到正文（没选工具或那家用不了）")
 
     def _extracted_result(url: str, text: str) -> ToolResult:
-        return _page_result(url, text[:20000] + "\n\n（这是经「抓网页正文」工具读到的正文）", "", url, "extract")
+        return _page_result(
+            url, text[:20000] + "\n\n（这是经「抓网页正文」工具读到的正文）", "", url, "extract",
+            page_date.published_from_text(text),
+        )
 
     async def fetch_page(ctx: ToolContext, args: dict) -> ToolResult:
         url = str(args.get("url") or "").strip()
@@ -533,23 +549,30 @@ def register_builtin(
                 return ToolResult(ok=False, output="", error=problem)
             got = await reader.read(url)
             if got.ok:
-                return _page_result(url, got.text, got.image_url, got.final_url or url, "jina")
+                return _page_result(
+                    url, got.text, got.image_url, got.final_url or url, "jina",
+                    page_date.normalize_date(getattr(got, "published", "")),
+                )
             reasons = [f"Jina Reader：{got.reason}"]
             text, why = await _try_extract(url)
             if text:
                 return _extracted_result(url, text)
             reasons.append(f"抓正文工具：{why}")
-            ok, text, image_url, final_url = await _fetch_page_text(url, transport=http_transport, resolver=resolve)
+            ok, text, image_url, final_url, published = await _fetch_page_text(
+                url, transport=http_transport, resolver=resolve
+            )
             if ok:
-                return _page_result(url, text, image_url, final_url, "direct")
+                return _page_result(url, text, image_url, final_url, "direct", published)
             reasons.append(f"直接打开：{text}")
             return ToolResult(ok=False, output="", error="打不开这个页面。" + "；".join(reasons))
 
         # 老顺序（Jina 关着）：直接打开，被网站拦了（403 等）再用抓正文工具。
         # 内网 / 非法地址（安全拒绝）绝不走抓正文。线上实测约三分之一原文页 403。
-        ok, text, image_url, final_url = await _fetch_page_text(url, transport=http_transport, resolver=resolve)
+        ok, text, image_url, final_url, published = await _fetch_page_text(
+            url, transport=http_transport, resolver=resolve
+        )
         if ok:
-            return _page_result(url, text, image_url, final_url, "direct")
+            return _page_result(url, text, image_url, final_url, "direct", published)
         blocked_for_safety = "内网" in text or "不允许" in text or "只支持" in text
         if not blocked_for_safety:
             extracted, _why = await _try_extract(url)
@@ -656,6 +679,11 @@ def register_builtin(
                     + (
                         final_url_note(str((res.data or {}).get("final_url") or ""))
                         if (res.data or {}).get("final_url")
+                        else ""
+                    )
+                    + (
+                        page_date.note(str((res.data or {}).get("published") or ""))
+                        if (res.data or {}).get("published")
                         else ""
                     )
                 )

@@ -1,8 +1,8 @@
-"""0.8.0 发布版本号元数据：发布前必须一起对齐（docs/19-0.8.0收口验证.md §发布状态）。
+"""发布版本号元数据：发布前必须一起对齐（0.8.0 见 docs/19；0.9.0 = 构想可行性闸 + 资讯来源多样化，2026-10-05）。
 
 只读 manifest / plugin.py / config.py 里的版本常量，不碰线上配置：
-- 发布版本 = 0.8.0（`_manifest.json` 的 version 与 `plugin.PLUGIN_VERSION` 必须一致）；
-- `CONFIG_VERSION` 仍是 0.4.6 —— 本次只是版本号收口，**不升配置版本**，
+- 发布版本 = 0.9.0（`_manifest.json` 的 version 与 `plugin.PLUGIN_VERSION` 必须一致）；
+- `CONFIG_VERSION` 仍是 0.4.6 —— 本次不加配置项，**不升配置版本**，
   宿主也就不需要为这次 bump 改任何插件配置；
 - manifest 声明的 SDK / 宿主版本范围仍然覆盖当前开发（SDK 2.8.1）与线上宿主
   （MaiCore 1.3.2 / SDK 2.8.2，docs/06）；
@@ -20,7 +20,7 @@ from packaging.version import Version
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 MANIFEST = json.loads((PLUGIN_DIR / "_manifest.json").read_text(encoding="utf-8"))
 
-RELEASE_VERSION = "0.8.0"
+RELEASE_VERSION = "0.9.0"
 CONFIG_VERSION_EXPECTED = "0.4.6"
 # 声明范围必须覆盖的版本：本地开发 SDK / 线上宿主与 SDK（docs/06 §QQ 官方适配器统一账号 2026-10-03）
 SDK_VERSIONS_COVERED = ("2.8.1", "2.8.2")
@@ -28,7 +28,7 @@ HOST_VERSION_COVERED = "1.3.2"
 SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
 
 
-def test_release_version_is_0_8_0():
+def test_release_version_is_0_9_0():
     from CharTyr_MaiWork.plugin import PLUGIN_VERSION
 
     assert PLUGIN_VERSION == RELEASE_VERSION, PLUGIN_VERSION

@@ -1,7 +1,12 @@
 """RSS 资讯源（rss.py）。
 
-- 数据：kv["feeds.rss.<群号>"] = [{id, url, title, enabled, added_ts, last_ok_ts, last_error}]；
+- 数据：kv["feeds.rss.<群号>"] = [{id, url, title, enabled, added_ts, last_ok_ts, last_error,
+  auto, origin, reason, label, trial_until}]；
   每群最多 20 个，url 必须为无 userinfo 的公开 http(s) 地址。
+  后五个是自动订阅（docs/10 §九 第二步，auto_sources.py）加的：auto=True = 自动加的源，
+  origin = trusted|map|push（来源：门槛 / 来源地图 / 固定 push 清单），reason = 推荐理由
+  （给网页看），label = 来源标签（source_name 口径，用来跟拒绝名单比对），
+  trial_until = 试用期截止（epoch 秒）。老条目没有这几个键，读的时候补默认值，照常工作。
 - 解析：RSS 2.0（channel/item）和 Atom（feed/entry）都认；先用标准库 Expat
   的 DTD 事件拒绝真正的 DOCTYPE（不误伤注释），再交给 xml.etree 解析。
 - 取最近 lookback_days 内的条目 {title, url, published, summary(去 HTML 截 500)}；
@@ -60,11 +65,25 @@ def _save_list(store: Any, gid: str, feeds: list[dict[str, Any]]) -> None:
         store.kv_set(conn, _key(gid), feeds)
 
 def list_feeds(store: Any, gid: str) -> list[dict[str, Any]]:
-    """按 added_ts/id 稳定排序返回已加源（管理员视图）。"""
-    return sorted(_load_list(store, gid), key=lambda e: (float(e.get("added_ts") or 0.0), str(e.get("id") or "")))
+    """按 added_ts/id 稳定排序返回已加源（管理员视图）。
 
-def add_feed(store: Any, gid: str, *, url: str, title: str, feed_id: str, now: float | None = None) -> dict[str, Any]:
-    """加源（不试取——试取是接口层「先试取，成功才保存」在做）。RssError 拒绝。"""
+    老条目（第一步之前的 kv 数据）没有 auto/origin/reason/label/trial_until 这几个键，
+    这里统一补默认值——网页 / 接线处拿到的形状始终一样。
+    """
+    return sorted(
+        (_with_defaults(e) for e in _load_list(store, gid)),
+        key=lambda e: (float(e.get("added_ts") or 0.0), str(e.get("id") or "")),
+    )
+
+def add_feed(
+    store: Any, gid: str, *, url: str, title: str, feed_id: str, now: float | None = None,
+    auto: bool = False, origin: str = "", reason: str = "", label: str = "", trial_until: float = 0.0,
+) -> dict[str, Any]:
+    """加源（不试取——试取是接口层「先试取，成功才保存」在做）。RssError 拒绝。
+
+    auto/origin/reason/label/trial_until 只有自动订阅（auto_sources.py）会传；
+    手动加源不传，落库就是默认值（auto=False、origin=""）。
+    """
     url_s = _require_http(url)
     _public_url(url_s)  # 即使绕过网页接口直接保存，也不能存入明显的内网地址或 userinfo。
     now = float(clock.now() if now is None else now)
@@ -76,7 +95,8 @@ def add_feed(store: Any, gid: str, *, url: str, title: str, feed_id: str, now: f
     feed_id_s = str(feed_id or "").strip() or _new_id(feeds)
     if any(str(e.get("id")) == feed_id_s for e in feeds):
         feed_id_s = _new_id(feeds)
-    entry = _plain(feed_id_s, url_s, title, True, now, 0.0, "")
+    entry = _plain(feed_id_s, url_s, title, True, now, 0.0, "", auto=auto, origin=origin,
+                   reason=reason, label=label, trial_until=trial_until)
     feeds.append(entry)
     _save_list(store, gid, feeds)
     return entry
@@ -102,6 +122,16 @@ def toggle_feed(store: Any, gid: str, feed_id: str, *, enabled: bool) -> dict[st
     _save_list(store, gid, feeds)
     return victim
 
+def end_trial(store: Any, gid: str, feed_id: str) -> None:
+    """自动源过了试用期：trial_until 清零（网页不再显示「试用到」，退订也不再看试用期那条）。没有这个源就不动。"""
+    fid = str(feed_id or "")
+    feeds = _load_list(store, gid)
+    victim = next((e for e in feeds if str(e.get("id")) == fid), None)
+    if victim is None or not float(victim.get("trial_until") or 0.0):
+        return
+    victim["trial_until"] = 0.0
+    _save_list(store, gid, feeds)
+
 def mark_checked(store: Any, gid: str, feed_id: str, *, ok_ts: float | None, error: str) -> None:
     """记一次取源结果：ok_ts 非空记 last_ok_ts；error 非空记 last_error（保留上次成功时间）。"""
     fid = str(feed_id or "")
@@ -117,7 +147,10 @@ def mark_checked(store: Any, gid: str, feed_id: str, *, ok_ts: float | None, err
         victim["last_error"] = ""
     _save_list(store, gid, feeds)
 
-def _plain(feed_id: str, url: str, title: str, enabled: bool, added_ts: float, last_ok_ts: float, last_error: str) -> dict[str, Any]:
+def _plain(
+    feed_id: str, url: str, title: str, enabled: bool, added_ts: float, last_ok_ts: float, last_error: str,
+    *, auto: bool = False, origin: str = "", reason: str = "", label: str = "", trial_until: float = 0.0,
+) -> dict[str, Any]:
     return {
         "id": str(feed_id),
         "url": str(url),
@@ -126,7 +159,30 @@ def _plain(feed_id: str, url: str, title: str, enabled: bool, added_ts: float, l
         "added_ts": float(added_ts),
         "last_ok_ts": float(last_ok_ts or 0.0),
         "last_error": str(last_error or ""),
+        # 自动订阅标记（docs/10 §九 第二步）：手动加的源一律默认值。
+        "auto": bool(auto),
+        "origin": str(origin or ""),
+        "reason": str(reason or "")[:200],
+        "label": str(label or ""),
+        "trial_until": float(trial_until or 0.0),
     }
+
+# 老条目缺的字段：读的时候补上（写入侧照旧只写自己有的键，不动别人的数据）。
+_AUTO_DEFAULTS: dict[str, Any] = {
+    "auto": False, "origin": "", "reason": "", "label": "", "trial_until": 0.0,
+}
+
+def _with_defaults(entry: dict[str, Any]) -> dict[str, Any]:
+    out = dict(entry)
+    for key, default in _AUTO_DEFAULTS.items():
+        if key not in out or out[key] is None:
+            out[key] = default
+    out["auto"] = bool(out.get("auto"))
+    out["origin"] = str(out.get("origin") or "")
+    out["reason"] = str(out.get("reason") or "")
+    out["label"] = str(out.get("label") or "")
+    out["trial_until"] = float(out.get("trial_until") or 0.0)
+    return out
 
 def _new_id(existing: list[dict[str, Any]]) -> str:
     import secrets
@@ -364,28 +420,41 @@ def _item_of(node: Any) -> dict[str, Any] | None:
 # 取源
 # ----------------------------------------------------------------------
 
-async def fetch_feed_source(
+_CHARSET_RE = re.compile(r"charset\s*=\s*[\"']?([\w\-]+)", re.I)
+
+
+def _decode_text(body: bytes, content_type: str = "") -> str:
+    """按响应声明的 charset 解码（没有就 utf-8、坏字节替换）——中文站的 HTML 常是 gbk。"""
+    match = _CHARSET_RE.search(str(content_type or ""))
+    if match:
+        try:
+            return body.decode(match.group(1), errors="replace")
+        except LookupError:
+            pass
+    return body.decode("utf-8", errors="replace")
+
+
+async def fetch_bytes(
     url: str,
     *,
     transport: Any = None,
-    lookback_days: int = 14,
-    now: float | None = None,
-    limit: int = _PER_SOURCE_LIMIT,
+    timeout_s: float = _TIMEOUT_S,
+    max_bytes: int = _MAX_BYTES,
+    what: str = "RSS",
 ) -> dict[str, Any]:
-    """取一次并解析。返回 {"title", "items", "error"}；业务/网络失败走 error（不抛）。
-    url 不合法抛 RssError（接口层要 400）。"""
+    """安全取一次字节（全模块唯一一处出网请求；第二步取首页 HTML 也走这里）。
+
+    和取 RSS 同一套限制：生产先把域名解析成公开 IP 再连固定 IP（不在客户端里做第二次
+    DNS）、不跟随重定向（302 也只当失败）、trust_env=False（禁环境代理）、全程限时、
+    响应限字节。**别在别处另写一套 httpx 调用**。
+    返回 {"body": bytes|None, "status": int, "content_type": str, "error": str}；
+    url 不是合法的公开 http(s) 地址 → 抛 RssError（调用方自己决定 400 还是记 error）。
+    """
     url_s = _require_http(url)
-    now = float(clock.now() if now is None else now)
-    out: dict[str, Any] = {"title": "", "items": [], "error": ""}
-    try:
-        parsed = _public_url(url_s)
-    except RssError as e:
-        # 网页 POST 取源阶段用 error 返回 400；这里直接抛会变成未处理的 500。
-        out["error"] = str(e)
-        return out
+    parsed = _public_url(url_s)
     try:
         # 全程限时；to_thread 的系统 DNS 调用即使超时仍可能在后台结束，但不会发 HTTP 请求。
-        async with asyncio.timeout(_TIMEOUT_S):
+        async with asyncio.timeout(timeout_s):
             request_url = parsed
             headers = {"User-Agent": _UA}
             extensions: dict[str, Any] = {}
@@ -402,30 +471,57 @@ async def fetch_feed_source(
                 network_transport = httpx.AsyncHTTPTransport(trust_env=False)
             async with httpx.AsyncClient(transport=network_transport, trust_env=False) as client:
                 async with client.stream(
-                    "GET", request_url, timeout=_TIMEOUT_S, headers=headers,
+                    "GET", request_url, timeout=timeout_s, headers=headers,
                     extensions=extensions, follow_redirects=False,
                 ) as resp:
-                    if resp.status_code != 200:
-                        out["error"] = f"取 RSS 失败（HTTP {resp.status_code}）"
-                        return out
+                    content_type = str(resp.headers.get("content-type") or "")
+                    status = int(resp.status_code)
+                    if status != 200:
+                        return {"body": None, "status": status, "content_type": content_type,
+                                "error": f"取 {what} 失败（HTTP {status}）"}
                     chunks: list[bytes] = []
                     total = 0
                     async for chunk in resp.aiter_bytes():
                         total += len(chunk)
-                        if total > _MAX_BYTES:
-                            out["error"] = "RSS 响应太大了（超过 2MB）"
-                            return out
+                        if total > max_bytes:
+                            mb = max(1, int(max_bytes // (1024 * 1024)))
+                            return {"body": None, "status": status, "content_type": content_type,
+                                    "error": f"{what} 响应太大了（超过 {mb}MB）"}
                         chunks.append(chunk)
     except RssError as e:
+        return {"body": None, "status": 0, "content_type": "", "error": str(e)}
+    except (TimeoutError, httpx.TimeoutException):
+        return {"body": None, "status": 0, "content_type": "",
+                "error": f"取 {what} 超时（{timeout_s:g} 秒）"}
+    except httpx.HTTPError as e:
+        return {"body": None, "status": 0, "content_type": "",
+                "error": f"取 {what} 失败：{type(e).__name__}"}
+    return {"body": b"".join(chunks), "status": 200, "content_type": content_type, "error": ""}
+
+
+async def fetch_feed_source(
+    url: str,
+    *,
+    transport: Any = None,
+    lookback_days: int = 14,
+    now: float | None = None,
+    limit: int = _PER_SOURCE_LIMIT,
+) -> dict[str, Any]:
+    """取一次并解析。返回 {"title", "items", "error"}；业务/网络失败走 error（不抛）。
+    url 不合法抛 RssError（接口层要 400）。"""
+    url_s = _require_http(url)
+    now = float(clock.now() if now is None else now)
+    out: dict[str, Any] = {"title": "", "items": [], "error": ""}
+    try:
+        got = await fetch_bytes(url_s, transport=transport)
+    except RssError as e:
+        # 网页 POST 取源阶段用 error 返回 400；这里直接抛会变成未处理的 500。
         out["error"] = str(e)
         return out
-    except (TimeoutError, httpx.TimeoutException):
-        out["error"] = f"取 RSS 超时（{_TIMEOUT_S:g} 秒）"
+    if got.get("error"):
+        out["error"] = str(got["error"])
         return out
-    except httpx.HTTPError as e:
-        out["error"] = f"取 RSS 失败：{type(e).__name__}"
-        return out
-    text = b"".join(chunks).decode("utf-8", errors="replace")
+    text = _decode_text(got.get("body") or b"", str(got.get("content_type") or ""))
     try:
         parsed = parse_feed(text, now=now, lookback_days=int(lookback_days))
     except RssError as e:

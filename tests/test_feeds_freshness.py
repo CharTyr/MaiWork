@@ -664,8 +664,8 @@ class TestNewsFreshness:
     def test_old_news_hard_rejected_over_7_days(self, tmp_path) -> None:
         """发布时间在 7 天前的资讯：代码侧硬拒「旧闻：N 天前发的」，不走到打分。"""
         items = [
-            _cand(0, url="https://old.cn/game", title="两个月前发售游戏的商店页",
-                  published=NOW - 62 * 86400),
+            _cand(0, url="https://old.cn/game", title="一个月前发售游戏的商店页",
+                  published=NOW - 30 * 86400),
         ]
         store, settings, feeds, models, workers, topics, _ = _make_feeds(
             tmp_path,
@@ -679,7 +679,7 @@ class TestNewsFreshness:
         assert len(rows) == 1
         assert rows[0]["reject_gate"] == "hard"
         assert "旧闻" in rows[0]["reject_reason"]
-        assert "62" in rows[0]["reject_reason"]
+        assert "30" in rows[0]["reject_reason"]
         assert len(models.calls) == 2  # 两阶段后只调了定关注点 +「挑」，没调打分
 
     def test_news_within_7_days_passes(self, tmp_path) -> None:
@@ -716,10 +716,10 @@ class TestNewsFreshness:
         assert _rejected_rows(store) == []
 
     def test_old_guide_not_hard_rejected(self, tmp_path) -> None:
-        """好文（kind=guide）不受资讯的 7 天硬规则限制——180 天内的文章只要现在还适用照样收
-        （2026-09-29 起文章另有 180 天硬线，见 test_news_guide.py）。"""
+        """好文（kind=guide）不受资讯的 7 天硬规则限制——60 天内的文章只要现在还适用照样收
+        （文章另有 60 天硬线，2026-10-05 由 180 改 60，见 test_news_guide.py）。"""
         items = [_cand(0, kind="guide", url="https://tut.cn/z", title="经典老教程",
-                       published=NOW - 100 * 86400)]
+                       published=NOW - 40 * 86400)]
         store, settings, feeds, models, workers, topics, _ = _make_feeds(
             tmp_path,
             models=FakeModelsQueue(ready=True, replies=[
@@ -739,7 +739,7 @@ class TestNewsFreshness:
         items = [
             _cand(0, url="https://a.cn/n1", title="量子芯片全新架构发布"),
             _cand(1, kind="guide", url="https://b.cn/g1", title="本地部署实战全记录",
-                  published=NOW - 100 * 86400),
+                  published=NOW - 40 * 86400),
         ]
         store, settings, feeds, models, workers, topics, _ = _make_feeds(
             tmp_path,

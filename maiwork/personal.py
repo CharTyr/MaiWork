@@ -32,7 +32,7 @@ import json
 import logging
 from typing import Any, Callable
 
-from . import clock, members
+from . import clock, idea_feasibility, members
 from .config import Settings
 from .feeds import (
     _POST_ACCURACY_RULES,
@@ -311,6 +311,21 @@ class Personal:
             lines.extend(f"- {x}" for x in persona["asked"][:5])
         return lines
 
+    def _worker_tool_catalog(self) -> Any:
+        """子 agent（worker）现在能用的工具清单 [(名字, 描述)]；拿不到 → None。
+
+        「构想可行性评估」（idea_feasibility）用它算能力清单。测试替身 / 老 workers 没有
+        tool_catalog → None（按基本能力算）。
+        """
+        fn = getattr(self._workers, "tool_catalog", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn()
+        except Exception:
+            logger.exception("取子 agent 工具清单出错，个人向构想可行性按基本能力算")
+            return None
+
     async def _plan_focus(self, gid: str, name: str, persona: dict) -> dict:
         """用他的 persona 定 1–2 个关注点 + 0–1 条「我可以帮你……」构想。
 
@@ -333,12 +348,22 @@ class Personal:
         else:
             lines.append("（画像还少，按他最近在群里做的事挑）")
         lines.append("")
+        # 可行性硬闸的能力清单（docs/18 §八，2026-10-05 用户拍板 1.A 严格）：和群向共用同一段
+        lines.append(
+            idea_feasibility.prompt_section(
+                idea_feasibility.inventory(self._worker_tool_catalog())
+            )
+        )
+        lines.append("")
         lines.append(
             '请给出 1–2 个拿去搜索的关注点（具体一点，对着他做的/关心的），'
             '顺带想 0–1 个「我可以帮他……」的小忙（想不出就 idea 给 null）。只回 JSON：'
             '{"focus": [{"query": "搜索关键词", "why": "对着他哪件事"}],'
             ' "idea": {"title": "我可以帮你……", "body": "帮什么（一两句）", "step": "第一步", '
             '"effort": "大概多久",'
+            ' "feasibility": {"level": "ok", "note": "一句话：为什么真做得到",'
+            ' "uses": ["用到的本事名（至少 1 个，只从上面清单里挑）"],'
+            ' "deliver": "page"|"doc"|"tool"|"report", "needs_members": false},'
             ' "origin": "这件事接的是**他自己在群里说过想做的那件事**，用一个短名词短语'
             '（≤16 字，不含他的名字、QQ 号，比如「FPGA 小板子」）；想不出就空字符串"} | null}'
         )
@@ -363,6 +388,8 @@ class Personal:
                 "effort": str(idea.get("effort") or "").strip()[:60],
                 # 由头 = 他自己在群里说过想做的那件事（短名词短语，清洗 + 限 16 字）
                 "origin": clean_idea_origin(idea.get("origin")),
+                # 可行性原始字段（_insert_idea 里过 check；不过就不入库、只记 kv）
+                "feasibility": idea.get("feasibility"),
             }
         return {"focus": out_focus, "idea": out_idea}
 
@@ -968,6 +995,20 @@ class Personal:
         ).fetchall()
         if any(_similar(title, str(r["title"])) >= _IDEA_DEDUP_RATIO for r in rows):
             return
+        # 可行性硬闸（docs/18 §八，用户拍板 1.A 严格）：和群向同一套 check；不过就不入库，
+        # 只往 kv ideas.blocked.<群号> 记一条（title 只存标题，不存任何画像内容）。
+        feas_ok, feas_reason, feas_norm = idea_feasibility.check(
+            idea.get("feasibility"),
+            idea_feasibility.inventory(self._worker_tool_catalog()),
+        )
+        if not feas_ok:
+            idea_feasibility.record_blocked(self._store, gid, "personal", title, feas_reason)
+            logger.info(
+                "个人向构想过不了可行性闸，不入库（群 %s 人 %s）：%s —— %s",
+                gid, uid[:8], title, feas_reason,
+            )
+            return
+        feasibility_json = json.dumps(feas_norm, ensure_ascii=False)
         body = scrub(gid, str(idea.get("body") or ""), self._store) or ""
         # 由头也过隐私闸：含他的注记 / 画像片段 → 只把 origin 置空，不丢整条构想
         origin = clean_idea_origin(idea.get("origin"))
@@ -979,13 +1020,13 @@ class Personal:
                 "INSERT INTO ideas (group_id, icon, title, body, origin, basis, step, effort, state,"
                 " requested_by, task_id, up, down, created, updated, feasibility, keywords,"
                 " target_user_id)"
-                " VALUES (?, 'bulb', ?, ?, ?, ?, ?, ?, 'new', NULL, NULL, 0, 0, ?, ?, '', '[]', ?)",
+                " VALUES (?, 'bulb', ?, ?, ?, ?, ?, ?, 'new', NULL, NULL, 0, 0, ?, ?, ?, '[]', ?)",
                 (
                     gid, title, body, origin,
                     str(persona.get("summary") or "")[:120],  # basis：只给管理员参考，不进任何群文字
                     str(idea.get("step") or "").strip(),
                     str(idea.get("effort") or "").strip(),
-                    now, now, uid,
+                    now, now, feasibility_json, uid,
                 ),
             )
 

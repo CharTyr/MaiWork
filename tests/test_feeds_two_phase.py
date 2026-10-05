@@ -346,7 +346,7 @@ async def test_web_search_tool_no_registry_recording_anymore(tmp_path) -> None:
 
 
 def test_planned_searches_run_exactly_as_planned(tmp_path) -> None:
-    """定关注点给的 searches 就照单执行：q/site/news/days（news 7 天、guide 180 天）映射，
+    """定关注点给的 searches 就照单执行：q/site/news/days（news 7 天、guide 60 天）映射，
     同一方向的结果带 1 起的 focus 编号落登记簿；不再有任何 feeds-discover: 派工。"""
 
     class ByQuerySearch:
@@ -379,12 +379,12 @@ def test_planned_searches_run_exactly_as_planned(tmp_path) -> None:
     assert err is None
     got = discovery.close_run("feeds-discover:t:1:1")
     by_q = {c[0]: c for c in search.calls}
-    # 照计划各搜一次：site / news / days 映射（guide 放宽到 180 天）
+    # 照计划各搜一次：site / news / days 映射（guide 放宽到 60 天）
     assert set(by_q) == {"生化危机9 战斗系统", "生化危机9 豪华版提前解锁", "生化危机9 官方公告", "生化危机9 通关评测", "开源掌机 新品"}
     assert by_q["生化危机9 战斗系统"] == ("生化危机9 战斗系统", 10, 7, "", True)
     assert by_q["生化危机9 豪华版提前解锁"] == ("生化危机9 豪华版提前解锁", 10, 7, "", False)
     assert by_q["生化危机9 官方公告"] == ("生化危机9 官方公告", 10, 7, "capcom.com", False)
-    assert by_q["生化危机9 通关评测"] == ("生化危机9 通关评测", 10, 180, "", False)
+    assert by_q["生化危机9 通关评测"] == ("生化危机9 通关评测", 10, 60, "", False)
     # 方向 1 的四搜出的 4 条链接都在登记簿（focus=1）；方向 2 的在 focus=2
     f1 = [c for c in got if c["focus"] == 1]
     f2 = [c for c in got if c["focus"] == 2]
@@ -594,7 +594,7 @@ def test_floor_errors_ignored(tmp_path) -> None:
 
 
 def test_prefilter_drops_stored_blocked_old_and_near_dup(tmp_path) -> None:
-    """已入库链接、屏蔽来源、超 180 天（有日期的）、标题近似（候选之间 & 撞已发过的）都被筛掉。"""
+    """已入库链接、屏蔽来源、超 60 天（有日期的）、标题近似（候选之间 & 撞已发过的）都被筛掉。"""
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path)
     with _TimePatch():
         with store.tx() as conn:
@@ -617,7 +617,7 @@ def test_prefilter_drops_stored_blocked_old_and_near_dup(tmp_path) -> None:
         candidates = [
             _candidate("https://seen.com/post", title="这个链接已经出过"),              # 撞已入库链接
             _candidate("https://bad.example/news/1", title="屏蔽来源的"),                   # 屏蔽域名
-            _candidate("https://old.com/1", title="太旧的", published=NOW - 200 * 86400),  # 超 180 天
+            _candidate("https://old.com/1", title="太旧的", published=NOW - 61 * 86400),  # 超 60 天
             _candidate("https://fresh.com/1", title="量子芯片全新架构发布", published=NOW - 100),
             _candidate("https://fresh.com/2", title="量子芯片全新架构发布", published=NOW - 100),  # 标题和候选撞
             _candidate("https://fresh.com/3", title="开源掌机周报火热出炉", published=NOW - 100),  # 标题撞已发过的
@@ -1000,7 +1000,7 @@ def test_focus_prompt_plans_searches_with_all_guidance(tmp_path) -> None:
         assert word in prompt, word
     assert "同义" in prompt  # 禁止同义改写刷搜索
     assert "2–6" in prompt  # 搜索词要短的口径
-    assert "7 天" in prompt and "180" in prompt  # 时间由程序管
+    assert "7 天" in prompt and "60 天" in prompt  # 时间由程序管
     assert "search" in prompt and "searches" in prompt  # 要让模型给搜索计划
     assert "news" in prompt and "kind" in prompt
     assert "fetch_page" not in prompt and "web_search" not in prompt  # 工具话术不落在这

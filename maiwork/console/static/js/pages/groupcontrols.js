@@ -13,7 +13,7 @@ const current = c => !!c && state.g === c.gid && role() === c.role && gadmin();
 function frame(gid) {
   let c = state.groupControls;
   if (!c || c.gid !== gid || c.role !== role()) {
-    c = state.groupControls = { gid, role: role(), push: null, approval: null, loading: false, error: "", edit: null, draft: null, saving: false };
+    c = state.groupControls = { gid, role: role(), push: null, approval: null, loading: false, error: "", errorField: "", edit: null, draft: null, saving: false };
   }
   return c;
 }
@@ -60,6 +60,10 @@ function switchRow(c, key, label, help, value) {
     <label class="switch"><input id="gctl-${key}" data-gctl="${key}" type="checkbox" ${value ? "checked" : ""} aria-label="${label}" aria-describedby="gctl-${key}-help" /><span></span></label></div>`;
 }
 
+function fieldErrorAttrs(c, key, help = "") {
+  return `aria-describedby="${help ? help + " " : ""}gctl-${c.edit}-error"${c.errorField === key ? ' aria-invalid="true"' : ""}`;
+}
+
 function pushHTML(c) {
   const p = c.push || {}, cfg = p.config || {};
   let html = `<div class="h-sub-row"><h2 class="h-sub">往群里发</h2>${c.edit !== "push" ? `<button class="btn small" data-act="gctl-push-edit" data-g="${esc(c.gid)}">改设置</button>` : ""}</div>`;
@@ -69,10 +73,10 @@ function pushHTML(c) {
     html += switchRow(c, "news_card_enabled", "资讯卡片", "每批挑最值得看的做成图片；已配公开地址时附本群链接。", d.news_card_enabled);
     html += switchRow(c, "idea_mention_enabled", "构想提一嘴", "关心式问一句；个人向只 @ 本人，不说画像。", d.idea_mention_enabled);
     html += `<div class="login">
-      <label for="gctl-news_card_count">每张资讯卡放几条</label><select id="gctl-news_card_count" data-gctl="news_card_count">${[1, 2, 3].map(n => `<option value="${n}" ${n === Number(d.news_card_count) ? "selected" : ""}>${n} 条</option>`).join("")}</select>
-      <label for="gctl-daily_max">每天主动发送总上限</label><input id="gctl-daily_max" data-gctl="daily_max" type="number" min="0" max="24" step="1" value="${esc(d.daily_max)}" aria-describedby="gctl-cap-help" />
+      <label for="gctl-news_card_count">每张资讯卡放几条</label><select id="gctl-news_card_count" data-gctl="news_card_count" ${fieldErrorAttrs(c, "news_card_count")}>${[1, 2, 3].map(n => `<option value="${n}" ${n === Number(d.news_card_count) ? "selected" : ""}>${n} 条</option>`).join("")}</select>
+      <label for="gctl-daily_max">每天主动发送总上限</label><input id="gctl-daily_max" data-gctl="daily_max" type="number" min="0" max="24" step="1" value="${esc(d.daily_max)}" ${fieldErrorAttrs(c, "daily_max", "gctl-cap-help")} />
       <p class="fine" id="gctl-cap-help">开话题、资讯卡片和提一嘴共用这一个上限。0 表示不限，不建议。</p>
-      <label for="gctl-quiet_hours">睡觉时段</label><input id="gctl-quiet_hours" data-gctl="quiet_hours" value="${esc(d.quiet_hours)}" placeholder="23:00-08:00" aria-describedby="gctl-quiet-help" />
+      <label for="gctl-quiet_hours">睡觉时段</label><input id="gctl-quiet_hours" data-gctl="quiet_hours" value="${esc(d.quiet_hours)}" placeholder="23:00-08:00" ${fieldErrorAttrs(c, "quiet_hours", "gctl-quiet-help")} />
       <p class="fine" id="gctl-quiet-help">北京时间，写成 HH:MM-HH:MM；这段时间不发。</p>
       ${errorHTML(c)}
     </div>`;
@@ -107,7 +111,8 @@ function approvalHTML(c) {
 }
 
 function errorHTML(c) {
-  return c.error ? `<p class="err gctl-error" role="alert">${esc(c.error)}</p>` : "";
+  if (!c.edit && !c.error) return "";
+  return `<p id="gctl-${c.edit || "form"}-error" class="err gctl-error" role="alert" ${c.error ? "" : "hidden"}>${esc(c.error)}</p>`;
 }
 
 function saveActions(c, kind) {
@@ -137,9 +142,10 @@ function readDraft(c) {
 const accountLines = text => text.split(/\n/).map(x => x.trim()).filter(Boolean);
 
 function checkPush(d) {
-  if (!Number.isInteger(d.daily_max) || d.daily_max < 0 || d.daily_max > 24) throw new Error("总上限要填 0–24 的整数");
-  if (!Number.isInteger(d.news_card_count) || d.news_card_count < 1 || d.news_card_count > 3) throw new Error("每张资讯卡放 1–3 条");
-  if (!/^(?:[01]\d|2[0-3]):[0-5]\d-(?:[01]\d|2[0-3]):[0-5]\d$/.test(d.quiet_hours)) throw new Error("睡觉时段写成 HH:MM-HH:MM，如 23:00-08:00");
+  if (!Number.isInteger(d.daily_max) || d.daily_max < 0 || d.daily_max > 24) return { field: "daily_max", message: "总上限要填 0–24 的整数" };
+  if (!Number.isInteger(d.news_card_count) || d.news_card_count < 1 || d.news_card_count > 3) return { field: "news_card_count", message: "每张资讯卡放 1–3 条" };
+  if (!/^(?:[01]\d|2[0-3]):[0-5]\d-(?:[01]\d|2[0-3]):[0-5]\d$/.test(d.quiet_hours)) return { field: "quiet_hours", message: "睡觉时段写成 HH:MM-HH:MM，如 23:00-08:00" };
+  return null;
 }
 
 export async function actControls(action, el) {
@@ -153,6 +159,7 @@ export async function actControls(action, el) {
   if (action.endsWith("-edit")) {
     c.edit = kind;
     c.error = "";
+    c.errorField = "";
     c.draft = kind === "push" ? Object.fromEntries(PUSH_KEYS.map(k => [k, c.push.config[k]])) : {
       approvers: c.approval.approvers.join("\n"), exempt_users: c.approval.exempt_users.join("\n"), required: !!c.approval.required && !c.approval.exempt_group,
     };
@@ -161,8 +168,10 @@ export async function actControls(action, el) {
   }
   if (!action.endsWith("-save") || c.edit !== kind) return true;
   try {
+    c.errorField = "";
     const d = readDraft(c);
-    if (kind === "push") checkPush(d);
+    const invalid = kind === "push" ? checkPush(d) : null;
+    if (invalid) { c.error = invalid.message; c.errorField = invalid.field; return true; }
     const body = kind === "push" ? d : { approvers: accountLines(d.approvers), exempt_users: accountLines(d.exempt_users), required: d.required, exempt_group: false };
     c.saving = true;
     c.error = "";

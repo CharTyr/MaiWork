@@ -27,7 +27,7 @@
    资讯：relevance ≥3 且 avg ≥ web_min_avg 且新鲜度 ≥3 且 novelty >2 才上网页；relevance=2 但 chat、info ≥4、
    有桥、非敏感的进「拓展名额」（explore_quota 按近 14 天拓展条目的反馈给 0–2 个，意外度高者先得，
    angle='explore'）。文章（guide，2026-09-29 用户：宁缺毋滥、不能是新闻）：第一道就要求有发布时间且
-   ≤ GUIDE_MAX_AGE_DAYS（180）天、打分判 not_article 的拒；第二道 relevance ≥4、info ≥4、avg ≥3.8，
+   ≤ GUIDE_MAX_AGE_DAYS（60）天、打分判 not_article 的拒；第二道 relevance ≥4、info ≥4、avg ≥3.8，
    不吃任何放宽，每轮 ≤2 篇。政府 / 检察院 / 法院站点默认拒（「政府通讯稿」），除非画像对得上且 relevance ≥4。
    再按 avg + 0.1×surprise 去同质化（拓展名额先占位）：同轮同话题且标题像同一件事的只留一条、
    同一 topic ≤2、同一域名 ≤3、敏感 ≤1、总数 ≤ [feeds] max_items（默认 10），落选 gate='web'；
@@ -80,7 +80,8 @@ import re as _re
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
-from . import clock, members, news_rating, news_standard
+from . import clock, idea_feasibility, members, news_rating, news_standard
+from . import page_date, source_name
 from .config import Settings, normalize_domain as _normalize_domain
 from .models import ModelError
 from .search import SearchUnavailable
@@ -308,6 +309,29 @@ def _english_focus_query(query: Any) -> str:
     return " ".join(words[:6]).strip()
 
 
+def _limit_guide_directions(focus: list[dict]) -> int:
+    """文章（kind=guide）的搜索整轮只留在一个方向里（2026-10-05 用户定，docs/10 §十）：
+    第一个带 guide 搜索的方向保留；其余方向的 guide 搜索改成找资讯（kind=news，搜索次数不变）。
+    返回改了几条。模型提示词里也写了这条，这里是代码兜底，不信模型自觉。"""
+    changed = 0
+    owner_seen = False
+    for f in focus:
+        searches = f.get("searches") if isinstance(f, dict) else None
+        if not isinstance(searches, list):
+            continue
+        has_guide = any(isinstance(s, dict) and s.get("kind") == "guide" for s in searches)
+        if not has_guide:
+            continue
+        if not owner_seen:
+            owner_seen = True
+            continue
+        for s in searches:
+            if isinstance(s, dict) and s.get("kind") == "guide":
+                s["kind"] = "news"
+                changed += 1
+    return changed
+
+
 def _norm_source(raw: Any) -> str:
     """关注点的 source 只认 recent / long / explore；别的（含没给）一律 ""。"""
     src = str(raw or "").strip().lower()
@@ -331,18 +355,19 @@ def _entries_for_score(entries: list[dict], cap: int) -> list[dict]:
 
 
 # 「文章」（kind=guide）从严（2026-09-29 用户：宁缺毋滥，而且不能是新闻资讯内容）
-GUIDE_MAX_AGE_DAYS = 180      # 文章必须有发布时间且在这么多天内（代码硬判，不信模型的「还适用」）
+GUIDE_MAX_AGE_DAYS = 60       # 文章必须有发布时间且在这么多天内（代码硬判，不信模型的「还适用」；
+                              #   2026-10-05 用户定 180→60：线上一半文章是 50～160 天前的，显得旧）
 _GUIDE_MIN_RELEVANCE = 4.0    # 文章第二道：相关度 ≥4（拓展名额 / 相关度 3 的放宽都不给文章）
 _GUIDE_MIN_INFO = 4.0         # 文章第二道：信息量 ≥4
 _GUIDE_MIN_AVG = 3.8          # 文章第二道：五项平均 ≥3.8
-_GUIDE_ROUND_CAP = 2          # 每轮最多留几篇文章
+_GUIDE_ROUND_CAP = 1          # 每轮最多留几篇文章（2026-10-05 用户定 2→1：文章太多、资讯太少）
 # 「探索感」（2026-09-29）
 _NOVELTY_REJECT_MAX = 2.0     # 资讯新鲜感 ≤2（群友大概已经知道）→ 第二道拒
 _EXPLORE_MIN_RELEVANCE = 2.0  # 拓展名额：相关度 2 也行，但要 chat≥4、info≥4、有桥、非敏感
 _EXPLORE_MIN_CHAT = 4.0      # 资讯进拓展名额：值得聊 ≥4 **或** 意外度 ≥4（2026-09-29 用户定；
 _EXPLORE_MIN_SURPRISE = 4.0  #   只看值得聊时，沾边少的模型往往两项一起打低，名额从没用上）
 _EXPLORE_MIN_INFO = 4.0
-# 文章也能用拓展名额，门槛更高：信息量、意外度都 ≥4、有桥（发布时间 180 天内第一道已硬判）；
+# 文章也能用拓展名额，门槛更高：信息量、意外度都 ≥4、有桥（发布时间 GUIDE_MAX_AGE_DAYS 天内第一道已硬判）；
 # 仍算进每轮最多 _GUIDE_ROUND_CAP 篇
 _GUIDE_EXPLORE_MIN_INFO = 4.0
 _GUIDE_EXPLORE_MIN_SURPRISE = 4.0
@@ -377,8 +402,9 @@ def _same_story(a: str, b: str) -> bool:
 
 
 def _is_gov_site(site: str) -> bool:
-    """政府 / 检察院 / 法院的站点（按域名后缀判）。"""
-    return bool(site) and bool(_GOV_SITE_RE.search(str(site).lower().strip(".")))
+    """政府 / 检察院 / 法院的站点（按域名后缀判；传进来的可能是带作者段的来源名）。"""
+    dom = source_name.domain_of(site) or str(site or "").lower().strip(".")
+    return bool(dom) and bool(_GOV_SITE_RE.search(dom))
 
 
 def explore_quota(store: Any, group_id: Any, now: float) -> int:
@@ -620,8 +646,17 @@ def _normalize_url(url: str) -> str:
     return f"{host}{path}{('?' + query) if query else ''}"
 
 
+def _source_site(url: str) -> str:
+    """候选来源名（docs/10 §九 第一步 1）：真实域名；github / substack / medium / dev.to 按作者。
+
+    写入（候选 site / 入库 sources）和统计（source_stats）都用它；域名级判断用
+    `source_name.domain_of`（屏蔽名单、同域名配额照旧按域名算）。
+    """
+    return source_name.site_of_url(url)
+
+
 def _site_of(url: str) -> str:
-    """来源站点名：host 小写、去 www. 前缀。"""
+    """来源站点名：host 小写、去 www. 前缀（域名级判断用，见 _source_site）。"""
     raw = str(url or "").strip()
     if not raw:
         return ""
@@ -839,7 +874,7 @@ async def check_post_bodies(
         "",
     ]
     for k, it in enumerate(todo):
-        site = str(it.get("site") or _site_of(str(it.get("url") or "")))
+        site = _source_site(str(it.get("url") or "")) or str(it.get("site") or "")
         pub = _pub_date(it) or "不明"
         lines.append(f"[{k}] 帖子：{str(it['post']['body'])[:600]}")
         lines.append(f"    标题：{str(it.get('title') or '')[:150]}；来源网站：{site}；原文发布日期：{pub}")
@@ -1034,6 +1069,15 @@ def _blocked_key(gid: str) -> str:
     return f"feeds.blocked.{gid}"
 
 
+def _blocked_one(value: Any) -> str:
+    """屏蔽名单一项 → 域名：纯域名直接用；「github.com/<作者>」这类来源名取域名部分。
+
+    2026-10-05（docs/10 §九 第一步 1）：被拒列表网页上的「屏蔽 <来源名>」按钮传过来的是
+    来源名，可以是 github.com/<作者>；屏蔽是域名级的，取域名部分（整站不再从它找资讯）。
+    """
+    return _normalize_domain(value) or source_name.domain_of(value)
+
+
 def blocked_domains(store: Any, gid: str) -> list[str]:
     """这个群的生效屏蔽名单（kv["feeds.blocked.<gid>"] 是唯一来源；规范化去重稳定排序）。
 
@@ -1046,20 +1090,24 @@ def blocked_domains(store: Any, gid: str) -> list[str]:
         return []
     if not isinstance(raw, list):
         return []
-    return sorted({_normalize_domain(d) for d in raw if _normalize_domain(d)})
+    return sorted({_blocked_one(d) for d in raw if _blocked_one(d)})
 
 
 def blocked_domains_set(store: Any, gid: Any, names: list) -> list[str]:
     """覆盖写这个群的屏蔽名单（规范化去重稳定排序）；返回写进去的那份。"""
-    out = sorted({_normalize_domain(d) for d in (names or []) if _normalize_domain(d)})
+    out = sorted({_blocked_one(d) for d in (names or []) if _blocked_one(d)})
     with store.tx() as conn:
         store.kv_set(conn, _blocked_key(str(gid)), out)
     return out
 
 
 def _domain_blocked(site: str, blocked: set[str] | list[str]) -> bool:
-    """按域名及其子域匹配屏蔽名单：site == d 或 site 是 d 的子域。"""
-    site = str(site or "").lower()
+    """按域名及其子域匹配屏蔽名单：site == d 或 site 是 d 的子域。
+
+    传进来的可能是带作者段的来源名（github.com/openai、medium.com/@x）：先取域名，
+    屏蔽名单里写 github.com 一样能挡下 github.com 下的每个作者。
+    """
+    site = source_name.domain_of(site) or str(site or "").lower()
     if not site:
         return False
     for d in blocked:
@@ -1197,9 +1245,17 @@ class Feeds:
                         "paywall": False,
                         "image_url": "",
                         "url_key": _normalize_url(url_i),
-                        "site": str(entry.get("title") or _rss._site_of(url_i) or url_i.split("/", 3)[2]),
+                        # site 用条目链接算真实域名（2026-10-05 §九 第一步 1）：以前拿源标题
+                        # （entry.title）当 site，「机核」「游研社」这类中文站名写进了库，
+                        # 同一网站被拆两份、也没法拿去 site 搜 / 找 RSS。源标题留在 _rss_title。
+                        "site": _source_site(url_i),
                         "from_rss": True,  # 候选来自 RSS 源（可见标记，排查用；池里照走同一套门槛）
                         "_rss_feed": url,
+                        # 自动订阅（docs/10 §九 第二步）：入库时 src_provider 写成 "rss:<feed_id>"，
+                        # 让「可订阅门槛」能认出 RSS 条目（RSS 来的不计高分也不计反应，防自我放大），
+                        # 也让每源统计（auto_sources.note_round）认得清是哪个源。
+                        "_rss_feed_id": fid,
+                        "src_provider": f"rss:{fid}" if fid else "",
                         "_rss_title": str(entry.get("title") or ""),
                     }
                 )
@@ -1268,6 +1324,8 @@ class Feeds:
         所以一个源再勤也占不满上限。去重按 url_key：和这批候选已有的、和最近已入库的
         news_items、以及 RSS 之间自己重复的都不并（省下名额给真正新的）。
         并进来后就是普通候选：同一套硬淘汰 / 7 天新鲜度 / 打分 / 话题饱和照走，不另开绿灯。
+        自动源（auto_sources 的 trusted / map / push）另有试用期上限：每源每轮最多
+        auto_sources.TRIAL_CAND_CAP 条候选，坏源影响有上限。
         """
         if not rss_items:
             return 0
@@ -1297,6 +1355,20 @@ class Feeds:
             groups.setdefault(str(it.get("_rss_feed") or ""), []).append(it)
         for items in groups.values():
             items.sort(key=lambda x: float(x.get("published_ts") or 0.0), reverse=True)
+        # 试用期上限（docs/10 §九 第二步）：自动源（trusted / map / push）每轮最多并进
+        # auto_sources.TRIAL_CAND_CAP 条候选——坏源影响有上限。手动加的源不受这条限制。
+        try:
+            from . import auto_sources as _auto
+
+            auto_cap = int(_auto.TRIAL_CAND_CAP)
+            auto_urls = _auto.auto_feed_urls(self._store, gid) if auto_cap > 0 else set()
+        except Exception:
+            logger.debug("读自动源试用期上限失败（群 %s）", gid, exc_info=True)
+            auto_cap, auto_urls = 0, set()
+        if auto_cap > 0 and auto_urls:
+            for _key, _items in list(groups.items()):
+                if _key in auto_urls and len(_items) > auto_cap:
+                    groups[_key] = _items[:auto_cap]
         ordered = sorted(
             groups.values(), key=lambda items: float(items[0].get("published_ts") or 0.0), reverse=True
         )
@@ -1310,6 +1382,9 @@ class Feeds:
                     continue
                 item = items[round_no]
                 item["from_rss"] = True
+                # 来源名一律按链接算（docs/10 §九 第一步 1）：RSS 条目的 site 曾经是源标题
+                # （「机核」这类中文站名），在这里兜一道底，并池的条目不会再带站名进库。
+                item["site"] = _source_site(str(item.get("url") or "")) or str(item.get("site") or "")
                 candidates.append(item)
                 merged += 1
                 picked = True
@@ -1494,7 +1569,7 @@ class Feeds:
             lines.append("标题（顶 4）:")
             for it in items[:4]:
                 title = str(it.get("title") or "")[:40] or "（无题）"
-                site = str(it.get("site") or _site_of(str(it.get("url") or "")))[:40]
+                site = (_source_site(str(it.get("url") or "")) or str(it.get("site") or ""))[:40]
                 lines.append(f"- {title} · {site}".rstrip(" ·"))
         if recheck_note:
             lines.append(f"补打开：{recheck_note[:80]}")
@@ -1654,33 +1729,34 @@ class Feeds:
                 )
                 return 0
 
-        # ②.2 补打开（2026-09-29）：没真打开过原文的候选，派一个子 agent 一批打开 + 对照原文核对
-        # （news_recheck.py）；出任何错都不拖累这轮，候选原样往下走、照旧按没打开淘汰。
-        # 专岗接上时跑 news 角色的重看工具（fetch_page+web_search），不是通才 workers.run。
-        # RSS-only 轮（搜索不可用）：补打开要用 web_search 找替代来源，整个跳过——
-        # RSS 候选本就带 from_rss（pick_unverified 会跳过它们），跳过只是更早、更省。
-        recheck_mark = collect_mark.replace("feeds-collect:", "feeds-recheck:", 1)
-        if not rss_mode:
-            try:
-                from . import news_recheck
-
-                async def _recheck_runner(brief, **kwargs):
-                    return await self._recheck_run(gid, recheck_mark, brief, **kwargs)
-
-                await news_recheck.recheck(
-                    self._store, _RecheckRunnerProxy(self._workers, _recheck_runner), gid, candidates,
-                    collect_mark=collect_mark, recheck_mark=recheck_mark,
-                    parse_published=_parse_published, normalize_url=_normalize_url, site_of=_site_of,
-                    dup_check=self._dup_url_key_check(gid, settings),
-                )
-            except Exception:
-                logger.exception("资讯补打开意外出错（群 %s），这轮跳过补打开", gid)
-
-        # ②.5 RSS 条目并进候选池（≤_RSS_MERGE_CAP 条，新的在前、跨源轮询）：
+        # ②.2 RSS 条目并进候选池（≤_RSS_MERGE_CAP 条，新的在前、跨源轮询）。
+        # **挪到补打开之前**（2026-10-05 §九 第一步 3）：RSS 条目也要过补打开那道内容核验
+        # （水文 / 洗稿 / 低质转载，不合格丢弃），不再是「并进池就算核对过」。
         # 从这里往后和搜索候选完全同一套硬淘汰 / 新鲜度 / 打分 / 话题饱和，不另开绿灯。
         merged_rss = self._merge_rss_candidates(gid, settings, candidates, rss_items)
         if merged_rss:
             logger.info("RSS 并进候选池（群 %s）：%d 条", gid, merged_rss)
+
+        # ②.3 补打开（2026-09-29）：没真打开过原文的候选，派一个子 agent 一批打开 + 对照原文核对
+        # （news_recheck.py）；出任何错都不拖累这轮，候选原样往下走、照旧按没打开淘汰。
+        # 专岗接上时跑 news 角色的重看工具（fetch_page+web_search），不是通才 workers.run。
+        # RSS 条目也送（pick_unverified 不再跳过 from_rss）：它们的 quote 只是源里的摘要，
+        # 从没打开过原文——RSS-only 轮（搜索坏、只有 RSS）同样要核对，所以这里不再跳过。
+        recheck_mark = collect_mark.replace("feeds-collect:", "feeds-recheck:", 1)
+        try:
+            from . import news_recheck
+
+            async def _recheck_runner(brief, **kwargs):
+                return await self._recheck_run(gid, recheck_mark, brief, **kwargs)
+
+            await news_recheck.recheck(
+                self._store, _RecheckRunnerProxy(self._workers, _recheck_runner), gid, candidates,
+                collect_mark=collect_mark, recheck_mark=recheck_mark,
+                parse_published=_parse_published, normalize_url=_normalize_url, site_of=_source_site,
+                dup_check=self._dup_url_key_check(gid, settings),
+            )
+        except Exception:
+            logger.exception("资讯补打开意外出错（群 %s），这轮跳过补打开", gid)
 
         # ③ 第一道（代码侧）：没打开过 / 付费 / 屏蔽来源 / URL·标题重复
         survivors = self._hard_reject_code(gid, settings, candidates)
@@ -1780,6 +1856,14 @@ class Feeds:
                 source_mode="rss_only" if rss_mode else "",
             ),
         )
+        # 自动源每源统计（docs/10 §九 第二步）：按 feed_id 记「这轮给了几条候选 / 哪几条进了资讯」，
+        # 自动退订（auto_sources.unsubscribe_stale）拿它判。任何异常都不能影响出资讯。
+        try:
+            from . import auto_sources as _auto
+
+            _auto.note_round(self._store, gid, candidates, now=now)
+        except Exception:
+            logger.exception("记 RSS 自动源统计失败（群 %s）", gid)
         # 专岗挂上时：批次入库（成绩已定）→ 写一条「已验收」的新闻本岗记忆。
         # ref 指到 batch / handoff / 条目 id，绝不存候选 / 原始聊天；同批次幂等（source_id）。
         try:
@@ -1822,7 +1906,7 @@ class Feeds:
         """第二道分数门槛；被拒的打 item["reject"]=("web", 理由)。
 
         - 文章（guide）从严：相关度 ≥4、信息量 ≥4、平均 ≥3.8；相关度 2–3 的文章只有信息量、意外度都 ≥4
-          且有桥才能进拓展名额（和资讯共用名额，仍算进每轮最多 2 篇）。
+          且有桥才能进拓展名额（和资讯共用名额，仍算进每轮最多 _GUIDE_ROUND_CAP 篇）。
         - 资讯：相关度 ≥3 正常过；相关度 2 但（chat≥4 或 surprise≥4）、info≥4、有桥、非敏感的进「拓展名额」
           （名额数 explore_quota 按反馈 0–2 个；多条时意外度高者优先，其次平均分）；
           新鲜感 ≤2（群友大概已经知道）拒；不够新（新鲜度 <3）拒。
@@ -1917,7 +2001,7 @@ class Feeds:
         survivors: list[dict] = []
         for item in candidates:
             url_key = item["url_key"]
-            site = item.get("site") or _site_of(item["url"])
+            site = item.get("site") or _source_site(item["url"])
             item["site"] = site
             if item.get("reject"):
                 continue  # 补打开核对已经给了淘汰理由（旧闻 / 原文不支持），别覆盖
@@ -1996,13 +2080,16 @@ class Feeds:
             try:
                 src = json.loads(r["sources"] or "[]")
                 if isinstance(src, list) and src and isinstance(src[0], dict):
-                    site = _normalize_domain(src[0].get("site") or "")
-                    if not site:
-                        site = _normalize_domain((src[0].get("url") or "").split("/")[2] if "://" in str(src[0].get("url") or "") else "")
+                    # 域名级统计：先按 url 算（旧库里 site 还留着「机核」这类中文站名），再退回存的 site
+                    url = str(src[0].get("url") or "")
+                    site = source_name.domain_of(url) if url else ""
+                    site = site or _normalize_domain(src[0].get("site") or "")
             except (ValueError, TypeError):
                 src = []
             if not site:
-                site = _normalize_domain(str(r["url_key"] or "").split("/", 1)[0])
+                site = source_name.domain_of(str(r["url_key"] or "")) or _normalize_domain(
+                    str(r["url_key"] or "").split("/", 1)[0]
+                )
             if not site:
                 continue
             by_site[site] = by_site.get(site, 0) + (int(r["down"] or 0) - int(r["up"] or 0))
@@ -2183,7 +2270,8 @@ class Feeds:
             if topic and topic_n.get(topic, 0) >= _NORM_TOPIC_CAP:
                 item["reject"] = ("web", "同一个话题这轮已经留了两条，留分高的")
                 continue
-            if site and domain_n.get(site, 0) >= _NORM_DOMAIN_CAP:
+            domain_key = source_name.domain_of(site) or site  # 同域名 ≤3：作者标签不拆配额
+            if domain_key and domain_n.get(domain_key, 0) >= _NORM_DOMAIN_CAP:
                 item["reject"] = ("web", "同个来源这轮已经留了三条，留分高的")
                 continue
             if item.get("sensitive") and sensitive_n >= _NORM_SENSITIVE_CAP:
@@ -2202,8 +2290,8 @@ class Feeds:
                 guide_n += 1
             if topic:
                 topic_n[topic] = topic_n.get(topic, 0) + 1
-            if site:
-                domain_n[site] = domain_n.get(site, 0) + 1
+            if domain_key:
+                domain_n[domain_key] = domain_n.get(domain_key, 0) + 1
             if item.get("sensitive"):
                 sensitive_n += 1
             if str(item.get("angle") or "") == "diverse":
@@ -2487,7 +2575,7 @@ class Feeds:
                         batch_id, gid, str(item.get("icon") or "newspaper"), item["title"],
                         item["summary"], str(item.get("why") or ""),
                         json.dumps(
-                            [{"url": item["url"], "site": str(item.get("site") or _site_of(item["url"])),
+                            [{"url": item["url"], "site": str(item.get("site") or _source_site(item["url"])),
                               "title": item.get("title_orig") or item["title"]}],
                             ensure_ascii=False,
                         ),
@@ -2525,7 +2613,7 @@ class Feeds:
                         batch_id, gid, str(item.get("icon") or "newspaper"), item["title"],
                         item["summary"], str(item.get("why") or ""),
                         json.dumps(
-                            [{"url": item["url"], "site": str(item.get("site") or _site_of(item["url"])), "title": item["title"]}],
+                            [{"url": item["url"], "site": str(item.get("site") or _source_site(item["url"])), "title": item["title"]}],
                             ensure_ascii=False,
                         ),
                         item["url_key"], item.get("published_ts"),
@@ -2724,6 +2812,11 @@ class Feeds:
             '"site": "只搜这个域名（可留空）", "news": 要不要新闻类结果 true/false, '
             '"kind": "' + ('news 资讯 | guide 文章' if guides_on else "news（这轮只找资讯，别给 guide）") + '"}。'
         )
+        if guides_on:
+            lines.append(
+                "- **文章（kind=guide）整轮最多一个方向**：只挑最适合出深度文章的那一个方向放 guide 搜索，"
+                "其余方向全部找资讯（kind=news）。资讯是主菜，文章宁缺毋滥。"
+            )
         lines.append(
             "- 换个角度搜：技术细节 / 社区讨论 / 反面意见 / 本地语言的来源 / 后续进展都算；"
             "**至少一条用 site 直奔一手来源**（官方新闻室、公告、GitHub、文档站）。"
@@ -2861,6 +2954,7 @@ class Feeds:
             if diverse_searches:
                 diverse_item["searches"] = diverse_searches
             out.append(diverse_item)
+        _limit_guide_directions(out)
         self._append_focus_history(gid, out)
         logger.info(
             "定关注点（群 %s）：%d 个（recent=%d long=%d explore=%d diverse=%d）",
@@ -2927,8 +3021,10 @@ class Feeds:
         except Exception:
             trusted = []
         if trusted:
+            # 搜索的 site 参数只认域名：名单里「github.com/<作者>」这类标签取域名部分再给模型
+            hints = list(dict.fromkeys([source_name.domain_of(d) or d for d in trusted]))
             lines.append(
-                "- 这个群的优质来源（以前出过好几条高分的）：" + "、".join(trusted)
+                "- 这个群的优质来源（以前出过好几条高分的）：" + "、".join(hints)
                 + "。可以用 site 直奔它们，但最多约三分之一的搜索这样做，其余照常广撒网，给新来源留机会。"
             )
         return "\n".join(lines) + "\n\n"
@@ -3026,6 +3122,7 @@ class Feeds:
                 "image_url": _public_http_url(raw.get("image_url")),
                 "explore": bool(raw.get("explore")),
                 "url_key": _normalize_url(url),
+                "site": _source_site(url),
             }
             if results:
                 # 按内容卡质量（2026-10-03）：quality 只认显式 true/false，没给 = 不卡
@@ -3039,7 +3136,7 @@ class Feeds:
                     item["_src_url_key"] = item["url_key"]
                     item["url"] = alt
                     item["url_key"] = _normalize_url(alt)
-                    item["site"] = _site_of(alt)
+                    item["site"] = _source_site(alt)
             items.append(item)
         return items
 
@@ -3136,6 +3233,40 @@ class Feeds:
         except Exception:
             return 0.0
 
+    def _fill_dates_from_pages(self, task_id: str, items: list[dict]) -> int:
+        """模型没给发布日期时，用代码在打开网页那一步读到的补上（docs/10 §九 第一步 2）。
+
+        「必须有日期」（kind=guide）规则不放宽：这里只救「页面上明明有日期、子 agent 没抄回来」
+        的误杀。日期来自 fetch_page 写进 tool_calls 的「页面发布日期」标记。返回补了几条。
+        """
+        from .coordinator import normalize_link_for_check
+
+        try:
+            dates = page_date.page_dates(self._store, task_id)
+        except Exception:
+            logger.debug("读这轮页面发布日期失败（%s）", task_id, exc_info=True)
+            return 0
+        if not dates:
+            return 0
+        filled = 0
+        for item in items:
+            if not isinstance(item, dict) or isinstance(item.get("published_ts"), (int, float)):
+                continue
+            key = normalize_link_for_check(str(item.get("url") or ""))
+            date = dates.get(key) if key else ""
+            if not date:
+                continue
+            ts = _parse_published(date)
+            if not ts:
+                continue
+            item["published_ts"] = ts
+            if item.get("published_raw") in (None, ""):
+                item["published_raw"] = date
+            filled += 1
+        if filled:
+            logger.info("代码从网页读到发布日期，补上 %d 条（%s）", filled, task_id)
+        return filled
+
     def _prefilter(
         self, gid: str, settings: Settings, candidates: list[dict]
     ) -> tuple[list[dict], list[tuple[str, str]], dict]:
@@ -3164,7 +3295,7 @@ class Feeds:
         for c in candidates:
             url = str(c.get("url") or "").strip()
             key = _normalize_url(url)
-            site = _site_of(url)
+            site = _source_site(url)
             c["site"] = site
             # 非公开地址（内网 / 不像链接）：直接丢
             if not _public_http_url(url):
@@ -3203,7 +3334,7 @@ class Feeds:
             # 有已知发布日期且超 GUIDE_MAX_AGE_DAYS 天的
             published = c.get("published")
             if isinstance(published, (int, float)) and published and (now - float(published)) > max_age_s:
-                dropped.append((url, "太旧：超过半年"))
+                dropped.append((url, f"太旧：超过 {GUIDE_MAX_AGE_DAYS} 天"))
                 continue
             # 标题近似：撞候选里已留的（留先见的），或撞最近已发过的
             title = str(c.get("title") or "")
@@ -3479,6 +3610,10 @@ class Feeds:
                             item["published_ts"] = float(cand_pub)
                             if item.get("published_raw") in (None, ""):
                                 item["published_raw"] = float(cand_pub)
+                # 代码兜底（2026-10-05 §九 第一步 2）：核验没拿到、搜索结果也没有日期时，
+                # 用 fetch_page 从原始 HTML（meta / JSON-LD / <time>）读到的日期补上——
+                # 好文（guide）不再因为「页面上的日期没被看见」被硬拒。
+                self._fill_dates_from_pages(group_mark, items)
                 return items
 
             try:
@@ -4352,7 +4487,7 @@ class Feeds:
         # 每条的素材：候选本身 + 群原话
         per_item: list[dict] = []
         for item in items:
-            site = str(item.get("site") or _site_of(item["url"]))
+            site = _source_site(item["url"]) or str(item.get("site") or "")
             quotes = self._quotes_for_item(gid, item)
             per_item.append({"item": item, "site": site, "quotes": quotes})
 
@@ -4699,6 +4834,21 @@ class Feeds:
     # 构想
     # ------------------------------------------------------------------
 
+    def _worker_tool_catalog(self) -> Any:
+        """子 agent（worker）现在能用的工具清单 [(名字, 描述)]；拿不到 → None。
+
+        「构想可行性评估」（idea_feasibility）用它算能力清单。测试替身 FakeWorkers 没有
+        tool_catalog → None（按基本能力算）；真 Workers 的工具被摘掉后清单自然少那项。
+        """
+        fn = getattr(self._workers, "tool_catalog", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn()
+        except Exception:
+            logger.exception("取子 agent 工具清单出错，构想可行性按基本能力算")
+            return None
+
     async def make_idea(self, group_id: str) -> int | None:
         gid = str(group_id)
         if not self._profile_ready(gid):
@@ -4782,9 +4932,15 @@ class Feeds:
             "**少而精**：只提你真觉得值得这个群花时间的点子。想不到值得做的、或者把握不大，"
             "就老实给 null——这一轮不出不算失职，为了凑数硬出一条更糟。"
             "提之前自己过三关：① 群里真的有人要它吗（引群里最近在聊的 / 画像里在做的事，"
-            "别拿「可能有用」当理由）② 我真做得到吗（做不到就别许愿）③ 代价和风险说得出吗"
-            "（要谁配合、要花多久、会不会白费）；三关过不了就别提。"
+            "别拿「可能有用」当理由）② 对照下面的能力清单，我真做得到吗（清单里没有的本事，"
+            "别许愿）③ 代价和风险说得出吗（要花多久、会不会白费）；三关过不了就别提。"
         )
+        # 可行性硬闸的能力清单（docs/18 §八，2026-10-05 用户拍板 1.A 严格）：把子 agent
+        # 实际能用的工具算成能力清单讲给模型，入库前再逐条核对它交回的 feasibility。
+        cap_inv = idea_feasibility.inventory(self._worker_tool_catalog())
+        lines.append("")
+        lines.append(idea_feasibility.prompt_section(cap_inv))
+        lines.append("")
         lines.append(
             "想到了就按下面的格式交一条，想不到就给 null。只回 JSON："
             '{"idea": {"title": "我可以……（一句话）", "body": "想法是什么（两三句）",'
@@ -4796,15 +4952,16 @@ class Feeds:
             ' "worth": "high"|"medium"|"low"（★可省略：你自己觉得这条值不值得占管理员一次'
             '注意力；拿不准就别给，把握不大给 low 或干脆别出）,'
             ' "chat_worthy": 适不适合拿到群里聊一聊 true/false,'
-            ' "feasibility": {"level": "ok"|"maybe"|"need", "note": "一句话：'
-            '能做 / 可能能做 / 需要你提供什么"},'
+            ' "feasibility": {"level": "ok", "note": "一句话：为什么真做得到",'
+            ' "uses": ["用到的本事名（至少 1 个，只从上面清单里挑）"],'
+            ' "deliver": "page"|"doc"|"tool"|"report", "needs_members": false},'
             ' "keywords": ["5–10 个关键词，中英文、同义词都放点"],'
             ' "items": [{"kind": "task" 或 "goal", "title": "短标题", "desc": "一句话说明"}]} | null}'
             f"。items 是这个构想包含的项目，最多 {_IDEA_ITEMS_MAX} 个：kind=task 是能一次做完、"
             "有交付物的事，kind=goal 是要长期盯着、慢慢推进的事。**克制**：最好只给 1 个 task + "
             "1 个 goal，也可以只有其中之一；确实需要才多给，凑数不如少给。"
-            "构想不吹牛：level 只许这三个——ok=我真能做，maybe=可能能做，need=还需要群里提供什么"
-            "（note 里写清楚需要什么）。"
+            "构想不吹牛：level 只认 \"ok\"，needs_members 必须是 false；"
+            "自以为只是 maybe、或要群友报名 / 参与 / 配合才成立的，这轮干脆别提。"
         )
         try:
             result = await self._models.chat(
@@ -4847,15 +5004,17 @@ class Feeds:
         icon = str(idea.get("icon") or "").strip()
         if icon not in _ICONS:
             icon = "bulb"
-        # 可行性：level 只认 ok / maybe / need；没给或乱给 → maybe
-        raw_feas = idea.get("feasibility")
-        feas_level, feas_note = "maybe", ""
-        if isinstance(raw_feas, dict):
-            lv = str(raw_feas.get("level") or "").strip().lower()
-            if lv in ("ok", "maybe", "need"):
-                feas_level = lv
-            feas_note = str(raw_feas.get("note") or "").strip()[:120]
-        feasibility_json = json.dumps({"level": feas_level, "note": feas_note}, ensure_ascii=False)
+        # 可行性硬闸（docs/18 §八，用户拍板 1.A 严格）：拿子 agent 实际能用的工具清单对照模型
+        # 交回的 feasibility。level 不是 ok / needs_members 不是明确 false / uses 有清单外的本事 /
+        # deliver 认不出或对不上 / 缺字段 → 这条不入库，只记进 kv ideas.blocked.<群号>。
+        feas_ok, feas_reason, feas_norm = idea_feasibility.check(
+            idea.get("feasibility"), cap_inv
+        )
+        if not feas_ok:
+            idea_feasibility.record_blocked(self._store, gid, "group", title, feas_reason)
+            logger.info("构想过不了可行性闸，本轮不出（群 %s）：%s —— %s", gid, title, feas_reason)
+            return None
+        feasibility_json = json.dumps(feas_norm, ensure_ascii=False)
         keywords: list[str] = []
         raw_kw = idea.get("keywords")
         if isinstance(raw_kw, list):
@@ -5418,7 +5577,7 @@ class Feeds:
             src = json.loads(r["sources"] or "[]")
             if isinstance(src, list) and src and isinstance(src[0], dict):
                 url = str(src[0].get("url") or "")
-                site = str(src[0].get("site") or "")
+                site = _source_site(url) or str(src[0].get("site") or "")  # 按 url 重算（老数据中文站名也归到域名）
         except (ValueError, TypeError):
             pass
         return {

@@ -148,7 +148,7 @@ class FakeAgents:
             raise ValueError("不是 queued")
         h["status"] = "running"
 
-    def returned(self, gid, id, summary, data=None, evidence=(), *, ok=True, error=''):
+    def returned(self, gid, id, summary, data=None, evidence=(), *, ok=True, error='', used_tools=None):
         self._rec(("returned", gid, id, ok))
         self._verify_served(gid)
         h = self._handoffs[str(id)]
@@ -172,7 +172,7 @@ class FakeAgents:
         if accepted and learn and h["kind"] != "task":
             self.remember(gid, h["kind"], str(summary), refs, source_id=str(id))
 
-    def fail(self, gid, id, error, *, state='failed'):
+    def fail(self, gid, id, error, *, state='failed', used_tools=None):
         self._rec(("fail", gid, id, state))
         self._verify_served(gid)
         h = self._handoffs[str(id)]
@@ -225,7 +225,7 @@ class FakeWorkers:
     async def run(self, brief, *, group_id, tools, task_id="", actor="子 agent #1",
                   max_steps=0, output_schema=None, workspace=None, skills_hint=None,
                   system_extra="", deadline_ts=None, artifact_scope=None,
-                  agent_type="task", allowed_tools=None, allowed_skills=None):
+                  agent_type="task", allowed_tools=None, allowed_skills=None, used_tools=None):
         self.calls.append(
             WorkersCall(
                 brief=brief, tools=list(tools), group_id=group_id, task_id=task_id,

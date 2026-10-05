@@ -93,6 +93,8 @@ class ToolContext:
     agent_type: str = "task"
     allowed_tools: tuple[str, ...] | None = None
     allowed_skills: tuple[str, ...] | None = None
+    # 每次执行独有的可信遥测，不从模型参数读取；只记真正派发的工具。
+    used_tools: set[str] | None = None
 
     def effective_role(self) -> str:
         """这个上下文实际算哪个角色（role 优先，空则看 actor）。工具 handler 里也用它。"""
@@ -185,6 +187,21 @@ class Tools:
             )
         return out
 
+    def catalog(self, role: str) -> list[tuple[str, str]]:
+        """某角色**现在**能用的工具清单 [(名字, 描述)]（按名字排序）。
+
+        给「构想可行性评估」（idea_feasibility.inventory）算能力清单用：只列这个角色
+        真正注册着、且允许这个角色的工具。工具被摘掉（app._drop_command_tools_if_stopped
+        摘 run_command / start_process 等）后这里自然没有它——清单就那么算出来的。
+        """
+        table = self._table(str(role))
+        out: list[tuple[str, str]] = []
+        for name in sorted(table):
+            tool = table[name]
+            if str(role) in tool.roles:
+                out.append((tool.name, tool.description))
+        return out
+
     # ------------------------------------------------------------------
     # call：唯一入口
     # ------------------------------------------------------------------
@@ -271,6 +288,9 @@ class Tools:
             self._persist(name, args, result, ctx, start)
             return result
         timeout = tool.timeout_s if tool.timeout_s and tool.timeout_s > 0 else 60.0
+        used_tools = getattr(ctx, "used_tools", None)
+        if isinstance(used_tools, set) and name != "submit_result":
+            used_tools.add(name)
         try:
             result = await asyncio.wait_for(tool.handler(ctx, args), timeout=timeout)
         except asyncio.TimeoutError:

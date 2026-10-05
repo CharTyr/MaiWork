@@ -78,13 +78,13 @@ class FakeAgents:
         }
         return hid
 
-    def returned(self, gid, id, summary, data=None, evidence=(), *, ok=True, error=""):
+    def returned(self, gid, id, summary, data=None, evidence=(), *, ok=True, error="", used_tools=None):
         self.calls["returned"].append((str(gid), str(id), bool(ok)))
         h = self._handoffs.get(str(id))
         if h is not None:
             h["status"] = "returned" if ok else "failed"
 
-    def fail(self, gid, id, error, *, state="failed"):
+    def fail(self, gid, id, error, *, state="failed", used_tools=None):
         self.calls["fail"].append((str(gid), str(id), str(state)))
         self.fails.append({"gid": str(gid), "id": str(id), "state": str(state), "error": str(error)})
         h = self._handoffs.get(str(id))
@@ -121,7 +121,7 @@ class FakeSpecialists:
 
     async def run(self, kind, brief, *, group_id, phase="", task_id="",
                   tools=None, output_schema=None, actor="", deadline_ts=None,
-                  parent_id="", workspace=None, max_steps=0, artifact_scope=None):
+                  parent_id="", workspace=None, max_steps=0, artifact_scope=None, criteria=None):
         try:
             profile = self._agents.profile(kind)
         except Exception:
@@ -203,7 +203,7 @@ class FakeWorkersQueue:
     async def run(self, brief, *, group_id, tools, task_id="", actor="\u5b50 agent #1",
                   max_steps=0, output_schema=None, workspace=None, skills_hint=None,
                   system_extra="", deadline_ts=None, artifact_scope=None,
-                  agent_type="task", allowed_tools=None, allowed_skills=None):
+                  agent_type="task", allowed_tools=None, allowed_skills=None, used_tools=None):
         self.calls.append({
             "brief": str(brief), "group_id": str(group_id), "tools": list(tools or []),
             "task_id": str(task_id or ""), "actor": str(actor or ""),

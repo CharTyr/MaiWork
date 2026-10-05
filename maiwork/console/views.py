@@ -957,6 +957,15 @@ def group_view(svc: Any, group_id: str, *, admin: bool) -> dict[str, Any]:
     if admin:
         out["focus"] = _focus_list(svc, group_id)
         _attach_idea_targets(svc, group_id, ideas, out["focus"])
+        # 近 7 天被可行性闸拦下的构想（docs/18 §八）：只给管理员，群友视图一个键都不出现。
+        # 读不到 / 结构坏了兜底成全 0，视图绝不 500。
+        try:
+            from .. import idea_feasibility as _if
+
+            view["ideas_blocked"] = _if.blocked_view(svc.store, group_id)
+        except Exception:
+            logger.exception("读构想拦截记录失败（群 %s）", group_id)
+            view["ideas_blocked"] = {"count": 0, "recent": []}
         # 群空间（docs/02 §10）：仅管理员；模块没建起来给全 False + 空身份
         gs = getattr(svc, "group_space", None)
         try:

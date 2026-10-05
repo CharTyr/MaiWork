@@ -143,6 +143,21 @@ class Workers:
         # get_settings：取 Settings（context_window 等压缩参数）；没给时用默认 128000。
         self._get_settings = get_settings
 
+    def tool_catalog(self) -> Any:
+        """子 agent（worker 角色）现在能用的工具清单 [(名字, 描述)]；取不到 → None。
+
+        「构想可行性评估」用（feeds / personal 拿它算能力清单）。工具被摘掉后这里自然
+        没有那项；没有 Tools 或它没有 catalog 方法（老替身）→ None，调用方按基本能力算。
+        """
+        fn = getattr(self._tools, "catalog", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn("worker")
+        except Exception:
+            logger.exception("取 worker 工具清单出错，构想可行性按基本能力算")
+            return None
+
     def _hint(self, skills_hint: Any) -> str:
         """本次用哪个 hint：run 参数优先；否则问构造函数的 fn；坏了按没有处理。"""
         if skills_hint is not None:
@@ -211,6 +226,7 @@ class Workers:
         # 1b：模型侧的岗位 kind（默认等于 agent_type——专岗回合就用专岗自己的模型；
         # 只涉及执行身份、不涉及模型选型的调用方不用动）
         agent: str | None = None,
+        used_tools: set[str] | None = None,
     ) -> WorkerReport:
         # 本轮硬权限工具名单：默认 = 请求 tools + submit_result（每轮都硬门）；
         # allowed_tools 给了再收窄成「请求 ∩ allowed_tools」（submit_result 保底）。
@@ -245,6 +261,7 @@ class Workers:
             artifact_scope=artifact_scope,
             agent_type=str(agent_type or "task"),
             allowed_tools=hard_tools,
+            used_tools=used_tools,
             allowed_skills=(
                 tuple(str(x) for x in allowed_skills) if allowed_skills is not None else None
             ),

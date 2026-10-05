@@ -392,7 +392,8 @@ def _item_html(i: int, item: dict, now: float, lead: bool) -> str:
     meta = []
     if item.get("site"):
         meta.append(f'<span class="src">{_e(item["site"])}</span>')
-    ago = _ago(item.get("published_ts"), now)
+    # 文章（kind=guide）不显示发布日期（2026-10-05 用户定：老文章挂着「几月几日」显得旧）；资讯照旧
+    ago = "" if item.get("kind") == "guide" else _ago(item.get("published_ts"), now)
     if ago:
         meta.append(f"<span>{_e(ago)}</span>")
     meta += [f'<span class="tag">{_e(t)}</span>' for t in _tags(item)]

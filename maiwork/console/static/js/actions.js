@@ -282,10 +282,12 @@ export async function act(el, e) {
     case "rss-del": {
       const g = el.dataset.g;
       const id = el.dataset.id;
-      if (a === "rss-del" && !confirm("删掉这个 RSS 源？")) break;
+      const ask = el.dataset.auto === "1" ? "删掉这个自动订阅的源？以后也不再自动推荐它。" : "删掉这个 RSS 源？";
+      if (a === "rss-del" && !confirm(ask)) break;
       try {
         if (a === "rss-del") await api("DELETE", `/api/groups/${encodeURIComponent(g)}/rss/${encodeURIComponent(id)}`);
         else await api("POST", `/api/groups/${encodeURIComponent(g)}/rss/${encodeURIComponent(id)}/toggle`, { enabled: el.dataset.on === "1" });
+        if (state.rssAuto) delete state.rssAuto[g]; // 自动订阅记录 / 命中率跟着重拉
         await loadSettings();
         repaintSheet();
       } catch (err) {

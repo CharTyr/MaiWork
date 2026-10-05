@@ -375,10 +375,11 @@ class TestRssInPipeline:
         assert "https://ok.example.com/fresh" in score_prompt
         accepted = {r["title"]: r for r in _accepted_rows(store)}
         assert set(accepted) == {"搜索来的候选", "RSS 新鲜资讯"}
-        # RSS 那条真的被打过分（不是绕过打分混进来的），来源显示源标题
+        # RSS 那条真的被打过分（不是绕过打分混进来的）；来源是真实域名
+        # （2026-10-05 §九 第一步 1：以前是 RSS 源标题「好博客」，同一网站会被拆两份）
         rss_row = accepted["RSS 新鲜资讯"]
         assert json.loads(rss_row["scores"])["avg"] >= 4.0
-        assert json.loads(rss_row["sources"])[0]["site"] == "好博客"
+        assert json.loads(rss_row["sources"])[0]["site"] == "ok.example.com"
         store.close()
 
 

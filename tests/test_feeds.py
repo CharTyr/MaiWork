@@ -601,6 +601,14 @@ def test_prepare_news_bad_icon_falls_back(tmp_path) -> None:
 # make_idea
 # ----------------------------------------------------------------------
 
+# 合格样例的 feasibility（docs/18 §八：level 必须 ok、needs_members 必须 false、
+# uses 只能是能力清单里的本事、deliver 要和本事对得上）。
+# 这里用基本能力（FakeWorkers 没有 tool_catalog → search/chat/write/watch）。
+_FEAS_OK = {
+    "level": "ok", "note": "能做：联网搜公开资料整理成一页",
+    "uses": ["search", "write"], "deliver": "doc", "needs_members": False,
+}
+
 _IDEA_JSON = json.dumps(
     {
         "idea": {
@@ -609,6 +617,7 @@ _IDEA_JSON = json.dumps(
             "basis": "群里每周都在复盘",
             "icon": "books",
             "chat_worthy": True,
+            "feasibility": _FEAS_OK,
             "items": [
                 {"kind": "task", "title": "做一页每周复盘模板", "desc": "先出一版模板给大家改"},
                 {"kind": "goal", "title": "每周自动汇总讨论", "desc": "盯着这件事，每周五汇总一次"},
@@ -659,7 +668,7 @@ def test_make_idea_prompt_asks_items_and_drops_step_effort(tmp_path) -> None:
 def test_make_idea_items_capped_at_5_and_bad_ones_dropped(tmp_path) -> None:
     many = json.dumps(
         {"idea": {"title": "我可以做一堆小事", "body": "b", "basis": "x", "icon": "tools",
-                  "chat_worthy": False,
+                  "chat_worthy": False, "feasibility": _FEAS_OK,
                   "items": [
                       {"kind": "task", "title": f"事 {i}"} for i in range(1, 9)
                   ] + ["不是表", {"desc": "没标题"}, {"kind": "wat", "title": "怪类型"}]}},
@@ -680,7 +689,8 @@ def test_make_idea_no_items_writes_empty_list(tmp_path) -> None:
     """模型没给 items（老格式）→ 存 '[]'，读取按没有项目走老逻辑。"""
     plain = json.dumps(
         {"idea": {"title": "我可以整理一份清单", "body": "b", "basis": "x",
-                  "step": "列条目", "effort": "一小时", "icon": "books", "chat_worthy": False}},
+                  "step": "列条目", "effort": "一小时", "icon": "books", "chat_worthy": False,
+                  "feasibility": _FEAS_OK}},
         ensure_ascii=False,
     )
     models = FakeModelsQueue(ready=True, replies=[plain])
@@ -703,7 +713,8 @@ def test_make_idea_null_returns_none(tmp_path) -> None:
 def test_make_idea_not_chat_worthy_not_added_to_pool(tmp_path) -> None:
     idea = json.dumps(
         {"idea": {"title": "我可以做运维巡检", "body": "b", "basis": "有服务器",
-                  "step": "s", "effort": "半天", "icon": "tools", "chat_worthy": False}},
+                  "step": "s", "effort": "半天", "icon": "tools", "chat_worthy": False,
+                  "feasibility": _FEAS_OK}},
         ensure_ascii=False,
     )
     models = FakeModelsQueue(ready=True, replies=[idea])
@@ -740,7 +751,8 @@ def test_make_idea_dedup_recent_30_days(tmp_path) -> None:
     new_title = "我可以帮群把每周讨论整理成一页"  # difflib 相似度 > 0.75
     models = FakeModelsQueue(ready=True, replies=[
         json.dumps({"idea": {"title": new_title, "body": "b", "basis": "x",
-                             "step": "s", "effort": "e", "icon": "books", "chat_worthy": True}},
+                             "step": "s", "effort": "e", "icon": "books", "chat_worthy": True,
+                             "feasibility": _FEAS_OK}},
                    ensure_ascii=False)
     ])
     store, settings, feeds, m, w, topics, _ = _make_feeds(tmp_path, models=models)
@@ -754,7 +766,8 @@ def test_make_idea_no_dedup_beyond_30_days(tmp_path) -> None:
     new_title = "我可以帮群把每周讨论整理成一页"
     models = FakeModelsQueue(ready=True, replies=[
         json.dumps({"idea": {"title": new_title, "body": "b", "basis": "x",
-                             "step": "s", "effort": "e", "icon": "books", "chat_worthy": True}},
+                             "step": "s", "effort": "e", "icon": "books", "chat_worthy": True,
+                             "feasibility": _FEAS_OK}},
                    ensure_ascii=False)
     ])
     store, settings, feeds, m, w, topics, _ = _make_feeds(tmp_path, models=models)
@@ -1138,7 +1151,7 @@ _IDEA_WITH_ORIGIN = json.dumps(
             "origin": "涂击队百层挑战",
             "icon": "books",
             "chat_worthy": False,
-            "feasibility": {"level": "ok", "note": "能做"},
+            "feasibility": _FEAS_OK,
             "keywords": ["战报"],
             "items": [],
         }
@@ -1217,3 +1230,5 @@ def test_make_idea_origin_cleaned(tmp_path) -> None:
     got2 = _run(feeds2.make_idea(GID))
     row2 = store2.read().execute("SELECT origin FROM ideas WHERE id=?", (got2,)).fetchone()
     assert row2["origin"] == ""
+
+

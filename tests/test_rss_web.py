@@ -2,7 +2,8 @@
 
 - 接口：GET/POST/DELETE/toggle 只管理员；POST 先试取成功才保存；
 - 备料：RSS 条目和搜索子 agent 的候选合并后走同一套质量门槛（硬性淘汰、打分、去重）；
-  原样验证 sources.site 显示源标题、fetched/quote 交给子 agent。
+  sources.site 是条目链接算出来的真实域名（2026-10-05 docs/10 §九 第一步 1：以前是 RSS 源标题），
+  fetched/quote 交给补打开子 agent 再核对（同上 第一步 3）。
 """
 
 from __future__ import annotations
@@ -253,7 +254,8 @@ class TestRssPipeline:
         assert kept == 1
         rows = store.read().execute("SELECT * FROM news_items").fetchall()
         assert [r["url_key"] for r in rows] == ["ok.example.com/rss1"]
-        assert json.loads(rows[0]["sources"])[0]["site"] == "好博客"
+        # 来源名按条目链接算（2026-10-05 §九 第一步 1）：以前是 RSS 源标题「好博客」
+        assert json.loads(rows[0]["sources"])[0]["site"] == "ok.example.com"
         store.close()
 
     @pytest.mark.asyncio

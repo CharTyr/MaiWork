@@ -43,7 +43,7 @@ import logging
 import re
 from typing import Any, Callable, Iterable
 
-from .agents import Agents, KINDS, MAIN_KIND
+from .agents import Agents, KINDS, MAIN_KIND, _used_tool_names
 
 logger = logging.getLogger("maiwork.lessons")
 
@@ -59,6 +59,8 @@ FIRST_LOOK_BACK_S = 7 * 86400.0          # 第一次回看：7 天
 CURATE_MIN_GAP_S = 7 * 86400.0           # 每周整理最小间隔（只有 kind=task 吃这个）
 CURATE_MIN_AUTO_ACTIVE = 4                # task skill ≥ N 份才调模型整理（少于此不值得调）
 SIGNAL_MAX = 30
+_EXEC_SIGNAL_MAX = 8
+_EXEC_SIGNAL_SCAN_MAX = 4096  # 有界筛选；碰到上限不推进进度，不把后面的合格材料悄悄吞掉。
 VOTE_SNAPSHOT_WINDOW_S = 14 * 86400.0
 VOTE_SNAPSHOT_FIRST_WINDOW_S = 7 * 86400.0
 VOTE_SNAPSHOT_MAX = 200
@@ -333,6 +335,53 @@ def _collect_handoff_signals(store: Any, gid: str, kind: str, since: float, *, l
             out.append(f"失败〔{brief}〕：{err or '（没写错因）'}")
         elif status == "accepted" and why:
             out.append(f"验收通过〔{brief}〕：{why}")
+    return out
+
+
+def _collect_exec_handoff_signals(store: Any, gid: str, since: float, now: float) -> list[str]:
+    """先筛不简单的 task 再取至多八份；旧成功交接单没有可信遥测就不猜工具数。"""
+    out: list[str] = []
+    try:
+        rows = store.read().execute(
+            "SELECT status, brief, criteria, summary, review, error FROM agent_handoffs"
+            " WHERE group_id=? AND kind='task' AND updated>? AND updated<=?"
+            " AND status IN ('rejected','failed','accepted')"
+            " ORDER BY updated DESC, rowid DESC LIMIT ?",
+            (str(gid), since, now, _EXEC_SIGNAL_SCAN_MAX + 1),
+        )
+        for index, row in enumerate(rows):
+            if index == _EXEC_SIGNAL_SCAN_MAX:
+                logger.warning("通用执行交接单超过有界检查上限（群 %s），本轮不复盘、不推进进度", gid)
+                return []
+            try:
+                review = json.loads(row["review"] or "{}")
+            except (ValueError, TypeError):
+                review = {}
+            names = _used_tool_names(review.get("used_tools")) if isinstance(review, dict) else None
+            if row["status"] == "accepted" and (names is None or len(names) < 3):
+                continue
+            try:
+                criteria = json.loads(row["criteria"] or "[]")
+            except (ValueError, TypeError):
+                criteria = []
+            if not isinstance(criteria, list) or any(not isinstance(item, str) for item in criteria):
+                criteria = []
+            criteria_text = "；".join(item[:200] for item in criteria[:8])
+            text = lambda value: str(value or "").replace("\n", " ").strip()[:300]
+            feedback = review.get("summary", "") if isinstance(review, dict) else ""
+            status = {"accepted": "验收通过", "rejected": "被打回", "failed": "失败"}[row["status"]]
+            tool_text = "、".join(names) if names else ("无" if names == [] else "未记录（不能按可用名单猜）")
+            out.append(
+                f"{status}〔{text(row['brief'])}〕；交回：{text(row['summary']) or '（未交回）'}；"
+                f"验收要求：{criteria_text or '（未记录）'}；"
+                f"验收意见：{text(feedback) or '（未写意见）'}；实际工具（最多 24 种）：{tool_text}"
+                + (f"；错误：{text(row['error'])}" if row["error"] else "")
+            )
+            if len(out) == _EXEC_SIGNAL_MAX:
+                break
+    except Exception:
+        logger.warning("读取通用执行复盘材料失败（群 %s），不调模型、不推进进度", gid, exc_info=True)
+        return []
     return out
 
 
@@ -1111,10 +1160,9 @@ async def _run_exec_kind(
     if now - last_reflect < REFLECT_MIN_GAP_S:
         return 0
     since = last_reflect if last_reflect > 0 else (now - FIRST_LOOK_BACK_S)
-    signals = _collect_handoff_signals(store, gid, "task", since)
+    signals = _collect_exec_handoff_signals(store, gid, since, now)
     if not signals:
         return 0
-    signals = signals[:SIGNAL_MAX]
     existing = agents.skills(gid, "task", include_archived=False)
     chosen = _pick_relevant(existing, signals, limit=_EXEC_FULL_BODY_MAX_SKILLS)
     chosen_names = {str(it.get("name") or "").strip() for it in chosen}
@@ -1141,7 +1189,7 @@ async def _run_exec_kind(
     else:
         prompt_lines.append("（本群还没有通用执行 skill：要记就先 add 新建一份。）")
     prompt_lines.append("")
-    prompt_lines.append("本轮新交接单摘要（被打回 / 失败 / 通过的通用执行；最多 30 条）：")
+    prompt_lines.append("本轮不简单的通用执行交接单材料（被打回 / 失败，或实际用了至少 3 种工具；最多 8 条）：")
     for s in signals:
         prompt_lines.append(f"- {s}")
     prompt_lines.extend([

@@ -1390,6 +1390,7 @@ class Agents:
         *,
         ok: bool = True,
         error: str = "",
+        used_tools: Iterable[str] | None = None,
     ) -> None:
         summary_s = str(summary or "")[:_SUMMARY_MAX]
         evidence_list = _clean_str_list(evidence, _REFS_MAX * 4, _REF_MAX)  # 证据比 refs 多几倍
@@ -1402,13 +1403,13 @@ class Agents:
                 data_json = json.dumps(str(data)[:2000], ensure_ascii=False)
         to_state = "returned" if ok else "failed"
         gid_s, hid, cur = self._load_for_transition(gid, id)
-        self._apply_transition(
-            cur, to_state,
-            update={"summary": summary_s, "data": data_json,
-                    "evidence": json.dumps(evidence_list, ensure_ascii=False),
-                    "error": error_s},
-            gid=gid_s, hid=hid,
-        )
+        update = {"summary": summary_s, "data": data_json,
+                  "evidence": json.dumps(evidence_list, ensure_ascii=False), "error": error_s}
+        names = _used_tool_names(used_tools)
+        if str(cur["kind"]) == "task" and names is not None:
+            # review 是服务器写的验收元数据；不能从模型交回的 data 中拿工具遥测。
+            update["review"] = json.dumps({"used_tools": names}, ensure_ascii=False)
+        self._apply_transition(cur, to_state, update=update, gid=gid_s, hid=hid)
 
     def review(
         self,
@@ -1430,11 +1431,16 @@ class Agents:
         gid_s, hid, cur = self._load_for_transition(gid, id)
         kind = str(cur["kind"])
         to_state = "accepted" if accepted else "rejected"
-        review_payload = json.dumps(
-            {"accepted": bool(accepted), "summary": summary_s, "refs": refs_list,
-             "learn": bool(learn), "ts": clock.now()},
-            ensure_ascii=False,
-        )
+        review = {"accepted": bool(accepted), "summary": summary_s, "refs": refs_list,
+                  "learn": bool(learn), "ts": clock.now()}
+        try:
+            previous = json.loads(cur["review"] or "{}")
+        except (ValueError, TypeError):
+            previous = {}
+        names = _used_tool_names(previous.get("used_tools")) if isinstance(previous, dict) else None
+        if kind == "task" and names is not None:
+            review["used_tools"] = names
+        review_payload = json.dumps(review, ensure_ascii=False)
         from_state = str(cur["status"])
         if to_state not in _TRANSITIONS.get(from_state, ()):  # 终态/非法迁移
             raise ValueError(f"交接单状态不许从 {from_state} 变到 {to_state}")
@@ -1447,13 +1453,17 @@ class Agents:
             if write_memory:
                 Agents._remember_tx(conn, gid_s, kind, summary_s, refs_list, source_id=hid, now=clock.now())
 
-    def fail(self, gid: str, id: str, error: str, *, state: str = "failed") -> None:
+    def fail(self, gid: str, id: str, error: str, *, state: str = "failed", used_tools: Iterable[str] | None = None) -> None:
         target = "cancelled" if str(state) == "cancelled" else "failed"
         error_s = str(error or "")[:_ERROR_MAX]
         gid_s, hid, cur = self._load_for_transition(gid, id)
         if target == "cancelled" and str(cur["status"]) == "cancelled":
             return  # 取消收尾（cancel_unsettled）先一步落了 cancelled，协程自己再落一次不算错
-        self._apply_transition(cur, target, update={"error": error_s}, gid=gid_s, hid=hid)
+        update = {"error": error_s}
+        names = _used_tool_names(used_tools)
+        if str(cur["kind"]) == "task" and names is not None:
+            update["review"] = json.dumps({"used_tools": names}, ensure_ascii=False)
+        self._apply_transition(cur, target, update=update, gid=gid_s, hid=hid)
 
     def cancel_unsettled(self, *, task_id: str | None = None, why: str) -> int:
         """把没收尾的交接单（queued / running / returned）收成 cancelled，返回收了几张。
@@ -1774,6 +1784,16 @@ def _validate_profile_patch(
             if effort not in _efforts_of(model_entries[model_id]):
                 raise ValueError(f"这个模型不支持思考强度「{effort}」（它支持：{'、'.join(_efforts_of(model_entries[model_id])) or '无'}）")
     return clean
+
+
+def _used_tool_names(raw: Any) -> list[str] | None:
+    """可信调用遥测的有界名字列表；缺失或损坏不伪装成已使用，交回协议不算工具。"""
+    if not isinstance(raw, (list, tuple, set, frozenset)) or len(raw) > 4096:
+        return None
+    if any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name) for name in raw):
+        return None
+    names = sorted(raw) if isinstance(raw, (set, frozenset)) else raw
+    return list(dict.fromkeys(name for name in names if name != "submit_result"))[:_TOOLS_MAX]
 
 
 def _clean_str_list(values: Iterable[Any], max_items: int, max_len: int) -> list[str]:

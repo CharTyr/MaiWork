@@ -673,7 +673,9 @@ class TestIdeaFeasibility:
                   "body": "把最近聊到的几块 FPGA 板子收集起来，做个对比表",
                   "basis": "群里一直在聊板子选型", "step": "先列出三块板子",
                   "effort": "大概一晚上", "icon": "chart", "chat_worthy": True,
-                  "feasibility": {"level": "ok", "note": "能做：靠联网搜公开参数就行"},
+                  "feasibility": {"level": "ok", "note": "能做：靠联网搜公开参数就行",
+                                  "uses": ["search", "write"], "deliver": "doc",
+                                  "needs_members": False},
                   "keywords": ["FPGA", "对比表", "选型"]}},
         ensure_ascii=False,
     )
@@ -696,8 +698,9 @@ class TestIdeaFeasibility:
         assert ideas[0]["feasibility"]["note"]
         assert ideas[0]["keywords"] == ["FPGA", "对比表", "选型"]
 
-    def test_idea_without_feasibility_defaults(self, tmp_path) -> None:
-        """模型没给 feasibility：回落 {"level": "maybe", "note": ""}；keywords 空列表。"""
+    def test_idea_without_feasibility_rejected(self, tmp_path) -> None:
+        """模型没给 feasibility：缺字段一律不过（docs/18 §八 1.A 严格）——不入库，
+        只在 kv ideas.blocked.<群号> 记一条。"""
         plain = json.dumps(
             {"idea": {"title": "我可以整理一个 NAS 清单", "body": "整理清单",
                       "basis": "群里在折腾 NAS", "step": "列条目", "effort": "一小时",
@@ -707,17 +710,16 @@ class TestIdeaFeasibility:
         models = FakeModelsQueue(ready=True, replies=[plain])
         store, settings, feeds, models, *_r = _make_feeds(tmp_path, models=models)
         with _TimePatch():
-            idea_id = _run(feeds.make_idea(GID))
-        row = store.read().execute("SELECT * FROM ideas WHERE id=?", (idea_id,)).fetchone()
-        feas = json.loads(row["feasibility"])
-        assert feas["level"] == "maybe"
-        assert json.loads(row["keywords"]) == []
-        with _TimePatch():
-            view = feeds.ideas_view(GID)[0]
-        assert view["feasibility"]["level"] == "maybe"
-        assert view["keywords"] == []
+            assert _run(feeds.make_idea(GID)) is None
+        assert store.read().execute("SELECT COUNT(*) c FROM ideas").fetchone()["c"] == 0
+        blocked = store.kv_get(f"ideas.blocked.{GID}", [])
+        assert len(blocked) == 1
+        assert blocked[0]["kind"] == "group"
+        assert blocked[0]["title"] == "我可以整理一个 NAS 清单"
+        assert blocked[0]["reason"]
 
-    def test_idea_bad_feasibility_level_normalized(self, tmp_path) -> None:
+    def test_idea_bad_feasibility_level_rejected(self, tmp_path) -> None:
+        """level 不合法（impossible）＝不是 ok → 拦下，不入库。"""
         bad = json.dumps(
             {"idea": {"title": "我可以写一个群机器人", "body": "写个 bot",
                       "basis": "群里想要", "step": "起项目", "effort": "一周",
@@ -729,10 +731,11 @@ class TestIdeaFeasibility:
         models = FakeModelsQueue(ready=True, replies=[bad])
         store, settings, feeds, models, *_r = _make_feeds(tmp_path, models=models)
         with _TimePatch():
-            idea_id = _run(feeds.make_idea(GID))
-        row = store.read().execute("SELECT * FROM ideas WHERE id=?", (idea_id,)).fetchone()
-        assert json.loads(row["feasibility"])["level"] == "maybe"
-        assert json.loads(row["keywords"]) == []
+            assert _run(feeds.make_idea(GID)) is None
+        assert store.read().execute("SELECT COUNT(*) c FROM ideas").fetchone()["c"] == 0
+        blocked = store.kv_get(f"ideas.blocked.{GID}", [])
+        assert len(blocked) == 1
+        assert "level" in blocked[0]["reason"]
 
 
 # ----------------------------------------------------------------------

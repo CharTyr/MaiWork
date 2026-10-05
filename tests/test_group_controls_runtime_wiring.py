@@ -47,7 +47,7 @@ ADMIN_PW = "总管理员密码-群控接线-1234"
 G1_PW = "群一管理员密码-pushwiring"
 G2_PW = "群二管理员密码-pushwiring"
 SECRET = "sk-push-leak-9527-不许外泄"
-ABS_PATH = "/home/nobody/private/workspaces/secret-dir"
+ABS_PATH = "/Users/nobody/private/workspaces/secret-dir"
 
 
 def _free_port() -> int:

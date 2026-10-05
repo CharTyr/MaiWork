@@ -4,8 +4,10 @@
 不能绕过核对。这里只算名单和一个 0–1 的先验分，不碰任何门槛。
 
 - 统计口径：本群近 WINDOW_DAYS 天上了网页（rejected=0）、五项平均分 ≥ HIGH_AVG 的条目，
-  按域名（去 www.）计数；每条按距今天数衰减（半衰期 HALF_LIFE_DAYS）；群友点「有用」净值每 1 票
-  再加 UP_BONUS 条（同样衰减）。
+  按「来源名」计数（`source_name`：真实域名；github / medium / dev.to 按作者，见 §九 第一步 1）。
+  来源名**一律按 url 重算**（旧库里 site 是「机核」这类中文站名的行也因此归到域名），
+  url 缺失才退回存的 site / url_key；每条按距今天数衰减（半衰期 HALF_LIFE_DAYS）；
+  群友点「有用」净值每 1 票再加 UP_BONUS 条（同样衰减）。
 - 上名单：至少 MIN_HIGH 条高分（不衰减的原始条数，样本少不算数）；管理员移出的（kv
   「feeds.trusted_removed.<群号>」）和屏蔽名单里的不上；按衰减后的分数从高到低，最多 limit 个。
 - source_prior：在名单里 → 按名次给 1.0 往下递减（最低 0.3）；不在名单 → 0。
@@ -18,6 +20,8 @@ import json
 import logging
 from typing import Any, Iterable
 from urllib.parse import urlsplit
+
+from . import source_name
 
 logger = logging.getLogger("maiwork.source_stats")
 
@@ -45,15 +49,31 @@ def _norm(domain: Any) -> str:
 
 
 def _site_of_row(row: Any) -> str:
+    """这条记录算到哪个来源名上：**按 url 重算**（source_name.site_of_url）。
+
+    老库里 site 有的是「机核」这类中文站名（RSS 源标题，2026-10 前的老写法）——
+    不改数据，但统计时按 url 归到 gcores.com，和别的 gcores 行合一份。
+    """
     try:
         src = json.loads(row["sources"] or "[]")
         if isinstance(src, list) and src and isinstance(src[0], dict):
-            site = _norm(src[0].get("site") or "") or _norm(src[0].get("url") or "")
+            url = str(src[0].get("url") or "")
+            site = source_name.site_of_url(url) if url else ""
+            site = site or source_name.normalize_site(src[0].get("site") or "")
             if site:
                 return site
     except (ValueError, TypeError):
         pass
-    return _norm(str(row["url_key"] or ""))
+    return source_name.normalize_site(str(row["url_key"] or ""))
+
+
+def _removed_label(value: Any) -> str:
+    """移出名单一项 → 来源名：域名（gcores.com）和作者标签（github.com/openai）都原样保留。
+
+    2026-10-05（docs/10 §九 第一步 1）：优质来源名单按作者分（github.com/<作者>），
+    网页上的「移出」传的就是这个标签——不能被 _norm 截成 github.com（那会连坐整个平台）。
+    """
+    return source_name.normalize_site(value) or _norm(value)
 
 
 def removed(store: Any, gid: str) -> list[str]:
@@ -61,12 +81,12 @@ def removed(store: Any, gid: str) -> list[str]:
         raw = store.kv_get(_removed_key(str(gid)), []) or []
     except Exception:
         return []
-    return sorted({_norm(d) for d in raw if _norm(d)})
+    return sorted({_removed_label(d) for d in raw if _removed_label(d)})
 
 
 def set_removed(store: Any, gid: str, domain: str, is_removed: bool) -> list[str]:
     """管理员把某个域名移出 / 放回优质来源名单；返回移出清单。"""
-    d = _norm(domain)
+    d = _removed_label(domain)
     if not d:
         raise ValueError("域名不合法")
     cur = set(removed(store, gid))
@@ -119,12 +139,17 @@ def trusted_domains(
     return [d["domain"] for d in _ranked(store, gid, now, blocked=blocked)[: max(0, int(limit))]]
 
 
+def _covered(label: str, bases: Iterable[str]) -> bool:
+    """label 是不是 base 本身 / base 下的子名（管理员移出 github.com → github.com/<作者> 一起移出）。"""
+    return any(label == b or label.startswith(b + "/") for b in bases if b)
+
+
 def _ranked(store: Any, gid: str, now: float, *, blocked: Iterable[str] = ()) -> list[dict[str, Any]]:
     skip = set(removed(store, gid)) | {_norm(b) for b in blocked if _norm(b)}
     items = [
         {"domain": d, "high": int(s["high"]), "up": int(s["up"]), "score": round(s["score"], 3)}
         for d, s in _stats(store, gid, now).items()
-        if s["high"] >= MIN_HIGH and d not in skip
+        if s["high"] >= MIN_HIGH and not _covered(d, skip)
     ]
     items.sort(key=lambda x: (-x["score"], x["domain"]))
     return items
@@ -132,7 +157,7 @@ def _ranked(store: Any, gid: str, now: float, *, blocked: Iterable[str] = ()) ->
 
 def source_prior(store: Any, gid: str, site: str, now: float, *, blocked: Iterable[str] = ()) -> float:
     """两段式预筛排序用：名单第 1 名 1.0，往下每名少 0.1，最低 0.3；不在名单 0。"""
-    d = _norm(site)
+    d = source_name.normalize_site(site)
     if not d:
         return 0.0
     ranked = trusted_domains(store, gid, now, blocked=blocked)

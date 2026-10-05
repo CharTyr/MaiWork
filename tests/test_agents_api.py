@@ -382,3 +382,4 @@ class TestGroupHandoffsApiRemoved:
         # 交接单数据层还在（agents.begin / handoffs() 本身没删），只是少了这个 HTTP 出口
         env.agents.begin(G1, "news", "news-b1")
         assert len(env.agents.handoffs(G1)) == 1
+

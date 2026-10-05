@@ -1939,8 +1939,12 @@ class ConsoleServer:
                 return _err(400, "请求体不是 JSON")
             from ..config import normalize_domain
             from .. import feeds as _feeds
+            from .. import source_name
 
-            domain = normalize_domain(body.get("domain"))
+            # 2026-10-05（docs/10 §九 第一步 1）：来源名可能是「github.com/<作者>」这类
+            # 作者标签（被拒列表的「屏蔽」按钮传的就是它）；屏蔽按域名算，取域名部分。
+            raw_domain = body.get("domain")
+            domain = normalize_domain(raw_domain) or source_name.domain_of(raw_domain)
             if not domain:
                 return _err(400, "域名不合法（只认字母、数字、横线、点，如 example.com）")
             blocked_v = body.get("blocked")
@@ -3075,9 +3079,18 @@ class ConsoleServer:
             forbid = _rss_guard(request, gid)
             if forbid is not None:
                 return forbid
+            from .. import auto_sources as _auto
             from .. import rss as _rss
 
-            return web.json_response({"rss": _rss.list_feeds(svc.store, gid)})
+            now = clock.now()
+            # 自动订阅（docs/10 §九 第二步）：条目自带 auto / origin / reason / label / trial_until；
+            # 另带上按群的自动操作日志、来源地图、名额占用 + 固定清单（网页「自动」视图用）。
+            return web.json_response({
+                "rss": _rss.list_feeds(svc.store, gid),
+                "auto_log": _auto.load_log(svc.store, gid),
+                "source_map": _auto.load_map(svc.store, gid),
+                "auto": _auto.web_view(svc.store, gid, now),
+            })
 
         @post("/api/groups/{gid}/rss")
         async def _rss_add(request: web.Request) -> web.Response:
@@ -3125,11 +3138,18 @@ class ConsoleServer:
             forbid = _rss_guard(request, gid)
             if forbid is not None:
                 return forbid
+            from .. import auto_sources as _auto
             from .. import rss as _rss
 
             removed = _rss.remove_feed(svc.store, gid, str(request.match_info["id"]))
             if removed is None:
                 return _err(404, "没有这个 RSS 源")
+            # 删掉的是自动源 → 记进「不再推荐」名单（docs/10 §九 第二步）+ 自动操作日志。
+            # 手动加的源不记：删了以后还能自己加回来。
+            try:
+                _auto.note_removed(svc.store, gid, removed, now=clock.now())
+            except Exception:
+                logger.exception("记「管理员删了自动源」失败（群 %s）", gid)
             return web.json_response({"ok": True})
 
         @post("/api/groups/{gid}/rss/{id}/toggle")

@@ -7,7 +7,10 @@ app 的排程巡检每群每小时最多调一次 run（due 判断）：
    不读原始聊天；
 3. 做事经验（lessons.run，docs/17 §三.3–三.4）：每群每岗每日复盘 + 每周整理，出门计数记进返回 dict
    的 `lessons` 键；炸一次不拖垮本轮。
-不往群里发任何东西。模型没配好就只跳过要模型的部分（三步一起跳过）。
+4. 自动订阅 + 来源地图（auto_sources.run，docs/10 §九 第二步）：退订检查 + 门槛订阅每天一次、
+   来源地图 + push 判断每周一次（节流在模块里）；它不往群里发东西，炸了只记日志。
+   它自己的返回摘要只在真做了事时并进 `auto` 键（保持返回形状稳定）。
+不往群里发任何东西。模型没配好就只跳过要模型的部分（自动退订 / 门槛订阅不用模型，照跑）。
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ import json
 import logging
 from typing import Any, Callable
 
-from . import lessons, news_feedback
+from . import auto_sources, lessons, news_feedback
 
 logger = logging.getLogger("maiwork.feedback_jobs")
 
@@ -76,10 +79,19 @@ async def run(
     store: Any, models: Any, gid: str, now: float, *, profiles: Any = None,
     scrub: Callable[[str, str], str | None] | None = None,
     agents: Any = None,
+    transport: Any = None,
 ) -> dict[str, Any]:
     gid = str(gid)
     _last[gid] = now
     out: dict[str, Any] = {"mentions": 0, "lessons": 0}
+    # 自动订阅 / 退订 + 来源地图（docs/10 §九 第二步）：**放在「模型没配好就返回」之前**——
+    # 自动退订和门槛订阅不需要模型，模型没配好也要照跑（模块内部自己节流、自己兜异常）。
+    try:
+        auto_out = await auto_sources.run(store, models, gid, now, profiles=profiles, transport=transport)
+        if any(auto_out.get(k) for k in ("subscribed", "unsubscribed", "map", "push")):
+            out["auto"] = auto_out
+    except Exception:
+        logger.exception("自动订阅这一轮出错（群 %s）", gid)
     if not _models_ready(models):
         return out
     try:

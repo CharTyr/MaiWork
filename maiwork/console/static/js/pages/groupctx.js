@@ -118,9 +118,9 @@ function skillForm(c, kind, s) {
   const ph = task ? "做法：\n1. 先……\n   - 注意：……（因为……）\n2. 再……" : "做法：\n1. 先……\n   - 注意：……（因为……）\n偏好：……";
   return `<div class="skill-form" data-kind="${k}" data-id="${esc(id)}">
     ${task ? `<label class="fine" for="gctx-name-${k}">名字（一类活，不是某一次任务）</label>
-    <input id="gctx-name-${k}" maxlength="${SKILL_NAME_MAX}" value="${esc(draft(c, `gctx-name-${kind}`, (s && s.name) || ""))}" placeholder="例如：整理群活动报名表"${s ? " disabled" : ""} />
+    <input id="gctx-name-${k}" maxlength="${SKILL_NAME_MAX}" aria-describedby="gctx-err-${k}" value="${esc(draft(c, `gctx-name-${kind}`, (s && s.name) || ""))}" placeholder="例如：整理群活动报名表"${s ? " disabled" : ""} />
     <label class="fine" for="gctx-desc-${k}">什么时候用（一句）</label>
-    <input id="gctx-desc-${k}" maxlength="${SKILL_DESC_MAX}" value="${esc(draft(c, `gctx-desc-${kind}`, (s && s.description) || ""))}" placeholder="例如：要把群友报名整理成表格时" />` : ""}
+    <input id="gctx-desc-${k}" maxlength="${SKILL_DESC_MAX}" aria-describedby="gctx-err-${k}" value="${esc(draft(c, `gctx-desc-${kind}`, (s && s.description) || ""))}" placeholder="例如：要把群友报名整理成表格时" />` : ""}
     <label class="fine" for="gctx-body-${k}">做法</label>
     <textarea id="gctx-body-${k}" rows="10" maxlength="${max}" aria-describedby="gctx-help-${k} gctx-err-${k}" placeholder="${esc(ph)}">${esc(draft(c, `gctx-body-${kind}`, (s && s.body) || ""))}</textarea>
     <p class="fine" id="gctx-help-${k}">先写步骤，注意事项挂在对应步骤下，每条写「怎么做 + 一句为什么」。最多 ${max} 字。${task ? "" : "必须照做的写进上面的「本群规矩」。"}</p>
@@ -203,12 +203,21 @@ function taskBlock(c, all) {
 
 /* ───── 动作 ───── */
 
-function formError(key, msg) {
+function clearFormError(key) {
+  const ids = key === "rules" ? ["gctx-rules"] : [`gctx-name-${key}`, `gctx-desc-${key}`, `gctx-body-${key}`];
+  for (const id of ids) $(id)?.removeAttribute?.("aria-invalid");
   const box = $(`gctx-err-${key}`) || $(`gctx-${key}-err`);
-  const input = $(`gctx-body-${key}`) || $(`gctx-${key}`);
+  if (box) { box.textContent = ""; box.hidden = true; }
+}
+
+function formError(key, msg, inputId = null) {
+  const box = $(`gctx-err-${key}`) || $(`gctx-${key}-err`);
+  const input = inputId && $(inputId);
   if (input && input.setAttribute) input.setAttribute("aria-invalid", "true");
   if (box) { box.textContent = msg; box.hidden = false; } else toast(msg, true);
 }
+
+const currentContext = c => state.gctx === c && state.g === c.gid;
 
 // 写操作：群换了就不写（防把 A 群的操作落到 B 群）
 function sameGroup(el) {
@@ -229,12 +238,13 @@ async function write(el, c, method, url, body, okText, apply, errKey) {
   el.disabled = true;
   try {
     const out = await api(method, url, body);
-    if (state.gctx !== c) return true;
+    if (!currentContext(c)) return true;
     apply(out || {});
     clearForm(c);
     repaintCtx();
     if (okText) toast(okText);
   } catch (err) {
+    if (!currentContext(c)) return true;
     el.disabled = false;
     if (errKey) formError(errKey, err.message); else toast(err.message, true);
   }
@@ -258,23 +268,25 @@ export async function actCtx(action, el) {
     case "gctx-skill-open": c.open = String(c.open) === String(d.id) ? null : d.id; repaintCtx(); return true;
     case "gctx-rules-save": {
       if (!sameGroup(el)) return true;
+      clearFormError("rules");
       const body = (($("gctx-rules") || {}).value || "").trim();
-      if (body.length > RULES_MAX) return formError("rules", `最多 ${RULES_MAX} 字。`), true;
+      if (body.length > RULES_MAX) return formError("rules", `最多 ${RULES_MAX} 字。`, "gctx-rules"), true;
       return write(el, c, "PUT", rulesUrl(c.gid), { body }, body ? "保存好了，MaiWork 下次做事就照这个来" : "清空了", (out) => (c.rules = out), "rules");
     }
     case "gctx-skill-save": {
       if (!sameGroup(el)) return true;
       const kind = d.kind, isNew = d.id === "new", task = kind === "task";
+      clearFormError(kind);
       const body = (($(`gctx-body-${kind}`) || {}).value || "").trim();
       const name = task ? (($(`gctx-name-${kind}`) || {}).value || "").trim() : "";
       const description = task ? (($(`gctx-desc-${kind}`) || {}).value || "").trim() : "";
       const max = skillBodyMax(kind);
-      if (task && isNew && !name) return formError(kind, "名字不能空着。"), true;
-      if (task && !description) return formError(kind, "写一句什么时候用。"), true;
-      if (!body) return formError(kind, "做法不能空着。"), true;
-      if (body.length > max) return formError(kind, `做法最多 ${max} 字。`), true;
-      if (name.length > SKILL_NAME_MAX) return formError(kind, `名字最多 ${SKILL_NAME_MAX} 字。`), true;
-      if (description.length > SKILL_DESC_MAX) return formError(kind, `「什么时候用」最多 ${SKILL_DESC_MAX} 字。`), true;
+      if (task && isNew && !name) return formError(kind, "名字不能空着。", `gctx-name-${kind}`), true;
+      if (task && !description) return formError(kind, "写一句什么时候用。", `gctx-desc-${kind}`), true;
+      if (!body) return formError(kind, "做法不能空着。", `gctx-body-${kind}`), true;
+      if (body.length > max) return formError(kind, `做法最多 ${max} 字。`, `gctx-body-${kind}`), true;
+      if (name.length > SKILL_NAME_MAX) return formError(kind, `名字最多 ${SKILL_NAME_MAX} 字。`, `gctx-name-${kind}`), true;
+      if (description.length > SKILL_DESC_MAX) return formError(kind, `「什么时候用」最多 ${SKILL_DESC_MAX} 字。`, `gctx-desc-${kind}`), true;
       const payload = isNew ? (task ? { kind, name, description, body } : { kind, body }) : task ? { description, body } : { body };
       return write(el, c, isNew ? "POST" : "PATCH", skillsUrl(c.gid, isNew ? null : d.id), payload,
         isNew ? "写好了，下次工作时就会参考" : "改好了，旧的一版留在「历史」里", (out) => replaceKind(c, kind, out.skills), kind);

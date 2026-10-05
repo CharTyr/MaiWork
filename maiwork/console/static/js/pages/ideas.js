@@ -11,6 +11,7 @@ const ideaDot = (st) => (st === "started" ? "running" : st === "wanted" || st ==
 export function viewIdeas(g, v) {
   const ideas = (v && v.ideas) || [];
   let html = `<h1 class="h-page h-fish">${agentFish("idea", 44)}<span>构想</span></h1><p class="h-meta">看中哪个，复制要求到群里 @MaiBot 就能开工</p>`;
+  html += blockedNote(v && v.ideas_blocked);
   if (!ideas.length) {
     return html + emptyState("bulb", "还没有构想", g.fresh ? "熟悉这个群之后就开始提想法。" : "");
   }
@@ -32,6 +33,16 @@ export function viewIdeas(g, v) {
     })
     .join("");
   return html;
+}
+
+// 管理员才有 ideas_blocked：生成时被「MaiWork 做不到」拦下的构想（不入库，只留最近几条原因）
+export function blockedNote(b) {
+  const n = b && Number(b.count) > 0 ? Number(b.count) : 0;
+  if (!n) return "";
+  const rows = (Array.isArray(b.recent) ? b.recent : [])
+    .map((r) => `<li><span class="ib-title">${esc(r.title || "（没有标题）")}${r.kind === "personal" ? `<span class="ii-kind">个人向</span>` : ""}</span><span class="ib-why">${esc(r.reason || "")}${r.ts ? ` · ${esc(dayWord(r.ts))}` : ""}</span></li>`)
+    .join("");
+  return `<details class="idea-blocked"><summary>最近 7 天拦下 ${n} 条 MaiWork 做不到的构想<span class="private">${SVG.lock}只有管理员看得到</span></summary>${rows ? `<ul>${rows}</ul>` : ""}<p class="fine">要群友报名、配合，或要登录、付钱、线下才成立的，不会出成构想。</p></details>`;
 }
 
 export function findIdea(did) {

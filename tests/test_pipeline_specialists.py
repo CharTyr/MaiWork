@@ -499,7 +499,9 @@ class TestIdeaTwoLevel:
                 "title": "我可以每周整理群文件分类口诀",
                 "body": "一页「文件在哪找」速查图", "basis": "画像需求",
                 "icon": "bulb", "chat_worthy": False,
-                "feasibility": {"level": "ok", "note": "能做"},
+                "feasibility": {"level": "ok", "note": "能做",
+                                "uses": ["search", "write"], "deliver": "doc",
+                                "needs_members": False},
                 "keywords": ["群文件", "速查"], "items": [],
             }
         }
@@ -545,7 +547,9 @@ class TestIdeaTwoLevel:
             "title": "我可以每天问一句今天谁学到了东西",
             "body": "每天固定一句话冷场开场白", "basis": "画像需求",
             "icon": "bulb", "chat_worthy": False,
-            "feasibility": {"level": "maybe", "note": "可能"}, "keywords": [], "items": [],
+            "feasibility": {"level": "ok", "note": "能做",
+                            "uses": ["search", "write"], "deliver": "doc",
+                            "needs_members": False}, "keywords": [], "items": [],
         }}
         models = _ModelsOK({"feeds.idea": json.dumps(idea_payload, ensure_ascii=False)})
         feeds = _mk_feeds(store, models=models, specialists=sp)
@@ -573,7 +577,9 @@ class TestIdeaTwoLevel:
             "title": "我可以把上周讨论过的方案整理成对比表",
             "body": "对比后好选", "basis": "画像需求",
             "icon": "bulb", "chat_worthy": False,
-            "feasibility": {"level": "ok", "note": ""}, "keywords": [], "items": [],
+            "feasibility": {"level": "ok", "note": "",
+                            "uses": ["search", "write"], "deliver": "doc",
+                            "needs_members": False}, "keywords": [], "items": [],
         }}
         models = _ModelsOK({"feeds.idea": json.dumps(idea_payload, ensure_ascii=False)})
         feeds = _mk_feeds(store, models=models, specialists=sp)

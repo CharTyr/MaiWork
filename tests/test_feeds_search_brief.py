@@ -2,7 +2,7 @@
 
 - 每个方向换几种问法（一手来源 / 技术细节 / 社区讨论 / 反面意见 / 本地语言 / 后续进展），
   用 site 直奔一手来源，禁止同义改写刷搜索；
-- 时间由程序管：资讯默认只搜 7 天内，找文章才放宽到 180 天；
+- 时间由程序管：资讯默认只搜 7 天内，找文章才放宽到 60 天；
 - 屏蔽名单（手动 + 自动）写进提示词；
 - 绑定的搜索服务是预设的一家 → 把那家的 skill（官方用法）附在提示词后面。
 
@@ -37,7 +37,7 @@ def test_brief_says_time_is_handled_by_code(tmp_path) -> None:
     with _TimePatch():
         _run(feeds.prepare_news(GID))
     prompt = _focus_prompt(models)
-    assert "7 天" in prompt and "180" in prompt
+    assert "7 天" in prompt and "60 天" in prompt
     assert "别在搜索词里" in prompt  # 不要往搜索词里塞年份月份求新
 
 

@@ -218,6 +218,7 @@ class Specialists:
         workspace: Any = None,
         max_steps: int = 0,
         artifact_scope: Any = None,
+        criteria: Any = None,
     ) -> WorkerReport:
         gid = str(group_id or "")
         kind_s = str(kind or "").strip()
@@ -287,7 +288,7 @@ class Specialists:
                     parent_id=str(parent_id or ""),
                     tools=tuple(effective_tools),
                     skills=allowed_skills if allowed_skills is not None else (),
-                    criteria=None,
+                    criteria=criteria,
                 )
             )
         except Exception as e:
@@ -305,6 +306,8 @@ class Specialists:
             return WorkerReport(ok=False, summary="", error=f"交接单状态推进失败：{e}", handoff_id=handoff_id)
 
         actor_s = str(actor or "").strip() or f"{kind_s} 专岗"
+        used_tools: set[str] = set()
+        telemetry = {"used_tools": used_tools} if kind_s == "task" else {}
         try:
             report = await self._workers.run(
                 str(brief),
@@ -322,6 +325,7 @@ class Specialists:
                 agent_type=kind_s,
                 allowed_tools=tuple(effective_tools),
                 allowed_skills=allowed_skills,
+                **telemetry,
             )
         except asyncio.CancelledError:
             try:
@@ -332,7 +336,7 @@ class Specialists:
         except Exception as e:
             logger.exception("专岗回合出错（%s/%s）", kind_s, gid)
             try:
-                self._agents.fail(gid, handoff_id, str(e))
+                self._agents.fail(gid, handoff_id, str(e), **telemetry)
             except Exception:
                 logger.exception("专岗 fail 落库失败（%s）", handoff_id)
             return WorkerReport(ok=False, summary="", error=f"子 agent 执行出错：{e}", handoff_id=handoff_id)
@@ -343,23 +347,25 @@ class Specialists:
         # returned / fail（因任务停了而停手的：cancelled，不算它干砸）
         try:
             if report.stopped:
-                self._agents.fail(gid, handoff_id, str(report.error or "任务已停"), state="cancelled")
+                self._agents.fail(gid, handoff_id, str(report.error or "任务已停"), state="cancelled", **telemetry)
             elif report.ok:
                 self._agents.returned(
                     gid, handoff_id, report.summary,
                     data=report.data, evidence=tuple(report.evidence or ()),
+                    **telemetry,
                     ok=True,
                 )
             else:
                 self._agents.returned(
                     gid, handoff_id, report.summary or "",
                     data=report.data, evidence=tuple(report.evidence or ()),
+                    **telemetry,
                     ok=False, error=str(report.error or ""),
                 )
         except Exception:
             logger.exception("专岗 returned 落库失败（%s）", handoff_id)
             try:
-                self._agents.fail(gid, handoff_id, "returned 登记失败")
+                self._agents.fail(gid, handoff_id, "returned 登记失败", **telemetry)
             except Exception:
                 logger.exception("fail 也失败（%s）", handoff_id)
 
