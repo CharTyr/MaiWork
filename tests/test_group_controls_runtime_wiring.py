@@ -254,8 +254,8 @@ class TestStartupMigrationWiring:
 # ======================================================================
 
 
-def _hook_count(outbox: object, owner: object, name: str) -> int:
-    hooks = getattr(outbox, "_result_hooks", [])
+def _hook_count(outbox: object, owner: object, name: str, *, attr: str = "_result_hooks") -> int:
+    hooks = getattr(outbox, attr, [])
     return sum(
         1
         for h in hooks
@@ -277,6 +277,17 @@ class TestOutboxWiring:
             (app.idea_mention, "on_result"),
         ):
             assert _hook_count(app.outbox, owner, name) == 1, (type(owner).__name__, name)
+        # 个人提一嘴的复核者是单独登记的（set_personal_guard）：登记一次，且不是普通 preflight
+        guard = getattr(app.outbox, "_personal_guard", None)
+        assert guard is not None and getattr(guard, "__self__", None) is app.idea_mention
+        assert getattr(guard, "__name__", "") == "on_before_send"
+        assert _hook_count(app.outbox, app.idea_mention, "on_before_send",
+                           attr="_preflight_hooks") == 0
+        assert _hook_count(app.outbox, app.card_push, "on_before_send",
+                           attr="_preflight_hooks") == 0
+        # 开场白还是走普通 preflight（不能冒充个人提一嘴的复核者）
+        assert _hook_count(app.outbox, app.topics, "on_before_send",
+                           attr="_preflight_hooks") == 1
 
     @pytest.mark.asyncio
     async def test_pending_opener_written_only_after_real_sent(self, env: Env) -> None:

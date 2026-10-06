@@ -574,13 +574,17 @@ class Signals:
 
 
 class Models:
-    def __init__(self, opener: str = "话说最近那个新板子你们看了没？") -> None:
+    def __init__(self, opener: str = "话说最近那个新板子你们看了没？", *, guard=None) -> None:
         self._opener = opener
+        # 个人提一嘴的发送前复核默认：没结果、没拒绝、也没有明确需要（= 不通过）
+        self._guard = guard or {"resolved": False, "declined": False, "need": False, "evidence": []}
 
     def settings(self):
         return type("S", (), {"ready": lambda self: True})()
 
     async def chat(self, agent=None, messages=None, **kw):
+        if str(kw.get("purpose") or "") == "card_push.idea_guard":
+            return type("C", (), {"text": json.dumps(self._guard, ensure_ascii=False)})()
         return type("C", (), {"text": self._opener})()
 
 
@@ -821,8 +825,24 @@ async def test_idea_mention_enqueues_with_at_and_settles(tmp_path):
             "INSERT INTO members (group_id, user_id, name, ts) VALUES (?, ?, '阿柒', ?)",
             (GID, UID, NOON),
         )
-    im = card_push.IdeaMention(world.store, world.host, Models(), world.pushes, world.mentions,
-                               lambda: world.settings, outbox=world.ob)
+        # 个人提一嘴只提「当前关注成员」：先把他放进关注名单
+        conn.execute(
+            "INSERT INTO focus_members (group_id, user_id, name, reasons, note, pinned, removed,"
+            " updated) VALUES (?, ?, '阿柒', '[]', '', 1, 0, ?)",
+            (GID, UID, NOON),
+        )
+        # 发送前复核要求「他本人明确要过这件事」的原文依据
+        conn.execute(
+            "INSERT INTO chat_log (text, group_id, message_id, ts, user_id, user_name)"
+            " VALUES (?, ?, 'need-1', ?, ?, '阿柒')",
+            ("那个追更表能帮我做吗", GID, NOON - 30, UID),
+        )
+    im = card_push.IdeaMention(
+        world.store, world.host,
+        Models(guard={"resolved": False, "declined": False, "need": True,
+                      "evidence": ["need-1"]}),
+        world.pushes, world.mentions, lambda: world.settings, outbox=world.ob,
+    )
     group_push.set_config(world.store, GID, {"idea_mention_enabled": True}, world.settings, now=NOON - 120)
     assert im.scan(GID, NOON) == 1
     await im.flush(GID, NOON)

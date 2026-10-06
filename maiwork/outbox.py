@@ -15,6 +15,13 @@
   的那条直接作废，不把陈旧内容发进群。生产者还能挂 `add_preflight_hook`（同步、纯代码、
   generic 发件箱不替它读群 / 不调模型）做发送前新鲜度复核：开场白排队 / 重试期间群里又
   有人说话了，就不再当成冷场开口（Topics.on_before_send）。
+- **个人提一嘴的强制复核**（2026-10）：`key` 是 `idea_mention:<id>`、`push_kind=idea_mention`
+  且 `at_user` 非空的载荷（@ 某人的提议），发送前必须过两道：(a) **载荷契约**——必须带生产者
+  留下的复核材料 `payload["guard"]`（uid / checked_ts / 材料指纹 / 依据都得像样），这里只做
+  **结构性**检查，不读群、不调模型；(b) **生产者必须登记复核者**（`set_personal_guard`，
+  由 card_push.IdeaMention 的 on_before_send 承担，同步、纯代码）。**没登记复核者 → 一律
+  作废**：别的 preflight hook（比如冷场开场白的）冒充不了，重启 / 旧队列 / 生产者没起来
+  都不会把个人提议放出去。群向提一嘴（`at_user` 为空）不受这一条约束。
 - 发送结果统一走结果 hook（add_result_hook）：生产者（冷场开场白 / 资讯卡片 / 构想提一嘴）
   只负责 enqueue，真正发出去（或失败 / 不确定 / 作废）之后才回写自己的表。
 - 普通交付也受日限额/睡觉时段约束；群友以 /mw 领取 <任务号> 明确索取时，
@@ -92,6 +99,46 @@ def _ttl_expired(payload: dict, now: float) -> str:
         return ""
     return _TTL_EXPIRED_REASON if float(now) > expires else ""
 
+
+_PERSONAL_MENTION_KEY = "idea_mention:"
+
+
+def _is_personal_mention(key: str, payload: dict) -> bool:
+    """这条推送是不是「个人提一嘴」（@ 某人的 idea_mention）。
+
+    三样都占才算：key=idea_mention:<id>、push_kind=idea_mention、at_user 非空。
+    群向提一嘴（at_user 为空）和别的推送（哪怕带 at_user）都不算。
+    """
+    body = payload or {}
+    return (str(key or "").startswith(_PERSONAL_MENTION_KEY)
+            and str(body.get("push_kind") or "") == "idea_mention"
+            and bool(str(body.get("at_user") or "").strip()))
+
+
+def _personal_mention_unreviewed(payload: dict) -> str:
+    """个人提一嘴的载荷契约：必须带生产者留下的复核材料；缺了返回作废原因。
+
+    这里**只做结构检查**（不读群、不调模型）：`guard` 得是 dict、uid 与 at_user 一致、
+    `checked_ts` 是正数、`material`（材料指纹）是 dict、`evidence` 是非空列表。
+    生产者（card_push.IdeaMention）入队时把发送前复核的快照放进 `payload["guard"]`；
+    真正的复核由它登记的复核者做，这一条只保证「材料没丢」。
+    """
+    body = payload or {}
+    uid = str(body.get("at_user") or "").strip()
+    guard = body.get("guard")
+    if not isinstance(guard, dict) or str(guard.get("uid") or "").strip() != uid:
+        return "个人提一嘴没有发送前复核材料"
+    try:
+        checked = float(guard.get("checked_ts") or 0.0)
+    except (TypeError, ValueError):
+        return "个人提一嘴的复核材料不对"
+    if checked <= 0 or not isinstance(guard.get("material"), dict):
+        return "个人提一嘴的复核材料不对"
+    evidence = guard.get("evidence")
+    if not isinstance(evidence, list) or not evidence:
+        return "个人提一嘴的复核材料不对"
+    return ""
+
 _API_KEY_RE = re.compile(r"(?i)(api[_-]?key\s*[=:]\s*)\S+")
 _TOKEN_RE = re.compile(r"\b[A-Za-z0-9_\-]{32,}\b")
 
@@ -126,6 +173,9 @@ class Outbox:
         # 发送前新鲜度检查（0.8.0 收口）：生产者自己挂上来，同步、纯代码；
         # 见 add_preflight_hook。generic 发件箱不读群消息、不调模型。
         self._preflight_hooks: list[Any] = []
+        # 个人提一嘴的复核者（2026-10）：只有 card_push.IdeaMention 会登记；**没登记就不发**
+        # 个人提一嘴（见 set_personal_guard / _is_personal_mention），别的 hook 冒充不了。
+        self._personal_guard: Any = None
         # 并发收口（2026-10 复审）：同一实例的 flush 串行（asyncio 锁）；
         # 不同实例 / 跨进程靠 `_claim` 的数据库 CAS（status='pending' 条件）兜底。
         self._flush_lock: Optional[asyncio.Lock] = None
@@ -155,6 +205,18 @@ class Outbox:
         """
         if callable(hook):
             self._preflight_hooks.append(hook)
+
+    def set_personal_guard(self, hook: Any) -> None:
+        """登记「个人提一嘴的发送前复核」（生产者 card_push.IdeaMention 自己挂）。
+
+        同步、纯代码、由它自己读群 / 不调模型；签名同 add_preflight_hook 的 hook：
+        fn(info) -> Optional[str]，返回非空原因 = 作废。
+
+        **个人提一嘴只有在登记了复核者时才会发出去**（载荷契约见 _personal_mention_unreviewed）：
+        没登记（生产者没起来、重启后没接上、旧队列）→ 一律作废，宁可少发一条。
+        别的 preflight hook 不能冒充这一条。
+        """
+        self._personal_guard = hook if callable(hook) else None
 
     def set_group_file_hook(self, hook: Any) -> None:
         """挂群文件上传成功登记回调（fn(group_id, file_id, name, task_id)）。"""
@@ -363,21 +425,49 @@ class Outbox:
         self._set(oid, status="pending", error=f"推迟：{reason}（{why}，5 分钟后再试）",
                   not_before=float(now) + _POSTPONE_RETRY_S, moment=now)
 
+    def _hook_info(self, row: Any, payload: dict, now: float) -> dict:
+        """给发送前 hook 的材料（形状同 add_result_hook 的 info，外加 now）。"""
+        return {
+            "outbox_id": int(row["id"]),
+            "key": str(row["key"]),
+            "group_id": str(row["group_id"]),
+            "kind": str(row["kind"]),
+            "push_kind": str((payload or {}).get("push_kind") or ""),
+            "payload": dict(payload or {}),
+            "task_id": row["task_id"],
+            "now": float(now),
+        }
+
+    def _personal_review_reason(self, row: Any, payload: dict, now: float) -> str:
+        """个人提一嘴发送前的**强制**复核：载荷契约 + 生产者登记的复核者。
+
+        返回非空原因 = 作废；缺材料 / 没复核者 / 复核出错都失败关闭。
+        """
+        unreviewed = _personal_mention_unreviewed(payload)
+        if unreviewed:
+            return unreviewed
+        hook = self._personal_guard
+        if hook is None:
+            return "个人提一嘴没有发送前复核者（生产者没接上）"
+        try:
+            info = self._hook_info(row, payload, now)
+        except Exception:
+            logger.exception("组装个人提一嘴复核材料失败（发件 %s）",
+                             row["id"] if "id" in row.keys() else "?")
+            return "个人提一嘴复核材料拼不出来，作废"
+        try:
+            reason = hook(info)
+        except Exception:
+            logger.exception("个人提一嘴发送前复核出错（key=%s），按不新鲜作废", info["key"])
+            return "个人提一嘴发送前复核出错，作废"
+        return str(reason) if reason else ""
+
     def _preflight(self, row: Any, payload: dict, now: float) -> str:
         """发送前新鲜度检查：返回非空原因 = 作废。hook 出错 → 失败关闭（作废）。"""
         if not self._preflight_hooks or row is None:
             return ""
         try:
-            info = {
-                "outbox_id": int(row["id"]),
-                "key": str(row["key"]),
-                "group_id": str(row["group_id"]),
-                "kind": str(row["kind"]),
-                "push_kind": str((payload or {}).get("push_kind") or ""),
-                "payload": dict(payload or {}),
-                "task_id": row["task_id"],
-                "now": float(now),
-            }
+            info = self._hook_info(row, payload, now)
         except Exception:
             logger.exception("组装发送前检查材料失败（发件 %s），按不新鲜作废",
                              row["id"] if "id" in row.keys() else "?")
@@ -813,6 +903,16 @@ class Outbox:
                 self._fire_result(_row_after(self._store, oid), payload,
                                   outcome="dropped", error=ttl_reason, now=now)
                 continue
+
+            # 个人提一嘴的强制复核（载荷契约 + 生产者登记的复核者）：没材料 / 没复核者 /
+            # 复核不过 → 作废。纯代码、不调模型，放在通用新鲜度检查之前。
+            if _is_personal_mention(str(row["key"]), payload):
+                personal_reason = self._personal_review_reason(row, payload, now)
+                if personal_reason:
+                    self._set(oid, status="dropped", error=f"作废：{personal_reason}", moment=now)
+                    self._fire_result(_row_after(self._store, oid), payload,
+                                      outcome="dropped", error=personal_reason, now=now)
+                    continue
 
             # 生产者自己的新鲜度检查（打开场白：排队期间群里又有人说话 → 作废）。
             stale_reason = self._preflight(row, payload, now)

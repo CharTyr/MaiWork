@@ -32,7 +32,7 @@ import json
 import logging
 from typing import Any, Callable
 
-from . import clock, idea_feasibility, members
+from . import clock, idea_feasibility, idea_guard, members
 from .config import Settings
 from .feeds import (
     _POST_ACCURACY_RULES,
@@ -987,6 +987,13 @@ class Personal:
 
         title = str(idea.get("title") or "").strip()
         if not title:
+            return
+        # 堆积闸（2026-10 用户定，见 idea_guard.py）：个人向构想不占群面构想的位子，以前会
+        # 无限堆积。同一人同时只留 1 条没处理的；每群 7 天新鲜期里最多 3 条；7 天以前的
+        # 旧行不再占位子（绝不永久锁死）。**只读**：不改任何老行（等批准的 pending 不碰）。
+        blocked = idea_guard.personal_idea_block(self._store, gid, uid, clock.now())
+        if blocked:
+            logger.info("个人向构想先不入库（群 %s 人 %s）：%s", gid, uid[:8], blocked)
             return
         since = clock.now() - 30 * 86400.0
         rows = self._store.read().execute(

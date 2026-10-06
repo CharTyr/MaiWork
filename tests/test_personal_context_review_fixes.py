@@ -415,7 +415,7 @@ def _mention_env(tmp_path: Path, *, gid: str = G1, agents: Any = "auto"):
         ready=True,
         replies=[
             json.dumps(
-                {"text": "话说之前那个 FPGA 小板子后来怎么样了？要我帮忙吗？"}, ensure_ascii=False
+                {"text": "我可以帮你把例程理成一页，要不要我来弄？"}, ensure_ascii=False
             )
         ],
     )
