@@ -933,6 +933,12 @@ class TestMemberInteractionsDropped:
             " count INTEGER, PRIMARY KEY (group_id, user_id, day))"
         )
         conn.execute("INSERT INTO member_interactions VALUES ('g1', 'u1', '2026-10-01', 3)")
+        # news_items 从库号 3（_m2）起就有；手造的半截库补一张，
+        # 免得后面追加的迁移（如 _m_news_brief）找不到表
+        conn.execute(
+            "CREATE TABLE news_items (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " group_id TEXT NOT NULL, title TEXT NOT NULL, created REAL NOT NULL DEFAULT 0)"
+        )
         conn.execute("PRAGMA user_version=31")
         conn.commit()
         conn.close()

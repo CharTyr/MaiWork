@@ -1786,6 +1786,10 @@ class Feeds:
         for item in survivors:
             if "reject" not in item and self._scrub_item_text(gid, str(item.get("why") or "")) is None:
                 item["reject"] = ("web", "和群友相关的细节不宜公开，这条不上")
+            # brief 也上群卡片（群友可见）：同样过隐私闸，但不过只把 brief 置空——不拒整条
+            if item.get("brief"):
+                if self._scrub_item_text(gid, str(item["brief"])) is None:
+                    item["brief"] = ""
 
         # ⑥ 第二道（去同质化）：同话题 ≤2、同域名 ≤3、敏感 ≤1、diverse ≤2、总数 ≤ max_items；avg 高者留
         # （2026-10，C01：从写帖之后挪到写帖之前——确定会被名额刷掉的条目不再花写帖/自检的钱；
@@ -2568,9 +2572,9 @@ class Feeds:
                     " url_key, published_ts, score, status_kind, status_at, replies, expires_ts,"
                     " up, down, created, kind, scores, topic, sensitive, profile_ref, rejected,"
                     " reject_gate, reject_reason, body, reason, refs, audience, image_url,"
-                    " keywords, angle, verify, bridge, src_query, src_provider, followup)"
+                    " keywords, angle, verify, bridge, src_query, src_provider, followup, brief)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pool', NULL, 0, ?, 0, 0, ?,"
-                    " ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         batch_id, gid, str(item.get("icon") or "newspaper"), item["title"],
                         item["summary"], str(item.get("why") or ""),
@@ -2596,6 +2600,7 @@ class Feeds:
                         str(item.get("src_query") or "")[:300],
                         str(item.get("src_provider") or "")[:120],
                         json.dumps(item["followup"], ensure_ascii=False) if item.get("followup") else "",
+                        str(item.get("brief") or "")[:140],
                     ),
                 )
                 item["_news_id"] = int(cur.lastrowid or 0)
@@ -4050,6 +4055,7 @@ class Feeds:
             '"duplicate"（同样的事实换个标题 / 换家网站再报）/ "update"（这件事有了新进展：新版本、新数字、'
             '新决定、新结果）/ "context"（补背景、机制、影响，事实本身没变）；无关就给 "unrelated",'
             ' "new_fact": relation 是 update 时必填——一句话说清比上次多了什么事实；说不出就说明它其实是 duplicate，给空字符串,'
+            ' "brief": 发到群里卡片上的短摘要：两三句、60 到 100 个汉字，先说发生了什么 / 讲了什么，再补一两个最关键的事实或数字、影响，不要「XX 报道」「据悉」「本文」这类铺垫，不要重复标题原话，不点名任何群友,'
             ' "dup_in_batch": 如果这条和这批候选里编号比它小的另一条讲的是同一件事/同样的内容，'
             '就回那一条的编号（整数），否则回 null,'
             ' "why": "为什么给这个群（一句话，只说群的事，不许点名任何群友）",'
@@ -4122,6 +4128,8 @@ class Feeds:
             return {
                 "scores": five,
                 "why": str(s.get("why") or "").strip()[:200],
+                # 卡片短摘要：只给群卡片用（网页照旧 summary）；换行变空格、截 80 字
+                "brief": str(s.get("brief") or "").strip().replace("\n", " ")[:140],
                 "icon": icon,
                 "topic": topic,
                 "sensitive": bool(s.get("sensitive", False)),
@@ -4218,7 +4226,7 @@ class Feeds:
                     pub = c.get("published_raw")
                     pub_text = f"，发布于 {pub}" if pub else ""
                     ls.append(
-                        f"[{i}]（{kind_zh}）{c['title']} —— {c['summary'][:150]}（{c['url']}{pub_text}）"
+                        f"[{i}]（{kind_zh}）{c['title']} —— {c['summary'][:300]}（{c['url']}{pub_text}）"
                         + (f" 原文依据：{quote[:150]}" if quote else "")
                     )
                 ls.append("")
@@ -4282,7 +4290,7 @@ class Feeds:
         def _zero_pack() -> dict:
             return {
                 "scores": dict(zero_five),
-                "why": "", "icon": "newspaper", "topic": "", "sensitive": False,
+                "why": "", "brief": "", "icon": "newspaper", "topic": "", "sensitive": False,
                 "profile_ref": "", "bridge": "", "novelty": None, "surprise": None,
             }
 
@@ -4291,6 +4299,7 @@ class Feeds:
                 pack = _zero_pack()
                 item["scores"] = pack["scores"]
                 item.setdefault("why", pack["why"])
+                item.setdefault("brief", pack["brief"])
                 item.setdefault("icon", pack["icon"])
                 item.setdefault("topic", pack["topic"])
                 item.setdefault("sensitive", pack["sensitive"])
@@ -4319,6 +4328,7 @@ class Feeds:
                 pack = _zero_pack()
                 item["scores"] = pack["scores"]
                 item.setdefault("why", pack["why"])
+                item.setdefault("brief", pack["brief"])
                 item.setdefault("icon", pack["icon"])
                 item.setdefault("topic", pack["topic"])
                 item.setdefault("sensitive", pack["sensitive"])
@@ -4333,6 +4343,7 @@ class Feeds:
                 continue
             item["scores"] = s["scores"]
             item["why"] = s["why"]
+            item["brief"] = s["brief"]
             item["icon"] = s["icon"]
             item["topic"] = s["topic"]
             item["sensitive"] = s["sensitive"]

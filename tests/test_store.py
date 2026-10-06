@@ -114,6 +114,12 @@ class TestIdeaOriginMigration:
         conn.execute(
             "INSERT INTO ideas (group_id, title, created, updated) VALUES ('g1', '老构想', 0, 0)"
         )
+        # news_items 从库号 3（_m2）起就有；这里手造的半截库补一张，免得后面
+        # 追加的迁移（如 _m_news_brief）找不到表
+        conn.execute(
+            "CREATE TABLE news_items (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " group_id TEXT NOT NULL, title TEXT NOT NULL, created REAL NOT NULL DEFAULT 0)"
+        )
         # 停在「该跑 _m_idea_origin 了」的前一步
         conn.execute(f"PRAGMA user_version={store_mod._MIGRATIONS.index(store_mod._m_idea_origin)}")
         conn.commit()
@@ -244,6 +250,11 @@ def test_chat_feeds_table_dropped_on_fresh_and_legacy(tmp_path) -> None:
         said_text TEXT NOT NULL DEFAULT ''
     );
     """)
+    # news_items 从库号 3（_m2）起就有；手造的半截库补一张，免得追加的迁移找不到表
+    pre.execute(
+        "CREATE TABLE IF NOT EXISTS news_items (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " group_id TEXT NOT NULL, title TEXT NOT NULL, created REAL NOT NULL DEFAULT 0)"
+    )
     # 停在需要连跑 _m_drop_member_interactions 和 _m_drop_chat_feeds 两个的版本
     pre.execute(f"PRAGMA user_version={_MIGRATIONS.index(_m_drop_member_interactions)}")
     pre.commit()

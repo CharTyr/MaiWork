@@ -790,6 +790,14 @@ def _m_news_followup(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE news_items ADD COLUMN followup TEXT NOT NULL DEFAULT ''")
 
 
+def _m_news_brief(conn: sqlite3.Connection) -> None:
+    """卡片短摘要（2026-10）：发到 QQ 群的资讯卡片图上用的一两句话（30–60 汉字），
+    代替群里放不下的长 summary；网页照旧用 summary。老行 / 模型没给 = 空串。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(news_items)")}
+    if "brief" not in cols:
+        conn.execute("ALTER TABLE news_items ADD COLUMN brief TEXT NOT NULL DEFAULT ''")
+
+
 # 资讯卡片 / 构想提一嘴（card_push.py）：每批资讯至多一张卡片（batch_id 唯一），
 # 每个构想至多提一次（idea_id 唯一）；status pending/sending/sent/failed/uncertain/dropped
 def _m_card_push(conn: sqlite3.Connection) -> None:
@@ -1025,7 +1033,7 @@ def _m_task_lanes(conn: sqlite3.Connection) -> None:
 
 
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief]
 
 
 class Store:

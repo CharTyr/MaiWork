@@ -73,7 +73,7 @@ class TestStore:
     def test_migration_adds_task_lanes(self, store: Store) -> None:
         names = {r[0] for r in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert "task_lanes" in names
-        assert int(store._conn.execute("PRAGMA user_version").fetchone()[0]) == 35
+        assert int(store._conn.execute("PRAGMA user_version").fetchone()[0]) == 36
 
     def test_save_then_load_roundtrip(self, tasks: Tasks, lanes: TaskLanes) -> None:
         tid = _running_task(tasks)

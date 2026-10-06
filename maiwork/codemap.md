@@ -146,7 +146,9 @@ MaiWork 插件（`chartyr.maiwork`）的运行时主体：一个和 MaiBot 并�
 | `news_recheck.py` | 「补打开」子 agent：没真打开过的候选重新打开核对（drop/stale/重写摘要）；2026-10-05 起 `from_rss` 的条目不再跳过（排最前，总量照旧 `_RECHECK_CAP`=8 封顶），交回后模型没日期时用 `page_date` 读到的补上 |
 | `news_rating.py` | 群友评价资讯（理由+一句话；汇总进下一轮找资讯提示词） |
 | `news_viz.py` | 资讯图解：挑数据多的资讯让子 agent 写纯 CSS HTML 小图（程序严格校验） |
-| `news_card.py` | 资讯卡片 HTML/PNG 渲染（playwright 截图；cover 配图补齐） |
+| `news_card.py` | 资讯卡片 HTML/PNG 渲染（playwright 截图；cover 配图补齐并过 `cover_filter`，统一比例画框 + 同图模糊垫底，`cover_tint` 取主色给每条配色；每条只放 brief / `short_summary`，「值得看」只放头条；末尾本群网页二维码） |
+| `cover_filter.py` | 封面挑拣：`judge(im, url)` 认地址像 logo / 平涂图 / 纯色底带字横幅 → 不用（只用 Pillow，从不抛） |
+| `qr.py` | 自带纯 Python 二维码编码器（移植 Nayuki qrcodegen，MIT）：`matrix` / `svg_data_uri` |
 | `card_push.py` | 往群里发的两种小推送（0.8.0 起设置转发 `group_push`、**只 enqueue 进发件箱**、真发出由结果 hook 回写）：资讯卡片（CardPush；没封面但有图解的条目把图解截图画进卡片；`prune_card_cache` 每日清 7 天前的旧卡片图）/ 构想提一嘴（IdeaMention：SOUL 口吻说清具体动作/交付物并问许可；`_write` 用 title/body/step/items/feasibility，不传 basis；`_wording_bad` 检查隐私/广告/冒称已查证/状态追问，`_concrete_action` + `_template` 从安全动作兜底，空材料直接 dropped；个人建议复核和冷却仍照旧），每群开关默认关；Telegram 没有真 @ 段，发消息带 `at_name` 让 @ 退成正文名字 |
 | `update_check.py` | 查 GitHub 最新版本提醒（只提醒不自动更新） |
 

@@ -763,6 +763,28 @@ async def test_card_push_enqueues_image_then_hook_settles(tmp_path):
     assert json.loads(card["item_ids"]) == ids[:2]
 
 
+async def test_card_data_carries_brief(tmp_path):
+    """2026-10-06：卡片上用短摘要 brief——card_push 交给渲染器的每条都带 brief（老资讯为空串）。"""
+    world = _make(tmp_path)
+    seen = []
+
+    async def renderer(data):
+        seen.append(data)
+        return PNG
+
+    cp = card_push.CardPush(world.store, world.host, world.pushes, world.mentions,
+                            lambda: world.settings, renderer=renderer, outbox=world.ob)
+    _enable_card(world, news_card_count=2)
+    bid, ids = _batch(world)
+    with world.store.tx() as conn:
+        conn.execute("UPDATE news_items SET brief='一句话短摘要。' WHERE id=?", (ids[0],))
+    assert cp.scan(GID, NOON + 60) == 1
+    await cp.flush(GID, NOON + 60)
+    items = seen[0]["items"]
+    assert items[0]["brief"] == "一句话短摘要。"
+    assert items[1]["brief"] == ""
+
+
 async def test_card_image_render_cached_once_across_retry(tmp_path):
     """画一次图落盘缓存：发送失败重试用的是同一个文件，不重画。"""
     world = _make(tmp_path)

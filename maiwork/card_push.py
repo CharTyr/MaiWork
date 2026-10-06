@@ -382,6 +382,8 @@ class CardPush:
                 kws = []
             items.append({
                 "title": members.render(self._store, gid, r["title"]),
+                # 卡片上只放一两句短摘要（2026-10-06 用户定）；老资讯没有 brief，news_card 从 summary 截
+                "brief": members.render(self._store, gid, r["brief"] if "brief" in r.keys() else ""),
                 "summary": members.render(self._store, gid, r["summary"]),
                 "why": members.render(self._store, gid, r["why"]),
                 "site": str(src.get("site") or ""),

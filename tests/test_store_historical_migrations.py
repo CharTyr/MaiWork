@@ -79,7 +79,7 @@ CREATE INDEX IF NOT EXISTS idx_chat_feeds_key ON chat_feeds(group_id, key);
 
 STEP_PROFILE = 2      # _m_profile
 STEP_CHAT_FEEDS = 31  # _m_chat_feeds
-LATEST = len(_MIGRATIONS)  # 34
+LATEST = len(_MIGRATIONS)  # 36（34 = 历史步骤 + 35 task_lanes + 36 news_items.brief）
 
 _DEAD_MODULE = "CharTyr_MaiWork.maiwork.chat_feed"
 
@@ -217,14 +217,17 @@ class TestStep31ChatFeedsHistory:
 
 
 # ----------------------------------------------------------------------
-# 全量迁移：库号 35（34 之后加 task_lanes），两张历史表由追加的 DROP 步骤收尾
+# 全量迁移：库号 36（34 之后加 task_lanes、36 加 news_items.brief），
+# 两张历史表由追加的 DROP 步骤收尾
 # ----------------------------------------------------------------------
 
 class TestFullMigrate:
-    def test_latest_version_is_35(self) -> None:
-        # 34 = 历史步骤恢复原样后的库号；35 = 任务双岗协作的 task_lanes（docs/20）
-        assert LATEST == 35, "库号只因 docs/20 新增 task_lanes 一步"
+    def test_latest_version_is_36(self) -> None:
+        # 34 = 历史步骤恢复原样后的库号；35 = 任务双岗协作的 task_lanes（docs/20）；
+        # 36 = 资讯卡片短摘要 brief（news_items.brief）
+        assert LATEST == 36, "库号只因 docs/20 task_lanes 和 news_items.brief 各加一步"
         assert store_mod._MIGRATIONS[34].__name__ == "_m_task_lanes"
+        assert store_mod._MIGRATIONS[35].__name__ == "_m_news_brief"
 
     def test_fresh_db_has_no_history_tables_at_34(self, store: Store) -> None:
         """新库一路迁到最新：两张历史表建了又被后面的 DROP 拆掉，终态干净。"""
@@ -333,12 +336,15 @@ class TestStockV31Upgrade:
             s.close()
 
     def test_drop_does_not_touch_news_tables(self, tmp_path: Path) -> None:
-        """DROP 只拆两张历史表：news_items 的结构和行数都不动。"""
+        """DROP 只拆两张历史表：news_items 的老列一列不丢、顺序不变、行数不动
+        （后追加的步骤只许往后挂新列，如库号 36 的 brief）。"""
         s = self._stock_v31(tmp_path / "stock.db")
         try:
             before_cols = _columns(s, "news_items")
             s.migrate()
-            assert _columns(s, "news_items") == before_cols
+            after_cols = _columns(s, "news_items")
+            assert after_cols[: len(before_cols)] == before_cols
+            assert [c[0] for c in after_cols[len(before_cols):]] == ["brief"]
             assert s.read().execute("SELECT COUNT(*) FROM news_items").fetchone()[0] == 1
         finally:
             s.close()
