@@ -188,7 +188,8 @@ class _Goals:
         self._rows[str(goal_id)]["criteria"] = json.dumps(
             [{"text": t, "done": False} for t in texts], ensure_ascii=False)
 
-    def set_criterion(self, goal_id, idx, done):
+    def set_criterion(self, goal_id, idx, done, **kwargs):
+        # docs/22 §5 C：勾上时可以带 evidence / task_id / ts（假对象只记事件与 done）
         self.events.append(("set_criterion", str(goal_id), int(idx), bool(done)))
         crit_s = self._rows[str(goal_id)].get("criteria")
         if isinstance(crit_s, str):
@@ -638,11 +639,22 @@ class TestGoalCheck:
                            criteria=json.dumps([{"text": "a", "done": True},
                                                 {"text": "b", "done": True},
                                                 {"text": "c", "done": False}], ensure_ascii=False))
+        # docs/22 §5 C：打勾要证据——群里真发生的那句话就是证据（群聊片段匹配）
+        with store.tx() as conn:
+            conn.execute(
+                "INSERT INTO chat_log (text, group_id, message_id, ts, user_id, user_name)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                ("三条标准都做完了", G1, "gm-hg1", clock.now() - 60, "gu1", "阿柒"),
+            )
         tasks = _Tasks()
         workers = FakeWorkersQueue()
         models = _ModelsOK({
             "coordinator.check_goal": json.dumps({
-                "done_criteria": [0, 1, 2], "next_check_hours": 24,
+                "done_criteria": [
+                    {"index": i, "task_id": None, "evidence": "阿柒：三条标准都做完了"}
+                    for i in range(3)
+                ],
+                "next_check_hours": 24,
                 "progress": "三件事都完成了", "new_task": None, "report": "已打磨完",
             }, ensure_ascii=False),
         })

@@ -111,6 +111,42 @@ def register_exec_tools(
             error=f"这是别的任务的文件，和本任务无关，不能读写；你的成品目录是 {scope_text}",
         )
 
+    # ------------------------------------------------------------------
+    # 各步骤分文件夹（docs/22 §4 C）：write_scope 非空时，artifacts/ 下的写必须落在
+    # 写范围内；`artifacts/<任务>/steps/<步号>/` 只许对应那一步写。读不受它管。
+    # ------------------------------------------------------------------
+
+    def _write_denied(ctx: ToolContext, rel: str) -> str:
+        """返回拒绝原因（"" = 允许写）。只管道 artifacts/ 下的路径。"""
+        scope = _norm_scope(getattr(ctx, "write_scope", None))
+        if not scope:
+            return ""
+        cand = Path(str(rel or ""))
+        if cand.is_absolute():
+            return ""  # 绝对路径交给 env.resolve 去拒
+        parts = [p for p in cand.parts if p not in ("", ".")]
+        if not parts or parts[0].lower() != "artifacts" or len(parts) < 2:
+            return ""
+        allowed = [s.split("/") for s in scope]
+        if not any(parts[: len(a)] == a for a in allowed):
+            dirs = "、".join(f"{s}/" for s in scope)
+            return (
+                f"这一步只能写 {dirs}（中间步骤各写各的文件夹，"
+                "不能写交付成品的位置）"
+            )
+        if len(parts) >= 4 and parts[2] == "steps":
+            # steps/<步号>/ 只许对应那一步写：交付步骤（写范围是任务目录）写不了别人的步骤目录
+            own = "/".join(parts[:4])
+            if not any("/".join(a) == own or "/".join(a).startswith(own + "/") for a in allowed):
+                return (
+                    f"artifacts/{parts[1]}/steps/{parts[3]}/ 是别的步骤的文件夹，不能写"
+                    "（各步骤各写各的）"
+                )
+        return ""
+
+    def _write_scope_error(reason: str) -> ToolResult:
+        return ToolResult(ok=False, output="", error=reason)
+
     def _entry_out_of_scope(ctx: ToolContext, path: str, listed_under: str) -> bool:
         """目录清单里这一条要不要滤掉（不报错，只是不给看别的任务的目录）。"""
         scope = _norm_scope(getattr(ctx, "artifact_scope", None))
@@ -173,6 +209,9 @@ def register_exec_tools(
         refused, scope_text = _scope_other_artifacts(ctx, rel)
         if refused:
             return _scope_error(scope_text)
+        denied = _write_denied(ctx, rel)
+        if denied:
+            return _write_scope_error(denied)
         try:
             await env.write_file(ctx.workspace.name, rel, str(content), append=append)
         except PermissionError as e:

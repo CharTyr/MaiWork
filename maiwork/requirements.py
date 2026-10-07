@@ -1,0 +1,253 @@
+"""requirements.py（docs/22 §3.1–§3.2 第一期）：需求清单 + 逐条判定算结果。
+
+代码管流程、模型干活。这里只有纯函数和 kv 读写，不调模型、不碰宿主、不发消息：
+
+- `normalize_requirements(raw, req_text)`：把主模型给的 `requirements` 列表收拾干净——
+  去空白截 60 字、空的丢掉、最多 6 条（不含底线）、`origin` / `kind` 只认固定几个值
+  （写错 / 没写一律当**严**的那一档，防止模型把原话要求偷偷标成可选）；
+  一条「原话」都没有 → 代码自动补一条「按原话完成：<原话前 50 字>」；最后永远追加底线 R0。
+  id 由代码按顺序编 R1..Rn（底线固定 R0），不信模型给的 id。
+- `is_blocking(item)`：必须项 = `原话` + `底线`；加分项 = `补充`。
+- `criteria_texts(items)`：给网页 / 任务 criteria 用的文本（去掉底线，补充项标「（加分项）」）。
+- `judge(items, verdicts)`：**代码算过没过**。一条算「做到」必须 `met is True` 且给了证据
+  （去空白后 ≥2 字）；模型漏判某条必须项 = 没做到。模型自己给的 `pass` 只作参考。
+- `human_unmet(judgement, verdicts)`（第三期 §5 A）：没做到的必须项里带 `needs_human`
+  （去空白后 ≥ `NEEDS_HUMAN_MIN`=6 字）的那些——「需要真人参与、材料已备好」的出口。
+- `load` / `save`：清单锁在 kv `task.requirements.<任务ID>`，带需求版本号——同一版需求
+  之后的每轮计划都不许改它，只有群友改了需求（版本号变）才重新拆。不加表、不迁库。
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from . import clock
+
+logger = logging.getLogger("maiwork.requirements")
+
+MAX_ITEMS = 6          # 最多 6 条（不含底线 R0）
+TEXT_MAX = 60          # 每条要求 ≤60 字
+REQ_TEXT_MAX = 50      # 自动补的「按原话完成：」取原话前 50 字
+EVIDENCE_MIN = 2       # 证据去空白后至少这么长才算给了证据
+NEEDS_HUMAN_MIN = 6    # needs_human 去空白后至少这么长才算「写清了要谁做什么」（docs/22 §5 A）
+FLOOR_ID = "R0"
+FLOOR_TEXT = "内容真实、不编造；交付物能正常打开"
+ORIGIN_ORIGINAL = "原话"
+ORIGIN_BONUS = "补充"
+ORIGIN_FLOOR = "底线"
+_ORIGINS = (ORIGIN_ORIGINAL, ORIGIN_BONUS)
+KIND_STRICT = "按原话"
+_KINDS = ("实做", "文稿", "真人")
+
+WHY_NOT_MET = "判定没做到"
+WHY_NO_EVIDENCE = "没给证据"
+WHY_NOT_JUDGED = "验收没判这一条"
+
+
+def _clean_text(value: Any, limit: int) -> str:
+    """折叠空白后截断（模型爱写换行 / 连续空格）。"""
+    return " ".join(str(value or "").split())[:limit]
+
+
+def normalize_requirements(raw: Any, req_text: Any) -> list[dict]:
+    """把模型给的需求列表收拾成锁定的清单（纯函数，任何输入都不抛）。"""
+    items: list[dict] = []
+    if isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            text = _clean_text(entry.get("text"), TEXT_MAX)
+            if not text:
+                continue
+            origin = str(entry.get("origin") or "").strip()
+            if origin not in _ORIGINS:
+                # 写错 / 没写 → 当「原话」（宁严勿松）
+                origin = ORIGIN_ORIGINAL
+            kind = str(entry.get("kind") or "").strip()
+            if kind not in _KINDS:
+                kind = KIND_STRICT
+            items.append({"text": text, "origin": origin, "kind": kind})
+            if len(items) >= MAX_ITEMS:
+                break
+    if not any(i["origin"] == ORIGIN_ORIGINAL for i in items):
+        # 模型一条原话都没标（或没给）→ 代码自动补，防「原话要求被整份漏掉」
+        fallback = _clean_text(req_text, REQ_TEXT_MAX)
+        items.insert(0, {
+            "text": "按原话完成：" + fallback,
+            "origin": ORIGIN_ORIGINAL,
+            "kind": KIND_STRICT,
+        })
+        items = items[:MAX_ITEMS]
+    out: list[dict] = []
+    for i, item in enumerate(items, start=1):
+        out.append({
+            "id": f"R{i}",
+            "text": item["text"],
+            "origin": item["origin"],
+            "kind": item["kind"],
+        })
+    out.append({
+        "id": FLOOR_ID,
+        "text": FLOOR_TEXT,
+        "origin": ORIGIN_FLOOR,
+        "kind": ORIGIN_FLOOR,
+    })
+    return out
+
+
+def is_blocking(item: Any) -> bool:
+    """必须项 = 原话 + 底线；补充是加分项。"""
+    if not isinstance(item, dict):
+        return False
+    return str(item.get("origin") or "") in (ORIGIN_ORIGINAL, ORIGIN_FLOOR)
+
+
+def prompt_line(item: Any) -> str:
+    """提示词里的一行：`R1【原话·实做】把投票发起来`；补充项标「（加分项）」。"""
+    if not isinstance(item, dict):
+        return ""
+    text = str(item.get("text") or "")
+    if str(item.get("origin") or "") == ORIGIN_BONUS:
+        text += "（加分项）"
+    return f"{item.get('id')}【{item.get('origin')}·{item.get('kind')}】{text}"
+
+
+def criteria_texts(items: Any) -> list[str]:
+    """给网页 / tasks.criteria 的文本：去掉底线，补充项标「（加分项）」。"""
+    out: list[str] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("id") or "") == FLOOR_ID or str(item.get("origin") or "") == ORIGIN_FLOOR:
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        if str(item.get("origin") or "") == ORIGIN_BONUS:
+            text += "（加分项）"
+        out.append(text)
+    return out
+
+
+def judge(items: Any, verdicts: Any) -> dict:
+    """代码按规则算过没过（模型的 pass 不参与）。
+
+    返回 {"pass", "unmet_blocking", "unmet_bonus", "met"}；
+    `why` ∈ {"判定没做到", "没给证据", "验收没判这一条"}。
+    """
+    by_id: dict[str, dict] = {}
+    if isinstance(verdicts, list):
+        for v in verdicts:
+            if not isinstance(v, dict):
+                continue
+            vid = v.get("id")
+            if isinstance(vid, bool) or not isinstance(vid, str):
+                continue
+            key = vid.strip()
+            if not key or key in by_id:
+                continue
+            by_id[key] = v
+    met: list[str] = []
+    unmet_blocking: list[dict] = []
+    unmet_bonus: list[dict] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        iid = str(item.get("id") or "")
+        text = str(item.get("text") or "")
+        verdict = by_id.get(iid)
+        if verdict is None:
+            ok, why = False, WHY_NOT_JUDGED
+        elif verdict.get("met") is not True:
+            ok, why = False, WHY_NOT_MET
+        elif len(str(verdict.get("evidence") or "").strip()) < EVIDENCE_MIN:
+            # met=true 但没给证据 = 没做到（只拿一句「做了」不算数）
+            ok, why = False, WHY_NO_EVIDENCE
+        else:
+            ok, why = True, ""
+        if ok:
+            met.append(iid)
+        elif is_blocking(item):
+            unmet_blocking.append({"id": iid, "text": text, "why": why})
+        else:
+            unmet_bonus.append({"id": iid, "text": text, "why": why})
+    return {
+        "pass": not unmet_blocking,
+        "unmet_blocking": unmet_blocking,
+        "unmet_bonus": unmet_bonus,
+        "met": met,
+    }
+
+
+def human_unmet(judgement: Any, verdicts: Any) -> list[dict]:
+    """docs/22 §5 A：没做到的必须项里，哪些带 `needs_human`（需要真人参与）且写清了。
+
+    和 `judge` / coordinator 的 `_blocked_items` 同构：只认**没做到的必须项**；`needs_human`
+    去空白后至少 `NEEDS_HUMAN_MIN` 个字才算（写清了「要谁做什么、做完怎么告诉我」）。
+    返回 `[{"id", "text", "needs_human"}]`。
+    """
+    by_id: dict[str, dict] = {}
+    for v in verdicts if isinstance(verdicts, list) else []:
+        if not isinstance(v, dict):
+            continue
+        key = str(v.get("id") or "").strip()
+        if key and key not in by_id:
+            by_id[key] = v
+    out: list[dict] = []
+    for item in (judgement or {}).get("unmet_blocking") or []:
+        if not isinstance(item, dict):
+            continue
+        iid = str(item.get("id") or "")
+        verdict = by_id.get(iid) or {}
+        need = " ".join(str(verdict.get("needs_human") or "").split())
+        if len(need) < NEEDS_HUMAN_MIN:
+            continue
+        out.append({
+            "id": iid,
+            "text": str(item.get("text") or ""),
+            "needs_human": need[:200],
+        })
+    return out
+
+
+def kv_key(task_id: Any) -> str:
+    return f"task.requirements.{task_id}"
+
+
+def load(store: Any, task_id: Any, req_version: Any) -> list[dict] | None:
+    """读当前版本锁定的清单；没存过 / 版本对不上 / 坏数据 → None（= 还没锁）。"""
+    try:
+        saved = store.kv_get(kv_key(task_id))
+    except Exception:
+        logger.exception("读需求清单失败（任务 %s）", task_id)
+        return None
+    if not isinstance(saved, dict):
+        return None
+    try:
+        if int(saved.get("req_version")) != int(req_version):
+            return None
+    except (TypeError, ValueError):
+        return None
+    items = saved.get("items")
+    if not isinstance(items, list) or not items:
+        return None
+    got = [i for i in items if isinstance(i, dict)]
+    return got or None  # 整份都是坏数据 → 当没锁（下一轮重新拆）
+
+
+def save(store: Any, task_id: Any, req_version: Any, items: list[dict]) -> None:
+    """锁定这一版需求的清单（kv，带版本号）；出错只记日志，不打断任务。"""
+    try:
+        with store.tx() as conn:
+            store.kv_set(
+                conn,
+                kv_key(task_id),
+                {
+                    "req_version": int(req_version),
+                    "items": list(items or []),
+                    "ts": clock.now(),
+                },
+            )
+    except Exception:
+        logger.exception("存需求清单失败（任务 %s）", task_id)

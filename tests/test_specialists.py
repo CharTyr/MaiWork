@@ -224,7 +224,7 @@ class FakeWorkers:
 
     async def run(self, brief, *, group_id, tools, task_id="", actor="子 agent #1",
                   max_steps=0, output_schema=None, workspace=None, skills_hint=None,
-                  system_extra="", deadline_ts=None, artifact_scope=None,
+                  system_extra="", deadline_ts=None, artifact_scope=None, write_scope=None,
                   agent_type="task", allowed_tools=None, allowed_skills=None, used_tools=None):
         self.calls.append(
             WorkersCall(

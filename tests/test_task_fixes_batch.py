@@ -77,7 +77,8 @@ class FakeWorkers:
         self.before_return = None
 
     async def run(self, brief, *, group_id, tools, task_id="", actor="", max_steps=12,
-                  output_schema=None, workspace=None, system_extra="", artifact_scope=None):
+                  output_schema=None, workspace=None, system_extra="", artifact_scope=None,
+                  write_scope=None):
         import asyncio as _aio
         self.calls.append({"brief": brief, "tools": list(tools), "task_id": task_id})
         if self.before_return is not None:
@@ -260,7 +261,8 @@ async def test_review_inconclusive_retries_then_requeues(
         "SELECT n, status, review FROM attempts WHERE task_id=? ORDER BY n", (tid,)
     ).fetchall()
     assert len(rows) == 2
-    assert rows[0]["status"] == "failed"
+    # docs/22 §3.3：验收没结论记 inconclusive（不是 failed），不算打回、但仍占一次尝试
+    assert rows[0]["status"] == "inconclusive"
     assert "没给结论" in rows[0]["review"]
     assert rows[1]["status"] == "passed"
 
@@ -325,6 +327,11 @@ async def test_review_inconclusive_exhausts_attempts_marks_failed(
     )
     await coordinator.run_task(tid)
     assert tasks.get(tid)["status"] == "failed"
+    # 三次尝试都记 inconclusive（没结论不当打回，但次数照样用完）
+    rows = mem_store.read().execute(
+        "SELECT status FROM attempts WHERE task_id=? ORDER BY n", (tid,)
+    ).fetchall()
+    assert [r["status"] for r in rows] == ["inconclusive", "inconclusive", "inconclusive"]
     # 「没做成」固定话发到群里（和验收不通过同一路径），不是 error 故障推送
     fail_msgs = [e for e in outbox.enqueued
                  if e["kind"] == "text" and "没做成" in str(e["payload"].get("text") or "")]

@@ -93,8 +93,17 @@ class ToolContext:
     agent_type: str = "task"
     allowed_tools: tuple[str, ...] | None = None
     allowed_skills: tuple[str, ...] | None = None
+    # 各步骤分文件夹（docs/22 §4 C，2026-10-07 本地）：**写**文件的范围（工作区相对目录，
+    # 如 ("artifacts/T-4/steps/1",)）。None / 空 = 不限制写（管理员对话、资讯等老调用方）。
+    # 只管 artifacts/ 下的写：路径要落在写范围里，且 `artifacts/<任务>/steps/<步号>/`
+    # 只许对应那一步写（交付步骤写不了别人的步骤目录）。读不受它管（读仍按 artifact_scope）。
+    write_scope: tuple[str, ...] | None = None
     # 每次执行独有的可信遥测，不从模型参数读取；只记真正派发的工具。
     used_tools: set[str] | None = None
+    # 调用前的闸（docs/22 §4 F 止损用，workers 注入）：callable(name, args) -> ToolResult | None。
+    # 返回 ToolResult 就短路（不调 handler），但仍然照常落一条 tool_calls（可审计）；
+    # 返回 None / 不是 ToolResult → 正常派发。别的作用域（主模型 / 管理员）不传 = 不启用。
+    call_gate: Any = None
 
     def effective_role(self) -> str:
         """这个上下文实际算哪个角色（role 优先，空则看 actor）。工具 handler 里也用它。"""
@@ -291,6 +300,17 @@ class Tools:
         used_tools = getattr(ctx, "used_tools", None)
         if isinstance(used_tools, set) and name != "submit_result":
             used_tools.add(name)
+        # 调用前的闸（可选，workers 止损用）：短路也照常落一条 tool_calls（可审计）。
+        gate = getattr(ctx, "call_gate", None)
+        if callable(gate):
+            try:
+                blocked = gate(name, args)
+            except Exception:
+                logger.exception("调用前闸出错（%s），按不拦处理", name)
+                blocked = None
+            if isinstance(blocked, ToolResult):
+                self._persist(name, args, blocked, ctx, start)
+                return blocked
         try:
             result = await asyncio.wait_for(tool.handler(ctx, args), timeout=timeout)
         except asyncio.TimeoutError:

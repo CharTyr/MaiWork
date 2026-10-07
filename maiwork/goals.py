@@ -24,6 +24,46 @@ _REPEAT_UNTIL_S = 30 * 86400
 _RENEW_BEFORE_S = 1 * 86400
 _DONE_KEEP_S = 3 * 86400
 
+# docs/22 §5 C（2026-10-07 本地）：目标打勾要证据——evidence 引用本次提示给出的群聊行时，
+# 去空白后连续这么多字相同才算「群里真发生了」。criteria 里存的 evidence 上限。
+GOAL_EVIDENCE_MIN = 8
+GOAL_EVIDENCE_MAX = 200
+
+
+def _chat_line_body(line: Any) -> str:
+    """群聊提示行「- 谁：正文」→ 正文（没有冒号就整行）。"""
+    text = str(line or "").strip()
+    if text.startswith("-"):
+        text = text[1:].strip()
+    for sep in ("：", ":"):
+        if sep in text:
+            return text.split(sep, 1)[1]
+    return text
+
+
+def chat_evidence_match(evidence: Any, chat_lines: Any, *, min_len: int = GOAL_EVIDENCE_MIN) -> bool:
+    """docs/22 §5 C：(b) 证据里含有本次提示给出的群聊行正文片段（去空白后连续 ≥8 字）。
+
+    纯函数、可单测：不看任务、不改状态。`chat_lines` 是 `_goal_chat_lines` 的输出
+    （每条形如「- 谁：正文」），比对前把两边空白全去掉。
+    """
+    ev = "".join(str(evidence or "").split())
+    if not ev:
+        return False
+    try:
+        n = max(1, int(min_len))
+    except (TypeError, ValueError):
+        n = GOAL_EVIDENCE_MIN
+    for line in chat_lines if isinstance(chat_lines, (list, tuple)) else []:
+        body = "".join(_chat_line_body(line).split())
+        if len(body) < n:
+            continue
+        for i in range(len(body) - n + 1):
+            if body[i:i + n] in ev:
+                return True
+    return False
+
+
 _AGENT_STATES = ("active", "paused", "done", "cancelled")
 _ALLOWED_STATE_CHANGES = {
     "active": frozenset({"paused", "done", "cancelled"}),
@@ -279,7 +319,16 @@ class Goals:
                 raise KeyError(f"目标不存在: {goal_id}")
         return crit
 
-    def set_criterion(self, goal_id: str, index: int, done: bool) -> None:
+    def set_criterion(
+        self, goal_id: str, index: int, done: bool, *,
+        evidence: str | None = None, task_id: str | None = None, ts: float | None = None,
+    ) -> None:
+        """勾 / 取消一条完成标准。
+
+        docs/22 §5 C（2026-10-07 本地）：打勾要证据——传了 evidence / task_id / ts 时
+        一并写进这条 criterion（`evidence` 折叠空白截 200 字、`task_id` 可空、`ts` 默认现在），
+        旧调用（只传 done）行为一字不差。
+        """
         with self._store.tx() as conn:
             row = conn.execute("SELECT criteria FROM goals WHERE id=?", (str(goal_id),)).fetchone()
             if row is None:
@@ -294,6 +343,10 @@ class Goals:
                 raise IndexError(f"目标 {goal_id} 没有第 {index} 条完成标准")
             item = dict(crit[index])
             item["done"] = bool(done)
+            if evidence is not None or task_id is not None or ts is not None:
+                item["evidence"] = " ".join(str(evidence or "").split())[:GOAL_EVIDENCE_MAX]
+                item["task_id"] = (str(task_id) if task_id else None)
+                item["ts"] = float(ts) if ts is not None else clock.now()
             crit[index] = item
             conn.execute(
                 "UPDATE goals SET criteria=?, updated=? WHERE id=?",

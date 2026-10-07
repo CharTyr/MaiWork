@@ -11,6 +11,15 @@
   不发陈旧的）、睡觉时段与每日总上限（group_push 一份数据，**按这个群**那份算；
   读不到就只延 5 分钟再试，绝不按默认钟点误停到明天）。失败不占额度、不算已发；
   结果不明（uncertain）安全保留额度，网页视图也绝不写成「已发」。
+- 推迟时**一次算到「下一次能发」的时刻**（2026-10-06 本地修复，未部署）：额度用完 =
+  次日 00:00，若那一刻仍落在本群 quiet 里就接着移到那段 quiet 结束（跨夜 / 同日区间
+  都对）——线上 #58 / #59 是「19 点排到次日 00:00 → 又撞静默 → 再排 07:00」两趟，
+  而卡片 TTL 06:59，要拖到 07:00 才被发现过期。算出的发送时刻**严格晚于**
+  payload.expires_ts（与发送前判定同口径：now > expires 才算过期）→ 当场作废
+  （dropped）并如实通知生产者：**不延长 TTL、不提高额度、不改旧记录**；没有有效期的
+  载荷（任务交付等）不受影响。读不到那份设置 / 认不出原因 → 只延 5 分钟再试，
+  绝不用猜出来的次日钟点提前作废；这 5 分钟只做**有界检查**（下一次 flush 最早也在
+  之后，那时已经过期才作废）。延期 / 作废都留一条不含载荷内容的日志 + events。
 - 自动消息（开场白 / 资讯卡片 / 构想提一嘴）的载荷带 `expires_ts`：过了期限还没发出去
   的那条直接作废，不把陈旧内容发进群。生产者还能挂 `add_preflight_hook`（同步、纯代码、
   generic 发件箱不替它读群 / 不调模型）做发送前新鲜度复核：开场白排队 / 重试期间群里又
@@ -66,6 +75,12 @@ _RETRY_SAFE_KINDS = frozenset(("text", "image"))
 _MAX_ATTEMPTS = 2
 _RETRY_DELAY_S = 300.0
 _DROP_REASON = "开关已关"
+# Pushes.can_push 给的两个推迟原因（额度按北京日期次日 00:00 恢复；睡觉时段按本群 quiet）
+_QUOTA_REASON = "今天推够了"
+_QUIET_REASON = "睡觉时段"
+# 延期 / 作废的安全留痕（events.kind）：只有原因和目标时刻，绝不含载荷内容
+_EVENT_POSTPONE = "outbox.postpone"
+_EVENT_TTL_DROP = "outbox.ttl_drop"
 # 读不到本群那份设置时的推迟步长（秒）：只延 5 分钟再试，绝不按默认钟点误停到明天
 _POSTPONE_RETRY_S = 300.0
 # 自动消息过了 payload.expires_ts 还没发出去 → 作废（不发陈旧内容）
@@ -86,18 +101,59 @@ def _is_artifact_outbox_row(kind: str, key: str) -> bool:
             or (kind == "text" and key.endswith(":deliver:text")))
 
 
-def _ttl_expired(payload: dict, now: float) -> str:
-    """自动消息的 payload.expires_ts 过了吗；过了返回作废原因（没有期限 → ""）。"""
+def _expires_ts(payload: dict) -> Optional[float]:
+    """payload.expires_ts 的有效值；没有 / 坏值 / 非正数 → None（= 没有期限）。"""
     raw = (payload or {}).get("expires_ts")
     if raw is None:
-        return ""
+        return None
     try:
         expires = float(raw)
     except (TypeError, ValueError):
-        return ""
-    if expires <= 0:
+        return None
+    return expires if expires > 0 else None
+
+
+def _ttl_expired(payload: dict, now: float) -> str:
+    """自动消息的 payload.expires_ts 过了吗；过了返回作废原因（没有期限 → ""）。
+
+    口径不变：`now > expires` 才算过期（取等号仍算有效）。
+    """
+    expires = _expires_ts(payload)
+    if expires is None:
         return ""
     return _TTL_EXPIRED_REASON if float(now) > expires else ""
+
+
+def _quiet_window(quiet: Any) -> Optional[tuple[int, int]]:
+    """这个群的 quiet 时段：「23:00-08:00」→ (1380, 480)，单位分钟。
+
+    空 / 配错 / 起止相同（= 不限制，跟 Pushes.in_quiet 同一口径）→ None（没有静默窗口）。
+    """
+    text = str(quiet or "").strip()
+    if not text:
+        return None
+    try:
+        start, end = clock.parse_hhmm_range(text)
+    except (ValueError, AttributeError):
+        return None
+    if not (0 <= start < 1440 and 0 <= end < 1440) or start == end:
+        return None
+    return start, end
+
+
+def _quiet_end_after(ts: float, window: tuple[int, int]) -> float:
+    """ts 落在这段静默里时，这段静默结束的时刻（跨夜 / 同日区间都对）。"""
+    t = clock.bj(float(ts))
+    end = window[1]
+    out = t.replace(hour=end // 60, minute=end % 60, second=0, microsecond=0)
+    if out.timestamp() <= float(ts):
+        out = out + timedelta(days=1)
+    return out.timestamp()
+
+
+def _fmt_bj(ts: float) -> str:
+    """epoch → "YYYY-MM-DD HH:MM"（北京时间）：日志 / 事件里说清目标时刻。"""
+    return clock.bj(float(ts)).strftime("%Y-%m-%d %H:%M")
 
 
 _PERSONAL_MENTION_KEY = "idea_mention:"
@@ -402,23 +458,28 @@ class Outbox:
             except Exception:
                 logger.exception("发送结果 hook 出错（key=%s，outcome=%s）", info["key"], outcome)
 
-    def _quiet_hours_of(self, group_id: str) -> tuple[str, bool]:
-        """这个群那份睡觉时段（group_push 真源）；读不到 → ("", False)。"""
+    def _group_quiet(self, group_id: str) -> tuple[Optional[str], str]:
+        """这个群那份睡觉时段（group_push 真源）+ 读不出来的原因。
+
+        返回 (quiet, why)：
+        - 读到了可信的一份 → (quiet 字符串（可能是 ""，= 这个群没有静默窗口）, "")；
+        - 读不到（配置口炸了 / get_config 炸了 / 判定拿不到证据）→ (None, 中文原因)，
+          调用方只延 5 分钟再试，绝不拿猜出来的钟点当提前作废的依据。
+        """
         try:
             settings = self._get_settings()
         except Exception:
             logger.debug("读配置失败（推迟时间按 5 分钟后重试，群 %s）", group_id, exc_info=True)
-            return "", False
+            return None, "现在读不出来"
         if settings is None:
-            return "", False
+            return None, "现在读不出来"
         try:
             cfg = group_push.get_config(self._store, str(group_id), settings)
         except Exception:
             logger.debug("读每群推送设置失败（群 %s），推迟时间按 5 分钟后重试", group_id,
                          exc_info=True)
-            return "", False
-        quiet = str((cfg or {}).get("quiet_hours") or "")
-        return (quiet, True) if quiet else ("", False)
+            return None, "读不到设置"
+        return str((cfg or {}).get("quiet_hours") or ""), ""
 
     def _postpone_soon(self, oid: int, reason: str, now: float, why: str) -> None:
         """读不到可信设置：只延 5 分钟再试，不猜钟点（绝不停到明天）。"""
@@ -482,40 +543,124 @@ class Outbox:
                 return str(reason)
         return ""
 
-    def _postpone(self, oid: int, group_id: str, reason: str, now: float) -> None:
-        """推到睡觉时段结束 / 明天 00:00（取更近的），原因写 error，状态仍 pending。
+    def _next_send_time(self, group_id: str, reason: str, now: float) -> tuple[Optional[float], str]:
+        """推迟后「下一次能发」的时刻（**一次算到位**）+ 算不出来的原因。
 
-        睡觉时段用**这个群**那份（group_push）：每个群的醒来钟点可以不一样，
-        绝不能拿全局 `delivery.quiet_hours` 的默认钟点去算（会把某些群误停到明天）。
-        读不到那份设置 → 只延 5 分钟再试。
+        - 睡觉时段：本群那段 quiet 结束的钟点（跨夜 / 同日区间都按北京时间那一天算；
+          每个群的醒来钟点可以不一样，绝不能拿全局 `delivery.quiet_hours` 去算）。
+        - 每日额度用完：次日 00:00（额度按北京日期恢复）；那一刻若仍落在本群 quiet 里，
+          就一次接着移到那段 quiet 结束（线上 #58：19 点额度用满 → 00:00 撞上
+          00:00-07:00 的静默 → 直接到 07:00，不再排第二趟）。
+        - 读不到那份设置 / 认不出原因 /（睡觉时段但 quiet 配错）→ (None, 中文原因)：
+          调用方只延 5 分钟再试，绝不用猜出来的次日钟点提前作废。
+        """
+        reason_s = str(reason or "推送节制")
+        now = float(now)
+        if reason_s == _QUIET_REASON:
+            quiet, why = self._group_quiet(group_id)
+            if quiet is None:
+                return None, why
+            window = _quiet_window(quiet)
+            if window is None:
+                return None, "睡觉时段配错"
+            return _quiet_end_after(now, window), ""
+        if reason_s == _QUOTA_REASON:
+            quiet, why = self._group_quiet(group_id)
+            if quiet is None:
+                return None, why
+            t = clock.bj(now)
+            target = t.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() + 86400.0
+            window = _quiet_window(quiet)
+            if window is not None and clock.in_range(target, window):
+                target = _quiet_end_after(target, window)
+            return target, ""
+        if reason_s == UNREADABLE_REASON:
+            return None, "现在读不出来"
+        return None, "认不出这个原因"
+
+    def _payload_for(self, oid: int, payload: Optional[dict]) -> dict:
+        """拿这条的载荷：调用方给了就用（flush 已经解过一次）；没给才读一次库。"""
+        if isinstance(payload, dict):
+            return payload
+        try:
+            row = self._store.read().execute(
+                "SELECT payload FROM outbox WHERE id=?", (int(oid),)
+            ).fetchone()
+            data = json.loads((row["payload"] if row is not None else "") or "{}")
+        except Exception:
+            logger.debug("读发件载荷失败（发件 %s）", int(oid), exc_info=True)
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _event(self, kind: str, oid: int, group_id: str, body: dict) -> None:
+        """延期 / 作废留一条 events：只有原因和目标时刻，**不含**载荷 / 链接 / token / 正文。
+
+        纯留痕：写不进去只记日志，绝不影响推迟 / 作废本身。
+        """
+        try:
+            with self._store.tx() as conn:
+                self._store.event(conn, kind, group_id=str(group_id),
+                                  entity="outbox", entity_id=str(int(oid)), payload=dict(body))
+        except Exception:
+            logger.debug("写发件事件失败（%s，发件 %s）", kind, int(oid), exc_info=True)
+
+    def _drop_for_ttl(self, oid: int, group_id: str, reason: str, now: float, body: dict, *,
+                      expires: float, target: Optional[float], why: str = "") -> None:
+        """推迟后的发送时刻已经晚于期限 → 提前作废，如实通知生产者（每次只通知一次）。
+
+        不进发送闸、不占额度、不改 TTL：只是把「反正发不出去」提前说清楚，免得陈旧内容
+        压在队里等到过了点才被发现（线上 #58 就拖到了次日 07:00）。
+        """
+        if target is not None:
+            detail = f"{_TTL_EXPIRED_REASON}（{reason}推迟到 {_fmt_bj(target)} 也晚于期限）"
+        else:
+            detail = f"{_TTL_EXPIRED_REASON}（{reason}：{why}，等到下一次 flush 也来不及）"
+        logger.info("发件 %s 提前作废（群 %s）：%s；期限 %s", int(oid), group_id, detail,
+                    _fmt_bj(expires))
+        self._set(oid, status="dropped", error=f"作废：{detail}", moment=now)
+        self._event(_EVENT_TTL_DROP, oid, group_id,
+                    {"reason": _TTL_EXPIRED_REASON, "postpone_reason": str(reason),
+                     "target_ts": float(target) if target is not None else None,
+                     "expires_ts": float(expires)})
+        self._fire_result(_row_after(self._store, oid), dict(body or {}),
+                          outcome="dropped", error=detail, now=now)
+
+    def _postpone(self, oid: int, group_id: str, reason: str, now: float, *,
+                  payload: Optional[dict] = None) -> None:
+        """推到「下一次能发」的时刻；顺带盯住有效期，别把陈旧内容留在队里。
+
+        目标时刻一次算到位（见 _next_send_time），原因写 error，状态仍 pending。
+        算出的发送时刻**严格晚于** payload.expires_ts（跟发送前判定同一口径：
+        now > expires 才算过期，取等号仍算有效）→ 这条已经没法新鲜地发出去，当场作废
+        （dropped）并把结果交给生产者（_fire_result）：**不延长 TTL、不提高额度、
+        不改旧记录**。没有有效期的载荷（任务交付等）不受这一条影响。
+
+        读不到那份设置 / 认不出原因 → 只延 5 分钟再试，绝不用猜出来的次日钟点提前作废；
+        这条 5 分钟只做**有界检查**：下一次 flush 最早也在 now + 5 分钟，那时已经过期
+        才当场作废，不白等一趟。
         """
         now = float(now)
         reason_s = str(reason or "推送节制")
-        if reason_s == "睡觉时段":
-            quiet, known = self._quiet_hours_of(group_id)
-            if not known:
-                self._postpone_soon(oid, reason_s, now, "读不到设置")
+        body = self._payload_for(oid, payload)
+        expires = _expires_ts(body)
+        target, why = self._next_send_time(group_id, reason_s, now)
+        if target is None:
+            if expires is not None and now + _POSTPONE_RETRY_S > expires:
+                self._drop_for_ttl(oid, group_id, reason_s, now, body,
+                                   expires=expires, target=None, why=why)
                 return
-            try:
-                s, e = clock.parse_hhmm_range(quiet)
-            except (ValueError, AttributeError):
-                s, e = 0, 0
-            if s == e:
-                self._postpone_soon(oid, reason_s, now, "睡觉时段配错")
-                return
-            t = clock.bj(now)
-            end = t.replace(hour=e // 60, minute=e % 60, second=0, microsecond=0)
-            if end.timestamp() <= now:
-                end = end + timedelta(days=1)
-            self._set(oid, status="pending", error=f"推迟：{reason_s}",
-                      not_before=end.timestamp(), moment=now)
+            self._postpone_soon(oid, reason_s, now, why)
             return
-        if reason_s == UNREADABLE_REASON:
-            self._postpone_soon(oid, reason_s, now, "读不到设置")
+        if expires is not None and target > expires:
+            self._drop_for_ttl(oid, group_id, reason_s, now, body,
+                               expires=expires, target=target)
             return
-        t = clock.bj(now)
-        nb = t.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() + 86400.0
-        self._set(oid, status="pending", error=f"推迟：{reason_s}", not_before=nb, moment=now)
+        logger.info("发件 %s 推迟（群 %s）：%s → %s", int(oid), group_id, reason_s,
+                    _fmt_bj(target))
+        self._event(_EVENT_POSTPONE, oid, group_id,
+                    {"reason": reason_s, "target_ts": float(target)})
+        self._set(oid, status="pending", error=f"推迟：{reason_s}",
+                  not_before=float(target), moment=now)
 
     def _session_for_group(self, group_id: str) -> str:
         row = self._store.read().execute(
@@ -932,7 +1077,7 @@ class Outbox:
                         self._fire_result(_row_after(self._store, oid), payload,
                                           outcome="dropped", error=reason, now=now)
                         continue
-                    self._postpone(oid, gid, reason or "推送节制", now)
+                    self._postpone(oid, gid, reason or "推送节制", now, payload=payload)
                     continue
 
             # 先落库 sending（CAS：只有仍是 pending 且到点的行才抢得到），再执行（崩了 recover 能捡到）

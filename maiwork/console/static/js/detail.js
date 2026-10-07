@@ -84,6 +84,35 @@ function pausedBlock(t) {
   return `<div class="dt-sec"><div class="dt-label">为什么停了</div><div class="dt-text">${esc(text)}${esc(tail)}</div></div>`;
 }
 
+// 「怎样算完成」：有需求清单（docs/22 第一期）就按清单显示——原话里的是必须做到的，
+// 补充的标「加分项」，要真人参与的另标一下；底线那条（R0）不占位置。没有清单的旧任务照旧列 criteria。
+function reqBlock(t) {
+  const items = (t.requirements || []).filter((r) => r && r.origin !== "底线");
+  if (items.length) {
+    const tag = (r) =>
+      (r.origin === "补充" ? `<span class="ntag">加分项</span>` : `<span class="ntag ok">原话要求</span>`) +
+      (r.kind === "真人" ? ` <span class="ntag warn">要有人参与</span>` : "");
+    return `<div class="dt-sec"><div class="dt-label">怎样算完成</div><ul class="dt-list">${items
+      .map((r) => `<li>${esc(r.text)} ${tag(r)}</li>`)
+      .join("")}</ul><div class="fine">原话要求全部做到、内容真实，才算完成；加分项做不到不影响。</div></div>`;
+  }
+  return (t.criteria || []).length
+    ? `<div class="dt-sec"><div class="dt-label">怎样算完成</div><ul class="dt-list">${t.criteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul></div>`
+    : "";
+}
+
+// 目标完成标准的打勾依据（docs/22 第三期）：哪条任务交付的、证据一句（证据只有管理员看得到，
+// 服务端群友版本来就不带 evidence）。旧的、没留依据的勾显示「没留依据」，方便管理员复核。
+function critProof(c) {
+  if (!c || !c.done) return "";
+  const bits = [];
+  if (c.task_id) bits.push(`来自任务 <span class="mono">${esc(c.task_id)}</span>`);
+  if (c.evidence) bits.push(esc(c.evidence));
+  if (c.ts) bits.push(esc(when(c.ts)));
+  if (!c.task_id && !c.evidence) return admin() ? `<div class="fine-inline">没留打勾依据（旧记录）</div>` : "";
+  return `<div class="fine">${bits.join(" · ")}</div>`;
+}
+
 function taskDetail(id) {
   const t = state.tasks[id];
   const row = findTaskRow(id);
@@ -114,7 +143,7 @@ function taskDetail(id) {
     ${pausedBlock(t)}
     ${t.auto_reason ? `<div class="dt-sec"><div class="dt-label">谁批的</div><div class="dt-text">MaiWork 自动审核通过：${esc(t.auto_reason)}</div></div>` : ""}
     ${t.question ? `<div class="dt-sec"><div class="dt-label">在等回答</div><div class="quote">${esc(t.question)}</div></div>` : ""}
-    ${(t.criteria || []).length ? `<div class="dt-sec"><div class="dt-label">怎样算完成</div><ul class="dt-list">${t.criteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul></div>` : ""}
+    ${reqBlock(t)}
     ${admin() && t.env ? `<div class="dt-sec"><div class="dt-label">在哪里做</div><div class="dt-text">${esc(t.env)}</div></div>` : ""}
     ${
       !admin() && t.steps
@@ -180,7 +209,7 @@ function goalDetail(goal) {
     ${
       crit.length
         ? `<div class="dt-sec"><div class="dt-label">完成标准</div>
-      <ul class="checks">${crit.map((c) => `<li class="${c.done ? "done" : ""}"><span class="tick">${c.done ? SVG.check : ""}</span>${esc(c.text)}</li>`).join("")}</ul></div>`
+      <ul class="checks">${crit.map((c) => `<li class="${c.done ? "done" : ""}"><span class="tick">${c.done ? SVG.check : ""}</span><span class="ck-body">${esc(c.text)}${critProof(c)}</span></li>`).join("")}</ul></div>`
         : ""
     }
     ${goal.last ? `<div class="dt-sec"><div class="dt-label">最近一次</div><div class="dt-text">${esc(when(goal.last.ts))} ${esc(goal.last.text)}</div></div>` : ""}

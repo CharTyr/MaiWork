@@ -123,7 +123,8 @@ class FakeWorkers:
         self.report_fn = None
 
     async def run(self, brief, *, group_id, tools, task_id="", actor="", max_steps=12,
-                  output_schema=None, workspace=None, system_extra="", artifact_scope=None):
+                  output_schema=None, workspace=None, system_extra="", artifact_scope=None,
+                  write_scope=None):
         self.calls.append({"brief": brief, "group_id": group_id, "tools": list(tools),
                            "task_id": task_id, "actor": actor, "artifact_scope": artifact_scope})
         fn = self.report_fn
@@ -173,8 +174,10 @@ async def test_plan_rejects_out_of_range_after(mem_store, settings, env, tools, 
 
 async def test_plan_rejects_self_dependency(mem_store, settings, env, tools, tasks, goals):
     tid = _create_task(tasks)
+    # 两条 brief 都别落进「调研」关键词兜底：有调研活时 docs/22 §4 A 会给非调研活自动补 after，
+    # 这条用例要单独看「自己依赖自己」这一条的清理结果。
     raw = _jobs_plan([
-        {"brief": "调研", "tools": ["fetch_page"]},
+        {"brief": "第一步", "tools": ["fetch_page"]},
         {"brief": "自己做自己", "tools": ["write_file"], "after": [2]},
     ])
     models = ModelsQueue(replies=[raw])
@@ -210,8 +213,15 @@ async def _run_with_events(models, workers, jobs_raw):
 
 
 async def test_after_job_starts_only_after_dependency(mem_store, settings, env, tools, tasks, goals):
-    """有 after 时后一步在前一步结束后才开始；后一步 brief 带前一步摘要。"""
+    """有 after 时后一步在前一步结束后才开始；后一步 brief 带前一步摘要。
+
+    docs/22 §4 B 起，上游还必须**真交出资料**（声称的路径真实存在且非空），
+    所以这里先在工作区里放一份真的调研稿。
+    """
     tid = _create_task(tasks)
+    ws = env.workspace(tasks.get(tid)["workspace"])
+    (ws / "artifacts" / tid).mkdir(parents=True, exist_ok=True)
+    (ws / "artifacts" / tid / "research.md").write_text("资料", encoding="utf-8")
     started: dict[str, asyncio.Event] = {"子 agent #1": asyncio.Event(), "子 agent #2": asyncio.Event()}
     order: list[str] = []
 
@@ -226,7 +236,10 @@ async def test_after_job_starts_only_after_dependency(mem_store, settings, env, 
             if actor == "子 agent #1":
                 # 等着：如果 #2 已经开了，这里就是并发（不合要求）
                 await asyncio.sleep(0.05)
-                return WorkerReport(ok=True, summary="调研摘要：整理出 3 条后续动态", evidence=[])
+                return WorkerReport(
+                    ok=True, summary="调研摘要：整理出 3 条后续动态",
+                    evidence=[f"artifacts/{tid}/research.md"],
+                )
             return WorkerReport(ok=True, summary="页面做完了", evidence=[])
 
     workers = EventWorkers()
@@ -245,8 +258,12 @@ async def test_after_job_starts_only_after_dependency(mem_store, settings, env, 
     assert "前一步交回的" in brief2
 
 
-async def test_after_job_still_runs_when_dependency_failed(mem_store, settings, env, tools, tasks, goals):
-    """依赖的 job 失败：后一步照样开工，brief 里告诉它前一步没做成。"""
+async def test_after_job_skipped_when_dependency_failed(mem_store, settings, env, tools, tasks, goals):
+    """依赖的 job 没交出资料：后一步**不开工**（docs/22 §4 B 新语义）。
+
+    老语义（「照样开工，brief 里告诉它前一步没做成」）正是线上 T-2 / T-4 的病根：
+    前一步没资料，后一步硬做，就去找别的任务的成品当替代品。
+    """
     tid = _create_task(tasks)
 
     class FailingWorkers:
@@ -267,17 +284,25 @@ async def test_after_job_still_runs_when_dependency_failed(mem_store, settings, 
     models = ModelsQueue(replies=[raw, _review(pass_=True, artifact="", review="过了")])
     coord = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
                    tasks=tasks, goals=goals, models=models, workers=workers)
-    await coord.run_task(tid)
+    action = await coord._run_one_attempt(tasks.get(tid))
 
-    assert len(workers.calls) == 2, "前一步失败，后一步也必须照样开工（不许跳过去别处找替代品）"
-    brief2 = workers.calls[1]["brief"]
-    assert "没做成" in brief2
-    assert "抓页面全失败：403" in brief2
+    assert len(workers.calls) == 1, "上游没交出资料，下游的 workers.run 不许被调用"
+    assert workers.calls[0]["actor"] == "子 agent #1"
+    assert action == "retry"
+    row = mem_store.read().execute(
+        "SELECT status, review FROM attempts WHERE task_id=? ORDER BY n DESC LIMIT 1", (tid,)
+    ).fetchone()
+    assert row is not None and row["status"] == "failed"
+    assert "第 1 条活没交出资料" in str(row["review"]) and "403" in str(row["review"])
+    assert "依赖它的第 2 条没开工" in str(row["review"])
 
 
 async def test_after_job_receives_artifact_paths_from_dependency(mem_store, settings, env, tools, tasks, goals):
-    """前一步 evidence 里带工作区路径时，后一步 brief 里能看到这些路径。"""
+    """前一步交回的工作区路径真实存在时，后一步 brief 里能看到这些路径。"""
     tid = _create_task(tasks)
+    ws = env.workspace(tasks.get(tid)["workspace"])
+    (ws / "artifacts" / tid).mkdir(parents=True, exist_ok=True)
+    (ws / "artifacts" / tid / "research.md").write_text("真资料", encoding="utf-8")
 
     class PathWorkers:
         def __init__(self):
@@ -309,6 +334,9 @@ async def test_after_job_receives_artifact_paths_from_dependency(mem_store, sett
 async def test_reports_order_matches_jobs_order_with_after(mem_store, settings, env, tools, tasks, goals):
     """有 after 时 reports 顺序仍与 jobs 顺序一致（验收代码按下标用）。"""
     tid = _create_task(tasks)
+    ws = env.workspace(tasks.get(tid)["workspace"])
+    (ws / "artifacts" / tid).mkdir(parents=True, exist_ok=True)
+    (ws / "artifacts" / tid / "step1.md").write_text("第一步的产出", encoding="utf-8")
     thirds: list[str] = []
 
     class OrderWorkers:
@@ -317,7 +345,12 @@ async def test_reports_order_matches_jobs_order_with_after(mem_store, settings, 
 
         async def run(self, brief, *, group_id, tools, task_id="", actor="", **kw):
             self.calls.append({"brief": brief, "actor": actor})
-            # 交回标注自己是哪个 actor，最后一并出现在 attempt summary 里
+            # 交回标注自己是哪个 actor，最后一并出现在 attempt summary 里；
+            # 第一步还要真交出一份文件，下游才开工（docs/22 §4 B）。
+            if actor == "子 agent #1":
+                return WorkerReport(
+                    ok=True, summary=f"AA-{actor}", evidence=[f"artifacts/{tid}/step1.md"],
+                )
             return WorkerReport(ok=True, summary=f"AA-{actor}", evidence=[])
 
     workers = OrderWorkers()

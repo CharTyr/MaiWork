@@ -267,6 +267,9 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .checks { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 8px; }
 .checks li { display: flex; gap: 10px; align-items: flex-start; font-size: 15px; line-height: 1.5; color: var(--ink-2); }
 .checks li.done { color: var(--gray); }
+.checks .ck-body { min-width: 0; }
+.checks .ck-body .fine { margin-top: 2px; font-size: 12px; overflow-wrap: anywhere; }
+.checks .ck-body .fine-inline { display: block; margin: 2px 0 0; }
 .tick {
   flex: none;
   margin-top: 2px;

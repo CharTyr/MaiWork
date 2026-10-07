@@ -122,7 +122,7 @@ class FakeSpecialists:
     async def run(self, kind, brief, *, group_id, phase="", task_id="",
                   tools=None, output_schema=None, actor="", deadline_ts=None,
                   parent_id="", workspace=None, max_steps=0, artifact_scope=None, criteria=None,
-                  history=None, escalate=False):
+                  write_scope=None, history=None, escalate=False):
         try:
             profile = self._agents.profile(kind)
         except Exception:
@@ -203,7 +203,7 @@ class FakeWorkersQueue:
 
     async def run(self, brief, *, group_id, tools, task_id="", actor="\u5b50 agent #1",
                   max_steps=0, output_schema=None, workspace=None, skills_hint=None,
-                  system_extra="", deadline_ts=None, artifact_scope=None,
+                  system_extra="", deadline_ts=None, artifact_scope=None, write_scope=None,
                   agent_type="task", allowed_tools=None, allowed_skills=None, used_tools=None):
         self.calls.append({
             "brief": str(brief), "group_id": str(group_id), "tools": list(tools or []),

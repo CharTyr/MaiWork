@@ -19,7 +19,7 @@ import sqlite3
 from contextlib import nullcontext
 from typing import Any, Callable, Iterable
 
-from . import clock, members
+from . import clock, members, requirements
 from .lanes import close_task_lanes
 from .store import Store, next_id
 
@@ -551,6 +551,10 @@ class Tasks:
                 "started_ts": row["started_ts"],
                 "finished_ts": row["finished_ts"],
             }
+        )
+        # docs/22 §3.1：网页「怎样算完成」显示这一版的需求清单（没锁定 / 版本变了 → []）
+        item["requirements"] = (
+            requirements.load(self._store, task_id, int(row["req_version"])) or []
         )
         calls = self._calls(str(task_id))
         item["steps"] = len(calls)

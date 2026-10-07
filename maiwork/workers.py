@@ -28,6 +28,7 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import clock, compaction, lanes
 from .models import ModelError
@@ -37,6 +38,183 @@ logger = logging.getLogger("maiwork.workers")
 
 _TOOL_MSG_MAX = 6000    # 回给模型的单条 tool 消息截 6000 字（spill 之后一般远小于它）
 _MAX_NUDGES = 2         # 最多催几次「请调用 submit_result 交回」
+
+# ---------------------------------------------------------------------------
+# docs/22 §4 F（2026-10-07 本地）止损：抓取失败按主机计 + 连续没进展
+# ---------------------------------------------------------------------------
+
+FETCH_HOST_FAIL_LIMIT = 2      # 同一主机连续失败满这么多次 → 再请求直接短路
+NO_PROGRESS_NUDGE_AT = 15      # 连续这么多次搜索/抓取没有新打开的地址 → 插一条 user 提醒
+NO_PROGRESS_STOP_AT = 25       # 再连续到这么多次 → 和 deadline 一样只给 submit_result
+
+
+def _host_fail_note() -> str:
+    return (
+        f"这个网站已经连续拒绝 {FETCH_HOST_FAIL_LIMIT} 次，别再试它；"
+        "换别的来源，或在交回里如实写拿不到"
+    )
+
+
+def _no_progress_nudge() -> str:
+    return (
+        f"已经连续 {NO_PROGRESS_NUDGE_AT} 次没有新收获，停止继续搜，"
+        "用现有资料完成并交回，拿不到的如实写"
+    )
+
+
+def _no_progress_stop() -> str:
+    return (
+        f"已经连续 {NO_PROGRESS_STOP_AT} 次没有新收获：请立刻用 submit_result "
+        "把已经拿到的交回（拿不到的如实写），不要再搜、不要再抓。"
+    )
+
+
+def _tool_kind(name: Any) -> str:
+    """这条调用算「搜索」还是「抓取」（止损只数这两类）；别的 → ""。"""
+    n = str(name or "")
+    try:
+        from .tools_builtin import _is_extract_like_mcp
+
+        if n == "fetch_page" or _is_extract_like_mcp(n):
+            return "fetch"
+    except Exception:
+        if n == "fetch_page":
+            return "fetch"
+    try:
+        from .search_binding import _EXTRACT_HINT, _SEARCH_HINT  # noqa: SLF001 — 同一份特征
+
+        if n == "web_search":
+            return "search"
+        if n.startswith("mcp_") and _SEARCH_HINT.search(n) and not _EXTRACT_HINT.search(n):
+            return "search"
+    except Exception:
+        if n == "web_search":
+            return "search"
+    return ""
+
+
+def _hosts_of_args(name: Any, args: Any) -> list[str]:
+    """这次抓取请求打向哪些主机（去重、小写）；拿不到 → 空。"""
+    if _tool_kind(name) != "fetch" or not isinstance(args, dict):
+        return []
+    urls: list[str] = []
+    for key in ("url", "link"):
+        v = str(args.get(key) or "").strip()
+        if v:
+            urls.append(v)
+    many = args.get("urls")
+    if isinstance(many, list):
+        urls.extend(str(u).strip() for u in many if str(u or "").strip())
+    out: list[str] = []
+    for raw in urls:
+        host = _host_of_url(raw)
+        if host and host not in out:
+            out.append(host)
+    return out
+
+
+def _host_of_url(url: Any) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        host = urlsplit(raw).hostname
+    except ValueError:
+        return ""
+    return str(host or "").lower()
+
+
+def _opened_urls_of_call(name: Any, args: Any, output: Any) -> set[str]:
+    """这次调用**真打开过**的（规范化）地址：fetch_page / 抓正文类 MCP 工具才有。"""
+    if _tool_kind(name) != "fetch":
+        return set()
+    urls: list[str] = []
+    if isinstance(args, dict):
+        for key in ("url", "link"):
+            v = str(args.get(key) or "").strip()
+            if v:
+                urls.append(v)
+        many = args.get("urls")
+        if isinstance(many, list):
+            urls.extend(str(u).strip() for u in many if str(u or "").strip())
+    try:
+        from .tools_builtin import (
+            _FINAL_URL_LINE_RE,
+            _is_extract_like_mcp,
+            final_url_from_summary,
+        )
+        from .coordinator import normalize_link_for_check
+
+        text = str(output or "")
+        if str(name) == "fetch_page":
+            final = final_url_from_summary(text)
+            if final:
+                urls.append(final)
+        elif _is_extract_like_mcp(str(name)):
+            for m in _FINAL_URL_LINE_RE.finditer(text):
+                urls.append(m.group(1))
+    except Exception:
+        return set()
+    out: set[str] = set()
+    for raw in urls:
+        key = normalize_link_for_check(raw)
+        if key:
+            out.add(key)
+    return out
+
+
+class _StallGuard:
+    """一条活的止损账本（docs/22 §4 F）：按主机记失败 + 连续没进展。
+
+    - `gate` 装到 ToolContext.call_gate 上：同一主机失败满了就**短路**（不真发请求，
+      但仍然照常落一条 tool_calls；文案让它换来源）。
+    - `after` 每次工具调用后记一笔，返回要追加给模型的提醒（"" = 不用提醒）；
+      到 `NO_PROGRESS_STOP_AT` 时置 `stop_requested`，由 worker 循环收紧成只给 submit_result。
+    """
+
+    def __init__(self) -> None:
+        self.host_fails: dict[str, int] = {}
+        self.seen_urls: set[str] = set()
+        self.no_progress = 0
+        self.stop_requested = False
+
+    def gate(self, name: Any, args: Any) -> Any:
+        from .tools import ToolResult
+
+        for host in _hosts_of_args(name, args):
+            if self.host_fails.get(host, 0) >= FETCH_HOST_FAIL_LIMIT:
+                return ToolResult(ok=False, output="", error=_host_fail_note())
+        return None
+
+    def after(self, name: Any, args: Any, result: Any) -> str:
+        kind = _tool_kind(name)
+        if not kind:
+            return ""
+        if kind == "fetch" and bool(getattr(result, "ok", False)):
+            # 「连续」拒绝：这个网站打开成功一次，它的失败计数就清零
+            for host in _hosts_of_args(name, args):
+                self.host_fails.pop(host, None)
+            fresh = _opened_urls_of_call(name, args, getattr(result, "output", ""))
+            new = fresh - self.seen_urls
+            if new:
+                self.seen_urls |= fresh
+                self.no_progress = 0
+                return ""
+        elif kind == "fetch":
+            for host in _hosts_of_args(name, args):
+                self.host_fails[host] = self.host_fails.get(host, 0) + 1
+        self.no_progress += 1
+        if self.no_progress >= NO_PROGRESS_STOP_AT:
+            self.stop_requested = True
+            logger.info("子 agent 连续 %d 次搜索/抓取没有新收获，止损收紧到只交回", self.no_progress)
+            return ""
+        if self.no_progress == NO_PROGRESS_NUDGE_AT:
+            logger.info("子 agent 连续 %d 次搜索/抓取没有新收获，插一条提醒", self.no_progress)
+            return _no_progress_nudge()
+        return ""
+
 
 # 调研类子任务的报告框架（docs/02 §7.2 真实验收的配套）：主模型在计划里把子任务标成
 # research 时，coordinator 把这段作为 system 提示的追加段传进来（system_extra）。
@@ -225,6 +403,9 @@ class Workers:
         system_extra: str = "",
         deadline_ts: float | None = None,
         artifact_scope: tuple[str, ...] | None = None,
+        # 各步骤分文件夹（docs/22 §4 C）：这条活的写范围（工作区相对目录）。
+        # None = 不限制写（老调用方行为不变）。
+        write_scope: tuple[str, ...] | None = None,
         # 专岗（specialists.py）注入：执行身份与本论硬权限。None 向后兼容。
         agent_type: str = "task",
         allowed_tools: tuple[str, ...] | list[str] | None = None,
@@ -265,6 +446,8 @@ class Workers:
         if history:
             messages.extend(lanes.prepare_history(history, allowed=hard_tools))
         messages.append({"role": "user", "content": str(brief)})
+        # docs/22 §4 F：这一轮子 agent 的止损账本（按主机计失败 + 连续没进展）
+        stall = _StallGuard()
         ctx = ToolContext(
             group_id=str(group_id),
             task_id=str(task_id),
@@ -272,12 +455,14 @@ class Workers:
             workspace=workspace,
             role="worker",
             artifact_scope=artifact_scope,
+            write_scope=write_scope,
             agent_type=str(agent_type or "task"),
             allowed_tools=hard_tools,
             used_tools=used_tools,
             allowed_skills=(
                 tuple(str(x) for x in allowed_skills) if allowed_skills is not None else None
             ),
+            call_gate=stall.gate,
         )
         try:
             steps = 0
@@ -289,6 +474,7 @@ class Workers:
             agent_kind = str(agent or agent_type or "task")
             context_window = self._context_window(agent_kind, escalate=escalate)
             wrapped_up = False  # 到期强制交回的标记（一次：append 提示 + 只给 submit_result）
+            stall_wrapped = False  # 止损收紧成只交回的标记（同样只做一次）
             spill_dir = None
             if workspace is not None and task_id:
                 try:
@@ -432,11 +618,24 @@ class Workers:
                 # OpenAI 规范：tool 结果前面必须先有这条 assistant(tool_calls)，否则严格的端点直接 400
                 # （线上实测踩到：子 agent 一步都走不下去，资讯一批都出不来）
                 messages.append({"role": "assistant", "content": result.text or "", "tool_calls": tool_calls})
-                submitted = await self._run_tool_calls(tool_calls, ctx, messages, nudger, spill_dir)
+                submitted = await self._run_tool_calls(
+                    tool_calls, ctx, messages, nudger, spill_dir, stall
+                )
                 if submitted is not None:
                     report = submitted
                     report.steps = steps
                     return report
+                # docs/22 §4 F：连续没进展到止损线 → 和 deadline 一样只给 submit_result
+                if stall.stop_requested and not stall_wrapped:
+                    stall_wrapped = True
+                    if specs:
+                        specs = [
+                            x for x in (specs or [])
+                            if (x.get("function") or {}).get("name") == "submit_result"
+                        ] or specs
+                    ctx.allowed_tools = ("submit_result",)
+                    messages.append({"role": "user", "content": _no_progress_stop()})
+                    nudger.note_user_message()
 
             # 给了 max_steps（>0）且用完：兼容的老失败路径
             return WorkerReport(
@@ -463,8 +662,15 @@ class Workers:
         messages: list[dict],
         nudger: compaction.RepeatCallNudger | None = None,
         spill_dir: Path | None = None,
+        stall: "_StallGuard | None" = None,
     ) -> WorkerReport | None:
-        """顺序执行这一轮的工具调用并追加 tool 消息；遇到 submit_result 成功就构造报告返回。"""
+        """顺序执行这一轮的工具调用并追加 tool 消息；遇到 submit_result 成功就构造报告返回。
+
+        docs/22 §4 F：`stall` 给了就在每次调用后记一笔止损账（同一主机失败、连续没进展）；
+        要提醒的话攒起来，等这一轮所有 tool 消息都追加完再插一条 user 消息——不能把
+        user 消息插在同一个 assistant(tool_calls) 的多条 tool 结果中间（严格的端点会 400）。
+        """
+        stall_notes: list[str] = []
         for tc in tool_calls:
             if not isinstance(tc, dict):
                 continue
@@ -519,4 +725,17 @@ class Workers:
             if name:
                 msg["name"] = name
             messages.append(msg)
+            # docs/22 §4 F：止损账（同主机失败 / 连续没进展）
+            if stall is not None:
+                try:
+                    note = stall.after(name, args, result)
+                except Exception:
+                    logger.exception("止损账记一笔出错（%s），按不提醒处理", name)
+                    note = ""
+                if note:
+                    stall_notes.append(note)
+        for note in stall_notes:
+            messages.append({"role": "user", "content": note})
+            if nudger is not None:
+                nudger.note_user_message()
         return None

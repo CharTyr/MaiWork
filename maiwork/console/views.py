@@ -614,19 +614,38 @@ def _personal_view(svc: Any, group_id: str, user_id: str) -> dict[str, Any]:
     }
 
 
-def _goals_view(svc: Any, group_id: str) -> dict[str, Any]:
-    """GroupView.goals：Goals.view（{"agent": [...], "member": [...]}）；模块没开全空。"""
+def _goals_view(svc: Any, group_id: str, *, admin: bool) -> dict[str, Any]:
+    """GroupView.goals：Goals.view（{"agent": [...], "member": [...]}）；模块没开全空。
+
+    docs/22 §5 C：完成标准可能带 `evidence`（群友原话）——群友视图（admin=False）只留
+    `task_id` / `ts`，不带 evidence。
+    """
     goals = getattr(svc, "goals", None)
     if goals is None:
         return {"agent": [], "member": []}
     try:
         v = goals.view(group_id) or {}
+        agent = [_safe_jsonable(x) for x in (v.get("agent") or []) if isinstance(x, dict)]
+        if not admin:
+            agent = [_strip_goal_evidence(x) for x in agent]
         return {
-            "agent": [_safe_jsonable(x) for x in (v.get("agent") or []) if isinstance(x, dict)],
+            "agent": agent,
             "member": [_safe_jsonable(x) for x in (v.get("member") or []) if isinstance(x, dict)],
         }
     except Exception:
         return {"agent": [], "member": []}
+
+
+def _strip_goal_evidence(item: dict[str, Any]) -> dict[str, Any]:
+    """群友版目标：完成标准里的 evidence（可能含群友原话）去掉，task_id / ts 留着。"""
+    out = dict(item)
+    crit = out.get("criteria")
+    if isinstance(crit, list):
+        out["criteria"] = [
+            {k: v for k, v in c.items() if k != "evidence"} if isinstance(c, dict) else c
+            for c in crit
+        ]
+    return out
 
 
 def _tasks_view(svc: Any, group_id: str) -> dict[str, Any]:
@@ -948,7 +967,7 @@ def group_view(svc: Any, group_id: str, *, admin: bool) -> dict[str, Any]:
         "news": news,
         "guides": guides,
         "ideas": ideas,
-        "goals": _goals_view(svc, group_id),
+        "goals": _goals_view(svc, group_id, admin=admin),
         "tasks": _tasks_view(svc, group_id),
         "topic_log": topic_log,
         "upcoming": _upcoming(svc, group_id, row, now),

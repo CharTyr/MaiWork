@@ -218,6 +218,8 @@ class Specialists:
         workspace: Any = None,
         max_steps: int = 0,
         artifact_scope: Any = None,
+        # 各步骤分文件夹（docs/22 §4 C）：这条活的写范围，原样透传给 Workers.run
+        write_scope: Any = None,
         criteria: Any = None,
         # 任务双岗协作（docs/20 §5.3）：干活 lane 的前情（同一个列表透传，Workers 原地写回）
         # 和「换升级模型」；没给就不传，资讯/构想/目标照旧每次全新对话。
@@ -336,6 +338,7 @@ class Specialists:
                 system_extra=system_extra,
                 deadline_ts=deadline_ts,
                 artifact_scope=artifact_scope,
+                write_scope=write_scope,
                 agent_type=kind_s,
                 allowed_tools=tuple(effective_tools),
                 allowed_skills=allowed_skills,

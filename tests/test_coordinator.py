@@ -31,7 +31,7 @@ from CharTyr_MaiWork.maiwork.host import HostError
 from CharTyr_MaiWork.maiwork.models import ModelError
 from CharTyr_MaiWork.maiwork.store import Store
 from CharTyr_MaiWork.maiwork.tasks import Tasks
-from CharTyr_MaiWork.maiwork.tools import ToolContext, ToolResult, Tools
+from CharTyr_MaiWork.maiwork.tools import Tool, ToolContext, ToolResult, Tools
 from CharTyr_MaiWork.maiwork.tools_exec import register_exec_tools
 from CharTyr_MaiWork.maiwork.workers import WorkerReport
 
@@ -90,7 +90,8 @@ class FakeWorkers:
         self.before_return = None  # async callable()：返回前执行（用来模拟晚到）
 
     async def run(self, brief, *, group_id, tools, task_id="", actor="", max_steps=12,
-                  output_schema=None, workspace=None, system_extra="", artifact_scope=None):
+                  output_schema=None, workspace=None, system_extra="", artifact_scope=None,
+                  write_scope=None):
         self.calls.append(
             {
                 "brief": brief,
@@ -221,6 +222,10 @@ def goals(mem_store, settings):
     return Goals(mem_store, lambda: settings)
 
 
+async def _stub_worker_handler(ctx, args):  # noqa: ARG001
+    return ToolResult(ok=True, output="（测试桩）", data={})
+
+
 class _Profiles:
     def entries(self, group_id):
         return []
@@ -252,6 +257,20 @@ def _build(
         get_settings=lambda: settings,
         session_of=_session_of,
     )
+    # docs/22 §4 D：调研活必须有搜索 / 抓正文 / write_file。线上这三个由 tools_builtin +
+    # tools_exec 注册；测试里补两个桩，让「调研活」用例测的是它们各自要测的事，
+    # 不是开工前的工具补齐闸。
+    for _name in ("web_search", "fetch_page"):
+        if tools.get(_name, "worker") is None:
+            tools.register(
+                Tool(
+                    name=_name,
+                    description="测试桩（只证明注册表里真有）",
+                    parameters={"type": "object", "properties": {}},
+                    roles=frozenset({"worker"}),
+                    handler=_stub_worker_handler,
+                )
+            )
     # 主模型只读工具（inspect_file / inspect_files）已经由 register_exec_tools 注册。
     return Coordinator(
         mem_store,
@@ -645,7 +664,8 @@ async def test_same_workspace_tasks_serialized(
 
     class _Worker:
         async def run(self, brief, *, group_id, tools, task_id="", actor="", max_steps=12,
-                      output_schema=None, workspace=None, system_extra="", artifact_scope=None):
+                      output_schema=None, workspace=None, system_extra="", artifact_scope=None,
+                  write_scope=None):
             entered.append(task_id)
             order.append(f"enter:{task_id}")
             await asyncio.sleep(0.05)
@@ -849,11 +869,14 @@ async def test_check_goal_ticks_criteria_and_creates_task(
     mem_store: Store, settings, env, tools, tasks, goals
 ):
     gid_goal = _seed_goal(goals)
+    # docs/22 §5 C：打勾要证据——第 1 条完成标准靠群里真发生的话（群聊片段）勾上
+    _seed_chat(mem_store, GID, [("阿柒", "脚本已经写好了，跑通了")])
     models = ModelsQueue(
         replies=[
             json.dumps(
                 {
-                    "done_criteria": [0],
+                    "done_criteria": [{"index": 0, "task_id": None,
+                                       "evidence": "阿柒：脚本已经写好了，跑通了"}],
                     "next_check_hours": 12,
                     "progress": "脚本写了一半",
                     "new_task": {"title": "把测试跑起来", "req": "把 pytest 跑通",
@@ -910,7 +933,8 @@ async def test_check_goal_discards_late_model_result_after_stop(
         # 模拟主模型请求还在等待时，管理员取消或暂停了目标。
         (goals.cancel if stopped == "cancelled" else goals.pause)(goal_id)
         return ReplayChatResult(json.dumps({
-            "done_criteria": [0, 1], "next_check_hours": 1,
+            "done_criteria": [{"index": 0, "task_id": None, "evidence": "晚到的证据"}],
+            "next_check_hours": 1,
             "progress": "晚到进展", "new_task": {"title": "晚到任务", "req": "不能执行"},
             "report": "晚到汇报",
         }, ensure_ascii=False))
@@ -992,11 +1016,14 @@ async def test_check_goal_all_criteria_done_marks_done(
         criteria=["唯一一条"],
         by_text="",
     )
+    # docs/22 §5 C：唯一一条靠群里真发生的话（群聊片段）作证据勾上
+    _seed_chat(mem_store, GID, [("老李", "唯一一条真的做完了")])
     models = ModelsQueue(
         replies=[
             json.dumps(
                 {
-                    "done_criteria": [0],
+                    "done_criteria": [{"index": 0, "task_id": None,
+                                       "evidence": "老李：唯一一条真的做完了"}],
                     "next_check_hours": 0,
                     "progress": "完事了",
                     "new_task": None,
@@ -1179,7 +1206,8 @@ async def test_check_goal_prompt_always_carries_recent_chat(
             json.dumps(
                 {
                     "criteria": ["模型乱改的标准"],
-                    "done_criteria": [0],
+                    "done_criteria": [{"index": 0, "task_id": None,
+                                       "evidence": "阿柒：已经把脚本提交了"}],
                     "next_check_hours": 12,
                     "progress": None,
                     "new_task": None,
