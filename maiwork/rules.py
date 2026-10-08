@@ -407,15 +407,15 @@ _ADVANCED_KEYS = frozenset({
 # 值还从 config.toml 读（Settings 里那些字段留着），但只当**新群第一次的迁移种子**；
 # 运行时的真源是 kv["group_approval.<群号>"] / kv["group_push.<群号>"]。
 GROUP_MANAGED_KEYS: dict[str, str] = {
-    "approval.required": "群 → 派活批准（谁能批 / 要不要批 / 免批，每个群一份）",
-    "approval.admins": "群 → 派活批准（谁能批 / 要不要批 / 免批，每个群一份）",
-    "approval.exempt_groups": "群 → 派活批准（谁能批 / 要不要批 / 免批，每个群一份）",
-    "approval.exempt_users": "群 → 派活批准（谁能批 / 要不要批 / 免批，每个群一份）",
-    "topics.enabled": "群 → 往群里发（开话题 / 资讯卡 / 提一嘴 / 每日上限 / 睡觉时段，每个群一份）",
+    "approval.required": "群 → 派活审批（谁能批 / 要不要批 / 免批，每个群一份）",
+    "approval.admins": "群 → 派活审批（谁能批 / 要不要批 / 免批，每个群一份）",
+    "approval.exempt_groups": "群 → 派活审批（谁能批 / 要不要批 / 免批，每个群一份）",
+    "approval.exempt_users": "群 → 派活审批（谁能批 / 要不要批 / 免批，每个群一份）",
+    "topics.enabled": "群 → 主动发言（开话题 / 资讯卡 / 提一嘴 / 每日上限 / 睡觉时段，每个群一份）",
     "topics.speaker": "已退役：开话题现在都由 MaiWork 自己说一句，不用再设",
-    "topics.per_day": "群 → 往群里发（开话题 / 资讯卡 / 提一嘴 / 每日上限 / 睡觉时段，每个群一份）",
-    "delivery.push_per_day": "群 → 往群里发（开话题 / 资讯卡 / 提一嘴 / 每日上限 / 睡觉时段，每个群一份）",
-    "delivery.quiet_hours": "群 → 往群里发（开话题 / 资讯卡 / 提一嘴 / 每日上限 / 睡觉时段，每个群一份）",
+    "topics.per_day": "群 → 主动发言（开话题 / 资讯卡 / 提一嘴 / 每日上限 / 睡觉时段，每个群一份）",
+    "delivery.push_per_day": "群 → 主动发言（开话题 / 资讯卡 / 提一嘴 / 每日上限 / 睡觉时段，每个群一份）",
+    "delivery.quiet_hours": "群 → 主动发言（开话题 / 资讯卡 / 提一嘴 / 每日上限 / 睡觉时段，每个群一份）",
 }
 
 
@@ -455,139 +455,150 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     # 网页自己跟着没了，只能改 config.toml（2026-09-28 按用户要求从网页拿掉） ----
 
     # ---- groups ----
-    _F("groups.serve", "服务群列表", "写成 qq:群号。工作区名相同的群会共享群画像", "serve_groups"),
+    _F("groups.serve", "服务的群", "写成 qq:群号；同工作区共享画像", "serve_groups"),
 
     # ---- focus ----
-    _F("focus.max_members", "每群最多关注几个人", "", "int", min=1, max=20),
-    _F("focus.personal_profile", "建个人画像", "关掉就只了解群，不了解个人", "bool"),
-    _F("focus.personal_feeds", "出个人向资讯和构想", "只有本人和管理员看得到。需要先开「建个人画像」", "bool"),
-    _F("focus.personal_per_day", "个人向资讯每次最多几条", "", "int", min=1, max=10),
+    _F("focus.max_members", "关注人数", "每个群最多关注几人", "int", min=1, max=20),
+    _F("focus.personal_profile", "个人画像", "关掉后只了解群，不了解个人", "bool"),
+    _F("focus.personal_feeds", "个人推荐", "要先开个人画像；仅本人和管理员可见", "bool"),
+    _F("focus.personal_per_day", "个人资讯数", "每次给一个人最多几条", "int", min=1, max=10),
 
     # ---- feeds ----
-    _F("feeds.news_slots", "每天备资讯的时段", "每天这几个时间去找资讯（北京时间），比如 09:00", "time_list"),
-    _F("feeds.news_jitter_minutes", "时段随机浮动（分钟）", "", "int", min=0, max=120),
-    _F("feeds.max_items", "每批资讯上限", "", "int", min=1, max=20),
-    _F("feeds.lookback_days", "去重回看天数", "和最近这么多天的资讯去重", "int", min=1, max=90),
-    _F("feeds.web_min_avg", "上网页的平均分门槛", "满分 5 分，越高越挑", "float", min=1.0, max=5.0),
-    _F("feeds.pool_min_avg", "进话题候选池的平均分门槛", "满分 5 分，越高越挑", "float", min=1.0, max=5.0),
-    _F("feeds.guides", "同时找文章", "教程、好文章和好用的工具", "bool"),
-    _F("feeds.collect_minutes", "每轮找资讯最多几分钟", "到点就把已经找到的交回来，不会白找", "int", min=1, max=60),
-    _F("feeds.viz_per_day", "每天图解上限", "没配图、数字多的资讯，画一张小图放在配图的位置；0 = 不画", "int", min=0, max=10),
+    _F("feeds.news_slots", "找资讯时间", "每天几点找，北京时间", "time_list"),
+    _F("feeds.news_jitter_minutes", "时间浮动", "前后随机错开几分钟", "int", min=0, max=120),
+    _F("feeds.max_items", "每批条数", "一批最多留几条", "int", min=1, max=20),
+    _F("feeds.lookback_days", "查重天数", "和最近几天的比，重复不要", "int", min=1, max=90),
+    _F("feeds.web_min_avg", "上网页分数", "满分 5，越高越挑", "float", min=1.0, max=5.0),
+    _F("feeds.pool_min_avg", "开话题分数", "满分 5，够分才拿去开话题", "float", min=1.0, max=5.0),
+    _F("feeds.guides", "找文章", "顺便找教程、好文章和工具", "bool"),
+    _F("feeds.collect_minutes", "找资讯时长", "到点就交回已找到的", "int", min=1, max=60),
+    _F("feeds.viz_per_day", "每日图解", "没配图的画张图；0 = 不画", "int", min=0, max=10),
 
     # ---- goals ----
 
     # ---- topics ----
     # 0.8.0：enabled / speaker / per_day 归每个群自己一份（group_managed，不在网页列出、
     # 不能改）；config.toml 里那几行只作新群第一次的迁移种子（migrations.migrate_group_controls）。
-    _F("topics.enabled", "冷场开话题", "群里冷场时开个话题（现在每个群自己一份，到群页改）", "bool"),
-    _F("topics.speaker", "开话题谁说", "maiwork = MaiWork 直接说一句；maibot = 请 MaiBot 开口（已退役/每群自己一份）", "enum", options=["maiwork", "maibot"]),
-    _F("topics.per_day", "每天开话题上限", "现在并进每群的每日总上限（到群页改）", "int", min=1, max=10),
-    _F("topics.min_gap_hours", "两次开话题最小间隔（小时）", "", "int", min=1, max=24),
-    _F("topics.candidate_ttl_hours", "话题候选有效期（小时）", "", "int", min=1, max=72),
+    _F("topics.enabled", "开话题", "已改到群页单独设", "bool"),
+    _F("topics.speaker", "谁来开口", "已停用，改到群页", "enum", options=["maiwork", "maibot"]),
+    _F("topics.per_day", "每日话题数", "已并入群页每日上限", "int", min=1, max=10),
+    _F("topics.min_gap_hours", "话题间隔", "两次至少隔几小时", "int", min=1, max=24),
+    _F("topics.candidate_ttl_hours", "话题保鲜", "备好的话题几小时内有效", "int", min=1, max=72),
 
     # ---- delivery ----
     # 0.8.0：push_per_day / quiet_hours 归每个群自己一份（group_managed），只作迁移种子。
-    _F("delivery.push_per_day", "每天推送上限", "并进每群的每日总上限（到群页改）", "int", min=1, max=10),
-    _F("delivery.quiet_hours", "睡觉时段", "现在每个群自己一份（到群页改），比如 23:00-08:00", "str", check=_check_quiet_hours),
+    _F("delivery.push_per_day", "每日推送", "已并入群页每日上限", "int", min=1, max=10),
+    _F("delivery.quiet_hours", "睡觉时段", "已改到群页单独设", "str", check=_check_quiet_hours),
 
     # ---- approval ----
     # 0.8.0：required / admins / exempt_groups / exempt_users 归每个群自己一份
     # （kv["group_approval.<群号>"]，group_managed），只作迁移种子；这里保留规格是为了
     # schema 覆盖面检查与老种子的校验口径。
-    _F("approval.required", "派活要批准", "现在每个群自己一份（到群页改）", "bool"),
-    _F("approval.admins", "bot 管理员", "谁能批本群的活（现在每个群自己一份，到群页改）；写成 qq:账号", "list_str", check=_check_account_list("管理员")),
-    _F("approval.exempt_groups", "免批的群", "现在每个群自己一份（到群页改）：写成 qq:群号", "list_str", check=_check_account_list("免批的群")),
-    _F("approval.exempt_users", "免批的人", "现在每个群自己一份（到群页改）：写成 qq:账号", "list_str", check=_check_account_list("免批的人")),
-    _F("approval.remind", "待批提醒", "超过 24 小时没人批，在群里提醒一次", "bool"),
-    _F("approval.auto_review", "自动审核轻活", "调研、找东西、做个小网页这类低风险小活，直接开工", "bool"),
-    _F("approval.auto_review_daily", "每群每天最多自动批", "0 = 关掉自动审核；要花钱、对外发消息、大工程照旧等你批",
+    _F("approval.required", "派活要批", "已改到群页单独设", "bool"),
+    _F("approval.admins", "批准人", "已改到群页单独设", "list_str", check=_check_account_list("管理员")),
+    _F("approval.exempt_groups", "免批的群", "已改到群页单独设", "list_str", check=_check_account_list("免批的群")),
+    _F("approval.exempt_users", "免批的人", "已改到群页单独设", "list_str", check=_check_account_list("免批的人")),
+    _F("approval.remind", "待批提醒", "一天没人批就在群里提醒", "bool"),
+    _F("approval.auto_review", "小活自动批", "查资料、做小网页这类直接开工", "bool"),
+    _F("approval.auto_review_daily", "自动批上限", "每群每天几件；0 = 关。花钱、对外发消息、大工程照样等你批",
        "int", min=0, max=50),
 
     # ---- jev ----
-    _F("jev.enabled", "用 Jev 快速判断", "关掉会慢一些、贵一些", "bool"),
-    _F("jev.timeout_ms", "Jev 超时（毫秒）", "", "int", min=200, max=1200),
+    _F("jev.enabled", "快速判断", "关掉会慢一点、贵一点", "bool"),
+    _F("jev.timeout_ms", "等待上限", "超过几毫秒就不等了", "int", min=200, max=1200),
     _F("jev.api_key", "Jev 密钥", "", "secret"),
-    _F("jev.key_file", "Jev 密钥文件路径", "一般不用填", "str", check=_check_path_str("Jev 密钥文件路径")),
-    _F("jev.api_url", "Jev 服务端地址", "一般不用改", "str", check=_check_jev_url),
-    _F("jev.model", "Jev 模型名", "一般不用改", "str", check=_check_name_str("Jev 模型名")),
+    _F("jev.key_file", "密钥文件", "一般不用填", "str", check=_check_path_str("Jev 密钥文件路径")),
+    _F("jev.api_url", "服务地址", "一般不用改", "str", check=_check_jev_url),
+    _F("jev.model", "模型名", "一般不用改", "str", check=_check_name_str("Jev 模型名")),
 
     # ---- usage ----
-    _F("usage.alert_daily_tokens", "每日 token 提醒线", "0 = 不提醒", "int", min=0, max=10**9),
-    _F("usage.alert_task_tokens", "单任务 token 提醒线", "0 = 不提醒", "int", min=0, max=10**9),
+    _F("usage.alert_daily_tokens", "每日提醒线", "每天用超就提醒；0 = 不提醒", "int", min=0, max=10**9),
+    _F("usage.alert_task_tokens", "任务提醒线", "一件任务用超就提醒；0 = 不提醒", "int", min=0, max=10**9),
 
     # ---- models（2026-10 改版 1a：端点/模型库走 /api/settings/endpoints*、/api/settings/model-list*；
     #      [models].* 从「全部配置」拿掉，这里不登记） ----
 
     # ---- tasks ----
-    _F("tasks.token_limit", "单个任务最多用多少 token", "超过就自动暂停等你决定（0 = 不限）；点「继续」后重新计算", "int", min=0, max=10**9),
-    _F("tasks.run_seconds", "单个任务最长做多久（秒）", "做满就自动暂停等你决定（0 = 不限，默认 10800 = 3 小时）；点「继续」后重新计时", "int", min=0, max=30*86400),
+    _F("tasks.token_limit", "用量上限", "一件任务用超就暂停；0 = 不限", "int", min=0, max=10**9),
+    _F("tasks.run_seconds", "时长上限", "做太久就暂停（秒）；0 = 不限", "int", min=0, max=30*86400),
 
     # ---- console ----
-    _F("console.listen", "网页监听地址", "写成 IP:端口", "str", check=_check_listen),
-    _F("console.password", "管理员密码", "", "secret"),
-    _F("console.public_url", "网页对外地址", "用来生成群链接，比如 https://maiwork.example.com", "str", check=_check_public_url),
-    _F("console.update_check", "查新版本", "打开网页时看看 GitHub 上有没有 MaiWork 新版，有就提醒（更新去 MaiBot 的插件管理点）", "bool"),
-    _F("console.maibot_webui_url", "MaiBot 网页地址", "填了，更新提醒里有直达按钮，比如 http://127.0.0.1:8001", "str", check=_check_public_url),
+    _F("console.listen", "监听地址", "写成 IP:端口", "str", check=_check_listen),
+    _F("console.password", "管理密码", "", "secret"),
+    _F("console.public_url", "公开网址", "群链接要用，如 https://maiwork.example.com", "str", check=_check_public_url),
+    _F("console.update_check", "检查更新", "有新版就在网页提醒", "bool"),
+    _F("console.maibot_webui_url", "MaiBot 网址", "填了更新时能一键直达，如 http://127.0.0.1:8001", "str", check=_check_public_url),
 
     # ---- environments ----
-    _F("environments.railway", "允许用 Railway 临时 VM", "", "bool"),
-    _F("environments.ssh", "专用 SSH 机器", "自己的 VPS / VM：要跑命令的活优先用它们。先把「运行状态」里的公钥加进机器的 ~/.ssh/authorized_keys；各台的情况和用途写进「做事规矩」（AGENTS.md），主模型按它挑", "ssh_list"),
-    _F("environments.workspace_root", "远端工作区根目录", "", "str", check=_check_workspace_root),
-    _F("environments.memory_max", "单条命令内存上限", "比如 512M、1G", "str", check=_check_memory_max),
-    _F("environments.runtime_max_sec", "单条命令最长秒数", "", "int", min=10, max=86400),
-    _F("environments.local_mode", "本机执行方式", "", "enum", options=["systemd"], check=_check_local_mode),
-    _F("environments.run_as", "本机运行用户", "", "str", check=_check_run_as),
-    _F("environments.max_parallel", "同时子 agent 数", "", "int", min=1, max=10),
-    _F("environments.command_timeout_s", "子 agent 单条命令默认时长（秒）", "", "int", min=10, max=3600),
-    _F("environments.railway_daily_max", "Railway 每日上限", "官方限制每天最多 3 台", "int", min=1, max=3),
-    _F("environments.verify_enabled", "资讯实测（上 VM 试一试）", "挑几条资讯上 Railway 一次性 VM 真跑一遍，结果写进网页", "bool"),
-    _F("environments.verify_per_round", "每轮实测条数", "", "int", min=1, max=3),
-    _F("environments.verify_minutes", "单条实测时长上限（分钟）", "", "int", min=1, max=60),
+    _F("environments.railway", "临时机器", "允许用 Railway 一次性机器", "bool"),
+    _F("environments.ssh", "自有机器", "你自己的服务器，要跑命令的活优先用它。设置分两步：① 把「概况 → 运行状态」里的公钥加到机器的 ~/.ssh/authorized_keys；② 在主模型的 AGENTS.md 里写清每台机器的情况和用途，主模型会照着挑", "ssh_list"),
+    _F("environments.workspace_root", "远端目录", "在远端机器上放文件的地方", "str", check=_check_workspace_root),
+    _F("environments.memory_max", "内存上限", "每条命令最多用多少，如 1G", "str", check=_check_memory_max),
+    _F("environments.runtime_max_sec", "命令时长", "每条命令最多跑几秒", "int", min=10, max=86400),
+    _F("environments.local_mode", "本机方式", "本机怎么隔离运行", "enum", options=["systemd"], check=_check_local_mode),
+    _F("environments.run_as", "运行账号", "本机用哪个账号跑", "str", check=_check_run_as),
+    _F("environments.max_parallel", "同时几个", "最多几个子 agent 一起干", "int", min=1, max=10),
+    _F("environments.command_timeout_s", "默认时长", "每条命令默认跑几秒", "int", min=10, max=3600),
+    _F("environments.railway_daily_max", "每日台数", "每天最多几台（官方上限 3）", "int", min=1, max=3),
+    _F("environments.verify_enabled", "实测资讯", "挑几条真跑一遍，结果放网页", "bool"),
+    _F("environments.verify_per_round", "实测条数", "每轮试几条", "int", min=1, max=3),
+    _F("environments.verify_minutes", "实测时长", "每条最多试几分钟", "int", min=1, max=60),
 
     # ---- profile ----
-    _F("profile.batch_messages", "攒多少条提炼一次", "", "int", min=10, max=1000),
-    _F("profile.max_interval_hours", "提炼最长间隔（小时）", "", "int", min=1, max=72),
-    _F("profile.backfill_days", "首次往回读几天", "", "int", min=1, max=30),
-    _F("profile.backfill_max_messages", "首次最多读多少条", "", "int", min=100, max=10000),
-    _F("profile.weekly_day", "每周整理日", "0 = 周一，6 = 周日", "int", min=0, max=6),
-    _F("profile.read_interval_minutes", "读消息间隔（分钟）", "", "int", min=1, max=120),
+    _F("profile.batch_messages", "更新频率", "攒够几条消息更新一次画像", "int", min=10, max=1000),
+    _F("profile.max_interval_hours", "最长间隔", "最多隔几小时也要更新", "int", min=1, max=72),
+    _F("profile.backfill_days", "回读天数", "刚加入时往回读几天", "int", min=1, max=30),
+    _F("profile.backfill_max_messages", "回读条数", "刚加入时最多读几条", "int", min=100, max=10000),
+    _F("profile.weekly_day", "周整理日", "0 = 周一，6 = 周日", "int", min=0, max=6),
+    _F("profile.read_interval_minutes", "读取间隔", "每隔几分钟读新消息", "int", min=1, max=120),
 
     # ---- storage ----
-    _F("storage.data_dir", "数据目录", "", "str",
-       readonly=True, readonly_reason="只能在服务器上改"),
+    _F("storage.data_dir", "数据目录", "只能在服务器改", "str",
+       readonly=True, readonly_reason="只能在服务器改"),
 
     # ---- group_space ----
-    _F("group_space.enabled", "开群空间", "群文件、公告和相册", "bool"),
-    _F("group_space.notice_per_day", "每天群公告上限", "", "int", min=1, max=5),
+    _F("group_space.enabled", "群空间", "允许用群文件、公告和相册", "bool"),
+    _F("group_space.notice_per_day", "每日公告", "每天最多发几条公告", "int", min=1, max=5),
 
     # ---- reader ----
-    _F("reader.jina_enabled", "先用 Jina Reader 打开网页",
-       "读不到或限流时马上换「抓网页正文」工具，再不行直接打开", "bool"),
-    _F("reader.jina_api_key", "Jina Reader 密钥",
-       "可选。不填每分钟 20 次（按服务器 IP 算），填了 500 次；在 jina.ai 免费申请", "secret"),
+    _F("reader.jina_enabled", "用 Jina 读",
+       "先用 Jina，读不到再换", "bool"),
+    _F("reader.jina_api_key", "Jina 密钥",
+       "可选；填了每分钟 500 次（不填 20 次），jina.ai 免费申请", "secret"),
 ]
 
 CONFIG_SECTIONS: list[dict[str, str]] = [
-    {"id": "groups", "label": "服务群"},
-    {"id": "focus", "label": "关注成员"},
+    {"id": "groups", "label": "服务的群"},
+    {"id": "focus", "label": "关注的人"},
     {"id": "feeds", "label": "资讯"},
     {"id": "goals", "label": "目标"},
-    {"id": "topics", "label": "冷场开话题"},
-    {"id": "delivery", "label": "推送"},
-    {"id": "approval", "label": "派活批准"},
-    {"id": "tasks", "label": "任务安全网"},
+    {"id": "topics", "label": "开话题"},
+    {"id": "delivery", "label": "主动发言"},
+    {"id": "approval", "label": "派活审批"},
+    {"id": "tasks", "label": "任务上限"},
     {"id": "models", "label": "模型"},
     {"id": "jev", "label": "快速判断"},
     {"id": "usage", "label": "用量提醒"},
     {"id": "console", "label": "网页"},
-    {"id": "environments", "label": "执行环境"},
+    {"id": "environments", "label": "干活机器"},
     {"id": "profile", "label": "群画像"},
-    {"id": "storage", "label": "数据存储"},
+    {"id": "storage", "label": "数据"},
     {"id": "group_space", "label": "群空间"},
-    {"id": "reader", "label": "打开网页"},
+    {"id": "reader", "label": "读网页"},
 ]
 
 CONFIG_BY_KEY: dict[str, dict[str, Any]] = {f["key"]: f for f in CONFIG_SCHEMA}
+_SECTION_LABEL: dict[str, str] = {s["id"]: s["label"] for s in CONFIG_SECTIONS}
+
+
+def full_label(key: str) -> str:
+    """「节名 · 项名」。网页上项名很短、靠所在分节看懂；管理员对话等单独出现的地方用这个。"""
+    spec = CONFIG_BY_KEY.get(key)
+    if not spec:
+        return key
+    name = str(spec.get("label") or key)
+    sec = _SECTION_LABEL.get(key.partition(".")[0], "")
+    return name if not sec or sec == name else f"{sec} · {name}"
 
 KV_CONFIG_OVERRIDE = "config.override"  # 已废弃的 kv 键名（迁移用；数据库不再存配置覆盖层）
 
@@ -661,7 +672,7 @@ def save_config_patch(store: Any, body: Any, *, base: Settings, plugin_dir: Any 
         spec = CONFIG_BY_KEY.get(key)
         if spec is None:
             raise ValueError(f'不认识或不能在这里改的字段 "{key}"（[models] 走「设置 → 模型」、'
-                             "[extensions] 走「设置 → 扩展」、plugin.config_version 不可改）")
+                             "[extensions] 走「设置 → 工具」、plugin.config_version 不可改）")
         hint = group_managed_hint(key)
         if hint:
             raise ValueError(f"「{spec['label']}」现在每个群自己一份，到「{hint}」里改；"

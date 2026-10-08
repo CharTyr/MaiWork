@@ -444,7 +444,7 @@ class TestWriteTools:
         # 放宽（间隔缩短 = 开话题更勤）：要确认，同意后才生效
         r2, ticket = await _call_confirmed(app, "set_rules", {"patch": {"topics": {"min_gap_hours": 1}}})
         assert r2.ok, r2.error
-        assert "开话题最小间隔" in ticket["summary"] and "min_gap_hours" not in ticket["summary"]
+        assert "话题间隔" in ticket["summary"] and "min_gap_hours" not in ticket["summary"]
         assert app.get_settings().topics.min_gap_hours == 1
 
     @pytest.mark.asyncio

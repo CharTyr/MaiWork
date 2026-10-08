@@ -56,11 +56,11 @@ def test_blocked_row_shows_count_titles_reasons_and_is_admin_only_labeled(tmp_pa
         {"ts": 1, "kind": "group", "title": "帮大家约<开黑>", "reason": "要群友参与"},
         {"ts": 2, "kind": "personal", "title": "帮你找生蚝店", "reason": "要线下"},
     ]}})
-    assert "拦下 3 条 MaiWork 做不到的构想" in html
-    assert "只有管理员看得到" in html
+    assert "拦下 3 条做不到的" in html
+    assert "仅管理员可见" in html
     assert "帮大家约&lt;开黑&gt;" in html and "<开黑>" not in html
     assert "要群友参与" in html and "要线下" in html
-    assert "个人向" in html
+    assert "给个人" in html
     # 折叠在副标题下、列表之前
     assert html.index("idea-blocked") < html.index("我可以整理一份清单")
 

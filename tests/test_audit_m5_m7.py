@@ -81,7 +81,7 @@ class TestM7SearchCheckBindingOnly:
         feeds = self._feeds(store, search_obj)
         with pytest.raises(SearchUnavailable) as e:
             await feeds._ensure_search()
-        assert "扩展" in str(e.value)
+        assert "设置 → 工具" in str(e.value)
 
     @pytest.mark.asyncio
     async def test_fake_search_still_probed(self, tmp_path: Path) -> None:

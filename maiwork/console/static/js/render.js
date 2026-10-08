@@ -21,9 +21,9 @@ export function renderTop() {
   if (state.page === "chat") {
     $("top").innerHTML = `
       <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="${esc(botName())}" />
-      <div class="chip">和 MaiWork 聊</div>
+      <div class="chip">聊天</div>
       <div class="chip-sub">管理员</div>
-      <button class="round-btn" data-act="tab" data-tab="${state.tab}" aria-label="回到群">${SVG.close}</button>`;
+      <button class="round-btn" data-act="tab" data-tab="${state.tab}" aria-label="返回">${SVG.close}</button>`;
     return;
   }
   if (state.page === "settings") {
@@ -31,18 +31,18 @@ export function renderTop() {
       <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="${esc(botName())}" />
       <div class="chip">设置</div>
       <div class="chip-sub">管理员</div>
-      <button class="round-btn" data-act="tab" data-tab="${state.tab}" aria-label="回到群">${SVG.close}</button>`;
+      <button class="round-btn" data-act="tab" data-tab="${state.tab}" aria-label="返回">${SVG.close}</button>`;
     return;
   }
   const g = grp();
   const q = quiet(g);
   $("top").innerHTML = `
     <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="${esc(botName())}" />
-    ${admin() && state.groups.length > 1 ? `<button class="chip" data-act="groups" aria-label="切换群，当前：${esc(gname(g))}">${mq(gname(g))}${SVG.down}</button>` : `<div class="chip">${mq(gname(g))}</div>`}
+    ${admin() && state.groups.length > 1 ? `<button class="chip" data-act="groups" aria-label="换群，现在是 ${esc(gname(g))}">${mq(gname(g))}${SVG.down}</button>` : `<div class="chip">${mq(gname(g))}</div>`}
     <div class="chip-sub"><span class="dot ${q.live ? "ok" : ""}"></span>${esc(q.text)}</div>
     ${
       admin()
-        ? `<button class="round-btn left" data-act="chat" aria-label="和 MaiWork 聊">${SVG.chat}</button><button class="round-btn" data-act="settings" aria-label="设置">${SVG.sliders}</button>`
+        ? `<button class="round-btn left" data-act="chat" aria-label="聊天">${SVG.chat}</button><button class="round-btn" data-act="settings" aria-label="设置">${SVG.sliders}</button>`
         : `<button class="round-btn" data-act="login" aria-label="${isGA() ? "群管理员" : "管理员登录"}">${SVG.key}</button>`
     }`;
 }
@@ -72,7 +72,7 @@ export function renderRail() {
   $("rail").innerHTML = `
     <div class="brand">
       <img src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="${esc(botName())}" />
-      <div class="brand-t"><div class="brand-name">MaiWork</div><div class="brand-sub">${admin() ? "管理员 · 全部群" : isGA() ? "群管理员" : esc(botName()) + "的后台"}</div></div>
+      <div class="brand-t"><div class="brand-name">MaiWork</div><div class="brand-sub">${admin() ? "管理员 · 所有群" : isGA() ? "群管理员" : esc(botName()) + " 的工作台"}</div></div>
     </div>
     ${admin() ? `<div class="rail-label">群</div>` : ""}
     ${list
@@ -95,10 +95,10 @@ export function renderRail() {
       </button>`
     ).join("")}
     <div class="rail-foot">
-      ${admin() ? `<button class="r-item" data-act="chat" title="和 MaiWork 聊" aria-current="${state.page === "chat"}">${SVG.chat}<span class="r-text"><span class="r-name">和 MaiWork 聊</span></span></button>` : ""}
+      ${admin() ? `<button class="r-item" data-act="chat" title="聊天" aria-current="${state.page === "chat"}">${SVG.chat}<span class="r-text"><span class="r-name">聊天</span></span></button>` : ""}
       ${
         admin()
-          ? `<button class="r-item" data-act="settings" title="设置" aria-current="${state.page === "settings"}">${SVG.sliders}<span class="r-text"><span class="r-name">设置</span></span>${state.settings && state.settings.models && !state.settings.models.ready ? `<span class="r-badge">!</span><span class="r-dot"></span>` : hasUpdate() ? `<span class="r-badge upd">新</span><span class="r-dot upd"></span>` : ""}</button>`
+          ? `<button class="r-item" data-act="settings" title="设置" aria-current="${state.page === "settings"}">${SVG.sliders}<span class="r-text"><span class="r-name">设置</span></span>${state.settings && state.settings.models && !state.settings.models.ready ? `<span class="r-badge">!</span><span class="r-dot"></span>` : hasUpdate() ? `<span class="r-badge upd">有更新</span><span class="r-dot upd"></span>` : ""}</button>`
           : `<button class="r-item" data-act="login" title="${isGA() ? "群管理员" : "管理员"}">${SVG.key}<span class="r-text"><span class="r-name">${isGA() ? "群管理员" : "管理员"}</span></span></button>`
       }
     </div>`;
@@ -124,7 +124,7 @@ export function renderSide() {
     return;
   }
   if (state.detail) {
-    $("side").innerHTML = `<button class="side-close" data-act="side-close" aria-label="关闭详情">${SVG.close}</button>${detailHTML()}`;
+    $("side").innerHTML = `<button class="side-close" data-act="side-close" aria-label="关闭">${SVG.close}</button>${detailHTML()}`;
     return;
   }
   const v = gview();
@@ -136,7 +136,7 @@ export function renderSide() {
     <div class="stats">
       <button class="stat" data-act="tab" data-tab="news"><b>${t.news || 0}</b><span>条资讯</span></button>
       <button class="stat" data-act="tab" data-tab="group"><b>${t.topics || 0}</b><span>次开话题</span></button>
-      <button class="stat" data-act="tab" data-tab="tasks"><b>${t.pending || 0}</b><span>${gadmin() ? "件等你批准" : "件等批准"}</span></button>
+      <button class="stat" data-act="tab" data-tab="tasks"><b>${t.pending || 0}</b><span>${gadmin() ? "件等你批" : "件等批"}</span></button>
       <button class="stat" data-act="tab" data-tab="tasks"><b>${t.running || 0}</b><span>件在做</span></button>
     </div>
     ${
@@ -237,11 +237,11 @@ function landing() {
     <div class="landing">
       <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="" style="width:120px;height:120px" />
       <h1 class="h-page" style="margin-top:22px">MaiWork</h1>
-      <p class="landing-text">${esc(botName())}在群里的后台：资讯、构想和在做的事都在这里。</p>
-      ${bad ? `<div class="warn-box" style="width:100%;text-align:left">这个链接打不开了：可能是管理员重置过，或者复制时少了几个字。请在群里重新发 <b>/mw 网页</b> 拿新链接。</div>` : ""}
+      <p class="landing-text">资讯、构想和任务，都在这里。</p>
+      ${bad ? `<div class="warn-box" style="width:100%;text-align:left">链接失效了。在群里发 <b>/mw 网页</b> 拿个新的。</div>` : ""}
       <div class="landing-box">
-        <div class="landing-t">群友</div>
-        <p>在群里发 <b>/mw 网页</b>，${esc(botName())}会回一个本群专属链接，打开就能看到这个群的内容。</p>
+        <div class="landing-t">我是群友</div>
+        <p>在群里发 <b>/mw 网页</b>，就能拿到本群链接。</p>
       </div>
       <button class="btn primary" data-act="login" style="margin-top:20px;height:48px;padding:0 28px">管理员登录</button>
     </div>`;
@@ -251,9 +251,9 @@ function noGroups() {
   return `
     <div class="landing">
       <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="" style="width:120px;height:120px" />
-      <h1 class="h-page" style="margin-top:22px">还没有服务群</h1>
-      <p class="landing-text">在设置里加上要服务的群</p>
-      <button class="btn primary" data-act="settings" style="height:48px;padding:0 28px">打开设置</button>
+      <h1 class="h-page" style="margin-top:22px">还没有群</h1>
+      <p class="landing-text">先在设置里加个群</p>
+      <button class="btn primary" data-act="settings" style="height:48px;padding:0 28px">去设置</button>
     </div>`;
 }
 
@@ -274,7 +274,7 @@ export function render() {
   renderView();
   renderSide();
   if (onSettings) {
-    document.title = state.page === "chat" ? "和 MaiWork 聊 · MaiWork" : "设置 · MaiWork";
+    document.title = state.page === "chat" ? "聊天 · MaiWork" : "设置 · MaiWork";
     return;
   }
   const label = TABS.find((t) => t.id === state.tab).label;

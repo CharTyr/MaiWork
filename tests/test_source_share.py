@@ -126,9 +126,9 @@ def _render(tmp_path, trusted):
 def test_frontend_share_line(tmp_path):
     html = _render(tmp_path, {"trusted": [{"domain": "good.example", "high": 3, "up": 0}], "removed": [],
                               "share": {"days": 14, "total": 8, "trusted": 4, "rss": 2, "other": 2}})
-    assert "近 14 天入选 8 条" in html
-    assert "来自优质来源 4 条（50%）" in html
-    assert "订阅 RSS 带来 2 条" in html and "其他 2 条" in html
+    assert "近 14 天 8 条" in html
+    assert "优质 4（50%）" in html
+    assert "RSS 2" in html and "其他 2" in html
     assert 'class="fine trusted-share"' in html
 
 

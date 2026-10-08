@@ -19,12 +19,12 @@ def _read(name: str) -> str:
 
 
 def test_paused_task_settings_hint_only_for_top_admin() -> None:
-    """任务因用量 / 时长上限自动暂停：只有总管理员的说明里才提「设置 → 全部配置 → 任务安全网」。"""
+    """任务因用量 / 时长上限自动暂停：只有总管理员的说明里才提「设置 → 全部设置 → 任务上限」。"""
     src = _read("detail.js")
     m = re.search(r"function pausedBlock\(t\) \{(.*?)\n\}", src, re.S)
     assert m, "detail.js 里找不到 pausedBlock"
     body = m.group(1)
-    assert "任务安全网" in body, "总管理员仍应被告知上限在哪改"
+    assert "任务上限" in body, "总管理员仍应被告知上限在哪改"
     # 提到设置页的那句话必须挂在 admin() 分支上（不能是 gadmin()，群管理员也会命中）：
     # 往前找离它最近的「xxx() ?」条件
     for m2 in re.finditer(r"设置 →", body):

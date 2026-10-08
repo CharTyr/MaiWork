@@ -1300,6 +1300,82 @@ class TestM2Loop:
             await app.stop()
 
     @pytest.mark.asyncio
+    async def test_idea_shelve_runs_before_schedule(self, tmp_path: Path) -> None:
+        """线上 2026-10-08：先判堆积闸、几分钟后才收起过期构想，当天名额白白空着。
+        同一轮里必须先收起、再排程。"""
+        from fakes import FakeFeeds, FakeScheduler
+
+        order: list[str] = []
+        feeds = FakeFeeds()
+        feeds.shelve_ignored_ideas = lambda gid, now: order.append(f"shelve:{gid}")  # type: ignore[attr-defined]
+        scheduler = FakeScheduler()
+        orig_due = scheduler.due
+
+        def _due(gid, now, **kw):
+            order.append(f"due:{gid}")
+            return orig_due(gid, now, **kw)
+
+        scheduler.due = _due  # type: ignore[method-assign]
+        app = _app(tmp_path)
+        app.feeds_factory = lambda *a, **kw: feeds
+        app.scheduler_factory = lambda *a, **kw: scheduler
+        await app.start()
+        try:
+            await app.run_loop_once()
+            assert order.index(f"shelve:{G1}") < order.index(f"due:{G1}")
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_idea_blocked_by_pile_is_not_marked_done_and_rechecked(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """堆积闸挡住 = 暂时受阻：不开长活、不记当天做过；节流后重查，有名额就照常出构想。"""
+        from fakes import FakeFeeds, FakeScheduler
+
+        from CharTyr_MaiWork.maiwork import app as app_mod
+
+        t = [1_800_000_000.0]
+        monkeypatch.setattr(app_mod, "_now", lambda: t[0])
+        feeds = FakeFeeds()
+        room = {"ok": False}
+        checks: list[str] = []
+
+        def _idea_room(gid):
+            checks.append(gid)
+            return room["ok"]
+
+        feeds.idea_room = _idea_room  # type: ignore[attr-defined]
+        scheduler = FakeScheduler()
+        scheduler.due_map[G2] = [["idea"], ["idea"], ["idea"]]
+        app = _app(tmp_path)
+        app.feeds_factory = lambda *a, **kw: feeds
+        app.scheduler_factory = lambda *a, **kw: scheduler
+        await app.start()
+        try:
+            await app.run_loop_once()
+            await asyncio.sleep(0.05)
+            assert feeds.make_idea_calls == []
+            assert not any(c[0] == G2 and c[1] == "idea" for c in scheduler.done_calls)
+            # 节流：一分钟后再到点，不重查
+            t[0] += 60
+            room["ok"] = True
+            await app.run_loop_once()
+            await asyncio.sleep(0.05)
+            assert checks.count(G2) == 1 and feeds.make_idea_calls == []
+            # 节流期过了：有名额就照常开
+            t[0] += 15 * 60
+            await app.run_loop_once()
+            for _ in range(40):
+                if G2 in feeds.make_idea_calls and any(c[0] == G2 and c[1] == "idea" for c in scheduler.done_calls):
+                    break
+                await asyncio.sleep(0.02)
+            assert feeds.make_idea_calls == [G2]
+            assert any(c[0] == G2 and c[1] == "idea" for c in scheduler.done_calls)
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
     async def test_goal_job_ignored_since_feature_removed(self, tmp_path: Path) -> None:
         """主动提目标已删（2026-10 docs/18）：scheduler 递来的 goal 场合什么都不做，不炸。"""
         from fakes import FakeFeeds, FakeScheduler

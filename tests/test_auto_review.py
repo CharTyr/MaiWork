@@ -549,7 +549,7 @@ class TestConfig:
 
         f = CONFIG_BY_KEY["approval.auto_review"]
         assert f["type"] == "bool"
-        assert "自动审核" in f["label"]
+        assert "自动批" in f["label"]
         g = CONFIG_BY_KEY["approval.auto_review_daily"]
         assert g["type"] == "int"
         assert "自动批" in g["label"]

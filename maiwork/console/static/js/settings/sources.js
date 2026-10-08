@@ -10,12 +10,12 @@ export function sourcesPage(s) {
   const groups = s.groups || [];
   return `
     <h2 class="h-sub" style="margin-top:18px">RSS</h2>
-    <p class="h-meta">优先看这些来源，每个群最多 20 个；标「自动」的是 MaiWork 按群里的反应自己订的，删掉就不再推荐</p>
-    ${groups.length ? groups.map((g) => rssGroup(g, rss[g.id] || [])).join("") : `<p class="h-meta">还没有服务群。</p>`}
+    <p class="h-meta">优先看这些，每群最多 20 个；「自动」是自己订的，删掉就不再推荐</p>
+    ${groups.length ? groups.map((g) => rssGroup(g, rss[g.id] || [])).join("") : `<p class="h-meta">还没有群</p>`}
     <h2 class="h-sub">优质来源</h2>
-    <p class="h-meta">从每个群最近上了网页的高分资讯里自动攒出来的，找资讯时会优先去这些站看；不想要的可以移出</p>
+    <p class="h-meta">按高分资讯自动攒的，会优先看</p>
     ${groups.map((g) => trustedGroup(g)).join("")}
-    <h2 class="h-sub">屏蔽的来源</h2>
+    <h2 class="h-sub">屏蔽的</h2>
     ${feedsSettings(s.feeds, groups)}`;
 }
 
@@ -37,15 +37,15 @@ function trustedGroup(g) {
     ? (v.trusted || [])
         .map(
           (t) => `
-      <div class="set-row">${ico("pushpin")}<div><div class="set-name">${esc(t.domain)}</div><div class="set-text">近期 ${t.high} 条高分${t.up ? `，群友点有用 ${t.up} 次` : ""}</div></div>
-        <span class="row-btns"><button class="btn small" data-act="trusted-toggle" data-g="${esc(g.id)}" data-domain="${esc(t.domain)}" data-on="1">移出</button></span></div>`
+      <div class="set-row">${ico("pushpin")}<div><div class="set-name">${esc(t.domain)}</div><div class="set-text">${t.high} 条高分${t.up ? ` · ${t.up} 次有用` : ""}</div></div>
+        <span class="row-btns"><button class="btn small" data-act="trusted-toggle" data-g="${esc(g.id)}" data-domain="${esc(t.domain)}" data-on="1">移除</button></span></div>`
         )
         .join("") +
       (v.removed || [])
         .map(
           (d) => `
-      <div class="set-row is-off">${ico("pushpin")}<div><div class="set-name">${esc(d)}</div><div class="set-text">你移出的</div></div>
-        <span class="row-btns"><button class="btn small" data-act="trusted-toggle" data-g="${esc(g.id)}" data-domain="${esc(d)}" data-on="0">放回</button></span></div>`
+      <div class="set-row is-off">${ico("pushpin")}<div><div class="set-name">${esc(d)}</div><div class="set-text">你移除的</div></div>
+        <span class="row-btns"><button class="btn small" data-act="trusted-toggle" data-g="${esc(g.id)}" data-domain="${esc(d)}" data-on="0">恢复</button></span></div>`
         )
         .join("")
     : "";
@@ -53,7 +53,7 @@ function trustedGroup(g) {
     <div class="rss-group trusted-g" data-g="${esc(g.id)}">
       <div class="rss-gname">${mq(g.name || `群 ${g.id}`)}</div>
       ${v ? shareLine(v.share) : ""}
-      ${v == null ? `<p class="fine">读取中…</p>` : rows || `<p class="fine">还没攒出来：同一个站至少要有 2 条高分资讯</p>`}
+      ${v == null ? `<p class="fine">读取中…</p>` : rows || `<p class="fine">还没有，一个站要 2 条高分</p>`}
     </div>`;
 }
 
@@ -62,7 +62,7 @@ function shareLine(sh) {
   if (!sh || !sh.total) return "";
   const n = (k) => Number(sh[k]) || 0;
   const pct = Math.round((n("trusted") / n("total")) * 100);
-  return `<p class="fine trusted-share">近 ${esc(n("days") || 14)} 天入选 ${esc(n("total"))} 条：来自优质来源 ${esc(n("trusted"))} 条（${esc(pct)}%）、订阅 RSS 带来 ${esc(n("rss"))} 条、其他 ${esc(n("other"))} 条</p>`;
+  return `<p class="fine trusted-share">近 ${esc(n("days") || 14)} 天 ${esc(n("total"))} 条：优质 ${esc(n("trusted"))}（${esc(pct)}%）· RSS ${esc(n("rss"))} · 其他 ${esc(n("other"))}</p>`;
 }
 
 // RSS 一个群：源列表 + 自动订阅说明（自动订阅记录 / 来源地图 / 命中率按群懒加载进 state.rssAuto[群]，
@@ -87,7 +87,7 @@ function rssGroup(g, list) {
           ${list.map((f) => rssRow(g, f, hits[f.id])).join("")}
           <form class="rss-add" data-g="${esc(g.id)}" autocomplete="off">
             <input type="url" inputmode="url" spellcheck="false" placeholder="https://…/feed.xml" aria-label="RSS 地址" />
-            <button class="btn small" type="submit">加上</button>
+            <button class="btn small" type="submit">添加</button>
           </form>
           ${v ? autoDetails(v) : ""}
         </div>`;
@@ -96,17 +96,17 @@ function rssGroup(g, list) {
 function rssRow(g, f, hit) {
   const lines = [];
   if (f.auto && f.reason) lines.push(`<div class="set-text">${esc(f.reason)}</div>`);
-  if (f.auto && f.trial_until > now()) lines.push(`<div class="set-text">试用到${esc(dayWord(f.trial_until))}，两周没成绩会自己退订</div>`);
-  if (hit) lines.push(`<div class="set-text">近 ${hit.days} 天给了 ${hit.cand} 条，进资讯 ${hit.kept} 条</div>`);
-  if (f.last_error) lines.push(`<div class="set-text bad-t">上次没取到：${esc(f.last_error)}</div>`);
-  else if (f.last_ok_ts) lines.push(`<div class="set-text">${esc(dayWord(f.last_ok_ts))}取过</div>`);
+  if (f.auto && f.trial_until > now()) lines.push(`<div class="set-text">试用到${esc(dayWord(f.trial_until))}，没效果自动退订</div>`);
+  if (hit) lines.push(`<div class="set-text">近 ${hit.days} 天：${hit.cand} 条，入选 ${hit.kept} 条</div>`);
+  if (f.last_error) lines.push(`<div class="set-text bad-t">上次失败：${esc(f.last_error)}</div>`);
+  else if (f.last_ok_ts) lines.push(`<div class="set-text">更新于${esc(dayWord(f.last_ok_ts))}</div>`);
   const tag = f.auto ? ` <span class="tag rss-auto-tag">自动</span>` : "";
   return `
           <div class="set-row">${ico("newspaper")}<div><div class="set-name">${esc(f.title || f.url)}${tag}</div><div class="set-text mono-link">${esc(f.url)}</div>${lines.join("")}</div>
-            <span class="row-btns"><button class="btn small" data-act="rss-toggle" data-g="${esc(g.id)}" data-id="${esc(f.id)}" data-on="${f.enabled ? "0" : "1"}">${f.enabled ? "停用" : "启用"}</button><button class="btn small" data-act="rss-del" data-g="${esc(g.id)}" data-id="${esc(f.id)}"${f.auto ? ` data-auto="1"` : ""}>删掉</button></span></div>`;
+            <span class="row-btns"><button class="btn small" data-act="rss-toggle" data-g="${esc(g.id)}" data-id="${esc(f.id)}" data-on="${f.enabled ? "0" : "1"}">${f.enabled ? "停用" : "启用"}</button><button class="btn small" data-act="rss-del" data-g="${esc(g.id)}" data-id="${esc(f.id)}"${f.auto ? ` data-auto="1"` : ""}>删除</button></span></div>`;
 }
 
-const LOG_VERB = { subscribed: "订上", unsubscribed: "退订", rejected: "不再推荐", skipped: "没订上" };
+const LOG_VERB = { subscribed: "订阅", unsubscribed: "退订", rejected: "不再推荐", skipped: "没订上" };
 // 0.9.0 上线首轮把「体检没过 / 找不到订阅地址」也记成了 rejected，按原因认回「没订上」
 const logVerb = (e) =>
   e.action === "rejected" && /^(体检没过|没找到订阅地址)/.test(e.reason || "") ? LOG_VERB.skipped : LOG_VERB[e.action] || e.action;
@@ -124,25 +124,25 @@ function autoDetails(v) {
           (e) => `<li><span class="ra-title">${esc(logVerb(e))} ${esc(e.label || e.url)}</span><span class="ra-why">${esc(dayWord(e.ts))}${e.reason ? ` · ${esc(e.reason)}` : ""}</span></li>`
         )
         .join("")}</ul>`
-    : `<p class="fine">还没自动订过</p>`;
+    : `<p class="fine">还没自动订阅过</p>`;
   const mapHtml = map.length
     ? `<ul>${map
         .map(
           (m) => `<li><span class="ra-title">${esc(m.name || m.label)}${m.label && m.label !== m.name ? ` <span class="ra-label">${esc(m.label)}</span>` : ""}${
-            m.origin === "search" ? ` <span class="tag ra-found">搜到的</span>` : ""
+            m.origin === "search" ? ` <span class="tag ra-found">找到的</span>` : ""
           }</span><span class="ra-why">${
-            m.status === "verified" ? `能订 · ${esc(m.why || "")}` : `没订：${esc(m.reason || "没通过检查")}`
+            m.status === "verified" ? `可订 · ${esc(m.why || "")}` : `没订：${esc(m.reason || "没通过")}`
           }</span></li>`
         )
         .join("")}</ul>`
-    : `<p class="fine">群画像成形后每周列一次</p>`;
+    : `<p class="fine">了解这个群后每周找一次</p>`;
   return `
           <details class="rss-auto">
-            <summary>自动订阅：门槛来的 ${used("trusted")} · 来源地图 ${used("map")}</summary>
+            <summary>自动订阅：按成绩 ${used("trusted")} · 按来源图 ${used("map")}</summary>
             ${a.rule ? `<p class="ra-rule">${esc(a.rule)}</p>` : ""}
             <div class="ra-h">最近</div>
             ${logHtml}
-            <div class="ra-h">来源地图</div>
+            <div class="ra-h">来源图</div>
             ${mapHtml}
           </details>`;
 }

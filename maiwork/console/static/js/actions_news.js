@@ -16,7 +16,7 @@ export async function actNews(a, el) {
         await loadExt();
         repaintSheet();
         const skill = ((state.ext || {}).skills || []).find((k) => k.name === el.dataset.name);
-        toast(el.dataset.on !== "1" ? "已停用，模型将不再使用这份 skill" : skill && skill.enabled === false ? skill.disabled_reason || "已设为启用，等待配套服务开启" : "已启用，模型现在可以使用这份 skill");
+        toast(el.dataset.on !== "1" ? "已停用" : skill && skill.enabled === false ? skill.disabled_reason || "已启用，等配套服务开启" : "已启用");
       } catch (err) {
         el.disabled = false;
         toast(err.message, true);
@@ -45,7 +45,7 @@ export async function actNews(a, el) {
         state.presetEdit = null;
         await loadExt();
         repaintSheet();
-        toast(clear ? "改回免密钥了" : r && r.bound ? `打开了，联网搜索现在用 ${r.label || id}` : key ? "密钥保存好了" : "打开了");
+        toast(clear ? "已改回免费" : r && r.bound ? `已开启，现在用 ${r.label || id} 搜索` : key ? "密钥已保存" : "已开启");
       } catch (e2) {
         el.disabled = false;
         if (err) {

@@ -8,7 +8,7 @@ import { avatar, render } from "../render.js";
 import { ONB_STEPS, onb, onbPane } from "../onboarding.js";
 
 /* ───── 身份：SOUL / AGENTS / 工作记忆 ───── */
-export const AV_SRC = { custom: "你自定义的", qq: "跟 MaiBot 的 QQ 头像同步", platform: "跟 MaiBot 在其他平台的头像同步", default: "默认头像（MaiBot 没有 QQ 账号可同步）" };
+export const AV_SRC = { custom: "自定义", qq: "同步 MaiBot 的 QQ 头像", platform: "同步 MaiBot 头像", default: "默认头像" };
 export function avatarBlock() {
   const a = state.avatarCfg;
   const src = a ? AV_SRC[a.source] || "" : "";
@@ -17,14 +17,14 @@ export function avatarBlock() {
     <div class="av-row">
       <img class="top-avatar av-big" src="${esc((a && a.url) || avatar())}" alt="" onerror="this.onerror=null;this.src='/static/assets/logo.png'" />
       <div class="av-main">
-        <div class="set-text">默认和 MaiBot 的头像一样</div>
-        ${a ? `<div class="set-text">现在：<b>${esc(src)}</b></div>` : ""}
+        <div class="set-text">默认和 MaiBot 一样</div>
+        ${a ? `<div class="set-text">当前：<b>${esc(src)}</b></div>` : ""}
         <div class="row-btns" style="margin-top:8px">
-          <label class="btn small file-btn">上传图片<input type="file" id="avatar-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden /></label>
+          <label class="btn small file-btn">上传<input type="file" id="avatar-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden /></label>
           <button type="button" class="btn small" data-act="avatar-url">用网址</button>
           ${a && a.source === "custom" ? `<button type="button" class="btn small" data-act="avatar-reset">恢复同步</button>` : ""}
         </div>
-        <p class="fine" style="margin:4px 0 0">图片最大 2MB，png / jpg / webp / gif。</p>
+        <p class="fine" style="margin:4px 0 0">最大 2MB，png / jpg / webp / gif</p>
       </div>
     </div>`;
 }
@@ -70,7 +70,7 @@ export function memoryPage(s) {
   if (!d) return loading();
   const lim = d.limits || {};
   return `
-    <p class="h-meta">MaiWork 做事时记下的经验。主模型会自己往里记，你也可以直接改。</p>
-    ${idBlock("memory", "工作记忆（全局）", "所有群通用的经验，不写具体的群和人", d.memory, lim.memory)}
-    <p class="fine">每个群自己的规矩和做法在群页的「这个群」区。</p>`;
+    <p class="h-meta">MaiWork 自己记的经验，你也能改</p>
+    ${idBlock("memory", "通用记忆", "所有群通用，不写具体群和人", d.memory, lim.memory)}
+    <p class="fine">本群规矩和做法在群页里</p>`;
 }

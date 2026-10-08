@@ -13,7 +13,7 @@ export function taskRow(t, i) {
       ${ico(t.icon || "package")}
       <span>
         <span class="row-title">${esc(t.title)}</span>
-        <span class="row-meta"><span class="dot ${DOT[t.status] !== undefined ? DOT[t.status] : t.status}"></span><span>${STATUS[t.status] || esc(t.status)}${t.meta ? ` · ${esc(t.meta)}` : ""}${t.auto_reason ? " · 自动审核通过" : ""}${t.undelivered ? ` · <b class="warn-t">做完了但还没发出去</b>` : ""}</span></span>
+        <span class="row-meta"><span class="dot ${DOT[t.status] !== undefined ? DOT[t.status] : t.status}"></span><span>${STATUS[t.status] || esc(t.status)}${t.meta ? ` · ${esc(t.meta)}` : ""}${t.auto_reason ? " · 自动批准" : ""}${t.undelivered ? ` · <b class="warn-t">做完了，还没发</b>` : ""}</span></span>
       </span>
       <span class="chev">${SVG.right}</span>
     </button>`;
@@ -31,18 +31,18 @@ function pendingItems(p) {
 }
 
 export function viewTasks(g, v) {
-  let html = `<h1 class="h-page h-fish">${agentFish("task", 44)}<span>在做的事</span></h1>`;
+  let html = `<h1 class="h-page h-fish">${agentFish("task", 44)}<span>任务</span></h1>`;
   const tasks = (v && v.tasks) || { pending: [], list: [] };
   const pending = tasks.pending || [];
   const list = tasks.list || [];
   const botName = (state.me && state.me.bot && state.me.bot.name) || "MaiBot";
   const goalsHtml = goalSections(g, v);
   if (!pending.length && !list.length && !goalsHtml) {
-    return html + emptyState("package", "还没有在做的事", `在群里 @${botName} 派活，或说「提醒我……」试试`);
+    return html + emptyState("package", "还没有任务", `在群里 @${botName} 派活，或说「提醒我…」`);
   }
   let i = 0;
   if (pending.length) {
-    html += `<h2 class="h-sub" style="margin-top:22px">${gadmin() ? "等你批准" : "等管理员批准"} <small>${pending.length} 件</small></h2>`;
+    html += `<h2 class="h-sub" style="margin-top:22px">${gadmin() ? "等你批" : "等批准"} <small>${pending.length} 件</small></h2>`;
     html += pending
       .map(
         (p) => `
@@ -52,14 +52,14 @@ export function viewTasks(g, v) {
             <h3 class="item-title">${esc(p.title)}</h3>
             ${pendingItems(p)}
             ${p.quote ? `<div class="quote"><span class="quote-by">${esc(p.who)} · ${esc(when(p.ts))}</span>${esc(p.quote)}</div>` : ""}
-            <div class="via">${esc(p.via || "")}${p.age_s > 86400 ? ` · <b class="warn-t">等了 ${dur(p.age_s)}</b>` : ""}</div>
+            <div class="via">${esc(p.via || "")}${p.age_s > 86400 ? ` · <b class="warn-t">已等 ${dur(p.age_s)}</b>` : ""}</div>
             ${
               gadmin()
                 ? `<div class="actions">
               <button class="btn primary" data-act="req" data-op="approve" data-id="${esc(p.id)}">批准</button>
-              <button class="btn" data-act="req" data-op="reject" data-id="${esc(p.id)}">拒绝</button>
+              <button class="btn" data-act="req" data-op="reject" data-id="${esc(p.id)}">不批</button>
             </div>`
-                : `<div class="note-ok"><span class="dot pending"></span>管理员批准后开工</div>`
+                : `<div class="note-ok"><span class="dot pending"></span>批准后开工</div>`
             }
           </div>
         </article>`
@@ -67,14 +67,14 @@ export function viewTasks(g, v) {
       .join("");
   }
   if (list.length) {
-    html += `<h2 class="h-sub">全部任务</h2>`;
-    html += `<div class="filters" role="group" aria-label="按状态筛选">${FILTERS.map((f) => {
+    html += `<h2 class="h-sub">所有任务</h2>`;
+    html += `<div class="filters" role="group" aria-label="按状态看">${FILTERS.map((f) => {
       const n = list.filter(f.match).length;
       return `<button class="filter" data-act="filter" data-f="${f.id}" aria-pressed="${state.filter === f.id}">${f.label}<span class="n">${n}</span></button>`;
     }).join("")}</div>`;
     const f = FILTERS.find((x) => x.id === state.filter) || FILTERS[0];
     const rows = list.filter(f.match);
-    html += rows.length ? `<div>${rows.map((t) => taskRow(t, i++)).join("")}</div>` : `<p class="h-meta" style="margin-top:18px">这个状态下没有任务，换个筛选看看。</p>`;
+    html += rows.length ? `<div>${rows.map((t) => taskRow(t, i++)).join("")}</div>` : `<p class="h-meta" style="margin-top:18px">这里没有，换一个看看</p>`;
   }
   return html + goalsHtml;
 }

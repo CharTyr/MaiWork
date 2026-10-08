@@ -111,7 +111,7 @@ function chatToolMsg(m) {
     <div class="cm-tool ${ok ? "" : "bad"}${asked ? " asked" : ""}${asked && !waiting ? " done" : ""}">
       <button class="cm-tool-h" data-act="chat-tool" data-id="${m.id}" aria-expanded="${!!open}">
         <span class="dot ${asked && waiting ? "pending" : asked ? "" : ok ? "ok" : "failed"}"></span>
-        <span class="cm-tool-l">${esc(meta.label || m.name || "用了一个工具")}</span>${asked ? `<span class="cm-tool-s">${waiting ? "待你确认" : "问过你了"}</span>` : ""}
+        <span class="cm-tool-l">${esc(meta.label || m.name || "用了工具")}</span>${asked ? `<span class="cm-tool-s">${waiting ? "等你确认" : "已问过"}</span>` : ""}
         ${SVG.down}
       </button>
       ${open ? `<pre class="lm-text">${esc(m.content || "")}</pre>` : ""}
@@ -126,7 +126,7 @@ function chatSummaryHTML(m) {
   return `
     <div class="cm-summary${open ? " open" : ""}">
       <button class="cm-summary-h" data-act="chat-summary" data-id="${m.id}" aria-expanded="${!!open}">
-        ${ico("memo", "")}<span class="cm-summary-l">前面的对话已整理成摘要${meta.covers ? `<small>${meta.covers} 条${span ? ` · ${esc(span)}` : ""}</small>` : ""}</span>${SVG.down}
+        ${ico("memo", "")}<span class="cm-summary-l">已整理成摘要${meta.covers ? `<small>前 ${meta.covers} 条${span ? ` · ${esc(span)}` : ""}</small>` : ""}</span>${SVG.down}
       </button>
       ${open ? `<div class="cm-summary-b md">${mdLite(m.content || "")}</div>` : ""}
     </div>`;
@@ -150,15 +150,15 @@ function chatMsgHTML(m) {
 function pendingCard(p) {
   return `
     <div class="cm-pending">
-      <div class="cm-pending-h">${ico("lock")}<span>要你确认</span></div>
+      <div class="cm-pending-h">${ico("lock")}<span>请确认</span></div>
       <div class="cm-pending-t">${esc(p.summary || p.tool)}</div>
       ${
         p.args && Object.keys(p.args).length
-          ? `<details class="cm-pending-d"><summary>看具体参数</summary><pre class="lm-text">${esc(JSON.stringify(p.args, null, 2))}</pre></details>`
+          ? `<details class="cm-pending-d"><summary>看细节</summary><pre class="lm-text">${esc(JSON.stringify(p.args, null, 2))}</pre></details>`
           : ""
       }
       <div class="actions">
-        <button class="btn primary small" data-act="chat-confirm" data-id="${p.id}" data-ok="1">确认，去做</button>
+        <button class="btn primary small" data-act="chat-confirm" data-id="${p.id}" data-ok="1">确认</button>
         <button class="btn small" data-act="chat-confirm" data-id="${p.id}" data-ok="0">不要</button>
       </div>
     </div>`;
@@ -166,9 +166,9 @@ function pendingCard(p) {
 
 const CHAT_SUGGEST = [
   "这几个群最近怎么样？",
-  "今天的资讯为什么这么少？",
-  "把 19:00 的备料改成 20:30",
-  "帮我盯一下这个群里有没有人问 NAS 的问题",
+  "今天资讯怎么这么少？",
+  "把 19:00 找资讯改到 20:30",
+  "帮我留意群里谁问 NAS",
 ];
 
 function chatStream() {
@@ -179,7 +179,7 @@ function chatStream() {
   const empty = !C.messages.length
     ? `<div class="chat-empty">
         <img src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="" />
-        <p>想让我做什么，直接说</p>
+        <p>想做什么，直接说</p>
         <div class="chat-sugs">${CHAT_SUGGEST.map((t) => `<button class="btn small" data-act="chat-suggest" data-t="${esc(t)}">${esc(t)}</button>`).join("")}</div>
       </div>`
     : "";
@@ -193,24 +193,24 @@ export function chatPage() {
   const groups = state.groups || [];
   return `
     <div class="chat-head">
-      <h1 class="h-page">和 MaiWork 聊</h1>
+      <h1 class="h-page">聊天</h1>
       <div class="chat-tools">
         ${
           C
-            ? `<select class="chat-group" data-act="chat-group" aria-label="这段对话主要聊哪个群">
-                <option value="">不限群</option>
+            ? `<select class="chat-group" data-act="chat-group" aria-label="聊哪个群">
+                <option value="">所有群</option>
                 ${groups.map((g) => `<option value="${esc(g.id)}" ${info.group_id === g.id ? "selected" : ""}>${esc(gname(g))}</option>`).join("")}
               </select>`
             : ""
         }
-        ${C && C.messages.length ? `<button class="btn small" data-act="chat-compact" title="把前面的对话整理成一段摘要，之后接着聊更省、更不容易忘">整理前面的对话</button>` : ""}
+        ${C && C.messages.length ? `<button class="btn small" data-act="chat-compact" title="整理成摘要，省用量不忘事">压缩对话</button>` : ""}
         <button class="btn small chat-list-btn" data-act="chat-list">对话</button>
         <button class="btn small" data-act="chat-new">新对话</button>
       </div>
     </div>
     <div class="chat-stream" id="chat-stream">${C ? chatStream() : loading()}</div>
     <form id="chat-form" class="chat-composer" autocomplete="off">
-      <textarea id="chat-input" rows="1" placeholder="跟 MaiWork 说点什么…" ${C && C.running ? "" : ""}></textarea>
+      <textarea id="chat-input" rows="1" placeholder="说点什么…" ${C && C.running ? "" : ""}></textarea>
       <button class="chat-send" type="submit" aria-label="发送" ${C && C.running ? "disabled" : ""}>${SVG.send || "↑"}</button>
     </form>`;
 }
@@ -230,7 +230,7 @@ export function chatSide() {
         </button>`
             )
             .join("")
-        : `<p class="h-meta">还没有对话。</p>`
+        : `<p class="h-meta">还没有对话</p>`
     }`;
 }
 

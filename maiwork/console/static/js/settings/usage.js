@@ -39,7 +39,7 @@ const md = (day) => {
 };
 
 export function usageAndLogsPage() {
-  return usagePage() + `<h2 class="h-sub">请求日志</h2>` + logsPage();
+  return usagePage() + `<h2 class="h-sub">调用记录</h2>` + logsPage();
 }
 
 export function usagePage() {
@@ -56,23 +56,23 @@ export function usagePage() {
       const tot = (d.main || 0) + (d.worker || 0);
       const hm = ((d.main || 0) / max) * 100;
       const hw = ((d.worker || 0) / max) * 100;
-      return `<button type="button" class="ub${u.sel === d.day ? " on" : ""}" data-act="usage-day" data-d="${esc(d.day)}" title="${esc(d.day)} · ${tokens(tot)} tokens · ${d.calls || 0} 次调用${d.errors ? ` · ${d.errors} 次出错` : ""}">
+      return `<button type="button" class="ub${u.sel === d.day ? " on" : ""}" data-act="usage-day" data-d="${esc(d.day)}" title="${esc(d.day)} · ${tokens(tot)} tokens · 调用 ${d.calls || 0} 次${d.errors ? ` · 出错 ${d.errors} 次` : ""}">
         <span class="ub-col"><span class="ub-w" style="height:${hw}%"></span><span class="ub-m" style="height:${hm}%"></span></span>
         <span class="ub-x">${showX ? esc(md(d.day)) : "&nbsp;"}</span></button>`;
     })
     .join("");
   return `
-    <div class="h-sub-row"><h2 class="h-sub" style="margin-top:14px">最近 ${u.days} 天</h2>
+    <div class="h-sub-row"><h2 class="h-sub" style="margin-top:14px">近 ${u.days} 天</h2>
       <span class="seg" role="tablist" style="margin:0">${[7, 14, 30].map((n) => `<button role="tab" aria-selected="${u.days === n}" data-act="usage-range" data-n="${n}">${n} 天</button>`).join("")}</span></div>
     <div class="usage usage-4">
-      <div><b>${tokens(t.main)}</b><span>主模型 · tokens</span></div>
-      <div><b>${tokens(t.worker)}</b><span>子 agent · tokens</span></div>
-      <div><b>${t.calls || 0}</b><span>模型调用 · 次${t.errors ? `（出错 ${t.errors}）` : ""}</span></div>
-      <div><b>${t.jev || 0}</b><span>Jev 判断 · 次</span></div>
+      <div><b>${tokens(t.main)}</b><span>主模型 tokens</span></div>
+      <div><b>${tokens(t.worker)}</b><span>子 agent tokens</span></div>
+      <div><b>${t.calls || 0}</b><span>调用次数${t.errors ? `（错 ${t.errors}）` : ""}</span></div>
+      <div><b>${t.jev || 0}</b><span>Jev 次数</span></div>
     </div>
     <div class="ubars" style="--n:${list.length}">${bars}</div>
     <p class="fine"><span class="lg lg-m"></span>主模型 <span class="lg lg-w"></span>子 agent</p>
-    <label class="u-pick"><span>直接看某一天</span><input type="date" class="u-date" value="${esc(u.sel || "")}" min="${esc((list[0] || {}).day || "")}" max="${esc((list[list.length - 1] || {}).day || "")}" /></label>
+    <label class="u-pick"><span>选一天</span><input type="date" class="u-date" value="${esc(u.sel || "")}" min="${esc((list[0] || {}).day || "")}" max="${esc((list[list.length - 1] || {}).day || "")}" /></label>
     ${usageDay(u)}`;
 }
 
@@ -81,18 +81,18 @@ function usageDay(u) {
   if (!u.sel) return "";
   if (!d) return `<h2 class="h-sub">${esc(u.sel)}</h2>` + loading();
   const tbl = (head, rows) =>
-    rows.length ? `<div class="utbl" style="--c:${head.length - 1}"><div class="utr uth">${head.map((h) => `<span>${h}</span>`).join("")}</div>${rows.map((r) => `<div class="utr">${r.map((c) => `<span>${c}</span>`).join("")}</div>`).join("")}</div>` : `<p class="h-meta">没有。</p>`;
+    rows.length ? `<div class="utbl" style="--c:${head.length - 1}"><div class="utr uth">${head.map((h) => `<span>${h}</span>`).join("")}</div>${rows.map((r) => `<div class="utr">${r.map((c) => `<span>${c}</span>`).join("")}</div>`).join("")}</div>` : `<p class="h-meta">没有</p>`;
   const hours = d.by_hour || [];
   const hmax = Math.max(1, ...hours);
   return `
-    <h2 class="h-sub">${esc(d.day)} 的明细</h2>
+    <h2 class="h-sub">${esc(d.day)} 明细</h2>
     <div class="uhours">${hours.map((n, h) => `<span title="${h} 点 · ${tokens(n)} tokens" style="height:${Math.max(n ? 6 : 2, (n / hmax) * 100)}%"></span>`).join("")}</div>
     <div class="uhours-x"><span>0 点</span><span>6</span><span>12</span><span>18</span><span>23</span></div>
     <h3 class="h-mini">按模型</h3>
-    ${tbl(["模型", "调用", "输入", "输出", "出错", "平均耗时"], (d.by_model || []).map((m) => [`<span class="mono">${esc(m.model || "?")}</span> <small>${esc(ROLE_NAMES[m.role] || m.role || "")}</small>`, m.calls || 0, tokens(m.prompt), tokens(m.completion), m.errors || 0, fmtMs(m.avg_ms)]))}
+    ${tbl(["模型", "次数", "输入", "输出", "出错", "平均耗时"], (d.by_model || []).map((m) => [`<span class="mono">${esc(m.model || "?")}</span> <small>${esc(ROLE_NAMES[m.role] || m.role || "")}</small>`, m.calls || 0, tokens(m.prompt), tokens(m.completion), m.errors || 0, fmtMs(m.avg_ms)]))}
     <h3 class="h-mini">按用途</h3>
-    ${tbl(["用途", "调用", "tokens"], (d.by_purpose || []).map((p) => [esc(p.purpose || "其他"), p.calls || 0, tokens(p.tokens)]))}
+    ${tbl(["用途", "次数", "tokens"], (d.by_purpose || []).map((p) => [esc(p.purpose || "其他"), p.calls || 0, tokens(p.tokens)]))}
     <h3 class="h-mini">按群</h3>
-    ${tbl(["群", "调用", "tokens"], (d.by_group || []).map((g) => [esc(g.name || (g.group_id ? `群 ${g.group_id}` : "不属于哪个群")), g.calls || 0, tokens(g.tokens)]))}
-    <p class="fine">这天 Jev 判断了 ${d.jev || 0} 次。</p>`;
+    ${tbl(["群", "次数", "tokens"], (d.by_group || []).map((g) => [esc(g.name || (g.group_id ? `群 ${g.group_id}` : "不分群")), g.calls || 0, tokens(g.tokens)]))}
+    <p class="fine">当天 Jev 判断 ${d.jev || 0} 次</p>`;
 }

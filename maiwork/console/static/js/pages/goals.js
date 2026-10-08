@@ -5,7 +5,7 @@ import { agentFish } from "../api.js";
 
 export function nextText(goal) {
   if (goal.state === "paused") return "暂停中";
-  return goal.next_check_ts ? `${when(goal.next_check_ts)} 检查` : "等新消息";
+  return goal.next_check_ts ? `${when(goal.next_check_ts)}后检查` : "等新消息";
 }
 
 export function goalSections(g, v) {
@@ -18,7 +18,7 @@ export function goalSections(g, v) {
   }
   let i = 0;
   if (agent.length) {
-    html += `<h2 class="h-sub h-fish">${agentFish("goal", 28)}<span>我在推进 <small>${agent.length} 个</small></span></h2>`;
+    html += `<h2 class="h-sub h-fish">${agentFish("goal", 28)}<span>正在推进 <small>${agent.length} 个</small></span></h2>`;
     html += agent
       .map((goal) => {
         const crit = goal.criteria || [];
@@ -31,14 +31,14 @@ export function goalSections(g, v) {
             <h3 class="item-title">${esc(goal.title)}</h3>
             <p class="item-body soft">${esc(goal.body)}</p>
             ${crit.length ? `<div class="progress" aria-label="完成 ${done} / ${crit.length}"><i style="width:${(done / crit.length) * 100}%"></i></div>` : ""}
-            <div class="status"><span class="dot ${goal.stale ? "failed" : goal.state === "paused" ? "" : "running"}"></span><span class="status-text">${goal.stale ? `<b class="bad-t">卡住了：${esc(goal.stale_reason || "")}</b>` : `${crit.length ? `${done} / ${crit.length} · ` : ""}${esc(nextText(goal))}`}</span></div>
+            <div class="status"><span class="dot ${goal.stale ? "failed" : goal.state === "paused" ? "" : "running"}"></span><span class="status-text">${goal.stale ? `<b class="bad-t">卡在：${esc(goal.stale_reason || "")}</b>` : `${crit.length ? `${done} / ${crit.length} · ` : ""}${esc(nextText(goal))}`}</span></div>
           </div>
         </article>`;
       })
       .join("");
   }
   if (member.length) {
-    html += `<h2 class="h-sub">帮大家记着 <small>${member.length} 件</small></h2>`;
+    html += `<h2 class="h-sub">提醒 <small>${member.length} 件</small></h2>`;
     html += member
       .map((m) => {
         const due = m.repeat === "daily" ? "每天" : m.due_ts ? when(m.due_ts) : "没定时间";

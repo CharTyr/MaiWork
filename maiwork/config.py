@@ -110,7 +110,7 @@ class PluginSectionConfig(PluginConfigBase):
 class ServeGroupConfig(PluginConfigBase):
     """一个服务群；多个群填同一个 workspace 即共享一个工作区。"""
 
-    __ui_label__ = "服务群"
+    __ui_label__ = "服务的群"
     __ui_icon__ = "users"
 
     group: str = Field(
@@ -132,7 +132,7 @@ class GroupsSectionConfig(PluginConfigBase):
 
 
 class FocusSectionConfig(PluginConfigBase):
-    __ui_label__ = "关注成员"
+    __ui_label__ = "关注的人"
     __ui_icon__ = "star"
     __ui_order__ = 2
 
@@ -159,7 +159,7 @@ class FeedsSectionConfig(PluginConfigBase):
 
 
 class TopicsSectionConfig(PluginConfigBase):
-    __ui_label__ = "冷场开话题"
+    __ui_label__ = "开话题"
     __ui_icon__ = "message-circle"
     __ui_order__ = 4
 
@@ -173,7 +173,7 @@ class TopicsSectionConfig(PluginConfigBase):
 
 
 class DeliverySectionConfig(PluginConfigBase):
-    __ui_label__ = "推送"
+    __ui_label__ = "主动发言"
     __ui_icon__ = "send"
     __ui_order__ = 5
 
@@ -183,7 +183,7 @@ class DeliverySectionConfig(PluginConfigBase):
 
 
 class ApprovalSectionConfig(PluginConfigBase):
-    __ui_label__ = "派活批准"
+    __ui_label__ = "派活审批"
     __ui_icon__ = "shield-check"
     __ui_order__ = 6
 
@@ -283,7 +283,7 @@ class UsageSectionConfig(PluginConfigBase):
 
 
 class TasksSectionConfig(PluginConfigBase):
-    __ui_label__ = "任务安全网"
+    __ui_label__ = "任务上限"
     __ui_icon__ = "shield"
     __ui_order__ = 9
 
@@ -306,7 +306,7 @@ class ConsoleSectionConfig(PluginConfigBase):
 class SSHServerConfig(PluginConfigBase):
     """一台可用的远程执行环境。"""
 
-    __ui_label__ = "SSH 机器"
+    __ui_label__ = "自有机器"
     __ui_icon__ = "server"
 
     name: str = Field(default="", description="这台机器的名字")
@@ -315,7 +315,7 @@ class SSHServerConfig(PluginConfigBase):
 
 
 class EnvironmentsSectionConfig(PluginConfigBase):
-    __ui_label__ = "执行环境"
+    __ui_label__ = "干活机器"
     __ui_icon__ = "server"
     __ui_order__ = 11
 
@@ -354,7 +354,7 @@ class ProfileSectionConfig(PluginConfigBase):
 
 
 class StorageSectionConfig(PluginConfigBase):
-    __ui_label__ = "数据存储"
+    __ui_label__ = "数据"
     __ui_icon__ = "database"
     __ui_order__ = 13
 
@@ -377,7 +377,7 @@ class McpExtensionConfig(PluginConfigBase):
 
 
 class ExtensionsSectionConfig(PluginConfigBase):
-    __ui_label__ = "扩展"
+    __ui_label__ = "工具"
     __ui_icon__ = "puzzle"
     __ui_order__ = 14
 
@@ -394,7 +394,7 @@ class GroupSpaceSectionConfig(PluginConfigBase):
 
 
 class ReaderSectionConfig(PluginConfigBase):
-    __ui_label__ = "打开网页"
+    __ui_label__ = "读网页"
     __ui_icon__ = "globe"
     __ui_order__ = 16
 

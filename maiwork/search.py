@@ -663,7 +663,7 @@ class Search:
         """
         binding = get_binding(self._store)
         if binding is None:
-            raise SearchUnavailable("还没指定联网搜索：去 设置 → 扩展 里选一个 MCP 用作联网搜索")
+            raise SearchUnavailable("还没指定联网搜索：去 设置 → 工具 里选一个 MCP 用作联网搜索")
         problem = tool_problem(
             self._store, self._settings(), self._runtime, binding["mcp"], binding["tool"], role="搜索"
         )
@@ -704,7 +704,7 @@ class Search:
         entries = {e.name: e for e in extensions_web.merged_entries(settings, self._store)}
         binding = get_binding(self._store)
         if binding is None:
-            raise SearchUnavailable("还没指定联网搜索：去 设置 → 扩展 里选一个 MCP 用作联网搜索")
+            raise SearchUnavailable("还没指定联网搜索：去 设置 → 工具 里选一个 MCP 用作联网搜索")
         errors: list[Exception] = []
         names = self._fallback_chain(entries, binding)
         for name in names:
@@ -723,14 +723,14 @@ class Search:
             return out
         if errors:
             raise errors[-1]
-        raise SearchUnavailable("还没指定联网搜索：去 设置 → 扩展 里选一个 MCP 用作联网搜索")  # 理论到不了
+        raise SearchUnavailable("还没指定联网搜索：去 设置 → 工具 里选一个 MCP 用作联网搜索")  # 理论到不了
 
     def _fallback_chain(self, entries: dict[str, Any], binding: dict[str, Any] | None = None) -> list[str]:
         """搜索要试的扩展顺序：[主绑定] + [fallback 名单里认得出预设且启用的]。"""
         if binding is None:
             binding = get_binding(self._store)
         if binding is None:
-            raise SearchUnavailable("还没指定联网搜索：去 设置 → 扩展 里选一个 MCP 用作联网搜索")
+            raise SearchUnavailable("还没指定联网搜索：去 设置 → 工具 里选一个 MCP 用作联网搜索")
         chain = [binding["mcp"]]
         for name in binding.get("fallback") or []:
             entry = entries.get(name)
@@ -800,7 +800,7 @@ class Search:
         否则通用 schema 映射（site/news 忽略，保持老行为）。结果带 provider。"""
         binding = get_binding(self._store)
         if binding is None:
-            raise SearchUnavailable("还没指定联网搜索：去 设置 → 扩展 里选一个 MCP 用作联网搜索")
+            raise SearchUnavailable("还没指定联网搜索：去 设置 → 工具 里选一个 MCP 用作联网搜索")
         if name == binding["mcp"]:
             # 主绑定：复用 _client() 的状态判断 + 绑定里记的工具名
             client, _, runtime = self._client()

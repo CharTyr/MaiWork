@@ -18,7 +18,7 @@ document.addEventListener("change", async (e) => {
       if (state.chat.info) state.chat.info.group_id = e.target.value;
       await loadChats();
       renderSide();
-      toast(e.target.value ? "这段对话聚焦在这个群了" : "不限群");
+      toast(e.target.value ? "已切到本群" : "所有群");
     } catch (err) {
       toast(err.message, true);
     }
@@ -42,13 +42,13 @@ document.addEventListener("change", async (e) => {
     const file = e.target.files && e.target.files[0];
     e.target.value = "";
     if (!file) return;
-    if (file.size > 2 * 1024 * 1024) return toast("图片太大了，最多 2MB", true);
-    if (!/^image\/(png|jpeg|webp|gif)$/.test(file.type)) return toast("只支持 png / jpg / webp / gif", true);
+    if (file.size > 2 * 1024 * 1024) return toast("图片太大，最多 2MB", true);
+    if (!/^image\/(png|jpeg|webp|gif)$/.test(file.type)) return toast("只支持 png、jpg、webp、gif", true);
     try {
       const data = await new Promise((ok, bad) => {
         const r = new FileReader();
         r.onload = () => ok(String(r.result).split(",")[1] || "");
-        r.onerror = () => bad(new Error("读不了这张图"));
+        r.onerror = () => bad(new Error("打不开这张图"));
         r.readAsDataURL(file);
       });
       await avatarSaved(await api("POST", "/api/settings/avatar", { data, mime: file.type }));
@@ -62,7 +62,7 @@ document.addEventListener("change", async (e) => {
   const file = e.target.files && e.target.files[0];
   e.target.value = "";
   if (!file) return;
-  if (file.size > 5 * 1024 * 1024) return toast("zip 太大了，最多 5MB", true);
+  if (file.size > 5 * 1024 * 1024) return toast("文件太大，最多 5MB", true);
   const upload = async (replace) => {
     const res = await fetch(`/api/extensions/skills/upload${replace ? "?replace=1" : ""}`, {
       method: "POST",
@@ -76,14 +76,14 @@ document.addEventListener("change", async (e) => {
     } catch (x) {}
     return { res, data };
   };
-  toast("在装…");
+  toast("安装中…");
   try {
     let { res, data } = await upload(false);
-    if (res.status === 409 && confirm(`${(data && data.error) || "已经有同名的 skill 了"}。要替换吗？`)) ({ res, data } = await upload(true));
+    if (res.status === 409 && confirm(`${(data && data.error) || "已有同名 skill"}，替换吗？`)) ({ res, data } = await upload(true));
     if (!res.ok) throw new Error((data && data.error) || `出错了（${res.status}）`);
     await loadExt();
     repaintSheet();
-    toast(`装好了：${data.name}，下一次就能用`);
+    toast(`已装好 ${data.name}，下次可用`);
   } catch (err) {
     toast(err.message, true);
   }

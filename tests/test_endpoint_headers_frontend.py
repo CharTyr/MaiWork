@@ -88,12 +88,12 @@ def run_js(tmp_path, rows, action="mdl-ep-test", *, json_text=None, json_mode=No
 
 def test_advanced_settings_folded_and_values_write_only(tmp_path):
     html = run_js(tmp_path, [])["html"]
-    assert "高级设置" in html
+    assert "<summary>高级" in html
     assert 'id="ep-headers"' in html and 'id="ep-advanced"' in html
     assert 'id="ep-advanced" open' not in html
     assert "SHOULD-NOT-RENDER" not in html
     assert "X-Route" in html and "Authorization" in html
-    assert "已填写" in html and "留空" in html
+    assert "已填" in html and "留空" in html
     assert 'data-act="mdl-header-add"' in html and 'data-act="mdl-header-del"' in html
     assert 'type="password"' in html
 

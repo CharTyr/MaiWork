@@ -35,6 +35,9 @@
   （Retry-After 秒数 / HTTP 日期，封顶 120 秒；没有就按连续 429 次数
   10/20/40/60 秒退避、封顶 60 秒，加 ±20% 抖动）；
   用完再尝候选里的下一条，同样规则；其他 4xx 不重试、不换，直接抛。
+  例外：「模型在这个端点不可用」（_model_unavailable，model_not_found / No available
+  channel 等，503/404/400/200 内嵌都认）只试一次立刻换下一条，并在内存熔断
+  `端点|模型` _UNAVAILABLE_TTL_S 秒（全部候选都熔断时探测最早到期的那个）。
   chat(retries=n) 可临时覆盖设置里的重试次数（后台主循环里直接 await 的调用传 1）。
 - 端点级限流（EndpointThrottle，状态只在进程内存、不落库）：按
   `{端点 id}|{normalize(base_url)}` 分门（同一端点条目改地址自然隔两门）；
@@ -105,6 +108,26 @@ async def _SLEEP(seconds: float) -> None:
 def _NOW() -> float:
     """限流用的当前时间；单独一个函数方便测试换成假时钟。"""
     return clock.now()
+
+
+_UNAVAILABLE_TTL_S = 600.0  # 「模型在这个端点不可用」后熔断多久（秒）；只在内存
+_UNAVAILABLE_RE = re.compile(
+    r"model_not_found|no available channel|no such model|模型不存在|模型不可用"
+    r"|\bmodel\b[^\n]{0,80}?(?:does not exist|not exist|not found)",
+    re.IGNORECASE,
+)
+
+
+def _model_unavailable(status: int, err_text: str) -> bool:
+    """端点明说「这个模型在这里用不了」（不是过载 / 限流）：重试没意义，该立刻换备用。
+
+    认 model_not_found、No available channel（NewAPI 分组没渠道，线上 503）、
+    model ... does not exist / not found、模型不存在 等写法；状态码可以是 503/404/400，
+    或 200 内嵌错误换算出来的码。429 / 408 一律不算（那是限流 / 超时，照旧重试）。
+    """
+    if status in (200, 408, 429):
+        return False
+    return bool(_UNAVAILABLE_RE.search(str(err_text or "")))
 
 
 def _jitter(seconds: float) -> float:
@@ -1160,6 +1183,32 @@ class Models:
         # {"<限流键>|<模型>": {"mct": True（上限字段换 max_completion_tokens）,
         #                      "effort_cap": "high"（强度最多发到这档；"" = 不发）}}
         self._adapt: dict[str, dict[str, Any]] = {}
+        # 「模型在这个端点不可用」短期熔断（只在内存）：{"<限流键>|<模型>": 恢复时刻（_NOW 口径）}
+        self._unavailable: dict[str, float] = {}
+
+    def _cand_key(self, cand: Any) -> str:
+        """候选的熔断 / 适配键：`{端点 id}|{规范化地址}|{模型}`（与 chat 里 adapt_key 同口径）。"""
+        ep = cand.endpoint
+        base_url = str(getattr(ep, "base_url", "") or "").rstrip("/")
+        return f"{getattr(ep, 'id', '')}|{self._throttle.normalize(base_url)}|{cand.service_model}"
+
+    def _skip_unavailable(self, candidates: list[Any]) -> list[Any]:
+        """去掉还在熔断期的候选；全都在熔断期时留熔断最早到期的那个（探测恢复，并列取靠前的）。"""
+        now = _NOW()
+        for k in [k for k, until in self._unavailable.items() if until <= now]:
+            del self._unavailable[k]
+        blocked = {i: self._unavailable[k] for i, c in enumerate(candidates)
+                   if (k := self._cand_key(c)) in self._unavailable}
+        if not blocked:
+            return candidates
+        if len(blocked) == len(candidates):
+            probe = min(blocked, key=lambda i: (blocked[i], i))
+            logger.info("候选模型都在「不可用」熔断期，探测熔断最早到期的 %s", candidates[probe].service_model)
+            return [candidates[probe]]
+        for i in blocked:
+            logger.info("模型 %s 在「不可用」熔断期（还剩约 %.0f 秒），这次跳过",
+                        candidates[i].service_model, blocked[i] - now)
+        return [c for i, c in enumerate(candidates) if i not in blocked]
 
     def set_agents(self, agents: Any) -> None:
         """app 在 Agents 就位后挂上（Models 建得比 Agents 早）；同时清缓存重算。"""
@@ -2134,6 +2183,12 @@ class Models:
         429 由端点级冷却决定等待（Retry-After 秒数 / HTTP 日期，封顶 120 秒；
         没有就按连续 429 次数 10/20/40/60 秒退避、封顶 60 秒，加 ±20% 抖动）；
         用完再换备用模型，备用同样规则。其他 4xx 不重试、不换备用，直接抛。
+        例外：端点明说「这个模型在这里不可用」（_model_unavailable：model_not_found、
+        No available channel、model … does not exist / not found、模型不存在；状态码 503/404/400
+        或 200 内嵌错误都算，429/408 不算）→ 这个候选只试这一次、不等，立刻换下一个；并在内存里
+        熔断「端点|模型」_UNAVAILABLE_TTL_S 秒，期内的调用直接跳过它（只记日志、不写 model_calls）；
+        候选全在熔断期时只探测熔断最早到期的那个；到期或探测成功自动恢复。
+        备用救回（首选没成、别的候选成了）记一行 info：首选、实际模型、本次总耗时。
         retries=None 用设置里的；主循环里直接 await 的调用传 1（别让循环卡几分钟）。
         max_tokens=None 用所选条目的 max_tokens（缺省 32768）；传了以调用方为准。
         请求体里总是带 max_tokens（有些端点没有它会出错；anthropic 必填）。
@@ -2189,6 +2244,9 @@ class Models:
         last_err: ModelError | None = None
         attempt = 0
         client = self._get_client()
+        call_start = clock.now()
+        first_choice = candidates[0]
+        candidates = self._skip_unavailable(candidates)
         for pos, cand in enumerate(candidates):
             model = cand.service_model
             ep = cand.endpoint
@@ -2302,6 +2360,23 @@ class Models:
                     # 200 但响应体是错误：按错误体里的码（没有按 502）走下面同一套重试 / 换备用 / 抛
                     status, err_text = embedded
                     shown = "200 但内容是错误"
+                # 「模型在这个端点不可用」（model_not_found / No available channel…）：重试没用，
+                # 记这次、熔断这个端点+模型一段时间，不等、立刻换下一个候选
+                if status != 200 and _model_unavailable(
+                    status, err_text if embedded is None else f"{err_text} {json.dumps((data or {}).get('error'), ensure_ascii=False)}"
+                ):
+                    last_err = ModelError(_redact(f"端点返回 {shown}：{err_text}", secret_keys), status=status)
+                    self._unavailable[adapt_key] = _NOW() + _UNAVAILABLE_TTL_S
+                    self._log_attempt(
+                        model, role_effective, attempt, ok=False, status=http_status, ms=ms,
+                        prompt_tokens=0, completion_tokens=0, error=last_err.message,
+                        request=log_request, response=None, keys=secret_keys,
+                        purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
+                        usage_src="none",  # 端点明说没这个模型：确定没生成
+                    )
+                    logger.warning("模型 %s 在这个端点不可用（%s），%d 分钟内先不用它，换下一个候选",
+                                   model, last_err.message[:160], int(_UNAVAILABLE_TTL_S // 60))
+                    break
                 if status >= 500 or status in (429, 408):
                     last_err = ModelError(
                         _redact(f"端点返回 {shown}：{err_text}", secret_keys),
@@ -2394,6 +2469,12 @@ class Models:
                     usage_src="reported" if result.usage_known else "unknown",
                     cache_read=result.cache_read_tokens, cache_write=result.cache_write_tokens,
                 )
+                self._unavailable.pop(adapt_key, None)  # 探测成功：解除熔断
+                if cand is not first_choice:
+                    logger.info(
+                        "备用救回：首选 %s 没成，实际由 %s 完成，本次调用共 %.1f 秒",
+                        first_choice.service_model, model, clock.now() - call_start,
+                    )
                 return result
         assert last_err is not None
         raise last_err

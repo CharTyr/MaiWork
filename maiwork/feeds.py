@@ -560,6 +560,46 @@ _FALLBACK_STOPWORDS = frozenset({
     "that", "from", "by", "at",
 })
 
+# ---- 核验阶段分清来源身份、保留关键条件（线上 2026-10 核实：炉石补丁把玩家回帖拼进 quote 写错改动数值；
+# 免费 TTS 的「fair use、指定型号才不计费」在卡片里丢了）。核验 / 补打开 / 个人向找料三处提示词共用。
+_CONDITIONS_MAX = 5
+_CONDITION_LEN = 80
+CONDITIONS_SCHEMA: dict = {"type": "array", "items": {"type": "string"}}
+
+SOURCE_IDENTITY_RULES = (
+    "**分清谁说的**：quote（原文依据）只能抄正文作者 / 发布方本身写的内容；论坛回帖、评论区、读者回复里的话"
+    "只是读者看法，不能当事实写进 summary，也不能拼进 quote。"
+    "页面只是引导（只有一两句话加「View Full Article / 阅读全文 / 查看完整公告」这类链接）、关键内容在链接后面时，"
+    "必须打开那个完整原文核对；打不开就不写具体改动结论。"
+    "数字、价格、版本改动（旧值→新值）必须是原文写明的，原文没写的不许推算、不许补"
+)
+CONDITIONS_RULE = (
+    "conditions（读者必须知道的限定条件：收费 / 免费范围、适用型号、地区、资格、期限、额度、预览 / 传闻等；"
+    f"字符串数组，最多 {_CONDITIONS_MAX} 条、每条一句短话，照原文写，没有就给空数组）"
+)
+
+
+def clean_conditions(raw: Any) -> list[str]:
+    """核验交回的 conditions 清洗：只收字符串、去空白和空条、去重、每条截 _CONDITION_LEN 字、最多 _CONDITIONS_MAX 条。"""
+    out: list[str] = []
+    if not isinstance(raw, list):
+        return out
+    for x in raw:
+        if not isinstance(x, str):
+            continue
+        s = _re.sub(r"\s+", " ", x).strip()[:_CONDITION_LEN]
+        if s and s not in out:
+            out.append(s)
+        if len(out) >= _CONDITIONS_MAX:
+            break
+    return out
+
+
+def _conditions_text(item: dict) -> str:
+    """提示词里列「必须保留的限定」用：没有就空字符串。"""
+    return "；".join(clean_conditions(item.get("conditions")))
+
+
 _NEWS_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -584,6 +624,8 @@ _NEWS_OUTPUT_SCHEMA = {
                     "quality": {"type": "boolean"},
                     "quality_reason": {"type": "string"},
                     "original_url": {"type": "string"},
+                    # 2026-10 读者必须知道的限定条件（免费范围 / 型号 / 地区 / 期限…），可选
+                    "conditions": CONDITIONS_SCHEMA,
                 },
                 "required": ["title", "url", "summary", "kind", "fetched", "quote", "paywall"],
             },
@@ -843,43 +885,98 @@ _POST_ACCURACY_RULES = (
     "- 漏掉限定：原文说的是模拟 / 演示 / 教学示例 / 预览 / 传闻 / 作者自述 / 尚未上线时，这些限定词必须保留，"
     "不许把示例的特点安到正式产品上。",
     "- 意思写反：允许 / 禁止、放行 / 拦截、增加 / 减少、有 / 没有、支持 / 不支持这类关系照原文写，不许反过来。",
+    "- 范围扩大：免费 / 付费、全部 / 部分、永久 / 限时照原文写；条目列了「必须保留的限定」的，正文要写到，"
+    "标题和正文都不许写反或把范围说大；只用这一条自己的依据，不许串用同批其他条目的事实。",
 )
 
 
-async def check_post_bodies(
+def _body_rewritten(it: dict) -> bool:
+    post = it.get("post")
+    body = str(post.get("body") or "") if isinstance(post, dict) else ""
+    return bool(body) and body != it.get("summary")
+
+
+def _fall_back_display(it: dict, field: str) -> None:
+    """一处展示文字没过核验 → 回落到已核验内容：
+    body → 摘要；title → 删 title_zh（保留原标题）；brief → 置空（卡片会从 summary 截）。"""
+    if field == "title":
+        it.pop("title_zh", None)
+    elif field == "brief":
+        if "brief" in it:
+            it["brief"] = ""
+    elif isinstance(it.get("post"), dict):
+        it["post"]["body"] = str(it.get("summary") or "")
+
+
+def drop_unverified_rewrites(items: list[dict]) -> None:
+    """没核验成（自检出错 / 没跑成）的条目：三类改写全部回落，只放已核验的摘要和原标题。"""
+    for it in items:
+        for field in ("title", "brief", "body"):
+            if field == "body" and not _body_rewritten(it):
+                continue
+            _fall_back_display(it, field)
+
+
+def _check_field(raw: Any) -> str:
+    f = str(raw or "").strip().lower()
+    if f in ("title", "title_zh"):
+        return "title"
+    if f == "brief":
+        return "brief"
+    return "body"  # 旧格式没 field / 认不出：按正文处理
+
+
+async def check_display_texts(
     models: Any, gid: str, items: list[dict], *,
     agent: str = "news", purpose: str = "feeds.post_check", task_id: str = "",
 ) -> None:
-    """群资讯 / 个人向共用：一次模型调用，逐条对照原文依据（quote）、摘要、发布日期和来源网站，找帖子正文里原文撑不住的说法。
+    """群资讯 / 个人向共用：群友实际看到的改写文字（中文标题 title_zh、卡片短摘要 brief、帖子正文 post.body）
+    一次模型调用统一对原文核验。依据只有这一条自己的原文依据（quote）、摘要、限定条件（conditions）、
+    来源网站和发布日期。
 
-    自检本身失败（模型报错 / JSON 坏）：没核对过的改写不放出去，这些条正文一律回落摘要
-    （线上巡检 2026-10-02：改写会添错，摘要通常更准）。
+    不过关的字段各自回落到已核验内容（见 _fall_back_display）；自检本身失败（模型报错 / JSON 坏）：
+    没核对过的改写一律不放出去，三类都回落（线上巡检 2026-10-02 / 2026-10 卡片短摘要和标题出错后补）。
     """
     todo = [
         it for it in items
-        if str((it.get("post") or {}).get("body") or "") and (it.get("post") or {}).get("body") != it.get("summary")
+        if _body_rewritten(it) or str(it.get("title_zh") or "").strip() or str(it.get("brief") or "").strip()
     ]
     if not todo:
         return
     lines = [
         f"今天是 {clock.bj(clock.now()).strftime('%Y-%m-%d')}（北京时间）。",
-        "下面每条是一篇给群友看的帖子，后面是它的标题、来源网站、原文发布日期、原文依据（从原文抄的一段）和原文摘要。",
-        "逐条检查帖子正文：有没有原文依据和摘要都撑不住的事实说法（编出来的数字、日期、结论、「首个 / 最快」这类绝对化说法、",
-        "把推测说成事实）。口吻、比喻、个人感受不算。下面四类要特别查：",
-        "- 相对日期：正文写「今天 / 昨天 / 刚刚 / 本周」等，但和原文发布日期、今天日期对不上；",
-        "- 来源拔高：来源网站是媒体、转载、商店新闻页或聚合站，正文却说成「官方公告 / 官方确认」；",
-        "- 漏掉限定：原文是模拟 / 演示 / 教学示例 / 预览 / 传闻 / 作者自述 / 尚未上线，正文丢了这层限定，说成了正式产品的事实；",
-        "- 意思写反：允许 / 禁止、放行 / 拦截、增 / 减、有 / 没有、支持 / 不支持与原文相反。",
-        '只回 JSON：{"unsupported": [{"i": 编号, "phrases": ["撑不住的那几个词或短句"]}]}；全都没问题就给空列表。',
+        "下面每条是要给群友看的一条资讯：先是它的依据（原标题、来源网站、原文发布日期、原文依据（从原文抄的一段）、"
+        "原文摘要、必须保留的限定），再是要核的改写文字（中文标题 title / 卡片短摘要 brief / 帖子正文 body，有几样列几样）。",
+        "逐条逐样检查改写文字：有没有这一条依据撑不住的事实说法（编出来的数字、日期、结论、「首个 / 最快」这类绝对化说法、",
+        "把推测说成事实）。口吻、比喻、个人感受不算。下面几类要特别查：",
+        "- 相对日期：写了「今天 / 昨天 / 刚刚 / 本周」等，但和原文发布日期、今天日期对不上；",
+        "- 来源拔高：来源网站是媒体、转载、商店新闻页或聚合站，却说成「官方公告 / 官方确认」；",
+        "- 漏掉限定：原文是模拟 / 演示 / 教学示例 / 预览 / 传闻 / 作者自述 / 尚未上线，改写丢了这层限定，说成了正式产品的事实；",
+        "- 意思写反：允许 / 禁止、放行 / 拦截、增 / 减、有 / 没有、支持 / 不支持与原文相反；",
+        "- 范围扩大：免费 / 付费、全部 / 部分、永久 / 限时、全球 / 部分地区被说大（如「学生价」写成「免费」、"
+        "「部分型号」写成「全部」）；",
+        "- 条件写反或删坏：「必须保留的限定」在标题或卡片短摘要里被说反；卡片短摘要篇幅短，可以不写全部条件，"
+        "但不许写出和条件矛盾的承诺（如条件是 fair use、指定型号才不计费，却写「免费无限量」）；",
+        "- 串条：用了这一条依据之外的事实（比如同批其他条目里的事实、依据里明说没有的东西）。",
+        '只回 JSON：{"unsupported": [{"i": 编号, "field": "title 或 brief 或 body", "phrases": ["撑不住的那几个词或短句"]}]}；'
+        "同一条几样都有问题就分几项写；全都没问题就给空列表。",
         "",
     ]
     for k, it in enumerate(todo):
         site = _source_site(str(it.get("url") or "")) or str(it.get("site") or "")
         pub = _pub_date(it) or "不明"
-        lines.append(f"[{k}] 帖子：{str(it['post']['body'])[:600]}")
-        lines.append(f"    标题：{str(it.get('title') or '')[:150]}；来源网站：{site}；原文发布日期：{pub}")
+        lines.append(f"[{k}] 原标题：{str(it.get('title') or '')[:150]}；来源网站：{site}；原文发布日期：{pub}")
         lines.append(f"    原文依据：{str(it.get('quote') or '')[:300]}")
         lines.append(f"    原文摘要：{str(it.get('summary') or '')[:300]}")
+        conds = _conditions_text(it)
+        if conds:
+            lines.append(f"    必须保留的限定：{conds}")
+        if str(it.get("title_zh") or "").strip():
+            lines.append(f"    要核 title（中文标题）：{str(it['title_zh'])[:150]}")
+        if str(it.get("brief") or "").strip():
+            lines.append(f"    要核 brief（卡片短摘要）：{str(it['brief'])[:200]}")
+        if _body_rewritten(it):
+            lines.append(f"    要核 body（帖子正文）：{str(it['post']['body'])[:600]}")
     try:
         result = await models.chat(
             agent=agent, messages=[{"role": "user", "content": "\n".join(lines)}],
@@ -888,21 +985,22 @@ async def check_post_bodies(
         )
         data = _parse_model_json(result.text)
     except (ModelError, ValueError) as e:
-        logger.info("帖子对原文自检失败（群 %s），%d 条正文回落摘要：%s", gid, len(todo), e)
-        for it in todo:
-            it["post"]["body"] = str(it.get("summary") or "")
+        logger.info("展示文字对原文自检失败（群 %s），%d 条改写全部回落：%s", gid, len(todo), e)
+        drop_unverified_rewrites(todo)
         return
     bad = data.get("unsupported") if isinstance(data, dict) else None
-    for x in bad or []:
-        try:
-            k = int((x or {}).get("i"))
-        except (TypeError, ValueError, AttributeError):
+    for x in bad if isinstance(bad, list) else []:
+        if not isinstance(x, dict):
             continue
-        phrases = [str(p) for p in ((x or {}).get("phrases") or []) if str(p).strip()]
+        try:
+            k = int(x.get("i"))
+        except (TypeError, ValueError):
+            continue
+        phrases = [str(p) for p in (x.get("phrases") or []) if str(p).strip()]
         if 0 <= k < len(todo) and phrases:
-            it = todo[k]
-            logger.info("帖子有原文撑不住的说法，正文回落摘要（群 %s）：%s", gid, "、".join(phrases)[:80])
-            it["post"]["body"] = str(it.get("summary") or "")
+            field = _check_field(x.get("field"))
+            logger.info("%s 有原文撑不住的说法，回落已核验内容（群 %s）：%s", field, gid, "、".join(phrases)[:80])
+            _fall_back_display(todo[k], field)
 
 
 def _adopt_title_zh(item: dict, post: Any) -> None:
@@ -1806,6 +1904,7 @@ class Feeds:
                 logger.exception("写帖子意外出错（群 %s），全部回落原文", gid)
                 for item in posting:
                     self._post_fallback(item)
+                drop_unverified_rewrites(posting)  # 自检没跑到：标题 / 卡片短摘要也不放没核过的
 
         # ⑥.5 「实测过再发是加分项」（docs/02 §4.1）：对最终入选的条目挑 ≤2 条，
         # 在 railway.new 一次性 VM 里真试一下（verify_enabled=false / railway=false 整个关掉；
@@ -3138,6 +3237,8 @@ class Feeds:
                 "explore": bool(raw.get("explore")),
                 "url_key": _normalize_url(url),
                 "site": _source_site(url),
+                # 读者必须知道的限定条件（2026-10）：写帖 / 打分 / 自检都拿它当依据；没给就空列表
+                "conditions": clean_conditions(raw.get("conditions")),
             }
             if results:
                 # 按内容卡质量（2026-10-03）：quality 只认显式 true/false，没给 = 不卡
@@ -3249,37 +3350,19 @@ class Feeds:
             return 0.0
 
     def _fill_dates_from_pages(self, task_id: str, items: list[dict]) -> int:
-        """模型没给发布日期时，用代码在打开网页那一步读到的补上（docs/10 §九 第一步 2）。
+        """按依据定核验交回的发布日期（page_date.resolve_dates；docs/10 §九 第一步 2、2026-10-08）。
 
-        「必须有日期」（kind=guide）规则不放宽：这里只救「页面上明明有日期、子 agent 没抄回来」
-        的误杀。日期来自 fetch_page 写进 tool_calls 的「页面发布日期」标记。返回补了几条。
+        代码从网页 HTML 读到的日期（fetch_page 写进 tool_calls 的「页面发布日期」标记）覆盖模型给的；
+        模型原样抄回的相对时间（「3 小时前」）按这轮打开该链接的时间换算；依据记 item["date_basis"]。
+        「必须有日期」（kind=guide）规则不放宽：解析不了照旧没有日期。返回被代码定 / 改了几条。
         """
-        from .coordinator import normalize_link_for_check
-
         try:
-            dates = page_date.page_dates(self._store, task_id)
+            filled = page_date.resolve_dates(self._store, task_id, items, _parse_published)
         except Exception:
-            logger.debug("读这轮页面发布日期失败（%s）", task_id, exc_info=True)
+            logger.debug("按页面定发布日期失败（%s）", task_id, exc_info=True)
             return 0
-        if not dates:
-            return 0
-        filled = 0
-        for item in items:
-            if not isinstance(item, dict) or isinstance(item.get("published_ts"), (int, float)):
-                continue
-            key = normalize_link_for_check(str(item.get("url") or ""))
-            date = dates.get(key) if key else ""
-            if not date:
-                continue
-            ts = _parse_published(date)
-            if not ts:
-                continue
-            item["published_ts"] = ts
-            if item.get("published_raw") in (None, ""):
-                item["published_raw"] = date
-            filled += 1
         if filled:
-            logger.info("代码从网页读到发布日期，补上 %d 条（%s）", filled, task_id)
+            logger.info("代码按网页 / 相对时间定发布日期 %d 条（%s）", filled, task_id)
         return filled
 
     def _prefilter(
@@ -3489,6 +3572,8 @@ class Feeds:
         2026-09-30 线上实录（8 分钟 23 次 fetch_page 的「找日期打转」）后加硬规矩：
         只开候选链接本身（打不开最多换一个备用地址），不许搜镜像 / 存档站 / API；
         页面上没有可见发布日期，就用搜索结果自带的日期（下面每条已列出），没有就留空。
+        2026-10（炉石补丁帖把玩家回帖拼进 quote）：分清来源身份（SOURCE_IDENTITY_RULES），
+        引导页允许多开它链出的那一个完整原文；交回 conditions（读者必须知道的限定条件）。
         """
         today = clock.bj(clock.now()).strftime("%Y-%m-%d")
         guides = True  # 核验这步不作「找不找文章」的决定：挑里带 kind，照老格式交回
@@ -3514,17 +3599,20 @@ class Feeds:
             + news_standard.for_collect(guides)
             + "\n\n要求：\n"
             "1. 每条都必须用 fetch_page 真打开过原文（只用 fetch_page，**不要搜索**）；\n"
-            "2. **只开候选链接本身**：打不开最多再换一个备用地址（比如标题链接跳转后的地址）试一次，"
+            "2. **只开候选链接本身**：打不开最多再换一个备用地址（比如标题链接跳转后的地址）试一次；"
+            "唯一的例外：候选页只是引导、关键内容在它链出的完整原文里（见第 9 条），允许为此多开这一个完整原文链接。"
             "**绝不为了找信息去搜或去开镜像站、存档站（web.archive）、oEmbed / API 之类的接口**——"
             "候选打不开就标打不开，别硬啃；\n"
             "3. 发布日期：页面上有直接可见的就用页面上的（它和搜索结果自带的对不上以页面为准），"
+            "页面上只写相对时间（「3 小时前」「昨天」「2 days ago」）就把那段文字原样填进 published、别自己换算，"
             "页面上找不到可见日期就用「搜索结果自带的发布日期」，没有再留空——"
             "**不许为了找日期多开任何页面**；\n"
             f"4. 每条：title（原标题或大意）、url（原文链接）、summary（2–4 句中文纯文本，别用 Markdown）、"
             f"kind（{'news 或 guide，照同事的 hint 填，你判断 hint 明显不对可以改'}）、"
             f"published（发布时间，ISO 格式或 epoch 秒，拿不到空字符串）、"
             f"fetched（确实打开过 true）、quote（从原文抄一小段能支撑摘要的依据，≤{_QUOTE_MAX} 字）、"
-            "paywall（要登录/付费 true）、image_url（有封面图就抄过来）；\n"
+            "paywall（要登录/付费 true）、image_url（有封面图就抄过来）、"
+            + CONDITIONS_RULE + "；\n"
             "5. 每条候选的打开次数有限（程序按组封死），次数用完工具会直接拒绝——"
             "别再找别的页面，用已经打开到的内容按格式交回；\n"
             "6. **按内容卡质量（逐篇看内容，不看站点出身）**：逐条判断这篇是不是——"
@@ -3540,7 +3628,8 @@ class Feeds:
             "8. 门户 / 导购站（163、新浪、搜狐、news.qq、17173、gamersky、什么值得买等）这类站"
             "更常见上面这些问题，打开时**重点看**——但只是多看一眼的提醒，不是「一概不收」："
             "内容过关（有自己的采访 / 实测 / 完整信息）的门户稿照样收；\n"
-            "9. 最后用 submit_result 交回，data 按约定的 JSON Schema；\n"
+            "9. " + SOURCE_IDENTITY_RULES + "；\n"
+            "10. 最后用 submit_result 交回，data 按约定的 JSON Schema；\n"
             f"你只有大约 {VERIFY_MINUTES} 分钟，到点前把已经核对完的交回来。\n\n"
             + "\n\n".join(lines)
         )
@@ -3623,6 +3712,7 @@ class Feeds:
                         cand_pub = src.get("published")
                         if isinstance(cand_pub, (int, float)) and cand_pub:
                             item["published_ts"] = float(cand_pub)
+                            item["date_basis"] = "search"
                             if item.get("published_raw") in (None, ""):
                                 item["published_raw"] = float(cand_pub)
                 # 代码兜底（2026-10-05 §九 第一步 2）：核验没拿到、搜索结果也没有日期时，
@@ -4055,7 +4145,9 @@ class Feeds:
             '"duplicate"（同样的事实换个标题 / 换家网站再报）/ "update"（这件事有了新进展：新版本、新数字、'
             '新决定、新结果）/ "context"（补背景、机制、影响，事实本身没变）；无关就给 "unrelated",'
             ' "new_fact": relation 是 update 时必填——一句话说清比上次多了什么事实；说不出就说明它其实是 duplicate，给空字符串,'
-            ' "brief": 发到群里卡片上的短摘要：两三句、60 到 100 个汉字，先说发生了什么 / 讲了什么，再补一两个最关键的事实或数字、影响，不要「XX 报道」「据悉」「本文」这类铺垫，不要重复标题原话，不点名任何群友,'
+            ' "brief": 发到群里卡片上的短摘要：两三句、60 到 100 个汉字，先说发生了什么 / 讲了什么，再补一两个最关键的事实或数字、影响，不要「XX 报道」「据悉」「本文」这类铺垫，不要重复标题原话，不点名任何群友；'
+            '只能用这一条自己的摘要和原文依据，不能用同批其他条目的事实，摘要里说「没有 / 未见」的不许写成有；'
+            '这一条列了「必须保留的限定」的，不能写反或把范围说大（如「限时 / 指定型号免费」不能写成「免费无限量」）,'
             ' "dup_in_batch": 如果这条和这批候选里编号比它小的另一条讲的是同一件事/同样的内容，'
             '就回那一条的编号（整数），否则回 null,'
             ' "why": "为什么给这个群（一句话，只说群的事，不许点名任何群友）",'
@@ -4225,9 +4317,11 @@ class Feeds:
                     quote = str(c.get("quote") or "")
                     pub = c.get("published_raw")
                     pub_text = f"，发布于 {pub}" if pub else ""
+                    conds = _conditions_text(c)
                     ls.append(
                         f"[{i}]（{kind_zh}）{c['title']} —— {c['summary'][:300]}（{c['url']}{pub_text}）"
                         + (f" 原文依据：{quote[:150]}" if quote else "")
+                        + (f" 必须保留的限定：{conds}" if conds else "")
                     )
                 ls.append("")
                 ls.append(instr)
@@ -4483,6 +4577,9 @@ class Feeds:
             quote = str(item.get("quote") or "")[:150]
             if quote:
                 lines.append(f"    原文依据：{quote}")
+            conds = _conditions_text(item)
+            if conds:
+                lines.append(f"    必须保留的限定（正文要写到，标题不许和它矛盾）：{conds}")
             if pack["quotes"]:
                 lines.append("    本群聊过的相关原话（编号从 1 开始，写 reason 和 audience 只能用这些）：")
                 for j, hit in enumerate(pack["quotes"], 1):
@@ -4495,7 +4592,8 @@ class Feeds:
             "给每条写帖子，只回 JSON："
             '{"posts": [{"i": 编号, "title": "对应条目标题（原样照抄）",'
             ' "title_zh": "原标题不是中文时译成简洁自然的中文标题（专有名词、产品名可保留原文），'
-            '不许加原文没有的信息；原标题已是中文就原样照抄",'
+            '不许加原文没有的信息，不许扩大承诺（学生价不能写成免费、部分不能写成全部、限时不能写成永久）；'
+            '原标题已是中文就原样照抄",'
             ' "body": "按 MaiBot 口吻写的正文 2–5 句，像跟熟人讲；关键处可用 [文字](https://链接)'
             ' 嵌原文链接，只许 http(s) 链接,'
             ' "reason": "我发这条的原因，第一人称；落到群里真实聊过的事和时间'
@@ -4570,16 +4668,19 @@ class Feeds:
             item = pack["item"]
             if "post" not in item:
                 self._post_fallback(item)
-        # 写完再对一遍原文（2026-09-30）：原文撑不住的说法 → 那条正文回落原摘要；
-        # 自检自己出错时 _check_posts 已把改写过的正文回落摘要，这里只兜意外
+        # 写完再对一遍原文（2026-09-30；2026-10 起中文标题、卡片短摘要一起核）：
+        # 原文撑不住的说法 → 那一样回落已核验内容；自检自己出错时 _check_display 已全部回落，
+        # 这里只兜意外（同样全部回落）
+        items = [p["item"] for p in per_item]
         try:
-            await self._check_posts(gid, [p["item"] for p in per_item], task_id=task_id)
+            await self._check_display(gid, items, task_id=task_id)
         except Exception:
-            logger.info("帖子对原文自检意外出错（群 %s）", gid, exc_info=True)
+            logger.info("展示文字对原文自检意外出错（群 %s），改写全部回落", gid, exc_info=True)
+            drop_unverified_rewrites(items)
 
-    async def _check_posts(self, gid: str, items: list[dict], *, task_id: str = "") -> None:
-        """写完对一遍原文：见模块级 check_post_bodies（个人向也用它）。"""
-        await check_post_bodies(self._models, gid, items, agent="news", purpose="feeds.post_check", task_id=task_id)
+    async def _check_display(self, gid: str, items: list[dict], *, task_id: str = "") -> None:
+        """写完对一遍原文：见模块级 check_display_texts（个人向也用它）。"""
+        await check_display_texts(self._models, gid, items, agent="news", purpose="feeds.post_check", task_id=task_id)
 
     def _post_fallback(self, item: dict) -> None:
         """写帖子失败 / 漏了这条的回落：body=summary、reason=why、refs/audience 空、
@@ -5241,6 +5342,11 @@ class Feeds:
             (gid, since),
         ).fetchall()
         return [str(r["title"]) for r in rows if r["title"]]
+
+    def idea_room(self, group_id: str) -> bool:
+        """本群构想还有没有位子（没处理的 < _IDEAS_PILE_LIMIT）。app 排程到点先问它：
+        没位子是「暂时受阻」，不该把当天记成做过。只读一条 COUNT，不调模型。"""
+        return self._unhandled_idea_count(str(group_id)) < _IDEAS_PILE_LIMIT
 
     def _unhandled_idea_count(self, gid: str) -> int:
         """本群还占着位子的构想条数：new（新想法）+ wanted（有人点过想要）+ pending（等批准）。
@@ -5905,7 +6011,7 @@ class Feeds:
         if callable(available_probe):
             if not available_probe():
                 _, text = self._search.status()
-                raise SearchUnavailable(text or "还没指定联网搜索：去 设置 → 扩展 里选一个 MCP 用作联网搜索")
+                raise SearchUnavailable(text or "还没指定联网搜索：去 设置 → 工具 里选一个 MCP 用作联网搜索")
             return
         probe = getattr(self._search, "search", None)
         if callable(probe):

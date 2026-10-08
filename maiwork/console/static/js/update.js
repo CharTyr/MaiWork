@@ -39,9 +39,9 @@ export function updateBanner() {
   return `
     <div class="upd-banner" role="status">
       <span class="upd-dot" aria-hidden="true"></span>
-      <div class="upd-t"><b>MaiWork 有新版 ${esc(u.latest)}</b><span>现在是 ${esc(u.current)}${u.notes ? ` · ${esc(u.notes.replace(/^v?[\d.]+[：:\s]*/, ""))}` : ""}</span></div>
+      <div class="upd-t"><b>有新版 ${esc(u.latest)}</b><span>当前 ${esc(u.current)}${u.notes ? ` · ${esc(u.notes.replace(/^v?[\d.]+[：:\s]*/, ""))}` : ""}</span></div>
       <button class="btn small" data-act="upd-how">怎么更新</button>
-      <button class="upd-x" data-act="upd-dismiss" aria-label="知道了，这一版不再提醒">${SVG.close}</button>
+      <button class="upd-x" data-act="upd-dismiss" aria-label="知道了">${SVG.close}</button>
     </div>`;
 }
 
@@ -51,25 +51,25 @@ export function updateSection() {
   const u = state.update;
   if (!u) return "";
   if (u.enabled === false) {
-    return `<h2 class="h-sub">版本</h2><p class="fine">现在是 ${esc(u.current || "?")}。更新检查已关（配置 [console] update_check）。</p>`;
+    return `<h2 class="h-sub">版本</h2><p class="fine">当前 ${esc(u.current || "?")} · 已关闭检查更新</p>`;
   }
   const checked = u.checked_ts ? `上次检查 ${esc(when(u.checked_ts))}` : "还没查过";
   if (!u.newer) {
-    return `<h2 class="h-sub">版本</h2><p class="fine">现在是 ${esc(u.current || "?")}${u.latest ? "，已经是最新" : ""}。${checked}${u.error ? "（这次没连上 GitHub，过会儿再查）" : ""}</p>`;
+    return `<h2 class="h-sub">版本</h2><p class="fine">当前 ${esc(u.current || "?")}${u.latest ? "，已是最新" : ""}。${checked}${u.error ? "（这次没连上，稍后再查）" : ""}</p>`;
   }
   const go = u.maibot_webui_url
-    ? `<a class="btn primary small" href="${esc(u.maibot_webui_url)}" target="_blank" rel="noopener noreferrer">打开 MaiBot 网页</a>`
+    ? `<a class="btn primary small" href="${esc(u.maibot_webui_url)}" target="_blank" rel="noopener noreferrer">打开 MaiBot</a>`
     : "";
   return `
     <h2 class="h-sub">版本</h2>
     <div class="upd-card">
-      <div class="upd-head"><b>有新版 ${esc(u.latest)}</b><span>现在是 ${esc(u.current)} · ${checked}</span></div>
+      <div class="upd-head"><b>有新版 ${esc(u.latest)}</b><span>当前 ${esc(u.current)} · ${checked}</span></div>
       ${u.notes ? `<p class="upd-notes">${esc(u.notes)}</p>` : ""}
       <ol class="upd-steps">
-        <li>打开 MaiBot 自己的网页${u.maibot_webui_url ? "" : "（MaiWork 没记它的地址，可以在配置 [console] maibot_webui_url 里填上，这里就会有直达按钮）"}，进「插件管理」。</li>
-        <li>找到 MaiWork，点「更新」。你的配置（config.toml）会保留，任务、资讯这些数据不在插件目录里，不受影响。</li>
-        <li>更新会让 MaiBot 的全部插件重新加载一次，挑群里不忙的时候点。</li>
+        <li>打开 MaiBot 网页，进「插件管理」${u.maibot_webui_url ? "" : "（在「全部设置 → 网页」填上 MaiBot 网址，这里就有直达按钮）"}</li>
+        <li>找到 MaiWork 点「更新」，设置和数据都保留</li>
+        <li>所有插件会重载一次，挑群里不忙时</li>
       </ol>
-      <div class="actions">${go}<a class="btn small" href="${esc(u.repo_url || "https://github.com/CharTyr/MaiWork")}/commits/main" target="_blank" rel="noopener noreferrer">看改了什么</a></div>
+      <div class="actions">${go}<a class="btn small" href="${esc(u.repo_url || "https://github.com/CharTyr/MaiWork")}/commits/main" target="_blank" rel="noopener noreferrer">看更新内容</a></div>
     </div>`;
 }

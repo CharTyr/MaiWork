@@ -14,6 +14,7 @@
 - `actions.js` 处理 `data-act` 点击（群切换、反馈/评价、任务批准、设置及扩展操作等）；`act()` 先调用新增的 `actions_news.js::actNews(a, el)`，返回 `true` 即不再进入通用分支。资讯专用分支负责预设搜索服务打开/改密钥、优质来源移出/恢复、漏斗展开；再问 `pages/groupcontrols.js::actControls()`（群页「往群里发」/「谁能批本群的活」的 `gctl-*`）和 `pages/groupctx.js::actCtx()`（群页「这个群」区的 `gctx-*`）。`search-save` 同时提交主搜索、正文抓取、`fallback` 与 `broad`；`checkedProviders()` 去掉主搜索自身。
 - `events.js` 处理输入、上传、群内推送开关和长名滚动；写操作之后按场景调用 `loadView()` / `loadSettings()` 和局部重画。资讯新增缓存按群存在 `state.trusted`，漏斗展开批次存在 `state.openFunnel`，预设列表存在 `state.extPresets`。
 - `sheet.js` 复用单个抽屉展示登录、编辑、群列表、对话列表或详情；桌面详情改画进 `#side`。`detail.js` 读 `/api/tasks/{id}` 并组任务/目标/构想详情。
+- `handoff.js` 是交接包（docs/24）：构想 / 任务详情底部「交给我的 agent」→ `openHandoff()` 取 `GET /api/handoff/{idea|task}/{id}`（构想带当前勾选的 `items`；`seq` 挡住慢请求）→ `sheet.js` 画 `handoffSheet()` 预览；复制（剪贴板不可用时选中全文）/ 下载（浏览器里存成 `.md`）后 `POST .../taken` 记一次，失败静默。手机上从详情抽屉打开的，关掉回到详情（`state.handoff.back`）。「被带走 N 次」只在 `gadmin()` 下显示。
 - `chat.js` 管理管理员对话的消息列表与未完成对话轮询；`onboarding.js` 引导模型、服务群、可选密钥、联网搜索、管理员和头像。搜索步骤懒加载 `/api/extensions/presets`，按预设清单顺序提交勾选项到 `/api/extensions/presets-setup`（第一家主搜索，其余备用，而非点击先后顺序），必填密钥先在表单校验，实际激活与秘密保存由后端完成。
 - `main.js` 的 `edit` 提交管群画像条目和关注成员；口味小结 / 资讯偏好的编辑已删（并进群页「这个群」区，见 `pages/groupctx.js`）。
 - `api.js::gplat()` / `platTag()` 根据后端 `platform` 显示 Telegram / QQ 官方标识（旧数据缺省 `qq`），用于左栏、群选择和群页；`update.js` 显示只提示不自动安装的新版信息；`pulse.js` 画群状态概况；`util.js` 提供 HTML 转义、URL 检查、图标与北京时间格式化。

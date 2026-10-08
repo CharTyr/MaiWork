@@ -1233,7 +1233,7 @@ class TestGroupViewM2Fields:
 
     @pytest.mark.asyncio
     async def test_upcoming_includes_next_news_ts(self, m2_client) -> None:
-        """upcoming 里有「下一批资讯备料」（scheduler.next_news_ts）。"""
+        """upcoming 里有「下一次找资讯」（scheduler.next_news_ts）。"""
         from fakes import FakeScheduler
 
         from CharTyr_MaiWork.maiwork.console import views as _views
@@ -1268,8 +1268,8 @@ class TestGroupViewM2Fields:
         try:
             view = _views.group_view(svc, G1, admin=False)
             texts = [u["text"] for u in view["upcoming"]]
-            assert any(t == "下一批资讯备料" for t in texts)
-            entry = next(u for u in view["upcoming"] if u["text"] == "下一批资讯备料")
+            assert any(t == "下一次找资讯" for t in texts)
+            entry = next(u for u in view["upcoming"] if u["text"] == "下一次找资讯")
             assert entry["at"] == 1_790_100_000.0
             assert entry["icon"] == "newspaper"
         finally:

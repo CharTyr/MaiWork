@@ -468,3 +468,14 @@ class TestMakeIdeaFewAndGood:
             _seed_idea(store, title=f"个人{i}", created=NOW - 60, target_user_id="u1")
 
         assert isinstance(_run(feeds.make_idea(GID)), int)
+
+    def test_idea_room_matches_pile_gate(self, tmp_path) -> None:
+        """app 排程到点先问 idea_room：和堆积闸同一口径（满 3 条没位子；腾出一条就有）。"""
+        store, feeds, models, topics = _feeds(tmp_path, cfg=_SERVED)
+        assert feeds.idea_room(GID) is True
+        ids = [_seed_idea(store, title=f"占位{i}", created=NOW - 60) for i in range(3)]
+        _seed_idea(store, title="个人", created=NOW - 60, target_user_id="u1")
+        assert feeds.idea_room(GID) is False
+        with store.tx() as conn:
+            conn.execute("UPDATE ideas SET state='dismissed' WHERE id=?", (ids[0],))
+        assert feeds.idea_room(GID) is True

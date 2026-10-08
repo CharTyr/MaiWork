@@ -4,6 +4,7 @@ import { RATE_REASONS } from "./pages/news.js";
 import { SVG, esc } from "./util.js";
 import { gname, grp } from "./api.js";
 import { detailHTML, loadTask } from "./detail.js";
+import { handoffSheet } from "./handoff.js";
 import { groupPicker } from "./settings/index.js";
 import { draft } from "./settings/models.js";
 import { chatSide } from "./chat.js";
@@ -14,37 +15,37 @@ function loginSheet() {
   if (isGA())
     return `
     <h1 class="h-page">群管理员</h1>
-    <p class="h-meta sheet-lead">你管的是「${esc(gname(grp()))}」：能批准本群派的活、改群画像、本群规矩和做法。关注成员的个人画像只能看。</p>
+    <p class="h-meta sheet-lead">你在管「${esc(gname(grp()))}」：可批活、改画像和规矩；关注的人的画像只能看</p>
     <div class="actions" style="margin-top:22px"><button class="btn" data-act="logout">退出</button></div>
-    <p class="fine" style="margin-top:22px">要用别的密码登录，先退出。</p>`;
+    <p class="fine" style="margin-top:22px">换账号要先退出</p>`;
   return `
-    <h1 class="h-page">管理员</h1>
+    <h1 class="h-page">管理员登录</h1>
     
     <form id="login" class="login" autocomplete="off">
       <label for="pw">密码</label>
-      <input id="pw" name="pw" type="password" autocomplete="current-password" placeholder="管理员或群管理员密码" />
+      <input id="pw" name="pw" type="password" autocomplete="current-password" placeholder="管理员或群管理员的" />
       <p class="err" ${state.loginError ? "" : "hidden"}>${esc(state.loginError)}</p>
-      <button class="btn primary wide" type="submit">进入管理</button>
-      <p class="fine">忘了密码？在服务器上 MaiWork 数据目录的 console_password.txt 里</p>
+      <button class="btn primary wide" type="submit">登录</button>
+      <p class="fine">忘了？看服务器上的 console_password.txt</p>
     </form>`;
 }
 
 function rateSheet(e) {
   const picked = new Set(e.reasons || []);
   return `
-    <h1 class="h-page">评价这条资讯</h1>
+    <h1 class="h-page">评价这条</h1>
     <p class="h-meta sheet-lead">${esc(e.title || "")}</p>
     <form id="edit" class="login" autocomplete="off">
-      <label>哪里不好（可以多选）</label>
+      <label>哪里不好（可多选）</label>
       <div class="rate-chips">${RATE_REASONS.map(
         ([k, n]) => `<button type="button" class="rate-chip" data-act="rate-chip" data-k="${k}" aria-pressed="${picked.has(k)}">${esc(n)}</button>`
       ).join("")}</div>
-      <label for="ed-text">想补一句（可选）</label>
-      <input id="ed-text" maxlength="60" spellcheck="false" placeholder="比如「上周就看过了」" value="${esc(e.note || "")}" />
-      <p class="fine">下一轮找资讯会参考大家的评价。</p>
+      <label for="ed-text">补一句（可选）</label>
+      <input id="ed-text" maxlength="60" spellcheck="false" placeholder="如「上周看过了」" value="${esc(e.note || "")}" />
+      <p class="fine">下次找资讯会参考</p>
       <p class="err" id="ed-err" hidden></p>
       <button class="btn primary wide" type="submit">提交</button>
-      ${e.had ? `<button class="btn wide" type="button" data-act="rate-clear" style="margin-top:10px">撤回我的评价</button>` : ""}
+      ${e.had ? `<button class="btn wide" type="button" data-act="rate-clear" style="margin-top:10px">撤回评价</button>` : ""}
     </form>`;
 }
 
@@ -54,24 +55,24 @@ function editSheet() {
   if (e.kind === "ga")
     return `
     <h1 class="h-page">群管理员 · ${esc(e.name || "")}</h1>
-    <p class="h-meta sheet-lead">能批准本群派的活、改群画像、本群规矩和做法；看不到别的群和全局设置</p>
+    <p class="h-meta sheet-lead">只能管本群：批活、改画像和规矩</p>
     <form id="edit" class="login" autocomplete="off">
-      <label for="ga-pw">网页密码</label>
-      <input id="ga-pw" type="password" autocomplete="new-password" placeholder="${e.password_set ? "已设置 · 留空就不改" : "至少 8 位 · 可以不填"}" />
-      <p class="fine">批准与免批名单在群页「谁能批本群的活」里设置，这里只改网页密码。</p>
+      <label for="ga-pw">登录密码</label>
+      <input id="ga-pw" type="password" autocomplete="new-password" placeholder="${e.password_set ? "已设，留空不改" : "至少 8 位，可不填"}" />
+      <p class="fine">审批名单去群页「派活审批」改</p>
       <p class="err" id="ed-err" hidden></p>
       <button class="btn primary wide" type="submit">保存</button>
-      ${e.password_set ? `<button class="btn wide" type="button" data-act="ga-clear" style="margin-top:10px">清掉网页密码</button>` : ""}
+      ${e.password_set ? `<button class="btn wide" type="button" data-act="ga-clear" style="margin-top:10px">清除密码</button>` : ""}
     </form>`;
-  const title = e.kind === "focus" ? "加一个关注成员" : e.id ? "改这一条" : `加到「${(CATS.find((c) => c[0] === e.cat) || [, ""])[1]}」`;
+  const title = e.kind === "focus" ? "添加关注" : e.id ? "修改" : `加到「${(CATS.find((c) => c[0] === e.cat) || [, ""])[1]}」`;
   const isFocus = e.kind === "focus";
   return `
     <h1 class="h-page">${esc(title)}</h1>
-    <p class="h-meta sheet-lead">${isFocus ? "个人画像只有管理员看得到" : "改过的条目 MaiWork 不会再动"}</p>
+    <p class="h-meta sheet-lead">${isFocus ? "仅管理员可见" : "改过的 MaiWork 不再动"}</p>
     <form id="edit" class="login" autocomplete="off">
       ${
         isFocus
-          ? `<label for="ed-text">QQ 号</label><input id="ed-text" inputmode="numeric" spellcheck="false" placeholder="比如 10001" />`
+          ? `<label for="ed-text">QQ 号</label><input id="ed-text" inputmode="numeric" spellcheck="false" placeholder="如 10001" />`
           : `<label for="ed-text">内容</label><textarea id="ed-text" rows="3" spellcheck="false">${esc(e.text || "")}</textarea>`
       }
       <p class="err" id="ed-err" hidden></p>
@@ -88,6 +89,7 @@ function sheetHTML(kind) {
   if (kind === "groups") return groupPicker();
   if (kind === "login") return loginSheet();
   if (kind === "edit") return editSheet();
+  if (kind === "handoff") return handoffSheet();
   return detailHTML();
 }
 
@@ -130,6 +132,15 @@ export function repaintSheet() {
 
 export function closeSheet() {
   if (!state.sheet) return;
+  if (state.sheet === "handoff") {
+    // 手机上从详情抽屉打开的交接包：关掉回到详情，不把详情一起关没
+    const back = state.handoff && state.handoff.back && state.detail;
+    state.handoff = null;
+    if (back) {
+      openSheet("detail");
+      return;
+    }
+  }
   if (state.sheet === "detail") {
     state.detail = null;
     syncHash();

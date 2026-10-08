@@ -228,7 +228,7 @@ def _delivery_item(svc: Any) -> dict[str, Any]:
     return _item(
         "delivery", "warn", "交付",
         "网页现在只有你（管理员）在这台机器上能打开；群友拿不到链接——要给群友用，"
-        "需要你自己给网页配一个公网地址（设置 → 全部配置 → 网页对外地址），MaiWork 不会替你公开",
+        "需要你自己给网页配一个公网地址（设置 → 全部设置 → 网页 → 公开网址），MaiWork 不会替你公开",
         sub="config",
     )
 

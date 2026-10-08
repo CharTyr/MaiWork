@@ -30,7 +30,7 @@ function foldText(key, text) {
   const long = s.length > FOLD_CHARS || s.split("\n").length > FOLD_LINES;
   if (!long) return `<div class="dt-text">${esc(s)}</div>`;
   const open = !!foldOpen[key];
-  return `<div class="dt-text fold${open ? " open" : ""}" data-fold="${esc(key)}">${esc(s)}</div><button class="link-btn dt-more" data-fold-btn="${esc(key)}" aria-expanded="${open}">${open ? "收起" : "展开全文"}</button>`;
+  return `<div class="dt-text fold${open ? " open" : ""}" data-fold="${esc(key)}">${esc(s)}</div><button class="link-btn dt-more" data-fold-btn="${esc(key)}" aria-expanded="${open}">${open ? "收起" : "展开"}</button>`;
 }
 document.addEventListener("click", (e) => {
   const btn = e.target && e.target.closest && e.target.closest("[data-fold-btn]");
@@ -41,7 +41,7 @@ document.addEventListener("click", (e) => {
   const box = btn.previousElementSibling;
   if (box && box.dataset.fold === key) box.classList.toggle("open", open);
   btn.setAttribute("aria-expanded", String(open));
-  btn.textContent = open ? "收起" : "展开全文";
+  btn.textContent = open ? "收起" : "展开";
 });
 
 // 验收意见 + 引用核对：结构化结果在 link_check，意见文本里同一行去掉免得重复
@@ -49,11 +49,11 @@ function reviewBlock(t) {
   const lc = t.link_check && typeof t.link_check === "object" ? t.link_check : null;
   let text = String(t.review || "");
   if (lc) text = text.split("\n").filter((l) => !/^\s*引用核对：/.test(l)).join("\n").trim();
-  let html = text ? `<div class="dt-sec"><div class="dt-label">验收意见</div>${foldText(`review:${t.id}`, text)}</div>` : "";
+  let html = text ? `<div class="dt-sec"><div class="dt-label">检查意见</div>${foldText(`review:${t.id}`, text)}</div>` : "";
   if (lc && lc.links) {
     const bad = lc.unopened || 0;
     const urls = (lc.unopened_urls || []).slice(0, 10);
-    html += `<div class="dt-sec"><div class="dt-label">引用核对</div><div class="dt-text">${bad ? `引用了 ${lc.links} 个链接，其中 ${bad} 个这次没打开核实过` : `引用了 ${lc.links} 个链接，都打开核实过`}</div>${
+    html += `<div class="dt-sec"><div class="dt-label">引用核对</div><div class="dt-text">${bad ? `${lc.links} 个链接里有 ${bad} 个没核实` : `${lc.links} 个链接都核实过`}</div>${
       urls.length ? `<ul class="dt-list lc-list">${urls.map((u) => `<li><a href="${safeUrl(u)}" target="_blank" rel="noopener noreferrer">${esc(u)}</a></li>`).join("")}</ul>` : ""
     }</div>`;
   }
@@ -67,20 +67,20 @@ function pausedBlock(t) {
   if (!r || !["tokens", "time", "capability"].includes(r.kind)) return "";
   if (r.kind === "capability") {
     if (!r.text) return "";
-    const tail = gadmin() ? "工具和做法对上后，点「继续」再试；不想做了就点「取消」。" : "管理员决定要不要接着做。";
+    const tail = gadmin() ? "准备好了点「继续」，不做就「取消」。" : "等管理员决定。";
     return `<div class="dt-sec"><div class="dt-label">为什么停了</div><div class="dt-text">${esc(r.text)}${esc(tail)}</div></div>`;
   }
   const text =
     r.kind === "tokens"
-      ? `这个任务的用量到了上限（用了约 ${wan(r.used)} token，上限 ${wan(r.limit)}），先自动停下，等你决定。`
-      : `这个任务已经做了 ${dur(r.used)}，到了时长上限（${dur(r.limit)}），先自动停下，等你决定。`;
+      ? `用量到上限了（约 ${wan(r.used)} / ${wan(r.limit)} token），先停下等你定。`
+      : `做了 ${dur(r.used)}，到时长上限（${dur(r.limit)}）了，先停下等你定。`;
   // 群管理员进不了设置页：上限在哪改只告诉总管理员
-  const act = "想接着做就点「继续」，用量和时长从那一刻重新算；不想做了就「取消」。";
+  const act = "点「继续」重新计算，或点「取消」。";
   const tail = admin()
-    ? act + "上限在「设置 → 全部配置 → 任务安全网」里改。"
+    ? act + "上限在「设置 → 全部设置 → 任务上限」。"
     : gadmin()
-      ? act + "上限由总管理员设。"
-      : "管理员决定要不要接着做。";
+      ? act + "上限由管理员定。"
+      : "等管理员决定。";
   return `<div class="dt-sec"><div class="dt-label">为什么停了</div><div class="dt-text">${esc(text)}${esc(tail)}</div></div>`;
 }
 
@@ -90,14 +90,14 @@ function reqBlock(t) {
   const items = (t.requirements || []).filter((r) => r && r.origin !== "底线");
   if (items.length) {
     const tag = (r) =>
-      (r.origin === "补充" ? `<span class="ntag">加分项</span>` : `<span class="ntag ok">原话要求</span>`) +
-      (r.kind === "真人" ? ` <span class="ntag warn">要有人参与</span>` : "");
-    return `<div class="dt-sec"><div class="dt-label">怎样算完成</div><ul class="dt-list">${items
+      (r.origin === "补充" ? `<span class="ntag">加分</span>` : `<span class="ntag ok">原话</span>`) +
+      (r.kind === "真人" ? ` <span class="ntag warn">要人参与</span>` : "");
+    return `<div class="dt-sec"><div class="dt-label">完成标准</div><ul class="dt-list">${items
       .map((r) => `<li>${esc(r.text)} ${tag(r)}</li>`)
-      .join("")}</ul><div class="fine">原话要求全部做到、内容真实，才算完成；加分项做不到不影响。</div></div>`;
+      .join("")}</ul><div class="fine">原话都做到、内容属实才算完成</div></div>`;
   }
   return (t.criteria || []).length
-    ? `<div class="dt-sec"><div class="dt-label">怎样算完成</div><ul class="dt-list">${t.criteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul></div>`
+    ? `<div class="dt-sec"><div class="dt-label">完成标准</div><ul class="dt-list">${t.criteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul></div>`
     : "";
 }
 
@@ -109,7 +109,7 @@ function critProof(c) {
   if (c.task_id) bits.push(`来自任务 <span class="mono">${esc(c.task_id)}</span>`);
   if (c.evidence) bits.push(esc(c.evidence));
   if (c.ts) bits.push(esc(when(c.ts)));
-  if (!c.task_id && !c.evidence) return admin() ? `<div class="fine-inline">没留打勾依据（旧记录）</div>` : "";
+  if (!c.task_id && !c.evidence) return admin() ? `<div class="fine-inline">旧记录，没留依据</div>` : "";
   return `<div class="fine">${bits.join(" · ")}</div>`;
 }
 
@@ -117,7 +117,7 @@ function taskDetail(id) {
   const t = state.tasks[id];
   const row = findTaskRow(id);
   if (!t) {
-    if (t === null) return `<div class="empty">${ico("hourglass")}<b>找不到这个任务</b><span>可能不在这个群，或者已经被清理。</span></div>`;
+    if (t === null) return `<div class="empty">${ico("hourglass")}<b>找不到这个任务</b><span>可能已删除或不在本群</span></div>`;
     return row ? `<div class="dt-head">${ico(row.icon || "package")}<div><h2 class="dt-title">${esc(row.title)}</h2></div></div>${loading()}` : loading();
   }
   const tl = t.timeline || [];
@@ -129,7 +129,7 @@ function taskDetail(id) {
     if (["running", "reviewing", "queued", "waiting_input"].includes(st)) acts = b("pause", "暂停") + b("cancel", "取消");
     else if (st === "paused" || st === "shelved") acts = b("resume", "继续", true) + b("cancel", "取消");
     else if (st === "failed") acts = b("retry", "重试", true);
-    else if (st === "completed") acts = b("redeliver", t.undelivered ? "再发一次" : "重新发布", t.undelivered);
+    else if (st === "completed") acts = b("redeliver", t.undelivered ? "再发一次" : "重新发", t.undelivered);
   }
   return `
     <div class="dt-head">
@@ -141,13 +141,13 @@ function taskDetail(id) {
     </div>
     <div class="dt-sec"><div class="dt-label">要做什么</div>${foldText(`req:${t.id}`, t.req || t.meta || "")}</div>
     ${pausedBlock(t)}
-    ${t.auto_reason ? `<div class="dt-sec"><div class="dt-label">谁批的</div><div class="dt-text">MaiWork 自动审核通过：${esc(t.auto_reason)}</div></div>` : ""}
-    ${t.question ? `<div class="dt-sec"><div class="dt-label">在等回答</div><div class="quote">${esc(t.question)}</div></div>` : ""}
+    ${t.auto_reason ? `<div class="dt-sec"><div class="dt-label">谁批的</div><div class="dt-text">自动批准：${esc(t.auto_reason)}</div></div>` : ""}
+    ${t.question ? `<div class="dt-sec"><div class="dt-label">在等回复</div><div class="quote">${esc(t.question)}</div></div>` : ""}
     ${reqBlock(t)}
-    ${admin() && t.env ? `<div class="dt-sec"><div class="dt-label">在哪里做</div><div class="dt-text">${esc(t.env)}</div></div>` : ""}
+    ${admin() && t.env ? `<div class="dt-sec"><div class="dt-label">在哪做</div><div class="dt-text">${esc(t.env)}</div></div>` : ""}
     ${
       !admin() && t.steps
-        ? `<div class="dt-sec"><div class="dt-label">过程</div><div class="dt-text">已经做了 ${t.steps} 步${st === "running" ? "，还在继续" : ""}。每一步的细节只有管理员看得到。</div></div>`
+        ? `<div class="dt-sec"><div class="dt-label">过程</div><div class="dt-text">已做 ${t.steps} 步${st === "running" ? "，还在做" : ""} · 细节仅管理员可见</div></div>`
         : ""
     }
     ${
@@ -165,7 +165,7 @@ function taskDetail(id) {
     }
     ${
       admin() && (t.lane_notes || []).length
-        ? `<div class="dt-sec"><div class="dt-label">返工和换手</div><ul class="dt-list">${t.lane_notes
+        ? `<div class="dt-sec"><div class="dt-label">返工记录</div><ul class="dt-list">${t.lane_notes
             .map((n) => `<li><span class="fine">${esc(when(n.ts))}</span> ${esc(n.note)}</li>`)
             .join("")}</ul></div>`
         : ""
@@ -173,7 +173,7 @@ function taskDetail(id) {
     ${reviewBlock(t)}
     ${
       (t.delivery || []).length
-        ? `<div class="dt-sec"><div class="dt-label">交付</div>${t.delivery
+        ? `<div class="dt-sec"><div class="dt-label">成品</div>${t.delivery
             .map((x) => {
               const icon = x.kind === "群文件" ? "package" : x.kind === "here.now" ? "link" : "filebox";
               const title = x.url ? `<a href="${safeUrl(x.url)}" target="_blank" rel="noopener noreferrer">${esc(x.text)}</a>` : esc(x.text);
@@ -182,7 +182,15 @@ function taskDetail(id) {
             .join("")}</div>`
         : ""
     }
-    ${acts ? `<div class="actions" style="margin-top:28px">${acts}</div>` : ""}`;
+    ${acts ? `<div class="actions" style="margin-top:28px">${acts}</div>` : ""}
+    ${handoffEntry(t)}`;
+}
+
+// 交接包入口（docs/24）：任何状态都能带走；被带走次数只给管理员看
+function handoffEntry(t) {
+  const n = Number(t.handoff_count) || 0;
+  const count = gadmin() && n > 0 ? `<span class="ho-count">被带走 ${n} 次</span>` : "";
+  return `<div class="ho-entry ho-task"><button class="link-btn" data-act="handoff" data-kind="task" data-id="${esc(t.id)}">交给我的 agent</button>${count}</div>`;
 }
 
 function goalDetail(goal) {
@@ -212,10 +220,10 @@ function goalDetail(goal) {
       <ul class="checks">${crit.map((c) => `<li class="${c.done ? "done" : ""}"><span class="tick">${c.done ? SVG.check : ""}</span><span class="ck-body">${esc(c.text)}${critProof(c)}</span></li>`).join("")}</ul></div>`
         : ""
     }
-    ${goal.last ? `<div class="dt-sec"><div class="dt-label">最近一次</div><div class="dt-text">${esc(when(goal.last.ts))} ${esc(goal.last.text)}</div></div>` : ""}
+    ${goal.last ? `<div class="dt-sec"><div class="dt-label">上次</div><div class="dt-text">${esc(when(goal.last.ts))} ${esc(goal.last.text)}</div></div>` : ""}
     <div class="dt-sec"><div class="dt-label">下次</div><div class="dt-text">${esc(nextText(goal))}</div></div>
     ${goal.by ? `<div class="dt-sec"><div class="dt-label">来源</div><div class="dt-text">${esc(goal.by)}</div></div>` : ""}
-    ${row ? `<div class="dt-sec"><div class="dt-label">正在做的任务</div>${taskRow(row, 0)}</div>` : ""}
+    ${row ? `<div class="dt-sec"><div class="dt-label">相关任务</div>${taskRow(row, 0)}</div>` : ""}
     ${acts}`;
 }
 
@@ -224,10 +232,10 @@ export function detailHTML() {
   if (state.detail.type === "task") return taskDetail(state.detail.id);
   if (state.detail.type === "idea") {
     const it = findIdea(state.detail.id);
-    return it ? ideaDetail(it) : `<div class="empty">${ico("bulb")}<b>找不到这条构想</b></div>`;
+    return it ? ideaDetail(it) : `<div class="empty">${ico("bulb")}<b>找不到了</b></div>`;
   }
   const goal = findGoal(state.detail.id);
-  return goal ? goalDetail(goal) : `<div class="empty">${ico("bullseye")}<b>找不到这个目标</b></div>`;
+  return goal ? goalDetail(goal) : `<div class="empty">${ico("bullseye")}<b>找不到了</b></div>`;
 }
 
 export async function loadTask(id) {

@@ -52,15 +52,15 @@ export function judgeText(t) {
   const reason = j.reason && j.reason !== "可以开" ? String(j.reason) : "";
   if (okP == null) {
     // 旧记录只存了 ok 结论和「原因」的把握：不再把那个把握当分数，也不写「不适合 · 可以开」
-    if (j.ok) return "适合开（旧记录没存分数）";
-    return `不适合${reason ? ` · ${reason}` : "（分数不够）"}（旧记录没存分数）`;
+    if (j.ok) return "适合开（旧记录）";
+    return `不适合${reason ? ` · ${reason}` : "（分不够）"}（旧记录）`;
   }
-  const parts = [`适合开 ${f2(okP)}（要 ${f2(num(j.ok_need) ?? OK_NEED)}）`];
+  const parts = [`适合度 ${f2(okP)}（要 ${f2(num(j.ok_need) ?? OK_NEED)}）`];
   if (reason) parts.push(`原因：${reason}`);
   const fit = num(j.fit_best);
-  if (fit != null) parts.push(`最合适的候选 ${f2(fit)}（要 ${f2(num(j.fit_need) ?? FIT_NEED)}）${j.fit_title ? `「${j.fit_title}」` : ""}`);
-  if (j.stuck === "timing") parts.push("卡在：时机不对");
-  else if (j.stuck === "candidate") parts.push("卡在：候选不对胃口");
+  if (fit != null) parts.push(`最佳候选 ${f2(fit)}（要 ${f2(num(j.fit_need) ?? FIT_NEED)}）${j.fit_title ? `「${j.fit_title}」` : ""}`);
+  if (j.stuck === "timing") parts.push("时机不对");
+  else if (j.stuck === "candidate") parts.push("没合适的话题");
   return parts.join(" · ");
 }
 
@@ -72,8 +72,8 @@ export function daySummary(log, isToday) {
   const opened = st.filter((s) => s.opened).length;
   const oks = st.map((s) => s.bestOk).filter((v) => v != null);
   const fits = st.map((s) => s.bestFit).filter((v) => v != null);
-  let s = `今天 ${st.length} 段冷场，开了 ${opened} 次`;
-  if (oks.length) s += ` · 适合开最高 ${f2(Math.max(...oks))}（要 ${f2(OK_NEED)}）`;
+  let s = `今天冷场 ${st.length} 次，开了 ${opened} 次`;
+  if (oks.length) s += ` · 最高 ${f2(Math.max(...oks))}（要 ${f2(OK_NEED)}）`;
   if (fits.length) s += ` · 候选最高 ${f2(Math.max(...fits))}（要 ${f2(FIT_NEED)}）`;
   return s;
 }

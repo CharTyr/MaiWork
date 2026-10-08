@@ -45,7 +45,7 @@ def test_check_prompt_has_dates_site_and_named_error_kinds(tmp_path) -> None:
     models = FakeModelsQueue(ready=True, replies=['{"unsupported": []}'])
     _store, _settings, feeds, *_ = _make_feeds(tmp_path, models=models)
     with _TimePatch():
-        _run(feeds._check_posts(GID, [_item()]))
+        _run(feeds._check_display(GID, [_item()]))
     p = _prompt(models, "feeds.post_check")
     assert clock.bj(NOW).strftime("%Y-%m-%d") in p, "自检要知道今天是哪天"
     assert clock.bj(_PUB).strftime("%Y-%m-%d") in p, "自检要知道原文发布日期"
@@ -59,7 +59,7 @@ def test_check_flags_relative_date_falls_back_to_summary(tmp_path) -> None:
     _store, _settings, feeds, *_ = _make_feeds(tmp_path, models=models)
     it = _item()
     with _TimePatch():
-        _run(feeds._check_posts(GID, [it]))
+        _run(feeds._check_display(GID, [it]))
     assert it["post"]["body"] == it["summary"]
 
 
@@ -70,7 +70,7 @@ def test_check_error_falls_back_to_summary(tmp_path) -> None:
         _store, _settings, feeds, *_ = _make_feeds(tmp_path / str(id(reply)), models=models)
         it = _item()
         with _TimePatch():
-            _run(feeds._check_posts(GID, [it]))
+            _run(feeds._check_display(GID, [it]))
         assert it["post"]["body"] == it["summary"]
 
 

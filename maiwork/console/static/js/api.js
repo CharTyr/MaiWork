@@ -13,7 +13,7 @@ export async function api(method, path, body) {
   try {
     res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), credentials: "same-origin" });
   } catch (e) {
-    throw new Error("连不上 MaiWork，检查一下网络");
+    throw new Error("连不上，请检查网络");
   }
   let data = null;
   try {
@@ -52,7 +52,7 @@ export const mq = (text) => `<span class="mq" title="${esc(text)}"><span class="
 export function quiet(g) {
   if (!g) return { text: "", usual: "", live: false };
   const q = g.quiet || {};
-  if (g.fresh) return { text: "还在熟悉这个群", usual: g.read_since ? `已读 ${dur(now() - g.read_since)}的聊天记录` : "刚开始读聊天记录", live: false };
+  if (g.fresh) return { text: "正在了解这个群", usual: g.read_since ? `已读 ${dur(now() - g.read_since)}的聊天记录` : "刚开始读聊天记录", live: false };
   if (!q.last_msg_ts) return { text: "还没收到消息", usual: "", live: false };
   const gap = now() - q.last_msg_ts;
   const usual = q.usual_gap_s ? `平时这个点 ${dur(q.usual_gap_s)}一条` : "";

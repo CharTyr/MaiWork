@@ -330,7 +330,7 @@ class TestWriteTools:
         assert r.ok, r.error
         assert svc.get_settings().topics.candidate_ttl_hours == 20
         # 回执用中文名（管理员点开工具卡片能看到），不露「节.字段」
-        assert "话题候选有效期（小时） → 20" in r.output
+        assert "开话题 · 话题保鲜 → 20" in r.output
         assert "topics." not in r.output and "candidate_ttl_hours" not in r.output
 
     @pytest.mark.asyncio
@@ -676,7 +676,7 @@ class TestH1SetRulesLoosen:
 class TestAutoReviewRulesConfirm:
     """自动审核两键：打开 / 调高上限才算放宽（要确认）；关掉 / 调低不用。
 
-    小票里不露英文键名（用中文标签「自动审核轻活」「每群每天最多自动批」）。
+    小票里不露英文键名（用中文标签「小活自动批」「自动批上限」）。
     """
 
     @pytest.fixture(autouse=True)
@@ -702,7 +702,7 @@ class TestAutoReviewRulesConfirm:
         rows = _pending_rows(svc.store)
         assert len(rows) == 1 and rows[0]["tool"] == "set_rules"
         summary = rows[0]["summary"]
-        assert "自动审核轻活" in summary
+        assert "小活自动批" in summary
         assert "approval.auto_review" not in summary
         assert _config_field(svc, "approval", "auto_review", "没写过") == "没写过"
 
@@ -714,7 +714,7 @@ class TestAutoReviewRulesConfirm:
         rows = _pending_rows(svc.store)
         assert len(rows) == 1 and rows[0]["tool"] == "set_rules"
         summary = rows[0]["summary"]
-        assert "每群每天最多自动批" in summary
+        assert "自动批上限" in summary
         assert "approval.auto_review_daily" not in summary
 
     @pytest.mark.asyncio
@@ -740,8 +740,8 @@ class TestM1SummaryListsAllFields:
         rows = _pending_rows(svc.store)
         assert len(rows) == 1
         summary = rows[0]["summary"]
-        assert "两次开话题最小间隔（小时） → 2" in summary
-        assert "每群每天最多自动批 → 8" in summary
+        assert "开话题 · 话题间隔 → 2" in summary
+        assert "派活审批 · 自动批上限 → 8" in summary
         assert "topics." not in summary and "approval." not in summary
 
     @pytest.mark.asyncio

@@ -530,7 +530,7 @@ class TestSettingsViewSeedOnly:
         rules = (await r.json())["rules"]
         assert rules["group_managed"] is True and rules["seed_only"] is True
         assert "每个群" in rules["note"]
-        assert "往群里发" in rules["group_page"]
+        assert "主动发言" in rules["group_page"]
         # 老键还在（兼容老前端 / 老测试），但都被标成种子，不是第二运行来源
         assert "quiet_hours" in rules and "topics_min_gap_hours" in rules
 

@@ -1685,3 +1685,33 @@ a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 .agent-doc .mono-area { width: 100%; }
 .btn.danger { color: var(--red); }
 @media (max-width: 560px) { .agent-avatar { margin-left: 0; } }
+
+/* 交接包（docs/24）：详情底部的次入口 + 抽屉里的预览 */
+.ho-entry { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 6px; }
+.ho-entry.ho-task { justify-content: flex-start; margin-top: 22px; }
+.ho-entry .link-btn { min-height: 44px; padding: 0 4px; font-size: 15px; }
+.ho-entry .link-btn:disabled { color: var(--gray); cursor: default; }
+.ho-count { font-size: 12.5px; color: var(--gray); font-variant-numeric: tabular-nums; }
+.ho-text {
+  display: block;
+  width: 100%;
+  min-height: 280px;
+  max-height: 52dvh;
+  margin-top: 18px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: var(--fill-2);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  resize: vertical;
+}
+.ho-text:focus { outline: none; border-color: var(--ink); }
+.ho-cut { margin-top: 14px; }
+.ho-acts .btn { display: inline-flex; align-items: center; gap: 8px; }
+.ho-acts .btn svg { width: 16px; height: 16px; }
+.ho-err { margin-top: 22px; display: grid; gap: 8px; color: var(--ink-2); font-size: 15px; line-height: 1.6; }
+.ho-err b { color: var(--ink); font-size: 17px; }

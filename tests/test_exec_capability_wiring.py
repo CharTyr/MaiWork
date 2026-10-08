@@ -183,7 +183,7 @@ class TestCoordinatorStoppedFallback:
 
 
 class TestLocalenvHealthCopy:
-    """网页「本机干活」健康项各档文案（大白话，给装插件的人看）。"""
+    """网页「本机」健康项各档文案（大白话，给装插件的人看）。"""
 
     def _health(self, tmp_path, decision):
         from CharTyr_MaiWork.maiwork.console.views import _localenv_health
@@ -194,13 +194,13 @@ class TestLocalenvHealthCopy:
 
     def test_fixed_copy(self, tmp_path):
         h = self._health(tmp_path, _dec("fixed", True))
-        assert h["name"] == "本机干活"
+        assert h["name"] == "本机"
         assert h["state"] == "ok"
         assert h["text"] == "隔离运行（固定账号 maiwork）"
 
     def test_dynamic_copy(self, tmp_path):
         h = self._health(tmp_path, _dec("dynamic", True))
-        assert h["name"] == "本机干活"
+        assert h["name"] == "本机"
         assert h["state"] == "ok"
         assert h["text"] == "隔离运行（自动分配临时账号，不用建用户）"
 
@@ -211,7 +211,7 @@ class TestLocalenvHealthCopy:
             log_line="本机干活：不能用——这台机器不是 Linux",
         )
         h = self._health(tmp_path, dec)
-        assert h["name"] == "本机干活"
+        assert h["name"] == "本机"
         assert h["state"] == "off"
         assert "没开" in h["text"] and "这台机器不是 Linux" in h["text"]
-        assert "Railway" in h["text"]
+        assert "临时机器" in h["text"]

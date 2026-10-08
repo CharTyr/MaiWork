@@ -13,7 +13,7 @@
    按原文重写摘要和原文依据、填发布时间、判旧闻（stale：正文说的事已经过去 / 发布超过 7 天）。
 3. 代码只认它**这次真打开过**的链接（查补打开这轮的 fetch_page 记录）；说 keep 但没打开 → 不动，
    后面第一道照旧按「原文没打开过」淘汰。drop / stale → 直接打上第一道淘汰理由。
-4. 模型没填日期时，用代码在打开网页那一步读到的发布日期补上（page_date；docs/10 §九 第一步 2）。
+4. 代码在打开网页那一步读到的发布日期覆盖模型填的；模型抄回的相对时间按打开时间换算（page_date.resolve_dates）。
 补打开出任何错都不拖累这轮：记日志，候选原样往下走。
 
 2026-10-05（docs/10 §九 第一步 3）：RSS 条目也走这道（`pick_unverified` 不再跳过 `from_rss`）——
@@ -50,6 +50,8 @@ RECHECK_SCHEMA: dict[str, Any] = {
                     "published": {"type": "string"},
                     "stale": {"type": "boolean"},
                     "reason": {"type": "string"},
+                    # 读者必须知道的限定条件（2026-10，和 feeds 核验同一字段）
+                    "conditions": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["index", "verdict", "url"],
             },
@@ -103,38 +105,21 @@ def pick_unverified(candidates: list[dict], opened: set[str], records: int) -> l
 
 
 def _fill_code_dates(store: Any, task_id: str, items: list[dict], parse_published: Callable[[Any], Any]) -> int:
-    """模型没给日期时，用代码从网页读到的发布日期补上（docs/10 §九 第一步 2）；返回补了几条。"""
+    """按依据定补打开这轮的发布日期（page_date.resolve_dates；docs/10 §九 第一步 2、2026-10-08）：
+    代码从网页读到的日期覆盖模型给的，模型原样抄回的相对时间按打开时间换算；返回被代码定 / 改了几条。"""
     from . import page_date
-    from .coordinator import normalize_link_for_check
 
+    live = [it for it in items if isinstance(it, dict) and not it.get("reject")]
     try:
-        dates = page_date.page_dates(store, task_id)
+        return page_date.resolve_dates(store, task_id, live, parse_published)
     except Exception:
-        logger.debug("读补打开这轮的页面日期失败（%s）", task_id, exc_info=True)
+        logger.debug("补打开这轮按页面定发布日期失败（%s）", task_id, exc_info=True)
         return 0
-    if not dates:
-        return 0
-    filled = 0
-    for item in items:
-        if not isinstance(item, dict) or item.get("reject"):
-            continue
-        if isinstance(item.get("published_ts"), (int, float)):
-            continue
-        key = normalize_link_for_check(str(item.get("url") or ""))
-        date = dates.get(key) if key else ""
-        if not date:
-            continue
-        ts = parse_published(date)
-        if not ts:
-            continue
-        item["published_ts"] = ts
-        if item.get("published_raw") in (None, ""):
-            item["published_raw"] = date
-        filled += 1
-    return filled
 
 
 def _brief(candidates: list[dict], picked: list[int]) -> str:
+    from .feeds import CONDITIONS_RULE, SOURCE_IDENTITY_RULES
+
     today = clock.bj(clock.now()).strftime("%Y-%m-%d")
     lines = []
     for n, i in enumerate(picked):
@@ -155,7 +140,9 @@ def _brief(candidates: list[dict], picked: list[int]) -> str:
         "的，verdict=drop，reason 用中文大白话写清"
         "（例如「低质转载：整段搬运，没注明出处」「洗稿：改写自 IGN 的报道」）；\n"
         "3. 支持的 verdict=keep：按原文重写 summary（2–4 句中文纯文本）；quote 从原文里抄一小段能支撑摘要的原话"
-        f"（≤{_QUOTE_MAX} 字）；published 填原文的发布时间（ISO 日期，拿不到就空字符串）；\n"
+        f"（≤{_QUOTE_MAX} 字）；published 填原文的发布时间（ISO 日期；页面上只写相对时间如「3 小时前」「昨天」「2 days ago」就原样抄那段文字、别自己换算；拿不到就空字符串）；"
+        + CONDITIONS_RULE + "；\n"
+        "3.1 " + SOURCE_IDENTITY_RULES + "；\n"
         "4. 判旧闻：原文说的事已经过去了（比如写「争取 9 月 20 日上线」而今天已经过了那天），或原文发布超过 7 天，"
         "stale=true，reason 写清楚；\n"
         "5. 每条都要给结论（index 用方括号里的编号）；打不开也找不到别的来源的，verdict=drop、reason 写「打不开」；\n"
@@ -243,6 +230,10 @@ async def recheck(
         if summary:
             item["summary"] = summary
         item["quote"] = quote
+        # 限定条件跟着这次核对过的原文走（旧的属于没核对过的摘要，整份换掉）
+        from .feeds import clean_conditions
+
+        item["conditions"] = clean_conditions(res.get("conditions"))
         published = str(res.get("published") or "").strip()
         if published:
             item["published_raw"] = published
@@ -252,7 +243,7 @@ async def recheck(
         item["fetched"] = True
         item["rechecked"] = True
         kept += 1
-    # 模型没填日期 → 用代码这次从网页读到的补上（「必须有日期」不放宽，只救「页面上没看见」的误杀）
+    # 代码这次从网页读到的日期覆盖模型的 / 相对时间按打开时间换算（「必须有日期」不放宽）
     _fill_code_dates(store, recheck_mark, [candidates[i] for i in picked], parse_published)
     logger.info("资讯补打开（群 %s）：送去 %d 条，核对通过 %d 条", gid, len(picked), kept)
     return kept

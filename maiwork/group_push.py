@@ -370,7 +370,7 @@ def set_config(store: Any, group_id: Any, patch: dict, settings: Any = None, *,
         if _existing_config(store, gid) is None:
             raise ValueError(
                 "群控设置还没从旧的全局设置搬过来（启动时那次迁移没成功），"
-                "现在改不了这个群的「往群里发」；稍后再试或看启动日志"
+                "现在改不了这个群的「主动发言」；稍后再试或看启动日志"
             )
     moment = clock.now() if now is None else float(now)
     cur = dict(get_config(store, gid, settings))
@@ -380,7 +380,7 @@ def set_config(store: Any, group_id: Any, patch: dict, settings: Any = None, *,
             # 就是「假保存」，网页 / 老桥会以为改成功了。一个字段都不落库。
             raise ValueError(
                 f"{key} 已经退役：每类每日上限并成了一个「每日总上限」，"
-                "请到群页的「往群里发」里改"
+                "请到群页的「主动发言」里改"
             )
         if key not in SETTABLE:
             raise ValueError(f"不认识的字段：{key}")

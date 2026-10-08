@@ -7,6 +7,7 @@ M2/M3 的路由先注册、统一 501。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -16,7 +17,7 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
-from .. import clock
+from .. import clock, handoff, members, privacy
 from . import usage_history
 from . import views
 from ..group_admins import GroupAdmins
@@ -96,6 +97,44 @@ _PERSONAL_READONLY = "群管理员只能看，不能改个人画像"
 
 def _err(status: int, text: str) -> web.Response:
     return web.json_response({"error": text}, status=status)
+
+
+# 交接包「被带走」的重复窗口（docs/24 §六）：同一浏览器同一条 10 分钟内重复点只算一次。
+_HANDOFF_DEDUPE_S = 600.0
+
+
+def _handoff_record_taken(
+    store: Any, gid: str, kind: str, entity_id: str, action: str, role: str, browser: str
+) -> None:
+    """在 events 里记一次「被带走」（docs/24 §六）。
+
+    payload = `{action, role, browser}`；`browser` 是网页随机标识的 sha256 前 12 位
+    （没给 = 空串，不存原值）。同一 browser 同一条 10 分钟内只写一次（防双击 / 连点）；
+    没带 browser 的（认不出浏览器）不参与去重，照记。
+    """
+    now = clock.now()
+    with store.tx() as conn:
+        if browser:
+            rows = conn.execute(
+                "SELECT payload FROM events WHERE kind='handoff.taken' AND entity=? AND entity_id=?"
+                " AND ts>=?",
+                (str(kind), str(entity_id), now - _HANDOFF_DEDUPE_S),
+            ).fetchall()
+            for row in rows:
+                try:
+                    data = json.loads(row["payload"] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(data, dict) and str(data.get("browser") or "") == browser:
+                    return
+        store.event(
+            conn,
+            "handoff.taken",
+            group_id=str(gid),
+            entity=str(kind),
+            entity_id=str(entity_id),
+            payload={"action": str(action), "role": str(role), "browser": str(browser or "")},
+        )
 
 
 def _looks_like_token(ref: str) -> bool:
@@ -749,7 +788,7 @@ class ConsoleServer:
                 if key in _gp.RETIRED_FIELDS:
                     return (
                         f"「{key}」已经退役：每类每日上限并成了一个「每天主动发送总上限」，"
-                        "到「群 → 往群里发（开话题 / 资讯卡 / 提一嘴 / 每日上限 / 睡觉时段）」里改，"
+                        "到「群 → 主动发言（开话题 / 资讯卡 / 提一嘴 / 每日上限 / 睡觉时段）」里改，"
                         "不从全局改"
                     )
                 if key not in _gp.SETTABLE:
@@ -3293,6 +3332,10 @@ class ConsoleServer:
             _merge_delivery(detail, tid)
             _merge_auto_review(detail, tid)
             _merge_link_check(detail, tid)
+            if ident.role in ("admin", "group_admin"):
+                # 交接包被带走几次（docs/24 §六）：只给总管理员和本群群管理员；
+                # 群友版没有这个字段（群管理员其它字段照旧是群友版）
+                detail["handoff_count"] = views.handoff_counts(svc.store, "task", [tid]).get(str(tid), 0)
             if ident.role != "admin":
                 # detail_view(admin=False) 已经不给了，这里再断言一次
                 # （红线：群友看不到 env / timeline / tokens / workspace / source / request_id / requester_id）
@@ -3448,6 +3491,186 @@ class ConsoleServer:
                 f"/api/goals/{{id}}/{_op}",
                 self._write(lambda req, op=_op: _goal_op(req, op)),
             )
+
+        # ---------- 交接包（docs/24）：构想 / 任务 → 一份能贴给自己个人 agent 的 Markdown ----------
+        #
+        # 只往外带、不往回收（不认领、不回写、不改状态、不往群里发）。
+        # 口径（docs/24 §二）：**谁点都一样**——内容只从群友版数据生成
+        # （feeds.ideas_view(admin=False) / tasks.detail_view(admin=False)），
+        # 总管理员 / 群管理员拿到的和群友逐字相同。出门三道处理：
+        # 去人（handoff.py）→ 遮密钥（和别的出网出口同一份）→ 隐私闸。
+
+        def _handoff_is_served(gid: Any) -> bool:
+            """只服务配置里列出的群；非服务群一律当没有（404）。"""
+            if not gid:
+                return False
+            try:
+                return bool(svc.get_settings().is_served(str(gid)))
+            except Exception:
+                logger.exception("查服务群失败（%s），交接包这次当作没有", gid)
+                return False
+
+        def _handoff_idea_view(gid: str, item_id: int) -> dict | None:
+            """群友版构想（原始 view：含 target_user_id，basis 已被 feeds 清空）。"""
+            try:
+                ideas = views._ideas_of(svc.feeds, gid, False)
+            except Exception:
+                logger.exception("取群友版构想出错（群 %s），交接包这次生不出来", gid)
+                return None
+            for it in ideas or []:
+                if isinstance(it, dict) and int(it.get("id") or 0) == int(item_id):
+                    return it
+            return None
+
+        def _handoff_task_view(tid: str) -> dict:
+            """群友版任务详情 + 交付记录 + 引用核对（都是群友在任务详情里本来就看得到的）。
+
+            不从 tool_calls 捞「打开过的链接」：工具调用只给总管理员看（docs/24 §二.2）。
+            """
+            detail = svc.tasks.detail_view(tid, admin=False)
+            _merge_delivery(detail, tid)
+            _merge_link_check(detail, tid)
+            return detail
+
+        def _handoff_response(gid: str, kind: str, item_id: Any, payload: dict) -> web.Response:
+            """拼好的包：遮密钥 → 隐私闸 → 返回。任何一道拦下就是 409，不给半份。"""
+            text = str(payload.get("markdown") or "")
+            try:
+                text = _models_mod._redact_full(text, _secret_list())
+            except Exception:
+                logger.exception("交接包遮密钥出错（群 %s，%s %s）", gid, kind, item_id)
+                return _err(409, "这份内容没法带出去")
+            # 本群网页链接的随机码 = 整个群页的访问权，不该进别家模型的记录（docs/24 §二.8）
+            try:
+                token = str(svc.token_of(gid) or "")
+            except Exception:
+                token = ""
+            if token and token in text:
+                logger.warning("交接包里有本群链接码，已拦下（群 %s，%s %s）", gid, kind, item_id)
+                return _err(409, "这份内容没法带出去")
+            try:
+                if privacy.scrub(gid, text, svc.store) is None:
+                    logger.warning("交接包没过隐私闸，已拦下（群 %s，%s %s）", gid, kind, item_id)
+                    return _err(409, "这份内容没法带出去")
+            except Exception:
+                logger.exception("交接包过隐私闸出错（群 %s，%s %s）", gid, kind, item_id)
+                return _err(409, "这份内容没法带出去")
+            out = dict(payload)
+            out["markdown"] = text
+            out["chars"] = len(text)
+            return web.json_response(out)
+
+        def _handoff_place(kind: str, ident: Identity, raw_id: str) -> tuple[str | None, web.Response | None]:
+            """条目归属 + 权限：ok 返回 (群号, None)；不然 (None, 错误响应)。"""
+            if kind == "idea":
+                try:
+                    item_id = int(raw_id)
+                except (TypeError, ValueError):
+                    return None, _err(404, "这条构想不存在")
+                gid = _group_of("ideas", item_id)
+                if gid is None or not _handoff_is_served(gid):
+                    return None, _err(404, "这条构想不存在")
+                if _wrong_group(ident, gid):
+                    return None, _err(403, "只能看自己群的内容")
+                return gid, None
+            try:
+                row = svc.tasks.get(str(raw_id))
+            except Exception:
+                row = None
+            if row is None:
+                return None, _err(404, "找不到这个任务")
+            gid = str(row.get("group_id") or "")
+            if not _handoff_is_served(gid):
+                return None, _err(404, "找不到这个任务")
+            if _wrong_group(ident, gid):
+                return None, _err(403, "只能看自己群的内容")
+            return gid, None
+
+        @get("/api/handoff/idea/{id}")
+        async def _handoff_idea(request: web.Request) -> web.Response:
+            ident = self._identify(request)
+            if ident.role not in ("admin", "member", "group_admin"):
+                return _err(401, "先登录管理员，或用群链接打开")
+            not_ready = _m2_ready(getattr(svc, "feeds", None))
+            if not_ready is not None:
+                return not_ready
+            raw_id = str(request.match_info["id"])
+            gid, deny = _handoff_place("idea", ident, raw_id)
+            if deny is not None:
+                return deny
+            view = _handoff_idea_view(str(gid), int(raw_id))
+            if view is None:
+                return _err(404, "这条构想不存在")
+            payload = handoff.build_idea(
+                view,
+                request.query.get("items", ""),
+                views._profile_sections(svc, gid),
+                members.roster_names(svc.store, gid),
+                clock.now(),
+            )
+            return _handoff_response(str(gid), "idea", raw_id, payload)
+
+        @get("/api/handoff/task/{id}")
+        async def _handoff_task(request: web.Request) -> web.Response:
+            ident = self._identify(request)
+            if ident.role not in ("admin", "member", "group_admin"):
+                return _err(401, "先登录管理员，或用群链接打开")
+            not_ready = _m3_ready(getattr(svc, "tasks", None))
+            if not_ready is not None:
+                return not_ready
+            tid = str(request.match_info["id"])
+            gid, deny = _handoff_place("task", ident, tid)
+            if deny is not None:
+                return deny
+            try:
+                detail = _handoff_task_view(tid)
+            except KeyError:
+                return _err(404, "找不到这个任务")
+            payload = handoff.build_task(
+                detail,
+                views._profile_sections(svc, gid),
+                members.roster_names(svc.store, gid),
+                clock.now(),
+            )
+            return _handoff_response(str(gid), "task", tid, payload)
+
+        @post("/api/handoff/{kind}/{id}/taken")
+        async def _handoff_taken(request: web.Request) -> web.Response:
+            """点「复制 / 下载」时记一次（docs/24 §六）。记数失败不影响前端复制。"""
+            ident = self._identify(request)
+            if ident.role not in ("admin", "member", "group_admin"):
+                return _err(401, "先登录管理员，或用群链接打开")
+            kind = str(request.match_info["kind"])
+            if kind not in ("idea", "task"):
+                return _err(404, "没有这个接口")
+            not_ready = _m2_ready(getattr(svc, "feeds", None)) if kind == "idea" else _m3_ready(getattr(svc, "tasks", None))
+            if not_ready is not None:
+                return not_ready
+            raw_id = str(request.match_info["id"])
+            gid, deny = _handoff_place(kind, ident, raw_id)
+            if deny is not None:
+                return deny
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            action = str(body.get("action") or "")
+            if action not in ("copy", "download"):
+                return _err(400, 'action 只支持 "copy" / "download"')
+            client = body.get("client")
+            browser = ""
+            if isinstance(client, str) and client.strip():
+                # 只存哈希前 12 位：网页的随机浏览器标识不进库（资讯评价也用它）
+                browser = hashlib.sha256(client.encode("utf-8", "ignore")).hexdigest()[:12]
+            entity_id = str(int(raw_id)) if kind == "idea" else raw_id
+            store = getattr(svc, "store", None)
+            if store is None:
+                return _err(503, "这个功能还没开")
+            try:
+                _handoff_record_taken(store, gid, kind, entity_id, action, ident.role, browser)
+            except Exception:
+                # 记数失败不影响前端复制（前端本来就静默）：日志只记群号和条目编号，不记内容
+                logger.exception("交接包记「被带走」失败（群 %s，%s %s）", gid, kind, entity_id)
+            return web.json_response({"ok": True})
 
         # ---------- 身份与工作记忆（identity.py；只管理员；docs/02「身份与工作记忆」） ----------
 

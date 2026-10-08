@@ -1178,8 +1178,8 @@ class TestStoppedMode:
             from CharTyr_MaiWork.maiwork.console.views import _localenv_health
 
             h = _localenv_health(w.app)
-            assert h["name"] == "本机干活" and h["state"] == "off"
-            assert "没开" in h["text"] and "Railway" in h["text"]
+            assert h["name"] == "本机" and h["state"] == "off"
+            assert "没开" in h["text"] and "临时机器" in h["text"]
         finally:
             await w.plugin.on_unload()
 

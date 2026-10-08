@@ -19,7 +19,7 @@ export const ONB_STEPS = [
   { id: "groups", name: "群" },
   { id: "keys", name: "可选" },
   { id: "search", name: "搜索" },
-  { id: "admins", name: "管理员" },
+  { id: "admins", name: "群管理" },
   { id: "look", name: "头像" },
   { id: "done", name: "完成" },
 ];
@@ -43,11 +43,11 @@ export function onbPane(id) {
     return `
       <div class="onb-hero"><img class="onb-avatar" src="${esc(bot.avatar || "/static/assets/logo.png")}" alt="" /><span class="onb-spark">${ico("sparkles", "ico")}</span></div>
       <h1 class="onb-title">欢迎用 MaiWork</h1>
-      <p class="onb-lead">花两分钟配好几样东西就能开始</p>
+      <p class="onb-lead">两分钟就能配好</p>
       <ul class="onb-list">
-        <li>${ico("robot")}<div><b>模型</b><span>必填：连一个端点，挑主模型</span></div></li>
-        <li>${ico("speech")}<div><b>服务的群</b><span>MaiWork 在哪些群工作</span></div></li>
-        <li>${ico("lock")}<div><b>管理员和密钥</b><span>可以之后再填</span></div></li>
+        <li>${ico("robot")}<div><b>模型</b><span>必填，连上并选主模型</span></div></li>
+        <li>${ico("speech")}<div><b>群</b><span>在哪些群工作</span></div></li>
+        <li>${ico("lock")}<div><b>其他</b><span>可以以后再填</span></div></li>
       </ul>`;
   if (id === "models") {
     // 2026-10：端点 + 模型库。引导里只加一个端点、挑主模型和专岗用的模型；细项去「模型」页调
@@ -58,27 +58,27 @@ export function onbPane(id) {
     const curMain = byId(prof("main").model), curWork = byId(prof("task").model);
     // 下拉 + 手填二合一（docs/13 A03）：列表接口 404 的端点也能直接填模型 ID
     const sel = (sid, v, empty) =>
-      `<input id="${sid}" list="onb-model-list" spellcheck="false" autocomplete="off" value="${esc(v || "")}" placeholder="${esc(empty || (list.length ? "从列表选，或手填模型 ID" : "手填模型 ID，或先测试连接拉列表"))}" />`;
+      `<input id="${sid}" list="onb-model-list" spellcheck="false" autocomplete="off" value="${esc(v || "")}" placeholder="${esc(empty || "从列表选或手填 ID")}" />`;
     const proto = ep.protocol || "openai";
     return `
       <div class="onb-step-ico">${ico("robot")}</div>
       <h1 class="onb-title">连上模型</h1>
-      <p class="onb-lead">先连一个端点，再挑主模型。更多端点、思考强度这些，之后在「模型」和「专岗」页里调</p>
+      <p class="onb-lead">先连一个，其余以后再调</p>
       <div class="login onb-form">
         <label for="onb-proto">接口格式</label>
         <select id="onb-proto">${Object.entries(PROTOCOLS).map(([k, v]) => `<option value="${k}"${k === proto ? " selected" : ""}>${esc(v.name)}</option>`).join("")}</select>
         <label for="onb-url">端点地址</label>
         <input id="onb-url" type="url" inputmode="url" spellcheck="false" value="${esc(ep.base_url || "")}" placeholder="${esc((PROTOCOLS[proto] || PROTOCOLS.openai).ph)}" />
         <label for="onb-key">API 密钥</label>
-        <input id="onb-key" type="password" autocomplete="new-password" placeholder="${ep.key_set ? "已填写 · 留空就不改" : "粘贴密钥"}" />
-        <div class="onb-test"><button class="btn" type="button" data-act="onb-test">测试连接</button><span class="onb-status" id="onb-status">${list.length ? `<i class="onb-ok">${SVG.check}</i>找到 ${list.length} 个模型` : ""}</span></div>
+        <input id="onb-key" type="password" autocomplete="new-password" placeholder="${ep.key_set ? "已填，留空不改" : "粘贴密钥"}" />
+        <div class="onb-test"><button class="btn" type="button" data-act="onb-test">测试连接</button><span class="onb-status" id="onb-status">${list.length ? `<i class="onb-ok">${SVG.check}</i>找到 ${list.length} 个` : ""}</span></div>
         <div class="onb-picks">
           <datalist id="onb-model-list">${list.map((x) => `<option value="${esc(x)}"></option>`).join("")}</datalist>
-          <label for="onb-main">主模型 <span class="fine-inline">负责想和验收，选聪明的</span></label>
+          <label for="onb-main">主模型 <span class="fine-inline">负责想和检查，选聪明的</span></label>
           ${sel("onb-main", onb.pickMain || curMain)}
-          <label for="onb-worker">各专岗用的模型 <span class="fine-inline">负责动手，选便宜耐用的</span></label>
-          ${sel("onb-worker", onb.pickWork || (curWork && curWork !== curMain ? curWork : ""), "留空 = 跟主模型一样")}
-          <p class="fine" id="onb-verify-note">保存时会验证所选模型：发一句很短的问话、做一次空工具测试（共 2~6 次小请求，会用掉一点点 token）</p>
+          <label for="onb-worker">专岗模型 <span class="fine-inline">负责动手，选便宜的</span></label>
+          ${sel("onb-worker", onb.pickWork || (curWork && curWork !== curMain ? curWork : ""), "空 = 同主模型")}
+          <p class="fine" id="onb-verify-note">保存时会试问几句，花一点 token</p>
         </div>
       </div>`;
   }
@@ -87,19 +87,19 @@ export function onbPane(id) {
     return `
       <div class="onb-step-ico">${ico("speech")}</div>
       <h1 class="onb-title">服务哪些群</h1>
-      <p class="onb-lead">MaiWork 只在这些群里工作</p>
-      <div class="login onb-form">${f ? rowsEditor("onb-serve", ROWS_COLS.serve_groups, f.value) : `<p class="fine">读不到配置，先跳过这步。</p>`}</div>
+      <p class="onb-lead">只在这些群工作</p>
+      <div class="login onb-form">${f ? rowsEditor("onb-serve", ROWS_COLS.serve_groups, f.value) : `<p class="fine">读不到设置，先跳过</p>`}</div>
       `;
   }
   if (id === "keys") {
     const jev = onbField("jev.api_key") || {};
     return `
       <div class="onb-step-ico">${ico("lock")}</div>
-      <h1 class="onb-title">可选：快速判断</h1>
-      <p class="onb-lead">不填也能用，填了反应更快</p>
+      <h1 class="onb-title">快速判断（可选）</h1>
+      <p class="onb-lead">填了反应更快</p>
       <div class="login onb-form">
         <label for="onb-jev">Jev 密钥 </label>
-        <input id="onb-jev" type="password" autocomplete="new-password" placeholder="${jev.set ? "已设置 · 留空就不改" : "没设置 · 可以不填"}" />
+        <input id="onb-jev" type="password" autocomplete="new-password" placeholder="${jev.set ? "已设，留空不改" : "可不填"}" />
       </div>
       `;
   }
@@ -107,9 +107,9 @@ export function onbPane(id) {
   if (id === "admins") {
     return `
       <div class="onb-step-ico">${ico("lock")}</div>
-      <h1 class="onb-title">各群的网页管理员</h1>
-      <p class="onb-lead">可选：给每个群设置单独的网页密码，只能管自己的群。</p>
-      <p class="fine">群里谁能批准、谁免批，统一在群页「谁能批本群的活」里设置，不再另填一份全局名单。</p>
+      <h1 class="onb-title">群管理员（可选）</h1>
+      <p class="onb-lead">每群一个密码，只管本群</p>
+      <p class="fine">审批名单在群页「派活审批」设</p>
       ${onbGaBlock()}`;
   }
   if (id === "look") {
@@ -117,14 +117,14 @@ export function onbPane(id) {
     const src = (a && a.url) || bot.avatar || "/static/assets/logo.png";
     return `
       <div class="onb-hero"><img class="onb-avatar" id="onb-av" src="${esc(src)}" alt="" onerror="this.onerror=null;this.src='/static/assets/logo.png'" /></div>
-      <h1 class="onb-title">可选：换个头像</h1>
-      <p class="onb-lead">默认和 MaiBot 一样，也可以换一张</p>
+      <h1 class="onb-title">换头像（可选）</h1>
+      <p class="onb-lead">默认同 MaiBot</p>
       <div class="onb-av-btns">
-        <label class="btn file-btn">上传图片<input type="file" id="avatar-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden /></label>
+        <label class="btn file-btn">上传<input type="file" id="avatar-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden /></label>
         <button type="button" class="btn" data-act="avatar-url">用网址</button>
         ${a && a.source === "custom" ? `<button type="button" class="btn ghost" data-act="avatar-reset">恢复同步</button>` : ""}
       </div>
-      <p class="fine">${a ? esc(AV_SRC[a.source] || "") : ""}${a ? " · " : ""}png / jpg / webp / gif，最大 2MB。</p>`;
+      <p class="fine">${a ? esc(AV_SRC[a.source] || "") : ""}${a ? " · " : ""}最大 2MB</p>`;
   }
   return onbDonePane();
 }
@@ -136,16 +136,16 @@ function onbDonePane() {
   const info = onb.info || {};
   const items = info.items || [];
   const usable = !!info.usable;
-  const miss = (info.missing || []).map((k) => ({ models: "模型", groups: "服务的群" })[k] || k);
+  const miss = (info.missing || []).map((k) => ({ models: "模型", groups: "群" })[k] || k);
   const row = (it, i) => {
     const goto = it.state !== "ok" && it.step && it.step !== "done" ? `<button type="button" class="link-btn" data-act="onb-goto" data-step="${esc(it.step)}">去补</button>` : "";
-    const copy = it.copy ? `<button type="button" class="link-btn" data-act="copy" data-link="${esc(it.copy)}" data-what="链接">复制链接</button>` : "";
+    const copy = it.copy ? `<button type="button" class="link-btn" data-act="copy" data-link="${esc(it.copy)}" data-what="链接">复制</button>` : "";
     return `<li class="onb-sum" style="--i:${i}"><span class="onb-mark ${MARK[it.state] || ""}">${it.state === "ok" ? SVG.check : it.state === "wait" ? "…" : it.state === "warn" ? "!" : ""}</span><div><b>${esc(it.title)}${goto}${copy}</b><span>${esc(it.text)}</span></div></li>`;
   };
   return `
     ${usable ? `<div class="onb-done-mark"><svg viewBox="0 0 52 52"><circle cx="26" cy="26" r="24"/><path d="M15 27l7.5 7.5L37.5 19"/></svg></div>` : `<div class="onb-step-ico">${ico("floppy")}</div>`}
-    <h1 class="onb-title">${usable ? "可以开始用了" : "先存下了，还差一点"}</h1>
-    <p class="onb-lead">${usable ? "下面是现在各项能做到哪一步；标了感叹号的能用但有限制，随时可以在「设置」里补" : `还没配好：${esc(miss.join("、"))}。MaiWork 要这些才能干活，点「去补」接着填`}</p>
+    <h1 class="onb-title">${usable ? "可以用了" : "先存好了，还差一点"}</h1>
+    <p class="onb-lead">${usable ? "带「!」的能用但有限制，可去设置补" : `还差：${esc(miss.join("、"))}，补上才能干活`}</p>
     <ul class="onb-list onb-summary">${items.map(row).join("")}</ul>`;
 }
 
@@ -160,18 +160,18 @@ function onbSearchPane() {
   const rows = list
     .map((p) => {
       const on = onb.sxPicked.includes(p.id);
-      const ph = p.key_set ? "已填 · 留空就不改" : p.free ? "可以不填 · 不填就用免费额度" : "粘贴 API 密钥";
+      const ph = p.key_set ? "已填，留空不改" : p.free ? "可不填，用免费额度" : "粘贴密钥";
       return `
       <div class="onb-sx${on ? " on" : ""}" data-id="${esc(p.id)}">
         <label class="onb-sx-head">
           <input type="checkbox" class="onb-sx-chk" value="${esc(p.id)}" ${on ? "checked" : ""} data-act="onb-sx-toggle" />
           <img class="onb-sx-logo" src="${esc(p.logo)}" alt="" />
           <span class="onb-sx-name"><b>${esc(p.label)}</b><span>${esc(p.free_note || "")}</span></span>
-          ${p.free ? `<span class="ntag ok">免密钥可用</span>` : `<span class="ntag warn">要密钥</span>`}
+          ${p.free ? `<span class="ntag ok">免费可用</span>` : `<span class="ntag warn">要密钥</span>`}
         </label>
         <div class="onb-sx-key login">
           <input id="onb-sx-key-${esc(p.id)}" type="password" autocomplete="new-password" spellcheck="false" placeholder="${esc(ph)}" />
-          <a href="${esc(p.key_page_url)}" target="_blank" rel="noopener noreferrer">${p.free ? "想要更高额度？去官网拿密钥 ↗" : `还没有密钥？去 ${esc(p.label)} 官网拿 ↗`}</a>
+          <a href="${esc(p.key_page_url)}" target="_blank" rel="noopener noreferrer">去 ${esc(p.label)} 官网拿密钥 ↗</a>
         </div>
       </div>`;
     })
@@ -179,8 +179,8 @@ function onbSearchPane() {
   return `
     <div class="onb-step-ico">${ico("magnifier")}</div>
     <h1 class="onb-title">联网搜索</h1>
-    <p class="onb-lead">MaiWork 找资讯、干活要上网搜。勾上要用的，第一个当主搜索，其余当备用</p>
-    <div class="onb-sx-list">${list.length ? rows : `<p class="fine">读不到搜索服务清单，先跳过这步，之后在「设置 → 扩展」里打开。</p>`}</div>`;
+    <p class="onb-lead">勾上要用的，第一个为主</p>
+    <div class="onb-sx-list">${list.length ? rows : `<p class="fine">读不到列表，以后在「设置 → 工具」开</p>`}</div>`;
 }
 
 // 引导「管理员」一步里的各群群管理员（可选）：网页密码 + 群里能批准的人
@@ -195,7 +195,7 @@ function onbGaBlock() {
   const gids = onbServed().filter((gid) => onb.ga && onb.ga[gid]);
   if (!gids.length) return "";
   return `
-    <div class="onb-ga-head"><b>各群的群管理员</b><span>可选 · 只能管自己的群</span></div>
+    <div class="onb-ga-head"><b>群管理员</b><span>可选</span></div>
     ${gids
       .map((gid) => {
         const x = onb.ga[gid];
@@ -203,8 +203,8 @@ function onbGaBlock() {
         return `
       <div class="onb-ga login">
         <div class="onb-ga-name">${esc(gname(g) || `群 ${gid}`)}</div>
-        <label for="onb-ga-pw-${gid}">网页密码</label>
-        <input id="onb-ga-pw-${gid}" type="password" autocomplete="new-password" placeholder="${x.password_set ? "已设置 · 留空就不改" : "至少 8 位 · 可以不填"}" />
+        <label for="onb-ga-pw-${gid}">密码</label>
+        <input id="onb-ga-pw-${gid}" type="password" autocomplete="new-password" placeholder="${x.password_set ? "已设，留空不改" : "至少 8 位，可不填"}" />
       </div>`;
       })
       .join("")}`;
@@ -214,10 +214,10 @@ function onbShell() {
   const n = ONB_STEPS.length - 1;
   return `
     <div class="onb-scrim"></div>
-    <div class="onb-card" role="dialog" aria-modal="true" aria-label="MaiWork 首次引导">
+    <div class="onb-card" role="dialog" aria-modal="true" aria-label="设置向导">
       <header class="onb-head">
         <div class="onb-dots">${ONB_STEPS.map((s, i) => `<span class="onb-dot" data-i="${i}" title="${s.name}"></span>`).join("")}</div>
-        <button class="btn ghost small onb-skip" type="button" data-act="onb-skip">跳过引导</button>
+        <button class="btn ghost small onb-skip" type="button" data-act="onb-skip">跳过</button>
       </header>
       <div class="onb-bar"><i style="transform:scaleX(${onb.i / n})"></i></div>
       <div class="onb-stage" id="onb-stage"></div>
@@ -229,9 +229,9 @@ function onbShell() {
 function onbFoot() {
   const id = ONB_STEPS[onb.i].id;
   const back = onb.i > 0 && id !== "done" ? `<button class="btn ghost" type="button" data-act="onb-back">上一步</button>` : `<span></span>`;
-  const later = ["keys", "search", "admins", "groups", "look"].includes(id) ? `<button class="btn" type="button" data-act="onb-later">这步先不填</button>` : id === "models" ? `<button class="btn" type="button" data-act="onb-later">稍后再配</button>` : "";
+  const later = ["keys", "search", "admins", "groups", "look"].includes(id) ? `<button class="btn" type="button" data-act="onb-later">跳过这步</button>` : id === "models" ? `<button class="btn" type="button" data-act="onb-later">以后再配</button>` : "";
   const usable = !!(onb.info && onb.info.usable);
-  const next = id === "hello" ? "开始配置" : id === "done" ? (usable ? "进入 MaiWork" : "先存下，稍后继续") : "保存，下一步";
+  const next = id === "hello" ? "开始" : id === "done" ? (usable ? "进入 MaiWork" : "先存，以后继续") : "下一步";
   return `${back}<div class="onb-foot-r">${later}<button class="btn primary" type="button" data-act="onb-next">${next}</button></div>`;
 }
 
@@ -335,7 +335,7 @@ export async function openOnboarding(info) {
     info = await api("POST", "/api/onboarding", { action: "start", step: (info && info.step) || "hello" });
   } catch (e) {
     onb.open = false;
-    return toast(`引导没能打开：${e.message}。请重试`, true);
+    return toast(`向导打不开：${e.message}`, true);
   }
   onb.info = info;
   onb.sequence = Number(info.sequence) || 0;
@@ -399,12 +399,12 @@ async function closeOnboarding(action) {
     const runId = (onb.info && onb.info.run_id) || "";
     const result = await api("POST", "/api/onboarding", { action, run_id: runId, sequence: ++onb.sequence });
     if (result.run_id !== runId || result.state === "in_progress") {
-      return onbError("引导已被另一个页面更新，这次没有结束：请刷新后接着填");
+      return onbError("别的页面改过了，请刷新");
     }
     onb.info = result;
     finished = true;
   } catch (e) {
-    return onbError(`引导结束状态没能保存：${e.message}。请重试`);
+    return onbError(`进度没保存：${e.message}，请重试`);
   } finally {
     onb.busy = finished ? false : wasBusy;
   }
@@ -426,8 +426,8 @@ async function closeOnboarding(action) {
   else gone();
   onb.anims = [];
   loadSettings().then(() => render());
-  if (action === "skip") toast("跳过了，以后在设置概况里可以重新引导");
-  else if (action === "done" && onb.info && !onb.info.usable) toast("先存下了，设置概况里可以接着引导");
+  if (action === "skip") toast("已跳过，可在概况重来");
+  else if (action === "done" && onb.info && !onb.info.usable) toast("已保存，可在概况继续");
 }
 
 // 这一步要保存的东西；返回错误文字（空 = 过）
@@ -435,9 +435,9 @@ async function onbSave(id) {
   const v = (x) => ($(x) ? $(x).value.trim() : "");
   if (id === "models") {
     const ep = onbEndpoint();
-    if (!/^https?:\/\/\S+$/.test(v("onb-url"))) return "端点地址要以 http:// 或 https:// 开头。";
-    if (!ep.key_set && !v("onb-key")) return "还没填密钥。";
-    if (!v("onb-main")) return "先选或手填主模型 ID（点「测试连接」可以拉出列表）。";
+    if (!/^https?:\/\/\S+$/.test(v("onb-url"))) return "地址要以 http(s):// 开头。";
+    if (!ep.key_set && !v("onb-key")) return "请填密钥。";
+    if (!v("onb-main")) return "请选主模型。";
     const epId = ep.id || "default";
     await api("PUT", `/api/settings/endpoints/${encodeURIComponent(epId)}`, {
       name: ep.name || "默认端点", protocol: v("onb-proto") || "openai", base_url: v("onb-url"), api_key: v("onb-key") || undefined,
@@ -478,7 +478,7 @@ async function onbSave(id) {
     const items = [];
     for (const p of picked) {
       const key = v(`onb-sx-key-${p.id}`);
-      if (!p.free && !key && !p.key_set) return `${p.label} 要先填 API 密钥（勾上后输入框下方有去官网拿密钥的链接），或者不勾它。`;
+      if (!p.free && !key && !p.key_set) return `${p.label}：请填密钥，或取消勾选。`;
       items.push(key ? { id: p.id, key } : { id: p.id });
     }
     const r = await api("POST", "/api/extensions/presets-setup", { items });
@@ -491,7 +491,7 @@ async function onbSave(id) {
       if (!field) continue;
       const pw = field.value || "";
       if (!pw) continue;
-      if (pw.length < 8) return "群管理员密码至少 8 位。";
+      if (pw.length < 8) return "密码至少 8 位。";
       try {
         onb.ga[gid] = await api("PUT", `/api/groups/${encodeURIComponent(gid)}/group-admin`, { password: pw });
       } catch (e) {
@@ -520,7 +520,7 @@ async function onbVerify(ids) {
   const notes = [];
   for (const mid of ids) {
     const entry = ((state.mdl && state.mdl.models) || []).find((x) => x.id === mid) || {};
-    if (out) out.innerHTML = `<i class="onb-spin"></i>正在验证 ${esc(entry.model || mid)}（一句短问话 + 一次空工具测试）…`;
+    if (out) out.innerHTML = `<i class="onb-spin"></i>正在验证 ${esc(entry.model || mid)}…`;
     let r;
     try {
       r = await api("POST", `/api/settings/model-list/${encodeURIComponent(mid)}/verify`, {});
@@ -529,11 +529,11 @@ async function onbVerify(ids) {
     }
     if (r.stale) {
       if (out) out.textContent = "";
-      return "验证期间模型配置已经改变：请重新验证，本步尚未完成。";
+      return "设置改过了，请重新验证。";
     }
     if (!r.ok) {
       if (out) out.textContent = "";
-      return `${entry.model || mid} 没能正常回答：${r.error || "验证没通过"}。可以换个模型，或先「稍后再配」。`;
+      return `${entry.model || mid} 没通过：${r.error || "没回答"}。换个模型或以后再配。`;
     }
     if (r.suggested_max_tokens) {
       try {
@@ -542,10 +542,10 @@ async function onbVerify(ids) {
         });
         await loadModels();
         const saved = ((state.mdl && state.mdl.models) || []).find((x) => x.id === mid);
-        if (!saved || Number(saved.max_tokens) !== Number(r.suggested_max_tokens)) throw new Error("未能确认新参数已经生效");
+        if (!saved || Number(saved.max_tokens) !== Number(r.suggested_max_tokens)) throw new Error("没确认生效");
       } catch (e) {
         if (out) out.textContent = "";
-        return `${entry.model || mid} 用 ${r.suggested_max_tokens} 能回答，但建议最大输出没能保存：${e.message}。请重试；本步尚未完成。`;
+        return `${entry.model || mid} 最大输出没保存成：${e.message}，请重试。`;
       }
     }
     if (r.note) notes.push(`${entry.model || mid}：${r.note}`);
@@ -562,7 +562,7 @@ function onbRemember() {
   const runId = (onb.info && onb.info.run_id) || "";
   api("POST", "/api/onboarding", { action: "progress", step, run_id: runId, sequence: ++onb.sequence })
     .catch((e) => {
-      if (onb.open && onb.info && onb.info.run_id === runId) onbError(`配置已保存，但引导进度没能记录：${e.message}。可继续，或重新打开引导重试`);
+      if (onb.open && onb.info && onb.info.run_id === runId) onbError(`进度没保存：${e.message}，请重试`);
     });
 }
 
@@ -601,13 +601,13 @@ async function onbGo(delta) {
       if (!onb.open || !onb.info || onb.info.run_id !== runId) return;
       if (info.run_id !== runId) {
         onb.i = from;
-        return onbError("引导已被另一个页面更新，请刷新后继续");
+        return onbError("别的页面改过了，请刷新");
       }
       onb.info = info;
     } catch (e) {
       if (onb.open && onb.info && onb.info.run_id === runId) {
         onb.i = from;
-        onbError(`能力状态没能读到：${e.message}。请重试`);
+        onbError(`读取失败：${e.message}，请重试`);
       }
       return;
     }
@@ -629,13 +629,13 @@ export async function onbAct(el) {
       const current = await api("GET", "/api/onboarding");
       if (!onb.open || !onb.info || onb.info.run_id !== runId) return;
       if (current.run_id !== runId) {
-        if (current.state !== "in_progress") return onbError("这一轮引导已经在其他页面结束或更新，请重新打开后继续");
+        if (current.state !== "in_progress") return onbError("别的页面改过了，请刷新");
         onb.info = current;
         ownedRunId = current.run_id;
         onb.sequence = Number(current.sequence) || 0;
       } else onb.sequence = Math.max(onb.sequence, Number(current.sequence) || 0);
     } catch (e) {
-      return onbError(`当前引导状态没能读到：${e.message}。请重试`);
+      return onbError(`读取失败：${e.message}，请重试`);
     } finally {
       if (onb.info && onb.info.run_id === ownedRunId) onb.busy = false;
     }
@@ -687,15 +687,15 @@ export async function onbAct(el) {
     const key = $("onb-key").value.trim();
     const ep = onbEndpoint();
     if (!/^https?:\/\/\S+$/.test(url)) return onbError("地址要以 http:// 或 https:// 开头。");
-    if (!ep.key_set && !key) return onbError("先填密钥再测。");
+    if (!ep.key_set && !key) return onbError("先填密钥。");
     $("onb-err").hidden = true;
     el.disabled = true;
-    out.innerHTML = `<i class="onb-spin"></i>正在连…`;
+    out.innerHTML = `<i class="onb-spin"></i>连接中…`;
     try {
       const r = await api("POST", `/api/settings/endpoints/${encodeURIComponent(ep.id || "default")}/test`, { base_url: url, api_key: key || undefined, protocol: $("onb-proto").value });
       if (!r.ok) {
         out.textContent = "";
-        onbError(`${r.error || "没连上"}（有的服务不提供模型列表：地址和密钥没错的话，直接在下面手填模型 ID，保存时会真的发一句话验证）`);
+        onbError(`${r.error || "没连上"} · 拉不到列表就手填 ID`);
         return;
       }
       onb.models = r.models || [];
@@ -707,7 +707,7 @@ export async function onbAct(el) {
       const picks = el.closest(".onb-pane").querySelector(".onb-picks");
       picks.replaceWith(tmp.querySelector(".onb-picks"));
       const np = el.closest(".onb-pane").querySelector(".onb-picks");
-      out.innerHTML = `<i class="onb-ok">${SVG.check}</i>连上了，找到 ${onb.models.length} 个模型`;
+      out.innerHTML = `<i class="onb-ok">${SVG.check}</i>已连上，找到 ${onb.models.length} 个`;
       if (!calm()) {
         onbAnim(out.querySelector(".onb-ok"), [{ transform: "scale(0.3)", opacity: 0 }, { transform: "scale(1)", opacity: 1 }], { duration: 460, easing: EASE_SPRING });
         [...np.children].forEach((c, i) => onbAnim(c, [{ opacity: 0, transform: "translateY(8px)" }, { opacity: 1, transform: "translateY(0)" }], { duration: 340, delay: 60 + i * 40, easing: "cubic-bezier(0.2, 0.8, 0.2, 1)" }));

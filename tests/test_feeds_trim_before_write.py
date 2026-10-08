@@ -186,7 +186,7 @@ def test_trim_reasons_unchanged_and_order_kept(tmp_path) -> None:
 
 
 def test_post_check_fallback_does_not_change_kept_count(tmp_path) -> None:
-    """自检（_check_posts）只回落正文、不新增淘汰；先截后写后没有意外回补：
+    """自检（_check_display）只回落改写、不新增淘汰；先截后写后没有意外回补：
     最终条数不受自检结论影响。"""
     titles = _TITLES_12[:5]
     items = [_cand(i, title=titles[i], url=f"https://site-{i}.example.com/p") for i in range(5)]

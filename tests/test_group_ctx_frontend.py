@@ -98,17 +98,17 @@ def test_skill_meta_uses_current_api_fields():
 def test_loads_rules_and_skills_from_group_endpoints(tmp_path):
     html = run_js(tmp_path)["html"]
     assert "本群规矩" in html and "别发&lt;script&gt;手机评测" in html and "<script>" not in html
-    assert "从旧设置搬来的" in html
+    assert "旧设置迁来" in html
     assert "本群做法" in html and "资讯" in html and "先找&lt;b&gt;原始公告" in html
     for kind in ("idea", "goal"):
         assert f'data-act="gctx-skill-add" data-kind="{kind}"' in html  # 没有的岗位给「自己先写一份」
-    assert "通用执行积累的做事方法 · 1" in html and "用过 3 次" in html and "已锁定" in html
+    assert "做事经验 · 1" in html and "用过 3 次" in html and "已锁定" in html
     assert "已归档 · 1" in html and 'data-to="active"' in html
 
 
 def test_empty_rules_invites_writing(tmp_path):
     html = run_js(tmp_path, noRules=True)["html"]
-    assert "还没有。写下这个群必须照做的事" in html and 'data-act="gctx-rules-edit"' in html
+    assert "还没有。写下本群必须照做的事" in html and 'data-act="gctx-rules-edit"' in html
 
 
 def test_save_rules_puts_body(tmp_path):
@@ -126,7 +126,7 @@ def test_rules_draft_survives_repaint(tmp_path):
 def test_rules_history_and_restore(tmp_path):
     out = run_js(tmp_path, actions=[["gctx-hist", {"id": "rules", "g": "g1"}]])
     assert out["calls"] == [{"method": "GET", "url": "/api/groups/g1/rules/versions"}]
-    assert "旧的一版" in out["html"] and "网页上改的" in out["html"]
+    assert "旧的一版" in out["html"] and "网页改的" in out["html"]
     out = run_js(tmp_path, actions=[["gctx-restore", {"id": "rules", "vid": "7", "g": "g1"}]])
     assert out["calls"] == [{"method": "POST", "url": "/api/groups/g1/rules/versions/7/restore", "body": {}}]
     assert out["rules"]["body"] == "旧规矩"
@@ -152,7 +152,7 @@ def test_new_task_skill_needs_name_and_posts_all(tmp_path):
     ds = {"kind": "task", "id": "new", "g": "g1"}
     out = run_js(tmp_path, edit={"kind": "task", "id": "new"}, actions=[["gctx-skill-save", ds]],
                  fields={"gctx-name-task": "", "gctx-desc-task": "要做表时", "gctx-body-task": "1."})
-    assert out["calls"] == [] and "名字" in out["errTask"]["textContent"]
+    assert out["calls"] == [] and "名称" in out["errTask"]["textContent"]
     out = run_js(tmp_path, edit={"kind": "task", "id": "new"}, actions=[["gctx-skill-save", ds]],
                  fields={"gctx-name-task": "整理表格", "gctx-desc-task": "要做表时", "gctx-body-task": "1. 先列字段"})
     assert out["calls"] == [{"method": "POST", "url": "/api/groups/g1/skills",
@@ -161,7 +161,7 @@ def test_new_task_skill_needs_name_and_posts_all(tmp_path):
 
 def test_empty_body_shows_accessible_error(tmp_path):
     out = run_js(tmp_path, edit={"kind": "news", "id": "1"}, fields={"gctx-body-news": "  "}, actions=[["gctx-skill-save", NEWS]])
-    assert out["calls"] == [] and out["errNews"]["hidden"] is False and "不能空着" in out["errNews"]["textContent"]
+    assert out["calls"] == [] and out["errNews"]["hidden"] is False and "请写做法" in out["errNews"]["textContent"]
     assert 'aria-describedby="gctx-help-news gctx-err-news"' in out["html"]
 
 

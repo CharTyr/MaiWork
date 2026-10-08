@@ -14,19 +14,19 @@ function topicItem(s, i) {
   const opened = s.opened;
   const j = t.jev;
   const span = s.n > 1 ? `${when(s.first.ts)}–${hhmm(s.rows[0].ts)}` : when(t.ts);
-  const times = s.n > 1 ? `这段判了 ${s.n} 次${s.bestOk != null && !opened ? `，适合开最高 ${s.bestOk.toFixed(2)}` : ""}。` : "";
+  const times = s.n > 1 ? `判断 ${s.n} 次${s.bestOk != null && !opened ? `，最高 ${s.bestOk.toFixed(2)} 分` : ""}。` : "";
   const r = t.result;
   return `
     <article class="item ruled enter" style="--i:${i}">
       ${ico(opened ? "speech" : "hourglass")}
       <div>
-        <h3 class="item-title">${esc(span)} · ${opened ? "开了话题" : "忍住了没开"}</h3>
-        <p class="item-body soft">安静了 ${esc(dur(t.quiet_s))}${t.usual_gap_s ? `，平时这个点 ${esc(dur(t.usual_gap_s))}一条` : ""}。${esc(times)}Jev：${esc(judgeText(t))}${j && j.detail ? `（${esc(j.detail)}）` : ""}。${t.pick && t.pick.title && opened ? `挑的是「${esc(t.pick.title)}」。` : ""}</p>
+        <h3 class="item-title">${esc(span)} · ${opened ? "开了话题" : "没开"}</h3>
+        <p class="item-body soft">静了 ${esc(dur(t.quiet_s))}${t.usual_gap_s ? `（平时 ${esc(dur(t.usual_gap_s))}一条）` : ""}。${esc(times)}Jev：${esc(judgeText(t))}${j && j.detail ? `（${esc(j.detail)}）` : ""}。${t.pick && t.pick.title && opened ? `选了「${esc(t.pick.title)}」。` : ""}</p>
         ${opened ? `<div class="opener">${esc(t.opener)}</div>` : ""}
-        ${opened ? `<div class="status"><span class="dot ${r && r.replies ? "used" : ""}"></span><span class="status-text">${r ? (r.replies ? `${r.replies} 人接话${r.followups ? `，MaiBot 接着聊了 ${r.followups} 句` : ""}` : "10 分钟内没人接，下次隔久一点") : "等着看有没有人接"}</span></div>` : ""}
+        ${opened ? `<div class="status"><span class="dot ${r && r.replies ? "used" : ""}"></span><span class="status-text">${r ? (r.replies ? `${r.replies} 人接话${r.followups ? `，MaiBot 聊了 ${r.followups} 句` : ""}` : "没人接，下次隔久点") : "等人接话"}</span></div>` : ""}
         ${
           gadmin()
-            ? `<div class="verdict">这次判断对吗？
+            ? `<div class="verdict">判断得对吗？
           <button class="btn" data-act="verdict" data-id="${t.id}" data-v="right" aria-pressed="${t.verdict === "right"}">对</button>
           <button class="btn" data-act="verdict" data-id="${t.id}" data-v="wrong" aria-pressed="${t.verdict === "wrong"}">不对</button>
         </div>`
@@ -46,7 +46,7 @@ function profileSection(v) {
     if (!entries.length && !gadmin()) return "";
     return `
       <div class="pf-sec enter" style="--i:${i++}">
-        <div class="pf-name">${esc(sec.name || name)}${gadmin() ? `<button class="pf-add" data-act="pf-add" data-cat="${cat}" aria-label="加一条">${SVG.plus}</button>` : ""}</div>
+        <div class="pf-name">${esc(sec.name || name)}${gadmin() ? `<button class="pf-add" data-act="pf-add" data-cat="${cat}" aria-label="添加">${SVG.plus}</button>` : ""}</div>
         ${
           entries.length
             ? entries
@@ -54,10 +54,10 @@ function profileSection(v) {
                   const meta = e.locked
                     ? gadmin()
                       ? e.source === "admin"
-                        ? "你加的 · 不会被改写"
-                        : "已锁定 · 不会被改写"
-                      : "管理员确认过"
-                    : [e.evidence_count ? `依据 ${e.evidence_count} 条消息` : "", e.last_ts ? `最近 ${dayWord(e.last_ts)}` : ""].filter(Boolean).join(" · ");
+                        ? "你加的 · 不会被改"
+                        : "已锁定 · 不会被改"
+                      : "管理员认可"
+                    : [e.evidence_count ? `据 ${e.evidence_count} 条消息` : "", e.last_ts ? `最近 ${dayWord(e.last_ts)}` : ""].filter(Boolean).join(" · ");
                   return `
             <div class="pf" data-entry="${e.id}">
               <div><div class="pf-text">${esc(e.text)}</div><div class="pf-meta">${esc(meta)}</div></div>
@@ -82,17 +82,17 @@ function profileSection(v) {
 function groupSpaceBlock(v, g) {
   const plat = gplat(g, v);
   if (plat !== "qq") {
-    const who = plat === "telegram" ? "Telegram 群" : "QQ 官方机器人所在的群";
-    return `<h2 class="h-sub">群空间</h2><p class="h-meta">${who}没有群文件、群公告和群相册，成品会用网页链接交付</p>`;
+    const who = plat === "telegram" ? "Telegram 群" : "QQ 官方机器人群";
+    return `<h2 class="h-sub">群空间</h2><p class="h-meta">${who}没有群文件，成品用网页链接发</p>`;
   }
   const gs = v && v.group_space;
   if (!gs) return "";
-  const role = { owner: "群主", admin: "管理员", member: "普通成员" }[gs.role] || "身份未知";
+  const role = { owner: "群主", admin: "管理员", member: "成员" }[gs.role] || "不清楚";
   const cap = [
     ["files_list", "看群文件"],
-    ["files_manage", "整理自己传的文件"],
-    ["notice_send", "发群公告"],
-    ["album_upload", "传群相册"],
+    ["files_manage", "管自己的文件"],
+    ["notice_send", "发公告"],
+    ["album_upload", "传相册"],
   ];
   const any = cap.some(([k]) => gs[k]);
   return `
@@ -106,7 +106,7 @@ function groupSpaceBlock(v, g) {
 
 function focusSection(v) {
   const focus = (v && v.focus) || [];
-  let html = `<div class="h-sub-row"><h2 class="h-sub">关注成员 <span class="private">${SVG.lock}只有管理员看得到</span></h2><button class="btn small" data-act="focus-add">加一个人</button></div>`;
+  let html = `<div class="h-sub-row"><h2 class="h-sub">关注的人 <span class="private">${SVG.lock}仅管理员可见</span></h2><button class="btn small" data-act="focus-add">添加</button></div>`;
   if (!focus.length) return html + `<p class="h-meta">还没有</p>`;
   return (
     html +
@@ -120,7 +120,7 @@ function focusSection(v) {
           ${personaBlock(p)}
           ${personalBlock(p)}
         </div>
-        ${admin() ? `<button class="icon-btn" data-act="focus-rm" data-uid="${esc(p.user_id)}" aria-label="不再关注">${SVG.close}</button>` : ""}
+        ${admin() ? `<button class="icon-btn" data-act="focus-rm" data-uid="${esc(p.user_id)}" aria-label="取消关注">${SVG.close}</button>` : ""}
       </div>`
       )
       .join("")
@@ -132,16 +132,16 @@ const pname = (p) => String(p.display_name || p.name || "群友");
 
 function personaBlock(p) {
   const ps = p.persona;
-  if (!ps) return `<div class="person-note">${esc(p.note || "还没攒够了解。")}</div>`;
+  if (!ps) return `<div class="person-note">${esc(p.note || "还不够了解")}</div>`;
   const list = (label, arr) =>
     arr && arr.length ? `<div class="pa-row"><span class="pa-k">${label}</span><span class="pa-v">${arr.map(esc).join("、")}</span></div>` : "";
   return `
     <div class="person-note">${esc(ps.summary || p.note || "")}</div>
     <div class="pa">
-      ${list("在做", ps.doing)}${list("关心", ps.cares)}${list("提过", ps.asked)}
-      ${ps.style ? `<div class="pa-row"><span class="pa-k">说话</span><span class="pa-v">${esc(ps.style)}</span></div>` : ""}
+      ${list("在忙", ps.doing)}${list("关心", ps.cares)}${list("提过", ps.asked)}
+      ${ps.style ? `<div class="pa-row"><span class="pa-k">说话风格</span><span class="pa-v">${esc(ps.style)}</span></div>` : ""}
     </div>
-    ${ps.updated_ts ? `<div class="pa-ts">${esc(dayWord(ps.updated_ts))}更新 · 结合了 MaiBot 的长期记忆</div>` : ""}`;
+    ${ps.updated_ts ? `<div class="pa-ts">${esc(dayWord(ps.updated_ts))}更新 · 含 MaiBot 的记忆</div>` : ""}`;
 }
 
 function personalBlock(p) {
@@ -161,7 +161,7 @@ function personalBlock(p) {
             ${src ? `<a class="pers-title" href="${safeUrl(src.url)}" target="_blank" rel="noopener noreferrer">${esc(n.title)}</a>` : `<span class="pers-title">${esc(n.title)}</span>`}
             <div class="pers-body">${richText(n.body || n.summary || "")}</div>
           </div>
-          ${admin() ? `<button class="btn small" data-act="mention-member" data-id="${n.id}" data-name="${esc(pname(p))}">在群里提给 ta</button>` : ""}
+          ${admin() ? `<button class="btn small" data-act="mention-member" data-id="${n.id}" data-name="${esc(pname(p))}">在群里提一嘴</button>` : ""}
         </div>`;
         })
         .join("")}
@@ -177,7 +177,7 @@ export function hash(s) {
 // 这个群：本群规矩 + 本群做法，只给总管理员和本群群管理员（群友看不到）
 function ctxBlock(g) {
   if (!gadmin()) return "";
-  return `<h2 class="h-sub">这个群 <span class="private">${SVG.lock}只有管理员看得到</span></h2>${ctxSection(g.id)}`;
+  return `<h2 class="h-sub">本群 <span class="private">${SVG.lock}仅管理员可见</span></h2>${ctxSection(g.id)}`;
 }
 
 export function viewGroup(g, v) {
@@ -186,7 +186,7 @@ export function viewGroup(g, v) {
   html += pulseCard(g, v, false);
   if (!v) return html + loading();
   if (g.fresh) {
-    html += emptyState("seedling", "还在熟悉这个群", "");
+    html += emptyState("seedling", "正在了解这个群", "");
     return gadmin() ? html + ctxBlock(g) + controlsSection(g.id, v) + focusSection(v) : html;
   }
   const log = v.topic_log || [];

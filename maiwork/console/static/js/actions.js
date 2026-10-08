@@ -5,6 +5,7 @@ import { api, grp, gview } from "./api.js";
 import { FB_KEY, RATE_KEY, clientId, myFb, myRates } from "./pages/news.js";
 import { findIdea, ideaAsk, ideaItems, ideaPicked } from "./pages/ideas.js";
 import { refreshDetail } from "./detail.js";
+import { handoffCopy, handoffDownload, openHandoff } from "./handoff.js";
 import { checkedProviders, headerRow, loadExt, pickedTool, readHeaders } from "./settings/ext.js";
 import { actNews } from "./actions_news.js";
 import { actCtx } from "./pages/groupctx.js";
@@ -88,19 +89,19 @@ export async function act(el, e) {
       const C = state.chat;
       if (!C) break;
       if (C.running) {
-        toast("MaiWork 还在回话，等它说完再整理");
+        toast("等它说完再压缩");
         break;
       }
       el.disabled = true;
       const label = el.textContent;
-      el.textContent = "整理中…";
+      el.textContent = "压缩中…";
       try {
         await api("POST", `/api/chat/${encodeURIComponent(C.id)}/compact`);
         await loadChat(C.id);
         paintChat(true);
-        toast("前面的对话整理好了");
+        toast("压缩好了");
       } catch (err) {
-        toast(err.status === 409 ? "MaiWork 还在回话，等它说完再整理" : err.message, true);
+        toast(err.status === 409 ? "等它说完再压缩" : err.message, true);
       } finally {
         el.disabled = false;
         el.textContent = label;
@@ -116,7 +117,7 @@ export async function act(el, e) {
       el.disabled = true;
       try {
         const r = await api("POST", `/api/chat/pending/${encodeURIComponent(el.dataset.id)}`, { approve: el.dataset.ok === "1" });
-        toast(el.dataset.ok === "1" ? (r.status === "done" ? "好，已经去做了" : `没做成：${r.result || ""}`) : "好，这件不做了", r.status === "failed");
+        toast(el.dataset.ok === "1" ? (r.status === "done" ? "已去做了" : `没做成：${r.result || ""}`) : "好，不做了", r.status === "failed");
         await loadChat(state.chatId, true);
         if (state.chat) state.chat.running = true;
         paintChat(true);
@@ -215,14 +216,14 @@ export async function act(el, e) {
         state.rules = await api("POST", "/api/settings/config/reset", { field: el.dataset.f });
         await loadSettings();
         repaintSheet();
-        toast("恢复成默认值了");
+        toast("已恢复默认");
       } catch (err) {
         toast(err.message, true);
       }
       break;
     }
     case "cfg-clear": {
-      if (!confirm("把 config.toml 里的这个密钥清空？")) break;
+      if (!confirm("清空这个密钥？")) break;
       try {
         state.rules = await api("PUT", "/api/settings/config", { [el.dataset.f]: null });
         await loadSettings();
@@ -259,7 +260,7 @@ export async function act(el, e) {
     case "avatar-reset":
       try {
         await avatarSaved(await api("DELETE", "/api/settings/avatar"));
-        toast("恢复成跟 MaiBot 同步了");
+        toast("已恢复同步 MaiBot");
       } catch (err) {
         toast(err.message, true);
       }
@@ -282,7 +283,7 @@ export async function act(el, e) {
     case "rss-del": {
       const g = el.dataset.g;
       const id = el.dataset.id;
-      const ask = el.dataset.auto === "1" ? "删掉这个自动订阅的源？以后也不再自动推荐它。" : "删掉这个 RSS 源？";
+      const ask = el.dataset.auto === "1" ? "删掉这个来源？以后不再推荐" : "删掉这个 RSS？";
       if (a === "rss-del" && !confirm(ask)) break;
       try {
         if (a === "rss-del") await api("DELETE", `/api/groups/${encodeURIComponent(g)}/rss/${encodeURIComponent(id)}`);
@@ -304,7 +305,7 @@ export async function act(el, e) {
         const runId = (r && r.run_id) || "";
         state.newsRunning = gid;
         renderView();
-        toast("开始备料了，一般几分钟，好了会自己出现在这里");
+        toast("开始找了，几分钟后出现在这里");
         let n = 0;
         const tick = async () => {
           n += 1;
@@ -317,9 +318,9 @@ export async function act(el, e) {
             state.newsRunning = null;
             if (state.g === gid) await loadView(true);
             renderView();
-            if (st.state === "done") toast(st.reason || "新的一批资讯到了");
-            else if (st.state === "skipped") toast(`这轮没出新资讯：${st.reason || "没有能用的候选"}`);
-            else toast(`备料没成：${st.reason || "出错了"}`, true);
+            if (st.state === "done") toast(st.reason || "新资讯到了");
+            else if (st.state === "skipped") toast(`这次没找到新的：${st.reason || "没合适的"}`);
+            else toast(`没找成：${st.reason || "出错了"}`, true);
             return;
           }
           if (n >= 90 || state.g !== gid) {
@@ -368,10 +369,10 @@ export async function act(el, e) {
       const { headers } = readHeaders();
       el.disabled = true;
       out.style.color = "";
-      out.textContent = "正在连…";
+      out.textContent = "连接中…";
       try {
         const r = await api("POST", "/api/extensions/mcp/test", { url, headers, name: f.dataset.name || undefined });
-        out.textContent = r.ok ? `连上了，${(r.tools || []).length} 个工具` : `没连上：${r.error || "未知原因"}`;
+        out.textContent = r.ok ? `已连上，${(r.tools || []).length} 个工具` : `没连上：${r.error || "原因不明"}`;
         out.style.color = r.ok ? "" : "var(--red)";
       } catch (err) {
         out.textContent = err.message;
@@ -387,7 +388,7 @@ export async function act(el, e) {
         await api("POST", `/api/extensions/mcp/${encodeURIComponent(el.dataset.name)}/toggle`, { enabled: el.dataset.on === "1" });
         await loadExt();
         repaintSheet();
-        toast(el.dataset.on === "1" ? "打开了" : "关掉了，子 agent 下一次就用不到它");
+        toast(el.dataset.on === "1" ? "已开启" : "已关闭");
       } catch (err) {
         el.disabled = false;
         toast(err.message, true);
@@ -419,7 +420,7 @@ export async function act(el, e) {
         await loadExt();
         if (state.settings) await loadSettings();
         repaintSheet();
-        toast(`联网搜索改用 ${mcp} 了，马上生效`);
+        toast(`搜索已换成 ${mcp}`);
       } catch (err) {
         el.disabled = false;
         toast(err.message, true);
@@ -427,14 +428,14 @@ export async function act(el, e) {
       break;
     }
     case "search-off": {
-      if (!confirm("不用联网搜索？资讯会暂停更新")) break;
+      if (!confirm("关闭联网搜索？资讯会停更")) break;
       try {
         await api("DELETE", "/api/extensions/search");
         state.searchEdit = false;
         await loadExt();
         if (state.settings) await loadSettings();
         repaintSheet();
-        toast("不联网搜索了");
+        toast("已关闭联网搜索");
       } catch (err) {
         toast(err.message, true);
       }
@@ -443,7 +444,7 @@ export async function act(el, e) {
     case "mcp-del":
     case "skill-del": {
       const isMcp = a === "mcp-del";
-      if (!confirm(`删掉「${el.dataset.name}」？${isMcp ? "它的密钥也会一起删。" : "整个 skill 目录都会删掉。"}`)) break;
+      if (!confirm(`删掉「${el.dataset.name}」？${isMcp ? "密钥一起删" : "整个 skill 一起删"}`)) break;
       try {
         await api("DELETE", `/api/extensions/${isMcp ? "mcp" : "skills"}/${encodeURIComponent(el.dataset.name)}`);
         state.extEdit = null;
@@ -480,14 +481,14 @@ export async function act(el, e) {
       state.ext = null;
       history.replaceState(null, "", "#/");
       await reboot();
-      toast("已退出管理员");
+      toast("已退出");
       break;
     case "copy":
       try {
         await navigator.clipboard.writeText(el.dataset.link);
         toast(`${el.dataset.what || "链接"}复制好了`);
       } catch (err) {
-        toast("复制不了，手动选中复制吧", true);
+        toast("复制失败，请手动复制", true);
       }
       break;
     case "ga-edit": {
@@ -503,7 +504,7 @@ export async function act(el, e) {
     }
     case "ga-clear": {
       const ed = state.editing || {};
-      if (!confirm("清掉后，用这个密码登录的人会马上退出。确定？")) break;
+      if (!confirm("清除后，已登录的人会被退出。确定？")) break;
       try {
         state.ga[ed.gid] = await api("DELETE", `/api/groups/${encodeURIComponent(ed.gid)}/group-admin/password`);
         closeSheet();
@@ -515,12 +516,12 @@ export async function act(el, e) {
       break;
     }
     case "reset-link": {
-      if (!confirm("重置后旧链接会失效，群友要重新发 /mw 网页 拿新链接。确定重置？")) break;
+      if (!confirm("换新后旧链接失效，群友要重新发 /mw 网页。确定？")) break;
       try {
         await api("POST", `/api/groups/${encodeURIComponent(el.dataset.g)}/token`, {});
         await Promise.all([loadGroups(), loadSettings()]);
         repaintSheet();
-        toast("重置好了，旧链接已失效");
+        toast("已换新，旧链接失效");
       } catch (err) {
         toast(err.message, true);
       }
@@ -554,7 +555,7 @@ export async function act(el, e) {
         });
         renderView();
         refreshDetail();
-        if (next) toast(next === "up" ? "记下了：有用，以后多找这类" : "记下了：没用，以后少找这类");
+        if (next) toast(next === "up" ? "记下了，多找这类" : "记下了，少找这类");
       } catch (err) {
         toast(err.message, true);
       }
@@ -573,7 +574,7 @@ export async function act(el, e) {
         renderView();
         renderSide();
         refreshDetail();
-        toast(op === "do" ? "已开工，排进任务了" : "收起了，以后不再提");
+        toast(op === "do" ? "已开工" : "不会再提了");
       } catch (err) {
         el.disabled = false;
         toast(err.message, true);
@@ -589,7 +590,7 @@ export async function act(el, e) {
         renderTopBits();
         renderView();
         renderSide();
-        toast(op === "approve" ? "已批准，会告诉发起的人" : "已拒绝，会告诉发起的人");
+        toast(op === "approve" ? "已批准，会通知发起人" : "已拒绝，会通知发起人");
       } catch (err) {
         el.disabled = false;
         toast(err.message, true);
@@ -599,8 +600,8 @@ export async function act(el, e) {
     case "task-op":
     case "goal-op": {
       const kind = a === "task-op" ? "tasks" : "goals";
-      const labels = { pause: "已暂停", resume: "继续了", cancel: a === "task-op" ? "已取消" : "不做了", retry: "重新排队了", redeliver: "重新发出去了" };
-      if (el.dataset.op === "cancel" && !confirm("确定取消？已经发生的外部操作不会撤回。")) break;
+      const labels = { pause: "已暂停", resume: "已继续", cancel: a === "task-op" ? "已取消" : "不做了", retry: "已重新排队", redeliver: "已重发" };
+      if (el.dataset.op === "cancel" && !confirm("确定取消？已做的不会撤回")) break;
       el.disabled = true;
       try {
         const r = await api("POST", `/api/${kind}/${encodeURIComponent(el.dataset.id)}/${el.dataset.op}`, {});
@@ -624,13 +625,13 @@ export async function act(el, e) {
       break;
     }
     case "mention-member": {
-      if (!confirm(`让 MaiBot 在群里合适的时候把这条提给 ${el.dataset.name || "ta"}？不会说出 MaiWork 怎么知道 ta 关心这个。`)) break;
+      if (!confirm(`让 MaiBot 找机会跟 ${el.dataset.name || "ta"} 提一嘴？不会透露原因`)) break;
       el.disabled = true;
       try {
         const r = await api("POST", `/api/news/${encodeURIComponent(el.dataset.id)}/mention-to-member`, {});
-        if (r && r.ok === false) throw new Error("这条的文字碰到了私下画像的内容，没交给 MaiBot");
+        if (r && r.ok === false) throw new Error("内容涉及个人画像，没发出");
         el.textContent = "交给 MaiBot 了";
-        toast("交给 MaiBot 了，它会在合适的时候提");
+        toast("交给 MaiBot 了，它会找机会提");
       } catch (err) {
         el.disabled = false;
         toast(err.message, true);
@@ -643,7 +644,7 @@ export async function act(el, e) {
         const r = await api("POST", `/api/extensions/mcp/${encodeURIComponent(el.dataset.name)}/reload`, {});
         await Promise.all([loadSettings(), state.page === "settings" ? loadExt() : null]);
         repaintSheet();
-        toast(r && r.ok ? `重新连上了，${r.tools || 0} 个工具` : `没连上：${(r && r.error) || "未知原因"}`, !(r && r.ok));
+        toast(r && r.ok ? `已重连，${r.tools || 0} 个工具` : `没连上：${(r && r.error) || "原因不明"}`, !(r && r.ok));
       } catch (err) {
         el.disabled = false;
         toast(err.message, true);
@@ -705,12 +706,12 @@ export async function act(el, e) {
       const blocked = a === "block-domain";
       const bg = el.dataset.g || state.g;
       if (!bg) break;
-      if (blocked && !confirm(`这个群以后不再从 ${el.dataset.domain} 找资讯？可以在设置里解除。`)) break;
+      if (blocked && !confirm(`本群不再看 ${el.dataset.domain}？可在设置里解除`)) break;
       try {
         await api("POST", `/api/groups/${encodeURIComponent(bg)}/feeds/domains`, { domain: el.dataset.domain, blocked });
         if (state.settings) await loadSettings();
         repaintSheet();
-        toast(blocked ? `屏蔽了 ${el.dataset.domain}` : `解除了 ${el.dataset.domain}`);
+        toast(blocked ? `已屏蔽 ${el.dataset.domain}` : `已解除 ${el.dataset.domain}`);
       } catch (err) {
         toast(err.message, true);
       }
@@ -748,12 +749,21 @@ export async function act(el, e) {
       if (!it) break;
       try {
         await navigator.clipboard.writeText(ideaAsk(it));
-        toast("复制好了：到群里 @MaiBot 粘贴发送");
+        toast("已复制，去群里 @MaiBot 粘贴");
       } catch (err) {
-        toast("复制不了，手动选中复制吧", true);
+        toast("复制失败，请手动复制", true);
       }
       break;
     }
+    case "handoff":
+      openHandoff(el.dataset.kind, el.dataset.id);
+      break;
+    case "handoff-copy":
+      handoffCopy();
+      break;
+    case "handoff-download":
+      handoffDownload();
+      break;
     case "verdict": {
       const id = el.dataset.id;
       const t = ((gview() || {}).topic_log || []).find((x) => String(x.id) === String(id));
@@ -762,7 +772,7 @@ export async function act(el, e) {
         await api("POST", `/api/topics/${encodeURIComponent(id)}/verdict`, { value });
         if (t) t.verdict = value;
         renderView();
-        if (value) toast("标注好了，用来调冷场判断");
+        if (value) toast("记下了，会用来改进");
       } catch (err) {
         toast(err.message, true);
       }
@@ -775,7 +785,7 @@ export async function act(el, e) {
         await api("PATCH", `/api/profile/${en.id}`, { locked: !en.locked });
         en.locked = !en.locked;
         renderView();
-        toast(en.locked ? "锁定了，MaiWork 不会再改这条" : "解锁了");
+        toast(en.locked ? "已锁定" : "已解锁");
       } catch (err) {
         toast(err.message, true);
       }
@@ -788,7 +798,7 @@ export async function act(el, e) {
         await api("DELETE", `/api/profile/${en.id}`);
         patchView((vw) => vw.profile.forEach((s) => (s.entries = (s.entries || []).filter((x) => x.id !== en.id))));
         renderView();
-        toast("删掉了，这条不会再被写回来");
+        toast("已删除，不会再加回");
       } catch (err) {
         toast(err.message, true);
       }
@@ -818,7 +828,7 @@ export async function act(el, e) {
         await api("POST", `/api/groups/${encodeURIComponent(g.id)}/focus`, { user_id: uid, action: "remove" });
         patchView((vw) => (vw.focus = (vw.focus || []).filter((p) => p.user_id !== uid)));
         renderView();
-        toast("不再关注这个人，TA 的个人画像也删掉了");
+        toast("已取消关注，画像已删除");
       } catch (err) {
         toast(err.message, true);
       }

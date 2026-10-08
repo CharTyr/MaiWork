@@ -85,12 +85,12 @@ def test_rows_of_one_quiet_stretch_merge_into_one_card(tmp_path):
 def test_judge_text_shows_real_score_threshold_and_where_it_got_stuck(tmp_path):
     d = _run(tmp_path)
     t = d["freshText"]
-    assert "适合开 0.66（要 0.60）" in t
-    assert "最合适的候选 0.33（要 0.50）" in t and "战锤40K预告" in t
-    assert "卡在：候选不对胃口" in t
+    assert "适合度 0.66（要 0.60）" in t
+    assert "最佳候选 0.33（要 0.50）" in t and "战锤40K预告" in t
+    assert "没合适的话题" in t
     assert "把握" not in t, "不再把「原因」的把握冒充成分数"
     t2 = d["timingText"]
-    assert "适合开 0.43（要 0.60）" in t2 and "原因：有问题还没人回" in t2 and "卡在：时机不对" in t2
+    assert "适合度 0.43（要 0.60）" in t2 and "原因：有问题还没人回" in t2 and "时机不对" in t2
     assert "卡在" not in d["openedText"]
 
 
@@ -98,7 +98,7 @@ def test_old_records_do_not_contradict_themselves(tmp_path):
     d = _run(tmp_path)
     t = d["oldText"]
     assert "可以开" not in t, "旧记录 ok=false 却写「不适合 · 可以开」是自相矛盾"
-    assert "不适合" in t and "旧记录没存分数" in t
+    assert "不适合" in t and "旧记录" in t
     assert "把握" not in t
     assert d["noJev"] == "没问 Jev"
 
@@ -106,8 +106,8 @@ def test_old_records_do_not_contradict_themselves(tmp_path):
 def test_day_summary_counts_stretches_and_best_scores(tmp_path):
     d = _run(tmp_path)
     s = d["summary"]
-    assert "3 段冷场" in s and "开了 1 次" in s
-    assert "适合开最高 0.70（要 0.60）" in s
+    assert "冷场 3 次" in s and "开了 1 次" in s
+    assert "最高 0.70（要 0.60）" in s
     assert "候选最高 0.70（要 0.50）" in s
     assert d["summaryNone"] == ""
 

@@ -125,7 +125,7 @@ class TestStatus:
         ok, text = status_of(store, settings, lambda name: None)
         assert ok is False
         assert "还没指定联网搜索" in text
-        assert "扩展" in text
+        assert "设置 → 工具" in text
 
     def test_binding_extension_gone(self, store: Store) -> None:
         settings = _settings_with_mcp()

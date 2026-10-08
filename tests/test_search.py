@@ -158,7 +158,7 @@ class TestUnavailable:
         with pytest.raises(SearchUnavailable) as e:
             await s.search("MaiBot")
         assert "还没指定联网搜索" in str(e.value)
-        assert "扩展" in str(e.value)
+        assert "设置 → 工具" in str(e.value)
 
     @pytest.mark.asyncio
     async def test_extension_gone(self, store: Store) -> None:

@@ -66,46 +66,46 @@ function fieldErrorAttrs(c, key, help = "") {
 
 function pushHTML(c) {
   const p = c.push || {}, cfg = p.config || {};
-  let html = `<div class="h-sub-row"><h2 class="h-sub">往群里发</h2>${c.edit !== "push" ? `<button class="btn small" data-act="gctl-push-edit" data-g="${esc(c.gid)}">改设置</button>` : ""}</div>`;
+  let html = `<div class="h-sub-row"><h2 class="h-sub">主动发言</h2>${c.edit !== "push" ? `<button class="btn small" data-act="gctl-push-edit" data-g="${esc(c.gid)}">修改</button>` : ""}</div>`;
   if (c.edit === "push") {
     const d = c.draft;
-    html += switchRow(c, "topics_enabled", "冷场开话题", "只开一句，后续对话归 MaiBot；判断门槛不变。", d.topics_enabled);
-    html += switchRow(c, "news_card_enabled", "资讯卡片", "每批挑最值得看的做成图片；已配公开地址时附本群链接。", d.news_card_enabled);
-    html += switchRow(c, "idea_mention_enabled", "构想提一嘴", "关心式问一句；个人向只 @ 本人，不说画像。", d.idea_mention_enabled);
+    html += switchRow(c, "topics_enabled", "开话题", "冷场时开一句，后面交给 MaiBot；判断标准不变", d.topics_enabled);
+    html += switchRow(c, "news_card_enabled", "资讯卡片", "挑几条好资讯做成图发群里；配了公开网址会附本群链接", d.news_card_enabled);
+    html += switchRow(c, "idea_mention_enabled", "提构想", "顺口问一句；个人的只 @ 本人，不提画像", d.idea_mention_enabled);
     html += `<div class="login">
-      <label for="gctl-news_card_count">每张资讯卡放几条</label><select id="gctl-news_card_count" data-gctl="news_card_count" ${fieldErrorAttrs(c, "news_card_count")}>${[1, 2, 3].map(n => `<option value="${n}" ${n === Number(d.news_card_count) ? "selected" : ""}>${n} 条</option>`).join("")}</select>
-      <label for="gctl-daily_max">每天主动发送总上限</label><input id="gctl-daily_max" data-gctl="daily_max" type="number" min="0" max="24" step="1" value="${esc(d.daily_max)}" ${fieldErrorAttrs(c, "daily_max", "gctl-cap-help")} />
-      <p class="fine" id="gctl-cap-help">开话题、资讯卡片和提一嘴共用这一个上限。0 表示不限，不建议。</p>
+      <label for="gctl-news_card_count">每张几条</label><select id="gctl-news_card_count" data-gctl="news_card_count" ${fieldErrorAttrs(c, "news_card_count")}>${[1, 2, 3].map(n => `<option value="${n}" ${n === Number(d.news_card_count) ? "selected" : ""}>${n} 条</option>`).join("")}</select>
+      <label for="gctl-daily_max">每天上限</label><input id="gctl-daily_max" data-gctl="daily_max" type="number" min="0" max="24" step="1" value="${esc(d.daily_max)}" ${fieldErrorAttrs(c, "daily_max", "gctl-cap-help")} />
+      <p class="fine" id="gctl-cap-help">以上三种合计；0 = 不限（不建议）</p>
       <label for="gctl-quiet_hours">睡觉时段</label><input id="gctl-quiet_hours" data-gctl="quiet_hours" value="${esc(d.quiet_hours)}" placeholder="23:00-08:00" ${fieldErrorAttrs(c, "quiet_hours", "gctl-quiet-help")} />
-      <p class="fine" id="gctl-quiet-help">北京时间，写成 HH:MM-HH:MM；这段时间不发。</p>
+      <p class="fine" id="gctl-quiet-help">这段时间不发，如 23:00-08:00</p>
       ${errorHTML(c)}
     </div>`;
     html += saveActions(c, "push");
   } else {
-    const line = (label, on) => `<div class="set-row gctl-row"><div><div class="set-name">${label}</div><div class="set-text">${on ? "已开" : "已关"}</div></div></div>`;
-    html += line("冷场开话题", cfg.topics_enabled) + line("资讯卡片", cfg.news_card_enabled) + line("构想提一嘴", cfg.idea_mention_enabled);
-    html += `<p class="fine">每天主动发送总上限：${Number(cfg.daily_max) === 0 ? "不限" : `${esc(cfg.daily_max)} 条`} · 睡觉时段 ${esc(cfg.quiet_hours || "23:00-08:00")}<br />今天实际发出 ${Number(p.sent_today) || 0} 条；总额度用了 ${Number(p.quota_used) || 0}。结果不明的发送暂占额度，避免重复发。</p>`;
-    if ((p.recent || []).length) html += `<details><summary>最近发送</summary>${p.recent.map(r => `<p class="fine">${esc(when(r.ts))} · ${esc(r.state || r.status)}${r.text ? ` · ${esc(r.text)}` : ""}</p>`).join("")}</details>`;
+    const line = (label, on) => `<div class="set-row gctl-row"><div><div class="set-name">${label}</div><div class="set-text">${on ? "开" : "关"}</div></div></div>`;
+    html += line("开话题", cfg.topics_enabled) + line("资讯卡片", cfg.news_card_enabled) + line("提构想", cfg.idea_mention_enabled);
+    html += `<p class="fine">每天最多 ${Number(cfg.daily_max) === 0 ? "不限" : `${esc(cfg.daily_max)} 条`} · 睡觉 ${esc(cfg.quiet_hours || "23:00-08:00")}<br />今天发了 ${Number(p.sent_today) || 0} 条（用了 ${Number(p.quota_used) || 0}）；没确认发出的也先算进额度，防止重复发</p>`;
+    if ((p.recent || []).length) html += `<details><summary>最近发的</summary>${p.recent.map(r => `<p class="fine">${esc(when(r.ts))} · ${esc(r.state || r.status)}${r.text ? ` · ${esc(r.text)}` : ""}</p>`).join("")}</details>`;
   }
   return html;
 }
 
 function approvalHTML(c) {
   const a = c.approval || {};
-  let html = `<div class="h-sub-row"><h2 class="h-sub">谁能批本群的活</h2>${admin() && c.edit !== "approval" ? `<button class="btn small" data-act="gctl-approval-edit" data-g="${esc(c.gid)}">改名单</button>` : ""}</div>`;
+  let html = `<div class="h-sub-row"><h2 class="h-sub">派活审批</h2>${admin() && c.edit !== "approval" ? `<button class="btn small" data-act="gctl-approval-edit" data-g="${esc(c.gid)}">修改</button>` : ""}</div>`;
   if (c.edit === "approval" && admin()) {
     const d = c.draft;
     html += `<div class="login">
-      <label for="gctl-approvers">群里能批准的人</label><textarea id="gctl-approvers" data-gctl="approvers" rows="3" aria-describedby="gctl-accounts-help">${esc(d.approvers)}</textarea>
-      <label for="gctl-exempt_users">派活免批的人</label><textarea id="gctl-exempt_users" data-gctl="exempt_users" rows="3" aria-describedby="gctl-accounts-help">${esc(d.exempt_users)}</textarea>
-      <p class="fine" id="gctl-accounts-help">一行一个平台账号，如 qq:账号；只影响这个群，不会改别的群。</p>
+      <label for="gctl-approvers">谁能批</label><textarea id="gctl-approvers" data-gctl="approvers" rows="3" aria-describedby="gctl-accounts-help">${esc(d.approvers)}</textarea>
+      <label for="gctl-exempt_users">谁不用批</label><textarea id="gctl-exempt_users" data-gctl="exempt_users" rows="3" aria-describedby="gctl-accounts-help">${esc(d.exempt_users)}</textarea>
+      <p class="fine" id="gctl-accounts-help">一行一个，如 qq:12345；只管本群，不影响别的群</p>
     </div>`;
-    html += switchRow(c, "required", "本群派活要批准", "关掉后本群整群免批；默认开着，只给信任的人单独免批。", d.required);
+    html += switchRow(c, "required", "派活要批准", "关掉后本群都不用批；默认开着，只给信得过的人单独免批", d.required);
     html += errorHTML(c) + saveActions(c, "approval");
   } else {
-    const list = xs => xs && xs.length ? xs.map(esc).join("、") : "还没设置";
-    html += `<p class="h-meta">${a.required && !a.exempt_group ? "本群派活默认要批准" : "本群整群免批"}</p><p class="fine">群里能批准：${list(a.approvers)}<br />免批的人：${list(a.exempt_users)}</p>`;
-    if (!admin()) html += `<p class="fine">批准与免批名单由总管理员设置；你可以在「在做的事」里批准本群的活。</p>`;
+    const list = xs => xs && xs.length ? xs.map(esc).join("、") : "还没设";
+    html += `<p class="h-meta">${a.required && !a.exempt_group ? "派活要批" : "派活不用批"}</p><p class="fine">能批：${list(a.approvers)}<br />不用批：${list(a.exempt_users)}</p>`;
+    if (!admin()) html += `<p class="fine">名单由管理员定；你可在「任务」里批准</p>`;
   }
   return html;
 }
@@ -116,12 +116,12 @@ function errorHTML(c) {
 }
 
 function saveActions(c, kind) {
-  return `<div class="actions"><button class="btn primary" data-act="gctl-${kind}-save" data-g="${esc(c.gid)}" ${c.saving ? "disabled" : ""}>${c.saving ? "保存中…" : "保存"}</button><button class="btn" data-act="gctl-cancel" data-g="${esc(c.gid)}" ${c.saving ? "disabled" : ""}>不改了</button></div>`;
+  return `<div class="actions"><button class="btn primary" data-act="gctl-${kind}-save" data-g="${esc(c.gid)}" ${c.saving ? "disabled" : ""}>${c.saving ? "保存中…" : "保存"}</button><button class="btn" data-act="gctl-cancel" data-g="${esc(c.gid)}" ${c.saving ? "disabled" : ""}>取消</button></div>`;
 }
 
 function controlsHTML(c) {
   if (!c.push || !c.approval) return c.error ? `<div class="warn-box" role="alert">${esc(c.error)} <button class="btn small" data-act="gctl-reload" data-g="${esc(c.gid)}">重试</button></div>` : loading();
-  return pushHTML(c) + approvalHTML(c) + (!c.edit ? `<button class="btn small" data-act="gctl-reload" data-g="${esc(c.gid)}">刷新发送记录与名单</button>` : "") + (!c.edit ? errorHTML(c) : "");
+  return pushHTML(c) + approvalHTML(c) + (!c.edit ? `<button class="btn small" data-act="gctl-reload" data-g="${esc(c.gid)}">刷新</button>` : "") + (!c.edit ? errorHTML(c) : "");
 }
 
 function readDraft(c) {
@@ -142,9 +142,9 @@ function readDraft(c) {
 const accountLines = text => text.split(/\n/).map(x => x.trim()).filter(Boolean);
 
 function checkPush(d) {
-  if (!Number.isInteger(d.daily_max) || d.daily_max < 0 || d.daily_max > 24) return { field: "daily_max", message: "总上限要填 0–24 的整数" };
-  if (!Number.isInteger(d.news_card_count) || d.news_card_count < 1 || d.news_card_count > 3) return { field: "news_card_count", message: "每张资讯卡放 1–3 条" };
-  if (!/^(?:[01]\d|2[0-3]):[0-5]\d-(?:[01]\d|2[0-3]):[0-5]\d$/.test(d.quiet_hours)) return { field: "quiet_hours", message: "睡觉时段写成 HH:MM-HH:MM，如 23:00-08:00" };
+  if (!Number.isInteger(d.daily_max) || d.daily_max < 0 || d.daily_max > 24) return { field: "daily_max", message: "每天上限填 0–24" };
+  if (!Number.isInteger(d.news_card_count) || d.news_card_count < 1 || d.news_card_count > 3) return { field: "news_card_count", message: "每张 1–3 条" };
+  if (!/^(?:[01]\d|2[0-3]):[0-5]\d-(?:[01]\d|2[0-3]):[0-5]\d$/.test(d.quiet_hours)) return { field: "quiet_hours", message: "时段写成 23:00-08:00 这样" };
   return null;
 }
 
@@ -181,7 +181,7 @@ export async function actControls(action, el) {
     c[kind] = result;
     c.edit = null;
     c.draft = null;
-    toast("保存好了，只影响这个群");
+    toast("已保存（仅本群）");
   } catch (e) {
     if (current(c)) c.error = e.message;
   } finally {

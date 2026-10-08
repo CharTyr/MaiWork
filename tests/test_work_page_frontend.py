@@ -74,13 +74,13 @@ def run_js(tmp_path, **cfg):
 def test_four_group_tabs(tmp_path):
     assert run_js(tmp_path)["tabs"] == [
         {"id": "news", "label": "资讯"}, {"id": "ideas", "label": "构想"},
-        {"id": "tasks", "label": "在做的事"}, {"id": "group", "label": "群"},
+        {"id": "tasks", "label": "任务"}, {"id": "group", "label": "群"},
     ]
 
 
 def test_empty_work_page_has_one_heading(tmp_path):
     html = run_js(tmp_path)["html"]
-    assert "在做的事" in html and "还没有在做的事" in html
+    assert "任务" in html and "还没有任务" in html
     assert html.count("<h1") == 1
 
 
@@ -91,9 +91,9 @@ def test_tasks_goals_reminders_share_work_page(tmp_path):
         "goals": {"agent": [{"id": "G-1", "title": "持续盯进展", "body": "<private>", "criteria": [{"done": True}, {"done": False}], "state": "paused"}],
                   "member": [{"id": "M-1", "title": "活动提醒", "who": "阿鲤", "repeat": "daily"}]},
     })["html"]
-    for text in ("在做的事", "等你批准", "已完成报表", "做完了但还没发出去", "我在推进", "暂停中", "帮大家记着", "活动提醒"):
+    for text in ("任务", "等你批", "已完成报表", "做完了，还没发", "正在推进", "暂停中", "提醒", "活动提醒"):
         assert text in html
-    assert html.index("等你批准") < html.index("全部任务") < html.index("我在推进")
+    assert html.index("等你批") < html.index("所有任务") < html.index("正在推进")
     assert 'data-act="goal" data-id="G-1"' in html
     assert "&lt;private&gt;" in html and "<private>" not in html
     assert html.count("<h1") == 1

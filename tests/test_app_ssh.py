@@ -2,7 +2,7 @@
 
 - app 启动就建 SshEnv（没配机器也建：先生成 key，网页上先把公钥给用户）；
 - machine_* 工具注册给子 agent；Coordinator 拿到同一个 SshEnv；
-- 后台循环每 30 分钟（或机器名单变了）连一遍，结果进网页「运行状态」的「专用机器」一项，
+- 后台循环每 30 分钟（或机器名单变了）连一遍，结果进网页「运行状态」的「自有机器」一项，
   这一项带上公钥（copy 字段），前端给个复制按钮。
 """
 
@@ -95,7 +95,7 @@ def test_health_no_machines_still_shows_pubkey() -> None:
     ssh = FakeSshEnv.__new__(FakeSshEnv)
     ssh.status = lambda: []
     h = _ssh_health(_svc(ssh, []))
-    assert h["name"] == "专用机器" and h["state"] == "off"
+    assert h["name"] == "自有机器" and h["state"] == "off"
     assert h["copy"].startswith("ssh-ed25519 ")
     assert "authorized_keys" in h["text"]
 

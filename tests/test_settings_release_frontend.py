@@ -62,7 +62,7 @@ def settings_js(tmp_path, target, **cfg):
 
 def test_one_usage_logs_settings_entry(tmp_path):
     tabs = settings_js(tmp_path, "settings/index.js")["html"]
-    assert any(t[0] == "usage" and t[1] == "用量与日志" for t in tabs)
+    assert any(t[0] == "usage" and t[1] == "用量" for t in tabs)
     assert not any(t[0] == "logs" for t in tabs)
 
 

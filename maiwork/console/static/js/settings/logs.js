@@ -51,28 +51,28 @@ export function logsPage() {
   const t = (L.summary && L.summary.today) || {};
   const lf = L.summary.last_failure;
   const summary = `
-    <p class="h-meta">最近 3 天的模型和工具调用。默认只看摘要；出问题时再展开明细。</p>
+    <p class="h-meta">近 3 天的调用，出问题再展开</p>
     <div class="usage" style="margin-top:14px">
-      <div><b>${t.calls || 0}</b><span>今天调用模型 · 次</span></div>
-      <div><b class="${t.failed ? "bad-t" : ""}">${t.failed || 0}</b><span>失败 · 次</span></div>
-      <div><b>${t.retried || 0}</b><span>重试 · 次</span></div>
+      <div><b>${t.calls || 0}</b><span>今天调用</span></div>
+      <div><b class="${t.failed ? "bad-t" : ""}">${t.failed || 0}</b><span>失败</span></div>
+      <div><b>${t.retried || 0}</b><span>重试</span></div>
     </div>
-    ${lf ? `<div class="warn-box" style="margin-top:12px"><b>最近一次失败：</b>${esc(hms(lf.ts))} · ${esc(lf.purpose_name || lf.purpose || "")} · ${esc(lf.model || "")}<br />${esc(lf.error || "")}</div>` : ""}
-    <div class="actions"><button class="btn small" data-act="log-expand" aria-expanded="${!!L.expanded}">${L.expanded ? "收起明细" : "展开调用明细"}</button></div>`;
+    ${lf ? `<div class="warn-box" style="margin-top:12px"><b>上次失败：</b>${esc(hms(lf.ts))} · ${esc(lf.purpose_name || lf.purpose || "")} · ${esc(lf.model || "")}<br />${esc(lf.error || "")}</div>` : ""}
+    <div class="actions"><button class="btn small" data-act="log-expand" aria-expanded="${!!L.expanded}">${L.expanded ? "收起" : "展开明细"}</button></div>`;
   if (!L.expanded) return summary;
   return summary + `
     <div class="log-bar">
       <div class="seg" role="tablist">
-        <button role="tab" data-act="log-tab" data-t="model" aria-selected="${L.tab === "model"}">模型调用</button>
-        <button role="tab" data-act="log-tab" data-t="tool" aria-selected="${L.tab === "tool"}">工具调用</button>
+        <button role="tab" data-act="log-tab" data-t="model" aria-selected="${L.tab === "model"}">模型</button>
+        <button role="tab" data-act="log-tab" data-t="tool" aria-selected="${L.tab === "tool"}">工具</button>
       </div>
       <label class="chk"><input type="checkbox" data-act="log-failed" ${L.failed ? "checked" : ""} />只看失败</label>
       <button class="btn small" data-act="log-refresh">刷新</button>
     </div>
     <div class="logs">
-      ${L.items.length ? L.items.map((it) => (L.tab === "model" ? modelLogRow(it) : toolLogRow(it))).join("") : `<p class="h-meta">${L.failed ? "没有失败记录。" : "还没有记录。"}</p>`}
+      ${L.items.length ? L.items.map((it) => (L.tab === "model" ? modelLogRow(it) : toolLogRow(it))).join("") : `<p class="h-meta">${L.failed ? "没有失败" : "还没有记录"}</p>`}
     </div>
-    ${L.next ? `<div class="actions" style="justify-content:center"><button class="btn small" data-act="log-more">再往前看</button></div>` : ""}`;
+    ${L.next ? `<div class="actions" style="justify-content:center"><button class="btn small" data-act="log-more">更早的</button></div>` : ""}`;
 }
 
 function modelLogRow(it) {
@@ -83,7 +83,7 @@ function modelLogRow(it) {
       <button class="log-head" data-act="log-open" data-kind="m" data-id="${it.id}" aria-expanded="${!!open}">
         <span class="dot ${it.ok ? "ok" : "failed"}"></span>
         <span class="log-main">
-          <span class="log-title">${esc(it.purpose_name || it.purpose || "模型调用")}${it.attempt > 1 ? `<span class="tag">第 ${it.attempt} 次尝试</span>` : ""}</span>
+          <span class="log-title">${esc(it.purpose_name || it.purpose || "模型调用")}${it.attempt > 1 ? `<span class="tag">第 ${it.attempt} 次</span>` : ""}</span>
           <span class="log-sub">${esc(hms(it.ts))} · ${esc(it.model || "")} · ${esc(fmtMs(it.ms))}${tok ? ` · ${tokens(tok)} tokens` : ""}${it.group_name ? ` · ${esc(it.group_name)}` : ""}${it.task_id ? ` · ${esc(it.task_id)}` : ""}</span>
           ${!it.ok && it.error ? `<span class="log-err">${esc(it.error)}</span>` : ""}
         </span>
@@ -100,7 +100,7 @@ function modelLogDetail(d) {
     .map(
       (m) => `
       <div class="lm">
-        <div class="lm-role">${esc({ system: "系统提示", user: "发给模型", assistant: "模型", tool: "工具结果" }[m.role] || m.role)}${m.name ? ` · ${esc(m.name)}` : ""}</div>
+        <div class="lm-role">${esc({ system: "系统提示", user: "发出", assistant: "回复", tool: "工具结果" }[m.role] || m.role)}${m.name ? ` · ${esc(m.name)}` : ""}</div>
         ${m.content ? `<pre class="lm-text">${esc(m.content)}</pre>` : ""}
         ${(m.tool_calls || []).map((tc) => `<pre class="lm-text lm-tc">调用 ${esc(tc.name || "")}：${esc(tc.arguments || "")}</pre>`).join("")}
       </div>`
@@ -108,15 +108,15 @@ function modelLogDetail(d) {
     .join("");
   return `
     ${d.error ? `<div class="warn-box">${esc(d.error)}${d.status ? `（HTTP ${d.status}）` : ""}</div>` : ""}
-    <div class="ld-meta">${req.json_mode ? "要求返回 JSON · " : ""}${(req.tools || []).length ? `可用工具：${req.tools.map(esc).join("、")}` : "没给工具"}</div>
-    <details class="log-raw"><summary>查看完整请求与回复</summary>
+    <div class="ld-meta">${req.json_mode ? "要 JSON · " : ""}${(req.tools || []).length ? `工具：${req.tools.map(esc).join("、")}` : "无工具"}</div>
+    <details class="log-raw"><summary>看完整内容</summary>
     <h3 class="ld-h">请求</h3>
-    ${msgs || `<p class="h-meta">（没记下）</p>`}
+    ${msgs || `<p class="h-meta">（没记录）</p>`}
     <h3 class="ld-h">回复</h3>
     ${
       d.ok
         ? `${res.text ? `<pre class="lm-text">${esc(res.text)}</pre>` : ""}${(res.tool_calls || []).map((tc) => `<pre class="lm-text lm-tc">调用 ${esc(tc.name || "")}：${esc(tc.arguments || "")}</pre>`).join("")}${!res.text && !(res.tool_calls || []).length ? `<p class="h-meta">（空）</p>` : ""}`
-        : `<p class="h-meta">这次没拿到回复。</p>`
+        : `<p class="h-meta">没有回复</p>`
     }</details>`;
 }
 

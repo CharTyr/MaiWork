@@ -97,6 +97,31 @@ def name_of(store_or_conn: Any, group_id: Any, user_id: Any, fallback: Any = "")
     return _clean(fallback, uid)
 
 
+def roster_names(store_or_conn: Any, group_id: Any) -> list[str]:
+    """本群名册里所有当前名字（去重；长的在前）。
+
+    只读、不认人：给「交接包去人」（docs/24 §五）这类「要把名字从文字里换掉」的
+    出口用——那些出口不需要 id，只需要「本群现在有谁叫这些名字」。
+    读不到 / 读失败 → []（调用方按「没有名字」处理，宁少换不多换错）。
+    """
+    gid = str(group_id or "").strip()
+    if not gid:
+        return []
+    try:
+        rows = _conn(store_or_conn).execute(
+            "SELECT user_id, name FROM members WHERE group_id=?", (gid,)
+        ).fetchall()
+    except Exception:
+        logger.debug("读名册名字失败（群 %s），按没有名字处理", gid, exc_info=True)
+        return []
+    names: set[str] = set()
+    for r in rows:
+        n = _clean(r["name"], r["user_id"])
+        if n:
+            names.add(n)
+    return sorted(names, key=len, reverse=True)
+
+
 def render(store_or_conn: Any, group_id: Any, text: Any) -> str:
     """把文字里的 {@id} 换成当前名字；不认识的换「某群友」。"""
     s = str(text or "")

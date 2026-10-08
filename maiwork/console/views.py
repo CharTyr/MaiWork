@@ -46,7 +46,7 @@ PURPOSE_NAMES: dict[str, str] = {
     "feeds.verify_plan": "挑实测",
     "worker": "子 agent",
     "coordinator.plan": "派活计划",
-    "coordinator.review": "验收",
+    "coordinator.review": "检查",
     "coordinator.groupspace": "群空间探活",
     "coordinator.remember": "记下任务经验",
     "coordinator.check_goal": "目标检查点",
@@ -440,6 +440,28 @@ def _ideas_of(feeds: Any, group_id: str, admin: bool) -> list:
         return feeds.ideas_view(group_id)
 
 
+def handoff_counts(store: Any, kind: str, ids: Any) -> dict[str, int]:
+    """这些条目各自「被带走」几次（events kind=handoff.taken；只数条数，不读 payload）。
+
+    docs/24 §六：次数只给总管理员和本群群管理员看（群友版视图里没有这个字段）。
+    store 没就位 / 读失败 → {}（视图绝不因此 500），调用方缺省当 0。
+    """
+    wanted = [str(i) for i in (ids or []) if str(i or "").strip()]
+    if not wanted or getattr(store, "read", None) is None:
+        return {}
+    try:
+        marks = ",".join("?" * len(wanted))
+        rows = store.read().execute(
+            "SELECT entity_id, COUNT(*) AS c FROM events WHERE kind='handoff.taken'"
+            f" AND entity=? AND entity_id IN ({marks}) GROUP BY entity_id",
+            (str(kind), *wanted),
+        ).fetchall()
+    except Exception:
+        logger.exception("数交接包带走次数失败（%s）", kind)
+        return {}
+    return {str(r["entity_id"]): int(r["c"] or 0) for r in rows}
+
+
 def _attach_idea_targets(svc: Any, group_id: str, ideas: list, focus: list, *, admin: bool = True) -> None:
     """给「给某人的」构想挂 for_member {user_id, name, avatar}（卡片底部画头像 + 名字）。
 
@@ -713,7 +735,7 @@ def _upcoming(svc: Any, group_id: str, row: dict[str, Any], now: float) -> list[
             if scheduler is not None:
                 at = scheduler.next_news_ts(group_id, now)
                 if isinstance(at, (int, float)) and float(at) > 0:
-                    out.append({"icon": "newspaper", "at": float(at), "text": "下一批资讯备料"})
+                    out.append({"icon": "newspaper", "at": float(at), "text": "下一次找资讯"})
         except Exception:
             pass
     # M3：成员提醒 + agent 目标检查（最近的在前，最多 3 条）
@@ -976,6 +998,14 @@ def group_view(svc: Any, group_id: str, *, admin: bool) -> dict[str, Any]:
     if admin:
         out["focus"] = _focus_list(svc, group_id)
         _attach_idea_targets(svc, group_id, ideas, out["focus"])
+        # 交接包被带走几次（docs/24 §六）：只给总管理员 / 本群群管理员（这个分支）；
+        # 群友版（admin=False）一个键都不出。
+        counts = handoff_counts(
+            getattr(svc, "store", None), "idea", [it.get("id") for it in ideas if isinstance(it, dict)]
+        )
+        for it in ideas:
+            if isinstance(it, dict):
+                it["handoff_count"] = counts.get(str(it.get("id")), 0)
         # 近 7 天被可行性闸拦下的构想（docs/18 §八）：只给管理员，群友视图一个键都不出现。
         # 读不到 / 结构坏了兜底成全 0，视图绝不 500。
         try:
@@ -1066,7 +1096,7 @@ def _jev_health(svc: Any) -> dict[str, Any]:
         key = ""
     if not key:
         return {"key": "jev", "icon": "sparkles", "name": "快速判断", "state": "warn", "text": "没找到密钥"}
-    return {"key": "jev", "icon": "sparkles", "name": "快速判断", "state": "warn", "text": "连续失败在熔断，过会儿自己恢复"}
+    return {"key": "jev", "icon": "sparkles", "name": "快速判断", "state": "warn", "text": "连续出错，稍后自动恢复"}
 
 
 def _search_health(svc: Any) -> dict[str, Any]:
@@ -1078,7 +1108,7 @@ def _search_health(svc: Any) -> dict[str, Any]:
     search = getattr(svc, "search", None)
     if search is None:
         return {"key": "search", "icon": "magnifier", "name": "搜索", "state": "warn",
-                "text": "还没选：去「设置 → 扩展」选一个"}
+                "text": "还没选：去「设置 → 工具」选一个"}
     try:
         ok, text = search.status()
     except Exception:
@@ -1109,13 +1139,13 @@ def _reader_health(svc: Any) -> dict[str, Any]:
             enabled = False
     if not enabled:
         text = f"Jina Reader 关着：先直接打开，被网站拦了再用{extract_part}"
-        return {"key": "reader", "icon": "books", "name": "打开网页", "state": "ok", "text": text}
+        return {"key": "reader", "icon": "books", "name": "读网页", "state": "ok", "text": text}
     try:
         r_ok, r_text = reader.status()
     except Exception:
         r_ok, r_text = False, "Jina Reader 状态读不出来"
     text = f"{r_text} → {extract_part} → 直接打开"
-    return {"key": "reader", "icon": "books", "name": "打开网页", "state": "ok" if r_ok else "warn", "text": text}
+    return {"key": "reader", "icon": "books", "name": "读网页", "state": "ok" if r_ok else "warn", "text": text}
 
 
 def _ssh_health(svc: Any) -> dict[str, Any] | None:
@@ -1128,7 +1158,7 @@ def _ssh_health(svc: Any) -> dict[str, Any] | None:
     ssh = getattr(svc, "ssh", None)
     if ssh is None:
         return None
-    base = {"key": "ssh", "icon": "monitor", "name": "专用机器"}
+    base = {"key": "ssh", "icon": "monitor", "name": "自有机器"}
     try:
         pub = str(ssh.public_key() or "")
     except Exception:
@@ -1169,12 +1199,12 @@ def _localenv_health(svc: Any) -> dict[str, Any]:
     settings = svc.get_settings()
     env = getattr(settings, "environments", None) if settings is not None else None
     mode = str(getattr(env, "local_mode", "") or "").strip() if env is not None else ""
-    base = {"key": "localenv", "icon": "monitor", "name": "本机干活"}
+    base = {"key": "localenv", "icon": "monitor", "name": "本机"}
     cap = getattr(svc, "capability", None)
     cap_mode = str(getattr(cap, "mode", "") or "")
     if cap_mode == "stopped":
         why = str(getattr(cap, "reason", "") or "这台机器不能隔离跑命令")
-        return {**base, "state": "off", "text": f"没开（{why}）；跑命令的活交给专用机器或 Railway，都没有就做不了"}
+        return {**base, "state": "off", "text": f"没开（{why}）；跑命令的活交给自有机器或临时机器，都没有就做不了"}
     if mode == "direct":
         return {**base, "state": "warn", "text": "直跑模式没有隔离，只能本地测试用"}
     if cap_mode == "fixed":
@@ -1240,7 +1270,7 @@ def _railway_health(svc: Any) -> dict[str, Any] | None:
     状态全部从 kv 读（railway.day.<北京日期> / railway.last_fail / railway.last_acquire），
     网页不用有 RailwayEnv 实例也能显示。
     """
-    base = {"key": "railway", "icon": "cloud", "name": "一次性 VM（railway.new）"}
+    base = {"key": "railway", "icon": "cloud", "name": "临时机器"}
     settings = svc.get_settings()
     env = getattr(settings, "environments", None) if settings is not None else None
     if env is None:
@@ -1352,11 +1382,11 @@ def settings_view(svc: Any) -> dict[str, Any]:
             "group_managed": True,
             "seed_only": True,
             "note": (
-                "「谁能批 / 免批」和「往群里发（开话题 / 资讯卡 / 提一嘴 / 每日上限 / "
-                "睡觉时段）」现在每个群自己一份，到「群 → 往群里发 / 派活批准」里改；"
+                "「派活审批」和「主动发言（开话题 / 资讯卡 / 提一嘴 / 每日上限 / "
+                "睡觉时段）」现在每个群自己一份，到「群 → 主动发言 / 派活审批」里改；"
                 "下面几项只是新群第一次的迁移种子，不是任何群的实际值。"
             ),
-            "group_page": "每个群页面 → 往群里发 / 派活批准",
+            "group_page": "每个群页面 → 主动发言 / 派活审批",
             "quiet_hours": settings.delivery.quiet_hours,
             "topics_per_day": settings.topics.per_day,
             "topics_min_gap_hours": settings.topics.min_gap_hours,
@@ -1371,7 +1401,7 @@ def settings_view(svc: Any) -> dict[str, Any]:
             "group_managed": True,
             "seed_only": True,
             "note": "看不到配置：这几项（开话题 / 每日上限 / 睡觉时段 / 批准）每个群自己一份，到群页里改。",
-            "group_page": "每个群页面 → 往群里发 / 派活批准",
+            "group_page": "每个群页面 → 主动发言 / 派活审批",
             "quiet_hours": "23:00-08:00",
             "topics_per_day": 2,
             "topics_min_gap_hours": 3,
@@ -1409,7 +1439,7 @@ def settings_view(svc: Any) -> dict[str, Any]:
         auto_blocked_by_group = {}
     # 健康项：railway 那条老 stub 里没有 environments 节时返回 None，不放进列表
     health = [
-        {"key": "models", "icon": "robot", "name": "模型端点", "state": model_state, "text": model_text},
+        {"key": "models", "icon": "robot", "name": "模型", "state": model_state, "text": model_text},
         _jev_health(svc),
         _search_health(svc),
         _reader_health(svc),

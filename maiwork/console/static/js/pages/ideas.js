@@ -5,15 +5,15 @@ import { agentFish, gview } from "../api.js";
 import { emptyState, fbButtons } from "./news.js";
 import { hash } from "./group.js";
 
-const IDEA_STATE = { new: "", wanted: "有人想要，等管理员批准", pending: "等管理员批准", started: "已经在做了", dismissed: "已收起" };
+const IDEA_STATE = { new: "", wanted: "有人想要，等批准", pending: "等批准", started: "在做了", dismissed: "已收起" };
 const ideaDot = (st) => (st === "started" ? "running" : st === "wanted" || st === "pending" ? "pending" : "");
 
 export function viewIdeas(g, v) {
   const ideas = (v && v.ideas) || [];
-  let html = `<h1 class="h-page h-fish">${agentFish("idea", 44)}<span>构想</span></h1><p class="h-meta">看中哪个，复制要求到群里 @MaiBot 就能开工</p>`;
+  let html = `<h1 class="h-page h-fish">${agentFish("idea", 44)}<span>构想</span></h1><p class="h-meta">看中了就复制，到群里 @MaiBot 开工</p>`;
   html += blockedNote(v && v.ideas_blocked);
   if (!ideas.length) {
-    return html + emptyState("bulb", "还没有构想", g.fresh ? "熟悉这个群之后就开始提想法。" : "");
+    return html + emptyState("bulb", "还没有构想", g.fresh ? "了解这个群后就会提" : "");
   }
   html += ideas
     .map((it, k) => {
@@ -40,9 +40,9 @@ export function blockedNote(b) {
   const n = b && Number(b.count) > 0 ? Number(b.count) : 0;
   if (!n) return "";
   const rows = (Array.isArray(b.recent) ? b.recent : [])
-    .map((r) => `<li><span class="ib-title">${esc(r.title || "（没有标题）")}${r.kind === "personal" ? `<span class="ii-kind">个人向</span>` : ""}</span><span class="ib-why">${esc(r.reason || "")}${r.ts ? ` · ${esc(dayWord(r.ts))}` : ""}</span></li>`)
+    .map((r) => `<li><span class="ib-title">${esc(r.title || "（没有标题）")}${r.kind === "personal" ? `<span class="ii-kind">给个人</span>` : ""}</span><span class="ib-why">${esc(r.reason || "")}${r.ts ? ` · ${esc(dayWord(r.ts))}` : ""}</span></li>`)
     .join("");
-  return `<details class="idea-blocked"><summary>最近 7 天拦下 ${n} 条 MaiWork 做不到的构想<span class="private">${SVG.lock}只有管理员看得到</span></summary>${rows ? `<ul>${rows}</ul>` : ""}<p class="fine">要群友报名、配合，或要登录、付钱、线下才成立的，不会出成构想。</p></details>`;
+  return `<details class="idea-blocked"><summary>7 天内拦下 ${n} 条做不到的<span class="private">${SVG.lock}仅管理员可见</span></summary>${rows ? `<ul>${rows}</ul>` : ""}<p class="fine">要人配合、付钱、登录或线下的不提</p></details>`;
 }
 
 export function findIdea(did) {
@@ -86,27 +86,27 @@ function ideaItemsBlock(it, open) {
       ? `<button class="ii-row${on ? " on" : ""}" data-act="idea-item" data-id="${it.id}" data-no="${x.no}" aria-pressed="${on}">${inner}</button>`
       : `<div class="ii-row static">${inner}</div>`;
   };
-  return `<div class="dt-sec idea-items"><div class="dt-label">包含的项目${open && items.length > 1 ? ` <small>${picked.length}/${items.length}</small>` : ""}</div>${items.map(row).join("")}</div>`;
+  return `<div class="dt-sec idea-items"><div class="dt-label">包含哪些${open && items.length > 1 ? ` <small>${picked.length}/${items.length}</small>` : ""}</div>${items.map(row).join("")}</div>`;
 }
 
 export function ideaDetail(it) {
-  const st = IDEA_STATE[it.state] || "新想法";
+  const st = IDEA_STATE[it.state] || "新的";
   const f = it.feasibility || {};
   const rows = [];
-  if (f.note) rows.push([f.level === "ok" ? "能做" : f.level === "need" ? "需要帮忙" : "可能能做", f.note]);
-  if (it.basis) rows.push(["为什么想到这个", it.basis]);
+  if (f.note) rows.push([f.level === "ok" ? "能做" : f.level === "need" ? "要人帮" : "也许能做", f.note]);
+  if (it.basis) rows.push(["为什么想到", it.basis]);
   const open = it.state === "new" || it.state === "wanted";
   const none = open && ideaItems(it).length > 0 && !ideaPicked(it).length;
   const more = state.ideaMore === it.id;
   const menu = more
     ? `<div class="idea-menu">
-        <div class="idea-menu-row"><span>有没有用</span>${fbButtons("ideas", it)}</div>
-        ${gadmin() && open && !none ? `<button class="idea-menu-btn" data-act="idea" data-op="do" data-id="${it.id}">${SVG.check}<span>不用发到群里，直接开工</span></button>` : ""}
-        ${gadmin() && open ? `<button class="idea-menu-btn danger" data-act="idea" data-op="dismiss" data-id="${it.id}">${SVG.close}<span>收起，以后不再提</span></button>` : ""}
+        <div class="idea-menu-row"><span>有用吗</span>${fbButtons("ideas", it)}</div>
+        ${gadmin() && open && !none ? `<button class="idea-menu-btn" data-act="idea" data-op="do" data-id="${it.id}">${SVG.check}<span>直接开工</span></button>` : ""}
+        ${gadmin() && open ? `<button class="idea-menu-btn danger" data-act="idea" data-op="dismiss" data-id="${it.id}">${SVG.close}<span>不再提</span></button>` : ""}
       </div>`
     : "";
   let main;
-  if (none) main = `<button class="btn primary idea-go" disabled>至少选一个项目</button>`;
+  if (none) main = `<button class="btn primary idea-go" disabled>至少勾一项</button>`;
   else if (open) main = `<button class="btn primary idea-go" data-act="idea-copy" data-id="${it.id}">${SVG.copy}复制要求</button>`;
   else if (it.state === "started" && it.task_id) main = `<button class="btn primary idea-go" data-act="task" data-id="${esc(it.task_id)}">看任务</button>`;
   else if (it.state === "pending" && gadmin()) main = `<button class="btn primary idea-go" data-act="tab" data-tab="tasks">去批准</button>`;
@@ -129,13 +129,21 @@ export function ideaDetail(it) {
         <button class="idea-more" data-act="idea-more" data-id="${it.id}" aria-expanded="${more}" aria-label="更多">${SVG.more}</button>
         ${main}
       </div>
-      ${open ? `<p class="idea-how">复制后到群里 @MaiBot 发送${gadmin() ? "" : "，管理员批准后开工"}</p>` : ""}
+      ${open ? `<p class="idea-how">复制后到群里 @MaiBot${gadmin() ? "" : "，批准后开工"}</p>` : ""}
+      ${handoffBtn(it, none)}
     </div>`;
+}
+
+// 交接包入口（docs/24）：带走给自己的个人 agent；被带走次数只给管理员看
+function handoffBtn(it, none) {
+  const n = Number(it.handoff_count) || 0;
+  const count = gadmin() && n > 0 ? `<span class="ho-count">被带走 ${n} 次</span>` : "";
+  return `<div class="ho-entry"><button class="link-btn" data-act="handoff" data-kind="idea" data-id="${it.id}"${none ? " disabled" : ""}>交给我的 agent</button>${count}</div>`;
 }
 
 // 构想「给谁的」：指明了人就在卡片底部放头像 + 名字；面向全群的不放
 function forWho(m) {
   if (!m || !m.user_id) return "";
   const name = String(m.name || "群友");
-  return `<div class="for-who"><span class="face" style="background:${TONES[Math.abs(hash(m.user_id)) % TONES.length]}">${esc(name.slice(0, 1))}${m.avatar ? `<img src="${esc(m.avatar)}" alt="" loading="lazy" onerror="this.remove()" />` : ""}</span><span>想给 <b>${esc(name)}</b></span></div>`;
+  return `<div class="for-who"><span class="face" style="background:${TONES[Math.abs(hash(m.user_id)) % TONES.length]}">${esc(name.slice(0, 1))}${m.avatar ? `<img src="${esc(m.avatar)}" alt="" loading="lazy" onerror="this.remove()" />` : ""}</span><span>给 <b>${esc(name)}</b></span></div>`;
 }

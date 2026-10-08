@@ -6,35 +6,35 @@ export const desktop = window.matchMedia("(min-width: 1180px)");
 export const TABS = [
   { id: "news", label: "资讯" },
   { id: "ideas", label: "构想" },
-  { id: "tasks", label: "在做的事" },
+  { id: "tasks", label: "任务" },
   { id: "group", label: "群" },
 ];
 export const STATUS = {
   pending_approval: "等批准",
   queued: "排队中",
   running: "进行中",
-  waiting_input: "等人回复",
-  shelved: "搁置",
-  reviewing: "验收中",
+  waiting_input: "等回复",
+  shelved: "先放着",
+  reviewing: "检查中",
   completed: "已完成",
-  failed: "失败",
+  failed: "没做成",
   paused: "暂停",
   cancelled: "已取消",
-  rejected: "被拒",
+  rejected: "没批准",
 };
 export const DOT = { waiting_input: "waiting", shelved: "", completed: "done", paused: "", cancelled: "", rejected: "failed" };
 const ACTIVE = ["running", "reviewing", "queued"];
 export const FILTERS = [
   { id: "all", label: "全部", match: () => true },
   { id: "active", label: "进行中", match: (t) => ACTIVE.includes(t.status) },
-  { id: "waiting", label: "等人回复", match: (t) => ["waiting_input", "shelved", "paused"].includes(t.status) },
+  { id: "waiting", label: "等回复", match: (t) => ["waiting_input", "shelved", "paused"].includes(t.status) },
   { id: "done", label: "已完成", match: (t) => t.status === "completed" },
   { id: "failed", label: "没做成", match: (t) => ["failed", "cancelled", "rejected"].includes(t.status) },
 ];
 export const CATS = [
   ["recent", "最近在聊"],
-  ["interest", "长期兴趣"],
-  ["ongoing", "在做的事"],
+  ["interest", "长期爱好"],
+  ["ongoing", "在忙什么"],
   ["convention", "约定和说法"],
   ["resource", "常用资源"],
 ];
@@ -57,6 +57,7 @@ export const state = {
   settings: null,
   update: null, // /api/update 的结果（更新提醒，只有总管理员有）
   tasks: {}, // 任务详情缓存
+  handoff: null, // 交接包抽屉：{kind, id, items, back, data, err}
   badLink: false,
   loginError: "",
   skew: 0, // 服务器时间 - 本机时间

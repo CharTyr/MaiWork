@@ -88,7 +88,7 @@ def test_auto_feed_tagged_with_reason_trial_and_hits(tmp_path):
     assert "自动" in auto_row
     assert "近 30 天有 5 条 4 分以上&lt;b&gt;" in auto_row and "<b>" not in auto_row
     assert "试用到后天" in auto_row
-    assert "近 30 天给了 6 条，进资讯 2 条" in auto_row
+    assert "近 30 天：6 条，入选 2 条" in auto_row
     # 删掉自动源要说清楚「以后不再推荐」
     assert 'data-auto="1"' in auto_row
     manual_row = html[html.index("好博客"):]
@@ -99,8 +99,8 @@ def test_auto_feed_tagged_with_reason_trial_and_hits(tmp_path):
 def test_auto_log_and_source_map_in_collapsed_details(tmp_path):
     html = render(tmp_path, [AUTO_FEED], AUTO_VIEW)
     assert "<details" in html and "rss-auto" in html
-    assert "门槛来的 1/3" in html and "来源地图 0/3" in html
-    assert "订上 gcores.com" in html
+    assert "按成绩 1/3" in html and "按来源图 0/3" in html
+    assert "订阅 gcores.com" in html
     assert "退订 slow.example.com" in html and "试用期结束，一条都没被选进资讯" in html
     assert "不再推荐 bad.example.com" in html
     # 体检没过 = 这次没订上；0.9.0 上线首轮的老记录动作写的是 rejected，也按原因认出来
@@ -111,7 +111,7 @@ def test_auto_log_and_source_map_in_collapsed_details(tmp_path):
     assert "近 30 天 ≥4 条 4 分以上" in html
     # 每周「找来源」搜索搜到的网站在来源地图里标出来（模型列的不标）
     assert html.count("ra-found") == 1
-    assert '搜到的</span>' in html and "找来源搜索「独立游戏 blog」搜到" in html
+    assert '找到的</span>' in html and "找来源搜索「独立游戏 blog」搜到" in html
 
 
 def test_no_auto_details_before_data_loads(tmp_path):
@@ -123,5 +123,5 @@ def test_no_auto_details_before_data_loads(tmp_path):
 def test_delete_auto_feed_confirm_says_not_recommended_again_and_refreshes_auto_view():
     js = ACTIONS.read_text(encoding="utf-8")
     block = js[js.index('case "rss-del"'):js.index('case "news-run"')]
-    assert "不再自动推荐" in block
+    assert "不再推荐" in block
     assert "rssAuto" in block

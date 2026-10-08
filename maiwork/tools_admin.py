@@ -868,7 +868,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         if settings is None:
             return _bad("读不到规则：设置没就位")
         lines = _flat_rules(settings)
-        tail = ("每群的「谁能批 / 免批」和「往群里发（开话题 / 资讯卡 / 每日上限 / 睡觉时段）」"
+        tail = ("每群的「派活审批」和「主动发言（开话题 / 资讯卡 / 每日上限 / 睡觉时段）」"
                 "在每个群自己的页面里管（这里不再从全局改；config.toml 里那几行只作新群第一次的种子）。")
         return _ok("现在的规则：\n" + "\n".join(lines) + "\n" + tail,
                    data={"flat": lines, "group_page_note": tail})
@@ -1127,12 +1127,12 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                         raise ValueError(f'不认识或不能在这里改的字段 "{key}"')
                     hint = rules.group_managed_hint(key)
                     if hint:
-                        raise ValueError(f"「{spec['label']}」现在每个群自己一份，到「{hint}」里改，"
+                        raise ValueError(f"「{rules.full_label(key)}」现在每个群自己一份，到「{hint}」里改，"
                                          "不从全局改（config.toml 里那一行只作新群的种子）")
                     if spec.get("readonly"):
                         raise ValueError(f"{spec['label']}不能从这里改：{spec.get('readonly_reason') or '只能改 config.toml 文件'}")
                     if spec["type"] == "secret":
-                        raise ValueError(f"{spec['label']}是密钥，这里不许动（到网页「全部配置」里改）")
+                        raise ValueError(f"{spec['label']}是密钥，这里不许动（到网页「全部设置」里改）")
                     out.setdefault(str(section), {})[str(field)] = rules._validate_generic(spec, value)
         except ValueError as e:
             return _bad(str(e))
@@ -1207,8 +1207,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         不给管理员看 approval.admins 这种英文键名；万一哪个键没登记中文名才退回「节.字段」。
         """
         def _label(key: str) -> str:
-            spec = rules.CONFIG_BY_KEY.get(key) or {}
-            return str(spec.get("label") or key)
+            return rules.full_label(key)
 
         items: list[str] = []
         for section in sorted(validated.keys()):
@@ -1259,7 +1258,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         try:
             plugin_dir, data_dir = svc.config_file_ops()
         except Exception:
-            return _bad("这台机器拿不到 config.toml 的位置，改不了（去网页「全部配置」里改）")
+            return _bad("这台机器拿不到 config.toml 的位置，改不了（去网页「全部设置」里改）")
         try:
             changed = rules.save_config_patch(svc.store, flat, base=base, plugin_dir=plugin_dir)
         except ValueError as e:
@@ -1279,7 +1278,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         for key in changed:
             sec, _, fld = key.partition(".")
             value = flat.get(sec + "." + fld, validated.get(sec, {}).get(fld))
-            name = str((rules.CONFIG_BY_KEY.get(key) or {}).get("label") or key)
+            name = rules.full_label(key)
             if isinstance(value, bool):
                 value = "开" if value else "关"
             elif isinstance(value, (list, tuple)):
@@ -1979,7 +1978,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         (
             {
                 "name": "get_rules",
-                "description": "看现在生效的规则（推送 / 开话题 / 派活批准 / 资讯，含网页改过的覆盖）。",
+                "description": "看现在生效的规则（主动发言 / 开话题 / 派活审批 / 资讯，含网页改过的覆盖）。",
                 "parameters": {"type": "object", "properties": {}},
             },
             get_rules,
@@ -2099,7 +2098,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         (
             {
                 "name": "set_rules",
-                "description": '改规则（推送 / 开话题 / 派活批准 / 资讯），形如 {"delivery": {"push_per_day": 5}}。直接写进 config.toml 立刻生效；放宽安全设置时要管理员确认。',
+                "description": '改规则（主动发言 / 开话题 / 派活审批 / 资讯），形如 {"delivery": {"push_per_day": 5}}。直接写进 config.toml 立刻生效；放宽安全设置时要管理员确认。',
                 "parameters": {
                     "type": "object",
                     "properties": {

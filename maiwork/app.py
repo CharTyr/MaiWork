@@ -173,6 +173,8 @@ class MaiWorkApp:
         # 长活（资讯备料 / 构想）：同一群同一种同时只跑一个，不阻塞后台循环
         self._bg_jobs: set[asyncio.Task] = set()
         self._running_jobs: set[tuple[str, str]] = set()
+        # 构想被堆积闸挡住（暂时受阻）的群 → 下次重查时刻；只在内存，重启就重查一次
+        self._idea_recheck_at: dict[str, float] = {}
         # 名册跟 QQ 对名字：每群上次派工时间（30 分钟一轮）
         self._names_last: dict[str, float] = {}
         # M3 任务派工：同一任务同一时刻只跑一个 coordinator.run_task
@@ -2514,6 +2516,12 @@ class MaiWorkApp:
                 raise
             except Exception:
                 logger.exception("开话题巡检出错（群 %s）", gid)
+            # 先收起 7 天没人理的构想、再排程：腾出的位子当轮就能用（线上 2026-10-08 先判
+            # 堆积闸、几分钟后才收起，当天名额白白空着）
+            try:
+                self._ideas_shelve_round(gid, now)
+            except Exception:
+                logger.exception("构想自动收起巡检出错（群 %s）", gid)
             try:
                 await self._schedule_round(gid, now, signals.get(gid))
             except asyncio.CancelledError:
@@ -2534,10 +2542,6 @@ class MaiWorkApp:
                 self._viz_round(gid, now)
             except Exception:
                 logger.exception("资讯图解巡检出错（群 %s）", gid)
-            try:
-                self._ideas_shelve_round(gid, now)
-            except Exception:
-                logger.exception("构想自动收起巡检出错（群 %s）", gid)
         # 3) M3 巡检：发件箱 / 批准提醒与过期 / 目标到期 / 排队任务派工
         try:
             await self._m3_round(now)
@@ -2928,7 +2932,35 @@ class MaiWorkApp:
                     continue
                 if (gid, "idea_manual") in self._running_jobs:
                     continue  # 手动点的那个还在跑，这次先不开（下一轮再看）
+                if not self._idea_has_room(gid, now):
+                    continue  # 暂时受阻：不开长活、不记当天做过，节流后重查
                 self._spawn_long_job(gid, "idea", self.feeds.make_idea)
+
+    def _idea_has_room(self, gid: str, now: float) -> bool:
+        """构想到点时先看本群还有没有位子（堆积闸）。
+
+        挡住 = 「暂时做不了」，不是「做过了」：不开长活、不记 scheduler.done，
+        _IDEA_RECHECK_S 后再查（有人处理掉 / 7 天收起腾出位子，当天还能出）。
+        真开工的长活不管成败照旧记当天做过（做过 / 明确不值得 / 失败都不在当天反复重来）。
+        feeds 没有这个口（老版本 / 测试替身）→ 当有位子，行为同以前。
+        """
+        if now < self._idea_recheck_at.get(gid, 0.0):
+            return False
+        check = getattr(self.feeds, "idea_room", None)
+        if not callable(check):
+            return True
+        try:
+            ok = bool(check(gid))
+        except Exception:
+            logger.exception("查构想位子出错（群 %s），这次按有位子处理", gid)
+            return True
+        if ok:
+            self._idea_recheck_at.pop(gid, None)
+            return True
+        if gid not in self._idea_recheck_at:
+            logger.info("构想位子已满（群 %s），暂不出新的，%d 分钟后再看", gid, _IDEA_RECHECK_S // 60)
+        self._idea_recheck_at[gid] = now + _IDEA_RECHECK_S
+        return False
     async def _feedback_round(self, gid: str) -> None:
         from . import feedback_jobs
         from .privacy import scrub
@@ -3290,6 +3322,9 @@ class MaiWorkApp:
             except Exception:
                 logger.exception("后台循环这一轮出错，继续")
             await asyncio.sleep(self.loop_interval)
+
+
+_IDEA_RECHECK_S = 10 * 60  # 构想位子满时多久再查一次（只是一条 COUNT，不调模型）
 
 
 def _now() -> float:

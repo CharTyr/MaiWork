@@ -57,9 +57,9 @@ document.addEventListener("submit", async (e) => {
       const r = await api("POST", "/api/login", { password: pw });
       closeSheet();
       await reboot();
-      toast(r && r.role === "group_admin" ? "已进入群管理员，能管这个群" : "已进入管理员，能看到全部群");
+      toast(r && r.role === "group_admin" ? "已登录，可管本群" : "已登录，可看所有群");
     } catch (err) {
-      state.loginError = err.status === 429 ? "错太多次了，过 10 分钟再试。" : err.status === 401 ? "密码不对，再试一次。" : err.message;
+      state.loginError = err.status === 429 ? "试太多次了，10 分钟后再试。" : err.status === 401 ? "密码不对。" : err.message;
       const p = f.querySelector(".err");
       p.textContent = state.loginError;
       p.hidden = false;
@@ -73,7 +73,7 @@ document.addEventListener("submit", async (e) => {
     const input = $("chat-input");
     const text = input.value.trim();
     if (!text || !state.chat) return;
-    if (state.chat.running) return toast("上一句还在处理，等一下", true);
+    if (state.chat.running) return toast("上一句还没处理完", true);
     btn.disabled = true;
     try {
       await api("POST", `/api/chat/${encodeURIComponent(state.chat.id)}/messages`, { text });
@@ -116,7 +116,7 @@ document.addEventListener("submit", async (e) => {
         render();
       }
       repaintSheet();
-      toast((state.rules.reload_pending || []).length ? "写进 config.toml 了；标「重载后生效」的要等插件重载" : "写进 config.toml 了，马上生效");
+      toast((state.rules.reload_pending || []).length ? "已保存，部分要重载才生效" : "已保存，马上生效");
     } catch (ex) {
       errEl.textContent = ex.message;
       errEl.hidden = false;
@@ -130,16 +130,16 @@ document.addEventListener("submit", async (e) => {
     const url = input.value.trim();
     if (!/^https?:\/\/\S+$/.test(url)) return toast("地址要以 http:// 或 https:// 开头", true);
     btn.disabled = true;
-    btn.textContent = "在取…";
+    btn.textContent = "获取中…";
     try {
       const r = await api("POST", `/api/groups/${encodeURIComponent(f.dataset.g)}/rss`, { url });
       if (state.rssAuto) delete state.rssAuto[f.dataset.g];
       await loadSettings();
       repaintSheet();
-      toast(`加上了：${r.title || url}${r.items_count != null ? `，现在有 ${r.items_count} 篇` : ""}`);
+      toast(`已添加 ${r.title || url}${r.items_count != null ? `，共 ${r.items_count} 篇` : ""}`);
     } catch (ex) {
       btn.disabled = false;
-      btn.textContent = "加上";
+      btn.textContent = "添加";
       toast(ex.message, true);
     }
     return;
@@ -191,7 +191,7 @@ document.addEventListener("submit", async (e) => {
     for (const x of ok) {
       try {
         const r = await api("POST", "/api/extensions/mcp", { name: x.name, url: x.url, headers: x.headers, tools: [], roles: ["worker"], enabled: true, timeout_s: 30 });
-        done.push(`${x.name}${r.ok ? "" : "（加上了但没连上）"}`);
+        done.push(`${x.name}${r.ok ? "" : "（已添加，但没连上）"}`);
       } catch (ex) {
         failed.push(`${x.name}：${ex.message}`);
       }
@@ -200,7 +200,7 @@ document.addEventListener("submit", async (e) => {
     state.extEdit = null;
     await loadExt();
     repaintSheet();
-    toast([done.length ? `加上了 ${done.join("、")}` : "", failed.length ? `没加上 ${failed.join("；")}` : "", skipped.length ? `跳过 ${skipped.map((x) => x.name).join("、")}` : ""].filter(Boolean).join("。"), !!failed.length);
+    toast([done.length ? `已添加 ${done.join("、")}` : "", failed.length ? `没加上 ${failed.join("；")}` : "", skipped.length ? `跳过 ${skipped.map((x) => x.name).join("、")}` : ""].filter(Boolean).join("。"), !!failed.length);
     return;
   }
   if (f.id === "mcp-form" || f.id === "skill-form") {
@@ -211,13 +211,13 @@ document.addEventListener("submit", async (e) => {
       errEl.textContent = t;
       errEl.hidden = false;
     };
-    if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) return fail("名字只能用字母、数字、下划线、横线。");
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) return fail("名称只能用字母、数字、_ 和 -。");
     let body;
     if (isMcp) {
       const url = $("x-url").value.trim();
       if (!/^https:\/\/\S+$/.test(url)) return fail("地址要以 https:// 开头。");
       const roles = readRoles("x");
-      if (!roles.length) return fail("至少选一个「给谁用」。");
+      if (!roles.length) return fail("选一下给谁用。");
       const { headers, remove } = readHeaders();
       body = {
         name,
@@ -231,10 +231,10 @@ document.addEventListener("submit", async (e) => {
       };
     } else {
       const roles = readRoles("k");
-      if (!roles.length) return fail("至少选一个「给谁用」。");
+      if (!roles.length) return fail("选一下给谁用。");
       const text = $("k-body").value;
       if (!text.trim()) return fail("内容不能是空的。");
-      if (new Blob([text]).size > 40000) return fail("内容太长了，最多 40KB。");
+      if (new Blob([text]).size > 40000) return fail("太长了，最多 40KB。");
       body = { name, description: $("k-desc").value.trim(), roles, body: text };
     }
     btn.disabled = true;
@@ -245,7 +245,7 @@ document.addEventListener("submit", async (e) => {
       state.extEdit = null;
       await Promise.all([loadExt(), loadSettings()]);
       repaintSheet();
-      toast(isMcp ? "保存好了，子 agent 下一次就能用" : "保存好了，子 agent 下一次就能看到");
+      toast("保存好了，下次生效");
     } catch (ex) {
       fail(ex.message);
     } finally {
@@ -282,7 +282,7 @@ document.addEventListener("submit", async (e) => {
     const note = $("ed-text").value.trim().slice(0, 60);
     const reasons = ed.reasons || [];
     if (!reasons.length && !note) {
-      err.textContent = "挑一个理由，或者写一句。";
+      err.textContent = "选个理由或写一句。";
       err.hidden = false;
       return;
     }
@@ -295,7 +295,7 @@ document.addEventListener("submit", async (e) => {
       closeSheet();
       await loadView(true);
       renderView();
-      toast("收到，下一轮找资讯会参考");
+      toast("收到，下次会参考");
     } catch (ex) {
       err.textContent = ex.message;
       err.hidden = false;
@@ -317,7 +317,7 @@ document.addEventListener("submit", async (e) => {
     try {
       const g = grp();
       if (ed.kind === "focus") {
-        if (!/^\d{5,12}$/.test(text)) throw new Error("QQ 号应该是 5 到 12 位数字。");
+        if (!/^\d{5,12}$/.test(text)) throw new Error("QQ 号是 5–12 位数字。");
         await api("POST", `/api/groups/${encodeURIComponent(g.id)}/focus`, { user_id: text, action: "add" });
       } else if (ed.id) {
         await api("PATCH", `/api/profile/${ed.id}`, { text });
@@ -327,7 +327,7 @@ document.addEventListener("submit", async (e) => {
       closeSheet();
       await loadView(true);
       renderView();
-      toast(ed.kind === "focus" ? "加上了" : "保存好了，这条已锁定");
+      toast(ed.kind === "focus" ? "已添加" : "已保存并锁定");
     } catch (ex) {
       err.textContent = ex.message;
       err.hidden = false;

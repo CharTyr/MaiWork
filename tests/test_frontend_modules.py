@@ -311,11 +311,11 @@ def test_fish_custom_picker_contract():
 
 
 def test_specialist_escalate_selector_contract():
-    """任务双岗协作（docs/20 §5.3）：干活岗位能选「做不动时换用」；主模型岗没有这一项。"""
+    """任务双岗协作（docs/20 §5.3）：干活岗位能选「返工换用」；主模型岗没有这一项。"""
     text = (JS / "settings/agents.js").read_text(encoding="utf-8")
     assert 'id="agent-escalate"' in text
-    assert "做不动时换用" in text
-    assert 'modelOptions(p.escalate, "用主模型的")' in text, "没选 = 用主模型的（用户 2026-10-05 定）"
+    assert "返工换用" in text
+    assert 'modelOptions(p.escalate, "同主模型")' in text, "没选 = 用主模型的（用户 2026-10-05 定）"
     assert 'if ($("agent-escalate")) body.escalate = $("agent-escalate").value;' in text
     # 主模型岗不显示这一项：只排计划和验收，不亲自干活
     assert '${main ? "" : `<label for="agent-escalate">' in text
@@ -325,4 +325,4 @@ def test_task_detail_shows_lane_notes():
     """任务双岗协作（docs/20 §八）：管理员版任务详情显示返工 / 换模型 / 重开的记录。"""
     text = (JS / "detail.js").read_text(encoding="utf-8")
     assert "t.lane_notes" in text
-    assert "返工和换手" in text
+    assert "返工记录" in text

@@ -10,7 +10,7 @@ import { loading } from "../pages/news.js";
 const CFG_CHIPS = { "approval.admins": "accounts", "approval.exempt_users": "accounts", "approval.exempt_groups": "groups", "feeds.news_slots": "times" };
 const cfgKind = (f) => CFG_CHIPS[f.key] || (f.type === "time_list" ? "times" : f.type);
 const cfgId = (key) => `c-${String(key).replace(/[^a-z0-9_]/gi, "-")}`;
-const SRC_NAMES = { file: "config.toml 里", env: "服务器环境变量", none: "" };
+const SRC_NAMES = { file: "配置文件", env: "服务器环境变量", none: "" };
 
 export async function loadRules() {
   try {
@@ -76,7 +76,7 @@ export function chipAdd(box) {
     if (kind === "groups" && v && !/^[a-z][a-z0-9_]*:\d+$/.test(v)) v = "";
   }
   if (!v) {
-    err.textContent = kind === "times" ? "选一个时间" : kind === "groups" ? "填群号（数字）" : "填账号，平台默认 qq";
+    err.textContent = kind === "times" ? "请选时间" : kind === "groups" ? "请填群号（数字）" : "请填账号（默认 qq）";
     err.hidden = false;
     return;
   }
@@ -99,18 +99,18 @@ export function chipAdd(box) {
 
 // 多行表格编辑器（服务的群、SSH 服务器）：cols = [[字段, 占位提示], ...]
 export function rowsEditor(id, cols, rows) {
-  const one = (r) => `<div class="re-row">${cols.map(([k, ph]) => `<input data-k="${k}" spellcheck="false" placeholder="${esc(ph)}" value="${esc((r || {})[k] ?? "")}" />`).join("")}<button type="button" class="icon-btn" data-act="re-del" aria-label="删掉这一行">${SVG.trash}</button></div>`;
+  const one = (r) => `<div class="re-row">${cols.map(([k, ph]) => `<input data-k="${k}" spellcheck="false" placeholder="${esc(ph)}" value="${esc((r || {})[k] ?? "")}" />`).join("")}<button type="button" class="icon-btn" data-act="re-del" aria-label="删除">${SVG.trash}</button></div>`;
   return `<div class="rows-ed" id="${id}" data-cols="${esc(JSON.stringify(cols))}"><div class="re-list">${(rows || []).map(one).join("")}</div><button type="button" class="btn small" data-act="re-add">${SVG.plus}加一行</button></div>`;
 }
 export function rowsAdd(box) {
   const cols = JSON.parse(box.dataset.cols || "[]");
-  box.querySelector(".re-list").insertAdjacentHTML("beforeend", `<div class="re-row">${cols.map(([k, ph]) => `<input data-k="${k}" spellcheck="false" placeholder="${esc(ph)}" />`).join("")}<button type="button" class="icon-btn" data-act="re-del" aria-label="删掉这一行">${SVG.trash}</button></div>`);
+  box.querySelector(".re-list").insertAdjacentHTML("beforeend", `<div class="re-row">${cols.map(([k, ph]) => `<input data-k="${k}" spellcheck="false" placeholder="${esc(ph)}" />`).join("")}<button type="button" class="icon-btn" data-act="re-del" aria-label="删除">${SVG.trash}</button></div>`);
   const first = box.querySelector(".re-row:last-child input");
   if (first) first.focus();
 }
 export const ROWS_COLS = {
-  serve_groups: [["group", "qq:群号 / telegram:群 ID / qqbot:群 openid"], ["workspace", "工作区名（可空）"]],
-  ssh_list: [["name", "名字"], ["host", "user@1.2.3.4:22"], ["note", "配置 / 用途（主模型看得到）"]],
+  serve_groups: [["group", "如 qq:群号"], ["workspace", "工作区（可空）"]],
+  ssh_list: [["name", "名称"], ["host", "user@1.2.3.4:22"], ["note", "用途（主模型能看到）"]],
 };
 
 function cfgInput(f) {
@@ -136,8 +136,8 @@ function cfgInput(f) {
   if (kind === "secret") {
     const src = SRC_NAMES[f.source] || "";
     const pw = f.key === "console.password";
-    return `<input id="${id}" type="password" autocomplete="new-password" placeholder="${f.set ? `已设置${src ? `（${src}）` : ""} · 留空就不改` : "没设置 · 粘贴进来"}" />${
-      pw ? `<input id="${id}-cur" type="password" autocomplete="current-password" placeholder="改密码要先填现在的密码" style="margin-top:8px" />` : ""
+    return `<input id="${id}" type="password" autocomplete="new-password" placeholder="${f.set ? `已设${src ? `（${src}）` : ""}，留空不改` : "没设，粘贴进来"}" />${
+      pw ? `<input id="${id}-cur" type="password" autocomplete="current-password" placeholder="先填旧密码" style="margin-top:8px" />` : ""
     }${f.source === "file" && f.set && !pw ? `<button type="button" class="link-btn" data-act="cfg-clear" data-f="${esc(f.key)}">清空</button>` : ""}`;
   }
   return `<input id="${id}" spellcheck="false" value="${esc(val ?? "")}" />`;
@@ -157,10 +157,10 @@ function cfgRow(f) {
   return `
     <div class="rule-row${kind === "bool" && !f.readonly ? " is-bool" : ""}${wide ? " is-list" : ""}">
       <div class="rule-l">
-        <label for="${cfgId(f.key)}" class="set-name">${esc(f.label || f.key)}${over ? `<span class="tag">改过</span>` : ""}${f.applies === "reload" ? `<span class="tag tag-warn">重载后生效</span>` : ""}</label>
+        <label for="${cfgId(f.key)}" class="set-name">${esc(f.label || f.key)}${over ? `<span class="tag">改过</span>` : ""}${f.applies === "reload" ? `<span class="tag tag-warn">重载生效</span>` : ""}</label>
         ${f.help ? `<div class="set-text" id="${cfgId(f.key)}-help">${esc(f.help)}</div>` : ""}
-        ${f.readonly ? `<div class="set-text">${SVG.lock} 只能在服务器上改</div>` : ""}
-        ${over && !f.readonly ? `<div class="set-text">默认是：<span class="mono">${esc(cfgShow(f.default))}</span> <button type="button" class="link-btn" data-act="rule-reset" data-f="${esc(f.key)}">恢复默认</button></div>` : ""}
+        ${f.readonly ? `<div class="set-text">${SVG.lock} 只能在服务器改</div>` : ""}
+        ${over && !f.readonly ? `<div class="set-text">默认 <span class="mono">${esc(cfgShow(f.default))}</span> <button type="button" class="link-btn" data-act="rule-reset" data-f="${esc(f.key)}">恢复默认</button></div>` : ""}
       </div>
       <div class="rule-r">${cfgInput(f)}</div>
     </div>`;
@@ -172,7 +172,7 @@ function cfgSection(s) {
   const advanced = fields.filter(f => f.advanced);
   return `<h2 class="h-sub" id="cfg-${esc(s.id)}">${esc(s.label)}</h2>` +
     basic.map(cfgRow).join("") + (advanced.length ?
-      `<details class="cfg-advanced"><summary>高级 · ${advanced.length} 项</summary><p class="fine">机器资源、处理节奏和服务地址，一般不用改。</p>${advanced.map(cfgRow).join("")}</details>` : "");
+      `<details class="cfg-advanced"><summary>高级 · ${advanced.length} 项</summary><p class="fine">一般不用改</p>${advanced.map(cfgRow).join("")}</details>` : "");
 }
 
 export function rulesPage() {
@@ -183,8 +183,8 @@ export function rulesPage() {
   const jump = state.cfgSec && secs.some((s) => s.id === state.cfgSec) ? state.cfgSec : "";
   const shown = jump ? secs.filter((s) => s.id === jump) : secs;
   return `
-    <p class="h-meta">保存后马上生效</p>
-    ${pending.length ? `<div class="warn-box">有 ${pending.length} 项改了还没生效（${pending.map((k) => esc((cfgField(k) || {}).label || k)).join("、")}），要等插件重载后才生效</div>` : ""}
+    <p class="h-meta">保存即生效</p>
+    ${pending.length ? `<div class="warn-box">${pending.length} 项要等插件重载才生效（${pending.map((k) => esc((cfgField(k) || {}).label || k)).join("、")}）</div>` : ""}
     <div class="cfg-jump" role="tablist"><button type="button" role="tab" aria-selected="${!jump}" data-act="cfg-sec" data-s="">全部</button>${secs.map((s) => `<button type="button" role="tab" aria-selected="${jump === s.id}" data-act="cfg-sec" data-s="${esc(s.id)}">${esc(s.label)}</button>`).join("")}</div>
     <datalist id="mw-platforms">${Object.keys(PLATFORM_NAMES).map((p) => `<option value="${p}">${PLATFORM_NAMES[p]}</option>`).join("")}</datalist>
     <form id="rules-form" class="rules-form" autocomplete="off">
@@ -210,7 +210,7 @@ export function readRules() {
         out[f.key] = v;
         if (f.key === "console.password") {
           const cur = ($(`${cfgId(f.key)}-cur`) || {}).value || "";
-          if (!cur) throw new Error("改网页密码要先填现在的密码");
+          if (!cur) throw new Error("先填旧密码");
           out.current_password = cur;
         }
         continue;

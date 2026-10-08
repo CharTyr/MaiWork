@@ -36,11 +36,17 @@ from . import clock, idea_feasibility, idea_guard, members
 from .config import Settings
 from .feeds import (
     _POST_ACCURACY_RULES,
+    CONDITIONS_RULE,
+    CONDITIONS_SCHEMA,
+    SOURCE_IDENTITY_RULES,
     _adopt_title_zh,
+    _conditions_text,
     _localize_title,
     _looks_chinese,
     _pub_date,
-    check_post_bodies,
+    check_display_texts,
+    clean_conditions,
+    drop_unverified_rewrites,
     _titles_with_originals,
     clean_idea_origin,
     clean_step,
@@ -274,11 +280,12 @@ class Personal:
                 logger.exception("个人向写帖子意外出错（群 %s），全部回落原文", gid)
                 for item in posting:
                     self._post_fallback(item)
-            # 写完对一遍原文（和群资讯同一道，线上巡检 2026-10-02 后补）
+            # 写完对一遍原文（和群资讯同一道，线上巡检 2026-10-02 后补；中文标题一起核）
             try:
-                await check_post_bodies(self._models, gid, posting, agent="main", purpose="personal.post_check")
+                await check_display_texts(self._models, gid, posting, agent="main", purpose="personal.post_check")
             except Exception:
-                logger.exception("个人向帖子对原文自检意外出错（群 %s）", gid)
+                logger.exception("个人向帖子对原文自检意外出错（群 %s），改写全部回落", gid)
+                drop_unverified_rewrites(posting)
 
         # ⑦ 落库（含被筛的）+ 标今天做过
         kept_n = self._insert_items(gid, uid, now, candidates)
@@ -430,7 +437,8 @@ class Personal:
             f"4. 最多交回 {_COLLECT_CAP} 条，宁缺毋滥；\n"
             "5. 每条：title、url、summary（2–4 句中文纯文本，别用 Markdown）、kind（一律 news）、"
             "published（ISO 或 epoch，拿不到就空字符串）、fetched（真打开过就 true）、"
-            "quote（从原文抄一小段能支撑摘要的依据，≤200 字）、paywall；\n"
+            "quote（从原文抄一小段能支撑摘要的依据，≤200 字）、paywall、" + CONDITIONS_RULE + "；\n"
+            "5.1 " + SOURCE_IDENTITY_RULES + "（为此可以多开那一个完整原文链接）；\n"
             "6. 最后用 submit_result 交回，data 按约定的 JSON Schema；"
             f"你只有大约 {collect_minutes} 分钟，到点前记得把已经找到的交回来（部分结果也算，不会丢）；\n"
             f"7. 这次最多搜 {PERSONAL_SEARCH_CAP} 次、打开 {PERSONAL_PAGE_CAP} 个页面（用完工具会拒绝）："
@@ -458,6 +466,7 @@ class Personal:
                                 "fetched": {"type": "boolean"},
                                 "quote": {"type": "string"},
                                 "paywall": {"type": "boolean"},
+                                "conditions": CONDITIONS_SCHEMA,
                             },
                             "required": ["title", "url", "summary", "kind", "fetched", "quote", "paywall"],
                         },
@@ -494,6 +503,7 @@ class Personal:
                     "quote": str(raw.get("quote") or "").replace("\n", " ").strip()[:_QUOTE_MAX],
                     "paywall": bool(raw.get("paywall")),
                     "url_key": _normalize_url(url),
+                    "conditions": clean_conditions(raw.get("conditions")),
                 }
             )
         return items
@@ -596,9 +606,11 @@ class Personal:
             quote = str(c.get("quote") or "")
             pub = c.get("published_raw")
             pub_text = f"，发布于 {pub}" if pub else ""
+            conds = _conditions_text(c)
             lines.append(
                 f"[{i}] {c['title']} —— {c['summary'][:150]}（{c['url']}{pub_text}）"
                 + (f" 原文依据：{quote[:150]}" if quote else "")
+                + (f" 必须保留的限定：{conds}" if conds else "")
             )
         lines.append("")
         icon_list = "、".join(_ICONS)
@@ -779,6 +791,9 @@ class Personal:
             quote = str(item.get("quote") or "")[:150]
             if quote:
                 lines.append(f"    原文依据：{quote}")
+            conds = _conditions_text(item)
+            if conds:
+                lines.append(f"    必须保留的限定（正文要写到，标题不许和它矛盾）：{conds}")
             if pack["quotes"]:
                 lines.append("    他本人在群里说过的相关原话（编号从 1 开始，reason 要引用只能用这些；"
                              "可以说「你前几天在群里提到……」并引用编号）：")
@@ -792,7 +807,8 @@ class Personal:
             "给每条写帖子，只回 JSON："
             '{"posts": [{"i": 编号, "title": "对应条目标题（原样照抄）",'
             ' "title_zh": "原标题不是中文时译成简洁自然的中文标题（专有名词、产品名可保留原文），'
-            '不许加原文没有的信息；原标题已是中文就原样照抄",'
+            '不许加原文没有的信息，不许扩大承诺（学生价不能写成免费、部分不能写成全部、限时不能写成永久）；'
+            '原标题已是中文就原样照抄",'
             ' "body": "写给他的正文 2–4 句，第二人称，像「你在弄 X，这个可能用得上……」；'
             ' 关键处可用 [文字](https://链接) 嵌原文链接，只许 http(s),'
             ' "reason": "为什么给他；说他提过的事只能用上面引用列表里他本人的原话，别的不编,'
@@ -1244,7 +1260,7 @@ class Personal:
         if callable(available_probe):
             if not available_probe():
                 _, text = self._search.status()
-                raise SearchUnavailable(text or "还没指定联网搜索：去 设置 → 扩展 里选一个 MCP 用作联网搜索")
+                raise SearchUnavailable(text or "还没指定联网搜索：去 设置 → 工具 里选一个 MCP 用作联网搜索")
             return
         probe = getattr(self._search, "search", None)
         if callable(probe):
