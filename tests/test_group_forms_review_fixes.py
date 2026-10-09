@@ -100,7 +100,10 @@ def test_readme_does_not_promise_automatic_lock_for_admin_writing():
     if not readme.is_file():
         readme = plugin.parent.parent / "README.md"
     assert readme.is_file(), "发布说明缺失"
-    text = readme.read_text()
+    # README 只留入门内容，细节拆到 docs/guide/*.md（公开仓库里同样在 README 旁边）
+    guide = readme.parent / "docs" / "guide"
+    assert guide.is_dir(), "用户文档目录 docs/guide 缺失"
+    text = "\n".join(p.read_text() for p in [readme, *sorted(guide.glob("*.md"))])
     assert "你写过的、你锁定的它不会动" not in text
     assert "如果没锁定" in text and "不想让它再改就锁定" in text
 
