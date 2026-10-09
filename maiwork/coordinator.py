@@ -46,6 +46,13 @@
 - 成品最后必须用 vm_fetch_file 拷回本机工作区 artifacts/<task_id>/ 才算数——验收
   和交付永远只看本机工作区。
 - 任务结束（成功 / 失败 / 取消 / 异常）一定 release（try/finally）。
+
+2026-10 线上 T-10 / T-11 整改（docs/26 问题 C）：
+- 计划 JSON 增加 `scale`（brief / standard / full，缺省按 standard）；brief 由代码强制
+  `deliver_kind=text` + 最多 1 条活，并把「篇幅：几句话回答清楚，不做网页/文件」作为
+  **补充项**写进锁定清单（`requirements.with_brief_scale`）。
+- 交付说明 note：≤60 字、第一句给结论；空 / 含内部词 / 超长由 `delivery_note_text`
+  兜底成人话（按任务标题生成），不再用「做好了，请查收」。
 """
 
 from __future__ import annotations
@@ -92,7 +99,123 @@ _REVIEW_FORCE_JSON_TRIES = 2
 _REVIEW_ITEMS_RETRIES = 1
 _REMEMBER_TOOL_LIMIT = 2  # 「记经验」小回合最多 2 次工具调用（验收通过、交付之前）
 _GROUPSPACE_TOOL_LIMIT = 4  # 群空间小回合最多 4 轮工具调用（验收通过、交付之前）
-_TEXT_DELIVER_FALLBACK_NOTE = "做好了，请查收"
+
+# ---------------------------------------------------------------------------
+# 交付说明（docs/26 问题 C 的交付侧收口，2026-10 线上 T-10 / T-11）
+#
+# 线上事实：T-11 的 note 是「ZATO入门表已存成DOC，关键节点和结局都折叠遮挡可放心点开」，
+# T-10 是「韩国银行AI攻击事件已整理成手机直开单页，时间线和争议点都标好了来源」——
+# 只说「做好了」，没有结论；旧兜底常量是「做好了，请查收」。
+#
+# 这里把「什么样的 note 算合格」做成纯函数，代码兜底和它同一套口径：
+# - 空 / 含内部词（任务号、子 agent 编号、内部文件名、工作区目录、.py）→ 按任务标题说人话；
+# - 超过 60 字 → 在句读处收尾，不硬截半句；
+# - 其余原样（只折叠空白）。文件类的兜底说清「文件在链接里」。
+# @ 发起人由 outbox 那边做，note 里不写名字（G7 隐私闸照旧先过）。
+# ---------------------------------------------------------------------------
+_NOTE_MAX = 60
+_NOTE_INTERNAL_RE = re.compile(
+    r"T-\d+|job\d|research\.md|steps/|artifacts/|\.py(?![A-Za-z0-9_])", re.IGNORECASE
+)
+_NOTE_SENTENCE_ENDS = "。！？!?；;"
+_NOTE_SOFT_ENDS = "，,、：:"
+_NOTE_BREAKS = _NOTE_SENTENCE_ENDS + _NOTE_SOFT_ENDS
+_NOTE_FALLBACK_SUFFIX = {"file": "弄好了，文件在链接里", "text": "弄好了，就这几句"}
+_NOTE_FALLBACK_SUFFIX_DEFAULT = "弄好了，点开就能看"
+
+# ---------------------------------------------------------------------------
+# 规模档（docs/26 §问题 C / 2026-10 线上 T-10）
+#
+# 线上事实：原话只有「麦麦你搜搜，今天韩国银行被ai攻击了」，计划却做出 50KB / 12 节 /
+# 80 来源的长页，79 分钟、1594 万 token，发起人只回「哦哦哦」。计划提示只有
+# view/file/text 分别做什么，没有规模档。这里给计划 JSON 加 `scale`：
+# brief（随口一问）/ standard（明确要表/页/文档）/ full（明确要全面/深度/报告）。
+# 缺省、写错、老数据一律 standard（兼容老模型与老测试）。
+# ---------------------------------------------------------------------------
+SCALE_BRIEF = "brief"
+SCALE_STANDARD = "standard"
+SCALE_FULL = "full"
+_SCALES = (SCALE_BRIEF, SCALE_STANDARD, SCALE_FULL)
+# brief 时由代码钉在**唯一那条活**末尾的一句（用户 2026-10 定）：光把 deliver_kind 改成
+# text 挡不住子 agent 还照模型写的「做网页」brief 干活，这句直接告诉子 agent 别做。
+BRIEF_JOB_TAIL = "这是随口一问：只交回几句话的结论和关键出处，不做网页、文件或长报告。"
+# 判「已经钉过」用开头这几个字（不是整句）：步骤存档按 200 字截断，整句可能被截掉尾巴，
+# 只看整句会在下一轮复用存档时又追加一遍，前后拼出半句残话。
+_BRIEF_JOB_TAIL_MARK = "这是随口一问"
+
+
+def normalize_scale(value: Any) -> str:
+    """计划 JSON 的 scale：只认 brief / standard / full；缺省、写错、老数据一律 standard。"""
+    text = str(value or "").strip().lower()
+    return text if text in _SCALES else SCALE_STANDARD
+
+
+def with_brief_job_tail(brief: Any) -> str:
+    """brief 规模档：在活的说明末尾钉上 `BRIEF_JOB_TAIL`（纯函数，幂等）。
+
+    已经带了这句（模型自己写了 / 上一轮存档里就有，哪怕被截断）→ 原样返回，不重复追加；
+    空 brief → 原样返回（不凭空造活）。
+    """
+    text = str(brief or "").rstrip()
+    if not text or _BRIEF_JOB_TAIL_MARK in text:
+        return str(brief or "")
+    return f"{text}\n{BRIEF_JOB_TAIL}"
+
+
+def _cut_note_at_punctuation(text: str, limit: int = _NOTE_MAX) -> str:
+    """把 text 截到 ≤limit 字：能在句读处收尾就在句读处收（不硬截半句）。"""
+    head = text[:limit]
+    cut = -1
+    for i in range(len(head) - 1, -1, -1):
+        if head[i] in _NOTE_BREAKS:
+            if i + 1 >= limit // 2:  # 太靠前的句读不用，免得只剩半句
+                cut = i
+            break
+    if cut >= 0:
+        if head[cut] in _NOTE_SOFT_ENDS:
+            return head[:cut].strip()
+        return head[:cut + 1].strip()
+    return head.strip()
+
+
+def delivery_note_fallback(task_title: Any, deliver_kind: Any = "view") -> str:
+    """note 空 / 不合格时的人话兜底：`<任务标题>弄好了，点开就能看`（file 类说文件在链接里）。
+
+    标题里混进来的内部词（任务号 / 内部文件名）先刮掉，剩下的按句读截；整句 ≤ `_NOTE_MAX`。
+    """
+    kind = str(deliver_kind or "").strip()
+    suffix = _NOTE_FALLBACK_SUFFIX.get(kind, _NOTE_FALLBACK_SUFFIX_DEFAULT)
+    title = " ".join(
+        _NOTE_INTERNAL_RE.sub(" ", " ".join(str(task_title or "").split())).split()
+    )
+    room = _NOTE_MAX - len(suffix)
+    if not title or room <= 0:
+        return suffix
+    if len(title) > room:
+        title = _cut_note_at_punctuation(title, room)
+    return f"{title}{suffix}"
+
+
+def delivery_note_text(note: Any, task_title: Any, deliver_kind: Any = "view") -> str:
+    """交付说明的纯函数（不发消息、不碰库）：
+
+    - 空 / 全是空白 → 按任务标题生成人话兜底；
+    - 含内部词（T-数字 / job\\d / research.md / steps/ / artifacts/ / .py）→ 同样兜底；
+    - 超过 60 字 → 在句读处截到 ≤60；
+    - 其余原样返回（只折叠空白）。
+    """
+    text = " ".join(str(note or "").split())
+    if not text or _NOTE_INTERNAL_RE.search(text):
+        return delivery_note_fallback(task_title, deliver_kind)
+    return _cut_note_at_punctuation(text, _NOTE_MAX)
+
+
+def _with_brief_criteria(criteria: list[str]) -> list[str]:
+    """brief 但没有锁定清单（旧逻辑）时，把篇幅要求放进 criteria（不占清单条数）。"""
+    out = [str(c) for c in (criteria or [])]
+    if not any("篇幅" in c for c in out):
+        out.append(requirements.BRIEF_SCALE_TEXT)
+    return out
 
 # 群空间工具（tools_groupspace.py，roles={"main"}）→ 这个群要具备的能力键
 # （platforms/qq_onebot.py 的 capabilities_async 返回那本字典）。
@@ -1461,6 +1584,16 @@ class Coordinator:
             "用户明确要求深入调研、完整盘点或网页时，仍按原话做到；不能用省时作理由漏掉硬性要求。"
             "补充项只能服务原始需求，不得把可选展示形式变成额外必做工作。"
         )
+        # docs/26 问题 C：规模档按原话定——防止一句「搜搜」被升级成全景报告，也不让
+        # 明确要报告的任务缩水。代码对 brief 还有硬闸（text + 最多 1 条活）。
+        prompt_lines.append(
+            "规模档（scale）按原话定，不要自己加码："
+            "原话只是「搜搜 / 看看 / 查一下 / 啥情况」这类随口一问、没要求做表 / 页 / 文件 → "
+            '写 "brief"；明确要求整理成表 / 页 / 文档 → 写 "standard"；'
+            '明确要求全面 / 深度 / 报告 → 写 "full"。'
+            "brief 就只回几句话（交付形式用 text、只派 1 条活），不做网页也不做文件；"
+            "standard 按原话做，要一页就一页，别扩成全景报告；full 才按完整报告做。"
+        )
         # 执行环境可选项：只有就位的才出现在提示词里（模型不会瞎选）
         env_field, env_guide, _env_allowed = self._env_options()
         # 专岗改版 4/4：jobs[].agent 的 JSON 说明是动态的（没有自定义专岗就不提这个键），
@@ -1496,7 +1629,10 @@ class Coordinator:
             "只回 JSON，不要输出别的："
             '{"criteria": ["完成标准 1", "…"],'
             + requirements_field_doc
-            + ' "deliver_kind": "view|file|text"（view=做成网页给人打开看；file=做成文件给人下载/编辑；text=不用成品，直接在群里文字回复）,'
+            + ' "scale": "brief|standard|full"（按原话定规模：随口一问、没要求做表/页/文件 = brief；'
+            '明确要求整理成表/页/文档 = standard；明确要求全面/深度/报告 = full；'
+            '没写按 standard）,'
+            + ' "deliver_kind": "view|file|text"（view=做成网页给人打开看；file=做成文件给人下载/编辑；text=不用成品，直接在群里文字回复；brief 必须是 text）,'
             + env_field
             + ' "jobs": [{"brief": "派给一个子 agent 的具体活，要写清楚要做什么、写到 artifacts/<任务ID>/ 下；'
             '展示类做成单页 index.html（手机能看、不依赖外部资源）",'
@@ -1638,16 +1774,18 @@ class Coordinator:
                 covered_count=lead_lane.covered, covered_rev=lead_rev,
             )
 
+        req_fresh = False
+        req_changed = False
         if locked:
             # 清单已锁定：criteria 与 requirements 都按清单来，模型这轮想改也不认
             req_items: list[dict] | None = locked
             criteria = requirements.criteria_texts(locked)
         elif isinstance(data.get("requirements"), list):
-            # 第一次排计划给了清单：收拾干净 → 锁定 → 事件只记条数
+            # 第一次排计划给了清单：收拾干净 → 后面统一锁定 → 事件只记条数
             req_items = requirements.normalize_requirements(
                 data.get("requirements"), str(task.get("req") or "")
             )
-            requirements.save(self._store, tid, req_version, req_items)
+            req_fresh = True
             criteria = requirements.criteria_texts(req_items)
             self._task_fact_event(
                 tid, gid, "task.requirements_set",
@@ -1728,6 +1866,43 @@ class Coordinator:
         question = data.get("question")
         question = str(question).strip() if question else ""
 
+        # 规模档（docs/26 问题 C / 2026-10 线上 T-10）：原话只是随口一问时，代码强制
+        # 「就回几句话」。只动交付形式、活数和代码自己加的那条篇幅要求；锁定清单里
+        # 模型给的条目一个字都不改，standard / full 行为完全不变。
+        scale = normalize_scale(data.get("scale"))
+        brief_before_kind, brief_before_jobs = deliver_kind, len(jobs)
+        if scale == SCALE_BRIEF:
+            deliver_kind = "text"
+            jobs = jobs[:1]
+            self._sanitize_jobs_after(jobs)  # 砍掉的活可能还被 after 指着，重新清一遍
+            if jobs:
+                # 子 agent 只看 brief：把「这是随口一问、只回几句话」直接钉在活末尾，
+                # 免得它照模型原来写的「做网页」brief 干活（幂等，不重复追加）。
+                jobs[0]["brief"] = with_brief_job_tail(jobs[0]["brief"])
+            if req_items:
+                scaled = requirements.with_brief_scale(req_items)
+                if scaled != req_items:
+                    req_items = scaled
+                    criteria = requirements.criteria_texts(req_items)
+                    req_changed = True
+            else:
+                # 旧逻辑（模型没给清单）：不凭空锁一份清单，把篇幅要求放进 criteria。
+                criteria = _with_brief_criteria(criteria)
+        if req_items and (req_fresh or req_changed):
+            requirements.save(self._store, tid, req_version, req_items)
+        brief_forced = bool(
+            scale == SCALE_BRIEF
+            and (brief_before_kind != deliver_kind or brief_before_jobs != len(jobs))
+        )
+        self._task_fact_event(
+            tid, gid, "task.plan.scale",
+            scale=scale, deliver_kind=deliver_kind, jobs=len(jobs), forced=brief_forced,
+        )
+        logger.info(
+            "任务 %s 规模档 scale=%s（交付形式 %s，活数 %d%s）",
+            tid, scale, deliver_kind, len(jobs), "，已按 brief 强制" if brief_forced else "",
+        )
+
         env_choice = self._normalize_env_choice(data.get("env"))
         machine = str(data.get("machine") or "").strip()[:64] if env_choice == "ssh" else ""
         env_reason = str(data.get("env_reason") or "").strip()
@@ -1736,6 +1911,7 @@ class Coordinator:
             "criteria": criteria,
             "requirements": req_items,
             "deliver_kind": deliver_kind,
+            "scale": scale,
             "jobs": jobs,
             "question": question,
             "env": env_choice,
@@ -3676,6 +3852,13 @@ class Coordinator:
             "结果，缺一样就算没做完；原始需求只要方案或文字，就按它点名的文稿评，不加码；"
             "拿不准就以原始需求为准。）"
         )
+        # docs/26 问题 C：篇幅要和原话相符——这一条是判据，不改通过公式（模型自己判断）。
+        scale = normalize_scale(plan.get("scale"))
+        prompt_lines.append(
+            f"（这次交付的规模档 scale={scale}：brief=几句话直接回答；standard=按原话做一页 / "
+            "一个文件；full=全面 / 深度报告。篇幅与原话相符：brief 是几句话，要一页就一页"
+            "——做多了、做少了都在 review 里按这个量说清。）"
+        )
         prompt_lines.append("")
         prompt_lines.append("验收必须照这些原则：")
         prompt_lines.append(
@@ -3786,8 +3969,10 @@ class Coordinator:
             '{"pass": true|false, "review": "中文验收意见：第一句先写结论（「通过」或「没过：……」），'
             '只说没过的地方，全段不超过 150 字；通过就一两句话，别列一遍过了的项",'
             ' "missing": ["还缺什么"], "artifact": "要交付的成品在工作区里的相对路径（'
-            '如 artifacts/T-1/index.html；text 交付可以留空）", "note": "交付时在群里说的一句话（'
-            '不点名关注成员、不暴露工具细节）"}'
+            '如 artifacts/T-1/index.html；text 交付可以留空）", "note": "交付时在群里说的那句话：'
+            "不超过 60 字；第一句直接给结论或最关键的一两个发现（不要写「已整理成…」「做好了」"
+            "这种只说做了什么的开头）；是文件就说清要下载 / 打开什么；用口语，像群友说话；"
+            '不写任务号、内部文件名、工具或流程词；不点名关注成员。"}'
         )
         if req_items:
             prompt_lines.append(
@@ -4598,17 +4783,22 @@ class Coordinator:
     # 结果落地
     # ------------------------------------------------------------------
 
-    def _scrub_note(self, gid: str, note: str, task_title: str) -> str:
+    def _scrub_note(self, gid: str, note: str, task_title: str,
+                    deliver_kind: str = "view") -> str:
         """G7：交付说明要发进群，不能含关注成员名字 / 注记。
-        命中 → 兜底「做好了：<任务标题>」；note 本来空 → 默认兜底话。"""
+
+        被隐私闸拒 → 用按任务标题生成的人话兜底（不含任何成员信息）。过了闸再按
+        `delivery_note_text` 收拾：空 / 含内部词 → 兜底；超 60 字 → 句读处截断。
+        """
         from .privacy import scrub
 
-        text = str(note or "").strip() or _TEXT_DELIVER_FALLBACK_NOTE
-        cleaned = scrub(gid, text, self._store)
-        if cleaned is None:
-            title = str(task_title or "").strip() or "任务"
-            return f"做好了：{title}"
-        return cleaned
+        raw = " ".join(str(note or "").split())
+        if raw:
+            cleaned = scrub(gid, raw, self._store)
+            if cleaned is None:
+                return delivery_note_fallback(task_title, deliver_kind)
+            raw = str(cleaned)
+        return delivery_note_text(raw, task_title, deliver_kind)
 
     async def _handle_passed(
         self, task_id: str, gid: str, ws_name: str, plan: dict, review: dict
@@ -4646,14 +4836,15 @@ class Coordinator:
             logger.warning("任务 %s →completed 非法：%s", task_id, e)
             return "done"
 
-        # G7 隐私闸：note 含关注成员信息 → 兜底「做好了：<任务标题>」
+        # G7 隐私闸 + 交付说明口径：note 含关注成员信息 / 空 / 带内部词 / 超 60 字
+        # → 兜底按任务标题生成人话（docs/26 问题 C）。
         task_title = ""
         try:
             _t = self._tasks.get(task_id)
             task_title = str((_t or {}).get("title") or "")
         except Exception:
             task_title = ""
-        note = self._scrub_note(gid, review["note"] or _TEXT_DELIVER_FALLBACK_NOTE, task_title)
+        note = self._scrub_note(gid, review.get("note") or "", task_title, kind)
         if kind == "text":
             try:
                 self._outbox.enqueue(

@@ -2987,6 +2987,10 @@ class MaiWorkApp:
         """
         cp = self.card_push
         if cp is not None:
+            # 画卡前要给卡片条目补图解（news_viz.ensure_for_items）；NewsViz 比 CardPush
+            # 晚一步建，所以每轮补接一次（attach_viz 幂等）。
+            if self.news_viz is not None:
+                cp.attach_viz(self.news_viz)
             cp.scan(gid, now)
             if cp.has_due(gid, now):
                 self._spawn_long_job(gid, "newscard", cp.flush)
@@ -2997,14 +3001,39 @@ class MaiWorkApp:
                 self._spawn_long_job(gid, "ideamention", im.flush)
 
     def _viz_round(self, gid: str, now: float) -> None:
-        """资讯图解：有到期的活（开着、没到当天上限、有没处理过的候选）才派后台长活 kind=viz。"""
+        """资讯图解：有到期的活（开着、没到当天上限、有没处理过的候选）才派后台长活 kind=viz。
+
+        卡片条目优先（2026-10 用户定的口径）：卡片**马上要备料**（到点了、长活正在跑）
+        时这一轮让位——名额先给卡片上那几条，剩下的才轮到独立的 _viz_round。
+        睡觉时段卡片反正发不出去，这轮照跑：图解是后台活，提前做好反而能在早上
+        被卡片直接用上（卡片条目本身由 news_viz 的「等卡片」名单保护，不会被抢）。
+        """
         nv = self.news_viz
         if nv is None or (str(gid), "viz") in self._running_jobs:
             return
+        cp = self.card_push
+        if cp is not None:
+            try:
+                card_busy = bool(cp.has_due(gid, now)) or (str(gid), "newscard") in self._running_jobs
+            except Exception:
+                card_busy = False
+                logger.debug("查卡片是否到点失败，本轮图解照常（群 %s）", gid, exc_info=True)
+            if card_busy and not self._in_quiet(now, gid):
+                return
         if not self._models_ready():
             return
         if nv.has_work(str(gid), now):
             self._spawn_long_job(str(gid), "viz", nv.run)
+
+    def _in_quiet(self, now: float, gid: str) -> bool:
+        """这个群现在在不在睡觉时段；查不到就当不在（图解是后台活，不靠它挡）。"""
+        pushes = self.pushes
+        if pushes is None:
+            return False
+        try:
+            return bool(pushes.in_quiet(now, gid))
+        except Exception:
+            return False
 
     _NAMES_EVERY_S = 30 * 60.0
 

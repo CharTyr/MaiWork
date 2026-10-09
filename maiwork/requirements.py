@@ -13,6 +13,9 @@
   （去空白后 ≥2 字）；模型漏判某条必须项 = 没做到。模型自己给的 `pass` 只作参考。
 - `human_unmet(judgement, verdicts)`（第三期 §5 A）：没做到的必须项里带 `needs_human`
   （去空白后 ≥ `NEEDS_HUMAN_MIN`=6 字）的那些——「需要真人参与、材料已备好」的出口。
+- `with_brief_scale(items)`（docs/26 问题 C）：规模档 brief 时由代码往已锁定的清单里加一条
+  「篇幅：几句话回答清楚，不做网页/文件」（`补充`=加分项，不参与通过公式；条数满了就挂在
+  底线 R0 文字后面，不占条数）。
 - `load` / `save`：清单锁在 kv `task.requirements.<任务ID>`，带需求版本号——同一版需求
   之后的每轮计划都不许改它，只有群友改了需求（版本号变）才重新拆。不加表、不迁库。
 """
@@ -33,6 +36,9 @@ EVIDENCE_MIN = 2       # 证据去空白后至少这么长才算给了证据
 NEEDS_HUMAN_MIN = 6    # needs_human 去空白后至少这么长才算「写清了要谁做什么」（docs/22 §5 A）
 FLOOR_ID = "R0"
 FLOOR_TEXT = "内容真实、不编造；交付物能正常打开"
+# 规模档 brief（docs/26 问题 C 收口）：群友只是随口一问时，代码要把「别做网页/文件、
+# 几句话答清楚」锁进清单，免得下一轮又派制作网页的活。由 `with_brief_scale` 写进去。
+BRIEF_SCALE_TEXT = "篇幅：几句话回答清楚，不做网页/文件"
 ORIGIN_ORIGINAL = "原话"
 ORIGIN_BONUS = "补充"
 ORIGIN_FLOOR = "底线"
@@ -209,6 +215,49 @@ def human_unmet(judgement: Any, verdicts: Any) -> list[dict]:
             "needs_human": need[:200],
         })
     return out
+
+
+def with_brief_scale(items: Any) -> list[dict]:
+    """规模档 brief（docs/26 问题 C）：把 `BRIEF_SCALE_TEXT` 写进已锁定的清单（纯函数）。
+
+    只有 `Coordinator._plan` 在 scale=brief 时调用；模型给的条目一个字都不改。
+
+    - 已经有这条 → 原样返回（幂等：多轮计划不会越加越多）；
+    - 去掉底线后还有位置（少于 `MAX_ITEMS`）→ 插在底线前面，id 按现有最大编号接着编；
+    - 条数已经满了 → **不占条数**，把这句挂到底线 R0 的文字后面（R0 永远要判，
+      不会被漏掉；这样不会把模型给的第 6 条原话挤出去、也不破坏「最多 6 条」的上限）。
+
+    这条永远标 `补充`（加分项），不是 `原话`：它不是群友原话里明确说的，是 MaiWork
+    自己按「口头一问别升级成全景报告」加的口径——本模块的规矩是「为了做好自己加的
+    一律标补充」。所以它进清单、进计划/验收提示，但不参与 `judge` 的通过公式
+    （brief 的硬闸在 coordinator：deliver_kind 一定是 text、最多 1 条活）。
+    """
+    rows = [dict(i) for i in items if isinstance(i, dict)] if isinstance(items, list) else []
+    if not rows:
+        return [{
+            "id": FLOOR_ID, "text": FLOOR_TEXT, "origin": ORIGIN_FLOOR, "kind": ORIGIN_FLOOR,
+        }]
+    if any(BRIEF_SCALE_TEXT in str(i.get("text") or "") for i in rows):
+        return rows
+    floor_idx = next(
+        (n for n, i in enumerate(rows) if str(i.get("id") or "") == FLOOR_ID), len(rows)
+    )
+    body = [i for i in rows if str(i.get("id") or "") != FLOOR_ID]
+    if len(body) < MAX_ITEMS:
+        top = 0
+        for i in body:
+            iid = str(i.get("id") or "")
+            if iid.startswith("R") and iid[1:].isdigit():
+                top = max(top, int(iid[1:]))
+        rows.insert(floor_idx, {
+            "id": f"R{top + 1}", "text": BRIEF_SCALE_TEXT,
+            "origin": ORIGIN_BONUS, "kind": KIND_STRICT,
+        })
+    else:
+        floor = rows[floor_idx]
+        base = str(floor.get("text") or "").strip() or FLOOR_TEXT
+        floor["text"] = f"{base}；{BRIEF_SCALE_TEXT}"
+    return rows
 
 
 def kv_key(task_id: Any) -> str:

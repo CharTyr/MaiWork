@@ -15,10 +15,21 @@
 5. 网页按需取（GET /api/news/{id}/viz），外面包一层 wrap()：CSP default-src 'none'、
    只放行我们自己那段报高度的脚本（按 sha256）；前端放进 sandbox="allow-scripts"
    （没有 allow-same-origin）的 iframe，碰不到网页登录信息、不能联网、不能跳转页面。
+
+**卡片条目优先（2026-10 线上问题，方案 A+C）**：上面 1~2 步那条「每轮挑一条」的路
+（`run`，app 每轮 `_viz_round` 派的长活）和资讯卡片是**两条互不等待的长活**，
+卡片几秒就画完、图解要几十秒到十几分钟，所以卡片发出去时图解还没好——线上 5 天里
+进过卡片的 18 张 ok 图解全部晚于卡片画图，发群的卡片从来没带过图解。
+修法：`CardPush.flush` 画卡前调 `ensure_for_items(gid, item_ids, now=…, deadline=…)`，
+**只为卡片上那几条、没自带配图的条目**做图解，有截止时间就不越线（默认最多等 150 秒），
+到点没做完就照旧画卡发出，这张留给 `run` 用剩余名额。两条路共用 `_active` 占位 +
+`viz_per_day` 名额：同一条不会被同时做两次，名额先到先得、并发也不超额；
+正在等卡片的条目还会经 `set_reserved_getter` 告诉 `run` 避开（不抢同一条，也不记 skip）。
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -283,6 +294,30 @@ class NewsViz:
         self._workers = workers
         self._tools = tools
         self._get_settings = get_settings
+        # 正在做的条目（item_id → 群号）：卡片路径和 _viz_round 共用，同一条不重复做。
+        # 进程内的东西；插件重启后靠 news_viz 表里的记录接着走（有记录就不重做）。
+        self._active: dict[int, str] = {}
+        self._lock = asyncio.Lock()
+        # 正在等卡片的条目（CardPush.pending_item_ids）：归卡片路径先做，_viz_round 不碰。
+        self._reserved_getter: Optional[Callable[[str], Any]] = None
+
+    def set_reserved_getter(self, fn: Any) -> None:
+        """接上「哪些条目正在等卡片」（app 用 CardPush.pending_item_ids 注入）。
+
+        这些条目归卡片路径先做（画卡前 `ensure_for_items`），`run` 这一轮不碰它们：
+        既不抢同一条，也不会把它们记成 skip——那样会把卡片的图解机会顶掉。
+        """
+        self._reserved_getter = fn if callable(fn) else None
+
+    def _reserved(self, gid: str) -> set[int]:
+        fn = self._reserved_getter
+        if not callable(fn):
+            return set()
+        try:
+            return {int(x) for x in (fn(gid) or ())}
+        except Exception:  # noqa: BLE001  读不到就当作没保留，不拖垮图解
+            logger.debug("读「等卡片的条目」失败，本轮图解照常（群 %s）", gid, exc_info=True)
+            return set()
 
     def _per_day(self) -> int:
         try:
@@ -291,13 +326,18 @@ class NewsViz:
             return 0
 
     def _candidates(self, gid: str, now: float) -> list[Any]:
-        return self._store.read().execute(
+        rows = self._store.read().execute(
             "SELECT i.* FROM news_items i WHERE i.group_id=? AND i.rejected=0 AND i.kind IN ('news','guide')"
             " AND i.target_user_id='' AND COALESCE(i.image_url,'')='' AND i.created>=?"
             " AND NOT EXISTS (SELECT 1 FROM news_viz v WHERE v.item_id=i.id)"
             " ORDER BY i.score DESC, i.id ASC LIMIT ?",
             (gid, float(now) - SCAN_HOURS * 3600.0, CANDIDATE_MAX),
         ).fetchall()
+        blocked = set(self._active)
+        blocked |= self._reserved(gid)
+        if not blocked:
+            return list(rows)
+        return [r for r in rows if int(r["id"]) not in blocked]
 
     def made_today(self, gid: str, now: float) -> int:
         row = self._store.read().execute(
@@ -306,12 +346,36 @@ class NewsViz:
         ).fetchone()
         return int(row["c"]) if row else 0
 
+    def _in_flight(self, gid: str) -> int:
+        """这个群正在做、还没落库的图解条数（要占名额，并发也不超额）。"""
+        return sum(1 for g in self._active.values() if g == gid)
+
     def has_work(self, group_id: Any, now: float) -> bool:
         gid = str(group_id)
         cap = self._per_day()
-        if cap <= 0 or self.made_today(gid, now) >= cap:
+        if cap <= 0 or self.made_today(gid, now) + self._in_flight(gid) >= cap:
             return False
         return bool(self._candidates(gid, now))
+
+    async def _claim(self, gid: str, iid: int, now: float) -> bool:
+        """占住一条（同一条不会被卡片路径和 _viz_round 同时做）+ 占一个当天名额。
+
+        占不到（已在做 / 名额用完 / viz 关着）返回 False，调用方照旧往下走、不记 skip。
+        """
+        async with self._lock:
+            if iid in self._active:
+                return False
+            cap = self._per_day()
+            if cap <= 0 or self.made_today(gid, now) + self._in_flight(gid) >= cap:
+                return False
+            self._active[iid] = gid
+            return True
+
+    def _release(self, iid: Any) -> None:
+        try:
+            self._active.pop(int(iid), None)
+        except (TypeError, ValueError):
+            pass
 
     async def _pick(self, gid: str, cands: list[Any]) -> int:
         lines = [
@@ -370,26 +434,82 @@ class NewsViz:
             f"原文（程序刚打开的，只以这个为准）：\n{page}"
         )
 
-    async def run(self, group_id: Any, now: Optional[float] = None) -> None:
+    def _rows_for(self, gid: str, item_ids: list[int]) -> list[Any]:
+        """传进来的条目里「该做图解」的那些：本群、通过、news/guide、不是个人向、
+        没有真 image_url（自带配图仍用配图）、还没有任何 news_viz 记录（做过的 / 拒过的不重做）。"""
+        if not item_ids:
+            return []
+        marks = ",".join("?" * len(item_ids))
+        return self._store.read().execute(
+            f"SELECT * FROM news_items i WHERE i.id IN ({marks}) AND i.group_id=? AND i.rejected=0"
+            " AND i.kind IN ('news','guide') AND COALESCE(i.target_user_id,'')=''"
+            " AND COALESCE(i.image_url,'')=''"
+            " AND NOT EXISTS (SELECT 1 FROM news_viz v WHERE v.item_id=i.id)"
+            " ORDER BY i.score DESC, i.id ASC",
+            [*item_ids, gid],
+        ).fetchall()
+
+    async def ensure_for_items(self, group_id: Any, item_ids: Any, *, now: Optional[float] = None,
+                               deadline: Optional[float] = None) -> int:
+        """给指定条目（卡片上的那几条）**先**做图解，返回真做成了几张。
+
+        - 只为传进来的、没有真 image_url 的条目做；已有任何记录（ok/skip/rejected/failed）不重做。
+        - 名额沿用 `viz_per_day`；和 `run` 共用 `_active`，同一条不会同时做两次。
+        - 有 deadline 就不越线：到点就停，不抛异常（剩下的条目回到 `run` 那条路用剩余名额）。
+        - 不调主模型挑（条目已经定了），直接 fetch_page → 子 agent → check_html。
+        """
         gid = str(group_id)
         now = clock.now() if now is None else float(now)
-        if not self.has_work(gid, now):
-            return
-        cands = self._candidates(gid, now)
-        pick = await self._pick(gid, cands)
-        if pick == -2:
-            return
-        for n, r in enumerate(cands):
-            if n != pick:
-                _set(self._store, gid, int(r["id"]), "skip", reason="没挑中", now=now)
-        if pick < 0:
-            return
-        row = cands[pick]
+        ids: list[int] = []
+        for x in item_ids or []:
+            try:
+                ids.append(int(x))
+            except (TypeError, ValueError):
+                continue
+        if not ids:
+            return 0
+        rows = self._rows_for(gid, ids)
+        if not rows:
+            return 0
+        start = clock.now()
+        # deadline 是绝对时刻，但算预算用「进来那一刻起还能花多久」——调用方传的 now
+        # 可能是逻辑时刻，不跟 clock.now() 混着比。
+        budget: Optional[float] = None if deadline is None else max(0.0, float(deadline) - float(now))
+        made = 0
+        for row in rows:
+            iid = int(row["id"])
+            remain = None if budget is None else budget - (clock.now() - start)
+            if remain is not None and remain <= 0:
+                break
+            if not await self._claim(gid, iid, now):
+                break
+            try:
+                if remain is None:
+                    ok = await self._make_one(gid, row, now)
+                else:
+                    try:
+                        ok = await asyncio.wait_for(self._make_one(gid, row, now), timeout=remain)
+                    except asyncio.TimeoutError:
+                        logger.info("图解到截止时间还没做完，这张先不做（群 %s 条 %s）", gid, iid)
+                        break
+                if ok:
+                    made += 1
+            except Exception:
+                logger.exception("图解出错（群 %s 条 %s），这条跳过", gid, iid)
+            finally:
+                self._release(iid)
+        return made
+
+    async def _make_one(self, gid: str, row: Any, now: float) -> bool:
+        """一条：打开原文 → 子 agent 写 HTML → 核对 → 落库。返回是否 ok。
+
+        调用方必须先用 `_claim` 占住这条，并负责 `_release`。
+        """
         iid = int(row["id"])
         url = self._first_url(row)
         if not url:
             _set(self._store, gid, iid, "failed", reason="没有原文链接", now=now)
-            return
+            return False
         from .tools import ToolContext
 
         ctx = ToolContext(group_id=gid, task_id=f"viz:{iid}", actor="图解·打开原文", role="worker")
@@ -400,7 +520,7 @@ class NewsViz:
             logger.info("图解打开原文出错（群 %s 条 %s）：%s", gid, iid, e)
         if got is None or not getattr(got, "ok", False) or not str(getattr(got, "output", "") or "").strip():
             _set(self._store, gid, iid, "failed", reason=f"原文打不开：{getattr(got, 'error', '') or ''}"[:200], now=now)
-            return
+            return False
         page = str(got.output)[:SOURCE_MAX_CHARS]
         try:
             report = await self._workers.run(
@@ -410,17 +530,46 @@ class NewsViz:
         except Exception as e:
             logger.info("图解子 agent 出错（群 %s 条 %s）：%s", gid, iid, e)
             _set(self._store, gid, iid, "failed", reason="子 agent 出错", now=now)
-            return
+            return False
         data = getattr(report, "data", None)
         html = str(data.get("html") or "") if isinstance(data, dict) else ""
         if not getattr(report, "ok", False) or not html.strip():
             _set(self._store, gid, iid, "failed", reason="子 agent 没交回图", now=now)
-            return
+            return False
         source = "\n".join([str(row["title"] or ""), str(row["summary"] or ""), str(row["body"] or ""), page])
         ok, why = check_html(html, source)
         if not ok:
             logger.info("图解没过核对（群 %s 条 %s）：%s", gid, iid, why)
             _set(self._store, gid, iid, "rejected", reason=why, now=now)
-            return
+            return False
         _set(self._store, gid, iid, "ok", html=html.strip(), now=now)
         logger.info("图解做好了（群 %s 条 %s）", gid, iid)
+        return True
+
+    async def run(self, group_id: Any, now: Optional[float] = None) -> None:
+        gid = str(group_id)
+        now = clock.now() if now is None else float(now)
+        if not self.has_work(gid, now):
+            return
+        cands = self._candidates(gid, now)
+        if not cands:
+            return
+        pick = await self._pick(gid, cands)
+        if pick == -2:
+            return
+        if pick < 0:
+            for r in cands:
+                _set(self._store, gid, int(r["id"]), "skip", reason="没挑中", now=now)
+            return
+        row = cands[pick]
+        iid = int(row["id"])
+        if not await self._claim(gid, iid, now):
+            # 卡片路径正在做这条 / 今天的名额刚被占完：不记 skip，下一轮再看
+            return
+        try:
+            for n, r in enumerate(cands):
+                if n != pick:
+                    _set(self._store, gid, int(r["id"]), "skip", reason="没挑中", now=now)
+            await self._make_one(gid, row, now)
+        finally:
+            self._release(iid)

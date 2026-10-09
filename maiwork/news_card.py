@@ -224,11 +224,31 @@ def cover_tint(uri: str) -> dict | None:
         return None
 
 
+def _has_viz(item: dict) -> bool:
+    """这条有没有核对过的图解整页（有就画图解，见 _viz_todo）。"""
+    return bool(str(item.get("viz_html") or "").strip())
+
+
+def _needs_scraped_cover(item: dict) -> bool:
+    """这条该不该去打开原文页抓封面。
+
+    - 已经有 cover 了：不动。
+    - 有核对过的图解、又没自带配图（image_url）：不抓——直接画图解
+      （2026-10 线上问题：临时抓来的封面把库里已经 ok 的图解顶掉了）。
+    - 自带配图（真 image_url）仍用配图；没图解的照旧抓原文封面。
+    """
+    if item.get("cover"):
+        return False
+    if _has_viz(item) and not str(item.get("image_url") or "").strip():
+        return False
+    return bool(item.get("image_url") or item.get("url"))
+
+
 async def prepare_covers(data: dict, *, fetch: Callable | None = None, timeout_s: float = 20.0) -> None:
     """给前 3 条补 cover（并发、总时限）；已有 cover 的不动。就地修改 data。"""
     fetch = fetch or fetch_cover
     items = [it for it in (data.get("items") or []) if isinstance(it, dict)][:3]
-    todo = [it for it in items if not it.get("cover") and (it.get("image_url") or it.get("url"))]
+    todo = [it for it in items if _needs_scraped_cover(it)]
     if not todo:
         return
 

@@ -37,9 +37,16 @@
   仅把待发的本任务成品标 awaited_delivery，不受两项节制、不占额度；
   error / command / admin 即时反馈也不受限。
 - file 传完补一条说明消息（MaiBot 不知道文件是谁发的）；herenow 成功发链接说明。
+- 交付说明消息（note / note+链接 / 只发文字的交付）带上**发起人**：QQ 走真 at 段，
+  Telegram 由 host 退成正文「@名字 」（docs/06）；发起人缺失保持老行为。
 - 交付成功都把链接/文件名放进可提起清单（ttl 6 小时）。
 - 首选渠道失败（failed，不含 uncertain）自动回落备选；两条都失败 → 兜底说明
   「做好了，但发群文件和网页都没成功，成品在 MaiWork 网页里」。
+- file 回落 here.now 的页面必须**手机可读**（线上 T-11 的教训：老页面只有一句
+  「附件：」+ 下载链接，点开什么都看不到）：同目录有同名主干的 .html（X.docx →
+  X.html）或成品目录根有 index.html 就用那份网页当主体，原文件同批发布并保留下载
+  链接；都没有就生成一个内联 CSS、转义过的手机友好页（标题 / 说明 / 文件名+大小 /
+  醒目下载按钮）。页面里绝不写工作区路径或 artifacts/ 这类内部路径。
 - 插件重启 recover()：sending → uncertain（不重放）。
 Fallback 的临时目录放在 settings.workspace_root 下的 .web/.fallback，不进群友可见工作区。
 """
@@ -54,10 +61,12 @@ import re
 import shutil
 import zipfile
 from datetime import timedelta
+from html import escape as _html_escape
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import quote as _url_quote
 
-from . import clock, group_push
+from . import clock, group_push, members
 from .delivery import UNREADABLE_REASON, Mentions, Pushes
 from .host import HostError
 from .models import _redact
@@ -89,6 +98,180 @@ _TTL_EXPIRED_REASON = "超过有效期限，作废"
 # 图片载荷的严格闸（docs/02 §6.5：发进群的东西必须在工作区里、是真 PNG）
 _IMAGE_MAX_BYTES = 8 * 1024 * 1024
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+# 交付说明消息：只有这两种 push_kind 才算「交付」（提问 / 报错 / 卡片不受 @ 发起人影响）
+_DELIVERY_PUSH_KINDS = frozenset(("delivery", "awaited_delivery"))
+# 回落页的候选网页后缀（X.docx → X.html）
+_PAGE_SUFFIXES = (".html", ".htm")
+
+
+def _row_field(row: Any, name: str) -> str:
+    """行里某一列（取不到 → ""）：_due_rows 的行有 task_id，别处不一定。"""
+    try:
+        return str(row[name] or "")
+    except Exception:
+        return ""
+
+
+def _human_size(size: Optional[int]) -> str:
+    """字节数 → 人看的「10 B / 2.0 KB / 3.5 MB」；没有 / 坏值 → ""。"""
+    try:
+        n = int(size)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return ""
+    if n < 0:
+        return ""
+    for unit, step in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if n >= step:
+            return f"{n / step:.1f} {unit}"
+    return f"{n} B"
+
+
+def _download_button_html(name: str, href: str) -> str:
+    """一个醒目的下载按钮（全内联样式，不引外部资源）。"""
+    label = _html_escape(str(name or "原文件"), quote=True)
+    url = _html_escape(str(href or ""), quote=True)
+    return (
+        '<div style="margin:24px 16px 32px;padding:14px 16px;border-radius:14px;'
+        'background:#f2f3f5;text-align:center;font-size:17px;">'
+        '<a style="display:inline-block;padding:14px 26px;border-radius:999px;'
+        'background:#07c160;color:#fff;text-decoration:none;font-weight:600;"'
+        f' href="{url}" download>{label}</a></div>'
+    )
+
+
+def _append_download_button(page: str, name: str) -> str:
+    """同名网页当页面主体时，补一个原文件下载条（页面自己没链它的话）。"""
+    bar = _download_button_html(name, _url_quote(str(name)))
+    idx = page.lower().rfind("</body>")
+    if idx < 0:
+        return page + bar
+    return page[:idx] + bar + page[idx:]
+
+
+# 页面里声明的字符集（<meta charset=...> / <meta http-equiv=... charset=...>）
+_PAGE_CHARSET_RE = re.compile(r"(?i)<meta[^>]*?charset\s*=\s*[\"']?[A-Za-z0-9_\-]+[\"']?")
+
+
+def _read_page_text(path: Path) -> str:
+    """读回落页正文：优先 utf-8，读不动就试 gb18030（老工具产的中文网页）。
+
+    非 utf-8 的页面按 utf-8 重写索引页，所以顺手把页面里声明的字符集也改成 utf-8
+    （否则浏览器按老声明解新文件，中文全是乱码）。
+    """
+    raw = path.read_bytes()
+    for enc in ("utf-8", "gb18030"):
+        try:
+            text = raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+        if enc == "utf-8":
+            return text
+        return _PAGE_CHARSET_RE.sub('<meta charset="utf-8"', text)
+    return raw.decode("utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# 交付说明的兜底措辞（2026-10 docs/26 问题 C，线上 T-10 / T-11）：
+# 和 coordinator.delivery_note_fallback 同一套口径——`<任务标题>弄好了，点开就能看`
+# （file 说「文件在链接里」、text 说「就这几句」），标题里的内部词先刮掉、整句 ≤60 字。
+# 这里是**本地副本**：coordinator import 了 outbox，反向 import 会成环；改措辞时两边一起改。
+# ---------------------------------------------------------------------------
+_NOTE_MAX = 60
+_NOTE_INTERNAL_RE = re.compile(
+    r"T-\d+|job\d|research\.md|steps/|artifacts/|\.py(?![A-Za-z0-9_])", re.IGNORECASE
+)
+_NOTE_SENTENCE_ENDS = "。！？!?；;"
+_NOTE_SOFT_ENDS = "，,、：:"
+_NOTE_BREAKS = _NOTE_SENTENCE_ENDS + _NOTE_SOFT_ENDS
+_NOTE_FALLBACK_SUFFIX = {"file": "弄好了，文件在链接里", "text": "弄好了，就这几句"}
+_NOTE_FALLBACK_SUFFIX_DEFAULT = "弄好了，点开就能看"
+
+
+def _cut_note_at_punctuation(text: str, limit: int = _NOTE_MAX) -> str:
+    """把 text 截到 ≤limit 字：能在句读处收尾就在句读处收（不硬截半句）。"""
+    head = text[:limit]
+    cut = -1
+    for i in range(len(head) - 1, -1, -1):
+        if head[i] in _NOTE_BREAKS:
+            if i + 1 >= limit // 2:  # 太靠前的句读不用，免得只剩半句
+                cut = i
+            break
+    if cut >= 0:
+        if head[cut] in _NOTE_SOFT_ENDS:
+            return head[:cut].strip()
+        return head[:cut + 1].strip()
+    return head.strip()
+
+
+def _note_fallback(task_title: Any, deliver_kind: Any = "view") -> str:
+    """note 空 / 不合格时的人话兜底：`<任务标题>弄好了，点开就能看`（file 说文件在链接里）。
+
+    标题里混进来的内部词（任务号 / 内部文件名）先刮掉，剩下的按句读截；整句 ≤60 字。
+    """
+    kind = str(deliver_kind or "").strip()
+    suffix = _NOTE_FALLBACK_SUFFIX.get(kind, _NOTE_FALLBACK_SUFFIX_DEFAULT)
+    title = " ".join(
+        _NOTE_INTERNAL_RE.sub(" ", " ".join(str(task_title or "").split())).split()
+    )
+    room = _NOTE_MAX - len(suffix)
+    if not title or room <= 0:
+        return suffix
+    if len(title) > room:
+        title = _cut_note_at_punctuation(title, room)
+    return f"{title}{suffix}"
+
+
+def _mobile_delivery_page(*, title: str, note: str, name: str,
+                          size: Optional[int], href: str) -> str:
+    """现生成的手机友好回落页：标题 / 说明 / 文件名+大小 / 醒目下载按钮。
+
+    全内联 CSS、不引外部资源；标题、说明、文件名全部按 HTML 转义（防注入）；
+    页面里只有文件名，不写工作区路径、artifacts/ 这类内部路径。
+    """
+    safe_title = _html_escape(str(title or name or "成品"), quote=True)
+    safe_name = _html_escape(str(name or "附件"), quote=True)
+    safe_note = _html_escape(str(note or ""), quote=True)
+    size_text = _human_size(size)
+    note_html = f'\n  <p class="note">{safe_note}</p>' if safe_note else ""
+    meta = f"文件名：{safe_name}"
+    if size_text:
+        meta += f" · 大小：{_html_escape(size_text, quote=True)}"
+    button = ""
+    tip = ""
+    if href:
+        url = _html_escape(str(href), quote=True)
+        button = f'\n    <a class="btn" href="{url}" download>下载 {safe_name}</a>'
+        tip = '\n  <p class="tip">这个链接 24 小时后过期，请及时保存。</p>'
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{safe_title}</title>
+<style>
+  body {{ margin:0; padding:0; background:#f7f7f8; color:#1a1a1a;
+         font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; }}
+  main {{ max-width:640px; margin:0 auto; padding:28px 18px 40px; }}
+  h1 {{ font-size:22px; line-height:1.4; margin:0 0 12px; word-break:break-word; }}
+  .note {{ font-size:16px; line-height:1.7; margin:0 0 20px; white-space:pre-wrap; word-break:break-word; }}
+  .card {{ background:#fff; border-radius:14px; padding:18px 16px 22px; box-shadow:0 1px 3px rgba(0,0,0,.08); }}
+  .meta {{ font-size:14px; color:#666; margin:0 0 16px; word-break:break-all; }}
+  .btn {{ display:block; text-align:center; padding:16px 20px; border-radius:999px;
+          background:#07c160; color:#fff; font-size:17px; font-weight:600; text-decoration:none; }}
+  .tip {{ font-size:13px; color:#888; margin:18px 0 0; text-align:center; }}
+</style>
+</head>
+<body>
+<main>
+  <h1>{safe_title}</h1>{note_html}
+  <div class="card">
+    <p class="meta">{meta}</p>{button}
+  </div>{tip}
+</main>
+</body>
+</html>
+"""
 
 
 class OutboxPayloadError(HostError):
@@ -749,6 +932,11 @@ class Outbox:
             extra = {}
             at_user = str(payload.get("at_user") or "")
             at_name = str(payload.get("at_name") or "")
+            if not at_user and not at_name and self._is_delivery_text(payload):
+                # 交付说明消息带上发起人（只 @ 本人、不加别的信息）；缺失 → 保持老行为
+                who = self._requester_at(gid, _row_field(row, "task_id"))
+                at_user = str(who.get("at_user") or "")
+                at_name = str(who.get("at_name") or "")
             if at_user or at_name:
                 extra = {"at_user": at_user, "at_name": at_name}
             res = await self._host.send_text(
@@ -847,6 +1035,108 @@ class Outbox:
         ).fetchone()
         return str(row["result"]) if row is not None else "{}"
 
+    # ------------------------------------------------------------------
+    # 交付说明 @ 发起人（docs/06：QQ 走真 at 段，Telegram 退成正文「@名字 」）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_delivery_text(payload: dict) -> bool:
+        """这条文字是不是「交付说明」（只发文字的交付 / note / note+链接）。"""
+        return str((payload or {}).get("push_kind") or "") in _DELIVERY_PUSH_KINDS
+
+    def _requester_at(self, group_id: str, task_id: Any) -> dict:
+        """任务发起人的 at 参数：{"at_user", "at_name"}。
+
+        只按**本群**这个任务查（不跨群）；发起人 id 缺失 / 查不到 / 读库失败 → {}，
+        调用方保持老行为（不 @）。显示名优先用名册当前名，查不到回落任务里的老快照。
+        """
+        gid = str(group_id or "").strip()
+        tid = str(task_id or "").strip()
+        if not gid or not tid:
+            return {}
+        try:
+            row = self._store.read().execute(
+                "SELECT requester_id, requester_name FROM tasks WHERE id=? AND group_id=?",
+                (tid, gid),
+            ).fetchone()
+        except Exception:
+            logger.debug("读任务发起人失败（任务 %s），这条不 @", tid, exc_info=True)
+            return {}
+        if row is None:
+            return {}
+        uid = str(row["requester_id"] or "").strip()
+        if not uid:
+            return {}
+        name = str(row["requester_name"] or "").strip()
+        try:
+            name = str(members.name_of(self._store, gid, uid, fallback=name) or "").strip()
+        except Exception:
+            logger.debug("读名册名字失败（任务 %s），用老快照", tid, exc_info=True)
+        return {"at_user": uid, "at_name": name}
+
+    def _task_title(self, task_id: Any) -> str:
+        """任务标题（回落页的 h1）；查不到 → ""。"""
+        tid = str(task_id or "").strip()
+        if not tid:
+            return ""
+        try:
+            row = self._store.read().execute(
+                "SELECT title FROM tasks WHERE id=?", (tid,)
+            ).fetchone()
+        except Exception:
+            return ""
+        return str(row["title"] or "").strip() if row is not None else ""
+
+    def _task_artifact_root(self, row: Any) -> Optional[Path]:
+        """这个任务的成品目录 <工作区>/artifacts/<任务号>；查不到 → None。"""
+        tid = _row_field(row, "task_id").strip()
+        if not tid:
+            return None
+        try:
+            task = self._store.read().execute(
+                "SELECT workspace FROM tasks WHERE id=?", (tid,)
+            ).fetchone()
+        except Exception:
+            return None
+        if task is None:
+            return None
+        ws_name = str(task["workspace"] or "").strip()
+        if not ws_name:
+            return None
+        root = Path(getattr(self._get_settings(), "workspace_root", Path("data/workspaces")))
+        try:
+            return (root / ws_name / "artifacts" / tid).resolve()
+        except OSError:
+            return None
+
+    @staticmethod
+    def _pick_fallback_page(src: Path, artifact_root: Optional[Path]) -> Optional[Path]:
+        """回落页主体：成品自己的 .html → 同名主干的 .html（X.docx → X.html）→ 成品目录根 index.html。
+
+        只认普通文件、不认符号链接（和工作区其它闸同一个口径）；都没有 → None（现生成页面）。
+        """
+        def ok(p: Optional[Path]) -> bool:
+            if p is None:
+                return False
+            try:
+                return p.is_file() and not p.is_symlink()
+            except OSError:
+                return False
+
+        if ok(src) and src.suffix.lower() in _PAGE_SUFFIXES:
+            return src
+        if src.suffix:
+            for suf in _PAGE_SUFFIXES:
+                cand = src.with_suffix(suf)
+                if ok(cand):
+                    return cand
+        if artifact_root is not None:
+            for suf in _PAGE_SUFFIXES:
+                cand = artifact_root / f"index{suf}"
+                if ok(cand):
+                    return cand
+        return None
+
     def _fallback_dir(self) -> Path:
         """回落材料（zip、附件页）的临时存放处：workspace_root/.web/.fallback。"""
         settings = self._get_settings()
@@ -915,24 +1205,47 @@ class Outbox:
                     task_id=tid,
                 )
             elif fb_kind == "herenow":
-                # 群文件发不出去 → herenow 附件页：临时目录放 index.html + 原文件一起发布
+                # 群文件发不出去 → here.now 回落页：优先用同目录的手机版网页当主体
+                # （T-11 的教训），没有就现生成一个手机友好页；原文件同批发布并保留
+                # 下载链接（页面里绝不放工作区路径 / artifacts/ 这类内部路径）。
                 src = Path(str(fb.get("path") or ""))
                 name = str(fb.get("name") or src.name or "附件")
                 d = self._fallback_dir() / f"hn-{int(row['id'])}"
                 if d.exists():
                     shutil.rmtree(d)
                 d.mkdir(parents=True, exist_ok=True)
+                copied = False
+                size: Optional[int] = None
                 if src.is_file() and not src.is_symlink():
                     # 符号链接不复制（S3：会跟着链接读到工作区外的文件）
-                    target = d / name
-                    shutil.copyfile(src, target)
-                    page = (
-                        "<!doctype html><html><head><meta charset='utf-8'>"
-                        f"<title>{name}</title></head><body>"
-                        f"<p>附件：</p><p><a href='{name}' download>{name}</a></p>"
-                        "</body></html>"
+                    shutil.copyfile(src, d / name)
+                    copied = True
+                    try:
+                        size = int(src.stat().st_size)
+                    except OSError:
+                        size = None
+                page_src = self._pick_fallback_page(src, self._task_artifact_root(row))
+                page = ""
+                if page_src is not None:
+                    try:
+                        page = _read_page_text(page_src)
+                    except OSError as e:
+                        logger.warning("回落页读不出来，改用生成的页面：%s（%s）", page_src, e)
+                        page = ""
+                href = _url_quote(name) if copied else ""
+                if not page.strip():
+                    # 没有可用网页 → 现生成一个手机能看的页面（标题 / 说明 / 文件名+大小 / 下载按钮）
+                    page = _mobile_delivery_page(
+                        title=self._task_title(_row_field(row, "task_id")) or name,
+                        note=fb_note,
+                        name=name,
+                        size=size,
+                        href=href,
                     )
-                    (d / "index.html").write_text(page, encoding="utf-8")
+                elif copied and name and name not in page:
+                    # 那份网页自己没链原文件 → 补一个下载条，别让下载入口丢了
+                    page = _append_download_button(page, name)
+                (d / "index.html").write_text(page, encoding="utf-8")
                 self.enqueue(
                     f"{row['key']}:fallback",
                     gid,
@@ -1407,7 +1720,8 @@ class Delivery:
         if any(_is_artifact_outbox_row(r["kind"], str(r["key"])) for r in existing):
             return False
         kind = str(task["delivery_kind"] or "")
-        note = f"做好了：{str(task['title'] or '请查看成品')}"[:300]
+        # 兜底措辞和 coordinator 的交付说明同一套（本地 _note_fallback，不 import coordinator）
+        note = _note_fallback(task["title"], kind)
         if kind == "text":
             self._outbox.enqueue(
                 f"task:{tid}:deliver:text", gid, "text",

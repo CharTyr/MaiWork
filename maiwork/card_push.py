@@ -36,6 +36,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -53,6 +54,13 @@ LEGACY_KV_PREFIX = group_push.LEGACY_KV_PREFIX
 GROUP_PUSH_KV_PREFIX = group_push.KV_PREFIX
 
 EXPIRE_S = 12 * 3600.0
+# 画卡前先给卡片条目补图解，最多等这么久（2026-10 线上问题：同一批资讯同时触发
+# 「卡片长活」和「图解长活」，互不等待，卡片几秒画完、图解要 47 秒 ~ 13 分钟，
+# 所以发群的卡片从来没带过图解）。等待有上限，且远小于 12 小时的 TTL；
+# 想调就改这个常量（不为它新增 config 项）。
+CARD_VIZ_WAIT_S = 150.0
+# 快到 TTL 时宁可不等图解、直接画卡，也不能把这张卡等到过期（发件箱会作废）。
+CARD_VIZ_TAIL_S = 30.0
 # 卡片图落盘缓存的保留期：发完（或失败 / 作废）之后这么久可以删（app._prune_round 每天跑）
 PRUNE_AGE_S = 7 * 86400.0
 _MEMO_TTL_S = 6 * 3600
@@ -248,6 +256,8 @@ class CardPush:
         *,
         renderer: Optional[Renderer] = None,
         outbox: Any = None,
+        viz: Any = None,
+        viz_wait_s: float = CARD_VIZ_WAIT_S,
     ) -> None:
         self._store = store
         self._host = host
@@ -258,6 +268,39 @@ class CardPush:
         self._outbox: Any = None
         if outbox is not None:
             self.attach_outbox(outbox)
+        # 图解模块（news_viz.NewsViz）：画卡前先给卡片条目补图解，见 _viz_first
+        self._viz: Any = None
+        self._viz_wait_s = float(viz_wait_s)
+        if viz is not None:
+            self.attach_viz(viz)
+
+    def attach_viz(self, viz: Any) -> None:
+        """接上图解模块（app 建好 NewsViz 之后调，幂等）。
+
+        装配顺序上 NewsViz 比 CardPush 晚一步建，所以是「补接」而不是构造参数。
+        顺带告诉图解模块「哪些条目正在等卡片」——那些条目归卡片路径先做，
+        `_viz_round` 这一轮别抢、也别把它们记成 skip。
+        """
+        self._viz = viz
+        setter = getattr(viz, "set_reserved_getter", None)
+        if callable(setter):
+            setter(self.pending_item_ids)
+
+    def pending_item_ids(self, gid: str) -> set[int]:
+        """这个群「待发（还没备料）」的卡片条目 id。
+
+        图解模块用它在 `_viz_round` 里避开这些条目：名额和时机都先给卡片路径。
+        """
+        rows = self._store.read().execute(
+            "SELECT item_ids FROM news_cards WHERE group_id=? AND status='pending'", (str(gid),)
+        ).fetchall()
+        out: set[int] = set()
+        for r in rows:
+            try:
+                out.update(int(x) for x in json.loads(r["item_ids"] or "[]"))
+            except (TypeError, ValueError):
+                continue
+        return out
 
     def attach_outbox(self, outbox: Any) -> None:
         """接上发件箱（app 建好 Outbox 之后调一次）：卡片只入队，发出去之后回写。"""
@@ -436,6 +479,40 @@ class CardPush:
         d.mkdir(parents=True, exist_ok=True)
         return d / f"card-{int(cid)}.png"
 
+    def _viz_budget(self, created: float, moment: float) -> float:
+        """这次愿意为图解等多久：默认上限 CARD_VIZ_WAIT_S，且给发件箱留 CARD_VIZ_TAIL_S。
+
+        快到 12 小时 TTL 时直接归零——宁可这次不带图解，也绝不把卡片等到过期作废。
+        """
+        left = float(created) + EXPIRE_S - float(moment) - CARD_VIZ_TAIL_S
+        return max(0.0, min(float(self._viz_wait_s), left))
+
+    async def _viz_first(self, gid: str, item_ids: list[int], moment: float, created: float) -> None:
+        """画卡前先给这批条目补图解；有上限地等，超时 / 出错照旧画图发出。
+
+        绝不阻塞、绝不抛异常到调用方（卡片不能因为图解没做好就不发）。
+        """
+        viz = self._viz
+        if viz is None or not item_ids:
+            return
+        ensure = getattr(viz, "ensure_for_items", None)
+        if not callable(ensure):
+            return
+        budget = self._viz_budget(created, moment)
+        if budget <= 0:
+            return
+        try:
+            # 双保险：ensure 自己按 deadline 收手（能保住已做成的那些）；
+            # 这里再硬等一次，防止实现不听话时卡住卡片。
+            await asyncio.wait_for(
+                ensure(gid, list(item_ids), now=float(moment), deadline=float(moment) + budget),
+                timeout=budget,
+            )
+        except asyncio.TimeoutError:
+            logger.info("等图解超时（群 %s，等了 %.0f 秒），照旧画卡片", gid, budget)
+        except Exception:
+            logger.exception("画卡前补图解出错（群 %s），照旧画卡片", gid)
+
     async def flush(self, group_id: Any, now: Optional[float] = None) -> None:
         """把到点的待发卡片「备料 + 入队」（真正发出去由发件箱那一轮做）。
 
@@ -489,9 +566,13 @@ class CardPush:
             if not live:
                 self._set(cid, status="dropped", error="要发的条目都发过或被撤下了")
                 continue
+            live_ids = [int(r["id"]) for r in live]
+            # 先图解、再画卡（2026-10 线上问题）：图解长活和卡片长活本来互不等待，
+            # 卡片画图时图解还没做好，发到群里的卡片从来没带过图解。等一小会儿
+            # （有上限、远小于 TTL），超时 / 失败就照旧画卡发出。
+            await self._viz_first(gid, live_ids, moment, float(row["created"]))
             link = group_link(self._store, self._get_settings(), gid)
             data = self._card_data(gid, live, int(row["batch_id"]), link)
-            live_ids = [int(r["id"]) for r in live]
             png: bytes = b""
             try:
                 png = await self._render(data)

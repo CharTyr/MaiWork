@@ -11,7 +11,7 @@ privacy.scrub(group_id, text, store)：
 - profile 模型 add/update 条目：被拒 → 丢这一条；
 - feeds 资讯 why / body / reason / audience、构想 body·basis：被拒 → 丢这一条；
 - topics 开场白：被拒 → 不发；
-- coordinator 交付说明：被拒 → 换兜底「做好了：<任务标题>」；
+- coordinator 交付说明：被拒 → 换兜底「<任务标题>弄好了，点开就能看」；
 - profile 提示词里关注成员名单只在 personal_profile 为真时给。
 persona 的 summary 也进片段来源（note 和它同步，但库里可能只存了 persona）。"""
 
@@ -243,8 +243,9 @@ class TestCoordinatorNoteScrubbed:
         )
         # 名字本身放行（2026-09-27 调整）
         assert coord._scrub_note(GID, f"做好了，{MEMBER_NAME}看看", "整理 NAS 清单") == f"做好了，{MEMBER_NAME}看看"
-        # note 片段仍拦 → 兜底「做好了：<任务标题>」
-        assert coord._scrub_note(GID, "给备考注册建筑师考试的朋友顺了一份", "整理 NAS 清单") == "做好了：整理 NAS 清单"
+        # note 片段仍拦 → 换成人话兜底（按任务标题生成，不含任何成员信息）
+        assert coord._scrub_note(GID, "给备考注册建筑师考试的朋友顺了一份", "整理 NAS 清单") == \
+            "整理 NAS 清单弄好了，点开就能看"
         # 干净 → 原样
         assert coord._scrub_note(GID, "做好了，清单在链接里", "整理 NAS 清单") == "做好了，清单在链接里"
 
