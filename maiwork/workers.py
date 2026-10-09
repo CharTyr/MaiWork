@@ -445,6 +445,14 @@ RESEARCH_REPORT_FRAMEWORK = (
     "对关联未知的机构，不写成已证实由同一攻击者所为。"
 )
 
+# 线上 T-11：成品里出现了 job1 / research.md / T-11 / 「上一步」「主模型」这些内部说法，
+# 群友看得见。由 coordinator._enrich_brief 追加到**每条活**（调研 + 制作）的 brief 末尾。
+AUDIENCE_NOTE = (
+    "成品是给群友看的：不写 job 编号、不写 research.md / artifacts/ 这类文件路径、"
+    "不写任务号、不写「上一步」「主模型」「子 agent」这类内部说法——"
+    "要引用别的东西就说清是什么（比如「第 1 步查到的资料」「这次的调研记录」）。"
+)
+
 
 @dataclass
 class WorkerReport:

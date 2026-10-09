@@ -943,7 +943,7 @@ async def test_host_call_adapter_passthrough() -> None:
     name, kw = ctx.calls[0]
     assert kw["api_name"] == "adapter.napcat.file.get_group_root_files"
     assert kw["version"] == "1"
-    assert kw["args"] == {"group_id": GID}
+    assert kw["args"] == {"params": {"group_id": GID}}  # 适配器 1.x 动作直通接口
     # retcode 非 0 → HostError
     ctx2 = FakeCtx({"api.call": {"status": "failed", "retcode": 100, "data": {}}})
     with pytest.raises(HostError):

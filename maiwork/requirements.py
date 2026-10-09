@@ -10,7 +10,10 @@
 - `is_blocking(item)`：必须项 = `原话` + `底线`；加分项 = `补充`。
 - `criteria_texts(items)`：给网页 / 任务 criteria 用的文本（去掉底线，补充项标「（加分项）」）。
 - `judge(items, verdicts)`：**代码算过没过**。一条算「做到」必须 `met is True` 且给了证据
-  （去空白后 ≥2 字）；模型漏判某条必须项 = 没做到。模型自己给的 `pass` 只作参考。
+  （去空白后 ≥2 字）；模型漏判某条必须项 = 没做到。**原话**必须项的 `met=true` 但证据里是
+  「未覆盖 / 不另扩搜 / 待补充 / 需另开一次调研」这类「没去做」的写法 → 也算没做到
+  （`WHY_PLACEHOLDER`，线上 T-11；「查不到」本身不是标记词，写清查过哪里是合法的）；
+  底线 R0 和补充项不受这条规则影响。模型自己给的 `pass` 只作参考。
 - `human_unmet(judgement, verdicts)`（第三期 §5 A）：没做到的必须项里带 `needs_human`
   （去空白后 ≥ `NEEDS_HUMAN_MIN`=6 字）的那些——「需要真人参与、材料已备好」的出口。
 - `with_brief_scale(items)`（docs/26 问题 C）：规模档 brief 时由代码往已锁定的清单里加一条
@@ -49,6 +52,17 @@ _KINDS = ("实做", "文稿", "真人")
 WHY_NOT_MET = "判定没做到"
 WHY_NO_EVIDENCE = "没给证据"
 WHY_NOT_JUDGED = "验收没判这一条"
+# 线上 T-11：原话必须项写成「这块没覆盖 / 本次不另扩搜 / 待补充：需另开一次调研」——
+# 明说了「没去做」，不得算做到（「查过但查不到、并写清查过哪里」是合法的，不算留空）。
+WHY_PLACEHOLDER = "只写了没覆盖/待补，内容没做"
+PLACEHOLDER_MARKERS = (
+    "未覆盖", "不另扩搜", "不扩搜", "不展开", "此处不写", "待补充",
+    "需另开", "另开一次", "未收录", "留待后续", "占位",
+)
+
+# 计划覆盖（线上 T-11）：job 用 `covers` 声明自己负责哪几条需求；代码把没被任何 job
+# 覆盖到的**原话**必须项补成一行指令，追加进合适的 job brief。
+COVERS_HINT_PREFIX = "另外必须为这些要求取材/产出："
 
 
 def _clean_text(value: Any, limit: int) -> str:
@@ -136,11 +150,29 @@ def criteria_texts(items: Any) -> list[str]:
     return out
 
 
+def placeholder_marker(text: Any) -> str:
+    """证据里有没有「没去做」的标记词（去空白后找）；返回命中的第一个，没有 → ''。
+
+    只认 `PLACEHOLDER_MARKERS`（未覆盖 / 不另扩搜 / 待补充 / 需另开一次调研 / 占位…）。
+    **「查不到」「未确认」本身不是标记词**：查过之后如实写清「查过哪些地方、没查到」是
+    合法的证据，不许当留空。
+    """
+    folded = " ".join(str(text or "").split())
+    for marker in PLACEHOLDER_MARKERS:
+        if marker in folded:
+            return marker
+    return ""
+
+
 def judge(items: Any, verdicts: Any) -> dict:
     """代码按规则算过没过（模型的 pass 不参与）。
 
     返回 {"pass", "unmet_blocking", "unmet_bonus", "met"}；
-    `why` ∈ {"判定没做到", "没给证据", "验收没判这一条"}。
+    `why` ∈ {"判定没做到", "没给证据", "验收没判这一条", "只写了没覆盖/待补，内容没做"}。
+
+    线上 T-11：**原话**必须项 `met=true` 但证据里是「这块没覆盖 / 本次不另扩搜 / 待补充」
+    这类「没去做」的写法 → 判没做到。底线 R0 和补充项不受这条规则影响（`is_blocking`
+    之外的项不进通过公式；底线只要求「内容真实、能打开」，不查留空措辞）。
     """
     by_id: dict[str, dict] = {}
     if isinstance(verdicts, list):
@@ -170,6 +202,12 @@ def judge(items: Any, verdicts: Any) -> dict:
         elif len(str(verdict.get("evidence") or "").strip()) < EVIDENCE_MIN:
             # met=true 但没给证据 = 没做到（只拿一句「做了」不算数）
             ok, why = False, WHY_NO_EVIDENCE
+        elif (
+            str(item.get("origin") or "") == ORIGIN_ORIGINAL
+            and placeholder_marker(verdict.get("evidence"))
+        ):
+            # 线上 T-11：原话必须项只写「没覆盖 / 不另扩搜 / 待补充」= 内容没做
+            ok, why = False, WHY_PLACEHOLDER
         else:
             ok, why = True, ""
         if ok:
@@ -258,6 +296,56 @@ def with_brief_scale(items: Any) -> list[dict]:
         base = str(floor.get("text") or "").strip() or FLOOR_TEXT
         floor["text"] = f"{base}；{BRIEF_SCALE_TEXT}"
     return rows
+
+
+def covered_ids(jobs: Any) -> set[str]:
+    """所有 job 的 `covers` 声明的需求 id（去空白、统一大写，便于对上 R1/r1）。"""
+    out: set[str] = set()
+    for job in jobs if isinstance(jobs, list) else []:
+        if not isinstance(job, dict):
+            continue
+        covers = job.get("covers")
+        for raw in covers if isinstance(covers, list) else []:
+            key = str(raw or "").strip().upper()
+            if key:
+                out.add(key)
+    return out
+
+
+def uncovered_required(items: Any, jobs: Any) -> list[dict]:
+    """计划里没有任何 job 的 `covers` 覆盖到的**原话**必须项（不含底线 R0、不含补充）。
+
+    纯函数，任何输入都不抛。**所有 job 都没给 covers → 返回 []**（兼容旧模型 / 旧行为：
+    没有声明就没有「没覆盖」这回事，不许凭空往 brief 里塞指令）。
+    """
+    covered = covered_ids(jobs)
+    if not covered:
+        return []
+    out: list[dict] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("origin") or "") != ORIGIN_ORIGINAL:
+            continue
+        iid = str(item.get("id") or "").strip()
+        if not iid or iid.upper() in covered:
+            continue
+        out.append({"id": iid, "text": str(item.get("text") or "")})
+    return out
+
+
+def covers_instruction(missing: Any) -> str:
+    """没被覆盖的原话必须项 → 一行补充指令（`COVERS_HINT_PREFIX` + `R2 文本；R3 文本`）。"""
+    parts: list[str] = []
+    for item in missing if isinstance(missing, list) else []:
+        if not isinstance(item, dict):
+            continue
+        line = f"{item.get('id')} {item.get('text')}".strip()
+        if line:
+            parts.append(line)
+    if not parts:
+        return ""
+    return COVERS_HINT_PREFIX + "；".join(parts)
 
 
 def kv_key(task_id: Any) -> str:

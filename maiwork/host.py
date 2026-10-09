@@ -24,6 +24,18 @@ logger = logging.getLogger("maiwork.host")
 _DEFAULT_TIMEOUT_S = 10.0
 _KNOWLEDGE_TIMEOUT_S = 15.0
 
+# 适配器里按关键字收参的接口（SnowLuma 适配器 1.x 线上源码 apis/group.py，2026-10-10 读过）；
+# 其余 adapter.napcat.* 动作直通接口签名是 api_action_xxx(params=None)，参数整包放 params。
+_TYPED_ADAPTER_APIS = frozenset({
+    "adapter.napcat.group.get_group_info",
+    "adapter.napcat.group.get_group_member_info",
+    "adapter.napcat.group.get_group_member_list",
+})
+# 参数形状不对时宿主转回的 TypeError 文本（Python 参数绑定失败，动作还没执行）
+_SHAPE_MISMATCH_RE = re.compile(
+    r"unexpected keyword argument|missing \d+ required (?:positional|keyword-only) argument"
+)
+
 
 # ---------------------------------------------------------------------------
 # 数据结构
@@ -129,6 +141,8 @@ class Host:
         self._session_cache: dict[str, str] = {}
         # session_id → 平台（session_for_group 解析时记下），发消息 / 读消息按它认平台
         self._session_platform: dict[str, str] = {}
+        # 适配器接口名 → 实测收得下的参数形状（"params" / "flat"），见 _api_call
+        self._api_shape: dict[str, str] = {}
         # 群号 → 平台（app 启动时接上 settings.platform_of）；没接就当 qq（老行为）
         self._platform_resolver: Any = None
 
@@ -198,6 +212,51 @@ class Host:
             logger.warning("宿主能力 %s 调用失败: %s", capability, type(exc).__name__)
             raise HostError(f"调用宿主能力失败: {capability}") from exc
         return result
+
+    # ------------------------------------------------------------------
+    # 适配器 api.call（参数形状 + 失败不吞）
+    # ------------------------------------------------------------------
+
+    async def _api_call(
+        self,
+        api_name: str,
+        args: dict[str, Any],
+        timeout_s: float = _DEFAULT_TIMEOUT_S,
+    ) -> Any:
+        """调适配器公开 API；返回 SDK 解包后的 result。
+
+        - 形状：SnowLuma 适配器 1.x 的「动作直通」接口（群文件 / 公告 / 相册……）签名是
+          `api_action_xxx(params=None)`，参数要整包放进 `params`；`_TYPED_ADAPTER_APIS`
+          里的按关键字收参。老适配器（0.8.x）全是平铺。默认按名字猜，宿主报「多了 / 少了
+          关键字」（参数绑定失败，动作根本没执行）就换另一种形状重试一次，成功后记住。
+        - 失败：宿主 api.call 失败返回 `{"success": False, "error": ...}`，这里抛 HostError
+          （带宿主给的原因，截短），不再当成功吞掉。
+        """
+        name = str(api_name)
+        flat = dict(args or {})
+        learned = self._api_shape.get(name)
+        if learned is None:
+            learned = "flat" if name in _TYPED_ADAPTER_APIS else "params"
+        shapes = [learned, "flat" if learned == "params" else "params"]
+        last_error = ""
+        for i, shape in enumerate(shapes):
+            call_args = {"params": flat} if shape == "params" else flat
+            result = await self._call(
+                "api.call",
+                timeout_s=timeout_s,
+                api_name=name,
+                version="1",
+                args=call_args,
+            )
+            if isinstance(result, dict) and result.get("success") is False:
+                last_error = str(result.get("error") or "").strip()
+                if i == 0 and _SHAPE_MISMATCH_RE.search(last_error):
+                    logger.info("适配器接口 %s 不收 %s 形状的参数，换一种再试", name, shape)
+                    continue
+                raise HostError(f"{name} 失败: {last_error[:200] or '宿主没说原因'}")
+            self._api_shape[name] = shape
+            return result
+        raise HostError(f"{name} 失败: {last_error[:200] or '参数形状都不对'}")
 
     # ------------------------------------------------------------------
     # messages()
@@ -496,11 +555,8 @@ class Host:
                     return {"name": name, "member_count": 0}
             return {}
         try:
-            result = await self._call(
-                "api.call",
-                api_name="adapter.napcat.group.get_group_info",
-                version="1",
-                args={"group_id": group_id},
+            result = await self._api_call(
+                "adapter.napcat.group.get_group_info", {"group_id": group_id}
             )
         except HostError:
             return {}
@@ -608,12 +664,10 @@ class Host:
         """上传群文件。上传不幂等：绝不重试。"""
         if not has_onebot(self._plat(group_id, platform)):
             raise HostError("这个平台不支持上传群文件（适配器没有群文件接口），走网页链接交付")
-        result = await self._call(
-            "api.call",
+        result = await self._api_call(
+            "adapter.napcat.file.upload_group_file",
+            {"group_id": group_id, "file": path, "name": name},
             timeout_s=timeout_s + 5.0,
-            api_name="adapter.napcat.file.upload_group_file",
-            version="1",
-            args={"group_id": group_id, "file": path, "name": name},
         )
         if not isinstance(result, dict):
             raise HostError("adapter.napcat.file.upload_group_file 返回格式异常")
@@ -638,11 +692,9 @@ class Host:
     async def group_file_url(self, group_id: str, file_id: str, *, platform: str | None = None) -> str:
         if not has_onebot(self._plat(group_id, platform)):
             raise HostError("这个平台不支持取群文件链接（适配器没有群文件接口），走网页链接交付")
-        result = await self._call(
-            "api.call",
-            api_name="adapter.napcat.file.get_group_file_url",
-            version="1",
-            args={"group_id": group_id, "file_id": file_id},
+        result = await self._api_call(
+            "adapter.napcat.file.get_group_file_url",
+            {"group_id": group_id, "file_id": file_id},
         )
         if isinstance(result, dict):
             data = result.get("data") if isinstance(result.get("data"), dict) else result
@@ -718,13 +770,7 @@ class Host:
         gid = str((args or {}).get("group_id") or "")
         if not has_onebot(self._plat(gid, platform)):
             raise HostError("这个平台的适配器没有 api.call 接口，不支持这个功能")
-        result = await self._call(
-            "api.call",
-            timeout_s=timeout_s,
-            api_name=str(api_name),
-            version="1",
-            args=dict(args or {}),
-        )
+        result = await self._api_call(str(api_name), dict(args or {}), timeout_s=timeout_s)
         if not isinstance(result, dict):
             raise HostError(f"{api_name} 返回格式异常")
         status = str(result.get("status") or "").lower()
@@ -745,11 +791,9 @@ class Host:
         if not has_onebot(self._plat(group_id, platform)):
             return ""
         try:
-            result = await self._call(
-                "api.call",
-                api_name="adapter.napcat.group.get_group_member_info",
-                version="1",
-                args={"group_id": group_id, "user_id": user_id},
+            result = await self._api_call(
+                "adapter.napcat.group.get_group_member_info",
+                {"group_id": group_id, "user_id": user_id},
             )
         except HostError:
             return ""
@@ -775,11 +819,9 @@ class Host:
         if not has_onebot(self._plat(group_id, platform)):
             return {}
         try:
-            result = await self._call(
-                "api.call",
-                api_name="adapter.napcat.group.get_group_member_info",
-                version="1",
-                args={"group_id": group_id, "user_id": user_id},
+            result = await self._api_call(
+                "adapter.napcat.group.get_group_member_info",
+                {"group_id": group_id, "user_id": user_id},
             )
         except HostError:
             return {}

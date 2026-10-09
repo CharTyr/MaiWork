@@ -67,7 +67,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
-from . import clock, compaction, members, requirements
+from . import clock, compaction, deliverable_check, members, requirements
 from .goals import chat_evidence_match as _chat_evidence_match
 from .host import HostError
 from .lanes import TaskLanes, prepare_history
@@ -846,6 +846,37 @@ def _requirements_review_text(judgement: dict, model_review: Any) -> str:
     return text
 
 
+def _deliverable_issue_review(scan: Any, review_text: Any) -> str:
+    """成品扫描命中 → 拼一段大白话返工意见（线上 T-11），放在验收意见最前面。
+
+    「命中片段 + 要怎么改」都由代码写清：留空 → 补内容、查不到就写清查过哪里；
+    内部用语 → 换成群友看得懂的说法。原来的「通过」结论换掉，不写成「通过，但……」。
+    """
+    parts: list[str] = []
+    data = scan if isinstance(scan, dict) else {}
+    placeholder = [str(x) for x in (data.get("placeholder") or []) if str(x)]
+    internal = [str(x) for x in (data.get("internal") or []) if str(x)]
+    if placeholder:
+        parts.append(
+            "成品里还留着「没做」的写法：" + "；".join(placeholder)
+            + "。补上原话要的内容；确实查不到就写清查过哪里（写清「查不到」本身是可以的）。"
+        )
+    if internal:
+        parts.append(
+            "成品里有群友看不懂的内部用语：" + "；".join(internal)
+            + "。把 job1、research.md 这类内部用语换成群友看得懂的说法"
+            "（要引用就说清是什么，比如「第 1 步查到的资料」）。"
+        )
+    head = "（成品检查没过）" + "".join(parts)
+    base = " ".join(str(review_text or "").split())
+    if base.startswith("通过"):
+        base = base[len("通过"):].lstrip("；;，, ")
+    if base.startswith("没过"):
+        # 已经是「没过：…」的形态：把成品检查的说明并进同一条，别叠两个结论
+        base = base[len("没过"):].lstrip("：:；; ")
+    return (head + base) if base else head
+
+
 def _parse_plan_json(text: Any) -> Any:
     """解析计划回合的 JSON 文本（容忍 ```json 代码围栏；带工具时模型爱加）。
 
@@ -1584,6 +1615,16 @@ class Coordinator:
             "用户明确要求深入调研、完整盘点或网页时，仍按原话做到；不能用省时作理由漏掉硬性要求。"
             "补充项只能服务原始需求，不得把可选展示形式变成额外必做工作。"
         )
+        # 线上 T-11：主模型只派「核实四项」+「照 job1 做成品、不另扩搜」两步，关键节点 /
+        # 结局 / 电波梗三块在成品里写成「未覆盖该范围」——「停止扩搜」被拿来跳过必须项。
+        prompt_lines.append(
+            "（上面说的「停止扩搜」只针对加分项和旁支，不是用来跳过必须项的："
+            "需求清单里**每条原话必须项要的内容**都必须有一步活负责取材或产出；"
+            "制作步不许用「不另扩搜」当理由跳过调研步没覆盖的必须项内容——"
+            "需要就再排一条调研活，或把要产出的内容写进那一步的 brief 里。"
+            '每条活用 "covers" 写清它负责清单里的哪几条（如 "covers": ["R2", "R3"]），'
+            "排完自己核对一遍：原话必须项有没有一条没人负责。）"
+        )
         # docs/26 问题 C：规模档按原话定——防止一句「搜搜」被升级成全景报告，也不让
         # 明确要报告的任务缩水。代码对 brief 还有硬闸（text + 最多 1 条活）。
         prompt_lines.append(
@@ -1639,6 +1680,8 @@ class Coordinator:
             ' "type": "research|build|other"（research=要查资料出结论的活：调研、对比、盘点、「大家怎么看」、找现状/口碑；'
             'build=做东西；other=其它）,'
             ' "tools": ["子 agent 工具名单里的名字"],'
+            + ' "covers": ["这条活负责清单里的哪几条：写 R1 / R2 这样的编号；'
+            '每条原话必须项都要有活负责，制作步不许用「不另扩搜」跳过调研步没覆盖的必须项"],'
             + agent_field_doc
             + ' "after": ["要用前一步的产出（比如先调研、再按调研做页面）时写这个：'
             '前一步 jobs 的编号（第 1 个是 1），可以写 1 个或几个；'
@@ -1853,6 +1896,11 @@ class Coordinator:
                     "after": list(j.get("after") or []) if isinstance(j.get("after"), list) else [],
                     "agent": job_agent,
                     "reuse": job_reuse,
+                    # 线上 T-11：这条活负责清单里的哪几条（代码用它核对原话必须项有没有人管）
+                    "covers": [
+                        str(x).strip() for x in (j.get("covers") or [])
+                        if str(x).strip()
+                    ] if isinstance(j.get("covers"), list) else [],
                 })
         self._sanitize_jobs_after(jobs)
         # docs/22 §4 A（2026-10-07 本地）：调研 → 制作由**代码**补先后依赖，不再靠模型自觉。
@@ -1902,6 +1950,31 @@ class Coordinator:
             "任务 %s 规模档 scale=%s（交付形式 %s，活数 %d%s）",
             tid, scale, deliver_kind, len(jobs), "，已按 brief 强制" if brief_forced else "",
         )
+
+        # 线上 T-11：计划派了两步，制作步用「不另扩搜」跳过了调研步没覆盖的原话必须项
+        # （关键节点 / 结局避雷 / 电波梗整块写成「未覆盖」）。代码兜底：只要**有任何 job
+        # 给了 covers**，就把没被任何 covers 覆盖到的原话必须项（不含底线 R0、不含补充）
+        # 补成一行指令，追加进合适的 job brief（优先第一条调研活，没有就第一条活）。
+        # 所有 job 都没给 covers（旧模型）→ 一个字都不动，兼容旧行为。
+        try:
+            missing = requirements.uncovered_required(req_items, jobs)
+        except Exception:
+            missing = []
+            logger.exception("核对计划 covers 覆盖失败（任务 %s）", tid)
+        if missing and jobs:
+            target = next(
+                (n for n, j in enumerate(jobs) if str(j.get("type") or "") == "research"), 0
+            )
+            line = requirements.covers_instruction(missing)
+            if line:
+                head = str(jobs[target].get("brief") or "").rstrip()
+                # 幂等：复用上一轮存档的 brief 时别把同一行指令叠第二遍
+                if requirements.COVERS_HINT_PREFIX not in head:
+                    jobs[target]["brief"] = (head + "\n\n" + line) if head else line
+                    logger.info(
+                        "任务 %s 有原话必须项没被 covers 覆盖（%s），已补进第 %d 条活的 brief",
+                        tid, "、".join(str(m.get("id")) for m in missing), target + 1,
+                    )
 
         env_choice = self._normalize_env_choice(data.get("env"))
         machine = str(data.get("machine") or "").strip()[:64] if env_choice == "ssh" else ""
@@ -3707,6 +3780,14 @@ class Coordinator:
                 f"{target_dir}/ 下，拷不回来就等于没做成。"
                 "机器时间不多，别拖；快到期会提醒你，一提醒就马上 vm_fetch_file。"
             )
+        # 线上 T-11：成品是给群友看的，不许出现 job 编号 / research.md / 任务号这些内部说法。
+        try:
+            from .workers import AUDIENCE_NOTE
+
+            if AUDIENCE_NOTE and AUDIENCE_NOTE not in out:
+                out += "\n\n" + AUDIENCE_NOTE
+        except Exception:
+            logger.exception("取成品读者提示失败")
         return out
 
     # ------------------------------------------------------------------
@@ -3883,6 +3964,19 @@ class Coordinator:
             "检查摘要、正文和限定条件是否一致：开头写已证实、后文却说关联未知时，"
             "不能放行扩大了确定性的结论，应缩回证据支持的范围。"
             "返工只针对影响原始需求或真实性的缺口；不能为了补充项或链接数量要求整轮返工。"
+        )
+        # 线上 T-11：成品整块写成「未覆盖 / 不另扩搜 / 待补充：需另开一次调研」，验收模型
+        # 照样判过。这里把口径写进提示；代码在验收末尾还会扫一遍成品文本兜底。
+        prompt_lines.append(
+            "- 成品里不能留「没做」的写法：一块要求只写「未覆盖 / 不另扩搜 / 不展开 / 此处不写 / "
+            "待补充 / 未收录 / 留待后续 / 占位 / 另开一次调研」这类「这块没去做」的说法，"
+            "不算做到。确实查不到是可以的——但要写清查过哪里（查过哪些地方、为什么没有），"
+            "写清「查不到 / 未确认」本身不是没过，别因为它判不过。"
+        )
+        prompt_lines.append(
+            "- 成品是给群友看的：里面不许出现 job 编号、research.md 这类内部文件名、artifacts/ "
+            "这类路径、任务号、子 agent / 主模型这类内部说法；出现就算没过，"
+            "让它换成群友看得懂的说法（要引用就说清是什么，比如「第 1 步查到的资料」）。"
         )
         prompt_lines.append("")
         prompt_lines.append("子 agent 的总结：")
@@ -4309,6 +4403,26 @@ class Coordinator:
                         passed = False
                         review_text = f"（{problem}，视为不通过）" + review_text
 
+        # 线上 T-11：验收模型看不出成品里的「留空」（未覆盖 / 不另扩搜 / 待补充）和群友
+        # 看得见的内部用语（job1 / research.md / 任务号）。代码再扫一遍最终成品文本；
+        # 命中就**即使模型判过也改判不通过**，返工意见用大白话说清命中了什么、要怎么改。
+        # 扫描自己出错（读不出文件等）→ 记日志跳过，绝不打断验收。
+        if passed:
+            scan = None
+            try:
+                scan = self._scan_deliverable(ws_name, tid, artifact, note)
+            except Exception:
+                logger.exception("成品文本扫描出错（任务 %s），这次跳过", tid)
+            if deliverable_check.has_issues(scan):
+                passed = False
+                review_text = _deliverable_issue_review(scan, review_text)
+                logger.info(
+                    "任务 %s 成品扫描命中留空 %d 处、内部用语 %d 处，验收改判不通过",
+                    tid,
+                    len((scan or {}).get("placeholder") or []),
+                    len((scan or {}).get("internal") or []),
+                )
+
         # 引用核对留痕：验收意见里带一行「引用核对：N 条链接，M 条没打开过」，
         # 结构化结果存 kv["task.link_check.<任务ID>"]（前端读它做字段）。
         if link_check is not None:
@@ -4382,6 +4496,31 @@ class Coordinator:
                 "evidence": evidence[:300],
             })
         return out
+
+    def _scan_deliverable(
+        self, ws_name: str, tid: str, artifact: Any, note: Any
+    ) -> dict:
+        """扫最终成品文本（线上 T-11）：验收认定的成品文件 + 交给群友的那句话。
+
+        成品文件按 `review.artifact` 拿（走 `_deliver_path_in_task_dir` 的同一道越界闸），
+        读不出 / 不存在就只扫 note。返回 `{"placeholder": [...], "internal": [...]}`
+        （去重、每类最多 `deliverable_check.MAX_HITS` 条）。只读，不改任何东西。
+        """
+        texts: list[str] = []
+        rel = str(artifact or "").strip()
+        if rel:
+            path = self._deliver_path_in_task_dir(ws_name, tid, rel)
+            if path is not None:
+                texts.append(deliverable_check.read_deliverable_text(path))
+        texts.append(str(note or ""))
+        merged: dict[str, list[str]] = {"placeholder": [], "internal": []}
+        for text in texts:
+            got = deliverable_check.scan_text(text, task_id=tid)
+            for key in ("placeholder", "internal"):
+                for piece in got.get(key) or []:
+                    if piece not in merged[key] and len(merged[key]) < deliverable_check.MAX_HITS:
+                        merged[key].append(piece)
+        return merged
 
     # ------------------------------------------------------------------
     # 验收引用核对（调研类任务）：交付里的链接是不是这个任务真打开过

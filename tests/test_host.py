@@ -630,9 +630,8 @@ class TestUploadGroupFile:
         assert name == "api.call"
         assert kw["api_name"] == "adapter.napcat.file.upload_group_file"
         assert kw["version"] == "1"
-        assert kw["args"]["group_id"] == "900000001"
-        assert kw["args"]["file"] == "/tmp/file.txt"
-        assert kw["args"]["name"] == "readme.txt"
+        # 适配器 1.x 动作直通接口：参数整包放 params（2026-10-10 线上巡检）
+        assert kw["args"]["params"] == {"group_id": "900000001", "file": "/tmp/file.txt", "name": "readme.txt"}
         # timeout_s=60 → timeout_ms=(60+5)*1000
         assert kw["timeout_ms"] == 65000
 
@@ -682,8 +681,7 @@ class TestGroupFileUrl:
         assert name == "api.call"
         assert kw["api_name"] == "adapter.napcat.file.get_group_file_url"
         assert kw["version"] == "1"
-        assert kw["args"]["group_id"] == "900000001"
-        assert kw["args"]["file_id"] == "abc-123"
+        assert kw["args"]["params"] == {"group_id": "900000001", "file_id": "abc-123"}
 
 
 # ----------------------------------------------------------------------

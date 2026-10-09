@@ -157,6 +157,9 @@ class HostResponses:
     async def api_call(self, **kw: Any) -> Any:
         name = str(kw.get("api_name") or "")
         args = dict(kw.get("args") or {})
+        # 线上 SnowLuma 适配器 1.x：动作直通接口参数整包在 params 里（2026-10-10 巡检）
+        if isinstance(args.get("params"), dict):
+            args = dict(args["params"])
         if name == "api.list":
             # 群空间探测：e2e 世界按旧版适配器处理（只有上传和取链接），
             # 公告/相册/文件管理一律不出现
