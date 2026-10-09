@@ -1032,8 +1032,45 @@ def _m_task_lanes(conn: sqlite3.Connection) -> None:
     """)
 
 
+# lane 的**原始历史**单独归档（docs/27 §7/§8 P0，2026-10-09）：
+# - task_lanes.messages 是**压缩后的工作视图**（摘要 + 最近原文），压缩会整段换掉它；
+# - task_lane_raw.messages 是这一轮压缩之前说过的**原话**，追加式（只增不减、不覆盖，
+#   一模一样的 user / tool 消息重复出现是正常的证据，不按内容去重）；
+# - rev：每次真追加 +1，保存时当 expect_rev 用（晚到 / 并发的一方不许覆盖新的）；
+# - covered_count / covered_rev：工作视图那次摘要覆盖到原始历史的第几条 / 当时的 rev；
+# - summary：最近一次成功的提要（失败绝不覆盖）。
+# 老库（库号 36）里已有的 lane 工作视图是最好的原始历史基线，这里回填一份；
+# 空前情的 lane 不回填。回填的 covered_count 只能记 0（当年没记过覆盖区间）。
+def _m_task_lane_raw(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS task_lane_raw (
+        task_id TEXT NOT NULL,
+        lane TEXT NOT NULL,
+        group_id TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT '',
+        req_version INTEGER NOT NULL DEFAULT 1,
+        messages TEXT NOT NULL DEFAULT '[]',
+        rev INTEGER NOT NULL DEFAULT 0,
+        covered_count INTEGER NOT NULL DEFAULT 0,
+        covered_rev INTEGER NOT NULL DEFAULT 0,
+        summary TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'open',
+        created REAL NOT NULL DEFAULT 0,
+        updated REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (task_id, lane)
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_lane_raw_group ON task_lane_raw(group_id, updated);
+    """)
+    conn.execute(
+        "INSERT OR IGNORE INTO task_lane_raw (task_id, lane, group_id, kind, req_version, messages,"
+        " rev, covered_count, covered_rev, summary, status, created, updated)"
+        " SELECT task_id, lane, group_id, kind, req_version, messages, 1, 0, 0, snapshot,"
+        " status, created, updated FROM task_lanes WHERE messages != '[]'"
+    )
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw]
 
 
 class Store:

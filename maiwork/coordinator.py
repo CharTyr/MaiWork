@@ -51,10 +51,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -106,6 +107,149 @@ _GROUPSPACE_TOOLS = tuple(name for name, _cap in _GROUPSPACE_TOOL_CAPS)
 
 _AGENT_DONE_WORD_HINT = "目标完成"
 
+# ---------------------------------------------------------------------------
+# 主模型工具输出的归档（docs/27 §7/§8 P1；和 workers.py 同一套口径）
+#
+# 会超单条 tool 消息上限（6000 字）的正文，先落盘到 `<工作区>/tool_spill/<任务ID>/`，
+# 对话里只留头 + 尾 + **工作区相对路径** + 分页回读指引（主模型侧的读文件工具是
+# inspect_file，子 agent 侧是 read_file）。归档文件就是这段正文的完整留档，**不过期**。
+# 归档失败 / 这一轮没有可用的回读工具 → **原样保留完整正文**（不硬截、不假装能读回），
+# 装不下交给预算闸（chat_with_retry_on_long_context）明确报错，绝不悄悄丢中段。
+# ---------------------------------------------------------------------------
+_TOOL_MSG_MAX = 6000
+_ARCHIVE_LINE = _TOOL_MSG_MAX + 1
+_ARCHIVE_HEAD = 3600
+_ARCHIVE_TAIL = 1000
+# 归档文件**不做淘汰**：它们是对话里那些回读指针的唯一证据，按数量删会把活指针删空
+# （归档方 2026-10-09 定的口径：严格 no-eviction；清理由任务生命周期/工作区回收管）。
+_ARCHIVE_PAGE = 5000
+_ARCHIVE_READERS = ("inspect_file", "read_file")
+
+
+def _archive_tool_output(
+    text: str, workspace: Any, task_id: str, *, reader: str
+) -> tuple[str, str]:
+    """把超预算的工具正文归档到工作区，返回 (回给模型的文字, 工作区相对路径)。
+
+    写盘走 `compaction.secure_write_text`（根目录 fd 逐级 O_NOFOLLOW + O_EXCL 建文件，
+    没有「先 lstat 再写」的 TOCTOU 窗口，也不跟任何软链接、不写到工作区外）。
+    成功 → 头 + 尾 + 相对路径指针 + 回读指引；拒绝 / 失败（没工作区 / 路径不合法 /
+    软链接 / 写不进去）→ **原样返回完整正文** + 空指针，调用方不许再硬截。
+    """
+    body = str(text or "")
+    try:
+        base = Path(workspace)
+        if not base.is_absolute():
+            # 相对路径锚不住（secure_write_text 只认绝对 base）：宁可不归档，完整正文照发。
+            # 这里**不** resolve()——软链接要留给 secure_write_text 的 O_NOFOLLOW 去拒，
+            # 先 resolve 等于把软链接跟到底、把这道防线拆了。
+            return body, ""
+        directory = base / "tool_spill" / str(task_id)
+        rel_dir = str(directory.relative_to(base)).replace("\\", "/")
+    except Exception:
+        logger.exception("算主模型工具输出归档目录出错，这一段不归档")
+        return body, ""
+    if not rel_dir or rel_dir.startswith(".."):
+        return body, ""
+    name = f"spill-{int(clock.now() * 1000)}.txt"
+    written = compaction.secure_write_text(directory, name, body)
+    if written is None:
+        logger.warning(
+            "主模型工具输出归档没做成（%d 字，目录 %s）：完整正文照发，不硬截",
+            len(body), directory,
+        )
+        return body, ""
+    try:
+        rel = str(Path(written).relative_to(base)).replace("\\", "/")
+    except ValueError:
+        logger.warning("归档文件不在工作区内（%s），这一段不归档", written)
+        return body, ""
+    total = len(body)
+    omitted = max(0, total - _ARCHIVE_HEAD - _ARCHIVE_TAIL)
+    return (
+        body[:_ARCHIVE_HEAD]
+        + f"\n\n……（输出太长：中间省略 {omitted} 字；完整 {total} 字已归档到工作区文件 {rel}）……\n\n"
+        + body[-_ARCHIVE_TAIL:]
+        + f"\n\n【完整输出在工作区文件】{rel}（共 {total} 字）\n"
+        f"回读：{reader}(path=\"{rel}\", offset=0, limit={_ARCHIVE_PAGE})，照返回里的「下一页 offset」"
+        f"一页页往后读（offset 从 0 数、单位字符，一页最多 {_ARCHIVE_PAGE} 字）。"
+        "路径要用工作区内的相对路径（绝对路径读不了）；别以为你只看到了这一段。"
+    ), rel
+
+
+def _budget_window(budget: dict, fallback: int) -> int:
+    """整包预算里的上下文窗口（键名以 compaction.context_budget 的返回为准）。"""
+    try:
+        v = int(budget.get("context_window") or 0)
+    except Exception:
+        v = 0
+    return v or int(fallback)
+
+
+def _summary_text_of(view: list[dict]) -> str:
+    """投影里那条摘要消息的正文（没有 → 空串）：存进 raw.summary，下一轮当上一版提要用。"""
+    for m in view:
+        if isinstance(m, dict) and compaction.is_summary_message(m):
+            return str(m.get("content") or "")
+    return ""
+
+
+@dataclass
+class LeadPrior:
+    """领队这次回合要接的前情（`Coordinator._lead_begin` 的返回）。
+
+    history = 工作视图（可能是压缩后的投影）；ver = 记录时的需求版本；rev = 读到的原始历史
+    版本（保存时当 expect_rev）；summary / covered / raw_count = 这条 lane 已有的提要与覆盖
+    区间（增量摘要和覆盖计算都用它）。
+    """
+
+    history: list[dict] = field(default_factory=list)
+    ver: int | None = None
+    rev: int | None = None
+    summary: str = ""
+    covered: int = 0
+    raw_count: int = 0
+
+
+@dataclass
+class LaneContext:
+    """主模型回合里那条持久 lane 的压缩上下文（领队 lane；非持久调用方不用给）。
+
+    `_chat_main` 压缩之后：`raw_seed` = 压缩前那份完整视图（保存时当 original_messages，
+    原始历史一条不丢）、`summary_text` / `covered` = 这次压出来的提要 / 覆盖条数；
+    同时把调用方那份 messages **原地**换成投影——下一轮的基线就是投影，摘要走增量，
+    不会每轮把整段老历史重新总结一遍。
+    """
+
+    prev_summary: str = ""
+    prev_covered: int = 0
+    raw_cap: int = 0
+    raw_seed: list[dict] | None = None
+    summary_text: str = ""
+    covered: int | None = None
+
+
+@dataclass
+class LaneOpening:
+    """开一条 lane 的结果（`Coordinator._lane_open`）。
+
+    - history：这一轮接着用的前情（工作视图）；
+    - escalated / snapshot：这一轮换没换升级模型 / 换模型前压出的提要（没压成 = None）；
+    - parent：上一轮的交接单 id；
+    - raw_seed：压缩前的完整对话（原始历史归档用；没压缩就是 None）；
+    - rev / covered_count / covered_rev：读到的原始历史版本与这次摘要的覆盖区间
+      （保存时当 expect_rev / 覆盖元数据传回去）。
+    """
+
+    history: list[dict] = field(default_factory=list)
+    escalated: bool = False
+    snapshot: str | None = None
+    parent: str = ""
+    raw_seed: list[dict] | None = None
+    rev: int | None = None
+    covered_count: int | None = None
+    covered_rev: int | None = None
+
 # docs/22 §5 A：需要真人参与时 question 的总长上限（首尾固定句子保留，中间的要求列表按剩余长度截）
 _HUMAN_QUESTION_MAX = 200
 
@@ -132,7 +276,9 @@ _TEXT_ARTIFACT_SUFFIXES = (
 _ARTIFACT_SCAN_MAX_FILES = 20          # 最多扫 20 个成品文件
 _ARTIFACT_SCAN_MAX_BYTES = 200_000     # 每个文件最多读 200KB
 _UNOPENED_URLS_IN_PROMPT = 10          # 喂给验收模型的「没打开」清单最多列 10 条
-_LINK_RE = re.compile(r"https?://[^\s<>\"'()\[\]{}，。；、）】》]+", re.IGNORECASE)
+# T-10 的「链接（AFP）」曾把开括号和来源标签算进 URL，产生假「没打开」。
+# 中文正文的成对括号/引号都是边界；Unicode 路径与已编码括号仍保留。
+_LINK_RE = re.compile(r"https?://[^\s<>\"'()\[\]{}，。；、（）【】《》「」『』“”‘’]+", re.IGNORECASE)
 # 跟踪参数：utm_* 前缀 + 这些常见名字（比对时两边都去掉）
 _TRACKING_PARAM_NAMES = frozenset({
     "fbclid", "gclid", "igshid", "mc_cid", "mc_eid", "ref_src", "spm",
@@ -737,25 +883,71 @@ class Coordinator:
         tools: Any = None,
         json_mode: bool = False,
         retries: Any = None,
+        lane: "LaneContext | None" = None,
     ) -> Any:
-        """主模型统一出口（0.4.0）：调之前先上下文压缩，撞上「上下文超长」裁最旧一段重试一次。
+        """主模型统一出口（0.4.0）：调之前先算整包预算再压缩，装不下明确报错。
 
-        - 压缩规则见 compaction.py：估算超触发线先截旧 tool 结果，仍超把最老一段总结成
-          一条 8 节摘要（summary 失败原样继续，不抛）；
-        - 「上下文超长」类错误：裁掉最旧一段再重试一次；其他错误原样抛；
+        - 预算 `compaction.context_budget(models, role, agent, messages, tools, json_mode)`
+          按**整包**算（system + messages + 工具 schema），拿它的 context_window；
+        - 压缩 `compaction.maybe_compact_ex(...)`：`require_recoverable=True`（任何裁剪都得
+          可回读）；上一版提要通过 `previous_summary` / `previous_coverage` 传进去（增量）；
+        - 压出来的投影**原地换进调用方这份 messages**：持久 lane 的调用方随后照常保存，
+          存下来的工作视图就是投影（下一轮基线 = 投影，不会每轮重压整段老历史）；
+        - `lane` 给了（持久 lane）就顺手填 `raw_seed` / `summary_text` / `covered`，
+          调用方保存时按它们写原始历史与覆盖区间（同一个事务）；
+        - 压缩没做成时原样继续（**不删要求、不换假摘要**）；
+        - 「上下文超长」类错误：由 chat_with_retry_on_long_context 明确报错，不静默丢弃；
         - 返回 ChatResult（原样）。
         """
         try:
-            messages = await compaction.maybe_compact(
+            raw_before = list(messages) if lane is not None else None
+            previous_coverage = None
+            if lane is not None and lane.prev_covered > 0:
+                previous_coverage = {
+                    "cumulative_covered": int(lane.prev_covered),
+                    "covered_messages": int(lane.prev_covered),
+                    "last_index": int(lane.prev_covered) - 1,
+                }
+            budget = compaction.context_budget(
+                models=self._models,
+                role="main",
+                agent="main",
+                messages=messages,
+                tools=tools,
+                json_mode=json_mode,
+            )
+            outcome = await compaction.maybe_compact_ex(
                 messages,
                 models=self._models,
                 role="main",
                 agent="main",
-                context_window=self._context_window(),
+                context_window=_budget_window(budget, self._context_window()),
+                output_reserve=int(
+                    budget.get("output_reserve") or compaction.DEFAULT_OUTPUT_RESERVE
+                ),
+                tools=tools,
+                escalate=False,
                 purpose=purpose,
                 group_id=group_id,
                 task_id=task_id,
+                json_mode=json_mode,
+                require_recoverable=True,
+                previous_summary=(lane.prev_summary or None) if lane is not None else None,
+                previous_coverage=previous_coverage,
             )
+            view = list(getattr(outcome, "messages", None) or [])
+            if view and view != messages:
+                if lane is not None:
+                    lane.raw_seed = raw_before
+                    lane.summary_text = _summary_text_of(view)
+                    covered = int(
+                        getattr(getattr(outcome, "coverage", None), "covered_messages", 0) or 0
+                    )
+                    lane.covered = (
+                        max(0, min(int(lane.prev_covered) + covered, int(lane.raw_cap)))
+                        if lane.raw_cap else None
+                    )
+                messages[:] = view  # 原地换成投影：调用方那份也变，保存下来的就是工作视图
         except Exception:
             logger.exception("主模型上下文压缩失败（%s），原样继续", purpose)
         kwargs: dict[str, Any] = {
@@ -1152,9 +1344,15 @@ class Coordinator:
         locked = requirements.load(self._store, tid, req_version)
         # 任务双岗协作第二步：领队 lane 的前情（完整对话，只往后接）
         lead_prior: list[dict] = []
+        lead_rev: int | None = None
+        lead_lane = LaneContext()
         req_note = ""
         if lead:
-            lead_prior, lead_ver = await self._lead_begin(tid, gid)
+            prior = await self._lead_begin(tid, gid)
+            lead_prior, lead_ver, lead_rev = prior.history, prior.ver, prior.rev
+            lead_lane = LaneContext(
+                prev_summary=prior.summary, prev_covered=prior.covered, raw_cap=prior.raw_count,
+            )
             if lead_prior and lead_ver is not None and lead_ver != req_version:
                 req_note = (
                     f"注意：需求改过——在你上次排计划之后从第 {lead_ver} 版改成了第 {req_version} 版，"
@@ -1254,6 +1452,15 @@ class Coordinator:
                 "（例：「每张图注明出处链接」），不写理由、例子和返工说明。"
             )
 
+        # T-10 线上巡检：一句「搜搜」扩成 80 来源全景网页。按原话决定工作量，
+        # 不改锁定清单、不降低核实要求，也不以固定链接数代替事实判断。
+        prompt_lines.append(
+            "调研范围与交付形式按原始需求：只是查一条消息、核实一件事时，不默认升级成全景报告"
+            "或另派制作网页；先解决核心问题，再决定是否需要补充调查。"
+            "关键问题有可靠依据、未确认的点已说明，就停止扩搜，不为凑链接、填满框架追查所有旁支。"
+            "用户明确要求深入调研、完整盘点或网页时，仍按原话做到；不能用省时作理由漏掉硬性要求。"
+            "补充项只能服务原始需求，不得把可选展示形式变成额外必做工作。"
+        )
         # 执行环境可选项：只有就位的才出现在提示词里（模型不会瞎选）
         env_field, env_guide, _env_allowed = self._env_options()
         # 专岗改版 4/4：jobs[].agent 的 JSON 说明是动态的（没有自定义专岗就不提这个键），
@@ -1329,6 +1536,11 @@ class Coordinator:
         messages: list[dict] = lead_prior + [
             {"role": "user", "content": prefix + "\n".join(prompt_lines)}
         ]
+        pinned = self._pinned_requirements_message(locked)
+        if pinned is not None:
+            # 锁定的需求清单：每轮由代码从库里重注入（不做事后抽取），并标记成「钉住」——
+            # 压缩永不把它摘要掉（compaction.pin_message / protect_pinned）。
+            messages.insert(len(lead_prior), pinned)
         if not specs:
             # 一个排计划能用的工具都没有（roles 含 main 的 MCP / skill 工具全没注册）：
             # 行为完全不变——一次 json_mode=True 的纯 JSON 调用，不带 tools。
@@ -1338,6 +1550,7 @@ class Coordinator:
                 purpose="coordinator.plan",
                 group_id=gid,
                 task_id=tid,
+                lane=lead_lane if lead else None,
             )
             try:
                 data = json.loads(result.text)
@@ -1417,7 +1630,13 @@ class Coordinator:
             raise ModelError("主模型计划返回不是 JSON 对象")
         if lead:
             messages.append({"role": "assistant", "content": str(result.text or "")})
-            self._lane_save(tid, gid, _LEAD_LANE, "main", messages, req_version)
+            self._lane_save(
+                tid, gid, _LEAD_LANE, "main", messages, req_version, expect_rev=lead_rev,
+                snapshot=lead_lane.summary_text or None,
+                original_messages=lead_lane.raw_seed,
+                summary=lead_lane.summary_text or None,
+                covered_count=lead_lane.covered, covered_rev=lead_rev,
+            )
 
         if locked:
             # 清单已锁定：criteria 与 requirements 都按清单来，模型这轮想改也不认
@@ -2083,20 +2302,18 @@ class Coordinator:
                 # 模型/skills 由 specialists → workers 按 kind 各自注/挑。
                 kind = str(agent or "task")
                 lane_kw: dict[str, Any] = {}
-                history: list[dict] = []
-                esc = False
-                snapshot: str | None = None
+                opening: LaneOpening | None = None
                 if lane:
                     # 任务双岗协作（docs/20 §5.3）：同一条干活 lane 带着前情接着干
-                    history, esc, snapshot, parent = await self._lane_open(
-                        tid, gid, lane, kind, escalate=escalate, quiet=step,
+                    opening = await self._lane_open(
+                        tid, gid, lane, kind, req_version=req_version, escalate=escalate, quiet=step,
                     )
-                    lane_kw["history"] = history
-                    if esc:
+                    lane_kw["history"] = opening.history
+                    if opening.escalated:
                         lane_kw["escalate"] = True
-                    if parent:
+                    if opening.parent:
                         # §八：同一 lane 的返工交接单指向上一轮
-                        lane_kw["parent_id"] = parent
+                        lane_kw["parent_id"] = opening.parent
                 report = await specialists.run(
                     kind, brief,
                     group_id=gid, task_id=tid,
@@ -2108,11 +2325,18 @@ class Coordinator:
                     write_scope=write_scope,
                     **lane_kw,
                 )
-                if lane:
+                if lane and opening is not None:
+                    # 工作视图 + 原始历史 + 压缩覆盖一条事务写；expect_rev 钉住读到的原始历史版本
                     self._lane_save(
-                        tid, gid, lane, kind, history, req_version,
-                        escalated=True if esc else None, snapshot=snapshot,
+                        tid, gid, lane, kind, opening.history, req_version,
+                        escalated=True if opening.escalated else None,
+                        snapshot=opening.snapshot,
                         handoff_id=str(getattr(report, "handoff_id", "") or "") or None,
+                        original_messages=opening.raw_seed,
+                        expect_rev=opening.rev,
+                        summary=opening.snapshot,
+                        covered_count=opening.covered_count,
+                        covered_rev=opening.covered_rev,
                     )
                 return report
             except (ModelError, HostError) as e:
@@ -3469,6 +3693,14 @@ class Coordinator:
             "按原始需求逐条核对实际证据，核不到就当没过，在 review 里写清还缺什么；原始需求"
             "只要方案或文字时，就核这份文稿有没有按它说清，别要求它出示做不到的实做证据。"
         )
+        prompt_lines.append(
+            "- 调研验收要核对结论与材料，不是数链接：打开过只证明取得过材料，不证明结论正确；"
+            "关键事实要与实际来源内容相符，不同站点转载同一篇稿件，不算独立佐证。"
+            "置信程度、时间点或讨论对象不同，不自动等于事实互相矛盾；先核对它们是否真的互斥。"
+            "检查摘要、正文和限定条件是否一致：开头写已证实、后文却说关联未知时，"
+            "不能放行扩大了确定性的结论，应缩回证据支持的范围。"
+            "返工只针对影响原始需求或真实性的缺口；不能为了补充项或链接数量要求整轮返工。"
+        )
         prompt_lines.append("")
         prompt_lines.append("子 agent 的总结：")
         prompt_lines.append(summary or "（空）")
@@ -3597,8 +3829,13 @@ class Coordinator:
                 "这不算没过。真没过、要返工就别写 next，把问题写进 review。"
             )
         lead_prior: list[dict] = []
+        lead_lane = LaneContext()
         if lead:
-            lead_prior, _ver = await self._lead_begin(tid, gid)
+            prior = await self._lead_begin(tid, gid)
+            lead_prior, lead_rev = prior.history, prior.rev
+            lead_lane = LaneContext(
+                prev_summary=prior.summary, prev_covered=prior.covered, raw_cap=prior.raw_count,
+            )
         if lead_prior:
             prompt_lines.insert(
                 0, "（上面是你在这个任务里排计划、验收的经过；这次验收以这一条为准。）"
@@ -3629,6 +3866,7 @@ class Coordinator:
                 purpose="coordinator.review",
                 group_id=gid,
                 task_id=tid,
+                lane=lead_lane if lead else None,
             )
             tool_calls = result.tool_calls or []
             if not tool_calls:
@@ -3673,6 +3911,7 @@ class Coordinator:
                     purpose="coordinator.review",
                     group_id=gid,
                     task_id=tid,
+                lane=lead_lane if lead else None,
                 )
                 try:
                     parsed = json.loads(result.text)
@@ -3688,7 +3927,13 @@ class Coordinator:
                     break
             if review_data is None:
                 if lead:
-                    self._lane_save(tid, gid, _LEAD_LANE, "main", messages, lead_ver)
+                    self._lane_save(
+                tid, gid, _LEAD_LANE, "main", messages, lead_ver, expect_rev=lead_rev,
+                snapshot=lead_lane.summary_text or None,
+                original_messages=lead_lane.raw_seed,
+                summary=lead_lane.summary_text or None,
+                covered_count=lead_lane.covered, covered_rev=lead_rev,
+            )
                 attempt_n2 = int(task.get("attempts") or 0)
                 return {
                     "pass": False,
@@ -3726,6 +3971,7 @@ class Coordinator:
                     purpose="coordinator.review",
                     group_id=gid,
                     task_id=tid,
+                lane=lead_lane if lead else None,
                 )
                 try:
                     parsed = json.loads(result.text)
@@ -3736,7 +3982,13 @@ class Coordinator:
                     break
             if not isinstance(review_data.get("items"), list):
                 if lead:
-                    self._lane_save(tid, gid, _LEAD_LANE, "main", messages, lead_ver)
+                    self._lane_save(
+                tid, gid, _LEAD_LANE, "main", messages, lead_ver, expect_rev=lead_rev,
+                snapshot=lead_lane.summary_text or None,
+                original_messages=lead_lane.raw_seed,
+                summary=lead_lane.summary_text or None,
+                covered_count=lead_lane.covered, covered_rev=lead_rev,
+            )
                 attempt_n3 = int(task.get("attempts") or 0)
                 return {
                     "pass": False,
@@ -3785,6 +4037,7 @@ class Coordinator:
                         purpose="coordinator.review",
                         group_id=gid,
                         task_id=tid,
+                lane=lead_lane if lead else None,
                     )
                     parsed = json.loads(result.text)
                 except (ValueError, TypeError):
@@ -3798,7 +4051,13 @@ class Coordinator:
 
         if lead:
             messages.append({"role": "assistant", "content": str(result.text or "")})
-            self._lane_save(tid, gid, _LEAD_LANE, "main", messages, lead_ver)
+            self._lane_save(
+                tid, gid, _LEAD_LANE, "main", messages, lead_ver, expect_rev=lead_rev,
+                snapshot=lead_lane.summary_text or None,
+                original_messages=lead_lane.raw_seed,
+                summary=lead_lane.summary_text or None,
+                covered_count=lead_lane.covered, covered_rev=lead_rev,
+            )
 
         model_pass = bool(review_data.get("pass"))
         judgement: dict | None = None
@@ -4030,13 +4289,24 @@ class Coordinator:
         *,
         assistant_text: str = "",
     ) -> None:
-        """跑一轮工具调用：结果（截断 6000 字）当 tool 消息追加进 messages。
+        """跑一轮工具调用：结果当 tool 消息追加进 messages。
 
-        主模型自己的工具调用一律走 Tools.call —— 落 tool_calls 表（actor="主模型"）。
+        - 正文超过单条 tool 消息上限（6000 字）且这一轮有回读工具（inspect_file / read_file）：
+          完整正文先归档到 `<工作区>/tool_spill/<任务ID>/`，消息里留头 + 尾 + **工作区相对
+          路径** + 分页回读指引（归档的那份就是完整留档，不过期）；
+        - 归档失败，或这一轮没有可用的回读工具：**完整正文原样保留**（不硬截），
+          装不下由预算闸明确报错，绝不悄悄丢中段（docs/27 §7/§8 P1）；
+        - 主模型自己的工具调用一律走 Tools.call —— 落 tool_calls 表（actor="主模型"）。
         """
         messages.append(
             {"role": "assistant", "content": assistant_text, "tool_calls": tool_calls}
         )
+        allowed = {str(x) for x in (ctx.allowed_tools or ())}
+        reader = ""
+        for cand in _ARCHIVE_READERS:
+            if cand in allowed:
+                reader = cand
+                break
         for tc in tool_calls:
             fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
             name = str(fn.get("name") or "")
@@ -4052,8 +4322,24 @@ class Coordinator:
                 args = {}
             tr = await self._tools.call(name, args, ctx)
             content = tr.output if tr.ok else (tr.error or tr.output)
-            if len(content) > 6000:
-                content = content[:6000] + " …（已截断）"
+            if len(content) > _TOOL_MSG_MAX:
+                archived = ""
+                if reader and ctx.workspace is not None:
+                    try:
+                        content, archived = _archive_tool_output(
+                            content, ctx.workspace, str(ctx.task_id or ""), reader=reader
+                        )
+                    except Exception:
+                        logger.exception("工具输出归档出错（%s），按完整正文继续", name)
+                        archived = ""
+                if archived:
+                    logger.info("主模型工具 %s 的输出已归档：%s", name, archived)
+                else:
+                    # 没有回读工具 / 归档没做成：完整正文照发（交给预算闸），不硬截
+                    logger.warning(
+                        "主模型工具 %s 的输出 %d 字没能归档（回读工具=%s）：完整正文照发",
+                        name or "（无名）", len(content), reader or "无",
+                    )
             msg: dict[str, Any] = {"role": "tool", "content": content}
             if tc.get("id"):
                 msg["tool_call_id"] = str(tc["id"])
@@ -4440,15 +4726,17 @@ class Coordinator:
             logger.exception("记 lane 事件失败（任务 %s）", tid)
 
     async def _lane_open(
-        self, tid: str, gid: str, lane: str, kind: str, *, escalate: bool, quiet: bool = False,
-    ) -> tuple[list[dict], bool, str | None, str]:
-        """开这条干活 lane：返回 (接着用的前情, 这一轮换没换升级模型, 新的前情提要或 None,
-        上一轮交接单 id)。
+        self, tid: str, gid: str, lane: str, kind: str, *, req_version: int, escalate: bool,
+        quiet: bool = False,
+    ) -> LaneOpening:
+        """开这条干活 lane：返回 LaneOpening（前情 / 换没换升级模型 / 提要 / 交接单 / 归档信息）。
 
         - 有前情且还是同一个岗 → 接着用（task.lane_rework）；换了岗 → 从零（task.lane_reset）；
-        - escalate（这一版已被打回 2 次）且有可升级的：第一次换时先把前情压缩成提要再换
-          （task.lane_escalate）；压缩没做成 → 从零 + 上次的前情提要（有的话）接着干
-          （task.lane_reset）。
+        - escalate（这一版已被打回 2 次）且有可升级的：第一次换时先把前情压缩成提要，并**当场
+          连同原始历史一条事务存下来**（task.lane_escalate；这样原始历史只按压缩前那份算一次，
+          这一轮结束再存时基线是「提要」视图，只追加这一轮新长出来的话）；
+        - 压缩没做成 → **完整前情原样接着用**（不退回旧提要、不从零重开，也不删原始历史），
+          另记 task.lane_compact_failed：装不下交给下游容量闸明确报错。
         """
         lanes = self._lane_store()
         try:
@@ -4456,13 +4744,21 @@ class Coordinator:
         except Exception:
             logger.exception("读 lane 失败（%s %s），这一轮从零开始", tid, lane)
             row = None
+        try:
+            raw = lanes.load_raw(tid, lane, group_id=gid)
+        except Exception:
+            logger.exception("读 lane 原始历史失败（%s %s）", tid, lane)
+            raw = None
+        raw_rev = int(raw["rev"]) if raw else None
+        raw_count = len(raw["messages"]) if raw else 0
         n = lane.split(":", 1)[-1]
-        history: list[dict] = []
+        opening = LaneOpening(history=[], parent="", rev=raw_rev)
         same_kind = row is not None and row["status"] == "open" and row["kind"] == kind
-        parent = str(row.get("handoff_id") or "") if same_kind and row is not None else ""
+        if same_kind and row is not None:
+            opening.parent = str(row.get("handoff_id") or "")
         if row is not None and row["status"] == "open" and row["messages"]:
             if same_kind:
-                history = list(row["messages"])
+                opening.history = list(row["messages"])
             else:
                 try:
                     lanes.reset(tid, lane, group_id=gid)
@@ -4473,46 +4769,65 @@ class Coordinator:
                     f"第 {n} 条活这次派给了别的岗位，上一轮的前情不是它的，从零开始",
                     lane=lane, why="kind_changed",
                 )
-        esc = False
-        snapshot: str | None = None
         if escalate:
             target = self._escalation_target(kind)
             if target is not None:
-                esc = True
+                opening.escalated = True
                 if not (same_kind and row is not None and row["escalated"]):
-                    if history:
+                    if opening.history:
+                        before = list(opening.history)
                         try:
-                            text = await compaction.summarize_messages(
-                                history, models=self._models, role="worker", agent=kind,
-                                purpose="worker.lane_escalate", group_id=gid, task_id=tid,
+                            view, text, covered = await self._lane_compress(
+                                tid=tid, gid=gid, lane=lane, role="worker", agent=kind,
+                                purpose="worker.lane_escalate", history=before,
+                                prev_summary=str((raw or {}).get("summary") or ""),
+                                prev_covered=int((raw or {}).get("covered_count") or 0),
+                                raw_cap=raw_count,
+                                keep_tokens=min(
+                                    _LEAD_COMPACT_TOKENS, int(self._context_window() * 0.4)
+                                ),
                             )
-                            history = [compaction.summary_to_message(text)]
-                            snapshot = text
-                        except Exception as e:
-                            logger.warning("任务 %s %s 换模型前压缩没做成：%s", tid, lane, e)
-                            old_snap = str((row or {}).get("snapshot") or "") if same_kind else ""
-                            history = [compaction.summary_to_message(old_snap)] if old_snap else []
+                        except Exception:
+                            logger.exception("第 %s 条活换模型前压缩异常（%s）", n, tid)
+                            view, text, covered = before, None, None
+                        if text is None:
+                            # 完整前情原样接着用（不是旧提要、不是空）：压缩失败不改工作视图、
+                            # 不动原始历史、不写提要；装不下由下游容量闸明确失败。
                             self._lane_event(
-                                tid, gid, "task.lane_reset",
-                                f"第 {n} 条活换模型前，前情压缩没做成：从零开始"
-                                + ("，带上上次的前情提要" if old_snap else "") + "，按这次的说明接着干",
+                                tid, gid, "task.lane_compact_failed",
+                                f"第 {n} 条活换模型前，前情压缩没做成：完整前情原样接着用"
+                                "（不退回旧提要、不清空）；装不下会明确报错，不删要求",
                                 lane=lane, why="compact_failed",
                             )
+                        else:
+                            opening.history = view
+                            opening.snapshot = text
+                            # 压缩当场落库（视图 + 原始历史按压缩前那份对齐 + 覆盖，一条事务）：
+                            # 这一轮结束再存时基线是压缩后的视图，只追加新长出来的话，
+                            # 不会把压缩前那段重复追加一遍。
+                            self._lane_save(
+                                tid, gid, lane, kind, opening.history, int(req_version),
+                                snapshot=text, original_messages=before, summary=text,
+                                covered_count=covered, covered_rev=raw_rev,
+                                expect_rev=raw_rev,
+                            )
+                            opening.rev = lanes.raw_rev(tid, lane, group_id=gid)
+                            opening.raw_seed = None
                     label = str(target.get("label") or target.get("entry_id") or "")
                     self._lane_event(
                         tid, gid, "task.lane_escalate",
                         f"第 {n} 条活已经被打回两次：换成「{label}」接着改"
-                        + ("（先把前情压缩成提要）" if snapshot else ""),
+                        + ("（先把前情压缩成提要）" if opening.snapshot else ""),
                         lane=lane, to=label, entry_id=str(target.get("entry_id") or ""),
                     )
-                    return history, esc, snapshot, parent
-        if history and not quiet:
+                    return opening
+        if opening.history and not quiet:
             self._lane_event(
                 tid, gid, "task.lane_rework",
                 f"第 {n} 条活被打回：交给同一个子 agent 带着上一轮的前情接着改",
                 lane=lane,
             )
-        return history, esc, snapshot, parent
+        return opening
 
     def _worker_model_note(self, escalated: bool) -> str:
         """排计划时告诉领队这一轮干活的是哪个模型（docs/20 第三步：按模型组合调说明写多细）。"""
@@ -4545,48 +4860,145 @@ class Coordinator:
             return [], None
         return list(row["messages"]), int(row["req_version"])
 
-    async def _lead_begin(self, tid: str, gid: str) -> tuple[list[dict], int | None]:
+    async def _lane_compress(
+        self, *, tid: str, gid: str, lane: str, role: str, agent: str, purpose: str,
+        history: list[dict], prev_summary: str, prev_covered: int, raw_cap: int,
+        keep_tokens: int,
+    ) -> tuple[list[dict], str | None, int | None]:
+        """按整包预算把前情压一版（领队 lane / 干活 lane 共用）。
+
+        返回 (新的工作视图, 新提要文本或 None, 覆盖到 raw 的第几条或 None)。提要 None = 没压成：
+        调用方保持手里的完整历史原样（不退回旧提要、不清空），raw 不动。
+
+        - `compaction.plan_projection`：keep / cut——system、最近一段、**最新一条 user 原话**、
+          **钉住的需求清单**永不进 cut（保护由 compaction 按结构判定，不做语义抽取）；
+          「最近一段」按调用方给的 `keep_tokens` 算（触发线本来就是「前情超过它就压」）；
+        - cut 为空（最新原话要留住、没得摘要）→ 不摘要：装不下交给容量闸明确失败，不吞原话；
+        - `summarize_messages_ex(cut, previous_summary=上一版提要, previous_coverage=…)：增量摘要
+          （上一版提要不再被总结一遍）；cut 里已有的摘要消息先剔掉（那是视图，不是新事实）；
+        - 摘要插回 keep 的原位置（plan.summary_index）；覆盖条数取摘要统计的累计值再夹到
+          raw 现有条数内（**不等于全量 raw**：保留的最近原文不算被覆盖）。
+        """
+        try:
+            budget = compaction.context_budget(
+                models=self._models, role=role, agent=agent, messages=history, escalate=False,
+            )
+            reserve = int(budget.get("output_reserve") or compaction.DEFAULT_OUTPUT_RESERVE)
+            # 保留预算 = 触发线（默认取整包窗口的 40%，上限 _LEAD_COMPACT_TOKENS）；
+            # 换算成 plan_projection 要的窗口：keep ≈ (window − reserve) × KEEP_RECENT_FACTOR
+            keep = max(1024, int(keep_tokens))
+            window = int(keep / compaction.KEEP_RECENT_FACTOR) + reserve
+            plan = compaction.plan_projection(
+                history, context_window=window, output_reserve=reserve,
+                protect_latest_user=True, protect_pinned=True,
+            )
+        except Exception:
+            logger.exception("算 lane 压缩计划失败（%s %s）", tid, lane)
+            return history, None, None
+        cut = [m for m in plan.cut if not compaction.is_summary_message(m)]
+        if len(cut) < 2:
+            return history, None, None
+        previous_coverage = None
+        if prev_covered > 0:
+            previous_coverage = {
+                "cumulative_covered": int(prev_covered),
+                "covered_messages": int(prev_covered),
+                "last_index": int(prev_covered) - 1,
+            }
+        try:
+            result = await compaction.summarize_messages_ex(
+                cut, models=self._models, role=role, agent=agent, purpose=purpose,
+                group_id=gid, task_id=tid,
+                previous_summary=prev_summary or None, previous_coverage=previous_coverage,
+            )
+        except Exception as e:
+            logger.warning("任务 %s %s 前情压缩没做成：%s", tid, lane, e)
+            return history, None, None
+        text = str(getattr(result, "text", "") or "")
+        if not text:
+            logger.warning("任务 %s %s 前情压缩回了空提要，按没压成处理", tid, lane)
+            return history, None, None
+        summary_msg = compaction.summary_to_message(text)
+        view = list(plan.keep)
+        view.insert(max(0, min(int(plan.summary_index), len(view))), summary_msg)
+        covered = int(getattr(getattr(result, "coverage", None), "cumulative_covered", 0) or 0)
+        if covered <= 0:
+            covered = int(prev_covered) + len(cut)
+        cap = max(0, int(raw_cap))
+        return view, text, (max(0, min(covered, cap)) if cap else 0)
+
+    async def _lead_begin(self, tid: str, gid: str) -> LeadPrior:
         """领队这次请求要接的前情（完整对话，原样往后接，开头不动才吃得上缓存）。
 
         估算超过 _LEAD_COMPACT_TOKENS（或主模型窗口的 40%）→ 先压成一条前情提要存回去
-        （task.lane_compact，缓存断一次，之后接着接）；压缩没做成 → 从零 + 上次的提要（有的话）
-        （task.lane_reset）。返回 (前情, 记录时的需求版本)。
+        （task.lane_compact，缓存断一次，之后接着接）；压缩没做成 → **完整前情原样接着用**
+        （不退回旧提要、不清空、不动原始历史），另记 task.lane_compact_failed：装不下交给
+        下游容量闸（chat_with_retry_on_long_context）明确报错。
+        返回 LeadPrior（前情 / 需求版本 / 读到的原始历史版本 / 已有提要 / 覆盖 / raw 条数）。
         """
         history, ver = self._lead_load(tid, gid)
-        if not history:
-            return [], ver
+        lane_prior = LeadPrior(history=[], ver=ver)
         history = prepare_history(history, allowed=spec_tool_names(self._lead_tool_specs(gid)))
+        lanes = self._lane_store()
+        try:
+            raw = lanes.load_raw(tid, _LEAD_LANE, group_id=gid)
+        except Exception:
+            logger.exception("读领队 lane 原始历史失败（%s）", tid)
+            raw = None
+        raw_rev = int(raw["rev"]) if raw else None
+        raw_count = len(raw["messages"]) if raw else 0
+        lane_prior.rev = raw_rev
+        lane_prior.raw_count = raw_count
+        lane_prior.summary = str(raw["summary"] or "") if raw else ""
+        lane_prior.covered = int(raw["covered_count"] or 0) if raw else 0
         budget = min(_LEAD_COMPACT_TOKENS, int(self._context_window() * 0.4))
         if compaction.estimate_tokens_in_messages(history) <= budget:
-            return history, ver
-        row = None
+            lane_prior.history = history
+            return lane_prior
+        before = list(history)
+        prev_summary = lane_prior.summary
+        prev_covered = lane_prior.covered
         try:
-            row = self._lane_store().load(tid, _LEAD_LANE, group_id=gid)
-        except Exception:
-            logger.exception("读领队 lane 失败（%s）", tid)
-        try:
-            text = await compaction.summarize_messages(
-                history, models=self._models, role="main", agent="main",
-                purpose="coordinator.lead", group_id=gid, task_id=tid,
+            view, text, covered = await self._lane_compress(
+                tid=tid, gid=gid, lane=_LEAD_LANE, role="main", agent="main",
+                purpose="coordinator.lead", history=before, prev_summary=prev_summary,
+                prev_covered=prev_covered, raw_cap=raw_count, keep_tokens=budget,
             )
-            history = [compaction.summary_to_message(text)]
-            self._lane_save(tid, gid, _LEAD_LANE, "main", history, int(ver or 1), snapshot=text)
+        except Exception as e:  # 防御：压缩这一路任何岔子都不许把前情弄丢
+            logger.exception("领队前情压缩异常（%s）", tid)
+            view, text, covered = before, None, None
+        if text is None:
+            # 压不下去 / 没得切：工作视图一条不动（完整历史接着用）、原始历史不动、
+            # 不写提要、不写覆盖；不拿旧提要顶替。这一轮装不下由容量闸明确报错。
+            self._lane_event(
+                tid, gid, "task.lane_compact_failed",
+                "领队这个任务的前情太长、压缩没做成：完整历史原样接着用"
+                "（不退回旧提要、不清空）；装不下会明确报错，不删要求",
+                lane=_LEAD_LANE, why="compact_failed",
+            )
+            lane_prior.history = history
+            return lane_prior
+        history = view
+        try:
+            # 工作视图换成投影；原始历史按压缩前那份对齐归档（一条不丢）；覆盖区间显式给
+            self._lane_save(
+                tid, gid, _LEAD_LANE, "main", history, int(ver or 1), snapshot=text,
+                original_messages=before, summary=text,
+                covered_count=covered, covered_rev=raw_rev, expect_rev=raw_rev,
+            )
             self._lane_event(
                 tid, gid, "task.lane_compact",
                 "领队这个任务的前情太长了：压成一条提要接着用", lane=_LEAD_LANE,
             )
         except Exception as e:
-            logger.warning("任务 %s 领队前情压缩没做成：%s", tid, e)
-            old_snap = str((row or {}).get("snapshot") or "")
-            history = [compaction.summary_to_message(old_snap)] if old_snap else []
-            self._lane_save(tid, gid, _LEAD_LANE, "main", history, int(ver or 1))
-            self._lane_event(
-                tid, gid, "task.lane_reset",
-                "领队这个任务的前情太长、压缩没做成：从零开始"
-                + ("，带上上次的前情提要" if old_snap else "") + "（上一次验收意见仍写在提示里）",
-                lane=_LEAD_LANE, why="compact_failed",
-            )
-        return history, ver
+            logger.warning("任务 %s 领队前情压缩保存失败：%s", tid, e)
+            lane_prior.history = before
+            return lane_prior
+        lane_prior.history = history
+        lane_prior.summary = text
+        lane_prior.covered = covered or 0
+        lane_prior.rev = self._lane_store().raw_rev(tid, _LEAD_LANE, group_id=gid)
+        return lane_prior
 
     @staticmethod
     def _lead_prefix(prefix: str, history: list[dict]) -> str:
@@ -4598,6 +5010,24 @@ class Coordinator:
             if m.get("role") == "user" and p in str(m.get("content") or ""):
                 return _LEAD_SAME_PREFIX
         return p
+
+    @staticmethod
+    def _pinned_requirements_message(locked: list[dict] | None) -> dict | None:
+        """锁定需求清单那条「钉住」的消息（没锁定清单 → None）。
+
+        内容是代码照清单原文拼的（**不做事后语义抽取**）；compaction 认这个标记，
+        摘要时永不把它丢掉（protect_pinned / pin_message）。
+        """
+        if not locked:
+            return None
+        lines = [f"- {requirements.prompt_line(item)}" for item in locked]
+        return compaction.pin_message({
+            "role": "user",
+            "content": (
+                "【本任务已锁定的需求清单（每轮由代码重新注入，压缩不许丢；一个字都不许改）】\n"
+                + "\n".join(lines)
+            ),
+        })
 
     def _lead_tool_specs(self, gid: str) -> list[dict]:
         """领队 lane 的工具表：验收的核对工具 + 排计划的 skill 工具 + 主模型 MCP，计划和验收共用一张。
@@ -4631,13 +5061,22 @@ class Coordinator:
     def _lane_save(
         self, tid: str, gid: str, lane: str, kind: str, history: list[dict], req_version: int,
         *, escalated: bool | None = None, snapshot: str | None = None,
-        handoff_id: str | None = None,
+        handoff_id: str | None = None, original_messages: list[dict] | None = None,
+        expect_rev: int | None = None, summary: str | None = None,
+        covered_count: int | None = None, covered_rev: int | None = None,
     ) -> None:
+        """存这条 lane（工作视图 + 原始历史 + 压缩覆盖，一条事务）。
+
+        `expect_rev` = 读这条 lane 时看到的原始历史版本：中途被别的写入者（取消 / 改版 /
+        另一轮）动过 → 这一版整体不写，不覆盖新的那份。
+        """
         try:
             self._lane_store().save(
                 tid, lane, group_id=gid, kind=kind, messages=list(history or []),
                 req_version=int(req_version), escalated=escalated, snapshot=snapshot,
-                handoff_id=handoff_id,
+                handoff_id=handoff_id, original_messages=original_messages,
+                expect_rev=expect_rev, summary=summary, covered_count=covered_count,
+                covered_rev=covered_rev,
             )
         except Exception:
             logger.exception("存 lane 失败（%s %s）", tid, lane)

@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 from contextlib import contextmanager
 import inspect
 import logging
@@ -59,6 +60,12 @@ __all__ = ["LocalEnv", "RunResult", "Runner", "RunOutcome"]
 _MAX_OUTPUT_CHARS = 20_000          # stdout / stderr 各截 20000 字（保留末尾）
 _MAX_FILE_BYTES = 5 * 1024 * 1024   # 工作区单文件上限 5MB
 _READ_DEFAULT_BYTES = 200_000       # read_file 默认最多读多少字节
+# read_file_page：单次扫描多少字节。UTF-8 一个字最多 4 字节，所以「扫够 offset+limit 个
+# 字」只需要 4×(offset+limit+1) 字节——上限**由调用方要的窗口算出来**，随 offset 增长。
+# 这里**故意不设固定绝对帽**：工具输出归档可能几百 MB，固定帽会让深 offset 的尾页永久失联，
+# 那就不能叫「完整可回读」；读一个深 offset 本来就必须扫过它前面的内容（CPU 与 offset 成正比，
+# 这是读取语义决定的，不是可以偷偷砍掉的东西）。真嫌慢由工具超时 / 调用方指定窗口解决。
+_PAGE_CHUNK_BYTES = 64 * 1024       # read_file_page 每次二进制读多少（内存只留一块 + 一页）
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _LABEL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _WS_SUBDIRS = ("tasks", "artifacts", "tools", "runtime")
@@ -77,6 +84,78 @@ class RunResult:
     ms: int
     timed_out: bool
     oom: bool
+
+
+@dataclass(frozen=True)
+class FilePage:
+    """一份文件按字符切出来的一页（`LocalEnv.read_file_page` 的返回）。"""
+
+    text: str            # 窗口正文（最多 limit 个字）
+    total_chars: int     # 已扫到的字数；complete=False 时只是**下限**（文件可能更长）
+    complete: bool       # True = 已经扫到文件末尾（total_chars 是准数）
+    eof: bool            # True = 这一页已经到文件末尾
+    hit_scan_cap: bool = False   # True = 是撞到本次扫描上限停的（不是窗口够了、也不是到末尾）
+
+
+def write_new_file_verified(root: Any, rel_dir: str, name: str, data: bytes) -> bool:
+    """在工作区根下**新建**一个文件并立刻读回来核对（工具输出归档用，不跟随符号链接）。
+
+    为什么不直接用 `Path.write_text`：工作区里任何一次 `write_file` / `run_command` 都能预埋
+    一个 `tool_spill` → 指向工作区外的符号链接，普通写就会把子 agent 的工具正文泄到工作区外。
+
+    - `root`：工作区根目录（可信锚点，本函数从它开始逐段走）；
+    - `rel_dir`：工作区内的相对目录（如 `tool_spill/T-1`），逐段 `O_NOFOLLOW` 打开、缺就建：
+      任一段是符号链接 / 不是目录 → PermissionError；
+    - `name`：文件名（不许含路径分隔符），`O_CREAT|O_EXCL|O_NOFOLLOW` 创建：已存在 → 
+      FileExistsError（不覆盖别人，也不跟 hardlink 走）；
+    - 写完从**同一个 dir_fd** 读回来逐字比对，不一致返回 False（调用方按「没归档」处理，
+      保留完整正文）；文件名由调用方起（带随机段，避免撞名）。
+    """
+    body = bytes(data or b"")
+    if not name or name in (".", "..") or "/" in name or "\\" in name:
+        raise PermissionError(f"文件名不安全：{name!r}")
+    parts = [p for p in str(rel_dir or "").split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        raise PermissionError(f"路径越界（不允许 ..）：{rel_dir!r}")
+    root_fd = os.open(Path(root).resolve(), LocalEnv._dir_flags())
+    dir_fd = os.dup(root_fd)
+    os.close(root_fd)
+    try:
+        for part in parts:
+            child = LocalEnv._open_dir(dir_fd, part, create=True)
+            os.close(dir_fd)
+            dir_fd = child
+        fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | LocalEnv._nofollow_flag()
+            | getattr(os, "O_CLOEXEC", 0),
+            0o644,
+            dir_fd=dir_fd,
+        )
+        try:
+            with os.fdopen(fd, "wb") as f:
+                fd = -1
+                f.write(body)
+        except Exception:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(name, dir_fd=dir_fd)
+            except OSError:
+                pass
+            raise
+        try:
+            check_fd = os.open(
+                name,
+                os.O_RDONLY | LocalEnv._nofollow_flag() | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=dir_fd,
+            )
+        except OSError:
+            return False
+        with os.fdopen(check_fd, "rb") as f:
+            return f.read() == body
+    finally:
+        os.close(dir_fd)
 
 
 class LocalEnv:
@@ -833,6 +912,93 @@ class LocalEnv:
         if len(data) > max_bytes:
             data = data[:max_bytes]
         return data.decode("utf-8", errors="replace")
+
+    async def read_file_page(
+        self,
+        name: str,
+        rel: str,
+        *,
+        offset: int = 0,
+        limit: int = 5_000,
+        max_scan_bytes: int | None = None,
+    ) -> "FilePage":
+        """按**字符** offset / limit 流式读一页（docs/27 §8 P1：归档可能远超单次读取字节上限）。
+
+        - offset / limit 都是字符数（0 = 第一个字），limit = 这一页最多给多少字；
+        - 逐块二进制读 + 增量 UTF-8 解码（跨块的多字节字符不会破），跳过 offset 之前的字、
+          只收集窗口内的字 → **内存 = 一块 + 一页**，不把整份文件读进来；
+        - **扫到「窗口够用」就停**，不每页扫到文件末尾；扫描字节上限随 offset 增长
+          （`max(4 × (offset + limit + 1), max_scan_bytes)`，再夹一个绝对帽）——这样多深的
+          offset 都够得到，短读只发生在病态大文件上；
+        - 扫到文件末尾：`complete=True`，`total_chars` 是准数；否则 `complete=False`，
+          `total_chars` 只是**下限**（"已经扫到这么多字"）——调用方必须按可读前缀报，
+          不许说成文件总长度（和 read_file 顶到字节上限时的口径一致）；
+        - 打开方式与 read_file 完全一样：可信工作区根锚定 fd、逐段 O_NOFOLLOW、只认独立的
+          普通文件（符号链接 / 硬链接一律拒）。**权限没有放宽**，只是不再把整份文件读进内存。
+        """
+        offset = max(0, int(offset))
+        limit = max(0, int(limit))
+        want_chars = offset + limit
+        # 扫描字节上限：默认按「要够到 offset+limit 个字」算（一个字最多 4 字节），
+        # 不设固定绝对帽——固定帽会让深 offset 的页永久失联（那就不是完整可回读）。
+        scan_cap = (
+            max(1, int(max_scan_bytes))
+            if max_scan_bytes is not None
+            else 4 * (want_chars + 1)
+        )
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        taken: list[str] = []
+        seen = 0            # 已解码的字符总数（含跳过的）
+        taken_chars = 0
+        consumed = 0
+        complete = False
+        hit_cap = False
+
+        def _take(chunk_text: str) -> None:
+            """把这一块的文字里属于窗口的部分收下（其余只数字数）。"""
+            nonlocal seen, taken_chars
+            if not chunk_text:
+                return
+            start = offset - seen
+            if taken_chars < limit and start < len(chunk_text):
+                at = max(0, start)
+                piece = chunk_text[at: at + (limit - taken_chars)]
+                if piece:
+                    taken.append(piece)
+                    taken_chars += len(piece)
+            seen += len(chunk_text)
+
+        with self._parent_fd(name, rel) as (_ws, parent_fd, last):
+            try:
+                fd = self._open_file_at(parent_fd, last)
+            except FileNotFoundError:
+                raise FileNotFoundError(f"工作区内没有这个文件：{rel!r}") from None
+            with os.fdopen(fd, "rb") as f:
+                while True:
+                    chunk = f.read(_PAGE_CHUNK_BYTES)
+                    if not chunk:
+                        _take(decoder.decode(b"", final=True))
+                        complete = True
+                        break
+                    consumed += len(chunk)
+                    _take(decoder.decode(chunk))
+                    if len(chunk) < _PAGE_CHUNK_BYTES:   # 短读 = 文件到底了（缓冲读只会在末尾短读）
+                        _take(decoder.decode(b"", final=True))
+                        complete = True
+                        break
+                    if seen >= want_chars:      # 窗口够了就停，别替调用方读完整份
+                        break
+                    if consumed >= scan_cap:
+                        hit_cap = True
+                        break
+        body = "".join(taken)
+        return FilePage(
+            text=body,
+            total_chars=seen,
+            complete=complete,
+            eof=complete and offset + len(body) >= seen,
+            hit_scan_cap=hit_cap,
+        )
 
     async def write_file(self, name: str, rel: str, content: str, *, append: bool = False) -> None:
         data = str(content).encode("utf-8")

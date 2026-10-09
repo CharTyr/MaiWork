@@ -26,11 +26,17 @@ class FakeChatResult:
 class ReplayModels:
     """假 models：按队列回放 ChatResult；每项可以是 ChatResult / Exception。
 
-    记录每次 chat 的 (role, messages, kwargs) 供断言。"""
+    记录每次 chat 的 (role, messages, kwargs) 供断言。
 
-    def __init__(self, results):
+    limits：可选，给了就实现 `limits_for(kind, escalate=…)`——2026-10 起「窗口 / 输出预留」
+    由 compaction 的整包预算口统一解析（`models.request_budget` → `limits_for` → 默认），
+    workers 不再自己读 settings 里的窗口；要测压缩触发就得在这个口上给窗口。
+    """
+
+    def __init__(self, results, limits: dict | None = None):
         self.queue = list(results)
         self.calls = []
+        self._limits = limits
 
     async def chat(self, role=None, messages=None, **kwargs):
         # 深拷贝 messages 的快照（后面会被 workers 继续追加）
@@ -41,6 +47,11 @@ class ReplayModels:
         if isinstance(item, BaseException):
             raise item
         return item
+
+    def limits_for(self, kind=None, *, escalate: bool = False):
+        if self._limits is None:
+            raise AttributeError("limits_for")
+        return dict(self._limits)
 
 
 def _tool_call(name, arguments, call_id="call-1"):
@@ -292,7 +303,11 @@ class TestFailures:
         assert "端点挂了" in report.error
 
     @pytest.mark.asyncio
-    async def test_tool_result_truncated_in_message(self, store, tools):
+    async def test_tool_result_not_truncated_in_message(self, store, tools):
+        """超长工具输出**不再硬截**：没有归档目录（归档不了）就原样给全文，装不下由预算闸报错。
+
+        2026-10 口径（docs/27 §8 P1）：明确失败比重造「截断后看着像读完了」的假象正确。
+        """
         from CharTyr_MaiWork.maiwork.tools import Tool
 
         async def big(ctx, args):
@@ -319,7 +334,8 @@ class TestFailures:
         assert report.ok
         msgs2 = models.calls[1][1]
         tool_msg = [m for m in msgs2 if m.get("role") == "tool"][0]
-        assert len(tool_msg["content"]) <= 6100  # 截 6000 字 + 截断标记
+        assert tool_msg["content"] == "长" * 20000, "归档不了时也不许悄悄丢中段"
+        assert "已截断" not in tool_msg["content"]
 
 
 class TestToolCallsPersisted:
@@ -425,7 +441,7 @@ class TestWorkersCompaction:
             FakeChatResult(tool_calls=[_tool_call("big_out", {}, "c2")]),
             FakeChatResult(tool_calls=[_tool_call("big_out", {}, "c3")]),
             FakeChatResult(tool_calls=[_tool_call("submit_result", {"summary": "好了"}, "c4")]),
-        ])
+        ], limits={"context_window": 64000, "max_tokens": 4096})
         orig_chat = models.chat
 
         async def chat(role=None, messages=None, **kw):
@@ -468,7 +484,7 @@ class TestWorkersContextCompaction:
             FakeChatResult(tool_calls=[_tool_call("web_search", {"query": "a3"}, "c3")]),
             FakeChatResult(tool_calls=[_tool_call("web_search", {"query": "a4"}, "c4")]),
             FakeChatResult(tool_calls=[_tool_call("submit_result", {"summary": "完"}, "c5")]),
-        ])
+        ], limits={"context_window": 64000, "max_tokens": 4096})
         # 假 models.chat 里 purpose 以 :compact 结尾时回 8 节摘要文本
         orig_chat = models.chat
         compact_calls: list[dict] = []

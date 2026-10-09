@@ -129,15 +129,17 @@ class TestCompactLooped:
 
     @pytest.mark.asyncio
     async def test_big_tool_only_solves_without_summary(self):
-        # 只有超长 tool 结果超了触发线 → 截断后不再超 → 不调摘要
+        # 只有超长 tool 结果超了触发线 → 截断后不再超 → 不调摘要。
+        # 2026-10-09 起剪枝要求能回读：正文里带 spill 指针行才会被剪（docs/27 §8 P0）。
         class M:
             async def chat(self, *a, **k):
                 raise AssertionError("不该调模型")
 
-        big = "x" * 30000
+        big = "x" * 30000 + "\n\n（完整输出在：/tmp/spill-big.txt）"
         msgs = [_msg("system", "s"), _msg("user", "u"), _msg("assistant", "", tool_calls=[{"id": "c", "function": {"name": "f", "arguments": "{}"}}]), _msg("tool", big, tool_call_id="c")]
         out = await compaction.maybe_compact(msgs, models=M(), role="main", context_window=8192, output_reserve=0, keep_recent_n=0)
         assert "省略" in out[3]["content"]
+        assert "/tmp/spill-big.txt" in out[3]["content"], "回读指针必须留住"
 
     @pytest.mark.asyncio
     async def test_summary_replaces_old_part_and_logged(self):

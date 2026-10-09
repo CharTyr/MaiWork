@@ -69,6 +69,7 @@ _REFUSED = "管理员没有同意，这次动作已取消"
 _NOT_IN_SERVICE = "这不是配置里的服务群，MaiWork 不读也不动它"
 _ADMIN_ONLY = "只有 bot 管理员能用，当前角色不允许"
 _NO_CHAT = "管理员对话还没绑定，这个动作先记不下小票：请在网页对话里重发一次"
+_NO_CHAT_READ = "这段对话没绑定，读不了原文：请让管理员在网页的对话页面里叫我读（只读当前对话，不猜别的）"
 
 MAX_SUMMARY = 200
 
@@ -782,6 +783,61 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             for r in data
         ]
         return _ok(f"「{status}」请求 {len(data)} 条：\n" + "\n".join(lines), data=data)
+
+    async def read_admin_history(ctx: ToolContext, args: dict) -> ToolResult:
+        """读**当前这段**管理员对话的原文（含被压缩截断的工具输出全文），按 id / 字符窗口分页。
+
+        参数里没有 chat_id，也绝不看模型传的 chat_id：归属只认 ctx.chat_id
+        （admin_chat._run_call 每轮挂上的），所以模型拿不到「读别的对话」的口子；
+        没绑定对话就直接拒绝，不猜一段来读。
+        """
+        from . import admin_chat as _admin_chat
+
+        chat = getattr(svc, "admin_chat", None)
+        if chat is None:
+            return _bad("管理员对话层还没就位，读不了对话原文")
+        try:
+            cid = int(getattr(ctx, "chat_id", 0) or 0)
+        except (TypeError, ValueError):
+            cid = 0
+        if cid <= 0:
+            return _bad(_NO_CHAT_READ)
+        after = _int(args.get("after"), 0, 0, 2**31)
+        limit = _int(args.get("limit"), _admin_chat.READ_HISTORY_DEFAULT_LIMIT, 1, _admin_chat.READ_HISTORY_MAX_LIMIT)
+        offset = _int(args.get("offset"), 0, 0, 2**31)
+        chars = _int(args.get("chars"), _admin_chat.READ_HISTORY_DEFAULT_CHARS, 1, _admin_chat.READ_HISTORY_MAX_CHARS)
+        try:
+            page = chat.read_history(cid, after=after, limit=limit, offset=offset, chars=chars)
+        except ValueError as e:
+            return _bad(str(e))
+        except Exception as e:
+            logger.exception("读管理员对话原文失败（对话 %s）", cid)
+            return _bad(f"读对话原文失败：{e}")
+        msgs = list(page.get("messages") or [])
+        if not msgs:
+            return _ok(f"这段对话里没有 id > {after} 的消息", data=page)
+        lines: list[str] = []
+        for m in msgs:
+            try:
+                mid = int(m.get("id") or 0)
+            except (TypeError, ValueError):
+                mid = 0
+            head = f"#{mid} [{m.get('role')}" + (f" {m.get('name')}" if m.get("name") else "") + "]"
+            body = str(m.get("content") or "")
+            if m.get("has_more_content"):
+                body += (
+                    f"\n……（这条还有，用 after={max(mid - 1, 0)} offset={m.get('next_offset')} "
+                    f"chars={chars} 接着读同一条）"
+                )
+            lines.append(head + "\n" + body)
+        if page.get("has_more"):
+            nxt = page.get("next_after")
+            nxt_off = int(page.get("next_offset") or 0)
+            hint = f"after={nxt} offset={nxt_off}" if nxt_off else f"after={nxt}"
+            tail = f"（共 {len(msgs)} 条；接着往下读用 {hint}）"
+        else:
+            tail = f"（共 {len(msgs)} 条，后面没有了）"
+        return _ok("\n\n".join(lines) + "\n" + tail, data=page)
 
     async def read_chat(ctx: ToolContext, args: dict) -> ToolResult:
         gid, err = _served(args.get("group_id") or ctx.group_id)
@@ -1945,6 +2001,28 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                 },
             },
             list_requests,
+        ),
+        (
+            {
+                "name": "read_admin_history",
+                "description": (
+                    "读当前这段管理员对话的原文（含被截断 / 压缩的工具结果全文）。"
+                    "只能读当前对话，参数里没有也认不了别的对话号。"
+                    "after=从哪条消息 id 之后读（默认 0），limit=一次几条（默认 4，最多 20）；"
+                    "offset / chars=每条按字符窗口取（默认 0 / 4000）；"
+                    "一次整体最多 2 万字，没读完的最后一条用返回里的 after / offset 接着读。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "after": {"type": "integer", "description": "只看 id 大于它的消息（默认 0）"},
+                        "limit": {"type": "integer", "description": "一次最多几条，默认 4，最多 20"},
+                        "offset": {"type": "integer", "description": "每条从第几个字开始取，默认 0"},
+                        "chars": {"type": "integer", "description": "每条最多取多少字，默认 4000，最多 20000"},
+                    },
+                },
+            },
+            read_admin_history,
         ),
         (
             {

@@ -202,15 +202,19 @@ class TestBudgetHardCap:
 
     @pytest.mark.asyncio
     async def test_every_chunk_body_within_budget(self):
-        """多消息多工具的长对话：每次 prompt（含模板）都 ≤ 预算。"""
+        """多消息多工具的长对话：每次 prompt（含模板）都 ≤ 预算。
+
+        2026-10-09 起超长 tool 结果只有「能回读」（正文带 spill 指针行）才容许截断，
+        所以两条 tool 结果都带上指针行（docs/27 §8 P0 的可回读规则）。
+        """
         piece = [
             _msg("user", "任务" + "u" * 20000),
             _msg("assistant", "", tool_calls=[_tool_call("c1", "web_search")]),
-            _msg("tool", "结果" + "t" * 20000, tool_call_id="c1"),
+            _msg("tool", "结果" + "t" * 20000 + "\n\n（完整输出在：/tmp/spill-c1.txt）", tool_call_id="c1"),
             _msg("assistant", "决定" + "a" * 25000),
             _msg("user", "补充约束" + "v" * 30000),
             _msg("assistant", "", tool_calls=[_tool_call("c2", "fetch_page")]),
-            _msg("tool", "页面" + "p" * 30000, tool_call_id="c2"),
+            _msg("tool", "页面" + "p" * 30000 + "\n\n（完整输出在：/tmp/spill-c2.txt）", tool_call_id="c2"),
             _msg("user", "收尾" + "w" * 15000),
         ]
         models = _RecordingModels(replies=[_summary_stub() for _ in range(16)])
@@ -399,13 +403,17 @@ class TestContractsKept:
 
     @pytest.mark.asyncio
     async def test_maybe_compact_keeps_system_and_recent(self):
-        """走完整 maybe_compact：system 不动、最近回合原样、摘要消息替换最老段。"""
-        old = [_msg("user", f"老{i}" + "x" * 9000) for i in range(5)]
+        """走完整 maybe_compact：system 不动、最近回合原样、摘要消息替换最老段。
+
+        窗口取 128k（保留预算够放 keep 段）：8192 的窗口下，光「保住最近那 1 条大消息」
+        就已经超过可用输入，收尾的整包复算会明确拒绝替换（那是设计行为，见 docs/27 §8 P1）。
+        """
+        old = [_msg("user", f"老{i}" + "x" * 9000) for i in range(10)]
         recent = [_msg("user", "最近的活 " + "r" * 200)]
         msgs = [_msg("system", "sys_prompt_unique")] + old + recent
         models = _RecordingModels(replies=[_summary_stub() for _ in range(8)])
         out = await compaction.maybe_compact(
-            msgs, models=models, role="main", context_window=8192,
+            msgs, models=models, role="main", context_window=128000,
             output_reserve=256, purpose="t",
         )
         assert out[0]["role"] == "system" and out[0]["content"] == "sys_prompt_unique"

@@ -38,6 +38,8 @@ ALL_ADMIN_TOOLS = {
     "list_groups", "group_overview", "read_profile", "list_focus", "list_news",
     "list_ideas", "list_tasks", "task_detail", "list_goals", "list_requests",
     "read_chat", "read_logs", "get_rules", "get_identity", "list_extensions",
+    # 管理员对话自己的原文回读（0.4.1 加：工具结果全文落库 + 按 id/字符窗口分页读回）
+    "read_admin_history",
     # 写类
     "profile_edit", "profile_bulk_delete", "focus_edit",
     "rss_add", "rss_remove", "block_domain", "set_rules", "identity_edit", "remember",

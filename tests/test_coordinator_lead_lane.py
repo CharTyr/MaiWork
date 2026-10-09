@@ -217,12 +217,15 @@ async def test_long_lead_lane_compacted_once(mem_store, settings, env, tools, ta
     await coord.run_task(tid)
     assert tasks.get(tid)["status"] == "completed"
     second_plan = _calls(models, "coordinator.plan")[1]
-    assert len(second_plan) == 2 and "试过不行的" in second_plan[0]["content"], "压成一条提要再接"
+    earlier = second_plan[:-1]
+    assert any("试过不行的" in str(m.get("content") or "") for m in earlier), "压成一条提要再接"
+    assert len(earlier) < 5, "老的那段被提要替代，不是原样全量重发"
     kinds = [k for k, _ in _kinds(mem_store, tid)]
     assert "task.lane_compact" in kinds
 
 
-async def test_lead_compact_failure_falls_back(mem_store, settings, env, tools, tasks, goals, monkeypatch):
+async def test_lead_compact_failure_keeps_full_history(mem_store, settings, env, tools, tasks, goals, monkeypatch):
+    """领队前情压缩没做成：完整历史接着用（不是旧提要、不是空），另记失败事件。"""
     from CharTyr_MaiWork.maiwork import coordinator as co
 
     monkeypatch.setattr(co, "_LEAD_COMPACT_TOKENS", 50)
@@ -231,5 +234,9 @@ async def test_lead_compact_failure_falls_back(mem_store, settings, env, tools, 
     coord, _spec = _setup(mem_store, settings, env, tools, tasks, goals, models)
     await coord.run_task(tid)
     assert tasks.get(tid)["status"] == "completed", "压不下去不卡任务"
-    assert len(_calls(models, "coordinator.plan")[1]) == 1, "从零开始（上一次验收意见仍在提示里）"
-    assert "缺下载链接" in _calls(models, "coordinator.plan")[1][-1]["content"]
+    second_plan = _calls(models, "coordinator.plan")[1]
+    earlier = json.dumps(second_plan[:-1], ensure_ascii=False)
+    assert "查资料做一页" in earlier, "完整历史接着用（不是从零）"
+    assert "缺下载链接" in earlier, "上一轮验收意见也在前情里"
+    kinds = [k for k, _ in _kinds(mem_store, tid)]
+    assert "task.lane_compact_failed" in kinds and "task.lane_compact" not in kinds

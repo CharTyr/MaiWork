@@ -140,17 +140,26 @@ async def test_rework_plan_prompt_tells_lead_same_worker(mem_store, settings, en
     assert "接着改" not in plan_prompts[0]
 
 
-async def test_second_failure_compacts_and_escalates(mem_store, settings, env, tools, tasks, goals):
+async def test_second_failure_compacts_and_escalates(mem_store, settings, env, tools, tasks, goals, monkeypatch):
+    from CharTyr_MaiWork.maiwork import coordinator as co
+
+    monkeypatch.setattr(co, "_LEAD_COMPACT_TOKENS", 20)
     tid = _create_task(tasks)
-    models = LaneModels([TEXT_PLAN, BAD, TEXT_PLAN, BAD, TEXT_PLAN, GOOD])
+    long_plan = json.dumps(
+        {"criteria": ["包含链接"], "deliver_kind": "text",
+         "jobs": [{"brief": "查资料做一页" * 400, "tools": ["web_search"]}], "question": None},
+        ensure_ascii=False,
+    )
+    models = LaneModels([long_plan, BAD, long_plan, BAD, long_plan, GOOD])
     coord, spec = _setup(mem_store, settings, env, tools, tasks, goals, models)
     await coord.run_task(tid)
     assert tasks.get(tid)["status"] == "completed"
     assert len(spec.calls) == 3
     assert [c["escalate"] for c in spec.calls] == [False, False, True]
-    assert models.compact_calls == 1
     third = spec.calls[2]["history"]
-    assert len(third) == 1 and "试过不行的" in third[0]["content"], "换模型前先压缩成前情提要"
+    assert models.compact_calls >= 1, "换模型前压了一次"
+    assert any("试过不行的" in str(m.get("content") or "") for m in third), "换模型前先压缩成前情提要"
+    assert "前面对话的摘要" in str(third[0].get("content") or ""), "提要接在最前面"
     esc = [p for k, p in _kinds(mem_store, tid) if k == "task.lane_escalate"]
     assert esc and esc[0].get("to") == "主模型"
 
@@ -176,15 +185,21 @@ async def test_third_failure_fails(mem_store, settings, env, tools, tasks, goals
     assert len(spec.calls) == 3
 
 
-async def test_compaction_failure_resets_lane(mem_store, settings, env, tools, tasks, goals):
+async def test_compaction_failure_keeps_full_history(mem_store, settings, env, tools, tasks, goals):
+    """换模型前压缩没做成：完整前情原样接着用（不 reset 成空、不退回旧提要）。"""
     tid = _create_task(tasks)
     models = LaneModels([TEXT_PLAN, BAD, TEXT_PLAN, BAD, TEXT_PLAN, GOOD], compact_fail=True)
     coord, spec = _setup(mem_store, settings, env, tools, tasks, goals, models)
     await coord.run_task(tid)
     assert tasks.get(tid)["status"] == "completed"
-    assert spec.calls[2]["history"] == []
+    third = spec.calls[2]["history"]
+    assert third, "不是从零开始"
+    text = json.dumps(third, ensure_ascii=False)
+    assert "第 1 轮做完了" in text and "第 2 轮做完了" in text
     assert spec.calls[2]["escalate"] is True
-    assert "task.lane_reset" in [k for k, _ in _kinds(mem_store, tid)]
+    kinds = [k for k, _ in _kinds(mem_store, tid)]
+    assert "task.lane_compact_failed" in kinds
+    assert "task.lane_reset" not in kinds
 
 
 async def test_terminal_clears_lane(mem_store, settings, env, tools, tasks, goals):
@@ -219,18 +234,22 @@ async def test_rework_handoffs_chain_by_parent(mem_store, settings, env, tools, 
     assert [c["parent_id"] for c in spec.calls] == ["", "H-1", "H-2"]
 
 
-async def test_compaction_failure_falls_back_to_old_snapshot(mem_store, settings, env, tools, tasks, goals):
-    """压不下去 → 「从零 + 前情提要」：有旧提要就带上旧提要。"""
+async def test_compaction_failure_does_not_reinject_old_snapshot(mem_store, settings, env, tools, tasks, goals):
+    """压不下去 → 手里的完整前情原样接（不拿旧提要顶替、不从 raw 展开补料）。"""
     tid = _create_task(tasks)
     if str(tasks.get(tid)["status"]) == "pending_approval":
         tasks.transition(tid, "queued")
-    TaskLanes(mem_store).save(tid, "worker:1", group_id=GID, kind="task",
-                              messages=[], req_version=1, snapshot="旧提要：第一版缺链接")
+    TaskLanes(mem_store).save(
+        tid, "worker:1", group_id=GID, kind="task", req_version=1, snapshot="旧提要：第一版缺链接",
+        messages=[{"role": "user", "content": "上一轮交代"},
+                  {"role": "assistant", "content": "搜到 3 条"}],
+    )
     models = LaneModels([TEXT_PLAN, BAD, TEXT_PLAN, BAD, TEXT_PLAN, GOOD], compact_fail=True)
     coord, spec = _setup(mem_store, settings, env, tools, tasks, goals, models)
     await coord.run_task(tid)
-    third = spec.calls[2]["history"]
-    assert len(third) == 1 and "旧提要：第一版缺链接" in third[0]["content"]
+    third = json.dumps(spec.calls[2]["history"], ensure_ascii=False)
+    assert "搜到 3 条" in third, "完整前情接着用"
+    assert "旧提要：第一版缺链接" not in third, "不拿旧提要顶替"
 
 
 async def test_lane_survives_new_coordinator(mem_store, settings, env, tools, tasks, goals):

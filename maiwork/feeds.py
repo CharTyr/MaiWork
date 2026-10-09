@@ -515,6 +515,20 @@ _IDEA_WORTH_LOW = ("low", "低", "不确定", "unsure")
 _GUIDES_VIEW_DAYS = 30      # 好文专栏：最近 30 天
 _GUIDES_VIEW_CAP = 20       # 好文专栏最多 20 条
 _QUOTE_MAX = 200            # 子 agent 交回的原文依据最长（截断照收，只有空才淘汰）
+# 卡片短摘要（brief）的长度口径（2026-10-08 线上巡检 #1301）：打分落库转换处原来 [:140]
+# 硬截，把 176 字的模型原文切在词中间（alpha → al），还把「免费 / 付费限定」整句丢掉；
+# 截断发生在展示核验之前，所以那一轮核验看到的就是截断后的文本、没拦下来（conditions 也在
+# 核验输入里，不能据此断言原则上发现不了）。修法是不在转换阶段静默切：
+# 正常长度（≤ _BRIEF_KEEP_MAX）原样保留；只有超长异常才 fail-safe 丢掉 brief，
+# 让卡片回落已核验的 summary（不截在词中、不把条件丢一半）。
+_BRIEF_KEEP_MAX = 300
+# 整轮打分失败（所有批都没评上）时给没评上的候选留的理由；和 _score 内逐条判的一致。
+_SCORE_FAILED_REASON = "打分没做完（模型超时/出错），这轮没评上"
+# 模型回了、但漏给这一条分（不是出错/超时）：同样「没评过」，理由另写免得混在一起。
+_SCORE_MISSING_REASON = "打分漏了这条（模型没给分）"
+# 「模型压根没评过这一条」的两句写死话术（打分那一步的固定产出，见 _score / _persist_score_failure）。
+# 这两句不是内容判定，不能进「内容被拒过」的长期去重名单（2026-10-08 复核发现的交互）。
+_SCORE_UNJUDGED_REASONS = (_SCORE_FAILED_REASON, _SCORE_MISSING_REASON)
 _TOPIC_MAX_LEN = 8          # 话题标签最多几个字（超了截断）
 _POOL_NEWS_MAX_AGE_H = 48   # 进话题候选池的资讯必须多少小时内
 _AUTO_BLOCK_NET_DOWN_MIN = 3   # 「没用」净值（down-up）到多少自动屏蔽这个来源
@@ -840,6 +854,23 @@ def _rejection_is_quota(gate: Any, reason: Any) -> bool:
     return any(marker in text for marker in _QUOTA_REJECT_MARKERS)
 
 
+def _rejection_has_no_content_verdict(gate: Any, reason: Any) -> bool:
+    """这条淘汰里有没有「内容不行」的判断？没有（模型压根没评过这一条）→ 不挡后面批次的同一链接。
+
+    2026-10-08 复核发现的交互：整轮打分失败（端点 451 内容拦截）后给幸存者落库的
+    score「打分没做完（模型超时/出错）」留痕，被 `_recent_rejected_keys` 当成内容否决，
+    于是这批从没被评过的好文在 lookback_days 内被粗筛 / 即时判重永久挡掉。留痕要留，
+    但它不是内容判定。
+
+    精确判定，不一刀切跳过 score 闸：只认 gate == "score" 且理由**正好**是
+    `_SCORE_UNJUDGED_REASONS` 里那两句写死话术。别的门、别的话术（将来 score 闸若出现
+    真正的内容判定）→ False，照旧按内容类处理（宁多挡不误放；空 / 认不出也 False）。
+    """
+    if str(gate or "") != "score":
+        return False
+    return str(reason or "").strip() in _SCORE_UNJUDGED_REASONS
+
+
 def _title_key(title: Any) -> str:
     """标题去重用的键：去掉所有空白、转小写（「A | B」和「A |B」算同一个）。"""
     return _re.sub(r"\s+", "", str(title or "")).lower()
@@ -888,6 +919,21 @@ _POST_ACCURACY_RULES = (
     "- 范围扩大：免费 / 付费、全部 / 部分、永久 / 限时照原文写；条目列了「必须保留的限定」的，正文要写到，"
     "标题和正文都不许写反或把范围说大；只用这一条自己的依据，不许串用同批其他条目的事实。",
 )
+
+
+def _clean_brief(raw: Any) -> str:
+    """卡片短摘要（brief）的清洗：不在转换阶段静默切掉条件（2026-10-08 线上巡检 #1301）。
+
+    - 换行 / 连续空白并成一个空格（老行为）；
+    - 正常长度（≤ _BRIEF_KEEP_MAX，含实测的 140–176 字）原样保留——老的 [:140] 硬截会把
+      「免费 / 付费限定」这类条件整句切掉，还把 alpha 截成 al；
+    - 超长异常：整条丢掉（返回 ""），让卡片回落已核验的 summary；宁可回落也不留半截文本。
+    """
+    text = _re.sub(r"\s+", " ", str(raw or "").replace("\n", " ")).strip()
+    if len(text) > _BRIEF_KEEP_MAX:
+        logger.info("卡片短摘要过长（%d 字 > %d），按保底回落已核验摘要", len(text), _BRIEF_KEEP_MAX)
+        return ""
+    return text
 
 
 def _body_rewritten(it: dict) -> bool:
@@ -974,7 +1020,9 @@ async def check_display_texts(
         if str(it.get("title_zh") or "").strip():
             lines.append(f"    要核 title（中文标题）：{str(it['title_zh'])[:150]}")
         if str(it.get("brief") or "").strip():
-            lines.append(f"    要核 brief（卡片短摘要）：{str(it['brief'])[:200]}")
+            # 保留下来的 brief 最多 _BRIEF_KEEP_MAX 字，这里按同一口径给全：
+            # 核验看到的必须是被保留的全文，否则结构上发现不了「截断丢条件」（2026-10-08 巡检）
+            lines.append(f"    要核 brief（卡片短摘要）：{str(it['brief'])[:_BRIEF_KEEP_MAX]}")
         if _body_rewritten(it):
             lines.append(f"    要核 body（帖子正文）：{str(it['post']['body'])[:600]}")
     try:
@@ -1379,8 +1427,12 @@ class Feeds:
         用途：同一链接被内容类理由拒过一次，后面几轮别再并进来、别再打分
         （2026-09-30 线上实录：RSS 轮询源触乐/游研社/机核的同几篇文章，批次 48/49/52
         每轮都重新打分、再被同一个理由拒一次）。窗口和 _stored_url_keys 一致。
-        例外：纯名额 / 配额类淘汰（_rejection_is_quota：「留分高的」「超出本轮上限」
-        「拓展名额」「换换别的」）不挡——只怪这轮没位子，内容本身没毛病。
+        两类例外（都不算内容否决，不挡后面批次的同一链接）：
+        - 纯名额 / 配额类淘汰（_rejection_is_quota：「留分高的」「超出本轮上限」
+          「拓展名额」「换换别的」）——只怪这轮没位子，内容本身没毛病；
+        - 模型压根没评过这一条（_rejection_has_no_content_verdict：score 闸的
+          「打分没做完（模型超时/出错）」「打分漏了这条（模型没给分）」）——2026-10-08 复核：
+          整轮打分失败的留痕行不能变成 14 天内容黑名单（留痕照留，只是不当内容判定）。
         """
         lookback_days = max(1, int(getattr(settings.feeds, "lookback_days", 14)))
         since = clock.now() - lookback_days * 86400.0
@@ -1398,7 +1450,8 @@ class Feeds:
             key = str(r["url_key"] or "")
             if not key:
                 continue
-            if _rejection_is_quota(_row_get(r, "reject_gate", ""), _row_get(r, "reject_reason", "")):
+            gate, reason = _row_get(r, "reject_gate", ""), _row_get(r, "reject_reason", "")
+            if _rejection_is_quota(gate, reason) or _rejection_has_no_content_verdict(gate, reason):
                 continue
             out.add(key)
         return out
@@ -1865,9 +1918,12 @@ class Feeds:
                 await self._score(gid, settings, survivors, task_id=collect_mark)
             except (ModelError, ValueError) as e:
                 logger.info("备资讯-打分失败（群 %s）：%s", gid, e)
-                self._skipped_batch(
-                    gid, f"模型打分失败：{e}", found=len(candidates),
-                    stats=self._round_stats(collect_mark, two_phase_stats.get("funnel")),
+                # 2026-10-08 线上巡检：451 内容拦截让同一块全失败时，老代码只记一条
+                # found/kept/skipped 的跳过批次就 return 0，候选的逐条拒绝记录全丢。
+                # 现在走正常落库路径把候选留下（0 收录、零额外模型调用），见 _persist_score_failure。
+                self._persist_score_failure(
+                    gid, settings, candidates, survivors, e,
+                    collect_mark=collect_mark, funnel=two_phase_stats.get("funnel"),
                 )
                 return 0
             # 第一道（模型侧）：不扎实 / 垃圾 / 同一件事（含 dup_of 指到已发布的）
@@ -2699,7 +2755,8 @@ class Feeds:
                         str(item.get("src_query") or "")[:300],
                         str(item.get("src_provider") or "")[:120],
                         json.dumps(item["followup"], ensure_ascii=False) if item.get("followup") else "",
-                        str(item.get("brief") or "")[:140],
+                        # 入库这刀也不许再静默截条件：正常长度照留，超长异常回落（_clean_brief）
+                        _clean_brief(item.get("brief")),
                     ),
                 )
                 item["_news_id"] = int(cur.lastrowid or 0)
@@ -4147,7 +4204,8 @@ class Feeds:
             ' "new_fact": relation 是 update 时必填——一句话说清比上次多了什么事实；说不出就说明它其实是 duplicate，给空字符串,'
             ' "brief": 发到群里卡片上的短摘要：两三句、60 到 100 个汉字，先说发生了什么 / 讲了什么，再补一两个最关键的事实或数字、影响，不要「XX 报道」「据悉」「本文」这类铺垫，不要重复标题原话，不点名任何群友；'
             '只能用这一条自己的摘要和原文依据，不能用同批其他条目的事实，摘要里说「没有 / 未见」的不许写成有；'
-            '这一条列了「必须保留的限定」的，不能写反或把范围说大（如「限时 / 指定型号免费」不能写成「免费无限量」）,'
+            '这一条列了「必须保留的限定」的，不能写反或把范围说大（如「限时 / 指定型号免费」不能写成「免费无限量」），'
+            '而且限定一定要写进 brief——宁可多写几个字、超过 100 字，也不许把收费 / 免费 / 限时这类限定漏掉,'
             ' "dup_in_batch": 如果这条和这批候选里编号比它小的另一条讲的是同一件事/同样的内容，'
             '就回那一条的编号（整数），否则回 null,'
             ' "why": "为什么给这个群（一句话，只说群的事，不许点名任何群友）",'
@@ -4220,8 +4278,9 @@ class Feeds:
             return {
                 "scores": five,
                 "why": str(s.get("why") or "").strip()[:200],
-                # 卡片短摘要：只给群卡片用（网页照旧 summary）；换行变空格、截 80 字
-                "brief": str(s.get("brief") or "").strip().replace("\n", " ")[:140],
+                # 卡片短摘要：只给群卡片用（网页照旧 summary）；换行变空格，正常长度原样保留，
+                # 超长异常由 _clean_brief 整条回落（不硬截、不切词，2026-10-08 线上巡检）
+                "brief": _clean_brief(s.get("brief")),
                 "icon": icon,
                 "topic": topic,
                 "sensitive": bool(s.get("sensitive", False)),
@@ -4408,9 +4467,9 @@ class Feeds:
                 # E（2026-11）：模型漏给分（不是出错/超时）→ 理由写「打分漏了这条」，不写相关度
                 item.setdefault(
                     "reject",
-                    ("score", "打分没做完（模型超时/出错），这轮没评上")
+                    ("score", _SCORE_FAILED_REASON)
                     if pos in errored
-                    else ("score", "打分漏了这条（模型没给分）"),
+                    else ("score", _SCORE_MISSING_REASON),
                 )
                 continue
             s = by_index.get(pos)
@@ -4892,6 +4951,48 @@ class Feeds:
     # ------------------------------------------------------------------
     # 资讯偏好
     # ------------------------------------------------------------------
+
+    def _persist_score_failure(
+        self, gid: str, settings: Settings, candidates: list[dict], survivors: list[dict],
+        error: Exception, *, collect_mark: str = "", funnel: dict | None = None,
+    ) -> None:
+        """整轮打分失败（所有候选都没评上）时给候选留痕，不再只记一条跳过批次。
+
+        线上 2026-10-08（批次 #199）：一次 HTTP 451 内容拦截
+        （censorship_blocked）让同一打分块 8 条全失败 → _score 抛错 → 老代码只落一条
+        found / kept=0 / skipped=1 的批次就 return 0，候选的逐条拒绝记录全丢，事后无法审计。
+        这里走正常落库路径把候选留下：
+
+        - 第一道（补打开核对 / 原文没打开 / 付费 / 旧闻 / 重复）已经拒了的保持原 reject 不动；
+        - 还没评上的标 score「打分没做完…」——不补默认分、不放行、不发卡片；
+        - 本轮 0 收录（kept=0，skipped 由落库路径写 1），不做写帖 / 自检 / 话题池，
+          零额外模型调用；
+        - 451 之类的内容拦截仍按「打分失败」处理：不换通道、不拆条重发、不绕拦截
+          （换通道的判定在 models.py，这里一个字不改）。
+        写库本身出错也不能炸本轮：退回老的「只记跳过批次」，原因照留。
+        """
+        for item in survivors:
+            if not item.get("reject"):
+                item["reject"] = ("score", _SCORE_FAILED_REASON)
+        rejected_items = [item for item in candidates if item.get("reject")]
+        stats = self._round_stats(collect_mark, funnel)
+        # 新增统计（2026-10-08 巡检）：这轮有多少条候选卡在打分。0 收录时也看得出来是
+        # 「打分整轮失败」还是「没过门槛」；不动 news_batches.skipped 的老口径（布尔：本轮没收录）。
+        sf = stats.get("funnel")
+        if isinstance(sf, dict):
+            sf["score_failed"] = int(len(survivors))
+        try:
+            self._insert_batch_and_items(
+                gid, clock.now(),
+                found=len(candidates), kept=0,
+                rejected_items=rejected_items, accepted_items=[],
+                ttl_h=float(getattr(settings.topics, "candidate_ttl_hours", 12)),
+                note=f"模型打分失败：{error}",
+                stats=stats,
+            )
+        except Exception:
+            logger.exception("记打分失败的候选明细出错（群 %s），退回只记跳过批次", gid)
+            self._skipped_batch(gid, f"模型打分失败：{error}", found=len(candidates), stats=stats)
 
     def _skipped_batch(self, gid: str, note: str, *, found: int = 0, stats: dict | None = None) -> None:
         now = clock.now()

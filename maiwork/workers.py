@@ -10,8 +10,13 @@
 - 上下文压缩（compaction.py，共用）：估算超触发线先截旧 tool 结果（不调模型），
   仍超再调模型把最老一段总结成 8 节摘要；system 永不压缩、tool/assistant 成组切分；
   摘要失败原样继续；模型回「上下文超长」裁最旧一段重试一次。
-- 大工具结果落盘：单个工具结果超约 5 万字时完整写到 `<workspace>/tool_spill/<任务ID>/`，
-  对话里只放「头 + 尾 + 文件路径说明」；没工作区时退回头尾截断。
+- 大工具结果落盘归档（docs/27 §7 / §8 P1）：**任何会被单条 tool 消息上限（6000 字）截断**
+  的工具输出（成功、报错都算）都把完整正文写到 `<workspace>/tool_spill/<任务ID>/`，对话里
+  留头 + 尾 + **工作区相对路径**指针（用 `read_file(path=…, offset=, limit=)` 逐页读回）；
+  **worker 这边不再做任何 6000 字硬截断**：归档成功给指针、归档失败 / 没有工作区都原样
+  保留完整正文，装不下交给预算闸明确失败（明确失败 > 悄悄丢中段）。
+- 原始历史 vs 工作视图：`history` 是 lane 的工作视图（会被压缩改写）；`raw_history` 是这一轮
+  的**原始对话**（只增不改，压缩切掉的那段和压缩前的旧工具正文原样留着），交给调用方落库。
 - 重复调用提醒：同一工具 + 规范化参数连用第 3 / 5 / 8 次往对话里加一句提醒
   （只提醒，不拦截）；有新的 user 消息进来计数清零。
 - 模型调用 ModelError：ok=False，error 带原因。
@@ -23,8 +28,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -38,6 +45,206 @@ logger = logging.getLogger("maiwork.workers")
 
 _TOOL_MSG_MAX = 6000    # 回给模型的单条 tool 消息截 6000 字（spill 之后一般远小于它）
 _MAX_NUDGES = 2         # 最多催几次「请调用 submit_result 交回」
+# 分页文件工具（tools_exec 的 read_file / inspect_file）：它们的页大小是照
+# _TOOL_MSG_MAX 定的，正常永远碰不到下面的截断。真碰到了说明页比预算大（改坏了），
+# 那时不能只说一句「已截断」让模型以为本页读完了——要明确让它重读本页同一段。
+_FILE_TOOLS = ("read_file", "inspect_file")
+
+# ---------------------------------------------------------------------------
+# 工具输出归档（docs/27 §8 P1：6001~49999 字以前既被截断又没有归档）
+#
+# 判定只有一条：**这条 tool 消息会不会被单条消息上限（_TOOL_MSG_MAX）截断**。会，就必须有
+# 完整归档（成功、报错都算）。阈值取 _TOOL_MSG_MAX + 1 = 6001（父 agent 定的口径：不留
+# 「被截断但没归档」的段）。写归档**不走 compaction.spill_big_output**——它用普通 Path 写，
+# 会顺着工作区里预埋的符号链接把正文写到工作区外面；改走
+# `environments.local.write_new_file_verified`（逐段 O_NOFOLLOW + O_CREAT|O_EXCL + 写完读回来核对）。
+# 不新增任何配置字段。
+# ---------------------------------------------------------------------------
+
+_ARCHIVE_LINE = _TOOL_MSG_MAX + 1      # 6001：够到它就一定会被截断 → 必须归档
+_ARCHIVE_HEAD = 3600                   # 归档后对话里留的开头
+_ARCHIVE_TAIL = 1000                   # 归档后对话里留的结尾
+_ARCHIVE_PAGE = 5000                   # 回读指引里给的一页字数（tools_exec 的页上限）
+_ARCHIVE_FAIL_NOTE = (
+    "注意：刚才 {name} 的输出（{chars} 字）太长、没能归档到工作区，完整正文就在上面那条"
+    "工具结果里、一个字没删；没有可以按路径回读的文件。"
+    "上下文装不下时这一步会明确报错，不会悄悄把中段丢掉。"
+)
+
+
+@dataclass
+class _SpillZone:
+    """这一轮子 agent 的工具输出归档地：工作区内、按任务分目录。"""
+
+    base: Path            # 工作区根（可信锚点；安全写从它开始逐段走）
+    rel_dir: str          # 工作区相对目录（给模型看的那种形式）
+
+    @property
+    def directory(self) -> Path:
+        return self.base / self.rel_dir
+
+
+def _spill_zone(workspace: Any, task_id: str) -> _SpillZone | None:
+    """`<workspace>/tool_spill/<任务ID>/` 和它的工作区相对路径；缺一个就不归档。"""
+    if workspace is None or not task_id:
+        return None
+    try:
+        base = Path(workspace)
+        rel = str((base / "tool_spill" / str(task_id)).relative_to(base)).replace("\\", "/")
+    except Exception:
+        logger.exception("算工具输出归档目录出错，这一轮不归档")
+        return None
+    if not rel or rel.startswith(".."):
+        return None
+    return _SpillZone(base=base, rel_dir=rel)
+
+
+def _pointer_line(rel: str, total: int) -> str:
+    """回读指针行（归档后回给模型 / compaction 剪枝时贴在正文尾部的那段）。"""
+    return (
+        f"【完整输出在工作区文件】{rel}（共 {total} 字）\n"
+        f"回读：read_file(path=\"{rel}\", offset=0, limit={_ARCHIVE_PAGE})，"
+        f"照返回里的「下一页 offset」一页页往后读（offset 从 0 数、单位字符，"
+        f"一页最多 {_ARCHIVE_PAGE} 字）。路径要用工作区内的相对路径（绝对路径读不了）；"
+        "别以为你只看到了这一段。"
+    )
+
+
+def _archive_pointer(text: str, rel: str, *, file_tool: bool) -> str:
+    """归档成功时回给模型的那段：头 + 尾 + 工作区相对路径 + 分页回读指引。"""
+    total = len(text)
+    omitted = max(0, total - _ARCHIVE_HEAD - _ARCHIVE_TAIL)
+    foot = "\n\n" + _pointer_line(rel, total)
+    if file_tool:
+        foot += "\n另外：这页正文本身就超了单条消息预算——别往后翻，请用更小的 limit 重读同一个 offset。"
+    return (
+        text[:_ARCHIVE_HEAD]
+        + f"\n\n……（输出太长：中间省略 {omitted} 字；完整 {total} 字已归档到工作区文件 {rel}）……\n\n"
+        + text[-_ARCHIVE_TAIL:]
+        + foot
+    )
+
+
+def _write_archive(text: str, zone: _SpillZone) -> str:
+    """把完整正文**安全地**落盘归档；成功回工作区相对路径，失败回 ""。
+
+    - 写走 `environments.local.write_new_file_verified`：从工作区根开始逐段 `O_NOFOLLOW`
+      打开（子 agent 能预埋符号链接 / 硬链接，普通 `Path.write_text` 会把正文写到工作区外），
+      新文件用 `O_CREAT|O_EXCL|O_NOFOLLOW` 建，写完**从同一个 dir_fd 读回来逐字核对**；
+    - 所以「指针能不能读回」不靠猜：核对不过 / 写不进去都算没归档，调用方原样保留完整正文；
+    - 文件名 `spill-<毫秒>-<内容摘要8>-<随机8>.txt`：随机段保证不撞名，摘要只给人和检索看；
+    - 这里**不清理**旧归档：还在跑的任务可能正拿着旧指针回读（目录按任务分，随工作区走）。
+    """
+    text = str(text or "")
+    if not text:
+        return ""
+    digest = hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()[:8]
+    name = f"spill-{int(clock.now() * 1000)}-{digest}-{secrets.token_hex(4)}.txt"
+    try:
+        from .environments.local import write_new_file_verified
+
+        written = write_new_file_verified(
+            zone.base, zone.rel_dir, name, text.encode("utf-8")
+        )
+    except Exception:
+        logger.warning("工具输出归档写失败（%d 字）：按没归档处理", len(text), exc_info=True)
+        return ""
+    if not written:
+        logger.warning("工具输出归档读回来对不上（%d 字）：按没归档处理", len(text))
+        return ""
+    return f"{zone.rel_dir}/{name}"
+
+
+def _archive_tool_output(text: str, zone: _SpillZone, *, file_tool: bool = False) -> tuple[str, str]:
+    """把会超预算的工具正文落盘归档，返回 (回给模型的文字, 归档文件的工作区相对路径)。
+
+    成功 → 头 + 尾 + 工作区相对指针 + 回读指引；
+    失败（没目录 / 写不进去 / 盘上核对不到）→ **原样返回完整正文** + 空指针。调用方据此另加
+    一条「没归档」提示，并且**不许再硬截**：中段宁可让预算闸明确失败，也不许悄悄丢。
+    """
+    text = str(text or "")
+    rel = _write_archive(text, zone)
+    if not rel:
+        return text, ""
+    return _archive_pointer(text, rel, file_tool=file_tool), rel
+
+
+def _archive_message(message: dict, zone: _SpillZone) -> str:
+    """compaction 剪枝用的归档回调：把这条 tool 正文落盘，**只回指针行**。
+
+    compaction 自己会做「头 + 尾」裁剪，所以这里只回指针（回整段指针文本会把头尾塞两遍）。
+    归档失败回 ""：那条就不剪（`require_recoverable=True`），宁可让预算闸明确失败。
+    """
+    text = str(message.get("content") or "")
+    rel = _write_archive(text, zone)
+    if not rel:
+        return ""
+    return _pointer_line(rel, len(text))
+
+
+def _archive_hook(zone: _SpillZone | None):
+    """给 compaction 的 archive 回调；没有可用归档目录 → None（那条都不剪）。"""
+    if zone is None:
+        return None
+    return lambda message: _archive_message(message, zone)
+
+
+def _log_compaction(actor: str, outcome: Any) -> None:
+    """压缩结果记一笔（docs/27 §8 P2 的观测）：quiet 时走 debug，动过就 info。"""
+    if outcome is None:
+        return
+    try:
+        obs = outcome.observations or {}
+        inp = obs.get("input") or {}
+        prune = obs.get("prune") or {}
+        line = (
+            "子 agent（%s）上下文：action=%s window=%s reserve=%s threshold=%s pruned=%s failure=%s"
+        )
+        args = (
+            actor, getattr(outcome, "action", ""), inp.get("context_window"),
+            inp.get("output_reserve"), inp.get("threshold"), prune.get("count"),
+            (obs.get("failure") or {}).get("kind") or "",
+        )
+        if str(getattr(outcome, "action", "none")) == "none":
+            logger.debug(line, *args)
+        else:
+            logger.info(line, *args)
+    except Exception:
+        logger.debug("记压缩观测出错", exc_info=True)
+
+
+def _has_dangling_tool_calls(messages: list[dict]) -> bool:
+    """assistant(tool_calls) 有没有没配上 tool 回复的（严格端点少一条就 400）。"""
+    answered = {
+        str(m.get("tool_call_id") or "")
+        for m in messages
+        if isinstance(m, dict) and m.get("role") == "tool"
+    }
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        for tc in m.get("tool_calls") or ():
+            if not isinstance(tc, dict):
+                continue
+            cid = str(tc.get("id") or "")
+            if cid and cid not in answered:
+                return True
+    return False
+
+
+def _repair_tool_pairing(messages: list[dict], actor: str) -> None:
+    """压缩之后把弄丢的工具回复补回来（原地改，只补不删；配对好好的就一个字不动）。
+
+    配对保不保是压缩那一层的事，但不该由子 agent 赌：严格端点少一条 tool 回复直接 400，
+    整个子 agent 一步都走不下去（线上踩过）。
+    """
+    try:
+        if not _has_dangling_tool_calls(messages):
+            return
+        messages[:] = lanes.close_dangling_tool_calls(messages)
+        logger.warning("压缩后的对话有没配对的工具调用（%s），已补回占位回复", actor)
+    except Exception:
+        logger.exception("补工具配对失败（%s），原样继续", actor)
 
 # ---------------------------------------------------------------------------
 # docs/22 §4 F（2026-10-07 本地）止损：抓取失败按主机计 + 连续没进展
@@ -219,6 +426,9 @@ class _StallGuard:
 # 调研类子任务的报告框架（docs/02 §7.2 真实验收的配套）：主模型在计划里把子任务标成
 # research 时，coordinator 把这段作为 system 提示的追加段传进来（system_extra）。
 # 只给调研/对比/盘点这类要出结论的活；做东西（build）不加。文案给子 agent 看，不写实现细节。
+# 2026-10 线上 T-10 复核（用户口述）：六段只是**组织框架**，不是扩搜配额；「多源」按
+# 独立来源算（转载不算独立佐证）；说法不一致 ≠ 事实矛盾；关联未知的机构不能写成
+# 已证实由同一攻击者所为。
 RESEARCH_REPORT_FRAMEWORK = (
     "这是一件调研类的活，交给群里的成果按这个框架组织，别写成一堆链接：\n"
     "1. 一句话结论；\n"
@@ -227,7 +437,12 @@ RESEARCH_REPORT_FRAMEWORK = (
     "4. 吐槽最多的；\n"
     "5. 新冒头的；\n"
     "6. 没人提的（值得注意的空白）。\n"
-    "每一点都要带链接，并标明「多源」（≥2 个不同站点支持）还是「单源」。"
+    "六段是组织框架，不是扩搜配额：按任务原话和手上已有的证据组织，"
+    "关键问题有可靠依据、未确认的点已说明就停，不用为了凑满每一节再去搜。\n"
+    "每一点都要带链接，并标明「多源」（至少 2 个独立采集或独立确认的来源；"
+    "不同站点转载同一来源，不算独立佐证）还是「单源」。\n"
+    "别把说法不一致直接当成事实矛盾：置信程度或时间点不同，不自动等于事实矛盾；"
+    "对关联未知的机构，不写成已证实由同一攻击者所为。"
 )
 
 
@@ -417,6 +632,13 @@ class Workers:
         # 任务双岗协作（docs/20 §6.2）：lane 的持久对话（不含 system）。给了就接着上次干，
         # 跑完原地换成这一轮结束时的对话；None = 老做法（每次全新对话，资讯/构想/目标用）。
         history: list[dict] | None = None,
+        # 原始历史（docs/27 §9）：这一轮的完整原始对话（不含 system），**只增不改**——
+        # 压缩切掉的那段、压缩前的旧工具正文都原样留着，tool 正文存的是**完整正文**
+        # （不是「头 + 尾 + 指针」那份工作视图投影；归档指针是额外的，不替代它）。
+        # 调用方给上一轮的 canonical 就传进来（从这里接着写，不从工作视图抄，免得把
+        # 摘要行 / 指针投影当原始历史）跑完原地装进同一份，交给调用方落库
+        # （TaskLanes.save(..., original_messages=…)）；不传就没这个口。
+        raw_history: list[dict] | None = None,
         # 第 2 次没过换升级模型（docs/20 §5.3）：原样透传给 models.chat
         escalate: bool = False,
     ) -> WorkerReport:
@@ -445,7 +667,18 @@ class Workers:
         ]
         if history:
             messages.extend(lanes.prepare_history(history, allowed=hard_tools))
-        messages.append({"role": "user", "content": str(brief)})
+        # 原始日志（docs/27 §9）：有上一轮的 canonical 原始历史（raw_history 传进来的）就从
+        # 它接着写——**不从工作视图（history）抄**：工作视图可能已经带摘要行、tool 正文也换成了
+        # 指针投影，抄它等于把 canonical 的完整正文丢掉一段。两边都没有才是这一轮的空日志。
+        baseline = raw_history if raw_history else history
+        raw_log: list[dict] = [dict(m) for m in (baseline or []) if isinstance(m, dict)]
+
+        def _append(message: dict[str, Any]) -> None:
+            """messages 和原始日志一起追加（两个列表各自持有自己的 dict，互不牵连）。"""
+            messages.append(message)
+            raw_log.append(dict(message))
+
+        _append({"role": "user", "content": str(brief)})
         # docs/22 §4 F：这一轮子 agent 的止损账本（按主机计失败 + 连续没进展）
         stall = _StallGuard()
         ctx = ToolContext(
@@ -472,15 +705,10 @@ class Workers:
             # 模型岗位 = 干活身份（agent=… 没给就用 agent_type）：岗位自己的模型/强度/备用
             # 自动生效；没配该岗候选的在 Models 侧兜底主模型链。
             agent_kind = str(agent or agent_type or "task")
-            context_window = self._context_window(agent_kind, escalate=escalate)
             wrapped_up = False  # 到期强制交回的标记（一次：append 提示 + 只给 submit_result）
             stall_wrapped = False  # 止损收紧成只交回的标记（同样只做一次）
-            spill_dir = None
-            if workspace is not None and task_id:
-                try:
-                    spill_dir = Path(workspace) / "tool_spill" / str(task_id)
-                except Exception:
-                    spill_dir = None
+            spill_zone = _spill_zone(workspace, task_id)
+            archive_notes: list[str] = []  # 归档失败要告诉模型的提示（这一轮攒着）
 
             while True:
                 # 0 = 不限；给了正的 max_steps 还按老规矩收尾（兼容）
@@ -522,7 +750,7 @@ class Workers:
                         ] or specs
                     # 硬权限同步收紧：到期后只剩 submit_result 可调（Tools.call 层也会拦）。
                     ctx.allowed_tools = ("submit_result",)
-                    messages.append(
+                    _append(
                         {
                             "role": "user",
                             "content": (
@@ -553,24 +781,33 @@ class Workers:
                             stopped=True,
                         )
                 steps += 1
-                # 上下文压缩：估算超触发线先截旧 tool 结果（不调模型），仍超再摘要最老一段。
-                # 摘要失败原样继续（maybe_compact 内部吞掉，不抛）。
+                # 上下文压缩（docs/27 的口）：整包预算 + 可回读剪枝 + 最老一段摘要，全在
+                # compaction.maybe_compact_ex 里（它自己用 context_budget → models.request_budget
+                # / limits_for 解析窗口与输出预留，不再由这里硬写 8192）。摘要失败它会把
+                # 原 history 一条不动地返回（action="failed_original"），这里只管接结果。
                 try:
-                    compacted = await compaction.maybe_compact(
+                    outcome = await compaction.maybe_compact_ex(
                         messages,
                         models=self._models,
                         role="worker",
                         agent=agent_kind,
-                        context_window=context_window,
-                        output_reserve=compaction.DEFAULT_OUTPUT_RESERVE,
+                        tools=specs or None,
+                        escalate=escalate,
                         purpose="worker",
                         group_id=str(group_id),
                         task_id=str(task_id),
                         keep_recent_n=1,
+                        # 剪枝只剪「能回读」的：正文里已有指针行，或这次经这个回调归档
+                        archive=_archive_hook(spill_zone),
+                        require_recoverable=True,
                     )
-                    if compacted is not messages:
+                    new_messages = outcome.messages if outcome is not None else None
+                    if new_messages and new_messages is not messages:
                         # 原地替换：外层 finally 要拿同一个列表写回 lane 的 history
-                        messages[:] = list(compacted)
+                        messages[:] = list(new_messages)
+                        # 压缩是别人写的，配对标不保不该由子 agent 赌（严格端点少一条 400）
+                        _repair_tool_pairing(messages, actor)
+                    _log_compaction(actor, outcome)
                 except Exception:
                     logger.exception("上下文压缩失败（%s），原样继续", actor)
                 try:
@@ -598,8 +835,8 @@ class Workers:
                 if not tool_calls:
                     if result.text.strip() and nudges < _MAX_NUDGES:
                         nudges += 1
-                        messages.append({"role": "assistant", "content": result.text})
-                        messages.append(
+                        _append({"role": "assistant", "content": result.text})
+                        _append(
                             {
                                 "role": "user",
                                 "content": "请调用 submit_result 工具把成果交回（summary 必填）；没干完就继续用工具干活。",
@@ -617,9 +854,9 @@ class Workers:
 
                 # OpenAI 规范：tool 结果前面必须先有这条 assistant(tool_calls)，否则严格的端点直接 400
                 # （线上实测踩到：子 agent 一步都走不下去，资讯一批都出不来）
-                messages.append({"role": "assistant", "content": result.text or "", "tool_calls": tool_calls})
+                _append({"role": "assistant", "content": result.text or "", "tool_calls": tool_calls})
                 submitted = await self._run_tool_calls(
-                    tool_calls, ctx, messages, nudger, spill_dir, stall
+                    tool_calls, ctx, messages, nudger, spill_zone, stall, raw_log, archive_notes
                 )
                 if submitted is not None:
                     report = submitted
@@ -634,7 +871,7 @@ class Workers:
                             if (x.get("function") or {}).get("name") == "submit_result"
                         ] or specs
                     ctx.allowed_tools = ("submit_result",)
-                    messages.append({"role": "user", "content": _no_progress_stop()})
+                    _append({"role": "user", "content": _no_progress_stop()})
                     nudger.note_user_message()
 
             # 给了 max_steps（>0）且用完：兼容的老失败路径
@@ -646,8 +883,12 @@ class Workers:
             )
         finally:
             if history is not None:
-                # 写回这一轮结束时的对话（不含 system；悬着的工具调用补回复），由调用方落库
+                # 写回这一轮结束时的对话（不含 system；悬着的工具调用补回复），由调用方落库。
+                # 这是**工作视图**：压缩可能已经把它改写过（切段进了摘要、旧 tool 正文被裁）。
                 history[:] = lanes.close_dangling_tool_calls(messages[1:])
+            if raw_history is not None:
+                # 原始历史（只增不改）：压缩切掉的那段、压缩前的旧工具正文都还在里面。
+                raw_history[:] = lanes.close_dangling_tool_calls(raw_log)
 
     @staticmethod
     def _progress_text(progress: list[str]) -> str:
@@ -661,14 +902,20 @@ class Workers:
         ctx: ToolContext,
         messages: list[dict],
         nudger: compaction.RepeatCallNudger | None = None,
-        spill_dir: Path | None = None,
+        spill_zone: "_SpillZone | None" = None,
         stall: "_StallGuard | None" = None,
+        raw_log: list[dict] | None = None,
+        archive_notes: list[str] | None = None,
     ) -> WorkerReport | None:
         """顺序执行这一轮的工具调用并追加 tool 消息；遇到 submit_result 成功就构造报告返回。
 
         docs/22 §4 F：`stall` 给了就在每次调用后记一笔止损账（同一主机失败、连续没进展）；
         要提醒的话攒起来，等这一轮所有 tool 消息都追加完再插一条 user 消息——不能把
         user 消息插在同一个 assistant(tool_calls) 的多条 tool 结果中间（严格的端点会 400）。
+
+        工具输出归档（docs/27 §8 P1）：只要这条消息会被单条上限截断（成功 / 报错都算），
+        就先落盘归档、只给头尾 + 工作区相对指针；归档失败则**原样保留完整正文**、不再硬截，
+        另记一条提示让模型知道没归档（`raw_log` 一起留档：它是这一轮的原始对话）。
         """
         stall_notes: list[str] = []
         for tc in tool_calls:
@@ -701,16 +948,40 @@ class Workers:
                     challenge=data.get("challenge") if isinstance(data.get("challenge"), dict) else None,
                 )
 
-            # 其余（或 submit 失败）→ 把结果作为 role=tool 消息回给模型继续
-            content = result.output if result.ok else f"出错了：{result.error or result.output}"
-            # 大结果落盘：超出 spill 阈值的完整写到工作区，对话里放头 + 尾 + 路径说明
-            if spill_dir is not None and result.ok and content:
+            # 其余（或 submit 失败）→ 把结果作为 role=tool 消息回给模型继续。
+            # `full` = 这条工具**真正的完整输出**（原始历史里存的就是它）；`content` 是给
+            # 模型的工作视图（可能已换成「头 + 尾 + 归档指针」）。
+            full = result.output if result.ok else f"出错了：{result.error or result.output}"
+            content = full
+            archived = False
+            if spill_zone is not None and content and len(content) >= _ARCHIVE_LINE:
                 try:
-                    content = compaction.spill_big_output(content, spill_dir)
+                    content, archived_rel = _archive_tool_output(
+                        content, spill_zone, file_tool=name in _FILE_TOOLS
+                    )
+                    archived = bool(archived_rel)
                 except Exception:
-                    logger.exception("大结果落盘失败，原样走长度截断")
-            if len(content) > _TOOL_MSG_MAX:
-                content = content[:_TOOL_MSG_MAX] + " …（已截断）"
+                    logger.exception("工具输出归档出错（%s），按完整正文继续", name)
+                    archived = False
+                if not archived and archive_notes is not None:
+                    archive_notes.append(
+                        _ARCHIVE_FAIL_NOTE.format(name=name or "这个工具", chars=len(full))
+                    )
+                    logger.warning(
+                        "工具 %s 的输出 %d 字没能归档：完整正文原样交给模型，交给预算闸判",
+                        name or "（无名）", len(full),
+                    )
+            # **这里不再做任何 6000 字硬截断**（docs/27 §8 P1 / 父 agent 口径）：放得下就原样，
+            # 放不下由预算闸（chat_with_retry_on_long_context）明确报错——「明确失败」比
+            # 「悄悄丢掉中段、还看起来像读完了」正确。归档失败的正文同理，一个字都不删。
+            # 文件工具页超预算是 tools_exec 那层的问题（它保证每页 ≤ 单条预算）：留一条
+            # warning 便于定位，但不许因此动正文（线上 T-10 的教训是「别把半页当整页」，
+            # 现在连半页都不会出现——要么整页，要么明确失败）。
+            if len(content) > _TOOL_MSG_MAX and name in _FILE_TOOLS:
+                logger.warning(
+                    "文件工具 %s 的返回 %d 字超过单条 tool 消息上限 %d 字（tools_exec 应保证每页不超）",
+                    name, len(content), _TOOL_MSG_MAX,
+                )
             # 重复调用提醒：同参数连用第 3/5/8 次附加一句（只提醒，不拦截）
             if nudger is not None and name:
                 try:
@@ -725,6 +996,12 @@ class Workers:
             if name:
                 msg["name"] = name
             messages.append(msg)
+            if raw_log is not None:
+                # 原始历史存**完整正文**（不是工作视图那份指针投影）：两者分开存，
+                # 视图可以剪、原始那份不少一个字（父 agent 定的口径）。
+                raw_msg = dict(msg)
+                raw_msg["content"] = full
+                raw_log.append(raw_msg)
             # docs/22 §4 F：止损账（同主机失败 / 连续没进展）
             if stall is not None:
                 try:
@@ -734,8 +1011,12 @@ class Workers:
                     note = ""
                 if note:
                     stall_notes.append(note)
-        for note in stall_notes:
+        # 提醒一律等这一轮的 tool 消息都排完再插（不能插在 tool 结果中间）；归档失败的提示
+        # 排在最前——模型要先知道「上一条其实没归档、正文是全的」。
+        for note in [*(archive_notes or []), *stall_notes]:
             messages.append({"role": "user", "content": note})
+            if raw_log is not None:
+                raw_log.append({"role": "user", "content": note})
             if nudger is not None:
                 nudger.note_user_message()
         return None

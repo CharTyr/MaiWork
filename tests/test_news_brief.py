@@ -6,7 +6,8 @@
 
 - store.py：迁移 `_m_news_brief` 给 news_items 加 `brief TEXT NOT NULL DEFAULT ''`，
   幂等（列已在就跳过），追加在 `_MIGRATIONS` 末尾。
-- feeds.py：打分提示词加 `"brief"` 一项；`_norm` 读出（去空白、换行变空格、截 140 字）；
+- feeds.py：打分提示词加 `"brief"` 一项；`_norm` 读出（去空白、换行变空格；正常长度原样保留，
+  超长异常整条回落——2026-10-08 巡检前是硬截 140 字，会把「免费 / 付费限定」这类条件切掉）；
   写回 item、`_zero_pack` / 两处 setdefault 兜底空串；
   隐私闸（`_scrub_item_text`）对 brief 也过一遍——不过只把 brief 置空，**不**拒整条；
   入库（accepted_items 那条 INSERT）写 brief；打分时给模型看的 summary 从 150 字放宽到 300 字。
@@ -93,8 +94,10 @@ def _score_prompt(models: FakeModelsQueue) -> str:
 
 
 class TestMigration:
-    def test_migration_is_last_and_named(self) -> None:
-        assert _MIGRATIONS[-1].__name__ == "_m_news_brief"
+    def test_migration_step_kept_in_order(self) -> None:
+        """加 brief 那一步还在原来的位置（第 36 步），后面只许往后追加新步。"""
+        idx = [fn.__name__ for fn in _MIGRATIONS].index("_m_news_brief")
+        assert idx == 35, "第 36 步 = news_items.brief（docs/20）；新步只能往后加"
 
     def test_fresh_db_has_brief_column(self, tmp_path: Path) -> None:
         store = Store(tmp_path / "t.db")
@@ -112,7 +115,7 @@ class TestMigration:
         """老库（库号停在加 brief 之前）升上来补列；重复跑同一步不报错、结构不变。"""
         store = Store(tmp_path / "old.db")
         try:
-            steps = len(_MIGRATIONS) - 1
+            steps = store_mod._MIGRATIONS.index(store_mod._m_news_brief)
             for fn in _MIGRATIONS[:steps]:
                 fn(store.read())
             store.read().execute(f"PRAGMA user_version={steps}")
@@ -132,7 +135,7 @@ class TestMigration:
         """老行跟着补列后 brief 读作空串，数据不动。"""
         store = Store(tmp_path / "old.db")
         try:
-            steps = len(_MIGRATIONS) - 1
+            steps = store_mod._MIGRATIONS.index(store_mod._m_news_brief)
             for fn in _MIGRATIONS[:steps]:
                 fn(store.read())
             store.read().execute(f"PRAGMA user_version={steps}")
@@ -207,7 +210,9 @@ class TestBriefLanding:
         finally:
             store.close()
 
-    def test_long_brief_truncated_to_140(self, tmp_path) -> None:
+    def test_long_brief_kept_in_full(self, tmp_path) -> None:
+        """2026-10-08 巡检改契约：正常长度的 brief 不再硬截 140（线上 #1301 176 字被切成
+        「…目前只是 al」，把收费限定整句丢掉）。200 字照原样入库。"""
         long_brief = "字" * 200
         store = _run_prepare(tmp_path, [
             _entry(0, "新开源 FPGA 开发板发布", brief=long_brief),
@@ -217,8 +222,29 @@ class TestBriefLanding:
         try:
             row = store.read().execute(
                 "SELECT brief FROM news_items WHERE title='新开源 FPGA 开发板发布'").fetchone()
-            assert row["brief"] == long_brief[:140]
-            assert len(row["brief"]) == 140
+            assert row["brief"] == long_brief
+            assert len(row["brief"]) == 200
+        finally:
+            store.close()
+
+    def test_overlong_brief_is_blanked_for_summary_fallback(self, tmp_path) -> None:
+        """超长异常（超过安全上限）不硬截也不留半截：整条置空，卡片回落已核验的 summary。"""
+        from CharTyr_MaiWork.maiwork.feeds import _BRIEF_KEEP_MAX
+
+        store = _run_prepare(tmp_path, [
+            _entry(0, "新开源 FPGA 开发板发布", brief="字" * (_BRIEF_KEEP_MAX + 20)),
+            _entry(1, "小模型本地部署教程", brief=BRIEF_B),
+            _entry(2, "吃桃子的十种方法", brief="挑桃子的三个小窍门。", relevance=1, chat=1),
+        ])
+        try:
+            row = store.read().execute(
+                "SELECT brief, summary FROM news_items WHERE title='新开源 FPGA 开发板发布'").fetchone()
+            assert row["brief"] == ""
+            assert row["summary"], "回落靠的是已经核验过的 summary，它必须在"
+            # 同批别条不受影响
+            other = store.read().execute(
+                "SELECT brief FROM news_items WHERE title='小模型本地部署教程'").fetchone()
+            assert other["brief"] == BRIEF_B
         finally:
             store.close()
 

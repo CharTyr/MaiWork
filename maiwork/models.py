@@ -54,10 +54,12 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import email.utils
 import hashlib
 import json
 import logging
+import math
 import random
 import re
 from contextlib import asynccontextmanager
@@ -384,6 +386,405 @@ class ModelError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+# ---------------------------------------------------------------------------
+# 整包请求预算 + 派发前的物理硬闸 + 保守 usage 校正（docs/27 §8 P1）
+# ---------------------------------------------------------------------------
+
+INPUT_SAFETY_MARGIN = 512        # 物理硬闸的固定保守余量（tokens）；不猜大、不拿 prefill 减
+MIN_USABLE_INPUT = 2048          # 配置不自洽的判定线：窗口至少要能给输入留这么多
+CALIBRATION_MAX_FACTOR = 4.0     # usage 校正系数的上限（1.0~4.0，只放大不缩小）
+_MESSAGE_OVERHEAD_TOKENS = 4     # 每条消息的固定开销估算（很小，只当记账用）
+_REQUEST_WRAPPER_TOKENS = 16     # 请求体包装开销估算（很小，只当记账用）
+
+
+def _compaction_module() -> Any:
+    """懒取 compaction（token 估算唯一口径）；取不到就返回 None（用本地兜底）。"""
+    try:
+        from . import compaction as _c
+
+        return _c
+    except Exception:  # pragma: no cover - 防御（循环导入/半初始化）
+        return None
+
+
+def _estimate_text(text: Any) -> int:
+    mod = _compaction_module()
+    if mod is not None:
+        return int(mod.estimate_tokens(text))
+    s = str(text or "")
+    return max(1, math.ceil(len(s) / 1.3)) if s else 0
+
+
+def _estimate_messages(messages: Any) -> int:
+    if not messages:
+        return 0
+    mod = _compaction_module()
+    if mod is not None:
+        return int(mod.estimate_tokens_in_messages(list(messages)))
+    return sum(
+        _estimate_text(m.get("content")) for m in messages if isinstance(m, dict)
+    )
+
+
+def _estimate_tools(tools: Any) -> int:
+    if not tools:
+        return 0
+    try:
+        text = json.dumps(tools, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        text = str(tools)
+    return _estimate_text(text)
+
+
+def _estimate_request(
+    messages: Any,
+    *,
+    tools: Any = None,
+    json_mode: bool = False,
+    system_text: str = "",
+) -> tuple[int, int, int]:
+    """(system + messages 估算, tools schema 估算, 固定开销估算)。
+
+    固定开销 = 每条消息 4 token + json_mode 真注入的那条 JSON 提示 + 请求体包装 16 token；
+    不含任何「prefill 基线」的减法（那种减法是错的，见 docs/27 §6.1 取舍）。
+    """
+    msgs = list(messages or [])
+    msg_tokens = _estimate_messages(msgs)
+    tool_tokens = _estimate_tools(tools)
+    system_tokens = _estimate_text(system_text) if system_text else 0
+    json_tokens = _estimate_text(_JSON_ONLY_HINT) if json_mode else 0
+    overhead = (
+        _MESSAGE_OVERHEAD_TOKENS * (len(msgs) + (1 if json_mode else 0))
+        + _REQUEST_WRAPPER_TOKENS
+        + json_tokens
+    )
+    return msg_tokens + system_tokens, tool_tokens, overhead
+
+
+def _strip_internal_keys(messages: list[dict]) -> list[dict]:
+    """剥掉内部标记（`maiwork_*`）：它们绝不发到端点上，也不参与请求签名。
+
+    返回新列表 + 新 dict（不改调用方那份）。
+    """
+    out: list[dict] = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        cleaned = {k: v for k, v in m.items() if not str(k).startswith("maiwork_")}
+        out.append(cleaned)
+    return out
+
+
+def _measured_input_tokens(result: ChatResult, protocol: str) -> int:
+    """这次调用「真实占住上下文」的输入 tokens（只在端点真报了 usage 时才算）。
+
+    - anthropic：`input_tokens` 不含缓存，缓存读 / 写也要算（缓存不是免费，只是另记）；
+    - openai / responses：`prompt_tokens` / `input_tokens` 本来就含缓存命中部分，
+      不再加，免得重复计数。
+    """
+    if not getattr(result, "usage_known", False):
+        return 0
+    base = int(getattr(result, "prompt_tokens", 0) or 0)
+    if str(protocol or "").strip().lower() == "anthropic":
+        base += int(getattr(result, "cache_read_tokens", 0) or 0)
+        base += int(getattr(result, "cache_write_tokens", 0) or 0)
+    return max(0, base)
+
+
+def _request_signature(
+    model: str, messages: Any, tools: Any, json_mode: bool, max_tokens: int,
+    system_text: str = "",
+) -> str:
+    """整包请求指纹：**全量** messages + tools + system_text 规范化 JSON（中段改了也变）。"""
+    payload = {
+        "model": str(model or ""),
+        "json_mode": bool(json_mode),
+        "max_tokens": int(max_tokens or 0),
+        "system_text": str(system_text or ""),
+        "messages": _strip_internal_keys(list(messages or [])),
+        "tools": _normalize_json(tools),
+    }
+    try:
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):  # pragma: no cover - 防御
+        text = repr(payload)
+    return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
+
+
+def _normalize_json(value: Any) -> Any:
+    """把任意值收成可稳定 JSON 化的形状（集合排序、非基础类型转字符串）。"""
+    if isinstance(value, dict):
+        return {str(k): _normalize_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_json(v) for v in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted(str(v) for v in value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+@dataclass
+class RequestBudget:
+    """这一次调用该按多大的整包预算算（压缩触发线、物理硬闸、外部自查共用一份）。"""
+
+    kind: str = "main"
+    escalate: bool = False
+    entry_id: str = ""
+    model: str = ""
+    context_window: int = 128000
+    max_output_tokens: int = 32768          # chat() 真会发的 max_tokens
+    output_reserve: int = 32768             # 硬闸用的输出预留（= max_output_tokens）
+    estimated_message_tokens: int = 0       # system + messages
+    estimated_tool_tokens: int = 0          # tools schema
+    overhead_tokens: int = 0                # 每条消息固定开销 + 请求包装
+    estimated_input_tokens: int = 0         # 整包估算（已乘保守校正系数 / 已知实测更大时取实测）
+    usable_input_tokens: int = 0            # context_window − output_reserve − INPUT_SAFETY_MARGIN
+    trigger_threshold: int = 0              # 压缩触发线（compaction.compact_threshold）
+    fits: bool = True
+    shortfall_tokens: int = 0
+    calibrate_factor: float = 1.0
+    measured_input_tokens: int = 0          # 指纹一致时的真实输入（0 = 不适用/不知道）
+    usage_source: str = "estimated"         # measured | estimated
+    limit_source: str = "candidate"         # candidate | legacy | default
+
+    def as_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+@dataclass
+class _UsageCalibration:
+    """一个「端点|模型」的保守校正记录（只在内存）。"""
+
+    factor: float = 1.0
+    measured_input: int = 0
+    estimated_input: int = 0
+    signature: str = ""
+    at: float = 0.0
+    samples: int = 0
+
+
+# ---------------------------------------------------------------------------
+# 「正常请求前缀配方」（compaction 前缀复用；只在内存，不输出正文、不落库）
+#
+# 干什么：正常（purpose 不以 `:compact` 结尾）调用**成功后**，把那次真正发出去的协议体
+# 连同「实际候选 / 有效强度 / max_tokens / mct / 协议」按 (agentkind, groupid, taskid,
+# purpose) 记一份；下一次同一个 scope 要在同一前缀后接一句 instruction 时，先用同一候选、
+# 同一协议、同一形状重建一遍，确认 model / tools / system / 其它参数**全等**、messages
+# 只是**纯追加**（整份结构最多一处增长），才发这一次请求；对不上就返回 None（不发请求）。
+#
+# 为什么：端点侧（OpenAI 自动前缀缓存 / 各家的显式或配置化缓存）只有在**前缀逐字一致**时
+# 才可能命中。当前三套适配器都**没有任何显式 cache_control**（加了会把现有请求体契约测试
+# 打红），所以这里只做「前缀一致」这一件事，缓存标记 / TTL 是后续独立改动。
+#
+# 硬约束：
+# - 只在内存；`body` 是请求体本身（不含请求头 / 密钥），不进日志、不出网页、不落库；
+# - 绝不读 `model_calls` 那份被遮罩 + 被截断（content 4000 字 / 整份 80KB）的日志；
+# - 单个 body 超过 _PREFIX_MAX_BODY_BYTES 就**不存**，并把该 scope 的旧配方**删掉**
+#   （否则会复用更早那份前缀，违反「复用的是最后一次正常请求」）；
+# - 最多 _PREFIX_MAX_SCOPES 个 scope、总量 _PREFIX_MAX_TOTAL_BYTES，超了按 LRU 淘汰；
+# - `:compact` 的调用既不记、也不覆盖任何配方；escalate 的**正常**调用照样记（带 flag）。
+# ---------------------------------------------------------------------------
+
+_PREFIX_MAX_SCOPES = 16
+_PREFIX_MAX_BODY_BYTES = 512 * 1024      # 单份 body 上限（128k 窗口的整包约 166k 字符，装得下）
+_PREFIX_MAX_TOTAL_BYTES = 8 * 1024 * 1024
+_PREFIX_SCOPE_SEP = "\x1f"
+# 允许「纯追加」的键：openai / anthropic 是 messages，responses 是 input（其余键必须逐字相等）
+_PREFIX_GROWTH_KEYS = ("messages", "input")
+
+
+def _prefix_scope_key(agent_kind: Any, group_id: Any, task_id: Any, purpose: Any) -> str:
+    """scope 键：(agentkind, groupid, taskid, purpose)。"""
+    return _PREFIX_SCOPE_SEP.join((
+        str(agent_kind or ""), str(group_id or ""), str(task_id or ""), str(purpose or ""),
+    ))
+
+
+def _is_compact_purpose(purpose: Any) -> bool:
+    """压缩自己的摘要调用（compaction._chat_once 给 purpose 追加 `:compact`）不算正常请求。"""
+    return str(purpose or "").strip().endswith(":compact")
+
+
+def _json_size_bytes(value: Any) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8"))
+    except (TypeError, ValueError):  # pragma: no cover - 防御
+        return -1
+
+
+def _growth_count(stored: Any, current: Any) -> int:
+    """`stored` 是不是 `current` 的「前缀」：0 = 完全相等，1 = 恰好一处纯追加，-1 = 不是。
+
+    规则（父 agent 定稿）：**整份结构里最多允许一处增长**——
+    - 字符串：相等，或 current 以 stored 开头（末条消息 content 往后接一段）；
+    - 列表：逐项比前缀，且尾部**纯追加**新元素（新消息 / Anthropic 的 content 新块）算一处增长；
+    - 字典：键集合必须完全一致，各值递归比（不做「任意键都能变」的放宽）；
+    - 别的（数字 / 布尔 / None）：只能相等。
+    """
+    if isinstance(stored, str) and isinstance(current, str):
+        if stored == current:
+            return 0
+        return 1 if current.startswith(stored) else -1
+    if isinstance(stored, list) and isinstance(current, list):
+        if len(current) < len(stored):
+            return -1
+        total = 0
+        for old, new in zip(stored, current):
+            n = _growth_count(old, new)
+            if n < 0:
+                return -1
+            total += n
+            if total > 1:
+                return -1
+        if len(current) > len(stored):
+            total += 1                      # 尾部纯追加
+        return total if total <= 1 else -1
+    if isinstance(stored, dict) and isinstance(current, dict):
+        if set(stored) != set(current):
+            return -1
+        total = 0
+        for key in stored:
+            n = _growth_count(stored[key], current[key])
+            if n < 0:
+                return -1
+            total += n
+            if total > 1:
+                return -1
+        return total
+    if isinstance(stored, (bool, int, float, type(None))) and isinstance(current, (bool, int, float, type(None))):
+        return 0 if stored == current else -1
+    return 0 if _normalize_json(stored) == _normalize_json(current) else -1
+
+
+def _messages_prefix_ok(stored_msgs: Any, new_msgs: Any) -> bool:
+    """消息数组能不能当「同一份前缀」用（严格版，父 agent 定的形状）。
+
+    - 前面每一条消息必须**逐字相等**（中段改了就是另一个请求）；
+    - 尾部可以纯追加新消息（工作视图长出来的新轮次）；
+    - **只有最后一条消息的 content** 允许增长（末条 content 往后接一段 / 追加一个 content
+      块——Anthropic 连续 user 并块就是这么长的）；末条消息别的键必须相等。
+      非 dict 的末条不做放宽（没有任何可数的地方）。
+    """
+    if not isinstance(stored_msgs, list) or not isinstance(new_msgs, list):
+        return False
+    if len(new_msgs) < len(stored_msgs):
+        return False
+    n = len(stored_msgs)
+    for i in range(max(0, n - 1)):
+        if _growth_count(stored_msgs[i], new_msgs[i]) != 0:
+            return False
+    if n:
+        old, new = stored_msgs[n - 1], new_msgs[n - 1]
+        if isinstance(old, dict) and isinstance(new, dict):
+            if set(old) != set(new):
+                return False
+            for key in old:
+                if key == "content":
+                    if not (0 <= _growth_count(old[key], new[key]) <= 1):
+                        return False
+                elif _growth_count(old[key], new[key]) != 0:
+                    return False
+        elif _growth_count(old, new) != 0:
+            return False
+    return True
+
+
+def _body_reusable(stored_body: Any, new_body: Any) -> bool:
+    """重建出来的整包 body 是否「接着存的那份前缀长出来的」。"""
+    if not isinstance(stored_body, dict) or not isinstance(new_body, dict):
+        return False
+    if set(stored_body) != set(new_body):
+        return False
+    for key, old in stored_body.items():
+        if key in _PREFIX_GROWTH_KEYS:
+            if not _messages_prefix_ok(old, new_body[key]):
+                return False
+        elif _growth_count(old, new_body[key]) != 0:
+            return False                    # model / tools / system / 其它参数必须逐字相等
+    return True
+
+
+def _prefix_chars(body: Any) -> int:
+    """这份 body 前缀里承载正文的字符数（只用于观测，不参与判定）。"""
+    if not isinstance(body, dict):
+        return 0
+    for key in _PREFIX_GROWTH_KEYS:
+        value = body.get(key)
+        if isinstance(value, list):
+            total = 0
+            for item in value:
+                if isinstance(item, dict):
+                    content = item.get("content")
+                    total += len(json.dumps(content, ensure_ascii=False)) if not isinstance(content, str) else len(content)
+                else:
+                    total += len(str(item))
+            return total
+    return 0
+
+
+@dataclass
+class _PrefixRecipe:
+    """一份「正常请求前缀配方」（只在内存；body 不进日志、不出网页、不落库）。"""
+
+    scope: str
+    agent_kind: str
+    group_id: str
+    task_id: str
+    purpose: str
+    escalate: bool
+    requested_effort: str       # 记录时岗位 profile 里请求的强度（复用前按当前值重新推导要比它）
+    effort: str                 # 真正发出去的强度（含条目 efforts 勾选 + 学到的上限）
+    chain_sig: tuple            # (entry_id, service_model, efforts, max_tokens) 的候选链指纹
+    cand_key: str               # 端点 id|规范化地址|模型
+    entry_id: str
+    service_model: str
+    protocol: str
+    mct: bool                   # 上限字段名变体（max_completion_tokens）
+    max_tokens: int
+    json_mode: bool
+    tools_sig: str
+    body: dict                  # 原始请求体（含剥过内部键的 messages）
+    body_bytes: int
+    prefix_chars: int
+    at: float
+    hits: int = 0
+
+
+def _budget_numbers(
+    *, context_window: int, max_output_tokens: int, messages: Any, tools: Any,
+    json_mode: bool, factor: float = 1.0, measured: int = 0, system_text: str = "",
+) -> dict:
+    """整包预算的核心算术（纯函数；`chat()` 的硬闸和 `request_budget()` 共用）。
+
+    预留**必须**等于实际会发的 `max_tokens`（含推理输出）：不许一边把预留夹小、
+    一边照发大的 max_tokens。窗口连 `MIN_USABLE_INPUT` 都给不出来（配置不自洽）→
+    `coherent=False`，调用方拒发这个候选（换备用；全不行就明确报错）。
+    """
+    window = max(1, int(context_window or 0))
+    reserve = max(0, int(max_output_tokens or 0))
+    msg_tokens, tool_tokens, overhead = _estimate_request(
+        messages, tools=tools, json_mode=json_mode, system_text=system_text,
+    )
+    base = msg_tokens + tool_tokens + overhead
+    f = float(factor or 1.0)
+    est = int(math.ceil(base * f)) if f > 1.0 else int(base)
+    est = max(est, int(measured or 0))
+    usable = window - reserve - INPUT_SAFETY_MARGIN
+    coherent = usable >= MIN_USABLE_INPUT
+    fits = bool(coherent and est <= usable)
+    return {
+        "estimated_message_tokens": msg_tokens,
+        "estimated_tool_tokens": tool_tokens,
+        "overhead_tokens": overhead,
+        "estimated_input_tokens": est,
+        "usable_input_tokens": max(0, usable),
+        "fits": fits,
+        "coherent": bool(coherent),
+        "shortfall_tokens": max(0, est - max(0, usable)),
+    }
 
 
 @dataclass
@@ -1185,6 +1586,11 @@ class Models:
         self._adapt: dict[str, dict[str, Any]] = {}
         # 「模型在这个端点不可用」短期熔断（只在内存）：{"<限流键>|<模型>": 恢复时刻（_NOW 口径）}
         self._unavailable: dict[str, float] = {}
+        # usage 保守校正（只在内存）：{"<限流键>|<模型>": _UsageCalibration}
+        self._usage_calib: dict[str, _UsageCalibration] = {}
+        # 正常请求前缀配方（只在内存；按 (agentkind, groupid, taskid, purpose) 索引，
+        # 插入顺序当 LRU 用）：{scope: _PrefixRecipe}。body 不落库、不进日志、不出网页。
+        self._prefix_recipes: dict[str, _PrefixRecipe] = {}
 
     def _cand_key(self, cand: Any) -> str:
         """候选的熔断 / 适配键：`{端点 id}|{规范化地址}|{模型}`（与 chat 里 adapt_key 同口径）。"""
@@ -1569,6 +1975,487 @@ class Models:
         settings = self._get_settings()
         old = self._legacy_brick(settings)
         return {"context_window": old.context_window, "max_tokens": old.max_tokens}
+
+    def _budget_candidates(self, kind: str, *, escalate: bool) -> tuple[list[_Candidate], str]:
+        """预算用候选链 + 来源标记（"candidate" | "legacy" | "default"）。
+
+        和平常调用走同一条解析（岗位链 → 主模型兜底 → 旧四槽 → 系统默认）。
+        """
+        cands: list[_Candidate] = []
+        if escalate:
+            try:
+                cands = self._escalation_candidates(kind)
+            except Exception:
+                cands = []
+        if not cands:
+            try:
+                cands = self._current_candidates(kind)
+            except Exception:
+                cands = []
+        if cands:
+            return cands, "candidate"
+        old = self._legacy_brick(self._get_settings())
+        if old.any_value() or old.context_window != 128000 or old.max_tokens != 32768:
+            return [], "legacy"
+        return [], "default"
+
+    def _legacy_limits(self) -> tuple[int, int]:
+        old = self._legacy_brick(self._get_settings())
+        return int(old.context_window or 128000), int(old.max_tokens or 32768)
+
+    def _calibration_key(self, cand: _Candidate | None, model: str = "") -> str:
+        """校正键：`{端点 id}|{规范化地址}|{模型}`（和 chat 的 adapt_key 同口径）。"""
+        if cand is not None:
+            return self._cand_key(cand)
+        return f"legacy||{model}"
+
+    def _usage_state(
+        self, key: str, model: str, messages: Any, tools: Any, json_mode: bool, body_max: int,
+        system_text: str = "",
+    ) -> tuple[float, int, str]:
+        """(保守校正系数, 指纹一致时的实测输入, 本次请求指纹)。
+
+        实测总量只有「整包请求指纹一致」时才算数：调用方改过 messages / tools /
+        system_text（哪怕只改中段）就作废，只保留模型级的保守系数。
+        """
+        sig = _request_signature(model, messages, tools, json_mode, body_max, system_text)
+        snap = self._usage_calib.get(key)
+        if snap is None:
+            return 1.0, 0, sig
+        measured = int(snap.measured_input) if (snap.signature and snap.signature == sig) else 0
+        return float(snap.factor), measured, sig
+
+    def _fit_rejection(self, cand: _Candidate, numbers: dict, body_max_tokens: int) -> ModelError | None:
+        """派发前的物理硬闸：装不下 / 配置不自洽 → 中文错（调用方换备用或明确失败）。"""
+        window = int(cand.context_window or 0)
+        if not numbers.get("coherent", True):
+            return ModelError(
+                f"模型条目「{cand.label}」的配置不自洽：上下文窗口 {window} tokens 放不下设置的输出上限 "
+                f"{body_max_tokens} tokens（还要给输入留 {MIN_USABLE_INPUT} tokens）。"
+                "本次没发请求；请把「最大输出」调小，或换一条窗口更大的模型",
+                status=0,
+            )
+        if not numbers.get("fits", True):
+            return ModelError(
+                f"模型「{cand.label}」的上下文放不下这次请求：整包估算 {numbers['estimated_input_tokens']} "
+                f"tokens（含工具 schema）> 可用 {numbers['usable_input_tokens']} "
+                f"（窗口 {window} − 输出预留 {body_max_tokens} − 余量 {INPUT_SAFETY_MARGIN}）。"
+                "本次没发请求，也没丢弃任何要求或批准范围；请先整理对话、把大材料拆开，或换窗口更大的模型。",
+                status=0,
+            )
+        return None
+
+    def request_usage_snapshot(
+        self,
+        kind: str | None = None,
+        *,
+        messages: Any = None,
+        tools: Any = None,
+        max_tokens: int | None = None,
+        escalate: bool = False,
+        json_mode: bool = False,
+        system_text: str = "",
+    ) -> dict | None:
+        """上一轮的真实输入用量（只在「端点真报了 usage」且**整包请求指纹一致**时给）。
+
+        - 没记过 / 端点没报（unknown）→ None；
+        - 调用方改过 messages / tools / system_text（哪怕只改中段）→ 指纹对不上，
+          `measured_input_tokens` 记 0、`usage_source="estimated"`（实测总量作废，
+          但模型级的保守系数照留）。
+        """
+        kind_s = str(kind or "").strip() or "main"
+        cands, _src = self._budget_candidates(kind_s, escalate=escalate)
+        cand = cands[0] if cands else None
+        key = self._calibration_key(cand, getattr(cand, "service_model", "") if cand else "")
+        snap = self._usage_calib.get(key)
+        if snap is None:
+            return None
+        mt = int(max_tokens) if (max_tokens is not None and int(max_tokens) > 0) else (
+            int(cand.max_tokens) if cand is not None else int(self._legacy_limits()[1])
+        )
+        sig = _request_signature(
+            getattr(cand, "service_model", "") if cand is not None else "", messages, tools,
+            json_mode, mt, system_text,
+        )
+        matched = bool(snap.signature and snap.signature == sig)
+        return {
+            "key": key,
+            "calibrate_factor": float(snap.factor),
+            "measured_input_tokens": int(snap.measured_input) if matched else 0,
+            "estimated_input_tokens": int(snap.estimated_input),
+            "usage_source": "measured" if matched else "estimated",
+            "signature": snap.signature,
+            "matches": matched,
+            "at": float(snap.at),
+            "samples": int(snap.samples),
+        }
+
+    def request_budget(
+        self,
+        kind: str | None = None,
+        *,
+        messages: Any = None,
+        tools: Any = None,
+        max_tokens: int | None = None,
+        escalate: bool = False,
+        json_mode: bool = False,
+        system_text: str = "",
+    ) -> RequestBudget:
+        """这一次调用该按多大的整包预算算（压缩触发线 / 物理硬闸 / 调用方自查共用）。
+
+        - 岗位 / 升级链 / 旧四槽的解析和 chat() 完全一致（escalate=True 走 `profile.escalate`，
+          岗位没选模型 = 主模型的链）；
+        - `output_reserve` **等于**这次真会发的 `max_tokens`（调用方传值优先，否则条目值，
+          否则 32768）——不许一边夹小预留一边发大输出；
+        - 输入估算 = system/messages + tools schema + 固定开销，再乘保守校正系数
+          （只有端点真报过的 usage 才会进校正，见 `_note_measured_usage`）。
+        """
+        kind_s = str(kind or "").strip() or "main"
+        cands, limit_source = self._budget_candidates(kind_s, escalate=escalate)
+        cand = cands[0] if cands else None
+        if cand is not None:
+            window = int(cand.context_window or 128000)
+            entry_max = int(cand.max_tokens or 32768)
+            model = str(cand.service_model or "")
+            entry_id = str(cand.entry_id or "")
+        else:
+            window, entry_max = self._legacy_limits()
+            model, entry_id = "", ""
+        body_max = int(max_tokens) if (max_tokens is not None and int(max_tokens) > 0) else entry_max
+        if body_max <= 0:
+            body_max = 32768
+        key = self._calibration_key(cand, model)
+        factor, measured, sig = self._usage_state(
+            key, model, messages, tools, json_mode, body_max, system_text,
+        )
+        numbers = _budget_numbers(
+            context_window=window, max_output_tokens=body_max, messages=messages, tools=tools,
+            json_mode=json_mode, factor=factor, measured=measured, system_text=system_text,
+        )
+        from . import compaction as _compaction  # 懒导入：触发线口径只有一份
+
+        return RequestBudget(
+            kind=kind_s,
+            escalate=bool(escalate),
+            entry_id=entry_id,
+            model=model,
+            context_window=int(window),
+            max_output_tokens=int(body_max),
+            output_reserve=int(body_max),
+            estimated_message_tokens=int(numbers["estimated_message_tokens"]),
+            estimated_tool_tokens=int(numbers["estimated_tool_tokens"]),
+            overhead_tokens=int(numbers["overhead_tokens"]),
+            estimated_input_tokens=int(numbers["estimated_input_tokens"]),
+            usable_input_tokens=int(numbers["usable_input_tokens"]),
+            trigger_threshold=int(_compaction.compact_threshold(window, body_max)),
+            fits=bool(numbers["fits"]),
+            shortfall_tokens=int(numbers["shortfall_tokens"]),
+            calibrate_factor=factor,
+            measured_input_tokens=measured,
+            usage_source="measured" if measured > 0 else "estimated",
+            limit_source=limit_source,
+        )
+
+    # ------------------------------------------------------------------
+    # 正常请求前缀配方（compaction 前缀复用）
+    #
+    # 记录口在 chat() 成功分支（`_maybe_record_prefix_recipe`），复用口是
+    # `chat_compaction_prefix`。两处都不读 model_calls、不碰密钥、不落库、不输出正文。
+    # ------------------------------------------------------------------
+
+    def prefix_recipe_info(self) -> dict:
+        """观测/测试用摘要：配方表有哪些 scope、各自的形状（**不含 body 正文**）。"""
+        scopes: dict[str, dict] = {}
+        for key, r in self._prefix_recipes.items():
+            scopes[key] = {
+                "agent": r.agent_kind, "group_id": r.group_id, "task_id": r.task_id,
+                "purpose": r.purpose, "escalate": r.escalate, "entry_id": r.entry_id,
+                "model": r.service_model, "protocol": r.protocol, "cand_key": r.cand_key,
+                "effort": r.effort, "requested_effort": r.requested_effort, "mct": r.mct,
+                "max_tokens": r.max_tokens, "json_mode": r.json_mode, "tools_sig": r.tools_sig,
+                "body_bytes": r.body_bytes, "prefix_chars": r.prefix_chars, "hits": r.hits,
+                "at": r.at,
+            }
+        return {
+            "scopes": scopes,
+            "total_bytes": self._prefix_total_bytes(),
+            "max_scopes": _PREFIX_MAX_SCOPES,
+            "max_body_bytes": _PREFIX_MAX_BODY_BYTES,
+            "max_total_bytes": _PREFIX_MAX_TOTAL_BYTES,
+        }
+
+    def _prefix_total_bytes(self) -> int:
+        return sum(int(getattr(r, "body_bytes", 0) or 0) for r in self._prefix_recipes.values())
+
+    def _drop_prefix_recipe(self, scope: str) -> None:
+        self._prefix_recipes.pop(str(scope), None)
+
+    def _prefix_recipe_lookup(
+        self, agent_kind: Any, group_id: Any, task_id: Any, purpose: Any,
+    ) -> "_PrefixRecipe | None":
+        """按 scope 取配方；命中即刷新 LRU 顺序（插入顺序当 LRU 用）。"""
+        key = _prefix_scope_key(agent_kind, group_id, task_id, purpose)
+        recipe = self._prefix_recipes.get(key)
+        if recipe is None:
+            return None
+        self._prefix_recipes.pop(key, None)
+        self._prefix_recipes[key] = recipe
+        return recipe
+
+    def _prefix_candidates(self, agent_kind: str, *, escalate: bool) -> list[Any]:
+        """这个岗位现在（含升级链）的候选链——复用前重新解析一次，profile 变了就对不上。"""
+        agent_kind = str(agent_kind or "main").strip() or "main"
+        if self._agents is None:
+            try:
+                return list(self._current_candidates(agent_kind))
+            except Exception:
+                return []
+        settings = self._get_settings()
+        endpoints = tuple(getattr(settings, "endpoints", ()) or ())
+        model_list = tuple(getattr(settings, "model_list", ()) or ())
+        old = self._legacy_brick(settings)
+        if escalate:
+            try:
+                return list(self._escalation_candidates(agent_kind))
+            except Exception:
+                return []
+        try:
+            cands, _own = self._effective_candidates(agent_kind, endpoints, model_list, old, self._agents)
+            return list(cands)
+        except Exception:
+            return []
+
+    def _prefix_chain_sig(self, cands: list[Any]) -> tuple:
+        """候选链指纹：entry_id / 模型名 / 条目勾的强度 / 条目默认输出上限。"""
+        return tuple(
+            (
+                str(getattr(c, "entry_id", "") or ""),
+                str(getattr(c, "service_model", "") or ""),
+                tuple(getattr(c, "efforts", ()) or ()),
+                int(getattr(c, "max_tokens", 0) or 0),
+            )
+            for c in cands
+        )
+
+    def _prefix_now_state(self, agent_kind: str, cand: Any) -> tuple[str, str, bool]:
+        """按**当前**配置重新推导 (请求强度, 实际会发的强度, mct)——不复用配方里的旧值。
+
+        学到的适配（400 教会的 mct / 强度上限）也算在内：配方必须和「现在真会发的形状」
+        逐字一致，否则复用会把「上一次的形状」偷渡进来。
+        """
+        requested = ""
+        try:
+            requested = str(self._profile_effort(agent_kind) or "")
+        except Exception:
+            requested = ""
+        key = self._cand_key(cand)
+        learned = self._adapt.get(key, {}) if isinstance(self._adapt.get(key), dict) else {}
+        effort = requested if requested in tuple(getattr(cand, "efforts", ()) or ()) else ""
+        effort = _effort_capped(effort, learned.get("effort_cap"))
+        return requested, str(effort or ""), bool(learned.get("mct"))
+
+    def _prune_prefix_recipes(self) -> None:
+        while len(self._prefix_recipes) > _PREFIX_MAX_SCOPES:
+            oldest = next(iter(self._prefix_recipes))
+            self._prefix_recipes.pop(oldest, None)
+        while self._prefix_total_bytes() > _PREFIX_MAX_TOTAL_BYTES and self._prefix_recipes:
+            oldest = next(iter(self._prefix_recipes))
+            self._prefix_recipes.pop(oldest, None)
+
+    def _store_prefix_recipe(self, recipe: _PrefixRecipe) -> bool:
+        """存一份配方（超单份上限就删掉旧的那份，绝不把「更早的前缀」留在表里）。"""
+        if recipe.body_bytes <= 0 or recipe.body_bytes > _PREFIX_MAX_BODY_BYTES:
+            self._drop_prefix_recipe(recipe.scope)
+            logger.debug("前缀配方不存（scope=%s，body %d 字节）：删掉该 scope 的旧配方",
+                         recipe.scope, recipe.body_bytes)
+            return False
+        self._prefix_recipes.pop(recipe.scope, None)
+        self._prefix_recipes[recipe.scope] = recipe
+        self._prune_prefix_recipes()
+        return True
+
+    def _maybe_record_prefix_recipe(
+        self, *, agent_kind: str, group_id: str, task_id: str, purpose: str, escalate: bool,
+        body: Any, protocol: str, cand: Any, effort: str, requested_effort: str, mct: bool,
+        max_tokens: int, json_mode: bool, tools: Any,
+    ) -> None:
+        """正常调用成功后的记录口（`:compact` 跳过；记的是真正发出去的那份 body）。"""
+        if _is_compact_purpose(purpose) or not isinstance(body, dict) or not body:
+            return
+        scope = _prefix_scope_key(agent_kind, group_id, task_id, purpose)
+        body_bytes = _json_size_bytes(body)
+        if body_bytes <= 0 or body_bytes > _PREFIX_MAX_BODY_BYTES:
+            self._store_prefix_recipe(_PrefixRecipe(
+                scope=scope, agent_kind=str(agent_kind), group_id=str(group_id or ""),
+                task_id=str(task_id or ""), purpose=str(purpose or ""), escalate=bool(escalate),
+                requested_effort=str(requested_effort or ""), effort=str(effort or ""),
+                chain_sig=(), cand_key="", entry_id="", service_model="", protocol="",
+                mct=bool(mct), max_tokens=int(max_tokens or 0), json_mode=bool(json_mode),
+                tools_sig="", body={}, body_bytes=int(body_bytes), prefix_chars=0, at=float(_NOW()),
+            ))
+            return
+        chain = self._prefix_chain_sig(self._prefix_candidates(agent_kind, escalate=bool(escalate)))
+        if not chain:
+            chain = ((
+                str(getattr(cand, "entry_id", "") or ""),
+                str(getattr(cand, "service_model", "") or ""),
+                tuple(getattr(cand, "efforts", ()) or ()),
+                int(getattr(cand, "max_tokens", 0) or 0),
+            ),)
+        self._store_prefix_recipe(_PrefixRecipe(
+            scope=scope, agent_kind=str(agent_kind), group_id=str(group_id or ""),
+            task_id=str(task_id or ""), purpose=str(purpose or ""), escalate=bool(escalate),
+            requested_effort=str(requested_effort or ""), effort=str(effort or ""),
+            chain_sig=chain, cand_key=self._cand_key(cand),
+            entry_id=str(getattr(cand, "entry_id", "") or ""),
+            service_model=str(getattr(cand, "service_model", "") or ""), protocol=str(protocol or ""),
+            mct=bool(mct), max_tokens=int(max_tokens or 0), json_mode=bool(json_mode),
+            tools_sig=json.dumps(_normalize_json(tools), ensure_ascii=False, sort_keys=True, default=str)
+            if tools else "",
+            body=body, body_bytes=int(body_bytes), prefix_chars=_prefix_chars(body), at=float(_NOW()),
+        ))
+
+    def _rebuild_prefix_body(
+        self, recipe: _PrefixRecipe, messages: Any, tools: Any, json_mode: bool,
+    ) -> "dict | None":
+        """用**同一个候选 / 同一个协议 / 同一批参数**把请求体重建一遍（纯函数，不发请求）。"""
+        msgs = _strip_internal_keys([m for m in (messages or []) if isinstance(m, dict)])
+        try:
+            if recipe.protocol == "openai":
+                return _build_openai_request(
+                    recipe.service_model, msgs, tools=tools, json_mode=json_mode,
+                    max_tokens=recipe.max_tokens, effort=recipe.effort,
+                    completion_tokens_param=bool(recipe.mct),
+                )
+            if recipe.protocol == "responses":
+                return _build_responses_request(
+                    recipe.service_model, msgs, tools=tools, json_mode=json_mode,
+                    max_tokens=recipe.max_tokens, effort=recipe.effort,
+                )
+            if recipe.protocol == "anthropic":
+                return _build_anthropic_request(
+                    recipe.service_model, msgs, tools=tools, json_mode=json_mode,
+                    max_tokens=recipe.max_tokens, effort=recipe.effort,
+                )
+        except Exception:  # pragma: no cover - 防御
+            logger.debug("重建前缀配方请求体出错", exc_info=True)
+        return None
+
+    async def chat_compaction_prefix(
+        self,
+        role: Literal["main", "worker"] | None = None,
+        messages: list[dict] | None = None,
+        *,
+        instruction: str,
+        agent: str | None = None,
+        tools: list[dict] | None = None,
+        json_mode: bool = False,
+        escalate: bool = False,
+        purpose: str = "",
+        group_id: str = "",
+        task_id: str = "",
+    ) -> ChatResult | None:
+        """在「上一次正常请求」的同一前缀后面接一句 instruction，再发一次（复用前缀）。
+
+        返回成功的 `ChatResult`（工具调用原样交给 compaction 去验证）；**任何**不确定的
+        情况一律返回 `None`，绝不抛、绝不偷偷换模型、绝不发一次形状不一样的请求：
+
+        - 没记过这个 scope / escalate 或 json_mode 对不上 / instruction 空 → None；
+        - 岗位（或升级链）的候选链、当前强度（含学到的强度上限）、mct、协议、端点配置
+          与配方不一致 → None；
+        - 该候选在「模型不可用」熔断期 → None（不借这次调用去探测恢复）；
+        - 重建出来的 body 与配方对不上（model / tools / system / 其它参数必须逐字相等，
+          messages 只许纯追加且整份结构最多一处增长）→ None；
+        - 整包超物理预算 → None（派发前就判，不发请求）；
+        - 真发出去时 `retries=0`（只一次尝试），端点冷却 / 每分钟上限 / 记账照走；
+          `ModelError`（含 400 适配路径）→ None。
+        """
+        agent_kind = str(agent or "").strip() or ("main" if str(role or "") == "main" else "task")
+        recipe = self._prefix_recipe_lookup(agent_kind, group_id, task_id, purpose)
+        if recipe is None or not str(instruction or ""):
+            return None
+        if bool(recipe.escalate) != bool(escalate) or bool(recipe.json_mode) != bool(json_mode):
+            return None
+        if float(self._unavailable.get(recipe.cand_key) or 0.0) > _NOW():
+            return None                     # 熔断期：不拿复用路径当探测
+        cands = self._prefix_candidates(agent_kind, escalate=bool(escalate))
+        if self._prefix_chain_sig(cands) != recipe.chain_sig:
+            return None                     # 岗位 / 升级链 / profile 变了
+        cand = next((c for c in cands if self._cand_key(c) == recipe.cand_key), None)
+        if cand is None:
+            return None
+        requested_now, effort_now, mct_now = self._prefix_now_state(agent_kind, cand)
+        if (requested_now, effort_now, mct_now) != (recipe.requested_effort, recipe.effort, recipe.mct):
+            return None                     # 当前真会发的强度 / 上限字段名和配方不一致
+        base = [m for m in (messages or []) if isinstance(m, dict)]
+        # 第一步：**当前工作视图**（还没接 instruction）要接着配方长出来——整份结构最多一处
+        # 增长（末条消息 content 往后接一段，或尾部纯追加新消息 / 新 content 块）。
+        without = self._rebuild_prefix_body(recipe, base, tools, json_mode)
+        if without is None or not _body_reusable(recipe.body, without):
+            return None                     # 前缀长不出来 / 中间变了
+        # 第二步：把 instruction 当最后一条 user 接上后，**原前缀必须原样保留**——
+        # 也就是「接上 instruction 的 body」相对「没接的 body」只许纯追加
+        # （Anthropic 连续 user 会并块：末块纯追加一个 text 块，同样算纯追加）。
+        msgs = [*base, {"role": "user", "content": str(instruction)}]
+        new_body = self._rebuild_prefix_body(recipe, msgs, tools, json_mode)
+        if new_body is None or not _body_reusable(without, new_body):
+            return None                     # instruction 把原来的形状改动了：不发
+        numbers = _budget_numbers(
+            context_window=int(getattr(cand, "context_window", 0) or 0),
+            max_output_tokens=int(recipe.max_tokens or 0), messages=msgs, tools=tools,
+            json_mode=json_mode,
+        )
+        if not numbers.get("coherent", True) or not numbers.get("fits", True):
+            return None                     # 整包超预算：派发前就放弃
+        pin = {
+            "expect_body": new_body,        # chat 里发请求前再比一次（防两端推导漂移）
+            "expect_effort": effort_now,
+            "expect_mct": mct_now,
+        }
+        try:
+            result = await self.chat(
+                role, msgs, agent=agent_kind, tools=tools, json_mode=json_mode, purpose=purpose,
+                group_id=group_id, task_id=task_id, max_tokens=int(recipe.max_tokens or 0),
+                retries=0, _candidates=[cand], _prefix_recipe=pin,
+            )
+        except ModelError:
+            return None
+        except Exception:                   # pragma: no cover - 防御：复用路径绝不把异常抛给调用方
+            logger.debug("前缀复用调用异常（已按 None 处理）", exc_info=True)
+            return None
+        recipe.hits += 1
+        return result
+
+    def _note_measured_usage(
+        self, cand: _Candidate, protocol: str, result: ChatResult, *,
+        estimated_input: int, signature: str,
+    ) -> None:
+        """成功一次后按**真报过**的输入用量更新保守校正系数（unknown 永不校正）。
+
+        - 真实输入 = 协议口径的输入总量（anthropic 要加缓存读 / 写）；
+        - 系数 = clamp(实测 / 估算, 1.0, CALIBRATION_MAX_FACTOR)，只放大不缩小（保守）；
+        - 同时记下这次请求的整包指纹：调用方改了请求就让实测总量作废。
+        """
+        measured = _measured_input_tokens(result, protocol)
+        if measured <= 0 or estimated_input <= 0:
+            return
+        try:
+            raw = measured / float(estimated_input)
+        except ZeroDivisionError:  # pragma: no cover - 上面已挡
+            return
+        new_factor = min(max(raw, 1.0), CALIBRATION_MAX_FACTOR)
+        key = self._calibration_key(cand)
+        prev = self._usage_calib.get(key)
+        # 只放大不缩小：之后的样本估得比实测大，也别把已经学到的保守系数抹掉
+        factor = max(float(prev.factor), float(new_factor)) if prev else float(new_factor)
+        self._usage_calib[key] = _UsageCalibration(
+            factor=float(factor),
+            measured_input=int(measured),
+            estimated_input=int(estimated_input),
+            signature=str(signature or ""),
+            at=float(_NOW()),
+            samples=(int(prev.samples) + 1) if prev else 1,
+        )
 
     def _legacy_brick(self, settings: Settings) -> "_LegacyBrick":
         cfg = getattr(settings, "models", None)
@@ -2170,6 +3057,10 @@ class Models:
         max_tokens: int | None = None,
         _candidates: list[_Candidate] | None = None,
         escalate: bool = False,
+        # 私有口（只有 chat_compaction_prefix 用）：出参收「这次真发出去的 body」，
+        # 入参钉住形状（expect_body / expect_effort / expect_mct）——发请求**之前**
+        # 逐项对一次，任何一处不一致就抛 ModelError（那次不发，调用方按 None 处理）。
+        _prefix_recipe: dict | None = None,
     ) -> ChatResult:
         """调一次模型。
 
@@ -2198,7 +3089,7 @@ class Models:
         每分钟上限 max_rpm（缺省 0 = 关）；等待可取消，状态只在内存。
         """
         settings = self._get_settings()
-        msgs = list(messages or [])
+        msgs = _strip_internal_keys(list(messages or []))
         agent_kind = str(agent or "").strip()
         if not agent_kind:
             agent_kind = "main" if str(role or "") == "main" else "task"
@@ -2284,10 +3175,43 @@ class Models:
             # 这个端点+模型以前被 400 点名学到的适配（强度封顶 / 上限字段名）
             adapt_key = f"{endpoint}|{model}"
             effort_send = _effort_capped(effort_send, self._adapt.get(adapt_key, {}).get("effort_cap"))
+            if _prefix_recipe is not None and "expect_effort" in _prefix_recipe:
+                # 前缀复用：形状必须跟配方逐字一致，不一致就别发（含强度 / 上限字段名）
+                want = str(_prefix_recipe.get("expect_effort") or "")
+                if want != effort_send:
+                    raise ModelError(
+                        f"前缀复用的强度对不上（配方 {want or '不发'} / 现在要发 {effort_send or '不发'}），"
+                        "这次不发：前缀对不上，缓存命中不了",
+                        status=0,
+                    )
+            if _prefix_recipe is not None and "expect_mct" in _prefix_recipe:
+                if bool(_prefix_recipe.get("expect_mct")) != bool(self._adapt.get(adapt_key, {}).get("mct")):
+                    raise ModelError(
+                        "前缀复用的输出上限字段名对不上（配方 / 现在不一致），这次不发",
+                        status=0,
+                    )
             max_tries = 1 + (ep_retries if retries is None else max(0, int(retries)))
             body_max_tokens = int(max_tokens) if (max_tokens is not None and int(max_tokens) > 0) else int(cand.max_tokens or 32768)
             if body_max_tokens <= 0:
                 body_max_tokens = 32768
+            # 派发前的物理硬闸（docs/27 §8 P1）：整包估算（含工具 schema + 固定开销，
+            # 再乘保守校正系数）超过「窗口 − 实际输出预留 − 余量」就不发这个候选——
+            # 先换备用（备用可能窗口更大），全不行才明确报错。输出预留**就是**下面
+            # 真要发的 body_max_tokens，不做「夹小预留、照发大输出」的静默少算。
+            usage_factor, measured_input, request_sig = self._usage_state(
+                adapt_key, model, msgs, tools, json_mode, body_max_tokens
+            )
+            numbers = _budget_numbers(
+                context_window=int(cand.context_window or 0), max_output_tokens=body_max_tokens,
+                messages=msgs, tools=tools, json_mode=json_mode,
+                factor=usage_factor, measured=measured_input,
+            )
+            budget_error = self._fit_rejection(cand, numbers, body_max_tokens)
+            if budget_error is not None:
+                logger.warning("模型 %s 这次不发：%s", model, budget_error.message)
+                last_err = budget_error
+                continue
+            used_estimate = int(numbers["estimated_input_tokens"])
             log_request = self._build_log_request(msgs, tools, json_mode, secret_keys, body_max_tokens)
             try_n = 0
             resend = False  # 刚按 400 的点名改了请求：立刻重发，不等、不占重试次数
@@ -2313,12 +3237,14 @@ class Models:
                         await _SLEEP(wait)
                 elif pos > 0:
                     logger.warning("模型 %s 失败（%s），换备用 %s 再试", candidates[pos - 1].service_model, last_err, model)
-                # 请求体按协议拼（纯函数，各自注释里有 json_mode / effort 的规矩）
+                # 请求体按协议拼（纯函数，各自注释里有 json_mode / effort 的规矩）。
+                # 上限字段名每次拼之前现读：400 教会新字段名之后，这一次的立刻重发就得用上。
+                mct_flag = bool(self._adapt.get(adapt_key, {}).get("mct"))
                 body: dict[str, Any]
                 if protocol == "openai":
                     body = _build_openai_request(
                         model, msgs, tools=tools, json_mode=json_mode, max_tokens=body_max_tokens,
-                        effort=effort_send, completion_tokens_param=bool(self._adapt.get(adapt_key, {}).get("mct")),
+                        effort=effort_send, completion_tokens_param=mct_flag,
                     )
                 elif protocol == "responses":
                     body = _build_responses_request(model, msgs, tools=tools, json_mode=json_mode,
@@ -2326,6 +3252,20 @@ class Models:
                 else:  # anthropic
                     body = _build_anthropic_request(model, msgs, tools=tools, json_mode=json_mode,
                                                     max_tokens=body_max_tokens, effort=effort_send)
+                if _prefix_recipe is not None:
+                    # 前缀复用：**发请求之前**拿真拼出来的这份 body 跟钉住的形状对一次
+                    # （两端推导一旦漂移就在这里挡住，绝不用一个不一样的形状去撞缓存）
+                    expect = _prefix_recipe.get("expect_body")
+                    if isinstance(expect, dict) and not _body_reusable(expect, body):
+                        raise ModelError(
+                            "前缀复用的请求体跟配方不一致（model / tools / system / 参数或消息前缀变了），"
+                            "这次不发",
+                            status=0,
+                        )
+                    _prefix_recipe.update({
+                        "body": body, "protocol": protocol, "model": model, "effort": effort_send,
+                        "mct": bool(mct_flag), "max_tokens": int(body_max_tokens), "cand_key": adapt_key,
+                    })
                 start = clock.now()
                 status = 0
                 try:
@@ -2470,11 +3410,30 @@ class Models:
                     cache_read=result.cache_read_tokens, cache_write=result.cache_write_tokens,
                 )
                 self._unavailable.pop(adapt_key, None)  # 探测成功：解除熔断
+                # 保守 usage 校正：只有端点真报过输入用量才算（unknown 不动系数）；
+                # anthropic 的缓存读 / 写也占上下文，按协议口径加进去
+                self._note_measured_usage(
+                    cand, protocol, result,
+                    estimated_input=used_estimate, signature=request_sig,
+                )
                 if cand is not first_choice:
                     logger.info(
                         "备用救回：首选 %s 没成，实际由 %s 完成，本次调用共 %.1f 秒",
                         first_choice.service_model, model, clock.now() - call_start,
                     )
+                if _prefix_recipe is None:
+                    # 正常调用成功 → 记一份前缀配方（`:compact` 跳过；记的是这份真发出去的 body）。
+                    # 复用调用（_prefix_recipe 非空）不覆盖配方：它的 body 里多了 instruction。
+                    try:
+                        self._maybe_record_prefix_recipe(
+                            agent_kind=agent_kind, group_id=group_id, task_id=task_id,
+                            purpose=purpose, escalate=bool(escalate), body=body, protocol=protocol,
+                            cand=cand, effort=effort_send, requested_effort=requested_effort,
+                            mct=bool(mct_flag), max_tokens=int(body_max_tokens),
+                            json_mode=bool(json_mode), tools=tools,
+                        )
+                    except Exception:  # 记账类辅助，绝不影响这次调用
+                        logger.debug("记前缀配方出错（不影响本次调用）", exc_info=True)
                 return result
         assert last_err is not None
         raise last_err

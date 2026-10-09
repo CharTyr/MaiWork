@@ -182,11 +182,13 @@ class TestChunkedSummarization:
     async def test_middle_constraint_survives_chunking(self):
         """分段场景：约束在中段的 user 里，所有送给模型的输入里至少一处含约束。"""
         marker = "MIDDLE_CONSTRAINT_NEVER_PUBLISH"
-        # 构造：约束消息本身很长（优先内容本身就超预算），逼出分段路径
+        # 构造：约束消息本身很长（优先内容本身就超预算），逼出分段路径。
+        # 2026-10-09 起超长 tool 结果只有「能回读」（正文带 spill 指针行）才容许截断，
+        # 这里给 tool 正文带上指针行（docs/27 §8 P0 的可回读规则）。
         piece = [
             _msg("user", "W" * 20000),
             _msg("assistant", "", tool_calls=[_tool_call("c1", "web_search")]),
-            _msg("tool", "R" * 15000, tool_call_id="c1"),
+            _msg("tool", "R" * 15000 + "\n\n（完整输出在：/tmp/spill-mid.txt）", tool_call_id="c1"),
             _msg("user", marker + "：这条规则管全程。" + "X" * 20000),
             _msg("assistant", "A" * 15000),
             _msg("user", "V" * 18000),
