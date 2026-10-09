@@ -116,6 +116,19 @@ def is_fresh_news_ask(text: str) -> bool:
 HEADER = "【MaiWork 备忘】话题相关时可以自然提起，不必每条都说："
 MAX_TEXT_LENGTH = 300  # 备忘总文字 ≤300 字
 MARKER = "【MaiWork 备忘】"  # 已注入标记：inject 排重用（不含「话题相关时可以自然提起」整段）
+# 派活 / 任务状态类备忘的 key 前缀（intake.py 写）：这些行排在话题接龙行之前，
+# 并优先分配 300 字预算（放不下按句截断；预算耗尽就停止——备忘条目多时，后面的行
+# 这一轮可能整条不进上下文，不保证每条每轮都完整）。线上 2026-10-09：两条长接龙
+# 吃光预算，派活行被整行跳过，MaiBot 那轮看不到就自己答应自己做了。
+# - request:<待批请求号>：群友 @ 派活后写的那条；同一请求的状态更新
+#   （等管理员批准 → 已开工）用同一个 key 覆盖同一行。
+# - idea-busy:<构想号>:<消息号>：「这条构想已经在等批准 / 已经在做了，不用再建」。
+# 以后新增任务状态行也沿用这两个前缀，就能自动拿到优先级。
+PRIORITY_MEMO_PREFIXES = ("request:", "idea-busy:")
+# 派活行自身太长、预算又必须给它时：按句截断（句末标点优先），不整行丢。
+_PRIORITY_SENTENCE_ENDS = "。！？；!?;."
+_PRIORITY_MIN_BODY = 12  # 截断后正文至少留这么多字（再多行也在可用预算内分份额，不足截短）
+_PRIORITY_MIN_LINE = _PRIORITY_MIN_BODY + 2  # 含 "- " 前缀
 # 普通交付算主动推送；只有群友用 /mw 领取 <任务号> 当场索取时，
 # 才把待发的本任务成品升级为 awaited_delivery。它与故障及指令回执一样不受
 # 睡觉时段/每日额度限制，仍记发送审计；不要把所有 delivery 都豁免。
@@ -466,7 +479,9 @@ class Mentions:
     - add()：存素材，同 key 覆盖。
     - render(session_id)：拼出备忘文本；不调模型、纯查库；非服务群或没货 → None。
     - inject(kwargs)：钩子本体；追加到第一个 SystemMessageItem 最后一个 text part。
-      话题接龙（TopicMatcher）命中的行排在已存备忘前面，共用 300 字总上限。
+      派活 / 任务状态行（key 前缀见 PRIORITY_MEMO_PREFIXES）排在话题接龙行前面、
+      优先分配 300 字预算（放不下按句截断，预算耗尽停止；备忘条目多时不保证每条完整），
+      话题接龙（TopicMatcher）命中的行排在它们后面，共用同一个总上限。
     """
 
     def __init__(self, store: Store, get_settings: Callable[[], Settings]) -> None:
@@ -505,11 +520,43 @@ class Mentions:
     def _mention_rows(self, group_id: str) -> list[Any]:
         now = clock.now()
         return self._store.read().execute(
-            "SELECT id, text, turns_left FROM mentions"
+            "SELECT id, key, text, turns_left FROM mentions"
             " WHERE group_id=? AND expires_ts>? AND turns_left>0"
             " ORDER BY created DESC",
             (str(group_id), now),
         ).fetchall()
+
+    @staticmethod
+    def _is_priority(row: Any) -> bool:
+        """这条备忘是不是派活 / 任务状态类（靠 key 前缀认，见 PRIORITY_MEMO_PREFIXES）。"""
+        try:
+            return str(row["key"] or "").startswith(PRIORITY_MEMO_PREFIXES)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _fit_priority_line(text: str, limit: int) -> str:
+        """派活 / 状态行优先占预算：放不下就按句截断，再不行硬截加省略号。
+
+        limit 是这一行（含 "- " 前缀）能占的字数；返回整行长度 ≤ limit；一行都放不下
+        返回 ""（预算耗尽时调用方随即停止，后面的行这一轮不进上下文）。
+        句末标点太靠前（截了会丢掉大半内容）就不按它断，改成硬截。
+        """
+        room = int(limit) - 2  # "- "
+        if room <= 0:
+            return ""
+        body = str(text or "")
+        if len(body) <= room:
+            return f"- {body}"
+        cut = body[:room]
+        best = -1
+        for ch in _PRIORITY_SENTENCE_ENDS:
+            best = max(best, cut.rfind(ch))
+        if best + 1 >= max(_PRIORITY_MIN_BODY, room // 2):
+            return f"- {cut[: best + 1]}"
+        if room <= 1:
+            return f"- {cut}"
+        return f"- {cut[: room - 1]}…"
 
     def _decrement_turns(self, used_ids: list[int], group_id: str) -> None:
         """turn 递减：只扣这次真的放进渲染的那些。"""
@@ -543,29 +590,57 @@ class Mentions:
         return HEADER + "\n" + "\n".join(lines)
 
     def _memo_with_topics(self, group_id: str, kwargs: Any) -> Optional[str]:
-        """话题接龙行排前面 + 已存备忘，共用同一个 300 字总上限；没货 → None。
+        """派活 / 任务状态行优先分配预算，再话题接龙行，再其它备忘行；共用 300 字总上限。
+
+        2026-10-09 线上实测（planner 请求存档）：10:28:03 那一轮的备忘被两条长接龙
+        先拼吃光了 300 预算，派活行整行跳过，MaiBot 那轮没看到就自己答应自己做了；
+        10:29:21 那轮看得到派活行。现在派活 / 任务状态行（`_is_priority`）排在接龙行
+        之前、优先分配预算：单条太长按句截断、不整行丢；预算耗尽就停止（备忘条目多时
+        后面的行这一轮可能整条不进；不保证每条每轮都完整）；剩余预算再按原规则给
+        接龙行（不够就少放）和其它备忘行。
 
         2026-10：只递不记账（chat_feeds 表和 record/check_said 已删；「聊到了」状态也删）。
         """
         topic_entries = self._topics.memo_entries(group_id, kwargs)
+        rows = self._mention_rows(group_id)
+        priority_rows = [r for r in rows if self._is_priority(r)]
+        other_rows = [r for r in rows if not self._is_priority(r)]
         lines: list[str] = []
         used_ids: list[int] = []
         used_keys: list[str] = []
         remaining = MAX_TEXT_LENGTH - len(HEADER)
+
+        # 1) 派活 / 任务状态行：在可用预算内分配份额；预算不足时截短，耗尽后停止
+        #    （后面的行这一轮不进上下文）
+        for i, r in enumerate(priority_rows):
+            left = len(priority_rows) - i
+            share = remaining // left if left > 0 else remaining
+            limit = min(max(remaining - 1, 0), max(share, _PRIORITY_MIN_LINE))
+            line = self._fit_priority_line(str(r["text"]), limit)
+            if not line:
+                break
+            lines.append(line)
+            used_ids.append(int(r["id"]))
+            remaining -= len(line) + 1  # +1 是换行
+
+        # 2) 话题接龙行：原规则（放不下就少放）
         for entry in topic_entries:
             line = f"- {entry['text']}"
-            if len(line) > remaining:
+            if len(line) + 1 > remaining:
                 continue
             lines.append(line)
             used_keys.append(entry["key"])
             remaining -= len(line) + 1
-        for r in self._mention_rows(group_id):
+
+        # 3) 其它备忘行：原规则（放不下就跳过，继续看后面短的）
+        for r in other_rows:
             line = f"- {r['text']}"
-            if len(line) > remaining:
+            if len(line) + 1 > remaining:
                 continue
             lines.append(line)
             used_ids.append(int(r["id"]))
             remaining -= len(line) + 1
+
         if not lines:
             return None
         self._decrement_turns(used_ids, group_id)

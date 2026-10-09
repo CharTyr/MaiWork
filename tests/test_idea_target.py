@@ -190,7 +190,9 @@ class TestIdeaRefFromGroup:
         assert "构想" in kw["via"]
         row = store.read().execute("SELECT state, requested_by FROM ideas WHERE id=?", (iid,)).fetchone()
         assert row["state"] == "pending" and row["requested_by"] == "阿柒"
-        assert any("MaiWork 已经记下" in m["text"] for m in mentions.items)
+        # 2026-10 线上整改（方案 B）：备忘改成明确指令「已由 MaiWork 接手；你不要自己做」
+        assert any("已由 MaiWork 接手" in m["text"] for m in mentions.items)
+        assert any("不要自己做" in m["text"] for m in mentions.items)
 
     @pytest.mark.asyncio
     async def test_already_started_idea_not_duplicated(self, tmp_path) -> None:

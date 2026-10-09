@@ -200,12 +200,14 @@ class TestAtRecognition:
         assert kw["message_id"] == "m-7"
         assert "把握 0.86" in kw["via"]
         assert "Jev" in kw["via"]
-        # 可提起清单有一句「已记下，等管理员批准」
+        # 可提起清单有一句「已由 MaiWork 接手（等管理员批准），你不要自己做」
         assert len(mentions.items) == 1
         m = mentions.items[0]
         assert m["group_id"] == G1
         assert "阿柒" in m["text"]
-        assert "MaiWork 已经记下" in m["text"]
+        assert "已由 MaiWork 接手" in m["text"]
+        assert "等管理员批准" in m["text"]
+        assert "不要自己做" in m["text"]
         assert m["ttl_s"] == 30 * 60
 
     @pytest.mark.asyncio

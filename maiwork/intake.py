@@ -9,8 +9,11 @@
 - 群友派的活走 Approvals（要批准的未批准不开工）。
 
 M3 决定的出入（和 docs/07 §11.5 对齐）：
-- @ 之后 Jev 判 kind=prepare/goal 且把握 ≥0.6 → 后台 approvals.create，
-  并往可提起清单加一句「已记下，等管理员批准」（ttl 30 分钟）。
+- @ 之后 Jev 判 kind=prepare/goal 且把握 ≥0.6 → 后台 approvals.create，并往可提起清单
+  加一句「<名字> 刚才 @ 你派的活已由 MaiWork 接手（等管理员批准 / 已开工）；你不用答应，
+  不要自己做」（ttl 30 分钟，key 前缀 request: → delivery 把它排在接龙行之前、优先分配
+  预算；放不下按句截断，预算耗尽停止——条目多时不保证这一轮完整注入）。「已开工」是
+  免批 / 当场获准的口径，不是子 agent 已在跑。
 - kind=reminder 且把握 ≥0.6 → 后台回调 on_reminder(group_id, msg)（app 提供，
   由主模型解析时间后建成员目标）。
 - Jev 明确判 none 且把握 ≥0.6 → 什么都不记（这是正常闲聊）。
@@ -64,7 +67,7 @@ _STATE_TEXT_MAX = 500
 _TITLE_MAX = 30
 # 可提起清单的存活期
 _COMMAND_MENTION_TTL_S = 120        # /mw 指令说明只留 2 分钟
-_REQUEST_MENTION_TTL_S = 30 * 60    # 「已记下，等管理员批准」留 30 分钟
+_REQUEST_MENTION_TTL_S = 30 * 60    # 「已由 MaiWork 接手（等批准 / 已开工）」留 30 分钟
 _SLOW_QUEUE_MAX = 200               # 慢路径内存队列上限（满了丢最旧的）
 # 网页构想详情「复制要求」带的编号（「（构想 #12）」）：认出来就按这条构想建请求，不问 Jev。
 # 2026-10：还认「（构想 #12，要做：1、3）」这种挑了项目的写法（尾部不跨右括号 / 换行）。
@@ -437,7 +440,6 @@ class Intake:
             return
         kind = "task" if label == "prepare" else "goal"
         zh = {"prepare": "准备东西", "goal": "帮忙盯着或做成"}[label]
-        request_zh = {"prepare": "准备 / 整理东西", "goal": "帮忙把一件事做成"}[label]
         title = text.strip()[:_TITLE_MAX] or zh
         via = f"群里 @ · Jev 判断是「{zh}」（把握 {confidence:.2f}）"
         try:
@@ -458,9 +460,14 @@ class Intake:
         if not isinstance(res, dict) or not res.get("id"):
             return
         name = user_name or user_id or "有人"
+        # 有 id 的返回路径只有 pending / approved 两种（approvals.create）。
+        # approved = 免批 / 当场获准：口径是「已获准、交给 MaiWork」，不是子 agent 已在跑。
+        state_zh = "等管理员批准" if str(res.get("status") or "") == "pending" else "已开工"
         self._add_mention(
             group_id,
-            f"{name}刚才请你{request_zh}，MaiWork 已经记下，等管理员批准后开工（免批的话已经开工）",
+            f"{name} 刚才 @ 你派的活已由 MaiWork 接手（{state_zh}）。"
+            f"你不用答应，不要自己做、不要说你来做或给出成品；"
+            f"可以只简短说一句「好，交给它了」，也可以不回。",
             key=f"request:{res['id']}",
             ttl_s=_REQUEST_MENTION_TTL_S,
         )
@@ -539,9 +546,12 @@ class Intake:
                     )
             except Exception:
                 logger.exception("构想 #%s 标「等批准」失败", iid)
+        state_zh = "等管理员批准" if str(res.get("status") or "") == "pending" else "已开工"
         self._add_mention(
             group_id,
-            f"{name}刚才请你做构想「{title[:40]}」，MaiWork 已经记下，等管理员批准后开工（免批的话已经开工）",
+            f"{name} 刚才 @ 你派的活（构想「{title[:40]}」）已由 MaiWork 接手（{state_zh}）。"
+            f"你不用答应，不要自己做、不要说你来做或给出成品；"
+            f"可以只简短说一句「好，交给它了」，也可以不回。",
             key=f"request:{res['id']}",
             ttl_s=_REQUEST_MENTION_TTL_S,
         )

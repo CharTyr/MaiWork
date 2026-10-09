@@ -662,8 +662,14 @@ class TestIntakeIntegration:
         assert h.started == [str(row["task_id"])]
 
     @pytest.mark.asyncio
-    async def test_mention_text_same_as_exempt_path(self, tmp_path) -> None:
-        """群里看到的固定话和「免批直接开工」那句一致（都是 intake 那句）。"""
+    async def test_mention_text_pending_until_approved(self, tmp_path) -> None:
+        """备忘在审批结果出来之前写好：自动审核还没批 → 口径是「等管理员批准」。
+
+        2026-10 线上整改（方案 B）：派活备忘改成明确指令「已由 MaiWork 接手；
+        你不用答应，不要自己做」，并按实际状态写（等管理员批准 / 免批已开工）。
+        免批直接开工那条写「已开工」，见 tests/test_task_memo_priority.py。
+        这里守住「自动审核还没批时写等管理员批准」。
+        """
         from fakes import hook_message
 
         from CharTyr_MaiWork.maiwork.intake import Intake, Signals
@@ -683,8 +689,9 @@ class TestIntakeIntegration:
         await intake.handle(hook_message(is_at=True, text="@MaiBot 帮我查一下免费图床"))
         await self._drain(spawned)
         assert len(mentions.items) == 1
-        assert "等管理员批准后开工（免批的话已经开工）" in mentions.items[0]["text"]
-        # 自动批了，但群里那句话没变（和免批一样）
+        assert "等管理员批准" in mentions.items[0]["text"]
+        assert "不要自己做" in mentions.items[0]["text"]
+        # 自动批了（在备忘写完之后异步完成），但备忘里写的是「还在等批准」
         row = h.store.read().execute("SELECT status FROM requests").fetchone()
         assert str(row["status"]) == "approved"
 
