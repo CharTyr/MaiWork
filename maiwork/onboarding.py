@@ -50,9 +50,10 @@ def _checks(svc: Any) -> dict[str, bool]:
     except Exception:
         out["search"] = False
     try:
-        from .jev import _resolve_key
+        from .jev import resolve_target
 
-        out["jev"] = bool(_resolve_key(settings))
+        target = resolve_target(settings)
+        out["jev"] = bool(target is not None and str(target.key or "").strip())
     except Exception:
         out["jev"] = False
     return out

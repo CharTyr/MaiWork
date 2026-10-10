@@ -5,7 +5,7 @@
 # 是否启用 MaiWork；默认关闭。宿主在没写 enabled 时会当成开启，所以这里必须显式写。
 enabled = false
 # 配置版本；改默认值时会升。一般不用手改。
-config_version = "0.4.6"
+config_version = "0.4.8"
 
 
 [groups]
@@ -167,6 +167,46 @@ key_file = ""
 api_url = "https://api.typesafe.ai/v1/systemone"
 # Jev 模型名；一般不用改。
 model = "jev-1.13.0"
+# 现在用哪个判断服务：内置的写 "typesafe"（就用上面的 api_url / api_key / model）；
+# 想换成别家就写下面 [[jev_endpoints]] 里某条的 id。
+use = "typesafe"
+
+# ── 判断服务：自己加的那些（2026-10）──────────────────────────────────
+# 判断服务不只 TypeSafe 一家；网页「设置 → 快速判断」里有内置预设（OpenRouter、
+# OpenCode Zen、Command Code、Vercel、Upstage、Inception、Liquid、Cloudflare、
+# OpenAI Decisions），一键填好地址和模型名，也能自己加。改的是这里。
+# 地址必须 https:// 开头（密钥跟着请求走）；只有本机地址（localhost / 127.0.0.1 / ::1）
+# 才能用 http://，方便接自己跑的开源判断模型。
+# 预设里的地址/模型名只是照官方文档抄的默认值，没有用真密钥实测过，能改。
+# 下面是一条占位示例：id、密钥要换成你自己的；不想要就整段删掉（要留着 [jev] use）。
+#[[jev_endpoints]]
+# id = "or"                       # 小写字母/数字/_/-，1~32 个字符，不能重复，不能叫 typesafe
+# name = "OpenRouter"             # 显示名（≤40 字）；空 = 用预设名或 id
+# preset = "openrouter"           # 内置预设 id；空 = 自定义（这时地址和模型名必须自己填）
+# protocol = "systemone"          # systemone 或 openai_decisions
+# url = "https://openrouter.ai/api/v1/systemone"
+# model = "typesafe/jev-1.13"
+# api_key = ""                    # 只进不出：接口只回 key_set，不写日志
+# 用哪一条由上面 [jev] 的 use 决定；网页「测试」按钮会真发一次小请求试试通不通。
+
+
+[quick_judge]
+# 派活判断兜底：没配 Jev、Jev 连不上、或 Jev 拿不准时，用模型快速判一次
+# 「群里 @ 的是不是派活」。判得准的当场建待批请求 / 提醒；判不准的仍然写进
+# pending_asks，等主模型读群时再判（老慢路径照旧，一条都不丢）。
+enabled = true
+# 用哪个模型判断：填 [[model_list]] 的条目 id（一般挑个又快又便宜的）；
+# 空 = 跟主模型用同一条链。填的条目不存在 / 用不了会退回主模型的链（只记一条日志）。
+model = ""
+# 先过一遍请求词：没有「帮我、整理、查一下、提醒我」这类说法的 @ 直接当闲聊，
+# 不花模型钱（也不写 pending_asks，主模型读群时照样能看见这条消息）。
+# 默认关：开了会漏掉说法含糊的派活（比如「我可以做张开黑语音排障卡…整理成文档」），省钱但可能漏活。
+keyword_filter = false
+# 每个群每天最多让模型判几次（0 = 一次都不用模型，全走老慢路径）。
+daily_max = 30
+# 第一条 @ 进来后等几秒，把这段时间里的 @ 合成一次判断（一批 = 一次模型调用）；
+# 攒够 6 条就提前判，不等满。3~120 秒。
+batch_wait_s = 15
 
 [usage]
 # 一天 token 总量超过这个数就在网页/日志提醒；0 = 不提醒；只提醒不暂停。

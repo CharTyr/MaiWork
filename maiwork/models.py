@@ -1823,6 +1823,25 @@ class Models:
             )
         return out
 
+    def candidates_for_entry(self, entry_id: Any) -> list[_Candidate]:
+        """按模型库条目 id 解析候选链（空 = 没这个条目 / 端点缺地址密钥）。
+
+        给「派活判断兜底」这类要自己点一个模型的地方用（quick_judge.py）：
+        传空的候选就得回落主模型的链，所以这里只回真能用的。
+        """
+        eid = str(entry_id or "").strip()
+        if not eid:
+            return []
+        try:
+            settings = self._get_settings()
+        except Exception:
+            return []
+        return self._entries_to_candidates(
+            (eid,),
+            tuple(getattr(settings, "endpoints", ()) or ()),
+            tuple(getattr(settings, "model_list", ()) or ()),
+        )
+
     def _escalation_candidates(self, kind: str) -> list[_Candidate]:
         """任务双岗协作（docs/20 §5.3）：岗位「做不动时换用」的候选链。
 
@@ -3055,6 +3074,7 @@ class Models:
         timeout: float = 120,
         retries: int | None = None,
         max_tokens: int | None = None,
+        effort: str | None = None,
         _candidates: list[_Candidate] | None = None,
         escalate: bool = False,
         # 私有口（只有 chat_compaction_prefix 用）：出参收「这次真发出去的 body」，
@@ -3082,6 +3102,9 @@ class Models:
         备用救回（首选没成、别的候选成了）记一行 info：首选、实际模型、本次总耗时。
         retries=None 用设置里的；主循环里直接 await 的调用传 1（别让循环卡几分钟）。
         max_tokens=None 用所选条目的 max_tokens（缺省 32768）；传了以调用方为准。
+        effort=None 用岗位 profile 里选的强度（老行为）；传了以传入的为准（比如
+        「派活判断兜底」固定 low）。发的规矩不变：条目 efforts 勾了才发，端点 400
+        说不收就降一档，学到的上限照旧管着。
         请求体里总是带 max_tokens（有些端点没有它会出错；anthropic 必填）。
         每次尝试（成功或失败）写一条 usage + 一条 model_calls；usage 的 role 记
         实际干活链路分桶（主模型兜底也记 main），agent 记调用方报的岗位。
@@ -3126,8 +3149,12 @@ class Models:
                 raise ModelError("模型还没配好：「主模型」还没挑模型，到网页「专岗」页给它选一个模型")
             raise ModelError(f"模型还没配好：「{agent_kind}」专岗还没挑模型，连主模型也没选好，到网页「专岗」页先选一个模型")
         role_effective = "main" if role_kind == "main" else "worker"
-        # 思考强度：跟「用谁的链」一致——用它自己的 profile 强度；兜底用主模型的
-        requested_effort = self._profile_effort(role_kind)
+        # 思考强度：跟「用谁的链」一致——用它自己的 profile 强度；兜底用主模型的。
+        # 调用方明确传了 effort（比如兜底判断固定 low）就以它为准，后面「条目勾了才发 +
+        # 学到上限」的规矩一样管着。
+        requested_effort = (
+            self._profile_effort(role_kind) if effort is None else str(effort).strip().lower()
+        )
 
         # 所有端点的密钥 + 全部请求头值都进遮罩名单（备用在另一个端点时也可能泄进错误文本）
         secret_keys = self._all_secret_values(settings)

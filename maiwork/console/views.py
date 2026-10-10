@@ -1073,30 +1073,63 @@ def _recent_model_errors(store: Any, now: float) -> bool:
 
 
 def _jev_health(svc: Any) -> dict[str, Any]:
-    """Jev 健康项：available → ok「能用 · 今天判断 N 次」；没密钥 → warn；关了 → off。"""
+    """Jev 健康项：available → ok「能用 · <服务名> · 今天判断 N 次」；没密钥 / 选的服务
+    不在了 → warn；关了 → off。服务名来自当前目标（内置就是 TypeSafe 官方）。"""
     jev = getattr(svc, "jev", None)
     if jev is None:
         return {"key": "jev", "icon": "sparkles", "name": "快速判断", "state": "off", "text": "还没启用"}
     settings = svc.get_settings()
     if settings is not None and not bool(getattr(settings.jev, "enabled", True)):
         return {"key": "jev", "icon": "sparkles", "name": "快速判断", "state": "off", "text": "已关闭"}
+    info: dict[str, Any] = {}
+    try:
+        info = jev.current_target_info() or {}
+    except Exception:
+        info = {}
+    use = ""
+    try:
+        use = str(getattr(getattr(settings, "jev", None), "use", "") or "").strip()
+    except Exception:
+        use = ""
+    if use and use != "typesafe" and not info.get("id"):
+        return {"key": "jev", "icon": "sparkles", "name": "快速判断", "state": "warn",
+                "text": "选的服务不见了，去设置里换一个"}
     try:
         if jev.available():
             try:
                 n = int(jev.calls_today())
             except Exception:
                 n = 0
-            return {"key": "jev", "icon": "sparkles", "name": "快速判断", "state": "ok", "text": f"能用 · 今天判断 {n} 次"}
+            name = str(info.get("name") or "")
+            text = f"能用 · {name} · 今天判断 {n} 次" if name else f"能用 · 今天判断 {n} 次"
+            return {"key": "jev", "icon": "sparkles", "name": "快速判断", "state": "ok", "text": text}
     except Exception:
         pass
-    key = ""
-    try:
-        key = jev._key()  # noqa: SLF001 —— 网页要分清「没密钥」和「熔断」，只能问它
-    except Exception:
-        key = ""
-    if not key:
+    if not info.get("key_set"):
         return {"key": "jev", "icon": "sparkles", "name": "快速判断", "state": "warn", "text": "没找到密钥"}
     return {"key": "jev", "icon": "sparkles", "name": "快速判断", "state": "warn", "text": "连续出错，稍后自动恢复"}
+
+
+def _quick_judge_health(svc: Any) -> dict[str, Any]:
+    """派活判断兜底健康项：开 → ok「开 · 今天判断 N 次」（N = 今天所有群的调用次数之和）；
+    关 → off；今天一次都没判不额外标（正常，@ 少的时候本来就没几次）。"""
+    try:
+        from ..quick_judge import calls_today
+
+        n = calls_today(getattr(svc, "store", None))
+    except Exception:
+        n = 0
+    try:
+        settings = svc.get_settings()
+        qj = getattr(settings, "quick_judge", None)
+        on = bool(getattr(qj, "enabled", True)) if qj is not None else False
+    except Exception:
+        on = False
+    if not on:
+        return {"key": "quick_judge", "icon": "bullseye", "name": "派活判断兜底", "state": "off",
+                "text": "已关闭：Jev 拿不准的 @ 走读群慢路径"}
+    return {"key": "quick_judge", "icon": "bullseye", "name": "派活判断兜底", "state": "ok",
+            "text": f"开 · 今天判断 {n} 次"}
 
 
 def _search_health(svc: Any) -> dict[str, Any]:
@@ -1441,6 +1474,7 @@ def settings_view(svc: Any) -> dict[str, Any]:
     health = [
         {"key": "models", "icon": "robot", "name": "模型", "state": model_state, "text": model_text},
         _jev_health(svc),
+        _quick_judge_health(svc),
         _search_health(svc),
         _reader_health(svc),
         _localenv_health(svc),

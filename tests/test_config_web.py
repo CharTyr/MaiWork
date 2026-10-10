@@ -175,7 +175,7 @@ class TestConfigApi:
         # topics / approval 节只剩还归全局的键。
         assert ids == [
             "groups", "focus", "feeds", "topics", "approval",
-            "tasks", "jev", "usage", "console", "environments", "profile",
+            "tasks", "jev", "quick_judge", "usage", "console", "environments", "profile",
             "storage", "group_space", "reader",
         ]
         assert data["file"] == "config.toml"

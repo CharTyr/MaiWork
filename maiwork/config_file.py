@@ -45,6 +45,7 @@ _AOT_FIELDS: dict[str, tuple[str, ...]] = {
 _AOT_TOP_FIELDS: dict[str, tuple[str, ...]] = {
     "endpoints": ("id", "name", "protocol", "base_url", "api_key", "retries", "retry_delay_s", "max_concurrency", "max_rpm", "headers"),
     "model_list": ("id", "endpoint", "model", "name", "efforts", "vision", "context_window", "max_tokens"),
+    "jev_endpoints": ("id", "name", "preset", "protocol", "url", "model", "api_key"),
 }
 
 

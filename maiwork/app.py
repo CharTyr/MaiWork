@@ -92,6 +92,8 @@ class MaiWorkApp:
         self.profiles: Any = None
         self.signals = Signals()
         self._intake: Intake | None = None
+        # 派活判断兜底（quick_judge.QuickJudge；由 _make_intake 建，停机时收）
+        self.quick_judge: Any = None
         self.console: Any = None  # console.server.ConsoleServer
         # 管理员对话（tools_admin.PendingGate / admin_chat.AdminChat）
         self.admin_pending: Any = None
@@ -916,6 +918,14 @@ class MaiWorkApp:
             except Exception:
                 logger.exception("关闭 Jev 客户端出错")
             self.jev = None
+        # 派活判断兜底：手里还没判的这批先交回慢路径，在跑的批处理取消干净（要在
+        # 关模型客户端之前收 —— 它调模型）
+        qj, self.quick_judge = self.quick_judge, None
+        if qj is not None:
+            try:
+                await qj.close()
+            except Exception:
+                logger.exception("收派活判断兜底出错")
         if self.models is not None:
             try:
                 await self.models.close()
@@ -1895,7 +1905,7 @@ class MaiWorkApp:
             return None
 
     def _make_intake(self) -> Intake:
-        return Intake(
+        intake = Intake(
             self.get_settings,
             self.signals,
             jev=self.jev,
@@ -1909,7 +1919,11 @@ class MaiWorkApp:
             store=self.store,
             on_answer=self._resume_from_answer,
             waiting_tasks=self._waiting_answer_map,
+            models=self.models,
         )
+        # 派活判断兜底（quick_judge）：intake 自己建的；停机时要单独收（见 _stop_stack）
+        self.quick_judge = getattr(intake, "quick_judge", None)
+        return intake
 
     # ------------------------------------------------------------------
     # 提问的回答恢复（docs/02 §7.2）
@@ -2085,6 +2099,9 @@ class MaiWorkApp:
             if settings is not None:
                 self._add_secret(out, getattr(getattr(settings, "models", None), "api_key", ""))
                 self._add_secret(out, getattr(getattr(settings, "jev", None), "api_key", ""))
+                # [[jev_endpoints]] 自己加的判断服务密钥也进遮罩（只进不出）
+                for jev_ep in (getattr(settings, "jev_endpoints", ()) or ()):
+                    self._add_secret(out, getattr(jev_ep, "api_key", ""))
                 self._add_secret(out, getattr(getattr(settings, "console", None), "password", ""))
                 # 所有端点的 api_key 与高级请求头值都进遮罩（绝不进日志/工具摘要）
                 for ep in (getattr(settings, "endpoints", ()) or ()):

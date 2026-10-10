@@ -1,16 +1,22 @@
-"""jev.py：TypeSafe Jev HTTP 客户端 + 熔断 + judgments 落库。
+"""jev.py：判断服务 HTTP 客户端（TypeSafe Jev / OpenAI Decisions 等）+ 熔断 + judgments 落库。
 
-- 密钥读取顺序（照 reference/jev/client.py::resolve_key；2026-10 起网页改的密钥
-  也写进 config.toml，数据库不再存覆盖层）：
+- 现在支持多家判断服务（2026-10）：内置 TypeSafe 那个仍用旧的 [jev] api_url/api_key/model
+  字段和密钥链；用户自己加的写在 [[jev_endpoints]]，[jev] use 选现在用哪一个
+  （见 jev_presets.py 的内置预设、resolve_target）。
+- 密钥读取顺序（只对内置那个；照 reference/jev/client.py::resolve_key；2026-10 起网页
+  改的密钥也写进 config.toml，数据库不再存覆盖层）：
   环境变量 TYPESAFE_API_KEY → [jev] api_key（配置，网页改的也写这里）
   → TYPESAFE_KEY_FILE 环境变量 → [jev] key_file（配置，默认 ~/.typesafe_key）。
-  符号链接或非文件拒绝读取。
+  符号链接或非文件拒绝读取。自己加的服务用条目自己的 api_key。
 - 密钥不打印、不入库；错误消息返回给调用方前已去掉密钥。
-- 请求：POST {api_url}，Authorization Bearer，body={model,state,questions}，timeout=timeout_ms。
+- 协议两种（jev_presets.PROTOCOLS）：systemone 直接 POST {model,state,questions}；
+  openai_decisions 走 OpenAI Decisions 形状（{model,input,questions:[…]}），应答由
+  normalize_response 折回 systemone 形状再统一校验。
 - 答案校验：noul 在 [0,1]；choice 的标签必须在 criteria 里，probabilities 键集合
   和 criteria 一致。校验不过 → 返回 None。
-- 熔断：连续失败 3 次停 60 秒。
-- 每次调用写 judgments 表（state_summary 为 state JSON 截 800 字）。
+- 熔断：连续失败 3 次停 60 秒；**按当前目标各算**，换了服务就重新开始。
+- 每次调用写 judgments 表（state_summary 为 state JSON 截 800 字；失败原因前面带
+  "[目标 id] "，看得出是哪个服务挂的）。
 """
 
 from __future__ import annotations
@@ -42,9 +48,32 @@ _BREAKER_COOLDOWN_S = 60.0  # 熔断时长（秒）
 _STATE_SUMMARY_MAX = 800
 _ANSWERS_JSON_MAX = 4000
 
+# 网页「测试」按钮发的那道小请求（固定内容，不碰真实业务）
+_TEST_STATE = {"message": "你好，今天天气不错"}
+_TEST_QUESTIONS: Dict[str, Any] = {
+    "greeting": {"type": "noul", "instructions": "这条消息是不是在打招呼？"},
+    "lang": {
+        "type": "choice",
+        "instructions": "这条消息是什么语言？",
+        "criteria": {"zh": "中文", "en": "英文"},
+    },
+}
+
 
 class JevError(Exception):
     """Jev 调用错误（含超时）。message 已去掉密钥。"""
+
+
+@dataclass(frozen=True)
+class JevTarget:
+    """现在这一次判断打给谁：一个内置 / 自己加的判断服务。"""
+
+    id: str
+    name: str
+    protocol: str   # systemone / openai_decisions
+    url: str
+    model: str
+    key: str = ""   # "" = 没配密钥，用不了
 
 
 def _resolve_key(settings: Settings) -> str:
@@ -79,6 +108,185 @@ def _resolve_key(settings: Settings) -> str:
         except OSError:
             continue
     return ""
+
+
+def resolve_target(settings: Settings) -> Optional[JevTarget]:
+    """按 [jev] use 算出现在打给谁；找不到（选了不存在的 id）返回 None。
+
+    - use "" / "typesafe"：内置那个，用旧的 [jev] api_url / model + 原来的密钥链。
+    - 别的：settings.jev_endpoints 里同 id 的那条，密钥用条目自己的 api_key。
+    key 为 "" 表示这条虽然存在、但没有密钥，用不了（调用方看 available()）。
+    """
+    try:
+        from .jev_presets import PRESETS
+
+        jev = getattr(settings, "jev", None)
+        if jev is None:
+            return None
+        use = str(getattr(jev, "use", "") or "").strip()
+        if use in ("", "typesafe"):
+            builtin = PRESETS.get("typesafe")
+            return JevTarget(
+                id="typesafe",
+                name=str(getattr(builtin, "name", "") or "TypeSafe 官方"),
+                protocol="systemone",
+                url=str(getattr(jev, "api_url", "") or DEFAULT_API_URL).strip() or DEFAULT_API_URL,
+                model=str(getattr(jev, "model", "") or DEFAULT_MODEL).strip() or DEFAULT_MODEL,
+                key=_resolve_key(settings),
+            )
+        for ep in (getattr(settings, "jev_endpoints", ()) or ()):
+            if str(getattr(ep, "id", "")) != use:
+                continue
+            return JevTarget(
+                id=use,
+                name=str(getattr(ep, "name", "") or use),
+                protocol=str(getattr(ep, "protocol", "") or "systemone"),
+                url=str(getattr(ep, "url", "") or ""),
+                model=str(getattr(ep, "model", "") or ""),
+                key=str(getattr(ep, "api_key", "") or "").strip(),
+            )
+        return None
+    except Exception:
+        logger.debug("算当前判断服务出错", exc_info=True)
+        return None
+
+
+# ----------------------------------------------------------------------
+# 协议适配（纯函数）：请求拼装 / 应答折回 systemone 形状
+# ----------------------------------------------------------------------
+
+
+def _as_instruction_text(raw: Any) -> str:
+    """instructions 是字符串就原样；别的类型 json.dumps（不猜它的意思）。"""
+    if isinstance(raw, str):
+        return raw
+    return json.dumps(raw, ensure_ascii=False, default=str)
+
+
+def _probabilities_map(items: Any) -> Dict[str, Any]:
+    """OpenAI 形状的 probabilities 数组 → {标签: 概率}（保序）。
+
+    每项取 value，没有就取 label，都没有就用序号当键（和文档里的
+    "str(value or index)" 一致）。
+    """
+    out: Dict[str, Any] = {}
+    if not isinstance(items, list):
+        return out
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        key = item.get("value")
+        if key is None:
+            key = item.get("label")
+        if key is None:
+            key = index
+        out[str(key)] = item.get("probability")
+    return out
+
+
+def build_body(protocol: str, model: str, state: Any, questions: Dict[str, Any]) -> Dict[str, Any]:
+    """按协议拼请求体（纯函数）。不认识的协议 / 题型直接 ValueError。"""
+    if protocol == "systemone":
+        return {"model": model, "state": state, "questions": questions}
+    if protocol != "openai_decisions":
+        raise ValueError(f"unknown protocol: {protocol}")
+    items: List[Dict[str, Any]] = []
+    for name, question in questions.items():
+        if not isinstance(question, dict):
+            raise ValueError(f"invalid question: {name}")
+        qtype = question.get("type")
+        instructions = _as_instruction_text(question.get("instructions", ""))
+        if qtype == "noul":
+            criteria = question.get("criteria")
+            if isinstance(criteria, dict) and "true" in criteria and "false" in criteria:
+                yes = _as_instruction_text(criteria.get("true"))
+                no = _as_instruction_text(criteria.get("false"))
+                instructions = f"{instructions}（是：{yes}；否：{no}）"
+            items.append({"type": "predicate", "name": str(name), "instructions": instructions})
+        elif qtype == "choice":
+            criteria = question.get("criteria") or {}
+            if not isinstance(criteria, dict):
+                raise ValueError(f"invalid criteria: {name}")
+            items.append({
+                "type": "choice", "name": str(name), "instructions": instructions,
+                "choices": [
+                    {"value": str(label), "description": _as_instruction_text(desc)}
+                    for label, desc in criteria.items()
+                ],
+            })
+        elif qtype == "score":
+            criteria = question.get("criteria") or []
+            if not isinstance(criteria, (list, tuple)):
+                raise ValueError(f"invalid criteria: {name}")
+            levels = [{"label": c if isinstance(c, str) else _as_instruction_text(c)} for c in criteria]
+            items.append({"type": "score", "name": str(name), "instructions": instructions, "levels": levels})
+        else:
+            raise ValueError(f"unknown question type: {qtype}")
+    text = state if isinstance(state, str) else json.dumps(state, ensure_ascii=False, default=str)
+    return {"model": model, "input": text, "questions": items}
+
+
+def normalize_response(protocol: str, data: Any, questions: Dict[str, Any]) -> Dict[str, Any]:
+    """把各家应答折回 systemone 形状 {"answers": {名字: …}}，交给 validate_answers。
+
+    - systemone：本身就是这个形状，原样返回。Cloudflare Workers AI 的 REST 会包一层
+      ``{"result": {...}, "success": …, "errors": […]}``，这里拆开；``success=false``
+      就拿第一条 errors[].message 当错误（遮过密钥）。其余（TypeSafe 原厂、OpenRouter、
+      OpenCode、Upstage、Inception、Liquid 等）不带这层，直接过。
+    - openai_decisions：``answers`` 是数组，按 name 映射成 systemone 的字典；
+      refusal 直接算失败。
+    """
+    if protocol == "systemone":
+        if not isinstance(data, dict):
+            raise ValueError("invalid response")
+        if data.get("success") is False:
+            errors = data.get("errors")
+            message = ""
+            if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+                message = str(errors[0].get("message") or "")
+            raise ValueError(_sanitize_error(message or "systemone 调用失败", "", 200))
+        payload = data
+        if "answers" not in payload:
+            result = payload.get("result")
+            if isinstance(result, dict) and "answers" in result:
+                payload = result
+        if not isinstance(payload, dict) or not isinstance(payload.get("answers"), dict):
+            raise ValueError("invalid response")
+        return payload
+    if protocol != "openai_decisions":
+        raise ValueError(f"unknown protocol: {protocol}")
+    raw = data.get("answers") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        raise ValueError("invalid response")
+    answers: Dict[str, Any] = {}
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        atype = entry.get("type")
+        if atype == "refusal":
+            raise ValueError(f"refusal: {name}")
+        if atype == "predicate":
+            answers[name] = {"type": "noul", "noul": entry.get("probability")}
+        elif atype == "choice":
+            answers[name] = {
+                "type": "choice",
+                "choice": entry.get("choice"),
+                "probabilities": _probabilities_map(entry.get("probabilities")),
+                "confidence": entry.get("confidence"),
+            }
+        elif atype == "score":
+            answers[name] = {
+                "type": "score",
+                "score": entry.get("score"),
+                "probabilities": _probabilities_map(entry.get("probabilities")),
+                "confidence": entry.get("confidence"),
+            }
+        else:
+            raise ValueError(f"unknown answer type: {atype}")
+    return {"answers": answers}
 
 
 def _sanitize_error(err: str, key: str, max_len: int = 300) -> str:
@@ -218,6 +426,8 @@ class Jev:
         self._client = httpx.AsyncClient(transport=transport) if transport else httpx.AsyncClient()
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
+        # 熔断按目标各算：记着上次用的是哪个服务，换了就重新开始
+        self._target_id = ""
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -230,10 +440,22 @@ class Jev:
             raise JevError("settings 还没准备好")
         return s
 
+    def _target(self) -> Optional[JevTarget]:
+        """现在打给谁；换了目标就把失败计数和熔断重置。"""
+        target = resolve_target(self._settings())
+        if target is None:
+            return None
+        if target.id != self._target_id:
+            self._consecutive_failures = 0
+            self._breaker_open_until = 0.0
+            self._target_id = target.id
+        return target
+
     def _key(self) -> str:
-        """读密钥；不存在或不可用返回 ""，不抛异常。"""
+        """当前目标的密钥；不存在或不可用返回 ""，不抛异常。"""
         try:
-            return _resolve_key(self._settings())
+            target = self._target()
+            return str(target.key or "") if target is not None else ""
         except Exception:
             return ""
 
@@ -283,16 +505,33 @@ class Jev:
     # ------------------------------------------------------------------
 
     def available(self) -> bool:
-        """开着、有密钥、没在熔断。"""
+        """开着、当前目标存在且有密钥、没在熔断。"""
         try:
             s = self._settings()
             if not getattr(s.jev, "enabled", True):
                 return False
-            if not self._key():
+            target = self._target()
+            if target is None or not str(target.key or "").strip():
                 return False
             return not self._breaker_open()
         except Exception:
             return False
+
+    def current_target_info(self) -> Dict[str, Any]:
+        """现在用哪个判断服务（给网页健康行）；**永远不含密钥**。"""
+        info: Dict[str, Any] = {"id": "", "name": "", "protocol": "", "model": "", "key_set": False}
+        try:
+            target = self._target()
+        except Exception:
+            target = None
+        if target is None:
+            return info
+        info["id"] = str(target.id)
+        info["name"] = str(target.name)
+        info["protocol"] = str(target.protocol)
+        info["model"] = str(target.model)
+        info["key_set"] = bool(str(target.key or "").strip())
+        return info
 
     def calls_today(self) -> int:
         """北京时间的今天，发起过多少次 Jev 调用（含失败）。"""
@@ -327,15 +566,22 @@ class Jev:
         if not self.available():
             return None
         settings = self._settings()
-        key = self._key()
+        target = self._target()
+        if target is None:
+            return None
+        key = str(target.key or "").strip()
         if not key:
             return None
+        tag = f"[{target.id}] "
 
-        url = str(getattr(settings.jev, "api_url", "") or DEFAULT_API_URL).strip()
-        model = str(getattr(settings.jev, "model", "") or DEFAULT_MODEL).strip()
         if timeout_ms is None:
             timeout_ms = getattr(settings.jev, "timeout_ms", 1500)
         timeout_s = max(0.1, float(timeout_ms) / 1000.0)
+        try:
+            body = build_body(target.protocol, target.model, state, questions)
+        except ValueError as exc:
+            logger.warning("拼判断请求失败（%s）：%s", target.id, exc)
+            return None
 
         async with self._lock:  # 熔断计数里有共享状态，串行请求
             # 再次检查（拿到锁后可能别人刚成功/失败过）
@@ -344,37 +590,39 @@ class Jev:
                 return None
             start = clock.now()
             answers: Optional[Dict[str, Any]] = None
-            error_text = ""
-            ok = False
             try:
                 resp = await self._client.post(
-                    url,
-                    json={"model": model, "state": state, "questions": questions},
+                    target.url,
+                    json=body,
                     headers={"Authorization": f"Bearer {key}"},
                     timeout=timeout_s,
                 )
                 ms = int((clock.now() - start) * 1000)
                 if resp.status_code != 200:
-                    error_text = f"http_{resp.status_code}"
+                    error_text = f"{tag}http_{resp.status_code}"
                     try:
-                        body = resp.text[:200]
+                        body_text = resp.text[:200]
                     except Exception:
-                        body = ""
-                    if body:
-                        error_text += f": {body}"
+                        body_text = ""
+                    if body_text:
+                        error_text += f": {body_text}"
                     self._record_failure(ms, error_text, purpose=purpose, group_id=group_id, state=state, key=key)
                     return None
                 try:
                     data = resp.json()
                 except ValueError:
-                    self._record_failure(ms, "bad_json", purpose=purpose, group_id=group_id, state=state, key=key)
+                    self._record_failure(ms, f"{tag}bad_json", purpose=purpose, group_id=group_id, state=state, key=key)
                     return None
                 try:
-                    answers = validate_answers(data, questions)
+                    normalized = normalize_response(target.protocol, data, questions)
                 except ValueError as exc:
-                    self._record_failure(ms, f"invalid_answers: {exc}", purpose=purpose, group_id=group_id, state=state, key=key)
+                    self._record_failure(ms, f"{tag}invalid_response: {exc}", purpose=purpose, group_id=group_id, state=state, key=key)
                     return None
-                ok = True
+                try:
+                    answers = validate_answers(normalized, questions)
+                except ValueError as exc:
+                    self._record_failure(ms, f"{tag}invalid_answers: {exc}", purpose=purpose, group_id=group_id, state=state, key=key)
+                    return None
                 self._record_success()
                 # 成功也落库
                 self._log_success(
@@ -382,19 +630,89 @@ class Jev:
                     purpose=purpose,
                     group_id=group_id,
                     state=state,
-                    answers_raw=data.get("answers", {}),
+                    answers_raw=normalized.get("answers", {}),
                     answers_validated=answers,
                     key=key,
                 )
                 return answers
             except (httpx.HTTPError, asyncio.TimeoutError) as exc:
                 ms = int((clock.now() - start) * 1000)
-                self._record_failure(ms, type(exc).__name__, purpose=purpose, group_id=group_id, state=state, key=key)
+                self._record_failure(ms, f"{tag}{type(exc).__name__}", purpose=purpose, group_id=group_id, state=state, key=key)
                 return None
             except Exception as exc:
                 ms = int((clock.now() - start) * 1000)
-                self._record_failure(ms, f"unexpected: {exc}", purpose=purpose, group_id=group_id, state=state, key=key)
+                self._record_failure(ms, f"{tag}unexpected: {exc}", purpose=purpose, group_id=group_id, state=state, key=key)
                 return None
+
+    # ------------------------------------------------------------------
+    # test_endpoint（网页「测试」按钮）
+    # ------------------------------------------------------------------
+
+    async def test_endpoint(
+        self,
+        *,
+        protocol: str,
+        url: str,
+        model: str,
+        key: str,
+        timeout_ms: int = 8000,
+    ) -> Dict[str, Any]:
+        """真发一次小请求试试这个服务；**不动熔断、不写 judgments、不影响业务**。
+
+        返回 {"ok": bool, "ms": int, "error": str, "answers": {…验证过的，元组转 list}}；
+        error 已去掉密钥；HTTP 状态错误会带一小段正文（≤200 字）。
+        """
+        from .jev_presets import PROTOCOLS
+
+        started = clock.now()
+
+        def _fail(message: str, *, ms: int = -1) -> Dict[str, Any]:
+            return {
+                "ok": False,
+                "ms": int(ms if ms >= 0 else (clock.now() - started) * 1000),
+                "error": _sanitize_error(message or "测试失败", key),
+                "answers": {},
+            }
+
+        if protocol not in PROTOCOLS:
+            return _fail(f"协议只认 {' / '.join(PROTOCOLS)}")
+        if not str(url or "").strip() or not str(model or "").strip():
+            return _fail("地址和模型名都要填")
+        try:
+            body = build_body(protocol, str(model), _TEST_STATE, _TEST_QUESTIONS)
+        except ValueError as exc:
+            return _fail(f"请求拼不出来：{exc}")
+        try:
+            resp = await self._client.post(
+                str(url),
+                json=body,
+                headers={"Authorization": f"Bearer {str(key)}"},
+                timeout=max(0.1, float(timeout_ms) / 1000.0),
+            )
+        except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+            return _fail(type(exc).__name__)
+        except Exception as exc:
+            return _fail(f"unexpected: {exc}")
+        ms = int((clock.now() - started) * 1000)
+        if resp.status_code != 200:
+            try:
+                short = resp.text[:200]
+            except Exception:
+                short = ""
+            return _fail(f"http_{resp.status_code}: {short}" if short else f"http_{resp.status_code}", ms=ms)
+        try:
+            data = resp.json()
+        except ValueError:
+            return _fail("返回不是 JSON", ms=ms)
+        try:
+            normalized = normalize_response(protocol, data, _TEST_QUESTIONS)
+            answers = validate_answers(normalized, _TEST_QUESTIONS)
+        except ValueError as exc:
+            return _fail(f"答案不合法：{exc}", ms=ms)
+        out: Dict[str, Any] = {}
+        for name, value in answers.items():
+            out[name] = list(value) if isinstance(value, tuple) else value
+        return {"ok": True, "ms": ms, "error": "", "answers": out}
 
     def _log_success(
         self,

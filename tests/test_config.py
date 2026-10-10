@@ -52,7 +52,9 @@ class TestDefaults:
         # 0.4.4：[console] update_check、maibot_webui_url（更新提醒）
         # 0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）
         # 0.4.6：每端点高级请求头覆盖 headers（默认空）
-        assert CONFIG_VERSION == "0.4.6"
+        # 0.4.7：[jev] use + [[jev_endpoints]]（多判断服务：内置预设 / 自己加 / 换着用）
+        # 0.4.8：[quick_judge] 派活判断兜底（Jev 不在 / 拿不准时用模型快速判）
+        assert CONFIG_VERSION == "0.4.8"
         assert MaiWorkConfig().plugin.config_version == CONFIG_VERSION
 
     def test_railway_verify_new_fields_defaults(self) -> None:

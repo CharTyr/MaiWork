@@ -5,7 +5,7 @@ intake 侧：
 - Jev 不可用 / 超时 / 答案无效 / 把握不够 → 写 pending_asks(handled=0)，不写 intake.slow 事件。
 
 profile 提炼侧：
-- 提示词里给 pending_asks 未处理的消息标「这条 @ 了 MaiBot，Jev 没判出来，请你判断」，
+- 提示词里给 pending_asks 未处理的消息标「这条 @ 了 MaiBot，快速判断没判准，请你判断…」，
   规则里声明 asks 输出；
 - 模型输出 asks：prepare/goal → approvals 落待批（message_id 去重）；reminder+when →
   goals.create_member + outbox 回「记下了，<时间> 提醒你」（reply_to 原消息）；
@@ -273,11 +273,11 @@ class TestAskPrompt:
         prompt = models.calls[0][1][1]["content"]
         # 未处理的那条标出来了，别的没标（只看 [序号] 开头的消息行；规则段也含这句话）
         msg_lines = [ln for ln in prompt.splitlines() if ln.lstrip().startswith("[")]
-        flagged = [ln for ln in msg_lines if "这条 @ 了 MaiBot，Jev 没判出来，请你判断" in ln]
+        flagged = [ln for ln in msg_lines if "这条 @ 了 MaiBot，快速判断没判准，请你判断" in ln]
         assert len(flagged) == 1
         assert "@她 在吗" in flagged[0]
         normal_line = [ln for ln in msg_lines if "随便聊聊" in ln]
-        assert normal_line and "Jev 没判出来" not in normal_line[0]
+        assert normal_line and "快速判断没判准" not in normal_line[0]
         # 规则里声明了 asks 和输出格式
         assert "请求 | 消息序号" in prompt  # 2026-09-29 起一行一件事：请求写成「请求 | …」行
         assert "prepare 或 goal 或 reminder" in prompt

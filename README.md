@@ -6,7 +6,7 @@
 
 **MaiBot 的常驻生产力 Agent**：理解一个群 · 主动找资讯 · 提构想 · 追目标 · 交付任何工作
 
-[![Version](https://img.shields.io/badge/version-0.9.3-blue.svg)](https://github.com/CharTyr/MaiWork)
+[![Version](https://img.shields.io/github/v/release/CharTyr/MaiWork?label=version)](https://github.com/CharTyr/MaiWork/releases)
 [![MaiBot](https://img.shields.io/badge/MaiBot-1.3.2%20实测-green.svg)](https://github.com/Mai-with-u/MaiBot)
 [![SDK](https://img.shields.io/badge/插件%20SDK-2.x-green.svg)](https://github.com/Mai-with-u/MaiBot)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-orange.svg)](LICENSE)
@@ -117,7 +117,7 @@ MaiBot 会自动加载插件。
 3. **首次引导**一步一屏，依次走：
    - **开始** → **模型**：连一个端点（选接口格式、填地址和密钥），模型可以从列表里选，也可以直接手填模型名；保存时会用一句很短的问话加一次空工具测试验证这个模型，会用掉一点点 token
    - **服务的群**：MaiWork 只在写进去的群里工作
-   - **可选**：Jev 密钥（不填也能用，填了快速判断更快更省）
+   - **可选**：Jev 这类判断模型的密钥（不填也能用，填了快速判断更快更省；网页「模型 → 快速判断」里选哪家）
    - **联网搜索**：直接勾选要用的搜索服务预设，免密钥的不用填就能用；勾的第一个当主搜索，其余当备用
    - **管理员**：群友派的活由谁批准（填你自己的账号）
    - **头像** → **完成**

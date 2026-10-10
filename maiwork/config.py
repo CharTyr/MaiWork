@@ -73,7 +73,7 @@ def _norm_accounts(values: object, field_zh: str, problems: list[str]) -> tuple[
     return tuple(out)
 
 
-CONFIG_VERSION = "0.4.6"  # 0.4.6：每端点高级请求头 headers（默认空）；0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）；0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
+CONFIG_VERSION = "0.4.8"  # 0.4.8：[quick_judge] 派活判断兜底（Jev 不在 / 拿不准时用模型快速判群里 @ 的是不是派活）；0.4.7：[jev] use + [[jev_endpoints]]（多判断服务：预设 / 自己加 / 换着用）；0.4.6：每端点高级请求头 headers（默认空）；0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）；0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
 
 # 0.8.0 群控归一（docs/18 §五 + 往群里发）：下面这些全局键**只作新群第一次的迁移种子**
 # （migrations.migrate_group_controls 按服务群种进 kv["group_approval.<群号>"] /
@@ -260,6 +260,27 @@ class ModelListItemConfig(PluginConfigBase):
     max_tokens: int = Field(default=32768, description="一次回答最多写多少 token（1024~1000000，必须小于上下文窗口）")
 
 
+class JevEndpointItemConfig(PluginConfigBase):
+    """一个 [[jev_endpoints]] 条目（2026-10：多判断服务）。
+
+    用户自己加的一家判断服务：地址 + 密钥（只进不出）+ 协议 + 模型名。
+    `preset` 空 = 自定义；填了预设名（jev_presets.PRESETS 的键）就按预设补没填的
+    地址 / 模型 / 协议 / 名字。校验在 load_settings 的 _parse_jev_endpoints 里逐条做
+    （坏条目丢条目、记问题，不拖垮整段），这里只收留字段。
+    """
+
+    __ui_label__ = "判断服务"
+    __ui_icon__ = "zap"
+
+    id: str = Field(default="", description="服务 id（小写字母/数字/_/-，1~32 个字符，不能重复）")
+    name: str = Field(default="", description="显示名（≤40 字）；空 = 用预设名或 id")
+    preset: str = Field(default="", description="内置预设 id；空 = 自定义")
+    protocol: str = Field(default="systemone", description="协议：systemone / openai_decisions")
+    url: str = Field(default="", description="请求地址，https:// 开头（本机地址可以 http://）")
+    model: str = Field(default="", description="模型名（非空，≤200 字）")
+    api_key: str = Field(default="", description="服务密钥；只进不出，不写日志")
+
+
 class JevSectionConfig(PluginConfigBase):
     __ui_label__ = "快速判断"
     __ui_icon__ = "zap"
@@ -271,6 +292,25 @@ class JevSectionConfig(PluginConfigBase):
     key_file: str = Field(default="", description="Jev 密钥文件路径；空 = ~/.typesafe_key；只读取，不写日志、不入库")
     api_url: str = Field(default="https://api.typesafe.ai/v1/systemone", description="Jev 服务端地址")
     model: str = Field(default="jev-1.13.0", description="Jev 模型名")
+    use: str = Field(default="typesafe", description='现在用哪个判断服务：内置 "typesafe"（= 上面的 api_url/api_key/model）或 [[jev_endpoints]] 的 id')
+
+
+class QuickJudgeSectionConfig(PluginConfigBase):
+    """[quick_judge] 派活判断兜底（2026-10）。
+
+    Jev 没配 / 连不上 / 拿不准时，把群里 @ 的消息攒一小批，用主模型快速判一次
+    「是不是派活」。判不准的仍然回落 pending_asks（主模型读群时再判）。
+    """
+
+    __ui_label__ = "派活判断兜底"
+    __ui_icon__ = "zap"
+    __ui_order__ = 8
+
+    enabled: bool = Field(default=True, description="没配 Jev 或 Jev 拿不准时，用模型快速判断群里 @ 的是不是派活")
+    model: str = Field(default="", description='用哪个模型判断（[[model_list]] 的条目 id）；空 = 跟主模型用同一条链；填的条目不存在也用主模型的链')
+    keyword_filter: bool = Field(default=False, description="先用请求词过一遍：没有「帮我、整理、查一下、提醒我」这类词的 @ 直接当闲聊，不花模型钱；可能漏掉说法含糊的派活")
+    daily_max: int = Field(default=30, description="每个群每天最多判几次（0 = 一次都不用模型，全走老慢路径）")
+    batch_wait_s: int = Field(default=15, description="第一条 @ 进来后等几秒，把这段时间里的 @ 合成一次判断（攒够 6 条就早点判）")
 
 
 class UsageSectionConfig(PluginConfigBase):
@@ -414,6 +454,8 @@ class MaiWorkConfig(PluginConfigBase):
     endpoints: list[EndpointItemConfig] = Field(default_factory=list, description="模型端点列表（2026-10 改版：替代旧 [models] 的单一端点）")
     model_list: list[ModelListItemConfig] = Field(default_factory=list, description="模型库（挂在端点下；各专岗从这里挑模型）")
     jev: JevSectionConfig = Field(default_factory=JevSectionConfig)
+    jev_endpoints: list[JevEndpointItemConfig] = Field(default_factory=list, description="自己加的判断服务（[jev] use 选中的那个生效）")
+    quick_judge: QuickJudgeSectionConfig = Field(default_factory=QuickJudgeSectionConfig)
     usage: UsageSectionConfig = Field(default_factory=UsageSectionConfig)
     tasks: TasksSectionConfig = Field(default_factory=TasksSectionConfig)
     console: ConsoleSectionConfig = Field(default_factory=ConsoleSectionConfig)
@@ -661,6 +703,19 @@ class ModelEntry:
 
 
 @dataclass(frozen=True)
+class JevEndpointSetting:
+    """一个 [[jev_endpoints]] 规范化后的快照（2026-10：多判断服务）。"""
+
+    id: str
+    name: str
+    preset: str   # "" = 自定义
+    protocol: str
+    url: str
+    model: str
+    api_key: str = ""
+
+
+@dataclass(frozen=True)
 class JevSetting:
     enabled: bool
     timeout_ms: int
@@ -668,6 +723,19 @@ class JevSetting:
     api_url: str
     model: str
     api_key: str = ""
+    # 现在用哪个判断服务："" / "typesafe" = 上面这组内置字段；别的 = jev_endpoints 的 id
+    use: str = "typesafe"
+
+
+@dataclass(frozen=True)
+class QuickJudgeSetting:
+    """[quick_judge] 规范化后的快照（2026-10：派活判断兜底）。"""
+
+    enabled: bool = True
+    model: str = ""            # [[model_list]] 条目 id；空 = 主模型的链
+    keyword_filter: bool = False
+    daily_max: int = 30        # 每群每天模型调用次数上限（0 = 不用模型）
+    batch_wait_s: int = 15     # 攒批等待秒数（3~120）
 
 
 @dataclass(frozen=True)
@@ -784,6 +852,10 @@ class Settings:
     # 2026-10 模型改版阶段 1a：端点 + 模型库（替代旧 [models] 的单一端点/四槽）
     endpoints: tuple[EndpointSetting, ...] = ()
     model_list: tuple[ModelEntry, ...] = ()
+    # 2026-10 多判断服务：自己加的判断服务（[jev] use 选中的那个生效）
+    jev_endpoints: tuple[JevEndpointSetting, ...] = ()
+    # 2026-10 派活判断兜底（Jev 不在 / 拿不准时用模型快速判）
+    quick_judge: QuickJudgeSetting = QuickJudgeSetting()
     tasks: TasksSetting = TasksSetting()
     extensions: ExtensionsSetting = ExtensionsSetting(mcp=())
     group_space: GroupSpaceSetting = GroupSpaceSetting(enabled=True, notice_per_day=1)
@@ -997,7 +1069,148 @@ def _parse_jev(jev: JevSectionConfig, problems: list[str]) -> JevSetting:
         api_url=str(jev.api_url or "").strip() or "https://api.typesafe.ai/v1/systemone",
         model=str(jev.model or "").strip() or "jev-1.13.0",
         api_key=str(getattr(jev, "api_key", "") or "").strip(),
+        use=str(getattr(jev, "use", "") or "").strip() or "typesafe",
     )
+
+
+def _parse_quick_judge(qj: QuickJudgeSectionConfig, problems: list[str]) -> QuickJudgeSetting:
+    """[quick_judge] 节规范化：数值夹到合法区间并记中文问题，坏值不抛。"""
+    raw_daily = int(getattr(qj, "daily_max", 30))
+    daily = max(0, min(500, raw_daily))
+    if daily != raw_daily:
+        problems.append(f"[quick_judge] daily_max = {raw_daily} 超出 0~500 范围，已按 {daily} 处理")
+    raw_wait = int(getattr(qj, "batch_wait_s", 15))
+    wait = max(3, min(120, raw_wait))
+    if wait != raw_wait:
+        problems.append(f"[quick_judge] batch_wait_s = {raw_wait} 超出 3~120 秒范围，已按 {wait} 处理")
+    return QuickJudgeSetting(
+        enabled=bool(getattr(qj, "enabled", True)),
+        model=str(getattr(qj, "model", "") or "").strip(),
+        keyword_filter=bool(getattr(qj, "keyword_filter", False)),
+        daily_max=daily,
+        batch_wait_s=wait,
+    )
+
+
+# 判断服务 id：小写字母开头，字母/数字/_/-，1~32 个字（比 [[endpoints]] 宽松一点，
+# 因为预设 id 里可能有下划线组合）；"typesafe" 是内置那个，不许占。
+_JEV_ENDPOINT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+
+def jev_endpoint_url_problem(url: str) -> str:
+    """地址检查：返回中文问题；"" 表示合法。
+
+    - 还带 ``{...}`` 占位（Cloudflare 预设的 ``{account_id}``）→ 提醒换掉；
+    - ``https://`` 一律可以；
+    - ``http://`` 只允许本机（localhost / 127.0.0.1 / ::1）：密钥跟着请求走，外网
+      明文等于泄露；本机自己跑的开源判断模型没有这个顾虑。
+    """
+    if "{" in url or "}" in url:
+        return "地址里还有没替换的占位（比如 {account_id}），换成你自己的"
+    if url.startswith("https://"):
+        return ""
+    if url.startswith("http://"):
+        rest = url[len("http://"):].split("/", 1)[0].strip()
+        rest = rest.rsplit("@", 1)[-1]
+        if rest.startswith("["):  # IPv6 字面量 [::1]:port
+            host = rest[1:rest.find("]")] if "]" in rest else rest
+        else:
+            host = rest.split(":", 1)[0]
+        if host in ("localhost", "127.0.0.1", "::1"):
+            return ""
+        return "外网地址必须是 https://（密钥走这个请求，明文 http 会泄露）；本机地址可以用 http://"
+    return "地址必须是 https:// 开头的网址（本机地址可以 http://）"
+
+
+def _parse_jev_endpoints(raw: Any, problems: list[str]) -> tuple[JevEndpointSetting, ...]:
+    """[[jev_endpoints]] 逐条规范化：坏条目丢弃记中文问题，绝不抛异常。
+
+    填了 `preset` 的条目，没填的协议 / 地址 / 模型名 / 显示名从预设补齐。
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        problems.append("[[jev_endpoints]] 必须是表数组，本次整段忽略")
+        return ()
+    from .jev_presets import PRESETS, PROTOCOLS
+
+    out: list[JevEndpointSetting] = []
+    seen: set[str] = set()
+    for item in raw:
+        try:
+            entry = _as_item_mapping(item, JevEndpointItemConfig)
+            if entry is None:
+                problems.append(f"判断服务条目不是表：{str(item)[:60]}，已丢弃")
+                continue
+            eid = str(entry.get("id") or "").strip()
+            if not _JEV_ENDPOINT_ID_RE.match(eid):
+                problems.append(
+                    f'判断服务 id "{eid or str(entry.get("id"))}" 不合法（只能用小写字母、数字、_、-，1~32 个字符），此条已丢弃'
+                )
+                continue
+            if eid == "typesafe":
+                problems.append('判断服务 id "typesafe" 是内置的，不能占用，此条已丢弃')
+                continue
+            if eid in seen:
+                problems.append(f'判断服务 id "{eid}" 重复出现，只保留第一个，后一个已丢弃')
+                continue
+            preset = str(entry.get("preset") or "").strip()
+            preset_obj = None
+            if preset:
+                preset_obj = PRESETS.get(preset)
+                if preset_obj is None:
+                    problems.append(f'判断服务 "{eid}" 的预设 "{preset}" 不认识，按自定义处理')
+                    preset = ""
+            protocol = str(entry.get("protocol") or "").strip().lower()
+            if not protocol and preset_obj is not None:
+                protocol = preset_obj.protocol
+            if not protocol:
+                protocol = "systemone"
+            if protocol not in PROTOCOLS:
+                problems.append(
+                    f'判断服务 "{eid}" 的协议 "{protocol}" 不认识（只能是 systemone / openai_decisions），此条已丢弃'
+                )
+                continue
+            url = str(entry.get("url") or "").strip().rstrip("/")
+            if not url and preset_obj is not None:
+                url = preset_obj.url.rstrip("/")
+            url_problem = jev_endpoint_url_problem(url)
+            if url_problem:
+                problems.append(f'判断服务 "{eid}"：{url_problem}，此条已丢弃')
+                continue
+            model = str(entry.get("model") or "").strip()
+            if not model and preset_obj is not None:
+                model = preset_obj.model
+            if not model:
+                problems.append(f'判断服务 "{eid}" 的模型名不能为空，此条已丢弃')
+                continue
+            if len(model) > 200:
+                problems.append(f'判断服务 "{eid}" 的模型名太长（上限 200 字），此条已丢弃')
+                continue
+            name = str(entry.get("name") or "").strip()
+            if not name and preset_obj is not None:
+                name = preset_obj.name
+            if len(name) > 40:
+                problems.append(f'判断服务 "{eid}" 的名字太长（上限 40 字），此条已丢弃')
+                continue
+            if not name:
+                name = eid
+            out.append(
+                JevEndpointSetting(
+                    id=eid, name=name, preset=preset, protocol=protocol,
+                    url=url, model=model, api_key=str(entry.get("api_key") or "").strip(),
+                )
+            )
+            seen.add(eid)
+        except Exception as e:
+            label = ""
+            try:
+                label = str(item.get("id") or "")  # type: ignore[union-attr]
+            except Exception:
+                label = ""
+            where = f"「{label}」" if label else ""
+            problems.append(f"判断服务条目{where}解析出错（{e}），已丢弃")
+    return tuple(out)
 
 
 def _running_as_root() -> bool:
@@ -1360,6 +1573,7 @@ _SECTIONS: tuple[tuple[str, type[PluginConfigBase]], ...] = (
     ("approval", ApprovalSectionConfig),
     ("models", ModelsSectionConfig),
     ("jev", JevSectionConfig),
+    ("quick_judge", QuickJudgeSectionConfig),
     ("usage", UsageSectionConfig),
     ("tasks", TasksSectionConfig),
     ("console", ConsoleSectionConfig),
@@ -1432,6 +1646,7 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
     approval = sections["approval"]
     models = sections["models"]
     jev = sections["jev"]
+    quick_judge = sections["quick_judge"]
     usage = sections["usage"]
     tasks_cfg = sections["tasks"]
     console = sections["console"]
@@ -1449,6 +1664,7 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
     assert isinstance(approval, ApprovalSectionConfig)
     assert isinstance(models, ModelsSectionConfig)
     assert isinstance(jev, JevSectionConfig)
+    assert isinstance(quick_judge, QuickJudgeSectionConfig)
     assert isinstance(usage, UsageSectionConfig)
     assert isinstance(tasks_cfg, TasksSectionConfig)
     assert isinstance(console, ConsoleSectionConfig)
@@ -1467,6 +1683,8 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
     # 端点 + 模型库（2026-10 模型改版阶段 1a）：从原始输入逐条解析（坏条目丢单条记问题）
     endpoints_parsed = _parse_endpoints(raw_mapping.get("endpoints"), problems)
     model_list_parsed = _parse_model_list(raw_mapping.get("model_list"), endpoints_parsed, problems)
+    # 自己加的判断服务（2026-10）：同样逐条解析，坏的丢单条
+    jev_endpoints_parsed = _parse_jev_endpoints(raw_mapping.get("jev_endpoints"), problems)
 
     # data_dir：空 = 默认位置
     data_dir_str = str(storage.data_dir or "").strip()
@@ -1520,6 +1738,7 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
             max_tokens=_clamp_int(getattr(models, "max_tokens", 32768), 1024, 1_000_000, 32768),
         ),
         jev=_parse_jev(jev, problems),
+        quick_judge=_parse_quick_judge(quick_judge, problems),
         usage=UsageSetting(
             alert_daily_tokens=int(usage.alert_daily_tokens),
             alert_task_tokens=int(usage.alert_task_tokens),
@@ -1537,6 +1756,7 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
         ),
         endpoints=endpoints_parsed,
         model_list=model_list_parsed,
+        jev_endpoints=jev_endpoints_parsed,
         environments=_parse_environments(env, workspace_root, problems),
         profile=ProfileSetting(
             batch_messages=int(profile.batch_messages),

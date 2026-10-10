@@ -1287,6 +1287,301 @@ class ConsoleServer:
 
         app.router.add_route("POST", "/api/settings/model-list/{id}/verify", self._write(_model_verify))
 
+        # ---------- 判断服务（Jev / Decisions；2026-10 多端点） ----------
+        # GET 看全貌；PUT/DELETE 建改删自己加的；PUT /use 换现在用哪个；POST .../test 真发一次。
+        # 密钥永远不回值，只给 key_set / key_source。
+
+        def _jev_builtin_key_source(settings: Any) -> str:
+            """内置那个的密钥从哪来：env / file / none（只看有没有，不回值）。"""
+            try:
+                import os as _os
+
+                if (_os.environ.get("TYPESAFE_API_KEY", "") or "").strip():
+                    return "env"
+                from ..jev import _resolve_key
+
+                return "file" if _resolve_key(settings) else "none"
+            except Exception:
+                return "none"
+
+        def _preset_public(p: Any) -> dict[str, Any]:
+            return {
+                "id": str(p.id), "name": str(p.name), "protocol": str(p.protocol),
+                "url": str(p.url), "model": str(p.model),
+                "models": [str(x) for x in (getattr(p, "models", ()) or ())],
+                "docs_url": str(p.docs_url), "key_url": str(p.key_url), "note": str(p.note),
+            }
+
+        def _jev_entry_dict(ep: Any) -> dict[str, Any]:
+            return {
+                "id": str(getattr(ep, "id", "")), "name": str(getattr(ep, "name", "")),
+                "preset": str(getattr(ep, "preset", "")), "protocol": str(getattr(ep, "protocol", "")),
+                "url": str(getattr(ep, "url", "")), "model": str(getattr(ep, "model", "")),
+                "api_key": str(getattr(ep, "api_key", "") or ""),
+            }
+
+        def _jev_view() -> dict[str, Any]:
+            from ..jev_presets import PRESETS
+
+            settings = svc.get_settings()
+            jev_cfg = getattr(settings, "jev", None)
+            builtin_key_set = False
+            try:
+                from ..jev import _resolve_key
+
+                builtin_key_set = bool(_resolve_key(settings))
+            except Exception:
+                builtin_key_set = False
+            endpoints: list[dict[str, Any]] = [{
+                "id": "typesafe", "name": "TypeSafe 官方", "preset": "typesafe",
+                "protocol": "systemone",
+                "url": str(getattr(jev_cfg, "api_url", "") or ""),
+                "model": str(getattr(jev_cfg, "model", "") or ""),
+                "key_set": builtin_key_set, "key_source": _jev_builtin_key_source(settings),
+                "builtin": True,
+            }]
+            for ep in (getattr(settings, "jev_endpoints", ()) or ()):
+                endpoints.append({
+                    "id": str(ep.id), "name": str(ep.name), "preset": str(ep.preset),
+                    "protocol": str(ep.protocol), "url": str(ep.url), "model": str(ep.model),
+                    "key_set": bool(str(getattr(ep, "api_key", "") or "").strip()), "builtin": False,
+                })
+            use_ok = False
+            try:
+                use_ok = bool(getattr(svc, "jev", None) is not None and svc.jev.available())
+            except Exception:
+                use_ok = False
+            return {
+                "enabled": bool(getattr(jev_cfg, "enabled", True)),
+                "timeout_ms": int(getattr(jev_cfg, "timeout_ms", 1200) or 1200),
+                "use": str(getattr(jev_cfg, "use", "") or "typesafe"),
+                "use_ok": use_ok,
+                "endpoints": endpoints,
+                "presets": [_preset_public(PRESETS[k]) for k in PRESETS],
+                "quick_judge": _quick_judge_public(settings),
+            }
+
+        def _quick_judge_public(settings: Any) -> dict[str, Any]:
+            """「没有 Jev 时怎么判断派活」：[quick_judge] 现值 + 今天所有群判了几次。"""
+            from ..quick_judge import calls_today
+
+            q = getattr(settings, "quick_judge", None)
+            try:
+                today = int(calls_today(svc.store))
+            except Exception:
+                today = 0
+            return {
+                "enabled": bool(getattr(q, "enabled", True)),
+                "model": str(getattr(q, "model", "") or ""),
+                "keyword_filter": bool(getattr(q, "keyword_filter", False)),
+                "daily_max": int(getattr(q, "daily_max", 30) if q is not None else 30),
+                "today": today,
+            }
+
+        @get("/api/settings/jev")
+        async def _jev_get(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            return web.json_response(_jev_view())
+
+        def _validate_jev_custom(body: dict[str, Any], path_id: str, existing: dict[str, Any] | None) -> dict[str, Any]:
+            """合出自己加的一条判断服务；预设会补齐没填的字段；错误抛 ValueError(中文)。
+
+            api_key：空串 / 没给 / null = 保持旧值（新建 = 空）。
+            """
+            cand: dict[str, Any] = dict(existing or {})
+            cand["id"] = path_id
+            if "preset" in body:
+                cand["preset"] = str(body.get("preset") or "").strip()
+            if "name" in body:
+                cand["name"] = str(body.get("name") or "").strip()
+            for key in ("protocol", "url", "model"):
+                if key in body and body.get(key) is not None:
+                    cand[key] = str(body[key]).strip()
+            if "api_key" in body:
+                value = body.get("api_key")
+                if value is not None and str(value).strip():
+                    cand["api_key"] = str(value)
+            cand.setdefault("api_key", "")
+            problems: list[str] = []
+            parsed = _cfg._parse_jev_endpoints([cand], problems)
+            if problems:
+                raise ValueError(problems[0])
+            if not parsed:
+                raise ValueError("判断服务参数不合法")
+            e = parsed[0]
+            return {
+                "id": e.id, "name": e.name, "preset": e.preset, "protocol": e.protocol,
+                "url": e.url, "model": e.model, "api_key": e.api_key,
+            }
+
+        async def _jev_endpoint_put(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            path_id = str(request.match_info["id"]).strip()
+            settings = svc.get_settings()
+            if path_id == "typesafe":
+                # 内置那个：改的就是旧的 [jev] api_url / model / api_key
+                flat: dict[str, Any] = {}
+                if "url" in body:
+                    url = str(body.get("url") or "").strip().rstrip("/")
+                    if not url:
+                        return _err(400, "地址不能为空")
+                    problem = _cfg.jev_endpoint_url_problem(url)
+                    if problem:
+                        return _err(400, problem)
+                    flat["jev.api_url"] = url
+                if "model" in body:
+                    model = str(body.get("model") or "").strip()
+                    if not model:
+                        return _err(400, "模型名不能为空")
+                    if len(model) > 200:
+                        return _err(400, "模型名太长（上限 200 字）")
+                    flat["jev.model"] = model
+                if "api_key" in body:
+                    value = body.get("api_key")
+                    if value is not None and str(value).strip():
+                        flat["jev.api_key"] = str(value)
+                if flat:
+                    try:
+                        new_text = _cf.write_fields(svc.config_file_ops()[0], svc.config_file_ops()[1], flat)
+                    except _cf.ConfigFileError as e:
+                        return _err(500, str(e))
+                    await _apply_config_after_file_write(new_text)
+                    logger.info("内置判断服务已保存（key_set=%s）", "jev.api_key" in flat)
+                return web.json_response(_jev_view())
+            entries = [_jev_entry_dict(ep) for ep in (getattr(settings, "jev_endpoints", ()) or ())]
+            old = next((e for e in entries if e["id"] == path_id), None)
+            try:
+                cand = _validate_jev_custom(body, path_id, old)
+            except ValueError as e:
+                return _err(400, str(e))
+            entries = [cand if e["id"] == cand["id"] else e for e in entries] if old else entries + [cand]
+            try:
+                new_text = _cf.write_aot_section(
+                    svc.config_file_ops()[0], svc.config_file_ops()[1], "jev_endpoints", entries
+                )
+            except _cf.ConfigFileError as e:
+                return _err(500, str(e))
+            await _apply_config_after_file_write(new_text)
+            logger.info("判断服务「%s」已保存（key_set=%s）", cand["id"], bool(cand.get("api_key")))
+            return web.json_response(_jev_view())
+
+        async def _jev_endpoint_delete(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            path_id = str(request.match_info["id"]).strip()
+            if path_id == "typesafe":
+                return _err(400, "内置的不能删")
+            settings = svc.get_settings()
+            entries = [_jev_entry_dict(ep) for ep in (getattr(settings, "jev_endpoints", ()) or ())]
+            if not any(e["id"] == path_id for e in entries):
+                return _err(404, "没有这个判断服务")
+            if str(getattr(settings.jev, "use", "") or "").strip() == path_id:
+                return _err(400, "正在用，先换成别的再删")
+            entries = [e for e in entries if e["id"] != path_id]
+            try:
+                new_text = _cf.write_aot_section(
+                    svc.config_file_ops()[0], svc.config_file_ops()[1], "jev_endpoints", entries
+                )
+            except _cf.ConfigFileError as e:
+                return _err(500, str(e))
+            await _apply_config_after_file_write(new_text)
+            logger.info("判断服务「%s」已删除", path_id)
+            return web.json_response(_jev_view())
+
+        async def _jev_use_put(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            target_id = str(body.get("id") or "").strip()
+            settings = svc.get_settings()
+            ids = {"typesafe"} | {str(ep.id) for ep in (getattr(settings, "jev_endpoints", ()) or ())}
+            if target_id not in ids:
+                return _err(400, "没有这个判断服务，先建一个再选它")
+            try:
+                new_text = _cf.write_fields(
+                    svc.config_file_ops()[0], svc.config_file_ops()[1], {"jev.use": target_id}
+                )
+            except _cf.ConfigFileError as e:
+                return _err(500, str(e))
+            await _apply_config_after_file_write(new_text)
+            logger.info("判断服务换成「%s」", target_id)
+            return web.json_response(_jev_view())
+
+        @post("/api/settings/jev/endpoints/{id}/test")
+        async def _jev_endpoint_test(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from ..jev_presets import PROTOCOLS
+
+            path_id = str(request.match_info["id"]).strip()
+            settings = svc.get_settings()
+            jev_cfg = settings.jev
+            builtin = path_id == "typesafe"
+            ep = next(
+                (e for e in (getattr(settings, "jev_endpoints", ()) or ()) if str(getattr(e, "id", "")) == path_id),
+                None,
+            )
+            if not builtin and ep is None and not str(body.get("url") or "").strip():
+                return _err(404, "没有这个判断服务（测未存的值请在 body 里给 url）")
+            protocol = str(body.get("protocol") or "").strip().lower()
+            if not protocol:
+                protocol = str(getattr(ep, "protocol", "") or "systemone") if ep is not None else "systemone"
+            if protocol not in PROTOCOLS:
+                return _err(400, "协议只认 systemone / openai_decisions")
+            url = str(body.get("url") or "").strip()
+            if not url:
+                url = str(getattr(ep, "url", "") or "") if ep is not None else str(getattr(jev_cfg, "api_url", "") or "")
+            problem = _cfg.jev_endpoint_url_problem(url)
+            if problem:
+                return _err(400, problem)
+            model = str(body.get("model") or "").strip()
+            if not model:
+                model = str(getattr(ep, "model", "") or "") if ep is not None else str(getattr(jev_cfg, "model", "") or "")
+            if not model:
+                return _err(400, "模型名要填")
+            api_key = str(body.get("api_key") or "")
+            if not api_key.strip() and ep is not None:
+                api_key = str(getattr(ep, "api_key", "") or "")
+            if not api_key.strip() and builtin:
+                try:
+                    from ..jev import _resolve_key
+
+                    api_key = _resolve_key(settings)
+                except Exception:
+                    api_key = ""
+            if not api_key.strip():
+                return web.json_response({"ok": False, "error": "先填密钥"})
+            jev_svc = getattr(svc, "jev", None)
+            if jev_svc is None or not hasattr(jev_svc, "test_endpoint"):
+                return _err(503, "判断服务还没起来")
+            try:
+                result = await jev_svc.test_endpoint(
+                    protocol=protocol, url=url, model=model, key=api_key.strip()
+                )
+            except Exception:
+                logger.exception("测试判断服务出错（%s）", path_id)
+                return web.json_response({"ok": False, "ms": 0, "error": "测试出错，看网页日志", "answers": {}})
+            return web.json_response(result)
+
+        app.router.add_route("PUT", "/api/settings/jev/endpoints/{id}", self._write(_jev_endpoint_put))
+        app.router.add_route("DELETE", "/api/settings/jev/endpoints/{id}", self._write(_jev_endpoint_delete))
+        app.router.add_route("PUT", "/api/settings/jev/use", self._write(_jev_use_put))
+
         # ---------- 通用设置（管理员；直写 config.toml，数据库不再存覆盖层） ----------
 
         def _config_view() -> Any:

@@ -48,6 +48,7 @@ const stubs = {
   } },
   '../sheet.js': { repaintSheet: () => {} }, '../pages/news.js': { loading: () => '' },
   '../router.js': { loadSettings: async () => {} },
+  './jev.js': { jevSection: () => '', loadJev: async () => {} },
 };
 const modules = new Map();
 async function link(spec) {

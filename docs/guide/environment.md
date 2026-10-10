@@ -13,7 +13,7 @@ MaiWork 需要什么环境、在哪里跑命令，以及怎么给它配专用机
 | 模型 | 一个**模型服务端点**（OpenAI / Anthropic / Responses 三种接口格式都行）+ 一个**模型库**：「主模型」负责想和验收，各专岗负责动手；专岗没单独选就跟主模型一样 |
 | 联网搜索 | 在首次引导里直接勾选搜索服务预设（免密钥的可以直接用）；主搜索坏了备用会自动接上 |
 | 资讯卡片画图 | 用 MaiBot 环境里的 playwright + Chromium、Pillow 画卡片、处理配图；缺了就自动改发文字列表 |
-| 可选 | Jev（TypeSafe）密钥，让快速判断更快更省；自己的 VPS / VM（专用机器，可以配多台）；[railway.new](https://railway.new) 一次性 VM |
+| 可选 | Jev 这类判断模型的密钥（TypeSafe 官方，或 OpenRouter、OpenCode、Command Code、Vercel、Upstage、Inception、Liquid AI、Cloudflare、OpenAI Decisions 任一家），让快速判断更快更省；自己的 VPS / VM（专用机器，可以配多台）；[railway.new](https://railway.new) 一次性 VM |
 
 ## 本机能不能跑命令
 

@@ -6,6 +6,7 @@ import { esc, ico, toast, when } from "../util.js";
 import { api } from "../api.js";
 import { repaintSheet } from "../sheet.js";
 import { loading } from "../pages/news.js";
+import { jevSection, loadJev } from "./jev.js";
 
 // 屏蔽名单按群（docs/18 第一步）：blocked_domains / auto_blocked 都是 {群号: [域名]}
 export function feedsSettings(f, groups) {
@@ -48,7 +49,7 @@ const intIn = (v, lo, hi, d) => { const n = parseInt(v, 10); return Number.isFin
 export async function loadModels() {
   state.mdlError = "";
   try {
-    const [cat, agents] = await Promise.all([api("GET", "/api/settings/endpoints"), api("GET", "/api/agents").catch(() => null)]);
+    const [cat, agents] = await Promise.all([api("GET", "/api/settings/endpoints"), api("GET", "/api/agents").catch(() => null), loadJev()]);
     state.mdl = { endpoints: cat.endpoints || [], models: cat.models || [] };
     state.mdlVerification = {}; // 刷新配置后不复用界面里上一次的验证/待保存建议
     if (agents) state.agents = agents;
@@ -80,8 +81,7 @@ export function modelsPage() {
     <div class="h-sub-row"><h2 class="h-sub">端点</h2><button class="btn small" data-act="mdl-ep-new">添加</button></div>
     ${edit && edit.type === "ep" && edit.isNew ? endpointForm(edit.draft, true) : ""}
     ${m.endpoints.length ? m.endpoints.map(endpointBlock).join("") : edit && edit.isNew ? "" : `<p class="h-meta">还没有端点，点「添加」</p>`}
-    <h2 class="h-sub">Jev</h2>
-    <div class="set-row">${ico("sparkles")}<div><div class="set-name">Jev</div><div class="set-text">快速判断群消息，要单独的密钥 <button type="button" class="link-btn" data-act="cfg-goto" data-s="jev">去填</button></div></div><span></span></div>`;
+    ${jevSection()}`;
 }
 
 function endpointBlock(ep) {

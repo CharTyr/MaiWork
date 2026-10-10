@@ -956,7 +956,8 @@ class Profiles:
         "一句话不超过 120 字；没有新观察就空列表。\n"
         "9. 请求：这批消息里**明确对 MaiBot / 机器人说的请求**（@ 了它、点名它、或明确说"
         "「帮我整理 / 帮我准备 / 提醒我」这类），记一条；"
-        "消息序号后面标了「这条 @ 了 MaiBot，Jev 没判出来，请你判断」的，请重点判断那条。"
+        "消息序号后面标了「这条 @ 了 MaiBot，快速判断没判准，请你判断；闲聊、玩笑、"
+        "MaiBot 当场能答的都不算请求」的，请重点判断那条。"
         "kind 三选一：prepare=请它准备 / 整理 / 调研 / 做一个东西；goal=请它帮忙盯着某件事"
         "或把某件事做成；reminder=请它到某个时间提醒说话的人。\n"
         "   title 用不超过 30 字说清要什么；kind=reminder 且话里有明确时间时，when 填提醒"
@@ -1035,7 +1036,7 @@ class Profiles:
         )
         if legend:
             parts.append(f"条目里提到的人：{legend}")
-        # pending_asks 里还没判的消息（@ 了 MaiBot 但 Jev 没判出来的）在消息行尾标出来
+        # pending_asks 里还没判的消息（@ 了 MaiBot 但快速判断也没判准的）在消息行尾标出来
         pending_ask_ids: set[str] = set()
         try:
             pending_ask_ids = {
@@ -1055,7 +1056,7 @@ class Profiles:
             text = str(m.text)[: self._MSG_TEXT_MAX]
             flag = ""
             if str(m.id) in pending_ask_ids:
-                flag = "（这条 @ 了 MaiBot，Jev 没判出来，请你判断）"
+                flag = "（这条 @ 了 MaiBot，快速判断没判准，请你判断；闲聊、玩笑、MaiBot 当场能答的都不算请求）"
                 pending_ask_ids.discard(str(m.id))
             lines.append(f"[{i}] {hhmm} {name}: {text}{flag}")
         parts.append("这批消息：\n" + "\n".join(lines))

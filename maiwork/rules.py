@@ -253,6 +253,19 @@ def _check_jev_url(value: Any) -> str:
     return s
 
 
+_JEV_USE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+
+def _check_jev_use(value: Any) -> str:
+    """「现在用哪个判断服务」：内置 typesafe，或 [[jev_endpoints]] 的 id。"""
+    s = str(value or "").strip()
+    if s in ("", "typesafe"):
+        return "typesafe"
+    if not _JEV_USE_RE.match(s):
+        raise ValueError("判断服务 id 只能用小写字母、数字、_、-（1~32 个字符），或内置的 typesafe")
+    return s
+
+
 def _check_name_str(field_zh: str) -> Any:
     def check(value: Any) -> str:
         s = str(value or "").strip()
@@ -393,7 +406,8 @@ _ADVANCED_KEYS = frozenset({
     "feeds.pool_min_avg", "feeds.collect_minutes", "topics.min_gap_hours",
     "topics.candidate_ttl_hours", "console.listen",
     "tasks.token_limit", "tasks.run_seconds", "storage.data_dir",
-    "jev.timeout_ms", "jev.key_file", "jev.api_url", "jev.model",
+    "jev.timeout_ms", "jev.key_file", "jev.api_url", "jev.model", "jev.use",
+    "quick_judge.model", "quick_judge.batch_wait_s",
     "environments.workspace_root", "environments.memory_max", "environments.runtime_max_sec",
     "environments.local_mode", "environments.run_as", "environments.max_parallel",
     "environments.command_timeout_s", "environments.railway_daily_max",
@@ -510,6 +524,15 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     _F("jev.key_file", "密钥文件", "一般不用填", "str", check=_check_path_str("Jev 密钥文件路径")),
     _F("jev.api_url", "服务地址", "一般不用改", "str", check=_check_jev_url),
     _F("jev.model", "模型名", "一般不用改", "str", check=_check_name_str("Jev 模型名")),
+    _F("jev.use", "现在用哪个", "内置的写 typesafe，或自己加的服务 id；平时在「设置 → 快速判断」换",
+       "str", check=_check_jev_use),
+
+    # ---- quick_judge ----
+    _F("quick_judge.enabled", "派活判断兜底", "没配 Jev 或 Jev 拿不准时，用模型快速判一次", "bool"),
+    _F("quick_judge.model", "判断用哪个模型", "填模型库条目 id；空 = 跟主模型一条链", "str"),
+    _F("quick_judge.keyword_filter", "先过请求词", "没有请求词的 @ 当闲聊；可能漏掉说法含糊的派活", "bool"),
+    _F("quick_judge.daily_max", "每天判断次数", "每个群每天最多判几次；0 = 不用模型", "int", min=0, max=500),
+    _F("quick_judge.batch_wait_s", "等几秒攒批", "第一条 @ 进来后等几秒合成一次判断", "int", min=3, max=120),
 
     # ---- usage ----
     _F("usage.alert_daily_tokens", "每日提醒线", "每天用超就提醒；0 = 不提醒", "int", min=0, max=10**9),
@@ -578,6 +601,7 @@ CONFIG_SECTIONS: list[dict[str, str]] = [
     {"id": "tasks", "label": "任务上限"},
     {"id": "models", "label": "模型"},
     {"id": "jev", "label": "快速判断"},
+    {"id": "quick_judge", "label": "派活判断兜底"},
     {"id": "usage", "label": "用量提醒"},
     {"id": "console", "label": "网页"},
     {"id": "environments", "label": "干活机器"},

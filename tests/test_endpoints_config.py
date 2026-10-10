@@ -244,4 +244,4 @@ class TestOldModelsSectionStillParses:
         assert settings.models.main == "m"
 
     def test_config_version_bumped(self) -> None:
-        assert CONFIG_VERSION == "0.4.6"
+        assert CONFIG_VERSION == "0.4.8"
