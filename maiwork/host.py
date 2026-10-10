@@ -336,6 +336,45 @@ class Host:
         result.sort(key=lambda m: m.ts)
         return result
 
+    async def message_by_id(
+        self,
+        message_id: str,
+        session_id: str = "",
+        *,
+        include_binary_data: bool = False,
+        _timeout_s: float = 20.0,
+    ) -> dict | None:
+        """按 message_id 取一条消息（宿主能力 `message.get_by_id`，2026-10-10 实读）。
+
+        参数：`message_id`（必填）、`chat_id`（会话 id，空就不传）、
+        `include_binary_data`（要图片 / 表情的 base64 原件时传 True；宿主还留着文件才会给
+        `binary_data_base64`）。返回消息 dict；失败 / 没这条 / 拿不到 → None，只记日志不抛。
+
+        超时给 20 秒：原图 base64 走传输帧（上限 16MB），比普通读消息慢。
+        """
+        kwargs: dict[str, Any] = {
+            "message_id": str(message_id),
+            "include_binary_data": bool(include_binary_data),
+        }
+        sid = str(session_id or "").strip()
+        if sid:
+            kwargs["chat_id"] = sid
+        try:
+            result = await self._call(
+                "message.get_by_id", timeout_s=_timeout_s, **kwargs
+            )
+        except HostError:
+            logger.warning("按 id 取消息失败：%s", str(message_id))
+            return None
+        except Exception:
+            logger.warning("按 id 取消息出错：%s", str(message_id), exc_info=True)
+            return None
+        if isinstance(result, dict) and result.get("success") is False:
+            logger.info("宿主说取不到这条消息：%s", str(message_id))
+            return None
+        inner = result.get("message") if isinstance(result, dict) and "message" in result else result
+        return inner if isinstance(inner, dict) else None
+
     # ------------------------------------------------------------------
     # knowledge()
     # ------------------------------------------------------------------

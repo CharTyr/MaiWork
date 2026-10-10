@@ -38,6 +38,7 @@
   "capabilities": [
     "config.get",
     "message.get_by_time_in_chat",
+    "message.get_by_id",
     "knowledge.search",
     "person.get_id",
     "person.get_value",

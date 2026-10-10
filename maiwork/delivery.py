@@ -133,6 +133,23 @@ _PRIORITY_MIN_LINE = _PRIORITY_MIN_BODY + 2  # 含 "- " 前缀
 # 才把待发的本任务成品升级为 awaited_delivery。它与故障及指令回执一样不受
 # 睡觉时段/每日额度限制，仍记发送审计；不要把所有 delivery 都豁免。
 PUSH_EXEMPT_KINDS = frozenset(("error", "command", "admin", "awaited_delivery"))
+# 任务自己的消息（用户 2026-10-10 定的口径）：群友派的活，它的交付消息和状态消息
+# （问发起人要东西、需要人接手、失败通知）**不占每日额度、也不被每日额度挡住**。
+# 线上 10-10：测试群 5 个额度 17:00 用完，17:08 任务 T-14 想请发起人重发一张图，
+# 那条状态行（outbox key human:T-14:2）被推到次日 07:00，人一直没被问到。
+# 认法只有一处（Outbox.flush 与 group_push.used_today 共用 task_quota_free_kind）：
+# outbox 行 task_id 非空 + 载荷 push_kind ∈ {delivery, status}（含交付自动补的说明行）。
+# 仍受服务群检查与睡觉时段约束；awaited_delivery 照旧完全豁免。
+TASK_QUOTA_FREE_KINDS = frozenset(("task_delivery", "task_status"))
+# 载荷里的原始 push_kind → quota-free kind（闸门 / 留痕都按后者走）
+_TASK_QUOTA_KIND = {"delivery": "task_delivery", "status": "task_status"}
+# 完全不占每日额度的 kind 全集（永远豁免的 + 任务自己的）
+NO_QUOTA_KINDS = PUSH_EXEMPT_KINDS | TASK_QUOTA_FREE_KINDS
+# quota-free kind 的中文名（网页「最近发的」显示用；认不出来原样显示英文 kind）
+PUSH_KIND_CN = {
+    "task_delivery": "任务交付",
+    "task_status": "任务状态",
+}
 # 读不到可信的每群配置时的理由：**不是**「开关已关」（那条会被作废），
 # 调用方（Outbox.flush）据此只推迟、不发、也不作废。
 UNREADABLE_REASON = "读不到设置"
@@ -142,6 +159,21 @@ UNSERVED_REASON = "非服务群"
 # 2026-10-03（docs/18 第三步）：「自带每群每日上限、不占开场白额度」的那一套退役。
 # 现在每群只有一份设置（group_push.py）：一个 daily_max 把 topic / news_card /
 # idea_mention 三种自制消息一起数，睡觉时段也只有一份；豁免清单保持原样，不扩也不缩。
+# 2026-10-10 唯一的一次口径扩张：任务自己的消息（TASK_QUOTA_FREE_KINDS）不占额度。
+
+
+def task_quota_free_kind(task_id: Any, push_kind: Any) -> str:
+    """载荷 push_kind → 闸门 / 留痕用的 kind：任务自己的消息换成 quota-free kind。
+
+    认法（全项目只有这一处）：outbox 行 task_id 非空 + push_kind ∈ {delivery, status}。
+    其余（topic / news_card / idea_mention / reminder / 群公告预告 / 目标巡检 /
+    不带任务的状态行 / awaited_delivery）原样返回，节制规则一个字都不变。
+    """
+    kind = str(push_kind or "")
+    if not str(task_id or "").strip():
+        return kind
+    return _TASK_QUOTA_KIND.get(kind, kind)
+
 
 # MaiBot 上下文里聊天消息形如 `<message msg_id="..">文本</message>` 的 text part
 # （出处：reference/jev/processor.py 的 _parse_chat_message）；
@@ -806,6 +838,10 @@ class Pushes:
         now 决定「用哪一天的额度」和「是不是在睡觉时段」。三种自制消息的每群开关
         也在这里管：关了就返回「开关已关」，调用方据此把这条待发的作废（不发陈旧的）。
 
+        任务自己的消息（TASK_QUOTA_FREE_KINDS：task_delivery / task_status）只查
+        服务群 + 睡觉时段：不查每日额度（群友派的活不能因为群里的额度被丢掉），也不查
+        每群开关（它们不是 topic / news_card / idea_mention 那三个开关管的）。
+
         非服务群（或认不出在不在服务名单）：直接 `(False, UNSERVED_REASON)`，**零 SQL**
         ——不读每群设置、不数额度、不看睡觉时段。只有明确的服务群才继续往下查。
         """
@@ -823,6 +859,11 @@ class Pushes:
         except Exception:
             logger.exception("读每群推送设置失败（群 %s），按保守默认节制", gid)
             return False, UNREADABLE_REASON
+        if kind_s in TASK_QUOTA_FREE_KINDS:
+            # 任务自己的消息：只看睡觉时段（不看每群开关，也不看每日额度）
+            if self.in_quiet(now, gid):
+                return False, "睡觉时段"
+            return True, ""
         if not group_push.kind_enabled(cfg, kind_s):
             return False, "开关已关"
         if self.in_quiet(now, gid):
@@ -861,11 +902,11 @@ class Pushes:
         """ts 所在北京那一天推过几条**原始留痕**（不含结果不明的保留）。kind=None 只算受限的。
 
         额度判定请用 count_used（它把结果不明的安全保留也算进去）；这个口是给统计 / 老调用
-        （网页、审计测试）看留痕用的。
+        （网页、审计测试）看留痕用的。kind=None 也不含不占额度的豁免 / 任务自己的那些。
         """
         day = clock.day_key(float(ts))
         if kind is None:
-            exempt = tuple(sorted(PUSH_EXEMPT_KINDS))
+            exempt = tuple(sorted(NO_QUOTA_KINDS))
             placeholders = ", ".join("?" for _ in exempt)
             row = self._store.read().execute(
                 "SELECT COUNT(*) AS c FROM pushes"
@@ -880,9 +921,12 @@ class Pushes:
         return int(row["c"]) if row else 0
 
     def count_used(self, group_id: str, now: float) -> int:
-        """今天占掉的额度：已发出的受限推送 + 结果不明的安全保留（group_push.used_today）。"""
+        """今天占掉的额度：已发出的受限推送 + 结果不明的安全保留（group_push.used_today）。
+
+        任务自己的消息（task_delivery / task_status）与完全豁免的那些都不算在内。
+        """
         return group_push.used_today(
-            self._store, str(group_id), now=float(now), exempt_kinds=PUSH_EXEMPT_KINDS
+            self._store, str(group_id), now=float(now), exempt_kinds=NO_QUOTA_KINDS
         )
 
     def count_today(self, group_id: str, kind: Optional[str] = None) -> int:

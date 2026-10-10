@@ -1028,10 +1028,12 @@ class TestM3Loop:
                 conn.execute("UPDATE tasks SET question_ts=? WHERE id=?", (t - 7 * 3600, tid))
             await app.run_loop_once()
             rows = app.store.read().execute(
-                "SELECT key, payload FROM outbox WHERE key=?", (f"task-wait-remind:{tid}",)
+                "SELECT key, payload, task_id FROM outbox WHERE key=?", (f"task-wait-remind:{tid}",)
             ).fetchall()
             assert len(rows) == 1
             assert "还在等回答" in rows[0]["payload"]
+            # 2026-10-10：带上任务号，才算「任务自己的消息」——不占、也不被每日额度挡住
+            assert rows[0]["task_id"] == tid
             # key 去重：第二轮不再加新的
             await app.run_loop_once()
             rows = app.store.read().execute(

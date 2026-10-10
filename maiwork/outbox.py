@@ -67,7 +67,7 @@ from typing import Any, Callable, Optional
 from urllib.parse import quote as _url_quote
 
 from . import clock, group_push, members
-from .delivery import UNREADABLE_REASON, Mentions, Pushes
+from .delivery import UNREADABLE_REASON, Mentions, Pushes, task_quota_free_kind
 from .host import HostError
 from .models import _redact
 from .store import Store
@@ -1386,6 +1386,11 @@ class Outbox:
             except Exception:
                 payload = {}
             push_kind = str(payload.get("push_kind") or "delivery")
+            # 任务自己的消息（task_id 非空 + push_kind ∈ delivery/status，含交付自动补的
+            # 说明行）在闸门与留痕里换成 quota-free kind：不吃每日额度、不占额度名额
+            # （用户 2026-10-10 定的口径，见 delivery.TASK_QUOTA_FREE_KINDS）。
+            # 载荷里的 push_kind 一个字不改，下游（@ 发起人 / 说明行）照旧认它。
+            gate_kind = task_quota_free_kind(row["task_id"], push_kind)
             # 同一件交付自动补的说明（file → note）：跟着已经出去的那条走，
             # 不占第二份额度、也不再过一遍闸（不然说明会被推到第二天）。
             follow_up = bool(payload.get("follow_up_of"))
@@ -1419,8 +1424,9 @@ class Outbox:
 
             # 单一节制入口：明确领取与故障/指令的豁免由 Pushes 决定；
             # 每群开关也在这里查（待发期间关开关 → 直接作废，不发陈旧的）。
+            # 任务自己的消息用 quota-free kind 问闸门（只看服务群 + 睡觉时段）。
             if not follow_up:
-                ok_push, reason = self._pushes.can_push(gid, push_kind, now)
+                ok_push, reason = self._pushes.can_push(gid, gate_kind, now)
                 if not ok_push:
                     if reason == _DROP_REASON:
                         self._set(oid, status="dropped", error=f"作废：{reason}", moment=now)
@@ -1485,8 +1491,10 @@ class Outbox:
                     logger.exception("群文件登记 hook 出错（群 %s），不影响发送", gid)
             if not follow_up:
                 try:
+                    # 留痕按闸门口径记：任务自己的消息记 task_delivery / task_status，
+                    # used_today 不会把它算进群额度（载荷里的 push_kind 不动）。
                     self._pushes.record(
-                        gid, push_kind,
+                        gid, gate_kind,
                         str(payload.get("text") or payload.get("note") or kind), now,
                     )
                 except Exception:

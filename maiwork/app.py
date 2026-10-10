@@ -2788,6 +2788,7 @@ class MaiWorkApp:
                     str(row["group_id"]),
                     "text",
                     {"text": f"「{title}」还在等回答：{question}（回复那条提问就行）", "push_kind": "status"},
+                    task_id=str(tid),  # 任务自己的消息：不占每日额度（2026-10-10 用户定）
                 )
 
 

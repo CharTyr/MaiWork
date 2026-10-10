@@ -449,12 +449,18 @@ def used_today(store: Any, group_id: Any, *, now: float, exempt_kinds: Iterable[
     """今天占掉的推送额度：已发出的受限推送 + 结果不明（sending / uncertain）的安全保留。
 
     - 不算豁免 kind（error / command / admin / awaited_delivery，由调用方传进来）。
+    - 也不算任务自己的消息（task_delivery / task_status，见 delivery.TASK_QUOTA_FREE_KINDS）：
+      不管调用方给没给，这里都按 `task_quota_free_kind` 归一后再判，免得口径漏一处。
     - 不算同一件交付自动补的说明（payload.follow_up_of）：它不占第二份额度。
     - 失败的发送不留痕（没发出去就不该占额度）。
     """
+    from .delivery import TASK_QUOTA_FREE_KINDS, task_quota_free_kind  # 局部导入：避免 import 环
+
     gid = str(group_id)
     day = clock.day_key(float(now))
-    exempt = tuple(sorted({str(k) for k in (exempt_kinds or ()) if str(k)}))
+    exempt = tuple(sorted(
+        {str(k) for k in (exempt_kinds or ()) if str(k)} | set(TASK_QUOTA_FREE_KINDS)
+    ))
     sql = "SELECT COUNT(*) AS c FROM pushes WHERE group_id=? AND day=?"
     params: list[Any] = [gid, day]
     if exempt:
@@ -463,7 +469,8 @@ def used_today(store: Any, group_id: Any, *, now: float, exempt_kinds: Iterable[
     row = store.read().execute(sql, params).fetchone()
     used = int(row["c"]) if row else 0
     rows = store.read().execute(
-        "SELECT payload, updated FROM outbox WHERE group_id=? AND status IN ('sending', 'uncertain')",
+        "SELECT task_id, payload, updated FROM outbox"
+        " WHERE group_id=? AND status IN ('sending', 'uncertain')",
         (gid,),
     ).fetchall()
     for r in rows:
@@ -472,7 +479,8 @@ def used_today(store: Any, group_id: Any, *, now: float, exempt_kinds: Iterable[
         payload = _payload_of(r["payload"])
         if payload.get("follow_up_of"):
             continue
-        if str(payload.get("push_kind") or "") in exempt:
+        kind = task_quota_free_kind(r["task_id"], payload.get("push_kind"))
+        if kind in exempt:
             continue
         used += 1
     return used
@@ -490,9 +498,15 @@ def sent_today(store: Any, group_id: Any, *, now: float) -> int:
 
 
 def recent(store: Any, group_id: Any, *, limit: int = 5) -> list[dict]:
-    """最近几条发件记录（新在前）：结果不明的那条 state=不确定，不写成「已发」。"""
+    """最近几条发件记录（新在前）：结果不明的那条 state=不确定，不写成「已发」。
+
+    `push_kind` 是载荷里的原始 kind；`push_kind_cn` 是闸门 / 留痕口径的中文名
+    （任务自己的消息在闸门与 pushes 表里是 task_delivery / task_status，见 delivery）。
+    """
+    from .delivery import PUSH_KIND_CN, task_quota_free_kind  # 局部导入：口径只有一份
+
     rows = store.read().execute(
-        "SELECT id, key, kind, payload, status, error, updated, result FROM outbox"
+        "SELECT id, key, kind, payload, task_id, status, error, updated, result FROM outbox"
         " WHERE group_id=? ORDER BY updated DESC, id DESC LIMIT ?",
         (str(group_id), int(limit)),
     ).fetchall()
@@ -502,11 +516,14 @@ def recent(store: Any, group_id: Any, *, limit: int = 5) -> list[dict]:
         status = str(r["status"] or "")
         text = str(payload.get("text") or payload.get("note") or payload.get("title")
                    or payload.get("name") or "")
+        raw_kind = str(payload.get("push_kind") or "")
+        gate_kind = task_quota_free_kind(r["task_id"], raw_kind)
         out.append({
             "id": int(r["id"]),
             "key": str(r["key"] or ""),
             "kind": str(r["kind"] or ""),
-            "push_kind": str(payload.get("push_kind") or ""),
+            "push_kind": raw_kind,
+            "push_kind_cn": PUSH_KIND_CN.get(gate_kind, raw_kind),
             "status": status,
             "state": _STATE_CN.get(status, status),
             "uncertain": status == "uncertain",
@@ -528,13 +545,13 @@ def view(store: Any, group_id: Any, settings: Any = None, *, now: Optional[float
     if settings is not None and not _served(settings, gid):
         return {"config": cfg, "daily_max": int(cfg["daily_max"]), "sent_today": 0,
                 "quota_used": 0, "recent": []}
-    from .delivery import PUSH_EXEMPT_KINDS  # 局部导入：豁免清单只有一份（delivery）
+    from .delivery import NO_QUOTA_KINDS  # 局部导入：不占额度的清单只有一份（delivery）
 
     return {
         "config": cfg,
         "daily_max": int(cfg["daily_max"]),
         "sent_today": sent_today(store, gid, now=moment),
-        "quota_used": used_today(store, gid, now=moment, exempt_kinds=PUSH_EXEMPT_KINDS),
+        "quota_used": used_today(store, gid, now=moment, exempt_kinds=NO_QUOTA_KINDS),
         "recent": recent(store, gid),
     }
 

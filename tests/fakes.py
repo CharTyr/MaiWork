@@ -202,6 +202,9 @@ class FakeHost:
     - session_id: session_for_group 的固定返回值；session_error 非空时抛它。
     - info: group_info 的固定返回 dict；info_error 非空时抛它。
     - 记录：msg_calls=[(session_id, start, end, limit)]、session_calls=[gid]、info_calls=[gid]。
+    - 线上 T-14（2026-10-10）追加（只加不改）：by_id 是 {message_id: 消息 dict}，
+      供 `message_by_id`（取原图用）回放；message_error 非空时抛它；记录
+      by_id_calls=[(message_id, session_id, include_binary_data)]。
     """
 
     def __init__(
@@ -212,6 +215,8 @@ class FakeHost:
         info: Dict[str, Any] | None = None,
         session_error: Exception | None = None,
         info_error: Exception | None = None,
+        by_id: Dict[str, Any] | None = None,
+        message_error: Exception | None = None,
     ) -> None:
         self.msgs: List[Any] = sorted(list(msgs or []), key=lambda m: m.ts)
         self.session_id = session_id
@@ -221,6 +226,9 @@ class FakeHost:
         self.msg_calls: List[Tuple[str, float, float, int]] = []
         self.session_calls: List[str] = []
         self.info_calls: List[str] = []
+        self.by_id: Dict[str, Any] = dict(by_id or {})
+        self.message_error = message_error
+        self.by_id_calls: List[Tuple[str, str, bool]] = []
 
     async def messages(
         self, session_id: str, start: float, end: float, limit: int, *, limit_mode: str = "latest"
@@ -245,6 +253,26 @@ class FakeHost:
         if self.info_error is not None:
             raise self.info_error
         return dict(self.info)
+
+    async def message_by_id(
+        self, message_id: str, session_id: str = "", *, include_binary_data: bool = False, **kwargs: Any
+    ) -> Any:
+        """假 `Host.message_by_id`（线上 T-14）：从 by_id 里回放一条消息 dict。
+
+        深拷贝一份再给出去，免得调用方（把原图解码写盘那套）改到预置数据。
+        预置值是异常实例时抛它（测「宿主炸了」）；对不上 message_error 也一样。
+        """
+        import copy
+
+        self.by_id_calls.append((str(message_id), str(session_id or ""), bool(include_binary_data)))
+        if self.message_error is not None:
+            raise self.message_error
+        msg = self.by_id.get(str(message_id))
+        if isinstance(msg, BaseException):
+            raise msg
+        if msg is None:
+            return None
+        return copy.deepcopy(msg)
 
 
 class FakeModels:

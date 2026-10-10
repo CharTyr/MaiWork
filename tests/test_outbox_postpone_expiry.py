@@ -292,20 +292,26 @@ async def test_expiry_equal_now_is_not_expired(tmp_path):
 
 
 async def test_task_delivery_without_ttl_is_never_dropped_by_postpone(tmp_path):
-    """没有有效期的任务交付：延期照旧排队，绝不因为「推迟到明天」被作废。"""
+    """没有有效期的任务交付：推迟照旧排队，绝不因为「推到下一段能发的时间」被作废。
+
+    2026-10-10 起任务自己的消息（task_id 非空 + delivery/status）不吃每日额度了
+    （新口径与用例见 tests/test_task_push_quota.py），所以这里改用**睡觉时段**造成推迟
+    ——顺带证明改口径之后睡觉时段仍然照旧推迟、且没有有效期就绝不提前作废。
+    """
     world = _world(tmp_path)
     seen: list[dict] = []
     world.ob.add_result_hook(seen.append)
-    _exhaust_quota(world)
+    group_push.set_config(world.store, GID, {"quiet_hours": "19:00-20:00", "daily_max": 1},
+                          world.settings, now=NOW_19 - 10)
     world.ob.enqueue("task:T-9:deliver:text", GID, "text",
                      {"text": "任务成品", "push_kind": "delivery"}, task_id="T-9")
     await world.ob.flush(NOW_19)
     row = _rows(world.store)[0]
     assert row["status"] == "pending"
     assert "推迟" in row["error"]
-    assert float(row["not_before"]) == QUIET_07
+    assert float(row["not_before"]) == _ts(20, 0)   # 这段 quiet 结束的时刻
     assert seen == []                     # 没作废、没结果 hook
-    await world.ob.flush(QUIET_07 + 60)
+    await world.ob.flush(_ts(20, 1))
     assert _rows(world.store)[0]["status"] == "sent"
     assert [t["text"] for t in world.host.texts] == ["任务成品"]
 

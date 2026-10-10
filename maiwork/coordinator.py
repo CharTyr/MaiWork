@@ -58,9 +58,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,7 +71,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from . import clock, compaction, deliverable_check, members, requirements
 from .goals import chat_evidence_match as _chat_evidence_match
-from .host import HostError
+from .host import HostError, _parse_reply_to
 from .lanes import TaskLanes, prepare_history
 from .models import ModelError
 from .outbox import report_error as _report_error
@@ -163,6 +165,78 @@ BRIEF_JOB_TAIL = "这是随口一问：只交回几句话的结论和关键出�
 # 判「已经钉过」用开头这几个字（不是整句）：步骤存档按 200 字截断，整句可能被截掉尾巴，
 # 只看整句会在下一轮复用存档时又追加一遍，前后拼出半句残话。
 _BRIEF_JOB_TAIL_MARK = "这是随口一问"
+
+# ---------------------------------------------------------------------------
+# 群友给的原图（线上 T-14，2026-10-10）
+#
+# 线上事实：群友引用一张图说「把它改得凶一点，加一句『我可不是什么好好小姐』」。任务的
+# 需求文本里只有「[image]」，子 agent 看不到图，另画了一个角色，验收打回，最后停在等人。
+# 图其实在宿主拿得到（`message.get_by_id` + `include_binary_data=True`）。
+# 收口：开工前由代码把请求消息（含它引用的那条）里的图片原件取回来，落到
+# `artifacts/<任务>/input/`；计划 / 每条活的 brief / 验收都点名这个路径。原图是**材料**，
+# 不是成品——验收指到 input/ 下就是拿群友的图当交付，直接判不过。
+# ---------------------------------------------------------------------------
+INPUT_IMAGES_DIR = "input"  # artifacts/<任务>/input/
+_INPUT_IMAGES_MAX = 4  # 最多收 4 张
+_INPUT_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 单张解码后超过 10MB 不要
+_INPUT_IMAGES_HINT = (
+    "群友这条请求附带 / 引用了 {n} 张图片，已经存到工作区：{paths}。"
+    "要改图、看图的活必须基于这些原图做，不要另画一张。"
+)
+_INPUT_IMAGES_REVIEW_HINT = (
+    "原图在 {paths}，改图类活要对照原图判断是不是在原图基础上改的。"
+)
+
+
+def _image_ext_by_magic(data: bytes) -> str:
+    """按魔数认图片类型（png / jpg / gif / webp）；认不出（不是图片）返回 ""。"""
+    if data.startswith(b"\x89PNG"):
+        return "png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data.startswith(b"GIF8"):
+        return "gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return ""
+
+
+def _message_image_segments(msg: Any) -> list[dict]:
+    """消息 dict → raw_message 里的图片 / 表情段（别的段、坏数据一律丢掉）。"""
+    if not isinstance(msg, dict):
+        return []
+    raw = msg.get("raw_message")
+    if not isinstance(raw, list):
+        return []
+    return [
+        seg for seg in raw
+        if isinstance(seg, dict) and str(seg.get("type") or "") in ("image", "emoji")
+    ]
+
+
+def _segment_image_bytes(seg: Any) -> bytes | None:
+    """图片 / 表情段 → 解码后的原图字节；没有 binary_data_base64 / base64 坏了 → None。
+
+    只认 `binary_data_base64`（宿主 `include_binary_data=True` 时给的真件）；`data` 是
+    宿主给的 Content 字符串，不是原件，不能拿它当图。
+    """
+    if not isinstance(seg, dict):
+        return None
+    b64 = str(seg.get("binary_data_base64") or "").strip()
+    if not b64:
+        return None
+    try:
+        return base64.b64decode(b64, validate=True)
+    except Exception:
+        return None
+
+
+def input_images_hint(paths: Any) -> str:
+    """计划提示词 / 每条活的 brief 里那句「原图已经存到工作区」（没有原图 → ""）。"""
+    rels = [str(p) for p in (paths or []) if str(p).strip()]
+    if not rels:
+        return ""
+    return _INPUT_IMAGES_HINT.format(n=len(rels), paths="、".join(rels))
 
 
 def normalize_scale(value: Any) -> str:
@@ -983,6 +1057,9 @@ class Coordinator:
         # 挂上后：_run_job 走 kind="task"（task 是「本次任务一类」通用类型，绝不能被错写成 news/goal）；
         # 岗位停用 / 群不服务 → 报 ValueError，上游照旧按失败处理，**绝不落到通才 workers**。
         self._specialists: Any = None
+        # 线上 T-14（2026-10-10）：本轮从群友那条请求（含引用的消息）取回来的原图相对路径，
+        # 按任务 id 存（计划 / brief / 验收都要点名它们；见 _collect_request_images）。
+        self._input_images: dict[str, list[str]] = {}
 
     # ------------------------------------------------------------------
     # 内部小工具
@@ -1201,6 +1278,191 @@ class Coordinator:
         except (PermissionError, ValueError):
             return False
         return bool(p.exists())
+
+    # ------------------------------------------------------------------
+    # 群友给的原图（线上 T-14，2026-10-10）
+    # ------------------------------------------------------------------
+
+    def _input_images_dir(self, tid: str) -> str:
+        return f"{self._artifact_dir(tid)}/{INPUT_IMAGES_DIR}"
+
+    def _points_into_input_dir(self, tid: str, artifact: Any) -> bool:
+        """验收给的成品路径是不是指到了群友原图目录（`artifacts/<任务>/input/`）里。
+
+        只看工作区相对路径的字面形态（绝对路径 / 越界路径本来就被交付闸挡掉）。
+        """
+        rel = str(artifact or "").strip().replace("\\", "/").lstrip("/")
+        while rel.startswith("./"):
+            rel = rel[2:]
+        base = self._input_images_dir(tid).strip("/")
+        return rel == base or rel.startswith(base + "/")
+
+    def _request_message_id(self, tid: str) -> str:
+        """任务 → requests 行 → 群友那条原始消息的 message_id；没有就 ""。"""
+        try:
+            row = self._store.read().execute(
+                "SELECT request_id FROM tasks WHERE id=?", (str(tid),)
+            ).fetchone()
+            request_id = str(row["request_id"] or "").strip() if row is not None else ""
+            if not request_id:
+                return ""
+            rrow = self._store.read().execute(
+                "SELECT message_id FROM requests WHERE id=?", (request_id,)
+            ).fetchone()
+            return str(rrow["message_id"] or "").strip() if rrow is not None else ""
+        except Exception:
+            logger.exception("读任务的需求消息失败（任务 %s）", tid)
+            return ""
+
+    def _existing_input_images(self, tid: str, ws_name: str) -> list[str]:
+        """`artifacts/<任务>/input/` 里已经落过的文件（重试 / 继续时不再拉一次宿主）。
+
+        符号链接一律不算（工作区里别人预埋的链接不能当原图用）。没有就 []。
+        """
+        rel_dir = self._input_images_dir(tid)
+        try:
+            base = self._env.resolve(ws_name, rel_dir)
+        except (PermissionError, ValueError, OSError) as e:
+            logger.warning("原图目录解析失败（任务 %s）：%s", tid, e)
+            return []
+        try:
+            if not base.is_dir():
+                return []
+            out: list[str] = []
+            for p in sorted(base.iterdir(), key=lambda x: x.name):
+                try:
+                    if p.is_symlink() or not p.is_file():
+                        continue
+                except OSError:
+                    continue
+                out.append(f"{rel_dir}/{p.name}")
+            return out
+        except OSError:
+            logger.exception("列原图目录失败（任务 %s）", tid)
+            return []
+
+    def _save_input_images(self, tid: str, ws_name: str, segments: list[dict]) -> list[str]:
+        """把图片段落到 `artifacts/<任务>/input/原图N.<ext>`，返回相对路径（最多 4 张）。
+
+        - 认魔数：不是图片（png / jpg / gif / webp）的字节跳过；单张解码后 > 10MB 跳过；
+          base64 坏了跳过；内容重复的只留一份。
+        - 一律不跟随符号链接：目录是链接、目标文件是链接都跳过（工作区里子 agent 能预埋）。
+        - 写不出来就跳过，不抛。
+        """
+        rel_dir = self._input_images_dir(tid)
+        try:
+            base = self._env.resolve(ws_name, rel_dir)
+        except (PermissionError, ValueError, OSError) as e:
+            logger.warning("原图目录解析失败（任务 %s）：%s", tid, e)
+            return []
+        if base.is_symlink():
+            logger.warning("原图目录是符号链接，不写（任务 %s）", tid)
+            return []
+        made_dir = False
+        saved: list[str] = []
+        seen: set[bytes] = set()
+        for seg in segments:
+            if len(saved) >= _INPUT_IMAGES_MAX:
+                break
+            data = _segment_image_bytes(seg)
+            if data is None:
+                continue
+            if len(data) > _INPUT_IMAGE_MAX_BYTES:
+                logger.info("群友给的图超过 10MB，跳过（任务 %s）", tid)
+                continue
+            ext = _image_ext_by_magic(data)
+            if not ext:
+                continue
+            digest = hashlib.sha256(data).digest()
+            if digest in seen:
+                continue
+            if not made_dir:
+                # 一张都没收下就别留个空目录（免得下一轮误以为已经收过）。
+                try:
+                    base.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    logger.exception("建原图目录失败（任务 %s）", tid)
+                    return saved
+                made_dir = True
+            name = f"原图{len(saved) + 1}.{ext}"
+            path = base / name
+            try:
+                if path.is_symlink():
+                    logger.warning("原图目标文件是符号链接，跳过（任务 %s）：%s", tid, path.name)
+                    continue
+                fd = os.open(
+                    str(path),
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(data)
+            except FileExistsError:
+                continue
+            except OSError:
+                logger.exception("写原图失败（任务 %s）：%s", tid, path.name)
+                continue
+            seen.add(digest)
+            saved.append(f"{rel_dir}/{name}")
+        return saved
+
+    async def _collect_request_images(self, tid: str, gid: str, ws_name: str) -> list[str]:
+        """线上 T-14（2026-10-10）：把群友这条请求附带 / 引用的图片原件收进工作区。
+
+        顺序（引用的排前面——群友说「这张图改成…」时，被引用的那张才是主角）：
+        1. 任务 → requests 行的 message_id（构想派生的任务没有 → []）；
+        2. `artifacts/<任务>/input/` 里已经有文件 → 直接用（幂等：重试 / 继续不再拉宿主）；
+        3. `host.message_by_id(..., include_binary_data=True)` 取请求消息，记下它的
+           reply 段（或顶层 reply_to）；有引用就再取被引用那条；
+        4. 先收被引用那条的图片 / 表情段，再收请求自己的；最多 4 张、单张 ≤ 10MB；
+        5. 落盘后记一条 `task.input_images`（count）；消息里**有**图片段却一张都没收下来
+           （宿主文件没了 / 不是图片 / 太大）记 `task.input_images_missing`。
+
+        任何异常都只记日志、返回 []——取不到图不该把任务卡死。
+        """
+        try:
+            if self._host is None:
+                return []
+            already = self._existing_input_images(tid, ws_name)
+            if already:
+                return already
+            request_mid = self._request_message_id(tid)
+            if not request_mid:
+                return []
+            session_id = await self._host.session_for_group(gid)
+            if not session_id:
+                return []
+            segments: list[dict] = []
+            had_image = False
+            req_msg = await self._host.message_by_id(
+                request_mid, session_id, include_binary_data=True
+            )
+            if isinstance(req_msg, dict):
+                quoted_mid = str(req_msg.get("reply_to") or "").strip() or _parse_reply_to(
+                    req_msg.get("raw_message")
+                )
+                if quoted_mid:
+                    quoted = await self._host.message_by_id(
+                        quoted_mid, session_id, include_binary_data=True
+                    )
+                    quoted_segs = _message_image_segments(quoted)
+                    had_image = had_image or bool(quoted_segs)
+                    segments.extend(quoted_segs)
+                own_segs = _message_image_segments(req_msg)
+                had_image = had_image or bool(own_segs)
+                segments.extend(own_segs)
+            paths = self._save_input_images(tid, ws_name, segments)
+            if paths:
+                self._task_fact_event(tid, gid, "task.input_images", count=len(paths))
+                logger.info("任务 %s 收下群友给的 %d 张原图", tid, len(paths))
+            elif had_image:
+                # 群里确实带了图，但一张都没拿到：记一笔（群友可以重发 / 宿主文件过期）。
+                self._task_fact_event(tid, gid, "task.input_images_missing")
+                logger.info("任务 %s 消息里有图但一张都没取到（原图缺失）", tid)
+            return paths
+        except Exception:
+            logger.exception("取群友给的原图出错（任务 %s），照常开工", tid)
+            return []
 
     # ------------------------------------------------------------------
     # 执行环境（本机 / railway.new 一次性 VM）
@@ -1580,6 +1842,11 @@ class Coordinator:
                 prompt_lines.append(f"- {c}")
         else:
             prompt_lines.append("（空，这次必须给出；完成标准要能验收，不要写「做完了」这种）")
+        # 线上 T-14（2026-10-10）：群友这条请求带的原图已经在工作区里（代码取的）。
+        input_images = self._input_images.get(tid) or []
+        if input_images:
+            prompt_lines.append("")
+            prompt_lines.append(input_images_hint(input_images))
         if profile_lines:
             prompt_lines.append("")
             prompt_lines.append("群画像要点（供你判断时参考，不要点名任何群友）：")
@@ -2088,6 +2355,15 @@ class Coordinator:
         # 任务双岗协作（docs/20）：这一版需求已经被打回几次（决定接着改 / 换升级模型）
         lanes_on = getattr(self, "_specialists", None) is not None
         rejections = self._rejections(tid, req_version)
+
+        # 线上 T-14（2026-10-10）：群友这条请求（含它引用的那条）带了图片时，先把原图取回来
+        # 落到 artifacts/<任务>/input/，再排计划——子 agent 只看得到需求文本里的「[image]」，
+        # 不把图摆到工作区它就只能另画一张。取不到就算了（_collect_request_images 不抛）。
+        try:
+            self._input_images[tid] = await self._collect_request_images(tid, gid, ws_name)
+        except Exception:
+            logger.exception("收原图出错（任务 %s），不带头开工", tid)
+            self._input_images[tid] = []
 
         review_text = ""
         try:
@@ -3778,6 +4054,11 @@ class Coordinator:
             f"只用本任务目录 {self._artifact_dir(tid)}/ 和前一步交给你的东西；"
             "工作区里别的任务的文件和这个任务无关，别读别用。"
         )
+        # 线上 T-14（2026-10-10）：这条请求带的原图已经存在工作区里，每条活都要知道，
+        # 免得子 agent 看不到图、自己另画一张。
+        input_images = getattr(self, "_input_images", {}).get(tid) or []
+        if input_images:
+            out += "\n\n" + input_images_hint(input_images)
         if deliver_kind == "view":
             out += "展示类成品做成单页 index.html（手机能看、不依赖外部资源）。"
         elif deliver_kind == "file":
@@ -3973,6 +4254,12 @@ class Coordinator:
             "一个文件；full=全面 / 深度报告。篇幅与原话相符：brief 是几句话，要一页就一页"
             "——做多了、做少了都在 review 里按这个量说清。）"
         )
+        # 线上 T-14（2026-10-10）：群友给的原图在工作区里；改图类活要对着它判。
+        input_images = self._input_images.get(tid) or []
+        if input_images:
+            prompt_lines.append(
+                _INPUT_IMAGES_REVIEW_HINT.format(paths="、".join(input_images))
+            )
         prompt_lines.append("")
         prompt_lines.append("验收必须照这些原则：")
         prompt_lines.append(
@@ -4428,6 +4715,13 @@ class Coordinator:
         artifact = str(review_data.get("artifact") or "").strip()
         note = str(review_data.get("note") or "").strip()
         missing = review_data.get("missing") if isinstance(review_data.get("missing"), list) else []
+
+        # 线上 T-14（2026-10-10）：群友给的原图存在 artifacts/<任务>/input/ 下，是**材料**、
+        # 不是成品。验收指到那儿就是拿群友的图当交付物，直接判不过（换句话说：没在原图
+        # 基础上改，只是把原图又交了一遍）。
+        if passed and self._points_into_input_dir(tid, artifact):
+            passed = False
+            review_text = "（交付物不能是群友给的原图本身，视为不通过）" + review_text
 
         # 硬性检查：pass 且非 text 时 artifact 必须真的存在、且不含符号链接（S3：
         # 发布/打包会跳过所有符号链接，交带链接的成品等于少件；线上是 root，
