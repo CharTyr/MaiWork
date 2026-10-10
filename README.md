@@ -20,10 +20,7 @@
 </div>
 
 > MaiWork 是 MaiBot 的插件（插件 ID `chartyr.maiwork`）。它和 MaiBot **并行运行**、共用一套人设，但**不抢 MaiBot 的话筒**：不改回复频率、不拦 MaiBot 说话。想让群里知道的事，优先交给 MaiBot 在聊天里顺口提。
->
-> 基本功能已完成，仍在持续迭代。
->
-> 当前版本 **0.9.3**。每一版改了什么、升级要注意什么，见[升级说明](docs/guide/upgrade.md)；升级前请备份插件和数据目录。
+
 
 <div align="center">
 <img src="docs/images/news.png" width="92%" alt="资讯页" />
