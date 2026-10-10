@@ -1027,9 +1027,9 @@ async def test_jev_log_records_full_scores_timing_stuck(tmp_path):
 
     jev = _read_jev(store)
     assert jev["ok_p"] == pytest.approx(0.4)
-    assert jev["ok_need"] == pytest.approx(0.6)
+    assert jev["ok_need"] == pytest.approx(0.5)  # 2026-10-10 由 0.6 放宽
     assert jev["fit_best"] == pytest.approx(0.9)
-    assert jev["fit_need"] == pytest.approx(0.5)
+    assert jev["fit_need"] == pytest.approx(0.4)  # 2026-10-10 由 0.5 放宽
     assert jev["fit_title"] == "医疗话题"
     assert jev["stuck"] == "timing"
     assert jev["stretch_ts"] == pytest.approx(t - 3600.0)
