@@ -283,6 +283,34 @@ class TestAskMessageIdWriteback:
         finally:
             await app.stop()
 
+    async def test_outbox_human_ask_writes_question_msg_id(self, tmp_path: Path) -> None:
+        """「需要有人参与」的提问（key human:{tid}:{n}）发出后同样回写 question_msg_id。
+
+        线上 T-14（2026-10-10）：这条没回写，发起人引用回复那条提问时认不出是回答，
+        只能靠「@ 机器人」那条规则兜底。
+        """
+        app = _app(tmp_path)
+        await app.start()
+        try:
+            _fix_session(app)
+            tid = app.tasks.create(G1, title="改图", req="", criteria=[], source="test", status="queued")
+            app.tasks.transition(tid, "running")
+            app.tasks.transition(tid, "waiting_input", question="请重发原图", question_ts=clock.now())
+            oid = app.outbox.enqueue(
+                f"human:{tid}:2",
+                G1,
+                "text",
+                {"text": "这一步需要有人参与：请重发原图", "push_kind": "status"},
+                task_id=tid,
+            )
+            await app.outbox.flush(clock.now())
+            row = app.store.read().execute("SELECT status FROM outbox WHERE id=?", (oid,)).fetchone()
+            assert row["status"] == "sent"
+            t = app.tasks.get(tid)
+            assert str(t["question_msg_id"] or "") == "fake-msg-id"
+        finally:
+            await app.stop()
+
     async def test_non_ask_text_does_not_touch_question_msg_id(self, tmp_path: Path) -> None:
         app = _app(tmp_path)
         await app.start()
@@ -364,6 +392,88 @@ class TestReplyResumesTaskEndToEnd:
                     break
                 await asyncio.sleep(0.02)
             assert coord.resume_calls == [(tid, "五百以内")]
+        finally:
+            await app.stop()
+
+
+class TestQuoteAnyPromptOfTheTask:
+    """2026-10-10（线上 T-14）：提问末尾统一写「引用这条消息回复我就行」——
+    6 小时「还在等回答」的提醒也写了，所以引用那条提醒回复也要认得出是回答。"""
+
+    @staticmethod
+    def _waiting_task_with_reminder(app: MaiWorkApp) -> str:
+        tid = app.tasks.create(
+            G1, title="改图", req="改成生气的", criteria=[], source="test",
+            requester_id="10001", requester_name="阿柒", status="queued",
+        )
+        app.tasks.transition(tid, "running")
+        app.tasks.transition(tid, "waiting_input", question="请补原图", question_ts=clock.now())
+        oid = app.outbox.enqueue(
+            f"task-wait-remind:{tid}", G1, "text",
+            {"text": "「改图」还在等回答：请补原图（引用这条消息回复我就行）", "push_kind": "status"},
+            task_id=tid,
+        )
+        with app.store.tx() as conn:
+            conn.execute("UPDATE tasks SET question_msg_id=? WHERE id=?", ("m-q-1", tid))
+            conn.execute(
+                "UPDATE outbox SET status='sent', result=? WHERE id=?",
+                (json.dumps({"message_id": "m-remind-1"}), oid),
+            )
+        app._invalidate_answer_cache()
+        return tid
+
+    async def test_quoting_the_reminder_resumes(self, tmp_path: Path) -> None:
+        app = _app(tmp_path)
+        coord = FakeCoordinator()
+        app.coordinator_factory = lambda *a, **kw: coord
+        await app.start()
+        try:
+            _fix_session(app)
+            tid = self._waiting_task_with_reminder(app)
+            reply = _hook_reply(text="图在这", reply_to="m-remind-1", message_id="m-801")
+            assert await app._intake.handle(reply) == {"action": "continue"}
+            for _ in range(50):
+                if coord.resume_calls:
+                    break
+                await asyncio.sleep(0.02)
+            assert coord.resume_calls == [(tid, "图在这")]
+        finally:
+            await app.stop()
+
+    async def test_quoting_the_original_question_still_resumes(self, tmp_path: Path) -> None:
+        app = _app(tmp_path)
+        coord = FakeCoordinator()
+        app.coordinator_factory = lambda *a, **kw: coord
+        await app.start()
+        try:
+            _fix_session(app)
+            tid = self._waiting_task_with_reminder(app)
+            reply = _hook_reply(text="好了", reply_to="m-q-1", message_id="m-802")
+            assert await app._intake.handle(reply) == {"action": "continue"}
+            for _ in range(50):
+                if coord.resume_calls:
+                    break
+                await asyncio.sleep(0.02)
+            assert coord.resume_calls == [(tid, "好了")]
+        finally:
+            await app.stop()
+
+    async def test_at_bot_rule_counts_tasks_not_prompts(self, tmp_path: Path) -> None:
+        """同一个任务有两条提问消息（原提问 + 提醒），「@ 机器人 + 只有一个等待任务」仍成立。"""
+        app = _app(tmp_path)
+        coord = FakeCoordinator()
+        app.coordinator_factory = lambda *a, **kw: coord
+        await app.start()
+        try:
+            _fix_session(app)
+            tid = self._waiting_task_with_reminder(app)
+            reply = _hook_reply(text="弄好了", message_id="m-803", is_at=True)
+            assert await app._intake.handle(reply) == {"action": "continue"}
+            for _ in range(50):
+                if coord.resume_calls:
+                    break
+                await asyncio.sleep(0.02)
+            assert coord.resume_calls == [(tid, "弄好了")]
         finally:
             await app.stop()
 

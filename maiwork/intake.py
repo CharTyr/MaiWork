@@ -316,9 +316,10 @@ class Intake:
                     break
         # 规则 2：请求人 @ 机器人 + 这个群里只有一个等待任务
         if not task_id and (bool(message.get("is_at")) or bool(message.get("is_mentioned"))):
-            mine = [t for t in waiting if str(t[2] or "") == str(user_id)]
+            # 按任务数，不按提问条数：同一个任务可能有原提问 + 提醒两条（2026-10-10）
+            mine = {str(t[0]) for t in waiting if str(t[2] or "") == str(user_id)}
             if len(mine) == 1:
-                task_id = str(mine[0][0])
+                task_id = next(iter(mine))
         if not task_id:
             return
         if mid:

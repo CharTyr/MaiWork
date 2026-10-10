@@ -193,6 +193,9 @@ async def test_human_wait_all_unmet_are_human_on_first_attempt(
     assert asks[0]["key"] == f"human:{tid}:1"
     assert asks[0]["payload"]["push_kind"] == "status"
     assert asks[0]["payload"]["text"].startswith("@小明 ")
+    # 2026-10-10：群里那条末尾告诉人怎么回（引用回复才认得出是回答）；存进任务的 question 不带
+    assert asks[0]["payload"]["text"].endswith("（引用这条消息回复我就行）")
+    assert "引用这条消息" not in question
 
     assert _attempt_rows(mem_store, tid)[-1]["status"] == "waiting"
 

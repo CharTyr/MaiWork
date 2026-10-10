@@ -101,6 +101,8 @@ _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 # 交付说明消息：只有这两种 push_kind 才算「交付」（提问 / 报错 / 卡片不受 @ 发起人影响）
 _DELIVERY_PUSH_KINDS = frozenset(("delivery", "awaited_delivery"))
+# 等发起人回答的提问 key 前缀：发出后回写任务 question_msg_id（app._on_ask_sent）
+_ASK_KEY_PREFIXES = ("ask:", "human:")
 # 回落页的候选网页后缀（X.docx → X.html）
 _PAGE_SUFFIXES = (".html", ".htm")
 
@@ -440,7 +442,7 @@ class Outbox:
         # 群空间（docs/02 §10）：上传成功时登记 group_files_owned 的回调
         # （app 启动时挂 GroupSpace.register_owned；没挂就跳过）
         self._group_file_hook: Any = None
-        # 提问回执（docs/02 §7.2）：key 以 "ask:" 开头的 text 发送成功后，
+        # 提问回执（docs/02 §7.2）：key 以 "ask:" / "human:" 开头的 text 发送成功后，
         # 把 QQ 消息 ID 交给 app 回写任务的 question_msg_id（回复那条提问 → 恢复任务）
         self._ask_hook: Any = None
         # 发送结果回调（0.8.0 归一）：生产者自己挂上来，真发出去之后才回写自己的表。
@@ -500,7 +502,7 @@ class Outbox:
 
     def set_ask_hook(self, hook: Any) -> None:
         """挂「提问发出」回调：fn(key, group_id, task_id, message_id)。只在 text 发送成功、
-        key 以 "ask:" 开头时调；出错只记日志，不影响发送。"""
+        key 以 "ask:" / "human:" 开头时调；出错只记日志，不影响发送。"""
         self._ask_hook = hook
 
     # ------------------------------------------------------------------
@@ -1472,7 +1474,10 @@ class Outbox:
             fresh = _row_after(self._store, oid)
             # 提问回执：ask:{task_id}:{attempt} 的提问发出去了，把 QQ 消息 ID 交回
             # （回复那条提问 → 恢复 waiting_input / shelved 任务；app 挂了钩子才有动作）
-            if kind == "text" and str(row["key"]).startswith("ask:") and self._ask_hook is not None:
+            # ask:（缺信息 / 做不到）和 human:（需要有人参与，线上 T-14 2026-10-10 漏了）都是
+            # 等发起人回答的提问：发出后要回写 question_msg_id，引用回复才认得出是回答。
+            if (kind == "text" and str(row["key"]).startswith(_ASK_KEY_PREFIXES)
+                    and self._ask_hook is not None):
                 try:
                     mid = str(result.get("message_id") or "").strip()
                     if mid:

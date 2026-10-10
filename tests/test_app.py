@@ -1032,6 +1032,7 @@ class TestM3Loop:
             ).fetchall()
             assert len(rows) == 1
             assert "还在等回答" in rows[0]["payload"]
+            assert "引用这条消息回复我就行" in rows[0]["payload"]
             # 2026-10-10：带上任务号，才算「任务自己的消息」——不占、也不被每日额度挡住
             assert rows[0]["task_id"] == tid
             # key 去重：第二轮不再加新的

@@ -1354,6 +1354,7 @@ async def test_blocked_ask_only_from_second_attempt(mem_store, settings, env, to
     assert asks, outbox.enqueued
     assert asks[-1]["payload"]["push_kind"] == "status"
     assert asks[-1]["payload"]["text"].startswith("@小明 ")
+    assert asks[-1]["payload"]["text"].endswith("（引用这条消息回复我就行）")
     assert "task.blocked_ask" in _kinds(mem_store, tid)
     row = _attempt_rows(mem_store, tid)[-1]
     assert row["status"] == "waiting"

@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 from . import clock, members
 from .config import Settings, load_settings
+from .tasks import ANSWER_HINT
 from .host import Host
 from .intake import Intake, Signals
 from .models import Models
@@ -1915,7 +1916,7 @@ class MaiWorkApp:
     # ------------------------------------------------------------------
 
     def _on_ask_sent(self, key: str, group_id: str, task_id: Any, message_id: str) -> None:
-        """outbox 把 ask:{task_id}:{attempt} 的提问发出去了 → 回写任务的 question_msg_id。
+        """outbox 把 ask:{task_id}:{attempt} / human:{task_id}:{attempt} 的提问发出去了 → 回写任务的 question_msg_id。
 
         只回写 waiting_input / shelved 的任务（别的状态的提问说明早就move on了）；
         写完让回答缓存立刻失效（question_msg_id 变了，下一轮 intake 必须看得到）。
@@ -1929,7 +1930,7 @@ class MaiWorkApp:
             tid = str(task_id)
         else:
             parts = str(key or "").split(":")
-            if len(parts) >= 3 and parts[0] == "ask":
+            if len(parts) >= 3 and parts[0] in ("ask", "human"):
                 tid = parts[1]
         if not tid:
             return
@@ -1955,6 +1956,34 @@ class MaiWorkApp:
         self._answer_cache = {}
         self._answer_cache_ts = 0.0
 
+    def _task_prompt_message_ids(self, task_ids: list[str]) -> dict[str, list[str]]:
+        """等待中的任务发过的提问 / 提醒的 QQ 消息 ID（outbox 已发、key 是 ask: / human: /
+        task-wait-remind:）。2026-10-10：提醒也写了「引用这条消息回复我就行」，引用它也要认。"""
+        out: dict[str, list[str]] = {}
+        if not task_ids or self.store is None:
+            return out
+        marks = ", ".join("?" for _ in task_ids)
+        try:
+            rows = self.store.read().execute(
+                "SELECT task_id, key, result FROM outbox WHERE status='sent'"
+                f" AND task_id IN ({marks})",
+                tuple(task_ids),
+            ).fetchall()
+        except Exception:
+            logger.exception("读任务提问消息 ID 出错")
+            return out
+        for r in rows:
+            key = str(r["key"] or "")
+            if not key.startswith(("ask:", "human:", "task-wait-remind:")):
+                continue
+            try:
+                mid = str((json.loads(r["result"] or "{}") or {}).get("message_id") or "").strip()
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if mid:
+                out.setdefault(str(r["task_id"]), []).append(mid)
+        return out
+
     def _waiting_answer_map(self, group_id: str) -> list:
         """intake 用的「群 → [(task_id, question_msg_id, requester_id)]」缓存快照。
 
@@ -1973,14 +2002,16 @@ class MaiWorkApp:
                         " FROM tasks WHERE status IN ('waiting_input', 'shelved')"
                     ).fetchall()
                     cache: dict[str, list] = {}
+                    prompts = self._task_prompt_message_ids([str(r["id"]) for r in rows])
                     for r in rows:
-                        cache.setdefault(str(r["group_id"]), []).append(
-                            (
-                                str(r["id"]),
-                                str(r["question_msg_id"] or ""),
-                                str(r["requester_id"] or ""),
-                            )
-                        )
+                        tid_s = str(r["id"])
+                        rid_s = str(r["requester_id"] or "")
+                        entries = cache.setdefault(str(r["group_id"]), [])
+                        entries.append((tid_s, str(r["question_msg_id"] or ""), rid_s))
+                        # 同一个任务发过的其它提问 / 提醒（引用哪一条回复都算回答）
+                        for mid in prompts.get(tid_s, ()):
+                            if mid != str(r["question_msg_id"] or ""):
+                                entries.append((tid_s, mid, rid_s))
                     self._answer_cache = cache
                     self._answer_cache_ts = now
                 except Exception:
@@ -2787,7 +2818,7 @@ class MaiWorkApp:
                     f"task-wait-remind:{tid}",
                     str(row["group_id"]),
                     "text",
-                    {"text": f"「{title}」还在等回答：{question}（回复那条提问就行）", "push_kind": "status"},
+                    {"text": f"「{title}」还在等回答：{question}{ANSWER_HINT}", "push_kind": "status"},
                     task_id=str(tid),  # 任务自己的消息：不占每日额度（2026-10-10 用户定）
                 )
 

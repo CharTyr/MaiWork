@@ -51,6 +51,10 @@ _MUTABLE_FIELDS = frozenset({
 })
 
 _TERMINAL = frozenset({"completed", "cancelled", "rejected"})
+# 等发起人回答的提问（缺信息 / 做不到 / 需要有人参与 / 6 小时「还在等回答」）发进群时
+# 末尾统一加这句（2026-10-10，线上 T-14）：只有引用回复提问、或发起人 @ 机器人才认得出
+# 是回答，直接在群里说一句认不出来。只加在群消息上，任务里存的 question 不带。
+ANSWER_HINT = "（引用这条消息回复我就行）"
 
 
 def _load_json(s: Any, default: Any) -> Any:

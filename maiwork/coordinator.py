@@ -76,6 +76,7 @@ from .lanes import TaskLanes, prepare_history
 from .models import ModelError
 from .outbox import report_error as _report_error
 from .store import Store
+from .tasks import ANSWER_HINT
 from .tools import ToolContext
 
 logger = logging.getLogger("maiwork.coordinator")
@@ -6126,7 +6127,7 @@ class Coordinator:
         requester = members.name_of(
             self._store, gid, task.get("requester_id"), fallback=task.get("requester_name")
         ).strip()
-        text = f"@{requester} {question}" if requester else question
+        text = (f"@{requester} {question}" if requester else question) + ANSWER_HINT
         try:
             self._outbox.enqueue(
                 outbox_key,
