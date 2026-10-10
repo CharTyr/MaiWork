@@ -124,6 +124,27 @@ _NOTE_FALLBACK_SUFFIX = {"file": "弄好了，文件在链接里", "text": "弄�
 _NOTE_FALLBACK_SUFFIX_DEFAULT = "弄好了，点开就能看"
 
 # ---------------------------------------------------------------------------
+# 直接回文字的活的正文（线上 T-13 事故，2026-10-10）
+#
+# 线上事实：群友让 bot 写一封 ~100 字的信，计划成 deliver_kind="text"；子 agent 把信只
+# 写在交回总结里，验收通过后群里只收到那条 ≤60 字的交付说明
+# （「信写好了，林诗栋口吻三件事都说到，125字够数直接用」）——信本身从没发出去。
+# 根因：text 活没有任何字段 / 文件在扛「要发出去的答案」，那 60 字说明就是全部。
+#
+# 收口：text 活的成品固定是工作区 `artifacts/<任务>/reply.md`——子 agent 必须把要发进
+# 群的**完整回复原文**写在这里（只有正文本身）；验收只认这个文件（不在 / 空的 → 不通过，
+# 成品扫描也扫它）；交付时原文 ≤ TEXT_REPLY_MAX 字就整段发进群，超了当群文件发。
+# ---------------------------------------------------------------------------
+TEXT_REPLY_NAME = "reply.md"
+TEXT_REPLY_MAX = 1500
+# MaiBot 已经回过就不重复发（T-13 第二问题）：去掉引用的原话后还剩这么多字才算「真答了」
+_MAIBOT_REPLY_MIN = 30
+# 找 MaiBot 的回复时往前看多久（需求创建时刻之前这么多秒开始读群消息）。
+# 需求是主模型读群时才记下的，可能比原话晚好几分钟（线上 T-13：原话 16:17、记下 16:19），
+# MaiBot 可能就在这段里回了；往前看 30 分钟盖住它（读的是 latest 200 条，够用）。
+_MAIBOT_LOOKBACK_S = 1800.0
+
+# ---------------------------------------------------------------------------
 # 规模档（docs/26 §问题 C / 2026-10 线上 T-10）
 #
 # 线上事实：原话只有「麦麦你搜搜，今天韩国银行被ai攻击了」，计划却做出 50KB / 12 节 /
@@ -3761,6 +3782,18 @@ class Coordinator:
             out += "展示类成品做成单页 index.html（手机能看、不依赖外部资源）。"
         elif deliver_kind == "file":
             out += "做成文件给人下载或编辑，文件名起清楚。"
+        elif deliver_kind == "text" and not steps_dir:
+            # 线上 T-13（2026-10-10）：直接回文字的活，答案必须落在 reply.md 里——
+            # 群里发出去的就是这个文件里的原文，子 agent 只写在交回总结里等于没交付。
+            out += (
+                f"\n\n这次是直接回文字的活：把**要发进群里的完整回复原文**写进工作区 "
+                f"{self._artifact_dir(tid)}/{TEXT_REPLY_NAME}"
+                "（只写正文本身，比如整封信；不要标题、不要「全文共 125 字」「已数过」"
+                "这类字数统计和自我说明）。"
+                "群里发出去的就是这个文件里的文字，一个字不改；"
+                "所以按一条聊天消息来写，别太长。验收只认这个文件："
+                "文件不在或是空的，就算没做成。"
+            )
         if on_railway and self._is_ssh_box(on_railway):
             out += (
                 f"\n\n这轮在专用机器「{getattr(on_railway, 'name', '')}」上做（用户自己的 VPS / VM，没有时间限制）："
@@ -4058,12 +4091,26 @@ class Coordinator:
                     line += f"；建议：{ch['suggestion']}"
                 prompt_lines.append(line)
         prompt_lines.append("")
+        # 线上 T-13（2026-10-10）：直接回文字的活，成品就是 reply.md 里的回复原文（不是
+        # 「可以留空」）；验收必须按这份原文判，文件不在 / 空的直接 pass=false。
+        if str(plan.get("deliver_kind") or "") == "text":
+            _artifact_spec = (
+                '"要交付的成品在工作区里的相对路径。这次是直接回文字的活：'
+                f'子 agent 必须把要发进群里的完整回复原文写进 {self._artifact_dir(tid)}/'
+                f'{TEXT_REPLY_NAME}，成品就是它（相对路径 {self._artifact_dir(tid)}/'
+                f'{TEXT_REPLY_NAME}）。你要按这个文件里的回复原文判：内容够不够、有没有'
+                '内部用语、是不是把答案只写在总结里没写进去；文件不在、读不出或是空的，'
+                'pass 必须 false"'
+            )
+        else:
+            _artifact_spec = (
+                '"要交付的成品在工作区里的相对路径（如 artifacts/T-1/index.html）"'
+            )
         prompt_lines.append(
             "只回 JSON："
             '{"pass": true|false, "review": "中文验收意见：第一句先写结论（「通过」或「没过：……」），'
             '只说没过的地方，全段不超过 150 字；通过就一两句话，别列一遍过了的项",'
-            ' "missing": ["还缺什么"], "artifact": "要交付的成品在工作区里的相对路径（'
-            '如 artifacts/T-1/index.html；text 交付可以留空）", "note": "交付时在群里说的那句话：'
+            ' "missing": ["还缺什么"], "artifact": ' + _artifact_spec + ', "note": "交付时在群里说的那句话：'
             "不超过 60 字；第一句直接给结论或最关键的一两个发现（不要写「已整理成…」「做好了」"
             "这种只说做了什么的开头）；是文件就说清要下载 / 打开什么；用口语，像群友说话；"
             '不写任务号、内部文件名、工具或流程词；不点名关注成员。"}'
@@ -4402,6 +4449,34 @@ class Coordinator:
                     if problem:
                         passed = False
                         review_text = f"（{problem}，视为不通过）" + review_text
+
+        # 线上 T-13（2026-10-10）：text 活的成品固定是 artifacts/<任务>/reply.md 里的
+        # 完整回复原文。模型给的 artifact 一律不看（老提示里 text 可以留空），代码把它钉成
+        # reply.md，再按和非 text 一样的闸核：文件在不在本任务成品目录、是不是符号链接、
+        # 内容空不空。不在 / 空的 → 不通过（下面 `_scan_deliverable` 会拿这个强制路径扫正文）。
+        if passed and plan["deliver_kind"] == "text":
+            reply_rel = f"{self._artifact_dir(tid)}/{TEXT_REPLY_NAME}"
+            artifact = reply_rel
+            reply_missing = "（直接回文字的活要把完整回复原文写进 reply.md，没找到或是空的，视为不通过）"
+            reply_path = self._deliver_path_in_task_dir(ws_name, tid, reply_rel)
+            if reply_path is None:
+                passed = False
+                review_text = "（交付物不在本任务成品目录，视为不通过）" + review_text
+            else:
+                problem = self._find_artifact_symlink_escape(reply_path)
+                if problem:
+                    passed = False
+                    review_text = f"（{problem}，视为不通过）" + review_text
+                else:
+                    try:
+                        reply_text = reply_path.read_text(
+                            encoding="utf-8", errors="replace"
+                        ) if reply_path.exists() else ""
+                    except OSError:
+                        reply_text = ""
+                    if not reply_text.strip():
+                        passed = False
+                        review_text = reply_missing + review_text
 
         # 线上 T-11：验收模型看不出成品里的「留空」（未覆盖 / 不另扩搜 / 待补充）和群友
         # 看得见的内部用语（job1 / research.md / 任务号）。代码再扫一遍最终成品文本；
@@ -4985,16 +5060,19 @@ class Coordinator:
             task_title = ""
         note = self._scrub_note(gid, review.get("note") or "", task_title, kind)
         if kind == "text":
-            try:
-                self._outbox.enqueue(
-                    f"task:{task_id}:deliver:text",
-                    gid,
-                    "text",
-                    {"text": note, "push_kind": "delivery"},
-                    task_id=task_id,
+            # 线上 T-13 第二问题（2026-10-10）：宿主 MaiBot（同一个 QQ 账号）已经用引用回复
+            # 答过这件事了，这份小文本活再发一条就是重复刷屏 → 不往群里发，答案留在任务页。
+            if await self._maibot_already_answered(
+                task_id, gid, our_len=self._text_reply_len(task_id, ws_name)
+            ):
+                self._lane_event(
+                    task_id, gid, "task.lane_maibot_answered",
+                    "MaiBot 已经在群里回过这件事，这次不重复发；答案留在任务页",
                 )
-            except Exception:
-                logger.exception("text 交付入队失败")
+                logger.info("任务 %s：MaiBot 已经在群里回过，跳过重复交付", task_id)
+                self._write_tokens(task_id)
+                return "done"
+            await self._deliver_text_reply(task_id, gid, ws_name, note)
         else:
             assert artifact_path is not None
             name = artifact_path.name or artifact_path.parent.name or task_id
@@ -5006,6 +5084,167 @@ class Coordinator:
                 logger.exception("deliver_task 失败")
         self._write_tokens(task_id)
         return "done"
+
+    async def _deliver_text_reply(
+        self, task_id: str, gid: str, ws_name: str, note: str
+    ) -> None:
+        """text 交付（线上 T-13）：把 `artifacts/<任务>/reply.md` 的原文发进群。
+
+        - 0 < 原文 ≤ `TEXT_REPLY_MAX` 字：过隐私闸后整段当群消息发（**替代**那条交付说明，
+          不另外再发 note）；被隐私闸拦下 → 回落老行为（只发说明）。
+        - 原文超长：当群文件发（`deliver_task(kind="file")`，走它那一套入队 key 和回落）。
+        - 文件读不到（验收之后不该发生）：回落老行为（只发说明）+ 记警告，绝不抛。
+        """
+        from .privacy import scrub
+
+        reply_rel = f"{self._artifact_dir(task_id)}/{TEXT_REPLY_NAME}"
+        reply = ""
+        try:
+            reply_path = self._deliver_path_in_task_dir(ws_name, task_id, reply_rel)
+            if reply_path is not None and reply_path.exists():
+                reply = reply_path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            logger.exception("读 text 交付正文失败（任务 %s），回落只发交付说明", task_id)
+            reply_path = None
+
+        if reply and len(reply) <= TEXT_REPLY_MAX:
+            cleaned = scrub(gid, reply, self._store)
+            if cleaned is not None and str(cleaned).strip():
+                text = str(cleaned)
+            else:
+                logger.warning("任务 %s 的回复原文没过隐私闸，改发交付说明", task_id)
+                text = note
+        elif reply:
+            # 太长：聊天消息装不下，当群文件发（发不出去由 deliver_task 的回落兜着）
+            try:
+                await self._delivery.deliver_task(
+                    task_id, kind="file", path=reply_path, name="回复.md", note=note
+                )
+            except Exception:
+                logger.exception("text 正文当群文件交付失败（任务 %s），回落只发交付说明", task_id)
+                text = note
+            else:
+                return
+        else:
+            logger.warning("任务 %s 验收通过但读不到 %s，回落只发交付说明", task_id, reply_rel)
+            text = note
+
+        try:
+            self._outbox.enqueue(
+                f"task:{task_id}:deliver:text",
+                gid,
+                "text",
+                {"text": text, "push_kind": "delivery"},
+                task_id=task_id,
+            )
+        except Exception:
+            logger.exception("text 交付入队失败")
+
+    def _own_sent_message_ids(self, gid: str) -> set[str]:
+        """MaiWork 自己已经发进这个群的 QQ 消息 ID（outbox 已发记录的 result.message_id）。
+
+        用于把「MaiBot 的回复」和「我自己发的那条」分开：同一个 QQ 账号，光看 is_bot 分不清。
+        读不出 / 坏 JSON 一律跳过（按没有处理）。
+        """
+        out: set[str] = set()
+        try:
+            rows = self._store.read().execute(
+                "SELECT result FROM outbox WHERE group_id=? AND status='sent'", (str(gid),)
+            ).fetchall()
+        except Exception:
+            logger.exception("读自己发过的群消息 ID 失败（群 %s），按没有处理", gid)
+            return out
+        for row in rows:
+            try:
+                data = json.loads(row["result"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if isinstance(data, dict):
+                mid = str(data.get("message_id") or "").strip()
+                if mid:
+                    out.add(mid)
+        return out
+
+    def _text_reply_len(self, task_id: str, ws_name: str) -> int:
+        """reply.md 正文字数（读不到 = 0）；给「MaiBot 是否已答过」定门槛用。"""
+        try:
+            path = self._deliver_path_in_task_dir(
+                ws_name, task_id, f"{self._artifact_dir(task_id)}/{TEXT_REPLY_NAME}"
+            )
+            if path is None or not path.exists():
+                return 0
+            return len(path.read_text(encoding="utf-8", errors="replace").strip())
+        except OSError:
+            return 0
+
+    async def _maibot_already_answered(self, task_id: str, gid: str, our_len: int = 0) -> bool:
+        """MaiBot 已经在群里回过这件事了吗（线上 T-13 第二问题，2026-10-10）。
+
+        宿主 MaiBot 和 MaiWork 是同一个 QQ 账号：一条小文本活，MaiBot 先一步用
+        **引用回复**答了，MaiWork 再发一条就是重复刷屏。判断条件（全部满足才算「真答了」）：
+        - 任务的 request 有 message_id（构想派生的任务没有 → 不算）；
+        - 群里有一条机器人消息，`reply_to` 正好是需求那条消息；
+        - 那条消息不是 MaiWork 自己发的（id 不在 outbox 已发记录的 message_id 里）；
+        - 把引用的原话（requests.quote / 需求那条消息的原文）抠掉后，正文还剩
+          ≥ max(`_MAIBOT_REPLY_MIN`, 我们回复字数的一半)——「好的稍等」「收到，交给我，
+          弄好了发群里」这种接话不算答复（线上 MaiBot 的普通引用回复几乎都 < 30 字）。
+        任何异常（宿主读消息失败 / 超时 / 坏数据）都记日志后放行（照常交付）。
+        """
+        if self._host is None:
+            return False
+        try:
+            task = self._tasks.get(task_id) or {}
+            request_id = str(task.get("request_id") or "").strip()
+            if not request_id:
+                return False
+            row = self._store.read().execute(
+                "SELECT message_id, quote, created FROM requests WHERE id=?", (request_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            request_mid = str(row["message_id"] or "").strip()
+            if not request_mid:
+                return False
+            created = float(row["created"] or 0.0)
+            session_id = await self._host.session_for_group(gid)
+            if not session_id:
+                return False
+            msgs = await self._host.messages(
+                session_id,
+                start=created - _MAIBOT_LOOKBACK_S,
+                end=clock.now(),
+                limit=200,
+            )
+            if not msgs:
+                return False
+            # MaiBot 存的原文里带着被引用的原话，判「够不够实质」时先抠掉。
+            originals = [str(row["quote"] or "").strip()]
+            for m in msgs:
+                if str(getattr(m, "id", "") or "") == request_mid:
+                    originals.append(str(getattr(m, "text", "") or "").strip())
+            originals = [t for t in originals if t]
+            own = self._own_sent_message_ids(gid)
+            need = max(_MAIBOT_REPLY_MIN, int(max(0, our_len)) // 2)
+            for m in msgs:
+                if not bool(getattr(m, "is_bot", False)):
+                    continue
+                if str(getattr(m, "reply_to", "") or "").strip() != request_mid:
+                    continue
+                mid = str(getattr(m, "id", "") or "").strip()
+                if not mid or mid in own:
+                    continue
+                text = str(getattr(m, "text", "") or "")
+                for original in originals:
+                    text = text.replace(original, "")
+                if len(text.strip()) >= need:
+                    logger.info(
+                        "任务 %s：MaiBot 已经引用回复过这条需求（消息 %s）", task_id, mid
+                    )
+                    return True
+            return False
+        except Exception:
+            logger.exception("判断 MaiBot 是否已回过出错（任务 %s），照常交付", task_id)
+            return False
 
     # ------------------------------------------------------------------
     # 任务双岗协作：干活 lane（docs/20 §5.3 / §六）

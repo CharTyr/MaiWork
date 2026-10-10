@@ -40,6 +40,7 @@ from CharTyr_MaiWork.maiwork.tasks import Tasks
 from CharTyr_MaiWork.maiwork.tools import Tool, ToolContext, ToolResult, Tools
 from CharTyr_MaiWork.maiwork.tools_exec import register_exec_tools
 from CharTyr_MaiWork.maiwork.workers import WorkerReport
+from fakes import write_text_reply
 
 pytestmark = pytest.mark.asyncio
 
@@ -133,10 +134,19 @@ def _coord(
     return coord
 
 
-def _create_task(tasks: Tasks, *, title="整理", req="做一页总结", criteria=(), **kw) -> str:
+def _create_task(tasks: Tasks, *, title="整理", req="做一页总结", criteria=(),
+                 reply="（正文）", **kw) -> str:
+    """建测试任务；顺手把 text 活的成品正文写进 reply.md（线上 T-13，见 tests/fakes.py）。
+
+    这个文件（和引用它的用例）的计划缺省 deliver_kind="text"，不写正文会被验收改判不通过。
+    需要「没有 reply.md」的用例显式传 `reply=None`。
+    """
     kwargs = {"title": title, "req": req, "criteria": list(criteria), "source": "test"}
     kwargs.update(kw)
-    return tasks.create(GID, **kwargs)
+    tid = tasks.create(GID, **kwargs)
+    if reply is not None:
+        write_text_reply(tasks, tid, str(reply))
+    return tid
 
 
 def _plan_json(jobs, *, criteria=None, deliver_kind="text", question=None, requirements=None) -> str:

@@ -257,7 +257,9 @@ async def test_review_prompt_note_field_spec_is_human(mem_store, settings, env, 
 
 async def test_handle_passed_empty_note_delivers_human_line(mem_store, settings, env, tools,
                                                             tasks, goals):
-    tid = _create_task(tasks, title="韩国银行AI攻击事件", req="搜搜")
+    # 线上 T-13 起 text 活先发 reply.md 原文；这条测的是「没有正文 → 回落只发交付说明」
+    # 那条路（note 为空时的兜底措辞），所以显式不要 reply.md。
+    tid = _create_task(tasks, title="韩国银行AI攻击事件", req="搜搜", reply=None)
     tasks.transition(tid, "running")
     tasks.transition(tid, "reviewing")
     outbox = FakeOutbox()

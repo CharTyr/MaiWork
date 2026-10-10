@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -34,6 +35,7 @@ from CharTyr_MaiWork.maiwork.tasks import Tasks
 from CharTyr_MaiWork.maiwork.tools import Tool, ToolContext, ToolResult, Tools
 from CharTyr_MaiWork.maiwork.tools_exec import register_exec_tools
 from CharTyr_MaiWork.maiwork.workers import WorkerReport
+from fakes import write_text_reply
 
 pytestmark = pytest.mark.asyncio
 
@@ -243,6 +245,7 @@ def _build(
     workers: FakeWorkers,
     delivery: FakeDelivery | None = None,
     outbox: FakeOutbox | None = None,
+    host: Any = None,
 ) -> Coordinator:
     delivery = delivery or FakeDelivery()
     outbox = outbox or FakeOutbox()
@@ -284,13 +287,26 @@ def _build(
         env,
         _Profiles(),
         lambda: settings,
+        host=host,
     )
 
 
-def _create_task(tasks: Tasks, *, title="整理", req="做一页总结", criteria=(), **kw) -> str:
+def _create_task(tasks: Tasks, *, title="整理", req="做一页总结", criteria=(),
+                 reply="（正文）", **kw) -> str:
+    """建一个测试任务；顺手把 text 活的成品正文写进 reply.md。
+
+    线上 T-13（2026-10-10）起，deliver_kind="text" 的成品固定是工作区
+    `artifacts/<任务>/reply.md` 里的回复原文（`coordinator.TEXT_REPLY_NAME`），验收只认这个
+    文件。很多老用例用 text 当「随便哪种交付」（图省事不写任何成品），现在不写正文就会被
+    验收改判不通过、多跑一轮。这里在**建任务时**就把正文写上，等价于子 agent 写出了成品；
+    需要「没有 reply.md」的用例显式传 `reply=None`。
+    """
     kwargs = {"title": title, "req": req, "criteria": list(criteria), "source": "test"}
     kwargs.update(kw)
-    return tasks.create(GID, **kwargs)
+    tid = tasks.create(GID, **kwargs)
+    if reply is not None:
+        write_text_reply(tasks, tid, str(reply))
+    return tid
 
 
 def _plan(criteria=None, deliver_kind="view", jobs=None, question=None) -> str:

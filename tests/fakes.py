@@ -381,6 +381,27 @@ FakeHost.proactive_trigger = _fake_host_proactive_trigger
 FakeHost.config = _fake_host_config
 
 
+def write_text_reply(tasks: Any, tid: str, text: str = "（正文）") -> bool:
+    """给任务写 text 活的成品正文 `artifacts/<任务>/reply.md`（线上 T-13，2026-10-10）。
+
+    `deliver_kind="text"` 的成品固定是这个文件（`coordinator.TEXT_REPLY_NAME`），验收只认它。
+    测试建任务时顺手写上，等价于子 agent 交回了正文；需要「没有 reply.md / 空 reply.md」
+    的用例不要调它（或自己覆盖 / 删掉）。写不出来返回 False，不抛。
+    """
+    from pathlib import Path
+
+    try:
+        settings = tasks._get_settings()
+        root = Path(settings.environments.workspace_root)
+        ws_name = str(tasks.get(tid)["workspace"])
+        path = root / ws_name / "artifacts" / str(tid) / "reply.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(text), encoding="utf-8")
+    except Exception:
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # app.py / console M2 接线测试用（2026-10 追加，只加不改）：FakeFeeds / FakeScheduler
 # ---------------------------------------------------------------------------

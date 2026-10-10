@@ -222,6 +222,43 @@ def _note_fallback(task_title: Any, deliver_kind: Any = "view") -> str:
     return f"{title}{suffix}"
 
 
+_TEXT_REPLY_NAME = "reply.md"
+# 和 coordinator 的 TEXT_REPLY_MAX 同一套口径（本地重复一份，不 import coordinator）：
+# 超过这个字数的回复原文当群文件发，不当聊天消息发。
+_TEXT_REPLY_MAX = 1500
+
+
+def _read_text_reply(task: Any, tid: str, env: Any, settings: Any) -> str:
+    """text 活的回复原文（`artifacts/<任务>/reply.md`，线上 T-13）。
+
+    读不出 / env 拿不到 / 空 / 超 1500 字 → 返回 ""（调用方照旧发兜底说明）。
+    路径闸和下面 file / view 一样的口径：只在**本任务成品目录**里，符号链接不算。
+    """
+    if env is None:
+        return ""
+    try:
+        ws_name = str(task["workspace"] or settings.workspace_of(str(task["group_id"])))
+        ws = env.workspace(ws_name)
+        path = env.resolve(ws_name, f"artifacts/{tid}/{_TEXT_REPLY_NAME}")
+    except (KeyError, ValueError, OSError):
+        return ""
+    base = ws / "artifacts" / tid
+    try:
+        real = Path(path).resolve()
+        real_base = Path(base).resolve()
+    except OSError:
+        return ""
+    if real != real_base and real_base not in real.parents:
+        return ""
+    try:
+        if Path(path).is_symlink() or not Path(path).is_file():
+            return ""
+        text = Path(path).read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    return text if 0 < len(text) <= _TEXT_REPLY_MAX else ""
+
+
 def _mobile_delivery_page(*, title: str, note: str, name: str,
                           size: Optional[int], href: str) -> str:
     """现生成的手机友好回落页：标题 / 说明 / 文件名+大小 / 醒目下载按钮。
@@ -1723,9 +1760,14 @@ class Delivery:
         # 兜底措辞和 coordinator 的交付说明同一套（本地 _note_fallback，不 import coordinator）
         note = _note_fallback(task["title"], kind)
         if kind == "text":
+            # 线上 T-13（2026-10-10）：直接回文字的活，成品是 artifacts/<任务>/reply.md
+            # 里的回复原文（coordinator 的 TEXT_REPLY_NAME / TEXT_REPLY_MAX 同一套口径，
+            # 这里按老规矩本地重复一份常量，不 import coordinator）。补发时优先发原文；
+            # 读不到 / 空的 / 超 1500 字 / 路径不对 → 照旧只发兜底说明，绝不报错。
+            reply = _read_text_reply(task, tid, env, settings)
             self._outbox.enqueue(
                 f"task:{tid}:deliver:text", gid, "text",
-                {"text": note, "push_kind": "delivery"}, task_id=tid,
+                {"text": reply or note, "push_kind": "delivery"}, task_id=tid,
             )
             return True
         if kind not in ("file", "view"):
