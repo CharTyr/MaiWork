@@ -521,6 +521,21 @@ class Approvals:
         row = self._get(_norm(request_id))
         return str(row["group_id"]) if row is not None else None
 
+    def by_message(self, group_id: str, message_id: str) -> dict | None:
+        """这条群消息已经建过的请求行；没有 → None。
+
+        `/mw do` 用来去重（热重载会把同一条消息再送一遍，不能再建第二条请求）。
+        """
+        gid, mid = _norm(group_id), _norm(message_id)
+        if not gid or not mid:
+            return None
+        row = self._store.read().execute(
+            "SELECT * FROM requests WHERE group_id=? AND message_id=?"
+            " ORDER BY created ASC, id ASC LIMIT 1",
+            (gid, mid),
+        ).fetchone()
+        return {k: row[k] for k in row.keys()} if row is not None else None
+
     # ------------------------------------------------------------------
     # 网页视图（docs/07 §9.3 tasks.pending）
     # ------------------------------------------------------------------

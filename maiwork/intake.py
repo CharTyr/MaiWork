@@ -59,6 +59,12 @@ def _is_command(text: str) -> bool:
     t = str(text or "").lstrip()
     return bool(t) and t.startswith(("/", "／", "!", "！", "#"))
 
+
+def _reply_to_of(message: dict) -> str:
+    """这条消息引用了哪条：顶层 reply_to 优先，再解析 raw_message（CQ 串 / 消息段列表）。"""
+    return str(message.get("reply_to") or "").strip() or _parse_reply_to(message.get("raw_message"))
+
+
 # Jev 选择题（选项文字按任务书原文，别随手改——判准是拿它喂的）
 _AT_QUESTIONS: Dict[str, Any] = {
     "kind": {
@@ -293,11 +299,14 @@ class Intake:
                 key=f"cmd-note:{message_id}",
                 ttl_s=_COMMAND_MENTION_TTL_S,
             )
-            _spawn_safely(self._spawn, self._run_command(group_id, user_id, user_name, text, message_id))
+            _spawn_safely(
+                self._spawn,
+                self._run_command(group_id, user_id, user_name, text, message_id, _reply_to_of(message)),
+            )
             return
         # 2.5) 回复 / 引用了 MaiWork 发的资讯卡片 → 记一次自动好评（news_feedback；卡片清单 60 秒缓存）
         if self._store is not None:
-            reply_to = str(message.get("reply_to") or "").strip() or _parse_reply_to(message.get("raw_message"))
+            reply_to = _reply_to_of(message)
             if reply_to:
                 at = _ts_of(message.get("timestamp")) or clock.now()
                 self._card_index.on_message(self._store, group_id, user_id, message_id, reply_to, at)
@@ -310,12 +319,14 @@ class Intake:
         if (bool(message.get("is_at")) or bool(message.get("is_mentioned"))) and not _is_command(text):
             await self._handle_at(settings, group_id, user_id, user_name, message_id, text, context)
 
-    async def _run_command(self, group_id: str, user_id: str, user_name: str, text: str, message_id: str) -> None:
+    async def _run_command(
+        self, group_id: str, user_id: str, user_name: str, text: str, message_id: str, reply_to: str = ""
+    ) -> None:
         commands = self._commands
         if commands is None:
             return
         try:
-            await commands.handle(group_id, user_id, user_name, text, message_id)
+            await commands.handle(group_id, user_id, user_name, text, message_id, reply_to=reply_to)
         except Exception:
             logger.exception("/mw 指令处理协程出错（群 %s）", group_id)
 

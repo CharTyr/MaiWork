@@ -50,7 +50,7 @@
 | `tasks.token_limit` | int | `2000000` | 单任务 token 上限，到了自动暂停 |
 | `tasks.run_seconds` | int | `10800` | 单任务时长上限（秒） |
 
-> 「派的活要不要批准 / 谁能批本群的活（含免批）」0.8.0 起**每个群自己一份**，在网页「群」页的「谁能批本群的活」里改；旧 `approval.required` / `approval.admins` / `approval.exempt_*` 只作新群第一次的迁移种子。`/mw 批准` 认的就是本群这一份名单。
+> 「派的活要不要批准 / 谁能批本群的活（含免批）」0.8.0 起**每个群自己一份**，在网页「群」页的「谁能批本群的活」里改；旧 `approval.required` / `approval.admins` / `approval.exempt_*` 只作新群第一次的迁移种子。`/mw 批准` 认的就是本群这一份名单。群友在群里发 `/mw do 要做的事` 直接派的活，走的也是这一份名单。
 
 ### 模型
 

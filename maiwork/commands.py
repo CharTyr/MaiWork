@@ -9,6 +9,9 @@
 指令表（02 §5.3）：
 - /mw            任何人：本群进行中的目标、任务、待批请求（简短，各最多 5 条）
 - /mw 网页       任何人：本群网页链接（没配 public_url 就回「网页还没公开，找管理员要」）
+- /mw do 要做的事 任何人（别名 /mw 做）：**不问 Jev、不调模型**，直接记一条待批请求，之后
+  走正常批准流程（免批直接开工）。引用一条消息再发就用被引用的正文当要做的事，后面的话算
+  发起人的补充说明；请求的 message_id 就是这条 /mw do 自己的消息（收图靠它，见 coordinator）。
 - /mw 批准 [ID]  本群批准人（`kv["group_approval.<群号>"].approvers`，含全局管理员从旧
   名单种进来的那份）：批准**本群**的待批请求；不带 ID 时本群只有一个待批直接处理，多个列出
   让人选；请求属于别的群一律拒（群命令只管本群，bot 管理员也不例外）
@@ -25,14 +28,24 @@ import re
 from typing import Any, Callable
 
 from . import clock
+from .intake import _TITLE_MAX  # 标题上限和 @ 派活同一个口径
 
 logger = logging.getLogger("maiwork.commands")
 
 _USAGE = (
     "MaiWork 指令：/mw 看进度；/mw 网页 拿本群网页链接；"
+    "/mw do 要做的事（或引用一条消息再发 /mw do）派活；"
     "/mw 领取 T-任务号 当场取成品；/mw 批准 [ID]、/mw 拒绝 [ID]（本群批准人）；"
     "/mw 取消 [ID]（发起人 / 群管理 / 本群批准人）"
 )
+
+# `/mw do` 的两种写法（别名「做」只在代码里认，文档只写 do）
+_DO_SUBS = ("do", "做")
+_DO_RE = re.compile(r"^\s*/mw\s+(?:do|做)\s*")
+_DO_EMPTY = "把要做的事写在后面，例如 /mw do 整理一份开黑语音排障步骤；也可以引用一条消息再发 /mw do"
+_DO_VIA = "群里 /mw do 指令"
+_QUOTE_MAX = 2000          # 引用来的正文最多留这么多字
+_QUOTE_TIMEOUT_S = 5.0     # 取被引用消息的超时（宿主慢就当没引用）
 
 _ID_PREFIX_KIND = {"T": "task", "G": "goal", "M": "goal"}
 
@@ -50,6 +63,12 @@ _TASK_STATUS_ZH = {
 }
 
 _GOAL_STATE_ZH = {"active": "进行中", "paused": "已暂停", "done": "已完成", "cancelled": "已取消"}
+
+
+def _do_text(raw: str) -> str:
+    """「/mw do 要做的事」后面那截原文（保留原有空格 / 换行，只去首尾空白）。"""
+    m = _DO_RE.match(str(raw or ""))
+    return str(raw)[m.end():].strip() if m else ""
 
 
 class Commands:
@@ -88,7 +107,15 @@ class Commands:
     # 入口
     # ------------------------------------------------------------------
 
-    async def handle(self, group_id: str, user_id: str, user_name: str, text: str, message_id: str) -> None:
+    async def handle(
+        self,
+        group_id: str,
+        user_id: str,
+        user_name: str,
+        text: str,
+        message_id: str,
+        reply_to: str = "",
+    ) -> None:
         gid = str(group_id)
         message_id_s = str(message_id or "")
         try:
@@ -97,8 +124,17 @@ class Commands:
         except Exception:
             return
         try:
-            parts = (str(text or "")).strip().split()
-            reply = await self._dispatch(gid, str(user_id or ""), str(user_name or ""), parts)
+            raw = str(text or "").strip()
+            parts = raw.split()
+            reply = await self._dispatch(
+                gid,
+                str(user_id or ""),
+                str(user_name or ""),
+                parts,
+                raw=raw,
+                message_id=message_id_s,
+                reply_to=str(reply_to or ""),
+            )
         except Exception:
             logger.exception("/mw 指令处理出错（群 %s，消息 %s）", gid, message_id_s)
             reply = "这条指令处理出错了，日志里有；admin 可以到网页上看"
@@ -121,11 +157,23 @@ class Commands:
     # 分发
     # ------------------------------------------------------------------
 
-    async def _dispatch(self, gid: str, user_id: str, user_name: str, parts: list[str]) -> str:
+    async def _dispatch(
+        self,
+        gid: str,
+        user_id: str,
+        user_name: str,
+        parts: list[str],
+        *,
+        raw: str = "",
+        message_id: str = "",
+        reply_to: str = "",
+    ) -> str:
         if len(parts) <= 1:
             return self._status(gid)
         sub = parts[1]
         arg = parts[2] if len(parts) > 2 else ""
+        if sub in _DO_SUBS:
+            return await self._do(gid, user_id, user_name, raw, message_id, reply_to)
         if sub == "网页":
             return self._web(gid)
         if sub in ("批准", "通过"):
@@ -137,6 +185,80 @@ class Commands:
         if sub == "领取":
             return self._claim_delivery(gid, arg)
         return _USAGE
+
+    # ------------------------------------------------------------------
+    # /mw do 要做的事：直接派活（不问 Jev、不调模型），引用一条消息就用它的正文
+    # ------------------------------------------------------------------
+
+    async def _do(
+        self, gid: str, user_id: str, user_name: str, raw: str, message_id: str, reply_to: str
+    ) -> str:
+        try:
+            existing = self._approvals.by_message(gid, message_id)
+        except Exception:
+            logger.exception("/mw do 查重失败（群 %s，消息 %s）", gid, message_id)
+            existing = None
+        if existing:
+            return self._do_existing(existing)
+        extra = _do_text(raw)
+        quoted = await self._quote_text(reply_to)
+        if not extra and not quoted:
+            return _DO_EMPTY
+        job = quoted or extra
+        body = f"{quoted}\n\n{extra}" if (quoted and extra) else job
+        res = self._approvals.create(
+            gid,
+            kind="task",
+            title=" ".join(job.split())[:_TITLE_MAX],
+            quote=body,
+            via=_DO_VIA,
+            requester_id=user_id,
+            requester_name=user_name,
+            message_id=message_id,   # 这条 /mw do 自己的消息：收图时靠它拿到引用的那条
+            screen=False,            # 明确指令，不过「类似的被拒多了就不再收」
+        )
+        if not isinstance(res, dict) or not str(res.get("id") or ""):
+            raise RuntimeError("approvals.create 没给出请求 id")
+        if str(res.get("status") or "") == "pending":
+            return f"收到，{res['id']} 等管理员批准，批准后开工"
+        tids = [str(t) for t in (res.get("task_ids") or []) if str(t)]
+        tid = str(res.get("task_id") or "")
+        if tid and tid not in tids:
+            tids.insert(0, tid)
+        for one in tids:
+            self._start_task(one)  # 和 /mw 批准 同一条开工路
+        if tids:
+            return f"收到，已开工（{'、'.join(tids)}）"
+        return f"收到，{res['id']} 已批准"
+
+    @staticmethod
+    def _do_existing(row: dict) -> str:
+        """同一条消息已经派过（热重载重放）：报已有那条，不再建第二条。"""
+        rid = str(row.get("id") or "")
+        status = str(row.get("status") or "")
+        if status == "pending":
+            return f"收到，{rid} 等管理员批准，批准后开工"
+        if status == "approved":
+            tid = str(row.get("task_id") or "")
+            return f"收到，已开工（{tid}）" if tid else f"收到，{rid} 已批准"
+        return f"这条消息已经派过一次（{rid}），不重复建"
+
+    async def _quote_text(self, reply_to: str) -> str:
+        """被引用那条消息的正文；宿主取不到 / 出错 / 超时 → 空串（当没引用）。"""
+        mid = str(reply_to or "").strip()
+        if not mid or self._host is None:
+            return ""
+        try:
+            msg = await asyncio.wait_for(
+                self._host.message_by_id(mid, _timeout_s=_QUOTE_TIMEOUT_S),
+                timeout=_QUOTE_TIMEOUT_S,
+            )
+        except Exception:
+            logger.warning("/mw do 取被引用消息失败（%s），当作没写正文", mid)
+            return ""
+        if not isinstance(msg, dict):
+            return ""
+        return str(msg.get("processed_plain_text") or "").strip()[:_QUOTE_MAX]
 
     def _claim_delivery(self, gid: str, task_id: str) -> str:
         """只有明确索取本群指定任务的这条指令能升级待发交付。"""

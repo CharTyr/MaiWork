@@ -74,9 +74,18 @@ class _FakeCommands:
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    async def handle(self, group_id: str, user_id: str, user_name: str, text: str, message_id: str) -> None:
+    async def handle(
+        self, group_id: str, user_id: str, user_name: str, text: str, message_id: str, reply_to: str = ""
+    ) -> None:
         self.calls.append(
-            {"group_id": group_id, "user_id": user_id, "user_name": user_name, "text": text, "message_id": message_id}
+            {
+                "group_id": group_id,
+                "user_id": user_id,
+                "user_name": user_name,
+                "text": text,
+                "message_id": message_id,
+                "reply_to": reply_to,
+            }
         )
 
 
@@ -392,6 +401,28 @@ class TestMwCommand:
         out = await intake.handle(hook_message(text="/mw"))
         assert out == {"action": "continue"}
         await _drain(spawned)  # 不炸
+
+    @pytest.mark.asyncio
+    async def test_reply_to_field_passed_through(self) -> None:
+        """`/mw do` 引用了谁 → 原样交给 commands（引用正文要按这个 id 去取）。"""
+        commands = _FakeCommands()
+        intake, signals, spawned = _make(commands=commands)
+        kwargs = hook_message(user_id="20002", text="/mw do")
+        kwargs["message"]["reply_to"] = "m-quoted"
+        await intake.handle(kwargs)
+        await _drain(spawned)
+        assert commands.calls[0]["reply_to"] == "m-quoted"
+
+    @pytest.mark.asyncio
+    async def test_reply_to_parsed_from_raw_cq_reply(self) -> None:
+        """老消息只有 raw_message 里的 [CQ:reply,id=…] → 也认出来。"""
+        commands = _FakeCommands()
+        intake, signals, spawned = _make(commands=commands)
+        kwargs = hook_message(user_id="20002", text="/mw do")
+        kwargs["message"]["raw_message"] = "[CQ:reply,id=777888] [CQ:text,text=/mw do]"
+        await intake.handle(kwargs)
+        await _drain(spawned)
+        assert commands.calls[0]["reply_to"] == "777888"
 
 
 # ----------------------------------------------------------------------
