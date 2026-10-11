@@ -8,16 +8,21 @@
 
 指令表（02 §5.3）：
 - /mw            任何人：本群进行中的目标、任务、待批请求（简短，各最多 5 条）
-- /mw 网页       任何人：本群网页链接（没配 public_url 就回「网页还没公开，找管理员要」）
 - /mw do 要做的事 任何人（别名 /mw 做）：**不问 Jev、不调模型**，直接记一条待批请求，之后
   走正常批准流程（免批直接开工）。引用一条消息再发就用被引用的正文当要做的事，后面的话算
   发起人的补充说明；请求的 message_id 就是这条 /mw do 自己的消息（收图靠它，见 coordinator）。
+- /mw 领取 T-x  本群任何人：明确当场索取已完成且待发的成品（不重复传已发/不确定的文件）
+- /mw 网页       任何人：本群网页链接（没配 public_url 就回「网页还没公开，找管理员要」）
+- /mw 帮助       任何人（别名 help / ? / ？）：全部指令一张表（`HELP_ITEMS`，唯一来源）
 - /mw 批准 [ID]  本群批准人（`kv["group_approval.<群号>"].approvers`，含全局管理员从旧
   名单种进来的那份）：批准**本群**的待批请求；不带 ID 时本群只有一个待批直接处理，多个列出
   让人选；请求属于别的群一律拒（群命令只管本群，bot 管理员也不例外）
 - /mw 拒绝 [ID]  同上
 - /mw 取消 [ID]  发起人 / 群主 / 群管理 / 本群批准人：取消任务（T-）、agent 目标（G-）、提醒（M-）
-- /mw 领取 T-x  本群任何人：明确当场索取已完成且待发的成品（不重复传已发/不确定的文件）
+
+群友不会用就给提示：回复里顺手带下一步（状态末句、do 回批准 / 取消怎么发、批准回「发 /mw 看进度」）；
+未知子命令回一句短提示；那截文字看着像派活（和 @ 派活同一份请求词表）就给一行能直接照抄的
+「/mw do …」，**不建请求**。全部固定文本，不调模型。
 """
 
 from __future__ import annotations
@@ -29,20 +34,99 @@ from typing import Any, Callable
 
 from . import clock
 from .intake import _TITLE_MAX  # 标题上限和 @ 派活同一个口径
+from .quick_judge import has_request_cue  # 「看着像派活」的请求词表只有这一份
 
 logger = logging.getLogger("maiwork.commands")
 
-_USAGE = (
-    "MaiWork 指令：/mw 看进度；/mw 网页 拿本群网页链接；"
-    "/mw do 要做的事（或引用一条消息再发 /mw do）派活；"
-    "/mw 领取 T-任务号 当场取成品；/mw 批准 [ID]、/mw 拒绝 [ID]（本群批准人）；"
-    "/mw 取消 [ID]（发起人 / 群管理 / 本群批准人）"
+# ----------------------------------------------------------------------
+# 指令表（唯一来源）：/mw 帮助、未知子命令的短提示、网页群视图的 commands 都从它来
+# ----------------------------------------------------------------------
+
+HELP_ITEMS: tuple[dict[str, str], ...] = (
+    {"who": "所有人", "syntax": "/mw", "example": "", "desc": "看本群进度（目标、任务、待批）"},
+    {
+        "who": "所有人",
+        "syntax": "/mw do 要做的事",
+        "example": "/mw do 整理一份开黑语音排障步骤",
+        "desc": "派活；也可以引用一条消息再发 /mw do",
+    },
+    {"who": "所有人", "syntax": "/mw 领取 T-任务号", "example": "/mw 领取 T-8", "desc": "取做好的成品"},
+    {"who": "所有人", "syntax": "/mw 网页", "example": "", "desc": "拿本群网页链接"},
+    {"who": "所有人", "syntax": "/mw 帮助", "example": "", "desc": "看这份说明"},
+    {"who": "批准人", "syntax": "/mw 批准 [ID]", "example": "/mw 批准 R-12", "desc": "批准开工"},
+    {"who": "批准人", "syntax": "/mw 拒绝 [ID]", "example": "/mw 拒绝 R-12", "desc": "不批这条"},
+    {
+        "who": "发起人 / 群管理 / 批准人",
+        "syntax": "/mw 取消 [ID]",
+        "example": "/mw 取消 T-8",
+        "desc": "取消任务 / 提醒（发起人、群管理、批准人都能发）",
+    },
 )
+
+# `/mw 帮助` 的别名（中文、英文、问号两种写法）
+_HELP_ALIASES = ("帮助", "help", "?", "？")
+_HELP_TITLE = "MaiWork 群指令："
+_HELP_GROUP_ALL = "大家都能用："
+_HELP_GROUP_APPROVER = "批准人："
+# 短提示里点名的三条常用：(表里的写法, 一句话)——写法都从表里取，不另写一份指令名
+_HELP_BY_SYNTAX = {it["syntax"]: it for it in HELP_ITEMS}
+_USAGE_HEADS = (("/mw", "看进度"), ("/mw do 要做的事", "派活"))
+_USAGE_TAIL = "/mw 帮助"
+# 「要派活请这样发」里原话最多留这么多字（QQ 消息，别太长）
+_HINT_MAX = 100
+
+
+def _help_line(item: dict[str, str]) -> str:
+    line = f"{item['syntax']} — {item['desc']}"
+    return f"{line}，例：{item['example']}" if item.get("example") else line
+
+
+def help_text() -> str:
+    """`/mw 帮助` 的整段回复：从 HELP_ITEMS 生成，按「谁能用」分两组。"""
+    out = [_HELP_TITLE, _HELP_GROUP_ALL]
+    out += [f"· {_help_line(it)}" for it in HELP_ITEMS if it["who"] == "所有人"]
+    out.append(_HELP_GROUP_APPROVER)
+    out += [f"· {_help_line(it)}" for it in HELP_ITEMS if it["who"] != "所有人"]
+    return "\n".join(out)
+
+
+def usage_text(sub: str) -> str:
+    """未知子命令的短提示：三条常用（写法取自指令表），完整清单在 /mw 帮助。"""
+    heads = "；".join(f"{_HELP_BY_SYNTAX[s]['syntax']} {word}" for s, word in _USAGE_HEADS)
+    return f"没有「{sub}」这个指令。常用：{heads}；全部指令发 {_HELP_BY_SYNTAX[_USAGE_TAIL]['syntax']}"
+
+
+def do_hint(rest: str) -> str:
+    """看着像派活但没写 do：给一行能直接照抄的 /mw do（只提示，不建请求）。"""
+    return f"要派活请这样发：\n/mw do {str(rest or '').strip()[:_HINT_MAX]}"
+
+
+def _rest_after_head(raw: str) -> str:
+    """`/mw` 后面那截原文（保留原有空格和换行，只去首尾空白）。"""
+    parts = str(raw or "").split(None, 1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+def _pending_reply(rid: str) -> str:
+    """待批的统一回法：告诉批准人怎么一句话开工。"""
+    return f"收到，{rid} 等管理员批准；批准人发 /mw 批准 {rid} 就开工"
+
+
+def _started_reply(task_ids: str) -> str:
+    """开工的统一回法：去哪看进度、怎么取消（用第一个任务号举例）。"""
+    first = str(task_ids).split("、")[0]
+    return f"收到，已开工（{task_ids}）；发 /mw 看进度，/mw 取消 {first} 可以取消"
+
 
 # `/mw do` 的两种写法（别名「做」只在代码里认，文档只写 do）
 _DO_SUBS = ("do", "做")
 _DO_RE = re.compile(r"^\s*/mw\s+(?:do|做)\s*")
-_DO_EMPTY = "把要做的事写在后面，例如 /mw do 整理一份开黑语音排障步骤；也可以引用一条消息再发 /mw do"
+_DO_EMPTY = (
+    "把要做的事写在后面，例如 /mw do 整理一份开黑语音排障步骤；"
+    "也可以引用一条消息再发 /mw do；全部指令发 /mw 帮助"
+)
+_STATUS_HINT = "派活发 /mw do 要做的事；全部指令发 /mw 帮助"
+
 _DO_VIA = "群里 /mw do 指令"
 _QUOTE_MAX = 2000          # 引用来的正文最多留这么多字
 _QUOTE_TIMEOUT_S = 5.0     # 取被引用消息的超时（宿主慢就当没引用）
@@ -176,6 +260,8 @@ class Commands:
             return await self._do(gid, user_id, user_name, raw, message_id, reply_to)
         if sub == "网页":
             return self._web(gid)
+        if sub in _HELP_ALIASES:
+            return help_text()
         if sub in ("批准", "通过"):
             return await self._decide(gid, user_id, arg, op="approve")
         if sub == "拒绝":
@@ -184,7 +270,9 @@ class Commands:
             return await self._cancel(gid, user_id, arg)
         if sub == "领取":
             return self._claim_delivery(gid, arg)
-        return _USAGE
+        # 不认的子命令：看着像派活（和 @ 派活同一份请求词表）就给一行能照抄的 /mw do
+        rest = _rest_after_head(raw)
+        return do_hint(rest) if has_request_cue(rest) else usage_text(sub)
 
     # ------------------------------------------------------------------
     # /mw do 要做的事：直接派活（不问 Jev、不调模型），引用一条消息就用它的正文
@@ -220,7 +308,7 @@ class Commands:
         if not isinstance(res, dict) or not str(res.get("id") or ""):
             raise RuntimeError("approvals.create 没给出请求 id")
         if str(res.get("status") or "") == "pending":
-            return f"收到，{res['id']} 等管理员批准，批准后开工"
+            return _pending_reply(str(res["id"]))
         tids = [str(t) for t in (res.get("task_ids") or []) if str(t)]
         tid = str(res.get("task_id") or "")
         if tid and tid not in tids:
@@ -228,7 +316,7 @@ class Commands:
         for one in tids:
             self._start_task(one)  # 和 /mw 批准 同一条开工路
         if tids:
-            return f"收到，已开工（{'、'.join(tids)}）"
+            return _started_reply("、".join(tids))
         return f"收到，{res['id']} 已批准"
 
     @staticmethod
@@ -237,10 +325,10 @@ class Commands:
         rid = str(row.get("id") or "")
         status = str(row.get("status") or "")
         if status == "pending":
-            return f"收到，{rid} 等管理员批准，批准后开工"
+            return _pending_reply(rid)
         if status == "approved":
             tid = str(row.get("task_id") or "")
-            return f"收到，已开工（{tid}）" if tid else f"收到，{rid} 已批准"
+            return _started_reply(tid) if tid else f"收到，{rid} 已批准"
         return f"这条消息已经派过一次（{rid}），不重复建"
 
     async def _quote_text(self, reply_to: str) -> str:
@@ -322,6 +410,7 @@ class Commands:
         lines += self._section("进行中的目标", goal_items)
         lines += self._section("任务", task_items)
         lines += self._section("待批", pending_items)
+        lines.append(_STATUS_HINT)  # 顺手告诉群友怎么派活、去哪看全部指令
         return "\n".join(lines)
 
     @staticmethod
@@ -425,7 +514,7 @@ class Commands:
         if tids:
             for one in tids:
                 self._start_task(one)
-            return f"已批准 {rid_s}，任务 {'、'.join(tids)} 这就开工"
+            return f"已批准 {rid_s}，已开工（{'、'.join(tids)}）；发 /mw 看进度"
         if goal_id:
             return f"已批准 {rid_s}，目标 {goal_id} 记下了，会定期检查"
         return f"已批准 {rid_s}"

@@ -13,7 +13,7 @@ import pytest
 from fakes import FakeCoordinator, FakeHost
 
 from CharTyr_MaiWork.maiwork.approvals import Approvals
-from CharTyr_MaiWork.maiwork.commands import Commands
+from CharTyr_MaiWork.maiwork.commands import HELP_ITEMS, Commands, help_text, usage_text
 from CharTyr_MaiWork.maiwork.config import load_settings
 from CharTyr_MaiWork.maiwork.goals import Goals
 from CharTyr_MaiWork.maiwork.store import Store
@@ -131,6 +131,13 @@ class TestBareMw:
         reply = await env.say("/mw")
         assert "共 7 件" in reply
 
+    @pytest.mark.asyncio
+    async def test_status_ends_with_next_step_hint(self, tmp_path: Path) -> None:
+        """状态最后一句告诉群友怎么派活、怎么找全部指令。"""
+        env = _env(tmp_path)
+        reply = await env.say("/mw")
+        assert reply.splitlines()[-1] == "派活发 /mw do 要做的事；全部指令发 /mw 帮助"
+
 
 # ----------------------------------------------------------------------
 # /mw 网页
@@ -181,6 +188,7 @@ class TestDecide:
         req = _request(env)
         reply = await env.say("/mw 批准", user=ADMIN)
         assert "开工" in reply
+        assert "发 /mw 看进度" in reply  # 顺手告诉批准人去哪看进展
         task_id = started[0] if started else None
         assert task_id is not None and task_id.startswith("T-")
         assert task_id in reply
@@ -338,7 +346,8 @@ class TestReplyShape:
     async def test_unknown_subcommand_shows_usage(self, tmp_path: Path) -> None:
         env = _env(tmp_path)
         reply = await env.say("/mw 拍脑袋")
-        assert "MaiWork 指令" in reply
+        assert reply.startswith("没有「拍脑袋」这个指令")
+        assert "/mw 帮助" in reply and "/mw do" in reply
 
     @pytest.mark.asyncio
     async def test_reply_has_reply_to_and_command_push_kind(self, tmp_path: Path) -> None:
@@ -432,3 +441,76 @@ class TestApproveIdeaItems:
         assert "目标 G-1" in reply
         assert started == []
         assert env.goals.get("G-1")["title"] == "每周更新铝价"
+
+
+# ----------------------------------------------------------------------
+# /mw 帮助：整段回复由 commands.HELP_ITEMS 这一张表生成
+# ----------------------------------------------------------------------
+
+
+class TestHelp:
+    @pytest.mark.asyncio
+    async def test_help_aliases_reply_the_same_text(self, tmp_path: Path) -> None:
+        env = _env(tmp_path)
+        for i, alias in enumerate(("帮助", "help", "?", "？")):
+            reply = await env.say(f"/mw {alias}", message_id=f"m-help-{i}")
+            assert reply == help_text()
+
+    def test_help_text_is_grouped_and_covers_every_syntax(self) -> None:
+        text = help_text()
+        assert "大家都能用：" in text and "批准人：" in text
+        for it in HELP_ITEMS:
+            assert it["syntax"] in text, it
+            assert it["desc"] in text, it
+        # 例子照抄就能用
+        assert "例：/mw do 整理一份开黑语音排障步骤" in text
+        assert "例：/mw 批准 R-12" in text
+        assert "例：/mw 取消 T-8" in text
+        assert "例：/mw 领取 T-8" in text
+        # 群消息，别太长
+        assert len(text) <= 400
+        # 人人能用的排在前一组，批准人才用的排在后一组
+        cut = text.index("批准人：")
+        assert text.index("/mw do 要做的事") < cut
+        assert text.index("/mw 领取 T-任务号") < cut
+        assert text.index("/mw 网页") < cut
+        assert text.index("/mw 帮助") < cut
+        assert text.index("/mw 批准 [ID]") > cut
+        assert text.index("/mw 拒绝 [ID]") > cut
+        assert text.index("/mw 取消 [ID]") > cut
+
+    @pytest.mark.asyncio
+    async def test_short_usage_comes_from_the_same_table(self, tmp_path: Path) -> None:
+        env = _env(tmp_path)
+        reply = await env.say("/mw 随便")
+        assert reply == usage_text("随便")
+        assert "/mw 看进度" in reply and "/mw do 要做的事" in reply and "/mw 帮助" in reply
+
+
+# ----------------------------------------------------------------------
+# 少了 do：看着像派活就回一行能照抄的 /mw do，绝不建请求
+# ----------------------------------------------------------------------
+
+
+class TestMissingDoHint:
+    @pytest.mark.asyncio
+    async def test_request_like_text_gets_copyable_line(self, tmp_path: Path) -> None:
+        env = _env(tmp_path)
+        reply = await env.say("/mw 帮我整理一份清单")
+        assert reply == "要派活请这样发：\n/mw do 帮我整理一份清单"
+        assert env.approvals.pending_view(G1) == []
+        n = env.store.read().execute("SELECT COUNT(*) AS n FROM requests").fetchone()["n"]
+        assert int(n) == 0, "提示归提示，不许真建请求"
+
+    @pytest.mark.asyncio
+    async def test_hint_caps_long_text(self, tmp_path: Path) -> None:
+        env = _env(tmp_path)
+        reply = await env.say("/mw 帮我" + "整" * 300)
+        assert reply.splitlines()[1] == "/mw do 帮我" + "整" * 98
+
+    @pytest.mark.asyncio
+    async def test_chitchat_without_cue_gets_plain_usage(self, tmp_path: Path) -> None:
+        env = _env(tmp_path)
+        reply = await env.say("/mw 随便说说")
+        assert reply.startswith("没有「随便说说」这个指令")
+        assert "要派活请这样发" not in reply

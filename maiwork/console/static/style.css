@@ -974,6 +974,15 @@ body.booting .app, body.booting .tabbar { visibility: hidden; }
 .cap { display: inline-flex; align-items: center; gap: 5px; height: 32px; padding: 0 12px; border-radius: 999px; background: var(--fill); font-size: 13px; font-weight: 600; color: var(--gray-2); }
 .cap.on { background: var(--ok-bg); color: var(--ok-ink); }
 .cap svg { width: 12px; height: 12px; }
+.cmds { display: grid; gap: 2px; }
+.cmds-who { margin: 14px 0 4px; font-size: 13px; font-weight: 700; color: var(--gray-2); }
+.cmds-who:first-child { margin-top: 4px; }
+.cmd-row { display: grid; grid-template-columns: minmax(150px, 220px) minmax(0, 1fr); gap: 4px 16px; align-items: baseline; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.cmd-row code { font-size: 14px; font-weight: 700; color: var(--ink); overflow-wrap: anywhere; }
+.cmd-desc { font-size: 14px; color: var(--ink-2); line-height: 1.5; }
+.cmd-eg { display: block; font-size: 13px; color: var(--gray); }
+.cmd-eg code { font-size: 13px; font-weight: 500; color: var(--gray); }
+@media (max-width: 759px) { .cmd-row { grid-template-columns: 1fr; } }
 
 /* ───────────── 设置页（单独一页，不再是抽屉） ───────────── */
 .set-nav { display: flex; gap: 6px; overflow-x: auto; margin: 16px -24px 4px; padding: 2px 24px 8px; scrollbar-width: none; }

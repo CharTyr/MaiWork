@@ -174,6 +174,33 @@ export function hash(s) {
   return h;
 }
 
+// 群指令：/mw 有哪些、谁能用、怎么写（数据来自后端 commands.HELP_ITEMS）；复制整段好转发到群公告
+function commandsBlock(v) {
+  const c = v && v.commands;
+  const items = (c && c.items) || [];
+  if (!items.length) return "";
+  const groups = [];
+  for (const it of items) {
+    let g = groups.find((x) => x.who === it.who);
+    if (!g) groups.push((g = { who: it.who, list: [] }));
+    g.list.push(it);
+  }
+  return `
+    <div class="h-sub-row"><h2 class="h-sub">群指令</h2>${c.text ? `<button class="btn small" data-act="copy" data-what="群指令" data-link="${esc(c.text)}">${SVG.copy}复制给群友</button>` : ""}</div>
+    <p class="h-meta">在群里发这些，不用 @ 机器人</p>
+    <div class="cmds">${groups
+      .map(
+        (g) => `<div class="cmds-who">${esc(g.who)}</div>${g.list
+          .map(
+            (it) => `<div class="cmd-row"><code class="mono">${esc(it.syntax)}</code><span class="cmd-desc">${esc(it.desc)}${
+              it.example && it.example !== it.syntax ? `<span class="cmd-eg">例：<code class="mono">${esc(it.example)}</code></span>` : ""
+            }</span></div>`
+          )
+          .join("")}`
+      )
+      .join("")}</div>`;
+}
+
 // 这个群：本群规矩 + 本群做法，只给总管理员和本群群管理员（群友看不到）
 function ctxBlock(g) {
   if (!gadmin()) return "";
@@ -186,7 +213,7 @@ export function viewGroup(g, v) {
   html += pulseCard(g, v, false);
   if (!v) return html + loading();
   if (g.fresh) {
-    html += emptyState("seedling", "正在了解这个群", "");
+    html += emptyState("seedling", "正在了解这个群", "") + commandsBlock(v);
     return gadmin() ? html + ctxBlock(g) + controlsSection(g.id, v) + focusSection(v) : html;
   }
   const log = v.topic_log || [];
@@ -197,6 +224,7 @@ export function viewGroup(g, v) {
   html += ctxBlock(g);
   html += `<h2 class="h-sub">群画像 </h2>`;
   html += profileSection(v);
+  html += commandsBlock(v);
   if (gadmin()) html += controlsSection(g.id, v) + groupSpaceBlock(v, g) + focusSection(v);
   return html;
 }

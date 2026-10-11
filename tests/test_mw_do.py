@@ -117,7 +117,7 @@ class TestTextForm:
     async def test_creates_pending_request(self, tmp_path: Path) -> None:
         env = _env(tmp_path)
         reply = await env.say(f"/mw do {JOB}", message_id="m-9")
-        assert reply == "收到，R-1 等管理员批准，批准后开工"
+        assert reply == "收到，R-1 等管理员批准；批准人发 /mw 批准 R-1 就开工"
         rows = env.requests()
         assert len(rows) == 1
         row = rows[0]
@@ -170,7 +170,10 @@ class TestTextForm:
     async def test_empty_without_quote_shows_usage(self, tmp_path: Path) -> None:
         env = _env(tmp_path)
         reply = await env.say("/mw do")
-        assert reply == "把要做的事写在后面，例如 /mw do 整理一份开黑语音排障步骤；也可以引用一条消息再发 /mw do"
+        assert reply == (
+            "把要做的事写在后面，例如 /mw do 整理一份开黑语音排障步骤；"
+            "也可以引用一条消息再发 /mw do；全部指令发 /mw 帮助"
+        )
         assert env.requests() == []
 
 
@@ -234,7 +237,7 @@ class TestAutoApproved:
         started: list[str] = []
         env = _env(tmp_path, approval={"required": False, "admins": [ADMIN]}, run_task_starter=started.append)
         reply = await env.say(f"/mw do {JOB}")
-        assert reply == "收到，已开工（T-1）"
+        assert reply == "收到，已开工（T-1）；发 /mw 看进度，/mw 取消 T-1 可以取消"
         assert started == ["T-1"]
         assert env.approvals.pending_view(G1) == []
         assert env.tasks.get("T-1")["status"] == "queued"
@@ -254,7 +257,7 @@ class TestGuards:
         assert "R-1" in first
         env.outbox._keys.clear()  # 热重载重放：发件箱的去重键没了，请求也不能再来一条
         second = await env.say(f"/mw do {JOB}", message_id="m-same")
-        assert second == "收到，R-1 等管理员批准，批准后开工"
+        assert second == "收到，R-1 等管理员批准；批准人发 /mw 批准 R-1 就开工"
         assert len(env.requests()) == 1
 
     @pytest.mark.asyncio
@@ -263,7 +266,7 @@ class TestGuards:
         await env.say(f"/mw do {JOB}", message_id="m-same2")
         env.outbox._keys.clear()
         reply = await env.say(f"/mw do {JOB}", message_id="m-same2")
-        assert reply == "收到，已开工（T-1）"
+        assert reply == "收到，已开工（T-1）；发 /mw 看进度，/mw 取消 T-1 可以取消"
         assert len(env.requests()) == 1
 
     @pytest.mark.asyncio
@@ -298,3 +301,16 @@ class TestUsage:
         env = _env(tmp_path)
         reply = await env.say("/mw 拍脑袋")
         assert "/mw do" in reply
+        assert "/mw 帮助" in reply  # 短提示里带上哪里看全部指令
+
+    @pytest.mark.asyncio
+    async def test_pending_reply_says_who_can_approve(self, tmp_path: Path) -> None:
+        env = _env(tmp_path)
+        reply = await env.say(f"/mw do {JOB}", message_id="m-hint-1")
+        assert "等管理员批准" in reply and "批准人发 /mw 批准 R-1 就开工" in reply
+
+    @pytest.mark.asyncio
+    async def test_started_reply_says_where_to_look_and_cancel(self, tmp_path: Path) -> None:
+        env = _env(tmp_path, approval={"required": False, "admins": [ADMIN]}, run_task_starter=lambda t: None)
+        reply = await env.say(f"/mw do {JOB}", message_id="m-hint-2")
+        assert "发 /mw 看进度" in reply and "/mw 取消 T-1 可以取消" in reply

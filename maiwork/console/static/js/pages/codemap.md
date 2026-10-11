@@ -13,7 +13,7 @@
 - `ideas.js`：`viewIdeas()` 和 `ideaDetail()` 展示构想及选项；`ideaAsk()` 拼出复制到群内交给 MaiBot 的要求，`findIdea()` 从当前群视图找构想。
 - `goals.js`：`goalSections()` 在「在做的事」里区分 MaiWork 推进的目标与群友的提醒，`nextText()` 解释下次检查时间。
 - `tasks.js`：`viewTasks()` 展示「在做的事」：待批、按状态筛选的任务、持续目标与成员提醒；`taskRow()` 供列表与详情复用；待批构想项通过 `findIdea()` 交叉引用。
-- `group.js`：`viewGroup()` 组织群状态、开话题记录、「这个群」区（只给总管理员 / 本群群管理员，`ctxBlock()` → `groupctx.js`）、群画像、群空间能力及关注成员；管理员视图接上 `controlsSection()` → `groupcontrols.js`（「往群里发」+「谁能批本群的活」）——批准 / 免批名单只读、总管理员才显示「改名单」。通过 `gplat()` / `platTag()` 区分平台；非 `qq` 群的 `groupSpaceBlock(v, g)` 不画 OneBot 群文件/公告/相册控件，而说明成品走网页链接。个人画像只在管理视图渲染，服务器仍需独立执行鉴权。
+- `group.js`：`viewGroup()` 组织群状态、开话题记录、「这个群」区（只给总管理员 / 本群群管理员，`ctxBlock()` → `groupctx.js`）、群画像、「群指令」卡片（`commandsBlock(v)` 读 `v.commands`，按 who 分组列写法 / 说明 / 例子，「复制给群友」复用通用 `data-act="copy"` 复制帮助全文；所有人可见，新群也显示）、群空间能力及关注成员；管理员视图接上 `controlsSection()` → `groupcontrols.js`（「往群里发」+「谁能批本群的活」）——批准 / 免批名单只读、总管理员才显示「改名单」。通过 `gplat()` / `platTag()` 区分平台；非 `qq` 群的 `groupSpaceBlock(v, g)` 不画 OneBot 群文件/公告/相册控件，而说明成品走网页链接。个人画像只在管理视图渲染，服务器仍需独立执行鉴权。
 
 ## Flow
 

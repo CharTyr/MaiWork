@@ -1052,6 +1052,10 @@ def group_view(svc: Any, group_id: str, *, admin: bool) -> dict[str, Any]:
         view["topic_log"] = [
             {k: v for k, v in e.items() if k != "verdict"} for e in topic_log
         ]
+    # `/mw` 指令清单：管理版和群友版都给同一份固定文本，唯一来源是 commands.HELP_ITEMS
+    from ..commands import HELP_ITEMS, help_text
+
+    out["commands"] = {"items": [dict(x) for x in HELP_ITEMS], "text": help_text()}
     out.update(view)
     return out
 

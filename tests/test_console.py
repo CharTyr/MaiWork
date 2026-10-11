@@ -1098,6 +1098,19 @@ class TestM2RoutesAuth:
 
 class TestGroupViewM2Fields:
     @pytest.mark.asyncio
+    async def test_group_view_carries_the_mw_command_list(self, m2_client) -> None:
+        """群视图带 /mw 指令清单：管理版和群友版同一份，正文来自 commands.HELP_ITEMS。"""
+        from CharTyr_MaiWork.maiwork.commands import HELP_ITEMS, help_text
+        from CharTyr_MaiWork.maiwork.console import views as _views
+
+        svc = m2_client.app
+        for admin in (True, False):
+            view = _views.group_view(svc, G1, admin=admin)
+            assert view["commands"]["text"] == help_text()
+            assert view["commands"]["items"] == [dict(x) for x in HELP_ITEMS]
+            assert any(it["syntax"] == "/mw 帮助" for it in view["commands"]["items"])
+
+    @pytest.mark.asyncio
     async def test_member_view_topic_log_visible_but_no_verdict(self, m2_client) -> None:
         """群友看得到 topic_log，但没有 verdict 字段；也不含 focus 个人画像信息。"""
         from CharTyr_MaiWork.maiwork.console import views as _views
