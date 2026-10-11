@@ -918,7 +918,7 @@ class MaiWorkApp:
             except Exception:
                 logger.exception("关闭 Jev 客户端出错")
             self.jev = None
-        # 派活判断兜底：手里还没判的这批先交回慢路径，在跑的批处理取消干净（要在
+        # 派活判断兜底：在跑的判断取消干净、没判完的交回慢路径（要在
         # 关模型客户端之前收 —— 它调模型）
         qj, self.quick_judge = self.quick_judge, None
         if qj is not None:

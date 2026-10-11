@@ -17,7 +17,8 @@ M3 决定的出入（和 docs/07 §11.5 对齐）：
 - kind=reminder 且把握 ≥0.6 → 后台回调 on_reminder(group_id, msg)（app 提供，
   由主模型解析时间后建成员目标）。
 - Jev 明确判 none 且把握 ≥0.6 → 什么都不记（这是正常闲聊）。
-- Jev 不可用 / 超时 / 失败 / 答案无效 / 把握不够 → 写进 pending_asks 表（不再攒内存、
+- Jev 不可用 / 超时 / 失败 / 答案无效 / 把握不够 → 先试派活判断兜底（quick_judge.QuickJudge，
+  一条 @ 一次模型调用、立刻判）；兜底也不收 / 判不准 → 写进 pending_asks 表（不再攒内存、
   不写 intake.slow 事件）；主模型读群提炼时把这批消息标出来逐条判（asks），判过标
   handled。slow_queue 属性返回未处理的行（没接库的极简构造退回内存攒着，兼容老测试）。
 """
@@ -46,6 +47,11 @@ _KIND_ZH: Dict[str, str] = {"prepare": "准备东西", "goal": "帮忙盯着或�
 # 内存环：每个服务群留最近几条消息当快速判断的上下文
 _RING_MAX = 8
 _RING_TEXT_MAX = 120
+# 给 Jev 的状态：最多带几条前文；前文 + 这条 @ 的总字数上限（超了从最老的上下文开始丢）
+_JEV_CONTEXT_MAX = 4
+_JEV_STATE_TEXT_MAX = 800
+# 建待批的 via 总长上限（网页待批列表显示用）
+_VIA_MAX = 60
 
 
 def _is_command(text: str) -> bool:
@@ -57,7 +63,7 @@ def _is_command(text: str) -> bool:
 _AT_QUESTIONS: Dict[str, Any] = {
     "kind": {
         "type": "choice",
-        "instructions": "群里有人 @ MaiBot，这条消息是在请 MaiBot 做什么？",
+        "instructions": "群里有人 @ MaiBot。最后一条（USER）是这条 @ 的消息，前面几条只是上下文。这条 @ 是在请 MaiBot 做什么？",
         "criteria": {
             "prepare": "请 MaiBot 准备/整理/调研/做一个能在网上做出来的东西（资料、清单、文档等）",
             "goal": "请 MaiBot 在网上帮忙盯着某件事，或把一件它在线上能做成的事做成",
@@ -181,7 +187,6 @@ class Intake:
         bot_account: Callable[[str], str] | None = None,
         models: Any = None,
         quick_judge: Any = None,
-        quick_judge_sleep: Callable[[float], Any] | None = None,
     ) -> None:
         self._get_settings = get_settings
         self._signals = signals
@@ -207,10 +212,11 @@ class Intake:
         self._answered_ids: dict[str, float] = {}
         # 慢路径在库里的表是 pending_asks；这个内存队列只给「没接库」的极简构造兜底
         self._slow_queue: list[dict] = []
-        # 通过 @ 判断的最近几条消息（内存环，零 I/O）：快速判断兜底要用「这条 @ 之前的
-        # 6 条」当上下文；每个服务群一份，只留最近 8 条（机器人自己的也记，标 MaiBot）
+        # 通过 @ 判断的最近几条消息（内存环，零 I/O）：Jev 取「这条 @ 之前的 4 条」、
+        # 快速判断兜底取「之前的 6 条」当上下文；每个服务群一份，只留最近 8 条
+        # （机器人自己的也记，标 MaiBot）
         self._recent: dict[str, list[dict]] = {}
-        # 派活判断兜底（quick_judge.QuickJudge）：Jev 不在 / 拿不准时用模型快速判一次。
+        # 派活判断兜底（quick_judge.QuickJudge）：Jev 不在 / 拿不准时用模型快速判这一条 @。
         # 显式注入（测试）优先；只给了 models 就在这里自己建一个。
         self._quick_judge = quick_judge
         if self._quick_judge is None and models is not None:
@@ -224,7 +230,6 @@ class Intake:
                     on_request=self._qj_request,
                     on_reminder=on_reminder,
                     on_slow=self._slow,
-                    sleep=quick_judge_sleep,
                 )
             except Exception:
                 logger.exception("建派活判断兜底出错，这次退回慢路径")
@@ -408,7 +413,7 @@ class Intake:
             except Exception:
                 available = False
             if available:
-                state = {"messages": [{"speaker": "USER", "text": text[:_STATE_TEXT_MAX]}]}
+                state = {"messages": self._jev_messages(context, text)}
                 try:
                     answers = await asyncio.wait_for(
                         jev.ask(state, _AT_QUESTIONS, purpose="intake", group_id=group_id, timeout_ms=timeout_ms),
@@ -491,8 +496,10 @@ class Intake:
         self._slow(reason, group_id, user_id, user_name, message_id, text)
 
     def _qj_request(self, group_id: str, label: str, sure: float, item: dict, title: str) -> Awaitable[None]:
-        """快速判断判成 prepare / goal：和 Jev 那条路一样建待批，只是 via 说明出处。"""
+        """快速判断判成 prepare / goal：和 Jev 那条路一样建待批，只是 via 说明出处和依据。"""
         zh = _KIND_ZH.get(str(label), str(label))
+        why = str(item.get("_why") or "").strip()
+        via = (f"群里 @ · 快速判断：{why}" if why else f"群里 @ · 快速判断是「{zh}」")[:_VIA_MAX]
         return self._create_request(
             group_id,
             str(label),
@@ -501,7 +508,7 @@ class Intake:
             str(item.get("user_name") or ""),
             str(item.get("message_id") or ""),
             str(item.get("text") or ""),
-            via=f"群里 @ · 快速判断是「{zh}」（把握 {float(sure):.2f}）",
+            via=via,
             title=str(title or ""),
         )
 
@@ -690,6 +697,26 @@ class Intake:
             return list(self._recent.get(str(group_id), []))[-6:]
         except Exception:
             return []
+
+    def _jev_messages(self, context: list[dict] | None, text: str) -> list[dict]:
+        """给 Jev 的状态：最多 4 条前文（最近的在后）+ 最后一条 @ 的消息（USER）。
+
+        前文的说话人只说「MaiBot」（机器人自己的）或「群友」（别人），单条截 120 字；
+        总字数 ~800 以内，太长就从最老的那条上下文开始丢（USER 这条永远留着）。
+        """
+        msgs: list[dict] = []
+        for c in list(context or [])[-_JEV_CONTEXT_MAX:]:
+            msgs.append(
+                {
+                    "speaker": "MaiBot" if c.get("bot") else "群友",
+                    "text": str(c.get("text") or "")[:_RING_TEXT_MAX],
+                }
+            )
+        msgs.append({"speaker": "USER", "text": str(text or "")[:_STATE_TEXT_MAX]})
+        total = sum(len(m["text"]) for m in msgs)
+        while len(msgs) > 1 and total > _JEV_STATE_TEXT_MAX:
+            total -= len(msgs.pop(0)["text"])
+        return msgs
 
     def _slow(self, reason: str, group_id: str, user_id: str, user_name: str, message_id: str, text: str) -> None:
         """Jev 判不了的 @ 走慢路径：写进 pending_asks 表（docs/02 §5.1），主模型下次

@@ -54,7 +54,8 @@ class TestDefaults:
         # 0.4.6：每端点高级请求头覆盖 headers（默认空）
         # 0.4.7：[jev] use + [[jev_endpoints]]（多判断服务：内置预设 / 自己加 / 换着用）
         # 0.4.8：[quick_judge] 派活判断兜底（Jev 不在 / 拿不准时用模型快速判）
-        assert CONFIG_VERSION == "0.4.8"
+        # 0.4.9：[quick_judge] 不再攒批（删 batch_wait_s）、daily_max 归高级项
+        assert CONFIG_VERSION == "0.4.9"
         assert MaiWorkConfig().plugin.config_version == CONFIG_VERSION
 
     def test_railway_verify_new_fields_defaults(self) -> None:

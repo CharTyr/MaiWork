@@ -73,7 +73,7 @@ def _norm_accounts(values: object, field_zh: str, problems: list[str]) -> tuple[
     return tuple(out)
 
 
-CONFIG_VERSION = "0.4.8"  # 0.4.8：[quick_judge] 派活判断兜底（Jev 不在 / 拿不准时用模型快速判群里 @ 的是不是派活）；0.4.7：[jev] use + [[jev_endpoints]]（多判断服务：预设 / 自己加 / 换着用）；0.4.6：每端点高级请求头 headers（默认空）；0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）；0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
+CONFIG_VERSION = "0.4.9"  # 0.4.9：[quick_judge] 不再攒批（删 batch_wait_s，一条 @ 一次判断）、daily_max 归高级项；0.4.8：[quick_judge] 派活判断兜底（Jev 不在 / 拿不准时用模型快速判群里 @ 的是不是派活）；0.4.7：[jev] use + [[jev_endpoints]]（多判断服务：预设 / 自己加 / 换着用）；0.4.6：每端点高级请求头 headers（默认空）；0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）；0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
 
 # 0.8.0 群控归一（docs/18 §五 + 往群里发）：下面这些全局键**只作新群第一次的迁移种子**
 # （migrations.migrate_group_controls 按服务群种进 kv["group_approval.<群号>"] /
@@ -298,8 +298,8 @@ class JevSectionConfig(PluginConfigBase):
 class QuickJudgeSectionConfig(PluginConfigBase):
     """[quick_judge] 派活判断兜底（2026-10）。
 
-    Jev 没配 / 连不上 / 拿不准时，把群里 @ 的消息攒一小批，用主模型快速判一次
-    「是不是派活」。判不准的仍然回落 pending_asks（主模型读群时再判）。
+    Jev 没配 / 连不上 / 拿不准时，立刻用主模型快速判这一条 @「是不是派活」
+    （一条 @ = 一次模型调用，不攒批）。判不准的仍然回落 pending_asks（主模型读群时再判）。
     """
 
     __ui_label__ = "派活判断兜底"
@@ -309,8 +309,8 @@ class QuickJudgeSectionConfig(PluginConfigBase):
     enabled: bool = Field(default=True, description="没配 Jev 或 Jev 拿不准时，用模型快速判断群里 @ 的是不是派活")
     model: str = Field(default="", description='用哪个模型判断（[[model_list]] 的条目 id）；空 = 跟主模型用同一条链；填的条目不存在也用主模型的链')
     keyword_filter: bool = Field(default=False, description="先用请求词过一遍：没有「帮我、整理、查一下、提醒我」这类词的 @ 直接当闲聊，不花模型钱；可能漏掉说法含糊的派活")
-    daily_max: int = Field(default=30, description="每个群每天最多判几次（0 = 一次都不用模型，全走老慢路径）")
-    batch_wait_s: int = Field(default=15, description="第一条 @ 进来后等几秒，把这段时间里的 @ 合成一次判断（攒够 6 条就早点判）")
+    daily_max: int = Field(default=30, description="每个群每天最多判几次（0 = 一次都不用模型，全走老慢路径）；一条 @ 算一次")
+    # 0.4.9 起删掉 batch_wait_s（不再攒批）：老 config.toml 还留着这个键也能读（配置模型忽略不认识的键）
 
 
 class UsageSectionConfig(PluginConfigBase):
@@ -734,8 +734,7 @@ class QuickJudgeSetting:
     enabled: bool = True
     model: str = ""            # [[model_list]] 条目 id；空 = 主模型的链
     keyword_filter: bool = False
-    daily_max: int = 30        # 每群每天模型调用次数上限（0 = 不用模型）
-    batch_wait_s: int = 15     # 攒批等待秒数（3~120）
+    daily_max: int = 30        # 每群每天模型调用次数上限（0 = 不用模型）；一条 @ 算一次
 
 
 @dataclass(frozen=True)
@@ -1079,16 +1078,11 @@ def _parse_quick_judge(qj: QuickJudgeSectionConfig, problems: list[str]) -> Quic
     daily = max(0, min(500, raw_daily))
     if daily != raw_daily:
         problems.append(f"[quick_judge] daily_max = {raw_daily} 超出 0~500 范围，已按 {daily} 处理")
-    raw_wait = int(getattr(qj, "batch_wait_s", 15))
-    wait = max(3, min(120, raw_wait))
-    if wait != raw_wait:
-        problems.append(f"[quick_judge] batch_wait_s = {raw_wait} 超出 3~120 秒范围，已按 {wait} 处理")
     return QuickJudgeSetting(
         enabled=bool(getattr(qj, "enabled", True)),
         model=str(getattr(qj, "model", "") or "").strip(),
         keyword_filter=bool(getattr(qj, "keyword_filter", False)),
         daily_max=daily,
-        batch_wait_s=wait,
     )
 
 

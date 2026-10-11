@@ -1,14 +1,14 @@
-"""派活判断兜底（快速判断）：Jev 不在 / 拿不准时，用主模型快速判一次这批 @。
+"""派活判断兜底（快速判断）：Jev 不在 / 拿不准时，用主模型快速判这一条 @。
 
 背景（docs/02 §5.1）：收消息钩子被 @ 时先问 Jev（快、便宜）。Jev 没配、连不上、超时、
 答案无效或把握不够，以前一律写进 `pending_asks`，等主模型下一次读群（可能几小时后）
-才判 —— 慢，而且读群那一路噪声大。这个模块补一条**快**的兜底：Jev 判不了的 @ 攒一小批，
-过十几秒合成**一次**模型调用判掉。
+才判 —— 慢，而且读群那一路噪声大。这个模块补一条**快**的兜底：Jev 判不了的 @ 立刻
+用模型判这一条（一条 = 一次模型调用），带上前面对话当上下文。
 
 红线：
-- 绝不卡住收消息钩子：`enqueue` 只往内存队列里放，模型调用在后台批处理任务里。
+- 绝不卡住收消息钩子：`enqueue` 只登记一条并起后台任务，模型调用在后台任务里。
 - 省钱：`keyword_filter` 先过请求词（没有「帮我 / 整理 / 查一下 / 提醒我」这类词当闲聊）；
-  每群每天模型调用次数上限（跨重启计数，存 kv）；一批就是一次调用。
+  每群每天模型调用次数上限（跨重启计数，存 kv）；一条就是一次调用。
 - 拿不准的一律回落 `pending_asks`（慢路径照旧，读群时还能看见），绝不猜。
 - 决策落地走调用方给的回调（建待批 / 提醒 / 慢路径），这里不直接碰审批和群消息。
 """
@@ -41,8 +41,6 @@ _AT_TOKEN = re.compile(r"@[^\s，,。！!？?：:；;、~]{1,32}(?=[\s，,。！
 _REQUEST_SURE = 0.8
 # reminder / none 的门槛（和 Jev 那边一致）
 _OTHER_SURE = 0.7
-# 一批攒够这么多条就不等窗口了，提前判
-_BATCH_FLUSH_AT = 6
 # 给模型看的前文最多几条（intake 内存环里取）
 _CONTEXT_MAX = 6
 # 前文单条最多多少字
@@ -90,7 +88,7 @@ _PROMPT_SYSTEM = (
     "你是 MaiWork 的「派活判断兜底」。MaiWork 是群里的后台小助手，只能做网上能做完、"
     "过一会儿再交的活：查资料、整理成文档/清单/表格/报告、对比、翻译长材料；"
     "在网上盯着某件事、有结果再来报；到点提醒某个人。\n"
-    "下面每一条都是群里 @ 了机器人的消息（前面几行是上下文）。判断它是不是在给 MaiWork 派活。\n\n"
+    "下面这条是群里 @ 了机器人的消息（前面几行是上下文）。判断它是不是在给 MaiWork 派活。\n\n"
     "算派活：\n"
     "- prepare：要它准备 / 整理 / 调研 / 做一个能在网上做出来的东西（资料、清单、文档、表格、报告）。\n"
     "- goal：要它在网上盯着某件事并回报，或把一件它在线上能做成的事做成。\n"
@@ -111,32 +109,32 @@ _PROMPT_SYSTEM = (
 )
 
 
-def _user_text(batch: list[dict]) -> str:
-    """把这一批（含前文）拼成给模型看的一段字。"""
-    blocks: list[str] = []
-    for n, item in enumerate(batch, 1):
-        head = f"[{n}] {item.get('user_name') or item.get('user_id') or '有人'}: {item.get('text')}"
-        ctx = item.get("context") or []
-        if ctx:
-            lines = [
-                f"    {c.get('speaker') or '有人'}: {str(c.get('text') or '')[:_CONTEXT_TEXT_MAX]}"
-                for c in ctx[:_CONTEXT_MAX]
-            ]
-            head = "  （前面对话）\n" + "\n".join(lines) + "\n" + head
-        blocks.append(head)
+def _user_text(item: dict) -> str:
+    """把这一条（含前文）拼成给模型看的一段字。"""
+    head = f"{item.get('user_name') or item.get('user_id') or '有人'}: {item.get('text')}"
+    ctx = item.get("context") or []
+    if ctx:
+        lines = [
+            f"    {c.get('speaker') or '有人'}: {str(c.get('text') or '')[:_CONTEXT_TEXT_MAX]}"
+            for c in ctx[:_CONTEXT_MAX]
+        ]
+        head = "（前面对话）\n" + "\n".join(lines) + "\n" + head
     return (
         "待判的消息：\n"
-        + "\n".join(blocks)
+        + head
         + "\n只输出 JSON，不要别的话："
-        '{"items":[{"i":1,"kind":"prepare|goal|reminder|none","sure":0.0,"title":"要做的事（≤20字；none 留空）"}]}'
+        '{"kind":"prepare|goal|reminder|none","sure":0.0,"title":"要做的事（≤20字；none 留空）","why":"判断依据（≤30字）"}'
     )
 
 
 _FENCE = re.compile(r"```[a-zA-Z]*\s*|\s*```")
 
 
-def _parse_items(text: Any) -> Optional[dict[int, dict]]:
-    """把模型回答解成 {序号: 条目}；读不出来（或一条都没有）返回 None。"""
+def _parse_decision(text: Any) -> Optional[dict]:
+    """把模型回答解成**一条**结论；读不出来返回 None。
+
+    认两种形状：新的单条 `{"kind":…}`；旧的攒批 `{"items":[{…}]}`（只取第一条，无害）。
+    """
     s = _FENCE.sub("", str(text or "")).strip()
     if not s:
         return None
@@ -152,26 +150,22 @@ def _parse_items(text: Any) -> Optional[dict[int, dict]]:
                 data = None
     if not isinstance(data, dict):
         return None
+    if isinstance(data.get("kind"), str):
+        return data
     raw = data.get("items")
-    if not isinstance(raw, list):
-        return None
-    out: dict[int, dict] = {}
-    for it in raw:
-        if not isinstance(it, dict):
-            continue
-        try:
-            n = int(it.get("i"))
-        except (TypeError, ValueError):
-            continue
-        out[n] = it
-    return out or None
+    if isinstance(raw, list):
+        for it in raw:
+            if isinstance(it, dict):
+                return it
+    return None
 
 
 class QuickJudge:
-    """一批 @ 一次模型调用的快速判断；落地全靠注入的回调。
+    """一条 @ 一次模型调用的快速判断；落地全靠注入的回调。
 
     回调（和 app / intake 的接口对齐）：
-    - on_request(group_id, label, sure, item, title)：prepare / goal 落地（可 sync 可 async）
+    - on_request(group_id, label, sure, item, title)：prepare / goal 落地（可 sync 可 async）；
+      item 里带 `_why`（模型给的判断依据，建待批的 via 用）。
     - on_reminder(group_id, msg)：reminder 落地（可 sync 可 async）
     - on_slow(reason, group_id, user_id, user_name, message_id, text)：回落慢路径（sync）
     """
@@ -185,7 +179,6 @@ class QuickJudge:
         on_request: Optional[Callable[..., Any]] = None,
         on_reminder: Optional[Callable[..., Any]] = None,
         on_slow: Optional[Callable[..., Any]] = None,
-        sleep: Optional[Callable[[float], Any]] = None,
     ) -> None:
         self._get_settings = get_settings
         self._models = models
@@ -193,12 +186,9 @@ class QuickJudge:
         self._on_request = on_request
         self._on_reminder = on_reminder
         self._on_slow = on_slow
-        self._sleep = sleep if sleep is not None else asyncio.sleep
-        self._queues: dict[str, list[dict]] = {}
-        self._wake: dict[str, asyncio.Event] = {}
         self._tasks: set[asyncio.Task] = set()
-        self._batch_tasks: dict[str, asyncio.Task] = {}
-        self._inflight: dict[str, list[dict]] = {}
+        # 正在判的（键 (群号, message_id) → 条目）：去重用；停机时把没判完的交回慢路径
+        self._inflight: dict[tuple[str, str], dict] = {}
         self._judged: dict[tuple[str, str], float] = {}
         self._entry_fallback_logged = False
 
@@ -215,7 +205,7 @@ class QuickJudge:
         return bool(qj is not None and bool(getattr(qj, "enabled", True)) and self._models is not None)
 
     def enqueue(self, group_id: str, item: dict, *, context: Optional[list] = None) -> bool:
-        """把一条被 @ 的消息排进这一批。
+        """把一条被 @ 的消息交给后台立刻判（一条 = 一次模型调用）。
 
         返回 True = 收了（后台会判；也可能因为上限 / 拿不准最终走慢路径）；
         False = 现在不收（调用方按老路写 pending_asks）。
@@ -228,116 +218,73 @@ class QuickJudge:
         mid = str((item or {}).get("message_id") or "")
         if not gid or not mid:
             return False
-        if (gid, mid) in self._judged:
-            return True  # 判过了：不再花第二遍钱，也不重复写慢路径
-        queue = self._queues.setdefault(gid, [])
-        if any(str(x.get("message_id") or "") == mid for x in queue):
-            return True
+        key = (gid, mid)
+        if key in self._judged or key in self._inflight:
+            return True  # 判过了 / 正在判：不再花第二遍钱，也不重复写慢路径
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug("没有事件循环，快速判断先不收（群 %s）", gid)
+            return False
         entry = dict(item or {})
         entry["group_id"] = gid
         # 上下文：调用方显式给的优先；没给就用条目上带的（直连调用方便）
         ctx = context if context is not None else entry.get("context")
         entry["context"] = list(ctx or [])[-_CONTEXT_MAX:]
-        queue.append(entry)
-        self._ensure_batch(gid)
-        if len(queue) >= _BATCH_FLUSH_AT:
-            ev = self._wake.get(gid)
-            if ev is not None:
-                ev.set()  # 攒够了：别再等这个窗口
-        return True
-
-    def _ensure_batch(self, gid: str) -> None:
-        running = self._batch_tasks.get(gid)
-        if running is not None and not running.done():
-            return
+        self._mark_judged(gid, mid)
+        self._inflight[key] = entry
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            logger.debug("没有事件循环，快速判断这批先攒着（群 %s）", gid)
-            return
-        try:
-            task = loop.create_task(self._run_batch(gid))
+            task = loop.create_task(self._judge_one(key, entry))
         except Exception:
-            logger.exception("起快速判断批处理出错（群 %s）", gid)
-            return
-        self._batch_tasks[gid] = task
+            logger.exception("起快速判断任务出错（群 %s，消息 %s）", gid, mid)
+            self._inflight.pop(key, None)
+            return False
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        return True
 
     # ------------------------------------------------------------------
-    # 批处理
+    # 后台判一条
     # ------------------------------------------------------------------
 
-    async def _wait_batch(self, gid: str) -> None:
-        """等这批：睡 batch_wait_s，或攒够 _BATCH_FLUSH_AT 条提前走。"""
-        wait = self._wait_seconds()
-        if len(self._queues.get(gid) or []) >= _BATCH_FLUSH_AT:
-            return
-        ev = self._wake.get(gid)
-        if ev is None:
-            ev = asyncio.Event()
-            self._wake[gid] = ev
-        ev.clear()
-        sleeper = asyncio.ensure_future(self._sleep(wait))
-        waker = asyncio.ensure_future(ev.wait())
+    async def _judge_one(self, key: tuple[str, str], item: dict) -> None:
+        """后台判这一条；停机被打断就交回慢路径。"""
         try:
-            await asyncio.wait({sleeper, waker}, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            for t in (sleeper, waker):
-                if not t.done():
-                    t.cancel()
-            await asyncio.gather(sleeper, waker, return_exceptions=True)
-
-    async def _run_batch(self, gid: str) -> None:
-        try:
-            # 一轮一轮判：调模型的时候又来了 @（enqueue 看到任务在跑就不另起一个任务），
-            # 这一批跑完要接着判那些新来的，不能让它们一直躺在队列里没人管。
-            while self._queues.get(gid):
-                await self._wait_batch(gid)
-                await self.flush(gid)
+            await self._judge(str(key[0]), item)
         except asyncio.CancelledError:
-            # 停机 / 热重载：还没判的这批交回慢路径，别把这些 @ 弄丢
-            self._slow_queued(gid, "快速判断被打断（停机）")
-            self._slow_inflight(gid, "快速判断被打断（停机）")
+            # 停机 / 热重载：这条还没判完，交回慢路径，别把它弄丢
+            self._slow_items([item], "快速判断被打断（停机）")
             raise
         except Exception:
-            logger.exception("快速判断这批出错（群 %s）", gid)
-
-    async def flush(self, group_id: str) -> None:
-        """把这一群攒着的 @ 合成一次判断（一批 = 一次模型调用）。"""
-        gid = str(group_id or "")
-        batch = self._queues.pop(gid, None) or []
-        if not batch:
-            return
-        self._inflight[gid] = batch
-        try:
-            for item in batch:
-                self._mark_judged(gid, str(item.get("message_id") or ""))
-            qj = self._cfg()
-            if qj is None or not bool(getattr(qj, "enabled", True)):
-                self._slow_items(batch, "快速判断拿不准（快速判断已关）")
-                return
-            if not self._ready():
-                self._slow_items(batch, "快速判断拿不准（模型没配好）")
-                return
-            used, key = self._counter(gid)
-            daily_max = self._daily_max(qj)
-            if daily_max <= 0 or used >= daily_max:
-                self._slow_items(batch, "快速判断今天次数用完")
-                return
-            # 一发就先记一次（一次批处理 = 一次调用；失败也算，免得失败时反复打端点）
-            self._bump(key, used)
-            res = await self._ask(gid, batch, qj)
-            items = _parse_items(getattr(res, "text", "") if res is not None else None)
-            if items is None:
-                self._slow_items(batch, "快速判断拿不准（答案读不出来）")
-                return
-            for n, item in enumerate(batch, 1):
-                await self._apply(gid, n, items.get(n), item)
+            logger.exception("快速判断出错（消息 %s）", key[1])
+            self._slow_items([item], "快速判断拿不准（出错）")
         finally:
-            self._inflight.pop(gid, None)
+            self._inflight.pop(key, None)
 
-    async def _ask(self, gid: str, batch: list[dict], qj: Any) -> Any:
+    async def _judge(self, gid: str, item: dict) -> None:
+        """判这一条：过上限 → 调一次模型 → 按门槛落地。"""
+        qj = self._cfg()
+        if qj is None or not bool(getattr(qj, "enabled", True)):
+            self._slow_items([item], "快速判断拿不准（快速判断已关）")
+            return
+        if not self._ready():
+            self._slow_items([item], "快速判断拿不准（模型没配好）")
+            return
+        used, key = self._counter(gid)
+        daily_max = self._daily_max(qj)
+        if daily_max <= 0 or used >= daily_max:
+            self._slow_items([item], "快速判断今天次数用完")
+            return
+        # 一发就先记一次（一次调用；失败也算，免得失败时反复打端点）
+        self._bump(key, used)
+        res = await self._ask(gid, item, qj)
+        got = _parse_decision(getattr(res, "text", "") if res is not None else None)
+        if got is None:
+            self._slow_items([item], "快速判断拿不准（答案读不出来）")
+            return
+        await self._apply(gid, got, item)
+
+    async def _ask(self, gid: str, item: dict, qj: Any) -> Any:
         kwargs: dict[str, Any] = {}
         cands = self._entry_candidates(qj)
         if cands:
@@ -347,7 +294,7 @@ class QuickJudge:
                 agent="main",
                 messages=[
                     {"role": "system", "content": _PROMPT_SYSTEM},
-                    {"role": "user", "content": _user_text(batch)},
+                    {"role": "user", "content": _user_text(item)},
                 ],
                 json_mode=True,
                 purpose="intake.quick_judge",
@@ -362,16 +309,15 @@ class QuickJudge:
             logger.exception("快速判断调模型出错（群 %s）", gid)
             return None
 
-    async def _apply(self, gid: str, n: int, got: Any, item: dict) -> None:
+    async def _apply(self, gid: str, got: dict, item: dict) -> None:
         """一条结论落地；拿不准的走慢路径。"""
-        if not isinstance(got, dict):
-            self._slow_items([item], "快速判断拿不准（这条没给结论）")
-            return
         kind = str(got.get("kind") or "").strip().lower()
         sure = self._sure_of(got.get("sure"))
         title = str(got.get("title") or "").strip()[:_TITLE_MAX]
+        why = str(got.get("why") or "").strip()
         if kind in ("prepare", "goal") and sure >= _REQUEST_SURE:
             item["_done"] = True
+            item["_why"] = why
             await self._call(self._on_request, gid, kind, sure, item, title)
             return
         if kind == "reminder" and sure >= _OTHER_SURE:
@@ -416,18 +362,12 @@ class QuickJudge:
     # 慢路径 / 计数 / 挑模型
     # ------------------------------------------------------------------
 
-    def _slow_items(self, batch: list[dict], reason: str) -> None:
-        for item in batch:
+    def _slow_items(self, items: list[dict], reason: str) -> None:
+        for item in items:
             if item.get("_done"):
                 continue
             item["_done"] = True
             self._slow_one(item, reason)
-
-    def _slow_queued(self, gid: str, reason: str) -> None:
-        self._slow_items(self._queues.pop(gid, None) or [], reason)
-
-    def _slow_inflight(self, gid: str, reason: str) -> None:
-        self._slow_items(list(self._inflight.get(gid) or []), reason)
 
     def _slow_one(self, item: dict, reason: str) -> None:
         cb = self._on_slow
@@ -517,20 +457,12 @@ class QuickJudge:
         except Exception:
             return False
 
-    def _wait_seconds(self) -> float:
-        qj = self._cfg()
-        try:
-            v = int(getattr(qj, "batch_wait_s", 15) or 0)
-        except (TypeError, ValueError):
-            v = 15
-        return float(min(120, max(3, v)))
-
     # ------------------------------------------------------------------
     # 停机 / 等扫尾
     # ------------------------------------------------------------------
 
     async def join(self) -> None:
-        """等手上这些批处理跑完（停机 / 测试用）。"""
+        """等手上这些判断跑完（停机 / 测试用）。"""
         while True:
             tasks = [t for t in self._tasks if not t.done()]
             if not tasks:
@@ -538,9 +470,7 @@ class QuickJudge:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def close(self) -> None:
-        """停机：还没判的这批交回慢路径，在跑的批处理取消干净。"""
-        for gid in list(self._queues):
-            self._slow_queued(gid, "快速判断被打断（停机）")
+        """停机：在跑的任务取消干净，还没判的交回慢路径。"""
         tasks = [t for t in self._tasks if not t.done()]
         for t in tasks:
             t.cancel()
@@ -550,8 +480,9 @@ class QuickJudge:
             except asyncio.CancelledError:
                 pass
             except Exception:
-                logger.debug("快速判断批处理退出时出错", exc_info=True)
+                logger.debug("快速判断任务退出时出错", exc_info=True)
+        # 还没开始跑就被取消的（CancelledError 没进到协程里）：这里补交回慢路径
+        for item in list(self._inflight.values()):
+            self._slow_items([item], "快速判断被打断（停机）")
         self._tasks.clear()
-        self._batch_tasks.clear()
-        self._queues.clear()
         self._inflight.clear()

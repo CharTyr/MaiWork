@@ -239,7 +239,8 @@ QJ = {"enabled": True, "model": "m1", "keyword_filter": False, "daily_max": 30, 
 
 def test_quick_judge_block_renders_current_values(tmp_path):
     html = run_js(tmp_path, view=dict(VIEW, quick_judge=QJ))["html"]
-    assert 'id="qj-enabled"' in html and 'id="qj-model"' in html and 'id="qj-keyword"' in html and 'id="qj-max"' in html
+    assert 'id="qj-enabled"' in html and 'id="qj-model"' in html and 'id="qj-keyword"' in html
+    assert 'id="qj-max"' not in html  # 每天上限是内部设置，不放这里
     assert '<option value="m1" selected>' in html and "便宜小模型" in html
     assert '<option value="">' in html  # 跟主模型
     kw_tag = html.split('id="qj-keyword"')[1].split(">")[0]
@@ -255,16 +256,11 @@ def test_quick_judge_block_hidden_without_data(tmp_path):
 
 
 def test_quick_judge_save_writes_config_and_reloads(tmp_path):
-    fields = {"qj-model": "m2", "qj-max": "12"}
+    fields = {"qj-model": "m2"}
     out = run_js(tmp_path, action="qj-save", view=dict(VIEW, quick_judge=QJ), fields=fields)
     put = [c for c in out["calls"] if c["method"] == "PUT"]
     assert put and put[0]["url"] == "/api/settings/config"
     body = put[0]["body"]
-    assert body["quick_judge.model"] == "m2" and body["quick_judge.daily_max"] == 12
+    assert body["quick_judge.model"] == "m2" and "quick_judge.daily_max" not in body
     assert body["quick_judge.enabled"] is True and body["quick_judge.keyword_filter"] is False
     assert any(c["method"] == "GET" and c["url"] == "/api/settings/jev" for c in out["calls"])
-
-
-def test_quick_judge_save_rejects_bad_number(tmp_path):
-    out = run_js(tmp_path, action="qj-save", view=dict(VIEW, quick_judge=QJ), fields={"qj-model": "", "qj-max": "abc"})
-    assert not [c for c in out["calls"] if c["method"] == "PUT"]

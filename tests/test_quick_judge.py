@@ -1,8 +1,8 @@
-"""quick_judge.py 单元测试：请求词筛、批处理、阈值、上限、上下文、挑模型、思考强度。
+"""quick_judge.py 单元测试：请求词筛、一条一次判断、阈值、上限、上下文、挑模型、思考强度。
 
 红线：
 - 请求词过滤开着、这条 @ 里一个请求词都没有 → 不调模型、也不写 pending_asks（当闲聊）；
-- 批处理：等待窗口内来的 @ 合成一次模型调用（等多久 = [quick_judge] batch_wait_s）；
+- 一条 @ 一条模型调用（不攒批、不等待）：`enqueue` 同步零 I/O，后台立刻判这一条；
 - 拿不准 / 坏 JSON / 模型出错 / 当天次数用完 → 回落 pending_asks（老慢路径照旧）；
 - 收消息钩子绝不 await 模型调用，永远快速返回 continue。
 """
@@ -113,30 +113,6 @@ class _BlockingModels(_FakeModels):
         return await super().chat(role=role, messages=messages, **kw)
 
 
-class _Sleeper:
-    """记下等待秒数的假 sleep（立刻返回）。"""
-
-    def __init__(self) -> None:
-        self.calls: list[float] = []
-
-    async def __call__(self, seconds: float) -> None:
-        self.calls.append(float(seconds))
-
-
-class _Gate:
-    """可控 sleep：进到等待窗口就置 started，直到 release 才返回。"""
-
-    def __init__(self) -> None:
-        self.started = asyncio.Event()
-        self.release = asyncio.Event()
-        self.calls: list[float] = []
-
-    async def __call__(self, seconds: float) -> None:
-        self.calls.append(float(seconds))
-        self.started.set()
-        await self.release.wait()
-
-
 class _Rec:
     """同步记录回调（同步回调不产生 await 点，测试时序确定）。"""
 
@@ -166,7 +142,13 @@ class _Rec:
         )
 
 
+def _one(kind: str = "none", sure: float = 0.9, title: str = "", why: str = "") -> str:
+    """新版单条形状：{"kind":…,"sure":…,"title":…,"why":…}。"""
+    return json.dumps({"kind": kind, "sure": sure, "title": title, "why": why}, ensure_ascii=False)
+
+
 def _reply(items) -> str:
+    """旧版攒批形状（{"items":[...]}）：现在只认第一条，用来测容错。"""
     return json.dumps({"items": items}, ensure_ascii=False)
 
 
@@ -181,12 +163,9 @@ def _item(mid: str = "m1", text: str = "帮我整理一下", *, user: str = "100
     }
 
 
-def _make_qj(*, replies=None, store=None, rec=None, sleeper=None, entry_cands=None, models=None, **qj_cfg):
-    cfg = {"batch_wait_s": 15}
-    cfg.update(qj_cfg)
-    settings = _settings(**cfg)
+def _make_qj(*, replies=None, store=None, rec=None, entry_cands=None, models=None, **qj_cfg):
+    settings = _settings(**qj_cfg)
     rec = rec or _Rec()
-    sleeper = sleeper if sleeper is not None else _Sleeper()
     models = models if models is not None else _FakeModels(replies, entry_cands=entry_cands)
     qj = QuickJudge(
         lambda: settings,
@@ -195,9 +174,8 @@ def _make_qj(*, replies=None, store=None, rec=None, sleeper=None, entry_cands=No
         on_request=rec.on_request,
         on_reminder=rec.on_reminder,
         on_slow=rec.on_slow,
-        sleep=sleeper,
     )
-    return qj, models, rec, sleeper
+    return qj, models, rec
 
 
 class _Jev:
@@ -210,7 +188,7 @@ class _Jev:
         return self._available
 
     async def ask(self, state, questions, *, purpose: str, group_id: str = "", timeout_ms=None):
-        self.calls.append({"state": state, "purpose": purpose, "group_id": group_id})
+        self.calls.append({"state": state, "questions": questions, "purpose": purpose, "group_id": group_id})
         return self.answers
 
 
@@ -235,11 +213,6 @@ def _at_kwargs(text: str = "帮我整理一下", *, mid: str = "123", **kw):
     return hook_message(G1, text=text, is_at=True, message_id=mid, **kw)
 
 
-async def _instant(_seconds: float) -> None:
-    """测试用：批处理等待窗口立刻到点（别真睡十几秒）。"""
-    return None
-
-
 def _make_intake(settings, *, models=None, jev=None, store=None, approvals=None, mentions=None, spawned=None, **kw):
     spawned = spawned if spawned is not None else []
     intake = Intake(
@@ -250,7 +223,6 @@ def _make_intake(settings, *, models=None, jev=None, store=None, approvals=None,
         mentions=mentions,
         store=store,
         models=models,
-        quick_judge_sleep=_instant,
         spawn=lambda coro: spawned.append(coro),
         **kw,
     )
@@ -307,50 +279,45 @@ class TestRequestCue:
 
 
 # ----------------------------------------------------------------------
-# 2. 批处理 / 上下文
+# 2. 一条一次判断（不攒批）/ 上下文 / 去重
 # ----------------------------------------------------------------------
 
 
-class TestBatch:
+class TestOneShot:
     @pytest.mark.asyncio
-    async def test_two_at_in_the_wait_window_one_call(self) -> None:
-        gate = _Gate()
-        reply = _reply([{"i": 1, "kind": "none", "sure": 0.9}, {"i": 2, "kind": "none", "sure": 0.9}])
-        qj, models, rec, _ = _make_qj(replies=[reply], sleeper=gate)
-        qj.enqueue(G1, _item("m1", "帮我整理一下"))
-        await asyncio.wait_for(gate.started.wait(), 1)
-        assert models.calls == []  # 还在等窗口里
-        qj.enqueue(G1, _item("m2", "帮我查一下"))
-        gate.release.set()
-        await qj.join()
+    async def test_one_message_one_call_without_waiting(self) -> None:
+        """排进来就判：不用等窗口，一条消息一次调用。"""
+        qj, models, rec = _make_qj(replies=[_one("none", 0.9)])
+        assert qj.enqueue(G1, _item("m1", "帮我整理一下")) is True
+        await asyncio.wait_for(qj.join(), 2)
         assert len(models.calls) == 1
         text = models.calls[0]["messages"][-1]["content"]
-        assert "[1]" in text and "[2]" in text
-        assert "帮我整理一下" in text and "帮我查一下" in text
-        assert gate.calls == [15.0]  # 等的是配置里的 batch_wait_s
+        assert "帮我整理一下" in text
         assert rec.requests == [] and rec.reminders == [] and rec.slows == []
         await qj.close()
 
     @pytest.mark.asyncio
-    async def test_six_queued_flush_early(self) -> None:
-        gate = _Gate()  # 永不放行：攒够 6 条必须提前走
-        reply = _reply([{"i": i, "kind": "none", "sure": 0.9} for i in range(1, 7)])
-        qj, models, _rec, _ = _make_qj(replies=[reply], sleeper=gate)
-        for i in range(6):
-            qj.enqueue(G1, _item(f"m{i}"))
+    async def test_two_at_two_calls(self) -> None:
+        qj, models, rec = _make_qj(replies=[_one("none", 0.9), _one("none", 0.9)])
+        qj.enqueue(G1, _item("m1", "帮我整理一下"))
+        qj.enqueue(G1, _item("m2", "帮我查一下"))
         await asyncio.wait_for(qj.join(), 2)
-        assert len(models.calls) == 1
+        assert len(models.calls) == 2
+        texts = [c["messages"][-1]["content"] for c in models.calls]
+        assert any("帮我整理一下" in t for t in texts) and any("帮我查一下" in t for t in texts)
+        # 一次调用只看一条消息，不把两条混在一起
+        assert not any("帮我整理一下" in t and "帮我查一下" in t for t in texts)
         await qj.close()
 
     @pytest.mark.asyncio
     async def test_context_lines_in_prompt(self) -> None:
-        qj, models, _rec, _ = _make_qj(replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])])
+        qj, models, _rec = _make_qj(replies=[_one("none", 0.9)])
         ctx = [
             {"speaker": "MaiBot", "text": "昨晚那个活动结束了", "message_id": "c1", "bot": True},
             {"speaker": "小明", "text": "那我们周末干什么", "message_id": "c2", "bot": False},
         ]
         qj.enqueue(G1, _item("m1", "帮我把这两天的聊天整理成一份计划", context=ctx))
-        await qj.flush(G1)
+        await asyncio.wait_for(qj.join(), 2)
         text = models.calls[0]["messages"][-1]["content"]
         assert "MaiBot: 昨晚那个活动结束了" in text
         assert "小明: 那我们周末干什么" in text
@@ -358,19 +325,22 @@ class TestBatch:
 
     @pytest.mark.asyncio
     async def test_same_message_id_never_judged_twice(self) -> None:
-        qj, models, _rec, _ = _make_qj(replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])])
+        """同一条 @ 排两次（钩子重复触发）只调一次模型。"""
+        qj, models, _rec = _make_qj(replies=[_one("none", 0.9)])
         qj.enqueue(G1, _item("m1"))
-        await qj.flush(G1)
-        assert qj.enqueue(G1, _item("m1")) is True
-        await qj.flush(G1)
+        qj.enqueue(G1, _item("m1"))
+        await asyncio.wait_for(qj.join(), 2)
+        assert len(models.calls) == 1
+        assert qj.enqueue(G1, _item("m1")) is True   # 判过了：收下但不再花钱
+        await asyncio.wait_for(qj.join(), 2)
         assert len(models.calls) == 1
         await qj.close()
 
     @pytest.mark.asyncio
     async def test_message_arriving_during_the_model_call_is_judged(self) -> None:
-        """批处理正在调模型时又来了 @：这一批跑完要接着判它，不能让它一直躺在队列里。"""
-        models = _BlockingModels(replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])])
-        qj, _models, _rec, _ = _make_qj(models=models, replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])])
+        """第一条还在调模型时又来了 @：各自一条，不互相等。"""
+        models = _BlockingModels(replies=[_one("none", 0.9), _one("none", 0.9)])
+        qj, _models, _rec = _make_qj(models=models)
         qj.enqueue(G1, _item("m1", "帮我整理一下"))
         await asyncio.wait_for(models.started.wait(), 1)   # 第一次调用已经在路上
         qj.enqueue(G1, _item("m2", "帮我查一下"))           # 调用过程中又来一条
@@ -381,6 +351,44 @@ class TestBatch:
         assert "帮我查一下" in models.calls[1]["messages"][-1]["content"]
         await qj.close()
 
+    @pytest.mark.asyncio
+    async def test_old_items_shape_still_parsed(self) -> None:
+        """旧版 {"items":[…]} 形状（只有一条）照样认，别因为提示词换了就读不出来。"""
+        qj, _models, rec = _make_qj(
+            replies=[_reply([{"i": 1, "kind": "prepare", "sure": 0.9, "title": "整理成文档"}])]
+        )
+        qj.enqueue(G1, _item("m1"))
+        await asyncio.wait_for(qj.join(), 2)
+        assert len(rec.requests) == 1 and rec.requests[0]["title"] == "整理成文档"
+        await qj.close()
+
+    @pytest.mark.asyncio
+    async def test_empty_items_shape_goes_slow(self) -> None:
+        qj, _models, rec = _make_qj(replies=[_reply([])])
+        qj.enqueue(G1, _item("m1"))
+        await asyncio.wait_for(qj.join(), 2)
+        assert rec.requests == [] and len(rec.slows) == 1
+        await qj.close()
+
+    @pytest.mark.asyncio
+    async def test_close_hands_inflight_back_to_slow(self) -> None:
+        """停机：在跑的调用被取消，还没判的交回慢路径，一条都不丢。"""
+        models = _BlockingModels(replies=[_one("none", 0.9)])
+        qj, _models, rec = _make_qj(models=models)
+        qj.enqueue(G1, _item("m1", "帮我整理一下"))
+        await asyncio.wait_for(models.started.wait(), 1)
+        qj.enqueue(G1, _item("m2", "帮我查一下"))   # 还没开始调
+        await qj.close()
+        assert {s["message_id"] for s in rec.slows} == {"m1", "m2"}
+        assert all("打断" in s["reason"] for s in rec.slows)
+        assert [t for t in qj._tasks if not t.done()] == []
+
+    def test_enqueue_returns_false_without_event_loop(self) -> None:
+        """没有事件循环（钩子外直接调）：不收，让调用方走慢路径，别把这条吞了。"""
+        qj, models, rec = _make_qj(replies=[_one("none", 0.9)])
+        assert qj.enqueue(G1, _item("m1")) is False
+        assert models.calls == [] and rec.slows == [] and qj._judged == {}
+
 
 # ----------------------------------------------------------------------
 # 3. 每种结论的门槛
@@ -389,37 +397,36 @@ class TestBatch:
 
 class TestDecisions:
     async def _decide(self, reply, item=None, **qj_cfg):
-        qj, models, rec, _ = _make_qj(replies=[reply], **qj_cfg)
+        qj, models, rec = _make_qj(replies=[reply], **qj_cfg)
         qj.enqueue(G1, item or _item())
-        await qj.flush(G1)
+        await asyncio.wait_for(qj.join(), 2)
         await qj.close()
         return rec, models
 
     @pytest.mark.asyncio
     async def test_prepare_high_sure_creates_request(self) -> None:
-        rec, _ = await self._decide(
-            _reply([{"i": 1, "kind": "prepare", "sure": 0.85, "title": "整理成一份文档"}])
-        )
+        rec, _ = await self._decide(_one("prepare", 0.85, "整理成一份文档", why="他把记录整理成文档"))
         assert len(rec.requests) == 1
         assert rec.requests[0]["label"] == "prepare"
         assert rec.requests[0]["title"] == "整理成一份文档"
         assert rec.requests[0]["sure"] == pytest.approx(0.85)
+        assert rec.requests[0]["item"]["_why"] == "他把记录整理成文档"
         assert rec.slows == []
 
     @pytest.mark.asyncio
     async def test_goal_high_sure_creates_request(self) -> None:
-        rec, _ = await self._decide(_reply([{"i": 1, "kind": "goal", "sure": 0.9, "title": "盯着降价"}]))
+        rec, _ = await self._decide(_one("goal", 0.9, "盯着降价"))
         assert len(rec.requests) == 1 and rec.requests[0]["label"] == "goal"
 
     @pytest.mark.asyncio
     async def test_prepare_low_sure_goes_slow(self) -> None:
-        rec, _ = await self._decide(_reply([{"i": 1, "kind": "prepare", "sure": 0.79, "title": "x"}]))
+        rec, _ = await self._decide(_one("prepare", 0.79, "x"))
         assert rec.requests == []
         assert len(rec.slows) == 1 and "拿不准" in rec.slows[0]["reason"]
 
     @pytest.mark.asyncio
     async def test_reminder_sure_7_invokes_callback(self) -> None:
-        rec, _ = await self._decide(_reply([{"i": 1, "kind": "reminder", "sure": 0.7, "title": "提醒开会"}]))
+        rec, _ = await self._decide(_one("reminder", 0.7, "提醒开会"))
         assert len(rec.reminders) == 1
         gid, msg = rec.reminders[0]
         assert gid == G1 and msg["message_id"] == "m1" and msg["text"] == "帮我整理一下"
@@ -427,23 +434,18 @@ class TestDecisions:
 
     @pytest.mark.asyncio
     async def test_reminder_low_sure_goes_slow(self) -> None:
-        rec, _ = await self._decide(_reply([{"i": 1, "kind": "reminder", "sure": 0.69, "title": "x"}]))
+        rec, _ = await self._decide(_one("reminder", 0.69, "x"))
         assert rec.reminders == [] and len(rec.slows) == 1
 
     @pytest.mark.asyncio
     async def test_none_confident_records_nothing(self) -> None:
-        rec, _ = await self._decide(_reply([{"i": 1, "kind": "none", "sure": 0.7, "title": ""}]))
+        rec, _ = await self._decide(_one("none", 0.7))
         assert rec.requests == [] and rec.reminders == [] and rec.slows == []
 
     @pytest.mark.asyncio
     async def test_none_low_sure_goes_slow(self) -> None:
-        rec, _ = await self._decide(_reply([{"i": 1, "kind": "none", "sure": 0.5, "title": ""}]))
+        rec, _ = await self._decide(_one("none", 0.5))
         assert len(rec.slows) == 1
-
-    @pytest.mark.asyncio
-    async def test_missing_item_goes_slow(self) -> None:
-        rec, _ = await self._decide(_reply([{"i": 2, "kind": "prepare", "sure": 0.95, "title": "x"}]))
-        assert rec.requests == [] and len(rec.slows) == 1
 
     @pytest.mark.asyncio
     async def test_bad_json_goes_slow(self) -> None:
@@ -453,7 +455,7 @@ class TestDecisions:
 
     @pytest.mark.asyncio
     async def test_bad_sure_goes_slow(self) -> None:
-        rec, _ = await self._decide(_reply([{"i": 1, "kind": "prepare", "sure": "很高", "title": "x"}]))
+        rec, _ = await self._decide(_one("prepare", "很高", "x"))
         assert rec.requests == [] and len(rec.slows) == 1
 
     @pytest.mark.asyncio
@@ -463,10 +465,13 @@ class TestDecisions:
 
     @pytest.mark.asyncio
     async def test_title_truncated_to_20(self) -> None:
-        rec, _ = await self._decide(
-            _reply([{"i": 1, "kind": "prepare", "sure": 0.9, "title": "一二三四五六七八九十一二三四五六七八九十十一"}])
-        )
+        rec, _ = await self._decide(_one("prepare", 0.9, "一二三四五六七八九十一二三四五六七八九十十一"))
         assert len(rec.requests[0]["title"]) <= 20
+
+    @pytest.mark.asyncio
+    async def test_json_fence_stripped(self) -> None:
+        rec, _ = await self._decide("```json\n" + _one("prepare", 0.9, "整理") + "\n```")
+        assert len(rec.requests) == 1
 
 
 # ----------------------------------------------------------------------
@@ -479,14 +484,13 @@ class TestDailyCap:
     async def test_cap_reached_no_more_calls_and_slow_path(self, tmp_path) -> None:
         store = _store(tmp_path)
         day = clock.day_key(clock.now())
-        reply = _reply([{"i": 1, "kind": "none", "sure": 0.9}])
-        qj, models, rec, _ = _make_qj(store=store, daily_max=1, replies=[reply, reply])
+        qj, models, rec = _make_qj(store=store, daily_max=1, replies=[_one("none", 0.9), _one("none", 0.9)])
         qj.enqueue(G1, _item("m1"))
-        await qj.flush(G1)
+        await asyncio.wait_for(qj.join(), 2)
         assert len(models.calls) == 1
         assert store.kv_get(f"quick_judge.calls.{G1}.{day}") == 1
         qj.enqueue(G1, _item("m2"))
-        await qj.flush(G1)
+        await asyncio.wait_for(qj.join(), 2)
         assert len(models.calls) == 1
         assert [s["message_id"] for s in rec.slows] == ["m2"]
         assert rec.slows[0]["reason"] == "快速判断今天次数用完"
@@ -495,15 +499,14 @@ class TestDailyCap:
     @pytest.mark.asyncio
     async def test_cap_survives_restart(self, tmp_path) -> None:
         store = _store(tmp_path)
-        reply = _reply([{"i": 1, "kind": "none", "sure": 0.9}])
-        qj, models, _rec, _ = _make_qj(store=store, daily_max=1, replies=[reply])
+        qj, _models, _rec = _make_qj(store=store, daily_max=1, replies=[_one("none", 0.9)])
         qj.enqueue(G1, _item("m1"))
-        await qj.flush(G1)
+        await asyncio.wait_for(qj.join(), 2)
         await qj.close()
         # 新进程（新实例、同一个库）：今天的次数不清零
-        qj2, models2, rec2, _ = _make_qj(store=store, daily_max=1, replies=[reply])
+        qj2, models2, rec2 = _make_qj(store=store, daily_max=1, replies=[_one("none", 0.9)])
         qj2.enqueue(G1, _item("m2"))
-        await qj2.flush(G1)
+        await asyncio.wait_for(qj2.join(), 2)
         assert models2.calls == []
         assert rec2.slows and rec2.slows[0]["reason"] == "快速判断今天次数用完"
         await qj2.close()
@@ -511,9 +514,9 @@ class TestDailyCap:
     @pytest.mark.asyncio
     async def test_daily_max_zero_never_calls(self, tmp_path) -> None:
         store = _store(tmp_path)
-        qj, models, rec, _ = _make_qj(store=store, daily_max=0, replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])])
+        qj, models, rec = _make_qj(store=store, daily_max=0, replies=[_one("none", 0.9)])
         qj.enqueue(G1, _item("m1"))
-        await qj.flush(G1)
+        await asyncio.wait_for(qj.join(), 2)
         assert models.calls == []
         assert rec.slows and rec.slows[0]["reason"] == "快速判断今天次数用完"
         await qj.close()
@@ -528,40 +531,40 @@ class TestModelChoice:
     @pytest.mark.asyncio
     async def test_configured_entry_candidates_passed(self) -> None:
         sentinel = [object()]
-        models = _FakeModels(replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])], entry_cands={"q1": sentinel})
-        qj, _models, _rec, _ = _make_qj(models=models, model="q1")
+        models = _FakeModels(replies=[_one("none", 0.9)], entry_cands={"q1": sentinel})
+        qj, _models, _rec = _make_qj(models=models, model="q1")
         qj.enqueue(G1, _item("m1"))
-        await qj.flush(G1)
+        await asyncio.wait_for(qj.join(), 2)
         assert models.entry_queries == ["q1"]
         assert models.calls[0]["_candidates"] == sentinel
         await qj.close()
 
     @pytest.mark.asyncio
     async def test_unknown_entry_falls_back_to_main_chain(self) -> None:
-        models = _FakeModels(replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])], entry_cands={})
-        qj, _models, _rec, _ = _make_qj(models=models, model="没有这条")
+        models = _FakeModels(replies=[_one("none", 0.9)], entry_cands={})
+        qj, _models, _rec = _make_qj(models=models, model="没有这条")
         qj.enqueue(G1, _item("m1"))
-        await qj.flush(G1)
+        await asyncio.wait_for(qj.join(), 2)
         assert models.entry_queries == ["没有这条"]
         assert models.calls[0].get("_candidates") is None  # 用主模型的链
         await qj.close()
 
     @pytest.mark.asyncio
     async def test_empty_model_uses_main_chain_without_lookup(self) -> None:
-        models = _FakeModels(replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])])
-        qj, _models, _rec, _ = _make_qj(models=models, model="")
+        models = _FakeModels(replies=[_one("none", 0.9)])
+        qj, _models, _rec = _make_qj(models=models, model="")
         qj.enqueue(G1, _item("m1"))
-        await qj.flush(G1)
+        await asyncio.wait_for(qj.join(), 2)
         assert models.entry_queries == []
         assert models.calls[0].get("_candidates") is None
         await qj.close()
 
     @pytest.mark.asyncio
     async def test_call_shape(self) -> None:
-        """一次批处理就是一次 chat：主模型、JSON、低强度、便宜、短超时。"""
-        qj, models, _rec, _ = _make_qj(replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])])
+        """一条消息就是一次 chat：主模型、JSON、低强度、便宜、短超时。"""
+        qj, models, _rec = _make_qj(replies=[_one("none", 0.9)])
         qj.enqueue(G1, _item("m1"))
-        await qj.flush(G1)
+        await asyncio.wait_for(qj.join(), 2)
         kw = models.calls[0]
         assert kw["role"] is None and kw["agent"] == "main"
         assert kw["json_mode"] is True
@@ -576,7 +579,7 @@ class TestModelChoice:
 
 
 # ----------------------------------------------------------------------
-# 6. 收消息钩子的接线（回落 / 快速返回）
+# 6. 收消息钩子的接线（回落 / 快速返回 / via / Jev 上下文）
 # ----------------------------------------------------------------------
 
 
@@ -600,7 +603,7 @@ class TestIntakeRouting:
     async def test_jev_unsure_goes_to_quick_judge(self) -> None:
         settings = _settings()
         ap, mn = _Approvals(), _Mentions()
-        reply = _reply([{"i": 1, "kind": "prepare", "sure": 0.9, "title": "整理成一份文档"}])
+        reply = _one("prepare", 0.9, "整理成一份文档", why="他把这几天的记录要整理成文档")
         models = _FakeModels(replies=[reply])
         jev = _Jev({"kind": ("prepare", 0.5, 0.65)})
         intake, _spawned = _make_intake(settings, models=models, jev=jev, approvals=ap, mentions=mn)
@@ -609,8 +612,7 @@ class TestIntakeRouting:
         assert intake.slow_queue == []     # 也没写慢路径
         await intake.quick_judge.join()
         assert len(ap.created) == 1
-        via = ap.created[0][1]["via"]
-        assert via.startswith("群里 @ · 快速判断是「准备东西」（把握 0.90）")
+        assert ap.created[0][1]["via"] == "群里 @ · 快速判断：他把这几天的记录要整理成文档"
         assert ap.created[0][1]["title"] == "整理成一份文档"
         assert ap.created[0][1]["message_id"] == "555"
         assert len(models.calls) == 1
@@ -619,10 +621,36 @@ class TestIntakeRouting:
         await intake.quick_judge.close()
 
     @pytest.mark.asyncio
+    async def test_via_truncated_to_60(self) -> None:
+        settings = _settings()
+        ap = _Approvals()
+        models = _FakeModels(replies=[_one("prepare", 0.9, "整理成一份文档", why="很" * 100)])
+        jev = _Jev({"kind": ("prepare", 0.5, 0.65)})
+        intake, _ = _make_intake(settings, models=models, jev=jev, approvals=ap)
+        await intake.handle(_at_kwargs("帮我把这几天的记录整理成一份文档", mid="556"))
+        await intake.quick_judge.join()
+        via = ap.created[0][1]["via"]
+        assert len(via) <= 60
+        assert via.startswith("群里 @ · 快速判断：")
+        await intake.quick_judge.close()
+
+    @pytest.mark.asyncio
+    async def test_via_falls_back_when_why_empty(self) -> None:
+        settings = _settings()
+        ap = _Approvals()
+        models = _FakeModels(replies=[_one("goal", 0.9, "", why="")])
+        jev = _Jev({"kind": ("goal", 0.5, 0.5)})
+        intake, _ = _make_intake(settings, models=models, jev=jev, approvals=ap)
+        await intake.handle(_at_kwargs("帮我把这几天的记录整理成一份文档", mid="557"))
+        await intake.quick_judge.join()
+        assert ap.created[0][1]["via"] == "群里 @ · 快速判断是「帮忙盯着或做成」"
+        await intake.quick_judge.close()
+
+    @pytest.mark.asyncio
     async def test_jev_unavailable_goes_to_quick_judge(self) -> None:
         settings = _settings()
         ap = _Approvals()
-        models = _FakeModels(replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])])
+        models = _FakeModels(replies=[_one("none", 0.9)])
         jev = _Jev(None, available=False)
         intake, _ = _make_intake(settings, models=models, jev=jev, approvals=ap)
         await intake.handle(_at_kwargs())
@@ -635,7 +663,7 @@ class TestIntakeRouting:
     @pytest.mark.asyncio
     async def test_quick_judge_disabled_goes_slow(self) -> None:
         settings = _settings(enabled=False)
-        models = _FakeModels(replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])])
+        models = _FakeModels(replies=[_one("none", 0.9)])
         intake, _ = _make_intake(settings, models=models)
         await intake.handle(_at_kwargs("帮我把记录整理成文档", mid="556"))
         await _drain([])
@@ -646,7 +674,7 @@ class TestIntakeRouting:
     @pytest.mark.asyncio
     async def test_keyword_filter_on_banter_skipped_entirely(self) -> None:
         settings = _settings(keyword_filter=True)
-        models = _FakeModels(replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])])
+        models = _FakeModels(replies=[_one("none", 0.9)])
         intake, _ = _make_intake(settings, models=models)
         await intake.handle(_at_kwargs("宝宝你看我给你买的鞋", mid="557"))
         assert models.calls == []
@@ -656,7 +684,7 @@ class TestIntakeRouting:
     @pytest.mark.asyncio
     async def test_keyword_filter_on_with_cue_still_judged(self) -> None:
         settings = _settings(keyword_filter=True)
-        models = _FakeModels(replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])])
+        models = _FakeModels(replies=[_one("none", 0.9)])
         intake, _ = _make_intake(settings, models=models)
         await intake.handle(_at_kwargs("帮我搞个不要钱的k3过来", mid="558"))
         await intake.quick_judge.join()
@@ -666,7 +694,7 @@ class TestIntakeRouting:
     @pytest.mark.asyncio
     async def test_keyword_filter_off_banter_still_judged(self) -> None:
         settings = _settings(keyword_filter=False)
-        models = _FakeModels(replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])])
+        models = _FakeModels(replies=[_one("none", 0.9)])
         intake, _ = _make_intake(settings, models=models)
         await intake.handle(_at_kwargs("宝宝你看我给你买的鞋", mid="559"))
         await intake.quick_judge.join()
@@ -691,7 +719,7 @@ class TestIntakeRouting:
     async def test_cap_reached_lands_in_pending_asks(self, tmp_path) -> None:
         store = _store(tmp_path)
         settings = _settings(daily_max=1)
-        models = _FakeModels(replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])])
+        models = _FakeModels(replies=[_one("none", 0.9)])
         intake, _ = _make_intake(settings, models=models, store=store)
         await intake.handle(_at_kwargs("帮我整理成文档", mid="601"))
         await intake.quick_judge.join()
@@ -706,7 +734,7 @@ class TestIntakeRouting:
     @pytest.mark.asyncio
     async def test_hook_returns_quickly_and_never_awaits_model(self) -> None:
         settings = _settings()
-        models = _FakeModels(replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])], delay_s=0.5)
+        models = _FakeModels(replies=[_one("none", 0.9)], delay_s=0.5)
         intake, _ = _make_intake(settings, models=models)
         start = time.monotonic()
         out = await intake.handle(_at_kwargs("帮我整理成文档", mid="603"))
@@ -721,7 +749,7 @@ class TestIntakeRouting:
     @pytest.mark.asyncio
     async def test_ring_records_bot_and_plain_messages_as_context(self) -> None:
         settings = _settings()
-        models = _FakeModels(replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])])
+        models = _FakeModels(replies=[_one("none", 0.9)])
         intake, _ = _make_intake(settings, models=models, bot_qq="424242")
         # 机器人自己发的一条 + 群友的一句闲聊，都该出现在给快速判断的上下文里
         await intake.handle(hook_message(G1, user_id="424242", text="我昨天说过活动结束了", message_id="c1"))
@@ -736,7 +764,7 @@ class TestIntakeRouting:
     @pytest.mark.asyncio
     async def test_ring_keeps_only_last_eight(self) -> None:
         settings = _settings()
-        models = _FakeModels(replies=[_reply([{"i": 1, "kind": "none", "sure": 0.9}])])
+        models = _FakeModels(replies=[_one("none", 0.9)])
         intake, _ = _make_intake(settings, models=models)
         for i in range(10):
             await intake.handle(hook_message(G1, text=f"闲聊第{i}条", message_id=f"r{i}"))
@@ -746,6 +774,96 @@ class TestIntakeRouting:
         assert "闲聊第9条" in text
         assert "闲聊第0条" not in text      # 只留最近 8 条
         await intake.quick_judge.close()
+
+
+# ----------------------------------------------------------------------
+# 6b. Jev 也带上下文（最多 4 条，USER 在最后）
+# ----------------------------------------------------------------------
+
+
+class TestJevContext:
+    @pytest.mark.asyncio
+    async def test_state_has_context_with_user_last(self) -> None:
+        settings = _settings()
+        jev = _Jev({"kind": ("none", 0.9, 0.9)})
+        intake, _ = _make_intake(settings, jev=jev, bot_qq="424242")
+        await intake.handle(hook_message(G1, user_id="424242", text="机器人说过的话", message_id="c1"))
+        await intake.handle(hook_message(G1, text="群友闲聊一句", message_id="c2"))
+        await intake.handle(_at_kwargs("帮我整理一下", mid="c3"))
+        msgs = jev.calls[0]["state"]["messages"]
+        assert [m["speaker"] for m in msgs] == ["MaiBot", "群友", "USER"]
+        assert msgs[-1]["text"] == "帮我整理一下"
+        assert msgs[0]["text"] == "机器人说过的话"
+        # 只带上下文文字，不把内部字段（message_id / bot）塞给 Jev
+        assert set(msgs[0]) == {"speaker", "text"}
+
+    @pytest.mark.asyncio
+    async def test_state_keeps_only_last_four_context_messages(self) -> None:
+        settings = _settings()
+        jev = _Jev({"kind": ("none", 0.9, 0.9)})
+        intake, _ = _make_intake(settings, jev=jev)
+        for i in range(6):
+            await intake.handle(hook_message(G1, text=f"第{i}句", message_id=f"c{i}"))
+        await intake.handle(_at_kwargs("帮我整理一下", mid="c9"))
+        msgs = jev.calls[0]["state"]["messages"]
+        assert [m["speaker"] for m in msgs] == ["群友"] * 4 + ["USER"]
+        assert msgs[0]["text"] == "第2句" and msgs[3]["text"] == "第5句"
+
+    @pytest.mark.asyncio
+    async def test_state_drops_oldest_context_over_800_chars(self) -> None:
+        settings = _settings()
+        jev = _Jev({"kind": ("none", 0.9, 0.9)})
+        intake, _ = _make_intake(settings, jev=jev)
+        for i in range(4):
+            await intake.handle(hook_message(G1, text="甲" * 120, message_id=f"c{i}"))
+        await intake.handle(_at_kwargs("乙" * 500, mid="c9"))
+        msgs = jev.calls[0]["state"]["messages"]
+        assert msgs[-1]["speaker"] == "USER" and len(msgs[-1]["text"]) == 500
+        assert sum(len(m["text"]) for m in msgs) <= 800
+        assert len(msgs) == 3          # 4 条上下文太长了，从最老的开始丢
+
+    @pytest.mark.asyncio
+    async def test_state_text_truncated_to_500(self) -> None:
+        settings = _settings()
+        jev = _Jev({"kind": ("none", 0.9, 0.9)})
+        intake, _ = _make_intake(settings, jev=jev)
+        await intake.handle(_at_kwargs("长" * 800, mid="c1"))
+        msgs = jev.calls[0]["state"]["messages"]
+        assert len(msgs) == 1
+        assert msgs[0]["speaker"] == "USER" and len(msgs[0]["text"]) == 500
+
+    def test_instructions_text_points_at_the_last_message(self) -> None:
+        from CharTyr_MaiWork.maiwork.intake import _AT_QUESTIONS
+
+        assert _AT_QUESTIONS["kind"]["instructions"] == (
+            "群里有人 @ MaiBot。最后一条（USER）是这条 @ 的消息，前面几条只是上下文。这条 @ 是在请 MaiBot 做什么？"
+        )
+        # 判准（criteria）不动
+        c = _AT_QUESTIONS["kind"]["criteria"]
+        assert c["prepare"].startswith("请 MaiBot 准备/整理/调研")
+        assert c["goal"].startswith("请 MaiBot 在网上帮忙盯着")
+        assert c["reminder"].startswith("请 MaiBot 到时间提醒")
+        assert c["none"].startswith("都不是")
+
+    def test_openai_decisions_multi_message_state(self) -> None:
+        """openai_decisions 协议：多条消息的状态要进 input，不能丢也不能炸。"""
+        from CharTyr_MaiWork.maiwork.jev import build_body
+
+        state = {
+            "messages": [
+                {"speaker": "群友", "text": "前面说的是活动"},
+                {"speaker": "USER", "text": "帮我整理一下"},
+            ]
+        }
+        body = build_body(
+            "openai_decisions", "m", state,
+            {"kind": {"type": "choice", "instructions": "在请 MaiBot 做什么？", "criteria": {"prepare": "准备", "none": "都不是"}}},
+        )
+        assert isinstance(body["input"], str)
+        assert "帮我整理一下" in body["input"] and "前面说的是活动" in body["input"]
+        assert body["questions"][0]["type"] == "choice"
+        # systemone 原样带走 messages
+        assert build_body("systemone", "m", state, {})["state"] == state
 
 
 # ----------------------------------------------------------------------
@@ -843,7 +961,7 @@ class TestModelsEffortAndEntry:
 
 
 # ----------------------------------------------------------------------
-# 8. 配置规范化 + 网页健康行
+# 8. 配置规范化 + 全部设置的高级项 + 网页健康行
 # ----------------------------------------------------------------------
 
 
@@ -855,20 +973,65 @@ class TestConfigAndWeb:
         assert qj.model == ""
         assert qj.keyword_filter is False
         assert qj.daily_max == 30
-        assert qj.batch_wait_s == 15
+        assert not hasattr(qj, "batch_wait_s")   # 攒批参数已删
 
-    def test_clamped_with_chinese_problems(self) -> None:
+    def test_daily_max_clamped_with_chinese_problems(self) -> None:
         settings, problems = load_settings(
             {
                 "plugin": {"enabled": True},
                 "groups": {"serve": [{"group": f"qq:{G1}"}]},
-                "quick_judge": {"daily_max": 999, "batch_wait_s": 1},
+                "quick_judge": {"daily_max": 999},
             }
         )
         assert settings.quick_judge.daily_max == 500
-        assert settings.quick_judge.batch_wait_s == 3
         assert any("daily_max" in p for p in problems)
-        assert any("batch_wait_s" in p for p in problems)
+
+    def test_old_config_with_batch_wait_s_loads_clean(self) -> None:
+        """老 config.toml 还留着 batch_wait_s：能读、不报问题。"""
+        settings, problems = load_settings(
+            {
+                "plugin": {"enabled": True, "config_version": "0.4.8"},
+                "groups": {"serve": [{"group": f"qq:{G1}"}]},
+                "quick_judge": {"enabled": True, "keyword_filter": True, "daily_max": 12, "batch_wait_s": 15},
+            }
+        )
+        assert problems == []
+        qj = settings.quick_judge
+        assert qj.daily_max == 12 and qj.keyword_filter is True
+        assert not hasattr(qj, "batch_wait_s")
+
+    def test_old_config_with_batch_wait_s_survives_host_normalize(self) -> None:
+        """宿主那层（PluginConfigBase，extra="ignore"）也认：老的 batch_wait_s 被忽略、不报错。"""
+        from CharTyr_MaiWork.plugin import create_plugin
+
+        cfg, _changed = create_plugin().normalize_plugin_config(
+            {
+                "plugin": {"enabled": False, "config_version": "0.4.8"},
+                "groups": {"serve": [{"group": f"qq:{G1}"}]},
+                "quick_judge": {"enabled": True, "keyword_filter": True, "daily_max": 12, "batch_wait_s": 15},
+            }
+        )
+        assert cfg["plugin"]["enabled"] is False
+        assert "groups" in cfg
+        assert "batch_wait_s" not in cfg["quick_judge"]
+        assert cfg["quick_judge"]["daily_max"] == 12 and cfg["quick_judge"]["keyword_filter"] is True
+
+    def test_daily_max_is_advanced_and_batch_wait_gone(self, tmp_path) -> None:
+        from CharTyr_MaiWork.maiwork import rules
+
+        store = _store(tmp_path)
+        try:
+            fields = {
+                f["key"]: f
+                for s in rules.config_view(_settings(), store)["sections"]
+                for f in s["fields"]
+            }
+            assert fields["quick_judge.daily_max"]["advanced"] is True
+            assert fields["quick_judge.enabled"]["advanced"] is False
+            assert "quick_judge.keyword_filter" in fields
+            assert "quick_judge.batch_wait_s" not in fields
+        finally:
+            store.close()
 
     def test_health_line(self, tmp_path) -> None:
         import types

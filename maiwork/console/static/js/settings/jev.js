@@ -55,9 +55,6 @@ function quickJudgeBlock(q) {
     <p class="fine" style="margin:2px 0 0">选个便宜快的就够，判断很简单</p>
     <label class="chk"><input id="qj-keyword" type="checkbox"${q.keyword_filter ? " checked" : ""} />先用请求词过一遍</label>
     <p class="fine" style="margin:2px 0 0">没有「帮我、整理、查一下、提醒我」这类词的 @ 直接当闲聊，不花钱；说法含糊的派活可能漏掉</p>
-    <label for="qj-max">每群每天最多判断几次</label>
-    <input id="qj-max" type="number" min="0" max="500" value="${esc(q.daily_max ?? 30)}" />
-    <p class="err" id="qj-err" role="alert" hidden></p>
     <div class="actions"><button class="btn primary" type="button" data-act="qj-save">保存</button></div>
   </div>`;
 }
@@ -259,20 +256,12 @@ export async function actJev(action, el) {
     case "qj-save": {
       const q = (v && v.quick_judge) || {};
       const box = (x) => ($(x) && typeof $(x).checked === "boolean" ? $(x).checked : null);
-      const raw = $("qj-max") ? String($("qj-max").value).trim() : String(q.daily_max ?? 30);
-      const max = /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
-      if (!Number.isFinite(max) || max > 500) {
-        const e = $("qj-err");
-        if (e) { e.textContent = "每天次数填 0 到 500 的整数"; e.hidden = false; } else toast("每天次数填 0 到 500 的整数", true);
-        return true;
-      }
       const enabled = box("qj-enabled");
       const keyword = box("qj-keyword");
       const body = {
         "quick_judge.enabled": enabled === null ? !!q.enabled : enabled,
         "quick_judge.model": $("qj-model") ? String($("qj-model").value) : String(q.model || ""),
         "quick_judge.keyword_filter": keyword === null ? !!q.keyword_filter : keyword,
-        "quick_judge.daily_max": max,
       };
       el.disabled = true;
       try {

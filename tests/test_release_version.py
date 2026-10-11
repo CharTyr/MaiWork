@@ -1,10 +1,10 @@
-"""发布版本号元数据：发布前必须一起对齐（0.8.0 见 docs/19；0.9.0 = 构想可行性闸 + 资讯来源多样化；0.9.1 = 取源跟随跳转 + 搜索软倾斜 + 找来源搜索 + 优质来源占比；0.9.2 = 任务双岗协作（docs/20），库号 35，2026-10-05；0.9.3 = 任务执行重设计 + 资讯卡片改版 + 个人提议核实 + 交接包 + 上下文压缩二轮 + 交付体验 + 派活备忘，库号 35 → 37，2026-10-09；0.9.4 = 多家判断服务 + 派活判断兜底，配置版本 0.4.8，库号不变，2026-10-11）。
+"""发布版本号元数据：发布前必须一起对齐（0.8.0 见 docs/19；0.9.0 = 构想可行性闸 + 资讯来源多样化；0.9.1 = 取源跟随跳转 + 搜索软倾斜 + 找来源搜索 + 优质来源占比；0.9.2 = 任务双岗协作（docs/20），库号 35，2026-10-05；0.9.3 = 任务执行重设计 + 资讯卡片改版 + 个人提议核实 + 交接包 + 上下文压缩二轮 + 交付体验 + 派活备忘，库号 35 → 37，2026-10-09；0.9.4 = 多家判断服务 + 派活判断兜底，配置版本 0.4.8，库号不变，2026-10-11；0.9.4 之后 = 快速判断不再攒批，配置版本 0.4.9）。
 
 只读 manifest / plugin.py / config.py 里的版本常量，不碰线上配置：
-- 发布版本 = 0.9.4（`_manifest.json` 的 version 与 `plugin.PLUGIN_VERSION` 必须一致）；
-- `CONFIG_VERSION` 0.4.7 → 0.4.8（[quick_judge] 派活判断兜底：Jev 不在 / 拿不准时用模型
-  快速判群里 @ 的是不是派活），
-  宿主不需要为这次 bump 改任何插件配置（新键都有默认值，老配置照常读）；
+- 发布版本 = 0.9.5（`_manifest.json` 的 version 与 `plugin.PLUGIN_VERSION` 必须一致）；
+- `CONFIG_VERSION` 0.4.8 → 0.4.9（[quick_judge] 不再攒批：删掉 batch_wait_s，一条 @ 一条
+  模型调用；daily_max 归「全部设置」的高级项），
+  宿主不需要为这次 bump 改任何插件配置（新键都有默认值，老配置照常读，老的 batch_wait_s 被忽略）；
 - manifest 声明的 SDK / 宿主版本范围仍然覆盖当前开发（SDK 2.8.1）与线上宿主
   （MaiCore 1.3.2 / SDK 2.8.2，docs/06）；
 - 不给 MaiBot 的 planner 注册任何工具（设计红线）。
@@ -21,8 +21,8 @@ from packaging.version import Version
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 MANIFEST = json.loads((PLUGIN_DIR / "_manifest.json").read_text(encoding="utf-8"))
 
-RELEASE_VERSION = "0.9.4"
-CONFIG_VERSION_EXPECTED = "0.4.8"
+RELEASE_VERSION = "0.9.5"
+CONFIG_VERSION_EXPECTED = "0.4.9"
 # 声明范围必须覆盖的版本：本地开发 SDK / 线上宿主与 SDK（docs/06 §QQ 官方适配器统一账号 2026-10-03）
 SDK_VERSIONS_COVERED = ("2.8.1", "2.8.2")
 HOST_VERSION_COVERED = "1.3.2"
@@ -33,7 +33,7 @@ HOST_DEV_VERSION_SEEN = "1.3.6"
 SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
 
 
-def test_release_version_is_0_9_4():
+def test_release_version_is_0_9_5():
     from CharTyr_MaiWork.plugin import PLUGIN_VERSION
 
     assert PLUGIN_VERSION == RELEASE_VERSION, PLUGIN_VERSION

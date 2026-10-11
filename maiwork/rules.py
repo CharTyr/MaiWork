@@ -407,7 +407,7 @@ _ADVANCED_KEYS = frozenset({
     "topics.candidate_ttl_hours", "console.listen",
     "tasks.token_limit", "tasks.run_seconds", "storage.data_dir",
     "jev.timeout_ms", "jev.key_file", "jev.api_url", "jev.model", "jev.use",
-    "quick_judge.model", "quick_judge.batch_wait_s",
+    "quick_judge.model", "quick_judge.daily_max",
     "environments.workspace_root", "environments.memory_max", "environments.runtime_max_sec",
     "environments.local_mode", "environments.run_as", "environments.max_parallel",
     "environments.command_timeout_s", "environments.railway_daily_max",
@@ -528,11 +528,10 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
        "str", check=_check_jev_use),
 
     # ---- quick_judge ----
-    _F("quick_judge.enabled", "派活判断兜底", "没配 Jev 或 Jev 拿不准时，用模型快速判一次", "bool"),
+    _F("quick_judge.enabled", "派活判断兜底", "没配 Jev 或 Jev 拿不准时，用模型快速判这条 @", "bool"),
     _F("quick_judge.model", "判断用哪个模型", "填模型库条目 id；空 = 跟主模型一条链", "str"),
     _F("quick_judge.keyword_filter", "先过请求词", "没有请求词的 @ 当闲聊；可能漏掉说法含糊的派活", "bool"),
-    _F("quick_judge.daily_max", "每天判断次数", "每个群每天最多判几次；0 = 不用模型", "int", min=0, max=500),
-    _F("quick_judge.batch_wait_s", "等几秒攒批", "第一条 @ 进来后等几秒合成一次判断", "int", min=3, max=120),
+    _F("quick_judge.daily_max", "每天判断次数", "每个群每天最多判几次；一条 @ 算一次；0 = 不用模型", "int", min=0, max=500),
 
     # ---- usage ----
     _F("usage.alert_daily_tokens", "每日提醒线", "每天用超就提醒；0 = 不提醒", "int", min=0, max=10**9),
