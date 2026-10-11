@@ -125,10 +125,14 @@ def _push_kinds(store: Store) -> list[str]:
 
 
 async def test_quota_free_kind_only_recognizes_task_rows():
-    """只有 task_id 非空 + delivery/status 才算任务自己的消息；其余原样。"""
-    assert TASK_QUOTA_FREE_KINDS == frozenset(("task_delivery", "task_status"))
+    """只有 task_id 非空 + delivery/status 才算任务自己的消息；goal_result 按 kind 直接认。"""
+    # goals-fit（2026-10-11）：目标的「盯到了 / 完成了」（goal_result，不带 task_id）同口径
+    assert TASK_QUOTA_FREE_KINDS == frozenset(
+        ("task_delivery", "task_status", "goal_result")
+    )
     assert task_quota_free_kind("T-14", "status") == "task_status"
     assert task_quota_free_kind("T-14", "delivery") == "task_delivery"
+    assert task_quota_free_kind(None, "goal_result") == "goal_result"
     # 没有 task_id：成员提醒 / 目标巡检 / 群公告预告这些状态行一点都不变
     assert task_quota_free_kind("", "status") == "status"
     assert task_quota_free_kind(None, "delivery") == "delivery"

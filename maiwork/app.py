@@ -115,6 +115,8 @@ class MaiWorkApp:
         self.approvals: Any = None
         # 派活自动审核（auto_review.py）：低风险轻活由主模型判断后自动批
         self.auto_review: Any = None
+        # 立目标前的判断（goal_fit.py，R5）：goal 请求先判「MaiWork 自己能不能盯 / 做成」
+        self.goal_fit: Any = None
         self.env: Any = None
         # 本机执行能力判定（environments/capability.py）：启动算一次、记一行中文日志；
         # fixed=固定用户隔离 / dynamic=自动分配用户隔离 / stopped=本机不能隔离跑命令。
@@ -606,6 +608,8 @@ class MaiWorkApp:
         # 派活自动审核（auto_review.py）：Approvals 每落一条待批请求就回调一次，
         # 这里把判断 spawn 到后台（调模型是慢活，绝不卡住收消息钩子）
         self.auto_review = self._make_auto_review()
+        # 立目标前的判断（goal_fit.py，R5）：同一个回调里再 spawn 一次
+        self.goal_fit = self._make_goal_fit()
         self._wire_auto_review()
         # 执行方式自动判定：fixed（固定用户隔离）/ dynamic（自动分配用户隔离）/ stopped（受限）
         self._detect_local_capability()
@@ -999,6 +1003,7 @@ class MaiWorkApp:
         self.goals = None
         self.approvals = None
         self.auto_review = None
+        self.goal_fit = None
         self.env = None
         self.railway = None
         self.outbox = None
@@ -1628,14 +1633,26 @@ class MaiWorkApp:
             logger.exception("建 AutoReviewer 出错，派活自动审核这次跳过")
             return None
 
+    def _make_goal_fit(self) -> Any:
+        """立目标前的判断（goal_fit.py，R5）；模块没就位 / 构造失败就 None，这块功能跳过。"""
+        try:
+            from .goal_fit import GoalFitJudge
+
+            return GoalFitJudge(
+                self.store, self.models, self.get_settings, approvals=self.approvals,
+            )
+        except Exception:
+            logger.exception("建 GoalFitJudge 出错，立目标前判断这次跳过")
+            return None
+
     def _wire_auto_review(self) -> None:
         """把「刚记下一条待批请求」的回调挂到 Approvals 上。
 
         回调只登记（spawn 后台协程），所以收消息钩子永远不会被审核卡住。
+        两个后台判断各自可选：自动审核和立目标前判断（R5）谁没就位都不影响另一个挂上。
         """
-        reviewer = self.auto_review
         approvals = self.approvals
-        if reviewer is None or approvals is None:
+        if approvals is None or (self.auto_review is None and self.goal_fit is None):
             return
         try:
             approvals.set_review_hook(self._spawn_auto_review)
@@ -1643,14 +1660,16 @@ class MaiWorkApp:
             logger.exception("挂自动审核回调出错，派活自动审核这次不生效")
 
     def _spawn_auto_review(self, request_id: str, group_id: str) -> None:
-        """Approvals.create 落了 pending 之后的回调：后台审一次（失败只记日志）。"""
-        reviewer = self.auto_review
-        if reviewer is None:
-            return
+        """Approvals.create 落了 pending 之后的回调：后台审一次 + 判一次目标贴合（失败只记日志）。"""
         rid = str(request_id or "")
         if not rid:
             return
-        self._spawn_bg(reviewer.review(rid, group_id=str(group_id or "")), name=f"maiwork-review-{rid}")
+        reviewer = self.auto_review
+        if reviewer is not None:
+            self._spawn_bg(reviewer.review(rid, group_id=str(group_id or "")), name=f"maiwork-review-{rid}")
+        judge = self.goal_fit
+        if judge is not None:
+            self._spawn_bg(judge.judge(rid), name=f"maiwork-goalfit-{rid}")
 
     def _make_identity(self) -> Any:
         """identity.py（身份与工作记忆）；没就位 / 构造失败就 None，各注入点自动跳过。"""
@@ -1870,6 +1889,8 @@ class MaiWorkApp:
                 self.get_settings, host=self.host, railway=self.railway,
                 group_space=self.group_space, identity=self.identity,
                 capability=self.capability, ssh=self.ssh,
+                # goals-fit R4（2026-10-11）：目标平时进展只进网页 + 可提起清单，不发群。
+                mentions=getattr(self, "mentions", None),
             )
         except TypeError:
             # 老的 / 测试替身 Coordinator 不认 ssh 参数：不带它再建一次

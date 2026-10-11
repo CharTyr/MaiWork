@@ -1111,6 +1111,33 @@ class TestGroupViewM2Fields:
             assert any(it["syntax"] == "/mw 帮助" for it in view["commands"]["items"])
 
     @pytest.mark.asyncio
+    async def test_group_view_carries_plain_usage_tips_with_bot_name(self, m2_client) -> None:
+        """网页群视图也带两条大白话用法：{bot} 换成 host 预热缓存里的机器人名字。"""
+        from CharTyr_MaiWork.maiwork.commands import USAGE_TIPS, help_text, usage_tips
+        from CharTyr_MaiWork.maiwork.console import views as _views
+
+        svc = m2_client.app
+        # 没有 host（或没预热）时回落 MaiBot
+        assert svc.host is None
+        view = _views.group_view(svc, G1, admin=True)
+        assert view["commands"]["tips"] == usage_tips("")
+        assert all("MaiBot" in t["say"] for t in view["commands"]["tips"])
+        assert view["commands"]["text"] == help_text("")
+
+        # host 预热过名字（app.py 启动时写 host.bot_name_cache）就用它
+        class _Host:
+            bot_name_cache = "阿笨"
+
+        svc.host = _Host()
+        try:
+            view = _views.group_view(svc, G1, admin=False)
+            assert view["commands"]["tips"] == usage_tips("阿笨")
+            assert len(view["commands"]["tips"]) == len(USAGE_TIPS) == 2
+            assert "@阿笨" in view["commands"]["text"]
+        finally:
+            svc.host = None
+
+    @pytest.mark.asyncio
     async def test_member_view_topic_log_visible_but_no_verdict(self, m2_client) -> None:
         """群友看得到 topic_log，但没有 verdict 字段；也不含 focus 个人画像信息。"""
         from CharTyr_MaiWork.maiwork.console import views as _views
@@ -1427,6 +1454,28 @@ class TestM3Routes:
     # ---------- 批准 / 拒绝 ----------
 
     @pytest.mark.asyncio
+    async def test_request_approve_human_goal_without_alt_is_409_with_reason(self, env: SimpleEnv) -> None:
+        """R5：网页批准「要群友自己动手」又没替代任务的目标请求 → 409 + 原样原因，请求仍在待批。"""
+        env.app.goal_fit = None      # 这条只看落地路径：背景判断会改写 goal_fit（别处已测）
+        req = env.app.approvals.create(
+            G1, kind="goal", title="一起开档打卡", quote="一起开档打卡", via="群里 @",
+            requester_id="20002", requester_name="阿柒",
+        )
+        with env.app.store.tx() as conn:
+            conn.execute(
+                "UPDATE requests SET goal_fit='human', goal_fit_reason='要群友自己开档、截图' WHERE id=?",
+                (req["id"],),
+            )
+        await env.login()
+        r = await env.client.post(f"/api/requests/{req['id']}/approve", json={})
+        assert r.status == 409
+        err = (await r.json())["error"]
+        assert "群友自己动手" in err and "盯不了" in err
+        assert "要群友自己开档、截图" in err and "只能不批" in err
+        row = env.app.store.read().execute("SELECT status FROM requests WHERE id=?", (req["id"],)).fetchone()
+        assert str(row["status"]) == "pending"
+
+    @pytest.mark.asyncio
     async def test_request_approve_spawns_run_task(self, env: SimpleEnv) -> None:
         from fakes import FakeCoordinator
 
@@ -1665,6 +1714,38 @@ class TestM3Routes:
         assert r.status == 200  # 重复 cancel 不炸（goals.cancel 是幂等的 _set_state）
         r = await env.client.post("/api/goals/G-9999/pause", json={})
         assert r.status == 404
+
+    @pytest.mark.asyncio
+    async def test_goal_pending_criterion_confirm_and_revoke(self, env: SimpleEnv) -> None:
+        """没留依据的旧勾（待确认）：管理员网页点「算数」/「撤掉」，各记一条事件（R1 D5）。"""
+        await env.login()
+        g = env.app.goals.create_agent(G1, title="盯版本", body="", criteria=["a", "b", "c"], by_text="管理员 发起")
+        env.app.goals.set_criterion(g, 0, True)  # 旧式勾：没有证据
+        env.app.goals.set_criterion(g, 1, True)
+        env.app.goals.set_criterion(g, 2, True, evidence="群里说过已经发布了新版本", ts=1.0)
+
+        r = await env.client.post(f"/api/goals/{g}/criteria/0/confirm", json={})
+        assert r.status == 200, r.status
+        r = await env.client.post(f"/api/goals/{g}/criteria/1/revoke", json={})
+        assert r.status == 200, r.status
+        crit = json.loads(env.app.goals.get(g)["criteria"])
+        assert crit[0]["done"] and crit[0]["confirmed_by"] == "网页管理员"
+        assert crit[1]["done"] is False
+        # 已有依据的那条不是待确认 → 409；越界 / 序号不是数 / 目标不存在 → 404
+        assert (await env.client.post(f"/api/goals/{g}/criteria/2/revoke", json={})).status == 409
+        assert (await env.client.post(f"/api/goals/{g}/criteria/9/confirm", json={})).status == 404
+        assert (await env.client.post(f"/api/goals/{g}/criteria/x/confirm", json={})).status == 404
+        assert (await env.client.post("/api/goals/G-9999/criteria/0/confirm", json={})).status == 404
+        kinds = [r["kind"] for r in env.app.store.read().execute(
+            "SELECT kind FROM events WHERE entity_id=? AND kind LIKE 'goal.criterion_%' ORDER BY id", (g,)
+        ).fetchall()]
+        assert kinds == ["goal.criterion_confirmed", "goal.criterion_revoked"]
+
+    @pytest.mark.asyncio
+    async def test_goal_criterion_ops_anonymous_401(self, env: SimpleEnv) -> None:
+        for op in ("confirm", "revoke"):
+            r = await env.client.post(f"/api/goals/G-1/criteria/0/{op}", json={})
+            assert r.status == 401, (op, r.status)
 
     @pytest.mark.asyncio
     async def test_task_ops_member_forbidden(self, env: SimpleEnv) -> None:

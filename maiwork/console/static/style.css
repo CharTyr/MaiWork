@@ -270,6 +270,9 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .checks .ck-body { min-width: 0; }
 .checks .ck-body .fine { margin-top: 2px; font-size: 12px; overflow-wrap: anywhere; }
 .checks .ck-body .fine-inline { display: block; margin: 2px 0 0; }
+/* 待确认旧勾的「算数 / 撤掉」：文字按钮，手机命中区撑到 44px（design.md §8.1） */
+.checks .ck-acts { display: inline-flex; gap: 14px; margin-left: 10px; }
+.checks .ck-acts .link-btn { min-height: 44px; padding: 0 4px; font-size: 14px; }
 .tick {
   flex: none;
   margin-top: 2px;

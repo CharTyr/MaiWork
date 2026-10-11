@@ -581,6 +581,262 @@ class TestIdeaItemsLanding:
         assert r["status"] == "pending"
 
 
+def _set_goal_fit(mem_store, rid: str, fit: str, *, reason: str = "", alt=None) -> None:
+    """把判断结果直接写进请求行（判断本身在 tests/test_goal_fit.py 测）。"""
+    with mem_store.tx() as conn:
+        conn.execute(
+            "UPDATE requests SET goal_fit=?, goal_fit_reason=?, goal_fit_alt=? WHERE id=?",
+            (fit, reason, (json.dumps(alt, ensure_ascii=False) if alt is not None else ""), rid),
+        )
+
+
+def _counts(mem_store) -> tuple[int, int]:
+    n_task = mem_store.read().execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+    n_goal = mem_store.read().execute("SELECT COUNT(*) AS n FROM goals").fetchone()["n"]
+    return int(n_task), int(n_goal)
+
+
+class TestGoalFitLanding:
+    """R5：批准时按「MaiWork 能不能盯 / 做成」的判断落地（只影响人批路径）。
+
+    - human + 替代任务 → 建任务、不建目标，记 `request.goal_as_task`；
+    - human 没替代 → 抛 ValueError，整条回滚（请求仍是 pending、什么都没建）；
+    - online / error / 没判 → 照旧建目标。
+    """
+
+    ALT = {"title": "整理 mod 清单", "req": "把 mod 和分线整理成一份清单"}
+
+    def _goal_request(self, ap, **kw) -> dict:
+        return ap.create(
+            GID,
+            **dict(_DEFAULTS, kind="goal", title="一起开档打卡攒攻略", quote="帮我们盯着开档打卡", **kw),
+        )
+
+    def test_human_with_alt_lands_task_not_goal(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        r = self._goal_request(ap)
+        _set_goal_fit(mem_store, r["id"], "human", reason="要群友自己开档截图", alt=self.ALT)
+        out = ap.approve(r["id"], by="42")
+        assert out["goal_ids"] == [] and out["goal_id"] is None
+        assert out["task_ids"] == ["T-1"] and out["task_id"] == "T-1"
+        t = tasks.get("T-1")
+        assert t["title"] == "整理 mod 清单"
+        assert t["req"] == "把 mod 和分线整理成一份清单"
+        assert t["status"] == "queued" and t["source"] == "request"
+        assert t["request_id"] == r["id"]
+        assert t["requester_id"] == "10001"
+        assert _counts(mem_store) == (1, 0)
+        kinds = {
+            str(e["kind"]) for e in mem_store.read().execute(
+                "SELECT kind FROM events WHERE entity_id=?", (r["id"],)
+            ).fetchall()
+        }
+        assert "request.goal_as_task" in kinds
+
+    def test_human_without_alt_refused_and_stays_pending(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        r = self._goal_request(ap)
+        _set_goal_fit(mem_store, r["id"], "human", reason="要群友自己开档截图")
+        with pytest.raises(ValueError) as ei:
+            ap.approve(r["id"], by="42")
+        msg = str(ei.value)
+        assert "群友自己动手" in msg and "盯不了" in msg
+        assert "要群友自己开档截图" in msg
+        assert "只能不批" in msg
+        assert ap._get(r["id"])["status"] == "pending"     # 整条事务回滚
+        assert _counts(mem_store) == (0, 0)
+        assert [p["id"] for p in ap.pending_view(GID)] == [r["id"]]
+
+    def test_human_without_alt_can_still_be_rejected(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        r = self._goal_request(ap)
+        _set_goal_fit(mem_store, r["id"], "human", reason="要群友自己动手")
+        assert ap.reject(r["id"], by="42")["status"] == "rejected"
+
+    @pytest.mark.parametrize("fit", ["online", "error", ""])
+    def test_online_error_and_unjudged_land_goal(self, mem_store, tasks, goals, fit):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        r = self._goal_request(ap)
+        if fit:
+            _set_goal_fit(mem_store, r["id"], fit, reason="随便一句")
+        out = ap.approve(r["id"], by="42")
+        assert out["goal_ids"] == ["G-1"] and out["goal_id"] == "G-1"
+        assert out["task_ids"] == []
+        assert goals.get("G-1")["title"] == "一起开档打卡攒攻略"
+
+    def test_auto_review_still_never_approves_goal_request(self, mem_store, tasks, goals):
+        """红线不变：goal 请求（哪怕判断说 human+替代任务）永远要管理员批准。"""
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        r = self._goal_request(ap)
+        _set_goal_fit(mem_store, r["id"], "human", alt=self.ALT)
+        with pytest.raises(ValueError, match="必须由管理员批准"):
+            ap.approve(r["id"], by="MaiWork 自动审核", auto_daily=("2026-09-25", 5))
+        assert ap._get(r["id"])["status"] == "pending"
+        assert _counts(mem_store) == (0, 0)
+
+    # ---------------- 构想：按项目判断 ----------------
+
+    ITEMS = [
+        {"kind": "task", "title": "抓铝价数据", "desc": "先把最近一个月的铝价抓下来"},
+        {"kind": "goal", "title": "分线开档打卡", "desc": "群友自己开档、截图打卡"},
+        {"kind": "goal", "title": "盯新版本", "desc": "出了新版本说一声"},
+    ]
+
+    def _idea_request(self, ap, mem_store, *, items=None) -> dict:
+        with mem_store.tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO ideas (group_id, icon, title, body, items, state, created, updated)"
+                " VALUES (?, 'books', '分线计划', '分线开档攒攻略', ?, 'new', 1, 1)",
+                (GID, json.dumps(self.ITEMS, ensure_ascii=False)),
+            )
+            idea_id = int(cur.lastrowid or 0)
+        return ap.create(GID, **dict(_DEFAULTS, idea_id=idea_id, via="来自构想", title="分线计划", items=items))
+
+    def test_idea_human_item_becomes_task_online_item_stays_goal(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        r = self._idea_request(ap, mem_store, items=[2, 3])
+        _set_goal_fit(
+            mem_store, r["id"], "human", reason="要群友自己开档截图",
+            alt={"items": {
+                "2": {"kind": "human", "reason": "要群友自己开档截图", "alt": self.ALT},
+                "3": {"kind": "online", "reason": "盯发布就行", "alt": None},
+            }},
+        )
+        out = ap.approve(r["id"], by="42")
+        assert out["task_ids"] == ["T-1"] and out["task_id"] == "T-1"
+        assert out["goal_ids"] == ["G-1"] and out["goal_id"] == "G-1"
+        assert out["skipped"] == []
+        t = tasks.get("T-1")
+        assert t["title"] == "整理 mod 清单"
+        assert "把 mod 和分线整理成一份清单" in t["req"]
+        assert goals.get("G-1")["title"] == "盯新版本"
+
+    def test_idea_human_item_without_alt_is_skipped(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        r = self._idea_request(ap, mem_store, items=[2, 3])
+        _set_goal_fit(
+            mem_store, r["id"], "human", reason="要群友自己开档截图",
+            alt={"items": {
+                "2": {"kind": "human", "reason": "要群友自己开档截图", "alt": None},
+                "3": {"kind": "online", "reason": "盯发布就行", "alt": None},
+            }},
+        )
+        out = ap.approve(r["id"], by="42")
+        assert out["task_ids"] == [] and out["task_id"] is None
+        assert out["goal_ids"] == ["G-1"]
+        assert out["skipped"] == [{"title": "分线开档打卡", "reason": "要群友自己开档截图"}]
+        row = mem_store.read().execute("SELECT state, task_id FROM ideas").fetchone()
+        assert row["state"] == "started" and row["task_id"] is None
+
+    def test_idea_three_way_mix_lands_task_skips_one_keeps_goal(self, mem_store, tasks, goals):
+        """一项转任务、一项跳过、一项照旧立目标：跳过的那项不能把整条请求拉倒。"""
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        with mem_store.tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO ideas (group_id, icon, title, body, items, state, created, updated)"
+                " VALUES (?, 'books', '分线计划', '分线开档攒攻略', ?, 'new', 1, 1)",
+                (GID, json.dumps([
+                    {"kind": "goal", "title": "分线开档打卡", "desc": "群友自己开档、截图打卡"},
+                    {"kind": "goal", "title": "凑人开档", "desc": "要大家到场才能开"},
+                    {"kind": "goal", "title": "盯新版本", "desc": "盯发布"},
+                ], ensure_ascii=False)),
+            )
+            idea_id = int(cur.lastrowid or 0)
+        r = ap.create(GID, **dict(_DEFAULTS, idea_id=idea_id, via="来自构想", title="分线计划"))
+        _set_goal_fit(
+            mem_store, r["id"], "human", reason="要群友自己开档截图",
+            alt={"items": {
+                "1": {"kind": "human", "reason": "要群友自己开档截图", "alt": self.ALT},
+                "2": {"kind": "human", "reason": "要大家到场", "alt": None},
+                "3": {"kind": "online", "reason": "盯发布就行", "alt": None},
+            }},
+        )
+        out = ap.approve(r["id"], by="42")
+        assert out["task_ids"] == ["T-1"] and out["goal_ids"] == ["G-1"]
+        assert tasks.get("T-1")["title"] == "整理 mod 清单"
+        assert goals.get("G-1")["title"] == "盯新版本"
+        assert out["skipped"] == [{"title": "凑人开档", "reason": "要大家到场"}]
+
+    def test_idea_all_items_skipped_refuses(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting(required=True))
+        r = self._idea_request(ap, mem_store, items=[2])
+        _set_goal_fit(
+            mem_store, r["id"], "human", reason="要群友自己开档截图",
+            alt={"items": {"2": {"kind": "human", "reason": "要群友自己开档截图", "alt": None}}},
+        )
+        with pytest.raises(ValueError) as ei:
+            ap.approve(r["id"], by="42")
+        assert "群友自己动手" in str(ei.value) and "只能不批" in str(ei.value)
+        assert ap._get(r["id"])["status"] == "pending"
+        assert _counts(mem_store) == (0, 0)
+        assert mem_store.read().execute("SELECT state FROM ideas").fetchone()["state"] == "new"
+
+
+class TestGoalFitPendingView:
+    """待批视图的 `goal_fit` 字段（前端 pages/tasks.js 只读这几个键）。"""
+
+    def test_unjudged_is_none(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting())
+        ap.create(GID, **dict(_DEFAULTS, kind="goal", title="盯着"))
+        assert ap.pending_view(GID)[0]["goal_fit"] is None
+
+    def test_online_shows_kind_and_reason(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting())
+        r = ap.create(GID, **dict(_DEFAULTS, kind="goal", title="盯着"))
+        _set_goal_fit(mem_store, r["id"], "online", reason="上网就能办")
+        assert ap.pending_view(GID)[0]["goal_fit"] == {
+            "kind": "online", "reason": "上网就能办", "alt_title": "",
+        }
+
+    def test_error_shows_kind(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting())
+        r = ap.create(GID, **dict(_DEFAULTS, kind="goal", title="盯着"))
+        _set_goal_fit(mem_store, r["id"], "error", reason="端点挂了")
+        assert ap.pending_view(GID)[0]["goal_fit"] == {
+            "kind": "error", "reason": "端点挂了", "alt_title": "",
+        }
+
+    def test_human_with_alt_shows_alt_title(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting())
+        r = ap.create(GID, **dict(_DEFAULTS, kind="goal", title="盯着"))
+        _set_goal_fit(
+            mem_store, r["id"], "human", reason="要群友动手",
+            alt={"title": "整理 mod 清单", "req": "整理成清单"},
+        )
+        assert ap.pending_view(GID)[0]["goal_fit"] == {
+            "kind": "human", "reason": "要群友动手", "alt_title": "整理 mod 清单",
+        }
+
+    def test_human_without_alt_has_no_alt_title(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting())
+        r = ap.create(GID, **dict(_DEFAULTS, kind="goal", title="盯着"))
+        _set_goal_fit(mem_store, r["id"], "human", reason="要群友动手")
+        assert ap.pending_view(GID)[0]["goal_fit"] == {
+            "kind": "human", "reason": "要群友动手", "alt_title": "",
+        }
+
+    def test_idea_alt_title_is_first_human_item(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting())
+        r = ap.create(GID, **dict(_DEFAULTS, kind="goal", title="盯着"))
+        _set_goal_fit(
+            mem_store, r["id"], "human", reason="要群友动手",
+            alt={"items": {
+                "2": {"kind": "human", "reason": "要群友动手", "alt": {"title": "整理 mod 清单", "req": "r"}},
+                "3": {"kind": "human", "reason": "也要动手", "alt": {"title": "第二件替代", "req": "r"}},
+            }},
+        )
+        assert ap.pending_view(GID)[0]["goal_fit"]["alt_title"] == "整理 mod 清单"
+
+    def test_broken_alt_json_is_safe(self, mem_store, tasks, goals):
+        ap = _approvals(mem_store, tasks, goals, _ApprovalSetting())
+        r = ap.create(GID, **dict(_DEFAULTS, kind="goal", title="盯着"))
+        with mem_store.tx() as conn:
+            conn.execute(
+                "UPDATE requests SET goal_fit='human', goal_fit_alt='不是 JSON' WHERE id=?", (r["id"],)
+            )
+        assert ap.pending_view(GID)[0]["goal_fit"] == {"kind": "human", "reason": "", "alt_title": ""}
+
+
 class TestCurrentNames:
     """发起人名字一律按 requester_id 查名册当前名；查不到回落快照；都没有写「群友」。"""
 

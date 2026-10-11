@@ -188,8 +188,9 @@ class _Goals:
         self._rows[str(goal_id)]["criteria"] = json.dumps(
             [{"text": t, "done": False} for t in texts], ensure_ascii=False)
 
-    def set_criterion(self, goal_id, idx, done, **kwargs):
-        # docs/22 §5 C：勾上时可以带 evidence / task_id / ts（假对象只记事件与 done）
+    def set_criterion(self, goal_id, idx, done, *, evidence=None, task_id=None, ts=None):
+        # docs/22 §5 C：勾上时带 evidence / task_id / ts；假对象照真 Goals 一并写进去
+        # （goals-fit R1 起判「全部完成」只认有依据的勾，假对象不写证据会假红）。
         self.events.append(("set_criterion", str(goal_id), int(idx), bool(done)))
         crit_s = self._rows[str(goal_id)].get("criteria")
         if isinstance(crit_s, str):
@@ -201,6 +202,10 @@ class _Goals:
             crit = list(crit_s or [])
         if 0 <= int(idx) < len(crit):
             crit[int(idx)]["done"] = bool(done)
+            if evidence is not None or task_id is not None or ts is not None:
+                crit[int(idx)]["evidence"] = " ".join(str(evidence or "").split())[:200]
+                crit[int(idx)]["task_id"] = str(task_id) if task_id else None
+                crit[int(idx)]["ts"] = float(ts) if ts is not None else clock.now()
             self._rows[str(goal_id)]["criteria"] = json.dumps(crit, ensure_ascii=False)
 
     def done(self, goal_id):
@@ -669,10 +674,15 @@ class TestGoalCheck:
                 "assessment": "两条标准已完成，第三条差一步", "plan": ["补一次对比"], "questions": []}),
         ])
         goals = _Goals()
+        # goals-fit R1（2026-10-11）：判「全部完成」只认**有依据**的勾——旧的无依据勾
+        # 只是「待确认」，不算完成。这里前两条本来就带依据（群里真发生的那句话），
+        # 第三条这次由主模型补上证据 → 三条都变有依据 → 才判 done。
         gid = goals.create(G1, title="打磨判 A", body="三条标准", kind="agent", by_text="",
-                           criteria=json.dumps([{"text": "a", "done": True},
-                                                {"text": "b", "done": True},
-                                                {"text": "c", "done": False}], ensure_ascii=False))
+                           criteria=json.dumps([
+                               {"text": "a", "done": True, "evidence": "阿柒：三条标准都做完了"},
+                               {"text": "b", "done": True, "evidence": "阿柒：三条标准都做完了"},
+                               {"text": "c", "done": False},
+                           ], ensure_ascii=False))
         # docs/22 §5 C：打勾要证据——群里真发生的那句话就是证据（群聊片段匹配）
         with store.tx() as conn:
             conn.execute(

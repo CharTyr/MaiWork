@@ -302,7 +302,10 @@ class TestView:
         assert a["last"] is None
         assert a["task_id"] == "T-7"
         assert a["state"] == "active"
-        assert isinstance(a["criteria"], list) and a["criteria"][0] == {"text": "不漏场", "done": False}
+        assert a["fit"] == "" and a["fit_reason"] == ""   # R5：老库没这列时兜底空串
+        assert isinstance(a["criteria"], list) and a["criteria"][0] == {
+            "text": "不漏场", "done": False, "backed": False, "pending": False,
+        }
         assert a["next_check_ts"] == NOW + 3600
         assert m["id"] == mid
         assert m["who"] == "阿柒"
@@ -385,3 +388,293 @@ class TestSetCriteria:
     def test_unknown_goal_raises(self, goals: Goals):
         with pytest.raises(KeyError):
             goals.set_criteria("G-999", ["x"])
+
+
+def _events(mem_store: Store, kind: str, entity_id: str) -> list[dict]:
+    rows = mem_store.read().execute(
+        "SELECT payload FROM events WHERE kind=? AND entity_id=? ORDER BY id",
+        (str(kind), str(entity_id)),
+    ).fetchall()
+    return [json.loads(r["payload"]) if r["payload"] else {} for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# R1 / R6：完成标准「有没有依据」纯函数
+# ---------------------------------------------------------------------------
+
+
+class TestCriterionPureFunctions:
+    """criterion_backed / criterion_pending：不写库、现算（R1 D5）。"""
+
+    def test_backed_by_evidence(self):
+        from CharTyr_MaiWork.maiwork import goals as goals_mod
+
+        c = {"text": "群里说过", "done": True, "evidence": "阿柒：投票结果出来了"}
+        assert goals_mod.criterion_backed(c) is True
+        assert goals_mod.criterion_pending(c) is False
+
+    def test_backed_by_task_id(self):
+        from CharTyr_MaiWork.maiwork import goals as goals_mod
+
+        c = {"text": "下级任务做完", "done": True, "task_id": "T-3"}
+        assert goals_mod.criterion_backed(c) is True
+        assert goals_mod.criterion_pending(c) is False
+
+    def test_backed_by_confirmed_by(self):
+        from CharTyr_MaiWork.maiwork import goals as goals_mod
+
+        c = {"text": "管理员算数", "done": True, "confirmed_by": "10001"}
+        assert goals_mod.criterion_backed(c) is True
+        assert goals_mod.criterion_pending(c) is False
+
+    def test_blank_evidence_is_not_backing(self):
+        from CharTyr_MaiWork.maiwork import goals as goals_mod
+
+        for c in (
+            {"done": True, "evidence": "   "},
+            {"done": True, "evidence": ""},
+            {"done": True, "evidence": None},
+            {"done": True, "task_id": ""},
+            {"done": True, "task_id": None},
+            {"done": True, "confirmed_by": "  "},
+        ):
+            assert goals_mod.criterion_backed(c) is False
+            assert goals_mod.criterion_pending(c) is True
+
+    def test_done_but_backed_nowhere_is_pending(self):
+        from CharTyr_MaiWork.maiwork import goals as goals_mod
+
+        c = {"text": "旧的无依据勾", "done": True}
+        assert goals_mod.criterion_backed(c) is False
+        assert goals_mod.criterion_pending(c) is True
+
+    def test_not_done_is_neither(self):
+        from CharTyr_MaiWork.maiwork import goals as goals_mod
+
+        c = {"text": "还没做", "done": False, "evidence": "随便写"}
+        assert goals_mod.criterion_backed(c) is False
+        assert goals_mod.criterion_pending(c) is False
+
+    def test_non_dict_always_false(self):
+        from CharTyr_MaiWork.maiwork import goals as goals_mod
+
+        for bad in (None, [], "done", 3, 0, True, ("a",)):
+            assert goals_mod.criterion_backed(bad) is False
+            assert goals_mod.criterion_pending(bad) is False
+
+
+class TestChatLineBody:
+    """R6：群聊行「- MM-DD HH:MM 谁：正文」先去时间前缀再取正文。"""
+
+    def test_new_format_strips_time_prefix(self):
+        """时间前缀（半角冒号）要先去掉，再按「谁：正文」取正文。"""
+        from CharTyr_MaiWork.maiwork.goals import _chat_line_body
+
+        assert _chat_line_body("- 10-11 14:05 阿柒:投票结果出来了") == "投票结果出来了"
+        assert _chat_line_body("- 10-11 14:05 阿柒：投票结果出来了") == "投票结果出来了"
+        assert _chat_line_body("- 10-11 14:05：投票结果出来了") == "投票结果出来了"
+
+    def test_old_format_unchanged(self):
+        from CharTyr_MaiWork.maiwork.goals import _chat_line_body
+
+        assert _chat_line_body("- 阿柒：投票结果出来了") == "投票结果出来了"
+        assert _chat_line_body("- 阿柒:投票结果出来了") == "投票结果出来了"
+        assert _chat_line_body("- 裸一行没有冒号") == "裸一行没有冒号"
+
+
+# ---------------------------------------------------------------------------
+# R5：目标本身的补判结果（goals.fit / goals.fit_reason，只给网页）
+# ---------------------------------------------------------------------------
+
+
+class TestSetFit:
+    def test_online_writes_fit_and_event(self, goals: Goals, mem_store: Store):
+        gid = _mk_agent(goals)
+        goals.set_fit(gid, "online", "  盯着  版本发布  ")
+        row = goals.get(gid)
+        assert row["fit"] == "online"
+        assert row["fit_reason"] == "盯着 版本发布"
+        assert _events(mem_store, "goal.fit", gid) == [
+            {"kind": "online", "reason": "盯着 版本发布"}
+        ]
+
+    def test_human_kind_allowed(self, goals: Goals):
+        gid = _mk_agent(goals)
+        goals.set_fit(gid, "human", "要群友自己动手")
+        assert goals.get(gid)["fit"] == "human"
+
+    def test_reason_truncated_to_80(self, goals: Goals):
+        gid = _mk_agent(goals)
+        goals.set_fit(gid, "human", "很" * 200)
+        assert len(goals.get(gid)["fit_reason"]) == 80
+
+    def test_empty_reason_ok(self, goals: Goals):
+        gid = _mk_agent(goals)
+        goals.set_fit(gid, "online", "   ")
+        assert goals.get(gid)["fit_reason"] == ""
+
+    def test_bad_kind_raises_and_writes_nothing(self, goals: Goals):
+        gid = _mk_agent(goals)
+        with pytest.raises(ValueError):
+            goals.set_fit(gid, "kinda", "x")
+        assert goals.get(gid)["fit"] == ""
+
+    def test_unknown_goal_raises(self, goals: Goals):
+        with pytest.raises(KeyError):
+            goals.set_fit("G-999", "online", "x")
+
+
+# ---------------------------------------------------------------------------
+# R1：管理员对待确认项「算数 / 撤掉」
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmRevokeCriterion:
+    def test_confirm_pending_sets_admin_and_event(
+        self, goals: Goals, mem_store: Store, fixed_clock
+    ):
+        gid = _mk_agent(goals)
+        goals.set_criterion(gid, 0, True)          # 旧的无依据勾 → 待确认
+        fixed_clock[0] = NOW + 60
+        goals.confirm_criterion(gid, 0, "10001")
+
+        item = json.loads(goals.get(gid)["criteria"])[0]
+        assert item["done"] is True
+        assert item["confirmed_by"] == "10001"
+        assert item["confirmed_ts"] == NOW + 60
+        assert _events(mem_store, "goal.criterion_confirmed", gid) == [
+            {"index": 0, "text": "不漏场", "by": "10001"}
+        ]
+
+    def test_confirm_paused_goal_allowed(self, goals: Goals):
+        gid = _mk_agent(goals)
+        goals.set_criterion(gid, 0, True)
+        goals.pause(gid)
+        goals.confirm_criterion(gid, 0, "10001")
+        assert json.loads(goals.get(gid)["criteria"])[0]["confirmed_by"] == "10001"
+
+    def test_confirm_requires_pending(self, goals: Goals, mem_store: Store):
+        gid = _mk_agent(goals)
+        # 没勾 → 不是待确认
+        with pytest.raises(ValueError):
+            goals.confirm_criterion(gid, 0, "10001")
+        # 有证据的勾 → 也不是待确认
+        goals.set_criterion(gid, 0, True, evidence="阿柒：投票结果出来了")
+        with pytest.raises(ValueError):
+            goals.confirm_criterion(gid, 0, "10001")
+        assert _events(mem_store, "goal.criterion_confirmed", gid) == []
+
+    def test_confirm_requires_live_state(self, goals: Goals):
+        gid = _mk_agent(goals)
+        goals.set_criterion(gid, 0, True)
+        goals.done(gid)
+        with pytest.raises(ValueError):
+            goals.confirm_criterion(gid, 0, "10001")
+        assert "confirmed_by" not in json.loads(goals.get(gid)["criteria"])[0]
+
+        gid2 = _mk_agent(goals, title="另一个")
+        goals.set_criterion(gid2, 0, True)
+        goals.cancel(gid2)
+        with pytest.raises(ValueError):
+            goals.confirm_criterion(gid2, 0, "10001")
+
+    def test_confirm_index_out_of_range(self, goals: Goals):
+        gid = _mk_agent(goals)
+        goals.set_criterion(gid, 0, True)
+        with pytest.raises(IndexError):
+            goals.confirm_criterion(gid, 99, "10001")
+
+    def test_confirm_unknown_goal(self, goals: Goals):
+        with pytest.raises(KeyError):
+            goals.confirm_criterion("G-999", 0, "10001")
+
+    def test_revoke_pending_clears_done_and_event(self, goals: Goals, mem_store: Store):
+        gid = _mk_agent(goals)
+        goals.set_criterion(gid, 0, True)
+        goals.revoke_criterion(gid, 0, "10001")
+
+        item = json.loads(goals.get(gid)["criteria"])[0]
+        assert item["text"] == "不漏场"
+        assert item["done"] is False
+        assert "confirmed_by" not in item and "confirmed_ts" not in item
+        assert _events(mem_store, "goal.criterion_revoked", gid) == [
+            {"index": 0, "text": "不漏场", "by": "10001"}
+        ]
+
+    def test_revoke_requires_pending(self, goals: Goals):
+        gid = _mk_agent(goals)
+        with pytest.raises(ValueError):
+            goals.revoke_criterion(gid, 0, "10001")
+        goals.set_criterion(gid, 0, True, evidence="阿柒：投票结果出来了")
+        with pytest.raises(ValueError):
+            goals.revoke_criterion(gid, 0, "10001")
+        assert json.loads(goals.get(gid)["criteria"])[0]["done"] is True
+
+    def test_revoke_requires_live_state(self, goals: Goals):
+        gid = _mk_agent(goals)
+        goals.set_criterion(gid, 0, True)
+        goals.done(gid)
+        with pytest.raises(ValueError):
+            goals.revoke_criterion(gid, 0, "10001")
+
+    def test_revoke_index_out_of_range(self, goals: Goals):
+        gid = _mk_agent(goals)
+        goals.set_criterion(gid, 0, True)
+        with pytest.raises(IndexError):
+            goals.revoke_criterion(gid, 99, "10001")
+
+
+# ---------------------------------------------------------------------------
+# R1 / R5：网页视图字段
+# ---------------------------------------------------------------------------
+
+
+class TestViewFitAndBackedFlags:
+    def test_view_exposes_fit_and_flags(self, goals: Goals, mem_store: Store):
+        gid = _mk_agent(goals)
+        mem_store.read().execute(
+            "UPDATE goals SET fit='human', fit_reason='要群友自己动手' WHERE id=?", (gid,)
+        )
+        a = goals.view(GID)["agent"][0]
+        assert a["fit"] == "human"
+        assert a["fit_reason"] == "要群友自己动手"
+        assert a["criteria"][0] == {
+            "text": "不漏场", "done": False, "backed": False, "pending": False,
+        }
+
+    def test_view_marks_pending_and_backed(self, goals: Goals):
+        gid = _mk_agent(goals)
+        goals.set_criterion(gid, 0, True)                              # 待确认
+        goals.set_criterion(gid, 1, True, evidence="阿柒：提前一周发了")  # 有依据
+        crit = goals.view(GID)["agent"][0]["criteria"]
+        assert (crit[0]["done"], crit[0]["backed"], crit[0]["pending"]) == (True, False, True)
+        assert (crit[1]["done"], crit[1]["backed"], crit[1]["pending"]) == (True, True, False)
+
+    def test_view_does_not_persist_flags(self, goals: Goals):
+        """backed / pending 是现算的，不写回库。"""
+        gid = _mk_agent(goals)
+        goals.set_criterion(gid, 0, True)
+        goals.view(GID)
+        assert json.loads(goals.get(gid)["criteria"])[0] == {"text": "不漏场", "done": True}
+
+    def test_agent_dict_exposes_fit(self, goals: Goals, mem_store: Store, fixed_clock):
+        """due() 走的 _agent_dict 也带 fit / fit_reason。"""
+        gid = _mk_agent(goals)
+        mem_store.read().execute(
+            "UPDATE goals SET fit='human', fit_reason='盯不了' WHERE id=?", (gid,)
+        )
+        fixed_clock[0] = NOW + 7200
+        item = next(d for d in goals.due(fixed_clock[0]) if d["type"] == "check")
+        assert item["goal"]["fit"] == "human"
+        assert item["goal"]["fit_reason"] == "盯不了"
+
+    def test_missing_fit_columns_fall_back_empty(self, goals: Goals):
+        """老库 dict 里没有 fit 列时用 g.get 兜底空串。"""
+        gid = _mk_agent(goals)
+        g = goals.get(gid)
+        g.pop("fit", None)
+        g.pop("fit_reason", None)
+        assert goals._agent_view(g)["fit"] == ""
+        assert goals._agent_view(g)["fit_reason"] == ""
+        assert goals._agent_dict(g)["fit"] == ""
+        assert goals._agent_dict(g)["fit_reason"] == ""

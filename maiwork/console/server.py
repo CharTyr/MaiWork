@@ -3759,8 +3759,22 @@ class ConsoleServer:
             forbid = self._require_group_admin_ident(ident, str(goal_row.get("group_id") or ""))
             if forbid is not None:
                 return forbid
+            # 完成标准「待确认」的旧勾（2026-10-11 R1 D5）：/criteria/{idx}/confirm|revoke
+            idx_raw = request.match_info.get("idx")
+            idx: int | None = None
+            if idx_raw is not None:
+                if not str(idx_raw).isdigit():
+                    return _err(404, "没有这条完成标准")
+                idx = int(idx_raw)
+            by = "网页管理员" if ident.role == "admin" else "群管理员（网页）"
             try:
-                if op == "pause":
+                if idx is not None and op == "confirm":
+                    svc.goals.confirm_criterion(gid_param, idx, by)
+                elif idx is not None and op == "revoke":
+                    svc.goals.revoke_criterion(gid_param, idx, by)
+                elif idx is not None:
+                    return _err(404, "没有这个操作")
+                elif op == "pause":
                     svc.goals.pause(gid_param)
                 elif op == "resume":
                     svc.goals.resume(gid_param)
@@ -3768,6 +3782,8 @@ class ConsoleServer:
                     svc.goals.cancel(gid_param)
                 else:
                     return _err(404, "没有这个操作")
+            except IndexError:
+                return _err(404, "没有这条完成标准")
             except KeyError:
                 return _err(404, "找不到这个目标")
             except ValueError as e:
@@ -3784,6 +3800,11 @@ class ConsoleServer:
         for _op in ("pause", "resume", "cancel"):
             app.router.add_post(
                 f"/api/goals/{{id}}/{_op}",
+                self._write(lambda req, op=_op: _goal_op(req, op)),
+            )
+        for _op in ("confirm", "revoke"):
+            app.router.add_post(
+                f"/api/goals/{{id}}/criteria/{{idx}}/{_op}",
                 self._write(lambda req, op=_op: _goal_op(req, op)),
             )
 

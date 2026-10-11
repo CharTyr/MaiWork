@@ -198,7 +198,16 @@ function commandsBlock(v) {
           )
           .join("")}`
       )
-      .join("")}</div>`;
+      .join("")}${tipsRows(c.tips)}</div>`;
+}
+
+// 不用指令、直接 @ 机器人说的大白话用法（commands.USAGE_TIPS，后端已换好机器人名字）
+function tipsRows(tips) {
+  const list = Array.isArray(tips) ? tips : [];
+  if (!list.length) return "";
+  return `<div class="cmds-who">也可以直接 @ 机器人说</div>${list
+    .map((t) => `<div class="cmd-row"><code class="mono">${esc(t.say)}</code><span class="cmd-desc">${esc(t.desc)}</span></div>`)
+    .join("")}`;
 }
 
 // 这个群：本群规矩 + 本群做法，只给总管理员和本群群管理员（群友看不到）

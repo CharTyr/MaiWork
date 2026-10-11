@@ -12,12 +12,17 @@
 - 非免批 → pending；approve/reject 只能处理 pending，重复操作抛 ValueError。
 - 落地：kind="task" → Tasks.create(status="queued", source="request", request_id=…)，
   把 request.task_id 指回去；kind="goal" → Goals.create_agent(...)。
+- 目标贴合群聊（goal_fit.py，2026-10-11 R5）：goal 请求批准前主模型判过一次
+  「这件事 MaiWork 自己能不能在网上盯 / 做成」（`requests.goal_fit`）。人批时
+  `human` + 替代任务 → 改建任务（记 `request.goal_as_task`）；`human` 没替代任务 →
+  抛 ValueError「只能不批」；`online` / `error` / 没判 → 照旧建目标。
 - pending 超 24 小时 → 提醒一次（记 reminded_ts，提醒过的不再提醒）；
   pending 超 7 天 → expired。
 - 取消的权限：发起人、群主/群管理（group_role 由调用方从适配器拿）、bot 管理员。
 - 自动审核（auto_review.py，2026-10）：落了 pending 就回调 `set_review_hook` 注入的函数，
   由 app 把「主模型看一眼该不该直接批」spawn 到后台；批通过走 `approve(by="MaiWork 自动审核",
-  auto_reason=…)`——和人批同一条落地路径。
+  auto_reason=…)`——和人批同一条落地路径。同一个回调里 app 还会 spawn 一次
+  `GoalFitJudge.judge`（立目标前的判断，R5）；两个判断各自可选。
 """
 
 from __future__ import annotations
@@ -102,6 +107,104 @@ def _parse_item_nos(raw: Any) -> list[int]:
     except (TypeError, ValueError):
         return []
     return _norm_item_nos(data)
+
+
+# ----------------------------------------------------------------------
+# 「这件事 MaiWork 能不能盯」的判断（R5）：写进 requests.goal_fit_alt 的 JSON 形状
+#   - 单个目标请求：{"title": …, "req": …}（替代任务）
+#   - 构想请求：{"items": {"<项目序号>": {"kind": …, "reason": …, "alt": {…}|null}}}
+# 写的一方是 goal_fit.py（主模型判断），读的一方是这里（pending_view + _land）。
+# ----------------------------------------------------------------------
+
+
+def _parse_fit_alt(raw: Any) -> dict:
+    """requests.goal_fit_alt → dict；坏数据 / 空 → {}（当没给替代任务）。"""
+    if isinstance(raw, dict):
+        return raw
+    try:
+        data = json.loads(str(raw or "") or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _norm_alt(value: Any) -> dict | None:
+    """替代任务：title + req 都要有才认（都去空白、截断）。"""
+    if not isinstance(value, dict):
+        return None
+    title = " ".join(str(value.get("title") or "").split())[:30]
+    req = " ".join(str(value.get("req") or "").split())[:200]
+    if not title or not req:
+        return None
+    return {"title": title, "req": req}
+
+
+def _fit_alt_single(alt: dict) -> dict | None:
+    """单个目标请求的替代任务；没给 / 不完整 → None。"""
+    if isinstance(alt.get("items"), dict):
+        return None
+    return _norm_alt(alt)
+
+
+def _fit_alt_item(alt: dict, no: int) -> dict | None:
+    """构想请求里第 no 项的判断；没有这一项 → None。"""
+    items = alt.get("items")
+    if not isinstance(items, dict):
+        return None
+    one = items.get(str(no))
+    return one if isinstance(one, dict) else None
+
+
+def _fit_alt_item_kind(alt: dict, no: int) -> str:
+    one = _fit_alt_item(alt, no)
+    return _norm((one or {}).get("kind")).lower()
+
+
+def _fit_alt_item_alt(alt: dict, no: int) -> dict | None:
+    one = _fit_alt_item(alt, no)
+    return _norm_alt((one or {}).get("alt"))
+
+
+def _fit_alt_item_reason(alt: dict, no: int) -> str:
+    one = _fit_alt_item(alt, no)
+    return " ".join(str((one or {}).get("reason") or "").split())[:80]
+
+
+def _refuse_fit_message(reason: Any) -> str:
+    """「只能不批」的原话（网页 409 和 /mw 回复都原样带出这一句）。"""
+    why = _norm(reason)
+    if why:
+        return f"这件事要群友自己动手，MaiWork 盯不了：{why}；只能不批"
+    return "这件事要群友自己动手，MaiWork 盯不了；只能不批"
+
+
+def _goal_fit_view(row: Any) -> dict | None:
+    """待批视图的 `goal_fit` 字段（前端 pages/tasks.js 只读这三个键）；没判 → None。
+
+    - `kind`：`online` / `human` / `error`；
+    - `reason`：一句话理由；
+    - `alt_title`：`human` 时批准后按哪个一次性任务开工（构想取第一个 human 项的替代标题）；
+      没有替代任务 → ""（前端据此不给「批准」按钮）。
+    """
+    fit = _norm(_row_get(row, "goal_fit")).lower()
+    if not fit:
+        return None
+    alt = _parse_fit_alt(_row_get(row, "goal_fit_alt"))
+    title = ""
+    if fit == "human":
+        items = alt.get("items")
+        if isinstance(items, dict):
+            for one in items.values():
+                if not isinstance(one, dict) or _norm(one.get("kind")).lower() != "human":
+                    continue
+                got = _norm_alt(one.get("alt"))
+                if got is not None:
+                    title = got["title"]
+                    break
+        else:
+            got = _norm_alt(alt)
+            title = got["title"] if got is not None else ""
+    return {"kind": fit, "reason": _norm(_row_get(row, "goal_fit_reason")), "alt_title": title}
 
 
 class Approvals:
@@ -363,6 +466,16 @@ class Approvals:
         """在批准请求的事务中创建所有 task / goal 并回写引用。
 
         构想选中的项目逐个建，任何一个失败即回滚整条请求与全部项目。
+
+        R5（目标贴合群聊）：批准前主模型判过这件「目标」MaiWork 自己能不能盯（`goal_fit`，
+        ''=没判 / online / human / error，见 goal_fit.py）。人批路径按判断落地：
+
+        - `human` + 替代任务 → **改建任务**（`source="request"`、criteria 空），记 `request.goal_as_task`；
+        - `human` 没替代任务 → 抛 ValueError（整条事务回滚，请求仍是 pending，回复里带理由）；
+        - `online` / `error` / `''` → 照旧建目标（判断失败不比现在差）。
+
+        构想请求按每个项目的判断逐个走；被跳过的项目记进返回值的 `skipped`。免批（auto）
+        路径在建请求时就落地了、那会儿还没判（`goal_fit` 是 ''），所以行为不变。
         """
         request_id = str(row["id"])
         kind = str(row["kind"])
@@ -372,15 +485,45 @@ class Approvals:
         by_text = f"{_who(conn, gid, _row_get(row, 'requester_id'), requester_name)} 发起 · {'自动批准' if auto else f'{by} 批准'}"
         if row["idea_id"] is not None:
             by_text = f"{by_text} · 来自构想"
+        fit = _norm(_row_get(row, "goal_fit")).lower()
+        fit_alt = _parse_fit_alt(_row_get(row, "goal_fit_alt"))
 
         task_ids: list[str] = []
         goal_ids: list[str] = []
+        skipped: list[dict] = []
         idea = self._idea_of_request(row)
-        picked = self.picked_idea_items(row)
+        picked = self.picked_idea_items_numbered(row)
         if picked:
             ctx = self._idea_context(idea or {})
-            for it in picked:
+            for no, it in picked:
                 if it["kind"] == "goal":
+                    item_fit = _fit_alt_item_kind(fit_alt, no)
+                    if item_fit == "human":
+                        one = _fit_alt_item_alt(fit_alt, no)
+                        if one is None:
+                            # 要群友自己动手、又给不出替代任务：这一项不做（回执里列出来）
+                            skipped.append({"title": it["title"], "reason": _fit_alt_item_reason(fit_alt, no)})
+                            continue
+                        task_ids.append(
+                            self._tasks.create(
+                                gid,
+                                title=one["title"],
+                                req=one["req"],
+                                criteria=[],
+                                source="request",
+                                requester_id=str(row["requester_id"]),
+                                requester_name=requester_name,
+                                request_id=request_id,
+                                icon=str(row["icon"] or "package"),
+                                status="queued",
+                                conn=conn,
+                            )
+                        )
+                        self._store.event(
+                            conn, "request.goal_as_task", group_id=gid, entity="request", entity_id=request_id,
+                            payload={"item_no": no, "title": one["title"], "from": it["title"]},
+                        )
+                        continue
                     goal_ids.append(
                         self._goals.create_agent(
                             gid,
@@ -411,6 +554,9 @@ class Approvals:
                             conn=conn,
                         )
                     )
+            if not task_ids and not goal_ids and skipped:
+                # 选中的项目全是要群友自己动手的：一个都做不了，只能不批
+                raise ValueError(_refuse_fit_message(_norm(_row_get(row, "goal_fit_reason")) or skipped[0]["reason"]))
         elif kind == "task":
             task_ids.append(
                 self._tasks.create(
@@ -427,7 +573,30 @@ class Approvals:
                     conn=conn,
                 )
             )
-        else:  # goal
+        elif fit == "human":  # goal：判断说要群友自己动手
+            one = _fit_alt_single(fit_alt)
+            if one is None:
+                raise ValueError(_refuse_fit_message(_norm(_row_get(row, "goal_fit_reason"))))
+            task_ids.append(
+                self._tasks.create(
+                    gid,
+                    title=one["title"],
+                    req=one["req"],
+                    criteria=[],
+                    source="request",
+                    requester_id=str(row["requester_id"]),
+                    requester_name=requester_name,
+                    request_id=request_id,
+                    icon=str(row["icon"] or "package"),
+                    status="queued",
+                    conn=conn,
+                )
+            )
+            self._store.event(
+                conn, "request.goal_as_task", group_id=gid, entity="request", entity_id=request_id,
+                payload={"title": one["title"], "from": str(row["title"])},
+            )
+        else:  # goal：online / error / 还没判 → 照旧立目标
             goal_ids.append(
                 self._goals.create_agent(
                     gid,
@@ -460,6 +629,7 @@ class Approvals:
             "id": request_id, "status": "approved", "auto": auto,
             "task_id": task_id, "goal_id": goal_id,
             "task_ids": task_ids, "goal_ids": goal_ids,
+            "skipped": skipped,
         }
 
     def _idea_of_request(self, row: dict) -> dict | None:
@@ -480,14 +650,23 @@ class Approvals:
         公开给自动审核用（auto_review.py 判「选中的项目里有没有 goal」）；落地 `_land`
         也走这一个口径。
         """
+        return [it for _no, it in self.picked_idea_items_numbered(row)]
+
+    def picked_idea_items_numbered(self, row: dict) -> list[tuple[int, dict]]:
+        """同 `picked_idea_items`，但带上项目序号：`[(序号, 项目)]`。
+
+        序号和网页构想页（`feeds.idea_items_view` 的 `no`）一致：从 1 起数。目标判断
+        （goal_fit.py）按序号把「能不能盯」的结论写进 `requests.goal_fit_alt`，落地
+        `_land` 也按序号取回来，两边共用这一处口径。
+        """
         idea = self._idea_of_request(row)
         if not idea:
             return []
-        return self._picked_idea_items(idea, _parse_item_nos(row.get("item_nos")))
+        return self._picked_idea_items_numbered(idea, _parse_item_nos(row.get("item_nos")))
 
     @staticmethod
-    def _picked_idea_items(idea: dict, item_nos: list[int]) -> list[dict]:
-        """构想里被点名的项目（按序号 1 起）；item_nos 空 = 全部。
+    def _picked_idea_items_numbered(idea: dict, item_nos: list[int]) -> list[tuple[int, dict]]:
+        """构想里被点名的项目 + 序号（按序号 1 起）；item_nos 空 = 全部。
 
         序号一个都没对上（比如写了 9、但这条构想只有 3 项）→ 当「全部」处理：写错序号
         不该变成什么都不做，也不该拿请求标题硬凑一个。反正落地前有人工批准这一关。
@@ -498,9 +677,14 @@ class Approvals:
         if not items:
             return []
         if not item_nos:
-            return items
-        picked = [it for i, it in enumerate(items, start=1) if i in item_nos]
-        return picked or items
+            return list(enumerate(items, start=1))
+        picked = [(i, it) for i, it in enumerate(items, start=1) if i in item_nos]
+        return picked or list(enumerate(items, start=1))
+
+    @staticmethod
+    def _picked_idea_items(idea: dict, item_nos: list[int]) -> list[dict]:
+        """兼容入口（app.py 的「构想直接开工」还在用）：只要项目、不要序号。"""
+        return [it for _no, it in Approvals._picked_idea_items_numbered(idea, item_nos)]
 
     @staticmethod
     def _idea_context(idea: dict) -> str:
@@ -567,6 +751,8 @@ class Approvals:
                 "age_s": max(0, int(now - float(r["created"]))),
                 "approved_by": str(_row_get(r, "decided_by") or ""),
                 "auto_reason": str(_row_get(r, "auto_reason") or ""),
+                # R5：批准前主模型判的「MaiWork 自己能不能盯」（没判 → None）
+                "goal_fit": _goal_fit_view(r),
             }
             for r in rows
         ]

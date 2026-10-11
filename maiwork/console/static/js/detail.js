@@ -4,7 +4,7 @@ import { SVG, dur, esc, ico, msText, safeUrl, when } from "./util.js";
 import { api, gview } from "./api.js";
 import { loading } from "./pages/news.js";
 import { findIdea, ideaDetail } from "./pages/ideas.js";
-import { nextText } from "./pages/goals.js";
+import { critBacked, critPending, nextText } from "./pages/goals.js";
 import { taskRow } from "./pages/tasks.js";
 import { sheetChrome } from "./sheet.js";
 import { renderSide } from "./render.js";
@@ -102,15 +102,28 @@ function reqBlock(t) {
 }
 
 // 目标完成标准的打勾依据（docs/22 第三期）：哪条任务交付的、证据一句（证据只有管理员看得到，
-// 服务端群友版本来就不带 evidence）。旧的、没留依据的勾显示「没留依据」，方便管理员复核。
-function critProof(c) {
+// 服务端群友版本来就不带 evidence）。没留依据的旧勾是「待确认」：不算进完成，
+// 群管理员可以点「算数」或「撤掉」（都会留记录）。
+function critProof(c, goal, i) {
   if (!c || !c.done) return "";
+  if (critPending(c)) {
+    const open = gadmin() && goal.state !== "done" && goal.state !== "cancelled";
+    const b = (op, label) => `<button class="link-btn" data-act="goal-op" data-op="${op}" data-id="${esc(goal.id)}" data-i="${i}">${label}</button>`;
+    return `<div class="fine-inline"><b class="warn-t">待确认</b> · 以前勾的，没留依据，先不算完成${open ? `<span class="ck-acts">${b("confirm", "算数")}${b("revoke", "撤掉")}</span>` : ""}</div>`;
+  }
   const bits = [];
   if (c.task_id) bits.push(`来自任务 <span class="mono">${esc(c.task_id)}</span>`);
   if (c.evidence) bits.push(esc(c.evidence));
-  if (c.ts) bits.push(esc(when(c.ts)));
-  if (!c.task_id && !c.evidence) return admin() ? `<div class="fine-inline">旧记录，没留依据</div>` : "";
-  return `<div class="fine">${bits.join(" · ")}</div>`;
+  if (c.confirmed_ts) bits.push("管理员确认算数");
+  if (c.ts || c.confirmed_ts) bits.push(esc(when(c.ts || c.confirmed_ts)));
+  return bits.length ? `<div class="fine">${bits.join(" · ")}</div>` : "";
+}
+
+// 目标判断（立目标前 / 补判）：要群友自己动手的，MaiWork 盯不了——只提示，不自动改
+function fitBlock(goal) {
+  if (goal.fit !== "human" || goal.state === "done" || goal.state === "cancelled") return "";
+  const why = goal.fit_reason ? `：${goal.fit_reason}` : "";
+  return `<div class="warn-box">这件事要群友自己动手，MaiWork 盯不了${esc(why)}。${gadmin() ? "建议点「不做了」；想留着也行，它不会再假装推进。" : "等管理员决定留不留。"}</div>`;
 }
 
 function taskDetail(id) {
@@ -195,7 +208,7 @@ function handoffEntry(t) {
 
 function goalDetail(goal) {
   const crit = goal.criteria || [];
-  const done = crit.filter((c) => c.done).length;
+  const done = crit.filter(critBacked).length;
   const row = goal.task_id && findTaskRow(goal.task_id);
   let acts = "";
   if (gadmin() && goal.state !== "done" && goal.state !== "cancelled") {
@@ -213,11 +226,12 @@ function goalDetail(goal) {
         <div class="dt-state"><span class="dot ${goal.state === "paused" ? "" : "running"}"></span>${goal.state === "paused" ? "暂停中" : "推进中"}${crit.length ? ` · ${done} / ${crit.length}` : ""}</div>
       </div>
     </div>
+    ${fitBlock(goal)}
     <div class="dt-sec"><div class="dt-text">${esc(goal.body)}</div></div>
     ${
       crit.length
         ? `<div class="dt-sec"><div class="dt-label">完成标准</div>
-      <ul class="checks">${crit.map((c) => `<li class="${c.done ? "done" : ""}"><span class="tick">${c.done ? SVG.check : ""}</span><span class="ck-body">${esc(c.text)}${critProof(c)}</span></li>`).join("")}</ul></div>`
+      <ul class="checks">${crit.map((c, i) => `<li class="${critBacked(c) ? "done" : ""}"><span class="tick">${critBacked(c) ? SVG.check : ""}</span><span class="ck-body">${esc(c.text)}${critProof(c, goal, i)}</span></li>`).join("")}</ul></div>`
         : ""
     }
     ${goal.last ? `<div class="dt-sec"><div class="dt-label">上次</div><div class="dt-text">${esc(when(goal.last.ts))} ${esc(goal.last.text)}</div></div>` : ""}

@@ -545,21 +545,29 @@ async def test_goal_missing_evidence_rejected(
 
 
 async def test_goal_view_hides_evidence_for_non_admin(mem_store, goals):
-    """群友视图只带 task_id / ts，不带 evidence（可能是群友原话）。"""
+    """群友视图不带 evidence（可能是群友原话）和 confirmed_by（管理员账号）；
+    backed / pending 留着（前端要显示「待确认」）。"""
     from CharTyr_MaiWork.maiwork.console import views as console_views
 
     goal_id = _mk_goal(goals)
+    goals.set_criteria(goal_id, ["群投票选定首开线路并公示结果", "另一条"])
     goals.set_criterion(goal_id, 0, True, evidence="阿柒：投票结果出来了",
                         task_id="T-3", ts=NOW)
+    goals.set_criterion(goal_id, 1, True)
+    goals.confirm_criterion(goal_id, 1, "10001")
 
     svc = SimpleNamespace(goals=goals)
-    admin = console_views._goals_view(svc, GID, admin=True)["agent"][0]["criteria"][0]
-    public = console_views._goals_view(svc, GID, admin=False)["agent"][0]["criteria"][0]
-    assert admin["evidence"] == "阿柒：投票结果出来了"
-    assert public["done"] is True
-    assert public["task_id"] == "T-3"
-    assert public["ts"] == NOW
-    assert "evidence" not in public
+    admin = console_views._goals_view(svc, GID, admin=True)["agent"][0]["criteria"]
+    public = console_views._goals_view(svc, GID, admin=False)["agent"][0]["criteria"]
+    assert admin[0]["evidence"] == "阿柒：投票结果出来了"
+    assert admin[1]["confirmed_by"] == "10001"
+    assert public[0]["done"] is True
+    assert public[0]["task_id"] == "T-3"
+    assert public[0]["ts"] == NOW
+    assert "evidence" not in public[0]
+    assert "confirmed_by" not in public[1]
+    assert public[1]["backed"] is True and public[1]["pending"] is False
+    assert public[1]["done"] is True
 
 
 async def test_chat_evidence_match_pure_function():
@@ -574,3 +582,20 @@ async def test_chat_evidence_match_pure_function():
     assert goals_mod.chat_evidence_match("随便一句别的", lines) is False
     # 跨空白拼接也算
     assert goals_mod.chat_evidence_match("投票结果\n已经出来了", lines) is True
+
+
+async def test_chat_evidence_match_with_time_prefix():
+    """R6：群聊行带时间「- MM-DD HH:MM 谁：正文」时，比对仍只看正文。"""
+    from CharTyr_MaiWork.maiwork import goals as goals_mod
+
+    timed = ["- 10-11 14:05 阿柒：投票结果已经出来了，A 线 12 票"]
+    assert goals_mod.chat_evidence_match("投票结果已经出来了", timed) is True
+    # 时间前缀和「谁」都不算正文
+    assert goals_mod.chat_evidence_match("10-11 14:05 阿柒", timed) is False
+    # 旧格式（没时间）行为不变
+    old = ["- 阿柒：投票结果已经出来了，A 线 12 票"]
+    assert goals_mod.chat_evidence_match("投票结果已经出来了", old) is True
+    # 半角冒号的「谁:正文」：时间里的半角冒号不能被当成正文分隔符
+    half = ["- 10-11 14:05 阿柒:投票结果已经出来了"]
+    assert goals_mod.chat_evidence_match("投票结果已经出来了", half) is True
+    assert goals_mod.chat_evidence_match("10-11 14:05 阿柒:投票结果", half) is False

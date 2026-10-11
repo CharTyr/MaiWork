@@ -30,6 +30,20 @@ function pendingItems(p) {
   return `<ul class="pend-items">${want.map((x) => `<li>${esc(x.title)}<span class="ii-kind">${x.kind === "goal" ? "目标" : "任务"}</span></li>`).join("")}</ul>`;
 }
 
+// 目标请求批准前的判断（MaiWork 自己能不能在网上盯 / 做成）：只说结论和批准后会怎样
+function fitNote(p) {
+  const f = p.goal_fit;
+  if (!f || !f.kind) return "";
+  if (f.kind === "online") return `<div class="via">能在网上盯${f.reason ? `：${esc(f.reason)}` : ""}</div>`;
+  if (f.kind === "error") return `<div class="via">没判断出能不能盯，批准后按目标接</div>`;
+  if (f.kind !== "human") return "";
+  const why = f.reason ? `：${esc(f.reason)}` : "";
+  const then = f.alt_title
+    ? `批准后改成一次性任务开工：${esc(f.alt_title)}`
+    : "MaiWork 做不了，只能不批";
+  return `<div class="warn-box">要群友自己动手，MaiWork 盯不了${why}。${then}</div>`;
+}
+
 export function viewTasks(g, v) {
   let html = `<h1 class="h-page h-fish">${agentFish("task", 44)}<span>任务</span></h1>`;
   const tasks = (v && v.tasks) || { pending: [], list: [] };
@@ -53,10 +67,11 @@ export function viewTasks(g, v) {
             ${pendingItems(p)}
             ${p.quote ? `<div class="quote"><span class="quote-by">${esc(p.who)} · ${esc(when(p.ts))}</span>${esc(p.quote)}</div>` : ""}
             <div class="via">${esc(p.via || "")}${p.age_s > 86400 ? ` · <b class="warn-t">已等 ${dur(p.age_s)}</b>` : ""}</div>
+            ${fitNote(p)}
             ${
               gadmin()
                 ? `<div class="actions">
-              <button class="btn primary" data-act="req" data-op="approve" data-id="${esc(p.id)}">批准</button>
+              ${p.goal_fit && p.goal_fit.kind === "human" && !p.goal_fit.alt_title ? "" : `<button class="btn primary" data-act="req" data-op="approve" data-id="${esc(p.id)}">${p.goal_fit && p.goal_fit.kind === "human" ? "按任务批准" : "批准"}</button>`}
               <button class="btn" data-act="req" data-op="reject" data-id="${esc(p.id)}">不批</button>
             </div>`
                 : `<div class="note-ok"><span class="dot pending"></span>批准后开工</div>`

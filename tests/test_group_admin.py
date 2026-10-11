@@ -697,6 +697,25 @@ class TestTaskAndApprovalRoutes:
             assert r2.status == 403, (op, r2.status)
 
     @pytest.mark.asyncio
+    async def test_goal_criterion_ops_own_ok_other_403(self, env: SimpleEnv) -> None:
+        """群管理员只能对本群目标的待确认旧勾点「算数 / 撤掉」，别的群 403 且不动数据。"""
+        import json
+
+        env.set_group_password(G1, G1_PW)
+        await env.login(G1_PW)
+        own = env.app.goals.create_agent(G1, title="甲", body="", criteria=["x"], by_text="测试")
+        other = env.app.goals.create_agent(G2, title="乙", body="", criteria=["y"], by_text="测试")
+        env.app.goals.set_criterion(own, 0, True)
+        env.app.goals.set_criterion(other, 0, True)
+        r = await env.client.post(f"/api/goals/{own}/criteria/0/confirm", json={})
+        assert r.status == 200, r.status
+        assert json.loads(env.app.goals.get(own)["criteria"])[0]["confirmed_by"] == "群管理员（网页）"
+        for op in ("confirm", "revoke"):
+            r2 = await env.client.post(f"/api/goals/{other}/criteria/0/{op}", json={})
+            assert r2.status == 403, (op, r2.status)
+        assert "confirmed_by" not in json.loads(env.app.goals.get(other)["criteria"])[0]
+
+    @pytest.mark.asyncio
     async def test_approve_own_ok_other_403_and_by_text(self, env: SimpleEnv) -> None:
         env.set_group_password(G1, G1_PW)
         await env.login(G1_PW)

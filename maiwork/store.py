@@ -1080,8 +1080,30 @@ def _m_idea_kind(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE ideas ADD COLUMN kind TEXT NOT NULL DEFAULT ''")
 
 
+# 目标贴合群聊（2026-10-11 R5）：requests 记「这个请求 MaiWork 能不能盯 / 做成」的判断
+# （goal_fit：'' 没判 / online / human / error；goal_fit_reason 一句理由；goal_fit_alt 替代任务的
+# JSON），goals 记目标本身的补判结果（fit / fit_reason，只给网页显示）。只加列、默认空串，
+# 旧代码读新库不受影响。
+def _m_goal_fit(conn: sqlite3.Connection) -> None:
+    tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "requests" in tables:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(requests)")}
+        for name in ("goal_fit", "goal_fit_reason", "goal_fit_alt"):
+            if name not in cols:
+                conn.execute(
+                    f"ALTER TABLE requests ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+                )
+    if "goals" in tables:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(goals)")}
+        for name in ("fit", "fit_reason"):
+            if name not in cols:
+                conn.execute(
+                    f"ALTER TABLE goals ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+                )
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit]
 
 
 class Store:

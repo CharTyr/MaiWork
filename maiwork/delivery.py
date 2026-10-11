@@ -140,7 +140,10 @@ PUSH_EXEMPT_KINDS = frozenset(("error", "command", "admin", "awaited_delivery"))
 # 认法只有一处（Outbox.flush 与 group_push.used_today 共用 task_quota_free_kind）：
 # outbox 行 task_id 非空 + 载荷 push_kind ∈ {delivery, status}（含交付自动补的说明行）。
 # 仍受服务群检查与睡觉时段约束；awaited_delivery 照旧完全豁免。
-TASK_QUOTA_FREE_KINDS = frozenset(("task_delivery", "task_status"))
+# 2026-10-11（用户定）：agent 目标的「盯到了 / 完成了」（载荷 push_kind=goal_result，
+# outbox 行 task_id 为空）与上面同口径——不占每日额度、也不被它挡住，只守服务群 +
+# 睡觉时段；每个目标每天最多 1 条的节制在 Coordinator 侧按 outbox key 管，不走这里。
+TASK_QUOTA_FREE_KINDS = frozenset(("task_delivery", "task_status", "goal_result"))
 # 载荷里的原始 push_kind → quota-free kind（闸门 / 留痕都按后者走）
 _TASK_QUOTA_KIND = {"delivery": "task_delivery", "status": "task_status"}
 # 完全不占每日额度的 kind 全集（永远豁免的 + 任务自己的）
@@ -149,6 +152,7 @@ NO_QUOTA_KINDS = PUSH_EXEMPT_KINDS | TASK_QUOTA_FREE_KINDS
 PUSH_KIND_CN = {
     "task_delivery": "任务交付",
     "task_status": "任务状态",
+    "goal_result": "目标结果",
 }
 # 读不到可信的每群配置时的理由：**不是**「开关已关」（那条会被作废），
 # 调用方（Outbox.flush）据此只推迟、不发、也不作废。
@@ -168,6 +172,8 @@ def task_quota_free_kind(task_id: Any, push_kind: Any) -> str:
     认法（全项目只有这一处）：outbox 行 task_id 非空 + push_kind ∈ {delivery, status}。
     其余（topic / news_card / idea_mention / reminder / 群公告预告 / 目标巡检 /
     不带任务的状态行 / awaited_delivery）原样返回，节制规则一个字都不变。
+    goal_result（目标「盯到了 / 完成了」）不带 task_id，原样返回后由
+    `TASK_QUOTA_FREE_KINDS` 按 kind 直接认成不占额度。
     """
     kind = str(push_kind or "")
     if not str(task_id or "").strip():
@@ -838,9 +844,10 @@ class Pushes:
         now 决定「用哪一天的额度」和「是不是在睡觉时段」。三种自制消息的每群开关
         也在这里管：关了就返回「开关已关」，调用方据此把这条待发的作废（不发陈旧的）。
 
-        任务自己的消息（TASK_QUOTA_FREE_KINDS：task_delivery / task_status）只查
-        服务群 + 睡觉时段：不查每日额度（群友派的活不能因为群里的额度被丢掉），也不查
-        每群开关（它们不是 topic / news_card / idea_mention 那三个开关管的）。
+        任务自己的消息与目标结果（TASK_QUOTA_FREE_KINDS：task_delivery / task_status /
+        goal_result）只查服务群 + 睡觉时段：不查每日额度（群友派的活、目标的「盯到了 /
+        完成了」不能因为群里的额度被丢掉），也不查每群开关（它们不是 topic / news_card /
+        idea_mention 那三个开关管的）。
 
         非服务群（或认不出在不在服务名单）：直接 `(False, UNSERVED_REASON)`，**零 SQL**
         ——不读每群设置、不数额度、不看睡觉时段。只有明确的服务群才继续往下查。
@@ -860,7 +867,7 @@ class Pushes:
             logger.exception("读每群推送设置失败（群 %s），按保守默认节制", gid)
             return False, UNREADABLE_REASON
         if kind_s in TASK_QUOTA_FREE_KINDS:
-            # 任务自己的消息：只看睡觉时段（不看每群开关，也不看每日额度）
+            # 任务自己的消息 + 目标结果：只看睡觉时段（不看每群开关，也不看每日额度）
             if self.in_quiet(now, gid):
                 return False, "睡觉时段"
             return True, ""

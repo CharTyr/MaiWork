@@ -780,7 +780,9 @@ def test_make_idea_dedup_recent_30_days(tmp_path) -> None:
                    ensure_ascii=False)
     ])
     store, settings, feeds, m, w, topics, _ = _make_idea_feeds(tmp_path, models=models)
-    _seed_idea(store, GID, title=old_title, created=NOW - 10 * 86400)
+    # 这两条不 patch clock（群聊按真实「现在」种）：旧构想时间也按真实现在往前推，
+    # 写死 NOW 会在 NOW-10 天 +30 天（2026-10-11 22:13）之后过期变红。
+    _seed_idea(store, GID, title=old_title, created=clock.now() - 10 * 86400)
     assert _run(feeds.make_idea(GID)) is None
     assert topics.calls == []
 
@@ -797,7 +799,7 @@ def test_make_idea_no_dedup_beyond_30_days(tmp_path) -> None:
                    ensure_ascii=False)
     ])
     store, settings, feeds, m, w, topics, _ = _make_idea_feeds(tmp_path, models=models)
-    _seed_idea(store, GID, title=old_title, created=NOW - 40 * 86400)
+    _seed_idea(store, GID, title=old_title, created=clock.now() - 40 * 86400)
     got = _run(feeds.make_idea(GID))
     assert isinstance(got, int)  # 超过 30 天不算重复
 

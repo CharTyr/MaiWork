@@ -13,7 +13,14 @@ import pytest
 from fakes import FakeCoordinator, FakeHost
 
 from CharTyr_MaiWork.maiwork.approvals import Approvals
-from CharTyr_MaiWork.maiwork.commands import HELP_ITEMS, Commands, help_text, usage_text
+from CharTyr_MaiWork.maiwork.commands import (
+    HELP_ITEMS,
+    USAGE_TIPS,
+    Commands,
+    help_text,
+    usage_text,
+    usage_tips,
+)
 from CharTyr_MaiWork.maiwork.config import load_settings
 from CharTyr_MaiWork.maiwork.goals import Goals
 from CharTyr_MaiWork.maiwork.store import Store
@@ -93,6 +100,17 @@ def _request(env: SimpleEnv, *, requester: str = MEMBER, title: str = "整理资
         via="群里 @ · Jev 判断是「准备东西」（把握 0.90）",
         requester_id=requester, requester_name=f"名字{requester}", message_id="m-req",
     )
+
+
+def _set_fit(env: SimpleEnv, rid: str, fit: str, *, reason: str = "", alt=None) -> None:
+    """把「这件事 MaiWork 能不能盯」的判断写进请求行（判断本身在 test_goal_fit.py 测）。"""
+    import json as _json
+
+    with env.store.tx() as conn:
+        conn.execute(
+            "UPDATE requests SET goal_fit=?, goal_fit_reason=?, goal_fit_alt=? WHERE id=?",
+            (fit, reason, (_json.dumps(alt, ensure_ascii=False) if alt is not None else ""), rid),
+        )
 
 
 # ----------------------------------------------------------------------
@@ -247,6 +265,74 @@ class TestDecide:
         reply = await env.say(f"/mw 批准 {req['id']}", user=ADMIN)
         assert "已批准" in reply
         assert started == []  # goal 不开任务
+
+    @pytest.mark.asyncio
+    async def test_approve_human_goal_without_alt_replies_the_reason(self, tmp_path: Path) -> None:
+        """R5：判断是「要群友自己动手」又没有替代任务 → 批准被拒，回复里写清原因。"""
+        env = _env(tmp_path)
+        req = env.approvals.create(
+            G1, kind="goal", title="一起开档打卡", quote="一起开档打卡", via="群里 @",
+            requester_id=MEMBER, requester_name=f"名字{MEMBER}",
+        )
+        _set_fit(env, req["id"], "human", reason="要群友自己开档、截图")
+        reply = await env.say(f"/mw 批准 {req['id']}", user=ADMIN)
+        assert "群友自己动手" in reply and "盯不了" in reply
+        assert "要群友自己开档、截图" in reply      # 原样带出理由
+        assert "只能不批" in reply
+        assert [p["id"] for p in env.approvals.pending_view(G1)] == [req["id"]]  # 还是待批
+        assert env.store.read().execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 0
+        assert env.store.read().execute("SELECT COUNT(*) AS n FROM goals").fetchone()["n"] == 0
+
+    @pytest.mark.asyncio
+    async def test_approve_human_goal_with_alt_starts_task(self, tmp_path: Path) -> None:
+        """human + 替代任务 → 批准后按任务开工（不是目标）。"""
+        started: list[str] = []
+        env = _env(tmp_path, run_task_starter=started.append)
+        req = env.approvals.create(
+            G1, kind="goal", title="一起开档打卡", quote="一起开档打卡", via="群里 @",
+            requester_id=MEMBER, requester_name=f"名字{MEMBER}",
+        )
+        _set_fit(
+            env, req["id"], "human", reason="要群友自己开档",
+            alt={"title": "整理 mod 清单", "req": "把 mod 和分线整理成清单"},
+        )
+        reply = await env.say(f"/mw 批准 {req['id']}", user=ADMIN)
+        assert "已开工" in reply
+        rows = env.store.read().execute("SELECT title, request_id FROM tasks").fetchall()
+        assert [r["title"] for r in rows] == ["整理 mod 清单"]
+        assert started == ["T-1"]
+
+    @pytest.mark.asyncio
+    async def test_approve_skipped_idea_items_are_listed_in_reply(self, tmp_path: Path) -> None:
+        """构想里「要群友自己动手」又没替代任务的项目被跳过，回复里要列出来。"""
+        import json as _json
+
+        env = _env(tmp_path)
+        with env.store.tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO ideas (group_id, icon, title, body, items, state, created, updated)"
+                " VALUES (?, 'books', '分线计划', '分线开档', ?, 'new', 1, 1)",
+                (G1, _json.dumps([
+                    {"kind": "goal", "title": "分线开档打卡", "desc": "群友自己开档"},
+                    {"kind": "goal", "title": "盯新版本", "desc": "盯发布"},
+                ], ensure_ascii=False)),
+            )
+            idea_id = int(cur.lastrowid or 0)
+        req = env.approvals.create(
+            G1, kind="task", title="分线计划", quote="分线计划", via="来自构想",
+            requester_id=MEMBER, requester_name=f"名字{MEMBER}", idea_id=idea_id, source="idea",
+        )
+        _set_fit(
+            env, req["id"], "human", reason="要群友自己开档",
+            alt={"items": {
+                "1": {"kind": "human", "reason": "要群友自己开档", "alt": None},
+                "2": {"kind": "online", "reason": "盯发布", "alt": None},
+            }},
+        )
+        reply = await env.say(f"/mw 批准 {req['id']}", user=ADMIN)
+        assert "目标" in reply                       # 第 2 项照旧立目标
+        assert "1 项要群友自己动手" in reply
+        assert "分线开档打卡" in reply
 
 
 # ----------------------------------------------------------------------
@@ -467,8 +553,8 @@ class TestHelp:
         assert "例：/mw 批准 R-12" in text
         assert "例：/mw 取消 T-8" in text
         assert "例：/mw 领取 T-8" in text
-        # 群消息，别太长
-        assert len(text) <= 400
+        # 群消息，别太长（加了「直接 @ 我说」两条用法后放宽：正文 306 → 421 字）
+        assert len(text) <= 460
         # 人人能用的排在前一组，批准人才用的排在后一组
         cut = text.index("批准人：")
         assert text.index("/mw do 要做的事") < cut
@@ -485,6 +571,90 @@ class TestHelp:
         reply = await env.say("/mw 随便")
         assert reply == usage_text("随便")
         assert "/mw 看进度" in reply and "/mw do 要做的事" in reply and "/mw 帮助" in reply
+
+
+# ----------------------------------------------------------------------
+# 「也可以直接 @ 我说」两条大白话用法（USAGE_TIPS / usage_tips / help_text 尾巴）
+# ----------------------------------------------------------------------
+
+
+def _table_head() -> str:
+    """/mw 帮助 原有的那一段（从指令表生成）；用来钉住「前面一字不变」。"""
+    def line(it: dict[str, str]) -> str:
+        # 和 commands._help_line 同一个写法，冻结成期望
+        return f"{it['syntax']} — {it['desc']}" + (
+            f"，例：{it['example']}" if it.get("example") else ""
+        )
+
+    out = ["MaiWork 群指令：", "大家都能用："]
+    out += [f"· {line(it)}" for it in HELP_ITEMS if it["who"] == "所有人"]
+    out.append("批准人：")
+    out += [f"· {line(it)}" for it in HELP_ITEMS if it["who"] != "所有人"]
+    return "\n".join(out)
+
+
+class TestUsageTips:
+    def test_two_tips_are_plain_sayings_with_placeholder(self) -> None:
+        assert len(USAGE_TIPS) == 2
+        assert USAGE_TIPS[0] == {
+            "say": "@{bot} 提醒我 周五晚八点 开黑",
+            "desc": "到点在群里 @ 你提醒，不用批准",
+        }
+        assert USAGE_TIPS[1] == {
+            "say": "@{bot} 帮我们盯着 暗潮新版本，出了说一声",
+            "desc": "MaiWork 在网上盯着，盯到了在群里说一声；要管理员批准",
+        }
+
+    def test_usage_tips_replaces_placeholder_on_a_copy(self) -> None:
+        tips = usage_tips("小笨")
+        assert len(tips) == 2
+        for got, src in zip(tips, USAGE_TIPS):
+            assert "{bot}" not in got["say"]
+            assert "小笨" in got["say"]
+            assert got["desc"] == src["desc"]
+        # 是副本：改返回值不能碰唯一来源
+        tips[0]["say"] = "改坏了"
+        assert "{bot}" in USAGE_TIPS[0]["say"]
+
+    def test_usage_tips_blank_name_falls_back_to_maibot(self) -> None:
+        for blank in ("", "   ", "\n"):
+            tips = usage_tips(blank)
+            assert all("MaiBot" in t["say"] for t in tips), blank
+        assert usage_tips() == usage_tips("MaiBot")
+
+    def test_help_text_appends_tips_after_the_unchanged_table(self) -> None:
+        text = help_text("小笨")
+        marker = "也可以直接 @ 我说："
+        assert text.count(marker) == 1
+        head, tail = text.split(marker)
+        # 前面部分一字不变（末尾换行 + 两条用法）
+        assert head == _table_head() + "\n"
+        assert tail == (
+            "\n· @小笨 提醒我 周五晚八点 开黑 — 到点在群里 @ 你提醒，不用批准"
+            "\n· @小笨 帮我们盯着 暗潮新版本，出了说一声 —"
+            " MaiWork 在网上盯着，盯到了在群里说一声；要管理员批准"
+        )
+        # 每条都在，且用了机器人名字
+        for tip in USAGE_TIPS:
+            assert tip["desc"] in text
+
+    def test_help_text_empty_name_is_maibot(self) -> None:
+        assert help_text("") == help_text("MaiBot")
+        assert "@MaiBot 提醒我 周五晚八点 开黑" in help_text()
+
+    @pytest.mark.asyncio
+    async def test_help_reply_uses_the_bot_name_from_host(self, tmp_path: Path) -> None:
+        env = _env(tmp_path)
+        env.host.bot_name_cache = "阿笨"
+        reply = await env.say("/mw 帮助", message_id="m-help-name")
+        assert reply == help_text("阿笨")
+        assert "@阿笨 提醒我 周五晚八点 开黑" in reply
+
+    @pytest.mark.asyncio
+    async def test_help_reply_falls_back_when_host_has_no_name(self, tmp_path: Path) -> None:
+        env = _env(tmp_path)
+        reply = await env.say("/mw 帮助", message_id="m-help-noname")
+        assert "@MaiBot 提醒我 周五晚八点 开黑" in reply
 
 
 # ----------------------------------------------------------------------

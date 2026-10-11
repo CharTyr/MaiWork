@@ -831,6 +831,48 @@ class TestM3Loop:
             await app.stop()
 
     @pytest.mark.asyncio
+    async def test_goal_request_judged_in_background_task_request_not(self, tmp_path: Path) -> None:
+        """R5：落一条 goal 请求 → 后台判一次目标贴合；task 请求不触发这个判断（零调用）。"""
+        app = _app(tmp_path)
+        await app.start()
+        try:
+            assert app.goal_fit is not None
+
+            class _FakeGoalFitModels:
+                def __init__(self) -> None:
+                    self.purposes: list[str] = []
+
+                async def chat(self, role=None, messages=None, **kwargs):
+                    self.purposes.append(str(kwargs.get("purpose") or ""))
+                    return type("R", (), {"text": '{"kind": "online", "reason": "盯着版本更新", "alt": null}'})()
+
+            models = _FakeGoalFitModels()
+            app.goal_fit._models = models
+            app.auto_review._models = None  # 这一条只看目标判断；goal 本来也不自动批
+            goal = app.approvals.create(
+                G1, kind="goal", title="帮我们盯着暗潮新版本", quote="帮我们盯着 暗潮新版本",
+                via="群里 @", requester_id="10001", requester_name="阿柒",
+            )
+            for _ in range(50):
+                if models.purposes:
+                    break
+                await asyncio.sleep(0.01)
+            assert models.purposes == ["approvals.goal_fit"]
+            row = app.store.read().execute("SELECT goal_fit FROM requests WHERE id=?", (goal["id"],)).fetchone()
+            assert str(row["goal_fit"]) == "online"
+
+            task = app.approvals.create(
+                G1, kind="task", title="帮我查一下免费图床", quote="帮我查一下",
+                via="群里 @", requester_id="10001", requester_name="阿柒",
+            )
+            await asyncio.sleep(0.15)
+            assert models.purposes == ["approvals.goal_fit"]     # task 请求不判
+            row2 = app.store.read().execute("SELECT goal_fit FROM requests WHERE id=?", (task["id"],)).fetchone()
+            assert str(row2["goal_fit"]) == ""
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
     async def test_coordinator_missing_still_starts(self, tmp_path: Path) -> None:
         """coordinator 没建好：app 照常启动，queued 任务不炸，只是没人开工。"""
         app = _app(tmp_path)

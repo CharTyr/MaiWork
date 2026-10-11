@@ -602,11 +602,13 @@ export async function act(el, e) {
     case "task-op":
     case "goal-op": {
       const kind = a === "task-op" ? "tasks" : "goals";
-      const labels = { pause: "已暂停", resume: "已继续", cancel: a === "task-op" ? "已取消" : "不做了", retry: "已重新排队", redeliver: "已重发" };
+      const labels = { pause: "已暂停", resume: "已继续", cancel: a === "task-op" ? "已取消" : "不做了", retry: "已重新排队", redeliver: "已重发", confirm: "这条算数了", revoke: "这条撤掉了" };
       if (el.dataset.op === "cancel" && !confirm("确定取消？已做的不会撤回")) break;
+      // 目标完成标准「待确认」的旧勾：data-i 是第几条（算数 / 撤掉）
+      const crit = kind === "goals" && el.dataset.i !== undefined ? `/criteria/${encodeURIComponent(el.dataset.i)}` : "";
       el.disabled = true;
       try {
-        const r = await api("POST", `/api/${kind}/${encodeURIComponent(el.dataset.id)}/${el.dataset.op}`, {});
+        const r = await api("POST", `/api/${kind}/${encodeURIComponent(el.dataset.id)}${crit}/${el.dataset.op}`, {});
         if (kind === "tasks" && r && r.id) state.tasks[r.id] = r;
         if (r && r.redeliver_warning) {
           toast(r.redeliver_warning, true);

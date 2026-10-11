@@ -23,6 +23,8 @@
 群友不会用就给提示：回复里顺手带下一步（状态末句、do 回批准 / 取消怎么发、批准回「发 /mw 看进度」）；
 未知子命令回一句短提示；那截文字看着像派活（和 @ 派活同一份请求词表）就给一行能直接照抄的
 「/mw do …」，**不建请求**。全部固定文本，不调模型。
+另外 `/mw 帮助` 末尾附两条大白话用法（`USAGE_TIPS`）：「直接 @ 机器人就能让它提醒 / 帮忙盯着」，
+**不是新指令**；`{bot}` 换成机器人在群里的名字，网页群视图的 `commands.tips` 和它同源。
 """
 
 from __future__ import annotations
@@ -68,6 +70,10 @@ _HELP_ALIASES = ("帮助", "help", "?", "？")
 _HELP_TITLE = "MaiWork 群指令："
 _HELP_GROUP_ALL = "大家都能用："
 _HELP_GROUP_APPROVER = "批准人："
+# 末尾两条大白话用法的小标题（不是指令，是「能这么跟机器人说话」）
+_TIPS_TITLE = "也可以直接 @ 我说："
+# 拿不到机器人在群里的名字时的回落（app.py 启动时把 bot.nickname 写进 host.bot_name_cache）
+_BOT_NAME_FALLBACK = "MaiBot"
 # 短提示里点名的三条常用：(表里的写法, 一句话)——写法都从表里取，不另写一份指令名
 _HELP_BY_SYNTAX = {it["syntax"]: it for it in HELP_ITEMS}
 _USAGE_HEADS = (("/mw", "看进度"), ("/mw do 要做的事", "派活"))
@@ -75,18 +81,40 @@ _USAGE_TAIL = "/mw 帮助"
 # 「要派活请这样发」里原话最多留这么多字（QQ 消息，别太长）
 _HINT_MAX = 100
 
+# ----------------------------------------------------------------------
+# 两条大白话用法（唯一来源）：群友不知道可以直接 @ 机器人让它提醒 / 帮忙盯着。
+# 只是帮人看懂「能怎么跟机器人说话」，**不是新指令**；`{bot}` 用机器人在群里的
+# 名字替换（见 usage_tips）。`/mw 帮助` 末尾和网页群视图的 commands.tips 都从这里来。
+# ----------------------------------------------------------------------
+
+USAGE_TIPS: tuple[dict[str, str], ...] = (
+    {"say": "@{bot} 提醒我 周五晚八点 开黑", "desc": "到点在群里 @ 你提醒，不用批准"},
+    {
+        "say": "@{bot} 帮我们盯着 暗潮新版本，出了说一声",
+        "desc": "MaiWork 在网上盯着，盯到了在群里说一声；要管理员批准",
+    },
+)
+
 
 def _help_line(item: dict[str, str]) -> str:
     line = f"{item['syntax']} — {item['desc']}"
     return f"{line}，例：{item['example']}" if item.get("example") else line
 
 
-def help_text() -> str:
-    """`/mw 帮助` 的整段回复：从 HELP_ITEMS 生成，按「谁能用」分两组。"""
+def usage_tips(bot_name: str = "") -> list[dict[str, str]]:
+    """USAGE_TIPS 的副本，把 `{bot}` 换成机器人在群里的名字（名字空着回落 MaiBot）。"""
+    name = str(bot_name or "").strip() or _BOT_NAME_FALLBACK
+    return [{k: str(v).replace("{bot}", name) for k, v in tip.items()} for tip in USAGE_TIPS]
+
+
+def help_text(bot_name: str = "") -> str:
+    """`/mw 帮助` 的整段回复：先是指令表（按「谁能用」分两组），末尾两条大白话用法。"""
     out = [_HELP_TITLE, _HELP_GROUP_ALL]
     out += [f"· {_help_line(it)}" for it in HELP_ITEMS if it["who"] == "所有人"]
     out.append(_HELP_GROUP_APPROVER)
     out += [f"· {_help_line(it)}" for it in HELP_ITEMS if it["who"] != "所有人"]
+    out.append(_TIPS_TITLE)
+    out += [f"· {t['say']} — {t['desc']}" for t in usage_tips(bot_name)]
     return "\n".join(out)
 
 
@@ -241,6 +269,14 @@ class Commands:
     # 分发
     # ------------------------------------------------------------------
 
+    def _bot_name(self) -> str:
+        """机器人在群里的名字：app.py 启动时预热进 host.bot_name_cache；拿不到给空串（回落 MaiBot）。"""
+        try:
+            return str(getattr(self._host, "bot_name_cache", "") or "")
+        except Exception:
+            logger.debug("取 host.bot_name_cache 失败，帮助文本回落 MaiBot", exc_info=True)
+            return ""
+
     async def _dispatch(
         self,
         gid: str,
@@ -261,7 +297,7 @@ class Commands:
         if sub == "网页":
             return self._web(gid)
         if sub in _HELP_ALIASES:
-            return help_text()
+            return help_text(self._bot_name())
         if sub in ("批准", "通过"):
             return await self._decide(gid, user_id, arg, op="approve")
         if sub == "拒绝":
@@ -511,13 +547,19 @@ class Commands:
         if tid and tid not in tids:
             tids.insert(0, tid)
         goal_id = str(res.get("goal_id") or "")
+        # 目标贴合（R5）：构想的项目里「要群友自己动手」又没替代任务的会被跳过，回执里说清
+        skipped = [s for s in (res.get("skipped") or []) if isinstance(s, dict)]
+        skip_note = ""
+        if skipped:
+            names = "、".join(str(s.get("title") or "")[:12] for s in skipped[:3])
+            skip_note = f"；另有 {len(skipped)} 项要群友自己动手，这次没做（{names}）"
         if tids:
             for one in tids:
                 self._start_task(one)
-            return f"已批准 {rid_s}，已开工（{'、'.join(tids)}）；发 /mw 看进度"
+            return f"已批准 {rid_s}，已开工（{'、'.join(tids)}）；发 /mw 看进度{skip_note}"
         if goal_id:
-            return f"已批准 {rid_s}，目标 {goal_id} 记下了，会定期检查"
-        return f"已批准 {rid_s}"
+            return f"已批准 {rid_s}，目标 {goal_id} 记下了，会定期检查{skip_note}"
+        return f"已批准 {rid_s}{skip_note}"
 
     def _start_task(self, task_id: str) -> None:
         try:

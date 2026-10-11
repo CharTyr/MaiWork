@@ -5286,7 +5286,8 @@ class Feeds:
             ' "deliver": "page"|"doc"|"tool"|"report", "needs_members": false}}'
             '} | null}'
             f"。items 是 MaiWork 自己能做完的那部分，最多 {_IDEA_ITEMS_MAX} 个：kind=task 是能一次"
-            "做完、有交付物的事，kind=goal 是要长期盯着、慢慢推进的事。**克制**：最好只给 1 个 task + "
+            "做完、有交付物的事，kind=goal 只用于 MaiWork 自己能在网上长期盯着的事"
+            "（例：盯版本更新、盯某个发布）；要群友动手的不要写成 goal。**克制**：最好只给 1 个 task + "
             "1 个 goal，也可以只有其中之一；确实需要才多给，凑数不如少给。"
             "构想不吹牛：level 只认 \"ok\"，needs_members 必须是 false；"
             "自以为只是 maybe、或要群友报名 / 参与 / 配合才成立的，这轮干脆别提。"

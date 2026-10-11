@@ -659,12 +659,16 @@ def _goals_view(svc: Any, group_id: str, *, admin: bool) -> dict[str, Any]:
 
 
 def _strip_goal_evidence(item: dict[str, Any]) -> dict[str, Any]:
-    """群友版目标：完成标准里的 evidence（可能含群友原话）去掉，task_id / ts 留着。"""
+    """群友版目标：去掉 evidence（可能含群友原话）和 confirmed_by（管理员账号）。
+
+    task_id / ts / backed / pending 留着（前端要显示「待确认」）。
+    """
     out = dict(item)
     crit = out.get("criteria")
     if isinstance(crit, list):
         out["criteria"] = [
-            {k: v for k, v in c.items() if k != "evidence"} if isinstance(c, dict) else c
+            {k: v for k, v in c.items() if k not in ("evidence", "confirmed_by")}
+            if isinstance(c, dict) else c
             for c in crit
         ]
     return out
@@ -1052,10 +1056,16 @@ def group_view(svc: Any, group_id: str, *, admin: bool) -> dict[str, Any]:
         view["topic_log"] = [
             {k: v for k, v in e.items() if k != "verdict"} for e in topic_log
         ]
-    # `/mw` 指令清单：管理版和群友版都给同一份固定文本，唯一来源是 commands.HELP_ITEMS
-    from ..commands import HELP_ITEMS, help_text
+    # `/mw` 指令清单 + 两条大白话用法：管理版和群友版都给同一份，唯一来源是 commands.HELP_ITEMS / USAGE_TIPS
+    from ..commands import HELP_ITEMS, help_text, usage_tips
 
-    out["commands"] = {"items": [dict(x) for x in HELP_ITEMS], "text": help_text()}
+    # 机器人名字：app.py 启动时预热进 host.bot_name_cache；拿不到给空串（commands 回落 MaiBot）
+    bot = str(getattr(getattr(svc, "host", None), "bot_name_cache", "") or "")
+    out["commands"] = {
+        "items": [dict(x) for x in HELP_ITEMS],
+        "tips": usage_tips(bot),
+        "text": help_text(bot),
+    }
     out.update(view)
     return out
 

@@ -12,6 +12,7 @@ agent 目标（G-n）：群请 MaiWork 盯着或做出来的事，按完成标�
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import nullcontext
 from typing import Any, Callable, Iterable
@@ -29,16 +30,48 @@ _DONE_KEEP_S = 3 * 86400
 GOAL_EVIDENCE_MIN = 8
 GOAL_EVIDENCE_MAX = 200
 
+# R5（2026-10-11）：目标 / 请求的「能不能盯」判断理由一句话，≤80 字。
+GOAL_FIT_REASON_MAX = 80
+_FIT_KINDS = ("online", "human")
+_ALLOWED_FIT_STATES = ("active", "paused")
+
+# R6（2026-10-11）：群聊提示行带时间「- MM-DD HH:MM 谁：正文」，时间前缀要在取正文前去掉
+# （时间里的半角冒号不能被当成「谁：正文」的分隔符）。
+_CHAT_TIME_PREFIX_RE = re.compile(r"^\d{2}-\d{2} \d{2}:\d{2}\s+")
+
 
 def _chat_line_body(line: Any) -> str:
-    """群聊提示行「- 谁：正文」→ 正文（没有冒号就整行）。"""
+    """群聊提示行「- 谁：正文」（R6 起也支持「- MM-DD HH:MM 谁：正文」）→ 正文（没冒号就整行）。"""
     text = str(line or "").strip()
     if text.startswith("-"):
         text = text[1:].strip()
+    text = _CHAT_TIME_PREFIX_RE.sub("", text, count=1)
     for sep in ("：", ":"):
         if sep in text:
             return text.split(sep, 1)[1]
     return text
+
+
+def criterion_backed(c: Any) -> bool:
+    """R1 D5：这条完成标准算不算「有依据」。
+
+    `done` 为真，且 evidence（去空白）/ task_id / confirmed_by 任一非空 → 有依据。
+    非 dict 一律 False（老数据 / 坏 JSON 里可能出现别的形状）。
+    """
+    if not isinstance(c, dict) or not c.get("done"):
+        return False
+    return bool(
+        str(c.get("evidence") or "").strip()
+        or str(c.get("task_id") or "").strip()
+        or str(c.get("confirmed_by") or "").strip()
+    )
+
+
+def criterion_pending(c: Any) -> bool:
+    """R1 D5：`done` 为真却没有依据 = 「待确认」的旧勾（等管理员点算数 / 撤掉）。"""
+    if not isinstance(c, dict) or not c.get("done"):
+        return False
+    return not criterion_backed(c)
 
 
 def chat_evidence_match(evidence: Any, chat_lines: Any, *, min_len: int = GOAL_EVIDENCE_MIN) -> bool:
@@ -274,6 +307,99 @@ class Goals:
                 (state, clock.now(), str(goal_id), previous),
             )
 
+    # ------------------------------------------------------------------
+    # R5 / R1（2026-10-11）：目标能不能盯（fit）+ 待确认的旧勾「算数 / 撤掉」
+    # ------------------------------------------------------------------
+
+    def set_fit(self, goal_id: str, kind: str, reason: str) -> None:
+        """R5 末条：目标本身的补判结果（online / human + 一句理由），只给网页显示。
+
+        kind 只认 online / human；reason 折叠空白截 80 字。事件 `goal.fit`。
+        """
+        k = str(kind or "")
+        if k not in _FIT_KINDS:
+            raise ValueError(f"不认识的贴合判断「{kind}」（只认 online / human）")
+        r = " ".join(str(reason or "").split())[:GOAL_FIT_REASON_MAX]
+        with self._store.tx() as conn:
+            row = conn.execute(
+                "SELECT group_id FROM goals WHERE id=?", (str(goal_id),)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"目标不存在: {goal_id}")
+            conn.execute(
+                "UPDATE goals SET fit=?, fit_reason=?, updated=? WHERE id=?",
+                (k, r, clock.now(), str(goal_id)),
+            )
+            self._store.event(
+                conn, "goal.fit", group_id=str(row["group_id"]), entity="goal",
+                entity_id=str(goal_id), payload={"kind": k, "reason": r},
+            )
+
+    def _pending_criterion(
+        self, conn: sqlite3.Connection, goal_id: str, index: int
+    ) -> tuple[list[dict], dict, str]:
+        """读出待确认的那一条（校验：目标在、下标在、状态活着、这条是待确认）。"""
+        row = conn.execute(
+            "SELECT group_id, state, criteria FROM goals WHERE id=?", (str(goal_id),)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"目标不存在: {goal_id}")
+        try:
+            crit = json.loads(row["criteria"] or "[]")
+        except (TypeError, ValueError):
+            crit = []
+        if not isinstance(crit, list):
+            crit = []
+        if index < 0 or index >= len(crit):
+            raise IndexError(f"目标 {goal_id} 没有第 {index} 条完成标准")
+        state = str(row["state"])
+        if state not in _ALLOWED_FIT_STATES:
+            raise ValueError(f"目标 {goal_id} 现在是「{state}」，不能改完成标准")
+        item = crit[index]
+        if not criterion_pending(item):
+            raise ValueError(f"目标 {goal_id} 第 {index} 条不是「待确认」，不能改")
+        return crit, item, str(row["group_id"])
+
+    def confirm_criterion(self, goal_id: str, index: int, by: str) -> None:
+        """管理员对「无依据的旧勾」点「算数」：写 confirmed_by / confirmed_ts。"""
+        with self._store.tx() as conn:
+            crit, item, group_id = self._pending_criterion(conn, goal_id, index)
+            who = str(by or "")
+            new = dict(item)
+            new["done"] = True
+            new["confirmed_by"] = who
+            new["confirmed_ts"] = clock.now()
+            crit[index] = new
+            conn.execute(
+                "UPDATE goals SET criteria=?, updated=? WHERE id=?",
+                (json.dumps(crit, ensure_ascii=False), clock.now(), str(goal_id)),
+            )
+            self._store.event(
+                conn, "goal.criterion_confirmed", group_id=group_id, entity="goal",
+                entity_id=str(goal_id),
+                payload={"index": int(index), "text": str(new.get("text") or ""), "by": who},
+            )
+
+    def revoke_criterion(self, goal_id: str, index: int, by: str) -> None:
+        """管理员对「无依据的旧勾」点「撤掉」：done 归 False，去掉 confirmed_*。"""
+        with self._store.tx() as conn:
+            crit, item, group_id = self._pending_criterion(conn, goal_id, index)
+            who = str(by or "")
+            new = dict(item)
+            new["done"] = False
+            new.pop("confirmed_by", None)
+            new.pop("confirmed_ts", None)
+            crit[index] = new
+            conn.execute(
+                "UPDATE goals SET criteria=?, updated=? WHERE id=?",
+                (json.dumps(crit, ensure_ascii=False), clock.now(), str(goal_id)),
+            )
+            self._store.event(
+                conn, "goal.criterion_revoked", group_id=group_id, entity="goal",
+                entity_id=str(goal_id),
+                payload={"index": int(index), "text": str(new.get("text") or ""), "by": who},
+            )
+
     def pause(self, goal_id: str) -> None:
         self._set_state(goal_id, "paused")
 
@@ -463,11 +589,32 @@ class Goals:
             out = []
         return out if isinstance(out, list) else []
 
+    def _criteria_view(self, g: dict) -> list[dict]:
+        """网页 / 提示词用的完成标准：每条现算 backed（有依据）/ pending（待确认），不写库。"""
+        out: list[dict] = []
+        for c in self._criteria(g):
+            if not isinstance(c, dict):
+                out.append(c)
+                continue
+            item = dict(c)
+            item["backed"] = criterion_backed(c)
+            item["pending"] = criterion_pending(c)
+            out.append(item)
+        return out
+
     def _who_name(self, g: dict) -> str:
         """成员目标的显示名：按 who_id 查名册当前名；查不到回落 who_name 快照。"""
         return members.name_of(
             self._store, g.get("group_id"), g.get("who_id"), fallback=g.get("who_name")
         )
+
+    @staticmethod
+    def _fit_fields(g: dict) -> dict:
+        """R5 补判结果；老库没有这两列时兜底空串。"""
+        return {
+            "fit": str(g.get("fit") or ""),
+            "fit_reason": str(g.get("fit_reason") or ""),
+        }
 
     def _agent_dict(self, g: dict) -> dict:
         return {
@@ -484,7 +631,9 @@ class Goals:
             "last_text": str(g["last_text"] or ""),
             "task_id": (str(g["task_id"]) if g["task_id"] else None),
             "request_id": (str(g["request_id"]) if g["request_id"] else None),
+            **self._fit_fields(g),
         }
+
 
     def _member_dict(self, g: dict) -> dict:
         return {
@@ -513,7 +662,8 @@ class Goals:
             "icon": str(g["icon"] or "bullseye"),
             "title": str(g["title"]),
             "body": str(g["body"] or ""),
-            "criteria": self._criteria(g),
+            # R1：每条现算 backed（有依据）/ pending（待确认的旧勾）
+            "criteria": self._criteria_view(g),
             "state": str(g["state"]),
             "next_check_ts": g["next_check_ts"],
             "by": str(g["by_text"] or ""),
@@ -523,7 +673,10 @@ class Goals:
             "stale": stale_is_blocking(reason),
             "stale_reason": reason,
             "heartbeat_ts": (float(g["heartbeat_ts"]) if g["heartbeat_ts"] is not None else None),
+            # R5：目标本身的补判结果（只给网页显示）
+            **self._fit_fields(g),
         }
+
 
     def _member_view(self, g: dict) -> dict:
         return {
