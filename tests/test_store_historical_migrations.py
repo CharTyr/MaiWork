@@ -79,7 +79,7 @@ CREATE INDEX IF NOT EXISTS idx_chat_feeds_key ON chat_feeds(group_id, key);
 
 STEP_PROFILE = 2      # _m_profile
 STEP_CHAT_FEEDS = 31  # _m_chat_feeds
-LATEST = len(_MIGRATIONS)  # 37（34 = 历史步骤 + 35 task_lanes + 36 brief + 37 lane 原始历史）
+LATEST = len(_MIGRATIONS)  # 38（34 = 历史步骤 + 35 task_lanes + 36 brief + 37 lane 原始历史 + 38 构想 kind）
 
 _DEAD_MODULE = "CharTyr_MaiWork.maiwork.chat_feed"
 
@@ -222,13 +222,15 @@ class TestStep31ChatFeedsHistory:
 # ----------------------------------------------------------------------
 
 class TestFullMigrate:
-    def test_latest_version_is_37(self) -> None:
+    def test_latest_version_is_38(self) -> None:
         # 34 = 历史步骤恢复原样后的库号；35 = 任务双岗协作的 task_lanes（docs/20）；
-        # 36 = 资讯卡片短摘要 brief（news_items.brief）；37 = lane 原始历史归档（docs/27）
-        assert LATEST == 37, "库号只因 task_lanes / brief / lane 原始历史各加一步"
+        # 36 = 资讯卡片短摘要 brief（news_items.brief）；37 = lane 原始历史归档（docs/27）；
+        # 38 = 构想 kind（docs/18 §十）
+        assert LATEST == 38, "库号只因 task_lanes / brief / lane 原始历史 / 构想 kind 各加一步"
         assert store_mod._MIGRATIONS[34].__name__ == "_m_task_lanes"
         assert store_mod._MIGRATIONS[35].__name__ == "_m_news_brief"
         assert store_mod._MIGRATIONS[36].__name__ == "_m_task_lane_raw"
+        assert store_mod._MIGRATIONS[37].__name__ == "_m_idea_kind"
 
     def test_fresh_db_has_no_history_tables_at_34(self, store: Store) -> None:
         """新库一路迁到最新：两张历史表建了又被后面的 DROP 拆掉，终态干净。"""

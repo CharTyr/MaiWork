@@ -609,12 +609,32 @@ _FEAS_OK = {
     "uses": ["search", "write"], "deliver": "doc", "needs_members": False,
 }
 
+_IDEA_EVIDENCE = "这手柄放半年了，还能救活吗"
+_IDEA_BASIS = {
+    "pain": "手柄坏了就扔，没人知道还能不能修",
+    "value": "修好能省下买新的钱",
+    "interest": "群里一直在折腾手柄和板子",
+}
+
+
+def _make_idea_feeds(tmp_path, **kw):
+    """_make_feeds + 种几条本群真发言：make_idea 的 evidence 要和这里对得上（docs/18 §十）。"""
+    from fakes import seed_idea_chat
+
+    store, settings, feeds, models, workers, topics, profiles = _make_feeds(tmp_path, **kw)
+    # 这些用例不 patch clock：群聊时间戳按真实「现在」种，才落在构想的 72 小时窗口里
+    seed_idea_chat(store, GID, now=clock.now())
+    return store, settings, feeds, models, workers, topics, profiles
+
+
 _IDEA_JSON = json.dumps(
     {
         "idea": {
+            "kind": "help",
             "title": "我可以帮群把每周讨论整理成一页",
             "body": "每周自动汇总",
-            "basis": "群里每周都在复盘",
+            "evidence": _IDEA_EVIDENCE,
+            "basis": dict(_IDEA_BASIS),
             "icon": "books",
             "chat_worthy": True,
             "feasibility": _FEAS_OK,
@@ -630,7 +650,7 @@ _IDEA_JSON = json.dumps(
 
 def test_make_idea_happy_path(tmp_path) -> None:
     models = FakeModelsQueue(ready=True, replies=[_IDEA_JSON])
-    store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path, models=models)
+    store, settings, feeds, models, workers, topics, _ = _make_idea_feeds(tmp_path, models=models)
     got = _run(feeds.make_idea(GID))
     assert isinstance(got, int) and got > 0
     row = store.read().execute("SELECT * FROM ideas WHERE id=?", (got,)).fetchone()
@@ -656,7 +676,7 @@ def test_make_idea_happy_path(tmp_path) -> None:
 def test_make_idea_prompt_asks_items_and_drops_step_effort(tmp_path) -> None:
     """提示词要「包含的项目」和克制要求；不再要第一步 / 要多久。"""
     models = FakeModelsQueue(ready=True, replies=[_IDEA_JSON])
-    store, settings, feeds, models, *_ = _make_feeds(tmp_path, models=models)
+    store, settings, feeds, models, *_ = _make_idea_feeds(tmp_path, models=models)
     _run(feeds.make_idea(GID))
     prompt = models.calls[0][1][-1]["content"]
     assert "items" in prompt
@@ -667,7 +687,8 @@ def test_make_idea_prompt_asks_items_and_drops_step_effort(tmp_path) -> None:
 
 def test_make_idea_items_capped_at_5_and_bad_ones_dropped(tmp_path) -> None:
     many = json.dumps(
-        {"idea": {"title": "我可以做一堆小事", "body": "b", "basis": "x", "icon": "tools",
+        {"idea": {"kind": "help", "title": "我可以做一堆小事", "body": "b",
+                  "evidence": _IDEA_EVIDENCE, "basis": dict(_IDEA_BASIS), "icon": "tools",
                   "chat_worthy": False, "feasibility": _FEAS_OK,
                   "items": [
                       {"kind": "task", "title": f"事 {i}"} for i in range(1, 9)
@@ -675,7 +696,7 @@ def test_make_idea_items_capped_at_5_and_bad_ones_dropped(tmp_path) -> None:
         ensure_ascii=False,
     )
     models = FakeModelsQueue(ready=True, replies=[many])
-    store, settings, feeds, *_ = _make_feeds(tmp_path, models=models)
+    store, settings, feeds, *_ = _make_idea_feeds(tmp_path, models=models)
     got = _run(feeds.make_idea(GID))
     row = store.read().execute("SELECT items FROM ideas WHERE id=?", (got,)).fetchone()
     items = json.loads(row["items"])
@@ -685,20 +706,20 @@ def test_make_idea_items_capped_at_5_and_bad_ones_dropped(tmp_path) -> None:
     assert items[0]["kind"] == "task"
 
 
-def test_make_idea_no_items_writes_empty_list(tmp_path) -> None:
-    """模型没给 items（老格式）→ 存 '[]'，读取按没有项目走老逻辑。"""
+def test_make_idea_talk_idea_has_no_items(tmp_path) -> None:
+    """kind=talk（话题）不用 MaiWork 动手 → items 存 '[]'，feasibility 存空。"""
     plain = json.dumps(
-        {"idea": {"title": "我可以整理一份清单", "body": "b", "basis": "x",
-                  "step": "列条目", "effort": "一小时", "icon": "books", "chat_worthy": False,
-                  "feasibility": _FEAS_OK}},
+        {"idea": {"kind": "talk", "title": "聊聊手柄怎么救", "body": "b",
+                  "evidence": _IDEA_EVIDENCE, "basis": dict(_IDEA_BASIS),
+                  "icon": "books", "chat_worthy": False}},
         ensure_ascii=False,
     )
     models = FakeModelsQueue(ready=True, replies=[plain])
-    store, settings, feeds, *_ = _make_feeds(tmp_path, models=models)
+    store, settings, feeds, *_ = _make_idea_feeds(tmp_path, models=models)
     got = _run(feeds.make_idea(GID))
-    row = store.read().execute("SELECT items, step FROM ideas WHERE id=?", (got,)).fetchone()
-    assert row["items"] == "[]"
-    assert row["step"] == ""  # 新构想不再生成第一步
+    row = store.read().execute("SELECT items, step, feasibility FROM ideas WHERE id=?", (got,)).fetchone()
+    assert row["items"] == "[]" and row["feasibility"] == ""
+    assert row["step"] == ""
     assert feeds.ideas_view(GID)[0]["items"] == []
 
 
@@ -712,13 +733,14 @@ def test_make_idea_null_returns_none(tmp_path) -> None:
 
 def test_make_idea_not_chat_worthy_not_added_to_pool(tmp_path) -> None:
     idea = json.dumps(
-        {"idea": {"title": "我可以做运维巡检", "body": "b", "basis": "有服务器",
-                  "step": "s", "effort": "半天", "icon": "tools", "chat_worthy": False,
-                  "feasibility": _FEAS_OK}},
+        {"idea": {"kind": "help", "title": "我可以做运维巡检", "body": "b",
+                  "evidence": _IDEA_EVIDENCE, "basis": dict(_IDEA_BASIS),
+                  "icon": "tools", "chat_worthy": False, "feasibility": _FEAS_OK,
+                  "items": [{"kind": "task", "title": "巡检一遍", "desc": ""}]}},
         ensure_ascii=False,
     )
     models = FakeModelsQueue(ready=True, replies=[idea])
-    store, settings, feeds, m, w, topics, _ = _make_feeds(tmp_path, models=models)
+    store, settings, feeds, m, w, topics, _ = _make_idea_feeds(tmp_path, models=models)
     got = _run(feeds.make_idea(GID))
     assert isinstance(got, int)
     assert topics.calls == []
@@ -750,12 +772,14 @@ def test_make_idea_dedup_recent_30_days(tmp_path) -> None:
     old_title = "我可以帮群把每周讨论整理成一页纸"
     new_title = "我可以帮群把每周讨论整理成一页"  # difflib 相似度 > 0.75
     models = FakeModelsQueue(ready=True, replies=[
-        json.dumps({"idea": {"title": new_title, "body": "b", "basis": "x",
-                             "step": "s", "effort": "e", "icon": "books", "chat_worthy": True,
-                             "feasibility": _FEAS_OK}},
+        json.dumps({"idea": {"kind": "help", "title": new_title, "body": "b",
+                             "evidence": _IDEA_EVIDENCE, "basis": dict(_IDEA_BASIS),
+                             "icon": "books", "chat_worthy": True,
+                             "feasibility": _FEAS_OK,
+                             "items": [{"kind": "task", "title": "出一页", "desc": ""}]}},
                    ensure_ascii=False)
     ])
-    store, settings, feeds, m, w, topics, _ = _make_feeds(tmp_path, models=models)
+    store, settings, feeds, m, w, topics, _ = _make_idea_feeds(tmp_path, models=models)
     _seed_idea(store, GID, title=old_title, created=NOW - 10 * 86400)
     assert _run(feeds.make_idea(GID)) is None
     assert topics.calls == []
@@ -765,12 +789,14 @@ def test_make_idea_no_dedup_beyond_30_days(tmp_path) -> None:
     old_title = "我可以帮群把每周讨论整理成一页纸"
     new_title = "我可以帮群把每周讨论整理成一页"
     models = FakeModelsQueue(ready=True, replies=[
-        json.dumps({"idea": {"title": new_title, "body": "b", "basis": "x",
-                             "step": "s", "effort": "e", "icon": "books", "chat_worthy": True,
-                             "feasibility": _FEAS_OK}},
+        json.dumps({"idea": {"kind": "help", "title": new_title, "body": "b",
+                             "evidence": _IDEA_EVIDENCE, "basis": dict(_IDEA_BASIS),
+                             "icon": "books", "chat_worthy": True,
+                             "feasibility": _FEAS_OK,
+                             "items": [{"kind": "task", "title": "出一页", "desc": ""}]}},
                    ensure_ascii=False)
     ])
-    store, settings, feeds, m, w, topics, _ = _make_feeds(tmp_path, models=models)
+    store, settings, feeds, m, w, topics, _ = _make_idea_feeds(tmp_path, models=models)
     _seed_idea(store, GID, title=old_title, created=NOW - 40 * 86400)
     got = _run(feeds.make_idea(GID))
     assert isinstance(got, int)  # 超过 30 天不算重复
@@ -1057,7 +1083,7 @@ def test_ideas_view_structure_and_rules(tmp_path) -> None:
     it = view[0]
     # 「有人味」新增 feasibility / keywords
     assert set(it.keys()) == {
-        "id", "icon", "title", "body", "basis", "step", "effort",
+        "id", "icon", "kind", "title", "body", "basis", "step", "effort",
         "state", "requested_by", "task_id", "created_ts", "feedback",
         "feasibility", "keywords", "target_user_id", "items",
     }
@@ -1145,15 +1171,17 @@ def _run(coro):
 _IDEA_WITH_ORIGIN = json.dumps(
     {
         "idea": {
+            "kind": "help",
             "title": "我可以帮群把百层挑战的战报汇总成一页",
             "body": "每周自动汇总一次战报",
-            "basis": "群里最近一直在打这个挑战",
+            "evidence": _IDEA_EVIDENCE,
+            "basis": dict(_IDEA_BASIS),
             "origin": "涂击队百层挑战",
             "icon": "books",
             "chat_worthy": False,
             "feasibility": _FEAS_OK,
             "keywords": ["战报"],
-            "items": [],
+            "items": [{"kind": "task", "title": "汇总一页", "desc": ""}],
         }
     },
     ensure_ascii=False,
@@ -1163,7 +1191,7 @@ _IDEA_WITH_ORIGIN = json.dumps(
 def test_make_idea_prompt_asks_origin(tmp_path) -> None:
     """出构想的 JSON 格式要带 origin（由头）：短名词短语、≤16 字、想不出给空串。"""
     models = FakeModelsQueue(ready=True, replies=[_IDEA_JSON])
-    store, settings, feeds, models, *_ = _make_feeds(tmp_path, models=models)
+    store, settings, feeds, models, *_ = _make_idea_feeds(tmp_path, models=models)
     _run(feeds.make_idea(GID))
     prompt = models.calls[0][1][-1]["content"]
     assert '"origin"' in prompt
@@ -1173,7 +1201,7 @@ def test_make_idea_prompt_asks_origin(tmp_path) -> None:
 
 def test_make_idea_stores_origin(tmp_path) -> None:
     models = FakeModelsQueue(ready=True, replies=[_IDEA_WITH_ORIGIN])
-    store, settings, feeds, *_ = _make_feeds(tmp_path, models=models)
+    store, settings, feeds, *_ = _make_idea_feeds(tmp_path, models=models)
     got = _run(feeds.make_idea(GID))
     row = store.read().execute("SELECT origin FROM ideas WHERE id=?", (got,)).fetchone()
     assert row["origin"] == "涂击队百层挑战"
@@ -1193,7 +1221,7 @@ def test_idea_material_section_carries_origin(tmp_path) -> None:
 def test_make_idea_origin_privacy_blanked_not_dropped(tmp_path) -> None:
     """origin 含关注成员信息 → 只把 origin 置空，整条构想照样入库（不整条丢）。"""
     models = FakeModelsQueue(ready=True, replies=[_IDEA_WITH_ORIGIN])
-    store, settings, feeds, *_ = _make_feeds(tmp_path, models=models)
+    store, settings, feeds, *_ = _make_idea_feeds(tmp_path, models=models)
     with store.tx() as conn:
         conn.execute(
             "INSERT INTO focus_members (group_id, user_id, name, note, removed, updated)"
@@ -1203,7 +1231,7 @@ def test_make_idea_origin_privacy_blanked_not_dropped(tmp_path) -> None:
     idea = json.loads(_IDEA_WITH_ORIGIN)
     idea["idea"]["origin"] = "他最近在准备考研"
     idea["idea"]["body"] = "整一页资料"
-    idea["idea"]["basis"] = "群里问的人多"
+    idea["idea"]["basis"] = dict(_IDEA_BASIS)
     models.reply_queue = [json.dumps(idea, ensure_ascii=False)]
     got = _run(feeds.make_idea(GID))
     assert isinstance(got, int) and got > 0
@@ -1218,7 +1246,7 @@ def test_make_idea_origin_cleaned(tmp_path) -> None:
     idea = json.loads(_IDEA_WITH_ORIGIN)
     idea["idea"]["origin"] = long_origin
     models = FakeModelsQueue(ready=True, replies=[json.dumps(idea, ensure_ascii=False)])
-    store, settings, feeds, *_ = _make_feeds(tmp_path, models=models)
+    store, settings, feeds, *_ = _make_idea_feeds(tmp_path, models=models)
     got = _run(feeds.make_idea(GID))
     row = store.read().execute("SELECT origin FROM ideas WHERE id=?", (got,)).fetchone()
     assert row["origin"] == long_origin[:16]
@@ -1226,7 +1254,7 @@ def test_make_idea_origin_cleaned(tmp_path) -> None:
     idea2 = json.loads(_IDEA_WITH_ORIGIN)
     idea2["idea"]["origin"] = "QQ123456789 的手册"
     models2 = FakeModelsQueue(ready=True, replies=[json.dumps(idea2, ensure_ascii=False)])
-    store2, settings2, feeds2, *_ = _make_feeds(tmp_path / "b", models=models2)
+    store2, settings2, feeds2, *_ = _make_idea_feeds(tmp_path / "b", models=models2)
     got2 = _run(feeds2.make_idea(GID))
     row2 = store2.read().execute("SELECT origin FROM ideas WHERE id=?", (got2,)).fetchone()
     assert row2["origin"] == ""

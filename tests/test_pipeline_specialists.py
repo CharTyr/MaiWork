@@ -291,6 +291,21 @@ def _mk_feeds(store, models=None, workers=None, settings=None, specialists=None,
     return feeds
 
 
+_IDEA_CHAT = "这手柄放半年了，还能救活吗"
+
+
+def _seed_idea_chat(store) -> None:
+    """make_idea 的 evidence 要照抄的群原话（docs/18 §十：没有真话可引就不出构想）。"""
+    ts = clock.now()
+    for i, text in enumerate([_IDEA_CHAT, "有什么办法能看清这块板子怎么接线"]):
+        with store.tx() as conn:
+            conn.execute(
+                "INSERT INTO chat_log (text, group_id, message_id, ts, user_id, user_name)"
+                " VALUES (?, ?, ?, ?, '10001', '群友')",
+                (text, G1, f"idea-chat-{i}", ts),
+            )
+
+
 def _mk_coordinator(store, models, workers, tasks, goals, settings, specialists=None):
     from CharTyr_MaiWork.maiwork.coordinator import Coordinator
 
@@ -497,18 +512,24 @@ class TestIdeaTwoLevel:
         # 主模型两个调用：构想 JSON
         idea_payload = {
             "idea": {
-                "title": "我可以每周整理群文件分类口诀",
-                "body": "一页「文件在哪找」速查图", "basis": "画像需求",
+                "kind": "help",
+                "title": "每周整理群文件分类口诀",
+                "body": "一页「文件在哪找」速查图",
+                "evidence": _IDEA_CHAT,
+                "basis": {"pain": "新进群的人老问文件在哪", "value": "少问一遍、少翻一次",
+                          "interest": "群里常聊群文件怎么理"},
                 "icon": "bulb", "chat_worthy": False,
                 "feasibility": {"level": "ok", "note": "能做",
                                 "uses": ["search", "write"], "deliver": "doc",
                                 "needs_members": False},
-                "keywords": ["群文件", "速查"], "items": [],
+                "keywords": ["群文件", "速查"],
+                "items": [{"kind": "task", "title": "理一页口诀", "desc": ""}],
             }
         }
         models = _ModelsOK({"feeds.idea": json.dumps(idea_payload, ensure_ascii=False)})
         settings = _Settings()
         feeds = _mk_feeds(store, models=models, settings=settings, specialists=sp)
+        _seed_idea_chat(store)
         with store.tx() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO groups (group_id, session_id, workspace, token, profile_ready_ts, created)"
@@ -545,15 +566,21 @@ class TestIdeaTwoLevel:
         agents = FakeAgents(enabled_kinds={"idea": False})
         sp = FakeSpecialists(agents)
         idea_payload = {"idea": {
-            "title": "我可以每天问一句今天谁学到了东西",
-            "body": "每天固定一句话冷场开场白", "basis": "画像需求",
+            "kind": "help",
+            "title": "每天问一句今天谁学到了东西",
+            "body": "每天固定一句话冷场开场白",
+            "evidence": _IDEA_CHAT,
+            "basis": {"pain": "群里常常冷场", "value": "给大家一个开口的话头",
+                      "interest": "画像里有「想多学点东西」"},
             "icon": "bulb", "chat_worthy": False,
             "feasibility": {"level": "ok", "note": "能做",
                             "uses": ["search", "write"], "deliver": "doc",
-                            "needs_members": False}, "keywords": [], "items": [],
+                            "needs_members": False}, "keywords": [],
+            "items": [{"kind": "task", "title": "写一句话头", "desc": ""}],
         }}
         models = _ModelsOK({"feeds.idea": json.dumps(idea_payload, ensure_ascii=False)})
         feeds = _mk_feeds(store, models=models, specialists=sp)
+        _seed_idea_chat(store)
         with store.tx() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO groups (group_id, session_id, workspace, token, profile_ready_ts, created)"
@@ -575,15 +602,21 @@ class TestIdeaTwoLevel:
             WorkerReport(ok=False, summary="", error="模型调用失败"),
         ])
         idea_payload = {"idea": {
-            "title": "我可以把上周讨论过的方案整理成对比表",
-            "body": "对比后好选", "basis": "画像需求",
+            "kind": "help",
+            "title": "把上周讨论过的方案整成对比表",
+            "body": "对比后好选",
+            "evidence": _IDEA_CHAT,
+            "basis": {"pain": "几个方案聊过就散了，挑不定", "value": "拿着表就能拍板",
+                      "interest": "群里一直在折腾手柄和板子"},
             "icon": "bulb", "chat_worthy": False,
             "feasibility": {"level": "ok", "note": "",
                             "uses": ["search", "write"], "deliver": "doc",
-                            "needs_members": False}, "keywords": [], "items": [],
+                            "needs_members": False}, "keywords": [],
+            "items": [{"kind": "task", "title": "列个对比表", "desc": ""}],
         }}
         models = _ModelsOK({"feeds.idea": json.dumps(idea_payload, ensure_ascii=False)})
         feeds = _mk_feeds(store, models=models, specialists=sp)
+        _seed_idea_chat(store)
         with store.tx() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO groups (group_id, session_id, workspace, token, profile_ready_ts, created)"
@@ -606,6 +639,7 @@ class TestIdeaTwoLevel:
         idea_payload = {"idea": None}
         models = _ModelsOK({"feeds.idea": json.dumps(idea_payload, ensure_ascii=False)})
         feeds = _mk_feeds(store, models=models, specialists=sp)
+        _seed_idea_chat(store)
         with store.tx() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO groups (group_id, session_id, workspace, token, profile_ready_ts, created)"

@@ -1920,6 +1920,8 @@ class MaiWorkApp:
             on_answer=self._resume_from_answer,
             waiting_tasks=self._waiting_answer_map,
             models=self.models,
+            # 话头火花（docs/18 §十一）：记进 feeds 的内存（每条群消息都可能来一下，零库写）
+            on_spark=(self.feeds.note_spark if self.feeds is not None else None),
         )
         # 派活判断兜底（quick_judge）：intake 自己建的；停机时要单独收（见 _stop_stack）
         self.quick_judge = getattr(intake, "quick_judge", None)
@@ -2984,6 +2986,38 @@ class MaiWorkApp:
                 if not self._idea_has_room(gid, now):
                     continue  # 暂时受阻：不开长活、不记当天做过，节流后重查
                 self._spawn_long_job(gid, "idea", self.feeds.make_idea)
+        # 话头火花（docs/18 §十一）：群里刚有人明显在为难 / 想要，不等排程点也顺口出一次。
+        # 到点排程之外的一条路，条件都过了才认领（清火花 + 记「今天出过」）。
+        if self.feeds is not None and self._spark_idea_due(gid, now):
+            take = getattr(self.feeds, "spark_taken", None)
+            if callable(take):
+                try:
+                    take(gid, now)
+                except Exception:
+                    logger.exception("记火花认领出错（群 %s），这次先不触发", gid)
+                else:
+                    self._spawn_long_job(gid, "idea", self.feeds.make_idea)
+
+    def _spark_idea_due(self, gid: str, now: float) -> bool:
+        """群里蹦出话头时该不该马上出一轮构想（docs/18 §十一）。
+
+        先看有没有在跑的 idea 长活（同群同一种只跑一个），再问 feeds.spark_ready
+        （2 小时窗口 / 今天没火花过 / 离上一条群面构想 ≥6 小时 / 画像已成形），
+        最后才过堆积闸——没位子就留着火花，别记「今天做过」，腾出位子还能来。
+        feeds 没有这口（老版本 / 测试替身）→ 不触发。
+        """
+        if (str(gid), "idea") in self._running_jobs or (str(gid), "idea_manual") in self._running_jobs:
+            return False  # 到点的或管理员手动点的那一轮还在跑，火花不再叠一轮
+        ready = getattr(self.feeds, "spark_ready", None)
+        if not callable(ready):
+            return False
+        try:
+            if not ready(gid, now):
+                return False
+        except Exception:
+            logger.exception("查话头火花出错（群 %s），这次不触发", gid)
+            return False
+        return self._idea_has_room(gid, now)
 
     def _idea_has_room(self, gid: str, now: float) -> bool:
         """构想到点时先看本群还有没有位子（堆积闸）。

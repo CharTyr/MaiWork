@@ -485,8 +485,14 @@ class TestPersonalPrepare:
         models = FakeModelsQueue(ready=True, replies=[
             json.dumps({
                 "focus": [{"query": "FPGA", "why": "在做"}],
-                "idea": {"title": "我可以帮你把这块板的上手例程跑一遍",
-                         "body": "我可以帮你把这板子的例程整理成一页", "step": "先列出要跑的例程",
+                "idea": {"kind": "help",
+                         "title": "把这块板的上手例程跑一遍",
+                         "body": "我可以帮你把这板子的例程整理成一页",
+                         "origin": "FPGA 小板子",
+                         "basis": {"pain": "例程散着找不到", "value": "少走弯路",
+                                   "interest": "他在做板子"},
+                         "step": "先列出要跑的例程",
+                         "items": [{"kind": "task", "title": "理一下例程", "desc": ""}],
                          "effort": "半天", "feasibility": _FEAS_OK},
             }, ensure_ascii=False),
             _personal_scores_json(),
@@ -501,7 +507,7 @@ class TestPersonalPrepare:
             "SELECT * FROM ideas WHERE target_user_id=?", (UID,)
         ).fetchall()
         assert len(rows) == 1
-        assert "帮你" in rows[0]["title"] or "帮你" in rows[0]["body"]
+        assert rows[0]["origin"] == "FPGA 小板子"
         assert all(c.get("kind") != "idea" for c in topics.calls)
 
     def test_idea_origin_stored(self, tmp_path) -> None:
@@ -509,9 +515,13 @@ class TestPersonalPrepare:
         models = FakeModelsQueue(ready=True, replies=[
             json.dumps({
                 "focus": [{"query": "FPGA", "why": "在做"}],
-                "idea": {"title": "我可以帮你把这块板的例程理一下",
+                "idea": {"kind": "help",
+                         "title": "把这块板的例程理一下",
                          "body": "我可以帮你把例程整理成一页",
                          "origin": "FPGA 小板子", "feasibility": _FEAS_OK,
+                         "basis": {"pain": "例程散着找不到", "value": "少走弯路",
+                                   "interest": "他在做板子"},
+                         "items": [{"kind": "task", "title": "理一下例程", "desc": ""}],
                          "step": "先列出要跑的例程", "effort": "半天"},
             }, ensure_ascii=False),
             _personal_scores_json(),
@@ -537,9 +547,13 @@ class TestPersonalPrepare:
         models = FakeModelsQueue(ready=True, replies=[
             json.dumps({
                 "focus": [{"query": "FPGA", "why": "在做"}],
-                "idea": {"title": "我可以帮他把例程理一下",
+                "idea": {"kind": "help",
+                         "title": "帮他理顺例程",
                          "body": "我可以帮你把例程整理成一页",
                          "origin": "我在折腾 FPGA 呢", "feasibility": _FEAS_OK,
+                         "basis": {"pain": "例程散着找不到", "value": "少走弯路",
+                                   "interest": "他在做板子"},
+                         "items": [{"kind": "task", "title": "理一下例程", "desc": ""}],
                          "step": "", "effort": ""},
             }, ensure_ascii=False),
             _personal_scores_json(),

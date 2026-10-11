@@ -668,14 +668,20 @@ class TestDiverse:
 
 
 class TestIdeaFeasibility:
+    _IDEA_EVIDENCE = "新出的 FPGA 板子要不要上"
+    _IDEA_BASIS = {"pain": "板子挑不定，没人说得清差别",
+                   "value": "挑板子时少走弯路", "interest": "群里一直在聊板子选型"}
     _IDEA_JSON = json.dumps(
-        {"idea": {"title": "我可以帮大家把板子列表整理成对比表",
+        {"idea": {"kind": "help",
+                  "title": "把最近聊的板子整成对比表",
                   "body": "把最近聊到的几块 FPGA 板子收集起来，做个对比表",
-                  "basis": "群里一直在聊板子选型", "step": "先列出三块板子",
-                  "effort": "大概一晚上", "icon": "chart", "chat_worthy": True,
+                  "evidence": _IDEA_EVIDENCE,
+                  "basis": dict(_IDEA_BASIS),
+                  "icon": "chart", "chat_worthy": True,
                   "feasibility": {"level": "ok", "note": "能做：靠联网搜公开参数就行",
                                   "uses": ["search", "write"], "deliver": "doc",
                                   "needs_members": False},
+                  "items": [{"kind": "task", "title": "收集板子参数", "desc": ""}],
                   "keywords": ["FPGA", "对比表", "选型"]}},
         ensure_ascii=False,
     )
@@ -683,6 +689,7 @@ class TestIdeaFeasibility:
     def test_idea_stores_feasibility_and_keywords(self, tmp_path) -> None:
         models = FakeModelsQueue(ready=True, replies=[self._IDEA_JSON])
         store, settings, feeds, models, *_r = _make_feeds(tmp_path, models=models)
+        _seed_chat(store)
         with _TimePatch():
             idea_id = _run(feeds.make_idea(GID))
         assert idea_id
@@ -702,34 +709,38 @@ class TestIdeaFeasibility:
         """模型没给 feasibility：缺字段一律不过（docs/18 §八 1.A 严格）——不入库，
         只在 kv ideas.blocked.<群号> 记一条。"""
         plain = json.dumps(
-            {"idea": {"title": "我可以整理一个 NAS 清单", "body": "整理清单",
-                      "basis": "群里在折腾 NAS", "step": "列条目", "effort": "一小时",
-                      "icon": "chart", "chat_worthy": False}},
+            {"idea": {"kind": "help", "title": "整理一个 NAS 清单", "body": "整理清单",
+                      "evidence": self._IDEA_EVIDENCE, "basis": dict(self._IDEA_BASIS),
+                      "icon": "chart", "chat_worthy": False,
+                      "items": [{"kind": "task", "title": "列条目", "desc": ""}]}},
             ensure_ascii=False,
         )
         models = FakeModelsQueue(ready=True, replies=[plain])
         store, settings, feeds, models, *_r = _make_feeds(tmp_path, models=models)
+        _seed_chat(store)
         with _TimePatch():
             assert _run(feeds.make_idea(GID)) is None
         assert store.read().execute("SELECT COUNT(*) c FROM ideas").fetchone()["c"] == 0
         blocked = store.kv_get(f"ideas.blocked.{GID}", [])
         assert len(blocked) == 1
         assert blocked[0]["kind"] == "group"
-        assert blocked[0]["title"] == "我可以整理一个 NAS 清单"
+        assert blocked[0]["title"] == "整理一个 NAS 清单"
         assert blocked[0]["reason"]
 
     def test_idea_bad_feasibility_level_rejected(self, tmp_path) -> None:
         """level 不合法（impossible）＝不是 ok → 拦下，不入库。"""
         bad = json.dumps(
-            {"idea": {"title": "我可以写一个群机器人", "body": "写个 bot",
-                      "basis": "群里想要", "step": "起项目", "effort": "一周",
+            {"idea": {"kind": "help", "title": "写一个群机器人", "body": "写个 bot",
+                      "evidence": self._IDEA_EVIDENCE, "basis": dict(self._IDEA_BASIS),
                       "icon": "robot", "chat_worthy": False,
                       "feasibility": {"level": "impossible", "note": "不合法的 level"},
+                      "items": [{"kind": "task", "title": "起个项目", "desc": ""}],
                       "keywords": "不是列表"}},
             ensure_ascii=False,
         )
         models = FakeModelsQueue(ready=True, replies=[bad])
         store, settings, feeds, models, *_r = _make_feeds(tmp_path, models=models)
+        _seed_chat(store)
         with _TimePatch():
             assert _run(feeds.make_idea(GID)) is None
         assert store.read().execute("SELECT COUNT(*) c FROM ideas").fetchone()["c"] == 0

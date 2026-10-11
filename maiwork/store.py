@@ -1069,8 +1069,19 @@ def _m_task_lane_raw(conn: sqlite3.Connection) -> None:
     )
 
 
+# 构想的「类型」（docs/18 §十，2026-10-11 用户拍板「先有真实需要，再有构想」）：
+# help = MaiWork 帮一步（要给 items、过可行性闸）；talk = 值得群里聊一聊的话题（不动手）。
+# 老构想没有类型 → ''。只加列，不改历史 SQL；读取时 kind 空 / 认不出都当 help（老口径）。
+def _m_idea_kind(conn: sqlite3.Connection) -> None:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ideas)")}
+    if not cols:
+        return  # 半截老库连 ideas 都没有（测试造的晋级库）：没表可加，跳过
+    if "kind" not in cols:
+        conn.execute("ALTER TABLE ideas ADD COLUMN kind TEXT NOT NULL DEFAULT ''")
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind]
 
 
 class Store:

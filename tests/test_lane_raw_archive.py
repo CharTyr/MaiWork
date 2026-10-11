@@ -35,7 +35,7 @@ from CharTyr_MaiWork.maiwork.tasks import Tasks
 GID = "900000001"
 OTHER = "111222333"
 NOW = 1_790_000_000.0
-LATEST = len(_MIGRATIONS)  # 37 = 36（docs/20 task_lanes + brief）+ 1（lane 原始历史归档）
+LATEST = len(_MIGRATIONS)  # 38 = 37（docs/20 task_lanes + brief + lane 原始历史）+ 1（构想 kind）
 
 MSGS = [
     {"role": "user", "content": "派的活：整理一页"},
@@ -159,14 +159,15 @@ class TestRawMerge:
 
 
 # ---------------------------------------------------------------------------
-# 迁移：库号 37 新表 + 从老 task_lanes 回填
+# 迁移：库号 37 新表 + 从老 task_lanes 回填；库号 38 构想 kind（docs/18 §十）
 # ---------------------------------------------------------------------------
 
 
 class TestMigration:
-    def test_latest_version_is_37(self) -> None:
-        assert LATEST == 37, "库号只因 lane 原始历史归档加一步"
+    def test_latest_version_is_38(self) -> None:
+        assert LATEST == 38, "库号只因 lane 原始历史归档 / 构想 kind 各加一步"
         assert _MIGRATIONS[36].__name__ == "_m_task_lane_raw"
+        assert _MIGRATIONS[37].__name__ == "_m_idea_kind"
 
     def test_raw_table_exists_with_coverage_columns(self, store: Store) -> None:
         names = {r[0] for r in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}

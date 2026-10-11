@@ -32,6 +32,7 @@ from fakes import (
     ensure_pick_fallback,
     focus_reply,
     patch_two_phase_feeds,
+    seed_idea_chat,
     two_phase_workers_run,
 )
 
@@ -381,12 +382,19 @@ class TestRecentPublishedForDedup:
         store, settings, feeds, models, *_r = _make_feeds(
             tmp_path,
             models=FakeModelsQueue(ready=True, replies=[json.dumps(
-                {"idea": {"title": "我可以整理对比表", "body": "整一下", "basis": "群里在聊",
-                          "step": "列条目", "effort": "一小时", "icon": "chart",
-                          "chat_worthy": False}},
+                {"idea": {"kind": "help", "title": "整理最近聊过的方案对比表",
+                          "body": "整一下", "evidence": "新出的 FPGA 板子要不要上",
+                          "basis": {"pain": "方案聊过就散", "value": "挑的时候有依据",
+                                    "interest": "群里在聊板子"},
+                          "icon": "chart", "chat_worthy": False,
+                          "feasibility": {"level": "ok", "note": "能做",
+                                          "uses": ["search", "write"], "deliver": "doc",
+                                          "needs_members": False},
+                          "items": [{"kind": "task", "title": "列条目", "desc": ""}]}},
                 ensure_ascii=False,
             )]),
         )
+        seed_idea_chat(store, GID, now=NOW)
         with _TimePatch():
             _insert_published(store, GID, title="已发布的资讯标题", url_key="ok.cn/1")
             _insert_published(store, GID, title="被拒的资讯标题不该给构想看", url_key="no.cn/2", rejected=1)

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from test_feeds import GID, NOW, _IDEA_JSON, _make_feeds, _run
+from test_feeds import GID, NOW, _IDEA_JSON, _make_idea_feeds, _run
 from fakes import FakeModelsQueue
 
 
@@ -17,7 +17,7 @@ def _task(store, tid: str, title: str, status: str, created: float, gid: str = G
 
 def test_idea_prompt_lists_recent_tasks(tmp_path) -> None:
     models = FakeModelsQueue(ready=True, replies=[_IDEA_JSON])
-    store, settings, feeds, models, *_ = _make_feeds(tmp_path, models=models)
+    store, settings, feeds, models, *_ = _make_idea_feeds(tmp_path, models=models)
     _task(store, "T-1", "找提丰的高清图", "completed", NOW - 86400)
     _task(store, "T-2", "整理暗潮配装表", "running", NOW - 3600)
     _task(store, "T-3", "被取消的事", "cancelled", NOW - 3600)

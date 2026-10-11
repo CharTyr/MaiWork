@@ -23,7 +23,12 @@ from CharTyr_MaiWork.maiwork import clock, idea_feasibility
 from CharTyr_MaiWork.maiwork.console import views
 from CharTyr_MaiWork.maiwork.store import Store
 
-from fakes import FakeModelsQueue
+from fakes import (
+    IDEA_BASIS,
+    IDEA_EVIDENCE,
+    FakeModelsQueue,
+    seed_idea_chat,
+)
 from test_feeds import GID, _make_feeds, _run, _TimePatch
 from test_personal import (
     GID as PGID,
@@ -451,16 +456,29 @@ class TestToolCatalog:
 
 
 def _idea_json(feasibility: Any = None, **over: Any) -> str:
+    """群向回包样例（docs/18 §十：kind / evidence / 三段 basis 都是必给项）。"""
     idea: Dict[str, Any] = {
-        "title": "我可以帮群把每周讨论整理成一页",
+        "kind": "help",
+        "title": "把手柄救活",
         "body": "每周自动汇总一次",
-        "basis": "群里每周都在复盘",
+        "evidence": IDEA_EVIDENCE,
+        "basis": dict(IDEA_BASIS),
         "icon": "books",
         "chat_worthy": True,
+        "items": [{"kind": "task", "title": "查清故障", "desc": ""}],
         "feasibility": GOOD if feasibility is None else feasibility,
     }
     idea.update(over)
     return json.dumps({"idea": idea}, ensure_ascii=False)
+
+
+def _feeds_with_chat(tmp_path, *, models, **kw):
+    """装好 Feeds（真库）+ 种几条本群真发言（evidence 要和它对得上）。"""
+    store, settings, feeds, models, workers, topics, profiles = _make_feeds(
+        tmp_path, models=models, **kw
+    )
+    seed_idea_chat(store, GID, now=NOW)
+    return store, settings, feeds, models, workers, topics, profiles
 
 
 class _CatalogWorkers:
@@ -479,7 +497,7 @@ class _CatalogWorkers:
 class TestMakeIdeaWiring:
     def test_pass_stores_normalized_json(self, tmp_path) -> None:
         models = FakeModelsQueue(ready=True, replies=[_idea_json()])
-        store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path, models=models)
+        store, settings, feeds, models, workers, topics, _ = _feeds_with_chat(tmp_path, models=models)
         with _TimePatch():
             got = _run(feeds.make_idea(GID))
         assert isinstance(got, int) and got > 0
@@ -496,7 +514,7 @@ class TestMakeIdeaWiring:
         bad = {"level": "ok", "note": "约人开黑", "uses": ["chat"],
                "deliver": "doc", "needs_members": True}
         models = FakeModelsQueue(ready=True, replies=[_idea_json(bad, title="我可以帮你约人开黑")])
-        store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path, models=models)
+        store, settings, feeds, models, workers, topics, _ = _feeds_with_chat(tmp_path, models=models)
         with _TimePatch():
             got = _run(feeds.make_idea(GID))
         assert got is None
@@ -509,29 +527,29 @@ class TestMakeIdeaWiring:
         assert topics.calls == []
 
     def test_missing_feasibility_blocked(self, tmp_path) -> None:
-        """模型没给 feasibility → 不是「回落 maybe 入库」，而是拦下。"""
-        payload = {"idea": {"title": "我可以整理一个 NAS 清单", "body": "整理清单",
-                            "basis": "群里在折腾 NAS", "icon": "chart", "chat_worthy": False}}
-        models = FakeModelsQueue(ready=True, replies=[json.dumps(payload, ensure_ascii=False)])
-        store, settings, feeds, models, *_r = _make_feeds(tmp_path, models=models)
+        """help 给了 items 却没给 feasibility → 不是「回落 maybe 入库」，而是拦下。"""
+        payload = _idea_json(feasibility={}, title="整理一个 NAS 清单")
+        models = FakeModelsQueue(ready=True, replies=[payload])
+        store, settings, feeds, models, *_r = _feeds_with_chat(tmp_path, models=models)
         with _TimePatch():
             assert _run(feeds.make_idea(GID)) is None
         assert store.read().execute("SELECT COUNT(*) c FROM ideas").fetchone()["c"] == 0
-        assert len(store.kv_get(f"ideas.blocked.{GID}", [])) == 1
+        blocked = store.kv_get(f"ideas.blocked.{GID}", [])
+        assert len(blocked) == 1 and blocked[0]["reason"]
 
     def test_unknown_capability_blocked(self, tmp_path) -> None:
         """uses 里写了清单没有的能力（FakeWorkers → 基本能力，没有 code）→ 拦下。"""
         bad = {"level": "ok", "note": "起个 VM 跑", "uses": ["code", "write"],
                "deliver": "tool", "needs_members": False}
         models = FakeModelsQueue(ready=True, replies=[_idea_json(bad)])
-        store, settings, feeds, models, *_r = _make_feeds(tmp_path, models=models)
+        store, settings, feeds, models, *_r = _feeds_with_chat(tmp_path, models=models)
         with _TimePatch():
             assert _run(feeds.make_idea(GID)) is None
         assert len(store.kv_get(f"ideas.blocked.{GID}", [])) == 1
 
     def test_prompt_carries_capability_section(self, tmp_path) -> None:
         models = FakeModelsQueue(ready=True, replies=[_idea_json()])
-        store, settings, feeds, models, *_r = _make_feeds(tmp_path, models=models)
+        store, settings, feeds, models, *_r = _feeds_with_chat(tmp_path, models=models)
         with _TimePatch():
             _run(feeds.make_idea(GID))
         prompt = models.calls[0][1][-1]["content"]
@@ -552,7 +570,7 @@ class TestMakeIdeaWiring:
         bad = {"level": "ok", "note": "写个脚本", "uses": ["code"],
                "deliver": "tool", "needs_members": False}
         models = FakeModelsQueue(ready=True, replies=[_idea_json(bad)])
-        store, settings, feeds, models, *_r = _make_feeds(
+        store, settings, feeds, models, *_r = _feeds_with_chat(
             tmp_path, models=models, workers=_CatalogWorkers(tools), search=None
         )
         with _TimePatch():
@@ -567,11 +585,16 @@ class TestMakeIdeaWiring:
 
 
 def _personal_idea_json(feasibility: Any, title: str = "我可以帮你把这块板的例程理一下") -> str:
+    """个人向回包样例（docs/18 §十：由头 / 三段 basis / kind / items 都是必给项）。"""
     return json.dumps(
         {
             "focus": [{"query": "FPGA", "why": "在做"}],
-            "idea": {"title": title, "body": "我可以帮你把例程整理成一页",
+            "idea": {"kind": "help", "title": title, "body": "把这块板的例程整理成一页",
                      "step": "先列出要跑的例程", "effort": "半天",
+                     "origin": "FPGA 小板子",
+                     "basis": {"pain": "例程散着找不到", "value": "少走弯路",
+                               "interest": "他在做 FPGA 板子"},
+                     "items": [{"kind": "task", "title": "理一下例程", "desc": ""}],
                      "feasibility": feasibility},
         },
         ensure_ascii=False,
@@ -637,10 +660,7 @@ class TestPersonalWiring:
         assert title == "我可以帮你把这块板的例程理一下"
 
     def test_missing_feasibility_blocked(self, tmp_path) -> None:
-        payload = json.dumps({
-            "focus": [{"query": "FPGA", "why": "在做"}],
-            "idea": {"title": "我可以帮你把例程理一下", "body": "整理", "step": "", "effort": ""},
-        }, ensure_ascii=False)
+        payload = _personal_idea_json({}, title="把这块板的例程理一下")
         models = FakeModelsQueue(ready=True, replies=[
             payload, _personal_scores_json(), json.dumps({"posts": []}, ensure_ascii=False),
         ])

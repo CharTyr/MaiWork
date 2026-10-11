@@ -35,10 +35,12 @@ from typing import Any, Callable
 from . import clock, idea_feasibility, idea_guard, members
 from .config import Settings
 from .feeds import (
+    _IDEA_ITEMS_MAX,
     _POST_ACCURACY_RULES,
     CONDITIONS_RULE,
     CONDITIONS_SCHEMA,
     SOURCE_IDENTITY_RULES,
+    IDEA_KIND_TALK,
     _adopt_title_zh,
     _conditions_text,
     _localize_title,
@@ -46,7 +48,10 @@ from .feeds import (
     _pub_date,
     check_display_texts,
     clean_conditions,
+    clean_idea_kind,
     drop_unverified_rewrites,
+    idea_basis_text,
+    parse_idea_items,
     _titles_with_originals,
     clean_idea_origin,
     clean_step,
@@ -74,6 +79,21 @@ PERSONAL_PAGE_CAP = 8
 _SEARCH_QUOTES = 6
 # 入网门槛（第二道）：相关度 ≥3 且平均分 ≥3
 _WEB_MIN_AVG = 3.0
+
+# 个人向「给你的点子」的原则（docs/18 §十，2026-10-11 用户拍板「先有真实需要，再有构想」）。
+# 第二人称：对着一个人说；没有群聊可以核 evidence，所以由头（他自己说过想做的那件事）当依据。
+# 改文案只动这一块。
+_PERSONAL_IDEA_GUIDE: tuple[str, ...] = (
+    "**先有他的真实需要**：点子不是他派的活，是你主动递过去的。先看他自己在群里说过想做 / "
+    "在为难的那件事（写进 origin，写不出就别给 idea），再想你能顺手帮上哪一步。",
+    "**三条都占才提**：① 他确实有的麻烦 / 需要（basis.pain，不点名别人）；"
+    "② 值得去做：做出来真能用上，省掉他的什么麻烦（basis.value）；"
+    "③ 落在他感兴趣的方向上（basis.interest，对着画像里的兴趣 / 在做的事）。缺一条就给 null。",
+    "**写法**：title 写「具体的事 + 我帮到哪一步」（≤30 字，不要用「我可以帮你」开头），"
+    "别默认「整理一份××速查 / 清单」；**kind 二选一**：\"help\" = 你要替他做一步"
+    "（items 至少一个 + feasibility），\"talk\" = 值得他自己想一想 / 聊一聊的话题"
+    "（不用你动手，items 留空、不写 feasibility）。",
+)
 
 
 def _join_blocks(*blocks: str) -> str:
@@ -294,7 +314,7 @@ class Personal:
         # ⑧ 顺带 0–1 条个人向构想
         if idea is not None:
             try:
-                self._insert_idea(gid, uid, idea, persona)
+                self._insert_idea(gid, uid, idea)
             except Exception:
                 logger.exception("个人向构想入库失败（群 %s 人 %s）", gid, uid[:8])
         return kept_n
@@ -334,7 +354,7 @@ class Personal:
             return None
 
     async def _plan_focus(self, gid: str, name: str, persona: dict) -> dict:
-        """用他的 persona 定 1–2 个关注点 + 0–1 条「我可以帮你……」构想。
+        """用他的 persona 定 1–2 个关注点 + 0–1 条「给你的点子」。
 
         AGENTS.md（做事规矩，含管理员写的搜索要求）在定关注点时就生效。
         """
@@ -355,7 +375,12 @@ class Personal:
         else:
             lines.append("（画像还少，按他最近在群里做的事挑）")
         lines.append("")
-        # 可行性硬闸的能力清单（docs/18 §八，2026-10-05 用户拍板 1.A 严格）：和群向共用同一段
+        # 点子的原则（docs/18 §十，2026-10-11 用户拍板）：整块在 _PERSONAL_IDEA_GUIDE。
+        lines.extend(_PERSONAL_IDEA_GUIDE)
+        lines.append("")
+        # 可行性硬闸的能力清单（docs/18 §八，2026-10-05 用户拍板 1.A 严格）：和群向共用同一段，
+        # 只约束 items（MaiWork 能帮的那一步）。
+        lines.append("下面是 MaiWork 自己能用的本事（只约束 items 那部分）：")
         lines.append(
             idea_feasibility.prompt_section(
                 idea_feasibility.inventory(self._worker_tool_catalog())
@@ -364,15 +389,25 @@ class Personal:
         lines.append("")
         lines.append(
             '请给出 1–2 个拿去搜索的关注点（具体一点，对着他做的/关心的），'
-            '顺带想 0–1 个「我可以帮他……」的小忙（想不出就 idea 给 null）。只回 JSON：'
+            '顺带想 0–1 个「给你的点子」（想不出就 idea 给 null）。只回 JSON：'
             '{"focus": [{"query": "搜索关键词", "why": "对着他哪件事"}],'
-            ' "idea": {"title": "我可以帮你……", "body": "帮什么（一两句）", "step": "第一步", '
-            '"effort": "大概多久",'
-            ' "feasibility": {"level": "ok", "note": "一句话：为什么真做得到",'
-            ' "uses": ["用到的本事名（至少 1 个，只从上面清单里挑）"],'
-            ' "deliver": "page"|"doc"|"tool"|"report", "needs_members": false},'
+            ' "idea": {"kind": "help"|"talk",'
+            ' "title": "具体的事 + 我帮到哪一步（≤30 字，不要用「我可以帮你」开头）", '
+            '"body": "这个点子是什么、为什么值得他花时间（一两句）",'
             ' "origin": "这件事接的是**他自己在群里说过想做的那件事**，用一个短名词短语'
-            '（≤16 字，不含他的名字、QQ 号，比如「FPGA 小板子」）；想不出就空字符串"} | null}'
+            '（≤16 字，不含他的名字、QQ 号，比如「FPGA 小板子」）；这是个点子成不成立的前提，'
+            '写不出就别给 idea",'
+            ' "basis": {"pain": "他确实有的麻烦 / 需要（一句）",'
+            ' "value": "为什么值得做：做出来真能用上、省掉什么",'
+            ' "interest": "落在他感兴趣的哪个方向（引画像里的兴趣 / 在做的事）"},'
+            ' "step": "第一步", "effort": "大概多久",'
+            f' "items": [kind="help" 时至少 1 个、最多 {_IDEA_ITEMS_MAX} 个'
+            ' {"kind": "task" 或 "goal", "title": "短标题", "desc": "一句话说明"}]；'
+            'kind="talk" 留空,'
+            ' "feasibility": {"level": "ok", "note": "一句话：为什么这一步真做得到",'
+            ' "uses": ["用到的本事名（至少 1 个，只从上面清单里挑）"],'
+            ' "deliver": "page"|"doc"|"tool"|"report", "needs_members": false}}'
+            '} | null}'
         )
         result = await self._models.chat(
             agent="main",
@@ -389,13 +424,19 @@ class Personal:
         out_idea: dict | None = None
         if isinstance(idea, dict) and str(idea.get("title") or "").strip():
             out_idea = {
+                # 点子类型（docs/18 §十）：help / talk；老格式没给 → help
+                "kind": clean_idea_kind(idea.get("kind")),
                 "title": str(idea.get("title") or "").strip()[:60],
                 "body": str(idea.get("body") or "").strip()[:200],
                 "step": str(idea.get("step") or "").strip()[:120],
                 "effort": str(idea.get("effort") or "").strip()[:60],
-                # 由头 = 他自己在群里说过想做的那件事（短名词短语，清洗 + 限 16 字）
+                # 由头 = 他自己在群里说过想做的那件事（短名词短语，清洗 + 限 16 字）。
+                # 个人向没有群聊可以核 evidence，这条由头就是「先有真实需要」的依据（_insert_idea 要）。
                 "origin": clean_idea_origin(idea.get("origin")),
-                # 可行性原始字段（_insert_idea 里过 check；不过就不入库、只记 kv）
+                # 三条都占（痛点 / 值得做 / 感兴趣），_insert_idea 里查
+                "basis": idea.get("basis"),
+                # items（可选）与可行性原始字段（_insert_idea 里给 help 的 items 过 check）
+                "items": idea.get("items"),
                 "feasibility": idea.get("feasibility"),
             }
         return {"focus": out_focus, "idea": out_idea}
@@ -996,8 +1037,12 @@ class Personal:
                 )
         return len(accepted)
 
-    def _insert_idea(self, gid: str, uid: str, idea: dict, persona: dict) -> None:
-        """个人向构想（0–1 条「我可以帮你……」）→ ideas.target_user_id；不进候选池。"""
+    def _insert_idea(self, gid: str, uid: str, idea: dict) -> None:
+        """个人向点子（0–1 条「给你的点子」）→ ideas.target_user_id；不进候选池。
+
+        docs/18 §十：先有真实需要——个人向没有群聊可核 evidence，要求由头（他自己说过想做的那件事）
+        写得出；三条 basis 缺一条、help 没给 items / 过不了可行性闸 → 不入库，只记 kv 拦截记录。
+        """
         from .feeds import _similar, _IDEA_DEDUP_RATIO
         from .privacy import scrub
 
@@ -1018,38 +1063,64 @@ class Personal:
         ).fetchall()
         if any(_similar(title, str(r["title"])) >= _IDEA_DEDUP_RATIO for r in rows):
             return
-        # 可行性硬闸（docs/18 §八，用户拍板 1.A 严格）：和群向同一套 check；不过就不入库，
-        # 只往 kv ideas.blocked.<群号> 记一条（title 只存标题，不存任何画像内容）。
-        feas_ok, feas_reason, feas_norm = idea_feasibility.check(
-            idea.get("feasibility"),
-            idea_feasibility.inventory(self._worker_tool_catalog()),
-        )
-        if not feas_ok:
-            idea_feasibility.record_blocked(self._store, gid, "personal", title, feas_reason)
-            logger.info(
-                "个人向构想过不了可行性闸，不入库（群 %s 人 %s）：%s —— %s",
-                gid, uid[:8], title, feas_reason,
-            )
-            return
-        feasibility_json = json.dumps(feas_norm, ensure_ascii=False)
-        body = scrub(gid, str(idea.get("body") or ""), self._store) or ""
-        # 由头也过隐私闸：含他的注记 / 画像片段 → 只把 origin 置空，不丢整条构想
+        # 先有真实需要：由头 = 他自己在群里说过想做的那件事（没有群聊可比对，这就是依据）。
         origin = clean_idea_origin(idea.get("origin"))
-        if origin and scrub(gid, origin, self._store) is None:
+        if not origin:
+            idea_feasibility.record_blocked(self._store, gid, "personal", title, "没接上他自己说过的事")
+            logger.info("个人向点子没接上他自己说过的事，不入库（群 %s 人 %s）：%s", gid, uid[:8], title)
+            return
+        # 三条都占（痛点 / 值得做 / 感兴趣），缺一条 / 老式字符串 → 不入库。
+        basis_s = idea_basis_text(idea.get("basis"))
+        if not basis_s:
+            idea_feasibility.record_blocked(
+                self._store, gid, "personal", title, "痛点 / 值得做 / 感兴趣 没说全"
+            )
+            logger.info("个人向点子的三条没说全，不入库（群 %s 人 %s）：%s", gid, uid[:8], title)
+            return
+        kind = clean_idea_kind(idea.get("kind"))
+        if kind == IDEA_KIND_TALK:
+            # 话题：不用 MaiWork 动手，items / feasibility 都不留（也不进群话题池——那会暴露个人向）。
+            items: list[dict] = []
+            feasibility_json = ""
+        else:
+            items = parse_idea_items(idea.get("items"))
+            if not items:
+                idea_feasibility.record_blocked(
+                    self._store, gid, "personal", title, "说是帮一步，却没写要做哪一步"
+                )
+                logger.info("个人向点子说是帮一步却没写要做哪一步，不入库（群 %s 人 %s）：%s", gid, uid[:8], title)
+                return
+            # 可行性硬闸（docs/18 §八，用户拍板 1.A 严格）：和群向同一套 check；不过就不入库，
+            # 只往 kv ideas.blocked.<群号> 记一条（title 只存标题，不存任何画像内容）。
+            feas_ok, feas_reason, feas_norm = idea_feasibility.check(
+                idea.get("feasibility"),
+                idea_feasibility.inventory(self._worker_tool_catalog()),
+            )
+            if not feas_ok:
+                idea_feasibility.record_blocked(self._store, gid, "personal", title, feas_reason)
+                logger.info(
+                    "个人向构想过不了可行性闸，不入库（群 %s 人 %s）：%s —— %s",
+                    gid, uid[:8], title, feas_reason,
+                )
+                return
+            feasibility_json = json.dumps(feas_norm, ensure_ascii=False)
+        items_json = json.dumps(items, ensure_ascii=False)
+        body = scrub(gid, str(idea.get("body") or ""), self._store) or ""
+        # 由头也过隐私闸：含他的注记 / 画像片段 → 只把 origin 置空，不丢整条点子
+        if scrub(gid, origin, self._store) is None:
             origin = ""
         now = clock.now()
         with self._store.tx() as conn:
             conn.execute(
-                "INSERT INTO ideas (group_id, icon, title, body, origin, basis, step, effort, state,"
-                " requested_by, task_id, up, down, created, updated, feasibility, keywords,"
-                " target_user_id)"
-                " VALUES (?, 'bulb', ?, ?, ?, ?, ?, ?, 'new', NULL, NULL, 0, 0, ?, ?, ?, '[]', ?)",
+                "INSERT INTO ideas (group_id, kind, icon, title, body, origin, basis, step, effort,"
+                " state, requested_by, task_id, up, down, created, updated, feasibility, keywords,"
+                " items, target_user_id)"
+                " VALUES (?, ?, 'bulb', ?, ?, ?, ?, ?, ?, 'new', NULL, NULL, 0, 0, ?, ?, ?, '[]', ?, ?)",
                 (
-                    gid, title, body, origin,
-                    str(persona.get("summary") or "")[:120],  # basis：只给管理员参考，不进任何群文字
+                    gid, kind, title, body, origin, basis_s,
                     str(idea.get("step") or "").strip(),
                     str(idea.get("effort") or "").strip(),
-                    now, now, feasibility_json, uid,
+                    now, now, feasibility_json, items_json, uid,
                 ),
             )
 

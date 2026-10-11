@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any, Callable, Dict, List, Tuple
 
 
@@ -459,6 +460,9 @@ class FakeFeeds:
         self.news_map: Dict[str, List[dict]] = {}
         self.ideas_map: Dict[str, List[dict]] = {}
         self.today_map: Dict[str, int] = {}
+        self.spark: Dict[str, float] = {}
+        self.spark_ready_map: Dict[str, bool] = {}
+        self.spark_taken_calls: List[str] = []
 
     async def prepare_news(self, group_id: str) -> int:
         self.prepare_calls.append(group_id)
@@ -499,6 +503,18 @@ class FakeFeeds:
 
     def today_count(self, group_id: str) -> int:
         return int(self.today_map.get(group_id, 0))
+
+    # 话头火花（docs/18 §十一）：app 排程要问的几口；够不够格由 spark_ready_map 说了算，
+    # 认领过一次记在 spark_taken_calls（真 Feeds 里对应清内存火花 + 记当天）。
+    def note_spark(self, group_id: str, ts: Any = None) -> None:
+        self.spark[str(group_id)] = float(ts if ts is not None else 0.0)
+
+    def spark_ready(self, group_id: str, now: float) -> bool:
+        return bool(self.spark_ready_map.get(str(group_id), False))
+
+    def spark_taken(self, group_id: str, now: float) -> None:
+        self.spark_taken_calls.append(str(group_id))
+        self.spark.pop(str(group_id), None)
 
 
 class FakeScheduler:
@@ -880,3 +896,60 @@ def patch_two_phase_feeds(
             except Exception:
                 pass
     return fake
+
+
+# ---------------------------------------------------------------------------
+# 构想「先有真实需要，再有构想」（docs/18 §十，2026-10-11 用户拍板）：
+# 种本群真发言（evidence 要和它对得上）+ 拼一份合格的群向模型回包
+# ---------------------------------------------------------------------------
+
+IDEA_CHAT_LINES: List[str] = [
+    "- 阿强：这手柄放半年了，还能救活吗",
+    "- 小林：有什么办法能看清这块板子怎么接线",
+]
+IDEA_EVIDENCE = "这手柄放半年了，还能救活吗"
+IDEA_BASIS: Dict[str, str] = {
+    "pain": "手柄坏了就扔，没人知道还能不能修",
+    "value": "修好能省下买新的钱",
+    "interest": "群里一直在折腾手柄和板子",
+}
+IDEA_FEAS_OK: Dict[str, Any] = {
+    "level": "ok", "note": "能做：联网查公开资料整理成步骤",
+    "uses": ["search", "write"], "deliver": "doc", "needs_members": False,
+}
+
+
+def seed_idea_chat(store: Any, gid: str, lines: Any = None, *, now: float = 1_790_000_000.0) -> None:
+    """往 chat_log 种几条本群真发言：make_idea 的 evidence 要和这里对得上。"""
+    for i, line in enumerate(IDEA_CHAT_LINES if lines is None else lines):
+        text = str(line).strip()
+        if text.startswith("-"):
+            text = text[1:].strip()
+        if "：" in text:
+            text = text.split("：", 1)[1]
+        elif ":" in text:
+            text = text.split(":", 1)[1]
+        with store.tx() as conn:
+            conn.execute(
+                "INSERT INTO chat_log (text, group_id, message_id, ts, user_id, user_name)"
+                " VALUES (?, ?, ?, ?, '10001', '群友')",
+                (text, str(gid), f"seed-chat-{i}", float(now)),
+            )
+
+
+def idea_reply(**over: Any) -> str:
+    """群向构想的合格模型回包：evidence 照抄群里一句 + 三段 basis + kind（docs/18 §十）。"""
+    idea: Dict[str, Any] = {
+        "kind": "help",
+        "title": "把手柄救活",
+        "body": "先查这款手柄的常见故障，再出一份照着做的复活步骤。",
+        "evidence": IDEA_EVIDENCE,
+        "basis": dict(IDEA_BASIS),
+        "icon": "gamepad",
+        "chat_worthy": False,
+        "keywords": ["手柄"],
+        "items": [{"kind": "task", "title": "查清故障原因", "desc": "先出一版"}],
+        "feasibility": dict(IDEA_FEAS_OK),
+    }
+    idea.update(over)
+    return json.dumps({"drafts": ["查手柄", "修板子"], "idea": idea}, ensure_ascii=False)

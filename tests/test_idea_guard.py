@@ -286,9 +286,15 @@ def test_last_sent_and_mentioned_since(tmp_path) -> None:
 
 
 def _idea_reply(title: str) -> str:
+    # docs/18 §十：个人向要点子也得接上他自己说过的事（origin）+ 三条 basis
     return json.dumps({
         "focus": [{"query": "FPGA", "why": "在做"}],
-        "idea": {"title": title, "body": "我可以帮你把这板子的例程整理成一页",
+        "idea": {"kind": "help", "title": title,
+                 "body": "我可以帮你把这板子的例程整理成一页",
+                 "origin": "FPGA 小板子",
+                 "basis": {"pain": "例程散着找不到", "value": "少走弯路",
+                           "interest": "他在做板子"},
+                 "items": [{"kind": "task", "title": "理一下例程", "desc": ""}],
                  "step": "先列出要跑的例程", "effort": "半天",
                  "feasibility": tp._FEAS_OK},
     }, ensure_ascii=False)

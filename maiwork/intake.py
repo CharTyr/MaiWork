@@ -34,6 +34,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 from . import clock
 from .config import Settings, _norm_platform, host_platform
+from .feeds import idea_spark
 from .host import _parse_reply_to
 from .quick_judge import has_request_cue
 
@@ -193,6 +194,9 @@ class Intake:
         bot_account: Callable[[str], str] | None = None,
         models: Any = None,
         quick_judge: Any = None,
+        # 话头火花（docs/18 §十一）：群里有「明显在为难 / 想要」的话头时调一次
+        # on_spark(group_id, ts)。只记内存（app 接成 feeds.note_spark），零库写、零模型。
+        on_spark: Callable[[str, float], None] | None = None,
     ) -> None:
         self._get_settings = get_settings
         self._signals = signals
@@ -222,6 +226,8 @@ class Intake:
         # 快速判断兜底取「之前的 6 条」当上下文；每个服务群一份，只留最近 8 条
         # （机器人自己的也记，标 MaiBot）
         self._recent: dict[str, list[dict]] = {}
+        # 话头火花（docs/18 §十一）：命中的群发言记一笔到 app / feeds 那边（纯内存）
+        self._on_spark = on_spark
         # 派活判断兜底（quick_judge.QuickJudge）：Jev 不在 / 拿不准时用模型快速判这一条 @。
         # 显式注入（测试）优先；只给了 models 就在这里自己建一个。
         self._quick_judge = quick_judge
@@ -310,6 +316,16 @@ class Intake:
             if reply_to:
                 at = _ts_of(message.get("timestamp")) or clock.now()
                 self._card_index.on_message(self._store, group_id, user_id, message_id, reply_to, at)
+        # 2.6) 话头火花（docs/18 §十一）：群里明显在为难 / 想要的话头，记一笔内存火花
+        #      （零库写、零模型）。@ 机器人的是派活请求，走下面那条路，不算话头。
+        if self._on_spark is not None and not (
+            bool(message.get("is_at")) or bool(message.get("is_mentioned"))
+        ):
+            try:
+                if idea_spark(text):
+                    self._on_spark(group_id, _ts_of(message.get("timestamp")) or clock.now())
+            except Exception:
+                logger.debug("记话头火花出错（群 %s），已吞掉", group_id, exc_info=True)
         # 3) 提问的回答（docs/02 §7.2）：回复了 waiting_input/shelved 任务那条提问，
         #    或发起人 @ 机器人而且这个群里只有这一个等待任务 → 后台恢复任务。
         #    纯内存查（app 给的 30 秒缓存），不做重查询。

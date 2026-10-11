@@ -1,8 +1,8 @@
-"""构想 0.8.0：少而精（make_idea）+ 7 天没人理自动收起（shelve_ignored_ideas）。
+"""构想：先有真实需要再有构想（make_idea，docs/18 §十）+ 7 天没人理自动收起（shelve_ignored_ideas）。
 
-两份契约（docs/18「构想少而精：把握不大就不出；7 天没人理自动收起」）：
+两份契约（docs/18 §十「先有真实需要，再有构想」+「7 天没人理自动收起」）：
 
-A. make_idea 少而精
+A. make_idea：先有真实需要（evidence / 三段 basis / kind）
    - 提示词明说：想不到值得做的 / 把握不大就给 null，不要为了凑数硬出一条；
      提之前自己过三关：群里真的有人要它、我真做得到、风险和代价说得出。
    - 「值得做的把握」是**可选**字段 worth（high / medium / low，可省略）：
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any, List
 
 import pytest
@@ -122,19 +123,31 @@ def _feeds(
         store, models, None, profiles, topics,
         get_settings if get_settings is not None else (lambda: settings),
     )
+    # make_idea 的 evidence / 群聊素材（docs/18 §十）：按真实「现在」种，落在 72 小时窗口里
+    from fakes import seed_idea_chat
+
+    seed_idea_chat(store, GID, now=time.time())
     return store, feeds, models, topics
 
 
 def _plain_idea() -> dict:
     return {
+        "kind": "help",
         "title": "我可以帮群把每周讨论整理成一页",
         "body": "每周自动汇总一次",
-        "basis": "群里每周都在复盘",
+        # docs/18 §十：evidence 要照抄群里真说过的话；basis 三条都要占
+        "evidence": "这手柄放半年了，还能救活吗",
+        "basis": {
+            "pain": "手柄坏了就扔，没人知道还能不能修",
+            "value": "修好能省下买新的钱",
+            "interest": "群里一直在折腾手柄和板子",
+        },
         "icon": "books",
         "chat_worthy": False,
         # 合格样例（docs/18 §八；_feeds() 不接 workers → 基本能力 search/chat/write/watch）
         "feasibility": {"level": "ok", "note": "能做",
                         "uses": ["search", "write"], "deliver": "doc", "needs_members": False},
+        "items": [{"kind": "task", "title": "出一页每周复盘", "desc": ""}],
     }
 
 
@@ -353,27 +366,24 @@ class TestShelveIgnoredIdeas:
 
 
 # ----------------------------------------------------------------------
-# A. make_idea：少而精 + 堆积闸
+# A. make_idea：先有真实需要 + 堆积闸
 # ----------------------------------------------------------------------
 
 
 class TestMakeIdeaFewAndGood:
-    def test_prompt_demands_no_padding_and_optional_worth(self, tmp_path) -> None:
+    def test_prompt_demands_need_first_and_optional_worth(self, tmp_path) -> None:
         models = FakeModelsQueue(ready=True, replies=[_IDEA_PLAIN])
         store, feeds, models, topics = _feeds(tmp_path, models=models)
 
         assert isinstance(_run(feeds.make_idea(GID)), int)
 
         prompt = models.calls[0][1][-1]["content"]
-        # 少而精：想不到 / 把握不大就给 null，别凑数
-        assert "少而精" in prompt
-        assert "null" in prompt
-        assert "凑数" in prompt or "不值得" in prompt
-        assert "把握不大" in prompt
+        # 先有真实需要（docs/18 §十）：照着群里真话引，三条都占
+        assert "先有群里真实的需要" in prompt
+        assert "evidence" in prompt and "痛点" in prompt and "值得做" in prompt
+        assert "宁缺毋滥" in prompt and "null" in prompt
         # 信心字段是可选建议，不是硬要求
         assert '"worth"' in prompt and "可省略" in prompt
-        # 提之前要能说清真实群需求 / 做不做得到 / 风险代价
-        assert "风险" in prompt
         # 老要求没被挤掉
         assert '"origin"' in prompt and "不点名群友" in prompt
         assert "最多 5 个" in prompt
@@ -421,28 +431,26 @@ class TestMakeIdeaFewAndGood:
         assert store.read().execute("SELECT COUNT(*) c FROM ideas").fetchone()["c"] == 0
         assert topics.calls == []
 
-    def test_pile_gate_blocks_at_three_unhandled(self, tmp_path) -> None:
+    def test_pile_gate_blocks_at_two_unhandled(self, tmp_path) -> None:
         models = FakeModelsQueue(ready=True, replies=[_IDEA_PLAIN])
         store, feeds, models, topics = _feeds(tmp_path, models=models, cfg=_SERVED)
         _seed_idea(store, title="新的", created=NOW - 3600)
-        _seed_idea(store, title="有人想要", state="wanted", created=NOW - 7200)
         pending = _seed_idea(store, title="等批准", state="pending", created=NOW - 100)
 
         assert _run(feeds.make_idea(GID)) is None
 
         assert models.calls == []  # 堆积了就不发模型调用
         assert topics.calls == []
-        assert store.read().execute("SELECT COUNT(*) c FROM ideas").fetchone()["c"] == 3
+        assert store.read().execute("SELECT COUNT(*) c FROM ideas").fetchone()["c"] == 2
         # pending 安全：只读不改，没被顺手覆盖
         row = _row(store, pending)
         assert row["state"] == "pending"
         assert float(row["updated"]) == pytest.approx(NOW - 100)
 
-    def test_pile_gate_boundary_two_unhandled_still_creates(self, tmp_path) -> None:
+    def test_pile_gate_boundary_one_unhandled_still_creates(self, tmp_path) -> None:
         models = FakeModelsQueue(ready=True, replies=[_IDEA_PLAIN])
         store, feeds, models, topics = _feeds(tmp_path, models=models, cfg=_SERVED)
         _seed_idea(store, title="甲", created=NOW - 3600)
-        _seed_idea(store, title="乙", state="wanted", created=NOW - 3600)
 
         got = _run(feeds.make_idea(GID))
 
@@ -470,10 +478,10 @@ class TestMakeIdeaFewAndGood:
         assert isinstance(_run(feeds.make_idea(GID)), int)
 
     def test_idea_room_matches_pile_gate(self, tmp_path) -> None:
-        """app 排程到点先问 idea_room：和堆积闸同一口径（满 3 条没位子；腾出一条就有）。"""
+        """app 排程到点先问 idea_room：和堆积闸同一口径（满 2 条没位子；腾出一条就有）。"""
         store, feeds, models, topics = _feeds(tmp_path, cfg=_SERVED)
         assert feeds.idea_room(GID) is True
-        ids = [_seed_idea(store, title=f"占位{i}", created=NOW - 60) for i in range(3)]
+        ids = [_seed_idea(store, title=f"占位{i}", created=NOW - 60) for i in range(2)]
         _seed_idea(store, title="个人", created=NOW - 60, target_user_id="u1")
         assert feeds.idea_room(GID) is False
         with store.tx() as conn:
