@@ -4,7 +4,7 @@
 // 本群做法：MaiWork 从验收和反馈里总结，每个岗位一份 + 通用执行按「一类活」积累；可改、锁定、回退、归档。
 import { state, $ } from "../state.js";
 import { api } from "../api.js";
-import { esc, toast, SVG } from "../util.js";
+import { esc, tip, toast, SVG } from "../util.js";
 
 export const RULES_MAX = 3000;
 export const SKILL_DESC_MAX = 120;
@@ -12,8 +12,8 @@ export const SKILL_NAME_MAX = 40;
 export const skillBodyMax = (kind) => (kind === "task" ? 4000 : 2500);
 const KIND_ORDER = ["news", "idea", "goal", "task"];
 const KIND_TITLES = { news: "资讯", idea: "构想", goal: "目标", task: "通用执行" };
-const SOURCES = { auto: "MaiWork 改的", admin: "你改的", rollback: "回退的", migrate: "旧设置迁来" };
-const WHO = { admin: "网页改的", migrate: "旧设置迁来", admin_chat: "聊天里记的" };
+const SOURCES = { auto: "MaiWork 修改", admin: "管理员修改", rollback: "版本回退", migrate: "从旧设置迁移" };
+const WHO = { admin: "网页修改", migrate: "从旧设置迁移", admin_chat: "聊天中记录" };
 const shortDay = (ts) => (ts ? new Date(ts * 1000).toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" }) : "");
 const longTime = (ts) => new Date((ts || 0) * 1000).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
 const enc = encodeURIComponent;
@@ -58,7 +58,7 @@ function ctxInner() {
   const c = state.gctx;
   if (!c) return "";
   if (c.error) return `<p class="err" role="alert">${esc(c.error)}</p><button class="btn small" data-act="gctx-reload">刷新</button>`;
-  if (c.rules == null) return `<p class="fine">读取中…</p>`;
+  if (c.rules == null) return `<p class="fine">加载中…</p>`;
   return rulesBlock(c) + skillsBlock(c);
 }
 
@@ -77,21 +77,20 @@ function rulesBlock(c) {
   const meta = r.updated ? `${shortDay(r.updated)} ${WHO[r.updated_by] || ""}`.trim() : "";
   let inner;
   if (c.edit === "rules") {
-    inner = `<label class="fine" for="gctx-rules">本群规矩</label>
-      <textarea id="gctx-rules" rows="8" maxlength="${RULES_MAX}" aria-describedby="gctx-rules-help gctx-rules-err" placeholder="比如：少点手机评测，多找开源硬件">${esc(draft(c, "gctx-rules", body))}</textarea>
-      <p class="fine" id="gctx-rules-help">MaiWork 只照做不改；最多 ${RULES_MAX} 字</p>
+    inner = `<label class="fine" for="gctx-rules">本群规则</label>
+      <textarea id="gctx-rules" rows="8" maxlength="${RULES_MAX}" aria-describedby="gctx-rules-help gctx-rules-err" placeholder="例如：减少手机评测，多关注开源硬件">${esc(draft(c, "gctx-rules", body))}</textarea>
+      <p class="fine" id="gctx-rules-help">最多 ${RULES_MAX} 字</p>
       <p class="err" id="gctx-rules-err" role="alert" hidden></p>
       <div class="actions"><button class="btn small primary" data-act="gctx-rules-save" data-g="${esc(c.gid)}">保存</button><button class="btn small" data-act="gctx-cancel">取消</button></div>`;
   } else {
     const histOpen = c.hist && c.hist.id === "rules";
     inner = `<div class="pf skill">
-        <div>${body ? `<div class="skill-body">${esc(body)}</div>` : `<p class="fine">还没有。写下本群必须照做的事</p>`}${meta ? `<div class="pf-meta">${esc(meta)}</div>` : ""}</div>
-        <div class="pf-acts"><button type="button" class="btn small" data-act="gctx-hist" data-id="rules" data-g="${esc(c.gid)}" aria-expanded="${histOpen ? "true" : "false"}">历史</button><button type="button" class="icon-btn" data-act="gctx-rules-edit" aria-label="${body ? "修改" : "写规矩"}" title="${body ? "修改" : "写规矩"}">${SVG.pen}</button></div>
+        <div>${body ? `<div class="skill-body">${esc(body)}</div>` : `<p class="fine">暂无规则</p>`}${meta ? `<div class="pf-meta">${esc(meta)}</div>` : ""}</div>
+        <div class="pf-acts"><button type="button" class="btn small" data-act="gctx-hist" data-id="rules" data-g="${esc(c.gid)}" aria-expanded="${histOpen ? "true" : "false"}">历史</button><button type="button" class="icon-btn" data-act="gctx-rules-edit" aria-label="${body ? "修改" : "填写规则"}" title="${body ? "修改" : "填写规则"}">${SVG.pen}</button></div>
       </div>${histOpen ? historyBlock(c, "rules") : ""}`;
   }
   return `<div class="skills gctx-rules">
-    <div class="pf-name">本群规矩</div>
-    <p class="fine">必须照做；和做法冲突时听这里的</p>
+    <div class="pf-name">本群规则${tip("MaiWork 必须遵守的规则，只由管理员修改。与「本群做法」冲突时，以规则为准。")}</div>
     ${inner}
   </div>`;
 }
@@ -104,8 +103,7 @@ function skillsBlock(c) {
   const all = c.skills || [];
   const kinds = [...KIND_ORDER, ...[...new Set(all.map((s) => s.kind))].filter((k) => !KIND_ORDER.includes(k) && k !== "main")];
   return `<div class="gctx-skills">
-    <div class="pf-name">本群做法</div>
-    <p class="fine">MaiWork 自己总结的经验，可改可锁</p>
+    <div class="pf-name">本群做法${tip("MaiWork 根据反馈总结的工作方法，可修改或锁定；锁定后 MaiWork 不再自动修改。")}</div>
     ${kinds.map((k) => (k === "task" ? taskBlock(c, all.filter((s) => s.kind === "task")) : agentBlock(c, k, all.filter((s) => s.kind === k)))).join("")}
   </div>`;
 }
@@ -117,13 +115,13 @@ function skillForm(c, kind, s) {
   const max = skillBodyMax(kind);
   const ph = task ? "做法：\n1. 先……\n   - 注意：……（因为……）\n2. 再……" : "做法：\n1. 先……\n   - 注意：……（因为……）\n偏好：……";
   return `<div class="skill-form" data-kind="${k}" data-id="${esc(id)}">
-    ${task ? `<label class="fine" for="gctx-name-${k}">名称（一类活）</label>
-    <input id="gctx-name-${k}" maxlength="${SKILL_NAME_MAX}" aria-describedby="gctx-err-${k}" value="${esc(draft(c, `gctx-name-${kind}`, (s && s.name) || ""))}" placeholder="如：整理群活动报名表"${s ? " disabled" : ""} />
-    <label class="fine" for="gctx-desc-${k}">何时用</label>
-    <input id="gctx-desc-${k}" maxlength="${SKILL_DESC_MAX}" aria-describedby="gctx-err-${k}" value="${esc(draft(c, `gctx-desc-${kind}`, (s && s.description) || ""))}" placeholder="如：整理报名表的时候" />` : ""}
+    ${task ? `<label class="fine" for="gctx-name-${k}">名称（任务类型）</label>
+    <input id="gctx-name-${k}" maxlength="${SKILL_NAME_MAX}" aria-describedby="gctx-err-${k}" value="${esc(draft(c, `gctx-name-${kind}`, (s && s.name) || ""))}" placeholder="例如：整理群活动报名表"${s ? " disabled" : ""} />
+    <label class="fine" for="gctx-desc-${k}">适用场景</label>
+    <input id="gctx-desc-${k}" maxlength="${SKILL_DESC_MAX}" aria-describedby="gctx-err-${k}" value="${esc(draft(c, `gctx-desc-${kind}`, (s && s.description) || ""))}" placeholder="例如：整理报名表时" />` : ""}
     <label class="fine" for="gctx-body-${k}">做法</label>
     <textarea id="gctx-body-${k}" rows="10" maxlength="${max}" aria-describedby="gctx-help-${k} gctx-err-${k}" placeholder="${esc(ph)}">${esc(draft(c, `gctx-body-${kind}`, (s && s.body) || ""))}</textarea>
-    <p class="fine" id="gctx-help-${k}">按步骤写，附一句为什么；最多 ${max} 字</p>
+    <p class="fine" id="gctx-help-${k}">按步骤填写并说明原因，最多 ${max} 字</p>
     <p class="err" id="gctx-err-${k}" role="alert" hidden></p>
     <div class="actions"><button class="btn small primary" data-act="gctx-skill-save" data-kind="${k}" data-id="${esc(id)}" data-g="${esc(c.gid)}">保存</button><button class="btn small" data-act="gctx-cancel">取消</button></div>
   </div>`;
@@ -133,8 +131,8 @@ function skillMeta(kind, s) {
   return [
     s.locked ? "已锁定" : "",
     s.status === "archived" ? "已归档" : "",
-    kind === "task" ? `用过 ${Number(s.uses) || 0} 次` : "",
-    s.updated ? `${shortDay(s.updated)} 改过` : "",
+    kind === "task" ? `已使用 ${Number(s.uses) || 0} 次` : "",
+    s.updated ? `${shortDay(s.updated)} 修改` : "",
   ].filter(Boolean).join(" · ");
 }
 
@@ -150,12 +148,12 @@ function skillActions(c, kind, s) {
 function historyBlock(c, kind, s) {
   const h = c.hist;
   if (h.error) return `<p class="err" role="alert">${esc(h.error)}</p>`;
-  if (!h.versions) return `<p class="fine">读取中…</p>`;
-  if (!h.versions.length) return `<p class="fine">没有旧版本</p>`;
+  if (!h.versions) return `<p class="fine">加载中…</p>`;
+  if (!h.versions.length) return `<p class="fine">暂无历史版本</p>`;
   const rules = kind === "rules";
   return `<div class="skill-hist">${h.versions.map((v) => `<details><summary>${esc(longTime(v.ts))} · ${esc(rules ? WHO[v.updated_by] || v.updated_by || "" : SOURCES[v.source] || v.source || "")}${v.note ? ` · ${esc(v.note)}` : ""}</summary>
     <div class="skill-body">${esc(v.body || "") || `<span class="fine">（空）</span>`}</div>
-    <div class="actions"><button class="btn small" data-act="gctx-restore" data-kind="${esc(kind)}" data-id="${esc(rules ? "rules" : String(s.id))}" data-vid="${esc(String(v.id))}" data-g="${esc(c.gid)}">用这一版</button></div>
+    <div class="actions"><button class="btn small" data-act="gctx-restore" data-kind="${esc(kind)}" data-id="${esc(rules ? "rules" : String(s.id))}" data-vid="${esc(String(v.id))}" data-g="${esc(c.gid)}">恢复此版本</button></div>
   </details>`).join("")}</div>`;
 }
 
@@ -169,7 +167,7 @@ function agentBlock(c, kind, list) {
       <div><div class="skill-body">${esc(s.body || "") || `<span class="fine">（空）</span>`}</div><div class="pf-meta">${esc(skillMeta(kind, s))}</div></div>
       <div class="pf-acts">${skillActions(c, kind, s)}</div>
     </div>${c.hist && String(c.hist.id) === String(s.id) ? historyBlock(c, kind, s) : ""}`;
-  else inner = `<p class="fine">还没有，有反馈后次日开始写</p><div class="actions"><button class="btn small" data-act="gctx-skill-add" data-kind="${esc(kind)}">自己写</button></div>`;
+  else inner = `<p class="fine">暂无。收到反馈后，次日开始自动整理</p><div class="actions"><button class="btn small" data-act="gctx-skill-add" data-kind="${esc(kind)}">手动填写</button></div>`;
   return `<div class="skills"><div class="set-name">${esc(titleOf(kind))}</div>${inner}</div>`;
 }
 
@@ -193,11 +191,10 @@ function taskBlock(c, all) {
   const archived = all.filter((s) => s.status === "archived");
   const adding = c.edit && c.edit.kind === "task" && c.edit.id === "new";
   return `<div class="skills">
-    <div class="set-name">做事经验 · ${active.length}${adding ? "" : `<button type="button" class="pf-add" data-act="gctx-skill-add" data-kind="task" aria-label="新建">${SVG.plus}</button>`}</div>
-    <p class="fine">做完难活会记下方法；30 天不用自动归档</p>
+    <div class="set-name">工作经验 · ${active.length}${tip("完成较复杂的任务后，MaiWork 会记录方法；30 天未使用将自动归档。")}${adding ? "" : `<button type="button" class="pf-add" data-act="gctx-skill-add" data-kind="task" aria-label="新建">${SVG.plus}</button>`}</div>
     ${adding ? skillForm(c, "task", null) : ""}
-    ${active.map((s) => taskRow(c, s)).join("") || (adding ? "" : `<p class="fine">还没有</p>`)}
-    ${archived.length ? `<details><summary>已归档 · ${archived.length}</summary><p class="fine">不再使用，可恢复</p>${archived.map((s) => taskRow(c, s)).join("")}</details>` : ""}
+    ${active.map((s) => taskRow(c, s)).join("") || (adding ? "" : `<p class="fine">暂无</p>`)}
+    ${archived.length ? `<details><summary>已归档 · ${archived.length}</summary>${archived.map((s) => taskRow(c, s)).join("")}</details>` : ""}
   </div>`;
 }
 
@@ -271,7 +268,7 @@ export async function actCtx(action, el) {
       clearFormError("rules");
       const body = (($("gctx-rules") || {}).value || "").trim();
       if (body.length > RULES_MAX) return formError("rules", `最多 ${RULES_MAX} 字。`, "gctx-rules"), true;
-      return write(el, c, "PUT", rulesUrl(c.gid), { body }, body ? "已保存，下次照做" : "已清空", (out) => (c.rules = out), "rules");
+      return write(el, c, "PUT", rulesUrl(c.gid), { body }, body ? "已保存，下次运行时生效" : "已清空", (out) => (c.rules = out), "rules");
     }
     case "gctx-skill-save": {
       if (!sameGroup(el)) return true;
@@ -281,15 +278,15 @@ export async function actCtx(action, el) {
       const name = task ? (($(`gctx-name-${kind}`) || {}).value || "").trim() : "";
       const description = task ? (($(`gctx-desc-${kind}`) || {}).value || "").trim() : "";
       const max = skillBodyMax(kind);
-      if (task && isNew && !name) return formError(kind, "请填名称", `gctx-name-${kind}`), true;
-      if (task && !description) return formError(kind, "请写何时用", `gctx-desc-${kind}`), true;
-      if (!body) return formError(kind, "请写做法", `gctx-body-${kind}`), true;
+      if (task && isNew && !name) return formError(kind, "请填写名称", `gctx-name-${kind}`), true;
+      if (task && !description) return formError(kind, "请填写适用场景", `gctx-desc-${kind}`), true;
+      if (!body) return formError(kind, "请填写做法", `gctx-body-${kind}`), true;
       if (body.length > max) return formError(kind, `做法最多 ${max} 字。`, `gctx-body-${kind}`), true;
       if (name.length > SKILL_NAME_MAX) return formError(kind, `名称最多 ${SKILL_NAME_MAX} 字。`, `gctx-name-${kind}`), true;
-      if (description.length > SKILL_DESC_MAX) return formError(kind, `「何时用」最多 ${SKILL_DESC_MAX} 字。`, `gctx-desc-${kind}`), true;
+      if (description.length > SKILL_DESC_MAX) return formError(kind, `「适用场景」最多 ${SKILL_DESC_MAX} 字。`, `gctx-desc-${kind}`), true;
       const payload = isNew ? (task ? { kind, name, description, body } : { kind, body }) : task ? { description, body } : { body };
       return write(el, c, isNew ? "POST" : "PATCH", skillsUrl(c.gid, isNew ? null : d.id), payload,
-        isNew ? "已保存，下次会参考" : "已保存，旧版在「历史」", (out) => replaceKind(c, kind, out.skills), kind);
+        isNew ? "已保存，下次运行时参考" : "已保存，旧版本可在「历史」中查看", (out) => replaceKind(c, kind, out.skills), kind);
     }
     case "gctx-skill-lock": {
       if (!sameGroup(el)) return true;
@@ -303,8 +300,8 @@ export async function actCtx(action, el) {
     }
     case "gctx-skill-del": {
       if (!sameGroup(el)) return true;
-      if (!confirm("删掉？连历史一起删、找不回；只是不想用可「归档」")) return true;
-      return write(el, c, "DELETE", skillsUrl(c.gid, d.id), undefined, "删掉了", (out) => replaceKind(c, d.kind, out.skills));
+      if (!confirm("确定删除？历史版本将一并删除且无法恢复。如只是暂不使用，可选择「归档」。")) return true;
+      return write(el, c, "DELETE", skillsUrl(c.gid, d.id), undefined, "已删除", (out) => replaceKind(c, d.kind, out.skills));
     }
     case "gctx-hist": {
       if (c.hist && String(c.hist.id) === String(d.id)) { c.hist = null; repaintCtx(); return true; }
@@ -324,9 +321,9 @@ export async function actCtx(action, el) {
     }
     case "gctx-restore": {
       if (!sameGroup(el)) return true;
-      if (!confirm("换成这一版？当前内容会先存一版")) return true;
-      if (d.id === "rules") return write(el, c, "POST", rulesUrl(c.gid, `/versions/${enc(d.vid)}/restore`), {}, "已换回", (out) => (c.rules = out));
-      return write(el, c, "POST", skillsUrl(c.gid, d.id, `/versions/${enc(d.vid)}/restore`), {}, "已换回", (out) => replaceKind(c, d.kind, out.skills));
+      if (!confirm("恢复到此版本？当前内容将先保存为一个历史版本。")) return true;
+      if (d.id === "rules") return write(el, c, "POST", rulesUrl(c.gid, `/versions/${enc(d.vid)}/restore`), {}, "已恢复", (out) => (c.rules = out));
+      return write(el, c, "POST", skillsUrl(c.gid, d.id, `/versions/${enc(d.vid)}/restore`), {}, "已恢复", (out) => replaceKind(c, d.kind, out.skills));
     }
     default: return false;
   }

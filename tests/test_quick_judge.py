@@ -571,7 +571,7 @@ class TestModelChoice:
         assert kw["purpose"] == "intake.quick_judge"
         assert kw["group_id"] == G1
         assert kw["retries"] == 1
-        assert kw["max_tokens"] == 600
+        assert "max_tokens" not in kw  # 思考和答案共用额度，沿用模型条目配置
         assert kw["timeout"] == 60
         assert kw["effort"] == "low"
         assert isinstance(kw["messages"], list) and len(kw["messages"]) >= 2
@@ -918,6 +918,49 @@ def _models_cfg(*entries) -> dict:
 
 
 class TestModelsEffortAndEntry:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route", ["main", "explicit", "backup"])
+    async def test_quick_judge_uses_each_model_output_limit(self, tmp_path, route) -> None:
+        bodies: list[dict] = []
+        cfg = _models_cfg(
+            {"id": "m1", "endpoint": "e1", "model": "m-main", "max_tokens": 8192},
+            {"id": "m2", "endpoint": "e1", "model": "m-backup", "max_tokens": 16384},
+            {"id": "q1", "endpoint": "e1", "model": "m-quick", "max_tokens": 32768},
+        )
+        cfg["endpoints"][0]["retry_delay_s"] = 1
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            bodies.append(body)
+            # 模拟思考模型：额度太小只思考不出答案；备用场景让主模型始终为空。
+            empty = body["max_tokens"] <= 600 or (route == "backup" and body["model"] == "m-main")
+            return httpx.Response(200, json={
+                "choices": [{"index": 0, "message": {
+                    "role": "assistant",
+                    "content": "" if empty else _one("prepare", 0.95, "整理记录"),
+                }, "finish_reason": "length" if empty else "stop"}],
+                "usage": {},
+            })
+
+        models = _real_models(tmp_path, cfg, handler, agents=_Agents({
+            "main": {"model": "m1", "backup": "m2"},
+        }))
+        qj, _, rec = _make_qj(models=models, model="q1" if route == "explicit" else "")
+        try:
+            qj.enqueue(G1, _item())
+            await asyncio.wait_for(qj.join(), 5)
+            expected = {
+                "main": [("m-main", 8192)],
+                "explicit": [("m-quick", 32768)],
+                "backup": [("m-main", 8192), ("m-main", 8192), ("m-backup", 16384)],
+            }[route]
+            assert [(b["model"], b["max_tokens"]) for b in bodies] == expected
+            assert len(rec.requests) == 1
+            assert rec.slows == []
+        finally:
+            await qj.close()
+            await models.close()
+
     def test_candidates_for_entry(self, tmp_path) -> None:
         cfg = _models_cfg({"id": "q1", "endpoint": "e1", "model": "quick-model", "efforts": ["low"]})
         models = _real_models(tmp_path, cfg, _ok_handler([]))

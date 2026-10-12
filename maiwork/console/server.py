@@ -1310,6 +1310,7 @@ class ConsoleServer:
                 "url": str(p.url), "model": str(p.model),
                 "models": [str(x) for x in (getattr(p, "models", ()) or ())],
                 "docs_url": str(p.docs_url), "key_url": str(p.key_url), "note": str(p.note),
+                "logo": f"/static/assets/logos/jev/{p.id}.png",  # 出处见 assets/logos/jev/SOURCES.md
             }
 
         def _jev_entry_dict(ep: Any) -> dict[str, Any]:

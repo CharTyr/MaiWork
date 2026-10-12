@@ -49,7 +49,7 @@ def render_js(tmp_path, target, **cfg):
 @pytest.mark.parametrize("role", ["admin", "group_admin", "member"])
 def test_capability_pause_shows_reason_not_false_time_limit(tmp_path, role):
     html = render_js(tmp_path, "detail.js", role=role)["html"]
-    assert "工具不足，先别开工" in html and "为什么停了" in html
+    assert "工具不足，先别开工" in html and "暂停原因" in html
     assert "时长上限" not in html and "任务安全网" not in html
     if role != "member":
         assert "继续" in html and "取消" in html
@@ -64,7 +64,9 @@ def test_onboarding_only_saves_web_password(tmp_path):
     out = render_js(tmp_path, "onboarding.js")
     assert out["error"] == ""
     assert out["calls"] == [{"method": "PUT", "url": "/api/groups/g1/group-admin", "body": {"password": "local-only-password"}}]
-    assert "旧批准名单编辑器" not in out["html"] and "群页" in out["html"]
+    assert "旧批准名单编辑器" not in out["html"]
+    # 「审批名单在群页面设置」收进 ⓘ 提示（本测试的 util 桩不渲染提示，直接看源码）
+    assert "群页面的「任务审批」" in (JS / "onboarding.js").read_text(encoding="utf-8")
     assert "读不到配置" not in out["html"]
 
 

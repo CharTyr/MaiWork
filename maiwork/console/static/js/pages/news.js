@@ -23,20 +23,20 @@ export function fbButtons(kind, it) {
   const f = it.feedback || {};
   return `<span class="fb">
     <button data-act="fb" data-kind="${kind}" data-id="${it.id}" data-v="up" aria-pressed="${mine === "up"}" aria-label="有用">${SVG.up}${f.up ? `<i>${f.up}</i>` : ""}</button>
-    <button data-act="fb" data-kind="${kind}" data-id="${it.id}" data-v="down" aria-pressed="${mine === "down"}" aria-label="没用">${SVG.dn}${f.down ? `<i>${f.down}</i>` : ""}</button>
+    <button data-act="fb" data-kind="${kind}" data-id="${it.id}" data-v="down" aria-pressed="${mine === "down"}" aria-label="无用">${SVG.dn}${f.down ? `<i>${f.down}</i>` : ""}</button>
   </span>`;
 }
 
 function newsStatus(s) {
   s = s || {};
   const k = s.kind || "new";
-  if (k === "used") return `${when(s.at)} 拿去开话题了${s.replies ? ` · ${s.replies} 人接` : " · 没人接"}`;
-  if (k === "pool") return s.expires_ts ? `留着开话题 · 还剩 ${dur(s.expires_ts - now())}` : "留着开话题";
-  if (k === "expired") return "没等到时机，过期了";
-  return "新到";
+  if (k === "used") return `${when(s.at)} 已用于开启话题${s.replies ? ` · ${s.replies} 人回应` : " · 无人回应"}`;
+  if (k === "pool") return s.expires_ts ? `保留用于开启话题 · 剩余 ${dur(s.expires_ts - now())}` : "保留用于开启话题";
+  if (k === "expired") return "未找到合适时机，已过期";
+  return "新资讯";
 }
 
-const SCORE_NAMES = [["info", "干货"], ["source", "来源"], ["relevance", "相关"], ["timeliness", "新鲜"], ["chat", "好聊"]];
+const SCORE_NAMES = [["info", "信息量"], ["source", "来源"], ["relevance", "相关性"], ["timeliness", "时效性"], ["chat", "话题性"]];
 
 function verifyBlock(v) {
   if (!v || !v.status) return "";
@@ -44,7 +44,7 @@ function verifyBlock(v) {
   const steps = (v.steps || []).slice(0, 4);
   return `
     <div class="verify ${ok ? "ok" : "bad"}">
-      <div class="verify-head">${ico("testtube", "")}${ok ? "实测能跑" : "实测没跑通"}${v.minutes ? `<span> · 花了 ${v.minutes} 分钟</span>` : ""}</div>
+      <div class="verify-head">${ico("testtube", "")}${ok ? "实测可运行" : "实测未通过"}${v.minutes ? `<span> · 耗时 ${v.minutes} 分钟</span>` : ""}</div>
       ${v.summary ? `<div class="verify-text">${esc(v.summary)}</div>` : ""}
       ${steps.length ? `<ol class="verify-steps">${steps.map((x) => `<li>${esc(x)}</li>`).join("")}</ol>` : ""}
     </div>`;
@@ -59,7 +59,7 @@ function reasonBlock(it) {
   const open = !!reasonOpen[it.id];
   return `
     <details class="reason" data-rid="${esc(it.id)}"${open ? " open" : ""}>
-      <summary class="reason-h">为什么推这条</summary>
+      <summary class="reason-h">推荐理由</summary>
       ${reason ? `<p class="reason-t">${esc(reason)}</p>` : ""}
       ${
         refs.length
@@ -68,8 +68,8 @@ function reasonBlock(it) {
               .join("")}</div>`
           : ""
       }
-      ${aud.length ? `<div class="aud">可能用得上：${aud.map((n) => `<b>${esc(n)}</b>`).join("、")}</div>` : ""}
-      ${it.profile_ref ? `<div class="aud">因为群里关心「${esc(it.profile_ref)}」</div>` : ""}
+      ${aud.length ? `<div class="aud">可能需要：${aud.map((n) => `<b>${esc(n)}</b>`).join("、")}</div>` : ""}
+      ${it.profile_ref ? `<div class="aud">与群内关注的「${esc(it.profile_ref)}」相关</div>` : ""}
     </details>`;
 }
 const reasonOpen = {};
@@ -85,11 +85,11 @@ document.addEventListener(
 // 资讯评价（2026-09-29 取代「想在群里聊」气泡）：挑理由 + 可选一句话，下一轮找资讯照着改
 export const RATE_KEY = "mw-rate";
 export const RATE_REASONS = [
-  ["old", "太旧"],
-  ["useless", "没用"],
+  ["old", "过时"],
+  ["useless", "无用"],
   ["low", "质量差"],
   ["offtopic", "不相关"],
-  ["dup", "发过了"],
+  ["dup", "重复"],
   ["wrong", "不准确"],
 ];
 export const myRates = () => {
@@ -126,7 +126,7 @@ function ratingsBlock(it) {
     .map(([k, n]) => `<span class="ntag warn">${esc(reasonName(k))} ×${n}</span>`)
     .join("");
   const notes = (r.notes || []).slice(0, 3).map((n) => `<div class="rating-note">「${esc(n)}」</div>`).join("");
-  return `<div class="ratings"><div class="ratings-h">${r.total} 人评价过</div>${counts ? `<div class="ntags">${counts}</div>` : ""}${notes}</div>`;
+  return `<div class="ratings"><div class="ratings-h">${r.total} 人已评价</div>${counts ? `<div class="ntags">${counts}</div>` : ""}${notes}</div>`;
 }
 
 function newsItem(it, i, guide) {
@@ -138,7 +138,7 @@ function newsItem(it, i, guide) {
     it.angle === "diverse" ? `<span class="ntag alt">新角度</span>` : "",
     it.angle === "explore" ? `<span class="ntag ex">延伸</span>` : "",
     it.sensitive ? `<span class="ntag warn">有争议</span>` : "",
-    it.verify && it.verify.status === "passed" ? `<span class="ntag ok">实测过</span>` : "",
+    it.verify && it.verify.status === "passed" ? `<span class="ntag ok">已实测</span>` : "",
     admin() && sc && Number(sc.avg) > 0 ? `<span class="ntag score" title="${SCORE_NAMES.map(([k, n]) => `${n} ${sc[k] ?? "-"}`).join(" · ")}">${Number(sc.avg).toFixed(1)} 分</span>` : "",
   ].join("");
   const img = it.image_url && /^https?:\/\//i.test(it.image_url)
@@ -152,7 +152,7 @@ function newsItem(it, i, guide) {
       <div>
         ${tags ? `<div class="ntags">${tags}</div>` : ""}
         <h2 class="item-title">${esc(it.title)}</h2>
-        ${it.followup ? `<p class="n-bridge n-fu"><span aria-hidden="true">↻</span>${it.followup.of_title ? `接上条「${esc(it.followup.of_title)}」：` : ""}${esc(it.followup.new_fact || "")}</p>` : ""}
+        ${it.followup ? `<p class="n-bridge n-fu"><span aria-hidden="true">↻</span>${it.followup.of_title ? `续「${esc(it.followup.of_title)}」：` : ""}${esc(it.followup.new_fact || "")}</p>` : ""}
         ${it.bridge && it.angle === "explore" ? `<p class="n-bridge"><span aria-hidden="true">↳</span>${esc(it.bridge)}</p>` : ""}
         <p class="item-body">${richText(it.body || it.summary)}</p>
         ${img}
@@ -169,7 +169,7 @@ function newsItem(it, i, guide) {
         <div class="status">
           <span class="dot ${esc((it.status || {}).kind || "")}"></span>
           <span class="status-text">${esc(guide ? guideStatus(it) : newsStatus(it.status))}</span>
-          <button class="ratebtn" data-act="rate-open" data-id="${it.id}" aria-pressed="${rated}" title="哪里不好？">${SVG.pen}<i>${rated ? "已评价" : "评价"}</i></button>
+          <button class="ratebtn" data-act="rate-open" data-id="${it.id}" aria-pressed="${rated}" title="评价">${SVG.pen}<i>${rated ? "已评价" : "评价"}</i></button>
           ${fbButtons("news", it)}
         </div>
       </div>
@@ -219,21 +219,21 @@ window.addEventListener("message", (e) => {
 
 function guideStatus(it) {
   const when_ = it.published_ts ? `${dayWord(it.published_ts)}发布 · ` : "";
-  return `${when_}${it.created_ts ? dayWord(it.created_ts) + "找到" : "已复查"}`;
+  return `${when_}${it.created_ts ? dayWord(it.created_ts) + "收录" : "已复查"}`;
 }
 
 // 每轮找资讯的账：有统计就说搜了几次、看了几篇、收了几条；老数据没统计按旧说法
 function batchStats(batch) {
   const st = batch.stats;
   const f = st && st.funnel;
-  if (f && typeof f === "object") return `搜 ${f.queries || st.searches || 0} 次 · 看 ${f.opened || st.pages || 0} 篇 · 留 ${st.kept || 0} 条`;
-  if (st && typeof st === "object") return `搜 ${st.searches || 0} 次 · 看 ${st.pages || 0} 篇 · 留 ${st.kept || 0} 条`;
-  return `找 ${batch.found || 0} 条 · 留 ${batch.kept || 0} 条`;
+  if (f && typeof f === "object") return `搜索 ${f.queries || st.searches || 0} 次 · 阅读 ${f.opened || st.pages || 0} 篇 · 收录 ${st.kept || 0} 条`;
+  if (st && typeof st === "object") return `搜索 ${st.searches || 0} 次 · 阅读 ${st.pages || 0} 篇 · 收录 ${st.kept || 0} 条`;
+  return `找到 ${batch.found || 0} 条 · 收录 ${batch.kept || 0} 条`;
 }
 
 // 这一轮怎么找的（两段式才有，只给管理员）：漏斗每步剩多少 + 各关注点 + 各家搜索服务 + 预筛刷掉的原因 + 各段耗时
-const FUNNEL_STEPS = [["queries", "搜索"], ["discovered", "线索"], ["prefiltered", "初筛后"], ["picked", "挑中"], ["opened", "打开了"], ["returned", "看过"], ["kept", "上网页"]];
-const TIMING_NAMES = { discover: "广撒网", floor: "补搜", prefilter: "初筛", pick: "挑选", verify: "打开看" };
+const FUNNEL_STEPS = [["queries", "搜索"], ["discovered", "线索"], ["prefiltered", "初筛后"], ["picked", "选中"], ["opened", "打开"], ["returned", "阅读"], ["kept", "收录"]];
+const TIMING_NAMES = { discover: "广泛搜索", floor: "补充搜索", prefilter: "初筛", pick: "挑选", verify: "核实内容" };
 const secs = (v) => {
   const s = Math.max(0, Math.round(Number(v) || 0));
   return s < 60 ? `${s} 秒` : `${(s / 60).toFixed(1)} 分钟`;
@@ -243,15 +243,15 @@ function usageLine(batch) {
   const u = batch.stats && batch.stats.usage;
   if (!u || typeof u !== "object") return "";
   const kept = (batch.stats && batch.stats.kept != null ? batch.stats.kept : 0) || batch.kept || 0;
-  let s = `这轮用量 ${tokens(u.reported || 0)} tokens`;
-  if (u.cache_read) s += `（其中缓存读 ${tokens(u.cache_read)}）`;
-  if (u.unknown_calls) s += `；有 ${u.unknown_calls} 次没报用量`;
+  let s = `本轮用量 ${tokens(u.reported || 0)} tokens`;
+  if (u.cache_read) s += `（其中缓存命中 ${tokens(u.cache_read)}）`;
+  if (u.unknown_calls) s += `；${u.unknown_calls} 次调用未返回用量`;
   if (kept > 0) s += `；入选 ${kept} 条，平均每条约 ${tokens(Math.round((u.reported || 0) / kept))}`;
   return s;
 }
 
 // 中文 / 外文各多少（资讯偏中文的整改，docs/18）：问法按 zh/en，线索和上网页按 zh/foreign；旧批次没有就不显示
-const LANG_ROWS = [["query_langs", "搜的词", "en", "英文"], ["discovered_langs", "线索", "foreign", "外文"], ["kept_langs", "上网页", "foreign", "外文"]];
+const LANG_ROWS = [["query_langs", "搜索词", "en", "英文"], ["discovered_langs", "线索", "foreign", "外文"], ["kept_langs", "收录", "foreign", "外文"]];
 export function langMix(f) {
   if (!f || typeof f !== "object") return "";
   return LANG_ROWS.map(([key, name, other, otherName]) => {
@@ -271,7 +271,7 @@ function funnelBlock(batch) {
   const kept = batch.stats.kept != null ? batch.stats.kept : f.kept;
   const steps = FUNNEL_STEPS.map(([k, n]) => [n, k === "kept" ? kept : f[k]]).filter(([, v]) => v != null);
   const kv = (obj) => Object.entries(obj || {}).filter(([, v]) => v != null);
-  const perFocus = (f.per_focus || []).map((x) => `<div class="fn-row"><span class="fn-q">${esc(x.query || "")}</span><span class="fn-n">搜 ${x.queries || 0} 次 · ${x.cands || 0} 条线索</span></div>`).join("");
+  const perFocus = (f.per_focus || []).map((x) => `<div class="fn-row"><span class="fn-q">${esc(x.query || "")}</span><span class="fn-n">搜索 ${x.queries || 0} 次 · ${x.cands || 0} 条线索</span></div>`).join("");
   const provs = kv(f.providers).map(([k, v]) => `<span class="ntag">${esc(k)} ${v}</span>`).join("");
   const rejects = kv(f.rejects).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<span class="ntag warn">${esc(k)} ${v}</span>`).join("");
   const times = kv(f.timings_s).map(([k, v]) => `<span class="ntag">${esc(TIMING_NAMES[k] || k)} ${secs(v)}</span>`).join("");
@@ -280,7 +280,7 @@ function funnelBlock(batch) {
   return `
     <div class="rej funnel">
       <button class="rej-head" data-act="funnel-toggle" data-id="${batch.id}" aria-expanded="${open}">
-        这轮怎么找的 <span class="rej-hint">${steps.map(([, v]) => v || 0).join(" → ")}</span>${SVG.down}
+        本轮搜集过程 <span class="rej-hint">${steps.map(([, v]) => v || 0).join(" → ")}</span>${SVG.down}
       </button>
       ${
         open
@@ -289,7 +289,7 @@ function funnelBlock(batch) {
           ${perFocus ? `<div class="fn-h">按关注点</div>${perFocus}` : ""}
           ${langs ? `<div class="fn-h">中外来源</div>${langs}` : ""}
           ${provs ? `<div class="fn-h">按搜索服务</div><div class="fn-tags">${provs}</div>` : ""}
-          ${rejects ? `<div class="fn-h">初筛刷掉的</div><div class="fn-tags">${rejects}</div>` : ""}
+          ${rejects ? `<div class="fn-h">初筛淘汰</div><div class="fn-tags">${rejects}</div>` : ""}
           ${times ? `<div class="fn-h">各步耗时</div><div class="fn-tags">${times}</div>` : ""}
           ${usageTxt ? `<div class="fn-h">模型用量</div><p class="fine" style="margin:0">${esc(usageTxt)}</p>` : ""}
         </div>`
@@ -305,7 +305,7 @@ function rejectedBlock(batch) {
   return `
     <div class="rej">
       <button class="rej-head" data-act="rej-toggle" data-id="${batch.id}" aria-expanded="${open}">
-        筛掉的 ${list.length} 条 <span class="rej-hint">仅你可见</span>${SVG.down}
+        已淘汰 ${list.length} 条 <span class="rej-hint">仅管理员可见</span>${SVG.down}
       </button>
       ${
         open
@@ -315,8 +315,8 @@ function rejectedBlock(batch) {
           <div class="rej-row">
             <div class="rej-main">
               <a href="${safeUrl(r.url)}" target="_blank" rel="noopener noreferrer" class="rej-title">${esc(r.title || r.url)}</a>
-              <div class="rej-why"><span class="ntag ${r.gate === "hard" || r.gate === "score" ? "warn" : ""}">${r.gate === "hard" ? "直接淘汰" : r.gate === "score" ? "没打分" : "分不够"}</span>${esc(r.reason || "")}${r.avg != null ? ` · ${Number(r.avg).toFixed(1)} 分` : ""}</div>
-              ${r.src && r.src.query ? `<div class="rej-src">搜「${esc(r.src.query)}」得到${r.src.provider ? ` · ${esc(r.src.provider)}` : ""}</div>` : ""}
+              <div class="rej-why"><span class="ntag ${r.gate === "hard" || r.gate === "score" ? "warn" : ""}">${r.gate === "hard" ? "直接淘汰" : r.gate === "score" ? "未评分" : "分数不足"}</span>${esc(r.reason || "")}${r.avg != null ? ` · ${Number(r.avg).toFixed(1)} 分` : ""}</div>
+              ${r.src && r.src.query ? `<div class="rej-src">来自搜索「${esc(r.src.query)}」${r.src.provider ? ` · ${esc(r.src.provider)}` : ""}</div>` : ""}
             </div>
             ${r.site ? `<button class="btn small" data-act="block-domain" data-domain="${esc(r.site)}">屏蔽 ${esc(r.site)}</button>` : ""}
           </div>`
@@ -330,7 +330,7 @@ function rejectedBlock(batch) {
 function newsRunBtn() {
   if (!gadmin()) return "";
   const running = state.newsRunning === state.g;
-  return `<button class="btn small news-run" data-act="news-run" ${running ? "disabled" : ""}>${running ? "正在找…" : "现在找一批"}</button>`;
+  return `<button class="btn small news-run" data-act="news-run" ${running ? "disabled" : ""}>${running ? "正在搜集…" : "立即搜集"}</button>`;
 }
 
 function newsSwitch() {
@@ -343,17 +343,17 @@ function newsSwitch() {
 
 export function viewNews(g, v) {
   if (g.fresh) {
-    return `<h1 class="h-page h-fish">${agentFish("news", 44)}<span>资讯</span></h1>` + emptyState("seedling", "正在了解这个群", "了解后就开始找资讯");
+    return `<h1 class="h-page h-fish">${agentFish("news", 44)}<span>资讯</span></h1>` + emptyState("seedling", "正在建立群画像", "建立后将开始搜集资讯");
   }
   if ((state.newsTab || "news") === "guides") {
     const guides = (v && v.guides) || [];
-    let html = newsSwitch() + `<h1 class="h-page">文章</h1><p class="h-meta">教程、好文章和好工具</p>`;
-    if (!guides.length) return html + emptyState("books", "还没有文章", "");
+    let html = newsSwitch() + `<h1 class="h-page">文章</h1><p class="h-meta">教程、文章和工具</p>`;
+    if (!guides.length) return html + emptyState("books", "暂无文章", "");
     return html + guides.map((it, k) => newsItem(it, k, true)).join("");
   }
   const news = (v && v.news) || [];
   if (!news.length) {
-    return newsSwitch() + `<h1 class="h-page h-fish">${agentFish("news", 44)}<span>资讯</span></h1>` + emptyState("newspaper", "还没有资讯", "");
+    return newsSwitch() + `<h1 class="h-page h-fish">${agentFish("news", 44)}<span>资讯</span></h1>` + emptyState("newspaper", "暂无资讯", "");
   }
   let i = 0;
   return (
@@ -361,13 +361,13 @@ export function viewNews(g, v) {
     news
       .map((batch, b) => {
         const rc = batch.rejected_count || 0;
-        const head = `<h1 class="h-page${b ? "" : " h-fish"}" ${b ? 'style="margin-top:46px"' : ""}>${b ? "" : agentFish("news", 44)}<span>${esc(slotName(batch.slot_ts))}</span></h1><p class="h-meta">${hhmm(batch.slot_ts)} 找资讯 · ${batchStats(batch)}${rc ? ` · 筛掉 ${rc} 条` : ""}</p>`;
+        const head = `<h1 class="h-page${b ? "" : " h-fish"}" ${b ? 'style="margin-top:46px"' : ""}>${b ? "" : agentFish("news", 44)}<span>${esc(slotName(batch.slot_ts))}</span></h1><p class="h-meta">${hhmm(batch.slot_ts)} 搜集 · ${batchStats(batch)}${rc ? ` · 淘汰 ${rc} 条` : ""}</p>`;
         if (batch.skipped || !(batch.items || []).length) {
           // 收了东西但资讯栏是空的：收的都是文章，指过去，别说「没有值得看的」
           const got = Number((batch.stats && batch.stats.kept) || batch.kept || 0);
           const note = got > 0
-            ? `${ico("books")}<span>另有 ${got} 篇在「文章」里</span><button class="btn small" data-act="news-tab" data-t="guides">去看</button>`
-            : `${ico("teacup")}<span>${esc(batch.note || "这批没有好的，跳过了")}</span>`;
+            ? `${ico("books")}<span>另有 ${got} 篇已收录至「文章」</span><button class="btn small" data-act="news-tab" data-t="guides">查看</button>`
+            : `${ico("teacup")}<span>${esc(batch.note || "本轮无合适资讯，已跳过")}</span>`;
           return head + `<div class="skipped enter${got > 0 ? " to-guides" : ""}" style="--i:${i++}">${note}</div>` + funnelBlock(batch) + rejectedBlock(batch);
         }
         return head + batch.items.map((it) => newsItem(it, i++, false)).join("") + funnelBlock(batch) + rejectedBlock(batch);

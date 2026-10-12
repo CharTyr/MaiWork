@@ -13,7 +13,7 @@ export async function api(method, path, body) {
   try {
     res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), credentials: "same-origin" });
   } catch (e) {
-    throw new Error("连不上，请检查网络");
+    throw new Error("无法连接，请检查网络");
   }
   let data = null;
   try {
@@ -22,7 +22,7 @@ export async function api(method, path, body) {
     /* 空响应 */
   }
   if (!res.ok) {
-    const err = new Error((data && data.error) || `出错了（${res.status}）`);
+    const err = new Error((data && data.error) || `请求失败（${res.status}）`);
     err.status = res.status;
     throw err;
   }
@@ -52,10 +52,10 @@ export const mq = (text) => `<span class="mq" title="${esc(text)}"><span class="
 export function quiet(g) {
   if (!g) return { text: "", usual: "", live: false };
   const q = g.quiet || {};
-  if (g.fresh) return { text: "正在了解这个群", usual: g.read_since ? `已读 ${dur(now() - g.read_since)}的聊天记录` : "刚开始读聊天记录", live: false };
-  if (!q.last_msg_ts) return { text: "还没收到消息", usual: "", live: false };
+  if (g.fresh) return { text: "正在建立群画像", usual: g.read_since ? `已读取 ${dur(now() - g.read_since)}的聊天记录` : "开始读取聊天记录", live: false };
+  if (!q.last_msg_ts) return { text: "暂未收到消息", usual: "", live: false };
   const gap = now() - q.last_msg_ts;
-  const usual = q.usual_gap_s ? `平时这个点 ${dur(q.usual_gap_s)}一条` : "";
-  if (gap < 300) return { text: "有人在聊", usual, live: true };
-  return { text: `安静 ${dur(gap)}`, usual, live: true };
+  const usual = q.usual_gap_s ? `该时段平均 ${dur(q.usual_gap_s)}一条` : "";
+  if (gap < 300) return { text: "正在聊天", usual, live: true };
+  return { text: `已静默 ${dur(gap)}`, usual, live: true };
 }

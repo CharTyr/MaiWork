@@ -10,32 +10,32 @@ export const TABS = [
   { id: "group", label: "群" },
 ];
 export const STATUS = {
-  pending_approval: "等批准",
+  pending_approval: "待审批",
   queued: "排队中",
   running: "进行中",
-  waiting_input: "等回复",
-  shelved: "先放着",
+  waiting_input: "等待回复",
+  shelved: "已搁置",
   reviewing: "检查中",
   completed: "已完成",
-  failed: "没做成",
-  paused: "暂停",
+  failed: "失败",
+  paused: "已暂停",
   cancelled: "已取消",
-  rejected: "没批准",
+  rejected: "未通过审批",
 };
 export const DOT = { waiting_input: "waiting", shelved: "", completed: "done", paused: "", cancelled: "", rejected: "failed" };
 const ACTIVE = ["running", "reviewing", "queued"];
 export const FILTERS = [
   { id: "all", label: "全部", match: () => true },
   { id: "active", label: "进行中", match: (t) => ACTIVE.includes(t.status) },
-  { id: "waiting", label: "等回复", match: (t) => ["waiting_input", "shelved", "paused"].includes(t.status) },
+  { id: "waiting", label: "等待中", match: (t) => ["waiting_input", "shelved", "paused"].includes(t.status) },
   { id: "done", label: "已完成", match: (t) => t.status === "completed" },
-  { id: "failed", label: "没做成", match: (t) => ["failed", "cancelled", "rejected"].includes(t.status) },
+  { id: "failed", label: "未完成", match: (t) => ["failed", "cancelled", "rejected"].includes(t.status) },
 ];
 export const CATS = [
-  ["recent", "最近在聊"],
+  ["recent", "近期话题"],
   ["interest", "长期爱好"],
-  ["ongoing", "在忙什么"],
-  ["convention", "约定和说法"],
+  ["ongoing", "近期事务"],
+  ["convention", "约定与用语"],
   ["resource", "常用资源"],
 ];
 export const TONES = ["#FFD8A8", "#D0BFFF", "#A5D8FF", "#B2F2BB", "#FFC9C9", "#FFEC99", "#C3FAE8", "#EEBEFA"];

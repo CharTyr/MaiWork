@@ -111,7 +111,7 @@ function chatToolMsg(m) {
     <div class="cm-tool ${ok ? "" : "bad"}${asked ? " asked" : ""}${asked && !waiting ? " done" : ""}">
       <button class="cm-tool-h" data-act="chat-tool" data-id="${m.id}" aria-expanded="${!!open}">
         <span class="dot ${asked && waiting ? "pending" : asked ? "" : ok ? "ok" : "failed"}"></span>
-        <span class="cm-tool-l">${esc(meta.label || m.name || "用了工具")}</span>${asked ? `<span class="cm-tool-s">${waiting ? "等你确认" : "已问过"}</span>` : ""}
+        <span class="cm-tool-l">${esc(meta.label || m.name || "调用工具")}</span>${asked ? `<span class="cm-tool-s">${waiting ? "待确认" : "已请求确认"}</span>` : ""}
         ${SVG.down}
       </button>
       ${open ? `<pre class="lm-text">${esc(m.content || "")}</pre>` : ""}
@@ -154,21 +154,21 @@ function pendingCard(p) {
       <div class="cm-pending-t">${esc(p.summary || p.tool)}</div>
       ${
         p.args && Object.keys(p.args).length
-          ? `<details class="cm-pending-d"><summary>看细节</summary><pre class="lm-text">${esc(JSON.stringify(p.args, null, 2))}</pre></details>`
+          ? `<details class="cm-pending-d"><summary>查看详情</summary><pre class="lm-text">${esc(JSON.stringify(p.args, null, 2))}</pre></details>`
           : ""
       }
       <div class="actions">
         <button class="btn primary small" data-act="chat-confirm" data-id="${p.id}" data-ok="1">确认</button>
-        <button class="btn small" data-act="chat-confirm" data-id="${p.id}" data-ok="0">不要</button>
+        <button class="btn small" data-act="chat-confirm" data-id="${p.id}" data-ok="0">拒绝</button>
       </div>
     </div>`;
 }
 
 const CHAT_SUGGEST = [
-  "这几个群最近怎么样？",
-  "今天资讯怎么这么少？",
-  "把 19:00 找资讯改到 20:30",
-  "帮我留意群里谁问 NAS",
+  "各群最近的情况如何？",
+  "今天的资讯为什么较少？",
+  "将 19:00 的资讯搜集改到 20:30",
+  "留意群内询问 NAS 的成员",
 ];
 
 function chatStream() {
@@ -179,7 +179,7 @@ function chatStream() {
   const empty = !C.messages.length
     ? `<div class="chat-empty">
         <img src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="" />
-        <p>想做什么，直接说</p>
+        <p>请输入需要处理的事项</p>
         <div class="chat-sugs">${CHAT_SUGGEST.map((t) => `<button class="btn small" data-act="chat-suggest" data-t="${esc(t)}">${esc(t)}</button>`).join("")}</div>
       </div>`
     : "";
@@ -197,20 +197,20 @@ export function chatPage() {
       <div class="chat-tools">
         ${
           C
-            ? `<select class="chat-group" data-act="chat-group" aria-label="聊哪个群">
+            ? `<select class="chat-group" data-act="chat-group" aria-label="选择群">
                 <option value="">所有群</option>
                 ${groups.map((g) => `<option value="${esc(g.id)}" ${info.group_id === g.id ? "selected" : ""}>${esc(gname(g))}</option>`).join("")}
               </select>`
             : ""
         }
-        ${C && C.messages.length ? `<button class="btn small" data-act="chat-compact" title="整理成摘要，省用量不忘事">压缩对话</button>` : ""}
+        ${C && C.messages.length ? `<button class="btn small" data-act="chat-compact" title="将历史消息整理为摘要，以减少用量">压缩对话</button>` : ""}
         <button class="btn small chat-list-btn" data-act="chat-list">对话</button>
         <button class="btn small" data-act="chat-new">新对话</button>
       </div>
     </div>
     <div class="chat-stream" id="chat-stream">${C ? chatStream() : loading()}</div>
     <form id="chat-form" class="chat-composer" autocomplete="off">
-      <textarea id="chat-input" rows="1" placeholder="说点什么…" ${C && C.running ? "" : ""}></textarea>
+      <textarea id="chat-input" rows="1" placeholder="输入消息…" ${C && C.running ? "" : ""}></textarea>
       <button class="chat-send" type="submit" aria-label="发送" ${C && C.running ? "disabled" : ""}>${SVG.send || "↑"}</button>
     </form>`;
 }
@@ -230,7 +230,7 @@ export function chatSide() {
         </button>`
             )
             .join("")
-        : `<p class="h-meta">还没有对话</p>`
+        : `<p class="h-meta">暂无对话</p>`
     }`;
 }
 

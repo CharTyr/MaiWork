@@ -1,6 +1,6 @@
 // MaiWork 网页 · 设置 ·「扩展」：MCP、技能、联网搜索。
 import { state } from "../state.js";
-import { SVG, dayWord, esc, ico, toast } from "../util.js";
+import { SVG, dayWord, esc, ico, tip, tipLabel, toast } from "../util.js";
 import { api } from "../api.js";
 import { loading } from "../pages/news.js";
 
@@ -16,17 +16,16 @@ export function extPage() {
   const pasting = ed && ed.kind === "mcp-paste";
   const newSkill = ed && ed.kind === "skill" && !ed.name;
   return `
-    <p class="h-meta">给 MaiWork 加工具和做事说明</p>
     ${searchCard()}
-    <div class="h-sub-row"><h2 class="h-sub">MCP</h2>${newMcp || pasting ? "" : `<span class="row-btns"><button class="btn small" data-act="mcp-paste">粘贴配置</button><button class="btn small" data-act="ext-new" data-kind="mcp">添加</button></span>`}</div>
+    <div class="h-sub-row"><h2 class="h-sub">MCP${tip("MCP 服务为 MaiWork 提供外部工具，例如搜索、读取网页。仅支持远程（https）服务。")}</h2>${newMcp || pasting ? "" : `<span class="row-btns"><button class="btn small" data-act="mcp-paste">粘贴配置</button><button class="btn small" data-act="ext-new" data-kind="mcp">添加</button></span>`}</div>
     ${pasting ? mcpPasteForm() : ""}
     ${newMcp ? mcpForm(null) : ""}
     ${mcp.map((m) => (ed && ed.kind === "mcp" && ed.name === m.name ? mcpForm(m) : mcpRow(m))).join("")}
     ${presetsNotAdded().map(presetRow).join("")}
-    ${!mcp.length && !presetsNotAdded().length && !newMcp ? `<p class="h-meta">还没有</p>` : ""}
-    <div class="h-sub-row"><h2 class="h-sub">skill</h2>${newSkill ? "" : `<span class="row-btns"><label class="btn small file-btn">上传 zip<input type="file" id="skill-zip" accept=".zip,application/zip" hidden /></label><button class="btn small" data-act="ext-new" data-kind="skill">添加</button></span>`}</div>
+    ${!mcp.length && !presetsNotAdded().length && !newMcp ? `<p class="h-meta">暂无</p>` : ""}
+    <div class="h-sub-row"><h2 class="h-sub">skill${tip("skill 是给模型的操作说明，例如某类工作的做法和注意事项。模型会根据「简介」决定何时使用。")}</h2>${newSkill ? "" : `<span class="row-btns"><label class="btn small file-btn">上传 zip<input type="file" id="skill-zip" accept=".zip,application/zip" hidden /></label><button class="btn small" data-act="ext-new" data-kind="skill">添加</button></span>`}</div>
     ${newSkill ? skillForm(null) : ""}
-    ${skills.length ? skills.map((k) => (ed && ed.kind === "skill" && ed.name === k.name ? skillForm(k) : skillRow(k))).join("") : newSkill ? "" : `<p class="h-meta">还没有</p>`}`;
+    ${skills.length ? skills.map((k) => (ed && ed.kind === "skill" && ed.name === k.name ? skillForm(k) : skillRow(k))).join("") : newSkill ? "" : `<p class="h-meta">暂无</p>`}`;
 }
 
 // 联网搜索：从已接的 MCP 里挑一个工具来用（后端 GET/PUT/DELETE /api/extensions/search）。
@@ -38,8 +37,8 @@ function searchCard() {
   const st = sx.status || {};
   const cands = (sx.candidates || []).filter((c) => (c.tools || []).length);
   const editing = state.searchEdit || !b;
-  const head = `<div class="h-sub-row"><h2 class="h-sub">联网搜索</h2>${!editing ? `<span class="row-btns"><button class="btn small" data-act="search-edit">更换</button></span>` : ""}</div>`;
-  const stLine = `<div class="set-text ext-st"><span class="dot ${st.ok ? "ok" : b ? "failed" : ""}"></span>${esc(b ? st.text || "" : "还没选")}</div>`;
+  const head = `<div class="h-sub-row"><h2 class="h-sub">联网搜索${tip("选择用于联网搜索的服务和工具。搜索偏好可写入 AGENTS.md。")}</h2>${!editing ? `<span class="row-btns"><button class="btn small" data-act="search-edit">更换</button></span>` : ""}</div>`;
+  const stLine = `<div class="set-text ext-st"><span class="dot ${st.ok ? "ok" : b ? "failed" : ""}"></span>${esc(b ? st.text || "" : "未设置")}</div>`;
   if (!editing) {
     const exMcp = b.extract_mcp || b.mcp;
     return `${head}
@@ -47,15 +46,14 @@ function searchCard() {
         ${presetByEntry(b.mcp) ? logoImg(presetByEntry(b.mcp)) : ico("magnifier")}
         <div class="ext-main">
           <div class="set-name">${esc(labelOf(b.mcp))} · <span class="mono">${esc(b.tool)}</span></div>
-          ${b.extract_tool ? `<div class="set-text">读网页：${esc(exMcp)} · <span class="mono">${esc(b.extract_tool)}</span></div>` : ""}
+          ${b.extract_tool ? `<div class="set-text">网页读取：${esc(exMcp)} · <span class="mono">${esc(b.extract_tool)}</span></div>` : ""}
           ${extraProviders(b)}
           ${stLine}
         </div>
-      </div>
-      <p class="fine search-agents">搜索习惯可写进 AGENTS.md</p>`;
+      </div>`;
   }
   if (!cands.length) {
-    return `${head}${stLine}<p class="h-meta">先在下面开一个搜索，如 Keenable（免费）</p>`;
+    return `${head}${stLine}<p class="h-meta">请先在下方开启一个搜索服务</p>`;
   }
   const all = cands.flatMap((c) => c.tools.map((t) => ({ mcp: c.mcp, ...t })));
   const pick = b ? all.find((t) => t.mcp === b.mcp && t.name === b.tool) : all.find((t) => t.guess === "search") || all[0];
@@ -66,20 +64,20 @@ function searchCard() {
   const same = (t, p) => !!p && t.mcp === p.mcp && t.name === p.name;
   // 扩展名和工具名分开放在 data-* 里（别拼成一个值：HTML 属性里的 NUL 会被浏览器换掉，拆不开）
   const opt = (t, sel, hint) =>
-    `<option value="${esc(t.mcp + " · " + t.name)}" data-mcp="${esc(t.mcp)}" data-tool="${esc(t.name)}" ${sel ? "selected" : ""}>${esc(t.mcp)} · ${esc(t.name)}${t.guess === hint ? (hint === "search" ? "（搜索类）" : "（读网页类）") : ""}</option>`;
+    `<option value="${esc(t.mcp + " · " + t.name)}" data-mcp="${esc(t.mcp)}" data-tool="${esc(t.name)}" ${sel ? "selected" : ""}>${esc(t.mcp)} · ${esc(t.name)}${t.guess === hint ? (hint === "search" ? "（搜索）" : "（网页读取）") : ""}</option>`;
   return `${head}${b ? stLine : ""}
     <div class="login ext-form search-form">
-      <label for="sx-tool">用谁搜索</label>
+      <label for="sx-tool">搜索工具</label>
       <select id="sx-tool">${all.map((t) => opt(t, same(t, pick), "search")).join("")}</select>
-      <label for="sx-extract">读网页 <span class="fine-inline">可选，可换一家</span></label>
-      <select id="sx-extract"><option value="" ${exPick ? "" : "selected"}>不用</option>${all.map((t) => opt(t, same(t, exPick), "extract")).join("")}</select>
-      <label>备用 <span class="fine-inline">主搜索不行时依次换</span></label>
+      ${tipLabel("sx-extract", "网页读取工具（可选）", "用于读取网页正文，可以与搜索工具来自不同服务。")}
+      <select id="sx-extract"><option value="" ${exPick ? "" : "selected"}>不使用</option>${all.map((t) => opt(t, same(t, exPick), "extract")).join("")}</select>
+      <div class="lbl-row"><label>备用服务</label>${tip("主搜索服务不可用时，按顺序改用这些服务。")}</div>
       ${providerChecks("sx-fb", b && b.fallback, "")}
-      <label>一起搜 <span class="fine-inline">找资讯时多搜几家，次数翻倍</span></label>
+      <div class="lbl-row"><label>同时搜索</label>${tip("搜集资讯时同时使用这些服务，可提高覆盖面，搜索次数会相应增加。")}</div>
       ${providerChecks("sx-br", b && b.broad, "")}
       <div class="actions">
-        <button class="btn primary" data-act="search-save">就用它</button>
-        ${b ? `<button class="btn" data-act="search-cancel">取消</button><button class="btn danger" data-act="search-off">不联网搜索</button>` : ""}
+        <button class="btn primary" data-act="search-save">保存</button>
+        ${b ? `<button class="btn" data-act="search-cancel">取消</button><button class="btn danger" data-act="search-off">关闭联网搜索</button>` : ""}
       </div>
     </div>`;
 }
@@ -91,7 +89,7 @@ function searchRoleTags(name) {
   if (!b) return "";
   const out = [];
   if ((b.fallback || []).includes(name)) out.push(`<span class="tag">备用</span>`);
-  if ((b.broad || []).includes(name)) out.push(`<span class="tag">一起搜</span>`);
+  if ((b.broad || []).includes(name)) out.push(`<span class="tag">同时搜索</span>`);
   return out.join("");
 }
 const enabledPresets = () => presetList().filter((p) => p.entry && p.enabled);
@@ -102,11 +100,11 @@ const labelOf = (name) => {
 function extraProviders(b) {
   const fb = (b.fallback || []).map(labelOf);
   const br = (b.broad || []).map(labelOf);
-  return `${fb.length ? `<div class="set-text">备用：${esc(fb.join("、"))}</div>` : ""}${br.length ? `<div class="set-text">一起搜：${esc(br.join("、"))}</div>` : ""}`;
+  return `${fb.length ? `<div class="set-text">备用服务：${esc(fb.join("、"))}</div>` : ""}${br.length ? `<div class="set-text">同时搜索：${esc(br.join("、"))}</div>` : ""}`;
 }
 function providerChecks(cls, picked, hint) {
   const list = enabledPresets();
-  if (!list.length) return `<p class="fine" style="margin:0">先在下面开几个搜索服务</p>`;
+  if (!list.length) return `<p class="fine" style="margin:0">暂无已开启的搜索服务</p>`;
   return `<div class="prov-checks">${list
     .map(
       (p) =>
@@ -130,7 +128,7 @@ const presetList = () => (state.extPresets && state.extPresets.presets) || [];
 export const presetByEntry = (name) => presetList().find((p) => p.entry === name) || null;
 const presetsNotAdded = () => presetList().filter((p) => !p.entry);
 const logoImg = (p, cls = "ico ext-logo") => `<img class="${cls}" src="${esc(p.logo)}" alt="" loading="lazy" />`;
-const freeTag = (p) => (p.free ? `<span class="ntag ok">免费可用</span>` : `<span class="ntag warn">要密钥</span>`);
+const freeTag = (p) => (p.free ? `<span class="ntag ok">免费可用</span>` : `<span class="ntag warn">需要密钥</span>`);
 
 function presetRow(p) {
   const editing = state.presetEdit === p.id;
@@ -143,24 +141,24 @@ function presetRow(p) {
         <div class="set-text ext-st"><span class="dot"></span>未开启 · 搜索服务</div>
         ${editing ? presetKeyForm(p) : ""}
       </div>
-      <div class="row-btns ext-btns">${editing ? "" : `<button class="btn small" data-act="preset-open" data-id="${esc(p.id)}">${p.free ? "开启" : "填密钥开启"}</button>`}</div>
+      <div class="row-btns ext-btns">${editing ? "" : `<button class="btn small" data-act="preset-open" data-id="${esc(p.id)}">${p.free ? "开启" : "填写密钥并开启"}</button>`}</div>
     </div>`;
 }
 
 // 填密钥的小表单：已接上的改密钥 / 没接上的打开时填（免费的可以不填）
 function presetKeyForm(p) {
   const added = !!p.entry;
-  const ph = p.key_set ? "已填，留空不改" : p.free ? "可不填，用免费额度" : "粘贴密钥";
+  const ph = p.key_set ? "已填写，留空则不修改" : p.free ? "可留空，使用免费额度" : "输入密钥";
   return `
     <div class="preset-form login" data-id="${esc(p.id)}">
       <label for="pk-key">API 密钥 ${p.free ? `<small class="lbl-hint">可选</small>` : ""}</label>
       <input id="pk-key" type="password" autocomplete="new-password" spellcheck="false" placeholder="${esc(ph)}" />
-      <p class="fine preset-get"><a href="${esc(p.key_page_url)}" target="_blank" rel="noopener noreferrer">去 ${esc(p.label)} 官网拿密钥 ↗</a></p>
+      <p class="fine preset-get"><a href="${esc(p.key_page_url)}" target="_blank" rel="noopener noreferrer">前往 ${esc(p.label)} 官网获取密钥 ↗</a></p>
       <p class="err" id="pk-err" hidden></p>
       <div class="actions">
         <button type="button" class="btn primary small" data-act="preset-save" data-id="${esc(p.id)}">${added ? "保存" : "开启"}</button>
         <button type="button" class="btn small" data-act="preset-cancel">取消</button>
-        ${added && p.free && p.key_set ? `<button type="button" class="btn small ghost" data-act="preset-clear-key" data-id="${esc(p.id)}">不用密钥</button>` : ""}
+        ${added && p.free && p.key_set ? `<button type="button" class="btn small ghost" data-act="preset-clear-key" data-id="${esc(p.id)}">清除密钥</button>` : ""}
       </div>
     </div>`;
 }
@@ -168,18 +166,18 @@ function presetKeyForm(p) {
 function mcpRow(m) {
   const p = presetByEntry(m.name);
   const st = !m.enabled
-    ? `<span class="dot"></span>已关`
+    ? `<span class="dot"></span>已关闭`
     : m.ok
-      ? `<span class="dot ok"></span>已连上 · ${m.tools || 0} 个工具`
-      : `<span class="dot failed"></span>没连上：${esc(m.error || "")}`;
+      ? `<span class="dot ok"></span>已连接 · ${m.tools || 0} 个工具`
+      : `<span class="dot failed"></span>连接失败：${esc(m.error || "")}`;
   const roles = roleText(m.roles);
   const hdrs = (m.header_names || []).length ? ` · 请求头 ${m.header_names.map(esc).join("、")}` : "";
   return `
     <div class="ext-row${p ? " preset-row" : ""}">
       ${p ? logoImg(p) : ico("link")}
       <div class="ext-main">
-        <div class="set-name">${p ? esc(p.label) : esc(m.name)}${p ? `<span class="tag">预设</span>` : ""}${m.source === "config" ? `<span class="tag">来自配置</span>` : ""}${m.search_role === "search" ? `<span class="tag">搜索</span>` : m.search_role === "extract" ? `<span class="tag">读网页</span>` : ""}${searchRoleTags(m.name)}</div>
-        ${p ? `<div class="set-text">${p.key_set ? "自带密钥" : esc(p.free_note || "")}</div>` : `<div class="set-text mono-link">${esc(m.url || "")}</div>`}
+        <div class="set-name">${p ? esc(p.label) : esc(m.name)}${p ? `<span class="tag">预设</span>` : ""}${m.source === "config" ? `<span class="tag">来自配置</span>` : ""}${m.search_role === "search" ? `<span class="tag">搜索</span>` : m.search_role === "extract" ? `<span class="tag">网页读取</span>` : ""}${searchRoleTags(m.name)}</div>
+        ${p ? `<div class="set-text">${p.key_set ? "已填写密钥" : esc(p.free_note || "")}</div>` : `<div class="set-text mono-link">${esc(m.url || "")}</div>`}
         <div class="set-text ext-st">${st} · ${esc(roles)}可用${p ? "" : hdrs}</div>
         ${p && state.presetEdit === p.id ? presetKeyForm(p) : ""}
         ${
@@ -190,7 +188,7 @@ function mcpRow(m) {
       </div>
       <div class="row-btns ext-btns">
         <button class="btn small" data-act="mcp-toggle" data-name="${esc(m.name)}" data-on="${m.enabled ? "0" : "1"}">${m.enabled ? "关闭" : "开启"}</button>
-        ${m.enabled ? `<button class="btn small" data-act="mcp-reload" data-name="${esc(m.name)}">重连</button>` : ""}
+        ${m.enabled ? `<button class="btn small" data-act="mcp-reload" data-name="${esc(m.name)}">重新连接</button>` : ""}
         ${p && m.source !== "config" && state.presetEdit !== p.id ? `<button class="btn small" data-act="preset-open" data-id="${esc(p.id)}">密钥</button>` : ""}
         ${m.source === "config" ? "" : `<button class="btn small" data-act="ext-edit" data-kind="mcp" data-name="${esc(m.name)}">修改</button>`}
       </div>
@@ -200,8 +198,7 @@ function mcpRow(m) {
 function mcpPasteForm() {
   return `
     <form id="mcp-paste-form" class="login ext-form" autocomplete="off">
-      <div class="ext-form-h">粘贴 MCP 配置</div>
-      <p class="fine" style="margin:0">支持常见格式，仅远程（http / sse）</p>
+      <div class="ext-form-h">粘贴 MCP 配置${tip("支持常见的 MCP 配置格式，仅限远程服务（http / sse）。")}</div>
       <textarea id="mp-text" class="mono-area" rows="9" spellcheck="false" placeholder='{"mcpServers": {"tavily": {"type": "http", "url": "https://…/mcp", "headers": {"Authorization": "Bearer …"}}}}'></textarea>
       <p class="err" id="mp-err" hidden></p>
       <div class="actions">
@@ -221,10 +218,10 @@ export function parseMcpConfig(text) {
     try {
       data = JSON.parse(`{${text.trim().replace(/,\s*$/, "")}}`);
     } catch (e2) {
-      throw new Error("格式不对，检查括号和逗号。");
+      throw new Error("格式不正确，请检查括号和逗号。");
     }
   }
-  if (!data || typeof data !== "object") throw new Error("没识别出配置。");
+  if (!data || typeof data !== "object") throw new Error("未识别到配置。");
   const isServer = (o) => o && typeof o === "object" && (o.url || o.serverUrl || o.command);
   let entries;
   if (isServer(data)) entries = [["", data]];
@@ -232,7 +229,7 @@ export function parseMcpConfig(text) {
     const map = data.mcpServers || data.servers || (data.mcp && data.mcp.servers) || data;
     entries = Object.entries(map).filter(([, v]) => isServer(v));
   }
-  if (!entries.length) throw new Error("没找到地址（url）。");
+  if (!entries.length) throw new Error("未找到地址（url）。");
   const slug = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32);
   return entries.map(([key, v]) => {
     const url = String(v.url || v.serverUrl || "");
@@ -244,7 +241,7 @@ export function parseMcpConfig(text) {
       } catch (e) {}
     }
     if (v.command) return { name: name || "mcp", skipped: "不支持本地命令" };
-    if (!/^https:\/\//i.test(url)) return { name: name || "mcp", skipped: "不是 https 地址" };
+    if (!/^https:\/\//i.test(url)) return { name: name || "mcp", skipped: "非 https 地址" };
     const headers = {};
     Object.entries(v.headers || v.requestInit?.headers || {}).forEach(([k, val]) => {
       if (typeof val === "string") headers[k] = val;
@@ -254,7 +251,7 @@ export function parseMcpConfig(text) {
 }
 
 // 给谁用：三选一（主模型 / 子 agent / 两边都能用）
-const ROLE_PICKS = [["main", "仅主模型", "聊天和检查时用"], ["worker", "仅子 agent", "干活时用"], ["both", "都能用", ""]];
+const ROLE_PICKS = [["main", "仅主模型", "用于对话和检查"], ["worker", "仅子 agent", "用于执行任务"], ["both", "全部", ""]];
 const rolePick = (roles) => {
   roles = roles && roles.length ? roles : ["worker"];
   return roles.includes("main") && roles.includes("worker") ? "both" : roles.includes("main") ? "main" : "worker";
@@ -270,8 +267,8 @@ function roleChecks(prefix, roles) {
 export function headerRow(name, isOld, value) {
   return `
     <div class="hdr-row" data-old="${isOld ? "1" : "0"}">
-      <input class="hdr-name" spellcheck="false" placeholder="名称，如 Authorization" value="${esc(name || "")}" ${isOld ? "readonly" : ""} />
-      <input class="hdr-val" type="password" autocomplete="new-password" placeholder="${isOld ? "已填，留空不改" : "值，如 Bearer …"}" value="${esc(value || "")}" />
+      <input class="hdr-name" spellcheck="false" placeholder="名称，例如 Authorization" value="${esc(name || "")}" ${isOld ? "readonly" : ""} />
+      <input class="hdr-val" type="password" autocomplete="new-password" placeholder="${isOld ? "已填写，留空则不修改" : "值，例如 Bearer …"}" value="${esc(value || "")}" />
       <button type="button" class="icon-btn" data-act="hdr-del" aria-label="删除">${SVG.trash}</button>
     </div>`;
 }
@@ -284,19 +281,19 @@ function mcpForm(m) {
     <form id="mcp-form" class="login ext-form" autocomplete="off" data-name="${esc(isNew ? "" : m.name)}">
       <div class="ext-form-h">${isNew ? "添加 MCP" : `修改 ${esc(m.name)}`}</div>
       ${pre ? `` : ""}
-      ${isNew ? `<label for="x-name">名称</label><input id="x-name" spellcheck="false" placeholder="字母数字和 _ -，如 github" value="${esc(m.name || "")}" />` : ""}
+      ${isNew ? `<label for="x-name">名称</label><input id="x-name" spellcheck="false" placeholder="字母、数字、_ 或 -，例如 github" value="${esc(m.name || "")}" />` : ""}
       <label for="x-url">地址</label>
       <input id="x-url" type="url" inputmode="url" spellcheck="false" value="${esc(m.url || "")}" placeholder="https://…/mcp" />
-      <label>请求头 <small class="lbl-hint">保存后不再显示</small></label>
+      <div class="lbl-row"><label>请求头</label>${tip("请求头的值保存后不再显示。")}</div>
       <div id="x-hdrs">${isNew ? Object.entries(m.headers || {}).map(([h, v]) => headerRow(h, false, v)).join("") : (m.header_names || []).map((h) => headerRow(h, true)).join("")}</div>
       <button type="button" class="btn small" data-act="hdr-add" style="align-self:flex-start">添加请求头</button>
-      <label for="x-tools">限定工具 <small class="lbl-hint">空着 = 全部，逗号隔开</small></label>
+      ${tipLabel("x-tools", "限定工具", "留空表示使用全部工具；多个工具用逗号分隔。")}
       <input id="x-tools" spellcheck="false" value="${esc((m.tools_filter || []).join(", "))}" />
-      <label>给谁用</label>
+      <label>使用范围</label>
       ${roleChecks("x", m.roles)}
-      <label for="x-timeout">超时秒数</label>
+      <label for="x-timeout">超时（秒）</label>
       <input id="x-timeout" type="number" min="5" max="300" value="${esc(m.timeout_s || 30)}" />
-      <label class="chk"><input type="checkbox" id="x-enabled" ${m.enabled !== false ? "checked" : ""} />开启</label>
+      <label class="chk"><input type="checkbox" id="x-enabled" ${m.enabled !== false ? "checked" : ""} />启用</label>
       <div class="actions"><button type="button" class="btn" data-act="mcp-test">测试连接</button><span class="fine" id="x-check" style="margin:0;align-self:center"></span></div>
       <p class="err" id="x-err" hidden></p>
       <div class="actions">
@@ -316,9 +313,9 @@ function skillRow(k) {
     <div class="ext-row">
       ${ico("books")}
       <div class="ext-main">
-        <div class="set-name">${esc(k.name)}${k.source === "file" ? `<span class="tag">服务器上的</span>` : k.source === "builtin" ? `<span class="tag">内置</span>` : ""}</div>
-        <div class="set-text">${esc(k.description || "没有描述")}</div>
-        <div class="set-text ext-st"><span class="dot ${active ? "ok" : ""}"></span>${esc(status)} · ${esc(roles)}可用${k.updated_ts ? ` · ${esc(dayWord(k.updated_ts))}改过` : ""}</div>
+        <div class="set-name">${esc(k.name)}${k.source === "file" ? `<span class="tag">服务器文件</span>` : k.source === "builtin" ? `<span class="tag">内置</span>` : ""}</div>
+        <div class="set-text">${esc(k.description || "无简介")}</div>
+        <div class="set-text ext-st"><span class="dot ${active ? "ok" : ""}"></span>${esc(status)} · ${esc(roles)}可用${k.updated_ts ? ` · ${esc(dayWord(k.updated_ts))}修改` : ""}</div>
       </div>
       <div class="row-btns ext-btns"><button class="btn small" data-act="skill-toggle" data-name="${esc(k.name)}" data-on="${manual ? "0" : "1"}">${manual ? "停用" : "启用"}</button><button class="btn small" data-act="ext-edit" data-kind="skill" data-name="${esc(k.name)}">${k.source === "builtin" ? "查看" : "修改"}</button></div>
     </div>`;
@@ -333,24 +330,24 @@ function skillForm(k) {
     return `
     <div class="login ext-form">
       <div class="ext-form-h">${esc(k.name)}<span class="tag">内置</span></div>
-      <p class="fine" style="margin:0">自带的，只能看 · ${esc(roleText(d.roles))}可用</p>
-      <label>一句话说明</label>
+      <p class="fine" style="margin:0">内置 skill，仅可查看 · ${esc(roleText(d.roles))}可用</p>
+      <label>简介</label>
       <p class="set-text" style="margin:0">${esc(d.description || "")}</p>
       <label for="k-body">内容</label>
       <textarea id="k-body" class="mono-area" rows="14" readonly spellcheck="false">${esc(d.body || "")}</textarea>
       ${(d.files || []).length ? `<p class="fine" style="margin:0">附件：${d.files.map(esc).join("、")}</p>` : ""}
-      <div class="actions"><button type="button" class="btn" data-act="ext-cancel">收起</button></div>
+      <div class="actions"><button type="button" class="btn" data-act="ext-cancel">关闭</button></div>
     </div>`;
   }
   return `
     <form id="skill-form" class="login ext-form" autocomplete="off" data-name="${esc(isNew ? "" : k.name)}">
       <div class="ext-form-h">${isNew ? "添加 skill" : `修改 ${esc(k.name)}`}</div>
-      ${isNew ? `<label for="k-name">名称</label><input id="k-name" spellcheck="false" placeholder="字母数字和 _ -，如 write-report" />` : ""}
-      <label for="k-desc">一句话说明 <small class="lbl-hint">模型靠它判断何时用</small></label>
-      <input id="k-desc" value="${esc(d.description || "")}" placeholder="如：周报格式和注意事项" />
-      <label>给谁用</label>
+      ${isNew ? `<label for="k-name">名称</label><input id="k-name" spellcheck="false" placeholder="字母、数字、_ 或 -，例如 write-report" />` : ""}
+      ${tipLabel("k-desc", "简介", "模型根据简介判断何时使用该 skill。")}
+      <input id="k-desc" value="${esc(d.description || "")}" placeholder="例如：周报格式和注意事项" />
+      <label>使用范围</label>
       ${roleChecks("k", d.roles)}
-      <label for="k-body">内容 <small class="lbl-hint">做法、注意事项和例子；最多 40KB</small></label>
+      ${tipLabel("k-body", "内容", "写明做法、注意事项和示例，最多 40KB。")}
       <textarea id="k-body" class="mono-area" rows="14" spellcheck="false">${esc(d.body || "")}</textarea>
       ${(d.files || []).length ? `<p class="fine" style="margin:0">附件：${d.files.map(esc).join("、")}</p>` : ""}
       <p class="err" id="k-err" hidden></p>

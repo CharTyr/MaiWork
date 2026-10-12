@@ -1,6 +1,6 @@
 // MaiWork 网页 · 设置 ·「记忆」页 + 头像小块（头像放在专岗页「主模型」那一栏）。
 import { state } from "../state.js";
-import { dayWord, esc, toast } from "../util.js";
+import { dayWord, esc, tip, toast } from "../util.js";
 import { api } from "../api.js";
 import { loading } from "../pages/news.js";
 import { repaintSheet } from "../sheet.js";
@@ -13,18 +13,16 @@ export function avatarBlock() {
   const a = state.avatarCfg;
   const src = a ? AV_SRC[a.source] || "" : "";
   return `
-    <h2 class="h-sub">头像</h2>
+    <h2 class="h-sub">头像${tip("默认与 MaiBot 的头像相同。上传图片最大 2MB，支持 png、jpg、webp、gif。")}</h2>
     <div class="av-row">
       <img class="top-avatar av-big" src="${esc((a && a.url) || avatar())}" alt="" onerror="this.onerror=null;this.src='/static/assets/logo.png'" />
       <div class="av-main">
-        <div class="set-text">默认和 MaiBot 一样</div>
         ${a ? `<div class="set-text">当前：<b>${esc(src)}</b></div>` : ""}
         <div class="row-btns" style="margin-top:8px">
           <label class="btn small file-btn">上传<input type="file" id="avatar-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden /></label>
-          <button type="button" class="btn small" data-act="avatar-url">用网址</button>
-          ${a && a.source === "custom" ? `<button type="button" class="btn small" data-act="avatar-reset">恢复同步</button>` : ""}
+          <button type="button" class="btn small" data-act="avatar-url">使用网址</button>
+          ${a && a.source === "custom" ? `<button type="button" class="btn small" data-act="avatar-reset">恢复为 MaiBot 头像</button>` : ""}
         </div>
-        <p class="fine" style="margin:4px 0 0">最大 2MB，png / jpg / webp / gif</p>
       </div>
     </div>`;
 }
@@ -36,7 +34,7 @@ export async function avatarSaved(a) {
   if (onb.open && ONB_STEPS[onb.i].id === "look") {
     const pane = document.querySelector("#onb .onb-pane");
     if (pane) pane.innerHTML = onbPane("look");
-    toast("头像换好了");
+    toast("头像已更新");
   }
 }
 
@@ -57,10 +55,9 @@ function idBlock(kind, title, lead, item, limit, extra) {
   const text = item.text || "";
   return `
     <form class="id-form login" data-kind="${kind}" autocomplete="off">
-      <div class="h-sub-row"><h2 class="h-sub">${title}</h2>${extra || ""}</div>
-      <p class="h-meta" style="margin-top:-6px">${lead}</p>
+      <div class="h-sub-row"><h2 class="h-sub">${title}${tip(lead)}</h2>${extra || ""}</div>
       <textarea class="mono-area id-text" rows="10" spellcheck="false" data-limit="${limit || 16384}">${esc(text)}</textarea>
-      <div class="id-foot"><span class="fine id-count">${new Blob([text]).size} / ${limit || 16384} 字节${item.updated_ts ? ` · ${esc(dayWord(item.updated_ts))}改过` : ""}</span><button class="btn primary small" type="submit">保存</button></div>
+      <div class="id-foot"><span class="fine id-count">${new Blob([text]).size} / ${limit || 16384} 字节${item.updated_ts ? ` · ${esc(dayWord(item.updated_ts))}修改` : ""}</span><button class="btn primary small" type="submit">保存</button></div>
     </form>`;
 }
 
@@ -70,7 +67,5 @@ export function memoryPage(s) {
   if (!d) return loading();
   const lim = d.limits || {};
   return `
-    <p class="h-meta">MaiWork 自己记的经验，你也能改</p>
-    ${idBlock("memory", "通用记忆", "所有群通用，不写具体群和人", d.memory, lim.memory)}
-    <p class="fine">本群规矩和做法在群页里</p>`;
+    ${idBlock("memory", "通用记忆", "MaiWork 积累的经验，适用于所有群，可手动修改。不要写入具体的群或成员信息；各群的规则和做法在对应群页面中设置。", d.memory, lim.memory)}`;
 }

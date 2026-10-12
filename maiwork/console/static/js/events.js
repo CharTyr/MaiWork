@@ -18,7 +18,7 @@ document.addEventListener("change", async (e) => {
       if (state.chat.info) state.chat.info.group_id = e.target.value;
       await loadChats();
       renderSide();
-      toast(e.target.value ? "已切到本群" : "所有群");
+      toast(e.target.value ? "已切换到本群" : "已切换到所有群");
     } catch (err) {
       toast(err.message, true);
     }
@@ -42,17 +42,17 @@ document.addEventListener("change", async (e) => {
     const file = e.target.files && e.target.files[0];
     e.target.value = "";
     if (!file) return;
-    if (file.size > 2 * 1024 * 1024) return toast("图片太大，最多 2MB", true);
-    if (!/^image\/(png|jpeg|webp|gif)$/.test(file.type)) return toast("只支持 png、jpg、webp、gif", true);
+    if (file.size > 2 * 1024 * 1024) return toast("图片过大，最多 2MB", true);
+    if (!/^image\/(png|jpeg|webp|gif)$/.test(file.type)) return toast("仅支持 png、jpg、webp、gif", true);
     try {
       const data = await new Promise((ok, bad) => {
         const r = new FileReader();
         r.onload = () => ok(String(r.result).split(",")[1] || "");
-        r.onerror = () => bad(new Error("打不开这张图"));
+        r.onerror = () => bad(new Error("无法打开该图片"));
         r.readAsDataURL(file);
       });
       await avatarSaved(await api("POST", "/api/settings/avatar", { data, mime: file.type }));
-      toast("头像换好了");
+      toast("头像已更新");
     } catch (err) {
       toast(err.message, true);
     }
@@ -62,7 +62,7 @@ document.addEventListener("change", async (e) => {
   const file = e.target.files && e.target.files[0];
   e.target.value = "";
   if (!file) return;
-  if (file.size > 5 * 1024 * 1024) return toast("文件太大，最多 5MB", true);
+  if (file.size > 5 * 1024 * 1024) return toast("文件过大，最多 5MB", true);
   const upload = async (replace) => {
     const res = await fetch(`/api/extensions/skills/upload${replace ? "?replace=1" : ""}`, {
       method: "POST",
@@ -76,14 +76,14 @@ document.addEventListener("change", async (e) => {
     } catch (x) {}
     return { res, data };
   };
-  toast("安装中…");
+  toast("正在安装…");
   try {
     let { res, data } = await upload(false);
-    if (res.status === 409 && confirm(`${(data && data.error) || "已有同名 skill"}，替换吗？`)) ({ res, data } = await upload(true));
-    if (!res.ok) throw new Error((data && data.error) || `出错了（${res.status}）`);
+    if (res.status === 409 && confirm(`${(data && data.error) || "已有同名 skill"}，是否替换？`)) ({ res, data } = await upload(true));
+    if (!res.ok) throw new Error((data && data.error) || `请求失败（${res.status}）`);
     await loadExt();
     repaintSheet();
-    toast(`已装好 ${data.name}，下次可用`);
+    toast(`已安装 ${data.name}，下次运行时可用`);
   } catch (err) {
     toast(err.message, true);
   }
@@ -115,6 +115,39 @@ document.addEventListener("input", (e) => {
   c.textContent = `${n} / ${lim} 字节`;
   c.classList.toggle("bad-t", n > lim);
 });
+
+/* 「ⓘ」说明提示（util.js 的 tip()）：同时只开一个；点外面、按 Esc 关；靠右时往左挪，不出屏 */
+const openTips = () => document.querySelectorAll("details.tip[open]");
+document.addEventListener(
+  "toggle",
+  (e) => {
+    const d = e.target;
+    if (!d.matches || !d.matches("details.tip") || !d.open) return;
+    for (const x of openTips()) if (x !== d) x.open = false;
+    const pop = d.querySelector(".tip-pop");
+    if (!pop) return;
+    pop.style.removeProperty("--tip-shift");
+    const r = pop.getBoundingClientRect();
+    const over = r.right - (window.innerWidth - 12);
+    const under = 12 - r.left;
+    if (over > 0) pop.style.setProperty("--tip-shift", `${-Math.ceil(over)}px`);
+    else if (under > 0) pop.style.setProperty("--tip-shift", `${Math.ceil(under)}px`);
+  },
+  true
+);
+document.addEventListener("click", (e) => {
+  const inside = e.target.closest && e.target.closest("details.tip");
+  for (const x of openTips()) if (x !== inside) x.open = false;
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  const open = [...openTips()];
+  if (!open.length) return;
+  e.stopImmediatePropagation(); // 先关提示，不要连带关掉抽屉
+  for (const x of open) x.open = false;
+  const s = open[0].querySelector("summary");
+  if (s) s.focus();
+}, true);
 
 /* 长名字滚动：只在真的放不下时才动；尊重「减少动态效果」 */
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");

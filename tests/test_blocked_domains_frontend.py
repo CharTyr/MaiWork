@@ -17,7 +17,7 @@ const context = vm.createContext({ console, location: { origin: 'http://local.te
   document: { querySelectorAll: () => [], querySelector: () => null, addEventListener: () => {} } });
 const stubs = {
   '../state.js': { state: {}, $: () => null },
-  '../util.js': { esc, ico: () => '', toast: () => {}, when: () => '' },
+  '../util.js': { tip: (h) => (h ? '<details class="tip">' + h + '</details>' : ''), tipLabel: (f, t, h) => '<label for="' + f + '">' + t + '</label>' + (h ? '<details class="tip">' + h + '</details>' : ''), esc, ico: () => '', toast: () => {}, when: () => '' },
   '../api.js': { api: async () => ({}) },
   '../sheet.js': { repaintSheet: () => {} }, '../pages/news.js': { loading: () => '' },
   '../router.js': { loadSettings: async () => {} },
@@ -67,7 +67,7 @@ def test_lists_each_group_separately_with_group_id_on_unblock(tmp_path):
 
 def test_group_without_entries_says_none(tmp_path):
     html = render(tmp_path, {"blocked_domains": {}, "auto_blocked": {}}, [{"id": "111", "name": "甲群"}])
-    assert "甲群" in html and "还没有" in html
+    assert "甲群" in html and "暂无" in html
 
 
 def test_actions_use_per_group_endpoint_and_no_dead_calls():

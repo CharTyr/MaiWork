@@ -300,7 +300,7 @@ class QuickJudge:
                 purpose="intake.quick_judge",
                 group_id=gid,
                 retries=1,
-                max_tokens=600,
+                # 思考与最终答案共用输出额度，沿用每个候选模型的配置。
                 timeout=60,
                 effort="low",
                 **kwargs,

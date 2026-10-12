@@ -220,5 +220,5 @@ def test_retired_speaker_hint_does_not_point_to_missing_control() -> None:
     from CharTyr_MaiWork.maiwork import rules as _rules
 
     hint = _rules.group_managed_hint("topics.speaker")
-    assert "退役" in hint
+    assert "已停用" in hint
     assert "往群里发" not in hint

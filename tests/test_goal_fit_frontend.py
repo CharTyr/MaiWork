@@ -1,9 +1,9 @@
 """真实 JS：目标贴合群聊（.trellis/tasks/10-11-goals-fit-group-chat）的网页部分。
 
 - 没留依据的旧勾是「待确认」：不算进完成数，群管理员能「算数 / 撤掉」，群友只看到待确认；
-- 目标判断 fit=human：卡片和详情都提示「要群友自己动手，MaiWork 盯不了」；
+- 目标判断 fit=human：卡片和详情都提示「需由群成员亲自完成，MaiWork 无法跟进」；
 - 待批的目标请求带判断：human+替代 → 「按任务批准」；human 无替代 → 没有批准按钮；
-- 群指令卡多一段「也可以直接 @ 机器人说」。
+- 群指令卡多一段「也可以 @ 机器人发送」。
 """
 import json
 import shutil
@@ -97,7 +97,7 @@ def test_goal_card_counts_only_backed_ticks(tmp_path):
 def test_admin_sees_confirm_and_revoke_on_pending_tick(tmp_path, role):
     html = render(tmp_path, DETAIL, "detailHTML", role=role,
                   detail={"type": "goal", "id": "G-1"}, view={"goals": {"agent": [_goal()]}})
-    assert "待确认" in html and "先不算完成" in html
+    assert "待确认" in html and "暂不计入完成" in html
     assert 'data-op="confirm" data-id="G-1" data-i="0"' in html
     assert 'data-op="revoke" data-id="G-1" data-i="0"' in html
     assert 'data-i="1"' not in html  # 有依据的那条不出按钮
@@ -126,16 +126,16 @@ def test_old_api_without_pending_field_falls_back_to_proof_fields(tmp_path):
 def test_human_fit_goal_is_flagged(tmp_path):
     g = _goal(fit="human", fit_reason="要大家自己开档截图")
     card = render(tmp_path, WORK, "viewTasks", view={"goals": {"agent": [g]}})
-    assert "要群友自己动手，MaiWork 盯不了" in card
+    assert "需由群成员亲自完成，MaiWork 无法跟进" in card
     detail = render(tmp_path, DETAIL, "detailHTML", role="admin",
                     detail={"type": "goal", "id": "G-1"}, view={"goals": {"agent": [g]}})
-    assert "要群友自己动手，MaiWork 盯不了：要大家自己开档截图" in detail
-    assert "不做了" in detail
+    assert "需由群成员亲自完成，MaiWork 无法跟进：要大家自己开档截图" in detail
+    assert "取消目标" in detail
 
 
 def test_online_fit_goal_not_flagged(tmp_path):
     card = render(tmp_path, WORK, "viewTasks", view={"goals": {"agent": [_goal(fit="online")]}})
-    assert "盯不了" not in card
+    assert "无法跟进" not in card
 
 
 def _pending(fit):
@@ -145,20 +145,20 @@ def _pending(fit):
 def test_pending_goal_human_with_alt_approves_as_task(tmp_path):
     html = render(tmp_path, WORK, "viewTasks", role="admin",
                   view=_pending({"kind": "human", "reason": "要群友开档", "alt_title": "整理 mod 清单"}))
-    assert "要群友自己动手，MaiWork 盯不了：要群友开档" in html
-    assert "批准后改成一次性任务开工：整理 mod 清单" in html
+    assert "需由群成员亲自完成，MaiWork 无法跟进：要群友开档" in html
+    assert "审批通过后将改为一次性任务执行：整理 mod 清单" in html
     assert ">按任务批准<" in html and 'data-op="reject"' in html
 
 
 def test_pending_goal_human_without_alt_cannot_be_approved(tmp_path):
     html = render(tmp_path, WORK, "viewTasks", role="admin", view=_pending({"kind": "human", "reason": "要到场"}))
-    assert "只能不批" in html
+    assert "只能拒绝" in html
     assert 'data-op="approve"' not in html and 'data-op="reject"' in html
 
 
 @pytest.mark.parametrize("fit,text", [
-    ({"kind": "online", "reason": "查官网更新"}, "能在网上盯：查官网更新"),
-    ({"kind": "error"}, "没判断出能不能盯"),
+    ({"kind": "online", "reason": "查官网更新"}, "可在线跟进：查官网更新"),
+    ({"kind": "error"}, "无法判断能否在线跟进"),
 ])
 def test_pending_goal_online_or_error_approves_normally(tmp_path, fit, text):
     html = render(tmp_path, WORK, "viewTasks", role="admin", view=_pending(fit))
@@ -167,7 +167,7 @@ def test_pending_goal_online_or_error_approves_normally(tmp_path, fit, text):
 
 def test_pending_without_fit_unchanged(tmp_path):
     html = render(tmp_path, WORK, "viewTasks", role="admin", view=_pending(None))
-    assert ">批准<" in html and "盯不了" not in html and "能在网上盯" not in html
+    assert ">批准<" in html and "无法跟进" not in html and "可在线跟进" not in html
 
 
 def test_command_card_shows_at_bot_tips(tmp_path):
@@ -181,7 +181,7 @@ def test_command_card_shows_at_bot_tips(tmp_path):
     gp.write_text(gp.read_text(encoding="utf-8") + "\nexport function __cmds(g, v) { return commandsBlock(v); }\n",
                   encoding="utf-8")
     html = _run(tmp_path, patched, ["pages/group.js"], "__cmds", view=view)
-    assert "也可以直接 @ 机器人说" in html
+    assert "也可以 @ 机器人发送" in html
     assert "@MaiBot 提醒我 周五晚八点 开黑" in html and "到点 @ 你" in html
 
 

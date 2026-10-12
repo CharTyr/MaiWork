@@ -1,6 +1,6 @@
 // MaiWork 网页 · 设置：导航、概览、群链接、群管理员。
 import { state } from "../state.js";
-import { SVG, esc, gface, ico, tokens } from "../util.js";
+import { SVG, esc, gface, ico, tip, tokens } from "../util.js";
 import { api, gname, mq, platTag, quiet } from "../api.js";
 import { loading } from "../pages/news.js";
 import { extPage } from "./ext.js";
@@ -15,7 +15,7 @@ import { updateSection } from "../update.js";
 /* ───────────── 设置 / 群切换（抽屉） ───────────── */
 
 export function groupPicker() {
-  return `<h1 class="h-page">换个群</h1>${state.groups
+  return `<h1 class="h-page">切换群</h1>${state.groups
     .map(
       (g) => `
     <button class="gpick" data-act="group" data-g="${esc(g.id)}">
@@ -28,15 +28,15 @@ export function groupPicker() {
 }
 
 export const SET_SUBS = [
-  ["overview", "概况", "gear", "运行状态和今天用量"],
-  ["models", "模型", "robot", "连接和挑选模型"],
+  ["overview", "概况", "gear", "运行状态和今日用量"],
+  ["models", "模型", "robot", "端点、模型和快速判断"],
   ["extensions", "工具", "tools", "联网搜索、MCP 和 skill"],
-  ["agents", "专岗", "fish", "各岗位的模型、性格和规矩"],
+  ["agents", "专岗", "fish", "各岗位的模型、性格和规则"],
   ["memory", "记忆", "books", "所有群通用的经验"],
-  ["usage", "用量", "chart", "每天用量和出错记录"],
-  ["sources", "来源", "newspaper", "订阅、优质和屏蔽的网站"],
-  ["links", "群链接", "link", "群友链接和群管理员密码"],
-  ["rules", "全部设置", "moon", "所有选项都在这"],
+  ["usage", "用量", "chart", "每日用量和错误记录"],
+  ["sources", "来源", "newspaper", "订阅、优质来源和屏蔽网站"],
+  ["links", "群链接", "link", "群成员链接和群管理员密码"],
+  ["rules", "全部设置", "moon", "所有配置项"],
 ];
 
 function setNav() {
@@ -71,17 +71,17 @@ function linksPage(s) {
   return `
     ${(s.groups || [])
       .map(
-        (g) => `<div class="set-row">${ico("link")}<div><div class="set-name">${esc(g.name || `群 ${g.id}`)}</div><div class="set-text mono-link">${esc(fullLink(g))}</div></div><span class="row-btns"><button class="btn small" data-act="copy" data-link="${esc(fullLink(g))}">复制</button><button class="btn small" data-act="reset-link" data-g="${esc(g.id)}">换新链接</button></span></div>
+        (g) => `<div class="set-row">${ico("link")}<div><div class="set-name">${esc(g.name || `群 ${g.id}`)}</div><div class="set-text mono-link">${esc(fullLink(g))}</div></div><span class="row-btns"><button class="btn small" data-act="copy" data-link="${esc(fullLink(g))}">复制</button><button class="btn small" data-act="reset-link" data-g="${esc(g.id)}">重置链接</button></span></div>
         <div class="set-row ga-row">${ico("lock")}<div><div class="set-name">群管理员</div><div class="set-text">${esc(gaText(state.ga[g.id]))}</div></div><span class="row-btns"><button class="btn small" data-act="ga-edit" data-g="${esc(g.id)}" data-name="${esc(g.name || `群 ${g.id}`)}">设置</button></span></div>`
       )
-      .join("") || `<p class="h-meta">还没有服务群。</p>`}
-    <p class="fine">链接只能看本群；外泄了就换新链接。</p>`;
+      .join("") || `<p class="h-meta">暂无服务群</p>`}
+    <div class="fine">群链接仅能查看对应群的内容。${tip("链接泄露后，请重置链接；旧链接将立即失效。")}</div>`;
 }
 
 // 群管理员一行的状态文字
 function gaText(x) {
   if (!x) return "…";
-  return x.password_set ? "已设密码" : "还没设密码";
+  return x.password_set ? "已设置密码" : "未设置密码";
 }
 
 export async function loadGA() {
@@ -98,16 +98,16 @@ export async function loadGA() {
 // 引导没走完 / 先存下了：概况顶上给「接着引导」（回到第一项没配好的必要步骤）
 function onbBanner(o) {
   if (!o || !["in_progress", "later"].includes(o.state)) return "";
-  const miss = (o.missing || []).map((k) => ({ models: "模型", groups: "服务的群" })[k] || k);
-  const text = o.usable ? "引导还剩几步可选" : `引导还差：${miss.join("、")}`;
+  const miss = (o.missing || []).map((k) => ({ models: "模型", groups: "服务群" })[k] || k);
+  const text = o.usable ? "初始设置还有可选步骤未完成" : `初始设置未完成：${miss.join("、")}`;
   return `<div class="warn-box" style="margin-top:18px">${esc(text)}<button class="btn small" data-act="onb-continue" style="margin-left:8px">继续</button></div>`;
 }
 
 // 今天用量的补充说明：没报用量的调用、缓存命中、重试——只在数不是 0 时才说，不显示金额
 function usageExtra(u) {
   const bits = [];
-  if (u.unknown_calls) bits.push(`${u.unknown_calls} 次没报用量，未计入`);
-  if (u.cache_read) bits.push(`缓存省了 ${tokens(u.cache_read)} tokens`);
+  if (u.unknown_calls) bits.push(`${u.unknown_calls} 次调用未返回用量，未计入`);
+  if (u.cache_read) bits.push(`缓存命中 ${tokens(u.cache_read)} tokens`);
   if (u.retries) bits.push(`重试 ${u.retries} 次`);
   return bits.length ? " " + bits.join("；") + "。" : "";
 }
@@ -117,7 +117,7 @@ function settingsOverview(s) {
   const alert = (s.usage && s.usage.alert_daily_tokens) || 0;
   const used = (u.main || 0) + (u.worker || 0);
   return `
-    ${(s.problems || []).length ? `<div class="warn-box"><b>有几项设置不对，先跳过了：</b><br />${s.problems.map(esc).join("<br />")}</div>` : ""}
+    ${(s.problems || []).length ? `<div class="warn-box"><b>以下设置有误，已暂时忽略：</b><br />${s.problems.map(esc).join("<br />")}</div>` : ""}
     <h2 class="h-sub" style="margin-top:20px">各群</h2>
     ${
       state.groups.length
@@ -127,25 +127,24 @@ function settingsOverview(s) {
       <button class="gpick" data-act="group" data-g="${esc(g.id)}">
         ${gface(g)}
         <span class="gpick-t"><span class="gpick-name" style="display:block;font-size:16px">${mq(gname(g))}</span>
-        <span class="gpick-sub">${g.fresh ? "刚加入 · 正在了解" : `今天：资讯 ${g.today.news} · 话题 ${g.today.topics} · 待批 ${g.today.pending}`}</span></span>
+        <span class="gpick-sub">${g.fresh ? "新加入 · 正在建立群画像" : `今日：资讯 ${g.today.news} · 话题 ${g.today.topics} · 待审批 ${g.today.pending}`}</span></span>
         <span class="chev" style="color:var(--gray-2)">${SVG.right}</span>
       </button>`
             )
             .join("")
-        : `<p class="h-meta">还没有群 <button type="button" class="link-btn" data-act="cfg-goto" data-s="groups">去添加</button></p>`
+        : `<p class="h-meta">暂无群 <button type="button" class="link-btn" data-act="cfg-goto" data-s="groups">添加</button></p>`
     }
     ${onbBanner(s.onboarding)}
-    ${s.models && !s.models.ready ? `<div class="warn-box" style="margin-top:18px">还没配模型，MaiWork 没法干活<button class="btn small" data-act="set-sub" data-sub="models" style="margin-left:8px">去配置</button></div>` : ""}
+    ${s.models && !s.models.ready ? `<div class="warn-box" style="margin-top:18px">未配置模型，MaiWork 无法运行<button class="btn small" data-act="set-sub" data-sub="models" style="margin-left:8px">前往设置</button></div>` : ""}
     <div class="h-sub-row"><h2 class="h-sub">用量</h2><button class="btn small" data-act="set-sub" data-sub="usage">查看</button></div>
-    <p class="h-meta">每天用量和出错记录</p>
     ${
       ((s.usage && s.usage.alerts) || []).length
-        ? `<div class="warn-box"><b>今天用量超了提醒线：</b><br />${s.usage.alerts.map((a) => esc(a.text)).join("<br />")}</div>`
+        ? `<div class="warn-box"><b>今日用量已超过提醒线：</b><br />${s.usage.alerts.map((a) => esc(a.text)).join("<br />")}</div>`
         : ""
     }
-    <p class="fine">${alert ? `提醒线 ${tokens(alert)} tokens，已用 ${Math.round((used / alert) * 100)}%。` : "没设提醒线。"}${u.errors ? ` 今天出错 ${u.errors} 次。` : ""}${usageExtra(u)}</p>
+    <p class="fine">${alert ? `提醒线 ${tokens(alert)} tokens，已使用 ${Math.round((used / alert) * 100)}%。` : "未设置提醒线。"}${u.errors ? ` 今日错误 ${u.errors} 次。` : ""}${usageExtra(u)}</p>
     ${updateSection()}
     <h2 class="h-sub">运行状态</h2>
     ${(s.health || []).map((h) => `<div class="set-row">${ico(h.icon || "gear")}<div><div class="set-name">${esc(h.name)}</div><div class="set-text">${esc(h.text)}</div>${h.copy ? `<div class="set-text mono-link">${esc(h.copy)}</div><div class="actions" style="margin-top:8px"><button class="btn small" data-act="copy" data-link="${esc(h.copy)}" data-what="公钥">复制公钥</button></div>` : ""}</div><span class="dot ${h.state === "ok" ? "ok" : h.state === "warn" ? "pending" : ""}"></span></div>`).join("")}
-    <div class="actions" style="margin-top:22px"><button class="btn" data-act="onb-restart">重新引导</button><button class="btn" data-act="logout">退出登录</button></div>`;
+    <div class="actions" style="margin-top:22px"><button class="btn" data-act="onb-restart">重新进行初始设置</button><button class="btn" data-act="logout">退出登录</button></div>`;
 }

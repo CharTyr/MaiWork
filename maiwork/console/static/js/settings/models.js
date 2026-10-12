@@ -2,7 +2,7 @@
 // 这里只管「有哪些端点、从端点里加了哪些模型、每个模型能干什么」；
 // 谁用哪个模型（主模型、各专岗）在「专岗」页里选。
 import { state, $ } from "../state.js";
-import { esc, ico, toast, when } from "../util.js";
+import { esc, ico, tip, tipLabel, toast, when } from "../util.js";
 import { api } from "../api.js";
 import { repaintSheet } from "../sheet.js";
 import { loading } from "../pages/news.js";
@@ -13,19 +13,19 @@ export function feedsSettings(f, groups) {
   if (!f) return "";
   const pick = (m, gid) => (m && !Array.isArray(m) && Array.isArray(m[gid]) ? m[gid] : []);
   const list = groups || [];
-  if (!list.length) return `<p class="h-meta">还没有群</p>`;
+  if (!list.length) return `<p class="h-meta">暂无群</p>`;
   return list
     .map((g) => {
       const manual = pick(f.blocked_domains, g.id);
       const auto = pick(f.auto_blocked, g.id);
       const rows = [
-        ...manual.map((d) => `<div class="set-row">${ico("lock")}<div><div class="set-name mono">${esc(d)}</div><div class="set-text">你屏蔽的</div></div><button class="btn small" data-act="unblock-domain" data-g="${esc(g.id)}" data-domain="${esc(d)}">解除</button></div>`),
-        ...auto.map((d) => `<div class="set-row">${ico("lock")}<div><div class="set-name mono">${esc(d)}</div><div class="set-text">自动屏蔽的</div></div><span></span></div>`),
+        ...manual.map((d) => `<div class="set-row">${ico("lock")}<div><div class="set-name mono">${esc(d)}</div><div class="set-text">手动屏蔽</div></div><button class="btn small" data-act="unblock-domain" data-g="${esc(g.id)}" data-domain="${esc(d)}">取消屏蔽</button></div>`),
+        ...auto.map((d) => `<div class="set-row">${ico("lock")}<div><div class="set-name mono">${esc(d)}</div><div class="set-text">自动屏蔽</div></div><span></span></div>`),
       ].join("");
       return `
     <div class="rss-group">
       <div class="rss-gname">${esc(g.name || `群 ${g.id}`)}</div>
-      ${rows || `<p class="fine">还没有</p>`}
+      ${rows || `<p class="fine">暂无</p>`}
     </div>`;
     })
     .join("");
@@ -36,9 +36,9 @@ export const fullLink = (g) => (g.link && /^https?:/.test(g.link) ? g.link : `${
 export const draft = { models: null }; // 老引导用的临时列表（引导改版后仍共用这个对象）
 
 export const PROTOCOLS = {
-  openai: { name: "OpenAI 兼容", hint: "大多数中转和国产模型选这个", ph: "https://…/v1" },
-  anthropic: { name: "Anthropic", hint: "直连 Claude 用", ph: "https://api.anthropic.com" },
-  responses: { name: "OpenAI Responses", hint: "GPT 系列思考强度更全", ph: "https://api.openai.com/v1" },
+  openai: { name: "OpenAI 兼容", hint: "适用于大多数中转服务和国产模型。", ph: "https://…/v1" },
+  anthropic: { name: "Anthropic", hint: "用于直连 Anthropic Claude。", ph: "https://api.anthropic.com" },
+  responses: { name: "OpenAI Responses", hint: "OpenAI Responses 接口，GPT 系列的思考强度选项更完整。", ph: "https://api.openai.com/v1" },
 };
 export const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 export const EFFORT_NAMES = { low: "低", medium: "中", high: "高", xhigh: "很高", max: "最高" };
@@ -76,11 +76,10 @@ export function modelsPage() {
   const ready = s.models ? s.models.ready !== false : true;
   const edit = state.mdlEdit;
   return `
-    <p class="h-meta">先加端点，再加模型，到「专岗」分配</p>
-    ${ready ? "" : `<div class="warn-box">主模型还没选，MaiWork 没法干活<button class="btn small" data-act="set-sub" data-sub="agents" style="margin-left:8px">去选</button></div>`}
-    <div class="h-sub-row"><h2 class="h-sub">端点</h2><button class="btn small" data-act="mdl-ep-new">添加</button></div>
+    ${ready ? "" : `<div class="warn-box">未设置主模型，MaiWork 无法运行<button class="btn small" data-act="set-sub" data-sub="agents" style="margin-left:8px">前往设置</button></div>`}
+    <div class="h-sub-row"><h2 class="h-sub">端点${tip("端点是模型服务的接入地址。先添加端点，再在端点下添加模型，然后到「专岗」中为各岗位指定模型。")}</h2><button class="btn small" data-act="mdl-ep-new">添加</button></div>
     ${edit && edit.type === "ep" && edit.isNew ? endpointForm(edit.draft, true) : ""}
-    ${m.endpoints.length ? m.endpoints.map(endpointBlock).join("") : edit && edit.isNew ? "" : `<p class="h-meta">还没有端点，点「添加」</p>`}
+    ${m.endpoints.length ? m.endpoints.map(endpointBlock).join("") : edit && edit.isNew ? "" : `<p class="h-meta">暂无端点</p>`}
     ${jevSection()}`;
 }
 
@@ -91,13 +90,13 @@ function endpointBlock(ep) {
     ? endpointForm(edit.draft, false)
     : `<div class="set-row mdl-ep">${ico("link")}<div>
         <div class="set-name">${esc(ep.name || ep.id)}<span class="tag">${esc((PROTOCOLS[ep.protocol] || PROTOCOLS.openai).name)}</span></div>
-        <div class="set-text"><span class="mono">${esc(ep.base_url || "没填地址")}</span> · 密钥${ep.key_set ? "已填" : "<b>没填</b>"}${ep.checked_at ? ` · ${esc(when(ep.checked_at))}测过` : ""}</div>
+        <div class="set-text"><span class="mono">${esc(ep.base_url || "未填写地址")}</span> · 密钥${ep.key_set ? "已填写" : "<b>未填写</b>"}${ep.checked_at ? ` · ${esc(when(ep.checked_at))} 已测试` : ""}</div>
       </div><span class="row-btns"><button class="btn small" data-act="mdl-ep-edit" data-id="${esc(ep.id)}">修改</button><button class="btn small ghost" data-act="mdl-ep-del" data-id="${esc(ep.id)}">删除</button></span></div>`;
   const newModel = edit && edit.type === "model" && edit.isNew && edit.draft.endpoint === ep.id ? modelForm(edit.draft, true) : "";
   return `<section class="mdl-ep-box">
     ${head}
     <div class="mdl-list">
-      ${models.map(modelRow).join("") || (newModel ? "" : `<p class="fine">还没有模型</p>`)}
+      ${models.map(modelRow).join("") || (newModel ? "" : `<p class="fine">暂无模型</p>`)}
       ${newModel}
       ${newModel ? "" : `<button class="btn small" data-act="mdl-model-new" data-ep="${esc(ep.id)}">添加模型</button>`}
     </div>
@@ -106,18 +105,18 @@ function endpointBlock(ep) {
 
 function modelMeta(x) {
   return [
-    (x.efforts || []).length ? `思考强度 ${x.efforts.map((e) => EFFORT_NAMES[e] || e).join(" / ")}` : "不调思考强度",
-    x.vision ? "能看图" : "",
+    (x.efforts || []).length ? `思考强度 ${x.efforts.map((e) => EFFORT_NAMES[e] || e).join(" / ")}` : "不支持思考强度",
+    x.vision ? "支持图片" : "",
     `上下文 ${kTok(x.context_window)}`,
     `最大输出 ${kTok(x.max_tokens)}`,
   ].filter(Boolean).join(" · ");
 }
 
 function verificationMessage(r) {
-  if (r.stale) return "设置改过了，请重新验证。";
-  if (!r.ok) return `没通过：${r.error || "模型没回答"}`;
-  if (r.suggested_max_tokens) return `最大输出改成 ${r.suggested_max_tokens} 才行，还没保存。${r.note || ""}`;
-  return r.tools_ok ? "验证通过" : `能回答，但工具不行：${r.note || "工具调用没通过"}`;
+  if (r.stale) return "设置已更改，请重新验证。";
+  if (!r.ok) return `验证失败：${r.error || "模型无响应"}`;
+  if (r.suggested_max_tokens) return `最大输出需调整为 ${r.suggested_max_tokens}，尚未保存。${r.note || ""}`;
+  return r.tools_ok ? "验证通过" : `可以回复，但工具调用失败：${r.note || "工具调用未通过"}`;
 }
 
 function modelRow(x) {
@@ -128,9 +127,8 @@ function modelRow(x) {
   return `<div class="set-row mdl-model">${ico("robot")}<div>
       <div class="set-name">${esc(x.name || x.model)}${x.name && x.name !== x.model ? ` <span class="fine mono">${esc(x.model)}</span>` : ""}</div>
       <div class="set-text mdl-meta">${esc(modelMeta(x))}</div>
-      <div class="set-text">${users.length ? `谁在用：${esc(users.join("、"))}` : "没人用"}</div>
-      <button type="button" class="btn small" style="min-height:44px;margin-top:8px" data-act="mdl-model-verify" data-id="${esc(x.id)}">验证</button>
-      <span class="fine">发两三句试试，花一点 token</span>
+      <div class="set-text">${users.length ? `使用者：${esc(users.join("、"))}` : "未被使用"}</div>
+      <button type="button" class="btn small" style="min-height:44px;margin-top:8px" data-act="mdl-model-verify" data-id="${esc(x.id)}">验证</button>${tip("发送几条测试消息，检查模型能否正常回复和调用工具。会消耗少量 token。")}
       <div class="set-text mdl-verify-result" role="status" aria-live="polite"${result ? "" : " hidden"}>${result ? esc(verificationMessage(result)) : ""}</div>
     </div><span class="row-btns"><button class="btn small" data-act="mdl-model-edit" data-id="${esc(x.id)}">修改</button><button class="btn small ghost" data-act="mdl-model-del" data-id="${esc(x.id)}">删除</button></span></div>`;
 }
@@ -139,8 +137,8 @@ let headerSeq = 0;
 function endpointHeaderRow(name = "", old = false) {
   const id = `ep-hdr-${++headerSeq}`;
   return `<div class="mdl-header-row" data-old="${old ? "1" : "0"}">
-    <div class="mdl-header-field"><label for="${id}-name">名称</label><input id="${id}-name" class="ep-header-name mono" maxlength="128" spellcheck="false" autocomplete="off" value="${esc(name)}" placeholder="如 User-Agent"${old ? " readonly" : ""} /></div>
-    <div class="mdl-header-field"><label for="${id}-value">值${old ? " · 已填" : ""}</label><input id="${id}-value" class="ep-header-value" type="password" maxlength="8192" spellcheck="false" autocomplete="new-password" aria-describedby="ep-headers-help" placeholder="${old ? "留空不改" : "要发送的值"}" /></div>
+    <div class="mdl-header-field"><label for="${id}-name">名称</label><input id="${id}-name" class="ep-header-name mono" maxlength="128" spellcheck="false" autocomplete="off" value="${esc(name)}" placeholder="例如 User-Agent"${old ? " readonly" : ""} /></div>
+    <div class="mdl-header-field"><label for="${id}-value">值${old ? " · 已填" : ""}</label><input id="${id}-value" class="ep-header-value" type="password" maxlength="8192" spellcheck="false" autocomplete="new-password" aria-describedby="ep-headers-help" placeholder="${old ? "留空则不修改" : "请求头的值"}" /></div>
     <button class="btn small ghost" type="button" data-act="mdl-header-del" aria-label="删除${name ? `请求头 ${esc(name)}` : "这个请求头"}">删除</button>
   </div>`;
 }
@@ -150,28 +148,24 @@ function endpointForm(d, isNew) {
   const avail = (state.mdlAvail || {})[d.id];
   return `<div class="login ext-form mdl-form" id="mdl-ep-form">
     <div class="ext-form-h">${isNew ? "添加端点" : `修改「${esc(d.name || d.id)}」`}</div>
-    <label for="ep-name">名称</label><input id="ep-name" maxlength="40" value="${esc(d.name || "")}" placeholder="如：公司中转、Claude 官方" />
-    <label for="ep-proto">接口格式</label>
+    <label for="ep-name">名称</label><input id="ep-name" maxlength="40" value="${esc(d.name || "")}" placeholder="例如：公司中转、Claude 官方" />
+    ${tipLabel("ep-proto", "接口格式", `<p id="ep-proto-hint">${esc(proto.hint)}</p>`)}
     <select id="ep-proto">${Object.entries(PROTOCOLS).map(([k, v]) => `<option value="${k}"${k === d.protocol ? " selected" : ""}>${esc(v.name)}</option>`).join("")}</select>
-    <p class="fine" id="ep-proto-hint" style="margin:2px 0 0">${esc(proto.hint)}</p>
     <label for="ep-url">地址</label><input id="ep-url" type="url" inputmode="url" spellcheck="false" value="${esc(d.base_url || "")}" placeholder="${esc(proto.ph)}" />
-    <label for="ep-key">API 密钥</label><input id="ep-key" type="password" autocomplete="new-password" placeholder="${d.key_set ? "已填，留空不改" : "粘贴密钥"}" />
-    <div class="actions" style="margin-top:4px"><button class="btn" type="button" data-act="mdl-ep-test">测试连接</button><span class="fine" id="ep-check" style="margin:0;align-self:center">${avail ? `找到 ${avail.length} 个` : ""}</span></div>
+    <label for="ep-key">API 密钥</label><input id="ep-key" type="password" autocomplete="new-password" placeholder="${d.key_set ? "已填写，留空则不修改" : "输入密钥"}" />
+    <div class="actions" style="margin-top:4px"><button class="btn" type="button" data-act="mdl-ep-test">测试连接</button><span class="fine" id="ep-check" style="margin:0;align-self:center">${avail ? `可用模型 ${avail.length} 个` : ""}</span></div>
     <details class="mdl-more"><summary>重试与频率</summary>
       <div class="two-col">
         <div><label for="ep-retries">重试次数</label><input id="ep-retries" type="number" min="0" max="10" value="${esc(d.retries ?? 5)}" /></div>
         <div><label for="ep-delay">间隔秒数</label><input id="ep-delay" type="number" min="1" max="60" value="${esc(d.retry_delay_s ?? 10)}" /></div>
-        <div><label for="ep-conc">同时请求</label><input id="ep-conc" type="number" min="1" max="8" value="${esc(d.max_concurrency ?? 2)}" /></div>
-        <div><label for="ep-rpm">每分钟上限（0 = 不限）</label><input id="ep-rpm" type="number" min="0" max="600" value="${esc(d.max_rpm ?? 0)}" /></div>
+        <div><label for="ep-conc">并发数</label><input id="ep-conc" type="number" min="1" max="8" value="${esc(d.max_concurrency ?? 2)}" /></div>
+        <div>${tipLabel("ep-rpm", "每分钟请求上限", "0 表示不限制。频繁出现「请求过多」错误时，可调低并发数或每分钟上限。")}<input id="ep-rpm" type="number" min="0" max="600" value="${esc(d.max_rpm ?? 0)}" /></div>
       </div>
-      <p class="fine">常报请求太多就调小频率</p>
     </details>
     <details class="mdl-more mdl-advanced" id="ep-advanced">
       <summary>高级${(d.header_names || []).length ? ` · ${(d.header_names || []).length} 个自定义请求头` : ""}</summary>
       <div class="mdl-advanced-body">
-        <div class="set-name">自定义请求头</div>
-        <p class="fine">本端点所有请求都带上，同名的会替换</p>
-        <p class="fine" id="ep-headers-help">值保存后不显示；留空保留原值</p>
+        <div class="set-name">自定义请求头${tip(`<p>本端点的所有请求都会附带这些请求头，同名请求头会被替换。</p><p id="ep-headers-help">值保存后不再显示；留空则保留原值。</p><p>最多 32 项，仅支持英文字符；Host 等传输相关请求头不可修改。</p>`)}</div>
         <div class="seg mdl-header-modes" role="group" aria-label="填写方式">
           <button type="button" data-act="mdl-header-mode" data-mode="rows" aria-pressed="true">逐行</button>
           <button type="button" data-act="mdl-header-mode" data-mode="json" aria-pressed="false">JSON</button>
@@ -181,11 +175,9 @@ function endpointForm(d, isNew) {
           <button type="button" class="btn small" data-act="mdl-header-add">添加</button>
         </div>
         <div id="ep-headers-jsonbox" hidden>
-          <label for="ep-headers-json">JSON</label>
+          ${tipLabel("ep-headers-json", "JSON", `<p id="ep-headers-json-help">格式为 {"名称": "值"}。值写 "" 表示保留原值，未列出的请求头将被删除。此处为明文显示，请注意周围环境。</p>`)}
           <textarea id="ep-headers-json" class="mono-area" rows="8" spellcheck="false" autocomplete="off" autocapitalize="off" aria-describedby="ep-headers-json-help">${esc(headersJsonText(d.header_names || []))}</textarea>
-          <p class="fine" id="ep-headers-json-help">写成 {"名称": "值"}；值写 "" 保留原值，没写的会被删掉。这里是明文，注意旁人</p>
         </div>
-        <p class="fine">最多 32 项，只能英文；Host 等不能改</p>
       </div>
     </details>
     <p class="err" id="ep-err" role="alert" hidden></p>
@@ -200,19 +192,17 @@ function modelForm(d, isNew) {
   return `<div class="login ext-form mdl-form" id="mdl-model-form">
     <div class="ext-form-h">${isNew ? `添加模型 · ${esc(ep.name || ep.id || "")}` : `修改「${esc(d.name || d.model)}」`}</div>
     <label for="mo-model">模型 ID</label>
-    <input id="mo-model" list="mo-avail" spellcheck="false" autocomplete="off" value="${esc(d.model || "")}" placeholder="${avail.length ? "从列表挑或直接填" : "如 gpt-5.2"}" />
+    <input id="mo-model" list="mo-avail" spellcheck="false" autocomplete="off" value="${esc(d.model || "")}" placeholder="${avail.length ? "从列表选择或直接输入" : "例如 gpt-5.2"}" />
     <datalist id="mo-avail">${avail.map((x) => `<option value="${esc(x)}"></option>`).join("")}</datalist>
-    ${avail.length ? "" : `<p class="fine" style="margin:2px 0 0">想从列表挑？<button type="button" class="link-btn" data-act="mdl-avail" data-ep="${esc(d.endpoint)}">拉取列表</button></p>`}
-    <label for="mo-name">显示名（可选）</label><input id="mo-name" maxlength="60" value="${esc(d.name && d.name !== d.model ? d.name : "")}" placeholder="不填用模型 ID" />
-    <label>思考强度</label>
+    ${avail.length ? "" : `<p class="fine" style="margin:2px 0 0"><button type="button" class="link-btn" data-act="mdl-avail" data-ep="${esc(d.endpoint)}">获取可用模型列表</button></p>`}
+    <label for="mo-name">显示名（可选）</label><input id="mo-name" maxlength="60" value="${esc(d.name && d.name !== d.model ? d.name : "")}" placeholder="留空则使用模型 ID" />
+    <div class="lbl-row"><label>思考强度</label>${tip("只勾选模型实际支持的档位；未勾选时不传该参数。")}</div>
     <div class="mdl-efforts" role="group" aria-label="支持的思考强度">${EFFORTS.map((e) => `<label class="chk"><input type="checkbox" class="mo-effort" value="${e}"${efforts.has(e) ? " checked" : ""} />${EFFORT_NAMES[e]}（${e}）</label>`).join("")}</div>
-    <p class="fine" style="margin:2px 0 0">勾它真支持的，不勾就不传</p>
-    <label class="chk"><input id="mo-vision" type="checkbox"${d.vision ? " checked" : ""} />能看图</label>
+    <label class="chk"><input id="mo-vision" type="checkbox"${d.vision ? " checked" : ""} />支持图片输入</label>
     <div class="two-col">
-      <div><label for="mo-ctx">上下文长度（tokens）</label><input id="mo-ctx" type="number" min="8192" max="2000000" step="1024" value="${esc(d.context_window ?? 128000)}" /></div>
+      <div>${tipLabel("mo-ctx", "上下文长度（tokens）", "上下文长度是模型单次能处理的总长度；最大输出是单次回复的最大长度，须小于上下文长度。")}<input id="mo-ctx" type="number" min="8192" max="2000000" step="1024" value="${esc(d.context_window ?? 128000)}" /></div>
       <div><label for="mo-max">最大输出（tokens）</label><input id="mo-max" type="number" min="1024" max="1000000" step="1024" value="${esc(d.max_tokens ?? 32768)}" /></div>
     </div>
-    <p class="fine" style="margin:2px 0 0">上下文 = 能记多长；最大输出 = 一次写多长</p>
     <p class="err" id="mo-err" hidden></p>
     <div class="actions"><button class="btn primary" type="button" data-act="mdl-model-save">保存</button><button class="btn" type="button" data-act="mdl-cancel">取消</button></div>
   </div>`;
@@ -227,7 +217,7 @@ function showErr(id, text) {
 
 const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$/;
 const TRANSPORT_HEADERS = new Set(["host", "content-length", "transfer-encoding", "connection", "proxy-authorization", "proxy-authenticate", "proxy-connection", "keep-alive", "te", "trailer", "upgrade", "via"]);
-const HEADER_JSON_ERR = "格式不对，要写成 {\"名称\": \"值\"}";
+const HEADER_JSON_ERR = "格式不正确，应为 {\"名称\": \"值\"}";
 const savedHeaderNames = () => {
   const d = state.mdlEdit && state.mdlEdit.draft;
   return new Set(((d && d.header_names) || []).map((n) => String(n).toLowerCase()));
@@ -244,12 +234,12 @@ function checkedHeaders(entries) {
   for (const [rawName, rawValue, isSaved] of entries) {
     const name = String(rawName).trim();
     const value = rawValue || "";
-    if (!HEADER_NAME.test(name)) throw new Error("名称只能英文，不带空格。");
+    if (!HEADER_NAME.test(name)) throw new Error("名称只能包含英文字符，且不能有空格。");
     const lower = name.toLowerCase();
-    if (names.has(lower)) throw new Error("名称重复了。");
-    if (TRANSPORT_HEADERS.has(lower)) throw new Error("Host 等不能改。");
-    if (value.length > 8192 || /[^\t\x20-\x7e]/.test(value)) throw new Error("值只能是英文，不带换行。");
-    if (!value && !isSaved) throw new Error("新加的要填值，不要就删掉。");
+    if (names.has(lower)) throw new Error("名称重复。");
+    if (TRANSPORT_HEADERS.has(lower)) throw new Error("Host 等传输相关请求头不可修改。");
+    if (value.length > 8192 || /[^\t\x20-\x7e]/.test(value)) throw new Error("值只能包含英文字符，且不能换行。");
+    if (!value && !isSaved) throw new Error("新增的请求头必须填写值，不需要请删除。");
     names.add(lower);
     headers[name] = value; // 已存项空值由服务端保留；缺失的名称由服务端删除
   }
@@ -258,13 +248,13 @@ function checkedHeaders(entries) {
 
 // JSON 文本 → [[名称, 值或 null]]；错误提示不带 JSON 原文和值
 function parseHeadersJson(text) {
-  if (!String(text).trim()) throw new Error("不能空着，清空请写 {}。");
+  if (!String(text).trim()) throw new Error("内容不能为空；如需清空，请填写 {}。");
   let data;
   try { data = JSON.parse(text); } catch { throw new Error(HEADER_JSON_ERR); }
   if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error(HEADER_JSON_ERR);
   return Object.keys(data).map((key) => {
     const value = data[key];
-    if (value !== null && typeof value !== "string") throw new Error("值要用英文引号括起来。");
+    if (value !== null && typeof value !== "string") throw new Error("值必须是用英文双引号括起的字符串。");
     return [key, value];
   });
 }
@@ -312,10 +302,10 @@ async function testEndpoint(epId, body, out) {
   const r = await api("POST", `/api/settings/endpoints/${encodeURIComponent(epId)}/test`, body);
   if (r && r.ok) {
     state.mdlAvail = { ...(state.mdlAvail || {}), [epId]: r.models || [] };
-    if (out) { out.textContent = `已连上，找到 ${(r.models || []).length} 个`; out.style.color = ""; }
+    if (out) { out.textContent = `连接成功，可用模型 ${(r.models || []).length} 个`; out.style.color = ""; }
     return true;
   }
-  if (out) { out.textContent = (r && r.error) || "没连上"; out.style.color = "var(--red)"; }
+  if (out) { out.textContent = (r && r.error) || "连接失败"; out.style.color = "var(--red)"; }
   return false;
 }
 
@@ -358,7 +348,7 @@ export async function actModels(action, el) {
           for (const row of headerRows()) {
             const name = rowName(row), value = rowValue(row);
             if (!name && !value) continue;
-            if (name in pairs) throw new Error("名称重复了。");
+            if (name in pairs) throw new Error("名称重复。");
             pairs[name] = value;
           }
           text.value = JSON.stringify(pairs, null, 2);
@@ -382,9 +372,9 @@ export async function actModels(action, el) {
       try { body = readEndpoint(); }
       catch (err) { showErr("ep-err", err.message); return true; }
       const out = $("ep-check");
-      if (!/^https?:\/\/\S+$/.test(body.base_url)) { out.textContent = "地址要以 http:// 或 https:// 开头"; out.style.color = "var(--red)"; return true; }
-      if (!(d && d.key_set) && !body.api_key) { out.textContent = "先填密钥"; out.style.color = "var(--red)"; return true; }
-      el.disabled = true; out.style.color = ""; out.textContent = "连接中…";
+      if (!/^https?:\/\/\S+$/.test(body.base_url)) { out.textContent = "地址须以 http:// 或 https:// 开头"; out.style.color = "var(--red)"; return true; }
+      if (!(d && d.key_set) && !body.api_key) { out.textContent = "请先填写密钥"; out.style.color = "var(--red)"; return true; }
+      el.disabled = true; out.style.color = ""; out.textContent = "正在连接…";
       try { await testEndpoint(d.id, { base_url: body.base_url, api_key: body.api_key, protocol: body.protocol, headers: body.headers }, out); }
       catch (err) { out.textContent = err.message; out.style.color = "var(--red)"; }
       finally { el.disabled = false; }
@@ -397,7 +387,7 @@ export async function actModels(action, el) {
       if ($("ep-err")) $("ep-err").hidden = true;
       try { body = readEndpoint(); }
       catch (err) { showErr("ep-err", err.message); return true; }
-      const problem = !body.name ? "给端点起个名字。" : !/^https?:\/\/\S+$/.test(body.base_url) ? "地址要以 http:// 或 https:// 开头。" : !edit.draft.key_set && !body.api_key ? "还没填密钥。" : "";
+      const problem = !body.name ? "请填写端点名称。" : !/^https?:\/\/\S+$/.test(body.base_url) ? "地址须以 http:// 或 https:// 开头。" : !edit.draft.key_set && !body.api_key ? "请填写密钥。" : "";
       if (problem) return showErr("ep-err", problem), true;
       el.disabled = true;
       try {
@@ -405,16 +395,16 @@ export async function actModels(action, el) {
         const wasNew = edit.isNew;
         state.mdlEdit = null;
         await reloadAll();
-        toast(wasNew ? "端点已添加，接着加模型" : "已保存");
+        toast(wasNew ? "端点已添加，可继续添加模型" : "已保存");
       } catch (err) { el.disabled = false; showErr("ep-err", err.message); }
       return true;
     }
     case "mdl-ep-del": {
       const ep = m && m.endpoints.find((e) => e.id === el.dataset.id);
       if (!ep) return true;
-      if (m.models.some((x) => x.endpoint === ep.id)) return toast("先删掉里面的模型", true), true;
-      if (!confirm(`删掉「${ep.name || ep.id}」？密钥一起删`)) return true;
-      try { await api("DELETE", `/api/settings/endpoints/${encodeURIComponent(ep.id)}`); await reloadAll(); toast("删掉了"); }
+      if (m.models.some((x) => x.endpoint === ep.id)) return toast("请先删除该端点下的模型", true), true;
+      if (!confirm(`删除「${ep.name || ep.id}」？密钥将一并删除。`)) return true;
+      try { await api("DELETE", `/api/settings/endpoints/${encodeURIComponent(ep.id)}`); await reloadAll(); toast("已删除"); }
       catch (err) { toast(err.message, true); }
       return true;
     }
@@ -434,7 +424,7 @@ export async function actModels(action, el) {
           if (el.parentElement) el.parentElement.hidden = true; // 有列表了，提示行收起
         }
         el.disabled = false;
-        toast(ok ? `找到 ${list.length} 个，可直接选` : "没连上，检查地址和密钥", !ok);
+        toast(ok ? `已获取 ${list.length} 个可用模型` : "连接失败，请检查地址和密钥", !ok);
       } catch (err) { toast(err.message, true); el.disabled = false; }
       return true;
     }
@@ -451,7 +441,7 @@ export async function actModels(action, el) {
       const edit = state.mdlEdit;
       if (!edit) return true;
       const body = { ...readModel(), endpoint: edit.draft.endpoint };
-      const problem = !body.model ? "请填模型 ID。" : body.max_tokens >= body.context_window ? "最大输出要小于上下文。" : "";
+      const problem = !body.model ? "请填写模型 ID。" : body.max_tokens >= body.context_window ? "最大输出须小于上下文长度。" : "";
       if (problem) return showErr("mo-err", problem), true;
       el.disabled = true;
       try {
@@ -459,7 +449,7 @@ export async function actModels(action, el) {
         const wasNew = edit.isNew;
         state.mdlEdit = null;
         await reloadAll();
-        toast(wasNew ? "已添加，去「专岗」分配" : "已保存");
+        toast(wasNew ? "已添加，可在「专岗」中分配" : "已保存");
       } catch (err) { el.disabled = false; showErr("mo-err", err.message); }
       return true;
     }
@@ -469,7 +459,7 @@ export async function actModels(action, el) {
       const out = row && row.querySelector(".mdl-verify-result");
       const label = el.textContent;
       el.disabled = true;
-      el.textContent = "验证中…";
+      el.textContent = "正在验证…";
       if (out) out.hidden = true;
       try {
         const r = await api("POST", `/api/settings/model-list/${encodeURIComponent(id)}/verify`, {});
@@ -484,12 +474,12 @@ export async function actModels(action, el) {
           save.style.margin = "8px 0";
           save.dataset.act = "mdl-model-apply-limit";
           save.dataset.id = id;
-          save.textContent = `用建议值 ${r.suggested_max_tokens}`;
+          save.textContent = `应用建议值 ${r.suggested_max_tokens}`;
           out.appendChild(document.createElement("br"));
           out.appendChild(save);
         }
       } catch (e) {
-        if (out && el.isConnected) { out.textContent = `没验证完：${e.message}`; out.hidden = false; }
+        if (out && el.isConnected) { out.textContent = `验证未完成：${e.message}`; out.hidden = false; }
       } finally {
         if (el.isConnected) { el.disabled = false; el.textContent = label; }
       }
@@ -508,16 +498,16 @@ export async function actModels(action, el) {
         });
         await loadModels();
         const saved = state.mdl && state.mdl.models.find((x) => x.id === id);
-        if (!saved || Number(saved.max_tokens) !== Number(r.suggested_max_tokens)) throw new Error("没确认生效");
+        if (!saved || Number(saved.max_tokens) !== Number(r.suggested_max_tokens)) throw new Error("无法确认已生效");
         const applied = { ...r, suggested_max_tokens: 0 };
         state.mdlVerification = { ...(state.mdlVerification || {}), [id]: applied };
-        if (out) { out.textContent = `最大输出改为 ${saved.max_tokens}。${verificationMessage(applied)}`; out.hidden = false; }
+        if (out) { out.textContent = `最大输出已改为 ${saved.max_tokens}。${verificationMessage(applied)}`; out.hidden = false; }
         if (row) row.querySelector(".mdl-meta").textContent = modelMeta(saved);
       } catch (e) {
         if (out) {
           // 保留建议按钮，失败原因就在当前区域，不擦掉其他模型的未保存表单。
           const error = document.createElement("div");
-          error.textContent = `没保存成：${e.message}`;
+          error.textContent = `保存失败：${e.message}`;
           out.appendChild(error);
           out.hidden = false;
         }
@@ -529,9 +519,9 @@ export async function actModels(action, el) {
       const x = m && m.models.find((y) => y.id === el.dataset.id);
       if (!x) return true;
       const users = usersOf(x.id);
-      if (users.length) return toast(`${users.join("、")} 还在用，先去「专岗」换掉`, true), true;
+      if (users.length) return toast(`${users.join("、")} 正在使用该模型，请先在「专岗」中更换`, true), true;
       if (!confirm(`删除「${x.name || x.model}」？`)) return true;
-      try { await api("DELETE", `/api/settings/model-list/${encodeURIComponent(x.id)}`); await reloadAll(); toast("删掉了"); }
+      try { await api("DELETE", `/api/settings/model-list/${encodeURIComponent(x.id)}`); await reloadAll(); toast("已删除"); }
       catch (err) { toast(err.message, true); }
       return true;
     }

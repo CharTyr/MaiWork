@@ -47,20 +47,20 @@ export function stretches(log) {
 // 一次判断的 Jev 那句话：真实分数 + 门槛 + 原因 + 卡在哪。
 export function judgeText(t) {
   const j = t && t.jev;
-  if (!j) return "没问 Jev";
+  if (!j) return "未询问 Jev";
   const okP = num(j.ok_p);
   const reason = j.reason && j.reason !== "可以开" ? String(j.reason) : "";
   if (okP == null) {
     // 旧记录只存了 ok 结论和「原因」的把握：不再把那个把握当分数，也不写「不适合 · 可以开」
-    if (j.ok) return "适合开（旧记录）";
-    return `不适合${reason ? ` · ${reason}` : "（分不够）"}（旧记录）`;
+    if (j.ok) return "适合开启（旧记录）";
+    return `不适合${reason ? ` · ${reason}` : "（分数不足）"}（旧记录）`;
   }
-  const parts = [`适合度 ${f2(okP)}（要 ${f2(num(j.ok_need) ?? OK_NEED)}）`];
+  const parts = [`适合度 ${f2(okP)}（阈值 ${f2(num(j.ok_need) ?? OK_NEED)}）`];
   if (reason) parts.push(`原因：${reason}`);
   const fit = num(j.fit_best);
-  if (fit != null) parts.push(`最佳候选 ${f2(fit)}（要 ${f2(num(j.fit_need) ?? FIT_NEED)}）${j.fit_title ? `「${j.fit_title}」` : ""}`);
-  if (j.stuck === "timing") parts.push("时机不对");
-  else if (j.stuck === "candidate") parts.push("没合适的话题");
+  if (fit != null) parts.push(`最佳候选 ${f2(fit)}（阈值 ${f2(num(j.fit_need) ?? FIT_NEED)}）${j.fit_title ? `「${j.fit_title}」` : ""}`);
+  if (j.stuck === "timing") parts.push("时机不合适");
+  else if (j.stuck === "candidate") parts.push("无合适话题");
   return parts.join(" · ");
 }
 
@@ -72,8 +72,8 @@ export function daySummary(log, isToday) {
   const opened = st.filter((s) => s.opened).length;
   const oks = st.map((s) => s.bestOk).filter((v) => v != null);
   const fits = st.map((s) => s.bestFit).filter((v) => v != null);
-  let s = `今天冷场 ${st.length} 次，开了 ${opened} 次`;
-  if (oks.length) s += ` · 最高 ${f2(Math.max(...oks))}（要 ${f2(OK_NEED)}）`;
-  if (fits.length) s += ` · 候选最高 ${f2(Math.max(...fits))}（要 ${f2(FIT_NEED)}）`;
+  let s = `今日冷场 ${st.length} 次，开启话题 ${opened} 次`;
+  if (oks.length) s += ` · 最高 ${f2(Math.max(...oks))}（阈值 ${f2(OK_NEED)}）`;
+  if (fits.length) s += ` · 候选最高 ${f2(Math.max(...fits))}（阈值 ${f2(FIT_NEED)}）`;
   return s;
 }

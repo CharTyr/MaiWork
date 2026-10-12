@@ -39,7 +39,17 @@ export const SVG = {
   send: `<svg viewBox="0 0 24 24" ${P} stroke-width="2.2"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5"/></svg>`,
   chat: `<svg viewBox="0 0 24 24" ${P} stroke-width="1.9"><path d="M20 11.5a7.5 7.5 0 0 1-10.9 6.7L4.5 19.5l1.3-4A7.5 7.5 0 1 1 20 11.5z"/></svg>`,
   ext: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><path d="M14 4h6v6M20 4l-9 9M18 14v4.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 18.5v-11A1.5 1.5 0 0 1 5.5 6H10"/></svg>`,
+  info: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.2"/><circle cx="12" cy="7.8" r="0.6" fill="currentColor"/></svg>`,
 };
+
+// 「ⓘ」说明提示：说明文字默认收起，点图标才展开（design.md §8.5）。
+// html 由调用方负责：动态内容先 esc()，这里不再转义（说明里可以有 <b>、链接）。
+// 开关靠原生 <details>；点外面 / Esc 关闭、只开一个、防出屏在 events.js。
+export const tip = (html, label = "说明") =>
+  html ? `<details class="tip"><summary aria-label="${esc(label)}" title="${esc(label)}">${SVG.info}</summary><div class="tip-pop" role="note">${html}</div></details>` : "";
+// 表单标签 + 说明：提示放在 <label> 外面，点图标不会把焦点抢到输入框
+export const tipLabel = (forId, text, html) =>
+  html ? `<div class="lbl-row"><label for="${esc(forId)}">${text}</label>${tip(html)}</div>` : `<label for="${esc(forId)}">${text}</label>`;
 
 const ICONS = new Set("robot newspaper bulb monitor chart alarm moon speech tools package books filebox testtube palette seedling hourglass memo camera rocket joystick sparkles magnifier floppy link bell calendar dumpling bullseye flag pushpin lotus sleeping herb gear lock cloud teacup mailbox fish".split(" "));
 // 群头像：有 avatar 就盖一张真图在 emoji 上，图挂了就删掉露出 emoji

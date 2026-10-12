@@ -16,7 +16,7 @@ export function critBacked(c) {
 
 export function nextText(goal) {
   if (goal.state === "paused") return "暂停中";
-  return goal.next_check_ts ? `${when(goal.next_check_ts)}后检查` : "等新消息";
+  return goal.next_check_ts ? `${when(goal.next_check_ts)}后检查` : "等待新消息";
 }
 
 export function goalSections(g, v) {
@@ -44,8 +44,8 @@ export function goalSections(g, v) {
             <h3 class="item-title">${esc(goal.title)}</h3>
             <p class="item-body soft">${esc(goal.body)}</p>
             ${crit.length ? `<div class="progress" aria-label="完成 ${done} / ${crit.length}"><i style="width:${(done / crit.length) * 100}%"></i></div>` : ""}
-            <div class="status"><span class="dot ${goal.stale ? "failed" : goal.state === "paused" ? "" : "running"}"></span><span class="status-text">${goal.stale ? `<b class="bad-t">卡在：${esc(goal.stale_reason || "")}</b>` : `${crit.length ? `${done} / ${crit.length} · ` : ""}${pend ? `${pend} 条待确认 · ` : ""}${esc(nextText(goal))}`}</span></div>
-            ${human ? `<div class="via"><b class="warn-t">要群友自己动手，MaiWork 盯不了</b></div>` : ""}
+            <div class="status"><span class="dot ${goal.stale ? "failed" : goal.state === "paused" ? "" : "running"}"></span><span class="status-text">${goal.stale ? `<b class="bad-t">受阻：${esc(goal.stale_reason || "")}</b>` : `${crit.length ? `${done} / ${crit.length} · ` : ""}${pend ? `${pend} 条待确认 · ` : ""}${esc(nextText(goal))}`}</span></div>
+            ${human ? `<div class="via"><b class="warn-t">需由群成员亲自完成，MaiWork 无法跟进</b></div>` : ""}
           </div>
         </article>`;
       })
@@ -55,9 +55,9 @@ export function goalSections(g, v) {
     html += `<h2 class="h-sub">提醒 <small>${member.length} 件</small></h2>`;
     html += member
       .map((m) => {
-        const due = m.repeat === "daily" ? "每天" : m.due_ts ? when(m.due_ts) : "没定时间";
+        const due = m.repeat === "daily" ? "每天" : m.due_ts ? when(m.due_ts) : "未设定时间";
         const rem = m.remind_ts ? `${when(m.remind_ts)} 提醒` : "";
-        const left = m.until_ts ? ` · 循环还剩 ${dur(m.until_ts - now())}` : "";
+        const left = m.until_ts ? ` · 循环剩余 ${dur(m.until_ts - now())}` : "";
         return `
         <article class="item ruled enter" style="--i:${i++}">
           ${ico(m.icon || "alarm")}

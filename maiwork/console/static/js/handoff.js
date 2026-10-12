@@ -1,7 +1,7 @@
 // MaiWork 网页 · 交接包（docs/24）：把构想 / 任务写成一份说明，复制或下载给自己的个人 agent。
 // 预览 GET 不计数；真点了复制 / 下载才 POST /taken 记一次（失败不影响复制）。
 import { $, desktop, state } from "./state.js";
-import { SVG, esc, toast } from "./util.js";
+import { SVG, esc, tip, toast } from "./util.js";
 import { api } from "./api.js";
 import { clientId, loading } from "./pages/news.js";
 import { findIdea, ideaItems, ideaPicked } from "./pages/ideas.js";
@@ -36,16 +36,16 @@ export async function openHandoff(kind, id) {
     state.handoff.data = data;
   } catch (err) {
     if (my !== seq || !state.handoff) return;
-    state.handoff.err = err.status === 409 ? "这份内容里有不该带出去的信息，没法生成" : err.message;
+    state.handoff.err = err.status === 409 ? "内容包含不可导出的信息，无法生成" : err.message;
   }
   if (state.sheet === "handoff") repaintSheet();
 }
 
 export function handoffSheet() {
   const h = state.handoff;
-  const head = `<h1 class="h-page">交给我的 agent</h1><p class="h-meta sheet-lead">复制或下载，交给你自己的 AI 接着做</p>`;
+  const head = `<h1 class="h-page">交给我的 agent${tip("复制或下载以下内容，交给自己的 AI 继续处理。内容不含人名、群聊原文和本群链接。")}</h1>`;
   if (!h) return head;
-  if (h.err) return `${head}<div class="ho-err"><b>没法带出去</b><span>${esc(h.err)}</span></div>`;
+  if (h.err) return `${head}<div class="ho-err"><b>无法导出</b><span>${esc(h.err)}</span></div>`;
   if (!h.data) return head + loading();
   const d = h.data;
   return `${head}
@@ -55,7 +55,7 @@ export function handoffSheet() {
       <button class="btn primary" data-act="handoff-copy">${SVG.copy}复制</button>
       <button class="btn" data-act="handoff-download">下载 .md</button>
     </div>
-    <p class="fine">不含人名、群聊原话和本群链接</p>`;
+`;
 }
 
 function taken(action) {
@@ -71,7 +71,7 @@ export async function handoffCopy() {
   if (!h || !h.data) return;
   try {
     await navigator.clipboard.writeText(h.data.markdown || "");
-    toast("已复制，贴给你的 AI 就行");
+    toast("已复制");
     taken("copy");
   } catch (err) {
     // 网页不是 https 时浏览器常不给剪贴板：选中全文，让人自己复制

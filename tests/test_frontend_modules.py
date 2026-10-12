@@ -210,7 +210,7 @@ def test_guide_only_batch_points_to_articles():
     """一批只收了文章（没有资讯）时，资讯栏不说「没有值得看的」，而是指向「文章」栏。"""
     news = (JS / "pages/news.js").read_text(encoding="utf-8")
     view = news[news.index("export function viewNews"):]
-    assert "在「文章」里" in view
+    assert "已收录至「文章」" in view
     assert 'data-act="news-tab" data-t="guides"' in view, "给一个直接去文章栏的按钮"
 
 
@@ -314,11 +314,11 @@ def test_specialist_escalate_selector_contract():
     """任务双岗协作（docs/20 §5.3）：干活岗位能选「返工换用」；主模型岗没有这一项。"""
     text = (JS / "settings/agents.js").read_text(encoding="utf-8")
     assert 'id="agent-escalate"' in text
-    assert "返工换用" in text
+    assert "返工模型" in text
     assert 'modelOptions(p.escalate, "同主模型")' in text, "没选 = 用主模型的（用户 2026-10-05 定）"
     assert 'if ($("agent-escalate")) body.escalate = $("agent-escalate").value;' in text
     # 主模型岗不显示这一项：只排计划和验收，不亲自干活
-    assert '${main ? "" : `<label for="agent-escalate">' in text
+    assert '${main ? "" : `<div class="lbl-row"><label for="agent-escalate">' in text
 
 
 def test_task_detail_shows_lane_notes():

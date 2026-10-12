@@ -17,7 +17,7 @@ const esc = (s) => String(s ?? '').replaceAll('&', '&amp;').replaceAll('"', '&qu
 const context = vm.createContext({ console });
 const state = { trusted: { g1: { trusted: [], removed: [] } }, rssAuto: CFG.auto };
 const stubs = {
-  '../util.js': { dayWord: (ts) => (ts > CFG.now ? '后天' : '今天'), esc, ico: () => '', now: () => CFG.now },
+  '../util.js': { tip: (h) => (h ? '<details class="tip">' + h + '</details>' : ''), tipLabel: (f, t, h) => '<label for="' + f + '">' + t + '</label>' + (h ? '<details class="tip">' + h + '</details>' : ''), dayWord: (ts) => (ts > CFG.now ? '后天' : '今天'), esc, ico: () => '', now: () => CFG.now },
   '../api.js': { api: () => new Promise(() => {}), mq: (s) => esc(s) },
   '../state.js': { state },
   './models.js': { feedsSettings: () => '<p>BLOCKED</p>' },
@@ -104,14 +104,14 @@ def test_auto_log_and_source_map_in_collapsed_details(tmp_path):
     assert "退订 slow.example.com" in html and "试用期结束，一条都没被选进资讯" in html
     assert "不再推荐 bad.example.com" in html
     # 体检没过 = 这次没订上；0.9.0 上线首轮的老记录动作写的是 rejected，也按原因认出来
-    assert "没订上 busy.example.com" in html
-    assert "没订上 old.example.com" in html and "不再推荐 old.example.com" not in html
+    assert "未订阅 busy.example.com" in html
+    assert "未订阅 old.example.com" in html and "不再推荐 old.example.com" not in html
     assert "中文游戏媒体一手" in html
     assert "agg.example.com" in html and "找不到订阅地址" in html
     assert "近 30 天 ≥4 条 4 分以上" in html
     # 每周「找来源」搜索搜到的网站在来源地图里标出来（模型列的不标）
     assert html.count("ra-found") == 1
-    assert '找到的</span>' in html and "找来源搜索「独立游戏 blog」搜到" in html
+    assert '搜索发现</span>' in html and "找来源搜索「独立游戏 blog」搜到" in html
 
 
 def test_no_auto_details_before_data_loads(tmp_path):

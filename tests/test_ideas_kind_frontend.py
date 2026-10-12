@@ -20,7 +20,7 @@ const context = vm.createContext({ console });
 const state = { ideaMore: CFG.more ? CFG.idea.id : null, ideaOff: {} };
 const stubs = {
   '../state.js': { TONES: ['#000'], gadmin: () => CFG.admin, state },
-  '../util.js': { SVG: new Proxy({}, { get: (_, k) => `[${String(k)}]` }), dayWord: () => '今天', esc, ico: () => '' },
+  '../util.js': { tip: (h) => (h ? '<details class="tip">' + h + '</details>' : ''), tipLabel: (f, t, h) => '<label for="' + f + '">' + t + '</label>' + (h ? '<details class="tip">' + h + '</details>' : ''), SVG: new Proxy({}, { get: (_, k) => `[${String(k)}]` }), dayWord: () => '今天', esc, ico: () => '' },
   '../api.js': { agentFish: () => '', gview: () => null },
   './news.js': { emptyState: () => '<p>EMPTY</p>', fbButtons: () => '' },
   './group.js': { hash: () => 0 },
@@ -77,8 +77,8 @@ def test_talk_idea_leads_with_handoff_not_do(tmp_path):
     assert "交给我的 agent" in d
     assert 'data-act="idea-copy"' not in d
     assert 'data-op="do"' not in d
-    assert "复制后到群里" not in d
-    assert "这是个话题" in d and "冷场" in d
+    assert "复制后在群内" not in d
+    assert "这是一个话题" in d and "冷场" in d
     # 收起还在（管理员）
     assert 'data-op="dismiss"' in d
     # 底下那个小链接不重复出现
@@ -90,6 +90,6 @@ def test_idea_with_help_and_legacy_keep_old_buttons(tmp_path):
         d = render(tmp_path, idea)["detail"]
         assert 'data-act="idea-copy"' in d
         assert 'data-op="do"' in d
-        assert "复制后到群里" in d
-        assert "这是个话题" not in d
+        assert "复制后在群内" in d
+        assert "这是一个话题" not in d
         assert 'data-act="handoff"' in d  # 小链接照旧

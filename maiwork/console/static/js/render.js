@@ -38,7 +38,7 @@ export function renderTop() {
   const q = quiet(g);
   $("top").innerHTML = `
     <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="${esc(botName())}" />
-    ${admin() && state.groups.length > 1 ? `<button class="chip" data-act="groups" aria-label="换群，现在是 ${esc(gname(g))}">${mq(gname(g))}${SVG.down}</button>` : `<div class="chip">${mq(gname(g))}</div>`}
+    ${admin() && state.groups.length > 1 ? `<button class="chip" data-act="groups" aria-label="切换群，当前为 ${esc(gname(g))}">${mq(gname(g))}${SVG.down}</button>` : `<div class="chip">${mq(gname(g))}</div>`}
     <div class="chip-sub"><span class="dot ${q.live ? "ok" : ""}"></span>${esc(q.text)}</div>
     ${
       admin()
@@ -132,16 +132,16 @@ export function renderSide() {
   const up = (v && v.upcoming) || [];
   $("side").innerHTML = `
     ${pulseCard(g, v, true)}
-    <h2 class="h-sub">今天</h2>
+    <h2 class="h-sub">今日</h2>
     <div class="stats">
       <button class="stat" data-act="tab" data-tab="news"><b>${t.news || 0}</b><span>条资讯</span></button>
-      <button class="stat" data-act="tab" data-tab="group"><b>${t.topics || 0}</b><span>次开话题</span></button>
-      <button class="stat" data-act="tab" data-tab="tasks"><b>${t.pending || 0}</b><span>${gadmin() ? "件等你批" : "件等批"}</span></button>
-      <button class="stat" data-act="tab" data-tab="tasks"><b>${t.running || 0}</b><span>件在做</span></button>
+      <button class="stat" data-act="tab" data-tab="group"><b>${t.topics || 0}</b><span>次开启话题</span></button>
+      <button class="stat" data-act="tab" data-tab="tasks"><b>${t.pending || 0}</b><span>${gadmin() ? "件待审批" : "件等待审批"}</span></button>
+      <button class="stat" data-act="tab" data-tab="tasks"><b>${t.running || 0}</b><span>件进行中</span></button>
     </div>
     ${
       up.length
-        ? `<h2 class="h-sub">接下来</h2>${up.map((u) => `<div class="next">${ico(upcomingIcon(u))}<div><div class="next-time">${esc(when(u.at))}</div><div class="next-text">${esc(u.text)}</div></div></div>`).join("")}`
+        ? `<h2 class="h-sub">日程</h2>${up.map((u) => `<div class="next">${ico(upcomingIcon(u))}<div><div class="next-time">${esc(when(u.at))}</div><div class="next-text">${esc(u.text)}</div></div></div>`).join("")}`
         : ""
     }`;
 }
@@ -237,11 +237,10 @@ function landing() {
     <div class="landing">
       <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="" style="width:120px;height:120px" />
       <h1 class="h-page" style="margin-top:22px">MaiWork</h1>
-      <p class="landing-text">资讯、构想和任务，都在这里。</p>
-      ${bad ? `<div class="warn-box" style="width:100%;text-align:left">链接失效了。在群里发 <b>/mw 网页</b> 拿个新的。</div>` : ""}
+      ${bad ? `<div class="warn-box" style="width:100%;text-align:left">链接已失效。请在群内发送 <b>/mw 网页</b> 获取新链接。</div>` : ""}
       <div class="landing-box">
-        <div class="landing-t">我是群友</div>
-        <p>在群里发 <b>/mw 网页</b>，就能拿到本群链接。</p>
+        <div class="landing-t">群成员</div>
+        <p>在群内发送 <b>/mw 网页</b> 获取本群链接。</p>
       </div>
       <button class="btn primary" data-act="login" style="margin-top:20px;height:48px;padding:0 28px">管理员登录</button>
     </div>`;
@@ -251,9 +250,9 @@ function noGroups() {
   return `
     <div class="landing">
       <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="" style="width:120px;height:120px" />
-      <h1 class="h-page" style="margin-top:22px">还没有群</h1>
-      <p class="landing-text">先在设置里加个群</p>
-      <button class="btn primary" data-act="settings" style="height:48px;padding:0 28px">去设置</button>
+      <h1 class="h-page" style="margin-top:22px">暂无群</h1>
+      <p class="landing-text">请先在设置中添加群</p>
+      <button class="btn primary" data-act="settings" style="height:48px;padding:0 28px">前往设置</button>
     </div>`;
 }
 

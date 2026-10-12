@@ -129,7 +129,7 @@ class TestPresets:
             "https://api.upstage.ai/v1/systemone", "solar-decide",
         )
         assert up.models == ("solar-decide",)
-        assert up.note == "公测；choice 最多 26 个选项"
+        assert up.note == "公测中；choice 类问题最多 26 个选项。"
         inc = PRESETS["inception"]
         assert (inc.name, inc.url, inc.model) == (
             "Inception Mercury Decide", "https://api.inceptionlabs.ai/v1/decisions", "mercury-decide",
@@ -138,7 +138,7 @@ class TestPresets:
         liq = PRESETS["liquid"]
         assert (liq.url, liq.model) == ("https://api.liquid.ai/decisions/v1/systemone", "d1")
         assert liq.models == ("d1", "d1:free")
-        assert liq.note == "d1:free 免费档"
+        assert liq.note == "d1:free 为免费档。"
         cf = PRESETS["cloudflare"]
         assert cf.name == "Cloudflare Clef"
         assert cf.url == (

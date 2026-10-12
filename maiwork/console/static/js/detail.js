@@ -1,6 +1,6 @@
 // MaiWork 网页 · 任务 / 目标详情（右栏或抽屉）。
 import { $, DOT, STATUS, admin, desktop, gadmin, state } from "./state.js";
-import { SVG, dur, esc, ico, msText, safeUrl, when } from "./util.js";
+import { SVG, dur, esc, ico, msText, safeUrl, tip, when } from "./util.js";
 import { api, gview } from "./api.js";
 import { loading } from "./pages/news.js";
 import { findIdea, ideaDetail } from "./pages/ideas.js";
@@ -53,7 +53,7 @@ function reviewBlock(t) {
   if (lc && lc.links) {
     const bad = lc.unopened || 0;
     const urls = (lc.unopened_urls || []).slice(0, 10);
-    html += `<div class="dt-sec"><div class="dt-label">引用核对</div><div class="dt-text">${bad ? `${lc.links} 个链接里有 ${bad} 个没核实` : `${lc.links} 个链接都核实过`}</div>${
+    html += `<div class="dt-sec"><div class="dt-label">引用核对</div><div class="dt-text">${bad ? `${lc.links} 个链接中有 ${bad} 个未核实` : `${lc.links} 个链接均已核实`}</div>${
       urls.length ? `<ul class="dt-list lc-list">${urls.map((u) => `<li><a href="${safeUrl(u)}" target="_blank" rel="noopener noreferrer">${esc(u)}</a></li>`).join("")}</ul>` : ""
     }</div>`;
   }
@@ -67,21 +67,21 @@ function pausedBlock(t) {
   if (!r || !["tokens", "time", "capability"].includes(r.kind)) return "";
   if (r.kind === "capability") {
     if (!r.text) return "";
-    const tail = gadmin() ? "准备好了点「继续」，不做就「取消」。" : "等管理员决定。";
-    return `<div class="dt-sec"><div class="dt-label">为什么停了</div><div class="dt-text">${esc(r.text)}${esc(tail)}</div></div>`;
+    const tail = gadmin() ? "准备就绪后点击「继续」，不再执行请点击「取消」。" : "等待管理员处理。";
+    return `<div class="dt-sec"><div class="dt-label">暂停原因</div><div class="dt-text">${esc(r.text)}${esc(tail)}</div></div>`;
   }
   const text =
     r.kind === "tokens"
-      ? `用量到上限了（约 ${wan(r.used)} / ${wan(r.limit)} token），先停下等你定。`
-      : `做了 ${dur(r.used)}，到时长上限（${dur(r.limit)}）了，先停下等你定。`;
+      ? `用量已达上限（约 ${wan(r.used)} / ${wan(r.limit)} token），已暂停。`
+      : `已运行 ${dur(r.used)}，达到时长上限（${dur(r.limit)}），已暂停。`;
   // 群管理员进不了设置页：上限在哪改只告诉总管理员
-  const act = "点「继续」重新计算，或点「取消」。";
+  const act = "点击「继续」重新计算，或点击「取消」。";
   const tail = admin()
-    ? act + "上限在「设置 → 全部设置 → 任务上限」。"
+    ? act + "上限可在「设置 → 全部设置 → 任务上限」中修改。"
     : gadmin()
-      ? act + "上限由管理员定。"
-      : "等管理员决定。";
-  return `<div class="dt-sec"><div class="dt-label">为什么停了</div><div class="dt-text">${esc(text)}${esc(tail)}</div></div>`;
+      ? act + "上限由管理员设置。"
+      : "等待管理员处理。";
+  return `<div class="dt-sec"><div class="dt-label">暂停原因</div><div class="dt-text">${esc(text)}${esc(tail)}</div></div>`;
 }
 
 // 「怎样算完成」：有需求清单（docs/22 第一期）就按清单显示——原话里的是必须做到的，
@@ -90,11 +90,11 @@ function reqBlock(t) {
   const items = (t.requirements || []).filter((r) => r && r.origin !== "底线");
   if (items.length) {
     const tag = (r) =>
-      (r.origin === "补充" ? `<span class="ntag">加分</span>` : `<span class="ntag ok">原话</span>`) +
-      (r.kind === "真人" ? ` <span class="ntag warn">要人参与</span>` : "");
-    return `<div class="dt-sec"><div class="dt-label">完成标准</div><ul class="dt-list">${items
+      (r.origin === "补充" ? `<span class="ntag">补充</span>` : `<span class="ntag ok">原始要求</span>`) +
+      (r.kind === "真人" ? ` <span class="ntag warn">需人工参与</span>` : "");
+    return `<div class="dt-sec"><div class="dt-label">完成标准${tip("原始要求全部达成且内容属实，任务才算完成。")}</div><ul class="dt-list">${items
       .map((r) => `<li>${esc(r.text)} ${tag(r)}</li>`)
-      .join("")}</ul><div class="fine">原话都做到、内容属实才算完成</div></div>`;
+      .join("")}</ul></div>`;
   }
   return (t.criteria || []).length
     ? `<div class="dt-sec"><div class="dt-label">完成标准</div><ul class="dt-list">${t.criteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul></div>`
@@ -109,12 +109,12 @@ function critProof(c, goal, i) {
   if (critPending(c)) {
     const open = gadmin() && goal.state !== "done" && goal.state !== "cancelled";
     const b = (op, label) => `<button class="link-btn" data-act="goal-op" data-op="${op}" data-id="${esc(goal.id)}" data-i="${i}">${label}</button>`;
-    return `<div class="fine-inline"><b class="warn-t">待确认</b> · 以前勾的，没留依据，先不算完成${open ? `<span class="ck-acts">${b("confirm", "算数")}${b("revoke", "撤掉")}</span>` : ""}</div>`;
+    return `<div class="fine-inline"><b class="warn-t">待确认</b> · 此前标记完成但无依据，暂不计入完成${open ? `<span class="ck-acts">${b("confirm", "确认完成")}${b("revoke", "撤销")}</span>` : ""}</div>`;
   }
   const bits = [];
   if (c.task_id) bits.push(`来自任务 <span class="mono">${esc(c.task_id)}</span>`);
   if (c.evidence) bits.push(esc(c.evidence));
-  if (c.confirmed_ts) bits.push("管理员确认算数");
+  if (c.confirmed_ts) bits.push("管理员已确认");
   if (c.ts || c.confirmed_ts) bits.push(esc(when(c.ts || c.confirmed_ts)));
   return bits.length ? `<div class="fine">${bits.join(" · ")}</div>` : "";
 }
@@ -123,14 +123,14 @@ function critProof(c, goal, i) {
 function fitBlock(goal) {
   if (goal.fit !== "human" || goal.state === "done" || goal.state === "cancelled") return "";
   const why = goal.fit_reason ? `：${goal.fit_reason}` : "";
-  return `<div class="warn-box">这件事要群友自己动手，MaiWork 盯不了${esc(why)}。${gadmin() ? "建议点「不做了」；想留着也行，它不会再假装推进。" : "等管理员决定留不留。"}</div>`;
+  return `<div class="warn-box">该目标需由群成员亲自完成，MaiWork 无法跟进${esc(why)}。${gadmin() ? "建议点击「取消目标」；保留也可以，MaiWork 不会再推进。" : "等待管理员决定是否保留。"}</div>`;
 }
 
 function taskDetail(id) {
   const t = state.tasks[id];
   const row = findTaskRow(id);
   if (!t) {
-    if (t === null) return `<div class="empty">${ico("hourglass")}<b>找不到这个任务</b><span>可能已删除或不在本群</span></div>`;
+    if (t === null) return `<div class="empty">${ico("hourglass")}<b>未找到该任务</b><span>任务可能已删除或不属于本群</span></div>`;
     return row ? `<div class="dt-head">${ico(row.icon || "package")}<div><h2 class="dt-title">${esc(row.title)}</h2></div></div>${loading()}` : loading();
   }
   const tl = t.timeline || [];
@@ -142,7 +142,7 @@ function taskDetail(id) {
     if (["running", "reviewing", "queued", "waiting_input"].includes(st)) acts = b("pause", "暂停") + b("cancel", "取消");
     else if (st === "paused" || st === "shelved") acts = b("resume", "继续", true) + b("cancel", "取消");
     else if (st === "failed") acts = b("retry", "重试", true);
-    else if (st === "completed") acts = b("redeliver", t.undelivered ? "再发一次" : "重新发", t.undelivered);
+    else if (st === "completed") acts = b("redeliver", t.undelivered ? "重新发送" : "再次发送", t.undelivered);
   }
   return `
     <div class="dt-head">
@@ -152,15 +152,15 @@ function taskDetail(id) {
         <div class="dt-state"><span class="dot ${dot}"></span>${STATUS[st] || esc(st)} · <span class="mono">${esc(t.id)}</span></div>
       </div>
     </div>
-    <div class="dt-sec"><div class="dt-label">要做什么</div>${foldText(`req:${t.id}`, t.req || t.meta || "")}</div>
+    <div class="dt-sec"><div class="dt-label">任务内容</div>${foldText(`req:${t.id}`, t.req || t.meta || "")}</div>
     ${pausedBlock(t)}
-    ${t.auto_reason ? `<div class="dt-sec"><div class="dt-label">谁批的</div><div class="dt-text">自动批准：${esc(t.auto_reason)}</div></div>` : ""}
-    ${t.question ? `<div class="dt-sec"><div class="dt-label">在等回复</div><div class="quote">${esc(t.question)}</div></div>` : ""}
+    ${t.auto_reason ? `<div class="dt-sec"><div class="dt-label">审批</div><div class="dt-text">自动审批：${esc(t.auto_reason)}</div></div>` : ""}
+    ${t.question ? `<div class="dt-sec"><div class="dt-label">等待回复</div><div class="quote">${esc(t.question)}</div></div>` : ""}
     ${reqBlock(t)}
-    ${admin() && t.env ? `<div class="dt-sec"><div class="dt-label">在哪做</div><div class="dt-text">${esc(t.env)}</div></div>` : ""}
+    ${admin() && t.env ? `<div class="dt-sec"><div class="dt-label">运行环境</div><div class="dt-text">${esc(t.env)}</div></div>` : ""}
     ${
       !admin() && t.steps
-        ? `<div class="dt-sec"><div class="dt-label">过程</div><div class="dt-text">已做 ${t.steps} 步${st === "running" ? "，还在做" : ""} · 细节仅管理员可见</div></div>`
+        ? `<div class="dt-sec"><div class="dt-label">过程</div><div class="dt-text">已完成 ${t.steps} 步${st === "running" ? "，进行中" : ""} · 详情仅管理员可见</div></div>`
         : ""
     }
     ${
@@ -186,7 +186,7 @@ function taskDetail(id) {
     ${reviewBlock(t)}
     ${
       (t.delivery || []).length
-        ? `<div class="dt-sec"><div class="dt-label">成品</div>${t.delivery
+        ? `<div class="dt-sec"><div class="dt-label">成果</div>${t.delivery
             .map((x) => {
               const icon = x.kind === "群文件" ? "package" : x.kind === "here.now" ? "link" : "filebox";
               const title = x.url ? `<a href="${safeUrl(x.url)}" target="_blank" rel="noopener noreferrer">${esc(x.text)}</a>` : esc(x.text);
@@ -202,7 +202,7 @@ function taskDetail(id) {
 // 交接包入口（docs/24）：任何状态都能带走；被带走次数只给管理员看
 function handoffEntry(t) {
   const n = Number(t.handoff_count) || 0;
-  const count = gadmin() && n > 0 ? `<span class="ho-count">被带走 ${n} 次</span>` : "";
+  const count = gadmin() && n > 0 ? `<span class="ho-count">已导出 ${n} 次</span>` : "";
   return `<div class="ho-entry ho-task"><button class="link-btn" data-act="handoff" data-kind="task" data-id="${esc(t.id)}">交给我的 agent</button>${count}</div>`;
 }
 
@@ -216,7 +216,7 @@ function goalDetail(goal) {
       goal.state === "paused"
         ? `<button class="btn primary" data-act="goal-op" data-op="resume" data-id="${esc(goal.id)}">继续</button>`
         : `<button class="btn" data-act="goal-op" data-op="pause" data-id="${esc(goal.id)}">暂停</button>`
-    }<button class="btn" data-act="goal-op" data-op="cancel" data-id="${esc(goal.id)}">不做了</button></div>`;
+    }<button class="btn" data-act="goal-op" data-op="cancel" data-id="${esc(goal.id)}">取消目标</button></div>`;
   }
   return `
     <div class="dt-head">
@@ -234,8 +234,8 @@ function goalDetail(goal) {
       <ul class="checks">${crit.map((c, i) => `<li class="${critBacked(c) ? "done" : ""}"><span class="tick">${critBacked(c) ? SVG.check : ""}</span><span class="ck-body">${esc(c.text)}${critProof(c, goal, i)}</span></li>`).join("")}</ul></div>`
         : ""
     }
-    ${goal.last ? `<div class="dt-sec"><div class="dt-label">上次</div><div class="dt-text">${esc(when(goal.last.ts))} ${esc(goal.last.text)}</div></div>` : ""}
-    <div class="dt-sec"><div class="dt-label">下次</div><div class="dt-text">${esc(nextText(goal))}</div></div>
+    ${goal.last ? `<div class="dt-sec"><div class="dt-label">上次检查</div><div class="dt-text">${esc(when(goal.last.ts))} ${esc(goal.last.text)}</div></div>` : ""}
+    <div class="dt-sec"><div class="dt-label">下次检查</div><div class="dt-text">${esc(nextText(goal))}</div></div>
     ${goal.by ? `<div class="dt-sec"><div class="dt-label">来源</div><div class="dt-text">${esc(goal.by)}</div></div>` : ""}
     ${row ? `<div class="dt-sec"><div class="dt-label">相关任务</div>${taskRow(row, 0)}</div>` : ""}
     ${acts}`;
@@ -246,10 +246,10 @@ export function detailHTML() {
   if (state.detail.type === "task") return taskDetail(state.detail.id);
   if (state.detail.type === "idea") {
     const it = findIdea(state.detail.id);
-    return it ? ideaDetail(it) : `<div class="empty">${ico("bulb")}<b>找不到了</b></div>`;
+    return it ? ideaDetail(it) : `<div class="empty">${ico("bulb")}<b>未找到该构想</b></div>`;
   }
   const goal = findGoal(state.detail.id);
-  return goal ? goalDetail(goal) : `<div class="empty">${ico("bullseye")}<b>找不到了</b></div>`;
+  return goal ? goalDetail(goal) : `<div class="empty">${ico("bullseye")}<b>未找到该目标</b></div>`;
 }
 
 export async function loadTask(id) {

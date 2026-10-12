@@ -30,6 +30,9 @@ G1 = "900000001"
 SECRET = "[redacted]"
 SECRET2 = "jev-tmp-secret-12345"
 
+STATIC_DIR = Path(__file__).resolve().parents[1] / "maiwork/console/static"
+assert STATIC_DIR.is_dir(), f"找不到网页静态目录：{STATIC_DIR}"
+
 PRESET_ORDER = [
     "typesafe", "openrouter", "opencode", "commandcode", "vercel",
     "upstage", "inception", "liquid", "cloudflare", "openai",
@@ -180,9 +183,12 @@ class TestJevGet:
         assert [p["id"] for p in presets] == PRESET_ORDER
         for p in presets:
             assert set(p.keys()) == {
-                "id", "name", "protocol", "url", "model", "models", "docs_url", "key_url", "note",
+                "id", "name", "protocol", "url", "model", "models", "docs_url", "key_url", "note", "logo",
             }
             assert isinstance(p["models"], list) and p["models"]
+            # 每家都有自己的图标，且文件真的在（不是 404 的空图）
+            assert p["logo"] == f"/static/assets/logos/jev/{p['id']}.png"
+            assert (STATIC_DIR / "assets/logos/jev" / f"{p['id']}.png").is_file(), p["id"]
         by_id = {p["id"]: p for p in presets}
         assert by_id["openai"]["protocol"] == "openai_decisions"
         assert by_id["typesafe"]["url"] == "https://api.typesafe.ai/v1/systemone"

@@ -14,7 +14,7 @@ const esc = (s) => String(s ?? '').replaceAll('&', '&amp;').replaceAll('"', '&qu
 const context = vm.createContext({ console });
 const stubs = {
   '../state.js': { TONES: ['#000'], gadmin: () => true, state: {} },
-  '../util.js': { SVG: { lock: '<svg/>', check: '', close: '', copy: '', more: '' }, dayWord: () => '今天', esc, ico: () => '' },
+  '../util.js': { tip: (h) => (h ? '<details class="tip">' + h + '</details>' : ''), tipLabel: (f, t, h) => '<label for="' + f + '">' + t + '</label>' + (h ? '<details class="tip">' + h + '</details>' : ''), SVG: { lock: '<svg/>', check: '', close: '', copy: '', more: '' }, dayWord: () => '今天', esc, ico: () => '' },
   '../api.js': { agentFish: () => '', gview: () => null },
   './news.js': { emptyState: () => '<p>EMPTY</p>', fbButtons: () => '' },
   './group.js': { hash: () => 0 },
@@ -56,18 +56,18 @@ def test_blocked_row_shows_count_titles_reasons_and_is_admin_only_labeled(tmp_pa
         {"ts": 1, "kind": "group", "title": "帮大家约<开黑>", "reason": "要群友参与"},
         {"ts": 2, "kind": "personal", "title": "帮你找生蚝店", "reason": "要线下"},
     ]}})
-    assert "拦下 3 条" in html and "说不出群里真实需要" in html
+    assert "已拦截 3 条" in html and "不符合群内实际需求" in html
     assert "仅管理员可见" in html
     assert "帮大家约&lt;开黑&gt;" in html and "<开黑>" not in html
     assert "要群友参与" in html and "要线下" in html
-    assert "给个人" in html
+    assert 'ii-kind">个人<' in html
     # 折叠在副标题下、列表之前
     assert html.index("idea-blocked") < html.index("我可以整理一份清单")
 
 
 def test_blocked_row_also_shows_when_no_ideas_left(tmp_path):
     html = render(tmp_path, {"ideas": [], "ideas_blocked": {"count": 1, "recent": []}})
-    assert "拦下 1 条" in html and "EMPTY" in html
+    assert "已拦截 1 条" in html and "EMPTY" in html
 
 
 def test_no_row_without_field_or_zero_count(tmp_path):

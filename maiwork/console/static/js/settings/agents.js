@@ -2,7 +2,7 @@
 import { state, $ } from "../state.js";
 import { agentFish, agentSeed, api } from "../api.js";
 import { fishSvg, fishTraits, parseCustom, customSeed, FISH_SPECIES, FISH_EYES, FISH_COLORS, FISH_COLOR_NAMES, FISH_BASE_RE } from "../fish.js";
-import { esc, toast, SVG } from "../util.js";
+import { esc, tip, toast, SVG } from "../util.js";
 import { repaintSheet } from "../sheet.js";
 import { loading } from "../pages/news.js";
 import { avatarBlock } from "./identity.js";
@@ -12,15 +12,15 @@ import { EFFORT_NAMES, loadModels } from "./models.js";
 // 每个岗位一条程序生成的小鱼；fish_seed 为空时按岗位名固定，「换一条」只改这个岗位的种子。
 const fishOf = (kind, size) => agentFish(kind, size);
 const newSeed = () => Math.random().toString(36).slice(2, 10);
-const LABELS = { queued: "排队", running: "进行中", returned: "等检查", accepted: "已通过", rejected: "没采用", failed: "没做成", cancelled: "已取消" };
+const LABELS = { queued: "排队中", running: "进行中", returned: "待检查", accepted: "已通过", rejected: "未采用", failed: "失败", cancelled: "已取消" };
 const SPECIALISTS = new Set(["news", "idea", "goal"]);
-const PHASES = { discover: "广撒网", verify: "打开看", collect: "找候选", research: "调查", check: "查目标进展", execute: "做任务", "idea.research": "查构想", "goal.check": "查目标进展", "task.execute": "做任务" };
+const PHASES = { discover: "广泛搜索", verify: "核实内容", collect: "收集候选", research: "调研", check: "检查目标进展", execute: "执行任务", "idea.research": "调研构想", "goal.check": "检查目标进展", "task.execute": "执行任务" };
 
 const ORDER = ["main", "news", "idea", "goal", "task"];
 const TAGS = { main: "主模型", task: "通用执行" };
 const LEADS = {
-  main: "读懂群、派活和检查；群里口吻也用它",
-  news: "找资讯", idea: "想构想", goal: "推进目标", task: "做群友派的活",
+  main: "理解群聊、分派任务和检查结果；群内发言也使用该模型",
+  news: "搜集资讯", idea: "提出构想", goal: "推进目标", task: "执行群成员提交的任务",
 };
 const sortProfiles = (list) => [...list].sort((a, b) => {
   const ia = ORDER.indexOf(a.kind), ib = ORDER.indexOf(b.kind);
@@ -28,7 +28,7 @@ const sortProfiles = (list) => [...list].sort((a, b) => {
 });
 const isCustom = (p) => !ORDER.includes(p.kind);
 const modelById = (id) => ((state.mdl && state.mdl.models) || []).find((x) => x.id === id);
-const modelName = (id) => { const x = modelById(id); return x ? x.name || x.model : id ? `${id}（模型库里没有了）` : ""; };
+const modelName = (id) => { const x = modelById(id); return x ? x.name || x.model : id ? `${id}（已从模型库删除）` : ""; };
 
 export function agentsPage() {
   const profiles = sortProfiles((state.agents && state.agents.profiles) || []);
@@ -38,14 +38,12 @@ export function agentsPage() {
   const snapshot = state.agentSnapshot;
   const noModels = !((state.mdl && state.mdl.models) || []).length;
   return `
-    <p class="h-meta">主模型想和检查，专岗动手</p>
-    ${noModels ? `<div class="warn-box">还没有模型<button class="btn small" data-act="set-sub" data-sub="models" style="margin-left:8px">去添加</button></div>` : ""}
-    <div class="h-sub-row"><h2 class="h-sub">专岗</h2><button class="btn small" data-act="agent-new">新建</button></div>
+    ${noModels ? `<div class="warn-box">暂无模型<button class="btn small" data-act="set-sub" data-sub="models" style="margin-left:8px">前往添加</button></div>` : ""}
+    <div class="h-sub-row"><h2 class="h-sub">专岗${tip("主模型负责分析和检查，专岗负责执行具体工作。")}</h2><button class="btn small" data-act="agent-new">新建</button></div>
     ${state.agentNew ? newAgentForm() : ""}
     ${profiles.map((p) => state.agentEdit === p.kind ? profileForm(p) : state.agentFishEdit === p.kind ? fishForm(p) : profileRow(p) + (p.kind === "main" ? `<div class="agent-avatar">${avatarBlock()}</div>` : "")).join("")}
-    <h2 class="h-sub">本群工作记录</h2>
-    ${groups.length ? `<label for="agent-group" class="fine">选群</label><select id="agent-group">${groups.map((g) => `<option value="${esc(g.id)}"${state.agentGroup === g.id ? " selected" : ""}>${esc(g.name || `群 ${g.id}`)}</option>`).join("")}</select>` : `<p class="fine">先添加一个群</p>`}
-    <p class="fine">各专岗在本群做过的事</p>
+    <h2 class="h-sub">本群工作记录${tip("各专岗在所选群中的工作记录。")}</h2>
+    ${groups.length ? `<label for="agent-group" class="fine">群</label><select id="agent-group">${groups.map((g) => `<option value="${esc(g.id)}"${state.agentGroup === g.id ? " selected" : ""}>${esc(g.name || `群 ${g.id}`)}</option>`).join("")}</select>` : `<p class="fine">暂无群</p>`}
     ${state.agentError ? `<p class="err" role="alert">${esc(state.agentError)}</p><button class="btn small" data-act="agent-reload">刷新</button>` : ""}
     ${groups.length && !snapshot && !state.agentError ? loading() : ""}
     ${snapshot && snapshot.group_id === state.agentGroup ? (snapshot.agents || []).filter((a) => a.kind !== "main").map(journalSection).join("") : ""}`;
@@ -53,25 +51,24 @@ export function agentsPage() {
 
 function newAgentForm() {
   return `<div class="login ext-form">
-    <div class="ext-form-h">新建专岗</div>
-    <label for="agent-new-title">名称</label><input id="agent-new-title" maxlength="40" placeholder="如：写代码、做表格" />
-    <p class="fine">建好后在主模型 AGENTS.md 写何时派活</p>
+    <div class="ext-form-h">新建专岗${tip("创建后，需在主模型的 AGENTS.md 中写明何时向该专岗分派任务。")}</div>
+    <label for="agent-new-title">名称</label><input id="agent-new-title" maxlength="40" placeholder="例如：编写代码、制作表格" />
     <div class="actions"><button class="btn primary" data-act="agent-create">创建</button><button class="btn" data-act="agent-new-cancel">取消</button></div>
   </div>`;
 }
 
 function profileRow(p) {
-  const tag = TAGS[p.kind] || (isCustom(p) ? "自建" : "");
+  const tag = TAGS[p.kind] || (isCustom(p) ? "自定义" : "");
   const fresh = state.agentFishNew === p.kind;
   const off = p.kind !== "main" && p.enabled === false;
   const model = p.model
-    ? `${esc(modelName(p.model))}${p.effort ? ` · 思考${esc(EFFORT_NAMES[p.effort] || p.effort)}` : ""}${p.backup ? ` · 备用 ${esc(modelName(p.backup))}` : ""}`
-    : `<b>没选模型</b>${p.kind === "main" ? "（没法干活）" : "（暂用主模型）"}`;
+    ? `${esc(modelName(p.model))}${p.effort ? ` · 思考强度 ${esc(EFFORT_NAMES[p.effort] || p.effort)}` : ""}${p.backup ? ` · 备用 ${esc(modelName(p.backup))}` : ""}`
+    : `<b>未选择模型</b>${p.kind === "main" ? "（无法运行）" : "（暂用主模型）"}`;
   return `<div class="set-row agent-row"><span class="agent-fish${fresh ? " is-new" : ""}" data-fish="${esc(p.kind)}">${fishOf(p.kind, 48)}</span><div>
     <div class="set-name">${esc(p.title)}${tag ? `<span class="tag">${esc(tag)}</span>` : ""}</div>
-    <div class="set-text">${esc(LEADS[p.kind] || "主模型按 AGENTS.md 派活")}</div>
+    <div class="set-text">${esc(LEADS[p.kind] || "由主模型按 AGENTS.md 分派任务")}</div>
     <div class="set-text ext-st"><span class="dot ${off ? "" : "ok"}"></span>${off ? "已停用 · " : ""}${model}</div>
-    </div><div class="agent-row-acts"><button class="btn small ghost" data-act="agent-fish-reroll" data-kind="${esc(p.kind)}" title="随机换一条">换一条</button><button class="btn small ghost" data-act="agent-fish-custom" data-kind="${esc(p.kind)}" title="自己挑鱼种、颜色和眼神">自己挑</button><button class="btn small" data-act="agent-profile-edit" data-kind="${esc(p.kind)}">设置</button></div></div>`;
+    </div><div class="agent-row-acts"><button class="btn small ghost" data-act="agent-fish-reroll" data-kind="${esc(p.kind)}" title="随机生成">随机</button><button class="btn small ghost" data-act="agent-fish-custom" data-kind="${esc(p.kind)}" title="选择鱼种、颜色和眼神">自定义</button><button class="btn small" data-act="agent-profile-edit" data-kind="${esc(p.kind)}">设置</button></div></div>`;
 }
 
 function modelOptions(value, emptyLabel) {
@@ -79,7 +76,7 @@ function modelOptions(value, emptyLabel) {
   const eps = (state.mdl && state.mdl.endpoints) || [];
   const epName = (id) => { const e = eps.find((x) => x.id === id); return e ? e.name || e.id : id; };
   let html = `<option value="">${esc(emptyLabel)}</option>` + list.map((x) => `<option value="${esc(x.id)}"${x.id === value ? " selected" : ""}>${esc(x.name || x.model)} · ${esc(epName(x.endpoint))}</option>`).join("");
-  if (value && !modelById(value)) html += `<option value="${esc(value)}" selected>${esc(value)}（模型库里没有了）</option>`;
+  if (value && !modelById(value)) html += `<option value="${esc(value)}" selected>${esc(value)}（已从模型库删除）</option>`;
   return html;
 }
 
@@ -93,8 +90,7 @@ function effortOptions(modelId, value) {
 function docBlock(kind, which, title, lead, item, limit, extra) {
   const text = (item && item.text) || "";
   return `<div class="agent-doc">
-    <div class="h-sub-row"><label for="agent-doc-${which}" class="set-name" style="margin:0">${title}</label>${extra || ""}</div>
-    <p class="fine" style="margin:2px 0 6px">${lead}</p>
+    <div class="h-sub-row"><div class="lbl-row"><label for="agent-doc-${which}" class="set-name" style="margin:0">${title}</label>${tip(lead)}</div>${extra || ""}</div>
     <textarea id="agent-doc-${which}" class="mono-area" rows="10" spellcheck="false" data-limit="${limit || 16384}">${esc(text)}</textarea>
   </div>`;
 }
@@ -110,20 +106,18 @@ function profileForm(p) {
     <div class="ext-form-h"><span class="agent-fish sm">${fishOf(p.kind, 28)}</span>设置 ${esc(p.title)}</div>
     <label for="agent-title">名称</label><input id="agent-title" maxlength="40" value="${esc(p.title)}" />
     <h3 class="set-name" style="margin-top:14px">模型</h3>
-    <label for="agent-model">选模型</label><select id="agent-model">${modelOptions(p.model, main ? "选一个模型" : "同主模型")}</select>
+    <label for="agent-model">模型</label><select id="agent-model">${modelOptions(p.model, main ? "请选择模型" : "同主模型")}</select>
     <label for="agent-effort">思考强度</label><select id="agent-effort">${effortOptions(p.model, p.effort)}</select>
-    <label for="agent-backup">出错换用</label><select id="agent-backup">${modelOptions(p.backup, "不用")}</select>
-    ${main ? "" : `<label for="agent-escalate">返工换用</label><select id="agent-escalate">${modelOptions(p.escalate, "同主模型")}</select>
-    <p class="fine">打回两次后换它接着改；和当前相同就不再试</p>`}
+    <label for="agent-backup">备用模型</label><select id="agent-backup">${modelOptions(p.backup, "不使用")}</select>
+    ${main ? "" : `<div class="lbl-row"><label for="agent-escalate">返工模型</label>${tip("结果被退回两次后，改用该模型继续修改；与当前模型相同时不再重试。")}</div><select id="agent-escalate">${modelOptions(p.escalate, "同主模型")}</select>`}
     ${main ? "" : `<label class="chk"><input id="agent-enabled" type="checkbox"${p.enabled !== false ? " checked" : ""} />启用</label>`}
     ${main ? "" : `<label>可用 skill</label><div id="agent-skills">${names.map((name) => {
       const k = catalog.find((x) => x.name === name);
       return `<label class="chk"><input type="checkbox" value="${esc(name)}"${selected.has(name) ? " checked" : ""} />${esc(name)}${k && k.enabled === false ? `<span class="fine">（已停用）</span>` : ""}</label>`;
-    }).join("") || `<p class="fine">还没有 skill</p>`}</div>`}
+    }).join("") || `<p class="fine">暂无 skill</p>`}</div>`}
     ${!docs ? loading() : `
-      ${docBlock(p.kind, "soul", "SOUL.md", "性格口吻" + (docs.soul && docs.soul.synced_from_maibot ? " · 已同步 MaiBot" : ""), docs.soul, lim.soul, `<button type="button" class="btn small" data-act="agent-soul-sync" data-kind="${esc(p.kind)}">从 MaiBot 同步</button>`)}
-      ${docBlock(p.kind, "agents", "AGENTS.md", main ? "做事规矩 · 写清何时给谁派活" : "做事规矩", docs.agents, lim.agents, `<button type="button" class="btn small ghost" data-act="agent-agents-reset" data-kind="${esc(p.kind)}">恢复默认</button>`)}`}
-    <p class="fine">改这里不会放宽权限</p>
+      ${docBlock(p.kind, "soul", "SOUL.md", "性格与语气" + (docs.soul && docs.soul.synced_from_maibot ? "；当前内容已从 MaiBot 同步。" : "。"), docs.soul, lim.soul, `<button type="button" class="btn small" data-act="agent-soul-sync" data-kind="${esc(p.kind)}">从 MaiBot 同步</button>`)}
+      ${docBlock(p.kind, "agents", "AGENTS.md", main ? "工作规则，需写明何时向哪个专岗分派任务。" : "工作规则。", docs.agents, lim.agents, `<button type="button" class="btn small ghost" data-act="agent-agents-reset" data-kind="${esc(p.kind)}">恢复默认</button>`)}`}
     <p class="err" id="agent-err" hidden></p>
     <div class="actions"><button class="btn primary" data-act="agent-profile-save" data-kind="${esc(p.kind)}">保存</button><button class="btn" data-act="agent-profile-cancel">取消</button>${isCustom(p) ? `<button class="btn ghost danger" data-act="agent-delete" data-kind="${esc(p.kind)}">删除专岗</button>` : ""}</div>
   </div>`;
@@ -149,12 +143,12 @@ function fishForm(p) {
   const colors = FISH_COLORS.map((c, i) => pick("color", i, d.color === i, "", FISH_COLOR_NAMES[i], ` style="--c:${c}"`)).join("");
   const eyes = Object.entries(FISH_EYES).map(([k, name]) => pick("eyes", k, d.eyes === k, `${fishSvg(draftSeed(kind, d, { eyes: k }), { size: 40, still: true })}<span>${esc(name)}</span>`, name)).join("");
   return `<div class="login ext-form fish-form" data-kind="${esc(kind)}">
-    <div class="ext-form-h">给 ${esc(p.title)} 挑条鱼</div>
+    <div class="ext-form-h">${esc(p.title)} 的头像</div>
     <div class="fish-preview">${fishSvg(draftSeed(kind, d), { size: 96 })}<div><div class="set-name">${esc(FISH_SPECIES[d.species] || "")}</div><div class="fine">${esc(FISH_COLOR_NAMES[d.color] || "")} · ${esc(FISH_EYES[d.eyes] || "")}</div></div></div>
     <label>鱼种</label><div class="fish-opts" role="group" aria-label="鱼种">${species}</div>
     <label>颜色</label><div class="fish-swatches" role="group" aria-label="颜色">${colors}</div>
     <label>眼神</label><div class="fish-opts" role="group" aria-label="眼神">${eyes}</div>
-    <div class="actions"><button class="btn primary" data-act="agent-fish-save" data-kind="${esc(kind)}">保存</button><button class="btn" data-act="agent-fish-cancel">取消</button><button class="btn ghost" data-act="agent-fish-shape" data-kind="${esc(kind)}" title="只换鳍和姿态">换个姿势</button></div>
+    <div class="actions"><button class="btn primary" data-act="agent-fish-save" data-kind="${esc(kind)}">保存</button><button class="btn" data-act="agent-fish-cancel">取消</button><button class="btn ghost" data-act="agent-fish-shape" data-kind="${esc(kind)}" title="仅更换鳍和姿态">更换姿态</button></div>
   </div>`;
 }
 
@@ -173,12 +167,12 @@ function journalSection(a) {
   const handoffs = a.recent_handoffs || [];
   return `<section class="agent-journal">
     <h3 class="set-name"><span class="agent-fish sm">${fishOf(a.kind, 30)}</span>${esc(a.title)}</h3>
-    ${a.kind === "task" ? "" : `<details><summary>最近做过 · ${learned.length}</summary>
-      <p class="fine">防止重复做</p>
-      ${learned.map((m) => `<div class="agent-entry"><p>${esc(m.text || "")}</p>${referenceLinks(m.refs)}${m.source_id ? `<span class="fine">依据：${esc(m.source_id)}</span>` : ""}</div>`).join("") || `<p class="fine">还没有，检查通过后会记在这</p>`}
+    ${a.kind === "task" ? "" : `<details><summary>近期完成 · ${learned.length}</summary>
+      <p class="fine">用于避免重复工作</p>
+      ${learned.map((m) => `<div class="agent-entry"><p>${esc(m.text || "")}</p>${referenceLinks(m.refs)}${m.source_id ? `<span class="fine">依据：${esc(m.source_id)}</span>` : ""}</div>`).join("") || `<p class="fine">暂无记录</p>`}
     </details>`}
     <details><summary>最近交接 · ${handoffs.length}</summary>
-      ${handoffs.map(handoffEntry).join("") || `<p class="fine">还没有交接 · 有活时才会启动</p>`}
+      ${handoffs.map(handoffEntry).join("") || `<p class="fine">暂无交接记录</p>`}
     </details>
   </section>`;
 }
@@ -186,20 +180,20 @@ function journalSection(a) {
 function referenceLinks(refs) {
   return `<div class="agent-refs">${(refs || []).map((ref) => {
     const s = String(ref);
-    return /^https?:\/\//i.test(s) ? `<a href="${esc(s)}" target="_blank" rel="noopener noreferrer">看依据 ↗</a>` : `<span class="fine">${esc(s)}</span>`;
+    return /^https?:\/\//i.test(s) ? `<a href="${esc(s)}" target="_blank" rel="noopener noreferrer">查看依据 ↗</a>` : `<span class="fine">${esc(s)}</span>`;
   }).join(" · ")}</div>`;
 }
 
 function handoffEntry(h) {
   const created = h.created ? new Date(h.created * 1000).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
-  return `<details class="agent-entry"><summary><span class="tag">${esc(LABELS[h.status] || h.status || "")}</span>${esc(PHASES[h.phase] || h.phase || h.task_id || "回合")}<span class="fine"> ${esc(created)}</span></summary>
-    <p>${esc(h.summary || "还没交回")}</p>
+  return `<details class="agent-entry"><summary><span class="tag">${esc(LABELS[h.status] || h.status || "")}</span>${esc(PHASES[h.phase] || h.phase || h.task_id || "轮次")}<span class="fine"> ${esc(created)}</span></summary>
+    <p>${esc(h.summary || "尚未提交")}</p>
     ${h.review ? `<p class="fine">检查结果：${esc(typeof h.review === "string" ? h.review : JSON.stringify(h.review))}</p>` : ""}
     <p class="fine">要求：${esc(h.brief || "")}</p>
     ${h.criteria ? `<p class="fine">检查标准：${esc(typeof h.criteria === "string" ? h.criteria : JSON.stringify(h.criteria))}</p>` : ""}
     ${referenceLinks(h.evidence)}
-    ${(h.tools || []).length ? `<p class="fine">用的工具：${h.tools.map(esc).join("、")}</p>` : ""}
-    ${(h.skills || []).length ? `<p class="fine">用的 skill：${h.skills.map(esc).join("、")}</p>` : ""}
+    ${(h.tools || []).length ? `<p class="fine">使用的工具：${h.tools.map(esc).join("、")}</p>` : ""}
+    ${(h.skills || []).length ? `<p class="fine">使用的 skill：${h.skills.map(esc).join("、")}</p>` : ""}
     <p class="fine">编号 ${esc(h.id || "")}${h.parent_id ? ` · 来自 ${esc(h.parent_id)}` : ""}</p>
   </details>`;
 }
@@ -273,7 +267,7 @@ export async function actAgents(action, el) {
     case "agent-new-cancel": state.agentNew = false; repaintSheet(); return true;
     case "agent-create": {
       const title = ($("agent-new-title") && $("agent-new-title").value.trim()) || "";
-      if (!title) return toast("给专岗起个名", true), true;
+      if (!title) return toast("请填写专岗名称", true), true;
       el.disabled = true;
       try {
         const p = await api("POST", "/api/agents", { title });
@@ -283,18 +277,18 @@ export async function actAgents(action, el) {
         repaintSheet();
         await loadDocs(p.kind);
         repaintSheet();
-        toast("建好了，记得在主模型 AGENTS.md 写何时派活");
+        toast("已创建。请在主模型的 AGENTS.md 中写明何时分派任务");
       } catch (err) { el.disabled = false; toast(err.message, true); }
       return true;
     }
     case "agent-delete": {
       const kind = el.dataset.kind;
       const p = ((state.agents && state.agents.profiles) || []).find((x) => x.kind === kind);
-      if (!p || !confirm(`删除「${p.title}」？文件进回收目录，记录保留`)) return true;
+      if (!p || !confirm(`删除「${p.title}」？文件将移入回收目录，工作记录保留。`)) return true;
       try {
         await api("DELETE", `/api/agents/${encodeURIComponent(kind)}`);
         state.agentEdit = null;
-        await loadAgents(); repaintSheet(); toast("已删除，记得清掉主模型 AGENTS.md 里的提及");
+        await loadAgents(); repaintSheet(); toast("已删除。请同步删除主模型 AGENTS.md 中的相关内容");
       } catch (err) { toast(err.message, true); }
       return true;
     }
@@ -305,15 +299,15 @@ export async function actAgents(action, el) {
         const r = await api("POST", `/api/agents/${encodeURIComponent(kind)}/docs/soul/sync`, {});
         setDocText(kind, "soul", r);
         toast(r && r.persona_missing
-          ? (r.text ? "读不到 MaiBot 人格，没改" : "读不到 MaiBot 人格，先留空")
-          : "已同步 MaiBot");
+          ? (r.text ? "无法读取 MaiBot 人格，内容未更改" : "无法读取 MaiBot 人格，内容暂为空")
+          : "已从 MaiBot 同步");
       } catch (err) { toast(err.message, true); }
       finally { el.disabled = false; }
       return true;
     }
     case "agent-agents-reset": {
       const kind = el.dataset.kind;
-      if (!confirm("恢复默认？改过的会丢")) return true;
+      if (!confirm("恢复默认内容？已修改的内容将丢失。")) return true;
       try {
         const r = await api("POST", `/api/agents/${encodeURIComponent(kind)}/docs/agents/reset`, {});
         setDocText(kind, "agents", r);
@@ -361,7 +355,7 @@ export async function actAgents(action, el) {
         state.agentFishNew = kind;
         repaintSheet();
         setTimeout(() => { if (state.agentFishNew === kind) state.agentFishNew = null; }, 700);
-        toast("换好了");
+        toast("已更换");
       } catch (err) { el.disabled = false; toast(err.message, true); }
       return true;
     }
@@ -391,9 +385,9 @@ export async function actAgents(action, el) {
       const err = $("agent-err");
       const fail = (text) => { if (err) { err.textContent = text; err.hidden = false; } else toast(text, true); };
       const body = { title: $("agent-title").value.trim(), model: $("agent-model").value, effort: $("agent-effort").value, backup: $("agent-backup").value };
-      if (!body.title) return fail("请填名称"), true;
-      if (kind === "main" && !body.model) return fail("主模型必须选模型"), true;
-      if (body.backup && body.backup === body.model) return fail("备用不能和原来相同"), true;
+      if (!body.title) return fail("请填写名称"), true;
+      if (kind === "main" && !body.model) return fail("主模型必须选择模型"), true;
+      if (body.backup && body.backup === body.model) return fail("备用模型不能与当前模型相同"), true;
       if ($("agent-escalate")) body.escalate = $("agent-escalate").value;
       if ($("agent-enabled")) body.enabled = $("agent-enabled").checked;
       if ($("agent-skills")) body.skills = [...document.querySelectorAll("#agent-skills input:checked")].map((x) => x.value);
@@ -404,7 +398,7 @@ export async function actAgents(action, el) {
         if (!box || !docs) continue;
         const text = box.value;
         const limit = Number(box.dataset.limit) || 16384;
-        if (new Blob([text]).size > limit) return fail(`${which === "soul" ? "SOUL.md" : "AGENTS.md"} 太长了，最多 ${limit} 字节。`), true;
+        if (new Blob([text]).size > limit) return fail(`${which === "soul" ? "SOUL.md" : "AGENTS.md"} 过长，最多 ${limit} 字节。`), true;
         if (text !== ((docs[which] && docs[which].text) || "")) writes.push([which, text]);
       }
       el.disabled = true;
@@ -416,7 +410,7 @@ export async function actAgents(action, el) {
         await loadAgents();
         const { loadSettings } = await import("../router.js");
         await loadSettings().catch(() => null);
-        repaintSheet(); toast("已保存，下次生效");
+        repaintSheet(); toast("已保存，下次运行时生效");
       } catch (e) { el.disabled = false; fail(e.message); }
       return true;
     }

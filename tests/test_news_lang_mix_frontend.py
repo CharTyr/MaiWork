@@ -17,7 +17,7 @@ const context = vm.createContext({ console, document: doc, window: { addEventLis
 const fn = () => '';
 const stubs = {
   '../state.js': { admin: () => true, gadmin: () => true, state: {} },
-  '../util.js': { SVG: {}, dayWord: fn, dur: fn, esc, hhmm: fn, ico: fn, now: () => 0, richText: fn, safeUrl: fn, slotName: fn, tokens: fn, when: fn },
+  '../util.js': { tip: (h) => (h ? '<details class="tip">' + h + '</details>' : ''), tipLabel: (f, t, h) => '<label for="' + f + '">' + t + '</label>' + (h ? '<details class="tip">' + h + '</details>' : ''), SVG: {}, dayWord: fn, dur: fn, esc, hhmm: fn, ico: fn, now: () => 0, richText: fn, safeUrl: fn, slotName: fn, tokens: fn, when: fn },
   '../api.js': { agentFish: fn, api: async () => ({}), gview: fn },
 };
 const modules = new Map();
@@ -55,9 +55,9 @@ def test_shows_zh_and_foreign_counts_per_stage(tmp_path):
         "discovered_langs": {"zh": 30, "foreign": 12},
         "kept_langs": {"zh": 3, "foreign": 2},
     })
-    assert "搜的词" in html and "中文 6 · 英文 4" in html
+    assert "搜索词" in html and "中文 6 · 英文 4" in html
     assert "线索" in html and "中文 30 · 外文 12" in html
-    assert "上网页" in html and "中文 3 · 外文 2" in html
+    assert "收录" in html and "中文 3 · 外文 2" in html
 
 
 def test_old_batches_without_lang_fields_show_nothing(tmp_path):

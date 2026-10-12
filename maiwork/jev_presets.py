@@ -41,7 +41,7 @@ class JevPreset:
     models: tuple[str, ...]   # 这家还认的别的模型名（含默认那个）
     docs_url: str      # 官方文档
     key_url: str       # 去哪拿密钥（没有官方页就留空）
-    note: str          # 一句中文提醒
+    note: str          # 一句中文提醒（网页上收在表单标题旁的「ⓘ」里）
 
 
 PRESETS: dict[str, JevPreset] = {
@@ -54,7 +54,7 @@ PRESETS: dict[str, JevPreset] = {
         models=("jev-1.13.0", "jev-latest"),
         docs_url="https://docs.typesafe.ai/api",
         key_url="",
-        note="Jev 的原厂；内置那个就是它（也能用密钥文件）",
+        note="Jev 官方服务，即内置服务；也支持使用密钥文件。",
     ),
     "openrouter": JevPreset(
         id="openrouter",
@@ -65,7 +65,7 @@ PRESETS: dict[str, JevPreset] = {
         models=("typesafe/jev-1.13", "~typesafe/jev-latest"),
         docs_url="https://openrouter.ai/docs/guides/community/jev",
         key_url="https://openrouter.ai/keys",
-        note="一把密钥能用很多家模型",
+        note="一个密钥可调用多家模型。",
     ),
     "opencode": JevPreset(
         id="opencode",
@@ -76,7 +76,7 @@ PRESETS: dict[str, JevPreset] = {
         models=("jev-1.13", "jev-1.13-free"),
         docs_url="https://opencode.ai/docs/zen",
         key_url="",
-        note="jev-1.13-free 限时免费",
+        note="jev-1.13-free 限时免费。",
     ),
     "commandcode": JevPreset(
         id="commandcode",
@@ -87,7 +87,7 @@ PRESETS: dict[str, JevPreset] = {
         models=("typesafe/jev",),
         docs_url="https://commandcode.ai/models/jev",
         key_url="",
-        note="要有 Provider API 的套餐",
+        note="需要订阅 Provider API 套餐。",
     ),
     "vercel": JevPreset(
         id="vercel",
@@ -98,7 +98,7 @@ PRESETS: dict[str, JevPreset] = {
         models=("typesafe-ai/jev",),
         docs_url="https://vercel.com/docs/ai-gateway/sdks-and-apis/typesafe",
         key_url="",
-        note="走 Vercel 的网关，计费算在 Vercel 账上",
+        note="通过 Vercel AI Gateway 调用，费用计入 Vercel 账户。",
     ),
     "upstage": JevPreset(
         id="upstage",
@@ -109,7 +109,7 @@ PRESETS: dict[str, JevPreset] = {
         models=("solar-decide",),
         docs_url="https://console.upstage.ai/api/systemone",
         key_url="",
-        note="公测；choice 最多 26 个选项",
+        note="公测中；choice 类问题最多 26 个选项。",
     ),
     "inception": JevPreset(
         id="inception",
@@ -131,7 +131,7 @@ PRESETS: dict[str, JevPreset] = {
         models=("d1", "d1:free"),
         docs_url="https://docs.liquid.ai/lfm/models/d1",
         key_url="",
-        note="d1:free 免费档",
+        note="d1:free 为免费档。",
     ),
     "cloudflare": JevPreset(
         id="cloudflare",
@@ -145,7 +145,7 @@ PRESETS: dict[str, JevPreset] = {
         models=("clef-flash", "clef"),
         docs_url="https://developers.cloudflare.com/workers-ai/models/clef/",
         key_url="",
-        note="地址里的 {account_id} 换成你的 Cloudflare 账号 ID；换成 clef 时地址末尾也改成 clef",
+        note="需将地址中的 {account_id} 替换为 Cloudflare 账号 ID；使用 clef 模型时，地址末尾也需改为 clef。",
     ),
     "openai": JevPreset(
         id="openai",
@@ -156,6 +156,6 @@ PRESETS: dict[str, JevPreset] = {
         models=("gpt-6-luna",),
         docs_url="https://developers.openai.com/api/docs/guides/decisions",
         key_url="",
-        note="OpenAI 自家的判断模型（公测），不是 Jev",
+        note="OpenAI 自有的判断模型（公测中），不属于 Jev。",
     ),
 }

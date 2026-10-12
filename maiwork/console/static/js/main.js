@@ -57,9 +57,9 @@ document.addEventListener("submit", async (e) => {
       const r = await api("POST", "/api/login", { password: pw });
       closeSheet();
       await reboot();
-      toast(r && r.role === "group_admin" ? "已登录，可管本群" : "已登录，可看所有群");
+      toast(r && r.role === "group_admin" ? "已登录，可管理本群" : "已登录，可查看所有群");
     } catch (err) {
-      state.loginError = err.status === 429 ? "试太多次了，10 分钟后再试。" : err.status === 401 ? "密码不对。" : err.message;
+      state.loginError = err.status === 429 ? "尝试次数过多，请 10 分钟后重试。" : err.status === 401 ? "密码错误。" : err.message;
       const p = f.querySelector(".err");
       p.textContent = state.loginError;
       p.hidden = false;
@@ -73,7 +73,7 @@ document.addEventListener("submit", async (e) => {
     const input = $("chat-input");
     const text = input.value.trim();
     if (!text || !state.chat) return;
-    if (state.chat.running) return toast("上一句还没处理完", true);
+    if (state.chat.running) return toast("上一条消息仍在处理中", true);
     btn.disabled = true;
     try {
       await api("POST", `/api/chat/${encodeURIComponent(state.chat.id)}/messages`, { text });
@@ -101,7 +101,7 @@ document.addEventListener("submit", async (e) => {
       return;
     }
     if (!Object.keys(body).length) {
-      toast("没有改动");
+      toast("没有修改");
       return;
     }
     btn.disabled = true;
@@ -116,7 +116,7 @@ document.addEventListener("submit", async (e) => {
         render();
       }
       repaintSheet();
-      toast((state.rules.reload_pending || []).length ? "已保存，部分要重载才生效" : "已保存，马上生效");
+      toast((state.rules.reload_pending || []).length ? "已保存，部分设置需重载后生效" : "已保存并生效");
     } catch (ex) {
       errEl.textContent = ex.message;
       errEl.hidden = false;
@@ -128,9 +128,9 @@ document.addEventListener("submit", async (e) => {
   if (f.classList.contains("rss-add")) {
     const input = f.querySelector("input");
     const url = input.value.trim();
-    if (!/^https?:\/\/\S+$/.test(url)) return toast("地址要以 http:// 或 https:// 开头", true);
+    if (!/^https?:\/\/\S+$/.test(url)) return toast("地址须以 http:// 或 https:// 开头", true);
     btn.disabled = true;
-    btn.textContent = "获取中…";
+    btn.textContent = "正在获取…";
     try {
       const r = await api("POST", `/api/groups/${encodeURIComponent(f.dataset.g)}/rss`, { url });
       if (state.rssAuto) delete state.rssAuto[f.dataset.g];
@@ -148,13 +148,13 @@ document.addEventListener("submit", async (e) => {
     const kind = f.dataset.kind;
     const text = f.querySelector(".id-text").value;
     const limit = Number(f.querySelector(".id-text").dataset.limit) || 16384;
-    if (new Blob([text]).size > limit) return toast(`太长了，最多 ${limit} 字节`, true);
+    if (new Blob([text]).size > limit) return toast(`内容过长，最多 ${limit} 字节`, true);
     btn.disabled = true;
     try {
       await api("PUT", `/api/identity/${kind}`, { text });
       await loadIdentity();
       repaintSheet();
-      toast("保存好了");
+      toast("已保存");
     } catch (ex) {
       toast(ex.message, true);
     } finally {
@@ -182,7 +182,7 @@ document.addEventListener("submit", async (e) => {
     if (ok.length === 1) {
       state.extEdit = { kind: "mcp", name: null, prefill: { ...ok[0], roles: ["worker"], enabled: true, timeout_s: 30 } };
       repaintSheet();
-      if (skipped.length) toast(`跳过了：${skipped.map((x) => `${x.name}（${x.skipped}）`).join("、")}`, true);
+      if (skipped.length) toast(`已跳过：${skipped.map((x) => `${x.name}（${x.skipped}）`).join("、")}`, true);
       return;
     }
     btn.disabled = true;
@@ -191,7 +191,7 @@ document.addEventListener("submit", async (e) => {
     for (const x of ok) {
       try {
         const r = await api("POST", "/api/extensions/mcp", { name: x.name, url: x.url, headers: x.headers, tools: [], roles: ["worker"], enabled: true, timeout_s: 30 });
-        done.push(`${x.name}${r.ok ? "" : "（已添加，但没连上）"}`);
+        done.push(`${x.name}${r.ok ? "" : "（已添加，但连接失败）"}`);
       } catch (ex) {
         failed.push(`${x.name}：${ex.message}`);
       }
@@ -200,7 +200,7 @@ document.addEventListener("submit", async (e) => {
     state.extEdit = null;
     await loadExt();
     repaintSheet();
-    toast([done.length ? `已添加 ${done.join("、")}` : "", failed.length ? `没加上 ${failed.join("；")}` : "", skipped.length ? `跳过 ${skipped.map((x) => x.name).join("、")}` : ""].filter(Boolean).join("。"), !!failed.length);
+    toast([done.length ? `已添加 ${done.join("、")}` : "", failed.length ? `添加失败 ${failed.join("；")}` : "", skipped.length ? `已跳过 ${skipped.map((x) => x.name).join("、")}` : ""].filter(Boolean).join("。"), !!failed.length);
     return;
   }
   if (f.id === "mcp-form" || f.id === "skill-form") {
@@ -215,9 +215,9 @@ document.addEventListener("submit", async (e) => {
     let body;
     if (isMcp) {
       const url = $("x-url").value.trim();
-      if (!/^https:\/\/\S+$/.test(url)) return fail("地址要以 https:// 开头。");
+      if (!/^https:\/\/\S+$/.test(url)) return fail("地址须以 https:// 开头。");
       const roles = readRoles("x");
-      if (!roles.length) return fail("选一下给谁用。");
+      if (!roles.length) return fail("请选择适用对象。");
       const { headers, remove } = readHeaders();
       body = {
         name,
@@ -231,10 +231,10 @@ document.addEventListener("submit", async (e) => {
       };
     } else {
       const roles = readRoles("k");
-      if (!roles.length) return fail("选一下给谁用。");
+      if (!roles.length) return fail("请选择适用对象。");
       const text = $("k-body").value;
-      if (!text.trim()) return fail("内容不能是空的。");
-      if (new Blob([text]).size > 40000) return fail("太长了，最多 40KB。");
+      if (!text.trim()) return fail("内容不能为空。");
+      if (new Blob([text]).size > 40000) return fail("内容过长，最多 40KB。");
       body = { name, description: $("k-desc").value.trim(), roles, body: text };
     }
     btn.disabled = true;
@@ -245,7 +245,7 @@ document.addEventListener("submit", async (e) => {
       state.extEdit = null;
       await Promise.all([loadExt(), loadSettings()]);
       repaintSheet();
-      toast("保存好了，下次生效");
+      toast("已保存，下次运行时生效");
     } catch (ex) {
       fail(ex.message);
     } finally {
@@ -267,7 +267,7 @@ document.addEventListener("submit", async (e) => {
       state.ga[ed.gid] = await api("PUT", `/api/groups/${encodeURIComponent(ed.gid)}/group-admin`, { password: pw || undefined });
       closeSheet();
       repaintSheet();
-      toast("保存好了");
+      toast("已保存");
     } catch (ex) {
       err.textContent = ex.message;
       err.hidden = false;
@@ -282,7 +282,7 @@ document.addEventListener("submit", async (e) => {
     const note = $("ed-text").value.trim().slice(0, 60);
     const reasons = ed.reasons || [];
     if (!reasons.length && !note) {
-      err.textContent = "选个理由或写一句。";
+      err.textContent = "请选择问题或填写补充说明。";
       err.hidden = false;
       return;
     }
@@ -295,7 +295,7 @@ document.addEventListener("submit", async (e) => {
       closeSheet();
       await loadView(true);
       renderView();
-      toast("收到，下次会参考");
+      toast("已提交，下次搜集时参考");
     } catch (ex) {
       err.textContent = ex.message;
       err.hidden = false;
@@ -309,7 +309,7 @@ document.addEventListener("submit", async (e) => {
     const text = $("ed-text").value.trim();
     const err = $("ed-err");
     if (!text) {
-      err.textContent = ed.kind === "focus" ? "填一个 QQ 号。" : "内容不能是空的。";
+      err.textContent = ed.kind === "focus" ? "请填写 QQ 号。" : "内容不能为空。";
       err.hidden = false;
       return;
     }
@@ -317,7 +317,7 @@ document.addEventListener("submit", async (e) => {
     try {
       const g = grp();
       if (ed.kind === "focus") {
-        if (!/^\d{5,12}$/.test(text)) throw new Error("QQ 号是 5–12 位数字。");
+        if (!/^\d{5,12}$/.test(text)) throw new Error("QQ 号须为 5–12 位数字。");
         await api("POST", `/api/groups/${encodeURIComponent(g.id)}/focus`, { user_id: text, action: "add" });
       } else if (ed.id) {
         await api("PATCH", `/api/profile/${ed.id}`, { text });

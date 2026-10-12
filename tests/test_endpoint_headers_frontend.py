@@ -40,7 +40,7 @@ const context = vm.createContext({ console, location: { origin: 'http://local.te
 });
 const stubs = {
   '../state.js': { state, $: (id) => fields[id] },
-  '../util.js': { esc, ico: () => '', toast: () => {}, when: () => '' },
+  '../util.js': { tip: (h) => (h ? '<details class="tip">' + h + '</details>' : ''), tipLabel: (f, t, h) => '<label for="' + f + '">' + t + '</label>' + (h ? '<details class="tip">' + h + '</details>' : ''), esc, ico: () => '', toast: () => {}, when: () => '' },
   '../api.js': { api: async (method, url, body) => {
     calls.push({ method, url, body });
     return url.endsWith('/test') ? { ok: true, models: ['test-model'] }

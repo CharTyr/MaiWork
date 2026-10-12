@@ -90,7 +90,7 @@ const esc = (s) => String(s ?? '').replaceAll('&', '&amp;').replaceAll('"', '&qu
 const context = vm.createContext({ console });
 const state = { trusted: { g1: CFG.trusted }, rssAuto: { g1: {} } };
 const stubs = {
-  '../util.js': { dayWord: () => '今天', esc, ico: () => '', now: () => 0 },
+  '../util.js': { tip: (h) => (h ? '<details class="tip">' + h + '</details>' : ''), tipLabel: (f, t, h) => '<label for="' + f + '">' + t + '</label>' + (h ? '<details class="tip">' + h + '</details>' : ''), dayWord: () => '今天', esc, ico: () => '', now: () => 0 },
   '../api.js': { api: () => new Promise(() => {}), mq: (s) => esc(s) },
   '../state.js': { state },
   './models.js': { feedsSettings: () => '' },

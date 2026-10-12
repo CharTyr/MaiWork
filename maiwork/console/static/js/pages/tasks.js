@@ -13,7 +13,7 @@ export function taskRow(t, i) {
       ${ico(t.icon || "package")}
       <span>
         <span class="row-title">${esc(t.title)}</span>
-        <span class="row-meta"><span class="dot ${DOT[t.status] !== undefined ? DOT[t.status] : t.status}"></span><span>${STATUS[t.status] || esc(t.status)}${t.meta ? ` · ${esc(t.meta)}` : ""}${t.auto_reason ? " · 自动批准" : ""}${t.undelivered ? ` · <b class="warn-t">做完了，还没发</b>` : ""}</span></span>
+        <span class="row-meta"><span class="dot ${DOT[t.status] !== undefined ? DOT[t.status] : t.status}"></span><span>${STATUS[t.status] || esc(t.status)}${t.meta ? ` · ${esc(t.meta)}` : ""}${t.auto_reason ? " · 自动批准" : ""}${t.undelivered ? ` · <b class="warn-t">已完成，尚未发送</b>` : ""}</span></span>
       </span>
       <span class="chev">${SVG.right}</span>
     </button>`;
@@ -34,14 +34,14 @@ function pendingItems(p) {
 function fitNote(p) {
   const f = p.goal_fit;
   if (!f || !f.kind) return "";
-  if (f.kind === "online") return `<div class="via">能在网上盯${f.reason ? `：${esc(f.reason)}` : ""}</div>`;
-  if (f.kind === "error") return `<div class="via">没判断出能不能盯，批准后按目标接</div>`;
+  if (f.kind === "online") return `<div class="via">可在线跟进${f.reason ? `：${esc(f.reason)}` : ""}</div>`;
+  if (f.kind === "error") return `<div class="via">无法判断能否在线跟进，审批通过后按目标处理</div>`;
   if (f.kind !== "human") return "";
   const why = f.reason ? `：${esc(f.reason)}` : "";
   const then = f.alt_title
-    ? `批准后改成一次性任务开工：${esc(f.alt_title)}`
-    : "MaiWork 做不了，只能不批";
-  return `<div class="warn-box">要群友自己动手，MaiWork 盯不了${why}。${then}</div>`;
+    ? `审批通过后将改为一次性任务执行：${esc(f.alt_title)}`
+    : "MaiWork 无法完成，只能拒绝";
+  return `<div class="warn-box">需由群成员亲自完成，MaiWork 无法跟进${why}。${then}</div>`;
 }
 
 export function viewTasks(g, v) {
@@ -52,11 +52,11 @@ export function viewTasks(g, v) {
   const botName = (state.me && state.me.bot && state.me.bot.name) || "MaiBot";
   const goalsHtml = goalSections(g, v);
   if (!pending.length && !list.length && !goalsHtml) {
-    return html + emptyState("package", "还没有任务", `在群里 @${botName} 派活，或说「提醒我…」`);
+    return html + emptyState("package", "暂无任务", `在群内 @${botName} 提交任务，或发送「提醒我…」`);
   }
   let i = 0;
   if (pending.length) {
-    html += `<h2 class="h-sub" style="margin-top:22px">${gadmin() ? "等你批" : "等批准"} <small>${pending.length} 件</small></h2>`;
+    html += `<h2 class="h-sub" style="margin-top:22px">${gadmin() ? "待审批" : "等待审批"} <small>${pending.length} 件</small></h2>`;
     html += pending
       .map(
         (p) => `
@@ -66,15 +66,15 @@ export function viewTasks(g, v) {
             <h3 class="item-title">${esc(p.title)}</h3>
             ${pendingItems(p)}
             ${p.quote ? `<div class="quote"><span class="quote-by">${esc(p.who)} · ${esc(when(p.ts))}</span>${esc(p.quote)}</div>` : ""}
-            <div class="via">${esc(p.via || "")}${p.age_s > 86400 ? ` · <b class="warn-t">已等 ${dur(p.age_s)}</b>` : ""}</div>
+            <div class="via">${esc(p.via || "")}${p.age_s > 86400 ? ` · <b class="warn-t">已等待 ${dur(p.age_s)}</b>` : ""}</div>
             ${fitNote(p)}
             ${
               gadmin()
                 ? `<div class="actions">
               ${p.goal_fit && p.goal_fit.kind === "human" && !p.goal_fit.alt_title ? "" : `<button class="btn primary" data-act="req" data-op="approve" data-id="${esc(p.id)}">${p.goal_fit && p.goal_fit.kind === "human" ? "按任务批准" : "批准"}</button>`}
-              <button class="btn" data-act="req" data-op="reject" data-id="${esc(p.id)}">不批</button>
+              <button class="btn" data-act="req" data-op="reject" data-id="${esc(p.id)}">拒绝</button>
             </div>`
-                : `<div class="note-ok"><span class="dot pending"></span>批准后开工</div>`
+                : `<div class="note-ok"><span class="dot pending"></span>审批通过后开始执行</div>`
             }
           </div>
         </article>`
@@ -83,13 +83,13 @@ export function viewTasks(g, v) {
   }
   if (list.length) {
     html += `<h2 class="h-sub">所有任务</h2>`;
-    html += `<div class="filters" role="group" aria-label="按状态看">${FILTERS.map((f) => {
+    html += `<div class="filters" role="group" aria-label="按状态筛选">${FILTERS.map((f) => {
       const n = list.filter(f.match).length;
       return `<button class="filter" data-act="filter" data-f="${f.id}" aria-pressed="${state.filter === f.id}">${f.label}<span class="n">${n}</span></button>`;
     }).join("")}</div>`;
     const f = FILTERS.find((x) => x.id === state.filter) || FILTERS[0];
     const rows = list.filter(f.match);
-    html += rows.length ? `<div>${rows.map((t) => taskRow(t, i++)).join("")}</div>` : `<p class="h-meta" style="margin-top:18px">这里没有，换一个看看</p>`;
+    html += rows.length ? `<div>${rows.map((t) => taskRow(t, i++)).join("")}</div>` : `<p class="h-meta" style="margin-top:18px">暂无</p>`;
   }
   return html + goalsHtml;
 }

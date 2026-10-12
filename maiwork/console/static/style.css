@@ -1029,6 +1029,38 @@ body.booting .app, body.booting .tabbar { visibility: hidden; }
 .ext-form { margin: 12px 0 18px; padding: 18px; border-radius: 20px; border: 1px solid var(--line); background: var(--fill-2); gap: 8px; }
 .ext-form-h { font-size: 17px; font-weight: 800; margin-bottom: 2px; }
 .ext-form input, .ext-form textarea { background: var(--card); }
+/* 「ⓘ」说明提示（util.js 的 tip()）：说明默认收起，点开是一个小浮层 */
+.tip { position: relative; display: inline-block; vertical-align: middle; margin-left: 4px; font-size: 14px; font-weight: 400; letter-spacing: normal; line-height: 1; }
+.tip > summary { list-style: none; display: inline-grid; place-items: center; width: 30px; height: 30px; margin: -5px; border-radius: 999px; color: var(--gray); cursor: pointer; transition: color 0.15s, background-color 0.15s; }
+.tip > summary::-webkit-details-marker { display: none; }
+.tip > summary svg { width: 18px; height: 18px; }
+.tip > summary:hover, .tip[open] > summary { color: var(--ink); background: var(--fill); }
+.tip > summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 0; }
+.tip-pop { position: absolute; z-index: 20; top: calc(100% + 8px); left: -10px; transform: translateX(var(--tip-shift, 0)); width: max-content; max-width: min(320px, calc(100vw - 24px)); padding: 11px 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); box-shadow: 0 10px 30px rgba(var(--sh), 0.14); color: var(--ink-2); font-size: 13.5px; font-weight: 400; line-height: 1.6; text-align: left; white-space: normal; overflow-wrap: anywhere; }
+.tip-pop p { margin: 0; }
+.tip-pop p + p { margin-top: 6px; }
+.tip-pop a { color: var(--blue); }
+.tip[open] .tip-pop { animation: tip-in 0.16s var(--ease) both; }
+@keyframes tip-in { from { opacity: 0; } to { opacity: 1; } }
+.lbl-row { display: flex; align-items: center; gap: 2px; min-width: 0; }
+.lbl-row > label { min-width: 0; }
+.h-sub .tip, .ext-form-h .tip, .set-name .tip { margin-left: 6px; }
+/* 快速判断「添加」后的挑选框：一行一家，整行可点 */
+.jev-picks { display: grid; margin-top: 6px; border: 1px solid var(--line); border-radius: 16px; background: var(--card); overflow: hidden; }
+.jev-logo { width: 30px; height: 30px; border-radius: 8px; object-fit: cover; background: #fff; box-shadow: 0 0 0 1px var(--line); }
+.jev-logo-h { width: 24px; height: 24px; border-radius: 7px; vertical-align: -5px; margin-right: 8px; }
+.jev-pick-ico { grid-column: 1; grid-row: 1 / span 2; width: 30px; height: 30px; display: grid; place-items: center; }
+.jev-pick-ico .ico { width: 28px; height: 28px; }
+.jev-pick { display: grid; grid-template-columns: 30px minmax(0, 1fr) 18px; column-gap: 12px; row-gap: 2px; align-items: center; width: 100%; min-height: 52px; padding: 11px 14px 11px 16px; border: 0; border-bottom: 1px solid var(--line); background: none; color: var(--ink); font: inherit; text-align: left; cursor: pointer; transition: background-color 0.15s; }
+.jev-pick:last-child { border-bottom: 0; }
+.jev-pick:hover { background: var(--fill-2); }
+.jev-pick:active { background: var(--fill); }
+.jev-pick:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; border-radius: 12px; }
+.jev-pick-name { grid-column: 2; font-size: 15px; font-weight: 700; min-width: 0; }
+.jev-pick-name .tag { margin-left: 6px; }
+.jev-pick-note { grid-column: 2; font-size: 13px; color: var(--gray); line-height: 1.45; min-width: 0; }
+.jev-pick-go { grid-column: 3; grid-row: 1 / span 2; width: 18px; height: 18px; color: var(--gray-2); }
+.jev-pick-go svg { width: 18px; height: 18px; display: block; }
 .lbl-hint { font-size: 12.5px; font-weight: 500; color: var(--gray); margin-left: 4px; }
 .hdr-row { display: grid; grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr) 34px; gap: 8px; align-items: center; margin-bottom: 6px; }
 .hdr-row input[readonly] { color: var(--gray); background: var(--fill); }

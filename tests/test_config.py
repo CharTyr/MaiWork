@@ -405,8 +405,8 @@ class TestM2Sections:
 def test_full_label_adds_section_so_short_names_read_alone():
     """「全部设置」页名称很短（靠所在分节看懂）；管理员对话里单独出现时要带上节名。"""
     from maiwork import rules
-    assert rules.full_label("jev.timeout_ms") == "快速判断 · 等待上限"
-    assert rules.full_label("topics.min_gap_hours") == "开话题 · 话题间隔"
+    assert rules.full_label("jev.timeout_ms") == "快速判断 · 超时（毫秒）"
+    assert rules.full_label("topics.min_gap_hours") == "话题 · 话题间隔"
     # 项名和节名相同时不重复
     assert rules.full_label("group_space.enabled") == "群空间"
     # 没登记的键退回键名

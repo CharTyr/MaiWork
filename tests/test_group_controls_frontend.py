@@ -18,7 +18,7 @@ const approval={approvers:['qq:4321'],exempt_users:['qq:8765'],exempt_group:fals
 const context=vm.createContext({console,document:{querySelectorAll:()=>slots,addEventListener:(k,f)=>(listeners[k]||=[]).push(f)}});
 const stubs={
  '../state.js':{state,$:id=>fields[id]||null,admin:()=>state.me.role==='admin',gadmin:()=>['admin','group_admin'].includes(state.me.role)},
- '../util.js':{esc,SVG:{pen:'[pen]'},when:()=> '今天',toast:(x,b)=>toasts.push([x,!!b])},
+ '../util.js':{tip:(h)=>(h?'<details class="tip">'+h+'</details>':''),esc,SVG:{pen:'[pen]'},when:()=> '今天',toast:(x,b)=>toasts.push([x,!!b])},
  '../api.js':{api:async(method,url,body)=>{calls.push({method,url,body});if(cfg.fail&&method!=='GET')throw new Error('保存失败');
    if(url.endsWith('/push'))return method==='GET'?push:{...push,config:{...push.config,...body}};
    return method==='GET'?approval:body;}},
@@ -61,7 +61,7 @@ def test_controls_load_only_current_group_and_one_cap(tmp_path, role):
     out = run_controls(tmp_path, role=role)
     assert {c["url"] for c in out["loads"]} == {"/api/groups/g1/push", "/api/groups/g1/approval"}
     html = out["html"]
-    for text in ("主动发言", "开话题", "资讯卡片", "提构想", "每天最多", "23:00-08:00", "派活审批"):
+    for text in ("主动发言", "开启话题", "资讯卡片", "构想提及", "每日上限", "23:00-08:00", "任务审批"):
         assert text in html
     assert "不确定" in html and "&lt;script&gt;" in html and "<script>" not in html
     assert "news_card_daily_max" not in html and "idea_mention_daily_max" not in html
@@ -95,7 +95,7 @@ def test_switch_group_prevents_stale_write(tmp_path):
 
 def test_invalid_quiet_hours_keeps_form_without_request(tmp_path):
     out = run_controls(tmp_path, actions=["gctl-push-edit", "gctl-push-save"], fields={"gctl-quiet_hours": "乱填"})
-    assert out["calls"] == [] and "睡觉时段" in out["html"] and "乱填" in out["html"]
+    assert out["calls"] == [] and "免打扰时段" in out["html"] and "乱填" in out["html"]
 
 
 def test_failed_save_keeps_draft_and_inline_error(tmp_path):
@@ -112,12 +112,12 @@ def test_group_page_and_main_actions_wire_new_controls():
 
 def test_readonly_counts_follow_current_group_snapshot(tmp_path):
     out = run_controls(tmp_path, snapshotUpdate=True)
-    assert "今天发了 2 条" in out["html"] and "用了 3" in out["html"]
+    assert "今日已发送 2 条" in out["html"] and "占用额度 3" in out["html"]
 
 
 def test_error_stays_next_to_the_form_that_failed(tmp_path):
     out = run_controls(tmp_path, actions=["gctl-push-edit", "gctl-push-save"], fields={"gctl-quiet_hours": "错时段"})
-    assert out["html"].index("时段写成") < out["html"].index("派活审批")
+    assert out["html"].index("时段格式应为") < out["html"].index("任务审批")
 
 
 def test_approval_draft_preserves_blank_lines_while_typing(tmp_path):

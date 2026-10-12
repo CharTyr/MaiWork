@@ -49,14 +49,14 @@ const calls = [], fields = {}, toasts = [];
 for (const [id, value] of Object.entries(CFG.fields || {})) fields[id] = { value };
 fields['jv-err'] = { hidden: true, textContent: '' };
 fields['jv-check'] = { textContent: '', style: {} };
-const state = { jev: CFG.view, jevEdit: CFG.edit || null, mdl: { endpoints: [], models: [{ id: 'm1', model: 'cheap-mini', name: '便宜小模型' }, { id: 'm2', model: 'big-pro', name: '' }] } };
+const state = { jev: CFG.view, jevEdit: CFG.edit || null, jevPick: !!CFG.pick, mdl: { endpoints: [], models: [{ id: 'm1', model: 'cheap-mini', name: '便宜小模型' }, { id: 'm2', model: 'big-pro', name: '' }] } };
 const esc = (s) => String(s ?? '').replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 const context = vm.createContext({ console, setTimeout, confirm: () => true,
   document: { querySelectorAll: () => [], querySelector: () => null, addEventListener: () => {} },
 });
 const stubs = {
   '../state.js': { state, $: (id) => fields[id] },
-  '../util.js': { esc, ico: () => '', toast: (t, bad) => toasts.push([t, !!bad]), msText: (ms) => ms + ' 毫秒' },
+  '../util.js': { esc, ico: () => '', SVG: { right: '<svg></svg>' }, tip: (h) => (h ? '<details class="tip">' + h + '</details>' : ''), tipLabel: (f, t, h) => '<label for="' + f + '">' + t + '</label>' + (h ? '<details class="tip">' + h + '</details>' : ''), toast: (t, bad) => toasts.push([t, !!bad]), msText: (ms) => ms + ' 毫秒' },
   '../api.js': { api: async (method, url, body) => {
     calls.push({ method, url, body: body === undefined ? null : body });
     if (url.endsWith('/test')) return CFG.test_reply || { ok: true, ms: 321, error: '' };
@@ -82,17 +82,17 @@ await mod.link(link); await mod.evaluate();
 let handled = null;
 if (CFG.action) handled = await mod.namespace.actJev(CFG.action, { disabled: false, dataset: CFG.dataset || {}, textContent: '' });
 const html = mod.namespace.jevSection();
-console.log(JSON.stringify({ html, calls, handled, toasts, err: fields['jv-err'], check: fields['jv-check'], edit: state.jevEdit }));
+console.log(JSON.stringify({ html, calls, handled, toasts, err: fields['jv-err'], check: fields['jv-check'], edit: state.jevEdit, pick: !!state.jevPick }));
 """
 
 
-def run_js(tmp_path, *, action=None, dataset=None, fields=None, edit=None, view=None, test_reply=None):
+def run_js(tmp_path, *, action=None, dataset=None, fields=None, edit=None, view=None, test_reply=None, pick=False):
     node = shutil.which("node")
     assert node, "没有 Node，无法验证快速判断服务的前端"
     assert JS.is_file(), "缺 settings/jev.js"
     script = tmp_path / "jev.mjs"
     cfg = {"path": str(JS), "view": view or VIEW, "action": action, "dataset": dataset or {},
-           "fields": fields or {}, "edit": edit, "test_reply": test_reply}
+           "fields": fields or {}, "edit": edit, "test_reply": test_reply, "pick": pick}
     script.write_text(CHECK % json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
     r = subprocess.run([node, "--experimental-vm-modules", str(script)], capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr
@@ -112,7 +112,7 @@ def test_render_marks_in_use_and_offers_switch_and_presets(tmp_path):
     html = run_js(tmp_path)["html"]
     rows = _rows(html)
     assert set(rows) >= {"typesafe", "openrouter", "jabc12"}
-    assert "正在用" in rows["openrouter"]
+    assert "正在使用" in rows["openrouter"]
     assert 'data-act="jev-use"' not in rows["openrouter"]
     assert 'data-act="jev-use"' in rows["typesafe"] and 'data-act="jev-use"' in rows["jabc12"]
     # 内置的、正在用的都不能删
@@ -120,14 +120,75 @@ def test_render_marks_in_use_and_offers_switch_and_presets(tmp_path):
     assert 'data-act="jev-del"' not in rows["openrouter"]
     assert 'data-act="jev-del"' in rows["jabc12"]
     # 没填密钥要说出来；接口格式说人话
-    assert "没填" in rows["jabc12"] and "OpenAI Decisions" in rows["jabc12"]
+    assert "未填写" in rows["jabc12"] and "OpenAI Decisions" in rows["jabc12"]
+    # 平时不把预设一股脑列出来，只给一个「添加」入口
+    assert 'data-act="jev-preset"' not in html
+    assert 'data-act="jev-new"' not in html
+    assert 'data-act="jev-pick"' in html
+    # 默认格式不在每行重复标，只有不一样的才标
+    assert "System One" not in rows["openrouter"]
+
+
+def test_pick_lists_unused_presets_and_custom(tmp_path):
+    out = run_js(tmp_path, action="jev-pick")
+    html = out["html"]
+    assert out["handled"] is True
     # 还没接的预设（opencode / openai）列出来，已经接上的（openrouter / typesafe）不重复
     assert 'data-act="jev-preset" data-id="opencode"' in html
     assert 'data-act="jev-preset" data-id="openai"' in html
     assert 'data-act="jev-preset" data-id="openrouter"' not in html
     assert 'data-act="jev-preset" data-id="typesafe"' not in html
-    assert "jev-1.13-free 限时免费" in html
-    assert 'data-act="jev-new"' in html
+    # 挑选框只列名称和模型；说明进选中后表单标题旁的「ⓘ」
+    assert "jev-1.13" in html and "限时免费" not in html
+    assert 'data-act="jev-new"' in html and 'data-act="jev-pick-cancel"' in html
+    # 打开时「添加」按钮不再重复出现
+    assert 'data-act="jev-pick"' not in html
+
+
+def test_pick_cancel_and_choose_close_picker(tmp_path):
+    out = run_js(tmp_path, action="jev-pick-cancel", pick=True)
+    assert 'data-act="jev-preset"' not in out["html"] and 'data-act="jev-pick"' in out["html"]
+    out = run_js(tmp_path, action="jev-preset", dataset={"id": "opencode"}, pick=True)
+    assert 'data-act="jev-preset"' not in out["html"] and out["pick"] is False
+    out = run_js(tmp_path, action="jev-new", pick=True)
+    assert 'data-act="jev-preset"' not in out["html"] and out["pick"] is False
+
+
+def _logo_view():
+    v = json.loads(json.dumps(VIEW))
+    for p in v["presets"]:
+        p["logo"] = f"/static/assets/logos/jev/{p['id']}.png"
+    return v
+
+
+def test_rows_use_provider_logo(tmp_path):
+    rows = _rows(run_js(tmp_path, view=_logo_view())["html"])
+    # 接上的按预设认图标（内置 typesafe 也是）；自定义的没图标就用通用链接图标
+    assert 'src="/static/assets/logos/jev/typesafe.png"' in rows["typesafe"]
+    assert 'src="/static/assets/logos/jev/openrouter.png"' in rows["openrouter"]
+    assert "/logos/jev/" not in rows["jabc12"]
+    assert 'alt=""' in rows["openrouter"]  # 名字就在旁边，图标是装饰
+
+
+def test_picker_shows_provider_logo(tmp_path):
+    html = run_js(tmp_path, view=_logo_view(), action="jev-pick")["html"]
+    pick = html.split('id="jv-pick"')[1]
+    opencode = pick.split('data-id="opencode"')[1].split("</button>")[0]
+    assert 'src="/static/assets/logos/jev/opencode.png"' in opencode
+    custom = pick.split('data-act="jev-new"')[1].split("</button>")[0]
+    assert "/logos/jev/" not in custom
+
+
+def test_preset_form_shows_provider_logo(tmp_path):
+    html = run_js(tmp_path, view=_logo_view(), action="jev-preset", dataset={"id": "opencode"})["html"]
+    head = html.split('class="ext-form-h"')[1].split("</div>")[0]
+    assert 'src="/static/assets/logos/jev/opencode.png"' in head
+
+
+def test_all_presets_used_add_goes_straight_to_custom(tmp_path):
+    view = dict(VIEW, presets=[p for p in VIEW["presets"] if p["id"] in ("typesafe", "openrouter")])
+    html = run_js(tmp_path, view=view)["html"]
+    assert 'data-act="jev-new"' in html and 'data-act="jev-pick"' not in html
 
 
 def test_use_missing_shows_warning(tmp_path):
@@ -155,6 +216,8 @@ def test_preset_opens_prefilled_form(tmp_path):
     assert 'id="jv-key"' in html and 'type="password"' in html
     assert "jev-1.13-free" in html  # 可选模型列表
     assert "https://opencode.ai/docs/zen" in html
+    head = html.split('class="ext-form-h"')[1].split("</div>")[0]
+    assert '<details class="tip">' in head and "jev-1.13-free 限时免费" in head
 
 
 def _form(**kw):
@@ -247,7 +310,7 @@ def test_quick_judge_block_renders_current_values(tmp_path):
     assert "checked" not in kw_tag
     en_tag = html.split('id="qj-enabled"')[1].split(">")[0]
     assert "checked" in en_tag
-    assert "今天判断 4 次" in html
+    assert "今日已判断 4 次" in html
     assert 'data-act="qj-save"' in html
 
 

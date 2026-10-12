@@ -17,7 +17,7 @@
 - `handoff.js` 是交接包（docs/24）：构想 / 任务详情底部「交给我的 agent」→ `openHandoff()` 取 `GET /api/handoff/{idea|task}/{id}`（构想带当前勾选的 `items`；`seq` 挡住慢请求）→ `sheet.js` 画 `handoffSheet()` 预览；复制（剪贴板不可用时选中全文）/ 下载（浏览器里存成 `.md`）后 `POST .../taken` 记一次，失败静默。手机上从详情抽屉打开的，关掉回到详情（`state.handoff.back`）。「被带走 N 次」只在 `gadmin()` 下显示。
 - `chat.js` 管理管理员对话的消息列表与未完成对话轮询；`onboarding.js` 引导模型、服务群、可选密钥、联网搜索、管理员和头像。搜索步骤懒加载 `/api/extensions/presets`，按预设清单顺序提交勾选项到 `/api/extensions/presets-setup`（第一家主搜索，其余备用，而非点击先后顺序），必填密钥先在表单校验，实际激活与秘密保存由后端完成。
 - `main.js` 的 `edit` 提交管群画像条目和关注成员；口味小结 / 资讯偏好的编辑已删（并进群页「这个群」区，见 `pages/groupctx.js`）。
-- `api.js::gplat()` / `platTag()` 根据后端 `platform` 显示 Telegram / QQ 官方标识（旧数据缺省 `qq`），用于左栏、群选择和群页；`update.js` 显示只提示不自动安装的新版信息；`pulse.js` 画群状态概况；`util.js` 提供 HTML 转义、URL 检查、图标与北京时间格式化。
+- `api.js::gplat()` / `platTag()` 根据后端 `platform` 显示 Telegram / QQ 官方标识（旧数据缺省 `qq`），用于左栏、群选择和群页；`update.js` 显示只提示不自动安装的新版信息；`pulse.js` 画群状态概况；`util.js` 提供 HTML 转义、URL 检查、图标与北京时间格式化，以及「ⓘ」说明提示 `tip(html)` / `tipLabel(forId, text, html)`（`<details class="tip">`；调用方负责转义内容；不能放进别的 `<summary>`）；`events.js` 负责提示同一时间只开一个、点外面或 Esc 关闭、贴边时横向挪回屏内。说明性文字一律收进提示，状态、警告、错误和空状态留在原处（见 `design.md` §8.5 / §11，`tests/test_ui_copy_formal.py` 守口语词）。
 
 ## Flow
 
@@ -26,5 +26,5 @@
 ## Integration
 
 - [群页面](pages/codemap.md) ｜ [设置页面](settings/codemap.md) ｜ [静态入口及样式](../codemap.md) ｜ [服务端控制台](../../codemap.md)。
-- 重要 API：`/api/me`、`/api/groups`、`/api/groups/{ref}`、`/api/settings`、`/api/settings/config`、`/api/chat/*`；资讯相关新增 `/api/extensions/presets`、`/api/extensions/presets/{id}`、`/api/extensions/presets-setup`、`/api/groups/{id}/trusted-sources`、`/api/groups/{id}/rules*` / `/api/groups/{id}/skills*`（本群规矩 / 本群做法）、`/api/groups/{id}/push`（每群「往群里发」；旧 `card-push` 是别名）、`/api/groups/{id}/approval`（每群批准名单）、`/api/groups/{id}/feeds/domains`（按群屏蔽来源）和 `/go/{id}`。后端的 `ConsoleServer` 负责权限/群隔离和存储，不能从前端按钮可见性推定接口授权。
+- 重要 API：`/api/me`、`/api/groups`、`/api/groups/{ref}`、`/api/settings`、`/api/settings/config`、`/api/chat/*`；资讯相关新增 `/api/extensions/presets`、`/api/extensions/presets/{id}`、`/api/extensions/presets-setup`、`/api/groups/{id}/trusted-sources`、`/api/groups/{id}/rules*` / `/api/groups/{id}/skills*`（本群规则 / 本群做法）、`/api/groups/{id}/push`（每群「主动发言」；旧 `card-push` 是别名）、`/api/groups/{id}/approval`（每群「任务审批」名单）、`/api/groups/{id}/feeds/domains`（按群屏蔽来源）和 `/go/{id}`。后端的 `ConsoleServer` 负责权限/群隔离和存储，不能从前端按钮可见性推定接口授权。
 - 数据以服务端结果为准；`localStorage` 只记当前浏览器的反馈、评价与客户端标识，不能当作服务端授权或真相。

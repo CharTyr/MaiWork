@@ -56,7 +56,7 @@ def test_handoff_count_only_for_admins():
         # 计数那一段必须挂在 gadmin() 判断下
         idx = src.index("handoff_count")
         near = src[idx : idx + 200]
-        assert "gadmin() &&" in near and "被带走" in near, f"{name}：被带走次数只给管理员看"
+        assert "gadmin() &&" in near and "已导出" in near, f"{name}：导出次数只给管理员看"
 
 
 def test_sheet_renders_handoff_and_returns_to_detail_on_phone():

@@ -44,7 +44,7 @@ export function pulseCard(g, v, compact) {
       <div class="pulse-now"><b>${esc(q.text)}</b>${q.usual ? `<br />${esc(q.usual)}` : ""}</div>
     </div>`;
   if (!p || !p.bins || !p.bins.length) {
-    return `<section class="pulse-card${compact ? " compact" : ""}" aria-label="群动态">${head}<div class="pulse pulse-empty">读取中…</div></section>`;
+    return `<section class="pulse-card${compact ? " compact" : ""}" aria-label="群动态">${head}<div class="pulse pulse-empty">加载中…</div></section>`;
   }
   const bins = p.bins;
   const step = p.step || 900;
@@ -62,7 +62,7 @@ export function pulseCard(g, v, compact) {
     ...sleepBands(start, end, p.sleep).map(([l, r], k) => {
       const L = pct(l);
       const W = pct(r) - L;
-      return `<div class="band sleep" style="left:${L}%;width:${W}%">${k === 0 && W > 12 ? `<span class="band-label">${ico("moon", "")}睡觉</span>` : ""}</div>`;
+      return `<div class="band sleep" style="left:${L}%;width:${W}%">${k === 0 && W > 12 ? `<span class="band-label">${ico("moon", "")}免打扰</span>` : ""}</div>`;
     }),
     ...(p.spells || []).map((s) => {
       const L = pct(s.from);
@@ -73,7 +73,7 @@ export function pulseCard(g, v, compact) {
     .filter((t) => t.at >= start)
     .map((t) => {
       const L = pct(t.at);
-      return `<div class="mark${L < 30 ? " left" : ""}" style="left:${L}%"><span class="mark-label">开话题${t.replies ? ` · ${t.replies} 人接` : ""}</span></div>`;
+      return `<div class="mark${L < 30 ? " left" : ""}" style="left:${L}%"><span class="mark-label">开启话题${t.replies ? ` · ${t.replies} 人回应` : ""}</span></div>`;
     })
     .join("");
   const tickHours = compact ? [0, 8, 16] : [0, 4, 8, 12, 16, 20];
@@ -95,16 +95,16 @@ export function pulseCard(g, v, compact) {
           <path class="line" d="${line}" pathLength="1" />
         </svg>
         ${marks}
-        ${total ? "" : `<div class="pulse-none">24 小时没人说话</div>`}
+        ${total ? "" : `<div class="pulse-none">近 24 小时无人发言</div>`}
         <div class="axis">${ticks.join("")}<span style="left:100%">现在</span></div>
       </div>
       ${
         compact
           ? ""
           : `<div class="legend">
-              <span><i class="l-sleep"></i>睡觉时间，不开话题</span>
+              <span><i class="l-sleep"></i>免打扰时段</span>
               <span><i class="l-cold"></i>冷场</span>
-              <span><i class="l-topic"></i>MaiWork 开了话题</span>
+              <span><i class="l-topic"></i>MaiWork 开启话题</span>
             </div>`
       }
     </section>`;
