@@ -5,7 +5,7 @@
 # 是否启用 MaiWork；默认关闭。宿主在没写 enabled 时会当成开启，所以这里必须显式写。
 enabled = false
 # 配置版本；改默认值时会升。一般不用手改。
-config_version = "0.4.9"
+config_version = "0.5.0"
 
 
 [groups]
@@ -246,8 +246,12 @@ runtime_max_sec = 1800
 # 本机执行方式：只写 "systemd"（用 systemd-run 以独立用户跑，带内存/时长上限，隔离）。
 # 本机开发测试要无隔离的 "direct" 时不用改这里（写了默认也不生效），见 docs/00-开发入门.md。
 local_mode = "systemd"
-# 本机命令以哪个系统用户身份跑（systemd 模式的 --uid/--gid）。
+# 本机命令以哪个系统用户身份跑（systemd 模式的 --uid/--gid）。不许填 root 或 uid 为 0 的账号。
 run_as = "maiwork"
+# 允许子 agent 访问本机服务与内网地址（默认关）。
+# 关闭时：执行命令能出公网，但访问不到本机服务（控制台、MaiBot）、内网和 169.254.169.254
+# 之类的地址；DNS 服务器单独放行，解析照常。确实要让子 agent 碰内网时才开启。
+local_network = false
 # 每个工作区同时跑的子 agent 个数。
 max_parallel = 2
 # 子 agent 单条命令的默认时长上限（秒）。

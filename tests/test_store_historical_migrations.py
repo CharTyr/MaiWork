@@ -79,7 +79,9 @@ CREATE INDEX IF NOT EXISTS idx_chat_feeds_key ON chat_feeds(group_id, key);
 
 STEP_PROFILE = 2      # _m_profile
 STEP_CHAT_FEEDS = 31  # _m_chat_feeds
-LATEST = len(_MIGRATIONS)  # 39（34 = 历史步骤 + 35 task_lanes + 36 brief + 37 lane 原始历史 + 38 构想 kind + 39 goal fit）
+STEP_CHAT_LOG_IDS = 40  # _m_chat_log_ids（FTS5 chat_log 的去重账本）
+LATEST = len(_MIGRATIONS)  # 40（34 = 历史步骤 + 35 task_lanes + 36 brief + 37 lane 原始历史
+#                              + 38 构想 kind + 39 goal fit + 40 chat_log 去重账本）
 
 _DEAD_MODULE = "CharTyr_MaiWork.maiwork.chat_feed"
 
@@ -222,16 +224,18 @@ class TestStep31ChatFeedsHistory:
 # ----------------------------------------------------------------------
 
 class TestFullMigrate:
-    def test_latest_version_is_39(self) -> None:
+    def test_latest_version_is_40(self) -> None:
         # 34 = 历史步骤恢复原样后的库号；35 = 任务双岗协作的 task_lanes（docs/20）；
         # 36 = 资讯卡片短摘要 brief（news_items.brief）；37 = lane 原始历史归档（docs/27）；
-        # 38 = 构想 kind（docs/18 §十）；39 = 目标补判 fit（goals.fit / requests.goal_fit）
-        assert LATEST == 39, "库号只因 task_lanes / brief / lane 原始历史 / 构想 kind / goal fit 各加一步"
+        # 38 = 构想 kind（docs/18 §十）；39 = 目标补判 fit（goals.fit / requests.goal_fit）；
+        # 40 = chat_log 去重账本 chat_log_ids（FTS5 上没法建唯一索引）
+        assert LATEST == 40, "库号只因 task_lanes / brief / lane 原始历史 / 构想 kind / goal fit / chat_log 去重账本各加一步"
         assert store_mod._MIGRATIONS[34].__name__ == "_m_task_lanes"
         assert store_mod._MIGRATIONS[35].__name__ == "_m_news_brief"
         assert store_mod._MIGRATIONS[36].__name__ == "_m_task_lane_raw"
         assert store_mod._MIGRATIONS[37].__name__ == "_m_idea_kind"
         assert store_mod._MIGRATIONS[38].__name__ == "_m_goal_fit"
+        assert store_mod._MIGRATIONS[39].__name__ == "_m_chat_log_ids"
 
     def test_fresh_db_has_no_history_tables_at_34(self, store: Store) -> None:
         """新库一路迁到最新：两张历史表建了又被后面的 DROP 拆掉，终态干净。"""
@@ -284,6 +288,133 @@ class TestFullMigrate:
         try:
             s.migrate()
             assert s.read().execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        finally:
+            s.close()
+
+
+# ----------------------------------------------------------------------
+# 第 40 步：chat_log 的去重账本 chat_log_ids
+# ----------------------------------------------------------------------
+
+
+class _Msg:
+    """chatlog.record_messages 要的最小消息对象（host.Msg 同名字段）。"""
+
+    def __init__(self, mid: str, ts: float, text: str, *, user: str = "u1", name: str = "阿一") -> None:
+        self.id = mid
+        self.ts = ts
+        self.text = text
+        self.user_id = user
+        self.user_name = name
+        self.is_bot = False
+
+
+class TestStep40ChatLogIds:
+    """FTS5 虚表 chat_log 上没法建唯一索引（老去重是每条全表扫，3 万行时一批 200 条十几秒），
+    另立普通表 chat_log_ids 当去重账本：PRIMARY KEY (group_id, message_id) WITHOUT ROWID
+    + (group_id, ts) 索引供 14 天清理用；老库按 chat_log 回填一份。"""
+
+    def test_fresh_db_has_ids_table(self, store: Store) -> None:
+        assert store.migrate() == LATEST
+        assert "chat_log_ids" in _tables(store)
+
+    def test_columns_and_primary_key(self, store: Store) -> None:
+        _run_steps(store, STEP_CHAT_LOG_IDS)
+        assert _columns(store, "chat_log_ids") == [
+            ("group_id", "TEXT", 1, None, 1),
+            ("message_id", "TEXT", 1, None, 2),
+            ("ts", "REAL", 1, "0", 0),
+        ]
+
+    def test_is_without_rowid_with_group_ts_index(self, store: Store) -> None:
+        """普通表（不是虚表）、WITHOUT ROWID 省一份主键副本，外加清理用的 (group_id, ts) 索引。"""
+        _run_steps(store, STEP_CHAT_LOG_IDS)
+        table = store.read().execute(
+            "SELECT type, sql FROM sqlite_master WHERE name='chat_log_ids'"
+        ).fetchone()
+        assert table["type"] == "table"
+        assert "WITHOUT ROWID" in str(table["sql"]).upper()
+        assert _index_names(store, "chat_log_ids") == {"idx_chat_log_ids_group_ts"}
+        assert _index_cols(store.read(), "idx_chat_log_ids_group_ts") == ["group_id", "ts"]
+
+    def test_backfills_existing_chat_log_rows(self, store: Store) -> None:
+        """库号 39 的旧库（chat_log 里已有 3 万行那种）迁上来：账本被回填一份。"""
+        _run_steps(store, STEP_CHAT_LOG_IDS - 1)
+        assert "chat_log_ids" not in _tables(store)
+        with store.tx() as conn:
+            conn.executemany(
+                "INSERT INTO chat_log (text, group_id, message_id, ts, user_id, user_name)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    ("旧原话一", "900000001", "m1", 11.0, "u1", "阿一"),
+                    ("旧原话二", "900000001", "m2", 12.0, "u1", "阿一"),
+                    ("别的群的旧原话", "555666777", "m1", 13.0, "u2", "老王"),
+                ],
+            )
+        assert store.migrate() == LATEST
+        rows = {
+            (r["group_id"], r["message_id"]): float(r["ts"])
+            for r in store.read().execute("SELECT group_id, message_id, ts FROM chat_log_ids")
+        }
+        assert rows == {
+            ("900000001", "m1"): 11.0,
+            ("900000001", "m2"): 12.0,
+            ("555666777", "m1"): 13.0,
+        }
+
+    def test_backfilled_message_id_is_not_written_twice(self, tmp_path: Path) -> None:
+        """回填之后，同一条 message_id 再写一遍不会重复（去重账本真的接上了）。"""
+        from CharTyr_MaiWork.maiwork import chatlog
+
+        s = Store(tmp_path / "old39.db")
+        try:
+            _run_steps(s, STEP_CHAT_LOG_IDS - 1)
+            with s.tx() as conn:
+                conn.execute(
+                    "INSERT INTO chat_log (text, group_id, message_id, ts, user_id, user_name)"
+                    " VALUES ('迁移前就有的原话', '900000001', 'm1', 11.0, 'u1', '阿一')"
+                )
+            assert s.migrate() == LATEST
+            assert chatlog.record_messages(
+                s, "900000001", [_Msg("m1", 11.0, "回填之后又写一遍")], now=99.0
+            ) == 1
+            rows = s.read().execute(
+                "SELECT text FROM chat_log WHERE group_id='900000001' AND message_id='m1'"
+            ).fetchall()
+            assert len(rows) == 1 and rows[0]["text"] == "迁移前就有的原话"
+        finally:
+            s.close()
+
+    def test_rerun_is_idempotent(self, store: Store) -> None:
+        store.migrate()
+        store_mod._m_chat_log_ids(store.read())
+        store_mod._m_chat_log_ids(store.read())
+        assert "chat_log_ids" in _tables(store)
+        assert _index_names(store, "chat_log_ids") == {"idx_chat_log_ids_group_ts"}
+
+    def test_backfill_rerun_keeps_one_row_per_message(self, tmp_path: Path) -> None:
+        """同一步跑两遍（版本号认不准时会发生）不会把账本写重。"""
+        s = Store(tmp_path / "twice.db")
+        try:
+            _run_steps(s, STEP_CHAT_LOG_IDS - 1)
+            with s.tx() as conn:
+                conn.execute(
+                    "INSERT INTO chat_log (text, group_id, message_id, ts, user_id, user_name)"
+                    " VALUES ('原话', '900000001', 'm1', 11.0, 'u1', '阿一')"
+                )
+            store_mod._m_chat_log_ids(s.read())
+            store_mod._m_chat_log_ids(s.read())
+            count = s.read().execute("SELECT COUNT(*) c FROM chat_log_ids").fetchone()["c"]
+            assert int(count) == 1
+        finally:
+            s.close()
+
+    def test_missing_chat_log_table_is_tolerated(self, tmp_path: Path) -> None:
+        """半截老库（没有 chat_log 虚表）跑这一步不能炸——建表照做，回填跳过。"""
+        s = Store(tmp_path / "half.db")
+        try:
+            store_mod._m_chat_log_ids(s.read())
+            assert "chat_log_ids" in _tables(s)
         finally:
             s.close()
 

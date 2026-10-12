@@ -6,7 +6,7 @@
 
 ## Design
 
-- `news.js`：`viewNews(g, v)` 按时段展示资讯批次、被淘汰的候选与文章；复用 `emptyState()`、`loading()`、`fbButtons()`。`RATE_KEY` / `FB_KEY` 和 `clientId()` 管理本浏览器的评价/反馈标识，实际提交在上级的 `main.js` / `actions.js`。首个来源链接走 `/go/{id}?c={clientId}`，群友链接另带 `g` token，由服务端鉴权、记点击并重定向；其他来源仍直链。
+- `news.js`：`viewNews(g, v)` 按时段展示资讯批次、被淘汰的候选与文章；复用 `emptyState()`、`loading()`、`fbButtons()`。`loading(原因, what, 群)`：不给原因时是原来的加载动画；给了原因就显示「加载失败：原因」+ 重试按钮（`data-act="load-retry"`，由 `router.retryLoad` 按 `what` 重取）。`RATE_KEY` / `FB_KEY` 和 `clientId()` 管理本浏览器的评价/反馈标识，实际提交在上级的 `main.js` / `actions.js`。首个来源链接走 `/go/{id}?c={clientId}`，群友链接另带 `g` token，由服务端鉴权、记点击并重定向；其他来源仍直链。
 - 资讯 `followup` 显示「后续」、旧标题 `of_title` 和新增事实 `new_fact`；淘汰候选的 `src.query/provider` 显示搜索出处。`batchStats()` 兼容旧批次和 `stats.funnel`；`funnelBlock()` 仅全局管理员可展开搜索→线索→预筛→挑选→打开→核对→上网页各步计数，并列出 `per_focus`、`providers`、`rejects`、`timings_s`（包括保底补搜耗时）和「中文和外文来源」（`langMix()` 读 `query_langs` / `discovered_langs` / `kept_langs`，旧批次没有就不显示）。没有留下资讯的批次也可看漏斗。
 - 资讯页顶上的「这个群想看」和「口味小结」已删（2026-10，docs/17 §八）：并进群页「这个群」区的本群规矩 / 资讯做法。原来按群切两段式新找法的 `twoPhaseBtn()`（`feeds-two-phase`）已删：2026-09-30 起两段式恒生效，没有开关。
 - 图解通过 `GET /api/news/{id}/viz` 按需取 HTML，装入仅 `allow-scripts` 的沙箱 iframe；`MutationObserver` 填充、`postMessage` 校正高度，内存缓存避免刷新时重取。

@@ -12,7 +12,7 @@ import { loadIdentity } from "./settings/identity.js";
 import { loadModels } from "./settings/models.js";
 import { loadLogSummary } from "./settings/logs.js";
 import { closeSheet, openSheet, repaintSheet } from "./sheet.js";
-import { enterChat } from "./chat.js";
+import { enterChat, loadChat } from "./chat.js";
 import { render, renderRail, renderSide, renderTabbar, renderTop, renderView } from "./render.js";
 import { maybeOnboard, openOnboarding } from "./onboarding.js";
 import { loadUpdate } from "./update.js";
@@ -66,9 +66,13 @@ async function loadMe() {
   const me = await api("GET", "/api/me");
   state.me = me;
   if (me.now) state.skew = me.now - Date.now() / 1000;
-  state.badLink = me.role === "none" && !!h.ref;
+  state.badLink = me.role === "none" ? linkProblem(h) : "";
   if (me.role === "member" || me.role === "group_admin") state.g = me.group;
 }
+
+// 没登录却带着地址进来：管理员 / 群管理员的地址是群号、设置或聊天 → 登录过期（"expired"）；
+// 群友的地址是链接码 → 链接失效（"link"）；什么都没带 → ""。
+export const linkProblem = (h) => (h.settings || h.chat || /^\d+$/.test(h.ref || "") ? "expired" : h.ref ? "link" : "");
 
 export async function loadGroups() {
   if (!state.me || state.me.role === "none") {
@@ -86,9 +90,12 @@ export async function loadView(quietly) {
     const v = await api("GET", `/api/groups/${encodeURIComponent(groupRef(g))}`);
     if (state.g !== id) return;
     state.view = v;
+    if (state.loadErr) delete state.loadErr.view;
     const i = state.groups.findIndex((x) => x.id === id);
     if (i >= 0) state.groups[i] = Object.assign({}, state.groups[i], pickSummary(v));
   } catch (e) {
+    // 记下原因：没内容时原地显示「加载失败 + 重试」，有旧内容时保留旧内容并提示连接中断
+    if (state.g === id) (state.loadErr = state.loadErr || {}).view = e.message;
     if (!quietly) toast(e.message, true);
     if (e.status === 401 || e.status === 403) return reboot();
   }
@@ -100,12 +107,34 @@ export async function loadSettings() {
   if (!admin()) return;
   try {
     state.settings = await api("GET", "/api/settings");
+    if (state.loadErr) delete state.loadErr.settings;
   } catch (e) {
+    (state.loadErr = state.loadErr || {}).settings = e.message;
     toast(e.message, true);
   }
 }
 
+// 各块「加载失败」里的「重试」（loading(原因, what)）：按 what 重新取那一块，再重画
+export async function retryLoad(el) {
+  const what = el.dataset.what;
+  el.disabled = true;
+  if (what === "trusted") {
+    // 优质来源按群懒加载：删掉这个群的记录，重画时 sources.js 会重新去取
+    if (state.trusted) delete state.trusted[el.dataset.g];
+  } else if (what === "view") await loadView();
+  else if (what === "settings") await loadSettings();
+  else if (what === "rules") await loadRules();
+  else if (what === "ext") await loadExt();
+  else if (what === "usage") await Promise.all([loadUsage(), loadLogSummary()]);
+  else if (what === "identity") await loadIdentity();
+  else if (what === "chat") await loadChat(state.chatId, false);
+  ui.flash = true;
+  render();
+  if (state.sheet) repaintSheet();
+}
+
 export async function reboot() {
+  state.loadErr = {};
   state.view = null;
   state.settings = null;
   state.groupControls = null;
@@ -183,7 +212,10 @@ export async function enterSettings(sub) {
 export function go(patch) {
   const gChanged = patch.g && patch.g !== state.g;
   Object.assign(state, patch);
-  if (gChanged) state.view = null;
+  if (gChanged) {
+    state.view = null;
+    if (state.loadErr) delete state.loadErr.view; // 上一个群的失败不带到新群
+  }
   ui.flash = true;
   syncHash();
   render();

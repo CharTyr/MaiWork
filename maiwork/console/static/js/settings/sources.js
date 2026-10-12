@@ -3,6 +3,7 @@ import { dayWord, esc, ico, now, tip } from "../util.js";
 import { api, mq } from "../api.js";
 import { state } from "../state.js";
 import { feedsSettings } from "./models.js";
+import { loading } from "../pages/news.js";
 
 /* ───── 资讯来源：屏蔽 + RSS ───── */
 export function sourcesPage(s) {
@@ -28,9 +29,16 @@ function trustedGroup(g) {
         const box = document.querySelector(`.trusted-g[data-g="${CSS.escape(g.id)}"]`);
         if (box) box.outerHTML = trustedGroup(g);
       })
-      .catch(() => (all[g.id] = undefined));
+      .catch((e) => {
+        // 记下原因、不自动重取：这一节显示「加载失败 + 重试」，点了重试才再取（router.retryLoad 删掉这条）
+        all[g.id] = { error: (e && e.message) || "请求失败" };
+        const box = document.querySelector(`.trusted-g[data-g="${CSS.escape(g.id)}"]`);
+        if (box) box.outerHTML = trustedGroup(g);
+      });
   }
-  const v = all[g.id];
+  const got = all[g.id];
+  const fail = got && got.error;
+  const v = fail ? null : got;
   const rows = v
     ? (v.trusted || [])
         .map(
@@ -51,7 +59,7 @@ function trustedGroup(g) {
     <div class="rss-group trusted-g" data-g="${esc(g.id)}">
       <div class="rss-gname">${mq(g.name || `群 ${g.id}`)}</div>
       ${v ? shareLine(v.share) : ""}
-      ${v == null ? `<p class="fine">加载中…</p>` : rows || `<p class="fine">暂无</p>`}
+      ${fail ? loading(fail, "trusted", g.id) : v == null ? `<p class="fine">加载中…</p>` : rows || `<p class="fine">暂无</p>`}
     </div>`;
 }
 

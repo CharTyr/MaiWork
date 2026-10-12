@@ -3400,16 +3400,20 @@ class MaiWorkApp:
             return
 
         async def _runner() -> None:
+            cancelled = False
             try:
                 await fn(gid)
             except asyncio.CancelledError:
+                # 被取消 = 插件热重载 / 停止，不是「这个时段做过了」：记号留给下次重载后照常触发
+                cancelled = True
                 raise
             except Exception:
                 logger.exception("群 %s 的 %s 长活出错了", gid, kind)
             finally:
-                # scheduler 管的事（news/idea/goal）不管成功失败都算做过，错过不补（docs/07 §10.5）；
+                # scheduler 管的事（news/idea/goal）正常跑完 / 普通出错都算做过，错过不补（docs/07 §10.5）；
+                # 唯独被取消时不算——否则重载当天那个资讯时段会被吃掉，再也不会补上。
                 # 画像提炼（profile）不在 scheduler 的词表里，不汇报
-                if kind in ("news", "idea", "goal"):
+                if not cancelled and kind in ("news", "idea", "goal"):
                     try:
                         if self.scheduler is not None:
                             self.scheduler.done(gid, kind, _now())

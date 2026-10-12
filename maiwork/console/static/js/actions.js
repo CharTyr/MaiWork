@@ -21,7 +21,7 @@ import { closeSheet, openDetail, openSheet, repaintSheet } from "./sheet.js";
 import { chatPoll, enterChat, loadChat, loadChats, paintChat } from "./chat.js";
 import { renderSide, renderView } from "./render.js";
 import { dismissUpdate } from "./update.js";
-import { enterSettings, go, loadGroups, loadSettings, loadView, reboot, renderTopBits, syncHash } from "./router.js";
+import { enterSettings, go, loadGroups, loadSettings, loadView, reboot, renderTopBits, retryLoad, syncHash } from "./router.js";
 
 /* ───────────── 交互 ───────────── */
 
@@ -45,6 +45,9 @@ export async function act(el, e) {
   if (await actJev(a, el)) return;
   const g = grp();
   switch (a) {
+    case "load-retry":
+      await retryLoad(el);
+      break;
     case "tab":
       closeSheet();
       go({ page: null, tab: el.dataset.tab, detail: null });

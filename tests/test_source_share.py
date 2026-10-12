@@ -94,6 +94,7 @@ const stubs = {
   '../api.js': { api: () => new Promise(() => {}), mq: (s) => esc(s) },
   '../state.js': { state },
   './models.js': { feedsSettings: () => '' },
+  '../pages/news.js': { loading: (f) => (f ? 'FAIL:' + f : '<p>加载中</p>') },
 };
 const modules = new Map();
 async function link(spec) {

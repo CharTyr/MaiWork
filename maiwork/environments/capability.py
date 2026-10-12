@@ -39,6 +39,7 @@ class LocalCaps:
     is_root: bool
     has_systemd_run: bool
     run_as_exists: bool
+    run_as_is_root: bool = False  # run_as 是 root 或 uid 0（运行时会被 local.py 拒跑）
 
 
 @dataclass(frozen=True)
@@ -75,19 +76,21 @@ def _probe(run_as: str = "maiwork") -> LocalCaps:
 
         has_systemd_run = bool(shutil.which("systemd-run"))
     run_as_exists = False
+    run_as_is_root = False
     if is_linux:
         try:
             import pwd  # Windows 没有这个模块
 
             try:
-                pwd.getpwnam(str(run_as or "maiwork"))
+                run_as_is_root = pwd.getpwnam(str(run_as or "maiwork")).pw_uid == 0
                 run_as_exists = True
             except KeyError:
                 run_as_exists = False
         except ImportError:
             run_as_exists = False
     return LocalCaps(
-        is_linux=is_linux, is_root=is_root, has_systemd_run=has_systemd_run, run_as_exists=run_as_exists
+        is_linux=is_linux, is_root=is_root, has_systemd_run=has_systemd_run, run_as_exists=run_as_exists,
+        run_as_is_root=run_as_is_root,
     )
 
 
@@ -119,6 +122,14 @@ def detect(caps: LocalCaps, run_as: str = "maiwork") -> Decision:
             reason="MaiBot 不是以 root 运行",
             hint="以 root 跑 MaiBot 才能用 systemd 隔离子 agent；或改用「一次性机器」（设置 → 执行环境开 Railway）",
             log_line="本机干活：不能用——MaiBot 不是以 root 运行，起不了隔离单元；工作区放在插件数据目录下，由插件直接读写",
+        )
+    if run_as == "root" or (caps.run_as_exists and caps.run_as_is_root):
+        # 运行账号是 root：local.py 每次拼单元前都会拒跑（PermissionError），健康项要照实说
+        return Decision(
+            mode="stopped", ok=False, exec_kind="plugin", unit_user="",
+            reason=f"运行账号是 {run_as}（root 权限），已拒绝运行",
+            hint="请在「设置 → 全部设置 → 运行环境 → 运行账号」改用专用账号（例如 maiwork）",
+            log_line=f"本机干活：不能用——运行账号 {run_as} 有 root 权限，子 agent 不允许以 root 身份运行",
         )
     if caps.run_as_exists:
         return Decision(

@@ -1486,6 +1486,59 @@ class TestM2Loop:
         assert app._running_jobs == set()
 
     @pytest.mark.asyncio
+    async def test_cancelled_long_job_does_not_mark_done(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """长活被取消（插件热重载 / 停止）不算「今天做过了」：
+        记了 done 会把当天那个资讯时段吃掉，重载后就再也等不到那批资讯。"""
+        from fakes import FakeFeeds, FakeScheduler
+
+        feeds = FakeFeeds()
+        feeds.delay_s = 5.0  # 跑不完的长活
+        scheduler = FakeScheduler()
+        app = _app(tmp_path)
+        app.feeds_factory = lambda *a, **kw: feeds
+        app.scheduler_factory = lambda *a, **kw: scheduler
+        await app.start()
+        try:
+            app._spawn_long_job(G1, "news", feeds.prepare_news)
+            for _ in range(40):
+                if G1 in feeds.prepare_calls:
+                    break
+                await asyncio.sleep(0.02)
+            assert G1 in feeds.prepare_calls
+            bg = list(app._bg_jobs)
+            assert bg
+            for t in bg:
+                t.cancel()
+            await asyncio.gather(*bg, return_exceptions=True)
+            await asyncio.sleep(0.01)  # 让 done_callback 跑完
+            assert app._bg_jobs == set()
+            assert not any(c[0] == G1 and c[1] == "news" for c in scheduler.done_calls)
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_stop_does_not_mark_pending_news_done(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """stop（= 热重载 / 停用）取消在跑的资讯长活，同样不许记 done。"""
+        from fakes import FakeFeeds, FakeScheduler
+
+        feeds = FakeFeeds()
+        scheduler = FakeScheduler()
+        feeds.delay_s = 5.0
+        scheduler.due_map[G1] = [["news"]]
+        app = _app(tmp_path)
+        app.feeds_factory = lambda *a, **kw: feeds
+        app.scheduler_factory = lambda *a, **kw: scheduler
+        await app.start()
+        await app.run_loop_once()
+        for _ in range(40):
+            if G1 in feeds.prepare_calls:
+                break
+            await asyncio.sleep(0.02)
+        assert G1 in feeds.prepare_calls
+        await app.stop()
+        assert not any(c[0] == G1 and c[1] == "news" for c in scheduler.done_calls)
+
+    @pytest.mark.asyncio
     async def test_scheduler_none_means_no_due_calls(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """scheduler / feeds 模块没就位 → 这轮就不巡检，照常画像 tick。"""
         profiles = FakeProfiles()

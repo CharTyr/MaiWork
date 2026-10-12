@@ -19,6 +19,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+try:  # Windows 没有 pwd 模块；查不到账号就只按名字拦（下面只拦 "root" 这个名字）
+    import pwd
+except ImportError:  # pragma: no cover - Windows
+    pwd = None  # type: ignore[assignment]
+
 from .config import (
     GroupSetting,
     Settings,
@@ -276,10 +281,27 @@ def _check_name_str(field_zh: str) -> Any:
     return check
 
 
+def _run_as_uid(name: str) -> int | None:
+    """查这个账号的 uid；系统里没有这个账号 / 平台没有 pwd 模块 → None。"""
+    if pwd is None:
+        return None
+    try:
+        return int(pwd.getpwnam(str(name)).pw_uid)
+    except (KeyError, OSError, ValueError):
+        return None
+
+
 def _check_run_as(value: Any) -> str:
+    """运行账号：Linux 用户名，且不许是 root / uid 为 0 的账号（子 agent 拿到 root 就没有隔离了）。
+
+    账号还不存在时照旧放行（网页上可以先填、后建用户）；直接写 config.toml 绕过这里的，
+    由 environments/local.py 拼 systemd 单元前再拦一次。
+    """
     s = str(value or "").strip()
     if not s or not re.match(r"^[a-z_][a-z0-9_-]*$", s):
         raise ValueError("运行用户名要是合法的 Linux 用户名（小写字母/数字/下划线/横线）")
+    if s == "root" or _run_as_uid(s) == 0:
+        raise ValueError("运行账号不能是 root 或 uid 为 0 的账号（子 agent 会拿到 root 权限）")
     return s
 
 
@@ -559,6 +581,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     _F("environments.runtime_max_sec", "命令时长上限（秒）", "单条命令的最长运行时间。", "int", min=10, max=86400),
     _F("environments.local_mode", "本机隔离方式", "在本机运行命令时使用的隔离方式。", "enum", options=["systemd"], check=_check_local_mode),
     _F("environments.run_as", "运行账号", "在本机运行命令时使用的系统账号。", "str", check=_check_run_as),
+    _F("environments.local_network", "允许访问本机和内网", "开启后，执行命令可访问本机服务与内网地址。默认关闭。", "bool"),
     _F("environments.max_parallel", "并行数", "最多同时运行的子 agent 数量。", "int", min=1, max=10),
     _F("environments.command_timeout_s", "默认命令时长（秒）", "单条命令的默认超时时间。", "int", min=10, max=3600),
     _F("environments.railway_daily_max", "每日机器数", "每天最多使用的临时机器数量（官方上限为 3）。", "int", min=1, max=3),

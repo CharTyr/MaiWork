@@ -1102,8 +1102,34 @@ def _m_goal_fit(conn: sqlite3.Connection) -> None:
                 )
 
 
+# chat_log 的去重账本（2026-10，性能）：chat_log 是 FTS5 虚表，没有唯一约束、也建不了索引，
+# 老的写法是每条 `WHERE NOT EXISTS (SELECT 1 FROM chat_log WHERE group_id=? AND message_id=?)`，
+# 在虚表上每条都是全表扫描——线上约 3 万行时一批 200 条要十几秒，还堵在 MaiBot 同一个事件
+# 循环里。这里另立一张普通表当账本：主键 (group_id, message_id)（去重只认「哪个群的哪条消息」；
+# WITHOUT ROWID 省掉一份行号副本），(group_id, ts) 索引给 14 天清理用；老库已有的 chat_log
+# 行回填一份（INSERT OR IGNORE，跑几遍都幂等）。chat_log 的建表在 _m_humane，不在这儿动。
+def _m_chat_log_ids(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS chat_log_ids ("
+        " group_id TEXT NOT NULL,"
+        " message_id TEXT NOT NULL,"
+        " ts REAL NOT NULL DEFAULT 0,"
+        " PRIMARY KEY (group_id, message_id)"
+        ") WITHOUT ROWID"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chat_log_ids_group_ts ON chat_log_ids(group_id, ts)"
+    )
+    tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "chat_log" in tables:  # 半截老库连 chat_log 都没有（测试里手造的库）：没东西可回填
+        conn.execute(
+            "INSERT OR IGNORE INTO chat_log_ids (group_id, message_id, ts)"
+            " SELECT group_id, message_id, ts FROM chat_log"
+        )
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids]
 
 
 class Store:

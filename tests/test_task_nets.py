@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
 
 import pytest
 
@@ -200,3 +202,126 @@ class TestCoordinatorNet:
         assert reason is not None and reason["kind"] == "time"
         row = tasks.get(tid)
         assert row["status"] == "paused"
+
+
+class _FlakyConn:
+    """包一层连接：查 usage 的前 fail_times 次抛异常（模拟偶发锁冲突 / 表读不了）。
+
+    其它语句一律转给真连接，所以 Tasks.get / kv_get 这些读还是正常的。
+    """
+
+    def __init__(self, conn, *, fail_times: int = 1) -> None:
+        self._conn = conn
+        self.fail_times = int(fail_times)
+        self.usage_calls = 0
+
+    def execute(self, sql, *args):
+        if "FROM usage" in str(sql):
+            self.usage_calls += 1
+            if self.usage_calls <= self.fail_times:
+                raise sqlite3.OperationalError("database is locked")
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _tasks_with(store, *, token_limit: int, run_seconds: int = 0) -> Tasks:
+    class _S:
+        class tasks:
+            pass
+
+        def workspace_of(self, gid: str) -> str:
+            return f"g{gid}"
+
+    _S.tasks.token_limit = token_limit
+    _S.tasks.run_seconds = run_seconds
+    return Tasks(store, lambda: _S())
+
+
+class TestNetCheckUsageUnknown:
+    """读不到用量时不许当「一个 token 都没花」（fail-open）——有上限就停下来等人。"""
+
+    def test_usage_read_failure_pauses_fail_closed(self, store, monkeypatch, caplog):
+        tasks = _tasks_with(store, token_limit=1000)
+        tid = _mk_task(tasks)
+        tasks.transition(tid, "running", reason="开工")
+        proxy = _FlakyConn(store.read(), fail_times=99)
+        monkeypatch.setattr(store, "read", lambda: proxy)
+        with caplog.at_level(logging.WARNING):
+            reason = tasks.net_check(tid)
+        assert reason == {"kind": "tokens_unknown", "limit": 1000}
+        assert proxy.usage_calls == 2  # 读失败先立刻重试一次，才判定
+        row = tasks.get(tid)
+        assert row["status"] == "paused"
+        # 暂停说明（note）进 task.paused 事件的 reason（和手动暂停一样不改 review 字段）
+        ev = store.read().execute(
+            "SELECT payload FROM events WHERE entity='task' AND entity_id=? AND kind='task.paused'"
+            " ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert "无法核算用量" in str(json.loads(ev["payload"])["reason"])
+        pr = json.loads(row["paused_reason"])
+        assert pr["kind"] == "tokens_unknown" and pr["limit"] == 1000
+        assert "读不到" in caplog.text or "用量" in caplog.text  # 留一条 warning
+
+    def test_usage_read_retry_success_does_not_pause(self, store, monkeypatch):
+        """一次偶发失败、重试读到数：照常用量判，别冤枉暂停。"""
+        tasks = _tasks_with(store, token_limit=1000)
+        tid = _mk_task(tasks)
+        tasks.transition(tid, "running", reason="开工")
+        now = clock.now()
+        with store.tx() as conn:
+            conn.execute(
+                "INSERT INTO usage (ts, day, role, model, purpose, group_id, task_id, prompt_tokens, completion_tokens, ok, ms, error)"
+                " VALUES (?, ?, 'main', 'm', 'p', '900000001', ?, 200, 100, 1, 10, '')",
+                (now, clock.day_key(now), tid),
+            )
+        proxy = _FlakyConn(store.read(), fail_times=1)
+        monkeypatch.setattr(store, "read", lambda: proxy)
+        assert tasks.net_check(tid) is None
+        assert proxy.usage_calls == 2
+        assert tasks.get(tid)["status"] == "running"
+
+    def test_usage_read_failure_ignored_when_token_limit_off(self, store, monkeypatch):
+        """token_limit = 0（不限）：读不到用量也不停，只是重试一次。"""
+        tasks = _tasks_with(store, token_limit=0, run_seconds=3600)
+        tid = _mk_task(tasks)
+        tasks.transition(tid, "running", reason="开工")
+        proxy = _FlakyConn(store.read(), fail_times=99)
+        monkeypatch.setattr(store, "read", lambda: proxy)
+        assert tasks.net_check(tid) is None
+        assert proxy.usage_calls == 2
+        assert tasks.get(tid)["status"] == "running"
+
+    def test_usage_read_failure_still_applies_time_limit(self, store, monkeypatch):
+        """读不到用量不影响时长判断：该按跑太久停下来还是停。"""
+        tasks = _tasks_with(store, token_limit=0, run_seconds=60)
+        tid = _mk_task(tasks)
+        tasks.transition(tid, "running", reason="开工")
+        with store.tx() as conn:
+            conn.execute("UPDATE tasks SET started_ts=? WHERE id=?", (clock.now() - 7200, tid))
+        proxy = _FlakyConn(store.read(), fail_times=99)
+        monkeypatch.setattr(store, "read", lambda: proxy)
+        reason = tasks.net_check(tid)
+        assert reason is not None and reason["kind"] == "time"
+        assert tasks.get(tid)["status"] == "paused"
+
+    def test_tokens_unknown_reason_rendered(self, tasks):
+        """新 kind 要能写进库、并且网页三种视图都有一句安全中文。"""
+        tid = _mk_task(tasks)
+        tasks.transition(tid, "running", reason="开工")
+        tasks.transition(
+            tid, "paused", reason="安全网：无法核算用量，已自动暂停",
+            paused_reason={"kind": "tokens_unknown", "limit": 2000000},
+        )
+        view = tasks.list_view("900000001")
+        item = view[0]
+        assert item["paused_reason"]["kind"] == "tokens_unknown"
+        assert item["meta"] == "自动暂停：用量没核出来，等你决定"
+        assert "自动暂停" in item["paused_reason"]["text"]
+        d = tasks.detail_view(tid, admin=True)
+        assert d["paused_reason"]["kind"] == "tokens_unknown"
+        assert d["paused_reason"]["text"]
+        d2 = tasks.detail_view(tid, admin=False)
+        assert d2["paused_reason"]["kind"] == "tokens_unknown"

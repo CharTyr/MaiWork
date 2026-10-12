@@ -72,13 +72,19 @@ export async function loadChat(id, incremental) {
     C.running = !!r.running;
     C.info = r.chat || C.info;
     state.chat = C;
+    if (state.loadErr) delete state.loadErr.chat;
   } catch (e) {
     if (e.status === 404) {
       state.chat = null;
       state.chatId = null;
-    } else toast(e.message, true);
+    } else {
+      // 首次就没取到：消息区显示原因和重试（增量刷新失败时已有内容照常显示）
+      if (!state.chat) (state.loadErr = state.loadErr || {}).chat = e.message;
+      toast(e.message, true);
+    }
   }
 }
+const chatLoading = () => loading((state.loadErr || {}).chat, "chat");
 
 let chatTimer = null;
 export function chatPoll() {
@@ -208,7 +214,7 @@ export function chatPage() {
         <button class="btn small" data-act="chat-new">新对话</button>
       </div>
     </div>
-    <div class="chat-stream" id="chat-stream">${C ? chatStream() : loading()}</div>
+    <div class="chat-stream" id="chat-stream">${C ? chatStream() : chatLoading()}</div>
     <form id="chat-form" class="chat-composer" autocomplete="off">
       <textarea id="chat-input" rows="1" placeholder="输入消息…" ${C && C.running ? "" : ""}></textarea>
       <button class="chat-send" type="submit" aria-label="发送" ${C && C.running ? "disabled" : ""}>${SVG.send || "↑"}</button>
@@ -239,7 +245,7 @@ export function paintChat(stickBottom) {
   const box = $("chat-stream");
   if (!box || state.page !== "chat") return;
   const nearBottom = box.getBoundingClientRect().bottom - window.innerHeight < 160;
-  box.innerHTML = state.chat ? chatStream() : loading();
+  box.innerHTML = state.chat ? chatStream() : chatLoading();
   const send = document.querySelector(".chat-send");
   if (send) send.disabled = !!(state.chat && state.chat.running);
   if (stickBottom || nearBottom) window.scrollTo({ top: document.body.scrollHeight, behavior: stickBottom === "smooth" ? "smooth" : "auto" });
@@ -257,6 +263,7 @@ export async function enterChat(id) {
   }
   state.chatId = cid;
   state.chat = null;
+  if (state.loadErr) delete state.loadErr.chat;
   go({ page: "chat", detail: null });
   await loadChat(cid, false);
   render();

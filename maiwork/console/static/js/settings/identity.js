@@ -44,8 +44,10 @@ export async function loadIdentity() {
     .catch(() => (state.avatarCfg = null));
   try {
     state.identity = await api("GET", "/api/identity");
+    if (state.loadErr) delete state.loadErr.identity;
   } catch (e) {
     state.identity = null;
+    (state.loadErr = state.loadErr || {}).identity = e.message;
     toast(e.message, true);
   }
 }
@@ -64,7 +66,7 @@ function idBlock(kind, title, lead, item, limit, extra) {
 // 「记忆」页（2026-10：身份页撤掉，SOUL / AGENTS 搬到各专岗；这里只放记忆）
 export function memoryPage(s) {
   const d = state.identity;
-  if (!d) return loading();
+  if (!d) return loading((state.loadErr || {}).identity, "identity");
   const lim = d.limits || {};
   return `
     ${idBlock("memory", "通用记忆", "MaiWork 积累的经验，适用于所有群，可手动修改。不要写入具体的群或成员信息；各群的规则和做法在对应群页面中设置。", d.memory, lim.memory)}`;

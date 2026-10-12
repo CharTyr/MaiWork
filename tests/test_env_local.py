@@ -7,28 +7,72 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import sys
+import types
 from pathlib import Path
 
 import pytest
 
+from CharTyr_MaiWork.maiwork import rules as rules_mod
 from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.environments import local as local_mod
 from CharTyr_MaiWork.maiwork.environments.local import LocalEnv
 
 ON_MACOS = sys.platform == "darwin"
 
 
-def _settings(root: Path, *, mode: str = "direct"):
-    s, _ = load_settings(
-        {"environments": {"local_mode": mode, "workspace_root": str(root)}}
-    )
+def _settings(root: Path, *, mode: str = "direct", **env_over):
+    values = {"local_mode": mode, "workspace_root": str(root), **env_over}
+    s, _ = load_settings({"environments": values})
     return s
 
 
-def _env(root: Path, *, mode: str = "direct", runner=None) -> LocalEnv:
-    settings = _settings(root, mode=mode)
+def _env(root: Path, *, mode: str = "direct", runner=None, **env_over) -> LocalEnv:
+    settings = _settings(root, mode=mode, **env_over)
     return LocalEnv(lambda: settings, runner=runner)
+
+
+def _dynamic_env(root: Path, *, runner=None, run_as: str = "maiwork") -> LocalEnv:
+    """DynamicUser 方式：工作区根模拟线上的 /var/lib/private/maiwork/workspaces。"""
+    from CharTyr_MaiWork.maiwork.environments import capability
+
+    root = root / "private" / "maiwork" / "workspaces"
+    settings = _settings(root, mode="systemd", run_as=run_as)
+    decision = capability.Decision(
+        mode="dynamic", ok=True, exec_kind="isolated", unit_user=capability.DYNAMIC_USER,
+        reason="", hint="", log_line="test",
+    )
+    return LocalEnv(lambda: settings, runner=runner, capability=decision)
+
+
+def _patch_net(monkeypatch, *, addrs=(), nameservers=()) -> None:
+    """把「本机地址」「resolv.conf 里的 nameserver」换成固定值。
+
+    真实读取跟着测试机（macOS 上没有 /proc / ip；开发机有家庭路由 DNS），断言不了，
+    所以只测「拿到这些事实以后 argv 拼得对不对」。
+    """
+    monkeypatch.setattr(local_mod, "local_nonloopback_addrs", lambda: tuple(addrs))
+    monkeypatch.setattr(local_mod, "resolv_conf_nameservers", lambda: tuple(nameservers))
+
+
+def _props(argv: list[str]) -> list[str]:
+    """argv 里所有 -p 属性值（systemd 属性是「-p 键=值」两个 argv 元素）。"""
+    return [argv[i + 1] for i, a in enumerate(argv) if a == "-p" and i + 1 < len(argv)]
+
+
+def _prop(argv: list[str], key: str) -> str | None:
+    """取某个属性的值；没有这条返回 None。"""
+    for value in _props(argv):
+        if value.startswith(f"{key}="):
+            return value[len(key) + 1:]
+    return None
+
+
+def _prop_count(argv: list[str], key: str) -> int:
+    return sum(1 for value in _props(argv) if value.startswith(f"{key}="))
 
 
 def runner_with(exit_code: int = 0, out: str = "", err: str = ""):
@@ -725,16 +769,7 @@ class TestDynamicUserArgv:
     """
 
     def _dyn_env(self, tmp_path: Path, runner=None) -> LocalEnv:
-        from CharTyr_MaiWork.maiwork.environments import capability
-
-        # 工作区根模拟线上的 /var/lib/private/maiwork/workspaces（app 按判定结果换好再传进来）
-        root = tmp_path / "private" / "maiwork" / "workspaces"
-        settings = _settings(root, mode="systemd")
-        decision = capability.Decision(
-            mode="dynamic", ok=True, exec_kind="isolated", unit_user=capability.DYNAMIC_USER,
-            reason="", hint="", log_line="test",
-        )
-        return LocalEnv(lambda: settings, runner=runner, capability=decision)
+        return _dynamic_env(tmp_path, runner=runner)
 
     @pytest.mark.asyncio
     async def test_run_argv_dynamic_user(self, tmp_path: Path) -> None:
@@ -809,3 +844,359 @@ class TestDynamicUserArgv:
         finally:
             logger.removeHandler(h)
         assert any("没有用户" in r.getMessage() for r in recs)
+
+
+class TestNetworkIsolationArgv:
+    """systemd 模式下默认挡掉本机/内网（docs/03 线上实测：能出网但不该碰本机与内网服务）。
+
+    本机自己的地址 + nameserver 列表都能注入，这里只测拼出来的 argv。
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_denies_localhost_link_local_private_and_own_addrs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _patch_net(
+            monkeypatch,
+            addrs=("203.0.113.7", "2001:db8::5"),
+            nameservers=("1.1.1.1", "8.8.8.8", "172.16.9.100", "172.16.9.101"),
+        )
+        runner, calls = runner_with()
+        await _env(tmp_path, mode="systemd", runner=runner).run("ws", "true", timeout_s=10)
+        argv = calls[0]["argv"]
+        # 一条属性写全（不拆成多条 -p：属性之间的先后/覆盖语义越少越好）
+        assert _prop_count(argv, "IPAddressDeny") == 1
+        tokens = str(_prop(argv, "IPAddressDeny")).split()
+        for want in (
+            "127.0.0.0/8", "::1/128",                         # 回环
+            "169.254.0.0/16", "fe80::/10",                    # link-local（含元数据地址）
+            "224.0.0.0/4", "ff00::/8",                        # 组播
+            "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",  # 内网
+            "100.64.0.0/10", "fc00::/7",                      # 云厂商内网、IPv6 私有
+            "203.0.113.7", "2001:db8::5",                     # 本机自己的非回环地址
+        ):
+            assert want in tokens, want
+
+    @pytest.mark.asyncio
+    async def test_deny_uses_prefixes_not_unit_file_keywords(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """线上实测（2026-10-12，systemd 257）：systemd-run -p IPAddressDeny=localhost 报
+        「Failed to parse IP address prefix: localhost」直接起不来——只许写网段 / 地址。"""
+        import ipaddress
+        _patch_net(monkeypatch, addrs=("203.0.113.7",), nameservers=("172.16.9.100",))
+        runner, calls = runner_with()
+        await _env(tmp_path, mode="systemd", runner=runner).run("ws", "true", timeout_s=10)
+        argv = calls[0]["argv"]
+        for name in ("IPAddressDeny", "IPAddressAllow"):
+            for tok in str(_prop(argv, name)).split():
+                ipaddress.ip_network(tok, strict=False)  # 关键字（localhost / link-local / any…）会抛
+
+    @pytest.mark.asyncio
+    async def test_run_allow_only_nameservers_inside_denied_nets(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """IPAddressAllow 只放行落在被禁网段里的 nameserver（/32、/128 语义），保证 DNS 还能用。"""
+        _patch_net(
+            monkeypatch,
+            addrs=("203.0.113.7",),
+            nameservers=("1.1.1.1", "8.8.8.8", "172.16.9.100", "172.16.9.101"),
+        )
+        runner, calls = runner_with()
+        await _env(tmp_path, mode="systemd", runner=runner).run("ws", "true", timeout_s=10)
+        argv = calls[0]["argv"]
+        allow = _prop(argv, "IPAddressAllow")
+        assert allow is not None
+        assert allow.split() == ["172.16.9.100", "172.16.9.101"]
+        assert "1.1.1.1" not in allow and "8.8.8.8" not in allow
+        # Deny 写在 Allow 前面：不管 systemd 按「Allow 优先」还是「后写的覆盖先写的」解释，结果都一样
+        props = _props(argv)
+        deny_prop = next(p for p in props if p.startswith("IPAddressDeny="))
+        assert props.index(deny_prop) < props.index(f"IPAddressAllow={allow}")
+
+    @pytest.mark.asyncio
+    async def test_run_allows_loopback_nameserver(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """本机 DNS 桩（systemd-resolved 的 127.0.0.53）也在被禁网段里，要照样放行。"""
+        _patch_net(monkeypatch, addrs=(), nameservers=("127.0.0.53",))
+        runner, calls = runner_with()
+        await _env(tmp_path, mode="systemd", runner=runner).run("ws", "true", timeout_s=10)
+        assert _prop(calls[0]["argv"], "IPAddressAllow") == "127.0.0.53"
+
+    @pytest.mark.asyncio
+    async def test_run_public_nameservers_only_adds_no_allow_prop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """nameserver 都是公网地址（本来就不挡）→ 不加 IPAddressAllow。"""
+        _patch_net(monkeypatch, addrs=(), nameservers=("1.1.1.1", "8.8.8.8"))
+        runner, calls = runner_with()
+        await _env(tmp_path, mode="systemd", runner=runner).run("ws", "true", timeout_s=10)
+        argv = calls[0]["argv"]
+        assert _prop_count(argv, "IPAddressDeny") == 1
+        assert _prop_count(argv, "IPAddressAllow") == 0
+
+    @pytest.mark.asyncio
+    async def test_start_has_same_network_props(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _patch_net(monkeypatch, addrs=("203.0.113.7",), nameservers=("172.16.9.100",))
+        runner, calls = runner_with()
+        await _env(tmp_path, mode="systemd", runner=runner).start("ws", "sleep 1", label="p", timeout_s=10)
+        argv = calls[0]["argv"]
+        assert "203.0.113.7" in str(_prop(argv, "IPAddressDeny")).split()
+        assert _prop(argv, "IPAddressAllow") == "172.16.9.100"
+
+    @pytest.mark.asyncio
+    async def test_dynamic_user_also_denied(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """dynamic（DynamicUser，没建 run_as 用户）同样要挡。"""
+        _patch_net(monkeypatch, addrs=("203.0.113.7",), nameservers=("172.16.9.100",))
+        runner, calls = runner_with()
+        await _dynamic_env(tmp_path, runner=runner).run("ws", "true", timeout_s=10)
+        argv = calls[0]["argv"]
+        assert "127.0.0.0/8" in str(_prop(argv, "IPAddressDeny")).split()
+        assert _prop(argv, "IPAddressAllow") == "172.16.9.100"
+
+    @pytest.mark.asyncio
+    async def test_local_network_true_adds_no_network_props(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """配置开关打开（允许访问本机和内网）→ 两条属性都不加。"""
+        _patch_net(monkeypatch, addrs=("203.0.113.7",), nameservers=("172.16.9.100",))
+        runner, calls = runner_with()
+        env = _env(tmp_path, mode="systemd", runner=runner, local_network=True)
+        await env.run("ws", "true", timeout_s=10)
+        assert _prop_count(calls[0]["argv"], "IPAddressDeny") == 0
+        assert _prop_count(calls[0]["argv"], "IPAddressAllow") == 0
+        runner2, calls2 = runner_with()
+        env2 = _env(tmp_path, mode="systemd", runner=runner2, local_network=True)
+        await env2.start("ws", "sleep 1", label="p", timeout_s=10)
+        assert _prop_count(calls2[0]["argv"], "IPAddressDeny") == 0
+        assert _prop_count(calls2[0]["argv"], "IPAddressAllow") == 0
+
+    def test_local_network_default_is_off(self, tmp_path: Path) -> None:
+        assert _settings(tmp_path, mode="systemd").environments.local_network is False
+
+    @pytest.mark.asyncio
+    async def test_empty_addrs_still_denies_fixed_nets(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """本机地址一个都没拿到（读取失败）→ 只用固定网段，不抛错。"""
+        _patch_net(monkeypatch, addrs=(), nameservers=())
+        runner, calls = runner_with()
+        await _env(tmp_path, mode="systemd", runner=runner).run("ws", "true", timeout_s=10)
+        tokens = str(_prop(calls[0]["argv"], "IPAddressDeny")).split()
+        assert tokens == [
+            "127.0.0.0/8", "::1/128", "169.254.0.0/16", "fe80::/10", "224.0.0.0/4", "ff00::/8",
+            "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7",
+        ]
+        assert _prop_count(calls[0]["argv"], "IPAddressAllow") == 0
+
+    @pytest.mark.asyncio
+    async def test_direct_mode_argv_unchanged(self, tmp_path: Path) -> None:
+        """direct（本机开发）不隔离网络：argv 还是那三个元素，一条属性都没有。"""
+        runner, calls = runner_with()
+        await _env(tmp_path, runner=runner).run("ws", "true", timeout_s=10)
+        assert calls[0]["argv"] == ["/bin/bash", "-lc", "true"]
+
+
+class TestLocalAddressCollection:
+    """本机地址 / nameserver 的读取：解析要笨得住各种输入，读不到绝不抛错。"""
+
+    FIB_TRIE = """Main:
+  +-- 0.0.0.0/0 3 0 5
+     |-- 0.0.0.0
+        /0 universe UNICAST
+     +-- 10.0.0.0/8 2 0 2
+        |-- 10.0.0.0
+           /8 universe UNICAST
+        +-- 172.16.9.100/32 1 0 0
+           |-- 172.16.9.100
+              /32 host LOCAL
+        +-- 172.16.9.255/32 1 0 0
+           |-- 172.16.9.255
+              /32 host BROADCAST
+     +-- 127.0.0.0/8 2 0 2
+        +-- 127.0.0.1/32 1 0 0
+           |-- 127.0.0.1
+              /32 host LOCAL
+     +-- 203.0.113.7/32 1 0 0
+        |-- 203.0.113.7
+           /32 host LOCAL
+"""
+
+    IF_INET6 = """00000000000000000000000000000001 01 80 10 80       lo
+fe800000000000000000000000000001 02 40 20 80     eth0
+20010db8000000000000000000000005 02 40 00 80     eth0
+"""
+
+    def test_parse_fib_trie_keeps_host_local_only(self) -> None:
+        assert local_mod._addrs_from_fib_trie(self.FIB_TRIE) == ("172.16.9.100", "127.0.0.1", "203.0.113.7")
+
+    def test_parse_if_inet6_expands_hex(self) -> None:
+        assert local_mod._addrs_from_if_inet6(self.IF_INET6) == ("::1", "fe80::1", "2001:db8::5")
+
+    def test_parse_ip_json(self) -> None:
+        text = json.dumps([
+            {"ifname": "lo", "addr_info": [{"local": "127.0.0.1"}, {"local": "::1"}]},
+            {"ifname": "eth0", "addr_info": [{"local": "203.0.113.7"}, {"local": "2001:db8::5"}, {"local": ""}]},
+        ])
+        assert local_mod._addrs_from_ip_json(text) == ("127.0.0.1", "::1", "203.0.113.7", "2001:db8::5")
+
+    def test_parse_ip_json_garbage_is_empty(self) -> None:
+        assert local_mod._addrs_from_ip_json("不是 JSON") == ()
+
+    def test_collect_filters_loopback_and_dedups(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        files = {"/proc/net/fib_trie": self.FIB_TRIE, "/proc/net/if_inet6": self.IF_INET6}
+        monkeypatch.setattr(local_mod, "_IS_LINUX", True)
+        monkeypatch.setattr(local_mod, "_read_text", lambda path: files.get(str(path), ""))
+        addrs = local_mod._collect_local_addrs()
+        assert "203.0.113.7" in addrs and "172.16.9.100" in addrs and "2001:db8::5" in addrs
+        assert "127.0.0.1" not in addrs and "::1" not in addrs and "::" not in addrs
+        assert len(addrs) == len(set(addrs))
+
+    def test_collect_source_failure_returns_empty_and_warns(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """本机地址读取炸了：不抛错、返回空、记一条 warning（只用固定网段）。"""
+        monkeypatch.setattr(local_mod, "_LOCAL_ADDR_CACHE", {"at": 0.0, "addrs": None})
+
+        def boom() -> tuple[str, ...]:
+            raise OSError("读不到本机地址")
+
+        monkeypatch.setattr(local_mod, "_collect_local_addrs", boom)
+        with caplog.at_level(logging.WARNING, logger="maiwork.environments.local"):
+            assert local_mod.local_nonloopback_addrs() == ()
+        assert any("固定网段" in r.getMessage() for r in caplog.records)
+
+    def test_collect_result_is_cached(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(local_mod, "_LOCAL_ADDR_CACHE", {"at": 0.0, "addrs": None})
+        calls: list[int] = []
+
+        def once() -> tuple[str, ...]:
+            calls.append(1)
+            return ("203.0.113.7",)
+
+        monkeypatch.setattr(local_mod, "_collect_local_addrs", once)
+        assert local_mod.local_nonloopback_addrs() == ("203.0.113.7",)
+        assert local_mod.local_nonloopback_addrs() == ("203.0.113.7",)
+        assert len(calls) == 1
+
+    def test_parse_resolv_conf_tolerates_junk(self) -> None:
+        text = """# 注释
+; 另一种注释
+search example.com
+nameserver 1.1.1.1
+nameserver   8.8.8.8
+nameserver 172.16.9.100 # 内网 DNS
+nameserver fe80::1%eth0
+nameserver 不是地址
+nameserver
+options timeout:2
+nameserver 1.1.1.1
+"""
+        assert local_mod._parse_resolv_conf(text) == ("1.1.1.1", "8.8.8.8", "172.16.9.100", "fe80::1")
+
+    def test_nameservers_missing_file_is_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(local_mod, "_read_text", lambda path: "")
+        assert local_mod.resolv_conf_nameservers() == ()
+
+
+class TestRunAsRootRejected:
+    """运行账号不许是 root / uid 为 0 的账号（配置校验 + 运行时兜底）。"""
+
+    def test_check_run_as_rejects_root(self) -> None:
+        with pytest.raises(ValueError) as ei:
+            rules_mod._check_run_as("root")
+        assert "root" in str(ei.value)
+
+    def test_check_run_as_rejects_uid0_account(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            rules_mod, "pwd",
+            types.SimpleNamespace(getpwnam=lambda name: types.SimpleNamespace(pw_uid=0, pw_gid=0)),
+        )
+        with pytest.raises(ValueError) as ei:
+            rules_mod._check_run_as("wheel")
+        assert "root" in str(ei.value)
+
+    def test_check_run_as_allows_missing_account(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """系统里还没有这个账号 → 照旧放行（网页上可以先填、后建用户）。"""
+
+        def missing(name: str):
+            raise KeyError(name)
+
+        monkeypatch.setattr(rules_mod, "pwd", types.SimpleNamespace(getpwnam=missing))
+        assert rules_mod._check_run_as("maiwork") == "maiwork"
+
+    def test_check_run_as_allows_ordinary_account(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            rules_mod, "pwd",
+            types.SimpleNamespace(getpwnam=lambda name: types.SimpleNamespace(pw_uid=994, pw_gid=984)),
+        )
+        assert rules_mod._check_run_as("maiwork") == "maiwork"
+
+    def test_check_run_as_still_rejects_bad_name(self) -> None:
+        for bad in ("", "Root", "1abc", "带空格", "a/b"):
+            with pytest.raises(ValueError):
+                rules_mod._check_run_as(bad)
+
+    @pytest.mark.asyncio
+    async def test_fixed_run_as_root_raises_before_runner(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fixed 模式 run_as="root"：run 直接 PermissionError，命令一个都没跑。"""
+        _patch_net(monkeypatch)
+        runner, calls = runner_with()
+        env = _env(tmp_path, mode="systemd", runner=runner, run_as="root")
+        with pytest.raises(PermissionError) as ei:
+            await env.run("ws", "true", timeout_s=10)
+        assert "root" in str(ei.value)
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_fixed_run_as_uid0_raises_before_runner(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _patch_net(monkeypatch)
+        monkeypatch.setattr(local_mod, "lookup_uid", lambda name: 0)
+        runner, calls = runner_with()
+        env = _env(tmp_path, mode="systemd", runner=runner, run_as="wheel")
+        with pytest.raises(PermissionError):
+            await env.run("ws", "true", timeout_s=10)
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_fixed_run_as_uid0_start_raises_before_runner(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _patch_net(monkeypatch)
+        monkeypatch.setattr(local_mod, "lookup_uid", lambda name: 0)
+        runner, calls = runner_with()
+        env = _env(tmp_path, mode="systemd", runner=runner, run_as="wheel")
+        with pytest.raises(PermissionError):
+            await env.start("ws", "sleep 1", label="p", timeout_s=10)
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_fixed_ordinary_run_as_still_runs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _patch_net(monkeypatch)
+        runner, calls = runner_with()
+        env = _env(tmp_path, mode="systemd", runner=runner, run_as="maiwork")
+        await env.run("ws", "true", timeout_s=10)
+        assert "--uid=maiwork" in calls[0]["argv"]
+
+    @pytest.mark.asyncio
+    async def test_dynamic_mode_ignores_run_as_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """dynamic 不用 --uid（systemd 自动分配），配置里写了 root 也不受影响。"""
+        _patch_net(monkeypatch)
+        runner, calls = runner_with()
+        await _dynamic_env(tmp_path, runner=runner, run_as="root").run("ws", "true", timeout_s=10)
+        argv = calls[0]["argv"]
+        assert "-p DynamicUser=yes" in " ".join(argv)
+        assert not any(a.startswith("--uid") for a in argv)

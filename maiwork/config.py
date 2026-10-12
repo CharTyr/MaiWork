@@ -73,7 +73,7 @@ def _norm_accounts(values: object, field_zh: str, problems: list[str]) -> tuple[
     return tuple(out)
 
 
-CONFIG_VERSION = "0.4.9"  # 0.4.9：[quick_judge] 不再攒批（删 batch_wait_s，一条 @ 一次判断）、daily_max 归高级项；0.4.8：[quick_judge] 派活判断兜底（Jev 不在 / 拿不准时用模型快速判群里 @ 的是不是派活）；0.4.7：[jev] use + [[jev_endpoints]]（多判断服务：预设 / 自己加 / 换着用）；0.4.6：每端点高级请求头 headers（默认空）；0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）；0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
+CONFIG_VERSION = "0.5.0"  # 0.5.0：[environments] local_network（子 agent 默认碰不到本机与内网，开了才放行）；0.4.9：[quick_judge] 不再攒批（删 batch_wait_s，一条 @ 一次判断）、daily_max 归高级项；0.4.8：[quick_judge] 派活判断兜底（Jev 不在 / 拿不准时用模型快速判群里 @ 的是不是派活）；0.4.7：[jev] use + [[jev_endpoints]]（多判断服务：预设 / 自己加 / 换着用）；0.4.6：每端点高级请求头 headers（默认空）；0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）；0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
 
 # 0.8.0 群控归一（docs/18 §五 + 往群里发）：下面这些全局键**只作新群第一次的迁移种子**
 # （migrations.migrate_group_controls 按服务群种进 kv["group_approval.<群号>"] /
@@ -372,6 +372,10 @@ class EnvironmentsSectionConfig(PluginConfigBase):
         ),
     )
     run_as: str = Field(default="maiwork", description="本机命令以哪个系统用户身份跑（systemd 模式的 --uid/--gid）")
+    local_network: bool = Field(
+        default=False,
+        description="允许子 agent 访问本机服务与内网地址（默认关：只放行 DNS，别的本机/内网地址一律挡住）",
+    )
     max_parallel: int = Field(default=2, description="每个工作区同时跑的子 agent 个数")
     command_timeout_s: int = Field(default=300, description="子 agent 单条命令的默认时长上限（秒）")
     railway_daily_max: int = Field(default=2, description="Railway 一次性 VM 每天最多用几台（同一出口 IP 每天最多 3 台，留 1 台给派活）")
@@ -781,6 +785,7 @@ class EnvironmentsSetting:
     runtime_max_sec: int
     local_mode: str  # "systemd" | "direct"（direct 无隔离，只在本机开发开关下才可能留下）
     run_as: str
+    local_network: bool      # 允许子 agent 访问本机服务与内网地址（默认 False：只放行 DNS）
     max_parallel: int
     command_timeout_s: int
     railway_daily_max: int   # Railway 一次性 VM 每天最多用几台（官方同一出口 IP 最多 3 台/天）
@@ -1262,6 +1267,7 @@ def _parse_environments(
         runtime_max_sec=int(env.runtime_max_sec),
         local_mode=local_mode,
         run_as=str(env.run_as or "").strip() or "maiwork",
+        local_network=bool(env.local_network),
         max_parallel=max(1, int(env.max_parallel)),
         command_timeout_s=max(1, int(env.command_timeout_s)),
         railway_daily_max=max(1, int(env.railway_daily_max)),

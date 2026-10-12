@@ -64,7 +64,7 @@ function reviewBlock(t) {
 const wan = (n) => (n >= 1e4 ? `${Math.round(n / 1e4)} 万` : String(n || 0));
 function pausedBlock(t) {
   const r = t.status === "paused" && t.paused_reason;
-  if (!r || !["tokens", "time", "capability"].includes(r.kind)) return "";
+  if (!r || !["tokens", "tokens_unknown", "time", "capability"].includes(r.kind)) return "";
   if (r.kind === "capability") {
     if (!r.text) return "";
     const tail = gadmin() ? "准备就绪后点击「继续」，不再执行请点击「取消」。" : "等待管理员处理。";
@@ -73,7 +73,9 @@ function pausedBlock(t) {
   const text =
     r.kind === "tokens"
       ? `用量已达上限（约 ${wan(r.used)} / ${wan(r.limit)} token），已暂停。`
-      : `已运行 ${dur(r.used)}，达到时长上限（${dur(r.limit)}），已暂停。`;
+      : r.kind === "tokens_unknown"
+        ? `暂时无法核算本任务的用量（上限 ${wan(r.limit)} token），为防止超支已暂停。`
+        : `已运行 ${dur(r.used)}，达到时长上限（${dur(r.limit)}），已暂停。`;
   // 群管理员进不了设置页：上限在哪改只告诉总管理员
   const act = "点击「继续」重新计算，或点击「取消」。";
   const tail = admin()

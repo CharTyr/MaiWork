@@ -1,8 +1,9 @@
 """tools_admin.py：管理员对话专用的工具层（docs/02-设计.md「管理员对话」）。
 
 一句话说清它干什么：管理员在网页上和 MaiWork 的主模型对话时，主模型能调的那批工具
-在这里注册；能直接读的读，能直接改的改，**会对外发东西 / 会删东西 / 会放宽安全设置的**
-一律不当时动手——先写一张「待确认」小票（admin_chat_pending 表），等管理员点「同意」。
+在这里注册；能直接读的读，能直接改的改，**会对外发东西 / 会删东西 / 会改安全相关设置
+（含放宽）的**一律不当时动手——先写一张「待确认」小票（admin_chat_pending 表），等管理
+员点「同意」。
 
 对外接口：
 - `register_admin_tools(tools, svc) -> PendingGate`：把工具注册进 Tools，返回门闸对象；
@@ -65,6 +66,48 @@ CONFIRM_TOOLS = frozenset(
 
 # 确认话术（固定，测试断言这一句；对话循环也靠它识别「等确认」）
 NEED_CONFIRM = "已请求管理员确认，同意后我再动手"
+
+# set_rules 的确认口径（2026-10-12 改成白名单）：**只有**下面这些「无安全影响的调参项」
+# 才允许不经管理员确认直接写 config.toml 并热生效——都是资讯 / 画像 / 快速判断的节奏与
+# 数量。其余任何字段（包括将来新增的、schema 里还没有的）一律先写小票等管理员点头。
+# 为什么：管理员在网页和主模型对话时，主模型读到的群消息 / 网页正文 / 工具输出里可能藏
+# 注入指令，不能让它替管理员改运行账号（换成 root 就是提权）、服务地址（密钥随请求发
+# 出去）、密钥文件路径、SSH 机器、控制台监听地址这些安全边界。
+_SET_RULES_NO_CONFIRM: frozenset[str] = frozenset(
+    {
+        "feeds.news_slots",
+        "feeds.news_jitter_minutes",
+        "feeds.max_items",
+        "feeds.lookback_days",
+        "feeds.web_min_avg",
+        "feeds.pool_min_avg",
+        "feeds.guides",
+        "feeds.collect_minutes",
+        "feeds.viz_per_day",
+        "topics.candidate_ttl_hours",
+        "profile.batch_messages",
+        "profile.max_interval_hours",
+        "profile.backfill_days",
+        "profile.backfill_max_messages",
+        "profile.weekly_day",
+        "profile.read_interval_minutes",
+        "jev.timeout_ms",
+        "quick_judge.keyword_filter",
+    }
+)
+
+# 不在白名单、但沿用 _loosens_security 细粒度口径的键：只有「放宽」才要确认
+# （关掉自动审核、调低每天自动批上限、把开话题最小间隔调大都不用确认）。这几项 0.8.0
+# 就是这么定的，既有行为保持不变，所以不并进白名单。
+_SET_RULES_FINE_GRAINED: frozenset[str] = frozenset(
+    {
+        "approval.remind",
+        "approval.auto_review",
+        "approval.auto_review_daily",
+        "topics.min_gap_hours",
+    }
+)
+
 _REFUSED = "管理员没有同意，这次动作已取消"
 _NOT_IN_SERVICE = "这不是配置里的服务群，MaiWork 不读也不动它"
 _ADMIN_ONLY = "只有 bot 管理员能用，当前角色不允许"
@@ -1207,6 +1250,8 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         0.8.0：管理员名单 / 免批 / 批准开关、推送上限 / 睡觉时段、开话题开关与上限都归
         每个群自己管了，根本进不到这里（_validated_patch 已拒）；这里只剩仍归全局的几项。
         比「现在值」时以有效设置为准；读不到当前值时，但凡沾边一律算放宽（要确认）。
+        2026-10-12 起它只负责 _SET_RULES_FINE_GRAINED 那几项；白名单以外的其余字段由
+        _strict_keys 一律要确认（不靠这里判「是不是放宽」）。
         """
         out: list[str] = []
         approval = validated.get("approval") or {}
@@ -1255,12 +1300,31 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         uniq = [x for x in out if not (x in seen or seen.add(x))]
         return "；".join(uniq)
 
+    def _strict_keys(validated: dict[str, dict[str, Any]]) -> list[str]:
+        """验过的 patch 里「不是无安全影响的调参项」的键 → 一律要先确认。
+
+        白名单口径：_SET_RULES_NO_CONFIRM 里那些键（资讯 / 画像 / 快速判断的节奏与数量）
+        可以直接改；_SET_RULES_FINE_GRAINED（approval.remind / auto_review /
+        auto_review_daily / topics.min_gap_hours）交给 _loosens_security 判「是不是放宽」，
+        不算在这里；**其余任何键**——包括将来新增、schema 里还没出现的——都算需要确认。
+        """
+        out: list[str] = []
+        for section, fields in validated.items():
+            for field in fields:
+                key = f"{section}.{field}"
+                if key in _SET_RULES_NO_CONFIRM or key in _SET_RULES_FINE_GRAINED:
+                    continue
+                out.append(key)
+        return sorted(out)
+
     def _patch_summary(validated: dict[str, dict[str, Any]], loosen: str) -> str:
         """小票摘要：patch 里**全部**要改的字段都列出来（节.键 → 新值，名单类显示成员），
         超长截断但写明「共改 N 项」——管理员点头前看到的必须和真正会改的一致。
 
         全部字段都用中文名（和网页「全部配置」同一套：rules.CONFIG_BY_KEY 的 label），
         不给管理员看 approval.admins 这种英文键名；万一哪个键没登记中文名才退回「节.字段」。
+        loosen 是 _loosens_security / _strict_keys 给出的「为什么这次要确认」中文说明，
+        放得下就缀在末尾，让管理员一眼看出这次碰了安全相关设置。
         """
         def _label(key: str) -> str:
             return rules.full_label(key)
@@ -1279,10 +1343,13 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                 items.append(f"{name} → {shown}")
         total = len(items)
         head = "改规则：" + "；".join(items)
-        if len(head) <= MAX_SUMMARY - 1:
-            return head
-        # 截断：尽量多装几项，末尾写明总数
+        note = f"（涉及安全设置：{loosen}）" if loosen else ""
+        if len(head) + len(note) <= MAX_SUMMARY - 1:
+            return head + note
+        # 截断：尽量多装几项，末尾写明总数；放得下就把「涉及安全设置」一起带上
         suffix = f"…（共改 {total} 项）"
+        if len(suffix) + len(note) < MAX_SUMMARY:
+            suffix += note
         keep = MAX_SUMMARY - len(suffix)
         return head[: max(0, keep)] + suffix
 
@@ -1298,9 +1365,16 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                 base = getter()
             except Exception:
                 base = None
-        # 放宽安全设置 / 让 MaiWork 更常往群里发东西的改动，要先让管理员点头；
-        # 摘要列出 patch 里的全部字段（不是只写放宽那一项）——点同意前看到的就是真要改的
+        # 要确认的两种情况，先合起来判（摘要列出 patch 里的全部字段——点同意前看到的就是
+        # 真要改的）：
+        # ① 白名单之外的任何字段（含将来新增的）：一律先让管理员点头，不判「是不是放宽」；
+        # ② approval.* / topics.min_gap_hours：沿用细粒度口径，只有放宽才要点头。
         loosen = _loosens_security(validated)
+        strict = _strict_keys(validated)
+        if strict:
+            # 摘要末尾已有「（涉及安全设置：…）」，这里只给中文名，不再重复前缀
+            names = "、".join(rules.full_label(k) for k in strict)
+            loosen = f"{loosen}；{names}" if loosen else names
         if loosen:
             pending = _need_confirm("set_rules", args, _patch_summary(validated, loosen))
             if pending is not None:

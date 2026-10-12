@@ -248,6 +248,22 @@ class TestConfigApi:
         assert r.status == 200
 
     @pytest.mark.asyncio
+    async def test_environments_local_network_writes_and_applies_now(self, env: _Env) -> None:
+        """新键 environments.local_network（允许访问本机和内网，bool，默认关）：能存、存完立刻生效。"""
+        await _login(env)
+        assert _field(await (await env.client.get("/api/settings/config")).json(),
+                      "environments.local_network")["default"] is False
+        r = await env.client.put("/api/settings/config", json={"environments.local_network": True})
+        assert r.status == 200
+        assert _field(await r.json(), "environments.local_network")["value"] is True
+        assert "local_network = true" in env.config_text()
+        assert env.app.get_settings().environments.local_network is True
+        # 改回来立刻生效（子 agent 下次跑命令就重新受网络隔离约束）
+        r = await env.client.put("/api/settings/config", json={"environments.local_network": False})
+        assert r.status == 200
+        assert env.app.get_settings().environments.local_network is False
+
+    @pytest.mark.asyncio
     async def test_validation_failure_400_no_write(self, env: _Env) -> None:
         await _login(env)
         before = env.config_text()

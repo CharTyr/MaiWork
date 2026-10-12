@@ -13,9 +13,10 @@ import pytest
 from CharTyr_MaiWork.maiwork import store as store_mod
 from CharTyr_MaiWork.maiwork.store import Store
 
-# 新库号 = 迁移列表长度（39 = 38 + goal_fit）
-STEP_GOAL_FIT = len(store_mod._MIGRATIONS)
+# 第 39 步 = goal_fit（40 = 后来加的 chat_log 去重账本，不是本文件的事）
+STEP_GOAL_FIT = store_mod._MIGRATIONS.index(store_mod._m_goal_fit) + 1
 PREVIOUS = STEP_GOAL_FIT - 1
+LATEST = len(store_mod._MIGRATIONS)
 
 REQUEST_COLS = ("goal_fit", "goal_fit_reason", "goal_fit_alt")
 GOAL_COLS = ("fit", "fit_reason")
@@ -45,13 +46,13 @@ def store(tmp_path: Path):
 
 class TestGoalFitMigration:
     def test_step_is_appended_last(self) -> None:
-        """新阶段只能往后加，_m_goal_fit 是最后一步。"""
+        """新阶段只能往后加：_m_goal_fit 就在第 39 步（第 40 步是后加的 chat_log 去重账本）。"""
         assert STEP_GOAL_FIT == 39, "库号只因 goal_fit 加一步"
-        assert store_mod._MIGRATIONS[-1].__name__ == "_m_goal_fit"
+        assert store_mod._MIGRATIONS[STEP_GOAL_FIT - 1].__name__ == "_m_goal_fit"
 
     def test_fresh_db_has_all_five_columns(self, store: Store) -> None:
         """全新库一路迁到最新也有这五列（全走迁移，没有单独的建库 SQL）。"""
-        assert store.migrate() == STEP_GOAL_FIT
+        assert store.migrate() == LATEST
         req = _columns(store, "requests")
         goal = _columns(store, "goals")
         for name in REQUEST_COLS:
@@ -67,7 +68,7 @@ class TestGoalFitMigration:
         for name in GOAL_COLS:
             assert name not in _columns(store, "goals")
 
-        assert store.migrate() == STEP_GOAL_FIT
+        assert store.migrate() == LATEST
         req = _columns(store, "requests")
         goal = _columns(store, "goals")
         assert set(REQUEST_COLS) <= set(req)

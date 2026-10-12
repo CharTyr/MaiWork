@@ -34,6 +34,15 @@ def test_paused_task_settings_hint_only_for_top_admin() -> None:
     assert "继续" in body and re.search(r"gadmin\(\)\s*\?\s*act\b", body), "群管理员应仍有「继续 / 取消」的说明"
 
 
+def test_paused_tokens_unknown_has_its_own_line() -> None:
+    """安全网读不到用量（kind=tokens_unknown）也暂停：详情要说清是「核算不出用量」，不能被当成时长超线。"""
+    src = _read("detail.js")
+    body = re.search(r"function pausedBlock\(t\) \{(.*?)\n\}", src, re.S).group(1)
+    assert re.search(r"\[[^\]]*\"tokens_unknown\"[^\]]*\]\.includes\(r\.kind\)", body), "白名单要放进 tokens_unknown"
+    m = re.search(r'r\.kind === "tokens_unknown"\s*\?\s*`([^`]*)`', body)
+    assert m and "无法核算" in m.group(1) and "已暂停" in m.group(1) and "r.limit" in m.group(1)
+
+
 def test_no_settings_hint_behind_gadmin_anywhere() -> None:
     """设置页以外的模块里，gadmin() 分支的文案都不许指向设置页。"""
     bad = []

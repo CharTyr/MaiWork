@@ -58,7 +58,8 @@ export const state = {
   update: null, // /api/update 的结果（更新提醒，只有总管理员有）
   tasks: {}, // 任务详情缓存
   handoff: null, // 交接包抽屉：{kind, id, items, back, data, err}
-  badLink: false,
+  badLink: "", // 没登录却带着地址进来："expired" = 管理员登录过期，"link" = 群友链接失效（router.linkProblem）
+  loadErr: {}, // 各块加载失败的原因：view / settings / rules / ext / usage / identity / chat → 文字（成功后删掉）
   loginError: "",
   skew: 0, // 服务器时间 - 本机时间
   page: null, // "settings" = 设置页；"chat" = 和 MaiWork 聊（都不属于任何群）

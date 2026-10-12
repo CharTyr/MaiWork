@@ -7,11 +7,15 @@
 
 表：chat_log（FTS5，tokenize='trigram'，中文可用；列 text / group_id / message_id / ts /
 user_id / user_name，由 store._m_humane 建好）。只读本群的。
+去重账本：chat_log_ids（普通表，(group_id, message_id) 主键，store._m_chat_log_ids 建）。
+chat_log 是虚表、没有唯一约束也建不了索引，老写法每条去重都要全表扫它（3 万行时一批
+200 条十几秒，堵住 MaiBot 的事件循环）；现在先往账本 INSERT OR IGNORE，真插进去了才写
+chat_log。清理时两张表一起删，保证一致。
 
 - record_messages(store, group_id, msgs, *, now)：profile.tick 统计之后把本轮新消息塞进来；
   只收非机器人、文本非空、不是「[图片]」占位的；同一 message_id 重复插入不动原文。
-- prune_old(store, group_id, *, now, keep_days=14)：清 14 天前的；每天（北京时间）最多清一次
-  （kv 记上次清的日子），tick 每次都调也便宜。
+- prune_old(store, group_id, *, now, keep_days=14)：清 14 天前的（chat_log 和 chat_log_ids
+  一起删）；每天（北京时间）最多清一次（kv 记上次清的日子），tick 每次都调也便宜。
 - search_chat(store, group_id, query, *, days=14, limit=8, now=None)：
   [{ts, who, user_id, text, message_id}]，新的在前；trigram 要 ≥3 个字符，短词自动换 LIKE 兜底；
   只查本群；空查询 / 没命中 → []。
@@ -39,7 +43,7 @@ _RECENT_SCAN_MAX = 200       # recent_chat 单次最多取多少条（limit 的�
 
 
 def record_messages(store: Any, group_id: str, msgs: list, *, now: float) -> int:
-    """把一批新消息写进 chat_log；返回实际写入条数。库里出错记日志、不抛。"""
+    """把一批新消息写进 chat_log；返回本批收下的候选条数。库里出错记日志、不抛。"""
     gid = str(group_id)
     rows: list[tuple] = []
     for m in msgs or []:
@@ -68,15 +72,23 @@ def record_messages(store: Any, group_id: str, msgs: list, *, now: float) -> int
         return 0
     try:
         with store.tx() as conn:
-            # FTS5 表没有唯一约束，INSERT OR IGNORE 拦不住重复；同一 message_id
-            # 已存在就跳过（不改原文）。
-            conn.executemany(
-                "INSERT INTO chat_log (text, group_id, message_id, ts, user_id, user_name)"
-                " SELECT ?, ?, ?, ?, ?, ?"
-                " WHERE NOT EXISTS ("
-                " SELECT 1 FROM chat_log WHERE group_id=? AND message_id=?)",
-                [(*r, r[1], r[2]) for r in rows],
-            )
+            # chat_log 是 FTS5 虚表：没有唯一约束、也建不了索引，INSERT OR IGNORE 拦不住重复。
+            # 去重账本是普通表 chat_log_ids（store._m_chat_log_ids 建，(group_id, message_id)
+            # 主键）：先占位，只有真插进去（rowcount == 1）才写 chat_log——每条只查一次主键，
+            # 不再全表扫 chat_log；同一个 message_id 已记过就跳过（不改原文）。
+            for r in rows:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO chat_log_ids (group_id, message_id, ts)"
+                    " VALUES (?, ?, ?)",
+                    (r[1], r[2], r[3]),
+                )
+                if not cur.rowcount:
+                    continue
+                conn.execute(
+                    "INSERT INTO chat_log (text, group_id, message_id, ts, user_id, user_name)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    r,
+                )
     except Exception:
         logger.info("chat_log 写入失败（群 %s）", gid, exc_info=True)
         return 0
@@ -94,6 +106,11 @@ def prune_old(store: Any, group_id: str, *, now: float, keep_days: int = _KEEP_D
         cutoff = float(now) - max(1, int(keep_days)) * 86400.0
         with store.tx() as conn:
             cur = conn.execute("DELETE FROM chat_log WHERE group_id=? AND ts<?", (gid, cutoff))
+            # 账本跟着一起清（按同一个群 + 同一个时间界限），两张表保持一致：
+            # 清掉的消息再写进来还能重新入库，和原来一样。
+            conn.execute(
+                "DELETE FROM chat_log_ids WHERE group_id=? AND ts<?", (gid, cutoff)
+            )
             store.kv_set(conn, kv_key, day)
         return int(cur.rowcount or 0)
     except Exception:

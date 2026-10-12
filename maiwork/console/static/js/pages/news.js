@@ -8,7 +8,12 @@ import { agentFish, api, gview } from "../api.js";
 export function emptyState(iconName, title, text) {
   return `<div class="empty enter">${ico(iconName)}<b>${esc(title)}</b>${text ? `<span>${esc(text)}</span>` : ""}</div>`;
 }
-export const loading = () => `<div class="loading"><span></span><span></span><span></span></div>`;
+// 加载中；给了失败原因就改成原地的「加载失败 + 重试」（design.md §8.3：失败不只靠一闪而过的 toast）。
+// what = 重试时重新取哪一块（router.retryLoad），g = 按群懒加载的块带上群号。
+export const loading = (fail, what, g) =>
+  fail
+    ? `<div class="warn-box load-fail" role="alert">加载失败：${esc(fail)} <button class="btn small" data-act="load-retry" data-what="${esc(what || "")}"${g ? ` data-g="${esc(g)}"` : ""}>重试</button></div>`
+    : `<div class="loading"><span></span><span></span><span></span></div>`;
 
 export const FB_KEY = "mw-fb";
 export const myFb = () => {

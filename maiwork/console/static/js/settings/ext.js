@@ -8,7 +8,7 @@ export const ROLE_NAMES = { worker: "子 agent", main: "主模型" };
 
 export function extPage() {
   const x = state.ext;
-  if (!x) return loading();
+  if (!x) return loading((state.loadErr || {}).ext, "ext");
   const ed = state.extEdit;
   const mcp = x.mcp || [];
   const skills = x.skills || [];
@@ -382,8 +382,11 @@ export function readHeaders() {
 export async function loadExt() {
   try {
     state.ext = await api("GET", "/api/extensions");
+    if (state.loadErr) delete state.loadErr.ext;
   } catch (e) {
-    state.ext = { mcp: [], skills: [] };
+    // 取不到不能画成「暂无」：留空，让页面显示失败原因和重试
+    state.ext = null;
+    (state.loadErr = state.loadErr || {}).ext = e.message;
     toast(e.message, true);
   }
   try {

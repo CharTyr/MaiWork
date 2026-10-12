@@ -15,8 +15,10 @@ export async function loadUsage(days) {
     const list = (u.hist && u.hist.days) || [];
     if (!u.sel || !list.some((d) => d.day === u.sel)) u.sel = list.length ? list[list.length - 1].day : "";
     if (u.sel) await loadUsageDay(u.sel);
+    if (state.loadErr) delete state.loadErr.usage;
   } catch (e) {
     u.hist = null;
+    (state.loadErr = state.loadErr || {}).usage = e.message;
     toast(e.message, true);
   }
 }
@@ -44,7 +46,7 @@ export function usageAndLogsPage() {
 
 export function usagePage() {
   const u = state.usage;
-  if (!u || !u.hist) return loading();
+  if (!u || !u.hist) return loading((state.loadErr || {}).usage, "usage");
   const list = u.hist.days || [];
   const t = u.hist.totals || {};
   const max = Math.max(1, ...list.map((d) => (d.main || 0) + (d.worker || 0)));

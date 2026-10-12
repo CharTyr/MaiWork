@@ -24,7 +24,7 @@
 
 ## Integration
 
-- 父模块：[浏览器控制层](../codemap.md)；页面复用 [群页面组件](../pages/codemap.md) 的 loading/反馈。
+- 父模块：[浏览器控制层](../codemap.md)；页面复用 [群页面组件](../pages/codemap.md) 的 loading/反馈；各页加载失败把原因记进 `state.loadErr.<块>`，传给 `loading()` 显示「加载失败 + 重试」。
 - 服务端：[控制台 API](../../../codemap.md)。密钥只在浏览器输入并提交，不通过 GET 回显；表单隐藏不构成权限边界。
 - 数据出处：`/api/settings`、`/api/settings/config`、`/api/extensions`、`/api/extensions/search`、`/api/extensions/presets`、`/api/groups/{id}/trusted-sources`、`/api/usage/history`、`/api/logs/*`、`/api/identity`；预设打开/密钥提交用 `POST /api/extensions/presets/{id}`，首次引导批量设置另用 `POST /api/extensions/presets-setup`。
 - `rules.js` 的字段元数据由后端生成，服务群行表单提示支持 `qq:群号` / `telegram:群 ID` / `qqbot:群 openid`；`index.js::groupPicker()` 通过 `platTag()` 标平台。

@@ -735,7 +735,9 @@ class Workers:
                             summary=(
                                 "任务被安全网自动暂停（{}），子 agent 停手，没跑完的从恢复那刻接着干"
                             ).format(
-                                "token 超线" if reason.get("kind") == "tokens" else "时长超线"
+                                {"tokens": "token 超线", "tokens_unknown": "用量核不出来"}.get(
+                                    reason.get("kind"), "时长超线"
+                                )
                             ),
                             steps=steps,
                             error="任务被安全网自动暂停",

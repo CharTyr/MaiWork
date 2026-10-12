@@ -218,7 +218,14 @@ export function renderView(opts) {
   const v = gview();
   const views = { news: viewNews, ideas: viewIdeas, tasks: viewTasks, group: viewGroup };
   const el = $("view");
-  const html = updateBanner() + (!v && state.tab !== "group" ? `<h1 class="h-page">${TABS.find((t) => t.id === state.tab).label}</h1>${loading()}` : views[state.tab](g, v));
+  const fail = (state.loadErr || {}).view;
+  // 没内容：其他页显示加载中；取失败了（含「群」页）原地显示原因和重试。
+  // 有旧内容但最近一次刷新失败：内容照旧，顶部提示连接中断（不让人以为数据还是最新的）
+  const body =
+    !v && (state.tab !== "group" || fail)
+      ? `<h1 class="h-page">${TABS.find((t) => t.id === state.tab).label}</h1>${loading(fail, "view")}`
+      : (v && fail ? `<div class="warn-box stale-note" role="status">连接中断，正在重试。当前显示的可能不是最新内容。</div>` : "") + views[state.tab](g, v);
+  const html = updateBanner() + body;
   // 定时轮询时内容没变就不重画：不让图解 iframe 重新加载（一闪），也不打断正在看的页面。
   // 只限轮询（opts.poll）：点按钮之后的重画照旧整块重画，按钮状态会复位
   if (opts && opts.poll && html === lastView && !ui.flash) return;
@@ -237,7 +244,13 @@ function landing() {
     <div class="landing">
       <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="" style="width:120px;height:120px" />
       <h1 class="h-page" style="margin-top:22px">MaiWork</h1>
-      ${bad ? `<div class="warn-box" style="width:100%;text-align:left">链接已失效。请在群内发送 <b>/mw 网页</b> 获取新链接。</div>` : ""}
+      ${
+        bad === "expired"
+          ? `<div class="warn-box" style="width:100%;text-align:left">登录已过期，请重新登录。</div>`
+          : bad
+            ? `<div class="warn-box" style="width:100%;text-align:left">链接已失效。请在群内发送 <b>/mw 网页</b> 获取新链接。</div>`
+            : ""
+      }
       <div class="landing-box">
         <div class="landing-t">群成员</div>
         <p>在群内发送 <b>/mw 网页</b> 获取本群链接。</p>

@@ -3,7 +3,12 @@
 chat_log = 服务群最近 14 天发言的只读副本（FTS5 trigram，支持中文全文检索）：
 - 写入只收：非机器人、文本非空、且不是「[图片]」占位的消息（profile.tick 统计之后调
   chatlog.record_messages；本文件直接测 record_messages / search_chat / prune_old）。
-- 清理：每天清一次 14 天前的（kv 记上次清的日子，同一天第二次调用跳过）。
+- 去重：chat_log 是 FTS5 虚表，没有唯一约束，也不能建索引；去重靠普通表 chat_log_ids
+  （库号 40 的迁移建，PRIMARY KEY (group_id, message_id) WITHOUT ROWID）——
+  先 INSERT OR IGNORE 进 ids，只有真插进去才写 chat_log。老实现每条都全表扫 chat_log，
+  存量 3 万行时一批 200 条要十几秒，还把 MaiBot 的事件循环堵住。
+- 清理：每天清一次 14 天前的（kv 记上次清的日子，同一天第二次调用跳过）；chat_log 和
+  chat_log_ids 一起删，两张表保持一致。
 - search_chat(store, group_id, query, *, days=14, limit=8)：
   - trigram 需要查询词 ≥3 个字符；短词自动换 LIKE 兜底（照样能命中）；
   - 只查本群（别的群的原话绝不混进来）；
@@ -13,6 +18,7 @@ chat_log = 服务群最近 14 天发言的只读副本（FTS5 trigram，支持�
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -60,6 +66,27 @@ def _seed_chat(store: Store) -> None:
         M("m7", NOW - 40, "我机器人自己说一句", bot=True),            # 机器人：不进
     ]
     record_messages(store, GID, msgs, now=NOW)
+
+
+def _in_chat_log(store: Store, mid: str, gid: str = GID) -> int:
+    row = store.read().execute(
+        "SELECT COUNT(*) c FROM chat_log WHERE group_id=? AND message_id=?", (gid, mid)
+    ).fetchone()
+    return int(row["c"])
+
+
+def _in_ids(store: Store, mid: str, gid: str = GID) -> int:
+    row = store.read().execute(
+        "SELECT COUNT(*) c FROM chat_log_ids WHERE group_id=? AND message_id=?", (gid, mid)
+    ).fetchone()
+    return int(row["c"])
+
+
+def _text_of(store: Store, mid: str, gid: str = GID) -> str:
+    row = store.read().execute(
+        "SELECT text FROM chat_log WHERE group_id=? AND message_id=?", (gid, mid)
+    ).fetchone()
+    return str(row["text"]) if row is not None else ""
 
 
 # ----------------------------------------------------------------------
@@ -111,6 +138,105 @@ class TestRecord:
 
 
 # ----------------------------------------------------------------------
+# 去重（chat_log_ids 主键，不再全表扫 FTS5）
+# ----------------------------------------------------------------------
+
+
+class TestDedupe:
+    def test_same_batch_duplicate_stored_once(self, store: Store) -> None:
+        """同一批里同一个 message_id 出现两次：只存一份。"""
+        record_messages(
+            store, GID,
+            [M("d1", NOW - 10, "同一条消息"), M("d1", NOW - 10, "同一条消息")],
+            now=NOW,
+        )
+        assert _in_chat_log(store, "d1") == 1
+        assert _in_ids(store, "d1") == 1
+
+    def test_cross_batch_duplicate_ignored(self, store: Store) -> None:
+        """跨批重复：第二批不动原文。"""
+        record_messages(store, GID, [M("c1", NOW - 10, "第一次写进去的原话")], now=NOW)
+        record_messages(store, GID, [M("c1", NOW - 5, "第二次想改写的原文")], now=NOW)
+        assert _in_chat_log(store, "c1") == 1
+        assert _in_ids(store, "c1") == 1
+        assert _text_of(store, "c1") == "第一次写进去的原话"
+
+    def test_same_message_id_in_two_groups_each_kept(self, store: Store) -> None:
+        """不同群里的同一个 message_id 各存一份（去重只在本群内）。"""
+        record_messages(store, GID, [M("same1", NOW - 10, "甲群的原话")], now=NOW)
+        record_messages(store, GID_B, [M("same1", NOW - 10, "乙群的原话")], now=NOW)
+        assert _in_chat_log(store, "same1", GID) == 1
+        assert _in_chat_log(store, "same1", GID_B) == 1
+        assert _in_ids(store, "same1", GID) == 1
+        assert _in_ids(store, "same1", GID_B) == 1
+
+    def test_ids_rows_mirror_chat_log(self, store: Store) -> None:
+        """写完一遍：chat_log_ids 里 (群, 消息, 时间) 跟 chat_log 一一对应。"""
+        _seed_chat(store)
+        seen = {
+            (r["group_id"], r["message_id"], float(r["ts"]))
+            for r in store.read().execute("SELECT group_id, message_id, ts FROM chat_log")
+        }
+        ids = {
+            (r["group_id"], r["message_id"], float(r["ts"]))
+            for r in store.read().execute("SELECT group_id, message_id, ts FROM chat_log_ids")
+        }
+        assert ids == seen
+
+    def test_return_value_stays_input_count(self, store: Store) -> None:
+        """返回值语义不变：返回本批收下的候选条数（含重复，不是新增条数）。"""
+        n = record_messages(
+            store, GID,
+            [M("r1", NOW, "一"), M("r1", NOW, "一"), M("r2", NOW, "二")],
+            now=NOW,
+        )
+        assert n == 3
+        assert record_messages(store, GID, [M("r1", NOW, "一")], now=NOW) == 1
+        assert _in_chat_log(store, "r1") == 1
+
+
+# ----------------------------------------------------------------------
+# 去重查询走主键 / 大批量写的耗时守门
+# ----------------------------------------------------------------------
+
+
+class TestDedupeIsIndexed:
+    def test_lookup_plan_uses_primary_key(self, store: Store) -> None:
+        """去重查询 EXPLAIN QUERY PLAN 必须走 chat_log_ids 主键，不是 SCAN。"""
+        plan = store.read().execute(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM chat_log_ids WHERE group_id=? AND message_id=?",
+            (GID, "m1"),
+        ).fetchall()
+        text = " ".join(str(r[3]) for r in plan).upper()
+        assert "SCAN" not in text, text
+        assert "PRIMARY KEY" in text, text
+
+    def test_big_table_batch_write_is_fast(self, store: Store) -> None:
+        """存量 2 万行时再写 200 条：耗时要明显低于旧实现的全表扫描（旧实现十几秒）。
+
+        这里只往 chat_log 灌存量（回填由迁移负责，见 test_store_historical_migrations），
+        本测试只关心「去重别再去扫 FTS5 虚表」。阈值放宽到 1 秒以避机器差异。
+        """
+        rows = [
+            ("存量原话 %d 中文内容" % i, GID, "old%d" % i, NOW - i, "u1", "阿一")
+            for i in range(20000)
+        ]
+        with store.tx() as conn:
+            conn.executemany(
+                "INSERT INTO chat_log (text, group_id, message_id, ts, user_id, user_name)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+        batch = [M("fresh%d" % i, NOW, "新消息 %d 中文内容" % i) for i in range(200)]
+        t0 = time.perf_counter()
+        n = record_messages(store, GID, batch, now=NOW)
+        elapsed = time.perf_counter() - t0
+        assert n == 200
+        assert _in_chat_log(store, "fresh0") == 1 and _in_ids(store, "fresh0") == 1
+        assert elapsed < 1.0, f"200 条写了 {elapsed:.3f}s：去重多半又退化成全表扫描了"
+
+
+# ----------------------------------------------------------------------
 # 清理（14 天）
 # ----------------------------------------------------------------------
 
@@ -155,6 +281,38 @@ class TestPrune:
             "SELECT COUNT(*) c FROM chat_log WHERE group_id=?", (GID_B,)
         ).fetchone()
         assert int(row["c"]) == 1
+
+    def test_prune_deletes_ids_rows_too(self, store: Store) -> None:
+        """prune 两张表一起清：删掉的老消息在 chat_log_ids 里也不留。"""
+        old = NOW - 15 * 86400
+        record_messages(
+            store, GID,
+            [M("old7", old, "十五天前的老消息"), M("new7", NOW - 100, "今天的消息")],
+            now=NOW,
+        )
+        prune_old(store, GID, now=NOW)
+        assert _in_chat_log(store, "old7") == 0
+        assert _in_ids(store, "old7") == 0
+        assert _in_chat_log(store, "new7") == 1
+        assert _in_ids(store, "new7") == 1
+
+    def test_prune_leaves_other_group_ids_alone(self, store: Store) -> None:
+        """清甲群不动乙群（chat_log_ids 也一样按群清）。"""
+        old = NOW - 15 * 86400
+        record_messages(store, GID_B, [M("b7", old, "乙群的旧消息")], now=NOW)
+        prune_old(store, GID, now=NOW)
+        assert _in_ids(store, "b7", GID_B) == 1
+
+    def test_pruned_message_can_be_recorded_again(self, store: Store) -> None:
+        """prune 之后同一条 message_id 还能重新写进来（和原来一致：清掉就不再去重）。"""
+        old = NOW - 15 * 86400
+        record_messages(store, GID, [M("again1", old, "第一次写的老消息")], now=NOW)
+        prune_old(store, GID, now=NOW)
+        assert _in_chat_log(store, "again1") == 0
+        record_messages(store, GID, [M("again1", old, "清掉之后重写")], now=NOW)
+        assert _in_chat_log(store, "again1") == 1
+        assert _in_ids(store, "again1") == 1
+        assert _text_of(store, "again1") == "清掉之后重写"
 
 
 # ----------------------------------------------------------------------
@@ -279,11 +437,13 @@ class TestTickWiring:
                 " VALUES ('很早以前聊过重装系统', ?, 'old1', ?, 'u9', '古人')",
                 (GID, old),
             )
+            conn.execute(
+                "INSERT INTO chat_log_ids (group_id, message_id, ts) VALUES (?, 'old1', ?)",
+                (GID, old),
+            )
         import asyncio as _aio
 
         monkeypatch.setattr(_clock, "now", lambda: NOW + 86400)
         _aio.run(profiles.tick(GID))  # 第二天：没有新消息也照样做清理那一步
-        row = store.read().execute(
-            "SELECT COUNT(*) c FROM chat_log WHERE message_id='old1'"
-        ).fetchone()
-        assert int(row["c"]) == 0
+        assert _in_chat_log(store, "old1") == 0
+        assert _in_ids(store, "old1") == 0

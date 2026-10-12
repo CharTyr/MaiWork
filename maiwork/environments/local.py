@@ -26,6 +26,10 @@
 - 命令、子目录名一律拼进 argv 传 exec，不经过本机 shell 二次解释；
 - run() 在 RuntimeMaxSec 之外再用 asyncio.wait_for(+15s) 兜底，超时要 kill
   systemd-run 进程并 systemctl stop 兜底单元，所以 run 也带 --unit=maiwork-run-<随机>。
+- 网络（systemd 模式默认）：IPAddressDeny 挡回环 / link-local（含 169.254 元数据地址）/
+  组播 / 私有网段 / 云厂商内网 + 本机自己的非回环地址，只把落在这些网段里的 nameserver
+  放进 IPAddressAllow（否则 DNS 也断）——子 agent 出公网照旧，但碰不到 MaiWork 控制台、
+  MaiBot 和这台机器自己的服务；配置 environments.local_network = true 时整块跳过。
 """
 
 from __future__ import annotations
@@ -34,12 +38,15 @@ import asyncio
 import codecs
 from contextlib import contextmanager
 import inspect
+import ipaddress
+import json
 import logging
 import os
 import re
 import secrets
 import shlex
 import stat
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -156,6 +163,198 @@ def write_new_file_verified(root: Any, rel_dir: str, name: str, data: bytes) -> 
             return f.read() == body
     finally:
         os.close(dir_fd)
+
+
+# ----------------------------------------------------------------------
+# 网络隔离：systemd 单元的 IPAddressDeny / IPAddressAllow
+#
+# 默认不让子 agent 碰本机服务（MaiWork 控制台、MaiBot）、这台机器自己监听 0.0.0.0 的公网
+# IP、云厂商内网和 169.254.169.254 元数据（线上实测：2026-09-27 那套隔离「能出网」，
+# 也就意味着能 curl 本机）。固定挡「回环 / link-local / 组播 / 私有网段 / 云内网」，
+# 再补上本机自己的非回环地址；resolv.conf 里落进这些网段的 nameserver 单独放行
+# （IPAddressAllow 优先于 IPAddressDeny），否则 DNS 也会被一起挡死。
+# ----------------------------------------------------------------------
+
+_IS_LINUX = sys.platform.startswith("linux")
+_RESOLV_CONF = "/etc/resolv.conf"
+_FIB_TRIE = "/proc/net/fib_trie"
+_IF_INET6 = "/proc/net/if_inet6"
+_LOCAL_ADDR_TTL_S = 600  # 本机地址在进程内缓存 10 分钟（别每条命令都去读一遍）
+_LOCAL_ADDR_CACHE: dict[str, Any] = {"at": 0.0, "addrs": None}  # addrs=None 表示还没取过
+# 一条 IPAddressDeny 写全的固定部分：回环、link-local（169.254 元数据地址在里面）、组播、
+# 内网、云厂商内网（100.64.0.0/10）、IPv6 私有（fc00::/7）。
+# 一律写成网段：线上实测（2026-10-12，systemd 257）`systemd-run -p IPAddressDeny=localhost …`
+# 直接报「Failed to parse IP address prefix: localhost」起不来——unit 文件认的 localhost /
+# link-local / multicast 关键字，systemd-run 的 -p 不认。
+_NET_DENY_KEYWORDS = (
+    "127.0.0.0/8", "::1/128",        # 回环（localhost）
+    "169.254.0.0/16", "fe80::/10",   # link-local（含 169.254.169.254 元数据地址）
+    "224.0.0.0/4", "ff00::/8",       # 组播
+)
+_NET_DENY_NETS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7")
+# 判「这个 nameserver 会不会被挡住」用的网段：上面两组合起来
+_NET_DENIED_RANGES = tuple(ipaddress.ip_network(text) for text in (*_NET_DENY_KEYWORDS, *_NET_DENY_NETS))
+
+
+def _read_text(path: str) -> str:
+    """读文本文件；读不到（不存在 / 没权限 / 平台没有）返回空串——绝不抛。"""
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _parse_ip(text: str) -> Any:
+    """字符串 → ipaddress 地址对象；不合法返回 None（带 %网卡 的 IPv6 也认）。"""
+    try:
+        return ipaddress.ip_address(str(text or "").split("%", 1)[0].strip())
+    except ValueError:
+        return None
+
+
+def _addrs_from_fib_trie(text: str) -> tuple[str, ...]:
+    """解析 /proc/net/fib_trie：只认「host LOCAL」（本机地址），UNICAST / BROADCAST 不算。"""
+    out: list[str] = []
+    pending = ""
+    for line in str(text or "").splitlines():
+        s = line.strip()
+        if s.startswith("|-- "):
+            pending = s[len("|-- "):].strip()
+            continue
+        if pending and "host LOCAL" in s:
+            out.append(pending)
+            pending = ""
+    return tuple(out)
+
+
+def _addrs_from_if_inet6(text: str) -> tuple[str, ...]:
+    """解析 /proc/net/if_inet6（每行开头是 32 位十六进制的 IPv6 地址）。"""
+    out: list[str] = []
+    for line in str(text or "").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        try:
+            out.append(str(ipaddress.IPv6Address(int(parts[0], 16))))
+        except ValueError:
+            continue
+    return tuple(out)
+
+
+def _addrs_from_ip_json(text: str) -> tuple[str, ...]:
+    """解析 `ip -j addr` 的输出（本机地址在每条 addr_info 的 local 字段）。"""
+    try:
+        devices = json.loads(str(text or ""))
+    except ValueError:
+        return ()
+    if not isinstance(devices, list):
+        return ()
+    out: list[str] = []
+    for dev in devices:
+        if not isinstance(dev, dict):
+            continue
+        for info in dev.get("addr_info") or []:
+            if isinstance(info, dict) and str(info.get("local") or "").strip():
+                out.append(str(info["local"]).strip())
+    return tuple(out)
+
+
+def _clean_addrs(raw: Any) -> list[str]:
+    """规范化 + 去重 + 去掉回环地址（回环由 IPAddressDeny 的 127.0.0.0/8 / ::1 兜着）。"""
+    out: list[str] = []
+    for item in raw or ():
+        ip = _parse_ip(str(item or ""))
+        if ip is None or ip.is_loopback:
+            continue
+        addr = str(ip)
+        if addr not in out:
+            out.append(addr)
+    return out
+
+
+def _collect_local_addrs() -> tuple[str, ...]:
+    """本机所有非回环 IP：先读 /proc（无额外依赖），一个都没读到再退 `ip -j addr`。
+
+    非 Linux（本机开发）直接返回空：那里没有 systemd 隔离，网络限制也用不上。
+    """
+    if not _IS_LINUX:
+        return ()
+    raw = [*_addrs_from_fib_trie(_read_text(_FIB_TRIE)), *_addrs_from_if_inet6(_read_text(_IF_INET6))]
+    if not raw:
+        try:
+            # 兜底路径（正常 Linux 上用不到）：读 /proc 拿不到才跑一次 ip，别让事件循环等太久
+            done = subprocess.run(
+                ["ip", "-j", "addr"], capture_output=True, text=True, timeout=3, check=False,
+            )
+            raw = list(_addrs_from_ip_json(done.stdout if done.returncode == 0 else ""))
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("跑不了 ip -j addr（%s），本机地址只能靠 /proc 读", exc)
+            raw = []
+    return tuple(_clean_addrs(raw))
+
+
+def local_nonloopback_addrs() -> tuple[str, ...]:
+    """本机自己的非回环 IP（进程内缓存 10 分钟）；读不到返回空元组并记 warning，绝不抛。"""
+    cached = _LOCAL_ADDR_CACHE.get("addrs")
+    fresh = clock.now() - float(_LOCAL_ADDR_CACHE.get("at") or 0.0) < _LOCAL_ADDR_TTL_S
+    if cached is not None and fresh:
+        return tuple(cached)
+    try:
+        addrs = tuple(_collect_local_addrs())
+    except Exception:
+        logger.warning("读取本机地址失败，网络隔离只挡固定网段（本机自己的地址可能仍可访问）", exc_info=True)
+        addrs = ()
+    if not addrs and _IS_LINUX:
+        logger.warning("没有取到本机非回环地址，网络隔离只挡固定网段")
+    _LOCAL_ADDR_CACHE["at"] = clock.now()
+    _LOCAL_ADDR_CACHE["addrs"] = addrs
+    return addrs
+
+
+def _parse_resolv_conf(text: str) -> tuple[str, ...]:
+    """解析 /etc/resolv.conf 的 nameserver：注释、选项、坏地址一律跳过，去重。"""
+    out: list[str] = []
+    for line in str(text or "").splitlines():
+        line = line.split("#", 1)[0].split(";", 1)[0].strip()
+        parts = line.split()
+        if len(parts) < 2 or parts[0] != "nameserver":
+            continue
+        ip = _parse_ip(parts[1])
+        if ip is None:
+            continue
+        addr = str(ip)
+        if addr not in out:
+            out.append(addr)
+    return tuple(out)
+
+
+def resolv_conf_nameservers() -> tuple[str, ...]:
+    """resolv.conf 里的 DNS 服务器地址；读不到 / 解析不了都返回空元组，绝不抛。"""
+    try:
+        return _parse_resolv_conf(_read_text(_RESOLV_CONF))
+    except Exception:
+        logger.warning("解析 %s 失败，本次不额外放行 DNS", _RESOLV_CONF, exc_info=True)
+        return ()
+
+
+def _in_denied_range(addr: str) -> bool:
+    """这个地址会不会被 IPAddressDeny 挡住（决定要不要写进 IPAddressAllow）。"""
+    ip = _parse_ip(addr)
+    if ip is None:
+        return False
+    if ip.is_loopback or ip.is_link_local or ip.is_multicast:
+        return True
+    return any(ip.version == net.version and ip in net for net in _NET_DENIED_RANGES)
+
+
+def lookup_uid(name: str) -> int | None:
+    """查系统账号的 uid；账号不存在 / 平台没有 pwd 模块 → None（放行，交给 systemd 自己报错）。"""
+    if pwd is None:
+        return None
+    try:
+        return int(pwd.getpwnam(str(name)).pw_uid)
+    except (KeyError, OSError, ValueError):
+        return None
 
 
 class LocalEnv:
@@ -569,15 +768,57 @@ class LocalEnv:
                 "-p", f"StateDirectory=maiwork/workspaces/{name}",
             ]
         run_as = self._run_as()
+        self._reject_root_run_as(run_as)
         return [f"--uid={run_as}", f"--gid={run_as}"]
 
+    def _reject_root_run_as(self, run_as: str) -> None:
+        """fixed 模式的运行账号兜底：root / uid 0 一律拒跑。
+
+        网页那层有 rules._check_run_as 挡着，但直接改 config.toml 能绕过（配置加载不校验
+        run_as）。这里在拼单元之前再拦一次：宁可不跑命令，也不让子 agent 拿到 root。
+        """
+        if run_as == "root" or lookup_uid(run_as) == 0:
+            raise PermissionError(
+                f"运行账号不能是 root 或 uid 为 0 的账号（当前为 {run_as}）："
+                "请在网页「设置 → 全部设置 → 运行环境 → 运行账号」改用专用账号（例如 maiwork）"
+            )
+
+    def _allow_local_network(self) -> bool:
+        """environments.local_network：用户明确允许子 agent 访问本机与内网。"""
+        return bool(getattr(self._get_settings().environments, "local_network", False))
+
+    def _network_props(self) -> list[str]:
+        """网络隔离属性（交给 _hardening 拼进 systemd 单元）。
+
+        - IPAddressDeny=<回环 / link-local / 组播网段> <私有网段 / 云内网> <本机自己的非回环地址…>；
+          线上实测（2026-10-12）：DNS 与出公网正常，127.0.0.1、本机公网 IP、docker 网桥都连不上；
+        - 落在被禁网段里的 nameserver 写进 IPAddressAllow=（Allow 优先于 Deny，DNS 照常能用，
+          且只放行 DNS 服务器自己的地址）；没有要放行的就不加这条；
+        - 开关 environments.local_network = true → 一条都不加（direct 模式不走这里，本来就没有）。
+        """
+        if self._allow_local_network():
+            return []
+        own = list(local_nonloopback_addrs())
+        deny = [*_NET_DENY_KEYWORDS, *_NET_DENY_NETS]
+        deny += [addr for addr in own if addr not in deny]
+        props = ["-p", "IPAddressDeny=" + " ".join(deny)]
+        allow: list[str] = []
+        for ns in resolv_conf_nameservers():
+            if ns not in allow and (_in_denied_range(ns) or ns in own):
+                allow.append(ns)
+        if allow:
+            # Deny 写在前、Allow 写在后：不管 systemd 按「Allow 优先」还是「后写的覆盖先写的」解释都对
+            props += ["-p", "IPAddressAllow=" + " ".join(allow)]
+        return props
+
     def _hardening(self, ws: Path) -> list[str]:
-        """隔离：整个系统只读、家目录只读、/tmp 私有、不能提权。
+        """隔离：整个系统只读、家目录只读、/tmp 私有、不能提权、默认碰不到本机与内网。
 
         - fixed：工作区根被换成空的临时目录，只把本工作区挂回来——看不到别的群的工作区。
           线上实测（2026-09-27）：别的工作区「No such file」、/home/maiwork 只读、本工作区可写、能出网。
         - dynamic：不用 BindPaths（工作区是 StateDirectory，systemd 自己挂上、属主自动改对）；
           ProtectHome=yes 把整个 /home 遮掉（2026-09-28 实测两次运行 uid 相同、能续写、读 /root 被拒）。
+        - 两种方式都追加网络隔离（_network_props）。
         """
         if self._exec_user_kind() == "dynamic":
             return [
@@ -585,6 +826,7 @@ class LocalEnv:
                 "-p", "ProtectHome=yes",
                 "-p", "PrivateTmp=yes",
                 "-p", "NoNewPrivileges=yes",
+                *self._network_props(),
             ]
         root = Path(ws).parent
         return [
@@ -594,6 +836,7 @@ class LocalEnv:
             "-p", "NoNewPrivileges=yes",
             "-p", f"TemporaryFileSystem={root}",
             "-p", f"BindPaths={ws}",
+            *self._network_props(),
         ]
 
     async def _systemctl_stop(self, unit: str, ws: Path) -> None:

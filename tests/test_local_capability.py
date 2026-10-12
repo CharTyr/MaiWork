@@ -62,6 +62,17 @@ class TestDetect:
         assert r.mode == "stopped"
         assert "systemd" in r.log_line
 
+    def test_root_run_as_is_reported_stopped_not_isolated(self):
+        """运行账号是 root：local.py 会拒跑，健康项不能还显示「隔离运行（固定账号 root）」。"""
+        r = capability.detect(_probe(user=True), run_as="root")
+        assert r.mode == "stopped" and r.ok is False and r.unit_user == ""
+        assert "root" in r.reason and "运行账号" in r.hint
+
+    def test_uid0_alias_run_as_is_reported_stopped(self):
+        caps = capability.LocalCaps(is_linux=True, is_root=True, has_systemd_run=True, run_as_exists=True, run_as_is_root=True)
+        r = capability.detect(caps, run_as="toor")
+        assert r.mode == "stopped" and r.ok is False
+
     def test_stopped_reasons_in_priority_order(self):
         # 全不满足：先说不是 Linux
         r = capability.detect(_probe(platform="windows", root=False, systemd=False, user=False), run_as="x")

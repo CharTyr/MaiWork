@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 from contextlib import nullcontext
@@ -22,6 +23,8 @@ from typing import Any, Callable, Iterable
 from . import clock, members, requirements
 from .lanes import close_task_lanes
 from .store import Store, next_id
+
+logger = logging.getLogger("maiwork.tasks")
 
 _STATUS_KINDS = (
     "pending_approval", "queued", "running", "waiting_input", "shelved",
@@ -70,12 +73,13 @@ def _load_json(s: Any, default: Any) -> Any:
 # 为什么要有 schema：暂停原因会进网页的任务列表和详情（总管理员 / 群管理员 / 群友
 # 三种身份都看得到），所以只留「说得清 + 不泄密」的最小结构，写入时严格校验、限长：
 #   {"kind": "tokens"|"time", "limit": int>0, "used": int>=0}   安全网自动暂停
+#   {"kind": "tokens_unknown", "limit": int>0}                  安全网读不到用量（fail-closed）暂停
 #   {"kind": "capability", "text": "中文一句", "jobs": [int, ...]} 开工前能力闸暂停
 # 三处视图（list_view / 管理员详情 / 群友详情）都从这里派生一句安全中文 `text`。
 # 手动暂停（网页 / /mw 点「暂停」）没有原因：paused_reason 为空，视图不编造
 # 「时长 0」这类假原因。
 # ---------------------------------------------------------------------------
-_PAUSED_KINDS = frozenset({"tokens", "time", "capability"})
+_PAUSED_KINDS = frozenset({"tokens", "time", "tokens_unknown", "capability"})
 _PAUSED_TEXT_MAX = 400   # 中文一句话的硬上限（能力闸原因本来就写成大白话，超长一律截断）
 _PAUSED_JOBS_MAX = 8     # 最多记 8 条出问题的活（只用来指路，不记 job 详情）
 _SECRET_IN_TEXT = re.compile(
@@ -89,6 +93,7 @@ _ACCOUNT_IN_TEXT = re.compile(r"\d{6,}")
 _PAUSED_META = {
     "tokens": "自动暂停：用量到上限了，等你决定",
     "time": "自动暂停：做得太久了，等你决定",
+    "tokens_unknown": "自动暂停：用量没核出来，等你决定",
     "capability": "自动暂停：开工前对不上，等你决定",
 }
 
@@ -114,6 +119,15 @@ def _clean_paused_reason(value: Any) -> dict | None:
     kind = str(value.get("kind") or "").strip()
     if kind not in _PAUSED_KINDS:
         return None
+    if kind == "tokens_unknown":
+        # 读不到用量才走这条：除了「上限是多少」，什么都核不出来，别编 used
+        try:
+            limit = int(value.get("limit") or 0)
+        except (TypeError, ValueError):
+            return None
+        if limit <= 0:
+            return None
+        return {"kind": kind, "limit": limit}
     if kind in ("tokens", "time"):
         try:
             limit = int(value.get("limit") or 0)
@@ -152,8 +166,9 @@ def _paused_reason_for_store(value: Any) -> Any:
     cleaned = _clean_paused_reason(value)
     if cleaned is None:
         raise ValueError(
-            "暂停原因不合法：kind 只认 tokens / time / capability，"
-            "且要带够最小信息（tokens/time 要有正的 limit，capability 要有 text）"
+            "暂停原因不合法：kind 只认 tokens / time / tokens_unknown / capability，"
+            "且要带够最小信息（tokens/time 要有正的 limit，tokens_unknown 要有正的 limit，"
+            "capability 要有 text）"
         )
     return cleaned
 
@@ -186,6 +201,11 @@ def paused_reason_text(reason: dict | None) -> str:
         return (
             f"自动暂停：做得太久了（已跑 {int(reason.get('used') or 0)} 秒，"
             f"上限 {int(reason.get('limit') or 0)} 秒），先停下等你决定"
+        )
+    if kind == "tokens_unknown":
+        return (
+            f"自动暂停：暂时核不出这个任务用了多少用量（上限 {int(reason.get('limit') or 0)} token），"
+            "先停下等你决定"
         )
     return ""
 
@@ -609,6 +629,9 @@ class Tasks:
         - tokens：usage 里这个任务的累计（减去继续那时刻的基线 task.net_base 的 tokens）；
         - 时长：现在 − resume_ts（没有基线 = started_ts / created）；
         - 没在 running 的任务不碰；限值 0 = 不限；失败返回 None（不抛）。
+        - 读不到用量：先立刻重试一次（偶发锁冲突），还是读不到就 **fail-closed**——
+          token_limit > 0 时按「核不出来」停下来等人（kind=tokens_unknown），
+          绝不当「一个 token 都没花」把超额保护静默放过；token_limit = 0 时不停。
         网页 / /mw / admin 把它 queued 回来时 transition 自动清原因、按那时刻重记基线
         （恢复后 token 从恢复那时刻重新累计、时长重新开始跑）。
         """
@@ -635,30 +658,39 @@ class Tasks:
             base = None
         base_tokens = int((base or {}).get("tokens") or 0) if isinstance(base, dict) else 0
         base_ts = float((base or {}).get("resume_ts") or 0.0) if isinstance(base, dict) else 0.0
-        total_tokens = 0
-        try:
-            r = self._store.read().execute(
-                "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS t FROM usage WHERE task_id=?",
-                (tid,),
-            ).fetchone()
-            total_tokens = int(r["t"]) if r is not None else 0
-        except Exception:
-            total_tokens = 0
-        used_tokens = max(0, total_tokens - base_tokens)
+        # 用量：读失败先重试一次（偶发锁冲突不该直接判停）；还是失败 → None（核不出来）
+        total_tokens: int | None = None
+        for attempt in (1, 2):
+            try:
+                r = self._store.read().execute(
+                    "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS t FROM usage WHERE task_id=?",
+                    (tid,),
+                ).fetchone()
+                total_tokens = int(r["t"]) if r is not None else 0
+                break
+            except Exception:
+                if attempt == 1:
+                    continue
+                logger.warning("安全网读不到任务 %s 的用量（上限 %s token），按超线自动暂停", tid, token_limit)
+        used_tokens = max(0, total_tokens - base_tokens) if total_tokens is not None else 0
         started = base_ts or float(row.get("started_ts") or row.get("created") or now)
         elapsed = max(0.0, now - started)
         reason: dict | None = None
-        if token_limit > 0 and used_tokens >= token_limit:
+        if total_tokens is None and token_limit > 0:
+            # fail-closed：算不出用量就当已经超线，停下等人核对（limit 0 = 不限，不停）
+            reason = {"kind": "tokens_unknown", "limit": token_limit}
+        elif token_limit > 0 and used_tokens >= token_limit:
             reason = {"kind": "tokens", "limit": token_limit, "used": used_tokens}
         elif run_seconds > 0 and elapsed >= run_seconds:
             reason = {"kind": "time", "limit": run_seconds, "used": int(elapsed)}
         if reason is None:
             return None
-        note = (
-            f"安全网：token 超线（{used_tokens} / {token_limit}），自动暂停"
-            if reason["kind"] == "tokens"
-            else f"安全网：跑满 {run_seconds} 秒，自动暂停"
-        )
+        if reason["kind"] == "tokens":
+            note = f"安全网：token 超线（{used_tokens} / {token_limit}），自动暂停"
+        elif reason["kind"] == "tokens_unknown":
+            note = "安全网：无法核算用量，已自动暂停"
+        else:
+            note = f"安全网：跑满 {run_seconds} 秒，自动暂停"
         try:
             self.transition(tid, "paused", reason=note, paused_reason=reason)
         except (KeyError, ValueError):

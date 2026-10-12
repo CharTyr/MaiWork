@@ -4,7 +4,7 @@
 
 ## Responsibility
 
-这个目录解决一个核心问题：**子 agent 的命令和文件不能碰到 MaiBot 宿主、不能碰到别的群的工作区、不能超过资源限额**。
+这个目录解决一个核心问题：**子 agent 的命令和文件不能碰到 MaiBot 宿主、不能碰到别的群的工作区、不能碰到本机服务与内网（2026-10-12 起默认挡，见下）、不能超过资源限额**。
 
 五个文件的职责：
 
@@ -51,11 +51,19 @@ stopped → 其它所有情况（非 Linux、没 systemd、非 root）
 **命令执行（systemd 模式）**：
 
 - 环境变量只给最小集（`PATH` + `HOME=工作区` + `LANG=C.UTF-8`），绝不继承插件进程的环境（防止密钥漏给子进程）。
-- `run()`：一次性命令。`systemd-run --wait --collect --pipe` + `--uid=<run_as>` + `--setenv=HOME=ws` + `MemoryMax=<配置值，默认 512M>` + `RuntimeMaxSec=limit` + 一套沙箱 flag（`ProtectSystem=strict` + `ProtectHome=yes/read-only` + `PrivateTmp=yes` + `NoNewPrivileges=yes` + 工作区 BindPaths）。外再包 `asyncio.wait_for(limit+15s)` 兜底。
+- `run()`：一次性命令。`systemd-run --wait --collect --pipe` + `--uid=<run_as>` + `--setenv=HOME=ws` + `MemoryMax=<配置值，默认 512M>` + `RuntimeMaxSec=limit` + 一套沙箱 flag（`ProtectSystem=strict` + `ProtectHome=yes/read-only` + `PrivateTmp=yes` + `NoNewPrivileges=yes` + 工作区 BindPaths + 网络隔离，见下）。外再包 `asyncio.wait_for(limit+15s)` 兜底。
 - `start()`：后台进程。`systemd-run --collect --quiet`（不带 `--wait --pipe`），输出重定向到工作区 `runtime/logs/<标签>.log`，进程收尾把自己的退出码写进 `runtime/logs/<标签>.exit`。`status()` 看 `systemctl show` 的 `ActiveState`，不活跃时退出码从 `.exit` 文件读。
 - 判断超时/OOM：靠解析 stderr 里 `Finished with result:` 行（`oom-kill` → OOM，`timeout` → 超时），不靠退出码（都可能是 1）。
 - `stop()`：`systemctl stop`，幂等。
 - `close()`：收尾所有 direct 后台进程，杀进程、关日志句柄、取消 kill 定时器。插件热重载时由 `app._stop_stack` 调用。
+
+**网络隔离与运行账号（2026-10-12，systemd 模式 fixed / dynamic 都加）**：
+
+- `_network_props()` 拼 `-p IPAddressDeny=`：一条写全回环（`127.0.0.0/8 ::1/128`）、link-local（`169.254.0.0/16 fe80::/10`，含 169.254.169.254 元数据地址）、组播（`224.0.0.0/4 ff00::/8`）、私有 / 云内网 / IPv6 私有（`10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7`），再补上**本机自己的非回环地址**（`local_nonloopback_addrs()`：读 `/proc/net/fib_trie` + `/proc/net/if_inet6`，读不到退 `ip -j addr`，进程内缓存 10 分钟）。
+- 落在这些网段里的 `resolv.conf` nameserver 写进 `-p IPAddressAllow=`（Allow 优先于 Deny，不然 DNS 也断）；一条要放行的都没有就不加这条。
+- `[environments] local_network = true` 时整块跳过（`_allow_local_network()`）；direct 模式不走这里。
+- **只写网段，不写关键字**：线上实测（2026-10-12，systemd 257）`systemd-run -p IPAddressDeny=localhost …` 报 `Failed to parse IP address prefix: localhost` 起不来。
+- 运行账号不许 root / uid 0：拼单元前 `_reject_root_run_as(run_as)` 抛 `PermissionError`（网页层 `rules._check_run_as` 也拦一道，**直接改 config.toml 绕不过**）。`lookup_uid(name)` 查 uid，查不到 / 平台没有 `pwd` 就放行交给 systemd 报错。
 
 **direct 模式**（仅本机开发测试，需 `MAIWORK_DEV_ALLOW_DIRECT=1` + 非 root）：
 

@@ -49,7 +49,7 @@ export function settingsPage() {
   const s = state.settings;
   const sub = SET_SUBS.find((x) => x[0] === state.setSub) || SET_SUBS[0];
   const head = `<h1 class="h-page">${sub[0] === "overview" ? "设置" : esc(sub[1])}</h1>${setNav()}`;
-  if (!s) return head + loading();
+  if (!s) return head + loading((state.loadErr || {}).settings, "settings");
   const body = { overview: settingsOverview, models: modelsPage, extensions: extPage, agents: agentsPage, usage: usageAndLogsPage, sources: sourcesPage, links: linksPage, rules: rulesPage, memory: memoryPage }[sub[0]];
   return head + `<div class="set-body">${body(s)}</div>`;
 }

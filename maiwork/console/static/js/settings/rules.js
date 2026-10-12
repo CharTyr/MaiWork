@@ -15,8 +15,10 @@ const SRC_NAMES = { file: "配置文件", env: "服务器环境变量", none: ""
 export async function loadRules() {
   try {
     state.rules = await api("GET", "/api/settings/config");
+    if (state.loadErr) delete state.loadErr.rules;
   } catch (e) {
     state.rules = null;
+    (state.loadErr = state.loadErr || {}).rules = e.message;
     toast(e.message, true);
   }
 }
@@ -176,7 +178,7 @@ function cfgSection(s) {
 
 export function rulesPage() {
   const r = state.rules;
-  if (!r) return loading();
+  if (!r) return loading((state.loadErr || {}).rules, "rules");
   const secs = r.sections || [];
   const pending = r.reload_pending || [];
   const jump = state.cfgSec && secs.some((s) => s.id === state.cfgSec) ? state.cfgSec : "";

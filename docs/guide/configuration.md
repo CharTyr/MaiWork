@@ -84,6 +84,8 @@
 |:------|:-----|:-------|:-----|
 | `environments.ssh` | list | `[]` | 专用机器，每台写 `name` / `host`（`user@地址:端口`）/ `note`，可以多台 |
 | `environments.railway` | bool | `true` | 允许用 railway.new 一次性 VM |
+| `environments.run_as` | string | `"maiwork"` | 在本机跑命令用哪个系统账号；**不能填 `root`**（也不能填 uid 是 0 的账号）——子 agent 拿到 root 就没有隔离了，填了会被挡住不跑 |
+| `environments.local_network` | bool | `false` | 允不允许子 agent 访问**本机服务**（网页控制台、MaiBot）和**内网**地址。默认关：子 agent 能上公网，但连不上 `127.0.0.1`、路由器 / 内网机器、云服务器的元数据地址；域名解析照常能用。确实要让它连本机或内网时才开 |
 | `environments.memory_max` | string | `"512M"` | 本机隔离单元内存上限 |
 | `environments.runtime_max_sec` | int | `1800` | 本机隔离单元最长运行秒数 |
 | `environments.verify_enabled` | bool | `false` | 资讯实测：挑几条上 VM 试一试再发 |
