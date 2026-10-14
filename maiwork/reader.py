@@ -50,6 +50,8 @@ class ReadResult:
     image_url: str = ""
     final_url: str = ""
     published: str = ""
+    title: str = ""
+    body: str = ""         # actual tool-visible body, without generated metadata
 
 
 class JinaReader:
@@ -166,16 +168,21 @@ class JinaReader:
         body = str(data.get("content") or "").strip()
         if _BLOCKED.search(title) or (len(body) < 1500 and _BLOCKED.search(body[:300])):
             return ReadResult(False, reason="读到的是验证 / 拦截页，不是正文")
-        if len(body) < _MIN_BODY_CHARS:
-            return ReadResult(False, reason="读到的正文是空的")
+        from .verify_budget import article_body
+
+        if not article_body(body, title):
+            return ReadResult(False, reason="没读到可用正文（只有标题/导航或正文为空）")
 
         published = str(data.get("publishedTime") or "").strip()
         meta = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
         image = str(meta.get("og:image") or "").strip()
         if not image.startswith(("http://", "https://")):
             image = ""
-        text = (f"《{title}》\n" if title else "") + (f"（发布时间：{published}）\n" if published else "") + body
-        if len(text) > _TEXT_MAX_CHARS:
-            text = text[:_TEXT_MAX_CHARS] + " …（后面还有，已截断）"
+        prefix = (f"《{title[:300]}》\n" if title else "") + (f"（发布时间：{published}）\n" if published else "")
+        visible_body = body[:max(0, _TEXT_MAX_CHARS - len(prefix))]
+        text = prefix + visible_body
+        if len(visible_body) < len(body):
+            text += " …（后面还有，已截断）"
         final_url = str(data.get("url") or "").strip() or url
-        return ReadResult(True, text=text, image_url=image, final_url=final_url, published=published)
+        return ReadResult(True, text=text, image_url=image, final_url=final_url, published=published,
+                          title=title, body=visible_body)

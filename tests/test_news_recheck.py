@@ -88,7 +88,20 @@ class SeqWorkers:
         self._log(step, tid)
         if isinstance(step.get("report"), BaseException):
             raise step["report"]
+        self._record_bodies(step, tid)
         return step["report"]
+
+    @staticmethod
+    def _record_bodies(step: Dict[str, Any], tid: str) -> None:
+        """补打开真打开的页面，正文里写着它 keep 时抄回的 quote（fetch_page 在本轮记下的正文）。"""
+        from fakes import record_fixture_pages
+
+        opened = {str(e[-1] if isinstance(e, (tuple, list)) else e) for e in step.get("open", [])}
+        opened |= {str(e[0]) for e in step.get("open", []) if isinstance(e, (tuple, list))}
+        data = getattr(step.get("report"), "data", None) or {}
+        for v in data.get("items") or []:
+            if isinstance(v, dict) and str(v.get("url") or "") in opened:
+                record_fixture_pages(tid, [dict(v, fetched=True)])
 
     def seed_collect(self, feeds: Any, models: Any = None) -> None:
         """把「找资讯那一步」的预置挪成现在的两步：登记簿候选由假搜索出 + 顺带记录落库。

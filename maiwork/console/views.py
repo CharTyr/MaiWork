@@ -1000,6 +1000,23 @@ def group_view(svc: Any, group_id: str, *, admin: bool) -> dict[str, Any]:
         "agent_fish": _agent_fish(svc),
     }
     if admin:
+        pa = getattr(getattr(svc, "profiles", None), "pending_asks", None)
+        review = []
+        review_error = ""
+        if pa is not None:
+            try:
+                for r in pa.review_view(group_id):
+                    # 不把异常原文送浏览器：可能带端点、模型密钥或其他群信息。
+                    why = "处理失败，重试后仍未办成" if r.get("last_error") else "超过 48 小时仍未办成"
+                    decision = r.get("decision") or {}
+                    review.append({"message_id": r["message_id"], "text": r["text"],
+                                   "who": r["user_name"] or "群成员", "ts": r["ts"],
+                                   "why": why, "attempts": r.get("attempts", 0),
+                                   "kind": "goal" if decision.get("kind") == "goal" else "task"})
+            except Exception:
+                review_error = "待复核暂时无法读取，请稍后刷新"
+        view["tasks"]["review"] = review
+        view["tasks"]["review_error"] = review_error
         out["focus"] = _focus_list(svc, group_id)
         _attach_idea_targets(svc, group_id, ideas, out["focus"])
         # 交接包被带走几次（docs/24 §六）：只给总管理员 / 本群群管理员（这个分支）；

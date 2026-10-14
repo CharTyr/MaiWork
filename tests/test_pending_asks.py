@@ -139,13 +139,15 @@ async def _drain(spawned: list) -> None:
 
 class TestIntakeSlowPath:
     @pytest.mark.asyncio
-    async def test_confident_none_records_nothing(self, store: Store, frozen_now: float) -> None:
+    async def test_confident_none_closes_row(self, store: Store, frozen_now: float) -> None:
+        # 2026-10-13：@ 在等 Jev 之前先落库；明确闲聊把这一行记成终态，不进待判
         jev = _FakeJev({"kind": ("none", 0.95, 0.92)})
         intake, signals, spawned = _make_intake(store, jev=jev)
         await intake.handle(hook_message(is_at=True, text="哈哈哈你说得对", message_id="m-none"))
         await _drain(spawned)
         assert intake.slow_queue == []
-        assert _pending_rows(store) == []
+        rows = _pending_rows(store)
+        assert len(rows) == 1 and rows[0]["state"] == "none" and rows[0]["handled"] == 1
         assert _events(store, "intake.slow") == []
 
     @pytest.mark.asyncio
@@ -203,8 +205,8 @@ class TestIntakeSlowPath:
         assert rows[0]["text"] == "第二次"  # 后到的覆盖
 
     @pytest.mark.asyncio
-    async def test_confident_prepare_does_not_touch_pending(self, store: Store, frozen_now: float) -> None:
-        # 快路径（Jev 有把握判 prepare）照走 approvals，不进 pending_asks
+    async def test_confident_prepare_completes_row(self, store: Store, frozen_now: float) -> None:
+        # 快路径（Jev 有把握判 prepare）照走 approvals；建成后待判行带着请求号结束
         jev = _FakeJev({"kind": ("prepare", 0.9, 0.9)})
         raw = {"plugin": {"enabled": True}, "groups": {"serve": [{"group": f"qq:{GID}"}]}}
         settings, _ = load_settings(raw)
@@ -222,7 +224,9 @@ class TestIntakeSlowPath:
         )
         await intake.handle(hook_message(is_at=True, message_id="m-fast", text="@她 帮我整理"))
         await _drain(spawned)
-        assert _pending_rows(store) == []
+        rows = _pending_rows(store)
+        assert len(rows) == 1 and rows[0]["state"] == "completed" and rows[0]["result_id"] == "R-1"
+        assert rows[0]["handled"] == 1 and intake.slow_queue == []
         assert created and created[0]["message_id"] == "m-fast"  # 走的还是快路径
 
 

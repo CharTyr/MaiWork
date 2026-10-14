@@ -2,8 +2,11 @@
 
 红线（AGENTS.md / docs/02 §2）：
 - 非服务群立刻返回 continue，**在读取任何其他字段之前**；零 Jev、零调用、零 Store、零发送。
-- 钩子里唯一的慢事：服务群里被 @ 时等 Jev（≤ [jev] timeout_ms，外面再用
-  asyncio.wait_for 兜一层）；批准、指令处理、提醒解析这些慢活全部 spawn 到后台。
+- 钩子里唯一的慢事：服务群里被 @ 时等 Jev（≤ min([jev] timeout_ms, 600ms)，给宿主
+  1500ms 的钩子超时留出余量；超时只取消、不等取消收尾）；批准、指令处理、提醒解析、
+  资讯卡片反馈写库这些慢活全部 spawn 到后台。
+- 接了库：被 @ 的消息在等 Jev 之前先落 pending_asks（pending_asks.PendingAsks）；判出的
+  结论先落库再派后台落地，只有真的建成（拿到 id）或明确闲聊才关掉这一行，失败的留给独立重试。
 - 收消息的钩子永不中止：任何异常吞掉，永远返回 {"action": "continue"}。
 - 机器人自己的消息不当成请求（只记信号）。
 - 群友派的活走 Approvals（要批准的未批准不开工）。
@@ -90,6 +93,9 @@ _TITLE_MAX = 30
 _COMMAND_MENTION_TTL_S = 120        # /mw 指令说明只留 2 分钟
 _REQUEST_MENTION_TTL_S = 30 * 60    # 「已由 MaiWork 接手（等批准 / 已开工）」留 30 分钟
 _SLOW_QUEUE_MAX = 200               # 慢路径内存队列上限（满了丢最旧的）
+# 钩子里等 Jev 的上限：宿主钩子超时 1500ms，留一半余量给其余同步步骤和事件循环抖动
+_HOOK_JEV_MAX_MS = 600
+_FEEDBACK_INFLIGHT_MAX = 4          # 卡片反馈后台写库同时最多几条
 # 网页构想详情「复制要求」带的编号（「（构想 #12）」）：认出来就按这条构想建请求，不问 Jev。
 # 2026-10：还认「（构想 #12，要做：1、3）」这种挑了项目的写法（尾部不跨右括号 / 换行）。
 _IDEA_REF = re.compile(r"构想\s*[#＃]\s*(\d{1,9})([^\n）)]{0,80})")
@@ -197,6 +203,7 @@ class Intake:
         # 话头火花（docs/18 §十一）：群里有「明显在为难 / 想要」的话头时调一次
         # on_spark(group_id, ts)。只记内存（app 接成 feeds.note_spark），零库写、零模型。
         on_spark: Callable[[str, float], None] | None = None,
+        pending_asks: Any = None,
     ) -> None:
         self._get_settings = get_settings
         self._signals = signals
@@ -210,6 +217,18 @@ class Intake:
         self._bot_account_source = bot_account
         self._spawn = spawn if spawn is not None else _default_spawn
         self._store = store
+        # 待判 @ 的持久记录（app 注入画像那份共享实例；只给了库就自己建一个）
+        self._pending = pending_asks
+        if self._pending is None and store is not None:
+            try:
+                from .pending_asks import PendingAsks
+
+                self._pending = PendingAsks(store, get_settings)
+            except Exception:
+                logger.exception("建待判 @ 记录出错，退回只写慢路径")
+                self._pending = None
+        # 卡片反馈后台写库：同时在跑的上限（反馈只是软信号，满了就丢这一条）
+        self._feedback_inflight = 0
         from .news_feedback import CardIndex
 
         self._card_index = CardIndex()
@@ -242,6 +261,7 @@ class Intake:
                     on_request=self._qj_request,
                     on_reminder=on_reminder,
                     on_slow=self._slow,
+                    on_none=self._qj_none,
                 )
             except Exception:
                 logger.exception("建派活判断兜底出错，这次退回慢路径")
@@ -311,11 +331,13 @@ class Intake:
             )
             return
         # 2.5) 回复 / 引用了 MaiWork 发的资讯卡片 → 记一次自动好评（news_feedback；卡片清单 60 秒缓存）
+        #      查卡片 + 写库放后台线程（独立短连接），钩子和共享事件循环都不等它
         if self._store is not None:
             reply_to = _reply_to_of(message)
-            if reply_to:
+            if reply_to and self._feedback_inflight < _FEEDBACK_INFLIGHT_MAX:
                 at = _ts_of(message.get("timestamp")) or clock.now()
-                self._card_index.on_message(self._store, group_id, user_id, message_id, reply_to, at)
+                self._feedback_inflight += 1
+                _spawn_safely(self._spawn, self._record_feedback(group_id, user_id, message_id, reply_to, at))
         # 2.6) 话头火花（docs/18 §十一）：群里明显在为难 / 想要的话头，记一笔内存火花
         #      （零库写、零模型）。@ 机器人的是派活请求，走下面那条路，不算话头。
         if self._on_spark is not None and not (
@@ -334,6 +356,36 @@ class Intake:
         #    别的插件的指令（/pic 之类）不是 MaiWork 的活，连 Jev 都不问
         if (bool(message.get("is_at")) or bool(message.get("is_mentioned"))) and not _is_command(text):
             await self._handle_at(settings, group_id, user_id, user_name, message_id, text, context)
+
+    async def _record_feedback(
+        self, group_id: str, user_id: str, message_id: str, reply_to: str, at: float
+    ) -> None:
+        """后台记一次「回复了资讯卡片」：在线程里用独立短连接查卡片、写反馈。
+
+        SQLite 连接不跨线程共用，所以线程里按同一个库文件另开一个 Store、用完就关；
+        不做迁移（主连接启动时已经迁好）。出错只记日志。"""
+        try:
+            path = getattr(self._store, "path", None)
+            if path is None:
+                return
+            index = self._card_index
+
+            def work() -> None:
+                from .store import Store
+
+                st = Store(path)
+                try:
+                    index.on_message(st, group_id, user_id, message_id, reply_to, at)
+                finally:
+                    st.close()
+
+            await asyncio.to_thread(work)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("记资讯卡片反馈出错（群 %s）", group_id)
+        finally:
+            self._feedback_inflight = max(0, self._feedback_inflight - 1)
 
     async def _run_command(
         self, group_id: str, user_id: str, user_name: str, text: str, message_id: str, reply_to: str = ""
@@ -425,13 +477,18 @@ class Intake:
         text: str,
         context: list[dict] | None = None,
     ) -> None:
-        # G5：钩子阻塞宿主管线，等 Jev 的时间绝不超 1200 毫秒（配置解析时已夹到
-        # [200,1200]，这里 min 再兜一层，防止构造时绕过了 load_settings）
+        # G5：钩子阻塞宿主管线（宿主钩子超时 1500ms）。配置解析时已夹到 [200,1200]，
+        # 这里再夹到 _HOOK_JEV_MAX_MS（600ms），给钩子其余步骤和事件循环抖动留余量
         idea = self._idea_of(group_id, text)
         if idea is not None:
             _spawn_safely(self._spawn, self._create_idea_request(group_id, idea, user_id, user_name, message_id, text))
             return
-        timeout_ms = min(1200, max(100, int(getattr(getattr(settings, "jev", None), "timeout_ms", 1500) or 1500)))
+        timeout_ms = min(
+            _HOOK_JEV_MAX_MS,
+            max(100, int(getattr(getattr(settings, "jev", None), "timeout_ms", 1500) or 1500)),
+        )
+        # 等 Jev 之前先把这条 @ 落库：钩子被宿主超时掐断 / 插件重载都不会把它弄丢
+        self._record(group_id, user_id, user_name, message_id, text, "收到 @，等判断")
         answers: Optional[dict] = None
         jev = self._jev
         if jev is not None:
@@ -441,20 +498,17 @@ class Intake:
                 available = False
             if available:
                 state = {"messages": self._jev_messages(context, text)}
-                try:
-                    answers = await asyncio.wait_for(
-                        jev.ask(state, _AT_QUESTIONS, purpose="intake", group_id=group_id, timeout_ms=timeout_ms),
-                        timeout=timeout_ms / 1000.0,
-                    )
-                except Exception:  # 超时 / 客户端异常都走慢路径
-                    answers = None
+                answers = await _bounded(
+                    jev.ask(state, _AT_QUESTIONS, purpose="intake", group_id=group_id, timeout_ms=timeout_ms),
+                    timeout_ms / 1000.0,
+                )
         ctx = {"context": list(context or [])}
         if not isinstance(answers, dict):
             self._fallback("jev_无答案", group_id, user_id, user_name, message_id, text, **ctx)
             return
         raw_kind = answers.get("kind")
         if isinstance(raw_kind, (tuple, list)) and len(raw_kind) >= 3:
-            label, prob, confidence = str(raw_kind[0]), raw_kind[1], raw_kind[2]
+            label, confidence = str(raw_kind[0]), raw_kind[2]
             try:
                 confidence_f = float(confidence)
             except (TypeError, ValueError):
@@ -462,15 +516,23 @@ class Intake:
         else:
             label, confidence_f = "", 0.0
         if label in ("prepare", "goal") and confidence_f >= _REQUEST_CONFIDENCE_MIN:
+            zh = _KIND_ZH.get(label, label)
+            self._decide(group_id, message_id, {
+                "kind": label, "title": text.strip()[:_TITLE_MAX] or zh,
+                "via": f"群里 @ · Jev 判断是「{zh}」（把握 {confidence_f:.2f}）",
+            })
             _spawn_safely(self._spawn, self._create_request(group_id, label, confidence_f, user_id, user_name, message_id, text))
             return
         if label == "reminder" and confidence_f >= _CONFIDENCE_MIN:
             cb = self._on_reminder
             if cb is not None:
+                # 时间还没解析：只记「是提醒」，行保持待处理，解析建成后才关
+                self._decide(group_id, message_id, {"kind": "reminder", "title": text.strip()[:_TITLE_MAX]})
                 _spawn_safely(self._spawn, self._run_reminder(cb, group_id, user_id, user_name, message_id, text))
             return
         if label == "none" and confidence_f >= _CONFIDENCE_MIN:
-            # Jev 明确判成闲聊且把握够：这是正常闲聊，什么都不记（不进慢路径）
+            # Jev 明确判成闲聊且把握够：正常闲聊，待判行记成终态（不进慢路径）
+            self._decide(group_id, message_id, {"kind": "none", "why": f"Jev 判闲聊（把握 {confidence_f:.2f}）"})
             return
         self._fallback(f"jev_判成「{label or '无效'}」（把握 {confidence_f:.2f}）",
                        group_id, user_id, user_name, message_id, text, **ctx)
@@ -507,6 +569,8 @@ class Intake:
             except Exception:
                 qjs = None
             if bool(getattr(qjs, "keyword_filter", False)) and not has_request_cue(text):
+                # 一个请求词都没有：当闲聊，等 Jev 前落的待判行记成终态
+                self._decide(group_id, message_id, {"kind": "none", "why": "没有请求词"})
                 return
             if qj.enqueue(
                 group_id,
@@ -522,11 +586,19 @@ class Intake:
                 return
         self._slow(reason, group_id, user_id, user_name, message_id, text)
 
-    def _qj_request(self, group_id: str, label: str, sure: float, item: dict, title: str) -> Awaitable[None]:
+    def _qj_none(self, group_id: str, item: dict) -> bool:
+        """快速判断明确判成闲聊：待判行记成终态。"""
+        return self._decide(group_id, str(item.get("message_id") or ""), {"kind": "none", "why": "快速判断判闲聊"})
+
+    def _qj_request(self, group_id: str, label: str, sure: float, item: dict, title: str) -> Awaitable[bool]:
         """快速判断判成 prepare / goal：和 Jev 那条路一样建待批，只是 via 说明出处和依据。"""
         zh = _KIND_ZH.get(str(label), str(label))
         why = str(item.get("_why") or "").strip()
         via = (f"群里 @ · 快速判断：{why}" if why else f"群里 @ · 快速判断是「{zh}」")[:_VIA_MAX]
+        self._decide(group_id, str(item.get("message_id") or ""), {
+            "kind": str(label), "title": str(title or "").strip()[:_TITLE_MAX] or str(item.get("text") or "").strip()[:_TITLE_MAX] or zh,
+            "via": via,
+        })
         return self._create_request(
             group_id,
             str(label),
@@ -547,7 +619,8 @@ class Intake:
         user_name: str,
         message_id: str,
         text: str,
-    ) -> None:
+    ) -> bool:
+        """后台交 app 解析时间并建提醒；app 落地成功时自己关掉待判行（同一事务）。"""
         try:
             msg = {
                 "group_id": group_id,
@@ -558,9 +631,12 @@ class Intake:
             }
             result = cb(group_id, msg)
             if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
-                await result
+                result = await result
         except Exception:
             logger.exception("提醒慢路径出错（群 %s）", group_id)
+            self._fail(group_id, message_id, "提醒落地出错")
+            return False
+        return result is not False
 
     async def _create_request(
         self,
@@ -574,11 +650,12 @@ class Intake:
         *,
         via: str | None = None,
         title: str | None = None,
-    ) -> None:
+    ) -> bool:
+        """建待批请求。返回是否真的落地（拿到 id / 被筛掉）；失败时待判行留着、记下错误等重试。"""
         approvals = self._approvals
         if approvals is None:
             self._slow("approvals_没就位", group_id, user_id, user_name, message_id, text)
-            return
+            return False
         kind = "task" if label == "prepare" else "goal"
         zh = _KIND_ZH.get(label, label)
         title = (str(title or "").strip()[:_TITLE_MAX]) or (text.strip()[:_TITLE_MAX]) or zh
@@ -597,9 +674,16 @@ class Intake:
             )
         except Exception:
             logger.exception("记待批请求出错（群 %s，消息 %s）", group_id, message_id)
-            return
+            self._fail(group_id, message_id, "建待批请求出错")
+            return False
+        if isinstance(res, dict) and str(res.get("status") or "") == "screened":
+            # 本群拒过多次的同类请求：按批准规则筛掉，也算处理完（终态）
+            self._complete(group_id, message_id, "screened", "")
+            return True
         if not isinstance(res, dict) or not res.get("id"):
-            return
+            self._fail(group_id, message_id, "建待批请求没拿到编号")
+            return False
+        self._complete(group_id, message_id, "request", str(res["id"]))
         name = user_name or user_id or "有人"
         # 有 id 的返回路径只有 pending / approved 两种（approvals.create）。
         # approved = 免批 / 当场获准：口径是「已获准、交给 MaiWork」，不是子 agent 已在跑。
@@ -612,6 +696,51 @@ class Intake:
             key=f"request:{res['id']}",
             ttl_s=_REQUEST_MENTION_TTL_S,
         )
+        return True
+
+    # ------------------------------------------------------------------
+    # 待判 @ 的持久记录（pending_asks.PendingAsks；没接库时全部空操作）
+    # ------------------------------------------------------------------
+
+    def _record(self, group_id: str, user_id: str, user_name: str, message_id: str, text: str, reason: str) -> None:
+        pending = self._pending
+        if pending is None or not message_id:
+            return
+        try:
+            pending.record_pending(group_id, {
+                "message_id": message_id, "user_id": user_id, "user_name": user_name,
+                "text": str(text or "")[:_STATE_TEXT_MAX],
+            }, reason)
+        except Exception:
+            logger.exception("记待判 @ 出错（群 %s，消息 %s）", group_id, message_id)
+
+    def _decide(self, group_id: str, message_id: str, decision: dict) -> bool:
+        pending = self._pending
+        if pending is None or not message_id:
+            return True
+        try:
+            return pending.decide(group_id, message_id, decision) is not False
+        except Exception:
+            logger.exception("记 @ 的判断结论出错（群 %s，消息 %s）", group_id, message_id)
+            return False
+
+    def _fail(self, group_id: str, message_id: str, error: str) -> None:
+        pending = self._pending
+        if pending is None or not message_id:
+            return
+        try:
+            pending.fail(group_id, message_id, error)
+        except Exception:
+            logger.exception("记 @ 落地失败出错（群 %s，消息 %s）", group_id, message_id)
+
+    def _complete(self, group_id: str, message_id: str, kind: str, result_id: str) -> None:
+        pending = self._pending
+        if pending is None or not message_id:
+            return
+        try:
+            pending.complete(group_id, message_id, result_kind=kind, result_id=result_id)
+        except Exception:
+            logger.exception("关待判 @ 出错（群 %s，消息 %s）", group_id, message_id)
 
     def _idea_of(self, group_id: str, text: str) -> dict | None:
         """消息里带「构想 #N」且这条构想属于本群 → 构想行（dict，带 wanted）；否则 None。
@@ -766,23 +895,8 @@ class Intake:
             if len(self._slow_queue) > _SLOW_QUEUE_MAX:
                 del self._slow_queue[: len(self._slow_queue) - _SLOW_QUEUE_MAX]
             return
-        try:
-            with self._store.tx() as conn:
-                conn.execute(
-                    "INSERT INTO pending_asks"
-                    " (group_id, message_id, user_id, user_name, text, ts, reason, handled)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, 0)"
-                    " ON CONFLICT(group_id, message_id) DO UPDATE SET"
-                    " user_id=excluded.user_id, user_name=excluded.user_name,"
-                    " text=excluded.text, ts=excluded.ts, reason=excluded.reason,"
-                    " handled=0",
-                    (
-                        gid, mid, str(user_id), str(user_name),
-                        str(text or "")[:_STATE_TEXT_MAX], clock.now(), str(reason),
-                    ),
-                )
-        except Exception:
-            logger.debug("写 pending_asks 失败（群 %s）", gid, exc_info=True)
+        # 接库时交给 PendingAsks：同一条消息重复进来不刷新收到时间、不重开已结束的行
+        self._record(gid, str(user_id), str(user_name), mid, str(text or ""), str(reason))
 
     @property
     def slow_queue(self) -> list[dict]:
@@ -904,6 +1018,33 @@ class Intake:
             return False
         except Exception:
             return True  # 判不了就当不用记，反正不能炸
+
+
+async def _bounded(awaitable: Awaitable[Any], timeout_s: float) -> Any:
+    """最多等 timeout_s 秒拿结果；超时就取消、但不等取消收尾（收尾慢也不占钩子时间）。
+    超时 / 出错都回 None。"""
+    task = asyncio.ensure_future(awaitable)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout_s)
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    if task in done:
+        try:
+            return task.result()
+        except Exception:
+            return None
+    task.cancel()
+    task.add_done_callback(_swallow_task_result)
+    return None
+
+
+def _swallow_task_result(task: asyncio.Future) -> None:
+    if not task.cancelled():
+        try:
+            task.exception()
+        except Exception:
+            pass
 
 
 def _spawn_safely(spawner: Callable[[Awaitable[Any]], Any], coro: Awaitable[Any]) -> None:

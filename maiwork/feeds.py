@@ -86,7 +86,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from . import clock, goals, idea_feasibility, members, news_rating, news_standard, search_stats
-from . import page_date, source_name
+from . import page_date, source_name, verify_budget
 from .config import Settings, normalize_domain as _normalize_domain
 from .models import ModelError
 from .search import SearchUnavailable
@@ -595,6 +595,7 @@ _IDEA_GUIDE: tuple[str, ...] = (
 _GUIDES_VIEW_DAYS = 30      # 好文专栏：最近 30 天
 _GUIDES_VIEW_CAP = 20       # 好文专栏最多 20 条
 _QUOTE_MAX = 200            # 子 agent 交回的原文依据最长（截断照收，只有空才淘汰）
+_SCORE_SOURCE_MAX = 1500    # 打分提示里每条带的本轮真读到正文节选上限（控制整批提示长度）
 # 卡片短摘要（brief）的长度口径（2026-10-08 线上巡检 #1301）：打分落库转换处原来 [:140]
 # 硬截，把 176 字的模型原文切在词中间（alpha → al），还把「免费 / 付费限定」整句丢掉；
 # 截断发生在展示核验之前，所以那一轮核验看到的就是截断后的文本、没拦下来（conditions 也在
@@ -1043,13 +1044,42 @@ def drop_unverified_rewrites(items: list[dict]) -> None:
             _fall_back_display(it, field)
 
 
+# 展示自检里每条给的原文正文节选上限（一批最多十来条，整体提示词仍可控）
+_CHECK_SOURCE_MAX = 2000
+
+
 def _check_field(raw: Any) -> str:
-    f = str(raw or "").strip().lower()
+    if not isinstance(raw, str):
+        raise ValueError("展示自检 field 必须是字符串")
+    f = raw.strip().lower()
     if f in ("title", "title_zh"):
         return "title"
-    if f == "brief":
-        return "brief"
-    return "body"  # 旧格式没 field / 认不出：按正文处理
+    if f in ("brief", "body"):
+        return f
+    raise ValueError("展示自检 field 无效")
+
+
+def _display_failures(data: Any, count: int) -> list[tuple[int, str, list[str]]]:
+    """先校验完整结论再改任何条目；漏项、坏类型、越界都不是通过。"""
+    if not isinstance(data, dict) or not isinstance(data.get("unsupported"), list):
+        raise ValueError("展示自检必须给 unsupported 列表")
+    failures = []
+    for entry in data["unsupported"]:
+        if not isinstance(entry, dict):
+            raise ValueError("展示自检条目必须是对象")
+        k = entry.get("i")
+        # bool、浮点、小数字符串都不能冒充条目编号。
+        if type(k) is not int or not 0 <= k < count:
+            raise ValueError("展示自检编号无效或越界")
+        # 老格式只省略 field；显式给错或给 null 不算老格式。
+        field = _check_field(entry.get("field", "body"))
+        phrases = entry.get("phrases")
+        if not isinstance(phrases, list) or not phrases or any(
+            not isinstance(p, str) or not p.strip() for p in phrases
+        ):
+            raise ValueError("展示自检 phrases 必须是非空文字列表")
+        failures.append((k, field, [p.strip() for p in phrases]))
+    return failures
 
 
 async def check_display_texts(
@@ -1072,6 +1102,7 @@ async def check_display_texts(
     lines = [
         f"今天是 {clock.bj(clock.now()).strftime('%Y-%m-%d')}（北京时间）。",
         "下面每条是要给群友看的一条资讯：先是它的依据（原标题、来源网站、原文发布日期、原文依据（从原文抄的一段）、"
+        "原文正文节选（有的话，是程序真读到的原文，以它为准）、"
         "原文摘要、必须保留的限定），再是要核的改写文字（中文标题 title / 卡片短摘要 brief / 帖子正文 body，有几样列几样）。",
         "逐条逐样检查改写文字：有没有这一条依据撑不住的事实说法（编出来的数字、日期、结论、「首个 / 最快」这类绝对化说法、",
         "把推测说成事实）。口吻、比喻、个人感受不算。下面几类要特别查：",
@@ -1094,6 +1125,11 @@ async def check_display_texts(
         lines.append(f"[{k}] 原标题：{str(it.get('title') or '')[:150]}；来源网站：{site}；原文发布日期：{pub}")
         lines.append(f"    原文依据：{str(it.get('quote') or '')[:300]}")
         lines.append(f"    原文摘要：{str(it.get('summary') or '')[:300]}")
+        # 本轮代码真读到的正文（verify_budget.bind_pages 绑上，模型改不了）：有就给一段有上限的节选，
+        # 改写要对原文核，不能只对生成的摘要和一句引文核
+        source = str(it.get("_source_body") or "").strip()
+        if source:
+            lines.append(f"    原文正文节选：{source[:_CHECK_SOURCE_MAX]}")
         conds = _conditions_text(it)
         if conds:
             lines.append(f"    必须保留的限定：{conds}")
@@ -1112,23 +1148,14 @@ async def check_display_texts(
             task_id=task_id,
         )
         data = _parse_model_json(result.text)
-    except (ModelError, ValueError) as e:
+        failures = _display_failures(data, len(todo))
+    except (ModelError, ValueError, TypeError) as e:
         logger.info("展示文字对原文自检失败（群 %s），%d 条改写全部回落：%s", gid, len(todo), e)
         drop_unverified_rewrites(todo)
         return
-    bad = data.get("unsupported") if isinstance(data, dict) else None
-    for x in bad if isinstance(bad, list) else []:
-        if not isinstance(x, dict):
-            continue
-        try:
-            k = int(x.get("i"))
-        except (TypeError, ValueError):
-            continue
-        phrases = [str(p) for p in (x.get("phrases") or []) if str(p).strip()]
-        if 0 <= k < len(todo) and phrases:
-            field = _check_field(x.get("field"))
-            logger.info("%s 有原文撑不住的说法，回落已核验内容（群 %s）：%s", field, gid, "、".join(phrases)[:80])
-            _fall_back_display(todo[k], field)
+    for k, field, phrases in failures:
+        logger.info("%s 有原文撑不住的说法，回落已核验内容（群 %s）：%s", field, gid, "、".join(phrases)[:80])
+        _fall_back_display(todo[k], field)
 
 
 def _adopt_title_zh(item: dict, post: Any) -> None:
@@ -2247,8 +2274,10 @@ class Feeds:
             item["site"] = site
             if item.get("reject"):
                 continue  # 补打开核对已经给了淘汰理由（旧闻 / 原文不支持），别覆盖
-            if not item.get("fetched") or not str(item.get("quote") or "").strip():
-                item["reject"] = ("hard", "原文没打开过/打不开")
+            # 2026-10-13：依据必须是本轮代码真读到的正文里的原话（不是标题 / 导航 / 模型自报）
+            evidence_problem = verify_budget.evidence_problem(item)
+            if evidence_problem:
+                item["reject"] = ("hard", evidence_problem)
             elif item.get("paywall"):
                 item["reject"] = ("hard", "原文要登录/付费")
             elif site and _domain_blocked(site, blocked):
@@ -2367,7 +2396,7 @@ class Feeds:
             if followup is not None:
                 item["followup"] = followup
             skip_dup = followup is not None or (points_recent and relation == "context")
-            if not flags.get("grounded", True):
+            if flags.get("grounded") is not True:
                 item["reject"] = ("hard", "摘要在原文找不到依据（不扎实）")
             elif flags.get("junk"):
                 reason = str(flags.get("junk_reason") or "").strip()
@@ -3370,7 +3399,8 @@ class Feeds:
                 "kind": kind,
                 "published_raw": raw.get("published"),
                 "published_ts": _parse_published(raw.get("published")),
-                "fetched": bool(raw.get("fetched")),
+                "fetched": raw.get("fetched") is True,
+                "evidence_sufficient": raw.get("evidence_sufficient", True) is True and raw.get("grounded", True) is True,
                 "quote": str(raw.get("quote") or "").replace("\n", " ").strip()[:_QUOTE_MAX],
                 "paywall": bool(raw.get("paywall")),
                 "image_url": _public_http_url(raw.get("image_url")),
@@ -3859,6 +3889,8 @@ class Feeds:
                 # 用 fetch_page 从原始 HTML（meta / JSON-LD / <time>）读到的日期补上——
                 # 好文（guide）不再因为「页面上的日期没被看见」被硬拒。
                 self._fill_dates_from_pages(group_mark, items)
+                # 关账本之前把本轮真读到的正文挂到候选上（第一道按它核依据）
+                verify_budget.bind_pages(group_mark, items)
                 return items
 
             try:
@@ -4313,7 +4345,8 @@ class Feeds:
             except (TypeError, ValueError):
                 dup_in_batch = None
             flags = {
-                "grounded": bool(s.get("grounded", True)),
+                # 只认字面 true：漏给、"false"、1 都不算「摘要有依据」
+                "grounded": s.get("grounded") is True,
                 "junk": bool(s.get("junk", False)),
                 "junk_reason": str(s.get("junk_reason") or "")[:80],
                 "same_as_recent": bool(s.get("same_as_recent", False)),
@@ -4460,10 +4493,13 @@ class Feeds:
                     pub = c.get("published_raw")
                     pub_text = f"，发布于 {pub}" if pub else ""
                     conds = _conditions_text(c)
+                    # 代码在本轮打开网页时留下的正文（不是模型自报），给 grounded 判断对照
+                    source_body = str(c.get("_source_body") or "").replace("\n", " ")[:_SCORE_SOURCE_MAX]
                     ls.append(
                         f"[{i}]（{kind_zh}）{c['title']} —— {c['summary'][:300]}（{c['url']}{pub_text}）"
                         + (f" 原文依据：{quote[:150]}" if quote else "")
                         + (f" 必须保留的限定：{conds}" if conds else "")
+                        + (f" 本轮读到的原文正文（节选）：{source_body}" if source_body else "")
                     )
                 ls.append("")
                 ls.append(instr)

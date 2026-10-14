@@ -59,7 +59,9 @@ import json
 import logging
 import re
 import shutil
+import sqlite3
 import zipfile
+from contextlib import nullcontext
 from datetime import timedelta
 from html import escape as _html_escape
 from pathlib import Path
@@ -518,16 +520,17 @@ class Outbox:
         *,
         task_id: Optional[str] = None,
         not_before: float = 0,
+        conn: Optional[sqlite3.Connection] = None,
     ) -> int:
-        """入队；同 key 已存在 → 返回旧 id，不重复。"""
+        """入队；同 key 已存在 → 返回旧 id，不重复。给了 conn 就并进调用方的事务。"""
         key = str(key)
-        row = self._store.read().execute(
+        row = (conn if conn is not None else self._store.read()).execute(
             "SELECT id FROM outbox WHERE key=?", (key,)
         ).fetchone()
         if row is not None:
             return int(row["id"])
         now = clock.now()
-        with self._store.tx() as conn:
+        with (self._store.tx() if conn is None else nullcontext(conn)) as conn:
             cur = conn.execute(
                 "INSERT INTO outbox (key, group_id, kind, payload, status, attempts,"
                 " result, error, task_id, not_before, created, updated)"

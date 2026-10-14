@@ -184,7 +184,8 @@ class TestPrompt:
 
 def _run_prepare(tmp_path, entries: list[dict]):
     """跑一次完整备料（三候选，前两条过线），返回 (store, 打分回复)。"""
-    models = FakeModelsQueue(ready=True, replies=[_FOCUS_JSON, _scores_json(entries)])
+    models = FakeModelsQueue(ready=True, replies=[_FOCUS_JSON, _scores_json(entries)],
+                             defaults={"feeds.post_check": '{"unsupported": []}'})
     store, settings, feeds, models, workers, topics, profiles = _make_feeds(
         tmp_path, models=models)
     with _TimePatch():
@@ -283,7 +284,7 @@ class TestBriefLanding:
                 _entry(1, "小模型本地部署教程", brief=BRIEF_B),
                 _entry(2, "吃桃子的十种方法", brief="挑桃子的三个小窍门。", relevance=1, chat=1),
             ]),
-        ])
+        ], defaults={"feeds.post_check": '{"unsupported": []}'})  # 展示自检明确通过
         store, settings, feeds, models, workers, topics, profiles = _make_feeds(
             tmp_path, models=models)
         _seed_focus_member(store)
@@ -311,7 +312,7 @@ class TestBriefLanding:
                 _entry(1, "小模型本地部署教程", brief=BRIEF_B),
                 _entry(2, "吃桃子的十种方法", brief="挑桃子的三个小窍门。", relevance=1, chat=1),
             ]),
-        ])
+        ], defaults={"feeds.post_check": '{"unsupported": []}'})  # 展示自检明确通过
         store, settings, feeds, models, workers, topics, profiles = _make_feeds(
             tmp_path, models=models)
         _seed_focus_member(store)

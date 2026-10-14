@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from CharTyr_MaiWork.maiwork import news_card, news_recheck
 from CharTyr_MaiWork.maiwork.feeds import _NEWS_OUTPUT_SCHEMA, _normalize_url, _parse_published, _source_site
 from CharTyr_MaiWork.maiwork.models import ModelError
@@ -93,6 +95,21 @@ def test_check_prompt_lists_title_brief_body_and_conditions(tmp_path) -> None:
     assert it["brief"] and it["title_zh"] and it["post"]["body"] != it["summary"]
 
 
+def test_check_prompt_compares_against_actual_source_body(tmp_path) -> None:
+    """改写要对本轮真读到的正文核，不能只对生成的摘要 + 一句引文核（Steam 卡片 2026-10-13）。"""
+    body = "开源学习板首批出货 500 块，单价 39 美元。" + "资料包含原理图与示例工程。" * 300
+    it = _plain_item(_source_body=body)
+    models = _check(tmp_path, '{"unsupported": []}', [it])
+    p = _prompt(models, "feeds.post_check")
+    assert "单价 39 美元" in p, "自检要看到本轮读到的原文正文"
+    assert len(p) < len(body) + 4000, "正文给一段有上限的节选，不整篇塞进提示词"
+
+
+def test_check_prompt_omits_body_section_without_source(tmp_path) -> None:
+    models = _check(tmp_path, '{"unsupported": []}', [_plain_item()])
+    assert "原文正文节选：" not in _prompt(models, "feeds.post_check")
+
+
 def test_brief_with_excluded_fact_is_cleared_and_card_falls_back_to_summary(tmp_path) -> None:
     """Mistral：核验写明页面没有 1M 上下文，brief 却写了 → brief 置空，卡片用 summary。"""
     it = _plain_item(
@@ -148,6 +165,36 @@ def test_check_failure_falls_back_all_rewrites(tmp_path) -> None:
         assert it["post"]["body"] == it["summary"]
         assert "title_zh" not in it
         assert it["brief"] == ""
+
+
+@pytest.mark.parametrize("data", [
+    {}, {"ok": True}, [], None,
+    {"unsupported": None}, {"unsupported": {}}, {"unsupported": "none"},
+    {"unsupported": [None]}, {"unsupported": ["brief"]},
+    {"unsupported": [{"i": -1, "field": "brief", "phrases": ["免费"]}]},
+    {"unsupported": [{"i": 1, "field": "brief", "phrases": ["免费"]}]},
+    {"unsupported": [{"i": True, "field": "brief", "phrases": ["免费"]}]},
+    {"unsupported": [{"i": 0.5, "field": "brief", "phrases": ["免费"]}]},
+    {"unsupported": [{"i": "0", "field": "brief", "phrases": ["免费"]}]},
+    {"unsupported": [{"i": 0, "field": "unknown", "phrases": ["免费"]}]},
+    {"unsupported": [{"i": 0, "field": None, "phrases": ["免费"]}]},
+    {"unsupported": [{"i": 0, "field": "brief"}]},
+    {"unsupported": [{"i": 0, "field": "brief", "phrases": "免费"}]},
+    {"unsupported": [{"i": 0, "field": "brief", "phrases": []}]},
+    {"unsupported": [{"i": 0, "field": "brief", "phrases": [42]}]},
+    {"unsupported": [{"i": 0, "field": "brief", "phrases": [" "]}]},
+    {"unsupported": [
+        {"i": 0, "field": "brief", "phrases": ["免费"]},
+        {"i": 99, "field": "body", "phrases": ["编造"]},
+    ]},
+])
+def test_malformed_check_falls_back_all_rewrites(tmp_path, data: Any) -> None:
+    """自检未交回完整、合法的结论，不能把漏项或忽略异常当通过。"""
+    it = _tts_item()
+    _check(tmp_path, json.dumps(data, ensure_ascii=False), [it])
+    assert it["post"]["body"] == it["summary"]
+    assert "title_zh" not in it
+    assert it["brief"] == ""
 
 
 def test_item_without_any_rewrite_skips_model(tmp_path) -> None:

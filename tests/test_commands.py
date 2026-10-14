@@ -98,7 +98,8 @@ def _request(env: SimpleEnv, *, requester: str = MEMBER, title: str = "整理资
     return env.approvals.create(
         G1, kind="task", title=title, quote=quote or title,
         via="群里 @ · Jev 判断是「准备东西」（把握 0.90）",
-        requester_id=requester, requester_name=f"名字{requester}", message_id="m-req",
+        # 每件请求各来自一条群消息（同一条消息只建一个请求）
+        requester_id=requester, requester_name=f"名字{requester}", message_id=f"m-req-{title}",
     )
 
 

@@ -296,7 +296,12 @@ class Approvals:
         if kind_s not in _KINDS:
             raise ValueError(f"不认识的请求类型「{kind}」（只能是 task / goal）")
         gid = _norm(group_id)
+        mid = _norm(message_id)
         now = clock.now()
+        # 同一条来源消息只建一条请求（快路径 / 读群发现 / 恢复重试都可能撞上）：返回已有的那条
+        existing = self._by_source_message(self._store.read(), gid, mid)
+        if existing is not None:
+            return existing
         auto = False if force_manual else self._is_auto(gid, requester_id)
         item_nos = _norm_item_nos(items)
         if screen and not _norm(source):
@@ -313,6 +318,10 @@ class Approvals:
                     logger.debug("记 request.screened 事件失败（群 %s）", gid, exc_info=True)
                 return {"id": "", "status": "screened", "auto": None}
         with self._store.tx() as conn:
+            # 事务里再查一次：查和建之间不能插进同一条消息的另一条请求
+            existing = self._by_source_message(conn, gid, mid)
+            if existing is not None:
+                return existing
             rid = next_id(conn, "R")
             conn.execute(
                 "INSERT INTO requests (id, group_id, kind, title, quote, via, icon,"
@@ -340,6 +349,24 @@ class Approvals:
             return landed
         self._notify_review(rid, gid)
         return {"id": rid, "status": "pending", "auto": None}
+
+    @staticmethod
+    def _by_source_message(conn: Any, gid: str, mid: str) -> dict | None:
+        """这条来源消息已经建过请求（任意状态）→ 返回它的简要视图；没 message_id 不去重。
+
+        不加唯一索引：老库里可能已有同消息的历史重复行，加索引会让迁移失败。
+        """
+        if not mid:
+            return None
+        row = conn.execute(
+            "SELECT id, status FROM requests WHERE group_id=? AND message_id=?"
+            " ORDER BY created ASC, id ASC LIMIT 1",
+            (gid, mid),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"id": str(row["id"]), "status": str(row["status"]), "auto": None,
+                "task_id": None, "goal_id": None, "existing": True}
 
     def _similar_rejected(self, gid: str, text: Any) -> list[str]:
         """本群近 60 天被拒过、且和 text 相似的群友 @ 请求 id（构想 / MaiWork 自提的不算）。"""

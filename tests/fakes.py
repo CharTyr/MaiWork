@@ -297,18 +297,28 @@ class FakeModels:
 # ---------------------------------------------------------------------------
 
 
+DISPLAY_CHECK_PASSES = {"feeds.post_check": '{"unsupported": []}', "personal.post_check": '{"unsupported": []}'}
+
+
 class FakeModelsQueue:
     """假的 Models（第二部分提炼画像用）：预设回复队列 + 记录每次调用。
 
     - reply_queue: 先进先出；元素是 str（chat 的返回文本）或 Exception 实例（抛出）。
-      队列空了默认回 "{\"ops\": [], \"people\": []}"。
+      队列空了默认回 "{\"ops\": [], \"people\": []}"；按 purpose 给了 defaults 的用那份
+      （比如端到端测试给展示自检一个明确的 {"unsupported": []}，不靠不合格式的兜底回复）。
     - calls: 每次 chat 记 (role, messages, kwargs)；kwargs 含 json_mode/purpose/group_id 等。
     - 其他 FakeModels 的测试不受影响（两个类并存）。
     """
 
-    def __init__(self, ready: bool = True, replies: List[Any] | None = None) -> None:
+    # 整个测试文件共用的按 purpose 默认回复（用 monkeypatch 设，测完自动还原）
+    DEFAULTS: Dict[str, str] = {}
+
+    def __init__(
+        self, ready: bool = True, replies: List[Any] | None = None, defaults: Dict[str, str] | None = None
+    ) -> None:
         self._ready = ready
         self.reply_queue: List[Any] = list(replies or [])
+        self.defaults: Dict[str, str] = dict(defaults or {})
         self.calls: List[Tuple[str, List[dict], Dict[str, Any]]] = []
 
     def settings(self) -> Any:
@@ -334,7 +344,8 @@ class FakeModelsQueue:
                 text = str(item)
                 finish = "stop"
         else:
-            text = '{"ops": [], "people": []}'
+            purpose = str(kwargs.get("purpose") or "")
+            text = self.defaults.get(purpose, type(self).DEFAULTS.get(purpose, '{"ops": [], "people": []}'))
             finish = "stop"
         return type("ChatResult", (), {"text": text, "finish_reason": finish})()
 
@@ -823,7 +834,7 @@ def ensure_pick_fallback(models: Any) -> Any:
     return models
 
 
-async def two_phase_workers_run(report: Any, brief: str, kwargs: Dict[str, Any]) -> Any:
+async def two_phase_workers_run(report: Any, brief: str, kwargs: Dict[str, Any], *, store: Any = None) -> Any:
     """「预置一份老路 report」的假 workers 接上两阶段流水线的通用派发。
 
     2026-10-01 起撒网不再派子 agent（代码按计划搜；预置「discover」候选由
@@ -849,8 +860,62 @@ async def two_phase_workers_run(report: Any, brief: str, kwargs: Dict[str, Any])
             for it in preset_items
             if isinstance(it, dict) and str(it.get("url") or "") and str(it.get("url") or "") in str(brief)
         ]
+        record_fixture_pages(task_id, kept)
         return WorkerReport(ok=True, summary="核验好", data={"items": kept}, evidence=[], steps=2)
+    if task_id.startswith("personal-collect:"):
+        record_fixture_pages(task_id, preset_items)
+    if task_id.startswith("feeds-recheck:") and store is not None:
+        # 给了 store 的用例：补打开真打开 brief 里每条链接（工具记录 + 正文含 quote）
+        return fixture_recheck_keep(store, brief, task_id, FIXTURE_RECHECK_QUOTE)
     return report
+
+
+FIXTURE_RECHECK_QUOTE = "原文正文里确实写着这件事的细节。"
+
+
+def fixture_recheck_keep(store: Any, brief: str, task_id: str, quote: str) -> Any:
+    """Fake recheck sub-agent that really "opens" every listed link: writes the
+    fetch_page tool record and the page body (containing ``quote``), then keeps each."""
+    import re
+
+    from CharTyr_MaiWork.maiwork import clock
+    from CharTyr_MaiWork.maiwork.workers import WorkerReport
+
+    verdicts = []
+    for n, url in re.findall(r"^\[(\d+)\] .*?\n\s*链接：(\S+)", str(brief), flags=re.M):
+        with store.tx() as conn:
+            conn.execute(
+                "INSERT INTO tool_calls (ts, group_id, task_id, actor, tool, input, output, ok)"
+                " VALUES (?, '', ?, '子 agent', 'fetch_page', ?, '取到正文', 1)",
+                (clock.now(), task_id, json.dumps({"url": url})),
+            )
+        item = {"index": int(n), "verdict": "keep", "url": url, "quote": quote}
+        record_fixture_pages(task_id, [dict(item, fetched=True, summary="")])
+        verdicts.append(item)
+    return WorkerReport(ok=True, summary="补打开好了", data={"items": verdicts}, evidence=[], steps=2)
+
+
+def fixture_article(item: dict) -> str:
+    """Fixture page body for a preset item: an article paragraph that contains its quote."""
+    return (f"这篇文章的正文这样写道：{item.get('quote') or ''}。"
+            f"正文接着介绍：{item.get('summary') or ''}")
+
+
+def record_fixture_pages(task_id: str, items: list) -> None:
+    """Test-only stand-in for fetch_page: the fake sub-agent "opened" each item it
+    reports as fetched=true, and the page body really contains its quote.
+
+    Production never does this — evidence there only comes from fetch_page handlers.
+    Items whose preset says fetched is not literally True get no page (they were not opened).
+    """
+    from CharTyr_MaiWork.maiwork import verify_budget
+
+    for it in items:
+        if not isinstance(it, dict) or it.get("fetched") is not True:
+            continue
+        url = str(it.get("original_url") or it.get("url") or "")
+        if url:
+            verify_budget.record_page(task_id, url, url, fixture_article(it), title=str(it.get("title") or ""))
 
 
 def patch_two_phase_feeds(

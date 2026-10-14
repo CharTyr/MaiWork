@@ -224,12 +224,14 @@ class TestStep31ChatFeedsHistory:
 # ----------------------------------------------------------------------
 
 class TestFullMigrate:
-    def test_latest_version_is_40(self) -> None:
+    def test_latest_version_is_41(self) -> None:
         # 34 = 历史步骤恢复原样后的库号；35 = 任务双岗协作的 task_lanes（docs/20）；
         # 36 = 资讯卡片短摘要 brief（news_items.brief）；37 = lane 原始历史归档（docs/27）；
         # 38 = 构想 kind（docs/18 §十）；39 = 目标补判 fit（goals.fit / requests.goal_fit）；
-        # 40 = chat_log 去重账本 chat_log_ids（FTS5 上没法建唯一索引）
-        assert LATEST == 40, "库号只因 task_lanes / brief / lane 原始历史 / 构想 kind / goal fit / chat_log 去重账本各加一步"
+        # 40 = chat_log 去重账本 chat_log_ids（FTS5 上没法建唯一索引）；
+        # 41 = 待判 @ 请求状态机（pending_asks 加 state / decision / 退避列，2026-10-13）
+        assert LATEST == 41, "库号只因 task_lanes / brief / lane 原始历史 / 构想 kind / goal fit / chat_log 去重账本 / 待判请求状态各加一步"
+        assert store_mod._MIGRATIONS[40].__name__ == "_m_pending_ask_state"
         assert store_mod._MIGRATIONS[34].__name__ == "_m_task_lanes"
         assert store_mod._MIGRATIONS[35].__name__ == "_m_news_brief"
         assert store_mod._MIGRATIONS[36].__name__ == "_m_task_lane_raw"

@@ -117,6 +117,11 @@ class _RecheckWorkers:
         assert tid.startswith("feeds-recheck:"), f"RSS-only 轮只该派补打开：{tid}"
         for url in self.opened:
             _log_fetch(self.store_ref[0], tid, url)
+        # 真打开的页面正文里写着它 keep 时抄回的 quote（fetch_page 本轮记下的正文）
+        from fakes import record_fixture_pages
+
+        record_fixture_pages(tid, [dict(v, fetched=True) for v in self.items
+                                   if str(v.get("url") or "") in self.opened])
         return WorkerReport(ok=True, summary="核对好了", data={"items": self.items}, evidence=[], steps=2)
 
 
@@ -250,19 +255,23 @@ def test_rss_item_verified_kept_with_rewritten_quote(tmp_path) -> None:
     store.close()
 
 
-def test_rss_only_round_without_check_result_still_accepts_rss(tmp_path) -> None:
-    """补打开没交回结论（子 agent 空手 / 打不开）：RSS 条目照旧往下走，不能说丢就丢。"""
+def test_rss_only_round_without_check_result_rejects_unread_rss(tmp_path) -> None:
+    """补打开没交回结论（子 agent 空手 / 打不开）：RSS 条目的 quote 只是源摘要，
+    本轮没读到正文就没有原文依据——硬拒并写清理由（2026-10-13 巡检：仅标题级核对的卡片照样发了）。
+    以前这里「没核对出问题就放行」，等于把 RSS 源摘要当成原文依据。"""
     store, settings, feeds, workers = _setup_rss_only(
         tmp_path,
         items=[],
         opened=[],
-        replies=[
-            json.dumps({"scores": [_score(0, topic="硬件")]}, ensure_ascii=False),
-            json.dumps({"posts": [_post(0, "RSS 水文一条")]}, ensure_ascii=False),
-        ],
+        replies=[],
     )
     with _TimePatch():
         kept = _run(feeds.prepare_news(GID))
-    assert kept == 1, "没核对出问题就不丢（宁缺毋滥只针对判定的问题）"
+    assert kept == 0, "没读到正文的 RSS 条目不能凭源摘要发出去"
     assert len(_recheck_calls(workers)) == 1
+    row = store.read().execute("SELECT * FROM news_items ORDER BY id").fetchall()[0]
+    assert int(row["rejected"]) == 1 and row["reject_gate"] == "hard"
+    assert "正文" in str(row["reject_reason"]) or "原文" in str(row["reject_reason"])
+    assert not [c for _r, _m, c in feeds._models.calls if c.get("purpose") == "feeds.score"], \
+        "没幸存者就不该花打分的钱"
     store.close()

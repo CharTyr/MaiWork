@@ -215,7 +215,7 @@ class _FakeWorkers:
         self.calls.append({"brief": brief, **kwargs})
         from fakes import two_phase_workers_run
 
-        return await two_phase_workers_run(self.report, brief, kwargs)
+        return await two_phase_workers_run(self.report, brief, kwargs, store=getattr(self, "store", None))
 
 
 def _worker_report(items: list[dict]) -> Any:
@@ -270,7 +270,9 @@ class TestRssPipelineMarking:
             '{"focus": [{"query": "FPGA", "why": "群里在做"}]}', '{"note": "测试不挑"}', score,
             '{"posts": []}',
         ])
-        feeds = Feeds(store, models, _FakeWorkers(_worker_report([])), profiles, _FakeTopics(),
+        workers = _FakeWorkers(_worker_report([]))
+        workers.store = store  # 补打开替身真打开 RSS 原文（工具记录 + 正文）
+        feeds = Feeds(store, models, workers, profiles, _FakeTopics(),
                       lambda: settings, search=_EmptySearch())
         feeds._rss_transport = httpx.MockTransport(
             lambda req: httpx.Response(200, text=_good_xml())

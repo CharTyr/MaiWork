@@ -174,7 +174,7 @@ class _FakeWorkers:
         self.calls.append({"brief": brief, **kwargs})
         from fakes import two_phase_workers_run
 
-        return await two_phase_workers_run(self.report, brief, kwargs)
+        return await two_phase_workers_run(self.report, brief, kwargs, store=getattr(self, "store", None))
 
 
 def _worker_report(items: list[dict]) -> Any:
@@ -203,6 +203,7 @@ def _make_feeds(store: Store, workers: Any, models: Any = None) -> Feeds:
     if models is None:
         focus_json = '{"focus": [{"query": "FPGA", "why": "群里在做"}]}'
         models = FakeModelsQueue(ready=True, replies=[focus_json])
+    workers.store = store  # 补打开替身真打开 RSS 原文（工具记录 + 正文）
     return Feeds(store, models, workers, profiles, _FakeTopics(), lambda: settings, search=_EmptySearch())
 
 

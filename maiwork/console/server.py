@@ -494,6 +494,36 @@ class ConsoleServer:
                 return web.json_response(views.group_view(svc, token_gid, admin=False))
             return _err(401, "先登录管理员，或用群链接打开")
 
+        @post("/api/groups/{gid}/pending-asks/{mid}")
+        async def _pending_ask_review(request: web.Request) -> web.Response:
+            gid = self._resolve_ref(request.match_info["gid"])
+            if gid is None:
+                return _err(404, "没有这个服务群")
+            forbid = self._require_group_admin(request, gid)
+            if forbid is not None:
+                return forbid
+            pa = getattr(getattr(svc, "profiles", None), "pending_asks", None)
+            if pa is None:
+                return _err(503, "待复核模块还没准备好")
+            body = await _json_body(request)
+            if not isinstance(body, dict):
+                return _err(400, "请求体要是 JSON 对象")
+            action, kind = body.get("action"), body.get("kind", "task")
+            if action not in ("request", "ignore") or kind not in ("task", "goal"):
+                return _err(400, "只能转为任务 / 目标请求，或忽略")
+            try:
+                out = pa.review_action(gid, request.match_info["mid"], action,
+                                       approvals=getattr(svc, "approvals", None), kind=kind,
+                                       by="网页管理员" if self._identify(request).role == "admin" else "群管理员（网页）")
+            except KeyError:
+                return _err(404, "找不到这条待复核")
+            except ValueError as exc:
+                return _err(409, str(exc))
+            except Exception:
+                logger.exception("待复核处理失败")
+                return _err(503, "处理失败，原记录仍保留，请稍后再试")
+            return web.json_response(out)
+
         # ---------- 画像 / 关注成员（管理员） ----------
 
         @post("/api/groups/{gid}/profile")

@@ -25,6 +25,7 @@ from test_humane import (
     _seed_chat,
     FakeWorkers,
 )
+from test_humane import _display_check_passes  # noqa: F401  autouse：展示自检明确通过
 
 _EN = "New open-source FPGA dev board released"
 _ZH = "新款开源 FPGA 开发板发布"

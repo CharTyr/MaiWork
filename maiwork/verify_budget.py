@@ -19,12 +19,150 @@ oEmbed……），提示词劝不住。所以上限做进代码：
 
 from __future__ import annotations
 
+import html
+import re
 import threading
-from typing import Any
+import unicodedata
+from dataclasses import dataclass
 
 # task_id -> {"cap": int, "used": int, "search_cap": int(0=不限), "search_used": int}
 _RUNS: dict[str, dict[str, int]] = {}
 _LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class FetchedPage:
+    """Code-owned evidence from the exact text shown by a successful fetch_page."""
+    url: str
+    final_url: str
+    title: str
+    body: str
+
+
+_PAGES: dict[str, list[FetchedPage]] = {}
+_EVIDENCE_MAX_CHARS = 20000  # extraction fallback's existing tool-visible limit
+# A quote must carry at least this many letters/digits/CJK chars (one 4-char CJK
+# phrase); 1–3 characters match almost any page and prove nothing.
+_QUOTE_MIN_ALNUM = 4
+_METADATA = re.compile(r"^(?:title|url source|published time|markdown content|发布时间|发布日期|作者|来源)\s*[:：]", re.I)
+_NAV_WORDS = re.compile(r"^(?:首页|登录|注册|商店|社区|支持|关于|联系我们|隐私政策|版权|目录|分享|上一页|下一页|home|store|community|support|sign in|log in|login|register|menu|search|privacy|terms|share|next|previous|about)[\s|/·:：-]*$", re.I)
+_INSUFFICIENT = re.compile(r"仅(?:根据|依据|凭|从).{0,8}标题|只(?:根据|依据|凭|看(?:到|了)?).{0,8}标题|未(?:读取|读到|获得|能读取).{0,4}正文|正文(?:无法|不可|未能)(?:读取|获得|访问)|(?:based|relying)\s+(?:only\s+)?on\s+(?:the\s+)?(?:title|headline)|title[- ]only|body\s+(?:was\s+)?(?:unavailable|not\s+(?:read|fetched))", re.I)
+_ACCESS_WALL = re.compile(r"sign in to (?:read|continue)|subscribe to (?:read|continue)|log in to (?:read|continue)|登录后(?:阅读|查看)|订阅后(?:阅读|查看)|付费(?:后|才能)(?:阅读|查看)", re.I)
+
+
+def _match_text(text: str) -> str:
+    # Keep punctuation and digits: a quote with different limits/prices must not match.
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", html.unescape(str(text or "")))).casefold()
+
+
+def _quote_text(text: str) -> str:
+    """引文比对口径（2026-10-14 用户同意放宽）：在 `_match_text` 之上再去掉标点。
+
+    文字、数字、货币和百分号这些符号一字不差；只忽略标点、空格、全半角差别。
+    数字中间的 . , : 保留（「1.5 万」不能被「15 万」冒充）。
+    """
+    base = _match_text(text)
+    out = []
+    for i, ch in enumerate(base):
+        if unicodedata.category(ch).startswith("P"):
+            if (ch in "%‰‱" or
+                (ch in "-‐‑‒–—" and i + 1 < len(base) and base[i + 1].isdigit()) or
+                (ch in ".,:/" and 0 < i < len(base) - 1 and base[i - 1].isdigit() and base[i + 1].isdigit())):
+                out.append(ch)
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def article_body(text: str, title: str = "") -> str:
+    """Remove standalone headings, metadata and navigation; retain concise prose.
+
+    This is a structural screen, not a claim that every summary sentence is supported.
+    A short sentence can qualify; hundreds of menu labels cannot.
+    """
+    headline = _match_text(title).strip("《》#")
+    paragraphs = []
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", "![", "（代码从页面", "（发布时间", "（这个链接", "（这页有封面", "（这是经")):
+            continue
+        if _METADATA.match(line) or _NAV_WORDS.fullmatch(line):
+            continue
+        if _match_text(line).strip("《》#") == headline and headline:
+            continue
+        # Menu entries and footer link lists are not article paragraphs.
+        if re.fullmatch(r"(?:[-*+]\s*)?\[[^\]]+\]\([^)]*\)(?:\s*\|?\s*\[[^\]]+\]\([^)]*\))*", line):
+            continue
+        line = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", line)
+        letters = sum(ch.isalnum() for ch in line)
+        if letters < 8 or (letters < 40 and not re.search(r"[。！？.!?；;]", line)):
+            continue
+        paragraphs.append(line)
+    body = "\n".join(paragraphs)
+    if len(body) < 1500 and _ACCESS_WALL.search(body):
+        return ""
+    return body
+
+
+def record_page(task_id: str, url: str, final_url: str, body: str, *, title: str = "") -> None:
+    """Capture successful fetches only inside an active, bounded run."""
+    tid = str(task_id or "")
+    page = FetchedPage(str(url), str(final_url or url), str(title)[:300], str(body)[:_EVIDENCE_MAX_CHARS])
+    with _LOCK:
+        run = _RUNS.get(tid)
+        if run is not None and len(_PAGES.get(tid, [])) < min(run["cap"], 32):
+            _PAGES.setdefault(tid, []).append(page)
+
+
+def bind_pages(task_id: str, items: list[dict]) -> None:
+    """Bind this run's actual source to parsed candidates before closing the run.
+
+    Model-supplied original_url receives no evidence from the old source unless the
+    new URL was itself fetched (or was the final URL of a real redirect).
+    """
+    from .feeds import _normalize_url
+
+    with _LOCK:
+        pages = tuple(_PAGES.get(str(task_id or ""), ()))
+    for item in items:
+        item.pop("_fetched_evidence", None)
+        item.pop("_source_body", None)
+        key = _normalize_url(str(item.get("url") or ""))
+        matching = [p for p in pages if key and key in {_normalize_url(p.url), _normalize_url(p.final_url)}]
+        if not matching:
+            continue
+        # Multiple fetches of one URL: use a body actually containing this quote.
+        quote = _quote_text(str(item.get("quote") or ""))
+        page = next((p for p in matching if quote and quote in _quote_text(article_body(p.body, p.title))), matching[-1])
+        item["_fetched_evidence"] = page
+        item["_source_body"] = article_body(page.body, page.title)
+
+
+def evidence_problem(item: dict) -> str:
+    """Shared fail-closed gate; strings/numbers cannot assert fetched/grounded."""
+    from .feeds import _normalize_url
+
+    quote = str(item.get("quote") or "").strip()
+    if item.get("fetched") is not True or not quote:
+        return "原文没打开过/打不开"
+    if item.get("evidence_sufficient") is False or _INSUFFICIENT.search(str(item.get("summary") or "")):
+        return "摘要明确缺少正文依据"
+    page = item.get("_fetched_evidence")
+    if not isinstance(page, FetchedPage):
+        return "本轮没有这条原文的正文记录"
+    key = _normalize_url(str(item.get("url") or ""))
+    if not key or key not in {_normalize_url(page.url), _normalize_url(page.final_url)}:
+        return "原文依据与本轮打开的链接不一致"
+    body = article_body(page.body, page.title)
+    if not body:
+        return "原文只有标题/导航，正文依据不足"
+    evidence = _quote_text(quote)
+    headlines = [_quote_text(page.title), _quote_text(str(item.get("title") or ""))]
+    if any(headline and evidence in headline for headline in headlines):
+        return "原文依据只有标题，缺少正文依据"
+    if sum(ch.isalnum() for ch in evidence) < _QUOTE_MIN_ALNUM or evidence not in _quote_text(body):
+        return "原文依据不在本轮读到的正文中"
+    return ""
 
 # 绝对上限（防「组内条数多就无限开」；一组最多先开这么多页）
 _CAP_MAX = 6
@@ -76,6 +214,7 @@ def open_run(task_id: str, *, cap_page_calls: int, cap_search_calls: int = 0) ->
         search_cap = 0
     with _LOCK:
         _RUNS[tid] = {"cap": cap, "used": 0, "search_cap": search_cap, "search_used": 0}
+        _PAGES[tid] = []
 
 
 def close_run(task_id: str) -> None:
@@ -83,6 +222,7 @@ def close_run(task_id: str) -> None:
     tid = str(task_id or "")
     with _LOCK:
         _RUNS.pop(tid, None)
+        _PAGES.pop(tid, None)
 
 
 def consume(task_id: str) -> tuple[bool, str]:

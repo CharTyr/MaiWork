@@ -74,7 +74,7 @@ class FakeWorkers:
 
     async def run(self, brief: str, **kwargs: Any) -> Any:
         self.calls.append({"brief": brief, **kwargs})
-        return await two_phase_workers_run(self.report, brief, kwargs)
+        return await two_phase_workers_run(self.report, brief, kwargs, store=getattr(self, "store", None))
 
 
 class FakeTopics:
@@ -177,6 +177,7 @@ def _make_feeds(tmp_path, *, models=None, workers=None) -> tuple:
     profiles = FakeProfiles()
     profiles.entries_map[G1] = [{"category": "ongoing", "text": "在做开源硬件项目"}]
     topics = FakeTopics()
+    workers.store = store  # 补打开替身真打开 RSS 原文（工具记录 + 正文）
     feeds = Feeds(store, models, workers, profiles, topics, lambda: settings,
                   search=_EmptySearch())
     return store, settings, feeds, models, workers, topics

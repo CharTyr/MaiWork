@@ -178,6 +178,8 @@ class MaiWorkApp:
         # 长活（资讯备料 / 构想）：同一群同一种同时只跑一个，不阻塞后台循环
         self._bg_jobs: set[asyncio.Task] = set()
         self._running_jobs: set[tuple[str, str]] = set()
+        # 待判 @ 独立重试：每群上次派工时刻（内存；重启后第一轮就派一次）
+        self._pending_recover_at: dict[str, float] = {}
         # 构想被堆积闸挡住（暂时受阻）的群 → 下次重查时刻；只在内存，重启就重查一次
         self._idea_recheck_at: dict[str, float] = {}
         # 名册跟 QQ 对名字：每群上次派工时间（30 分钟一轮）
@@ -1943,6 +1945,8 @@ class MaiWorkApp:
             models=self.models,
             # 话头火花（docs/18 §十一）：记进 feeds 的内存（每条群消息都可能来一下，零库写）
             on_spark=(self.feeds.note_spark if self.feeds is not None else None),
+            # 待判 @ 的持久记录：和画像提炼 / 独立重试共用同一份（同一套终态和去重）
+            pending_asks=getattr(self.profiles, "pending_asks", None),
         )
         # 派活判断兜底（quick_judge）：intake 自己建的；停机时要单独收（见 _stop_stack）
         self.quick_judge = getattr(intake, "quick_judge", None)
@@ -2461,16 +2465,34 @@ class MaiWorkApp:
     # @ 设提醒的慢路径：主模型解析时间 → 成员目标 → 群里回一句
     # ------------------------------------------------------------------
 
-    async def on_reminder(self, group_id: str, msg: dict) -> None:
+    @staticmethod
+    def _pending_landed(pending: Any, gid: str, message_id: str) -> bool:
+        """这条待判 @ 是否已经真的落地（建成请求 / 提醒，或按批准规则筛掉）。"""
+        try:
+            row = pending.get(gid, message_id)
+        except Exception:
+            logger.exception("读待判 @ 出错（群 %s）", gid)
+            return False
+        return bool(row) and str(row["state"]) in ("completed", "screened")
+
+    async def on_reminder(self, group_id: str, msg: dict) -> bool:
+        """解析提醒时间并落地。返回是否真的建成（False = 没建成，待判行留着等重试）。
+
+        接了待判记录（profiles.pending_asks）时：模型在事务外解析，解析结果先落成结论，
+        再由 profiles.apply_pending_ask 在一个事务里查状态、建成员目标、排回执、关待判行
+        ——同一条原消息只建一次（行已结束就直接算成功）。"""
         gid = str(group_id)
         try:
             if self.models is None or self.goals is None or self.outbox is None:
-                return
+                return False
             if not isinstance(msg, dict):
-                return
+                return False
             user_name = str(msg.get("user_name") or msg.get("user_id") or "")
             text = str(msg.get("text") or "")
             message_id = str(msg.get("message_id") or "")
+            pending = getattr(self.profiles, "pending_asks", None)
+            if pending is not None and message_id and self._pending_landed(pending, gid, message_id):
+                return True  # 同一条原消息已经建过（重试 / 重复投递）：不再花模型钱
             now = _now()
             prompt = (
                 "把群友的话解析成一个提醒，只输出 JSON，不带任何其他文字。\n"
@@ -2491,7 +2513,30 @@ class MaiWorkApp:
             data = _parse_reminder_json(str(getattr(result, "text", "") or ""), now)
             if data is None:
                 logger.info("提醒没解析出来（群 %s，原话：%s）", gid, text[:60])
-                return
+                if pending is not None and message_id:
+                    pending.fail(gid, message_id, "提醒时间没解析出来")
+                return False
+            due_txt = clock.bj(float(data["due_ts"])).strftime("%Y-%m-%d %H:%M")
+            if pending is not None and message_id:
+                pending.decide(gid, message_id, {
+                    "kind": "reminder", "title": str(data["title"]),
+                    "remind_ts": float(data["remind_ts"]), "due_ts": float(data["due_ts"]),
+                    "repeat": None, "via": "群里 @ · 提醒解析",
+                })
+                landed = bool(self.profiles.apply_pending_ask(gid, message_id)) or self._pending_landed(
+                    pending, gid, message_id
+                )
+                if landed and self.mentions is not None:
+                    try:
+                        self.mentions.add(
+                            gid,
+                            f"{user_name} 刚才定了个提醒（{due_txt}：{data['title']}），有人问起可以说已经记下了",
+                            key=f"reminder-mention:{gid}:{message_id}",
+                            ttl_s=30 * 60,
+                        )
+                    except Exception:
+                        logger.exception("提醒备忘写入失败（群 %s）", gid)
+                return landed
             goal_id = self.goals.create_member(
                 gid,
                 who_id=str(msg.get("user_id") or ""),
@@ -2500,7 +2545,6 @@ class MaiWorkApp:
                 due_ts=float(data["due_ts"]),
                 remind_ts=float(data["remind_ts"]),
             )
-            due_txt = clock.bj(float(data["due_ts"])).strftime("%Y-%m-%d %H:%M")
             self.outbox.enqueue(
                 f"reminder:{goal_id}",
                 gid,
@@ -2522,8 +2566,12 @@ class MaiWorkApp:
                 except Exception:
                     logger.exception("提醒备忘写入失败（群 %s）", gid)
             logger.info("提醒已建：%s（群 %s，%s 提醒）", goal_id, gid, due_txt)
+            return True
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("解析提醒出错（群 %s）", gid)
+            return False
 
 
     async def run_loop_once(self) -> None:
@@ -2573,6 +2621,12 @@ class MaiWorkApp:
                         self._spawn_long_job(gid, "profile", self.profiles.refresh)
                 except Exception:
                     logger.exception("画像提炼后台派工出错（群 %s）", gid)
+            # 待判 @ 的独立重试：不看画像游标、不等新消息；每群每 5 分钟最多派一次，
+            # 每次有上限（recover_pending_asks 自己限条数），同群同时只跑一个
+            try:
+                self._maybe_recover_pending(gid, now)
+            except Exception:
+                logger.exception("待判 @ 重试派工出错（群 %s）", gid)
             try:
                 self._persona_round(gid, now)
             except Exception:
@@ -3392,6 +3446,16 @@ class MaiWorkApp:
         self._spawn_long_job(gid, "profile_manual", _force_refresh)
         return {"started": True, "reason": ""}
 
+    def _maybe_recover_pending(self, gid: str, now: float) -> None:
+        profiles = self.profiles
+        if profiles is None or not hasattr(profiles, "recover_pending_asks"):
+            return
+        last = self._pending_recover_at.get(gid, 0.0)
+        if now - last < _PENDING_RECOVER_EVERY_S:
+            return
+        self._pending_recover_at[gid] = now
+        self._spawn_long_job(gid, "pending_asks", profiles.recover_pending_asks)
+
     def _spawn_long_job(self, gid: str, kind: str, fn: Callable[..., Any]) -> None:
         """资讯备料 / 构想 / 画像提炼：可能跑几分钟，独立后台任务；同一群同一种同时只跑一个。"""
         key = (str(gid), str(kind))
@@ -3461,6 +3525,7 @@ class MaiWorkApp:
             await asyncio.sleep(self.loop_interval)
 
 
+_PENDING_RECOVER_EVERY_S = 5 * 60  # 待判 @ 独立重试的派工间隔（每群）
 _IDEA_RECHECK_S = 10 * 60  # 构想位子满时多久再查一次（只是一条 COUNT，不调模型）
 
 

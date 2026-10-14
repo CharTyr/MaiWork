@@ -49,6 +49,14 @@ from fakes import (
     two_phase_workers_run,
 )
 
+
+@pytest.fixture(autouse=True)
+def _display_check_passes(monkeypatch):
+    """这些端到端测试不测展示自检：给它一个明确的「全部通过」，不靠不合格式的兜底回复。"""
+    from fakes import DISPLAY_CHECK_PASSES, FakeModelsQueue
+
+    monkeypatch.setattr(FakeModelsQueue, "DEFAULTS", dict(DISPLAY_CHECK_PASSES))
+
 BJ = timezone(timedelta(hours=8))
 NOW = 1_790_000_000.0
 GID = "111"

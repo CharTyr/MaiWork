@@ -828,7 +828,7 @@ class TestWritePostsRobust:
             _FOCUS_JSON,
             _scores_json(_score(0, topic="甲"), _score(1, topic="乙")),
             *post_replies,
-        ])
+        ], defaults={"feeds.post_check": '{"unsupported": []}'})  # 展示自检明确通过
         store, settings, feeds, models, workers, topics, _ = _make_feeds(
             tmp_path,
             models=models,

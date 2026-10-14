@@ -41,7 +41,7 @@ from test_feeds_quality import (
     _TimePatch,
 )
 
-from fakes import FakeCtx, FakeModelsQueue, FakeProfiles
+from fakes import FakeCtx, FakeModelsQueue, FakeProfiles, record_fixture_pages
 from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 from CharTyr_MaiWork.maiwork import discovery
 from CharTyr_MaiWork.maiwork.feeds import _normalize_url
@@ -87,6 +87,10 @@ class SeqWorkers:
                 rep = self.verify.pop(0) if self.verify else None
                 if isinstance(rep, BaseException):
                     raise rep
+                # 假核验子 agent「打开过」它报 fetched=true 的原文（页面正文含 quote）
+                data = getattr(rep, "data", None)
+                if isinstance(data, dict):
+                    record_fixture_pages(task_id, list(data.get("items") or []))
                 return rep
             finally:
                 self._cur -= 1

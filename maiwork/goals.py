@@ -189,11 +189,13 @@ class Goals:
         due_ts: float | None,
         remind_ts: float | None,
         repeat: str | None = None,
+        conn: sqlite3.Connection | None = None,
     ) -> str:
+        """建成员目标（提醒）；给了 conn 就并进调用方的事务（提醒 + 回话 + 完成标记一起提交）。"""
         now = clock.now()
         repeat_s = str(repeat).strip() if repeat else None
         until = (now + _REPEAT_UNTIL_S) if repeat_s else None
-        with self._store.tx() as conn:
+        with (self._store.tx() if conn is None else nullcontext(conn)) as conn:
             mid = next_id(conn, "M")
             conn.execute(
                 "INSERT INTO goals (id, group_id, kind, icon, title, who_id, who_name,"

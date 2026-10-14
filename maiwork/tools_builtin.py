@@ -321,7 +321,13 @@ async def _fetch_page_text(
             image_url = _extract_og_image(text, current)
             published = page_date.published_from_html(text)  # 原始 HTML 里读日期（读完再提正文）
             title, body = _extract_html(text)
-            text = (f"《{title}》\n{body}" if title else body) or text
+            from .verify_budget import article_body
+
+            # Empty/headline/navigation extraction should try the configured fallback.
+            # Tiny transport fixtures remain successful but never satisfy the news gate.
+            if not body.strip() or body.strip() == title.strip() or (len(body) > 30 and not article_body(body, title)):
+                return False, "只读到标题/导航，没读到可用正文", "", "", ""
+            text = f"《{title}》\n{body}" if title else body
         if len(text) > _TEXT_MAX_CHARS:
             text = text[:_TEXT_MAX_CHARS] + " …（后面还有，已截断）"
         return True, text, image_url, current, published
@@ -509,8 +515,18 @@ def register_builtin(
         return ToolResult(ok=True, output="\n".join(lines), data=results)
 
     def _page_result(
-        url: str, text: str, image_url: str, final_url: str, via: str, published: str = ""
+        ctx: ToolContext, url: str, text: str, image_url: str, final_url: str, via: str,
+        published: str = "", *, body: str | None = None, title: str = "",
     ) -> ToolResult:
+        from . import verify_budget
+
+        if body is None:
+            body = text
+            if body.startswith("《") and "》\n" in body:
+                heading, body = body.split("》\n", 1)
+                title = heading[1:]
+            body = body.removesuffix(" …（后面还有，已截断）")
+        verify_budget.record_page(str(ctx.task_id or ""), url, final_url or url, body, title=title)
         host = urlparse(url).hostname or ""
         if image_url:
             # 拿到封面图就告诉子 agent 一声（交回候选时带 image_url）
@@ -540,10 +556,11 @@ def register_builtin(
             return "", str(e)[:120] or type(e).__name__
         return (text, "") if text else ("", "没读到正文（没选工具或那家用不了）")
 
-    def _extracted_result(url: str, text: str) -> ToolResult:
+    def _extracted_result(ctx: ToolContext, url: str, text: str) -> ToolResult:
+        body = text[:20000]
         return _page_result(
-            url, text[:20000] + "\n\n（这是经「抓网页正文」工具读到的正文）", "", url, "extract",
-            page_date.published_from_text(text),
+            ctx, url, body + "\n\n（这是经「抓网页正文」工具读到的正文）", "", url, "extract",
+            page_date.published_from_text(text), body=body,
         )
 
     async def fetch_page(ctx: ToolContext, args: dict) -> ToolResult:
@@ -554,12 +571,11 @@ def register_builtin(
         # （verify_budget.py，feeds._verify_batch 按组开账）。用完直接拒——提示词劝不住
         # 「找日期打转」（2026-09-30 线上实录 8 分钟 23 次），要靠代码拦。
         # 个人向找料（personal-collect:）同一本账（2026-10-03，线上巡检后）。
-        if str(ctx.task_id or "").startswith(("feeds-verify:", "personal-collect:")):
-            from . import verify_budget
+        from . import verify_budget
 
-            allowed, note = verify_budget.consume(str(ctx.task_id))
-            if not allowed:
-                return ToolResult(ok=False, output="", error=note)
+        allowed, note = verify_budget.consume(str(ctx.task_id or ""))
+        if not allowed:
+            return ToolResult(ok=False, output="", error=note)
         use_jina = reader is not None and bool(getattr(reader, "enabled", lambda: False)())
         if use_jina:
             # 新顺序：Jina → 抓正文工具 → 直接打开。先做地址安全检查（内网地址哪条路都不走）。
@@ -569,19 +585,20 @@ def register_builtin(
             got = await reader.read(url)
             if got.ok:
                 return _page_result(
-                    url, got.text, got.image_url, got.final_url or url, "jina",
+                    ctx, url, got.text, got.image_url, got.final_url or url, "jina",
                     page_date.normalize_date(getattr(got, "published", "")),
+                    body=getattr(got, "body", ""), title=getattr(got, "title", ""),
                 )
             reasons = [f"Jina Reader：{got.reason}"]
             text, why = await _try_extract(url)
             if text:
-                return _extracted_result(url, text)
+                return _extracted_result(ctx, url, text)
             reasons.append(f"抓正文工具：{why}")
             ok, text, image_url, final_url, published = await _fetch_page_text(
                 url, transport=http_transport, resolver=resolve
             )
             if ok:
-                return _page_result(url, text, image_url, final_url, "direct", published)
+                return _page_result(ctx, url, text, image_url, final_url, "direct", published)
             reasons.append(f"直接打开：{text}")
             return ToolResult(ok=False, output="", error="打不开这个页面。" + "；".join(reasons))
 
@@ -591,12 +608,12 @@ def register_builtin(
             url, transport=http_transport, resolver=resolve
         )
         if ok:
-            return _page_result(url, text, image_url, final_url, "direct", published)
+            return _page_result(ctx, url, text, image_url, final_url, "direct", published)
         blocked_for_safety = "内网" in text or "不允许" in text or "只支持" in text
         if not blocked_for_safety:
             extracted, _why = await _try_extract(url)
             if extracted:
-                return _extracted_result(url, extracted)
+                return _extracted_result(ctx, url, extracted)
         return ToolResult(ok=False, output="", error=text)
 
     async def read_profile(ctx: ToolContext, args: dict) -> ToolResult:

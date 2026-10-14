@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
 from . import clock, members
+from .pending_asks import PendingAsks
 from .privacy import scrub
 
 if TYPE_CHECKING:  # 只做类型提示，运行时不需要
@@ -119,6 +120,8 @@ class Profiles:
         self._approvals: Any = None
         self._goals: Any = None
         self._outbox: Any = None
+        # 待判 @ 请求的唯一主人（intake / app 共用同一个实例：app 从这里拿）
+        self.pending_asks = PendingAsks(store, get_settings)
 
     def set_request_deps(self, *, approvals: Any = None, goals: Any = None, outbox: Any = None) -> None:
         """接上 asks 的落地依赖：prepare/goal → approvals.create；reminder → goals + outbox 回一句。"""
@@ -351,16 +354,14 @@ class Profiles:
             changed = self._apply_people(conn, gid, people, now) or bool(
                 sum(op_counts.values())
             )
+            # 读群发现的请求（docs/02 §3.1/§5.1）：结论和游标同一个事务落库——游标推进了，
+            # 结论一定也在；落地（建请求 / 提醒）放到事务之后，失败留在 pending_asks 里重试。
+            decided = self._record_asks(conn, gid, batch_msgs, asks)
             self._finish_batch_tx(conn, gid, batch_msgs, now, op_counts)
         if changed or sum(op_counts.values()):
             self._write_profile_md(gid)
-        # 读群时顺带发现的请求（docs/02 §3.1/§5.1）：在 ops 事务之后落地，
-        # 各自的 create 再开自己的事务（Store 不支持套事务）。落地出错只记日志，
-        # 不影响这一批提炼的收账。
-        try:
-            self._apply_asks(gid, batch_msgs, asks)
-        except Exception:
-            logger.exception("落地读群发现的请求出错（群 %s）", gid)
+        for mid in decided:
+            self.apply_pending_ask(gid, mid)
         return True
 
     # ------------------------------------------------------------------
@@ -607,27 +608,25 @@ class Profiles:
     _ASK_TITLE_MAX = 30
     _ASK_QUOTE_MAX = 500
 
-    def _apply_asks(self, gid: str, batch_msgs: list, asks: list) -> None:
-        """把这一批里发现的请求落地；pending_asks 中被判过的标 handled。
+    _ASK_VIA = "主模型读群时发现"
+    _RECOVER_VIA = "主模型复查待判 @"
+    # 普通提炼先有一小时机会顺带判；过了这段还没判的才交给独立复查（和画像游标无关）
+    _RECOVER_GRACE_S = 3600
+    _RECOVER_TIMEOUT_S = 120
 
-        - prepare → approvals.create(kind=task)；goal → approvals.create(kind=goal)；
-          via 都写「主模型读群时发现」，requester 是那条消息的发言人；
-          同一 message_id 已有请求（任意状态）就跳过，不重复建。
-        - reminder 且 when 解析得出 → goals.create_member（who=发言人，remind_ts=due_ts=when），
-          并经 outbox 在群里回一句固定话「记下了，<时间> 提醒你」（push_kind=status，
-          reply_to 原消息）；同一 message_id 已经回过（发件箱 key 在）就跳过。
-        - 机器人自己的消息、非服务群的消息绝不处理；依赖没接线（set_request_deps 没给）
-          对应 kind 跳过且不标 handled，下次接上还能再判。
+    def _record_asks(self, conn: Any, gid: str, batch_msgs: list, asks: list) -> list[str]:
+        """在提炼事务里把这批发现的请求结论落库（pending_asks.decision），返回待落地的消息号。
+
+        - prepare / goal / reminder：先 record_pending 再 decide（同一个 conn）；
+        - none：只关掉已经在等判的那条（不给普通消息建行）；
+        - 机器人自己的消息、别的插件的指令、非服务群一律不处理；终态不会被重新打开。
         """
         if not asks:
-            return
-        settings = self._get_settings()
-        if not settings.is_served(gid):
-            return
-        approvals = self._approvals
-        goals = self._goals
-        outbox = self._outbox
-        handled: list[str] = []
+            return []
+        if not self._get_settings().is_served(gid):
+            return []
+        pa = self.pending_asks
+        out: list[str] = []
         for a in asks:
             try:
                 idx = int(a.get("i"))
@@ -640,92 +639,206 @@ class Profiles:
                 continue  # 机器人自己的消息绝不处理
             if is_command(getattr(m, "text", "")):
                 continue  # 别的插件的指令，不是给 MaiWork 的活
-            kind = str(a.get("kind") or "").strip()
+            mid = str(getattr(m, "id", "") or "")
+            if not mid:
+                continue
+            kind = str(a.get("kind") or "").strip().lower()
             title = str(a.get("title") or "").strip()[: self._ASK_TITLE_MAX]
             if not title:
                 title = str(getattr(m, "text", "") or "").strip()[: self._ASK_TITLE_MAX]
-            mid = str(getattr(m, "id", "") or "")
-            if kind in ("prepare", "goal"):
-                if approvals is None:
-                    continue
-                if mid and self._request_exists(gid, mid):
-                    handled.append(mid)  # 同一 message_id 已有请求：不重复建，但也算判过了
-                    continue
-                try:
-                    approvals.create(
-                        gid,
-                        kind="task" if kind == "prepare" else "goal",
-                        title=title or "群里的请求",
-                        quote=str(getattr(m, "text", "") or "")[: self._ASK_QUOTE_MAX],
-                        via="主模型读群时发现",
-                        requester_id=str(getattr(m, "user_id", "") or ""),
-                        requester_name=str(getattr(m, "user_name", "") or ""),
-                        message_id=mid,
-                        screen=True,
-                    )
-                except Exception:
-                    logger.exception("读群发现的请求建待批出错（群 %s，消息 %s）", gid, mid)
-                    continue
-                handled.append(mid)
-            elif kind == "reminder":
-                if goals is None or outbox is None:
-                    continue
-                remind_ts = _parse_bj_when(str(a.get("when") or ""))
-                if remind_ts is None:
-                    # 模型判了是提醒但没给得出时间：不建目标，算判过（避免每轮重复问）
-                    handled.append(mid)
-                    continue
-                key = f"ask-remind:{gid}:{mid}"
-                if mid and self._outbox_key_exists(key):
-                    handled.append(mid)  # 同一 message_id 只回一次
-                    continue
-                title = title or "提醒"
-                who_name = str(getattr(m, "user_name", "") or "")
-                goals.create_member(
+            decision = {"kind": kind, "title": title, "via": self._ASK_VIA, "when": str(a.get("when") or "")}
+            if kind == "none":
+                pa.decide(gid, mid, decision, conn=conn)
+                continue
+            if kind not in ("prepare", "goal", "reminder"):
+                continue
+            msg = {
+                "message_id": mid,
+                "user_id": str(getattr(m, "user_id", "") or ""),
+                "user_name": str(getattr(m, "user_name", "") or ""),
+                "text": str(getattr(m, "text", "") or ""),
+                "timestamp": float(getattr(m, "ts", 0) or 0),
+            }
+            if pa.record_pending(gid, msg, self._ASK_VIA, conn=conn) is None:
+                continue
+            if pa.decide(gid, mid, decision, conn=conn):
+                out.append(mid)
+        return out
+
+    def apply_pending_ask(self, gid: str, mid: str) -> bool:
+        """把一条已判（decided）的 @ 请求落地；成功才标完成，失败按退避留着重试。
+
+        prepare / goal → approvals.create（同一来源消息去重在 create 里）；被相似拒绝筛掉 → screened。
+        reminder → 一个事务里：复核状态 → 成员目标 + 回话入发件箱 + 标完成（任何一步失败整体回滚）。
+        依赖没接线（set_request_deps 缺）→ 不落地也不算失败，等接上。
+        """
+        gid, mid = str(gid), str(mid)
+        if not self._get_settings().is_served(gid):
+            return False
+        pa = self.pending_asks
+        row = pa.get(gid, mid)
+        if row is None or row.get("state") != "decided" or not isinstance(row.get("decision"), dict):
+            return False
+        d = row["decision"]
+        kind = str(d.get("kind") or "")
+        text = str(row.get("text") or "")
+        title = str(d.get("title") or "").strip() or text.strip()[: self._ASK_TITLE_MAX]
+        if kind in ("prepare", "goal"):
+            approvals = self._approvals
+            if approvals is None:
+                return False
+            try:
+                res = approvals.create(
                     gid,
-                    who_id=str(getattr(m, "user_id", "") or ""),
-                    who_name=who_name,
-                    title=title,
-                    due_ts=remind_ts,
-                    remind_ts=remind_ts,
+                    kind="task" if kind == "prepare" else "goal",
+                    title=title or "群里的请求",
+                    quote=text[: self._ASK_QUOTE_MAX],
+                    via=str(d.get("via") or self._ASK_VIA),
+                    requester_id=str(row.get("user_id") or ""),
+                    requester_name=str(row.get("user_name") or ""),
+                    message_id=mid,
+                    screen=True,
                 )
-                when_txt = clock.bj(remind_ts).strftime("%Y-%m-%d %H:%M")
-                outbox.enqueue(
-                    key,
-                    gid,
-                    "text",
-                    {
-                        "text": f"记下了，{when_txt} 提醒你",
-                        "reply_to": mid,
-                        "push_kind": "status",
-                    },
-                )
-                handled.append(mid)
-        # pending_asks 里被判过的标 handled（只有确实走到落地这一步的才标）
-        if handled:
+            except Exception as e:
+                logger.exception("待判 @ 请求建待批出错（群 %s，消息 %s），稍后重试", gid, mid)
+                pa.fail(gid, mid, f"建待批出错：{e}")
+                return False
+            if isinstance(res, dict) and str(res.get("status") or "") == "screened":
+                return pa.complete(gid, mid, result_kind="screened")
+            rid = str(res.get("id") or "") if isinstance(res, dict) else ""
+            if rid:
+                return pa.complete(gid, mid, result_kind="request", result_id=rid)
+            pa.fail(gid, mid, "建待批没拿到请求号")
+            return False
+        if kind == "reminder":
+            goals, outbox = self._goals, self._outbox
+            if goals is None or outbox is None:
+                return False
+            try:
+                remind_ts = float(d["remind_ts"])
+                due_raw = d.get("due_ts")
+                due_ts = float(due_raw) if due_raw is not None else remind_ts
+            except (KeyError, TypeError, ValueError):
+                pa.fail(gid, mid, "提醒结论缺时间")
+                return False
+            key = f"ask-remind:{gid}:{mid}"
+            when_txt = clock.bj(remind_ts).strftime("%Y-%m-%d %H:%M")
             try:
                 with self._store.tx() as conn:
-                    for mid in handled:
-                        conn.execute(
-                            "UPDATE pending_asks SET handled=1 WHERE group_id=? AND message_id=?",
-                            (gid, mid),
-                        )
-            except Exception:
-                logger.info("标 pending_asks handled 失败（群 %s）", gid, exc_info=True)
+                    cur = conn.execute(
+                        "SELECT state FROM pending_asks WHERE group_id=? AND message_id=?", (gid, mid)
+                    ).fetchone()
+                    if cur is None or str(cur["state"]) != "decided":
+                        return False  # 别处已经落过 / 转了终态
+                    old = conn.execute("SELECT id FROM outbox WHERE key=?", (key,)).fetchone()
+                    if old is not None:
+                        # 老版本已经回过话（同一来源消息只回一次）：不再建第二个目标
+                        return pa.complete(gid, mid, result_kind="reminder",
+                                           result_id=f"outbox:{int(old['id'])}", conn=conn)
+                    goal_id = goals.create_member(
+                        gid,
+                        who_id=str(row.get("user_id") or ""),
+                        who_name=str(row.get("user_name") or ""),
+                        title=title or "提醒",
+                        due_ts=due_ts,
+                        remind_ts=remind_ts,
+                        repeat=d.get("repeat") or None,
+                        conn=conn,
+                    )
+                    outbox.enqueue(
+                        key, gid, "text",
+                        {"text": f"记下了，{when_txt} 提醒你", "reply_to": mid, "push_kind": "status"},
+                        conn=conn,
+                    )
+                    if not pa.complete(gid, mid, result_kind="reminder", result_id=str(goal_id), conn=conn):
+                        raise RuntimeError("提醒落地后标完成失败")
+                return True
+            except Exception as e:
+                logger.exception("待判 @ 提醒落地出错（群 %s，消息 %s），稍后重试", gid, mid)
+                pa.fail(gid, mid, f"提醒落地出错：{e}")
+                return False
+        return False
 
-    def _request_exists(self, gid: str, message_id: str) -> bool:
-        """同一 message_id 已有请求（intake 快路径或以往读群建的都算，任意状态）。"""
-        row = self._store.read().execute(
-            "SELECT 1 FROM requests WHERE group_id=? AND message_id=? LIMIT 1",
-            (gid, str(message_id)),
-        ).fetchone()
-        return row is not None
+    async def recover_pending_asks(self, gid: str, *, limit: int = 8) -> int:
+        """独立恢复（和画像游标无关、可重复跑）：返回这轮真落地的条数。
 
-    def _outbox_key_exists(self, key: str) -> bool:
-        row = self._store.read().execute(
-            "SELECT 1 FROM outbox WHERE key=? LIMIT 1", (str(key),)
-        ).fetchone()
-        return row is not None
+        1) 超 48 小时没落地的标 review 留着（不再调模型、不删）；
+        2) 判了没落地、退避到点的重试落地；
+        3) 还没判、等了超过一小时的，一次模型调用批量复查（最多 limit 条）；
+           模型没给结论 / 给不出时间的不算闲聊，按退避下次再问。非服务群零工作。
+        """
+        gid = str(gid)
+        if not self._get_settings().is_served(gid):
+            return 0
+        pa = self.pending_asks
+        now = clock.now()
+        pa.mark_stale(gid, now=now)
+        landed = 0
+        for d in pa.due(gid, now=now, limit=limit):
+            if self.apply_pending_ask(gid, str(d["message_id"])):
+                landed += 1
+        rows = pa.undecided(gid, before=now - self._RECOVER_GRACE_S, now=now, limit=limit)
+        if rows:
+            landed += await self._classify_pending(gid, rows, now)
+        return landed
+
+    async def _classify_pending(self, gid: str, rows: list[dict], now: float) -> int:
+        from .models import ModelError
+
+        pa = self.pending_asks
+        try:
+            ready = bool(self._models.settings().ready())
+        except Exception:
+            ready = False
+        if not ready:
+            return 0
+        lines = [
+            "下面是群友 @ MaiBot 的几条消息，当时没判出来是不是请求。逐条判断：",
+            "prepare = 请 MaiBot 准备 / 整理 / 查东西；goal = 请帮忙盯着某事或做成某事；"
+            "reminder = 请到点提醒；none = 闲聊、玩笑、MaiBot 当场能答的、不是请求。",
+            f"现在是北京时间 {clock.bj(now).strftime('%Y-%m-%d %H:%M')}。reminder 必须给 when（北京时间 "
+            "YYYY-MM-DD HH:MM，按消息发出的时间换算相对日期）；算不出时间就不要写 when。",
+            '只回 JSON：{"asks": [{"i": 序号, "kind": "prepare|goal|reminder|none", "title": "十字左右的标题", '
+            '"when": "仅 reminder"}]}，每条都要给。',
+            "",
+        ]
+        for i, r in enumerate(rows, 1):
+            at = clock.bj(float(r.get("first_seen") or r.get("ts") or now)).strftime("%Y-%m-%d %H:%M")
+            lines.append(f"[{i}] {at} {r.get('user_name') or '群友'}：{str(r.get('text') or '')[:self._MSG_TEXT_MAX]}")
+        answers: dict[int, dict] = {}
+        try:
+            result = await self._models.chat(
+                agent="main", messages=[{"role": "user", "content": "\n".join(lines)}], json_mode=True,
+                purpose="profile.pending_asks", group_id=gid,
+                timeout=self._RECOVER_TIMEOUT_S, retries=0,
+            )
+            text = str(getattr(result, "text", "") or "")
+            i, j = text.find("{"), text.rfind("}")
+            data = json.loads(text[i : j + 1]) if i >= 0 and j > i else None
+            items = data.get("asks") if isinstance(data, dict) else None
+            for a in items if isinstance(items, list) else []:
+                if isinstance(a, dict) and type(a.get("i")) is int and 1 <= a["i"] <= len(rows):
+                    answers.setdefault(a["i"], a)
+        except (ModelError, ValueError, TypeError) as e:
+            for r in rows:
+                pa.fail(gid, str(r["message_id"]), f"复查调模型失败：{e}")
+            return 0
+        landed = 0
+        for i, r in enumerate(rows, 1):
+            mid = str(r["message_id"])
+            a = answers.get(i)
+            if a is None:
+                pa.fail(gid, mid, "复查没给结论")
+                continue
+            kind = str(a.get("kind") or "").strip().lower()
+            decision = {"kind": kind, "title": str(a.get("title") or ""), "when": str(a.get("when") or ""),
+                        "via": self._RECOVER_VIA}
+            if not pa.decide(gid, mid, decision):
+                pa.fail(gid, mid, "复查结论不完整")
+                continue
+            if kind != "none" and self.apply_pending_ask(gid, mid):
+                landed += 1
+        return landed
 
     # ------------------------------------------------------------------
     # 每周整理：合并重复、删掉过时的（recent 类 14 天没更新的优先）
@@ -1042,7 +1155,7 @@ class Profiles:
             pending_ask_ids = {
                 str(r["message_id"])
                 for r in conn.execute(
-                    "SELECT message_id FROM pending_asks WHERE group_id=? AND handled=0",
+                    "SELECT message_id FROM pending_asks WHERE group_id=? AND handled=0 AND state='pending'",
                     (gid,),
                 )
             }

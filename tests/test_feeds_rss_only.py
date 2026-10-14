@@ -26,6 +26,7 @@ from fakes import (
     PICK_FALLBACK_REPLY,
     FakeModelsQueue,
     FakeProfiles,
+    fixture_recheck_keep,
     focus_reply,
     patch_two_phase_feeds,
 )
@@ -80,13 +81,18 @@ class _BrokenSearch:
 class FakeWorkers:
     """假 workers.run：记录调用；RSS-only 轮里只该派补打开（撒网 / 核验都不派）。"""
 
-    def __init__(self) -> None:
+    def __init__(self, store: Any = None) -> None:
         self.calls: List[Dict[str, Any]] = []
+        self.store = store
 
     async def run(self, brief: str, **kwargs: Any) -> Any:
         self.calls.append({"brief": brief, **kwargs})
         from CharTyr_MaiWork.maiwork.workers import WorkerReport
 
+        task_id = str(kwargs.get("task_id") or "")
+        if self.store is not None and task_id.startswith("feeds-recheck:"):
+            # 补打开真打开了 RSS 原文（正文里有 quote）：只有这样 RSS 条目才过第一道
+            return fixture_recheck_keep(self.store, brief, task_id, _QUOTE)
         return WorkerReport(ok=True, summary="好", data={"items": []}, evidence=[], steps=1)
 
 
@@ -173,7 +179,7 @@ def _make_feeds(tmp_path, *, models=None, search=None) -> tuple:
     settings = _settings()
     if models is None:
         models = FakeModelsQueue(ready=True)
-    workers = FakeWorkers()
+    workers = FakeWorkers(store)
     profiles = FakeProfiles()
     profiles.entries_map[G1] = [{"category": "ongoing", "text": "在做开源硬件项目"}]
     topics = FakeTopics()

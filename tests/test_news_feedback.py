@@ -203,10 +203,18 @@ def test_intake_hook_records_reply_to_card(store):
     settings, _ = load_settings({"plugin": {"enabled": True}, "groups": {"serve": [{"group": f"qq:{GID}"}]}})
     a = _item(store)
     _card(store, [a], "9001")
-    intake = Intake(lambda: settings, Signals(), store=store, spawn=lambda c: c.close())
+    spawned = []
+    intake = Intake(lambda: settings, Signals(), store=store, spawn=spawned.append)
     msg = hook_message(group_id=GID, text="[CQ:reply,id=9001]这个好", message_id="m77")
     out = _run(intake.handle(msg))
     assert out == {"action": "continue"}
+    assert _rows(store) == [], "写反馈在后台做，钩子本身不写库"
+
+    async def drain():
+        for coro in spawned:
+            await coro
+
+    _run(drain())
     rows = _rows(store)
     assert len(rows) == 1 and rows[0]["kind"] == "reply" and rows[0]["message_id"] == "m77"
 

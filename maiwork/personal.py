@@ -37,6 +37,7 @@ from .config import Settings
 from .feeds import (
     _IDEA_ITEMS_MAX,
     _POST_ACCURACY_RULES,
+    _SCORE_SOURCE_MAX,
     CONDITIONS_RULE,
     CONDITIONS_SCHEMA,
     SOURCE_IDENTITY_RULES,
@@ -453,7 +454,10 @@ class Personal:
         mark = f"personal-collect:{gid}:{str(uid)[:8]}:{int(clock.now() * 1000)}"
         verify_budget.open_run(mark, cap_page_calls=PERSONAL_PAGE_CAP, cap_search_calls=PERSONAL_SEARCH_CAP)
         try:
-            return await self._collect_inner(gid, focus_list, mark)
+            items = await self._collect_inner(gid, focus_list, mark)
+            # 关账本前把本轮真读到的正文挂上（第一道按它核依据，模型自报的不算）
+            verify_budget.bind_pages(mark, items)
+            return items
         finally:
             verify_budget.close_run(mark)
 
@@ -540,7 +544,8 @@ class Personal:
                     "kind": "news",
                     "published_raw": raw.get("published"),
                     "published_ts": _parse_published(raw.get("published")),
-                    "fetched": bool(raw.get("fetched")),
+                    "fetched": raw.get("fetched") is True,
+                    "evidence_sufficient": raw.get("evidence_sufficient", True) is True and raw.get("grounded", True) is True,
                     "quote": str(raw.get("quote") or "").replace("\n", " ").strip()[:_QUOTE_MAX],
                     "paywall": bool(raw.get("paywall")),
                     "url_key": _normalize_url(url),
@@ -555,6 +560,7 @@ class Personal:
 
     def _hard_reject_code(self, gid: str, candidates: list[dict]) -> list[dict]:
         """不调模型的第一道硬性淘汰；返回幸存列表（原序）。"""
+        from . import verify_budget
         from .feeds import _similar, _site_of, _TITLE_DEDUP_RATIO, _domain_blocked, blocked_domains
 
         settings = self._get_settings()
@@ -572,8 +578,9 @@ class Personal:
             url_key = item["url_key"]
             site = _site_of(item["url"])
             item["site"] = site
-            if not item.get("fetched") or not str(item.get("quote") or "").strip():
-                item["reject"] = ("hard", "原文没打开过/打不开")
+            evidence_problem = verify_budget.evidence_problem(item)
+            if evidence_problem:
+                item["reject"] = ("hard", evidence_problem)
             elif item.get("paywall"):
                 item["reject"] = ("hard", "原文要登录/付费")
             elif site and _domain_blocked(site, blocked):
@@ -594,7 +601,7 @@ class Personal:
             if "reject" in item:
                 continue
             flags = item.get("_flags") or {}
-            if not flags.get("grounded", True):
+            if flags.get("grounded") is not True:
                 item["reject"] = ("hard", "摘要在原文找不到依据（不扎实）")
             elif flags.get("junk"):
                 reason = str(flags.get("junk_reason") or "").strip()
@@ -648,10 +655,13 @@ class Personal:
             pub = c.get("published_raw")
             pub_text = f"，发布于 {pub}" if pub else ""
             conds = _conditions_text(c)
+            # 代码在本轮打开网页时留下的正文（不是模型自报），给 grounded 判断对照
+            source_body = str(c.get("_source_body") or "").replace("\n", " ")[:_SCORE_SOURCE_MAX]
             lines.append(
                 f"[{i}] {c['title']} —— {c['summary'][:150]}（{c['url']}{pub_text}）"
                 + (f" 原文依据：{quote[:150]}" if quote else "")
                 + (f" 必须保留的限定：{conds}" if conds else "")
+                + (f" 本轮读到的原文正文（节选）：{source_body}" if source_body else "")
             )
         lines.append("")
         icon_list = "、".join(_ICONS)
@@ -695,7 +705,8 @@ class Personal:
             if icon not in _ICONS:
                 icon = "newspaper"
             flags = {
-                "grounded": bool(s.get("grounded", True)),
+                # 只认字面 true：漏给、"false"、1 都不算「摘要有依据」
+                "grounded": s.get("grounded") is True,
                 "junk": bool(s.get("junk", False)),
                 "junk_reason": str(s.get("junk_reason") or "")[:80],
                 "same_as_recent": bool(s.get("same_as_recent", False)),

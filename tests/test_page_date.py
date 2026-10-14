@@ -276,6 +276,10 @@ class _CodeDateWorkers:
             dict(it) for it in self.items
             if str(it.get("url") or "") and str(it.get("url") or "") in brief
         ]
+        # 本轮 fetch_page 真读到的正文（含 quote）
+        from fakes import record_fixture_pages
+
+        record_fixture_pages(tid, kept)
         return WorkerReport(ok=True, summary="核验好", data={"items": kept}, evidence=[], steps=2)
 
 

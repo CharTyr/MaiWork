@@ -51,7 +51,9 @@ export function viewTasks(g, v) {
   const list = tasks.list || [];
   const botName = (state.me && state.me.bot && state.me.bot.name) || "MaiBot";
   const goalsHtml = goalSections(g, v);
-  if (!pending.length && !list.length && !goalsHtml) {
+  const review = gadmin() && Array.isArray(tasks.review) ? tasks.review : [];
+  const reviewError = gadmin() ? tasks.review_error || "" : "";
+  if (!pending.length && !list.length && !goalsHtml && !review.length && !reviewError) {
     return html + emptyState("package", "暂无任务", `在群内 @${botName} 提交任务，或发送「提醒我…」`);
   }
   let i = 0;
@@ -80,6 +82,19 @@ export function viewTasks(g, v) {
         </article>`
       )
       .join("");
+  }
+  if (reviewError) html += `<div class="warn-box">${esc(reviewError)}</div>`;
+  if (review.length) {
+    html += `<h2 class="h-sub">待复核 <small>${review.length} 条${review.length === 100 ? " · 显示最早的 100 条" : ""}</small></h2><p class="h-meta">转为请求后仍需审批，不会直接开工。</p>`;
+    html += review.map((r) => `<article class="item ruled enter" style="--i:${i++}">
+      ${ico("magnifier")}<div>
+      <div class="quote"><span class="quote-by">${esc(r.who)} · ${esc(when(r.ts))}</span>${esc(r.text)}</div>
+      <div class="via">${esc(r.why)}${r.attempts ? ` · 已重试 ${esc(r.attempts)} 次` : ""}</div>
+      <div class="actions">
+        <button class="btn primary" data-act="ask-review" data-gid="${esc(g.id)}" data-id="${esc(r.message_id)}" data-op="request" data-kind="task">转为任务请求</button>
+        <button class="btn" data-act="ask-review" data-gid="${esc(g.id)}" data-id="${esc(r.message_id)}" data-op="request" data-kind="goal">转为目标请求</button>
+        <button class="btn" data-act="ask-review" data-gid="${esc(g.id)}" data-id="${esc(r.message_id)}" data-op="ignore">忽略</button>
+      </div></div></article>`).join("");
   }
   if (list.length) {
     html += `<h2 class="h-sub">所有任务</h2>`;

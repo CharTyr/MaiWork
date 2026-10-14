@@ -168,6 +168,10 @@ class QuickJudge:
       item 里带 `_why`（模型给的判断依据，建待批的 via 用）。
     - on_reminder(group_id, msg)：reminder 落地（可 sync 可 async）
     - on_slow(reason, group_id, user_id, user_name, message_id, text)：回落慢路径（sync）
+    - on_none(group_id, item)：明确闲聊的终态（可选；接库时把待判行关掉）
+
+    落地回调返回 False 或抛异常 = 没落地，这条交回慢路径（不当成已处理）；
+    返回 None 按老接口当成功。落地途中被取消（停机）同样交回慢路径再往外抛。
     """
 
     def __init__(
@@ -179,6 +183,7 @@ class QuickJudge:
         on_request: Optional[Callable[..., Any]] = None,
         on_reminder: Optional[Callable[..., Any]] = None,
         on_slow: Optional[Callable[..., Any]] = None,
+        on_none: Optional[Callable[..., Any]] = None,
     ) -> None:
         self._get_settings = get_settings
         self._models = models
@@ -186,6 +191,7 @@ class QuickJudge:
         self._on_request = on_request
         self._on_reminder = on_reminder
         self._on_slow = on_slow
+        self._on_none = on_none
         self._tasks: set[asyncio.Task] = set()
         # 正在判的（键 (群号, message_id) → 条目）：去重用；停机时把没判完的交回慢路径
         self._inflight: dict[tuple[str, str], dict] = {}
@@ -316,13 +322,14 @@ class QuickJudge:
         title = str(got.get("title") or "").strip()[:_TITLE_MAX]
         why = str(got.get("why") or "").strip()
         if kind in ("prepare", "goal") and sure >= _REQUEST_SURE:
-            item["_done"] = True
             item["_why"] = why
-            await self._call(self._on_request, gid, kind, sure, item, title)
+            if await self._call(self._on_request, gid, kind, sure, item, title):
+                item["_done"] = True
+            else:
+                self._slow_items([item], f"快速判断判成「{kind}」但落地失败，等重试")
             return
         if kind == "reminder" and sure >= _OTHER_SURE:
-            item["_done"] = True
-            await self._call(
+            ok = await self._call(
                 self._on_reminder,
                 gid,
                 {
@@ -333,9 +340,15 @@ class QuickJudge:
                     "text": str(item.get("text") or ""),
                 },
             )
+            if ok:
+                item["_done"] = True
+            else:
+                self._slow_items([item], "快速判断判成提醒但落地失败，等重试")
             return
         if kind == "none" and sure >= _OTHER_SURE:
-            item["_done"] = True  # 明确是闲聊：什么都不记
+            # 明确是闲聊：接了 on_none 就记成终态（失败也无妨，待判行留着由读群再判）
+            await self._call(self._on_none, gid, item)
+            item["_done"] = True
             return
         self._slow_items([item], f"快速判断拿不准（{kind or '没给类型'}）（把握 {sure:.2f}）")
 
@@ -348,15 +361,18 @@ class QuickJudge:
             return -1.0
         return v if 0.0 <= v <= 1.0 else -1.0
 
-    async def _call(self, cb: Optional[Callable[..., Any]], *args: Any) -> None:
+    async def _call(self, cb: Optional[Callable[..., Any]], *args: Any) -> bool:
+        """调落地回调；返回是否真的落地了（False / 异常 = 没落地）。取消照常往外抛。"""
         if cb is None:
-            return
+            return True
         try:
             result = cb(*args)
             if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
-                await result
+                result = await result
         except Exception:
             logger.exception("快速判断落地出错（%s）", getattr(cb, "__name__", cb))
+            return False
+        return result is not False
 
     # ------------------------------------------------------------------
     # 慢路径 / 计数 / 挑模型

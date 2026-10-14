@@ -1128,8 +1128,44 @@ def _m_chat_log_ids(conn: sqlite3.Connection) -> None:
         )
 
 
+# 待判 @ 请求的状态机（2026-10-13 生产巡检：9 条 pending_asks 搁了 3~15 天没人判）。
+# 判断结论（decision，JSON）先落库，落地失败按退避重试；只有落地成功 / 明确闲聊 / 被筛掉
+# 才是终态（handled=1）；超 48 小时没落地的标 review 留着，不悄悄丢。
+# state：pending（待判）/ decided（判了待落地）/ completed / none / screened / review。
+# 老库：handled=1 的行一律当已完成（result_kind='legacy'），first_seen 回填 ts。
+_PENDING_ASK_COLUMNS = (
+    ("state", "TEXT NOT NULL DEFAULT 'pending'"),
+    ("decision", "TEXT NOT NULL DEFAULT ''"),
+    ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("next_try_ts", "REAL NOT NULL DEFAULT 0"),
+    ("last_error", "TEXT NOT NULL DEFAULT ''"),
+    ("result_kind", "TEXT NOT NULL DEFAULT ''"),
+    ("result_id", "TEXT NOT NULL DEFAULT ''"),
+    ("first_seen", "REAL NOT NULL DEFAULT 0"),
+    ("review", "INTEGER NOT NULL DEFAULT 0"),
+    ("updated", "REAL NOT NULL DEFAULT 0"),
+)
+
+
+def _m_pending_ask_state(conn: sqlite3.Connection) -> None:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(pending_asks)")}
+    if not cols:  # 半截老库（测试里手造的）没有 pending_asks：没东西可加
+        return
+    for name, ddl in _PENDING_ASK_COLUMNS:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE pending_asks ADD COLUMN {name} {ddl}")
+    conn.execute("UPDATE pending_asks SET first_seen=ts WHERE first_seen=0")
+    conn.execute(
+        "UPDATE pending_asks SET state='completed', result_kind='legacy'"
+        " WHERE handled=1 AND state='pending'"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_asks_state ON pending_asks(group_id, state, next_try_ts)"
+    )
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids, _m_pending_ask_state]
 
 
 class Store:
@@ -1145,6 +1181,11 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._chmod(self._path, 0o600)
         self._lock = threading.RLock()
+
+    @property
+    def path(self) -> Path:
+        """库文件路径（只读）。后台线程要碰库时用它另开一条短连接，绝不跨线程共用 self 的连接。"""
+        return self._path
 
     @staticmethod
     def _chmod(p: Path, mode: int) -> None:

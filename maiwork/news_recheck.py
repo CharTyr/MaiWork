@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, Callable
 
@@ -32,6 +31,7 @@ logger = logging.getLogger("maiwork.news_recheck")
 
 _RECHECK_MINUTES = 6
 _RECHECK_CAP = 8
+_RECHECK_PAGES_PER_ITEM = 3  # 补打开每条最多开几次页面（原链接 + 换来源）
 _QUOTE_MAX = 200
 
 RECHECK_SCHEMA: dict[str, Any] = {
@@ -166,12 +166,42 @@ async def recheck(
     dup_check: Callable[[str], bool] | None = None,
 ) -> int:
     """补打开 + 核对；原地改 candidates。返回核对通过（keep 且真打开过）的条数。出错不抛。"""
-    from .coordinator import normalize_link_for_check
+    from . import verify_budget
 
     opened, records = opened_links(store, collect_mark)
     picked = pick_unverified(candidates, opened, records)[:_RECHECK_CAP]
     if not picked:
         return 0
+    # 补打开这轮也开账本：fetch_page 把真读到的正文记在这里，keep 的条目关账前绑上，
+    # 第一道按它核依据（2026-10-13；RSS-only 轮以前只凭模型说 keep + 打开记录放行）。
+    # 上限按「每条最多三次」给，宽于核验组（这里还可能换来源），不额外多调模型。
+    verify_budget.open_run(recheck_mark, cap_page_calls=len(picked) * _RECHECK_PAGES_PER_ITEM)
+    try:
+        return await _recheck_open(
+            store, workers, gid, candidates, picked,
+            recheck_mark=recheck_mark, parse_published=parse_published,
+            normalize_url=normalize_url, site_of=site_of, dup_check=dup_check,
+        )
+    finally:
+        verify_budget.close_run(recheck_mark)
+
+
+async def _recheck_open(
+    store: Any,
+    workers: Any,
+    gid: str,
+    candidates: list[dict],
+    picked: list[int],
+    *,
+    recheck_mark: str,
+    parse_published: Callable[[Any], Any],
+    normalize_url: Callable[[str], str],
+    site_of: Callable[[str], str],
+    dup_check: Callable[[str], bool] | None,
+) -> int:
+    from . import verify_budget
+    from .coordinator import normalize_link_for_check
+
     try:
         report = await workers.run(
             _brief(candidates, picked),
@@ -190,6 +220,7 @@ async def recheck(
         return 0
     reopened, _n = opened_links(store, recheck_mark)
     kept = 0
+    kept_items: list[dict] = []
     for res in data["items"]:
         if not isinstance(res, dict):
             continue
@@ -242,7 +273,10 @@ async def recheck(
                 item["published_ts"] = ts
         item["fetched"] = True
         item["rechecked"] = True
+        kept_items.append(item)
         kept += 1
+    # 新的 quote / url 属于这轮补打开：换上本轮代码真读到的正文（旧证据作废，没读到就没有）
+    verify_budget.bind_pages(recheck_mark, kept_items)
     # 代码这次从网页读到的日期覆盖模型的 / 相对时间按打开时间换算（「必须有日期」不放宽）
     _fill_code_dates(store, recheck_mark, [candidates[i] for i in picked], parse_published)
     logger.info("资讯补打开（群 %s）：送去 %d 条，核对通过 %d 条", gid, len(picked), kept)

@@ -7,6 +7,7 @@ import logging
 import os
 import socket
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1719,3 +1720,80 @@ class TestAdminChatWiring:
         finally:
             await app.stop()
         assert app.admin_chat is None and app.admin_pending is None
+
+
+class TestPendingAskWiring:
+    """待判 @：提醒建成走一次事务、同一消息只建一次；独立重试由后台循环派工。"""
+
+    @staticmethod
+    def _real_app(tmp_path: Path) -> MaiWorkApp:
+        from CharTyr_MaiWork.maiwork.profile import Profiles
+
+        app = _app(tmp_path)
+        app.profiles_cls = Profiles  # 这两条要真的待判记录和落地逻辑
+        return app
+
+    @pytest.mark.asyncio
+    async def test_reminder_lands_once_and_closes_pending(self, tmp_path: Path) -> None:
+        app = self._real_app(tmp_path)
+        await app.start()
+        try:
+            app.models = _RetryCapturingModels()
+            msg = {"user_id": "10001", "user_name": "阿一", "text": "提醒我明天买菜", "message_id": "m-r1"}
+            app.profiles.pending_asks.record_pending(G1, msg, "测试")
+            assert await app.on_reminder(G1, msg) is True
+            assert await app.on_reminder(G1, msg) is True, "已结束的行再来一次直接算成功"
+            goals = app.store.read().execute(
+                "SELECT COUNT(*) FROM goals WHERE group_id=?", (G1,)
+            ).fetchone()[0]
+            assert goals == 1, "同一条原消息只建一个提醒"
+            row = app.store.read().execute(
+                "SELECT handled FROM pending_asks WHERE group_id=? AND message_id='m-r1'", (G1,)
+            ).fetchone()
+            assert row is not None and row["handled"] == 1
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_unparsed_reminder_reports_failure(self, tmp_path: Path) -> None:
+        app = self._real_app(tmp_path)
+        await app.start()
+        try:
+            fake = _RetryCapturingModels()
+
+            async def bad_chat(role=None, messages=None, **kwargs):
+                class _R:
+                    text = '{"ok": false}'
+                return _R()
+
+            fake.chat = bad_chat
+            app.models = fake
+            msg = {"user_id": "10001", "user_name": "阿一", "text": "提醒我", "message_id": "m-r2"}
+            app.profiles.pending_asks.record_pending(G1, msg, "测试")
+            assert await app.on_reminder(G1, msg) is False
+            row = app.store.read().execute(
+                "SELECT handled FROM pending_asks WHERE group_id=? AND message_id='m-r2'", (G1,)
+            ).fetchone()
+            assert row is not None and row["handled"] == 0, "没建成的提醒要留着等重试"
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_loop_spawns_bounded_pending_recovery(self, tmp_path: Path) -> None:
+        app = _app(tmp_path)
+        await app.start()
+        try:
+            calls: list[str] = []
+
+            async def recover(gid, *, limit=8):
+                calls.append(gid)
+                return 0
+
+            app.profiles.recover_pending_asks = recover
+            await app.run_loop_once()
+            await asyncio.sleep(0)
+            await app.run_loop_once()
+            await asyncio.sleep(0)
+            assert calls.count(G1) == 1, "每群有间隔地派一次，不是每轮都派"
+        finally:
+            await app.stop()

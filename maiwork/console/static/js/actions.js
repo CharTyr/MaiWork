@@ -586,6 +586,27 @@ export async function act(el, e) {
       }
       break;
     }
+    case "ask-review": {
+      const gid = el.dataset.gid;
+      if (String(state.g) !== String(gid) || !["admin", "group_admin"].includes((state.me || {}).role)) break;
+      const op = el.dataset.op;
+      if (!confirm(op === "ignore" ? "忽略这条待复核？原话仍保留，不会再自动处理。" : "转为请求？仍需管理员审批，不会直接开工。")) break;
+      const buttons = el.closest(".actions").querySelectorAll("button");
+      buttons.forEach((b) => { b.disabled = true; });
+      try {
+        await api("POST", `/api/groups/${encodeURIComponent(gid)}/pending-asks/${encodeURIComponent(el.dataset.id)}`, { action: op, kind: el.dataset.kind || "task" });
+        if (String(state.g) !== String(gid)) break;
+        await loadView(true);
+        renderTopBits();
+        renderView();
+        renderSide();
+        toast(op === "ignore" ? "已忽略，原话仍保留" : "已转为请求，等待审批");
+      } catch (err) {
+        buttons.forEach((b) => { b.disabled = false; });
+        if (String(state.g) === String(gid)) toast(err.message, true);
+      }
+      break;
+    }
     case "req": {
       const op = el.dataset.op;
       el.disabled = true;
