@@ -44,7 +44,8 @@ _AOT_FIELDS: dict[str, tuple[str, ...]] = {
 # 算好整段再写），键顺序固定；空串/空列表的键不写进文件（读回时按默认补全）。
 _AOT_TOP_FIELDS: dict[str, tuple[str, ...]] = {
     "endpoints": ("id", "name", "protocol", "base_url", "api_key", "retries", "retry_delay_s", "max_concurrency", "max_rpm", "headers"),
-    "model_list": ("id", "endpoint", "model", "name", "efforts", "vision", "context_window", "max_tokens"),
+    "model_list": ("id", "endpoint", "model", "name", "efforts", "vision", "context_window", "max_tokens",
+                   "use", "image_api", "image_default_size", "image_max_n"),
     "jev_endpoints": ("id", "name", "preset", "protocol", "url", "model", "api_key"),
 }
 

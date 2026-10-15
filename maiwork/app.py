@@ -15,11 +15,13 @@ import dataclasses
 import json
 import logging
 import secrets
+import time
 from pathlib import Path
 from typing import Any, Callable
 
 from . import clock, members
 from .config import Settings, load_settings
+from .environments import vm_platforms
 from .tasks import ANSWER_HINT
 from .host import Host
 from .intake import Intake, Signals
@@ -32,6 +34,11 @@ logger = logging.getLogger("maiwork.app")
 _TOKEN_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
 
 _CONTINUE: dict[str, Any] = {"action": "continue"}
+
+# planner 备忘钩子的本地附加工作硬上限（秒）：宿主钩子超时 1000ms，这里最多 500ms。
+# 超了就「不改动消息」（`Mentions.inject` 按 deadline 自检），不让宿主计超时、更不让它熔断
+# （熔断期间所有群的钩子都被跳过）。2026-10 线上实测：mentions 钩子 4 天超时 3 次。
+_PLANNER_HOOK_BUDGET_S = 0.5
 
 
 def _import_profiles_cls():
@@ -73,6 +80,9 @@ class MaiWorkApp:
         self.personal_factory: Callable[..., Any] | None = None
         self.env_factory: Callable[..., Any] | None = None
         self.railway_factory: Callable[..., Any] | None = None
+        # 一次性 VM 平台工厂（2026-10-15）：按 (kind, get_settings, data_dir, *, store, transport)
+        # 建环境对象；缺省走 environments/vm_platforms.make_env。
+        self.vm_env_factory: Callable[..., Any] | None = None
         self.loop_interval: float = 30.0
         # 测试注入点（可选，start 前设置）：各外部 HTTP 客户端的 httpx transport。
         # 缺省 None = 真实网络；测试注入 httpx.MockTransport 后不碰任何真实网络（AGENTS.md 红线）。
@@ -82,6 +92,7 @@ class MaiWorkApp:
         self.extensions_transport: Any = None  # extensions.py 的 MCP 扩展客户端
         self.rss_transport: Any = None         # rss.py 的 RSS 客户端（MockTransport 用）
         self.avatar_transport: Any = None      # console/avatar.py 的头像出站下载（MockTransport 用）
+        self.freestyle_transport: Any = None   # environments/freestyle.py 的 Freestyle API 客户端
 
         self._settings: Settings | None = None
         self.problems: list[str] = []
@@ -135,18 +146,28 @@ class MaiWorkApp:
         self._group_controls_seed_ready: bool = False
         # 测试注入点：替换探测（默认走 capability.probe 真探测）
         self.capability_probe: Callable[[str], Any] | None = None
-        # 一次性 VM 执行环境（environments/railway.py；railway=false / 模块没就位 → None）
+        # 一次性 VM 执行环境（environments/vm_platforms.py 注册表里的那一家；
+        # 配置关了 / 模块没就位 → {}）。键是平台名（"railway" / "freestyle"）。
+        self.vms: dict[str, Any] = {}
+        # 几家合一的分派器（vm_* 工具用它；两家都开时按 box.kind 分派）；没开任何一家 → None
+        self.vm_router: Any = None
+        # 兼容位：就是 self.vms["railway"]（老代码 / 老测试直接读 app.railway）
         self.railway: Any = None
         # 专用 SSH 机器（environments/ssh.py；启动就建，没配机器也先生成 key 给网页展示公钥）
         self.ssh: Any = None
         self.ssh_factory: Any = None  # 测试注入点
         self._ssh_check_ts = 0.0
         self._ssh_check_sig: Any = None
+        # Freestyle 密钥后台验证的节流（同 _ssh_check_*；只在用户选了 freestyle 时才跑）
+        self._freestyle_check_ts = 0.0
+        self._freestyle_check_sig: Any = None
         self.outbox: Any = None
         self.card_push: Any = None  # 资讯卡片（card_push.py）
         self.idea_mention: Any = None  # 构想提一嘴（card_push.py）
         self.news_viz: Any = None  # 资讯图解（news_viz.py）
         self.update_check: Any = None  # 更新提醒（update_check.py；只提醒不自动更新）
+        # 可选依赖（optional_deps.py；2026-10-15 用户定：办公文档三库可选安装，不进必装依赖）
+        self.optional_deps: Any = None
         self.delivery: Any = None
         self.herenow: Any = None
         self.coordinator: Any = None
@@ -582,9 +603,11 @@ class MaiWorkApp:
             self.mentions, self.pushes, self.get_settings, self.signals,
             identity=self.identity,
         )
-        # 3.55 一次性 VM（railway.new 资讯实测，docs/07 §11.1b）：railway=true 才建 +
-        # 注册 vm 工具；Feeds 的 verify_runner 从这里拿（railway=false → None）
-        self.railway = self._make_railway()
+        # 3.55 一次性 VM（资讯实测 + 派活，docs/07 §11.1b / §11.1d）：按
+        # 「设置 → 干活机器 → 临时机器用哪家」（railway / freestyle）建**当前选中的那一家**
+        # + 注册 vm 工具；Feeds 的 verify_runner 从这里拿（没建起来 → None）
+        self.vms = self._make_vm_envs()
+        self.railway = self.vms.get("railway")
         self.feeds = self._make_feeds()
         self.scheduler = self._make_scheduler()
         # 关注成员的个人向产出（personal.py；要在 topics / workers / search 就位之后建）
@@ -625,20 +648,34 @@ class MaiWorkApp:
             self._drop_command_tools_if_stopped(self.tools)
         except Exception:
             logger.exception("注册执行工具出错，子 agent 这次用不了文件 / 命令 / 聊天历史")
+        # 生图（2026-10-15 第一期）：generate_image（roles=worker）——成品落进
+        # artifacts/<任务>/images/，用本机工作区的 resolve 做越界检查，密钥从端点现读。
+        try:
+            from .tools_imagegen import register_image_tools
+
+            register_image_tools(
+                self.tools, get_settings=self.get_settings, env=self.env,
+                store=self.store, http_transport=self.http_transport,
+            )
+        except Exception:
+            logger.exception("注册生图工具出错，子 agent 这次画不了图")
         # vm_fetch_file 需要本机 LocalEnv（此刻才建好）；register_vm_tools 逐个幂等，
-        # 只补还没注册的（vm_run/put/read 已在 _make_railway 注册过就跳过这一遍）
-        if self.railway is not None and self.env is not None:
+        # 只补还没注册的（vm_run/put/read 已在 _make_vm_envs 注册过就跳过这一遍）
+        _vm_tool_env = self.vm_router if self.vm_router is not None else (
+            next(iter(self.vms.values())) if self.vms else None
+        )
+        if _vm_tool_env is not None and self.env is not None:
             try:
                 from .tools_railway import register_vm_tools as _register_vm_tools2
 
                 _register_vm_tools2(
                     self.tools,
-                    get_box=lambda: getattr(self.railway, "current_box", None),
-                    env=self.railway,
+                    get_box=lambda env=_vm_tool_env: getattr(env, "current_box", None),
+                    env=_vm_tool_env,
                     local_env=self.env,
                 )
             except Exception:
-                logger.exception("注册 vm_fetch_file 出错，railway 派活这次少个拷回工具")
+                logger.exception("注册 vm_fetch_file 出错，一次性 VM 派活这次少个拷回工具")
         # 专用 SSH 机器：建环境 + 注册 machine_* 工具（要在本机 LocalEnv 建好之后，拷回成品用它）
         self.ssh = self._make_ssh()
         self.herenow = self._make_herenow()
@@ -733,6 +770,20 @@ class MaiWorkApp:
         except Exception:
             logger.exception("更新提醒模块没建起来，这次不查新版")
             self.update_check = None
+        # 可选依赖（optional_deps.py；2026-10-15 用户定：办公文档三库以「可选安装」方式提供，
+        # 不进 _manifest.json 必装依赖）。探测走 self.env（子 agent 那条路），装在
+        # <workspace_root>/../pylibs；本机执行没就位 → 建不起来也如实说，网页能一键装。
+        try:
+            from .optional_deps import OptionalDeps
+
+            self.optional_deps = OptionalDeps(
+                self.store, self.get_settings,
+                env=getattr(self, "env", None),
+                capability=getattr(self, "capability", None),
+            )
+        except Exception:
+            logger.exception("可选依赖模块没建起来，这次不能一键装")
+            self.optional_deps = None
         self.delivery = Delivery(self.store, self.outbox, self.tasks)
         self.coordinator = self._make_coordinator()
         # 按群的管理员（group_admins.py）：密码哈希 / 本群管理员名单只进数据库，
@@ -958,25 +1009,28 @@ class MaiWorkApp:
                         await result
             except Exception:
                 logger.exception("关闭搜索客户端出错")
-        if self.railway is not None:
-            # 一次性 VM：手上那台放掉（本地删 key 目录 + 清 kv 标记；远端只能等官方回收）
+        for _kind, _vm_env in list(self.vms.items()):
+            # 一次性 VM：手上那台放掉（railway 本地删 key 目录 + 清 kv 标记、等官方回收；
+            # Freestyle 会真发 DELETE 销毁），再收掉 HTTP 客户端
             try:
-                box = getattr(self.railway, "current_box", None)
+                box = getattr(_vm_env, "current_box", None)
                 if box is not None:
-                    result = self.railway.release(box)
+                    result = _vm_env.release(box)
                     if asyncio.iscoroutine(result):
                         await result
             except Exception:
-                logger.exception("释放一次性 VM 出错")
+                logger.exception("释放一次性 VM 出错（%s）", _kind)
             try:
-                close = getattr(self.railway, "close", None)
+                close = getattr(_vm_env, "close", None)
                 if callable(close):
                     result = close()
                     if asyncio.iscoroutine(result):
                         await result
             except Exception:
-                logger.exception("收一次性 VM 环境出错")
-            self.railway = None
+                logger.exception("收一次性 VM 环境出错（%s）", _kind)
+        self.vms = {}
+        self.vm_router = None
+        self.railway = None
         self.ssh = None
         if self.extensions is not None:
             # MCP 扩展缓存着会话和 httpx 连接；热重载/停用时要收掉
@@ -1008,6 +1062,8 @@ class MaiWorkApp:
         self.goal_fit = None
         self.env = None
         self.railway = None
+        self.vms = {}
+        self.vm_router = None
         self.outbox = None
         self.card_push = None
         self.idea_mention = None
@@ -1074,6 +1130,13 @@ class MaiWorkApp:
             self._detect_local_capability()
         except Exception:
             logger.exception("配置更新后重判本机执行能力出错")
+        # 可选依赖：探测走的就是本机执行环境，重判完跟着重接一次（工作区根 / 判定都可能变了）
+        try:
+            deps = getattr(self, "optional_deps", None)
+            if deps is not None:
+                deps.rebind(env=getattr(self, "env", None), capability=getattr(self, "capability", None))
+        except Exception:
+            logger.exception("配置更新后重接可选依赖出错")
         self._drop_command_tools_if_stopped(self.tools)
         self._ensure_groups()
         self._refresh_served_sessions()
@@ -1104,6 +1167,11 @@ class MaiWorkApp:
             await self._reconcile_group_space(old_settings, new_settings)
         except Exception:
             logger.exception("群空间热更新出错")
+        # 临时机器开关热生效（设置页标的是「立刻生效」）
+        try:
+            await self._sync_vm_envs()
+        except Exception:
+            logger.exception("临时机器热更新出错")
         logger.info("MaiWork 配置已更新")
 
     async def _reconcile_group_space(self, old_settings: Settings | None, new_settings: Settings) -> None:
@@ -1186,7 +1254,12 @@ class MaiWorkApp:
     # ------------------------------------------------------------------
 
     async def on_message(self, kwargs: dict) -> dict:
-        """钩子本体；async（@ 时钩子里等 Jev ≤ timeout_ms）；永远返回 {"action": "continue"}。"""
+        """钩子本体；async；永远返回 {"action": "continue"}。
+
+        @ 消息**不等 Jev**（判词在后台任务里），钩子只做纯本地快事；`Intake.handle`
+        自己还套了一层 800ms 预算（超了放弃这次的附加工作）。宿主 intake 钩子超时
+        1500ms，连续超时会熔断（熔断期间所有群的钩子都被跳过）。
+        """
         try:
             if not self._started or self._intake is None:
                 return dict(_CONTINUE)
@@ -1205,6 +1278,8 @@ class MaiWorkApp:
         写法出处：reference/maibot_sdk-2.8.1/maibot_sdk/components.py HookHandler
         docstring 里的 BLOCKING 钩子示例（回写用 modified_kwargs，整体替换 kwargs）。
         非服务群零读取（连库都不碰）；任何异常一律 continue。
+        本地附加工作有 `_PLANNER_HOOK_BUDGET_S`（500ms）硬上限：查库拼备忘 / 深拷贝前
+        按 deadline 自检，超了就「不改动消息」（不回传整包，也少一次大帧回程）。
         """
         try:
             if not self._started or self.mentions is None:
@@ -1221,7 +1296,9 @@ class MaiWorkApp:
                     return dict(_CONTINUE)
                 if self._settings is None or not self._settings.is_served(gid):
                     return dict(_CONTINUE)
-            modified = self.mentions.inject(kwargs, group_id=gid)
+            modified = self.mentions.inject(
+                kwargs, group_id=gid, deadline=time.monotonic() + _PLANNER_HOOK_BUDGET_S
+            )
             if isinstance(modified, dict):
                 return {"action": "continue", "modified_kwargs": modified}
             return dict(_CONTINUE)
@@ -1683,15 +1760,34 @@ class MaiWorkApp:
             logger.exception("建 Identity 出错，身份/工作记忆这次跳过")
             return None
 
+    def _selected_vm_env(self) -> Any:
+        """资讯实测等「只要一台」的地方用哪家：开着的里面优先那家（都没建起来 → None）。"""
+        try:
+            kinds = vm_platforms.enabled_kinds(self.get_settings())
+        except Exception:
+            kinds = ("railway",)
+        for kind in kinds:
+            env = self.vms.get(kind)
+            if env is not None:
+                return env
+        return None
+
     def _make_verify_runner(self) -> Any:
         """资讯实测的注入闭包（Feeds 的 verify_runner 契约：async (items, picks, gid, settings)）。
 
-        没建起 RailwayEnv（railway=false / 模块没就位）→ None，Feeds 整段跳过实测；
+        没建起一次性 VM 环境（配置关了 / 没就位）→ None，Feeds 整段跳过实测；
         有 → 真跑 feeds.run_railway_verify（它自己 acquire / 逐条派子 agent / release）。
+        平台是用户在设置里选的那家（railway / freestyle），流程两边通用。
         """
-        env = self.railway
+        env = self._selected_vm_env()
         if env is None:
             return None
+        if self.vm_router is not None:
+            # 申请机器走分派器那把锁：实测和派活不会两家各占一台
+            for _k, _e in self.vm_router.envs.items():
+                if _e is env:
+                    env = self.vm_router.exclusive(_k)
+                    break
 
         async def _runner(items: list, picks: list, gid: str, settings: Any) -> None:
             from .feeds import run_railway_verify
@@ -1802,24 +1898,139 @@ class MaiWorkApp:
             logger.exception("建本机执行环境出错，派活这次跳过")
             return None
 
-    def _make_railway(self) -> Any:
-        """一次性 VM 执行环境（docs/07 §11.1b）：railway=true 才建 + 注册 vm 工具。
+    def _make_vm_envs(self) -> dict[str, Any]:
+        """建**所有开着的**一次性 VM 环境（docs/07 §11.1b / §11.1d）+ 注册 vm 工具。
 
-        - [environments] railway=false / environments 节都没有 / 模块没就位 → None；
-        - 建起来就把 vm_run / vm_put_file / vm_read_file 注册进 tools（worker 角色），
-          get_box 现读「当前占着的那台」（RailwayEnv.current_box，同时只许 1 台）——
-          实测流程 acquire 之后就能看到机器，release 之后自动变 None。
+        2026-10-15 用户定：Railway 和 Freestyle 各自开关、可以同时开（不是二选一），
+        `[environments] vm_platform` 只表示「优先用哪家」。两家合用一套 vm_* 工具：
+        工具拿到的是 `vm_platforms.VMRouter`，按 box.kind 交给对应那家；同一时间两家
+        合计只占一台（coordinator 申请前查），所以 get_box 现读「现在那台」就够了。
+
+        - environments 节都没有 / 都关了 / 模块没就位 / 工厂炸了 → {}（炸了的那家单独跳过）；
+        - 建起来就把 vm_run / vm_put_file / vm_read_file 注册进 tools（worker 角色）。
         """
         settings = self.get_settings()
         env_cfg = getattr(settings, "environments", None)
-        if env_cfg is None or not bool(getattr(env_cfg, "railway", True)):
-            return None
-        factory = self.railway_factory
-        cls = factory if factory is not None else _import_m2_class("environments.railway", "RailwayEnv")
-        if cls is None:
-            return None
+        if env_cfg is None:
+            return {}
+        built: dict[str, Any] = {}
+        factory = self.vm_env_factory
+        for kind in vm_platforms.enabled_kinds(settings):
+            try:
+                if factory is not None:
+                    env = factory(
+                        kind, self.get_settings, settings.data_dir,
+                        store=self.store, transport=self.freestyle_transport,
+                    )
+                else:
+                    env = vm_platforms.make_env(
+                        kind, self.get_settings, settings.data_dir,
+                        store=self.store, transport=self.freestyle_transport,
+                    )
+            except Exception:
+                logger.exception("建 %s 一次性 VM 环境出错，这次不用它", kind)
+                continue
+            if env is not None:
+                built[kind] = env
+        if not built:
+            return {}
+        self.vm_router = vm_platforms.VMRouter(built)
+        router = self.vm_router
         try:
-            env = cls(self.get_settings, settings.data_dir, store=self.store)
+            from .tools_railway import register_vm_tools
+
+            register_vm_tools(self.tools, get_box=lambda: router.current_box, env=router)
+        except Exception:
+            logger.exception("注册 vm 工具出错，一次性 VM 这次跳过")
+            return {}
+        return built
+
+    async def _sync_vm_envs(self) -> None:
+        """配置变了（网页开 / 关临时机器）：把一次性 VM 环境对齐到新开关，不用重载插件。
+
+        - 还开着的那家沿用原对象（手里正占着的机器不丢）；新打开的现建；
+        - 关掉的那家：手里没机器就收掉，正占着机器就先留着（任务还在用），下次再收；
+        - 分派器原地换（vm_* 工具手里拿的就是它）；第一次有平台时才建分派器、注册 vm 工具；
+        - coordinator 的可选平台、资讯实测的 runner 跟着换。
+        """
+        settings = self.get_settings()
+        try:
+            want = tuple(vm_platforms.enabled_kinds(settings))
+        except Exception:
+            logger.exception("读临时机器开关出错，这次不调整")
+            return
+        old = dict(self.vms or {})
+        new: dict[str, Any] = {}
+        for kind in want:
+            if kind in old:
+                new[kind] = old[kind]
+                continue
+            try:
+                factory = self.vm_env_factory
+                maker = factory if factory is not None else vm_platforms.make_env
+                env = maker(
+                    kind, self.get_settings, settings.data_dir,
+                    store=self.store, transport=self.freestyle_transport,
+                )
+            except Exception:
+                logger.exception("建 %s 一次性 VM 环境出错，这次不用它", kind)
+                continue
+            if env is not None:
+                new[kind] = env
+                logger.info("临时机器 %s 已打开（立刻生效）", kind)
+        for kind, env in old.items():
+            if kind in new:
+                continue
+            if getattr(env, "current_box", None) is not None:
+                new[kind] = env  # 正占着机器：任务还在用，先留着
+                logger.info("临时机器 %s 已关，但手里还有一台在用，用完再收", kind)
+                continue
+            try:
+                close = getattr(env, "close", None)
+                if callable(close):
+                    result = close()
+                    if asyncio.iscoroutine(result):
+                        await result
+            except Exception:
+                logger.exception("收一次性 VM 环境出错（%s）", kind)
+            logger.info("临时机器 %s 已关闭（立刻生效）", kind)
+        if set(new) == set(old) and all(new[k] is old[k] for k in new):
+            return
+        self.vms = new
+        self.railway = new.get("railway")
+        if self.vm_router is not None:
+            self.vm_router.set_envs(new)
+        elif new:
+            self.vm_router = vm_platforms.VMRouter(new)
+            router = self.vm_router
+            try:
+                from .tools_railway import register_vm_tools
+
+                register_vm_tools(
+                    self.tools, get_box=lambda: router.current_box, env=router,
+                    local_env=self.env,
+                )
+            except Exception:
+                logger.exception("注册 vm 工具出错（热更新）")
+        co = self.coordinator
+        if co is not None:
+            co._vms = {k: v for k, v in new.items() if v is not None}  # noqa: SLF001
+            co._railway = new.get("railway")  # noqa: SLF001
+            co._vm_router = self.vm_router  # noqa: SLF001
+        if self.feeds is not None and hasattr(self.feeds, "_verify_runner"):
+            try:
+                self.feeds._verify_runner = self._make_verify_runner()  # noqa: SLF001
+            except Exception:
+                logger.exception("换资讯实测 runner 出错")
+
+    def _make_railway(self) -> Any:
+        """（老名字，railway 专用）保留给老调用 / 测试替身：建 railway 那一家。"""
+        factory = self.railway_factory
+        if factory is None:
+            return self._make_vm_envs().get("railway")
+        settings = self.get_settings()
+        try:
+            env = factory(self.get_settings, settings.data_dir, store=self.store)
         except Exception:
             logger.exception("建 RailwayEnv 出错，一次性 VM 实测这次跳过")
             return None
@@ -1868,6 +2079,39 @@ class MaiWorkApp:
         self._ssh_check_ts = now
         self._spawn_bg(ssh.check_all(), name="maiwork-ssh-check")
 
+    def _maybe_check_freestyle(self, now: float) -> None:
+        """每 30 分钟（或平台换了）在后台验一次 Freestyle 密钥，结果给网页「运行状态」。
+
+        `_freestyle_health` 是同步的视图函数，不能在里头发网络请求；所以照
+        `_maybe_check_ssh` 的做法：后台调 `check_key()`（GET /v5/vms?limit=1），
+        把结论写进 kv["freestyle.key_check"]，视图只读缓存。只在 Freestyle 开着时验
+        （没开时一次网络请求都不发）。
+        """
+        env = self.vms.get("freestyle")
+        if env is None or not hasattr(env, "check_key"):
+            return
+        kind = "freestyle"
+        if self._freestyle_check_sig == kind and now - self._freestyle_check_ts < 1800:
+            return
+        self._freestyle_check_sig = kind
+        self._freestyle_check_ts = now
+        self._spawn_bg(self._run_freestyle_check(env), name="maiwork-freestyle-check")
+
+    async def _run_freestyle_check(self, env: Any) -> None:
+        """后台验密钥：结论写 kv（只写「行不行 + 中文说明」，绝不写密钥本身）。"""
+        try:
+            ok, text = await env.check_key()
+        except Exception as e:
+            ok, text = False, f"验密钥时出错：{e}"
+        try:
+            with self.store.tx() as conn:
+                self.store.kv_set(
+                    conn, "freestyle.key_check",
+                    {"ts": _now(), "ok": bool(ok), "text": str(text)[:200]},
+                )
+        except Exception:
+            logger.exception("写 Freestyle 密钥检查结果失败（网页健康项这次看不到）")
+
     def _make_herenow(self) -> Any:
         module_cls = _import_m2_class("herenow", "HereNow")
         if module_cls is None:
@@ -1889,13 +2133,14 @@ class MaiWorkApp:
                 self.store, self.models, self.workers, self.tools, self.tasks,
                 self.goals, self.delivery, self.outbox, self.env, self.profiles,
                 self.get_settings, host=self.host, railway=self.railway,
+                vms=self.vms, vm_router=self.vm_router,
                 group_space=self.group_space, identity=self.identity,
                 capability=self.capability, ssh=self.ssh,
                 # goals-fit R4（2026-10-11）：目标平时进展只进网页 + 可提起清单，不发群。
                 mentions=getattr(self, "mentions", None),
             )
         except TypeError:
-            # 老的 / 测试替身 Coordinator 不认 ssh 参数：不带它再建一次
+            # 老的 / 测试替身 Coordinator 不认 vms / ssh 参数：不带它再建一次
             try:
                 return cls(
                     self.store, self.models, self.workers, self.tools, self.tasks,
@@ -2130,6 +2375,8 @@ class MaiWorkApp:
                 for jev_ep in (getattr(settings, "jev_endpoints", ()) or ()):
                     self._add_secret(out, getattr(jev_ep, "api_key", ""))
                 self._add_secret(out, getattr(getattr(settings, "console", None), "password", ""))
+                # Freestyle 的账号级 API key（2026-10-15）：和模型密钥同级，绝不外发 / 不进日志
+                self._add_secret(out, getattr(getattr(settings, "environments", None), "freestyle_api_key", ""))
                 # 所有端点的 api_key 与高级请求头值都进遮罩（绝不进日志/工具摘要）
                 for ep in (getattr(settings, "endpoints", ()) or ()):
                     self._add_secret(out, getattr(ep, "api_key", ""))
@@ -2588,6 +2835,10 @@ class MaiWorkApp:
             self._maybe_check_ssh(now)
         except Exception:
             logger.exception("检查专用机器出错")
+        try:
+            self._maybe_check_freestyle(now)
+        except Exception:
+            logger.exception("验 Freestyle 密钥出错")
         # 1) 收消息信号写进 profiles
         try:
             signals = self.signals.take()

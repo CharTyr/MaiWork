@@ -20,6 +20,7 @@ import html
 import json
 import logging
 import re
+import time
 from typing import Any, Callable, Optional
 
 from . import clock, group_push
@@ -717,7 +718,12 @@ class Mentions:
     # maisaka.planner.before_request 钩子
     # ------------------------------------------------------------------
 
-    def inject(self, kwargs: dict, *, group_id: str = "") -> Optional[dict]:
+    @staticmethod
+    def _budget_used(deadline: float | None) -> bool:
+        """钩子预算用完了没有。`deadline` 是 time.monotonic() 的绝对时刻；没给 = 不限。"""
+        return deadline is not None and time.monotonic() >= float(deadline)
+
+    def inject(self, kwargs: dict, *, group_id: str = "", deadline: float | None = None) -> Optional[dict]:
         """追加到第一个 SystemMessageItem 最后一个 text part。
 
         group_id 由已验证服务群的 planner 钩子传入；不再按同一个 session_id
@@ -728,9 +734,17 @@ class Mentions:
         - 已经含固定标题（本插件或其他实例加过）→ None。
         - 追加 "\n\n" + 备忘文本；保留其他所有键（item_schema_version 等）。
         - 深拷贝后返回整个新 kwargs；任何异常/格式不符 → None。
+        - `deadline` 是调用方给的预算（time.monotonic() 的绝对时刻，planner 钩子 500ms）：
+          查库拼备忘前、深拷贝前各查一次；超了就**不改动消息**（返回 None）并记一条中文
+          日志。2026-10 线上实测：mentions 钩子（宿主超时 1000ms）4 天超时 3 次，宿主连续
+          3 次失败熔断 60 秒，期间所有群的备忘都注入不了——钩子里宁可少做一点。
         """
         try:
             if not isinstance(kwargs, dict):
+                return None
+            if self._budget_used(deadline):
+                logger.info("planner 备忘钩子的本地工作超过预算，这次不改动消息（会话 %s）",
+                            str(kwargs.get("session_id") or "?"))
                 return None
             items = kwargs.get("items")
             if not isinstance(items, list):
@@ -770,6 +784,10 @@ class Mentions:
                     return None
             memo = self._memo_with_topics(gid, kwargs)
             if memo is None:
+                return None
+            # 拼备忘本身可能已经吃掉了预算（库慢）：这时候不再深拷贝整包、也不回传
+            if self._budget_used(deadline):
+                logger.info("planner 备忘钩子的本地工作超过预算，这次不改动消息（群 %s）", gid)
                 return None
 
             # 深拷贝整个 kwargs（不动原 dict），在第一个 SystemMessageItem 里追加

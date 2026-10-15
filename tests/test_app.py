@@ -179,10 +179,14 @@ class TestOnMessage:
         try:
             out = await app.on_message(hook_message(group_id=G1, ts=1_790_000_123.0))
             assert out == {"action": "continue"}
+            # 钩子内部有预算包装，会让出一次事件循环；后台循环可能已经先把信号取走
+            # 并落进 profiles（remember_session）。两条路都算「服务群消息记到了」。
             taken = app.signals.take()
-            assert G1 in taken
-            assert taken[G1].session_id == "sess-1"
-            assert taken[G1].last_ts == 1_790_000_123.0
+            if G1 in taken:
+                assert taken[G1].session_id == "sess-1"
+                assert taken[G1].last_ts == 1_790_000_123.0
+            else:
+                assert (G1, "sess-1", 1_790_000_123.0) in getattr(app.profiles, "remembered", [])
         finally:
             await app.stop()
 
@@ -1616,6 +1620,144 @@ class TestRailwayWiring:
             keys = {h["key"]: h for h in settings_view(app)["health"]}
             assert "railway" in keys
             assert keys["railway"]["state"] == "off"
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_freestyle_platform_builds_freestyle_env(self, tmp_path: Path) -> None:
+        """只开 Freestyle + 密钥：建 FreestyleEnv（不是 RailwayEnv）、vm 工具齐、
+        verify_runner 非 None、健康项是 freestyle。全程 MockTransport，不发真请求。"""
+        import httpx
+
+        from CharTyr_MaiWork.maiwork.environments.freestyle import FreestyleEnv
+        from CharTyr_MaiWork.maiwork.environments.railway import RailwayEnv
+        from CharTyr_MaiWork.maiwork.console.views import settings_view
+
+        captured, factory = _capture_feeds_kwargs()
+        raw = _raw(tmp_path / "data")
+        raw["environments"] = {
+            "railway": False,           # 只开 Freestyle（两家各自开关）
+            "freestyle": True,
+            "vm_platform": "freestyle",
+            "freestyle_api_key": "fs-app-ascii-key",
+        }
+        app = _app(tmp_path, raw=raw)
+        app.feeds_factory = factory
+        app.freestyle_transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"vms": [], "totalCount": 0})
+        )
+        await app.start()
+        try:
+            assert set(app.vms) == {"freestyle"}
+            assert isinstance(app.vms["freestyle"], FreestyleEnv)
+            assert not isinstance(app.vms["freestyle"], RailwayEnv)
+            assert app.railway is None
+            assert callable(captured.get("verify_runner"))
+            names = {s["function"]["name"] for s in app.tools.specs("worker")}
+            assert {"vm_run", "vm_put_file", "vm_read_file", "vm_fetch_file"} <= names
+            keys = {h["key"]: h for h in settings_view(app)["health"]}
+            assert "freestyle" in keys and "railway" not in keys
+        finally:
+            await app.stop()
+        assert app.vms == {}  # stop 收干净
+
+    @pytest.mark.asyncio
+    async def test_both_platforms_build_both_envs(self, tmp_path: Path) -> None:
+        """两家都开（2026-10-15 改为额外添加）：两个环境都建、vm 工具交给分派器、健康项两条、
+        优先那家排前；coordinator 拿到分派器。"""
+        import httpx
+
+        from CharTyr_MaiWork.maiwork.console.views import settings_view
+        from CharTyr_MaiWork.maiwork.environments import vm_platforms
+
+        raw = _raw(tmp_path / "data")
+        raw["environments"] = {"freestyle": True, "vm_platform": "freestyle", "freestyle_api_key": "fs-k"}
+        app = _app(tmp_path, raw=raw)
+        app.freestyle_transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"vms": [], "totalCount": 0})
+        )
+        await app.start()
+        try:
+            assert set(app.vms) == {"railway", "freestyle"}
+            assert isinstance(app.vm_router, vm_platforms.VMRouter)
+            vm_keys = [h["key"] for h in settings_view(app)["health"] if h["key"] in ("railway", "freestyle")]
+            assert vm_keys == ["freestyle", "railway"]
+            if app.coordinator is not None:
+                assert getattr(app.coordinator, "_vm_router", None) is app.vm_router
+        finally:
+            await app.stop()
+        assert app.vms == {} and app.vm_router is None
+
+    @pytest.mark.asyncio
+    async def test_vm_switches_apply_without_reload(self, tmp_path: Path) -> None:
+        """网页上开 / 关临时机器（写配置 → update_config）要立刻生效，不用重载插件
+        （设置页标的是「立刻生效」；以前 app.vms 只在启动时建一次）。"""
+        import copy
+
+        import httpx
+
+        raw = _raw(tmp_path / "data")
+        raw["environments"] = {"railway": False}
+        app = _app(tmp_path, raw=raw)
+        app.freestyle_transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"vms": [], "totalCount": 0})
+        )
+        await app.start()
+        try:
+            assert app.vms == {} and app.vm_router is None
+            raw2 = copy.deepcopy(raw)
+            raw2["environments"] = {"railway": False, "freestyle": True, "freestyle_api_key": "fs-k"}
+            await app.update_config(raw2)
+            assert set(app.vms) == {"freestyle"}
+            router = app.vm_router
+            assert router is not None
+            assert app.tools.get("vm_run", "worker") is not None
+            co = app.coordinator
+            if co is not None:
+                assert co._oneshot_kinds() == ("freestyle",)  # noqa: SLF001
+                assert co._vm_router is router  # noqa: SLF001
+            # 再把 railway 也打开：分派器还是同一个（vm 工具手里拿的那个），两家都在
+            raw3 = copy.deepcopy(raw2)
+            raw3["environments"]["railway"] = True
+            await app.update_config(raw3)
+            assert set(app.vms) == {"freestyle", "railway"}
+            assert app.vm_router is router
+            if co is not None:
+                assert set(co._oneshot_kinds()) == {"freestyle", "railway"}  # noqa: SLF001
+            # 关掉 freestyle：从可选里消失
+            raw4 = copy.deepcopy(raw3)
+            raw4["environments"]["freestyle"] = False
+            await app.update_config(raw4)
+            assert set(app.vms) == {"railway"}
+            if co is not None:
+                assert co._oneshot_kinds() == ("railway",)  # noqa: SLF001
+        finally:
+            await app.stop()
+        assert app.vms == {} and app.vm_router is None
+
+    @pytest.mark.asyncio
+    async def test_freestyle_without_key_builds_but_not_offered(self, tmp_path: Path) -> None:
+        """选了 freestyle 但没填密钥：环境建起来（好让健康项报「还没填密钥」），
+        但不作为可选项给主模型（不能假装能拿到机器）。"""
+        import httpx
+
+        from CharTyr_MaiWork.maiwork.console.views import settings_view
+
+        raw = _raw(tmp_path / "data")
+        raw["environments"] = {"vm_platform": "freestyle", "freestyle": True, "railway": False}
+        app = _app(tmp_path, raw=raw)
+        app.freestyle_transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"vms": [], "totalCount": 0})
+        )
+        await app.start()
+        try:
+            assert set(app.vms) == {"freestyle"}
+            coord = app.coordinator
+            assert coord is not None
+            assert coord._oneshot_kinds() == ()  # noqa: SLF001
+            keys = {h["key"]: h for h in settings_view(app)["health"]}
+            assert keys["freestyle"]["state"] == "warn"
+            assert "密钥" in keys["freestyle"]["text"]
         finally:
             await app.stop()
 

@@ -230,8 +230,13 @@ def _make_intake(settings, *, models=None, jev=None, store=None, approvals=None,
 
 
 async def _drain(spawned) -> None:
-    for coro in list(spawned):
-        await coro
+    """把钩子 spawn 出来的后台协程跑完（后台里再 spawn 出来的也跑，直到清空）。
+
+    2026-10 起 Jev 判词在后台：钩子只登记 `_judge_at`，判完才回落快速判断 /
+    慢路径——所以这里要抽干，不能只看第一层。
+    """
+    while spawned:
+        await spawned.pop(0)
 
 
 # ----------------------------------------------------------------------
@@ -606,10 +611,11 @@ class TestIntakeRouting:
         reply = _one("prepare", 0.9, "整理成一份文档", why="他把这几天的记录要整理成文档")
         models = _FakeModels(replies=[reply])
         jev = _Jev({"kind": ("prepare", 0.5, 0.65)})
-        intake, _spawned = _make_intake(settings, models=models, jev=jev, approvals=ap, mentions=mn)
+        intake, spawned = _make_intake(settings, models=models, jev=jev, approvals=ap, mentions=mn)
         await intake.handle(_at_kwargs("帮我把这几天的记录整理成一份文档", mid="555"))
         assert ap.created == []            # 钩子里不建（后台还没跑）
         assert intake.slow_queue == []     # 也没写慢路径
+        await _drain(spawned)              # 后台问 Jev：判不准 → 回落快速判断
         await intake.quick_judge.join()
         assert len(ap.created) == 1
         assert ap.created[0][1]["via"] == "群里 @ · 快速判断：他把这几天的记录要整理成文档"
@@ -626,8 +632,9 @@ class TestIntakeRouting:
         ap = _Approvals()
         models = _FakeModels(replies=[_one("prepare", 0.9, "整理成一份文档", why="很" * 100)])
         jev = _Jev({"kind": ("prepare", 0.5, 0.65)})
-        intake, _ = _make_intake(settings, models=models, jev=jev, approvals=ap)
+        intake, spawned = _make_intake(settings, models=models, jev=jev, approvals=ap)
         await intake.handle(_at_kwargs("帮我把这几天的记录整理成一份文档", mid="556"))
+        await _drain(spawned)
         await intake.quick_judge.join()
         via = ap.created[0][1]["via"]
         assert len(via) <= 60
@@ -640,8 +647,9 @@ class TestIntakeRouting:
         ap = _Approvals()
         models = _FakeModels(replies=[_one("goal", 0.9, "", why="")])
         jev = _Jev({"kind": ("goal", 0.5, 0.5)})
-        intake, _ = _make_intake(settings, models=models, jev=jev, approvals=ap)
+        intake, spawned = _make_intake(settings, models=models, jev=jev, approvals=ap)
         await intake.handle(_at_kwargs("帮我把这几天的记录整理成一份文档", mid="557"))
+        await _drain(spawned)
         await intake.quick_judge.join()
         assert ap.created[0][1]["via"] == "群里 @ · 快速判断是「帮忙盯着或做成」"
         await intake.quick_judge.close()
@@ -652,9 +660,10 @@ class TestIntakeRouting:
         ap = _Approvals()
         models = _FakeModels(replies=[_one("none", 0.9)])
         jev = _Jev(None, available=False)
-        intake, _ = _make_intake(settings, models=models, jev=jev, approvals=ap)
+        intake, spawned = _make_intake(settings, models=models, jev=jev, approvals=ap)
         await intake.handle(_at_kwargs())
         assert jev.calls == []
+        await _drain(spawned)
         await intake.quick_judge.join()
         assert len(models.calls) == 1 and ap.created == []
         assert intake.slow_queue == []
@@ -664,9 +673,9 @@ class TestIntakeRouting:
     async def test_quick_judge_disabled_goes_slow(self) -> None:
         settings = _settings(enabled=False)
         models = _FakeModels(replies=[_one("none", 0.9)])
-        intake, _ = _make_intake(settings, models=models)
+        intake, spawned = _make_intake(settings, models=models)
         await intake.handle(_at_kwargs("帮我把记录整理成文档", mid="556"))
-        await _drain([])
+        await _drain(spawned)
         assert models.calls == []
         rows = intake.slow_queue
         assert len(rows) == 1 and rows[0]["message_id"] == "556"
@@ -675,8 +684,9 @@ class TestIntakeRouting:
     async def test_keyword_filter_on_banter_skipped_entirely(self) -> None:
         settings = _settings(keyword_filter=True)
         models = _FakeModels(replies=[_one("none", 0.9)])
-        intake, _ = _make_intake(settings, models=models)
+        intake, spawned = _make_intake(settings, models=models)
         await intake.handle(_at_kwargs("宝宝你看我给你买的鞋", mid="557"))
+        await _drain(spawned)              # 后台判词 → 没有请求词 → 当闲聊
         assert models.calls == []
         assert intake.slow_queue == []     # 不写 pending_asks：读群时照样能看见这条
         await intake.quick_judge.close()
@@ -685,8 +695,9 @@ class TestIntakeRouting:
     async def test_keyword_filter_on_with_cue_still_judged(self) -> None:
         settings = _settings(keyword_filter=True)
         models = _FakeModels(replies=[_one("none", 0.9)])
-        intake, _ = _make_intake(settings, models=models)
+        intake, spawned = _make_intake(settings, models=models)
         await intake.handle(_at_kwargs("帮我搞个不要钱的k3过来", mid="558"))
+        await _drain(spawned)
         await intake.quick_judge.join()
         assert len(models.calls) == 1
         await intake.quick_judge.close()
@@ -695,8 +706,9 @@ class TestIntakeRouting:
     async def test_keyword_filter_off_banter_still_judged(self) -> None:
         settings = _settings(keyword_filter=False)
         models = _FakeModels(replies=[_one("none", 0.9)])
-        intake, _ = _make_intake(settings, models=models)
+        intake, spawned = _make_intake(settings, models=models)
         await intake.handle(_at_kwargs("宝宝你看我给你买的鞋", mid="559"))
+        await _drain(spawned)
         await intake.quick_judge.join()
         assert len(models.calls) == 1
         await intake.quick_judge.close()
@@ -706,8 +718,9 @@ class TestIntakeRouting:
         store = _store(tmp_path)
         settings = _settings()
         models = _FakeModels(replies=["这不是 JSON"])
-        intake, _ = _make_intake(settings, models=models, store=store)
+        intake, spawned = _make_intake(settings, models=models, store=store)
         await intake.handle(_at_kwargs("帮我整理成文档", mid="600"))
+        await _drain(spawned)
         await intake.quick_judge.join()
         rows = intake.slow_queue
         assert len(rows) == 1
@@ -720,11 +733,13 @@ class TestIntakeRouting:
         store = _store(tmp_path)
         settings = _settings(daily_max=1)
         models = _FakeModels(replies=[_one("none", 0.9)])
-        intake, _ = _make_intake(settings, models=models, store=store)
+        intake, spawned = _make_intake(settings, models=models, store=store)
         await intake.handle(_at_kwargs("帮我整理成文档", mid="601"))
+        await _drain(spawned)
         await intake.quick_judge.join()
         assert len(models.calls) == 1
         await intake.handle(_at_kwargs("帮我查一下这个", mid="602"))
+        await _drain(spawned)
         await intake.quick_judge.join()
         assert len(models.calls) == 1
         rows = {r["message_id"]: r for r in intake.slow_queue}
@@ -735,13 +750,14 @@ class TestIntakeRouting:
     async def test_hook_returns_quickly_and_never_awaits_model(self) -> None:
         settings = _settings()
         models = _FakeModels(replies=[_one("none", 0.9)], delay_s=0.5)
-        intake, _ = _make_intake(settings, models=models)
+        intake, spawned = _make_intake(settings, models=models)
         start = time.monotonic()
         out = await intake.handle(_at_kwargs("帮我整理成文档", mid="603"))
         elapsed = time.monotonic() - start
         assert out == {"action": "continue"}
         assert elapsed < 0.3
         assert models.calls == []          # 模型调用在后台，钩子不等
+        await _drain(spawned)
         await intake.quick_judge.join()
         assert len(models.calls) == 1
         await intake.quick_judge.close()
@@ -750,11 +766,12 @@ class TestIntakeRouting:
     async def test_ring_records_bot_and_plain_messages_as_context(self) -> None:
         settings = _settings()
         models = _FakeModels(replies=[_one("none", 0.9)])
-        intake, _ = _make_intake(settings, models=models, bot_qq="424242")
+        intake, spawned = _make_intake(settings, models=models, bot_qq="424242")
         # 机器人自己发的一条 + 群友的一句闲聊，都该出现在给快速判断的上下文里
         await intake.handle(hook_message(G1, user_id="424242", text="我昨天说过活动结束了", message_id="c1"))
         await intake.handle(hook_message(G1, text="那我们周末干什么", message_id="c2"))
         await intake.handle(_at_kwargs("帮我把这两天的安排整理成一份计划", mid="604"))
+        await _drain(spawned)
         await intake.quick_judge.join()
         text = models.calls[0]["messages"][-1]["content"]
         assert "MaiBot: 我昨天说过活动结束了" in text
@@ -765,10 +782,11 @@ class TestIntakeRouting:
     async def test_ring_keeps_only_last_eight(self) -> None:
         settings = _settings()
         models = _FakeModels(replies=[_one("none", 0.9)])
-        intake, _ = _make_intake(settings, models=models)
+        intake, spawned = _make_intake(settings, models=models)
         for i in range(10):
             await intake.handle(hook_message(G1, text=f"闲聊第{i}条", message_id=f"r{i}"))
         await intake.handle(_at_kwargs("帮我整理成文档", mid="605"))
+        await _drain(spawned)
         await intake.quick_judge.join()
         text = models.calls[0]["messages"][-1]["content"]
         assert "闲聊第9条" in text
@@ -786,10 +804,11 @@ class TestJevContext:
     async def test_state_has_context_with_user_last(self) -> None:
         settings = _settings()
         jev = _Jev({"kind": ("none", 0.9, 0.9)})
-        intake, _ = _make_intake(settings, jev=jev, bot_qq="424242")
+        intake, spawned = _make_intake(settings, jev=jev, bot_qq="424242")
         await intake.handle(hook_message(G1, user_id="424242", text="机器人说过的话", message_id="c1"))
         await intake.handle(hook_message(G1, text="群友闲聊一句", message_id="c2"))
         await intake.handle(_at_kwargs("帮我整理一下", mid="c3"))
+        await _drain(spawned)               # 判词在后台，抽干后才看得到 Jev 请求
         msgs = jev.calls[0]["state"]["messages"]
         assert [m["speaker"] for m in msgs] == ["MaiBot", "群友", "USER"]
         assert msgs[-1]["text"] == "帮我整理一下"
@@ -801,10 +820,11 @@ class TestJevContext:
     async def test_state_keeps_only_last_four_context_messages(self) -> None:
         settings = _settings()
         jev = _Jev({"kind": ("none", 0.9, 0.9)})
-        intake, _ = _make_intake(settings, jev=jev)
+        intake, spawned = _make_intake(settings, jev=jev)
         for i in range(6):
             await intake.handle(hook_message(G1, text=f"第{i}句", message_id=f"c{i}"))
         await intake.handle(_at_kwargs("帮我整理一下", mid="c9"))
+        await _drain(spawned)
         msgs = jev.calls[0]["state"]["messages"]
         assert [m["speaker"] for m in msgs] == ["群友"] * 4 + ["USER"]
         assert msgs[0]["text"] == "第2句" and msgs[3]["text"] == "第5句"
@@ -813,10 +833,11 @@ class TestJevContext:
     async def test_state_drops_oldest_context_over_800_chars(self) -> None:
         settings = _settings()
         jev = _Jev({"kind": ("none", 0.9, 0.9)})
-        intake, _ = _make_intake(settings, jev=jev)
+        intake, spawned = _make_intake(settings, jev=jev)
         for i in range(4):
             await intake.handle(hook_message(G1, text="甲" * 120, message_id=f"c{i}"))
         await intake.handle(_at_kwargs("乙" * 500, mid="c9"))
+        await _drain(spawned)
         msgs = jev.calls[0]["state"]["messages"]
         assert msgs[-1]["speaker"] == "USER" and len(msgs[-1]["text"]) == 500
         assert sum(len(m["text"]) for m in msgs) <= 800
@@ -826,8 +847,9 @@ class TestJevContext:
     async def test_state_text_truncated_to_500(self) -> None:
         settings = _settings()
         jev = _Jev({"kind": ("none", 0.9, 0.9)})
-        intake, _ = _make_intake(settings, jev=jev)
+        intake, spawned = _make_intake(settings, jev=jev)
         await intake.handle(_at_kwargs("长" * 800, mid="c1"))
+        await _drain(spawned)
         msgs = jev.calls[0]["state"]["messages"]
         assert len(msgs) == 1
         assert msgs[0]["speaker"] == "USER" and len(msgs[0]["text"]) == 500

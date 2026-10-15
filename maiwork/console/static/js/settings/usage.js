@@ -75,7 +75,32 @@ export function usagePage() {
     <div class="ubars" style="--n:${list.length}">${bars}</div>
     <p class="fine"><span class="lg lg-m"></span>主模型 <span class="lg lg-w"></span>子 agent</p>
     <label class="u-pick"><span>选择日期</span><input type="date" class="u-date" value="${esc(u.sel || "")}" min="${esc((list[0] || {}).day || "")}" max="${esc((list[list.length - 1] || {}).day || "")}" /></label>
+    ${imagegenBlock(u.hist.imagegen)}
     ${usageDay(u)}`;
+}
+
+// 生图用量（2026-10-15）：后端 GET /api/usage/history 顶层 imagegen；没配生图模型且从没用过就不显示
+function imagegenBlock(g) {
+  if (!g) return "";
+  const t = g.total || {};
+  if (!g.configured && !t.calls) return "";
+  const w = g.week || {};
+  const d = g.today || {};
+  const lf = g.last_failure;
+  const when = (ts) => {
+    const x = new Date(ts * 1000);
+    return `${x.getMonth() + 1}/${x.getDate()} ${String(x.getHours()).padStart(2, "0")}:${String(x.getMinutes()).padStart(2, "0")}`;
+  };
+  return `
+    <h2 class="h-sub">生图${tip("子 agent 调用生图模型画图的次数和张数。生图按张计费，费用请以服务商账单为准。")}</h2>
+    <p class="h-meta">${g.configured ? `使用模型：<span class="mono">${esc(g.model || g.model_id || "")}</span>` : "目前没有配置生图模型（可在「模型」里添加）"}</p>
+    <div class="usage usage-4">
+      <div><b>${d.images || 0}</b><span>今日张数（调用 ${d.calls || 0} 次）</span></div>
+      <div><b>${w.images || 0}</b><span>近 7 天张数</span></div>
+      <div><b>${w.failed || 0}</b><span>近 7 天失败</span></div>
+      <div><b>${t.images || 0}</b><span>累计张数</span></div>
+    </div>
+    ${lf ? `<p class="fine">最近一次失败${lf.ts ? `（${esc(when(lf.ts))}）` : ""}：${esc(lf.error || "原因未知")}</p>` : ""}`;
 }
 
 function usageDay(u) {

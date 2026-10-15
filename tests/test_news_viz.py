@@ -25,6 +25,15 @@ GOOD = """<style>.bar{height:8px;background:var(--accent)}</style>
 <p>43%（原 37%）<b>+6</b></p><p title="SWE-Atlas-QnA 58%">58%</p>
 <p>输入 / 输出 $2 / $10</p><p>价格 −50%</p><p>9 月 22 日</p>
 <div class="bar" style="width:43%"></div></div>"""
+# 新做法（2026-10-15）：子 agent 交零件规格
+GOOD_SPEC = {
+    "title": "GPT-6 Sol 跑分",
+    "blocks": [
+        {"type": "compare", "unit": "%", "items": [{"label": "Sol", "value": 43}, {"label": "上一代", "value": 37}]},
+        {"type": "stat", "value": 2, "unit": "$", "label": "输入每百万 token", "change": "−50%"},
+        {"type": "takeaway", "text": "Terminal-Bench 涨了 +6 分"},
+    ],
+}
 
 
 # ----------------------------------------------------------------------
@@ -129,14 +138,14 @@ class FakeModels:
 
 
 class FakeWorkers:
-    def __init__(self, html, ok=True):
-        self.html = html
+    def __init__(self, data, ok=True):
+        self.data = data
         self.ok = ok
         self.briefs = []
 
     async def run(self, brief, **kw):
         self.briefs.append((brief, kw))
-        return SimpleNamespace(ok=self.ok, data={"html": self.html}, error="", summary="")
+        return SimpleNamespace(ok=self.ok, data=self.data, error="", summary="")
 
 
 class FakeTools:
@@ -151,10 +160,10 @@ class FakeTools:
         return SimpleNamespace(ok=self.ok, output=self.text, error="" if self.ok else "打不开")
 
 
-def _viz(s, *, pick=0, html=GOOD, per_day=3, tools=None, workers=None):
+def _viz(s, *, pick=0, spec=GOOD_SPEC, per_day=3, tools=None, workers=None):
     settings = SimpleNamespace(feeds=SimpleNamespace(viz_per_day=per_day), is_served=lambda g: True)
     models = FakeModels({"pick": pick, "why": "有对比数字"})
-    workers = workers or FakeWorkers(html)
+    workers = workers or FakeWorkers({"spec": spec, "why": ""})
     tools = tools or FakeTools()
     return nv.NewsViz(s, models, workers, tools, lambda: settings), models, workers, tools
 
@@ -171,8 +180,13 @@ def test_happy_path_makes_viz_and_view_flag(tmp_path) -> None:
     assert SOURCE in brief and kw["tools"] == []
     assert nv.status_of(s, [a, b]) == {a: "ok", b: "skip"}
     doc = nv.html_for(s, G, a)
-    assert doc and "Content-Security-Policy" in doc
+    assert doc and "Content-Security-Policy" in doc and "<script" not in doc
     assert nv.html_for(s, "999", a) is None  # 别的群拿不到
+    frag = nv.frag_for(s, G, a)
+    assert frag.startswith('<div class="vs">') and "Sol" in frag
+    assert nv.frag_for(s, "999", a) is None
+    assert nv.kinds_of(s, [a, b]) == {a: "spec"}
+    assert "零件" in brief and "takeaway" in brief
     assert not v.has_work(G, NOW)  # 都处理过了
 
 
@@ -185,13 +199,58 @@ def test_model_picks_none_marks_all_skip(tmp_path) -> None:
     assert workers.briefs == []
 
 
-def test_bad_html_rejected_with_reason(tmp_path) -> None:
+def test_made_up_number_in_spec_rejected_with_reason(tmp_path) -> None:
     s = _store(tmp_path)
     a = _item(s)
-    v, *_ = _viz(s, html=GOOD.replace("58%", "61%"))
+    bad = json.loads(json.dumps(GOOD_SPEC))
+    bad["blocks"][0]["items"][0]["value"] = 61
+    v, *_ = _viz(s, spec=bad)
     asyncio.run(v.run(G, now=NOW))
     assert nv.status_of(s, [a]) == {a: "rejected"}
     assert nv.html_for(s, G, a) is None
+    reason = s.read().execute("SELECT reason FROM news_viz WHERE item_id=?", (a,)).fetchone()["reason"]
+    assert "61" in reason
+
+
+def test_spec_outside_catalog_rejected(tmp_path) -> None:
+    """没有自由 HTML 的后门：零件清单外的东西整张不要。"""
+    s = _store(tmp_path)
+    a = _item(s)
+    v, *_ = _viz(s, spec={"blocks": [{"type": "html", "html": "<b>43%</b>"}]})
+    asyncio.run(v.run(G, now=NOW))
+    assert nv.status_of(s, [a]) == {a: "rejected"}
+
+
+def test_legacy_html_answer_not_accepted(tmp_path) -> None:
+    s = _store(tmp_path)
+    a = _item(s)
+    v, *_ = _viz(s, workers=FakeWorkers({"html": GOOD}))
+    asyncio.run(v.run(G, now=NOW))
+    assert nv.status_of(s, [a]) == {a: "failed"}
+
+
+def test_null_spec_means_plain_text(tmp_path) -> None:
+    """子 agent 判断不适合画 → skip（纯文字），不算失败、不占当天名额。"""
+    s = _store(tmp_path)
+    a = _item(s)
+    v, *_ = _viz(s, workers=FakeWorkers({"spec": None, "why": "没有数字"}))
+    asyncio.run(v.run(G, now=NOW))
+    assert nv.status_of(s, [a]) == {a: "skip"}
+    assert v.made_today(G, NOW) == 0
+
+
+def test_old_html_rows_still_display(tmp_path) -> None:
+    """老的 HTML 图解照旧：整页带 CSP + 报高度脚本，没有片段（网页走沙箱 iframe）。"""
+    s = _store(tmp_path)
+    a = _item(s)
+    with s.tx() as conn:
+        conn.execute(
+            "INSERT INTO news_viz (item_id, group_id, status, html, reason, created, updated)"
+            " VALUES (?, ?, 'ok', ?, '', ?, ?)", (a, G, GOOD, NOW, NOW))
+    doc = nv.html_for(s, G, a)
+    assert GOOD in doc and doc.count("<script") == 1
+    assert nv.frag_for(s, G, a) is None
+    assert nv.kinds_of(s, [a]) == {a: "html"}
 
 
 def test_source_unreachable_fails(tmp_path) -> None:
@@ -293,17 +352,30 @@ def test_feeds_view_flags_viz(tmp_path) -> None:
         items = {it["id"]: it for bt in feeds.news_view(G) for it in bt["items"]}
     finally:
         fm.clock.now = orig
-    assert items[a]["viz"] is True
+    assert items[a]["viz"] == "html"  # 老图解：前端放沙箱 iframe
     assert items[b]["viz"] is False
 
 
 def test_brief_prefers_one_glance_over_interaction():
-    """2026-09-29 用户定：图解以一眼能看完为主，内容实在放不下才做交互（标签页 / 展开）。
-    群里的资讯卡片只截图解最上面一段，藏在别的标签页 / 折叠里的内容卡片上看不到。"""
+    """2026-09-29 用户定：图解以一眼能看完为主，内容实在放不下才用标签页。
+    群里的资讯卡片只截第一屏，藏在别的标签页里的内容卡片上看不到。
+    2026-10-15：改交零件规格，不适合画就交 null（纯文字），不许写 HTML。"""
     from CharTyr_MaiWork.maiwork.news_viz import NewsViz
 
     b = NewsViz._brief({"title": "t", "body": "b", "summary": ""}, "原文")
     assert "一眼能看完" in b
-    i_glance, i_interact = b.index("一眼能看完"), b.index("单选框")
-    assert i_glance < i_interact and "放不下" in b[i_glance:i_interact + 80]
-    assert "480" in b  # 高度建议：卡片截图只截上面一段
+    i_glance, i_tabs = b.index("一眼能看完"), b.index("tabs")
+    assert i_glance < i_tabs and "放不下" in b[i_glance:i_tabs + 80]
+    assert '"spec": null' in b and "宁可不画" in b
+    assert "<script" not in b and "HTML 片段" not in b
+
+
+def test_numbers_glued_to_chinese_are_found() -> None:
+    """线上 2026-10-15 巡检：原文「压到85%」「售价42元」里紧贴汉字的数字以前取不到
+    （Python 的 \\w 含汉字），图解照写 85 就被误判「原文里找不到」整张扔掉。"""
+    assert nv.numbers_in("压到85%，售价42元，飙到11.73A") == [85.0, 42.0, 11.73]
+    ok, why = nv.check_numbers(["85%", "42 元", "11.73"], "功耗压到85%，售价42元，电流飙到11.73A")
+    assert ok, why
+    # 英文 / 数字串里的仍不拆出来（abc123、v2.5 里的 5 不算独立数字）
+    assert nv.numbers_in("abc123") == []
+    assert nv.numbers_in("1.2.3") == [1.2]

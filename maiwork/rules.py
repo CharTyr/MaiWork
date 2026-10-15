@@ -312,6 +312,20 @@ def _check_workspace_root(value: Any) -> str:
     return s
 
 
+# Freestyle 的镜像：官方 slug（freestyle/ubuntu-sm）或用户自己拍的快照（sh-<uuid>）。
+_FREESTYLE_SNAPSHOT_RE = re.compile(r"^(?:freestyle/[a-z0-9][a-z0-9-]{0,62}|[a-z0-9][a-z0-9-]{0,62})$")
+
+
+def _check_freestyle_snapshot(value: Any) -> str:
+    s = str(value or "").strip()
+    if not _FREESTYLE_SNAPSHOT_RE.match(s):
+        raise ValueError(
+            "机器规格要填 Freestyle 的镜像名：官方的如 freestyle/ubuntu-sm（2 核 4G）、"
+            "freestyle/ubuntu（4 核 8G，免费档上限），或你自己拍的快照（sh- 开头）"
+        )
+    return s
+
+
 def _check_local_mode(value: Any) -> str:
     s = str(value or "").strip().lower()
     if s == "direct":
@@ -394,7 +408,8 @@ def _validate_typed(spec: dict[str, Any], value: Any) -> Any:
             raise ValueError(f"{label}要填字符串")
         return value
     if ftype == "enum":
-        options = [str(o) for o in spec.get("options") or ()]
+        # options 可以是纯字符串，也可以是 {"value","label"}（网页下拉显示 label）
+        options = [str(o.get("value") if isinstance(o, dict) else o) for o in spec.get("options") or ()]
         s = str(value or "").strip()
         if s not in options:
             raise ValueError(f"{label}只能是：{'、'.join(options)}")
@@ -433,6 +448,8 @@ _ADVANCED_KEYS = frozenset({
     "environments.workspace_root", "environments.memory_max", "environments.runtime_max_sec",
     "environments.local_mode", "environments.run_as", "environments.max_parallel",
     "environments.command_timeout_s", "environments.railway_daily_max",
+    "environments.freestyle_snapshot", "environments.freestyle_ttl_minutes",
+    "environments.freestyle_idle_minutes", "environments.freestyle_daily_max",
     "environments.verify_per_round", "environments.verify_minutes",
     "profile.batch_messages", "profile.max_interval_hours", "profile.backfill_days",
     "profile.backfill_max_messages", "profile.weekly_day", "profile.read_interval_minutes",
@@ -574,7 +591,19 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     _F("console.maibot_webui_url", "MaiBot 网址", "填写后，更新提示中可直接跳转，例如 http://127.0.0.1:8001。", "str", check=_check_public_url),
 
     # ---- environments ----
-    _F("environments.railway", "临时机器", "允许使用 Railway 一次性机器。", "bool"),
+    _F("environments.railway", "Railway 临时机器", "允许使用 Railway 一次性机器（免密钥、匿名，用完等它自己过期）。", "bool"),
+    _F("environments.freestyle", "Freestyle 临时机器",
+       "允许使用 Freestyle 一次性机器（要自己注册并填下面的密钥，用完能主动销毁）。可以和 Railway 同时开，互为备用。", "bool"),
+    _F("environments.vm_platform", "优先用哪家临时机器",
+       "Railway 和 Freestyle 都开着时先用哪家；先用的那家拿不到（故障、当天用完、正被占着）会自动换另一家。"
+       "只开了一家时这一项不起作用。",
+       "enum", options=[
+           {"value": "railway", "label": "Railway（免密钥、匿名）"},
+           {"value": "freestyle", "label": "Freestyle（要自己的 API key）"},
+       ]),
+    _F("environments.freestyle_api_key", "Freestyle 密钥",
+       "在 https://dash.freestyle.sh 注册后创建一个 API key（只在创建时显示一次）。只进不出，也可用环境变量 FREESTYLE_API_KEY。",
+       "secret"),
     _F("environments.ssh", "自有机器", "自有服务器，需要执行命令的任务优先使用。配置步骤：① 将「概况 → 运行状态」中的公钥添加到机器的 ~/.ssh/authorized_keys；② 在主模型的 AGENTS.md 中写明每台机器的配置和用途，主模型据此选择。", "ssh_list"),
     _F("environments.workspace_root", "远端目录", "远端机器上存放文件的目录。", "str", check=_check_workspace_root),
     _F("environments.memory_max", "内存上限", "单条命令可使用的最大内存，例如 1G。", "str", check=_check_memory_max),
@@ -585,6 +614,15 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     _F("environments.max_parallel", "并行数", "最多同时运行的子 agent 数量。", "int", min=1, max=10),
     _F("environments.command_timeout_s", "默认命令时长（秒）", "单条命令的默认超时时间。", "int", min=10, max=3600),
     _F("environments.railway_daily_max", "每日机器数", "每天最多使用的临时机器数量（官方上限为 3）。", "int", min=1, max=3),
+    _F("environments.freestyle_snapshot", "机器规格",
+       "Freestyle 机器用哪个镜像，它决定 CPU / 内存 / 磁盘：freestyle/ubuntu-sm 是 2 核 4G，"
+       "freestyle/ubuntu 是 4 核 8G（免费档上限）。", "str", check=_check_freestyle_snapshot),
+    _F("environments.freestyle_ttl_minutes", "最长活多久（分钟）",
+       "Freestyle 机器从创建时刻算，到点自动删除。", "int", min=5, max=1440),
+    _F("environments.freestyle_idle_minutes", "空闲休眠（分钟）",
+       "Freestyle 机器无网络活动多久后自动休眠；休眠只算存储费，文件仍可读取。", "int", min=1, max=1440),
+    _F("environments.freestyle_daily_max", "每日机器数",
+       "每天最多使用的 Freestyle 机器数量。", "int", min=1, max=10),
     _F("environments.verify_enabled", "资讯实测", "选取部分资讯进行实际测试，结果显示在网页中。", "bool"),
     _F("environments.verify_per_round", "每轮实测条数", "每轮实际测试的资讯条数。", "int", min=1, max=3),
     _F("environments.verify_minutes", "实测时长（分钟）", "每条资讯的最长测试时间。", "int", min=1, max=60),
@@ -657,6 +695,11 @@ SECRET_FIELDS: dict[str, dict[str, Any]] = {
     },
     "console.password": {"setting": ("console", "password"), "env": ()},
     "reader.jina_api_key": {"setting": ("reader", "jina_api_key"), "env": ()},
+    # Freestyle 的账号级 API key（2026-10-15）：只进不出；环境变量优先
+    "environments.freestyle_api_key": {
+        "setting": ("environments", "freestyle_api_key"),
+        "env": ("FREESTYLE_API_KEY",),
+    },
 }
 
 

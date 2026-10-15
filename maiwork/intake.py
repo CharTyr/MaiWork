@@ -2,11 +2,14 @@
 
 红线（AGENTS.md / docs/02 §2）：
 - 非服务群立刻返回 continue，**在读取任何其他字段之前**；零 Jev、零调用、零 Store、零发送。
-- 钩子里唯一的慢事：服务群里被 @ 时等 Jev（≤ min([jev] timeout_ms, 600ms)，给宿主
-  1500ms 的钩子超时留出余量；超时只取消、不等取消收尾）；批准、指令处理、提醒解析、
-  资讯卡片反馈写库这些慢活全部 spawn 到后台。
-- 接了库：被 @ 的消息在等 Jev 之前先落 pending_asks（pending_asks.PendingAsks）；判出的
-  结论先落库再派后台落地，只有真的建成（拿到 id）或明确闲聊才关掉这一行，失败的留给独立重试。
+- 钩子里**绝不等模型 / Jev / 网络**：服务群里被 @ 时只做纯本地、快的事（记信号、认构想编号、
+  把这条 @ 落 pending_asks），Jev 判词丢后台任务（`_judge_at`），判完走原来的后续路径。
+  钩子整体再套一层 `_HOOK_BUDGET_MS`（800ms）预算：超了就放弃这次钩子里的附加工作、
+  返回「不改动消息」并记一条中文日志。宿主 intake 钩子超时 1500ms，连续失败会熔断
+  （2026-10 线上 4 天：intake 超时 9 次、mentions 超时 3 次，熔断 60 秒里所有群的钩子
+  都被跳过），所以钩子里一点慢活都不能留。
+- 接了库：被 @ 的消息在钩子里先落 pending_asks（pending_asks.PendingAsks）；后台判出的
+  结论先落库再落地，只有真的建成（拿到 id）或明确闲聊才关掉这一行，失败的留给独立重试。
 - 收消息的钩子永不中止：任何异常吞掉，永远返回 {"action": "continue"}。
 - 机器人自己的消息不当成请求（只记信号）。
 - 群友派的活走 Approvals（要批准的未批准不开工）。
@@ -32,6 +35,7 @@ import asyncio
 import logging
 import math
 import re
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional
 
@@ -93,8 +97,28 @@ _TITLE_MAX = 30
 _COMMAND_MENTION_TTL_S = 120        # /mw 指令说明只留 2 分钟
 _REQUEST_MENTION_TTL_S = 30 * 60    # 「已由 MaiWork 接手（等批准 / 已开工）」留 30 分钟
 _SLOW_QUEUE_MAX = 200               # 慢路径内存队列上限（满了丢最旧的）
-# 钩子里等 Jev 的上限：宿主钩子超时 1500ms，留一半余量给其余同步步骤和事件循环抖动
-_HOOK_JEV_MAX_MS = 600
+# 钩子给自己留的硬上限（毫秒）：宿主 intake 钩子超时 1500ms，这里最多 800ms 就放弃这次
+# 钩子里的附加工作、返回「不改动消息」，给宿主和事件循环抖动留足余量。钩子连续超时会被
+# 宿主熔断（熔断期间所有群的钩子都被跳过），宁可少做一点也不让宿主计超时。
+_HOOK_BUDGET_MS = 800
+# 后台等 Jev 判词的外层保险（毫秒）：Jev 客户端自己按 [jev] timeout_ms 收（配置夹在
+# [200,1200]），这层只防客户端卡死。判词不在钩子里等，慢一点不影响收消息。
+_JEV_BG_WAIT_MAX_MS = 8000
+# 钩子里落 pending_asks 最多等多久写锁（秒）：Store 的共享连接 busy_timeout 是 5000ms，
+# 钩子绝不能跟着它等（同步代码没有 await 点，_HOOK_BUDGET_MS 拦不住）。150ms 拿不到
+# 就把这条 @ 原子写进磁盘 spool（请求已经持久），后台补落库（2026-10-15 复核）。
+_HOOK_RECORD_WAIT_S = 0.15
+# 后台补落库（spool → 库）：每次等锁多久、两次之间退避多久（上限）、判词等落库的上限。
+# 没有「试几次就丢」——写不进就一直退避重试，条目本来就在磁盘上。
+_RECORD_RETRY_TIMEOUT_S = 1.0
+_RECORD_RETRY_SLEEP_S = 0.5
+_RECORD_RETRY_SLEEP_MAX_S = 5.0
+_RECORD_WAIT_MAX_S = 8.0
+# 判词链（decide / complete / fail）在后台协程里写库的上限：同样走独立短连接，
+# 绝不在共享事件循环上等 Store 的 5 秒 busy_timeout
+_CHAIN_WRITE_WAIT_S = 0.2
+# 内存里的「已经写进库」标记：判词取走即清，另外封顶防无限涨
+_LANDED_MAX = 500
 _FEEDBACK_INFLIGHT_MAX = 4          # 卡片反馈后台写库同时最多几条
 # 网页构想详情「复制要求」带的编号（「（构想 #12）」）：认出来就按这条构想建请求，不问 Jev。
 # 2026-10：还认「（构想 #12，要做：1、3）」这种挑了项目的写法（尾部不跨右括号 / 换行）。
@@ -229,6 +253,12 @@ class Intake:
                 self._pending = None
         # 卡片反馈后台写库：同时在跑的上限（反馈只是软信号，满了就丢这一条）
         self._feedback_inflight = 0
+        # 待判 @ 的磁盘 spool → 库（写锁被占时钩子的落点，见 _record / _drain_pending_writes）：
+        # 只有一个补落库任务在跑；landed 标记给判词等落库用（取走即清、另设上限）
+        self._draining = False
+        self._spool_started = False
+        self._landed_set: set[str] = set()
+        self._landed_order: deque[str] = deque()
         from .news_feedback import CardIndex
 
         self._card_index = CardIndex()
@@ -266,13 +296,26 @@ class Intake:
             except Exception:
                 logger.exception("建派活判断兜底出错，这次退回慢路径")
                 self._quick_judge = None
+        # 启动时立刻恢复上次没写完的 spool（安全后台路径；没有运行中的事件循环就留给
+        # 下一次触发——第一条消息 / 巡检的 mark_stale）
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            self.kick_spool_recover()
 
     # ------------------------------------------------------------------
     # 钩子本体
     # ------------------------------------------------------------------
 
     async def handle(self, kwargs: dict) -> dict:
-        """钩子本体；async；永远返回 {"action": "continue"}。"""
+        """钩子本体；async；永远返回 {"action": "continue"}。
+
+        @ 消息在这里**不等 Jev**：钩子只记信号、认构想编号、把这条 @ 落 pending_asks，
+        判词交给后台任务。整段本地附加工作再套一层 `_HOOK_BUDGET_MS` 预算，超时就放弃
+        这次的附加工作（返回「不改动消息」）并记日志——磁盘 / 库慢也不会让宿主计超时。
+        """
         try:
             group_id = self._group_id_of(kwargs)
             if not group_id:
@@ -293,7 +336,16 @@ class Intake:
                 return _CONTINUE
             session_id = str(message.get("session_id") or "")
             self._signals.mark(group_id, session_id, _ts_of(message.get("timestamp")))
-            await self._m3(settings, group_id, message, platform)
+            # 上次进程留下的待判 @ spool：每个进程补一次（纯 spawn，钩子里零磁盘等待；
+            # 真正扫 spool 在后台任务里）。启动时已经补过就不会再进来。
+            if not self._spool_started:
+                self._spool_started = True
+                self._ensure_drainer()
+            ok = await _budgeted(self._m3(settings, group_id, message, platform), _HOOK_BUDGET_MS / 1000.0)
+            if not ok:
+                logger.info(
+                    "收消息钩子的本地附加工作超过 %dms 预算，这次放弃（群 %s）", _HOOK_BUDGET_MS, group_id
+                )
             return _CONTINUE
         except Exception:  # 任何异常都吞掉，钩子永不中止消息
             logger.debug("收消息钩子异常，已吞掉", exc_info=True)
@@ -352,7 +404,8 @@ class Intake:
         #    或发起人 @ 机器人而且这个群里只有这一个等待任务 → 后台恢复任务。
         #    纯内存查（app 给的 30 秒缓存），不做重查询。
         self._maybe_answer(group_id, user_id, message_id, text, message)
-        # 4) @ MaiBot：钩子里只问 Jev（带超时），其余全部后台
+        # 4) @ MaiBot：钩子里只做纯本地的事（认构想编号、落 pending_asks），
+        #    Jev 判词丢后台；其余全部后台
         #    别的插件的指令（/pic 之类）不是 MaiWork 的活，连 Jev 都不问
         if (bool(message.get("is_at")) or bool(message.get("is_mentioned"))) and not _is_command(text):
             await self._handle_at(settings, group_id, user_id, user_name, message_id, text, context)
@@ -477,65 +530,139 @@ class Intake:
         text: str,
         context: list[dict] | None = None,
     ) -> None:
-        # G5：钩子阻塞宿主管线（宿主钩子超时 1500ms）。配置解析时已夹到 [200,1200]，
-        # 这里再夹到 _HOOK_JEV_MAX_MS（600ms），给钩子其余步骤和事件循环抖动留余量
+        """钩子侧的 @ 处理：只做纯本地、快的事，绝不在这里等模型 / Jev / 网络。
+
+        - 认得出「构想 #N」→ 后台按构想建请求（原行为）。
+        - 其余先把这条 @ 落 pending_asks（0.9.8 的持久化：钩子被宿主超时掐断 / 插件
+          重载都不会把它弄丢），再把 Jev 判词丢后台任务 `_judge_at`，判完走原来的后续路径。
+          落库走**独立短连接 + 有界等锁**（`_HOOK_RECORD_WAIT_S`）：写锁被别的写入者占着
+          时钩子只等 150ms；拿不到写锁就把这条 @ 原子写进磁盘 spool（请求已经持久）——
+          绝不跟着 Store 的 5 秒 busy_timeout 走（2026-10-15 复核，本机实测钩子曾被拖 5.36s）。
+        """
         idea = self._idea_of(group_id, text)
         if idea is not None:
             _spawn_safely(self._spawn, self._create_idea_request(group_id, idea, user_id, user_name, message_id, text))
             return
-        timeout_ms = min(
-            _HOOK_JEV_MAX_MS,
-            max(100, int(getattr(getattr(settings, "jev", None), "timeout_ms", 1500) or 1500)),
+        # 落库必须在钩子里（本地短事务 + 有界等锁；写不进就落 spool）：
+        # 宿主超时掐断 / 插件重载都不丢这条 @
+        spool_key = self._record(group_id, user_id, user_name, message_id, text, "收到 @，等判断")
+        if spool_key is _RECORD_FAILED:
+            # **没持久就绝不往下判**：不 spawn 判词、不调 Jev / 模型、不建请求、不建提醒。
+            # 钩子照常 continue（永不中止宿主消息），失败已经有 error 日志可查。
+            logger.warning(
+                "待判 @ 没持久（库和 spool 都没写进），这次不判、不建请求也不建提醒（群 %s 消息 %s）",
+                group_id, message_id,
+            )
+            return
+        _spawn_safely(
+            self._spawn,
+            self._judge_at(
+                settings, group_id, user_id, user_name, message_id, text, context,
+                spool_key=spool_key,
+            ),
         )
-        # 等 Jev 之前先把这条 @ 落库：钩子被宿主超时掐断 / 插件重载都不会把它弄丢
-        self._record(group_id, user_id, user_name, message_id, text, "收到 @，等判断")
-        answers: Optional[dict] = None
-        jev = self._jev
-        if jev is not None:
-            try:
-                available = bool(jev.available())
-            except Exception:
-                available = False
-            if available:
-                state = {"messages": self._jev_messages(context, text)}
-                answers = await _bounded(
-                    jev.ask(state, _AT_QUESTIONS, purpose="intake", group_id=group_id, timeout_ms=timeout_ms),
-                    timeout_ms / 1000.0,
-                )
-        ctx = {"context": list(context or [])}
-        if not isinstance(answers, dict):
-            self._fallback("jev_无答案", group_id, user_id, user_name, message_id, text, **ctx)
+
+    async def _judge_at(
+        self,
+        settings: Settings,
+        group_id: str,
+        user_id: str,
+        user_name: str,
+        message_id: str,
+        text: str,
+        context: list[dict] | None = None,
+        *,
+        spool_key: Optional[str] = None,
+    ) -> None:
+        """后台问 Jev 并按判词走原来的后续路径；异常只记日志 + 留待重试，绝不外抛。
+
+        等 Jev 的时间：配置解析时已夹到 [200,1200]（[jev] timeout_ms，Jev 客户端自己
+        按它收），外面再兜一层 `_JEV_BG_WAIT_MAX_MS` 防客户端卡死。这一段不在钩子里，
+        慢一点不影响收消息，也不占宿主的钩子超时。
+
+        `spool_key` 非空 = 这条 @ 当时没能立刻落库（写锁被占），现在在磁盘 spool 里：
+        先等补落库任务把它真写进库再判——落库前判，`decide` / `complete` 找不到行，
+        落地结果会丢；等不到就**不判**（不调 Jev、不建请求），留给 spool 与独立重试路径
+        （`profile.recover_pending_asks`）按库里那行判一次，保证一条 @ 只判一次。
+        """
+        if spool_key is not None and not await self._wait_recorded(spool_key):
+            logger.warning(
+                "待判 @ 还没写进库（写锁被占太久），这次不判、留给 spool 与独立重试（群 %s 消息 %s）",
+                group_id, message_id,
+            )
             return
-        raw_kind = answers.get("kind")
-        if isinstance(raw_kind, (tuple, list)) and len(raw_kind) >= 3:
-            label, confidence = str(raw_kind[0]), raw_kind[2]
-            try:
-                confidence_f = float(confidence)
-            except (TypeError, ValueError):
-                confidence_f = 0.0
-        else:
-            label, confidence_f = "", 0.0
-        if label in ("prepare", "goal") and confidence_f >= _REQUEST_CONFIDENCE_MIN:
-            zh = _KIND_ZH.get(label, label)
-            self._decide(group_id, message_id, {
-                "kind": label, "title": text.strip()[:_TITLE_MAX] or zh,
-                "via": f"群里 @ · Jev 判断是「{zh}」（把握 {confidence_f:.2f}）",
-            })
-            _spawn_safely(self._spawn, self._create_request(group_id, label, confidence_f, user_id, user_name, message_id, text))
-            return
-        if label == "reminder" and confidence_f >= _CONFIDENCE_MIN:
-            cb = self._on_reminder
-            if cb is not None:
-                # 时间还没解析：只记「是提醒」，行保持待处理，解析建成后才关
-                self._decide(group_id, message_id, {"kind": "reminder", "title": text.strip()[:_TITLE_MAX]})
-                _spawn_safely(self._spawn, self._run_reminder(cb, group_id, user_id, user_name, message_id, text))
-            return
-        if label == "none" and confidence_f >= _CONFIDENCE_MIN:
-            # Jev 明确判成闲聊且把握够：正常闲聊，待判行记成终态（不进慢路径）
-            self._decide(group_id, message_id, {"kind": "none", "why": f"Jev 判闲聊（把握 {confidence_f:.2f}）"})
-            return
-        self._fallback(f"jev_判成「{label or '无效'}」（把握 {confidence_f:.2f}）",
-                       group_id, user_id, user_name, message_id, text, **ctx)
+        try:
+            timeout_ms = min(
+                _JEV_BG_WAIT_MAX_MS,
+                max(100, int(getattr(getattr(settings, "jev", None), "timeout_ms", 1500) or 1500)),
+            )
+            answers: Optional[dict] = None
+            jev = self._jev
+            if jev is not None:
+                try:
+                    available = bool(jev.available())
+                except Exception:
+                    available = False
+                if available:
+                    state = {"messages": self._jev_messages(context, text)}
+                    answers = await _bounded(
+                        jev.ask(state, _AT_QUESTIONS, purpose="intake", group_id=group_id, timeout_ms=timeout_ms),
+                        _JEV_BG_WAIT_MAX_MS / 1000.0,
+                    )
+            ctx = {"context": list(context or [])}
+            if not isinstance(answers, dict):
+                self._fallback("jev_无答案", group_id, user_id, user_name, message_id, text, **ctx)
+                return
+            raw_kind = answers.get("kind")
+            if isinstance(raw_kind, (tuple, list)) and len(raw_kind) >= 3:
+                label, confidence = str(raw_kind[0]), raw_kind[2]
+                try:
+                    confidence_f = float(confidence)
+                except (TypeError, ValueError):
+                    confidence_f = 0.0
+            else:
+                label, confidence_f = "", 0.0
+            if label in ("prepare", "goal") and confidence_f >= _REQUEST_CONFIDENCE_MIN:
+                zh = _KIND_ZH.get(label, label)
+                # 结论先落库，落住了才建请求：`_decide` 说这条已经不归这次判词管
+                # （终态 / 已被独立重试接手 / 库写不进去）就不重复建——保证一条 @ 只判一次
+                if self._decide(group_id, message_id, {
+                    "kind": label, "title": text.strip()[:_TITLE_MAX] or zh,
+                    "via": f"群里 @ · Jev 判断是「{zh}」（把握 {confidence_f:.2f}）",
+                }) is not True:
+                    logger.info(
+                        "这条 @ 的判词没记下（终态 / 已被独立重试接手 / 写锁被占），不重复建请求（群 %s 消息 %s）",
+                        group_id, message_id,
+                    )
+                    return
+                _spawn_safely(self._spawn, self._create_request(group_id, label, confidence_f, user_id, user_name, message_id, text))
+                return
+            if label == "reminder" and confidence_f >= _CONFIDENCE_MIN:
+                cb = self._on_reminder
+                if cb is not None:
+                    # 时间还没解析：只记「是提醒」，行保持待处理，解析建成后才关
+                    # （`_decide` 这里返回 False 是正常的「还没时间」，照样要建提醒）；
+                    # 只有「结论压根没写成功」（None）才不建，免得和独立重试重复触发
+                    if self._decide(group_id, message_id, {"kind": "reminder", "title": text.strip()[:_TITLE_MAX]}) is None:
+                        logger.info(
+                            "写锁被占，这条 @ 的提醒判词没记下，留给独立重试（群 %s 消息 %s）",
+                            group_id, message_id,
+                        )
+                        return
+                    _spawn_safely(self._spawn, self._run_reminder(cb, group_id, user_id, user_name, message_id, text))
+                return
+            if label == "none" and confidence_f >= _CONFIDENCE_MIN:
+                # Jev 明确判成闲聊且把握够：正常闲聊，待判行记成终态（不进慢路径）
+                self._decide(group_id, message_id, {"kind": "none", "why": f"Jev 判闲聊（把握 {confidence_f:.2f}）"})
+                return
+            self._fallback(f"jev_判成「{label or '无效'}」（把握 {confidence_f:.2f}）",
+                           group_id, user_id, user_name, message_id, text, **ctx)
+        except asyncio.CancelledError:
+            # 停机 / 热重载：行留在 pending_asks，下次重载或读群提炼照常接手
+            raise
+        except Exception:
+            logger.exception("后台问 Jev 出错（群 %s，消息 %s）", group_id, message_id)
+            self._fail(group_id, message_id, "后台问 Jev 出错")
 
     # ------------------------------------------------------------------
     # 派活判断兜底（quick_judge）：Jev 不在 / 拿不准时的第二条快路
@@ -702,45 +829,208 @@ class Intake:
     # 待判 @ 的持久记录（pending_asks.PendingAsks；没接库时全部空操作）
     # ------------------------------------------------------------------
 
-    def _record(self, group_id: str, user_id: str, user_name: str, message_id: str, text: str, reason: str) -> None:
+    def _record(
+        self, group_id: str, user_id: str, user_name: str, message_id: str, text: str, reason: str
+    ) -> Any:
+        """记一条待判 @。返回三种（**调用方必须分清**，2026-10-15 复核收口）：
+
+        - `None`：**已经持久了**（直接进了库），或者这个构造压根没接库（`pending is None` /
+          没有消息号，老语义，照旧往下判）；
+        - `str`（spool 键）：进了磁盘 spool、还没进库，后台补落库会接手；
+        - `_RECORD_FAILED`：**DB 和 spool 都没写进去**——这条没保住，调用方不许再判
+          （不调 Jev / 模型、不建请求、不建提醒）。
+
+        钩子里只等 `_HOOK_RECORD_WAIT_S`（150ms）写锁，用的是独立短连接（不碰 Store 的共享
+        连接，所以也不受它 5 秒 busy_timeout 的牵连）。拿不到写锁就把这条 @ 原子写进磁盘
+        spool——**请求此时已经持久了**（`pending_asks._PendingSpool`：0700 目录 / 0600 文件 /
+        先写 .tmp 再 os.replace / 同名幂等 / 限长载荷，完全不碰主库写锁），再由后台任务用
+        独立连接补落库（写进库才删 spool 文件）。收消息钩子绝不跟着 Store 的 5 秒
+        busy_timeout 走（2026-10-15 复核，本机实测旧实现被拖 5.36s）。
+        """
         pending = self._pending
         if pending is None or not message_id:
-            return
+            return None
+        msg = {
+            "message_id": message_id, "user_id": user_id, "user_name": user_name,
+            "text": str(text or "")[:_STATE_TEXT_MAX],
+        }
         try:
-            pending.record_pending(group_id, {
-                "message_id": message_id, "user_id": user_id, "user_name": user_name,
-                "text": str(text or "")[:_STATE_TEXT_MAX],
-            }, reason)
+            row = pending.record_pending_bounded(
+                group_id, msg, reason, timeout_s=_HOOK_RECORD_WAIT_S
+            )
         except Exception:
             logger.exception("记待判 @ 出错（群 %s，消息 %s）", group_id, message_id)
+            row = None
+        if row is not None:
+            return None
+        try:
+            ok = pending.spool_write(group_id, msg, reason)
+        except Exception:
+            logger.exception("待判 @ 写 spool 出错（群 %s 消息 %s）", group_id, message_id)
+            ok = False
+        if not ok:
+            # 库和磁盘都写不进去（磁盘满 / 只读）：这是真丢，必须留一条能查的 error，
+            # 并且明确告诉调用方「没持久」——绝不能拿 None（= 已落库）糊过去
+            logger.error(
+                "待判 @ 既没落库也没写进 spool（群 %s 消息 %s）——这条保不住了", group_id, message_id
+            )
+            return _RECORD_FAILED
+        self._ensure_drainer()
+        return _spool_key(group_id, message_id)
 
-    def _decide(self, group_id: str, message_id: str, decision: dict) -> bool:
+    # ------------------------------------------------------------------
+    # 待判 @ 的磁盘 spool → 库（补落库；不丢请求）
+    # ------------------------------------------------------------------
+
+    def _ensure_drainer(self) -> None:
+        """确保只有一个后台补落库任务在跑（spawn 不出去就只记日志，钩子照常返回）。"""
+        if self._draining or self._pending is None:
+            return
+        self._draining = True
+        try:
+            _spawn_safely(self._spawn, self._drain_pending_writes())
+        except Exception:
+            self._draining = False
+            logger.exception("起待判 @ 补落库任务出错，spool 留着下次再试")
+
+    def kick_spool_recover(self) -> None:
+        """新实例启动时立刻恢复 spool（安全后台路径）；没有运行中的事件循环就留给下一次触发。
+
+        只做一次 `listdir`（在启动路径上，不在收消息钩子里）：空目录连任务都不起。
+        """
+        if self._spool_started or self._pending is None:
+            return
+        self._spool_started = True
+        try:
+            if self._pending.spool_count() <= 0:
+                return
+        except Exception:
+            logger.debug("查待判 @ spool 条数失败，按有处理", exc_info=True)
+        self._ensure_drainer()
+
+    async def _drain_pending_writes(self) -> None:
+        """后台补落库：把 spool 里的待判 @ 用**独立连接**写进库，写进库才删 spool 文件。
+
+        - 等锁发生在 `asyncio.to_thread` 的 worker 线程里（timeout_s 有界），事件循环不承担
+          5 秒等锁；绝不跨线程共用 Store 的连接（连接在 `record_pending_bounded` 里现开现关）。
+        - 写不进就退避重试（0.5s → 5s 封顶）**永不丢弃**；spool 里只剩当前非服务群 / 已过期
+          的条目时退出（由下一次启动 / 巡检 / 新 @ 再触发）。
+        - 被取消（停机 / 热重载）直接退出：条目本来就在磁盘上，重载后启动恢复照常接手。
+        """
+        try:
+            delay = _RECORD_RETRY_SLEEP_S
+            while True:
+                try:
+                    landed, waiting = await asyncio.to_thread(
+                        self._pending.flush_spool_once, timeout_s=_RECORD_RETRY_TIMEOUT_S
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("待判 @ 补落库出错，稍后再试")
+                    landed, waiting = [], 1
+                for gid, mid in landed:
+                    self._mark_landed(_spool_key(gid, mid))
+                if waiting <= 0:
+                    return
+                await asyncio.sleep(delay)
+                delay = min(_RECORD_RETRY_SLEEP_MAX_S, delay * 2)
+        finally:
+            self._draining = False
+
+    def _mark_landed(self, key: str) -> None:
+        """记一条「已经写进库」的标记（有上限，等判词取走就清；防内存无限涨）。"""
+        if key in self._landed_set:
+            return
+        self._landed_set.add(key)
+        self._landed_order.append(key)
+        while len(self._landed_order) > _LANDED_MAX:
+            self._landed_set.discard(self._landed_order.popleft())
+
+    def _take_landed(self, key: str) -> bool:
+        """取走一条 landed 标记（取到即清理）。"""
+        if key not in self._landed_set:
+            return False
+        self._landed_set.discard(key)
+        try:
+            self._landed_order.remove(key)
+        except ValueError:
+            pass
+        return True
+
+    async def _wait_recorded(self, key: str, timeout_s: float = _RECORD_WAIT_MAX_S) -> bool:
+        """等这条 @ 真写进库（补落库任务落地后才标记）。返回是否落了库。
+
+        等不到就返回 False：判词**不判**（不调 Jev、不建请求），留给 spool 与独立重试路径
+        ——保证一条 @ 只判一次，也不会把「还没落库」误当成「已经落库」。
+        """
+        if self._pending is None:
+            return False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(timeout_s)
+        while True:
+            if self._take_landed(key):
+                return True
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(0.2)
+
+    def _decide(self, group_id: str, message_id: str, decision: dict) -> Optional[bool]:
+        """记判断结论（判词链专用：**独立短连接 + 有界等锁**，不在事件循环等 5 秒写锁）。
+
+        返回三态，调用方按自己那条路解释：
+        - `True`：结论完整、已进 decided（none 直接终态）；
+        - `False`：结论没进 decided（行不存在 / 已是终态 / **reminder 还没解析出时间**）——
+          reminder 那条路本来就靠后面的 `_run_reminder` 补时间，不能因为 False 就不建；
+        - `None`：**没写成功**（写锁被占 / 库错）：调用方别接着建请求，留给独立重试路径
+          （`profile.recover_pending_asks`）按库里那行判一次——保证一条 @ 只判一次。
+        """
         pending = self._pending
         if pending is None or not message_id:
             return True
         try:
-            return pending.decide(group_id, message_id, decision) is not False
+            r = pending.decide_bounded(group_id, message_id, decision, timeout_s=_CHAIN_WRITE_WAIT_S)
         except Exception:
             logger.exception("记 @ 的判断结论出错（群 %s，消息 %s）", group_id, message_id)
-            return False
+            return None
+        if r is None:
+            logger.warning(
+                "写锁被占，这条 @ 的判断结论没记下（群 %s 消息 %s），留给独立重试", group_id, message_id
+            )
+        return r
 
     def _fail(self, group_id: str, message_id: str, error: str) -> None:
         pending = self._pending
         if pending is None or not message_id:
             return
         try:
-            pending.fail(group_id, message_id, error)
+            r = pending.fail_bounded(group_id, message_id, error, timeout_s=_CHAIN_WRITE_WAIT_S)
         except Exception:
             logger.exception("记 @ 落地失败出错（群 %s，消息 %s）", group_id, message_id)
+            return
+        if r is None:
+            logger.warning(
+                "写锁被占，这条 @ 的失败退避没记下（群 %s 消息 %s），留给独立重试", group_id, message_id
+            )
 
     def _complete(self, group_id: str, message_id: str, kind: str, result_id: str) -> None:
         pending = self._pending
         if pending is None or not message_id:
             return
         try:
-            pending.complete(group_id, message_id, result_kind=kind, result_id=result_id)
+            r = pending.complete_bounded(
+                group_id, message_id, result_kind=kind, result_id=result_id,
+                timeout_s=_CHAIN_WRITE_WAIT_S,
+            )
         except Exception:
             logger.exception("关待判 @ 出错（群 %s，消息 %s）", group_id, message_id)
+            return
+        if r is None:
+            # 请求已经建出来了（按来源消息去重），行留给独立重试路径补关，不重复建
+            logger.warning(
+                "写锁被占，这条 @ 的落地结果没记上（群 %s 消息 %s），留给独立重试",
+                group_id, message_id,
+            )
 
     def _idea_of(self, group_id: str, text: str) -> dict | None:
         """消息里带「构想 #N」且这条构想属于本群 → 构想行（dict，带 wanted）；否则 None。
@@ -896,7 +1186,12 @@ class Intake:
                 del self._slow_queue[: len(self._slow_queue) - _SLOW_QUEUE_MAX]
             return
         # 接库时交给 PendingAsks：同一条消息重复进来不刷新收到时间、不重开已结束的行
-        self._record(gid, str(user_id), str(user_name), mid, str(text or ""), str(reason))
+        result = self._record(gid, str(user_id), str(user_name), mid, str(text or ""), str(reason))
+        if result is _RECORD_FAILED:
+            # 没落库也没进 spool：这条**不在**慢路径里（slow_queue 读的就是库），别当落盘成功
+            logger.warning(
+                "待判 @ 没持久（库和 spool 都没写进），这条不进慢路径（群 %s 消息 %s）", gid, mid
+            )
 
     @property
     def slow_queue(self) -> list[dict]:
@@ -1047,6 +1342,53 @@ def _swallow_task_result(task: asyncio.Future) -> None:
             pass
 
 
+def _spool_key(group_id: Any, message_id: Any) -> str:
+    """待判 @ 在内存里的键（群号 + 消息号；只用于「已经写进库」的标记，不落盘）。"""
+    return f"{str(group_id)}\x00{str(message_id)}"
+
+
+class _RecordFailed:
+    """`Intake._record` 的失败哨兵：**DB 和 spool 都没写进去**（这条请求没保住）。
+
+    必须和「已经落库（返回 None）」区分开：没持久就绝不能往下判（不调 Jev / 模型、
+    不建请求、不建提醒）——2026-10-15 复核收口「先持久、再判」。
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - 只为日志好读
+        return "<待判@未持久>"
+
+
+_RECORD_FAILED = _RecordFailed()
+
+
+async def _budgeted(awaitable: Awaitable[Any], timeout_s: float) -> bool:
+    """钩子里的本地附加工作最多等 timeout_s 秒。
+
+    正常跑完（哪怕里面有异常，异常照旧往外抛给调用方吞）返回 True；超时就取消、
+    不等取消收尾、返回 False——调用方据此返回「不改动消息」并记日志。
+    注意：纯同步代码（本机 SQLite 读写）没有 await 点，取消只能等到它自己让出；
+    真正保证钩子快的是「钩子里没有慢活」，这一层是给异步附加工作兜底的硬闸。
+    """
+    task = asyncio.ensure_future(awaitable)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout_s)
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    if task in done:
+        task.result()  # 有异常就照旧往外抛（调用方的 try 吞掉）
+        return True
+    task.cancel()
+    task.add_done_callback(_swallow_task_result)
+    return False
+
+
+# 兜底 spawn 起的后台任务引用：asyncio 只对任务持弱引用，不留一份可能被 GC 掉
+_BG_TASKS: set[asyncio.Task] = set()
+
+
 def _spawn_safely(spawner: Callable[[Awaitable[Any]], Any], coro: Awaitable[Any]) -> None:
     """调用注入的 spawn；spawn 本身出错（一般是没事件循环）→ 兜底 / 关协程，绝不外抛。"""
     try:
@@ -1057,7 +1399,11 @@ def _spawn_safely(spawner: Callable[[Awaitable[Any]], Any], coro: Awaitable[Any]
 
 
 def _default_spawn(coro: Awaitable[Any]) -> None:
-    """没注入 spawn 时的兜底：丢进当前事件循环；没有循环就关掉协程防告警。"""
+    """没注入 spawn 时的兜底：丢进当前事件循环；没有循环就关掉协程防告警。
+
+    任务引用留一份在 `_BG_TASKS`（asyncio 对任务只有弱引用，不留可能跑一半被 GC），
+    跑完自己摘掉。
+    """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -1067,6 +1413,8 @@ def _default_spawn(coro: Awaitable[Any]) -> None:
         task = loop.create_task(coro)
         # M9：后台协程的异常要有处看
         task.add_done_callback(_log_silent_task_exception)
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
     except Exception:
         logger.exception("兜底 spawn 出错，协程丢弃")
         _close_quietly(coro)

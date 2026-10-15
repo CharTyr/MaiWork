@@ -763,6 +763,7 @@ class Profiles:
         """独立恢复（和画像游标无关、可重复跑）：返回这轮真落地的条数。
 
         1) 超 48 小时没落地的标 review 留着（不再调模型、不删）；
+        1b) 待复核里搁了超过 14 天还没人处理的归档成 expired（保留记录、记中文日志）；
         2) 判了没落地、退避到点的重试落地；
         3) 还没判、等了超过一小时的，一次模型调用批量复查（最多 limit 条）；
            模型没给结论 / 给不出时间的不算闲聊，按退避下次再问。非服务群零工作。
@@ -773,6 +774,7 @@ class Profiles:
         pa = self.pending_asks
         now = clock.now()
         pa.mark_stale(gid, now=now)
+        pa.archive_expired(gid, now=now)
         landed = 0
         for d in pa.due(gid, now=now, limit=limit):
             if self.apply_pending_ask(gid, str(d["message_id"])):

@@ -28,7 +28,7 @@ from .maiwork.config import (
 logger = logging.getLogger("maiwork")
 
 PLUGIN_ID = "chartyr.maiwork"
-PLUGIN_VERSION = "0.9.8"
+PLUGIN_VERSION = "0.10.0"
 
 __all__ = [
     "PLUGIN_ID",
@@ -160,6 +160,10 @@ class MaiWorkPlugin(MaiBotPlugin):
         error_policy=ErrorPolicy.SKIP,
     )
     async def maiwork_intake(self, **kwargs: Any) -> Dict[str, Any]:
+        # 返回值只有 {"action": "continue"}：**不回传整条消息载荷**（宿主推过来的
+        # kwargs 可能带图片原始字节，单帧上限 16MiB；回程帧越轻越好）。
+        # 钩子内部也不等模型 / Jev / 网络：@ 的判词在后台任务里做，本地附加工作有
+        # 800ms 预算（intake._HOOK_BUDGET_MS）。宿主连续 3 次超时会熔断 60 秒。
         try:
             if self._app is None:
                 return {"action": "continue"}
@@ -186,6 +190,10 @@ class MaiWorkPlugin(MaiBotPlugin):
         # {"action": "continue", "modified_kwargs": <整体替换的 kwargs>}；
         # 不改就是 {"action": "continue"}（manifest 不写 modifies）。
         # 宿主侧解析见 docs/06：allow_abort=False，败了只警告并忽略。
+        # 有备忘要注入时**必须**回传整包（BLOCKING 改写的约定写法，大小与入参同阶、
+        # 插件侧不放大）；没货 / 超预算就只回 {"action": "continue"}，不回传整包。
+        # 本地附加工作（查库拼备忘 + 深拷贝）有 500ms 预算，在
+        # app.on_planner_before_request → Mentions.inject 里按 deadline 自检。
         try:
             if self._app is None:
                 return {"action": "continue"}

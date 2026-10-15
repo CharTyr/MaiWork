@@ -33,6 +33,7 @@ OLD = NOW - WEEK - 60.0     # 早就过了保留期
 RECENT = NOW - WEEK + 60.0  # 还没到
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"cache-bytes"
+JPEG = b"\xff\xd8\xff\xe0" + b"cache-bytes"
 
 
 def _make(tmp_path):
@@ -50,6 +51,13 @@ def _make(tmp_path):
 def _png_file(push_dir: Path, cid) -> Path:
     p = push_dir / f"card-{cid}.png"
     p.write_bytes(PNG)
+    return p
+
+
+def _jpg_file(push_dir: Path, cid) -> Path:
+    """2026-10-15 起卡片图默认是 JPEG（card-<id>.jpg）。"""
+    p = push_dir / f"card-{cid}.jpg"
+    p.write_bytes(JPEG)
     return p
 
 
@@ -165,3 +173,27 @@ def test_prune_no_records_is_noop(tmp_path):
     _png_file(push_dir, 50)
     assert _prune(store, settings) == 0
     assert (push_dir / "card-50.png").exists()
+
+
+def test_prune_removes_new_jpg_and_old_png(tmp_path):
+    """新扩展名 .jpg 要认，老 .png 也照清（升级后工作区里两种都在）。"""
+    store, settings, push_dir = _make(tmp_path)
+    _jpg_file(push_dir, 60)
+    _box(store, "news_card:60", status="sent", updated=OLD)
+    _png_file(push_dir, 61)          # 老版本留下的 PNG 缓存
+    _box(store, "news_card:61", status="failed", updated=OLD)
+    _jpg_file(push_dir, 62)          # 还没定：不删
+    _box(store, "news_card:62", status="uncertain", updated=OLD)
+    # 两种扩展名都在：只删该删的两张
+    _jpg_file(push_dir, 63)
+    _png_file(push_dir, 63)
+    _box(store, "news_card:63", status="sent", updated=OLD)
+
+    removed = _prune(store, settings)
+
+    assert removed == 4          # 60 一张 + 61 一张 + 63 的两张（.jpg / .png 都算）
+    assert not (push_dir / "card-60.jpg").exists()
+    assert not (push_dir / "card-61.png").exists()
+    assert (push_dir / "card-62.jpg").exists()
+    assert not (push_dir / "card-63.jpg").exists()
+    assert not (push_dir / "card-63.png").exists()

@@ -2,7 +2,8 @@
 
 红线断言：
 - 非服务群：@、/mw、关键词——零 Jev 调用、零 approvals、零 mentions、零 commands。
-- 钩子里唯一的慢事是等 Jev（≤ [jev] timeout_ms）；其他全部 spawn 到后台。
+- 钩子里**不等 Jev**：@ 时钩子只落 pending_asks 并把判词丢后台（`_judge_at`），
+  其他慢活也全部 spawn 到后台。测试里用 `_drain(spawned)` 把后台协程抽干再看结果。
 """
 
 from __future__ import annotations
@@ -118,9 +119,9 @@ def _make(
 
 
 async def _drain(spawned: list) -> None:
-    """把钩子 spawn 出来的后台协程跑完。"""
-    for coro in list(spawned):
-        await coro
+    """把钩子 spawn 出来的后台协程跑完（后台里再 spawn 出来的也跑，直到清空）。"""
+    while spawned:
+        await spawned.pop(0)
 
 
 # ----------------------------------------------------------------------
@@ -194,10 +195,11 @@ class TestAtRecognition:
             hook_message(is_at=True, user_id="20002", nickname="阿柒", message_id="m-7", text="帮我整理一份铝坨坨的资料")
         )
         assert out == {"action": "continue"}
-        # 钩子里只问 Jev：approvals 还没被碰（在后台协程里）
-        assert len(jev.calls) == 1
+        # 钩子里连 Jev 都不问（判词在后台协程里），approvals 也还没被碰
+        assert jev.calls == []
         assert approvals.created == []
         await _drain(spawned)
+        assert len(jev.calls) == 1
         assert len(approvals.created) == 1
         gid, kw = approvals.created[0]
         assert gid == G1
@@ -235,6 +237,7 @@ class TestAtRecognition:
         intake, signals, spawned = _make(jev=jev)
         long_text = "长" * 800
         await intake.handle(hook_message(is_at=True, text=long_text))
+        await _drain(spawned)
         state_text = jev.calls[0]["state"]["messages"][0]["text"]
         assert len(state_text) == 500
         assert jev.calls[0]["state"]["messages"][0]["speaker"] == "USER"
@@ -310,7 +313,8 @@ class TestAtRecognition:
 
 class TestJevTimeout:
     @pytest.mark.asyncio
-    async def test_hook_returns_within_timeout_budget(self) -> None:
+    async def test_hook_does_not_wait_for_slow_jev(self) -> None:
+        """Jev 要 2 秒：钩子立刻返回，判词在后台跑完、按原来的结果建待批请求。"""
         jev = _FakeJev({"kind": ("prepare", 0.9, 0.9)}, delay_s=2.0)
         approvals = _FakeApprovals()
         intake, signals, spawned = _make(jev=jev, approvals=approvals, jev_timeout_ms=300)
@@ -318,9 +322,10 @@ class TestJevTimeout:
         out = await intake.handle(hook_message(is_at=True, text="帮我整理资料"))
         took = time.monotonic() - t0
         assert out == {"action": "continue"}
-        assert took < 0.8, f"钩子不该等 Jev 超时太久（实际 {took:.2f}s）"
+        assert took < 0.8, f"钩子不该等 Jev（实际 {took:.2f}s）"
         assert approvals.created == []
-        assert len(intake.slow_queue) == 1
+        await _drain(spawned)     # 后台等 Jev 的外层保险是 8 秒，2 秒的判词跑得完
+        assert len(approvals.created) == 1
 
     @pytest.mark.asyncio
     async def test_jev_unavailable_no_wait_slow_queue(self) -> None:
@@ -330,6 +335,7 @@ class TestJevTimeout:
         await intake.handle(hook_message(is_at=True, text="帮我整理资料"))
         took = time.monotonic() - t0
         assert took < 0.3
+        await _drain(spawned)   # 后台：Jev 不可用 → 慢路径
         assert jev.calls == []  # 不可用根本不问
         assert len(intake.slow_queue) == 1
 

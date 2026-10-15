@@ -11,6 +11,7 @@ import { loadUsage } from "./settings/usage.js";
 import { loadIdentity } from "./settings/identity.js";
 import { loadModels } from "./settings/models.js";
 import { loadLogSummary } from "./settings/logs.js";
+import { loadAttention } from "./settings/attention.js";
 import { closeSheet, openSheet, repaintSheet } from "./sheet.js";
 import { enterChat, loadChat } from "./chat.js";
 import { render, renderRail, renderSide, renderTabbar, renderTop, renderView } from "./render.js";
@@ -108,6 +109,7 @@ export async function loadSettings() {
   try {
     state.settings = await api("GET", "/api/settings");
     if (state.loadErr) delete state.loadErr.settings;
+    await loadAttention();
   } catch (e) {
     (state.loadErr = state.loadErr || {}).settings = e.message;
     toast(e.message, true);
@@ -195,6 +197,7 @@ export async function enterSettings(sub) {
   state.extEdit = null;
   go({ page: "settings", setSub: sub || state.setSub || "overview", detail: null });
   if (!state.settings) await loadSettings();
+  else if (state.setSub === "overview") await loadAttention();
   if (state.setSub === "extensions") await loadExt();
   if (state.setSub === "agents") await loadAgents();
   if (state.setSub === "models") await loadModels();

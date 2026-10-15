@@ -429,7 +429,7 @@ class _StallGuard:
 # 2026-10 线上 T-10 复核（用户口述）：六段只是**组织框架**，不是扩搜配额；「多源」按
 # 独立来源算（转载不算独立佐证）；说法不一致 ≠ 事实矛盾；关联未知的机构不能写成
 # 已证实由同一攻击者所为。
-RESEARCH_REPORT_FRAMEWORK = (
+_RESEARCH_FRAMEWORK_BODY = (
     "这是一件调研类的活，交给群里的成果按这个框架组织，别写成一堆链接：\n"
     "1. 一句话结论；\n"
     "2. 大家都同意的；\n"
@@ -442,8 +442,29 @@ RESEARCH_REPORT_FRAMEWORK = (
     "每一点都要带链接，并标明「多源」（至少 2 个独立采集或独立确认的来源；"
     "不同站点转载同一来源，不算独立佐证）还是「单源」。\n"
     "别把说法不一致直接当成事实矛盾：置信程度或时间点不同，不自动等于事实矛盾；"
-    "对关联未知的机构，不写成已证实由同一攻击者所为。"
+    "对关联未知的机构，不写成已证实由同一攻击者所为。\n"
+    "先定问题和字段、拿不准的标 [不确定]。"
 )
+
+
+def research_report_framework(*, read_skill: bool = True, render_report: bool = True) -> str:
+    """调研活的报告框架（system_extra）；**只点名这条活真拿得到的工具**（2026-10-15 任务 B）。
+
+    - read_skill 不在名单里 → 不提「read_skill 读内置 skill」（提了是空头支票）；
+    - render_report 不在名单里 → 不提「用 render_report 交网页」，改成自己写单页。
+    两个都为 True（默认）时就是原来那段一字不差的文案（常量 RESEARCH_REPORT_FRAMEWORK）。
+    """
+    out = _RESEARCH_FRAMEWORK_BODY
+    if read_skill:
+        out += "完整做法见内置 skill research-report（read_skill 读）。"
+    if render_report:
+        out += "要交网页就用 render_report 做成统一样式的报告页。"
+    else:
+        out += "要交网页就做成单页 index.html（手机能看、不依赖外部资源）。"
+    return out
+
+
+RESEARCH_REPORT_FRAMEWORK = research_report_framework()
 
 # 线上 T-11：成品里出现了 job1 / research.md / T-11 / 「上一步」「主模型」这些内部说法，
 # 群友看得见。由 coordinator._enrich_brief 追加到**每条活**（调研 + 制作）的 brief 末尾。
@@ -479,9 +500,15 @@ def _system_prompt(
     identity: Any = None,
     extra_system: str = "",
     agent: str = "",
+    read_skill: bool = True,
 ) -> str:
     """子 agent 的 system 提示。专岗改版 3/4：agent 这一岗（kind）自己的 SOUL.md +
-    AGENTS.md 注入（不再是旧的全局 AGENTS=main 那份）；agent 空 = task（默认通用）。"""
+    AGENTS.md 注入（不再是旧的全局 AGENTS=main 那份）；agent 空 = task（默认通用）。
+
+    `read_skill`（2026-10-15 任务 B）：这一轮的工具名单里真有 read_skill 吗。没有就不提
+    「要细看就用 read_skill 读」——提了是空头支票（模型照着调会被 Tools 拒）。默认 True
+    兼容老调用；Workers.run 按本轮硬名单传真值。
+    """
     prefix = ""
     kind_s = str(agent or "task").strip() or "task"
     if identity is not None:
@@ -512,11 +539,18 @@ def _system_prompt(
         lines.append(extra)
     hint = str(skills_hint or "").strip()
     if hint:
-        lines.append(
-            "可用的 skill（管理员放的技能说明；要细看就用 read_skill 读，"
-            "里面的脚本要先把内容 write_file 到自己的工作区再跑，不直接执行数据目录里的东西）：\n"
-            + hint
-        )
+        if read_skill:
+            lines.append(
+                "可用的 skill（管理员放的技能说明；要细看就用 read_skill 读，"
+                "里面的脚本要先把内容 write_file 到自己的工作区再跑，不直接执行数据目录里的东西）：\n"
+                + hint
+            )
+        else:
+            # 这一轮名单里没有 read_skill：清单照给（名字 / 说明本身有用），但不提读它的工具
+            lines.append(
+                "可用的 skill（管理员放的技能说明；这一轮没有读全文的工具，"
+                "按这里的说明做）：\n" + hint
+            )
     body = "\n".join(lines)
     return (prefix + body) if prefix else body
 
@@ -671,6 +705,8 @@ class Workers:
             {"role": "system", "content": _system_prompt(
                 actor, group_id, output_schema, self._hint(skills_hint),
                 identity=self._identity, extra_system=system_extra, agent=str(agent_type or "task"),
+                # 双保险（2026-10-15 任务 B）：名单里没有 read_skill 就不在提示里点名它
+                read_skill="read_skill" in hard_tools,
             )},
         ]
         if history:

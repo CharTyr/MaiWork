@@ -88,6 +88,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 from . import clock, goals, idea_feasibility, members, news_rating, news_standard, search_stats
 from . import page_date, source_name, verify_budget
 from .config import Settings, normalize_domain as _normalize_domain
+from .environments import vm_platforms
 from .models import ModelError
 from .search import SearchUnavailable
 from .store import Store
@@ -5255,6 +5256,12 @@ class Feeds:
         gc = self._group_context_safe(gid, "idea")
         if gc:
             prefix_parts.append(gc.strip())
+        # 内置 skill idea-shaping（main 角色）：这一回合是纯 JSON 调用、没有 skill 工具，要点直接注入
+        from .skills import guidance as _skill_guidance
+
+        shaping = _skill_guidance(getattr(self, "_skills", None), "idea-shaping")
+        if shaping:
+            prefix_parts.append(shaping)
         lines = ([p for p in prefix_parts] if prefix_parts else []) + ["这是一个 QQ 群的画像要点："]
         for e in entries[:25]:
             lines.append(f"- [{e.get('category', '')}] {e.get('text', '')}")
@@ -6141,16 +6148,19 @@ class Feeds:
         return out
 
     def _attach_viz(self, items: list[dict]) -> None:
-        """每条带 viz：有没有核对过的图解（有就前端按需取 /api/news/{id}/viz）。"""
+        """每条带 viz：核对过的图解是哪种（前端按需取 /api/news/{id}/viz）。
+
+        "spec" = 零件清单图解（2026-10-15 起，网页原生画）；"html" = 老 HTML 图解（沙箱 iframe）；
+        False = 没有。"""
         try:
             from . import news_viz
 
-            st = news_viz.status_of(self._store, [int(it["id"]) for it in items])
+            st = news_viz.kinds_of(self._store, [int(it["id"]) for it in items])
         except Exception:
             logger.exception("读图解状态出错，视图里先不带")
             st = {}
         for it in items:
-            it["viz"] = st.get(int(it["id"])) == "ok"
+            it["viz"] = st.get(int(it["id"])) or False
 
     def _attach_ratings(self, items: list[dict]) -> None:
         """管理员视图：每条带群友评价汇总 ratings={counts,total,notes}（没人评的不带）。
@@ -6418,7 +6428,9 @@ async def run_railway_verify(
       以 submit_result 收尾；时间受 _VERIFY_BUDGET_S 约束），
       brief 写清「只做只读/无副作用的验证」；
     - 实测总时长上限 20 分钟（_VERIFY_BUDGET_S）：到钟就不再派下一条，没测的不留半截；
-    - 用完必 release（本地删 key 目录；远端没有销毁命令，只能等它过期）；
+    - 用完必 release：railway 只能本地删 key 等它过期；Freestyle 会真发 DELETE 销毁；
+    - 单条命令上限按平台走（Freestyle 5 分钟、railway 10 分钟），brief 里写实际值，
+      不让子 agent 以为能跑 600 秒（docs/02 §9 T-7 那类假能力事故）；
     - 直接改写 items[i]["verify"]（结构见 _verify_dict）；单条崩溃只算那一单 failed。
     """
     minutes = max(1, int(getattr(settings.environments, "verify_minutes", 10) or 10))
@@ -6456,7 +6468,7 @@ async def run_railway_verify(
                 continue
             item = items[idx]
             t0 = clock.now()
-            brief = _verify_brief(item, plan, minutes, gid)
+            brief = _verify_brief(item, plan, minutes, gid, box=box, env=env)
             try:
                 report = await workers.run(
                     brief,
@@ -6478,11 +6490,29 @@ async def run_railway_verify(
                 logger.exception("释放一次性 VM 出错（群 %s）", gid)
 
 
-def _verify_brief(item: dict, plan: dict, minutes: int, gid: str) -> str:
-    """实测子 agent 的 brief：只读/无副作用的规矩写死，10 分钟内做完。"""
+def _verify_brief(item: dict, plan: dict, minutes: int, gid: str, *, box: Any = None, env: Any = None) -> str:
+    """实测子 agent 的 brief：只读/无副作用的规矩写死。
+
+    2026-10-15：机器名 / 规格 / 单条命令上限 / 远端根目录按**实际拿到的平台**写，
+    不再写死 railway 的「2 vCPU / 2G、60 分钟」（Freestyle 是 2 核 4G 且单条命令
+    最多 5 分钟）——brief 里说能跑 600 秒、实际被平台掐断就是假能力。
+    """
     del gid
+    kind = str(getattr(box, "kind", "") or "railway")
+    preset = vm_platforms.get(kind)
+    label = preset.label if preset is not None else kind
+    spec = ""
+    if preset is not None:
+        snap = preset.snapshot_spec(str(getattr(box, "snapshot", "") or preset.default_snapshot))
+        spec = (snap.label.split("·")[0].strip() if snap is not None else "") or preset.fixed_spec
+    root = str(getattr(box, "remote_root", "") or "/app").rstrip("/") or "/app"
+    try:
+        per_cmd = int(getattr(env, "max_run_timeout_s", 0) or 0) or 600
+    except (TypeError, ValueError):
+        per_cmd = 600
+    machine = f"{label} 一次性 Linux VM" + (f"（{spec}）" if spec else "")
     lines = [
-        "你的任务：在一台一次性 Linux VM（2 vCPU / 2G，60 分钟后自动销毁）里实测下面这条内容。",
+        f"你的任务：在一台{machine}里实测下面这条内容。",
         "",
         f"条目：{item.get('title', '')}",
         f"链接：{item.get('url', '')}",
@@ -6490,14 +6520,15 @@ def _verify_brief(item: dict, plan: dict, minutes: int, gid: str) -> str:
         f"要验证什么：{str(plan.get('what') or '')[:200]}",
         f"预期结果：{str(plan.get('expect') or '')[:200]}",
         "",
-        "工具：vm_run（在 VM 里跑命令）、vm_put_file（把工作区里你写的测试脚本传到 VM /app 下）、"
-        "vm_read_file（读 VM 上 /app 下的文件）。",
+        f"工具：vm_run（在 VM 里跑命令）、vm_put_file（把工作区里你写的测试脚本传到 VM 的 {root}/ 下）、"
+        f"vm_read_file（读 VM 上 {root}/ 下的文件）。",
         "",
         "硬规矩：",
         "1. **只做只读 / 无副作用的验证**：安装、跑示例、看输出；",
         "2. 不注册账号、不填任何密钥、不访问要登录的服务、不联网拉来路不明的脚本直接跑；",
         "3. VM 是干净的临时机：别往里放任何隐私或密钥；",
-        f"4. {minutes} 分钟内做完（timeout_s 别超过 600 秒）；做完用 submit_result 交回：",
+        f"4. 整条实测预算约 {minutes} 分钟；**单条命令平台最多 {per_cmd} 秒**（vm_run 会自动夹到上限），"
+        "要跑更久的活用 setsid -f 起后台进程 + 短命令轮询 .exit 文件；做完用 submit_result 交回：",
         '   data = {"status": "passed" 或 "failed", "summary": "一句话结论", '
         '"steps": ["做了什么，≤6 条，每条一句话，写明关键输出/坑"]}。',
         "   验证结果和「预期结果」对得上才是 passed；对不上、装不上、跑不通都是 failed，如实交回。",

@@ -167,7 +167,7 @@ def _default_profiles() -> dict[str, dict[str, Any]]:
             "kind": "news",
             "title": "资讯",
             "instructions": "为群找值得看的资讯：先读画像与关注点，再撒网搜索、逐条打开核对。",
-            "skills": ["news-standard", *_SEARCH_SKILLS],
+            "skills": ["news-standard", "news-verify", *_SEARCH_SKILLS],
             "enabled": True,
             "tools": list(_SPECIALIST_TOOLS),
             "fish_seed": "",
@@ -320,7 +320,22 @@ class Agents:
         if bad:
             raise ValueError(f"不允许改的字段：{sorted(bad)}")
         current = self.profile(kind_s)
-        model_entries = _model_entries_of(self._settings())
+        settings = self._settings()
+        model_entries = _model_entries_of(settings)
+        # 生图模型不能当聊天 / 干活模型：给一条专门的说明（别让人以为是「库里没有」）
+        for key in ("model", "backup"):
+            raw_id = patch.get(key)
+            if not isinstance(raw_id, str) or not raw_id.strip():
+                continue
+            eid = raw_id.strip()
+            if eid in model_entries:
+                continue
+            img_name = _image_entry_name(settings, eid)
+            if img_name is not None:
+                raise ValueError(
+                    f"「{img_name}」是生图模型，不能当聊天 / 干活模型用；"
+                    "请到「模型」页选一个用途是「聊天」的条目（生图模型在设置 → 模型里点「设为生图模型」）"
+                )
         if kind_s == "main" and "escalate" in patch:
             raise ValueError("主模型岗没有「做不动时换用」：它只排计划和验收，不亲自干活")
         clean = _validate_profile_patch(patch, model_entries=model_entries, current=current)
@@ -1653,7 +1668,11 @@ _EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
 
 def _model_entries_of(settings: Any) -> dict[str, Any]:
-    """settings.model_list → {模型条目 id: ModelEntry}；拿不到 / 坏了按空库（校验一律不通过）。"""
+    """settings.model_list → {模型条目 id: ModelEntry}；拿不到 / 坏了按空库（校验一律不通过）。
+
+    2026-10-15 生图第一期：use="image" 的条目**不在里面**——专岗选不了生图模型
+    （写路径 400 拒；读路径把库里存的这种选择按「没选」处理）。
+    """
     out: dict[str, Any] = {}
     try:
         entries = getattr(settings, "model_list", ()) or ()
@@ -1662,11 +1681,31 @@ def _model_entries_of(settings: Any) -> dict[str, Any]:
     for e in entries:
         try:
             eid = str(getattr(e, "id", "") or "")
+            if str(getattr(e, "use", "chat") or "chat").strip().lower() == "image":
+                continue
         except Exception:
             continue
         if eid:
             out[eid] = e
     return out
+
+
+def _image_entry_name(settings: Any, entry_id: str) -> str | None:
+    """这个 id 是不是一个 use="image" 的生图条目？是就回它的显示名（给中文报错用），不是回 None。"""
+    try:
+        entries = getattr(settings, "model_list", ()) or ()
+    except Exception:
+        return None
+    for e in entries:
+        try:
+            if str(getattr(e, "id", "") or "") != entry_id:
+                continue
+            if str(getattr(e, "use", "chat") or "chat").strip().lower() != "image":
+                return None
+            return str(getattr(e, "name", "") or "") or entry_id
+        except Exception:
+            return None
+    return None
 
 
 def _efforts_of(entry: Any) -> tuple[str, ...]:

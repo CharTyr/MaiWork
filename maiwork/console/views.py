@@ -10,11 +10,13 @@ import hashlib
 import json
 import logging
 import re
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 from .. import clock, members
 from ..names import clean_group_name
+from ..pending_asks import review_wait_s
 
 logger = logging.getLogger("maiwork.console.views")
 
@@ -29,6 +31,9 @@ CATEGORIES: tuple[tuple[str, str], ...] = (
     ("resource", "常用资源"),
 )
 CATEGORY_KEYS = {k for k, _ in CATEGORIES}
+
+# 待复核汇总里每条原话摘要最长多少个字（超了截断加省略号，2026-10-15）
+ASKS_REVIEW_TEXT_MAX = 60
 
 # 不适合当群图标的：设置、锁、睡觉；fish 是设置里「专岗」专用（2026-09-30 加的），
 # 也不进群头像候选——否则多一张图，所有群按群号取模挑到的图标会整体错位。
@@ -151,7 +156,8 @@ def _group_avatar_path(svc: Any, group_id: str) -> str:
 
 
 def _m3_today_counts(svc: Any, group_id: str) -> dict[str, int]:
-    """today.pending = 本群待批件数；today.running = 本群 running 任务数（真值）。"""
+    """today.pending = 本群待批件数；today.running = 本群 running 任务数（真值）；
+    today.asks_review = 本群待复核 @ 请求条数（2026-10-15 加，网页拿它显示提醒）。"""
     pending = 0
     try:
         appr = getattr(svc, "approvals", None)
@@ -166,7 +172,28 @@ def _m3_today_counts(svc: Any, group_id: str) -> dict[str, int]:
             running = int(tasks.running_count(group_id) or 0)
     except Exception:
         running = 0
-    return {"pending": pending, "running": running}
+    return {"pending": pending, "running": running, "asks_review": _asks_review_count(svc, group_id)}
+
+
+def _pending_asks_of(svc: Any) -> Any:
+    """挂在 svc.profiles 上的 PendingAsks；没接线 / 模块没就位 → None。"""
+    return getattr(getattr(svc, "profiles", None), "pending_asks", None)
+
+
+def _asks_review_count(svc: Any, group_id: str) -> int:
+    """本群待复核 @ 请求条数（真值，不受列表 100 条上限影响）；读不到算 0（视图绝不 500）。"""
+    pa = _pending_asks_of(svc)
+    if pa is None:
+        return 0
+    try:
+        return int(pa.review_count(group_id) or 0)
+    except Exception:
+        return 0
+
+
+def _review_why(row: dict[str, Any]) -> str:
+    """这条待复核为什么卡着（大白话）；绝不把 last_error 原文送出去（可能带端点/密钥）。"""
+    return "处理失败，重试后仍未办成" if row.get("last_error") else "超过 48 小时仍未办成"
 
 
 def _base_summary(svc: Any, group_id: str, row: dict[str, Any], now: float, *, m2: dict[str, int] | None = None) -> dict[str, Any]:
@@ -205,6 +232,8 @@ def _base_summary(svc: Any, group_id: str, row: dict[str, Any], now: float, *, m
             "topics": int((m2 or {}).get("topics", 0)),
             "pending": m3["pending"],
             "running": m3["running"],
+            # 待复核 @ 请求（2026-10-15）：首页/导航的「待办」类汇总，前端直接显示
+            "asks_review": m3["asks_review"],
         },
     }
 
@@ -231,6 +260,104 @@ def list_summaries(svc: Any, *, admin: bool, only_group_id: str | None = None) -
             item.pop("token", None)
         out.append(item)
     return out
+
+
+# ----------------------------------------------------------------------
+# 待复核 @ 请求的汇总（2026-10-15 线上：9 条 review 最老 17 天没人管）
+# ----------------------------------------------------------------------
+
+
+def _wait_text(seconds: float) -> str:
+    """等待时长的中文写法：不到 1 分钟 / N 分钟 / N 小时 / N 天。"""
+    try:
+        s = max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        s = 0.0
+    if s < 60:
+        return "不到 1 分钟"
+    if s < 3600:
+        return f"{int(s // 60)} 分钟"
+    if s < 86400:
+        return f"{int(s // 3600)} 小时"
+    return f"{int(s // 86400)} 天"
+
+
+def _ask_review_item(row: dict[str, Any], now: float, group_name: str) -> dict[str, Any]:
+    """一条待复核的网页形状：群 / 发起人昵称 / 原话摘要 / 等了多久；不含 last_error 原文。"""
+    text = str(row.get("text") or "").strip()
+    if len(text) > ASKS_REVIEW_TEXT_MAX:
+        text = text[: ASKS_REVIEW_TEXT_MAX - 1] + "…"
+    wait = review_wait_s(row, now)
+    return {
+        "group_id": str(row.get("group_id") or ""),
+        "group_name": group_name,
+        "message_id": str(row.get("message_id") or ""),
+        "user_id": str(row.get("user_id") or ""),
+        "user_name": str(row.get("user_name") or "") or "群成员",
+        "text": text,
+        "ts": float(row.get("ts") or 0.0),
+        "first_seen": float(row.get("first_seen") or 0.0),
+        "wait_s": wait,
+        "wait_text": _wait_text(wait),
+        "attempts": int(row.get("attempts") or 0),
+        "why": _review_why(row),
+        "kind": "goal" if (row.get("decision") or {}).get("kind") == "goal" else "task",
+    }
+
+
+def asks_review_summary(svc: Any, *, only_group_id: str | None = None) -> dict[str, Any]:
+    """全部服务群的「待复核 @ 请求」汇总（管理员看；纯读，不调模型、不发消息）。
+
+    返回 `{"total", "shown", "group_count", "oldest_wait_s", "oldest_wait_text", "group_counts", "items"}`；
+    `total` 是各群真实计数之和（每群取 `review_count` 与本次列出条数的**较大者**，所以至少不小于
+    `items` 里列出来的明细数），`items` 最老的在前（每群最多列最老 100 条，`shown` 是列出来的条数）；
+    `group_counts` 是 `{群号: 真实条数}`（口径同 `total`，只含有待复核的群；2026-10-15 发版前修复：
+    `items` 每群封顶 100 条，前端照 `items` 自己数群计数会把 101 条显示成 100 条）；
+    `group_count` 是 `group_counts` 里的群数；
+    每条带群号 / 群名 / 发起人昵称 / 原话摘要 / 等了多久 / 为什么卡着。
+    只统计配置里的服务群；读不到待复核模块算空，视图绝不 500。
+    """
+    now = clock.now()
+    gids = _served_group_ids(svc)
+    if only_group_id is not None:
+        gids = [g for g in gids if str(g) == str(only_group_id)]
+    pa = _pending_asks_of(svc)
+    items: list[dict[str, Any]] = []
+    total = 0
+    group_counts: dict[str, int] = {}
+    if pa is not None:
+        for gid in gids:
+            try:
+                count = int(pa.review_count(gid) or 0)
+                rows = pa.review_view(gid) or []
+            except Exception:
+                logger.exception("读待复核失败（群 %s）", gid)
+                continue
+            name = clean_group_name(_group_row(svc, gid).get("name") or "", gid)
+            listed = 0
+            for r in rows:
+                if isinstance(r, dict):
+                    items.append(_ask_review_item(dict(r, group_id=gid), now, name))
+                    listed += 1
+            # 群计数走 review_count（真值，不受 100 条上限影响）；万一计数读成 0 却有明细，
+            # 兜底用明细条数，保证前端按 group_counts / total 显示时不会比列出来的还少
+            # （total=0 而 shown=1 会让前端把整块藏起来，真躺在待复核里的那条就没人看见）。
+            real = max(count, listed)
+            total += real
+            if real > 0:
+                group_counts[str(gid)] = real
+    # 最老的排前面（等了越久越要紧）
+    items.sort(key=lambda x: (x["wait_s"], x["message_id"]), reverse=True)
+    oldest = float(items[0]["wait_s"]) if items else 0.0
+    return {
+        "total": total,
+        "shown": len(items),
+        "group_count": len(group_counts),
+        "oldest_wait_s": oldest,
+        "oldest_wait_text": _wait_text(oldest) if items else "",
+        "group_counts": group_counts,
+        "items": items,
+    }
 
 
 def _profile_sections(svc: Any, group_id: str) -> list[dict[str, Any]]:
@@ -851,6 +978,8 @@ def secret_list(svc: Any) -> list[str]:
         settings = svc.get_settings()
         if settings is not None:
             _add(getattr(settings.models, "api_key", ""))
+            # Freestyle 的账号级 API key（2026-10-15）：和模型密钥同级，进同一份遮罩名单
+            _add(getattr(getattr(settings, "environments", None), "freestyle_api_key", ""))
             for endpoint in getattr(settings, "endpoints", ()) or ():
                 _add(getattr(endpoint, "api_key", ""))
                 for header_value in dict(getattr(endpoint, "headers", {}) or {}).values():
@@ -1000,18 +1129,17 @@ def group_view(svc: Any, group_id: str, *, admin: bool) -> dict[str, Any]:
         "agent_fish": _agent_fish(svc),
     }
     if admin:
-        pa = getattr(getattr(svc, "profiles", None), "pending_asks", None)
+        pa = _pending_asks_of(svc)
         review = []
         review_error = ""
         if pa is not None:
             try:
                 for r in pa.review_view(group_id):
                     # 不把异常原文送浏览器：可能带端点、模型密钥或其他群信息。
-                    why = "处理失败，重试后仍未办成" if r.get("last_error") else "超过 48 小时仍未办成"
                     decision = r.get("decision") or {}
                     review.append({"message_id": r["message_id"], "text": r["text"],
                                    "who": r["user_name"] or "群成员", "ts": r["ts"],
-                                   "why": why, "attempts": r.get("attempts", 0),
+                                   "why": _review_why(r), "attempts": r.get("attempts", 0),
                                    "kind": "goal" if decision.get("kind") == "goal" else "task"})
             except Exception:
                 review_error = "待复核暂时无法读取，请稍后刷新"
@@ -1334,7 +1462,7 @@ def _railway_health(svc: Any) -> dict[str, Any] | None:
     状态全部从 kv 读（railway.day.<北京日期> / railway.last_fail / railway.last_acquire），
     网页不用有 RailwayEnv 实例也能显示。
     """
-    base = {"key": "railway", "icon": "cloud", "name": "临时机器"}
+    base = {"key": "railway", "icon": "cloud", "name": "临时机器 · Railway"}
     settings = svc.get_settings()
     env = getattr(settings, "environments", None) if settings is not None else None
     if env is None:
@@ -1380,6 +1508,86 @@ def _railway_health(svc: Any) -> dict[str, Any] | None:
     return {**base, "state": "ok", "text": f"可用 · 今天用了 {used}/{daily_max} 台"}
 
 
+def _freestyle_health(svc: Any) -> dict[str, Any] | None:
+    """一次性 VM（Freestyle）健康项（2026-10-15，调研 §3.6）。
+
+    - [environments] 里没有 environments 节（老 stub）→ None，不出现在健康列表里；
+    - 现在选的不是 Freestyle → off「没在用」（和 railway 那条二选一，不同时列）；
+    - 选了但没填 key → warn「还没填 API key」；
+    - 密钥验不过（后台 check_key 写过 kv["freestyle.key_check"]，24 小时内）→ warn；
+    - 否则 ok「可用 · 今天用了 N/<上限> 台」。
+
+    **验 key 的网络请求在后台**（app._maybe_check_freestyle → FreestyleEnv.check_key →
+    GET /v5/vms?limit=1），这里只读缓存：视图函数是同步的，不能在里头发请求。
+    状态从 kv 读（freestyle.day.<北京日期> / freestyle.last_fail / freestyle.key_check），
+    网页不用有 FreestyleEnv 实例也能显示。
+    """
+    base = {"key": "freestyle", "icon": "cloud", "name": "临时机器 · Freestyle"}
+    settings = svc.get_settings()
+    env = getattr(settings, "environments", None) if settings is not None else None
+    if env is None:
+        return None
+    from ..environments import vm_platforms
+
+    if "freestyle" not in vm_platforms.enabled_kinds(settings):
+        return {**base, "state": "off", "text": "没开（设置 → 干活机器 → Freestyle 临时机器）"}
+    if not vm_platforms.api_key_of("freestyle", settings):
+        return {**base, "state": "warn", "text": "还没填 Freestyle 密钥（设置 → 干活机器）"}
+    daily_max = max(1, int(getattr(env, "freestyle_daily_max", 2) or 2))
+    used = 0
+    last_fail: dict | None = None
+    last_acquire_ts = 0.0
+    key_check: dict | None = None
+    store = getattr(svc, "store", None)
+    if store is not None:
+        try:
+            rec = store.kv_get(f"freestyle.day.{clock.day_key(clock.now())}", None)
+            if isinstance(rec, dict):
+                acquires = rec.get("acquires")
+                if isinstance(acquires, list):
+                    used = len([x for x in acquires if isinstance(x, (int, float))])
+                else:
+                    used = int(rec.get("count", 0) or 0)
+        except Exception:
+            used = 0
+        try:
+            lf = store.kv_get("freestyle.last_fail", None)
+            if isinstance(lf, dict):
+                last_fail = lf
+        except Exception:
+            last_fail = None
+        try:
+            la = store.kv_get("freestyle.last_acquire", None)
+            if isinstance(la, dict):
+                last_acquire_ts = float(la.get("ts", 0) or 0)
+        except Exception:
+            last_acquire_ts = 0.0
+        try:
+            kc = store.kv_get("freestyle.key_check", None)
+            if isinstance(kc, dict):
+                key_check = kc
+        except Exception:
+            key_check = None
+    # 密钥验不过（后台刚验过、24 小时内）优先报：这是「用户要先修的事」
+    if key_check is not None and not bool(key_check.get("ok", True)):
+        try:
+            kc_ts = float(key_check.get("ts", 0) or 0)
+        except (TypeError, ValueError):
+            kc_ts = 0.0
+        if clock.now() - kc_ts < 86400.0:
+            reason = str(key_check.get("text") or "").strip() or "原因不明"
+            return {**base, "state": "warn", "text": f"密钥验不过：{reason}"}
+    if last_fail is not None:
+        try:
+            fail_ts = float(last_fail.get("ts", 0) or 0)
+        except (TypeError, ValueError):
+            fail_ts = 0.0
+        if fail_ts > last_acquire_ts and clock.now() - fail_ts < 86400.0:
+            reason = str(last_fail.get("reason") or "").strip() or "原因不明"
+            return {**base, "state": "warn", "text": f"最近一次没拿到机器：{reason}"}
+    return {**base, "state": "ok", "text": f"可用 · 今天用了 {used}/{daily_max} 台"}
+
+
 def _bot_info(svc: Any) -> dict[str, str]:
     """bot 名字从 host 的预热缓存拿，拿不到用 MaiBot。
 
@@ -1399,6 +1607,112 @@ def _bot_info(svc: Any) -> dict[str, str]:
     except Exception:
         avatar = "/static/assets/logo.png"
     return {"name": name or "MaiBot", "avatar": avatar}
+
+
+# 生图用量（2026-10-15 任务 A5）：数据源是 kv["imagegen.calls"]（tools_imagegen 记账）。
+_IMAGEGEN_WEEK_DAYS = 7
+
+
+def imagegen_usage(svc: Any) -> dict[str, Any]:
+    """生图用量小节：今天 / 近 7 天的调用次数、出图张数、失败次数 + 最近一次失败原因。
+
+    网页直接读的 JSON 字段（`/api/settings` 的 usage.imagegen 与 `/api/usage/history` 的
+    imagegen 同一份）：
+
+        {"configured": bool,        # 现在配没配生图模型
+         "model": str,              # 当前在用的生图模型显示名（没配 = ""；没有显示名就是模型名）
+         "model_id": str,           # 服务商模型名（如 gpt-image-1）
+         "today": {"calls": int, "images": int, "failed": int},
+         "week":  {"calls": int, "images": int, "failed": int},   # 近 7 天含今天
+         "days":  [{"day": "YYYY-MM-DD", "calls": int, "images": int, "failed": int}…],  # 近 7 天升序、缺的天补 0
+         "total": {"calls": int, "images": int, "failed": int},   # 累计（含老记录）
+         "last_failure": {"ts": float, "model": str, "error": str} | null}
+
+    读不到库 / 记录是坏数据一律当 0，视图绝不 500。老记录没有 `days`（2026-10-15 之前记的）
+    → 今天 / 近 7 天算 0，累计照旧给出来；老记录的 `last_error` 且 `last_ok=false` 也当
+    「最近一次失败原因」用。
+    """
+    zero = {"calls": 0, "images": 0, "failed": 0}
+    out: dict[str, Any] = {
+        "configured": False, "model": "", "model_id": "",
+        "today": dict(zero), "week": dict(zero), "days": [],
+        "total": dict(zero), "last_failure": None,
+    }
+
+    def _int(v: Any) -> int:
+        try:
+            n = int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+        return n if n > 0 else 0
+
+    # 配没配生图模型：复用生图自己的判定（use="image" 的条目 + 端点有地址密钥）
+    try:
+        from ..tools_imagegen import image_entries, pick_image_entry
+
+        settings = svc.get_settings()
+        entries = image_entries(settings)
+        out["configured"] = bool(entries)
+        if entries:
+            entry = pick_image_entry(settings, getattr(svc, "store", None))
+            out["model_id"] = str(getattr(entry, "model", "") or "")
+            out["model"] = str(getattr(entry, "name", "") or "") or out["model_id"]
+    except Exception:
+        logger.debug("读生图模型配置失败，按「没配」处理", exc_info=True)
+
+    stat: dict = {}
+    try:
+        store = getattr(svc, "store", None)
+        rec = store.kv_get("imagegen.calls") if store is not None else None
+        if isinstance(rec, dict):
+            stat = rec
+    except Exception:
+        logger.debug("读生图记账失败，按 0 处理", exc_info=True)
+
+    out["total"] = {
+        "calls": _int(stat.get("total")),
+        "images": _int(stat.get("images")),
+        "failed": _int(stat.get("failed")),
+    }
+    today = clock.bj(clock.now()).date()
+    day_list = [
+        (today - timedelta(days=i)).isoformat()
+        for i in range(_IMAGEGEN_WEEK_DAYS - 1, -1, -1)
+    ]
+    raw_days = stat.get("days") if isinstance(stat.get("days"), dict) else {}
+    days_out: list[dict[str, Any]] = []
+    week = {"calls": 0, "images": 0, "failed": 0}
+    for key in day_list:
+        bucket = raw_days.get(key) if isinstance(raw_days.get(key), dict) else {}
+        item = {
+            "day": key,
+            "calls": _int(bucket.get("calls")),
+            "images": _int(bucket.get("images")),
+            "failed": _int(bucket.get("failed")),
+        }
+        days_out.append(item)
+        week["calls"] += item["calls"]
+        week["images"] += item["images"]
+        week["failed"] += item["failed"]
+    out["days"] = days_out
+    out["week"] = week
+    out["today"] = {k: v for k, v in days_out[-1].items() if k != "day"}
+
+    err = str(stat.get("last_failure_error") or "").strip()
+    ts_raw = stat.get("last_failure_ts")
+    model = str(stat.get("last_failure_model") or "")
+    if not err and not bool(stat.get("last_ok", True)):
+        # 老记录（2026-10-15 之前）：只有「最近一次调用失败」的字段，也当最近一次失败给出来
+        err = str(stat.get("last_error") or "").strip()
+        ts_raw = stat.get("last_ts")
+        model = str(stat.get("last_model") or "")
+    if err:
+        try:
+            ts = float(ts_raw or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        out["last_failure"] = {"ts": ts, "model": model, "error": err}
+    return out
 
 
 def settings_view(svc: Any) -> dict[str, Any]:
@@ -1514,9 +1828,19 @@ def settings_view(svc: Any) -> dict[str, Any]:
     ssh_health = _ssh_health(svc)
     if ssh_health is not None:
         health.append(ssh_health)
-    railway_health = _railway_health(svc)
-    if railway_health is not None:
-        health.append(railway_health)
+    # 一次性 VM：railway 与 freestyle 各自开关、可同时开（2026-10-15 用户定）。
+    # 开着的都列出来、优先那家在前；一家都没开时照旧显示 railway 那条（它会写「没开」）。
+    from ..environments import vm_platforms as _vm_platforms
+
+    _vm_settings = svc.get_settings()
+    try:
+        _vm_on = _vm_platforms.enabled_kinds(_vm_settings) if _vm_settings is not None else ("railway",)
+    except Exception:
+        _vm_on = ("railway",)
+    for _kind in (_vm_on or ("railway",)):
+        _h = _freestyle_health(svc) if _kind == "freestyle" else _railway_health(svc)
+        if _h is not None:
+            health.append(_h)
     # 用量提醒（docs/02 §7.2）：超阈值只在网页标出，不往群里发；只列今天产生的
     try:
         from ..usage_alerts import today_alerts
@@ -1530,6 +1854,8 @@ def settings_view(svc: Any) -> dict[str, Any]:
             "today": usage_today,
             "alert_daily_tokens": alert,
             "alerts": usage_alerts_today,
+            # 生图用量（2026-10-15 任务 A5）：字段见 imagegen_usage 的说明
+            "imagegen": imagegen_usage(svc),
         },
         "health": health,
         "rules": rules,

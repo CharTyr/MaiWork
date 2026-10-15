@@ -11,6 +11,7 @@ import { sourcesPage } from "./sources.js";
 import { memoryPage } from "./identity.js";
 import { fullLink, modelsPage } from "./models.js";
 import { updateSection } from "../update.js";
+import { attentionSection } from "./attention.js";
 
 /* ───────────── 设置 / 群切换（抽屉） ───────────── */
 
@@ -127,7 +128,7 @@ function settingsOverview(s) {
       <button class="gpick" data-act="group" data-g="${esc(g.id)}">
         ${gface(g)}
         <span class="gpick-t"><span class="gpick-name" style="display:block;font-size:16px">${mq(gname(g))}</span>
-        <span class="gpick-sub">${g.fresh ? "新加入 · 正在建立群画像" : `今日：资讯 ${g.today.news} · 话题 ${g.today.topics} · 待审批 ${g.today.pending}`}</span></span>
+        <span class="gpick-sub">${g.fresh ? "新加入 · 正在建立群画像" : `今日：资讯 ${g.today.news} · 话题 ${g.today.topics} · 待审批 ${g.today.pending}${g.today.asks_review ? ` · 待复核 ${g.today.asks_review}` : ""}`}</span></span>
         <span class="chev" style="color:var(--gray-2)">${SVG.right}</span>
       </button>`
             )
@@ -135,6 +136,7 @@ function settingsOverview(s) {
         : `<p class="h-meta">暂无群 <button type="button" class="link-btn" data-act="cfg-goto" data-s="groups">添加</button></p>`
     }
     ${onbBanner(s.onboarding)}
+    ${attentionSection()}
     ${s.models && !s.models.ready ? `<div class="warn-box" style="margin-top:18px">未配置模型，MaiWork 无法运行<button class="btn small" data-act="set-sub" data-sub="models" style="margin-left:8px">前往设置</button></div>` : ""}
     <div class="h-sub-row"><h2 class="h-sub">用量</h2><button class="btn small" data-act="set-sub" data-sub="usage">查看</button></div>
     ${

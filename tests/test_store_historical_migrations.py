@@ -80,7 +80,7 @@ CREATE INDEX IF NOT EXISTS idx_chat_feeds_key ON chat_feeds(group_id, key);
 STEP_PROFILE = 2      # _m_profile
 STEP_CHAT_FEEDS = 31  # _m_chat_feeds
 STEP_CHAT_LOG_IDS = 40  # _m_chat_log_ids（FTS5 chat_log 的去重账本）
-LATEST = len(_MIGRATIONS)  # 40（34 = 历史步骤 + 35 task_lanes + 36 brief + 37 lane 原始历史
+LATEST = len(_MIGRATIONS)  # 41（34 = 历史步骤 + 35 task_lanes + 36 brief + 37 lane 原始历史
 #                              + 38 构想 kind + 39 goal fit + 40 chat_log 去重账本）
 
 _DEAD_MODULE = "CharTyr_MaiWork.maiwork.chat_feed"

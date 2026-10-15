@@ -1,0 +1,121 @@
+/* 图解零件（viz_spec.py 渲染出来的 .vs 块）的样式——唯一一份：
+   网页直接 <link> 它；卡片截图、交付网页（render_report）由 Python 读这份文件内嵌进去。
+   颜色全部取站点变量（--ink / --fill / --blue …），深浅色跟着站点走；单独成页时由
+   viz_spec.page() 补上同名变量。不许写脚本、不许引用外部资源。 */
+.vs {
+  --vs-ink: var(--ink, #111114);
+  --vs-ink2: var(--ink-2, #3a3a3c);
+  --vs-muted: var(--gray, #8a8a8e);
+  --vs-line: var(--line, #ececf0);
+  --vs-fill: var(--fill, #f2f2f5);
+  --vs-card: var(--fill-2, #f7f7f9);
+  --vs-accent: var(--blue, #2f6fe8);
+  --vs-good: var(--green, #34c759);
+  --vs-bad: var(--red, #ff3b30);
+  --vs-warn: var(--orange, #ff9f0a);
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border-radius: 18px;
+  background: var(--vs-card);
+  border: 1px solid var(--vs-line);
+  color: var(--vs-ink);
+  font-size: 14px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.vs * { box-sizing: border-box; }
+.vs-title { margin: 0; font-size: 16px; font-weight: 700; letter-spacing: -0.01em; }
+.vs-cap { margin: -8px 0 0; color: var(--vs-muted); font-size: 12px; }
+.vs-h { margin: 6px 0 -4px; font-size: 18px; font-weight: 700; }
+.vs-p { margin: 0; color: var(--vs-ink2); }
+.vs-num { font-variant-numeric: tabular-nums; }
+.vs-good { color: var(--vs-good); }
+.vs-bad { color: var(--vs-bad); }
+.vs-warn { color: var(--vs-warn); }
+
+/* 大数字 / 数字组 */
+.vs-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+.vs-stat { padding: 12px 14px; border-radius: 14px; background: var(--vs-fill); min-width: 0; }
+.vs-stat-v { font-size: 28px; font-weight: 750; line-height: 1.15; letter-spacing: -0.02em; }
+.vs-stat-v small { margin: 0 2px; font-size: 14px; font-weight: 600; color: var(--vs-ink2); }
+.vs-stat-l { margin-top: 4px; color: var(--vs-ink2); font-size: 13px; }
+.vs-stat-c { margin-top: 2px; font-size: 12px; font-weight: 650; }
+.vs-stat-n { margin-top: 2px; color: var(--vs-muted); font-size: 12px; }
+.vs-stats.one .vs-stat-v { font-size: 40px; }
+
+/* 对比条（横向） */
+.vs-cmp { display: grid; gap: 8px; }
+.vs-cmp-row { display: grid; grid-template-columns: minmax(64px, 30%) 1fr auto; align-items: center; gap: 10px; }
+.vs-cmp-l { color: var(--vs-ink2); font-size: 13px; }
+.vs-cmp-t { height: 10px; border-radius: 6px; background: var(--vs-fill); overflow: hidden; }
+.vs-cmp-b { display: block; height: 100%; border-radius: 6px; background: var(--vs-accent); }
+.vs-cmp-b.good { background: var(--vs-good); }
+.vs-cmp-b.bad { background: var(--vs-bad); }
+.vs-cmp-b.mute { background: var(--vs-muted); }
+.vs-cmp-v { font-weight: 650; font-size: 13px; }
+
+/* 柱状图（竖向） */
+.vs-bars { display: flex; align-items: flex-end; gap: 6px; height: 150px; padding-top: 18px; }
+.vs-bar { flex: 1 1 0; min-width: 0; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; gap: 4px; }
+.vs-bar-v { font-size: 11px; font-weight: 650; color: var(--vs-ink2); white-space: nowrap; }
+.vs-bar-b { width: 100%; max-width: 40px; border-radius: 6px 6px 3px 3px; background: var(--vs-accent); min-height: 2px; }
+.vs-bar-b.bad { background: var(--vs-bad); }
+.vs-bar-l { width: 100%; text-align: center; font-size: 11px; color: var(--vs-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* 折线图 */
+.vs-line svg { display: block; width: 100%; height: 120px; overflow: visible; }
+.vs-line polyline { fill: none; stroke: var(--vs-accent); stroke-width: 2.2; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.vs-line .area { fill: var(--vs-accent); opacity: 0.08; stroke: none; }
+.vs-line-x { display: flex; justify-content: space-between; gap: 6px; margin-top: 6px; color: var(--vs-muted); font-size: 11px; }
+.vs-line-x b { color: var(--vs-ink2); font-weight: 650; }
+
+/* 占比条 */
+.vs-share-t { display: flex; height: 14px; border-radius: 8px; overflow: hidden; gap: 2px; }
+.vs-share-t i { display: block; height: 100%; background: var(--c); }
+.vs-share-k { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 8px; font-size: 12px; color: var(--vs-ink2); }
+.vs-share-k span::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 5px; border-radius: 2px; background: var(--c); }
+.vs-c0 { --c: var(--vs-accent); }
+.vs-c1 { --c: var(--vs-good); }
+.vs-c2 { --c: var(--vs-warn); }
+.vs-c3 { --c: var(--vs-bad); }
+.vs-c4 { --c: #8e7cf0; }
+.vs-c5 { --c: var(--vs-muted); }
+
+/* 时间线 */
+.vs-tl { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.vs-tl li { position: relative; padding-left: 18px; }
+.vs-tl li::before { content: ""; position: absolute; left: 3px; top: 7px; width: 7px; height: 7px; border-radius: 50%; background: var(--vs-accent); }
+.vs-tl li:not(:last-child)::after { content: ""; position: absolute; left: 6px; top: 16px; bottom: -12px; width: 1px; background: var(--vs-line); }
+.vs-tl-w { font-size: 12px; font-weight: 650; color: var(--vs-muted); }
+
+/* 对比表 */
+.vs-tbl-w { overflow-x: auto; }
+.vs-tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+.vs-tbl th, .vs-tbl td { padding: 7px 8px; text-align: left; border-bottom: 1px solid var(--vs-line); vertical-align: top; }
+.vs-tbl th { color: var(--vs-muted); font-weight: 650; font-size: 12px; }
+.vs-tbl tr:last-child td { border-bottom: 0; }
+
+/* 要点 / 结论 / 提醒 / 来源 */
+.vs-list { margin: 0; padding-left: 20px; display: grid; gap: 4px; color: var(--vs-ink2); }
+.vs-take { margin: 0; padding: 10px 12px; border-radius: 12px; background: var(--vs-fill); font-weight: 650; }
+.vs-note { margin: 0; padding: 10px 12px; border-radius: 12px; border-left: 3px solid var(--vs-warn); background: var(--vs-fill); color: var(--vs-ink2); }
+.vs-src { margin: 0; padding-left: 20px; font-size: 12px; color: var(--vs-muted); display: grid; gap: 3px; }
+.vs-src a { color: var(--vs-accent); text-decoration: none; }
+
+/* 标签页：单选框 + label，纯 CSS（最多 4 个） */
+.vs-tabs { position: relative; }
+.vs-tabs > input { position: absolute; opacity: 0; pointer-events: none; }
+.vs-tabbar { display: flex; gap: 4px; padding: 3px; border-radius: 999px; background: var(--vs-fill); overflow-x: auto; scrollbar-width: none; }
+.vs-tabbar label { flex: none; padding: 5px 12px; border-radius: 999px; font-size: 13px; font-weight: 650; color: var(--vs-muted); cursor: pointer; transition: background 0.2s, color 0.2s; }
+.vs-panel { display: none; gap: 14px; margin-top: 12px; }
+.vs-tabs > input:nth-of-type(1):checked ~ .vs-tabbar label:nth-child(1),
+.vs-tabs > input:nth-of-type(2):checked ~ .vs-tabbar label:nth-child(2),
+.vs-tabs > input:nth-of-type(3):checked ~ .vs-tabbar label:nth-child(3),
+.vs-tabs > input:nth-of-type(4):checked ~ .vs-tabbar label:nth-child(4) { background: var(--vs-card); color: var(--vs-ink); box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08); }
+.vs-tabs > input:nth-of-type(1):checked ~ .vs-panels > .vs-panel:nth-child(1),
+.vs-tabs > input:nth-of-type(2):checked ~ .vs-panels > .vs-panel:nth-child(2),
+.vs-tabs > input:nth-of-type(3):checked ~ .vs-panels > .vs-panel:nth-child(3),
+.vs-tabs > input:nth-of-type(4):checked ~ .vs-panels > .vs-panel:nth-child(4) { display: grid; }
+.vs-tabs > input:focus-visible ~ .vs-tabbar { outline: 2px solid var(--vs-accent); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { .vs-tabbar label { transition: none; } }

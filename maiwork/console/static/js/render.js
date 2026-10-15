@@ -157,11 +157,56 @@ function tabScrolls() {
   }
   return out;
 }
+// 分栏的「样子签名」：按钮的动作、参数、文字都一样，只是选中项不同 → 可以沿用旧分栏
+const tabSig = (bar) =>
+  [...bar.querySelectorAll("button")].map((b) => `${b.dataset.act}|${b.dataset.sub || ""}|${b.dataset.s || ""}|${b.textContent}`).join("\n");
+function tabBars() {
+  const out = {};
+  for (const sel of TAB_SCROLLERS) {
+    const el = document.querySelector(`#view ${sel}`);
+    if (el) out[sel] = el;
+  }
+  return out;
+}
+// 整页重画后，把新分栏换回旧的那个 DOM，只改选中项：
+// 旧分栏的滚动位置和正在进行的平滑滚动都不中断，选中底色也能过渡，不会「先跳回去再滑过来」（2026-10-15 修抽搐）
+function keepTabBars(old) {
+  const kept = new Set();
+  for (const sel of TAB_SCROLLERS) {
+    const o = old[sel];
+    const nu = document.querySelector(`#view ${sel}`);
+    if (!o || !nu || o === nu || tabSig(o) !== tabSig(nu)) continue;
+    const ob = o.querySelectorAll("button");
+    nu.querySelectorAll("button").forEach((b, i) => ob[i].setAttribute("aria-selected", b.getAttribute("aria-selected") || "false"));
+    nu.replaceWith(o);
+    kept.add(sel);
+  }
+  return kept;
+}
+// 自己用 requestAnimationFrame 滑：不依赖浏览器原生平滑滚动（刚挂回页面的元素上各家表现不一，
+// 会出现「先跳回原位再滑」的抽搐）；同一个分栏再点一次就从当前位置接着滑，不叠两段动画
+const tabAnim = new WeakMap();
+function slideTabs(bar, target) {
+  cancelAnimationFrame(tabAnim.get(bar) || 0);
+  const start = bar.scrollLeft;
+  const dist = target - start;
+  const t0 = performance.now();
+  const dur = Math.min(420, 220 + Math.abs(dist) * 0.4);
+  const step = (now) => {
+    // rAF 给的帧时间可能早于 t0（同一帧里开的动画），不夹住会先往反方向退几像素
+    const k = Math.max(0, Math.min(1, (now - t0) / dur));
+    bar.scrollLeft = start + dist * (1 - Math.pow(1 - k, 3));
+    if (k < 1) tabAnim.set(bar, requestAnimationFrame(step));
+    else tabAnim.delete(bar);
+  };
+  tabAnim.set(bar, requestAnimationFrame(step));
+}
 function centerTabs(was) {
   for (const sel of TAB_SCROLLERS) {
     const bar = document.querySelector(`#view ${sel}`);
     if (!bar || bar.scrollWidth <= bar.clientWidth) continue;
     const on = bar.querySelector('[aria-selected="true"]');
+    // 分栏离开过页面（整页重画时摘下又挂回），浏览器会把它的横向位置清零：先原样放回再滑
     const from = was && sel in was ? was[sel] : null;
     if (from != null) bar.scrollLeft = from;
     if (!on) continue;
@@ -171,8 +216,9 @@ function centerTabs(was) {
     const center = bar.scrollLeft + (r.left - br.left) + r.width / 2;
     const target = Math.max(0, Math.min(max, center - bar.clientWidth / 2));
     if (Math.abs(target - bar.scrollLeft) < 2) continue;
-    // 第一次出现（没有旧位置）直接就位；之后用平滑滚动，减少动态效果时也直接就位
-    bar.scrollTo({ left: target, behavior: from == null || calm() ? "auto" : "smooth" });
+    // 第一次出现（没有旧位置）直接就位；之后平滑滑过去，减少动态效果时也直接就位
+    if (from == null || calm()) bar.scrollLeft = target;
+    else slideTabs(bar, target);
   }
 }
 
@@ -208,8 +254,10 @@ export function renderView(opts) {
   }
   if (state.page === "settings") {
     const was = tabScrolls();
+    const old = tabBars();
     lastView = null;
     $("view").innerHTML = settingsPage();
+    keepTabBars(old);
     centerTabs(was);
     ui.flash = false;
     return;

@@ -44,8 +44,9 @@ SOURCE = (
 GOOD = """<style>.bar{height:8px;background:var(--accent)}</style>
 <div class="card"><h3>GPT-6 Sol</h3><p>43%（原 37%）<b>+6</b></p><p>价格 −50%</p></div>"""
 
-# 发件箱按内容（PNG 魔数）判图片类型：假渲染器也要给一张「真 PNG 头」的数据
-PNG = b"\x89PNG\r\n\x1a\n" + b"card-bytes"
+# 发件箱按内容判图片类型：假渲染器也要给一张「真图头」的数据
+# （2026-10-15 起卡片图默认 JPEG）
+JPG = b"\xff\xd8\xff\xe0" + b"card-bytes"
 
 
 # ----------------------------------------------------------------------
@@ -75,7 +76,7 @@ class Renderer:
     async def __call__(self, data):
         self.order.append("render")
         self.calls.append(data)
-        return PNG
+        return JPG
 
 
 class StubViz:
@@ -279,9 +280,13 @@ class VizModels:
         return SimpleNamespace(text=json.dumps(self.reply))
 
 
+# 2026-10-15 起子 agent 交零件规格（数字取自 SOURCE）
+GOOD_SPEC = {"blocks": [{"type": "takeaway", "text": "跑分 43%"}]}
+
+
 class VizWorkers:
-    def __init__(self, html: str = GOOD, *, sleep: float = 0.0) -> None:
-        self.html = html
+    def __init__(self, spec: dict | None = None, *, sleep: float = 0.0) -> None:
+        self.spec = spec if spec is not None else GOOD_SPEC
         self.sleep = sleep
         self.briefs = []
 
@@ -289,7 +294,7 @@ class VizWorkers:
         self.briefs.append((brief, kw))
         if self.sleep:
             await asyncio.sleep(self.sleep)
-        return SimpleNamespace(ok=True, data={"html": self.html}, error="", summary="")
+        return SimpleNamespace(ok=True, data={"spec": self.spec}, error="", summary="")
 
 
 class VizTools:

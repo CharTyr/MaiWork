@@ -479,3 +479,36 @@ def _normalize_roles(raw: Any) -> list[str]:
         items = _parse_roles_value(raw)
     roles = [r for r in items if r in ("worker", "main")]
     return roles or ["worker"]
+
+
+def guidance(registry: Any, name: str, *, max_chars: int = 4000) -> str:
+    """把一份 skill 的正文（去掉 front matter）做成一段提示词「做法参考」（2026-10-15）。
+
+    给那些**不带 skill 工具**的主模型回合用（目标检查、构想生成都是纯 JSON 调用，读不到
+    main 角色的 goal-tracking / idea-shaping）。registry 是 Skills 实例：停用了就返回 ""；
+    registry 为 None（老调用方 / 测试桩）就直接读插件自带的那份。超长截断。"""
+    text: str | None = None
+    if registry is not None:
+        try:
+            text = registry.read(name)
+        except Exception:
+            logger.exception("读 skill %s 出错，这次不带做法参考", name)
+            return ""
+        if text is None:
+            return ""
+    else:
+        try:
+            text = (BUILTIN_ROOT / name / "SKILL.md").read_text(encoding="utf-8")
+        except OSError:
+            return ""
+    body = str(text)
+    if body.startswith("---"):
+        end = body.find("\n---", 3)
+        if end >= 0:
+            body = body[end + 4:]
+    body = body.strip()
+    if not body:
+        return ""
+    if len(body) > max_chars:
+        body = body[:max_chars].rstrip() + "\n…（后略）"
+    return f"【做法参考（内置 skill {name}，照这个口径判断）】\n{body}"

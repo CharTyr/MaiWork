@@ -13,6 +13,8 @@ import { actControls } from "./pages/groupcontrols.js";
 import { actAgents } from "./settings/agents.js";
 import { actModels } from "./settings/models.js";
 import { actJev } from "./settings/jev.js";
+import { actOptDeps } from "./settings/optdeps.js";
+import { actAttention } from "./settings/attention.js";
 import { chipAdd, rowsAdd } from "./settings/rules.js";
 import { loadUsage, loadUsageDay } from "./settings/usage.js";
 import { avatarSaved } from "./settings/identity.js";
@@ -43,6 +45,8 @@ export async function act(el, e) {
   if (await actAgents(a, el)) return;
   if (await actModels(a, el)) return;
   if (await actJev(a, el)) return;
+  if (await actOptDeps(a, el)) return;
+  if (await actAttention(a, el)) return;
   const g = grp();
   switch (a) {
     case "load-retry":

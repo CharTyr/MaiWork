@@ -747,7 +747,11 @@ async def test_research_job_gets_search_extract_write(mem_store, settings, env, 
 
 
 async def test_research_job_complete_needs_nothing(mem_store, settings, env, tools, tasks, goals):
-    """调研活三样都有 → 一个都不补、不记事件。"""
+    """调研活三样都有 → 这三样一个都不补。
+
+    （2026-10-15 任务 B：调研活的 system 提示会点名 render_report，所以它会被补进名单；
+    这里要证的是「三样必备工具本来就齐 → 不为它们记补工具事件」。）
+    """
     tid = _create_task(tasks)
     coord = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
                    tasks=tasks, goals=goals, models=ModelsQueue(), workers=StepWorkers())
@@ -756,8 +760,10 @@ async def test_research_job_complete_needs_nothing(mem_store, settings, env, too
     report = await _run_check(coord, tid, [job])
 
     assert report.blocked is False
-    assert job["tools"] == ["web_search", "fetch_page", "write_file"]
-    assert "task.tool_autofill" not in _kinds(mem_store, tid)
+    assert {"web_search", "fetch_page", "write_file"} <= set(job["tools"])
+    filled = {str(p.get("tool")) for p in _payloads(mem_store, tid, "task.tool_autofill")}
+    assert not ({"web_search", "fetch_page", "write_file"} & filled), filled
+    assert "task.exec_unavailable" not in _kinds(mem_store, tid)
 
 
 async def test_file_job_without_write_file_gets_it(mem_store, settings, env, tools, tasks, goals):

@@ -469,6 +469,70 @@ class TestConfigApi:
         assert env.app.store.secret_get("admin_password_hash")
 
 
+class TestFreestyleConfig:
+    """0.5.1（2026-10-15）：一次性 VM 平台选择 + Freestyle 字段上网页，密钥只进不出。"""
+
+    @pytest.mark.asyncio
+    async def test_fields_present_with_expected_types(self, env: _Env) -> None:
+        await _login(env)
+        data = await (await env.client.get("/api/settings/config")).json()
+        assert _field(data, "environments.vm_platform")["type"] == "enum"
+        assert _field(data, "environments.freestyle_api_key")["type"] == "secret"
+        assert _field(data, "environments.freestyle_snapshot")["type"] == "str"
+        assert _field(data, "environments.freestyle_ttl_minutes")["type"] == "int"
+        assert _field(data, "environments.freestyle_idle_minutes")["type"] == "int"
+        assert _field(data, "environments.freestyle_daily_max")["type"] == "int"
+        # 下拉里两家都在（带中文标签），默认选 railway
+        opts = _field(data, "environments.vm_platform")["options"]
+        values = [o["value"] if isinstance(o, dict) else o for o in opts]
+        assert values == ["railway", "freestyle"]
+        assert _field(data, "environments.vm_platform")["value"] == "railway"
+        # 密钥没配：只给 set/source，绝不给值
+        key_field = _field(data, "environments.freestyle_api_key")
+        assert "value" not in key_field and "file_value" not in key_field
+        assert key_field["set"] is False and key_field["source"] == "none"
+
+    @pytest.mark.asyncio
+    async def test_key_set_never_echoed_and_masked(self, env: _Env, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("FREESTYLE_API_KEY", raising=False)
+        await _login(env)
+        r = await env.client.put(
+            "/api/settings/config", json={"environments.freestyle_api_key": "fs-web-key-显眼"}
+        )
+        assert r.status == 200
+        data = await r.json()
+        f = _field(data, "environments.freestyle_api_key")
+        assert f["set"] is True and f["source"] == "file"
+        assert "value" not in f
+        assert 'freestyle_api_key = "fs-web-key-显眼"' in env.config_text()
+        # 进已知密钥遮罩名单（网页出口 / 工具摘要共用）
+        assert "fs-web-key-显眼" in env.app._known_secrets()
+        # PUT 空串 = 不改；null = 清空
+        r = await env.client.put("/api/settings/config", json={"environments.freestyle_daily_max": 3})
+        assert r.status == 200
+        assert 'freestyle_api_key = "fs-web-key-显眼"' in env.config_text()
+        r = await env.client.put("/api/settings/config", json={"environments.freestyle_api_key": ""})
+        assert r.status == 200
+        assert 'freestyle_api_key = "fs-web-key-显眼"' in env.config_text()
+        r = await env.client.put("/api/settings/config", json={"environments.freestyle_api_key": None})
+        assert r.status == 200
+        assert env.app.get_settings().environments.freestyle_api_key == ""
+
+    @pytest.mark.asyncio
+    async def test_platform_switch_and_bad_snapshot(self, env: _Env) -> None:
+        await _login(env)
+        r = await env.client.put("/api/settings/config", json={"environments.vm_platform": "freestyle"})
+        assert r.status == 200
+        assert env.app.get_settings().environments.vm_platform == "freestyle"
+        r = await env.client.put("/api/settings/config", json={"environments.vm_platform": "aws"})
+        assert r.status == 400
+        r = await env.client.put("/api/settings/config", json={"environments.freestyle_snapshot": "带空格 的名字"})
+        assert r.status == 400
+        r = await env.client.put("/api/settings/config", json={"environments.freestyle_snapshot": "freestyle/ubuntu"})
+        assert r.status == 200
+        assert env.app.get_settings().environments.freestyle_snapshot == "freestyle/ubuntu"
+
+
 class TestJevKeyPriority:
     """jev 密钥顺序：环境变量 TYPESAFE_API_KEY → [jev] api_key（网页改的也写进 config.toml）→ key_file → ~/.typesafe_key。"""
 

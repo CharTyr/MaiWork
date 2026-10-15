@@ -558,6 +558,36 @@ class TestSendText:
             await h.send_text("sid-1", "hello")
 
     @pytest.mark.asyncio
+    async def test_send_failure_carries_host_error_reason(self) -> None:
+        """宿主 `_build_send_result` 失败时会把原因放进 result["error"]：
+        异常文字要带上它（截 200 字、去换行），不再只丢一句「发送失败」。"""
+        ctx = FakeCtx({"send.hybrid": {"sent": False, "error": "群号不对\n第二行"}})
+        h = Host(ctx)
+        with pytest.raises(HostError) as e:
+            await h.send_text("sid-1", "hello")
+        msg = str(e.value)
+        assert msg.startswith("send.hybrid 发送失败")
+        assert "群号不对" in msg
+        assert "\n" not in msg
+
+    @pytest.mark.asyncio
+    async def test_send_failure_reason_truncated_to_200(self) -> None:
+        ctx = FakeCtx({"send.hybrid": {"sent": False, "error": "错" * 500}})
+        h = Host(ctx)
+        with pytest.raises(HostError) as e:
+            await h.send_text("sid-1", "hello")
+        assert str(e.value).count("错") == 200
+
+    @pytest.mark.asyncio
+    async def test_send_failure_without_error_keeps_old_text(self) -> None:
+        """宿主没给 error → 保持老文案，一个字不多。"""
+        ctx = FakeCtx({"send.hybrid": {"sent": False}})
+        h = Host(ctx)
+        with pytest.raises(HostError) as e:
+            await h.send_text("sid-1", "hello")
+        assert str(e.value) == "send.hybrid 发送失败"
+
+    @pytest.mark.asyncio
     async def test_at_segment_goes_first(self) -> None:
         """构想提一嘴 @ 本人：at 段在文字前（宿主 message_utils 认 data.target_user_id）。"""
         ctx = FakeCtx({"send.hybrid": {"sent": True, "message_id": "9"}})
@@ -597,6 +627,14 @@ class TestSendImage:
         ctx = FakeCtx({"send.hybrid": {"sent": False}})
         h = Host(ctx)
         with pytest.raises(HostError):
+            await h.send_image("sid-1", b"img")
+
+    @pytest.mark.asyncio
+    async def test_image_failure_carries_host_error_reason(self) -> None:
+        """图片这条走同一个 _send_segments，宿主给的原因也要带上。"""
+        ctx = FakeCtx({"send.hybrid": {"sent": False, "error": "图片太大"}})
+        h = Host(ctx)
+        with pytest.raises(HostError, match="图片太大"):
             await h.send_image("sid-1", b"img")
 
     @pytest.mark.asyncio
@@ -649,6 +687,25 @@ class TestUploadGroupFile:
         h = Host(ctx)
         with pytest.raises(HostError, match="adapter.napcat.file.upload_group_file"):
             await h.upload_group_file("900000001", "/tmp/file.txt", "readme.txt")
+
+    @pytest.mark.asyncio
+    async def test_upload_failure_carries_host_error_reason(self) -> None:
+        """别的 send_* 能力同理：宿主给了 error 就带进异常文字。"""
+        ctx = FakeCtx(
+            {
+                "api.call": {
+                    "status": "failed",
+                    "retcode": 1400,
+                    "error": "群文件接口没开\n请先装适配器",
+                    "data": {},
+                }
+            }
+        )
+        h = Host(ctx)
+        with pytest.raises(HostError) as e:
+            await h.upload_group_file("900000001", "/tmp/file.txt", "readme.txt")
+        msg = str(e.value)
+        assert "群文件接口没开" in msg and "\n" not in msg
 
     @pytest.mark.asyncio
     async def test_upload_does_not_retry(self) -> None:

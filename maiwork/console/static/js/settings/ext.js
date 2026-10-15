@@ -3,6 +3,7 @@ import { state } from "../state.js";
 import { SVG, dayWord, esc, ico, tip, tipLabel, toast } from "../util.js";
 import { api } from "../api.js";
 import { loading } from "../pages/news.js";
+import { loadOptDeps, optDepsSection } from "./optdeps.js";
 
 export const ROLE_NAMES = { worker: "子 agent", main: "主模型" };
 
@@ -25,7 +26,8 @@ export function extPage() {
     ${!mcp.length && !presetsNotAdded().length && !newMcp ? `<p class="h-meta">暂无</p>` : ""}
     <div class="h-sub-row"><h2 class="h-sub">skill${tip("skill 是给模型的操作说明，例如某类工作的做法和注意事项。模型会根据「简介」决定何时使用。")}</h2>${newSkill ? "" : `<span class="row-btns"><label class="btn small file-btn">上传 zip<input type="file" id="skill-zip" accept=".zip,application/zip" hidden /></label><button class="btn small" data-act="ext-new" data-kind="skill">添加</button></span>`}</div>
     ${newSkill ? skillForm(null) : ""}
-    ${skills.length ? skills.map((k) => (ed && ed.kind === "skill" && ed.name === k.name ? skillForm(k) : skillRow(k))).join("") : newSkill ? "" : `<p class="h-meta">暂无</p>`}`;
+    ${skills.length ? skills.map((k) => (ed && ed.kind === "skill" && ed.name === k.name ? skillForm(k) : skillRow(k))).join("") : newSkill ? "" : `<p class="h-meta">暂无</p>`}
+    ${optDepsSection()}`;
 }
 
 // 联网搜索：从已接的 MCP 里挑一个工具来用（后端 GET/PUT/DELETE /api/extensions/search）。
@@ -399,4 +401,5 @@ export async function loadExt() {
   } catch (e) {
     state.extPresets = null;
   }
+  await loadOptDeps();
 }

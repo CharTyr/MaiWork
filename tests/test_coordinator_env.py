@@ -204,6 +204,101 @@ class _Profiles:
         return []
 
 
+class FakeFreestyleEnv:
+    """假 FreestyleEnv（2026-10-15）：形状和 FakeRailwayEnv 一样，box 带 kind / remote_root。
+
+    只验证 coordinator 按 box.kind 查表分派 + 描述文案查预设；不碰任何网络。
+    """
+
+    def __init__(self, give_box: bool = True, *, remaining_s: float = 3600.0):
+        self.give_box = give_box
+        self.remaining_s = remaining_s
+        self.acquire_calls: list[str] = []
+        self.release_calls = 0
+        self._box: Any = None
+        self.last_fail_reason = "今天的 Freestyle 机器用量到顶了（2/2）"
+
+    async def acquire(self, job_id: str) -> Any:
+        self.acquire_calls.append(str(job_id))
+        if not self.give_box:
+            return None
+        from CharTyr_MaiWork.maiwork.environments.freestyle import FreestyleBox
+
+        self._box = FreestyleBox(
+            job_id=str(job_id),
+            vm_id="vm-fake-1",
+            expires_ts=clock.now() + self.remaining_s,
+            remote_root="/root/maiwork",
+            slug="maiwork-fake-1",
+            state="running",
+            snapshot="freestyle/ubuntu-sm",
+            cpu=2,
+            memory_mib=4096,
+        )
+        return self._box
+
+    async def release(self, box: Any) -> None:
+        if box is not None:
+            self.release_calls += 1
+            if self._box is box:
+                self._box = None
+
+    @property
+    def current_box(self) -> Any:
+        return self._box
+
+    def last_fail(self) -> dict | None:
+        return {"ts": clock.now(), "reason": self.last_fail_reason}
+
+    def usage_today(self) -> int:
+        return len(self.acquire_calls)
+
+    async def run(self, box: Any, command: str, *, timeout_s: int) -> Any:
+        from CharTyr_MaiWork.maiwork.environments.local import RunResult
+
+        return RunResult(exit_code=0, stdout="ok", stderr="", ms=5, timed_out=False, oom=False)
+
+    async def put(self, box: Any, local_path: Any, remote_path: str) -> None:
+        pass
+
+    async def get(self, box: Any, remote_path: str, local_path: Any) -> None:
+        p = Path(local_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("REMOTE-FETCHED", encoding="utf-8")
+
+
+class _SshBox:
+    kind = "ssh"
+    name = "甲"
+    expires_ts = 0.0
+
+
+class FakeSshEnv:
+    """假 SshEnv：只用来验回落顺序（拿得到 / 拿不到）。"""
+
+    def __init__(self, box: Any = None):
+        self.box = box
+        self.acquire_calls: list[str] = []
+        self.release_calls = 0
+
+    def available(self) -> bool:
+        return True
+
+    def machines(self) -> list[dict]:
+        return [{"name": "甲", "host": "u@10.0.0.1"}]
+
+    async def acquire(self, tid: str, prefer: str = "") -> Any:
+        self.acquire_calls.append(str(tid))
+        return self.box
+
+    def last_fail(self) -> dict | None:
+        return {"ts": clock.now(), "reason": "甲：连不上"}
+
+    async def release(self, box: Any) -> None:
+        if box is not None:
+            self.release_calls += 1
+
+
 # ---------------------------------------------------------------------------
 # fixtures
 # ---------------------------------------------------------------------------
@@ -225,7 +320,8 @@ def mem_store(tmp_path):
 
 
 class _Settings:
-    def __init__(self, ws_root: Path, *, railway: bool = True):
+    def __init__(self, ws_root: Path, *, railway: bool = True, vm_platform: str = "railway",
+                 freestyle_api_key: str = "fs-test-key"):
         self._ws_root = Path(ws_root)
         self.environments = type(
             "Env",
@@ -240,6 +336,12 @@ class _Settings:
                 "command_timeout_s": 300,
                 "railway": railway,
                 "railway_daily_max": 2,
+                "vm_platform": vm_platform,
+                "freestyle_api_key": freestyle_api_key,
+                "freestyle_snapshot": "freestyle/ubuntu-sm",
+                "freestyle_ttl_minutes": 60,
+                "freestyle_idle_minutes": 10,
+                "freestyle_daily_max": 2,
             },
         )()
         self.delivery = type("Dlv", (), {"quiet_hours": "23:00-08:00"})()
@@ -284,6 +386,8 @@ def _build(
     models: ModelsQueue,
     workers: FakeWorkers,
     railway: FakeRailwayEnv | None = None,
+    freestyle: FakeFreestyleEnv | None = None,
+    ssh: Any = None,
     delivery: FakeDelivery | None = None,
     outbox: FakeOutbox | None = None,
 ) -> Coordinator:
@@ -298,6 +402,10 @@ def _build(
         register_vm_tools(
             tools, get_box=lambda: railway.current_box, env=railway, local_env=env,
         )
+    if freestyle is not None:
+        register_vm_tools(
+            tools, get_box=lambda: freestyle.current_box, env=freestyle, local_env=env,
+        )
     return Coordinator(
         mem_store,
         models,
@@ -311,6 +419,8 @@ def _build(
         _Profiles(),
         lambda: settings,
         railway=railway,
+        ssh=ssh,
+        vms=({"freestyle": freestyle} if freestyle is not None else None),
     )
 
 
@@ -634,3 +744,124 @@ async def test_expired_vm_tools_fail_chinese(
         r = await _railway_tool_call(tools, name, args, ctx)
         assert not r.ok
         assert "到期" in r.error or "到点" in r.error
+
+
+# ---------------------------------------------------------------------------
+# 7. Freestyle（2026-10-15）：第二家一次性 VM —— 提示词 / 工具 / 描述 / 回落
+# ---------------------------------------------------------------------------
+
+
+async def _run_task_with_env(
+    mem_store, env, tools, tasks, goals, *, plan_env, settings, freestyle=None, ssh=None,
+    models=None, workers=None,
+):
+    tid = _create_task(tasks)
+    models = models or ModelsQueue(replies=[_plan(env=plan_env), _review(pass_=True)])
+    workers = workers or FakeWorkers()
+
+    async def _write():
+        ws = env.workspace(tasks.get(tid)["workspace"])
+        (ws / "artifacts" / tid).mkdir(parents=True, exist_ok=True)
+        (ws / "artifacts" / tid / "index.html").write_text("<html>ok</html>", encoding="utf-8")
+
+    workers.before_return = _write
+    coordinator = _build(
+        mem_store=mem_store, settings=settings, env=env, tools=tools, tasks=tasks,
+        goals=goals, models=models, workers=workers, freestyle=freestyle, ssh=ssh,
+    )
+    await coordinator.run_task(tid)
+    return tid, models, workers, coordinator
+
+
+async def test_freestyle_plan_prompt_lists_freestyle_not_railway(
+    mem_store: Store, tmp_path: Path, env, tools, tasks, goals
+):
+    """选了 freestyle：排计划提示词里出现 freestyle、不出现 railway，工具照样是 vm_*。"""
+    settings = _Settings(tmp_path / "ws", vm_platform="freestyle")
+    freestyle = FakeFreestyleEnv(give_box=True)
+    tid, models, workers, _c = await _run_task_with_env(
+        mem_store, env, tools, tasks, goals,
+        plan_env="freestyle", settings=settings, freestyle=freestyle,
+    )
+    assert tasks.get(tid)["status"] == "completed"
+    prompt = "\n".join(str(m.get("content")) for m in models.calls[0][1])
+    assert "freestyle" in prompt and "railway" not in prompt
+    assert len(freestyle.acquire_calls) == 1
+    assert freestyle.release_calls == 1
+    for call in workers.calls:
+        names = set(call["tools"])
+        assert {"vm_run", "vm_put_file", "vm_read_file", "vm_fetch_file"} <= names
+        assert "run_command" not in names
+    # brief 里的远端根目录跟着 box.remote_root 走（不是 /app）
+    brief_all = "\n".join(c["brief"] for c in workers.calls)
+    assert "/root/maiwork" in brief_all and "/app/" not in brief_all
+
+
+async def test_freestyle_env_field_uses_platform_spec(
+    mem_store: Store, tmp_path: Path, env, tools, tasks, goals
+):
+    """任务 env 字段写「Freestyle 一次性机器 · 2 核 4G」，不是 railway 那套文案。"""
+    settings = _Settings(tmp_path / "ws", vm_platform="freestyle")
+    freestyle = FakeFreestyleEnv(give_box=True)
+    tid, _m, _w, _c = await _run_task_with_env(
+        mem_store, env, tools, tasks, goals,
+        plan_env="freestyle", settings=settings, freestyle=freestyle,
+    )
+    desc = str(tasks.get(tid)["env"])
+    assert "Freestyle" in desc and "2 核 4G" in desc
+    assert "railway" not in desc
+
+
+async def test_freestyle_unavailable_falls_back_to_ssh(
+    mem_store: Store, tmp_path: Path, env, tools, tasks, goals
+):
+    """Freestyle 拿不到（配额到顶）→ 回落专用机器，时间线写清中文原因。"""
+    settings = _Settings(tmp_path / "ws", vm_platform="freestyle")
+    freestyle = FakeFreestyleEnv(give_box=False)
+    ssh = FakeSshEnv(box=_SshBox())
+    tid, _m, _w, _c = await _run_task_with_env(
+        mem_store, env, tools, tasks, goals,
+        plan_env="freestyle", settings=settings, freestyle=freestyle, ssh=ssh,
+    )
+    assert ssh.acquire_calls == [tid]
+    assert ssh.release_calls == 1
+    assert "专用机器" in str(tasks.get(tid)["env"])
+
+
+async def test_want_railway_switches_to_freestyle_when_only_freestyle_on(
+    mem_store: Store, tmp_path: Path, env, tools, tasks, goals
+):
+    """计划写 railway，但用户选的/就位的是 freestyle → 排计划阶段就换成 freestyle。"""
+    settings = _Settings(tmp_path / "ws", vm_platform="freestyle")
+    freestyle = FakeFreestyleEnv(give_box=True)
+    tid, _m, _w, c = await _run_task_with_env(
+        mem_store, env, tools, tasks, goals,
+        plan_env="railway", settings=settings, freestyle=freestyle,
+    )
+    # 计划里的 railway 在规范阶段就换成唯一可用的那家一次性 VM
+    assert c._normalize_env_choice("railway") == "freestyle"  # noqa: SLF001
+    assert len(freestyle.acquire_calls) == 1
+    env_desc = str(tasks.get(tid)["env"])
+    assert "Freestyle" in env_desc and "railway" not in env_desc
+
+
+async def test_freestyle_env_desc_and_tools_helpers(
+    mem_store: Store, tmp_path: Path, env, tools, tasks, goals
+):
+    """_remote_env_desc / _remote_job_tools 按 box.kind 查表；老 railway Box 行为不变。"""
+    settings = _Settings(tmp_path / "ws", vm_platform="freestyle")
+    coordinator = _build(
+        mem_store=mem_store, settings=settings, env=env, tools=tools, tasks=tasks,
+        goals=goals, models=ModelsQueue(), workers=FakeWorkers(),
+        freestyle=FakeFreestyleEnv(give_box=True),
+    )
+    from CharTyr_MaiWork.maiwork.environments.freestyle import FreestyleBox
+    from CharTyr_MaiWork.maiwork.environments.railway import Box as RailwayBox
+
+    fbox = FreestyleBox(job_id="t", vm_id="vm-1", expires_ts=0.0, cpu=2, memory_mib=4096)
+    rbox = RailwayBox(job_id="t", key_path=Path("/tmp/x"), expires_ts=0.0)
+    assert "Freestyle" in coordinator._remote_env_desc(fbox)  # noqa: SLF001
+    assert coordinator._remote_env_desc(rbox).startswith("railway.new 一次性机器")  # noqa: SLF001
+    assert coordinator._remote_job_tools(["run_command"], fbox) == coordinator._remote_job_tools(  # noqa: SLF001
+        ["run_command"], rbox
+    )

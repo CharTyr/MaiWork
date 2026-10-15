@@ -73,7 +73,7 @@ def _norm_accounts(values: object, field_zh: str, problems: list[str]) -> tuple[
     return tuple(out)
 
 
-CONFIG_VERSION = "0.5.0"  # 0.5.0：[environments] local_network（子 agent 默认碰不到本机与内网，开了才放行）；0.4.9：[quick_judge] 不再攒批（删 batch_wait_s，一条 @ 一次判断）、daily_max 归高级项；0.4.8：[quick_judge] 派活判断兜底（Jev 不在 / 拿不准时用模型快速判群里 @ 的是不是派活）；0.4.7：[jev] use + [[jev_endpoints]]（多判断服务：预设 / 自己加 / 换着用）；0.4.6：每端点高级请求头 headers（默认空）；0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）；0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
+CONFIG_VERSION = "0.5.1"  # 0.5.1：[environments] freestyle 开关 + freestyle_* + vm_platform（两家一次性 VM 可同时开，vm_platform = 优先用哪家）；0.5.0：[environments] local_network（子 agent 默认碰不到本机与内网，开了才放行）；0.4.9：[quick_judge] 不再攒批（删 batch_wait_s，一条 @ 一次判断）、daily_max 归高级项；0.4.8：[quick_judge] 派活判断兜底（Jev 不在 / 拿不准时用模型快速判群里 @ 的是不是派活）；0.4.7：[jev] use + [[jev_endpoints]]（多判断服务：预设 / 自己加 / 换着用）；0.4.6：每端点高级请求头 headers（默认空）；0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）；0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
 
 # 0.8.0 群控归一（docs/18 §五 + 往群里发）：下面这些全局键**只作新群第一次的迁移种子**
 # （migrations.migrate_group_controls 按服务群种进 kv["group_approval.<群号>"] /
@@ -258,6 +258,10 @@ class ModelListItemConfig(PluginConfigBase):
     vision: bool = Field(default=False, description="支不支持图片输入")
     context_window: int = Field(default=128000, description="上下文窗口（tokens，8192~2000000）")
     max_tokens: int = Field(default=32768, description="一次回答最多写多少 token（1024~1000000，必须小于上下文窗口）")
+    use: str = Field(default="chat", description="用途：chat = 聊天/干活（默认）；image = 生图（不能当聊天模型）")
+    image_api: str = Field(default="openai", description="生图接口形状：openai（OpenAI / 火山方舟）或 siliconflow（硅基流动）；仅 use=image 时有意义")
+    image_default_size: str = Field(default="", description="生图默认尺寸（≤40 字，如 1024x1024）；空 = 让服务商按默认来")
+    image_max_n: int = Field(default=1, description="一次生图最多几张（1~4；仅 use=image 时有意义）")
 
 
 class JevEndpointItemConfig(PluginConfigBase):
@@ -360,6 +364,22 @@ class EnvironmentsSectionConfig(PluginConfigBase):
     __ui_order__ = 11
 
     railway: bool = Field(default=True, description="是否允许用 Railway 临时 VM 跑活")
+    vm_platform: str = Field(
+        default="railway",
+        description="两家一次性 VM 都开时优先用哪家：railway | freestyle（优先那家拿不到会自动换另一家）",
+    )
+    freestyle: bool = Field(default=False, description="是否允许用 Freestyle 一次性 VM（要自己的 API key；和 Railway 可以同时开）")
+    freestyle_api_key: str = Field(
+        default="",
+        description="Freestyle API key（https://dash.freestyle.sh 建，只在创建时显示一次）；只进不出，也可用环境变量 FREESTYLE_API_KEY",
+    )
+    freestyle_snapshot: str = Field(
+        default="freestyle/ubuntu-sm",
+        description="建 Freestyle 机器用哪个镜像（决定 CPU/内存/磁盘；创建时不能单独选规格）",
+    )
+    freestyle_ttl_minutes: int = Field(default=60, description="一台 Freestyle 机器最多活多少分钟（从创建时刻算，到点自动删）")
+    freestyle_idle_minutes: int = Field(default=10, description="Freestyle 机器无网络活动多少分钟后自动休眠（暂停只计存储费，文件仍可读）")
+    freestyle_daily_max: int = Field(default=2, description="Freestyle 一次性 VM 每天最多用几台")
     ssh: list[SSHServerConfig] = Field(default_factory=list, description="已有的专用 VM/VPS（按顺序优先用）")
     workspace_root: str = Field(default="/home/maiwork/workspaces", description="工作区根目录；每个工作区是它下面的一个子目录")
     memory_max: str = Field(default="512M", description="单个命令的内存上限，如 512M / 1G")
@@ -554,6 +574,19 @@ EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
 ENDPOINT_PROTOCOLS: tuple[str, ...] = ("openai", "anthropic", "responses")
 
+# 模型条目的用途（2026-10-15 生图第一期）：chat = 聊天/干活（老配置默认，行为一字不变）；
+# image = 生图。use="image" 的条目**不能**当聊天 / 主模型 / 子 agent 模型。
+MODEL_USES: tuple[str, ...] = ("chat", "image")
+
+# 生图接口形状（第一期只做「同步 + 一次拿结果」的两家，都是 POST {base}/images/generations）：
+# - openai：OpenAI gpt-image-1 / 火山方舟 Seedream（size / n，响应 data[].b64_json 或 data[].url）
+# - siliconflow：硅基流动（image_size / batch_size，响应 images[].url，URL 只活 1 小时）
+IMAGE_APIS: tuple[str, ...] = ("openai", "siliconflow")
+
+# 单次生图最多几张的硬上限（条目上的 image_max_n 只能 ≤ 它）
+IMAGE_MAX_N_LIMIT = 4
+IMAGE_DEFAULT_SIZE_MAX = 40
+
 _ID_RE = re.compile(r"^[a-z0-9_-]{1,24}$")
 
 
@@ -704,6 +737,11 @@ class ModelEntry:
     vision: bool = False
     context_window: int = 128000
     max_tokens: int = 32768
+    # 2026-10-15 生图第一期：用途 + 生图参数（都带默认值，老配置读出来就是 chat）
+    use: str = "chat"                # "chat"（默认）| "image"
+    image_api: str = "openai"        # "openai" | "siliconflow"（仅 use="image" 时有意义）
+    image_default_size: str = ""     # 空 = 让服务商按默认来
+    image_max_n: int = 1             # 一次最多几张（1~4）
 
 
 @dataclass(frozen=True)
@@ -792,6 +830,13 @@ class EnvironmentsSetting:
     verify_enabled: bool    # 备资讯时要不要挑几条上 Railway 一次性 VM 实测（默认关）
     verify_per_round: int    # 每轮备资讯最多实测几条
     verify_minutes: int      # 单条实测的时长上限（分钟）
+    vm_platform: str = "railway"          # 两家都开时优先用哪家：railway | freestyle
+    freestyle: bool = False               # 是否允许用 Freestyle 一次性 VM（额外添加；默认关）
+    freestyle_api_key: str = ""           # 只进不出；环境变量 FREESTYLE_API_KEY 优先
+    freestyle_snapshot: str = "freestyle/ubuntu-sm"
+    freestyle_ttl_minutes: int = 60
+    freestyle_idle_minutes: int = 10
+    freestyle_daily_max: int = 2
 
 
 @dataclass(frozen=True)
@@ -893,6 +938,9 @@ class Settings:
 
 _LISTEN_RE = re.compile(r"^(?P<host>(?:\d{1,3}\.){3}\d{1,3}):(?P<port>\d{1,5})$")
 _WORKSPACE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Freestyle 的镜像：官方 slug 形如 freestyle/ubuntu-sm；用户自己拍的快照是 sh-<uuid>。
+# 两种都收，别的一律回落默认（免得把空格 / 中文写进请求体）。
+_FREESTYLE_SNAPSHOT_RE = re.compile(r"^(?:freestyle/[a-z0-9][a-z0-9-]{0,62}|[a-z0-9][a-z0-9-]{0,62})$")
 # Telegram 虚拟群 ID（docs/06）：普通群是负数 chat_id（如 "-1001234567890"），
 # 话题群形如 "<chat_id>::tg-topic::mt=<id>"，所以允许 :、=、_、|、.、-、字母数字。
 _TG_GROUP_ID_RE = re.compile(r"^[-0-9A-Za-z:=_|.]{1,64}$")
@@ -1259,8 +1307,31 @@ def _parse_environments(
     if local_mode == "direct" and _running_as_root():
         problems.append("以 root 运行时不允许 direct（子 agent 会直接拿到 root 权限），本次按 systemd 处理")
         local_mode = "systemd"
+    # 一次性 VM 用哪家（2026-10-15）：不认识回落 railway；freestyle 的镜像 slug 也校验一遍
+    vm_platform = str(env.vm_platform or "").strip().lower() or "railway"
+    if vm_platform not in ("railway", "freestyle"):
+        problems.append(
+            f'[environments] vm_platform = "{env.vm_platform}" 不认识（只能是 railway / freestyle），本次按 railway 处理'
+        )
+        vm_platform = "railway"
+    freestyle_snapshot = str(env.freestyle_snapshot or "").strip() or "freestyle/ubuntu-sm"
+    if not _FREESTYLE_SNAPSHOT_RE.match(freestyle_snapshot):
+        problems.append(
+            f'[environments] freestyle_snapshot = "{freestyle_snapshot}" 不像镜像名'
+            "（如 freestyle/ubuntu-sm，或你自己拍的快照 sh-xxxx），本次用默认 freestyle/ubuntu-sm"
+        )
+        freestyle_snapshot = "freestyle/ubuntu-sm"
+    # 老配置兼容（二选一那版）：没写 freestyle 开关、但 vm_platform 选了 freestyle
+    # = 当时的意思是「只用 Freestyle」→ 开 Freestyle、关 Railway，行为不变
+    _set = set(getattr(env, "model_fields_set", set()) or set())
+    railway_on = bool(env.railway)
+    freestyle_on = bool(env.freestyle)
+    if "freestyle" not in _set and vm_platform == "freestyle":
+        freestyle_on = True
+        if "railway" not in _set:
+            railway_on = False
     return EnvironmentsSetting(
-        railway=bool(env.railway),
+        railway=railway_on,
         ssh=tuple(SSHServer(name=str(s.name or ""), host=str(s.host or ""), note=str(s.note or "")) for s in env.ssh),
         workspace_root=workspace_root,
         memory_max=str(env.memory_max or "512M"),
@@ -1274,6 +1345,13 @@ def _parse_environments(
         verify_enabled=bool(env.verify_enabled),
         verify_per_round=max(1, min(3, int(env.verify_per_round))),
         verify_minutes=max(1, int(env.verify_minutes)),
+        vm_platform=vm_platform,
+        freestyle=freestyle_on,
+        freestyle_api_key=str(env.freestyle_api_key or "").strip(),
+        freestyle_snapshot=freestyle_snapshot,
+        freestyle_ttl_minutes=max(5, min(1440, int(env.freestyle_ttl_minutes))),
+        freestyle_idle_minutes=max(1, min(1440, int(env.freestyle_idle_minutes))),
+        freestyle_daily_max=max(1, min(10, int(env.freestyle_daily_max))),
     )
 
 
@@ -1544,11 +1622,46 @@ def _parse_model_list(
                     f'模型库条目 "{mid}" 的 max_tokens（{max_tokens}）必须小于 context_window（{context_window}），此条已丢弃'
                 )
                 continue
+            # 生图字段（2026-10-15 第一期）：**宽松解析**——不认识的值回落默认 + 记问题，
+            # 绝不因为一个新字段丢掉整条（老配置没有这些键，读出来就是 chat / openai）。
+            # 网页保存路径会把这里的问题当 400 报给管理员（不静默回落）。
+            use = str(entry.get("use", "chat") or "").strip().lower()
+            if use not in MODEL_USES:
+                problems.append(
+                    f'模型库条目 "{mid}" 的 use "{use}" 不认识（只能是 chat / image），本次按 chat 处理'
+                )
+                use = "chat"
+            image_api = str(entry.get("image_api", "openai") or "").strip().lower()
+            if image_api not in IMAGE_APIS:
+                problems.append(
+                    f'模型库条目 "{mid}" 的 image_api "{image_api}" 不认识'
+                    f'（只能是 {" / ".join(IMAGE_APIS)}），本次按 openai 处理'
+                )
+                image_api = "openai"
+            image_default_size = str(entry.get("image_default_size", "") or "").strip()
+            if len(image_default_size) > IMAGE_DEFAULT_SIZE_MAX:
+                problems.append(
+                    f'模型库条目 "{mid}" 的 image_default_size 太长'
+                    f'（上限 {IMAGE_DEFAULT_SIZE_MAX} 字），本次按没填处理'
+                )
+                image_default_size = ""
+            raw_n = entry.get("image_max_n", 1)
+            try:
+                image_max_n = int(raw_n)
+            except (TypeError, ValueError):
+                image_max_n = 0
+            if not (1 <= image_max_n <= IMAGE_MAX_N_LIMIT):
+                problems.append(
+                    f'模型库条目 "{mid}" 的 image_max_n 只能是 1~{IMAGE_MAX_N_LIMIT}，本次按 1 处理'
+                )
+                image_max_n = 1
             out.append(
                 ModelEntry(
                     id=mid, endpoint=endpoint, model=model, name=name,
                     efforts=tuple(efforts), vision=vision_raw,
                     context_window=context_window, max_tokens=max_tokens,
+                    use=use, image_api=image_api,
+                    image_default_size=image_default_size, image_max_n=image_max_n,
                 )
             )
             seen.add(mid)

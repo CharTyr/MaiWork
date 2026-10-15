@@ -63,7 +63,7 @@ def _index_html() -> str:
     """首页：入口脚本和样式带版本号；入口 import 的其余模块经 import map 也带上版本号。
     这样前端不用编译、拆成多个文件，部署后浏览器也不会新旧模块混用。"""
     html = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    for name in ("js/main.js", "style.css"):
+    for name in ("js/main.js", "style.css", "viz.css"):
         ver = _asset_version(name)
         if ver:
             html = html.replace(f'"/static/{name}"', f'"/static/{name}?v={ver}"')
@@ -494,6 +494,38 @@ class ConsoleServer:
                 return web.json_response(views.group_view(svc, token_gid, admin=False))
             return _err(401, "先登录管理员，或用群链接打开")
 
+        @get("/api/asks/review")
+        async def _asks_review(request: web.Request) -> web.Response:
+            """全部服务群的「待复核 @ 请求」汇总（只总管理员；2026-10-15）。
+
+            形状：{total, shown, group_count, oldest_wait_s, oldest_wait_text, group_counts,
+            items:[...]}。
+            - `total` 是**各群真实计数求和**（每群取 `review_count` 与本次列出条数的**较大者**，
+              所以它**至少不小于 `items` 里列出来的明细数**，也不受列表上限影响）；
+            - `group_counts` 是 `{群号: 真实条数}`（口径同上，只含有待复核的群）——前端按群显示
+              计数要用它，**不要**拿 `items` 自己数（`items` 每群最多列最老 100 条，
+              101 条会被数成 100）；
+            - `items` 最老的在前、每群最多 100 条（`shown` = 列出来的条数），
+              每条带群 / 发起人昵称 / 原话摘要 / 等了多久 / 为什么卡着；
+            - `group_count` = **`group_counts` 里的群数**（也就是「有几个服务群有待复核」），
+              和 `items` 的条数无关。
+            """
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            return web.json_response(views.asks_review_summary(svc))
+
+        @get("/api/groups/{gid}/pending-asks")
+        async def _group_pending_asks(request: web.Request) -> web.Response:
+            """一个服务群的待复核队列（总管理员 / 本群群管理员）：形状同上，只含这个群。"""
+            gid = self._resolve_ref(request.match_info["gid"])
+            if gid is None:
+                return _err(404, "没有这个服务群")
+            forbid = self._require_group_admin(request, gid)
+            if forbid is not None:
+                return forbid
+            return web.json_response(views.asks_review_summary(svc, only_group_id=gid))
+
         @post("/api/groups/{gid}/pending-asks/{mid}")
         async def _pending_ask_review(request: web.Request) -> web.Response:
             gid = self._resolve_ref(request.match_info["gid"])
@@ -913,7 +945,26 @@ class ConsoleServer:
                 "name": str(entry.name), "efforts": [str(x) for x in (entry.efforts or ())],
                 "vision": bool(entry.vision),
                 "context_window": int(entry.context_window), "max_tokens": int(entry.max_tokens),
+                # 2026-10-15 生图第一期：用途 + 生图参数（密钥照旧只给 key_set 布尔）
+                "use": str(getattr(entry, "use", "chat") or "chat"),
+                "image_api": str(getattr(entry, "image_api", "openai") or "openai"),
+                "image_default_size": str(getattr(entry, "image_default_size", "") or ""),
+                "image_max_n": int(getattr(entry, "image_max_n", 1) or 1),
             }
+
+        def _image_model_id() -> str:
+            """现在用哪个生图模型：网页选过的优先，其次模型库里第一个 use="image" 的条目。
+
+            只回**当前真能用**的条目 id（条目删了 / 端点缺密钥 → 回落 / 空串），
+            免得网页显示一个点不动的名字。
+            """
+            from .. import tools_imagegen as _tig
+
+            try:
+                entry = _tig.pick_image_entry(svc.get_settings(), svc.store)
+            except Exception:
+                return ""
+            return str(getattr(entry, "id", "") or "") if entry is not None else ""
 
         def _endpoints_view() -> dict[str, Any]:
             settings = svc.get_settings()
@@ -921,6 +972,20 @@ class ConsoleServer:
                 "endpoints": [_endpoint_public(ep) for ep in (getattr(settings, "endpoints", ()) or ())],
                 "models": [_model_public(m) for m in (getattr(settings, "model_list", ()) or ())],
             }
+
+        def _imagegen_view() -> dict[str, Any]:
+            """生图这一块的状态：用哪个生图模型 + 常用服务预设（都不含密钥）。
+
+            单独一个接口（不塞进 /api/settings/endpoints）：那条接口的形状是既有契约。
+            """
+            try:
+                from ..imagegen_presets import public_list as _image_presets
+
+                presets = _image_presets()
+            except Exception:
+                logger.exception("生图预设读不出来（不影响模型页）")
+                presets = []
+            return {"model": _image_model_id(), "presets": presets}
 
         async def _apply_config_after_file_write(new_text: str) -> None:
             """写完文件立刻在本进程应用；失败只记日志（宿主文件监控会补一次）。"""
@@ -1185,6 +1250,10 @@ class ConsoleServer:
             for key in ("context_window", "max_tokens"):
                 if key in body and body[key] is not None:
                     raw_patch[key] = body[key]
+            # 2026-10-15 生图第一期：用途 + 生图参数（不认识的值由 _parse_model_list 记问题 → 400）
+            for key in ("use", "image_api", "image_default_size", "image_max_n"):
+                if key in body and body[key] is not None:
+                    raw_patch[key] = body[key]
             cand: dict[str, Any] = dict(existing or {})
             cand.update(raw_patch)
             cand["id"] = path_id
@@ -1201,6 +1270,8 @@ class ConsoleServer:
                 "id": m.id, "endpoint": m.endpoint, "model": m.model, "name": m.name,
                 "efforts": list(m.efforts or ()), "vision": bool(m.vision),
                 "context_window": int(m.context_window), "max_tokens": int(m.max_tokens),
+                "use": m.use, "image_api": m.image_api,
+                "image_default_size": m.image_default_size, "image_max_n": int(m.image_max_n),
             }
 
         async def _model_put(request: web.Request) -> web.Response:
@@ -1275,6 +1346,54 @@ class ConsoleServer:
 
         app.router.add_route("PUT", "/api/settings/model-list/{id}", self._write(_model_put))
         app.router.add_route("DELETE", "/api/settings/model-list/{id}", self._write(_model_delete))
+
+        # ---------- 生图（2026-10-15 第一期）：用哪个生图模型 + 常用服务预设 ----------
+        # GET 只回「选了哪个条目 id + 预设清单」，都不含密钥；PUT 选/清（存 kv，不改 config.toml）。
+
+        @get("/api/settings/imagegen")
+        async def _imagegen_get(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            return web.json_response(_imagegen_view())
+
+        async def _imagegen_put(request: web.Request) -> web.Response:
+            """选「用哪个生图模型」（2026-10-15 生图第一期）：只认 use="image" 的条目。
+
+            存 kv["imagegen.model"]（不是配置）：换用哪个不用改 config.toml、不用重载。
+            传空串 = 回到「模型库里第一个生图条目」。
+            """
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            want = str(body.get("model") or "").strip()
+            if want:
+                settings = svc.get_settings()
+                entry = next(
+                    (m for m in (getattr(settings, "model_list", ()) or ())
+                     if str(getattr(m, "id", "") or "") == want),
+                    None,
+                )
+                if entry is None:
+                    return _err(400, f"模型库里没有 id 是「{want}」的条目")
+                if str(getattr(entry, "use", "chat") or "chat").strip().lower() != "image":
+                    return _err(400, "这个条目不是生图模型（用途是「聊天」）；先在「模型」页把它改成用途「生图」")
+            try:
+                with svc.store.tx() as conn:
+                    if want:
+                        svc.store.kv_set(conn, "imagegen.model", want)
+                    else:
+                        svc.store.kv_delete(conn, "imagegen.model")
+            except Exception:
+                logger.exception("保存生图模型选择出错")
+                return _err(500, "保存失败，请重试")
+            logger.info("生图模型选择已保存（%s）", want or "（回到第一个生图条目）")
+            return web.json_response(_imagegen_view())
+
+        app.router.add_route("PUT", "/api/settings/imagegen", self._write(_imagegen_put))
 
         async def _model_verify(request: web.Request) -> web.Response:
             """验证所选模型（docs/13 A03）：一次短回答 + 一次无副作用工具往返，结果存
@@ -1723,6 +1842,88 @@ class ConsoleServer:
                 return _err(400, str(e))
 
         app.router.add_route("POST", "/api/onboarding", self._write(_onboarding_post))
+
+        # ---------- 可选依赖（2026-10-15 用户定：办公文档三库可选安装；optional_deps.py） ----------
+        # 只给总管理员。GET 第一次会**等一次探测**（子 agent 那个 python 下 import 得到吗 +
+        # 有没有 soffice），之后 5 分钟内只回缓存、过期就后台刷；装 / 卸都是后台跑，立刻回 202。
+        # 装在 <workspace_root>/../pylibs（MaiWork 自己的目录），绝不往 MaiBot 的 venv 里装。
+
+        def _optional_deps() -> Any:
+            return getattr(svc, "optional_deps", None)
+
+        @get("/api/optional-deps")
+        async def _optional_deps_get(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            deps = _optional_deps()
+            if deps is None:
+                return _err(503, "可选依赖管理没就位（这个 MaiWork 版本没带这个模块）")
+            try:
+                if not deps.checked():
+                    view = await deps.refresh()  # 第一次：等这次探测，页面直接看到真状态
+                else:
+                    deps.maybe_refresh()         # 之后：过期才后台刷，这次先回缓存
+                    view = deps.status()
+            except Exception:
+                logger.exception("读可选依赖状态出错")
+                return _err(500, "可选依赖状态读不出来")
+            return web.json_response(view)
+
+        async def _optional_deps_install(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            deps = _optional_deps()
+            if deps is None:
+                return _err(503, "可选依赖管理没就位（这个 MaiWork 版本没带这个模块）")
+            from .. import optional_deps as _od
+
+            gid = str(request.match_info.get("gid") or "")
+            try:
+                view = deps.start_install(gid, by="网页管理员")
+            except KeyError:
+                return _err(404, f"没有叫「{gid}」的可选组件")
+            except _od.Busy:
+                return web.json_response(
+                    {**deps.status(), "accepted": False, "error": "正在装，等它跑完再点"}, status=409
+                )
+            except _od.Unavailable as e:
+                return _err(409, str(e))
+            except Exception:
+                logger.exception("起可选依赖安装出错（%s）", gid)
+                return _err(500, "装不起来（看服务端日志）")
+            return web.json_response({**view, "accepted": True}, status=202)
+
+        async def _optional_deps_uninstall(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            deps = _optional_deps()
+            if deps is None:
+                return _err(503, "可选依赖管理没就位（这个 MaiWork 版本没带这个模块）")
+            from .. import optional_deps as _od
+
+            gid = str(request.match_info.get("gid") or "")
+            try:
+                view = deps.start_uninstall(gid, by="网页管理员")
+            except KeyError:
+                return _err(404, f"没有叫「{gid}」的可选组件")
+            except _od.Busy:
+                return web.json_response(
+                    {**deps.status(), "accepted": False, "error": "正在装 / 卸，等它跑完再点"}, status=409
+                )
+            except _od.Unavailable as e:
+                # 本机执行没就位：卸完没法重新探测（也没法如实报状态），当场说清，
+                # 不 500、更不许拿「没环境」的错误桩覆盖上次那份好探测结果。
+                return _err(409, str(e))
+            except Exception:
+                logger.exception("起可选依赖卸载出错（%s）", gid)
+                return _err(500, "卸不下来（看服务端日志）")
+            return web.json_response({**view, "accepted": True}, status=202)
+
+        app.router.add_route("POST", "/api/optional-deps/{gid}/install", self._write(_optional_deps_install))
+        app.router.add_route("POST", "/api/optional-deps/{gid}/uninstall", self._write(_optional_deps_uninstall))
 
         # ---------- 最近模型/工具请求日志（管理员，docs/07 §9.4） ----------
 
@@ -3322,6 +3523,88 @@ class ConsoleServer:
         app.router.add_post("/api/groups/{gid}/news/run", self._write(_news_run))
         app.router.add_get("/api/groups/{gid}/news/run", _news_run_get)
 
+        # ---------- 资讯卡片补救（2026-10-15；只给总管理员） ----------
+
+        _CARD_STATUSES = ("pending", "queued", "sending", "sent", "uncertain", "failed", "dropped")
+
+        async def _news_cards_get(request: web.Request) -> web.Response:
+            """最近失败 / 不确定的资讯卡片列表（网页补救入口）。
+
+            查询参数：
+            - `group_id`：群号或群链接码；空 = 所有服务群。
+            - `status`：卡片状态；空 = 只列 failed + uncertain（网页默认看的两种）。
+            - `limit`：默认 20，最多 200。
+
+            返回 `{"cards": [{"id","group_id","group_name","batch_id","status","mode",
+            "created","due_ts","sent_ts","error","count","item_ids","titles","outbox_id",
+            "outbox_status","fallback"}], "count": N}`；error 过一遍密钥 / 路径遮罩。
+            只给总管理员（群管理员 / 群友 403，匿名 401）。
+            """
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            cp = getattr(svc, "card_push", None)
+            if cp is None:
+                return _err(503, "资讯卡片模块没开")
+            gid = str(request.query.get("group_id") or "").strip()
+            if gid:
+                resolved = self._resolve_ref(gid)
+                if resolved is None:
+                    return _err(404, "没有这个群")
+                gid = resolved
+            status = str(request.query.get("status") or "").strip()
+            if status and status not in _CARD_STATUSES:
+                return _err(400, "status 只能是 " + " / ".join(_CARD_STATUSES))
+            try:
+                limit = int(request.query.get("limit") or 20)
+            except (TypeError, ValueError):
+                return _err(400, "limit 要是数字")
+            secrets = views.secret_list(svc)
+            try:
+                cards = cp.recent_cards(group_id=gid, status=status, limit=limit)
+            except Exception:
+                logger.exception("读最近失败卡片出错（群 %s）", gid or "全部")
+                return _err(500, "服务器出错了")
+            for card in cards:
+                card["error"] = views.redact_free_text(card.get("error"), secrets)
+            return web.json_response({"cards": cards, "count": len(cards)})
+
+        async def _news_card_resend(request: web.Request) -> web.Response:
+            """管理员手动重发一张失败 / 不确定的资讯卡片。
+
+            只允许 failed / uncertain；一张卡片每天最多手动重发 1 次（北京日期）。
+            有缓存图（card-<id>.jpg / .png）就用缓存，没有就重新画图；画不出来退回纯文字；
+            一律走发件箱（开关 / 睡觉时段 / 每日额度照旧管）。
+
+            返回 `{"ok": true, "card_id", "group_id", "mode": "image"|"text", "used_cache",
+            "outbox_id", "expires_ts", "message"}`；
+            404 卡片不存在、409 状态不对 / 今天重发过了 / 群不在服务名单、503 模块没开。
+            只给总管理员。
+            """
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            cp = getattr(svc, "card_push", None)
+            if cp is None:
+                return _err(503, "资讯卡片模块没开")
+            try:
+                cid = int(request.match_info["id"])
+            except (TypeError, ValueError):
+                return _err(400, "id 要是数字")
+            try:
+                out = await cp.resend(cid)
+            except KeyError:
+                return _err(404, "没有这张卡片")
+            except ValueError as e:
+                return _err(409, str(e))
+            except Exception:
+                logger.exception("手动重发资讯卡片出错（卡片 %s）", cid)
+                return _err(500, "服务器出错了")
+            return web.json_response(out)
+
+        app.router.add_get("/api/news/cards", _news_cards_get)
+        app.router.add_post("/api/news/cards/{id}/resend", self._write(_news_card_resend))
+
         async def _news_rate(request: web.Request) -> web.Response:
             """资讯评价（news_rating）：群友（本群）或管理员给一条资讯挑理由 + 可选一句话。
 
@@ -3369,7 +3652,7 @@ class ConsoleServer:
         app.router.add_post("/api/news/{id}/rate", self._write(_news_rate))
 
         async def _news_viz(request: web.Request) -> web.Response:
-            """资讯图解（news_viz）：核对过的图解整页（带 CSP，前端放进沙箱 iframe）。
+            """资讯图解（news_viz）：核对过的图解整页（带 CSP）+ 新格式的片段 frag（网页原生显示）。
             本群群友 / 群管理员 / 总管理员都能看；个人向资讯不做图解。"""
             ident, deny = await _ident_for_group_action(request, need_admin=False)
             if deny is not None:
@@ -3388,7 +3671,9 @@ class ConsoleServer:
             doc = news_viz.html_for(svc.store, gid, item_id) if svc.store is not None else None
             if doc is None:
                 return _err(404, "这条资讯没有图解")
-            return web.json_response({"html": doc}, headers={"Cache-Control": "no-store"})
+            # frag：零件清单图解（2026-10-15 起）的片段，网页原生插入；老 HTML 图解为 null（照旧沙箱 iframe）
+            frag = news_viz.frag_for(svc.store, gid, item_id)
+            return web.json_response({"html": doc, "frag": frag}, headers={"Cache-Control": "no-store"})
 
         app.router.add_get("/api/news/{id}/viz", _news_viz)
 

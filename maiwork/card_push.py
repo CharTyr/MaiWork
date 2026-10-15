@@ -25,8 +25,15 @@
   同一条资讯永远只进一次卡片；同一个构想只提一次。
   发过的东西 MaiBot 照样可以再提（发完另记一条 6 小时备忘）。
 - 只发服务群：建行和入队两处都挡。
-- 卡片图缓存（<workspace_root>/.web/.push/card-<id>.png）由 `prune_card_cache` 每天清一次
-  （app._prune_round 调）：只删发件箱里已经是 sent / failed / dropped 且过了 7 天的自己那一份。
+- **卡片发不出去怎么办（2026-10-15 用户定）**：卡片图走完发件箱的有界重试仍是 failed 时，
+  自动再入队一条**纯文字列表**（就是「画图失败退回纯文字」那一套，`news_card:<id>:fallback`）——
+  同样受开关 / 每日额度 / 睡觉时段 / 12 小时 TTL 约束，**只兜一次**（兜底自己再失败也不兜第二层），
+  `uncertain` 不兜（超时可能已发出，别重复刷屏）；兜底结果写回卡片行 `error` +
+  `kv["news_card.fallback.<id>"]`（不加迁移）。管理员还能 `resend(cid)` 手动重发
+  （只 failed / uncertain、有缓存用缓存、没有重画、每天最多 1 次），`recent_cards()` 列补救名单。
+- 卡片图缓存（<workspace_root>/.web/.push/card-<id>.jpg|.png）由 `prune_card_cache` 每天清一次
+  （app._prune_round 调）：只删发件箱里已经是 sent / failed / dropped 且过了 7 天的自己那一份；
+  2026-10-15 起卡片图是 JPEG（`.jpg`），Pillow 缺失时回落 PNG（`.png`），两种扩展名都认。
 - 插件重启：recover() 跟着发件箱的真实状态对账（没入过队的回 pending，发出去的补记 sent，
   结果不明的照抄），绝不重复发。
 
@@ -68,6 +75,14 @@ _ERR_MAX = 300
 _CARD_KINDS = ("news", "guide")
 # 卡片图落盘缓存的位置（相对 workspace_root）：发送失败重试用同一个文件，不重画
 _IMAGE_DIR = (".web", ".push")
+# 卡片图扩展名（2026-10-15 起默认 JPEG，小 50~80%）：.jpg 优先，.png 是 Pillow 缺失时的
+# 回落与老缓存；清缓存两种都认。落盘时按内容选，不拿错内容当后缀骗人。
+_IMAGE_SUFFIXES = (".jpg", ".png")
+_JPEG_MAGIC = b"\xff\xd8\xff"
+# 卡片最终 failed 时的纯文字兜底：key 后缀 / kv 记录 / 一天一次的手动重发记录
+_FALLBACK_SUFFIX = ":fallback"
+_FALLBACK_KV = "news_card.fallback"
+_RESEND_KV = "news_card.resend"
 
 
 # ----------------------------------------------------------------------
@@ -169,9 +184,10 @@ def prune_card_cache(store: Any, get_settings: Callable[[], Any], now: float, *,
                      age_s: float = PRUNE_AGE_S) -> int:
     """清掉早就落地的卡片图缓存；返回真删了几张。
 
-    只碰**自己那一份**：路径必须正好是 `<workspace_root>/.web/.push/card-<id>.png`
-    （解析后仍在该目录里、不是符号链接），且发件箱里有一条 `key=news_card:<id>`、
-    `kind='image'`、`status ∈ sent/failed/dropped` 且 `updated <= now-7 天` 的记录。
+    只碰**自己那一份**：路径必须正好是 `<workspace_root>/.web/.push/card-<id>.jpg`
+    或 `card-<id>.png`（解析后仍在该目录里、不是符号链接），且发件箱里有一条
+    `key=news_card:<id>`、`kind='image'`、`status ∈ sent/failed/dropped`
+    且 `updated <= now-7 天` 的记录。
 
     `pending` / `sending` / `uncertain` 绝不删（结果没定，图还得留着重发）；
     符号链接、解析到目录外的、名字 / 编号对不上的、没有对应记录的、artifact 或别处的
@@ -211,19 +227,21 @@ def prune_card_cache(store: Any, get_settings: Callable[[], Any], now: float, *,
             cid = _card_id_of_key(row["key"])
             if cid is None:
                 continue
-            target = push_resolved / f"card-{cid}.png"
-            if target.is_symlink() or not target.exists():
-                continue
-            resolved = target.resolve()
-            # 精确 basename + 就在这个目录里（resolve 后仍在 containment 内）
-            if resolved.name != f"card-{cid}.png" or resolved.parent != push_resolved:
-                continue
-            if root_resolved not in resolved.parents:
-                continue
-            if not resolved.is_file():
-                continue
-            resolved.unlink()
-            removed += 1
+            for suffix in _IMAGE_SUFFIXES:
+                name = f"card-{cid}{suffix}"
+                target = push_resolved / name
+                if target.is_symlink() or not target.exists():
+                    continue
+                resolved = target.resolve()
+                # 精确 basename + 就在这个目录里（resolve 后仍在 containment 内）
+                if resolved.name != name or resolved.parent != push_resolved:
+                    continue
+                if root_resolved not in resolved.parents:
+                    continue
+                if not resolved.is_file():
+                    continue
+                resolved.unlink()
+                removed += 1
         except OSError as e:
             logger.warning("删卡片图缓存失败（key=%s）：%s", row["key"], e)
         except Exception:
@@ -453,7 +471,8 @@ class CardPush:
         try:
             from . import news_viz
 
-            return news_viz.html_for(self._store, gid, int(item_id)) or ""
+            # 卡片是图片：用平铺版（标签页摊开、不省略不滚动），保证群里看得全
+            return news_viz.card_html_for(self._store, gid, int(item_id)) or ""
         except Exception:  # noqa: BLE001  图解是锦上添花，读不到就不画
             logger.debug("读图解失败（群 %s 条 %s）", gid, item_id, exc_info=True)
             return ""
@@ -468,16 +487,28 @@ class CardPush:
             lines.append(f"看全部资讯：{data['link']}")
         return "\n".join(lines)
 
-    def _image_path(self, cid: int) -> Path:
-        """卡片图的落盘位置（workspace_root/.web/.push/card-<id>.png）。
-
-        画一次就落盘：发送失败重试时发件箱用的是同一个文件，不重画（省一次起浏览器）。
-        """
+    def _push_dir(self) -> Path:
+        """卡片图落盘目录（workspace_root/.web/.push）。"""
         settings = self._get_settings()
         root = Path(getattr(settings, "workspace_root", Path("data/workspaces")))
         d = root.joinpath(*_IMAGE_DIR)
         d.mkdir(parents=True, exist_ok=True)
-        return d / f"card-{int(cid)}.png"
+        return d
+
+    def _image_paths(self, cid: int) -> list[Path]:
+        """这张卡片可能的两份缓存（.jpg 在前，.png 是回落 / 老缓存）。"""
+        d = self._push_dir()
+        return [d / f"card-{int(cid)}{suffix}" for suffix in _IMAGE_SUFFIXES]
+
+    def _image_path(self, cid: int, data: bytes = b"") -> Path:
+        """卡片图的落盘位置（workspace_root/.web/.push/card-<id>.jpg|.png）。
+
+        画一次就落盘：发送失败重试 / 管理员手动重发都用同一个文件，不重画（省一次起浏览器）。
+        扩展名**跟着内容走**：JPEG 魔数 → .jpg，其余 → .png（Pillow 缺失时 render_png
+        回落 PNG，落盘也得是 .png）。
+        """
+        suffix = ".jpg" if bytes(data[:3]) == _JPEG_MAGIC else ".png"
+        return self._push_dir() / f"card-{int(cid)}{suffix}"
 
     def _viz_budget(self, created: float, moment: float) -> float:
         """这次愿意为图解等多久：默认上限 CARD_VIZ_WAIT_S，且给发件箱留 CARD_VIZ_TAIL_S。
@@ -588,7 +619,7 @@ class CardPush:
             mode = "text"
             if png:
                 try:
-                    path = self._image_path(cid)
+                    path = self._image_path(cid, png)
                     path.write_bytes(bytes(png))
                     payload.update({"path": str(path), "text": f"看全部资讯：{link}" if link else ""})
                     kind, mode = "image", "image"
@@ -621,13 +652,25 @@ class CardPush:
             self._set(cid, status="uncertain", sent_ts=now,
                       error=f"发送超时，可能已发出，不重发：{error}"[:_ERR_MAX])
         elif outcome == "failed":
-            self._set(cid, status="failed", error=(error or "发送失败")[:_ERR_MAX])
+            err = (error or "发送失败")[:_ERR_MAX]
+            self._set(cid, status="failed", error=err)
+            # 卡片最终失败（发件箱重试一次之后仍然发不出去）→ 自动补一条**纯文字**列表：
+            # 群里至少还能看到这批资讯（2026-10-15 用户定）。uncertain 不补——超时可能
+            # 其实已经发出去了，再补一条就是重复刷屏。
+            try:
+                self._enqueue_text_fallback(gid, cid, now=now)
+            except Exception:
+                logger.exception("资讯卡片纯文字兜底出错（卡片 %s）", cid)
         elif outcome == "dropped":
             self._set(cid, status="dropped", error=(error or "作废")[:_ERR_MAX])
 
     def on_result(self, info: dict) -> None:
         """发件箱的结果回调（attach_outbox 时自动挂上）。"""
         key = str((info or {}).get("key") or "")
+        if key.startswith("news_card:") and key.endswith(_FALLBACK_SUFFIX):
+            # 纯文字兜底那条的结果：只记账，绝不因为兜底又失败再兜一层
+            self._settle_fallback(info)
+            return
         if not key.startswith("news_card:"):
             return
         try:
@@ -644,6 +687,302 @@ class CardPush:
                          moment=info.get("ts"))
         except Exception:
             logger.exception("资讯卡片结果回写失败（卡片 %s，outcome=%s）", cid, outcome)
+
+    # ---------------------------------------------------------- 纯文字兜底
+
+    @staticmethod
+    def _fallback_key(cid: int) -> str:
+        return f"news_card:{int(cid)}{_FALLBACK_SUFFIX}"
+
+    @staticmethod
+    def _fallback_kv(cid: int) -> str:
+        return f"{_FALLBACK_KV}.{int(cid)}"
+
+    def _kv_set(self, key: str, value: Any) -> None:
+        with self._store.tx() as conn:
+            self._store.kv_set(conn, key, value)
+
+    def _note_card_error(self, cid: int, extra: str) -> None:
+        """往卡片行的 error 里补一句（不加迁移、不改表结构）；已经有了就不重复加。"""
+        extra = str(extra or "").strip()
+        if not extra:
+            return
+        try:
+            row = self._store.read().execute(
+                "SELECT error FROM news_cards WHERE id=?", (int(cid),)
+            ).fetchone()
+            cur = str(row["error"] or "") if row is not None else ""
+            if extra in cur:
+                return
+            combined = f"{cur}；{extra}" if cur else extra
+            if len(combined) > _ERR_MAX:
+                keep = max(0, _ERR_MAX - len(extra) - 2)
+                combined = f"{cur[:keep]}…；{extra}"
+            self._set(cid, error=combined[:_ERR_MAX])
+        except Exception:
+            logger.exception("卡片行补记兜底结果失败（卡片 %s）", cid)
+
+    def _items_for_card(self, gid: str, item_ids: Any) -> list[Any]:
+        """这张卡片当时挑的条目里现在还能发的那几条（被撤下 / 个人向 / 类型不对的不要）。"""
+        try:
+            ids = [int(x) for x in json.loads(item_ids or "[]")]
+        except (TypeError, ValueError):
+            ids = []
+        out: list[Any] = []
+        for i in ids:
+            r = self._store.read().execute(
+                "SELECT * FROM news_items WHERE id=? AND group_id=? AND rejected=0"
+                " AND kind IN ('news','guide') AND COALESCE(target_user_id,'')=''",
+                (int(i), str(gid)),
+            ).fetchone()
+            if r is not None:
+                out.append(r)
+        return out
+
+    def _fallback_text(self, gid: str, row: Any) -> tuple[str, float]:
+        """兜底用的纯文字（就是「画图失败退回纯文字列表」那一套）+ 12 小时期限。"""
+        items = self._items_for_card(gid, row["item_ids"])
+        if not items:
+            return "", 0.0
+        link = group_link(self._store, self._get_settings(), gid)
+        data = self._card_data(gid, items, int(row["batch_id"] or 0), link)
+        return self._text_fallback(data), float(row["created"] or 0) + EXPIRE_S
+
+    def _enqueue_text_fallback(self, gid: str, cid: int, *, now: float) -> bool:
+        """卡片最终 failed → 入队一条纯文字兜底；**只发一次**，返回是否真的入队。
+
+        - 走同一份发件箱：开关 / 每日额度 / 睡觉时段 / 12 小时有效期照旧管；
+        - kv 记一笔（`news_card.fallback.<id>`）：重复的结果回调 / 重启对账不会再兜一次；
+        - 兜底那条自己也失败时只记结果，绝不再兜第二层（on_result 里没有递归）。
+        """
+        key = self._fallback_key(cid)
+        try:
+            if self._store.kv_get(self._fallback_kv(cid)):
+                return False
+        except Exception:
+            logger.debug("读兜底记录失败（卡片 %s），按没兜过处理", cid, exc_info=True)
+        outbox = self._outbox
+        if outbox is None:
+            return False
+        row = self._store.read().execute(
+            "SELECT * FROM news_cards WHERE id=?", (int(cid),)
+        ).fetchone()
+        if row is None:
+            return False
+        text, expires = self._fallback_text(gid, row)
+        if not text:
+            self._kv_set(self._fallback_kv(cid),
+                         {"status": "no_items", "ts": float(now), "outbox_id": 0})
+            self._note_card_error(cid, "没有可发的条目，没补文字")
+            return False
+        payload = {"push_kind": "news_card", "text": text, "expires_ts": float(expires)}
+        try:
+            oid = outbox.enqueue(key, gid, "text", payload)
+        except Exception:
+            logger.exception("纯文字兜底入队失败（群 %s 卡片 %s）", gid, cid)
+            return False
+        self._kv_set(self._fallback_kv(cid),
+                     {"status": "queued", "ts": float(now), "outbox_id": int(oid)})
+        # 这里只是**入队**：发件箱后面还可能按开关 / 睡觉时段 / 每日额度推迟、或按 12 小时
+        # 有效期作废，所以措辞只说「已入队」，真发出去了由 _settle_fallback 补记
+        # 「纯文字兜底已发出」（2026-10-15 复核：原来这里写「已补发」，实际还没发）。
+        self._note_card_error(cid, "已入队纯文字兜底（还没发出）")
+        logger.info("资讯卡片发不出去，已入队纯文字兜底（群 %s 卡片 %s）", gid, cid)
+        return True
+
+    def _settle_fallback(self, info: dict) -> None:
+        """兜底文字那条的结果回写：kv 记状态 + 卡片行补一句。"""
+        key = str((info or {}).get("key") or "")
+        cid_text = key[len("news_card:"):-len(_FALLBACK_SUFFIX)]
+        if not cid_text.isdigit():
+            return
+        cid = int(cid_text)
+        outcome = str(info.get("outcome") or "")
+        if outcome == "retrying":
+            return
+        error = str(info.get("error") or "")[:200]
+        try:
+            self._kv_set(self._fallback_kv(cid), {
+                "status": outcome or "unknown",
+                "ts": info.get("ts"),
+                "error": error,
+            })
+            if outcome == "sent":
+                self._note_card_error(cid, "纯文字兜底已发出")
+            elif outcome == "failed":
+                self._note_card_error(cid, "纯文字兜底也没发出去")
+            elif outcome == "uncertain":
+                self._note_card_error(cid, "纯文字兜底结果不明")
+            elif outcome == "dropped":
+                self._note_card_error(cid, "纯文字兜底作废了")
+        except Exception:
+            logger.exception("兜底结果回写失败（卡片 %s，outcome=%s）", cid, outcome)
+
+    # ---------------------------------------------------------- 管理员手动重发
+
+    async def resend(self, cid: int, *, now: Optional[float] = None) -> dict:
+        """手动重发一张 failed / uncertain 的卡片（网页管理员接口调它）。
+
+        - 只允许 failed / uncertain，别的状态抛 ValueError（网页 409）；卡片不存在抛 KeyError（404）；
+        - 有缓存图（card-<id>.jpg / .png）就用缓存，没有就重新画；画图失败退回纯文字；
+        - 一张卡片**每天最多手动重发 1 次**（kv 记北京日期）；
+        - 照旧走发件箱：开关 / 睡觉时段 / 每日额度都还管；有效期从这次重发重新算 12 小时
+          （不然失败很久的卡片一入队就被 TTL 作废，点了等于没点）。
+        """
+        moment = clock.now() if now is None else float(now)
+        row = self._store.read().execute(
+            "SELECT * FROM news_cards WHERE id=?", (int(cid),)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"没有这张卡片：{cid}")
+        gid = str(row["group_id"])
+        status = str(row["status"] or "")
+        if status not in ("failed", "uncertain"):
+            raise ValueError(f"只有失败或不确定的卡片能重发（现在是 {status}）")
+        if not _served(self._get_settings, gid):
+            raise ValueError("这个群不在服务名单里，不发")
+        outbox = self._outbox
+        if outbox is None:
+            raise ValueError("发件箱还没接上，重发不了")
+        today = clock.bj(moment).strftime("%Y-%m-%d")
+        kvkey = f"{_RESEND_KV}.{int(cid)}"
+        rec = self._store.kv_get(kvkey)
+        if isinstance(rec, dict) and str(rec.get("date") or "") == today:
+            raise ValueError("这张卡片今天已经手动重发过一次了，明天再试")
+
+        link = group_link(self._store, self._get_settings(), gid)
+        items = self._items_for_card(gid, row["item_ids"])
+        cached = next(
+            (p for p in self._image_paths(cid) if p.is_file() and not p.is_symlink()), None
+        )
+        path: Optional[Path] = cached
+        used_cache = cached is not None
+        mode = "image" if cached is not None else "text"
+        data: Optional[dict] = None
+        if cached is None:
+            if not items:
+                raise ValueError("这张卡片的条目都撤下了，没有可发的")
+            data = self._card_data(gid, items, int(row["batch_id"] or 0), link)
+            img: bytes = b""
+            try:
+                img = await self._render(data)
+            except Exception as e:  # 画不出来 → 退回纯文字，和自动路径一个口径
+                logger.warning("手动重发画图失败，改发纯文字（群 %s 卡片 %s）：%s", gid, cid, e)
+            if img:
+                path = self._image_path(cid, bytes(img))
+                try:
+                    path.write_bytes(bytes(img))
+                    mode = "image"
+                except OSError as e:
+                    logger.warning("手动重发图片落盘失败，改发纯文字（群 %s 卡片 %s）：%s", gid, cid, e)
+                    path, mode = None, "text"
+        payload: dict[str, Any] = {
+            "push_kind": "news_card",
+            # 有效期从这次重发重新算：手动重发是管理员明确要求的，不能被老 TTL 当场作废
+            "expires_ts": moment + EXPIRE_S,
+        }
+        if mode == "image" and path is not None:
+            payload.update({"path": str(path), "text": f"看全部资讯：{link}" if link else ""})
+        else:
+            if not items:
+                raise ValueError("这张卡片的条目都撤下了，没有可发的")
+            if data is None:
+                data = self._card_data(gid, items, int(row["batch_id"] or 0), link)
+            payload["text"] = self._text_fallback(data)
+            mode = "text"
+        kind = "image" if mode == "image" else "text"
+        box = self._store.read().execute(
+            "SELECT id FROM outbox WHERE key=?", (f"news_card:{int(cid)}",)
+        ).fetchone()
+        if box is None:
+            oid = int(outbox.enqueue(f"news_card:{int(cid)}", gid, kind, payload))
+        else:
+            oid = int(box["id"])
+            with self._store.tx() as conn:
+                conn.execute(
+                    "UPDATE outbox SET status='pending', kind=?, payload=?, attempts=attempts+1,"
+                    " not_before=0, error='', updated=? WHERE id=?",
+                    (kind, json.dumps(payload, ensure_ascii=False), moment, oid),
+                )
+        self._set(cid, status="queued", mode=mode, due_ts=moment,
+                  error=f"手动重发：{today}")
+        self._kv_set(kvkey, {"date": today, "ts": moment, "mode": mode, "outbox_id": oid})
+        logger.info("管理员手动重发资讯卡片（群 %s 卡片 %s，%s）", gid, cid, mode)
+        return {
+            "ok": True, "card_id": int(cid), "group_id": gid, "mode": mode,
+            "used_cache": used_cache, "outbox_id": oid,
+            "expires_ts": float(payload["expires_ts"]),
+            "message": "已重新入队（图片）" if mode == "image" else "已重新入队（纯文字）",
+        }
+
+    def recent_cards(self, *, group_id: Any = "", status: str = "", limit: int = 20) -> list[dict]:
+        """最近失败 / 不确定的卡片（网页补救入口用），新的在前。
+
+        默认列 failed + uncertain 两种；`status` 给了就只列那一种（网页自己校验取值）。
+        每条带：id、群号 / 群名、时间、状态、error、条目 id 与标题、发件箱那条的状态、
+        以及纯文字兜底的结果（kv）。
+        """
+        statuses = (str(status).strip(),) if str(status).strip() else ("failed", "uncertain")
+        sql = (
+            "SELECT id, group_id, batch_id, status, item_ids, created, due_ts, sent_ts, mode, error"
+            " FROM news_cards WHERE status IN (" + ", ".join("?" for _ in statuses) + ")"
+        )
+        params: list[Any] = list(statuses)
+        if str(group_id or "").strip():
+            sql += " AND group_id=?"
+            params.append(str(group_id).strip())
+        sql += " ORDER BY created DESC, id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 200)))
+        try:
+            rows = self._store.read().execute(sql, params).fetchall()
+        except Exception:
+            logger.exception("读最近失败卡片出错")
+            return []
+        names: dict[str, str] = {}
+        out: list[dict] = []
+        for r in rows:
+            cid = int(r["id"])
+            gid = str(r["group_id"])
+            try:
+                ids = [int(x) for x in json.loads(r["item_ids"] or "[]")]
+            except (TypeError, ValueError):
+                ids = []
+            titles: list[str] = []
+            if ids:
+                placeholders = ", ".join("?" for _ in ids)
+                got = self._store.read().execute(
+                    f"SELECT id, title FROM news_items WHERE id IN ({placeholders})", ids
+                ).fetchall()
+                by_id = {int(x["id"]): str(x["title"] or "") for x in got}
+                titles = [by_id[i] for i in ids if i in by_id]
+            if gid not in names:
+                grow = self._store.read().execute(
+                    "SELECT name FROM groups WHERE group_id=?", (gid,)
+                ).fetchone()
+                names[gid] = str(grow["name"] or "") if grow is not None else ""
+            box = self._store.read().execute(
+                "SELECT id, status FROM outbox WHERE key=?", (f"news_card:{cid}",)
+            ).fetchone()
+            fallback = self._store.kv_get(self._fallback_kv(cid))
+            out.append({
+                "id": cid,
+                "group_id": gid,
+                "group_name": names[gid],
+                "batch_id": int(r["batch_id"] or 0),
+                "status": str(r["status"] or ""),
+                "mode": str(r["mode"] or ""),
+                "created": float(r["created"] or 0.0),
+                "due_ts": r["due_ts"],
+                "sent_ts": r["sent_ts"],
+                "error": str(r["error"] or ""),
+                "count": len(ids),
+                "item_ids": ids,
+                "titles": titles,
+                "outbox_id": int(box["id"]) if box is not None else None,
+                "outbox_status": str(box["status"] or "") if box is not None else "",
+                "fallback": fallback if isinstance(fallback, dict) else {},
+            })
+        return out
 
     def _memo(self, gid: str, cid: int) -> None:
         """发完给 MaiBot 加一条 6 小时备忘（有人问起能接上）。"""

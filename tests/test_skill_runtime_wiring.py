@@ -163,8 +163,11 @@ async def test_disabled_find_skills_keeps_group_task_skills_in_plan_tools(tmp_pa
         assert "find-skills" in [i["name"] for i in app.skills.list("main")]
         assert _plan_names(app.tools) == ["list_skills", "read_skill"]
 
-        skills_mod.set_disabled(app.store, "find-skills", True)
-        assert app.skills.list("main") == []  # 全局那一份没了
+        # 2026-10-15：内置 main 通用 skill 不止 find-skills 一份（还有 goal-tracking /
+        # idea-shaping），要「一份都不剩」得逐份停用——别写死名字。
+        for name in [str(i["name"]) for i in app.skills.list("main")]:
+            skills_mod.set_disabled(app.store, name, True)
+        assert app.skills.list("main") == []  # 全局那几份都没了
 
         _add_group_skills(app)
         # 本群有 kind=task 的 active 做法 → 排计划照样给 list / read

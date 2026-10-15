@@ -648,6 +648,11 @@ async def _make_world(
     assert app.started
     # 测试里完全手动驱动 run_loop_once；后台循环挂到 1 小时，绝不自己开火（确定性）
     app.loop_interval = 3600.0
+    # 服务群的 session_id 先就位（等价于「这个群已经在聊了」）：发件箱发消息要它，
+    # 而手动驱动的循环不会自己先跑一轮。以前靠第一条消息后的 run_loop_once 补上；
+    # 2026-10 起收消息钩子会让出一次事件循环（钩子预算包装），钩子自己丢出去的
+    # 后台活（/mw 指令、Jev 判词）可能抢在那一轮前面跑，所以这里显式先写。
+    app._remember_session_row(SERVE, SESSION, travel())
     return World(
         plugin=plugin, app=app, host=host, openai=openai, jev=jev, herenow=herenow, travel=travel, tmp_path=tmp_path, config=cfg
     )

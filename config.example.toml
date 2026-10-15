@@ -5,7 +5,7 @@
 # 是否启用 MaiWork；默认关闭。宿主在没写 enabled 时会当成开启，所以这里必须显式写。
 enabled = false
 # 配置版本；改默认值时会升。一般不用手改。
-config_version = "0.5.0"
+config_version = "0.5.1"
 
 
 [groups]
@@ -140,6 +140,12 @@ context_window = 128000
 # 一次回答最多写多少 token（1024~1000000，默认 32768，必须小于 context_window）。
 # 每次模型调用都会带上它，有些端点收不到这个参数会出错。
 max_tokens = 32768
+# 用途（0.10.0 起，可省）：chat（默认，聊天 / 干活）或 image（生图）。生图条目不能当聊天模型，
+# 网页「设置 → 模型」里切到「生图」加更方便。下面三项只在 use = "image" 时有意义。
+# use = "chat"
+# image_api = "openai"    # 生图接口形状：openai（OpenAI / 火山方舟）或 siliconflow（硅基流动）
+# image_default_size = "" # 默认尺寸（空 = 服务商默认），如 1024x1024
+# image_max_n = 1         # 一次最多画几张（1~4）
 
 
 [tasks]
@@ -228,8 +234,28 @@ maibot_webui_url = ""
 
 
 [environments]
+# 一次性机器有两家，各自开关、可以同时开（互为备用）：
+# Railway 免密钥、匿名，用完等它自己过期；Freestyle 要自己注册并填下面的 freestyle_api_key，用完能主动销毁。
 # 是否允许用 Railway 临时 VM 跑活（ssh railway.new）。
 railway = true
+# 是否允许用 Freestyle 临时 VM 跑活（还要填密钥才真能用）。
+freestyle = false
+# 两家都开时优先用哪家："railway" 或 "freestyle"；优先那家拿不到（故障、当天用完、正被占着）自动换另一家。
+# 同一时间两家合计只用一台。
+vm_platform = "railway"
+# ---- Freestyle（https://www.freestyle.sh ；控制台 https://dash.freestyle.sh ）----
+# 账号级 API key：在控制台创建一个（只在创建时显示一次），只进不出。
+# 也可以不改这里，改用环境变量 FREESTYLE_API_KEY（优先级更高）。
+freestyle_api_key = ""
+# 机器规格用哪个镜像（创建时不能单独选 CPU / 内存，只能靠镜像）：
+# freestyle/ubuntu-sm = 2 核 4G · 16G 盘；freestyle/ubuntu = 4 核 8G · 32G 盘（免费档上限）。
+freestyle_snapshot = "freestyle/ubuntu-sm"
+# 一台机器从创建时刻算最多活多少分钟，到点自动删除（5~1440）。
+freestyle_ttl_minutes = 60
+# 无网络活动多少分钟后自动休眠；休眠只算存储费，文件仍可读（1~1440）。
+freestyle_idle_minutes = 10
+# Freestyle 一次性 VM 每天最多用几台（1~10；免费档并发上限 10，自留余量）。
+freestyle_daily_max = 2
 # 自己的专用 VPS / VM（可以写多台）：要跑命令的活优先用它们，按列出顺序挑连得上、没活的那台。
 # 先把网页「运行状态 → 专用机器」里的 MaiWork 公钥加进机器的 ~/.ssh/authorized_keys。
 # 各台的情况和用途可以写进网页「做事规矩」（AGENTS.md），主模型按它挑（也可以点名）。
@@ -305,6 +331,9 @@ jina_api_key = ""
 [extensions]
 # 子 agent 的扩展：MCP 端点和 skill。MaiWork 自己加载，只注册进自己的工具表
 # （不给 MaiBot 的 planner）；skill 由管理员放到 <数据目录>/skills/<名字>/SKILL.md，不用配置。
+# 另有几份随插件自带的 skill（调研报告、资讯核实、通用任务、目标追踪、构想整理、办公文档），
+# 只读，可在网页「设置 → 工具」里停用。办公文档要用的 python-docx / openpyxl / python-pptx
+# 是可选组件：在同一页「可选组件」一键安装（装在 MaiWork 自己的目录，不动 MaiBot 的环境）。
 # 联网搜索不写死在配置里：在首次引导的「联网搜索」一步，或网页「设置 → 扩展」里，
 # 勾选搜索服务预设（免密钥的可以直接用）并绑定即可（绑定存数据库，见 docs/02 §10）；
 # 也可以自己加一个带搜索工具的 MCP，再点「用作联网搜索」。勾的第一个当主搜索，其余当备用。

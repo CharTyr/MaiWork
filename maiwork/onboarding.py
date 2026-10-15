@@ -13,8 +13,10 @@
 没有记录但模型已经配好 = 已经在用的老安装，不打扰。
 
 checks（老字段，布尔）保留给旧前端；items 是给完成页 / 设置页的能力清单（docs/13 G01/G02）：
-模型、群、搜索、执行、交付、第一件小事，各自写清楚「能用 / 受限 / 在等 / 没开」和下一步。
-全部从现有设置和运行状态里读，不另存、不联网、不调模型。
+模型、群、搜索、执行、办公文档（可选依赖，2026-10-15 加）、交付、第一件小事，各自写清楚
+「能用 / 受限 / 在等 / 没开」和下一步。
+全部从现有设置和运行状态里读，不另存、不联网、不调模型（办公文档那项只读上次探测结果，
+真探测由网页 /api/optional-deps 触发）。
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ KV_KEY = "onboarding"
 ACTIONS = ("done", "skip", "reset", "start", "progress")
 _TERMINAL = ("done", "skipped", "later")
 # 和前端 ONB_STEPS 同一份名单（前端改步骤要一起改）
-STEPS = ("hello", "models", "groups", "keys", "search", "admins", "look", "done")
+STEPS = ("hello", "models", "groups", "keys", "search", "admins", "look", "env", "done")
 # 必要条件：缺了就不算「可用」；其余（Jev、头像、管理员、搜索）可选
 REQUIRED = ("models", "groups")
 
@@ -212,6 +214,53 @@ def _exec_item(svc: Any) -> dict[str, Any]:
     )
 
 
+def _office_item(svc: Any) -> dict[str, Any]:
+    """办公文档三库（可选安装，2026-10-15 用户定；optional_deps.py）。
+
+    - 装好了 → ok，写清楚版本和有没有 LibreOffice；
+    - 没装 / 装一半 → warn，指路网页「设置 → 工具」一键装（不装也能交 Markdown / CSV / HTML）；
+    - 正在装 → wait；
+    - 还没探测过 → wait（网页「设置 → 工具」打开时才会真探测，这里不瞎猜）。
+    """
+    deps = getattr(svc, "optional_deps", None)
+    if deps is None:
+        return _item("office", "off", "办公文档", "这个 MaiWork 版本没带可选依赖管理，装不了", sub="extensions")
+    try:
+        view = deps.status()
+        group = (view.get("groups") or [{}])[0]
+    except Exception:
+        return _item("office", "warn", "办公文档", "状态读不出来（看服务端日志）", sub="extensions")
+    label = str(group.get("label") or "办公文档")
+    if group.get("state") == "installing" or group.get("uninstalling"):
+        return _item("office", "wait", label, "正在装 / 卸，装完这里会自己更新", sub="extensions")
+    if not float(view.get("checked_at") or 0):
+        return _item(
+            "office", "wait", label,
+            "还没查过这台机器上有没有装（可选）：打开网页「设置 → 工具」会自动查一次，"
+            "没装可以在那里一键装",
+            sub="extensions",
+        )
+    pkgs = list(group.get("packages") or [])
+    if group.get("state") == "ok":
+        have = "、".join(
+            f"{p.get('name')} {p.get('version') or ''}".strip() for p in pkgs
+        )
+        soffice = (group.get("tools") or [{}])[0]
+        tail = "有 LibreOffice（能转 PDF、重算公式）" if soffice.get("found") else "没有 LibreOffice（转 PDF / 重算 Excel 公式做不了，会如实说明）"
+        return _item("office", "ok", label, f"已装好：{have}；{tail}", sub="extensions")
+    last = group.get("last_install") or {}
+    why = ""
+    if str(last.get("state")) == "failed" and last.get("error"):
+        why = f"；上次装失败：{last.get('error')}"
+    return _item(
+        "office", "warn", label,
+        "还没装（可选）：要交 Word / Excel / PPT 就得装它——管理员可以在网页「设置 → 工具」一键装"
+        "（装的是 MaiWork 自己的目录，不动 MaiBot 的环境）；不装也能干活，改交 Markdown / CSV / HTML"
+        + why,
+        sub="extensions",
+    )
+
+
 def _delivery_item(svc: Any) -> dict[str, Any]:
     settings = svc.get_settings()
     public_url = ""
@@ -264,6 +313,7 @@ def items(svc: Any, checks: dict[str, bool] | None = None) -> list[dict[str, Any
         _groups_item(svc, gids),
         _search_item(svc, gids),
         _exec_item(svc),
+        _office_item(svc),
         _delivery_item(svc),
         _first_item(svc, gids, bool(checks.get("models"))),
         _item("jev", "ok" if checks.get("jev") else "off", "Jev 快速判断",

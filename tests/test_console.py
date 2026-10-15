@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import aiohttp
 import pytest
@@ -1797,6 +1798,98 @@ class TestM3Routes:
         finally:
             await tc.close()
             await app.stop()
+
+    # ---------- 一次性 VM 健康项：railway 与 freestyle 二选一（2026-10-15） ----------
+
+    async def _health_states(self, tmp_path: Path, raw: dict, *, transport: Any = None) -> dict:
+        ctx = FakeCtx({})
+        app = MaiWorkApp(ctx, raw, plugin_dir=Path(__file__).resolve().parents[1])
+        app.profiles_cls = FakeProfiles
+        if transport is not None:
+            app.freestyle_transport = transport
+        await app.start()
+        server = TestServer(app.console.app)
+        tc = TestClient(server, cookie_jar=aiohttp.CookieJar(unsafe=True))
+        await tc.start_server()
+        try:
+            await tc.post("/api/login", json={"password": PASSWORD})
+            s = await (await tc.get("/api/settings")).json()
+            return {h["key"]: h for h in s["health"]}
+        finally:
+            await tc.close()
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_health_shows_freestyle_when_selected(self, tmp_path: Path) -> None:
+        """只开 Freestyle（railway 关）：健康列表里是 freestyle 那条，不出现 railway 那条。
+
+        验密钥是后台的（GET /v5/vms?limit=1），视图只读 kv 缓存；这里注入
+        MockTransport，一条真请求都不发（AGENTS.md 红线）。
+        """
+        import httpx
+
+        raw = _raw_config(tmp_path / "d10")
+        raw["environments"] = {
+            "vm_platform": "freestyle", "freestyle": True, "railway": False,
+            "freestyle_api_key": "fs-health-ascii-key",
+            "freestyle_daily_max": 2,
+        }
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v5/vms"
+            assert request.headers["authorization"] == "Bearer fs-health-ascii-key"
+            return httpx.Response(200, json={"vms": [], "totalCount": 3, "runningCount": 1})
+
+        states = await self._health_states(tmp_path, raw, transport=httpx.MockTransport(_handler))
+        assert "freestyle" in states and "railway" not in states
+        assert states["freestyle"]["state"] == "ok"
+        assert "今天用了 0/2 台" in states["freestyle"]["text"]
+        # 密钥绝不出现在接口返回里
+        assert "fs-health-ascii-key" not in json.dumps(states, ensure_ascii=False)
+
+    @pytest.mark.asyncio
+    async def test_freestyle_key_check_writes_kv(self, tmp_path: Path) -> None:
+        """后台验密钥（_run_freestyle_check → check_key）把结论写进 kv，且绝不写密钥。"""
+        import httpx
+
+        raw = _raw_config(tmp_path / "d10b")
+        raw["environments"] = {"vm_platform": "freestyle", "freestyle": True, "freestyle_api_key": "fs-kv-ascii-key"}
+        app = MaiWorkApp(FakeCtx({}), raw, plugin_dir=Path(__file__).resolve().parents[1])
+        app.profiles_cls = FakeProfiles
+        seen: list[str] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.url.path)
+            return httpx.Response(200, json={"vms": [], "totalCount": 3, "runningCount": 1})
+
+        app.freestyle_transport = httpx.MockTransport(_handler)
+        await app.start()
+        try:
+            env = app._selected_vm_env()
+            assert env is not None
+            await app._run_freestyle_check(env)
+            rec = app.store.kv_get("freestyle.key_check", None)
+            assert isinstance(rec, dict) and rec["ok"] is True
+            assert "fs-kv-ascii-key" not in json.dumps(rec, ensure_ascii=False)
+            assert seen == ["/v5/vms"]
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_health_freestyle_without_key_warns(self, tmp_path: Path) -> None:
+        raw = _raw_config(tmp_path / "d11")
+        raw["environments"] = {"vm_platform": "freestyle", "freestyle": True}
+        states = await self._health_states(tmp_path, raw)
+        # 两家各自开关：Railway 默认也开着，两条都在
+        assert "freestyle" in states and "railway" in states
+        assert states["freestyle"]["state"] == "warn"
+        assert "密钥" in states["freestyle"]["text"]
+
+    @pytest.mark.asyncio
+    async def test_health_keeps_railway_by_default(self, tmp_path: Path) -> None:
+        raw = _raw_config(tmp_path / "d12")
+        states = await self._health_states(tmp_path, raw)
+        assert "railway" in states and "freestyle" not in states
 
     # ---------- 构想「想要这个」已删（docs/18 §五）：路由摘掉、不再落待批 ----------
 

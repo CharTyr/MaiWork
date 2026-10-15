@@ -35,8 +35,9 @@ def _ts(hour: int, minute: int = 0, *, day: int = 15) -> float:
 NOON = _ts(12)
 SLEEP = _ts(23, 30)
 
-# 发件箱按内容（PNG 魔数）判图片类型：假渲染器也要给一张「真 PNG 头」的数据
-PNG = b"\x89PNG\r\n\x1a\n" + b"card-bytes"
+# 发件箱按内容判图片类型：假渲染器也要给一张「真图头」的数据
+# （2026-10-15 起卡片图默认 JPEG：news_card.render_png 用 Pillow 转 quality 85）
+JPG = b"\xff\xd8\xff\xe0" + b"card-bytes"
 
 
 class CardHost:
@@ -60,12 +61,13 @@ class Renderer:
     def __init__(self) -> None:
         self.calls: list[dict] = []
         self.error: Exception | None = None
+        self.data: bytes = JPG
 
     async def __call__(self, data):
         self.calls.append(data)
         if self.error is not None:
             raise self.error
-        return PNG
+        return self.data
 
 
 def _make(tmp_path, *, public_url="https://mw.example", groups=(GID,), outbox=True):
@@ -209,12 +211,14 @@ async def test_scan_then_flush_sends_top_n_with_link(tmp_path):
     assert card["status"] == "queued" and card["sent_ts"] is None
     box = _boxes(store)[0]
     assert box["status"] == "pending" and box["kind"] == "image"
-    assert Path(json.loads(box["payload"])["path"]).is_file()
+    # 2026-10-15 起卡片图是 JPEG（小 50~80%）：落盘扩展名跟着内容走
+    card_path = Path(json.loads(box["payload"])["path"])
+    assert card_path.is_file() and card_path.suffix == ".jpg"
     await ob.flush(NOON + 61)
     assert len(host.images) == 1
     sent = host.images[0]
     assert sent["session_id"] == f"sess-{GID}"
-    assert sent["png"] == PNG
+    assert sent["png"] == JPG
     assert "https://mw.example/#/tok900000001/news" in sent["text"]
     data = renderer.calls[0]
     assert [it["title"] for it in data["items"]] == [f"标题1-0", f"标题1-1"]  # 分数最高的两条
@@ -405,6 +409,21 @@ async def test_render_failure_falls_back_to_text_list(tmp_path):
     assert "标题1-0" in t and "标题1-1" in t and "https://mw.example/#/tok900000001/news" in t
     row = _cards(store)[0]
     assert row["status"] == "sent" and row["mode"] == "text"
+
+
+async def test_png_render_fallback_keeps_png_extension(tmp_path):
+    """Pillow 不可用时 render_png 回落 PNG：落盘扩展名跟着内容走（.png），发件箱照样放行。"""
+    store, _, host, _p, _m, renderer, cp, ob = _make(tmp_path)
+    renderer.data = b"\x89PNG\r\n\x1a\n" + b"fallback-png"
+    _enable(store)
+    _batch(store)
+    cp.scan(GID, NOON + 10)
+    await cp.flush(GID, NOON + 10)
+    box = _boxes(store)[0]
+    path = Path(json.loads(box["payload"])["path"])
+    assert path.suffix == ".png"
+    await ob.flush(NOON + 11)
+    assert len(host.images) == 1 and host.images[0]["png"][:8] == b"\x89PNG\r\n\x1a\n"
 
 
 async def test_no_public_url_image_only(tmp_path):

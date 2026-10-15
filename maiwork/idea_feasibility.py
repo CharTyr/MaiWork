@@ -10,7 +10,7 @@
 `check()` 逐条核对模型交回的 feasibility。工具被摘掉时（`app._drop_command_tools_if_stopped`
 摘 `run_command` / `start_process` 等）清单自然没有那项能力，模型硬写 uses 也过不了。
 
-工具名以代码里的真实名字为准（2026-10-05 grep 核实）：
+工具名以代码里的真实名字为准（2026-10-05 grep 核实；2026-10-15 加 image）：
 - `web_search` / `fetch_page`（tools_builtin.py）→ search
 - `read_chat_history` / `search_memory`（tools_exec.py）、`read_profile`（tools_builtin.py）→ chat
   （`search_chat` 只是 chatlog.py 里的 Python 函数，**不是**给子 agent 的工具，不算）
@@ -18,6 +18,7 @@
 - `run_command`（tools_exec.py）→ code
 - `vm_run`（tools_railway.py）→ vm
 - `machine_*` 前缀（tools_ssh.py）→ machine
+- `generate_image`（tools_imagegen.py）→ image（画照片 / 插画 / 封面 / 概念图；数字图表不算）
 - `mcp_<扩展名>_<工具名>`（extensions.py）→ `ext:<工具名>`，最多 12 个
 
 群文件 / 公告 / 相册（本群权限，MaiWork 时有时无）**不进清单**：构想不该靠它成立。
@@ -45,6 +46,10 @@ _CAP_TOOLS: dict[str, tuple[str, ...]] = {
     "write": ("write_file",),
     "code": ("run_command",),
     "vm": ("vm_run",),
+    # 2026-10-15：AI 生图（tools_imagegen.generate_image）。只有工具真在子 agent 名单里
+    # 才算有这个本事（工具一直注册着，摘掉 / 没接就没有）；「配没配生图模型」是运行期的
+    # 事（没配时 generate_image 会中文报错），构想这边只看工具拿不拿得到。
+    "image": ("generate_image",),
 }
 # 能力 → 工具名前缀（machine_*）
 _CAP_PREFIXES: dict[str, str] = {"machine": "machine_"}
@@ -67,6 +72,7 @@ _CAP_LABEL: dict[str, str] = {
     "code": "在本机跑命令 / 脚本",
     "vm": "起一台一次性云 VM 跑",
     "machine": "连你自己的服务器跑",
+    "image": "AI 生图（画照片 / 插画 / 封面 / 概念图；数字和图表画不准，那类要走确定性渲染）",
 }
 
 # 做不到清单（提示词里逐条讲给模型听；check() 不做文本匹配，靠 level / needs_members / uses
@@ -78,7 +84,9 @@ CANNOT: tuple[str, ...] = (
     "要登录 / 注册 / 实名 / 付费下单 / 填验证码才能用的站和服务",
     "实际去玩游戏、代打、线下跑腿、买卖实物",
     "实时盯盘、抢购、抢票、秒级行情（没有常驻实时通道）",
-    "生成图片 / 视频 / 音频（除非清单里有对应的 ext: 扩展）",
+    # 2026-10-15：图片不再一律做不到——清单里真有 image 本事（generate_image）就能画；
+    # 视频 / 音频仍然做不到（除非清单里有对应的 ext: 扩展）。
+    "生成视频 / 音频（除非清单里有对应的 ext: 扩展）；图片要看清单里有没有 image 本事，没有就别提",
     "保证某个结果一定发生（只能做事、交东西，不能保证群友会响应）",
 )
 

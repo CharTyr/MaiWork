@@ -10,6 +10,11 @@
 - direct（只给本机开发测试）：直接开子进程，不隔离。环境变量也只给最小集合
   （PATH、HOME=工作区、LANG=C.UTF-8），绝不继承插件进程的环境（防密钥漏给子进程）。
 
+可选依赖（2026-10-15 加）：装了办公文档三库（optional_deps.py 装到
+<workspace_root>/../pylibs）时，上面两种模式都会额外给一个 `PYTHONPATH=<那个目录>`，
+子 agent 的 python3 才 import 得到 docx / openpyxl / pptx；**没装就一个字都不加**，
+宿主进程（MaiBot 的 venv）也完全不受影响。
+
 后台进程：
 - systemd：systemd-run（--collect，不带 --wait --pipe）--unit=maiwork-<工作区>-<标签>，
   输出重定向到工作区 runtime/logs/<标签>.log，进程收尾把自己的退出码写进
@@ -396,14 +401,38 @@ class LocalEnv:
 
     _MINIMAL_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
 
-    @staticmethod
-    def _minimal_env(ws: Path) -> dict[str, str]:
-        """子进程只给最小环境；绝不传插件进程的环境（密钥不落子进程）。"""
-        return {
+    def _pylibs(self) -> str:
+        """可选依赖目录（<workspace_root>/../pylibs）；没装过 / 读不到配置 → 空串。
+
+        2026-10-15 加：办公文档三库（python-docx / openpyxl / python-pptx）按需装到
+        MaiWork 自己的目录里（optional_deps.py），子 agent 的本机命令要靠 PYTHONPATH
+        才 import 得到。**只影响子进程**：插件进程（宿主 venv）一点都不碰。
+        """
+        try:
+            from .. import optional_deps
+
+            path = optional_deps.pylibs_dir(self._get_settings())
+        except Exception:
+            logger.debug("读可选依赖目录出错，这次不注入 PYTHONPATH", exc_info=True)
+            return ""
+        if path is None or not path.is_dir():
+            return ""
+        return str(path)
+
+    def _minimal_env(self, ws: Path) -> dict[str, str]:
+        """子进程只给最小环境；绝不传插件进程的环境（密钥不落子进程）。
+
+        没装可选依赖时就是老的三件套（PATH / HOME / LANG），行为一字不变。
+        """
+        env = {
             "PATH": LocalEnv._MINIMAL_PATH,
             "HOME": str(ws),
             "LANG": "C.UTF-8",
         }
+        pylibs = self._pylibs()
+        if pylibs:
+            env["PYTHONPATH"] = pylibs
+        return env
 
     def _systemd_setenv(self, ws: Path) -> list[str]:
         """--setenv 把最小环境直接给单元（线上实测：不设的话单元里 HOME 是

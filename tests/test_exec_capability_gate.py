@@ -29,6 +29,7 @@ import json
 
 import pytest
 
+from CharTyr_MaiWork.maiwork import clock
 from CharTyr_MaiWork.maiwork.coordinator import Coordinator
 from CharTyr_MaiWork.maiwork.goals import Goals
 from CharTyr_MaiWork.maiwork.tasks import Tasks
@@ -77,14 +78,14 @@ def _plan_json(*, jobs, criteria=None, deliver_kind="view", env=None, question=N
 
 def _coord(
     store, settings, env, tools, agents, workers, *,
-    specialists=None, models=None, railway=None, ssh=None,
+    specialists=None, models=None, railway=None, ssh=None, vms=None,
 ):
     """和共用 _coordinator 一样，但把 outbox / delivery 也交回给用例检查。"""
     outbox, delivery = FakeOutbox(), FakeDelivery()
     coord = Coordinator(
         store, models, workers, tools, Tasks(store, lambda: settings),
         Goals(store, lambda: settings), delivery, outbox, env, FakeProfiles(), lambda: settings,
-        capability=None, railway=railway, ssh=ssh,
+        capability=None, railway=railway, ssh=ssh, vms=vms,
     )
     coord._specialists = specialists  # noqa: SLF001
     return coord, outbox, delivery
@@ -653,3 +654,66 @@ class TestNoReplanWhenFine:
         assert len(_plan_prompts(models)) == 1
         assert "task.exec_replanned" not in _kinds(store, tid)
         assert "task.exec_unavailable" not in _kinds(store, tid)
+
+
+# ----------------------------------------------------------------------
+# 6b. 第二家一次性 VM（Freestyle）：暂停前同样必须释放（2026-10-15）
+# ----------------------------------------------------------------------
+
+
+class FakeFreestyle:
+    """Freestyle 桩：记下申请 / 释放，不碰网络。"""
+
+    def __init__(self, box):
+        self.box = box
+        self.acquired: list[str] = []
+        self.released: list = []
+
+    async def acquire(self, tid):
+        self.acquired.append(str(tid))
+        return self.box
+
+    async def release(self, box):
+        self.released.append(box)
+
+
+def _freestyle_box():
+    from CharTyr_MaiWork.maiwork.environments.freestyle import FreestyleBox
+
+    return FreestyleBox(
+        job_id="T-1", vm_id="vm-fs-1", expires_ts=clock.now() + 3600,
+        remote_root="/root/maiwork", snapshot="freestyle/ubuntu-sm", cpu=2, memory_mib=4096,
+    )
+
+
+class TestFreestyleBoxRelease:
+    async def test_freestyle_box_released_before_pause(self, store, settings, env, tools, agents):
+        import dataclasses
+
+        fs_settings = dataclasses.replace(
+            settings,
+            environments=dataclasses.replace(
+                settings.environments, vm_platform="freestyle", freestyle=True, freestyle_api_key="fs-gate-key"
+            ),
+        )
+        box = _freestyle_box()
+        freestyle = FakeFreestyle(box)
+        tasks = Tasks(store, lambda: fs_settings)
+        tid = _new_task(tasks)
+        workers = CaptureWorkers()
+        specialists = _make_specialists(agents, workers)
+        models = ModelsQueue(replies=[
+            _plan_json(jobs=[_job(["read_file", "write_file"], agent="task")], env="freestyle"),
+            _plan_json(jobs=[_job(["read_file", "write_file"], agent="task")], env="freestyle"),
+        ])
+        coord, _o, _d = _coord(
+            store, fs_settings, env, tools, agents, workers,
+            specialists=specialists, models=models, vms={"freestyle": freestyle},
+        )
+
+        await asyncio.wait_for(coord.run_task(tid), timeout=10)
+
+        assert freestyle.acquired == [tid]
+        assert freestyle.released == [box], "暂停也必须释放 Freestyle 机器"
+        assert tasks.get(tid)["status"] == "paused"
+        assert workers.calls == []

@@ -26,14 +26,136 @@
 
 from __future__ import annotations
 
+import base64
 import logging
+import re
 from pathlib import Path
 from typing import Any, Callable
 
-from . import clock
+from . import clock, viz_spec
 from .tools import Tool, ToolContext, ToolResult, Tools
 
 logger = logging.getLogger("maiwork.tools_exec")
+
+# ---------------------------------------------------------------------------
+# 交付报告里的图片（2026-10-15，任务 A1）：render_report 把图内联成 data URI
+#
+# 交付网页的 CSP 是 `default-src 'none'; style-src 'unsafe-inline'; img-src data:`——
+# 图**只能**内联，不能引工作区路径（here.now 上看不到本机文件）也不能引外网地址
+# （CSP 会拦、链接也会过期）。所以 render_report 渲染前把 image 零件指向的图读出来，
+# 编成 data URI 写进零件里，单个 html 交付到哪儿都不会裂图。
+#
+# 三条硬闸（超了直接中文报错，让子 agent 换小图，绝不悄悄截断/降质）：
+# - 只认**本任务成品目录** artifacts/<任务ID>/ 里的图（别的任务、工作区外一律拒）；
+# - 按**内容**认图（PNG / JPEG / WebP / GIF 魔数），不看后缀；
+# - 单张 ≤ _IMG_ONE_MAX、整页所有图加起来 ≤ _IMG_PAGE_MAX。
+#
+# 整页上限为什么是 3MB（2026-10-15 复核修正）：报告是用 `write_file` 写的，工作区
+# 单文件硬上限 5MB（`environments/local.py::_MAX_FILE_BYTES`），而 data URI 会把图放大
+# 约 4/3。原来写的 12MB 根本到不了——两张 2MB 的图（单张 <3MB、合计 4MB <12MB）就会在
+# 写文件那一步报「单个文件不能超过 5MB」，子 agent 拿到的错误和清单里承诺的上限自相矛盾。
+# 3MB 整页 ≈ base64 4MB，加页面骨架仍稳稳落在 5MB 以内；**不提高全局写文件上限**
+# （那是全模块共用的闸，不为交付网页单独放宽）。
+# ---------------------------------------------------------------------------
+
+_IMG_ONE_MAX = 3 * 1024 * 1024        # 单张图片上限（3MB）
+_IMG_PAGE_MAX = 3 * 1024 * 1024       # 一页所有图片加起来的上限（3MB；见上面为什么不是 12MB）
+_IMG_TASK_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _image_mime(data: bytes) -> str:
+    """按内容认图片类型；不是认识的图返回 ""（后缀一律不看）。"""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
+
+
+def _inline_report_images(ctx: ToolContext, env: Any, spec: dict) -> str:
+    """把 report 规格里的 image 零件读成 data URI（写回 `block["src"]`）。
+
+    返回中文错误（"" = 全部成功）；有错时一个 src 都不留（调用方直接失败、不写半张图的页面）。
+    路径口径和交付闸一致：先 env.resolve（挡越界 / 符号链接逃逸），再要求落在
+    `artifacts/<本任务ID>/` 里。
+    """
+    blocks = [b for b in (spec.get("blocks") or []) if b.get("type") == "image"]
+    if not blocks:
+        return ""
+    if ctx.workspace is None:
+        return "这次任务没带工作区，读不了图"
+    task_id = str(getattr(ctx, "task_id", "") or "").strip()
+    if not task_id or not _IMG_TASK_ID_RE.fullmatch(task_id):
+        return "这次没有可用的任务号，不知道该从哪个任务目录读图"
+    base_rel = f"artifacts/{task_id}"
+    try:
+        base = Path(env.resolve(ctx.workspace.name, base_rel)).resolve()
+    except (PermissionError, ValueError, OSError) as e:
+        return f"读不了本任务的成品目录 {base_rel}/：{e}"
+    total = 0
+    for i, b in enumerate(spec.get("blocks") or []):
+        if b.get("type") != "image":
+            continue
+        where = f"第 {i + 1} 个零件（image）"
+        shown = str(b.get("path") or "")
+        rel_in = shown
+        if rel_in.startswith(base_rel + "/"):
+            rel_in = rel_in[len(base_rel) + 1:]
+        elif rel_in.startswith("artifacts/"):
+            return (
+                f"{where} 只能引用本任务成品目录 {base_rel}/ 里的图，"
+                f"不能引用 {shown}（那是别的任务的目录）"
+            )
+        try:
+            path = Path(env.resolve(ctx.workspace.name, f"{base_rel}/{rel_in}"))
+        except (PermissionError, ValueError) as e:
+            return f"{where} 的图读不到：{shown}（{e}）"
+        try:
+            real = path.resolve()
+        except OSError as e:
+            return f"{where} 的图读不到：{shown}（{e}）"
+        if real != base and base not in real.parents:
+            return (
+                f"{where} 的图不在本任务成品目录 {base_rel}/ 里（符号链接指到外面了？），不能内联：{shown}"
+            )
+        if not real.is_file():
+            return (
+                f"{where} 找不到这张图：{shown}。用生成图片时返回的那个路径（"
+                f"{base_rel}/images/…），或先确认图真的写进了本任务目录"
+            )
+        try:
+            size = int(real.stat().st_size)
+        except OSError as e:
+            return f"{where} 的图读不到大小：{shown}（{e}）"
+        if size > _IMG_ONE_MAX:
+            return (
+                f"{where} 的图太大了（{size / 1048576:.1f}MB，单张上限 "
+                f"{_IMG_ONE_MAX // 1048576}MB）：{shown}。换一张小图，或把图压一下再放进来"
+            )
+        try:
+            data = real.read_bytes()
+        except OSError as e:
+            return f"{where} 的图读不出来：{shown}（{e}）"
+        mime = _image_mime(data)
+        if not mime:
+            return (
+                f"{where} 不是图片文件（按内容判，只认 PNG / JPEG / WebP / GIF）：{shown}"
+            )
+        total += len(data)
+        if total > _IMG_PAGE_MAX:
+            # 说清是哪条闸、为什么有这条闸（交付网页本身要落成一个文件，还有 5MB 上限），
+            # 并给可行做法——不要让子 agent 去猜「整页上限」和写文件报错哪个说了算。
+            return (
+                f"这一页的图加起来太大了（{total / 1048576:.1f}MB，整页合计上限 "
+                f"{_IMG_PAGE_MAX // 1048576}MB；交付网页要写成一个文件，页面本身还有 5MB 上限）："
+                "少放几张、把图压小，或把图拆到多个报告页里"
+            )
+        b["src"] = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+    return ""
 
 # ---------------------------------------------------------------------------
 # 分页读（线上 T-10）：read_file / inspect_file 的 offset / limit
@@ -790,6 +912,62 @@ def register_exec_tools(
             summarize=lambda args, res: (
                 str(args.get("path", "")),
                 f"{'追加' if args.get('append') else '写入'} {len(str(args.get('content', '')))} 字" if res.ok else res.error,
+            ),
+            timeout_s=15.0,
+        )
+    )
+    async def render_report(ctx: ToolContext, args: dict) -> ToolResult:
+        """交付报告网页（2026-10-15 intelligent UI）：零件规格 → 统一样式的网页文件。"""
+
+        rel = str(args.get("path") or "").strip()
+        if not rel.lower().endswith(".html"):
+            return ToolResult(ok=False, output="", error="path 要以 .html 结尾（如 artifacts/<任务>/report.html）")
+        spec_in = {k: args.get(k) for k in ("title", "caption", "blocks")}
+        try:
+            spec = viz_spec.validate(spec_in, "report")
+        except viz_spec.SpecError as e:
+            return ToolResult(ok=False, output="", error=f"规格不合格：{e}（照零件清单改了再交）")
+        # image 零件：把图读成 data URI 内联（CSP 是 img-src data:，不放宽；单个 html 不裂图）
+        img_err = _inline_report_images(ctx, env, spec)
+        if img_err:
+            return ToolResult(ok=False, output="", error=f"规格里的图用不了：{img_err}")
+        foot = str(args.get("foot") or "").strip()[:120]
+        doc = viz_spec.page(spec, uid="r", report=True, foot=foot)
+        res = await write_file(ctx, {"path": rel, "content": doc})
+        if not res.ok:
+            return res
+        return ToolResult(
+            ok=True,
+            output=f"已生成报告网页 {rel}（{len(spec['blocks'])} 个零件，统一样式，手机/电脑/深浅色都能看）",
+            data={"path": rel},
+        )
+
+    tools.register(
+        Tool(
+            name="render_report",
+            description=(
+                "把调研 / 分析 / 汇报类结果做成**统一样式的报告网页**（交付网页时优先用它，不要自己手写 HTML/CSS）。"
+                "从固定零件清单里挑零件填数据，程序负责排版、配色、深浅色和手机适配；"
+                "不能写 HTML，零件拼不出来的内容用 text / list / table 写成文字。数字要来自你查到的资料，"
+                "拿不准的写进 note，参考链接放进 sources。\n"
+                + viz_spec.catalog_prompt("report")
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "工作区内的相对路径，以 .html 结尾，如 artifacts/T-1/report.html"},
+                    "title": {"type": "string", "description": "报告大标题"},
+                    "caption": {"type": "string", "description": "一行副标题（可省），如：一句话结论"},
+                    "blocks": {"type": "array", "items": {"type": "object"}, "description": "零件列表，按阅读顺序"},
+                    "foot": {"type": "string", "description": "页脚小字（可省），如：资料截至 2026-10-15"},
+                },
+                "required": ["path", "title", "blocks"],
+            },
+            roles=frozenset({"worker"}),
+            handler=render_report,
+            summarize=lambda args, res: (
+                str(args.get("path", "")),
+                res.output if res.ok else res.error,
             ),
             timeout_s=15.0,
         )

@@ -5,8 +5,9 @@ G4：planner 备忘钩子不能只看内存信号认服务群——信号是历�
 is_served。修复：两处都用 settings.is_served 复核；update_config 时清掉
 不再服务的群的信号。
 
-G5：收消息钩子等 Jev 的实际时间 = min(settings.jev.timeout_ms, 1200) 毫秒；
-配置解析时 jev.timeout_ms 夹到 [200, 1200]，超出记问题。
+G5（2026-10 改口径）：收消息钩子**不等 Jev**——判词在后台任务里问，钩子只做纯本地
+快事（记信号 / 落 pending_asks），自己再套一层 800ms 预算；后台问 Jev 时把
+settings.jev.timeout_ms 传下去，配置解析时夹到 [200, 1200]，超出记问题。
 """
 
 from __future__ import annotations
@@ -80,19 +81,23 @@ class TestG5JevTimeoutClamp:
 
     @pytest.mark.asyncio
     async def test_intake_wait_uses_clamped_value(self, tmp_path: Path) -> None:
-        """钩子里等 Jev 传下去的 timeout_ms ≤ 1200（即使配置还没夹过）。"""
+        """钩子不等 Jev；后台问 Jev 时传下去的 timeout_ms ≤ 1200（即使配置还没夹过）。"""
         store = _store(tmp_path)
         settings, _ = load_settings({
             "groups": {"serve": [{"group": f"qq:{G1}"}]},
             "jev": {"timeout_ms": 1200},
         })
         jev = _FakeJev()
+        spawned: list = []
         intake = Intake(
             lambda: settings, Signals(), jev=jev, store=store,
-            spawn=lambda c: None,
+            spawn=lambda coro: spawned.append(coro),
         )
         out = await intake.handle(_at_message(G1))
         assert out == {"action": "continue"}
+        assert jev.seen_timeout_ms == []      # 钩子里一次都不问
+        for coro in spawned:
+            await coro
         assert jev.seen_timeout_ms and all(t <= 1200 for t in jev.seen_timeout_ms)
 
 

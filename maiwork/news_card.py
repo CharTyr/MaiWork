@@ -4,6 +4,8 @@ render_html(data) -> str：把一批资讯精选拼成一张卡片的 HTML（纯
     不加载外链图片 / 网页字体，服务器上用系统里的 Noto CJK）。
 render_png(data) -> bytes：用 playwright 起一个无头 chromium 截图（2 倍像素），同一时间只画一张。
     没装 playwright / 浏览器起不来 / 超时 → 抛 RenderError，调用方退回纯文字。
+    2026-10-15 起返回值是 **JPEG**（quality 85，线上 1~3.5MB 的 PNG 小 50~80%）；
+    没有 Pillow / 转码失败才回落 PNG（`_to_card_jpeg`）。函数名保留，老调用口不改。
 
 data（card_push 组装）：
     {"group_name", "slot_label": "9月29日 · 下午", "slot_ts": float, "link", "total": int,
@@ -44,8 +46,12 @@ _WIDTH = 600          # CSS 像素；截图 2 倍 → 1200 宽，手机上点开
 _SCALE = 2
 _RENDER_TIMEOUT_S = 60.0
 _VIZ_W = 520          # 图解截图宽度 = 卡片里正文的宽度（600 - 两边 16 - 卡片内边距 24×2）
-_VIZ_MAX_H = 520      # 图解太长只截上面这么高（头条）
-_VIZ_SUB_MAX_H = 300  # 第二、三条的图解最多截这么高
+_VIZ_MAX_H = 520      # （已不用于截断）老的头条截断高度，留作参考
+_VIZ_SUB_MAX_H = 300  # （已不用于截断）老的第二、三条截断高度
+# 图解绝不截半（2026-10-15 用户要：卡片里也要完整可读；新旧格式都一样）：
+# 每条都整块画（用户定：第二、三条一样带图解）；单张高过 _VIZ_STATIC_MAX_H 的不画（防失控，
+# 那条照样有文字摘要，扫码能看网页版）。
+_VIZ_STATIC_MAX_H = 2400
 _LOCK = asyncio.Lock()
 
 
@@ -648,9 +654,7 @@ def _viz_todo(data: dict) -> list[dict]:
 
 async def _shoot_viz(browser: Any, data: dict) -> None:
     """把图解整页截成图，塞进 item["viz_img"]（浅色、白底、正文宽）；哪条失败就那条不画。"""
-    first = next((x for x in (data.get("items") or []) if isinstance(x, dict)), None)
     for it in _viz_todo(data):
-        max_h = _VIZ_MAX_H if it is first else _VIZ_SUB_MAX_H  # 非头条的图解截短一点，整张别太长
         page = None
         try:
             page = await browser.new_page(
@@ -663,9 +667,18 @@ async def _shoot_viz(browser: Any, data: dict) -> None:
             h = int(await page.evaluate("Math.ceil(document.documentElement.scrollHeight)") or 0)
             if h < 40:
                 continue
-            png = await page.screenshot(type="png", clip={"x": 0, "y": 0, "width": _VIZ_W, "height": min(h, max_h)})
+            # 新旧格式一样：要么整块，要么不画——绝不截半（线上 2026-10-15 用户报：
+            # 第二条起的图解底部被截掉、虚化）
+            # 每条都整块画（2026-10-15 用户定：第二、三条一样带图解）；只有单张失控的超长图解不画
+            if h > _VIZ_STATIC_MAX_H:
+                logger.info("资讯卡片图解太高（%s），这条不画图解，只留文字", h)
+                continue
+            shot_h = h
+            # 截图只截得到窗口里的部分：先把窗口拉到要截的高度，否则高过 400 的下半截会悄悄丢掉
+            await page.set_viewport_size({"width": _VIZ_W, "height": shot_h})
+            png = await page.screenshot(type="png", clip={"x": 0, "y": 0, "width": _VIZ_W, "height": shot_h})
             it["viz_img"] = "data:image/png;base64," + base64.b64encode(png).decode()
-            it["viz_cut"] = h > max_h  # 截断了：底部加一道渐隐，别在半截硬切
+            it["viz_cut"] = False  # 不再截断（渐隐样式留着只为兼容老数据）
         except Exception as e:  # noqa: BLE001  图解截不出来就不画，不影响卡片
             logger.info("资讯卡片图解截图失败：%s", e)
         finally:
@@ -676,8 +689,34 @@ async def _shoot_viz(browser: Any, data: dict) -> None:
                     pass
 
 
+def _to_card_jpeg(png: bytes) -> bytes:
+    """卡片截图（PNG）→ JPEG（quality 85、optimize、progressive）。
+
+    2026-10-15 用户定：线上卡片 PNG 1~3.5MB，实测 JPEG quality 85 小 50~80%，
+    群里看得清、发得也快。Pillow 不在（宿主 venv 没装）/ 转码失败 → **原样返回 PNG**，
+    卡片照发（发件箱按内容放行 PNG / JPEG 两种）。
+    """
+    try:
+        from PIL import Image  # 宿主 venv 自带 Pillow（配图那条路也用它）
+    except Exception:  # noqa: BLE001  没有 Pillow：保持 PNG，不影响出卡片
+        logger.info("没有 Pillow，资讯卡片图保持 PNG")
+        return png
+    try:
+        with Image.open(io.BytesIO(bytes(png))) as im:
+            buf = io.BytesIO()
+            im.convert("RGB").save(buf, "JPEG", quality=85, optimize=True, progressive=True)
+        return buf.getvalue()
+    except Exception as e:  # noqa: BLE001  转码坏了也别把卡片弄丢
+        logger.info("资讯卡片图转 JPEG 失败，保持 PNG：%s", e)
+        return png
+
+
 async def render_png(data: dict, *, timeout_s: float = _RENDER_TIMEOUT_S) -> bytes:
-    """无头 chromium 截图；同一时间只画一张（省内存）。失败一律抛 RenderError。"""
+    """无头 chromium 截图；同一时间只画一张（省内存）。失败一律抛 RenderError。
+
+    函数名保留（老调用口不改），返回的**是 JPEG**（Pillow 不可用时才是 PNG）；
+    落盘扩展名由 card_push 按内容定。
+    """
     try:
         from playwright.async_api import async_playwright  # 宿主 venv 自带；本地测试可能没有
     except Exception as e:  # noqa: BLE001
@@ -701,7 +740,8 @@ async def render_png(data: dict, *, timeout_s: float = _RENDER_TIMEOUT_S) -> byt
                 await page.route("**/*", lambda route: route.abort()
                                  if not route.request.url.startswith(("data:", "about:")) else route.continue_())
                 await page.set_content(page_html, wait_until="load")
-                return await page.locator(".card").screenshot(type="png")
+                shot = await page.locator(".card").screenshot(type="png")
+                return _to_card_jpeg(shot)
             finally:
                 await browser.close()
 

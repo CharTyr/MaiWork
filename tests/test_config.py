@@ -54,8 +54,9 @@ class TestDefaults:
         # 0.4.6：每端点高级请求头覆盖 headers（默认空）
         # 0.4.7：[jev] use + [[jev_endpoints]]（多判断服务：内置预设 / 自己加 / 换着用）
         # 0.4.8：[quick_judge] 派活判断兜底（Jev 不在 / 拿不准时用模型快速判）
+        # 0.5.1：[environments] vm_platform + freestyle_*（一次性 VM 可选 Freestyle，要自己的 API key）
         # 0.5.0：[environments] local_network；0.4.9：[quick_judge] 不再攒批（删 batch_wait_s）、daily_max 归高级项
-        assert CONFIG_VERSION == "0.5.0"
+        assert CONFIG_VERSION == "0.5.1"
         assert MaiWorkConfig().plugin.config_version == CONFIG_VERSION
 
     def test_railway_verify_new_fields_defaults(self) -> None:
@@ -78,6 +79,49 @@ class TestDefaults:
         """[environments] verify_enabled 默认关：备资讯不挑实测、不多调模型、不申请 VM。"""
         s, _ = settings_of({})
         assert s.environments.verify_enabled is False
+
+    # ---- 0.5.1：一次性 VM 平台选择 + Freestyle（2026-10-15） ----
+
+    def test_vm_platform_defaults_to_railway(self) -> None:
+        """老 config.toml 没有这些键：平台默认 railway，行为不变。"""
+        s, problems = settings_of({})
+        assert s.environments.vm_platform == "railway"
+        assert s.environments.freestyle_api_key == ""
+        assert s.environments.freestyle_snapshot == "freestyle/ubuntu-sm"
+        assert s.environments.freestyle_ttl_minutes == 60
+        assert s.environments.freestyle_idle_minutes == 10
+        assert s.environments.freestyle_daily_max == 2
+        assert problems == []
+
+    def test_vm_platform_unknown_falls_back_with_problem(self) -> None:
+        s, problems = settings_of(_raw(**{"environments.vm_platform": "aws"}))
+        assert s.environments.vm_platform == "railway"
+        assert any("vm_platform" in p and "railway" in p for p in problems)
+
+    def test_vm_platform_freestyle_kept(self) -> None:
+        s, problems = settings_of(_raw(**{"environments.vm_platform": "Freestyle"}))
+        assert s.environments.vm_platform == "freestyle"
+        assert problems == []
+
+    def test_freestyle_numbers_are_clamped(self) -> None:
+        s, _ = settings_of(_raw(**{
+            "environments.freestyle_ttl_minutes": 1,
+            "environments.freestyle_idle_minutes": 99999,
+            "environments.freestyle_daily_max": 99,
+        }))
+        assert s.environments.freestyle_ttl_minutes == 5
+        assert s.environments.freestyle_idle_minutes == 1440
+        assert s.environments.freestyle_daily_max == 10
+
+    def test_freestyle_snapshot_bad_value_falls_back(self) -> None:
+        s, problems = settings_of(_raw(**{"environments.freestyle_snapshot": "有中文 的镜像"}))
+        assert s.environments.freestyle_snapshot == "freestyle/ubuntu-sm"
+        assert any("freestyle_snapshot" in p for p in problems)
+
+    def test_freestyle_snapshot_accepts_custom_snapshot(self) -> None:
+        s, problems = settings_of(_raw(**{"environments.freestyle_snapshot": "sh-abc123"}))
+        assert s.environments.freestyle_snapshot == "sh-abc123"
+        assert problems == []
 
     def test_verify_enabled_parses_true(self) -> None:
         """配置里写 true → 挑实测开着（当前行为不变）。"""

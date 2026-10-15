@@ -21,6 +21,7 @@ export const ONB_STEPS = [
   { id: "search", name: "搜索" },
   { id: "admins", name: "群管理" },
   { id: "look", name: "头像" },
+  { id: "env", name: "能做什么" },
   { id: "done", name: "完成" },
 ];
 export const onb = { open: false, i: 0, busy: false, cfg: null, models: null, info: null, sequence: 0, done: {}, anims: [], presets: null, sxPicked: null };
@@ -123,6 +124,20 @@ export function onbPane(id) {
         ${a && a.source === "custom" ? `<button type="button" class="btn ghost" data-act="avatar-reset">恢复为 MaiBot 头像</button>` : ""}
       </div>
       <p class="fine">${a ? esc(AV_SRC[a.source] || "") : ""}${a ? " · " : ""}最大 2MB</p>`;
+  }
+  if (id === "env") {
+    // 2026-10-15 用户定：先把预期说清——任务做不做得成，主要看模型能力和当前环境能做什么；
+    // 鼓励先在「和 MaiWork 聊」里让它帮忙把环境配好（它会检查、开功能、装 skill）。
+    return `
+      <div class="onb-step-ico">${ico("sparkles")}</div>
+      <h1 class="onb-title">MaiWork 能做到什么</h1>
+      <p class="onb-lead">任务做得好不好，主要看模型能力和环境能做什么</p>
+      <ul class="onb-list">
+        <li>${ico("robot")}<div><b>模型能力</b><span>主模型负责理解需求、分派和验收，模型越强，复杂任务越容易一次做好</span></div></li>
+        <li>${ico("tools")}<div><b>环境能做什么</b><span>联网搜索、运行代码、云端机器、生图模型、已装的 skill；没开的能力，相关任务就做不到</span></div></li>
+        <li>${ico("books")}<div><b>自带的做法</b><span>调研报告、目标追踪、构想整理等常用 skill 已内置；做 Word / Excel / PPT 要先在「设置 → 扩展」一键装办公文档组件（可选）</span></div></li>
+      </ul>
+      <p class="onb-note">建议完成后先去「和 MaiWork 聊」，说说群里打算让它做哪些事，它会检查当前环境、帮你开启或配置缺的能力</p>`;
   }
   return onbDonePane();
 }
@@ -445,7 +460,7 @@ async function onbSave(id) {
     // 模型库里这个端点已有同名模型就复用，没有就加一条（能力参数用默认值，之后在「模型」页细调）
     const ensure = async (name) => {
       if (!name) return "";
-      const hit = ((state.mdl && state.mdl.models) || []).find((x) => x.endpoint === epId && x.model === name);
+      const hit = ((state.mdl && state.mdl.models) || []).find((x) => x.endpoint === epId && x.model === name && (x.use || "chat") !== "image");
       if (hit) return hit.id;
       const mid = "m" + Math.random().toString(36).slice(2, 8);
       await api("PUT", `/api/settings/model-list/${mid}`, { endpoint: epId, model: name, name, efforts: [], vision: false, context_window: 128000, max_tokens: 32768 });

@@ -148,9 +148,11 @@ function newsItem(it, i, guide) {
   ].join("");
   const img = it.image_url && /^https?:\/\//i.test(it.image_url)
     ? `<img class="n-img" src="${esc(it.image_url)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()" />`
-    : it.viz
-      ? `<iframe class="n-viz" data-viz="${esc(it.id)}" sandbox="allow-scripts" referrerpolicy="no-referrer" title="图解：${esc(it.title)}"></iframe>`
-      : "";
+    : it.viz === "spec"
+      ? `<div class="n-vs" data-vizspec="${esc(it.id)}" role="figure" aria-label="图解：${esc(it.title)}"></div>`
+      : it.viz
+        ? `<iframe class="n-viz" data-viz="${esc(it.id)}" sandbox="allow-scripts" referrerpolicy="no-referrer" title="图解：${esc(it.title)}"></iframe>`
+        : "";
   return `
     <article class="item news-item enter" style="--i:${i}">
       ${ico(it.icon || (guide ? "books" : "newspaper"))}
@@ -209,7 +211,30 @@ function fillViz(frame) {
     .catch(() => frame.remove())
     .finally(() => delete vizLoading[id]);
 }
-new MutationObserver(() => document.querySelectorAll("iframe.n-viz:not([data-ready])").forEach(fillViz)).observe(document.documentElement, { childList: true, subtree: true });
+/* 零件清单图解（2026-10-15 起）：服务端用固定零件渲染、文字全转义、没有脚本，直接原生插进页面，
+   样式走 viz.css（跟站点同一套颜色和深浅色）。占位 div 写进 HTML 时是空的：轮询比对不受影响；
+   重画后从缓存同步填回，不闪。取不到就把占位去掉（照旧纯文字）。 */
+const vsFrag = {};
+function fillVizSpec(box) {
+  const id = box.dataset.vizspec;
+  if (!id || box.dataset.ready) return;
+  box.dataset.ready = "1";
+  if (vsFrag[id]) {
+    box.innerHTML = vsFrag[id];
+    return;
+  }
+  const p = vizLoading["s" + id] || (vizLoading["s" + id] = api("GET", `/api/news/${encodeURIComponent(id)}/viz`).finally(() => delete vizLoading["s" + id]));
+  p.then((r) => {
+    vsFrag[id] = (r && r.frag) || "";
+    if (!document.contains(box)) return;
+    if (vsFrag[id]) box.innerHTML = vsFrag[id];
+    else box.remove();
+  }).catch(() => box.remove());
+}
+new MutationObserver(() => {
+  document.querySelectorAll("iframe.n-viz:not([data-ready])").forEach(fillViz);
+  document.querySelectorAll("div.n-vs:not([data-ready])").forEach(fillVizSpec);
+}).observe(document.documentElement, { childList: true, subtree: true });
 window.addEventListener("message", (e) => {
   const d = e.data;
   if (!d || d.mwviz !== 1 || typeof d.h !== "number") return;

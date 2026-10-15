@@ -5,8 +5,8 @@
   按 key（对象+版本+事件类型+目标群）去重。发送超时标 uncertain 不盲目重发；
   群文件上传不幂等，绝不自动重试；文本 / 图片这类「重发一次也不会更糟」的推送，
   非超时的安全失败自动重试一次（attempts 与下次时间都落库，重启后接着算，不重复发）。
-- 四种载荷：text（可选 reply_to / at_user / at_name）、file（群文件）、image（PNG 文件，
-  严格路径闸：非符号链接、resolve 后在工作区根下、大小与类型按内容判）、herenow（网页）。
+- 四种载荷：text（可选 reply_to / at_user / at_name）、file（群文件）、image（PNG / JPEG
+  文件，严格路径闸：非符号链接、resolve 后在工作区根下、大小与类型按内容判）、herenow（网页）。
 - 发送前再查一遍：这个群还在服务名单里吗、这条推送的每群开关还开着吗（关了直接作废，
   不发陈旧的）、睡觉时段与每日总上限（group_push 一份数据，**按这个群**那份算；
   读不到就只延 5 分钟再试，绝不按默认钟点误停到明天）。失败不占额度、不算已发；
@@ -55,8 +55,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 import logging
+import os
 import re
 import shutil
 import sqlite3
@@ -97,9 +99,230 @@ _POSTPONE_RETRY_S = 300.0
 # 自动消息过了 payload.expires_ts 还没发出去 → 作废（不发陈旧内容）
 _TTL_EXPIRED_REASON = "超过有效期限，作废"
 
-# 图片载荷的严格闸（docs/02 §6.5：发进群的东西必须在工作区里、是真 PNG）
+# 图片载荷的严格闸（docs/02 §6.5：发进群的东西必须在工作区里、是真 PNG / JPEG）
+# 2026-10-15：资讯卡片改 JPEG（线上 PNG 1~3.5MB，JPEG quality 85 小 50~80%）；
+# 判定一律**按内容**，不看扩展名（老 .png 缓存、Pillow 缺失时回落的 PNG 都照发）。
 _IMAGE_MAX_BYTES = 8 * 1024 * 1024
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+_JPEG_MAGIC = b"\xff\xd8\xff"
+
+# ---------------------------------------------------------------------------
+# 交付图组（2026-10-15 发版前修复，491d 线上真复现）：一组图的「定位口径」三处共用——
+# 正常交付（Delivery.deliver_task）、管理员重发（Delivery.reenqueue_missing）、
+# 发出后补说明（Outbox._repair_sent_followups）。三种形态，都不递归：
+#   ① 明确给的目录（`artifacts/<任务>/images/` 或别的子目录）→ 取这一层的图；
+#   ② 单张文件、父目录名是 `images`（**线上验收记的就是这种**）→ 用那个目录；
+#   ③ 任务成品根 `artifacts/<任务>`（图在根下的 `images/`）→ 取 `images/` 这一层，
+#      根下没有 `images/` 才退回根这一层（老任务把图直接写在根里的情况）。
+# 线上症状：coordinator 允许把成品根交给交付层，而旧 deliver_task 只 iterdir 根一层 →
+# 目录里没有图 → ValueError 被 coordinator 吞掉 → 任务 completed 却零入队。
+# ---------------------------------------------------------------------------
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+_IMAGE_GROUP_MAX = 4
+# 交付入口把 WEBP/GIF 转成 PNG 的落点（图片所在目录下的隐藏子目录，不参与图组挑选）
+_PNG_CACHE_DIR = ".png"
+# 转 PNG 的预算（2026-10-15 收口）：判型只读文件头；`load()` 之前先按文件头里的像素数卡一道
+# （防解压炸弹把内存吃光）；读入 / 转出都卡 `_IMAGE_MAX_BYTES` 同一个上限。
+_PNG_HEAD_BYTES = 32
+_PNG_MAX_PIXELS = 4096 * 4096
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _contained_in(base: Path, path: Path) -> Path:
+    """resolve 后的真实路径必须等于 base 或位于 base 下（跟软链、消 `..`）；否则抛 ValueError。
+
+    `Delivery._check_deliver_path` 和 `Outbox._repair_image_group` 共用这一处判定。
+    """
+    try:
+        real = Path(path).resolve()
+    except OSError as e:
+        raise ValueError(f"交付路径解析失败：{path}（{e}）") from e
+    if real != base and base not in real.parents:
+        raise ValueError(
+            f"交付路径不在本任务的成品目录 artifacts/{base.name}/ 里，不交付：{path}"
+        )
+    return real
+
+
+def _image_candidates(base: Path, path: Path) -> list[Path]:
+    """按三种形态挑这一组图的候选（最多 4 张、按文件名排序、跳过符号链接、不递归）。
+
+    只做定位，不做容器判定（调用方对每张再过 `_contained_in`）；一张都没有回 []。
+    """
+    p = Path(path)
+    dirs: list[Path] = []
+    if p.is_dir():
+        if p == base:
+            sub = p / "images"
+            if sub.is_dir():
+                dirs.append(sub)
+        dirs.append(p)
+    elif p.parent.name == "images" and p.parent.is_dir():
+        dirs.append(p.parent)
+    for d in dirs:
+        try:
+            cands = sorted(
+                x for x in d.iterdir()
+                if x.is_file() and not x.is_symlink() and x.suffix.lower() in _IMAGE_SUFFIXES
+            )
+        except OSError as e:
+            raise ValueError(f"图片目录读不出来：{d}（{e}）") from None
+        if cands:
+            return cands[:_IMAGE_GROUP_MAX]
+    if dirs:
+        return []
+    return [p]
+
+
+def _image_real_format(data: bytes) -> str:
+    """按内容认图片格式：png / jpeg / webp / gif；认不出来回 ""（不信扩展名）。"""
+    raw = bytes(data or b"")
+    if raw.startswith(_PNG_MAGIC):
+        return "png"
+    if raw.startswith(_JPEG_MAGIC):
+        return "jpeg"
+    if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "webp"
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    return ""
+
+
+def _to_png_bytes(data: bytes) -> Optional[bytes]:
+    """WEBP/GIF → PNG 字节（Pillow 是**可选**依赖）；转不了回 None，调用方按原样走。
+
+    写法沿用项目里既有的几处（news_card / cover_filter：`Image.open → convert → save`），
+    不新增任何强制依赖：没装 Pillow 时交付照旧走「发不出去 → 群文件回落」。
+
+    预算（2026-10-15 收口，别让子 agent 预置的坏图把内存吃光）：
+    - 输入超过 `_IMAGE_MAX_BYTES` 直接不转；
+    - `load()` **之前**先看文件头里的像素数，超过 `_PNG_MAX_PIXELS`（4096×4096）不 load；
+    - 转出来的 PNG 超过 `_IMAGE_MAX_BYTES` 也不交（发件箱那道闸本来就卡同一个上限）。
+    """
+    if not data or len(data) > _IMAGE_MAX_BYTES:
+        return None
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        with Image.open(io.BytesIO(bytes(data))) as im:
+            fmt = str(getattr(im, "format", "") or "").upper()
+            if fmt in ("PNG", "JPEG"):
+                return None
+            w, h = int(im.size[0]), int(im.size[1])
+            if w <= 0 or h <= 0 or w * h > _PNG_MAX_PIXELS:
+                return None  # 超像素：不 load、不转，走原件的群文件回落
+            im.load()
+            out = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+            buf = io.BytesIO()
+            out.save(buf, "PNG")
+            png = buf.getvalue()
+    except Exception:
+        return None
+    return png if len(png) <= _IMAGE_MAX_BYTES else None
+
+
+def _png_for_send(img: Path) -> Path:
+    """交付入口：WEBP/GIF 真转成 PNG（Pillow 可选）；本来就是 PNG/JPEG 的原样返回。
+
+    发件箱的图片闸（`Outbox._check_image_path`）只认真 PNG / JPEG 内容，宿主 send_image
+    也按 PNG 段发，所以 webp / gif 成品必须**在交付入口**转一次：
+    - 按内容认格式（不信扩展名，后缀只在挑图时用）；
+    - 输出写进图片所在目录下的 `.png/`（受控位置；幂等：已有且不比源旧就复用）；
+    - **不删、不改原成品**（回落群文件发的还是原件）；
+    - 没装 Pillow / 解不开 / 写不下 → 原样返回，让发件箱按老路走（失败 → 群文件回落）。
+
+    安全边界（2026-10-15 收口，子 agent 能往成品目录里预置东西）：
+    - 只读文件头判型、转换前先看文件大小，超过 `_IMAGE_MAX_BYTES` 不读整份、不转；
+    - `.png/` 缓存目录和既有输出都可能是预置的符号链接：一律拒（绝不跟着链接读写成
+      品目录外的东西），派生目录 resolve 后必须仍在图片所在目录里；
+    - 临时文件用 O_CREAT|O_EXCL|O_NOFOLLOW 独占创建（可预测名字也不会跟链接 / 覆盖别人
+      的文件），写入 / 改名都用已校验目录的 fd 锚定（中途被换名字也改不了落点）；
+    - 任何一步不放心都保持原样返回。
+    """
+    # 大小先过闸：超上限的文件不读整份、不转（发件箱的图片闸卡的是同一个上限）
+    try:
+        size = img.stat().st_size
+        if size <= 0 or size > _IMAGE_MAX_BYTES:
+            return img
+        with img.open("rb") as fh:
+            head = fh.read(_PNG_HEAD_BYTES)
+    except OSError:
+        return img
+    # 判型只看文件头：PNG/JPEG 原样返回，不为判型读整份；认不出来也原样返回
+    if _image_real_format(head) in ("png", "jpeg", ""):
+        return img
+    out_dir = img.parent / _PNG_CACHE_DIR
+    out_name = f"{img.name}.png"
+    # `.png/` 与既有输出都可能是预置的软链：一律拒（绝不跟着链接读写成品目录外）
+    if out_dir.is_symlink() or (out_dir / out_name).is_symlink():
+        logger.warning("交付图片转 PNG 的落点是符号链接，不转（原件走群文件回落）：%s", out_dir)
+        return img
+    # 幂等复用：已有输出且不比源旧、且真是 PNG（O_NOFOLLOW：被换成软链就打不开）
+    try:
+        rfd = os.open(out_dir / out_name, os.O_RDONLY | _NOFOLLOW)
+    except OSError:
+        rfd = -1
+    if rfd >= 0:
+        try:
+            with os.fdopen(rfd, "rb") as fh:
+                fresh = os.fstat(fh.fileno()).st_mtime_ns >= img.stat().st_mtime_ns
+                if fresh and fh.read(len(_PNG_MAGIC)) == _PNG_MAGIC:
+                    return out_dir / out_name
+        except OSError:
+            pass
+    # 读入有界：stat 之后文件还可能被写大，最多读 _IMAGE_MAX_BYTES+1 字节，
+    # 超出的那份交给 _to_png_bytes 的现有长度检查拒掉（回原件 → 群文件回落）。
+    try:
+        with img.open("rb") as fh:
+            data = fh.read(_IMAGE_MAX_BYTES + 1)
+    except OSError:
+        return img
+    png = _to_png_bytes(data)
+    if png is None:
+        return img
+    # 落点：目录必须真在图片所在目录里（`.png/` 被换成软链就过不去），之后用这个目录的
+    # fd 锚定写临时文件 + 改名——中途名字被换也改不了落点。
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        real_dir = out_dir.resolve()
+        parent_real = img.parent.resolve()
+    except OSError as e:
+        logger.warning("交付图片转 PNG 的落点建不起来（%s），按原样走：%s", img, e)
+        return img
+    if real_dir != parent_real and parent_real not in real_dir.parents:
+        logger.warning("交付图片转 PNG 的落点不在成品目录里，不转：%s", out_dir)
+        return img
+    try:
+        # O_NOFOLLOW：resolve 之后末级还可能被换成软链，打开时再挡一道
+        dir_fd = os.open(real_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW)
+    except (OSError, NotImplementedError):
+        # dir_fd 不是所有平台都有（Windows）：不转，走原件的群文件回落，绝不硬来
+        return img
+    try:
+        tmp_name = f".{out_name}.tmp"
+        try:
+            wfd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
+                          0o600, dir_fd=dir_fd)
+        except (OSError, NotImplementedError) as e:
+            logger.warning("交付图片转 PNG 写不下（%s），按原样走（发件箱会回落群文件）：%s", img, e)
+            return img
+        try:
+            with os.fdopen(wfd, "wb") as fh:
+                fh.write(png)
+            os.replace(tmp_name, out_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except (OSError, NotImplementedError) as e:
+            logger.warning("交付图片转 PNG 写不下（%s），按原样走（发件箱会回落群文件）：%s", img, e)
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except (OSError, NotImplementedError):
+                pass
+            return img
+    finally:
+        os.close(dir_fd)
+    return out_dir / out_name
+
 
 # 交付说明消息：只有这两种 push_kind 才算「交付」（提问 / 报错 / 卡片不受 @ 发起人影响）
 _DELIVERY_PUSH_KINDS = frozenset(("delivery", "awaited_delivery"))
@@ -188,7 +411,8 @@ _NOTE_INTERNAL_RE = re.compile(
 _NOTE_SENTENCE_ENDS = "。！？!?；;"
 _NOTE_SOFT_ENDS = "，,、：:"
 _NOTE_BREAKS = _NOTE_SENTENCE_ENDS + _NOTE_SOFT_ENDS
-_NOTE_FALLBACK_SUFFIX = {"file": "弄好了，文件在链接里", "text": "弄好了，就这几句"}
+_NOTE_FALLBACK_SUFFIX = {"file": "弄好了，文件在链接里", "text": "弄好了，就这几句",
+                         "image": "弄好了，图发在群里了"}
 _NOTE_FALLBACK_SUFFIX_DEFAULT = "弄好了，点开就能看"
 
 
@@ -320,9 +544,18 @@ class OutboxPayloadError(HostError):
 
 
 def _is_artifact_outbox_row(kind: str, key: str) -> bool:
-    """真实交付项；失败兜底告知和后续说明都不算成品。"""
+    """真实交付项；失败兜底告知和后续说明都不算成品。
+
+    image 只认任务交付的图（`task:<id>:deliver` / `:deliver:imgN`，2026-10-15）；
+    资讯卡片等别的图片行不是任务成品。
+    """
     return ((kind in ("file", "herenow") and not key.endswith(_DELIVERY_NOTE_SUFFIXES))
-            or (kind == "text" and key.endswith(":deliver:text")))
+            or (kind == "text" and key.endswith(":deliver:text"))
+            or (kind == "image" and key.startswith("task:")
+                and (key.endswith(":deliver") or _IMG_KEY_RE.search(key) is not None)))
+
+
+_IMG_KEY_RE = re.compile(r":deliver:img\d+$")
 
 
 def _expires_ts(payload: dict) -> Optional[float]:
@@ -924,7 +1157,7 @@ class Outbox:
 
     def _check_image_path(self, raw_path: str) -> Path:
         """图片发送前检查：不能是符号链接、resolve 后必须在 workspace_root 下、是普通文件、
-        大小在 1 字节 ~ 8MB 之间、按内容（PNG 魔数）判类型。
+        大小在 1 字节 ~ 8MB 之间、按内容（PNG / JPEG 魔数）判类型。
 
         不合法抛 OutboxPayloadError（中文）：这种错误重试多少次都一样，直接判失败，
         不浪费那次自动重试。
@@ -955,11 +1188,11 @@ class Outbox:
             raise OutboxPayloadError(f"图片大小不合适（{size} 字节，上限 {_IMAGE_MAX_BYTES}），不发")
         try:
             with resolved.open("rb") as fh:
-                head = fh.read(len(_PNG_MAGIC))
+                head = fh.read(max(len(_PNG_MAGIC), len(_JPEG_MAGIC)))
         except OSError as e:
             raise OutboxPayloadError(f"图片读不出来：{text}（{e}）") from None
-        if head != _PNG_MAGIC:
-            raise OutboxPayloadError(f"图片不是 PNG（按内容判），不发：{text}")
+        if not (head.startswith(_PNG_MAGIC) or head.startswith(_JPEG_MAGIC)):
+            raise OutboxPayloadError(f"图片不是 PNG/JPEG（按内容判），不发：{text}")
         return resolved
 
     async def _execute(self, row: Any) -> dict:
@@ -1060,6 +1293,13 @@ class Outbox:
             if note:
                 memo += f"（{note}）"
             memo += "，有人问起可以把链接再给他；链接 24 小时后过期，MaiWork 网页里还有副本"
+            self._mentions.add(gid, memo, key=f"deliver:{int(row['id'])}", ttl_s=_DELIVER_MENTION_TTL_S)
+        elif kind == "image" and str(key).startswith("task:") and str(key).endswith(":deliver"):
+            # 任务交付的图（只第一张记一次）：让 MaiBot 有人问起时接得上
+            note = str(payload.get("text") or "").strip()
+            memo = "刚在群里发了任务做好的图"
+            memo += f"（{note[:60]}）" if note else ""
+            memo += "，有人问起可以告诉他往上翻聊天记录"
             self._mentions.add(gid, memo, key=f"deliver:{int(row['id'])}", ttl_s=_DELIVER_MENTION_TTL_S)
         elif kind == "text":
             text = str(payload.get("text") or "")
@@ -1311,12 +1551,18 @@ class Outbox:
             )
 
     def _repair_sent_followups(self, served: set[str]) -> None:
-        """发送已成功却在补说明/备忘前崩溃：只补幂等后续，不重发原件。"""
+        """发送已成功却在补说明/备忘前崩溃：只补幂等后续，不重发原件。
+
+        图组（2026-10-15）另有一条：热重载可能只入队了图组的一部分，这里按**同一套图组口径**
+        从原成品位置把漏掉的 `:deliver:imgN` 补上（enqueue 按 key 幂等：已入队 / 已发出的
+        行原样返回，绝不重发已发过的那几张）。补说明仍然只认第一张。
+        """
         rows = []
         for gid in served:
             rows.extend(self._store.read().execute(
                 "SELECT id, key, group_id, kind, payload, task_id, status, result, updated FROM outbox"
-                " WHERE group_id=? AND status='sent' AND kind IN ('file', 'herenow', 'text') ORDER BY id",
+                " WHERE group_id=? AND status='sent'"
+                " AND kind IN ('file', 'herenow', 'text', 'image') ORDER BY id",
                 (gid,),
             ).fetchall())
         for row in rows:
@@ -1325,8 +1571,12 @@ class Outbox:
             key = str(row["key"])
             if gid not in served or (kind == "text" and not key.endswith(":deliver:text")):
                 continue
+            if kind == "image" and not (key.startswith("task:") and key.endswith(":deliver")):
+                continue  # 图组只认任务交付的第一张（`:deliver:imgN` 没有后续动作）
             try:
                 payload = json.loads(row["payload"] or "{}")
+                if kind == "image":
+                    self._repair_image_group(row, payload, gid)
                 result = json.loads(row["result"] or "{}")
                 need_note = ((kind == "file" and bool(str(payload.get("note") or "").strip()))
                              or (kind == "herenow" and bool(result.get("url"))))
@@ -1342,6 +1592,45 @@ class Outbox:
                     self._after_sent(row, payload)
             except Exception:
                 logger.exception("补交付说明/备忘失败（发件 %s），下轮再试", row["id"])
+
+    def _repair_image_group(self, row: Any, payload: dict, gid: str) -> None:
+        """图组只入队了一部分（热重载）：按同一套口径把漏掉的 `:deliver:imgN` 补上。
+
+        定位用载荷里记的**原成品路径**（`fallback.path`；`path` 可能是转出来的 `.png`，
+        从它定位不到整组），容器闸 / 符号链接 / 排序 / 4 张上限都和正常交付共用
+        `_image_candidates` + `_contained_in`。enqueue 按 key 幂等，已发的不会重发。
+        """
+        tid = str(_row_field(row, "task_id") or "").strip()
+        if not tid:
+            return
+        fb = payload.get("fallback") if isinstance(payload.get("fallback"), dict) else {}
+        src = str(fb.get("path") or payload.get("path") or "").strip()
+        if not src:
+            return
+        base = self._task_artifact_root(row)
+        if base is None:
+            return
+        for i, cand in enumerate(_image_candidates(base, Path(src))):
+            if i == 0:
+                continue
+            try:
+                img = _contained_in(base, cand)
+            except ValueError:
+                continue
+            if not img.is_file() or Path(cand).is_symlink():
+                continue
+            self.enqueue(
+                f"task:{tid}:deliver:img{i + 1}",
+                gid,
+                "image",
+                {
+                    "path": str(_png_for_send(img)),
+                    "text": "",
+                    "push_kind": "delivery",
+                    "fallback": {"kind": "file", "path": str(img), "name": img.name, "note": ""},
+                },
+                task_id=tid,
+            )
 
     def _lock(self) -> asyncio.Lock:
         """本实例的 flush 锁：按当前事件循环懒建（换循环就换一把，避免跨循环复用）。"""
@@ -1468,7 +1757,10 @@ class Outbox:
                                       outcome="retrying", error=err, now=now)
                     continue
                 self._set(oid, status="failed", error=err, moment=now)
-                if kind in ("file", "herenow"):
+                if kind in ("file", "herenow") or (
+                        kind == "image" and isinstance(payload.get("fallback"), dict)):
+                    # 任务交付的图发不出去 → 按载荷里的回落描述改发群文件；
+                    # 资讯卡片的图没有回落描述（card_push 自己兜文字），不走这里
                     self._enqueue_fallback(_row_after(self._store, oid))
                 self._fire_result(_row_after(self._store, oid), payload,
                                   outcome="failed", error=err, now=now)
@@ -1683,16 +1975,31 @@ class Delivery:
         `tasks/...`、`.`、指到外面的符号链接都过不去。不满足抛 ValueError（中文），
         调用方记日志、任务照常结束。
         """
-        base = self._task_artifact_dir(task_id, gid)
+        return _contained_in(self._task_artifact_dir(task_id, gid), path)
+
+    def _task_title(self, task_id: str) -> str:
+        """任务标题（回落说明换群文件口径时用）；查不到回 ""。"""
         try:
-            real = Path(path).resolve()
-        except OSError as e:
-            raise ValueError(f"交付路径解析失败：{path}（{e}）") from e
-        if real != base and base not in real.parents:
-            raise ValueError(
-                f"交付路径不在本任务的成品目录 artifacts/{task_id}/ 里，不交付：{path}"
-            )
-        return real
+            row = self._store.read().execute(
+                "SELECT title FROM tasks WHERE id=?", (str(task_id),)
+            ).fetchone()
+        except Exception:
+            return ""
+        return str(row["title"] or "") if row is not None else ""
+
+    def _image_group(self, task_id: str, gid: str, path: Path) -> list[Path]:
+        """把交付入口给的路径定位成一组图（1~4 张，文件名排序）。
+
+        三种形态见 `_image_candidates`；每张都过容器闸（resolve 后必须在本任务成品目录里）
+        并跳过符号链接（绝不跟着软链把工作区外的文件发进群）。一张都没有回 []。
+        """
+        base = self._task_artifact_dir(task_id, gid)
+        out: list[Path] = []
+        for cand in _image_candidates(base, Path(path)):
+            real = self._check_deliver_path(task_id, gid, cand)
+            if real.is_file() and not Path(cand).is_symlink():
+                out.append(real)
+        return out[:_IMAGE_GROUP_MAX]
 
     async def deliver_task(
         self,
@@ -1703,7 +2010,11 @@ class Delivery:
         name: str,
         note: str,
     ) -> int:
-        """把成品交付出去（只入队首选渠道）。返回首选的 outbox id。"""
+        """把成品交付出去（只入队首选渠道）。返回首选的 outbox id。
+
+        kind：view=网页（here.now 先、群文件回落）/ file=群文件（here.now 回落）/
+        image=直接把图发进群（2026-10-15 任务 A2；一到四张，说明挂在第一张上）。
+        """
         path = Path(path)
         gid = self._group_of_task(task_id)
         if not gid:
@@ -1711,6 +2022,41 @@ class Delivery:
         path = self._check_deliver_path(task_id, gid, path)
         name = str(name or path.name or "成品")
         note = str(note or "")
+
+        if kind == "image":
+            # image 形态：成品是一到四张图片时，直接把图发进群 + 一句交付说明。
+            # 一组图的定位口径见 _image_candidates（明确目录 / images 里的单张 / 任务成品根），
+            # 容器闸、符号链接、排序、4 张上限都在 _image_group 里统一管。
+            # 说明（note）只挂在第一张上，后面的图不带文字；载荷里的 fallback 是
+            # 「图发不出去就当群文件发」的描述（回落在 Outbox.flush 里走）。
+            images = self._image_group(task_id, gid, path)
+            if not images:
+                raise ValueError(
+                    "这次交付没有可发的图片（只认 .png / .jpg / .jpeg / .webp / .gif；"
+                    "图要先写进本任务的成品目录）"
+                )
+            # 图发不出去改发群文件时，说明必须换成**群文件口径**（2026-10-15）：
+            # 原来的交付说明是「…图发在群里了」，图没发出去还这么说就是假话。
+            fb_note = _note_fallback(self._task_title(task_id), "file")
+            first_id = 0
+            for i, img in enumerate(images):
+                send_path = _png_for_send(img)
+                payload = {
+                    "path": str(send_path),
+                    "text": note if i == 0 else "",
+                    "push_kind": "delivery",
+                    "fallback": {
+                        "kind": "file",
+                        "path": str(img),  # 回落发原成品（群文件不挑格式）
+                        "name": (name.strip() or img.name) if len(images) == 1 else img.name,
+                        "note": fb_note if i == 0 else "",
+                    },
+                }
+                key = f"task:{task_id}:deliver" if i == 0 else f"task:{task_id}:deliver:img{i + 1}"
+                oid = self._outbox.enqueue(key, gid, "image", payload, task_id=task_id)
+                if i == 0:
+                    first_id = oid
+            return first_id
 
         if kind == "view":
             # 首选 here.now：目录原样发；单个 html 文件放进临时目录当 index.html
@@ -1786,7 +2132,7 @@ class Delivery:
                 {"text": reply or note, "push_kind": "delivery"}, task_id=tid,
             )
             return True
-        if kind not in ("file", "view"):
+        if kind not in ("file", "view", "image"):
             raise ValueError("任务缺少可恢复的交付方式，请先核对成品")
         attempt = self._store.read().execute(
             "SELECT artifacts FROM attempts WHERE task_id=? AND status='passed' ORDER BY n DESC LIMIT 1",

@@ -45,7 +45,7 @@ ALL_ADMIN_TOOLS = {
     "rss_add", "rss_remove", "block_domain", "set_rules", "identity_edit", "remember",
     # 危险 / 对外
     "send_group_message", "group_notice_send", "group_file_manage", "group_album_upload",
-    "skill_delete", "mcp_toggle", "mcp_delete",
+    "skill_delete", "skill_install", "env_overview", "mcp_toggle", "mcp_delete",
     # 现在动手（后台类）
     "run_news_now", "make_idea_now", "refresh_profile",
     # 任务 / 目标 / 请求

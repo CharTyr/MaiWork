@@ -118,6 +118,27 @@ def _extract_name(user_info: dict[str, Any]) -> str:
     return ""
 
 
+def _fail_reason(result: Any, *, max_len: int = 200) -> str:
+    """从宿主返回里取失败原因（`error` 字段），截短、去换行；没有 → ""。
+
+    宿主 `_build_send_result` 失败时会把原因放进 `result["error"]`（用户 2026-10-15 指出；
+    线上源码未读，标「待实测」）。以前只看 `sent`，失败就丢一句固定文案，真实原因
+    （群号不对 / 被禁言 / 权限不够…）全被吞掉，线上排查只能靠猜。取不到就返回 ""，
+    调用方保持原文案。
+    """
+    if not isinstance(result, dict):
+        return ""
+    raw = result.get("error")
+    if raw is None:
+        return ""
+    text = re.sub(r"\s+", " ", str(raw)).strip()
+    if not text:
+        return ""
+    if len(text) > max_len:
+        return text[:max_len] + "…"
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Host
 # ---------------------------------------------------------------------------
@@ -656,6 +677,8 @@ class Host:
 
         image 段形状照宿主 capabilities/core.py _normalize_plugin_segment：content = base64
         → binary_data_base64（线上源码读过）；QQ 里图文同一条的实际效果待实测。
+        2026-10-15 起卡片图是 JPEG（参数名保留 png 不改调用口）：段里**不带 mime**，
+        宿主 / 适配器按内容认格式——JPEG 走这条路是否一样通，标「待实测」（docs/06）。
         """
         if not png:
             raise HostError("send_image 没有图片数据")
@@ -684,7 +707,10 @@ class Host:
         sent = bool(result.get("sent", False))
         message_id = str(result.get("message_id") or "")
         if not sent:
-            raise HostError("send.hybrid 发送失败")
+            # 宿主把真实失败原因放在 result["error"]（截 200 字、去换行）；
+            # 没有就保持老文案（用户 2026-10-15）。
+            reason = _fail_reason(result)
+            raise HostError(f"send.hybrid 发送失败：{reason}" if reason else "send.hybrid 发送失败")
         return SendResult(sent=sent, message_id=message_id)
 
     # ------------------------------------------------------------------
@@ -713,9 +739,12 @@ class Host:
         status = str(result.get("status") or "").lower()
         retcode = result.get("retcode")
         if status != "ok" or (retcode is not None and int(retcode) != 0):
-            raise HostError(
+            base = (
                 f"adapter.napcat.file.upload_group_file 失败: status={status}, retcode={retcode}"
             )
+            # 宿主给了 error 就带上（截 200 字、去换行）；没有保持老文案
+            reason = _fail_reason(result)
+            raise HostError(f"{base}：{reason}" if reason else base)
         data = result.get("data") or {}
         if not isinstance(data, dict):
             raise HostError("adapter.napcat.file.upload_group_file 返回 data 格式异常")
@@ -814,10 +843,13 @@ class Host:
             raise HostError(f"{api_name} 返回格式异常")
         status = str(result.get("status") or "").lower()
         retcode = result.get("retcode")
+        reason = _fail_reason(result)
         if status and status != "ok":
-            raise HostError(f"{api_name} 失败: status={status}, retcode={retcode}")
+            base = f"{api_name} 失败: status={status}, retcode={retcode}"
+            raise HostError(f"{base}：{reason}" if reason else base)
         if retcode is not None and int(retcode) != 0:
-            raise HostError(f"{api_name} 失败: status={status}, retcode={retcode}")
+            base = f"{api_name} 失败: status={status}, retcode={retcode}"
+            raise HostError(f"{base}：{reason}" if reason else base)
         data = result.get("data")
         return data if data is not None else {}
 

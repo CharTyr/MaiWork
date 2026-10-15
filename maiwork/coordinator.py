@@ -35,14 +35,18 @@
   tools_builtin.opened_urls_from_rows——fetch_page 之外，mcp_ 开头、名字像抓正文、
   不像搜索的工具成功过的也算打开过（input JSON 的 url/urls/link + output「URL: <最终地址>」）。
 
-执行环境（docs/02 §9、docs/09 §7、docs/07 §11.1b）：
-- 主模型按计划 JSON 的 "env" 选「本机隔离环境」（local，默认）还是「railway.new
-  一次性 VM」（railway）。快、便宜、能直接交付的活走 local；要装一堆依赖、跑不信任
-  的第三方代码、要 root/docker、要很多内存或长时间、要干净系统时选 railway。
-- 选 railway：acquire(job_id=task_id) 拿一台（同时只 1 台、每天有限额；拿不到就回落
-  local 并在任务 env 字段 / 时间线写明原因）；拿到后子 agent 工具集用
+执行环境（docs/02 §9、docs/09 §7、docs/07 §11.1b / §11.1d）：
+- 主模型按计划 JSON 的 "env" 选「本机隔离环境」（local，默认）、「专用机器」（ssh，
+  用户自己的 VPS / VM）或「一次性 VM」。一次性 VM 有哪几家由
+  `environments/vm_platforms.py` 的注册表说了算（railway / freestyle），用户在
+  「设置 → 干活机器 → 临时机器用哪家」里单选，**同一时间只有一家可用**。
+  快、便宜、能直接交付的活走 local；要装一堆依赖、跑不信任的第三方代码、
+  要 root/docker、要很多内存或长时间、要干净系统时选一次性 VM。
+- 选一次性 VM：acquire(job_id=task_id) 拿一台（同时只 1 台、每天有限额；拿不到就回落
+  ssh / local 并在任务 env 字段 / 时间线写明原因）；拿到后子 agent 工具集用
   vm_run/vm_put_file/vm_read_file/vm_fetch_file 替代本机命令工具（read_file /
-  write_file / list_files 保留，用来写脚本、收成品）。
+  write_file / list_files 保留，用来写脚本、收成品）。工具名两边通用，远端根目录
+  和单条命令时长上限由 `box.kind` / `box.remote_root` / `env.max_run_timeout_s` 决定。
 - 成品最后必须用 vm_fetch_file 拷回本机工作区 artifacts/<task_id>/ 才算数——验收
   和交付永远只看本机工作区。
 - 任务结束（成功 / 失败 / 取消 / 异常）一定 release（try/finally）。
@@ -71,6 +75,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from . import clock, compaction, deliverable_check, members, requirements
+from .environments import vm_platforms
 from .goals import chat_evidence_match as _chat_evidence_match
 from .goals import criterion_backed as _criterion_backed
 from .goals import criterion_pending as _criterion_pending
@@ -126,7 +131,12 @@ _NOTE_INTERNAL_RE = re.compile(
 _NOTE_SENTENCE_ENDS = "。！？!?；;"
 _NOTE_SOFT_ENDS = "，,、：:"
 _NOTE_BREAKS = _NOTE_SENTENCE_ENDS + _NOTE_SOFT_ENDS
-_NOTE_FALLBACK_SUFFIX = {"file": "弄好了，文件在链接里", "text": "弄好了，就这几句"}
+_NOTE_FALLBACK_SUFFIX = {
+    "file": "弄好了，文件在链接里",
+    "text": "弄好了，就这几句",
+    # image（2026-10-15）：图直接发在群里，没有「点开」的链接
+    "image": "弄好了，图发在群里了",
+}
 _NOTE_FALLBACK_SUFFIX_DEFAULT = "弄好了，点开就能看"
 
 # ---------------------------------------------------------------------------
@@ -574,6 +584,48 @@ _NEED_EXEC_WORDS = (
 # 2026-10 复核：还要过「岗位角色门控 + 注册表真有」才算数（见 _job_effective_tools）。
 _EXEC_TOOL_NAMES = frozenset({"run_command", "start_process", "vm_run", "machine_run"})
 
+# 生图（2026-10-15 任务 A3）：任务明显要「画图 / 生图 / 配图 / 海报 / 插画」时，
+# 子 agent 必须有 generate_image，而且**得真配了生图模型**（tools_imagegen.image_entries
+# 判定：use="image" 的条目 + 端点有地址和密钥）。没配 → 走现有能力闸（重排一次 → 暂停），
+# 给中文原因让管理员先去设置里加模型，绝不硬派一条画不出图的活。
+_IMAGE_TOOL_NAME = "generate_image"
+# 「要画图」的判据：明确的画图词，或「画 / 做 / 设计 / 生成 + 一张封面」这类动词短语。
+# **下载现成的封面图不算**——线上 brief 里就有「把 3 张封面图下载下来保存到本地」，
+# 那是下载，不是画；只有「封面」两个字出现时一律不当成画图。
+#
+# 2026-10-15 复核修正：**图表 / 流程图 / 思维导图（导图）是确定性渲染的活，不算生图**。
+# 老判据里「做+一+个+图」「生成图」「画图」都是裸子串，于是「做一个图表」「生成图表」
+# 「画图表」全被判成要生图——没配生图模型时，一条本该出图表的活会被能力闸拦下暂停，
+# 原因还写着「去设置加生图模型」。这里改成**精确的负向前瞻**，而不是「句子里出现图表就
+# 整句不算」：同一句里完全可能既有图表又有封面（例如「做一个图表，再画一张封面」），
+# 后者仍要认出来（负向前瞻只看紧跟的那几个字，不整句跳过）。
+# - 词尾是「图」的固定说法（画图 / 生图 / 生成图…）：后面紧跟「表」→ 图表，不算；
+# - 词尾不是「图」的（绘制 / 手绘）与只有量词的说法（画一张 / 画两张…）：后面紧跟
+#   `_DIAGRAM_NEG` 里那几种图（图表 / 流程图 / 思维导图 / 导图）才算确定性渲染，
+#   紧跟「图片 / 封面」照算（「绘制一张封面」「画一张流程图，再画一张封面」都要认出来）；
+# - 动词短语（做 + 一张 + 图）：名词位置是「图」且紧跟「表」时不算。
+_DIAGRAM_NEG = r"(?!图表|流程图|思维导图|导图)"
+_NEED_IMAGE_RE = re.compile(
+    r"(?:画图|画出来|画个图|画幅|生图|生成图片|生成图|配图|插图)(?!表)"
+    r"|(?:绘制|手绘)" + _DIAGRAM_NEG
+    + r"|(?:画一张|画两张|画几张|画张|画幅)" + _DIAGRAM_NEG
+    + r"|(?:画|做|设计|生成|出|搞|来)[一二三四五六七八九十两0-9]*[张幅个版]?"
+    r"(?:封面|图片|图(?!表)|照片|头像|海报|插画|插图|配图|概念图)"
+    r"|(?:插画|海报|概念图)"
+)
+
+
+def job_needs_image_capability(text: str) -> bool:
+    """交接单 / 完成标准文本里有没有「要画图」的字样（画图 / 生图 / 配图 / 海报 / 插画）。
+
+    「把图片整理好」「两张图落到 images/」「下载封面图」这类**不**算——那是整理或下载
+    现成的图，不该被生图能力闸拦下（线上 brief 里就有「把 3 张封面图下载下来」）。
+    「做一个图表 / 生成图表 / 画图表 / 绘制图表 / 画一张流程图 / 画一张思维导图」这类
+    **确定性渲染**的活也不算（2026-10-15 修正），但同一句里另外要求封面 / 插画时照样算
+    （负向前瞻只看紧跟的那几个字，不整句跳过）。
+    """
+    return bool(_NEED_IMAGE_RE.search(str(text or "")))
+
 
 def job_needs_exec_capability(text: str) -> bool:
     """交接单 / 完成标准文本里有没有「要下载 / 本地存图 / 压缩包 / 跑代码」的字样。
@@ -605,6 +657,10 @@ _NEED_LABELS = {
     "search": "搜索工具",
     "extract": "抓正文工具",
     "write": "写文件工具（write_file）",
+    "image": "生图工具（generate_image）",
+    # 2026-10-15 任务 B：提示词里会点名的工具，自动补进名单
+    "render_report": "报告网页工具（render_report）",
+    "read_skill": "读 skill 工具（read_skill）",
 }
 
 
@@ -729,6 +785,11 @@ class ExecCheckReport:
         if not needs or needs == {"exec"}:
             tail = (
                 "也可以把「本地存图/下载」改成给出来源页链接+出处署名，或取消。"
+            )
+        elif needs == {"image"}:
+            tail = (
+                "也可以改成不画图（用文字 / 表格说清），或先到网页「设置 → 模型」"
+                "加一个用途是「生图」的模型（端点要填地址和密钥）。"
             )
         else:
             tail = "也可以把这条活改派给能拿到这些工具的岗位，或取消。"
@@ -1059,6 +1120,8 @@ class Coordinator:
         host: Any = None,
         railway: Any = None,
         ssh: Any = None,
+        vms: dict[str, Any] | None = None,
+        vm_router: Any = None,
         group_space: Any = None,
         identity: Any = None,
         capability: Any = None,
@@ -1080,8 +1143,16 @@ class Coordinator:
         # 按「本机能隔离跑命令」处理，行为和以前一样）。ok=False（受限）时本机不跑命令：
         # 有一次性机器就去机器上做，没有就把话说明白、任务判失败。
         self._capability = capability
-        # 一次性 VM 执行环境（RailwayEnv；None / railway=false → 不提供 railway 选项）
+        # 一次性 VM 执行环境（environments/vm_platforms.py 注册表里的实现对象；
+        # None / 配置关了 / 没就位 → 提示词里不出现这个选项）。
+        # railway 单独留一个老属性位（老调用与测试替身直接塞 self._railway）；
+        # 其它平台（freestyle…）放在 self._vms 里按平台名查。
         self._railway = railway
+        self._vms: dict[str, Any] = {str(k): v for k, v in (vms or {}).items() if v is not None}
+        if railway is not None:
+            self._vms.setdefault("railway", railway)
+        # 几家一次性 VM 的分派器（app 建；有它时申请机器走它那把锁，两家合计同一时间只占一台）
+        self._vm_router = vm_router
         # 专用机器（SshEnv；None / 没配机器 → 不提供 ssh 选项）
         self._ssh = ssh
         # 群空间（platforms.qq_onebot.GroupSpace；None = 没开 / 没就位 → 交付前不折腾群空间）
@@ -1506,12 +1577,23 @@ class Coordinator:
             return []
 
     # ------------------------------------------------------------------
-    # 执行环境（本机 / railway.new 一次性 VM）
+    # 执行环境（本机 / 一次性 VM（railway | freestyle）/ 专用机器）
     # ------------------------------------------------------------------
+
+    def _vm_env(self, kind: str) -> Any:
+        """某个一次性 VM 平台的实现对象；None = 没就位。
+
+        railway 走老属性位 `self._railway`（老调用 / 测试替身直接塞它）；
+        其它平台从 `self._vms` 按平台名查。
+        """
+        k = str(kind or "").strip().lower()
+        if k == "railway":
+            return getattr(self, "_railway", None)
+        return dict(getattr(self, "_vms", None) or {}).get(k)
 
     def _railway_available(self) -> bool:
         """能不能把 railway 当作可选项：railway 环境就位 + [environments] railway 没关。"""
-        if self._railway is None:
+        if getattr(self, "_railway", None) is None:
             return False
         try:
             if not bool(getattr(self._get_settings().environments, "railway", True)):
@@ -1519,6 +1601,62 @@ class Coordinator:
         except Exception:
             pass
         return callable(getattr(self._railway, "acquire", None))
+
+    def _vm_available(self, kind: str) -> bool:
+        """能不能把某个一次性 VM 平台当作可选项：环境就位 + 配置选了它 + 密钥齐（要密钥的）。"""
+        k = str(kind or "").strip().lower()
+        if k == "railway":
+            return self._railway_available()
+        env = self._vm_env(k)
+        if env is None:
+            return False
+        preset = vm_platforms.get(k)
+        if preset is not None:
+            try:
+                if not preset.ready(self._get_settings()):
+                    return False
+            except Exception:
+                return False
+        return callable(getattr(env, "acquire", None))
+
+    def _oneshot_kinds(self) -> tuple[str, ...]:
+        """现在能用的一次性 VM 平台：优先那家排第一，另一家是备用（2026-10-15 两家可同时开）。"""
+        try:
+            first = vm_platforms.selected_kind(self._get_settings())
+        except Exception:
+            first = "railway"
+        order = [first, *[k for k in vm_platforms.kinds() if k != first]]
+        return tuple(k for k in order if self._vm_available(k))
+
+    def _oneshot_busy(self, kind: str) -> str:
+        """另一家一次性 VM 现在是不是占着一台（同一时间两家合计只用一台）；返回占着的那家或 ""。"""
+        for other in vm_platforms.kinds():
+            if other == kind:
+                continue
+            env = self._vm_env(other)
+            try:
+                if env is not None and getattr(env, "current_box", None) is not None:
+                    return other
+            except Exception:
+                continue
+        return ""
+
+    def _vm_label(self, kind: str) -> str:
+        """给管理员看的平台名（「Railway 一次性机器」）。"""
+        preset = vm_platforms.get(kind)
+        return f"{preset.label} 一次性机器" if preset is not None else f"{kind} 一次性机器"
+
+    def _vm_window_minutes(self, kind: str) -> int:
+        """这台机器默认最多活多少分钟（给子 agent 的说明用；freestyle 读配置）。"""
+        preset = vm_platforms.get(kind)
+        if preset is None:
+            return 0
+        if str(kind) == "freestyle":
+            try:
+                return max(1, int(self._get_settings().environments.freestyle_ttl_minutes or preset.ttl_minutes))
+            except Exception:
+                return preset.ttl_minutes
+        return preset.ttl_minutes
 
     def _ssh_available(self) -> bool:
         """能不能把专用机器当作可选项：SshEnv 就位 + 配了至少一台地址写对的机器。"""
@@ -1531,6 +1669,11 @@ class Coordinator:
             return False
 
     @staticmethod
+    def _box_kind(box: Any) -> str:
+        """这台机器是哪一家：box.kind；没带的（老 railway Box / 假 box）一律当 railway。"""
+        return str(getattr(box, "kind", "") or "").strip().lower() or "railway"
+
+    @staticmethod
     def _is_ssh_box(box: Any) -> bool:
         return str(getattr(box, "kind", "") or "") == "ssh"
 
@@ -1540,13 +1683,15 @@ class Coordinator:
         return f"专用机器 · {getattr(box, 'name', '') or '未命名'}"
 
     def _remote_env_desc(self, box: Any) -> str:
-        return self._ssh_env_desc(box) if self._is_ssh_box(box) else self._railway_env_desc(box)
+        if self._is_ssh_box(box):
+            return self._ssh_env_desc(box)
+        return vm_platforms.describe(self._box_kind(box), box)
 
     @staticmethod
     def _remote_job_tools(requested: list[str], box: Any) -> list[str]:
         """按机器种类换工具：专用机器换 machine_*，一次性 VM 换 vm_*；本机命令工具都去掉。"""
-        if str(getattr(box, "kind", "") or "") != "ssh":
-            return Coordinator._railway_job_tools(requested)
+        if Coordinator._box_kind(box) != "ssh":
+            return Coordinator._oneshot_job_tools(requested)
         out: list[str] = []
         for t in requested:
             if t in _LOCAL_EXEC_TOOLS or t in _VM_TOOLS:
@@ -1561,11 +1706,13 @@ class Coordinator:
     def _env_options(self) -> tuple[str, str, set[str]]:
         """排计划提示词里的 env 选项：(JSON 字段说明, 怎么选的说明, 允许的值)。没就位的不出现。"""
         ssh_ok = self._ssh_available()
-        railway_ok = self._railway_available()
-        allowed = {"local"} | ({"ssh"} if ssh_ok else set()) | ({"railway"} if railway_ok else set())
+        # 两家都开时只给主模型一个「一次性机器」选项（优先那家）；拿不到时程序自己换另一家，
+        # 不让模型挑平台（2026-10-15 用户定）
+        oneshot = self._oneshot_kinds()[:1]
+        allowed = {"local"} | ({"ssh"} if ssh_ok else set()) | set(oneshot)
         if allowed == {"local"}:
             return ' "env": "local"（本机隔离环境干活），', "", allowed
-        opts = "|".join(k for k in ("local", "ssh", "railway") if k in allowed)
+        opts = "|".join(k for k in ("local", "ssh", *vm_platforms.kinds()) if k in allowed)
         field = f' "env": "{opts}"（在哪干活，下面有说明）， "env_reason": "一句话说清为什么这么选",'
         if ssh_ok:
             field += ' "machine": "选 ssh 时想用哪台专用机器（写名字；无所谓就 null）",'
@@ -1581,12 +1728,10 @@ class Coordinator:
                 "都在忙或连不上会自动换别的地方。有好几台时，按上面「做事规矩」（AGENTS.md）里写的"
                 "各台机器的情况和用途挑一台，写进 machine。"
             )
-        if railway_ok:
-            lines.append(
-                "railway 是一台一次性机器：60 分钟窗口、2 核 2G、用完即弃；同一时间只有 1 台、每天有限额，"
-                "现在不一定拿得到。要跑不信任的第三方代码、要 root 或 docker、要一台干净系统时选它"
-                + ("（其余要跑命令的活先选 ssh）。" if ssh_ok else "。")
-            )
+        for kind in oneshot:
+            preset = vm_platforms.get(kind)
+            hint = preset.plan_hint if preset is not None else f"{kind} 是一台一次性机器"
+            lines.append(hint + ("（其余要跑命令的活先选 ssh）。" if ssh_ok else "。"))
         lines.append("不管在哪台机器上做，成品最后都必须拷回本机工作区才能交付。")
         return field, "".join(lines), allowed
 
@@ -1594,13 +1739,22 @@ class Coordinator:
         """计划里的 env 规范成可用的值：乱写 → local；要的那种机器没开 → 换另一种机器，都没开 → local。"""
         choice = str(raw or "").strip().lower()
         _f, _g, allowed = self._env_options()
-        if choice not in ("local", "ssh", "railway"):
+        oneshot = self._oneshot_kinds()[:1]
+        if choice not in ("local", "ssh", *vm_platforms.kinds()):
             return "local"
         if choice in allowed:
             return choice
-        if choice in ("ssh", "railway"):
-            other = "railway" if choice == "ssh" else "ssh"
-            return other if other in allowed else "local"
+        if choice == "ssh":
+            # 要专用机器但没有：先看有没有一次性 VM（同样是「一台干净机器」）
+            candidates = list(oneshot)
+        elif choice in vm_platforms.kinds():
+            # 要的一次性 VM 没开：先看另一家一次性 VM，再退专用机器
+            candidates = [k for k in oneshot if k != choice] + ["ssh"]
+        else:
+            candidates = []
+        for kind in candidates:
+            if kind in allowed:
+                return kind
         return "local"
 
     def _local_can_exec(self) -> bool:
@@ -1630,22 +1784,18 @@ class Coordinator:
 
     @staticmethod
     def _railway_env_desc(box: Any) -> str:
-        """任务 env 字段（railway）：「railway.new 一次性机器 · 2 核 2G · 到期 HH:MM」。"""
-        expire_txt = ""
-        try:
-            expires = float(getattr(box, "expires_ts", 0) or 0)
-            if expires > 0:
-                expire_txt = clock.bj(expires).strftime("%H:%M")
-        except Exception:
-            expire_txt = ""
-        base = "railway.new 一次性机器 · 2 核 2G"
-        if expire_txt:
-            base += f" · 到期 {expire_txt}"
-        return base
+        """（老名字，railway 专用）任务 env 字段：「railway.new 一次性机器 · 2 核 2G · 到期 HH:MM」。
+
+        现在统一走 vm_platforms.describe；这个方法留着给老调用 / 测试替身用。
+        """
+        return vm_platforms.describe("railway", box)
 
     @staticmethod
-    def _railway_job_tools(requested: list[str]) -> list[str]:
-        """把主模型给的工具名单换成 railway 版：去掉本机命令工具、补 vm_*，保留其它。"""
+    def _oneshot_job_tools(requested: list[str]) -> list[str]:
+        """把主模型给的工具名单换成一次性 VM 版：去掉本机命令工具、补 vm_*，保留其它。
+
+        工具名两家平台通用（railway / freestyle），远端根目录由 box.remote_root 决定。
+        """
         out: list[str] = []
         for t in requested:
             if t in _LOCAL_EXEC_TOOLS:
@@ -1660,16 +1810,24 @@ class Coordinator:
                 out.append(t)
         return out
 
-    async def _fetch_acquire_reason(self) -> str:
-        """从 railway 环境拿一句「为什么没拿到机器」（last_fail），拿不到就给兜底话。"""
+    # 老名字（railway 时代的调用点）：等价于 _oneshot_job_tools
+    _railway_job_tools = _oneshot_job_tools
+
+    async def _fetch_vm_acquire_reason(self, kind: str) -> str:
+        """从某个一次性 VM 平台的 last_fail 拿一句「为什么没拿到机器」。"""
         reason = ""
         try:
-            lf = self._railway.last_fail() if self._railway is not None else None
+            env = self._vm_env(kind)
+            lf = env.last_fail() if env is not None else None
             if isinstance(lf, dict):
                 reason = str(lf.get("reason") or "").strip()
         except Exception:
             reason = ""
         return reason or "配额用完或现在同时已经有机器在用"
+
+    async def _fetch_acquire_reason(self) -> str:
+        """（老名字，railway 专用）保留给老调用 / 测试替身。"""
+        return await self._fetch_vm_acquire_reason("railway")
 
     @staticmethod
     def _find_artifact_symlink_escape(artifact_path: Any) -> str | None:
@@ -2002,10 +2160,14 @@ class Coordinator:
             + ' "scale": "brief|standard|full"（按原话定规模：随口一问、没要求做表/页/文件 = brief；'
             '明确要求整理成表/页/文档 = standard；明确要求全面/深度/报告 = full；'
             '没写按 standard）,'
-            + ' "deliver_kind": "view|file|text"（view=做成网页给人打开看；file=做成文件给人下载/编辑；text=不用成品，直接在群里文字回复；brief 必须是 text）,'
+            + ' "deliver_kind": "view|file|text|image"（view=做成网页给人打开看；file=做成文件给人下载/编辑；'
+            'text=不用成品，直接在群里文字回复；brief 必须是 text；'
+            'image=成品就是**一到四张图片**（照片 / 插画 / 封面 / 概念图）——直接发进群 + 一句说明，'
+            '不要为了图去做网页）,'
             + env_field
             + ' "jobs": [{"brief": "派给一个子 agent 的具体活，要写清楚要做什么、写到 artifacts/<任务ID>/ 下；'
-            '展示类做成单页 index.html（手机能看、不依赖外部资源）",'
+            '展示类做成单页 index.html（手机能看、不依赖外部资源）；'
+            '交付是图片时把成品图写进 artifacts/<任务ID>/images/ 下",'
             ' "type": "research|build|other"（research=要查资料出结论的活：调研、对比、盘点、「大家怎么看」、找现状/口碑；'
             'build=做东西；other=其它）,'
             ' "tools": ["子 agent 工具名单里的名字"],'
@@ -2028,6 +2190,10 @@ class Coordinator:
             "（子 agent 工具名单：" + " / ".join(worker_job_tool_names(self._tools)) + "；"
             "只能从这里挑，别多要）"
         )
+        # 2026-10-15 任务 A3：只有真配了生图模型才写这句能力说明（没配一个字都不提）。
+        image_line = self._imagegen_capability_line()
+        if image_line:
+            prompt_lines.append(image_line)
         role_lines = self._role_tools_hint_lines()
         if role_lines:
             prompt_lines.append("")
@@ -2185,7 +2351,9 @@ class Coordinator:
             )
 
         deliver_kind = str(data.get("deliver_kind") or "").strip()
-        if deliver_kind not in ("view", "file", "text"):
+        # image（2026-10-15）：成品是一到四张图片时直接把图发进群（见 Delivery.deliver_task）；
+        # 认不出的值照旧回落 file。
+        if deliver_kind not in ("view", "file", "text", "image"):
             deliver_kind = "file"
 
         jobs_raw = data.get("jobs")
@@ -2540,6 +2708,9 @@ class Coordinator:
                 j["brief"], tid, plan["deliver_kind"],
                 railway_box if on_railway else False,
                 steps_dir=steps_dirs.get(job_no, ""),
+                # 双保险（2026-10-15 任务 B）：brief 里点名的工具只用**这条活真拿得到**的
+                # （岗位上限 / 环境换名之后的名单，和真跑活同一个解析入口）。
+                tools=self._job_tool_names(j, on_remote=bool(on_railway), box=railway_box),
             )
             for d in deps:
                 await done[d - 1].wait()
@@ -2751,6 +2922,7 @@ class Coordinator:
                     brief=self._enrich_brief(
                         nx["brief"], tid, plan["deliver_kind"], False,
                         steps_dir=steps_dirs.get(i + 1, ""),
+                        tools=tuple(j.get("tools") or ()),
                     ),
                     tools=j["tools"],
                     gid=gid,
@@ -2859,13 +3031,19 @@ class Coordinator:
                 from .workers import WorkerReport
 
                 return WorkerReport(ok=False, summary="", error=f"拿不到工作区：{e}")
-            # 调研类子任务：system 提示追加报告框架（做东西的活不加）
+            # 调研类子任务：system 提示追加报告框架（做东西的活不加）。
+            # 2026-10-15 任务 B：框架里点名的工具（read_skill / render_report）**只在这条活
+            # 真拿得到时**才写——不然就是让子 agent 去调一个会被拒的工具。
             system_extra = ""
             if str(job_type) == "research":
                 try:
-                    from .workers import RESEARCH_REPORT_FRAMEWORK
+                    from .workers import research_report_framework
 
-                    system_extra = RESEARCH_REPORT_FRAMEWORK
+                    job_tools = {str(t) for t in (tools or ())}
+                    system_extra = research_report_framework(
+                        read_skill="read_skill" in job_tools,
+                        render_report="render_report" in job_tools,
+                    )
                 except Exception:
                     logger.exception("取调研报告框架失败")
             try:
@@ -2937,38 +3115,46 @@ class Coordinator:
                 return WorkerReport(ok=False, summary="", error=f"子 agent 执行异常：{e}")
 
     # ------------------------------------------------------------------
-    # 执行环境：选 railway → 拿一台一次性机器（回落本机写清原因）
+    # 执行环境：选一次性 VM / 专用机器 → 拿一台（回落写清原因）
     # ------------------------------------------------------------------
 
     async def _setup_exec_env(self, tid: str, plan: dict, gid: str) -> tuple[bool, Any]:
         """决定这轮在哪干 + 把任务 env 字段写好。返回 (跑在别的机器上?, 拿到的机器 | None)。
 
-        机器有两种：专用机器（ssh，用户自己的 VPS / VM）和一次性 VM（railway）。
+        机器有两种：专用机器（ssh，用户自己的 VPS / VM）和一次性 VM（railway / freestyle
+        各自开关、可同时开；优先那家排第一，同一时间两家合计只占一台）。
         - 选 local 且本机能隔离跑命令：就在本机（不碰机器）；
         - 选 ssh：专用机器 → 一次性 VM → 本机；
-        - 选 railway：一次性 VM → 专用机器 → 本机；
+        - 选一次性 VM：优先那家 → 另一家（开着的话）→ 专用机器 → 本机；
         - 选 local 但本机受限（不能隔离跑命令）：专用机器 → 一次性 VM → 做不了。
         换了地方都在 env 字段 / 时间线写清原因；最后都拿不到且本机受限，返回 (False, None)，
         调用方据此判失败，不假装开工。
         """
         want = str(plan.get("env") or "local")
         local_ok = self._local_can_exec()
-        if want not in ("ssh", "railway") and local_ok:
+        oneshot = list(self._oneshot_kinds())
+        machine_kinds = ("ssh", *oneshot)
+        if want not in machine_kinds and local_ok:
             try:
                 self._tasks.set_env(tid, self._local_env_desc())
             except Exception:
                 logger.exception("写任务 %s 的 env 字段失败", tid)
             return False, None
-        order = ["railway", "ssh"] if want == "railway" else ["ssh", "railway"]
-        labels = {"ssh": "专用机器", "railway": "一次性机器"}
+        if want == "ssh":
+            order = ["ssh", *oneshot]
+        elif want in oneshot:
+            order = [want, *[k for k in oneshot if k != want], "ssh"]
+        else:
+            order = ["ssh", *oneshot]
+        labels = {"ssh": "专用机器", **{k: self._vm_label(k) for k in oneshot}}
         reasons: list[str] = []
         for kind in order:
             box, reason = await self._acquire_remote(kind, tid, str(plan.get("machine") or "").strip())
             if box is None:
                 if reason:
-                    reasons.append(f"{labels[kind]}：{reason}")
+                    reasons.append(f"{labels.get(kind, kind)}：{reason}")
                 continue
-            if not local_ok and want not in ("ssh", "railway"):
+            if not local_ok and want not in machine_kinds:
                 cap = getattr(self, "_capability", None)
                 why = str(getattr(cap, "reason", "") or "这台机器不能隔离跑命令")
                 note = f"不能隔离跑命令，改在{labels[kind]}上做：{why}"
@@ -3015,16 +3201,38 @@ class Coordinator:
             except Exception:
                 reason = ""
             return None, reason or "都连不上或都在忙"
-        if not self._railway_available():
-            return None, "现在没开 railway（配置关了或环境没就位）" if getattr(self, "_railway", None) is not None else ""
+        env = self._vm_env(kind)
+        if not self._vm_available(kind):
+            label = self._vm_label(kind)
+            if env is None:
+                return None, ""
+            # 开着但缺密钥：原因要说准（2026-10-15 巡检 M6），不然管理员会去找开关
+            preset = vm_platforms.get(str(kind or "").strip().lower())
+            try:
+                settings = self._get_settings()
+                if preset is not None and preset.enabled(settings) and not preset.has_key(settings):
+                    return None, f"{label}开着，但还没填密钥（设置 → 干活机器）"
+            except Exception:
+                logger.debug("判断 %s 缺不缺密钥出错，按通用原因说", kind, exc_info=True)
+            return None, f"现在没开 {label}（配置关了或环境没就位）"
+        busy = self._oneshot_busy(kind)
+        if busy:
+            return None, f"{self._vm_label(busy)}正被别的任务占着（临时机器同一时间只用一台）"
+        router = getattr(self, "_vm_router", None)
         try:
-            box = await self._railway.acquire(tid)
+            if router is not None and kind in getattr(router, "envs", {}):
+                # 带锁：查另一家空不空 + 申请一起做完，两个任务同时申请也不会两家各占一台
+                box, busy = await router.acquire(kind, tid)
+                if box is None and busy:
+                    return None, f"{self._vm_label(busy)}正被别的任务占着（临时机器同一时间只用一台）"
+            else:
+                box = await env.acquire(tid)
         except Exception:
             logger.exception("申请一次性机器出错（任务 %s）", tid)
             box = None
         if box is not None:
             return box, ""
-        return None, await self._fetch_acquire_reason()
+        return None, await self._fetch_vm_acquire_reason(kind)
 
     def _worker_tool_registered(self, name: Any) -> bool:
         """这个工具名在注册表里现在真的给子 agent 用吗（没注册 / 被摘掉 = 用不了）。
@@ -3105,6 +3313,64 @@ class Coordinator:
         if self._local_can_exec():
             return "run_command", ()
         return "", ()
+
+    # ------------------------------------------------------------------
+    # 生图能力（2026-10-15 任务 A3）：配没配复用 tools_imagegen 的判定
+    # ------------------------------------------------------------------
+
+    def _imagegen_configured(self) -> bool:
+        """现在配了生图模型吗（`use="image"` 的条目 + 端点有地址和密钥）。
+
+        判定只有一处：`tools_imagegen.image_entries`——和 generate_image 真跑时同一份
+        口径（网页选的模型在 kv 里，这里只看「有没有能用的条目」）。读配置出错 → False
+        （宁可不提能力，也不吹一个跑不通的工具）。
+        """
+        try:
+            from .tools_imagegen import image_entries
+
+            return bool(image_entries(self._get_settings()))
+        except Exception:
+            logger.debug("查生图模型配置失败，按「没配」处理", exc_info=True)
+            return False
+
+    def _imagegen_capability_line(self) -> str:
+        """配了生图模型才写的一句能力说明（给排计划的主模型看）；没配 → ""。"""
+        if not self._imagegen_configured():
+            return ""
+        return (
+            "（已经配好生图模型：可以用 generate_image 画照片 / 插画 / 封面 / 概念图，"
+            "成品落在任务目录的 images/ 下，交付形态用 image 直接把图发进群；"
+            "数字、图表、资讯卡片别用它——那些要能逐个对原文的确定性做法。）"
+        )
+
+    def _imagegen_unavailable_reason(self, kind: str) -> str:
+        """要画图但这条活拿不到生图工具时的中文原因（说清是哪一种）。"""
+        if not self._worker_tool_registered(_IMAGE_TOOL_NAME):
+            return f"现在没有可用的生图工具（{_IMAGE_TOOL_NAME} 没注册）"
+        if not self._imagegen_configured():
+            return (
+                "现在没配生图模型——先到网页「设置 → 模型」加一个用途是「生图」的模型"
+                "（端点要填地址和密钥）"
+            )
+        return f"按岗位「{kind}」的实际上限，子 agent 拿不到 {_IMAGE_TOOL_NAME}"
+
+    def _job_tool_names(self, job: dict, *, on_remote: bool, box: Any) -> tuple[str, ...]:
+        """这条活**实际**会交给子 agent 的工具名（给「提示词只点名真拿得到的工具」用）。
+
+        走和真跑活同一个解析入口（岗位上限 / 远端换名都算上，2026-10-15 任务 B）；
+        解析不出来 / 空名单就退回计划里写的那份——宁可多提一句，也不让提示词与
+        工具名单对不上。只读，不改计划。
+        """
+        try:
+            effective, _kind, _why = self._job_effective_tools(
+                job, on_remote=on_remote, box=box
+            )
+        except Exception:
+            logger.debug("解析这条活的实际工具名单失败，退回计划里写的那份", exc_info=True)
+            effective = []
+        if effective:
+            return tuple(str(t) for t in effective)
+        return tuple(str(t) for t in (job.get("tools") or ()))
 
     def _try_fill_exec_tool(self, job: dict, *, on_remote: bool, box: Any) -> str:
         """在「岗位允许 + 环境具备 + 注册表真有」三条同时满足时，给这条活补一个执行工具。
@@ -3191,6 +3457,55 @@ class Coordinator:
             pred(t) for t in (effective or []) if self._worker_tool_registered(t)
         )
 
+    def _prompt_named_tool_fills(self, job: dict, plan: dict) -> list[tuple[str, str]]:
+        """提示词会点名、但这条活名单里还没有的工具 → [(工具名, 中文说明)]（2026-10-15 任务 B）。
+
+        规矩（只补提示词**真会写到**的，不滥补）：
+        - `render_report`：deliver_kind=view（brief 里让子 agent 用 render_report 交网页）
+          或这条活是调研活（报告框架点名它）；
+        - `read_skill`：现在有可用 worker skill（system 提示会附 skill 清单并让读全文）。
+
+        **不在这里管 `generate_image`**（2026-10-15 复核更正 docstring）：生图工具由
+        `_exec_capability_self_check` 里 `needs_image` 那一段补——它还要判「配没配生图模型」，
+        补不上时要记 `task.exec_unavailable(need=image)` 走能力闸（重排 / 暂停），
+        和这里「只补、不判做不到」的语义不同。
+
+        注册表里没有的**不返回**（不往计划里塞假名字）；岗位上限压掉的由
+        `_try_fill_worker_tool` 自己拒（不越权放大）。
+        """
+        out: list[tuple[str, str]] = []
+        if not isinstance(job, dict):
+            return out
+        existing = {str(t) for t in (job.get("tools") or ())}
+        is_research = str(job.get("type") or "") == "research"
+        if "render_report" not in existing and (
+            str(plan.get("deliver_kind") or "") == "view" or is_research
+        ):
+            out.append((
+                "render_report",
+                "提示词里让子 agent 用 render_report 交网页 / 报告，名单里没有这个工具",
+            ))
+        if "read_skill" not in existing and self._worker_skills_available():
+            out.append((
+                "read_skill",
+                "system 提示里附了可用 skill 并让子 agent 用 read_skill 读全文，名单里没有这个工具",
+            ))
+        return out
+
+    def _worker_skills_available(self) -> bool:
+        """现在有没有给子 agent 用的 skill（有 → system 提示会点名 read_skill）。
+
+        认不出 skill 注册表（老调用 / 测试桩）→ False：**不**凭猜去补工具。
+        """
+        registry = getattr(self._tools, "skill_registry", None)
+        if registry is None:
+            return False
+        try:
+            return bool(registry.list("worker"))
+        except Exception:
+            logger.debug("查 worker skill 清单失败，这次不补 read_skill", exc_info=True)
+            return False
+
     def _exec_capability_self_check(
         self, tid: str, gid: str, plan: dict, *, on_remote: bool, box: Any = None
     ) -> ExecCheckReport:
@@ -3233,12 +3548,91 @@ class Coordinator:
                 needs_exec = job_needs_exec_capability(text)
                 is_research = str(job.get("type") or "") == "research"
                 needs_file = job_needs_file_output(text)
-                if not (needs_exec or is_research or needs_file):
+                # 2026-10-15 任务 A3：要画图（画图 / 生图 / 配图 / 海报 / 插画）但拿不到
+                # generate_image（或没配生图模型）→ 和「要执行能力但拿不到」同一条路。
+                # 判据是**这条活的 brief**（真派下去要干的活）；只有整个任务的交付形态就是
+                # 图片（deliver_kind=image）时，完成标准里提到画图也算。这样「完成标准里
+                # 顺带提一句画一张图（补充 / 加分项）」不会把整条任务卡住——补充项没做到
+                # 本来就由清单判定管，不该在开工前当硬门槛。
+                needs_image = job_needs_image_capability(job.get("brief") or "") or (
+                    str(plan.get("deliver_kind") or "") == "image"
+                    and job_needs_image_capability(criteria_text)
+                )
+                # 2026-10-15 任务 B：提示词会点名的工具先补齐（只补、不判「做不到」）——
+                # 这一趟对所有活都跑，不受下面那条「要不要做能力检查」的早退影响。
+                for tool_name, why_line in self._prompt_named_tool_fills(job, plan):
+                    if not self._worker_tool_registered(tool_name):
+                        continue
+                    if not self._try_fill_worker_tool(
+                        job, tool_name, on_remote=on_remote, box=box
+                    ):
+                        continue
+                    short0 = " ".join(str(text).split())[:40]
+                    note0 = (
+                        f"开工前自检：{why_line}，已按岗位允许的范围补上 {tool_name}"
+                        f"（第 {idx + 1} 条活「{short0}…」）"
+                    )
+                    logger.info("任务 %s %s", tid, note0)
+                    self._record_exec_event(
+                        tid, gid, "task.tool_autofill", note0,
+                        job=idx + 1, tool=tool_name, agent=str(job.get("agent") or "task"),
+                        need=tool_name,
+                    )
+                    findings.append(ExecFinding(
+                        job=idx + 1, agent=str(job.get("agent") or "task"), brief=short0,
+                        status="filled", tool=tool_name, need=tool_name,
+                    ))
+                if not (needs_exec or is_research or needs_file or needs_image):
                     continue
                 short = " ".join(str(text).split())[:40]
                 effective, kind, why = self._job_effective_tools(
                     job, on_remote=on_remote, box=box
                 )
+                if needs_image and not self._has_worker_tool(
+                    effective, lambda n: n == _IMAGE_TOOL_NAME
+                ):
+                    filled = ""
+                    if (not why and self._worker_tool_registered(_IMAGE_TOOL_NAME)
+                            and self._imagegen_configured()
+                            and self._try_fill_worker_tool(
+                                job, _IMAGE_TOOL_NAME, on_remote=on_remote, box=box
+                            )):
+                        filled = _IMAGE_TOOL_NAME
+                    if filled:
+                        note = (
+                            f"开工前自检：这条活要画图（{short}…），子 agent 实际拿不到生图工具，"
+                            f"已按岗位允许的范围补上 {filled}（第 {idx + 1} 条活）"
+                        )
+                        logger.info("任务 %s %s", tid, note)
+                        self._record_exec_event(
+                            tid, gid, "task.tool_autofill", note,
+                            job=idx + 1, tool=filled, agent=kind, need="image",
+                        )
+                        findings.append(ExecFinding(
+                            job=idx + 1, agent=kind, brief=short, status="filled",
+                            tool=filled, need="image",
+                        ))
+                        effective, kind, why = self._job_effective_tools(
+                            job, on_remote=on_remote, box=box
+                        )
+                    else:
+                        reason = why or self._imagegen_unavailable_reason(kind)
+                        note = (
+                            f"开工前自检：这条活要画图（{short}…），{reason}，"
+                            "照现在的计划做不成；别硬做——改成用文字 / 表格说清"
+                            "（或改派能给生图工具的岗位），管理员也可以先到"
+                            "「设置 → 模型」加一个用途是「生图」的模型"
+                            f"（第 {idx + 1} 条活）"
+                        )
+                        logger.warning("任务 %s %s", tid, note)
+                        self._record_exec_event(
+                            tid, gid, "task.exec_unavailable", note,
+                            job=idx + 1, agent=kind, need="image",
+                        )
+                        findings.append(ExecFinding(
+                            job=idx + 1, agent=kind, brief=short, status="unavailable",
+                            reason=reason, need="image",
+                        ))
                 if needs_exec:
                     real_exec = [
                         t for t in effective
@@ -3624,14 +4018,33 @@ class Coordinator:
             except Exception:
                 logger.exception("释放专用机器出错（任务跑完兜底）")
             return
-        await self._release_railway(box)
+        await self._release_oneshot(box)
 
-    async def _release_railway(self, box: Any) -> None:
-        """结束（成功 / 失败 / 取消 / 异常）一定释放一次性机器；自身不再抛错。"""
-        if box is None or self._railway is None:
+    async def _release_oneshot(self, box: Any) -> None:
+        """结束（成功 / 失败 / 取消 / 异常）一定释放一次性机器；自身不再抛错。
+
+        按 box.kind 查表找那家平台对象；railway / freestyle 的 release 都不抛
+        （freestyle 的 DELETE 404 也算成功）。
+        """
+        if box is None:
+            return
+        env = self._vm_env(self._box_kind(box))
+        if env is None:
             return
         try:
-            await self._railway.release(box)
+            await env.release(box)
+        except Exception:
+            logger.exception("释放一次性机器出错（任务跑完兜底）")
+
+    async def _release_railway(self, box: Any) -> None:
+        """（老名字，railway 专用）保留给老调用 / 测试替身。"""
+        if box is None:
+            return
+        railway = getattr(self, "_railway", None)
+        if railway is None:
+            return
+        try:
+            await railway.release(box)
         except Exception:
             logger.exception("释放一次性机器出错（任务跑完兜底）")
 
@@ -4075,8 +4488,17 @@ class Coordinator:
 
     def _enrich_brief(
         self, brief: str, tid: str, deliver_kind: str, on_railway: bool = False,
-        steps_dir: str = "",
+        steps_dir: str = "", tools: Any = None,
     ) -> str:
+        """给这条活的 brief 补上代码侧硬要求。
+
+        `tools`：这条活**实际**会交给子 agent 的工具名（用来做「提示词只在名单里真有
+        该工具时才点名它」的双保险，2026-10-15 任务 B）：名单里没有 render_report /
+        generate_image 时，brief 里就不出现这两个名字。None = 调用方不知道名单（老调用 /
+        测试），按「有」处理，行为不变。
+        """
+        tools_known = tools is not None
+        tool_names = {str(t) for t in (tools or ())}
         out = str(brief)
         # docs/22 §4 C（2026-10-07 本地）：有下游依赖的活 = 中间步骤，产出写自己的
         # artifacts/<任务>/steps/<步号>/（工具层也真拦）；交付成品由最后一步写。
@@ -4102,6 +4524,34 @@ class Coordinator:
             out += "\n\n" + input_images_hint(input_images)
         if deliver_kind == "view":
             out += "展示类成品做成单页 index.html（手机能看、不依赖外部资源）。"
+            # 2026-10-15 交付 intelligent UI：调研 / 分析 / 汇报类网页统一走 render_report（零件清单 + 统一样式），
+            # 只有游戏、工具、互动演示这类零件表达不了的才自己写 HTML。
+            # 双保险（2026-10-15 任务 B）：只有这条活真拿得到 render_report 时才点名它。
+            if not tools_known or "render_report" in tool_names:
+                out += (
+                    "调研、对比、分析、汇报这类以内容为主的网页，用 render_report 工具生成 index.html"
+                    "（挑零件填数据，程序统一排版，不要自己写 HTML/CSS）；"
+                    "只有小游戏、小工具、互动演示这类零件表达不了的，才自己写 HTML。"
+                )
+            else:
+                out += (
+                    "调研、对比、分析、汇报这类以内容为主的网页，做成单页 index.html，"
+                    "结构清楚、不依赖外部资源；只有小游戏、小工具、互动演示这类才写复杂 HTML。"
+                )
+        elif deliver_kind == "image":
+            # 2026-10-15 任务 A2：image 交付的成品就是图片本身（一到四张），别做成网页。
+            out += (
+                f"\n\n这次交付的是**图片**：把成品图写进工作区 {self._artifact_dir(tid)}/images/ 下"
+                "（一到四张，文件名起清楚；同一张图别写两份）。"
+                "群里会直接把图发出去，再附一句说明——所以不用做网页、也不用写 HTML。"
+            )
+            if "generate_image" in tool_names:
+                out += (
+                    "要画照片 / 插画 / 封面 / 概念图就用 generate_image（成品直接落在 images/ 里）；"
+                    "数字、图表这类要能逐个对原文的东西别用生图，用文字或表格写清。"
+                )
+            else:
+                out += "用你手上的材料整理出图片（裁剪、拼版、导出都可以）；查不到就老实说查不到。"
         elif deliver_kind == "file":
             out += "做成文件给人下载或编辑，文件名起清楚。"
         elif deliver_kind == "text" and not steps_dir:
@@ -4126,12 +4576,27 @@ class Coordinator:
                 f"最后一定要用 machine_fetch_file 把成品拷回本机工作区 {target_dir}/ 下，拷不回来就等于没做成。"
             )
         elif on_railway:
+            kind = self._box_kind(on_railway)
+            preset = vm_platforms.get(kind)
+            label = preset.label if preset is not None else kind
+            spec = ""
+            if preset is not None:
+                snap_slug = str(getattr(on_railway, "snapshot", "") or preset.default_snapshot)
+                snap = preset.snapshot_spec(snap_slug)
+                if snap is not None:
+                    spec = snap.label.split("·")[0].strip()
+                elif preset.fixed_spec:
+                    spec = preset.fixed_spec
+            minutes = self._vm_window_minutes(kind)
+            bits = [b for b in (spec, f"{minutes} 分钟窗口" if minutes else "") if b]
+            window = ("（" + "、".join(bits) + "，到点就什么都没了）：") if bits else "（到点就什么都没了）："
+            root = str(getattr(on_railway, "remote_root", "") or "/app").rstrip("/")
             out += (
-                "\n\n这轮在 railway.new 一次性机器上做（2 核 2G、60 分钟窗口，到点就什么都没了）："
-                "用 vm_run 在机器上跑命令、vm_put_file 把工作区里你写的脚本传上去、"
+                f"\n\n这轮在 {label} 的一次性机器上做" + window
+                + "用 vm_run 在机器上跑命令、vm_put_file 把工作区里你写的脚本传上去、"
                 "vm_read_file 看机器上的输出。"
                 "做好的成品不能留在机器上——交付只认本机工作区；"
-                "最后一定要用 vm_fetch_file 把成品从机器的 /app/ 下拷回本机工作区 "
+                f"最后一定要用 vm_fetch_file 把成品从机器的 {root}/ 下拷回本机工作区 "
                 f"{target_dir}/ 下，拷不回来就等于没做成。"
                 "机器时间不多，别拖；快到期会提醒你，一提醒就马上 vm_fetch_file。"
             )
@@ -5411,6 +5876,14 @@ class Coordinator:
         else:
             assert artifact_path is not None
             name = artifact_path.name or artifact_path.parent.name or task_id
+            if kind == "image":
+                # 2026-10-15 任务 A2：成品是图。图落在 artifacts/<任务>/images/ 里时，
+                # 把那个目录交给交付层——它按文件名顺序取一到四张真图片一起发进群
+                # （说明只挂在第一张上），不用一张张单独交付。
+                parent = artifact_path.parent
+                if parent.name == "images" and parent.is_dir():
+                    artifact_path = parent
+                    name = task_title or name
             try:
                 await self._delivery.deliver_task(
                     task_id, kind=kind, path=artifact_path, name=name, note=note
@@ -6362,9 +6835,13 @@ class Coordinator:
             return  # 调查期间被取消 / 暂停 / 删群：不再调主模型
 
         gc_goal = self._group_context_safe(str(goal.get("group_id") or ""), "goal")
+        # 内置 skill goal-tracking（main 角色）：检查回合是纯 JSON 调用、没有 skill 工具，要点直接注入
+        from .skills import guidance as _skill_guidance
+
+        tracking = _skill_guidance(getattr(self._tools, "skill_registry", None), "goal-tracking")
         prompt_lines = (
             [gc_goal.strip()] if gc_goal else []
-        ) + [
+        ) + ([tracking] if tracking else []) + [
             # R6（2026-10-11）：检查要有时间感——现在几点、盯了几天、上次什么时候看的。
             self._goal_time_head(goal),
             "你是 MaiWork 的主模型，在检查一个 agent 目标的进展。",

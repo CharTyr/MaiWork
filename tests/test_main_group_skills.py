@@ -117,12 +117,16 @@ def test_no_skill_anywhere_keeps_empty_table(store: Store, tmp_path: Path) -> No
 
 
 def test_disabled_nav_still_opens_for_group_task(store: Store, tmp_path: Path) -> None:
-    """find-skills 停用（全局开关）后没有 main 通用 skill，但本群 task 做法仍给 list/read。"""
+    """内置 main 通用 skill 全停用后没有 main 通用 skill，但本群 task 做法仍给 list/read。"""
     agents = agents_mod.Agents(store, lambda: _Settings())
     agents._ensure_schema()
     skills = skills_mod.Skills(str(tmp_path), store=store)
-    assert "find-skills" in [i["name"] for i in skills.list("main")]
-    skills_mod.set_disabled(store, "find-skills", True)
+    main_builtin = [str(i["name"]) for i in skills.list("main")]
+    assert "find-skills" in main_builtin
+    # 2026-10-15：内置的 main 通用 skill 不止 find-skills 一份（还有 goal-tracking /
+    # idea-shaping），要「一份 main 通用 skill 都不剩」得全停用——逐份停用，别写死名字。
+    for name in main_builtin:
+        skills_mod.set_disabled(store, name, True)
     assert skills.list("main") == []
     tools = Tools(store)
     tools._agents = agents  # noqa: SLF001

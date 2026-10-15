@@ -402,9 +402,10 @@ async def test_worker_tools_never_include_groupspace(
     )
     await coordinator.run_task(tid)
 
-    # 主模型点名要了群空间工具，派给子 agent 时被摘掉（只剩 write_file）
+    # 主模型点名要了群空间工具，派给子 agent 时被摘掉（只剩本岗工具）
+    # （2026-10-15 任务 B：view 活还会按需补上 render_report，所以这里只断言「没有群空间工具」）
     assert len(workers.calls) == 1
-    assert workers.calls[0]["tools"] == ["write_file"]
+    assert "write_file" in workers.calls[0]["tools"]
     assert not set(workers.calls[0]["tools"]) & set(_GROUPSPACE_TOOLS)
     # 就算硬塞，子 agent 这个角色也拿不到这 4 个工具的规格（roles={"main"}）
     worker_specs = tools.specs("worker", requested)

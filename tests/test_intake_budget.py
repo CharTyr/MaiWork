@@ -1,4 +1,9 @@
-"""收消息入口必须及时放行；已接到的消息、后台落地失败都能恢复。"""
+"""收消息入口必须及时放行；已接到的消息、后台落地失败都能恢复。
+
+2026-10 起钩子**不等 Jev**（判词丢后台任务 `_judge_at`）：这里量的是钩子本身的返回
+时间，后台判词 / 落地用 spawn 捕获的协程手动抽干（`for coro in spawned: await coro`，
+列表迭代器能看到后台里再 spawn 出来的协程）。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -10,6 +15,7 @@ from fakes import hook_message
 from test_intake_m3 import _FakeApprovals, _FakeJev, _settings
 from test_quick_judge import _Rec, _item, _make_qj, _one
 
+from CharTyr_MaiWork.maiwork import intake as intake_mod
 from CharTyr_MaiWork.maiwork.intake import Intake, Signals
 from CharTyr_MaiWork.maiwork.store import Store
 
@@ -24,14 +30,19 @@ def _store(tmp_path):
 
 @pytest.mark.asyncio
 async def test_slow_jev_leaves_headroom_for_host_timeout():
+    """Jev 要 2 秒：钩子不等它（<0.9s 返回），判词在后台跑完再走原来的路。"""
     settings = _settings(jev_timeout_ms=1200)
     jev = _FakeJev(delay_s=2)
-    intake = Intake(lambda: settings, Signals(), jev=jev)
+    spawned: list = []
+    intake = Intake(lambda: settings, Signals(), jev=jev, spawn=lambda coro: spawned.append(coro))
     start = time.monotonic()
     assert await intake.handle(hook_message(GID, text="帮我整理资料", is_at=True)) == {"action": "continue"}
     assert time.monotonic() - start < 0.9
-    assert jev.calls[0]["timeout_ms"] <= 600
-    assert intake.slow_queue
+    assert jev.calls == []          # 钩子里连问都没问
+    for coro in spawned:
+        await coro
+    assert jev.calls[0]["timeout_ms"] <= 1200   # 后台按 [jev] timeout_ms 问
+    assert intake.slow_queue                    # 没接 approvals：后台走慢路径
 
 
 @pytest.mark.asyncio
@@ -62,7 +73,8 @@ async def test_feedback_is_deferred_and_does_not_block_loop(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_cancel_cleanup_does_not_extend_hook_budget():
+async def test_cancel_cleanup_does_not_extend_hook_budget(monkeypatch):
+    """Jev 卡死被后台外层保险掐断：取消收尾（0.45s）也不占钩子时间。"""
     settings = _settings(jev_timeout_ms=1200)
     cleaned = asyncio.Event()
 
@@ -74,11 +86,15 @@ async def test_cancel_cleanup_does_not_extend_hook_budget():
                 await asyncio.sleep(0.45)
                 cleaned.set()
 
-    intake = Intake(lambda: settings, Signals(), jev=SlowCancel())
+    monkeypatch.setattr(intake_mod, "_JEV_BG_WAIT_MAX_MS", 100)
+    spawned: list = []
+    intake = Intake(lambda: settings, Signals(), jev=SlowCancel(), spawn=lambda coro: spawned.append(coro))
     start = time.monotonic()
     assert await intake.handle(hook_message(GID, text="帮我整理资料", is_at=True)) == {"action": "continue"}
     assert time.monotonic() - start < 0.9
-    assert intake.slow_queue
+    for coro in spawned:
+        await coro
+    assert intake.slow_queue     # 掐断 → 慢路径
     await asyncio.wait_for(cleaned.wait(), timeout=1)
 
 
@@ -96,8 +112,16 @@ async def test_message_is_durable_before_jev_await(tmp_path):
             observed.append(row)
             return {"kind": ("none", 0.95, 0.95)}
 
-    intake = Intake(lambda: settings, Signals(), store=store, jev=Probe())
+    spawned: list = []
+    intake = Intake(
+        lambda: settings, Signals(), store=store, jev=Probe(), spawn=lambda coro: spawned.append(coro)
+    )
     assert await intake.handle(hook_message(GID, message_id="probe", text="晚上好", is_at=True)) == {"action": "continue"}
+    # 钩子里还没问 Jev（判词在后台），但这条 @ 已经落库了
+    row = store.read().execute("SELECT handled FROM pending_asks WHERE message_id='probe'").fetchone()
+    assert row is not None and row["handled"] == 0
+    for coro in spawned:
+        await coro
     assert observed and observed[0] is not None
     row = store.read().execute("SELECT handled FROM pending_asks WHERE message_id='probe'").fetchone()
     assert row["handled"] == 1, "只有明确闲聊结论才关闭待判行"

@@ -86,7 +86,11 @@ async def test_render_png_without_playwright_raises(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_render_png_real_browser(monkeypatch):
-    """本机装了 playwright + chromium 就真画一张（服务器宿主 venv 自带 playwright 1.58）。"""
+    """本机装了 playwright + chromium 就真画一张（服务器宿主 venv 自带 playwright 1.58）。
+
+    2026-10-15 起最终产物是 JPEG（quality 85，线上 PNG 1~3.5MB → 小 50~80%）；
+    没有 Pillow 时才回落 PNG。
+    """
     import os
     import pwd
     from pathlib import Path
@@ -100,9 +104,70 @@ async def test_render_png_real_browser(monkeypatch):
             break
     else:
         pytest.skip("本机没装 playwright 浏览器")
-    png = await news_card.render_png(_data())
-    assert png[:8] == b"\x89PNG\r\n\x1a\n"
-    assert len(png) > 20_000
+    data = await news_card.render_png(_data())
+    if data[:3] == b"\xff\xd8\xff":
+        assert len(data) > 10_000
+    else:  # 没有 Pillow → 回落 PNG
+        assert data[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+# ----------------------------------------------------------------------
+# 卡片图转 JPEG（2026-10-15）
+# ----------------------------------------------------------------------
+
+
+def _tiny_png(w: int = 2, h: int = 2, color=(200, 30, 40)) -> bytes:
+    """手写一张最小 PNG（不依赖 Pillow，用来测转码 / 回落两条路）。"""
+    import struct
+    import zlib
+
+    raw = b"".join(b"\x00" + bytes(color) * w for _ in range(h))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw))
+            + chunk(b"IEND", b""))
+
+
+def test_to_card_jpeg_converts_and_shrinks():
+    """Pillow 在 → 真 JPEG（FF D8 FF 开头）；像照片的图明显比 PNG 小（线上省 50~80% 的同理）。"""
+    pytest.importorskip("PIL")
+    import io
+    import random
+
+    from PIL import Image, ImageFilter
+
+    rnd = random.Random(7)
+    im = Image.new("RGB", (600, 400))
+    im.putdata([(rnd.randrange(256), rnd.randrange(256), rnd.randrange(256))
+                for _ in range(600 * 400)])
+    im = im.filter(ImageFilter.GaussianBlur(1))
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    png = buf.getvalue()
+
+    jpg = news_card._to_card_jpeg(png)
+
+    assert jpg[:3] == b"\xff\xd8\xff"
+    assert len(jpg) < len(png)
+
+
+def test_to_card_jpeg_without_pillow_returns_png(monkeypatch):
+    """Pillow 不可用（宿主 venv 没装）→ 原样返回 PNG，卡片照发。"""
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **k):
+        if name == "PIL" or name.startswith("PIL."):
+            raise ImportError("no PIL")
+        return real_import(name, *a, **k)
+
+    png = _tiny_png()
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    assert news_card._to_card_jpeg(png) == png
 
 
 # ----------------------------------------------------------------------

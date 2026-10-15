@@ -1,4 +1,4 @@
-"""资讯图解（2026-09-29 用户定，参考 Muse）：没配图、内容里有数字 / 对比 / 时间线的资讯，
+"""资讯图解（2026-09-29 用户定，参考 Muse；2026-10-15 改成零件清单式，见下方「新做法」）：没配图、内容里有数字 / 对比 / 时间线的资讯，
 做一张小小的「数据图」放在网页上配图的位置。
 
 流程（app 每群后台长活 kind=viz，同群同时只跑一个）：
@@ -25,6 +25,13 @@
 到点没做完就照旧画卡发出，这张留给 `run` 用剩余名额。两条路共用 `_active` 占位 +
 `viz_per_day` 名额：同一条不会被同时做两次，名额先到先得、并发也不超额；
 正在等卡片的条目还会经 `set_reserved_getter` 告诉 `run` 避开（不抢同一条，也不记 skip）。
+
+**新做法（2026-10-15 用户定「方案 A」，参考 OpenUI 的 intelligent UI）**：子 agent 不再写 HTML，
+改交一个 JSON 规格 {"spec": {...}}，只能用 viz_spec.py 零件清单里的零件（大数字、对比条、柱状图、
+折线图、占比条、时间线、对比表、要点、结论、标签页）。程序校验规格 → 规格里每个显示出来的数字
+照旧逐个对原文（同一套规则 check_numbers）→ 用自己的渲染器画（样式全站统一，网页直接原生显示，
+不用 iframe）。**没有自由 HTML 的后门**：零件拼不出来（交 {"spec": null}）就记 skip，这条照旧纯文字。
+存法：news_viz.html 列里存 "spec:" + 规格 JSON（不加库步骤）；老的 HTML 图解照旧走 wrap + 沙箱 iframe。
 """
 
 from __future__ import annotations
@@ -63,9 +70,27 @@ CREATE INDEX IF NOT EXISTS idx_news_viz_group ON news_viz(group_id, status, crea
 
 VIZ_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": {"html": {"type": "string"}},
-    "required": ["html"],
+    "properties": {
+        "spec": {"type": ["object", "null"]},
+        "why": {"type": "string"},
+    },
+    "required": ["spec"],
 }
+
+# 新格式的行：html 列存 SPEC_PREFIX + 规格 JSON（老行是 HTML 片段，不会以它开头）
+SPEC_PREFIX = "spec:"
+
+
+def _load_spec(raw: str) -> Optional[dict]:
+    """存着的规格（再校验一遍，渲染器只吃干净的）；不是新格式 / 坏了 → None。"""
+    if not str(raw or "").startswith(SPEC_PREFIX):
+        return None
+    from . import viz_spec
+
+    try:
+        return viz_spec.validate(json.loads(raw[len(SPEC_PREFIX):]), "news")
+    except (ValueError, TypeError):
+        return None
 
 # ----------------------------------------------------------------------
 # 外壳：CSP + 报高度（唯一放行的脚本，按 sha256）
@@ -121,7 +146,9 @@ _FORBIDDEN = [
     (re.compile(r"(?i)<\s*img\b[^>]*\bsrc\s*=\s*['\"]?(?!data:)"), "图片只能内嵌（data:）"),
 ]
 
-_NUM_RE = re.compile(r"(?<![\w.])\d[\d,]*(?:\.\d+)?")
+# 前面不能紧挨英文字母 / 数字 / 下划线 / 小数点（只认 ASCII：Python 的 \w 含汉字，
+# 以前「压到85%」里的 85 取不到，好图被误判「原文里找不到」——2026-10-15 线上巡检）
+_NUM_RE = re.compile(r"(?<![0-9A-Za-z_.])\d[\d,]*(?:\.\d+)?")
 _CHECK_ATTRS = ("title", "aria-label", "alt", "value", "placeholder")
 
 
@@ -214,9 +241,15 @@ def check_html(html: str, source: str) -> tuple[bool, str]:
         parser.close()
     except Exception:
         return False, "HTML 解析不了"
+    return check_numbers(parser.parts + _css_content_strings(h), source)
+
+
+def check_numbers(parts: Iterable[str], source: str) -> tuple[bool, str]:
+    """显示出来的每段文字里的数字都要对得上原文（规则见 check_html）。"""
     base, diffs, pcts = _allowed(source)
     bad: list[str] = []
-    for part in parser.parts + _css_content_strings(h):
+    for part in parts:
+        part = str(part or "")
         for m in _NUM_RE.finditer(part):
             v = _num(m.group(0))
             if v is None:
@@ -253,8 +286,19 @@ def status_of(store: Any, item_ids: Iterable[int]) -> dict[int, str]:
     return {int(r["item_id"]): str(r["status"]) for r in rows}
 
 
-def html_for(store: Any, group_id: Any, item_id: int) -> Optional[str]:
-    """核对过的图解整页（wrap 过）；不是本群 / 没有 / 没过 → None。"""
+def kinds_of(store: Any, item_ids: Iterable[int]) -> dict[int, str]:
+    """做好了的图解是哪种：{条目: "spec"（零件清单，网页原生画）| "html"（老图解，沙箱 iframe）}。"""
+    ids = [int(i) for i in item_ids]
+    if not ids:
+        return {}
+    rows = store.read().execute(
+        f"SELECT item_id, substr(html, 1, {len(SPEC_PREFIX)}) AS head FROM news_viz"
+        f" WHERE status='ok' AND item_id IN ({','.join('?' * len(ids))})", ids
+    ).fetchall()
+    return {int(r["item_id"]): ("spec" if r["head"] == SPEC_PREFIX else "html") for r in rows}
+
+
+def _ok_row(store: Any, group_id: Any, item_id: int) -> Optional[str]:
     row = store.read().execute(
         "SELECT v.html FROM news_viz v JOIN news_items i ON i.id=v.item_id"
         " WHERE v.item_id=? AND v.group_id=? AND i.group_id=? AND v.status='ok' AND i.rejected=0",
@@ -262,7 +306,58 @@ def html_for(store: Any, group_id: Any, item_id: int) -> Optional[str]:
     ).fetchone()
     if row is None or not row["html"]:
         return None
-    return wrap(str(row["html"]))
+    return str(row["html"])
+
+
+def html_for(store: Any, group_id: Any, item_id: int) -> Optional[str]:
+    """核对过的图解整页；不是本群 / 没有 / 没过 → None。
+
+    新格式（规格）→ viz_spec.page（无脚本，样式内嵌）；老格式 → wrap（CSP + 报高度脚本）。
+    卡片截图、网页 iframe 回落都用它。"""
+    raw = _ok_row(store, group_id, item_id)
+    if raw is None:
+        return None
+    if raw.startswith(SPEC_PREFIX):
+        spec = _load_spec(raw)
+        if spec is None:
+            return None
+        from . import viz_spec
+
+        return viz_spec.page(spec, uid=f"v{int(item_id)}")
+    return wrap(raw)
+
+
+
+
+from .viz_spec import STATIC_MARK  # noqa: E402  卡片截图认这个标记（平铺版）
+
+
+def card_html_for(store: Any, group_id: Any, item_id: int) -> Optional[str]:
+    """群资讯卡片截图用的图解整页（2026-10-15 用户要：卡片里也要完整可读）。
+
+    新格式 → 平铺版（标签页摊开、不省略不滚动）；老格式 HTML → 和网页一样（wrap）。"""
+    raw = _ok_row(store, group_id, item_id)
+    if raw is None:
+        return None
+    if raw.startswith(SPEC_PREFIX):
+        spec = _load_spec(raw)
+        if spec is None:
+            return None
+        from . import viz_spec
+
+        return viz_spec.page(spec, uid=f"v{int(item_id)}", static=True)
+    return wrap(raw)
+
+
+def frag_for(store: Any, group_id: Any, item_id: int) -> Optional[str]:
+    """新格式图解的 HTML 片段（网页原生插入用）；老格式 / 没有 → None。"""
+    raw = _ok_row(store, group_id, item_id)
+    spec = _load_spec(raw or "")
+    if spec is None:
+        return None
+    from . import viz_spec
+
+    return viz_spec.render(spec, uid=f"v{int(item_id)}")
 
 
 def _set(store: Any, gid: str, iid: int, status: str, *, html: str = "", reason: str = "", now: float) -> None:
@@ -414,23 +509,22 @@ class NewsViz:
 
     @staticmethod
     def _brief(row: Any, page: str) -> str:
+        from . import viz_spec
+
         return (
-            "给群里的一条资讯做一张「图解」小图，放在资讯页配图的位置（宽约 360~640 像素，手机上也要好看）。\n\n"
+            "给群里的一条资讯做一张「图解」小图，放在资讯页配图的位置（手机上宽约 360 像素）。\n\n"
             f"资讯标题：{row['title']}\n资讯正文：{str(row['body'] or row['summary'] or '')[:800]}\n\n"
             "要求：\n"
-            "1. 只交一段 HTML 片段（可以带 <style>），不要 <html>/<head>/<body>。**不许写 <script>、不许 on 开头的事件属性**，"
-            "不许引用任何外部地址（图片、字体、样式都不行）、不许放链接。\n"
-            "2. **以一眼能看完为主**：一张图只讲一件事，挑最重要的几项数据直接摆出来，"
-            "整张高度尽量不超过 480 像素（按 516 像素宽算）；默认不做交互——群里的资讯卡片只截图解最上面一段，"
-            "藏在别的标签页、折叠里的内容在卡片上看不到。只有内容实在放不下、而且分开看更清楚时，"
-            "才用 CSS 做交互：单选框 + label 做标签页、:hover 显示数值、<details> 展开；"
-            "这时第一眼看到的那一屏（默认标签 / 没展开时）也要能单独看懂重点。\n"
-            "3. **图上的每个数字都必须原样来自下面的原文**（可以写两个原文数字的差、变化百分比），不许估算、不许编；"
-            "原文没有的数据就别画。数字写法照原文（比如 43%、$0.10）。\n"
-            "4. 颜色只用这些变量，深浅色模式会自动切换：var(--card) 卡片底、var(--ink) 主字、var(--ink-2) 次字、"
-            "var(--muted) 弱字、var(--line) 分隔线、var(--accent) 强调、var(--good) 涨/好、var(--bad) 跌/差、var(--warn)。"
-            "圆角 14~18px，留白足，中文，字号 12~18px，一眼能看懂重点；最后一行用一句话说结论。\n"
-            "5. 整段不超过 30KB。用 submit_result 交回，data 为 {\"html\": \"...\"}。\n\n"
+            "1. **一张图只讲一件事，一眼能看完**：挑最重要的几项数据摆出来，通常 1~3 个零件，最后用 takeaway 一句话说结论。"
+            "默认不用标签页——群里的资讯卡片只截第一屏；只有内容实在放不下、分开看更清楚时才用 tabs，"
+            "而且第一页要能单独看懂重点。\n"
+            "2. **图上的每个数字都必须原样来自下面的原文**（带 + / − 号的可以是原文两数之差或变化百分比），"
+            "不许估算、不许编、不许自己换算单位；原文没有的数据就别画。\n"
+            "3. 这条资讯不适合画（没有具体数字 / 对比 / 时间线，或零件拼不出来）就交 {\"spec\": null, \"why\": \"一句话\"}，"
+            "这条会照旧显示纯文字——**宁可不画，也别硬凑**。\n"
+            "4. 文字用中文，标签要短。\n\n"
+            + viz_spec.catalog_prompt("news")
+            + "\n\n用 submit_result 交回，data 为 {\"spec\": 规格或 null, \"why\": \"一句话\"}。\n\n"
             f"原文（程序刚打开的，只以这个为准）：\n{page}"
         )
 
@@ -501,7 +595,7 @@ class NewsViz:
         return made
 
     async def _make_one(self, gid: str, row: Any, now: float) -> bool:
-        """一条：打开原文 → 子 agent 写 HTML → 核对 → 落库。返回是否 ok。
+        """一条：打开原文 → 子 agent 交零件规格 → 校验 + 数字对原文 → 落库。返回是否 ok。
 
         调用方必须先用 `_claim` 占住这条，并负责 `_release`。
         """
@@ -532,17 +626,29 @@ class NewsViz:
             _set(self._store, gid, iid, "failed", reason="子 agent 出错", now=now)
             return False
         data = getattr(report, "data", None)
-        html = str(data.get("html") or "") if isinstance(data, dict) else ""
-        if not getattr(report, "ok", False) or not html.strip():
-            _set(self._store, gid, iid, "failed", reason="子 agent 没交回图", now=now)
+        if not getattr(report, "ok", False) or not isinstance(data, dict) or "spec" not in data:
+            _set(self._store, gid, iid, "failed", reason="子 agent 没交回规格", now=now)
+            return False
+        raw_spec = data.get("spec")
+        if not raw_spec:
+            # 子 agent 判断不适合画：这条照旧纯文字（没有自由 HTML 的后门）
+            _set(self._store, gid, iid, "skip", reason=("不适合画：" + str(data.get("why") or ""))[:300], now=now)
+            return False
+        from . import viz_spec
+
+        try:
+            spec = viz_spec.validate(raw_spec, "news")
+        except viz_spec.SpecError as e:
+            logger.info("图解规格不合格（群 %s 条 %s）：%s", gid, iid, e)
+            _set(self._store, gid, iid, "rejected", reason=f"规格不合格：{e}", now=now)
             return False
         source = "\n".join([str(row["title"] or ""), str(row["summary"] or ""), str(row["body"] or ""), page])
-        ok, why = check_html(html, source)
+        ok, why = check_numbers(viz_spec.texts_of(spec), source)
         if not ok:
             logger.info("图解没过核对（群 %s 条 %s）：%s", gid, iid, why)
             _set(self._store, gid, iid, "rejected", reason=why, now=now)
             return False
-        _set(self._store, gid, iid, "ok", html=html.strip(), now=now)
+        _set(self._store, gid, iid, "ok", html=SPEC_PREFIX + json.dumps(spec, ensure_ascii=False), now=now)
         logger.info("图解做好了（群 %s 条 %s）", gid, iid)
         return True
 

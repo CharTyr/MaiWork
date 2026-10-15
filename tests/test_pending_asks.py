@@ -1,6 +1,6 @@
 """问题 B：@ 的慢路径落地 pending_asks；主模型读群时发现请求（asks）。
 
-intake 侧：
+intake 侧（2026-10 起 Jev 判词在后台，测试里用 `_drain(spawned)` 抽干后台协程）：
 - Jev 明确判 none 且把握 ≥0.6 → 什么都不记（不进 pending_asks、不写事件）；
 - Jev 不可用 / 超时 / 答案无效 / 把握不够 → 写 pending_asks(handled=0)，不写 intake.slow 事件。
 
@@ -25,6 +25,7 @@ import pytest
 from fakes import FakeCtx, FakeHost, FakeModelsQueue, FakeProfiles, hook_message
 
 from CharTyr_MaiWork.maiwork import clock
+from CharTyr_MaiWork.maiwork import intake as intake_mod
 from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 from CharTyr_MaiWork.maiwork.approvals import Approvals
 from CharTyr_MaiWork.maiwork.config import load_settings
@@ -133,8 +134,9 @@ def _make_intake(store: Store | None, *, jev=None, jev_timeout_ms: int = 1200):
 
 
 async def _drain(spawned: list) -> None:
-    for coro in list(spawned):
-        await coro
+    """把钩子 spawn 出来的后台协程跑完（后台里再 spawn 出来的也跑，直到清空）。"""
+    while spawned:
+        await spawned.pop(0)
 
 
 class TestIntakeSlowPath:
@@ -151,12 +153,17 @@ class TestIntakeSlowPath:
         assert _events(store, "intake.slow") == []
 
     @pytest.mark.asyncio
-    async def test_timeout_goes_pending_asks(self, store: Store, frozen_now: float) -> None:
+    async def test_timeout_goes_pending_asks(
+        self, store: Store, frozen_now: float, monkeypatch
+    ) -> None:
+        # 钩子不等 Jev 了：这里把后台等 Jev 的外层保险调到 50ms，模拟「Jev 没答上来」
+        monkeypatch.setattr(intake_mod, "_JEV_BG_WAIT_MAX_MS", 50)
         jev = _FakeJev({"kind": ("prepare", 0.9, 0.9)}, delay_s=2.0)
         intake, signals, spawned = _make_intake(store, jev=jev, jev_timeout_ms=300)
         await intake.handle(
             hook_message(is_at=True, user_id="20002", nickname="阿柒", message_id="m-slow", text="@她 帮我整理")
         )
+        await _drain(spawned)
         rows = _pending_rows(store)
         assert len(rows) == 1
         r = rows[0]
@@ -175,31 +182,36 @@ class TestIntakeSlowPath:
     @pytest.mark.asyncio
     async def test_invalid_answer_goes_pending(self, store: Store, frozen_now: float) -> None:
         jev = _FakeJev({"kind": "not-a-tuple"})
-        intake, _, _ = _make_intake(store, jev=jev)
+        intake, _, spawned = _make_intake(store, jev=jev)
         await intake.handle(hook_message(is_at=True, message_id="m-bad", text="@她 在吗"))
+        await _drain(spawned)
         assert [r["message_id"] for r in _pending_rows(store)] == ["m-bad"]
 
     @pytest.mark.asyncio
     async def test_low_confidence_goes_pending(self, store: Store, frozen_now: float) -> None:
         jev = _FakeJev({"kind": ("prepare", 0.7, 0.4)})
-        intake, _, _ = _make_intake(store, jev=jev)
+        intake, _, spawned = _make_intake(store, jev=jev)
         await intake.handle(hook_message(is_at=True, message_id="m-low", text="@她 也许帮我看看"))
+        await _drain(spawned)
         rows = _pending_rows(store)
         assert len(rows) == 1 and "0.40" in rows[0]["reason"]
 
     @pytest.mark.asyncio
     async def test_none_low_confidence_goes_pending(self, store: Store, frozen_now: float) -> None:
         jev = _FakeJev({"kind": ("none", 0.5, 0.4)})
-        intake, _, _ = _make_intake(store, jev=jev)
+        intake, _, spawned = _make_intake(store, jev=jev)
         await intake.handle(hook_message(is_at=True, message_id="m-nlow", text="嗯嗯"))
+        await _drain(spawned)
         assert [r["message_id"] for r in _pending_rows(store)] == ["m-nlow"]
 
     @pytest.mark.asyncio
     async def test_same_message_upserts_not_duplicates(self, store: Store, frozen_now: float) -> None:
         jev = _FakeJev({"kind": ("prepare", 0.5, 0.3)})
-        intake, _, _ = _make_intake(store, jev=jev)
+        intake, _, spawned = _make_intake(store, jev=jev)
         await intake.handle(hook_message(is_at=True, message_id="m-x", text="第一次"))
+        await _drain(spawned)
         await intake.handle(hook_message(is_at=True, message_id="m-x", text="第二次"))
+        await _drain(spawned)
         rows = _pending_rows(store)
         assert len(rows) == 1
         assert rows[0]["text"] == "第二次"  # 后到的覆盖

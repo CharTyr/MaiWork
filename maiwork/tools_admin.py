@@ -56,6 +56,7 @@ CONFIRM_TOOLS = frozenset(
         "group_album_upload",
         "rss_remove",
         "skill_delete",
+        "skill_install",  # 2026-10-15：从网址装 skill（外部内容，管理员点头才下载安装）
         "mcp_delete",
         "profile_bulk_delete",
         "approve_request",  # 群友派的活要 bot 管理员批准；模型可能被群内容注入，绝不能替管理员拍板
@@ -124,6 +125,73 @@ _CHAT_CTX: ContextVar[tuple[int, int]] = ContextVar("mw_admin_chat_ctx", default
 # 但它再调确认类工具时参数对不上指纹就照样要写小票，不能把「已批准」当通行证用。
 # 模型传来的参数一律不算数（参数里写什么都不影响这里的值）。
 _APPROVED_CTX: ContextVar[tuple[str, str] | None] = ContextVar("mw_admin_approved", default=None)
+
+
+# ----------------------------------------------------------------------
+# 从网址装 skill（skill_install，2026-10-15）：只认公网 https，下载在**管理员点头之后**
+# ----------------------------------------------------------------------
+
+SKILL_FETCH_MAX = 5 * 1024 * 1024
+_GH_RE = re.compile(r"^https://github\.com/([\w.-]+)/([\w.-]+)/(?:blob|tree)/([^/]+)/(.+?)/?$")
+
+
+def skill_source_url(url: str) -> tuple[str, str]:
+    """把管理员给的网址换成真正要下载的地址：(下载地址, "zip" | "md")。不认识的抛 ValueError（中文）。
+
+    - 直接的 .zip 链接 → zip；
+    - GitHub 上某个 skill 目录 / SKILL.md 页面 → raw.githubusercontent.com 的 SKILL.md（只装这一份文件；
+      带脚本 / 附件的 skill 请管理员下载 zip 后在网页「设置 → 扩展」上传）；
+    - 直接的 …/SKILL.md 原文链接 → md。"""
+    u = str(url or "").strip()
+    if not u.lower().startswith("https://") or any(c in u for c in " \n\r\t\"'<>"):
+        raise ValueError("只认 https 开头的网址")
+    m = _GH_RE.match(u)
+    if m:
+        owner, repo, branch, path = m.groups()
+        if not path.endswith("SKILL.md"):
+            path = path.rstrip("/") + "/SKILL.md"
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}", "md"
+    low = u.lower().split("?", 1)[0]
+    if low.endswith(".zip"):
+        return u, "zip"
+    if low.endswith("/skill.md"):
+        return u, "md"
+    raise ValueError(
+        "这个网址认不出是 skill：给 GitHub 上 skill 目录或 SKILL.md 的链接，或一个 .zip 下载链接"
+        "（skills.sh 的页面请点进它的 GitHub 源仓库再给链接）"
+    )
+
+
+async def fetch_public(url: str, max_bytes: int = SKILL_FETCH_MAX) -> bytes:
+    """下载一个公网 https 地址（防 SSRF：每一跳都查不是内网 / 本机；最多跟 3 次跳转；有大小上限）。"""
+    from urllib.parse import urljoin, urlsplit
+
+    import aiohttp
+
+    from .tools_builtin import _default_resolver, _host_is_forbidden
+
+    cur = url
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for _ in range(4):
+            parts = urlsplit(cur)
+            if parts.scheme != "https" or not parts.hostname:
+                raise ValueError("只认 https 网址")
+            if await asyncio.to_thread(_host_is_forbidden, parts.hostname, _default_resolver):
+                raise ValueError("这个地址指向内网或本机，不下载")
+            async with session.get(cur, allow_redirects=False) as resp:
+                if resp.status in (301, 302, 303, 307, 308):
+                    cur = urljoin(cur, resp.headers.get("Location", ""))
+                    continue
+                if resp.status != 200:
+                    raise ValueError(f"下载失败（HTTP {resp.status}）")
+                buf = bytearray()
+                async for chunk in resp.content.iter_chunked(65536):
+                    buf.extend(chunk)
+                    if len(buf) > max_bytes:
+                        raise ValueError(f"文件太大（超过 {max_bytes // 1024 // 1024}MB）")
+                return bytes(buf)
+    raise ValueError("跳转太多次，不下载")
 
 
 def _norm_args(args: Any) -> dict:
@@ -1601,6 +1669,164 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             return _bad(f"删 skill 失败：{e}")
         return _ok(f"已删掉 skill「{name}」")
 
+    async def skill_install(ctx: ToolContext, args: dict) -> ToolResult:
+        url = str(args.get("url") or "").strip()
+        replace = bool(args.get("replace"))
+        try:
+            src, kind = skill_source_url(url)
+        except ValueError as e:
+            return _bad(str(e))
+        settings = _settings()
+        data_dir = getattr(settings, "data_dir", None) or getattr(svc, "data_dir", None)
+        if data_dir is None or getattr(svc, "store", None) is None:
+            return _bad("skill 目录没就位，这次装不了")
+        pending = _need_confirm(
+            "skill_install", args,
+            f"从 {url} 下载并安装一个 skill" + ("（同名的会被覆盖）" if replace else "")
+            + "；外部内容，装之前最好先在网页上看一眼它写了什么",
+        )
+        if pending is not None:
+            return pending
+        try:
+            blob = await fetch_public(src)
+        except ValueError as e:
+            return _bad(str(e))
+        except Exception as e:
+            return _bad(f"下载失败：{e}")
+        from . import skills_web
+
+        if kind == "md":
+            import io
+            import zipfile
+
+            from .skills import parse_front_matter
+
+            try:
+                text = blob.decode("utf-8")
+                name = str((parse_front_matter(text) or {}).get("name") or "").strip()
+            except Exception:
+                name = ""
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", name or ""):
+                return _bad("下载到的不是合格的 SKILL.md（开头要有 name: 小写字母数字和连字符）")
+            mem = io.BytesIO()
+            with zipfile.ZipFile(mem, "w") as zf:
+                zf.writestr(f"{name}/SKILL.md", text)
+            blob = mem.getvalue()
+        try:
+            # 同网页上传一样在本线程装（store 不能跨线程用；包有大小上限，很快）
+            view = skills_web.install_zip(svc.store, data_dir, blob, filename=url.rsplit("/", 1)[-1], replace=replace)
+        except FileExistsError as e:
+            return _bad(f"{e}（要覆盖就带 replace=true 再来一次）")
+        except ValueError as e:
+            return _bad(f"装不上：{e}")
+        name = str((view or {}).get("name") or "") if isinstance(view, dict) else ""
+        return _ok(f"已安装 skill「{name or '（见扩展页）'}」；网页「设置 → 扩展」里能看到、能停用", data=view)
+
+    async def env_overview(ctx: ToolContext, args: dict) -> ToolResult:
+        """现在这套 MaiWork 能做到什么（模型 / 搜索 / 干活环境 / 交付 / skill / MCP），缺的怎么补。"""
+        lines: list[str] = ["任务做不做得成，主要看两件事：模型能力，和下面这些环境能力。"]
+        mark = {"ok": "✅", "warn": "⚠️", "wait": "⏳", "off": "⛔"}
+        data: dict[str, Any] = {"items": []}
+        try:
+            from . import onboarding
+
+            for it in onboarding.items(svc):
+                data["items"].append(it)
+                lines.append(f"{mark.get(str(it.get('state')), '•')} {it.get('title')}：{it.get('text')}")
+        except Exception:
+            logger.exception("env_overview 读能力清单出错")
+            lines.append("（能力清单这次读不出来）")
+        env = getattr(_settings(), "environments", None)
+        try:
+            from .environments import vm_platforms as _vmp
+
+            _on = _vmp.enabled_kinds(_settings())
+        except Exception:
+            _on = ()
+        if env is not None:
+            if _on:
+                names = "、".join(
+                    (_vmp.get(k).label if _vmp.get(k) else k)
+                    + ("（还没填密钥）" if _vmp.get(k) and not _vmp.get(k).has_key(_settings()) else "")
+                    for k in _on
+                )
+                tail = "；排第一的优先用，拿不到自动换另一家" if len(_on) > 1 else ""
+                lines.append(f"• 一次性云端机器：开着 {names}{tail}")
+            else:
+                lines.append("• 一次性云端机器：都没开")
+        # 可选依赖（办公文档三库；2026-10-15 用户定：可选安装，不进必装依赖）：
+        # 装了说装了，没装指路网页一键装（只读上次探测结果，不在这里现探测）
+        try:
+            deps = getattr(svc, "optional_deps", None)
+            if deps is not None:
+                view = deps.status()
+                rows = []
+                for g in view.get("groups") or []:
+                    have = [
+                        f"{p.get('name')} {p.get('version') or ''}".strip()
+                        for p in (g.get("packages") or []) if p.get("installed")
+                    ]
+                    rows.append({"id": g.get("id"), "state": g.get("state"), "installed": have})
+                    state = str(g.get("state") or "")
+                    last = g.get("last_install") or {}
+                    why = (
+                        f"；上次装失败：{last.get('error')}"
+                        if str(last.get("state")) == "failed" and last.get("error") else ""
+                    )
+                    if state == "ok":
+                        soffice = (g.get("tools") or [{}])[0]
+                        lines.append(
+                            f"• {g.get('label')}：已装（{'、'.join(have)}）；"
+                            + (
+                                "LibreOffice 有（能转 PDF、重算公式）"
+                                if soffice.get("found") else "LibreOffice 没有（转 PDF / 重算 Excel 公式做不了）"
+                            )
+                        )
+                    elif state in ("installing", "uninstalling"):
+                        lines.append(f"• {g.get('label')}：正在装 / 卸，等它跑完")
+                    elif state == "partial":
+                        lines.append(
+                            f"• {g.get('label')}：只装了一部分（{'、'.join(have)}）；"
+                            "去网页「设置 → 工具」重装一次"
+                        )
+                    elif state == "unknown":
+                        lines.append(f"• {g.get('label')}：还没查过（打开网页「设置 → 工具」会自动查一次）")
+                    else:
+                        lines.append(
+                            f"• {g.get('label')}：还没装（可选）——要交 Word / Excel / PPT 就让管理员在网页"
+                            f"「设置 → 工具」一键装（装到 MaiWork 自己的目录，不动 MaiBot 的环境）；"
+                            f"不装也能干活，改交 Markdown / CSV / HTML{why}"
+                        )
+                if rows:
+                    data["optional_deps"] = rows
+        except Exception:
+            logger.exception("env_overview 读可选依赖出错")
+        skills = _skills()
+        if skills is not None:
+            try:
+                rows = skills.list()
+                builtin = [r for r in rows if r.get("builtin")]
+                custom = [r for r in rows if not r.get("builtin")]
+                data["skills"] = [r.get("name") for r in rows]
+                lines.append(
+                    f"• skill：自带 {len(builtin)} 个（{'、'.join(str(r.get('name')) for r in builtin)}）"
+                    + (f"，另装了 {len(custom)} 个" if custom else "")
+                )
+            except Exception:
+                pass
+        exts = getattr(svc, "extensions", None)
+        if exts is not None:
+            try:
+                info = list(exts.info())
+                lines.append(f"• MCP 连接：{len(info)} 个，开着的 {sum(1 for i in info if i.get('enabled'))} 个")
+            except Exception:
+                pass
+        lines.append(
+            "怎么补：开关、数量这类设置可以直接让我改（set_rules）；装 skill 用 skill_install；"
+            "**密钥一律请管理员自己在网页上填**（设置 → 模型 / 工具 / 执行环境），别在对话里发密钥。"
+        )
+        return _ok("\n".join(lines), data=data)
+
     async def mcp_toggle(ctx: ToolContext, args: dict) -> ToolResult:
         name = str(args.get("name") or "").strip()
         if not name:
@@ -2369,6 +2595,36 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                 },
             },
             skill_delete,
+        ),
+        (
+            {
+                "name": "skill_install",
+                "description": (
+                    "从网址安装一个 skill（要管理员确认；确认后才下载）。认 GitHub 上 skill 目录 / SKILL.md 的链接"
+                    "（只装 SKILL.md 这一份），或一个 .zip 下载链接（整包）。只装管理员点名要的，不自己挑来装。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "https 网址"},
+                        "replace": {"type": "boolean", "description": "已有同名 skill 时覆盖（默认否）"},
+                    },
+                    "required": ["url"],
+                },
+            },
+            skill_install,
+        ),
+        (
+            {
+                "name": "env_overview",
+                "description": (
+                    "看现在这套 MaiWork 能做到什么：模型、联网搜索、干活环境（本机 / 一次性云端机器）、交付、"
+                    "skill、MCP，各自能用 / 受限 / 没开，以及缺的怎么补。管理员问「能不能做 XX」「环境配好没」"
+                    "或要帮他配置环境时先看这个。"
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            },
+            env_overview,
         ),
         (
             {

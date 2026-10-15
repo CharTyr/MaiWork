@@ -1787,7 +1787,11 @@ class Models:
     def _entries_to_candidates(
         self, entry_ids: Any, endpoints: tuple, model_list: tuple
     ) -> list[_Candidate]:
-        """按模型库条目 id 列表解析候选（条目没了 / 端点缺地址密钥的跳过）。"""
+        """按模型库条目 id 列表解析候选（条目没了 / 端点缺地址密钥的跳过）。
+
+        2026-10-15 生图第一期：use="image" 的条目**不是聊天模型**，这里直接跳过——
+        聊天 / 干活 / 判断的候选链都从这一处走，挡住一处就全挡住（手改配置也绕不过）。
+        """
         by_id = {str(getattr(m, "id", "") or ""): m for m in model_list}
         ep_by_id = {str(getattr(e, "id", "") or ""): e for e in endpoints}
         out: list[_Candidate] = []
@@ -1797,6 +1801,8 @@ class Models:
                 continue
             entry = by_id.get(entry_id)
             if entry is None:
+                continue
+            if str(getattr(entry, "use", "chat") or "chat").strip().lower() == "image":
                 continue
             ep = ep_by_id.get(str(getattr(entry, "endpoint", "") or ""))
             if ep is None:

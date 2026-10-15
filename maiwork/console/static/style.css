@@ -896,7 +896,8 @@ body.booting .app, body.booting .tabbar { visibility: hidden; }
 /* 资讯：两栏切换、标签、被筛掉的 */
 .seg { display: inline-flex; margin: 18px 0 -10px; padding: 4px; border-radius: 999px; background: var(--fill); }
 .seg button { height: 34px; padding: 0 18px; border-radius: 999px; font-size: 15px; font-weight: 700; color: var(--gray); transition: background 0.2s, color 0.2s; }
-.seg button[aria-selected="true"] { background: var(--card); color: var(--ink); box-shadow: 0 2px 8px rgba(var(--sh), 0.08); }
+.seg button[aria-selected="true"], .seg button[aria-pressed="true"] { background: var(--card); color: var(--ink); box-shadow: 0 2px 8px rgba(var(--sh), 0.08); }
+.seg.mdl-seg { display: flex; width: fit-content; margin: 2px 0 8px; }
 .ntags { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 6px; }
 .ntag { display: inline-flex; align-items: center; padding: 1px 9px; border-radius: 999px; background: var(--fill); font-size: 12px; font-weight: 600; color: var(--ink-2); }
 .ntag.warn { background: var(--warn-bg); color: var(--warn-ink); }
@@ -943,6 +944,8 @@ body.booting .app, body.booting .tabbar { visibility: hidden; }
 .ntag.ok { background: var(--ok-bg); color: var(--ok-ink); }
 /* 资讯图解：沙箱 iframe，高度由里面报上来 */
 .n-viz { display: block; width: 100%; height: 220px; margin-top: 14px; border: 0; border-radius: 18px; background: transparent; color-scheme: light dark; transition: height 0.25s var(--ease-out); }
+.n-vs { margin-top: 14px; }
+.n-vs:empty { min-height: 120px; border-radius: 18px; background: var(--fill-2); }
 .ratebtn { display: inline-flex; align-items: center; gap: 5px; height: 34px; padding: 0 12px 0 10px; border-radius: 17px; background: var(--fill-2); color: var(--gray); transition: transform 0.18s var(--ease-out), background 0.2s, color 0.2s; }
 .ratebtn svg { width: 15px; height: 15px; }
 .ratebtn i { font-style: normal; font-size: 13px; font-weight: 600; }
@@ -1407,6 +1410,7 @@ body.onb-lock { overflow: hidden; }
 .onb-pane.leaving { pointer-events: none; }
 .onb-title { margin: 6px 0 8px; font-size: 30px; line-height: 1.2; letter-spacing: -0.02em; }
 .onb-lead { margin: 0 0 16px; color: var(--ink-2); font-size: 16px; }
+.onb-note { margin: 14px 0 0; padding: 12px 14px; border-radius: 14px; background: var(--alt-bg); color: var(--ink-2); font-size: 14px; line-height: 1.5; }
 .onb-step-ico .ico { width: 40px; height: 40px; }
 .onb-hero { position: relative; width: 88px; height: 88px; margin: 6px 0 12px; }
 .onb-avatar { width: 88px; height: 88px; border-radius: 26px; object-fit: cover; box-shadow: 0 10px 30px rgba(var(--sh), 0.18); }
@@ -1760,3 +1764,6 @@ a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 .ho-acts .btn svg { width: 16px; height: 16px; }
 .ho-err { margin-top: 22px; display: grid; gap: 8px; color: var(--ink-2); font-size: 15px; line-height: 1.6; }
 .ho-err b { color: var(--ink); font-size: 17px; }
+
+/* 设置 · 工具 · 可选组件（optdeps.js）/ 概况 · 需要处理（attention.js） */
+.od-miss { color: var(--orange); }

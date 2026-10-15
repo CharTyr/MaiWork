@@ -574,3 +574,13 @@ async def test_worker_brief_says_deliverable_is_for_group(
     assert "job 编号" in AUDIENCE_NOTE
     assert "research.md" in AUDIENCE_NOTE
     assert "主模型" in AUDIENCE_NOTE
+
+
+async def test_view_brief_points_content_pages_to_render_report(
+    mem_store, settings, env, tools, tasks, goals
+):
+    """2026-10-15 交付 intelligent UI：内容型网页统一走 render_report，互动类才手写。"""
+    coordinator = _coordinator(mem_store, settings, env, tools, tasks, goals, replies=[])
+    brief = coordinator._enrich_brief("调研三款笔记软件做成网页", "T-12", "view")
+    assert "render_report" in brief and "小游戏" in brief
+    assert "render_report" not in coordinator._enrich_brief("做个表格", "T-12", "file")

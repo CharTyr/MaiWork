@@ -59,7 +59,12 @@ _MINIMAL_ENV = {
 
 @dataclass
 class Box:
-    """一台拿到手的一次性 VM（一把 key = 一台）。"""
+    """一台拿到手的一次性 VM（一把 key = 一台）。
+
+    kind / remote_root 是 2026-10-15 为「第二个一次性 VM 平台」加的：
+    coordinator 按 `box.kind` 查表分派，`vm_*` 工具按 `box.remote_root` 拼远端路径。
+    默认值就是 railway 自己的行为（/app），现有调用与测试不受影响。
+    """
 
     job_id: str
     key_path: Path
@@ -67,6 +72,8 @@ class Box:
     preview_url: str = ""   # 认领前只有创建它的 IP 能开；绝不打印/外传
     claim_url: str = ""     # human_claim_url；我们永不自动认领（要账号）
     key_dir: Path | None = None  # data_dir/railway/<job_id>/（release 整个删）
+    kind: str = "railway"
+    remote_root: str = "/app"
 
 
 class RailwayEnv:

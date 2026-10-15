@@ -198,3 +198,100 @@ def test_agents_default_template_explains_machines() -> None:
     from CharTyr_MaiWork.maiwork.identity import _AGENTS_DEFAULT
 
     assert "专用机器" in _AGENTS_DEFAULT
+
+
+# ---------------------------------------------------------------------------
+# 第二家一次性 VM（Freestyle，2026-10-15）：三值环境名 + 按 box.kind 分派
+# ---------------------------------------------------------------------------
+
+
+class _FreeBox:
+    kind = "freestyle"
+    expires_ts = 0
+    remote_root = "/root/maiwork"
+    snapshot = "freestyle/ubuntu-sm"
+
+
+def _coord_freestyle(*, ssh_on: bool = True, free_on: bool = True):
+    """一次性 VM 那一家是 freestyle（不是 railway）：railway 环境对象根本不存在。"""
+    c = Coordinator.__new__(Coordinator)
+    c._capability = _Dec(True)
+    c._get_settings = lambda: types.SimpleNamespace(environments=types.SimpleNamespace(
+        railway=True, vm_platform="freestyle", freestyle_api_key="fs-test-key",
+        run_as="maiwork", memory_max="512M"))
+    released: list = []
+
+    class _Ssh:
+        def available(self):
+            return ssh_on
+
+        def machines(self):
+            return [{"name": "甲", "host": "u@10.0.0.1"}]
+
+        async def acquire(self, tid):
+            return None
+
+        def last_fail(self):
+            return {"reason": "甲：连不上"}
+
+        async def release(self, box):
+            released.append(("ssh", box))
+
+    class _Free:
+        async def acquire(self, tid):
+            return _FreeBox()
+
+        def last_fail(self):
+            return {"reason": "今天的 Freestyle 机器用量到顶了"}
+
+        async def release(self, box):
+            released.append(("freestyle", box))
+
+    c._ssh = _Ssh() if ssh_on else None
+    c._railway = None
+    c._vms = {"freestyle": _Free()} if free_on else {}
+
+    class _Tasks:
+        def set_env(self, tid, desc, note=""):
+            pass
+
+    c._tasks = _Tasks()
+    return c, released
+
+
+def test_env_options_list_freestyle_when_selected() -> None:
+    c, _ = _coord_freestyle(ssh_on=True)
+    field, guide, allowed = c._env_options()
+    assert '"local|ssh|freestyle"' in field
+    assert allowed == {"local", "ssh", "freestyle"}
+    assert "Freestyle" in guide and "railway" not in guide
+
+
+def test_normalize_env_choice_switches_railway_to_freestyle() -> None:
+    """只有 freestyle 就位时，计划里写 railway → 换成 freestyle（同一类机器）。"""
+    c, _ = _coord_freestyle(ssh_on=True)
+    assert c._normalize_env_choice("railway") == "freestyle"
+    assert c._normalize_env_choice("freestyle") == "freestyle"
+    assert c._normalize_env_choice("ssh") == "ssh"
+    c2, _ = _coord_freestyle(ssh_on=False)
+    assert c2._normalize_env_choice("ssh") == "freestyle"  # 要专用机器没有 → 给一次性 VM
+
+
+def test_freestyle_box_desc_and_release_dispatch() -> None:
+    c, released = _coord_freestyle()
+    desc = c._remote_env_desc(_FreeBox())
+    assert "Freestyle" in desc and "2 核 4G" in desc and "railway" not in desc
+    _run(c._release_remote(_FreeBox()))
+    assert [k for k, _ in released] == ["freestyle"]
+
+
+def test_freestyle_box_gets_vm_tools_not_machine_tools() -> None:
+    tools = Coordinator._remote_job_tools(["run_command", "read_file"], _FreeBox())
+    assert "vm_run" in tools and "vm_fetch_file" in tools
+    assert "machine_run" not in tools and "run_command" not in tools
+
+
+def test_setup_exec_env_uses_freestyle() -> None:
+    c, released = _coord_freestyle()
+    on, box = _run(c._setup_exec_env("t1", {"env": "freestyle"}, "1"))
+    assert on is True and box.kind == "freestyle"

@@ -320,8 +320,12 @@ def _make_intake(*, jev, approvals, mentions):
 
 
 async def _drain(spawned: list) -> None:
-    for coro in list(spawned):
-        await coro
+    """把钩子 spawn 出来的后台协程跑完（后台里再 spawn 出来的也跑，直到清空）。
+
+    2026-10 起 Jev 判词在后台：钩子只登记 `_judge_at`，判完才建待批 / 写备忘。
+    """
+    while spawned:
+        await spawned.pop(0)
 
 
 @pytest.mark.asyncio

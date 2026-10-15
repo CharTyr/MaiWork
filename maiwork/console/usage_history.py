@@ -157,6 +157,13 @@ def history_view(svc: Any, *, days: Any = None, date: Any = None) -> dict[str, A
     # 顶层 jev 统一是整数（范围内的 Jev 次数），明细汇总放 jev_stats
     out["jev"] = jev_stats["calls"]
     out["jev_stats"] = jev_stats
+    # 生图用量（2026-10-15 任务 A5）：生图不计入 token 口径，单独一小节（今天 / 近 7 天 /
+    # 累计 / 最近一次失败原因）。字段见 console/views.imagegen_usage 的说明。
+    try:
+        out["imagegen"] = views.imagegen_usage(svc)
+    except Exception:
+        logger.exception("拼生图用量失败，这一小节留空")
+        out["imagegen"] = None
     return out
 
 

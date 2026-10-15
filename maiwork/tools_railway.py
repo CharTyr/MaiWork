@@ -1,23 +1,26 @@
-"""railway.new 一次性 VM 上的子 agent 工具（worker 角色，docs/07-代码接口.md §11.1b）。
+"""一次性 VM 上的子 agent 工具（worker 角色，docs/07-代码接口.md §11.1b / §11.1d）。
 
-这些工具在「资讯实测」和「派活选了 railway」两种流程里用，拿到一次性 VM 之后才
-有意义；box 通过闭包 `get_box()` 现读（box 变了/没了时不必重新注册）：
+这些工具在「资讯实测」和「派活选了一次性 VM」两种流程里用，拿到机器之后才有
+意义；box 通过闭包 `get_box()` 现读（box 变了/没了时不必重新注册）。
+平台（railway / Freestyle）只影响两件事：**远端根目录**（`box.remote_root`，
+railway 是 /app、Freestyle 是 /root/maiwork）和**单条命令的时长上限**
+（`env.max_run_timeout_s`）——工具名字与参数两边完全一样，不再写死平台名。
 
-- vm_run：在 VM 里跑一条命令（远端退出码原样回传；timeout_s 上限 600 秒）。
-- vm_put_file：把**当前工作区里的一个文件**传到 VM 的 /app/ 下
+- vm_run：在 VM 里跑一条命令（远端退出码原样回传；timeout_s 按平台上限夹）。
+- vm_put_file：把**当前工作区里的一个文件**传到 VM 的远端根下
   （红线：绝不把工作区以外的任何本地文件/数据传上去——唯一的数据来源是
   子 agent 自己在工作区里写的测试脚本）。
-- vm_read_file：读 VM 上 /app 下的一个文件（截 20000 字回给模型）。
+- vm_read_file：读 VM 上远端根下的一个文件（截 20000 字回给模型）。
 - vm_fetch_file（给了 local_env 才注册，派活用）：把 VM 上的文件拷回本机工作区
   artifacts/<task_id>/ 下——成品必须拿回本机工作区才能交付。
 
 安全要点（和 tools_exec 一套思路）：
 - 没 box（拿不到机器 / 已 release）一律中文失败，不让模型瞎试。
 - 传文件只收工作区内相对路径：绝对路径、..、符号链接逃出去一律拒。
-- 远端文件名白名单（字母数字 ._-），远端路径固定在 /app/ 下，不许到别处写。
-- vm_fetch_file 只收 /app/ 下的远端文件、单个 ≤20MB；落到 artifacts/<task_id>/<文件名>，
+- 远端文件名白名单（字母数字 ._-），远端路径固定在远端根下，不许到别处写。
+- vm_fetch_file 只收远端根下的远端文件、单个 ≤20MB；落到 artifacts/<task_id>/<文件名>，
   目标路径过 LocalEnv.resolve 校验（越界一律拒）；落点文件名同样走白名单（不含路径符）。
-- 到期护栏：build_expires_at 距现在 <10 分钟时，每个工具结果后面附「机器快到期了，
+- 到期护栏：机器剩余存活时间 <10 分钟时，每个工具结果后面附「机器快到期了，
   赶紧把成品拿回来」；已经到点（剩余 ≤0）的工具一律失败，让模型收手。
 - 注册幂等：同一份 Tools 上重复 register 不炸（app 重启/测试重复搭）；逐个工具判，
   已注册过的跳过、只补缺的（先注册 vm_*、后来补 vm_fetch_file 不冲突）。
@@ -36,13 +39,34 @@ from .tools import Tool, ToolContext, ToolResult, Tools
 
 logger = logging.getLogger("maiwork.tools_railway")
 
-_VM_RUN_TIMEOUT_MAX = 600     # vm_run 的 timeout_s 上限（秒）
+_VM_RUN_TIMEOUT_MAX = 600     # vm_run 的 timeout_s 上限（秒）；平台自己的上限可能更低
 _VM_RUN_TIMEOUT_DEFAULT = 120
 _VM_READ_MAX = 20000          # vm_read_file 回给模型最多多少字
 _VM_FETCH_MAX_BYTES = 20 * 1024 * 1024  # vm_fetch_file 单文件上限 20MB
 _EXPIRE_WARN_S = 600          # 剩 <10 分钟，就在每个工具结果后附「快到期」提醒
+_DEFAULT_REMOTE_ROOT = "/app"  # box 没带 remote_root 时的兜底（老调用 / 假 box）
 _REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _LOCAL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")  # 拷回本机用的文件名（不含路径符）
+
+
+def _remote_root(box: Any) -> str:
+    """这台机器的远端根目录：box.remote_root（railway 是 /app、Freestyle 是 /root/maiwork）。
+
+    没带这个属性的假 box / 老调用按 /app 处理（行为和 2026-10 之前一样）。
+    """
+    root = str(getattr(box, "remote_root", "") or "").strip() or _DEFAULT_REMOTE_ROOT
+    return root.rstrip("/") or "/"
+
+
+def _run_timeout_limit(env: Any) -> int:
+    """这台机器单条命令的实际上限（秒）：平台自报优先，没有就按 vm_run 的老上限 600。"""
+    try:
+        limit = int(getattr(env, "max_run_timeout_s", 0) or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0:
+        return _VM_RUN_TIMEOUT_MAX
+    return max(1, min(limit, _VM_RUN_TIMEOUT_MAX))
 
 
 def register_vm_tools(
@@ -56,11 +80,12 @@ def register_vm_tools(
     """把 vm 工具注册进 tools（逐个幂等：已注册过同名的跳过，缺的补上）。
 
     - get_box() -> Box | None：实测流程现读当前 box（拿不到机器时是 None）。
-    - env：RailwayEnv（或仿它的假对象，async run/put/get）。
+    - env：一次性 VM 环境（RailwayEnv / FreestyleEnv，或仿它们的假对象，async run/put/get）。
     - tmp_dir：vm_read_file 取回文件的临时落点；None 用系统临时目录。
     - local_env：本机 LocalEnv，给 vm_fetch_file 用；没给就不注册 vm_fetch_file
       ——资讯实测那一挂不需要把成品拷回本机工作区。
     """
+    run_limit = _run_timeout_limit(env)
 
     def _registered(name: str) -> bool:
         existing = {s["function"]["name"] for s in tools.specs("worker")}
@@ -98,7 +123,7 @@ def register_vm_tools(
     def _expired_result(remaining: float) -> ToolResult:
         return ToolResult(
             ok=False, output="",
-            error="这台一次性机器到点了（已经过了 60 分钟构建窗口，不能再用）："
+            error="这台一次性机器到点了（已经过了它的存活窗口，不能再用）："
                   "别再往上放活了。已经在本机工作区的成品不受影响。",
         )
 
@@ -135,7 +160,9 @@ def register_vm_tools(
             timeout_s = int(args.get("timeout_s") or _VM_RUN_TIMEOUT_DEFAULT)
         except (TypeError, ValueError):
             timeout_s = _VM_RUN_TIMEOUT_DEFAULT
-        timeout_s = max(1, min(timeout_s, _VM_RUN_TIMEOUT_MAX))  # 上限写死，模型说了不算
+        # 上限写死，模型说了不算；两家同开时按这台机器那家现取（Freestyle 280、railway 600）
+        limit_now = _run_timeout_limit(env)
+        timeout_s = max(1, min(timeout_s, limit_now))
         try:
             result = await env.run(box, command, timeout_s=timeout_s)
         except Exception as e:
@@ -143,7 +170,7 @@ def register_vm_tools(
         head = f"退出码 {result.exit_code}"
         if result.timed_out:
             head += " · 超时被掐断（远端进程可能还在跑，可用 .exit 文件轮询）"
-        head += f" · 耗时 {result.ms / 1000:.1f} 秒"
+        head += f" · 耗时 {result.ms / 1000:.1f} 秒 · 本平台单条命令最多 {limit_now} 秒"
         parts = [head, "--- 输出（stdout） ---"]
         parts.append(result.stdout or "（空）")
         if result.stderr:
@@ -208,7 +235,7 @@ def register_vm_tools(
                 ok=False, output="",
                 error=f"remote_name 不合法：{remote_name!r}（只能用字母、数字、点、下划线、横线，字母或数字开头，1~64 个字符）",
             )
-        remote = f"/app/{remote_name}"
+        remote = f"{_remote_root(box)}/{remote_name}"
         try:
             await env.put(box, local, remote)
         except Exception as e:
@@ -229,8 +256,12 @@ def register_vm_tools(
         if state == "expired":
             return _expired_result(remaining)
         remote = str(args.get("path") or "").strip()
-        if not remote.startswith("/app/"):
-            return ToolResult(ok=False, output="", error="只能读 VM 上 /app/ 下的文件（实测的产出都在那里）")
+        root = _remote_root(box)
+        if not remote.startswith(f"{root}/"):
+            return ToolResult(
+                ok=False, output="",
+                error=f"只能读 VM 上 {root}/ 下的文件（实测的产出都在那里）",
+            )
         base = tmp_dir or Path(tempfile.gettempdir())
         base.mkdir(parents=True, exist_ok=True)
         local = base / f"maiwork-vmread-{id(box):x}-{Path(remote).name[:32]}"
@@ -265,10 +296,11 @@ def register_vm_tools(
         state, remaining = _expiry_state(box)
         if state == "expired":
             return _expired_result(remaining)
-        # 远端只收 /app/ 下的文件（成品都在那里）
+        # 远端只收远端根下的文件（成品都在那里）
         remote = str(args.get("remote_path") or "").strip()
-        if not remote.startswith("/app/"):
-            return ToolResult(ok=False, output="", error="只能从 VM 的 /app/ 下拷回文件")
+        root = _remote_root(box)
+        if not remote.startswith(f"{root}/"):
+            return ToolResult(ok=False, output="", error=f"只能从 VM 的 {root}/ 下拷回文件")
         # 落点文件名：白名单（不含路径符），拒 .. / 子目录
         name = str(args.get("local_name") or "").strip() or Path(remote).name
         if not _LOCAL_NAME_RE.match(name):
@@ -318,20 +350,21 @@ def register_vm_tools(
             Tool(
                 name="vm_run",
                 description=(
-                    "在一次性 VM（railway.new）里跑一条命令：用来装依赖、跑示例、看输出。"
-                    "远端退出码原样回传。只读/无副作用的验证优先；timeout_s 最多 600 秒。"
+                    "在一次性 VM 里跑一条命令：用来装依赖、跑示例、看输出。远端退出码原样回传。"
+                    "只读/无副作用的验证优先；timeout_s 由平台上限夹住（本平台最多 "
+                    f"{run_limit} 秒，超了就按上限算），更久的活请用 setsid -f + .exit 文件轮询。"
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
                         "command": {"type": "string", "description": "要在 VM 里跑的命令（bash）"},
-                        "timeout_s": {"type": "integer", "description": "这条命令最多跑多少秒（上限 600）"},
+                        "timeout_s": {"type": "integer", "description": f"这条命令最多跑多少秒（本平台上限 {run_limit}）"},
                     },
                     "required": ["command"],
                 },
                 roles=frozenset({"worker"}),
                 handler=vm_run,
-                timeout_s=float(_VM_RUN_TIMEOUT_MAX) + 60.0,  # 工具层兜底 > 内部 run 的上限
+                timeout_s=float(run_limit) + 60.0,  # 工具层兜底 > 内部 run 的上限
             )
         )
     if not _registered("vm_put_file"):
@@ -339,14 +372,14 @@ def register_vm_tools(
             Tool(
                 name="vm_put_file",
                 description=(
-                    "把当前工作区里的一个文件（比如你自己写的测试脚本）传到 VM 的 /app/ 下。"
+                    "把当前工作区里的一个文件（比如你自己写的测试脚本）传到 VM 的工作目录下。"
                     "只能传工作区里的文件；remote_name 不给就用原文件名。"
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "工作区内的相对路径"},
-                        "remote_name": {"type": "string", "description": "在 VM /app/ 下叫什么名字（可选）"},
+                        "remote_name": {"type": "string", "description": "在 VM 工作目录下叫什么名字（可选）"},
                     },
                     "required": ["path"],
                 },
@@ -359,11 +392,11 @@ def register_vm_tools(
         tools.register(
             Tool(
                 name="vm_read_file",
-                description="读 VM 上 /app/ 下的一个文件（内容截 20000 字）。",
+                description="读 VM 工作目录下的一个文件（内容截 20000 字）。",
                 parameters={
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "VM 上的绝对路径，必须 /app/ 开头"},
+                        "path": {"type": "string", "description": "VM 上的绝对路径，必须在这个任务的工作目录下"},
                     },
                     "required": ["path"],
                 },
@@ -377,14 +410,14 @@ def register_vm_tools(
             Tool(
                 name="vm_fetch_file",
                 description=(
-                    "把 VM 上 /app/ 下的一个文件拷回本机工作区 artifacts/<任务ID>/ 下。"
+                    "把 VM 工作目录下的一个文件拷回本机工作区 artifacts/<任务ID>/ 下。"
                     "做好的成品最后一定要用本工具拷回本机工作区——成品只留在 VM 上是没法交付的"
                     "（单文件 ≤20MB；local_name 不给就用远端文件名）。"
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
-                        "remote_path": {"type": "string", "description": "VM 上的绝对路径，必须 /app/ 开头"},
+                        "remote_path": {"type": "string", "description": "VM 上的绝对路径，必须在这个任务的工作目录下"},
                         "local_name": {"type": "string", "description": "拷回本机工作区 artifacts/<任务ID>/ 下叫什么名字（可选）"},
                     },
                     "required": ["remote_path"],

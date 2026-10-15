@@ -823,6 +823,27 @@ async def test_image_kind_sends_png_and_rejects_bad_payload_without_retry(tmp_pa
     assert "PNG" in row["error"] and len(host.images) == 1
 
 
+async def test_image_kind_accepts_jpeg_by_content(tmp_path):
+    """2026-10-15 起卡片图改 JPEG（quality 85，小 50~80%）：严格闸按内容放行 JPEG 魔数。"""
+    store, settings, host, *_r, ob = _make(tmp_path)
+    group_push.set_config(store, GID, {"news_card_enabled": True}, settings, now=NOON - 10)
+    jpg = tmp_path / "card.jpg"
+    jpg.write_bytes(b"\xff\xd8\xff\xe0" + b"jpeg-data")
+    ob.enqueue("jpg1", GID, "image", {"path": str(jpg), "text": "看全部资讯", "push_kind": "news_card"})
+    await ob.flush(NOON)
+    row = _rows(store)[0]
+    assert row["status"] == "sent"
+    assert host.images[0]["png"] == b"\xff\xd8\xff\xe0jpeg-data"
+    # 扩展名是 .jpg 但内容不是真图 → 照样拒（按内容判，不看后缀）
+    fake = tmp_path / "fake.jpg"
+    fake.write_bytes(b"GIF89a")
+    ob.enqueue("jpg2", GID, "image", {"path": str(fake), "text": "", "push_kind": "news_card"})
+    await ob.flush(NOON + 1)
+    row = [r for r in _rows(store) if r["key"] == "jpg2"][0]
+    assert row["status"] == "failed" and int(row["attempts"]) == 1
+    assert "PNG" in row["error"] and len(host.images) == 1
+
+
 async def test_uncertain_reserves_quota_but_is_not_recorded_as_sent(tmp_path):
     """超时 → uncertain：不写 pushes（不算已发），但额度按「可能已发出」保留。"""
     store, _, host, pushes, _, ob = _make(tmp_path, cfg={"delivery": {"push_per_day": 1}})

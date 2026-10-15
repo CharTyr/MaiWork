@@ -72,7 +72,8 @@ function profileRow(p) {
 }
 
 function modelOptions(value, emptyLabel) {
-  const list = (state.mdl && state.mdl.models) || [];
+  // 生图模型（use="image"）不能当聊天 / 干活模型：专岗下拉里不列它（服务端也会拒）。
+  const list = ((state.mdl && state.mdl.models) || []).filter((x) => (x.use || "chat") !== "image");
   const eps = (state.mdl && state.mdl.endpoints) || [];
   const epName = (id) => { const e = eps.find((x) => x.id === id); return e ? e.name || e.id : id; };
   let html = `<option value="">${esc(emptyLabel)}</option>` + list.map((x) => `<option value="${esc(x.id)}"${x.id === value ? " selected" : ""}>${esc(x.name || x.model)} · ${esc(epName(x.endpoint))}</option>`).join("");

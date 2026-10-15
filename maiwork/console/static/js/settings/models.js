@@ -42,6 +42,20 @@ export const PROTOCOLS = {
 };
 export const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 export const EFFORT_NAMES = { low: "低", medium: "中", high: "高", xhigh: "很高", max: "最高" };
+// 模型用途（2026-10-15 生图第一期）：聊天 / 干活，或者只用来画图。
+export const USE_NAMES = { chat: "聊天", image: "生图" };
+// 生图接口形状：只收「OpenAI 兼容形状」的两家（同步、一次拿结果）。
+export const IMAGE_APIS = {
+  openai: {
+    name: "OpenAI 兼容",
+    hint: "OpenAI、火山方舟（豆包 Seedream）等：POST 到 /images/generations，尺寸字段用 size、张数用 n。",
+  },
+  siliconflow: {
+    name: "硅基流动",
+    hint: "硅基流动：地址路径一样，但字段名不同（image_size / batch_size），返回的图片地址只活 1 小时。",
+  },
+};
+const isImageModel = (x) => (x && (x.use || "chat")) === "image";
 const kTok = (n) => (n >= 1000000 ? `${+(n / 1000000).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}K` : String(n || 0));
 const newId = (p) => p + Math.random().toString(36).slice(2, 8);
 const intIn = (v, lo, hi, d) => { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : d; };
@@ -49,8 +63,17 @@ const intIn = (v, lo, hi, d) => { const n = parseInt(v, 10); return Number.isFin
 export async function loadModels() {
   state.mdlError = "";
   try {
-    const [cat, agents] = await Promise.all([api("GET", "/api/settings/endpoints"), api("GET", "/api/agents").catch(() => null), loadJev()]);
-    state.mdl = { endpoints: cat.endpoints || [], models: cat.models || [] };
+    // 生图那半（用哪个生图模型 + 常用服务预设）单独一条接口：端点的响应形状是既有契约，不往里塞。
+    const [cat, agents, , img] = await Promise.all([
+      api("GET", "/api/settings/endpoints"),
+      api("GET", "/api/agents").catch(() => null),
+      loadJev(),
+      api("GET", "/api/settings/imagegen").catch(() => null),
+    ]);
+    state.mdl = {
+      endpoints: cat.endpoints || [], models: cat.models || [],
+      image_model: (img && img.model) || "", imagegen_presets: (img && img.presets) || [],
+    };
     state.mdlVerification = {}; // 刷新配置后不复用界面里上一次的验证/待保存建议
     if (agents) state.agents = agents;
   } catch (err) {
@@ -104,6 +127,14 @@ function endpointBlock(ep) {
 }
 
 function modelMeta(x) {
+  if (isImageModel(x)) {
+    return [
+      `用途 ${USE_NAMES.image}`,
+      `接口 ${(IMAGE_APIS[x.image_api] || IMAGE_APIS.openai).name}`,
+      x.image_default_size ? `默认尺寸 ${x.image_default_size}` : "默认尺寸跟随服务商",
+      `一次最多 ${x.image_max_n || 1} 张`,
+    ].join(" · ");
+  }
   return [
     (x.efforts || []).length ? `思考强度 ${x.efforts.map((e) => EFFORT_NAMES[e] || e).join(" / ")}` : "不支持思考强度",
     x.vision ? "支持图片" : "",
@@ -123,13 +154,21 @@ function modelRow(x) {
   const edit = state.mdlEdit;
   if (edit && edit.type === "model" && !edit.isNew && edit.id === x.id) return modelForm(edit.draft, false);
   const users = usersOf(x.id);
+  const image = isImageModel(x);
+  const currentImage = image && String((state.mdl && state.mdl.image_model) || "") === x.id;
   const result = (state.mdlVerification || {})[x.id];
+  // 生图模型不跑「验证」（那是聊天口径：会发测试对话，白花钱），改给「设为生图模型」。
+  const acts = image
+    ? `${currentImage
+        ? `<span class="tag">当前生图模型</span>`
+        : `<button type="button" class="btn small" style="min-height:44px;margin-top:8px" data-act="mdl-image-model" data-id="${esc(x.id)}">设为生图模型</button>`}${tip("生图模型只在任务需要画图时用；它不参与聊天，所以不用「验证」。")}`
+    : `<button type="button" class="btn small" style="min-height:44px;margin-top:8px" data-act="mdl-model-verify" data-id="${esc(x.id)}">验证</button>${tip("发送几条测试消息，检查模型能否正常回复和调用工具。会消耗少量 token。")}
+      <div class="set-text mdl-verify-result" role="status" aria-live="polite"${result ? "" : " hidden"}>${result ? esc(verificationMessage(result)) : ""}</div>`;
   return `<div class="set-row mdl-model">${ico("robot")}<div>
-      <div class="set-name">${esc(x.name || x.model)}${x.name && x.name !== x.model ? ` <span class="fine mono">${esc(x.model)}</span>` : ""}</div>
+      <div class="set-name">${esc(x.name || x.model)}${image ? `<span class="tag">${esc(USE_NAMES.image)}</span>` : ""}${x.name && x.name !== x.model ? ` <span class="fine mono">${esc(x.model)}</span>` : ""}</div>
       <div class="set-text mdl-meta">${esc(modelMeta(x))}</div>
-      <div class="set-text">${users.length ? `使用者：${esc(users.join("、"))}` : "未被使用"}</div>
-      <button type="button" class="btn small" style="min-height:44px;margin-top:8px" data-act="mdl-model-verify" data-id="${esc(x.id)}">验证</button>${tip("发送几条测试消息，检查模型能否正常回复和调用工具。会消耗少量 token。")}
-      <div class="set-text mdl-verify-result" role="status" aria-live="polite"${result ? "" : " hidden"}>${result ? esc(verificationMessage(result)) : ""}</div>
+      <div class="set-text">${image ? "给子 agent 画图用" : users.length ? `使用者：${esc(users.join("、"))}` : "未被使用"}</div>
+      ${acts}
     </div><span class="row-btns"><button class="btn small" data-act="mdl-model-edit" data-id="${esc(x.id)}">修改</button><button class="btn small ghost" data-act="mdl-model-del" data-id="${esc(x.id)}">删除</button></span></div>`;
 }
 
@@ -185,10 +224,42 @@ function endpointForm(d, isNew) {
   </div>`;
 }
 
+// 填入了常用生图服务、但当前端点地址对不上（2026-10-15 巡检 M7）：模型挂在端点下，地址和密钥在端点上，
+// 只填模型名会让请求打到别家。对不上就在表单里明确提示，不悄悄改端点。
+const normUrl = (u) => String(u || "").trim().replace(/\/+$/, "").toLowerCase();
+export function presetMismatch(d) {
+  const p = d && d._preset;
+  if (!p || !p.base_url) return "";
+  const ep = ((state.mdl && state.mdl.endpoints) || []).find((e) => e.id === d.endpoint) || {};
+  if (normUrl(ep.base_url) === normUrl(p.base_url)) return "";
+  return `<div class="warn-box">「${esc(p.label)}」的地址是 <span class="mono">${esc(p.base_url)}</span>，当前端点「${esc(ep.name || ep.id || d.endpoint || "")}」的地址是 <span class="mono">${esc(ep.base_url || "未填写")}</span>，两者不一致。请先新建一个端点，填上这个地址和${p.key_url ? `从 <span class="mono">${esc(p.key_url)}</span> 获取的` : "对应的"}密钥，再在新端点下添加这个模型。</div>`;
+}
+
+function imageModelFields(d) {
+  const presets = (state.mdl && state.mdl.imagegen_presets) || [];
+  const api = IMAGE_APIS[d.image_api] || IMAGE_APIS.openai;
+  return `
+    ${presetMismatch(d)}
+    ${tipLabel("mo-image-api", "接口形状", `<p id="mo-image-api-hint">${esc(api.hint)}</p>`)}
+    <select id="mo-image-api" aria-describedby="mo-image-api-hint">${Object.entries(IMAGE_APIS).map(([k, v]) => `<option value="${k}"${k === (d.image_api || "openai") ? " selected" : ""}>${esc(v.name)}</option>`).join("")}</select>
+    <div class="two-col">
+      <div>${tipLabel("mo-image-size", "默认尺寸（可选）", "不填就让服务商按默认来。例如 1024x1024、1536x1024；火山方舟也可以填档位，如 2K。")}<input id="mo-image-size" maxlength="40" spellcheck="false" value="${esc(d.image_default_size || "")}" placeholder="例如 1024x1024" /></div>
+      <div>${tipLabel("mo-image-n", "一次最多几张", "子 agent 一次调用最多能要几张（1~4）。")}<input id="mo-image-n" type="number" min="1" max="4" value="${esc(d.image_max_n ?? 1)}" /></div>
+    </div>
+    <p class="fine">生图模型不参与聊天，只在任务需要画图时用，所以不用填思考强度和上下文长度。</p>
+    ${presets.length ? `<details class="mdl-more"><summary>常用生图服务（点「填入」自动填好模型和接口形状）</summary>
+      <div>${presets.map((p) => `<div class="set-row"><div>
+        <div class="set-name">${esc(p.label)}</div>
+        <div class="set-text"><span class="mono">${esc(p.base_url)}</span> · 模型 ${esc(p.model)}<br>${esc(p.note || "")}</div>
+      </div><button type="button" class="btn small" data-act="mdl-preset" data-preset="${esc(p.id)}">填入</button></div>`).join("")}</div>
+    </details>` : ""}`;
+}
+
 function modelForm(d, isNew) {
   const ep = state.mdl.endpoints.find((e) => e.id === d.endpoint) || {};
   const avail = (state.mdlAvail || {})[d.endpoint] || ep.available || [];
   const efforts = new Set(d.efforts || []);
+  const image = isImageModel(d);
   return `<div class="login ext-form mdl-form" id="mdl-model-form">
     <div class="ext-form-h">${isNew ? `添加模型 · ${esc(ep.name || ep.id || "")}` : `修改「${esc(d.name || d.model)}」`}</div>
     <label for="mo-model">模型 ID</label>
@@ -196,13 +267,19 @@ function modelForm(d, isNew) {
     <datalist id="mo-avail">${avail.map((x) => `<option value="${esc(x)}"></option>`).join("")}</datalist>
     ${avail.length ? "" : `<p class="fine" style="margin:2px 0 0"><button type="button" class="link-btn" data-act="mdl-avail" data-ep="${esc(d.endpoint)}">获取可用模型列表</button></p>`}
     <label for="mo-name">显示名（可选）</label><input id="mo-name" maxlength="60" value="${esc(d.name && d.name !== d.model ? d.name : "")}" placeholder="留空则使用模型 ID" />
+    <div class="lbl-row"><label>用途</label>${tip("「聊天」用于对话和干活；「生图」只用来画图。生图模型不能当主模型或子 agent 的聊天模型。")}</div>
+    <div class="seg mdl-seg" role="group" aria-label="用途">
+      <button type="button" class="mdl-use" data-act="mdl-use" data-use="chat" aria-pressed="${image ? "false" : "true"}">聊天</button>
+      <button type="button" class="mdl-use" data-act="mdl-use" data-use="image" aria-pressed="${image ? "true" : "false"}">生图</button>
+    </div>
+    ${image ? imageModelFields(d) : `
     <div class="lbl-row"><label>思考强度</label>${tip("只勾选模型实际支持的档位；未勾选时不传该参数。")}</div>
     <div class="mdl-efforts" role="group" aria-label="支持的思考强度">${EFFORTS.map((e) => `<label class="chk"><input type="checkbox" class="mo-effort" value="${e}"${efforts.has(e) ? " checked" : ""} />${EFFORT_NAMES[e]}（${e}）</label>`).join("")}</div>
     <label class="chk"><input id="mo-vision" type="checkbox"${d.vision ? " checked" : ""} />支持图片输入</label>
     <div class="two-col">
       <div>${tipLabel("mo-ctx", "上下文长度（tokens）", "上下文长度是模型单次能处理的总长度；最大输出是单次回复的最大长度，须小于上下文长度。")}<input id="mo-ctx" type="number" min="8192" max="2000000" step="1024" value="${esc(d.context_window ?? 128000)}" /></div>
       <div><label for="mo-max">最大输出（tokens）</label><input id="mo-max" type="number" min="1024" max="1000000" step="1024" value="${esc(d.max_tokens ?? 32768)}" /></div>
-    </div>
+    </div>`}
     <p class="err" id="mo-err" hidden></p>
     <div class="actions"><button class="btn primary" type="button" data-act="mdl-model-save">保存</button><button class="btn" type="button" data-act="mdl-cancel">取消</button></div>
   </div>`;
@@ -283,11 +360,20 @@ function readEndpoint() {
 
 function readModel() {
   const v = (id) => ($(id) ? $(id).value.trim() : "");
+  const d = (state.mdlEdit && state.mdlEdit.draft) || {};
+  const seg = document.querySelector('.mdl-use[aria-pressed="true"]');
+  const image = !!(seg && seg.dataset.use === "image");
   return {
     model: v("mo-model"), name: v("mo-name") || v("mo-model"),
+    use: image ? "image" : "chat",
     efforts: [...document.querySelectorAll(".mo-effort:checked")].map((x) => x.value),
     vision: !!($("mo-vision") && $("mo-vision").checked),
-    context_window: intIn(v("mo-ctx"), 8192, 2000000, 128000), max_tokens: intIn(v("mo-max"), 1024, 1000000, 32768),
+    // 生图表单不显示这两项：保留原值（别把已存的配置清掉）
+    context_window: $("mo-ctx") ? intIn(v("mo-ctx"), 8192, 2000000, 128000) : (d.context_window ?? 128000),
+    max_tokens: $("mo-max") ? intIn(v("mo-max"), 1024, 1000000, 32768) : (d.max_tokens ?? 32768),
+    image_api: v("mo-image-api") || "openai",
+    image_default_size: v("mo-image-size"),
+    image_max_n: $("mo-image-n") ? intIn(v("mo-image-n"), 1, 4, 1) : (d.image_max_n ?? 1),
   };
 }
 
@@ -429,8 +515,41 @@ export async function actModels(action, el) {
       return true;
     }
     case "mdl-model-new":
-      state.mdlEdit = { type: "model", isNew: true, draft: { id: newId("m"), endpoint: el.dataset.ep, efforts: [], vision: false, context_window: 128000, max_tokens: 32768 } };
+      state.mdlEdit = { type: "model", isNew: true, draft: { id: newId("m"), endpoint: el.dataset.ep, use: "chat", efforts: [], vision: false, context_window: 128000, max_tokens: 32768, image_api: "openai", image_default_size: "", image_max_n: 1 } };
       repaintSheet(); setTimeout(() => $("mo-model") && $("mo-model").focus(), 0); return true;
+    case "mdl-use": {
+      // 切「聊天 / 生图」：先把当前表单收进 draft（重画表单，别丢没保存的输入）
+      const edit = state.mdlEdit;
+      if (!edit || edit.type !== "model") return true;
+      const want = el.dataset.use === "image" ? "image" : "chat";
+      if ((edit.draft.use || "chat") === want) return true;
+      Object.assign(edit.draft, readModel(), { use: want });
+      if ($("mo-err")) $("mo-err").hidden = true;
+      repaintSheet();
+      return true;
+    }
+    case "mdl-preset": {
+      // 常用生图服务一键填入（只填模型名和接口形状；地址 / 密钥在端点上填）
+      const edit = state.mdlEdit;
+      if (!edit || edit.type !== "model") return true;
+      const p = ((state.mdl && state.mdl.imagegen_presets) || []).find((x) => x.id === el.dataset.preset);
+      if (!p) return true;
+      Object.assign(edit.draft, readModel(), { use: "image", image_api: p.image_api, model: p.model, _preset: p });
+      if (!edit.draft.name) edit.draft.name = p.label;
+      repaintSheet();
+      toast(presetMismatch(edit.draft) ? `已填好模型 ${p.model}，但端点地址不一致，请查看表单里的提示` : `已按「${p.label}」填好模型 ${p.model}`);
+      return true;
+    }
+    case "mdl-image-model": {
+      el.disabled = true;
+      try {
+        await api("PUT", "/api/settings/imagegen", { model: el.dataset.id });
+        await loadModels();
+        repaintSheet();
+        toast("已设为生图模型");
+      } catch (err) { el.disabled = false; toast(err.message, true); }
+      return true;
+    }
     case "mdl-model-edit": {
       const x = m && m.models.find((y) => y.id === el.dataset.id);
       if (!x) return true;
@@ -441,7 +560,10 @@ export async function actModels(action, el) {
       const edit = state.mdlEdit;
       if (!edit) return true;
       const body = { ...readModel(), endpoint: edit.draft.endpoint };
-      const problem = !body.model ? "请填写模型 ID。" : body.max_tokens >= body.context_window ? "最大输出须小于上下文长度。" : "";
+      // 生图模型不看上下文 / 最大输出（那两个字段在生图表单里不显示）
+      const problem = !body.model ? "请填写模型 ID。"
+        : body.use === "chat" && body.max_tokens >= body.context_window ? "最大输出须小于上下文长度。"
+        : "";
       if (problem) return showErr("mo-err", problem), true;
       el.disabled = true;
       try {
@@ -449,7 +571,9 @@ export async function actModels(action, el) {
         const wasNew = edit.isNew;
         state.mdlEdit = null;
         await reloadAll();
-        toast(wasNew ? "已添加，可在「专岗」中分配" : "已保存");
+        toast(body.use === "image"
+          ? (wasNew ? "已添加生图模型，可在模型行点「设为生图模型」" : "已保存")
+          : (wasNew ? "已添加，可在「专岗」中分配" : "已保存"));
       } catch (err) { el.disabled = false; showErr("mo-err", err.message); }
       return true;
     }
