@@ -88,9 +88,9 @@ class TestDefaults:
         assert s.environments.vm_platform == "railway"
         assert s.environments.freestyle_api_key == ""
         assert s.environments.freestyle_snapshot == "freestyle/ubuntu-sm"
-        assert s.environments.freestyle_ttl_minutes == 60
+        assert s.environments.freestyle_ttl_minutes == 90
         assert s.environments.freestyle_idle_minutes == 10
-        assert s.environments.freestyle_daily_max == 2
+        assert s.environments.freestyle_daily_max == 5
         assert problems == []
 
     def test_vm_platform_unknown_falls_back_with_problem(self) -> None:

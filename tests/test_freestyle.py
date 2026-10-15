@@ -175,7 +175,7 @@ class TestAcquire:
         }
         assert body["snapshotId"] == "freestyle/ubuntu-sm"
         assert body["autoDeleteSeconds"] == 0
-        assert body["ttlSeconds"] == 60 * 60
+        assert body["ttlSeconds"] == 90 * 60
         assert body["idleTimeoutSeconds"] == 10 * 60
         assert body["metadata"]["maiwork_job"] == "job-a"
         assert body["slug"].startswith("maiwork-job-a-")

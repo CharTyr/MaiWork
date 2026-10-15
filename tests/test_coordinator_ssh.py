@@ -124,10 +124,37 @@ def test_stopped_local_prefers_ssh_then_railway_then_fail() -> None:
     assert "做不了" in notes[-1] and "受限" in envs[-1]
 
 
-def test_local_ok_want_local_does_not_touch_machines() -> None:
+def test_local_ok_want_local_still_gets_machine() -> None:
+    """机器可用时，计划里报 local 也一律上机器（2026-10-15 用户定：本机只兜底）。"""
     c, envs, notes, _ = _coord(ssh_box=_SshBox())
     on, box = _run(c._setup_exec_env("t1", {"env": "local"}, "1"))
+    assert on is True and box.kind == "ssh"
+    assert "专用机器" in envs[-1] and "本机" not in envs[-1]
+    assert not notes
+
+
+def test_no_machine_at_all_keeps_local() -> None:
+    """一台机器都没就位：还是本机，不申请任何机器、不写原因。"""
+    c, envs, notes, _ = _coord(ssh_box=_SshBox(), ssh_on=False, rail_on=False)
+    on, box = _run(c._setup_exec_env("t1", {"env": "local"}, "1"))
     assert on is False and box is None and not notes
+    assert "本机" in envs[-1]
+
+
+def test_freestyle_only_forces_off_local() -> None:
+    """只有 Freestyle 就位、没有专用机器：计划报 local 也要上 Freestyle 那台。"""
+    c, _ = _coord_freestyle(ssh_on=False)
+    on, box = _run(c._setup_exec_env("t1", {"env": "local"}, "1"))
+    assert on is True and box.kind == "freestyle"
+    assert "Freestyle" in c._ci_envs[-1] and not c._ci_notes
+
+
+def test_machines_unreachable_falls_back_to_local_with_reason() -> None:
+    """机器都在忙 / 都连不上：才回落本机，并写清原因。"""
+    c, envs, notes, _ = _coord(ssh_box=None, rail_box=None)
+    on, box = _run(c._setup_exec_env("t1", {"env": "local"}, "1"))
+    assert on is False and box is None
+    assert "本机" in envs[-1] and "专用机器拿不到" in notes[-1]
 
 
 def test_tools_brief_release_for_ssh() -> None:
@@ -146,29 +173,37 @@ def test_tools_brief_release_for_ssh() -> None:
 
 
 def test_plan_env_options_mention_ssh_only_when_available() -> None:
+    """机器可用时提示词只列机器（不给 local）；一台机器都没有时才只剩 local。"""
     c, *_ = _coord(ssh_box=_SshBox(), ssh_on=True, rail_on=False)
     field, guide, allowed = c._env_options()
-    assert '"local|ssh"' in field and "ssh" in allowed and "railway" not in allowed
+    assert '"env": "ssh"' in field and allowed == {"ssh"} and "local" not in allowed
     assert "专用机器" in guide and "优先" in guide and "railway" not in guide
+    assert "兜底" in guide                      # 明说本机只是兜底
     c, *_ = _coord(ssh_on=False, rail_on=True)
     c._railway_available = lambda: True
     field, guide, allowed = c._env_options()
-    assert '"local|railway"' in field and "ssh" not in allowed and "专用机器" not in guide
+    assert '"env": "railway"' in field and allowed == {"railway"} and "ssh" not in allowed
+    assert "专用机器" not in guide
     c, *_ = _coord(ssh_on=False, rail_on=False)
     c._railway_available = lambda: False
     field, guide, allowed = c._env_options()
-    assert allowed == {"local"} and guide == ""
+    assert allowed == {"local"} and guide == "" and '"env": "local"' in field
 
 
 def test_plan_env_choice_normalized() -> None:
+    """有机器时 local / 乱写都规范成机器；一台机器都没有才 local。"""
     c, *_ = _coord(ssh_on=True, rail_on=False)
     c._railway_available = lambda: False
     assert c._normalize_env_choice("ssh") == "ssh"
     assert c._normalize_env_choice("railway") == "ssh"   # 没开 railway，要机器就给专用机器
-    assert c._normalize_env_choice("乱写") == "local"
+    assert c._normalize_env_choice("local") == "ssh"     # 报本机也上机器（本机只兜底）
+    assert c._normalize_env_choice("乱写") == "ssh"
+    assert c._normalize_env_choice("") == "ssh"
     c, *_ = _coord(ssh_on=False, rail_on=False)
     c._railway_available = lambda: False
     assert c._normalize_env_choice("ssh") == "local"
+    assert c._normalize_env_choice("local") == "local"
+    assert c._normalize_env_choice("乱写") == "local"
 
 
 def test_plan_prompt_lists_machines_with_notes_and_points_to_agents_md() -> None:
@@ -250,20 +285,25 @@ def _coord_freestyle(*, ssh_on: bool = True, free_on: bool = True):
     c._ssh = _Ssh() if ssh_on else None
     c._railway = None
     c._vms = {"freestyle": _Free()} if free_on else {}
+    envs, notes = [], []
 
     class _Tasks:
         def set_env(self, tid, desc, note=""):
-            pass
+            envs.append(desc)
+            if note:
+                notes.append(note)
 
     c._tasks = _Tasks()
+    c._ci_envs = envs        # 测试用：这次写了什么 env 字段 / 原因
+    c._ci_notes = notes
     return c, released
 
 
 def test_env_options_list_freestyle_when_selected() -> None:
     c, _ = _coord_freestyle(ssh_on=True)
     field, guide, allowed = c._env_options()
-    assert '"local|ssh|freestyle"' in field
-    assert allowed == {"local", "ssh", "freestyle"}
+    assert '"env": "ssh|freestyle"' in field
+    assert allowed == {"ssh", "freestyle"} and "local" not in allowed
     assert "Freestyle" in guide and "railway" not in guide
 
 

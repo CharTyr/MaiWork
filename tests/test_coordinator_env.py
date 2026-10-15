@@ -464,9 +464,44 @@ async def _railway_tool_call(tools: Tools, name: str, args: dict, ctx: Any):
 # ---------------------------------------------------------------------------
 
 
-async def test_local_keeps_local_tools_and_no_acquire(
+async def test_no_machine_keeps_local_tools_and_no_acquire(
+    mem_store: Store, env, tools, tasks, goals, tmp_path
+):
+    """一台机器都没就位时才在本机：保留 run_command、不申请任何机器。"""
+    off_settings = _Settings(tmp_path / "workspaces", railway=False)
+    tid = _create_task(tasks)
+    models = ModelsQueue(replies=[_plan(env="local"), _review(pass_=True)])
+    workers = FakeWorkers()
+
+    async def _write():
+        ws = env.workspace(tasks.get(tid)["workspace"])
+        (ws / "artifacts" / tid).mkdir(parents=True, exist_ok=True)
+        (ws / "artifacts" / tid / "index.html").write_text("<html>ok</html>", encoding="utf-8")
+
+    workers.before_return = _write
+    register_exec_tools(
+        tools, env=env, host=None, get_settings=lambda: off_settings, session_of=lambda _g: "s",
+    )
+    coordinator = Coordinator(
+        mem_store, models, workers, tools, tasks, goals,
+        FakeDelivery(), FakeOutbox(), env, _Profiles(), lambda: off_settings,
+        railway=None,
+    )
+    await coordinator.run_task(tid)
+
+    assert tasks.get(tid)["status"] == "completed"
+    assert "本机" in str(tasks.get(tid)["env"])
+    # 子 agent 拿到的还是本机命令工具（run_command），没被换成 vm_*
+    assert workers.calls, "应该派过活"
+    for call in workers.calls:
+        assert "run_command" in call["tools"]
+        assert not any(t.startswith("vm_") for t in call["tools"])
+
+
+async def test_machine_available_forces_off_local(
     mem_store: Store, settings, env, tools, tasks, goals
 ):
+    """机器可用时，计划报 local 也一律上机器（本机只兜底，2026-10-15 用户定）。"""
     tid = _create_task(tasks)
     models = ModelsQueue(replies=[_plan(env="local"), _review(pass_=True)])
     workers = FakeWorkers()
@@ -485,14 +520,15 @@ async def test_local_keeps_local_tools_and_no_acquire(
     await coordinator.run_task(tid)
 
     assert tasks.get(tid)["status"] == "completed"
-    # 没碰一次性机器
-    assert railway.acquire_calls == []
-    assert railway.release_calls == 0
-    # 子 agent 拿到的还是本机命令工具（run_command），没被换成 vm_*
+    # 计划里写的是 local，但机器可用 → 必须申请并真的用上那台
+    assert railway.acquire_calls == [tid]
+    assert railway.release_calls == 1
+    row = tasks.get(tid)
+    assert "railway" in str(row["env"]) and "本机" not in str(row["env"])
     assert workers.calls, "应该派过活"
     for call in workers.calls:
-        assert "run_command" in call["tools"]
-        assert not any(t.startswith("vm_") for t in call["tools"])
+        assert "vm_run" in call["tools"]
+        assert "run_command" not in call["tools"]
 
 
 # ---------------------------------------------------------------------------

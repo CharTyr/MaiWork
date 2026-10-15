@@ -378,9 +378,9 @@ class EnvironmentsSectionConfig(PluginConfigBase):
         default="freestyle/ubuntu-sm",
         description="建 Freestyle 机器用哪个镜像（决定 CPU/内存/磁盘；创建时不能单独选规格）",
     )
-    freestyle_ttl_minutes: int = Field(default=60, description="一台 Freestyle 机器最多活多少分钟（从创建时刻算，到点自动删）")
+    freestyle_ttl_minutes: int = Field(default=90, description="一台 Freestyle 机器最多活多少分钟（从创建时刻算，到点自动删）")
     freestyle_idle_minutes: int = Field(default=10, description="Freestyle 机器无网络活动多少分钟后自动休眠（暂停只计存储费，文件仍可读）")
-    freestyle_daily_max: int = Field(default=2, description="Freestyle 一次性 VM 每天最多用几台")
+    freestyle_daily_max: int = Field(default=5, description="Freestyle 一次性 VM 每天最多用几台")
     ssh: list[SSHServerConfig] = Field(default_factory=list, description="已有的专用 VM/VPS（按顺序优先用）")
     workspace_root: str = Field(default="/home/maiwork/workspaces", description="工作区根目录；每个工作区是它下面的一个子目录")
     memory_max: str = Field(default="512M", description="单个命令的内存上限，如 512M / 1G")
@@ -835,9 +835,9 @@ class EnvironmentsSetting:
     freestyle: bool = False               # 是否允许用 Freestyle 一次性 VM（额外添加；默认关）
     freestyle_api_key: str = ""           # 只进不出；环境变量 FREESTYLE_API_KEY 优先
     freestyle_snapshot: str = "freestyle/ubuntu-sm"
-    freestyle_ttl_minutes: int = 60
+    freestyle_ttl_minutes: int = 90
     freestyle_idle_minutes: int = 10
-    freestyle_daily_max: int = 2
+    freestyle_daily_max: int = 5
 
 
 @dataclass(frozen=True)

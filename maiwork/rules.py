@@ -623,7 +623,9 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     _F("environments.freestyle_idle_minutes", "空闲休眠（分钟）",
        "Freestyle 机器无网络活动多久后自动休眠；休眠只算存储费，文件仍可读取。", "int", min=1, max=1440),
     _F("environments.freestyle_daily_max", "每日 Freestyle 机器数",
-       "每天最多使用的 Freestyle 机器数量。", "int", min=1, max=10),
+       "每天最多用几台 Freestyle 机器。免费档每月含 200 vCPU 小时 / 400 GiB 内存小时，"
+       "按「分配的资源 × 占用时长」计费，默认的 2 核 4G 镜像一个月约能用 100 机时。"
+       "实际用量通常远低于上限；当月额度用完后 Freestyle 会拒绝新建机器，任务改回本机执行。", "int", min=1, max=10),
     _F("environments.verify_enabled", "资讯实测", "选取部分资讯进行实际测试，结果显示在网页中。", "bool"),
     _F("environments.verify_per_round", "每轮实测条数", "每轮实际测试的资讯条数。", "int", min=1, max=3),
     _F("environments.verify_minutes", "实测时长（分钟）", "每条资讯的最长测试时间。", "int", min=1, max=60),

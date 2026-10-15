@@ -147,7 +147,9 @@ async def test_plan_offers_only_preferred_platform(mem_store, tmp_path, env, too
     rw, fs = FakeRailwayEnv(), FakeFreestyleEnv()
     _tid, models, c = await _run(mem_store, env, tools, tasks, goals, settings, rw, fs, plan_env="freestyle")
     prompt = "\n".join(str(m.get("content")) for m in models.calls[0][1])
-    assert '"env": "local|freestyle"' in prompt and "railway" not in prompt
+    # 机器可用时提示词只列机器，不给 local（本机只兜底，2026-10-15 用户定）
+    assert '"env": "freestyle"' in prompt and "local" not in prompt.split('"env_reason"')[0]
+    assert "railway" not in prompt
     # 模型硬写另一家 → 规范成优先那家
     assert c._normalize_env_choice("railway") == "freestyle"  # noqa: SLF001
     assert len(fs.acquire_calls) == 1 and rw.acquire_calls == []

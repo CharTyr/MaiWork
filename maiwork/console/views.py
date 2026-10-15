@@ -1533,7 +1533,7 @@ def _freestyle_health(svc: Any) -> dict[str, Any] | None:
         return {**base, "state": "off", "text": "未启用（设置 → 全部设置 → 运行环境 → Freestyle 临时机器）"}
     if not vm_platforms.api_key_of("freestyle", settings):
         return {**base, "state": "warn", "text": "未填写 Freestyle 密钥（设置 → 全部设置 → 运行环境 → Freestyle 密钥）"}
-    daily_max = max(1, int(getattr(env, "freestyle_daily_max", 2) or 2))
+    daily_max = max(1, int(getattr(env, "freestyle_daily_max", 5) or 5))
     used = 0
     last_fail: dict | None = None
     last_acquire_ts = 0.0

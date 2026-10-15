@@ -189,13 +189,13 @@ class FreestyleEnv:
 
     def _daily_max(self) -> int:
         try:
-            return max(1, int(self._get_settings().environments.freestyle_daily_max or 2))
+            return max(1, int(self._get_settings().environments.freestyle_daily_max or 5))
         except Exception:
             return 2
 
     def _ttl_seconds(self) -> int:
         try:
-            minutes = max(1, int(self._get_settings().environments.freestyle_ttl_minutes or 60))
+            minutes = max(1, int(self._get_settings().environments.freestyle_ttl_minutes or 90))
         except Exception:
             minutes = 60
         return minutes * 60

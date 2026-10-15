@@ -251,11 +251,11 @@ freestyle_api_key = ""
 # freestyle/ubuntu-sm = 2 核 4G · 16G 盘；freestyle/ubuntu = 4 核 8G · 32G 盘（免费档上限）。
 freestyle_snapshot = "freestyle/ubuntu-sm"
 # 一台机器从创建时刻算最多活多少分钟，到点自动删除（5~1440）。
-freestyle_ttl_minutes = 60
+freestyle_ttl_minutes = 90
 # 无网络活动多少分钟后自动休眠；休眠只算存储费，文件仍可读（1~1440）。
 freestyle_idle_minutes = 10
 # Freestyle 一次性 VM 每天最多用几台（1~10）。
-freestyle_daily_max = 2
+freestyle_daily_max = 5
 # 自己的专用 VPS / VM（可以写多台）：要跑命令的活优先用它们，按列出顺序挑连得上、没活的那台。
 # 先把网页「运行状态 → 专用机器」里的 MaiWork 公钥加进机器的 ~/.ssh/authorized_keys。
 # 各台的情况和用途可以写进网页「做事规矩」（AGENTS.md），主模型按它挑（也可以点名）。

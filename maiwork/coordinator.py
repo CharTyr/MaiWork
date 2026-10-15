@@ -1705,19 +1705,27 @@ class Coordinator:
         return out
 
     def _env_options(self) -> tuple[str, str, set[str]]:
-        """排计划提示词里的 env 选项：(JSON 字段说明, 怎么选的说明, 允许的值)。没就位的不出现。"""
+        """排计划提示词里的 env 选项：(JSON 字段说明, 怎么选的说明, 允许的值)。没就位的不出现。
+
+        机器可用时**不给 local**（2026-10-15 用户定）：要跑的活一律在机器上做，本机只在
+        机器全都拿不到时兜底；模型硬写 local 也会被 `_normalize_env_choice` 规范成机器。
+        一台机器都没就位时才只剩 local。
+        """
         ssh_ok = self._ssh_available()
         # 两家都开时只给主模型一个「一次性机器」选项（优先那家）；拿不到时程序自己换另一家，
         # 不让模型挑平台（2026-10-15 用户定）
         oneshot = self._oneshot_kinds()[:1]
-        allowed = {"local"} | ({"ssh"} if ssh_ok else set()) | set(oneshot)
-        if allowed == {"local"}:
-            return ' "env": "local"（本机隔离环境干活），', "", allowed
-        opts = "|".join(k for k in ("local", "ssh", *vm_platforms.kinds()) if k in allowed)
+        machines = ({"ssh"} if ssh_ok else set()) | set(oneshot)
+        if not machines:
+            return ' "env": "local"（本机隔离环境干活），', "", {"local"}
+        allowed = set(machines)
+        opts = "|".join(k for k in ("ssh", *vm_platforms.kinds()) if k in allowed)
         field = f' "env": "{opts}"（在哪干活，下面有说明）， "env_reason": "一句话说清为什么这么选",'
         if ssh_ok:
             field += ' "machine": "选 ssh 时想用哪台专用机器（写名字；无所谓就 null）",'
-        lines = ["怎么选 env：只写写文件、查资料、做网页这类不用跑命令的轻活，选 local（本机隔离环境，快，做完能直接交付）。"]
+        lines = [
+            "怎么选 env：要跑命令的活一律在机器上做（本机只在机器都拿不到时兜底，你不用选它）。"
+        ]
         if ssh_ok:
             names = "、".join(
                 (str(m.get("name") or "") + (f"（{m['note']}）" if str(m.get("note") or "").strip() else ""))
@@ -1737,12 +1745,21 @@ class Coordinator:
         return field, "".join(lines), allowed
 
     def _normalize_env_choice(self, raw: Any) -> str:
-        """计划里的 env 规范成可用的值：乱写 → local；要的那种机器没开 → 换另一种机器，都没开 → local。"""
+        """计划里的 env 规范成可用的值。
+
+        机器可用时**一律用机器**（2026-10-15 用户定）：报 local 或乱写都规范成第一台可用
+        机器（专用机器优先，其次优先那家一次性机器）——本机只做兜底。一台机器都没有才 local。
+        要的那种机器没开时照旧换另一种机器（换不到才回落本机）。
+        """
         choice = str(raw or "").strip().lower()
         _f, _g, allowed = self._env_options()
         oneshot = self._oneshot_kinds()[:1]
+        # 机器可用时的第一顺位（ssh 优先，其次优先那家一次性机器）；没有机器时是 ""
+        machine_first = "ssh" if "ssh" in allowed else (oneshot[0] if oneshot else "")
         if choice not in ("local", "ssh", *vm_platforms.kinds()):
-            return "local"
+            return machine_first or "local"      # 乱写：有机器就上机器，没机器才本机
+        if choice == "local":
+            return machine_first or "local"      # 报本机：有机器也上机器，没机器才本机
         if choice in allowed:
             return choice
         if choice == "ssh":
@@ -1756,7 +1773,7 @@ class Coordinator:
         for kind in candidates:
             if kind in allowed:
                 return kind
-        return "local"
+        return machine_first or "local"
 
     def _local_can_exec(self) -> bool:
         """本机能不能隔离跑命令（判定 ok；没判定过按能，行为和以前一样）。"""
@@ -3124,23 +3141,30 @@ class Coordinator:
 
         机器有两种：专用机器（ssh，用户自己的 VPS / VM）和一次性 VM（railway / freestyle
         各自开关、可同时开；优先那家排第一，同一时间两家合计只占一台）。
-        - 选 local 且本机能隔离跑命令：就在本机（不碰机器）；
-        - 选 ssh：专用机器 → 一次性 VM → 本机；
-        - 选一次性 VM：优先那家 → 另一家（开着的话）→ 专用机器 → 本机；
-        - 选 local 但本机受限（不能隔离跑命令）：专用机器 → 一次性 VM → 做不了。
+        **机器可用时一律用机器，本机只兜底**（2026-10-15 用户定）：计划里写 local（老存档的
+        计划、或直接调用绕过 `_normalize_env_choice`）也在这里再规范成第一台可用机器。
+        - 选了机器：那台 → 另一台 → 本机；
+        - 选 local 但一台机器都没有、且本机能隔离跑命令：就在本机；
+        - 选 local 但本机受限（不能隔离跑命令）：机器 → 做不了。
         换了地方都在 env 字段 / 时间线写清原因；最后都拿不到且本机受限，返回 (False, None)，
         调用方据此判失败，不假装开工。
         """
         want = str(plan.get("env") or "local")
+        want_raw = want                       # 计划里原本要的环境（写 note 用）
         local_ok = self._local_can_exec()
         oneshot = list(self._oneshot_kinds())
         machine_kinds = ("ssh", *oneshot)
-        if want not in machine_kinds and local_ok:
-            try:
-                self._tasks.set_env(tid, self._local_env_desc())
-            except Exception:
-                logger.exception("写任务 %s 的 env 字段失败", tid)
-            return False, None
+        # 真正就位的机器（machine_kinds 里的 "ssh" 是无条件占位，不能拿来当强制目标）
+        available = [*(["ssh"] if self._ssh_available() else []), *oneshot]
+        if want not in machine_kinds:
+            if available:
+                want = available[0]           # 有机器就不许留在本机
+            elif local_ok:
+                try:
+                    self._tasks.set_env(tid, self._local_env_desc())
+                except Exception:
+                    logger.exception("写任务 %s 的 env 字段失败", tid)
+                return False, None
         if want == "ssh":
             order = ["ssh", *oneshot]
         elif want in oneshot:
@@ -3155,7 +3179,7 @@ class Coordinator:
                 if reason:
                     reasons.append(f"{labels.get(kind, kind)}：{reason}")
                 continue
-            if not local_ok and want not in machine_kinds:
+            if not local_ok and want_raw not in machine_kinds:
                 cap = getattr(self, "_capability", None)
                 why = str(getattr(cap, "reason", "") or "这台机器不能隔离跑命令")
                 note = f"不能隔离跑命令，改在{labels[kind]}上做：{why}"
