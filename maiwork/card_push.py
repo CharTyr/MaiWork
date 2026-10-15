@@ -83,6 +83,17 @@ _JPEG_MAGIC = b"\xff\xd8\xff"
 _FALLBACK_SUFFIX = ":fallback"
 _FALLBACK_KV = "news_card.fallback"
 _RESEND_KV = "news_card.resend"
+# 卡片状态的中文说法（给管理员的报错 / 回执里用，不把英文状态码写给用户看；
+# 与网页 attention.js 的 CARD_STATE 同一套口径）。
+CARD_STATUS_ZH = {
+    "pending": "等待发送",
+    "queued": "排队中",
+    "sending": "发送中",
+    "sent": "已发送",
+    "uncertain": "发送结果未知",
+    "failed": "发送失败",
+    "dropped": "已取消",
+}
 
 
 # ----------------------------------------------------------------------
@@ -773,7 +784,7 @@ class CardPush:
         if not text:
             self._kv_set(self._fallback_kv(cid),
                          {"status": "no_items", "ts": float(now), "outbox_id": 0})
-            self._note_card_error(cid, "没有可发的条目，没补文字")
+            self._note_card_error(cid, "没有可发送的条目，未补发文字版")
             return False
         payload = {"push_kind": "news_card", "text": text, "expires_ts": float(expires)}
         try:
@@ -784,9 +795,9 @@ class CardPush:
         self._kv_set(self._fallback_kv(cid),
                      {"status": "queued", "ts": float(now), "outbox_id": int(oid)})
         # 这里只是**入队**：发件箱后面还可能按开关 / 睡觉时段 / 每日额度推迟、或按 12 小时
-        # 有效期作废，所以措辞只说「已入队」，真发出去了由 _settle_fallback 补记
-        # 「纯文字兜底已发出」（2026-10-15 复核：原来这里写「已补发」，实际还没发）。
-        self._note_card_error(cid, "已入队纯文字兜底（还没发出）")
+        # 有效期作废，所以措辞只说「已排入发送队列」，真发出去了由 _settle_fallback 补记
+        # 「文字版已发出」（2026-10-15 复核：原来这里写「已补发」，实际还没发）。
+        self._note_card_error(cid, "文字版已排入发送队列（尚未发出）")
         logger.info("资讯卡片发不出去，已入队纯文字兜底（群 %s 卡片 %s）", gid, cid)
         return True
 
@@ -808,13 +819,13 @@ class CardPush:
                 "error": error,
             })
             if outcome == "sent":
-                self._note_card_error(cid, "纯文字兜底已发出")
+                self._note_card_error(cid, "文字版已发出")
             elif outcome == "failed":
-                self._note_card_error(cid, "纯文字兜底也没发出去")
+                self._note_card_error(cid, "文字版同样发送失败")
             elif outcome == "uncertain":
-                self._note_card_error(cid, "纯文字兜底结果不明")
+                self._note_card_error(cid, "文字版发送结果未知")
             elif outcome == "dropped":
-                self._note_card_error(cid, "纯文字兜底作废了")
+                self._note_card_error(cid, "文字版已取消")
         except Exception:
             logger.exception("兜底结果回写失败（卡片 %s，outcome=%s）", cid, outcome)
 
@@ -838,17 +849,19 @@ class CardPush:
         gid = str(row["group_id"])
         status = str(row["status"] or "")
         if status not in ("failed", "uncertain"):
-            raise ValueError(f"只有失败或不确定的卡片能重发（现在是 {status}）")
+            raise ValueError(
+                f"只有发送失败或发送结果未知的卡片可以重发（当前状态：{CARD_STATUS_ZH.get(status, status)}）"
+            )
         if not _served(self._get_settings, gid):
-            raise ValueError("这个群不在服务名单里，不发")
+            raise ValueError("这个群不在服务名单里，不发送")
         outbox = self._outbox
         if outbox is None:
-            raise ValueError("发件箱还没接上，重发不了")
+            raise ValueError("发送队列尚未就绪，无法重发")
         today = clock.bj(moment).strftime("%Y-%m-%d")
         kvkey = f"{_RESEND_KV}.{int(cid)}"
         rec = self._store.kv_get(kvkey)
         if isinstance(rec, dict) and str(rec.get("date") or "") == today:
-            raise ValueError("这张卡片今天已经手动重发过一次了，明天再试")
+            raise ValueError("这张卡片今天已手动重发过一次，请明天再操作")
 
         link = group_link(self._store, self._get_settings(), gid)
         items = self._items_for_card(gid, row["item_ids"])
@@ -861,7 +874,7 @@ class CardPush:
         data: Optional[dict] = None
         if cached is None:
             if not items:
-                raise ValueError("这张卡片的条目都撤下了，没有可发的")
+                raise ValueError("这张卡片的条目已全部撤下，没有可发送的内容")
             data = self._card_data(gid, items, int(row["batch_id"] or 0), link)
             img: bytes = b""
             try:
@@ -885,7 +898,7 @@ class CardPush:
             payload.update({"path": str(path), "text": f"看全部资讯：{link}" if link else ""})
         else:
             if not items:
-                raise ValueError("这张卡片的条目都撤下了，没有可发的")
+                raise ValueError("这张卡片的条目已全部撤下，没有可发送的内容")
             if data is None:
                 data = self._card_data(gid, items, int(row["batch_id"] or 0), link)
             payload["text"] = self._text_fallback(data)
@@ -904,15 +917,17 @@ class CardPush:
                     " not_before=0, error='', updated=? WHERE id=?",
                     (kind, json.dumps(payload, ensure_ascii=False), moment, oid),
                 )
-        self._set(cid, status="queued", mode=mode, due_ts=moment,
-                  error=f"手动重发：{today}")
+        # 只改状态和模式：**不往 error 里写「手动重发」**——那是给网页显示的错误行，
+        # 写操作记录会被读成一条报错；重发次数限制记在下面 kv["news_card.resend.<id>"] 里，
+        # 和 error 字段无关（2026-10-15 复核）。真发送失败时 on_result 会用新原因覆盖 error。
+        self._set(cid, status="queued", mode=mode, due_ts=moment)
         self._kv_set(kvkey, {"date": today, "ts": moment, "mode": mode, "outbox_id": oid})
         logger.info("管理员手动重发资讯卡片（群 %s 卡片 %s，%s）", gid, cid, mode)
         return {
             "ok": True, "card_id": int(cid), "group_id": gid, "mode": mode,
             "used_cache": used_cache, "outbox_id": oid,
             "expires_ts": float(payload["expires_ts"]),
-            "message": "已重新入队（图片）" if mode == "image" else "已重新入队（纯文字）",
+            "message": "已重新提交发送（图片）" if mode == "image" else "已重新提交发送（纯文字）",
         }
 
     def recent_cards(self, *, group_id: Any = "", status: str = "", limit: int = 20) -> list[dict]:

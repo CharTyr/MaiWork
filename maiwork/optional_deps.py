@@ -83,7 +83,7 @@ PIP_ENV_KEYS = (
 _TOOL_CHECKS: dict[str, dict[str, Any]] = {
     "soffice": {
         "bins": ("soffice", "libreoffice"),
-        "note": "LibreOffice：转 PDF、重算 Excel 公式要用；系统级软件，MaiWork 不替你装（没装就按 skill 里写的回落）",
+        "note": "LibreOffice：转 PDF、重算 Excel 公式需要它；属系统级软件，MaiWork 不代为安装（未安装时按 skill 中的替代做法处理）",
     },
 }
 
@@ -261,7 +261,7 @@ def _error_summary(text: str) -> str:
             pick = line
     if not pick:
         pick = lines[-1] if lines else ""
-    return (pick[:MAX_ERROR_CHARS] or "装依赖失败（pip 没有给出更多信息）")
+    return (pick[:MAX_ERROR_CHARS] or "安装依赖失败（安装程序未给出更多信息）")
 
 
 def _pkg_installed(check: Mapping[str, Any], name: str) -> bool:
@@ -294,9 +294,9 @@ def _parse_probe(stdout: str, *, exit_code: int = 0) -> dict[str, Any]:
                 info["soffice"] = {"found": True, "path": line}
     if not info["python"]:
         info["error"] = (
-            "探测命令没跑起来（这台机器的 PATH 上没有 python3？）"
+            "探测命令未能启动（本机 PATH 中没有 python3）"
             if int(exit_code or 0) != 0
-            else "探测输出看不懂（没拿到结果）"
+            else "探测输出无法解析（未取得结果）"
         )
     return info
 
@@ -578,11 +578,11 @@ class OptionalDeps:
     def _run_note(self) -> str:
         """能不能在本机跑命令 / 探测（不能就装、卸都做不了）。"""
         if self._env is None:
-            return "本机执行环境没就位（这台机器不能隔离跑命令），可选依赖装不了"
+            return "本机执行环境不可用（这台机器无法隔离运行命令），无法安装可选依赖"
         cap = self._capability
         if cap is not None and not bool(getattr(cap, "ok", True)):
-            why = str(getattr(cap, "reason", "") or "本机执行没开")
-            return f"本机执行没开（{why}），可选依赖装不了"
+            why = str(getattr(cap, "reason", "") or "本机执行未启用")
+            return f"本机执行未启用（{why}），无法安装可选依赖"
         return ""
 
     def _unavailable_note(self) -> str:
@@ -601,10 +601,10 @@ class OptionalDeps:
         cap = self._capability
         if str(getattr(cap, "mode", "") or "") == "dynamic":
             return (
-                "这台机器用的是 systemd 临时用户隔离（系统里没有固定的运行账号）："
-                "子 agent 看不到 MaiWork 自己的库目录，可选组件装了也 import 不到，"
-                "所以这里先不提供安装。要用办公文档就先建一个专用运行账号"
-                "（例如 maiwork）并把「设置 → 运行环境 → 运行账号」配上，再回来装。"
+                "当前运行模式使用系统临时账号隔离，没有固定运行账号："
+                "子 agent 读不到 MaiWork 自己的库目录，可选组件装了也无法生效，"
+                "因此暂不提供安装。需要办公文档时，请先建立专用运行账号"
+                "（例如 maiwork），在「设置 → 全部设置 → 运行环境 → 运行账号」填好后返回安装。"
             )
         return ""
 
@@ -697,7 +697,9 @@ class OptionalDeps:
                 continue            # 探测期间环境换了：这次结果丢掉，按当前环境重探
             self._python_path = str(info.get("python") or "")
             return self._python_path
-        raise Unavailable("执行环境在探测期间变了（工作区 / 判定刚改过），这次装不了；稳定后再点一次")
+        raise Unavailable(
+            "执行环境在探测期间发生变化（工作区或判定刚修改过），本次未安装；配置稳定后请重新操作"
+        )
 
     # ---------------- 状态 ----------------
 
@@ -851,15 +853,15 @@ class OptionalDeps:
 
     async def _install(self, group: Group, specs: Sequence[str], *, by: str) -> None:
         rec = _Install(state="failed", by=by, packages=[p.name for p in group.packages])
-        epoch = self._epoch        # 装的过程中环境换了（工作区根改了）→ 这次结果不作数
+        epoch = self._epoch        # 安装过程中环境变了（工作区根改了）→ 本次结果无效
         try:
             target = self.dir()
             if target is None:
-                raise Unavailable("找不到安装目录（配置里的工作区根目录没读到）")
+                raise Unavailable("找不到安装目录（未读到配置中的工作区根目录）")
             target.mkdir(parents=True, exist_ok=True)
             python = await self._python()
             if not python:
-                raise Unavailable("这台机器的 PATH 上没有 python3，装不了（先装 python3）")
+                raise Unavailable("本机 PATH 中没有 python3，无法安装（请先安装 python3）")
             code, out, err = await self._pip(python, target, specs)
             log = _tail_text(out + "\n" + err)
             rec.log = log
@@ -868,29 +870,29 @@ class OptionalDeps:
                 rec.error = _error_summary(err or out)
             else:
                 _relax_perms(target)
-                # pip 说成功不算数：真在那个 python 下 import 到才算装好
+                # 安装程序说成功不算数：真在那个 python 下 import 到才算装好
                 info = await self._probe()
                 fresh = self._commit_check(info, epoch=epoch)
                 if fresh is None:
                     rec.state = "failed"
                     rec.error = (
-                        "装的过程中执行环境 / 工作区目录变了，这次结果不作数；"
-                        "等配置稳定了再点一次装"
+                        "安装过程中执行环境或工作区目录发生变化，本次结果无效；"
+                        "配置稳定后请重新安装"
                     )[:MAX_ERROR_CHARS]
                 else:
                     missing = [p.name for p in group.packages if not _pkg_installed(fresh, p.name)]
                     if missing:
                         rec.state = "failed"
                         rec.error = (
-                            "装完了但子 agent 那边 import 不到：" + "、".join(missing)
-                            + "（安装目录它可能读不到，看看运行账号有没有读权限）"
+                            "已安装，但子 agent 无法导入：" + "、".join(missing)
+                            + "（可能读不到安装目录，请检查运行账号的读权限）"
                         )[:MAX_ERROR_CHARS]
                     else:
                         rec.state = "ok"
                         rec.error = ""
         except asyncio.TimeoutError:
             rec.state = "failed"
-            rec.error = f"装依赖超时（超过 {self._timeout_s} 秒）"
+            rec.error = f"安装依赖超时（超过 {self._timeout_s} 秒）"
         except Exception as exc:
             logger.warning("装可选依赖「%s」出错", group.id, exc_info=True)
             rec.state = "failed"
@@ -910,9 +912,9 @@ class OptionalDeps:
             target = self.dir()
             removed = _remove_group_files(target, group) if target is not None else 0
             left = _group_leftovers(target, group) if target is not None else []
-            rec.log = f"删掉 {removed} 个文件 / 目录"
+            rec.log = f"已删除 {removed} 个文件或目录"
             if left:
-                rec.log += f"；还剩：{'、'.join(left)}"
+                rec.log += f"；仍存在：{'、'.join(left)}"
             info = await self._probe()
             fresh = self._commit_check(info, epoch=epoch)
             # 卸载的结论必须来自「真删干净了 + 真重新探测过」：
@@ -922,18 +924,19 @@ class OptionalDeps:
             if fresh is None:
                 rec.state = "failed"
                 rec.error = (
-                    "卸的过程中执行环境 / 工作区目录变了，这次结果没法确认；等配置稳定了再点一次"
+                    "卸载过程中执行环境或工作区目录发生变化，本次结果无法确认；"
+                    "配置稳定后请重新操作"
                 )[:MAX_ERROR_CHARS]
             elif str(fresh.get("error") or ""):
                 rec.state = "failed"
                 rec.error = (
-                    f"文件删了，但卸完没法确认状态（{fresh.get('error')}）"
+                    f"文件已删除，但卸载后无法确认状态（{fresh.get('error')}）"
                 )[:MAX_ERROR_CHARS]
             elif left:
                 rec.state = "failed"
                 rec.error = (
-                    "有的文件没删掉：" + "、".join(left)
-                    + "（多半是权限问题，看看服务端日志）"
+                    "部分文件未删除：" + "、".join(left)
+                    + "（通常是权限问题，请查看服务端日志）"
                 )[:MAX_ERROR_CHARS]
             else:
                 rec.state = "ok"

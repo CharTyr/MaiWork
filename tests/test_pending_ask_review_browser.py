@@ -95,8 +95,8 @@ async def test_settings_attention_and_optional_components_responsive(env, monkey
             for width in (390, 760, 1180, 1440):
                 await page.set_viewport_size({'width': width, 'height': 900})
                 await page.goto(base + '/#/settings/overview')
-                await expect(page.get_by_role('heading', name='需要你处理', exact=True)).to_be_visible()
-                await expect(page.get_by_text('文字版正在排队', exact=False)).to_be_visible()
+                await expect(page.get_by_role('heading', name='待处理', exact=True)).to_be_visible()
+                await expect(page.get_by_text('文字版等待发送', exact=False)).to_be_visible()
                 await expect(page.get_by_text('已改发文字版', exact=False)).to_have_count(0)
                 assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth'), width
                 await page.screenshot(path=str(tmp_path / f'attention-{width}.png'), full_page=True)

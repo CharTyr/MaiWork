@@ -21,7 +21,7 @@ export const ONB_STEPS = [
   { id: "search", name: "搜索" },
   { id: "admins", name: "群管理" },
   { id: "look", name: "头像" },
-  { id: "env", name: "能做什么" },
+  { id: "env", name: "能力说明" },
   { id: "done", name: "完成" },
 ];
 export const onb = { open: false, i: 0, busy: false, cfg: null, models: null, info: null, sequence: 0, done: {}, anims: [], presets: null, sxPicked: null };
@@ -130,14 +130,14 @@ export function onbPane(id) {
     // 鼓励先在「和 MaiWork 聊」里让它帮忙把环境配好（它会检查、开功能、装 skill）。
     return `
       <div class="onb-step-ico">${ico("sparkles")}</div>
-      <h1 class="onb-title">MaiWork 能做到什么</h1>
-      <p class="onb-lead">任务做得好不好，主要看模型能力和环境能做什么</p>
+      <h1 class="onb-title">能力说明</h1>
+      <p class="onb-lead">任务完成效果主要取决于模型能力和运行环境</p>
       <ul class="onb-list">
-        <li>${ico("robot")}<div><b>模型能力</b><span>主模型负责理解需求、分派和验收，模型越强，复杂任务越容易一次做好</span></div></li>
-        <li>${ico("tools")}<div><b>环境能做什么</b><span>联网搜索、运行代码、云端机器、生图模型、已装的 skill；没开的能力，相关任务就做不到</span></div></li>
-        <li>${ico("books")}<div><b>自带的做法</b><span>调研报告、目标追踪、构想整理等常用 skill 已内置；做 Word / Excel / PPT 要先在「设置 → 扩展」一键装办公文档组件（可选）</span></div></li>
+        <li>${ico("robot")}<div><b>模型能力</b><span>主模型负责理解需求、分派和验收。模型能力越强，复杂任务的完成质量越高</span></div></li>
+        <li>${ico("tools")}<div><b>运行环境</b><span>包括联网搜索、运行代码、云端机器、生图模型和已安装的 skill。未开启的能力，相关任务无法完成</span></div></li>
+        <li>${ico("books")}<div><b>内置 skill</b><span>已内置调研报告、目标追踪、构想整理等常用 skill。如需生成 Word、Excel、PPT，可在「设置 → 工具」安装办公文档组件</span></div></li>
       </ul>
-      <p class="onb-note">建议完成后先去「和 MaiWork 聊」，说说群里打算让它做哪些事，它会检查当前环境、帮你开启或配置缺的能力</p>`;
+      <p class="onb-note">完成设置后，建议在「和 MaiWork 聊」中说明需要 MaiWork 在群里做哪些事，MaiWork 会检查当前环境，并协助开启或配置缺少的能力</p>`;
   }
   return onbDonePane();
 }

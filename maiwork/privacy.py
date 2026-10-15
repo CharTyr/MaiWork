@@ -12,7 +12,7 @@
 
 用法：模型要出库 / 出库前发送的文字都过一遍；None = 整条作废或换兜底话
 （各调用方定：条目丢弃、开场白不发、交付说明换按任务标题生成的人话兜底——
-coordinator.delivery_note_fallback，如「<标题>弄好了，点开就能看」）。
+coordinator.delivery_note_fallback，如「<标题>做好了，点开就能看」）。
 """
 
 from __future__ import annotations

@@ -48,11 +48,11 @@ export const USE_NAMES = { chat: "聊天", image: "生图" };
 export const IMAGE_APIS = {
   openai: {
     name: "OpenAI 兼容",
-    hint: "OpenAI、火山方舟（豆包 Seedream）等：POST 到 /images/generations，尺寸字段用 size、张数用 n。",
+    hint: "适用于 OpenAI、火山方舟（豆包 Seedream）等兼容 OpenAI 图像生成接口的服务。",
   },
   siliconflow: {
     name: "硅基流动",
-    hint: "硅基流动：地址路径一样，但字段名不同（image_size / batch_size），返回的图片地址只活 1 小时。",
+    hint: "适用于硅基流动。服务商返回的图片链接 1 小时后失效，MaiWork 会在生成后立即保存图片。",
   },
 };
 const isImageModel = (x) => (x && (x.use || "chat")) === "image";
@@ -132,7 +132,7 @@ function modelMeta(x) {
       `用途 ${USE_NAMES.image}`,
       `接口 ${(IMAGE_APIS[x.image_api] || IMAGE_APIS.openai).name}`,
       x.image_default_size ? `默认尺寸 ${x.image_default_size}` : "默认尺寸跟随服务商",
-      `一次最多 ${x.image_max_n || 1} 张`,
+      `单次最多 ${x.image_max_n || 1} 张`,
     ].join(" · ");
   }
   return [
@@ -161,13 +161,13 @@ function modelRow(x) {
   const acts = image
     ? `${currentImage
         ? `<span class="tag">当前生图模型</span>`
-        : `<button type="button" class="btn small" style="min-height:44px;margin-top:8px" data-act="mdl-image-model" data-id="${esc(x.id)}">设为生图模型</button>`}${tip("生图模型只在任务需要画图时用；它不参与聊天，所以不用「验证」。")}`
+        : `<button type="button" class="btn small" style="min-height:44px;margin-top:8px" data-act="mdl-image-model" data-id="${esc(x.id)}">设为生图模型</button>`}${tip("生图模型仅在任务需要生成图片时调用，不参与对话，因此无需验证。")}`
     : `<button type="button" class="btn small" style="min-height:44px;margin-top:8px" data-act="mdl-model-verify" data-id="${esc(x.id)}">验证</button>${tip("发送几条测试消息，检查模型能否正常回复和调用工具。会消耗少量 token。")}
       <div class="set-text mdl-verify-result" role="status" aria-live="polite"${result ? "" : " hidden"}>${result ? esc(verificationMessage(result)) : ""}</div>`;
   return `<div class="set-row mdl-model">${ico("robot")}<div>
       <div class="set-name">${esc(x.name || x.model)}${image ? `<span class="tag">${esc(USE_NAMES.image)}</span>` : ""}${x.name && x.name !== x.model ? ` <span class="fine mono">${esc(x.model)}</span>` : ""}</div>
       <div class="set-text mdl-meta">${esc(modelMeta(x))}</div>
-      <div class="set-text">${image ? "给子 agent 画图用" : users.length ? `使用者：${esc(users.join("、"))}` : "未被使用"}</div>
+      <div class="set-text">${image ? "供子 agent 生成图片" : users.length ? `使用者：${esc(users.join("、"))}` : "未被使用"}</div>
       ${acts}
     </div><span class="row-btns"><button class="btn small" data-act="mdl-model-edit" data-id="${esc(x.id)}">修改</button><button class="btn small ghost" data-act="mdl-model-del" data-id="${esc(x.id)}">删除</button></span></div>`;
 }
@@ -232,7 +232,7 @@ export function presetMismatch(d) {
   if (!p || !p.base_url) return "";
   const ep = ((state.mdl && state.mdl.endpoints) || []).find((e) => e.id === d.endpoint) || {};
   if (normUrl(ep.base_url) === normUrl(p.base_url)) return "";
-  return `<div class="warn-box">「${esc(p.label)}」的地址是 <span class="mono">${esc(p.base_url)}</span>，当前端点「${esc(ep.name || ep.id || d.endpoint || "")}」的地址是 <span class="mono">${esc(ep.base_url || "未填写")}</span>，两者不一致。请先新建一个端点，填上这个地址和${p.key_url ? `从 <span class="mono">${esc(p.key_url)}</span> 获取的` : "对应的"}密钥，再在新端点下添加这个模型。</div>`;
+  return `<div class="warn-box">「${esc(p.label)}」的地址是 <span class="mono">${esc(p.base_url)}</span>，当前端点「${esc(ep.name || ep.id || d.endpoint || "")}」的地址是 <span class="mono">${esc(ep.base_url || "未填写")}</span>，两者不一致。请先新建一个端点，填写此地址和${p.key_url ? `从 <span class="mono">${esc(p.key_url)}</span> 获取的` : "对应的"}密钥，再在新端点下添加这个模型。</div>`;
 }
 
 function imageModelFields(d) {
@@ -240,14 +240,14 @@ function imageModelFields(d) {
   const api = IMAGE_APIS[d.image_api] || IMAGE_APIS.openai;
   return `
     ${presetMismatch(d)}
-    ${tipLabel("mo-image-api", "接口形状", `<p id="mo-image-api-hint">${esc(api.hint)}</p>`)}
+    ${tipLabel("mo-image-api", "接口类型", `<p id="mo-image-api-hint">${esc(api.hint)}</p>`)}
     <select id="mo-image-api" aria-describedby="mo-image-api-hint">${Object.entries(IMAGE_APIS).map(([k, v]) => `<option value="${k}"${k === (d.image_api || "openai") ? " selected" : ""}>${esc(v.name)}</option>`).join("")}</select>
     <div class="two-col">
-      <div>${tipLabel("mo-image-size", "默认尺寸（可选）", "不填就让服务商按默认来。例如 1024x1024、1536x1024；火山方舟也可以填档位，如 2K。")}<input id="mo-image-size" maxlength="40" spellcheck="false" value="${esc(d.image_default_size || "")}" placeholder="例如 1024x1024" /></div>
-      <div>${tipLabel("mo-image-n", "一次最多几张", "子 agent 一次调用最多能要几张（1~4）。")}<input id="mo-image-n" type="number" min="1" max="4" value="${esc(d.image_max_n ?? 1)}" /></div>
+      <div>${tipLabel("mo-image-size", "默认尺寸（可选）", "留空则使用服务商的默认尺寸。例如 1024x1024、1536x1024；火山方舟也支持填写档位，如 2K。")}<input id="mo-image-size" maxlength="40" spellcheck="false" value="${esc(d.image_default_size || "")}" placeholder="例如 1024x1024" /></div>
+      <div>${tipLabel("mo-image-n", "单次最多张数", "子 agent 单次调用最多生成的图片张数（1–4）。")}<input id="mo-image-n" type="number" min="1" max="4" value="${esc(d.image_max_n ?? 1)}" /></div>
     </div>
-    <p class="fine">生图模型不参与聊天，只在任务需要画图时用，所以不用填思考强度和上下文长度。</p>
-    ${presets.length ? `<details class="mdl-more"><summary>常用生图服务（点「填入」自动填好模型和接口形状）</summary>
+    <p class="fine">生图模型不参与对话，无需设置思考强度和上下文长度。</p>
+    ${presets.length ? `<details class="mdl-more"><summary>常用生图服务（点击「填入」自动填写模型和接口类型）</summary>
       <div>${presets.map((p) => `<div class="set-row"><div>
         <div class="set-name">${esc(p.label)}</div>
         <div class="set-text"><span class="mono">${esc(p.base_url)}</span> · 模型 ${esc(p.model)}<br>${esc(p.note || "")}</div>
@@ -267,7 +267,7 @@ function modelForm(d, isNew) {
     <datalist id="mo-avail">${avail.map((x) => `<option value="${esc(x)}"></option>`).join("")}</datalist>
     ${avail.length ? "" : `<p class="fine" style="margin:2px 0 0"><button type="button" class="link-btn" data-act="mdl-avail" data-ep="${esc(d.endpoint)}">获取可用模型列表</button></p>`}
     <label for="mo-name">显示名（可选）</label><input id="mo-name" maxlength="60" value="${esc(d.name && d.name !== d.model ? d.name : "")}" placeholder="留空则使用模型 ID" />
-    <div class="lbl-row"><label>用途</label>${tip("「聊天」用于对话和干活；「生图」只用来画图。生图模型不能当主模型或子 agent 的聊天模型。")}</div>
+    <div class="lbl-row"><label>用途</label>${tip("「聊天」用于对话和执行任务；「生图」仅用于生成图片，不能用作主模型或子 agent 的聊天模型。")}</div>
     <div class="seg mdl-seg" role="group" aria-label="用途">
       <button type="button" class="mdl-use" data-act="mdl-use" data-use="chat" aria-pressed="${image ? "false" : "true"}">聊天</button>
       <button type="button" class="mdl-use" data-act="mdl-use" data-use="image" aria-pressed="${image ? "true" : "false"}">生图</button>
@@ -537,7 +537,7 @@ export async function actModels(action, el) {
       Object.assign(edit.draft, readModel(), { use: "image", image_api: p.image_api, model: p.model, _preset: p });
       if (!edit.draft.name) edit.draft.name = p.label;
       repaintSheet();
-      toast(presetMismatch(edit.draft) ? `已填好模型 ${p.model}，但端点地址不一致，请查看表单里的提示` : `已按「${p.label}」填好模型 ${p.model}`);
+      toast(presetMismatch(edit.draft) ? `已填入模型 ${p.model}，但端点地址不一致，请查看表单中的提示` : `已填入「${p.label}」的模型 ${p.model}`);
       return true;
     }
     case "mdl-image-model": {
@@ -572,7 +572,7 @@ export async function actModels(action, el) {
         state.mdlEdit = null;
         await reloadAll();
         toast(body.use === "image"
-          ? (wasNew ? "已添加生图模型，可在模型行点「设为生图模型」" : "已保存")
+          ? (wasNew ? "已添加。点击「设为生图模型」后启用" : "已保存")
           : (wasNew ? "已添加，可在「专岗」中分配" : "已保存"));
       } catch (err) { el.disabled = false; showErr("mo-err", err.message); }
       return true;

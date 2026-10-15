@@ -68,11 +68,14 @@ async def test_env_overview_lists_abilities_and_key_rule(app) -> None:  # noqa: 
     assert r.ok, r.error
     assert "模型能力" in r.output and "联网搜索" in r.output
     assert "research-report" in r.output  # 自带 skill 列出来
-    assert "密钥一律请管理员自己在网页上填" in r.output
+    assert "密钥请自己在网页上填" in r.output
+    # 不能把内部工具名 / 参数名 / Markdown 星号写给管理员看
+    for bad in ("set_rules", "skill_install", "**"):
+        assert bad not in r.output, bad
 
 
 def test_admin_prompt_guides_env_setup(app) -> None:  # noqa: F811
     from CharTyr_MaiWork.maiwork.admin_chat import AdminChat
 
     p = AdminChat(app)._system_prompt({"group_id": ""})
-    assert "env_overview" in p and "skill_install" in p and "别让他把密钥发在对话里" in p
+    assert "env_overview" in p and "skill_install" in p and "不要在对话里发密钥" in p

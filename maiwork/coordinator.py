@@ -39,7 +39,7 @@
 - 主模型按计划 JSON 的 "env" 选「本机隔离环境」（local，默认）、「专用机器」（ssh，
   用户自己的 VPS / VM）或「一次性 VM」。一次性 VM 有哪几家由
   `environments/vm_platforms.py` 的注册表说了算（railway / freestyle），用户在
-  「设置 → 干活机器 → 临时机器用哪家」里单选，**同一时间只有一家可用**。
+  「设置 → 全部设置 → 运行环境 → 优先用哪家临时机器」里单选，**同一时间只有一家可用**。
   快、便宜、能直接交付的活走 local；要装一堆依赖、跑不信任的第三方代码、
   要 root/docker、要很多内存或长时间、要干净系统时选一次性 VM。
 - 选一次性 VM：acquire(job_id=task_id) 拿一台（同时只 1 台、每天有限额；拿不到就回落
@@ -132,12 +132,13 @@ _NOTE_SENTENCE_ENDS = "。！？!?；;"
 _NOTE_SOFT_ENDS = "，,、：:"
 _NOTE_BREAKS = _NOTE_SENTENCE_ENDS + _NOTE_SOFT_ENDS
 _NOTE_FALLBACK_SUFFIX = {
-    "file": "弄好了，文件在链接里",
-    "text": "弄好了，就这几句",
-    # image（2026-10-15）：图直接发在群里，没有「点开」的链接
-    "image": "弄好了，图发在群里了",
+    "file": "做好了，文件在链接里",
+    "text": "做好了，就这几句",
+    # image（2026-10-15）：图和说明是**同一条消息**，段顺序 [image, text]（host.send_image），
+    # 说明跟在图后面；不写「在下面」这种方位话——QQ 图文同一条的渲染顺序 docs/06 标「待实测」。
+    "image": "做好了",
 }
-_NOTE_FALLBACK_SUFFIX_DEFAULT = "弄好了，点开就能看"
+_NOTE_FALLBACK_SUFFIX_DEFAULT = "做好了，点开就能看"
 
 # ---------------------------------------------------------------------------
 # 直接回文字的活的正文（线上 T-13 事故，2026-10-10）
@@ -288,7 +289,7 @@ def _cut_note_at_punctuation(text: str, limit: int = _NOTE_MAX) -> str:
 
 
 def delivery_note_fallback(task_title: Any, deliver_kind: Any = "view") -> str:
-    """note 空 / 不合格时的人话兜底：`<任务标题>弄好了，点开就能看`（file 类说文件在链接里）。
+    """note 空 / 不合格时的人话兜底：`<任务标题>做好了，点开就能看`（file 类说文件在链接里）。
 
     标题里混进来的内部词（任务号 / 内部文件名）先刮掉，剩下的按句读截；整句 ≤ `_NOTE_MAX`。
     """
@@ -788,8 +789,8 @@ class ExecCheckReport:
             )
         elif needs == {"image"}:
             tail = (
-                "也可以改成不画图（用文字 / 表格说清），或先到网页「设置 → 模型」"
-                "加一个用途是「生图」的模型（端点要填地址和密钥）。"
+                "也可以改为不用图片交付（改用文字或表格说明），"
+                "或先在网页「设置 → 模型」添加一个用途为「生图」的模型。"
             )
         else:
             tail = "也可以把这条活改派给能拿到这些工具的岗位，或取消。"
@@ -3211,10 +3212,12 @@ class Coordinator:
             try:
                 settings = self._get_settings()
                 if preset is not None and preset.enabled(settings) and not preset.has_key(settings):
-                    return None, f"{label}开着，但还没填密钥（设置 → 干活机器）"
+                    return None, (
+                        f"{label}已启用，但未填写密钥（设置 → 全部设置 → 运行环境）"
+                    )
             except Exception:
                 logger.debug("判断 %s 缺不缺密钥出错，按通用原因说", kind, exc_info=True)
-            return None, f"现在没开 {label}（配置关了或环境没就位）"
+            return None, f"{label}未启用（配置已关闭或环境不可用）"
         busy = self._oneshot_busy(kind)
         if busy:
             return None, f"{self._vm_label(busy)}正被别的任务占着（临时机器同一时间只用一台）"

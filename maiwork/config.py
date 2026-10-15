@@ -359,7 +359,8 @@ class SSHServerConfig(PluginConfigBase):
 
 
 class EnvironmentsSectionConfig(PluginConfigBase):
-    __ui_label__ = "干活机器"
+    # 与网页「设置 → 全部设置」里的实际分节名保持一致（rules.CONFIG_SECTIONS: environments = 运行环境）
+    __ui_label__ = "运行环境"
     __ui_icon__ = "server"
     __ui_order__ = 11
 
@@ -1318,7 +1319,7 @@ def _parse_environments(
     if not _FREESTYLE_SNAPSHOT_RE.match(freestyle_snapshot):
         problems.append(
             f'[environments] freestyle_snapshot = "{freestyle_snapshot}" 不像镜像名'
-            "（如 freestyle/ubuntu-sm，或你自己拍的快照 sh-xxxx），本次用默认 freestyle/ubuntu-sm"
+            "（如 freestyle/ubuntu-sm，或你自建的快照 sh-xxxx），本次用默认 freestyle/ubuntu-sm"
         )
         freestyle_snapshot = "freestyle/ubuntu-sm"
     # 老配置兼容（二选一那版）：没写 freestyle 开关、但 vm_platform 选了 freestyle
@@ -1642,7 +1643,7 @@ def _parse_model_list(
             if len(image_default_size) > IMAGE_DEFAULT_SIZE_MAX:
                 problems.append(
                     f'模型库条目 "{mid}" 的 image_default_size 太长'
-                    f'（上限 {IMAGE_DEFAULT_SIZE_MAX} 字），本次按没填处理'
+                    f'（上限 {IMAGE_DEFAULT_SIZE_MAX} 字），本次按留空处理'
                 )
                 image_default_size = ""
             raw_n = entry.get("image_max_n", 1)

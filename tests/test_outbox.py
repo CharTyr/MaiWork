@@ -527,6 +527,8 @@ async def test_sent_file_recovers_missing_note_without_reupload(tmp_path, monkey
 
 async def test_sent_file_recovers_memo_after_note_queued(tmp_path, monkeypatch):
     """说明已入队但写备忘失败：下一轮补备忘，不重复入队说明或上传。"""
+    # 补备忘按真实时钟算 6 小时有效期：把时钟钉在 NOON，否则过了当天 18:00 就恒失败
+    monkeypatch.setattr(clock, "now", lambda: NOON)
     store, _, host, _, mentions, ob = _make(tmp_path)
     _seed_task(store)
     f = _artifact_file(tmp_path, "结果.txt", text="结果")

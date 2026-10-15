@@ -92,8 +92,8 @@ function imagegenBlock(g) {
     return `${x.getMonth() + 1}/${x.getDate()} ${String(x.getHours()).padStart(2, "0")}:${String(x.getMinutes()).padStart(2, "0")}`;
   };
   return `
-    <h2 class="h-sub">生图${tip("子 agent 调用生图模型画图的次数和张数。生图按张计费，费用请以服务商账单为准。")}</h2>
-    <p class="h-meta">${g.configured ? `使用模型：<span class="mono">${esc(g.model || g.model_id || "")}</span>` : "目前没有配置生图模型（可在「模型」里添加）"}</p>
+    <h2 class="h-sub">生图${tip("子 agent 调用生图模型的次数和生成的图片张数。费用以服务商账单为准。")}</h2>
+    <p class="h-meta">${g.configured ? `使用模型：<span class="mono">${esc(g.model || g.model_id || "")}</span>` : "未配置生图模型，可在「模型」中添加"}</p>
     <div class="usage usage-4">
       <div><b>${d.images || 0}</b><span>今日张数（调用 ${d.calls || 0} 次）</span></div>
       <div><b>${w.images || 0}</b><span>近 7 天张数</span></div>

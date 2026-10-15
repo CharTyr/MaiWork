@@ -1858,7 +1858,7 @@ class ConsoleServer:
                 return forbid
             deps = _optional_deps()
             if deps is None:
-                return _err(503, "可选依赖管理没就位（这个 MaiWork 版本没带这个模块）")
+                return _err(503, "可选依赖管理不可用（这个 MaiWork 版本不包含该模块）")
             try:
                 if not deps.checked():
                     view = await deps.refresh()  # 第一次：等这次探测，页面直接看到真状态
@@ -1867,7 +1867,7 @@ class ConsoleServer:
                     view = deps.status()
             except Exception:
                 logger.exception("读可选依赖状态出错")
-                return _err(500, "可选依赖状态读不出来")
+                return _err(500, "可选依赖状态读取失败")
             return web.json_response(view)
 
         async def _optional_deps_install(request: web.Request) -> web.Response:
@@ -1876,7 +1876,7 @@ class ConsoleServer:
                 return forbid
             deps = _optional_deps()
             if deps is None:
-                return _err(503, "可选依赖管理没就位（这个 MaiWork 版本没带这个模块）")
+                return _err(503, "可选依赖管理不可用（这个 MaiWork 版本不包含该模块）")
             from .. import optional_deps as _od
 
             gid = str(request.match_info.get("gid") or "")
@@ -1886,13 +1886,13 @@ class ConsoleServer:
                 return _err(404, f"没有叫「{gid}」的可选组件")
             except _od.Busy:
                 return web.json_response(
-                    {**deps.status(), "accepted": False, "error": "正在装，等它跑完再点"}, status=409
+                    {**deps.status(), "accepted": False, "error": "正在安装，完成后可再次操作"}, status=409
                 )
             except _od.Unavailable as e:
                 return _err(409, str(e))
             except Exception:
                 logger.exception("起可选依赖安装出错（%s）", gid)
-                return _err(500, "装不起来（看服务端日志）")
+                return _err(500, "无法安装（请查看服务端日志）")
             return web.json_response({**view, "accepted": True}, status=202)
 
         async def _optional_deps_uninstall(request: web.Request) -> web.Response:
@@ -1901,7 +1901,7 @@ class ConsoleServer:
                 return forbid
             deps = _optional_deps()
             if deps is None:
-                return _err(503, "可选依赖管理没就位（这个 MaiWork 版本没带这个模块）")
+                return _err(503, "可选依赖管理不可用（这个 MaiWork 版本不包含该模块）")
             from .. import optional_deps as _od
 
             gid = str(request.match_info.get("gid") or "")
@@ -1911,15 +1911,15 @@ class ConsoleServer:
                 return _err(404, f"没有叫「{gid}」的可选组件")
             except _od.Busy:
                 return web.json_response(
-                    {**deps.status(), "accepted": False, "error": "正在装 / 卸，等它跑完再点"}, status=409
+                    {**deps.status(), "accepted": False, "error": "正在安装或卸载，完成后可再次操作"}, status=409
                 )
             except _od.Unavailable as e:
-                # 本机执行没就位：卸完没法重新探测（也没法如实报状态），当场说清，
+                # 本机执行不可用：卸载后无法重新探测（也无法如实报状态），当场说清，
                 # 不 500、更不许拿「没环境」的错误桩覆盖上次那份好探测结果。
                 return _err(409, str(e))
             except Exception:
                 logger.exception("起可选依赖卸载出错（%s）", gid)
-                return _err(500, "卸不下来（看服务端日志）")
+                return _err(500, "无法卸载（请查看服务端日志）")
             return web.json_response({**view, "accepted": True}, status=202)
 
         app.router.add_route("POST", "/api/optional-deps/{gid}/install", self._write(_optional_deps_install))
@@ -3525,6 +3525,9 @@ class ConsoleServer:
 
         # ---------- 资讯卡片补救（2026-10-15；只给总管理员） ----------
 
+        # 查询参数用英文值（前端按值传），给管理员看的报错里换成中文说法（不把英文状态码写出去）
+        from ..card_push import CARD_STATUS_ZH as _CARD_STATUS_ZH
+
         _CARD_STATUSES = ("pending", "queued", "sending", "sent", "uncertain", "failed", "dropped")
 
         async def _news_cards_get(request: web.Request) -> web.Response:
@@ -3554,11 +3557,12 @@ class ConsoleServer:
                 gid = resolved
             status = str(request.query.get("status") or "").strip()
             if status and status not in _CARD_STATUSES:
-                return _err(400, "status 只能是 " + " / ".join(_CARD_STATUSES))
+                return _err(400, "状态取值不正确，只能是以下之一："
+                            + "、".join(_CARD_STATUS_ZH.get(s, s) for s in _CARD_STATUSES))
             try:
                 limit = int(request.query.get("limit") or 20)
             except (TypeError, ValueError):
-                return _err(400, "limit 要是数字")
+                return _err(400, "limit 必须是数字")
             secrets = views.secret_list(svc)
             try:
                 cards = cp.recent_cards(group_id=gid, status=status, limit=limit)
@@ -3590,7 +3594,7 @@ class ConsoleServer:
             try:
                 cid = int(request.match_info["id"])
             except (TypeError, ValueError):
-                return _err(400, "id 要是数字")
+                return _err(400, "id 必须是数字")
             try:
                 out = await cp.resend(cid)
             except KeyError:

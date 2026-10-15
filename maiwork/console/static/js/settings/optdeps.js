@@ -39,26 +39,26 @@ function schedulePoll() {
       if (finished.length !== running.length || finished.some((g) => !["ok", "failed", "interrupted"].includes((g.last_install || {}).state))) return;
       const failed = finished.some((g) => ["failed", "interrupted"].includes((g.last_install || {}).state));
       const uninstall = running.some((g) => g.uninstalling);
-      toast(failed ? `${uninstall ? "卸载没成功" : "没装成功"}，原因见「可选组件」` : uninstall ? "已卸载" : "已安装", failed);
+      toast(failed ? `${uninstall ? "卸载失败" : "安装失败"}，原因见「可选组件」` : uninstall ? "已卸载" : "已安装", failed);
     }
   }, 3000);
 }
 
 function pkgText(p) {
   if (p.installed === true) return `${esc(p.name)} ${esc(p.version || "")}`.trim();
-  if (p.installed === false) return `<span class="od-miss">${esc(p.name)} 未装</span>`;
+  if (p.installed === false) return `<span class="od-miss">${esc(p.name)} 未安装</span>`;
   return `${esc(p.name)} 未检查`;
 }
 
 function stateText(g) {
-  if (g.installing) return "正在安装，通常需要一到两分钟，可以先离开这个页面";
+  if (g.installing) return "正在安装，通常需要 1–2 分钟，可离开此页面";
   if (g.uninstalling) return "正在卸载…";
   const n = g.installed_count || 0;
   const total = g.total || (g.packages || []).length;
-  if (g.state === "ok") return "已安装，子 agent 可以直接生成和编辑这类文件";
-  if (g.state === "partial") return `装了一部分（${n}/${total}），建议重新安装`;
-  if (g.state === "missing") return "未安装。不装也能用：会改用 Markdown、表格或网页交付";
-  return "还没检查";
+  if (g.state === "ok") return "已安装，子 agent 可以生成和编辑这类文件";
+  if (g.state === "partial") return `部分安装（${n}/${total}），请重新安装`;
+  if (g.state === "missing") return "未安装。未安装时改用 Markdown、表格或网页交付";
+  return "未检查";
 }
 
 function groupRow(g) {
@@ -74,9 +74,9 @@ function groupRow(g) {
       }</span>`;
   const warn =
     li.state === "failed" && !doing
-      ? `<div class="warn-box" style="margin-top:8px"><b>上次操作没成功：</b>${esc(li.error || "原因未知")}</div>`
+      ? `<div class="warn-box" style="margin-top:8px"><b>上次操作失败：</b>${esc(li.error || "原因未知")}</div>`
       : li.state === "interrupted" && !doing
-        ? `<div class="warn-box" style="margin-top:8px">上次操作被打断（插件重新加载了），请重新操作</div>`
+        ? `<div class="warn-box" style="margin-top:8px">上次操作因插件重新加载而中断，请重新操作</div>`
         : "";
   const tools = (g.tools || [])
     .filter((t) => !t.found)
@@ -94,9 +94,9 @@ export function optDepsSection() {
   if (!v && !state.optDepsErr) return "";
   const head = `<div class="h-sub-row"><h2 class="h-sub">可选组件${tip("按需安装的额外能力。安装在 MaiWork 自己的目录里，不会改动 MaiBot 的运行环境。")}</h2></div>`;
   if (!v) return `${head}<p class="h-meta">读取失败：${esc(state.optDepsErr)} <button type="button" class="link-btn" data-act="od-reload">重试</button></p>`;
-  if (v.available === false) return `${head}<p class="h-meta">${esc(v.note || "本机执行没有开启，暂时不能安装")}</p>`;
+  if (v.available === false) return `${head}<p class="h-meta">${esc(v.note || "本机执行未开启，无法安装")}</p>`;
   const refreshError = state.optDepsErr ? `<p class="h-meta" role="status">刷新失败：${esc(state.optDepsErr)} <button type="button" class="link-btn" data-act="od-reload">重试</button></p>` : "";
-  return `${head}${refreshError}${(v.groups || []).map(groupRow).join("")}${v.check_error ? `<p class="fine">检查出错：${esc(v.check_error)}</p>` : ""}`;
+  return `${head}${refreshError}${(v.groups || []).map(groupRow).join("")}${v.check_error ? `<p class="fine">检查失败：${esc(v.check_error)}</p>` : ""}`;
 }
 
 export async function actOptDeps(a, el) {
@@ -112,7 +112,7 @@ export async function actOptDeps(a, el) {
       el.disabled = true;
       try {
         state.optDeps = await api("POST", `/api/optional-deps/${encodeURIComponent(id)}/${a === "od-install" ? "install" : "uninstall"}`);
-        toast(a === "od-install" ? "开始安装" : "开始卸载");
+        toast(a === "od-install" ? "已开始安装" : "已开始卸载");
       } catch (err) {
         toast(err.message, true);
         await loadOptDeps();

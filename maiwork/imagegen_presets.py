@@ -47,7 +47,7 @@ PRESETS: dict[str, Preset] = {
             models=("gpt-image-1", "gpt-image-1-mini", "dall-e-3"),
             key_url="https://platform.openai.com/api-keys",
             docs_url="https://platform.openai.com/docs/guides/image-generation",
-            note="按张计费，没有免费额度；gpt-image 系固定回 base64。",
+            note="按张计费，没有免费额度。",
         ),
         Preset(
             id="ark",
@@ -71,7 +71,7 @@ PRESETS: dict[str, Preset] = {
             models=("Kwai-Kolors/Kolors",),
             key_url="https://cloud.siliconflow.cn/account/ak",
             docs_url="https://docs.siliconflow.com/cn/api-reference/images/images-generations",
-            note="有免费额度；字段名和响应形状与 OpenAI 不同（已单独适配），图片地址只活 1 小时。",
+            note="有免费额度；生成的图片链接有效期 1 小时。",
         ),
     )
 }

@@ -400,8 +400,9 @@ def _read_page_text(path: Path) -> str:
 
 # ---------------------------------------------------------------------------
 # 交付说明的兜底措辞（2026-10 docs/26 问题 C，线上 T-10 / T-11）：
-# 和 coordinator.delivery_note_fallback 同一套口径——`<任务标题>弄好了，点开就能看`
-# （file 说「文件在链接里」、text 说「就这几句」），标题里的内部词先刮掉、整句 ≤60 字。
+# 和 coordinator.delivery_note_fallback 同一套口径——`<任务标题>做好了，点开就能看`
+# （file 说「文件在链接里」、text 说「就这几句」、image 只说「做好了」（图就在同一条消息里）），
+# 标题里的内部词先刮掉、整句 ≤60 字。
 # 这里是**本地副本**：coordinator import 了 outbox，反向 import 会成环；改措辞时两边一起改。
 # ---------------------------------------------------------------------------
 _NOTE_MAX = 60
@@ -411,9 +412,9 @@ _NOTE_INTERNAL_RE = re.compile(
 _NOTE_SENTENCE_ENDS = "。！？!?；;"
 _NOTE_SOFT_ENDS = "，,、：:"
 _NOTE_BREAKS = _NOTE_SENTENCE_ENDS + _NOTE_SOFT_ENDS
-_NOTE_FALLBACK_SUFFIX = {"file": "弄好了，文件在链接里", "text": "弄好了，就这几句",
-                         "image": "弄好了，图发在群里了"}
-_NOTE_FALLBACK_SUFFIX_DEFAULT = "弄好了，点开就能看"
+_NOTE_FALLBACK_SUFFIX = {"file": "做好了，文件在链接里", "text": "做好了，就这几句",
+                         "image": "做好了"}
+_NOTE_FALLBACK_SUFFIX_DEFAULT = "做好了，点开就能看"
 
 
 def _cut_note_at_punctuation(text: str, limit: int = _NOTE_MAX) -> str:
@@ -433,7 +434,7 @@ def _cut_note_at_punctuation(text: str, limit: int = _NOTE_MAX) -> str:
 
 
 def _note_fallback(task_title: Any, deliver_kind: Any = "view") -> str:
-    """note 空 / 不合格时的人话兜底：`<任务标题>弄好了，点开就能看`（file 说文件在链接里）。
+    """note 空 / 不合格时的人话兜底：`<任务标题>做好了，点开就能看`（file 说文件在链接里）。
 
     标题里混进来的内部词（任务号 / 内部文件名）先刮掉，剩下的按句读截；整句 ≤60 字。
     """
@@ -2036,7 +2037,7 @@ class Delivery:
                     "图要先写进本任务的成品目录）"
                 )
             # 图发不出去改发群文件时，说明必须换成**群文件口径**（2026-10-15）：
-            # 原来的交付说明是「…图发在群里了」，图没发出去还这么说就是假话。
+            # 原来的交付说明默认图已在群里，图没发出去还这么说就是假话。
             fb_note = _note_fallback(self._task_title(task_id), "file")
             first_id = 0
             for i, img in enumerate(images):

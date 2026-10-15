@@ -1,9 +1,9 @@
-"""真实 JS（2026-10-15 线上巡检后）：设置概况「需要你处理」+ 工具页「可选组件」。
+"""真实 JS（2026-10-15 线上巡检后）：设置概况「待处理」+ 工具页「可选组件」。
 
-- 待复核 @ 请求按群汇总，给「去处理」；没发出去的资讯卡片列出来，给「重发」；
+- 待复核 @ 请求按群汇总，给「处理」；发送失败的资讯卡片列出来，给「重发」；
 - 两样都没有 → 整块不显示（不画空标题）；
 - 可选组件：没装给「安装」、装好给「卸载」、装着显示进度不给按钮；上次失败写原因；
-  「被打断」不显示成正在装；读取失败写原因 + 重试；后端没这个模块（null 且无错）整块不显示；
+  「中断」不显示成正在装；读取失败写原因 + 重试；后端没这个模块（null 且无错）整块不显示；
 - 所有文字转义。
 """
 import json
@@ -49,21 +49,21 @@ def test_attention_lists_review_asks_and_failed_cards(tmp_path):
              "titles": ["<b>头条</b>"], "error": "send.hybrid 发送失败：超时", "fallback": {"status": "sent"}},
         ]},
     }})
-    assert "需要你处理" in html
+    assert "待处理" in html
     assert "2 条 @ 请求" in html and "17 天" in html and 'data-act="att-asks"' in html and 'data-g="111"' in html
     assert "&lt;测试群&gt;" in html and "<测试群>" not in html
-    assert 'data-act="att-resend"' in html and 'data-id="99"' in html and "没发出去" in html
+    assert 'data-act="att-resend"' in html and 'data-id="99"' in html and "发送失败" in html
     assert "&lt;b&gt;头条" in html and "已改发文字版" in html and "超时" in html
 
 
 @pytest.mark.parametrize(("fallback", "expected"), [
     ({}, ""),
-    ({"status": "queued"}, "文字版正在排队"),
+    ({"status": "queued"}, "文字版等待发送"),
     ({"status": "sent"}, "已改发文字版"),
-    ({"status": "failed"}, "文字版也没发出去"),
-    ({"status": "uncertain"}, "文字版不确定是否发出"),
+    ({"status": "failed"}, "文字版发送失败"),
+    ({"status": "uncertain"}, "文字版发送结果未知"),
     ({"status": "dropped"}, "文字版已取消"),
-    ({"status": "no_items"}, "没有可发的文字内容"),
+    ({"status": "no_items"}, "无可发送的文字内容"),
 ])
 def test_attention_reports_actual_text_fallback_status(tmp_path, fallback, expected):
     html = render(tmp_path, ATT, "attentionSection", state={"attention": {"cards": {"cards": [
@@ -108,7 +108,7 @@ def test_optdeps_missing_offers_install(tmp_path):
     html = render(tmp_path, OD, "optDepsSection", state={"optDeps": _od()})
     assert "可选组件" in html and "办公文档" in html
     assert 'data-act="od-install"' in html and 'data-act="od-uninstall"' not in html
-    assert "未安装" in html and "python-docx 未装" in html and "openpyxl 未检查" in html
+    assert "未安装" in html and "python-docx 未安装" in html and "openpyxl 未检查" in html
     assert "LibreOffice" in html
 
 
@@ -127,9 +127,9 @@ def test_optdeps_installing_shows_progress_no_buttons(tmp_path):
 
 def test_optdeps_failed_and_interrupted(tmp_path):
     html = render(tmp_path, OD, "optDepsSection", state={"optDeps": _od(last_install={"state": "failed", "error": "<pip> 网络不通"})})
-    assert "上次操作没成功" in html and "&lt;pip&gt; 网络不通" in html and "重新安装" in html
+    assert "上次操作失败" in html and "&lt;pip&gt; 网络不通" in html and "重新安装" in html
     html = render(tmp_path, OD, "optDepsSection", state={"optDeps": _od(last_install={"state": "interrupted"})})
-    assert "被打断" in html and "正在安装" not in html
+    assert "中断" in html and "正在安装" not in html
 
 
 def test_optdeps_load_error_and_absent(tmp_path):
@@ -153,7 +153,7 @@ def test_wired_into_pages_and_actions():
     od = (JS / "settings/optdeps.js").read_text()
     assert "confirm(" in od.split('case "od-uninstall"')[1] or "confirm(" in od.split("od-uninstall")[-1]
     onb = (JS / "onboarding.js").read_text()
-    assert "开箱可用" not in onb and "一键装办公文档组件" in onb
+    assert "开箱可用" not in onb and "「设置 → 工具」安装办公文档组件" in onb
 
 
 def test_usage_page_shows_imagegen(tmp_path):

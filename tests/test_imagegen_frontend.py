@@ -120,7 +120,7 @@ def test_image_row_marked_and_no_chat_verify_button(tmp_path: Path) -> None:
 
 def test_image_row_shows_shape_and_limits(tmp_path: Path) -> None:
     html = render(tmp_path)
-    assert "一次最多 2 张" in html
+    assert "单次最多 2 张" in html
     assert "默认尺寸 1024x1024" in html
     assert "硅基流动" in html  # image_api 的中文名
 

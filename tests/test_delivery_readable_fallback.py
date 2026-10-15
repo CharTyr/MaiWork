@@ -447,14 +447,15 @@ def _note_fallback():
 
 
 async def test_reissue_note_wording_matches_delivery_fallback():
-    """兜底措辞：`<标题>弄好了，点开就能看`（file / text 各有说法），内部词刮掉、≤60 字。"""
+    """兜底措辞：`<标题>做好了，点开就能看`（file / text / image 各有说法），内部词刮掉、≤60 字。"""
     note = _note_fallback()
-    assert note("月度账单", "file") == "月度账单弄好了，文件在链接里"
-    assert note("韩国银行事件", "text") == "韩国银行事件弄好了，就这几句"
-    assert note("月度账单", "view") == "月度账单弄好了，点开就能看"
-    assert note("", "view") == "弄好了，点开就能看"
+    assert note("月度账单", "file") == "月度账单做好了，文件在链接里"
+    assert note("韩国银行事件", "text") == "韩国银行事件做好了，就这几句"
+    assert note("月度账单", "view") == "月度账单做好了，点开就能看"
+    assert note("两只猫", "image") == "两只猫做好了"
+    assert note("", "view") == "做好了，点开就能看"
     dirty = note("T-11 的成品已经放好了", "file")
-    assert "T-11" not in dirty and dirty.endswith("弄好了，文件在链接里")
+    assert "T-11" not in dirty and dirty.endswith("做好了，文件在链接里")
     assert len(note("标题" * 40, "view")) <= 60
 
 
@@ -466,5 +467,5 @@ async def test_reenqueue_missing_uses_new_note_wording(tmp_path):
     delivery = Delivery(store, ob)
     assert await delivery.reenqueue_missing("T-11", None) is True
     await ob.flush(NOON)
-    assert host.texts[0]["text"] == "月度账单弄好了，就这几句"
+    assert host.texts[0]["text"] == "月度账单做好了，就这几句"
     assert host.texts[0]["at_user"] == REQUESTER

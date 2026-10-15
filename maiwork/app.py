@@ -604,7 +604,7 @@ class MaiWorkApp:
             identity=self.identity,
         )
         # 3.55 一次性 VM（资讯实测 + 派活，docs/07 §11.1b / §11.1d）：按
-        # 「设置 → 干活机器 → 临时机器用哪家」（railway / freestyle）建**当前选中的那一家**
+        # 「设置 → 全部设置 → 运行环境 → 优先用哪家临时机器」（railway / freestyle）建**当前选中的那一家**
         # + 注册 vm 工具；Feeds 的 verify_runner 从这里拿（没建起来 → None）
         self.vms = self._make_vm_envs()
         self.railway = self.vms.get("railway")
@@ -2101,8 +2101,11 @@ class MaiWorkApp:
         """后台验密钥：结论写 kv（只写「行不行 + 中文说明」，绝不写密钥本身）。"""
         try:
             ok, text = await env.check_key()
-        except Exception as e:
-            ok, text = False, f"验密钥时出错：{e}"
+        except Exception:
+            # 原始异常只进日志：这条 text 会直接显示在网页健康项上（views._freestyle_health），
+            # 不能把英文异常原文写给用户看（2026-10-15 用户定）。
+            logger.exception("验 Freestyle 密钥时出错")
+            ok, text = False, "验密钥时出错，请稍后再试"
         try:
             with self.store.tx() as conn:
                 self.store.kv_set(

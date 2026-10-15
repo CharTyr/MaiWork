@@ -1458,7 +1458,7 @@ def _railway_health(svc: Any) -> dict[str, Any] | None:
     - railway=false → off；
     - 开着 → ok「今天用了 N/<railway_daily_max> 台」（N = 今天成功拿到的台数）；
     - 最近一次申请没拿到（railway.last_fail 在最近 24 小时内、且之后没再成功拿到过）
-      → warn「最近一次没拿到机器：<原因>」。
+      → warn「最近一次未能获取机器：<原因>」。
     状态全部从 kv 读（railway.day.<北京日期> / railway.last_fail / railway.last_acquire），
     网页不用有 RailwayEnv 实例也能显示。
     """
@@ -1504,7 +1504,7 @@ def _railway_health(svc: Any) -> dict[str, Any] | None:
             fail_ts = 0.0
         if fail_ts > last_acquire_ts and clock.now() - fail_ts < 86400.0:
             reason = str(last_fail.get("reason") or "").strip() or "原因不明"
-            return {**base, "state": "warn", "text": f"最近一次没拿到机器：{reason}"}
+            return {**base, "state": "warn", "text": f"最近一次未能获取机器：{reason}"}
     return {**base, "state": "ok", "text": f"可用 · 今天用了 {used}/{daily_max} 台"}
 
 
@@ -1514,7 +1514,7 @@ def _freestyle_health(svc: Any) -> dict[str, Any] | None:
     - [environments] 里没有 environments 节（老 stub）→ None，不出现在健康列表里；
     - 现在选的不是 Freestyle → off「没在用」（和 railway 那条二选一，不同时列）；
     - 选了但没填 key → warn「还没填 API key」；
-    - 密钥验不过（后台 check_key 写过 kv["freestyle.key_check"]，24 小时内）→ warn；
+    - 密钥验证失败（后台 check_key 写过 kv["freestyle.key_check"]，24 小时内）→ warn；
     - 否则 ok「可用 · 今天用了 N/<上限> 台」。
 
     **验 key 的网络请求在后台**（app._maybe_check_freestyle → FreestyleEnv.check_key →
@@ -1530,9 +1530,9 @@ def _freestyle_health(svc: Any) -> dict[str, Any] | None:
     from ..environments import vm_platforms
 
     if "freestyle" not in vm_platforms.enabled_kinds(settings):
-        return {**base, "state": "off", "text": "没开（设置 → 干活机器 → Freestyle 临时机器）"}
+        return {**base, "state": "off", "text": "未启用（设置 → 全部设置 → 运行环境 → Freestyle 临时机器）"}
     if not vm_platforms.api_key_of("freestyle", settings):
-        return {**base, "state": "warn", "text": "还没填 Freestyle 密钥（设置 → 干活机器）"}
+        return {**base, "state": "warn", "text": "未填写 Freestyle 密钥（设置 → 全部设置 → 运行环境 → Freestyle 密钥）"}
     daily_max = max(1, int(getattr(env, "freestyle_daily_max", 2) or 2))
     used = 0
     last_fail: dict | None = None
@@ -1568,7 +1568,7 @@ def _freestyle_health(svc: Any) -> dict[str, Any] | None:
                 key_check = kc
         except Exception:
             key_check = None
-    # 密钥验不过（后台刚验过、24 小时内）优先报：这是「用户要先修的事」
+    # 密钥验证失败（后台刚验过、24 小时内）优先报：这是「用户要先修的事」
     if key_check is not None and not bool(key_check.get("ok", True)):
         try:
             kc_ts = float(key_check.get("ts", 0) or 0)
@@ -1576,7 +1576,7 @@ def _freestyle_health(svc: Any) -> dict[str, Any] | None:
             kc_ts = 0.0
         if clock.now() - kc_ts < 86400.0:
             reason = str(key_check.get("text") or "").strip() or "原因不明"
-            return {**base, "state": "warn", "text": f"密钥验不过：{reason}"}
+            return {**base, "state": "warn", "text": f"密钥验证失败：{reason}"}
     if last_fail is not None:
         try:
             fail_ts = float(last_fail.get("ts", 0) or 0)
@@ -1584,7 +1584,7 @@ def _freestyle_health(svc: Any) -> dict[str, Any] | None:
             fail_ts = 0.0
         if fail_ts > last_acquire_ts and clock.now() - fail_ts < 86400.0:
             reason = str(last_fail.get("reason") or "").strip() or "原因不明"
-            return {**base, "state": "warn", "text": f"最近一次没拿到机器：{reason}"}
+            return {**base, "state": "warn", "text": f"最近一次未能获取机器：{reason}"}
     return {**base, "state": "ok", "text": f"可用 · 今天用了 {used}/{daily_max} 台"}
 
 

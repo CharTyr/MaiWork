@@ -64,7 +64,7 @@ async def test_image_delivery_rows_count_as_artifacts():
 
 
 async def test_image_note_fallback_wording():
-    assert _note_fallback("两只猫", "image") == "两只猫弄好了，图发在群里了"
+    assert _note_fallback("两只猫", "image") == "两只猫做好了"
 
 
 async def test_failed_image_falls_back_to_group_file(tmp_path):
@@ -115,6 +115,6 @@ async def test_admin_resend_rebuilds_image_delivery(tmp_path):
     assert await delivery.reenqueue_missing("T-1", _Env(tmp_path)) is True
     rows = [r for r in _rows(store) if r["kind"] == "image"]
     assert [r["key"] for r in rows] == ["task:T-1:deliver", "task:T-1:deliver:img2"]
-    assert json.loads(rows[0]["payload"])["text"] == "两只猫弄好了，图发在群里了"
+    assert json.loads(rows[0]["payload"])["text"] == "两只猫做好了"
     # 已有成品行 → 不重复建
     assert await delivery.reenqueue_missing("T-1", _Env(tmp_path)) is False

@@ -140,10 +140,10 @@ context_window = 128000
 # 一次回答最多写多少 token（1024~1000000，默认 32768，必须小于 context_window）。
 # 每次模型调用都会带上它，有些端点收不到这个参数会出错。
 max_tokens = 32768
-# 用途（0.10.0 起，可省）：chat（默认，聊天 / 干活）或 image（生图）。生图条目不能当聊天模型，
-# 网页「设置 → 模型」里切到「生图」加更方便。下面三项只在 use = "image" 时有意义。
+# 用途（0.10.0 起，可省）：chat（默认，聊天与干活）或 image（生图）。生图条目不能当聊天模型；
+# 在网页「设置 → 模型」里直接添加生图条目更方便。下面三项只在 use = "image" 时有效。
 # use = "chat"
-# image_api = "openai"    # 生图接口形状：openai（OpenAI / 火山方舟）或 siliconflow（硅基流动）
+# image_api = "openai"    # 生图接口类型：openai（OpenAI、火山方舟）或 siliconflow（硅基流动）
 # image_default_size = "" # 默认尺寸（空 = 服务商默认），如 1024x1024
 # image_max_n = 1         # 一次最多画几张（1~4）
 
@@ -240,11 +240,11 @@ maibot_webui_url = ""
 railway = true
 # 是否允许用 Freestyle 临时 VM 跑活（还要填密钥才真能用）。
 freestyle = false
-# 两家都开时优先用哪家："railway" 或 "freestyle"；优先那家拿不到（故障、当天用完、正被占着）自动换另一家。
-# 同一时间两家合计只用一台。
+# 两家都启用时优先用哪家："railway" 或 "freestyle"；优先那家不可用（故障、当天额度用完、正被占用）
+# 会自动切换另一家。同一时间两家合计只用一台。
 vm_platform = "railway"
 # ---- Freestyle（https://www.freestyle.sh ；控制台 https://dash.freestyle.sh ）----
-# 账号级 API key：在控制台创建一个（只在创建时显示一次），只进不出。
+# 账号级 API key：在控制台创建一个（只在创建时显示一次），填写后不回显。
 # 也可以不改这里，改用环境变量 FREESTYLE_API_KEY（优先级更高）。
 freestyle_api_key = ""
 # 机器规格用哪个镜像（创建时不能单独选 CPU / 内存，只能靠镜像）：
@@ -254,7 +254,7 @@ freestyle_snapshot = "freestyle/ubuntu-sm"
 freestyle_ttl_minutes = 60
 # 无网络活动多少分钟后自动休眠；休眠只算存储费，文件仍可读（1~1440）。
 freestyle_idle_minutes = 10
-# Freestyle 一次性 VM 每天最多用几台（1~10；免费档并发上限 10，自留余量）。
+# Freestyle 一次性 VM 每天最多用几台（1~10）。
 freestyle_daily_max = 2
 # 自己的专用 VPS / VM（可以写多台）：要跑命令的活优先用它们，按列出顺序挑连得上、没活的那台。
 # 先把网页「运行状态 → 专用机器」里的 MaiWork 公钥加进机器的 ~/.ssh/authorized_keys。

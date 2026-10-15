@@ -140,7 +140,7 @@ def skill_source_url(url: str) -> tuple[str, str]:
 
     - 直接的 .zip 链接 → zip；
     - GitHub 上某个 skill 目录 / SKILL.md 页面 → raw.githubusercontent.com 的 SKILL.md（只装这一份文件；
-      带脚本 / 附件的 skill 请管理员下载 zip 后在网页「设置 → 扩展」上传）；
+      带脚本 / 附件的 skill 请管理员下载 zip 后在网页「设置 → 工具」上传）；
     - 直接的 …/SKILL.md 原文链接 → md。"""
     u = str(url or "").strip()
     if not u.lower().startswith("https://") or any(c in u for c in " \n\r\t\"'<>"):
@@ -157,8 +157,8 @@ def skill_source_url(url: str) -> tuple[str, str]:
     if low.endswith("/skill.md"):
         return u, "md"
     raise ValueError(
-        "这个网址认不出是 skill：给 GitHub 上 skill 目录或 SKILL.md 的链接，或一个 .zip 下载链接"
-        "（skills.sh 的页面请点进它的 GitHub 源仓库再给链接）"
+        "无法从这个网址识别 skill。请提供 GitHub 上 skill 目录或 SKILL.md 的链接，"
+        "或一个 .zip 下载链接；skills.sh 的页面请先打开它对应的 GitHub 仓库再复制链接。"
     )
 
 
@@ -1679,11 +1679,11 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         settings = _settings()
         data_dir = getattr(settings, "data_dir", None) or getattr(svc, "data_dir", None)
         if data_dir is None or getattr(svc, "store", None) is None:
-            return _bad("skill 目录没就位，这次装不了")
+            return _bad("skill 目录不可用，本次无法安装")
         pending = _need_confirm(
             "skill_install", args,
             f"从 {url} 下载并安装一个 skill" + ("（同名的会被覆盖）" if replace else "")
-            + "；外部内容，装之前最好先在网页上看一眼它写了什么",
+            + "；这是外部内容，建议先在网页上查看它的内容",
         )
         if pending is not None:
             return pending
@@ -1707,7 +1707,10 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             except Exception:
                 name = ""
             if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", name or ""):
-                return _bad("下载到的不是合格的 SKILL.md（开头要有 name: 小写字母数字和连字符）")
+                return _bad(
+                    "下载到的文件不是合格的 SKILL.md：开头缺少 name 字段，"
+                    "或 name 含小写字母、数字、连字符以外的字符"
+                )
             mem = io.BytesIO()
             with zipfile.ZipFile(mem, "w") as zf:
                 zf.writestr(f"{name}/SKILL.md", text)
@@ -1716,15 +1719,17 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             # 同网页上传一样在本线程装（store 不能跨线程用；包有大小上限，很快）
             view = skills_web.install_zip(svc.store, data_dir, blob, filename=url.rsplit("/", 1)[-1], replace=replace)
         except FileExistsError as e:
-            return _bad(f"{e}（要覆盖就带 replace=true 再来一次）")
+            return _bad(f"{e}（如需覆盖，请说明「覆盖同名 skill」后重试）")
         except ValueError as e:
-            return _bad(f"装不上：{e}")
+            return _bad(f"安装失败：{e}")
         name = str((view or {}).get("name") or "") if isinstance(view, dict) else ""
-        return _ok(f"已安装 skill「{name or '（见扩展页）'}」；网页「设置 → 扩展」里能看到、能停用", data=view)
+        if name:
+            return _ok(f"已安装 skill「{name}」；网页「设置 → 工具」里能看到、能停用", data=view)
+        return _ok("已安装 skill；网页「设置 → 工具」里能看到、能停用", data=view)
 
     async def env_overview(ctx: ToolContext, args: dict) -> ToolResult:
         """现在这套 MaiWork 能做到什么（模型 / 搜索 / 干活环境 / 交付 / skill / MCP），缺的怎么补。"""
-        lines: list[str] = ["任务做不做得成，主要看两件事：模型能力，和下面这些环境能力。"]
+        lines: list[str] = ["任务能否做成，主要看模型能力和下面这些环境能力。"]
         mark = {"ok": "✅", "warn": "⚠️", "wait": "⏳", "off": "⛔"}
         data: dict[str, Any] = {"items": []}
         try:
@@ -1735,7 +1740,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                 lines.append(f"{mark.get(str(it.get('state')), '•')} {it.get('title')}：{it.get('text')}")
         except Exception:
             logger.exception("env_overview 读能力清单出错")
-            lines.append("（能力清单这次读不出来）")
+            lines.append("（能力清单暂时读取失败）")
         env = getattr(_settings(), "environments", None)
         try:
             from .environments import vm_platforms as _vmp
@@ -1747,13 +1752,13 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             if _on:
                 names = "、".join(
                     (_vmp.get(k).label if _vmp.get(k) else k)
-                    + ("（还没填密钥）" if _vmp.get(k) and not _vmp.get(k).has_key(_settings()) else "")
+                    + ("（未填写密钥）" if _vmp.get(k) and not _vmp.get(k).has_key(_settings()) else "")
                     for k in _on
                 )
-                tail = "；排第一的优先用，拿不到自动换另一家" if len(_on) > 1 else ""
-                lines.append(f"• 一次性云端机器：开着 {names}{tail}")
+                tail = "；排第一的优先使用，不可用时自动切换另一家" if len(_on) > 1 else ""
+                lines.append(f"• 一次性云端机器：已启用 {names}{tail}")
             else:
-                lines.append("• 一次性云端机器：都没开")
+                lines.append("• 一次性云端机器：均未启用")
         # 可选依赖（办公文档三库；2026-10-15 用户定：可选安装，不进必装依赖）：
         # 装了说装了，没装指路网页一键装（只读上次探测结果，不在这里现探测）
         try:
@@ -1770,32 +1775,32 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                     state = str(g.get("state") or "")
                     last = g.get("last_install") or {}
                     why = (
-                        f"；上次装失败：{last.get('error')}"
+                        f"；上次安装失败：{last.get('error')}"
                         if str(last.get("state")) == "failed" and last.get("error") else ""
                     )
                     if state == "ok":
                         soffice = (g.get("tools") or [{}])[0]
                         lines.append(
-                            f"• {g.get('label')}：已装（{'、'.join(have)}）；"
+                            f"• {g.get('label')}：已安装（{'、'.join(have)}）；"
                             + (
-                                "LibreOffice 有（能转 PDF、重算公式）"
-                                if soffice.get("found") else "LibreOffice 没有（转 PDF / 重算 Excel 公式做不了）"
+                                "LibreOffice 已安装（可转 PDF、可重算公式）"
+                                if soffice.get("found") else "LibreOffice 未安装（无法转 PDF、无法重算 Excel 公式）"
                             )
                         )
                     elif state in ("installing", "uninstalling"):
-                        lines.append(f"• {g.get('label')}：正在装 / 卸，等它跑完")
+                        lines.append(f"• {g.get('label')}：正在安装或卸载…")
                     elif state == "partial":
                         lines.append(
-                            f"• {g.get('label')}：只装了一部分（{'、'.join(have)}）；"
-                            "去网页「设置 → 工具」重装一次"
+                            f"• {g.get('label')}：只安装了一部分（{'、'.join(have)}）；"
+                            "请到网页「设置 → 工具」重新安装"
                         )
                     elif state == "unknown":
-                        lines.append(f"• {g.get('label')}：还没查过（打开网页「设置 → 工具」会自动查一次）")
+                        lines.append(f"• {g.get('label')}：尚未检测（打开网页「设置 → 工具」会自动检测一次）")
                     else:
                         lines.append(
-                            f"• {g.get('label')}：还没装（可选）——要交 Word / Excel / PPT 就让管理员在网页"
-                            f"「设置 → 工具」一键装（装到 MaiWork 自己的目录，不动 MaiBot 的环境）；"
-                            f"不装也能干活，改交 Markdown / CSV / HTML{why}"
+                            f"• {g.get('label')}：未安装（可选）。需要交付 Word / Excel / PPT 时，"
+                            f"可在网页「设置 → 工具」一键安装（装到 MaiWork 自己的目录，"
+                            f"不改动 MaiBot 的环境）；未安装也可交付 Markdown、CSV 或 HTML{why}"
                         )
                 if rows:
                     data["optional_deps"] = rows
@@ -1822,8 +1827,9 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             except Exception:
                 pass
         lines.append(
-            "怎么补：开关、数量这类设置可以直接让我改（set_rules）；装 skill 用 skill_install；"
-            "**密钥一律请管理员自己在网页上填**（设置 → 模型 / 工具 / 执行环境），别在对话里发密钥。"
+            "怎么补：开关和数量这类设置可以直接改（安全相关的会先等你确认）；装 skill 请提供网址。"
+            "密钥请自己在网页上填（「设置 → 模型」「设置 → 工具」「设置 → 全部设置 → 运行环境」），"
+            "不要发在对话里。"
         )
         return _ok("\n".join(lines), data=data)
 

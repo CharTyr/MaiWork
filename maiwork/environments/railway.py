@@ -253,8 +253,11 @@ class RailwayEnv:
                 timeout_s=20,
                 cwd=key_dir,
             )
-        except Exception as e:
-            self._note_fail(f"生成 SSH key 失败：{e}")
+        except Exception:
+            # 这条原因会显示在网页「临时机器 · Railway」健康项上，只留中文结论；
+            # 原始异常进日志（2026-10-15 用户定）。
+            logger.exception("生成 SSH key 时出错")
+            self._note_fail("生成 SSH key 失败（详情见服务端日志）")
             shutil.rmtree(key_dir, ignore_errors=True)
             return None
         if code != 0:
@@ -278,8 +281,9 @@ class RailwayEnv:
         ssh_argv = ["ssh", *self._ssh_base(key_path, known_hosts), "railway.new"]
         try:
             code, out, _err = await self._exec(ssh_argv, timeout_s=_ACQUIRE_CONNECT_TIMEOUT + 20, cwd=key_dir)
-        except Exception as e:
-            self._note_fail(f"连 railway.new 失败：{e}")
+        except Exception:
+            logger.exception("连接 railway.new 时出错")
+            self._note_fail("连 railway.new 失败（详情见服务端日志）")
             shutil.rmtree(key_dir, ignore_errors=True)
             return None
         box = self._parse_manifest(code, out)

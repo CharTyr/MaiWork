@@ -154,13 +154,14 @@ async def test_unknown_deliver_kind_still_falls_back_to_file(
 # ----------------------------------------------------------------------
 
 
-async def test_note_fallback_for_image_says_picture_is_in_group():
+async def test_note_fallback_for_image_is_just_title_done():
+    # 图和说明在同一条消息里，兜底说明只说「<标题>做好了」，不说图在哪
     from CharTyr_MaiWork.maiwork import coordinator as coord
 
     out = coord.delivery_note_fallback("画两只猫", "image")
     assert len(out) <= 60
+    assert out.endswith("做好了")
     assert "画两只猫" in out
-    assert "图" in out
     assert "点开就能看" not in out
 
 

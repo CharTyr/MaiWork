@@ -97,21 +97,24 @@ def _parse_ts(value: Any) -> float | None:
 
 
 def _error_reason(status: int, code: str, message: str) -> str:
-    """HTTP 错误换成人话（进 kv 给网页健康状态用）；按 code 分支，不照抄 message 当结论。"""
+    """HTTP 错误换成人话（进 kv 给网页健康状态用）；按 code 分支，不照抄 message 当结论。
+
+    只回中文结论：服务商的原始 code / message 是英文实现细节（还可能是英文报错原文），
+    **不拼进给网页看的文字**，只写日志（2026-10-15 用户定）。
+    """
     code_s = str(code or "").strip()
     msg = str(message or "").strip()[:200]
+    if code_s or msg:
+        logger.info("Freestyle 返回错误详情（HTTP %s）：%s %s", status, code_s, msg)
     if status in (401, 403) or code_s in _AUTH_CODES:
-        base = "Freestyle 密钥不对或没填（去 https://dash.freestyle.sh 建一个 API key 填进设置）"
-    elif status == 429 or code_s in _QUOTA_CODES:
-        base = "Freestyle 现在不给机器（配额 / 限流到顶）"
-    elif status == 404 or code_s in _NOT_FOUND_CODES:
-        base = "Freestyle 上找不到这台机器（可能已经被回收）"
-    elif status == 409 or code_s == "CONFLICT":
-        base = "Freestyle 说名字撞了（409）"
-    else:
-        base = f"Freestyle 返回错误（HTTP {status}）"
-    detail = f"{code_s}：{msg}" if code_s and msg else (code_s or msg)
-    return f"{base}：{detail}" if detail else base
+        return "Freestyle 密钥不正确或未填写（请到 https://dash.freestyle.sh 创建 API key 后填入设置）"
+    if status == 429 or code_s in _QUOTA_CODES:
+        return "Freestyle 当前无法提供机器（配额或限流已达上限）"
+    if status == 404 or code_s in _NOT_FOUND_CODES:
+        return "Freestyle 上找不到这台机器（可能已被回收）"
+    if status == 409 or code_s == "CONFLICT":
+        return "Freestyle 返回名称冲突（409）"
+    return f"Freestyle 返回错误（HTTP {status}）"
 
 
 class FreestyleEnv:
@@ -284,22 +287,27 @@ class FreestyleEnv:
         """申请一台 Freestyle VM；拿不到返回 None（原因进 kv["freestyle.last_fail"]）。"""
         settings = self._get_settings()
         if not self._platform_selected(settings):
-            self._note_fail("Freestyle 临时机器没开（设置 → 干活机器 → Freestyle 临时机器）")
+            self._note_fail(
+                "Freestyle 临时机器未启用（设置 → 全部设置 → 运行环境 → Freestyle 临时机器）"
+            )
             return None
         key = self._api_key(settings)
         if not key:
-            self._note_fail("还没填 Freestyle 密钥（设置 → 干活机器 → Freestyle 密钥）")
+            self._note_fail(
+                "未填写 Freestyle 密钥（设置 → 全部设置 → 运行环境 → Freestyle 密钥）"
+            )
             return None
         if self._today_count() >= self._daily_max():
             self._note_fail(
-                f"今天的 Freestyle 机器用量到顶了（{self._today_count()}/{self._daily_max()}），明天再说"
+                f"今天的 Freestyle 机器用量已达上限（{self._today_count()}/{self._daily_max()}），"
+                "请明天再试"
             )
             return None
         if self._busy_box is not None:
-            self._note_fail("手上已经有一台在用，同时只能用一台")
+            self._note_fail("已有一台正在使用，同一时间只能用一台")
             return None
         if self._active_marker() is not None:
-            self._note_fail("库里面还记着一台没过期的 Freestyle 机器，同时只能用一台")
+            self._note_fail("数据库里还记着一台未过期的 Freestyle 机器，同一时间只能用一台")
             return None
 
         ttl = self._ttl_seconds()
@@ -321,7 +329,8 @@ class FreestyleEnv:
                     "/v5/vms", json=body, headers={"Authorization": f"Bearer {key}"}
                 )
             except Exception as e:
-                self._note_fail(f"连 Freestyle 失败：{e}")
+                logger.info("申请机器时连 Freestyle 失败：%s", e)
+                self._note_fail("申请机器时连不上 Freestyle（详情见服务端日志）")
                 return None
             if resp.status_code in (200, 201):
                 try:
@@ -331,7 +340,7 @@ class FreestyleEnv:
                 if isinstance(created, dict) and created.get("id"):
                     break
                 created = None
-                last_reason = "Freestyle 建了机器但返回看不懂（没有 id）"
+                last_reason = "Freestyle 已创建机器，但返回信息无法解析（缺少 id）"
                 break
             last_reason = _error_reason(resp.status_code, *_error_code_message(resp))
             if resp.status_code != 409:
@@ -351,7 +360,7 @@ class FreestyleEnv:
             created = {**created, **vm}
         box = self._box_from(created, job_id=str(job_id), ttl=ttl)
         if box is None:
-            self._note_fail("Freestyle 返回的机器信息看不懂（没有 id）")
+            self._note_fail("Freestyle 返回的机器信息无法解析（缺少 id）")
             return None
         # 远端工作根先建出来（走文件 API，不花一次 exec）；建不出来不致命，后面 put 会再试
         await self._mkdir(box.remote_root, key, vm_id=box.vm_id, quiet=True)
@@ -413,7 +422,8 @@ class FreestyleEnv:
                     f"/v5/vms/{vm_id}", headers={"Authorization": f"Bearer {key}"}
                 )
             except Exception as e:
-                self._note_fail(f"等机器起来时连 Freestyle 失败：{e}")
+                logger.info("等待机器启动时连 Freestyle 失败：%s", e)
+                self._note_fail("等待机器启动时连不上 Freestyle（详情见服务端日志）")
                 return None
             if resp.status_code != 200:
                 self._note_fail(_error_reason(resp.status_code, *_error_code_message(resp)))
@@ -423,16 +433,16 @@ class FreestyleEnv:
             except ValueError:
                 data = None
             if not isinstance(data, dict):
-                self._note_fail("Freestyle 返回的机器信息看不懂（不是 JSON 对象）")
+                self._note_fail("Freestyle 返回的机器信息无法解析（不是 JSON 对象）")
                 return None
             last_state = str(data.get("state") or "")
             if last_state == _RUNNING:
                 return data
             if last_state in _DEAD_STATES:
-                self._note_fail(f"机器建出来就停了（state={last_state}），换一台再来")
+                self._note_fail(f"机器创建后即停止（state={last_state}），请重新申请一台")
                 return None
             if clock.now() >= deadline:
-                self._note_fail(f"等机器起来等超时了（一直停在 state={last_state or '未知'}）")
+                self._note_fail(f"等待机器启动超时（一直停在 state={last_state or '未知'}）")
                 return None
             await self._sleep(self._poll_interval_s)
 
@@ -464,8 +474,8 @@ class FreestyleEnv:
             return RunResult(
                 exit_code=-1,
                 stdout="",
-                stderr=f"机器快到期了（还剩 {max(0, int(remaining))} 秒，这条命令要 {timeout_s} 秒，"
-                       "留不出收尾时间）：别把活放上去了，换一台再来",
+                stderr=f"机器即将到期（还剩 {max(0, int(remaining))} 秒，这条命令需要 {timeout_s} 秒，"
+                       "不足以完成收尾）：请不要再提交任务，重新申请一台",
                 ms=0,
                 timed_out=False,
                 oom=False,
@@ -475,7 +485,8 @@ class FreestyleEnv:
         if not key:
             return RunResult(
                 exit_code=-1, stdout="",
-                stderr="没有 Freestyle 密钥，跑不了命令（设置 → 干活机器 → Freestyle 密钥）",
+                stderr="未填写 Freestyle 密钥，无法运行命令"
+                       "（设置 → 全部设置 → 运行环境 → Freestyle 密钥）",
                 ms=0, timed_out=False, oom=False,
             )
         body = {"command": str(command), "timeoutMs": timeout_ms, "linuxUser": _LINUX_USER}
@@ -507,7 +518,7 @@ class FreestyleEnv:
             data = None
         if not isinstance(data, dict):
             return RunResult(
-                exit_code=-1, stdout="", stderr="Freestyle 返回的命令结果看不懂（不是 JSON 对象）",
+                exit_code=-1, stdout="", stderr="Freestyle 返回的命令结果无法解析（不是 JSON 对象）",
                 ms=max(0, int((clock.now() - started) * 1000)), timed_out=False, oom=False,
             )
         status = data.get("statusCode")
@@ -540,7 +551,10 @@ class FreestyleEnv:
             raise ValueError(f"远端路径必须是绝对路径（建议 {box.remote_root}/xxx）：{remote!r}")
         key = self._api_key()
         if not key:
-            raise RuntimeError("没有 Freestyle 密钥，传不了文件（设置 → 干活机器 → Freestyle 密钥）")
+            raise RuntimeError(
+                "未填写 Freestyle 密钥，无法传文件"
+                "（设置 → 全部设置 → 运行环境 → Freestyle 密钥）"
+            )
         data = local.read_bytes()
         await self._mkdir(str(Path(remote).parent), key, vm_id=box.vm_id)
         if len(data) <= _FS_WRITE_MAX_BYTES:
@@ -579,7 +593,7 @@ class FreestyleEnv:
         except ValueError:
             upload_id = ""
         if not upload_id:
-            raise RuntimeError("分片上传开局返回看不懂（没有 uploadId）")
+            raise RuntimeError("分片上传开局返回无法解析（缺少 uploadId）")
         offset = 0
         try:
             while offset < len(data):
@@ -618,7 +632,10 @@ class FreestyleEnv:
             raise ValueError(f"远端路径必须是绝对路径：{remote!r}")
         key = self._api_key()
         if not key:
-            raise RuntimeError("没有 Freestyle 密钥，取不了文件（设置 → 干活机器 → Freestyle 密钥）")
+            raise RuntimeError(
+                "未填写 Freestyle 密钥，无法取回文件"
+                "（设置 → 全部设置 → 运行环境 → Freestyle 密钥）"
+            )
         size = await self._stat_size(box, remote, key)
         local = Path(local_path)
         local.parent.mkdir(parents=True, exist_ok=True)
@@ -740,13 +757,17 @@ class FreestyleEnv:
         """验密钥：GET /v5/vms?limit=1。返回 (能不能用, 中文说明)；不发请求就没有密钥。"""
         key = self._api_key()
         if not key:
-            return False, "还没填 Freestyle 密钥（设置 → 干活机器 → Freestyle 密钥）"
+            return False, ("未填写 Freestyle 密钥"
+                           "（设置 → 全部设置 → 运行环境 → Freestyle 密钥）")
         try:
             resp = await self._client_or_new().get(
                 "/v5/vms", params={"limit": "1"}, headers={"Authorization": f"Bearer {key}"}
             )
-        except Exception as e:
-            return False, f"连不上 Freestyle：{e}"
+        except Exception:
+            # 这条说明会直接显示在网页健康项上（views._freestyle_health → 「密钥验证失败：…」），
+            # 不能把英文异常原文写给用户看；详情只进日志（2026-10-15 用户定）。
+            logger.exception("验 Freestyle 密钥时连不上")
+            return False, "连不上 Freestyle（详情见服务端日志）"
         if resp.status_code == 200:
             count = 0
             try:

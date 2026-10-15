@@ -217,27 +217,28 @@ def _exec_item(svc: Any) -> dict[str, Any]:
 def _office_item(svc: Any) -> dict[str, Any]:
     """办公文档三库（可选安装，2026-10-15 用户定；optional_deps.py）。
 
-    - 装好了 → ok，写清楚版本和有没有 LibreOffice；
-    - 没装 / 装一半 → warn，指路网页「设置 → 工具」一键装（不装也能交 Markdown / CSV / HTML）；
-    - 正在装 → wait；
-    - 还没探测过 → wait（网页「设置 → 工具」打开时才会真探测，这里不瞎猜）。
+    - 已安装 → ok，写清楚版本和有没有 LibreOffice；
+    - 未安装 / 装一半 → warn，指路网页「设置 → 工具」一键安装（未安装也能交 Markdown / CSV / HTML）；
+    - 正在安装 → wait；
+    - 尚未探测过 → wait（网页「设置 → 工具」打开时才会真探测，这里不猜）。
     """
     deps = getattr(svc, "optional_deps", None)
     if deps is None:
-        return _item("office", "off", "办公文档", "这个 MaiWork 版本没带可选依赖管理，装不了", sub="extensions")
+        return _item("office", "off", "办公文档",
+                     "这个 MaiWork 版本不包含可选依赖管理，无法安装", sub="extensions")
     try:
         view = deps.status()
         group = (view.get("groups") or [{}])[0]
     except Exception:
-        return _item("office", "warn", "办公文档", "状态读不出来（看服务端日志）", sub="extensions")
+        return _item("office", "warn", "办公文档", "状态读取失败，请查看服务端日志", sub="extensions")
     label = str(group.get("label") or "办公文档")
     if group.get("state") == "installing" or group.get("uninstalling"):
-        return _item("office", "wait", label, "正在装 / 卸，装完这里会自己更新", sub="extensions")
+        return _item("office", "wait", label, "正在安装或卸载，完成后这里会自动更新", sub="extensions")
     if not float(view.get("checked_at") or 0):
         return _item(
             "office", "wait", label,
-            "还没查过这台机器上有没有装（可选）：打开网页「设置 → 工具」会自动查一次，"
-            "没装可以在那里一键装",
+            "尚未检测本机安装情况（可选）。打开网页「设置 → 工具」会自动检测一次，"
+            "未安装可在那里一键安装",
             sub="extensions",
         )
     pkgs = list(group.get("packages") or [])
@@ -246,16 +247,17 @@ def _office_item(svc: Any) -> dict[str, Any]:
             f"{p.get('name')} {p.get('version') or ''}".strip() for p in pkgs
         )
         soffice = (group.get("tools") or [{}])[0]
-        tail = "有 LibreOffice（能转 PDF、重算公式）" if soffice.get("found") else "没有 LibreOffice（转 PDF / 重算 Excel 公式做不了，会如实说明）"
-        return _item("office", "ok", label, f"已装好：{have}；{tail}", sub="extensions")
+        tail = ("LibreOffice 已安装（可转 PDF、可重算公式）" if soffice.get("found")
+                else "LibreOffice 未安装（无法转 PDF、无法重算 Excel 公式）")
+        return _item("office", "ok", label, f"已安装：{have}；{tail}", sub="extensions")
     last = group.get("last_install") or {}
     why = ""
     if str(last.get("state")) == "failed" and last.get("error"):
-        why = f"；上次装失败：{last.get('error')}"
+        why = f"；上次安装失败：{last.get('error')}"
     return _item(
         "office", "warn", label,
-        "还没装（可选）：要交 Word / Excel / PPT 就得装它——管理员可以在网页「设置 → 工具」一键装"
-        "（装的是 MaiWork 自己的目录，不动 MaiBot 的环境）；不装也能干活，改交 Markdown / CSV / HTML"
+        "未安装（可选）。需要交付 Word / Excel / PPT 时，可在网页「设置 → 工具」一键安装"
+        "（装到 MaiWork 自己的目录，不改动 MaiBot 的环境）；未安装也可交付 Markdown、CSV 或 HTML"
         + why,
         sub="extensions",
     )

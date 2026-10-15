@@ -203,7 +203,7 @@ async def test_fallback_failure_is_recorded_and_not_retried_again(tmp_path):
     assert host.texts, "兜底文字至少真的试发过"
     # 卡片行记下了兜底的结果（不加迁移：写在已有 error 文本里）
     err = str(_cards(store)[0]["error"])
-    assert "兜底" in err
+    assert "文字版" in err, err
     # 也没生成「兜底的兜底」
     keys = [str(b["key"]) for b in _boxes(store)]
     assert len(keys) == len(set(keys))
@@ -216,7 +216,7 @@ async def test_fallback_sent_records_success_on_card(tmp_path):
     assert str(_fallback_boxes(store)[0]["status"]) == "sent"
     assert len(host.texts) == 1
     assert "标题1-0" in host.texts[0]["text"]
-    assert "兜底" in str(_cards(store)[0]["error"])
+    assert "文字版已发出" in str(_cards(store)[0]["error"])
     # 卡片本身仍是 failed（只有 sent 才算真发出去），不复活
     assert _cards(store)[0]["status"] == "failed"
 
@@ -264,6 +264,6 @@ async def test_queued_fallback_wording_says_enqueued_not_sent(tmp_path):
     assert len(boxes) == 1 and str(boxes[0]["status"]) == "pending", "兜底只入队，还没发"
     assert str(store.kv_get("news_card.fallback.1")["status"]) == "queued"
     err = str(_cards(store)[0]["error"])
-    assert "入队" in err
+    assert "已排入发送队列" in err
     assert "已补发" not in err and "已发出" not in err, err
     assert host.texts == [], "这一轮不该真发出去"

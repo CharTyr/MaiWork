@@ -208,16 +208,21 @@ class TestAcquire:
         assert box is not None
         assert len(seen) == 2 and seen[0] != seen[1]
 
-    async def test_acquire_429_gives_chinese_reason(self, tmp_path: Path) -> None:
+    async def test_acquire_429_gives_chinese_reason(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
         api = FakeAPI()
         api.json_route("POST", "/v5/vms", 429, {"code": "RATE_LIMITED", "message": "too many vms"})
         env, _st, _s = _make_env(tmp_path, api)
-        assert await env.acquire("job-c") is None
+        with caplog.at_level(logging.INFO):
+            assert await env.acquire("job-c") is None
         lf = env.last_fail()
         assert isinstance(lf, dict)
         reason = str(lf["reason"])
         assert "配额" in reason or "上限" in reason
-        assert "too many vms" in reason
+        # 服务商原始英文报错**不拼进给网页看的中文结论**（2026-10-15 用户定），只进日志
+        assert "too many vms" not in reason
+        assert "too many vms" in caplog.text
         assert env.usage_today() == 0
 
     async def test_acquire_401_says_key_is_wrong(self, tmp_path: Path) -> None:
@@ -269,7 +274,7 @@ class TestLimits:
             assert box is not None
             await env.release(box)
         assert await env.acquire("job-3") is None
-        assert "到顶" in str(env.last_fail()["reason"])  # type: ignore[index]
+        assert "已达上限" in str(env.last_fail()["reason"])  # type: ignore[index]
         assert env.usage_today() == 2
         rec = st.kv_get(f"freestyle.day.{clock.day_key(NOW)}", None)
         assert isinstance(rec, dict) and int(rec["count"]) == 2
@@ -280,7 +285,7 @@ class TestLimits:
         first = await env.acquire("job-1")
         assert first is not None
         assert await env.acquire("job-2") is None
-        assert "同时" in str(env.last_fail()["reason"])  # type: ignore[index]
+        assert "同一时间只能用一台" in str(env.last_fail()["reason"])  # type: ignore[index]
         await env.release(first)
         assert env.current_box is None
         assert await env.acquire("job-3") is not None
@@ -351,7 +356,7 @@ class TestRun:
         box.expires_ts = clock.now() + 100
         r = await env.run(box, "ls", timeout_s=60)
         assert r.exit_code != 0
-        assert "快到期" in r.stderr
+        assert "即将到期" in r.stderr
 
 
 # ----------------------------------------------------------------------

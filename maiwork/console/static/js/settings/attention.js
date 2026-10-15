@@ -23,14 +23,14 @@ export async function loadAttention() {
   state.attentionErr = errors;
 }
 
-const CARD_STATE = { failed: "没发出去", uncertain: "不确定是否发出" };
+const CARD_STATE = { failed: "发送失败", uncertain: "发送结果未知" };
 const FALLBACK_STATE = {
-  queued: "文字版正在排队",
+  queued: "文字版等待发送",
   sent: "已改发文字版",
-  failed: "文字版也没发出去",
-  uncertain: "文字版不确定是否发出",
+  failed: "文字版发送失败",
+  uncertain: "文字版发送结果未知",
   dropped: "文字版已取消",
-  no_items: "没有可发的文字内容",
+  no_items: "无可发送的文字内容",
 };
 
 function when(ts) {
@@ -50,10 +50,10 @@ function asksBlock(a) {
   }
   const rows = [...by.entries()]
     .map(
-      ([gid, g]) => `<div class="set-row">${ico("speech")}<div><div class="set-name">${esc(g.name || `群 ${gid}`)}</div><div class="set-text">${Number((a.group_counts || {})[gid]) || g.n} 条 @ 请求等你判断，最久等了 ${esc(g.oldest || "")}</div></div><span class="row-btns"><button class="btn small" data-act="att-asks" data-g="${esc(gid)}">去处理</button></span></div>`
+      ([gid, g]) => `<div class="set-row">${ico("speech")}<div><div class="set-name">${esc(g.name || `群 ${gid}`)}</div><div class="set-text">${Number((a.group_counts || {})[gid]) || g.n} 条 @ 请求待复核，最早一条已等待 ${esc(g.oldest || "")}</div></div><span class="row-btns"><button class="btn small" data-act="att-asks" data-g="${esc(gid)}">处理</button></span></div>`
     )
     .join("");
-  return `<h3 class="h-mini">待复核的 @ 请求${tip("群友 @ 时说的话像在派活，但 MaiWork 拿不准，没有自动处理。转为请求后仍需审批；超过 14 天没处理会自动归档。")}</h3>${rows}`;
+  return `<h3 class="h-mini">待复核的 @ 请求${tip("群成员 @ MaiWork 的消息疑似派活，但无法确定，因此未自动处理。转为请求后仍需审批；超过 14 天未处理将自动归档。")}</h3>${rows}`;
 }
 
 function cardsBlock(c) {
@@ -67,7 +67,7 @@ function cardsBlock(c) {
       return `<div class="set-row cp">${ico("newspaper")}<div><div class="set-name">${esc(k.group_name || `群 ${k.group_id}`)} · ${esc(when(k.created))}</div><div class="set-text">${esc(CARD_STATE[k.status] || k.status)}${fb}：${esc(title)}</div>${k.error ? `<p class="fine">${esc(k.error)}</p>` : ""}</div><span class="row-btns"><button class="btn small" data-act="att-resend" data-id="${esc(k.id)}">重发</button></span></div>`;
     })
     .join("");
-  return `<h3 class="h-mini">没发出去的资讯卡片${tip("没发出去的卡片会自动改发一条文字版；也可以手动重发，每张每天一次。「不确定」的可能已经发出，重发前请先到群里查看。")}</h3>${rows}`;
+  return `<h3 class="h-mini">发送失败的资讯卡片${tip("卡片发送失败后会自动改发一条文字版，也可以手动重发，每张每天限一次。「发送结果未知」的卡片可能已经发出，重发前请先在群内确认。")}</h3>${rows}`;
 }
 
 export function attentionSection() {
@@ -76,7 +76,7 @@ export function attentionSection() {
   const errors = Object.values(state.attentionErr || {});
   const error = errors.length ? `<p class="h-meta" role="status">待处理事项刷新失败：${esc(errors.join("；"))} <button type="button" class="link-btn" data-act="att-reload">重试</button></p>` : "";
   const body = error + asksBlock(a.asks) + cardsBlock(a.cards);
-  return body ? `<h2 class="h-sub">需要你处理</h2>${body}` : "";
+  return body ? `<h2 class="h-sub">待处理</h2>${body}` : "";
 }
 
 export async function actAttention(act, el) {
@@ -96,7 +96,7 @@ export async function actAttention(act, el) {
       el.disabled = true;
       try {
         const out = await api("POST", `/api/news/cards/${encodeURIComponent(el.dataset.id)}/resend`);
-        toast((out && out.message) || "已重新排队发送");
+        toast((out && out.message) || "已加入发送队列");
       } catch (err) {
         el.disabled = false;
         toast(err.message, true);

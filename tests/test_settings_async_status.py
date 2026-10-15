@@ -59,7 +59,7 @@ def test_poll_uninstall_failure_uses_uninstall_copy(tmp_path):
     failed = {"available": True, "groups": [{"id": "office", "last_install": {"state": "failed"}}]}
     out = run(tmp_path, ["settings/optdeps.js"], "loadOptDeps", poll=True,
               state={"page": "settings", "setSub": "extensions"}, responses=[initial, failed])
-    assert out["toasts"] == [["卸载没成功，原因见「可选组件」", True]]
+    assert out["toasts"] == [["卸载失败，原因见「可选组件」", True]]
 
 
 def test_probe_completion_does_not_announce_install_success(tmp_path):

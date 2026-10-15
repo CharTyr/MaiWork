@@ -333,8 +333,8 @@ class Agents:
             img_name = _image_entry_name(settings, eid)
             if img_name is not None:
                 raise ValueError(
-                    f"「{img_name}」是生图模型，不能当聊天 / 干活模型用；"
-                    "请到「模型」页选一个用途是「聊天」的条目（生图模型在设置 → 模型里点「设为生图模型」）"
+                    f"「{img_name}」是生图模型，不能用作聊天模型。"
+                    "请在「模型」页为这个岗位选择一个用途是「聊天」的条目。"
                 )
         if kind_s == "main" and "escalate" in patch:
             raise ValueError("主模型岗没有「做不动时换用」：它只排计划和验收，不亲自干活")

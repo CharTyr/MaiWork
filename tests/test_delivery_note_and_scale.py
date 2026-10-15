@@ -138,8 +138,8 @@ def _event_payloads(store: Store, tid: str, kind: str) -> list[dict]:
 
 async def test_note_empty_falls_back_to_human_line_from_title():
     delivery_note_text = _note_mod().delivery_note_text
-    assert delivery_note_text("", "整理 NAS 清单") == "整理 NAS 清单弄好了，点开就能看"
-    assert delivery_note_text("   \n ", "整理 NAS 清单") == "整理 NAS 清单弄好了，点开就能看"
+    assert delivery_note_text("", "整理 NAS 清单") == "整理 NAS 清单做好了，点开就能看"
+    assert delivery_note_text("   \n ", "整理 NAS 清单") == "整理 NAS 清单做好了，点开就能看"
 
 
 async def test_note_empty_file_kind_says_file_is_in_link():
@@ -168,7 +168,7 @@ async def test_note_empty_text_kind_stays_short():
 )
 async def test_note_with_internal_words_uses_fallback(bad):
     out = _note_mod().delivery_note_text(bad, "整理 NAS 清单")
-    assert out == "整理 NAS 清单弄好了，点开就能看"
+    assert out == "整理 NAS 清单做好了，点开就能看"
     for token in ("T-", "job", "research.md", "steps/", "artifacts/", ".py"):
         assert token not in out
 
@@ -218,7 +218,7 @@ async def test_scrub_note_privacy_hit_uses_new_fallback(tmp_path):
         delivery=None, outbox=None, env=None, profiles=None, get_settings=lambda: None,
     )
     out = coord._scrub_note(GID, "给备考注册建筑师考试的朋友顺了一份", "整理 NAS 清单")
-    assert out == "整理 NAS 清单弄好了，点开就能看"
+    assert out == "整理 NAS 清单做好了，点开就能看"
     assert "备考" not in out
 
 
@@ -234,7 +234,7 @@ async def test_scrub_note_clean_and_internal_go_through_note_rule(tmp_path):
         "韩国银行这事是钓鱼邮件引起的"
     # 内部词 → 标题兜底
     assert coord._scrub_note(GID, "看 artifacts/T-1/index.html", "整理") == \
-        "整理弄好了，点开就能看"
+        "整理做好了，点开就能看"
     # 空 → 标题兜底；file 类说清文件在链接里
     assert coord._scrub_note(GID, "", "月度账单", "file").endswith("文件在链接里")
 
@@ -272,7 +272,7 @@ async def test_handle_passed_empty_note_delivers_human_line(mem_store, settings,
     )
     text = outbox.enqueued[-1]["payload"]["text"]
     assert "做好了，请查收" not in text
-    assert text == "韩国银行AI攻击事件弄好了，就这几句"
+    assert text == "韩国银行AI攻击事件做好了，就这几句"
 
 
 # ===========================================================================

@@ -670,20 +670,20 @@ async def test_uninstall_reports_leftovers_as_failed(store, tmp_path: Path, monk
     g = deps.status()["groups"][0]
     assert g["last_install"]["state"] == "failed"
     assert "docx" in g["last_install"]["error"]
-    assert "还剩" in g["last_install"]["log"]
+    assert "仍存在" in g["last_install"]["log"]
     assert (libs / "docx").exists()
 
 
 @pytest.mark.asyncio
 async def test_uninstall_with_probe_error_is_not_ok(store, tmp_path: Path) -> None:
-    """文件删了、但卸完探测没跑起来：状态没法确认，不许记 ok。"""
+    """文件已删除、但卸载后探测没跑起来：状态无法确认，不许记 ok。"""
     (tmp_path / "pylibs" / "docx").mkdir(parents=True)
     deps = _deps(store, tmp_path, env=_FakeEnv("", exit_code=1))   # 没有探测结果那一行
     deps.start_uninstall("office")
     await deps.wait()
     g = deps.status()["groups"][0]
     assert g["last_install"]["state"] == "failed"
-    assert "没法确认" in g["last_install"]["error"]
+    assert "无法确认" in g["last_install"]["error"]
 
 
 @pytest.mark.asyncio
@@ -706,12 +706,12 @@ async def test_uninstall_result_discarded_when_env_changes_midway(store, tmp_pat
     assert store.kv_get(od.CHECK_KEY) is None
     g = deps.status()["groups"][0]
     assert g["last_install"]["state"] == "failed"
-    assert "没法确认" in g["last_install"]["error"]
+    assert "无法确认" in g["last_install"]["error"]
 
 
 @pytest.mark.asyncio
 async def test_dynamic_mode_install_refused_but_uninstall_allowed(store, tmp_path: Path) -> None:
-    """dynamic 模式（systemd 临时用户）装不了：说清原因，别让管理员反复白装。
+    """dynamic 模式（系统临时账号隔离）装不了：说清原因，别让管理员反复白装。
 
     docs/06 实测：dynamic 下 `/var/lib/private/` 在单元的命名空间里只挂了它自己的工作区
     → `<工作区根>/../pylibs` 子 agent 根本看不到，装了也 import 不到。
@@ -724,7 +724,7 @@ async def test_dynamic_mode_install_refused_but_uninstall_allowed(store, tmp_pat
     )
     view = deps.status()
     assert view["available"] is False
-    assert "systemd 临时用户" in view["note"]
+    assert "没有固定运行账号" in view["note"]
     with pytest.raises(od.Unavailable):
         deps.start_install("office")
 
