@@ -1,9 +1,7 @@
-"""topics._build_opener_prompt：构想候选的开场白要「关心式问法」（2026-10 与用户定）。
+"""开场提示合同：具体可聊，不默认揽活，不强制问句。
 
-- kind == "idea"：从 ideas 表按 ref_id 读 origin / title / body；有由头就说「话说之前…怎么样了？
-  要我帮忙吗？」，没有就按构想内容自然问一句要不要帮忙；不点名任何群友、不提个人情况。
-- kind == "news"：保持原来的写法（随口一提，把候选素材带出来）。
-- 两个都用 voice.persona 的人设：只认 SOUL（2026-10-01 用户定），不自我介绍、不寒暄。
+构想只读取 origin / title / body，不读取 basis；有由头可自然回访，
+无由头不能编造共同经历。新闻允许独立新话题；两者保留 SOUL 和隐私边界。
 """
 
 from __future__ import annotations
@@ -83,7 +81,7 @@ def _candidate(ref_id: int, *, title: str, brief: str) -> Dict[str, Any]:
 
 
 async def test_idea_opener_with_origin(tmp_path) -> None:
-    """有由头：提示词要求「话说之前大家聊的那个{origin}…要我帮忙…吗？」式关心问法。"""
+    """有由头可关心回访，也可以聊具体细节，不默认招揽任务。"""
     store, topics = _make(tmp_path)
     iid = _seed_idea(store, title="我可以帮大家把百层挑战的战报汇总",
                      body="每周汇总一次战报", origin="涂击队百层挑战")
@@ -94,14 +92,16 @@ async def test_idea_opener_with_origin(tmp_path) -> None:
     text = json.dumps(prompt, ensure_ascii=False)
     assert "涂击队百层挑战" in text           # 由头
     assert "关心" in text                     # 关心式问法
-    assert "问句" in text                     # 结尾问句
+    assert "不必" in text and "问句" in text
+    assert "要我帮忙吗" not in text
+    assert "具体" in text and "取舍" in text
     assert "不点名" in text                   # 群向：不点名任何人
     assert "别推销" in text                   # 不许推销腔
     assert "画像依据" not in text             # basis 不进提示词（会引画像）
 
 
 async def test_idea_opener_without_origin(tmp_path) -> None:
-    """没由头：按构想内容自然问一句要不要帮忙。"""
+    """没有由头就直接聊素材，不编造历史或默认邀约协助。"""
     store, topics = _make(tmp_path)
     iid = _seed_idea(store, title="我可以帮大家整理一份复习资料",
                      body="把大家整理的资料汇总成一页", origin="")
@@ -112,6 +112,9 @@ async def test_idea_opener_without_origin(tmp_path) -> None:
     assert "复习资料" in text
     assert "没给由头" in text or "没有由头" in text
     assert "关心" in text
+    assert "不要编造" in text
+    assert "要不要帮忙" not in text
+    assert "要我帮忙吗" not in text
 
 
 @pytest.mark.parametrize("kind", ["idea", "news"])
@@ -154,3 +157,8 @@ async def test_news_opener_keeps_old_shape(tmp_path) -> None:
     assert "播报腔" in text
     assert "由头" not in text
     assert "关心" not in text
+    assert "具体细节" in text
+    assert "不必" in text and "问句" in text
+    assert "新话题" in text and "硬接" in text
+    assert "不要编造" in text
+    assert "120 字" in text and "最多一个链接" in text

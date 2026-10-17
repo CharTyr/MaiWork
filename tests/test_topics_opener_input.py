@@ -19,7 +19,7 @@ from typing import Any, List
 
 import pytest
 
-from fakes import FakeHost, SignalsStub  # noqa: E402
+from fakes import FakeHost, FakeProfiles, SignalsStub  # noqa: E402
 from test_topics import (  # noqa: E402  （conftest 已把 tests 目录放进 sys.path）
     GID,
     SID,
@@ -37,16 +37,18 @@ T = _bj_ts(2026, 9, 27, 15, 0)
 _CFG = {"topics": {"enabled": True, "per_day": 10, "min_gap_hours": 0}}
 
 
-async def _ask_jev(tmp_path, msgs: List[Any], *, signals_ts: float | None = None):
+async def _ask_jev(tmp_path, msgs: List[Any], *, signals_ts: float | None = None,
+                   profiles=None, candidate_titles=("测试候选",)):
     """造一个「安静 60 分钟」的冷场，问一次 Jev，返回 (state, questions)。"""
     signals = SignalsStub()
     signals.mark(GID, SID, signals_ts if signals_ts is not None else T - 3600.0)
     host = FakeHost(msgs=msgs, session_id=SID)
     fake = _Jev(response={"ok": 0.4, "reason": ("left", 0.8, 0.8), "fit_0": 0.2})
     store, settings, topics, *_ = _make_topics(
-        tmp_path, host=host, signals=signals, jev=fake, cfg=_CFG
+        tmp_path, host=host, signals=signals, jev=fake, cfg=_CFG, profiles=profiles
     )
-    _seed_candidate(store, check_now=T, title="测试候选")
+    for title in candidate_titles:
+        _seed_candidate(store, check_now=T, title=title)
     out = await topics.check(GID, T)
     assert fake.calls, f"该问到 Jev 才对（实际 {out}）"
     state, questions, _purpose, _gid = fake.calls[0]
@@ -203,3 +205,61 @@ async def test_ok_question_does_not_fight_reason_question(tmp_path):
     # 安静时长 / 平时节奏这两个数字还在（原来的材料不能丢）
     assert "60 分钟" in instr
     assert "5.0 分钟" in instr
+
+
+@pytest.mark.asyncio
+async def test_fit_gets_bounded_group_interest_evidence(tmp_path):
+    profiles = FakeProfiles()
+    profiles.usual_gap_value = 300.0
+    profiles.entries_map[GID] = [
+        {"category": "interest", "text": f"一般兴趣{i}"} for i in range(15)
+    ] + [
+        {"category": "interest", "text": "测试候选相关兴趣" + "甲" * 500},
+        {"category": "interest", "text": "测试候选相关兴趣" + "甲" * 500},
+        {"category": "rule", "text": "管理员规矩不属于兴趣"},
+    ]
+    profiles.entries_map["other"] = [{"category": "interest", "text": "别群画像"}]
+    state, questions = await _ask_jev(
+        tmp_path, [_text_msg(T - 600, "午饭吃什么")], profiles=profiles
+    )
+    interests = state["group_interests"]
+    assert len(interests) == 12
+    assert len(interests) == len(set(interests))
+    assert all(len(text) <= 240 for text in interests)
+    assert interests[0].startswith("测试候选相关兴趣")
+    assert "别群画像" not in str(state)
+    assert "管理员规矩不属于兴趣" not in str(state)
+    assert state["candidates"][0]["kind"] == "news"
+    instr = questions["fit_0"]["instructions"]
+    assert "group_interests" in instr
+    assert "不要求" in instr and "最近的聊天" in instr
+    assert "仅因" in instr and "新话题" in instr
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("broken", [False, True])
+async def test_fit_without_profile_does_not_invent_interests(tmp_path, broken):
+    profiles = FakeProfiles()
+    profiles.usual_gap_value = 300.0
+    if broken:
+        def fail_entries(_gid):
+            raise RuntimeError("画像暂时读不到")
+        profiles.entries = fail_entries
+    state, questions = await _ask_jev(tmp_path, [], profiles=profiles)
+    assert state["group_interests"] == []
+    assert "不足" in questions["fit_0"]["instructions"]
+
+
+@pytest.mark.asyncio
+async def test_fit_question_anchors_exact_list_index_and_title(tmp_path):
+    state, questions = await _ask_jev(
+        tmp_path, [], candidate_titles=("共享弹药的合作游戏", "农业采购备案", "有谁需要帮忙")
+    )
+    assert len(state["candidates"]) == 3
+    for i, candidate in enumerate(state["candidates"]):
+        instructions = questions[f"fit_{i}"]["instructions"]
+        assert f"state.candidates[{i}]" in instructions
+        assert candidate["title"] in instructions
+        for other in state["candidates"]:
+            if other is not candidate:
+                assert other["title"] not in instructions

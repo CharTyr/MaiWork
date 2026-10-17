@@ -491,15 +491,25 @@ class Topics:
             },
         }
         for i, cand in enumerate(candidates):
-            if str(cand.get("kind") or "") == "idea":
-                # 构想类候选是「回头问一句群里之前聊过的事、问大家要不要帮忙」
-                instr = (
-                    f"候选{i} 是回头问一句群里之前聊过的事、问大家要不要帮忙："
-                    "能自然接上最近的聊天吗、大家会愿意接吗？"
-                )
-            else:
-                instr = f"候选{i}能不能自然接上最近的聊天、这个群会不会感兴趣？"
-            questions[f"fit_{i}"] = {"type": "noul", "instructions": instr}
+            kind_note = (
+                "这是构想候选，判断事情本身是否值得讨论，不把接受协助当成接话。"
+                if str(cand.get("kind") or "") == "idea" else ""
+            )
+            questions[f"fit_{i}"] = {
+                "type": "noul",
+                "instructions": (
+                    f"state.candidates[{i}]（标题：{cand['title']}）这个群会不会感兴趣、愿意围绕其中的具体内容讨论？"
+                    "结合 group_interests 的本群兴趣依据和 messages 的真实聊天判断。"
+                    "不要求接上最近的聊天；能接上是加分依据，"
+                    "不要仅因这是新话题就判不合适。"
+                    "关注是否有值得聊的细节、体验或取舍，而非只看标题关键词。"
+                    "兴趣依据不足时谨慎判断，不要凭空假定大家感兴趣。"
+                    + kind_note
+                ),
+            }
+        # 画像只作内部判断依据，不传给写开场白的模型；优先保留与候选相关的条目。
+        interests = list(dict.fromkeys(text[:240] for text in self._interest_texts(gid)))
+        interests.sort(key=lambda text: -max(_interest_score(c, [text]) for c in candidates))
         state = {
             "quiet_minutes": quiet_minutes,
             "usual_gap_minutes": usual_gap_minutes,
@@ -519,9 +529,10 @@ class Topics:
             "last_human_minutes_ago": last_human_minutes,
             "note": _BOT_NOTE,
             "candidates": [
-                {"title": cand["title"], "brief": cand["brief"], "link": cand["link"]}
+                {"kind": cand["kind"], "title": cand["title"], "brief": cand["brief"], "link": cand["link"]}
                 for cand in candidates
             ],
+            "group_interests": interests[:12],
         }
         answers = await self._jev.ask(
             state, questions, purpose="topic_check", group_id=gid, timeout_ms=None
@@ -1126,8 +1137,8 @@ class Topics:
     ) -> List[dict]:
         """按 docs/02-设计.md §4.4 第 1 条组 prompt；人设只认 SOUL（voice.persona）。
 
-        kind == "idea" 的候选按「关心式问法」写（有由头就顺着由头问一句要不要帮忙）；
-        news 候选保持原来的写法。不自我介绍、不寒暄（规矩在 persona.section() 里）。
+        新闻挑一个具体可聊的切口；构想有由头可自然回访，没有由头不编造历史。
+        不默认揽活、不强制问句。不自我介绍、不寒暄（规矩在 persona.section() 里）。
         """
         del sid  # 不再读 MaiBot 最近发言当语气样例（人设只认 SOUL）
         persona = voice.persona(self._identity)
@@ -1159,6 +1170,10 @@ class Topics:
 
 写一两句口语化的开场白，把上面的话题自然带出来：
 - 像随口一提，别端着
+- 从素材里选一个具体细节，聊体验、看法或取舍，让群友不用先读链接也能随口接一句；别只复述标题
+- 这是新话题也可以直接起头，不要硬接最近的聊天；不要编造群友聊过、用过或正在做的事
+- 可以是一句有内容的感想，也可以顺口问一个具体问题，不必以问句结尾；别用泛泛的「大家怎么看」凑互动
+- 只聊事情本身，不招揽任务，不把话头写成提供服务的邀约
 - 最多一个链接（也可以不带，自然就行）
 - 别写「据报道」「以下是」「今日资讯」「新闻速报」这种播报腔
 - 别超过 120 字
@@ -1201,31 +1216,33 @@ class Topics:
     def _idea_opener_prompt(
         self, gid: str, candidate: dict, persona: Any, recent_text: str,
     ) -> str:
-        """构想候选的开场白：关心式问一句（有由头顺着由头问），不推销、不点名任何人。"""
+        """构想候选开场：可自然回访或聊具体细节，不默认揽活、不强制问句、不点名。"""
         material = self._idea_material(gid, candidate)
         origin = material["origin"]
         if origin:
             head = (
                 f"由头（群里之前聊过的那件事）：{origin}\n"
-                f"写成「话说之前大家聊的那个{origin}后来怎么样了？要我帮忙吗？」这种问法。"
+                "可以顺着这件事自然回访，也可以挑其中一个值得聊的细节，不必照搬固定句式。"
             )
         else:
-            head = "这件事没有由头（想不起接的是哪件事），就按下面的标题 / 想法自然地问一句要不要帮忙。"
+            head = "这件事没有由头，按下面的标题 / 想法直接起一个话头；不要编造群里之前聊过或有人正在做这件事。"
         gc_text = self._group_context_safe(gid, "main")
         gc_part = f"\n# 这个群的规矩（管理员定的，必须照做）\n{gc_text}\n\n" if gc_text else ""
-        return f"""群里冷场了一段时间，你想顺着之前聊过的一件事问一句。
+        return f"""群里冷场了一段时间，你想围绕下面这件事随口聊一句。
 
 {persona.section()}
 {gc_part}# 群里最近的对话
 {recent_text}
 
-# 想聊的事（群里之前有人提过想做）
+# 想聊的事（构想素材，不等于群友已经决定要做）
 {head}
 标题：{material["title"]}
 想法：{material["body"]}
 
 写一两句口语化的开场白：
-- 用关心、顺口问一句的口吻（「……后来怎么样了？要我帮忙吗？」），结尾是问句
+- 语气关心、随口，不催进度；围绕事情本身挑一个具体细节、体验或取舍，让群友容易接话
+- 可以自然回访，也可以说一句有内容的感想或问一个具体问题，不必以问句结尾；别用泛泛的「大家怎么看」凑互动
+- 不招揽任务，不把开场写成提供服务的邀约；素材里即使写了「我可以帮」，也不要照搬
 - 只提这件事本身，不点名任何群友，不提任何人的个人情况、习惯、经历
 - 别推销：不许写「我可以帮」「给大家带来」「推荐给大家」「安利」「感兴趣的话」「点进去看看」
 - 别写「据报道」「以下是」「今日资讯」「新闻速报」这种播报腔

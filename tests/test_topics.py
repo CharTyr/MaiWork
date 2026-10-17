@@ -974,7 +974,7 @@ def test_candidates_fallback_created_desc_when_profile_errors(tmp_path):
 
 @pytest.mark.asyncio
 async def test_idea_candidate_fit_question(tmp_path):
-    """kind="idea" → 按「回头问一句群里聊过的事、要不要帮忙」问。"""
+    """构想候选判断讨论价值，不把接受协助作为接话条件。"""
     t = _bj_ts(2026, 9, 27, 15, 0)
     signals = SignalsStub()
     signals.mark(GID, SID, t - 3600.0)
@@ -983,12 +983,14 @@ async def test_idea_candidate_fit_question(tmp_path):
     _seed_candidate(store, check_now=t, title="帮着做个小工具", kind="idea", ref_id=3)
     await topics.check(GID, t)
     q = fake.calls[0][1]
-    assert "要不要帮忙" in q["fit_0"]["instructions"]
+    assert "构想" in q["fit_0"]["instructions"]
+    assert "讨论" in q["fit_0"]["instructions"]
+    assert "要不要帮忙" not in q["fit_0"]["instructions"]
 
 
 @pytest.mark.asyncio
-async def test_news_candidate_fit_question_keeps_old_wording(tmp_path):
-    """kind="news" → 保持原来的问法。"""
+async def test_news_candidate_fit_question_keeps_interest_criterion(tmp_path):
+    """资讯仍以群兴趣为依据，并判断具体讨论价值。"""
     t = _bj_ts(2026, 9, 27, 15, 0)
     signals = SignalsStub()
     signals.mark(GID, SID, t - 3600.0)
