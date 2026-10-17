@@ -2,6 +2,7 @@
 import { $, admin, state } from "./state.js";
 import { SVG, calm, esc, ico, tip, toast } from "./util.js";
 import { api, gname } from "./api.js";
+import { loadOnbSocial, onbSocialPane, saveOnbSocial } from "./onboarding-social.js";
 import { ROWS_COLS, rowsEditor } from "./settings/rules.js";
 import { AV_SRC } from "./settings/identity.js";
 import { PROTOCOLS, loadModels } from "./settings/models.js";
@@ -19,6 +20,7 @@ export const ONB_STEPS = [
   { id: "groups", name: "群" },
   { id: "keys", name: "快速判断" },
   { id: "search", name: "搜索" },
+  { id: "social", name: "社交平台" },
   { id: "admins", name: "群管理" },
   { id: "look", name: "头像" },
   { id: "env", name: "能力说明" },
@@ -104,6 +106,7 @@ export function onbPane(id) {
       `;
   }
   if (id === "search") return onbSearchPane();
+  if (id === "social") return onbSocialPane();
   if (id === "admins") {
     return `
       <div class="onb-step-ico">${ico("lock")}</div>
@@ -242,7 +245,7 @@ function onbShell() {
 function onbFoot() {
   const id = ONB_STEPS[onb.i].id;
   const back = onb.i > 0 && id !== "done" ? `<button class="btn ghost" type="button" data-act="onb-back">上一步</button>` : `<span></span>`;
-  const later = ["keys", "search", "admins", "groups", "look"].includes(id) ? `<button class="btn" type="button" data-act="onb-later">跳过此步</button>` : id === "models" ? `<button class="btn" type="button" data-act="onb-later">稍后设置</button>` : "";
+  const later = ["keys", "search", "social", "admins", "groups", "look"].includes(id) ? `<button class="btn" type="button" data-act="onb-later">跳过此步</button>` : id === "models" ? `<button class="btn" type="button" data-act="onb-later">稍后设置</button>` : "";
   const usable = !!(onb.info && onb.info.usable);
   const next = id === "hello" ? "开始" : id === "done" ? (usable ? "进入 MaiWork" : "保存并稍后继续") : "下一步";
   return `${back}<div class="onb-foot-r">${later}<button class="btn primary" type="button" data-act="onb-next">${next}</button></div>`;
@@ -446,6 +449,7 @@ async function closeOnboarding(action) {
 // 这一步要保存的东西；返回错误文字（空 = 过）
 async function onbSave(id) {
   const v = (x) => ($(x) ? $(x).value.trim() : "");
+  if (id === "social") { await saveOnbSocial(); return ""; }
   if (id === "models") {
     const ep = onbEndpoint();
     if (!/^https?:\/\/\S+$/.test(v("onb-url"))) return "地址须以 http:// 或 https:// 开头。";
@@ -603,6 +607,7 @@ async function onbGo(delta) {
       onb.presets = [];
     }
   }
+  if (ONB_STEPS[to].id === "social") await loadOnbSocial();
   if (ONB_STEPS[to].id === "look" && !state.avatarCfg) {
     try {
       state.avatarCfg = await api("GET", "/api/settings/avatar");
@@ -692,6 +697,13 @@ export async function onbAct(el) {
     } catch (e) {
       return toast(e.message, true);
     }
+  }
+  if (a === "onb-social-reload") {
+    onb.busy = true;
+    el.disabled = true;
+    try { await loadOnbSocial(); onbPaint(0); }
+    finally { onb.busy = false; el.disabled = false; }
+    return;
   }
   if (a === "onb-later") return onbGo(1);
   if (a === "onb-test") {

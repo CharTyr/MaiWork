@@ -59,7 +59,9 @@ def register_skill_tools(tools: Tools, skills: Skills) -> None:
     async def list_skills(ctx: ToolContext, args: dict) -> ToolResult:
         role = role_of(ctx)
         try:
-            items = skills.list(role)
+            items = skills.list("main" if role == "admin" else role)
+            if role == "admin":
+                items = [item for item in items if item.get("name") == "social-login-helper"]
         except Exception:
             logger.exception("list_skills 读目录出错")
             return ToolResult(ok=False, output="", error="读 skill 目录出错了")
@@ -68,7 +70,7 @@ def register_skill_tools(tools: Tools, skills: Skills) -> None:
         # 岗位从真实 ToolContext.agent_type 读（不是不存在的 ctx.kind）；只列 active。
         _agents_obj_list = getattr(tools, "_agents", None)
         _gid_list = str(getattr(ctx, "group_id", "") or "").strip()
-        if _agents_obj_list is not None and _gid_list:
+        if role != "admin" and _agents_obj_list is not None and _gid_list:
             try:
                 for _kind in _group_kinds(ctx):
                     for _it in _agents_obj_list.skills(_gid_list, _kind, include_archived=False):
@@ -103,6 +105,8 @@ def register_skill_tools(tools: Tools, skills: Skills) -> None:
         name = str(args.get("name") or "").strip()
         if not name:
             return ToolResult(ok=False, output="", error="name 不能为空")
+        if role_of(ctx) == "admin" and name != "social-login-helper":
+            return _group_not_found(name)
         # 本群两份（§七.2）：「本群/<name>」读的是本群 skill；只在 ctx.group_id 对得上且
         # svc._agents 接上了才读得到；跨群 / 没群号 / 未服务群 / 归档 / 别的岗一律当「没有」
         # （不 leak 名字，也不计 uses）。
@@ -146,7 +150,7 @@ def register_skill_tools(tools: Tools, skills: Skills) -> None:
         role = role_of(ctx)
         # 角色对不上的 skill 当「没有」——不 leak 名字，也不给读（附属文件同理）
         skill_roles = skills.roles(name)
-        if skill_roles is None or role not in skill_roles:
+        if skill_roles is None or ("main" if role == "admin" else role) not in skill_roles:
             return _group_not_found(name)
         # 岗位白名单（专岗）：不在白名单当成「没有」；模型不能凭名字猜读。
         allowed = _allowed_skills(ctx)
@@ -171,7 +175,13 @@ def register_skill_tools(tools: Tools, skills: Skills) -> None:
             logger.exception("read_skill 出错（%s %s）", name, file_rel)
             return ToolResult(ok=False, output="", error="读 skill 出错了")
 
-    tools.register(
+    def register(tool: Tool) -> None:
+        from dataclasses import replace
+        tools.register(tool)
+        # Tools keeps admin tools in a separate registry; share handlers and schemas.
+        tools.register(replace(tool, roles=frozenset({"admin"})))
+
+    register(
         Tool(
             name="list_skills",
             description="列出你能用的 skill（管理员放在数据目录 skills/ 下的技能说明；只列 roles 含你这个角色的），给出名字和一句描述。",
@@ -182,7 +192,7 @@ def register_skill_tools(tools: Tools, skills: Skills) -> None:
             timeout_s=10.0,
         )
     )
-    tools.register(
+    register(
         Tool(
             name="read_skill",
             description="读一个 skill 的 SKILL.md 全文；给 file 参数则读它目录里的附属文件（只读，越界和符号链接会被拒）。要用里面的脚本就先把内容 write_file 到自己的工区再跑。",

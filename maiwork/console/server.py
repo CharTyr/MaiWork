@@ -147,7 +147,9 @@ class ConsoleServer:
     def __init__(self, svc: Any) -> None:
         self._svc = svc
         self._bg_tasks: set[Any] = set()  # 后台小任务（更新检查）的引用，防被回收
+        self._social_installs: dict[str, asyncio.Task] = {}
         self.app: web.Application = self._build_app()
+        self.app.on_cleanup.append(self._cleanup_social_installs)
         self._runner: web.AppRunner | None = None
         self.port: int | None = None
 
@@ -170,7 +172,36 @@ class ConsoleServer:
         logger.info("MaiWork 网页已开在 http://%s:%s", host, port)
         return True
 
+    async def _cleanup_social_installs(self, app: web.Application | None = None) -> None:
+        tasks = list(self._social_installs.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._social_installs.clear()
+
+    def _start_social_install(self, platform_id: str) -> None:
+        task = self._social_installs.get(platform_id)
+        if task is not None and not task.done():
+            return
+
+        async def install() -> None:
+            from .. import social_platforms
+            try:
+                await social_platforms.install_platform(self._svc.store, platform_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Never log CLI exceptions: they may include credentials.
+                logger.warning("社交平台 %s 安装失败", platform_id)
+            finally:
+                if self._social_installs.get(platform_id) is asyncio.current_task():
+                    self._social_installs.pop(platform_id, None)
+
+        self._social_installs[platform_id] = asyncio.create_task(install())
+
     async def stop(self) -> None:
+        await self._cleanup_social_installs()
         runner, self._runner = self._runner, None
         port, self.port = self.port, None
         if runner is not None:
@@ -449,6 +480,73 @@ class ConsoleServer:
             resp = web.json_response({"ok": True})
             resp.del_cookie(COOKIE_NAME, path="/")
             return resp
+
+        # ---------- 社交平台（总管理员；凭据只进不出） ----------
+
+        def social_row(pid: str) -> dict:
+            from .. import social_platforms
+            row = next(row for row in social_platforms.list_platforms(svc.store) if row["id"] == pid)
+            task = self._social_installs.get(pid)
+            row["installing"] = bool(task is not None and not task.done()) or bool(row.get("installing"))
+            return row
+
+        @get("/api/social/platforms")
+        async def _social_list(request: web.Request) -> web.Response:
+            deny = self._require_admin(request)
+            if deny is not None:
+                return deny
+            from .. import social_platforms
+            return web.json_response({"platforms": [social_row(pid) for pid in social_platforms.PLATFORMS]})
+
+        async def _social_action(request: web.Request) -> web.Response:
+            deny = self._require_admin(request)
+            if deny is not None:
+                return deny
+            from .. import social_platforms
+            pid = request.match_info["id"]
+            if pid not in social_platforms.PLATFORMS:
+                return _err(404, "没有这个社交平台")
+            action = request.match_info.get("action", "cookie")
+            try:
+                if action == "cookie-status":
+                    return web.json_response({"set": bool(social_platforms.cookie_status(svc.store, pid))})
+                if action == "cookie":
+                    if request.method == "DELETE":
+                        social_platforms.clear_cookie(svc.store, pid)
+                    else:
+                        body = await _json_body(request)
+                        if body is None or not isinstance(body.get("cookie"), str):
+                            return _err(400, "请填写 Cookie 文本")
+                        social_platforms.set_cookie(svc.store, pid, body["cookie"])
+                    return web.json_response({"ok": True})
+                if action == "enable":
+                    social_platforms.enable_platform(svc.store, pid)
+                    if not social_row(pid).get("installed"):
+                        self._start_social_install(pid)
+                    return web.json_response({"ok": True, "platform": social_row(pid)})
+                if action == "disable":
+                    task = self._social_installs.get(pid)
+                    if task is not None:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                    social_platforms.disable_platform(svc.store, pid)
+                    return web.json_response({"ok": True, "platform": social_row(pid)})
+                if action == "install":
+                    self._start_social_install(pid)
+                    return web.json_response({"ok": True, "msg": "正在安装"})
+                if action == "check":
+                    return web.json_response(await social_platforms.check_platform(svc.store, pid))
+                return _err(404, "没有这个操作")
+            except social_platforms.SocialPlatformError as exc:
+                # Module errors use fixed safe messages; raw CLI exceptions never reach this branch.
+                return _err(400, str(exc))
+            except Exception:
+                logger.warning("社交平台 %s 的 %s 操作失败", pid, action)
+                return _err(500, "社交平台操作失败，请稍后重试")
+
+        app.router.add_get("/api/social/platforms/{id}/{action:cookie-status}", _social_action)
+        app.router.add_post("/api/social/platforms/{id}/{action:enable|disable|install|check|cookie}", self._write(_social_action))
+        app.router.add_delete("/api/social/platforms/{id}/cookie", self._write(_social_action))
 
         # ---------- 群 ----------
 
@@ -5062,6 +5160,119 @@ class ConsoleServer:
 
         app.router.add_post("/api/settings/avatar", self._write(_avatar_settings_post))
         app.router.add_route("DELETE", "/api/settings/avatar", self._write(_avatar_settings_delete))
+
+        # ---------- 主题与音效包（任务 10-16-web-theme-sound，逻辑在 maiwork/sound_packs.py） ----------
+        # GET /api/theme 与 GET /api/sound-packs/{id}/{kind} 任何访客可读（不含路径 / 隐私）；
+        # 其余只总管理员，写操作过 _write 同源守卫。上传 zip 允许到 10MB，绕开 aiohttp 默认 1MB
+        # 请求体上限：自己按块读 request.content / multipart，超限立刻停。
+
+        from .. import sound_packs as _sp
+
+        def _sp_data_dir() -> Any:
+            return svc.get_settings().data_dir
+
+        async def _read_capped(reader: Any, cap: int) -> bytes:
+            buf = bytearray()
+            while True:
+                chunk = await reader.read_chunk() if hasattr(reader, "read_chunk") else await reader.read(65536)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if len(buf) > cap:
+                    raise ValueError(f"压缩包超过 {cap // 1024 // 1024}MB")
+            return bytes(buf)
+
+        @get("/api/theme")
+        async def _theme_get(request: web.Request) -> web.Response:
+            return web.json_response(_sp.get_theme(svc.store, _sp_data_dir()))
+
+        async def _theme_put(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            try:
+                view = _sp.set_theme(svc.store, _sp_data_dir(), body)
+            except ValueError as e:
+                return _err(400, str(e))
+            return web.json_response(view)
+
+        @get("/api/sound-packs")
+        async def _sound_packs_list(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            return web.json_response({"packs": _sp.list_packs(_sp_data_dir())})
+
+        async def _sound_pack_upload(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            from urllib.parse import unquote
+
+            filename = unquote(str(request.headers.get("X-Filename") or "").strip())
+            ct = str(request.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            blob = b""
+            try:
+                if ct.startswith("multipart/"):
+                    reader = await request.multipart()
+                    async for part in reader:
+                        if getattr(part, "name", None) == "file":
+                            filename = str(getattr(part, "filename", "") or filename)
+                            blob = await _read_capped(part, _sp.ZIP_MAX)
+                            break
+                elif ct in ("application/zip", "application/octet-stream", "application/x-zip-compressed"):
+                    blob = await _read_capped(request.content, _sp.ZIP_MAX)
+                if not blob:
+                    return _err(400, "请求体不是 zip（Content-Type: application/zip 或 multipart 字段 file）")
+                view = await asyncio.to_thread(_sp.install_zip, svc.store, _sp_data_dir(), blob, filename)
+            except ValueError as e:
+                return _err(400, str(e))
+            return web.json_response(view)
+
+        async def _sound_pack_github(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None or not isinstance(body.get("url"), str):
+                return _err(400, "请求体应为 {\"url\": \"https://github.com/...\"}")
+            try:
+                view = await _sp.install_github(
+                    svc.store, _sp_data_dir(), body["url"], transport=getattr(svc, "sound_pack_transport", None),
+                )
+            except ValueError as e:
+                return _err(400, str(e))
+            return web.json_response(view)
+
+        async def _sound_pack_delete(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            try:
+                _sp.delete_pack(svc.store, _sp_data_dir(), str(request.match_info["id"]))
+            except ValueError as e:
+                return _err(400, str(e))
+            except KeyError:
+                return _err(404, "没有这个音效包")
+            return web.json_response({"ok": True})
+
+        @get("/api/sound-packs/{id}/{kind}")
+        async def _sound_pack_file(request: web.Request) -> web.Response:
+            hit = _sp.pack_file(_sp_data_dir(), str(request.match_info["id"]), str(request.match_info["kind"]))
+            if hit is None:
+                return _err(404, "没有这个音效")
+            path, ctype = hit
+            return web.FileResponse(
+                path, headers={"Content-Type": ctype, "Cache-Control": "public, max-age=86400"},
+            )
+
+        app.router.add_route("PUT", "/api/theme", self._write(_theme_put))
+        app.router.add_post("/api/sound-packs/upload", self._write(_sound_pack_upload))
+        app.router.add_post("/api/sound-packs/github", self._write(_sound_pack_github))
+        app.router.add_route("DELETE", "/api/sound-packs/{id}", self._write(_sound_pack_delete))
 
         # ---------- 静态 ----------
 

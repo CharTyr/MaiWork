@@ -10,6 +10,9 @@ import { draft } from "./settings/models.js";
 import { chatSide } from "./chat.js";
 import { renderRail, renderSide, renderView } from "./render.js";
 import { syncHash } from "./router.js";
+import { appearanceSheet } from "./theme.js";
+import { socialCookieSheet } from "./settings/social.js";
+import { sfx } from "./sound.js";
 
 function loginSheet() {
   if (isGA())
@@ -85,6 +88,8 @@ export const sheetChrome = () => `<div class="grab"></div><button class="sheet-c
 function sheetHTML(kind) {
   if (kind === "chats") return chatsSheet();
   if (kind === "groups") return groupPicker();
+  if (kind === "appearance") return appearanceSheet();
+  if (kind === "social-cookie") return socialCookieSheet();
   if (kind === "login") return loginSheet();
   if (kind === "edit") return editSheet();
   if (kind === "handoff") return handoffSheet();
@@ -104,6 +109,7 @@ export function openSheet(kind) {
   $("scrim").hidden = false;
   sh.scrollTop = 0;
   if (!was) {
+    sfx("open");
     requestAnimationFrame(() => {
       sh.classList.add("on");
       $("scrim").classList.add("on");
@@ -113,7 +119,7 @@ export function openSheet(kind) {
   sh.focus({ preventScroll: true });
 }
 
-export function repaintSheet() {
+export function repaintSheet(opts = {}) {
   if (state.page === "settings") {
     const y = window.scrollY;
     renderView();
@@ -121,7 +127,7 @@ export function repaintSheet() {
     renderRail();
     window.scrollTo(0, y);
   }
-  if (!state.sheet) return;
+  if (!state.sheet || opts.preserveSheet) return;
   const sh = $("sheet");
   const top = sh.scrollTop;
   sh.innerHTML = sheetChrome() + sheetHTML(state.sheet);
@@ -146,6 +152,7 @@ export function closeSheet() {
   }
   state.sheet = null;
   draft.models = null;
+  sfx("close");
   const sh = $("sheet");
   sh.classList.remove("on");
   $("scrim").classList.remove("on");

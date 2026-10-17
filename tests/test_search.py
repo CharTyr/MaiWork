@@ -529,3 +529,207 @@ class TestExtractFromOtherMcp:
         _, _, s = self._two(store)
         secrets = s.known_secrets()
         assert "k-SECRET-甲" in secrets and "y-SECRET-乙" in secrets
+
+
+# ----------------------------------------------------------------------
+# search_broad：撒大网——broad_providers() 每家并行各搜一次，按 URL 合并去重
+# （2026-10-16 Twitter 网页备选渠道的「每查询 × 多引擎」能力）
+# ----------------------------------------------------------------------
+
+KEENABLE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string"},
+        "max_results": {"type": "integer"},
+        "site": {"type": "string"},
+        "mode": {"type": "string"},
+    },
+    "required": ["query"],
+}
+
+
+_TAVILY_SITE_SCHEMA = {
+    **TAVILY_SCHEMA,
+    "properties": {**TAVILY_SCHEMA["properties"], "include_domains": {"type": "array", "items": {"type": "string"}}},
+}
+
+
+def _bind_broad(store: Store, main_client, broad_client, *, main_url: str = "https://mcp.tavily.com/mcp/"):
+    """主绑定 tavily + 撒网 keenable（都是预设认得出的地址）。"""
+    set_binding(store, {"mcp": "tavily", "tool": "tavily-search", "extract_tool": "", "broad": ["keenable"]})
+    return {
+        "tavily": FakeExt("tavily", url=main_url,
+                          tools={"tavily-search": {"name": "tavily-search", "inputSchema": _TAVILY_SITE_SCHEMA}},
+                          client=main_client),
+        "keenable": FakeExt("keenable", url="https://api.keenable.ai/mcp",
+                            tools={"search_web_pages": {"name": "search_web_pages", "inputSchema": KEENABLE_SCHEMA}},
+                            client=broad_client),
+    }
+
+
+class TestBroadFanout:
+    @pytest.mark.asyncio
+    async def test_fans_out_merges_by_url_and_tags_provider(self, store: Store) -> None:
+        main = FakeClient([_text_result({"results": [
+            {"url": "https://x.com/a/status/1", "title": "主家一", "content": "m1"},
+            {"url": "https://x.com/b/status/2", "title": "主家重复", "content": "m2"},
+        ]})])
+        broad = FakeClient([_text_result({"results": [
+            {"url": "https://x.com/b/status/2", "title": "广家重复", "content": "b2"},
+            {"url": "https://x.com/c/status/3", "title": "广家三", "content": "b3"},
+        ]})])
+        s = _search(store, _bind_broad(store, main, broad))
+        out = await s.search_broad("话题", limit=8)
+        assert [i["url"] for i in out] == [
+            "https://x.com/a/status/1", "https://x.com/b/status/2", "https://x.com/c/status/3"]
+        assert [i["provider"] for i in out] == ["tavily", "tavily", "keenable"]
+        assert len(main.calls) == 1 and len(broad.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_site_and_limit_passed_to_each_provider(self, store: Store) -> None:
+        main = FakeClient([_text_result({"results": []})])
+        broad = FakeClient([_text_result({"results": []})])
+        s = _search(store, _bind_broad(store, main, broad))
+        await s.search_broad("话题", limit=5, site="x.com")
+        assert main.calls[0][1].get("include_domains") == ["x.com"]  # tavily 预设参数
+        assert broad.calls[0][1].get("site") == "x.com"              # keenable 预设参数
+        assert broad.calls[0][1].get("max_results") == 5
+
+    @pytest.mark.asyncio
+    async def test_merged_result_capped_at_limit(self, store: Store) -> None:
+        main = FakeClient([_text_result({"results": [
+            {"url": f"https://x.com/a/status/{i}", "title": f"m{i}", "content": "c"} for i in range(3)]})])
+        broad = FakeClient([_text_result({"results": [
+            {"url": f"https://x.com/b/status/{i}", "title": f"b{i}", "content": "c"} for i in range(3)]})])
+        s = _search(store, _bind_broad(store, main, broad))
+        out = await s.search_broad("话题", limit=4)
+        assert len(out) == 4
+
+    @pytest.mark.asyncio
+    async def test_single_failure_isolated(self, store: Store) -> None:
+        main = FakeClient([_text_result({"results": [
+            {"url": "https://x.com/a/status/1", "title": "t", "content": "c"}]})])
+        broad = FakeClient(error=MCPError("连不上"))
+        s = _search(store, _bind_broad(store, main, broad))
+        out = await s.search_broad("话题", limit=8)
+        assert [i["url"] for i in out] == ["https://x.com/a/status/1"]
+        assert out[0]["provider"] == "tavily"
+
+    @pytest.mark.asyncio
+    async def test_all_fail_raises_last_error(self, store: Store) -> None:
+        main = FakeClient(error=MCPError("主家连不上"))
+        broad = FakeClient(error=MCPError("广家连不上"))
+        s = _search(store, _bind_broad(store, main, broad))
+        with pytest.raises(SearchError):
+            await s.search_broad("话题", limit=8)
+
+    @pytest.mark.asyncio
+    async def test_no_binding_raises_unavailable_without_calls(self, store: Store) -> None:
+        main, broad = FakeClient(), FakeClient()
+        s = _search(store, {"tavily": FakeExt("tavily", client=main)})
+        with pytest.raises(SearchUnavailable):
+            await s.search_broad("话题", limit=8)
+        assert not main.calls and not broad.calls
+
+    @pytest.mark.asyncio
+    async def test_main_custom_mcp_still_in_fanout(self, store: Store) -> None:
+        """主绑定不是预设认得出的自定义 MCP：撒网仍带上主家（通用参数映射，site 忽略不报错）。"""
+        main = FakeClient([_text_result({"results": [
+            {"url": "https://x.com/m/status/9", "title": "t", "content": "c"}]})])
+        broad = FakeClient([_text_result({"results": []})])
+        s = _search(store, _bind_broad(store, main, broad, main_url="https://mcp.example/mcp"))
+        out = await s.search_broad("话题", limit=8, site="x.com")
+        assert [i["url"] for i in out] == ["https://x.com/m/status/9"]
+        assert out[0]["provider"] == "tavily"
+        assert main.calls[0][1].get("query") == "话题"  # 通用映射
+
+    @pytest.mark.asyncio
+    async def test_empty_success_with_other_failure_is_not_total_failure(self, store):
+        main = FakeClient([_text_result({"results": []})])
+        broad = FakeClient(error=MCPError("unavailable"))
+        s = _search(store, _bind_broad(store, main, broad))
+        assert await s.search_broad("topic") == []
+
+    @pytest.mark.asyncio
+    async def test_deadline_keeps_completed_provider_and_cancels_slow_one(self, store):
+        from CharTyr_MaiWork.maiwork.mcp_client import RequestBudget, use_request_budget
+        stopped = asyncio.Event()
+        class SlowClient:
+            async def call_tool(self, *args):
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    stopped.set()
+        main = FakeClient([_text_result({"results": [{"url": "https://x.com/a/status/1", "title": "kept"}]})])
+        s = _search(store, _bind_broad(store, main, SlowClient()))
+        with use_request_budget(RequestBudget(requests=4, concurrency=2, timeout_s=0.05)):
+            out = await s.search_broad("topic")
+        assert [row["title"] for row in out] == ["kept"]
+        assert stopped.is_set()
+
+    @pytest.mark.asyncio
+    async def test_twitter_keeps_fast_engine_when_other_engine_hits_deadline(self, store):
+        from CharTyr_MaiWork.maiwork import mcp_client as mc, social_platforms as sp
+        stopped = []
+        class SlowClient:
+            async def call_tool(self, *args):
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    stopped.append(True)
+        row = _text_result({'results': [{'url': 'https://x.com/a/status/1979000000000000000', 'title': 'kept'}]})
+        main = FakeClient([row, row])
+        search = _search(store, _bind_broad(store, main, SlowClient()))
+        with mc.use_request_budget(mc.RequestBudget(timeout_s=0.05)):
+            out = await sp.search_twitter_web('topic', web_search_fn=search.search_broad)
+        assert [row['title'] for row in out] == ['kept']
+        assert len(stopped) == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('tool_error', [False, True])
+    @pytest.mark.parametrize('padding', ['', 'x' * 270], ids=['short', 'at-cutoff'])
+    async def test_broad_errors_mask_secondary_provider_credentials(self, store, tool_error, padding):
+        secret = 'fixture-broad-secret-value-that-must-never-be-partially-visible'
+        main = FakeClient(error=MCPError('main unavailable'))
+        broad = (FakeClient([{'isError': True, 'content': [{'type': 'text', 'text': padding + secret}]}])
+                 if tool_error else FakeClient(error=MCPError(padding + secret)))
+        exts = _bind_broad(store, main, broad)
+        exts['keenable'].headers = {'Authorization': 'Bearer ' + secret}
+        search = _search(store, exts)
+        with pytest.raises(SearchError) as error:
+            await search.search_broad('topic')
+        assert secret[:8] not in str(error.value)
+
+    @pytest.mark.asyncio
+    async def test_twitter_domains_share_twelve_physical_http_attempts(self, store, monkeypatch):
+        import json
+        import httpx
+        from CharTyr_MaiWork.maiwork import mcp_client as mc, social_platforms as sp
+        hits = []
+        domains = set()
+        async def handler(request):
+            payload = json.loads(request.content)
+            hits.append(payload['method'])
+            if payload['method'] == 'notifications/initialized':
+                return httpx.Response(202)
+            if payload['method'] == 'tools/call':
+                domains.add(str(payload['params']['arguments']))
+                return httpx.Response(503)
+            return httpx.Response(200, json={'jsonrpc': '2.0', 'id': payload['id'], 'result': {}})
+        clients = [mc.McpSessionClient('https://mcp.example/mcp', '', transport=httpx.MockTransport(handler)) for _ in range(3)]
+        exts = _bind_broad(store, clients[0], clients[1])
+        exts['exa'] = FakeExt('exa', url='https://mcp.exa.ai/mcp',
+                              tools={'web_search_exa': {'name': 'web_search_exa', 'inputSchema': EXA_SCHEMA}}, client=clients[2])
+        set_binding(store, {'mcp': 'tavily', 'tool': 'tavily-search', 'extract_tool': '', 'broad': ['keenable', 'exa']})
+        search = _search(store, exts)
+        assert len(search.broad_providers()) == 3
+        monkeypatch.setattr('CharTyr_MaiWork.maiwork.search._MCP_RETRY_DELAY_S', 0)
+        try:
+            with pytest.raises(sp.SocialPlatformError):
+                await sp.search_twitter_web('topic', web_search_fn=search.search_broad)
+            assert len(hits) == 12
+            assert hits.count('initialize') == hits.count('notifications/initialized') == 3
+            assert any('x.com' in args for args in domains)
+            assert any('twitter.com' in args for args in domains)
+        finally:
+            await asyncio.gather(*(client.aclose() for client in clients))

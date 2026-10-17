@@ -584,7 +584,7 @@ class MaiWorkApp:
         # M5：工具落库摘要统一遮密钥——已知密钥（模型 / 搜索）由这个回调给
         self.tools = Tools(self.store, get_known_secrets=self._known_secrets)
         try:
-            register_builtin(self.tools, search=self.search, profiles=self.profiles, reader=self.reader)
+            register_builtin(self.tools, search=self.search, profiles=self.profiles, reader=self.reader, store=self.store)
         except Exception:
             logger.exception("注册内置工具出错，子 agent 这次没有工具用")
         # remember 工具（roles={"main"}；身份与工作记忆，identity.py）

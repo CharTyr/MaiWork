@@ -6,3 +6,11 @@
 - you.png：GitHub 组织 youdotcom-oss 头像
 - firecrawl.png：GitHub 组织 firecrawl 头像
 - tinyfish.png：https://tinyfish.ai 的 apple-icon
+
+社交平台图标（2026-10-16，缩放为 128×128 PNG；仅用于标识服务，商标归各平台所有）：
+
+- social/twitter-128.png：https://x.com/apple-touch-icon.png
+- social/xiaohongshu-128.png：https://cdn.simpleicons.org/xiaohongshu/FF2442
+- social/bilibili-128.png：https://github.com/bilibili.png
+- social/youtube-128.png：https://github.com/youtube.png
+- social/reddit-128.png：https://cdn.simpleicons.org/reddit/FF4500

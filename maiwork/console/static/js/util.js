@@ -1,5 +1,6 @@
 // MaiWork 网页 · 小工具：转义、图标、提示条、时间格式。
 import { $, state } from "./state.js";
+import { sfx } from "./sound.js";
 
 /* ───────────── 小工具 ───────────── */
 
@@ -39,6 +40,7 @@ export const SVG = {
   send: `<svg viewBox="0 0 24 24" ${P} stroke-width="2.2"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5"/></svg>`,
   chat: `<svg viewBox="0 0 24 24" ${P} stroke-width="1.9"><path d="M20 11.5a7.5 7.5 0 0 1-10.9 6.7L4.5 19.5l1.3-4A7.5 7.5 0 1 1 20 11.5z"/></svg>`,
   ext: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><path d="M14 4h6v6M20 4l-9 9M18 14v4.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 18.5v-11A1.5 1.5 0 0 1 5.5 6H10"/></svg>`,
+  palette: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><path d="M12 3.5a8.5 8.5 0 0 0 0 17c1.2 0 1.8-.8 1.8-1.7 0-1.2-1-1.6-1-2.6 0-1 .8-1.7 1.8-1.7h2.2a3.7 3.7 0 0 0 3.7-3.7C20.5 6.9 16.7 3.5 12 3.5z"/><circle cx="7.8" cy="11" r="1" fill="currentColor"/><circle cx="10.5" cy="7.3" r="1" fill="currentColor"/><circle cx="15" cy="7.6" r="1" fill="currentColor"/></svg>`,
   info: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.2"/><circle cx="12" cy="7.8" r="0.6" fill="currentColor"/></svg>`,
 };
 
@@ -76,6 +78,7 @@ export function toast(text, bad) {
       calm() ? [{ opacity: 0.55 }, { opacity: 1 }] : [{ transform: "translate(-50%, 0) scale(0.96)" }, { transform: "translate(-50%, 0) scale(1)" }],
       { duration: 160, easing: "cubic-bezier(0.2, 0.8, 0.2, 1)" }
     );
+  if (!/^正在/.test(String(text || ""))) sfx(bad ? "error" : "success"); // 「正在…」不是结果，不出声
   clearTimeout(toast.timer);
   // 错误按长度多留一会（至少 6 秒，长的最多 15 秒），点一下就关；成功提示照旧 2.4 秒
   const ms = bad ? Math.min(15000, Math.max(6000, String(text || "").length * 90)) : 2400;

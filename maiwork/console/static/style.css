@@ -506,8 +506,30 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .deliv-s { font-size: 13px; color: var(--gray); }
 
 /* 设置页 */
+.section-picker { margin: 12px 0 8px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+.section-picker > summary { min-height: 44px; padding: 10px 14px; cursor: pointer; font-size: 14px; font-weight: 700; color: var(--ink-2); }
+.section-current { margin-left: 12px; color: var(--gray); font-weight: 500; overflow-wrap: anywhere; }
+.section-picker nav { display: grid; max-height: min(360px, 50dvh); overflow-y: auto; overscroll-behavior: contain; padding: 4px 8px 8px; border-top: 1px solid var(--line); }
+.section-picker nav button { min-height: 44px; padding: 10px 12px; border-radius: 8px; text-align: left; font-size: 15px; color: var(--ink-2); overflow-wrap: anywhere; }
+.section-picker nav button:hover { background: var(--fill); }
+.section-picker nav button[aria-current="page"] { background: var(--fill); color: var(--ink); font-weight: 700; }
+.section-picker > summary:focus-visible, .section-picker nav button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 8px; }
+/* 桌面左栏已列出全部分栏，内容区不再重复一个同样列表。 */
+@media (min-width: 1180px) { .set-picker { display: none; } }
 .set-row { display: grid; grid-template-columns: 40px minmax(0, 1fr) auto; gap: 14px; align-items: center; padding: 13px 0; border-bottom: 1px solid var(--line); }
 .set-row:last-child { border-bottom: 0; }
+.social-logo { width: 30px; height: 30px; object-fit: contain; border-radius: 6px; flex: none; }
+.social-row .row-btns { flex-wrap: wrap; justify-content: flex-end; }
+.social-settings .btn, .onb-social-list .btn { min-height: 44px; min-width: 44px; }
+.social-settings .warn-box { overflow-wrap: anywhere; }
+.onb-social-list { display: grid; gap: 8px; margin-top: 20px; }
+.onb-social-option { display: flex; align-items: center; gap: 12px; min-height: 56px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 16px; cursor: pointer; }
+.onb-social-option input { width: 20px; height: 20px; accent-color: var(--blue); flex: none; }
+.onb-social-option > span { display: grid; gap: 2px; }
+@media (max-width: 560px) {
+  .social-row { grid-template-columns: 30px minmax(0, 1fr); }
+  .social-row .row-btns { grid-column: 2; justify-content: flex-start; }
+}
 .gctl-row { grid-template-columns: minmax(0, 1fr) auto; }
 .groupctl-slot .btn.small { min-height: 44px; }
 .groupctl-slot .switch { height: 44px; }
@@ -1376,7 +1398,8 @@ button[disabled]:active, .btn[disabled]:active { transform: none; opacity: 0.45;
 @media (prefers-reduced-motion: reduce) {
   .btn:active, .chip:active, .round-btn:active, .icon-btn:active, .fb button:active, .filter:active, .set-nav button:active, .ratebtn:active, .rate-chip:active, .chat-send:active, .src:active,
   .seg button:active, .cfg-jump button:active, .role-seg label:active span, .rej-head:active, .cm-tool-h:active, .news-run:active, .chat-list-btn:active,
-  .sheet-close:active, .side-close:active, .pf-add:active, .ci-x:active, .gpick:active, .r-item:active, .chat-item:active, .log-head:active, .tab:active svg { transform: none; opacity: 0.7; }
+  .sheet-close:active, .side-close:active, .pf-add:active, .ci-x:active, .gpick:active, .r-item:active, .chat-item:active, .log-head:active, .tab:active svg,
+  .section-picker nav button:active, .section-picker nav button[aria-current="page"] { transform: none; opacity: 0.7; }
 }
 
 /* 点开的明细淡入（只给刚点开的那一块，见 app.js reveal） */
@@ -1767,3 +1790,324 @@ a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 
 /* 设置 · 工具 · 可选组件（optdeps.js）/ 概况 · 需要处理（attention.js） */
 .od-miss { color: var(--orange); }
+
+/* ───────────── 外观：主题选择、音效包绑定 ───────────── */
+.theme-swatch { width: 36px; height: 36px; border-radius: 10px; border: 1px solid var(--line); background: linear-gradient(135deg, #fff 0 50%, #111114 50% 100%); }
+.theme-swatch[data-swatch="retro"] { border-radius: 3px; border: 2px solid #1d1b17; background: linear-gradient(135deg, #e8e1cf 0 50%, #7fd69c 50% 100%); }
+.gpick[aria-pressed="true"] { background: var(--fill); }
+.theme-check { font-size: 13px; font-weight: 700; color: var(--ok-ink); white-space: nowrap; }
+.theme-bind { height: 38px; max-width: 46vw; padding: 0 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--fill-2); color: var(--ink); font: inherit; font-size: 14px; }
+.theme-bind:disabled { opacity: 0.5; }
+#pack-gh .btn { justify-self: start; margin-top: 4px; }
+
+
+/* ───────────── 主题：复古终端（照 MaiBot WebUI 千禧主题；用户自选，只有浅色） ─────────────
+   三种材质：米黄塑料机壳（页面 / 卡片，左上亮边、右下暗边、底部厚度）、
+   下沉屏幕（输入框 / 内容区，带网格底纹）、键帽（按钮 / 标签，选中是按下去的薄荷绿键）。
+   变量名沿用 millennium.css 的 --mil-*；像素字（OFL 协议，见 assets/fonts/*-OFL.txt）只用在
+   标题、大数字和丝印标签，正文保持系统黑体。小鱼、立体图标保持原样。 */
+
+@font-face {
+  font-family: "Departure Mono";
+  src: url("/static/assets/fonts/DepartureMono-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Ark Pixel 12px SC";
+  src: url("/static/assets/fonts/ArkPixel12-ZhHans.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+3000-9FFF, U+FF00-FFEF;
+}
+
+:root[data-theme="retro"] {
+  color-scheme: light;
+  --mil-shell: #ddd4bf;
+  --mil-panel: #ebe4d2;
+  --mil-hi: #f6f1e3;
+  --mil-lo: #bdb39c;
+  --mil-drop: #9c927b;
+  --mil-line: #5a544a;
+  --mil-ink: #4a443a;
+  --mil-print: #5f5849;
+  --mil-vent: #a89e87;
+  --mil-screen: #fbf9f0;
+  --mil-screen-ink: #3a3833;
+  --mil-screen-dim: #66625a;
+  --mil-screen-shade: rgb(0 0 0 / 0.16);
+  --mil-screen-grid: rgb(0 0 0 / 0.03);
+  --mil-key: #f3eee1;
+  --mil-key-side: #c2b8a1;
+  --mil-key-hi: #fffaf0;
+  --mil-key-hover: #fbf7ec;
+  --mil-on: #8fd6a0;
+  --mil-on-ink: #2f3a2b;
+  --mil-on-side: #5fa873;
+  --mil-accent-text: #2a7d50;
+  --mil-hot: #f08a5d;
+  --mil-hot-ink: #3a2a22;
+  --mil-hot-side: #c2643c;
+  --mil-danger: #c2452f;
+  --mil-danger-side: #8f3020;
+  --mil-speck: radial-gradient(rgb(90 84 74 / 0.09) 1px, transparent 1px);
+  --mil-screen-tex:
+    linear-gradient(var(--mil-screen-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--mil-screen-grid) 1px, transparent 1px);
+  --mil-bevel: inset 2px 2px 0 var(--mil-hi), inset -2px -2px 0 var(--mil-lo);
+  --mil-raise: var(--mil-bevel), 0 5px 0 var(--mil-drop);
+  --mil-float: var(--mil-bevel), 6px 6px 0 rgb(74 68 58 / 0.28);
+  --mil-sunk: inset 3px 3px 0 var(--mil-screen-shade), -2px -2px 0 2px var(--mil-lo), 2px 2px 0 2px var(--mil-hi);
+  --mil-keycap: inset 0 0 0 2px var(--mil-line), inset 0 -7px 0 var(--mil-key-side), inset 4px 4px 0 var(--mil-key-hi);
+  --mil-pressed: inset 0 0 0 2px var(--mil-line), inset 0 -4px 0 var(--mil-on-side);
+  --mil-font: "Departure Mono", "Ark Pixel 12px SC", var(--mono);
+
+  /* 映射到 MaiWork 变量 */
+  --ink: var(--mil-ink);
+  --ink-2: var(--mil-print);
+  --gray: var(--mil-print);
+  --gray-2: var(--mil-screen-dim);
+  --line: var(--mil-lo);
+  --fill: var(--mil-panel);
+  --fill-2: var(--mil-panel);
+  --blue: var(--mil-accent-text);
+  --green: var(--mil-on-side);
+  --orange: var(--mil-hot);
+  --red: var(--mil-danger);
+  --purple: #6f4596;
+  --bg: var(--mil-shell);
+  --card: var(--mil-panel);
+  --on-ink: var(--mil-key);
+  --sh: 90, 84, 74;
+  --glass: var(--mil-panel);
+  --glass-hi: transparent;
+  --warn-bg: #f1dfc4;
+  --warn-ink: #6e3708;
+  --warn-t: #8f4510;
+  --warn-bg-2: #efe2cb;
+  --ok-ink: var(--mil-accent-text);
+  --ok-bg: rgb(143 214 160 / 0.25);
+  --alt-bg: #dfe3da;
+  --danger-bg: #efd6cc;
+  --face-ink: rgb(74 68 58 / 0.72);
+  --edge: 2px solid var(--mil-line);
+}
+
+:root[data-theme="retro"] body {
+  background-color: var(--mil-shell);
+  background-image: var(--mil-speck);
+  background-size: 5px 5px;
+}
+:root[data-theme="retro"] ::selection { background: var(--mil-on); color: var(--mil-on-ink); }
+:root[data-theme="retro"] :focus-visible { outline: 2px solid var(--mil-on-side); outline-offset: 2px; border-radius: 0; }
+
+/* 像素字只给标题、丝印标签和大数字；正文保持系统黑体 */
+:root[data-theme="retro"] .h-page,
+:root[data-theme="retro"] .h-sub,
+:root[data-theme="retro"] .brand-name,
+:root[data-theme="retro"] .stat b,
+:root[data-theme="retro"] .pulse-now b {
+  font-family: var(--mil-font);
+  font-synthesis: none;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+:root[data-theme="retro"] .h-sub { font-size: 19px; letter-spacing: 0.1em; }
+:root[data-theme="retro"] .h-sub::after { content: ""; flex: 1; align-self: center; min-width: 24px; height: 10px; background: repeating-linear-gradient(90deg, var(--mil-vent) 0 3px, transparent 3px 8px); }
+:root[data-theme="retro"] .h-sub-row .h-sub::after, :root[data-theme="retro"] .side .h-sub::after { display: none; }
+:root[data-theme="retro"] .h-meta, :root[data-theme="retro"] .chip-sub, :root[data-theme="retro"] .status { color: var(--mil-print); }
+:root[data-theme="retro"] .filter .n, :root[data-theme="retro"] .fb button i { font-family: var(--mil-font); font-synthesis: none; }
+
+/* 键帽：按钮、筛选、分段、导航键 */
+:root[data-theme="retro"] .btn,
+:root[data-theme="retro"] .filter,
+:root[data-theme="retro"] .set-nav button,
+:root[data-theme="retro"] .chip,
+:root[data-theme="retro"] .round-btn,
+:root[data-theme="retro"] .seg button,
+:root[data-theme="retro"] .fb button,
+:root[data-theme="retro"] .icon-btn,
+:root[data-theme="retro"] .sheet-close,
+:root[data-theme="retro"] .side-close,
+:root[data-theme="retro"] .gpick,
+:root[data-theme="retro"] .side-set {
+  border-radius: 0;
+  border: 0;
+  background-color: var(--mil-key);
+  box-shadow: var(--mil-keycap);
+  color: var(--mil-ink);
+  font-weight: 700;
+  transition: transform 60ms ease-out, background-color 120ms ease-out;
+}
+:root[data-theme="retro"] .btn:hover:not([disabled]),
+:root[data-theme="retro"] .filter:hover,
+:root[data-theme="retro"] .set-nav button:hover,
+:root[data-theme="retro"] .chip:hover,
+:root[data-theme="retro"] .round-btn:hover,
+:root[data-theme="retro"] .fb button:hover,
+:root[data-theme="retro"] .icon-btn:hover,
+:root[data-theme="retro"] .gpick:hover,
+:root[data-theme="retro"] .side-set:hover { background-color: var(--mil-key-hover); }
+:root[data-theme="retro"] .btn:active:not([disabled]),
+:root[data-theme="retro"] .filter:active,
+:root[data-theme="retro"] .set-nav button:active,
+:root[data-theme="retro"] .chip:active,
+:root[data-theme="retro"] .round-btn:active,
+:root[data-theme="retro"] .seg button:active,
+:root[data-theme="retro"] .fb button:active,
+:root[data-theme="retro"] .icon-btn:active,
+:root[data-theme="retro"] .gpick:active,
+:root[data-theme="retro"] .side-set:active {
+  box-shadow: inset 0 0 0 2px var(--mil-line), inset 0 -4px 0 rgb(0 0 0 / 0.22);
+  transform: translateY(2px);
+}
+/* 主操作键是珊瑚橙 */
+:root[data-theme="retro"] .btn.primary {
+  background-color: var(--mil-hot);
+  box-shadow: inset 0 0 0 2px var(--mil-line), inset 0 -7px 0 var(--mil-hot-side), inset 4px 4px 0 rgb(255 255 255 / 0.28);
+  color: var(--mil-hot-ink);
+}
+:root[data-theme="retro"] .btn.primary:hover:not([disabled]) { background-color: var(--mil-hot); filter: brightness(1.06); }
+:root[data-theme="retro"] .btn.danger { background-color: var(--mil-danger); box-shadow: inset 0 0 0 2px var(--mil-line), inset 0 -7px 0 var(--mil-danger-side), inset 4px 4px 0 rgb(255 255 255 / 0.2); color: #fff; }
+:root[data-theme="retro"] .btn.danger:hover { background-color: var(--mil-danger); filter: brightness(1.06); }
+:root[data-theme="retro"] .btn.ghost { background: transparent; box-shadow: none; color: var(--mil-print); }
+:root[data-theme="retro"] .btn[disabled] { box-shadow: var(--mil-keycap); opacity: 0.5; }
+/* 选中态是按下去的薄荷绿键 */
+:root[data-theme="retro"] .filter[aria-pressed="true"],
+:root[data-theme="retro"] .set-nav button[aria-selected="true"],
+:root[data-theme="retro"] .seg button[aria-selected="true"],
+:root[data-theme="retro"] .seg button[aria-pressed="true"],
+:root[data-theme="retro"] .fb button[aria-pressed="true"],
+:root[data-theme="retro"] .gpick[aria-pressed="true"],
+:root[data-theme="retro"] .side-set.on {
+  background-color: var(--mil-on);
+  box-shadow: var(--mil-pressed);
+  color: var(--mil-on-ink);
+  transform: translateY(2px);
+}
+:root[data-theme="retro"] .seg { border-radius: 0; border: var(--edge); background: var(--mil-panel); padding: 3px; }
+:root[data-theme="retro"] .filters { padding-bottom: 10px; }
+:root[data-theme="retro"] .set-nav { padding-bottom: 12px; }
+/* 竖向分栏菜单在复古主题里同样是键帽，选中项是按下去的薄荷绿键。 */
+:root[data-theme="retro"] .section-picker { border: var(--edge); border-radius: 0; background: var(--mil-panel); }
+:root[data-theme="retro"] .section-picker > summary { min-height: 44px; color: var(--mil-ink); font-family: var(--mil-font); font-synthesis: none; }
+:root[data-theme="retro"] .section-current { color: var(--mil-print); }
+:root[data-theme="retro"] .section-picker nav { border-top: var(--edge); gap: 6px; padding: 8px; }
+:root[data-theme="retro"] .section-picker nav button {
+  border-radius: 0;
+  background-color: var(--mil-key);
+  box-shadow: var(--mil-keycap);
+  color: var(--mil-ink);
+  font-weight: 700;
+  transition: transform 60ms ease-out, background-color 120ms ease-out;
+}
+:root[data-theme="retro"] .section-picker nav button:hover { background-color: var(--mil-key-hover); }
+:root[data-theme="retro"] .section-picker nav button:active,
+:root[data-theme="retro"] .section-picker nav button[aria-current="page"] {
+  background-color: var(--mil-on);
+  box-shadow: var(--mil-pressed);
+  color: var(--mil-on-ink);
+  transform: translateY(2px);
+}
+
+/* 凸起的塑料模块：卡片、来源卡、引用、提示 */
+:root[data-theme="retro"] .src,
+:root[data-theme="retro"] .quote,
+:root[data-theme="retro"] .pulse-card,
+:root[data-theme="retro"] .stat,
+:root[data-theme="retro"] .landing-box,
+:root[data-theme="retro"] .warn-box,
+:root[data-theme="retro"] .cm-pending,
+:root[data-theme="retro"] .item.tap.selected {
+  border-radius: 0;
+  border: var(--edge);
+  background-color: var(--mil-panel);
+  background-image: var(--mil-speck);
+  background-size: 5px 5px;
+  box-shadow: var(--mil-raise);
+}
+:root[data-theme="retro"] .tip-pop { border-radius: 0; border: var(--edge); background-color: var(--mil-panel); box-shadow: var(--mil-float); }
+:root[data-theme="retro"] .theme-swatch { border-radius: 0; border: var(--edge); }
+:root[data-theme="retro"] .theme-swatch[data-swatch="retro"] { border: 2px solid var(--mil-line); background: linear-gradient(135deg, #ddd4bf 0 50%, #8fd6a0 50% 100%); }
+
+/* 下沉屏幕：输入框、下拉、代码块 */
+:root[data-theme="retro"] .login input,
+:root[data-theme="retro"] .login select,
+:root[data-theme="retro"] .login textarea,
+:root[data-theme="retro"] .theme-bind,
+:root[data-theme="retro"] .mono-area {
+  border-radius: 0;
+  border: var(--edge);
+  background-color: var(--mil-screen);
+  background-image: var(--mil-screen-tex);
+  background-size: 3px 3px;
+  box-shadow: var(--mil-sunk);
+  color: var(--mil-screen-ink);
+}
+:root[data-theme="retro"] .login input:focus, :root[data-theme="retro"] .login select:focus { outline: 2px solid var(--mil-on-side); outline-offset: 1px; background-color: var(--mil-screen); }
+:root[data-theme="retro"] .login input::placeholder, :root[data-theme="retro"] .login textarea::placeholder { color: var(--mil-screen-dim); }
+
+/* 状态点、进度条：方块 + 分段格 */
+:root[data-theme="retro"] .dot { border-radius: 0; }
+:root[data-theme="retro"] .tick { border-radius: 0; border-color: var(--mil-line); }
+:root[data-theme="retro"] .done .tick { background: var(--mil-on); border-color: var(--mil-line); }
+:root[data-theme="retro"] .progress { height: 12px; border-radius: 0; border: var(--edge); background: var(--mil-screen); box-shadow: inset 2px 2px 0 var(--mil-screen-shade); }
+:root[data-theme="retro"] .progress i { border-radius: 0; background: repeating-linear-gradient(90deg, var(--mil-on) 0 8px, transparent 8px 10px); }
+
+/* 头像方角 */
+:root[data-theme="retro"] .top-avatar, :root[data-theme="retro"] .brand img { border-radius: 0; border: 2px solid var(--mil-line); box-shadow: var(--mil-bevel); }
+
+/* 手机底栏：一块浮起的塑料条，选中是绿键 */
+:root[data-theme="retro"] .tabbar {
+  border-radius: 0;
+  background-color: var(--mil-panel);
+  background-image: var(--mil-speck);
+  background-size: 5px 5px;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  border: var(--edge) !important;
+  box-shadow: var(--mil-float);
+}
+:root[data-theme="retro"] .tab-pill { border-radius: 0; background: var(--mil-on); box-shadow: var(--mil-pressed); }
+:root[data-theme="retro"] .tab .badge, :root[data-theme="retro"] .r-badge { border-radius: 0; font-family: var(--mil-font); font-synthesis: none; }
+:root[data-theme="retro"] .chat-composer { border-radius: 0; border: var(--edge); background-color: var(--mil-panel); -webkit-backdrop-filter: none; backdrop-filter: none; box-shadow: var(--mil-raise); }
+
+/* 抽屉、提示 */
+:root[data-theme="retro"] .sheet { border-radius: 0; border-top: var(--edge); background-color: var(--mil-shell); background-image: var(--mil-speck); background-size: 5px 5px; box-shadow: none; }
+:root[data-theme="retro"] .grab { border-radius: 0; background: var(--mil-line); }
+:root[data-theme="retro"] .scrim { background: rgb(74 68 58 / 0.4); }
+:root[data-theme="retro"] .toast { border-radius: 0; border: var(--edge); background-color: var(--mil-panel); box-shadow: var(--mil-float); font-weight: 700; }
+:root[data-theme="retro"] .toast.bad { background: var(--mil-danger); color: #fff; }
+
+/* 系统深色时默认样式里的滤镜不作用到机壳 */
+:root[data-theme="retro"] .ico { filter: drop-shadow(0 3px 4px rgb(74 68 58 / 0.15)); }
+:root[data-theme="retro"] .face { filter: none; }
+:root[data-theme="retro"] .item-img, :root[data-theme="retro"] .post-img { opacity: 1; }
+:root[data-theme="retro"] .pulse .area { fill: rgb(74 68 58 / 0.1); }
+
+/* 滚动条：塑料滑块 */
+@supports selector(::-webkit-scrollbar) {
+  :root[data-theme="retro"] *::-webkit-scrollbar { width: 14px; height: 14px; }
+  :root[data-theme="retro"] *::-webkit-scrollbar-track { background: var(--mil-shell); box-shadow: inset 2px 2px 0 var(--mil-lo); }
+  :root[data-theme="retro"] *::-webkit-scrollbar-thumb { background: var(--mil-key); border: 2px solid var(--mil-line); border-radius: 0; box-shadow: var(--mil-bevel); }
+  :root[data-theme="retro"] *::-webkit-scrollbar-thumb:hover { background: var(--mil-key-hover); }
+  :root[data-theme="retro"] *::-webkit-scrollbar-corner { background: var(--mil-shell); }
+}
+
+@media (min-width: 760px) {
+  :root[data-theme="retro"] .rail { background-color: var(--mil-shell); background-image: var(--mil-speck); background-size: 5px 5px; border-right: 2px solid var(--mil-lo); box-shadow: 2px 0 0 var(--mil-hi); }
+  :root[data-theme="retro"] .r-item { border-radius: 0; background-color: var(--mil-key); box-shadow: var(--mil-keycap); color: var(--mil-ink); }
+  :root[data-theme="retro"] .r-item:hover { background-color: var(--mil-key-hover); }
+  :root[data-theme="retro"] .r-item[aria-current="true"] { background-color: var(--mil-on); box-shadow: var(--mil-pressed); color: var(--mil-on-ink); transform: translateY(2px); }
+  :root[data-theme="retro"] .rail-sep { height: 2px; background: repeating-linear-gradient(90deg, var(--mil-line) 0 4px, transparent 4px 7px); }
+  :root[data-theme="retro"] .rail-label { color: var(--mil-print); letter-spacing: 0.14em; font-size: 12px; }
+  :root[data-theme="retro"] .sheet { border-top: 0; border-left: var(--edge); }
+}
+@media (min-width: 1180px) {
+  :root[data-theme="retro"] .side { background-color: var(--mil-shell); background-image: var(--mil-speck); background-size: 5px 5px; border-left: 2px solid var(--mil-lo); box-shadow: -2px 0 0 var(--mil-hi); }
+}
+@media (prefers-reduced-motion: reduce) {
+  :root[data-theme="retro"] .btn:active, :root[data-theme="retro"] .filter:active, :root[data-theme="retro"] .chip:active, :root[data-theme="retro"] .round-btn:active, :root[data-theme="retro"] .set-nav button:active, :root[data-theme="retro"] .section-picker nav button:active, :root[data-theme="retro"] .section-picker nav button[aria-current="page"] { transform: none; opacity: 0.7; }
+}

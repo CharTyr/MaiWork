@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 import httpx
@@ -32,6 +34,48 @@ _REQUEST_SESSION_HEADER = "Mcp-Session-Id"
 
 class MCPError(Exception):
     """MCP 调用失败（网络/HTTP/JSON-RPC error/isError/解析）；message 已遮密钥再抛。"""
+
+
+class RequestBudgetExceeded(MCPError):
+    """Fixed, credential-free error; exhausted budgets must never trigger retries."""
+
+
+class RequestBudget:
+    """One operation's HTTP attempts, active requests and wall-clock deadline.
+
+    A ContextVar shares the same mutable budget across child tasks without
+    affecting unrelated requests. Count immediately before sending, not while
+    waiting for a semaphore. Initialization and reconnection use this too.
+    """
+
+    def __init__(self, *, requests: int = 12, concurrency: int = 3, timeout_s: float = 20):
+        self.limit = max(1, requests)
+        self.used = 0
+        self.deadline = asyncio.get_running_loop().time() + max(0, timeout_s)
+        self._sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def run(self, send):
+        try:
+            async with asyncio.timeout_at(self.deadline):
+                async with self._sem:
+                    if self.used >= self.limit:
+                        raise RequestBudgetExceeded("搜索请求预算已用完")
+                    self.used += 1
+                    return await send()
+        except TimeoutError:
+            raise RequestBudgetExceeded("搜索总时限已用完") from None
+
+
+request_budget: ContextVar[RequestBudget | None] = ContextVar("mcp_request_budget", default=None)
+
+
+@contextmanager
+def use_request_budget(budget: RequestBudget):
+    token = request_budget.set(budget)
+    try:
+        yield budget
+    finally:
+        request_budget.reset(token)
 
 
 class McpSessionClient:
@@ -116,20 +160,26 @@ class McpSessionClient:
         return self._client
 
     async def _ensure_session(self) -> None:
-        if self._session_id or self._ready:
+        # A session ID arrives before notifications/initialized completes. Only
+        # _ready permits reuse; concurrent calls must wait for the handshake.
+        if self._ready:
             return
-        async with self._init_lock:
-            if self._session_id or self._ready:
-                return
-            await self._initialize_once()
+        budget = request_budget.get()
+        try:
+            async with asyncio.timeout_at(budget.deadline if budget is not None else None):
+                async with self._init_lock:
+                    if self._ready:
+                        return
+                    await self._initialize_once()
+        except TimeoutError:
+            if budget is None:
+                raise
+            raise RequestBudgetExceeded("搜索总时限已用完") from None
 
     async def _reconnect(self) -> None:
         self._session_id = None
         self._ready = False
-        async with self._init_lock:
-            if self._session_id:
-                return
-            await self._initialize_once()
+        await self._ensure_session()
 
     async def _initialize_once(self) -> None:
         payload = self._request_payload(
@@ -153,8 +203,9 @@ class McpSessionClient:
         notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
         try:
             await self._send(notify, include_session=True)
-        except MCPError:
-            # 通知失败就清掉刚拿的会话，下一次调用会完整重连；本次失败由调用方看到
+        except (Exception, asyncio.CancelledError):
+            # Failure or cancellation leaves no reusable partial session. The
+            # next caller must repeat the complete handshake.
             self._session_id = None
             self._ready = False
             raise
@@ -184,7 +235,10 @@ class McpSessionClient:
         if include_session and self._session_id:
             headers[_REQUEST_SESSION_HEADER] = self._session_id
         try:
-            resp = await self._http().post(self._url, json=payload, headers=headers)
+            budget = request_budget.get()
+            async def send():
+                return await self._http().post(self._url, json=payload, headers=headers)
+            resp = await budget.run(send) if budget is not None else await send()
         except httpx.HTTPError as e:
             raise MCPError(self._masked(f"MCP 请求失败：{e}")) from None
         if not 200 <= resp.status_code < 300:

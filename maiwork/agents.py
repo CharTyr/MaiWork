@@ -62,12 +62,12 @@ _NO_MEMORY_KINDS = frozenset((MAIN_KIND, "task"))
 
 # 专岗默认工具硬白名单（只读调研 + 交回）；task=None = 不受岗位名单限制。
 _SPECIALIST_TOOLS: tuple[str, ...] = (
-    "web_search", "fetch_page", "read_profile", "search_chat",
+    "web_search", "social_search", "fetch_page", "read_profile", "search_chat",
     "read_chat_history", "list_skills", "read_skill", "submit_result",
 )
 _SEARCH_SKILLS: tuple[str, ...] = (
     "search-exa", "search-firecrawl", "search-keenable",
-    "search-tavily", "search-tinyfish", "search-you",
+    "search-tavily", "search-tinyfish", "search-you", "social-platforms",
 )
 
 _KV_PROFILES = "agents.profiles"

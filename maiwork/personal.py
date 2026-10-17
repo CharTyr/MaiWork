@@ -493,7 +493,7 @@ class Personal:
             brief,
             group_id=gid,
             task_id=mark,
-            tools=["web_search", "fetch_page"],
+            tools=["web_search", "social_search", "fetch_page"],
             deadline_ts=clock.now() + collect_minutes * 60,
             output_schema={
                 "type": "object",

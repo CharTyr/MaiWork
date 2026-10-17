@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 
 import httpx
 import pytest
@@ -69,6 +70,84 @@ def _ctx(**over):
     base = dict(group_id="900000001", task_id="T-1", actor="子 agent #1", role="worker")
     base.update(over)
     return ToolContext(**base)
+
+
+@pytest.mark.asyncio
+async def test_oembed_original_dns_runs_outside_event_loop(store, settings):
+    def resolver(host):
+        assert threading.current_thread() is not threading.main_thread()
+        return ['93.184.216.34']
+    def handler(request):
+        return httpx.Response(200, json={'html': '<blockquote><p>fixture tweet body</p></blockquote>'})
+    tools = _make(store, settings, resolver=resolver, transport=httpx.MockTransport(handler))
+    result = await tools.call('fetch_page', {'url': 'https://x.com/a/status/1979000000000000000'}, _ctx())
+    assert result.ok, result.error
+    assert result.data['via'] == 'oembed'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('address', ['93.184.216.34', '2606:4700:4700::1111'])
+async def test_oembed_production_pins_dns_and_disables_proxies(monkeypatch, address):
+    from CharTyr_MaiWork.maiwork import rss, tools_builtin
+
+    resolved, requests, transports, clients = [], [], [], []
+    real_client = httpx.AsyncClient
+
+    def safe_dns(host, port):
+        assert threading.current_thread() is not threading.main_thread()
+        resolved.append((host, port))
+        return address
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={'html': '<blockquote><p>safe tweet body</p></blockquote>'})
+
+    def transport(**kwargs):
+        transports.append(kwargs)
+        return httpx.MockTransport(handler)
+
+    def client(**kwargs):
+        clients.append(kwargs)
+        # Capture production choices, but isolate even a broken implementation
+        # from real sockets and environment proxies during the red run.
+        return real_client(**{**kwargs, 'trust_env': False,
+                              'transport': kwargs.get('transport') or httpx.MockTransport(handler)})
+
+    monkeypatch.setenv('HTTPS_PROXY', 'http://127.0.0.1:12345')
+    monkeypatch.setenv('ALL_PROXY', 'http://127.0.0.1:12345')
+    monkeypatch.setattr(rss, '_resolve_public_ip', safe_dns)
+    monkeypatch.setattr(httpx, 'AsyncHTTPTransport', transport)
+    monkeypatch.setattr(httpx, 'AsyncClient', client)
+    url = 'https://x.com/alice/status/1979000000000000000'
+    result = await tools_builtin._fetch_twitter_oembed(url, transport=None, resolver=_public_dns)
+    assert result is not None and result[0] == url
+    assert resolved == [('publish.twitter.com', 443)]
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.url.host == address and request.url.scheme == 'https'
+    assert request.url.path == '/oembed' and request.url.params['url'] == url
+    assert request.headers['Host'] == 'publish.twitter.com'
+    assert request.extensions['sni_hostname'] == 'publish.twitter.com'
+    assert transports and all(kwargs.get('trust_env') is False for kwargs in transports)
+    assert clients and all(kwargs.get('trust_env') is False for kwargs in clients)
+
+
+@pytest.mark.asyncio
+async def test_oembed_production_unsafe_dns_falls_back_without_request(monkeypatch):
+    from CharTyr_MaiWork.maiwork import rss, tools_builtin
+
+    def reject(host, port):
+        raise rss.RssError('DNS returned unsafe address')
+
+    def no_client(**kwargs):
+        pytest.fail('unsafe production DNS must fail before constructing an HTTP client')
+
+    monkeypatch.setattr(rss, '_resolve_public_ip', reject)
+    monkeypatch.setattr(httpx, 'AsyncClient', no_client)
+    result = await tools_builtin._fetch_twitter_oembed(
+        'https://x.com/alice/status/1979000000000000000', transport=None, resolver=_public_dns,
+    )
+    assert result is None
 
 
 class TestWebSearch:
@@ -686,6 +765,280 @@ class TestOpenOrder:
     def test_timeout_leaves_room_for_three_ways(self, store, settings):
         tools = _make_r(store, settings, reader=_FakeReader())
         assert tools.get("fetch_page", "worker").timeout_s >= 60
+
+
+# ----------------------------------------------------------------------
+# Twitter/X 状态链接优先走官方 oEmbed（2026-10-16：X 页面有 JS 墙，三条老路都打不开）
+# ----------------------------------------------------------------------
+
+_TWEET_ID = "1979000000000000000"
+_TWEET_URL = f"https://x.com/alice/status/{_TWEET_ID}"
+_OEMBED_HTML = (
+    '<blockquote class="twitter-tweet"><p lang="zh" dir="ltr">推文正文 &amp; 转义'
+    '<a href="https://t.co/x">链接文字</a></p>&mdash; Alice (@alice) '
+    f'<a href="https://twitter.com/alice/status/{_TWEET_ID}">October 16, 2026</a></blockquote>'
+    '<script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script>'
+)
+_OEMBED_PAYLOAD = {"html": _OEMBED_HTML, "author_name": "Alice", "author_url": "https://twitter.com/alice"}
+
+
+def _page_html(body="正文"):
+    return f"<html><head><title>t</title></head><body><p>{body}</p></body></html>"
+
+
+class TestTwitterOembed:
+    @pytest.mark.asyncio
+    async def test_status_url_prefers_oembed(self, store, settings):
+        """合法状态链接：请求只去 publish.twitter.com/oembed（url 参数是规范化状态链接）。"""
+        hits = []
+
+        def handler(request):
+            hits.append(request.url.host)
+            assert request.url.host == "publish.twitter.com"
+            assert request.url.path == "/oembed"
+            assert request.url.params["url"] == _TWEET_URL
+            return httpx.Response(200, json=_OEMBED_PAYLOAD)
+
+        tools = _make(store, settings, transport=httpx.MockTransport(handler))
+        r = await tools.call("fetch_page", {"url": _TWEET_URL}, _ctx())
+        assert r.ok
+        assert r.data["via"] == "oembed"
+        assert "推文正文 & 转义" in r.output   # 去标签 + 反转义
+        assert "链接文字" in r.output          # <a> 内文字保留
+        assert "Alice" in r.output             # 作者行
+        assert "<blockquote>" not in r.output and "&amp;" not in r.output
+        assert hits == ["publish.twitter.com"]  # 只发了这一次请求
+        row = store.read().execute(
+            "SELECT output FROM tool_calls WHERE tool='fetch_page' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert "oEmbed" in row["output"]  # _VIA_NOTE 文案
+
+    @pytest.mark.asyncio
+    async def test_twitter_dot_com_status_normalized_for_oembed(self, store, settings):
+        """twitter.com 旧域名状态链接也走 oEmbed，url 参数归一化成 x.com。"""
+        seen = []
+
+        def handler(request):
+            seen.append(request.url.params.get("url"))
+            return httpx.Response(200, json=_OEMBED_PAYLOAD)
+
+        tools = _make(store, settings, transport=httpx.MockTransport(handler))
+        r = await tools.call("fetch_page", {"url": f"https://twitter.com/alice/status/{_TWEET_ID}"}, _ctx())
+        assert r.ok and r.data["via"] == "oembed"
+        assert seen == [_TWEET_URL]
+
+    @pytest.mark.asyncio
+    async def test_non_status_x_url_skips_oembed(self, store, settings):
+        """x.com 非状态路径（个人主页等）不走 oEmbed，照旧直接打开。"""
+        hits = []
+
+        def handler(request):
+            hits.append(request.url.host)
+            return httpx.Response(200, text=_page_html("个人主页正文"), headers={"content-type": "text/html"})
+
+        tools = _make(store, settings, transport=httpx.MockTransport(handler))
+        r = await tools.call("fetch_page", {"url": "https://x.com/alice"}, _ctx())
+        assert r.ok and r.data["via"] == "direct"
+        assert hits == ["x.com"]
+
+    @pytest.mark.asyncio
+    async def test_oembed_failure_falls_back_to_old_chain(self, store, settings):
+        """oEmbed 非 200 → 回落原有链（直接打开成功）。"""
+        hits = []
+
+        def handler(request):
+            hits.append(request.url.host)
+            if request.url.host == "publish.twitter.com":
+                return httpx.Response(404, json={"error": "not found"})
+            return httpx.Response(200, text=_page_html("直接打开读到的推文"), headers={"content-type": "text/html"})
+
+        tools = _make(store, settings, transport=httpx.MockTransport(handler))
+        r = await tools.call("fetch_page", {"url": _TWEET_URL}, _ctx())
+        assert r.ok and r.data["via"] == "direct"
+        assert "直接打开读到的推文" in r.output
+        assert hits == ["publish.twitter.com", "x.com"]  # 先试 oEmbed 再回落
+
+    @pytest.mark.asyncio
+    async def test_oembed_bad_json_and_empty_text_fall_back(self, store, settings):
+        """oEmbed 200 但 JSON 解析不了 / 正文为空 → 一样回落。"""
+        state = {"payload": "not-json"}
+
+        def handler(request):
+            if request.url.host == "publish.twitter.com":
+                body = state["payload"]
+                return httpx.Response(200, text=body, headers={"content-type": "application/json"})
+            return httpx.Response(200, text=_page_html("直接打开的正文"), headers={"content-type": "text/html"})
+
+        tools = _make(store, settings, transport=httpx.MockTransport(handler))
+        r = await tools.call("fetch_page", {"url": _TWEET_URL}, _ctx())
+        assert r.ok and r.data["via"] == "direct"
+        # 正文为空（blockquote 里没有 <p> 文本）也回落
+        state["payload"] = '{"html": "<blockquote class=\\"twitter-tweet\\"></blockquote>"}'
+        r = await tools.call("fetch_page", {"url": _TWEET_URL}, _ctx())
+        assert r.ok and r.data["via"] == "direct"
+
+    @pytest.mark.asyncio
+    async def test_oembed_dns_rebinding_refused(self, store, settings):
+        """SSRF：固定域名 publish.twitter.com 解析到内网 → 绝不出请求，回落老链。"""
+        hits = []
+
+        def handler(request):
+            hits.append(request.url.host)
+            return httpx.Response(200, text=_page_html("直接打开的正文"), headers={"content-type": "text/html"})
+
+        def resolver(host):
+            return ["10.0.0.5"] if host == "publish.twitter.com" else ["93.184.216.34"]
+
+        tools = _make(store, settings, transport=httpx.MockTransport(handler), resolver=resolver)
+        r = await tools.call("fetch_page", {"url": _TWEET_URL}, _ctx())
+        assert r.ok and r.data["via"] == "direct"
+        assert "publish.twitter.com" not in hits
+
+    @pytest.mark.asyncio
+    async def test_oembed_first_even_with_jina(self, store, settings):
+        """Jina 开着时也一样：状态链接先 oEmbed，Jina 不收到。"""
+        rd = _FakeReader()
+        hits = []
+
+        def handler(request):
+            hits.append(request.url.host)
+            return httpx.Response(200, json=_OEMBED_PAYLOAD)
+
+        tools = _make_r(store, settings, reader=rd, transport=httpx.MockTransport(handler))
+        r = await tools.call("fetch_page", {"url": _TWEET_URL}, _ctx())
+        assert r.ok and r.data["via"] == "oembed"
+        assert rd.calls == [] and hits == ["publish.twitter.com"]
+
+
+class TestTwitterOembedSecurity:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("case", ["redirect", "oversized", "bad-json", "list", "html-object", "author-only", "outside-p"])
+    async def test_invalid_responses_fall_back(self, store, settings, case):
+        hits = []
+        payloads = {
+            "list": [], "html-object": {"html": {}},
+            "author-only": {"html": '<blockquote><p> <script>fake body</script><style>fake css</style></p>— Alice <a>October 16</a></blockquote>'},
+            "outside-p": {"html": '<p>untrusted outside text</p><blockquote>— Alice</blockquote>'},
+        }
+
+        def handler(request):
+            hits.append(request.url.host)
+            if request.url.host != "publish.twitter.com":
+                return httpx.Response(200, text=_page_html("fallback body"), headers={"content-type": "text/html"})
+            if case == "redirect":
+                return httpx.Response(302, headers={"location": "http://169.254.169.254/private"})
+            if case == "oversized":
+                return httpx.Response(200, content=b" " * (200 * 1024) + json.dumps(_OEMBED_PAYLOAD).encode(), headers={"content-type": "application/json"})
+            if case == "bad-json":
+                return httpx.Response(200, text="{broken", headers={"content-type": "application/json"})
+            return httpx.Response(200, json=payloads[case])
+
+        tools = _make(store, settings, transport=httpx.MockTransport(handler))
+        result = await tools.call("fetch_page", {"url": _TWEET_URL}, _ctx())
+        assert result.ok and result.data["via"] == "direct"
+        assert "fallback body" in result.output
+        assert hits == ["publish.twitter.com", "x.com"]
+
+    @pytest.mark.asyncio
+    async def test_original_host_blocked_before_oembed_or_reader(self, store, settings):
+        hits = []
+        reader = _FakeReader()
+
+        def handler(request):
+            hits.append(request.url.host)
+            return httpx.Response(200, json=_OEMBED_PAYLOAD)
+
+        tools = _make_r(store, settings, reader=reader, transport=httpx.MockTransport(handler),
+                        resolver=lambda host: ["127.0.0.1"] if host == "twitter.com" else _public_dns(host))
+        result = await tools.call("fetch_page", {"url": f"https://twitter.com/alice/status/{_TWEET_ID}"}, _ctx())
+        assert not result.ok
+        assert hits == [] and reader.calls == []
+
+    @pytest.mark.asyncio
+    async def test_oembed_cancellation_propagates(self, store, settings):
+        import asyncio
+
+        hits = []
+
+        def handler(request):
+            hits.append(request.url.host)
+            if request.url.host == "publish.twitter.com":
+                raise asyncio.CancelledError()
+            return httpx.Response(200, text=_page_html(), headers={"content-type": "text/html"})
+
+        tools = _make(store, settings, transport=httpx.MockTransport(handler))
+        with pytest.raises(asyncio.CancelledError):
+            await tools.call("fetch_page", {"url": _TWEET_URL}, _ctx())
+        assert hits == ["publish.twitter.com"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["oversized", "timeout", "read-error", "cancel"])
+    async def test_stream_limits_and_cleanup(self, store, settings, monkeypatch, mode):
+        import asyncio
+        from CharTyr_MaiWork.maiwork import tools_builtin
+
+        hits, chunks, closed, deadlines = [], [], [], []
+        real_timeout = asyncio.timeout
+
+        def short_timeout(seconds):
+            deadlines.append(seconds)
+            return real_timeout(0.03)
+
+        monkeypatch.setattr(tools_builtin.asyncio, "timeout", short_timeout)
+
+        class Stream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                chunks.append(1)
+                yield b" " * (200 * 1024) if mode == "oversized" else b" "
+                chunks.append(2)
+                if mode == "oversized":
+                    yield b"x"
+                    pytest.fail("oversized stream drained past the cap")
+                elif mode == "timeout":
+                    await asyncio.Event().wait()
+                elif mode == "cancel":
+                    raise asyncio.CancelledError()
+                else:
+                    raise httpx.ReadError("broken stream")
+
+            async def aclose(self):
+                closed.append(True)
+
+        def handler(request):
+            hits.append(request.url.host)
+            if request.url.host == "publish.twitter.com":
+                return httpx.Response(200, stream=Stream(), headers={"content-type": "application/json"})
+            return httpx.Response(200, text=_page_html("fallback body"), headers={"content-type": "text/html"})
+
+        tools = _make(store, settings, transport=httpx.MockTransport(handler))
+        if mode == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await tools.call("fetch_page", {"url": _TWEET_URL}, _ctx())
+            assert hits == ["publish.twitter.com"]
+        else:
+            result = await tools.call("fetch_page", {"url": _TWEET_URL}, _ctx())
+            assert result.ok and result.data["via"] == "direct"
+            assert hits == ["publish.twitter.com", "x.com"]
+        assert closed == [True] and chunks == [1, 2]
+        assert deadlines == [8.0]
+
+    @pytest.mark.asyncio
+    async def test_body_evidence_and_safe_author(self, store, settings, monkeypatch):
+        from CharTyr_MaiWork.maiwork import verify_budget
+
+        recorded = []
+        monkeypatch.setattr(verify_budget, "record_page", lambda *args, **kwargs: recorded.append((args, kwargs)))
+        payload = {"author_name": '<b>Alice</b><script>author exploit</script>',
+                   "html": '<blockquote><p>Hello <a href="javascript:bad()">world</a><br>again<script>body exploit</script><style>bad css</style></p>— Alice <a>October 16</a></blockquote><p>outside</p>'}
+        tools = _make(store, settings, transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload)))
+        result = await tools.call("fetch_page", {"url": f"https://twitter.com/alice/status/{_TWEET_ID}?s=20"}, _ctx())
+        assert result.ok and result.data["via"] == "oembed"
+        assert result.data["final_url"] == _TWEET_URL
+        assert recorded[0][0][3] == "Hello world\nagain"
+        assert recorded[0][1]["title"] == "Alice"
+        assert "exploit" not in result.output and "<b>" not in result.output
+        assert "October 16" not in result.output and "outside" not in result.output
+        assert "代码从页面读到发布时间" not in result.output
 
 
 class TestOpenedUrlsFromRows:

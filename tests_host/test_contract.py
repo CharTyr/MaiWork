@@ -66,6 +66,32 @@ class HostContractTest(unittest.TestCase):
         self.assertEqual(v.errors, [])
         self.assertEqual(v.warnings, [])
 
+    def test_manifest_sdk_range_covers_running_sdk(self) -> None:
+        """声明的 SDK 区间必须真的覆盖当前宿主 venv 的 SDK。
+
+        宿主对 SDK 超范围是硬错误（`SDK 版本不兼容` 进 errors → 拒载），没有 Host 那种
+        「只高一个修订号就按兼容模式加载」的回落，所以这一条把「上限是实测端点」变成
+        能在真实宿主 venv 里复现的断言：跑测试用的这个 SDK 版本，就是被验证过的端点。
+        """
+        import json
+
+        import maibot_sdk
+        from packaging.version import Version
+
+        manifest = json.loads((PLUGIN_DIR / "_manifest.json").read_text(encoding="utf-8"))
+        sdk = manifest["sdk"]
+        running = str(maibot_sdk.__version__)
+        self.assertLessEqual(
+            Version(sdk["min_version"]),
+            Version(running),
+            f"当前宿主 SDK {running} 低于声明下限 {sdk['min_version']}",
+        )
+        self.assertLessEqual(
+            Version(running),
+            Version(sdk["max_version"]),
+            f"当前宿主 SDK {running} 高于声明上限 {sdk['max_version']}（宿主会拒载）",
+        )
+
     def test_lifecycle_contract(self) -> None:
         PluginLoader._validate_sdk_plugin_contract(PLUGIN_ID, create_plugin())
 

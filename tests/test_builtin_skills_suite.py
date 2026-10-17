@@ -77,11 +77,14 @@ _SPEC_TOP_KEYS = {"name", "description", "license", "compatibility", "metadata",
 _TOOL_TOKEN_RE = re.compile(r"`([a-z][a-z0-9]*(?:_[a-z0-9]+)+)`")
 
 # 例外：反引号里是蛇形、但**不是**工具的名字（写清为什么，别偷偷加）。
-# 只有「正文要照抄给模型的 JSON 字段名」这一类——工具名一律不许进这里。
+# 只有「正文要照抄的外部名字」这一类——给模型的 JSON 字段名，或要管理员照抄的
+# Cookie 名。工具名一律不许进这里。
 _NON_TOOL_TOKENS: dict[str, str] = {
     "task_id": "目标打勾交回里的 JSON 字段（指向下级任务）",
     "needs_members": "构想可行性交回里的 JSON 字段（要不要群友参与）",
     "deliver_kind": "计划 JSON 的交付形态字段（text / view / file）",
+    "auth_token": "Twitter/X Cookie 字段名（登录助手让管理员照抄请求头原文）",
+    "web_session": "小红书 Cookie 字段名（同上，只是建议包含）",
 }
 
 SKILL_ROOT = skills_mod.BUILTIN_ROOT

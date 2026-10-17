@@ -3,6 +3,7 @@ import { $, state } from "../state.js";
 import { SVG, esc, tip, toast } from "../util.js";
 import { api } from "../api.js";
 import { loading } from "../pages/news.js";
+import { sectionPicker } from "./navigation.js";
 
 /* ───── 全部配置（config.toml 的每一项；网页改的直接写进插件的 config.toml） ───── */
 // 后端 GET /api/settings/config：{file, sections:[{id,label,fields:[{key,label,help,type,value,default,changed,...}]}], reload_pending:[]}
@@ -185,6 +186,7 @@ export function rulesPage() {
   const shown = jump ? secs.filter((s) => s.id === jump) : secs;
   return `
     ${pending.length ? `<div class="warn-box">${pending.length} 项设置需在插件重载后生效（${pending.map((k) => esc((cfgField(k) || {}).label || k)).join("、")}）</div>` : ""}
+    <div class="cfg-picker">${sectionPicker([["", "全部"], ...secs.map((s) => [s.id, s.label])], jump, true)}</div>
     <div class="cfg-jump" role="tablist"><button type="button" role="tab" aria-selected="${!jump}" data-act="cfg-sec" data-s="">全部</button>${secs.map((s) => `<button type="button" role="tab" aria-selected="${jump === s.id}" data-act="cfg-sec" data-s="${esc(s.id)}">${esc(s.label)}</button>`).join("")}</div>
     <datalist id="mw-platforms">${Object.keys(PLATFORM_NAMES).map((p) => `<option value="${p}">${PLATFORM_NAMES[p]}</option>`).join("")}</datalist>
     <form id="rules-form" class="rules-form" autocomplete="off">

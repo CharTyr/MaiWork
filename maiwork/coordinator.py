@@ -7681,7 +7681,7 @@ class Coordinator:
             report = await specialists.run(
                 "goal", brief, group_id=str(gid), phase="check",
                 task_id=f"goal-check:{goal_id}",
-                tools=["web_search", "fetch_page", "read_profile"],
+                tools=["web_search", "social_search", "fetch_page", "read_profile"],
                 deadline_ts=deadline_ts, max_steps=8,
                 actor="目标检查",
             )

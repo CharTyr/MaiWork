@@ -43,7 +43,7 @@ export function renderTop() {
     ${
       admin()
         ? `<button class="round-btn left" data-act="chat" aria-label="聊天">${SVG.chat}</button><button class="round-btn" data-act="settings" aria-label="设置">${SVG.sliders}</button>`
-        : `<button class="round-btn" data-act="login" aria-label="${isGA() ? "群管理员" : "管理员登录"}">${SVG.key}</button>`
+        : `<button class="round-btn left" data-act="appearance" aria-label="外观">${SVG.palette}</button><button class="round-btn" data-act="login" aria-label="${isGA() ? "群管理员" : "管理员登录"}">${SVG.key}</button>`
     }`;
 }
 
@@ -95,6 +95,7 @@ export function renderRail() {
       </button>`
     ).join("")}
     <div class="rail-foot">
+      <button class="r-item" data-act="appearance" title="外观">${SVG.palette}<span class="r-text"><span class="r-name">外观</span></span></button>
       ${admin() ? `<button class="r-item" data-act="chat" title="聊天" aria-current="${state.page === "chat"}">${SVG.chat}<span class="r-text"><span class="r-name">聊天</span></span></button>` : ""}
       ${
         admin()

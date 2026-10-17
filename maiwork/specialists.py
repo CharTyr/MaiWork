@@ -30,11 +30,11 @@ logger = logging.getLogger("maiwork.specialists")
 # 专岗改版 4/4：自定义专岗（c_xxx）也走 task 这一条——调用方给的 tools 是什么用什么，
 # 不套专岗调研的只读白名单（它的「谁是自定义专岗」由 agents.is_custom_kind 把关）。
 _SPECIALIST_DEFAULT_TOOLS: dict[str, tuple[str, ...] | None] = {
-    "news": ("web_search", "fetch_page", "read_profile", "search_chat",
+    "news": ("web_search", "social_search", "fetch_page", "read_profile", "search_chat",
              "read_chat_history", "list_skills", "read_skill", "submit_result"),
-    "idea": ("web_search", "fetch_page", "read_profile", "search_chat",
+    "idea": ("web_search", "social_search", "fetch_page", "read_profile", "search_chat",
              "read_chat_history", "list_skills", "read_skill", "submit_result"),
-    "goal": ("web_search", "fetch_page", "read_profile", "search_chat",
+    "goal": ("web_search", "social_search", "fetch_page", "read_profile", "search_chat",
              "read_chat_history", "list_skills", "read_skill", "submit_result"),
     "task": None,
 }

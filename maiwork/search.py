@@ -35,7 +35,10 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from .mcp_client import MCPError, McpSessionClient
+from .mcp_client import (
+    MCPError, McpSessionClient, RequestBudget, RequestBudgetExceeded,
+    request_budget, use_request_budget,
+)
 from . import extensions_web, search_binding, search_presets
 from .search_binding import get_binding, status_of, tool_problem
 
@@ -404,7 +407,7 @@ def _published_of(item: dict) -> float | None:
     return None
 
 
-def _check_mcp_error(result: Any, role: str) -> None:
+def _check_mcp_error(result: Any, role: str, *, keys: list[str] | None = None) -> None:
     """MCP result.isError=True → SearchError（中文；Tavily 免密钥月度上限给专门话术）。
 
     2026-09-30 实测 Tavily 的月度上限回包「isError 被透出成 False」、错误码塞在
@@ -436,17 +439,17 @@ def _check_mcp_error(result: Any, role: str) -> None:
         raise SearchError(
             "Tavily 免密钥额度这个月用完了：去 https://app.tavily.com 拿一个免费密钥填上"
         )
-    raise SearchError(f"{role}端返回错误：{_mask(body, [])}")
+    raise SearchError(f"{role}端返回错误：{_mask(body, keys or [])}")
 
 
-def normalize_search_results(result: dict[str, Any]) -> list[dict]:
+def normalize_search_results(result: dict[str, Any], *, keys: list[str] | None = None) -> list[dict]:
     """tools/call 的 result → 统一 [{"title","url","snippet","published"}]。
 
     优先 structuredContent / content[0].text 的 JSON；在任意层找带 url 的 dict 列表
     （取最长的一份，You.com 的 results.web/news 会被拼成一份）；实在拿不到结构，
     把原文本截断当一条（url 空）返回。
     """
-    _check_mcp_error(result, "搜索")
+    _check_mcp_error(result, "搜索", keys=keys)
     payload = _mcp_structured(result)
     # Keenable 等纯文本块（Title:/URL:/Snippets:）——先按块拆，拆得出来就不走 dict 列表那套
     blocks = _parse_titled_blocks(_content_text(result))
@@ -615,10 +618,11 @@ class Search:
             binding = get_binding(self._store)
             if binding is None:
                 return out
-            names = [binding["mcp"]]
-            if binding["extract_mcp"] and binding["extract_mcp"] not in names:
-                names.append(binding["extract_mcp"])
-            for name in names:
+            names = list(dict.fromkeys(
+                [binding["mcp"], binding["extract_mcp"]]
+                + (binding.get("fallback") or []) + (binding.get("broad") or [])
+            ))
+            for name in filter(None, names):
                 headers: dict = {}
                 runtime = self._runtime(name)
                 rt_headers = getattr(runtime, "headers", None) if runtime is not None else None
@@ -785,6 +789,55 @@ class Search:
                 out.append(name)
         return out
 
+    async def search_broad(
+        self,
+        query: str,
+        *,
+        limit: int = 8,
+        days: int | None = None,
+        site: str = "",
+        news: bool = False,
+    ) -> list[dict]:
+        """撒大网：broad_providers() 的每家并行各搜一次，按 URL 合并去重（主家在前），每条带 provider。
+
+        与 feeds._floor_searches 的 extras 循环同语义（多 provider 各搜一次），但那边
+        串行、带漏斗计数与成绩过滤，抽取共用会动到既有行为——这里独立一份并行的，
+        供「一次拿广」的调用方用（2026-10-16 Twitter 网页备选渠道的 web fallback）。
+        一家挂了只记日志不影响别家；全挂抛最后一个错误；都没搜到（但没全挂）返回 []。
+        主绑定不是预设认得出的自定义 MCP 时也照常带上（通用参数映射，site/news 忽略）。
+        """
+        # At most three providers; both Twitter domains inherit one budget.
+        providers = self.broad_providers()[:3]
+        if not providers:
+            raise SearchUnavailable("还没指定联网搜索：去 设置 → 工具 里选一个 MCP 用作联网搜索")
+        settings = self._settings()
+        entries = {e.name: e for e in extensions_web.merged_entries(settings, self._store)}
+        with use_request_budget(request_budget.get() or RequestBudget()):
+            results = await asyncio.gather(
+                *(self._search_one(name, query, limit=limit, days=days, site=site, news=news,
+                                   entries=entries) for name in providers),
+                return_exceptions=True,
+            )
+        out: list[dict] = []
+        seen: set[str] = set()
+        errors: list[Exception] = []
+        for name, result in zip(providers, results):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, BaseException):
+                logger.info("撒网搜索家 %s 没搜成（%s），跳过这家", name, type(result).__name__)
+                errors.append(result)
+                continue
+            for item in result:
+                url = str(item.get("url") or "").strip()
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                out.append(item)
+        if len(errors) == len(providers):
+            raise errors[-1]
+        return out[: max(1, int(limit))]
+
     async def _search_one(
         self,
         name: str,
@@ -832,10 +885,10 @@ class Search:
         except MCPError as e:
             raise SearchError(_mask(f"搜索失败（{name}）：{e}", self.known_secrets())) from None
         try:
-            out = normalize_search_results(result)
+            out = normalize_search_results(result, keys=self.known_secrets())
         except SearchError as e:
             # isError 也算这家没搜成；带是谁家的好递补/交差
-            raise SearchError(f"{name}：{e}") from None
+            raise SearchError(_mask(f"{name}：{e}", self.known_secrets())) from None
         for item in out:
             item["provider"] = name
         return out[: max(1, int(limit))]
@@ -905,12 +958,32 @@ def _is_5xx(err: MCPError) -> bool:
 
 
 async def _call_retry_5xx(client: McpSessionClient, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """tools/call；端点回 5xx（多半是服务方或前面 CDN 临时出问题）隔一会儿重试一次。"""
-    try:
+    """Retry one 5xx; physical attempts and all queue/retry time share a budget."""
+    budget = request_budget.get()
+
+    async def call():
+        # Real MCP clients charge each HTTP POST in _send (including handshake).
+        # Adapters without that transport charge their one external call here.
+        if budget is not None and not isinstance(client, McpSessionClient):
+            return await budget.run(lambda: client.call_tool(name, arguments))
         return await client.call_tool(name, arguments)
-    except MCPError as e:
-        if not _is_5xx(e):
+
+    async def attempts():
+        try:
+            return await call()
+        except RequestBudgetExceeded:
             raise
-        logger.info("MCP 搜索端点临时出错（%s），%s 秒后重试一次", str(e)[:80], _MCP_RETRY_DELAY_S)
-    await asyncio.sleep(_MCP_RETRY_DELAY_S)
-    return await client.call_tool(name, arguments)
+        except MCPError as e:
+            if not _is_5xx(e):
+                raise
+        logger.info("MCP 搜索端点临时出错，%s 秒后重试一次", _MCP_RETRY_DELAY_S)
+        await asyncio.sleep(_MCP_RETRY_DELAY_S)
+        return await call()
+
+    if budget is None:
+        return await attempts()
+    try:
+        async with asyncio.timeout_at(budget.deadline):
+            return await attempts()
+    except TimeoutError:
+        raise RequestBudgetExceeded("搜索总时限已用完") from None

@@ -8,6 +8,9 @@ import { refreshDetail } from "./detail.js";
 import { handoffCopy, handoffDownload, openHandoff } from "./handoff.js";
 import { checkedProviders, headerRow, loadExt, pickedTool, readHeaders } from "./settings/ext.js";
 import { actNews } from "./actions_news.js";
+import { actTheme } from "./theme.js";
+import { actAppearance } from "./settings/appearance.js";
+import { actSocial } from "./settings/social.js";
 import { actCtx } from "./pages/groupctx.js";
 import { actControls } from "./pages/groupcontrols.js";
 import { actAgents } from "./settings/agents.js";
@@ -40,6 +43,9 @@ function findEntry(id) {
 export async function act(el, e) {
   const a = el.dataset.act;
   if (await actNews(a, el)) return;
+  if (await actTheme(a, el)) return;
+  if (await actAppearance(a, el)) return;
+  if (await actSocial(a, el)) return;
   if (await actCtx(a, el)) return;
   if (await actControls(a, el)) return;
   if (await actAgents(a, el)) return;

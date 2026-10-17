@@ -30,14 +30,14 @@ KV_KEY = "onboarding"
 ACTIONS = ("done", "skip", "reset", "start", "progress")
 _TERMINAL = ("done", "skipped", "later")
 # 和前端 ONB_STEPS 同一份名单（前端改步骤要一起改）
-STEPS = ("hello", "models", "groups", "keys", "search", "admins", "look", "env", "done")
+STEPS = ("hello", "models", "groups", "keys", "search", "social", "admins", "look", "env", "done")
 # 必要条件：缺了就不算「可用」；其余（Jev、头像、管理员、搜索）可选
 REQUIRED = ("models", "groups")
 
 
 def _checks(svc: Any) -> dict[str, bool]:
     settings = svc.get_settings()
-    out = {"models": False, "groups": False, "jev": False, "search": False, "admins": False}
+    out = {"models": False, "groups": False, "jev": False, "search": False, "admins": False, "social": False}
     try:
         out["models"] = models_status(svc)["state"] != "off"
     except Exception:
@@ -58,6 +58,12 @@ def _checks(svc: Any) -> dict[str, bool]:
         out["jev"] = bool(target is not None and str(target.key or "").strip())
     except Exception:
         out["jev"] = False
+    try:
+        from . import social_platforms
+
+        out["social"] = any(p.get("enabled") for p in social_platforms.list_platforms(svc.store))
+    except Exception:
+        out["social"] = False
     return out
 
 
@@ -320,6 +326,8 @@ def items(svc: Any, checks: dict[str, bool] | None = None) -> list[dict[str, Any
         _first_item(svc, gids, bool(checks.get("models"))),
         _item("jev", "ok" if checks.get("jev") else "off", "Jev 快速判断",
               "密钥已填" if checks.get("jev") else "没填（可选）：判断会走主模型，慢一些、多花一点", step="keys"),
+        _item("social", "ok" if checks.get("social") else "off", "社交平台",
+              "已启用" if checks.get("social") else "未启用（可选）：可以在 Twitter/X、小红书、B站等平台找讨论", step="social"),
         _item("admins", "ok" if checks.get("admins") else "warn", "管理员",
               "已填" if checks.get("admins") else "还没填：群友派的活没人能批准（可选，之后再填也行）", step="admins"),
     ]

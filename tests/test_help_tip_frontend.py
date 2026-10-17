@@ -18,7 +18,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 const source = fs.readFileSync(%s, 'utf8');
 const context = vm.createContext({ console, window: { matchMedia: () => ({ matches: false }) } });
-const stubs = { './state.js': { $: () => null, state: { skew: 0 } } };
+const stubs = { './state.js': { $: () => null, state: { skew: 0 } }, './sound.js': { sfx: () => {} } };
 async function link(spec) {
   const exports = stubs[spec];
   if (!exports) throw new Error('unexpected import: ' + spec);

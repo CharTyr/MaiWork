@@ -8,6 +8,13 @@
   <meta name="color-scheme" content="light dark" />
   <meta name="referrer" content="no-referrer" />
   <title>MaiWork</title>
+  <script>
+    // 首屏防闪：样式加载前按本浏览器记住的主题设好（个人选择 > 上次的全站默认），不发请求
+    try {
+      var t = localStorage.getItem("mw-theme") || localStorage.getItem("mw-theme-default") || "";
+      if (t && t !== "default") document.documentElement.setAttribute("data-theme", t);
+    } catch (e) {}
+  </script>
   <link rel="icon" type="image/png" sizes="64x64" href="/static/assets/favicon.png" />
   <link rel="apple-touch-icon" sizes="180x180" href="/static/assets/logo-180.png" />
   <link rel="stylesheet" href="/static/style.css" />

@@ -40,6 +40,8 @@ ALL_ADMIN_TOOLS = {
     "read_chat", "read_logs", "get_rules", "get_identity", "list_extensions",
     # 管理员对话自己的原文回读（0.4.1 加：工具结果全文落库 + 按 id/字符窗口分页读回）
     "read_admin_history",
+    # skill 说明（管理员只看得见 social-login-helper 这一份；行为测试在 test_social_wiring.py）
+    "list_skills", "read_skill",
     # 写类
     "profile_edit", "profile_bulk_delete", "focus_edit",
     "rss_add", "rss_remove", "block_domain", "set_rules", "identity_edit", "remember",

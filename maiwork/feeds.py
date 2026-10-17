@@ -4203,6 +4203,40 @@ class Feeds:
                     per_focus_cands[i] = per_focus_cands.get(i, 0) + n
                     if n:
                         providers[name] = providers.get(name, 0) + n
+        # 只对最多三个不同关注点补搜；每次失败独立处理，摘要只作候选。
+        from . import social_platforms
+        if self._social_search_ready():
+            seen_queries: set[str] = set()
+            for i, f in enumerate(focus, 1):
+                query = str(f.get("query") or "").strip()[:200]
+                if not query or query in seen_queries:
+                    continue
+                if len(seen_queries) >= 3:
+                    break
+                seen_queries.add(query)
+                funnel["queries"] = int(funnel.get("queries") or 0) + 1
+                _funnel_note_query(funnel, query)
+                per_focus_queries[i].add(query)
+                errors: dict[str, str] = {}
+                try:
+                    grouped = await social_platforms.search_all(
+                        self._store, query, limit=10, errors=errors,
+                        web_search_fn=getattr(search, "search_broad", None),
+                    )
+                except Exception:
+                    logger.info("社交平台补搜失败（群 %s 方向 %d）", gid, i)
+                    continue
+                for pid, items in grouped.items():
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        provider = str(item.get("provider") or f"social:{pid}")
+                        n = _record(query, i, provider, [item])
+                        if n:
+                            providers[provider] = providers.get(provider, 0) + n
+                            per_focus_cands[i] += n
+                if errors:
+                    funnel.setdefault("social_errors", {}).update({pid: "平台暂不可用，请检查设置和登录态" for pid in errors})
         funnel["providers"] = providers
         funnel["per_focus"] = [
             {
@@ -5537,7 +5571,7 @@ class Feeds:
         deadline_ts = clock.now() + _IDEA_INVESTIGATE_SECONDS
         report = await specialists.run(
             "idea", brief, group_id=str(gid), phase="investigate",
-            tools=["web_search", "fetch_page", "read_profile", "list_skills", "read_skill"],
+            tools=["web_search", "social_search", "fetch_page", "read_profile", "list_skills", "read_skill"],
             deadline_ts=deadline_ts, max_steps=_IDEA_INVESTIGATE_MAX_STEPS,
             actor="构想调查",
         )
@@ -6288,6 +6322,21 @@ class Feeds:
     def _models_ready(self) -> bool:
         return bool(self._models.settings().ready())
 
+    def _social_search_ready(self) -> bool:
+        from . import social_platforms
+        try:
+            search = getattr(self, "_search", None)
+            web_ready = callable(getattr(search, "search_broad", None)) and bool(
+                getattr(search, "available", lambda: False)()
+            )
+            return any(p.get("enabled") and (
+                (p.get("id") == "twitter" and web_ready)
+                or (p.get("installed") and not p.get("installing")
+                    and (not p.get("needs_cookie") or p.get("cookie_set")))
+            ) for p in social_platforms.list_platforms(self._store))
+        except Exception:
+            return False
+
     async def _ensure_search(self) -> None:
         """确认搜索可用（2026-10：只看绑定状态，不真发探活请求）。
 
@@ -6297,7 +6346,7 @@ class Feeds:
         - 注入了别的带 `search()` 的对象（测试假搜索）：照旧调一次 search() 自检
           （假搜索自己决定抛不抛 SearchUnavailable；现有测试桩依赖这个行为）。
         """
-        if self._search is None:
+        if self._search is None or self._social_search_ready():
             return
         available_probe = getattr(self._search, "available", None)
         if callable(available_probe):

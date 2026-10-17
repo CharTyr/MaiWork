@@ -17,6 +17,9 @@ import { enterChat, loadChat } from "./chat.js";
 import { render, renderRail, renderSide, renderTabbar, renderTop, renderView } from "./render.js";
 import { maybeOnboard, openOnboarding } from "./onboarding.js";
 import { loadUpdate } from "./update.js";
+import { loadAppearance } from "./settings/appearance.js";
+import { loadSocial, resetSocial } from "./settings/social.js";
+import { loadTheme } from "./theme.js";
 
 /* ───────────── 路由 ───────────── */
 
@@ -136,6 +139,7 @@ export async function retryLoad(el) {
 }
 
 export async function reboot() {
+  resetSocial();
   state.loadErr = {};
   state.view = null;
   state.settings = null;
@@ -145,6 +149,7 @@ export async function reboot() {
   state.agentEdit = null;
   state.agentLoadSeq = (state.agentLoadSeq || 0) + 1;
   state.tasks = {};
+  loadTheme(); // 主题和音效：不挡开页，拿不到就沿用首屏缓存的
   try {
     await loadMe();
     await loadGroups();
@@ -168,6 +173,8 @@ export async function reboot() {
         if (state.page === "settings" && state.setSub === "usage") await Promise.all([loadUsage(), loadLogSummary()]);
         if (state.page === "settings" && ["memory", "agents"].includes(state.setSub)) await loadIdentity();
         if (state.page === "settings" && state.setSub === "links") await loadGA();
+        if (state.page === "settings" && state.setSub === "appearance") await loadAppearance();
+        if (state.page === "settings" && ["social", "social-login"].includes(state.setSub)) await loadSocial();
         renderRail();
         repaintSheet();
       })
@@ -205,6 +212,8 @@ export async function enterSettings(sub) {
   if (state.setSub === "usage") await Promise.all([loadUsage(), loadLogSummary()]);
   if (["memory", "agents"].includes(state.setSub)) await loadIdentity();
   if (state.setSub === "links") await loadGA();
+  if (state.setSub === "appearance") await loadAppearance();
+  if (["social", "social-login"].includes(state.setSub)) await loadSocial();
   if (state.page === "settings") {
     renderView();
     renderSide();

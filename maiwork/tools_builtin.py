@@ -20,6 +20,7 @@ fetch_page 安全规则：
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import logging
@@ -215,6 +216,96 @@ def _extract_html(html: str) -> tuple[str, str]:
     return _extract_fallback(html)
 
 
+class _TweetBodyParser(HTMLParser):
+    """Only complete paragraphs inside a blockquote are tweet evidence."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.stack: list[str] = []
+        self.parts: list[str] = []
+        self.paragraphs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "br":
+            if "p" in self.stack and "blockquote" in self.stack:
+                self.parts.append("\n")
+        elif tag not in {"img", "hr", "meta", "link", "input", "wbr", "source"}:
+            self.stack.append(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag not in self.stack:
+            return
+        if tag == "p" and "blockquote" in self.stack:
+            self.paragraphs.append(_squeeze("".join(self.parts)))
+            self.parts.clear()
+        at = len(self.stack) - 1 - self.stack[::-1].index(tag)
+        del self.stack[at:]
+
+    def handle_data(self, data: str) -> None:
+        if "blockquote" in self.stack and "p" in self.stack and not _SKIP_TAGS.intersection(self.stack):
+            self.parts.append(data)
+
+
+async def _fetch_twitter_oembed(
+    url: str, *, transport: Any, resolver: Resolver,
+) -> tuple[str, str, str] | None:
+    """Return canonical status URL, safe author and actual body, or defer to old routes.
+
+    The fixed endpoint never redirects. Both the stream and the entire operation
+    (including DNS) have limits; cancellation belongs to the caller.
+    """
+    from .social_platforms import _platform_url
+    from .rss import RssError, _resolve_public_ip
+
+    canonical = _platform_url("twitter", url)
+    if not canonical:
+        return None
+    try:
+        async with asyncio.timeout(8.0):
+            endpoint = httpx.URL("https://publish.twitter.com/oembed")
+            headers: dict[str, str] = {}
+            extensions: dict[str, Any] = {}
+            network_transport = transport
+            if transport is None:
+                # Reuse RSS's all-answers check and pin the approved IP to
+                # prevent a second DNS lookup from changing the destination.
+                address = await asyncio.to_thread(_resolve_public_ip, "publish.twitter.com", 443)
+                endpoint = endpoint.copy_with(host=address)
+                headers["Host"] = "publish.twitter.com"
+                extensions["sni_hostname"] = "publish.twitter.com"
+                network_transport = httpx.AsyncHTTPTransport(trust_env=False)
+            elif await asyncio.to_thread(_host_is_forbidden, "publish.twitter.com", resolver):
+                return None
+            async with httpx.AsyncClient(transport=network_transport, timeout=8.0, trust_env=False) as client:
+                async with client.stream(
+                    "GET", endpoint, headers=headers, extensions=extensions,
+                    params={"url": canonical, "omit_script": "true"}, follow_redirects=False,
+                ) as response:
+                    if response.status_code != 200:
+                        return None
+                    if response.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+                        return None
+                    raw = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        if len(raw) + len(chunk) > _MAX_BODY_BYTES:
+                            return None
+                        raw.extend(chunk)
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or not isinstance(payload.get("html"), str):
+                return None
+            parser = _TweetBodyParser()
+            parser.feed(payload["html"])
+            parser.close()
+            body = "\n".join(p for p in parser.paragraphs if p).strip()
+            if not body:
+                return None
+            author = payload.get("author_name", "")
+            title = _extract_fallback(author)[1][:300] if isinstance(author, str) else ""
+            return canonical, title, body[:_TEXT_MAX_CHARS]
+    except (RssError, httpx.HTTPError, TimeoutError, ValueError, TypeError, RecursionError):
+        return None
+
+
 # ----------------------------------------------------------------------
 # fetch_page
 # ----------------------------------------------------------------------
@@ -339,7 +430,7 @@ async def _fetch_page_text(
 # ----------------------------------------------------------------------
 
 # 请求日志里标明是哪条路打开的（排查用）
-_VIA_NOTE = {"jina": "（Jina）", "extract": "（抓正文工具）", "direct": "（直接打开）"}
+_VIA_NOTE = {"oembed": "（Twitter oEmbed）", "jina": "（Jina）", "extract": "（抓正文工具）", "direct": "（直接打开）"}
 
 FINAL_URL_LABEL = "最终地址"
 # 到「）」/ 空白为止（标记是我们自己写的「（最终地址：<url>）」）
@@ -462,6 +553,7 @@ def register_builtin(
     get_settings: Callable[[], Any] | None = None,
     resolver: Resolver | None = None,  # 测试注入 DNS resolver（host -> [ip]）
     reader: Any = None,                # JinaReader（reader.py）；None / 关着 = 不走 Jina
+    store: Any = None,                 # Store（social_search 用）
 ) -> None:
     """把 M2 内置工具注册进 tools。search 可以为 None（届时 web_search 直接报没配）。"""
     resolve = resolver or _default_resolver
@@ -576,6 +668,14 @@ def register_builtin(
         allowed, note = verify_budget.consume(str(ctx.task_id or ""))
         if not allowed:
             return ToolResult(ok=False, output="", error=note)
+        problem = await asyncio.to_thread(_url_problem, url, resolve)
+        if problem:
+            return ToolResult(ok=False, output="", error=problem)
+        tweet = await _fetch_twitter_oembed(url, transport=http_transport, resolver=resolve)
+        if tweet is not None:
+            canonical, title, body = tweet
+            text = f"《{title}》\n{body}" if title else body
+            return _page_result(ctx, url, text, "", canonical, "oembed", body=body, title=title)
         use_jina = reader is not None and bool(getattr(reader, "enabled", lambda: False)())
         if use_jina:
             # 新顺序：Jina → 抓正文工具 → 直接打开。先做地址安全检查（内网地址哪条路都不走）。
@@ -744,6 +844,68 @@ def register_builtin(
             handler=read_profile,
             summarize=lambda args, res: (f"读画像（群 {args.get('group_id') or '本群'}）", res.output.splitlines()[0] if res.ok and res.output else (res.error or "空")),
             timeout_s=10.0,
+        )
+    )
+    async def social_search(ctx: ToolContext, args: dict) -> ToolResult:
+        from . import social_platforms
+
+        if store is None:
+            return ToolResult(ok=False, output="", error="社交平台存储尚未就绪")
+        query = args.get("query")
+        if not isinstance(query, str) or not query.strip() or len(query.strip()) > 200:
+            return ToolResult(ok=False, output="", error="query 须为 1–200 字的文本")
+        query = query.strip()
+        platforms = args.get("platforms")
+        if platforms is not None and (not isinstance(platforms, list) or any(
+            not isinstance(pid, str) or pid not in social_platforms.PLATFORMS for pid in platforms
+        )):
+            return ToolResult(ok=False, output="", error="platforms 须为已知平台 ID 数组")
+        try:
+            limit_i = max(1, min(20, int(args.get("limit", 8))))
+        except (TypeError, ValueError):
+            return ToolResult(ok=False, output="", error="limit 须为整数")
+        if str(ctx.task_id or "").startswith("personal-collect:"):
+            from . import verify_budget
+            allowed, note = verify_budget.consume_search(str(ctx.task_id))
+            if not allowed:
+                return ToolResult(ok=False, output="", error=note)
+        errors: dict[str, str] = {}
+        try:
+            grouped = await social_platforms.search_all(
+                store, query, platforms=platforms or None, limit=limit_i, errors=errors,
+                web_search_fn=getattr(search, "search_broad", None),
+            )
+        except Exception:
+            return ToolResult(ok=False, output="", error="社交平台搜索失败，请检查平台设置和登录态")
+        results = [dict(item, platform=pid) for pid, items in grouped.items() for item in items if isinstance(item, dict)]
+        lines = [f"{i}. [{item['platform']}] {item.get('title', '')}\n   {item.get('url', '')}\n   {item.get('snippet', '')}"
+                 for i, item in enumerate(results, 1)]
+        if errors:
+            lines.append("部分平台暂不可用：" + "、".join(pid for pid in errors if pid in social_platforms.PLATFORMS) + "；请管理员检查设置和登录态")
+        if not results and errors:
+            return ToolResult(ok=False, output="", error=lines[-1])
+        return ToolResult(ok=True, output="\n".join(lines) or "没有搜到结果", data=results)
+
+    tools.register(
+        Tool(
+            name="social_search",
+            description="在社交平台搜索讨论（Twitter/X、小红书、B站、YouTube、Reddit）。只给出搜索结果列表，要看具体内容再调 fetch_page。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索词，2–6 个词"},
+                    "platforms": {"type": "array", "items": {"type": "string"}, "description": "只搜这几个平台（可选，空 = 所有已启用的）"},
+                    "limit": {"type": "integer", "description": "最多几条，默认 8，上限 20"},
+                },
+                "required": ["query"],
+            },
+            roles=frozenset({"worker"}),
+            handler=social_search,
+            summarize=lambda args, res: (
+                f"社交平台搜索：{args.get('query', '')}",
+                (res.output.splitlines()[0] if res.ok and res.output else (res.error or "没搜到")),
+            ),
+            timeout_s=55.0,
         )
     )
     tools.register(
