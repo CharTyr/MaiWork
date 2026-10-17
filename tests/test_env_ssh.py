@@ -13,6 +13,7 @@ authorized_keys 里加）连上去干活：
 from __future__ import annotations
 
 import asyncio
+import types
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,19 @@ import pytest
 
 from CharTyr_MaiWork.maiwork.config import load_settings
 from CharTyr_MaiWork.maiwork.environments.ssh import SshEnv, parse_host
+from CharTyr_MaiWork.maiwork.environments import ssh as ssh_module
+from CharTyr_MaiWork.maiwork.console.views import _ssh_health
+
+
+@pytest.fixture(autouse=True)
+def ssh_commands_available(monkeypatch):
+    # FakeRunner 的测试不依赖开发机是否安装 OpenSSH。
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda command, *, path=None: f"/usr/bin/{command}")
+
+
+def _health(env):
+    return _ssh_health(types.SimpleNamespace(ssh=env))
 
 
 def _settings(machines: list[dict] | None = None) -> Any:
@@ -88,6 +102,116 @@ def test_ensure_key_generates_once_and_returns_pubkey(tmp_path) -> None:
     assert _run(env.ensure_key()) == pub
     assert len(runner.calls) == n  # 已有就不再生成
     assert env.public_key() == pub
+
+
+# ---------------------------------------------------------------- 初始化故障（Issue #2）
+
+
+@pytest.mark.parametrize("missing", [
+    {"ssh-keygen"}, {"ssh"}, {"scp"}, {"ssh-keygen", "ssh", "scp"},
+])
+@pytest.mark.parametrize("configured", [False, True])
+def test_missing_client_commands_warn_even_without_machines(tmp_path, monkeypatch, missing, configured):
+    import shutil
+    paths = []
+
+    def lookup(command, *, path=None):
+        paths.append(path)
+        return None if command in missing else f"/usr/bin/{command}"
+
+    monkeypatch.setattr(shutil, "which", lookup)
+    runner = FakeRunner()
+    machines = [{"name": "甲", "host": "a@10.0.0.1"}] if configured else []
+    env = SshEnv(lambda: _settings(machines), tmp_path, runner=runner.run)
+    _run(env.check_all())
+    health = _health(env)
+    assert health["state"] == "warn"
+    assert all(command in health["text"] for command in missing)
+    assert "容器" in health["text"] and "openssh-client" in health["text"]
+    assert "copy" not in health
+    assert not runner.calls  # 初始化失败不再探测远端
+    assert paths and all(path == ssh_module._MINIMAL_ENV["PATH"] for path in paths)
+
+
+@pytest.mark.parametrize("failure", ["exit", "missing", "permission", "timeout", "empty"])
+def test_key_initialization_failure_is_actionable_and_safe(tmp_path, failure):
+    async def runner(argv, *, cwd, env, timeout):
+        if failure == "missing":
+            raise FileNotFoundError("secret-in-exception")
+        if failure == "permission":
+            raise PermissionError("secret-in-exception")
+        if failure == "timeout":
+            raise asyncio.TimeoutError("secret-in-exception")
+        if failure == "exit":
+            return 1, "", "secret-in-stderr"
+        key = Path(argv[argv.index("-f") + 1])
+        key.write_text("PRIVATE")
+        key.with_suffix(".pub").write_text("")
+        return 0, "", ""
+
+    env = SshEnv(lambda: _settings(), tmp_path, runner=runner)
+    _run(env.check_all())
+    health = _health(env)
+    assert health["state"] == "warn"
+    assert "SSH" in health["text"]
+    assert any(word in health["text"] for word in ("权限", "可写", "openssh-client"))
+    assert "secret-in-" not in health["text"]
+    assert "copy" not in health and "下面的公钥" not in health["text"]
+
+
+def test_initial_health_does_not_refer_to_nonexistent_key(tmp_path):
+    env = SshEnv(lambda: _settings(), tmp_path, runner=FakeRunner().run)
+    health = _health(env)
+    assert "检查" in health["text"]
+    assert "下面的公钥" not in health["text"] and "copy" not in health
+
+
+def test_recheck_recovers_and_keeps_existing_key(tmp_path, monkeypatch):
+    import shutil
+    runner = FakeRunner()
+    env = SshEnv(lambda: _settings(), tmp_path, runner=runner.run)
+    pub = _run(env.ensure_key())
+    private = env.key_path.read_bytes()
+    runner.calls.clear()
+    monkeypatch.setattr(shutil, "which", lambda command, *, path=None: None)
+    _run(env.check_all())
+    assert _health(env)["state"] == "warn"
+    assert _health(env)["copy"] == pub
+    monkeypatch.setattr(shutil, "which", lambda command, *, path=None: f"/usr/bin/{command}")
+    _run(env.check_all())
+    assert _health(env)["state"] == "off"
+    assert _health(env)["copy"] == pub
+    assert env.key_path.read_bytes() == private and not runner.calls
+
+
+@pytest.mark.parametrize("content", [b"", b"\xff"])
+def test_invalid_existing_public_key_warns_without_replacing_identity(tmp_path, content):
+    runner = FakeRunner()
+    env = SshEnv(lambda: _settings(), tmp_path, runner=runner.run)
+    _run(env.ensure_key())
+    private = env.key_path.read_bytes()
+    env.key_path.with_suffix(".pub").write_bytes(content)
+    runner.calls.clear()
+    _run(env.check_all())
+    health = _health(env)
+    assert health["state"] == "warn" and "copy" not in health
+    assert env.key_path.read_bytes() == private and not runner.calls
+
+
+def test_unreadable_existing_public_key_warns(tmp_path, monkeypatch):
+    env = SshEnv(lambda: _settings(), tmp_path, runner=FakeRunner().run)
+    _run(env.ensure_key())
+    original = Path.read_text
+
+    def read_text(path, *args, **kwargs):
+        if path == env.key_path.with_suffix(".pub"):
+            raise PermissionError("secret-in-exception")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    _run(env.check_all())
+    assert _health(env)["state"] == "warn"
+    assert "权限" in _health(env)["text"] and "copy" not in _health(env)
 
 
 # ---------------------------------------------------------------- acquire / 顺序 / 忙

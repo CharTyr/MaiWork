@@ -505,17 +505,20 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .deliv-t { font-size: 15px; font-weight: 700; }
 .deliv-s { font-size: 13px; color: var(--gray); }
 
-/* 设置页 */
-.section-picker { margin: 12px 0 8px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
-.section-picker > summary { min-height: 44px; padding: 10px 14px; cursor: pointer; font-size: 14px; font-weight: 700; color: var(--ink-2); }
-.section-current { margin-left: 12px; color: var(--gray); font-weight: 500; overflow-wrap: anywhere; }
-.section-picker nav { display: grid; max-height: min(360px, 50dvh); overflow-y: auto; overscroll-behavior: contain; padding: 4px 8px 8px; border-top: 1px solid var(--line); }
+/* 设置页：分栏圆按钮只用在「全部设置」，设置各页仍是原来的横向滑动分栏。 */
+.section-tabs { position: relative; display: flex; align-items: center; gap: 8px; min-width: 0; margin: 14px 0 4px; }
+.section-tabs > .cfg-jump { flex: 1; min-width: 0; margin: 0; padding: 4px; }
+.section-tabs .cfg-jump button { min-height: 44px; }
+.section-picker { position: relative; flex: 0 0 44px; align-self: flex-start; margin-top: 4px; }
+.section-picker > summary { display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 1px solid var(--line); border-radius: 50%; background: var(--fill); cursor: pointer; list-style: none; color: var(--ink-2); }
+.section-picker > summary::-webkit-details-marker { display: none; }
+.section-picker > summary svg { width: 22px; height: 22px; }
+.section-picker[open] > summary { background: var(--ink); color: var(--on-ink); }
+.section-picker nav { position: absolute; z-index: 10; top: 52px; left: 0; display: grid; width: min(260px, calc(100vw - 48px)); max-height: min(360px, 50dvh); overflow-y: auto; overscroll-behavior: contain; padding: 8px; border: 1px solid var(--line); border-radius: 16px; background: var(--card); box-shadow: 0 8px 24px rgba(var(--sh), 0.12); }
 .section-picker nav button { min-height: 44px; padding: 10px 12px; border-radius: 8px; text-align: left; font-size: 15px; color: var(--ink-2); overflow-wrap: anywhere; }
 .section-picker nav button:hover { background: var(--fill); }
 .section-picker nav button[aria-current="page"] { background: var(--fill); color: var(--ink); font-weight: 700; }
 .section-picker > summary:focus-visible, .section-picker nav button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 8px; }
-/* 桌面左栏已列出全部分栏，内容区不再重复一个同样列表。 */
-@media (min-width: 1180px) { .set-picker { display: none; } }
 .set-row { display: grid; grid-template-columns: 40px minmax(0, 1fr) auto; gap: 14px; align-items: center; padding: 13px 0; border-bottom: 1px solid var(--line); }
 .set-row:last-child { border-bottom: 0; }
 .social-logo { width: 30px; height: 30px; object-fit: contain; border-radius: 6px; flex: none; }
@@ -1491,8 +1494,7 @@ body.onb-lock { overflow: hidden; }
 /* ───── 群头像：真头像盖在 emoji 上，加载失败自动露出 emoji ───── */
 .gav { position: relative; display: grid; place-items: center; width: 100%; aspect-ratio: 1; }
 .gav .ico { width: 100% !important; height: 100% !important; }
-.gav-img { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: 30%; object-fit: cover; background: var(--fill-2); box-shadow: 0 0 0 1px var(--line); animation: gav-in 0.3s var(--ease-out) both; }
-@keyframes gav-in { from { opacity: 0; } to { opacity: 1; } }
+.gav-img { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: 30%; object-fit: cover; background: var(--fill-2); box-shadow: 0 0 0 1px var(--line); }
 /* ───── 用量：直接挑某一天 ───── */
 .u-pick { display: inline-flex; align-items: center; gap: 10px; margin: 2px 0 6px; font-size: 13px; color: var(--gray); }
 .u-pick input { height: 34px; padding: 0 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--card); color: var(--ink); font: inherit; font-size: 14px; }
@@ -1650,15 +1652,28 @@ a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 .ntag.fu { background: var(--ok-bg); color: var(--ok-ink); }
 
 /* 专岗工作册：沿用设置页的克制布局，以记录与交接为主，不做岗位卡片墙。 */
-.agent-journal { margin: 28px 0; padding: 0 0 12px 18px; border-left: 2px solid var(--line); }
-.agent-journal h3 { display: flex; align-items: center; gap: 8px; margin: 0 0 14px; }
-.agent-journal h3 .ico, .ext-form-h .ico { width: 24px; height: 24px; vertical-align: middle; }
+.agent-journal { margin: 0; padding: 18px 0 10px; border-bottom: 1px solid var(--line); }
+.agent-journal:last-child { border-bottom: 0; padding-bottom: 0; }
+.journal-head { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.journal-title { min-width: 0; }
+.journal-title .set-name { margin: 0; font-size: 16px; }
+.journal-meta { margin-top: 2px; font-size: 13px; color: var(--gray); }
+.journal-meta b { color: var(--ink); font-weight: 600; }
+.journal-dot { margin: 0 8px; color: var(--gray-2); }
+.journal-row { border-top: 1px solid var(--line); }
+.journal-row:first-of-type { border-top: 0; }
+.journal-row > summary { display: flex; align-items: baseline; gap: 10px; padding: 12px 2px; cursor: pointer; list-style: none; font-size: 14px; font-weight: 600; color: var(--ink-2); }
+.journal-row > summary::-webkit-details-marker { display: none; }
+.journal-row > summary::after { content: ""; width: 7px; height: 7px; margin-left: auto; align-self: center; border-right: 2px solid var(--gray-2); border-bottom: 2px solid var(--gray-2); transform: rotate(-45deg); transition: transform 0.18s var(--ease-out); }
+.journal-row[open] > summary::after { transform: rotate(45deg); }
+.journal-row > summary:hover { color: var(--ink); }
+.journal-row > summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 6px; }
+.journal-row > summary .fine { font-weight: 400; }
 .agent-journal textarea, #agent-group { width: 100%; padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--fill-2); color: var(--ink); font: inherit; line-height: 1.5; }
 .agent-journal textarea { resize: vertical; margin-top: 6px; }
 .agent-journal textarea:focus-visible, #agent-group:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
-.agent-journal details { margin-top: 14px; }
-.agent-journal summary { cursor: pointer; font-size: 14px; font-weight: 650; line-height: 1.7; }
 .agent-entry { padding: 12px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.agent-entry:last-child { border-bottom: 0; }
 .agent-entry p { font-size: 14px; line-height: 1.6; white-space: pre-wrap; margin: 6px 0; }
 .agent-entry p.fine { color: var(--gray); font-size: 12px; }
 .agent-refs { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; margin-bottom: 4px; }
@@ -1751,12 +1766,14 @@ a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 @media (max-width: 560px) { .mdl-list { margin-left: 4px; padding-left: 10px; } }
 
 /* 专岗页（2026-10）：主模型下面挂头像；设置里 SOUL / AGENTS 两个大框 */
-.agent-avatar { margin: -4px 0 12px 64px; }
-.agent-avatar .h-sub { font-size: 15px; margin-top: 4px; }
+/* 头像块：标题沿用 .h-sub 的字号与字重，与下面「专岗」等分节标题保持一致。 */
+.agent-avatar { margin: 0; padding-bottom: 20px; border-bottom: 1px solid var(--line); }
+.agent-avatar .h-sub { margin: 18px 0 14px; }
+.agent-avatar .av-row { padding: 0; border-bottom: 0; }
 .agent-doc { margin-top: 14px; }
 .agent-doc .mono-area { width: 100%; }
 .btn.danger { color: var(--red); }
-@media (max-width: 560px) { .agent-avatar { margin-left: 0; } }
+
 
 /* 交接包（docs/24）：详情底部的次入口 + 抽屉里的预览 */
 .ho-entry { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 6px; }
@@ -1993,7 +2010,6 @@ a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 /* 竖向分栏菜单在复古主题里同样是键帽，选中项是按下去的薄荷绿键。 */
 :root[data-theme="retro"] .section-picker { border: var(--edge); border-radius: 0; background: var(--mil-panel); }
 :root[data-theme="retro"] .section-picker > summary { min-height: 44px; color: var(--mil-ink); font-family: var(--mil-font); font-synthesis: none; }
-:root[data-theme="retro"] .section-current { color: var(--mil-print); }
 :root[data-theme="retro"] .section-picker nav { border-top: var(--edge); gap: 6px; padding: 8px; }
 :root[data-theme="retro"] .section-picker nav button {
   border-radius: 0;

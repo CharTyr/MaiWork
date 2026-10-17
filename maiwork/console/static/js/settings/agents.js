@@ -39,9 +39,10 @@ export function agentsPage() {
   const noModels = !((state.mdl && state.mdl.models) || []).length;
   return `
     ${noModels ? `<div class="warn-box">暂无模型<button class="btn small" data-act="set-sub" data-sub="models" style="margin-left:8px">前往添加</button></div>` : ""}
+    <div class="agent-avatar">${avatarBlock()}</div>
     <div class="h-sub-row"><h2 class="h-sub">专岗${tip("主模型负责分析和检查，专岗负责执行具体工作。")}</h2><button class="btn small" data-act="agent-new">新建</button></div>
     ${state.agentNew ? newAgentForm() : ""}
-    ${profiles.map((p) => state.agentEdit === p.kind ? profileForm(p) : state.agentFishEdit === p.kind ? fishForm(p) : profileRow(p) + (p.kind === "main" ? `<div class="agent-avatar">${avatarBlock()}</div>` : "")).join("")}
+    ${profiles.map((p) => state.agentEdit === p.kind ? profileForm(p) : state.agentFishEdit === p.kind ? fishForm(p) : profileRow(p)).join("")}
     <h2 class="h-sub">本群工作记录${tip("各专岗在所选群中的工作记录。")}</h2>
     ${groups.length ? `<label for="agent-group" class="fine">群</label><select id="agent-group">${groups.map((g) => `<option value="${esc(g.id)}"${state.agentGroup === g.id ? " selected" : ""}>${esc(g.name || `群 ${g.id}`)}</option>`).join("")}</select>` : `<p class="fine">暂无群</p>`}
     ${state.agentError ? `<p class="err" role="alert">${esc(state.agentError)}</p><button class="btn small" data-act="agent-reload">刷新</button>` : ""}
@@ -166,13 +167,14 @@ function repaintFishForm(kind, focusSel) {
 function journalSection(a) {
   const learned = a.learned || [];
   const handoffs = a.recent_handoffs || [];
+  const meta = [a.kind === "task" ? "" : `近期完成 <b>${learned.length}</b>`, `最近交接 <b>${handoffs.length}</b>`]
+    .filter(Boolean).join('<span class="journal-dot">·</span>');
   return `<section class="agent-journal">
-    <h3 class="set-name"><span class="agent-fish sm">${fishOf(a.kind, 30)}</span>${esc(a.title)}</h3>
-    ${a.kind === "task" ? "" : `<details><summary>近期完成 · ${learned.length}</summary>
-      <p class="fine">用于避免重复工作</p>
+    <div class="journal-head"><span class="agent-fish sm">${fishOf(a.kind, 30)}</span><div class="journal-title"><h3 class="set-name">${esc(a.title)}</h3><div class="journal-meta">${meta}</div></div></div>
+    ${a.kind === "task" ? "" : `<details class="journal-row"><summary>近期完成<span class="fine">用于避免重复工作</span></summary>
       ${learned.map((m) => `<div class="agent-entry"><p>${esc(m.text || "")}</p>${referenceLinks(m.refs)}${m.source_id ? `<span class="fine">依据：${esc(m.source_id)}</span>` : ""}</div>`).join("") || `<p class="fine">暂无记录</p>`}
     </details>`}
-    <details><summary>最近交接 · ${handoffs.length}</summary>
+    <details class="journal-row"><summary>最近交接<span class="fine">交给我的任务和检查结果</span></summary>
       ${handoffs.map(handoffEntry).join("") || `<p class="fine">暂无交接记录</p>`}
     </details>
   </section>`;

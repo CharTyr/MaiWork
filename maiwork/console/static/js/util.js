@@ -55,7 +55,7 @@ export const tipLabel = (forId, text, html) =>
 
 const ICONS = new Set("robot newspaper bulb monitor chart alarm moon speech tools package books filebox testtube palette seedling hourglass memo camera rocket joystick sparkles magnifier floppy link bell calendar dumpling bullseye flag pushpin lotus sleeping herb gear lock cloud teacup mailbox fish".split(" "));
 // 群头像：有 avatar 就盖一张真图在 emoji 上，图挂了就删掉露出 emoji
-export const gface = (g) => `<span class="gav">${ico(g.icon)}${g.avatar ? `<img class="gav-img" src="${esc(g.avatar)}" alt="" loading="lazy" onerror="this.remove()" />` : ""}</span>`;
+export const gface = (g) => `<span class="gav" data-avatar="${esc(g.avatar || "")}">${ico(g.icon)}${g.avatar ? `<img class="gav-img" src="${esc(g.avatar)}" alt="" onerror="this.remove()" />` : ""}</span>`;
 export const ico = (name, cls = "ico") => `<img class="${cls}" src="/static/assets/icons/${ICONS.has(name) ? name : "sparkles"}.png" alt="" loading="lazy" />`;
 const enterAttr = (i) => `class="enter" style="--i:${i}"`;
 

@@ -186,8 +186,8 @@ export function rulesPage() {
   const shown = jump ? secs.filter((s) => s.id === jump) : secs;
   return `
     ${pending.length ? `<div class="warn-box">${pending.length} 项设置需在插件重载后生效（${pending.map((k) => esc((cfgField(k) || {}).label || k)).join("、")}）</div>` : ""}
-    <div class="cfg-picker">${sectionPicker([["", "全部"], ...secs.map((s) => [s.id, s.label])], jump, true)}</div>
-    <div class="cfg-jump" role="tablist"><button type="button" role="tab" aria-selected="${!jump}" data-act="cfg-sec" data-s="">全部</button>${secs.map((s) => `<button type="button" role="tab" aria-selected="${jump === s.id}" data-act="cfg-sec" data-s="${esc(s.id)}">${esc(s.label)}</button>`).join("")}</div>
+    <div class="section-tabs">${sectionPicker([["", "全部"], ...secs.map((s) => [s.id, s.label])], jump, true)}
+    <div class="cfg-jump" role="tablist"><button type="button" role="tab" aria-selected="${!jump}" data-act="cfg-sec" data-s="">全部</button>${secs.map((s) => `<button type="button" role="tab" aria-selected="${jump === s.id}" data-act="cfg-sec" data-s="${esc(s.id)}">${esc(s.label)}</button>`).join("")}</div></div>
     <datalist id="mw-platforms">${Object.keys(PLATFORM_NAMES).map((p) => `<option value="${p}">${PLATFORM_NAMES[p]}</option>`).join("")}</datalist>
     <form id="rules-form" class="rules-form" autocomplete="off">
       ${shown.map(cfgSection).join("")}

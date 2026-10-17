@@ -20,13 +20,13 @@ const loading = () => "加载中";
 '''
     body = r'''
 const settings = settingsPage();
-assert.match(settings, /<details class="section-picker">/);
-assert.match(settings, /跳转分栏/);
-assert.match(settings, /data-act="set-sub" data-sub="social" aria-current="page"/);
-assert.match(settings, /data-sub="social-login"/);
+assert.doesNotMatch(settings, /class="section-picker"/); // 分栏圆按钮只在「全部设置」页
+assert.match(settings, /data-act="set-sub" data-sub="social" aria-selected="true"/);
+assert.doesNotMatch(settings, /data-sub="social-login"|class="set-picker"/);
 assert.match(settings, /class="set-nav"/); // 保留原分栏
 const config = rulesPage();
-assert.match(config, /<details class="section-picker">/);
+assert.match(config, /class="section-tabs">\s*<details class="section-picker">/);
+assert.match(config, /summary aria-label="全部配置分类"/);
 assert.match(config, /data-act="cfg-sec" data-s="tasks" aria-current="page"/);
 assert.match(config, /data-act="cfg-sec" data-s=""/); // 可返回全部
 assert.match(config, /id="cfg-tasks"/);

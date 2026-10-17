@@ -20,7 +20,7 @@ export async function loadOnbSocial() {
 
 export function onbSocialPane() {
   const rows = (platforms || []).map((p) => `<label class="onb-social-option"><input type="checkbox" name="onb-social-platform" value="${esc(p.id)}" ${p.enabled ? "checked" : ""} />${socialLogo(p.id)}<span><b>${esc(p.name)}</b>${p.needs_cookie ? `<span class="set-text">需要登录态</span>` : ""}</span></label>`).join("");
-  return `<div class="onb-step-ico">${ico("speech")}</div><h1 class="onb-title">社交平台（可选）${tip("勾选后自动安装组件。需要登录的平台，请在完成引导后前往「设置 → 登录态」填写 Cookie。安装失败可在「社交平台」中重试。")}</h1><div class="onb-social-list">${error ? `<p class="err" role="alert">${esc(error)}</p><button class="btn" data-act="onb-social-reload">重试</button>` : rows || `<p class="fine">暂无平台，可跳过此步</p>`}</div>`;
+  return `<div class="onb-step-ico">${ico("speech")}</div><h1 class="onb-title">社交平台（可选）${tip("勾选后自动安装组件。需要登录的平台，请在完成引导后前往「设置 → 社交平台」填写登录态，填写框中附有 Cookie 获取步骤。安装失败可在「社交平台」中重试。")}</h1><div class="onb-social-list">${error ? `<p class="err" role="alert">${esc(error)}</p><button class="btn" data-act="onb-social-reload">重试</button>` : rows || `<p class="fine">暂无平台，可跳过此步</p>`}</div>`;
 }
 
 export async function saveOnbSocial() {

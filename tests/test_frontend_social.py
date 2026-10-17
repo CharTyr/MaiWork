@@ -63,7 +63,7 @@ assert.equal(rows.match(/class="social-logo"/g).length, 2, "已知平台用品�
 assert.ok(rows.includes("/static/assets/logos/social/twitter-128.png"));
 assert.ok(rows.includes("/static/assets/logos/social/xiaohongshu-128.png"));
 assert.ok(!rows.includes("/social/futurenet"), "未知平台不拼 logo 路径");
-const login = socialLoginPage();
+const login = socialPage();
 assert.match(login, /class="social-logo"[^>]*logos\/social\/twitter-128\.png/, "登录态页也用品牌 logo");
 ''')
 
@@ -119,12 +119,37 @@ assert.match(socialPage(), /连接中断/);
 ''')
 
 
-def test_independent_login_page():
+def test_login_actions_are_inside_the_platform_configuration():
     run_social('''
-social.platforms = [{id: "twitter", name: "Twitter/X", needs_cookie: true, cookie_set: true}];
-assert.match(socialLoginPage(), /social-cookie-clear/);
-assert.match(socialLoginPage(), /已填/);
-assert.doesNotMatch(socialPage(), /重填 Cookie|填 Cookie/);
+social.platforms = [{id: "twitter", name: "Twitter/X", enabled: true, installed: true, needs_cookie: true, cookie_set: true},
+{id: "youtube", name: "YouTube", enabled: true, installed: true}];
+const html = socialPage();
+assert.match(html, /social-cookie-clear/);
+assert.match(html, /登录态已填/);
+assert.match(html, /social-check/);
+assert.match(html, /无需填写登录态/);
+assert.equal((html.match(/data-act="social-cookie"/g) || []).length, 1);
+''')
+
+
+def test_cookie_instructions_are_visible_and_platform_specific():
+    run_social('''
+for (const [id, url, fields] of [
+ ["twitter", "https://x.com", "auth_token"],
+ ["xiaohongshu", "https://www.xiaohongshu.com", "web_session"],
+ ["reddit", "https://www.reddit.com", "完整 Cookie"],
+]) {
+ state.cookieEdit = {id, name:id};
+ const html = socialCookieSheet();
+ assert.match(html, /<ol/);
+ assert.ok(html.includes(url));
+ assert.ok(html.includes(fields));
+ assert.match(html, /Network/);
+ assert.match(html, /Request Headers/);
+ assert.match(html, /Cookie:/);
+ assert.match(html, /检测/);
+ assert.doesNotMatch(html, /<details[^>]*>[^]*id="cookie-help"/);
+}
 ''')
 
 

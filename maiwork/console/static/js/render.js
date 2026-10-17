@@ -65,11 +65,13 @@ export function renderTabbar() {
     ).join("");
 }
 
+const railMarkup = new WeakMap();
 export function renderRail() {
   const g = grp();
   const list = admin() ? state.groups : g ? [g] : [];
   const n = pendingCount(g);
-  $("rail").innerHTML = `
+  const rail = $("rail");
+  const html = `
     <div class="brand">
       <img src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="${esc(botName())}" />
       <div class="brand-t"><div class="brand-name">MaiWork</div><div class="brand-sub">${admin() ? "管理员 · 所有群" : isGA() ? "群管理员" : esc(botName()) + " 的工作台"}</div></div>
@@ -103,6 +105,9 @@ export function renderRail() {
           : `<button class="r-item" data-act="login" title="${isGA() ? "群管理员" : "管理员"}">${SVG.key}<span class="r-text"><span class="r-name">${isGA() ? "群管理员" : "管理员"}</span></span></button>`
       }
     </div>`;
+  if (railMarkup.get(rail) === html) return;
+  railMarkup.set(rail, html);
+  rail.innerHTML = html;
 }
 
 function upcomingIcon(u) {

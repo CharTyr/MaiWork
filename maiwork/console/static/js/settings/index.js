@@ -13,8 +13,7 @@ import { fullLink, modelsPage } from "./models.js";
 import { updateSection } from "../update.js";
 import { attentionSection } from "./attention.js";
 import { appearancePage } from "./appearance.js";
-import { socialPage, socialLoginPage } from "./social.js";
-import { sectionPicker } from "./navigation.js";
+import { socialPage } from "./social.js";
 
 /* ───────────── 设置 / 群切换（抽屉） ───────────── */
 
@@ -41,8 +40,7 @@ export const SET_SUBS = [
   ["sources", "来源", "newspaper", "订阅、优质来源和屏蔽网站"],
   ["links", "群链接", "link", "群成员链接和群管理员密码"],
   ["appearance", "外观", "palette", "主题和音效包"],
-  ["social", "社交平台", "speech", "Twitter、小红书、B站等平台的搜索"],
-  ["social-login", "登录态", "lock", "社交平台登录状态"],
+  ["social", "社交平台", "speech", "平台搜索、安装和登录态"],
   ["rules", "全部设置", "moon", "所有配置项"],
 ];
 
@@ -55,9 +53,9 @@ function setNav() {
 export function settingsPage() {
   const s = state.settings;
   const sub = SET_SUBS.find((x) => x[0] === state.setSub) || SET_SUBS[0];
-  const head = `<h1 class="h-page">${sub[0] === "overview" ? "设置" : esc(sub[1])}</h1><div class="set-picker">${sectionPicker(SET_SUBS, sub[0])}</div>${setNav()}`;
+  const head = `<h1 class="h-page">${sub[0] === "overview" ? "设置" : esc(sub[1])}</h1>${setNav()}`;
   if (!s) return head + loading((state.loadErr || {}).settings, "settings");
-  const body = { overview: settingsOverview, models: modelsPage, extensions: extPage, agents: agentsPage, usage: usageAndLogsPage, sources: sourcesPage, links: linksPage, rules: rulesPage, memory: memoryPage, appearance: appearancePage, social: socialPage, "social-login": socialLoginPage }[sub[0]];
+  const body = { overview: settingsOverview, models: modelsPage, extensions: extPage, agents: agentsPage, usage: usageAndLogsPage, sources: sourcesPage, links: linksPage, rules: rulesPage, memory: memoryPage, appearance: appearancePage, social: socialPage }[sub[0]];
   return head + `<div class="set-body">${body(s)}</div>`;
 }
 

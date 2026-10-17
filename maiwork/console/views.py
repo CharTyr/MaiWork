@@ -1344,7 +1344,8 @@ def _ssh_health(svc: Any) -> dict[str, Any] | None:
     """专用机器健康项：每台连不连得上；带上 MaiWork 的公钥（copy 字段，前端给复制按钮）。
 
     - SshEnv 没就位 → None（不放进列表）；
-    - 没配机器 → off，告诉用户怎么加（公钥照样给，可以先加上）；
+    - 初始化失败 → warn；尚无公钥 → 正在检查，不提示复制不存在的公钥；
+    - 没配机器且公钥就绪 → off，告诉用户怎么加（公钥照样给，可以先加上）；
     - 都连得上 → ok「甲、乙 都连得上」；有连不上的 → warn，逐台写原因；还没检查过 → 「正在检查」。
     """
     ssh = getattr(svc, "ssh", None)
@@ -1357,6 +1358,11 @@ def _ssh_health(svc: Any) -> dict[str, Any] | None:
         pub = ""
     if pub:
         base["copy"] = pub
+    error = ssh.initialization_error() if hasattr(ssh, "initialization_error") else ""
+    if error:
+        return {**base, "state": "warn", "text": error}
+    if not pub:
+        return {**base, "state": "warn", "text": "正在检查 SSH 客户端并准备公钥，请稍后查看"}
     try:
         st = list(ssh.status() or [])
     except Exception:

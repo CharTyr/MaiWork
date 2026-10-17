@@ -44,7 +44,7 @@ export function syncHash() {
 export function parseHash() {
   const parts = location.hash.replace(/^#\/?/, "").split("/");
   if (parts[0] === "chat") return { chat: true, id: parts[1] || "", ref: "", tab: "", sub: "" };
-  if (parts[0] === "settings") return { settings: true, sub: parts[1] === "logs" ? "usage" : parts[1] || "overview", ref: "", tab: "", id: "" };
+  if (parts[0] === "settings") return { settings: true, sub: parts[1] === "logs" ? "usage" : parts[1] === "social-login" ? "social" : parts[1] || "overview", ref: "", tab: "", id: "" };
   // 旧的目标页链接仍能打开原目标详情，只是落到「任务」。
   const tab = parts[1] === "goals" ? "tasks" : parts[1] || "";
   return { ref: decodeURIComponent(parts[0] || ""), tab, id: decodeURIComponent(parts[2] || "") };
@@ -174,7 +174,7 @@ export async function reboot() {
         if (state.page === "settings" && ["memory", "agents"].includes(state.setSub)) await loadIdentity();
         if (state.page === "settings" && state.setSub === "links") await loadGA();
         if (state.page === "settings" && state.setSub === "appearance") await loadAppearance();
-        if (state.page === "settings" && ["social", "social-login"].includes(state.setSub)) await loadSocial();
+        if (state.page === "settings" && ["social"].includes(state.setSub)) await loadSocial();
         renderRail();
         repaintSheet();
       })
@@ -213,7 +213,7 @@ export async function enterSettings(sub) {
   if (["memory", "agents"].includes(state.setSub)) await loadIdentity();
   if (state.setSub === "links") await loadGA();
   if (state.setSub === "appearance") await loadAppearance();
-  if (["social", "social-login"].includes(state.setSub)) await loadSocial();
+  if (["social"].includes(state.setSub)) await loadSocial();
   if (state.page === "settings") {
     renderView();
     renderSide();

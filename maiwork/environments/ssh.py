@@ -28,6 +28,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -110,6 +111,7 @@ class SshEnv:
         self._busy: dict[str, str] = {}      # 机器名 -> 占着它的 job_id
         self._status: dict[str, dict] = {}   # 机器名 -> {"ok", "error", "ts"}
         self._last_fail: dict | None = None
+        self._initialization_error = ""
         self._boxes: dict[str, SshBox] = {}  # job_id -> 分到的机器（工具按任务现读）
 
     # ------------------------------------------------------------------
@@ -180,31 +182,58 @@ class SshEnv:
     # key
     # ------------------------------------------------------------------
 
+    def initialization_error(self) -> str:
+        """最近一次初始化错误；只返回安全提示，不包含子进程原始输出。"""
+        return self._initialization_error
+
     async def ensure_key(self) -> str:
-        """没有 key 就生成一把；返回公钥一行。"""
+        """检查客户端工具，没有 key 就生成；失败状态供网页读取。"""
+        missing = [cmd for cmd in ("ssh-keygen", "ssh", "scp")
+                   if shutil.which(cmd, path=_MINIMAL_ENV["PATH"]) is None]
+        if missing:
+            self._initialization_error = (
+                "MaiBot 运行环境缺少 SSH 客户端命令：" + "、".join(missing)
+                + "。Docker 用户请在 MaiBot 容器内安装 openssh-client（不是只装在宿主机或目标机器上）；"
+                "其他环境请在运行 MaiBot 的机器上安装 OpenSSH 客户端。"
+            )
+            raise RuntimeError(self._initialization_error)
+        try:
+            pub = await self._prepare_key()
+        except Exception:
+            self._initialization_error = (
+                "SSH 公钥初始化失败。请检查 MaiBot 运行环境的 openssh-client 是否可用，"
+                "以及数据目录 ssh/ 的读写权限和挂载是否可写；已有私钥会保留，请勿删除以免更换身份。"
+            )
+            # 不透出异常正文或 ssh-keygen stderr，避免把敏感信息带进网页/日志。
+            raise RuntimeError(self._initialization_error) from None
+        self._initialization_error = ""
+        return pub
+
+    async def _prepare_key(self) -> str:
         pub = self.key_path.with_suffix(".pub")
-        if not (self.key_path.exists() and pub.exists()):
+        private_exists = self.key_path.exists()
+        if not private_exists and not pub.exists():
             self._key_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                os.chmod(self._key_dir, 0o700)
-            except OSError:
-                pass
-            code, _out, err = await self._exec(
+            os.chmod(self._key_dir, 0o700)
+            code, _out, _err = await self._exec(
                 ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "maiwork", "-f", str(self.key_path)],
                 timeout_s=30,
             )
             if code != 0:
-                raise RuntimeError(f"生成 SSH key 失败：{str(err).strip()[-200:]}")
-            try:
-                os.chmod(self.key_path, 0o600)
-            except OSError:
-                pass
-        return self.public_key()
+                raise RuntimeError("ssh-keygen 未成功")
+            os.chmod(self.key_path, 0o600)
+        elif not private_exists or not pub.exists():
+            # 不覆盖已有私钥，也不把孤立的旧公钥当成一个新的密钥对。
+            raise RuntimeError("SSH 密钥文件不完整")
+        value = pub.read_text(encoding="utf-8").strip()
+        if not value:
+            raise RuntimeError("SSH 公钥为空")
+        return value
 
     def public_key(self) -> str:
         try:
             return self.key_path.with_suffix(".pub").read_text(encoding="utf-8").strip()
-        except OSError:
+        except (OSError, UnicodeError):
             return ""
 
     # ------------------------------------------------------------------
@@ -242,7 +271,8 @@ class SshEnv:
         try:
             await self.ensure_key()
         except Exception:
-            logger.exception("生成 SSH key 出错")
+            logger.warning("SSH 初始化失败：%s", self._initialization_error)
+            return self.status()
         for m in self.machines():
             if "error" in m:
                 self._record(m["name"], False, m["error"])
