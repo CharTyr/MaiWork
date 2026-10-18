@@ -228,6 +228,9 @@ class Intake:
         # on_spark(group_id, ts)。只记内存（app 接成 feeds.note_spark），零库写、零模型。
         on_spark: Callable[[str, float], None] | None = None,
         pending_asks: Any = None,
+        # 按群功能开关（app 注入 group_features.enabled 的判定）：任务关闭时
+        # 不派活、不恢复等回答的任务；构想关闭时不认「构想 #N」。
+        feature_on: Callable[[str, str], bool] | None = None,
     ) -> None:
         self._get_settings = get_settings
         self._signals = signals
@@ -271,6 +274,8 @@ class Intake:
         self._answered_ids: dict[str, float] = {}
         # 慢路径在库里的表是 pending_asks；这个内存队列只给「没接库」的极简构造兜底
         self._slow_queue: list[dict] = []
+        # 按群功能开关闸（缺省 = 全开，老调用口不变）
+        self._feature_on = feature_on
         # 通过 @ 判断的最近几条消息（内存环，零 I/O）：Jev 取「这条 @ 之前的 4 条」、
         # 快速判断兜底取「之前的 6 条」当上下文；每个服务群一份，只留最近 8 条
         # （机器人自己的也记，标 MaiBot）
@@ -304,6 +309,42 @@ class Intake:
             pass
         else:
             self.kick_spool_recover()
+
+    def _feature(self, group_id: str, module: str) -> bool:
+        """这个群的这个模块开着吗；没注入闸（老调用口 / 极简构造）按开。"""
+        cb = self._feature_on
+        if cb is None:
+            return True
+        try:
+            return bool(cb(str(group_id), str(module)))
+        except Exception:
+            logger.warning("查功能开关失败（群 %s %s），本次暂停", group_id, module, exc_info=True)
+            return False
+
+    def _work_allowed(self, group_id: str, started_at: float | None = None, message_id: str = "") -> bool:
+        """A disable invalidates old pending intake, including a quick off/on cycle."""
+        try:
+            settings = self._get_settings()
+            if settings is None or not settings.is_served(str(group_id)) or not self._feature(group_id, "task"):
+                return False
+            if self._store is None:
+                return True
+            from . import group_features
+
+            cfg = group_features.get(self._store, group_id, settings)
+            if not cfg["task"]:
+                return False
+            if message_id and self._pending is not None:
+                pending = self._pending.get(group_id, message_id)
+                if pending is not None:
+                    received = float(pending.get("first_seen") or pending.get("ts") or 0)
+                    if received > 0:
+                        started_at = min(started_at, received) if started_at is not None else received
+            cutoff = cfg.get("last_disabled_ts", {}).get("task")
+            return cutoff is None or started_at is None or float(started_at) > float(cutoff)
+        except Exception:
+            logger.warning("查待判请求的功能开关失败（群 %s），本次不接新活", group_id, exc_info=True)
+            return False
 
     # ------------------------------------------------------------------
     # 钩子本体
@@ -467,6 +508,9 @@ class Intake:
         cb = self._on_answer
         if provider is None or cb is None:
             return
+        # 功能开关：任务关闭时不恢复等回答的任务（回复不触发开工）
+        if not self._feature(group_id, "task"):
+            return
         text_s = str(text or "").strip()
         if not text_s:
             return
@@ -539,9 +583,16 @@ class Intake:
           时钩子只等 150ms；拿不到写锁就把这条 @ 原子写进磁盘 spool（请求已经持久）——
           绝不跟着 Store 的 5 秒 busy_timeout 走（2026-10-15 复核，本机实测钩子曾被拖 5.36s）。
         """
+        # 功能开关：任务关闭时不认「构想 #N」派活（那是要开工的），也不落待判 @
+        # / 不调 Jev / 不建请求或提醒。钩子照常 continue，绝不中止宿主消息。
         idea = self._idea_of(group_id, text)
         if idea is not None:
-            _spawn_safely(self._spawn, self._create_idea_request(group_id, idea, user_id, user_name, message_id, text))
+            if self._feature(group_id, "idea") and self._feature(group_id, "task"):
+                _spawn_safely(self._spawn, self._create_idea_request(group_id, idea, user_id, user_name, message_id, text))
+            return
+        # 任务关闭：派活 / 提醒都走 task 开关（已确认连带目标）。不持久化、不判断。
+        if not self._feature(group_id, "task"):
+            logger.info("本群任务功能已关闭，这条 @ 不派活（群 %s 消息 %s）", group_id, message_id)
             return
         # 落库必须在钩子里（本地短事务 + 有界等锁；写不进就落 spool）：
         # 宿主超时掐断 / 插件重载都不丢这条 @
@@ -558,7 +609,7 @@ class Intake:
             self._spawn,
             self._judge_at(
                 settings, group_id, user_id, user_name, message_id, text, context,
-                spool_key=spool_key,
+                spool_key=spool_key, started_at=clock.now(),
             ),
         )
 
@@ -573,6 +624,7 @@ class Intake:
         context: list[dict] | None = None,
         *,
         spool_key: Optional[str] = None,
+        started_at: float | None = None,
     ) -> None:
         """后台问 Jev 并按判词走原来的后续路径；异常只记日志 + 留待重试，绝不外抛。
 
@@ -585,6 +637,9 @@ class Intake:
         落地结果会丢；等不到就**不判**（不调 Jev、不建请求），留给 spool 与独立重试路径
         （`profile.recover_pending_asks`）按库里那行判一次，保证一条 @ 只判一次。
         """
+        started_at = clock.now() if started_at is None else started_at
+        if not self._work_allowed(group_id, started_at, message_id):
+            return
         if spool_key is not None and not await self._wait_recorded(spool_key):
             logger.warning(
                 "待判 @ 还没写进库（写锁被占太久），这次不判、留给 spool 与独立重试（群 %s 消息 %s）",
@@ -592,6 +647,8 @@ class Intake:
             )
             return
         try:
+            if not self._work_allowed(group_id, started_at, message_id):
+                return
             timeout_ms = min(
                 _JEV_BG_WAIT_MAX_MS,
                 max(100, int(getattr(getattr(settings, "jev", None), "timeout_ms", 1500) or 1500)),
@@ -609,7 +666,9 @@ class Intake:
                         jev.ask(state, _AT_QUESTIONS, purpose="intake", group_id=group_id, timeout_ms=timeout_ms),
                         _JEV_BG_WAIT_MAX_MS / 1000.0,
                     )
-            ctx = {"context": list(context or [])}
+            if not self._work_allowed(group_id, started_at, message_id):
+                return
+            ctx = {"context": list(context or []), "started_at": started_at}
             if not isinstance(answers, dict):
                 self._fallback("jev_无答案", group_id, user_id, user_name, message_id, text, **ctx)
                 return
@@ -635,7 +694,7 @@ class Intake:
                         group_id, message_id,
                     )
                     return
-                _spawn_safely(self._spawn, self._create_request(group_id, label, confidence_f, user_id, user_name, message_id, text))
+                _spawn_safely(self._spawn, self._create_request(group_id, label, confidence_f, user_id, user_name, message_id, text, started_at=started_at))
                 return
             if label == "reminder" and confidence_f >= _CONFIDENCE_MIN:
                 cb = self._on_reminder
@@ -683,6 +742,7 @@ class Intake:
         text: str,
         *,
         context: list[dict] | None = None,
+        started_at: float | None = None,
     ) -> None:
         """Jev 判不了的一条 @：先试快速判断兜底，不行再走老慢路径（pending_asks）。
 
@@ -707,6 +767,7 @@ class Intake:
                     "user_name": str(user_name),
                     "message_id": str(message_id),
                     "text": str(text or ""),
+                    "_feature_started_ts": clock.now() if started_at is None else started_at,
                 },
                 context=list(context or []),
             ):
@@ -736,6 +797,7 @@ class Intake:
             str(item.get("text") or ""),
             via=via,
             title=str(title or ""),
+            started_at=item.get("_feature_started_ts"),
         )
 
     async def _run_reminder(
@@ -777,8 +839,11 @@ class Intake:
         *,
         via: str | None = None,
         title: str | None = None,
+        started_at: float | None = None,
     ) -> bool:
         """建待批请求。返回是否真的落地（拿到 id / 被筛掉）；失败时待判行留着、记下错误等重试。"""
+        if not self._work_allowed(group_id, started_at, message_id):
+            return False
         approvals = self._approvals
         if approvals is None:
             self._slow("approvals_没就位", group_id, user_id, user_name, message_id, text)
@@ -798,6 +863,7 @@ class Intake:
                 requester_name=user_name,
                 message_id=message_id,
                 screen=True,
+                started_at=started_at,
             )
         except Exception:
             logger.exception("记待批请求出错（群 %s，消息 %s）", group_id, message_id)

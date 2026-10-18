@@ -8,6 +8,7 @@ import { critBacked, critPending, nextText } from "./pages/goals.js";
 import { taskRow } from "./pages/tasks.js";
 import { sheetChrome } from "./sheet.js";
 import { renderSide } from "./render.js";
+import { goalChatHTML, preserveGoalChatInput } from "./goal-chat.js";
 
 /* ───────────── 详情 ───────────── */
 
@@ -63,7 +64,10 @@ function reviewBlock(t) {
 // 安全网自动暂停（paused_reason 只在自动暂停时有值；手动暂停为 null）
 const wan = (n) => (n >= 1e4 ? `${Math.round(n / 1e4)} 万` : String(n || 0));
 function pausedBlock(t) {
-  const r = t.status === "paused" && t.paused_reason;
+  const r = ["paused", "queued"].includes(t.status) && t.paused_reason;
+  if (r && r.kind === "feature_off") {
+    return `<div class="dt-sec"><div class="dt-label">搁置原因</div><div class="dt-text">任务功能关闭时已搁置。重新开启后，由管理员点击「恢复」。</div></div>`;
+  }
   if (!r || !["tokens", "tokens_unknown", "time", "capability"].includes(r.kind)) return "";
   if (r.kind === "capability") {
     if (!r.text) return "";
@@ -141,7 +145,8 @@ function taskDetail(id) {
   let acts = "";
   if (gadmin()) {
     const b = (op, label, primary) => `<button class="btn${primary ? " primary" : ""}" data-act="task-op" data-op="${op}" data-id="${esc(t.id)}">${label}</button>`;
-    if (["running", "reviewing", "queued", "waiting_input"].includes(st)) acts = b("pause", "暂停") + b("cancel", "取消");
+    if (st === "queued" && t.paused_reason && t.paused_reason.kind === "feature_off") acts = b("resume", "恢复", true) + b("cancel", "取消");
+    else if (["running", "reviewing", "queued", "waiting_input"].includes(st)) acts = b("pause", "暂停") + b("cancel", "取消");
     else if (st === "paused" || st === "shelved") acts = b("resume", "继续", true) + b("cancel", "取消");
     else if (st === "failed") acts = b("retry", "重试", true);
     else if (st === "completed") acts = b("redeliver", t.undelivered ? "重新发送" : "再次发送", t.undelivered);
@@ -220,6 +225,11 @@ function goalDetail(goal) {
         : `<button class="btn" data-act="goal-op" data-op="pause" data-id="${esc(goal.id)}">暂停</button>`
     }<button class="btn" data-act="goal-op" data-op="cancel" data-id="${esc(goal.id)}">取消目标</button></div>`;
   }
+  // 受阻时显示对话入口（2026-10 需求）
+  const staleBlock = goal.stale
+    ? `<div class="warn-box"><b>⚠️ 目标受阻</b>：${esc(goal.stale_reason || "原因未知")}</div>`
+    : "";
+  const chatBlock = goalChatHTML(goal);
   return `
     <div class="dt-head">
       ${ico(goal.icon || "bullseye")}
@@ -229,6 +239,7 @@ function goalDetail(goal) {
       </div>
     </div>
     ${fitBlock(goal)}
+    ${staleBlock}
     <div class="dt-sec"><div class="dt-text">${esc(goal.body)}</div></div>
     ${
       crit.length
@@ -240,6 +251,7 @@ function goalDetail(goal) {
     <div class="dt-sec"><div class="dt-label">下次检查</div><div class="dt-text">${esc(nextText(goal))}</div></div>
     ${goal.by ? `<div class="dt-sec"><div class="dt-label">来源</div><div class="dt-text">${esc(goal.by)}</div></div>` : ""}
     ${row ? `<div class="dt-sec"><div class="dt-label">相关任务</div>${taskRow(row, 0)}</div>` : ""}
+    ${chatBlock}
     ${acts}`;
 }
 
@@ -265,10 +277,10 @@ export async function loadTask(id) {
 
 export function refreshDetail() {
   if (desktop.matches) renderSide();
-  else if (state.sheet === "detail") {
+  else if (state.sheet === "detail") preserveGoalChatInput(() => {
     const sh = $("sheet");
     const top = sh.scrollTop;
     sh.innerHTML = sheetChrome() + detailHTML();
     sh.scrollTop = top;
-  }
+  });
 }

@@ -1001,6 +1001,72 @@ class ConsoleServer:
 
         app.router.add_route("PUT", "/api/groups/{gid}/push", self._write(_push_put))
 
+        # ---------- 按群功能开关（资讯 / 构想 / 任务） ----------
+
+        def _features_view(gid: str) -> dict:
+            from .. import group_features as _gf
+
+            cfg = _gf.get(svc.store, gid, svc.get_settings())
+            return {
+                "group_id": gid,
+                "news": bool(cfg.get("news", True)),
+                "idea": bool(cfg.get("idea", True)),
+                "task": bool(cfg.get("task", True)),
+                "disabled_ts": dict(cfg.get("disabled_ts") or {}),
+            }
+
+        @get("/api/groups/{gid}/features")
+        async def _features_get(request: web.Request) -> web.Response:
+            """这个群三个功能的启停状态。读：总管理员 + 本群群管理员 + 本群群友（页面要知道
+            哪些入口可用）；匿名 401、非服务群 404。"""
+            gid = self._resolve_ref(request.match_info["gid"])
+            if gid is None or not svc.get_settings().is_served(gid):
+                return _err(404, "没有这个群（只支持服务群）")
+            ident = self._identify(request)
+            if ident.role == "admin":
+                pass
+            elif ident.role in ("group_admin", "member") and str(ident.group_id or "") == str(gid):
+                pass
+            elif ident.role in ("group_admin", "member"):
+                return _err(403, "只能看自己群的功能开关")
+            else:
+                return _err(401, "先登录")
+            try:
+                return web.json_response(_features_view(gid))
+            except Exception:
+                logger.exception("读群 %s 的功能开关出错", gid)
+                return _err(500, "服务器出错了")
+
+        async def _features_put(request: web.Request) -> web.Response:
+            """改这个群三个功能的启停：只认 news/idea/task 三个布尔位，别的字段 400。"""
+            gid = self._resolve_ref(request.match_info["gid"])
+            if gid is None or not svc.get_settings().is_served(gid):
+                return _err(404, "没有这个群（只支持服务群）")
+            forbid = self._require_group_admin(request, gid)
+            if forbid is not None:
+                return forbid
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            from .. import group_features as _gf
+
+            patch = body
+            if not isinstance(patch, dict) or not patch:
+                return _err(400, "要给要改的功能（news / idea / task）")
+            try:
+                ident = self._identify(request)
+                by = "管理员" if ident.role == "admin" else "群管理员（网页）"
+                _gf.set_config(svc.store, gid, patch, svc.get_settings(), by=by, now=clock.now())
+            except ValueError as e:
+                return _err(400, str(e))
+            except Exception:
+                logger.exception("写群 %s 的功能开关出错", gid)
+                return _err(500, "服务器出错了")
+            logger.info("群 %s 的功能开关改成：%s", gid, sorted(patch))
+            return web.json_response(_features_view(gid))
+
+        app.router.add_route("PUT", "/api/groups/{gid}/features", self._write(_features_put))
+
         # ---------- 设置（管理员） ----------
 
         @get("/api/settings")
@@ -2511,6 +2577,14 @@ class ConsoleServer:
                     return _err(404, "这条构想不存在")
                 if _wrong_group(ident, gid):
                     return _err(403, "只能管自己群的内容")
+                # 功能开关：构想转任务要两个模块都开着（构想给出内容、任务真的开工）
+                if op == "do":
+                    from .. import group_features as _gf
+
+                    if not _gf.enabled(svc.store, gid, "idea", svc.get_settings()):
+                        return _err(409, "本群的「构想」功能已关闭（群管理页可重新开启）")
+                    if not _gf.enabled(svc.store, gid, "task", svc.get_settings()):
+                        return _err(409, "本群的「任务」功能已关闭（群管理页可重新开启）")
                 personal_deny = _personal_deny(ident, "ideas", item_id)
                 if personal_deny is not None:
                     return personal_deny
@@ -4119,15 +4193,35 @@ class ConsoleServer:
             if forbid is not None:
                 return forbid
             status = str(row.get("status") or "")
+            if op in ("resume", "retry"):
+                from .. import group_features
+
+                if not group_features.enabled(svc.store, row.get("group_id"), "task", svc.get_settings()):
+                    return _err(409, "本群的任务功能已关闭，请先重新开启")
             redeliver_warning = ""
             try:
                 if op == "pause":
                     svc.tasks.transition(tid, "paused", reason="网页暂停")
                 elif op == "resume":
-                    if status not in ("paused", "shelved"):
+                    # 「功能关闭搁置」的 queued 任务：管理员手动恢复（清标记，不直接派工，
+                    # 后台循环到点捞起）。别的 queued 不用恢复；paused/shelved 走正常恢复。
+                    if status == "queued":
+                        try:
+                            import json as _json
+
+                            pr = _json.loads(row.get("paused_reason") or "{}")
+                        except Exception:
+                            pr = {}
+                        if isinstance(pr, dict) and pr.get("kind") == "feature_off":
+                            by = "网页管理员" if ident.role == "admin" else "群管理员（网页）"
+                            svc.tasks.resume_feature_off(tid, by=by)
+                        else:
+                            return _err(409, "任务现在是「排队中」，不用恢复")
+                    elif status in ("paused", "shelved"):
+                        svc.tasks.transition(tid, "queued", reason="网页恢复")
+                        # 恢复不立刻 spawn：后台循环到点会把 queued 捞起来（同一任务不并发）
+                    else:
                         return _err(409, f"任务现在是「{status}」，不用恢复")
-                    svc.tasks.transition(tid, "queued", reason="网页恢复")
-                    # 恢复不立刻 spawn：后台循环到点会把 queued 捞起来（同一任务不并发）
                 elif op == "cancel":
                     svc.tasks.transition(tid, "cancelled", reason="网页取消")
                     _stop_running_task(svc, tid)
@@ -4225,6 +4319,66 @@ class ConsoleServer:
                 f"/api/goals/{{id}}/criteria/{{idx}}/{_op}",
                 self._write(lambda req, op=_op: _goal_op(req, op)),
             )
+
+        async def _goal_chat_target(request: web.Request):
+            # 管理员对话具备全局工具权限，群管理凭据不能提升成全局管理员。
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return None, None, None, forbid
+            goal = svc.goals.get(request.match_info["id"])
+            if goal is None or not svc.get_settings().is_served(str(goal.get("group_id") or "")):
+                return None, None, None, _err(404, "找不到这个目标")
+            mod = getattr(svc, "admin_chat", None)
+            if mod is None:
+                return None, None, None, _err(503, "管理员对话还没就位")
+            cid = svc.goals.get_admin_chat(goal["id"])
+            detail = None
+            if cid is not None:
+                try:
+                    detail = await _call(mod.detail, cid)
+                except (KeyError, ValueError):
+                    return None, None, None, _err(409, "目标绑定的对话已不可用")
+                chat = detail.get("chat") if isinstance(detail, dict) else None
+                if not isinstance(chat, dict) or str(chat.get("group_id") or "") != str(goal["group_id"]):
+                    return None, None, None, _err(409, "目标和对话的群不一致")
+            return goal, mod, detail, None
+
+        @get("/api/goals/{id}/chat")
+        async def _goal_chat_history(request: web.Request) -> web.Response:
+            goal, mod, detail, error = await _goal_chat_target(request)
+            if error is not None:
+                return error
+            if detail is None:
+                return _chat_json({"chat": None, "messages": [], "pending": [], "running": False})
+            cid = svc.goals.get_admin_chat(goal["id"])
+            return _chat_json({**detail, "running": _running_of(mod, cid, detail.get("running"))})
+
+        @post("/api/goals/{id}/chat")
+        async def _goal_chat(request: web.Request) -> web.Response:
+            goal, mod, detail, error = await _goal_chat_target(request)
+            if error is not None:
+                return error
+            body = await _json_body(request)
+            if body is None:
+                return _err(400, "请求体不是 JSON")
+            text = str(body.get("text") or "").strip()
+            if not text:
+                return _err(400, "要说点什么")
+            try:
+                cid = svc.goals.get_admin_chat(goal["id"])
+                if cid is None:
+                    chat = await _call(mod.create, group_id=str(goal["group_id"]))
+                    cid = int(chat["id"])
+                    svc.goals.set_admin_chat(goal["id"], cid)
+                mid = await _call(mod.send, cid, text)
+                return web.json_response({"accepted": True, "user_message_id": int(mid)}, status=202)
+            except ValueError:
+                return _err(409, "上一句还在处理，或消息太长，请稍后再试")
+            except KeyError:
+                return _err(404, "找不到这个对话")
+            except Exception:
+                logger.exception("目标对话发消息失败（目标 %s）", goal["id"])
+                return _err(500, "发消息失败，请稍后重试")
 
         # ---------- 交接包（docs/24）：构想 / 任务 → 一份能贴给自己个人 agent 的 Markdown ----------
         #

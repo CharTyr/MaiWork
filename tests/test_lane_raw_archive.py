@@ -165,8 +165,8 @@ class TestRawMerge:
 
 
 class TestMigration:
-    def test_latest_version_is_41(self) -> None:
-        assert LATEST == 41, "库号只因原始历史归档 / 构想 kind / goal fit / chat_log 去重账本 / 待判请求状态各加一步"
+    def test_latest_version_is_43(self) -> None:
+        assert LATEST == 43, "库号只因原始历史归档 / 构想 kind / goal fit / chat_log 去重账本 / 待判请求状态 / 目标提醒各加一步，另保留技能兼容占位"
         assert _MIGRATIONS[36].__name__ == "_m_task_lane_raw"
         assert _MIGRATIONS[37].__name__ == "_m_idea_kind"
 

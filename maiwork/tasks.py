@@ -79,7 +79,7 @@ def _load_json(s: Any, default: Any) -> Any:
 # 手动暂停（网页 / /mw 点「暂停」）没有原因：paused_reason 为空，视图不编造
 # 「时长 0」这类假原因。
 # ---------------------------------------------------------------------------
-_PAUSED_KINDS = frozenset({"tokens", "time", "tokens_unknown", "capability"})
+_PAUSED_KINDS = frozenset({"tokens", "time", "tokens_unknown", "capability", "feature_off"})
 _PAUSED_TEXT_MAX = 400   # 中文一句话的硬上限（能力闸原因本来就写成大白话，超长一律截断）
 _PAUSED_JOBS_MAX = 8     # 最多记 8 条出问题的活（只用来指路，不记 job 详情）
 _SECRET_IN_TEXT = re.compile(
@@ -138,6 +138,9 @@ def _clean_paused_reason(value: Any) -> dict | None:
             # 没上限 / 负数的「暂停原因」是脏数据：宁可不显示，也不编一个 0 时长
             return None
         return {"kind": kind, "limit": limit, "used": used}
+    if kind == "feature_off":
+        # 功能关闭搁置：没有额外字段，一句固定话由视图给出（paused_reason_text）
+        return {"kind": kind}
     text = _safe_paused_text(value.get("text") or value.get("reason") or "")
     if not text:
         return None
@@ -207,6 +210,8 @@ def paused_reason_text(reason: dict | None) -> str:
             f"自动暂停：暂时核不出这个任务用了多少用量（上限 {int(reason.get('limit') or 0)} token），"
             "先停下等你决定"
         )
+    if kind == "feature_off":
+        return "本群的任务功能关闭了，这条先搁置；重新开启后要管理员手动恢复"
     return ""
 
 
@@ -254,6 +259,10 @@ class Tasks:
         criteria_l = [str(c) for c in criteria]
         workspace = self._workspace_for(gid)
         with (self._store.tx() if conn is None else nullcontext(conn)) as conn:
+            from . import group_features
+
+            if not group_features.enabled(self._store, gid, "task", self._get_settings()):
+                raise ValueError("本群的任务功能已关闭，暂不接新任务")
             tid = next_id(conn, "T")
             conn.execute(
                 "INSERT INTO tasks (id, group_id, workspace, source, request_id, goal_id,"
@@ -400,6 +409,42 @@ class Tasks:
                 payload=payload or None,
             )
         return self.get(task_id)  # type: ignore[return-value]
+
+    def resume_feature_off(self, task_id: str, *, by: str = "") -> dict:
+        """管理员手动恢复一条「功能关闭搁置」的 queued 任务：清掉 feature_off 标记。
+
+        只动 status='queued' 且 paused_reason.kind='feature_off' 的任务；别的状态 / 别的原因
+        一律 ValueError（不让人拿它跳过正常的暂停 / 失败语义）。清掉后后台循环会照常捞起。
+        """
+        tid = str(task_id)
+        now = clock.now()
+        with self._store.tx() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+            if row is None:
+                raise KeyError(f"任务不存在: {task_id}")
+            from . import group_features
+
+            if not group_features.enabled(self._store, str(row["group_id"]), "task", self._get_settings()):
+                raise ValueError("本群的任务功能已关闭，请先重新开启再恢复")
+            if str(row["status"]) != "queued":
+                raise ValueError(f"任务 {tid} 现在是「{row['status']}」，不用恢复")
+            kind = ""
+            try:
+                data = _load_json(row["paused_reason"], None)
+                kind = str(data.get("kind") or "") if isinstance(data, dict) else ""
+            except Exception:
+                kind = ""
+            if kind != "feature_off":
+                raise ValueError("这条任务不是「功能关闭搁置」，不用这样恢复")
+            conn.execute(
+                "UPDATE tasks SET paused_reason='', updated=? WHERE id=?",
+                (now, tid),
+            )
+            self._store.event(
+                conn, "task.resumed", group_id=str(row["group_id"]), entity="task", entity_id=tid,
+                payload={"by": str(by or ""), "from": "feature_off"},
+            )
+        return self.get(tid)  # type: ignore[return-value]
 
     def interrupt_orphaned(self, *, reason: str = "插件重启中断，保留已有产物；核对后手动继续") -> int:
         """停机或冷启动时，把失去执行协程的任务暂停，不盲目重跑有副作用的操作。

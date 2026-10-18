@@ -35,6 +35,7 @@ import sqlite3
 from typing import Any, Callable, Iterable
 
 from . import clock, members
+from . import group_features
 from .goals import Goals
 from .group_approval import GroupApprovals
 from .store import Store, next_id
@@ -279,9 +280,11 @@ class Approvals:
         source: str = "",
         force_manual: bool = False,
         screen: bool = False,
+        started_at: float | None = None,
     ) -> dict:
         """记一条待批请求。
 
+        - `started_at`：异步接单开始的时间；途中关过任务就拒绝迟到落地，重新开启也不自动接。
         - `screen=True`（群友 @ / 主模型读群发现的请求用）：本群近 60 天被拒过 ≥3 条「像」的
           → 不建请求，返回 `{"id": "", "status": "screened", "auto": None}` 并记 `request.screened` 事件；
         - `items`：从构想转来的请求里，群友点名要做的项目序号（None / [] = 全部项目）；
@@ -296,6 +299,7 @@ class Approvals:
         if kind_s not in _KINDS:
             raise ValueError(f"不认识的请求类型「{kind}」（只能是 task / goal）")
         gid = _norm(group_id)
+        self._feature_gate(gid, started_at=started_at)
         mid = _norm(message_id)
         now = clock.now()
         # 同一条来源消息只建一条请求（快路径 / 读群发现 / 恢复重试都可能撞上）：返回已有的那条
@@ -318,6 +322,7 @@ class Approvals:
                     logger.debug("记 request.screened 事件失败（群 %s）", gid, exc_info=True)
                 return {"id": "", "status": "screened", "auto": None}
         with self._store.tx() as conn:
+            self._feature_gate(gid, started_at=started_at)
             # 事务里再查一次：查和建之间不能插进同一条消息的另一条请求
             existing = self._by_source_message(conn, gid, mid)
             if existing is not None:
@@ -408,6 +413,24 @@ class Approvals:
         except Exception:
             logger.debug("自动审核回调出错（请求 %s），这条留给人批", request_id, exc_info=True)
 
+    def _feature_gate(self, gid: str, *, started_at: float | None = None) -> None:
+        """Check before and inside creation/approval transactions; errors stop new work."""
+        try:
+            settings = self._get_settings()
+            if settings is None or not settings.is_served(gid):
+                raise ValueError("这个群不在服务列表里，不能接新活")
+            cfg = group_features.get(self._store, gid, settings)
+            if not cfg["task"]:
+                raise ValueError("本群的「任务」功能已关闭，这条活现在不能批准（群管理页可重新开启）")
+            cutoff = cfg.get("last_disabled_ts", {}).get("task")
+            if started_at is not None and cutoff is not None and float(started_at) <= float(cutoff):
+                raise ValueError("这条待判请求经过了任务关闭，需要手动重新提交")
+        except ValueError:
+            raise
+        except Exception as exc:
+            logger.warning("接新活前查功能开关失败（群 %s），本次不接", gid, exc_info=True)
+            raise ValueError("暂时读不到本群的任务功能开关，请稍后再试") from exc
+
     def approve(
         self, request_id: str, *, by: str, auto_reason: str = "",
         auto_daily: tuple[str, int] | None = None,
@@ -426,6 +449,8 @@ class Approvals:
                 raise KeyError(f"请求不存在: {request_id}")
             if str(row["status"]) != "pending":
                 raise ValueError(f"请求 {rid} 已经在「{row['status']}」状态，不能再批准")
+            # 功能开关闸：任务关闭的群不落地任何活（在事务里、改状态之前拦）
+            self._feature_gate(str(row["group_id"]))
             quota: tuple[str, str, int] | None = None
             if auto_daily is not None:
                 day, cap = auto_daily
@@ -507,6 +532,7 @@ class Approvals:
         request_id = str(row["id"])
         kind = str(row["kind"])
         gid = str(row["group_id"])
+        self._feature_gate(gid)
         requester_name = str(row["requester_name"])
         # 展示文字（by_text）用名册里的当前名；任务 / 目标行里仍存快照（视图再按 id 查当前名）
         by_text = f"{_who(conn, gid, _row_get(row, 'requester_id'), requester_name)} 发起 · {'自动批准' if auto else f'{by} 批准'}"

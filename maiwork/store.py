@@ -1164,8 +1164,32 @@ def _m_pending_ask_state(conn: sqlite3.Connection) -> None:
     )
 
 
+# 目标卡住通知 + 管理员对话绑定（2026-10 需求）
+_GOAL_STALE_COLUMNS = (
+    ("stale_notified_ts", "REAL"),  # 上次通知时间（每天只发一次）
+    ("admin_chat_id", "INTEGER"),   # 绑定的管理员对话 ID
+)
+
+
+def _m_goal_stale_notify(conn: sqlite3.Connection) -> None:
+    """goals 表加卡住通知和管理员对话绑定字段。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(goals)")}
+    if not cols:
+        return
+    for name, ddl in _GOAL_STALE_COLUMNS:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE goals ADD COLUMN {name} {ddl}")
+
+
+# 保留本地开发版已使用的第 43 步编号；任务经验复用 agent_skills，
+# 不再创建第二份技能库。已存在的旧 skills 表原样保留，不删除用户数据。
+def _m_skills(conn: sqlite3.Connection) -> None:
+    """兼容曾升级到第 43 步的本地数据库，无需新增表。"""
+    pass
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids, _m_pending_ask_state]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids, _m_pending_ask_state, _m_goal_stale_notify, _m_skills]
 
 
 class Store:

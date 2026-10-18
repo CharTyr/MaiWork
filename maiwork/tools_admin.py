@@ -50,6 +50,7 @@ _ROLES = frozenset({ROLE})
 # 要管理员确认才动手的工具名（测试 TestConfirmGate 逐个点名）
 CONFIRM_TOOLS = frozenset(
     {
+        "goal_adjust",  # 暂停 / 恢复 / 取消统一使用注册名开确认票
         "send_group_message",
         "group_notice_send",
         "group_file_manage",
@@ -496,6 +497,25 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
 
     def _profiles() -> Any:
         return getattr(svc, "profiles", None)
+
+    def _feature_deny(gid: str, module: str) -> ToolResult | None:
+        """这个群的这个模块关了 → 中文错误；开着 / 查不到 → None（不挡）。
+
+        任务关闭连带停目标（用户已确认），所以 create_goal 也走 task 开关。
+        """
+        try:
+            from . import group_features
+
+            store = getattr(svc, "store", None)
+            if store is None:
+                return None
+            settings = _settings()
+            if not group_features.enabled(store, gid, module, settings):
+                zh = {"news": "资讯", "idea": "构想", "task": "任务"}.get(module, module)
+                return _bad(f"本群的「{zh}」功能已关闭（群管理页可重新开启）")
+        except Exception:
+            logger.debug("管理员工具查功能开关失败（群 %s %s）", gid, module, exc_info=True)
+        return None
 
     def _feeds() -> Any:
         return getattr(svc, "feeds", None)
@@ -2024,6 +2044,9 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         gid, err = _served(args.get("group_id") or ctx.group_id)
         if err is not None:
             return err
+        deny = _feature_deny(gid, "task")
+        if deny is not None:
+            return deny
         title = str(args.get("title") or "").strip()
         req = str(args.get("request") or args.get("req") or "").strip()
         if not title:
@@ -2068,6 +2091,10 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         gid, err = _served(args.get("group_id") or ctx.group_id)
         if err is not None:
             return err
+        # 任务关闭连带停目标（用户已确认）：立目标也走 task 开关
+        deny = _feature_deny(gid, "task")
+        if deny is not None:
+            return deny
         title = str(args.get("title") or "").strip()
         if not title:
             return _bad("要给 title")
@@ -2117,6 +2144,9 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         gid, err = _served(str(row["group_id"]))
         if err is not None:
             return err
+        deny = _feature_deny(gid, "task")
+        if deny is not None:
+            return deny
         # 群友派的活要 **bot 管理员**批准（红线）；模型可能被群内容注入，
         # 绝不能一句话就替管理员把活批了——先写小票，管理员在网页点同意才算数
         pending = _need_confirm("approve_request", args, f"批准请求 {rid}（{_tail(row['title'], 60)}，群 {gid}）")
@@ -2188,6 +2218,58 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             except Exception:
                 logger.exception("停任务 %s 的后台协程出错", tid)
         return _ok(f"已取消任务 {tid}：{reason}", data={"task_id": tid, "status": "cancelled"})
+
+    async def goal_adjust(ctx: ToolContext, args: dict) -> ToolResult:
+        """调整目标：改标准、暂停/恢复/取消、改检查频率。"""
+        goal_id = str(args.get("goal_id") or "").strip()
+        if not goal_id:
+            return _bad("要给 goal_id")
+        goal = svc.goals.get(goal_id)
+        if goal is None:
+            return _bad(f"没有目标 {goal_id}")
+        gid, err = _served(str(goal.get("group_id") or ""))
+        if err is not None:
+            return err
+
+        action = str(args.get("action") or "").strip()
+        if not action:
+            return _bad("要给 action：add_criterion / remove_criterion / edit_criterion / pause / resume / cancel / set_interval / set_url / set_guidance")
+
+        # 暂停/恢复/取消 要确认（危险操作）
+        if action in ("pause", "resume", "cancel"):
+            pending = _need_confirm(
+                "goal_adjust",
+                args,
+                f"对目标 {goal_id}「{goal['title']}」执行 {action}",
+            )
+            if pending is not None:
+                return pending
+
+        try:
+            if action == "pause":
+                svc.goals._set_state(goal_id, "paused")
+                return _ok(f"已暂停目标 {goal_id}", data={"goal_id": goal_id, "state": "paused"})
+            elif action == "resume":
+                svc.goals._set_state(goal_id, "active")
+                return _ok(f"已恢复目标 {goal_id}", data={"goal_id": goal_id, "state": "active"})
+            elif action == "cancel":
+                svc.goals._set_state(goal_id, "cancelled")
+                return _ok(f"已取消目标 {goal_id}", data={"goal_id": goal_id, "state": "cancelled"})
+            elif action == "set_interval":
+                hours = svc.goals.set_check_interval(goal_id, args.get("hours"))
+                return _ok(f"已把目标 {goal_id} 的检查间隔改成 {hours:g} 小时", data={"goal_id": goal_id, "hours": hours})
+            elif action in ("set_url", "set_guidance"):
+                field = "url" if action == "set_url" else "guidance"
+                context = svc.goals.set_context(goal_id, field, args.get(field, args.get("text", "")))
+                return _ok(f"已更新目标 {goal_id} 的{'来源网址' if field == 'url' else '补充指导'}", data={"goal_id": goal_id, "context": context})
+            elif action in ("add_criterion", "remove_criterion", "edit_criterion"):
+                op = action.removesuffix("_criterion")
+                svc.goals.adjust_criterion(goal_id, op, index=args.get("index"), text=args.get("text", ""))
+                return _ok(f"已更新目标 {goal_id} 的完成标准", data={"goal_id": goal_id})
+            else:
+                return _bad(f"不认识的 action「{action}」")
+        except Exception as e:
+            return _bad(f"调整目标失败：{e}")
 
     # ------------------------------------------------------------------
     # 注册清单（name / description / parameters 给模型看；handler 是上面的函数）
@@ -2773,6 +2855,26 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                 },
             },
             cancel_task,
+        ),
+        (
+            {
+                "name": "goal_adjust",
+                "description": "调整目标：改标准、暂停/恢复/取消、改检查频率。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "goal_id": {"type": "string", "description": "目标编号"},
+                        "action": {"type": "string", "description": "操作：add_criterion / remove_criterion / edit_criterion / pause / resume / cancel / set_interval / set_url / set_guidance"},
+                        "index": {"type": "integer", "description": "标准序号（改标准时用，从 0 开始）"},
+                        "text": {"type": "string", "description": "标准内容（改标准时用）"},
+                        "hours": {"type": "number", "minimum": 1, "maximum": 72, "description": "检查间隔小时数（set_interval，1–72）"},
+                        "url": {"type": "string", "maxLength": 2048, "description": "来源网址（set_url，空串清除）"},
+                        "guidance": {"type": "string", "maxLength": 4000, "description": "补充指导（set_guidance，空串清除）"},
+                    },
+                    "required": ["goal_id", "action"],
+                },
+            },
+            goal_adjust,
         ),
     ]
 

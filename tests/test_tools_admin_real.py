@@ -51,7 +51,7 @@ ALL_ADMIN_TOOLS = {
     # 现在动手（后台类）
     "run_news_now", "make_idea_now", "refresh_profile",
     # 任务 / 目标 / 请求
-    "create_task", "create_goal", "approve_request", "reject_request", "cancel_task",
+    "create_task", "create_goal", "goal_adjust", "approve_request", "reject_request", "cancel_task",
 }
 
 NOW = time.time()
@@ -709,6 +709,25 @@ class TestTaskGoalRequestTools:
             "SELECT id, kind, state, title FROM goals WHERE kind='agent' AND title='盯着服务器状态'"
         ).fetchone()
         assert row is not None and row["state"] == "active"
+
+    @pytest.mark.asyncio
+    async def test_goal_adjust_preserves_evidence_and_confirms_pause(self, app) -> None:
+        goal_id = app._seeded["goal_id"]
+        app.goals.set_criterion(goal_id, 0, True, evidence="管理员已核实的原始证据")
+        before = json.loads(app.goals.get(goal_id)["criteria"])
+        result = await _call(app, "goal_adjust", {
+            "goal_id": goal_id, "action": "add_criterion", "text": "新增验收标准",
+        })
+        assert result.ok, result.error
+        assert json.loads(app.goals.get(goal_id)["criteria"]) == [
+            *before, {"text": "新增验收标准", "done": False},
+        ]
+        result, ticket = await _call_confirmed(app, "goal_adjust", {
+            "goal_id": goal_id, "action": "pause",
+        })
+        assert result.ok, result.error
+        assert ticket["tool"] == "goal_adjust" and goal_id in ticket["summary"]
+        assert app.goals.get(goal_id)["state"] == "paused"
 
     @pytest.mark.asyncio
     async def test_create_goal_ticket_only_before_approve(self, app) -> None:

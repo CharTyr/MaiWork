@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import clock, members
+from . import group_features
 from .config import Settings, load_settings
 from .environments import vm_platforms
 from .tasks import ANSWER_HINT
@@ -29,6 +30,32 @@ from .models import Models
 from .store import Store
 
 logger = logging.getLogger("maiwork.app")
+
+
+def _feature_on(app: Any, gid: Any, module: str) -> bool:
+    """这个群的这个模块开着吗（模块级，SimpleNamespace 测试替身也能用）。
+
+    读不出或缺 store 时暂停新增工作；绝不在这里炸掉后台循环。
+    """
+    store = getattr(app, "store", None)
+    if store is None:
+        return False
+    try:
+        return group_features.enabled(store, str(gid), module, getattr(app, "_settings", None))
+    except Exception:
+        logger.debug("查功能开关失败（群 %s %s），暂停新增工作", gid, module, exc_info=True)
+        return False
+
+
+def _feature_disabled_since(app: Any, gid: Any, module: str) -> float | None:
+    """这个模块最近一次被关闭的时刻；开着 / 读不出 → None。"""
+    store = getattr(app, "store", None)
+    if store is None:
+        return None
+    try:
+        return group_features.disabled_since(store, str(gid), module, getattr(app, "_settings", None))
+    except Exception:
+        return None
 
 # 群链接码字符集：去掉容易看混的 0/O、1/l/I
 _TOKEN_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
@@ -1551,6 +1578,22 @@ class MaiWorkApp:
         agent = view.get("agent", []) if isinstance(view, dict) else []
         return sum(1 for g in agent if isinstance(g, dict) and g.get("stale"))
 
+    def _get_group_approvers(self, group_id: str) -> list[str]:
+        """读这个群的批准人名单（受阻通知 @ 用）。
+
+        来源：group_approval.py 的 kv["group_approval.<群号>"].approvers。
+        读不到 / 没配 → 空列表（不发通知）。
+        """
+        if self.store is None:
+            return []
+        try:
+            from .group_approval import GroupApprovals
+            gv = GroupApprovals(self.store, get_settings=self.get_settings)
+            return list(gv.get(str(group_id)).approvers)
+        except Exception:
+            logger.exception("读群 %s 批准人名单出错", group_id)
+            return []
+
     def reset_group_token(self, group_id: str) -> str:
         """重置群链接码；旧链接即刻失效。返回新 token（群行不存在返回 ""）。"""
         if self.store is None:
@@ -2132,7 +2175,7 @@ class MaiWorkApp:
         if cls is None:
             return None
         try:
-            return cls(
+            coord = cls(
                 self.store, self.models, self.workers, self.tools, self.tasks,
                 self.goals, self.delivery, self.outbox, self.env, self.profiles,
                 self.get_settings, host=self.host, railway=self.railway,
@@ -2142,6 +2185,18 @@ class MaiWorkApp:
                 # goals-fit R4（2026-10-11）：目标平时进展只进网页 + 可提起清单，不发群。
                 mentions=getattr(self, "mentions", None),
             )
+            # 注入 skill_summary（2026-10 需求：任务完成 → 总结为 skill）
+            try:
+                from .skill_summary import SkillSummary
+                coord._skill_summary = SkillSummary(
+                    self.store, self.workers, agents=self.agents,
+                    data_dir=self.get_settings().data_dir,
+                    get_known_secrets=self.known_secrets,
+                )
+            except Exception:
+                logger.exception("建 SkillSummary 出错，任务总结 skill 这次不可用")
+                coord._skill_summary = None
+            return coord
         except TypeError:
             # 老的 / 测试替身 Coordinator 不认 vms / ssh 参数：不带它再建一次
             try:
@@ -2195,6 +2250,8 @@ class MaiWorkApp:
             on_spark=(self.feeds.note_spark if self.feeds is not None else None),
             # 待判 @ 的持久记录：和画像提炼 / 独立重试共用同一份（同一套终态和去重）
             pending_asks=getattr(self.profiles, "pending_asks", None),
+            # 按群功能开关：任务 / 构想关闭时不派活、不恢复等回答的任务
+            feature_on=self._feature_on,
         )
         # 派活判断兜底（quick_judge）：intake 自己建的；停机时要单独收（见 _stop_stack）
         self.quick_judge = getattr(intake, "quick_judge", None)
@@ -2463,6 +2520,50 @@ class MaiWorkApp:
             return bool(self.models is not None and self.models.settings().ready())
         except Exception:
             return False
+
+    # ------------------------------------------------------------------
+    # 按群功能开关（group_features）：news / idea / task 三个模块的启停闸
+    # ------------------------------------------------------------------
+
+    _FEATURE_ZH = {"news": "资讯", "idea": "构想", "task": "任务"}
+
+    def _feature_on(self, gid: Any, module: str) -> bool:
+        return _feature_on(self, gid, module)
+
+    def _feature_deny_reason(self, module: str) -> str:
+        return f"本群的「{self._FEATURE_ZH.get(str(module), module)}」功能已关闭（群管理页可重新开启）"
+
+    def _feature_disabled_since(self, gid: Any, module: str) -> float | None:
+        return _feature_disabled_since(self, gid, module)
+
+    @staticmethod
+    def _paused_kind_of(raw: Any) -> str:
+        """从 tasks 行的 paused_reason（JSON 串）剥出 kind；坏值 / 空 → ""。"""
+        if not raw:
+            return ""
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+        except (ValueError, TypeError):
+            return ""
+        return str(data.get("kind") or "") if isinstance(data, dict) else ""
+
+    def _mark_feature_off(self, task_id: str, raw_paused_reason: Any) -> None:
+        """把一条 queued 任务标成「功能关闭搁置」（queued + paused_reason.kind=feature_off）。
+
+        只标还没标过的；标过的（重复巡检）不重复写。标失败只记日志，不改任务状态。
+        """
+        if self._paused_kind_of(raw_paused_reason) == "feature_off":
+            return
+        if self.store is None:
+            return
+        try:
+            with self.store.tx() as conn:
+                conn.execute(
+                    "UPDATE tasks SET paused_reason=? WHERE id=? AND status='queued'",
+                    (json.dumps({"kind": "feature_off"}, ensure_ascii=False), str(task_id)),
+                )
+        except Exception:
+            logger.exception("标记功能关闭搁置出错（任务 %s）", task_id)
 
     def _bot_qq_now(self) -> str:
         """intake 拿机器人 QQ：优先 Host 预热缓存，没有就现问一次（失败返回 ""）。"""
@@ -3072,6 +3173,10 @@ class MaiWorkApp:
                 # 非服务群：零调用、零发送（回收逻辑已标 cancelled，这里再兜底）
                 if settings is not None and not settings.is_served(gid):
                     continue
+                # 功能开关：任务关闭时目标检查 / 提醒 / 目标派生任务一并暂停（用户已确认），
+                # 不推进检查点、不发送；重开后按下次到点时间自然恢复。
+                if gid and not _feature_on(self, gid, "task"):
+                    continue
                 if etype == "check":
                     # 先推进检查点，再开工；coordinator 没就位就等它有就位的那轮。
                     # 模型没配好：跳过（不推进、不报错），下次巡检自然再轮到这个检查点。
@@ -3122,6 +3227,22 @@ class MaiWorkApp:
         # 模型没配好的标「暂停检查」，不算卡住
         try:
             goals.refresh_stale(now, models_ready=self._models_ready())
+            # 持续受阻和三连错也每天重试通知，不只枚举本轮变化项。
+            for stale_goal in goals.active_stale():
+                if settings is not None and not settings.is_served(str(stale_goal["group_id"])):
+                    continue
+                # 任务关闭期间不报目标失联（关闭是有意为之，不是卡住）
+                if not _feature_on(self, str(stale_goal["group_id"]), "task"):
+                    continue
+                goal_id = str(stale_goal["id"])
+                try:
+                    goals.notify_stale_if_needed(
+                        goal_id, now,
+                        outbox=self.outbox,
+                        get_admins=self._get_group_approvers,
+                    )
+                except Exception:
+                    logger.exception("目标 %s 受阻通知出错", goal_id)
         except Exception:
             logger.exception("目标卡住巡视出错")
 
@@ -3129,7 +3250,7 @@ class MaiWorkApp:
         if self.store is None or self._settings is None:
             return
         rows = self.store.read().execute(
-            "SELECT id, group_id, status, title, question, question_ts FROM tasks"
+            "SELECT id, group_id, status, title, question, question_ts, paused_reason FROM tasks"
             " WHERE status IN ('queued', 'waiting_input')"
         ).fetchall()
         models_ready = self._models_ready()
@@ -3138,17 +3259,32 @@ class MaiWorkApp:
             if not served(str(row["group_id"])):
                 continue  # 非服务群：零派工（回收逻辑已标 cancelled，这里再兜底）
             tid = str(row["id"])
+            gid = str(row["group_id"])
             status = str(row["status"])
+            feature_on = _feature_on(self, gid, "task")
             if status == "queued":
+                # 功能关闭：不派工，并把这条标成「功能关闭搁置」（queued 保留 paused_reason，
+                # 重开后不自动捞起，要管理员在网页上点「恢复」）；已标的在关闭期间不重复写。
+                if not feature_on:
+                    self._mark_feature_off(tid, row["paused_reason"])
+                    continue
+                # 重开了：只有管理员手动恢复（转 queued 时清掉原因）的才到得了这里；
+                # 还带着 feature_off 标记的一律不自动派工。
+                if self._paused_kind_of(row["paused_reason"]) == "feature_off":
+                    continue
                 # 模型没配好不派工：任务保持排队（不报错、不开尝试，02 §12.1）
                 if models_ready:
                     self.spawn_run_task(tid)
                 continue
             # waiting_input：超 6 小时提醒一次、超 24 小时 → shelved
+            # 功能关闭时不提醒不搁置；关闭期间的等待时长不计入（从重开时刻重算）。
+            if not feature_on:
+                continue
             qts = float(row["question_ts"] or 0.0)
             if qts <= 0.0:
                 continue
-            age = now - qts
+            anchor = group_features.get(self.store, gid, self._settings)["enabled_since"].get("task", 0.0)
+            age = now - max(qts, anchor)
             if age >= 24 * 3600:
                 try:
                     if self.tasks is not None:
@@ -3304,11 +3440,18 @@ class MaiWorkApp:
             if job == "news":
                 if self.feeds is None:
                     continue
+                # 功能开关：资讯关闭时跳过本轮，不记 scheduler.done（重开后按后续时段走，
+                # 不补跑关闭期间的批次）
+                if not self._feature_on(gid, "news"):
+                    continue
                 if (gid, "news_manual") in self._running_jobs:
                     continue  # 手动的那批还在跑，这次先不开（下一轮再看）
                 self._spawn_long_job(gid, "news", self.feeds.prepare_news)
             elif job == "idea":
                 if self.feeds is None:
+                    continue
+                # 功能开关：构想关闭时跳过本轮，不记 scheduler.done
+                if not self._feature_on(gid, "idea"):
                     continue
                 if (gid, "idea_manual") in self._running_jobs:
                     continue  # 手动点的那个还在跑，这次先不开（下一轮再看）
@@ -3317,7 +3460,7 @@ class MaiWorkApp:
                 self._spawn_long_job(gid, "idea", self.feeds.make_idea)
         # 话头火花（docs/18 §十一）：群里刚有人明显在为难 / 想要，不等排程点也顺口出一次。
         # 到点排程之外的一条路，条件都过了才认领（清火花 + 记「今天出过」）。
-        if self.feeds is not None and self._spark_idea_due(gid, now):
+        if self.feeds is not None and self._feature_on(gid, "idea") and self._spark_idea_due(gid, now):
             take = getattr(self.feeds, "spark_taken", None)
             if callable(take):
                 try:
@@ -3387,6 +3530,8 @@ class MaiWorkApp:
             agents=self.agents,
             transport=rss_transport,
             search=getattr(self, "search", None),
+            # 资讯关闭：跳过自动订阅 / 退订 / 来源发现（资讯专属），其余共享分支照跑
+            news_enabled=self._feature_on(gid, "news"),
         )
         if out.get("mentions") or out.get("taste") or out.get("lessons") or out.get("auto"):
             logger.info("反馈 / 口味 / 做事经验 / 自动订阅（群 %s）：%s", gid, out)
@@ -3398,7 +3543,7 @@ class MaiWorkApp:
         后台长活（同群同种同时只跑一个），不卡主循环。
         """
         cp = self.card_push
-        if cp is not None:
+        if cp is not None and self._feature_on(gid, "news"):  # 资讯关闭：不画卡不推卡
             # 画卡前要给卡片条目补图解（news_viz.ensure_for_items）；NewsViz 比 CardPush
             # 晚一步建，所以每轮补接一次（attach_viz 幂等）。
             if self.news_viz is not None:
@@ -3407,7 +3552,7 @@ class MaiWorkApp:
             if cp.has_due(gid, now):
                 self._spawn_long_job(gid, "newscard", cp.flush)
         im = self.idea_mention
-        if im is not None:
+        if im is not None and self._feature_on(gid, "idea"):  # 构想关闭：不提一嘴
             im.scan(gid, now)
             if im.has_due(gid, now) and self._models_ready():
                 self._spawn_long_job(gid, "ideamention", im.flush)
@@ -3422,6 +3567,8 @@ class MaiWorkApp:
         """
         nv = self.news_viz
         if nv is None or (str(gid), "viz") in self._running_jobs:
+            return
+        if not self._feature_on(gid, "news"):  # 资讯关闭：不起图解
             return
         cp = self.card_push
         if cp is not None:
@@ -3502,6 +3649,8 @@ class MaiWorkApp:
         settings = self._settings
         if settings is None or self.feeds is None or not settings.is_served(gid):
             return {"started": False, "reason": "这个群现在备不了料（不是服务群，或资讯模块没开）"}
+        if not self._feature_on(gid, "news"):
+            return {"started": False, "reason": self._feature_deny_reason("news")}
         precheck = getattr(self.feeds, "news_precheck", None)
         if callable(precheck):
             try:
@@ -3668,6 +3817,8 @@ class MaiWorkApp:
         settings = self._settings
         if settings is None or self.feeds is None or not settings.is_served(gid):
             return {"started": False, "reason": "这个群现在出不了构想（不是服务群，或构想模块没开）"}
+        if not self._feature_on(gid, "idea"):
+            return {"started": False, "reason": self._feature_deny_reason("idea")}
         if not self._models_ready():
             return {"started": False, "reason": "模型还没配好"}
         if (gid, "idea") in self._running_jobs or (gid, "idea_manual") in self._running_jobs:

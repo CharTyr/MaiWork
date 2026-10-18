@@ -8,6 +8,7 @@ import { viewIdeas } from "./pages/ideas.js";
 import { viewTasks } from "./pages/tasks.js";
 import { viewGroup } from "./pages/group.js";
 import { detailHTML } from "./detail.js";
+import { preserveGoalChatInput } from "./goal-chat.js";
 import { settingsPage, settingsSide } from "./settings/index.js";
 import { chatPage, chatSide } from "./chat.js";
 import { hasUpdate, updateBanner } from "./update.js";
@@ -130,7 +131,9 @@ export function renderSide() {
     return;
   }
   if (state.detail) {
-    $("side").innerHTML = `<button class="side-close" data-act="side-close" aria-label="关闭">${SVG.close}</button>${detailHTML()}`;
+    preserveGoalChatInput(() => {
+      $("side").innerHTML = `<button class="side-close" data-act="side-close" aria-label="关闭">${SVG.close}</button>${detailHTML()}`;
+    });
     return;
   }
   const v = gview();

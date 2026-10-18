@@ -34,6 +34,10 @@ class _Approval:
 
 class _Settings:
     approval = _Approval()
+    groups = (GID, OTHER)
+
+    def is_served(self, group_id: str) -> bool:
+        return isinstance(group_id, str) and group_id in self.groups
 
     def workspace_of(self, group_id: str) -> str:
         return "ws-demo"

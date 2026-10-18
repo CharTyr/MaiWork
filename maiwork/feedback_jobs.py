@@ -81,6 +81,7 @@ async def run(
     agents: Any = None,
     transport: Any = None,
     search: Any = None,
+    news_enabled: bool = True,
 ) -> dict[str, Any]:
     gid = str(gid)
     _last[gid] = now
@@ -88,14 +89,16 @@ async def run(
     # 自动订阅 / 退订 + 来源地图 + 找来源搜索（docs/10 §九 第二步）：**放在「模型没配好就返回」之前**——
     # 自动退订和门槛订阅不需要模型，模型没配好也要照跑（模块内部自己节流、自己兜异常）。
     # search 是 feeds 那套搜索适配层，只给每周的「找来源」搜索用，不占资讯搜索名额。
-    try:
-        auto_out = await auto_sources.run(
-            store, models, gid, now, profiles=profiles, transport=transport, search=search
-        )
-        if any(auto_out.get(k) for k in ("subscribed", "unsubscribed", "map", "push")):
-            out["auto"] = auto_out
-    except Exception:
-        logger.exception("自动订阅这一轮出错（群 %s）", gid)
+    # 资讯功能关闭时跳过这一段（资讯专属）；接着聊 / 做事经验等共享分支不受影响。
+    if news_enabled:
+        try:
+            auto_out = await auto_sources.run(
+                store, models, gid, now, profiles=profiles, transport=transport, search=search
+            )
+            if any(auto_out.get(k) for k in ("subscribed", "unsubscribed", "map", "push")):
+                out["auto"] = auto_out
+        except Exception:
+            logger.exception("自动订阅这一轮出错（群 %s）", gid)
     if not _models_ready(models):
         return out
     try:

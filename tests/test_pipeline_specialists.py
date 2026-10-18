@@ -180,6 +180,12 @@ class _Goals:
     def fail(self, goal_id, err, now):
         self.events.append(("fail", str(goal_id)))
 
+    def context(self, goal_id):
+        return {}
+
+    def check_interval(self, goal_id):
+        return None
+
     def set_next_check(self, goal_id, ts):
         self.events.append(("next_check", str(goal_id)))
 

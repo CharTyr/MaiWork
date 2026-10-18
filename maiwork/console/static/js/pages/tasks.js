@@ -8,12 +8,13 @@ import { goalSections } from "./goals.js";
 
 export function taskRow(t, i) {
   const sel = state.detail && state.detail.id === t.id ? " selected" : "";
+  const held = t.status === "queued" && t.paused_reason && t.paused_reason.kind === "feature_off";
   return `
     <button class="row enter${sel}" style="--i:${i}" data-act="task" data-id="${esc(t.id)}">
       ${ico(t.icon || "package")}
       <span>
         <span class="row-title">${esc(t.title)}</span>
-        <span class="row-meta"><span class="dot ${DOT[t.status] !== undefined ? DOT[t.status] : t.status}"></span><span>${STATUS[t.status] || esc(t.status)}${t.meta ? ` · ${esc(t.meta)}` : ""}${t.auto_reason ? " · 自动批准" : ""}${t.undelivered ? ` · <b class="warn-t">已完成，尚未发送</b>` : ""}</span></span>
+        <span class="row-meta"><span class="dot ${DOT[t.status] !== undefined ? DOT[t.status] : t.status}"></span><span>${held ? "等待手动恢复" : STATUS[t.status] || esc(t.status)}${!held && t.meta ? ` · ${esc(t.meta)}` : ""}${t.auto_reason ? " · 自动批准" : ""}${t.undelivered ? ` · <b class="warn-t">已完成，尚未发送</b>` : ""}</span></span>
       </span>
       <span class="chev">${SVG.right}</span>
     </button>`;

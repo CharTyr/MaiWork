@@ -243,16 +243,20 @@ class TestKeepManual:
     @pytest.mark.asyncio
     async def test_non_served_group_never_calls_model(self, tmp_path) -> None:
         h = _setup(tmp_path, replies=[_OK], serve=(G1,))
-        r = h.create(group_id=G2)
-        assert await h.reviewer.review(r["id"]) is None
+        with pytest.raises(ValueError, match="服务列表"):
+            h.create(group_id=G2)
+        assert h.store.read().execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 0
         assert h.models.calls == []
+        assert h.started == []
 
     @pytest.mark.asyncio
     async def test_empty_group_never_calls_model(self, tmp_path) -> None:
         h = _setup(tmp_path, replies=[_OK], serve=(G1,))
-        r = h.create(group_id="")
-        assert await h.reviewer.review(r["id"]) is None
+        with pytest.raises(ValueError, match="服务列表"):
+            h.create(group_id="")
+        assert h.store.read().execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 0
         assert h.models.calls == []
+        assert h.started == []
 
     @pytest.mark.asyncio
     async def test_review_disabled_calls_nothing(self, tmp_path) -> None:

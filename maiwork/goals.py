@@ -17,7 +17,7 @@ import sqlite3
 from contextlib import nullcontext
 from typing import Any, Callable, Iterable
 
-from . import clock, members
+from . import clock, group_features, members
 from .store import Store, next_id
 
 _AGENT_NEXT_CHECK_S = 3600
@@ -432,6 +432,94 @@ class Goals:
             if cur.rowcount == 0:
                 raise KeyError(f"目标不存在: {goal_id}")
 
+    def set_check_interval(self, goal_id: str, hours: Any) -> float:
+        """保存管理员指定的检查周期（小时），同时安排下一次检查。"""
+        try:
+            value = float(hours)
+        except (TypeError, ValueError):
+            raise ValueError("检查间隔必须是 1–72 小时") from None
+        if isinstance(hours, bool) or not 1 <= value <= 72:
+            raise ValueError("检查间隔必须是 1–72 小时")
+        now = clock.now()
+        with self._store.tx() as conn:
+            cur = conn.execute(
+                "UPDATE goals SET next_check_ts=?, updated=? WHERE id=? AND kind='agent'",
+                (now + value * 3600, now, str(goal_id)),
+            )
+            if cur.rowcount == 0:
+                raise ValueError(f"没有 agent 目标 {goal_id}")
+            self._store.kv_set(conn, f"goal.check_interval.{goal_id}", value)
+            self._store.event(conn, "goal.interval_changed", entity="goal", entity_id=str(goal_id),
+                              payload={"hours": value})
+        return value
+
+    def check_interval(self, goal_id: str) -> float | None:
+        """有效的管理员周期优先于模型建议；旧数据 / 坏值按未设置处理。"""
+        raw = self._store.kv_get(f"goal.check_interval.{goal_id}")
+        if isinstance(raw, bool):
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if 1 <= value <= 72 else None
+
+    def context(self, goal_id: str) -> dict[str, str]:
+        """读取有界的目标补充信息；兼容缺失或损坏的旧 kv。"""
+        raw = self._store.kv_get(f"goal.context.{goal_id}", {})
+        if not isinstance(raw, dict):
+            return {}
+        return {key: raw[key][:limit] for key, limit in (("url", 2048), ("guidance", 4000))
+                if isinstance(raw.get(key), str)}
+
+    def set_context(self, goal_id: str, field: str, text: Any) -> dict[str, str]:
+        """只更新指定字段，不覆盖另一项；空字符串可以清除该项。"""
+        limits = {"url": 2048, "guidance": 4000}
+        if field not in limits or not isinstance(text, str):
+            raise ValueError("目标网址和补充指导必须是字符串")
+        text = text.strip()
+        if len(text) > limits[field]:
+            raise ValueError(f"{field} 不能超过 {limits[field]} 字")
+        with self._store.tx() as conn:
+            cur = conn.execute("UPDATE goals SET updated=? WHERE id=? AND kind='agent'",
+                               (clock.now(), str(goal_id)))
+            if cur.rowcount == 0:
+                raise ValueError(f"没有 agent 目标 {goal_id}")
+            data = self.context(goal_id)
+            data[field] = text
+            self._store.kv_set(conn, f"goal.context.{goal_id}", data)
+            self._store.event(conn, "goal.context_changed", entity="goal", entity_id=str(goal_id),
+                              payload={"field": field})
+        return data
+
+    def adjust_criterion(
+        self, goal_id: str, action: str, *, index: int | None = None, text: str = "",
+    ) -> list[dict]:
+        """单项增删改：未改条目保留全部证据，编辑条目重新等待验收。"""
+        if action not in {"add", "remove", "edit"}:
+            raise ValueError("不认识的标准操作")
+        if action != "remove" and (not isinstance(text, str) or not text.strip()):
+            raise ValueError("标准内容不能为空")
+        with self._store.tx() as conn:
+            row = conn.execute("SELECT criteria FROM goals WHERE id=? AND kind='agent'", (str(goal_id),)).fetchone()
+            if row is None:
+                raise ValueError(f"没有 agent 目标 {goal_id}")
+            crit = self._criteria(dict(row))
+            if action == "add":
+                crit.append({"text": text.strip(), "done": False})
+            else:
+                if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(crit):
+                    raise IndexError(f"标准序号越界（共 {len(crit)} 条，从 0 开始）")
+                if action == "remove":
+                    crit.pop(index)
+                else:
+                    crit[index] = {"text": text.strip(), "done": False}
+            conn.execute("UPDATE goals SET criteria=?, updated=? WHERE id=?",
+                         (json.dumps(crit, ensure_ascii=False), clock.now(), str(goal_id)))
+            self._store.event(conn, "goal.criteria_adjusted", entity="goal", entity_id=str(goal_id),
+                              payload={"action": action, "index": index})
+        return crit
+
     def set_criteria(self, goal_id: str, criteria: Iterable[str]) -> list[dict]:
         """整组换掉完成标准（只给「第一次检查补齐验收标准」用；空文字丢弃）。
 
@@ -526,20 +614,34 @@ class Goals:
         - 未超时 → 清掉巡视类原因；「连续 3 次检查出错：…」由 beat 清，巡视图省事不动。
         """
         rows = self._store.read().execute(
-            "SELECT id, created, heartbeat_ts, next_check_ts, stale_reason FROM goals"
+            "SELECT id, group_id, created, heartbeat_ts, next_check_ts, stale_reason FROM goals"
             " WHERE kind='agent' AND state='active'"
         ).fetchall()
         changed: list[str] = []
+        try:
+            settings = self._get_settings()
+        except Exception:
+            return changed
         with self._store.tx() as conn:
             for r in rows:
+                group_id = str(r["group_id"])
+                served = getattr(settings, "is_served", None)
+                if callable(served) and not served(group_id):
+                    continue
+                features = group_features.get(self._store, group_id, settings)
+                if not features["task"]:
+                    continue
                 gid = str(r["id"])
                 current = str(r["stale_reason"] or "")
-                if current.startswith(_STALE_ERROR_PREFIX):
-                    continue  # 出错原因保留，等下次成功（beat）清
+                if current and current not in (STALE_TIMEOUT_REASON, STALE_MODEL_REASON):
+                    continue  # 明确受阻原因保留，等下次成功（beat）清
                 ref = float(r["heartbeat_ts"]) if r["heartbeat_ts"] is not None else float(r["created"])
                 interval = _AGENT_NEXT_CHECK_S
                 if r["next_check_ts"] is not None and float(r["next_check_ts"]) > ref:
                     interval = float(r["next_check_ts"]) - ref
+                # A deliberate shutdown is not a missed heartbeat. Compute the
+                # expected interval first, then anchor elapsed time at reenablement.
+                ref = max(ref, features["enabled_since"].get("task", ref))
                 overdue = float(now) - ref > 2 * interval
                 if overdue:
                     desired = STALE_TIMEOUT_REASON if models_ready else STALE_MODEL_REASON
@@ -553,6 +655,99 @@ class Goals:
                 )
                 changed.append(gid)
         return changed
+
+    # ------------------------------------------------------------------
+    # 受阻通知（2026-10 需求）：卡住时群里 @ 主管理员，每天一次
+    # ------------------------------------------------------------------
+
+    def active_stale(self) -> list[dict]:
+        """枚举全部活动受阻目标，不限于本轮刚发生变化的目标。"""
+        rows = self._store.read().execute(
+            "SELECT id, group_id, stale_reason FROM goals WHERE kind='agent' AND state='active'"
+        ).fetchall()
+        return [dict(row) for row in rows if stale_is_blocking(str(row["stale_reason"] or ""))]
+
+    def notify_stale_if_needed(self, goal_id: str, now: float, *, outbox: Any, get_admins: Callable[[str], list[str]]) -> bool:
+        """目标卡住且今天没通知过 → 群里 @ 主管理员。
+
+        Args:
+            goal_id: 目标 ID
+            now: 当前时间戳
+            outbox: 发件箱实例
+            get_admins: 函数，输入群号返回主管理员账号列表（如 ["qq:123456"]）
+
+        Returns:
+            是否发了通知
+        """
+        goal = self.get(goal_id)
+        if not goal or str(goal.get("kind")) != "agent" or str(goal.get("state")) != "active":
+            return False
+        reason = str(goal.get("stale_reason") or "")
+        if not stale_is_blocking(reason):
+            return False
+
+        # 北京自然日去重，跨午夜无需等满 24 小时。
+        last_notify = goal.get("stale_notified_ts")
+        if last_notify is not None and clock.day_key(float(last_notify)) == clock.day_key(float(now)):
+            return False
+
+        gid = str(goal["group_id"])
+        admins = get_admins(gid)
+        if not admins:
+            return False
+
+        # 拼通知文本
+        title = str(goal.get("title") or "")
+        text = (
+            f"⚠️ 目标「{title}」需要管理员关注\n"
+            f"原因：{reason}\n"
+            f"请打开 MaiWork 网页 → 目标详情 → 和 MaiWork 聊这个，进行调整。"
+        )
+
+        # @ 第一个管理员
+        at_admin = admins[0]
+        full_text = f"@{at_admin} {text}"
+
+        # 发件箱 key：目标 + 日期，每天最多一条
+        day_key = clock.day_key(float(now))
+        try:
+            outbox.enqueue(
+                f"goal-stale:{goal_id}:{day_key}",
+                gid,
+                "text",
+                {
+                    "text": full_text,
+                    "push_kind": "goal_stale",
+                    "at_user": at_admin,
+                },
+            )
+        except Exception:
+            return False
+
+        # 记通知时间
+        with self._store.tx() as conn:
+            conn.execute(
+                "UPDATE goals SET stale_notified_ts=?, updated=? WHERE id=?",
+                (float(now), float(now), str(goal_id)),
+            )
+        return True
+
+    def set_admin_chat(self, goal_id: str, chat_id: int) -> None:
+        """绑定管理员对话 ID 到目标。"""
+        with self._store.tx() as conn:
+            conn.execute(
+                "UPDATE goals SET admin_chat_id=?, updated=? WHERE id=?",
+                (int(chat_id), clock.now(), str(goal_id)),
+            )
+
+    def get_admin_chat(self, goal_id: str) -> int | None:
+        """读目标绑定的管理员对话 ID。"""
+        row = self._store.read().execute(
+            "SELECT admin_chat_id FROM goals WHERE id=?", (str(goal_id),)
+        ).fetchone()
+        if row is None or row["admin_chat_id"] is None:
+            return None
+        return int(row["admin_chat_id"])
 
     # ------------------------------------------------------------------
     # 网页视图（docs/07 §9.3 goals）

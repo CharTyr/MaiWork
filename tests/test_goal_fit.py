@@ -268,17 +268,20 @@ class TestNoJudgement:
     @pytest.mark.asyncio
     async def test_non_served_group_calls_nothing(self, tmp_path) -> None:
         h = _setup(tmp_path, replies=[_ONLINE], serve=(G1,))
-        r = h.create(group_id=G2)
-        await h.judge.judge(r["id"])
+        with pytest.raises(ValueError, match="服务列表"):
+            h.create(group_id=G2)
+        assert h.store.read().execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 0
         assert h.models.calls == []
-        assert h.row(r["id"])["goal_fit"] == ""
+        assert h.counts() == (0, 0)
 
     @pytest.mark.asyncio
     async def test_empty_group_calls_nothing(self, tmp_path) -> None:
         h = _setup(tmp_path, replies=[_ONLINE])
-        r = h.create(group_id="")
-        await h.judge.judge(r["id"])
+        with pytest.raises(ValueError, match="服务列表"):
+            h.create(group_id="")
+        assert h.store.read().execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 0
         assert h.models.calls == []
+        assert h.counts() == (0, 0)
 
     @pytest.mark.asyncio
     async def test_missing_request_calls_nothing(self, tmp_path) -> None:

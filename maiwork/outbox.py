@@ -70,7 +70,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import quote as _url_quote
 
-from . import clock, group_push, members
+from . import clock, group_features, group_push, members
 from .delivery import UNREADABLE_REASON, Mentions, Pushes, task_quota_free_kind
 from .host import HostError
 from .models import _redact
@@ -846,7 +846,7 @@ class Outbox:
 
     def _due_rows(self, now: float) -> list[Any]:
         return self._store.read().execute(
-            "SELECT id, key, group_id, kind, payload, task_id, not_before FROM outbox"
+            "SELECT id, key, group_id, kind, payload, task_id, not_before, created FROM outbox"
             " WHERE status='pending' AND not_before<=? ORDER BY id",
             (float(now),),
         ).fetchall()
@@ -1654,6 +1654,32 @@ class Outbox:
         async with self._lock():
             await self._flush_locked(float(now), allowed_groups=allowed_groups)
 
+    def _feature_drop_reason(self, row: Any, payload: dict) -> str:
+        """Module messages expire across shutdown; task completion still delivers."""
+        key = str(row["key"])
+        push_kind = str(payload.get("push_kind") or "delivery")
+        module = {"news_card": "news", "idea_mention": "idea",
+                  "goal_result": "task", "goal_stale": "task"}.get(push_kind)
+        if key.startswith(("goal-remind:", "goal-ask:", "goal-renew:", "task-wait-remind:")):
+            module = "task"
+        if module is None:
+            return ""
+        try:
+            config = group_features.get(self._store, str(row["group_id"]), self._get_settings())
+        except Exception:
+            logger.warning("发送前读功能开关失败，本条作废", exc_info=True)
+            return "暂时无法确认功能开关"
+        if not config[module]:
+            return "本群功能已关闭"
+        cutoff = config["last_disabled_ts"].get(module)
+        if cutoff is not None:
+            # Content queued before shutdown, or while disabled, must not reappear
+            # after enabling. Only newly queued content belongs to the new period.
+            cutoff = max(cutoff, config["enabled_since"].get(module, cutoff))
+            if float(row["created"]) <= cutoff:
+                return "功能关闭前的旧消息"
+        return ""
+
     async def _flush_locked(self, now: float, *, allowed_groups: Any = None) -> None:
         if allowed_groups is None:
             try:
@@ -1689,6 +1715,13 @@ class Outbox:
             # 同一件交付自动补的说明（file → note）：跟着已经出去的那条走，
             # 不占第二份额度、也不再过一遍闸（不然说明会被推到第二天）。
             follow_up = bool(payload.get("follow_up_of"))
+
+            feature_reason = self._feature_drop_reason(row, payload)
+            if feature_reason:
+                self._set(oid, status="dropped", error=f"作废：{feature_reason}", moment=now)
+                self._fire_result(_row_after(self._store, oid), payload,
+                                  outcome="dropped", error=feature_reason, now=now)
+                continue
 
             # 自动消息的期限：到点还没发出去（睡觉时段 / 每日上限推迟了几天）就作废，
             # 绝不把陈旧的开场白 / 资讯卡片 / 提一嘴发进群。

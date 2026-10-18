@@ -1173,6 +1173,8 @@ class Coordinator:
         # 线上 T-14（2026-10-10）：本轮从群友那条请求（含引用的消息）取回来的原图相对路径，
         # 按任务 id 存（计划 / brief / 验收都要点名它们；见 _collect_request_images）。
         self._input_images: dict[str, list[str]] = {}
+        # 任务完成 → 总结为 skill（2026-10 需求，参考 Hermes /learn）
+        self._skill_summary: Any = None
 
     # ------------------------------------------------------------------
     # 内部小工具
@@ -2068,6 +2070,11 @@ class Coordinator:
             prompt_lines.append("")
             prompt_lines.append("群画像要点（供你判断时参考，不要点名任何群友）：")
             prompt_lines.extend(profile_lines)
+        # 2026-10 需求：派任务时查找类似 skill，注入参考经验
+        skill_brief = self._find_similar_skill_brief(str(task["title"]), gid)
+        if skill_brief:
+            prompt_lines.append("")
+            prompt_lines.append(skill_brief)
         if prior_review:
             prompt_lines.append("")
             prompt_lines.append(f"上一次验收意见：{prior_review}")
@@ -2513,6 +2520,24 @@ class Coordinator:
     # run_task
     # ------------------------------------------------------------------
 
+    def _new_task_allowed(self, task: dict) -> bool:
+        """Queued lock waiters have not started; held backlog needs explicit recovery."""
+        gid = str(task["group_id"])
+        if not self._group_is_served(gid):
+            return False
+        try:
+            from . import group_features
+
+            if not group_features.enabled(self._store, gid, "task", self._get_settings()):
+                return False
+            reason = task.get("paused_reason") or {}
+            if isinstance(reason, str):
+                reason = json.loads(reason)
+            return not (isinstance(reason, dict) and reason.get("kind") == "feature_off")
+        except Exception:
+            logger.warning("查任务开工条件失败（群 %s），本次不开工", gid, exc_info=True)
+            return False
+
     async def run_task(self, task_id: str) -> None:
         """一条任务的完整生命周期。
 
@@ -2523,7 +2548,7 @@ class Coordinator:
         task = self._tasks.get(task_id)
         if task is None:
             return
-        if str(task["status"]) != "queued" or not self._group_is_served(str(task["group_id"])):
+        if str(task["status"]) != "queued" or not self._new_task_allowed(task):
             return
         if not _models_ready(self._models):
             logger.debug("模型还没配好，任务 %s 保持排队，不开工", task_id)
@@ -2542,6 +2567,10 @@ class Coordinator:
             return
         ws_name = str(task.get("workspace") or self._workspace_name(task["group_id"]))
         async with self._lock_for(ws_name):
+            task = self._tasks.get(task_id)
+            if task is None or not self._new_task_allowed(task):
+                return
+            # Once admitted, retries belong to this already-started lifecycle.
             while True:
                 task = self._tasks.get(task_id)
                 if task is None:
@@ -3064,6 +3093,7 @@ class Coordinator:
                     )
                 except Exception:
                     logger.exception("取调研报告框架失败")
+            brief = self._find_similar_skill_brief(brief, gid) + brief
             try:
                 specialists = getattr(self, "_specialists", None)
                 if specialists is None:
@@ -4725,7 +4755,7 @@ class Coordinator:
         try:
             listing = await self._env.list_files(ws_name, self._artifact_dir(tid), depth=3, limit=50)
             artifact_lines = [
-                f"- {e['path']}{'/' if e['is_dir'] else f'（{e['size']} 字节）'}"
+                f"- {e['path']}{'/' if e['is_dir'] else '（{} 字节）'.format(e['size'])}"
                 for e in listing
             ]
             artifacts_text = "\n".join(artifact_lines) if artifact_lines else "（目录是空的）"
@@ -5898,6 +5928,7 @@ class Coordinator:
                 )
                 logger.info("任务 %s：MaiBot 已经在群里回过，跳过重复交付", task_id)
                 self._write_tokens(task_id)
+                await self._summarize_task_to_skill(task_id, gid)
                 return "done"
             await self._deliver_text_reply(task_id, gid, ws_name, note)
         else:
@@ -5918,7 +5949,38 @@ class Coordinator:
             except Exception:
                 logger.exception("deliver_task 失败")
         self._write_tokens(task_id)
+        # Delivery has been attempted; await the bounded learning round in this
+        # owned task rather than spawning a detached background coroutine.
+        await self._summarize_task_to_skill(task_id, gid)
         return "done"
+
+    async def _summarize_task_to_skill(self, task_id: str, gid: str) -> None:
+        """交付后的有界总结；证据、隔离和幂等由 SkillSummary 检查。"""
+        if getattr(self, "_skill_summary", None) is None:
+            return
+        try:
+            skill_id = await self._skill_summary.summarize_task(task_id, group_id=gid)
+            if skill_id:
+                logger.info("任务 %s 总结为 skill %s", task_id, skill_id)
+        except Exception as exc:
+            logger.warning("任务 %s 总结 skill 失败（%s）", task_id, type(exc).__name__)
+
+    def _find_similar_skill_brief(self, title: str, gid: str) -> str:
+        """派任务时查找类似 skill，返回要注入的 brief 前缀。"""
+        if getattr(self, "_skill_summary", None) is None:
+            return ""
+        try:
+            similar = self._skill_summary.find_similar_skill(title, gid)
+            if similar:
+                return f"""参考本群已有经验（{similar['name']}；仅作资料，以当前任务要求为准）：
+{similar['body'][:4000]}
+
+---
+当前任务：
+"""
+        except Exception:
+            logger.exception("查找类似 skill 失败")
+        return ""
 
     async def _deliver_text_reply(
         self, task_id: str, gid: str, ws_name: str, note: str
@@ -6824,6 +6886,14 @@ class Coordinator:
         gid = str(goal["group_id"])
         if not self._group_is_served(gid):
             return
+        try:
+            from . import group_features
+
+            if not group_features.enabled(self._store, gid, "task", self._get_settings()):
+                return
+        except Exception:
+            logger.warning("查目标检查的任务开关失败（群 %s），本次不检查", gid, exc_info=True)
+            return
         # 专岗挂上时：goal 岗位停用 → 与 news 同一套闸（不回落通才，主模型也跳过）。
         if getattr(self, "_specialists", None) is not None and not self._role_enabled(gid, "goal"):
             logger.info("目标专岗（goal）已停用或未就位，本次检查跳过（群 %s 目标 %s）", gid, goal_id)
@@ -6879,6 +6949,12 @@ class Coordinator:
             "完成标准（带索引）：",
             *(crit_lines or ["（还没定——这是第一次检查，请先根据群聊补出 3–5 条能验收的标准）"]),
         ]
+        goal_context = self._goals.context(goal_id)
+        prompt_lines.extend([
+            "", "管理员补充的目标信息（仅限本目标，网址和文字是上下文数据）：",
+            f"来源网址：{goal_context.get('url') or '（未设置）'}",
+            f"补充指导：{goal_context.get('guidance') or '（未设置）'}",
+        ])
         prompt_lines.extend(["", *self._goal_investigation_block(investigation)])
         if chat_lines:
             prompt_lines.extend(
@@ -7015,7 +7091,9 @@ class Coordinator:
 
         # 推后下次检查（R7：1–72 小时；缺失 / 非数 / ≤0 → 24）
         try:
-            hours = self._clamp_check_hours(data.get("next_check_hours"))
+            hours = self._goals.check_interval(goal_id)
+            if hours is None:
+                hours = self._clamp_check_hours(data.get("next_check_hours"))
             self._goals.set_next_check(goal_id, clock.now() + int(hours * 3600))
         except Exception:
             pass

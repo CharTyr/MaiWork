@@ -15,12 +15,14 @@ const esc=s=>String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replac
 const push={config:{topics_enabled:true,news_card_enabled:false,news_card_count:3,idea_mention_enabled:false,daily_max:3,quiet_hours:'23:00-08:00'},
   sent_today:1,quota_used:2,recent:[{status:'uncertain',state:'不确定',text:'<script>不明消息',ts:1}]};
 const approval={approvers:['qq:4321'],exempt_users:['qq:8765'],exempt_group:false,required:true};
+const features={group_id:'g1',news:true,idea:true,task:true,disabled_ts:{}};
 const context=vm.createContext({console,document:{querySelectorAll:()=>slots,addEventListener:(k,f)=>(listeners[k]||=[]).push(f)}});
 const stubs={
  '../state.js':{state,$:id=>fields[id]||null,admin:()=>state.me.role==='admin',gadmin:()=>['admin','group_admin'].includes(state.me.role)},
  '../util.js':{tip:(h)=>(h?'<details class="tip">'+h+'</details>':''),esc,SVG:{pen:'[pen]'},when:()=> '今天',toast:(x,b)=>toasts.push([x,!!b])},
  '../api.js':{api:async(method,url,body)=>{calls.push({method,url,body});if(cfg.fail&&method!=='GET')throw new Error('保存失败');
    if(url.endsWith('/push'))return method==='GET'?push:{...push,config:{...push.config,...body}};
+   if(url.endsWith('/features'))return method==='GET'?features:{...features,...body};
    return method==='GET'?approval:body;}},
  './news.js':{loading:()=>'<p>加载中</p>'},
 };
@@ -59,9 +61,9 @@ def test_member_does_not_load_or_show_private_controls(tmp_path):
 @pytest.mark.parametrize("role", ["admin", "group_admin"])
 def test_controls_load_only_current_group_and_one_cap(tmp_path, role):
     out = run_controls(tmp_path, role=role)
-    assert {c["url"] for c in out["loads"]} == {"/api/groups/g1/push", "/api/groups/g1/approval"}
+    assert {c["url"] for c in out["loads"]} == {"/api/groups/g1/push", "/api/groups/g1/approval", "/api/groups/g1/features"}
     html = out["html"]
-    for text in ("主动发言", "开启话题", "资讯卡片", "构想提及", "每日上限", "23:00-08:00", "任务审批"):
+    for text in ("主动发言", "开启话题", "资讯卡片", "构想提及", "每日上限", "23:00-08:00", "任务审批", "功能启用"):
         assert text in html
     assert "不确定" in html and "&lt;script&gt;" in html and "<script>" not in html
     assert "news_card_daily_max" not in html and "idea_mention_daily_max" not in html

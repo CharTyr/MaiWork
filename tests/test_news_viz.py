@@ -307,7 +307,9 @@ async def test_app_viz_round_spawns_once(tmp_path) -> None:
 
     from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
-    app = MaiWorkApp(ctx=None, raw_config={}, plugin_dir=Path(__file__).resolve().parents[1])
+    app = MaiWorkApp(ctx=None, raw_config={"groups": {"serve": [{"group": f"qq:{G}"}]}},
+                     plugin_dir=Path(__file__).resolve().parents[1])
+    app.store = _store(tmp_path)
     ran: list[str] = []
 
     class _V:

@@ -448,7 +448,9 @@ async def test_app_viz_round_yields_to_due_card(tmp_path):
 
     from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
-    app = MaiWorkApp(ctx=None, raw_config={}, plugin_dir=Path(__file__).resolve().parents[1])
+    app = MaiWorkApp(ctx=None, raw_config={"groups": {"serve": [{"group": f"qq:{GID}"}]}},
+                     plugin_dir=Path(__file__).resolve().parents[1])
+    app.store = _vstore(tmp_path)
     ran: list[str] = []
 
     class _V:
@@ -485,7 +487,9 @@ async def test_app_viz_round_runs_during_quiet_hours(tmp_path):
 
     from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
-    app = MaiWorkApp(ctx=None, raw_config={}, plugin_dir=Path(__file__).resolve().parents[1])
+    app = MaiWorkApp(ctx=None, raw_config={"groups": {"serve": [{"group": f"qq:{GID}"}]}},
+                     plugin_dir=Path(__file__).resolve().parents[1])
+    app.store = _vstore(tmp_path)
     ran: list[str] = []
 
     class _V:

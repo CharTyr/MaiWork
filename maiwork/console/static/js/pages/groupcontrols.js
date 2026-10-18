@@ -5,7 +5,8 @@ import { api } from "../api.js";
 import { loading } from "./news.js";
 
 const PUSH_KEYS = ["topics_enabled", "news_card_enabled", "news_card_count", "idea_mention_enabled", "daily_max", "quiet_hours"];
-const BOOLS = new Set(["topics_enabled", "news_card_enabled", "idea_mention_enabled", "required"]);
+const FEATURE_KEYS = ["news", "idea", "task"];
+const BOOLS = new Set(["topics_enabled", "news_card_enabled", "idea_mention_enabled", "required", "news", "idea", "task"]);
 const NUMBERS = new Set(["news_card_count", "daily_max"]);
 const role = () => (state.me && state.me.role) || "none";
 const current = c => !!c && state.g === c.gid && role() === c.role && gadmin();
@@ -13,7 +14,7 @@ const current = c => !!c && state.g === c.gid && role() === c.role && gadmin();
 function frame(gid) {
   let c = state.groupControls;
   if (!c || c.gid !== gid || c.role !== role()) {
-    c = state.groupControls = { gid, role: role(), push: null, approval: null, loading: false, error: "", errorField: "", edit: null, draft: null, saving: false };
+    c = state.groupControls = { gid, role: role(), push: null, approval: null, features: null, loading: false, error: "", errorField: "", edit: null, draft: null, saving: false };
   }
   return c;
 }
@@ -23,13 +24,15 @@ async function load(c) {
   c.loading = true;
   c.error = "";
   try {
-    const [push, approval] = await Promise.all([
+    const [push, approval, features] = await Promise.all([
       api("GET", `/api/groups/${encodeURIComponent(c.gid)}/push`),
       api("GET", `/api/groups/${encodeURIComponent(c.gid)}/approval`),
+      api("GET", `/api/groups/${encodeURIComponent(c.gid)}/features`),
     ]);
     if (!current(c) || state.groupControls !== c) return;
     c.push = push;
     c.approval = approval;
+    c.features = features;
   } catch (e) {
     if (current(c)) c.error = e.message;
   } finally {
@@ -43,7 +46,7 @@ export function controlsSection(gid, snapshot = null) {
   const c = frame(gid);
   const fresh = snapshot && snapshot.card_push && snapshot.card_push.group_push;
   if (fresh && !c.edit && !c.saving) c.push = fresh;
-  if ((!c.push || !c.approval) && !c.loading && !c.error) void load(c);
+  if ((!c.push || !c.approval || !c.features) && !c.loading && !c.error) void load(c);
   return `<div class="groupctl-slot" data-g="${esc(gid)}">${controlsHTML(c)}</div>`;
 }
 
@@ -88,8 +91,26 @@ function pushHTML(c) {
   return html;
 }
 
-function approvalHTML(c) {
-  const a = c.approval || {};
+function featuresHTML(c) {
+  const f = c.features || {};
+  const help = "三个功能各自独立。关闭后本群不再新增对应工作，历史和文件保留；任务关闭会一并暂停目标检查和提醒。";
+  let html = `<div class="h-sub-row"><h2 class="h-sub">功能启用${tip(help)}</h2>${c.edit !== "features" ? `<button class="btn small" data-act="gctl-features-edit" data-g="${esc(c.gid)}">修改</button>` : ""}</div>`;
+  if (c.edit === "features") {
+    const d = c.draft;
+    html += switchRow(c, "news", "资讯", "定时采集并整理本群关心的资讯；含手动备料、资讯卡片与来源维护。", d.news);
+    html += switchRow(c, "idea", "构想", "按群画像定时 / 话头触发出构想；含手动生成与构想提及。", d.idea);
+    html += switchRow(c, "task", "任务", "接派活、审批后开工、目标追踪与提醒；关闭会暂停目标检查，正在执行的任务做完。", d.task);
+    if (d.task === false) html += `<p class="fine warn-inline" role="note">关闭任务会同时暂停本群的目标检查和提醒；已在执行的任务会做完，排队任务重新开启后要手动恢复。</p>`;
+    html += errorHTML(c) + saveActions(c, "features");
+  } else {
+    const line = (label, on) => `<div class="set-row gctl-row"><div><div class="set-name">${label}</div><div class="set-text">${on ? "已开启" : "已关闭"}</div></div></div>`;
+    html += line("资讯", f.news) + line("构想", f.idea) + line("任务", f.task);
+    if (f.task === false) html += `<p class="fine">任务已关闭：目标检查和提醒一并暂停，历史与文件仍可查看。</p>`;
+  }
+  return html;
+}
+
+function approvalHTML(c) {  const a = c.approval || {};
   let html = `<div class="h-sub-row"><h2 class="h-sub">任务审批</h2>${admin() && c.edit !== "approval" ? `<button class="btn small" data-act="gctl-approval-edit" data-g="${esc(c.gid)}">修改</button>` : ""}</div>`;
   if (c.edit === "approval" && admin()) {
     const d = c.draft;
@@ -117,12 +138,12 @@ function saveActions(c, kind) {
 }
 
 function controlsHTML(c) {
-  if (!c.push || !c.approval) return c.error ? `<div class="warn-box" role="alert">${esc(c.error)} <button class="btn small" data-act="gctl-reload" data-g="${esc(c.gid)}">重试</button></div>` : loading();
-  return pushHTML(c) + approvalHTML(c) + (!c.edit ? `<button class="btn small" data-act="gctl-reload" data-g="${esc(c.gid)}">刷新</button>` : "") + (!c.edit ? errorHTML(c) : "");
+  if (!c.push || !c.approval || !c.features) return c.error ? `<div class="warn-box" role="alert">${esc(c.error)} <button class="btn small" data-act="gctl-reload" data-g="${esc(c.gid)}">重试</button></div>` : loading();
+  return featuresHTML(c) + pushHTML(c) + approvalHTML(c) + (!c.edit ? `<button class="btn small" data-act="gctl-reload" data-g="${esc(c.gid)}">刷新</button>` : "") + (!c.edit ? errorHTML(c) : "");
 }
 
 function readDraft(c) {
-  const keys = c.edit === "push" ? PUSH_KEYS : ["approvers", "exempt_users", "required"];
+  const keys = c.edit === "push" ? PUSH_KEYS : c.edit === "features" ? FEATURE_KEYS : ["approvers", "exempt_users", "required"];
   const d = { ...c.draft };
   for (const key of keys) {
     const el = $("gctl-" + key);
@@ -151,13 +172,13 @@ export async function actControls(action, el) {
   if (!current(c) || el.dataset.g !== c.gid || c.saving) return true;
   if (action === "gctl-reload") { await load(c); return true; }
   if (action === "gctl-cancel") { c.edit = null; c.draft = null; c.error = ""; repaintControls(); return true; }
-  const kind = action.includes("approval") ? "approval" : "push";
+  const kind = action.includes("approval") ? "approval" : action.includes("features") ? "features" : "push";
   if (kind === "approval" && !admin()) return true;
   if (action.endsWith("-edit")) {
     c.edit = kind;
     c.error = "";
     c.errorField = "";
-    c.draft = kind === "push" ? Object.fromEntries(PUSH_KEYS.map(k => [k, c.push.config[k]])) : {
+    c.draft = kind === "push" ? Object.fromEntries(PUSH_KEYS.map(k => [k, c.push.config[k]])) : kind === "features" ? Object.fromEntries(FEATURE_KEYS.map(k => [k, !!c.features[k]])) : {
       approvers: c.approval.approvers.join("\n"), exempt_users: c.approval.exempt_users.join("\n"), required: !!c.approval.required && !c.approval.exempt_group,
     };
     repaintControls();
@@ -169,7 +190,7 @@ export async function actControls(action, el) {
     const d = readDraft(c);
     const invalid = kind === "push" ? checkPush(d) : null;
     if (invalid) { c.error = invalid.message; c.errorField = invalid.field; return true; }
-    const body = kind === "push" ? d : { approvers: accountLines(d.approvers), exempt_users: accountLines(d.exempt_users), required: d.required, exempt_group: false };
+    const body = kind === "push" ? d : kind === "features" ? d : { approvers: accountLines(d.approvers), exempt_users: accountLines(d.exempt_users), required: d.required, exempt_group: false };
     c.saving = true;
     c.error = "";
     repaintControls();

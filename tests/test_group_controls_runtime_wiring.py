@@ -474,6 +474,88 @@ class TestPushApi:
 
 
 # ======================================================================
+# 3b. 按群功能开关：GET / PUT /api/groups/{gid}/features
+# ======================================================================
+
+
+class TestFeaturesApi:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status,op", [("queued", "resume"), ("paused", "resume"), ("failed", "retry")])
+    async def test_disabled_task_mutation_rejected(self, env, status, op):
+        from CharTyr_MaiWork.maiwork import group_features
+        await env.login()
+        tid = env.app.tasks.create(G1, title="test", req="test", criteria=[], source="test", status=status)
+        starts = []
+        env.app.spawn_run_task = starts.append
+        group_features.set_config(env.app.store, G1, {"task": False}, env.app.get_settings())
+        response = await env.client.post(f"/api/tasks/{tid}/{op}", json={})
+        assert starts == []
+        assert response.status == 409, await response.text()
+        assert env.app.tasks.get(tid)["status"] == status
+
+    @pytest.mark.asyncio
+    async def test_mixed_unknown_patch_rejected_without_changes(self, env):
+        await env.login()
+        response = await env.client.put(f"/api/groups/{G1}/features", json={"task": False, "typo": True})
+        assert response.status == 400
+        cfg = await (await env.client.get(f"/api/groups/{G1}/features")).json()
+        assert cfg["task"] is True
+
+    @pytest.mark.asyncio
+    async def test_defaults_all_on_and_admin_toggle(self, env: Env) -> None:
+        await env.login(ADMIN_PW)
+        r = await env.client.get(f"/api/groups/{G1}/features")
+        assert r.status == 200, await r.text()
+        body = await r.json()
+        assert body["news"] is True and body["idea"] is True and body["task"] is True
+        # 关掉任务：返回里 task=False，别的群不受影响
+        r2 = await env.client.put(f"/api/groups/{G1}/features", json={"task": False})
+        assert r2.status == 200, await r2.text()
+        out = await r2.json()
+        assert out["task"] is False and out["news"] is True
+        assert "task" in out["disabled_ts"]
+        g2 = await (await env.client.get(f"/api/groups/{G2}/features")).json()
+        assert g2["task"] is True
+
+    @pytest.mark.asyncio
+    async def test_anonymous_401_nonserved_404_cross_group_403(self, env: Env) -> None:
+        r = await env.client.get(f"/api/groups/{G1}/features")
+        assert r.status == 401, r.status
+        await env.login(ADMIN_PW)
+        r = await env.client.get("/api/groups/999999/features")
+        assert r.status == 404, r.status
+        env.set_group_password(G1, G1_PW)
+        env.set_group_password(G2, G2_PW)
+        await env.login(G2_PW)
+        r = await env.client.get(f"/api/groups/{G1}/features")
+        assert r.status == 403, r.status        # 别群群管理员看不到
+        r = await env.client.put(f"/api/groups/{G1}/features", json={"news": False})
+        assert r.status == 403, r.status        # 也不能改
+
+    @pytest.mark.asyncio
+    async def test_own_group_admin_read_and_write(self, env: Env) -> None:
+        env.set_group_password(G1, G1_PW)
+        await env.login(G1_PW)
+        r = await env.client.put(f"/api/groups/{G1}/features", json={"idea": False})
+        assert r.status == 200, await r.text()
+        out = await r.json()
+        assert out["idea"] is False and out["news"] is True
+
+    @pytest.mark.asyncio
+    async def test_unknown_field_and_non_bool_400_changes_nothing(self, env: Env) -> None:
+        await env.login(ADMIN_PW)
+        before = await (await env.client.get(f"/api/groups/{G1}/features")).json()
+        r = await env.client.put(f"/api/groups/{G1}/features", json={"nope": True})
+        assert r.status == 400, r.status
+        r = await env.client.put(f"/api/groups/{G1}/features", json={"news": "false"})
+        assert r.status == 400, r.status
+        r = await env.client.put(f"/api/groups/{G1}/features", json={})
+        assert r.status == 400, r.status
+        after = await (await env.client.get(f"/api/groups/{G1}/features")).json()
+        assert after["news"] == before["news"] and after["task"] == before["task"]
+
+
+# ======================================================================
 # 4. 每群开关 / 睡觉时段：只有一个来源
 # ======================================================================
 
