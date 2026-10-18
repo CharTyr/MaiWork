@@ -13,6 +13,7 @@ authorized_keys 里加）连上去干活：
 from __future__ import annotations
 
 import asyncio
+import os
 import types
 from pathlib import Path
 from typing import Any
@@ -51,7 +52,7 @@ class FakeRunner:
     async def run(self, argv, *, cwd, env, timeout):
         argv = list(argv)
         self.calls.append(argv)
-        if argv[0] == "ssh-keygen":
+        if Path(argv[0]).name == "ssh-keygen":
             key = Path(argv[argv.index("-f") + 1])
             key.write_text("PRIVATE")
             key.with_suffix(".pub").write_text("ssh-ed25519 AAAATEST maiwork\n")
@@ -66,6 +67,110 @@ class FakeRunner:
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+# ---------------------------------------------------------------- 客户端环境
+
+
+def test_ssh_minimal_env_keeps_posix_path_and_drops_process_secrets() -> None:
+    env = ssh_module._ssh_minimal_env(
+        platform="posix",
+        environ={"PATH": "/untrusted", "TOKEN": "secret", "PROGRAMDATA": "/not-used"},
+    )
+    assert env == {"PATH": ssh_module.LocalEnv._MINIMAL_PATH, "LANG": "C.UTF-8"}
+
+
+def test_ssh_minimal_env_uses_only_trusted_windows_system_paths() -> None:
+    env = ssh_module._ssh_minimal_env(
+        platform="nt",
+        environ={
+            "SystemRoot": r"C:\Windows",
+            "PROGRAMDATA": r"C:\ProgramData",
+            "PATH": r"C:\Users\alice\bin",
+            "TOKEN": "secret",
+        },
+    )
+    assert env == {
+        "PATH": r"C:\Windows\System32\OpenSSH;C:\Windows\System32",
+        "LANG": "C.UTF-8",
+        "PROGRAMDATA": r"C:\ProgramData",
+    }
+
+
+def test_ssh_minimal_env_accepts_windir_fallback() -> None:
+    env = ssh_module._ssh_minimal_env(platform="nt", environ={"WINDIR": r"D:\Windows"})
+    assert env["PATH"] == r"D:\Windows\System32\OpenSSH;D:\Windows\System32"
+    assert "PROGRAMDATA" not in env
+
+
+def test_ssh_minimal_env_windows_without_system_root_is_empty() -> None:
+    """SystemRoot / WINDIR 都没有时 PATH 是空串，调用方必须当成「环境异常」而不是「命令缺失」。"""
+    env = ssh_module._ssh_minimal_env(platform="nt", environ={})
+    assert env["PATH"] == ""
+    assert "PROGRAMDATA" not in env
+
+
+# ------------------------------------------------------- 命令一律用绝对路径启动
+
+
+def test_client_commands_are_launched_by_absolute_path(tmp_path, monkeypatch) -> None:
+    """Windows 的 CreateProcess 用父进程 PATH 找命令，子进程 env 说了不算；
+    所以 ssh / scp / ssh-keygen 必须用 which 找到的绝对路径启动，不能传裸名字。"""
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda command, *, path=None: f"/opt/ssh/bin/{command}")
+    monkeypatch.setattr(ssh_module, "_IS_WINDOWS", True)
+    runner = FakeRunner()
+    env = SshEnv(lambda: _settings([{"name": "甲", "host": "a@10.0.0.1"}]), tmp_path, runner=runner.run)
+    assert _run(env.acquire("T-1")) is not None
+    heads = [c[0] for c in runner.calls]
+    assert heads and all(h.startswith("/opt/ssh/bin/") for h in heads), heads
+
+
+def test_client_command_probe_uses_minimal_path(tmp_path, monkeypatch) -> None:
+    """探测命令时查的是**子进程那份最小 PATH**，不是插件进程的完整 PATH。"""
+    import shutil
+
+    paths: list[Any] = []
+
+    def lookup(command, *, path=None):
+        paths.append(path)
+        return f"/opt/ssh/bin/{command}"
+
+    monkeypatch.setattr(shutil, "which", lookup)
+    monkeypatch.setattr(ssh_module, "_IS_WINDOWS", True)
+    env = SshEnv(lambda: _settings([{"name": "甲", "host": "a@10.0.0.1"}]), tmp_path, runner=FakeRunner().run)
+    _run(env.acquire("T-1"))
+    assert paths and all(p == ssh_module._MINIMAL_ENV["PATH"] for p in paths)
+    assert sorted(set(paths)) == [ssh_module._MINIMAL_ENV["PATH"]]
+
+
+def test_client_command_paths_stay_bare_on_posix(tmp_path, monkeypatch) -> None:
+    """POSIX 子进程按自己的 env PATH 找命令，行为不变：仍然是裸名字。"""
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda command, *, path=None: f"/usr/bin/{command}")
+    monkeypatch.setattr(ssh_module, "_IS_WINDOWS", False)
+    runner = FakeRunner()
+    env = SshEnv(lambda: _settings([{"name": "甲", "host": "a@10.0.0.1"}]), tmp_path, runner=runner.run)
+    _run(env.acquire("T-1"))
+    heads = [c[0] for c in runner.calls]
+    assert heads and all(h in ("ssh", "scp", "ssh-keygen") for h in heads), heads
+
+
+def test_windows_without_system_root_reports_environment_error(tmp_path, monkeypatch) -> None:
+    """Windows 上读不到 SystemRoot/WINDIR：报「系统环境异常」，不能误报成「缺 ssh 命令」。"""
+    import shutil
+
+    monkeypatch.setattr(ssh_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(ssh_module, "_MINIMAL_ENV", {"PATH": "", "LANG": "C.UTF-8"})
+    monkeypatch.setattr(shutil, "which", lambda command, *, path=None: None)
+    env = SshEnv(lambda: _settings([{"name": "甲", "host": "a@10.0.0.1"}]), tmp_path, runner=FakeRunner().run)
+    _run(env.check_all())
+    health = _health(env)
+    assert health["state"] == "warn"
+    assert "SystemRoot" in health["text"] or "WINDIR" in health["text"]
+    assert "缺少 SSH 客户端命令" not in health["text"]
 
 
 # ---------------------------------------------------------------- host 解析
@@ -319,14 +424,17 @@ def test_minimal_env_for_subprocess(tmp_path) -> None:
 
     async def runner(argv, *, cwd, env, timeout):
         seen.update(env)
-        if argv[0] == "ssh-keygen":
+        if Path(argv[0]).name == "ssh-keygen":
             key = Path(argv[argv.index("-f") + 1]); key.write_text("K"); key.with_suffix(".pub").write_text("ssh-ed25519 X\n")
             return 0, "", ""
         return 0, "/home/u/maiwork/T-1\n", ""
 
     env = SshEnv(lambda: _settings([{"name": "甲", "host": "a@10.0.0.1"}]), tmp_path, runner=runner)
     _run(env.acquire("T-1"))
-    assert set(seen) <= {"PATH", "LANG", "HOME"}
+    allowed = {"PATH", "LANG", "HOME"}
+    if os.name == "nt":
+        allowed.add("PROGRAMDATA")
+    assert set(seen) <= allowed
 
 
 # ---------------------------------------------------------------- 连通检查（网页健康项用）
