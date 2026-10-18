@@ -21,8 +21,9 @@
 
 安全要点：
 - 所有命令拼接一律 shlex.quote，经 argv 传 exec，不过本机 shell。
-- ssh / scp / ssh-keygen 子进程只给最小环境（PATH/HOME/LANG），绝不继承插件进程的
-  环境变量（防密钥漏给子进程）。
+- ssh / scp / ssh-keygen 子进程只给最小环境，绝不继承插件进程的环境变量（防密钥漏给
+  子进程）。平台差异（Windows 的 PROGRAMDATA、绝对路径启动）统一在
+  openssh_client.py，和专用 SSH 机器共用同一份规则。
 - manifest 里的 preview_url / human_claim_url 落成 Box 属性，绝不写日志、绝不外传
   （认领前预览链接只有创建它的 IP 能开；claim 要账号，红线不做）。
 - 绝不把「工作区文件以外的本地数据」传上去——put 由调用方传本地路径，
@@ -42,6 +43,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from .. import clock
+from . import openssh_client
 from .local import LocalEnv, RunResult
 
 logger = logging.getLogger("maiwork.environments.railway")
@@ -51,10 +53,11 @@ __all__ = ["RailwayEnv", "Box"]
 _OK_STATUSES = ("trial_starting", "trial_ready")
 _RUN_GUARD_EXTRA_S = 120  # run 要求剩余时间比 timeout_s 多这么多秒才敢把活放上去
 _ACQUIRE_CONNECT_TIMEOUT = 25
-_MINIMAL_ENV = {
-    "PATH": LocalEnv._MINIMAL_PATH,
-    "LANG": "C.UTF-8",
-}
+_IS_WINDOWS = openssh_client.IS_WINDOWS
+_PLATFORM = "nt" if _IS_WINDOWS else "posix"  # 传给 openssh_client 的平台值（测试可注入）
+
+# 最小环境与「命令用绝对路径还是裸名字」的规则在 openssh_client.py（专用机器共用同一份）。
+_MINIMAL_ENV = openssh_client.minimal_env(posix_path=LocalEnv._MINIMAL_PATH)
 
 
 @dataclass
@@ -119,6 +122,14 @@ class RailwayEnv:
         if home:
             env["HOME"] = home  # ssh 自己要 HOME（lang/路径解析）；与插件的密钥无涉
         return env
+
+    def _tool(self, name: str) -> str:
+        """启动 ssh / scp / ssh-keygen 时用的名字（规则见 openssh_client.tool）。
+
+        Windows 上必须是绝对路径：CreateProcess 用父进程的 PATH 找命令，子进程
+        env 里的 PATH 它不认；当前目录还正好是放私钥的 railway/<job_id>/。
+        """
+        return openssh_client.tool(name, path=_MINIMAL_ENV["PATH"], platform=_PLATFORM)
 
     def _exec(self, argv: Sequence[str], *, timeout_s: float, cwd: Path | None = None) -> Any:
         """返回协程（同 LocalEnv._exec：本方法不 await，调用方自己包 wait_for）。"""
@@ -249,7 +260,7 @@ class RailwayEnv:
             pass  # exFAT 等不支持权限，尽量而已
         try:
             code, _out, err = await self._exec(
-                ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(key_path), "-q"],
+                [self._tool("ssh-keygen"), "-t", "ed25519", "-N", "", "-f", str(key_path), "-q"],
                 timeout_s=20,
                 cwd=key_dir,
             )
@@ -278,7 +289,7 @@ class RailwayEnv:
                 pass
 
         # 不带命令连一次：JSON manifest 在 stdout，每次都打印（docs/09 一、1.b）
-        ssh_argv = ["ssh", *self._ssh_base(key_path, known_hosts), "railway.new"]
+        ssh_argv = [self._tool("ssh"), *self._ssh_base(key_path, known_hosts), "railway.new"]
         try:
             code, out, _err = await self._exec(ssh_argv, timeout_s=_ACQUIRE_CONNECT_TIMEOUT + 20, cwd=key_dir)
         except Exception:
@@ -390,7 +401,7 @@ class RailwayEnv:
                 oom=False,
             )
         argv = [
-            "ssh",
+            self._tool("ssh"),
             *self._ssh_base(box.key_path, Path(box.key_dir or box.key_path.parent) / "known_hosts"),
             "railway.new",
             "--",
@@ -441,7 +452,7 @@ class RailwayEnv:
         if not remote.startswith("/"):
             raise ValueError(f"远端路径必须是绝对路径（建议 /app/xxx）：{remote!r}")
         argv = [
-            "scp",
+            self._tool("scp"),
             *self._ssh_base(box.key_path, Path(box.key_dir or box.key_path.parent) / "known_hosts"),
             str(local),
             f"railway.new:{shlex.quote(remote)}",
@@ -459,7 +470,7 @@ class RailwayEnv:
         local = Path(local_path)
         local.parent.mkdir(parents=True, exist_ok=True)
         argv = [
-            "scp",
+            self._tool("scp"),
             *self._ssh_base(box.key_path, Path(box.key_dir or box.key_path.parent) / "known_hosts"),
             f"railway.new:{shlex.quote(remote)}",
             str(local),

@@ -70,44 +70,27 @@ def _run(coro):
 
 
 # ---------------------------------------------------------------- 客户端环境
+# 平台规则本身在 tests/test_openssh_client.py；这里只验 SshEnv 用的是那份规则。
 
 
-def test_ssh_minimal_env_keeps_posix_path_and_drops_process_secrets() -> None:
-    env = ssh_module._ssh_minimal_env(
-        platform="posix",
-        environ={"PATH": "/untrusted", "TOKEN": "secret", "PROGRAMDATA": "/not-used"},
+def test_ssh_env_keeps_posix_path_and_drops_process_secrets() -> None:
+    """SshEnv 给子进程的环境 = 公共规则 + HOME；插件进程的变量一个都不带。"""
+    env = SshEnv._env()
+    assert env["PATH"] == ssh_module.LocalEnv._MINIMAL_PATH
+    assert env["LANG"] == "C.UTF-8"
+    assert set(env) <= {"PATH", "LANG", "HOME", "PROGRAMDATA"}
+
+
+def test_ssh_env_windows_adds_programdata(monkeypatch) -> None:
+    """Windows 上 PATH 走系统目录、另给 PROGRAMDATA（OpenSSH 缺它会静默退出 255）。"""
+    monkeypatch.setattr(
+        ssh_module, "_MINIMAL_ENV",
+        {"PATH": r"C:\Windows\System32\OpenSSH;C:\Windows\System32",
+         "LANG": "C.UTF-8", "PROGRAMDATA": r"C:\ProgramData"},
     )
-    assert env == {"PATH": ssh_module.LocalEnv._MINIMAL_PATH, "LANG": "C.UTF-8"}
-
-
-def test_ssh_minimal_env_uses_only_trusted_windows_system_paths() -> None:
-    env = ssh_module._ssh_minimal_env(
-        platform="nt",
-        environ={
-            "SystemRoot": r"C:\Windows",
-            "PROGRAMDATA": r"C:\ProgramData",
-            "PATH": r"C:\Users\alice\bin",
-            "TOKEN": "secret",
-        },
-    )
-    assert env == {
-        "PATH": r"C:\Windows\System32\OpenSSH;C:\Windows\System32",
-        "LANG": "C.UTF-8",
-        "PROGRAMDATA": r"C:\ProgramData",
-    }
-
-
-def test_ssh_minimal_env_accepts_windir_fallback() -> None:
-    env = ssh_module._ssh_minimal_env(platform="nt", environ={"WINDIR": r"D:\Windows"})
-    assert env["PATH"] == r"D:\Windows\System32\OpenSSH;D:\Windows\System32"
-    assert "PROGRAMDATA" not in env
-
-
-def test_ssh_minimal_env_windows_without_system_root_is_empty() -> None:
-    """SystemRoot / WINDIR 都没有时 PATH 是空串，调用方必须当成「环境异常」而不是「命令缺失」。"""
-    env = ssh_module._ssh_minimal_env(platform="nt", environ={})
-    assert env["PATH"] == ""
-    assert "PROGRAMDATA" not in env
+    env = SshEnv._env()
+    assert env["PROGRAMDATA"] == r"C:\ProgramData"
+    assert env["PATH"].startswith(r"C:\Windows\System32")
 
 
 # ------------------------------------------------------- 命令一律用绝对路径启动
@@ -119,7 +102,7 @@ def test_client_commands_are_launched_by_absolute_path(tmp_path, monkeypatch) ->
     import shutil
 
     monkeypatch.setattr(shutil, "which", lambda command, *, path=None: f"/opt/ssh/bin/{command}")
-    monkeypatch.setattr(ssh_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(ssh_module, "_PLATFORM", "nt")
     runner = FakeRunner()
     env = SshEnv(lambda: _settings([{"name": "甲", "host": "a@10.0.0.1"}]), tmp_path, runner=runner.run)
     assert _run(env.acquire("T-1")) is not None
@@ -138,7 +121,7 @@ def test_client_command_probe_uses_minimal_path(tmp_path, monkeypatch) -> None:
         return f"/opt/ssh/bin/{command}"
 
     monkeypatch.setattr(shutil, "which", lookup)
-    monkeypatch.setattr(ssh_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(ssh_module, "_PLATFORM", "nt")
     env = SshEnv(lambda: _settings([{"name": "甲", "host": "a@10.0.0.1"}]), tmp_path, runner=FakeRunner().run)
     _run(env.acquire("T-1"))
     assert paths and all(p == ssh_module._MINIMAL_ENV["PATH"] for p in paths)
@@ -150,7 +133,7 @@ def test_client_command_paths_stay_bare_on_posix(tmp_path, monkeypatch) -> None:
     import shutil
 
     monkeypatch.setattr(shutil, "which", lambda command, *, path=None: f"/usr/bin/{command}")
-    monkeypatch.setattr(ssh_module, "_IS_WINDOWS", False)
+    monkeypatch.setattr(ssh_module, "_PLATFORM", "posix")
     runner = FakeRunner()
     env = SshEnv(lambda: _settings([{"name": "甲", "host": "a@10.0.0.1"}]), tmp_path, runner=runner.run)
     _run(env.acquire("T-1"))
@@ -162,7 +145,7 @@ def test_windows_without_system_root_reports_environment_error(tmp_path, monkeyp
     """Windows 上读不到 SystemRoot/WINDIR：报「系统环境异常」，不能误报成「缺 ssh 命令」。"""
     import shutil
 
-    monkeypatch.setattr(ssh_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(ssh_module, "_PLATFORM", "nt")
     monkeypatch.setattr(ssh_module, "_MINIMAL_ENV", {"PATH": "", "LANG": "C.UTF-8"})
     monkeypatch.setattr(shutil, "which", lambda command, *, path=None: None)
     env = SshEnv(lambda: _settings([{"name": "甲", "host": "a@10.0.0.1"}]), tmp_path, runner=FakeRunner().run)

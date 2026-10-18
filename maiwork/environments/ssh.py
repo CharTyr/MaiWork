@@ -18,27 +18,25 @@
 
 安全要点：
 - host 写法严格校验（user@地址:端口），不许 - 开头、不许空白和 shell 字符（防参数注入）。
-- 子进程只给最小环境，绝不继承插件进程的环境变量：POSIX 是 PATH/LANG/HOME；
-  Windows 另加 PROGRAMDATA（OpenSSH 要从那里读系统级配置，缺了会静默退出 255），
-  PATH 只给 System32 下的 OpenSSH 和 System32 两个系统目录。
-- 客户端命令（ssh / scp / ssh-keygen）在 Windows 上一律用绝对路径启动：CreateProcess
-  按**父进程**的 PATH 找命令，子进程 env 里的 PATH 它不认。
+- 子进程只给最小环境，绝不继承插件进程的环境变量（防密钥漏给子进程）。
+- 平台差异统一在 openssh_client.py（和一次性 VM 共用同一份）：Windows 要带
+  PROGRAMDATA、PATH 只给 System32 下的两个系统目录、客户端命令走绝对路径
+  （CreateProcess 按父进程的 PATH 找命令，子进程 env 里的 PATH 它不认）。
 - 这台机器上的隔离由用户自己负责（它就是给 MaiWork 专用的机器）；网页和 README 写明。
 """
 
 from __future__ import annotations
 
 import logging
-import ntpath
 import os
 import re
 import shlex
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from .. import clock
+from . import openssh_client
 from .local import LocalEnv, RunResult
 
 logger = logging.getLogger("maiwork.environments.ssh")
@@ -51,39 +49,11 @@ _HOST_RE = re.compile(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})(?:\.[A-Za-z0-9-]{1
 _JOB_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _REL_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}(?:/[A-Za-z0-9_][A-Za-z0-9._-]{0,127}){0,15}$")
 _ABS_SAFE_RE = re.compile(r"^/[A-Za-z0-9._/-]{1,400}$")
-_IS_WINDOWS = os.name == "nt"
+_IS_WINDOWS = openssh_client.IS_WINDOWS
+_PLATFORM = "nt" if _IS_WINDOWS else "posix"  # 传给 openssh_client 的平台值（测试可注入）
 
-
-def _ssh_minimal_env(*, platform: str | None = None, environ: Any = None) -> dict[str, str]:
-    """Return the allowlisted environment used by local OpenSSH clients."""
-    platform = os.name if platform is None else platform
-    source = os.environ if environ is None else environ
-    if platform != "nt":
-        return {"PATH": LocalEnv._MINIMAL_PATH, "LANG": "C.UTF-8"}
-
-    system_root = str(source.get("SystemRoot") or source.get("WINDIR") or "").strip()
-    path = ""
-    if system_root:
-        system32 = ntpath.join(system_root, "System32")
-        path = ";".join((ntpath.join(system32, "OpenSSH"), system32))
-    env = {"PATH": path, "LANG": "C.UTF-8"}
-    # Windows OpenSSH reads its system-wide configuration from ProgramData and
-    # exits without diagnostics when this variable is absent.
-    program_data = str(source.get("PROGRAMDATA") or "").strip()
-    if program_data:
-        env["PROGRAMDATA"] = program_data
-    return env
-
-
-_MINIMAL_ENV = _ssh_minimal_env()
-
-
-def _windows_env_broken() -> bool:
-    """Windows 上 PATH 是空的 = 读不到 SystemRoot/WINDIR，连系统目录都定位不了。
-
-    这时报「缺 ssh 命令」是假话（用户装了也修不好），要单独说系统环境异常。
-    """
-    return _IS_WINDOWS and not str(_MINIMAL_ENV.get("PATH") or "").strip()
+# 最小环境与「命令用绝对路径还是裸名字」的规则在 openssh_client.py（一次性 VM 共用同一份）。
+_MINIMAL_ENV = openssh_client.minimal_env(posix_path=LocalEnv._MINIMAL_PATH)
 
 
 def parse_host(raw: Any) -> tuple[str, str, int]:
@@ -155,27 +125,17 @@ class SshEnv:
     # 配置 / 小工具
     # ------------------------------------------------------------------
 
-    _TOOL_NAMES = ("ssh-keygen", "ssh", "scp")
-
     def _probe_tools(self) -> dict[str, str]:
         """按**子进程那份最小 PATH** 找 ssh / scp / ssh-keygen；找不到的值是空串。
 
         这条检查两个平台都要做（issue #2：缺 openssh-client 要能说清楚），
         与「用什么名字启动」是两件事，见 `_tool()`。
         """
-        return {n: (shutil.which(n, path=_MINIMAL_ENV["PATH"]) or "") for n in self._TOOL_NAMES}
+        return openssh_client.resolve_tools(_MINIMAL_ENV["PATH"])
 
     def _tool(self, name: str) -> str:
-        """启动某个客户端命令时用的名字。
-
-        - POSIX：裸名字，子进程按自己 env 里的 PATH 找（行为一直如此，不变）；
-        - Windows：**必须**绝对路径。CreateProcess 用父进程的 PATH 找命令，
-          子进程 env 里给的 PATH 它不认；传裸名字会去父进程 PATH 甚至当前目录
-          （正好是放私钥的 ssh/ 目录）里找，要么起不来，要么跑到不相干的程序。
-        """
-        if not _IS_WINDOWS:
-            return name
-        return self._probe_tools().get(name) or name
+        """启动某个客户端命令时用的名字（规则见 openssh_client.tool）。"""
+        return openssh_client.tool(name, path=_MINIMAL_ENV["PATH"], platform=_PLATFORM)
 
     def machines(self) -> list[dict]:
         """配置里的机器（顺序即优先级）；地址写错的带 error，不参与挑选。"""
@@ -247,7 +207,7 @@ class SshEnv:
 
     async def ensure_key(self) -> str:
         """检查客户端工具，没有 key 就生成；失败状态供网页读取。"""
-        if _windows_env_broken():
+        if openssh_client.windows_env_broken(_MINIMAL_ENV, platform=_PLATFORM):
             # 读不到 SystemRoot/WINDIR 时 PATH 是空的，任何命令都「找不到」——
             # 这时说「缺 ssh 命令」是假话，用户装了也没用。
             self._initialization_error = (

@@ -20,6 +20,7 @@ import pytest
 
 from CharTyr_MaiWork.maiwork import clock
 from CharTyr_MaiWork.maiwork.config import load_settings
+from CharTyr_MaiWork.maiwork.environments import railway as railway_module
 from CharTyr_MaiWork.maiwork.environments.railway import Box, RailwayEnv
 from CharTyr_MaiWork.maiwork.store import Store
 
@@ -349,6 +350,40 @@ class TestRun:
         # acquire 那次连一次同样最小
         acq_env = calls[1]["env"]
         assert set(acq_env) <= {"PATH", "HOME", "LANG", "LC_ALL", "TERM"}
+
+    @pytest.mark.asyncio
+    async def test_env_follows_platform_rules(self, tmp_path: Path) -> None:
+        """Windows 上要带 PROGRAMDATA，否则 Win32-OpenSSH 静默退出 255。"""
+        responses = _keygen_and_manifest(_manifest()) + [(0, "ok", "")]
+        runner, calls = runner_scripted(responses)
+        env, _s, _ = _make_env(tmp_path, runner=runner)
+        box = await env.acquire("job-win")
+        assert box is not None
+        assert calls[-1]["env"]["PATH"] == railway_module.LocalEnv._MINIMAL_PATH
+
+    @pytest.mark.asyncio
+    async def test_windows_launches_clients_by_absolute_path(self, tmp_path: Path, monkeypatch) -> None:
+        """Windows 的 CreateProcess 用父进程 PATH：ssh / scp / ssh-keygen 必须是绝对路径。
+
+        否则子进程 env 里的 PATH 不生效，传裸名字会去父进程 PATH、甚至当前目录
+        （正好是放私钥的 railway/<job>/ 目录）里找。
+        """
+        monkeypatch.setattr(railway_module, "_PLATFORM", "nt")
+        monkeypatch.setattr(
+            railway_module.openssh_client, "resolve_tools",
+            lambda path, **kw: {n: rf"C:\Windows\System32\OpenSSH\{n}.exe" for n in ("ssh-keygen", "ssh", "scp")},
+        )
+        responses = _keygen_and_manifest(_manifest()) + [(0, "", ""), (0, "ok", "")]
+        runner, calls = runner_scripted(responses)
+        env, _s, _ = _make_env(tmp_path, runner=runner)
+        box = await env.acquire("job-abs")
+        assert box is not None
+        await env.run(box, "true", timeout_s=30)
+        import ntpath
+        heads = [ntpath.basename(str(c["argv"][0])).removesuffix(".exe") for c in calls]
+        assert all(h in ("ssh", "scp", "ssh-keygen") for h in heads), heads
+        for c in calls:
+            assert str(c["argv"][0]).startswith("C:" + chr(92) + "Windows" + chr(92) + "System32" + chr(92) + "OpenSSH" + chr(92)), c["argv"][0]
 
 
 # ----------------------------------------------------------------------
