@@ -13,6 +13,7 @@ authorized_keys 里加）连上去干活：
 from __future__ import annotations
 
 import asyncio
+import os
 import types
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,40 @@ class FakeRunner:
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+# ---------------------------------------------------------------- 客户端环境
+
+
+def test_ssh_minimal_env_keeps_posix_path_and_drops_process_secrets() -> None:
+    env = ssh_module._ssh_minimal_env(
+        platform="posix",
+        environ={"PATH": "/untrusted", "TOKEN": "secret", "PROGRAMDATA": "/not-used"},
+    )
+    assert env == {"PATH": ssh_module.LocalEnv._MINIMAL_PATH, "LANG": "C.UTF-8"}
+
+
+def test_ssh_minimal_env_uses_only_trusted_windows_system_paths() -> None:
+    env = ssh_module._ssh_minimal_env(
+        platform="nt",
+        environ={
+            "SystemRoot": r"C:\Windows",
+            "PROGRAMDATA": r"C:\ProgramData",
+            "PATH": r"C:\Users\alice\bin",
+            "TOKEN": "secret",
+        },
+    )
+    assert env == {
+        "PATH": r"C:\Windows\System32\OpenSSH;C:\Windows\System32",
+        "LANG": "C.UTF-8",
+        "PROGRAMDATA": r"C:\ProgramData",
+    }
+
+
+def test_ssh_minimal_env_accepts_windir_fallback() -> None:
+    env = ssh_module._ssh_minimal_env(platform="nt", environ={"WINDIR": r"D:\Windows"})
+    assert env["PATH"] == r"D:\Windows\System32\OpenSSH;D:\Windows\System32"
+    assert "PROGRAMDATA" not in env
 
 
 # ---------------------------------------------------------------- host 解析
@@ -326,7 +361,10 @@ def test_minimal_env_for_subprocess(tmp_path) -> None:
 
     env = SshEnv(lambda: _settings([{"name": "甲", "host": "a@10.0.0.1"}]), tmp_path, runner=runner)
     _run(env.acquire("T-1"))
-    assert set(seen) <= {"PATH", "LANG", "HOME"}
+    allowed = {"PATH", "LANG", "HOME"}
+    if os.name == "nt":
+        allowed.add("PROGRAMDATA")
+    assert set(seen) <= allowed
 
 
 # ---------------------------------------------------------------- 连通检查（网页健康项用）

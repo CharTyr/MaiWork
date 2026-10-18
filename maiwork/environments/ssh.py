@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import logging
+import ntpath
 import os
 import re
 import shlex
@@ -46,7 +47,30 @@ _HOST_RE = re.compile(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})(?:\.[A-Za-z0-9-]{1
 _JOB_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _REL_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}(?:/[A-Za-z0-9_][A-Za-z0-9._-]{0,127}){0,15}$")
 _ABS_SAFE_RE = re.compile(r"^/[A-Za-z0-9._/-]{1,400}$")
-_MINIMAL_ENV = {"PATH": LocalEnv._MINIMAL_PATH, "LANG": "C.UTF-8"}
+
+
+def _ssh_minimal_env(*, platform: str | None = None, environ: Any = None) -> dict[str, str]:
+    """Return the allowlisted environment used by local OpenSSH clients."""
+    platform = os.name if platform is None else platform
+    source = os.environ if environ is None else environ
+    if platform != "nt":
+        return {"PATH": LocalEnv._MINIMAL_PATH, "LANG": "C.UTF-8"}
+
+    system_root = str(source.get("SystemRoot") or source.get("WINDIR") or "").strip()
+    path = ""
+    if system_root:
+        system32 = ntpath.join(system_root, "System32")
+        path = ";".join((ntpath.join(system32, "OpenSSH"), system32))
+    env = {"PATH": path, "LANG": "C.UTF-8"}
+    # Windows OpenSSH reads its system-wide configuration from ProgramData and
+    # exits without diagnostics when this variable is absent.
+    program_data = str(source.get("PROGRAMDATA") or "").strip()
+    if program_data:
+        env["PROGRAMDATA"] = program_data
+    return env
+
+
+_MINIMAL_ENV = _ssh_minimal_env()
 
 
 def parse_host(raw: Any) -> tuple[str, str, int]:
