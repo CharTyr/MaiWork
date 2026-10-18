@@ -80,6 +80,8 @@ stopped → 其它所有情况（非 Linux、没 systemd、非 root）
 - `run(box, command)`：远端 `bash -lc` 跑（有 `timeout` 就用它限时），退出码原样回传。
 - `put / get`：白名单校验相对路径，scp 传文件。
 - `release(box)`：只释「忙」标记，远端目录留着（用户自己的机器）。
+- 子进程环境：只给最小集，绝不继承插件进程的环境。POSIX 是 `PATH`（系统目录）+ `LANG` + `HOME`；Windows 另加 `PROGRAMDATA`（OpenSSH 从那里读系统级配置，缺了静默退出 255），`PATH` 只给 `System32\OpenSSH` 和 `System32`。Windows 上 `ssh` / `scp` / `ssh-keygen` 一律用 `shutil.which` 找到的**绝对路径**启动（CreateProcess 用父进程 PATH，子进程 env 的 PATH 不生效）；POSIX 仍传裸名字。
+- 初始化失败的原因写在 `initialization_error()`，网页健康项读它显示；不含子进程原始输出（防密钥进网页）。
 - 机器隔离由用户自己负责——这是专用机器，不是共享沙箱。
 
 **Railway（railway.py）——一次性 VM：**
