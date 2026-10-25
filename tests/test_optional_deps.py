@@ -372,7 +372,11 @@ async def test_install_env_has_no_host_secrets(store, tmp_path: Path, monkeypatc
     deps.start_install("office")
     await deps.wait()
     env = calls[0]["env"]
-    assert set(env) == set(od.PIP_ENV_KEYS)
+    # SystemRoot / windir 只在 Windows 上带（PR #5）；其余白名单项每个平台都要有
+    windows_only = {"SystemRoot", "windir"}
+    assert set(env) <= set(od.PIP_ENV_KEYS)
+    assert set(od.PIP_ENV_KEYS) - windows_only <= set(env)
+    assert (set(env) & windows_only) == set(od.windows_system_env())
     assert "TYPESAFE_API_KEY" not in env and "MAIWORK_TEST_SECRET" not in env
     assert env["PATH"] == od.PIP_PATH
     assert env["HOME"] == str(tmp_path)  # pylibs 的上一级，不是宿主 HOME
