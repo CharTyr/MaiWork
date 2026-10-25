@@ -63,6 +63,11 @@ def minimal_env(
         system32 = ntpath.join(system_root, "System32")
         path = ";".join((ntpath.join(system32, "OpenSSH"), system32))
     env = {"PATH": path, "LANG": "C.UTF-8"}
+    if system_root:
+        # Win32-OpenSSH 少了 SystemRoot 就初始化不了 Winsock：会报「无法加载或初始化请求的
+        # 服务提供程序」，并被 ssh 当成主机名解析失败直接退 255（实测：只补这一项即恢复）。
+        env["SystemRoot"] = system_root
+        env["windir"] = system_root
     program_data = str(source.get("PROGRAMDATA") or "").strip()
     if program_data:
         env["PROGRAMDATA"] = program_data

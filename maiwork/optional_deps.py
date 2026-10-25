@@ -56,7 +56,7 @@ logger = logging.getLogger("maiwork.optional_deps")
 
 __all__ = [
     "GROUPS", "Group", "Package", "OptionalDeps", "Busy", "Unavailable",
-    "pylibs_dir", "package_specs", "pip_argv", "pip_env", "probe_command",
+    "pylibs_dir", "package_specs", "pip_argv", "pip_env", "windows_system_env", "probe_command",
     "KV_PREFIX", "INSTALL_TIMEOUT_S", "MAX_ERROR_CHARS", "PIP_PATH", "PIP_ENV_KEYS",
 ]
 
@@ -77,7 +77,25 @@ PIP_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
 PIP_ENV_KEYS = (
     "PATH", "HOME", "LANG",
     "PIP_DISABLE_PIP_VERSION_CHECK", "PIP_NO_INPUT", "PIP_NO_CACHE_DIR", "PYTHONNOUSERSITE",
+    "SystemRoot", "windir",
 )
+
+
+def windows_system_env() -> dict[str, str]:
+    """Windows 上给子进程补 SystemRoot / windir；其余平台返回空。
+
+    Win32 的 Winsock 初始化要读这两个变量里的系统目录。子进程环境是**最小环境**
+    （故意不继承插件进程），漏掉这两项时任何碰套接字的动作都会失败：
+    pip 下载 → 连不上；`from playwright.sync_api import ...` → 直接
+    「OSError [WinError 10106] 无法加载或初始化请求的服务提供程序」，
+    于是被误判成「没装 playwright」。实测：只补这两项即恢复。
+    """
+    if os.name != "nt":
+        return {}
+    root = str(os.environ.get("SystemRoot") or os.environ.get("WINDIR") or "").strip()
+    if not root:
+        return {}
+    return {"SystemRoot": root, "windir": root}
 
 # 只检测、不安装的外部命令（系统级软件，MaiWork 不替用户装）。
 _TOOL_CHECKS: dict[str, dict[str, Any]] = {
@@ -193,7 +211,10 @@ def pip_argv(python: str, target: Path, specs: Sequence[str]) -> list[str]:
 
 
 def pip_env(target: Path) -> dict[str, str]:
-    """pip 进程的最小环境：最小 PATH、HOME 指到目录上一级（别去写 /root）、禁缓存。"""
+    """pip 进程的最小环境：最小 PATH、HOME 指到目录上一级（别去写 /root）、禁缓存。
+
+    Windows 另补 SystemRoot / windir（少了 pip 连不上网，见 `windows_system_env`）。
+    """
     return {
         "PATH": PIP_PATH,
         "HOME": str(Path(target).parent),
@@ -202,6 +223,7 @@ def pip_env(target: Path) -> dict[str, str]:
         "PIP_NO_INPUT": "1",
         "PIP_NO_CACHE_DIR": "1",
         "PYTHONNOUSERSITE": "1",
+        **windows_system_env(),
     }
 
 

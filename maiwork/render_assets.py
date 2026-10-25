@@ -372,13 +372,20 @@ def chromium_install_argv(python: str) -> list[str]:
 
 
 def chromium_env(browsers_dir: Path, *, hostlibs: Path | None) -> dict[str, str]:
-    """playwright 子进程的最小环境：浏览器装到 / 从 MaiWork 自己的目录找；不继承插件进程的环境。"""
+    """playwright 子进程的最小环境：浏览器装到 / 从 MaiWork 自己的目录找；不继承插件进程的环境。
+
+    Windows 另补 SystemRoot / windir：少了这两项，子进程里的 `import playwright`
+    会因为 Winsock 初始化失败报 WinError 10106，被误判成「没装 playwright」。
+    """
+    from .optional_deps import windows_system_env
+
     env = {
         "PATH": _MIN_PATH,
         "HOME": str(Path(browsers_dir).parent),
         "LANG": "C.UTF-8",
         "PLAYWRIGHT_BROWSERS_PATH": str(browsers_dir),
         "PYTHONNOUSERSITE": "1",
+        **windows_system_env(),
     }
     if hostlibs is not None:
         env["PYTHONPATH"] = str(hostlibs)
