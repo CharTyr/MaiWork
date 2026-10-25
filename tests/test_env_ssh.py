@@ -78,7 +78,8 @@ def test_ssh_env_keeps_posix_path_and_drops_process_secrets() -> None:
     env = SshEnv._env()
     assert env["PATH"] == ssh_module.LocalEnv._MINIMAL_PATH
     assert env["LANG"] == "C.UTF-8"
-    assert set(env) <= {"PATH", "LANG", "HOME", "PROGRAMDATA"}
+    allowed = {"PATH", "LANG", "HOME", "PROGRAMDATA", "SystemRoot", "windir"}
+    assert set(env) <= allowed
 
 
 def test_ssh_env_windows_adds_programdata(monkeypatch) -> None:
@@ -419,7 +420,8 @@ def test_minimal_env_for_subprocess(tmp_path) -> None:
     _run(env.acquire("T-1"))
     allowed = {"PATH", "LANG", "HOME"}
     if os.name == "nt":
-        allowed.add("PROGRAMDATA")
+        # Windows 的 OpenSSH 还要 SystemRoot/windir 才能初始化 Winsock（缺了就退 255）
+        allowed |= {"PROGRAMDATA", "SystemRoot", "windir"}
     assert set(seen) <= allowed
 
 

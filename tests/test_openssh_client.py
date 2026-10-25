@@ -44,6 +44,10 @@ def test_windows_env_uses_only_trusted_system_paths() -> None:
         "PATH": r"C:\Windows\System32\OpenSSH;C:\Windows\System32",
         "LANG": "C.UTF-8",
         "PROGRAMDATA": r"C:\ProgramData",
+        # Win32-OpenSSH 少了 SystemRoot 就初始化不了 Winsock（退 255），
+        # 所以这一项也要一路传给子进程；值只来自受信的 SystemRoot/WINDIR。
+        "SystemRoot": r"C:\Windows",
+        "windir": r"C:\Windows",
     }
 
 
