@@ -208,6 +208,9 @@ def test_missing_client_commands_warn_even_without_machines(tmp_path, monkeypatc
         return None if command in missing else f"/usr/bin/{command}"
 
     monkeypatch.setattr(shutil, "which", lookup)
+    # 钉住「Linux + Docker」：修法提示按系统给，这里验的是容器那句
+    monkeypatch.setattr(ssh_module, "_HINT_PLATFORM", "linux")
+    monkeypatch.setattr(ssh_module.openssh_client, "_in_docker", lambda: True)
     runner = FakeRunner()
     machines = [{"name": "甲", "host": "a@10.0.0.1"}] if configured else []
     env = SshEnv(lambda: _settings(machines), tmp_path, runner=runner.run)
@@ -215,7 +218,7 @@ def test_missing_client_commands_warn_even_without_machines(tmp_path, monkeypatc
     health = _health(env)
     assert health["state"] == "warn"
     assert all(command in health["text"] for command in missing)
-    assert "容器" in health["text"] and "openssh-client" in health["text"]
+    assert "容器" in health["text"] and "apt-get install -y openssh-client" in health["text"]
     assert "copy" not in health
     assert not runner.calls  # 初始化失败不再探测远端
     assert paths and all(path == ssh_module._MINIMAL_ENV["PATH"] for path in paths)
@@ -467,3 +470,16 @@ def test_web_settings_reject_bad_host() -> None:
         _check_ssh_list([{"name": "甲", "host": "-oProxyCommand=x"}])
     with pytest.raises(ValueError):
         _check_ssh_list([{"name": "甲", "host": "u@a;b"}])
+
+
+def test_missing_client_on_windows_points_to_optional_feature(tmp_path, monkeypatch):
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda command, *, path=None: None if command == "ssh" else f"/x/{command}")
+    monkeypatch.setattr(ssh_module, "_HINT_PLATFORM", "nt")
+    env = SshEnv(lambda: _settings([]), tmp_path, runner=FakeRunner().run)
+    _run(env.check_all())
+    health = _health(env)
+    assert health["state"] == "warn"
+    assert "OpenSSH 客户端" in health["text"] and "Add-WindowsCapability" in health["text"]
+    assert "Git" in health["text"]

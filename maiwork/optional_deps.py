@@ -461,7 +461,11 @@ class OptionalDeps:
         runner: Any = None,
         timeout_s: int = INSTALL_TIMEOUT_S,
         probe_timeout_s: int = PROBE_TIMEOUT_S,
+        assets: Any = None,
     ) -> None:
+        # 画图组件（render_assets.RenderAssets：中文字体 / 画图浏览器）。给 MaiWork 自己画图用、
+        # 不走子 agent，所以本机执行没开也能装；网页上和办公文档并列（groups 里 kind="asset"）。
+        self._assets = assets
         self._store = store
         self._get_settings = get_settings
         self._env = env
@@ -615,6 +619,8 @@ class OptionalDeps:
 
     async def wait(self) -> None:
         """等后台的装 / 卸跑完（接口和测试用）。"""
+        if self._assets is not None:
+            await self._assets.wait()
         for _ in range(100):
             pending = [t for t in self._tasks if not t.done()]
             if not pending:
@@ -638,6 +644,11 @@ class OptionalDeps:
 
     async def refresh(self) -> dict[str, Any]:
         """现在探测一次并落 kv，返回最新状态。"""
+        if self._assets is not None:
+            try:
+                await self._assets.refresh()
+            except Exception:
+                logger.warning("探测画图组件出错", exc_info=True)
         if self._env is None:
             self._cache = {}
             return self.status()
@@ -659,10 +670,19 @@ class OptionalDeps:
         return self.status()
 
     def checked(self) -> bool:
-        return float(self._check().get("at") or 0.0) > 0
+        office = float(self._check().get("at") or 0.0) > 0
+        if self._assets is None:
+            return office
+        # 本机执行没开时办公文档那组探测不了（永远「没探测过」），别因此每次 GET 都重起一次浏览器探测
+        return (office or self._env is None) and bool(self._assets.checked())
 
     def maybe_refresh(self, *, max_age: float = CHECK_TTL_S) -> bool:
         """缓存过期就后台刷一次（不阻塞请求）；没事件循环 / 不可用时什么都不做。"""
+        if self._assets is not None:
+            try:
+                self._assets.maybe_refresh(max_age=max_age)
+            except Exception:
+                logger.debug("后台刷新画图组件出错", exc_info=True)
         if self._env is None or self._checking:
             return False
         at = float(self._check().get("at") or 0.0)
@@ -765,6 +785,9 @@ class OptionalDeps:
                 last_error = "上次操作因插件重新加载而中断，请重新操作"
             groups.append({
                 "id": gid,
+                "kind": "pip",
+                "available": not note,
+                "note": note,
                 "label": group.label,
                 "purpose": group.purpose,
                 "state": state,
@@ -783,6 +806,11 @@ class OptionalDeps:
                 },
                 "error": last_error if last_state in ("failed", "interrupted") else "",
             })
+        if self._assets is not None:
+            try:
+                groups.extend(self._assets.status_groups())
+            except Exception:
+                logger.warning("读画图组件状态出错", exc_info=True)
         return {
             "available": not note,
             "note": note,
@@ -790,7 +818,7 @@ class OptionalDeps:
             "python": str(check.get("python") or ""),
             "python_version": str(check.get("version") or ""),
             "checked_at": at,
-            "checking": bool(self._checking),
+            "checking": bool(self._checking) or bool(self._assets is not None and self._assets.busy()),
             "check_error": str(check.get("error") or ""),
             "groups": groups,
         }
@@ -799,6 +827,9 @@ class OptionalDeps:
 
     def start_install(self, group_id: str, *, by: str = "网页管理员") -> dict[str, Any]:
         """后台装这一组，立刻返回状态。已在装 → Busy；本机执行没就位 → Unavailable。"""
+        if self._assets is not None and str(group_id) in self._assets.group_ids:
+            self._assets.start_install(str(group_id), by=str(by))
+            return self.status()
         group = _group(group_id)
         note = self._unavailable_note()
         if note:
@@ -823,6 +854,9 @@ class OptionalDeps:
         走的是 `_run_note()`（只看能不能跑命令），**不**吃 dynamic 模式那条安装限制：
         那种机器上照样要能把这组文件删掉。
         """
+        if self._assets is not None and str(group_id) in self._assets.group_ids:
+            self._assets.start_uninstall(str(group_id), by=str(by))
+            return self.status()
         group = _group(group_id)
         note = self._run_note()
         if note:

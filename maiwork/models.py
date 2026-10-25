@@ -3783,8 +3783,9 @@ class Models:
         cache_read_i = max(0, int(cache_read or 0))
         cache_write_i = max(0, int(cache_write or 0))
         # 1) usage（原路；agent 列是 1b 新增的岗位账，role 两桶不变）
+        write_tx = self._store.immediate_tx if purpose == "session.triage" else self._store.tx
         try:
-            with self._store.tx() as conn:
+            with write_tx() as conn:
                 conn.execute(
                     "INSERT INTO usage (ts, day, role, agent, model, purpose, group_id, task_id,"
                     " prompt_tokens, completion_tokens, ok, ms, error, usage_src, cache_read, cache_write, attempt)"
@@ -3813,7 +3814,7 @@ class Models:
             logger.exception("写 usage 失败（model=%s ok=%s）", model, ok)
         # 2) model_calls（请求日志）
         try:
-            with self._store.tx() as conn:
+            with write_tx() as conn:
                 conn.execute(
                     "INSERT INTO model_calls (ts, purpose, role, agent, model, group_id, task_id, attempt, ok,"
                     " status, ms, prompt_tokens, completion_tokens, error, request, response,"
@@ -3841,12 +3842,13 @@ class Models:
                         cache_write_i,
                     ),
                 )
-                row = conn.execute("SELECT COUNT(*) AS c FROM model_calls").fetchone()
-                count = int(row["c"]) if row is not None else 0
-                if count > 0 and count % _LOG_PRUNE_EVERY == 0:
-                    removed = self._store._prune_model_calls_tx(conn, now)
-                    if removed:
-                        logger.info("model_calls 顺手清理了 %d 行（每 %d 行一次）", removed, _LOG_PRUNE_EVERY)
+                if purpose != "session.triage":
+                    row = conn.execute("SELECT COUNT(*) AS c FROM model_calls").fetchone()
+                    count = int(row["c"]) if row is not None else 0
+                    if count > 0 and count % _LOG_PRUNE_EVERY == 0:
+                        removed = self._store._prune_model_calls_tx(conn, now)
+                        if removed:
+                            logger.info("model_calls 顺手清理了 %d 行（每 %d 行一次）", removed, _LOG_PRUNE_EVERY)
         except Exception:
             logger.exception("写 model_calls 失败（model=%s ok=%s）", model, ok)
 

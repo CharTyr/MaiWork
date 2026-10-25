@@ -10,11 +10,13 @@
 from __future__ import annotations
 
 import logging
+import json
+import sqlite3
 import os
 from pathlib import Path
 from typing import Any, Dict
 
-from maibot_sdk import HookHandler, MaiBotPlugin
+from maibot_sdk import Command, HookHandler, MaiBotPlugin
 from maibot_sdk.types import ErrorPolicy, HookMode
 
 from .maiwork.config import (
@@ -28,7 +30,7 @@ from .maiwork.config import (
 logger = logging.getLogger("maiwork")
 
 PLUGIN_ID = "chartyr.maiwork"
-PLUGIN_VERSION = "0.10.5"
+PLUGIN_VERSION = "0.11.0"
 
 __all__ = [
     "PLUGIN_ID",
@@ -54,6 +56,43 @@ class MaiWorkPlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._app = None
+        self._registered_session_pattern = r"(?!)"
+
+    def get_components(self):
+        """注册前只读自己的候选名；本次加载中正则不再改变。"""
+        from .maiwork.session_gate import build_pattern, bounded_names
+
+        settings, _ = load_settings(self._with_data_dir_override(self._self_config()))
+        names = list(settings.session.bot_names)
+        path = settings.data_dir / "maiwork.db"
+        try:
+            conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0)
+            try:
+                row = conn.execute("SELECT value FROM kv WHERE key='session.bot_names'").fetchone()
+                if row:
+                    names.extend(bounded_names(json.loads(row[0])))
+            finally:
+                conn.close()
+        except (sqlite3.Error, ValueError, TypeError):
+            logger.debug("加载时没有可用的机器人显示名记录，先用配置候选")
+        self._registered_session_pattern = build_pattern(names, [])
+        components = super().get_components()
+        for component in components:
+            if component.get("name") == "maiwork_session":
+                component["metadata"]["command_pattern"] = self._registered_session_pattern
+        return components
+
+    @Command("maiwork_session", description="工作会话 @ 入口", pattern=r"(?!)",
+        timeout_ms=5000, intercept_message_level=0)
+    async def maiwork_session(self, **kwargs):
+        """失败明确放行，不向宿主返回文本，不在回调里发送消息。"""
+        try:
+            gate = getattr(self._app, "session_gate", None)
+            if gate is not None:
+                return await gate.handle(kwargs)
+        except BaseException:
+            logger.warning("会话原生命令未完成，消息继续", exc_info=True)
+        return True, None, False
 
     # ------------------------------------------------------------------
     # 内部
@@ -88,6 +127,7 @@ class MaiWorkPlugin(MaiBotPlugin):
             return
         raw = self._with_data_dir_override(config_data or {})
         app = MaiWorkApp(ctx, raw, plugin_dir=_PLUGIN_DIR)
+        app.registered_session_pattern = self._registered_session_pattern
         try:
             await app.start()
         except Exception:
@@ -118,6 +158,12 @@ class MaiWorkPlugin(MaiBotPlugin):
     # ------------------------------------------------------------------
 
     async def on_load(self) -> None:
+        try:
+            if self._ctx is not None:
+                from .maiwork.host import Host
+                await Host(self._ctx).set_session_command_enabled(False)
+        except Exception:
+            logger.warning("加载时关闭会话原生命令失败，应用启动后重试", exc_info=True)
         try:
             cfg = self._self_config()
             if cfg.get("plugin", {}).get("enabled"):

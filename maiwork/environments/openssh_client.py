@@ -28,6 +28,8 @@ __all__ = [
     "windows_env_broken",
     "resolve_tools",
     "tool",
+    "missing_tools",
+    "install_hint",
 ]
 
 IS_WINDOWS = os.name == "nt"
@@ -101,3 +103,67 @@ def tool(name: str, *, path: str, platform: str | None = None, which: Any = None
     if platform != "nt":
         return name
     return resolve_tools(path, names=(name,), which=which).get(name) or name
+
+
+def missing_tools(which: Any = None, env: Mapping[str, str] | None = None) -> list[str]:
+    """按子进程那份最小 PATH 找 ssh / scp / ssh-keygen，返回缺的（顺序同 TOOL_NAMES）。
+
+    只做 `shutil.which` 级别的查找，很便宜；`which` / `env` 只为测试注入。
+    """
+    env = minimal_env() if env is None else env
+    found = resolve_tools(str(env.get("PATH") or ""), which=which)
+    return [name for name in TOOL_NAMES if not found.get(name)]
+
+
+def _in_docker() -> bool:
+    return os.path.exists("/.dockerenv")
+
+
+WINDOWS_ENV_BROKEN_HINT = (
+    "读不到 Windows 的系统目录（环境变量 SystemRoot / WINDIR 都没有）。"
+    "请在运行 MaiBot 的环境里补上 SystemRoot（一般是 C:\\Windows）再重试；"
+    "Docker / 服务方式启动时尤其容易漏掉这两个变量。"
+)
+
+
+def install_hint(
+    missing: Sequence[str],
+    *,
+    platform: str | None = None,
+    in_docker: bool | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """缺 SSH 客户端时按系统给的大白话修法；什么都不缺返回 ""。
+
+    `platform` 可传 os.name（"nt" / "posix"）或 sys.platform（"win32" / "darwin" / "linux"）。
+    """
+    if not missing:
+        return ""
+    import sys
+
+    plat = str(platform if platform is not None else sys.platform).lower()
+    is_win = plat in ("nt", "win32", "windows") or plat.startswith("win")
+    if is_win:
+        if env is not None and windows_env_broken(env, platform="nt"):
+            return WINDOWS_ENV_BROKEN_HINT
+        return (
+            "在 Windows 的「设置 → 系统 → 可选功能 → 添加功能」里装「OpenSSH 客户端」，"
+            "或用管理员 PowerShell 运行 Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0；"
+            "装完重启 MaiBot。注意：MaiWork 只认系统自带的（C:\\Windows\\System32\\OpenSSH 和 System32 里的），"
+            "Git 自带的 ssh 不算。"
+        )
+    if plat == "darwin":
+        return (
+            "macOS 本来自带 SSH 客户端，缺了多半是运行 MaiBot 的环境找不到它（PATH 问题）："
+            "确认 /usr/bin/ssh 还在，再重启 MaiBot。"
+        )
+    docker = _in_docker() if in_docker is None else bool(in_docker)
+    if docker:
+        return (
+            "请在 MaiBot 容器里运行 apt-get install -y openssh-client"
+            "（要装在容器里，不是宿主机或目标机器上），装完重启 MaiBot。"
+        )
+    return (
+        "请在运行 MaiBot 的机器上用包管理器装 openssh-client"
+        "（例如 apt-get install -y openssh-client），装完重启 MaiBot。"
+    )

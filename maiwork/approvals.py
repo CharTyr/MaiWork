@@ -38,6 +38,7 @@ from . import clock, members
 from . import group_features
 from .goals import Goals
 from .group_approval import GroupApprovals
+from .sessions import Sessions
 from .store import Store, next_id
 from .tasks import Tasks
 
@@ -216,11 +217,14 @@ class Approvals:
         tasks: Tasks,
         goals: Goals,
         group_approvals: GroupApprovals | None = None,
+        *,
+        sessions: Sessions | None = None,
     ) -> None:
         self._store = store
         self._get_settings = get_settings
         self._tasks = tasks
         self._goals = goals
+        self._sessions = sessions
         # 每群批准名单（group_approval.py）；默认自己建一份，接线不用改 app.py
         self._group_approvals = group_approvals or GroupApprovals(store, get_settings=get_settings)
         # 自动审核回调（auto_review.py；app 注入）：刚记下一条要人批的请求 → hook(请求 id, 群号)。
@@ -281,6 +285,8 @@ class Approvals:
         force_manual: bool = False,
         screen: bool = False,
         started_at: float | None = None,
+        session_id: str = "",
+        session_materials: dict | None = None,
     ) -> dict:
         """记一条待批请求。
 
@@ -347,6 +353,16 @@ class Approvals:
                 group_id=gid, entity="request", entity_id=rid,
                 payload={"title": _norm(title), "kind": kind_s, "auto": auto, "source": _norm(source)},
             )
+            if self._sessions is not None and self._get_settings().session.enabled:
+                session_request = dict(self._request_row(conn, rid))
+                session_request["platform"] = self._get_settings().platform_of(gid)
+                if session_id:
+                    self._sessions.attach_request(conn, session_id, session_request)
+                    self._store.kv_set(conn, "session.pending." + session_id, rid)
+                    if session_materials is not None:
+                        self._store.kv_set(conn, "session.request_materials." + rid, session_materials)
+                else:
+                    self._sessions.open_for_request(conn, session_request)
             # 免批路径也必须让请求与其产出的所有任务/目标同生共死。
             landed = self._land(conn, self._request_row(conn, rid), by="自动批准", auto=True) if auto else None
         if auto:
@@ -506,6 +522,8 @@ class Approvals:
                 conn, "request.rejected", group_id=str(row["group_id"]),
                 entity="request", entity_id=rid, payload={"by": _norm(by)},
             )
+            if self._sessions is not None:
+                self._sessions.on_request_rejected(conn, rid)
             if row["idea_id"] is not None:
                 # 来自构想的请求被拒：构想回到「新想法」，别一直挂着「等批准」
                 conn.execute(
@@ -664,6 +682,9 @@ class Approvals:
                     who_name=requester_name,
                 )
             )
+        if self._sessions is not None:
+            for landed_task_id in task_ids:
+                self._sessions.on_task_landed(conn, request_id, landed_task_id)
         task_id = task_ids[0] if task_ids else None
         goal_id = goal_ids[0] if goal_ids else None
         now = clock.now()

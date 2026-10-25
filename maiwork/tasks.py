@@ -286,7 +286,7 @@ class Tasks:
             )
         return tid
 
-    def revise(self, task_id: str, *, req: str, criteria: Iterable[str]) -> int:
+    def revise(self, task_id: str, *, req: str, criteria: Iterable[str], applied_key: str = "") -> int:
         """存一个新需求版本；任务在 running / reviewing 时排回 queued（旧尝试作废）。"""
         now = clock.now()
         criteria_l = [str(c) for c in criteria]
@@ -294,7 +294,11 @@ class Tasks:
             row = conn.execute("SELECT status, req_version, group_id FROM tasks WHERE id=?", (str(task_id),)).fetchone()
             if row is None:
                 raise KeyError(f"任务不存在: {task_id}")
+            if applied_key and conn.execute("SELECT 1 FROM kv WHERE key=?", (applied_key,)).fetchone():
+                return int(row["req_version"])
             v = int(row["req_version"]) + 1
+            if applied_key:
+                self._store.kv_set(conn, applied_key, int(row["req_version"]))
             conn.execute(
                 "UPDATE tasks SET req=?, criteria=?, req_version=?, updated=? WHERE id=?",
                 (str(req or ""), json.dumps(criteria_l, ensure_ascii=False), v, now, str(task_id)),
@@ -408,6 +412,9 @@ class Tasks:
                 conn, f"task.{to_s}", group_id=str(row["group_id"]), entity="task", entity_id=str(task_id),
                 payload=payload or None,
             )
+            if row["session_id"] and getattr(getattr(self._get_settings(), "session", None), "enabled", False):
+                from .sessions import Sessions
+                getattr(self, "_sessions", Sessions(self._store)).sync_task_state(conn, str(row["session_id"]))
         return self.get(task_id)  # type: ignore[return-value]
 
     def resume_feature_off(self, task_id: str, *, by: str = "") -> dict:

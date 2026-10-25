@@ -524,3 +524,28 @@ async def test_card_data_carries_checked_viz_html(tmp_path):
     items = renderer.calls[0]["items"]
     assert "<p>图解一</p>" in items[0]["viz_html"] and "Content-Security-Policy" in items[0]["viz_html"]
     assert not items[1].get("viz_html")
+
+
+class _FakeShare:
+    """share.Share 替身：不联网，记下被要了哪一页。"""
+
+    herenow = object()
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    async def publish(self, group_id, *, tab="news", item=""):
+        self.calls.append((str(group_id), tab, item))
+        return f"https://pub{len(self.calls)}.here.now/"
+
+
+async def test_no_public_url_card_uses_herenow_link(tmp_path):
+    """没填公开网址、here.now 自动公开开着（默认）→ 资讯卡片也带链接。"""
+    store, _, host, _p, _m, renderer, cp, ob = _make(tmp_path, public_url="")
+    cp.share = _FakeShare()
+    _enable(store)
+    _batch(store)
+    cp.scan(GID, NOON + 10)
+    await cp.flush(GID, NOON + 10)
+    assert renderer.calls[0]["link"] == "https://pub1.here.now/"
+    assert cp.share.calls == [(GID, "news", "")]

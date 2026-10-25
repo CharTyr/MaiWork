@@ -652,3 +652,40 @@ class TestWorkerAgentKind:
         await w.run("测", group_id="1", tools=[], actor="子 agent #1",
                     agent_type="task", agent="news")
         assert models.calls[0][2].get("agent") == "news"
+
+
+class TestRevisionCheckpoint:
+    """阶段 4：运行中改了需求（req_version 变了）→ 子 agent 下一步开头停手，不再调模型。"""
+
+    class _Tasks:
+        def __init__(self, models, *, bump):
+            self.models, self.bump = models, bump
+
+        def get(self, task_id):
+            version = 2 if self.bump and len(self.models.calls) >= 1 else 1
+            return {"id": task_id, "status": "running", "req_version": version}
+
+        def net_check(self, task_id):
+            return None
+
+    def _models(self):
+        return ReplayModels([
+            FakeChatResult(tool_calls=[_tool_call("web_search", {"query": "MaiBot"}, "c1")]),
+            FakeChatResult(tool_calls=[_tool_call("submit_result", {"summary": "旧要求的结果"}, "c2")]),
+        ])
+
+    @pytest.mark.asyncio
+    async def test_revised_requirement_stops_worker_at_next_step(self, store, tools):
+        models = self._models()
+        w = Workers(models, tools, tasks=self._Tasks(models, bump=True))
+        report = await w.run("查一下", group_id="900000001", tools=["web_search"], task_id="T-1")
+        assert report.stopped is True and report.ok is False
+        assert len(models.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_unchanged_requirement_keeps_working(self, store, tools):
+        models = self._models()
+        w = Workers(models, tools, tasks=self._Tasks(models, bump=False))
+        report = await w.run("查一下", group_id="900000001", tools=["web_search"], task_id="T-1")
+        assert report.ok is True and report.summary == "旧要求的结果"
+        assert len(models.calls) == 2

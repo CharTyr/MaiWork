@@ -1127,7 +1127,9 @@ class Coordinator:
         identity: Any = None,
         capability: Any = None,
         mentions: Any = None,
+        share: Any = None,  # share.Share：没填公开网址时目标链接发 here.now
     ) -> None:
+        self.share = share
         self._store = store
         self._models = models
         self._workers = workers
@@ -1412,6 +1414,15 @@ class Coordinator:
         base = self._input_images_dir(tid).strip("/")
         return rel == base or rel.startswith(base + "/")
 
+    def _session_materials(self, tid: str) -> dict | None:
+        if not getattr(getattr(self._tasks._get_settings(), "session", None), "enabled", True):
+            return None
+        refs = self._store.kv_get("session.materials." + str(tid))
+        if not isinstance(refs, dict):
+            task = self._tasks.get(tid)
+            refs = self._store.kv_get("session.request_materials." + str((task or {}).get("request_id") or ""))
+        return refs if isinstance(refs, dict) else None
+
     def _request_message_id(self, tid: str) -> str:
         """任务 → requests 行 → 群友那条原始消息的 message_id；没有就 ""。"""
         try:
@@ -1541,9 +1552,30 @@ class Coordinator:
             already = self._existing_input_images(tid, ws_name)
             if already:
                 return already
-            request_mid = self._request_message_id(tid)
+            refs = self._session_materials(tid)
+            request_mid = str(refs.get("message_id") or "") if refs is not None else self._request_message_id(tid)
             if not request_mid:
                 return []
+            if refs is not None:
+                # 会话素材只允许主人的消息与明确采纳的引用；普通 reply 不自动采纳。
+                segments = []
+                missing = False
+                for mid in (refs.get("quoted_ref"), request_mid):
+                    if not mid:
+                        continue
+                    try:
+                        async with asyncio.timeout(3):
+                            msg = await self._host.message_by_id(str(mid), include_binary_data=True, _timeout_s=2.5)
+                        segments.extend(_message_image_segments(msg))
+                        missing = missing or not isinstance(msg, dict)
+                    except Exception:
+                        missing = True
+                paths = self._save_input_images(tid, ws_name, segments)
+                if paths:
+                    self._task_fact_event(tid, gid, "task.input_images", count=len(paths))
+                elif segments or missing:
+                    self._task_fact_event(tid, gid, "task.input_images_missing")
+                return paths
             session_id = await self._host.session_for_group(gid)
             if not session_id:
                 return []
@@ -2621,6 +2653,10 @@ class Coordinator:
             logger.exception("收原图出错（任务 %s），不带头开工", tid)
             self._input_images[tid] = []
 
+        speech = getattr(self, "_session_speech", None)
+        if speech is not None and task.get("session_id") and getattr(getattr(self._get_settings(), "session", None), "enabled", False):
+            await speech.start(self._tasks.get(tid))
+
         review_text = ""
         try:
             # 最近一次历史评审意见（给下一轮计划参考）
@@ -2643,7 +2679,11 @@ class Coordinator:
         # 安全网可能在计划回合把任务 paused 了：别再往下走 wait/重排
         _now = self._tasks.get(tid)
         if _now is None or str(_now.get("status") or "") not in ("running", "reviewing"):
-            logger.info("任务 %s 计划后状态已变（预案里被暂停或终态），停", tid)
+            logger.info("任务 %s 计划后状态已变（预案里被暂停、改了要求或终态），停", tid)
+            if _now is not None and int(_now.get("req_version") or 1) != int(req_version):
+                # 运行中被改了要求（版本 +1、排回 queued）：这一轮记作废，不留悬着的尝试。
+                # 只认版本变化；暂停 / 终态维持原有处理。
+                self._tasks.accept_result(tid, attempt_id, req_version)
             return "done"
 
         # question → waiting_input + 群里问一句
@@ -5557,6 +5597,7 @@ class Coordinator:
         messages.append(
             {"role": "assistant", "content": assistant_text, "tool_calls": tool_calls}
         )
+        self._relay_main_text(ctx, assistant_text)
         allowed = {str(x) for x in (ctx.allowed_tools or ())}
         reader = ""
         for cand in _ARCHIVE_READERS:
@@ -5930,8 +5971,10 @@ class Coordinator:
                 self._write_tokens(task_id)
                 await self._summarize_task_to_skill(task_id, gid)
                 return "done"
+            note = await self._session_delivery_note(task_id, note)
             await self._deliver_text_reply(task_id, gid, ws_name, note)
         else:
+            note = await self._session_delivery_note(task_id, note)
             assert artifact_path is not None
             name = artifact_path.name or artifact_path.parent.name or task_id
             if kind == "image":
@@ -5953,6 +5996,32 @@ class Coordinator:
         # owned task rather than spawning a detached background coroutine.
         await self._summarize_task_to_skill(task_id, gid)
         return "done"
+
+    def _relay_main_text(self, ctx: Any, text: str) -> None:
+        """D8：主模型边说边调工具时附带的那句自然话交给会话发言；工具调用 / 结果、
+        子 agent 文字都不走这里。非会话任务、功能关闭时不发；出错只记日志。"""
+        speech = getattr(self, "_session_speech", None)
+        if (speech is None or not str(text or "").strip() or getattr(ctx, "role", "") != "main"
+                or not getattr(ctx, "task_id", "")):
+            return
+        if not getattr(getattr(self._get_settings(), "session", None), "enabled", False):
+            return
+        try:
+            task = self._tasks.get(str(ctx.task_id))
+            if task and task.get("session_id"):
+                speech.relay(task, str(text), source="main")
+        except Exception as exc:
+            logger.info("会话工作回应没发出（%s），不影响干活", type(exc).__name__)
+
+    async def _session_delivery_note(self, task_id, note):
+        speech = getattr(self, "_session_speech", None)
+        task = self._tasks.get(task_id)
+        if speech is not None and task and task.get("session_id") and getattr(getattr(self._get_settings(), "session", None), "enabled", False):
+            try:
+                return await speech.finish(task, note)
+            except Exception as exc:
+                logger.info("会话交付回话不可用（%s），保留原说明", type(exc).__name__)
+        return note
 
     async def _summarize_task_to_skill(self, task_id: str, gid: str) -> None:
         """交付后的有界总结；证据、隔离和幂等由 SkillSummary 检查。"""
@@ -6027,11 +6096,18 @@ class Coordinator:
             text = note
 
         try:
+            from .session_speech import delivery_key, delivery_address
+            settings = self._get_settings()
+            key = delivery_key(self._store, settings, task_id, "text:" + reply)
+            address = delivery_address(self._store, settings, task_id, gid)
+            task = self._tasks.get(task_id)
+            if address and settings.session.relay_text and text != note:
+                text = note + "\n\n" + text
             self._outbox.enqueue(
-                f"task:{task_id}:deliver:text",
+                key + ":text",
                 gid,
                 "text",
-                {"text": text, "push_kind": "delivery"},
+                {"text": text, "push_kind": "delivery", **address},
                 task_id=task_id,
             )
         except Exception:
@@ -6091,6 +6167,9 @@ class Coordinator:
             return False
         try:
             task = self._tasks.get(task_id) or {}
+            from .session_speech import session_followup
+            if session_followup(task, self._get_settings()):
+                return False
             request_id = str(task.get("request_id") or "").strip()
             if not request_id:
                 return False
@@ -6729,13 +6808,17 @@ class Coordinator:
         requester = members.name_of(
             self._store, gid, task.get("requester_id"), fallback=task.get("requester_name")
         ).strip()
-        text = (f"@{requester} {question}" if requester else question) + ANSWER_HINT
+        session_question = bool(task.get("session_id")) and self._tasks._get_settings().session.enabled
+        if session_question:
+            from .session_runner import SESSION_ANSWER_HINT
+        hint = SESSION_ANSWER_HINT if session_question else ANSWER_HINT
+        text = (f"@{requester} {question}" if requester else question) + hint
         try:
             self._outbox.enqueue(
                 outbox_key,
                 gid,
                 "text",
-                {"text": text, "push_kind": "status"},
+                {"text": text, "push_kind": "command" if session_question else "status"},
                 task_id=tid,
             )
         except Exception:
@@ -7125,7 +7208,7 @@ class Coordinator:
                 goal_id, found, investigation
             )
             if ok_found:
-                found_reason = self._goal_found_report(goal, gid, found_text, found_url)
+                found_reason = await self._goal_found_report(goal, gid, found_text, found_url)
             if found_reason:
                 self._goal_event(goal_id, gid, "goal.found_rejected", reason=found_reason)
 
@@ -7145,7 +7228,7 @@ class Coordinator:
                 if not done_text:
                     logger.warning("目标 %s 完成话没过隐私闸，这一条不发", goal_id)
                 else:
-                    link = self._goal_web_link(gid, goal_id)
+                    link = await self._goal_web_link(gid, goal_id)
                     if link:
                         done_text += f"\n{link}"
                     payload = {
@@ -7170,7 +7253,7 @@ class Coordinator:
     # resume
     # ------------------------------------------------------------------
 
-    async def resume(self, task_id: str, answer: str) -> None:
+    async def resume(self, task_id: str, answer: str, *, session_event_id: int | None = None) -> None:
         """waiting_input / shelved 的任务收到回答 → 追加进 req → queued → run_task。
 
         docs/02 §7.2：任务详情时间线要能看见「收到回答：前 60 字」——
@@ -7189,7 +7272,9 @@ class Coordinator:
         if str(task["status"]) not in ("waiting_input", "shelved"):
             return
         answer_s = str(answer or "").strip()
-        old_version = int(task.get("req_version") or 1)
+        applied_key = f"session.answer.applied.{session_event_id}" if session_event_id is not None else ""
+        applied_version = self._store.kv_get(applied_key) if applied_key else None
+        old_version = int(applied_version if applied_version is not None else task.get("req_version") or 1)
         waiting = self._human_wait_record(task_id, old_version)
         kept_items = requirements.load(self._store, task_id, old_version) if waiting else None
         kept_steps = self._load_step_records(task_id) if waiting else {}
@@ -7198,8 +7283,12 @@ class Coordinator:
         current_crit = self._safe_json_list(task.get("criteria"))
         # revise 会把 running/reviewing 排回 queued；waiting_input/shelved 不在那张表里，
         # 所以 revise 之后还要手动 transition → queued
-        self._tasks.revise(task_id, req=new_req, criteria=current_crit)
-        self._record_answer(task_id, str(task.get("group_id") or ""), answer_s)
+        if applied_key:
+            self._tasks.revise(task_id, req=new_req, criteria=current_crit, applied_key=applied_key)
+        else:
+            self._tasks.revise(task_id, req=new_req, criteria=current_crit)
+        if applied_version is None:
+            self._record_answer(task_id, str(task.get("group_id") or ""), answer_s)
         if waiting:
             self._resume_human_wait(
                 task_id, str(task.get("group_id") or ""), old_version, kept_items, kept_steps,
@@ -7378,13 +7467,14 @@ class Coordinator:
             return str(text or "")
         return str(out or "")
 
-    def _goal_web_link(self, gid: str, goal_id: str) -> str:
-        """本目标的网页链接（拿不到 → ""，消息就只发文字）。"""
+    async def _goal_web_link(self, gid: str, goal_id: str) -> str:
+        """本目标的网页链接（public_url 优先，否则按开关发 here.now；拿不到 → ""，只发文字）。"""
         try:
-            from .card_push import group_link
+            from .share import group_link_async
 
             return str(
-                group_link(self._store, self._get_settings(), gid, tab="tasks", item=str(goal_id)) or ""
+                await group_link_async(self._store, self._get_settings(), gid, tab="tasks",
+                                       item=str(goal_id), share=getattr(self, "share", None)) or ""
             )
         except Exception:
             logger.debug("目标网页链接拼不出来（群 %s 目标 %s）", gid, goal_id, exc_info=True)
@@ -7496,7 +7586,7 @@ class Coordinator:
             return False, "daily_limit", text, url
         return True, "", text[:_GOAL_FOUND_TEXT_MAX], url
 
-    def _goal_found_report(self, goal: dict, gid: str, text: str, url: str) -> str:
+    async def _goal_found_report(self, goal: dict, gid: str, text: str, url: str) -> str:
         """R3：把「盯到了」入队（push_kind=goal_result，不占每日额度、只守睡觉时段）。
 
         发群前过隐私闸：被拦 / 拦成空 → 不发，返回拒绝原因 "scrubbed"（调用方记事件）；
@@ -7506,7 +7596,7 @@ class Coordinator:
         body = self._goal_scrub_text(gid, text)
         if not body:
             return "scrubbed"
-        link = self._goal_web_link(gid, goal_id)
+        link = await self._goal_web_link(gid, goal_id)
         if link:
             body += f"\n{link}"
         payload = {"text": body, "push_kind": "goal_result", **self._goal_result_at(goal, gid)}

@@ -118,6 +118,33 @@ def _extract_name(user_info: dict[str, Any]) -> str:
     return ""
 
 
+# 群文件上传：QQ 端读不到本机路径时的错误文本（白名单）。这类错误发生在调 QQ 之前，
+# 上传肯定没执行，才允许改用 base64:// 重传一次。SnowLuma 的 ENOENT 文本是推断。
+_PATH_UNREADABLE_MARKS = (
+    "enoent",
+    "no such file or directory",
+    "stage source is not a regular file",
+    "stage source is not a local file",
+    "识别url失败",
+    "文件不存在",
+)
+
+
+def upload_error_kind(msg: Any) -> str:
+    """群文件上传失败分类：path_unreadable / no_api / timeout / other（纯函数）。
+
+    只有 path_unreadable 允许重传；其余一律不重传（上传不幂等）。
+    """
+    text = str(msg or "").lower()
+    if any(m in text for m in _PATH_UNREADABLE_MARKS):
+        return "path_unreadable"
+    if "不支持上传群文件" in text or "没有群文件接口" in text:
+        return "no_api"
+    if "超时" in text or "timeout" in text or "timed out" in text or "对端动作执行失败" in text:
+        return "timeout"
+    return "other"
+
+
 def _fail_reason(result: Any, *, max_len: int = 200) -> str:
     """从宿主返回里取失败原因（`error` 字段），截短、去换行；没有 → ""。
 
@@ -158,6 +185,7 @@ class Host:
         self._bot_qq_cached: bool = bool(bot_qq)
         # bot.platforms 缓存：解析成 {规范平台名: 账号}（tg: 前缀归一为 telegram:）
         self._bot_accounts_map: dict[str, str] = {}
+        self._bot_accounts_sets: dict[str, set[str]] = {}
         self._bot_accounts_cached: bool = False
         self._session_cache: dict[str, str] = {}
         # session_id → 平台（session_for_group 解析时记下），发消息 / 读消息按它认平台
@@ -233,6 +261,13 @@ class Host:
             logger.warning("宿主能力 %s 调用失败: %s", capability, type(exc).__name__)
             raise HostError(f"调用宿主能力失败: {capability}") from exc
         return result
+
+    async def set_session_command_enabled(self, enabled: bool) -> None:
+        """按完整组件名对齐开关；仅全局作用域，拒绝伪成功。"""
+        result = await self._call("component.enable" if enabled else "component.disable", timeout_s=2,
+            name="chartyr.maiwork.maiwork_session", component_type="command")
+        if result is False or (isinstance(result, dict) and (result.get("success") is False or result.get("ok") is False)):
+            raise HostError("会话原生命令开关未成功")
 
     # ------------------------------------------------------------------
     # 适配器 api.call（参数形状 + 失败不吞）
@@ -485,6 +520,7 @@ class Host:
                 acc = acc.strip()
                 if platform and acc:
                     out[platform] = acc
+                    self._bot_accounts_sets.setdefault(platform, set()).add(acc)
             self._bot_accounts_map = out
             self._bot_accounts_cached = True
         return self._bot_accounts_map
@@ -495,6 +531,15 @@ class Host:
         if plat in ("", "qq"):
             return self._bot_qq
         return str(self._bot_accounts_map.get(plat) or "")
+
+    def cached_bot_accounts(self, platform: str) -> set[str]:
+        """真实 @ 身份闸只读缓存；保留同一平台的所有账号。"""
+        plat = _norm_platform(platform)
+        accounts = set(self._bot_accounts_sets.get(plat, ()))
+        primary = self.cached_bot_account(plat)
+        if primary:
+            accounts.add(primary)
+        return accounts
 
     async def bot_account(self, platform: str) -> str:
         """某个平台的机器人账号：qq → bot.qq_account；别的从 bot.platforms 里取。"""

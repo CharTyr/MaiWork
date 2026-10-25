@@ -10,13 +10,13 @@
 
 **端点高级设置。** 在「设置 → 模型」里新增或编辑端点，展开「高级设置」，可按行添加请求头覆盖，也可以切到「JSON」方式直接粘贴一个 `{"名称": "值"}` 对象，例如 `User-Agent`、`Authorization` 或服务商要求的自定义头。两种方式可以来回切换，已输入的内容会带过去。同一端点下所有模型共用，测试连接和模型验证也会带上；名称不分大小写，同名会覆盖默认值。不填保持原行为。头值可能含凭据，保存后只显示已填、不回显；原有项留空就保留（JSON 里已保存的名称写 `""` 或 `null` 同样表示保留原值），删掉该行或从 JSON 里去掉该名称再保存即可取消覆盖，写 `{}` 清空全部。`Host`、`Content-Length` 等传输头不能手动覆盖。
 
-**联网搜索。** 首次引导里直接勾搜索服务预设，免密钥的可以先拿来用；勾的第一个当主搜索，其余当备用——主搜索暂时坏了，备用会自动接上。之后在「设置 → 扩展」里也能改。同一页的 skill 可以单独启用或停用；预设搜索服务配套的 skill 只在对应服务开启时生效，你手动停用过的不会因为重开服务自动恢复。**没配搜索但订了 RSS 时，资讯只用 RSS 也能出。**
+**联网搜索。** 首次引导里直接勾搜索服务预设，免密钥的可以先拿来用；勾的第一个当主搜索，其余当备用——主搜索暂时坏了，备用会自动接上。之后在「设置 → 工具」里也能改。同一页的 skill 可以单独启用或停用（调研报告、资讯核实、通用任务、目标追踪、构想整理、办公文档 6 份随插件自带），办公文档所需组件也在同一页的「可选组件」一键安装。预设搜索服务配套的 skill 只在对应服务开启时生效，你手动停用过的不会因为重开服务自动恢复。**没配搜索但订了 RSS 时，资讯只用 RSS 也能出。**
 
 **记忆和「这个群怎么做」。** 全局经验在网页「设置 → 记忆」页看和改，只记和具体群、具体人无关的东西。每个群自己有两块，都在群页的「本群」区：**本群规则**（你或本群群管理员定的硬规矩，MaiWork 从来不自己改——追加也算改）和**本群做法**（它从验收结果、群友反馈和你在对话里说的话里总结的做事经验）。做法每天复盘一次（没有新情况就不总结）、每周整理一次；你可以直接改做法；如果没锁定，MaiWork 仍会按新反馈继续完善，不想让它再改就锁定。已锁定或归档的做法自动流程不会修改，也可以回退到以前的版本。设置 → 专岗里那个群的记录是只读的（最近做过什么、交接和验收）。每个群的规矩和做法只进那个群。群画像和关注成员的私下画像只给管理员看，不出现在群消息里。
 
 **多平台。** 服务群支持 `qq:`（NapCat / OneBot）、`telegram:`（写 `tg:` 也行）和 `qqbot:`（QQ 官方机器人，群号是 openid）。群文件 / 群公告 / 群相册这些群空间操作目前只有 QQ（OneBot）能用，其他平台的交付走网页链接。
 
-想让群友从外网访问网页，需要自己做反向代理，并把地址填到 `[console] public_url`（Docker 下的注意事项见 [Docker 部署](docker.md)）；不填的话只有管理员在这台机器上能打开，群友拿不到链接。
+群友要看的页面默认自动发布到 here.now（匿名公开页，24 小时过期，开关 `[console] herenow_share`，默认开），不用配置。想用自己的网址，自己做反向代理并填 `[console] public_url`，填了就优先用它（Docker 下的注意事项见 [Docker 部署](docker.md)）。两样都没有时，群友拿不到链接。
 
 ## 配置项
 
@@ -73,6 +73,10 @@
 | `[[model_list]] vision` | bool | `false` | 支不支持图片输入 |
 | `[[model_list]] context_window` | int | `128000` | 上下文窗口（tokens） |
 | `[[model_list]] max_tokens` | int | `32768` | 一次回答最多写多少 token，必须小于上下文窗口 |
+| `[[model_list]] use` | string | `"chat"` | 用途：`chat`（聊天与干活）或 `image`（生图，0.10.0 起）；生图条目不能当聊天模型 |
+| `[[model_list]] image_api` | string | `"openai"` | 生图接口类型：`openai`（OpenAI、火山方舟）或 `siliconflow`（硅基流动）；只对生图条目有意义 |
+| `[[model_list]] image_default_size` | string | `""` | 生图默认尺寸，空 = 服务商默认 |
+| `[[model_list]] image_max_n` | int | `1` | 一次最多画几张（1~4） |
 
 资讯的定方向、挑候选和打分会覆盖端点的重试次数：每个候选模型只试一次，网络失败就尝试已选的下一个备用，避免反复等待同一个无响应模型。没有备用或全部失败时，这一步按失败处理；打分内容坏了或漏项仍允许补问一次。其他调用照端点的重试设置执行。
 
@@ -83,7 +87,14 @@
 | 配置项 | 类型 | 默认值 | 说明 |
 |:------|:-----|:-------|:-----|
 | `environments.ssh` | list | `[]` | 专用机器，每台写 `name` / `host`（`user@地址:端口`）/ `note`，可以多台 |
-| `environments.railway` | bool | `true` | 允许用 railway.new 一次性 VM |
+| `environments.freestyle` | bool | `false` | 是否允许用 Freestyle 一次性机器（要你自己的 API key）。可以和 `railway` 同时开，互为备用 |
+| `environments.vm_platform` | string | `"railway"` | 两家都开时**优先用哪家**：`railway` 或 `freestyle`；优先那家拿不到自动换另一家。只开一家时不起作用 |
+| `environments.railway` | bool | `true` | 允许用 railway.new 一次性 VM（只在上面选 `railway` 时起作用） |
+| `environments.freestyle_api_key` | string | `""` | Freestyle 的 API key（[控制台](https://dash.freestyle.sh)里建，只在创建时显示一次）；只进不出，也可以改用环境变量 `FREESTYLE_API_KEY`（优先） |
+| `environments.freestyle_snapshot` | string | `"freestyle/ubuntu-sm"` | Freestyle 机器用哪个镜像，它决定几核几 G：`freestyle/ubuntu-sm` = 2 核 4G，`freestyle/ubuntu` = 4 核 8G（免费档上限） |
+| `environments.freestyle_ttl_minutes` | int | `90` | Freestyle 机器从创建算起最多活多少分钟，到点自动删 |
+| `environments.freestyle_idle_minutes` | int | `10` | 多久没网络活动就休眠；休眠只算存储费，文件还能读 |
+| `environments.freestyle_daily_max` | int | `5` | 每天最多用几台 Freestyle 机器；免费档每月约 100 机时（2 核 4G），用完后任务改回本机执行 |
 | `environments.run_as` | string | `"maiwork"` | 在本机跑命令用哪个系统账号；**不能填 `root`**（也不能填 uid 是 0 的账号）——子 agent 拿到 root 就没有隔离了，填了会被挡住不跑 |
 | `environments.local_network` | bool | `false` | 允不允许子 agent 访问**本机服务**（网页控制台、MaiBot）和**内网**地址。默认关：子 agent 能上公网，但连不上 `127.0.0.1`、路由器 / 内网机器、云服务器的元数据地址；域名解析照常能用。确实要让它连本机或内网时才开 |
 | `environments.memory_max` | string | `"512M"` | 本机隔离单元内存上限 |
@@ -97,6 +108,7 @@
 |:------|:-----|:-------|:-----|
 | `console.listen` | string | `"127.0.0.1:18650"` | 网页监听地址 |
 | `console.password` | string | `""` | 管理员密码，空则自动生成 |
-| `console.public_url` | string | `""` | 反向代理后的外网地址 |
+| `console.public_url` | string | `""` | 反向代理后的外网地址；填了优先用它 |
+| `console.herenow_share` | bool | `true` | 没填公开网址时，把群友要看的页面自动发布到 here.now（匿名、24 小时过期）。关掉就只发文字、不带链接 |
 | `console.update_check` | bool | `true` | 管理员打开网页时查 GitHub 上有没有新版（只提醒，更新去 MaiBot 的插件管理点） |
 | `console.maibot_webui_url` | string | `""` | MaiBot 自己网页的地址；填了，更新提醒里有直达按钮 |

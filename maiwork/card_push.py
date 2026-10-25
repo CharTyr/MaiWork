@@ -154,7 +154,9 @@ def web_view(svc: Any, group_id: Any) -> dict:
     view["sent_today"] = gp["sent_today"]     # 今天真发出去几条（含开场白 / 提一嘴）
     view["quota_used"] = gp["quota_used"]
     view["daily_max"] = gp["daily_max"]
-    view["has_link"] = bool(group_link(svc.store, settings, gid))
+    from .share import link_available
+
+    view["has_link"] = link_available(settings, getattr(svc, "share", None))
     view["group_push"] = gp
     return view
 
@@ -287,8 +289,10 @@ class CardPush:
         outbox: Any = None,
         viz: Any = None,
         viz_wait_s: float = CARD_VIZ_WAIT_S,
+        share: Any = None,  # share.Share：没填公开网址时把群友页发到 here.now
     ) -> None:
         self._store = store
+        self.share = share
         self._host = host
         self._pushes = pushes
         self._mentions = mentions
@@ -330,6 +334,28 @@ class CardPush:
             except (TypeError, ValueError):
                 continue
         return out
+
+
+    async def _link(self, gid: str, *, tab: str = "news", item: str = "") -> str:
+        """群友链接：public_url 优先；没有就按开关发 here.now（失败 → ""）。"""
+        from .share import group_link_async
+
+        try:
+            return await group_link_async(self._store, self._get_settings(), gid,
+                                          tab=tab, item=item, share=self.share)
+        except Exception:
+            logger.debug("群链接拿不到（群 %s）", gid, exc_info=True)
+            return ""
+
+    def _cached_link(self, gid: str, *, tab: str = "news", item: str = "") -> str:
+        """同步场景用：public_url 优先；否则只复用 here.now 缓存里的链接，不现发布。"""
+        from .share import group_link_cached
+
+        try:
+            return group_link_cached(self._store, self._get_settings(), gid,
+                                     tab=tab, item=item, share=self.share)
+        except Exception:
+            return ""
 
     def attach_outbox(self, outbox: Any) -> None:
         """接上发件箱（app 建好 Outbox 之后调一次）：卡片只入队，发出去之后回写。"""
@@ -613,7 +639,7 @@ class CardPush:
             # 卡片画图时图解还没做好，发到群里的卡片从来没带过图解。等一小会儿
             # （有上限、远小于 TTL），超时 / 失败就照旧画卡发出。
             await self._viz_first(gid, live_ids, moment, float(row["created"]))
-            link = group_link(self._store, self._get_settings(), gid)
+            link = await self._link(gid)
             data = self._card_data(gid, live, int(row["batch_id"]), link)
             png: bytes = b""
             try:
@@ -755,7 +781,7 @@ class CardPush:
         items = self._items_for_card(gid, row["item_ids"])
         if not items:
             return "", 0.0
-        link = group_link(self._store, self._get_settings(), gid)
+        link = self._cached_link(gid)
         data = self._card_data(gid, items, int(row["batch_id"] or 0), link)
         return self._text_fallback(data), float(row["created"] or 0) + EXPIRE_S
 
@@ -863,7 +889,7 @@ class CardPush:
         if isinstance(rec, dict) and str(rec.get("date") or "") == today:
             raise ValueError("这张卡片今天已手动重发过一次，请明天再操作")
 
-        link = group_link(self._store, self._get_settings(), gid)
+        link = await self._link(gid)
         items = self._items_for_card(gid, row["item_ids"])
         cached = next(
             (p for p in self._image_paths(cid) if p.is_file() and not p.is_symlink()), None
@@ -1018,7 +1044,7 @@ class CardPush:
                     f"SELECT title FROM news_items WHERE id IN ({placeholders})", ids
                 ).fetchall()
                 titles = "；".join(str(r["title"] or "") for r in rows)
-            link = group_link(self._store, self._get_settings(), gid)
+            link = self._cached_link(gid)
             self._mentions.add(
                 gid,
                 f"MaiWork 刚在群里发了资讯卡片：{titles[:120]}。有人问起可以接着聊，"
@@ -1359,8 +1385,10 @@ class IdeaMention:
         *,
         identity: Any = None,  # identity.py（读 SOUL）；None 就是没人设（不回退读 MaiBot 人格）
         outbox: Any = None,
+        share: Any = None,  # share.Share：没填公开网址时把群友页发到 here.now
     ) -> None:
         self._store = store
+        self.share = share
         self._host = host
         self._models = models
         self._pushes = pushes
@@ -1372,6 +1400,28 @@ class IdeaMention:
         self._outbox: Any = None
         if outbox is not None:
             self.attach_outbox(outbox)
+
+
+    async def _link(self, gid: str, *, tab: str = "news", item: str = "") -> str:
+        """群友链接：public_url 优先；没有就按开关发 here.now（失败 → ""）。"""
+        from .share import group_link_async
+
+        try:
+            return await group_link_async(self._store, self._get_settings(), gid,
+                                          tab=tab, item=item, share=self.share)
+        except Exception:
+            logger.debug("群链接拿不到（群 %s）", gid, exc_info=True)
+            return ""
+
+    def _cached_link(self, gid: str, *, tab: str = "news", item: str = "") -> str:
+        """同步场景用：public_url 优先；否则只复用 here.now 缓存里的链接，不现发布。"""
+        from .share import group_link_cached
+
+        try:
+            return group_link_cached(self._store, self._get_settings(), gid,
+                                     tab=tab, item=item, share=self.share)
+        except Exception:
+            return ""
 
     def attach_outbox(self, outbox: Any) -> None:
         """接上发件箱（app 建好 Outbox 之后调一次）：提一嘴只入队，发出去之后回写。
@@ -1934,7 +1984,7 @@ class IdeaMention:
                 if reason:
                     self._set(mid, status="dropped", error=reason)
                     continue
-            link = group_link(self._store, self._get_settings(), gid, tab="ideas", item=f"I-{int(idea['id'])}")
+            link = await self._link(gid, tab="ideas", item=f"I-{int(idea['id'])}")
             full = f"{text}\n{link}" if link else text
             # Telegram 没有真正的 @ 段：Host 会把 @ 退成正文「@名字 」，名字这里给
             at_name = members.name_of(self._store, gid, at_user) if at_user else ""
@@ -2003,8 +2053,7 @@ class IdeaMention:
             who = "给一位群友的" if row is not None and str(row["at_user"] or "") else ""
             link = ""
             if row is not None and row["id"] is not None:
-                link = group_link(self._store, self._get_settings(), gid,
-                                  tab="ideas", item=f"I-{int(row['id'])}")
+                link = self._cached_link(gid, tab="ideas", item=f"I-{int(row['id'])}")
             self._mentions.add(
                 gid,
                 f"MaiWork 刚在群里提了一个{who}构想：{title}。有人问起可以接着聊"

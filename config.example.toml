@@ -5,7 +5,7 @@
 # 是否启用 MaiWork；默认关闭。宿主在没写 enabled 时会当成开启，所以这里必须显式写。
 enabled = false
 # 配置版本；改默认值时会升。一般不用手改。
-config_version = "0.5.1"
+config_version = "0.5.3"
 
 
 [groups]
@@ -24,6 +24,22 @@ config_version = "0.5.1"
 # [[groups.serve]]
 # group = "telegram:-1001234567890"
 # workspace = "team-a"      # 和上面同一个名字 = 两个群共用一个工作区
+
+
+[session]
+# 工作会话入口（还需 plugin.enabled 与服务群配置）；关闭后保留已有会话数据。
+enabled = true
+# 以下两项留给会话执行与闲置管理阶段；当前入口不执行普通文字中继或自动关闭。
+relay_text = true
+idle_close_minutes = 60
+# 当前每群固定最多一个运行会话，其他值会规范为 1。
+max_running_per_group = 1
+# 入口判断默认 1.2 秒；允许 300~1500ms，回调为持久化预留约 100ms。
+triage_timeout_ms = 1200
+# 仅用于命令匹配，不授予身份；真实 @ 还须指向宿主缓存的机器人账号。
+# 最多 32 个、每个最多 80 字符。真实 @ 的名片/昵称会自动学习；正则只在重载时生成。
+# 首次部署 / 改名后重载前走后台降级，可能同时收到 MaiBot 回复。
+bot_names = []
 
 
 [focus]
@@ -227,6 +243,9 @@ listen = "127.0.0.1:18650"
 password = ""
 # 网页对外的地址（如 https://maiwork.example.com）；用来拼群专属链接。不公开就留空。
 public_url = ""
+# 没填公开网址时，把群友要看的页面（资讯 / 构想 / 目标）自动发布到 here.now 匿名公开页，
+# 24 小时过期；拿到链接的人都能看。不想公开就改成 false。
+herenow_share = true
 # 管理员打开网页时顺手查 GitHub 上有没有 MaiWork 新版（6 小时最多查一次；只提醒，不自动更新）。
 update_check = true
 # MaiBot 自己网页的地址（如 http://127.0.0.1:8001）；填了，更新提醒里的按钮直接跳过去。不填就只给文字说明。

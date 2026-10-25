@@ -149,6 +149,11 @@ class MaiWorkApp:
         self.scheduler: Any = None
         # M3 模块（docs/07 §11）
         self.tasks: Any = None
+        self.sessions: Any = None
+        self.session_gate: Any = None
+        self.session_runner: Any = None
+        self._session_runner_pending = False
+        self.registered_session_pattern = r"(?!)"
         self.goals: Any = None
         self.approvals: Any = None
         # 派活自动审核（auto_review.py）：低风险轻活由主模型判断后自动批
@@ -197,6 +202,7 @@ class MaiWorkApp:
         self.optional_deps: Any = None
         self.delivery: Any = None
         self.herenow: Any = None
+        self.share: Any = None  # share.Share：没填公开网址时把群友页发 here.now
         self.coordinator: Any = None
         self.commands: Any = None
         # 关注成员个人画像（persona.py；没就位就 None，网页 focus 里 persona 全 null）
@@ -225,6 +231,10 @@ class MaiWorkApp:
         self._listen: tuple[str, int] | None = None
         # 长活（资讯备料 / 构想）：同一群同一种同时只跑一个，不阻塞后台循环
         self._bg_jobs: set[asyncio.Task] = set()
+        self._session_gate_task: asyncio.Task | None = None
+        self._outbox_wake_pending = False
+        self._outbox_wake_due = None
+        self._outbox_wake_event = None
         self._running_jobs: set[tuple[str, str]] = set()
         # 待判 @ 独立重试：每群上次派工时刻（内存；重启后第一轮就派一次）
         self._pending_recover_at: dict[str, float] = {}
@@ -646,6 +656,7 @@ class MaiWorkApp:
         from .approvals import Approvals
         from .goals import Goals
         from .outbox import Delivery, Outbox
+        from .sessions import Sessions
         from .tasks import Tasks
         from .tools_exec import register_exec_tools
 
@@ -656,7 +667,8 @@ class MaiWorkApp:
         if interrupted:
             logger.warning("恢复时发现 %d 个执行中断的任务，已暂停待核对", interrupted)
         self.goals = Goals(self.store, self.get_settings)
-        self.approvals = Approvals(self.store, self.get_settings, self.tasks, self.goals)
+        self.sessions = Sessions(self.store)
+        self.approvals = Approvals(self.store, self.get_settings, self.tasks, self.goals, sessions=self.sessions)
         # 派活自动审核（auto_review.py）：Approvals 每落一条待批请求就回调一次，
         # 这里把判断 spawn 到后台（调模型是慢活，绝不卡住收消息钩子）
         self.auto_review = self._make_auto_review()
@@ -706,10 +718,12 @@ class MaiWorkApp:
         # 专用 SSH 机器：建环境 + 注册 machine_* 工具（要在本机 LocalEnv 建好之后，拷回成品用它）
         self.ssh = self._make_ssh()
         self.herenow = self._make_herenow()
+        self.share = self._make_share()
         self.outbox = Outbox(
             self.store, self.host, self.pushes, self.mentions, self.get_settings,
             herenow=self.herenow,
         )
+        self.outbox.set_wake_hook(self._wake_outbox)
         # 提问回执（docs/02 §7.2）：ask:{task_id}:{attempt} 发出 → 回写 question_msg_id
         try:
             self.outbox.set_ask_hook(self._on_ask_sent)
@@ -761,11 +775,13 @@ class MaiWorkApp:
             from .card_push import CardPush, IdeaMention
 
             self.card_push = CardPush(
-                self.store, self.host, self.pushes, self.mentions, self.get_settings
+                self.store, self.host, self.pushes, self.mentions, self.get_settings,
+                share=self.share,
             )
             self.idea_mention = IdeaMention(
                 self.store, self.host, self.models, self.pushes, self.mentions, self.get_settings,
                 identity=self.identity,  # 读 SOUL：提一嘴要按人设说话（voice.py）
+                share=self.share,
             )
             # 统一接发件箱（唯一发送路径）：只入队，真发出去了由 attach 内部登记的结果
             # hook 回写。别在这里再 add_result_hook（模块 attach 已经登记过）。
@@ -803,10 +819,20 @@ class MaiWorkApp:
         try:
             from .optional_deps import OptionalDeps
 
+            # 画图组件（render_assets.py，2026-10-25）：中文字体 / 画图浏览器，给资讯卡片用；
+            # 建不起来不影响办公文档那组
+            try:
+                from .render_assets import RenderAssets
+
+                assets = RenderAssets(self.store, self.get_settings)
+            except Exception:
+                logger.exception("画图组件模块没建起来，这次不能一键装字体 / 浏览器")
+                assets = None
             self.optional_deps = OptionalDeps(
                 self.store, self.get_settings,
                 env=getattr(self, "env", None),
                 capability=getattr(self, "capability", None),
+                assets=assets,
             )
         except Exception:
             logger.exception("可选依赖模块没建起来，这次不能一键装")
@@ -823,6 +849,24 @@ class MaiWorkApp:
             logger.exception("建群管理员存储出错，群管理员这次不可用")
             self.group_admins = None
         self.commands = self._make_commands()
+        from .session_runner import SessionRunner
+        self.session_runner = SessionRunner(self.store, self.sessions, self.tasks, self.approvals,
+            self.outbox, self.get_settings, start_task=self.spawn_run_task,
+            cancel_task=self.cancel_task_run, models=self.models, host=self.host, mentions=self.mentions)
+        self.session_runner.identity = self.identity
+        if self.coordinator is not None:
+            from .session_speech import SessionSpeech
+            speech = SessionSpeech(self.store, self.outbox, self.get_settings, models=self.models, identity=self.identity)
+            speech.closing_proposed = self.session_runner.closing_proposed
+            self.coordinator._session_speech = speech
+        self.session_gate = self._make_session_gate()
+        if self.session_gate is not None:
+            await self.session_gate.align()
+            # 常驻循环单独持有（同 self._task），不进 _bg_jobs：_bg_jobs 只放会结束的长活，
+            # 等它收完的地方（测试 drain、状态统计）碰上永不结束的循环会一直等下去。
+            self._session_gate_task = asyncio.create_task(
+                self.session_gate.maintain(), name="maiwork-session-alignment"
+            )
         # 3.66 专岗（agents.py + specialists.py）：要在 Workers / Tools / Skills / 扩展全部
         # 就位之后建（Specialists 要它们），在 Feeds/Coordinator 全部就位之后挂
         # （它们都吃 `_specialists` 注入点）。没就位 → None，网页 API（server.py）503、
@@ -942,6 +986,19 @@ class MaiWorkApp:
             logger.exception("群公告预告入队出错（群 %s）", group_id)
 
     async def _stop_stack(self) -> None:
+        if self.sessions is not None:
+            self.sessions.on_change = None
+        gate_task, self._session_gate_task = self._session_gate_task, None
+        if gate_task is not None:
+            gate_task.cancel()
+            try:
+                await gate_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("会话入口对齐循环退出时出错")
+        if self.session_gate is not None:
+            await self.session_gate.close()
         # 先停后台循环（它会 spawn 长活），再收长活；顺序反了收拾长活期间
         # 循环又 spawn 新的，永远收不完
         task, self._task = self._task, None
@@ -1083,6 +1140,10 @@ class MaiWorkApp:
         self.feeds = None
         self.scheduler = None
         self.tasks = None
+        self.sessions = None
+        self.session_gate = None
+        self.session_runner = None
+        self._session_runner_pending = False
         self.goals = None
         self.approvals = None
         self.auto_review = None
@@ -1096,6 +1157,7 @@ class MaiWorkApp:
         self.idea_mention = None
         self.delivery = None
         self.herenow = None
+        self.share = None
         self.coordinator = None
         self.commands = None
         self.group_admins = None
@@ -1167,6 +1229,9 @@ class MaiWorkApp:
         self._drop_command_tools_if_stopped(self.tools)
         self._ensure_groups()
         self._refresh_served_sessions()
+        if self.session_gate is not None:
+            self.session_gate.refresh()
+            await self.session_gate.align()
         # 配置里删掉的群：残留就地标记（发件 cancelled / 任务 cancelled / 目标 cancelled / 待批 expired）
         try:
             self._reconcile_unserved()
@@ -2158,6 +2223,16 @@ class MaiWorkApp:
         except Exception:
             logger.exception("写 Freestyle 密钥检查结果失败（网页健康项这次看不到）")
 
+    def _make_share(self) -> Any:
+        """群友页自动公开（share.py）；建不起来就 None（群里只发文字，不影响别的）。"""
+        try:
+            from .share import Share
+
+            return Share(self.store, self.herenow, self.get_settings, svc=self)
+        except Exception:
+            logger.exception("建 Share 出错，没填公开网址时群里这次不带链接")
+            return None
+
     def _make_herenow(self) -> Any:
         module_cls = _import_m2_class("herenow", "HereNow")
         if module_cls is None:
@@ -2185,6 +2260,7 @@ class MaiWorkApp:
                 # goals-fit R4（2026-10-11）：目标平时进展只进网页 + 可提起清单，不发群。
                 mentions=getattr(self, "mentions", None),
             )
+            coord.share = getattr(self, "share", None)  # 目标链接：没填公开网址时发 here.now
             # 注入 skill_summary（2026-10 需求：任务完成 → 总结为 skill）
             try:
                 from .skill_summary import SkillSummary
@@ -2225,10 +2301,106 @@ class MaiWorkApp:
                 run_task_starter=self.spawn_run_task,
                 run_task_stopper=self.cancel_task_run,
                 group_admins=self.group_admins,
+                share=getattr(self, "share", None),
             )
         except Exception:
             logger.exception("建 Commands 出错，/mw 指令这次跳过")
             return None
+
+    def _make_session_gate(self):
+        from .session_gate import SessionGate
+        gate = SessionGate(self.store, self.sessions, self.get_settings,
+            bot_ids=self.host.cached_bot_accounts,
+            is_admin=lambda uid, plat, gid: self.approvals.is_admin(uid, plat, group_id=gid),
+            host=self.host, jev=self.jev, models=self.models)
+        gate.registered_pattern = self.registered_session_pattern
+        gate.refresh()
+        self.sessions.on_change = self._refresh_session_gate
+        try:
+            from .session_gate import bounded_names
+            prior = self.store.kv_get("session.bot_names", [])
+            candidates = [self.host.bot_name_cache] + [account
+                for platform in {g.platform for g in self.get_settings().groups.values()}
+                for account in sorted(self.host.cached_bot_accounts(platform))]
+            with self.store.immediate_tx() as conn:
+                self.store.kv_set(conn, "session.bot_names", bounded_names(candidates + list(bounded_names(prior))))
+        except Exception:
+            logger.warning("启动时保存机器人候选名失败，真实 @ 会继续学习", exc_info=True)
+        return gate
+
+    def _refresh_session_gate(self):
+        """会话事务完成后刷新内存身份表，再异步对齐组件。"""
+        gate = self.session_gate
+        if gate is None:
+            return
+        try:
+            gate.refresh()
+            self._spawn_bg(gate.align(), name="maiwork-session-align-change")
+            self._wake_session_runner()
+            self._wake_outbox()
+        except Exception:
+            logger.exception("刷新会话入口失败，将由后台重试")
+
+    def _wake_outbox(self, delay=0):
+        """最多一个有限任务；短句等至合并窗结束，普通 command 立即 flush。"""
+        if self.outbox is None or not self.get_settings().session.enabled:
+            return
+        due = asyncio.get_running_loop().time() + max(0.0, min(float(delay), 2.0))
+        if self._outbox_wake_due is None or due < self._outbox_wake_due:
+            self._outbox_wake_due = due
+        if self._outbox_wake_pending:
+            if self._outbox_wake_event is not None:
+                self._outbox_wake_event.set()
+            return
+        self._outbox_wake_pending = True
+        self._outbox_wake_event = asyncio.Event()
+        self._spawn_bg(self._flush_outbox_now(), name="maiwork-session-outbox")
+
+    async def _flush_outbox_now(self):
+        cancelled = False
+        try:
+            # 这个等待最多 2 秒；同一批短句不会把窗口一再向后延长。
+            while self._outbox_wake_due is not None:
+                delay = self._outbox_wake_due - asyncio.get_running_loop().time()
+                if delay <= 0:
+                    break
+                self._outbox_wake_event.clear()
+                try:
+                    await asyncio.wait_for(self._outbox_wake_event.wait(), delay)
+                except TimeoutError:
+                    break
+            self._outbox_wake_due = None
+            if self.outbox is not None:
+                async with asyncio.timeout(8):
+                    await self.outbox.flush(clock.now(), allowed_groups=set(self.get_settings().groups))
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except Exception as exc:
+            logger.info("会话发件箱立即发送未完成（%s），由主循环接续", type(exc).__name__)
+        finally:
+            again = self._outbox_wake_due
+            self._outbox_wake_pending = False
+            self._outbox_wake_due = None
+            self._outbox_wake_event = None
+            if again is not None and not cancelled:
+                self._wake_outbox(max(0.0, again - asyncio.get_running_loop().time()))
+
+    def _wake_session_runner(self):
+        runner = self.session_runner
+        if runner is None or not self.get_settings().session.enabled or self._session_runner_pending:
+            return
+        self._session_runner_pending = True
+        self._spawn_bg(self._session_tick(), name="maiwork-session-controller")
+
+    async def _session_tick(self):
+        try:
+            if self.session_runner is not None:
+                await self.session_runner.tick()
+                if self.get_settings().session.enabled:
+                    self._tasks_round(clock.now())
+        finally:
+            self._session_runner_pending = False
 
     def _make_intake(self) -> Intake:
         intake = Intake(
@@ -2252,6 +2424,7 @@ class MaiWorkApp:
             pending_asks=getattr(self.profiles, "pending_asks", None),
             # 按群功能开关：任务 / 构想关闭时不派活、不恢复等回答的任务
             feature_on=self._feature_on,
+            session_gate=self.session_gate,
         )
         # 派活判断兜底（quick_judge）：intake 自己建的；停机时要单独收（见 _stop_stack）
         self.quick_judge = getattr(intake, "quick_judge", None)
@@ -2345,7 +2518,7 @@ class MaiWorkApp:
                 try:
                     rows = self.store.read().execute(
                         "SELECT id, group_id, question_msg_id, requester_id"
-                        " FROM tasks WHERE status IN ('waiting_input', 'shelved')"
+                        " FROM tasks WHERE status IN ('waiting_input', 'shelved') AND session_id IS NULL"
                     ).fetchall()
                     cache: dict[str, list] = {}
                     prompts = self._task_prompt_message_ids([str(r["id"]) for r in rows])
@@ -2602,6 +2775,8 @@ class MaiWorkApp:
         if tid in self._running_tasks:
             logger.debug("任务 %s 已在跑，不重复开工", tid)
             return
+        if self.session_runner is not None and not self.session_runner.admit(tid, running_ids=self._running_tasks):
+            return
         self._running_tasks.add(tid)
         self._spawn_bg(self._run_task_guarded(tid), name=f"maiwork-task-{tid}")
 
@@ -2635,15 +2810,36 @@ class MaiWorkApp:
 
     async def _run_task_guarded(self, task_id: str) -> None:
         tid = str(task_id)
+        cancelled = False
         try:
             if self.coordinator is not None:
+                answer = self.store.kv_get("session.answer." + tid) if self.get_settings().session.enabled else None
+                if isinstance(answer, dict):
+                    await self.coordinator.resume(tid, str(answer["answer"]), session_event_id=int(answer["event_id"]))
+                    with self.store.tx() as conn:
+                        self.store.kv_delete(conn, "session.answer." + tid)
                 await self.coordinator.run_task(tid)
         except asyncio.CancelledError:
+            cancelled = True
             raise
         except Exception:
             logger.exception("任务 %s 执行出错", tid)
         finally:
             self._running_tasks.discard(tid)
+            if not cancelled:
+                self._restart_if_requeued(tid)
+
+    def _restart_if_requeued(self, tid: str) -> None:
+        """阶段 4：会话任务这一轮停下时如果又是 queued（运行中被改了要求），马上叫控制器
+        派工，不等 30 秒主循环。只看会话任务；被取消（含停机）不走这里，功能关闭时什么都不做。"""
+        try:
+            if self.store is None or self.tasks is None or not self.get_settings().session.enabled:
+                return
+            task = self.tasks.get(tid)
+            if task and task.get("session_id") and task.get("status") == "queued":
+                self._wake_session_runner()
+        except Exception:
+            logger.exception("会话任务 %s 停下后重新派工出错，由主循环接续", tid)
 
     def _spawn_bg(self, awaitable: Any, *, name: str = "maiwork-bg") -> None:
         """通用后台派工（intake / 指令 / 网页用）：登记在 _bg_jobs，stop 时一起收。"""
@@ -3109,6 +3305,7 @@ class MaiWorkApp:
                 logger.exception("目标巡检出错")
         # 4) 排队任务派工 + waiting_input 照看
         try:
+            self._wake_session_runner()
             self._tasks_round(now)
         except Exception:
             logger.exception("任务巡检出错")
@@ -3250,7 +3447,7 @@ class MaiWorkApp:
         if self.store is None or self._settings is None:
             return
         rows = self.store.read().execute(
-            "SELECT id, group_id, status, title, question, question_ts, paused_reason FROM tasks"
+            "SELECT id, group_id, status, title, question, question_ts, paused_reason, session_id FROM tasks"
             " WHERE status IN ('queued', 'waiting_input')"
         ).fetchall()
         models_ready = self._models_ready()
@@ -3298,11 +3495,15 @@ class MaiWorkApp:
             elif age >= 6 * 3600 and self.outbox is not None:
                 question = str(row["question"] or "")[:60]
                 title = str(row["title"] or "")[:20]
+                hint = ANSWER_HINT
+                if row["session_id"] and self.get_settings().session.enabled:
+                    from .session_runner import SESSION_ANSWER_HINT
+                    hint = SESSION_ANSWER_HINT
                 self.outbox.enqueue(
                     f"task-wait-remind:{tid}",
                     str(row["group_id"]),
                     "text",
-                    {"text": f"「{title}」还在等回答：{question}{ANSWER_HINT}", "push_kind": "status"},
+                    {"text": f"「{title}」还在等回答：{question}{hint}", "push_kind": "status"},
                     task_id=str(tid),  # 任务自己的消息：不占每日额度（2026-10-10 用户定）
                 )
 

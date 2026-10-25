@@ -13,7 +13,7 @@
 没有记录但模型已经配好 = 已经在用的老安装，不打扰。
 
 checks（老字段，布尔）保留给旧前端；items 是给完成页 / 设置页的能力清单（docs/13 G01/G02）：
-模型、群、搜索、执行、办公文档（可选依赖，2026-10-15 加）、交付、第一件小事，各自写清楚
+模型、群、搜索、执行、办公文档（可选依赖，2026-10-15 加）、交付、群文件、第一件小事，各自写清楚
 「能用 / 受限 / 在等 / 没开」和下一步。
 全部从现有设置和运行状态里读，不另存、不联网、不调模型（办公文档那项只读上次探测结果，
 真探测由网页 /api/optional-deps 触发）。
@@ -72,10 +72,16 @@ def _checks(svc: Any) -> dict[str, bool]:
 # ----------------------------------------------------------------------
 
 
-def _item(key: str, state: str, title: str, text: str, step: str = "", sub: str = "") -> dict[str, Any]:
+def _item(key: str, state: str, title: str, text: str, step: str = "", sub: str = "",
+          sec: str = "") -> dict[str, Any]:
     """state：ok 能用 / warn 能用但受限 / wait 在等（不用你做什么）/ off 没开。
-    step：引导里对应哪一步（前端「去补」跳过去）；sub：设置里对应哪个子页。"""
-    return {"key": key, "state": state, "title": title, "text": text, "step": step, "sub": sub}
+    step：引导里对应哪一步（前端「去补」跳过去）；sub：设置里对应哪个子页（必须是网页
+    settings/index.js 的 SET_SUBS 里真有的）；sec：sub 是 rules 时直接打开哪一栏
+    （rules.CONFIG_SECTIONS 的 id）。没有 step 时，前端按 sub/sec 给「前往设置」。"""
+    out = {"key": key, "state": state, "title": title, "text": text, "step": step, "sub": sub}
+    if sec:
+        out["sec"] = sec
+    return out
 
 
 def _verified_for(svc: Any, kind: str = "main") -> dict[str, Any] | None:
@@ -147,7 +153,7 @@ def _group_rows(svc: Any, gids: list[str]) -> list[dict[str, Any]]:
 
 def _groups_item(svc: Any, gids: list[str]) -> dict[str, Any]:
     if not gids:
-        return _item("groups", "off", "服务的群", "还没有：MaiWork 只在你列出的群里工作", step="groups", sub="config")
+        return _item("groups", "off", "服务的群", "还没有：MaiWork 只在你列出的群里工作", step="groups", sub="rules")
     rows = _group_rows(svc, gids)
     heard = [r for r in rows if float(r.get("last_msg_ts") or 0) > 0]
     if len(heard) == len(rows):
@@ -212,12 +218,69 @@ def _exec_item(svc: Any) -> dict[str, Any]:
         return _item("exec", "ok", "干活", f"能查资料、写文件、跑命令（{local.get('text')}）")
     if railway is not None and railway.get("state") == "ok":
         return _item("exec", "ok", "干活", "本机不能跑命令；能查资料、写文件，要跑命令的活交给一次性机器")
+    missing: list[str] = []
+    if railway is not None and railway.get("state") != "off":
+        try:
+            from .console.views import ssh_install_hint, ssh_missing_tools
+
+            missing = ssh_missing_tools(svc)
+            hint = ssh_install_hint(missing) if missing else ""
+            if missing:
+                from .console.views import FREESTYLE_NO_SSH_HINT, in_docker
+
+                if in_docker(svc):
+                    hint += FREESTYLE_NO_SSH_HINT
+        except Exception:
+            missing, hint = [], ""
+    if missing:
+        return _item(
+            "exec", "warn", "干活",
+            "能查资料、写文件；要跑命令的活做不了：一次性机器连不上，因为这台电脑缺少 SSH 客户端（"
+            + " / ".join(missing) + "）。" + hint,
+            sub="rules", sec="environments",
+        )
     return _item(
         "exec", "warn", "干活",
         "能查资料、写文件；这台机器不能隔离跑命令，要跑命令的活做不了"
-        "（需要的话去「设置 → 执行环境」开一次性机器）",
-        sub="environments",
+        "（需要的话去「设置 → 全部设置 → 运行环境」开一次性机器）",
+        sub="rules", sec="environments",
     )
+
+
+def _docker_items(svc: Any) -> list[dict[str, Any]]:
+    """Docker 检查（只在容器里出现）：数据目录有没有挂出来、网页监听地址。
+
+    数据目录读不出（None）时不出这一项：判断不了就不打扰，「运行状态」里的「容器」
+    那条会写「看不出来，请自己确认」。"""
+    try:
+        from .console.views import data_dir_info, docker_data_text, in_docker
+
+        if not in_docker(svc):
+            return []
+        path, persisted = data_dir_info(svc)
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    if persisted is not None:
+        out.append(_item("docker_data", "ok" if persisted else "warn", "Docker · 数据目录",
+                         docker_data_text(path, persisted)))
+    settings = svc.get_settings()
+    listen = getattr(getattr(settings, "console", None), "listen", None)
+    host = ""
+    if isinstance(listen, (tuple, list)) and listen:
+        host = str(listen[0])
+    elif isinstance(listen, str):
+        host = listen.rsplit(":", 1)[0]
+    if host in ("0.0.0.0", "::", "[::]"):
+        out.append(_item("docker_listen", "ok", "Docker · 网页监听",
+                         "容器外能打开网页；别把这个端口直接暴露到公网（只在本机用就映射成 127.0.0.1:18650:18650）",
+                         sub="rules", sec="console"))
+    elif host:
+        out.append(_item("docker_listen", "warn", "Docker · 网页监听",
+                         "网页只在容器内部能打开；要在容器外打开，把「设置 → 全部设置 → 网页」的监听地址"
+                         "改成 0.0.0.0:18650 并映射端口（只在本机用就映射成 127.0.0.1:18650:18650 更安全）",
+                         sub="rules", sec="console"))
+    return out
 
 
 def _office_item(svc: Any) -> dict[str, Any]:
@@ -269,6 +332,44 @@ def _office_item(svc: Any) -> dict[str, Any]:
     )
 
 
+def _card_render_item(svc: Any) -> dict[str, Any] | None:
+    """资讯卡片画图（中文字体 + 画图浏览器，可选组件里的 fonts / browser 两组，render_assets.py）。
+
+    两组都 ok / system（系统自带）→ ok；有 missing / broken → warn，带上组自己的现成说明，
+    指路「设置 → 工具」一键装；还没探测过（unknown）或正在装 → wait。
+    老版本没有这两组 → None（不出这一项）。
+    """
+    deps = getattr(svc, "optional_deps", None)
+    if deps is None:
+        return None
+    try:
+        groups = {str(g.get("id")): g for g in (deps.status().get("groups") or []) if isinstance(g, dict)}
+    except Exception:
+        return None
+    pair = [groups.get("fonts"), groups.get("browser")]
+    if not all(isinstance(g, dict) for g in pair):
+        return None
+    states = [str(g.get("state") or "unknown") for g in pair]
+    bad = [g for g in pair if str(g.get("state")) in ("missing", "broken")]
+    if bad:
+        parts = []
+        for g in bad:
+            line = str(g.get("summary") or g.get("label") or "")
+            hint = str(g.get("hint") or "").strip()
+            parts.append(f"{line}（{hint}）" if hint else line)
+        return _item(
+            "card_render", "warn", "资讯卡片画图",
+            "；".join(p for p in parts if p) + "。没装好之前资讯卡片会改发文字；可在「设置 → 工具 → 可选组件」一键安装",
+            sub="extensions",
+        )
+    if all(s in ("ok", "system") for s in states):
+        return _item("card_render", "ok", "资讯卡片画图", "中文字体和画图浏览器都能用")
+    return _item(
+        "card_render", "wait", "资讯卡片画图",
+        "还没检查中文字体和画图浏览器（打开「设置 → 工具」会检查一次）", sub="extensions",
+    )
+
+
 def _delivery_item(svc: Any) -> dict[str, Any]:
     settings = svc.get_settings()
     public_url = ""
@@ -283,12 +384,56 @@ def _delivery_item(svc: Any) -> dict[str, Any]:
         )
         out["copy"] = public_url
         return out
+    herenow = True
+    try:
+        herenow = bool(getattr(settings.console, "herenow_share", True)) if settings is not None else True
+    except Exception:
+        herenow = True
+    if herenow:
+        return _item(
+            "delivery", "ok", "交付",
+            "群友链接会自动发布到 here.now（匿名公开页面，24 小时过期，每次推送重新发布）；"
+            "想用自己的网址可在 设置 → 全部设置 → 网页 填公开网址",
+        )
     return _item(
         "delivery", "warn", "交付",
-        "网页现在只有你（管理员）在这台机器上能打开；群友拿不到链接——要给群友用，"
-        "需要你自己给网页配一个公网地址（设置 → 全部设置 → 网页 → 公开网址），MaiWork 不会替你公开",
-        sub="config",
+        "群友拿不到链接：打开「用 here.now 自动公开」或填公开网址（设置 → 全部设置 → 网页）",
+        sub="rules", sec="console",
     )
+
+
+def _groupfile_item(svc: Any) -> dict[str, Any]:
+    """群文件：适配器能不能往群里传文件（只读已探测到的能力，不联网、不调模型）。
+
+    最近一次群文件上传失败（kv["outbox.file_last_fail"]，24 小时内、之后没成功过
+    kv["outbox.file_last_ok"]）就带上原因。
+    """
+    gs = getattr(svc, "group_space", None)
+    try:
+        opened = bool(gs is not None and gs.adapter_open())
+    except Exception:
+        opened = False
+    fail_reason = ""
+    store = getattr(svc, "store", None)
+    if store is not None:
+        try:
+            lf = store.kv_get("outbox.file_last_fail", None)
+            lo = store.kv_get("outbox.file_last_ok", None)
+            if isinstance(lf, dict):
+                fail_ts = float(lf.get("ts", 0) or 0)
+                ok_ts = float(lo.get("ts", 0) or 0) if isinstance(lo, dict) else 0.0
+                if fail_ts > ok_ts and clock.now() - fail_ts < 86400.0:
+                    fail_reason = str(lf.get("reason") or "").strip() or "原因不明"
+        except Exception:
+            fail_reason = ""
+    if not opened:
+        text = "QQ 适配器不支持上传群文件，成品会改发网页链接；想直接收文件请装 SnowLuma 适配器 1.x"
+        if fail_reason:
+            text += f"。最近一次群文件没发出去：{fail_reason}"
+        return _item("groupfile", "warn", "群文件", text, sub="overview")
+    if fail_reason:
+        return _item("groupfile", "warn", "群文件", f"最近一次群文件没发出去：{fail_reason}", sub="overview")
+    return _item("groupfile", "ok", "群文件", "能往群里传文件")
 
 
 def _first_item(svc: Any, gids: list[str], models_ready: bool) -> dict[str, Any]:
@@ -321,8 +466,11 @@ def items(svc: Any, checks: dict[str, bool] | None = None) -> list[dict[str, Any
         _groups_item(svc, gids),
         _search_item(svc, gids),
         _exec_item(svc),
+        *_docker_items(svc),
         _office_item(svc),
+        *[x for x in (_card_render_item(svc),) if x is not None],
         _delivery_item(svc),
+        _groupfile_item(svc),
         _first_item(svc, gids, bool(checks.get("models"))),
         _item("jev", "ok" if checks.get("jev") else "off", "Jev 快速判断",
               "密钥已填" if checks.get("jev") else "没填（可选）：判断会走主模型，慢一些、多花一点", step="keys"),

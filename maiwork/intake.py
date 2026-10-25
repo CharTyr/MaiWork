@@ -231,6 +231,7 @@ class Intake:
         # 按群功能开关（app 注入 group_features.enabled 的判定）：任务关闭时
         # 不派活、不恢复等回答的任务；构想关闭时不认「构想 #N」。
         feature_on: Callable[[str, str], bool] | None = None,
+        session_gate: Any = None,
     ) -> None:
         self._get_settings = get_settings
         self._signals = signals
@@ -238,6 +239,7 @@ class Intake:
         self._approvals = approvals
         self._mentions = mentions
         self._commands = commands
+        self._session_gate = session_gate
         self._on_reminder = on_reminder
         self._bot_qq_source = bot_qq
         # 非 qq 平台的机器人自己账号（平台 → 账号；app 给 Host 缓存的 bot.platforms）
@@ -441,6 +443,10 @@ class Intake:
                     self._on_spark(group_id, _ts_of(message.get("timestamp")) or clock.now())
             except Exception:
                 logger.debug("记话头火花出错（群 %s），已吞掉", group_id, exc_info=True)
+        if self._session_gate is not None and self._session_gate.intake({
+            "group_id": group_id, "platform": platform, "user_id": user_id,
+            "text": text, "message": message}, self._spawn):
+            return
         # 3) 提问的回答（docs/02 §7.2）：回复了 waiting_input/shelved 任务那条提问，
         #    或发起人 @ 机器人而且这个群里只有这一个等待任务 → 后台恢复任务。
         #    纯内存查（app 给的 30 秒缓存），不做重查询。
@@ -499,7 +505,7 @@ class Intake:
 
         两条规则（docs/02 §7.2）：
         - 消息的 reply_to（原始消息里的引用，host._parse_reply_to 解析）等于某个
-          waiting_input / shelved 任务的 question_msg_id；
+          waiting_input / shelved 老任务的 question_msg_id，且发言人是请求人或本群 bot 管理员；
         - 发言人就是该任务的请求人（requester_id）、这个群里此人只有一个等待任务、
           且这条消息 @ 了机器人。
         同一条消息只触发一次；拿不到回复字段时只用第二条规则。
@@ -528,11 +534,22 @@ class Intake:
         # 规则 1：回复了那条提问（消息里有引用段时）
         reply_to = _parse_reply_to(message.get("raw_message"))
         if reply_to:
-            for tid, qmid, _rid in waiting:
+            for tid, qmid, rid in waiting:
                 qmid_s = str(qmid or "").strip()
                 if qmid_s and reply_to == qmid_s:
-                    task_id = str(tid)
-                    break
+                    allowed = bool(str(rid or "")) and str(user_id) == str(rid)
+                    if not allowed and self._approvals is not None:
+                        try:
+                            # 身份来自宿主消息；引用的发言人不能授予权限。
+                            # handle 已核实宿主平台；管理员账号使用服务群的内部平台标签。
+                            # QQ 官方机器人在宿主里也叫 qq，身份命名空间却必须保留 qqbot。
+                            platform = self._get_settings().platform_of(group_id)
+                            allowed = self._approvals.is_admin(str(user_id), platform, group_id=group_id)
+                        except Exception:
+                            logger.debug("核对引用回答权限失败（群 %s）", group_id, exc_info=True)
+                    if allowed:
+                        task_id = str(tid)
+                        break
         # 规则 2：请求人 @ 机器人 + 这个群里只有一个等待任务
         if not task_id and (bool(message.get("is_at")) or bool(message.get("is_mentioned"))):
             # 按任务数，不按提问条数：同一个任务可能有原提问 + 提醒两条（2026-10-10）

@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "chartyr.maiwork",
-  "version": "0.10.5",
+  "version": "0.11.0",
   "name": "MaiWork",
   "description": "补全MaiBot群聊常驻Agent能力，理解一个群，主动找资讯、提构想、追目标，交付任何工作。包含完整且美观的插件自身WebUI",
   "plugin_type": "extension",
@@ -16,7 +16,7 @@
   },
   "sdk": {
     "min_version": "2.8.1",
-    "max_version": "2.12.0"
+    "max_version": "2.16.0"
   },
   "dependencies": [
     {
@@ -37,6 +37,8 @@
   ],
   "capabilities": [
     "config.get",
+    "component.enable",
+    "component.disable",
     "message.get_by_time_in_chat",
     "message.get_by_id",
     "knowledge.search",

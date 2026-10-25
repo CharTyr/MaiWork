@@ -18,7 +18,9 @@ class FakeCtx:
         self.responses: Dict[str, Any] = dict(responses or {})
         self.calls: List[Tuple[str, Dict[str, Any]]] = []
 
-    async def call_capability(self, name: str, **kw: Any) -> Any:
+    async def call_capability(self, capability: str, **kw: Any) -> Any:
+        # 第一个参数名与真 SDK 一致（capability），能力本身也可以带 name= 参数。
+        name = capability
         self.calls.append((name, kw))
         r = self.responses.get(name)
         if isinstance(r, BaseException):

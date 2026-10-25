@@ -1495,9 +1495,8 @@ class TestM3Routes:
             await asyncio.sleep(0.02)
         assert tid in coord.run_calls
 
-    @pytest.mark.asyncio
-    async def test_request_approve_idea_items_spawns_all_tasks(self, env: SimpleEnv) -> None:
-        """网页批准带项目的构想：逐个落任务，返回 task_ids，并把每个都开工。"""
+    async def _approve_two_item_idea(self, env: SimpleEnv) -> Any:
+        """网页批准带两个项目的构想；返回假协调器，调用方断言开工情况。"""
         import json as _json
 
         from fakes import FakeCoordinator
@@ -1524,12 +1523,39 @@ class TestM3Routes:
         res = await r.json()
         assert res["task_ids"] == ["T-1", "T-2"]
         assert res["task_id"] == "T-1"
+        return coord
+
+    @staticmethod
+    async def _wait_run(coord: Any, tid: str) -> bool:
+        import asyncio
+
+        for _ in range(30):
+            if tid in coord.run_calls:
+                return True
+            await asyncio.sleep(0.02)
+        return False
+
+    @pytest.mark.asyncio
+    async def test_request_approve_idea_items_spawns_all_tasks_when_sessions_off(self, env: SimpleEnv) -> None:
+        """连续对话关闭：沿用旧行为，构想的每个项目批准后都立刻开工。"""
+        from dataclasses import replace
+
+        before = env.app.base_settings()
+        env.app._settings = replace(before, session=replace(before.session, enabled=False))
+        coord = await self._approve_two_item_idea(env)
         for tid in ("T-1", "T-2"):
-            for _ in range(30):
-                if tid in coord.run_calls:
-                    break
-                await asyncio.sleep(0.02)
-            assert tid in coord.run_calls
+            assert await self._wait_run(coord, tid)
+
+    @pytest.mark.asyncio
+    async def test_request_approve_idea_items_run_one_by_one_with_sessions(self, env: SimpleEnv) -> None:
+        """连续对话开启（D12/D14）：同一会话的多件活逐件开工，前一件结束后才轮到下一件。"""
+        coord = await self._approve_two_item_idea(env)
+        assert await self._wait_run(coord, "T-1")
+        assert not await self._wait_run(coord, "T-2")
+        for status in ("running", "reviewing", "completed"):
+            env.app.tasks.transition("T-1", status)
+        env.app.spawn_run_task("T-2")
+        assert await self._wait_run(coord, "T-2")
 
     @pytest.mark.asyncio
     async def test_request_reject_and_state_errors(self, env: SimpleEnv) -> None:

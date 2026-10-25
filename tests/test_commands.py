@@ -52,7 +52,8 @@ class FakeOutbox:
         self.flushed.append(float(now))
 
 
-def _env(tmp_path: Path, *, public_url: str = "", coordinator=None, run_task_starter=None):
+def _env(tmp_path: Path, *, public_url: str = "", coordinator=None, run_task_starter=None,
+         share=None, herenow_share: bool = True):
     store = Store(tmp_path / "mw.db")
     store.migrate()
     settings, _ = load_settings(
@@ -60,7 +61,7 @@ def _env(tmp_path: Path, *, public_url: str = "", coordinator=None, run_task_sta
             "plugin": {"enabled": True},
             "groups": {"serve": [{"group": f"qq:{G1}"}]},
             "approval": {"required": True, "admins": [ADMIN]},
-            "console": {"public_url": public_url},
+            "console": {"public_url": public_url, "herenow_share": herenow_share},
         }
     )
     with store.tx() as conn:
@@ -79,6 +80,7 @@ def _env(tmp_path: Path, *, public_url: str = "", coordinator=None, run_task_sta
         lambda: settings,
         coordinator=coordinator,
         run_task_starter=run_task_starter,
+        share=share,
     )
     return SimpleEnv(store=store, settings=settings, tasks=tasks, goals=goals,
                      approvals=approvals, outbox=outbox, host=host, cmd=cmd)
@@ -168,7 +170,32 @@ class TestWeb:
     async def test_web_no_public_url(self, tmp_path: Path) -> None:
         env = _env(tmp_path)
         reply = await env.say("/mw 网页")
-        assert reply == "网页还没公开，找管理员要"
+        assert reply == "网页还没公开：管理员可以打开 here.now 自动公开或填公开网址"
+
+    @pytest.mark.asyncio
+    async def test_web_herenow_only(self, tmp_path: Path) -> None:
+        class FakeShare:
+            herenow = object()
+
+            async def publish(self, group_id, *, tab="news", item=""):
+                assert (group_id, tab, item) == (G1, "news", "")
+                return "https://abc.here.now/"
+
+        env = _env(tmp_path, share=FakeShare())
+        reply = await env.say("/mw 网页")
+        assert reply == "本群网页：https://abc.here.now/（24 小时内有效）"
+
+    @pytest.mark.asyncio
+    async def test_web_herenow_switched_off(self, tmp_path: Path) -> None:
+        class FakeShare:
+            herenow = object()
+
+            async def publish(self, group_id, *, tab="news", item=""):
+                raise AssertionError("开关关了不该发布")
+
+        env = _env(tmp_path, share=FakeShare(), herenow_share=False)
+        reply = await env.say("/mw 网页")
+        assert reply.startswith("网页还没公开")
 
     @pytest.mark.asyncio
     async def test_web_with_public_url(self, tmp_path: Path) -> None:

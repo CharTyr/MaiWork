@@ -645,6 +645,17 @@ class Workers:
             return ""
         return str(row.get("status") or "")
 
+    def _task_req_version(self, task_id: str) -> int | None:
+        """任务当前需求版本；没接 tasks / 查不到 / 没这个字段返回 None（不做版本检查）。"""
+        if self._tasks is None or not task_id:
+            return None
+        try:
+            row = self._tasks.get(task_id)
+            value = row.get("req_version") if row else None
+            return int(value) if value is not None else None
+        except Exception:
+            return None
+
     async def run(
         self,
         brief: str,
@@ -753,6 +764,9 @@ class Workers:
             stall_wrapped = False  # 止损收紧成只交回的标记（同样只做一次）
             spill_zone = _spill_zone(workspace, task_id)
             archive_notes: list[str] = []  # 归档失败要告诉模型的提示（这一轮攒着）
+            # 阶段 4 检查点：记住开工时的需求版本；运行中被改了要求（Tasks.revise 递增版本），
+            # 下一步开头就停手——旧要求的结果反正会被 accept_result 作废，不再白花模型调用。
+            start_version = self._task_req_version(task_id)
 
             while True:
                 # 0 = 不限；给了正的 max_steps 还按老规矩收尾（兼容）
@@ -826,6 +840,14 @@ class Workers:
                             error="任务已暂停" if status == "paused" else "任务已挂起",
                             stopped=True,
                         )
+                if start_version is not None and self._task_req_version(task_id) not in (None, start_version):
+                    return WorkerReport(
+                        ok=False,
+                        summary="任务要求改了，子 agent 停手；按新要求重新开工",
+                        steps=steps,
+                        error="任务要求已更新",
+                        stopped=True,
+                    )
                 steps += 1
                 # 上下文压缩（docs/27 的口）：整包预算 + 可回读剪枝 + 最老一段摘要，全在
                 # compaction.maybe_compact_ex 里（它自己用 context_budget → models.request_budget

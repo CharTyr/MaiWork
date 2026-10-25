@@ -8,7 +8,7 @@ import { AV_SRC } from "./settings/identity.js";
 import { PROTOCOLS, loadModels } from "./settings/models.js";
 import { loadAgents } from "./settings/agents.js";
 import { render } from "./render.js";
-import { applyHash, loadGroups, loadSettings, loadView } from "./router.js";
+import { applyHash, enterSettings, loadGroups, loadSettings, loadView } from "./router.js";
 
 // ───────────── 首次安装引导 ─────────────
 // 全屏一张卡片，一步一屏：打招呼 → 模型（端点 + 主模型 / 专岗模型）→ 服务的群 → 可选密钥 → 联网搜索 → 管理员 → 头像 → 完成。
@@ -154,7 +154,10 @@ function onbDonePane() {
   const usable = !!info.usable;
   const miss = (info.missing || []).map((k) => ({ models: "模型", groups: "群" })[k] || k);
   const row = (it, i) => {
-    const goto = it.state !== "ok" && it.step && it.step !== "done" ? `<button type="button" class="link-btn" data-act="onb-goto" data-step="${esc(it.step)}">前往设置</button>` : "";
+    // 有引导步骤 → 回到那一步；没有但有设置子页（sub，必要时带「全部设置」的栏目 sec）→ 关掉引导去设置页
+    const goto = it.state === "ok" ? ""
+      : it.step && it.step !== "done" ? `<button type="button" class="link-btn" data-act="onb-goto" data-step="${esc(it.step)}">前往设置</button>`
+      : it.sub ? `<button type="button" class="link-btn" data-act="onb-set" data-sub="${esc(it.sub)}" data-sec="${esc(it.sec || "")}">前往设置</button>` : "";
     const copy = it.copy ? `<button type="button" class="link-btn" data-act="copy" data-link="${esc(it.copy)}" data-what="链接">复制</button>` : "";
     return `<li class="onb-sum" style="--i:${i}"><span class="onb-mark ${MARK[it.state] || ""}">${it.state === "ok" ? SVG.check : it.state === "wait" ? "…" : it.state === "warn" ? "!" : ""}</span><div><b>${esc(it.title)}${goto}${copy}</b><span>${esc(it.text)}</span></div></li>`;
   };
@@ -683,6 +686,15 @@ export async function onbAct(el) {
     return;
   }
   if (a === "onb-back") return onbGo(-1);
+  if (a === "onb-set") {
+    // 完成页上的「前往设置」：先按「完成」收起引导（必要条件缺时后端记成「稍后继续」），再进设置页
+    const sub = el.dataset.sub || "overview";
+    const sec = el.dataset.sec || "";
+    await closeOnboarding("done");
+    if (onb.open) return; // 没关掉（保存失败已提示），留在引导里
+    state.cfgSec = sub === "rules" ? sec : state.cfgSec;
+    return enterSettings(sub);
+  }
   if (a === "onb-goto") {
     const to = ONB_STEPS.findIndex((s) => s.id === el.dataset.step);
     if (to >= 0) return onbGo(to - onb.i);

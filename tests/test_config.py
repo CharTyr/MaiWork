@@ -56,7 +56,9 @@ class TestDefaults:
         # 0.4.8：[quick_judge] 派活判断兜底（Jev 不在 / 拿不准时用模型快速判）
         # 0.5.1：[environments] vm_platform + freestyle_*（一次性 VM 可选 Freestyle，要自己的 API key）
         # 0.5.0：[environments] local_network；0.4.9：[quick_judge] 不再攒批（删 batch_wait_s）、daily_max 归高级项
-        assert CONFIG_VERSION == "0.5.1"
+        # 0.5.2：[session] 工作会话入口和固定机器人显示名候选
+        # 0.5.3：[console] herenow_share（没填公开网址时自动用 here.now 公开群友页）
+        assert CONFIG_VERSION == "0.5.3"
         assert MaiWorkConfig().plugin.config_version == CONFIG_VERSION
 
     def test_railway_verify_new_fields_defaults(self) -> None:

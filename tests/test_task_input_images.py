@@ -501,3 +501,35 @@ async def test_normal_artifact_still_passes_with_input_images(
         "完成", ["evidence"], [],
     )
     assert review["pass"] is True
+
+
+@pytest.mark.parametrize("adopted", [False, True])
+async def test_session_images_use_owner_source_and_only_explicit_adopted_quote(
+    mem_store, settings, env, tools, tasks, goals, adopted,
+):
+    tid = _create_task(tasks)
+    refs = {"message_id": "owner-next", "quoted_ref": "adopted-quote" if adopted else ""}
+    with mem_store.tx() as conn:
+        mem_store.kv_set(conn, "session.materials." + tid, refs)
+    own, quote = _jpg(b"owner"), _png(b"quote")
+    class SessionHost(FakeHost):
+        async def message_by_id(self, mid, session_id="", *, include_binary_data=False, _timeout_s=20):
+            assert _timeout_s <= 3
+            return await super().message_by_id(mid, session_id, include_binary_data=include_binary_data)
+    host = SessionHost(by_id={
+        "owner-next": _msg("owner-next", [_image_seg(own)], reply_to="unadopted-quote"),
+        "adopted-quote": _msg("adopted-quote", [_image_seg(quote)]),
+        "unadopted-quote": _msg("unadopted-quote", [_image_seg(_png(b"ignore"))]),
+    })
+    coord = _coordinator(mem_store=mem_store, settings=settings, env=env, tools=tools,
+        tasks=tasks, goals=goals, models=ModelsQueue(), workers=FakeWorkers(), host=host)
+    ws_name = str(tasks.get(tid)["workspace"])
+    paths = await coord._collect_request_images(tid, GID, ws_name)
+    assert len(paths) == (2 if adopted else 1)
+    assert (env.workspace(ws_name) / paths[-1]).read_bytes() == own
+    if adopted:
+        assert (env.workspace(ws_name) / paths[0]).read_bytes() == quote
+    assert {c[0] for c in host.by_id_calls} == ({"owner-next", "adopted-quote"} if adopted else {"owner-next"})
+    before = len(host.by_id_calls)
+    assert await coord._collect_request_images(tid, GID, ws_name) == paths
+    assert len(host.by_id_calls) == before

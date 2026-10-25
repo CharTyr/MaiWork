@@ -1188,8 +1188,57 @@ def _m_skills(conn: sqlite3.Connection) -> None:
     pass
 
 
+def _m_task_sessions(conn: sqlite3.Connection) -> None:
+    """第 44 步：工作会话与事件账本，老任务不自动归入会话。"""
+    conn.executescript("""
+CREATE TABLE IF NOT EXISTS task_sessions (
+    id TEXT PRIMARY KEY,
+    platform TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    request_id TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK(state IN ('awaiting_approval','working','idle','paused','asking','closed')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    current_task_id TEXT,
+    env_lease TEXT,
+    opened_at REAL NOT NULL,
+    last_active_at REAL NOT NULL,
+    last_delivery_at REAL NOT NULL DEFAULT 0,
+    closed_at REAL,
+    closed_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_sessions_open_group
+    ON task_sessions(platform, group_id) WHERE state != 'closed';
+CREATE INDEX IF NOT EXISTS idx_task_sessions_closed ON task_sessions(state, closed_at);
+CREATE TABLE IF NOT EXISTS session_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES task_sessions(id),
+    seq INTEGER NOT NULL,
+    source_key TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL CHECK(kind IN ('instruction','new_work','supplement','correction','pause','resume','end','progress_query','clarify_q','clarify_a','adopt','admin_stop')),
+    text TEXT NOT NULL DEFAULT '',
+    quoted_ref TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'received' CHECK(status IN ('received','applied','stale','rejected')),
+    revision INTEGER NOT NULL,
+    received_at REAL NOT NULL,
+    applied_at REAL,
+    note TEXT NOT NULL DEFAULT '',
+    UNIQUE(session_id, seq)
+);
+""")
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+    if cols:
+        for name, ddl in (("session_id", "TEXT"), ("turn_no", "INTEGER")):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {ddl}")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_session_turn"
+            " ON tasks(session_id, turn_no) WHERE session_id IS NOT NULL"
+        )
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids, _m_pending_ask_state, _m_goal_stale_notify, _m_skills]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids, _m_pending_ask_state, _m_goal_stale_notify, _m_skills, _m_task_sessions]
 
 
 class Store:
@@ -1251,6 +1300,23 @@ class Store:
                 raise
             else:
                 self._conn.execute("COMMIT")
+
+    @contextmanager
+    def immediate_tx(self) -> Iterator[sqlite3.Connection]:
+        """命令预算内的独立短事务：不等共享锁，遇写锁立即失败。"""
+        conn = sqlite3.connect(self.path, timeout=0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
 
     def read(self) -> sqlite3.Connection:
         """只读查询用（同一连接，row_factory = sqlite3.Row）。autocommit 模式，BEGIN/COMMIT 由 tx() 管。"""
@@ -1344,6 +1410,12 @@ class Store:
             cur = conn.execute("DELETE FROM mentions WHERE expires_ts <= ?", (float(now),))
             counts["mentions"] = int(cur.rowcount or 0)
             counts["model_calls"] = self._prune_model_calls_tx(conn, now)
+            cur = conn.execute(
+                "DELETE FROM session_events WHERE session_id IN ("
+                " SELECT id FROM task_sessions WHERE state='closed' AND closed_at < ?)",
+                (cutoff,),
+            )
+            counts["session_events"] = int(cur.rowcount or 0)
         return counts
 
     def _prune_model_calls_tx(self, conn: sqlite3.Connection, now: float) -> int:

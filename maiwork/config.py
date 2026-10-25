@@ -73,7 +73,7 @@ def _norm_accounts(values: object, field_zh: str, problems: list[str]) -> tuple[
     return tuple(out)
 
 
-CONFIG_VERSION = "0.5.1"  # 0.5.1：[environments] freestyle 开关 + freestyle_* + vm_platform（两家一次性 VM 可同时开，vm_platform = 优先用哪家）；0.5.0：[environments] local_network（子 agent 默认碰不到本机与内网，开了才放行）；0.4.9：[quick_judge] 不再攒批（删 batch_wait_s，一条 @ 一次判断）、daily_max 归高级项；0.4.8：[quick_judge] 派活判断兜底（Jev 不在 / 拿不准时用模型快速判群里 @ 的是不是派活）；0.4.7：[jev] use + [[jev_endpoints]]（多判断服务：预设 / 自己加 / 换着用）；0.4.6：每端点高级请求头 headers（默认空）；0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）；0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
+CONFIG_VERSION = "0.5.3"  # 0.5.3：[console] herenow_share（没填公开网址时群友页自动发 here.now）；0.5.2：[session] 工作会话入口、判断时限与候选显示名；0.5.1：[environments] freestyle 开关 + freestyle_* + vm_platform（两家一次性 VM 可同时开，vm_platform = 优先用哪家）；0.5.0：[environments] local_network（子 agent 默认碰不到本机与内网，开了才放行）；0.4.9：[quick_judge] 不再攒批（删 batch_wait_s，一条 @ 一次判断）、daily_max 归高级项；0.4.8：[quick_judge] 派活判断兜底（Jev 不在 / 拿不准时用模型快速判群里 @ 的是不是派活）；0.4.7：[jev] use + [[jev_endpoints]]（多判断服务：预设 / 自己加 / 换着用）；0.4.6：每端点高级请求头 headers（默认空）；0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）；0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
 
 # 0.8.0 群控归一（docs/18 §五 + 往群里发）：下面这些全局键**只作新群第一次的迁移种子**
 # （migrations.migrate_group_controls 按服务群种进 kv["group_approval.<群号>"] /
@@ -343,6 +343,7 @@ class ConsoleSectionConfig(PluginConfigBase):
     listen: str = Field(default="127.0.0.1:18650", description="网页监听地址，必须为 IP:端口")
     password: str = Field(default="", description="管理员密码；空则首次启动自动生成")
     public_url: str = Field(default="", description="网页对外的地址（如 https://maiwork.example.com）；用于拼群链接")
+    herenow_share: bool = Field(default=True, description="没填公开网址时，把群友要看的页面自动发布到 here.now 匿名公开页，24 小时过期")
     update_check: bool = Field(default=True, description="管理员打开网页时顺手查 GitHub 上有没有 MaiWork 新版（只提醒，不自动更新）")
     maibot_webui_url: str = Field(default="", description="MaiBot 自己网页的地址；填了，更新提醒里的按钮直接跳过去")
 
@@ -467,6 +468,19 @@ class ReaderSectionConfig(PluginConfigBase):
     jina_api_key: str = Field(default="", description="Jina Reader 密钥（可选）：不填每分钟 20 次（按服务器 IP 算），填了 500 次；只进不出，不写日志")
 
 
+class SessionSectionConfig(PluginConfigBase):
+    __ui_label__ = "工作会话"
+    __ui_icon__ = "messages-square"
+    __ui_order__ = 17
+
+    enabled: bool = Field(default=True, description="启用群友工作会话")
+    relay_text: bool = Field(default=True, description="会话里主模型的工作回应直接发到群里（工具调用等不发）")
+    idle_close_minutes: int = Field(default=60, description="空闲或暂停多久后关闭（分钟）")
+    max_running_per_group: int = Field(default=1, description="每群同时运行数（当前固定为 1）")
+    triage_timeout_ms: int = Field(default=1200, description="入口判断预算（300~1500 毫秒）")
+    bot_names: list[str] = Field(default_factory=list, description="机器人显示名；保存后下次加载注册")
+
+
 class MaiWorkConfig(PluginConfigBase):
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     groups: GroupsSectionConfig = Field(default_factory=GroupsSectionConfig)
@@ -489,6 +503,7 @@ class MaiWorkConfig(PluginConfigBase):
     storage: StorageSectionConfig = Field(default_factory=StorageSectionConfig)
     extensions: ExtensionsSectionConfig = Field(default_factory=ExtensionsSectionConfig)
     group_space: GroupSpaceSectionConfig = Field(default_factory=GroupSpaceSectionConfig)
+    session: SessionSectionConfig = Field(default_factory=SessionSectionConfig)
     reader: ReaderSectionConfig = Field(default_factory=ReaderSectionConfig)
 
 
@@ -805,6 +820,7 @@ class ConsoleSetting:
     password: str
     public_url: str
     update_check: bool = True
+    herenow_share: bool = True
     maibot_webui_url: str = ""
 
 
@@ -881,6 +897,35 @@ class ReaderSetting:
 
 
 @dataclass(frozen=True)
+class SessionSetting:
+    enabled: bool = True
+    relay_text: bool = True
+    idle_close_minutes: int = 60
+    max_running_per_group: int = 1
+    triage_timeout_ms: int = 1200
+    bot_names: tuple[str, ...] = ()
+
+
+def _parse_session(cfg: SessionSectionConfig, problems: list[str]) -> SessionSetting:
+    names = []
+    for raw in cfg.bot_names:
+        name = raw.strip()
+        if not name or len(name) > 80 or any(ord(c) < 32 for c in name):
+            problems.append("[session] bot_names 有空白、过长或控制字符条目，已忽略")
+        elif name not in names:
+            names.append(name)
+    if len(names) > 32:
+        problems.append("[session] bot_names 最多保留 32 个")
+    if cfg.max_running_per_group != 1:
+        problems.append("[session] max_running_per_group 当前固定为 1")
+    if not 300 <= cfg.triage_timeout_ms <= 1500:
+        problems.append("[session] triage_timeout_ms 已限制到 300~1500")
+    return SessionSetting(bool(cfg.enabled), bool(cfg.relay_text),
+        max(1, min(10080, cfg.idle_close_minutes)), 1,
+        max(300, min(1500, cfg.triage_timeout_ms)), tuple(names[:32]))
+
+
+@dataclass(frozen=True)
 class Settings:
     """规范化后的只读配置快照。groups 键是纯数字群号字符串。"""
 
@@ -909,6 +954,7 @@ class Settings:
     tasks: TasksSetting = TasksSetting()
     extensions: ExtensionsSetting = ExtensionsSetting(mcp=())
     group_space: GroupSpaceSetting = GroupSpaceSetting(enabled=True, notice_per_day=1)
+    session: SessionSetting = SessionSetting()
     reader: ReaderSetting = ReaderSetting()
     # 内部派生运行时字段（**不是** SDK / config.toml 可编辑键，不参与 schema / config_version）：
     # 群控归一（全局旧键 → 每群一份）这一轮是否已经「物化成功 + 有效重读成功」。
@@ -1696,6 +1742,7 @@ _SECTIONS: tuple[tuple[str, type[PluginConfigBase]], ...] = (
     ("storage", StorageSectionConfig),
     ("extensions", ExtensionsSectionConfig),
     ("group_space", GroupSpaceSectionConfig),
+    ("session", SessionSectionConfig),
     ("reader", ReaderSectionConfig),
 )
 
@@ -1866,6 +1913,7 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
             password=str(console.password or ""),
             public_url=str(console.public_url or "").rstrip("/"),
             update_check=bool(getattr(console, "update_check", True)),
+            herenow_share=bool(getattr(console, "herenow_share", True)),
             maibot_webui_url=_http_url_or_empty(getattr(console, "maibot_webui_url", "")),
         ),
         endpoints=endpoints_parsed,
@@ -1885,6 +1933,7 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
             enabled=bool(group_space.enabled),
             notice_per_day=max(1, int(group_space.notice_per_day)),
         ),
+        session=_parse_session(sections["session"], problems),
         reader=ReaderSetting(
             jina_enabled=bool(reader.jina_enabled),
             jina_api_key=str(reader.jina_api_key or "").strip(),

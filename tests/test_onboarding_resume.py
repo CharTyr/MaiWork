@@ -106,9 +106,10 @@ async def test_items_checklist(tmp_path: Path) -> None:
             assert i["title"] and i["text"]
         # 模型没验证过：不说「已验证」，如实标注
         assert "未验证" in by["models"]["text"] or "没验证" in by["models"]["text"]
-        # 没配公网地址：说清楚只有管理员本机能打开，群友拿不到链接
-        assert by["delivery"]["state"] == "warn"
-        assert "群友" in by["delivery"]["text"]
+        # 没配公网地址：默认走 here.now 自动公开，说清楚 24 小时过期和怎么换自己的网址
+        assert by["delivery"]["state"] == "ok"
+        assert "群友" in by["delivery"]["text"] and "here.now" in by["delivery"]["text"]
+        assert "groupfile" in by
         # 搜索没配：说清楚哪些还能用
         assert by["search"]["state"] in ("warn", "off")
         # 新群画像还没成形：第一件小事在等

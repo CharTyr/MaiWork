@@ -481,7 +481,7 @@ class Jev:
         state_text = _state_summary(state, key)
         answers_text = _answers_json(answers if answers is not None else {}, key)
         try:
-            with self._store.tx() as conn:
+            with (self._store.immediate_tx() if purpose == "session.triage" else self._store.tx()) as conn:
                 conn.execute(
                     "INSERT INTO judgments (ts, day, purpose, group_id, state_summary, answers, ms, ok, error)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -739,7 +739,7 @@ class Jev:
         except Exception:
             answers_text = _answers_json(answers_raw, key)
         try:
-            with self._store.tx() as conn:
+            with (self._store.immediate_tx() if purpose == "session.triage" else self._store.tx()) as conn:
                 conn.execute(
                     "INSERT INTO judgments (ts, day, purpose, group_id, state_summary, answers, ms, ok, error)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",

@@ -445,6 +445,7 @@ _ADVANCED_KEYS = frozenset({
     "tasks.token_limit", "tasks.run_seconds", "storage.data_dir",
     "jev.timeout_ms", "jev.key_file", "jev.api_url", "jev.model", "jev.use",
     "quick_judge.model", "quick_judge.daily_max",
+    "session.max_running_per_group", "session.triage_timeout_ms", "session.bot_names",
     "environments.workspace_root", "environments.memory_max", "environments.runtime_max_sec",
     "environments.local_mode", "environments.run_as", "environments.max_parallel",
     "environments.command_timeout_s", "environments.railway_daily_max",
@@ -572,6 +573,24 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     _F("quick_judge.keyword_filter", "关键词预筛选", "不含请求词的 @ 消息视为闲聊；表述含糊的任务请求可能被遗漏。", "bool"),
     _F("quick_judge.daily_max", "每日判断上限", "每个群每天最多判断的次数，每条 @ 消息计一次；0 表示不使用模型判断。", "int", min=0, max=500),
 
+    # ---- session（群友工作会话；docs/02 §9.2 补记、任务 10-20-group-task-sessions） ----
+    _F("session.enabled", "连续对话",
+       "群友派的活批准后，发起人可以继续 @ 机器人说「往下滚」「改成英文」「做到哪了」「结束吧」，"
+       "在同一段工作对话里接着做；关闭后与以前一样，每次 @ 都当一件新事。", "bool"),
+    _F("session.relay_text", "工作回应",
+       "连续对话里，把 MaiWork 边做边说的话直接发到群里（口吻按 MaiWork 人设；工具调用和内部过程不发）。"
+       "关闭后只发等批准、交付等固定的话。", "bool"),
+    _F("session.idle_close_minutes", "闲置结束（分钟）",
+       "没有活在跑、发起人也一直没再 @，过了这么久就悄悄结束这段对话，借用的电脑一并释放。",
+       "int", min=1, max=10080),
+    _F("session.max_running_per_group", "每群同时进行数", "一个群同一时间只做一件活，其余排队。",
+       "int", min=1, max=1, readonly=True, readonly_reason="当前固定为 1"),
+    _F("session.triage_timeout_ms", "判断时限（毫秒）",
+       "判断一句 @ 是给 MaiWork 的还是闲聊，最多等多久；超时当闲聊交给 MaiBot。", "int", min=300, max=1500),
+    _F("session.bot_names", "机器人显示名",
+       "机器人在各群里被 @ 时显示的名字（群名片或昵称）。通常无需填写，MaiWork 会自动学；"
+       "新增的名字在插件下次加载时生效。", "list_str"),
+
     # ---- usage ----
     _F("usage.alert_daily_tokens", "每日用量提醒线", "当日用量超过该值时提醒；0 表示不提醒。", "int", min=0, max=10**9),
     _F("usage.alert_task_tokens", "单任务用量提醒线", "单个任务用量超过该值时提醒；0 表示不提醒。", "int", min=0, max=10**9),
@@ -587,6 +606,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     _F("console.listen", "监听地址", "格式为 IP:端口。", "str", check=_check_listen),
     _F("console.password", "管理密码", "", "secret"),
     _F("console.public_url", "公开网址", "用于生成群链接，例如 https://maiwork.example.com。", "str", check=_check_public_url),
+    _F("console.herenow_share", "用 here.now 自动公开", "没填公开网址时，群友要看的页面自动发到 here.now 公开页，拿到链接的人都能看，24 小时后失效。", "bool"),
     _F("console.update_check", "检查更新", "有新版本时在网页中提示。", "bool"),
     _F("console.maibot_webui_url", "MaiBot 网址", "填写后，更新提示中可直接跳转，例如 http://127.0.0.1:8001。", "str", check=_check_public_url),
 
@@ -665,6 +685,7 @@ CONFIG_SECTIONS: list[dict[str, str]] = [
     {"id": "models", "label": "模型"},
     {"id": "jev", "label": "快速判断"},
     {"id": "quick_judge", "label": "任务识别备用方案"},
+    {"id": "session", "label": "连续对话"},
     {"id": "usage", "label": "用量提醒"},
     {"id": "console", "label": "网页"},
     {"id": "environments", "label": "运行环境"},

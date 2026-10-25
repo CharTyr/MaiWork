@@ -133,6 +133,65 @@ class HostContractTest(unittest.TestCase):
             kind = str(c.get("component_type") or c.get("type") or "").lower()
             self.assertNotIn("tool", kind, c)
 
+    def test_session_command_in_real_host_registry(self) -> None:
+        """会话原生命令放进**宿主真实的** ComponentRegistry：只认 @ 本 bot 的显示名、
+        宿主侧超时取 5000ms、全局关闭后完全不匹配（关着时不打 is_command 的前提）。
+
+        Runner 先 `_apply_plugin_config`（runner_main.py:1614）再 `get_components()`（:1405），
+        这里按同样顺序：先 set_plugin_config，再收集组件。
+        """
+        import tempfile
+
+        from src.plugin_runtime.host.component_registry import ComponentRegistry
+
+        p = create_plugin()
+        cfg, _ = p.normalize_plugin_config({
+            "plugin": {"enabled": False, "config_version": "0.0.1"},
+            "session": {"bot_names": ["東雪蓮", "🪷🪷"]},
+            "storage": {"data_dir": tempfile.mkdtemp(prefix="maiwork-ci-cmd-")},
+        })
+        p.set_plugin_config(cfg)
+        comps = p.get_components()
+        # 原始声明的类型键是 "type"；Runner 按 runner_main.py:1405-1430 转成
+        # ComponentDeclaration(component_type=type, chat_scope, allowed_session, metadata) 再交给注册表
+        cmds = [c for c in comps if str(c.get("type") or "").lower() == "command"]
+        self.assertEqual([c.get("name") for c in cmds], ["maiwork_session"], cmds)
+        decls = [
+            {
+                "name": str(c.get("name") or ""),
+                "component_type": str(c.get("type") or ""),
+                "chat_scope": str(c.get("chat_scope", "all") or "all"),
+                "allowed_session": list(c.get("allowed_session") or []),
+                "metadata": dict(c.get("metadata") or {}),
+            }
+            for c in comps
+        ]
+
+        reg = ComponentRegistry()
+        self.assertEqual(reg.register_plugin_components(PLUGIN_ID, decls), len(decls))
+        for text in ("@東雪蓮 往下滚", "@🪷🪷 做到哪了", "[reply]别人说的 @東雪蓮  按这个做", "@東雪蓮"):
+            hit = reg.find_command_by_text(text)
+            self.assertIsNotNone(hit, f"应命中：{text!r}")
+            entry, _groups = hit
+            self.assertEqual(entry.name, "maiwork_session")
+            self.assertEqual(entry.timeout_ms, 5000)
+        for text in ("@别人 继续", "今天天气不错", "/mw 状态", "@東雪蓮 /pic 猫", "东雪莲 往下滚", "文字 @東雪蓮 继续"):
+            self.assertIsNone(reg.find_command_by_text(text), f"不应命中：{text!r}")
+
+        full = f"{PLUGIN_ID}.maiwork_session"
+        self.assertTrue(reg.set_component_enabled(full, False))
+        self.assertIsNone(reg.find_command_by_text("@東雪蓮 往下滚"), "全局关闭后仍在匹配")
+        self.assertTrue(reg.set_component_enabled(full, True))
+        self.assertIsNotNone(reg.find_command_by_text("@東雪蓮 往下滚"))
+
+    def test_session_command_capabilities_declared(self) -> None:
+        """manifest 必须声明 component.enable / component.disable，否则开关会 E_CAPABILITY_DENIED。"""
+        import json
+
+        manifest = json.loads((PLUGIN_DIR / "_manifest.json").read_text(encoding="utf-8"))
+        for cap in ("component.enable", "component.disable"):
+            self.assertIn(cap, manifest["capabilities"])
+
     def test_old_config_merges(self) -> None:
         """线上旧版 config.toml（0.0.1，只有 [plugin]）能被规范化成新结构，且仍是关闭的。"""
         p = create_plugin()

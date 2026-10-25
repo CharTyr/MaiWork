@@ -1457,11 +1457,111 @@ def _groupspace_health(svc: Any) -> dict[str, Any]:
     }
 
 
+# 本机缺哪些 SSH 客户端命令（一次性机器要用 ssh / scp / ssh-keygen 连过去）。
+# 只是 shutil.which 级别的查找，仍缓存 30 秒，免得每次刷网页都找一遍。
+_SSH_MISSING_TTL = 30.0
+_SSH_MISSING_CACHE: tuple[float, list[str]] | None = None
+
+
+def ssh_missing_tools(svc: Any) -> list[str]:
+    """缺的 SSH 客户端命令；svc.ssh_missing_tools（可调用）可注入，测试用。查不了就当不缺。"""
+    global _SSH_MISSING_CACHE
+    probe = getattr(svc, "ssh_missing_tools", None)
+    try:
+        if callable(probe):
+            return [str(x) for x in (probe() or [])]
+        import time as _time
+
+        from ..environments import openssh_client
+
+        now = _time.monotonic()
+        hit = _SSH_MISSING_CACHE
+        if hit is not None and now - hit[0] < _SSH_MISSING_TTL:
+            return list(hit[1])
+        missing = list(openssh_client.missing_tools())
+        _SSH_MISSING_CACHE = (now, missing)
+        return missing
+    except Exception:
+        return []
+
+
+def ssh_install_hint(missing: list[str]) -> str:
+    try:
+        from ..environments import openssh_client
+
+        return openssh_client.install_hint(missing, env=openssh_client.minimal_env())
+    except Exception:
+        return ""
+
+
+_IN_DOCKER_CACHE: bool | None = None
+
+FREESTYLE_NO_SSH_HINT = (
+    "或者不装 SSH：在「设置 → 全部设置 → 运行环境」打开 Freestyle 临时机器并填密钥（它不用 SSH）。"
+)
+
+
+def in_docker(svc: Any) -> bool:
+    """是否跑在容器里；svc.in_docker（可调用）可注入，测试用。默认探测结果缓存。"""
+    global _IN_DOCKER_CACHE
+    probe = getattr(svc, "in_docker", None)
+    if callable(probe):
+        try:
+            return bool(probe())
+        except Exception:
+            return False
+    if _IN_DOCKER_CACHE is None:
+        try:
+            from ..environments import container
+
+            _IN_DOCKER_CACHE = bool(container.in_docker())
+        except Exception:
+            _IN_DOCKER_CACHE = False
+    return _IN_DOCKER_CACHE
+
+
+def data_dir_info(svc: Any) -> tuple[str, bool | None]:
+    """(数据目录路径, 是否挂到容器外 True/False/None)；svc.data_dir_persisted 可注入。"""
+    settings = svc.get_settings()
+    path = str(getattr(settings, "data_dir", "") or "") if settings is not None else ""
+    if not path:
+        return "", None
+    probe = getattr(svc, "data_dir_persisted", None)
+    try:
+        if callable(probe):
+            return path, probe(path)
+        from ..environments import container
+
+        return path, container.data_dir_persisted(path)
+    except Exception:
+        return path, None
+
+
+def docker_data_text(path: str, persisted: bool | None) -> str:
+    if persisted is False:
+        return (f"数据目录 {path} 在容器里面，重建容器会丢数据库、管理员密码和 SSH 密钥；"
+                f"请把它挂到容器外（docker run -v 宿主目录:{path}）")
+    if persisted:
+        return f"数据目录 {path} 已挂到容器外，重建容器不会丢"
+    return f"看不出数据目录 {path} 有没有挂到容器外；请自己确认 docker run 时用 -v 挂出来了"
+
+
+def _container_health(svc: Any) -> dict[str, Any] | None:
+    """Docker 下的「容器」健康项：数据目录是否挂到容器外。非 Docker → None。"""
+    if not in_docker(svc):
+        return None
+    path, persisted = data_dir_info(svc)
+    state = "warn" if persisted is False else ("ok" if persisted else "off")
+    return {"key": "container", "icon": "package", "name": "容器 · Docker", "state": state,
+            "text": docker_data_text(path or "（未知）", persisted)}
+
+
 def _railway_health(svc: Any) -> dict[str, Any] | None:
     """一次性 VM（railway.new）健康项（docs/09 实测）。
 
     - [environments] 里没有 environments 节（老 stub）→ None，不出现在健康列表里；
     - railway=false → off；
+    - 开着但本机缺 SSH 客户端 → warn「连不上临时机器：缺少 SSH 客户端（缺哪个写哪个）。<修法>」；
     - 开着 → ok「今天用了 N/<railway_daily_max> 台」（N = 今天成功拿到的台数）；
     - 最近一次申请没拿到（railway.last_fail 在最近 24 小时内、且之后没再成功拿到过）
       → warn「最近一次未能获取机器：<原因>」。
@@ -1475,6 +1575,13 @@ def _railway_health(svc: Any) -> dict[str, Any] | None:
         return None
     if not bool(getattr(env, "railway", True)):
         return {**base, "state": "off", "text": "已关闭"}
+    missing = ssh_missing_tools(svc)
+    if missing:
+        return {
+            **base, "state": "warn",
+            "text": "连不上临时机器：缺少 SSH 客户端（" + " / ".join(missing) + "）。" + ssh_install_hint(missing)
+            + (FREESTYLE_NO_SSH_HINT if in_docker(svc) else ""),
+        }
     daily_max = max(1, int(getattr(env, "railway_daily_max", 2) or 2))
     used = 0
     last_fail: dict | None = None
@@ -1834,6 +1941,9 @@ def settings_view(svc: Any) -> dict[str, Any]:
     ssh_health = _ssh_health(svc)
     if ssh_health is not None:
         health.append(ssh_health)
+    container_health = _container_health(svc)
+    if container_health is not None:
+        health.append(container_health)
     # 一次性 VM：railway 与 freestyle 各自开关、可同时开（2026-10-15 用户定）。
     # 开着的都列出来、优先那家在前；一家都没开时照旧显示 railway 那条（它会写「没开」）。
     from ..environments import vm_platforms as _vm_platforms

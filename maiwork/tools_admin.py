@@ -1787,6 +1787,12 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                 view = deps.status()
                 rows = []
                 for g in view.get("groups") or []:
+                    if g.get("kind") == "asset":
+                        # 画图组件（中文字体 / 浏览器）：直接用状态里那句话
+                        rows.append({"id": g.get("id"), "state": g.get("state"), "installed": []})
+                        lines.append(f"• {g.get('label')}：{g.get('summary') or g.get('state')}"
+                                     + (f"（{g.get('hint')}）" if g.get("hint") else ""))
+                        continue
                     have = [
                         f"{p.get('name')} {p.get('version') or ''}".strip()
                         for p in (g.get("packages") or []) if p.get("installed")

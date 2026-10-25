@@ -12,7 +12,7 @@
   走正常批准流程（免批直接开工）。引用一条消息再发就用被引用的正文当要做的事，后面的话算
   发起人的补充说明；请求的 message_id 就是这条 /mw do 自己的消息（收图靠它，见 coordinator）。
 - /mw 领取 T-x  本群任何人：明确当场索取已完成且待发的成品（不重复传已发/不确定的文件）
-- /mw 网页       任何人：本群网页链接（没配 public_url 就回「网页还没公开，找管理员要」）
+- /mw 网页       任何人：本群网页链接（public_url 优先；没填就按开关发 here.now 公开页；都没有回「网页还没公开…」）
 - /mw 帮助       任何人（别名 help / ? / ？）：全部指令一张表（`HELP_ITEMS`，唯一来源）
 - /mw 批准 [ID]  本群批准人（`kv["group_approval.<群号>"].approvers`，含全局管理员从旧
   名单种进来的那份）：批准**本群**的待批请求；不带 ID 时本群只有一个待批直接处理，多个列出
@@ -198,7 +198,9 @@ class Commands:
         run_task_starter: Callable[[str], None] | None = None,
         run_task_stopper: Callable[[str], None] | None = None,
         group_admins: Any = None,
+        share: Any = None,  # share.Share：没填公开网址时 /mw 网页发 here.now 公开页
     ) -> None:
+        self._share = share
         self._store = store
         self._approvals = approvals
         self._tasks = tasks
@@ -295,7 +297,7 @@ class Commands:
         if sub in _DO_SUBS:
             return await self._do(gid, user_id, user_name, raw, message_id, reply_to)
         if sub == "网页":
-            return self._web(gid)
+            return await self._web(gid)
         if sub in _HELP_ALIASES:
             return help_text(self._bot_name())
         if sub in ("批准", "通过"):
@@ -465,16 +467,18 @@ class Commands:
     # /mw 网页：本群链接
     # ------------------------------------------------------------------
 
-    def _web(self, gid: str) -> str:
-        from .card_push import group_link
+    async def _web(self, gid: str) -> str:
+        from .share import group_link_async
 
         try:
             settings = self._get_settings()
         except Exception:
             settings = None
-        link = group_link(self._store, settings, gid) if settings is not None else ""
+        link = await group_link_async(self._store, settings, gid, tab="news", share=self._share)
         if not link:
-            return "网页还没公开，找管理员要"
+            return "网页还没公开：管理员可以打开 here.now 自动公开或填公开网址"
+        if not str(getattr(getattr(settings, "console", None), "public_url", "") or ""):
+            return f"本群网页：{link}（24 小时内有效）"
         return f"本群网页：{link}"
 
     # ------------------------------------------------------------------

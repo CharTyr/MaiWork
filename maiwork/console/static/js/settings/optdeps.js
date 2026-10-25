@@ -53,6 +53,8 @@ function pkgText(p) {
 function stateText(g) {
   if (g.installing) return "正在安装，通常需要 1–2 分钟，可离开此页面";
   if (g.uninstalling) return "正在卸载…";
+  // 画图组件（中文字体 / 画图浏览器，kind=asset）：后端给好那句话
+  if (g.kind === "asset") return g.summary || "未检查";
   const n = g.installed_count || 0;
   const total = g.total || (g.packages || []).length;
   if (g.state === "ok") return "已安装，子 agent 可以生成和编辑这类文件";
@@ -70,7 +72,7 @@ function groupRow(g) {
     : `<span class="row-btns">${
         ok
           ? `<button class="btn small" data-act="od-uninstall" data-id="${esc(g.id)}">卸载</button>`
-          : `<button class="btn small primary" data-act="od-install" data-id="${esc(g.id)}">${g.state === "partial" || li.state === "failed" ? "重新安装" : "安装"}</button>`
+          : `<button class="btn small${g.state === "system" ? "" : " primary"}" data-act="od-install" data-id="${esc(g.id)}">${g.state === "partial" || g.state === "broken" || li.state === "failed" ? "重新安装" : "安装"}</button>`
       }</span>`;
   const warn =
     li.state === "failed" && !doing
@@ -82,11 +84,12 @@ function groupRow(g) {
     .filter((t) => !t.found)
     .map((t) => `<p class="fine">${esc(t.note || `${t.name} 未找到`)}</p>`)
     .join("");
+  const hint = g.hint && !doing && li.state !== "failed" ? `<div class="warn-box" style="margin-top:8px">${esc(g.hint)}</div>` : "";
   const pkgs = (g.packages || []).length ? `<div class="set-text">${(g.packages || []).map(pkgText).join(" · ")}</div>` : "";
   return `<div class="set-row cp">${ico("filebox")}<div>
       <div class="set-name">${esc(g.label || g.id)}</div>
-      <div class="set-text">${esc(stateText(g))}</div>${pkgs}${warn}${tools}
-    </div><span style="display:flex;align-items:center;gap:10px">${btns}<span class="dot ${ok ? "ok" : doing || g.state === "partial" ? "pending" : ""}"></span></span></div>`;
+      <div class="set-text">${esc(stateText(g))}</div>${pkgs}${warn}${hint}${tools}
+    </div><span style="display:flex;align-items:center;gap:10px">${btns}<span class="dot ${ok || g.state === "system" ? "ok" : doing || g.state === "partial" ? "pending" : ""}"></span></span></div>`;
 }
 
 export function optDepsSection() {
@@ -94,9 +97,12 @@ export function optDepsSection() {
   if (!v && !state.optDepsErr) return "";
   const head = `<div class="h-sub-row"><h2 class="h-sub">可选组件${tip("按需安装的额外能力。安装在 MaiWork 自己的目录里，不会改动 MaiBot 的运行环境。")}</h2></div>`;
   if (!v) return `${head}<p class="h-meta">读取失败：${esc(state.optDepsErr)} <button type="button" class="link-btn" data-act="od-reload">重试</button></p>`;
-  if (v.available === false) return `${head}<p class="h-meta">${esc(v.note || "本机执行未开启，无法安装")}</p>`;
+  // 本机执行没开时办公文档装不了，但画图组件（字体 / 浏览器，给 MaiWork 自己画图用）照样能装
+  const usable = (v.groups || []).filter((g) => v.available !== false || (g.kind === "asset" && g.available !== false));
+  if (v.available === false && !usable.length) return `${head}<p class="h-meta">${esc(v.note || "本机执行未开启，无法安装")}</p>`;
+  const offNote = v.available === false ? `<p class="h-meta">${esc(v.note || "本机执行未开启，无法安装")}</p>` : "";
   const refreshError = state.optDepsErr ? `<p class="h-meta" role="status">刷新失败：${esc(state.optDepsErr)} <button type="button" class="link-btn" data-act="od-reload">重试</button></p>` : "";
-  return `${head}${refreshError}${(v.groups || []).map(groupRow).join("")}${v.check_error ? `<p class="fine">检查失败：${esc(v.check_error)}</p>` : ""}`;
+  return `${head}${offNote}${refreshError}${usable.map(groupRow).join("")}${v.check_error ? `<p class="fine">检查失败：${esc(v.check_error)}</p>` : ""}`;
 }
 
 export async function actOptDeps(a, el) {
@@ -108,7 +114,11 @@ export async function actOptDeps(a, el) {
     case "od-install":
     case "od-uninstall": {
       const id = el.dataset.id;
-      if (a === "od-uninstall" && !confirm("卸载办公文档组件？之后子 agent 会改用 Markdown、表格或网页交付。")) return true;
+      const UNINSTALL_ASK = {
+        fonts: "删除 MaiWork 下载的中文字体？系统里没有中文字体时，资讯卡片的中文可能显示成方块。",
+        browser: "删除 MaiWork 下载的画图浏览器？没有可用浏览器时，资讯卡片会改发文字。",
+      };
+      if (a === "od-uninstall" && !confirm(UNINSTALL_ASK[id] || "卸载办公文档组件？之后子 agent 会改用 Markdown、表格或网页交付。")) return true;
       el.disabled = true;
       try {
         state.optDeps = await api("POST", `/api/optional-deps/${encodeURIComponent(id)}/${a === "od-install" ? "install" : "uninstall"}`);

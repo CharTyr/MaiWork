@@ -54,6 +54,7 @@ Fallback 的临时目录放在 settings.workspace_root 下的 .web/.fallback，�
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -72,11 +73,46 @@ from urllib.parse import quote as _url_quote
 
 from . import clock, group_features, group_push, members
 from .delivery import UNREADABLE_REASON, Mentions, Pushes, task_quota_free_kind
-from .host import HostError
+from .host import HostError, upload_error_kind
 from .models import _redact
 from .store import Store
 
 logger = logging.getLogger("maiwork.outbox")
+
+# 群文件路径读不到时改用 base64:// 重传的上限（NapCat websocket 50MB、适配器 15 秒超时）
+_BASE64_MAX_BYTES = 20 * 1024 * 1024
+_TOO_BIG_REASON = "QQ 端和 MaiBot 不在同一台机器/容器，文件超过 20MB 没法跨机器传"
+_KV_FILE_LAST_FAIL = "outbox.file_last_fail"
+_KV_FILE_LAST_OK = "outbox.file_last_ok"
+_EVENT_DELIVERY_FALLBACK = "task.delivery_fallback"
+_ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:\\|/)[^\s'\"，。；：、（）()]+")
+
+
+class _TooBigForBase64(HostError):
+    """路径读不到、文件又超过 20MB：不重传。"""
+
+
+def upload_fail_reason(err: Any) -> str:
+    """群文件失败原因 → 大白话（发群 / 网页可见，绝不含本机绝对路径）。"""
+    text = str(err or "")
+    if _TOO_BIG_REASON in text:
+        return _TOO_BIG_REASON
+    kind = upload_error_kind(text)
+    if kind == "path_unreadable":
+        return "QQ 端读不到这台机器上的文件（多半是 NapCat/SnowLuma 装在 Docker、WSL 或另一台电脑上）"
+    if kind == "no_api":
+        return "QQ 适配器不支持上传群文件，可以换 SnowLuma 适配器 1.x"
+    if kind == "timeout":
+        return "上传超时，文件可能太大或网络慢"
+    cleaned = _ABS_PATH_RE.sub("…", text.replace("\n", " ")).strip()
+    if len(cleaned) > 80:
+        cleaned = cleaned[:80] + "…"
+    return f"QQ 端拒绝了上传：{cleaned}" if cleaned else "QQ 端拒绝了上传"
+
+
+def upload_fail_kind(err: Any) -> str:
+    text = str(err or "")
+    return "path_unreadable" if _TOO_BIG_REASON in text else upload_error_kind(text)
 
 _DELIVER_MENTION_TTL_S = 6 * 3600  # 交付备忘在可提起清单里留 6 小时
 _ERR_MAX = 300
@@ -694,6 +730,21 @@ class Outbox:
         # 不同实例 / 跨进程靠 `_claim` 的数据库 CAS（status='pending' 条件）兜底。
         self._flush_lock: Optional[asyncio.Lock] = None
         self._flush_lock_loop: Any = None
+        self._wake_hook: Any = None
+
+    def set_wake_hook(self, hook):
+        """有限唤醒由 app 持有；call_soon 保证先退出调用方事务。"""
+        self._wake_hook = hook
+
+    def _wake_command(self, group_id, payload, not_before):
+        if not callable(self._wake_hook) or payload.get("push_kind") != "command":
+            return
+        if not self._get_settings().is_served(str(group_id)):
+            return
+        try:
+            asyncio.get_running_loop().call_soon(self._wake_hook, max(0.0, float(not_before or 0) - clock.now()))
+        except RuntimeError:
+            pass  # 无事件循环时由下次主循环恢复发送
 
     def add_result_hook(self, hook: Any) -> None:
         """挂发送结果回调（可挂多个）：fn(info) -> None。
@@ -780,7 +831,9 @@ class Outbox:
                     now,
                 ),
             )
-            return int(cur.lastrowid or 0)
+            oid = int(cur.lastrowid or 0)
+            self._wake_command(group_id, payload or {}, not_before)
+            return oid
 
     def claim_delivery(self, group_id: str, task_id: str) -> str:
         """群友当场索取本群已完成任务：仅提升尚未发出的交付，不重传已发/不确定的原件。
@@ -794,12 +847,14 @@ class Outbox:
         prefix = f"task:{tid}:deliver"
         with self._store.tx() as conn:
             task = conn.execute(
-                "SELECT status FROM tasks WHERE id=? AND group_id=?", (tid, gid)
+                "SELECT status,session_id,req_version FROM tasks WHERE id=? AND group_id=?", (tid, gid)
             ).fetchone()
             if task is None:
                 return "missing"  # 不透露别的群是否存在同 ID
             if task["status"] != "completed":
                 return "not_ready"
+            from .session_speech import delivery_prefix
+            prefix = delivery_prefix(tid, task, self._get_settings())
             rows = conn.execute(
                 "SELECT id, key, kind, status, payload FROM outbox"
                 " WHERE group_id=? AND task_id=? AND (key=? OR key LIKE ?)",
@@ -1063,6 +1118,21 @@ class Outbox:
         except Exception:
             logger.debug("写发件事件失败（%s，发件 %s）", kind, int(oid), exc_info=True)
 
+    def _note_file_result(self, now: float, *, fail_err: Optional[str] = None) -> None:
+        """群文件结果写 kv（引导自检读）：成功 file_last_ok={ts}；失败 file_last_fail={ts,reason,kind}。"""
+        try:
+            with self._store.tx() as conn:
+                if fail_err is None:
+                    self._store.kv_set(conn, _KV_FILE_LAST_OK, {"ts": float(now)})
+                else:
+                    self._store.kv_set(conn, _KV_FILE_LAST_FAIL, {
+                        "ts": float(now),
+                        "reason": upload_fail_reason(fail_err),
+                        "kind": upload_fail_kind(fail_err),
+                    })
+        except Exception:
+            logger.debug("写群文件结果 kv 失败", exc_info=True)
+
     def _drop_for_ttl(self, oid: int, group_id: str, reason: str, now: float, body: dict, *,
                       expires: float, target: Optional[float], why: str = "") -> None:
         """推迟后的发送时刻已经晚于期限 → 提前作废，如实通知生产者（每次只通知一次）。
@@ -1235,9 +1305,28 @@ class Outbox:
             return {"message_id": str(getattr(res, "message_id", "") or "")}
         if kind == "file":
             safe_path = self._check_upload_path(str(payload.get("path") or ""))
-            file_id = await self._host.upload_group_file(
-                gid, str(safe_path), str(payload.get("name") or "")
-            )
+            name = str(payload.get("name") or "")
+            try:
+                file_id = await self._host.upload_group_file(gid, str(safe_path), name)
+            except HostError as exc:
+                # 只有「QQ 端读不到路径」（调 QQ 之前就失败、上传肯定没执行）才重传一次，
+                # 改用 base64:// 带内容；其余错误（超时、未知）绝不重传——上传不幂等
+                if upload_error_kind(str(exc)) != "path_unreadable":
+                    raise
+                try:
+                    size = safe_path.stat().st_size
+                except OSError:
+                    raise exc from None
+                if size > _BASE64_MAX_BYTES:
+                    raise _TooBigForBase64(f"{_TOO_BIG_REASON}（{exc}）") from None
+                try:
+                    data = safe_path.read_bytes()  # 只读路径闸放行过的安全路径
+                except OSError:
+                    raise exc from None
+                logger.info("群文件路径 QQ 端读不到，改用 base64 重传一次（%d 字节）", size)
+                file_id = await self._host.upload_group_file(
+                    gid, "base64://" + base64.b64encode(data).decode("ascii"), name
+                )
             return {"file_id": str(file_id)}
         if kind == "herenow":
             if self._herenow is None:
@@ -1256,8 +1345,9 @@ class Outbox:
         gid = row["group_id"]
         key = row["key"]
         tid = row["task_id"]
-        follow_kind = ("awaited_delivery" if payload.get("push_kind") == "awaited_delivery"
-                       else "delivery")
+        follow_kind = (str(payload.get("push_kind")) if payload.get("session_delivery")
+                       else "awaited_delivery" if payload.get("push_kind") == "awaited_delivery" else "delivery")
+        address = {k: payload[k] for k in ("at_user", "reply_to", "session_delivery") if k in payload}
         if kind == "file":
             note = str(payload.get("note") or "").strip()
             name = str(payload.get("name") or "")
@@ -1268,7 +1358,7 @@ class Outbox:
                     "text",
                     # follow_up_of：这条是同一件交付自动补的说明，不是新的一次主动推送
                     # （不占第二份额度、也不再过一遍推送闸）
-                    {"text": note, "push_kind": follow_kind, "follow_up_of": int(row["id"])},
+                    {"text": note, "push_kind": follow_kind, "follow_up_of": int(row["id"]), **address},
                     task_id=tid,
                 )
             text = f"刚在群里发了文件「{name}」，有人问起可以告诉他：{note}" if note \
@@ -1287,7 +1377,7 @@ class Outbox:
                     f"{key}:note",
                     gid,
                     "text",
-                    {"text": text_out, "push_kind": follow_kind, "follow_up_of": int(row["id"])},
+                    {"text": text_out, "push_kind": follow_kind, "follow_up_of": int(row["id"]), **address},
                     task_id=tid,
                 )
             memo = f"刚在群里发了网页链接 {url}"
@@ -1325,7 +1415,7 @@ class Outbox:
     @staticmethod
     def _is_delivery_text(payload: dict) -> bool:
         """这条文字是不是「交付说明」（只发文字的交付 / note / note+链接）。"""
-        return str((payload or {}).get("push_kind") or "") in _DELIVERY_PUSH_KINDS
+        return bool((payload or {}).get("session_delivery")) or str((payload or {}).get("push_kind") or "") in _DELIVERY_PUSH_KINDS
 
     def _requester_at(self, group_id: str, task_id: Any) -> dict:
         """任务发起人的 at 参数：{"at_user", "at_name"}。
@@ -1452,6 +1542,21 @@ class Outbox:
         fb_kind = str(fb.get("kind") or "")
         fb_note = str(fb.get("note") or "")
         push_kind = str(payload.get("push_kind") or "delivery")
+        if str(row["kind"]) == "file":
+            # 群文件没发出去：交付说明末尾说清楚为什么（大白话、不含本机路径），时间线记一条
+            reason = upload_fail_reason(_row_field(row, "error"))
+            fb_note = f"{fb_note}（群文件没发出去：{reason}，改发网页链接）"
+            if tid:
+                try:
+                    with self._store.tx() as conn:
+                        self._store.event(
+                            conn, _EVENT_DELIVERY_FALLBACK, group_id=str(gid), entity="task",
+                            entity_id=str(tid),
+                            payload={"reason": reason, "kind": upload_fail_kind(_row_field(row, "error")),
+                                     "from": "file", "to": str(fb.get("kind") or "")},
+                        )
+                except Exception:
+                    logger.debug("写回落事件失败", exc_info=True)
         try:
             if fb_kind == "file":
                 fb_path = str(fb.get("path") or "")
@@ -1791,6 +1896,8 @@ class Outbox:
                                       outcome="retrying", error=err, now=now)
                     continue
                 self._set(oid, status="failed", error=err, moment=now)
+                if kind == "file":
+                    self._note_file_result(now, fail_err=err)
                 if kind in ("file", "herenow") or (
                         kind == "image" and isinstance(payload.get("fallback"), dict)):
                     # 任务交付的图发不出去 → 按载荷里的回落描述改发群文件；
@@ -1800,6 +1907,8 @@ class Outbox:
                                   outcome="failed", error=err, now=now)
                 continue
             self._set(oid, status="sent", result=result, moment=now)
+            if kind == "file":
+                self._note_file_result(now)
             fresh = _row_after(self._store, oid)
             # 提问回执：ask:{task_id}:{attempt} 的提问发出去了，把 QQ 消息 ID 交回
             # （回复那条提问 → 恢复 waiting_input / shelved 任务；app 挂了钩子才有动作）
@@ -2056,6 +2165,10 @@ class Delivery:
         path = self._check_deliver_path(task_id, gid, path)
         name = str(name or path.name or "成品")
         note = str(note or "")
+        from .session_speech import delivery_key, delivery_address
+        settings = self._outbox._get_settings()
+        base_key = delivery_key(self._store, settings, task_id, kind + ":" + str(path))
+        address = delivery_address(self._store, settings, task_id, gid)
 
         if kind == "image":
             # image 形态：成品是一到四张图片时，直接把图发进群 + 一句交付说明。
@@ -2079,6 +2192,7 @@ class Delivery:
                     "path": str(send_path),
                     "text": note if i == 0 else "",
                     "push_kind": "delivery",
+                    **address,
                     "fallback": {
                         "kind": "file",
                         "path": str(img),  # 回落发原成品（群文件不挑格式）
@@ -2086,7 +2200,7 @@ class Delivery:
                         "note": fb_note if i == 0 else "",
                     },
                 }
-                key = f"task:{task_id}:deliver" if i == 0 else f"task:{task_id}:deliver:img{i + 1}"
+                key = base_key if i == 0 else base_key + f":img{i + 1}"
                 oid = self._outbox.enqueue(key, gid, "image", payload, task_id=task_id)
                 if i == 0:
                     first_id = oid
@@ -2108,6 +2222,7 @@ class Delivery:
                 "note": note,
                 "title": name,
                 "push_kind": "delivery",
+                **address,
                 "fallback": {
                     "kind": "file",
                     "path": str(path),
@@ -2116,7 +2231,7 @@ class Delivery:
                 },
             }
             return self._outbox.enqueue(
-                f"task:{task_id}:deliver", gid, "herenow", payload, task_id=task_id
+                base_key, gid, "herenow", payload, task_id=task_id
             )
         # kind == "file"：首选群文件，回落 herenow 附件页
         payload = {
@@ -2124,6 +2239,7 @@ class Delivery:
             "name": name,
             "note": note,
             "push_kind": "delivery",
+            **address,
             "fallback": {
                 "kind": "herenow",
                 "path": str(path),
@@ -2132,14 +2248,14 @@ class Delivery:
             },
         }
         return self._outbox.enqueue(
-            f"task:{task_id}:deliver", gid, "file", payload, task_id=task_id
+            base_key, gid, "file", payload, task_id=task_id
         )
 
     async def reenqueue_missing(self, task_id: str, env: Any) -> bool:
         """管理员重发：无成品发件行时重建入队；已入队/已发/不确定的成品不碰。"""
         tid = str(task_id)
         task = self._store.read().execute(
-            "SELECT group_id, workspace, title, status, delivery_kind FROM tasks WHERE id=?", (tid,)
+            "SELECT group_id, workspace, title, status, delivery_kind,session_id,req_version FROM tasks WHERE id=?", (tid,)
         ).fetchone()
         if task is None or task["status"] != "completed":
             raise ValueError("只有已完成任务能补建交付记录")
@@ -2147,9 +2263,13 @@ class Delivery:
         settings = self._outbox._get_settings()
         if not settings.is_served(gid):
             raise ValueError("这个群已不在服务列表，不能交付")
+        from .session_speech import delivery_prefix, delivery_key, delivery_address
+        prefix = delivery_prefix(tid, task, settings)
         existing = self._store.read().execute(
             "SELECT key, kind FROM outbox WHERE task_id=?", (tid,)
         ).fetchall()
+        if task["session_id"] and settings.session.enabled:
+            existing = [r for r in existing if str(r["key"]).startswith(prefix+":") or r["key"]==prefix]
         if any(_is_artifact_outbox_row(r["kind"], str(r["key"])) for r in existing):
             return False
         kind = str(task["delivery_kind"] or "")
@@ -2161,9 +2281,13 @@ class Delivery:
             # 这里按老规矩本地重复一份常量，不 import coordinator）。补发时优先发原文；
             # 读不到 / 空的 / 超 1500 字 / 路径不对 → 照旧只发兜底说明，绝不报错。
             reply = _read_text_reply(task, tid, env, settings)
+            address = delivery_address(self._store,settings,tid,gid)
+            if address and settings.session.relay_text:
+                note = self._store.kv_get(f"session.final.{tid}.{task['req_version']}", note)
+            text = (str(note) + "\n\n" + reply) if address and settings.session.relay_text and reply else reply or note
             self._outbox.enqueue(
-                f"task:{tid}:deliver:text", gid, "text",
-                {"text": reply or note, "push_kind": "delivery"}, task_id=tid,
+                delivery_key(self._store,settings,tid,"text:"+reply)+":text", gid, "text",
+                {"text": text, "push_kind": "delivery", **address}, task_id=tid,
             )
             return True
         if kind not in ("file", "view", "image"):
@@ -2244,6 +2368,10 @@ class Delivery:
                     "raw_state": str(r["status"]),
                     "url": url or None,
                     "error": error_text,
+                    # 群文件失败的大白话原因（不含本机路径）；其余为 None
+                    "reason": (upload_fail_reason(r["error"])
+                               if str(r["kind"]) == "file" and str(r["status"]) == "failed"
+                               else None),
                 }
             )
         return records
@@ -2251,14 +2379,18 @@ class Delivery:
     def undelivered(self, task_id: str) -> bool:
         """已完成但没有成品发件、或成品发送失败：网页必须显眼标未交付。"""
         task = self._store.read().execute(
-            "SELECT status, delivery_kind, undelivered FROM tasks WHERE id=?", (str(task_id),)
+            "SELECT status, delivery_kind, undelivered,session_id,req_version FROM tasks WHERE id=?", (str(task_id),)
         ).fetchone()
         if task is None or str(task["status"]) != "completed":
             return False
+        from .session_speech import delivery_prefix
+        prefix = delivery_prefix(task_id,task,self._outbox._get_settings())
         rows = self._store.read().execute(
             "SELECT key, kind, status FROM outbox WHERE task_id=?",
             (str(task_id),),
         ).fetchall()
+        if task["session_id"] and self._outbox._get_settings().session.enabled:
+            rows = [r for r in rows if str(r["key"]).startswith(prefix+":") or r["key"]==prefix]
         artifact = [r for r in rows if _is_artifact_outbox_row(r["kind"], str(r["key"]))]
         if not artifact:
             return True

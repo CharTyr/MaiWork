@@ -37,7 +37,8 @@
 |------|------|
 | **主动资讯** | 每天几个时段，按群里在聊的话题上网找新消息和好文章；打分、去重、控制话题比例，只留值得看的 |
 | **构想与目标** | 提「我可以帮你们做这个」的点子；长期的事立成目标，定期检查进度、自己往前推 |
-| **接活交付** | 群友 @MaiBot 派活（查资料、做对比、写小网页、出 PDF…），子 agent 去做，主模型验收，不合格打回重做 |
+| **接活交付** | 群友 @MaiBot 派活（查资料、做对比、写报告网页、出 PDF…），子 agent 去做，主模型验收，不合格打回重做 |
+| **生图与报告页** | 配一个生图模型就能画插画、封面；调研类任务统一生成好读的报告网页；调研报告、资讯核实等 6 份内置 skill 随插件自带；办公文档组件在网页「设置 → 工具」一键安装 |
 | **不打扰** | 主动发到群里的消息每天有上限，免打扰时段不开话题，冷场时才开一句话题 |
 | **管理员说了算** | 群友派的活默认要管理员批准；低风险小活可自动放行（可关） |
 | **网页控制台** | 每个群一套资讯 / 构想 / 在做的事 / 群页面，管理员能直接和 MaiWork 对话；群页里还能写这个群的规矩、看它自己总结的做法；适配手机、平板、电脑 |
@@ -57,7 +58,7 @@
 </tr>
 <tr>
 <td width="50%"><img src="docs/images/chat.png" alt="和 MaiWork 聊" /><br /><sub><b>和 MaiWork 聊</b>：管理员直接问进度、提要求</sub></td>
-<td width="50%"><img src="docs/images/settings.png" alt="设置" /><br /><sub><b>运行状态</b>：模型、搜索、本机干活、专用机器、一次性 VM 一眼看清</sub></td>
+<td width="50%"><img src="docs/images/settings.png" alt="设置" /><br /><sub><b>运行状态</b>：模型、搜索、本机干活、专用机器、一次性 VM（Railway，可额外加 Freestyle）一眼看清</sub></td>
 </tr>
 </table>
 
@@ -76,7 +77,7 @@
 - **MaiBot**：插件 SDK 2.x（在 MaiBot 1.3.2 上实测）；需要的 Python 包 MaiBot 本身已带，不用另装。
 - **模型**：一个模型服务端点（OpenAI / Anthropic / Responses 接口格式都行），装好后在网页引导里填。
 - **联网搜索**：引导里直接勾一个搜索服务（有免密钥的）；只订 RSS 也能出资讯。
-- **跑命令的活**：Linux + systemd 且 MaiBot 以 root 运行时，本机隔离跑；其他环境（macOS / Windows / Docker 等）本机不跑命令，可以交给你自己的服务器或一次性 VM。
+- **跑命令的活**：Linux + systemd 且 MaiBot 以 root 运行时，本机隔离跑；其他环境（macOS / Windows / Docker 等）本机不跑命令，可以交给你自己的服务器或一次性 VM（设置里选 Railway 或 Freestyle）。
 
 详见[运行环境与干活的机器](docs/guide/environment.md)。**MaiBot 装在 Docker 里**的，请看 [Docker 部署](docs/guide/docker.md)。
 
@@ -120,8 +121,8 @@ MaiBot 会自动加载插件。
    - **可选**：Jev 这类判断模型的密钥（不填也能用，填了快速判断更快更省；网页「模型 → 快速判断」里选哪家）
    - **联网搜索**：直接勾选要用的搜索服务预设，免密钥的不用填就能用；勾的第一个当主搜索，其余当备用
    - **管理员**：群友派的活由谁批准（填你自己的账号）
-   - **头像** → **完成**
-4. **完成页**会把「模型 / 群 / 搜索 / 干活 / 交付 / 第一件小事」逐项列出来，写清哪一项能用、哪一项受限、还差什么。缺模型或群只会「先存下」，不算配好；中途刷新页面会接着上次那一步继续。
+   - **头像** → **能做到什么** → **完成**（这一步说明任务能否做成主要取决于模型和环境，并建议完成后到「和 MaiWork 聊」检查和补齐能力）
+4. **完成页**会把「模型 / 群 / 搜索 / 干活 / 办公文档 / 交付 / 第一件小事」逐项列出来，写清哪一项能用、哪一项受限、还差什么。缺模型或群只会「先存下」，不算配好；中途刷新页面会接着上次那一步继续。
 
 ### 第四步：在群里用
 
@@ -169,7 +170,16 @@ MaiBot 会自动加载插件。
 A：不需要。Linux + systemd 且 MaiBot 以 root 运行时，MaiWork 会自动分配临时账号隔离运行；你已经建了 `maiwork` 账号的话就用它。其他环境本机不跑命令，其余功能照常。
 
 **Q：在 Windows / macOS 上能用吗？**
-A：能装能用：资讯、构想、目标、网页、查资料写文件的任务都正常。只是本机不跑命令（没有能用的隔离方式），这类活可以交给自己配置的专用机器，或者 railway.new 一次性 VM。
+A：能装能用：资讯、构想、目标、网页、查资料写文件的任务都正常。只是本机不跑命令（没有能用的隔离方式），这类活可以交给自己配置的专用机器，或者一次性临时 VM（默认 railway.new，免密钥；也可以换成 [Freestyle](https://www.freestyle.sh)，用你自己的 API key，用完能主动销毁）。
+
+**Q：Windows 上 Railway 要怎么配？要装 WSL2 吗？**
+A：不用配，也不用 WSL2。Railway 免密钥、默认开着，只要电脑能用 `ssh` 命令。PowerShell 里输 `ssh -V` 看看；没有就在「设置 → 系统 → 可选功能」里装「OpenSSH 客户端」，重启 MaiBot 后到网页「运行状态」确认。详见 [Windows / macOS 上怎么用 Railway](docs/guide/environment.md#windows--macos-上怎么用-railway不用-wsl2)。
+
+**Q：任务做完了，群里却没收到文件？**
+A：发群文件要两样都满足：① MaiBot 装的 QQ 适配器支持上传群文件（[SnowLuma 适配器](https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter) 1.x 可以）；② NapCat / SnowLuma 和 MaiBot 在同一台电脑上、能按路径读到 `<MaiBot>/data/maiwork/` 里的文件（NapCat 装在 Docker、WSL 或另一台机器里就读不到；这种情况 MaiWork 会自动把 20MB 以内的文件内容直接传过去重试）。还是失败就改发网页链接，交付说明里会写明原因；网页「设置 → 运行状态」和首次引导的「群文件」一项也会显示最近一次失败的原因。
+
+**Q：群友打开网页链接要自己做反向代理吗？**
+A：不用。默认把群友要看的页面自动发布到 here.now（匿名公开页，24 小时过期）。想用自己的长期网址再填 `[console] public_url`；不想公开就关掉「用 here.now 自动公开」。
 
 **Q：装上之后什么都没发生？**
 A：默认什么都不做。检查 `[plugin] enabled = true`，并且 `[[groups.serve]]` 里写了群（格式 `平台:群 ID`，如 `qq:123456789`）；再到网页里走完首次引导、把模型配好。
@@ -188,7 +198,7 @@ A：默认在 `<MaiBot>/data/maiwork/`（数据库、网页密码、头像等）
 
 
 **Q：MaiBot 是用 Docker 装的，能用吗？**
-A：能用，但要多配几样：网页监听地址和端口、群友访问用的网址、画图用的中文字体；群文件要两个容器共用文件夹。见 [Docker 部署](docs/guide/docker.md)。
+A：能用，但要多配几样：数据目录挂到容器外、网页监听地址和端口、画图用的中文字体；要跑命令的活，容器里装 SSH 客户端，或者改用不需要 SSH 的 Freestyle 一次性机器；大文件想发群文件，两个容器要共用文件夹。MaiWork 在 Docker 里会自动识别，并在首次引导和「设置 → 运行状态」里提示数据目录、监听地址、SSH 这几项。见 [Docker 部署](docs/guide/docker.md)。
 
 ---
 
@@ -196,7 +206,7 @@ A：能用，但要多配几样：网页监听地址和端口、群友访问用�
 
 | 文档 | 内容 |
 |:-----|:-----|
-| [功能详解](docs/guide/features.md) | 资讯、构想与目标、任务、开话题、图解和评价、资讯卡片、网页控制台 |
+| [功能详解](docs/guide/features.md) | 资讯、构想与目标、任务（报告页、生图、办公文档）、开话题、图解和评价、资讯卡片、网页控制台 |
 | [运行环境与干活的机器](docs/guide/environment.md) | 需要什么、本机能不能跑命令、怎么配专用机器 |
 | [Docker 部署](docs/guide/docker.md) | MaiBot 装在 Docker 里时要额外配的地方 |
 | [配置说明](docs/guide/configuration.md) | 模型 / 搜索 / 记忆 / 多平台怎么配，`config.toml` 常用配置项 |
@@ -211,7 +221,8 @@ A：能用，但要多配几样：网页监听地址和端口、群友访问用�
 
 - [MaiBot](https://github.com/Mai-with-u/MaiBot) 开源聊天机器人框架
 - [here.now](https://here.now) 临时网页托管
-- [railway.new](https://railway.new) 一次性 VM
+- [railway.new](https://railway.new) 一次性 VM（免密钥）
+- [Freestyle](https://www.freestyle.sh) 一次性 VM（需要你自己的 API key）
 
 ## 许可证与作者
 

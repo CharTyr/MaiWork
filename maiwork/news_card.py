@@ -21,6 +21,14 @@ og:image；只收公开地址（和 fetch_page 同一套防内网）、只收位
 2026-10-06 用户定：每条只放一两句短摘要（item["brief"]，没有就从 summary 按句截，见
 short_summary）；「值得看」只放头条；最后一块是本群网页的二维码（qr.py 自带编码器，
 没有链接就不画）。链接原文不进图片。
+
+中文字体 / 浏览器（2026-10-25，render_assets.py）：Docker 精简镜像常没有中文字体和 Chromium。
+管理员在「设置 → 工具 → 可选组件」装过后——
+- 字体：卡片 CSS 多一条 @font-face（地址是 render_assets.FONT_URL 这个永远解析不到的虚拟地址，
+  路由拦下来直接回本地字体文件；卡片照样不联网），字体族排在系统字体之后，系统有中文字体时照旧用系统的；
+  Linux 上启动浏览器时再带 FONTCONFIG_FILE（只给这次启动的浏览器进程），图解页也能用到。没装 → 行为完全不变。
+- 浏览器：MaiWork 目录里有下载好的 Chromium → launch(executable_path=...)（不改全局环境变量，并发安全）。
+画图失败照旧抛 RenderError、调用方改发文字。
 """
 
 from __future__ import annotations
@@ -31,11 +39,14 @@ import html
 import io
 import logging
 import re
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urljoin, urlparse
+
+from . import render_assets
 
 logger = logging.getLogger(__name__)
 
@@ -635,10 +646,64 @@ def render_html(data: dict, *, now: float | None = None) -> str:
         + "</div>"
     )
     css = _CSS % {"w": _WIDTH, "sky": _SKY_H, "overlap": _OVERLAP, "qr": _QR_PX}
+    css = _with_local_font(css)
     return (
         '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
         f"<style>{css}</style></head><body>{body}</body></html>"
     )
+
+
+def _with_local_font(css: str) -> str:
+    """装过 MaiWork 的中文字体 → 加 @font-face，并把它排进字体列表（系统字体之后、sans-serif 之前）。"""
+    try:
+        font = render_assets.local_font_path()
+    except Exception:  # noqa: BLE001
+        font = None
+    if font is None:
+        return css
+    fam = render_assets.FONT_FAMILY
+    face = (
+        f'@font-face{{font-family:"{fam}";src:url("{render_assets.FONT_URL}") format("opentype");'
+        "font-weight:100 900;font-display:block}\n"
+    )
+    return face + css.replace('"Microsoft YaHei",sans-serif', f'"Microsoft YaHei","{fam}",sans-serif', 1)
+
+
+async def _route_local_only(route: Any) -> None:
+    """卡片 / 图解页的路由：只放行内嵌内容；字体虚拟地址回本地字体文件；其余一律拦掉。"""
+    url = route.request.url
+    if url == render_assets.FONT_URL:
+        font = render_assets.local_font_path()
+        if font is not None:
+            await route.fulfill(path=str(font), content_type="font/otf",
+                                headers={"Access-Control-Allow-Origin": "*"})
+            return
+        await route.abort()
+        return
+    if url.startswith(("data:", "about:")):
+        await route.continue_()
+    else:
+        await route.abort()
+
+
+def _launch_kwargs() -> dict[str, Any]:
+    """起浏览器的参数：有 MaiWork 自己下载的 Chromium 就指过去；Linux 上带上字体配置。
+
+    只影响这一次启动的浏览器进程（不改 os.environ，多张卡片 / 别的插件并发也互不影响）。
+    """
+    kw: dict[str, Any] = {"args": ["--no-sandbox", "--disable-dev-shm-usage"]}
+    try:
+        exe = render_assets.local_chromium()
+        if exe is not None:
+            kw["executable_path"] = str(exe)
+        conf = render_assets.fontconfig_file()
+        if conf is not None and sys.platform.startswith("linux"):
+            import os
+
+            kw["env"] = {**os.environ, "FONTCONFIG_FILE": str(conf)}
+    except Exception as e:  # noqa: BLE001  找不到就按原来的方式起
+        logger.info("读画图组件目录出错，按默认方式启动浏览器：%s", e)
+    return kw
 
 
 def _viz_todo(data: dict) -> list[dict]:
@@ -660,8 +725,7 @@ async def _shoot_viz(browser: Any, data: dict) -> None:
             page = await browser.new_page(
                 viewport={"width": _VIZ_W, "height": 400}, device_scale_factor=_SCALE, color_scheme="light"
             )
-            await page.route("**/*", lambda route: route.abort()
-                             if not route.request.url.startswith(("data:", "about:")) else route.continue_())
+            await page.route("**/*", _route_local_only)
             await page.set_content(str(it["viz_html"]), wait_until="load")
             await page.add_style_tag(content="html,body{background:#fff!important}")
             h = int(await page.evaluate("Math.ceil(document.documentElement.scrollHeight)") or 0)
@@ -720,7 +784,13 @@ async def render_png(data: dict, *, timeout_s: float = _RENDER_TIMEOUT_S) -> byt
     try:
         from playwright.async_api import async_playwright  # 宿主 venv 自带；本地测试可能没有
     except Exception as e:  # noqa: BLE001
-        raise RenderError(f"没有 playwright：{e}") from e
+        # 管理员在「可选组件」里装过一份到 MaiWork 自己的目录 → 再试一次
+        try:
+            if not render_assets.ensure_playwright_importable():
+                raise
+            from playwright.async_api import async_playwright
+        except Exception:  # noqa: BLE001
+            raise RenderError(f"没有 playwright：{e}") from e
     try:
         await prepare_covers(data)
     except Exception as e:  # noqa: BLE001  配图失败不影响出卡片
@@ -728,7 +798,7 @@ async def render_png(data: dict, *, timeout_s: float = _RENDER_TIMEOUT_S) -> byt
 
     async def _shot() -> bytes:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
+            browser = await p.chromium.launch(**_launch_kwargs())
             try:
                 # 没封面的条目有图解 → 先把图解截成图（2026-09-29 用户要：免得连配图都没有）
                 await _shoot_viz(browser, data)
@@ -737,8 +807,7 @@ async def render_png(data: dict, *, timeout_s: float = _RENDER_TIMEOUT_S) -> byt
                     viewport={"width": _WIDTH, "height": 800}, device_scale_factor=_SCALE
                 )
                 # 不许卡片去拉任何外部资源（内容全是内嵌的）
-                await page.route("**/*", lambda route: route.abort()
-                                 if not route.request.url.startswith(("data:", "about:")) else route.continue_())
+                await page.route("**/*", _route_local_only)
                 await page.set_content(page_html, wait_until="load")
                 shot = await page.locator(".card").screenshot(type="png")
                 return _to_card_jpeg(shot)

@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import shlex
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -53,6 +54,8 @@ _IS_WINDOWS = openssh_client.IS_WINDOWS
 _PLATFORM = "nt" if _IS_WINDOWS else "posix"  # 传给 openssh_client 的平台值（测试可注入）
 
 # 最小环境与「命令用绝对路径还是裸名字」的规则在 openssh_client.py（一次性 VM 共用同一份）。
+# 给修法提示用的系统名（Windows 固定 "nt"，其余用 sys.platform 区分 macOS / Linux；测试可注入）
+_HINT_PLATFORM = "nt" if _IS_WINDOWS else sys.platform
 _MINIMAL_ENV = openssh_client.minimal_env(posix_path=LocalEnv._MINIMAL_PATH)
 
 
@@ -210,18 +213,13 @@ class SshEnv:
         if openssh_client.windows_env_broken(_MINIMAL_ENV, platform=_PLATFORM):
             # 读不到 SystemRoot/WINDIR 时 PATH 是空的，任何命令都「找不到」——
             # 这时说「缺 ssh 命令」是假话，用户装了也没用。
-            self._initialization_error = (
-                "读不到 Windows 的系统目录（环境变量 SystemRoot / WINDIR 都没有）。"
-                "请在运行 MaiBot 的环境里补上 SystemRoot（一般是 C:\\Windows）再重试；"
-                "Docker / 服务方式启动时尤其容易漏掉这两个变量。"
-            )
+            self._initialization_error = openssh_client.WINDOWS_ENV_BROKEN_HINT
             raise RuntimeError(self._initialization_error)
         missing = [cmd for cmd, path in self._probe_tools().items() if not path]
         if missing:
             self._initialization_error = (
-                "MaiBot 运行环境缺少 SSH 客户端命令：" + "、".join(missing)
-                + "。Docker 用户请在 MaiBot 容器内安装 openssh-client（不是只装在宿主机或目标机器上）；"
-                "其他环境请在运行 MaiBot 的机器上安装 OpenSSH 客户端。"
+                "MaiBot 运行环境缺少 SSH 客户端命令：" + "、".join(missing) + "。"
+                + openssh_client.install_hint(missing, platform=_HINT_PLATFORM)
             )
             raise RuntimeError(self._initialization_error)
         try:
