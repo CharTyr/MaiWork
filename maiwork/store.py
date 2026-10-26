@@ -1250,20 +1250,28 @@ def _m_hot_indexes(conn: sqlite3.Connection) -> None:
 
     半截老库（测试 / 手工造的库）缺表或缺列时跳过那一条，不报错。
     """
-    for name, table, cols in (
-        ("idx_events_entity", "events", ("entity", "entity_id")),
-        ("idx_events_kind_group", "events", ("kind", "group_id", "ts")),
-        ("idx_attempts_task", "attempts", ("task_id", "n")),
-        ("idx_usage_task", "usage", ("task_id",)),
-        ("idx_usage_day", "usage", ("day",)),
-        ("idx_outbox_status", "outbox", ("status", "not_before")),
-        ("idx_outbox_task", "outbox", ("task_id",)),
-        ("idx_requests_group_status", "requests", ("group_id", "status")),
+    for table, cols, ddl in (
+        ("events", ("entity", "entity_id"),
+         "CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity, entity_id)"),
+        ("events", ("kind", "group_id", "ts"),
+         "CREATE INDEX IF NOT EXISTS idx_events_kind_group ON events(kind, group_id, ts)"),
+        ("attempts", ("task_id", "n"),
+         "CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id, n)"),
+        ("usage", ("task_id",),
+         "CREATE INDEX IF NOT EXISTS idx_usage_task ON usage(task_id)"),
+        ("usage", ("day",),
+         "CREATE INDEX IF NOT EXISTS idx_usage_day ON usage(day)"),
+        ("outbox", ("status", "not_before"),
+         "CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status, not_before)"),
+        ("outbox", ("task_id",),
+         "CREATE INDEX IF NOT EXISTS idx_outbox_task ON outbox(task_id)"),
+        ("requests", ("group_id", "status"),
+         "CREATE INDEX IF NOT EXISTS idx_requests_group_status ON requests(group_id, status)"),
     ):
-        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        have = {r[0] for r in conn.execute("SELECT name FROM pragma_table_info(?)", (table,))}
         if not set(cols) <= have:
             continue
-        conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({', '.join(cols)})")
+        conn.execute(ddl)
 
 
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的

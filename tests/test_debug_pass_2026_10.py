@@ -85,3 +85,28 @@ def test_login_limiter_does_not_keep_empty_entries(tmp_path, monkeypatch) -> Non
         assert auth.login_blocked("10.0.3.3") is True
     finally:
         store.close()
+
+
+def test_login_limiter_has_hard_cap_and_keeps_active_failures(tmp_path, monkeypatch) -> None:
+    store = Store(tmp_path / "mw.db")
+    try:
+        store.migrate()
+        auth = ConsoleAuth(store, lambda: None)
+        now = [1000.0]
+        monkeypatch.setattr(auth_mod.clock, "now", lambda: now[0])
+        monkeypatch.setattr(auth_mod, "_FAILS_PRUNE_AT", 2)
+        monkeypatch.setattr(auth_mod, "_FAILS_MAX", 3)
+        # 一个 IP 的失败里只有最后一条过期（时钟往回拨过），窗口内那条还在 → 不能整条摘掉
+        auth._fails["old"] = [now[0] + 100, now[0] - auth_mod._WINDOW - 1]
+        for i in range(5):
+            now[0] += 1
+            auth.record_login_fail(f"10.0.4.{i}")
+        assert len(auth._fails) <= 3
+        assert "10.0.4.4" in auth._fails  # 刚失败的不会被淘汰
+        auth._fails.clear()
+        auth._fails["skew"] = [now[0] + 10, now[0] - auth_mod._WINDOW - 1]
+        auth._fails["x"] = [now[0]]
+        auth.record_login_fail("y")
+        assert auth._fails["skew"] == [now[0] + 10]
+    finally:
+        store.close()

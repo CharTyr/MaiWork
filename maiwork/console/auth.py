@@ -33,6 +33,7 @@ COOKIE_TTL = 7 * 86400
 _MAX_TRIES = 5
 _WINDOW = 600.0  # 10 分钟
 _FAILS_PRUNE_AT = 1024  # 失败记录表超过这么多个 IP 就清一次过期的
+_FAILS_MAX = 4096  # 清完还超过就淘汰最久没失败的 IP，失败记录表的硬上限
 
 
 class ConsoleAuth:
@@ -201,9 +202,21 @@ class ConsoleAuth:
         fails.append(now)
         self._fails[ip] = fails
         if len(self._fails) > _FAILS_PRUNE_AT:
-            # 错一次就再没来过的 IP 也会一直占着：表大了顺手清掉窗口外的
-            for k in [k for k, ts in self._fails.items() if not ts or now - ts[-1] >= _WINDOW]:
-                self._fails.pop(k, None)
+            self._prune_fails(now)
+
+    def _prune_fails(self, now: float) -> None:
+        """错一次就再没来过的 IP 也会一直占着：表大了逐条清掉窗口外的时间点，清空了就摘掉；
+        窗口内的 IP 还是太多就按最近一次失败从旧到新淘汰到上限（内存有硬上限）。"""
+        for k in list(self._fails):
+            ts = [t for t in self._fails[k] if now - t < _WINDOW]
+            if ts:
+                self._fails[k] = ts
+            else:
+                del self._fails[k]
+        extra = len(self._fails) - _FAILS_MAX
+        if extra > 0:
+            for k in sorted(self._fails, key=lambda k: max(self._fails[k]))[:extra]:
+                del self._fails[k]
 
     def record_login_ok(self, ip: str) -> None:
         self._fails.pop(ip, None)
