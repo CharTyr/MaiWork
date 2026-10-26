@@ -234,7 +234,7 @@ class TestFullMigrate:
         # 44 = 工作会话、事件与任务轮次；前 43 步不改动。
         assert store_mod._MIGRATIONS[41].__name__ == "_m_goal_stale_notify"
         assert store_mod._MIGRATIONS[42].__name__ == "_m_skills"
-        assert LATEST == 44, "第 44 步追加工作会话，历史迁移位置保持不变"
+        assert LATEST == 45, "第 44 步追加工作会话、第 45 步补索引，历史迁移位置保持不变"
         assert store_mod._MIGRATIONS[40].__name__ == "_m_pending_ask_state"
         assert store_mod._MIGRATIONS[34].__name__ == "_m_task_lanes"
         assert store_mod._MIGRATIONS[35].__name__ == "_m_news_brief"

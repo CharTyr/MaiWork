@@ -43,6 +43,32 @@ from .tools import Tool, ToolContext, ToolResult, Tools
 
 logger = logging.getLogger("maiwork.tools_admin")
 
+# 管理员工具起的后台任务：留一份强引用（asyncio 对任务只有弱引用，不留可能跑一半被 GC），
+# 跑完自己摘掉
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_bg(coro: Awaitable[Any]) -> None:
+    """起后台任务并登记；没有运行中的事件循环时抛 RuntimeError（协程已关掉）。"""
+    try:
+        task = asyncio.get_running_loop().create_task(coro)
+    except RuntimeError:
+        close = getattr(coro, "close", None)
+        if callable(close):
+            close()
+        raise
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    task.add_done_callback(_log_bg_exception)
+
+
+def _log_bg_exception(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("管理员工具的后台任务出错", exc_info=exc)
+
 # 只有 bot 管理员能用（tools.ToolContext.role 的角色名）
 ROLE = "admin"
 _ROLES = frozenset({ROLE})
@@ -1944,7 +1970,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         if not callable(prepare):
             return _bad("这个 MaiWork 的资讯模块没有备料入口")
         try:
-            asyncio.get_running_loop().create_task(prepare(gid))
+            _spawn_bg(prepare(gid))
         except RuntimeError:
             return _bad("现在没有事件循环，起不了后台备料")
         return _ok(f"已经让群 {gid} 现在备一批资讯（后台跑，好了会在网页上出现）")
@@ -1988,7 +2014,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                 busy.discard(gid)
 
         try:
-            asyncio.get_running_loop().create_task(_run())
+            _spawn_bg(_run())
         except RuntimeError:
             busy.discard(gid)
             return _bad("现在没有事件循环，起不了后台任务")
@@ -2036,7 +2062,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                 busy.discard(gid)
 
         try:
-            asyncio.get_running_loop().create_task(_run())
+            _spawn_bg(_run())
         except RuntimeError:
             busy.discard(gid)
             return _bad("现在没有事件循环，起不了后台整理")

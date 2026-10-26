@@ -1237,8 +1237,37 @@ CREATE TABLE IF NOT EXISTS session_events (
         )
 
 
+def _m_hot_indexes(conn: sqlite3.Connection) -> None:
+    """第 45 步：给常查的几张表补索引（只加索引，不动数据）。
+
+    - events：没有任何索引，按 entity/entity_id（任务泳道历史、交接去重）和
+      kind/group_id/ts（群空间提示）查，每次都全表扫 30 天的事件；
+    - attempts：按 task_id 查最近一次尝试 / 数失败次数；
+    - usage：按 task_id 汇总任务用量（任务停下、预算核对都会查），按 day 汇总用量页；
+    - outbox：后台循环每轮按 status='pending' AND not_before<=? 捞待发，发件历史只增不减；
+      按 task_id 查交付；
+    - requests：按 group_id+status 查待批。
+
+    半截老库（测试 / 手工造的库）缺表或缺列时跳过那一条，不报错。
+    """
+    for name, table, cols in (
+        ("idx_events_entity", "events", ("entity", "entity_id")),
+        ("idx_events_kind_group", "events", ("kind", "group_id", "ts")),
+        ("idx_attempts_task", "attempts", ("task_id", "n")),
+        ("idx_usage_task", "usage", ("task_id",)),
+        ("idx_usage_day", "usage", ("day",)),
+        ("idx_outbox_status", "outbox", ("status", "not_before")),
+        ("idx_outbox_task", "outbox", ("task_id",)),
+        ("idx_requests_group_status", "requests", ("group_id", "status")),
+    ):
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if not set(cols) <= have:
+            continue
+        conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({', '.join(cols)})")
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids, _m_pending_ask_state, _m_goal_stale_notify, _m_skills, _m_task_sessions]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids, _m_pending_ask_state, _m_goal_stale_notify, _m_skills, _m_task_sessions, _m_hot_indexes]
 
 
 class Store:

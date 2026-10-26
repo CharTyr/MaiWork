@@ -373,6 +373,8 @@ class LocalEnv:
         self._cap = capability
         # direct 模式的后台进程登记：unit -> {"label","proc","log","exit_code"}
         self._procs: dict[str, dict[str, Any]] = {}
+        # 不等结果的后台收尾任务（超时兜底 systemctl stop）：留强引用到跑完
+        self._bg_tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------
     # 小工具
@@ -769,7 +771,10 @@ class LocalEnv:
                 # systemd-run 本身被 wait_for 掐了（runner 里已 kill 进程）；
                 # 单元可能还活着，兜底停掉（后台任务，不等）。
                 logger.warning("命令兜底超时，停止单元 %s", unit)
-                asyncio.get_running_loop().create_task(self._systemctl_stop(unit, ws))
+                stop = asyncio.get_running_loop().create_task(self._systemctl_stop(unit, ws))
+                # 留强引用到跑完（asyncio 对任务只有弱引用）
+                self._bg_tasks.add(stop)
+                stop.add_done_callback(self._bg_tasks.discard)
                 return self._make_result(-1, "", f"命令超时（超过 {limit} 秒，已强制停止）", started, True)
             clean_err, result = self._split_systemd_trailer(err)
             return self._make_result(code, out, clean_err, started, False, systemd_result=result)
@@ -935,14 +940,18 @@ class LocalEnv:
         if old is not None:
             await self._kill_entry(old)
         log_fh = open(log_path, "a", encoding="utf-8")
-        proc = await asyncio.create_subprocess_exec(
-            "/bin/bash", "-lc", inner,
-            cwd=str(ws),
-            env=self._minimal_env(ws),
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=log_fh,
-            stderr=asyncio.subprocess.STDOUT,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "/bin/bash", "-lc", inner,
+                cwd=str(ws),
+                env=self._minimal_env(ws),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=log_fh,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except BaseException:
+            log_fh.close()  # 子进程没起来，日志句柄别漏
+            raise
         timer = asyncio.get_running_loop().call_later(limit, self._kill_proc_quietly, proc)
         self._procs[unit] = {"label": label, "proc": proc, "log": log_path, "fh": log_fh, "timer": timer}
         return unit

@@ -32,6 +32,7 @@ COOKIE_NAME = "mw_admin"
 COOKIE_TTL = 7 * 86400
 _MAX_TRIES = 5
 _WINDOW = 600.0  # 10 分钟
+_FAILS_PRUNE_AT = 1024  # 失败记录表超过这么多个 IP 就清一次过期的
 
 
 class ConsoleAuth:
@@ -185,10 +186,13 @@ class ConsoleAuth:
     # ------------------------------------------------------------------
 
     def login_blocked(self, ip: str) -> bool:
-        fails = self._fails.get(ip) or []
         now = clock.now()
-        fails = [t for t in fails if now - t < _WINDOW]
-        self._fails[ip] = fails
+        fails = [t for t in (self._fails.get(ip) or []) if now - t < _WINDOW]
+        if fails:
+            self._fails[ip] = fails
+        else:
+            # 没有窗口内的失败就不留键（以前每个来登录的 IP 都会留一条空列表，只增不减）
+            self._fails.pop(ip, None)
         return len(fails) >= _MAX_TRIES
 
     def record_login_fail(self, ip: str) -> None:
@@ -196,6 +200,10 @@ class ConsoleAuth:
         fails = [t for t in (self._fails.get(ip) or []) if now - t < _WINDOW]
         fails.append(now)
         self._fails[ip] = fails
+        if len(self._fails) > _FAILS_PRUNE_AT:
+            # 错一次就再没来过的 IP 也会一直占着：表大了顺手清掉窗口外的
+            for k in [k for k, ts in self._fails.items() if not ts or now - ts[-1] >= _WINDOW]:
+                self._fails.pop(k, None)
 
     def record_login_ok(self, ip: str) -> None:
         self._fails.pop(ip, None)
