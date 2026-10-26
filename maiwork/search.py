@@ -39,7 +39,7 @@ from .mcp_client import (
     MCPError, McpSessionClient, RequestBudget, RequestBudgetExceeded,
     request_budget, use_request_budget,
 )
-from . import extensions_web, search_binding, search_presets
+from . import extensions_web, search_presets
 from .search_binding import get_binding, status_of, tool_problem
 
 logger = logging.getLogger("maiwork.search")
@@ -917,8 +917,6 @@ class Search:
         """抓正文参数：扩展 url 被预设认出 → 预设参数（滤运行时 schema）；
         预设没给固定参数（如 you-contents）/ 认不出 → 通用映射。"""
         try:
-            from .config import load_settings  # 无需时早早返回；真要用时兜底的最小空配置也一样走
-
             settings = self._settings()
             for e in extensions_web.merged_entries(settings, self._store):
                 if e.name != mcp:

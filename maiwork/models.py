@@ -2545,7 +2545,6 @@ class Models:
         写文件后由 config_writer 钩子立刻在本进程应用（app.apply_config_text）。
         checked_at / available 不进 config.toml，存 kv["models.checked"]。
         """
-        from . import config_file
 
         patch = dict(patch or {})
         problems = _validate(patch)

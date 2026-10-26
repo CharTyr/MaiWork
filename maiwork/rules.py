@@ -16,7 +16,6 @@ import os
 import re
 from dataclasses import is_dataclass, replace
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any
 
 try:  # Windows 没有 pwd 模块；查不到账号就只按名字拦（下面只拦 "root" 这个名字）
@@ -25,7 +24,6 @@ except ImportError:  # pragma: no cover - Windows
     pwd = None  # type: ignore[assignment]
 
 from .config import (
-    GroupSetting,
     Settings,
     _WORKSPACE_RE,
     _default_workspace,

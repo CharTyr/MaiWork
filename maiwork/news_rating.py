@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable
 
 REASONS: dict[str, str] = {
     "old": "太旧了",

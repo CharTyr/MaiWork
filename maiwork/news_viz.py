@@ -329,7 +329,7 @@ def html_for(store: Any, group_id: Any, item_id: int) -> Optional[str]:
 
 
 
-from .viz_spec import STATIC_MARK  # noqa: E402  卡片截图认这个标记（平铺版）
+from .viz_spec import STATIC_MARK  # noqa: E402, F401  卡片截图认这个标记（平铺版）
 
 
 def card_html_for(store: Any, group_id: Any, item_id: int) -> Optional[str]:

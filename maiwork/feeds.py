@@ -3323,7 +3323,7 @@ class Feeds:
         try:
             from . import extensions_web, search_binding
             from .search_presets import preset_of_url
-            from .skills import BUILTIN_ROOT, _search_preset_for, effective_status
+            from .skills import BUILTIN_ROOT
 
             binding = search_binding.get_binding(self._store)
             if binding is None:
@@ -4178,7 +4178,7 @@ class Feeds:
                 _funnel_note_query(funnel, query)
                 try:
                     got = await search.search(query, limit=10, days=7)
-                except Exception as e:  # noqa: BLE001（保底只补，出错不拖累这轮）
+                except Exception as e:  # noqa: BLE001  （保底只补，出错不拖累这轮）
                     logger.info("保底补搜失败（群 %s 方向 %d：%s）：%s", gid, i, query[:40], type(e).__name__)
                     break
                 n = _record(query, i, main_provider, got)

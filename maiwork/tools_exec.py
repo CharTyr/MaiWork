@@ -996,7 +996,7 @@ def register_exec_tools(
     tools.register(
         Tool(
             name="run_command",
-            description=f"在工作区里跑一条 bash 命令，拿回退出码、stdout、stderr、耗时。默认超时和上限以配置为准（单条命令最长 [environments] runtime_max_sec，再长的活要拆着跑）。命令里写 ~ 指工作区，不继承插件进程的环境变量。",
+            description="在工作区里跑一条 bash 命令，拿回退出码、stdout、stderr、耗时。默认超时和上限以配置为准（单条命令最长 [environments] runtime_max_sec，再长的活要拆着跑）。命令里写 ~ 指工作区，不继承插件进程的环境变量。",
             parameters={
                 "type": "object",
                 "properties": {
@@ -1011,7 +1011,7 @@ def register_exec_tools(
                 f"输入「{str(args.get('command', '')).splitlines()[0] if args.get('command') else ''}」",
                 (
                     (f"退出码 {res.data['exit_code']} · 超时" if res.data and res.data.get("timed_out") else f"退出码 {res.data['exit_code']}")
-                    + (f" · 内存超限" if res.data and res.data.get("oom") else "")
+                    + (" · 内存超限" if res.data and res.data.get("oom") else "")
                     + (f" · {res.data['ms'] / 1000:.1f} 秒" if res.data else "")
                 )
                 if res.ok and isinstance(res.data, dict)

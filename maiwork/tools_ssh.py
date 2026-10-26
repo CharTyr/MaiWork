@@ -171,7 +171,7 @@ def register_machine_tools(
                 Path(target).unlink(missing_ok=True)
             except OSError:
                 pass
-            return ToolResult(ok=False, output="", error=f"文件太大（超过 20MB 上限），已删掉没收；请压缩或只取需要的部分")
+            return ToolResult(ok=False, output="", error="文件太大（超过 20MB 上限），已删掉没收；请压缩或只取需要的部分")
         return ToolResult(ok=True, output=f"已拷回本机工作区 {rel}（{size} 字节）", data={"path": rel, "size": size})
 
     specs = [

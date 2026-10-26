@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import stat
 import threading
 import time
@@ -24,7 +23,6 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import tomlkit
-from tomlkit.items import AoT, Table
 
 logger = logging.getLogger("maiwork.config_file")
 
