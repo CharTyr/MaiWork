@@ -22,7 +22,7 @@ from __future__ import annotations
 import html as _html
 import math
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 __all__ = [
     "SpecError",

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 import random
-from typing import Any, Callable, List
+from typing import Callable, List
 
 from . import clock
 from .config import Settings

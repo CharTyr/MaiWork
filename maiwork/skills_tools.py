@@ -10,7 +10,6 @@ write_file 到自己工作区再跑（绝不直接执行数据目录里的东西
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from .skills import Skills
 from .tools import Tool, ToolContext, ToolResult, Tools, role_of

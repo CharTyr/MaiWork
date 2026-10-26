@@ -25,7 +25,6 @@ from typing import Any
 
 from .skills import (
     BUILTIN_ROOT,
-    KV_SKILLS_DISABLED,
     _roles_of,
     _search_preset_for,
     effective_status,

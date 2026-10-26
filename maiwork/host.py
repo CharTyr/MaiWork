@@ -14,7 +14,7 @@ import base64
 import time
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from .config import _norm_platform, has_onebot, host_platform

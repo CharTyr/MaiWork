@@ -33,7 +33,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -41,9 +40,8 @@ from . import clock, group_push, voice
 from .config import Settings
 from .delivery import Mentions, Pushes
 from .host import Host, HostError, Msg
-from .intake import Signals
 from .jev import Jev
-from .models import Models, ModelError
+from .models import Models
 from .store import Store
 
 # 不直接 import Profiles/Hosts 的具体类型——它们由别的同事在改，这里 duck-typing；类型签名做文档参考。

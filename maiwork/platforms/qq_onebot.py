@@ -22,7 +22,6 @@ from typing import Any, Awaitable, Callable
 
 from .. import clock
 from ..config import has_onebot
-from ..host import HostError
 from ..store import Store
 
 logger = logging.getLogger("maiwork.groupspace")
@@ -193,7 +192,6 @@ class GroupSpace:
     def role_of(self, group_id: str) -> str:
         """缓存里的身份（没有就 ""）。网页 GroupView 用。"""
         return self._role_cached(group_id)
-        return hit[1] if hit is not None else ""
 
     def adapter_open(self) -> bool:
         """适配器是不是新版（开放了群空间接口）。健康状态用。"""

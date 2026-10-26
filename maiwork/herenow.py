@@ -211,7 +211,7 @@ class HereNow:
             total += size
             if total > MAX_TOTAL_BYTES:
                 raise HereNowError(
-                    f"全部文件加起来太大（超过 200MB），here.now 发不了"
+                    "全部文件加起来太大（超过 200MB），here.now 发不了"
                 )
             try:
                 data = path.read_bytes()

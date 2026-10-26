@@ -1038,8 +1038,8 @@ class Agents:
                 # 来源归档也要查 rowcount：中途被锁定 / 归档 → 整笔回滚，
                 # 绝不允许「目标正文改了、来源没归档」的半成品。
                 archived = conn.execute(
-                    f"UPDATE agent_skills SET status='archived', updated=?"
-                    f" WHERE id=? AND group_id=?" + guard + " AND body=?",
+                    "UPDATE agent_skills SET status='archived', updated=?"
+                    " WHERE id=? AND group_id=?" + guard + " AND body=?",
                     (ts, sid_each, gid_s, str(live[sid_each]["body"] or "")),
                 )
                 if int(archived.rowcount or 0) != 1:
