@@ -56,6 +56,11 @@ async def test_group_feature_switches_render_and_toggle(tmp_path: Path, monkeypa
                 await page.goto(base + f"/#/{G1}/group")
                 # 群控区渲染出「功能启用」与三个开关
                 await page.wait_for_selector(".groupctl-slot", timeout=15000)
+                # 区块先出转圈占位、数据回来才填内容：等内容到了再读（CI 上偶发读到占位）
+                await page.wait_for_function(
+                    "document.querySelector('.groupctl-slot').innerHTML.includes('功能启用')",
+                    timeout=15000,
+                )
                 html = await page.inner_html(".groupctl-slot")
                 assert "功能启用" in html and "资讯" in html and "构想" in html and "任务" in html
                 # 开「功能启用」的编辑（该区块的修改按钮），草稿默认任务开着
