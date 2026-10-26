@@ -1,0 +1,11 @@
+# 本地单测依赖：pip install -r tests/requirements.txt
+# 插件运行时依赖见 _manifest.json（MaiBot 自带），这里只多列跑测试要的
+maibot-plugin-sdk>=2.8.1,<=2.16.0
+httpx>=0.24
+tomlkit>=0.12
+aiohttp>=3.9
+pillow
+pytest
+pytest-asyncio
+pytest-xdist
+playwright

@@ -18,6 +18,8 @@ MaiBot 加载清单和 `create_plugin()` → `MaiWorkPlugin.on_load()` 获取配
 
 ## Integration
 
+> 本文和各子目录 codemap 里指向 `../../docs/`、`AGENTS.md`、`prototype/` 的链接属于开发总仓，公开仓库里没有这些文件。
+
 - 宿主边界：`maibot_sdk.MaiBotPlugin` / `HookHandler`；真实宿主能力封装在 `maiwork/host.py`，先查 [宿主接口事实](../../docs/06-宿主接口事实.md)，不要猜 SDK 行为。
 - [maiwork/codemap.md](maiwork/codemap.md) 向下索引 console、environments、platforms；[测试目录](tests/) 为本地单测，[宿主契约测试](tests_host/) 仅在授权的安全环境中运行，测试和文档没有进入哈希跟踪。
 - [开发入门](../../docs/00-开发入门.md) 给目录与测试入口；本地 `plugin/` 和线上路径的热重载风险见根目录 [AGENTS.md](../../AGENTS.md)。
