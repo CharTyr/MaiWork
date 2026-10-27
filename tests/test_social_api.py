@@ -82,13 +82,13 @@ async def env(tmp_path: Path, monkeypatch):
     # 假 CLI：安装成功、检测成功、搜索回固定假数据
     async def run(argv, *, timeout, env=None, cwd=None):
         if "venv" in argv:
-            bindir = Path(argv[-1]) / "bin"
-            bindir.mkdir(parents=True, exist_ok=True)
-            (bindir / "python").touch()
+            python = sp._venv_exe(Path(argv[-1]), "python")
+            python.parent.mkdir(parents=True, exist_ok=True)
+            python.touch()
         if "pip" in argv:
             bindir = Path(argv[0]).parent
             for platform in sp.PLATFORMS.values():
-                cli = bindir / platform.cli_name
+                cli = bindir / (platform.cli_name + sp._EXE_SUFFIX)
                 cli.touch()
                 cli.chmod(0o700)
         if "--version" in argv:

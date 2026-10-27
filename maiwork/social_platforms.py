@@ -26,6 +26,8 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote_plus, urlsplit
 import weakref
 
+from .optional_deps import windows_system_env
+
 logger = logging.getLogger("maiwork.social_platforms")
 KV_KEY = "social.platforms"
 COOKIE_PREFIX = "social.cookie."
@@ -38,6 +40,12 @@ INSTALL_TIMEOUT_S = 180
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_PARALLEL = 3
 _FIXED_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+# venv layout differs by platform: POSIX venv/bin/<name>, Windows venv\Scripts\<name>.exe.
+def _venv_layout(os_name: str) -> tuple[str, str]:
+    return ("Scripts", ".exe") if os_name == "nt" else ("bin", "")
+
+
+_VENV_BIN, _EXE_SUFFIX = _venv_layout(os.name)
 
 
 class SocialPlatformError(RuntimeError):
@@ -285,6 +293,17 @@ def _private_dir(path: Path) -> None:
     path.chmod(0o700)
 
 
+def _venv_exe(venv: Path, name: str) -> Path:
+    return venv / _VENV_BIN / (name + _EXE_SUFFIX)
+
+
+def _fixed_path() -> str:
+    if os.name != "nt":
+        return _FIXED_PATH
+    root = windows_system_env().get("SystemRoot", "")
+    return os.pathsep.join([str(Path(root) / "System32"), root]) if root else ""
+
+
 def _prepare_root(store, p):
     root = managed_root(store, p.id)
     _private_dir(root.parent)
@@ -296,7 +315,7 @@ def _prepare_root(store, p):
 
 def _cli(store, p) -> str:
     root = managed_root(store, p.id)
-    exe = root / "venv" / "bin" / p.cli_name
+    exe = _venv_exe(root / "venv", p.cli_name)
     # Ignore legacy global-PATH/kv paths. Only an actual managed executable counts.
     try:
         if root.is_symlink() or root.parent.is_symlink() or (root / "venv").is_symlink():
@@ -421,11 +440,12 @@ def cookie_status(store, platform_id):
 def _child_env(home: Path, root: Path) -> dict[str, str]:
     # Deliberately excludes host secrets, PYTHONPATH, browser/config locations,
     # proxy credentials and arbitrary subprocess configuration.
-    return {"PATH": str(root / "venv" / "bin") + ":" + _FIXED_PATH,
+    return {"PATH": os.pathsep.join(filter(None, [str(root / "venv" / _VENV_BIN), _fixed_path()])),
             "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"),
             "XDG_CACHE_HOME": str(home / ".cache"), "XDG_DATA_HOME": str(home / ".local/share"),
             "TMPDIR": str(home), "LANG": "C.UTF-8", "PYTHONNOUSERSITE": "1",
-            "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_NO_INPUT": "1", "PIP_NO_CACHE_DIR": "1"}
+            "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_NO_INPUT": "1", "PIP_NO_CACHE_DIR": "1",
+            **windows_system_env()}
 
 
 def _credential_file(path: Path, data: dict) -> None:
@@ -463,7 +483,7 @@ async def _run_cli(argv: list, *, timeout: float, env: dict | None = None, cwd: 
     spawn = asyncio.create_task(asyncio.create_subprocess_exec(
         *map(str, argv), stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        env=env or {"PATH": _FIXED_PATH, "LANG": "C.UTF-8"}, cwd=cwd,
+        env=env or {"PATH": _fixed_path(), "LANG": "C.UTF-8", **windows_system_env()}, cwd=cwd,
         start_new_session=(os.name == "posix")))
     try:
         proc = await asyncio.shield(spawn)
@@ -518,11 +538,12 @@ async def install_platform(store, platform_id):
                 with tempfile.TemporaryDirectory(prefix="install-", dir=root) as name:
                     home = Path(name)
                     env = _child_env(home, root)
-                    if not (venv / "bin/python").is_file():
+                    python = _venv_exe(venv, "python")
+                    if not python.is_file():
                         code, _, _ = await _run_cli([sys.executable, "-m", "venv", str(venv)], timeout=INSTALL_TIMEOUT_S, env=env, cwd=home)
                         if code:
                             raise SocialPlatformError("安装失败：无法创建独立 Python 环境，请检查 venv 支持")
-                    code, _, _ = await _run_cli([str(venv / "bin/python"), "-m", "pip", "--isolated", "install", "--upgrade", p.package], timeout=INSTALL_TIMEOUT_S, env=env, cwd=home)
+                    code, _, _ = await _run_cli([str(python), "-m", "pip", "--isolated", "install", "--upgrade", p.package], timeout=INSTALL_TIMEOUT_S, env=env, cwd=home)
                     if code:
                         raise SocialPlatformError("安装失败，请检查网络、Python 版本或包源后重试")
                 cli = _cli(store, p)

@@ -17,7 +17,7 @@ def store(tmp_path):
     s.close()
 
 def ready(store, pid):
-    exe = sp.managed_root(store, pid) / "venv" / "bin" / sp.PLATFORMS[pid].cli_name
+    exe = sp._venv_exe(sp.managed_root(store, pid) / "venv", sp.PLATFORMS[pid].cli_name)
     exe.parent.mkdir(parents=True, exist_ok=True)
     exe.write_text("#!/bin/sh\nexit 0\n")
     exe.chmod(0o700)
@@ -181,7 +181,7 @@ async def test_install_managed_venv_and_disable_during_install(store, monkeypatc
             started.set()
             await release.wait()
         if "pip" in argv:
-            exe = sp.managed_root(store, "bilibili") / "venv" / "bin" / "bili"
+            exe = sp._venv_exe(sp.managed_root(store, "bilibili") / "venv", "bili")
             exe.parent.mkdir(parents=True, exist_ok=True)
             exe.write_text("fixture")
             exe.chmod(0o700)
@@ -347,7 +347,7 @@ async def test_external_symlink_executable_is_rejected(store, tmp_path):
     outside.write_text("#!/bin/sh\nexit 0\n")
     outside.chmod(0o700)
     # Verify the intended managed fixture path before replacement.
-    assert exe == sp.managed_root(store, "youtube") / "venv/bin/yt-dlp"
+    assert exe == sp._venv_exe(sp.managed_root(store, "youtube") / "venv", "yt-dlp")
     exe.unlink()
     exe.symlink_to(outside)
     row = next(r for r in sp.list_platforms(store) if r["id"] == "youtube")
@@ -752,3 +752,39 @@ async def test_queued_cancellation_leaves_no_waiter(store, monkeypatch, operatio
         lock.release()
     assert await sp.search(store, "bilibili", "topic") == []
     assert len(calls) == 1
+
+def test_venv_layout_by_platform():
+    assert sp._venv_layout("nt") == ("Scripts", ".exe")
+    assert sp._venv_layout("posix") == ("bin", "")
+    assert (sp._VENV_BIN, sp._EXE_SUFFIX) == sp._venv_layout(os.name)
+
+@pytest.mark.asyncio
+async def test_install_uses_windows_venv_layout(store, monkeypatch):
+    # Windows venvs put executables in venv\Scripts\<name>.exe, not venv/bin/<name>.
+    monkeypatch.setattr(sp, "_VENV_BIN", sp._venv_layout("nt")[0])
+    monkeypatch.setattr(sp, "_EXE_SUFFIX", sp._venv_layout("nt")[1])
+    calls = []
+    async def run(argv, *, timeout, env=None, cwd=None):
+        calls.append((argv, env))
+        if "pip" in argv:
+            exe = sp.managed_root(store, "bilibili") / "venv" / "Scripts" / "bili.exe"
+            exe.parent.mkdir(parents=True, exist_ok=True)
+            exe.write_text("fixture")
+            exe.chmod(0o700)
+        return 0, "ok", ""
+    monkeypatch.setattr(sp, "_run_cli", run)
+    result = await sp.install_platform(store, "bilibili")
+    venv = sp.managed_root(store, "bilibili") / "venv"
+    assert result["ok"], result
+    pip, env = next(c for c in calls if "pip" in c[0])
+    assert pip[0] == str(venv / "Scripts" / "python.exe")
+    assert env["PATH"].split(os.pathsep)[0] == str(venv / "Scripts")
+    assert result["cli_path"] == str(venv / "Scripts" / "bili.exe")
+
+def test_posix_venv_layout_ignores_windows_paths(store):
+    exe = sp.managed_root(store, "youtube") / "venv" / "Scripts" / "yt-dlp.exe"
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    exe.write_text("fixture")
+    exe.chmod(0o700)
+    if os.name != "nt":
+        assert sp._cli(store, sp.PLATFORMS["youtube"]) == ""
