@@ -110,3 +110,30 @@ def test_login_limiter_has_hard_cap_and_keeps_active_failures(tmp_path, monkeypa
         assert auth._fails["skew"] == [now[0] + 10]
     finally:
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_store_read_from_worker_thread_is_separate_and_read_only(tmp_path) -> None:
+    import sqlite3
+
+    store = Store(tmp_path / "mw.db")
+    try:
+        store.migrate()
+        with store.tx() as conn:
+            store.kv_set(conn, "k", {"v": 1})
+
+        def work():
+            conn = store.read()
+            assert conn is not store._conn
+            assert store.read() is conn  # 同一线程复用
+            got = store.kv_get("k")
+            with pytest.raises(sqlite3.OperationalError):
+                conn.execute("DELETE FROM kv")
+            return got
+
+        assert await asyncio.to_thread(work) == {"v": 1}
+        assert store.read() is store._conn
+        assert store.kv_get("k") == {"v": 1}
+    finally:
+        store.close()
+    assert store._side_conns == []

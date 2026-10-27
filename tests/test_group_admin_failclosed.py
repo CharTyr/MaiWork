@@ -282,9 +282,9 @@ class TestFailClosedStoredPassword:
         assert ga.has_password(G1) is True
         fp = ga.fingerprint(G1)
         assert fp and len(fp) == 16
-        # 哈希格式 / 最少 8 位 / 不回显：一个字没动
+        # 哈希格式（scrypt，passwords.py）/ 最少 8 位 / 不回显
         raw = store.secret_get("group_admin_pw." + G1)
-        assert raw.startswith("sha256$") and raw.count("$") == 2
+        assert raw.startswith("scrypt$") and raw.count("$") == 5
         assert PW1 not in raw
         with pytest.raises(ValueError):
             ga.set_password(G1, "1234567")

@@ -92,10 +92,10 @@ class TestGroupAdminsStore:
         assert ga.has_password(G1) is False
         ga.set_password(G1, G1_PW)
         assert ga.has_password(G1) is True
-        # 存的是 sha256$salt$digest 格式，明文不落库
+        # 存的是 scrypt 哈希（passwords.py），明文不落库
         raw = store.secret_get(f"group_admin_pw.{G1}")
-        assert raw.startswith("sha256$")
-        assert raw.count("$") == 2
+        assert raw.startswith("scrypt$")
+        assert raw.count("$") == 5
         assert G1_PW not in raw
         ga.clear_password(G1)
         assert ga.has_password(G1) is False

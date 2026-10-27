@@ -1291,6 +1291,11 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._chmod(self._path, 0o600)
         self._lock = threading.RLock()
+        # 主连接属于建库的那个线程（事件循环线程）；别的线程（asyncio.to_thread 里跑的只读
+        # 查询）调 read() 拿各自的只读连接（query_only，写不进去），见 `read`
+        self._owner = threading.get_ident()
+        self._local = threading.local()
+        self._side_conns: list[sqlite3.Connection] = []
 
     @property
     def path(self) -> Path:
@@ -1324,6 +1329,12 @@ class Store:
                 self._conn.close()
             except sqlite3.Error:
                 pass
+            side, self._side_conns = self._side_conns, []
+            for conn in side:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -1356,8 +1367,24 @@ class Store:
             conn.close()
 
     def read(self) -> sqlite3.Connection:
-        """只读查询用（同一连接，row_factory = sqlite3.Row）。autocommit 模式，BEGIN/COMMIT 由 tx() 管。"""
-        return self._conn
+        """只读查询用（row_factory = sqlite3.Row）。autocommit 模式，BEGIN/COMMIT 由 tx() 管。
+
+        在建库的线程（事件循环）里就是主连接；在别的线程里（`asyncio.to_thread` 把慢查询
+        挪出事件循环）返回该线程自己的只读连接：WAL 下读不挡写，`query_only` 保证挪出去的
+        代码写不进库（真要写会直接报错，而不是悄悄绕开 tx() 的单写入者锁）。
+        """
+        if threading.get_ident() == self._owner:
+            return self._conn
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(str(self._path), isolation_level=None, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA query_only=ON")
+            self._local.conn = conn
+            with self._lock:
+                self._side_conns.append(conn)
+        return conn
 
     def event(
         self,
@@ -1385,7 +1412,7 @@ class Store:
         return int(cur.lastrowid or 0)
 
     def kv_get(self, key: str, default: Any = None) -> Any:
-        row = self._conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+        row = self.read().execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
         if row is None:
             return default
         try:
@@ -1405,7 +1432,7 @@ class Store:
         conn.execute("DELETE FROM kv WHERE key=?", (str(key),))
 
     def secret_get(self, name: str) -> str:
-        row = self._conn.execute("SELECT value FROM secrets WHERE name=?", (name,)).fetchone()
+        row = self.read().execute("SELECT value FROM secrets WHERE name=?", (name,)).fetchone()
         return str(row["value"]) if row is not None else ""
 
     def secret_set(self, conn: sqlite3.Connection, name: str, value: str) -> None:

@@ -250,6 +250,9 @@ herenow_share = true
 update_check = true
 # MaiBot 自己网页的地址（如 http://127.0.0.1:8001）；填了，更新提醒里的按钮直接跳过去。不填就只给文字说明。
 maibot_webui_url = ""
+# 网页放在反向代理（nginx、frp 等）后面时，填代理的 IP 或网段，如 ["127.0.0.1"]。
+# 只有来自这些地址的请求才认 X-Forwarded-For，登录限流按真实访客 IP 计数；没用代理就留空。
+trusted_proxies = []
 
 
 [environments]

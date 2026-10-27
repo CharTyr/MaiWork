@@ -2,7 +2,8 @@
 
 - 管理员密码：[console] password 非空用它（网页改密码就是写进 config.toml 的这个键，
   明文，用户明确同意）；否则首次生成 16 位随机密码，
-  sha256(salt + 密码) 存 secrets.admin_password_hash（格式 "sha256$<salt hex>$<hash hex>"），
+  scrypt 哈希存 secrets.admin_password_hash（格式见 passwords.py；老的 "sha256$<salt>$<hash>"
+  照样认，登录成功时自动换成 scrypt），
   明文写 <data_dir>/console_password.txt（0600），日志只打印文件路径。
   网页改密码成功后旧的自动生成哈希会被删掉（rules.save_config_patch / 迁移）。
 - cookie mw_admin = "<到期时间戳>.<HMAC>"，HttpOnly、SameSite=Strict、Path=/、7 天；
@@ -11,10 +12,13 @@
   签名内容 = "group|<群号>|<到期>|<该群密码指纹>"——改了 / 清了这个群的群管理员密码，
   旧 cookie 立刻失效（指纹没了或不一致）。总管理员的格式保持兼容不变。
 - 同一 IP 10 分钟内密码错 5 次 → 429（总管理员和群管理员共用同一套限流）。
+  IP 默认是连接地址；配了 [console] trusted_proxies 时，来自这些代理的请求按
+  X-Forwarded-For 里的真实访客 IP 计数（`client_ip`）。
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -24,7 +28,7 @@ import stat
 from pathlib import Path
 from typing import Any
 
-from .. import clock
+from .. import clock, passwords
 
 logger = logging.getLogger("maiwork.console.auth")
 
@@ -73,14 +77,32 @@ class ConsoleAuth:
         if cfg_pw:
             return hmac.compare_digest(password.encode("utf-8"), cfg_pw.encode("utf-8"))
         stored = self._store.secret_get("admin_password_hash")
-        if not stored:
+        if not stored or not passwords.verify(password, stored):
             return False
+        if passwords.needs_upgrade(stored):
+            self._upgrade_hash(stored, passwords.hash_password(password))
+        return True
+
+    async def verify_password_async(self, password: str) -> bool:
+        """登录接口用：算哈希（scrypt 几十毫秒）放到线程里，不卡事件循环；读写库仍在循环线程。"""
+        cfg_pw = self._config_password()
+        if cfg_pw:
+            return hmac.compare_digest(password.encode("utf-8"), cfg_pw.encode("utf-8"))
+        stored = self._store.secret_get("admin_password_hash")
+        if not stored or not await asyncio.to_thread(passwords.verify, password, stored):
+            return False
+        if passwords.needs_upgrade(stored):
+            self._upgrade_hash(stored, await asyncio.to_thread(passwords.hash_password, password))
+        return True
+
+    def _upgrade_hash(self, old: str, new: str) -> None:
+        """老 sha256 哈希登录成功后换成 scrypt（中途被改过就不动）。指纹跟着变，旧 cookie 失效一次。"""
         try:
-            _algo, salt, expect = stored.split("$", 2)
-        except ValueError:
-            return False
-        actual = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
-        return hmac.compare_digest(actual, expect)
+            with self._store.tx() as conn:
+                if self._store.secret_get("admin_password_hash") == old:
+                    self._store.secret_set(conn, "admin_password_hash", new)
+        except Exception:
+            logger.warning("管理员密码哈希升级失败，下次登录再试", exc_info=True)
 
     def ensure_password(self, data_dir: Path) -> None:
         """有 config 密码就不用管；否则首次生成随机密码（存哈希、明文落文件）。"""
@@ -91,10 +113,8 @@ class ConsoleAuth:
         password = _secrets.token_urlsafe(12)  # 16 个字符
         if len(password) > 16:
             password = password[:16]
-        salt = _secrets.token_hex(8)
-        digest = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
         with self._store.tx() as conn:
-            self._store.secret_set(conn, "admin_password_hash", f"sha256${salt}${digest}")
+            self._store.secret_set(conn, "admin_password_hash", passwords.hash_password(password))
         data_dir = Path(data_dir)
         data_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -224,6 +244,46 @@ class ConsoleAuth:
     # ------------------------------------------------------------------
     # 同源检查
     # ------------------------------------------------------------------
+
+
+def client_ip(remote: str, forwarded_for: str, trusted: Any) -> str:
+    """登录限流用的访客 IP。
+
+    直连（来源不在 `trusted` 代理名单里）→ 就是连接地址，请求头一律不信（防伪造）；
+    来源是信任的代理 → 从 X-Forwarded-For 右往左找第一个不是信任代理的地址
+    （最右边是离我们最近的一跳，左边的可能被访客自己伪造）；头里全是代理 / 没有头 / 坏值
+    → 回落连接地址。
+    """
+    import ipaddress
+
+    remote = str(remote or "")
+    nets = []
+    for item in trusted or ():
+        try:
+            nets.append(ipaddress.ip_network(str(item), strict=False))
+        except ValueError:
+            continue
+    if not nets:
+        return remote
+
+    def _trusted(addr: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return False
+        return any(ip in n for n in nets)
+
+    if not _trusted(remote):
+        return remote
+    hops = [h.strip() for h in str(forwarded_for or "").split(",") if h.strip()]
+    for hop in reversed(hops):
+        try:
+            ipaddress.ip_address(hop)
+        except ValueError:
+            return remote  # 坏值：不猜，按代理本身算
+        if not _trusted(hop):
+            return hop
+    return remote
 
 
 def _norm_host_port(hostport: str, scheme: str) -> str:
