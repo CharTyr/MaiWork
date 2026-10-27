@@ -327,7 +327,8 @@ def search_args(
 
     if pid == "firecrawl":
         args = {"query": q, "limit": limit_i}  # limit 按源类型分别算（web N 条 + news N 条）
-        args["sources"] = ["web", "news"] if news else ["web", "news"]
+        # 不按 news 切源：web + news 两个源都要，日期过滤靠 tbs
+        args["sources"] = ["web", "news"]
         if days_i:
             args["tbs"] = _firecrawl_tbs(days_i)
         if site_s:

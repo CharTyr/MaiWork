@@ -1237,8 +1237,45 @@ CREATE TABLE IF NOT EXISTS session_events (
         )
 
 
+def _m_hot_indexes(conn: sqlite3.Connection) -> None:
+    """第 45 步：给常查的几张表补索引（只加索引，不动数据）。
+
+    - events：没有任何索引，按 entity/entity_id（任务泳道历史、交接去重）和
+      kind/group_id/ts（群空间提示）查，每次都全表扫 30 天的事件；
+    - attempts：按 task_id 查最近一次尝试 / 数失败次数；
+    - usage：按 task_id 汇总任务用量（任务停下、预算核对都会查），按 day 汇总用量页；
+    - outbox：后台循环每轮按 status='pending' AND not_before<=? 捞待发，发件历史只增不减；
+      按 task_id 查交付；
+    - requests：按 group_id+status 查待批。
+
+    半截老库（测试 / 手工造的库）缺表或缺列时跳过那一条，不报错。
+    """
+    for table, cols, ddl in (
+        ("events", ("entity", "entity_id"),
+         "CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity, entity_id)"),
+        ("events", ("kind", "group_id", "ts"),
+         "CREATE INDEX IF NOT EXISTS idx_events_kind_group ON events(kind, group_id, ts)"),
+        ("attempts", ("task_id", "n"),
+         "CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id, n)"),
+        ("usage", ("task_id",),
+         "CREATE INDEX IF NOT EXISTS idx_usage_task ON usage(task_id)"),
+        ("usage", ("day",),
+         "CREATE INDEX IF NOT EXISTS idx_usage_day ON usage(day)"),
+        ("outbox", ("status", "not_before"),
+         "CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status, not_before)"),
+        ("outbox", ("task_id",),
+         "CREATE INDEX IF NOT EXISTS idx_outbox_task ON outbox(task_id)"),
+        ("requests", ("group_id", "status"),
+         "CREATE INDEX IF NOT EXISTS idx_requests_group_status ON requests(group_id, status)"),
+    ):
+        have = {r[0] for r in conn.execute("SELECT name FROM pragma_table_info(?)", (table,))}
+        if not set(cols) <= have:
+            continue
+        conn.execute(ddl)
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids, _m_pending_ask_state, _m_goal_stale_notify, _m_skills, _m_task_sessions]
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids, _m_pending_ask_state, _m_goal_stale_notify, _m_skills, _m_task_sessions, _m_hot_indexes]
 
 
 class Store:
@@ -1254,6 +1291,11 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._chmod(self._path, 0o600)
         self._lock = threading.RLock()
+        # 主连接属于建库的那个线程（事件循环线程）；别的线程（asyncio.to_thread 里跑的只读
+        # 查询）调 read() 拿各自的只读连接（query_only，写不进去），见 `read`
+        self._owner = threading.get_ident()
+        self._local = threading.local()
+        self._side_conns: list[sqlite3.Connection] = []
 
     @property
     def path(self) -> Path:
@@ -1287,6 +1329,12 @@ class Store:
                 self._conn.close()
             except sqlite3.Error:
                 pass
+            side, self._side_conns = self._side_conns, []
+            for conn in side:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -1319,8 +1367,24 @@ class Store:
             conn.close()
 
     def read(self) -> sqlite3.Connection:
-        """只读查询用（同一连接，row_factory = sqlite3.Row）。autocommit 模式，BEGIN/COMMIT 由 tx() 管。"""
-        return self._conn
+        """只读查询用（row_factory = sqlite3.Row）。autocommit 模式，BEGIN/COMMIT 由 tx() 管。
+
+        在建库的线程（事件循环）里就是主连接；在别的线程里（`asyncio.to_thread` 把慢查询
+        挪出事件循环）返回该线程自己的只读连接：WAL 下读不挡写，`query_only` 保证挪出去的
+        代码写不进库（真要写会直接报错，而不是悄悄绕开 tx() 的单写入者锁）。
+        """
+        if threading.get_ident() == self._owner:
+            return self._conn
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(str(self._path), isolation_level=None, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA query_only=ON")
+            self._local.conn = conn
+            with self._lock:
+                self._side_conns.append(conn)
+        return conn
 
     def event(
         self,
@@ -1348,7 +1412,7 @@ class Store:
         return int(cur.lastrowid or 0)
 
     def kv_get(self, key: str, default: Any = None) -> Any:
-        row = self._conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+        row = self.read().execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
         if row is None:
             return default
         try:
@@ -1368,7 +1432,7 @@ class Store:
         conn.execute("DELETE FROM kv WHERE key=?", (str(key),))
 
     def secret_get(self, name: str) -> str:
-        row = self._conn.execute("SELECT value FROM secrets WHERE name=?", (name,)).fetchone()
+        row = self.read().execute("SELECT value FROM secrets WHERE name=?", (name,)).fetchone()
         return str(row["value"]) if row is not None else ""
 
     def secret_set(self, conn: sqlite3.Connection, name: str, value: str) -> None:

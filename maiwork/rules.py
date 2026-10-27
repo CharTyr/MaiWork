@@ -193,6 +193,26 @@ def _check_listen(value: Any) -> str:
     return f"{m.group('host')}:{port}"
 
 
+def _check_proxy_list(value: Any) -> list[str]:
+    """console.trusted_proxies：每一项都得是 IP 或网段。"""
+    import ipaddress
+
+    if not isinstance(value, list):
+        raise ValueError("反向代理地址要填 IP 或网段的列表")
+    out: list[str] = []
+    for raw in value:
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        try:
+            ipaddress.ip_network(s, strict=False)
+        except ValueError:
+            raise ValueError(f"「{s}」不是合法的 IP 或网段（例如 127.0.0.1、10.0.0.0/8）") from None
+        if s not in out:
+            out.append(s)
+    return out
+
+
 def _check_domain_list(field_zh: str) -> Any:
     def check(value: Any) -> list[str]:
         if not isinstance(value, list):
@@ -439,7 +459,7 @@ def _validate_generic(spec: dict[str, Any], value: Any) -> Any:
 _ADVANCED_KEYS = frozenset({
     "feeds.news_jitter_minutes", "feeds.lookback_days", "feeds.web_min_avg",
     "feeds.pool_min_avg", "feeds.collect_minutes", "topics.min_gap_hours",
-    "topics.candidate_ttl_hours", "console.listen",
+    "topics.candidate_ttl_hours", "console.listen", "console.trusted_proxies",
     "tasks.token_limit", "tasks.run_seconds", "storage.data_dir",
     "jev.timeout_ms", "jev.key_file", "jev.api_url", "jev.model", "jev.use",
     "quick_judge.model", "quick_judge.daily_max",
@@ -607,6 +627,9 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     _F("console.herenow_share", "用 here.now 自动公开", "没填公开网址时，群友要看的页面自动发到 here.now 公开页，拿到链接的人都能看，24 小时后失效。", "bool"),
     _F("console.update_check", "检查更新", "有新版本时在网页中提示。", "bool"),
     _F("console.maibot_webui_url", "MaiBot 网址", "填写后，更新提示中可直接跳转，例如 http://127.0.0.1:8001。", "str", check=_check_public_url),
+    _F("console.trusted_proxies", "反向代理地址",
+       "网页放在 nginx、frp 等反向代理后面时，填代理的 IP 或网段（如 127.0.0.1）。登录限流会按代理转发的真实 IP 计数；没用代理就留空。",
+       "list_str", check=_check_proxy_list),
 
     # ---- environments ----
     _F("environments.railway", "Railway 临时机器", "允许使用 Railway 一次性机器（免密钥、匿名，用完等它自己过期）。", "bool"),

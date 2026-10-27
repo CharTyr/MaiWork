@@ -21,7 +21,7 @@ from .. import clock, handoff, members, privacy
 from . import usage_history
 from . import views
 from ..group_admins import GroupAdmins
-from .auth import COOKIE_NAME, ConsoleAuth, same_origin
+from .auth import COOKIE_NAME, ConsoleAuth, client_ip, same_origin
 
 logger = logging.getLogger("maiwork.console.server")
 
@@ -440,12 +440,14 @@ class ConsoleServer:
         @post("/api/login")
         async def _login(request: web.Request) -> web.Response:
             auth: ConsoleAuth = request.app[AUTH_KEY]
-            ip = request.remote or ""
+            settings = svc.get_settings()
+            trusted = getattr(getattr(settings, "console", None), "trusted_proxies", ()) or ()
+            ip = client_ip(request.remote or "", request.headers.get("X-Forwarded-For", ""), trusted)
             if auth.login_blocked(ip):
                 return _err(429, "错太多次了，过 10 分钟再试")
             body = await _json_body(request)
             password = str((body or {}).get("password") or "")
-            if password and auth.verify_password(password):
+            if password and await auth.verify_password_async(password):
                 # 总管理员：cookie 格式和以前一样
                 auth.record_login_ok(ip)
                 value, max_age = auth.make_cookie()
@@ -457,7 +459,7 @@ class ConsoleServer:
                 ga = getattr(svc, "group_admins", None)
                 if ga is not None:
                     try:
-                        gid_hit = ga.match(password)
+                        gid_hit = await ga.match_async(password)
                     except Exception:
                         logger.exception("群管理员密码匹配出错")
                         gid_hit = None
@@ -2424,7 +2426,10 @@ class ConsoleServer:
             if forbid is not None:
                 return forbid
             try:
-                data = usage_history.history_view(
+                # 30 天的汇总要扫好几遍 usage 表（几万行时几百毫秒）：放线程里跑，不卡事件循环
+                # （history_view 只读库；别的线程里 store.read() 拿的是只读连接）
+                data = await asyncio.to_thread(
+                    usage_history.history_view,
                     svc,
                     days=request.query.get("days"),
                     date=request.query.get("date"),

@@ -51,6 +51,20 @@ _HTTP_TIMEOUT_S = 30.0
 _RUN_GUARD_EXTRA_S = 120              # run 要求剩余时间比 timeout_s 多这么多秒才敢放活
 _FS_WRITE_MAX_BYTES = 8 * 1024 * 1024  # 超过就走分片上传（官方 SDK 也是 8MiB 切）
 _FS_UPLOAD_CHUNK = 8 * 1024 * 1024
+
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _read_chunk(path: Path, offset: int, size: int) -> bytes:
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        return fh.read(size)
 _FS_READ_CHUNK = 4 * 1024 * 1024       # 大文件分块读（带 Range，可续传）
 _POLL_INTERVAL_S = 2.0
 _POLL_TIMEOUT_S = 120.0
@@ -553,12 +567,13 @@ class FreestyleEnv:
                 "未填写 Freestyle 密钥，无法传文件"
                 "（设置 → 全部设置 → 运行环境 → Freestyle 密钥）"
             )
-        data = local.read_bytes()
+        # 读文件 / 算校验都放线程里：大文件不一次性读进内存，也不卡事件循环
+        size = (await asyncio.to_thread(local.stat)).st_size
         await self._mkdir(str(Path(remote).parent), key, vm_id=box.vm_id)
-        if len(data) <= _FS_WRITE_MAX_BYTES:
-            await self._write_small(box, remote, data, key)
+        if size <= _FS_WRITE_MAX_BYTES:
+            await self._write_small(box, remote, await asyncio.to_thread(local.read_bytes), key)
             return
-        await self._write_big(box, remote, data, key)
+        await self._write_big(box, remote, local, size, key)
 
     async def _write_small(self, box: FreestyleBox, remote: str, data: bytes, key: str) -> None:
         body = {
@@ -577,11 +592,12 @@ class FreestyleEnv:
         if resp.status_code not in (200, 201, 204):
             raise RuntimeError(f"传到 Freestyle 失败：{_error_reason(resp.status_code, *_error_code_message(resp))}")
 
-    async def _write_big(self, box: FreestyleBox, remote: str, data: bytes, key: str) -> None:
-        digest = hashlib.sha256(data).hexdigest()
+    async def _write_big(self, box: FreestyleBox, remote: str, local: Path, size: int, key: str) -> None:
+        """分片上传：先流式算整份 sha256，再一片一片读、一片一片传（内存里最多一片）。"""
+        digest = await asyncio.to_thread(_file_sha256, local)
         begin = await self._client_or_new().post(
             f"/v5/vms/{box.vm_id}/fs/uploads",
-            json={"path": remote, "size": len(data), "sha256": digest, "mode": 0o644},
+            json={"path": remote, "size": size, "sha256": digest, "mode": 0o644},
             headers={"Authorization": f"Bearer {key}"},
         )
         if begin.status_code not in (200, 201):
@@ -594,8 +610,10 @@ class FreestyleEnv:
             raise RuntimeError("分片上传开局返回无法解析（缺少 uploadId）")
         offset = 0
         try:
-            while offset < len(data):
-                chunk = data[offset: offset + _FS_UPLOAD_CHUNK]
+            while offset < size:
+                chunk = await asyncio.to_thread(_read_chunk, local, offset, min(_FS_UPLOAD_CHUNK, size - offset))
+                if not chunk:
+                    raise RuntimeError(f"本地文件在上传途中变短了（offset={offset}）")
                 resp = await self._client_or_new().put(
                     f"/v5/vms/{box.vm_id}/fs/uploads/{upload_id}",
                     params={"offset": offset},
@@ -648,7 +666,7 @@ class FreestyleEnv:
             if resp.status_code not in (200, 206):
                 raise RuntimeError(f"从 Freestyle 取回失败：{_error_reason(resp.status_code, *_error_code_message(resp))}")
             data = resp.content
-        local.write_bytes(data)
+        await asyncio.to_thread(local.write_bytes, data)
 
     async def _stat_size(self, box: FreestyleBox, remote: str, key: str) -> int | None:
         try:

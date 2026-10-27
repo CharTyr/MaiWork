@@ -1333,12 +1333,9 @@ class MaiWorkApp:
 
         plugin_dir, data_dir = self.config_file_ops()
         text = config_file.write_fields(plugin_dir, data_dir, flat)
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self.apply_config_text(text))
-        except RuntimeError:
-            # 没有运行中的事件循环（测试里同步调用）：应用交给宿主的文件监控
-            pass
+        # 登记在 _bg_jobs 留强引用（asyncio 对任务只有弱引用）；没有运行中的事件循环
+        # （测试里同步调用）时 _spawn_bg 关掉协程，应用交给宿主的文件监控
+        self._spawn_bg(self.apply_config_text(text), name="maiwork-apply-config")
         return text
 
     # ------------------------------------------------------------------

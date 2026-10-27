@@ -346,6 +346,7 @@ class ConsoleSectionConfig(PluginConfigBase):
     herenow_share: bool = Field(default=True, description="没填公开网址时，把群友要看的页面自动发布到 here.now 匿名公开页，24 小时过期")
     update_check: bool = Field(default=True, description="管理员打开网页时顺手查 GitHub 上有没有 MaiWork 新版（只提醒，不自动更新）")
     maibot_webui_url: str = Field(default="", description="MaiBot 自己网页的地址；填了，更新提醒里的按钮直接跳过去")
+    trusted_proxies: list[str] = Field(default_factory=list, description="网页放在反向代理（nginx / frp 等）后面时，代理的 IP 或网段；只信这些来源带的 X-Forwarded-For")
 
 
 class SSHServerConfig(PluginConfigBase):
@@ -822,6 +823,8 @@ class ConsoleSetting:
     update_check: bool = True
     herenow_share: bool = True
     maibot_webui_url: str = ""
+    # 反向代理的 IP / 网段（规范化后的字符串）；来自这些地址的请求才认 X-Forwarded-For
+    trusted_proxies: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1402,6 +1405,25 @@ def _parse_environments(
     )
 
 
+def _parse_trusted_proxies(raw: Any, problems: list[str]) -> tuple[str, ...]:
+    """console.trusted_proxies：IP 或网段（127.0.0.1、10.0.0.0/8、::1）；写错的跳过并提示。"""
+    import ipaddress
+
+    out: list[str] = []
+    for item in raw if isinstance(raw, list) else []:
+        s = str(item or "").strip()
+        if not s:
+            continue
+        try:
+            net = str(ipaddress.ip_network(s, strict=False))
+        except ValueError:
+            problems.append(f'console.trusted_proxies 里的 "{s}" 不是合法的 IP 或网段，已跳过')
+            continue
+        if net not in out:
+            out.append(net)
+    return tuple(out)
+
+
 def _parse_listen(console: ConsoleSectionConfig, problems: list[str]) -> tuple[str, int]:
     raw = str(console.listen or "").strip()
     m = _LISTEN_RE.match(raw)
@@ -1915,6 +1937,7 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
             update_check=bool(getattr(console, "update_check", True)),
             herenow_share=bool(getattr(console, "herenow_share", True)),
             maibot_webui_url=_http_url_or_empty(getattr(console, "maibot_webui_url", "")),
+            trusted_proxies=_parse_trusted_proxies(getattr(console, "trusted_proxies", []), problems),
         ),
         endpoints=endpoints_parsed,
         model_list=model_list_parsed,

@@ -6,7 +6,8 @@
 
 存法（**只进数据库，不进 config.toml**）：
 - 每个群一份密码哈希：`secrets["group_admin_pw.<群号>"]`，格式与总管理员一致
-  （`sha256$<salt hex>$<digest hex>`），明文不落库。**密码这一份没动**。
+  （scrypt，见 passwords.py；老的 `sha256$<salt hex>$<digest hex>` 照样认，登录成功时
+  自动换成 scrypt），明文不落库。
 - 本群批准人名单（0.8.0 归一，docs/18 §五）：不再单独存 `kv["group_admins.<群号>"]`，
   而是和「谁能批本群的活（含免批）」共用**同一份** `kv["group_approval.<群号>"]` 的
   `approvers`（group_approval.py）。`accounts` / `set_accounts` / `is_group_admin`
@@ -27,12 +28,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import hmac
 import logging
-import secrets as _secrets
 from typing import Any, Callable
 
+from . import passwords
 from .group_approval import GroupApprovals
 
 logger = logging.getLogger("maiwork.group_admins")
@@ -179,10 +180,6 @@ class GroupAdmins:
     # 密码
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _digest(password: str, salt: str) -> str:
-        return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
-
     def _stored_hash(self, gid: Any) -> str:
         try:
             return str(self._store.secret_get(PW_PREFIX + str(gid)) or "")
@@ -190,17 +187,18 @@ class GroupAdmins:
             logger.debug("读群 %s 的群管理员密码失败", gid, exc_info=True)
             return ""
 
-    @classmethod
-    def _verify_hash(cls, password: str, stored: str) -> bool:
-        if not stored:
-            return False
+    @staticmethod
+    def _verify_hash(password: str, stored: str) -> bool:
+        return bool(stored) and passwords.verify(str(password), stored)
+
+    def _upgrade_hash(self, gid: str, old: str, new: str) -> None:
+        """老 sha256 哈希登录成功后换成 scrypt（中途被改过就不动）；指纹跟着变，本群旧 cookie 失效一次。"""
         try:
-            algo, salt, expect = stored.split("$", 2)
-        except ValueError:
-            return False
-        if algo != "sha256" or not salt or not expect:
-            return False
-        return hmac.compare_digest(cls._digest(str(password), salt), expect)
+            with self._store.tx() as conn:
+                if self._stored_hash(gid) == old:
+                    self._store.secret_set(conn, PW_PREFIX + str(gid), new)
+        except Exception:
+            logger.warning("群 %s 的群管理员密码哈希升级失败，下次登录再试", gid, exc_info=True)
 
     def has_password(self, gid: Any) -> bool:
         """这个群现在算不算「有群管理员密码」。
@@ -234,8 +232,7 @@ class GroupAdmins:
                 raise
             except Exception:
                 logger.debug("和总管理员密码比对失败，跳过这一步", exc_info=True)
-        salt = _secrets.token_hex(8)
-        stored = f"sha256${salt}${self._digest(pw, salt)}"
+        stored = passwords.hash_password(pw)
         with self._store.tx() as conn:
             self._store.secret_set(conn, PW_PREFIX + gid_s, stored)
 
@@ -254,7 +251,23 @@ class GroupAdmins:
         if not pw:
             return None
         for gid in self.served_gids():
-            if self._verify_hash(pw, self._stored_hash(gid)):
+            stored = self._stored_hash(gid)
+            if self._verify_hash(pw, stored):
+                if passwords.needs_upgrade(stored):
+                    self._upgrade_hash(gid, stored, passwords.hash_password(pw))
+                return gid
+        return None
+
+    async def match_async(self, password: str) -> str | None:
+        """同 `match`，登录接口用：逐个算哈希放到线程里，不卡事件循环；读写库仍在循环线程。"""
+        pw = str(password or "")
+        if not pw:
+            return None
+        for gid in self.served_gids():
+            stored = self._stored_hash(gid)
+            if stored and await asyncio.to_thread(passwords.verify, pw, stored):
+                if passwords.needs_upgrade(stored):
+                    self._upgrade_hash(gid, stored, await asyncio.to_thread(passwords.hash_password, pw))
                 return gid
         return None
 
