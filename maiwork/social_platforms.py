@@ -41,8 +41,11 @@ MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_PARALLEL = 3
 _FIXED_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
 # venv layout differs by platform: POSIX venv/bin/<name>, Windows venv\Scripts\<name>.exe.
-_VENV_BIN = "Scripts" if os.name == "nt" else "bin"
-_EXE_SUFFIX = ".exe" if os.name == "nt" else ""
+def _venv_layout(os_name: str) -> tuple[str, str]:
+    return ("Scripts", ".exe") if os_name == "nt" else ("bin", "")
+
+
+_VENV_BIN, _EXE_SUFFIX = _venv_layout(os.name)
 
 
 class SocialPlatformError(RuntimeError):
