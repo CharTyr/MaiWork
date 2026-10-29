@@ -20,6 +20,7 @@ import { loadUpdate } from "./update.js";
 import { loadAppearance } from "./settings/appearance.js";
 import { loadSocial, resetSocial } from "./settings/social.js";
 import { loadTheme } from "./theme.js";
+import { loadBoard, loadBoardItem } from "./board.js";
 
 /* ───────────── 路由 ───────────── */
 
@@ -27,6 +28,10 @@ export function syncHash() {
   if (state.page === "chat") {
     const h = `#/chat/${state.chatId || ""}`;
     if (location.hash !== h) history.replaceState(null, "", h);
+    return;
+  }
+  if (state.page === "board") {
+    if (location.hash !== "#/board") history.replaceState(null, "", "#/board");
     return;
   }
   if (state.page === "settings") {
@@ -43,6 +48,7 @@ export function syncHash() {
 
 export function parseHash() {
   const parts = location.hash.replace(/^#\/?/, "").split("/");
+  if (parts[0] === "board") return { board: true, id: "", ref: "", tab: "", sub: "" };
   if (parts[0] === "chat") return { chat: true, id: parts[1] || "", ref: "", tab: "", sub: "" };
   if (parts[0] === "settings") return { settings: true, sub: parts[1] === "logs" ? "usage" : parts[1] === "social-login" ? "social" : parts[1] || "overview", ref: "", tab: "", id: "" };
   // 旧的目标页链接仍能打开原目标详情，只是落到「任务」。
@@ -52,7 +58,7 @@ export function parseHash() {
 
 export function applyHash() {
   const h = parseHash();
-  state.page = h.settings && admin() ? "settings" : h.chat && admin() ? "chat" : null;
+  state.page = h.settings && admin() ? "settings" : h.chat && admin() ? "chat" : h.board && admin() ? "board" : null;
   if (h.chat && h.id) state.chatId = Number(h.id) || h.id;
   if (h.settings) state.setSub = SET_SUBS.some((x) => x[0] === h.sub) ? h.sub : "overview";
   if (TABS.some((x) => x.id === h.tab)) state.tab = h.tab;
@@ -60,7 +66,7 @@ export function applyHash() {
     const hit = state.groups.find((x) => x.id === h.ref || x.token === h.ref);
     state.g = hit ? hit.id : state.g && state.groups.some((x) => x.id === state.g) ? state.g : state.groups.length ? state.groups[0].id : null;
   }
-  if (!h.chat && !h.settings && h.id) state.detail = { type: /^G-/.test(h.id) ? "goal" : /^I-/.test(h.id) ? "idea" : "task", id: h.id };
+  if (!h.chat && !h.settings && !h.board && h.id) state.detail = { type: /^G-/.test(h.id) ? "goal" : /^I-/.test(h.id) ? "idea" : "task", id: h.id };
   else state.detail = null;
 }
 
@@ -76,7 +82,7 @@ async function loadMe() {
 
 // 没登录却带着地址进来：管理员 / 群管理员的地址是群号、设置或聊天 → 登录过期（"expired"）；
 // 群友的地址是链接码 → 链接失效（"link"）；什么都没带 → ""。
-export const linkProblem = (h) => (h.settings || h.chat || /^\d+$/.test(h.ref || "") ? "expired" : h.ref ? "link" : "");
+export const linkProblem = (h) => (h.settings || h.chat || h.board || /^\d+$/.test(h.ref || "") ? "expired" : h.ref ? "link" : "");
 
 export async function loadGroups() {
   if (!state.me || state.me.role === "none") {
@@ -133,6 +139,7 @@ export async function retryLoad(el) {
   else if (what === "usage") await Promise.all([loadUsage(), loadLogSummary()]);
   else if (what === "identity") await loadIdentity();
   else if (what === "chat") await loadChat(state.chatId, false);
+  else if (what === "board") await loadBoard();
   ui.flash = true;
   render();
   if (state.sheet) repaintSheet();
@@ -149,6 +156,7 @@ export async function reboot() {
   state.agentEdit = null;
   state.agentLoadSeq = (state.agentLoadSeq || 0) + 1;
   state.tasks = {};
+  state.board = null;
   loadTheme(); // 主题和音效：不挡开页，拿不到就沿用首屏缓存的
   try {
     await loadMe();
@@ -187,6 +195,7 @@ export async function reboot() {
   }
   // 网址带 ?open=settings / ?open=models 时直接打开（方便从别处跳过来，也方便截图核对）
   if (admin() && state.page === "chat") enterChat(state.chatId);
+  if (admin() && state.page === "board") enterBoard();
   const open = new URLSearchParams(location.search).get("open");
   if (admin() && open === "onboarding") {
     await settingsReady;
@@ -221,6 +230,17 @@ export async function enterSettings(sub) {
   }
 }
 
+export async function enterBoard() {
+  if (!admin()) return;
+  closeSheet();
+  go({ page: "board", detail: null });
+  await loadBoard();
+  if (state.page === "board") {
+    renderView();
+    renderSide();
+  }
+}
+
 export function go(patch) {
   const gChanged = patch.g && patch.g !== state.g;
   Object.assign(state, patch);
@@ -248,6 +268,16 @@ export function pollUpdate(first) {
   loadUpdate().then(repaintUpdate);
   updTimer = setTimeout(() => pollUpdate(false), first ? 12000 : 30 * 60 * 1000);
 }
+
+/* 看板：页面在前台且停在看板时每 10 秒刷新；内容没变不重画 */
+setInterval(() => {
+  if (document.hidden || state.page !== "board" || !admin()) return;
+  Promise.all([loadBoard(), state.sheet === "board-item" ? loadBoardItem(true) : null]).then(() => {
+    if (state.page !== "board") return;
+    renderView({ poll: true });
+    if (state.sheet === "board-item") repaintSheet();
+  });
+}, 10000);
 
 /* 定时刷新：页面在前台时每 30 秒拉一次当前群 */
 setInterval(() => {

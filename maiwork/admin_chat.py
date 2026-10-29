@@ -671,6 +671,13 @@ class AdminChat:
         if row is None:
             return
         gid = _s(row.get("group_id"))
+        # 一轮对话（可能多轮工具调用）并进同一条 main_runs（看板「主模型」栏）
+        from . import main_run
+        async with main_run.MainRuns(self.store).scope(
+                group_id=gid, purpose="admin_chat", title="回答管理员"):
+            await self._turn_body(chat_id, row, gid)
+
+    async def _turn_body(self, chat_id: int, row: dict, gid: str) -> None:
         spec_list = self._admin_specs()
         labels = {
             _s(s.get("function", {}).get("name")): _s(s.get("function", {}).get("description"))

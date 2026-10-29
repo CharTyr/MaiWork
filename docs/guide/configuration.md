@@ -112,3 +112,4 @@
 | `console.herenow_share` | bool | `true` | 没填公开网址时，把群友要看的页面自动发布到 here.now（匿名、24 小时过期）。关掉就只发文字、不带链接 |
 | `console.update_check` | bool | `true` | 管理员打开网页时查 GitHub 上有没有新版（只提醒，更新去 MaiBot 的插件管理点） |
 | `console.maibot_webui_url` | string | `""` | MaiBot 自己网页的地址；填了，更新提醒里有直达按钮 |
+| `console.board_hours` | int | `24` | 任务看板「最近动态」往回看多少小时（1~168）；只总管理员能看 |

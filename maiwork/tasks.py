@@ -748,6 +748,7 @@ class Tasks:
         except (KeyError, ValueError):
             pass
         except Exception:
+            logger.exception("安全网给任务 %s 写暂停失败（原因 %s），任务可能还在跑", tid, reason)
             return None
         return reason
 

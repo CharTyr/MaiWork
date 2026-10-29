@@ -167,7 +167,8 @@ CREATE TABLE IF NOT EXISTS judgments (
     ms INTEGER NOT NULL DEFAULT 0,
     ok INTEGER NOT NULL DEFAULT 1,
     error TEXT NOT NULL DEFAULT '',
-    verdict TEXT
+    verdict TEXT,
+    run_ref TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS tool_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -191,7 +192,8 @@ CREATE TABLE IF NOT EXISTS news_batches (
     kept INTEGER NOT NULL DEFAULT 0,
     skipped INTEGER NOT NULL DEFAULT 0,
     note TEXT NOT NULL DEFAULT '',
-    created REAL NOT NULL DEFAULT 0
+    created REAL NOT NULL DEFAULT 0,
+    run_ref TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS news_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -230,7 +232,8 @@ CREATE TABLE IF NOT EXISTS ideas (
     up INTEGER NOT NULL DEFAULT 0,
     down INTEGER NOT NULL DEFAULT 0,
     created REAL NOT NULL DEFAULT 0,
-    updated REAL NOT NULL DEFAULT 0
+    updated REAL NOT NULL DEFAULT 0,
+    run_ref TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS topic_candidates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -257,7 +260,8 @@ CREATE TABLE IF NOT EXISTS topic_log (
     message_id TEXT NOT NULL DEFAULT '',
     followup_due_ts REAL,
     result TEXT,
-    verdict TEXT
+    verdict TEXT,
+    run_ref TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS mentions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1274,8 +1278,60 @@ def _m_hot_indexes(conn: sqlite3.Connection) -> None:
         conn.execute(ddl)
 
 
-# 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids, _m_pending_ask_state, _m_goal_stale_notify, _m_skills, _m_task_sessions, _m_hot_indexes]
+# 第 46 步（2026-10-29，看板「主模型」栏）：主模型每次独立判断 / 一轮处理 = main_runs
+# 一行（开始写 running、结束写终态；进程中断留下的 running 由启动收尾标 cancelled、
+# 看板读取也把超过时限的当已中断）。这一轮里的 model_calls / tool_calls 靠新加的
+# run_ref 列精确挂到这条目上（看板 item 详情 link=exact 用它查，不用时间窗去猜）。
+def _m_main_runs(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+CREATE TABLE IF NOT EXISTS main_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id TEXT NOT NULL DEFAULT '',
+    purpose TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK(status IN ('running','done','failed','cancelled')),
+    started REAL NOT NULL DEFAULT 0,
+    finished REAL NOT NULL DEFAULT 0,
+    ok INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    ref TEXT NOT NULL DEFAULT '' UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_main_runs_group_started ON main_runs(group_id, started);
+CREATE INDEX IF NOT EXISTS idx_main_runs_status ON main_runs(status, started);
+""")
+    # run_ref 列：model_calls / tool_calls 表在更早的迁移里建；半截老库还没有这两张表时
+    # 跳过（表都没建到，列自然也不缺）——同第 38 步 `_m_idea_kind` 对半截老库的做法。
+    for table in ("model_calls", "tool_calls"):
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        if exists is None:
+            continue
+        cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if "run_ref" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN run_ref TEXT NOT NULL DEFAULT ''")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_run_ref ON {table}(run_ref)")
+
+
+# 第 47 步（2026-10-29，看板「精确关联」）：资讯轮 / 构想轮 / 开话题轮在条目上存一份
+# 本轮的 round ref（`news:` / `idea:` / `topic:`，和 main_runs 的 run_ref 同一个机制，
+# 但不开 main_runs 条目——这些轮里的调用不算「主模型独立判断」）。条目带 ref 后看板
+# item 详情直接按它查这一轮（link=exact），老记录（run_ref 空）照旧走时间窗。
+# judgments 也挂同轮 ref：开话题那次的 Jev 判断作为 think 步并进开话题条目。
+def _m_round_ref_marks(conn: sqlite3.Connection) -> None:
+    for table in ("news_batches", "ideas", "topic_log", "judgments"):
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        if exists is None:
+            continue
+        cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if "run_ref" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN run_ref TEXT NOT NULL DEFAULT ''")
+
+
+# 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的。
+# 库号对齐线上：45 = _m_hot_indexes（公开 0.11.1 已带），看板两步顺延为 46 / 47。
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids, _m_pending_ask_state, _m_goal_stale_notify, _m_skills, _m_task_sessions, _m_hot_indexes, _m_main_runs, _m_round_ref_marks]
 
 
 class Store:
@@ -1454,11 +1510,15 @@ class Store:
     # model_calls（最近模型请求日志）：留 3 天 / 最多 2000 行，哪个先到按哪个清
     _MODEL_CALLS_KEEP_S = 3 * 86400
     _MODEL_CALLS_MAX_ROWS = 2000
+    # main_runs（主模型条目，库号 46）：和 model_calls 同口径（它就是这些调用的条目壳，
+    # 留着比调用本身久没有意义）
+    _MAIN_RUNS_KEEP_S = 3 * 86400
+    _MAIN_RUNS_MAX_ROWS = 2000
 
     def prune(self, now: float) -> dict[str, int]:
         """清掉过期数据：events / tool_calls / usage / judgments 保留 30 天，
-        mentions 过期行物理删除，model_calls 留 3 天 / 最多 2000 行（哪个先到按哪个）。
-        返回各表删了多少条。幂等，app 每天跑一次。
+        mentions 过期行物理删除，model_calls / main_runs 留 3 天 / 最多 2000 行
+        （哪个先到按哪个）。返回各表删了多少条。幂等，app 每天跑一次。
         """
         cutoff = float(now) - self._PRUNE_KEEP_S
         counts: dict[str, int] = {}
@@ -1474,6 +1534,7 @@ class Store:
             cur = conn.execute("DELETE FROM mentions WHERE expires_ts <= ?", (float(now),))
             counts["mentions"] = int(cur.rowcount or 0)
             counts["model_calls"] = self._prune_model_calls_tx(conn, now)
+            counts["main_runs"] = self._prune_main_runs_tx(conn, now)
             cur = conn.execute(
                 "DELETE FROM session_events WHERE session_id IN ("
                 " SELECT id FROM task_sessions WHERE state='closed' AND closed_at < ?)",
@@ -1481,6 +1542,24 @@ class Store:
             )
             counts["session_events"] = int(cur.rowcount or 0)
         return counts
+
+    def _prune_main_runs_tx(self, conn: sqlite3.Connection, now: float) -> int:
+        """main_runs 跟 model_calls 同口径：3 天 / 2000 行上限。在调用方事务里。"""
+        try:
+            cutoff = float(now) - self._MAIN_RUNS_KEEP_S
+            cur = conn.execute("DELETE FROM main_runs WHERE started < ?", (cutoff,))
+            removed = int(cur.rowcount or 0)
+            cur = conn.execute(
+                "DELETE FROM main_runs WHERE id < ("
+                "  SELECT MIN(id) FROM (SELECT id FROM main_runs ORDER BY id DESC LIMIT ?)"
+                ")",
+                (self._MAIN_RUNS_MAX_ROWS,),
+            )
+            return removed + int(cur.rowcount or 0)
+        except Exception:
+            # 老库没有这张表（迁移没跑到的半截库）：不算错误，当清了 0 条
+            logger.debug("main_runs 清理失败（可能表还没建）", exc_info=True)
+            return 0
 
     def _prune_model_calls_tx(self, conn: sqlite3.Connection, now: float) -> int:
         """在调用方事务里按「3 天 + 2000 行上限」清 model_calls；返回删掉的行数。

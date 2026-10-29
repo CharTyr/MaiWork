@@ -36,7 +36,7 @@ import re
 from datetime import timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from . import clock, group_push, voice
+from . import clock, group_push, run_ref, voice
 from .config import Settings
 from .delivery import Mentions, Pushes
 from .host import Host, HostError, Msg
@@ -305,7 +305,27 @@ class Topics:
     # ------------------------------------------------------------------
 
     async def check(self, group_id: str, now: float) -> str:
-        """cold-start 判断；返回做了什么（给日志 / 测试）。"""
+        """cold-start 判断；返回做了什么（给日志 / 测试）。
+
+        整轮判断（Jev 问 + 写开场白 + topic_log / judgments 落库）在一个
+        `topic:<gid>:<ms>:<seq>` 的 round ref 下跑：轮里的 model_calls / judgments
+        自动挂它，topic_log 行存同一份 ref → 看板精确关联（link=exact）。
+        """
+        try:
+            ref = run_ref.new("topic", str(group_id))
+        except Exception:
+            ref = ""
+        scope = run_ref.tagged(ref)
+        await scope.__aenter__()
+        try:
+            return await self._check_round(group_id, now)
+        finally:
+            try:
+                await scope.__aexit__(None, None, None)
+            except Exception:
+                logger.exception("收开话题轮 round ref 失败")
+
+    async def _check_round(self, group_id: str, now: float) -> str:
         gid = str(group_id)
         try:
             settings = self._get_settings()
@@ -913,11 +933,12 @@ class Topics:
 
         jev_json = json.dumps(jev_obj, ensure_ascii=False)
         pick_json = json.dumps(pick or {}, ensure_ascii=False)
+        round_ref = run_ref.current()
         with self._store.tx() as conn:
             cur = conn.execute(
-                "INSERT INTO topic_log (group_id, ts, quiet_s, usual_gap_s, jev, pick, candidate_id, opener, message_id, followup_due_ts, result, verdict)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, '', '', NULL, NULL, NULL)",
-                (gid, float(now), float(quiet_s), float(usual_gap) if usual_gap is not None else None, jev_json, pick_json, candidate_id),
+                "INSERT INTO topic_log (group_id, ts, quiet_s, usual_gap_s, jev, pick, candidate_id, opener, message_id, followup_due_ts, result, verdict, run_ref)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, '', '', NULL, NULL, NULL, ?)",
+                (gid, float(now), float(quiet_s), float(usual_gap) if usual_gap is not None else None, jev_json, pick_json, candidate_id, round_ref),
             )
             return int(cur.lastrowid or 0)
 

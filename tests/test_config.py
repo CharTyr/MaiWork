@@ -58,7 +58,8 @@ class TestDefaults:
         # 0.5.0：[environments] local_network；0.4.9：[quick_judge] 不再攒批（删 batch_wait_s）、daily_max 归高级项
         # 0.5.2：[session] 工作会话入口和固定机器人显示名候选
         # 0.5.3：[console] herenow_share（没填公开网址时自动用 here.now 公开群友页）
-        assert CONFIG_VERSION == "0.5.3"
+        # 0.5.4：[console] board_hours（任务看板「最近动态」窗口）
+        assert CONFIG_VERSION == "0.5.4"
         assert MaiWorkConfig().plugin.config_version == CONFIG_VERSION
 
     def test_railway_verify_new_fields_defaults(self) -> None:

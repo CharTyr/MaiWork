@@ -234,7 +234,7 @@ class TestFullMigrate:
         # 44 = 工作会话、事件与任务轮次；前 43 步不改动。
         assert store_mod._MIGRATIONS[41].__name__ == "_m_goal_stale_notify"
         assert store_mod._MIGRATIONS[42].__name__ == "_m_skills"
-        assert LATEST == 45, "第 44 步追加工作会话、第 45 步补索引，历史迁移位置保持不变"
+        assert LATEST == 47, "第 45 步补索引、第 46 步主模型条目、第 47 步 round ref，历史迁移位置保持不变"
         assert store_mod._MIGRATIONS[40].__name__ == "_m_pending_ask_state"
         assert store_mod._MIGRATIONS[34].__name__ == "_m_task_lanes"
         assert store_mod._MIGRATIONS[35].__name__ == "_m_news_brief"
@@ -562,3 +562,62 @@ class TestUnknownOlderState:
             assert {"bot_messages", "member_interactions", "chat_feeds"} <= names
         finally:
             conn.close()
+
+
+# ----------------------------------------------------------------------
+# 线上库号 45（0.11.1/0.11.2，只有 _m_hot_indexes 补索引）→ 47 的升级路径
+# ----------------------------------------------------------------------
+
+class TestOnline45Upgrade:
+    """线上库：库号 45 = _m_task_sessions(44) 之后只有 _m_hot_indexes。
+    私有看板两步顺延为 46/47，从线上 45 升上来必须建出 main_runs 和各 run_ref 列。"""
+
+    STEP_ONLINE_45 = 45   # _m_task_sessions + _m_hot_indexes
+
+    def _online_45(self, path: Path) -> Store:
+        """造一个「线上 0.11.2 跑完的库」：跑到第 45 步（最后一步是 _m_hot_indexes）。"""
+        s = Store(path)
+        _run_steps(s, self.STEP_ONLINE_45)
+        return s
+
+    def test_online_45_has_only_hot_indexes(self, tmp_path: Path) -> None:
+        """对照组：线上 45 的库没有 main_runs、没有 run_ref 列（确保下面测的是 45→47 不是全量新建）。"""
+        s = self._online_45(tmp_path / "online45.db")
+        try:
+            assert "main_runs" not in _tables(s)
+            assert "run_ref" not in {c[0] for c in _columns(s, "model_calls")}
+            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 45
+        finally:
+            s.close()
+
+    def test_online_45_upgrades_to_47(self, tmp_path: Path) -> None:
+        """主路径：45（只补索引）→ 47 建出 main_runs、model_calls/tool_calls 与
+        news_batches/ideas/topic_log/judgments 的 run_ref 列。"""
+        s = self._online_45(tmp_path / "online45.db")
+        try:
+            assert s.migrate() == 47
+            assert "main_runs" in _tables(s)
+            for table in ("model_calls", "tool_calls", "news_batches", "ideas",
+                          "topic_log", "judgments"):
+                cols = {c[0] for c in _columns(s, table)}
+                assert "run_ref" in cols, table
+            assert "idx_model_calls_run_ref" in _index_names(s, "model_calls")
+            assert "idx_tool_calls_run_ref" in _index_names(s, "tool_calls")
+            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 47
+        finally:
+            s.close()
+
+    def test_step44_upgrades_to_47(self, tmp_path: Path) -> None:
+        """0.11.0 存量（库号 44）直升 47：先补索引再建 main_runs 和 run_ref 列。"""
+        s = Store(tmp_path / "v44.db")
+        try:
+            _run_steps(s, 44)
+            assert s.migrate() == 47
+            names = _tables(s)
+            assert "main_runs" in names and "task_sessions" in names
+            assert "idx_events_entity" in _index_names(s, "events")
+            cols = {c[0] for c in _columns(s, "model_calls")}
+            assert "run_ref" in cols
+            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 47
+        finally:
+            s.close()

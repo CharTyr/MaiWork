@@ -23,10 +23,11 @@ import { loadUsage, loadUsageDay } from "./settings/usage.js";
 import { avatarSaved } from "./settings/identity.js";
 import { loadLogs, loadLogSummary } from "./settings/logs.js";
 import { closeSheet, openDetail, openSheet, repaintSheet } from "./sheet.js";
+import { loadBoardItem } from "./board.js";
 import { chatPoll, enterChat, loadChat, loadChats, paintChat } from "./chat.js";
 import { renderSide, renderView } from "./render.js";
 import { dismissUpdate } from "./update.js";
-import { enterSettings, go, loadGroups, loadSettings, loadView, reboot, renderTopBits, retryLoad, syncHash } from "./router.js";
+import { enterBoard, enterSettings, go, loadGroups, loadSettings, loadView, reboot, renderTopBits, retryLoad, syncHash } from "./router.js";
 
 /* ───────────── 交互 ───────────── */
 
@@ -73,6 +74,23 @@ export async function act(el, e) {
     case "chat":
       await enterChat();
       break;
+    case "board":
+      await enterBoard();
+      break;
+    case "board-filter":
+      state.boardFilter = el.dataset.g || "";
+      renderView();
+      break;
+    case "board-item": {
+      if (!admin()) break;
+      state.boardItem = { source: el.dataset.src, id: el.dataset.id, kind: el.dataset.kind, data: null, err: "" };
+      state.boardOpen = {};
+      openSheet("board-item");
+      renderView();
+      await loadBoardItem(false);
+      if (state.sheet === "board-item") repaintSheet();
+      break;
+    }
     case "chat-open":
       closeSheet();
       await enterChat(Number(el.dataset.id));

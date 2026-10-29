@@ -5,13 +5,13 @@ from CharTyr_MaiWork.maiwork.store import Store
 def test_fresh_db_reuses_existing_skill_tables(tmp_path):
     store = Store(tmp_path / "new.db")
     try:
-        assert store.migrate() == 45
+        assert store.migrate() == 47
         names = {r[0] for r in store.read().execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"agent_skills", "agent_skill_versions"} <= names
         assert "skills" not in names
         cols = {r["name"] for r in store.read().execute("PRAGMA table_info(goals)")}
         assert {"stale_notified_ts", "admin_chat_id"} <= cols
-        assert store.migrate() == 45
+        assert store.migrate() == 47
     finally:
         store.close()
 
@@ -25,7 +25,7 @@ def test_reserved_migration_preserves_local_legacy_skill_data(tmp_path):
             conn.execute("CREATE TABLE skills (id TEXT PRIMARY KEY, content TEXT)")
             conn.execute("INSERT INTO skills VALUES ('legacy', 'keep this local draft')")
             conn.execute("PRAGMA user_version=42")
-        assert store.migrate() == 45
+        assert store.migrate() == 47
         assert store.read().execute("SELECT content FROM skills WHERE id='legacy'").fetchone()[0] == "keep this local draft"
     finally:
         store.close()

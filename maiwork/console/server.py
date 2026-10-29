@@ -18,6 +18,7 @@ from typing import Any, Awaitable, Callable
 from aiohttp import web
 
 from .. import clock, handoff, members, privacy
+from . import board
 from . import usage_history
 from . import views
 from ..group_admins import GroupAdmins
@@ -2437,6 +2438,38 @@ class ConsoleServer:
             except ValueError as e:  # date 格式不对
                 return _err(400, str(e))
             return web.json_response(data)
+
+        @get("/api/board")
+        async def _board(request: web.Request) -> web.Response:
+            """任务看板（只总管理员）：?hours=N（1..168，默认 console.board_hours=24）。
+
+            结构见 docs/07 §9.6；拼装全在 console/board.py，这里只接线。
+            """
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            data = board.board_view(svc, hours=request.query.get("hours"))
+            return web.json_response(data)
+
+        @get("/api/board/items/{source}/{id}")
+        async def _board_item(request: web.Request) -> web.Response:
+            """看板单条的逐步过程（只总管理员）：steps = tool_calls + model_calls 文本 + 状态节点。
+
+            整包过密钥遮罩（库里旧行可能没遮过）。不存在 / 非服务群 / 乱 source → 404。
+            ?after=<ts> 只回 ts > after 的增量 steps（增量轮询用）。
+            """
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            data = board.item_view(
+                svc,
+                request.match_info.get("source"),
+                request.match_info.get("id"),
+                after=request.query.get("after"),
+            )
+            if data is None:
+                return _err(404, "这条记录不存在")
+            return web.json_response(_redact_json(data, _secret_list()))
 
         # ---------- M2：资讯 / 构想 / 开话题（docs/07 §9.2 末段） ----------
 

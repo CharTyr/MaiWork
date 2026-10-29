@@ -12,6 +12,7 @@ import { preserveGoalChatInput } from "./goal-chat.js";
 import { settingsPage, settingsSide } from "./settings/index.js";
 import { chatPage, chatSide } from "./chat.js";
 import { hasUpdate, updateBanner } from "./update.js";
+import { boardPage } from "./board.js";
 
 /* ───────────── 渲染 ───────────── */
 
@@ -23,6 +24,14 @@ export function renderTop() {
     $("top").innerHTML = `
       <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="${esc(botName())}" />
       <div class="chip">聊天</div>
+      <div class="chip-sub">管理员</div>
+      <button class="round-btn" data-act="tab" data-tab="${state.tab}" aria-label="返回">${SVG.close}</button>`;
+    return;
+  }
+  if (state.page === "board") {
+    $("top").innerHTML = `
+      <img class="top-avatar" src="${esc(avatar())}" onerror="this.onerror=null;this.src='/static/assets/logo.png'" alt="${esc(botName())}" />
+      <div class="chip">看板</div>
       <div class="chip-sub">管理员</div>
       <button class="round-btn" data-act="tab" data-tab="${state.tab}" aria-label="返回">${SVG.close}</button>`;
     return;
@@ -43,7 +52,7 @@ export function renderTop() {
     <div class="chip-sub"><span class="dot ${q.live ? "ok" : ""}"></span>${esc(q.text)}</div>
     ${
       admin()
-        ? `<button class="round-btn left" data-act="chat" aria-label="聊天">${SVG.chat}</button><button class="round-btn" data-act="settings" aria-label="设置">${SVG.sliders}</button>`
+        ? `<button class="round-btn left" data-act="chat" aria-label="聊天">${SVG.chat}</button><button class="round-btn left second" data-act="board" aria-label="看板">${SVG.board}</button><button class="round-btn" data-act="settings" aria-label="设置">${SVG.sliders}</button>`
         : `<button class="round-btn left" data-act="appearance" aria-label="外观">${SVG.palette}</button><button class="round-btn" data-act="login" aria-label="${isGA() ? "群管理员" : "管理员登录"}">${SVG.key}</button>`
     }`;
 }
@@ -99,6 +108,7 @@ export function renderRail() {
     ).join("")}
     <div class="rail-foot">
       <button class="r-item" data-act="appearance" title="外观">${SVG.palette}<span class="r-text"><span class="r-name">外观</span></span></button>
+      ${admin() ? `<button class="r-item" data-act="board" title="看板" aria-current="${state.page === "board"}">${SVG.board}<span class="r-text"><span class="r-name">看板</span></span></button>` : ""}
       ${admin() ? `<button class="r-item" data-act="chat" title="聊天" aria-current="${state.page === "chat"}">${SVG.chat}<span class="r-text"><span class="r-name">聊天</span></span></button>` : ""}
       ${
         admin()
@@ -119,6 +129,10 @@ export function renderSide() {
   if (!desktop.matches) return;
   if (state.page === "chat") {
     $("side").innerHTML = chatSide();
+    return;
+  }
+  if (state.page === "board") {
+    $("side").innerHTML = "";
     return;
   }
   if (state.page === "settings") {
@@ -261,6 +275,15 @@ export function renderView(opts) {
     ui.flash = false;
     return;
   }
+  if (state.page === "board") {
+    const html = boardPage();
+    if (opts && opts.poll && html === lastView && !ui.flash) return;
+    lastView = html;
+    $("view").innerHTML = html;
+    if (!ui.flash) $("view").querySelectorAll(".enter").forEach((x) => x.classList.remove("enter"));
+    ui.flash = false;
+    return;
+  }
   if (state.page === "settings") {
     const was = tabScrolls();
     const old = tabBars();
@@ -327,10 +350,11 @@ function noGroups() {
 }
 
 export function render() {
-  const onSettings = admin() && (state.page === "settings" || state.page === "chat");
+  const onSettings = admin() && (state.page === "settings" || state.page === "chat" || state.page === "board");
   const lone = !onSettings && (!state.me || state.me.role === "none" || (admin() && !state.groups.length));
   document.body.classList.toggle("no-link", lone);
   document.body.classList.toggle("on-chat", state.page === "chat");
+  document.body.classList.toggle("on-board", state.page === "board");
   document.body.classList.remove("booting");
   if (lone) {
     $("view").innerHTML = admin() ? noGroups() : landing();
@@ -343,7 +367,7 @@ export function render() {
   renderView();
   renderSide();
   if (onSettings) {
-    document.title = state.page === "chat" ? "聊天 · MaiWork" : "设置 · MaiWork";
+    document.title = state.page === "chat" ? "聊天 · MaiWork" : state.page === "board" ? "看板 · MaiWork" : "设置 · MaiWork";
     return;
   }
   const label = TABS.find((t) => t.id === state.tab).label;

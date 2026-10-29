@@ -73,7 +73,7 @@ def _norm_accounts(values: object, field_zh: str, problems: list[str]) -> tuple[
     return tuple(out)
 
 
-CONFIG_VERSION = "0.5.3"  # 0.5.3：[console] herenow_share（没填公开网址时群友页自动发 here.now）；0.5.2：[session] 工作会话入口、判断时限与候选显示名；0.5.1：[environments] freestyle 开关 + freestyle_* + vm_platform（两家一次性 VM 可同时开，vm_platform = 优先用哪家）；0.5.0：[environments] local_network（子 agent 默认碰不到本机与内网，开了才放行）；0.4.9：[quick_judge] 不再攒批（删 batch_wait_s，一条 @ 一次判断）、daily_max 归高级项；0.4.8：[quick_judge] 派活判断兜底（Jev 不在 / 拿不准时用模型快速判群里 @ 的是不是派活）；0.4.7：[jev] use + [[jev_endpoints]]（多判断服务：预设 / 自己加 / 换着用）；0.4.6：每端点高级请求头 headers（默认空）；0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）；0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
+CONFIG_VERSION = "0.5.4"  # 0.5.4：[console] board_hours（任务看板最近 N 小时动态，默认 24）；0.5.3：[console] herenow_share（没填公开网址时群友页自动发 here.now）；0.5.2：[session] 工作会话入口、判断时限与候选显示名；0.5.1：[environments] freestyle 开关 + freestyle_* + vm_platform（两家一次性 VM 可同时开，vm_platform = 优先用哪家）；0.5.0：[environments] local_network（子 agent 默认碰不到本机与内网，开了才放行）；0.4.9：[quick_judge] 不再攒批（删 batch_wait_s，一条 @ 一次判断）、daily_max 归高级项；0.4.8：[quick_judge] 派活判断兜底（Jev 不在 / 拿不准时用模型快速判群里 @ 的是不是派活）；0.4.7：[jev] use + [[jev_endpoints]]（多判断服务：预设 / 自己加 / 换着用）；0.4.6：每端点高级请求头 headers（默认空）；0.4.5：[[endpoints]] / [[model_list]]（模型改版阶段 1a）；0.4.4：[console] update_check、maibot_webui_url；0.4.3：[feeds] viz_per_day；0.4.2：[models] max_tokens；0.4.1：[reader] Jina Reader；0.4.0：[models] context_window、[tasks] 安全网、[feeds] collect_minutes
 
 # 0.8.0 群控归一（docs/18 §五 + 往群里发）：下面这些全局键**只作新群第一次的迁移种子**
 # （migrations.migrate_group_controls 按服务群种进 kv["group_approval.<群号>"] /
@@ -347,6 +347,7 @@ class ConsoleSectionConfig(PluginConfigBase):
     update_check: bool = Field(default=True, description="管理员打开网页时顺手查 GitHub 上有没有 MaiWork 新版（只提醒，不自动更新）")
     maibot_webui_url: str = Field(default="", description="MaiBot 自己网页的地址；填了，更新提醒里的按钮直接跳过去")
     trusted_proxies: list[str] = Field(default_factory=list, description="网页放在反向代理（nginx / frp 等）后面时，代理的 IP 或网段；只信这些来源带的 X-Forwarded-For")
+    board_hours: int = Field(default=24, description="任务看板「最近动态」往回看多少小时（1~168）")
 
 
 class SSHServerConfig(PluginConfigBase):
@@ -825,6 +826,7 @@ class ConsoleSetting:
     maibot_webui_url: str = ""
     # 反向代理的 IP / 网段（规范化后的字符串）；来自这些地址的请求才认 X-Forwarded-For
     trusted_proxies: tuple[str, ...] = ()
+    board_hours: int = 24
 
 
 @dataclass(frozen=True)
@@ -1938,6 +1940,7 @@ def load_settings(raw: MaiWorkConfig | dict) -> tuple[Settings, list[str]]:
             herenow_share=bool(getattr(console, "herenow_share", True)),
             maibot_webui_url=_http_url_or_empty(getattr(console, "maibot_webui_url", "")),
             trusted_proxies=_parse_trusted_proxies(getattr(console, "trusted_proxies", []), problems),
+            board_hours=_clamp_int(getattr(console, "board_hours", 24), 1, 168, 24),
         ),
         endpoints=endpoints_parsed,
         model_list=model_list_parsed,

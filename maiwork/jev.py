@@ -31,7 +31,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
-from . import clock
+from . import clock, run_ref
 from .config import Settings
 from .store import Store
 
@@ -482,8 +482,8 @@ class Jev:
         try:
             with (self._store.immediate_tx() if purpose == "session.triage" else self._store.tx()) as conn:
                 conn.execute(
-                    "INSERT INTO judgments (ts, day, purpose, group_id, state_summary, answers, ms, ok, error)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO judgments (ts, day, purpose, group_id, state_summary, answers, ms, ok, error, run_ref)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         clock.now(),
                         clock.day_key(clock.now()),
@@ -494,6 +494,7 @@ class Jev:
                         int(ms),
                         0,
                         clean_error,
+                        run_ref.current(),
                     ),
                 )
         except Exception:
@@ -740,8 +741,8 @@ class Jev:
         try:
             with (self._store.immediate_tx() if purpose == "session.triage" else self._store.tx()) as conn:
                 conn.execute(
-                    "INSERT INTO judgments (ts, day, purpose, group_id, state_summary, answers, ms, ok, error)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO judgments (ts, day, purpose, group_id, state_summary, answers, ms, ok, error, run_ref)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         clock.now(),
                         clock.day_key(clock.now()),
@@ -752,6 +753,7 @@ class Jev:
                         int(ms),
                         1,
                         "",
+                        run_ref.current(),
                     ),
                 )
         except Exception:

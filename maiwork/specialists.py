@@ -24,6 +24,21 @@ from .workers import WorkerReport, Workers
 
 logger = logging.getLogger("maiwork.specialists")
 
+
+def agents_of(specialists: Any) -> Any:
+    """从 Specialists 拿 Agents（统一入口，别各处自己探测）。
+
+    正常走公开 ``.agents`` property；``_agents`` 只作老兜底的兼容读。
+    调用方拿不到就判 None，不要自己再写一份「先 _agents 再 agents」。
+    """
+    if specialists is None:
+        return None
+    agents = getattr(specialists, "agents", None)
+    if agents is None:
+        agents = getattr(specialists, "_agents", None)
+    return agents
+
+
 # news / idea / goal 专岗的默认硬白名单（契约 §8）：只读调研工具 + 交回。
 # 「实际存在的才用」：交集时若名字未注册被 Tools.specs 自然剔除；task 岗位 tools=None
 # 代表不受这份岗位名单限制，调用方本次给什么用什么。

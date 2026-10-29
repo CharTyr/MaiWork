@@ -86,7 +86,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from . import clock, goals, idea_feasibility, members, news_rating, news_standard, search_stats
-from . import page_date, source_name, verify_budget
+from . import page_date, run_ref, source_name, verify_budget
 from .config import Settings, normalize_domain as _normalize_domain
 from .environments import vm_platforms
 from .models import ModelError
@@ -1665,11 +1665,9 @@ class Feeds:
 
     @staticmethod
     def _sp_agents_of(specialists: Any) -> Any:
-        """从 Specialists 拿 Agents（父会话确认：内部 `_agents` 是稳定引用）。"""
-        agents = getattr(specialists, "_agents", None)
-        if agents is None:
-            agents = getattr(specialists, "agents", None)
-        return agents
+        """从 Specialists 拿 Agents（统一走 specialists.agents_of 公共入口）。"""
+        from .specialists import agents_of
+        return agents_of(specialists)
 
     def _role_enabled(self, gid: str, kind: str) -> bool:
         """服务群 + 岗位 enabled 复核（订阅：专职 C 的「禁岗绝不回落」闸）。
@@ -1891,6 +1889,24 @@ class Feeds:
     # ---- 资讯（原有逻辑） -------------------------------------------------------------
 
     async def prepare_news(self, group_id: str) -> int:
+        """一轮资讯：在 `news:<gid>:<ms>:<seq>` 的 round ref 下跑完，轮里的
+        model_calls / tool_calls 自动挂它；批次行存同一份 ref → 看板精确关联
+        （link=exact）。ref 不开 main_runs 条目（tagged scope），写库失败只记日志。"""
+        try:
+            ref = run_ref.new("news", str(group_id))
+        except Exception:
+            ref = ""
+        scope = run_ref.tagged(ref)
+        await scope.__aenter__()
+        try:
+            return await self._prepare_news_round(group_id)
+        finally:
+            try:
+                await scope.__aexit__(None, None, None)
+            except Exception:
+                logger.exception("收资讯轮 round ref 失败")
+
+    async def _prepare_news_round(self, group_id: str) -> int:
         gid = str(group_id)
         settings = self._get_settings()
         # 开工前提（画像成形 / news 专岗启停 / 模型就绪）：和手动「现在就备一批」共用同一个
@@ -2810,11 +2826,12 @@ class Feeds:
         每条通过的条目的 news_items.id 回写在 item["_news_id"]（第三道要用）。
         """
         expires = now + ttl_h * 3600.0
+        round_ref = run_ref.current()
         with self._store.tx() as conn:
             cur = conn.execute(
-                "INSERT INTO news_batches (group_id, slot_ts, found, kept, skipped, note, created)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (gid, now, int(found), int(kept), 1 if not kept else 0, str(note)[:300], now),
+                "INSERT INTO news_batches (group_id, slot_ts, found, kept, skipped, note, created, run_ref)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (gid, now, int(found), int(kept), 1 if not kept else 0, str(note)[:300], now, round_ref),
             )
             batch_id = int(cur.lastrowid or 0)
             funnel = (stats or {}).get("funnel")
@@ -5150,12 +5167,13 @@ class Feeds:
 
     def _skipped_batch(self, gid: str, note: str, *, found: int = 0, stats: dict | None = None) -> None:
         now = clock.now()
+        round_ref = run_ref.current()
         try:
             with self._store.tx() as conn:
                 cur = conn.execute(
-                    "INSERT INTO news_batches (group_id, slot_ts, found, kept, skipped, note, created)"
-                    " VALUES (?, ?, ?, 0, 1, ?, ?)",
-                    (gid, now, int(found), str(note)[:300], now),
+                    "INSERT INTO news_batches (group_id, slot_ts, found, kept, skipped, note, created, run_ref)"
+                    " VALUES (?, ?, ?, 0, 1, ?, ?, ?)",
+                    (gid, now, int(found), str(note)[:300], now, round_ref),
                 )
                 # 跳过的轮也记一份统计（默认全 0）：前端能按同一套字段读；收集之后才失败的
                 # 轮（打分失败等）传 stats 保留已经发生的搜索 / 打开次数，kept 一律 0。
@@ -5237,6 +5255,23 @@ class Feeds:
             return None
 
     async def make_idea(self, group_id: str) -> int | None:
+        """一轮构想：在 `idea:<gid>:<ms>:<seq>` 的 round ref 下跑完（同一轮出多条
+        构想都挂同一个 ref）；构想行存同一份 ref → 看板精确关联（link=exact）。"""
+        try:
+            ref = run_ref.new("idea", str(group_id))
+        except Exception:
+            ref = ""
+        scope = run_ref.tagged(ref)
+        await scope.__aenter__()
+        try:
+            return await self._make_idea_round(group_id)
+        finally:
+            try:
+                await scope.__aexit__(None, None, None)
+            except Exception:
+                logger.exception("收构想轮 round ref 失败")
+
+    async def _make_idea_round(self, group_id: str) -> int | None:
         gid = str(group_id)
         if not self._profile_ready(gid):
             return None
@@ -5472,15 +5507,16 @@ class Feeds:
         keywords_json = json.dumps(keywords, ensure_ascii=False)
         items_json = json.dumps(items, ensure_ascii=False)
         now = clock.now()
+        round_ref = run_ref.current()
         with self._store.tx() as conn:
             cur = conn.execute(
                 "INSERT INTO ideas (group_id, kind, icon, title, body, origin, basis, step, effort,"
                 " state, requested_by, task_id, up, down, created, updated, feasibility, keywords,"
-                " items)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, '', '', 'new', NULL, NULL, 0, 0, ?, ?, ?, ?, ?)",
+                " items, run_ref)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, '', '', 'new', NULL, NULL, 0, 0, ?, ?, ?, ?, ?, ?)",
                 (
                     gid, kind, icon, title, body_s, origin_s, basis_s,
-                    now, now, feasibility_json, keywords_json, items_json,
+                    now, now, feasibility_json, keywords_json, items_json, round_ref,
                 ),
             )
             idea_id = int(cur.lastrowid or 0)

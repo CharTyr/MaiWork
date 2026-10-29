@@ -394,10 +394,15 @@ class Tools:
         outp = self._mask_final(outp)[:_SUMMARY_MAX]
         ms = int((clock.now() - start) * 1000)
         try:
+            from . import run_ref as _run_ref_mod
+            round_ref = _run_ref_mod.current()
+        except Exception:
+            round_ref = ""
+        try:
             with self._store.tx() as conn:
                 conn.execute(
-                    "INSERT INTO tool_calls (ts, group_id, task_id, actor, tool, input, output, ms, ok, error)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO tool_calls (ts, group_id, task_id, actor, tool, input, output, ms, ok, error, run_ref)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         clock.now(),
                         str(ctx.group_id or ""),
@@ -409,6 +414,7 @@ class Tools:
                         ms,
                         1 if result.ok else 0,
                         self._mask_final(str(result.error or ""))[:_SUMMARY_MAX],
+                        round_ref,
                     ),
                 )
         except Exception:

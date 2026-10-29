@@ -49,6 +49,10 @@
 - 上下文窗口 / 最大输出：`limits_for(kind)` = 岗位首选候选条目的值；旧四槽兜底
   用 `Settings.models` 的旧全局值。压缩（workers/coordinator/admin_chat）先问它。
 - 每次尝试（含失败）写一条 usage + 一条 model_calls（管理员网页看，docs/07 §9）。
+- 思考链只进日志（2026-10）：openai reasoning_content（流式+非流式）、anthropic
+  thinking 块、responses reasoning item 的 summary → model_calls.response.reasoning
+  （截 ≤8000，超长带「…（已截断）」；redacted/加密的思考不存内容记
+  reasoning_redacted: true）。绝不进 ChatResult.text、不回传模型、不改请求体。
 """
 
 from __future__ import annotations
@@ -70,7 +74,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from . import clock
+from . import clock, main_run, run_ref
 from .config import Settings
 from .store import Store
 
@@ -86,6 +90,7 @@ _LOG_CONTENT_MAX = 4000     # message.content
 _LOG_TOOL_ARGS_MAX = 500    # 请求里 message.tool_calls 的 arguments
 _LOG_REQUEST_MAX = 80 * 1024  # 整份 request JSON
 _LOG_RESPONSE_TEXT_MAX = 20000  # response.text
+_LOG_REASONING_MAX = 8000   # response.reasoning（思考链只进日志，超长带「…（已截断）」）
 _LOG_TOOL_OUT_ARGS_MAX = 1000   # 响应里 tool_calls 的 arguments
 _LOG_PRUNE_EVERY = 200      # 每写多少行顺手清一次超量/超期
 _RETRY_AFTER_CAP_S = 120.0  # 429 冷却里 Retry-After 的封顶
@@ -1255,6 +1260,8 @@ def _parse_anthropic_response(data: Any, model: str) -> "ChatResult":
     texts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
     raw_blocks: list[dict[str, Any]] = []
+    thinking_parts: list[str] = []
+    reasoning_redacted = False
     for i, block in enumerate(content):
         if not isinstance(block, dict):
             continue
@@ -1273,7 +1280,13 @@ def _parse_anthropic_response(data: Any, model: str) -> "ChatResult":
                 "type": "function",
                 "function": {"name": name, "arguments": args},
             })
-        # thinking / redacted_thinking / 别的块：不进结果（跟 openai 那条 reasoning_content 一个处理）
+        elif btype == "thinking":
+            # 思考块只留作日志（写进 ChatResult.reasoning，不进 text / 不回传模型）
+            thinking_parts.append(str(block.get("thinking") or ""))
+        elif btype == "redacted_thinking":
+            # 加密思考：不存内容，只记「模型想过但内容不公开」
+            reasoning_redacted = True
+        # 别的块：不进结果
     usage_raw = data.get("usage")
     usage = usage_raw if isinstance(usage_raw, dict) else {}
     u = _usage_fields(usage_raw, "input_tokens", "output_tokens")
@@ -1295,6 +1308,8 @@ def _parse_anthropic_response(data: Any, model: str) -> "ChatResult":
         usage_known=u["known"],
         cache_read_tokens=int(usage.get("cache_read_input_tokens") or 0),
         cache_write_tokens=int(usage.get("cache_creation_input_tokens") or 0),
+        reasoning="\n".join(p for p in thinking_parts if p),
+        reasoning_redacted=reasoning_redacted,
     )
 
 
@@ -1309,6 +1324,8 @@ def _parse_responses_response(data: Any, model: str) -> "ChatResult":
         raise ModelError("模型返回格式不对：output 不是数组")
     texts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
+    reasoning_parts: list[str] = []
+    reasoning_redacted = False
     for i, item in enumerate(output):
         if not isinstance(item, dict):
             continue
@@ -1326,7 +1343,15 @@ def _parse_responses_response(data: Any, model: str) -> "ChatResult":
                 "type": "function",
                 "function": {"name": name, "arguments": str(item.get("arguments") or "")},
             })
-        # reasoning / refusal 等其它 item 不进结果
+        elif itype == "reasoning":
+            # reasoning item 只留作日志：收 summary 里的 summary_text；
+            # 有的端点把加密内容放 content 字段（不存内容，只记 redacted）
+            for part in item.get("summary") or []:
+                if isinstance(part, dict) and part.get("type") == "summary_text":
+                    reasoning_parts.append(str(part.get("text") or ""))
+            if item.get("content"):
+                reasoning_redacted = True
+        # refusal 等其它 item 不进结果
     usage_raw = data.get("usage")
     u = _usage_fields(usage_raw, "input_tokens", "output_tokens")
     details = usage_raw.get("input_tokens_details") if isinstance(usage_raw, dict) else None
@@ -1347,6 +1372,8 @@ def _parse_responses_response(data: Any, model: str) -> "ChatResult":
         usage_known=u["known"],
         cache_read_tokens=cached,
         cache_write_tokens=0,
+        reasoning="\n".join(p for p in reasoning_parts if p),
+        reasoning_redacted=reasoning_redacted,
     )
 
 
@@ -1429,6 +1456,11 @@ class ChatResult:
     # 缓存读/写 token（服务商实报才算）：不进 prompt/completion，另记——缓存不是免费
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    # 模型思考链（2026-10）：只进 model_calls.response 日志给管理员看。
+    # 绝不进给业务的 text、不回传给模型、不改请求体；
+    # redacted/加密的 thinking 不存内容，记 reasoning_redacted。
+    reasoning: str = ""
+    reasoning_redacted: bool = False
 
 
 def _usage_fields(usage: Any, prompt_key: str, completion_key: str) -> dict[str, Any]:
@@ -3089,6 +3121,13 @@ class Models:
     ) -> ChatResult:
         """调一次模型。
 
+        主模型条目（main_runs，库号 46，看板「主模型」栏）：要不要顺手记一件的
+        规则全在 `main_run.auto`（主模型、不属于任务、不是核验、不是
+        session.triage、当前不在任何一轮里 → 记一条；否则什么都不做）。记上的
+        话本轮写的 model_calls / tool_calls 挂它的 `run_ref`。条目写库失败只记
+        日志，绝不影响调用本身。一轮多次调用的入口（管理员对话 / 反馈复盘轮 /
+        个人向资讯轮）用 `main_run.MainRuns.scope` 并进同一条。
+
         干活岗位由 agent 决定（kind：main / news / idea / goal / task / c_xxx…）：
         它的 profile.model→backup 是候选链；它自己没解析出候选时用主模型（"main"）
         的链兜底（计划的规矩），此时强度也读主模型的。旧调用口 role 保住：
@@ -3116,12 +3155,47 @@ class Models:
         发请求前过端点限流门：并发上限 max_concurrency（缺省 2）+ 429 冷却 +
         每分钟上限 max_rpm（缺省 0 = 关）；等待可取消，状态只在内存。
         """
+        async with main_run.auto(
+            self._store, agent=str(agent or ""), role=str(role or ""),
+            task_id=str(task_id or ""), purpose=str(purpose or ""),
+            group_id=str(group_id or ""), verifying=_candidates is not None,
+        ):
+            return await self._chat_body(
+                role, messages, agent=agent, tools=tools, json_mode=json_mode,
+                purpose=purpose, group_id=group_id, task_id=task_id,
+                timeout=timeout, retries=retries, max_tokens=max_tokens,
+                effort=effort, _candidates=_candidates, escalate=escalate,
+                _prefix_recipe=_prefix_recipe,
+            )
+
+    async def _chat_body(
+        self,
+        role: Literal["main", "worker"] | None = None,
+        messages: list[dict] | None = None,
+        *,
+        agent: str | None = None,
+        tools: list[dict] | None = None,
+        json_mode: bool = False,
+        purpose: str = "",
+        group_id: str = "",
+        task_id: str = "",
+        timeout: float = 120,
+        retries: int | None = None,
+        max_tokens: int | None = None,
+        effort: str | None = None,
+        _candidates: list[_Candidate] | None = None,
+        escalate: bool = False,
+        _prefix_recipe: dict | None = None,
+    ) -> ChatResult:
+        """chat 的实现体，只供 chat 调用（外层的 async with main_run.auto 包着它；
+        没合回一个函数只是因为合回会让整个函数体多缩进一层）。"""
         settings = self._get_settings()
         msgs = _strip_internal_keys(list(messages or []))
         agent_kind = str(agent or "").strip()
         if not agent_kind:
             agent_kind = "main" if str(role or "") == "main" else "task"
         # 就绪与实际调用读同一条有效候选链（docs/13 A01）：不再先过一道全局 ready 闸
+        # （自动开主模型条目的事在包装层 `chat` 做了，这里只管发请求）
         role_kind = agent_kind
         if _candidates is not None:
             # 内部口：验证某个模型库条目（verify_entry），不走岗位路由
@@ -3600,6 +3674,7 @@ class Models:
                     raise ModelError("模型返回格式不对：不是 JSON") from None
                 return 200, "", data if isinstance(data, dict) else {}
             text_parts: list[str] = []
+            reasoning_parts: list[str] = []
             calls: dict[int, dict] = {}
             finish_reason = ""
             usage: dict = {}
@@ -3637,6 +3712,10 @@ class Models:
                         role = str(delta["role"])
                     if isinstance(delta.get("content"), str):
                         text_parts.append(delta["content"])
+                    # reasoning_content 分段累计（只留作日志，不进结果文本）
+                    rc = delta.get("reasoning_content")
+                    if isinstance(rc, str) and rc:
+                        reasoning_parts.append(rc)
                     for pos, tc in enumerate(delta.get("tool_calls") or []):
                         if not isinstance(tc, dict):
                             continue
@@ -3661,6 +3740,8 @@ class Models:
             message: dict[str, Any] = {"role": role, "content": "".join(text_parts)}
             if calls:
                 message["tool_calls"] = [calls[i] for i in sorted(calls)]
+            if reasoning_parts:
+                message["reasoning_content"] = "".join(reasoning_parts)
             return 200, "", {
                 "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
                 "usage": usage,
@@ -3739,10 +3820,16 @@ class Models:
                     "arguments": _redact_full(fn.get("arguments"), keys)[:_LOG_TOOL_OUT_ARGS_MAX],
                 }
             )
+        # 思考链只进日志：截 _LOG_REASONING_MAX，过长带「…（已截断）」；加密思考不存内容只记旗
+        reasoning = _redact_full(result.reasoning, keys)
+        if len(reasoning) > _LOG_REASONING_MAX:
+            reasoning = reasoning[:_LOG_REASONING_MAX] + "…（已截断）"
         return json.dumps(
             {"text": _redact_full(result.text, keys)[:_LOG_RESPONSE_TEXT_MAX],
              "tool_calls": out_tcs,
-             "finish_reason": finish_reason},
+             "finish_reason": finish_reason,
+             "reasoning": reasoning,
+             "reasoning_redacted": bool(result.reasoning_redacted)},
             ensure_ascii=False,
         )
 
@@ -3812,13 +3899,16 @@ class Models:
         except Exception:
             logger.exception("写 usage 失败（model=%s ok=%s）", model, ok)
         # 2) model_calls（请求日志）
+        # run_ref（库号 46）：现行轮（main_run scope / models.chat 自动开的条目 /
+        # tagged 轮）的标记；没挂（专岗调用、session.triage、T-* 任务里的调用）就是 ""。
+        ref = run_ref.current()
         try:
             with write_tx() as conn:
                 conn.execute(
                     "INSERT INTO model_calls (ts, purpose, role, agent, model, group_id, task_id, attempt, ok,"
                     " status, ms, prompt_tokens, completion_tokens, error, request, response,"
-                    " usage_src, cache_read, cache_write)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " usage_src, cache_read, cache_write, run_ref)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         now,
                         str(purpose or ""),
@@ -3839,6 +3929,7 @@ class Models:
                         usage_src_s,
                         cache_read_i,
                         cache_write_i,
+                        ref,
                     ),
                 )
                 if purpose != "session.triage":
@@ -3878,6 +3969,9 @@ class Models:
             usage_known=u["known"],
             cache_read_tokens=cached,
             cache_write_tokens=0,
+            # reasoning_content 只留作日志（写 model_calls.response.reasoning），不进 text
+            reasoning=str(message.get("reasoning_content") or ""),
+            reasoning_redacted=False,
         )
 
     # ------------------------------------------------------------------

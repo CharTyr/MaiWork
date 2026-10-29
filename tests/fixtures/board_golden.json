@@ -1,0 +1,3061 @@
+{
+  "board": {
+    "hours": 24,
+    "lanes": [
+      {
+        "counts": {
+          "done": 1,
+          "failed": 2,
+          "running": 1
+        },
+        "fish_seed": "",
+        "history": [
+          {
+            "counts": {
+              "thinks": 1,
+              "tools": 1
+            },
+            "elapsed_s": 50,
+            "finished": 1799999250.0,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": 1,
+            "last_step": {
+              "text": "probe：输出",
+              "ts": 1799999230.0
+            },
+            "ok": true,
+            "phase": "",
+            "source": "main",
+            "started": 1799999200.0,
+            "status": "done",
+            "status_text": "完成了",
+            "stuck": false,
+            "title": "回答管理员",
+            "updated": 1799999250.0
+          },
+          {
+            "counts": {
+              "thinks": 0,
+              "tools": 0
+            },
+            "elapsed_s": 50,
+            "finished": 1799999150.0,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": 4,
+            "last_step": null,
+            "ok": false,
+            "phase": "",
+            "source": "main",
+            "started": 1799999100.0,
+            "status": "failed",
+            "status_text": "没做成",
+            "stuck": false,
+            "title": "复盘一轮",
+            "updated": 1799999150.0
+          },
+          {
+            "counts": {
+              "thinks": 0,
+              "tools": 0
+            },
+            "elapsed_s": 0,
+            "finished": 1799974800.0,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": 3,
+            "last_step": null,
+            "ok": false,
+            "phase": "",
+            "source": "main",
+            "started": 1799974800.0,
+            "status": "cancelled",
+            "status_text": "中断 / 取消了",
+            "stuck": false,
+            "title": "判断",
+            "updated": 1799974800.0
+          }
+        ],
+        "kind": "main",
+        "kind_title": "主模型",
+        "running": [
+          {
+            "counts": {
+              "thinks": 0,
+              "tools": 0
+            },
+            "elapsed_s": 60,
+            "finished": null,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": 2,
+            "last_step": null,
+            "ok": null,
+            "phase": "",
+            "source": "main",
+            "started": 1799999940.0,
+            "status": "running",
+            "status_text": "正在判断",
+            "stuck": false,
+            "title": "判断 @ 是不是派活",
+            "updated": 1799999940.0
+          }
+        ]
+      },
+      {
+        "counts": {
+          "done": 4,
+          "failed": 0,
+          "running": 1
+        },
+        "fish_seed": "",
+        "history": [
+          {
+            "counts": {
+              "thinks": 1,
+              "tools": 1
+            },
+            "elapsed_s": 0,
+            "finished": 1799999850.0,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": 1,
+            "last_step": {
+              "text": "打分",
+              "ts": 1799999848.0
+            },
+            "ok": true,
+            "phase": "",
+            "source": "news_batch",
+            "started": 1799999850.0,
+            "status": "done",
+            "status_text": "找完了",
+            "stuck": false,
+            "title": "找了一轮资讯，留下 3/10 条",
+            "updated": 1799999850.0
+          },
+          {
+            "counts": {
+              "thinks": 0,
+              "tools": 0
+            },
+            "elapsed_s": 0,
+            "finished": 1799999700.0,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": "h-acc",
+            "last_step": null,
+            "ok": true,
+            "phase": "verify",
+            "source": "handoff",
+            "started": 1799999700.0,
+            "status": "accepted",
+            "status_text": "已通过",
+            "stuck": false,
+            "title": "交接单 h-acc",
+            "updated": 1799999700.0
+          },
+          {
+            "counts": {
+              "thinks": 0,
+              "tools": 0
+            },
+            "elapsed_s": 0,
+            "finished": 1799999600.0,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": 2,
+            "last_step": null,
+            "ok": true,
+            "phase": "",
+            "source": "news_batch",
+            "started": 1799999600.0,
+            "status": "done",
+            "status_text": "找完了",
+            "stuck": false,
+            "title": "找了一轮资讯，这轮没有可留的",
+            "updated": 1799999600.0
+          },
+          {
+            "counts": {
+              "thinks": 0,
+              "tools": 0
+            },
+            "elapsed_s": 0,
+            "finished": 1799999500.0,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": 3,
+            "last_step": null,
+            "ok": null,
+            "phase": "",
+            "source": "news_batch",
+            "started": 1799999500.0,
+            "status": "skipped",
+            "status_text": "跳过了",
+            "stuck": false,
+            "title": "找了一轮资讯，跳过：时机不对",
+            "updated": 1799999500.0
+          }
+        ],
+        "kind": "news",
+        "kind_title": "资讯",
+        "running": [
+          {
+            "counts": {
+              "thinks": 1,
+              "tools": 1
+            },
+            "elapsed_s": 700,
+            "finished": null,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": "h-run-stuck",
+            "last_step": {
+              "text": "核验中",
+              "ts": 1799999360.0
+            },
+            "ok": null,
+            "phase": "verify",
+            "source": "handoff",
+            "started": 1799999300.0,
+            "status": "running",
+            "status_text": "正在跑",
+            "stuck": true,
+            "title": "交接单 h-run-stuck",
+            "updated": 1799999300.0
+          }
+        ]
+      },
+      {
+        "counts": {
+          "done": 3,
+          "failed": 0,
+          "running": 1
+        },
+        "fish_seed": "",
+        "history": [
+          {
+            "counts": {
+              "thinks": 1,
+              "tools": 0
+            },
+            "elapsed_s": 0,
+            "finished": 1799999840.0,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": 1,
+            "last_step": {
+              "text": "出构想",
+              "ts": 1799999835.0
+            },
+            "ok": true,
+            "phase": "",
+            "source": "idea",
+            "started": 1799999840.0,
+            "status": "new",
+            "status_text": "有了新构想",
+            "stuck": false,
+            "title": "群构想甲",
+            "updated": 1799999840.0
+          },
+          {
+            "counts": {
+              "thinks": 0,
+              "tools": 0
+            },
+            "elapsed_s": 0,
+            "finished": 1799999830.0,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": 3,
+            "last_step": null,
+            "ok": true,
+            "phase": "",
+            "source": "idea",
+            "started": 1799999830.0,
+            "status": "new",
+            "status_text": "有了新构想",
+            "stuck": false,
+            "title": "个人构想",
+            "updated": 1799999830.0
+          },
+          {
+            "counts": {
+              "thinks": 0,
+              "tools": 0
+            },
+            "elapsed_s": 0,
+            "finished": 1799999550.0,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": 2,
+            "last_step": null,
+            "ok": true,
+            "phase": "",
+            "source": "idea",
+            "started": 1799999550.0,
+            "status": "new",
+            "status_text": "有了新构想",
+            "stuck": false,
+            "title": "老构想乙",
+            "updated": 1799999550.0
+          }
+        ],
+        "kind": "idea",
+        "kind_title": "构想",
+        "running": [
+          {
+            "counts": {
+              "thinks": 0,
+              "tools": 0
+            },
+            "elapsed_s": 100,
+            "finished": null,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": "h-run",
+            "last_step": null,
+            "ok": null,
+            "phase": "",
+            "source": "handoff",
+            "started": 1799999900.0,
+            "status": "running",
+            "status_text": "正在跑",
+            "stuck": false,
+            "title": "交接单 h-run",
+            "updated": 1799999900.0
+          }
+        ]
+      },
+      {
+        "counts": {
+          "done": 2,
+          "failed": 2,
+          "running": 0
+        },
+        "fish_seed": "",
+        "history": [
+          {
+            "counts": {
+              "thinks": 1,
+              "tools": 0
+            },
+            "elapsed_s": 120,
+            "finished": null,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": "G-1",
+            "last_step": {
+              "text": "盯一眼",
+              "ts": 1799999900.0
+            },
+            "ok": null,
+            "phase": "",
+            "source": "goal",
+            "started": 1799999880.0,
+            "status": "active",
+            "status_text": "进行中",
+            "stuck": false,
+            "title": "盯住发布页",
+            "updated": 1799999880.0
+          },
+          {
+            "counts": {
+              "thinks": 0,
+              "tools": 0
+            },
+            "elapsed_s": 4870,
+            "finished": 1799999870.0,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": "G-2",
+            "last_step": null,
+            "ok": true,
+            "phase": "",
+            "source": "goal",
+            "started": 1799995000.0,
+            "status": "done",
+            "status_text": "完成了",
+            "stuck": false,
+            "title": "老目标完成",
+            "updated": 1799999870.0
+          },
+          {
+            "counts": {
+              "thinks": 0,
+              "tools": 0
+            },
+            "elapsed_s": 3860,
+            "finished": 1799999860.0,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": "G-3",
+            "last_step": null,
+            "ok": false,
+            "phase": "",
+            "source": "goal",
+            "started": 1799996000.0,
+            "status": "cancelled",
+            "status_text": "已取消",
+            "stuck": false,
+            "title": "取消了的目标",
+            "updated": 1799999860.0
+          },
+          {
+            "counts": {
+              "thinks": 0,
+              "tools": 0
+            },
+            "elapsed_s": 0,
+            "finished": 1799999500.0,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": "h-fail",
+            "last_step": null,
+            "ok": false,
+            "phase": "",
+            "source": "handoff",
+            "started": 1799999500.0,
+            "status": "failed",
+            "status_text": "没做成",
+            "stuck": false,
+            "title": "交接单 h-fail",
+            "updated": 1799999500.0
+          }
+        ],
+        "kind": "goal",
+        "kind_title": "目标",
+        "running": []
+      },
+      {
+        "counts": {
+          "done": 1,
+          "failed": 0,
+          "running": 3
+        },
+        "fish_seed": "",
+        "history": [
+          {
+            "counts": {
+              "thinks": 1,
+              "tools": 0
+            },
+            "elapsed_s": 190,
+            "finished": 1799999800.0,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": "T-done",
+            "last_step": {
+              "text": "做完了",
+              "ts": 1799999650.0
+            },
+            "ok": true,
+            "phase": "",
+            "source": "task",
+            "started": 1799999610.0,
+            "status": "done",
+            "status_text": "完成了",
+            "stuck": false,
+            "title": "任务 T-done",
+            "updated": 1799999800.0
+          }
+        ],
+        "kind": "task",
+        "kind_title": "通用任务",
+        "running": [
+          {
+            "counts": {
+              "thinks": 0,
+              "tools": 1
+            },
+            "elapsed_s": 900,
+            "finished": null,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": "T-run",
+            "last_step": {
+              "text": "web_search：输出",
+              "ts": 1799999200.0
+            },
+            "ok": null,
+            "phase": "",
+            "source": "task",
+            "started": 1799999100.0,
+            "status": "running",
+            "status_text": "正在跑",
+            "stuck": true,
+            "title": "任务 T-run",
+            "updated": 1799999100.0
+          },
+          {
+            "counts": {
+              "thinks": 0,
+              "tools": 0
+            },
+            "elapsed_s": 3600,
+            "finished": null,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": "T-wait",
+            "last_step": null,
+            "ok": null,
+            "phase": "",
+            "source": "task",
+            "started": 1799996400.0,
+            "status": "waiting_input",
+            "status_text": "等人答复",
+            "stuck": false,
+            "title": "任务 T-wait",
+            "updated": 1799996400.0
+          },
+          {
+            "counts": {
+              "thinks": 0,
+              "tools": 0
+            },
+            "elapsed_s": 7200,
+            "finished": null,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": "T-off",
+            "last_step": null,
+            "ok": null,
+            "phase": "",
+            "source": "task",
+            "started": 1799992800.0,
+            "status": "queued",
+            "status_text": "排队中",
+            "stuck": false,
+            "title": "任务 T-off",
+            "updated": 1799992800.0
+          }
+        ]
+      },
+      {
+        "counts": {
+          "done": 1,
+          "failed": 1,
+          "running": 0
+        },
+        "fish_seed": "",
+        "history": [
+          {
+            "counts": {
+              "thinks": 1,
+              "tools": 0
+            },
+            "elapsed_s": 0,
+            "finished": 1799999820.0,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": 1,
+            "last_step": {
+              "text": "开场白草稿",
+              "ts": 1799999821.0
+            },
+            "ok": true,
+            "phase": "",
+            "source": "topic",
+            "started": 1799999820.0,
+            "status": "good",
+            "status_text": "开了个话题",
+            "stuck": false,
+            "title": "在群里开了个话题",
+            "updated": 1799999820.0
+          },
+          {
+            "counts": {
+              "thinks": 0,
+              "tools": 0
+            },
+            "elapsed_s": 0,
+            "finished": 1799999540.0,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": 2,
+            "last_step": null,
+            "ok": false,
+            "phase": "",
+            "source": "topic",
+            "started": 1799999540.0,
+            "status": "bad",
+            "status_text": "没开成",
+            "stuck": false,
+            "title": "开话题没开成：没有合适候选",
+            "updated": 1799999540.0
+          }
+        ],
+        "kind": "topic",
+        "kind_title": "开话题",
+        "running": []
+      },
+      {
+        "counts": {
+          "done": 0,
+          "failed": 1,
+          "running": 0
+        },
+        "fish_seed": "seed-c",
+        "history": [
+          {
+            "counts": {
+              "thinks": 0,
+              "tools": 0
+            },
+            "elapsed_s": 0,
+            "finished": 1799999600.0,
+            "group_id": "900000001",
+            "group_name": "黄金群一",
+            "id": "h-rej",
+            "last_step": null,
+            "ok": false,
+            "phase": "",
+            "source": "handoff",
+            "started": 1799999600.0,
+            "status": "rejected",
+            "status_text": "已打回",
+            "stuck": false,
+            "title": "交接单 h-rej",
+            "updated": 1799999600.0
+          }
+        ],
+        "kind": "c_ab12cd",
+        "kind_title": "调研岗",
+        "running": []
+      }
+    ],
+    "now": 1800000000.0,
+    "stuck_after_s": 600
+  },
+  "items": {
+    "goal/G-1": {
+      "item": {
+        "counts": {
+          "thinks": 1,
+          "tools": 0
+        },
+        "elapsed_s": 120,
+        "finished": null,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": "G-1",
+        "last_step": {
+          "text": "盯一眼",
+          "ts": 1799999900.0
+        },
+        "ok": null,
+        "phase": "",
+        "source": "goal",
+        "started": 1799999880.0,
+        "status": "active",
+        "status_text": "进行中",
+        "stuck": false,
+        "title": "盯住发布页",
+        "updated": 1799999880.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：进行中",
+          "tool": "",
+          "ts": 1799999880.0,
+          "type": "status"
+        },
+        {
+          "actor": "goal",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "盯一眼",
+          "tool": "",
+          "ts": 1799999900.0,
+          "type": "think"
+        }
+      ]
+    },
+    "goal/G-2": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 4870,
+        "finished": 1799999870.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": "G-2",
+        "last_step": null,
+        "ok": true,
+        "phase": "",
+        "source": "goal",
+        "started": 1799995000.0,
+        "status": "done",
+        "status_text": "完成了",
+        "stuck": false,
+        "title": "老目标完成",
+        "updated": 1799999870.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：完成了",
+          "tool": "",
+          "ts": 1799995000.0,
+          "type": "status"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": true,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：完成了",
+          "tool": "",
+          "ts": 1799999870.0,
+          "type": "status"
+        }
+      ]
+    },
+    "goal/G-3": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 3860,
+        "finished": 1799999860.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": "G-3",
+        "last_step": null,
+        "ok": false,
+        "phase": "",
+        "source": "goal",
+        "started": 1799996000.0,
+        "status": "cancelled",
+        "status_text": "已取消",
+        "stuck": false,
+        "title": "取消了的目标",
+        "updated": 1799999860.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：已取消",
+          "tool": "",
+          "ts": 1799996000.0,
+          "type": "status"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": false,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：已取消",
+          "tool": "",
+          "ts": 1799999860.0,
+          "type": "status"
+        }
+      ]
+    },
+    "goal/G-4": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 3600,
+        "finished": 1799859600.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": "G-4",
+        "last_step": null,
+        "ok": true,
+        "phase": "",
+        "source": "goal",
+        "started": 1799856000.0,
+        "status": "done",
+        "status_text": "完成了",
+        "stuck": false,
+        "title": "太老的目标",
+        "updated": 1799859600.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：完成了",
+          "tool": "",
+          "ts": 1799856000.0,
+          "type": "status"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": true,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：完成了",
+          "tool": "",
+          "ts": 1799859600.0,
+          "type": "status"
+        }
+      ]
+    },
+    "handoff/h-acc": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 0,
+        "finished": 1799999700.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": "h-acc",
+        "last_step": null,
+        "ok": true,
+        "phase": "verify",
+        "source": "handoff",
+        "started": 1799999700.0,
+        "status": "accepted",
+        "status_text": "已通过",
+        "stuck": false,
+        "title": "交接单 h-acc",
+        "updated": 1799999700.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：已通过",
+          "tool": "",
+          "ts": 1799999700.0,
+          "type": "status"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": true,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：已通过",
+          "tool": "",
+          "ts": 1799999700.0,
+          "type": "status"
+        }
+      ]
+    },
+    "handoff/h-fail": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 0,
+        "finished": 1799999500.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": "h-fail",
+        "last_step": null,
+        "ok": false,
+        "phase": "",
+        "source": "handoff",
+        "started": 1799999500.0,
+        "status": "failed",
+        "status_text": "没做成",
+        "stuck": false,
+        "title": "交接单 h-fail",
+        "updated": 1799999500.0
+      },
+      "link": "time_window",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：没做成",
+          "tool": "",
+          "ts": 1799999500.0,
+          "type": "status"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": false,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：没做成",
+          "tool": "",
+          "ts": 1799999500.0,
+          "type": "status"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "老轮打分",
+          "tool": "",
+          "ts": 1799999590.0,
+          "type": "think"
+        },
+        {
+          "actor": "task",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "做完了",
+          "tool": "",
+          "ts": 1799999650.0,
+          "type": "think"
+        },
+        {
+          "actor": "main",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "开场白草稿",
+          "tool": "",
+          "ts": 1799999821.0,
+          "type": "think"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "出构想",
+          "tool": "",
+          "ts": 1799999835.0,
+          "type": "think"
+        },
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "web_search",
+          "ts": 1799999845.0,
+          "type": "tool"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "打分",
+          "tool": "",
+          "ts": 1799999848.0,
+          "type": "think"
+        },
+        {
+          "actor": "goal",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "盯一眼",
+          "tool": "",
+          "ts": 1799999900.0,
+          "type": "think"
+        }
+      ]
+    },
+    "handoff/h-queued": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 50,
+        "finished": null,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": "h-queued",
+        "last_step": null,
+        "ok": null,
+        "phase": "",
+        "source": "handoff",
+        "started": 1799999950.0,
+        "status": "queued",
+        "status_text": "排队中",
+        "stuck": false,
+        "title": "交接单 h-queued",
+        "updated": 1799999950.0
+      },
+      "link": "time_window",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：排队中",
+          "tool": "",
+          "ts": 1799999950.0,
+          "type": "status"
+        }
+      ]
+    },
+    "handoff/h-rej": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 0,
+        "finished": 1799999600.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": "h-rej",
+        "last_step": null,
+        "ok": false,
+        "phase": "",
+        "source": "handoff",
+        "started": 1799999600.0,
+        "status": "rejected",
+        "status_text": "已打回",
+        "stuck": false,
+        "title": "交接单 h-rej",
+        "updated": 1799999600.0
+      },
+      "link": "time_window",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：已打回",
+          "tool": "",
+          "ts": 1799999600.0,
+          "type": "status"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": false,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：已打回",
+          "tool": "",
+          "ts": 1799999600.0,
+          "type": "status"
+        },
+        {
+          "actor": "task",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "做完了",
+          "tool": "",
+          "ts": 1799999650.0,
+          "type": "think"
+        },
+        {
+          "actor": "main",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "开场白草稿",
+          "tool": "",
+          "ts": 1799999821.0,
+          "type": "think"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "出构想",
+          "tool": "",
+          "ts": 1799999835.0,
+          "type": "think"
+        },
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "web_search",
+          "ts": 1799999845.0,
+          "type": "tool"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "打分",
+          "tool": "",
+          "ts": 1799999848.0,
+          "type": "think"
+        },
+        {
+          "actor": "goal",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "盯一眼",
+          "tool": "",
+          "ts": 1799999900.0,
+          "type": "think"
+        }
+      ]
+    },
+    "handoff/h-run": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 100,
+        "finished": null,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": "h-run",
+        "last_step": null,
+        "ok": null,
+        "phase": "",
+        "source": "handoff",
+        "started": 1799999900.0,
+        "status": "running",
+        "status_text": "正在跑",
+        "stuck": false,
+        "title": "交接单 h-run",
+        "updated": 1799999900.0
+      },
+      "link": "time_window",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：正在跑",
+          "tool": "",
+          "ts": 1799999900.0,
+          "type": "status"
+        },
+        {
+          "actor": "goal",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "盯一眼",
+          "tool": "",
+          "ts": 1799999900.0,
+          "type": "think"
+        }
+      ]
+    },
+    "handoff/h-run-stuck": {
+      "item": {
+        "counts": {
+          "thinks": 1,
+          "tools": 1
+        },
+        "elapsed_s": 700,
+        "finished": null,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": "h-run-stuck",
+        "last_step": {
+          "text": "核验中",
+          "ts": 1799999360.0
+        },
+        "ok": null,
+        "phase": "verify",
+        "source": "handoff",
+        "started": 1799999300.0,
+        "status": "running",
+        "status_text": "正在跑",
+        "stuck": true,
+        "title": "交接单 h-run-stuck",
+        "updated": 1799999300.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：正在跑",
+          "tool": "",
+          "ts": 1799999300.0,
+          "type": "status"
+        },
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "web_search",
+          "ts": 1799999350.0,
+          "type": "tool"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "核验中",
+          "tool": "",
+          "ts": 1799999360.0,
+          "type": "think"
+        }
+      ]
+    },
+    "idea/1": {
+      "item": {
+        "counts": {
+          "thinks": 1,
+          "tools": 0
+        },
+        "elapsed_s": 0,
+        "finished": 1799999840.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": 1,
+        "last_step": {
+          "text": "出构想",
+          "ts": 1799999835.0
+        },
+        "ok": true,
+        "phase": "",
+        "source": "idea",
+        "started": 1799999840.0,
+        "status": "new",
+        "status_text": "有了新构想",
+        "stuck": false,
+        "title": "群构想甲",
+        "updated": 1799999840.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "出构想",
+          "tool": "",
+          "ts": 1799999835.0,
+          "type": "think"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：有了新构想",
+          "tool": "",
+          "ts": 1799999840.0,
+          "type": "status"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": true,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：有了新构想",
+          "tool": "",
+          "ts": 1799999840.0,
+          "type": "status"
+        }
+      ]
+    },
+    "idea/2": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 0,
+        "finished": 1799999550.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": 2,
+        "last_step": null,
+        "ok": true,
+        "phase": "",
+        "source": "idea",
+        "started": 1799999550.0,
+        "status": "new",
+        "status_text": "有了新构想",
+        "stuck": false,
+        "title": "老构想乙",
+        "updated": 1799999550.0
+      },
+      "link": "time_window",
+      "steps": [
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "web_search",
+          "ts": 1799999200.0,
+          "type": "tool"
+        },
+        {
+          "actor": "main",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "管理员回复",
+          "tool": "",
+          "ts": 1799999220.0,
+          "type": "think"
+        },
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "probe",
+          "ts": 1799999230.0,
+          "type": "tool"
+        },
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "web_search",
+          "ts": 1799999350.0,
+          "type": "tool"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "核验中",
+          "tool": "",
+          "ts": 1799999360.0,
+          "type": "think"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：有了新构想",
+          "tool": "",
+          "ts": 1799999550.0,
+          "type": "status"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": true,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：有了新构想",
+          "tool": "",
+          "ts": 1799999550.0,
+          "type": "status"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "老轮打分",
+          "tool": "",
+          "ts": 1799999590.0,
+          "type": "think"
+        },
+        {
+          "actor": "task",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "做完了",
+          "tool": "",
+          "ts": 1799999650.0,
+          "type": "think"
+        },
+        {
+          "actor": "main",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "开场白草稿",
+          "tool": "",
+          "ts": 1799999821.0,
+          "type": "think"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "出构想",
+          "tool": "",
+          "ts": 1799999835.0,
+          "type": "think"
+        },
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "web_search",
+          "ts": 1799999845.0,
+          "type": "tool"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "打分",
+          "tool": "",
+          "ts": 1799999848.0,
+          "type": "think"
+        },
+        {
+          "actor": "goal",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "盯一眼",
+          "tool": "",
+          "ts": 1799999900.0,
+          "type": "think"
+        }
+      ]
+    },
+    "idea/3": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 0,
+        "finished": 1799999830.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": 3,
+        "last_step": null,
+        "ok": true,
+        "phase": "",
+        "source": "idea",
+        "started": 1799999830.0,
+        "status": "new",
+        "status_text": "有了新构想",
+        "stuck": false,
+        "title": "个人构想",
+        "updated": 1799999830.0
+      },
+      "link": "time_window",
+      "steps": [
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "probe",
+          "ts": 1799999230.0,
+          "type": "tool"
+        },
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "web_search",
+          "ts": 1799999350.0,
+          "type": "tool"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "核验中",
+          "tool": "",
+          "ts": 1799999360.0,
+          "type": "think"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "老轮打分",
+          "tool": "",
+          "ts": 1799999590.0,
+          "type": "think"
+        },
+        {
+          "actor": "task",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "做完了",
+          "tool": "",
+          "ts": 1799999650.0,
+          "type": "think"
+        },
+        {
+          "actor": "main",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "开场白草稿",
+          "tool": "",
+          "ts": 1799999821.0,
+          "type": "think"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：有了新构想",
+          "tool": "",
+          "ts": 1799999830.0,
+          "type": "status"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": true,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：有了新构想",
+          "tool": "",
+          "ts": 1799999830.0,
+          "type": "status"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "出构想",
+          "tool": "",
+          "ts": 1799999835.0,
+          "type": "think"
+        },
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "web_search",
+          "ts": 1799999845.0,
+          "type": "tool"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "打分",
+          "tool": "",
+          "ts": 1799999848.0,
+          "type": "think"
+        },
+        {
+          "actor": "goal",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "盯一眼",
+          "tool": "",
+          "ts": 1799999900.0,
+          "type": "think"
+        }
+      ]
+    },
+    "main/1": {
+      "item": {
+        "counts": {
+          "thinks": 1,
+          "tools": 1
+        },
+        "elapsed_s": 50,
+        "error": "",
+        "finished": 1799999250.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": 1,
+        "last_step": {
+          "text": "probe：输出",
+          "ts": 1799999230.0
+        },
+        "ok": true,
+        "phase": "",
+        "source": "main",
+        "started": 1799999200.0,
+        "status": "done",
+        "status_text": "完成了",
+        "stuck": false,
+        "title": "回答管理员",
+        "updated": 1799999250.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：完成了",
+          "tool": "",
+          "ts": 1799999200.0,
+          "type": "status"
+        },
+        {
+          "actor": "main",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "管理员回复",
+          "tool": "",
+          "ts": 1799999220.0,
+          "type": "think"
+        },
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "probe",
+          "ts": 1799999230.0,
+          "type": "tool"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": true,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：完成了",
+          "tool": "",
+          "ts": 1799999250.0,
+          "type": "status"
+        }
+      ]
+    },
+    "main/2": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 60,
+        "error": "",
+        "finished": null,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": 2,
+        "last_step": null,
+        "ok": null,
+        "phase": "",
+        "source": "main",
+        "started": 1799999940.0,
+        "status": "running",
+        "status_text": "正在判断",
+        "stuck": false,
+        "title": "判断 @ 是不是派活",
+        "updated": 1799999940.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：正在判断",
+          "tool": "",
+          "ts": 1799999940.0,
+          "type": "status"
+        }
+      ]
+    },
+    "main/3": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 0,
+        "error": "",
+        "finished": 1799974800.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": 3,
+        "last_step": null,
+        "ok": false,
+        "phase": "",
+        "source": "main",
+        "started": 1799974800.0,
+        "status": "cancelled",
+        "status_text": "中断 / 取消了",
+        "stuck": false,
+        "title": "判断",
+        "updated": 1799974800.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：中断 / 取消了",
+          "tool": "",
+          "ts": 1799974800.0,
+          "type": "status"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": false,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：中断 / 取消了",
+          "tool": "",
+          "ts": 1799974800.0,
+          "type": "status"
+        }
+      ]
+    },
+    "main/4": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 50,
+        "error": "",
+        "finished": 1799999150.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": 4,
+        "last_step": null,
+        "ok": false,
+        "phase": "",
+        "source": "main",
+        "started": 1799999100.0,
+        "status": "failed",
+        "status_text": "没做成",
+        "stuck": false,
+        "title": "复盘一轮",
+        "updated": 1799999150.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：没做成",
+          "tool": "",
+          "ts": 1799999100.0,
+          "type": "status"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": false,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：没做成",
+          "tool": "",
+          "ts": 1799999150.0,
+          "type": "status"
+        }
+      ]
+    },
+    "news_batch/1": {
+      "item": {
+        "counts": {
+          "thinks": 1,
+          "tools": 1
+        },
+        "elapsed_s": 0,
+        "finished": 1799999850.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": 1,
+        "last_step": {
+          "text": "打分",
+          "ts": 1799999848.0
+        },
+        "ok": true,
+        "phase": "",
+        "source": "news_batch",
+        "started": 1799999850.0,
+        "status": "done",
+        "status_text": "找完了",
+        "stuck": false,
+        "title": "找了一轮资讯，留下 3/10 条",
+        "updated": 1799999850.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "web_search",
+          "ts": 1799999845.0,
+          "type": "tool"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "打分",
+          "tool": "",
+          "ts": 1799999848.0,
+          "type": "think"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：找完了",
+          "tool": "",
+          "ts": 1799999850.0,
+          "type": "status"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": true,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：找完了",
+          "tool": "",
+          "ts": 1799999850.0,
+          "type": "status"
+        }
+      ]
+    },
+    "news_batch/2": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 0,
+        "finished": 1799999600.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": 2,
+        "last_step": null,
+        "ok": true,
+        "phase": "",
+        "source": "news_batch",
+        "started": 1799999600.0,
+        "status": "done",
+        "status_text": "找完了",
+        "stuck": false,
+        "title": "找了一轮资讯，这轮没有可留的",
+        "updated": 1799999600.0
+      },
+      "link": "time_window",
+      "steps": [
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "web_search",
+          "ts": 1799999200.0,
+          "type": "tool"
+        },
+        {
+          "actor": "main",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "管理员回复",
+          "tool": "",
+          "ts": 1799999220.0,
+          "type": "think"
+        },
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "probe",
+          "ts": 1799999230.0,
+          "type": "tool"
+        },
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "web_search",
+          "ts": 1799999350.0,
+          "type": "tool"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "核验中",
+          "tool": "",
+          "ts": 1799999360.0,
+          "type": "think"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "老轮打分",
+          "tool": "",
+          "ts": 1799999590.0,
+          "type": "think"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：找完了",
+          "tool": "",
+          "ts": 1799999600.0,
+          "type": "status"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": true,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：找完了",
+          "tool": "",
+          "ts": 1799999600.0,
+          "type": "status"
+        },
+        {
+          "actor": "task",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "做完了",
+          "tool": "",
+          "ts": 1799999650.0,
+          "type": "think"
+        },
+        {
+          "actor": "main",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "开场白草稿",
+          "tool": "",
+          "ts": 1799999821.0,
+          "type": "think"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "出构想",
+          "tool": "",
+          "ts": 1799999835.0,
+          "type": "think"
+        },
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "web_search",
+          "ts": 1799999845.0,
+          "type": "tool"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "打分",
+          "tool": "",
+          "ts": 1799999848.0,
+          "type": "think"
+        },
+        {
+          "actor": "goal",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "盯一眼",
+          "tool": "",
+          "ts": 1799999900.0,
+          "type": "think"
+        }
+      ]
+    },
+    "news_batch/3": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 0,
+        "finished": 1799999500.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": 3,
+        "last_step": null,
+        "ok": null,
+        "phase": "",
+        "source": "news_batch",
+        "started": 1799999500.0,
+        "status": "skipped",
+        "status_text": "跳过了",
+        "stuck": false,
+        "title": "找了一轮资讯，跳过：时机不对",
+        "updated": 1799999500.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：跳过了",
+          "tool": "",
+          "ts": 1799999500.0,
+          "type": "status"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：跳过了",
+          "tool": "",
+          "ts": 1799999500.0,
+          "type": "status"
+        }
+      ]
+    },
+    "news_batch/4": null,
+    "news_batch/5": null,
+    "task/T-done": {
+      "item": {
+        "counts": {
+          "thinks": 1,
+          "tools": 0
+        },
+        "elapsed_s": 190,
+        "finished": 1799999800.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": "T-done",
+        "last_step": {
+          "text": "做完了",
+          "ts": 1799999650.0
+        },
+        "ok": true,
+        "phase": "",
+        "source": "task",
+        "started": 1799999610.0,
+        "status": "done",
+        "status_text": "完成了",
+        "stuck": false,
+        "title": "任务 T-done",
+        "updated": 1799999800.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：完成了",
+          "tool": "",
+          "ts": 1799999610.0,
+          "type": "status"
+        },
+        {
+          "actor": "task",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "做完了",
+          "tool": "",
+          "ts": 1799999650.0,
+          "type": "think"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": true,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：完成了",
+          "tool": "",
+          "ts": 1799999800.0,
+          "type": "status"
+        }
+      ]
+    },
+    "task/T-off": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 7200,
+        "finished": null,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": "T-off",
+        "last_step": null,
+        "ok": null,
+        "phase": "",
+        "source": "task",
+        "started": 1799992800.0,
+        "status": "queued",
+        "status_text": "排队中",
+        "stuck": false,
+        "title": "任务 T-off",
+        "updated": 1799992800.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：排队中",
+          "tool": "",
+          "ts": 1799992800.0,
+          "type": "status"
+        }
+      ]
+    },
+    "task/T-old": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 3600,
+        "finished": 1799895600.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": "T-old",
+        "last_step": null,
+        "ok": true,
+        "phase": "",
+        "source": "task",
+        "started": 1799892000.0,
+        "status": "done",
+        "status_text": "完成了",
+        "stuck": false,
+        "title": "任务 T-old",
+        "updated": 1799895600.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：完成了",
+          "tool": "",
+          "ts": 1799892000.0,
+          "type": "status"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": true,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：完成了",
+          "tool": "",
+          "ts": 1799895600.0,
+          "type": "status"
+        }
+      ]
+    },
+    "task/T-run": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 1
+        },
+        "elapsed_s": 900,
+        "finished": null,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": "T-run",
+        "last_step": {
+          "text": "web_search：输出",
+          "ts": 1799999200.0
+        },
+        "ok": null,
+        "phase": "",
+        "source": "task",
+        "started": 1799999100.0,
+        "status": "running",
+        "status_text": "正在跑",
+        "stuck": true,
+        "title": "任务 T-run",
+        "updated": 1799999100.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：正在跑",
+          "tool": "",
+          "ts": 1799999100.0,
+          "type": "status"
+        },
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "web_search",
+          "ts": 1799999200.0,
+          "type": "tool"
+        }
+      ]
+    },
+    "task/T-wait": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 3600,
+        "finished": null,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": "T-wait",
+        "last_step": null,
+        "ok": null,
+        "phase": "",
+        "source": "task",
+        "started": 1799996400.0,
+        "status": "waiting_input",
+        "status_text": "等人答复",
+        "stuck": false,
+        "title": "任务 T-wait",
+        "updated": 1799996400.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：等人答复",
+          "tool": "",
+          "ts": 1799996400.0,
+          "type": "status"
+        }
+      ]
+    },
+    "topic/1": {
+      "item": {
+        "counts": {
+          "thinks": 1,
+          "tools": 0
+        },
+        "elapsed_s": 0,
+        "finished": 1799999820.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": 1,
+        "last_step": {
+          "text": "开场白草稿",
+          "ts": 1799999821.0
+        },
+        "ok": true,
+        "phase": "",
+        "source": "topic",
+        "started": 1799999820.0,
+        "status": "good",
+        "status_text": "开了个话题",
+        "stuck": false,
+        "title": "在群里开了个话题",
+        "updated": 1799999820.0
+      },
+      "link": "exact",
+      "steps": [
+        {
+          "actor": "Jev",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": true,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "Jev 判断：可以开（ok=0.90），群里冷了一会儿了，候选「候选话题甲」对得上",
+          "tool": "",
+          "ts": 1799999819.0,
+          "type": "think"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：开了个话题",
+          "tool": "",
+          "ts": 1799999820.0,
+          "type": "status"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": true,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：开了个话题",
+          "tool": "",
+          "ts": 1799999820.0,
+          "type": "status"
+        },
+        {
+          "actor": "main",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "开场白草稿",
+          "tool": "",
+          "ts": 1799999821.0,
+          "type": "think"
+        }
+      ]
+    },
+    "topic/2": {
+      "item": {
+        "counts": {
+          "thinks": 0,
+          "tools": 0
+        },
+        "elapsed_s": 0,
+        "finished": 1799999540.0,
+        "group_id": "900000001",
+        "group_name": "黄金群一",
+        "id": 2,
+        "last_step": null,
+        "ok": false,
+        "phase": "",
+        "source": "topic",
+        "started": 1799999540.0,
+        "status": "bad",
+        "status_text": "没开成",
+        "stuck": false,
+        "title": "开话题没开成：没有合适候选",
+        "updated": 1799999540.0
+      },
+      "link": "time_window",
+      "steps": [
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": null,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "开始：没开成",
+          "tool": "",
+          "ts": 1799999540.0,
+          "type": "status"
+        },
+        {
+          "actor": "",
+          "error": "",
+          "input": "",
+          "model": "",
+          "ms": 0,
+          "ok": false,
+          "output": "",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "结束：没开成",
+          "tool": "",
+          "ts": 1799999540.0,
+          "type": "status"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "老轮打分",
+          "tool": "",
+          "ts": 1799999590.0,
+          "type": "think"
+        },
+        {
+          "actor": "task",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "做完了",
+          "tool": "",
+          "ts": 1799999650.0,
+          "type": "think"
+        },
+        {
+          "actor": "main",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "开场白草稿",
+          "tool": "",
+          "ts": 1799999821.0,
+          "type": "think"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "出构想",
+          "tool": "",
+          "ts": 1799999835.0,
+          "type": "think"
+        },
+        {
+          "actor": "子 agent",
+          "error": "",
+          "input": "输入",
+          "model": "",
+          "ms": 10,
+          "ok": true,
+          "output": "输出",
+          "reasoning": "",
+          "reasoning_redacted": false,
+          "text": "",
+          "tool": "web_search",
+          "ts": 1799999845.0,
+          "type": "tool"
+        },
+        {
+          "actor": "news",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "打分",
+          "tool": "",
+          "ts": 1799999848.0,
+          "type": "think"
+        },
+        {
+          "actor": "goal",
+          "error": "",
+          "input": "",
+          "model": "m1",
+          "ms": 20,
+          "ok": true,
+          "output": "",
+          "reasoning": "想的过程",
+          "reasoning_redacted": false,
+          "text": "盯一眼",
+          "tool": "",
+          "ts": 1799999900.0,
+          "type": "think"
+        }
+      ]
+    }
+  }
+}

@@ -61,6 +61,21 @@ PURPOSE_NAMES: dict[str, str] = {
     "personal.post": "写个人向帖子",
     "opener": "开场白",
     "reminder_parse": "解析提醒",
+    "admin_chat": "回答管理员",
+    "intake.quick_judge": "派活快速判断",
+    "session.classify": "工作会话判断",
+    "session.triage": "会话入口分流",
+    "approvals.auto_review": "自动审查",
+    "approvals.goal_fit": "目标匹配判断",
+    "personal.post_check": "个人向内容检查",
+    "feeds.mention_judge": "反馈复盘判断",
+    "feeds.auto_push_fit": "自动订阅适配",
+    "feeds.source_map": "来源地图整理",
+    "card_push.idea_guard": "构想提一嘴把关",
+    "card_push.idea_mention": "写构想提一嘴",
+    "news_viz.pick": "挑资讯图解",
+    "skills_reflect.task": "整理干活经验",
+    "skills_curate.task": "归拢干活做法",
 }
 
 

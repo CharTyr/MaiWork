@@ -4718,10 +4718,8 @@ class Coordinator:
 
     @staticmethod
     def _sp_agents_of(specialists: Any) -> Any:
-        agents = getattr(specialists, "_agents", None)
-        if agents is None:
-            agents = getattr(specialists, "agents", None)
-        return agents
+        from .specialists import agents_of
+        return agents_of(specialists)
 
     def _settle_job_specialist_handoffs(
         self, gid: str, reports: Any, *, accepted: bool, why: str,
@@ -7115,7 +7113,7 @@ class Coordinator:
                     self._check_goal_fail(goal_id, f"目标检查失败：{msg}")
                     _report_error(self._store, self._outbox, gid, f"目标检查失败：{msg}", clock.now())
             except Exception:
-                pass
+                logger.exception("目标 %s 记检查失败 / 报错时自身出错（原因 %s）", goal_id, msg)
             return
         except (ValueError, TypeError) as e:
             if not self._goal_is_active(goal_id, gid):
@@ -7179,7 +7177,7 @@ class Coordinator:
                 hours = self._clamp_check_hours(data.get("next_check_hours"))
             self._goals.set_next_check(goal_id, clock.now() + int(hours * 3600))
         except Exception:
-            pass
+            logger.exception("目标 %s 推后下次检查失败，到期可能反复跑", goal_id)
 
         # 新建下级任务 + 立刻 run_task
         new_task = data.get("new_task")
@@ -7751,10 +7749,8 @@ class Coordinator:
 
     @staticmethod
     def _sp_agents_of_coordinator(specialists: Any) -> Any:
-        agents = getattr(specialists, "_agents", None)
-        if agents is None:
-            agents = getattr(specialists, "agents", None)
-        return agents
+        from .specialists import agents_of
+        return agents_of(specialists)
 
     def _role_enabled(self, gid: str, kind: str) -> bool:
         """服务群 + 岗位 enabled 复核（任何 worker / 模型调用前）；没挂上 specialists → False。"""

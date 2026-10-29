@@ -13,6 +13,7 @@ import { syncHash } from "./router.js";
 import { appearanceSheet } from "./theme.js";
 import { socialCookieSheet } from "./settings/social.js";
 import { sfx } from "./sound.js";
+import { boardItemSheet } from "./board.js";
 
 function loginSheet() {
   if (isGA())
@@ -93,6 +94,7 @@ function sheetHTML(kind) {
   if (kind === "login") return loginSheet();
   if (kind === "edit") return editSheet();
   if (kind === "handoff") return handoffSheet();
+  if (kind === "board-item") return boardItemSheet();
   return detailHTML();
 }
 
@@ -149,6 +151,11 @@ export function closeSheet() {
     state.detail = null;
     syncHash();
     renderView();
+  }
+  if (state.sheet === "board-item") {
+    state.boardItem = null;
+    state.boardOpen = {};
+    if (state.page === "board") renderView();
   }
   state.sheet = null;
   draft.models = null;

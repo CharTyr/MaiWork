@@ -666,6 +666,15 @@ class MaiWorkApp:
         interrupted = self.tasks.interrupt_orphaned()
         if interrupted:
             logger.warning("恢复时发现 %d 个执行中断的任务，已暂停待核对", interrupted)
+        # 上次进程留下的主模型条目 running：同一进程内没人会来收尾 → 标 cancelled
+        try:
+            from . import main_run
+            orphans = main_run.MainRuns(self.store).close_orphans(
+                reason="插件重启 / 热重载中断，没来得及收尾")
+            if orphans:
+                logger.warning("恢复时发现 %d 条没收尾的主模型条目，已标中断", orphans)
+        except Exception:
+            logger.exception("收尾遗留主模型条目出错")
         self.goals = Goals(self.store, self.get_settings)
         self.sessions = Sessions(self.store)
         self.approvals = Approvals(self.store, self.get_settings, self.tasks, self.goals, sessions=self.sessions)
@@ -3558,8 +3567,12 @@ class MaiWorkApp:
         uid = str(due[0])
 
         async def _runner() -> None:
+            from . import main_run
             try:
-                await personal.prepare_personal(str(gid), uid)
+                # 个人向一轮（关注点 + 打分 + 写帖子，可能多次调模型）并进同一条 main_runs
+                async with main_run.MainRuns(self.store).scope(
+                        group_id=str(gid), purpose="personal.focus", title="个人向资讯一轮"):
+                    await personal.prepare_personal(str(gid), uid)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -3722,15 +3735,19 @@ class MaiWorkApp:
         # rss_transport（测试里是 MockTransport；线上 None = 真实网络，走 rss.py 的安全取法）。
         # search 只给每周的「找来源」搜索用（不占资讯搜索名额）。
         rss_transport = getattr(getattr(self, "feeds", None), "_rss_transport", None)
-        out = await feedback_jobs.run(
-            self.store, self.models, gid, _now(), profiles=self.profiles,
-            scrub=lambda g, text: scrub(g, text, self.store),
-            agents=self.agents,
-            transport=rss_transport,
-            search=getattr(self, "search", None),
-            # 资讯关闭：跳过自动订阅 / 退订 / 来源发现（资讯专属），其余共享分支照跑
-            news_enabled=self._feature_on(gid, "news"),
-        )
+        # 这一轮（反馈 + 口味 + 做事经验 + 自动订阅，可能多次调模型）并进同一条 main_runs
+        from . import main_run
+        async with main_run.MainRuns(self.store).scope(
+                group_id=gid, purpose="feeds.mention_judge", title="反馈 / 订阅复盘一轮"):
+            out = await feedback_jobs.run(
+                self.store, self.models, gid, _now(), profiles=self.profiles,
+                scrub=lambda g, text: scrub(g, text, self.store),
+                agents=self.agents,
+                transport=rss_transport,
+                search=getattr(self, "search", None),
+                # 资讯关闭：跳过自动订阅 / 退订 / 来源发现（资讯专属），其余共享分支照跑
+                news_enabled=self._feature_on(gid, "news"),
+            )
         if out.get("mentions") or out.get("taste") or out.get("lessons") or out.get("auto"):
             logger.info("反馈 / 口味 / 做事经验 / 自动订阅（群 %s）：%s", gid, out)
 

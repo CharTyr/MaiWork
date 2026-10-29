@@ -1253,6 +1253,95 @@ body.booting .app, body.booting .tabbar { visibility: hidden; }
 
 /* ───────────── 和 MaiWork 聊 ───────────── */
 .round-btn.left { right: auto; left: 20px; }
+.round-btn.second { top: calc(92px + var(--safe-t)); width: 52px; height: 52px; }
+.round-btn.second svg { width: 24px; height: 24px; }
+
+/* ───────────── 看板（只总管理员，只看） ─────────────
+   每个专岗一栏平铺。看板是例外：主区不限 620px、桌面不留右栏，好让几栏并排一眼看完。 */
+body.on-board .view { max-width: none; }
+@media (min-width: 1180px) {
+  body.on-board .app { grid-template-columns: 268px minmax(0, 1fr); max-width: none; }
+  body.on-board .side { display: none; }
+}
+.board-head .filters { margin-top: 14px; }
+.board-fish { display: grid; place-items: center; width: 44px; height: 44px; flex: none; }
+.board-fish svg { display: block; max-width: 100%; height: auto; }
+.lanes {
+  margin-top: 22px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+.lane { min-width: 0; padding: 14px 14px 10px; border-radius: 22px; background: var(--fill-2); border: 1px solid var(--line); }
+.lane.busy { background: var(--card); box-shadow: 0 6px 18px rgba(var(--sh), 0.06); }
+.lane-h { display: flex; align-items: center; gap: 10px; padding-bottom: 6px; }
+.lane-ht { min-width: 0; display: grid; }
+.lane-ht b { font-size: 18px; font-weight: 800; line-height: 1.3; }
+.lane-ht > span { font-size: 13px; color: var(--gray); }
+.lane-sec { margin: 12px 2px 6px; font-size: 12.5px; font-weight: 700; color: var(--gray); }
+.lane-empty { padding: 4px 2px 6px; font-size: 13.5px; color: var(--gray); }
+.bcard {
+  width: 100%;
+  display: block;
+  margin-bottom: 8px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  text-align: left;
+  transition: border-color 0.2s, transform 0.18s var(--ease-out);
+}
+.bcard:hover { border-color: var(--gray-2); }
+.bcard:active { transform: scale(0.985); }
+.bcard.selected { border-color: var(--blue); box-shadow: 0 0 0 1px var(--blue); }
+.bcard:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.bcard-top { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--gray); min-width: 0; }
+.bcard-st { font-weight: 700; color: var(--ink-2); flex: none; }
+.bcard-g { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bcard-t { margin-top: 4px; font-size: 15px; font-weight: 700; line-height: 1.4; overflow-wrap: anywhere; }
+.bcard-last { margin-top: 6px; padding: 6px 8px; border-radius: 9px; background: var(--fill-2); font-size: 13px; line-height: 1.45; color: var(--ink-2); overflow-wrap: anywhere; }
+.bcard-last span { margin-right: 6px; font-family: var(--mono); font-size: 12px; color: var(--gray); }
+.bcard-m { margin-top: 5px; font-size: 12.5px; color: var(--gray); }
+/* 过程抽屉：桌面加宽，放得下工具输入输出 */
+@media (min-width: 760px) { body.on-board .sheet { width: min(760px, 96vw); } }
+.bi-h { display: flex; align-items: center; gap: 12px; }
+.bi-h .h-page { margin-top: 2px; font-size: 24px; line-height: 1.3; overflow-wrap: anywhere; }
+.bi-k { font-size: 13px; color: var(--gray); }
+.bi-meta { margin-top: 10px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 13.5px; color: var(--ink-2); }
+.steps { list-style: none; margin: 8px 0 0; padding: 0; border-left: 2px solid var(--line); }
+.st { position: relative; padding: 8px 0 10px 16px; }
+.st::before { content: ""; position: absolute; left: -6px; top: 15px; width: 10px; height: 10px; border-radius: 50%; background: var(--gray-2); border: 2px solid var(--card); }
+.st-tool::before { background: var(--blue); }
+.st-think::before { background: var(--purple); }
+.st.bad::before { background: var(--red); }
+.st-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-size: 14px; }
+.st-time { font-family: var(--mono); font-size: 12px; color: var(--gray); }
+.st-badge { padding: 1px 7px; border-radius: 6px; background: var(--fill); font-size: 12px; font-weight: 700; color: var(--ink-2); }
+.st-badge.tool { color: var(--blue); }
+.st-badge.think { color: var(--purple); }
+.st-name { font-family: var(--mono); font-size: 13.5px; overflow-wrap: anywhere; }
+.st-sub { font-size: 12.5px; color: var(--gray); overflow-wrap: anywhere; }
+.st-io { margin-top: 6px; }
+.st-io summary { cursor: pointer; font-size: 13px; color: var(--blue); }
+.st-l { margin: 8px 0 3px; font-size: 12px; font-weight: 700; color: var(--gray); }
+.steps pre, .st-text {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 320px;
+  overflow: auto;
+  border-radius: 10px;
+  background: var(--fill-2);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.st-text { margin-top: 6px; font-family: inherit; font-size: 13.5px; color: var(--ink-2); }
+.st-why { color: var(--gray); font-style: normal; border-left: 3px solid var(--purple); }
+.st-reason summary { color: var(--purple); }
+.st-why-note { margin-top: 6px; display: block; }
 .chat-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .chat-tools { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
 .chat-group { height: 34px; padding: 0 30px 0 12px; border-radius: 999px; border: 1px solid var(--line); background: var(--fill-2); font: inherit; font-size: 13px; font-weight: 600; color: var(--ink); max-width: 220px; }

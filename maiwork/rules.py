@@ -624,6 +624,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     _F("console.listen", "监听地址", "格式为 IP:端口。", "str", check=_check_listen),
     _F("console.password", "管理密码", "", "secret"),
     _F("console.public_url", "公开网址", "用于生成群链接，例如 https://maiwork.example.com。", "str", check=_check_public_url),
+    _F("console.board_hours", "看板时间范围", "看板「最近」一栏显示多少小时内的记录。", "int", min=1, max=168),
     _F("console.herenow_share", "用 here.now 自动公开", "没填公开网址时，群友要看的页面自动发到 here.now 公开页，拿到链接的人都能看，24 小时后失效。", "bool"),
     _F("console.update_check", "检查更新", "有新版本时在网页中提示。", "bool"),
     _F("console.maibot_webui_url", "MaiBot 网址", "填写后，更新提示中可直接跳转，例如 http://127.0.0.1:8001。", "str", check=_check_public_url),
