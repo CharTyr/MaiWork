@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import clock, members
+from . import clock, members, run_ref
 from . import group_features
 from .config import Settings, load_settings
 from .environments import vm_platforms
@@ -2853,15 +2853,21 @@ class MaiWorkApp:
             return
         if not (asyncio.iscoroutine(awaitable) or isinstance(awaitable, asyncio.Future)):
             return
+        # 交出去就不管的协程：先清掉继承来的轮标记（已建好的 Task / Future 原样登记）
+        coro = run_ref.detached(awaitable) if asyncio.iscoroutine(awaitable) else awaitable
         try:
-            task = asyncio.ensure_future(awaitable, loop=asyncio.get_running_loop())
+            task = asyncio.ensure_future(coro, loop=asyncio.get_running_loop())
         except RuntimeError:
+            if coro is not awaitable:
+                coro.close()
             # 没有运行中的事件循环：关掉协程防告警
             if asyncio.iscoroutine(awaitable):
                 awaitable.close()
             return
         except Exception:
             logger.exception("后台派工出错（%s）", name)
+            if coro is not awaitable:
+                coro.close()
             if asyncio.iscoroutine(awaitable):
                 awaitable.close()
             return
@@ -3536,6 +3542,7 @@ class MaiWorkApp:
         uid = str(due[0])
 
         async def _runner() -> None:
+            run_ref.detach()
             try:
                 await personas.refresh(str(gid), uid)
             except asyncio.CancelledError:
@@ -4084,6 +4091,7 @@ class MaiWorkApp:
             return
 
         async def _runner() -> None:
+            run_ref.detach()  # 别带着起它的那一轮（如管理员对话）的标记跑完整个长活
             cancelled = False
             try:
                 await fn(gid)

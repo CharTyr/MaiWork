@@ -49,8 +49,8 @@
 - 上下文窗口 / 最大输出：`limits_for(kind)` = 岗位首选候选条目的值；旧四槽兜底
   用 `Settings.models` 的旧全局值。压缩（workers/coordinator/admin_chat）先问它。
 - 每次尝试（含失败）写一条 usage + 一条 model_calls（管理员网页看，docs/07 §9）。
-- 思考链只进日志（2026-10）：openai reasoning_content（流式+非流式）、anthropic
-  thinking 块、responses reasoning item 的 summary → model_calls.response.reasoning
+- 思考链只进日志（2026-10）：openai reasoning_content / reasoning（流式+非流式）、anthropic
+  thinking 块、responses reasoning item 的 summary / reasoning_text → model_calls.response.reasoning
   （截 ≤8000，超长带「…（已截断）」；redacted/加密的思考不存内容记
   reasoning_redacted: true）。绝不进 ChatResult.text、不回传模型、不改请求体。
 """
@@ -1344,12 +1344,19 @@ def _parse_responses_response(data: Any, model: str) -> "ChatResult":
                 "function": {"name": name, "arguments": str(item.get("arguments") or "")},
             })
         elif itype == "reasoning":
-            # reasoning item 只留作日志：收 summary 里的 summary_text；
-            # 有的端点把加密内容放 content 字段（不存内容，只记 redacted）
+            # reasoning item 只留作日志：收 summary 里的 summary_text，和 content 里明文的
+            # reasoning_text（开源推理模型 / 兼容端点给的完整思考）；加密思考在
+            # encrypted_content，content 里别的形状也当加密——都不存内容，只记 redacted
+            readable = False
             for part in item.get("summary") or []:
                 if isinstance(part, dict) and part.get("type") == "summary_text":
                     reasoning_parts.append(str(part.get("text") or ""))
-            if item.get("content"):
+            content = item.get("content")
+            for part in content if isinstance(content, list) else []:
+                if isinstance(part, dict) and part.get("type") == "reasoning_text":
+                    reasoning_parts.append(str(part.get("text") or ""))
+                    readable = True
+            if item.get("encrypted_content") or (content and not readable):
                 reasoning_redacted = True
         # refusal 等其它 item 不进结果
     usage_raw = data.get("usage")
@@ -1461,6 +1468,18 @@ class ChatResult:
     # redacted/加密的 thinking 不存内容，记 reasoning_redacted。
     reasoning: str = ""
     reasoning_redacted: bool = False
+
+
+def _reasoning_of(message: Any) -> str:
+    """chat completions 回复里的思考文字：reasoning_content（DeepSeek 等），
+    没有就看 reasoning（OpenRouter / 新版 vLLM）；不是字符串的不认。"""
+    if not isinstance(message, dict):
+        return ""
+    for key in ("reasoning_content", "reasoning"):
+        v = message.get(key)
+        if isinstance(v, str) and v:
+            return v
+    return ""
 
 
 def _usage_fields(usage: Any, prompt_key: str, completion_key: str) -> dict[str, Any]:
@@ -3712,8 +3731,11 @@ class Models:
                         role = str(delta["role"])
                     if isinstance(delta.get("content"), str):
                         text_parts.append(delta["content"])
-                    # reasoning_content 分段累计（只留作日志，不进结果文本）
+                    # reasoning_content 分段累计（只留作日志，不进结果文本）；
+                    # OpenRouter / 新版 vLLM 叫 reasoning，两个都给时只认一个，免得拼两遍
                     rc = delta.get("reasoning_content")
+                    if not isinstance(rc, str) or not rc:
+                        rc = delta.get("reasoning")
                     if isinstance(rc, str) and rc:
                         reasoning_parts.append(rc)
                     for pos, tc in enumerate(delta.get("tool_calls") or []):
@@ -3970,7 +3992,7 @@ class Models:
             cache_read_tokens=cached,
             cache_write_tokens=0,
             # reasoning_content 只留作日志（写 model_calls.response.reasoning），不进 text
-            reasoning=str(message.get("reasoning_content") or ""),
+            reasoning=_reasoning_of(message),
             reasoning_redacted=False,
         )
 

@@ -26,6 +26,12 @@ except Exception:  # main_run 模块缺席的半截环境：不挡看板
     _STALE_S = 6 * 3600
 
 
+def _visible(ctx: Ctx, r: Any) -> bool:
+    """服务群的条目，或不属于任何群的（不聚焦群的管理员对话等，group_id 空）。"""
+    gid = str(r["group_id"] or "")
+    return not gid or gid in ctx.served
+
+
 def _row_to_item(r: Any, now: float) -> dict[str, Any]:
     started = _f(r["started"])
     finished = _f(r["finished"])
@@ -67,7 +73,7 @@ def active(ctx: Ctx) -> list[dict[str, Any]]:
         " FROM main_runs WHERE status='running' ORDER BY started DESC",
         (),
     ):
-        if str(r["group_id"] or "") not in ctx.served:
+        if not _visible(ctx, r):
             continue
         started = _f(r["started"])
         if ctx.now - started > _STALE_S:
@@ -83,11 +89,12 @@ def finished(ctx: Ctx, since: float) -> list[dict[str, Any]]:
         "SELECT id, group_id, purpose, title, status, started, finished, ok, error, ref"
         " FROM main_runs"
         " WHERE (status != 'running' AND COALESCE(NULLIF(finished,0), started) >= ?)"
-        "    OR (status = 'running' AND started <= ?)"
+        "    OR (status = 'running' AND started <= ? AND started >= ?)"
         " ORDER BY started DESC LIMIT 4000",
-        (since, stale_before),
+        # 过期 running 显示成「在 started 那刻中断」，跟别的历史一样受时间窗限制
+        (since, stale_before, since),
     ):
-        if str(r["group_id"] or "") not in ctx.served:
+        if not _visible(ctx, r):
             continue
         out.append(_row_to_item(r, ctx.now))
     return out
@@ -105,6 +112,6 @@ def get(ctx: Ctx, item_id: Any) -> dict[str, Any] | None:
     )
     if r is None:
         return None
-    if str(r["group_id"] or "") not in ctx.served:
+    if not _visible(ctx, r):
         return None
     return _row_to_item(r, ctx.now)

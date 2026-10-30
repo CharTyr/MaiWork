@@ -38,7 +38,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from . import clock, members, rules
+from . import clock, members, rules, run_ref
 from .tools import Tool, ToolContext, ToolResult, Tools
 
 logger = logging.getLogger("maiwork.tools_admin")
@@ -51,7 +51,8 @@ _BG_TASKS: set[asyncio.Task] = set()
 def _spawn_bg(coro: Awaitable[Any]) -> None:
     """起后台任务并登记；没有运行中的事件循环时抛 RuntimeError（协程已关掉）。"""
     try:
-        task = asyncio.get_running_loop().create_task(coro)
+        # 后台活不跟着这一轮管理员对话的标记跑（那一轮早收尾了，调用会挂错条目）
+        task = asyncio.get_running_loop().create_task(_detached(coro))
     except RuntimeError:
         close = getattr(coro, "close", None)
         if callable(close):
@@ -60,6 +61,11 @@ def _spawn_bg(coro: Awaitable[Any]) -> None:
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
     task.add_done_callback(_log_bg_exception)
+
+
+async def _detached(coro: Awaitable[Any]) -> Any:
+    run_ref.detach()
+    return await coro
 
 
 def _log_bg_exception(task: asyncio.Task) -> None:

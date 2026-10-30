@@ -179,7 +179,9 @@ class Ctx:
                   "trace", "_extra_think", "_finished_ts"):
             out.pop(k, None)
         out["title"] = _clip(out.get("title") or "")
-        out["group_name"] = self.group_name(out.get("group_id") or "")
+        gid = str(out.get("group_id") or "")
+        # 不属于任何群（不聚焦的管理员对话）：留空，别兜成占位的「群」
+        out["group_name"] = self.group_name(gid) if gid else ""
         if "elapsed_s" not in out:
             # 结束了 = 用时（finished − started）；没结束 = 已做多久（now − started）
             end = _f(out.get("finished")) or self.now

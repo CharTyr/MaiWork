@@ -2448,7 +2448,9 @@ class ConsoleServer:
             forbid = self._require_admin(request)
             if forbid is not None:
                 return forbid
-            data = board.board_view(svc, hours=request.query.get("hours"))
+            # 七类来源 + 批量计数，网页每 10 秒拉一次：放线程里跑，不卡事件循环（同用量历史；
+            # 别的线程里 store.read() 拿的是只读连接）
+            data = await asyncio.to_thread(board.board_view, svc, hours=request.query.get("hours"))
             return web.json_response(data)
 
         @get("/api/board/items/{source}/{id}")
@@ -2461,7 +2463,8 @@ class ConsoleServer:
             forbid = self._require_admin(request)
             if forbid is not None:
                 return forbid
-            data = board.item_view(
+            data = await asyncio.to_thread(
+                board.item_view,
                 svc,
                 request.match_info.get("source"),
                 request.match_info.get("id"),

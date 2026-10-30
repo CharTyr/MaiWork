@@ -67,6 +67,8 @@ const fishOf = (kind, size, opts = {}) => {
   return `<span class="board-fish" aria-hidden="true">${fishSvg(`agent:${kind}:${seed}`, { size, ...opts })}</span>`;
 };
 const gName = (x) => x.group_name || x.group_id || "";
+// 点开的那件来自 data-id（字符串），列表里资讯 / 构想 / 话题 / 主模型的 id 是数字：按字符串比
+const sameItem = (a, source, id) => a.source === source && String(a.id) === String(id);
 const dotOf = (x) => (x.stuck ? "waiting" : !x.finished && x.ok == null ? "running" : x.ok === false ? "failed" : x.ok === true ? "done" : "");
 
 function counts(x) {
@@ -80,7 +82,7 @@ function counts(x) {
 function card(lane, x, live) {
   const now = (state.board && state.board.now) || 0;
   const quiet = now - (x.updated || x.started || now);
-  const sel = state.boardItem && state.boardItem.source === x.source && state.boardItem.id === x.id;
+  const sel = state.boardItem && sameItem(state.boardItem, x.source, x.id);
   const meta = live
     ? `已做 ${dur(x.elapsed_s)}${x.stuck ? ` · <b class="warn-t">${dur(quiet)}没有进展</b>` : ""}`
     : `${esc(when(x.finished || x.updated))} · 用时 ${dur(x.elapsed_s)}`;
@@ -185,6 +187,6 @@ export function boardItemSheet() {
 
 // 列表里这件的最新概况（明细还没取回时先用它）
 export function boardBriefOf(source, id) {
-  for (const l of (state.board && state.board.lanes) || []) for (const x of [...(l.running || []), ...(l.history || [])]) if (x.source === source && x.id === id) return x;
+  for (const l of (state.board && state.board.lanes) || []) for (const x of [...(l.running || []), ...(l.history || [])]) if (sameItem(x, source, id)) return x;
   return null;
 }

@@ -147,10 +147,12 @@ def _last_into(ctx: Ctx, out: dict[str, dict[str, Any]], kind: str, values: list
     if not values:
         return
     marks = ",".join("?" * len(values))
+    # 每件只要最后一条：SQLite 的 MAX() 聚合会让同一行的其它列取 ts 最大那行的值，
+    # 不用把每件的全部行（model_calls.response 一行就几十 KB）拉回来再挑——列表每 10 秒刷一次
     try:
         for r in ctx.conn.execute(
-            f"SELECT {kind}, ts, tool, output FROM tool_calls"
-            f" WHERE {kind} IN ({marks}) ORDER BY ts DESC",
+            f"SELECT {kind}, MAX(ts) AS ts, tool, output FROM tool_calls"
+            f" WHERE {kind} IN ({marks}) GROUP BY {kind}",
             tuple(values),
         ).fetchall():
             key = f"{kind}:{r[kind]}"
@@ -161,8 +163,8 @@ def _last_into(ctx: Ctx, out: dict[str, dict[str, Any]], kind: str, values: list
         pass
     try:
         for r in ctx.conn.execute(
-            f"SELECT {kind}, ts, response FROM model_calls"
-            f" WHERE {kind} IN ({marks}) ORDER BY ts DESC",
+            f"SELECT {kind}, MAX(ts) AS ts, response FROM model_calls"
+            f" WHERE {kind} IN ({marks}) GROUP BY {kind}",
             tuple(values),
         ).fetchall():
             key = f"{kind}:{r[kind]}"
