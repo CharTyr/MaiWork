@@ -66,7 +66,7 @@ def _norm_accounts(values: object, field_zh: str, problems: list[str]) -> tuple[
     for v in (values or []):
         n = norm_account(v)
         if not n:
-            problems.append(f"[approval] {field_zh}里的 {v!r} 认不出，要写成「平台:账号」（如 qq:768295235），这条先跳过")
+            problems.append(f"[approval] {field_zh}里的 {v!r} 认不出，要写成「平台:账号」（如 qq:100000001），这条先跳过")
             continue
         if n not in out:
             out.append(n)
@@ -190,7 +190,7 @@ class ApprovalSectionConfig(PluginConfigBase):
     # required / admins / exempt_groups / exempt_users：0.8.0 起每群一份
     # （kv["group_approval.<群号>"]，group_approval.py）——只作新群的迁移种子。
     required: bool = Field(default=True, description="群友派的活是否要 bot 管理员批准后才能开工（种子；现在每群一份）")
-    admins: list[str] = Field(default_factory=lambda: ["qq:768295235"], description="bot 管理员，写成「平台:账号」（种子；现在每群一份）")
+    admins: list[str] = Field(default_factory=lambda: ["qq:100000001"], description="bot 管理员，写成「平台:账号」（种子；现在每群一份）")
     exempt_groups: list[str] = Field(default_factory=list, description="免批的群（种子；现在每群一份），写成「平台:群号」")
     exempt_users: list[str] = Field(default_factory=list, description="派活免批的人（种子；现在每群一份），写成「平台:账号」")
     remind: bool = Field(default=True, description="待批超过 24 小时没人处理时，在群里提醒管理员一次（可关）")

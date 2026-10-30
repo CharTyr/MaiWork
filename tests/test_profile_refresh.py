@@ -1121,7 +1121,7 @@ def test_refresh_batch_small_enough_for_gateway_limit() -> None:
 
 
 class TestMembersWiring:
-    U = "768295235"  # 一个长得像真 QQ 号的平台 id
+    U = "100000001"  # 一个长得像真 QQ 号的平台 id
 
     def _member(self, store: Store, uid: str):
         return store.read().execute(
@@ -1205,14 +1205,14 @@ class TestMembersWiring:
     async def test_bare_qq_in_model_output_stored_as_token_and_entries_render_current_name(
         self, store: Store, frozen_now: float, tmp_path: Path
     ) -> None:
-        """模型偷懒写了「iBad Bro (768295235)」：入库前 tokenize；
+        """模型偷懒写了「iBad Bro (100000001)」：入库前 tokenize；
         entries() 的 text 渲染成当前名字（raw_text 保留 {@id} 原文）。"""
         # 先把人聊进名册
         settings = _settings(tmp_path)
         host = FakeHost([_msg("s1", T0 - 300, user=self.U, name="iBad Bro", text="冒泡")])
         p = _make(store, host, FakeModelsQueue(replies=["没有变化"]), settings)
         await p.tick(GID, refresh=False)
-        # 第二批消息进来时模型写「iBad Bro (768295235)」
+        # 第二批消息进来时模型写「iBad Bro (100000001)」
         host.msgs.extend([
             _msg("b1", T0 - 200, user="u2", name="路人", text="你那边呢"),
             _msg("b2", T0 - 190, user=self.U, name="iBad Bro", text="底座发烫"),
@@ -1281,7 +1281,7 @@ class TestMembersWiring:
         assert '改成提一嘴 iBad Bro 的掌机' in entries_text
         # 注记里不出现 token / 裸 QQ 号（user_id 字段是身份不是名字，可以有）
         notes = " ".join(str(f.get("note") or "") for f in group["focus"])
-        assert "768295235" not in notes and "{@" not in notes
+        assert "100000001" not in notes and "{@" not in notes
 
     @pytest.mark.asyncio
     async def test_prompt_shows_raw_tokens_plus_legend(

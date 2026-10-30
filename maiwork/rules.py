@@ -104,12 +104,12 @@ def _check_account_list(field_zh: str) -> Any:
 
     def check(value: Any) -> list[str]:
         if not isinstance(value, list):
-            raise ValueError(f'{field_zh}要是一个列表，每条写成「平台:账号」，如 ["qq:768295235"]')
+            raise ValueError(f'{field_zh}要是一个列表，每条写成「平台:账号」，如 ["qq:100000001"]')
         out: list[str] = []
         for raw in value:
             n = norm_account(raw)
             if not n:
-                raise ValueError(f"{field_zh}里的 {raw!r} 认不出，要写成「平台:账号」，如 qq:768295235")
+                raise ValueError(f"{field_zh}里的 {raw!r} 认不出，要写成「平台:账号」，如 qq:100000001")
             if n not in out:
                 out.append(n)
         return out

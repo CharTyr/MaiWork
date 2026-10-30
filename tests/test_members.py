@@ -54,11 +54,11 @@ def test_per_group(tmp_path) -> None:
 def test_render_tokens_to_current_names(tmp_path) -> None:
     s = _store(tmp_path)
     with s.tx() as conn:
-        members.record(conn, G, "768295235", "胡萝卜花之王", 100.0)
-    text = f"{members.token('768295235')}的NS2底座发烫；{members.token('123456789')}也说烫"
+        members.record(conn, G, "100000001", "胡萝卜花之王", 100.0)
+    text = f"{members.token('100000001')}的NS2底座发烫；{members.token('123456789')}也说烫"
     out = members.render(s, G, text)
     assert out == f"胡萝卜花之王的NS2底座发烫；{members.UNKNOWN}也说烫"
-    assert "768295235" not in out and "123456789" not in out
+    assert "100000001" not in out and "123456789" not in out
     assert members.render(s, G, "没有人名") == "没有人名"
 
 
@@ -97,16 +97,16 @@ def test_tokenize_bare_ids_written_by_model(tmp_path) -> None:
     """模型没按要求写 {@id}、直接写了 QQ 号：本群认识的 id 一律转成 {@id}，名字括号去重。"""
     s = _store(tmp_path)
     with s.tx() as conn:
-        members.record(conn, G, "768295235", "胡萝卜花之王", 100.0)
+        members.record(conn, G, "100000001", "胡萝卜花之王", 100.0)
         conn.execute(
             "INSERT INTO member_activity (group_id, user_id, day, count, name)"
-            " VALUES (?, '768295235', '2026-09-20', 1, 'iBad Bro')",
+            " VALUES (?, '100000001', '2026-09-20', 1, 'iBad Bro')",
             (G,),
         )
     f = lambda t: members.tokenize_ids(s, G, t)  # noqa: E731
-    assert f("iBad Bro (768295235) 底座发烫") == "{@768295235} 底座发烫"
-    assert f("胡萝卜花之王(QQ 768295235)说烫") == "{@768295235}说烫"
-    assert f("{@768295235}（QQ 768295235）说烫") == "{@768295235}说烫"
-    assert f("QQ768295235 说烫") == "{@768295235} 说烫"
+    assert f("iBad Bro (100000001) 底座发烫") == "{@100000001} 底座发烫"
+    assert f("胡萝卜花之王(QQ 100000001)说烫") == "{@100000001}说烫"
+    assert f("{@100000001}（QQ 100000001）说烫") == "{@100000001}说烫"
+    assert f("QQ100000001 说烫") == "{@100000001} 说烫"
     assert f("价格 199 元，编号 12345678") == "价格 199 元，编号 12345678"  # 不认识的数字不动
-    assert members.render(s, G, f("iBad Bro (768295235) 底座发烫")) == "胡萝卜花之王 底座发烫"
+    assert members.render(s, G, f("iBad Bro (100000001) 底座发烫")) == "胡萝卜花之王 底座发烫"

@@ -91,7 +91,7 @@ class TestQQBotHost:
     async def test_session_lookup_uses_host_platform_qq(self) -> None:
         ctx = FakeCtx({"chat.get_group_streams": {"streams": [
             {"group_id": "900000001", "session_id": "s-snow", "account_id": "100000002"},
-            {"group_id": OPENID, "session_id": "s-off", "account_id": "9847158036852791717"},
+            {"group_id": OPENID, "session_id": "s-off", "account_id": "1000000000000000001"},
         ]}})
         h = self._host(ctx)
         assert await h.session_for_group(OPENID) == "s-off"

@@ -157,7 +157,7 @@ class TestDefaults:
         assert s.delivery.push_per_day == 3
         assert s.delivery.quiet_hours == "23:00-08:00"
         assert s.approval.required is True
-        assert s.approval.admins == ("qq:768295235",)  # 默认含部署人的 QQ；要加人往后写
+        assert s.approval.admins == ("qq:100000001",)  # 默认含部署人的 QQ；要加人往后写
         assert s.approval.exempt_groups == ()
         assert s.approval.exempt_users == ()
         assert s.models.base_url == ""
@@ -444,7 +444,7 @@ class TestM2Sections:
         assert "models" not in raw
         # 示例里不能有看起来像真的密钥 / 地址，统一用占位；
         # 第一位管理员和代码默认对齐（2026-10 docs/18 文档漂移修正）
-        assert s.approval.admins == ("qq:768295235",)
+        assert s.approval.admins == ("qq:100000001",)
         assert all(e.api_key == "" or "填" in e.api_key for e in s.endpoints)
         assert all("example.com" in e.base_url for e in s.endpoints)
 
