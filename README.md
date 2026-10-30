@@ -57,18 +57,31 @@
 <td width="50%"><img src="docs/images/task-delivered.png" alt="任务" /><br /><sub><b>任务</b>：等批准、进行中、交付；每一步谁做了什么都看得到</sub></td>
 </tr>
 <tr>
-<td width="50%"><img src="docs/images/chat.png" alt="和 MaiWork 聊" /><br /><sub><b>和 MaiWork 聊</b>：管理员直接问进度、提要求</sub></td>
-<td width="50%"><img src="docs/images/settings.png" alt="设置" /><br /><sub><b>运行状态</b>：模型、搜索、本机干活、专用机器、一次性 VM（Railway，可额外加 Freestyle）一眼看清</sub></td>
+<td width="50%"><img src="docs/images/chat.png" alt="聊天" /><br /><sub><b>聊天</b>：管理员直接问进度、提要求；要动手的操作先给你确认</sub></td>
+<td width="50%"><img src="docs/images/settings.png" alt="设置" /><br /><sub><b>设置概况</b>：各群今天的情况、待处理的事、用量和运行状态一页看清</sub></td>
 </tr>
 </table>
+
+### 看板
+
+只有总管理员能看、只看不改：每个专岗（主模型、资讯、构想、目标、通用任务、开话题）一栏平铺，进行中和做过的活各在哪一步一目了然；超过 10 分钟没动静的会标出来。
+
+<div align="center">
+<img src="docs/images/board.png" width="92%" alt="看板" />
+</div>
+
+点开任意一件，按时间看完整过程：调了哪些工具（输入、输出、耗时、成败）、模型每次回了什么，以及它的思考过程。
+
+<div align="center">
+<img src="docs/images/board-item.png" width="92%" alt="看板：单件过程" />
+</div>
 
 <div align="center">
 <img src="docs/images/mobile.png" width="92%" alt="手机端" />
 <br /><sub>手机上也能用：资讯、构想详情、任务批准</sub>
 </div>
 
-截图来自[在线演示](https://dewy-vow-gebh.here.now/)，群、成员和内容都是虚构的。
-> **图是旧版的**（0.7.x 时的界面，比如当时底栏还是 5 个、目标单独一页）。0.8.0 把「目标」并进「在做的事」、底栏变 4 个，这里的图暂未换新，**没有拿旧图冒充新版**。
+截图来自[在线演示](https://dewy-vow-gebh.here.now/)（0.12.0 的界面），群、成员和内容都是虚构的。
 
 ---
 
