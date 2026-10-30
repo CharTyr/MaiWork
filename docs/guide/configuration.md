@@ -2,114 +2,137 @@
 
 [← 回到 README](../../README.md)
 
-模型、搜索、记忆、多平台怎么配，以及 `config.toml` 里常用的配置项。
+日常使用中，**95% 的设置都直接在 MaiWork 网页上点点鼠标就行**，改完立刻生效，不用手改配置文件，也不用重启 MaiBot。
 
-## 几样东西分别是怎么配的
+这篇指南先讲清楚几个核心设置是怎么配合的，再附上 `config.toml` 的常用配置表供你查阅。
 
-**模型：端点 → 模型库 → 专岗。** 一个**端点**就是一家模型服务商（地址 + 密钥，接口格式支持 `openai` / `anthropic` / `responses`）；**模型库**里登记这个端点下有哪些模型；至于主模型和资讯 / 构想 / 目标 / 任务这些**专岗**各用哪个模型，在网页「设置 → 专岗」里挑（存在数据库里）。**专岗没单独选，就跟主模型一样**——这是正常能用的状态，不是没配好。想加第二家端点、调思考强度、改上下文窗口，都在「设置 → 模型」页。
+---
 
-**端点高级设置。** 在「设置 → 模型」里新增或编辑端点，展开「高级设置」，可按行添加请求头覆盖，也可以切到「JSON」方式直接粘贴一个 `{"名称": "值"}` 对象，例如 `User-Agent`、`Authorization` 或服务商要求的自定义头。两种方式可以来回切换，已输入的内容会带过去。同一端点下所有模型共用，测试连接和模型验证也会带上；名称不分大小写，同名会覆盖默认值。不填保持原行为。头值可能含凭据，保存后只显示已填、不回显；原有项留空就保留（JSON 里已保存的名称写 `""` 或 `null` 同样表示保留原值），删掉该行或从 JSON 里去掉该名称再保存即可取消覆盖，写 `{}` 清空全部。`Host`、`Content-Length` 等传输头不能手动覆盖。
+## 一、日常最常碰的几样设置
 
-**联网搜索。** 首次引导里直接勾搜索服务预设，免密钥的可以先拿来用；勾的第一个当主搜索，其余当备用——主搜索暂时坏了，备用会自动接上。之后在「设置 → 工具」里也能改。同一页的 skill 可以单独启用或停用（调研报告、资讯核实、通用任务、目标追踪、构想整理、办公文档 6 份随插件自带），办公文档所需组件也在同一页的「可选组件」一键安装。预设搜索服务配套的 skill 只在对应服务开启时生效，你手动停用过的不会因为重开服务自动恢复。**没配搜索但订了 RSS 时，资讯只用 RSS 也能出。**
+### 1. 模型怎么配：先连服务商，再给各岗位挑模型
 
-**记忆和「这个群怎么做」。** 全局经验在网页「设置 → 记忆」页看和改，只记和具体群、具体人无关的东西。每个群自己有两块，都在群页的「本群」区：**本群规则**（你或本群群管理员定的硬规矩，MaiWork 从来不自己改——追加也算改）和**本群做法**（它从验收结果、群友反馈和你在对话里说的话里总结的做事经验）。做法每天复盘一次（没有新情况就不总结）、每周整理一次；你可以直接改做法；如果没锁定，MaiWork 仍会按新反馈继续完善，不想让它再改就锁定。已锁定或归档的做法自动流程不会修改，也可以回退到以前的版本。设置 → 专岗里那个群的记录是只读的（最近做过什么、交接和验收）。每个群的规矩和做法只进那个群。群画像和关注成员的私下画像只给管理员看，不出现在群消息里。
+MaiWork 把模型分成好理解的三步（都在网页「设置 → 模型」和「设置 → 专岗」里操作）：
 
-**多平台。** 服务群支持 `qq:`（NapCat / OneBot）、`telegram:`（写 `tg:` 也行）和 `qqbot:`（QQ 官方机器人，群号是 openid）。群文件 / 群公告 / 群相册这些群空间操作目前只有 QQ（OneBot）能用，其他平台的交付走网页链接。
+1. **加一个端点（服务商）**：填上接口格式（`openai` / `anthropic` / `responses`）、地址和 API 密钥。如果你的中转站或服务商要求带特殊的请求头（比如自定义 `User-Agent` 或额外鉴权头），点开端点里的「高级设置」，按行填或直接粘贴一段 JSON 即可；填进去的头跟密钥一样只进不出。
+2. **往模型库里加模型**：从这个端点下拉取模型列表勾选，或者直接手填模型名字；顺手标一下它支不支持看图（`vision`）、思考强度（`efforts`）以及是用来聊天干活（`chat`）还是用来画图（`image`）。
+3. **给专岗挑模型**：MaiWork 里有主模型、资讯、构想、目标、任务这几个岗位。**你不单独给专岗挑模型也完全能用——没挑的岗位默认直接跟主模型用同一个。** 等你想省钱或提速了（比如让主模型用聪明的大模型、找资讯用便宜快的小模型），再去「设置 → 专岗」里分开选，还可以给每个岗位设一个备用模型。
 
-群友要看的页面默认自动发布到 here.now（匿名公开页，24 小时过期，开关 `[console] herenow_share`，默认开），不用配置。想用自己的网址，自己做反向代理并填 `[console] public_url`，填了就优先用它（Docker 下的注意事项见 [Docker 部署](docker.md)）。两样都没有时，群友拿不到链接。
+> 找资讯时为了不卡死在一处，如果某个模型网络报错，它会直接换你设好的备用模型，不会在同一个超时模型上傻等五次。
 
-## 配置项
+### 2. 联网搜索与做法（skill）
 
-完整说明见 [`config.example.toml`](../../config.example.toml)（每项都有中文注释）。常用的：
+- **联网搜索**：首次引导时直接勾几个预设搜索服务就行（有免密钥即开即用的），排第一的当主搜索，其余当替补——主搜索偶尔抽风时替补自动顶上。平时随时能在「设置 → 工具」里调整。就算你一个搜索都不配，只要给群绑了 RSS 源，资讯照样能靠 RSS 出内容。
+- **做法（skill）与专岗工具**：插件自带了 6 份写好的做事规范（调研报告、资讯核实、通用任务、目标追踪、构想整理、办公文档），在「设置 → 工具」里能随时开关或新建。新建或编辑做法时，你还可以勾选这份做法**要用的工具**（包括内置工具或已连上的 MCP 工具）——把这份做法挂给资讯、构想或目标专岗后，它们干活时就能直接调用这些工具了（勾选跑命令、写文件这类执行工具时，系统会先弹确认框让你拍板）。
+- **办公文档与画图组件**：做 Word / Excel / PPT 的依赖包、画资讯卡片要用的浏览器和中文字体，都在「设置 → 工具 → 可选组件」里一键安装，装在 MaiWork 自己的目录里，不污染 MaiBot 的环境。
+
+### 3. 记忆、「本群规则」和「本群做法」
+
+MaiWork 记东西分两层，绝不串群：
+- **全局记忆**（在「设置 → 记忆」）：只记跟具体哪个群、哪个人无关的通用经验。
+- **每个群自己的规矩与经验**（在对应群页面的「本群」区）：
+  - **本群规则**：你或本群管理员定下的硬规矩，MaiWork 只读不改（连往后追加都不会自己动手）。
+  - **本群做法**：它从每次任务验收、群友反应和你的对话里自己总结出来的经验，每天最多复盘一次、每周整理一次。你可以随时动手改它；如果没锁定，MaiWork 仍会按新反馈继续完善，不想让它再改就锁定。锁住或归档的做法它绝不再碰，改坏了也能一键回退到历史版本。
+  - **群画像与关注成员画像**：只在网页后台给管理员看，绝不会发到群消息里。
+
+### 4. 多平台与群友网页链接
+
+- **支持哪些聊天平台**：服务群支持写成 `qq:群号`（NapCat / OneBot）、`telegram:群号`（或 `tg:群号`）、`qqbot:群openid`（QQ 官方机器人）。其中传群文件、发群公告、传群相册是 QQ（OneBot）独有的能力，其他平台做完任务统一发网页链接。
+- **群友怎么打开网页**：默认不用你配域名或反向代理——MaiWork 会把群友要看的那一页自动发到 here.now（匿名临时网页，24 小时过期）。如果你有自己的服务器域名，在设置里填上 `public_url`，就会优先发你自己的固定链接；如果完全不想对外发链接，把「用 here.now 自动公开」关掉即可，群里就只发纯文字。
+
+---
+
+## 二、`config.toml` 常用配置项速查
+
+完整带中文注释的范例见插件目录下的 [`config.example.toml`](../../config.example.toml)。下面挑最常用的列出来：
 
 ### 群与关注
 
-| 配置项 | 类型 | 默认值 | 说明 |
+| 配置项 | 类型 | 默认值 | 用大白话说 |
 |:------|:-----|:-------|:-----|
-| `plugin.enabled` | bool | `false` | 总开关，必须显式写 `true` |
-| `groups.serve` | list | `[]` | 服务群列表，每项 `group = "平台:群 ID"`（`qq:` / `telegram:` / `tg:` / `qqbot:`），可选 `workspace` 共享工作区 |
-| `focus.max_members` | int | `5` | 每群最多关注几个人 |
-| `focus.personal_profile` | bool | `true` | 给关注成员建个人画像（只给管理员看） |
+| `plugin.enabled` | bool | `false` | 插件总开关，改成 `true` 才开始工作 |
+| `groups.serve` | list | `[]` | 要服务的群列表，每项写 `group = "平台:群号"`（如 `"qq:123456789"`），没写进来的群完全不碰 |
+| `focus.max_members` | int | `5` | 每个群最多重点关注几位活跃成员 |
+| `focus.personal_profile` | bool | `true` | 是否为关注成员整理私下画像（只给管理员看） |
 
-### 资讯与推送
+### 资讯与每日推送
 
-| 配置项 | 类型 | 默认值 | 说明 |
+| 配置项 | 类型 | 默认值 | 用大白话说 |
 |:------|:-----|:-------|:-----|
-| `feeds.news_slots` | list | `["08:30","14:00","19:00"]` | 每天备资讯的时段（北京时间） |
-| `feeds.max_items` | int | `10` | 每批最多入选几条 |
+| `feeds.news_slots` | list | `["08:30","14:00","19:00"]` | 每天几点备好新资讯（北京时间） |
+| `feeds.max_items` | int | `10` | 每一批最多留几条资讯 |
 
-> 「每群每天开几个话题 / 主动推几条 / 几点不打扰」0.8.0 起**每个群自己一份**，在网页「群」页的「主动发言」里改，不再写进 `config.toml`（旧文件里的值只作新群第一次的迁移种子）。
+> **每个群自己的推送开关**（每天最多主动发几条、几点到几点免打扰、开不开资讯卡片和构想提一嘴）都按群保存在数据库里，直接在网页「群 → 主动发言」里改。
 
-### 派活与批准
+### 派活审批与群内连续对话
 
-| 配置项 | 类型 | 默认值 | 说明 |
+| 配置项 | 类型 | 默认值 | 用大白话说 |
 |:------|:-----|:-------|:-----|
-| `approval.auto_review` | bool | `true` | 低风险小活由主模型审一眼直接开工 |
-| `approval.auto_review_daily` | int | `5` | 每群每天最多自动放行几件，`0` = 关 |
-| `approval.remind` | bool | `true` | 待批超过 24 小时没人处理时在群里提醒一次 |
-| `tasks.token_limit` | int | `2000000` | 单任务 token 上限，到了自动暂停 |
-| `tasks.run_seconds` | int | `10800` | 单任务时长上限（秒） |
+| `approval.auto_review` | bool | `true` | 低风险小活（查资料、做个小网页等）让主模型审一眼就自动放行开工 |
+| `approval.auto_review_daily` | int | `5` | 每个群每天最多自动放行几件，`0` 表示全部要人批 |
+| `approval.remind` | bool | `true` | 有人派了活超过 24 小时还没批时，在群里轻声提醒一次 |
+| `session.enabled` | bool | `true` | 群内连续对话：任务开工后，派活的人在群里直接 @ 就能改要求、问进度、说结束 |
+| `session.idle_minutes` | int | `60` | 连续对话多久没人说话就自动收起（分钟） |
+| `tasks.token_limit` | int | `2000000` | 单个任务最多花多少 token，到了自动暂停等你决定 |
+| `tasks.run_seconds` | int | `10800` | 单个任务最长跑多少秒（默认 3 小时） |
 
-> 「派的活要不要批准 / 谁能批本群的活（含免批）」0.8.0 起**每个群自己一份**，在网页「群」页的「任务审批」里改；旧 `approval.required` / `approval.admins` / `approval.exempt_*` 只作新群第一次的迁移种子。`/mw 批准` 认的就是本群这一份名单。群友在群里发 `/mw do 要做的事` 直接派的活，走的也是这一份名单。记不住指令就在群里发 `/mw 帮助`，全部指令和例子都会列出来。
+> **谁能批这个群的活、要不要开启审批、谁免批**，同样是每个群单独一份，在网页「群 → 任务审批」里设。
 
 ### 模型
 
-模型分三层：先有**端点**（一家模型服务商：地址 + 密钥），再把能用的模型登记进**模型库**，最后在网页「设置 → 专岗」页给主模型和各专岗挑用哪个（这一层存在数据库里，不在 `config.toml`）。
+模型推荐直接在网页「设置 → 模型」里添加和编辑，它会自动帮你写成下面的格式：
 
-| 配置项 | 类型 | 默认值 | 说明 |
+| 配置项 | 类型 | 默认值 | 用大白话说 |
 |:------|:-----|:-------|:-----|
-| `[[endpoints]] id` | string | — | 端点 id（小写字母、数字、`_`、`-`，1~24 字），重名只留第一个 |
+| `[[endpoints]] id` | string | — | 服务商短代号（小写字母、数字、`_`、`-`） |
 | `[[endpoints]] protocol` | string | `"openai"` | 接口格式：`openai` / `anthropic` / `responses` |
-| `[[endpoints]] base_url` | string | `""` | 端点地址，必须 `http(s)://` 开头 |
-| `[[endpoints]] api_key` | string | `""` | 端点密钥（网页上只进不出） |
-| `[[endpoints]] headers` | table | `{}` | 高级请求头覆盖，名称不分大小写；最多 32 项，值只进不出，不能带换行或非 ASCII 字符 |
-| `[[endpoints]] retries` / `retry_delay_s` | int | `5` / `10` | 调用失败最多重试几次 / 两次之间等几秒 |
-| `[[endpoints]] max_concurrency` / `max_rpm` | int | `2` / `0` | 这个端点同时最多几个请求 / 每分钟最多几次（`0` = 不限） |
-| `[[model_list]] id` | string | — | 模型条目 id（规则同上） |
-| `[[model_list]] endpoint` | string | — | 挂在哪个端点（写端点 id，必须存在） |
-| `[[model_list]] model` | string | — | 服务商那边的模型名 |
-| `[[model_list]] name` | string | `""` | 网页上的显示名；空 = 用模型名 |
-| `[[model_list]] efforts` | list | `[]` | 支持的思考强度（`low` / `medium` / `high` / `xhigh` / `max`，可多选） |
-| `[[model_list]] vision` | bool | `false` | 支不支持图片输入 |
-| `[[model_list]] context_window` | int | `128000` | 上下文窗口（tokens） |
-| `[[model_list]] max_tokens` | int | `32768` | 一次回答最多写多少 token，必须小于上下文窗口 |
-| `[[model_list]] use` | string | `"chat"` | 用途：`chat`（聊天与干活）或 `image`（生图，0.10.0 起）；生图条目不能当聊天模型 |
-| `[[model_list]] image_api` | string | `"openai"` | 生图接口类型：`openai`（OpenAI、火山方舟）或 `siliconflow`（硅基流动）；只对生图条目有意义 |
-| `[[model_list]] image_default_size` | string | `""` | 生图默认尺寸，空 = 服务商默认 |
-| `[[model_list]] image_max_n` | int | `1` | 一次最多画几张（1~4） |
-
-资讯的定方向、挑候选和打分会覆盖端点的重试次数：每个候选模型只试一次，网络失败就尝试已选的下一个备用，避免反复等待同一个无响应模型。没有备用或全部失败时，这一步按失败处理；打分内容坏了或漏项仍允许补问一次。其他调用照端点的重试设置执行。
-
-主模型和资讯 / 构想 / 目标 / 任务这五个岗位，各自选哪个模型条目、什么思考强度、备用是哪个，都在网页「设置 → 专岗」里改；**没单独选的岗位跟主模型一样**，这是正常可用状态。旧的 `[models]` 四槽会自动迁移，见[升级说明](upgrade.md)。
+| `[[endpoints]] base_url` | string | `""` | 接口地址（`http://` 或 `https://` 开头） |
+| `[[endpoints]] api_key` | string | `""` | API 密钥（网页上只进不出） |
+| `[[endpoints]] headers` | table | `{}` | 可选的自定义请求头覆盖（最多 32 项，值只进不出） |
+| `[[endpoints]] retries` / `retry_delay_s` | int | `5` / `10` | 请求失败重试几次 / 每次间隔几秒 |
+| `[[endpoints]] max_concurrency` / `max_rpm` | int | `2` / `0` | 同时最多几个请求 / 每分钟最多几次（`0` 不限） |
+| `[[model_list]] id` | string | — | 模型库里的条目代号 |
+| `[[model_list]] endpoint` | string | — | 属于上面哪个服务商端点 |
+| `[[model_list]] model` | string | — | 服务商那边的真实模型名 |
+| `[[model_list]] name` | string | `""` | 在网页上显示的好认名字（留空就显示真实模型名） |
+| `[[model_list]] efforts` | list | `[]` | 支持的思考强度（`low` / `medium` / `high` / `xhigh` / `max`） |
+| `[[model_list]] vision` | bool | `false` | 能不能看图片 |
+| `[[model_list]] context_window` | int | `128000` | 最大上下文长度（tokens） |
+| `[[model_list]] max_tokens` | int | `32768` | 单次回复最大输出长度（必须小于上下文长度） |
+| `[[model_list]] use` | string | `"chat"` | 用途：`chat`（聊天干活）或 `image`（AI 生图） |
+| `[[model_list]] image_api` | string | `"openai"` | 生图接口风格：`openai`（含火山方舟）或 `siliconflow`（硅基流动） |
+| `[[model_list]] image_default_size` | string | `""` | 生图默认尺寸，留空按服务商默认 |
+| `[[model_list]] image_max_n` | int | `1` | 单次最多生成几张图（1~4） |
 
 ### 干活环境
 
-| 配置项 | 类型 | 默认值 | 说明 |
+| 配置项 | 类型 | 默认值 | 用大白话说 |
 |:------|:-----|:-------|:-----|
-| `environments.ssh` | list | `[]` | 专用机器，每台写 `name` / `host`（`user@地址:端口`）/ `note`，可以多台 |
-| `environments.freestyle` | bool | `false` | 是否允许用 Freestyle 一次性机器（要你自己的 API key）。可以和 `railway` 同时开，互为备用 |
-| `environments.vm_platform` | string | `"railway"` | 两家都开时**优先用哪家**：`railway` 或 `freestyle`；优先那家拿不到自动换另一家。只开一家时不起作用 |
-| `environments.railway` | bool | `true` | 允许用 railway.new 一次性 VM（只在上面选 `railway` 时起作用） |
-| `environments.freestyle_api_key` | string | `""` | Freestyle 的 API key（[控制台](https://dash.freestyle.sh)里建，只在创建时显示一次）；只进不出，也可以改用环境变量 `FREESTYLE_API_KEY`（优先） |
-| `environments.freestyle_snapshot` | string | `"freestyle/ubuntu-sm"` | Freestyle 机器用哪个镜像，它决定几核几 G：`freestyle/ubuntu-sm` = 2 核 4G，`freestyle/ubuntu` = 4 核 8G（免费档上限） |
-| `environments.freestyle_ttl_minutes` | int | `90` | Freestyle 机器从创建算起最多活多少分钟，到点自动删 |
-| `environments.freestyle_idle_minutes` | int | `10` | 多久没网络活动就休眠；休眠只算存储费，文件还能读 |
-| `environments.freestyle_daily_max` | int | `5` | 每天最多用几台 Freestyle 机器；免费档每月约 100 机时（2 核 4G），用完后任务改回本机执行 |
-| `environments.run_as` | string | `"maiwork"` | 在本机跑命令用哪个系统账号；**不能填 `root`**（也不能填 uid 是 0 的账号）——子 agent 拿到 root 就没有隔离了，填了会被挡住不跑 |
-| `environments.local_network` | bool | `false` | 允不允许子 agent 访问**本机服务**（网页控制台、MaiBot）和**内网**地址。默认关：子 agent 能上公网，但连不上 `127.0.0.1`、路由器 / 内网机器、云服务器的元数据地址；域名解析照常能用。确实要让它连本机或内网时才开 |
-| `environments.memory_max` | string | `"512M"` | 本机隔离单元内存上限 |
-| `environments.runtime_max_sec` | int | `1800` | 本机隔离单元最长运行秒数 |
-| `environments.verify_enabled` | bool | `false` | 资讯实测：挑几条上 VM 试一试再发 |
-| `group_space.enabled` | bool | `true` | 群文件 / 群公告 / 群相册操作（适配器支持时） |
+| `environments.ssh` | list | `[]` | 你自己的专用服务器列表，每台填 `name` / `host`（`user@IP:端口`）/ `note` |
+| `environments.railway` | bool | `true` | 允许借用 railway.new 免密钥一次性云端机器 |
+| `environments.freestyle` | bool | `false` | 允许借用 Freestyle 一次性云端机器（需填 API key，支持与 Railway 同时开互为替补） |
+| `environments.vm_platform` | string | `"railway"` | 两家临时机器都开时优先用哪家（`railway` 或 `freestyle`） |
+| `environments.freestyle_api_key` | string | `""` | Freestyle 的密钥（也可通过环境变量 `FREESTYLE_API_KEY` 传入） |
+| `environments.freestyle_snapshot` | string | `"freestyle/ubuntu-sm"` | Freestyle 机器规格：`freestyle/ubuntu-sm`（2 核 4G）或 `freestyle/ubuntu`（4 核 8G） |
+| `environments.freestyle_ttl_minutes` | int | `90` | Freestyle 单台机器最长存活多少分钟 |
+| `environments.freestyle_idle_minutes` | int | `10` | Freestyle 机器闲置几分钟自动休眠 |
+| `environments.freestyle_daily_max` | int | `5` | 每天最多开几台 Freestyle 机器 |
+| `environments.run_as` | string | `"maiwork"` | 本机 Linux 隔离跑命令用的系统账号（**禁止填 `root`**） |
+| `environments.local_network` | bool | `false` | 是否允许任务代码访问本机（`127.0.0.1`）和内网地址，默认严禁 |
+| `environments.memory_max` | string | `"512M"` | 本机隔离跑命令的内存上限 |
+| `environments.runtime_max_sec` | int | `1800` | 本机单次命令最长运行秒数 |
+| `environments.verify_enabled` | bool | `false` | 资讯实测：挑几条技术资讯真开台机器跑一下试试 |
+| `group_space.enabled` | bool | `true` | 是否允许操作 QQ 群文件、群公告、群相册 |
 
-### 网页
+### 网页控制台
 
-| 配置项 | 类型 | 默认值 | 说明 |
+| 配置项 | 类型 | 默认值 | 用大白话说 |
 |:------|:-----|:-------|:-----|
-| `console.listen` | string | `"127.0.0.1:18650"` | 网页监听地址 |
-| `console.password` | string | `""` | 管理员密码，空则自动生成 |
-| `console.public_url` | string | `""` | 反向代理后的外网地址；填了优先用它 |
-| `console.herenow_share` | bool | `true` | 没填公开网址时，把群友要看的页面自动发布到 here.now（匿名、24 小时过期）。关掉就只发文字、不带链接 |
-| `console.update_check` | bool | `true` | 管理员打开网页时查 GitHub 上有没有新版（只提醒，更新去 MaiBot 的插件管理点） |
-| `console.maibot_webui_url` | string | `""` | MaiBot 自己网页的地址；填了，更新提醒里有直达按钮 |
-| `console.board_hours` | int | `24` | 任务看板「最近动态」往回看多少小时（1~168）；只总管理员能看 |
+| `console.listen` | string | `"127.0.0.1:18650"` | 网页监听地址（Docker 里需改成 `"0.0.0.0:18650"`） |
+| `console.password` | string | `""` | 总管理员密码，留空会自动生成在 `data/maiwork/console_password.txt` |
+| `console.public_url` | string | `""` | 你自己配好反向代理后的外网访问网址；填了就优先发这个网址 |
+| `console.trusted_proxies` | list | `[]` | 反向代理服务器的 IP 或网段（填上后，密码输错限流才按真实访客 IP 算） |
+| `console.herenow_share` | bool | `true` | 没填外网网址时，自动把群友要看的页面发到 here.now 临时公开页 |
+| `console.update_check` | bool | `true` | 打开网页时自动看一眼 GitHub 有没有发新版本 |
+| `console.maibot_webui_url` | string | `""` | MaiBot 自身 WebUI 的地址，填了在更新提醒里会有直达按钮 |
+| `console.board_hours` | int | `24` | 「看板」页默认显示最近多少小时内的动态（1~168） |

@@ -15,12 +15,12 @@ export const richText = (t) =>
 
 const P = 'fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"';
 export const SVG = {
-  news: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><rect x="5" y="3.5" width="14" height="17" rx="3.2"/><path d="M9 8.5h6M9 12h6M9 15.5h3.5"/></svg>`,
-  ideas: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><path d="M9.2 18h5.6M10.2 21h3.6"/><path d="M12 3a6 6 0 0 0-3.7 10.7c.6.5 1 1.2 1 2V16h5.4v-.3c0-.8.4-1.5 1-2A6 6 0 0 0 12 3z"/></svg>`,
+  news: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><rect class="n-page" x="5" y="3.5" width="14" height="17" rx="3.2"/><path class="n-l1" pathLength="1" d="M9 8.5h6"/><path class="n-l2" pathLength="1" d="M9 12h6"/><path class="n-l3" pathLength="1" d="M9 15.5h3.5"/></svg>`,
+  ideas: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><path class="i-base" d="M9.4 18.2h5.2M10.3 21h3.4"/><path class="i-bulb" d="M12 3.8a5.6 5.6 0 0 0-3.5 10c.55.45.9 1.1.9 1.8V16h5.2v-.4c0-.7.35-1.35.9-1.8A5.6 5.6 0 0 0 12 3.8z"/><g class="i-rays" stroke-width="1.9"><path d="M12 1v1.4"/><path d="M4.5 5l1.2.85"/><path d="M19.5 5l-1.2.85"/></g></svg>`,
   goals: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><rect x="3.5" y="3.5" width="17" height="17" rx="4.5"/><path d="M8 12.3l2.8 2.8 5.3-5.6"/></svg>`,
-  tasks: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><rect x="3.5" y="7" width="17" height="12.5" rx="3.2"/><path d="M9 7V5.6A1.6 1.6 0 0 1 10.6 4h2.8A1.6 1.6 0 0 1 15 5.6V7M3.5 12.3h17"/></svg>`,
-  group: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><circle cx="7.4" cy="7.4" r="3.3"/><path d="M16.6 4.2l3.4 5.8h-6.8z"/><rect x="4.1" y="13.3" width="6.6" height="6.6" rx="1.8"/><circle cx="16.6" cy="16.6" r="3.3"/></svg>`,
-  sliders: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><path d="M3.5 8h9M17.5 8h3M3.5 16h3M11.5 16h9"/><circle cx="15" cy="8" r="2.5"/><circle cx="9" cy="16" r="2.5"/></svg>`,
+  tasks: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><path class="t-handle" d="M9 7V5.6A1.6 1.6 0 0 1 10.6 4h2.8A1.6 1.6 0 0 1 15 5.6V7"/><rect class="t-box" x="3.5" y="7" width="17" height="12.5" rx="3.2"/><path class="t-flap" d="M3.5 12.2h6.4M14.1 12.2h6.4"/><rect class="t-latch" x="9.9" y="10.8" width="4.2" height="2.8" rx="0.9"/></svg>`,
+  group: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><circle class="g-p1" cx="7.4" cy="7.4" r="3.3"/><path class="g-p2" d="M16.6 4.2l3.4 5.8h-6.8z"/><rect class="g-p3" x="4.1" y="13.3" width="6.6" height="6.6" rx="1.8"/><circle class="g-p4" cx="16.6" cy="16.6" r="3.3"/></svg>`,
+  sliders: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><path d="M3.5 8h17M3.5 16h17" stroke-opacity="0.32"/><circle class="s-k1" cx="15" cy="8" r="2.6" fill="var(--card)"/><circle class="s-k2" cx="9" cy="16" r="2.6" fill="var(--card)"/></svg>`,
   down: `<svg viewBox="0 0 24 24" ${P} stroke-width="2.4"><path d="M6 9l6 6 6-6"/></svg>`,
   left: `<svg viewBox="0 0 24 24" ${P} stroke-width="2.2"><path d="M15 6l-6 6 6 6"/></svg>`,
   right: `<svg viewBox="0 0 24 24" ${P} stroke-width="2.2"><path d="M9 6l6 6-6 6"/></svg>`,
@@ -38,10 +38,10 @@ export const SVG = {
   pen: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><path d="M14.5 5.5l4 4M4.5 19.5l1-4.5L16 4.5a1.4 1.4 0 0 1 2 0l1.5 1.5a1.4 1.4 0 0 1 0 2L9 18.5z"/></svg>`,
   plus: `<svg viewBox="0 0 24 24" ${P} stroke-width="2.2"><path d="M12 5v14M5 12h14"/></svg>`,
   send: `<svg viewBox="0 0 24 24" ${P} stroke-width="2.2"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5"/></svg>`,
-  board: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><rect x="3.5" y="4" width="17" height="16" rx="3.5"/><path d="M9.5 4v16M14.5 4v16"/><path d="M5.8 8.5h1.6M11.2 8.5h1.6M16.6 8.5h1.6M11.2 12h1.6"/></svg>`,
-  chat: `<svg viewBox="0 0 24 24" ${P} stroke-width="1.9"><path d="M20 11.5a7.5 7.5 0 0 1-10.9 6.7L4.5 19.5l1.3-4A7.5 7.5 0 1 1 20 11.5z"/></svg>`,
+  board: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><rect x="3.5" y="4" width="17" height="16" rx="3.5"/><path d="M9.5 4v16M14.5 4v16"/><path class="b-c1" d="M5.8 8.5h1.6"/><path class="b-c2" d="M11.2 8.5h1.6"/><path class="b-c3" d="M16.6 8.5h1.6"/><path class="b-c4" d="M11.2 12.2h1.6"/></svg>`,
+  chat: `<svg viewBox="0 0 24 24" ${P} stroke-width="1.9"><path class="c-bub" d="M20 11.5a7.5 7.5 0 0 1-10.9 6.7L4.5 19.5l1.3-4A7.5 7.5 0 1 1 20 11.5z"/><circle class="c-d1" cx="9" cy="11.5" r="0.95" fill="currentColor" stroke="none"/><circle class="c-d2" cx="12" cy="11.5" r="0.95" fill="currentColor" stroke="none"/><circle class="c-d3" cx="15" cy="11.5" r="0.95" fill="currentColor" stroke="none"/></svg>`,
   ext: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><path d="M14 4h6v6M20 4l-9 9M18 14v4.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 18.5v-11A1.5 1.5 0 0 1 5.5 6H10"/></svg>`,
-  palette: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><path d="M12 3.5a8.5 8.5 0 0 0 0 17c1.2 0 1.8-.8 1.8-1.7 0-1.2-1-1.6-1-2.6 0-1 .8-1.7 1.8-1.7h2.2a3.7 3.7 0 0 0 3.7-3.7C20.5 6.9 16.7 3.5 12 3.5z"/><circle cx="7.8" cy="11" r="1" fill="currentColor"/><circle cx="10.5" cy="7.3" r="1" fill="currentColor"/><circle cx="15" cy="7.6" r="1" fill="currentColor"/></svg>`,
+  palette: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><path d="M12 3.5a8.5 8.5 0 0 0 0 17c1.2 0 1.8-.8 1.8-1.7 0-1.2-1-1.6-1-2.6 0-1 .8-1.7 1.8-1.7h2.2a3.7 3.7 0 0 0 3.7-3.7C20.5 6.9 16.7 3.5 12 3.5z"/><circle class="p-d1" cx="7.8" cy="11" r="1.05" fill="currentColor" stroke="none"/><circle class="p-d2" cx="10.5" cy="7.3" r="1.05" fill="currentColor" stroke="none"/><circle class="p-d3" cx="15" cy="7.6" r="1.05" fill="currentColor" stroke="none"/></svg>`,
   info: `<svg viewBox="0 0 24 24" ${P} stroke-width="2"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.2"/><circle cx="12" cy="7.8" r="0.6" fill="currentColor"/></svg>`,
 };
 

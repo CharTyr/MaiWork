@@ -60,11 +60,29 @@ export function renderTop() {
 const pendingCount = (g) => (g && g.today ? g.today.pending || 0 : 0);
 
 export function renderTabbar() {
-  $("tabbar").style.setProperty("--tab-count", TABS.length);
+  const bar = $("tabbar");
+  bar.style.setProperty("--tab-count", TABS.length);
   const g = grp();
   const idx = state.page ? -1 : TABS.findIndex((t) => t.id === state.tab);
   const n = pendingCount(g);
-  $("tabbar").innerHTML =
+  const pill = bar.querySelector && bar.querySelector(".tab-pill");
+  const tabs = bar.querySelectorAll ? bar.querySelectorAll(".tab") : [];
+  if (pill && tabs.length === TABS.length) {
+    pill.style.transform = `translateX(${Math.max(0, idx) * 100}%)`;
+    pill.style.opacity = String(idx < 0 ? 0 : 1);
+    TABS.forEach((t, i) => {
+      const b = tabs[i];
+      const on = idx >= 0 && t.id === state.tab;
+      if (b.getAttribute("aria-current") !== String(on)) b.setAttribute("aria-current", String(on));
+      const badge = b.querySelector && b.querySelector(".badge");
+      const show = gadmin() && t.id === "tasks" && n;
+      if (show && badge) badge.textContent = String(n);
+      else if (show && !badge && b.insertAdjacentHTML) b.insertAdjacentHTML("beforeend", `<span class="badge">${n}</span>`);
+      else if (!show && badge && badge.remove) badge.remove();
+    });
+    return;
+  }
+  bar.innerHTML =
     `<span class="tab-pill" style="transform:translateX(${Math.max(0, idx) * 100}%);opacity:${idx < 0 ? 0 : 1}"></span>` +
     TABS.map(
       (t) => `
@@ -76,6 +94,7 @@ export function renderTabbar() {
 }
 
 const railMarkup = new WeakMap();
+const stripCurrent = (s) => String(s || "").replace(/aria-current="(?:true|false)"/g, "");
 export function renderRail() {
   const g = grp();
   const list = admin() ? state.groups : g ? [g] : [];
@@ -116,7 +135,19 @@ export function renderRail() {
           : `<button class="r-item" data-act="login" title="${isGA() ? "群管理员" : "管理员"}">${SVG.key}<span class="r-text"><span class="r-name">${isGA() ? "群管理员" : "管理员"}</span></span></button>`
       }
     </div>`;
-  if (railMarkup.get(rail) === html) return;
+  const prev = railMarkup.get(rail);
+  if (prev === html) return;
+  const items = rail.querySelectorAll ? rail.querySelectorAll(".r-item") : [];
+  if (prev && items.length && stripCurrent(prev) === stripCurrent(html)) {
+    railMarkup.set(rail, html);
+    items.forEach((b) => {
+      const act = b.dataset && b.dataset.act;
+      if (act === "group") b.setAttribute("aria-current", String(b.dataset.g === state.g));
+      else if (act === "tab") b.setAttribute("aria-current", String(!state.page && b.dataset.tab === state.tab));
+      else if (act === "board" || act === "chat" || act === "settings") b.setAttribute("aria-current", String(state.page === act));
+    });
+    return;
+  }
   railMarkup.set(rail, html);
   rail.innerHTML = html;
 }

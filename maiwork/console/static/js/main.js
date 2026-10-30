@@ -1,6 +1,6 @@
 // MaiWork 网页 · 入口：点击 / 提交等全局事件，然后启动。
 import { $, desktop, gadmin, state, ui } from "./state.js";
-import { toast } from "./util.js";
+import { calm, toast } from "./util.js";
 import { api, grp, gview } from "./api.js";
 import { loadTask } from "./detail.js";
 import { loadGA } from "./settings/index.js";
@@ -20,11 +20,57 @@ import { onb, onbAct } from "./onboarding.js";
 import { RATE_KEY, clientId, myRates } from "./pages/news.js";
 import "./events.js"; // 只注册输入类事件，没有导出
 
+const NAV_SPRINGS = {
+  news: [
+    { transform: "translateY(0) scale(1) rotate(0deg)" },
+    { transform: "translateY(-2.4px) scale(1.08) rotate(3.5deg)", offset: 0.38 },
+    { transform: "translateY(0.4px) scale(0.99) rotate(-1deg)", offset: 0.74 },
+    { transform: "translateY(0) scale(1) rotate(0deg)" },
+  ],
+  ideas: [
+    { transform: "translateY(0) scale(1) rotate(0deg)" },
+    { transform: "translateY(-3px) scale(1.1) rotate(6.5deg)", offset: 0.34 },
+    { transform: "translateY(-0.6px) scale(1.02) rotate(-3.5deg)", offset: 0.68 },
+    { transform: "translateY(0) scale(1) rotate(0deg)" },
+  ],
+  tasks: [
+    { transform: "translateY(0) scale(1)" },
+    { transform: "translateY(-2.8px) scale(1.09)", offset: 0.38 },
+    { transform: "translateY(0.6px) scale(0.985)", offset: 0.74 },
+    { transform: "translateY(0) scale(1)" },
+  ],
+  group: [
+    { transform: "translateY(0) scale(1) rotate(0deg)" },
+    { transform: "translateY(-2px) scale(1.09) rotate(5.5deg)", offset: 0.38 },
+    { transform: "translateY(0.3px) scale(0.99) rotate(-1.8deg)", offset: 0.74 },
+    { transform: "translateY(0) scale(1) rotate(0deg)" },
+  ],
+  default: [
+    { transform: "translateY(0) scale(1)" },
+    { transform: "translateY(-2.2px) scale(1.08)", offset: 0.38 },
+    { transform: "translateY(0.4px) scale(0.99)", offset: 0.74 },
+    { transform: "translateY(0) scale(1)" },
+  ],
+};
+
+function pulseNav(el) {
+  if (!el || !el.matches(".tab, .r-item, .round-btn") || calm()) return;
+  const icon = el.querySelector("svg, .gav");
+  if (!icon || !icon.animate) return;
+  const frames = NAV_SPRINGS[el.dataset.tab] || NAV_SPRINGS.default;
+  try {
+    icon.animate(frames, { duration: 480, easing: "cubic-bezier(0.22, 1, 0.36, 1)", composite: "add" });
+  } catch (_) {
+    icon.animate(frames, { duration: 480, easing: "cubic-bezier(0.22, 1, 0.36, 1)" });
+  }
+}
+
 document.addEventListener("click", (e) => {
   const el = e.target.closest("[data-act]");
   if (!el || el.disabled) return;
   if (el.dataset.act.startsWith("onb-")) return void onbAct(el);
   act(el, e);
+  pulseNav(el);
 });
 
 document.addEventListener("keydown", (e) => {
