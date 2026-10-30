@@ -57,7 +57,7 @@ class FakeAgents:
             "refs": [str(x) for x in refs], "source_id": str(source_id or ""),
         })
 
-    def review(self, gid, id, accepted, summary, refs=(), *, learn=True):
+    def review(self, gid, id, accepted, summary, refs=(), *, learn=True, main_notes=None, post_notes=True):
         self.calls["review"].append((str(gid), str(id), bool(accepted)))
         self.reviews.append({
             "gid": str(gid), "id": str(id), "accepted": bool(accepted),
@@ -168,7 +168,8 @@ class FakeSpecialists:
             ok=bool(report.ok), error=str(report.error or ""))
         return report
 
-    def review(self, gid, report_or_id, accepted, summary, refs=(), *, learn=True):
+    def review(self, gid, report_or_id, accepted, summary, refs=(), *, learn=True,
+               main_notes=None, post_notes=True):
         if isinstance(report_or_id, WorkerReport):
             hid = str(getattr(report_or_id, "handoff_id", "") or "")
         else:
@@ -176,6 +177,7 @@ class FakeSpecialists:
         self.reviews.append({
             "gid": str(gid), "id": hid, "accepted": bool(accepted),
             "summary": str(summary), "refs": [str(x) for x in refs], "learn": bool(learn),
+            "post_notes": bool(post_notes),
         })
         if not hid:
             return

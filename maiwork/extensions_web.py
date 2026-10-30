@@ -328,11 +328,8 @@ def _validate_headers(raw: Any, *, allow_empty: bool, problems: list[str]) -> di
     return out
 
 
-def create(store: Any, settings: Settings, body: dict[str, Any]) -> dict[str, Any]:
-    """新增一个网页 MCP 条目。ValueError 校验失败；FileExistsError 重名（网页/config 都算）。
-
-    返回 kv 里存的条目结构（不含头值）。同一事务写 kv + secrets。
-    """
+def _validated_create(store: Any, settings: Settings, body: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
+    """新增的校验（纯计算，不写库）：(要存的条目, 头 {名字: 值})。"""
     problems: list[str] = []
     public = _validate_public_fields(body, problems)
     headers = _validate_headers(body.get("headers"), allow_empty=False, problems=problems)
@@ -350,6 +347,25 @@ def create(store: Any, settings: Settings, body: dict[str, Any]) -> dict[str, An
         "timeout_s": public["timeout_s"],
         "header_names": sorted(headers.keys()),
     }
+    return entry, headers
+
+
+def preview_create(store: Any, settings: Settings, body: dict[str, Any]) -> dict[str, Any]:
+    """不写库，先按新增的同一套校验算出要存的条目（不含头值）。
+
+    ValueError 校验失败；FileExistsError 重名。管理员对话写小票前先用它把不合格的挡掉。
+    """
+    entry, _headers = _validated_create(store, settings, body)
+    return entry
+
+
+def create(store: Any, settings: Settings, body: dict[str, Any]) -> dict[str, Any]:
+    """新增一个网页 MCP 条目。ValueError 校验失败；FileExistsError 重名（网页/config 都算）。
+
+    返回 kv 里存的条目结构（不含头值）。同一事务写 kv + secrets。
+    """
+    entry, headers = _validated_create(store, settings, body)
+    name = entry["name"]
     entries = _web_raw_entries(store)
     entries.append(entry)
     with store.tx() as conn:
@@ -361,18 +377,21 @@ def create(store: Any, settings: Settings, body: dict[str, Any]) -> dict[str, An
     return entry
 
 
-def update(store: Any, name: str, body: dict[str, Any]) -> dict[str, Any]:
-    """修改一个网页 MCP 条目（只允许 source=web，接口层先挡 config）。
+def web_entry(store: Any, name: str) -> dict[str, Any] | None:
+    """kv 里这个名字的网页条目（不含头值）；没有 → None。"""
+    name = str(name or "").strip()
+    return next((dict(e) for e in _web_raw_entries(store) if str(e.get("name") or "") == name), None)
+
+
+def _merge_update(
+    current: dict[str, Any], body: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, str], list[str]]:
+    """把修改 body 合到 current 上（纯计算，不写库）：(新条目, 要写的头, 要删的头名)。
 
     不传 / None 的字段保持原值；headers 里空字符串 = 不改这个头；remove_headers 删头。
-    KeyError 没有这个网页条目；ValueError 校验失败。
+    ValueError 校验失败（规则和网页修改接口同一套）。
     """
-    name = str(name or "").strip()
-    entries = _web_raw_entries(store)
-    idx = next((i for i, e in enumerate(entries) if str(e.get("name") or "") == name), -1)
-    if idx < 0:
-        raise KeyError(name)
-    current = dict(entries[idx])
+    current = dict(current)
     problems: list[str] = []
     # url / tools / roles / enabled / timeout_s：传了才改（None 视为没传）
     if body.get("url") is not None:
@@ -423,6 +442,34 @@ def update(store: Any, name: str, body: dict[str, Any]) -> dict[str, Any]:
     for h_name in remove_headers:
         names.discard(h_name)
     current["header_names"] = sorted(names)
+    return current, headers, remove_headers
+
+
+def preview_update(store: Any, name: str, body: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """不写库，先算出这次修改前后的条目：(旧条目, 新条目)（都不含头值）。
+
+    和 update 同一套校验：KeyError 没有这个网页条目；ValueError 校验失败。
+    管理员对话用它判断改动是「放宽」还是「收窄」，再决定要不要先等确认。
+    """
+    old = web_entry(store, name)
+    if old is None:
+        raise KeyError(name)
+    new, _headers, _remove = _merge_update(old, body)
+    return old, new
+
+
+def update(store: Any, name: str, body: dict[str, Any]) -> dict[str, Any]:
+    """修改一个网页 MCP 条目（只允许 source=web，接口层先挡 config）。
+
+    不传 / None 的字段保持原值；headers 里空字符串 = 不改这个头；remove_headers 删头。
+    KeyError 没有这个网页条目；ValueError 校验失败。
+    """
+    name = str(name or "").strip()
+    entries = _web_raw_entries(store)
+    idx = next((i for i, e in enumerate(entries) if str(e.get("name") or "") == name), -1)
+    if idx < 0:
+        raise KeyError(name)
+    current, headers, remove_headers = _merge_update(entries[idx], body)
     entries[idx] = current
     with store.tx() as conn:
         store.kv_set(conn, KV_MCP, entries)
@@ -507,3 +554,33 @@ def stored_headers_for(store: Any, settings: Settings, name: str) -> dict[str, s
         if s.name == name:
             return dict(s.headers)
     return {}
+
+
+async def try_connect(
+    url: str, headers: dict[str, str] | None = None, *, timeout_s: int = 20, transport: Any = None,
+) -> dict[str, Any]:
+    """只试连一次（initialize + tools/list），不保存：{"ok", "tools": [名字…≤50], "error"}。
+
+    网页「测试连接」（POST /api/extensions/mcp/test）和管理员对话的 mcp_test 共用。
+    地址必须 https://（密钥走这个请求，http 会泄露）——不合格抛 ValueError。
+    """
+    from .mcp_client import MCPError, McpSessionClient
+
+    url = str(url or "").strip()
+    if not url.startswith("https://"):
+        raise ValueError("MCP 端点地址必须 https:// 开头（密钥走这个请求，http 会泄露）")
+    client = McpSessionClient(url, "", timeout_s=max(1, int(timeout_s or 20)), transport=transport, headers=dict(headers or {}))
+    try:
+        tools = await client.list_tools()
+    except MCPError as e:
+        return {"ok": False, "tools": [], "error": str(e)}
+    except Exception as e:
+        logger.warning("试连 MCP 出意外错：%s", type(e).__name__, exc_info=True)
+        return {"ok": False, "tools": [], "error": f"连接出错：{type(e).__name__}"}
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+    names = [str(t.get("name") or "").strip() for t in tools if str(t.get("name") or "").strip()]
+    return {"ok": True, "tools": names[:_TOOL_NAMES_MAX], "error": ""}

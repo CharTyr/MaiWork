@@ -1329,9 +1329,39 @@ def _m_round_ref_marks(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN run_ref TEXT NOT NULL DEFAULT ''")
 
 
+# 第 48 步（2026-10-30，docs/34 专岗便条板）：每群一块便条板 agent_notes——专岗交回时
+# 留的「给别的岗看」的便条，主模型检查通过（review accepted）才贴上；from_kind 含 main。
+# 交接单表 agent_handoffs 由 agents.py 懒建；已有的老表补一列 notes（交回时暂存的便条，
+# 检查通过才搬上板）。表还没建到的半截库跳过（懒建时 DDL 已带这一列）。
+_AGENT_NOTES_DDL = (
+    "CREATE TABLE IF NOT EXISTS agent_notes ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " group_id TEXT NOT NULL,"
+    " from_kind TEXT NOT NULL,"
+    " to_kind TEXT NOT NULL DEFAULT '*',"
+    " body TEXT NOT NULL,"
+    " handoff_id TEXT NOT NULL DEFAULT '',"
+    " created REAL NOT NULL DEFAULT 0"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_agent_notes_group_created ON agent_notes(group_id, created)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_notes_handoff ON agent_notes(handoff_id)",
+)
+
+
+def _m_agent_notes(conn: sqlite3.Connection) -> None:
+    for stmt in _AGENT_NOTES_DDL:
+        conn.execute(stmt)
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_handoffs'").fetchone()
+    if exists is not None:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_handoffs)")}
+        if "notes" not in cols:
+            conn.execute("ALTER TABLE agent_handoffs ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的。
-# 库号对齐线上：45 = _m_hot_indexes（公开 0.11.1 已带），看板两步顺延为 46 / 47。
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids, _m_pending_ask_state, _m_goal_stale_notify, _m_skills, _m_task_sessions, _m_hot_indexes, _m_main_runs, _m_round_ref_marks]
+# 库号对齐线上：45 = _m_hot_indexes（公开 0.11.1 已带），看板两步顺延为 46 / 47；48 = 便条板。
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids, _m_pending_ask_state, _m_goal_stale_notify, _m_skills, _m_task_sessions, _m_hot_indexes, _m_main_runs, _m_round_ref_marks, _m_agent_notes]
 
 
 class Store:

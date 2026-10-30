@@ -176,7 +176,7 @@ class Ctx:
         elapsed_s / title 截断 / counts / last_step 占位。"""
         out = dict(item)
         for k in ("lane", "task_id", "_run_ref", "_trace_key",
-                  "trace", "_extra_think", "_finished_ts"):
+                  "trace", "_extra_think", "_finished_ts", "_notes"):
             out.pop(k, None)
         out["title"] = _clip(out.get("title") or "")
         out["group_name"] = self.group_name(out.get("group_id") or "")

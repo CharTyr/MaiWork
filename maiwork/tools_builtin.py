@@ -771,6 +771,12 @@ def register_builtin(
         challenge = _clean_challenge(args.get("challenge"))
         if challenge is not None:
             out["challenge"] = challenge
+        # 便条板（docs/34）：可选 0~2 条留给别的岗的便条；清洗在 agents.clean_notes 一处
+        from .agents import clean_notes
+
+        notes = clean_notes(args.get("notes_for_others"))
+        if notes:
+            out["notes_for_others"] = notes
         return ToolResult(ok=True, output=f"已交回：{summary}", data=out)
 
     tools.register(
@@ -927,6 +933,18 @@ def register_builtin(
                             "suggestion": {"type": "string", "description": "建议怎么改"},
                         },
                         "required": ["reason"],
+                    },
+                    "notes_for_others": {
+                        "type": "array",
+                        "description": "（可选，0~2 条）留给本群别的岗位看的便条：这次发现的、别的岗下次干活用得上的事实，每条不超过 80 字；不写个人隐私；上级检查通过才会贴出",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "to": {"type": "string", "description": "给哪个岗（news / idea / goal / 自定义岗 kind），给所有岗写 *"},
+                                "text": {"type": "string", "description": "便条正文，≤80 字"},
+                            },
+                            "required": ["text"],
+                        },
                     },
                 },
                 "required": ["summary"],

@@ -54,16 +54,16 @@ def _feeds_with_chat(tmp_path, reply: str):
 
 class TestMigration:
     def test_latest_version_is_47(self) -> None:
-        assert len(_MIGRATIONS) == 47, "第 45 步补索引、第 46 步追加主模型条目、第 47 步 round ref，历史迁移位置保持不变"
+        assert len(_MIGRATIONS) == 48, "第 45 步补索引、第 46 步追加主模型条目、第 47 步 round ref、第 48 步便条板，历史迁移位置保持不变"
         assert _MIGRATIONS[37].__name__ == "_m_idea_kind"
         assert _MIGRATIONS[39].__name__ == "_m_chat_log_ids"
 
     def test_fresh_db_has_kind_default_empty(self, tmp_path) -> None:
         store = Store(tmp_path / "t.db")
-        assert store.migrate() == 47
+        assert store.migrate() == 48
         cols = {r["name"] for r in store.read().execute("PRAGMA table_info(ideas)")}
         assert "kind" in cols
-        assert int(store._conn.execute("PRAGMA user_version").fetchone()[0]) == 47
+        assert int(store._conn.execute("PRAGMA user_version").fetchone()[0]) == 48
         # 不写 kind 的老式插入（老代码 / 老数据）拿到 ''
         with store.tx() as conn:
             conn.execute(
@@ -90,7 +90,7 @@ class TestMigration:
         finally:
             conn.close()
         store = Store(path)
-        assert store.migrate() == 47
+        assert store.migrate() == 48
         row = store.read().execute("SELECT title, kind FROM ideas").fetchone()
         assert row["title"] == "老构想" and row["kind"] == ""
         store.close()

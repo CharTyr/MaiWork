@@ -162,14 +162,24 @@ class TestRolesAndGuards:
         assert not (admin_specs & main_specs)
 
     def test_no_secret_tools(self, svc: _Svc) -> None:
-        """任何名字像密钥/端点/宿主管理的工具都不许存在。"""
-        names = {s["function"]["name"] for s in svc.tools.specs("admin")}
-        bad = ("secret", "api_key", "apikey", "token", "password", "endpoint",
-               "base_url", "restart", "maibot", "planner", "plugin")
+        """任何名字像密钥/宿主管理的工具都不许存在；任何工具的参数表里都不许有密钥字段。
+
+        端点和模型库能在对话里改（用户定：和网页同一套校验，新增端点 / 改地址要确认），
+        但密钥一律不经过对话：参数表里没有 api_key / headers 这类字段。"""
+        specs = svc.tools.specs("admin")
+        names = {s["function"]["name"] for s in specs}
+        bad = ("secret", "api_key", "apikey", "token", "password",
+               "restart", "maibot", "planner", "plugin")
         for n in names:
             low = n.lower()
             for frag in bad:
                 assert frag not in low, f"工具 {n} 名字里不该出现 {frag}"
+        secret_params = ("api_key", "apikey", "key", "headers", "header", "remove_headers",
+                         "token", "secret", "password", "authorization", "cookie")
+        for s in specs:
+            props = ((s["function"].get("parameters") or {}).get("properties") or {})
+            for p in props:
+                assert p.lower() not in secret_params, f"工具 {s['function']['name']} 的参数里不该有 {p}"
 
     @pytest.mark.asyncio
     async def test_non_served_group_rejected(self, svc: _Svc) -> None:

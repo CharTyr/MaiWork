@@ -1421,6 +1421,11 @@ class Feeds:
         self._round_reports: contextvars.ContextVar = contextvars.ContextVar(
             "feeds_round_reports", default=None
         )
+        # 本轮（一次 prepare_news）检查通过的 news 交接单 id：便条先压着，这批资讯真发出来
+        # （批次 kept>0 入库）才把它们的便条贴上板（docs/34 §五 4）；没出 → 丢弃。
+        self._round_note_hids: contextvars.ContextVar = contextvars.ContextVar(
+            "feeds_round_note_hids", default=None
+        )
         # 话头火花（docs/18 §十一）：每群最近一条「明显在为难 / 想要」的发言时间。
         # 纯内存（intake 每条消息都会碰它，不能每条写库）；当天出没出过记在 kv。
         self._spark_ts: dict[str, float] = {}
@@ -1775,7 +1780,11 @@ class Feeds:
                 self._settle_stage_reports_local(reports, reason="该环节已处理", gid=gid)
 
     def _settle_stage_reports_local(self, reports: list[Any], *, reason: str, gid: str = "") -> None:
-        """对一轮登记过的专岗报告做 review 收尾；learn=False（主流程再决定记不记忆）。"""
+        """对一轮登记过的专岗报告做 review 收尾；learn=False（主流程再决定记不记忆）。
+
+        便条板（docs/34 §五 4）：这里的 accepted 只说明「该环节交回了结构有效的产物」，
+        不代表这批资讯出了——post_notes=False 先压着，通过的单记进本轮名单，
+        等批次真有条目入库（_post_round_notes）才贴。"""
         specialists = getattr(self, "_specialists", None)
         if specialists is None:
             return
@@ -1797,9 +1806,29 @@ class Feeds:
                     summary if accepted else f"{summary}（被拒：{reason}）",
                     refs=(),
                     learn=False,
+                    post_notes=False,
                 )
             except Exception:
                 logger.exception("专岗 review 收尾失败（%s）", hid)
+                continue
+            if accepted:
+                held = self._round_note_hids.get()
+                if isinstance(held, list):
+                    held.append(hid)
+
+    def _post_round_notes(self, gid: str) -> None:
+        """这批资讯真发出来了（批次 kept>0 已入库）：把本轮检查通过的 news 交接单暂存的便条
+        贴上板（隐私闸 / 上限 / 过期走 Agents.post_held_notes，和 review 同一套）。出错只记日志。"""
+        held = self._round_note_hids.get()
+        if not isinstance(held, list) or not held:
+            return
+        agents = self._sp_agents_of(getattr(self, "_specialists", None))
+        if agents is None or not hasattr(agents, "post_held_notes"):
+            return
+        try:
+            agents.post_held_notes(str(gid), list(held))
+        except Exception:
+            logger.exception("资讯岗便条入板失败（群 %s）", gid)
 
     def _news_records_finish(
         self,
@@ -1898,9 +1927,11 @@ class Feeds:
             ref = ""
         scope = run_ref.tagged(ref)
         await scope.__aenter__()
+        note_token = self._round_note_hids.set([])  # 本轮压着便条的 news 交接单（docs/34 §五 4）
         try:
             return await self._prepare_news_round(group_id)
         finally:
+            self._round_note_hids.reset(note_token)
             try:
                 await scope.__aexit__(None, None, None)
             except Exception:
@@ -2142,6 +2173,11 @@ class Feeds:
                 source_mode="rss_only" if rss_mode else "",
             ),
         )
+        # 便条板（docs/34 §五 4，用户 2026-10-30 定）：资讯岗的便条只有这批资讯真发出来才贴。
+        # 「发出来」= 这一批入库且有条目通过（kept>0 → skipped=0、条目 rejected=0 上资讯页）；
+        # 没出（kept=0 / 前面早退的 skipped / 失败）→ 本轮压着的便条丢弃。卡片推不推群不算条件。
+        if kept and batch_id:
+            self._post_round_notes(gid)
         # 自动源每源统计（docs/10 §九 第二步）：按 feed_id 记「这轮给了几条候选 / 哪几条进了资讯」，
         # 自动退订（auto_sources.unsubscribe_stale）拿它判。任何异常都不能影响出资讯。
         try:
@@ -3028,7 +3064,7 @@ class Feeds:
         mem_block = self._prompt_block_safe("memory", group_id=gid)
         # AGENTS.md（做事规矩，含管理员写的搜索要求）和工作记忆一起，在定关注点时就生效；
         # 本群三份统一注入（docs/17 §八.2）：本群规矩 + 本群<资讯>做法（替换原来的「资讯偏好」+「口味小结」）
-        gc = self._group_context_safe(gid, "news")
+        gc = self._group_context_safe(gid, "news", include_notes=True)  # 便条板 docs/34
         lines = ([agents_block.strip()] if agents_block else [])
         lines += ([mem_block.strip()] if mem_block else [])
         lines += ([gc.strip()] if gc else [])
@@ -5216,7 +5252,7 @@ class Feeds:
             logger.debug("读自动反馈失败（群 %s）", gid, exc_info=True)
         return {"up": up, "down": down, "auto": auto}
 
-    def _group_context_safe(self, gid: str, kind: str) -> str:
+    def _group_context_safe(self, gid: str, kind: str, *, include_notes: bool = False) -> str:
         """统一注入（docs/17 §八.2）：本群规矩 + 本群<岗>的做法。没接线 / 出错 → ""。
 
         先用专岗（_specialists.agents）；没接时退回 feeds._agents（测试 / 某些场景 feeds 不挂专岗）。
@@ -5230,7 +5266,7 @@ class Feeds:
         try:
             from . import group_context as _gc
 
-            return str(_gc.group_context(agents, str(gid), kind) or "").strip()
+            return str(_gc.group_context(agents, str(gid), kind, include_notes=include_notes) or "").strip()
         except Exception:
             logger.warning("读本群规矩 / 做法出错（群 %s 岗 %s），这次不注入", gid, kind, exc_info=True)
             return ""
@@ -5322,7 +5358,7 @@ class Feeds:
         mem_block = self._prompt_block_safe("memory", group_id=gid)
         if mem_block:
             prefix_parts.append(mem_block.strip())
-        gc = self._group_context_safe(gid, "idea")
+        gc = self._group_context_safe(gid, "idea", include_notes=True)  # 便条板 docs/34
         if gc:
             prefix_parts.append(gc.strip())
         # 内置 skill idea-shaping（main 角色）：这一回合是纯 JSON 调用、没有 skill 工具，要点直接注入
@@ -5396,7 +5432,11 @@ class Feeds:
             ' "feasibility": {"level": "ok", "note": "一句话：为什么这一步真做得到",'
             ' "uses": ["用到的本事名（至少 1 个，只从上面清单里挑）"],'
             ' "deliver": "page"|"doc"|"tool"|"report", "needs_members": false}}'
-            '} | null}'
+            '} | null'
+            + (', "notes_for_others": [可选 0~2 条 {"to": "news"|"goal"|"*", "text": "≤80 字：'
+               '看了构想调查同事交回的素材，值得让别的岗知道的事实；没有就 []"}]'
+               if idea_candidate is not None else '')
+            + '}'
             f"。items 是 MaiWork 自己能做完的那部分，最多 {_IDEA_ITEMS_MAX} 个：kind=task 是能一次"
             "做完、有交付物的事，kind=goal 只用于 MaiWork 自己能在网上长期盯着的事"
             "（例：盯版本更新、盯某个发布）；要群友动手的不要写成 goal。**克制**：最好只给 1 个 task + "
@@ -5529,7 +5569,8 @@ class Feeds:
                 )
             except Exception:
                 logger.exception("构想进话题候选池失败（群 %s 条 %s）", gid, idea_id)
-        self._idea_finish(gid, idea_report, idea_candidate, idea_id, title)
+        self._idea_finish(gid, idea_report, idea_candidate, idea_id, title,
+                          main_notes=data.get("notes_for_others") if idea_candidate is not None else None)
         return idea_id
 
     # ------------------------------------------------------------------
@@ -5647,6 +5688,7 @@ class Feeds:
 
     def _idea_finish(
         self, gid: str, report: Any, candidate: dict | None, idea_id: int, title: str,
+        *, main_notes: Any = None,
     ) -> None:
         """入库之后收尾：专岗 review(True/False, learn=False)；accpeted 时本岗记「已审核构想」「构想」。
 
@@ -5666,6 +5708,8 @@ class Feeds:
                 f"{summary}（主流程已落库想法 {int(idea_id)}）" if ok else summary,
                 refs=(f"idea:{int(idea_id)}", f"handoff:{hid}") if hid and ok else (f"idea:{int(idea_id)}",),
                 learn=False,
+                # 便条板（docs/34）：主模型在同一份回包里附的便条，随检查通过一起贴
+                **({"main_notes": main_notes} if (accepted and main_notes) else {}),
             )
         except Exception:
             logger.exception("idea 专岗 review 收尾失败（群 %s hid %s）", gid, hid)

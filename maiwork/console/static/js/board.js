@@ -162,6 +162,14 @@ function stepHTML(s, i) {
   return `<li class="st st-status"><div class="st-row">${t}<span class="st-badge">状态</span><span class="st-sub">${clip(s.text)}</span></div></li>`;
 }
 
+// 便条板（docs/34）：/api/board/items 回包顶层 notes = 这次交接单留给别的岗的便条；没有就不显示这块
+function notesHTML(notes) {
+  if (!Array.isArray(notes) || !notes.length) return "";
+  const who = (k) => (k === "main" ? "主模型" : k === "*" ? "所有岗" : ((((state.board && state.board.lanes) || []).find((l) => l.kind === k) || {}).kind_title || k));
+  return `<h2 class="h-sub">留给别的岗的便条 <small>${notes.length} 条</small></h2>
+    <ul class="bi-notes">${notes.map((n) => `<li><span class="h-meta">${esc(who(n.from_kind))} → ${esc(who(n.to_kind))}</span><div>${esc(n.body)}</div></li>`).join("")}</ul>`;
+}
+
 export function boardItemSheet() {
   const cur = state.boardItem;
   if (!cur) return "";
@@ -177,6 +185,7 @@ export function boardItemSheet() {
     <div class="bi-meta"><span class="dot ${dotOf(it)}"></span>${esc(it.status_text || it.status || "")}${it.started ? ` · 开始 ${esc(when(it.started))}` : ""}${it.finished ? ` · 结束 ${esc(when(it.finished))}` : ""} · 用时 ${dur(it.elapsed_s)}</div>
     ${d && d.link === "time_window" ? `<div class="warn-box">这类工作没有直接记下归属，下面的过程是按同群、同时段推断的，可能混入同一时间的其他工作。</div>` : ""}
     ${cur.err ? `<div class="warn-box">${esc(cur.err)}</div>` : ""}
+    ${notesHTML(d && d.notes)}
     <h2 class="h-sub">过程 <small>${steps.length} 步 · 工具 ${tools} · 思考 ${thinks}</small></h2>
     ${!d && !cur.err ? loading() : steps.length ? `<ol class="steps">${steps.map(stepHTML).join("")}</ol>` : `<p class="h-meta">暂无过程记录。</p>`}
     ${steps.length >= 500 ? `<p class="h-meta">只显示前 500 步。</p>` : ""}

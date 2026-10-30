@@ -42,9 +42,9 @@ def test_schema_44_upgrade_and_idempotence(tmp_path):
             step(value.read())
         value.read().execute("PRAGMA user_version=43")
         Tasks(value, lambda: None).create(GID, title="旧任务", req="", criteria=[], source="admin")
-        assert value.migrate() == 47
+        assert value.migrate() == 48
         _MIGRATIONS[-1](value.read())
-        assert value.migrate() == 47
+        assert value.migrate() == 48
         old = value.read().execute("SELECT * FROM tasks WHERE id='T-1'").fetchone()
         assert old["session_id"] is None and old["turn_no"] is None
         assert value.read().execute("SELECT count(*) FROM task_sessions").fetchone()[0] == 0

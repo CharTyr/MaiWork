@@ -52,6 +52,10 @@ ALL_ADMIN_TOOLS = {
     "run_news_now", "make_idea_now", "refresh_profile",
     # 任务 / 目标 / 请求
     "create_task", "create_goal", "goal_adjust", "approve_request", "reject_request", "cancel_task",
+    # 改设置（和网页同一套校验；行为测试在 test_admin_settings_tools.py）
+    "mcp_add", "mcp_update", "mcp_test", "mcp_reload",
+    "list_agents", "agent_update", "agent_create", "agent_delete", "agent_detail",
+    "list_models", "endpoint_save", "endpoint_delete", "model_save", "model_delete",
 }
 
 NOW = time.time()

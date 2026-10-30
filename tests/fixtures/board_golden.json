@@ -911,7 +911,8 @@
           "ts": 1799999700.0,
           "type": "status"
         }
-      ]
+      ],
+      "notes": []
     },
     "handoff/h-fail": {
       "item": {
@@ -1072,7 +1073,8 @@
           "ts": 1799999900.0,
           "type": "think"
         }
-      ]
+      ],
+      "notes": []
     },
     "handoff/h-queued": {
       "item": {
@@ -1113,7 +1115,8 @@
           "ts": 1799999950.0,
           "type": "status"
         }
-      ]
+      ],
+      "notes": []
     },
     "handoff/h-rej": {
       "item": {
@@ -1259,7 +1262,8 @@
           "ts": 1799999900.0,
           "type": "think"
         }
-      ]
+      ],
+      "notes": []
     },
     "handoff/h-run": {
       "item": {
@@ -1315,7 +1319,8 @@
           "ts": 1799999900.0,
           "type": "think"
         }
-      ]
+      ],
+      "notes": []
     },
     "handoff/h-run-stuck": {
       "item": {
@@ -1389,7 +1394,8 @@
           "ts": 1799999360.0,
           "type": "think"
         }
-      ]
+      ],
+      "notes": []
     },
     "idea/1": {
       "item": {

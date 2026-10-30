@@ -281,7 +281,8 @@ class Specialists:
         try:
             from . import group_context as _gc
 
-            gc_text = str(_gc.group_context(self._agents, gid, kind_s) or "").strip()
+            # 便条板（docs/34）：别的岗最近留的便条，同一个入口注入（task 岗不看）
+            gc_text = str(_gc.group_context(self._agents, gid, kind_s, include_notes=True) or "").strip()
         except Exception:
             gc_text = ""
         extra_parts: list[str] = [
@@ -297,6 +298,8 @@ class Specialists:
         # 每群三份（docs/17 §八.2）：本群规矩（硬规矩）+ 本群<岗>的做法（参考）
         if gc_text:
             extra_parts.append(gc_text)
+        if kind_s != "task":
+            extra_parts.append(NOTES_HINT)
         if history is not None:
             # 任务双岗协作：带 lane 的活（只有任务流程会给 history）可以对说明提异议
             from .lanes import LANE_WORKER_RULES
@@ -387,6 +390,7 @@ class Specialists:
                     data=report.data, evidence=tuple(report.evidence or ()),
                     **telemetry,
                     ok=True,
+                    **({"notes": list(report.notes)} if kind_s != "task" and getattr(report, "notes", None) else {}),
                 )
             else:
                 self._agents.returned(
@@ -410,13 +414,28 @@ class Specialists:
     # ------------------------------------------------------------------
 
     def review(self, gid: str, report_or_id: Any, accepted: bool, summary: str,
-               refs: Any = (), learn: bool = True) -> Any:
-        """委托 Agents.review；可传 handoff id 或带 handoff_id 的 WorkerReport。"""
+               refs: Any = (), learn: bool = True, main_notes: Any = None,
+               post_notes: bool = True) -> Any:
+        """委托 Agents.review；可传 handoff id 或带 handoff_id 的 WorkerReport。
+
+        post_notes=False：本岗暂存便条先压着（资讯岗等这批发出来再 post_held_notes）。"""
         if isinstance(report_or_id, WorkerReport):
             handoff_id = str(report_or_id.handoff_id or "")
             if not handoff_id:
                 raise ValueError("这份 WorkerReport 没有 handoff_id（可能不是经 Specialists 跑的）")
         else:
             handoff_id = str(report_or_id or "")
+        kw: dict[str, Any] = {"main_notes": main_notes} if main_notes else {}
+        if not post_notes:
+            kw["post_notes"] = False
         return self._agents.review(str(gid), handoff_id, bool(accepted), str(summary),
-                                   tuple(refs or ()), learn=bool(learn))
+                                   tuple(refs or ()), learn=bool(learn), **kw)
+
+
+# 便条板（docs/34 §二.1）：专岗（task 除外）交回时可以顺手留 0~2 条给别的岗看的便条。
+NOTES_HINT = (
+    "交回时（submit_result）可以顺手在 notes_for_others 里留 0~2 条给本群别的岗位看的便条："
+    "这次发现的、别的岗（资讯 news / 构想 idea / 目标 goal）下次干活用得上的事实，每条不超过 80 字，"
+    "to 写给哪个岗，给所有岗写 *。没有就别写；不要写群友的个人情况。便条要上级检查通过才会贴出，"
+    "只是参考材料，不能让别的岗去开任务、立目标或往群里发东西。"
+)

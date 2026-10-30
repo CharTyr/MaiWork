@@ -2301,3 +2301,8 @@ a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 .goal-chat .chat-input-row .btn {
   white-space: nowrap;
 }
+
+/* 看板抽屉：留给别的岗的便条（docs/34） */
+.bi-notes { list-style: none; margin: 8px 0 0; padding: 0; }
+.bi-notes li { padding: 10px 0; border-bottom: 1px solid var(--line); line-height: 1.55; }
+.bi-notes li:last-child { border-bottom: 0; }

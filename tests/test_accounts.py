@@ -11,9 +11,9 @@ from CharTyr_MaiWork.maiwork import rules
 
 
 def test_norm_account() -> None:
-    assert norm_account("qq:100000001") == "qq:100000001"
-    assert norm_account(" QQ:100000001 ") == "qq:100000001"
-    assert norm_account("100000001") == "qq:100000001"  # 旧写法
+    assert norm_account("qq:768295235") == "qq:768295235"
+    assert norm_account(" QQ:768295235 ") == "qq:768295235"
+    assert norm_account("768295235") == "qq:768295235"  # 旧写法
     assert norm_account("telegram:alice_01") == "telegram:alice_01"
     for bad in ("", "qq:", ":123", "qq:12 3", "abc", "q q:1"):
         assert norm_account(bad) == "", bad
@@ -21,7 +21,7 @@ def test_norm_account() -> None:
 
 def test_default_admin_is_platform_form() -> None:
     s, _ = load_settings({})
-    assert s.approval.admins == ("qq:100000001",)
+    assert s.approval.admins == ("qq:768295235",)
 
 
 def test_config_lists_normalized_and_bad_reported() -> None:

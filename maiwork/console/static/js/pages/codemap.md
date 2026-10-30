@@ -12,7 +12,7 @@
 - 图解通过 `GET /api/news/{id}/viz` 按需取 HTML，装入仅 `allow-scripts` 的沙箱 iframe；`MutationObserver` 填充、`postMessage` 校正高度，内存缓存避免刷新时重取。
 - `ideas.js`：`viewIdeas()` 和 `ideaDetail()` 展示构想及选项；`ideaAsk()` 拼出复制到群内交给 MaiBot 的要求，`findIdea()` 从当前群视图找构想。`kind==="talk"`（话题类，`pureIdea()`）在列表上标「话题」，详情以「交给我的 agent」为主、不出「直接开工 / 复制要求」；help 和老构想（kind 空）照旧。拦截提示把「做不到」和「说不出群里真实需要」的合在一起数（docs/18 §十）。
 - `goals.js`：`goalSections()` 在「在做的事」里区分 MaiWork 推进的目标与群友的提醒，`nextText()` 解释下次检查时间。
-- `tasks.js`：`viewTasks()` 展示「在做的事」：待批、按状态筛选的任务、持续目标与成员提醒；`taskRow()` 供列表与详情复用；待批构想项通过 `findIdea()` 交叉引用。
+- `tasks.js`：`viewTasks()` 展示「在做的事」：待批、按状态筛选的任务、持续目标与成员提醒；`taskRow()` 供列表与详情复用；待批构想项通过 `findIdea()` 交叉引用。2026-10-14 增加管理员待复核 @ 列表（tasks.review / review_error）；可转为任务 / 目标请求或忽略，始终人工审批，动作走 actions.js 的 ask-review，带当前群保护、确认和重复点击禁用。
 - `group.js`：`viewGroup()` 组织群状态、开话题记录、「这个群」区（只给总管理员 / 本群群管理员，`ctxBlock()` → `groupctx.js`）、群画像、「群指令」卡片（`commandsBlock(v)` 读 `v.commands`，按 who 分组列写法 / 说明 / 例子，「复制给群友」复用通用 `data-act="copy"` 复制帮助全文；所有人可见，新群也显示）、群空间能力及关注成员；管理员视图接上 `controlsSection()` → `groupcontrols.js`（「往群里发」+「谁能批本群的活」）——批准 / 免批名单只读、总管理员才显示「改名单」。通过 `gplat()` / `platTag()` 区分平台；非 `qq` 群的 `groupSpaceBlock(v, g)` 不画 OneBot 群文件/公告/相册控件，而说明成品走网页链接。个人画像只在管理视图渲染，服务器仍需独立执行鉴权。
 
 ## Flow

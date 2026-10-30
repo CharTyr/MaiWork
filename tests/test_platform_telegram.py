@@ -5,7 +5,7 @@
 - Telegram 适配器（exynos967.telegram-adapter 1.3.1）平台名 "telegram"。
 - 入站群消息 group_info.group_id = 虚拟群 ID：普通群就是 chat_id（负数，如 "-1001234567890"），
   话题群形如 "<chat_id>::tg-topic::mt=<id>"（分隔符 "::tg-topic::"）。
-- 机器人自己在 Telegram 的账号：bot_config 的 bot.platforms = ["tg:1000000003"]。
+- 机器人自己在 Telegram 的账号：bot_config 的 bot.platforms = ["tg:8265271082"]。
 - Telegram 适配器没有任何 api.call 接口（没有群文件、公告、相册、成员身份/名片）。
 - 出站：send.hybrid 平台无关，但 at 段被 Telegram 适配器丢弃，要退成正文「@名字 」。
 """
@@ -154,20 +154,20 @@ class TestTelegramGroupConfig:
 
 class TestNormAccountTelegram:
     def test_tg_alias_normalized(self) -> None:
-        assert norm_account("tg:1000000003") == "telegram:1000000003"
+        assert norm_account("tg:8265271082") == "telegram:8265271082"
 
     def test_telegram_preserved(self) -> None:
-        assert norm_account("telegram:1000000003") == "telegram:1000000003"
+        assert norm_account("telegram:8265271082") == "telegram:8265271082"
 
     def test_case_insensitive_platform(self) -> None:
-        assert norm_account("TG:1000000003") == "telegram:1000000003"
+        assert norm_account("TG:8265271082") == "telegram:8265271082"
 
     def test_still_qq_default_for_digits(self) -> None:
-        assert norm_account("100000001") == "qq:100000001"
+        assert norm_account("768295235") == "qq:768295235"
 
     def test_telegram_admin_accepted(self) -> None:
-        s, _ = load_settings(_base_config(approval={"admins": ["tg:1000000003"]}))
-        assert s.approval.admins == ("telegram:1000000003",)
+        s, _ = load_settings(_base_config(approval={"admins": ["tg:8265271082"]}))
+        assert s.approval.admins == ("telegram:8265271082",)
 
     def test_telegram_exempt_accepted(self) -> None:
         s, _ = load_settings(
@@ -266,9 +266,9 @@ class TestIntakePlatformFiltering:
     async def test_bot_own_message_telegram_skipped(self) -> None:
         intake, signals = self._mk(
             serve=[f"telegram:{TG_PLAIN}"],
-            bot_qq=lambda: "1000000003",
+            bot_qq=lambda: "8265271082",
         )
-        msg = hook_message(group_id=TG_PLAIN, user_id="1000000003", is_at=True, text="/mw 帮助")
+        msg = hook_message(group_id=TG_PLAIN, user_id="8265271082", is_at=True, text="/mw 帮助")
         msg["message"]["platform"] = "telegram"
         msg["message"]["message_info"]["platform"] = "telegram"
         await intake.handle(msg)
@@ -313,12 +313,12 @@ class TestHostPlatformAwareness:
                     {
                         "group_id": TG_PLAIN,
                         "session_id": "sess-tg",
-                        "account_id": "1000000003",
+                        "account_id": "8265271082",
                     },
                 ]},
                 "config.get": lambda key, **kw: {
                     "bot.qq_account": "99999",
-                    "bot.platforms": ["tg:1000000003"],
+                    "bot.platforms": ["tg:8265271082"],
                 }.get(key),
             }
         )
@@ -333,7 +333,7 @@ class TestHostPlatformAwareness:
     async def test_person_id_uses_platform(self) -> None:
         ctx = FakeCtx({"person.get_id": "person-1"})
         h = Host(ctx)
-        pid = await h.person_id("1000000003", platform="telegram")
+        pid = await h.person_id("8265271082", platform="telegram")
         assert pid == "person-1"
         name, kw = ctx.calls[0]
         assert name == "person.get_id"
@@ -343,7 +343,7 @@ class TestHostPlatformAwareness:
     async def test_person_id_default_qq_unchanged(self) -> None:
         ctx = FakeCtx({"person.get_id": "person-1"})
         h = Host(ctx)
-        pid = await h.person_id("100000001")
+        pid = await h.person_id("768295235")
         assert pid == "person-1"
         name, kw = ctx.calls[0]
         assert kw["platform"] == "qq"
@@ -371,13 +371,13 @@ class TestHostPlatformAwareness:
                 {
                     "message_id": "1",
                     "timestamp": 1.0,
-                    "message_info": {"user_info": {"user_id": "1000000003"}},
+                    "message_info": {"user_info": {"user_id": "8265271082"}},
                     "processed_plain_text": "hi",
                 },
             ],
         })
         h = Host(ctx, bot_qq="99999")
-        msgs = await h.messages("sid", 0, 10, 10, bot_id="1000000003")
+        msgs = await h.messages("sid", 0, 10, 10, bot_id="8265271082")
         assert msgs[0].is_bot is True
 
     @pytest.mark.asyncio
@@ -399,12 +399,12 @@ class TestHostPlatformAwareness:
         ctx = FakeCtx({
             "chat.get_group_streams": {
                 "streams": [
-                    {"group_id": TG_PLAIN, "session_id": "s", "account_id": "1000000003", "group_name": "TG 测试群"},
+                    {"group_id": TG_PLAIN, "session_id": "s", "account_id": "8265271082", "group_name": "TG 测试群"},
                 ],
             },
             "config.get": lambda key, **kw: {
                 "bot.qq_account": "99999",
-                "bot.platforms": ["tg:1000000003"],
+                "bot.platforms": ["tg:8265271082"],
             }.get(key),
         })
         h = Host(ctx)
@@ -665,13 +665,13 @@ class TestApprovalsPlatformAwareness:
         assert ap.is_admin("10002") is False
 
     def test_is_admin_telegram(self, tmp_path: Path) -> None:
-        ap = self._mk_approvals([f"telegram:{TG_PLAIN}"], ["telegram:1000000003"], tmp_path)
-        assert ap.is_admin("1000000003", platform="telegram") is True
-        assert ap.is_admin("1000000003", platform="qq") is False
+        ap = self._mk_approvals([f"telegram:{TG_PLAIN}"], ["telegram:8265271082"], tmp_path)
+        assert ap.is_admin("8265271082", platform="telegram") is True
+        assert ap.is_admin("8265271082", platform="qq") is False
 
     def test_is_admin_tg_alias_matches(self, tmp_path: Path) -> None:
-        ap = self._mk_approvals([f"telegram:{TG_PLAIN}"], ["tg:1000000003"], tmp_path)
-        assert ap.is_admin("1000000003", platform="telegram") is True
+        ap = self._mk_approvals([f"telegram:{TG_PLAIN}"], ["tg:8265271082"], tmp_path)
+        assert ap.is_admin("8265271082", platform="telegram") is True
 
     def test_is_group_admin_telegram(self, tmp_path: Path) -> None:
         from CharTyr_MaiWork.maiwork.group_admins import GroupAdmins
@@ -760,9 +760,9 @@ class TestHostAutoPlatform:
         ctx = FakeCtx({
             "message.get_by_time_in_chat": [
                 {"message_id": "1", "timestamp": 1.0,
-                 "message_info": {"user_info": {"user_id": "1000000003"}}, "processed_plain_text": "hi"},
+                 "message_info": {"user_info": {"user_id": "8265271082"}}, "processed_plain_text": "hi"},
             ],
-            "config.get": lambda key, **kw: {"bot.qq_account": "99999", "bot.platforms": ["tg:1000000003"]}.get(key),
+            "config.get": lambda key, **kw: {"bot.qq_account": "99999", "bot.platforms": ["tg:8265271082"]}.get(key),
         })
         h = self._host(ctx)
         msgs = await h.messages("sess-tg", 0, 10, 10)
@@ -771,7 +771,7 @@ class TestHostAutoPlatform:
     @pytest.mark.asyncio
     async def test_session_for_group_without_platform_uses_config(self) -> None:
         ctx = FakeCtx({"chat.get_group_streams": {"streams": [
-            {"group_id": TG_PLAIN, "session_id": "sess-x", "account_id": "1000000003"}]}})
+            {"group_id": TG_PLAIN, "session_id": "sess-x", "account_id": "8265271082"}]}})
         h = self._host(ctx)
         assert await h.session_for_group(TG_PLAIN) == "sess-x"
         assert ctx.calls[0][1]["platform"] == "telegram"
@@ -792,10 +792,10 @@ class TestIntakeBotAccountPerPlatform:
         intake = Intake(
             lambda: settings, Signals(), jev=None, approvals=None, mentions=None,
             commands=_Cmds(), bot_qq=lambda: "99999",
-            bot_account=lambda plat: "1000000003" if plat == "telegram" else "",
+            bot_account=lambda plat: "8265271082" if plat == "telegram" else "",
             spawn=lambda c: ran.append("spawn") or c.close(),
         )
-        msg = hook_message(group_id=TG_PLAIN, user_id="1000000003", text="/mw 帮助")
+        msg = hook_message(group_id=TG_PLAIN, user_id="8265271082", text="/mw 帮助")
         msg["message"]["platform"] = "telegram"
         await intake.handle(msg)
         assert ran == []  # 机器人自己发的 /mw 不当指令

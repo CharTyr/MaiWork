@@ -136,13 +136,13 @@ class TestSeed:
             serve=("qq:" + G1, "telegram:" + TG),
             approval={
                 "required": True,
-                "admins": ["qq:" + QQ_ADMIN, "telegram:1000000003"],
-                "exempt_users": ["qq:10001", "telegram:1000000003"],
+                "admins": ["qq:" + QQ_ADMIN, "telegram:8265271082"],
+                "exempt_users": ["qq:10001", "telegram:8265271082"],
                 "exempt_groups": ["telegram:" + TG],
             },
         )
         tg = world.gv.get(TG)
-        assert tg.exempt_users == ("telegram:1000000003",)  # 只种本群平台的免批人
+        assert tg.exempt_users == ("telegram:8265271082",)  # 只种本群平台的免批人
         assert tg.exempt_group is True                       # exempt_groups 按本群平台种
         qq = world.gv.get(G1)
         assert qq.exempt_users == ("qq:10001",)

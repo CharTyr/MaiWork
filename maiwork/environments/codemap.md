@@ -1,20 +1,23 @@
 # plugin/CharTyr_MaiWork/maiwork/environments/
 
-执行环境模块。为 MaiWork 提供三种干活载体：本机（Local）、一次性 VM（Railway）、专用 SSH 机器（SshEnv）。本模块决定“活在哪跑、用什么用户身份、有什么资源限制”，并把工作区文件读写给隔离起来。
+执行环境模块。为 MaiWork 提供四种干活载体：本机（Local）、一次性 VM（Railway 或 Freestyle，用户在设置里单选一家）、专用 SSH 机器（SshEnv）。本模块决定“活在哪跑、用什么用户身份、有什么资源限制”，并把工作区文件读写给隔离起来。
 
 ## Responsibility
 
 这个目录解决一个核心问题：**子 agent 的命令和文件不能碰到 MaiBot 宿主、不能碰到别的群的工作区、不能碰到本机服务与内网（2026-10-12 起默认挡，见下）、不能超过资源限额**。
 
-五个文件的职责：
+七个文件的职责：
 
 | 文件 | 做什么 |
 |------|--------|
 | `capability.py` | 启动时探测一次本机能不能隔离跑命令，输出三种判定：`fixed` / `dynamic` / `stopped`。绝不真跑 systemd-run 或 useradd。 |
 | `local.py` | 本机执行环境。两种模式：`systemd`（生产隔离）和 `direct`（本机开发测试用，无隔离）。提供 run / start / status / logs / stop / read_file / write_file / list_files。 |
 | `openssh_client.py` | 本机 OpenSSH 客户端（ssh / scp / ssh-keygen）的最小环境与启动名。ssh.py 和 railway.py 共用，平台差异只写这一份。 |
-| `ssh.py` | 专用 SSH 机器执行环境（用户自己的 VPS/VM）。acquire / run / put / get / release / check_all / status。 |
-| `railway.py` | railway.new 一次性 VM 执行环境。acquire / run / put / get / release / usage_today / current_box。 |
+| `ssh.py` | 专用 SSH 机器执行环境（用户自己的 VPS/VM）。acquire / run / put / get / release / check_all / status；ensure_key 检查客户端依赖与公钥，initialization_error 提供网页安全错误提示；客户端经 openssh_client 启动。 |
+| `railway.py` | railway.new 一次性 VM 执行环境。acquire / run / put / get / release / usage_today / current_box。`Box` 带 `kind="railway"` / `remote_root="/app"`；进程同样用 openssh_client 的最小环境与绝对路径。 |
+| `freestyle.py` | Freestyle 一次性 VM 执行环境（2026-10-15，**未用真 key 实测**）。acquire / run / put / get / release（真 DELETE）/ check_key / usage_today / current_box；httpx + 可注入 transport；`FreestyleBox` 带 `kind="freestyle"` / `remote_root="/root/maiwork"`。 |
+| `container.py` | Docker / 容器探测（2026-10-25，**未在真 Docker 里实测**）：`in_docker()`（/.dockerenv、/run/.containerenv、/proc/1/cgroup 含 docker/containerd/kubepods）、`data_dir_persisted(path)`（读 /proc/self/mountinfo，覆盖它的最长挂载点是 overlay 根 → False，其它 → True，读不到 → None）。只读文件、不跑命令、读取可注入。消费方：`console/views.py` 的 `in_docker` / `data_dir_info` / `_container_health`，`onboarding._docker_items`。 |
+| `vm_platforms.py` | 一次性 VM 平台预设表（railway / freestyle）：`VMPreset` / `PRESETS` / `selected_kind` / `enabled_kinds` / `VMRouter` / `describe` / `make_env`。加第三家平台 = 加一个实现 + 一条注册。 |
 | `__init__.py` | 导出 `LocalEnv`、`RunResult`、`capability`。`RailwayEnv`、`SshEnv` 由 app.py 用 `_import_m2_class` 懒加载，不走这里。 |
 
 ## Design
@@ -93,12 +96,28 @@ stopped → 其它所有情况（非 Linux、没 systemd、非 root）
 - `run`：剩余时间 < timeout_s + 120 秒就拒（机器快到期）。
 - **不能主动销毁**：官方没有销毁命令。release 只做「本地删 key + 释放锁」，等它 60 分钟到点被官方回收。
 
-**回退逻辑（coordinator.py）**：
+**回退逻辑（coordinator.py，按 `box.kind` 查 `vm_platforms` 分派）**：
 
-1. 主模型选 `env: "ssh"` → 申请专用机器；拿不到 → 改 `railway` / `local`；都拿不到且本机不能隔离 → 任务失败（不假装开工）。
-2. 主模型选 `env: "railway"` → 申请一次性机器；拿不到 → 改 `ssh` / `local`。
+1. 主模型选 `env: "ssh"` → 申请专用机器；拿不到 → 改一次性机器 / `local`；都拿不到且本机不能隔离 → 任务失败（不假装开工）。
+2. 主模型选一次性机器（railway / freestyle）→ 申请那一家；拿不到 → 改另一家（如果有）/ `ssh` / `local`。
 3. 主模型选 `env: "local"` → 本机跑；`stopped` 判定且没远端机器 → 任务失败。
 4. env 选 `ssh` 时工具集换成 `machine_*`（put_file/get_file/run_command）；选 `railway` 时换成 `vm_*`；本机时用 `run_command`/`start_process` 等本地工具。
+
+### Freestyle（freestyle.py）——一次性 VM，第二家（2026-10-15，**未用真 key 实测**）
+
+- **要用户自己的 API key**（Bearer，`FREESTYLE_API_KEY` 环境变量优先、其次 `[environments] freestyle_api_key`）；只进不出：不写日志、不进 kv、不传给机器、不进任何接口返回。
+- 基址 `https://api.freestyle.sh`（`/v5`）。`acquire` = `POST /v5/vms`（`firewall` 必填、固定开公网出口；`snapshotId` 默认 `freestyle/ubuntu-sm` = 2 核 4G；`ttlSeconds` / `idleTimeoutSeconds`；`autoDeleteSeconds: 0`；`metadata.maiwork_job`）→ 轮询 `GET /v5/vms/{id}` 到 `state == running`。
+- `run` = `POST /v5/vms/{id}/exec-await`：**平台硬上限 5 分钟**，MaiWork 夹到 **280 秒**（`max_run_timeout_s`），工具结果与提示词里都写明；`statusCode` 原样回传，`null` = 被掐断 → `timed_out`。
+- `put` = `fs/write`（≤8MiB，base64 + sha256 原子写）/ `fs/uploads` 三段式；`get` = `fs/stat` + `fs/read`（大文件带 `Range` 续传，二进制安全）。不再用 scp。
+- **`release` = `DELETE /v5/vms/{id}`，真销毁**（比 railway 强）；404 也算成功，自身绝不抛错。
+- 限额与 kv 键和 railway 同形：`freestyle.day.<北京日期>` / `freestyle.active` / `freestyle.last_fail` / `freestyle.key_check`；同一时间 1 台、每天 `freestyle_daily_max`（默认 2）台。
+- 健康项：`check_key()`（`GET /v5/vms?limit=1`）由 app 后台每 30 分钟调一次，只在用户选了 freestyle 时跑；视图只读 kv 缓存。
+
+### 一次性 VM 平台注册表（vm_platforms.py）
+
+- `PRESETS` 里一家一条 `VMPreset`：`needs_key` / `key_url` / `docs_url` / `console_url` / `default_snapshot` / `snapshots`（镜像 → 规格）/ `ttl_minutes` / `plan_hint` / `describe_name`；`enabled` / `has_key` / `ready` 判配置里现在能不能用。
+- `selected_kind(settings)`（= `preferred_kind`）读 `[environments] vm_platform`：两家都开时**优先用哪家**（默认 railway）；`enabled_kinds(settings)` 列开着的（各自开关 `railway` / `freestyle`），优先那家排第一。2026-10-15 起两家可同时开：app 全建，合成 `VMRouter` 给 vm_* 工具（按 `box.kind` 分派），`VMRouter.acquire` 在一把锁里「查另一家 + 申请」，两家合计同一时间只占一台。
+- `describe(kind, box)` 出任务 env 字段那半句（railway 文案与以前逐字一致）；`make_env(...)` 按平台名建实现对象（app 用它取代写死的 `RailwayEnv` 导入）。
 
 ### 集成名称与数据流
 
@@ -107,18 +126,20 @@ app.py 启动
   ├─ capability.probe() → Decision (fixed/dynamic/stopped)
   ├─ resolve_workspace_root() → 按模式换工作区根
   ├─ LocalEnv(get_settings, capability=decision)      ← 唯一经 __init__.py 导出
-  ├─ RailwayEnv(get_settings, data_dir, store)        ← _import_m2_class 懒加载
+  ├─ _make_vm_envs() → app.vms = {开着的每家: env} + app.vm_router   ← vm_platforms.make_env / VMRouter
+  │    （railway → RailwayEnv；freestyle → FreestyleEnv；app.railway 是兼容位）
   ├─ SshEnv(get_settings, data_dir)                   ← _import_m2_class 懒加载
   └─ SshEnv.ensure_key() → 生成 key 供网页展示
 
 Coordinator.run_task() → _setup_exec_env()
-  ├─ plan.env = "local" | "ssh" | "railway"
+  ├─ plan.env = "local" | "ssh" | "railway" | "freestyle"（一次性 VM 只列用户选中的那家）
   ├─ "ssh"    → SshEnv.acquire(tid, prefer)  → SshBox
   │            → _run_job(tools=_remote_job_tools(..., box))
   │            → SshEnv.release(box)
-  ├─ "railway" → RailwayEnv.acquire(tid)     → railway.Box
+  ├─ 一次性 VM（railway / freestyle，按 box.kind 查表）
+  │            → env.acquire(tid) → Box
   │            → _run_job(tools=_remote_job_tools(..., box))
-  │            → RailwayEnv.release(box)
+  │            → env.release(box)（freestyle 真 DELETE；railway 等过期）
   └─ "local"  → _run_job(tools=本机工具)
                → 本机工具调用 LocalEnv.run()/start()
 ```

@@ -161,7 +161,7 @@ class FakeAgents:
         h["evidence"] = list(evidence)
         h["error"] = error
 
-    def review(self, gid, id, accepted, summary, refs=(), *, learn=True):
+    def review(self, gid, id, accepted, summary, refs=(), *, learn=True, main_notes=None, post_notes=True):
         self._rec(("review", gid, id, accepted))
         self._verify_served(gid)
         h = self._handoffs[str(id)]

@@ -490,6 +490,9 @@ class WorkerReport:
     stopped: bool = False
     # 任务双岗协作第三步（docs/20 §四）：对说明本身的异议 {reason, evidence, suggestion}；没提 = None
     challenge: dict | None = None
+    # 便条板（docs/34）：交回时附的「留给别的岗的便条」[{to, text}]（0~2 条，已清洗）；
+    # 由 Specialists 暂存到交接单，主模型检查通过才上板。
+    notes: list = field(default_factory=list)
 
 
 def _system_prompt(
@@ -1014,6 +1017,7 @@ class Workers:
                     data=data.get("data"),
                     evidence=[str(x) for x in evidence] if isinstance(evidence, list) else [],
                     challenge=data.get("challenge") if isinstance(data.get("challenge"), dict) else None,
+                    notes=_clean_notes(data.get("notes_for_others")),
                 )
 
             # 其余（或 submit 失败）→ 把结果作为 role=tool 消息回给模型继续。
@@ -1088,3 +1092,12 @@ class Workers:
             if nudger is not None:
                 nudger.note_user_message()
         return None
+
+
+def _clean_notes(raw: Any) -> list:
+    from .agents import clean_notes
+
+    try:
+        return clean_notes(raw)
+    except Exception:
+        return []

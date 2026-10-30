@@ -16,7 +16,8 @@
 - 所有工具 roles={"admin"}，子 agent 和普通主模型都调不到（tools.py 的角色门会拒）。
 - 带群号的工具都先查「是不是服务群」；非服务群零读取零动作（list_groups 只列服务群；
   read_logs / get_identity / list_extensions / skill_* / mcp_* 不涉及具体群）。
-- 没有任何工具能碰密钥 / 端点 / MaiBot 宿主（重启、改配置、装插件都不存在）。
+- 没有任何工具能碰密钥 / MaiBot 宿主（重启、改宿主配置、装插件都不存在）；端点 / 模型库 / MCP / 专岗
+  能改（tools_admin_settings.py，和网页同一套校验），但参数里不许有密钥，读回来也只说填没填。
 - 会往群里发东西的只有 `send_group_message` 和群空间写类（发公告会先发一句预告），
   全都在 CONFIRM_TOOLS 里，必须管理员确认后才动手。
 - 「已批准」只由 PendingGate.execute 在执行那一下置上（ContextVar），而且是
@@ -89,8 +90,18 @@ CONFIRM_TOOLS = frozenset(
         "approve_request",  # 群友派的活要 bot 管理员批准；模型可能被群内容注入，绝不能替管理员拍板
         "create_task",  # 任务开工后，做完 / 做不成 / 缺信息时 coordinator 会自动往群里发消息（coordinator.py 的 outbox.enqueue）
         "create_goal",  # agent 目标后台检查时会往群里发汇报 / 完成话（coordinator 的 goal:{id}:report / goal:{id}:done）
+        # 改设置（tools_admin_settings.py；用户定）：新增 MCP（MaiWork 会去连一个新地址）、删东西
+        "mcp_add",
+        "agent_delete",
+        "endpoint_delete",
+        "model_delete",
     }
 )
+
+# 看情形才要确认的工具：工具自己判断「这次是放宽 / 数据会发去新地址」才调 _need_confirm，
+# 收窄的改动直接做。set_rules（白名单外 / 放宽安全设置）、mcp_update（改地址 / 加主模型 /
+# 白名单放宽）、endpoint_save（新建 / 改地址 / 改协议）。
+_CONDITIONAL_CONFIRM = frozenset({"set_rules", "mcp_update", "endpoint_save"})
 
 # 确认话术（固定，测试断言这一句；对话循环也靠它识别「等确认」）
 NEED_CONFIRM = "已请求管理员确认，同意后我再动手"
@@ -219,6 +230,13 @@ async def fetch_public(url: str, max_bytes: int = SKILL_FETCH_MAX) -> bytes:
                         raise ValueError(f"文件太大（超过 {max_bytes // 1024 // 1024}MB）")
                 return bytes(buf)
     raise ValueError("跳转太多次，不下载")
+
+
+def settings_link(settings: Any, sub: str) -> str:
+    """网页设置页链接（public_url + /#/settings/<页>）；没公开网址 → ""。实现在 tools_admin_settings。"""
+    from .tools_admin_settings import settings_link as _link
+
+    return _link(settings, sub)
 
 
 def _norm_args(args: Any) -> dict:
@@ -635,7 +653,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
     def _need_confirm(tool: str, args: dict, summary: str) -> ToolResult | None:
         """要确认的工具统一入口：这次 (工具, 参数) 已被管理员点过头 → None（继续真做）；
         否则写小票并返回结果。比对的是指纹：execute 置上的只对票里那份参数有效。"""
-        if tool in CONFIRM_TOOLS or tool == "set_rules":
+        if tool in CONFIRM_TOOLS or tool in _CONDITIONAL_CONFIRM:
             if _APPROVED_CTX.get() == _fingerprint(tool, args):
                 return None
             return gate.queue(tool, _norm_args(args), summary)
@@ -1123,9 +1141,13 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                     lines.append(f"- skill {sk.get('name')}：{sk.get('description') or ''}")
             except Exception:
                 pass
+        hint = (
+            "要加 MCP、测连接、重连、改它给谁用和工具白名单，可以直接在对话里说（新加和放宽会先等管理员确认）；"
+            "要密钥（请求头）的请管理员自己到网页「设置 → 工具」填。"
+        )
         if not lines:
-            return _ok("现在一个扩展也没有", data=data)
-        return _ok("\n".join(lines), data=data)
+            return _ok("现在一个扩展也没有。" + hint, data=data)
+        return _ok("\n".join(lines) + "\n" + hint, data=data)
 
     # ------------------------------------------------------------------
     # 二、写类（改了库，但没对外发东西、没放宽安全设置）
@@ -1879,7 +1901,10 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             except Exception:
                 pass
         lines.append(
-            "怎么补：开关和数量这类设置可以直接改（安全相关的会先等你确认）；装 skill 请提供网址。"
+            "怎么补：开关和数量这类设置可以直接改（安全相关的会先等你确认）；装 skill 请提供网址；"
+            "MCP 服务可以直接让我加、测连接、重连、改白名单（新加、改地址、放宽权限会先等你确认）；"
+            "专岗换模型 / 思考强度 / 备用、建自定义专岗，以及模型端点和模型库，也可以在对话里让我改"
+            "（新加端点、改端点地址或协议、删除会先等你确认）。"
             "密钥请自己在网页上填（「设置 → 模型」「设置 → 工具」「设置 → 全部设置 → 运行环境」），"
             "不要发在对话里。"
         )
@@ -1920,8 +1945,11 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         try:
             from . import extensions_web
 
-            if extensions_web.source_of(settings, svc.store, name) is None:
+            source = extensions_web.source_of(settings, svc.store, name)
+            if source is None:
                 return _bad(f"没有叫「{name}」的 MCP 扩展")
+            if source != "web":  # 和网页删除同一条规矩
+                return _bad("这个扩展来自配置文件，只能开关，不能删除")
         except Exception as e:
             return _bad(f"查 MCP 扩展失败：{e}")
         pending = _need_confirm("mcp_delete", args, f"删掉 MCP 扩展「{name}」")
@@ -1936,6 +1964,12 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             return _bad(f"没有叫「{name}」的 MCP 扩展")
         except Exception as e:
             return _bad(f"删 MCP 扩展失败：{e}")
+        try:
+            from . import search_binding
+
+            search_binding.clear_binding(svc.store, mcp=name)  # 搜索绑定绑着它 → 跟着清掉（同网页删除）
+        except Exception:
+            logger.exception("清 MCP 扩展 %s 的搜索绑定出错", name)
         return _ok(f"已删掉 MCP 扩展「{name}」")
 
     async def run_news_now(ctx: ToolContext, args: dict) -> ToolResult:
@@ -2913,5 +2947,10 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
     for spec, handler in _SPECS:
         _register(spec, handler)
 
-    logger.info("管理员对话工具已注册：%d 个（其中 %d 个要确认）", len(_SPECS), len(CONFIRM_TOOLS))
+    # 改设置的那批（MCP / 专岗 / 端点与模型库）：和网页设置页同一套校验，密钥不经过对话
+    from .tools_admin_settings import register_settings_tools
+
+    register_settings_tools(svc, settings=_settings, register=_register, need_confirm=_need_confirm)
+
+    logger.info("管理员对话工具已注册：%d 个（其中 %d 个一律要确认）", len(tools.specs(ROLE)), len(CONFIRM_TOOLS))
     return gate

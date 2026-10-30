@@ -1085,39 +1085,16 @@ class ConsoleServer:
         from .. import config as _cfg
         from .. import config_file as _cf
 
+        from .. import settings_ops as _ops
+
+        # 端点 / 模型库 / 自定义专岗的校验和写入在 settings_ops（管理员对话的同名工具共用同一套）；
+        # 这里只管鉴权、读请求体、把 OpError 翻成 HTTP 状态码。
+
         def _endpoint_public(ep: Any) -> dict[str, Any]:
-            d: dict[str, Any] = {
-                "id": str(ep.id), "name": str(ep.name), "protocol": str(ep.protocol),
-                "base_url": str(ep.base_url), "key_set": bool(str(getattr(ep, "api_key", "") or "")),
-                "retries": int(ep.retries), "retry_delay_s": int(ep.retry_delay_s),
-                "max_concurrency": int(ep.max_concurrency), "max_rpm": int(ep.max_rpm),
-                # 网页「按行加头」用：只回名字，绝不回值（值是凭据）
-                "header_names": [
-                    str(k) for k in (getattr(ep, "headers", None) or {}).keys() if str(k or "").strip()
-                ],
-            }
-            checked = svc.store.kv_get(f"endpoints.checked.{ep.id}") if svc.store is not None else None
-            if isinstance(checked, dict):
-                try:
-                    d["checked_at"] = float(checked.get("checked_at") or 0.0)
-                except (TypeError, ValueError):
-                    d["checked_at"] = 0.0
-                raw = checked.get("available")
-                d["available"] = [str(x) for x in raw] if isinstance(raw, list) else []
-            return d
+            return _ops.endpoint_public(svc, ep)
 
         def _model_public(entry: Any) -> dict[str, Any]:
-            return {
-                "id": str(entry.id), "endpoint": str(entry.endpoint), "model": str(entry.model),
-                "name": str(entry.name), "efforts": [str(x) for x in (entry.efforts or ())],
-                "vision": bool(entry.vision),
-                "context_window": int(entry.context_window), "max_tokens": int(entry.max_tokens),
-                # 2026-10-15 生图第一期：用途 + 生图参数（密钥照旧只给 key_set 布尔）
-                "use": str(getattr(entry, "use", "chat") or "chat"),
-                "image_api": str(getattr(entry, "image_api", "openai") or "openai"),
-                "image_default_size": str(getattr(entry, "image_default_size", "") or ""),
-                "image_max_n": int(getattr(entry, "image_max_n", 1) or 1),
-            }
+            return _ops.model_public(entry)
 
         def _image_model_id() -> str:
             """现在用哪个生图模型：网页选过的优先，其次模型库里第一个 use="image" 的条目。
@@ -1134,11 +1111,7 @@ class ConsoleServer:
             return str(getattr(entry, "id", "") or "") if entry is not None else ""
 
         def _endpoints_view() -> dict[str, Any]:
-            settings = svc.get_settings()
-            return {
-                "endpoints": [_endpoint_public(ep) for ep in (getattr(settings, "endpoints", ()) or ())],
-                "models": [_model_public(m) for m in (getattr(settings, "model_list", ()) or ())],
-            }
+            return _ops.endpoints_view(svc)
 
         def _imagegen_view() -> dict[str, Any]:
             """生图这一块的状态：用哪个生图模型 + 常用服务预设（都不含密钥）。
@@ -1156,10 +1129,7 @@ class ConsoleServer:
 
         async def _apply_config_after_file_write(new_text: str) -> None:
             """写完文件立刻在本进程应用；失败只记日志（宿主文件监控会补一次）。"""
-            try:
-                await svc.apply_config_text(new_text)
-            except Exception:
-                logger.exception("写后应用出错（文件已写，宿主文件监控会补一次）")
+            await _ops.apply_config_after_file_write(svc, new_text)
 
         @get("/api/settings/endpoints")
         async def _endpoints_get(request: web.Request) -> web.Response:
@@ -1168,180 +1138,29 @@ class ConsoleServer:
                 return forbid
             return web.json_response(_endpoints_view())
 
-        def _validate_endpoint_headers(raw: Any, saved: Any) -> dict[str, str]:
-            """保存与试连共用：完整名称集合；已存同名空值保留，其余删除。"""
-            if not isinstance(raw, dict):
-                raise ValueError("headers 要是对象（名字→值）")
-            if len(raw) > 32:
-                raise ValueError("请求头个数超了（最多 32 个）")
-            old_ci = {name.lower(): value for name, value in dict(saved or {}).items()}
-            out: dict[str, str] = {}
-            seen: set[str] = set()
-            for raw_name, value in raw.items():
-                error, _ = _cfg.validate_endpoint_header_name(raw_name)
-                if error:
-                    raise ValueError(error)
-                name = raw_name.strip()
-                low = name.lower()
-                if low in seen:
-                    raise ValueError("请求头同名不同大小写重复（名字大小写不敏感）")
-                seen.add(low)
-                if value is not None:
-                    if not isinstance(value, str):
-                        raise ValueError("新请求头的值要填非空字符串")
-                    error = _cfg.validate_endpoint_header_value(value)
-                    if error:
-                        raise ValueError(error)
-                # 先校验再判断空值，换行/控制/超长空白不能被当成「保留」。
-                if value is None or not value.strip():
-                    if low not in old_ci:
-                        raise ValueError("新请求头的值要填非空字符串")
-                    out[name] = old_ci[low]
-                else:
-                    out[name] = value.strip()
-            return out
+        _validate_endpoint_headers = _ops.validate_endpoint_headers
 
-        def _validate_endpoint_payload(
-            body: dict[str, Any], path_id: str, existing: dict[str, Any] | None,
-        ) -> dict[str, Any]:
-            """把网页 body 合出一份端点字典；域名格式错误直接抛 ValueError(中文)。
-            api_key：空串/没给 = 保持 old 值（新建=空），非空串 = 覆盖。
-
-            headers（只给 PUT / 新建）：没给「headers」键 → 原样保留；给了（对象）= 完整名单
-            覆盖校验只允许可打印 ASCII 头名（名字 ≤128）、值只允许可打印 ASCII + TAB（值 ≤8192；
-            总数 ≤32；禁 Host / Content-Length / Transfer-Encoding / Connection /
-            Proxy-Authorization 等传输/代理头）。已存同名（大小写不敏感）且新值是空串 / null
-            → 保留旧值；不在对象里的删掉（{} = 清空）。同名大小写重复 / 在禁名单里的，
-            错误文案带中文原因，绝不透传值本身。
-            """
-            raw_patch: dict[str, Any] = {}
-            for key in ("name", "protocol", "base_url"):
-                if key in body:
-                    raw_patch[key] = body[key]
-            for key in ("retries", "retry_delay_s", "max_concurrency", "max_rpm"):
-                if key in body and body[key] is not None:
-                    raw_patch[key] = body[key]
-            cand: dict[str, Any] = dict(existing or {})
-            cand.update(raw_patch)
-            cand["id"] = path_id  # id 以路由为准（body.id 一致才放行，不然误导）
-            if "id" in body and str(body.get("id") or "").strip() != path_id:
-                raise ValueError("地址里的端点 id 和 body.id 不一致")
-            # api_key：只进；空串/没给 = 不改
-            if "api_key" in body:
-                key_v = body.get("api_key")
-                if key_v is not None and str(key_v).strip():
-                    cand["api_key"] = str(key_v)
-            elif "api_key" not in cand:
-                cand["api_key"] = ""
-
-            saved_headers = dict(cand.get("headers") or {})
-            cand["headers"] = (
-                _validate_endpoint_headers(body["headers"], saved_headers)
-                if "headers" in body else saved_headers
-            )
-
-            problems: list[str] = []
-            parsed = _cfg._parse_endpoints([cand], problems)
-            if problems:
-                raise ValueError(problems[0])
-            if not parsed:
-                raise ValueError("端点参数不合法")
-            e = parsed[0]
-            return {
-                "id": e.id, "name": e.name, "protocol": e.protocol, "base_url": e.base_url,
-                "api_key": e.api_key, "retries": e.retries, "retry_delay_s": e.retry_delay_s,
-                "max_concurrency": e.max_concurrency, "max_rpm": e.max_rpm,
-                "headers": dict(e.headers or {}),
-            }
-
-        async def _endpoints_save(
-            request: web.Request, *, create_or_update: bool,
-        ) -> web.Response:
+        async def _endpoint_put(request: web.Request) -> web.Response:
             forbid = self._require_admin(request)
             if forbid is not None:
                 return forbid
             body = await _json_body(request)
             if body is None:
                 return _err(400, "请求体不是 JSON")
-            settings = svc.get_settings()
-            entries = [
-                dict(
-                    id=str(ep.id), name=str(ep.name), protocol=str(ep.protocol), base_url=str(ep.base_url),
-                    api_key=str(getattr(ep, "api_key", "") or ""), retries=int(ep.retries),
-                    retry_delay_s=int(ep.retry_delay_s), max_concurrency=int(ep.max_concurrency),
-                    max_rpm=int(ep.max_rpm),
-                    headers=dict(getattr(ep, "headers", None) or {}),
-                )
-                for ep in (getattr(settings, "endpoints", ()) or ())
-            ]
-            path_id = str(request.match_info["id"]).strip()
-            old = next((e for e in entries if e["id"] == path_id), None)
-            if create_or_update and old is None:
-                # 新建再走一遍 id 规则（路径 id 本身就得合法，不然 table 会跳过）
-                problems: list[str] = []
-                _cfg._parse_endpoints([{"id": path_id, "base_url": "https://x.test"}], problems)
-                if problems:
-                    return _err(400, problems[0])
-            if not create_or_update and old is None:
-                return _err(404, "没有这个端点（只能改已存在的）")
             try:
-                cand = _validate_endpoint_payload(body, path_id, old)
-            except ValueError as e:
-                return _err(400, str(e))
-            # 新建不许和已有 id 撞
-            if create_or_update and old is None and any(e["id"] == cand["id"] for e in entries):
-                return _err(400, f"端点 id「{cand['id']}」已经存在")
-            entries = [cand if e["id"] == cand["id"] else e for e in entries] if old else entries + [cand]
-            try:
-                new_text = _cf.write_aot_section(
-                    svc.config_file_ops()[0], svc.config_file_ops()[1], "endpoints", entries
-                )
-            except _cf.ConfigFileError as e:
-                return _err(500, str(e))
-            await _apply_config_after_file_write(new_text)
-            logger.info("端点「%s」已保存（key_set=%s）", cand["id"], bool(cand.get("api_key")))
+                await _ops.save_endpoint(svc, str(request.match_info["id"]).strip(), body)
+            except _ops.OpError as e:
+                return _err(e.status, e.message)
             return web.json_response(_endpoints_view())
-
-        async def _endpoint_put(request: web.Request) -> web.Response:
-            return await _endpoints_save(request, create_or_update=True)
 
         async def _endpoint_delete(request: web.Request) -> web.Response:
             forbid = self._require_admin(request)
             if forbid is not None:
                 return forbid
-            settings = svc.get_settings()
-            path_id = str(request.match_info["id"]).strip()
-            entries = [
-                dict(
-                    id=str(ep.id), name=str(ep.name), protocol=str(ep.protocol), base_url=str(ep.base_url),
-                    api_key=str(getattr(ep, "api_key", "") or ""), retries=int(ep.retries),
-                    retry_delay_s=int(ep.retry_delay_s), max_concurrency=int(ep.max_concurrency),
-                    max_rpm=int(ep.max_rpm),
-                    headers=dict(getattr(ep, "headers", None) or {}),
-                )
-                for ep in (getattr(settings, "endpoints", ()) or ())
-            ]
-            if not any(e["id"] == path_id for e in entries):
-                return _err(404, "没有这个端点")
-            users = [m for m in (getattr(settings, "model_list", ()) or ()) if str(getattr(m, "endpoint", "")) == path_id]
-            if users:
-                return _err(400, f"模型库里还有 {len(users)} 条模型挂在这个端点上，先把它们删掉或换到别的端点")
-            entries = [e for e in entries if e["id"] != path_id]
             try:
-                new_text = _cf.write_aot_section(
-                    svc.config_file_ops()[0], svc.config_file_ops()[1], "endpoints", entries
-                )
-            except _cf.ConfigFileError as e:
-                return _err(500, str(e))
-            await _apply_config_after_file_write(new_text)
-            try:
-                mod = getattr(svc, "store", None)
-                if mod is not None:
-                    with mod.tx() as conn:
-                        conn.execute("DELETE FROM kv WHERE key=?", (f"endpoints.checked.{path_id}",))
-            except Exception:
-                pass
-            logger.info("端点「%s」已删除", path_id)
+                await _ops.delete_endpoint(svc, str(request.match_info["id"]).strip())
+            except _ops.OpError as e:
+                return _err(e.status, e.message)
             return web.json_response(_endpoints_view())
 
         app.router.add_route("PUT", "/api/settings/endpoints/{id}", self._write(_endpoint_put))
@@ -1403,44 +1222,6 @@ class ConsoleServer:
 
         # ---------- 模型库（[[model_list]]） ----------
 
-        def _validate_model_payload(
-            body: dict[str, Any], path_id: str, existing: dict[str, Any] | None, endpoints: tuple,
-        ) -> dict[str, Any]:
-            raw_patch: dict[str, Any] = {}
-            for key in ("endpoint", "model", "name"):
-                if key in body:
-                    raw_patch[key] = body[key]
-            if "efforts" in body and body["efforts"] is not None:
-                raw_patch["efforts"] = body["efforts"]
-            if "vision" in body and body["vision"] is not None:
-                raw_patch["vision"] = body["vision"]
-            for key in ("context_window", "max_tokens"):
-                if key in body and body[key] is not None:
-                    raw_patch[key] = body[key]
-            # 2026-10-15 生图第一期：用途 + 生图参数（不认识的值由 _parse_model_list 记问题 → 400）
-            for key in ("use", "image_api", "image_default_size", "image_max_n"):
-                if key in body and body[key] is not None:
-                    raw_patch[key] = body[key]
-            cand: dict[str, Any] = dict(existing or {})
-            cand.update(raw_patch)
-            cand["id"] = path_id
-            if "id" in body and str(body.get("id") or "").strip() != path_id:
-                raise ValueError("地址里的 id 和 body.id 不一致")
-            problems: list[str] = []
-            parsed = _cfg._parse_model_list([cand], endpoints, problems)
-            if problems:
-                raise ValueError(problems[0])
-            if not parsed:
-                raise ValueError("模型条目参数不合法")
-            m = parsed[0]
-            return {
-                "id": m.id, "endpoint": m.endpoint, "model": m.model, "name": m.name,
-                "efforts": list(m.efforts or ()), "vision": bool(m.vision),
-                "context_window": int(m.context_window), "max_tokens": int(m.max_tokens),
-                "use": m.use, "image_api": m.image_api,
-                "image_default_size": m.image_default_size, "image_max_n": int(m.image_max_n),
-            }
-
         async def _model_put(request: web.Request) -> web.Response:
             forbid = self._require_admin(request)
             if forbid is not None:
@@ -1448,67 +1229,20 @@ class ConsoleServer:
             body = await _json_body(request)
             if body is None:
                 return _err(400, "请求体不是 JSON")
-            settings = svc.get_settings()
-            endpoints = tuple(getattr(settings, "endpoints", ()) or ())
-            entries = [_model_public(m) for m in (getattr(settings, "model_list", ()) or ())]
-            path_id = str(request.match_info["id"]).strip()
-            old = next((m for m in entries if m["id"] == path_id), None)
-            expected = body.get("if_fingerprint")
-            if expected is not None:
-                if not isinstance(expected, str) or not expected or svc.models.verification_stamp(path_id) != expected:
-                    return _err(409, "验证期间模型配置已经改变：请重新验证后再保存建议，未覆盖你的新配置")
-            if old is None:
-                problems: list[str] = []
-                _cfg._parse_model_list([{"id": path_id, "endpoint": "__x__", "model": "y"}], endpoints, problems)
-                if problems and "不合法" in problems[0]:
-                    return _err(400, problems[0])
             try:
-                cand = _validate_model_payload(body, path_id, old, endpoints)
-            except ValueError as e:
-                return _err(400, str(e))
-            if old is None and any(m["id"] == cand["id"] for m in entries):
-                return _err(400, f"模型条目 id「{cand['id']}」已经存在")
-            entries = [cand if m["id"] == cand["id"] else m for m in entries] if old else entries + [cand]
-            try:
-                new_text = _cf.write_aot_section(
-                    svc.config_file_ops()[0], svc.config_file_ops()[1], "model_list", entries
-                )
-            except _cf.ConfigFileError as e:
-                return _err(500, str(e))
-            await _apply_config_after_file_write(new_text)
-            logger.info("模型条目「%s」已保存（服务端模型名 %s）", cand["id"], cand.get("model", ""))
+                await _ops.save_model(svc, str(request.match_info["id"]).strip(), body)
+            except _ops.OpError as e:
+                return _err(e.status, e.message)
             return web.json_response(_endpoints_view())
 
         async def _model_delete(request: web.Request) -> web.Response:
             forbid = self._require_admin(request)
             if forbid is not None:
                 return forbid
-            settings = svc.get_settings()
-            entries = [_model_public(m) for m in (getattr(settings, "model_list", ()) or ())]
-            path_id = str(request.match_info["id"]).strip()
-            if not any(m["id"] == path_id for m in entries):
-                return _err(404, "没有这个模型条目")
-            # 岗位在用 → 拒（消息点名岗位，管理员知道先去哪改）
-            users: list[str] = []
-            agents_mod = getattr(svc, "agents", None)
-            if agents_mod is not None:
-                try:
-                    for p in agents_mod.profiles():
-                        if str(p.get("model") or "") == path_id or str(p.get("backup") or "") == path_id:
-                            users.append(str(p.get("title") or p.get("kind") or "?"))
-                except Exception:
-                    pass
-            if users:
-                return _err(400, f"还有专岗在用这个模型（{'、'.join(users)}），先到「专岗」页改掉再删")
-            entries = [m for m in entries if m["id"] != path_id]
             try:
-                new_text = _cf.write_aot_section(
-                    svc.config_file_ops()[0], svc.config_file_ops()[1], "model_list", entries
-                )
-            except _cf.ConfigFileError as e:
-                return _err(500, str(e))
-            await _apply_config_after_file_write(new_text)
-            logger.info("模型条目「%s」已删除", path_id)
+                await _ops.delete_model(svc, str(request.match_info["id"]).strip())
+            except _ops.OpError as e:
+                return _err(e.status, e.message)
             return web.json_response(_endpoints_view())
 
         app.router.add_route("PUT", "/api/settings/model-list/{id}", self._write(_model_put))
@@ -3239,23 +2973,14 @@ class ConsoleServer:
                 timeout_s = max(1, int(body.get("timeout_s") or 20))
             except (TypeError, ValueError):
                 timeout_s = 20
-            from ..mcp_client import MCPError, McpSessionClient
-
-            client = McpSessionClient(url, "", timeout_s=timeout_s, transport=getattr(svc, "extensions_transport", None), headers=headers)
+            # 真正试连在 extensions_web.try_connect（管理员对话的 mcp_test 共用）
             try:
-                tools = await client.list_tools()
-            except MCPError as e:
-                return web.json_response({"ok": False, "tools": [], "error": str(e)})
-            except Exception as e:
-                logger.warning("试连 MCP 出意外错：%s", type(e).__name__, exc_info=True)
-                return web.json_response({"ok": False, "tools": [], "error": f"连接出错：{type(e).__name__}"})
-            finally:
-                try:
-                    await client.aclose()
-                except Exception:
-                    pass
-            names = [str(t.get("name") or "").strip() for t in tools if str(t.get("name") or "").strip()]
-            return web.json_response({"ok": True, "tools": names[:50], "error": ""})
+                result = await extensions_web.try_connect(
+                    url, headers, timeout_s=timeout_s, transport=getattr(svc, "extensions_transport", None),
+                )
+            except ValueError as e:
+                return _err(400, str(e))
+            return web.json_response(result)
 
         # ---------- skill 网页管理 ----------
 
@@ -4801,21 +4526,13 @@ class ConsoleServer:
             body = await _json_body(request)
             if body is None:
                 return _err(400, "请求体不是 JSON")
+            from .. import settings_ops as _ops
+
+            # 建 kv + 落 identity 文档目录（管理员对话的 agent_create 走同一个函数）
             try:
-                profile = mod.create_custom(str(body.get("title") or ""))
-            except ValueError as e:
-                return _err(400, str(e))
-            # 建 kv 成功后落 identity 文档（SOUL 从 MaiBot 同步或空 + AGENTS=custom 预设
-            # + main AGENTS.md 自动加一行 stub）。identity 缺位 → 只警告，kv 那份还在
-            # （下轮启动/修复 identity 再补建也来得及——kind 已经有了）。
-            ident = getattr(svc, "identity", None)
-            if ident is None:
-                logger.warning("identity 没就位：自定义专岗 %s 只建了 kv，文档目录跳过", profile.get("kind"))
-            else:
-                try:
-                    await ident.agent_init_custom(str(profile["kind"]), str(profile["title"]))
-                except Exception:
-                    logger.exception("自定义专岗 %s 建文档目录出错（kv 那份在）", profile.get("kind"))
+                profile = await _ops.agent_create_custom(svc, str(body.get("title") or ""))
+            except _ops.OpError as e:
+                return _err(e.status, e.message)
             return web.json_response(profile)
 
         app.router.add_post("/api/agents", self._write(_agents_custom_post))
@@ -4827,25 +4544,13 @@ class ConsoleServer:
             mod, not_ready = _agents_ready()
             if not_ready is not None:
                 return not_ready
-            kind = str(request.match_info["kind"])
+            from .. import settings_ops as _ops
+
+            # 清 kv + 文档目录挪 .trash（管理员对话的 agent_delete 确认后走同一个函数）
             try:
-                deleted = mod.delete_custom(kind)
-            except ValueError as e:
-                msg = str(e)
-                if "内置" in msg or "不能删" in msg:
-                    return _err(400, msg)
-                if "交接" in msg or "进行中" in msg:
-                    return _err(409, msg)
-                return _err(404, msg or "没有这个专岗")
-            # kv 删了；文档目录挪到 .trash（挪不动也只是警告，kv 那份已经删了）
-            ident = getattr(svc, "identity", None)
-            if ident is None:
-                logger.warning("identity 没就位：删专岗 %s 只清了 kv，文档目录留着", deleted)
-            else:
-                try:
-                    ident.agent_trash_custom(deleted)
-                except Exception:
-                    logger.exception("删专岗 %s 挪文档到 .trash 出错（kv 已删）", deleted)
+                deleted = _ops.agent_delete_custom(svc, str(request.match_info["kind"]))
+            except _ops.OpError as e:
+                return _err(e.status, e.message)
             return web.json_response({"ok": True, "kind": deleted})
 
         app.router.add_delete("/api/agents/{kind}", self._write(_agents_custom_delete))

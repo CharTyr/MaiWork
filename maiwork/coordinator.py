@@ -822,6 +822,7 @@ class GoalInvestigation:
     questions: list[str] = field(default_factory=list)
     links: list[str] = field(default_factory=list)
     raw: str = ""
+    handoff_id: str = ""  # 这次调查的交接单（主模型附的便条挂在它上面，docs/34）
 
 
 # 调查素材段 / 链接校验的上限（prd design §2、§3）
@@ -1972,7 +1973,7 @@ class Coordinator:
             return base
         return base | frozenset(extra)
 
-    def _group_context_safe(self, gid: str, kind: str) -> str:
+    def _group_context_safe(self, gid: str, kind: str, *, include_notes: bool = False) -> str:
         """统一注入（docs/17 §八.2）：本群规矩 + 本群<岗>的做法；没接线 / 出错 → ""。"""
         try:
             specialists = getattr(self, "_specialists", None)
@@ -1983,7 +1984,7 @@ class Coordinator:
                 return ""
             from . import group_context as _gc
 
-            return str(_gc.group_context(agents, str(gid), kind) or "").strip()
+            return str(_gc.group_context(agents, str(gid), kind, include_notes=include_notes) or "").strip()
         except Exception:
             logger.warning("读本群规矩 / 做法出错（群 %s 岗 %s），这次不注入", gid, kind, exc_info=True)
             return ""
@@ -7012,7 +7013,8 @@ class Coordinator:
         if not self._goal_is_active(goal_id, gid):
             return  # 调查期间被取消 / 暂停 / 删群：不再调主模型
 
-        gc_goal = self._group_context_safe(str(goal.get("group_id") or ""), "goal")
+        gc_goal = self._group_context_safe(str(goal.get("group_id") or ""), "goal",
+                                           include_notes=True)  # 便条板 docs/34
         # 内置 skill goal-tracking（main 角色）：检查回合是纯 JSON 调用、没有 skill 工具，要点直接注入
         from .skills import guidance as _skill_guidance
 
@@ -7083,6 +7085,12 @@ class Coordinator:
         )
         if not goal_fit:
             json_bits.append(', "fit": {"kind": "online" | "human", "reason": "一句话"}')
+        if investigation is not None:
+            # 便条板（docs/34 第五节 2）：检查专岗交回的同一份回包里可附 0~2 条便条
+            json_bits.append(
+                ', "notes_for_others": [可选 0~2 条 {"to": "news"|"idea"|"*", "text": "≤80 字：'
+                '这次调查里值得让别的岗知道的事实；没有就 []"}]'
+            )
         if need_criteria:
             json_bits.append(
                 ',' + ' "criteria": ["第一次检查补出的完成标准（3–5 条，一句话一条，每条不超过 30 字）"]'
@@ -7130,6 +7138,7 @@ class Coordinator:
         if not isinstance(data, dict):
             self._check_goal_fail(goal_id, "检查返回不是 JSON 对象")
             return
+        self._goal_post_main_notes(gid, investigation, data)
         # 成功跑完（不管有没有新进展）：报平安——写心跳、清卡住标记、出错计数归零
         try:
             self._goals.beat(goal_id, clock.now())
@@ -7896,6 +7905,22 @@ class Coordinator:
                     logger.debug("写 goal 检查记忆失败（群 %s 目标 %s）", gid, goal_id, exc_info=True)
         return investigation
 
+    def _goal_post_main_notes(self, gid: str, investigation: Any, data: Any) -> None:
+        """主模型检查目标时（看过 goal 专岗交回）附的便条贴上板；没调查就不贴。出错只记日志。"""
+        if investigation is None or not isinstance(data, dict):
+            return
+        notes = data.get("notes_for_others")
+        if not notes:
+            return
+        agents = self._sp_agents_of_coordinator(getattr(self, "_specialists", None))
+        if agents is None or not hasattr(agents, "post_main_notes"):
+            return
+        try:
+            agents.post_main_notes(str(gid), notes,
+                                   handoff_id=str(getattr(investigation, "handoff_id", "") or ""))
+        except Exception:
+            logger.warning("目标检查附的便条没贴上（群 %s）", gid, exc_info=True)
+
     @staticmethod
     def _goal_investigation_pack(report: Any, data: Any, summary: str) -> GoalInvestigation:
         """R2：把专岗这次交回打包成 `GoalInvestigation`（链接去重保序 ≤20，raw ≤4000 字）。"""
@@ -7932,6 +7957,7 @@ class Coordinator:
             questions=questions,
             links=links,
             raw=raw,
+            handoff_id=str(getattr(report, "handoff_id", "") or ""),
         )
 
     @staticmethod

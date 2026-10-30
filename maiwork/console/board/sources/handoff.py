@@ -99,4 +99,15 @@ def get(ctx: Ctx, item_id: Any) -> dict[str, Any] | None:
         return None
     if str(r["group_id"] or "") not in ctx.served:
         return None
-    return _row_to_item(r, str(r["kind"] or ""), ctx.now)
+    item = _row_to_item(r, str(r["kind"] or ""), ctx.now)
+    # 便条板（docs/34）：这张交接单检查通过时贴上板的便条（专岗自己的 + 主模型附的）
+    item["_notes"] = [
+        {"from_kind": str(n["from_kind"]), "to_kind": str(n["to_kind"]),
+         "body": str(n["body"]), "created": _f(n["created"])}
+        for n in ctx.fetch(
+            "SELECT from_kind, to_kind, body, created FROM agent_notes"
+            " WHERE group_id=? AND handoff_id=? ORDER BY id LIMIT 20",
+            (item["group_id"], item["id"]),
+        )
+    ]
+    return item

@@ -168,4 +168,7 @@ def item_view(svc: Any, source: Any, item_id: Any, *, after: Any = None,
     out_item["counts"] = counts
     out_item["last_step"] = last_step
     body = _trace_steps(ctx, trace, out_item, after=after_f, extra_think=extra)
-    return {"item": out_item, "link": body["link"], "steps": body["steps"]}
+    out = {"item": out_item, "link": body["link"], "steps": body["steps"]}
+    if "_notes" in item:  # 便条板（docs/34）：只有专岗交接单带
+        out["notes"] = item["_notes"]
+    return out
