@@ -54,14 +54,38 @@ _SPECIALIST_DEFAULT_TOOLS: dict[str, tuple[str, ...] | None] = {
     "task": None,
 }
 
+# 调研岗（=能挂做法带工具的岗）——只有这三个。task / 自定义专岗 / main 不受做法工具影响。
+RESEARCH_KINDS = ("news", "idea", "goal")
+
+# 自动回合各环节的基础工具名单（2026-10-30 起：调用点写死的名单收进这张表，
+# 展示与实际读同一份事实；做法带来的工具由 phase_tools 现算叠上）。
+AUTO_PHASES: dict[tuple[str, str], tuple[str, ...]] = {
+    ("news", "verify"):      ("fetch_page",),
+    ("news", "recheck"):     ("fetch_page", "web_search"),
+    ("news", "supplement"):  (),                      # 只给做法带来的工具
+    ("idea", "investigate"): ("web_search", "social_search", "fetch_page", "read_profile",
+                              "list_skills", "read_skill"),
+    ("goal", "check"):       ("web_search", "social_search", "fetch_page", "read_profile"),
+}
+
+# granting_skill_text 的篇幅上限：每份做法正文 ≤3000 字、合计 ≤6000 字。
+_SKILL_BODY_MAX = 3000
+_SKILL_TEXT_TOTAL_MAX = 6000
+
 
 class Specialists:
     """把岗位跑成一个临时 Workers 回合；与 Agents（交接单/记忆）联动。"""
 
-    def __init__(self, agents: Any, workers: Workers, skills: Any) -> None:
+    def __init__(self, agents: Any, workers: Workers, skills: Any,
+                 *, env: Any = None, tools: Any = None) -> None:
         self._agents = agents
         self._workers = workers
         self._skills = skills
+        # 做法工具两个可选底座：env = 本机执行环境（开单独工作区用，LocalEnv.ephemeral）；
+        # tools = 工具注册表（查 needs_workspace/exec_class/task_only 特性位）。
+        # 没给 = 老行为：做法声明的工具一律当「没注册」、永远不开单独工作区。
+        self._env = env
+        self._tools = tools
 
     @property
     def agents(self) -> Any:
@@ -91,18 +115,209 @@ class Specialists:
                 profile = self._agents.profile(kind)
             except Exception:
                 return default
+        # 做法带来的工具（调研岗才有）：挂着的、已启用的做法里 allowed-tools 声明、
+        # 且当前注册着的工具。profile.tools 只能收窄**出厂**那部分，压不掉做法工具。
+        granted = tuple(self.granted_tools(kind)) if kind in RESEARCH_KINDS else ()
         tools = profile.get("tools")
         if tools is None:
-            return default
+            factory = default
+        else:
+            try:
+                as_tuple = tuple(str(x) for x in tools if str(x or "").strip())
+            except Exception:
+                factory = default
+            else:
+                # 交集：profile 只能收窄默认上限
+                if default is None:
+                    return as_tuple  # 不会到（task 已早退）
+                default_set = set(default)
+                factory = tuple(n for n in as_tuple if n in default_set)
+        base = tuple(factory or ())
+        if not granted:
+            return base
+        seen = set(base)
+        return base + tuple(g for g in granted if g not in seen)
+
+    # ------------------------------------------------------------------
+    # 做法（skill）带来的工具：skill_tools / granted_tools / phase_tools
+    # ------------------------------------------------------------------
+
+    def _tool_traits(self, name: str) -> dict | None:
+        """查一个工具的特性位；没接注册表 / 没注册 → None。"""
+        tools = self._tools
+        if tools is None:
+            return None
         try:
-            as_tuple = tuple(str(x) for x in tools if str(x or "").strip())
+            return tools.traits(name)
         except Exception:
-            return default
-        # 交集：profile 只能收窄默认上限
-        if default is None:
-            return as_tuple  # 不会到（task 已早退）
-        default_set = set(default)
-        return tuple(n for n in as_tuple if n in default_set)
+            logger.exception("查工具 %s 特性出错，按没注册", name)
+            return None
+
+    def skill_tools(self, kind: str) -> list[dict[str, Any]]:
+        """这个调研岗挂着、且声明了工具的做法清单（管理员工具/网页展示用）。
+
+        每份做法一条：{skill, tools:[{name, registered, exec_class, task_only}], unknown}。
+        安全底线：只数「Skills.list(worker) 里已启用的内置+数据目录」做法
+        （_resolve_allowed_skills 已与启用名单取过交集）；名字带 本群/ 或路径符的
+        一律跳过——agent_skills 本就不在 Skills.list()，这里是双保险。
+        非调研岗 → []。
+        """
+        if str(kind or "") not in RESEARCH_KINDS:
+            return []
+        allowed = self._resolve_allowed_skills(str(kind)) or ()
+        if not allowed:
+            return []
+        try:
+            items = self._skills.list("worker")
+        except Exception:
+            logger.exception("读 skill 名单出错，这次做法不带工具")
+            return []
+        by_name = {str(i.get("name") or ""): i for i in items}
+        out: list[dict[str, Any]] = []
+        for name in allowed:
+            if "/" in name or "\\" in name or name.startswith("本群"):
+                continue  # 本群做法/越界形态绝不带工具（安全底线）
+            item = by_name.get(name)
+            if item is None:
+                continue
+            tools_list: list[dict[str, Any]] = []
+            unknown: list[str] = []
+            for t in item.get("allowed_tools") or []:
+                tr = self._tool_traits(str(t))
+                # 「注册」的口径 = 注册给 worker 的工具（main-only 的群空间/验收工具
+                # 带给调研岗没意义，按没注册算 → 进 unknown 给管理员看）
+                registered = tr is not None and "worker" in (tr.get("roles") or ())
+                tools_list.append({
+                    "name": str(t),
+                    "registered": registered,
+                    "exec_class": bool(registered and tr.get("exec_class")),
+                    "task_only": bool(registered and tr.get("task_only")),
+                })
+                if not registered:
+                    unknown.append(str(t))
+            if tools_list:
+                out.append({"skill": name, "tools": tools_list, "unknown": unknown})
+        return out
+
+    def granted_tools(self, kind: str) -> list[str]:
+        """做法带给这个调研岗的**已注册**工具名（去重保序）；非调研岗 → []。"""
+        out: list[str] = []
+        for entry in self.skill_tools(kind):
+            for t in entry.get("tools") or []:
+                if t.get("registered") and t["name"] not in out:
+                    out.append(t["name"])
+        return out
+
+    def phase_tools(self, kind: str, phase: str) -> list[str]:
+        """自动回合这个环节给子 agent 的名单 = AUTO_PHASES 基础 + 做法带来且非 task_only 的。"""
+        base = list(AUTO_PHASES.get((str(kind), str(phase)), ()))
+        for name in self.granted_tools(kind):
+            tr = self._tool_traits(name) or {}
+            if tr.get("task_only"):
+                continue  # 只在派活回合有意义的（vm_* / machine_* / render_report / generate_image）不进自动回合
+            if name not in base:
+                base.append(name)
+        return base
+
+    def granting_skill_text(self, kind: str, tools: Any) -> str:
+        """带来 `tools` 中任一工具的做法正文拼成的提示段（自动回合 system_extra 用）。
+
+        每份做法 ≤3000 字、合计 ≤6000 字，超了截断并注明「全文用 read_skill 读」；
+        标明「这是管理员写的做法」（数据不是指令的口径照旧由 system_extra 主段负责）。
+        """
+        wanted = {str(t) for t in (tools or ())}
+        if not wanted:
+            return ""
+        parts: list[str] = []
+        total = 0
+        truncated = False
+        for entry in self.skill_tools(kind):
+            skill_name = str(entry.get("skill") or "")
+            granted_here = [t["name"] for t in entry.get("tools") or []
+                            if t.get("registered") and t["name"] in wanted]
+            if not granted_here:
+                continue
+            try:
+                raw = self._skills.read(skill_name) or ""
+            except Exception:
+                logger.exception("读做法 %s 正文出错，这轮不带它的正文", skill_name)
+                continue
+            body = raw
+            if body.startswith("---"):
+                end = body.find("\n---", 3)
+                if end >= 0:
+                    body = body[end + 4:]
+            body = body.strip()
+            if len(body) > _SKILL_BODY_MAX:
+                body = body[:_SKILL_BODY_MAX].rstrip() + "\n…（截断，全文用 read_skill 读）"
+                truncated = True
+            if not body:
+                continue
+            if total + len(body) > _SKILL_TEXT_TOTAL_MAX:
+                truncated = True
+                continue
+            total += len(body)
+            parts.append(f"【做法 {skill_name}（管理员写的做法，它给你带来了工具：{'、'.join(granted_here)}）】\n{body}")
+        if not parts:
+            return ""
+        tail = "\n（做法正文太长被截断了，需要全文用 read_skill 读对应名字）" if truncated else ""
+        return (
+            "下面这些做法是这个岗位挂着的、管理员写的做法——你本轮的工具是它带来的，"
+            "照做法用这些工具：\n\n" + "\n\n".join(parts) + tail
+        )
+
+    def describe_tools(self, kind: str) -> dict[str, Any]:
+        """这个岗位「现在能用什么工具」的一份事实（agent_detail / GET /api/agents 共用）。
+
+        - 调研岗：出厂工具 + 做法带来的工具（按做法分组、带特性位）+ 各环节名单；
+        - task / 自定义专岗：工具不固定，每次派活从全部子 agent 工具里挑，列当前候选；
+        - main：不跑子 agent，列派活排计划 / 验收回合的工具。
+        """
+        kind_s = str(kind or "")
+        if kind_s in RESEARCH_KINDS:
+            phases = {
+                phase: self.phase_tools(kind_s, phase)
+                for (k, phase) in AUTO_PHASES if k == kind_s
+            }
+            return {
+                "mode": "fixed_plus_skills",
+                "factory": list(_SPECIALIST_DEFAULT_TOOLS.get(kind_s) or ()),
+                "skills": self.skill_tools(kind_s),
+                "phases": phases,
+            }
+        tools = self._tools
+        if kind_s == "main":
+            plan_review: list[str] = []
+            if tools is not None:
+                try:
+                    from .coordinator import (
+                        main_plan_tool_specs, main_review_tool_specs, spec_tool_names,
+                    )
+                    plan_review = list(spec_tool_names(main_plan_tool_specs(tools)))
+                    for n in spec_tool_names(main_review_tool_specs(tools)):
+                        if n not in plan_review:
+                            plan_review.append(n)
+                except Exception:
+                    logger.exception("列主模型排计划/验收工具出错")
+            return {
+                "mode": "main",
+                "plan_review": plan_review,
+                "note": "管理员对话只有管理员工具（admin 角色那一格），用不到这些",
+            }
+        candidates: list[str] = []
+        if tools is not None:
+            try:
+                from .coordinator import worker_job_tool_names
+
+                candidates = worker_job_tool_names(tools)
+            except Exception:
+                logger.exception("列子 agent 工具候选出错")
+        return {
+            "mode": "per_job",
+            "candidates": candidates,
+            "note": "这个岗的工具不固定：每次派活主模型从全部子 agent 工具里挑，"
+                    "做法里写的工具对这个岗不额外生效",
+        }
 
     def effective_tools(self, kind: str, requested: Any, profile: dict | None = None) -> list[str]:
         """本次 Workers **真正会拿到**的工具名单（角色门控后的）——唯一解析入口。
@@ -240,6 +455,8 @@ class Specialists:
         # 和「换升级模型」；没给就不传，资讯/构想/目标照旧每次全新对话。
         history: list[dict] | None = None,
         escalate: bool = False,
+        # run_auto 专用：追加到 system_extra 末尾的一段（做法正文等）；普通调用不给。
+        extra_system: str = "",
     ) -> WorkerReport:
         gid = str(group_id or "")
         kind_s = str(kind or "").strip()
@@ -305,6 +522,8 @@ class Specialists:
             from .lanes import LANE_WORKER_RULES
 
             extra_parts.append(LANE_WORKER_RULES)
+        if str(extra_system or "").strip():
+            extra_parts.append(str(extra_system))
         system_extra = "\n\n".join(extra_parts)
 
         # 5) 登记交接单（begin → running → returned/fail；绝不 auto accept）
@@ -408,6 +627,83 @@ class Specialists:
 
         report.handoff_id = handoff_id
         return report
+
+    # ------------------------------------------------------------------
+    # run_auto：自动回合统一入口（资讯核对/补打开/补找、构想调查、目标检查）
+    # ------------------------------------------------------------------
+
+    async def run_auto(
+        self,
+        kind: str,
+        brief: str,
+        *,
+        phase: str,
+        group_id: str,
+        task_id: str = "",
+        deadline_ts: float | None = None,
+        max_steps: int = 0,
+        actor: str = "",
+        output_schema: dict | None = None,
+    ) -> WorkerReport:
+        """调研岗自动回合：名单按环节表 + 做法带来的工具现算，提示带做法正文。
+
+        - tools = phase_tools(kind, phase)（AUTO_PHASES 基础 + 做法带来且非 task_only）；
+        - 本轮拿到做法工具 → system_extra 追加 granting_skill_text；
+        - 名单里有要工作区的工具 → 在 env.ephemeral("rr-"+kind) 的单独工作区里跑；
+          env 缺位 / 不支持 / 进场抛错 → 去掉这些工具、记中文 warning、照常跑；
+        - task_only 工具永远不会进自动回合（phase_tools 已滤）。
+        """
+        kind_s = str(kind or "").strip()
+        tools = self.phase_tools(kind_s, phase)
+        ws_tools = [
+            n for n in tools
+            if (self._tool_traits(n) or {}).get("needs_workspace")
+        ]
+        ws_ctx: Any = None
+        ws_path: Any = None
+        if ws_tools:
+            env = self._env
+            eph = getattr(env, "ephemeral", None) if env is not None else None
+            if callable(eph):
+                try:
+                    ws_ctx = eph(f"rr-{kind_s}", deadline_ts=deadline_ts)
+                    ws_path = await ws_ctx.__aenter__()
+                except Exception:
+                    logger.warning(
+                        "自动回合开单独工作区失败（岗位 %s，环节 %s）：去掉要工作区的工具 %s，照常跑",
+                        kind_s, phase, "、".join(ws_tools), exc_info=True,
+                    )
+                    ws_ctx = None
+                    ws_path = None
+            else:
+                logger.warning(
+                    "自动回合要工作区但执行环境不支持单独工作区（岗位 %s，环节 %s）："
+                    "去掉要工作区的工具 %s，照常跑",
+                    kind_s, phase, "、".join(ws_tools),
+                )
+            if ws_ctx is None:
+                drop = set(ws_tools)
+                tools = [n for n in tools if n not in drop]
+        # 最终名单里由做法带来的工具 → 提示里放做法正文
+        granted = set(self.granted_tools(kind_s))
+        in_round = [n for n in tools if n in granted]
+        extra_system = self.granting_skill_text(kind_s, in_round) if in_round else ""
+        try:
+            return await self.run(
+                kind_s, brief,
+                group_id=group_id, phase=phase, task_id=task_id,
+                tools=tools, output_schema=output_schema,
+                actor=actor, deadline_ts=deadline_ts, max_steps=max_steps,
+                workspace=ws_path, extra_system=extra_system,
+            )
+        finally:
+            if ws_ctx is not None:
+                try:
+                    await ws_ctx.__aexit__(None, None, None)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("自动回合单独工作区收尾失败（岗位 %s）", kind_s)
 
     # ------------------------------------------------------------------
     # review（主调用者后验收用）

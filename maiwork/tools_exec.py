@@ -892,6 +892,7 @@ def register_exec_tools(
                 (res.output[:200] + "…") if res.ok and len(res.output) > 200 else (res.output if res.ok else res.error),
             ),
             timeout_s=10.0,
+            needs_workspace=True,
         )
     )
     tools.register(
@@ -914,6 +915,8 @@ def register_exec_tools(
                 f"{'追加' if args.get('append') else '写入'} {len(str(args.get('content', '')))} 字" if res.ok else res.error,
             ),
             timeout_s=15.0,
+            needs_workspace=True,
+            exec_class=True,
         )
     )
     async def render_report(ctx: ToolContext, args: dict) -> ToolResult:
@@ -970,6 +973,9 @@ def register_exec_tools(
                 res.output if res.ok else res.error,
             ),
             timeout_s=15.0,
+            needs_workspace=True,
+            exec_class=True,
+            task_only=True,
         )
     )
     tools.register(
@@ -991,6 +997,7 @@ def register_exec_tools(
                 (f"{len(res.data or [])} 个条目" if res.ok else res.error),
             ),
             timeout_s=10.0,
+            needs_workspace=True,
         )
     )
     tools.register(
@@ -1018,6 +1025,8 @@ def register_exec_tools(
                 else (res.error or "出错"),
             ),
             timeout_s=3600.0,  # 工具自身的兜底：比 runtime_max_sec + 兜底 15s 多一档
+            needs_workspace=True,
+            exec_class=True,
         )
     )
     tools.register(
@@ -1040,6 +1049,8 @@ def register_exec_tools(
                 res.output if res.ok else res.error,
             ),
             timeout_s=30.0,
+            needs_workspace=True,
+            exec_class=True,
         )
     )
     tools.register(
@@ -1058,6 +1069,7 @@ def register_exec_tools(
                 (res.output.splitlines()[0] if res.output else res.error),
             ),
             timeout_s=10.0,
+            needs_workspace=True,
         )
     )
     tools.register(
@@ -1076,6 +1088,8 @@ def register_exec_tools(
                 res.output if res.ok else res.error,
             ),
             timeout_s=15.0,
+            needs_workspace=True,
+            exec_class=True,
         )
     )
     tools.register(

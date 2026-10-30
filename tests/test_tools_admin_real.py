@@ -31,31 +31,23 @@ G1 = "900000001"
 G2 = "123456789"
 G_BAD = "99999"
 
-# 管理员对话全部工具的覆盖清单（含本批新增的 refresh_profile / create_task 确认化）。
-# tools.specs("admin") 的实际名单必须和它一模一样：新增工具漏测会在这里报错。
+# 管理员对话全部工具的覆盖清单（10-30 收敛合并：63 → 25，一个动作一个合并工具 +
+# action 分派）。tools.specs("admin") 的实际名单必须和它一模一样：新增 / 少工具都在这里报错。
 ALL_ADMIN_TOOLS = {
     # 读类
-    "list_groups", "group_overview", "read_profile", "list_focus", "list_news",
-    "list_ideas", "list_tasks", "task_detail", "list_goals", "list_requests",
-    "read_chat", "read_logs", "get_rules", "get_identity", "list_extensions",
-    # 管理员对话自己的原文回读（0.4.1 加：工具结果全文落库 + 按 id/字符窗口分页读回）
-    "read_admin_history",
+    "list_groups", "group_overview", "env_overview",
+    "read_chat", "read_admin_history", "read_logs",
+    # 亲手试调子 agent 工具（行为测试在 test_admin_tool_calls.py / test_admin_tool_run.py）
+    "tool_run",
     # skill 说明（管理员只看得见 social-login-helper 这一份；行为测试在 test_social_wiring.py）
     "list_skills", "read_skill",
-    # 写类
-    "profile_edit", "profile_bulk_delete", "focus_edit",
-    "rss_add", "rss_remove", "block_domain", "set_rules", "identity_edit", "remember",
-    # 危险 / 对外
-    "send_group_message", "group_notice_send", "group_file_manage", "group_album_upload",
-    "skill_delete", "skill_install", "env_overview", "mcp_toggle", "mcp_delete",
-    # 现在动手（后台类）
-    "run_news_now", "make_idea_now", "refresh_profile",
-    # 任务 / 目标 / 请求
-    "create_task", "create_goal", "goal_adjust", "approve_request", "reject_request", "cancel_task",
-    # 改设置（和网页同一套校验；行为测试在 test_admin_settings_tools.py）
-    "mcp_add", "mcp_update", "mcp_test", "mcp_reload",
-    "list_agents", "agent_update", "agent_create", "agent_delete", "agent_detail",
-    "list_models", "endpoint_save", "endpoint_delete", "model_save", "model_delete",
+    # 群资料 / 日常业务 / 群外发（合并工具，action 分派）
+    "profile_manage", "focus_manage", "source_manage", "news_manage", "idea_manage",
+    "task_manage", "goal_manage", "request_manage", "group_deliver",
+    # 设置 / 做法 / 规则 / 身份（合并工具；行为测试在 test_admin_settings_tools.py 等）
+    "skill_manage", "rules_manage", "identity_manage",
+    "mcp_manage", "agent_manage", "model_manage",
+    "social_toggle",
 }
 
 NOW = time.time()
@@ -301,18 +293,18 @@ class TestReadTools:
 
     @pytest.mark.asyncio
     async def test_read_profile(self, app) -> None:
-        r = await _call(app, "read_profile", {"group_id": G1})
+        r = await _call(app, "profile_manage", {"action": "read", "group_id": G1})
         assert r.ok and "分享夜" in r.output and "自部署" in r.output
 
     @pytest.mark.asyncio
     async def test_list_focus(self, app) -> None:
-        r = await _call(app, "list_focus", {"group_id": G1})
+        r = await _call(app, "focus_manage", {"action": "list", "group_id": G1})
         assert r.ok and "10003" in r.output
 
     @pytest.mark.asyncio
     async def test_list_news_real_batches(self, app) -> None:
         """线上踩过的坑：news_view(admin=True) 返回的是批次列表，必须展开批次里的 items。"""
-        r = await _call(app, "list_news", {"group_id": G1})
+        r = await _call(app, "news_manage", {"action": "list", "group_id": G1})
         assert r.ok, r.error
         assert "railway.new" in r.output and "SQLite" in r.output
         assert "https://spam.example.com/x" in r.output, f"条目要带出链接 / 站点：{r.output}"
@@ -321,19 +313,19 @@ class TestReadTools:
 
     @pytest.mark.asyncio
     async def test_list_ideas(self, app) -> None:
-        r = await _call(app, "list_ideas", {"group_id": G1})
+        r = await _call(app, "idea_manage", {"action": "list", "group_id": G1})
         assert r.ok and "巡检" in r.output
 
     @pytest.mark.asyncio
     async def test_list_tasks(self, app) -> None:
-        r = await _call(app, "list_tasks", {"group_id": G1})
+        r = await _call(app, "task_manage", {"action": "list", "group_id": G1})
         assert r.ok and app._seeded["tid"] in r.output and "插件踩坑文档" in r.output
 
     @pytest.mark.asyncio
     async def test_task_detail_real(self, app) -> None:
         """线上踩过的坑：detail_view 没有 group_id 键，服务群检查永远失败。"""
         tid = app._seeded["tid"]
-        r = await _call(app, "task_detail", {"task_id": tid})
+        r = await _call(app, "task_manage", {"action": "detail", "task_id": tid})
         assert r.ok, r.error
         assert tid in r.output and "插件踩坑文档" in r.output
         assert "完成" in r.output or "completed" in r.output
@@ -344,17 +336,17 @@ class TestReadTools:
         """detail_view 没有 group_id 键（线上踩过：view.get('group_id') 永远是空），
         必须从 Tasks.get 的行上拿群号做服务群检查——别群的任务要拒。"""
         bad = app.tasks.create("555444333", title="别群的任务", req="x", criteria=[], source="admin_chat")
-        r = await _call(app, "task_detail", {"task_id": str(bad)})
+        r = await _call(app, "task_manage", {"action": "detail", "task_id": str(bad)})
         assert not r.ok and "不是服务群" in r.error
 
     @pytest.mark.asyncio
     async def test_list_goals(self, app) -> None:
-        r = await _call(app, "list_goals", {"group_id": G1})
+        r = await _call(app, "goal_manage", {"action": "list", "group_id": G1})
         assert r.ok and "插件开发的坑" in r.output and "Jev 对照" in r.output
 
     @pytest.mark.asyncio
     async def test_list_requests(self, app) -> None:
-        r = await _call(app, "list_requests", {"group_id": G1})
+        r = await _call(app, "request_manage", {"action": "list", "group_id": G1})
         assert r.ok and "NAS 方案" in r.output and "Kiriko" in r.output
 
     @pytest.mark.asyncio
@@ -371,7 +363,7 @@ class TestReadTools:
 
     @pytest.mark.asyncio
     async def test_get_rules(self, app) -> None:
-        r = await _call(app, "get_rules", {})
+        r = await _call(app, "rules_manage", {"action": "get", })
         assert r.ok, r.error
         # 0.8.0：归每群自己管的几项（批准名单 / 推送 / 开话题开关）不再当全局规则列出，
         # 要明确说去群页面管——不静默无效。
@@ -382,13 +374,13 @@ class TestReadTools:
 
     @pytest.mark.asyncio
     async def test_get_identity(self, app) -> None:
-        r = await _call(app, "get_identity", {})
+        r = await _call(app, "identity_manage", {"action": "get", })
         assert r.ok, r.error
         assert "SOUL.md" in r.output and "MEMORY.md" in r.output
 
     @pytest.mark.asyncio
     async def test_list_extensions(self, app) -> None:
-        r = await _call(app, "list_extensions", {})
+        r = await _call(app, "skill_manage", {"action": "list", })
         assert r.ok, r.error
         assert r.output  # 有或没有扩展都要有一句像样的话
 
@@ -396,25 +388,25 @@ class TestReadTools:
 class TestWriteTools:
     @pytest.mark.asyncio
     async def test_profile_edit_add_and_lock(self, app) -> None:
-        r = await _call(app, "profile_edit", {"group_id": G1, "action": "add", "category": "ongoing", "text": "在做：给群文档收尾"})
+        r = await _call(app, "profile_manage", {"group_id": G1, "action": "add", "category": "ongoing", "text": "在做：给群文档收尾"})
         assert r.ok, r.error
         eid = int(r.data["id"])
         texts = [e["text"] for e in app.profiles.entries(G1)]
         assert "在做：给群文档收尾" in texts
-        r2 = await _call(app, "profile_edit", {"group_id": G1, "action": "lock", "entry_id": eid})
+        r2 = await _call(app, "profile_manage", {"group_id": G1, "action": "lock", "entry_id": eid})
         assert r2.ok, r2.error
 
     @pytest.mark.asyncio
     async def test_profile_bulk_delete_confirmed(self, app) -> None:
         eid = app.profiles.add_entry(G1, "recent", "一条马上要被删的条目")
-        r, ticket = await _call_confirmed(app, "profile_bulk_delete", {"group_id": G1, "entry_ids": [eid]})
+        r, ticket = await _call_confirmed(app, "profile_manage", {"action": "bulk_delete", "group_id": G1, "entry_ids": [eid]})
         assert r.ok, r.error
         assert "已删 1 条" in r.output
         assert "1 条画像" in ticket["summary"]
 
     @pytest.mark.asyncio
     async def test_focus_edit(self, app) -> None:
-        r = await _call(app, "focus_edit", {"group_id": G1, "user_id": "10005", "action": "add"})
+        r = await _call(app, "focus_manage", {"group_id": G1, "user_id": "10005", "action": "add"})
         assert r.ok and "一直关注" in r.output
         rows = app.store.read().execute(
             "SELECT user_id FROM focus_members WHERE group_id=? AND removed=0 AND user_id='10005'", (G1,)
@@ -423,34 +415,34 @@ class TestWriteTools:
 
     @pytest.mark.asyncio
     async def test_rss_add_then_remove_confirmed(self, app) -> None:
-        r = await _call(app, "rss_add", {"group_id": G1, "url": "https://example.com/feed.xml", "title": "测试源"})
+        r = await _call(app, "source_manage", {"action": "rss_add", "group_id": G1, "url": "https://example.com/feed.xml", "title": "测试源"})
         assert r.ok, r.error
         from CharTyr_MaiWork.maiwork import rss as _rss
 
         rows = _rss.list_feeds(app.store, G1)
         assert len(rows) == 1
         fid = str(rows[0]["id"])
-        r2, ticket = await _call_confirmed(app, "rss_remove", {"group_id": G1, "feed_id": fid})
+        r2, ticket = await _call_confirmed(app, "source_manage", {"action": "rss_remove", "group_id": G1, "feed_id": fid})
         assert r2.ok, r2.error
         assert _rss.list_feeds(app.store, G1) == []
         assert "RSS 源" in ticket["summary"]
 
     @pytest.mark.asyncio
     async def test_block_domain(self, app) -> None:
-        r = await _call(app, "block_domain", {"domain": "spam.example.com", "blocked": True})
+        r = await _call(app, "source_manage", {"action": "block_domain", "domain": "spam.example.com", "blocked": True})
         assert r.ok and "屏蔽 spam.example.com" in r.output
-        r2 = await _call(app, "block_domain", {"domain": "spam.example.com", "blocked": False})
+        r2 = await _call(app, "source_manage", {"action": "block_domain", "domain": "spam.example.com", "blocked": False})
         assert r2.ok and "取消屏蔽" in r2.output
 
     @pytest.mark.asyncio
     async def test_set_rules_safe_and_loosen(self, app) -> None:
         # 收紧（间隔拉长）：不确认直接生效
-        r = await _call(app, "set_rules", {"patch": {"topics": {"min_gap_hours": 6}}})
+        r = await _call(app, "rules_manage", {"action": "set", "patch": {"topics": {"min_gap_hours": 6}}})
         assert r.ok, r.error
         assert "已请求管理员确认" not in r.output
         assert app.get_settings().topics.min_gap_hours == 6
         # 放宽（间隔缩短 = 开话题更勤）：要确认，同意后才生效
-        r2, ticket = await _call_confirmed(app, "set_rules", {"patch": {"topics": {"min_gap_hours": 1}}})
+        r2, ticket = await _call_confirmed(app, "rules_manage", {"action": "set", "patch": {"topics": {"min_gap_hours": 1}}})
         assert r2.ok, r2.error
         assert "话题间隔" in ticket["summary"] and "min_gap_hours" not in ticket["summary"]
         assert app.get_settings().topics.min_gap_hours == 1
@@ -468,7 +460,7 @@ class TestWriteTools:
             {"delivery": {"push_per_day": 9}},
             {"topics": {"enabled": False}},
         ):
-            r = await _call(app, "set_rules", {"patch": patch})
+            r = await _call(app, "rules_manage", {"action": "set", "patch": patch})
             assert not r.ok, patch
             assert "群" in (r.error or ""), patch
         # 全局设置和每群那份都没被这些调用动过
@@ -482,13 +474,13 @@ class TestWriteTools:
     async def test_identity_edit_group_kind_gone(self, app) -> None:
         """「每群三份」收尾：identity_edit 不再接受 kind=\"group\"（每群内容走
         /api/groups/{gid}/rules 或 set_rules；identity 只剩 soul/agents/memory）。"""
-        r = await _call(app, "identity_edit", {"kind": "group", "group_id": G1, "text": "新的群工作记忆"})
+        r = await _call(app, "identity_manage", {"action": "edit", "kind": "group", "group_id": G1, "text": "新的群工作记忆"})
         assert not r.ok
         assert "soul" in (r.error or "") and ("agents" in (r.error or ""))
 
     @pytest.mark.asyncio
     async def test_remember(self, app) -> None:
-        r = await _call(app, "remember", {"text": "管理员说：记住这个真模块集成测试", "group_id": G1})
+        r = await _call(app, "identity_manage", {"action": "remember", "text": "管理员说：记住这个真模块集成测试", "group_id": G1})
         assert r.ok, r.error
         assert "已记住" in r.output
 
@@ -496,7 +488,7 @@ class TestWriteTools:
 class TestDangerTools:
     @pytest.mark.asyncio
     async def test_send_group_message_confirmed(self, app) -> None:
-        r, ticket = await _call_confirmed(app, "send_group_message", {"group_id": G1, "text": "大家好，这是测试一句"})
+        r, ticket = await _call_confirmed(app, "group_deliver", {"action": "message", "group_id": G1, "text": "大家好，这是测试一句"})
         assert r.ok, r.error
         assert "发件箱" in r.output
         row = app.store.read().execute("SELECT * FROM outbox WHERE group_id=?", (G1,)).fetchone()
@@ -511,7 +503,7 @@ class TestDangerTools:
             calls.append((gid, content))
 
         app.group_space = type("FakeSpace", (), {"send_notice": staticmethod(_notice)})()
-        r, ticket = await _call_confirmed(app, "group_notice_send", {"group_id": G1, "content": "这周周报已整理"})
+        r, ticket = await _call_confirmed(app, "group_deliver", {"action": "notice", "group_id": G1, "content": "这周周报已整理"})
         assert r.ok, r.error
         assert calls == [(G1, "这周周报已整理")]
         assert "公告" in ticket["summary"]
@@ -524,7 +516,7 @@ class TestDangerTools:
             calls.append(("mkdir", gid, name))
 
         app.group_space = type("FakeSpace", (), {"create_folder": staticmethod(_mkdir)})()
-        r, _ticket = await _call_confirmed(app, "group_file_manage", {"group_id": G1, "action": "mkdir", "name": "成品"})
+        r, _ticket = await _call_confirmed(app, "group_deliver", {"group_id": G1, "action": "mkdir", "name": "成品"})
         assert r.ok, r.error
         assert calls == [("mkdir", G1, "成品")]
 
@@ -551,7 +543,7 @@ class TestDangerTools:
             calls.append((gid, album, path))
 
         app.group_space = type("FakeSpace", (), {"upload_to_album": staticmethod(_upload)})()
-        r, _t = await _call_confirmed(app, "group_album_upload", {"group_id": G1, "path": str(pic), "album_id": "A1"})
+        r, _t = await _call_confirmed(app, "group_deliver", {"action": "album_upload", "group_id": G1, "path": str(pic), "album_id": "A1"})
         assert r.ok, r.error
         assert calls and calls[0][2] == str(pic)
 
@@ -564,7 +556,7 @@ class TestDangerTools:
         root.mkdir(parents=True, exist_ok=True)
         (root / "SKILL.md").write_text("---\nname: demo-skill\ndescription: 测试用\n---\n正文", encoding="utf-8")
         assert skills.read("demo-skill") is not None
-        r, _t = await _call_confirmed(app, "skill_delete", {"name": "demo-skill"})
+        r, _t = await _call_confirmed(app, "skill_manage", {"action": "delete", "name": "demo-skill"})
         assert r.ok, r.error
         assert skills.read("demo-skill") is None
 
@@ -572,9 +564,9 @@ class TestDangerTools:
     async def test_mcp_toggle_and_delete_no_ext(self, app) -> None:
         """没接扩展管理时要说清「现在开不了也关不了」，而不是报错崩掉。"""
         if app.extensions is None:
-            r = await _call(app, "mcp_toggle", {"name": "x", "enabled": True})
+            r = await _call(app, "mcp_manage", {"action": "toggle", "name": "x", "enabled": True})
             assert not r.ok and "没接 MCP 扩展" in r.error
-            r2 = await _call(app, "mcp_delete", {"name": "x"})
+            r2 = await _call(app, "mcp_manage", {"action": "delete", "name": "x"})
             assert not r2.ok
             return
         pytest.skip("这个环境接了扩展管理")
@@ -591,7 +583,7 @@ class TestNowTools:
             return 0
 
         app.feeds.prepare_news = _fake_prepare
-        r = await _call(app, "run_news_now", {"group_id": G1})
+        r = await _call(app, "news_manage", {"action": "run_now", "group_id": G1})
         assert r.ok, r.error
         assert "备一批资讯" in r.output and "后台" in r.output
         assert (G1, "news_manual") in app._running_jobs
@@ -601,7 +593,7 @@ class TestNowTools:
             await asyncio.sleep(0.02)
         assert called == [G1], "真的要调到 Feeds.prepare_news"
         # 同群互斥：这批还没结，第二次直接回「已经在备料了」
-        r2 = await _call(app, "run_news_now", {"group_id": G1})
+        r2 = await _call(app, "news_manage", {"action": "run_now", "group_id": G1})
         assert not r2.ok and "已经在备料" in r2.error
 
     @pytest.mark.asyncio
@@ -613,7 +605,7 @@ class TestNowTools:
             return None
 
         app.feeds.make_idea = _fake_make
-        r = await _call(app, "make_idea_now", {"group_id": G1})
+        r = await _call(app, "idea_manage", {"action": "make_now", "group_id": G1})
         assert r.ok, r.error
         assert (G1, "idea_manual") in app._running_jobs
         for _ in range(50):
@@ -634,13 +626,13 @@ class TestNowTools:
             return True
 
         app.profiles.refresh = _fake_refresh
-        r = await _call(app, "refresh_profile", {"group_id": G1})
+        r = await _call(app, "profile_manage", {"action": "refresh", "group_id": G1})
         assert r.ok, r.error
         assert "已经开始重新整理" in r.output and G1 in r.output
         assert "网页群画像" in r.output
         assert (G1, "profile_manual") in app._running_jobs
         # 同群互斥：连调只起一个
-        r2 = await _call(app, "refresh_profile", {"group_id": G1})
+        r2 = await _call(app, "profile_manage", {"action": "refresh", "group_id": G1})
         assert not r2.ok and "已经在整理" in r2.error
         for _ in range(100):
             if called:
@@ -650,7 +642,7 @@ class TestNowTools:
 
     @pytest.mark.asyncio
     async def test_refresh_profile_rejects_non_served(self, app) -> None:
-        r = await _call(app, "refresh_profile", {"group_id": G_BAD})
+        r = await _call(app, "profile_manage", {"action": "refresh", "group_id": G_BAD})
         assert not r.ok and "不是服务群" in r.error
 
     @pytest.mark.asyncio
@@ -664,7 +656,7 @@ class TestNowTools:
         chat = AdminChat(app).create(G1)
         gate.bind_chat(int(chat["id"]), 0)
         try:
-            r = await _call(app, "refresh_profile", {"group_id": G1})
+            r = await _call(app, "profile_manage", {"action": "refresh", "group_id": G1})
         finally:
             gate.bind_chat(0, 0)
         assert r.ok, r.error
@@ -678,7 +670,7 @@ class TestTaskGoalRequestTools:
         """create_task 进了确认清单：同意前只写票不建任务，同意后才建并开工。"""
         title = "把本周聊的部署脚本整理成一页"
         r, ticket = await _call_confirmed(
-            app, "create_task", {"group_id": G1, "title": title, "request": "整理成一页网页，手机上能看"}
+            app, "task_manage", {"action": "create", "group_id": G1, "title": title, "request": "整理成一页网页，手机上能看"}
         )
         assert "子 agent" in ticket["summary"] and G1 in ticket["summary"] and title[:10] in ticket["summary"]
         assert r.ok, r.error
@@ -694,7 +686,7 @@ class TestTaskGoalRequestTools:
         gate.bind_chat(int(chat["id"]), 0)
         try:
             before = app.store.read().execute("SELECT COUNT(*) AS c FROM tasks").fetchone()["c"]
-            r = await _call(app, "create_task", {"group_id": G1, "title": "先不建", "request": "先不建"})
+            r = await _call(app, "task_manage", {"action": "create", "group_id": G1, "title": "先不建", "request": "先不建"})
             after = app.store.read().execute("SELECT COUNT(*) AS c FROM tasks").fetchone()["c"]
         finally:
             gate.bind_chat(0, 0)
@@ -705,7 +697,7 @@ class TestTaskGoalRequestTools:
     async def test_create_goal_needs_confirm_then_creates(self, app) -> None:
         """create_goal 进了确认清单：agent 目标后台检查时会往群里发汇报 / 完成话
         （coordinator 的 goal:{id}:report / goal:{id}:done），等于间接对外说话。"""
-        r, ticket = await _call_confirmed(app, "create_goal", {"group_id": G1, "title": "盯着服务器状态",
+        r, ticket = await _call_confirmed(app, "goal_manage", {"action": "create", "group_id": G1, "title": "盯着服务器状态",
                                                                "criteria": ["每天出一次状态摘要"], "check_hours": 12})
         assert G1 in ticket["summary"] and "盯着服务器状态" in ticket["summary"]
         assert r.ok, r.error
@@ -719,18 +711,18 @@ class TestTaskGoalRequestTools:
         goal_id = app._seeded["goal_id"]
         app.goals.set_criterion(goal_id, 0, True, evidence="管理员已核实的原始证据")
         before = json.loads(app.goals.get(goal_id)["criteria"])
-        result = await _call(app, "goal_adjust", {
+        result = await _call(app, "goal_manage", {
             "goal_id": goal_id, "action": "add_criterion", "text": "新增验收标准",
         })
         assert result.ok, result.error
         assert json.loads(app.goals.get(goal_id)["criteria"]) == [
             *before, {"text": "新增验收标准", "done": False},
         ]
-        result, ticket = await _call_confirmed(app, "goal_adjust", {
+        result, ticket = await _call_confirmed(app, "goal_manage", {
             "goal_id": goal_id, "action": "pause",
         })
         assert result.ok, result.error
-        assert ticket["tool"] == "goal_adjust" and goal_id in ticket["summary"]
+        assert ticket["tool"] == "goal_manage" and goal_id in ticket["summary"]
         assert app.goals.get(goal_id)["state"] == "paused"
 
     @pytest.mark.asyncio
@@ -739,7 +731,7 @@ class TestTaskGoalRequestTools:
         chat = AdminChat(app).create(G1)
         gate.bind_chat(int(chat["id"]), 0)
         try:
-            r = await _call(app, "create_goal", {"group_id": G1, "title": "先不立", "criteria": ["x"]})
+            r = await _call(app, "goal_manage", {"action": "create", "group_id": G1, "title": "先不立", "criteria": ["x"]})
         finally:
             gate.bind_chat(0, 0)
         assert r.ok and "已请求管理员确认" in r.output
@@ -753,7 +745,7 @@ class TestTaskGoalRequestTools:
             via="测试", requester_id="10004", requester_name="zzh",
         )
         rid = str(out["id"])
-        r, ticket = await _call_confirmed(app, "approve_request", {"request_id": rid})
+        r, ticket = await _call_confirmed(app, "request_manage", {"action": "approve", "request_id": rid})
         assert r.ok, r.error
         assert "已批准" in r.output
         row = app.store.read().execute("SELECT status FROM requests WHERE id=?", (rid,)).fetchone()
@@ -767,7 +759,7 @@ class TestTaskGoalRequestTools:
             via="测试", requester_id="10005", requester_name="捣蛋鬼",
         )
         rid = str(out["id"])
-        r = await _call(app, "reject_request", {"request_id": rid, "reason": "不合适"})
+        r = await _call(app, "request_manage", {"action": "reject", "request_id": rid, "reason": "不合适"})
         assert r.ok, r.error
         row = app.store.read().execute("SELECT status FROM requests WHERE id=?", (rid,)).fetchone()
         assert row["status"] == "rejected"
@@ -777,7 +769,7 @@ class TestTaskGoalRequestTools:
         tid = app._seeded["tid_running"]
         cancelled: list[str] = []
         app.cancel_task_run = lambda tid_: cancelled.append(str(tid_))
-        r = await _call(app, "cancel_task", {"task_id": tid, "reason": "不要了"})
+        r = await _call(app, "task_manage", {"action": "cancel", "task_id": tid, "reason": "不要了"})
         assert r.ok, r.error
         assert app.tasks.get(tid)["status"] == "cancelled"
         assert tid in cancelled, "取消要顺着统一入口把正在跑的子 agent 停掉"
@@ -879,11 +871,11 @@ class TestGuardsOnRealApp:
     async def test_non_served_group_rejected(self, app) -> None:
         for name, args in (
             ("group_overview", {"group_id": G_BAD}),
-            ("list_news", {"group_id": G_BAD}),
+            ("news_manage", {"action": "list", "group_id": G_BAD}),
             ("read_chat", {"group_id": G_BAD}),
-            ("run_news_now", {"group_id": G_BAD}),
-            ("make_idea_now", {"group_id": G_BAD}),
-            ("refresh_profile", {"group_id": G_BAD}),
+            ("news_manage", {"action": "run_now", "group_id": G_BAD}),
+            ("idea_manage", {"action": "make_now", "group_id": G_BAD}),
+            ("profile_manage", {"action": "refresh", "group_id": G_BAD}),
         ):
             r = await _call(app, name, args)
             assert not r.ok and "不是服务群" in r.error, f"{name} 没挡住非服务群：{r.ok} {r.output}{r.error}"

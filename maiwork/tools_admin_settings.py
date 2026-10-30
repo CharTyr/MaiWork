@@ -2,23 +2,25 @@
 
 管理员在网页和主模型对话时，主模型能做到网页「设置 → 工具 / 专岗 / 模型」能做的事：
 
-- MCP：mcp_add / mcp_update / mcp_test / mcp_reload
-- 专岗：list_agents / agent_update / agent_create / agent_delete / agent_detail（只读看一个岗的身份、
+- MCP：mcp_manage（list / add / update / toggle / test / reload / delete）
+- 专岗：agent_manage（list / detail / update / create / delete；detail 只读看一个岗的身份、
   有效工具名单；给了服务群群号再带本群记忆 / 本群做法 / 规矩里相关的条目）
-- 端点与模型库：list_models / endpoint_save / endpoint_delete / model_save / model_delete
+- 端点与模型库：model_manage（list / endpoint_save / endpoint_delete / model_save / model_delete）
 
 **不另写规则**：校验和写入一律调网页接口背后的同一套函数——MCP 走 extensions_web
 （create / update / try_connect，和 svc.reload_mcp），端点 / 模型库 / 自定义专岗走
 settings_ops，改岗位走 svc.agents.update_profile（PUT /api/agents/{kind} 的落点）。
 这里只多做两件事：
 
-1. 确认门（用户定）：
-   - 一律要确认（在 tools_admin.CONFIRM_TOOLS 里）：mcp_add、agent_delete、endpoint_delete、model_delete；
-   - 看情形要确认（tools_admin._CONDITIONAL_CONFIRM）：mcp_update 改了地址 / roles 新加 main /
-     工具白名单放宽（加工具名、从有白名单变成不限）；endpoint_save 新建端点 / 改地址 / 改协议
-     （数据会发去新地址、换一种发法）；
-   - 其余直接做：mcp_test、mcp_reload、MCP 只收窄的改动、改岗位模型三件套 / 做不动时换用 / 启停、
-     新建自定义专岗、加 / 改模型库条目、改端点地址和协议以外的字段。
+1. 确认门（用户定，三个合并工具都在 tools_admin._CONDITIONAL_CONFIRM 里，哪个 action
+   要确认由内部判断）：
+   - 一律要确认：mcp_manage 的 add / delete、agent_manage 的 delete、model_manage 的
+     endpoint_delete / model_delete；
+   - 看情形要确认：mcp_manage 的 update 改了地址 / roles 新加 main / 工具白名单放宽
+     （加工具名、从有白名单变成不限）、agent_manage 的 update 挂声明了执行类工具的做法；
+     model_manage 的 endpoint_save 新建端点 / 改地址 / 改协议（数据会发去新地址、换一种发法）；
+   - 其余直接做：list / test / reload / toggle、MCP 只收窄的改动、改岗位模型三件套 /
+     做不动时换用 / 启停、新建自定义专岗、加 / 改模型库条目、改端点地址和协议以外的字段。
    要确认的场景先过同一套校验再写小票：不合格的当场拒，不留一张注定失败的票。
 2. 密钥一律不经过对话（用户定）：参数表里根本没有 headers / api_key；模型硬塞了
    （或地址里夹查询串 / 用户名密码）也拒，并给出网页设置页的链接让管理员自己去填。
@@ -105,6 +107,57 @@ def url_secret_problem(url: Any) -> str:
     return ""
 
 
+_PHASE_ZH = {"verify": "核对", "recheck": "补打开", "supplement": "补找",
+             "investigate": "构想调查", "check": "目标检查"}
+
+
+def _tools_lines(describe: dict | None, tools: list[str], kind: str) -> list[str]:
+    """agent_detail 工具段的可读行（describe_tools 三种 mode 各自如实说）。"""
+    if describe is None:
+        return [f"有效工具（{len(tools)} 个）：{'、'.join(tools) or '（无）'}"]
+    mode = str(describe.get("mode") or "")
+    if mode == "fixed_plus_skills":
+        lines = [f"出厂工具（{len(describe.get('factory') or [])} 个）："
+                 f"{'、'.join(describe.get('factory') or [])}"]
+        skill_entries = describe.get("skills") or []
+        if skill_entries:
+            for entry in skill_entries:
+                marks: list[str] = []
+                for t in entry.get("tools") or []:
+                    name = str(t.get("name") or "")
+                    if not t.get("registered"):
+                        marks.append(f"{name}（没注册/连不上）")
+                    elif t.get("task_only"):
+                        marks.append(f"{name}（只在派活时有效）")
+                    elif t.get("exec_class"):
+                        marks.append(f"{name}（执行类）")
+                    else:
+                        marks.append(name)
+                lines.append(f"做法带来的工具：{entry.get('skill')} → {'、'.join(marks) or '（无）'}")
+        else:
+            lines.append("做法带来的工具：没有（岗位没挂声明工具的做法）")
+        phases = describe.get("phases") or {}
+        phase_text = "；".join(
+            f"{_PHASE_ZH.get(ph, ph)} [{'、'.join(names) or '（无）'}]"
+            for ph, names in phases.items()
+        )
+        lines.append(f"各环节实际给：{phase_text}")
+        return lines
+    if mode == "per_job":
+        cands = [str(t) for t in (describe.get("candidates") or [])]
+        return [
+            f"工具不固定：每次派活主模型从全部子 agent 工具里挑，现在可挑 {len(cands)} 个："
+            f"{'、'.join(cands) or '（无）'}；做法里写的工具对这个岗不额外生效",
+        ]
+    if mode == "main":
+        names = [str(t) for t in (describe.get("plan_review") or [])]
+        return [
+            f"主模型岗不跑子 agent；派活排计划 / 验收时能用：{'、'.join(names) or '（无）'}；"
+            "这段管理员对话只有管理员工具，用不到这些",
+        ]
+    return [f"有效工具（{len(tools)} 个）：{'、'.join(tools) or '（无）'}"]
+
+
 def register_settings_tools(
     svc: Any,
     *,
@@ -159,6 +212,25 @@ def register_settings_tools(
         tools = list(tools or [])
         return f"只开放 {'、'.join(tools)}" if tools else "工具不限"
 
+    def _mcp_coverage(name: str, entry: dict) -> str:
+        """扩展开给谁用的说明（admin 认知修正 §5.1）：按 roles 给一句准确归属。"""
+        roles = {str(r) for r in (entry.get("roles") or ["worker"])}
+        whitelist = [str(t) for t in (entry.get("tools") or []) if str(t or "").strip()]
+        names = "、".join(f"mcp_{name}_{t}" for t in whitelist) if whitelist else \
+            f"这个扩展的全部工具（注册名 mcp_{name}_<工具名>）"
+        lines: list[str] = []
+        if "worker" in roles:
+            lines.append(
+                f"给子 agent：派活时主模型可以把 {names} 分给通用任务 / 自定义专岗的子 agent；"
+                "资讯 / 构想 / 目标要用，得写进一份做法的 allowed-tools 并挂到岗位"
+                "（可以让我用 skill_manage + agent_manage 帮你做）。"
+            )
+        if "main" in roles:
+            lines.append(
+                f"给主模型：派活排计划和验收时能用 {names}；这段管理员对话里用不到。"
+            )
+        return "\n".join(lines)
+
     async def _reload_view(name: str) -> str:
         """改完立刻重连（同网页），回一句连接状态。"""
         try:
@@ -173,7 +245,7 @@ def register_settings_tools(
         return f"没连上：{res.get('error') or '原因不明'}"
 
     async def mcp_add(ctx: ToolContext, args: dict) -> ToolResult:
-        deny = _no_secret(args, "extensions", ("url",)) or _unknown(args, _MCP_FIELDS)
+        deny = _no_secret(args, "extensions", ("url",)) or _unknown(args, ("action", *_MCP_FIELDS))
         if deny is not None:
             return deny
         not_ready = _ext_ready()
@@ -188,7 +260,7 @@ def register_settings_tools(
             return _bad(str(e))
         name = str(entry["name"])
         pending = need_confirm(
-            "mcp_add", args,
+            "mcp_manage", args,
             f"新增 MCP 扩展「{name}」：地址 {extensions_web.url_no_query(entry['url'])}，"
             f"给{_roles_zh(entry['roles'])}用，{_tools_zh(entry['tools'])}"
             f"{'' if entry['enabled'] else '，先不打开'}；之后 MaiWork 会连这个地址",
@@ -202,14 +274,16 @@ def register_settings_tools(
         except ValueError as e:
             return _bad(str(e))
         state = await _reload_view(name) if entry.get("enabled") else "先没打开"
+        coverage = _mcp_coverage(name, entry)
         return _ok(
             f"已加上 MCP 扩展「{name}」（{state}）。如果这个服务要密钥（请求头），"
-            f"请管理员自己到{where(settings(), 'extensions')}填写，密钥不经过对话。",
+            f"请管理员自己到{where(settings(), 'extensions')}填写，密钥不经过对话。"
+            + (f"\n{coverage}" if coverage else ""),
             data={k: v for k, v in entry.items() if k != "header_names"},
         )
 
     async def mcp_update(ctx: ToolContext, args: dict) -> ToolResult:
-        deny = _no_secret(args, "extensions", ("url",)) or _unknown(args, _MCP_FIELDS)
+        deny = _no_secret(args, "extensions", ("url",)) or _unknown(args, ("action", *_MCP_FIELDS))
         if deny is not None:
             return deny
         not_ready = _ext_ready()
@@ -258,7 +332,7 @@ def register_settings_tools(
             return _ok(f"MCP 扩展「{name}」没有变化，什么都没改")
         if loosen:
             pending = need_confirm(
-                "mcp_update", args,
+                "mcp_manage", args,
                 f"改 MCP 扩展「{name}」：{'；'.join(changes)}（放宽：{'、'.join(loosen)}）",
             )
             if pending is not None:
@@ -270,10 +344,12 @@ def register_settings_tools(
         except ValueError as e:
             return _bad(str(e))
         state = await _reload_view(name)
-        return _ok(f"已改 MCP 扩展「{name}」：{'；'.join(changes)}（{state}）")
+        coverage = _mcp_coverage(name, new)
+        return _ok(f"已改 MCP 扩展「{name}」：{'；'.join(changes)}（{state}）"
+                   + (f"\n{coverage}" if coverage else ""))
 
     async def mcp_test(ctx: ToolContext, args: dict) -> ToolResult:
-        deny = _no_secret(args, "extensions", ("url",)) or _unknown(args, ("name", "url", "timeout_s"))
+        deny = _no_secret(args, "extensions", ("url",)) or _unknown(args, ("action", "name", "url", "timeout_s"))
         if deny is not None:
             return deny
         name = str(args.get("name") or "").strip()
@@ -336,7 +412,7 @@ def register_settings_tools(
         )
 
     async def mcp_reload(ctx: ToolContext, args: dict) -> ToolResult:
-        deny = _unknown(args, ("name",))
+        deny = _unknown(args, ("action", "name"))
         if deny is not None:
             return deny
         name = str(args.get("name") or "").strip()
@@ -356,6 +432,110 @@ def register_settings_tools(
             return _ok(f"已重连 MCP 扩展「{name}」，现在 {int(res.get('tools') or 0)} 个工具可用", data=dict(res))
         return _ok(f"重连了 MCP 扩展「{name}」，但没连上：{res.get('error') or '原因不明'}", data=dict(res))
 
+    async def mcp_list(ctx: ToolContext, args: dict) -> ToolResult:
+        deny = _unknown(args, ("action",))
+        if deny is not None:
+            return deny
+        exts = getattr(svc, "extensions", None)
+        if exts is None:
+            return _bad("这个 MaiWork 还没接 MCP 扩展管理")
+        try:
+            items = list(exts.info() or [])
+        except Exception as e:
+            return _bad(f"读扩展失败：{e}")
+        if not items:
+            return _ok("现在一个 MCP 扩展也没有。", data=[])
+        lines = [
+            f"- {i.get('name')}（{'开' if i.get('enabled') else '关'}，"
+            f"{'连得上' if i.get('ok') else '没连上'}，{i.get('tools', 0)} 个工具）"
+            for i in items
+        ]
+        return _ok("MCP 扩展：\n" + "\n".join(lines), data=[dict(i) for i in items])
+
+    async def mcp_toggle(ctx: ToolContext, args: dict) -> ToolResult:
+        deny = _unknown(args, ("action", "name", "enabled"))
+        if deny is not None:
+            return deny
+        name = str(args.get("name") or "").strip()
+        if not name:
+            return _bad("要给 name")
+        enabled = bool(args.get("enabled", True))
+        exts = getattr(svc, "extensions", None)
+        st = settings()
+        if exts is None or st is None:
+            return _bad("这个 MaiWork 还没接 MCP 扩展管理，现在开不了也关不了")
+        try:
+            extensions_web.toggle(svc.store, st, name, enabled)
+            reloader = getattr(exts, "reload", None)
+            if callable(reloader):
+                await reloader(name, svc.tools)
+        except KeyError:
+            return _bad(f"没有叫「{name}」的 MCP 扩展")
+        except ValueError as e:
+            return _bad(str(e))
+        except Exception as e:
+            return _bad(f"开关 MCP 扩展失败：{e}")
+        return _ok(f"MCP 扩展「{name}」已{'打开' if enabled else '关闭'}")
+
+    async def mcp_delete(ctx: ToolContext, args: dict) -> ToolResult:
+        deny = _unknown(args, ("action", "name"))
+        if deny is not None:
+            return deny
+        name = str(args.get("name") or "").strip()
+        if not name:
+            return _bad("要给 name")
+        exts = getattr(svc, "extensions", None)
+        st = settings()
+        if exts is None or st is None:
+            return _bad("这个 MaiWork 还没接 MCP 扩展管理，现在删不了")
+        try:
+            source = extensions_web.source_of(st, svc.store, name)
+            if source is None:
+                return _bad(f"没有叫「{name}」的 MCP 扩展")
+            if source != "web":  # 和网页删除同一条规矩
+                return _bad("这个扩展来自配置文件，只能开关，不能删除")
+        except Exception as e:
+            return _bad(f"查 MCP 扩展失败：{e}")
+        pending = need_confirm("mcp_manage", args, f"删掉 MCP 扩展「{name}」")
+        if pending is not None:
+            return pending
+        try:
+            extensions_web.delete(svc.store, name)
+            remover = getattr(exts, "remove", None)
+            if callable(remover):
+                await remover(name, svc.tools)
+        except KeyError:
+            return _bad(f"没有叫「{name}」的 MCP 扩展")
+        except Exception as e:
+            return _bad(f"删 MCP 扩展失败：{e}")
+        try:
+            from . import search_binding
+
+            search_binding.clear_binding(svc.store, mcp=name)  # 搜索绑定绑着它 → 跟着清掉（同网页删除）
+        except Exception:
+            logger.exception("清 MCP 扩展 %s 的搜索绑定出错", name)
+        return _ok(f"已删掉 MCP 扩展「{name}」")
+
+    _MCP_ACTIONS = ("list", "add", "update", "toggle", "test", "reload", "delete")
+
+    async def mcp_manage(ctx: ToolContext, args: dict) -> ToolResult:
+        a = str(args.get("action") or "list").strip().lower()
+        if a not in _MCP_ACTIONS:
+            return _bad(f"不认识的 action「{a or '（没给）'}」：可用 {'、'.join(_MCP_ACTIONS)}")
+        # action 先写进 args 再分派：小票指纹按「调 need_confirm 时那份 args」算，
+        # 回放时 execute 原样送回，两边必须一致
+        args = {**args, "action": a}
+        handlers = {
+            "list": mcp_list,
+            "add": mcp_add,
+            "update": mcp_update,
+            "toggle": mcp_toggle,
+            "test": mcp_test,
+            "reload": mcp_reload,
+            "delete": mcp_delete,
+        }
+        return await handlers[a](ctx, args)
+
     # ------------------------------------------------------------------
     # 二、专岗（svc.agents.update_profile / settings_ops.agent_*，和网页「设置 → 专岗」同一套）
     # ------------------------------------------------------------------
@@ -373,6 +553,9 @@ def register_settings_tools(
         return "，".join(bits)
 
     async def list_agents(ctx: ToolContext, args: dict) -> ToolResult:
+        deny = _unknown(args, ("action",))
+        if deny is not None:
+            return deny
         mod = _agents()
         if mod is None:
             return _bad("专岗功能还没开")
@@ -385,7 +568,8 @@ def register_settings_tools(
 
     async def agent_update(ctx: ToolContext, args: dict) -> ToolResult:
         deny = _no_secret(args, "agents") or _unknown(
-            args, ("kind", *_AGENT_FIELDS), f"；名字、人设、技能请管理员到{where(settings(), 'agents')}改",
+            args, ("action", "kind", *_AGENT_FIELDS, "add_skills", "remove_skills"),
+            f"；名字、人设请管理员到{where(settings(), 'agents')}改",
         )
         if deny is not None:
             return deny
@@ -393,9 +577,40 @@ def register_settings_tools(
         if mod is None:
             return _bad("专岗功能还没开")
         kind = str(args.get("kind") or "").strip()
+        add_skills = [str(x or "").strip() for x in (args.get("add_skills") or []) if str(x or "").strip()]
+        remove_skills = [str(x or "").strip() for x in (args.get("remove_skills") or []) if str(x or "").strip()]
         patch = _pick(args, _AGENT_FIELDS)
-        if not patch:
-            return _bad("没有要改的字段（可改 model / effort / backup / escalate / enabled）")
+        if not patch and not add_skills and not remove_skills:
+            return _bad("没有要改的字段（可改 model / effort / backup / escalate / enabled / add_skills / remove_skills）")
+        # add_skills / remove_skills：只认已存在的做法名（本群做法不能通过这里挂——安全底线）
+        if add_skills or remove_skills:
+            known = set()
+            try:
+                known = {str(i.get("name") or "") for i in svc.skills.list()}
+            except Exception:
+                logger.exception("读做法名单出错")
+            unknown = [n for n in (*add_skills, *remove_skills) if n not in known]
+            if unknown:
+                return _bad(f"不存在的做法：{'、'.join(unknown)}（只认 skill_manage 的 list / env_overview 里的做法名）")
+            try:
+                cur = list(mod.profile(kind).get("skills") or [])
+            except Exception:
+                cur = []
+            merged = [s for s in cur if s not in remove_skills]
+            for s in add_skills:
+                if s not in merged:
+                    merged.append(s)
+            patch["skills"] = merged
+            # 挂/摘带执行类工具的做法到调研岗 → 待确认小票（exec_grants 是唯一判定）
+            grants = settings_ops.exec_grants(svc, kind=kind, add_skills=add_skills)
+            if grants:
+                pending = need_confirm(
+                    "agent_manage", args,
+                    f"给岗位 {kind} 挂做法（{'、'.join(add_skills)}）："
+                    f"它会给这个岗带来执行类工具（{'、'.join(grants)}），同意才挂",
+                )
+                if pending is not None:
+                    return pending
         try:  # PUT /api/agents/{kind} 的同一个落点
             p = mod.update_profile(kind, patch)
         except ValueError as e:
@@ -403,10 +618,20 @@ def register_settings_tools(
         except Exception as e:
             logger.exception("管理员对话改岗位 %s 出错", kind)
             return _bad(f"改岗位出错：{type(e).__name__}")
-        return _ok(f"已改好：{_profile_line(p)}", data={k: p.get(k) for k in ("kind", "title", *_AGENT_FIELDS)})
+        lines = [f"已改好：{_profile_line(p)}"]
+        if add_skills or remove_skills:
+            try:
+                sp = getattr(svc, "specialists", None)
+                desc = sp.describe_tools(kind) if sp is not None else {}
+                granted = [t["name"] for e in (desc.get("skills") or [])
+                           for t in (e.get("tools") or []) if t.get("registered")]
+                lines.append(f"这个岗现在的做法工具：{'、'.join(granted) or '（无）'}")
+            except Exception:
+                logger.exception("读岗位 %s 做法工具出错", kind)
+        return _ok("\n".join(lines), data={k: p.get(k) for k in ("kind", "title", *_AGENT_FIELDS)})
 
     async def agent_create(ctx: ToolContext, args: dict) -> ToolResult:
-        deny = _no_secret(args, "agents") or _unknown(args, ("title",))
+        deny = _no_secret(args, "agents") or _unknown(args, ("action", "title"))
         if deny is not None:
             return deny
         try:
@@ -420,7 +645,7 @@ def register_settings_tools(
         )
 
     async def agent_delete(ctx: ToolContext, args: dict) -> ToolResult:
-        deny = _unknown(args, ("kind",))
+        deny = _unknown(args, ("action", "kind"))
         if deny is not None:
             return deny
         kind = str(args.get("kind") or "").strip()
@@ -429,7 +654,7 @@ def register_settings_tools(
         except settings_ops.OpError as e:
             return _bad(e.message)
         pending = need_confirm(
-            "agent_delete", args,
+            "agent_manage", args,
             f"删掉自定义专岗「{p.get('title')}」（{kind}）：岗位设置和各群给它攒的做法一起删，人格文档挪进回收目录",
         )
         if pending is not None:
@@ -497,7 +722,7 @@ def register_settings_tools(
         }
 
     async def agent_detail(ctx: ToolContext, args: dict) -> ToolResult:
-        deny = _no_secret(args, "agents") or _unknown(args, ("kind", "group_id"))
+        deny = _no_secret(args, "agents") or _unknown(args, ("action", "kind", "group_id"))
         if deny is not None:
             return deny
         mod = _agents()
@@ -505,7 +730,7 @@ def register_settings_tools(
             return _bad("专岗功能还没开")
         kind = str(args.get("kind") or "").strip()
         if not kind:
-            return _bad("要给 kind（岗位编号，list_agents 里有）")
+            return _bad("要给 kind（岗位编号，agent_manage 的 list 里有）")
         try:  # 不存在的岗位：Agents._kind_known 的同一句话
             p = mod.profile(kind)
         except ValueError as e:
@@ -522,17 +747,33 @@ def register_settings_tools(
             "group_id": "",
             "tools": [],
         }
-        # 有效工具名：和开工前能力自检同一个入口（specialists.effective_tools）；
-        # requested 用岗位配置里那份 tools（没配就是岗位默认上限），不再叠加别的名单。
+        # 工具段：调研岗 = 出厂 + 做法带来的（按做法列出）；task/自定义 = 每次派活
+        # 从全部子 agent 工具里挑；main = 派活排计划/验收回合的工具。统一读
+        # specialists.describe_tools——和实际给子 agent 的名单是同一份事实（admin 认知修正）。
         requested = p.get("tools")
         sp = getattr(svc, "specialists", None)
-        if sp is not None and callable(getattr(sp, "effective_tools", None)):
+        describe: dict[str, Any] | None = None
+        tools: list[str] = []
+        if sp is not None and callable(getattr(sp, "describe_tools", None)):
             try:
-                tools = [str(t) for t in sp.effective_tools(kind_s, requested, p)]
+                describe = sp.describe_tools(kind_s)
             except Exception:
-                logger.exception("算岗位 %s 有效工具出错", kind_s)
-                tools = []
-        else:  # 服务包没接 Specialists（精简测试包）：按 specialists.py 同一口径手算
+                logger.exception("算岗位 %s 工具描述出错", kind_s)
+                describe = None
+        if describe is not None:
+            mode = str(describe.get("mode") or "")
+            if mode == "fixed_plus_skills":
+                try:
+                    tools = [str(t) for t in sp.effective_tools(kind_s, requested, p)]
+                except Exception:
+                    logger.exception("算岗位 %s 有效工具出错", kind_s)
+                    tools = []
+            elif mode == "per_job":
+                tools = [str(t) for t in (describe.get("candidates") or [])]
+            elif mode == "main":
+                tools = [str(t) for t in (describe.get("plan_review") or [])]
+        else:
+            # 服务包没接 Specialists（精简测试包）：退回 effective_tools 口径
             from . import specialists as _sp_mod
 
             default = _sp_mod._SPECIALIST_DEFAULT_TOOLS.get(kind_s)
@@ -547,8 +788,11 @@ def register_settings_tools(
                 base.append("submit_result")
             tools = base
         data["tools"] = tools
+        if describe is not None:
+            data["describe"] = describe
 
-        out_lines = [_profile_line(p), f"有效工具（{len(tools)} 个）：{'、'.join(tools) or '（无）'}"]
+        out_lines = [_profile_line(p)]
+        out_lines.extend(_tools_lines(describe, tools, kind_s))
 
         gid_raw = str(args.get("group_id") or "").strip()
         if not gid_raw:
@@ -611,11 +855,30 @@ def register_settings_tools(
             out_lines.append("本群规矩里没有和这岗相关的条目。")
         return _ok("\n".join(out_lines), data=data)
 
+    _AGENT_ACTIONS = ("list", "detail", "update", "create", "delete")
+
+    async def agent_manage(ctx: ToolContext, args: dict) -> ToolResult:
+        a = str(args.get("action") or "list").strip().lower()
+        if a not in _AGENT_ACTIONS:
+            return _bad(f"不认识的 action「{a or '（没给）'}」：可用 {'、'.join(_AGENT_ACTIONS)}")
+        args = {**args, "action": a}
+        handlers = {
+            "list": list_agents,
+            "detail": agent_detail,
+            "update": agent_update,
+            "create": agent_create,
+            "delete": agent_delete,
+        }
+        return await handlers[a](ctx, args)
+
     # ------------------------------------------------------------------
     # 三、端点与模型库（settings_ops，和网页「设置 → 模型」同一套）
     # ------------------------------------------------------------------
 
     async def list_models(ctx: ToolContext, args: dict) -> ToolResult:
+        deny = _unknown(args, ("action",))
+        if deny is not None:
+            return deny
         view = settings_ops.endpoints_view(svc)  # 网页同一个视图：只进不出
         lines = ["端点："]
         for e in view["endpoints"]:
@@ -643,7 +906,7 @@ def register_settings_tools(
         return settings_ops.endpoint_public(svc, ep) if ep is not None else {"id": eid}
 
     async def endpoint_save(ctx: ToolContext, args: dict) -> ToolResult:
-        deny = _no_secret(args, "models", ("base_url",)) or _unknown(args, ("id", *_ENDPOINT_FIELDS))
+        deny = _no_secret(args, "models", ("base_url",)) or _unknown(args, ("action", "id", *_ENDPOINT_FIELDS))
         if deny is not None:
             return deny
         eid = str(args.get("id") or "").strip()
@@ -676,7 +939,7 @@ def register_settings_tools(
             return _ok(f"端点「{eid}」没有变化，什么都没改")
         if risky:
             pending = need_confirm(
-                "endpoint_save", args,
+                "model_manage", args,
                 f"{'新增' if old is None else '修改'}模型端点「{eid}」：{'；'.join(changes)}"
                 f"（之后用这个端点的模型请求{'和已存的密钥' if old and old.get('api_key') else ''}"
                 f"都会发到 {cand['base_url']}）",
@@ -694,7 +957,7 @@ def register_settings_tools(
         return _ok(f"已保存端点「{eid}」：{'；'.join(changes)}。{tail}".rstrip(), data=_endpoint_view(eid))
 
     async def endpoint_delete(ctx: ToolContext, args: dict) -> ToolResult:
-        deny = _unknown(args, ("id",))
+        deny = _unknown(args, ("action", "id"))
         if deny is not None:
             return deny
         eid = str(args.get("id") or "").strip()
@@ -702,7 +965,7 @@ def register_settings_tools(
             settings_ops.check_endpoint_delete(svc, eid)
         except settings_ops.OpError as e:
             return _bad(e.message)
-        pending = need_confirm("endpoint_delete", args, f"删掉模型端点「{eid}」（连同它存的密钥）")
+        pending = need_confirm("model_manage", args, f"删掉模型端点「{eid}」（连同它存的密钥）")
         if pending is not None:
             return pending
         try:
@@ -712,7 +975,7 @@ def register_settings_tools(
         return _ok(f"已删掉端点「{eid}」")
 
     async def model_save(ctx: ToolContext, args: dict) -> ToolResult:
-        deny = _no_secret(args, "models") or _unknown(args, ("id", *_MODEL_FIELDS))
+        deny = _no_secret(args, "models") or _unknown(args, ("action", "id", *_MODEL_FIELDS))
         if deny is not None:
             return deny
         mid = str(args.get("id") or "").strip()
@@ -733,7 +996,7 @@ def register_settings_tools(
         )
 
     async def model_delete(ctx: ToolContext, args: dict) -> ToolResult:
-        deny = _unknown(args, ("id",))
+        deny = _unknown(args, ("action", "id"))
         if deny is not None:
             return deny
         mid = str(args.get("id") or "").strip()
@@ -741,7 +1004,7 @@ def register_settings_tools(
             settings_ops.check_model_delete(svc, mid)
         except settings_ops.OpError as e:
             return _bad(e.message)
-        pending = need_confirm("model_delete", args, f"从模型库删掉「{mid}」")
+        pending = need_confirm("model_manage", args, f"从模型库删掉「{mid}」")
         if pending is not None:
             return pending
         try:
@@ -749,6 +1012,22 @@ def register_settings_tools(
         except settings_ops.OpError as e:
             return _bad(e.message)
         return _ok(f"已从模型库删掉「{mid}」")
+
+    _MODEL_ACTIONS = ("list", "endpoint_save", "endpoint_delete", "model_save", "model_delete")
+
+    async def model_manage(ctx: ToolContext, args: dict) -> ToolResult:
+        a = str(args.get("action") or "list").strip().lower()
+        if a not in _MODEL_ACTIONS:
+            return _bad(f"不认识的 action「{a or '（没给）'}」：可用 {'、'.join(_MODEL_ACTIONS)}")
+        args = {**args, "action": a}
+        handlers = {
+            "list": list_models,
+            "endpoint_save": endpoint_save,
+            "endpoint_delete": endpoint_delete,
+            "model_save": model_save,
+            "model_delete": model_delete,
+        }
+        return await handlers[a](ctx, args)
 
     # ------------------------------------------------------------------
     # 注册（参数表里没有任何密钥字段）
@@ -785,73 +1064,51 @@ def register_settings_tools(
     }
     _no_key = "参数里没有、也不许放密钥：要密钥的告诉管理员去网页设置页自己填。"
 
+    _action = lambda acts: {"type": "string", "enum": list(acts),  # noqa: E731
+                            "description": f"做什么：{' / '.join(acts)}"}
     specs: list[tuple[dict, Callable[[ToolContext, dict], Awaitable[ToolResult]], float]] = [
-        ({"name": "mcp_add",
-          "description": "新增一个 MCP 扩展（要管理员确认；确认后保存并立刻连一次）。" + _no_key,
-          "parameters": {"type": "object", "properties": _mcp_props, "required": ["name", "url"]}}, mcp_add, 60.0),
-        ({"name": "mcp_update",
-          "description": "改一个网页加的 MCP 扩展。改地址、给主模型用、放宽工具白名单要管理员确认；"
-                         "关掉、删工具名、去掉主模型这类收窄的直接改。改完立刻重连。" + _no_key,
-          "parameters": {"type": "object", "properties": _mcp_props, "required": ["name"]}}, mcp_update, 60.0),
-        ({"name": "mcp_test",
-          "description": "试连一个 MCP，列出对方的工具（不保存）。给 name 测已存的（用它存的地址和请求头），"
-                         "或只给 url 测一个新地址（不带任何请求头）。",
+        ({"name": "mcp_manage",
+          "description": (
+              "管 MCP 扩展（和网页「设置 → 工具」同一套）：action=list 看列表（默认）；"
+              "add 新增（要确认）；update 改（改地址、给主模型用、放宽白名单要确认，收窄直接改）；"
+              "toggle 开关；test 试连（给 name 测已存的带它存的请求头，只给 url 测新地址不带任何请求头）；"
+              "reload 重连刷工具列表；delete 删（要确认，只能删网页加的）。" + _no_key),
           "parameters": {"type": "object", "properties": {
-              "name": _mcp_props["name"], "url": _mcp_props["url"], "timeout_s": _mcp_props["timeout_s"]}}},
-         mcp_test, 70.0),
-        ({"name": "mcp_reload",
-          "description": "让一个 MCP 扩展重连、刷新工具列表。",
-          "parameters": {"type": "object", "properties": {"name": _mcp_props["name"]}, "required": ["name"]}},
-         mcp_reload, 60.0),
-        ({"name": "list_agents",
-          "description": "看各专岗（含主模型、自定义专岗）现在用哪个模型、思考强度、备用、做不动时换用、开没开。",
-          "parameters": {"type": "object", "properties": {}}}, list_agents, 30.0),
-        ({"name": "agent_update",
-          "description": "改一个岗位的模型 / 思考强度 / 备用模型 / 做不动时换用 / 启用停用（填模型库条目 id）。",
+              "action": _action(_MCP_ACTIONS),
+              **_mcp_props}}}, mcp_manage, 70.0),
+        ({"name": "agent_manage",
+          "description": (
+              "管专岗（含主模型、自定义专岗；和网页「设置 → 专岗」同一套）：action=list 看各岗"
+              "模型 / 强度 / 备用 / 做不动时换用 / 启停（默认）；detail 只读看一个岗的身份、"
+              "实际能用的工具名单（给服务群 group_id 再看本群记忆 / 做法 / 规矩）；"
+              "update 改模型三件套 / 做不动时换用 / 启停 / 挂摘做法（挂执行类做法要确认）；"
+              "create 建自定义专岗；delete 删自定义专岗（要确认，内置删不了）。"),
           "parameters": {"type": "object", "properties": {
-              "kind": {"type": "string", "description": "岗位编号（list_agents 里的 kind）"},
+              "action": _action(_AGENT_ACTIONS),
+              "kind": {"type": "string", "description": "岗位编号（list 里的 kind；自定义专岗 c_ 开头）"},
+              "group_id": {"type": "string", "description": "服务群群号（detail 用；给了才看本群的记忆 / 做法 / 规矩）"},
+              "title": {"type": "string", "description": "create 时的专岗名字（≤40 字）"},
               "model": {"type": "string", "description": "模型库条目 id；空串 = 不选"},
               "effort": {"type": "string", "description": "思考强度（所选模型支持的之一）；空串 = 默认"},
               "backup": {"type": "string", "description": "备用模型的条目 id；空串 = 不要"},
               "escalate": {"type": "string", "description": "做不动时换用的条目 id；主模型岗没有这一项"},
               "enabled": {"type": "boolean", "description": "开 / 停"},
-          }, "required": ["kind"]}}, agent_update, 30.0),
-        ({"name": "agent_create",
-          "description": "新建一个自定义专岗（起个名字）。",
+              "add_skills": {"type": "array", "items": {"type": "string"},
+                             "description": "挂到岗位的做法名（可多个）；"
+                                           "调研岗挂上声明了工具的做法后，做法里写的工具才对它生效"},
+              "remove_skills": {"type": "array", "items": {"type": "string"},
+                                "description": "从岗位摘掉的做法名（可多个）"},
+          }}}, agent_manage, 30.0),
+        ({"name": "model_manage",
+          "description": (
+              "管模型端点和模型库（和网页「设置 → 模型」同一套）：action=list 看端点和模型库"
+              "（只说密钥填没填，默认）；endpoint_save 新增 / 改端点（新增、改地址、改协议要确认）；"
+              "endpoint_delete 删端点（要确认；还有模型挂着删不了）；model_save 新增 / 改模型库条目（直接改）；"
+              "model_delete 删模型库条目（要确认；还有岗位在用删不了）。" + _no_key),
           "parameters": {"type": "object", "properties": {
-              "title": {"type": "string", "description": "专岗名字（≤40 字）"}}, "required": ["title"]}},
-         agent_create, 30.0),
-        ({"name": "agent_delete",
-          "description": "删掉一个自定义专岗（要管理员确认；内置岗位删不了）。",
-          "parameters": {"type": "object", "properties": {
-              "kind": {"type": "string", "description": "自定义专岗编号（c_ 开头）"}}, "required": ["kind"]}},
-         agent_delete, 30.0),
-        ({"name": "agent_detail",
-          "description": "只读看一个岗位：身份（模型 / 强度 / 备用 / 做不动时换用 / 启停）和它实际"
-                         "能用的工具名单。给 group_id（只能是服务群）再看它在这个群记下的经验、"
-                         "在用的本群做法、本群规矩里和它相关的条目。什么都不改，不用确认。",
-          "parameters": {"type": "object", "properties": {
-              "kind": {"type": "string", "description": "岗位编号（list_agents 里的 kind）"},
-              "group_id": {"type": "string", "description": "服务群群号（可选；给了才看本群的记忆 / 做法 / 规矩）"},
-          }, "required": ["kind"]}}, agent_detail, 30.0),
-        ({"name": "list_models",
-          "description": "看模型端点和模型库（只说密钥填没填，不给密钥本身）。",
-          "parameters": {"type": "object", "properties": {}}}, list_models, 30.0),
-        ({"name": "endpoint_save",
-          "description": "新增或修改一个模型端点。新增、改地址、改协议要管理员确认（数据会发去新地址）；"
-                         "名字、重试、并发这类直接改。" + _no_key,
-          "parameters": {"type": "object", "properties": _ep_props, "required": ["id"]}}, endpoint_save, 60.0),
-        ({"name": "endpoint_delete",
-          "description": "删掉一个模型端点（要管理员确认；还有模型挂在上面时删不了）。",
-          "parameters": {"type": "object", "properties": {"id": _ep_props["id"]}, "required": ["id"]}},
-         endpoint_delete, 60.0),
-        ({"name": "model_save",
-          "description": "新增或修改模型库的一条（挂到已有端点上）。直接改。",
-          "parameters": {"type": "object", "properties": _model_props, "required": ["id"]}}, model_save, 60.0),
-        ({"name": "model_delete",
-          "description": "从模型库删掉一条（要管理员确认；还有岗位在用时删不了）。",
-          "parameters": {"type": "object", "properties": {"id": _model_props["id"]}, "required": ["id"]}},
-         model_delete, 60.0),
+              "action": _action(_MODEL_ACTIONS),
+              "id": {"type": "string", "description": "端点 / 模型库条目 id（除 list 外都要）"},
+              **_ep_props, **_model_props}}}, model_manage, 60.0),
     ]
     for spec, handler, timeout_s in specs:
         register(spec, handler, timeout_s=timeout_s)

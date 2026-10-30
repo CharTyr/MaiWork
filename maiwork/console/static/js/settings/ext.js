@@ -306,6 +306,36 @@ function mcpForm(m) {
     </form>`;
 }
 
+// ───────── skill 的「要用的工具」（allowed-tools）─────────
+// 挂到资讯 / 构想 / 目标后，这些岗位会带上这里勾选的工具；候选来自 GET /api/agents 的 worker_tool_choices。
+// 清单没加载到（state.toolChoices 不是数组）时只列已声明的，不断言「未注册」。
+function toolChk(name, t, on, loaded) {
+  const tags = t
+    ? `${t.exec_class ? `<span class="ntag warn">执行类</span>` : ""}${t.task_only ? `<span class="ntag">仅派活时</span>` : ""}`
+    : loaded ? `<span class="ntag warn">未注册</span>` : "";
+  const label = t && t.label && t.label !== name ? `<span class="fine">${esc(t.label)}</span>` : "";
+  return `<label class="chk tool-chk"><input type="checkbox" value="${esc(name)}"${on ? " checked" : ""} /><span class="mono">${esc(name)}</span>${label}${tags}</label>`;
+}
+function toolChecks(selected) {
+  const loaded = Array.isArray(state.toolChoices);
+  const choices = loaded ? state.toolChoices : [];
+  const sel = new Set(selected || []);
+  const known = new Set(choices.map((t) => t.name));
+  const rows = [
+    ...[...sel].filter((n) => !known.has(n)).map((n) => toolChk(n, null, true, loaded)),
+    ...choices.map((t) => toolChk(t.name, t, sel.has(t.name), loaded)),
+  ];
+  return rows.length ? `<div id="k-tools" class="tool-checks">${rows.join("")}</div>` : `<p class="fine" style="margin:0">暂无可用工具</p>`;
+}
+const toolTags = (names) => ((names || []).length ? `<div class="ext-tools">${names.map((t) => `<span class="ntag">${esc(t)}</span>`).join("")}</div>` : "");
+
+// 服务端判定「带执行类工具，需要确认」：400 且错误里提到执行类工具（skill 增改 / 上传、专岗挂 skill 共用）
+export const execConfirmNeeded = (ex) => !!ex && ex.status === 400 && /执行类工具/.test(ex.message || "");
+export function confirmExecTools(ex) {
+  const m = /（([^）]+)）/.exec((ex && ex.message) || "");
+  return confirm(`所选 skill 带执行类工具${m ? `（${m[1]}）` : ""}。挂到资讯、构想或目标后，这些岗位自动运行时会使用这些工具：每轮在单独的工作区运行、结束后清空，但可以访问外网。确认继续？`);
+}
+
 function skillRow(k) {
   const roles = roleText(k.roles);
   const active = k.enabled !== false;
@@ -318,6 +348,7 @@ function skillRow(k) {
         <div class="set-name">${esc(k.name)}${k.source === "file" ? `<span class="tag">服务器文件</span>` : k.source === "builtin" ? `<span class="tag">内置</span>` : ""}</div>
         <div class="set-text">${esc(k.description || "无简介")}</div>
         <div class="set-text ext-st"><span class="dot ${active ? "ok" : ""}"></span>${esc(status)} · ${esc(roles)}可用${k.updated_ts ? ` · ${esc(dayWord(k.updated_ts))}修改` : ""}</div>
+        ${toolTags(k.allowed_tools)}
       </div>
       <div class="row-btns ext-btns"><button class="btn small" data-act="skill-toggle" data-name="${esc(k.name)}" data-on="${manual ? "0" : "1"}">${manual ? "停用" : "启用"}</button><button class="btn small" data-act="ext-edit" data-kind="skill" data-name="${esc(k.name)}">${k.source === "builtin" ? "查看" : "修改"}</button></div>
     </div>`;
@@ -337,6 +368,7 @@ function skillForm(k) {
       <p class="set-text" style="margin:0">${esc(d.description || "")}</p>
       <label for="k-body">内容</label>
       <textarea id="k-body" class="mono-area" rows="14" readonly spellcheck="false">${esc(d.body || "")}</textarea>
+      ${(d.allowed_tools || []).length ? `<label>要用的工具</label>${toolTags(d.allowed_tools)}` : ""}
       ${(d.files || []).length ? `<p class="fine" style="margin:0">附件：${d.files.map(esc).join("、")}</p>` : ""}
       <div class="actions"><button type="button" class="btn" data-act="ext-cancel">关闭</button></div>
     </div>`;
@@ -349,6 +381,8 @@ function skillForm(k) {
       <input id="k-desc" value="${esc(d.description || "")}" placeholder="例如：周报格式和注意事项" />
       <label>使用范围</label>
       ${roleChecks("k", d.roles)}
+      <div class="lbl-row"><label>要用的工具</label>${tip("挂到资讯、构想或目标后，这些岗位会带上勾选的工具，并按本 skill 的内容使用。执行类工具可以运行命令或写文件，保存时需要确认。")}</div>
+      ${toolChecks(d.allowed_tools)}
       ${tipLabel("k-body", "内容", "写明做法、注意事项和示例，最多 40KB。")}
       <textarea id="k-body" class="mono-area" rows="14" spellcheck="false">${esc(d.body || "")}</textarea>
       ${(d.files || []).length ? `<p class="fine" style="margin:0">附件：${d.files.map(esc).join("、")}</p>` : ""}
@@ -400,6 +434,11 @@ export async function loadExt() {
     state.extPresets = await api("GET", "/api/extensions/presets");
   } catch (e) {
     state.extPresets = null;
+  }
+  try {
+    state.toolChoices = (await api("GET", "/api/agents")).worker_tool_choices || [];
+  } catch (e) {
+    state.toolChoices = null;
   }
   await loadOptDeps();
 }

@@ -405,6 +405,9 @@ def register_image_tools(
             handler=generate_image,
             summarize=_summarize,
             timeout_s=TOOL_TIMEOUT_S,
+            needs_workspace=True,
+            exec_class=True,
+            task_only=True,
         )
     )
 

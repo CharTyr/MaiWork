@@ -730,6 +730,43 @@ _NEWS_OUTPUT_SCHEMA = {
     "required": ["items"],
 }
 
+# 补找（2026-10-30）：资讯岗挂了带工具的做法时，保底之后、粗筛之前多跑的一轮。
+# 链接必须出现在本轮工具输出里（discovery 的「见过」账），防凭记忆编造。
+_SUPPLEMENT_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "url": {"type": "string"},
+                    "snippet": {"type": "string"},
+                    "published": {"type": "string"},
+                    "focus": {"type": "integer"},
+                },
+                "required": ["title", "url"],
+            },
+        }
+    },
+    "required": ["items"],
+}
+
+_SUPPLEMENT_BRIEF = """你是资讯岗的补找助手。程序已经按下面这批关注点用常规搜索找过一轮；你的任务是按上面管理员写的做法，用你本轮拿到的工具，再找一找常规搜索容易漏掉的内容。
+
+本批关注点：
+{focus_lines}
+
+要求（硬）：
+1. 只找最近 7 天的内容；
+2. 只交回你本轮工具结果里真出现过的链接，不要凭记忆写链接，也不要改写链接；
+3. 每条写清它对应哪个关注点（focus 填编号），标题和摘要照工具结果写，不要夸大；
+4. 最多交回 15 条；找不到就交回空列表，不要凑数；
+5. 时间盒约 150 秒，没有新收获就尽早交回。
+
+用 submit_result 交回：data = {{"items": [{{"title": "…", "url": "…", "snippet": "…", "published": "YYYY-MM-DD 或空", "focus": 编号}}]}}。"""
+
 
 # ----------------------------------------------------------------------
 
@@ -1705,32 +1742,37 @@ class Feeds:
         phase: str,
         brief: str,
         task_id: str,
-        tools: list[str],
+        tools: list[str] | None = None,
         output_schema: dict | None = None,
         deadline_ts: float | None = None,
         actor: str = "",
         max_steps: int = 0,
     ) -> Any:
-        """news 阶段的统一入口：挂上 specialists → kind=news；否则 → Workers 老路。
+        """news 阶段的统一入口：挂上 specialists → run_auto(kind=news)；否则 → Workers 老路。
 
+        - 专岗路名单由 AUTO_PHASES + 做法工具现算（run_auto），调用方只报 phase；
+          老路（没接 specialists）按 AUTO_PHASES 的基础名单跑，行为与以前一致；
         - 禁岗绝不回落（ValueError 让上游 _skipped_batch 跳过本轮）；
         - 走 specialists 时把 report 登记进本轮 ContextVar（由 prepare_news 的
           _stage_isolated 统一 settle → review），并发核验互不串。
         """
         specialists = getattr(self, "_specialists", None)
         if specialists is None:
+            from .specialists import AUTO_PHASES as _AUTO
+
+            fallback = list(tools or _AUTO.get(("news", str(phase)), ()))
             return await self._workers.run(
-                brief, group_id=gid, tools=list(tools), task_id=task_id,
+                brief, group_id=gid, tools=fallback, task_id=task_id,
                 output_schema=output_schema, deadline_ts=deadline_ts,
                 max_steps=max_steps or 0,
             )
         if not self._role_enabled(gid, "news"):
             raise ValueError("资讯专岗（news）已停用或未就位")
-        report = await specialists.run(
+        report = await specialists.run_auto(
             "news", brief,
-            group_id=gid, phase=phase, task_id=task_id,
-            tools=list(tools), output_schema=output_schema,
-            actor=str(actor or ""), deadline_ts=deadline_ts, max_steps=0,
+            phase=phase, group_id=gid, task_id=task_id,
+            output_schema=output_schema,
+            actor=str(actor or ""), deadline_ts=deadline_ts, max_steps=max_steps,
         )
         reg = getattr(self, "_round_reports", None)
         if reg is not None:
@@ -1752,7 +1794,6 @@ class Feeds:
             self._run_stage(
                 gid_b, phase="recheck", brief=brief,
                 task_id=str(kwargs.get("task_id") or recheck_mark),
-                tools=["fetch_page", "web_search"],
                 output_schema=kwargs.get("output_schema"),
                 deadline_ts=kwargs.get("deadline_ts"),
                 actor="资讯重看",
@@ -3895,7 +3936,6 @@ class Feeds:
                 report = await self._run_stage(
                     gid, phase="verify", brief=self._verify_brief(gid, group),
                     task_id=group_mark,
-                    tools=["fetch_page"],
                     output_schema=_NEWS_OUTPUT_SCHEMA, deadline_ts=deadline_ts,
                     actor=f"资讯核验 子 agent #{k}", max_steps=0,
                 )
@@ -4040,6 +4080,95 @@ class Feeds:
         for c in candidates:
             d_langs[_item_lang_bucket(c)] += 1
         funnel["discovered_langs"] = d_langs
+
+        # ②.5 补找（2026-10-30）：资讯岗挂了带工具的做法才跑——按做法用这些工具
+        # 再找一轮常规搜索容易漏的；交回的链接必须是本轮工具输出里真出现过的。
+        t1b = clock.now()
+        supp: dict = {"ran": False, "returned": 0, "kept": 0, "not_in_output": 0, "error": ""}
+        try:
+            specialists = getattr(self, "_specialists", None)
+            supp_tools: list[str] = []
+            if specialists is not None:
+                try:
+                    supp_tools = list(specialists.phase_tools("news", "supplement") or [])
+                except Exception:
+                    logger.exception("算补找工具名单出错（群 %s），跳过补找", gid_s)
+                    supp_tools = []
+            if supp_tools and self._role_enabled(gid_s, "news"):
+                supp["ran"] = True
+                supp_mark = f"feeds-supplement:{base}"
+                discovery.open_run(supp_mark)
+                raw_items: list = []
+                try:
+                    focus_lines = "\n".join(
+                        f"{i + 1}. {str(f.get('query') or '')}"
+                        + (f"（{str(f.get('why') or '').strip()}）"
+                           if str(f.get("why") or "").strip() else "")
+                        for i, f in enumerate(focus)
+                    )
+                    report = await self._stage_isolated(
+                        self._run_stage(
+                            gid_s, phase="supplement",
+                            brief=_SUPPLEMENT_BRIEF.format(focus_lines=focus_lines),
+                            task_id=supp_mark,
+                            output_schema=_SUPPLEMENT_OUTPUT_SCHEMA,
+                            deadline_ts=clock.now() + 150,
+                            actor="资讯补找", max_steps=10,
+                        ),
+                        gid_s,
+                    )
+                    data = getattr(report, "data", None)
+                    if isinstance(data, dict) and isinstance(data.get("items"), list):
+                        raw_items = data["items"]
+                    elif not getattr(report, "ok", False):
+                        logger.info("补找子 agent 没干成（群 %s）：%s", gid_s,
+                                    getattr(report, "error", "") or getattr(report, "summary", ""))
+                finally:
+                    seen = discovery.take_seen(supp_mark)
+                    discovery.close_run(supp_mark)
+                supp["returned"] = len(raw_items)
+                have = {_normalize_url(c.get("url") or "") for c in candidates}
+                have.discard("")
+                for it in raw_items[:15]:
+                    if not isinstance(it, dict):
+                        continue
+                    key = _normalize_url(it.get("url") or "")
+                    if not key or key in have:
+                        continue
+                    tool = seen.get(key)
+                    if not tool:
+                        supp["not_in_output"] += 1
+                        continue
+                    have.add(key)
+                    fi = it.get("focus")
+                    candidates.append({
+                        "title": str(it.get("title") or "").strip(),
+                        "url": str(it.get("url") or "").strip(),
+                        "snippet": str(it.get("snippet") or "").strip(),
+                        "published": _parse_published(it.get("published")),
+                        "query": "", "queries": [],
+                        "focus": int(fi) if isinstance(fi, (int, float)) else None,
+                        "provider": f"agent:{tool}",
+                    })
+                    supp["kept"] += 1
+                    providers = funnel.setdefault("providers", {})
+                    providers[f"agent:{tool}"] = providers.get(f"agent:{tool}", 0) + 1
+                    pf = funnel.get("per_focus") or []
+                    if isinstance(fi, (int, float)) and 1 <= int(fi) <= len(pf):
+                        pf[int(fi) - 1]["cands"] = int(pf[int(fi) - 1].get("cands") or 0) + 1
+                if supp["kept"]:
+                    funnel["discovered"] = len(candidates)
+                    d_langs = {"zh": 0, "foreign": 0}
+                    for c in candidates:
+                        d_langs[_item_lang_bucket(c)] += 1
+                    funnel["discovered_langs"] = d_langs
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            supp["error"] = type(e).__name__
+            logger.exception("资讯补找出错（群 %s），整批照常", gid_s)
+        funnel["supplement"] = supp
+        funnel["timings_s"]["supplement"] = max(0.0, clock.now() - t1b)
         # 撒网/保底真的一条都没搜出，而且撒网本身还垮了（报错 / 主动认失败）：
         # 向上抛，让 prepare_news 落成「子 agent 没找到东西 / 出了意外」（老 _collect 句式）；
         # 哪怕只是登记簿空、撒网没垮，也照旧交空列表跳过这轮。
@@ -5646,9 +5775,8 @@ class Feeds:
         ])
         brief = "\n".join(parts)
         deadline_ts = clock.now() + _IDEA_INVESTIGATE_SECONDS
-        report = await specialists.run(
+        report = await specialists.run_auto(
             "idea", brief, group_id=str(gid), phase="investigate",
-            tools=["web_search", "social_search", "fetch_page", "read_profile", "list_skills", "read_skill"],
             deadline_ts=deadline_ts, max_steps=_IDEA_INVESTIGATE_MAX_STEPS,
             actor="构想调查",
         )

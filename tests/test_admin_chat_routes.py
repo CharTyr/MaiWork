@@ -99,7 +99,7 @@ class _FakeAdminChat:
             {"id": 2, "role": "assistant", "content": "在的", "tool_calls": [], "name": "", "meta": {}},
         ]
         self.pending: list[dict] = [
-            {"id": 7, "status": "pending", "tool": "send_group_message", "args": {"text": "早安"}, "summary": "发到群里"}
+            {"id": 7, "status": "pending", "tool": "group_deliver", "args": {"action": "message", "group_id": G1, "text": "早安"}, "summary": "发到群里"}
         ]
         self.running = False
         self.busy: set[int] = set()  # is_busy 认这个（详情里没带 running 时的兜底）

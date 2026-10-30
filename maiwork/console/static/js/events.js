@@ -1,8 +1,8 @@
 // MaiWork 网页 · 表单输入类事件：change / input / keydown，长名字滚动。
-import { $, desktop, state } from "./state.js";
+import { $, state } from "./state.js";
 import { toast } from "./util.js";
 import { api } from "./api.js";
-import { loadExt } from "./settings/ext.js";
+import { confirmExecTools, loadExt } from "./settings/ext.js";
 import { chipAdd } from "./settings/rules.js";
 import { loadUsageDay } from "./settings/usage.js";
 import { avatarSaved } from "./settings/identity.js";
@@ -63,8 +63,9 @@ document.addEventListener("change", async (e) => {
   e.target.value = "";
   if (!file) return;
   if (file.size > 5 * 1024 * 1024) return toast("文件过大，最多 5MB", true);
-  const upload = async (replace) => {
-    const res = await fetch(`/api/extensions/skills/upload${replace ? "?replace=1" : ""}`, {
+  const upload = async (replace, confirmExec) => {
+    const q = [replace ? "replace=1" : "", confirmExec ? "confirm_exec=1" : ""].filter(Boolean).join("&");
+    const res = await fetch(`/api/extensions/skills/upload${q ? `?${q}` : ""}`, {
       method: "POST",
       headers: { "Content-Type": "application/zip", "X-Filename": encodeURIComponent(file.name) },
       body: file,
@@ -78,8 +79,15 @@ document.addEventListener("change", async (e) => {
   };
   toast("正在安装…");
   try {
-    let { res, data } = await upload(false);
-    if (res.status === 409 && confirm(`${(data && data.error) || "已有同名 skill"}，是否替换？`)) ({ res, data } = await upload(true));
+    let replace = false;
+    let { res, data } = await upload(false, false);
+    if (res.status === 409 && confirm(`${(data && data.error) || "已有同名 skill"}，是否替换？`)) {
+      replace = true;
+      ({ res, data } = await upload(true, false));
+    }
+    // 包里的 skill 带执行类工具：服务端要求确认，确认后带 confirm_exec=1 重传
+    const execMsg = (data && data.error) || "";
+    if (res.status === 400 && /执行类工具/.test(execMsg) && confirmExecTools({ message: execMsg })) ({ res, data } = await upload(replace, true));
     if (!res.ok) throw new Error((data && data.error) || `请求失败（${res.status}）`);
     await loadExt();
     repaintSheet();
@@ -89,7 +97,8 @@ document.addEventListener("change", async (e) => {
   }
 });
 document.addEventListener("keydown", (e) => {
-  if (e.target.id === "chat-input" && e.key === "Enter" && !e.shiftKey && !e.isComposing && desktop.matches) {
+  // 管理员对话输入框：回车换行，Ctrl / Cmd + 回车发送（2026-10-30 用户定）
+  if (e.target.id === "chat-input" && e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing) {
     e.preventDefault();
     $("chat-form").requestSubmit();
     return;

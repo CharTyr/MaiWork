@@ -7,6 +7,7 @@ import { repaintSheet } from "../sheet.js";
 import { loading } from "../pages/news.js";
 import { avatarBlock } from "./identity.js";
 import { EFFORT_NAMES, loadModels } from "./models.js";
+import { confirmExecTools, execConfirmNeeded } from "./ext.js";
 
 
 // 每个岗位一条程序生成的小鱼；fish_seed 为空时按岗位名固定，「换一条」只改这个岗位的种子。
@@ -97,6 +98,32 @@ function docBlock(kind, which, title, lead, item, limit, extra) {
   </div>`;
 }
 
+// 岗位工具（GET /api/agents 的 tools_view，和自动回合实际给子 agent 的名单是同一份）
+const TOOL_PHASES = { verify: "核对", recheck: "补打开", supplement: "补找", investigate: "调查", check: "检查进展" };
+const toolChips = (names) => ((names || []).length
+  ? `<span class="ext-tools">${names.map((n) => `<span class="ntag">${esc(n)}</span>`).join("")}</span>`
+  : `<span class="fine">暂无</span>`);
+const toolMark = (t) => (!t.registered ? "未注册" : t.task_only ? "仅派活时" : t.exec_class ? "执行类" : "");
+function toolsBlock(p) {
+  const v = p.tools_view;
+  if (!v) return "";
+  if (v.mode === "per_job") return `<div class="lbl-row"><label>工具</label>${tip("该岗位的工具在每次分派任务时由主模型选择；skill 声明的工具对该岗位不额外生效。")}</div><p class="fine" style="margin:0">每次分派时选择</p>`;
+  if (v.mode !== "fixed_plus_skills") return "";
+  const row = (name, inner) => `<div class="agent-tool-row"><span class="set-text">${esc(name)}</span>${inner}</div>`;
+  const skills = (v.skills || []).map((e) => row(e.skill, `<span class="ext-tools">${(e.tools || []).map((t) => {
+    const mark = toolMark(t);
+    return `<span class="ntag${!t.registered || t.exec_class ? " warn" : ""}">${esc(t.name)}${mark ? ` · ${mark}` : ""}</span>`;
+  }).join("")}</span>`)).join("");
+  const phases = Object.entries(v.phases || {}).map(([ph, names]) => row(TOOL_PHASES[ph] || ph, toolChips(names))).join("");
+  return `<div class="lbl-row"><label>工具</label>${tip("出厂工具固定。勾选声明了工具的 skill 后，岗位会带上这些工具并按 skill 内容使用；保存后下一轮生效。")}</div>
+    <div class="agent-tools">
+      ${row("出厂", toolChips(v.factory))}
+      ${skills || row("skill 带来", `<span class="fine">暂无</span>`)}
+      <p class="fine agent-tool-sub">各环节使用</p>
+      ${phases}
+    </div>`;
+}
+
 function profileForm(p) {
   const selected = new Set(p.skills || []);
   const catalog = state.agentSkills || [];
@@ -115,8 +142,10 @@ function profileForm(p) {
     ${main ? "" : `<label class="chk"><input id="agent-enabled" type="checkbox"${p.enabled !== false ? " checked" : ""} />启用</label>`}
     ${main ? "" : `<label>可用 skill</label><div id="agent-skills">${names.map((name) => {
       const k = catalog.find((x) => x.name === name);
-      return `<label class="chk"><input type="checkbox" value="${esc(name)}"${selected.has(name) ? " checked" : ""} />${esc(name)}${k && k.enabled === false ? `<span class="fine">（已停用）</span>` : ""}</label>`;
+      const brings = k && (k.allowed_tools || []).length ? `<span class="fine">（带工具：${k.allowed_tools.map(esc).join("、")}）</span>` : "";
+      return `<label class="chk"><input type="checkbox" value="${esc(name)}"${selected.has(name) ? " checked" : ""} />${esc(name)}${brings}${k && k.enabled === false ? `<span class="fine">（已停用）</span>` : ""}</label>`;
     }).join("") || `<p class="fine">暂无 skill</p>`}</div>`}
+    ${main ? "" : toolsBlock(p)}
     ${!docs ? loading() : `
       ${docBlock(p.kind, "soul", "SOUL.md", "性格与语气" + (docs.soul && docs.soul.synced_from_maibot ? "；当前内容已从 MaiBot 同步。" : "。"), docs.soul, lim.soul, `<button type="button" class="btn small" data-act="agent-soul-sync" data-kind="${esc(p.kind)}">从 MaiBot 同步</button>`)}
       ${docBlock(p.kind, "agents", "AGENTS.md", main ? "工作规则，需写明何时向哪个专岗分派任务。" : "工作规则。", docs.agents, lim.agents, `<button type="button" class="btn small ghost" data-act="agent-agents-reset" data-kind="${esc(p.kind)}">恢复默认</button>`)}`}
@@ -207,6 +236,7 @@ export async function loadAgents() {
     const [agents, extensions] = await Promise.all([api("GET", "/api/agents"), api("GET", "/api/extensions"), state.mdl ? null : loadModels()]);
     state.agents = agents;
     state.agentSkills = extensions.skills || [];
+    if (Array.isArray(agents && agents.worker_tool_choices)) state.toolChoices = agents.worker_tool_choices;
     const groups = state.groups || [];
     if (!groups.some((g) => g.id === state.agentGroup)) state.agentGroup = groups.some((g) => g.id === state.g) ? state.g : groups[0] && groups[0].id;
     if (state.agentGroup) await loadAgentGroup(state.agentGroup);
@@ -406,7 +436,14 @@ export async function actAgents(action, el) {
       }
       el.disabled = true;
       try {
-        await api("PUT", `/api/agents/${encodeURIComponent(kind)}`, body);
+        const path = `/api/agents/${encodeURIComponent(kind)}`;
+        try {
+          await api("PUT", path, body);
+        } catch (ex) {
+          // 新挂的 skill 带执行类工具：服务端要求确认，确认后带 confirm_exec 重试
+          if (!execConfirmNeeded(ex) || !confirmExecTools(ex)) throw ex;
+          await api("PUT", path, { ...body, confirm_exec: true });
+        }
         for (const [which, text] of writes) await api("PUT", `/api/agents/${encodeURIComponent(kind)}/docs/${which}`, { text });
         state.agentEdit = null;
         if (state.agentDocs) delete state.agentDocs[kind];

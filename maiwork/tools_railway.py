@@ -365,6 +365,8 @@ def register_vm_tools(
                 roles=frozenset({"worker"}),
                 handler=vm_run,
                 timeout_s=float(run_limit) + 60.0,  # 工具层兜底 > 内部 run 的上限
+                exec_class=True,
+                task_only=True,
             )
         )
     if not _registered("vm_put_file"):
@@ -386,6 +388,9 @@ def register_vm_tools(
                 roles=frozenset({"worker"}),
                 handler=vm_put_file,
                 timeout_s=180.0,
+                needs_workspace=True,
+                exec_class=True,
+                task_only=True,
             )
         )
     if not _registered("vm_read_file"):
@@ -403,6 +408,8 @@ def register_vm_tools(
                 roles=frozenset({"worker"}),
                 handler=vm_read_file,
                 timeout_s=180.0,
+                exec_class=True,
+                task_only=True,
             )
         )
     if local_env is not None and not _registered("vm_fetch_file"):
@@ -425,5 +432,8 @@ def register_vm_tools(
                 roles=frozenset({"worker"}),
                 handler=vm_fetch_file,
                 timeout_s=180.0,
+                needs_workspace=True,
+                exec_class=True,
+                task_only=True,
             )
         )

@@ -392,6 +392,96 @@ async def delete_model(svc: Any, path_id: str) -> None:
 
 
 # ----------------------------------------------------------------------
+# 做法工具确认门（2026-10-30 管理员认知修正，设计 §2.3）：唯一判定函数
+# ----------------------------------------------------------------------
+
+
+def _tool_traits(svc: Any, name: str) -> dict | None:
+    tools = getattr(svc, "tools", None)
+    if tools is None:
+        return None
+    try:
+        return tools.traits(name)
+    except Exception:
+        logger.exception("查工具 %s 特性出错，按没注册", name)
+        return None
+
+
+def _skill_allowed_tools(svc: Any, name: str) -> list[str]:
+    """一份做法当前声明的 allowed-tools（含停用的——写的是「挂了会生效」的事实）。"""
+    n = str(name or "").strip()
+    if not n:
+        return []
+    try:
+        from . import skills_web
+
+        settings = svc.get_settings()
+        view = skills_web.get_view(
+            getattr(settings, "data_dir", ""), getattr(svc, "store", None), n,
+            settings=settings,
+        )
+        if view is not None:
+            return [str(t) for t in (view.get("allowed_tools") or [])]
+    except Exception:
+        logger.exception("读做法 %s 的 allowed-tools 出错，按没声明", n)
+    return []
+
+
+def exec_grants(
+    svc: Any,
+    *,
+    skill_name: str | None = None,
+    new_allowed: Any = None,
+    kind: str | None = None,
+    add_skills: Any = None,
+) -> list[str]:
+    """算出「这次改动会让某个调研岗**新得到**的执行类工具名」（确认门的唯一判定）。
+
+    纯计算，不写任何东西；返回空 = 不需要执行类确认。三种情形：
+    - 写 / 改 / 安装做法：new_allowed 里 exec_class 的、且旧版本没有的
+      （新建 = 全部执行类）——不管现在挂没挂，挂上后就会生效，写的时候就确认；
+    - 挂做法到调研岗（kind + add_skills）：被挂做法声明的执行类工具；
+    - 摘掉做法、删工具声明、声明的都是非执行类 → 空。
+
+    执行类与否读 Tool.exec_class（tools.py 特性位）；未注册的名字不算
+    （它本就不会生效，在 skill_tools 的 unknown 里给管理员看）。
+    """
+    from .specialists import RESEARCH_KINDS
+
+    out: list[str] = []
+
+    def _mark(names: Any) -> None:
+        for raw in names or ():
+            n = str(raw or "").strip()
+            if not n or n in out:
+                continue
+            tr = _tool_traits(svc, n)
+            # 执行类且注册给 worker 才算「带给调研岗的新工具」（main-only 工具不算）
+            if tr is not None and tr.get("exec_class") and "worker" in (tr.get("roles") or ()):
+                out.append(n)
+
+    # 写 / 改 / 安装做法
+    if new_allowed is not None:
+        try:
+            from . import skills_web
+
+            # 归一化在一处（空格分隔字符串也是合法写法——直接迭代会按字符拆开漏判）
+            names = skills_web.normalize_allowed_tools(new_allowed)
+        except ValueError:
+            names = [n for n in new_allowed if str(n or "").strip()] \
+                if isinstance(new_allowed, (list, tuple)) else []
+        old = set(_skill_allowed_tools(svc, skill_name)) if skill_name else set()
+        _mark([n for n in names if n not in old])
+
+    # 挂做法到调研岗（task / 自定义专岗 / main 不受做法工具影响）
+    if str(kind or "") in RESEARCH_KINDS:
+        for sname in add_skills or ():
+            _mark(_skill_allowed_tools(svc, sname))
+
+    return out
+
+
+# ----------------------------------------------------------------------
 # 专岗（自定义专岗的建 / 删；改岗位直接调 svc.agents.update_profile）
 # ----------------------------------------------------------------------
 

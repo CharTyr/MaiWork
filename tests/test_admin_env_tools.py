@@ -47,10 +47,10 @@ async def test_skill_install_needs_confirm_then_downloads(app, monkeypatch) -> N
 
     gate = app.admin_pending
     gate.bind_chat(int(AdminChat(app).create("900000001")["id"]), 0)
-    first = await _call(app, "skill_install", {"url": url})
+    first = await _call(app, "skill_manage", {"action": "install", "url": url})
     assert first.ok and "已请求管理员确认" in first.output
     assert fetched == []  # 没点头前不下载
-    r, _t = await _call_confirmed(app, "skill_install", {"url": url})
+    r, _t = await _call_confirmed(app, "skill_manage", {"action": "install", "url": url})
     assert r.ok, r.error
     assert fetched[-1] == "https://raw.githubusercontent.com/o/r/main/skills/demo-remote/SKILL.md"
     assert Skills(app.get_settings().data_dir).read("demo-remote") is not None
@@ -58,7 +58,7 @@ async def test_skill_install_needs_confirm_then_downloads(app, monkeypatch) -> N
 
 @pytest.mark.asyncio
 async def test_skill_install_rejects_bad_url_without_ticket(app) -> None:  # noqa: F811
-    r = await _call(app, "skill_install", {"url": "http://a.com/x.zip"})
+    r = await _call(app, "skill_manage", {"action": "install", "url": "http://a.com/x.zip"})
     assert not r.ok and "https" in r.error
 
 
@@ -70,7 +70,7 @@ async def test_env_overview_lists_abilities_and_key_rule(app) -> None:  # noqa: 
     assert "research-report" in r.output  # 自带 skill 列出来
     assert "密钥请自己在网页上填" in r.output
     # 不能把内部工具名 / 参数名 / Markdown 星号写给管理员看
-    for bad in ("set_rules", "skill_install", "**"):
+    for bad in ("rules_manage", "skill_manage", "**"):
         assert bad not in r.output, bad
 
 
@@ -78,4 +78,4 @@ def test_admin_prompt_guides_env_setup(app) -> None:  # noqa: F811
     from CharTyr_MaiWork.maiwork.admin_chat import AdminChat
 
     p = AdminChat(app)._system_prompt({"group_id": ""})
-    assert "env_overview" in p and "skill_install" in p and "不要在对话里发密钥" in p
+    assert "env_overview" in p and "skill_manage" in p and "不要在对话里发密钥" in p

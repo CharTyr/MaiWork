@@ -7851,10 +7851,9 @@ class Coordinator:
         brief = "\n".join(parts)
         deadline_ts = clock.now() + 180
         try:
-            report = await specialists.run(
+            report = await specialists.run_auto(
                 "goal", brief, group_id=str(gid), phase="check",
                 task_id=f"goal-check:{goal_id}",
-                tools=["web_search", "social_search", "fetch_page", "read_profile"],
                 deadline_ts=deadline_ts, max_steps=8,
                 actor="目标检查",
             )

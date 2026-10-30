@@ -255,7 +255,7 @@ def _msgs(svc: _Svc, cid: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def _seed_pending(svc: _Svc, cid: int, *, tool: str = "send_group_message", summary: str = "发到群：你好") -> int:
+def _seed_pending(svc: _Svc, cid: int, *, tool: str = "group_deliver", summary: str = "发到群：你好") -> int:
     with svc.store.tx() as conn:
         cur = conn.execute(
             "INSERT INTO admin_chat_pending (chat_id, msg_id, tool, args, summary, status, created)"
@@ -382,7 +382,7 @@ class TestChats:
         pid = _seed_pending(svc, cid)
         got = chat.detail(cid)
         assert [int(p["id"]) for p in got["pending"]] == [pid]
-        assert got["pending"][0]["tool"] == "send_group_message"
+        assert got["pending"][0]["tool"] == "group_deliver"
 
 
 # ---------------------------------------------------------------------------
@@ -856,7 +856,7 @@ class TestRealGate:
     async def test_real_gate_binds_chat_and_sends_after_confirm(self, svc: _Svc) -> None:
         self._wire(svc)
         svc.models.script = [
-            _res("", [_call("send_group_message", {"group_id": G1, "text": "大家好"}, "c1")]),
+            _res("", [_call("group_deliver", {"action": "message", "group_id": G1, "text": "大家好"}, "c1")]),
             _res("已经请管理员确认了"),
         ]
         chat, cid = _chat(svc, G1)
@@ -887,7 +887,7 @@ class TestRealGate:
     async def test_real_gate_reject_keeps_outbox_empty(self, svc: _Svc) -> None:
         self._wire(svc)
         svc.models.script = [
-            _res("", [_call("send_group_message", {"group_id": G1, "text": "别发"}, "c1")]),
+            _res("", [_call("group_deliver", {"action": "message", "group_id": G1, "text": "别发"}, "c1")]),
             _res("好"),
         ]
         chat, cid = _chat(svc, G1)
@@ -904,7 +904,7 @@ class TestRealGate:
     async def test_real_gate_blocks_non_served_group(self, svc: _Svc) -> None:
         self._wire(svc)
         svc.models.script = [
-            _res("", [_call("send_group_message", {"group_id": "99999", "text": "越界"}, "c1")]),
+            _res("", [_call("group_deliver", {"action": "message", "group_id": "99999", "text": "越界"}, "c1")]),
             _res("知道了"),
         ]
         chat, cid = _chat(svc, G1)

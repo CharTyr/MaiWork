@@ -133,7 +133,7 @@ class TestWhitelistWritesDirectly:
 
     @pytest.mark.asyncio
     async def test_feeds_max_items_needs_no_confirm(self, svc: _Svc) -> None:
-        r = await svc.tools.call("set_rules", {"patch": {"feeds": {"max_items": 12}}}, _ctx())
+        r = await svc.tools.call("rules_manage", {"action": "set", "patch": {"feeds": {"max_items": 12}}}, _ctx())
         assert r.ok, r.error
         assert NEED_CONFIRM not in r.output
         assert _pending_rows(svc.store) == []
@@ -145,7 +145,7 @@ class TestWhitelistWritesDirectly:
     async def test_every_whitelist_key_needs_no_confirm(self, svc: _Svc, key: str) -> None:
         section, field = key.split(".", 1)
         value = WHITELIST_VALUES[key]
-        r = await svc.tools.call("set_rules", {"patch": {section: {field: value}}}, _ctx())
+        r = await svc.tools.call("rules_manage", {"action": "set", "patch": {section: {field: value}}}, _ctx())
         assert r.ok, (key, r.error)
         assert NEED_CONFIRM not in r.output, key
         assert _pending_rows(svc.store) == [], key
@@ -174,11 +174,11 @@ class TestNonWhitelistNeedsConfirm:
     )
     async def test_sensitive_patch_queues_ticket(self, svc: _Svc, patch: dict, label: str) -> None:
         before = _config_raw(svc)
-        r = await svc.tools.call("set_rules", {"patch": patch}, _ctx())
+        r = await svc.tools.call("rules_manage", {"action": "set", "patch": patch}, _ctx())
         assert r.ok, (patch, r.error)
         assert NEED_CONFIRM in r.output, patch
         rows = _pending_rows(svc.store)
-        assert len(rows) == 1 and rows[0]["tool"] == "set_rules", patch
+        assert len(rows) == 1 and rows[0]["tool"] == "rules_manage", patch
         assert label in rows[0]["summary"], (label, rows[0]["summary"])
         assert "安全" in rows[0]["summary"], rows[0]["summary"]  # 摘要里点明涉及安全设置
         assert _config_raw(svc) == before, patch  # 没同意前不写文件
@@ -186,7 +186,7 @@ class TestNonWhitelistNeedsConfirm:
     @pytest.mark.asyncio
     async def test_run_as_applies_only_after_approval(self, svc: _Svc) -> None:
         """小票不是死路：管理员点头后这次改动照旧落地。"""
-        r = await svc.tools.call("set_rules", {"patch": {"environments": {"run_as": "worker"}}}, _ctx())
+        r = await svc.tools.call("rules_manage", {"action": "set", "patch": {"environments": {"run_as": "worker"}}}, _ctx())
         assert r.ok, r.error
         pid = int(_pending_rows(svc.store)[0]["id"])
         assert _config_field(svc, "environments", "run_as", "没写过") == "没写过"
@@ -205,7 +205,7 @@ class TestMixedPatch:
     @pytest.mark.asyncio
     async def test_mixed_patch_confirms_and_summarizes_all(self, svc: _Svc) -> None:
         patch = {"feeds": {"max_items": 12}, "environments": {"run_as": "worker"}}
-        r = await svc.tools.call("set_rules", {"patch": patch}, _ctx())
+        r = await svc.tools.call("rules_manage", {"action": "set", "patch": patch}, _ctx())
         assert r.ok, r.error
         assert NEED_CONFIRM in r.output
         rows = _pending_rows(svc.store)

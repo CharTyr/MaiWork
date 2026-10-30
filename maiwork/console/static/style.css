@@ -1038,6 +1038,18 @@ body.booting .app, body.booting .tabbar { visibility: hidden; }
 .ext-tools .ntag { font-family: var(--mono); font-weight: 500; font-size: 11.5px; }
 .ext-btns { flex-wrap: wrap; justify-content: flex-end; }
 @media (max-width: 759px) { .ext-row { grid-template-columns: 36px minmax(0, 1fr); } .ext-btns { grid-column: 2; justify-content: flex-start; } }
+/* skill 的「要用的工具」勾选清单：工具多时在框内滚动，不把表单撑得很长 */
+.tool-checks { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow: auto; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; }
+.tool-chk { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 14px; font-weight: 500; }
+.tool-chk .mono { font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere; }
+.tool-chk .fine { margin: 0; }
+/* 专岗设置里的「工具」：左侧名称、右侧工具小标签 */
+.agent-tools { display: flex; flex-direction: column; gap: 6px; }
+.agent-tool-row { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 8px; align-items: baseline; }
+.agent-tool-row > .set-text { margin: 0; overflow-wrap: anywhere; }
+.agent-tool-row .ext-tools { margin-top: 0; }
+.agent-tool-sub { margin: 6px 0 0; }
+@media (max-width: 519px) { .agent-tool-row { grid-template-columns: minmax(0, 1fr); gap: 2px; } }
 /* 预设搜索服务：各家彩色 logo 放进统一的圆角小方块（和 .ico 同尺寸，带细描边免得白底 logo 糊进卡片） */
 .ext-row .ext-logo { width: 28px; height: 28px; border-radius: 8px; object-fit: cover; filter: none; box-shadow: 0 0 0 1px var(--line), 0 2px 6px rgba(0, 0, 0, 0.06); background: #fff; }
 .preset-row .set-name .ntag { margin-left: 6px; }

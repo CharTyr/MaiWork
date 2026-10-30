@@ -119,6 +119,12 @@ class Tool:
     handler: Handler
     summarize: Summarizer | None = None  # 网页显示的「输入 → 输出」一句话
     timeout_s: float = 60.0      # 单个工具默认 60 秒
+    # 工具自己声明的特性（2026-10-30 管理员认知修正）：老注册点不传 = 全 False。
+    # 一份事实多处读取：岗位工具计算（specialists）、确认门（settings_ops）、
+    # 网页展示都经 Tools.traits 读这三个位，别处不许各写一份名单。
+    needs_workspace: bool = False  # 没工作区用不了（read/write/list、run_command、*_process…）
+    exec_class: bool = False       # 执行类：带给调研岗要单独确认（跑命令/写文件/生图/机器…）
+    task_only: bool = False        # 只在派活回合有意义（vm_* / machine_* / render_report / generate_image）
 
 
 class Tools:
@@ -154,6 +160,22 @@ class Tools:
         tool.roles = roles
         table[name] = tool
         logger.debug("注册工具 %s（角色：%s）", name, ",".join(sorted(tool.roles)))
+
+    def traits(self, name: str) -> dict | None:
+        """一个已注册工具的三个特性位；没注册（含管理员工具那格）→ None。
+
+        Specialists / 管理员工具 / 网页共用这份事实：skill 的 allowed-tools 里
+        写了名字但没注册的工具在这里现形（registered=False），绝不静默生效。
+        """
+        tool = self._tools.get(str(name))
+        if tool is None:
+            return None
+        return {
+            "needs_workspace": bool(tool.needs_workspace),
+            "exec_class": bool(tool.exec_class),
+            "task_only": bool(tool.task_only),
+            "roles": sorted(tool.roles),
+        }
 
     def get(self, name: str, role: str) -> Tool | None:
         """按角色取已注册的工具（管理员一格、其余一格）；角色不允许就当没有。"""
@@ -219,14 +241,21 @@ class Tools:
     def _role_of(ctx: ToolContext) -> str:
         return role_of(ctx)
 
-    async def call(self, name: str, args: dict | str, ctx: ToolContext) -> ToolResult:
+    async def call(self, name: str, args: dict | str, ctx: ToolContext, *,
+                   as_role: str = "") -> ToolResult:
         """查名字、查角色、查必填参数，限时执行；结果落库后返回。
 
         args 可以是 dict（正常）或 str（模型给的 arguments 原文；这是 §10.2 之外的
         容错扩展：workers 遇到解析不了的 arguments 会把原串透传进来，统一在这里
         判定、落库，错误消息面向模型）。
+
+        as_role（2026-10-30，tool_run）：内部代码强制按某个角色的注册表查名——
+        管理员对话的 tool_run 用它让 admin ctx 调到 worker 表里的工具，落库、
+        群绑闸、角色检查仍照常走，只是「查哪一格、按哪个角色核权限」被指定。
+        普通调用不传，角色照旧从 ctx 判。
         """
         start = clock.now()
+        role = str(as_role or "").strip() or self._role_of(ctx)
         if isinstance(args, str):
             try:
                 parsed = json.loads(args)
@@ -235,10 +264,9 @@ class Tools:
             if not isinstance(parsed, dict):
                 # 解析不了的参数原文不落库（红线：密钥不落库，坏串里指不定有什么）
                 result = ToolResult(ok=False, output="", error="工具参数不是合法的 JSON 对象，请检查格式后重试")
-                self._persist(name, {"_error": "arguments 不是合法 JSON"}, result, ctx, start)
+                self._persist(name, {"_error": "arguments 不是合法 JSON"}, result, ctx, start, role=role)
                 return result
             args = parsed
-        role = self._role_of(ctx)
         # 硬权限：本轮工具名单（专岗/时间盒收尾强约束）。模型捏造未提供的工具名
         # 到这里直接拒绝——落库保留痕迹，不调 handler。args 伪造 role/group/agent_type
         # 没用：这些只由 ToolContext 提供，进不了调用参数。
@@ -248,7 +276,7 @@ class Tools:
                 ok=False, output="",
                 error=f"工具「{name}」不在本轮允许使用的名单里，不能调用",
             )
-            self._persist(name, args, result, ctx, start)
+            self._persist(name, args, result, ctx, start, role=role)
             return result
         tool = self._table(role).get(name)
         if tool is None:
@@ -257,18 +285,18 @@ class Tools:
             if name in other:
                 who = "主模型或子 agent" if role == ADMIN_ROLE else "bot 管理员"
                 result = ToolResult(ok=False, output="", error=f"工具「{name}」只有{who}能用，当前角色不允许")
-                self._persist(name, args, result, ctx, start)
+                self._persist(name, args, result, ctx, start, role=role)
                 return result
         if tool is None:
             result = ToolResult(ok=False, output="", error=f"不认识名为「{name}」的工具")
-            self._persist(name, args, result, ctx, start)
+            self._persist(name, args, result, ctx, start, role=role)
             return result
         if role not in tool.roles:
             allowed = "、".join(
                 {"main": "主模型", "admin": "bot 管理员"}.get(r, "子 agent") for r in sorted(tool.roles)
             )
             result = ToolResult(ok=False, output="", error=f"工具「{name}」只有{allowed}能用，当前角色不允许")
-            self._persist(name, args, result, ctx, start)
+            self._persist(name, args, result, ctx, start, role=role)
             return result
         # 群绑闸（worker 专属）：读「本群资料」的工具不许用 args.group_id 越群。
         # handler 自己也可能再用 ctx.group_id 兜底，这一层是它的防线——模型用 args 伪造
@@ -284,17 +312,17 @@ class Tools:
                     ok=False, output="",
                     error=f"工具「{name}」只能读当前群的资料，不能跨群（你给了别的群号）",
                 )
-                self._persist(name, args, result, ctx, start)
+                self._persist(name, args, result, ctx, start, role=role)
                 return result
         if not isinstance(args, dict):
             result = ToolResult(ok=False, output="", error="工具参数必须是一个 JSON 对象")
-            self._persist(name, args, result, ctx, start)
+            self._persist(name, args, result, ctx, start, role=role)
             return result
         required = tool.parameters.get("required") or []
         missing = [k for k in required if k not in args]
         if missing:
             result = ToolResult(ok=False, output="", error=f"缺必填参数：{('、'.join(str(m) for m in missing))}")
-            self._persist(name, args, result, ctx, start)
+            self._persist(name, args, result, ctx, start, role=role)
             return result
         timeout = tool.timeout_s if tool.timeout_s and tool.timeout_s > 0 else 60.0
         used_tools = getattr(ctx, "used_tools", None)
@@ -309,7 +337,7 @@ class Tools:
                 logger.exception("调用前闸出错（%s），按不拦处理", name)
                 blocked = None
             if isinstance(blocked, ToolResult):
-                self._persist(name, args, blocked, ctx, start)
+                self._persist(name, args, blocked, ctx, start, role=role)
                 return blocked
         try:
             result = await asyncio.wait_for(tool.handler(ctx, args), timeout=timeout)
@@ -320,7 +348,17 @@ class Tools:
             result = ToolResult(ok=False, output="", error=f"工具「{name}」出错：{e}")
         if not isinstance(result, ToolResult):
             result = ToolResult(ok=bool(result), output=str(result))
-        self._persist(name, args, result, ctx, start)
+        # 补找防编造（2026-10-30）：成功调用把**完整**输出里的链接记进 task_id 的
+        # 「见过」账（没开登记簿的 task_id 直接返回；内部异常自吞，绝不影响结果）。
+        # 不能用落库的 output 对账——那被 _SUMMARY_MAX 截断了。
+        if result.ok:
+            try:
+                from . import discovery
+
+                discovery.note_output(getattr(ctx, "task_id", "") or "", name, result.output)
+            except Exception:
+                logger.debug("note_output 调用出错（%s），吞掉", name, exc_info=True)
+        self._persist(name, args, result, ctx, start, role=role)
         return result
 
     # ------------------------------------------------------------------
@@ -387,8 +425,11 @@ class Tools:
             return []
         return [str(v) for v in values if str(v or "")]
 
-    def _persist(self, name: str, args: Any, result: ToolResult, ctx: ToolContext, start: float) -> None:
-        tool = self._table(self._role_of(ctx)).get(name)
+    def _persist(self, name: str, args: Any, result: ToolResult, ctx: ToolContext, start: float,
+                 *, role: str = "") -> None:
+        # 摘要从「这次按哪个角色查的表」那格拿（call 的 as_role 会传进来）；
+        # 不传照旧按 ctx 判的角色——同名工具两格都注册时各拿各的 summarize
+        tool = self._table(str(role or "") or self._role_of(ctx)).get(name)
         inp, outp = self._summarize(tool, name, args, result)
         inp = self._mask_final(inp)[:_SUMMARY_MAX]
         outp = self._mask_final(outp)[:_SUMMARY_MAX]

@@ -217,7 +217,7 @@ export function chatPage() {
     <div class="chat-stream" id="chat-stream">${C ? chatStream() : chatLoading()}</div>
     <form id="chat-form" class="chat-composer" autocomplete="off">
       <textarea id="chat-input" rows="1" placeholder="输入消息…" ${C && C.running ? "" : ""}></textarea>
-      <button class="chat-send" type="submit" aria-label="发送" ${C && C.running ? "disabled" : ""}>${SVG.send || "↑"}</button>
+      <button class="chat-send" type="submit" aria-label="发送" title="发送（Ctrl+Enter）" ${C && C.running ? "disabled" : ""}>${SVG.send || "↑"}</button>
     </form>`;
 }
 

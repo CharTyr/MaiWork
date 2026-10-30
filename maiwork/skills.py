@@ -33,7 +33,7 @@ from typing import Any
 logger = logging.getLogger("maiwork.skills")
 
 _READ_MAX_BYTES = 40 * 1024          # SKILL.md / 附属文件一次最多读 40KB
-_FRONT_KEYS = ("name", "description", "roles")
+_FRONT_KEYS = ("name", "description", "roles", "allowed-tools")
 BUILTIN_ROOT = Path(__file__).resolve().parent / "builtin_skills"   # 插件自带的 skill（只读）
 
 KV_SKILLS_DISABLED = "extensions.skills.disabled"  # 手动停用的 skill 名单（网页 toggle 写入）
@@ -206,6 +206,7 @@ class Skills:
                     "roles": roles,
                     "path": str(path),
                     "builtin": builtin,
+                    "allowed_tools": list(front.get("allowed_tools") or []),
                 }
             )
         out.sort(key=lambda i: str(i["name"]))
@@ -443,8 +444,30 @@ def parse_front_matter(text: str) -> dict[str, Any]:
             value = value[1:-1]
         if key == "roles":
             out[key] = _parse_roles_value(value)
+        elif key == "allowed-tools":
+            out["allowed_tools"] = _parse_allowed_tools_value(value)
         else:
             out[key] = value
+    out.setdefault("allowed_tools", [])
+    return out
+
+
+def _parse_allowed_tools_value(value: str) -> list[str]:
+    """`allowed-tools` → 工具名列表（去重保序，原样保留认不出的名字）。
+
+    Agent Skills 规范是空格分隔字符串（`allowed-tools: a b c`）；容错接受
+    YAML 行内列表（`[a, b]`）。名字**不在这里校验**——注册与否由 Tools.traits
+    判（specialists.skill_tools），认不出的照样带出给管理员看。
+    """
+    v = str(value or "").strip()
+    if v.startswith("[") and v.endswith("]"):
+        items = [p.strip().strip("'\"") for p in v[1:-1].split(",")]
+    else:
+        items = v.split()
+    out: list[str] = []
+    for item in items:
+        if item and item not in out:
+            out.append(item)
     return out
 
 

@@ -118,7 +118,7 @@ class TestMcpAdd:
     @pytest.mark.asyncio
     async def test_add_needs_confirm_then_creates(self, app, fake_mcp) -> None:  # noqa: F811
         args = {"name": "exa", "url": "https://mcp.example.com/mcp", "tools": ["search"], "roles": ["worker"]}
-        pid = await _ticket(app, "mcp_add", args)
+        pid = await _ticket(app, "mcp_manage", {"action": "add", **args})
         assert _mcp(app) is None, "没点头前不能落库"
         assert fake_mcp["reload"] == [], "没点头前不能连"
         r = await app.admin_pending.execute(pid, True)
@@ -133,20 +133,20 @@ class TestMcpAdd:
     @pytest.mark.asyncio
     async def test_add_same_validation_as_web(self, app, fake_mcp) -> None:  # noqa: F811
         """http 地址、坏名字：网页接口那套校验当场拒，不写票。"""
-        await _refused(app, "mcp_add", {"name": "exa", "url": "http://mcp.example.com/mcp"}, "https://")
-        await _refused(app, "mcp_add", {"name": "坏 名字", "url": "https://mcp.example.com/mcp"}, "名字不合法")
+        await _refused(app, "mcp_manage", {"action": "add", "name": "exa", "url": "http://mcp.example.com/mcp"}, "https://")
+        await _refused(app, "mcp_manage", {"action": "add", "name": "坏 名字", "url": "https://mcp.example.com/mcp"}, "名字不合法")
         _seed_mcp(app)
-        await _refused(app, "mcp_add", {"name": "exa", "url": "https://other.example.com/mcp"}, "重名")
+        await _refused(app, "mcp_manage", {"action": "add", "name": "exa", "url": "https://other.example.com/mcp"}, "重名")
 
     @pytest.mark.asyncio
     async def test_add_rejects_secrets(self, app, fake_mcp) -> None:  # noqa: F811
         for extra in ({"headers": {"Authorization": "Bearer sk-x"}}, {"api_key": "sk-x"}, {"token": "x"}):
             r = await _refused(
-                app, "mcp_add", {"name": "exa", "url": "https://mcp.example.com/mcp", **extra}, "密钥", "设置 → 工具",
+                app, "mcp_manage", {"action": "add", "name": "exa", "url": "https://mcp.example.com/mcp", **extra}, "密钥", "设置 → 工具",
             )
             assert "sk-x" not in r.error
         # 地址里夹查询串（很多服务把 key 放这里）也算密钥进了对话
-        await _refused(app, "mcp_add", {"name": "exa", "url": "https://mcp.example.com/mcp?apiKey=abc"}, "密钥")
+        await _refused(app, "mcp_manage", {"action": "add", "name": "exa", "url": "https://mcp.example.com/mcp?apiKey=abc"}, "密钥")
         assert _mcp(app) is None
 
 
@@ -154,7 +154,7 @@ class TestMcpUpdate:
     @pytest.mark.asyncio
     async def test_url_change_needs_confirm(self, app, fake_mcp) -> None:  # noqa: F811
         _seed_mcp(app)
-        pid = await _ticket(app, "mcp_update", {"name": "exa", "url": "https://new.example.com/mcp"})
+        pid = await _ticket(app, "mcp_manage", {"action": "update", "name": "exa", "url": "https://new.example.com/mcp"})
         assert _mcp(app)["url"] == "https://mcp.example.com/mcp", "没点头前地址不能变"
         r = await app.admin_pending.execute(pid, True)
         assert r.ok, r.error
@@ -164,7 +164,7 @@ class TestMcpUpdate:
     @pytest.mark.asyncio
     async def test_add_main_role_needs_confirm(self, app, fake_mcp) -> None:  # noqa: F811
         _seed_mcp(app, roles=["worker"])
-        pid = await _ticket(app, "mcp_update", {"name": "exa", "roles": ["worker", "main"]})
+        pid = await _ticket(app, "mcp_manage", {"action": "update", "name": "exa", "roles": ["worker", "main"]})
         assert _mcp(app)["roles"] == ["worker"]
         assert (await app.admin_pending.execute(pid, True)).ok
         assert _mcp(app)["roles"] == ["main", "worker"]
@@ -172,10 +172,10 @@ class TestMcpUpdate:
     @pytest.mark.asyncio
     async def test_widen_whitelist_needs_confirm(self, app, fake_mcp) -> None:  # noqa: F811
         _seed_mcp(app)
-        await _ticket(app, "mcp_update", {"name": "exa", "tools": ["search", "fetch", "crawl"]})
+        await _ticket(app, "mcp_manage", {"action": "update", "name": "exa", "tools": ["search", "fetch", "crawl"]})
         assert _mcp(app)["tools"] == ["search", "fetch"]
         # 从「有白名单」变成「不限」也是放宽
-        pid = await _ticket(app, "mcp_update", {"name": "exa", "tools": []})
+        pid = await _ticket(app, "mcp_manage", {"action": "update", "name": "exa", "tools": []})
         assert _mcp(app)["tools"] == ["search", "fetch"]
         assert (await app.admin_pending.execute(pid, True)).ok
         assert _mcp(app)["tools"] == []
@@ -183,27 +183,27 @@ class TestMcpUpdate:
     @pytest.mark.asyncio
     async def test_narrowing_is_direct(self, app, fake_mcp) -> None:  # noqa: F811
         _seed_mcp(app)
-        await _direct(app, "mcp_update", {"name": "exa", "tools": ["search"]})
+        await _direct(app, "mcp_manage", {"action": "update", "name": "exa", "tools": ["search"]})
         assert _mcp(app)["tools"] == ["search"]
-        await _direct(app, "mcp_update", {"name": "exa", "roles": ["worker"]})
+        await _direct(app, "mcp_manage", {"action": "update", "name": "exa", "roles": ["worker"]})
         assert _mcp(app)["roles"] == ["worker"]
-        await _direct(app, "mcp_update", {"name": "exa", "enabled": False})
+        await _direct(app, "mcp_manage", {"action": "update", "name": "exa", "enabled": False})
         assert _mcp(app)["enabled"] is False
         assert fake_mcp["reload"] == ["exa", "exa", "exa"], "改完立刻重连（同网页）"
 
     @pytest.mark.asyncio
     async def test_unlimited_to_list_is_narrowing(self, app, fake_mcp) -> None:  # noqa: F811
         _seed_mcp(app, tools=[])
-        await _direct(app, "mcp_update", {"name": "exa", "tools": ["search"]})
+        await _direct(app, "mcp_manage", {"action": "update", "name": "exa", "tools": ["search"]})
         assert _mcp(app)["tools"] == ["search"]
 
     @pytest.mark.asyncio
     async def test_update_rejects_secrets_and_bad(self, app, fake_mcp) -> None:  # noqa: F811
         _seed_mcp(app)
-        await _refused(app, "mcp_update", {"name": "exa", "headers": {"X-Key": "abc"}}, "密钥", "设置 → 工具")
-        await _refused(app, "mcp_update", {"name": "exa", "remove_headers": ["X-Key"]}, "密钥")
-        await _refused(app, "mcp_update", {"name": "exa", "url": "http://x.example.com"}, "https://")
-        await _refused(app, "mcp_update", {"name": "nope", "enabled": False}, "没有")
+        await _refused(app, "mcp_manage", {"action": "update", "name": "exa", "headers": {"X-Key": "abc"}}, "密钥", "设置 → 工具")
+        await _refused(app, "mcp_manage", {"action": "update", "name": "exa", "remove_headers": ["X-Key"]}, "密钥")
+        await _refused(app, "mcp_manage", {"action": "update", "name": "exa", "url": "http://x.example.com"}, "https://")
+        await _refused(app, "mcp_manage", {"action": "update", "name": "nope", "enabled": False}, "没有")
         assert fake_mcp["reload"] == []
 
 
@@ -214,7 +214,7 @@ async def test_mcp_delete_clears_search_binding_like_web(app, fake_mcp) -> None:
 
     _seed_mcp(app)
     search_binding.set_binding(app.store, {"mcp": "exa", "tool": "search"})
-    pid = await _ticket(app, "mcp_delete", {"name": "exa"})
+    pid = await _ticket(app, "mcp_manage", {"action": "delete", "name": "exa"})
     assert (await app.admin_pending.execute(pid, True)).ok
     assert _mcp(app) is None
     assert search_binding.get_binding(app.store) is None
@@ -223,7 +223,7 @@ async def test_mcp_delete_clears_search_binding_like_web(app, fake_mcp) -> None:
 class TestMcpTestReload:
     @pytest.mark.asyncio
     async def test_test_by_url_is_direct_and_lists_tools(self, app, fake_mcp) -> None:  # noqa: F811
-        r = await _direct(app, "mcp_test", {"url": "https://try.example.com/mcp"})
+        r = await _direct(app, "mcp_manage", {"action": "test", "url": "https://try.example.com/mcp"})
         assert "search" in r.output and "fetch" in r.output
         assert fake_mcp["connect"] == [("https://try.example.com/mcp", {})], "试新地址不带任何已存的头"
 
@@ -236,7 +236,7 @@ class TestMcpTestReload:
             "https://[fc00::1]/mcp", "https://localhost/mcp", "https://intranet.example.org/mcp",
             "https://no-such-host.invalid/mcp",
         ):
-            await _refused(app, "mcp_test", {"url": url}, "内网")
+            await _refused(app, "mcp_manage", {"action": "test", "url": url}, "内网")
         assert fake_mcp["connect"] == [], "内网地址一次都不能连"
 
     @pytest.mark.asyncio
@@ -244,22 +244,22 @@ class TestMcpTestReload:
         extensions_web.create(app.store, app.get_settings(), {
             "name": "exa", "url": "https://mcp.example.com/mcp", "headers": {"X-Key": "secret-value-1"},
         })
-        r = await _direct(app, "mcp_test", {"name": "exa"})
+        r = await _direct(app, "mcp_manage", {"action": "test", "name": "exa"})
         assert fake_mcp["connect"] == [("https://mcp.example.com/mcp", {"X-Key": "secret-value-1"})]
         assert "secret-value-1" not in r.output and "secret-value-1" not in str(r.data)
         # 已存的头不能被带去别的地址
-        await _refused(app, "mcp_test", {"name": "exa", "url": "https://evil.example.com/mcp"}, "地址")
+        await _refused(app, "mcp_manage", {"action": "test", "name": "exa", "url": "https://evil.example.com/mcp"}, "地址")
         assert len(fake_mcp["connect"]) == 1
 
     @pytest.mark.asyncio
     async def test_test_rejects_secrets(self, app, fake_mcp) -> None:  # noqa: F811
-        await _refused(app, "mcp_test", {"url": "https://try.example.com/mcp", "headers": {"A": "b"}}, "密钥")
+        await _refused(app, "mcp_manage", {"action": "test", "url": "https://try.example.com/mcp", "headers": {"A": "b"}}, "密钥")
         assert fake_mcp["connect"] == []
 
     @pytest.mark.asyncio
     async def test_reload_is_direct(self, app, fake_mcp) -> None:  # noqa: F811
         _seed_mcp(app)
-        r = await _direct(app, "mcp_reload", {"name": "exa"})
+        r = await _direct(app, "mcp_manage", {"action": "reload", "name": "exa"})
         assert fake_mcp["reload"] == ["exa"] and "3" in r.output
 
 
@@ -271,10 +271,10 @@ class TestMcpTestReload:
 class TestAgents:
     @pytest.mark.asyncio
     async def test_update_model_effort_enabled_direct(self, app) -> None:  # noqa: F811
-        await _direct(app, "agent_update", {"kind": "news", "model": "m1", "backup": "m2", "escalate": "m1"})
+        await _direct(app, "agent_manage", {"action": "update", "kind": "news", "model": "m1", "backup": "m2", "escalate": "m1"})
         p = app.agents.profile("news")
         assert (p["model"], p["backup"], p["escalate"]) == ("m1", "m2", "m1")
-        await _direct(app, "agent_update", {"kind": "idea", "enabled": False})
+        await _direct(app, "agent_manage", {"action": "update", "kind": "idea", "enabled": False})
         assert app.agents.profile("idea")["enabled"] is False
 
     @pytest.mark.asyncio
@@ -283,28 +283,28 @@ class TestAgents:
         for kind, patch in (("news", {"model": "no-such"}), ("main", {"escalate": "m1"})):
             with pytest.raises(ValueError) as web_err:
                 app.agents.update_profile(kind, dict(patch))
-            await _refused(app, "agent_update", {"kind": kind, **patch}, str(web_err.value))
+            await _refused(app, "agent_manage", {"action": "update", "kind": kind, **patch}, str(web_err.value))
         # 只开放模型三件套 + 做不动时换用 + 启停；别的字段（人设之类）去网页改
-        await _refused(app, "agent_update", {"kind": "news", "instructions": "x"}, "instructions")
+        await _refused(app, "agent_manage", {"action": "update", "kind": "news", "instructions": "x"}, "instructions")
 
     @pytest.mark.asyncio
     async def test_create_direct_delete_confirm(self, app) -> None:  # noqa: F811
-        r = await _direct(app, "agent_create", {"title": "翻译"})
+        r = await _direct(app, "agent_manage", {"action": "create", "title": "翻译"})
         kind = r.data["kind"]
         assert app.agents.is_custom_kind(kind)
-        pid = await _ticket(app, "agent_delete", {"kind": kind})
+        pid = await _ticket(app, "agent_manage", {"action": "delete", "kind": kind})
         assert app.agents.is_custom_kind(kind), "没点头前不能删"
         assert (await app.admin_pending.execute(pid, True)).ok
         assert not app.agents.is_custom_kind(kind)
 
     @pytest.mark.asyncio
     async def test_delete_builtin_refused_without_ticket(self, app) -> None:  # noqa: F811
-        await _refused(app, "agent_delete", {"kind": "news"}, "内置")
-        await _refused(app, "agent_delete", {"kind": "c_zzzzzz"}, "没有")
+        await _refused(app, "agent_manage", {"action": "delete", "kind": "news"}, "内置")
+        await _refused(app, "agent_manage", {"action": "delete", "kind": "c_zzzzzz"}, "没有")
 
     @pytest.mark.asyncio
     async def test_list_agents(self, app) -> None:  # noqa: F811
-        r = await _direct(app, "list_agents", {})
+        r = await _direct(app, "agent_manage", {"action": "list", })
         assert "news" in r.output and "m2" in r.output
 
 
@@ -328,7 +328,7 @@ class TestAgentDetail:
     @pytest.mark.asyncio
     async def test_with_group_sees_memory_and_skills(self, app) -> None:  # noqa: F811
         await self._seed_group_stuff(app)
-        r = await _direct(app, "agent_detail", {"kind": "news", "group_id": G1})
+        r = await _direct(app, "agent_manage", {"action": "detail", "kind": "news", "group_id": G1})
         d = r.data
         assert d["kind"] == "news" and d["group_id"] == G1
         assert d["memory"]["count"] == 1 and "假官网" in d["memory"]["items"][0]["text"]
@@ -340,7 +340,7 @@ class TestAgentDetail:
             G1, "这个群最近爱在周五晚上分享折腾成果。\n给 news 岗：少收手机营销稿\n记住要先查官网\n",
             updated_by="admin",
         )
-        r = await _direct(app, "agent_detail", {"kind": "news", "group_id": G1})
+        r = await _direct(app, "agent_manage", {"action": "detail", "kind": "news", "group_id": G1})
         d = r.data
         titles = d["rules"]["recent"]
         assert d["rules"]["count"] == 2, titles
@@ -349,7 +349,7 @@ class TestAgentDetail:
 
     @pytest.mark.asyncio
     async def test_without_group_identity_and_tools_only(self, app) -> None:  # noqa: F811
-        r = await _direct(app, "agent_detail", {"kind": "news"})
+        r = await _direct(app, "agent_manage", {"action": "detail", "kind": "news"})
         d = r.data
         assert d["kind"] == "news" and d["title"]
         assert "enabled" in d and "model" in d and "effort" in d and "backup" in d and "escalate" in d
@@ -367,14 +367,17 @@ class TestAgentDetail:
         """工具名单必须和 Specialists.effective_tools 算出来的一模一样（同一入口）。"""
         p = app.agents.profile("news")
         want = app.specialists.effective_tools("news", p.get("tools"), p)
-        r = await _direct(app, "agent_detail", {"kind": "news"})
+        r = await _direct(app, "agent_manage", {"action": "detail", "kind": "news"})
         assert r.data["tools"] == want
 
     @pytest.mark.asyncio
     async def test_task_kind_tools_from_profile(self, app) -> None:  # noqa: F811
-        """task 岗没有岗位白名单：profile.tools=None → effective 只剩 submit_result 保底。"""
-        r = await _direct(app, "agent_detail", {"kind": "task"})
-        assert r.data["tools"] == ["submit_result"]
+        """task 岗（per_job）：data["tools"] 是全部子 agent 工具候选，不再误写成只剩 submit_result。"""
+        r = await _direct(app, "agent_manage", {"action": "detail", "kind": "task"})
+        assert r.data["describe"]["mode"] == "per_job"
+        assert r.data["tools"] == r.data["describe"]["candidates"]
+        assert len(r.data["tools"]) > 1
+        assert "工具不固定" in r.output
 
     @pytest.mark.asyncio
     async def test_memory_truncated_and_capped(self, app) -> None:  # noqa: F811
@@ -382,7 +385,7 @@ class TestAgentDetail:
         long_text = "长" * 200
         for i in range(12):
             app.agents.remember(G1, "news", f"第{i}条{long_text}", source_id=f"s{i}")
-        r = await _direct(app, "agent_detail", {"kind": "news", "group_id": G1})
+        r = await _direct(app, "agent_manage", {"action": "detail", "kind": "news", "group_id": G1})
         items = r.data["memory"]["items"]
         assert r.data["memory"]["count"] == 12
         assert len(items) <= 10
@@ -393,7 +396,7 @@ class TestAgentDetail:
         sid = int(app.agents.skills(G1, "news")[0]["id"])  # 启动迁移已建的 news-本群做法
         app.agents.skill_update(G1, sid, locked=True)
         app.agents.skill_touch_use(G1, "news", "news-本群做法")
-        r = await _direct(app, "agent_detail", {"kind": "news", "group_id": G1})
+        r = await _direct(app, "agent_manage", {"action": "detail", "kind": "news", "group_id": G1})
         sk = next(s for s in r.data["skills"] if s["name"] == "news-本群做法")
         assert sk["locked"] is True and sk["uses"] == 1
         assert sk["last_used"], "用过要给日期"
@@ -403,34 +406,34 @@ class TestAgentDetail:
     async def test_archived_skill_not_listed(self, app) -> None:  # noqa: F811
         sid = int(app.agents.skills(G1, "news")[0]["id"])
         app.agents.skill_update(G1, sid, status="archived")
-        r = await _direct(app, "agent_detail", {"kind": "news", "group_id": G1})
+        r = await _direct(app, "agent_manage", {"action": "detail", "kind": "news", "group_id": G1})
         assert "news-本群做法" not in {s["name"] for s in r.data["skills"]}
 
     @pytest.mark.asyncio
     async def test_no_group_no_rules_memory_skills(self, app) -> None:  # noqa: F811
         await self._seed_group_stuff(app)
-        r = await _direct(app, "agent_detail", {"kind": "news"})
+        r = await _direct(app, "agent_manage", {"action": "detail", "kind": "news"})
         for key in ("memory", "skills", "rules"):
             assert key not in r.data
 
     @pytest.mark.asyncio
     async def test_non_served_group_refused(self, app) -> None:  # noqa: F811
-        await _refused(app, "agent_detail", {"kind": "news", "group_id": "99999"}, "服务群")
+        await _refused(app, "agent_manage", {"action": "detail", "kind": "news", "group_id": "99999"}, "服务群")
 
     @pytest.mark.asyncio
     async def test_unknown_kind_refused(self, app) -> None:  # noqa: F811
-        await _refused(app, "agent_detail", {"kind": "nope"}, "岗位")
-        await _refused(app, "agent_detail", {}, "kind")
+        await _refused(app, "agent_manage", {"action": "detail", "kind": "nope"}, "岗位")
+        await _refused(app, "agent_manage", {"action": "detail", }, "kind")
 
     @pytest.mark.asyncio
     async def test_extra_args_refused(self, app) -> None:  # noqa: F811
-        await _refused(app, "agent_detail", {"kind": "news", "headers": {"X": "y"}}, "密钥")
+        await _refused(app, "agent_manage", {"action": "detail", "kind": "news", "headers": {"X": "y"}}, "密钥")
 
     @pytest.mark.asyncio
     async def test_no_ticket_written(self, app) -> None:  # noqa: F811
         """只读工具：不写小票。"""
         await self._seed_group_stuff(app)
-        r = await _direct(app, "agent_detail", {"kind": "news", "group_id": G1})
+        r = await _direct(app, "agent_manage", {"action": "detail", "kind": "news", "group_id": G1})
         assert tools_admin.NEED_CONFIRM not in r.output
 
 
@@ -447,7 +450,7 @@ class TestEndpoints:
     @pytest.mark.asyncio
     async def test_new_endpoint_needs_confirm(self, app) -> None:  # noqa: F811
         args = {"id": "ds", "name": "DeepSeek", "protocol": "openai", "base_url": "https://api.deepseek.com/v1"}
-        pid = await _ticket(app, "endpoint_save", args)
+        pid = await _ticket(app, "model_manage", {"action": "endpoint_save", **args})
         assert _ep(app, "ds") is None, "没点头前不能写配置"
         r = await app.admin_pending.execute(pid, True)
         assert r.ok, r.error
@@ -458,7 +461,7 @@ class TestEndpoints:
     @pytest.mark.asyncio
     async def test_base_url_change_needs_confirm_and_keeps_key(self, app) -> None:  # noqa: F811
         old_url = _ep(app, "default").base_url
-        pid = await _ticket(app, "endpoint_save", {"id": "default", "base_url": "https://new.example.com/v1"})
+        pid = await _ticket(app, "model_manage", {"action": "endpoint_save", "id": "default", "base_url": "https://new.example.com/v1"})
         assert _ep(app, "default").base_url == old_url
         # 已存的密钥会跟着去新地址：小票上要写明
         assert "已存的密钥" in app.admin_pending._row(pid)["summary"]
@@ -469,12 +472,12 @@ class TestEndpoints:
 
     @pytest.mark.asyncio
     async def test_protocol_change_needs_confirm(self, app) -> None:  # noqa: F811
-        await _ticket(app, "endpoint_save", {"id": "default", "protocol": "anthropic"})
+        await _ticket(app, "model_manage", {"action": "endpoint_save", "id": "default", "protocol": "anthropic"})
         assert _ep(app, "default").protocol == "openai"
 
     @pytest.mark.asyncio
     async def test_other_fields_direct(self, app) -> None:  # noqa: F811
-        await _direct(app, "endpoint_save", {"id": "default", "name": "主端点", "retries": 5, "max_rpm": 30})
+        await _direct(app, "model_manage", {"action": "endpoint_save", "id": "default", "name": "主端点", "retries": 5, "max_rpm": 30})
         ep = _ep(app, "default")
         assert (ep.name, ep.retries, ep.max_rpm) == ("主端点", 5, 30)
         assert ep.api_key == "test-key"
@@ -482,48 +485,48 @@ class TestEndpoints:
     @pytest.mark.asyncio
     async def test_endpoint_rejects_secrets_and_bad(self, app) -> None:  # noqa: F811
         for extra in ({"api_key": "sk-new"}, {"headers": {"X-Api-Key": "v"}}, {"key": "sk-new"}):
-            r = await _refused(app, "endpoint_save", {"id": "default", **extra}, "密钥", "设置 → 模型")
+            r = await _refused(app, "model_manage", {"action": "endpoint_save", "id": "default", **extra}, "密钥", "设置 → 模型")
             assert "sk-new" not in r.error
         assert _ep(app, "default").api_key == "test-key"
-        await _refused(app, "endpoint_save", {"id": "x1", "base_url": "ftp://x"})
-        await _refused(app, "endpoint_save", {"id": "x2", "base_url": "https://u:p@x.example.com/v1"}, "密钥")
+        await _refused(app, "model_manage", {"action": "endpoint_save", "id": "x1", "base_url": "ftp://x"})
+        await _refused(app, "model_manage", {"action": "endpoint_save", "id": "x2", "base_url": "https://u:p@x.example.com/v1"}, "密钥")
 
     @pytest.mark.asyncio
     async def test_delete_endpoint_confirm(self, app) -> None:  # noqa: F811
         await settings_ops.save_endpoint(app, "spare", {"base_url": "https://spare.example.com/v1"})
         assert _ep(app, "spare") is not None
-        pid = await _ticket(app, "endpoint_delete", {"id": "spare"})
+        pid = await _ticket(app, "model_manage", {"action": "endpoint_delete", "id": "spare"})
         assert _ep(app, "spare") is not None
         assert (await app.admin_pending.execute(pid, True)).ok
         assert _ep(app, "spare") is None
         # 还有模型挂着：同网页一样当场拒，不写票
-        await _refused(app, "endpoint_delete", {"id": "default"}, "模型")
+        await _refused(app, "model_manage", {"action": "endpoint_delete", "id": "default"}, "模型")
 
 
 class TestModelList:
     @pytest.mark.asyncio
     async def test_add_and_edit_direct_delete_confirm(self, app) -> None:  # noqa: F811
-        await _direct(app, "model_save", {"id": "m3", "endpoint": "default", "model": "gpt-x", "name": "备用"})
+        await _direct(app, "model_manage", {"action": "model_save", "id": "m3", "endpoint": "default", "model": "gpt-x", "name": "备用"})
         ids = [m.id for m in app.get_settings().model_list]
         assert "m3" in ids
-        await _direct(app, "model_save", {"id": "m3", "max_tokens": 4096})
+        await _direct(app, "model_manage", {"action": "model_save", "id": "m3", "max_tokens": 4096})
         m3 = next(m for m in app.get_settings().model_list if m.id == "m3")
         assert m3.max_tokens == 4096 and m3.model == "gpt-x"
-        pid = await _ticket(app, "model_delete", {"id": "m3"})
+        pid = await _ticket(app, "model_manage", {"action": "model_delete", "id": "m3"})
         assert "m3" in [m.id for m in app.get_settings().model_list]
         assert (await app.admin_pending.execute(pid, True)).ok
         assert "m3" not in [m.id for m in app.get_settings().model_list]
 
     @pytest.mark.asyncio
     async def test_model_same_validation_as_web(self, app) -> None:  # noqa: F811
-        await _refused(app, "model_save", {"id": "m4", "endpoint": "no-such", "model": "x"})
+        await _refused(app, "model_manage", {"action": "model_save", "id": "m4", "endpoint": "no-such", "model": "x"})
         # 有专岗在用：同网页一句话，当场拒、不写票
-        await _refused(app, "model_delete", {"id": "m2"}, "专岗")
-        await _refused(app, "model_save", {"id": "m4", "endpoint": "default", "model": "x", "api_key": "k"}, "密钥")
+        await _refused(app, "model_manage", {"action": "model_delete", "id": "m2"}, "专岗")
+        await _refused(app, "model_manage", {"action": "model_save", "id": "m4", "endpoint": "default", "model": "x", "api_key": "k"}, "密钥")
 
     @pytest.mark.asyncio
     async def test_list_models_no_secrets(self, app) -> None:  # noqa: F811
-        r = await _direct(app, "list_models", {})
+        r = await _direct(app, "model_manage", {"action": "list", })
         assert "default" in r.output and "m1" in r.output
         assert "test-key" not in r.output and "test-key" not in str(r.data)
         assert "已填" in r.output  # 只说密钥填没填
@@ -545,12 +548,12 @@ async def test_env_overview_mentions_new_abilities(app) -> None:  # noqa: F811
     r = await _call(app, "env_overview", {})
     assert r.ok, r.error
     assert "MCP" in r.output and "专岗" in r.output and "端点" in r.output
-    for bad in ("mcp_add", "endpoint_save", "agent_update"):
+    for bad in ("mcp_manage", "model_manage", "agent_manage"):
         assert bad not in r.output
 
 
 def test_admin_prompt_knows_new_tools(app) -> None:  # noqa: F811
     p = AdminChat(app)._system_prompt({"group_id": ""})
-    for name in ("mcp_add", "mcp_update", "agent_update", "endpoint_save", "model_save"):
+    for name in ("mcp_manage", "agent_manage", "model_manage"):
         assert name in p, name
     assert "不要在对话里发密钥" in p

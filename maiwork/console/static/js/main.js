@@ -4,7 +4,7 @@ import { toast } from "./util.js";
 import { api, grp, gview } from "./api.js";
 import { loadTask } from "./detail.js";
 import { loadGA } from "./settings/index.js";
-import { loadExt, parseMcpConfig, readHeaders, readRoles } from "./settings/ext.js";
+import { confirmExecTools, execConfirmNeeded, loadExt, parseMcpConfig, readHeaders, readRoles } from "./settings/ext.js";
 import { loadRules, readRules } from "./settings/rules.js";
 import { loadUsage } from "./settings/usage.js";
 import { loadIdentity } from "./settings/identity.js";
@@ -236,12 +236,22 @@ document.addEventListener("submit", async (e) => {
       if (!text.trim()) return fail("内容不能为空。");
       if (new Blob([text]).size > 40000) return fail("内容过长，最多 40KB。");
       body = { name, description: $("k-desc").value.trim(), roles, body: text };
+      // 要用的工具（allowed-tools）：表单里有清单才提交；没有就不带，服务端保持原样
+      if ($("k-tools")) body.allowed_tools = [...document.querySelectorAll("#k-tools input:checked")].map((x) => x.value);
     }
     btn.disabled = true;
     try {
       const kindPath = isMcp ? "mcp" : "skills";
-      if (f.dataset.name) await api("PUT", `/api/extensions/${kindPath}/${encodeURIComponent(f.dataset.name)}`, body);
-      else await api("POST", `/api/extensions/${kindPath}`, body);
+      const send = (b) => (f.dataset.name
+        ? api("PUT", `/api/extensions/${kindPath}/${encodeURIComponent(f.dataset.name)}`, b)
+        : api("POST", `/api/extensions/${kindPath}`, b));
+      try {
+        await send(body);
+      } catch (ex) {
+        // 带执行类工具：服务端要求确认，确认后带 confirm_exec 重试
+        if (isMcp || !execConfirmNeeded(ex) || !confirmExecTools(ex)) throw ex;
+        await send({ ...body, confirm_exec: true });
+      }
       state.extEdit = null;
       await Promise.all([loadExt(), loadSettings()]);
       repaintSheet();

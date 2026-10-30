@@ -207,4 +207,8 @@ def register_machine_tools(
             name=name, description=desc,
             parameters={"type": "object", "properties": props, "required": required},
             roles=frozenset({"worker"}), handler=handler, timeout_s=timeout,
+            # put/fetch 要用本机工作区读写；四个都只在派活回合有意义（机器按任务分）
+            needs_workspace=name in ("machine_put_file", "machine_fetch_file"),
+            exec_class=True,
+            task_only=True,
         ))

@@ -215,7 +215,7 @@ class TestPreconditions:
     async def test_admin_tool_returns_accurate_reason(self, env: Env) -> None:
         """管理员对话工具 run_news_now 也要回准确原因，不是「已经让它备料了」。"""
         ctx = ToolContext(group_id=G1, actor="bot 管理员", role="admin")
-        out = await env.app.tools.call("run_news_now", {"group_id": G1}, ctx)
+        out = await env.app.tools.call("news_manage", {"action": "run_now", "group_id": G1}, ctx)
         assert not out.ok
         assert "画像" in out.error or "熟悉" in out.error, out.error
 

@@ -133,6 +133,9 @@ class MaiWorkApp:
         # 派活判断兜底（quick_judge.QuickJudge；由 _make_intake 建，停机时收）
         self.quick_judge: Any = None
         self.console: Any = None  # console.server.ConsoleServer
+        # 社交平台安装任务簿（platform_id -> asyncio.Task；网页路由和管理员工具共用，
+        # 停机/停用都从这里取消）
+        self._social_installs: dict[str, asyncio.Task] = {}
         # 管理员对话（tools_admin.PendingGate / admin_chat.AdminChat）
         self.admin_pending: Any = None
         self.admin_chat: Any = None
@@ -947,7 +950,48 @@ class MaiWorkApp:
         self._task = asyncio.create_task(self._loop(), name="maiwork-loop")
         logger.info("MaiWork 已启动：%d 个服务群，数据目录 %s", len(settings.groups), settings.data_dir)
 
+    def start_social_install(self, platform_id: str) -> None:
+        """后台装一个社交平台（幂等；网页 enable/install 和 social_toggle 共用）。"""
+        task = self._social_installs.get(platform_id)
+        if task is not None and not task.done():
+            return
+
+        async def install() -> None:
+            from . import social_platforms
+            try:
+                await social_platforms.install_platform(self.store, platform_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # 不记底层异常原文：可能带凭据
+                logger.warning("社交平台 %s 安装失败", platform_id)
+            finally:
+                if self._social_installs.get(platform_id) is asyncio.current_task():
+                    self._social_installs.pop(platform_id, None)
+
+        self._social_installs[platform_id] = asyncio.create_task(install())
+
+    async def cancel_social_install(self, platform_id: str) -> None:
+        """取消某平台在跑的安装任务（disable 时调；没跑也安全）。"""
+        task = self._social_installs.pop(platform_id, None)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _cleanup_social_installs(self) -> None:
+        tasks = list(self._social_installs.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._social_installs.clear()
+
+    def social_install_running(self, platform_id: str) -> bool:
+        task = self._social_installs.get(platform_id)
+        return bool(task is not None and not task.done())
+
     async def stop(self) -> None:
+        await self._cleanup_social_installs()
         await self._stop_stack()
         self._settings = None
         self._effective_cache = None
@@ -1768,7 +1812,11 @@ class MaiWorkApp:
         try:
             from .specialists import Specialists
 
-            return Specialists(agents, self.workers, self.skills)
+            return Specialists(
+                agents, self.workers, self.skills,
+                env=self.env,      # 自动回合要工作区时开单独的（LocalEnv.ephemeral）；没有也照常
+                tools=self.tools,  # 做法 allowed-tools 的注册/特性查询
+            )
         except Exception:
             logger.info("专岗 Specialists 还没就位（模块未提供或构造出错），专岗功能这次跳过")
             return None

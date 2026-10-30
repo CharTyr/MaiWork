@@ -115,11 +115,43 @@ def _safe_skill_dir(root: Path, name: str) -> Path:
     return root / n
 
 
-def _render(name: str, description: str, roles: list[str], body: str) -> str:
-    """front matter + 正文。description 单行化；roles 逗号分隔（解析端两种写法都认）。"""
+def _normalize_allowed_tools(raw: Any) -> list[str]:
+    """allowed_tools 入参 → 工具名列表（去重保序）。
+
+    列表每项一个名；也收空格分隔字符串（和 Agent Skills 规范写法一致）。
+    名字不在这里校验注册与否——认不出的原样保留，由岗位工具计算标出。
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        items = raw.split()
+    elif isinstance(raw, (list, tuple)):
+        items = [str(x).strip() for x in raw]
+    else:
+        raise ValueError("allowed_tools 要是工具名列表（或空格分隔的字符串）")
+    out: list[str] = []
+    for item in items:
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
+# 公开版（exec_grants 等模块外调用走这个）
+normalize_allowed_tools = _normalize_allowed_tools
+
+
+def _render(name: str, description: str, roles: list[str], body: str,
+            allowed_tools: list[str] | None = None) -> str:
+    """front matter + 正文。description 单行化；roles 逗号分隔（解析端两种写法都认）。
+
+    allowed_tools 非空时写 `allowed-tools: <空格分隔>`（Agent Skills 规范字段）；
+    空就不写这行——老 skill 没声明 = 不带工具。"""
     desc = " ".join(str(description or "").split())
     roles_s = ", ".join(roles) if roles else "worker"
-    text = f"---\nname: {name}\ndescription: {desc}\nroles: {roles_s}\n---\n\n{body}"
+    tools_line = ""
+    if allowed_tools:
+        tools_line = "allowed-tools: " + " ".join(str(t) for t in allowed_tools) + "\n"
+    text = f"---\nname: {name}\ndescription: {desc}\nroles: {roles_s}\n{tools_line}---\n\n{body}"
     if not text.endswith("\n"):
         text += "\n"
     return text
@@ -175,6 +207,7 @@ def _stat_item(
         "enabled": bool(status.get("enabled", True)),
         "manual_enabled": bool(status.get("manual_enabled", True)),
         "disabled_reason": str(status.get("disabled_reason") or ""),
+        "allowed_tools": list(front.get("allowed_tools") or []),
     }
 
 
@@ -305,9 +338,15 @@ def create(data_dir: Path | str, store: Any, body: dict[str, Any]) -> dict[str, 
     description = str((body or {}).get("description") or "").strip()
     roles = _normalize_input_roles((body or {}).get("roles"), problems)
     text_body = str((body or {}).get("body") or "")
+    try:
+        allowed_tools = _normalize_allowed_tools((body or {}).get("allowed_tools"))
+    except ValueError as e:
+        problems.append(str(e))
+        allowed_tools = []
     if problems:
         raise ValueError("；".join(problems))
-    text = _render(name, description, roles if roles is not None else ["worker"], text_body)
+    text = _render(name, description, roles if roles is not None else ["worker"], text_body,
+                   allowed_tools=allowed_tools)
     _check_size(text)
     if _builtin_dir(name) is not None:
         raise FileExistsError(f"「{name}」是内置 skill 的名字，换一个")
@@ -354,9 +393,17 @@ def update(data_dir: Path | str, store: Any, name: str, body: dict[str, Any]) ->
         text_body = str((body or {}).get("body") or "")
     else:
         text_body = str(current.get("body") or "")
+    if (body or {}).get("allowed_tools") is not None:
+        try:
+            allowed_tools = _normalize_allowed_tools((body or {}).get("allowed_tools"))
+        except ValueError as e:
+            problems.append(str(e))
+            allowed_tools = [str(t) for t in (current.get("allowed_tools") or [])]
+    else:
+        allowed_tools = [str(t) for t in (current.get("allowed_tools") or [])]
     if problems:
         raise ValueError("；".join(problems))
-    text = _render(name, description, roles, text_body)
+    text = _render(name, description, roles, text_body, allowed_tools=allowed_tools)
     _check_size(text)
     _write_skill_md(skill_dir, text)
     logger.info("网页修改 skill %s", name)

@@ -116,7 +116,7 @@ async def test_round_skips_nonserved_and_model_only(svc, goal_id):
 ])
 async def test_criteria_changes_preserve_other_evidence(svc, goal_id, action, args, expected):
     before = seed_evidence(svc, goal_id)
-    result = await svc.tools.call("goal_adjust", {"goal_id": goal_id, "action": action, **args}, _ctx())
+    result = await svc.tools.call("goal_manage", {"goal_id": goal_id, "action": action, **args}, _ctx())
     assert result.ok, result.error
     after = criteria(svc, goal_id)
     if expected == "add":
@@ -133,7 +133,7 @@ async def test_criteria_changes_preserve_other_evidence(svc, goal_id, action, ar
 @pytest.mark.parametrize("index", [-1, 100, "bad"])
 async def test_criteria_invalid_index_does_not_change_evidence(svc, goal_id, index):
     before = seed_evidence(svc, goal_id)
-    result = await svc.tools.call("goal_adjust", {"goal_id": goal_id, "action": "edit_criterion", "index": index, "text": "修改"}, _ctx())
+    result = await svc.tools.call("goal_manage", {"goal_id": goal_id, "action": "edit_criterion", "index": index, "text": "修改"}, _ctx())
     assert not result.ok
     assert criteria(svc, goal_id) == before
 
@@ -144,11 +144,11 @@ async def test_state_change_waits_for_registered_confirmation(svc, goal_id, acti
     if initial == "paused":
         svc.goals._set_state(goal_id, initial)
     _bind_chat(svc)
-    result = await svc.tools.call("goal_adjust", {"goal_id": goal_id, "action": action}, _ctx())
+    result = await svc.tools.call("goal_manage", {"goal_id": goal_id, "action": action}, _ctx())
     assert result.ok and result.data.get("needs_confirm")
     assert svc.goals.get(goal_id)["state"] == initial
     pending = svc.admin_pending.pending()
-    assert len(pending) == 1 and pending[0]["tool"] == "goal_adjust"
+    assert len(pending) == 1 and pending[0]["tool"] == "goal_manage"
     confirmed = await svc.admin_pending.execute(result.data["pending_id"], True)
     assert confirmed.ok, confirmed.error
     assert svc.goals.get(goal_id)["state"] == target
@@ -158,7 +158,7 @@ async def test_state_change_waits_for_registered_confirmation(svc, goal_id, acti
 @pytest.mark.asyncio
 async def test_rejected_cancel_keeps_goal_active(svc, goal_id):
     _bind_chat(svc)
-    result = await svc.tools.call("goal_adjust", {"goal_id": goal_id, "action": "cancel"}, _ctx())
+    result = await svc.tools.call("goal_manage", {"goal_id": goal_id, "action": "cancel"}, _ctx())
     assert result.ok and result.data.get("needs_confirm")
     assert (await svc.admin_pending.execute(result.data["pending_id"], False)).ok
     assert svc.goals.get(goal_id)["state"] == "active"
@@ -169,7 +169,7 @@ async def test_rejected_cancel_keeps_goal_active(svc, goal_id):
 async def test_interval_saved_in_kv_and_reused_in_check(svc, goal_id, hours, monkeypatch):
     now = clock.now()
     monkeypatch.setattr(clock, "now", lambda: now)
-    result = await svc.tools.call("goal_adjust", {"goal_id": goal_id, "action": "set_interval", "hours": hours}, _ctx())
+    result = await svc.tools.call("goal_manage", {"goal_id": goal_id, "action": "set_interval", "hours": hours}, _ctx())
     assert result.ok, result.error
     assert svc.store.kv_get(f"goal.check_interval.{goal_id}") == hours
     assert svc.goals.get(goal_id)["next_check_ts"] == now + hours * 3600
@@ -183,7 +183,7 @@ async def test_interval_saved_in_kv_and_reused_in_check(svc, goal_id, hours, mon
 @pytest.mark.parametrize("hours", [0, -1, 73, 720, "bad", float("inf"), float("nan"), True])
 async def test_invalid_interval_never_persisted(svc, goal_id, hours):
     before = svc.goals.get(goal_id)["next_check_ts"]
-    result = await svc.tools.call("goal_adjust", {"goal_id": goal_id, "action": "set_interval", "hours": hours}, _ctx())
+    result = await svc.tools.call("goal_manage", {"goal_id": goal_id, "action": "set_interval", "hours": hours}, _ctx())
     assert not result.ok
     assert svc.store.kv_get(f"goal.check_interval.{goal_id}") is None
     assert svc.goals.get(goal_id)["next_check_ts"] == before
@@ -192,7 +192,7 @@ async def test_invalid_interval_never_persisted(svc, goal_id, hours):
 @pytest.mark.asyncio
 async def test_goal_context_saved_and_injected_into_check_prompt(svc, goal_id):
     for action, key, value in [("set_url", "url", "https://example.test/releases"), ("set_guidance", "guidance", "只核实正式发布，忽略预览版")]:
-        result = await svc.tools.call("goal_adjust", {"goal_id": goal_id, "action": action, key: value}, _ctx())
+        result = await svc.tools.call("goal_manage", {"goal_id": goal_id, "action": action, key: value}, _ctx())
         assert result.ok, result.error
     context = svc.store.kv_get(f"goal.context.{goal_id}")
     assert context == {"url": "https://example.test/releases", "guidance": "只核实正式发布，忽略预览版"}
@@ -215,6 +215,6 @@ async def test_goal_context_saved_and_injected_into_check_prompt(svc, goal_id):
     ("set_guidance", "guidance", "a" * 4001),
 ])
 async def test_context_rejects_nonstring_and_oversized_values(svc, goal_id, action, key, value):
-    result = await svc.tools.call("goal_adjust", {"goal_id": goal_id, "action": action, key: value}, _ctx())
+    result = await svc.tools.call("goal_manage", {"goal_id": goal_id, "action": action, key: value}, _ctx())
     assert not result.ok
     assert svc.store.kv_get(f"goal.context.{goal_id}") is None

@@ -11,6 +11,7 @@ import hashlib
 import inspect
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -174,6 +175,10 @@ class ConsoleServer:
         return True
 
     async def _cleanup_social_installs(self, app: web.Application | None = None) -> None:
+        cleanup = getattr(self._svc, "_cleanup_social_installs", None)
+        if callable(cleanup):
+            await cleanup()
+            return
         tasks = list(self._social_installs.values())
         for task in tasks:
             task.cancel()
@@ -181,7 +186,28 @@ class ConsoleServer:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._social_installs.clear()
 
+    async def _cancel_social_install(self, platform_id: str) -> None:
+        cancel = getattr(self._svc, "cancel_social_install", None)
+        if callable(cancel):
+            await cancel(platform_id)
+            return
+        task = self._social_installs.pop(platform_id, None)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    def _social_install_running(self, platform_id: str) -> bool:
+        running = getattr(self._svc, "social_install_running", None)
+        if callable(running):
+            return bool(running(platform_id))
+        task = self._social_installs.get(platform_id)
+        return bool(task is not None and not task.done())
+
     def _start_social_install(self, platform_id: str) -> None:
+        start = getattr(self._svc, "start_social_install", None)
+        if callable(start):
+            start(platform_id)
+            return
         task = self._social_installs.get(platform_id)
         if task is not None and not task.done():
             return
@@ -489,8 +515,7 @@ class ConsoleServer:
         def social_row(pid: str) -> dict:
             from .. import social_platforms
             row = next(row for row in social_platforms.list_platforms(svc.store) if row["id"] == pid)
-            task = self._social_installs.get(pid)
-            row["installing"] = bool(task is not None and not task.done()) or bool(row.get("installing"))
+            row["installing"] = self._social_install_running(pid) or bool(row.get("installing"))
             return row
 
         @get("/api/social/platforms")
@@ -528,10 +553,7 @@ class ConsoleServer:
                         self._start_social_install(pid)
                     return web.json_response({"ok": True, "platform": social_row(pid)})
                 if action == "disable":
-                    task = self._social_installs.get(pid)
-                    if task is not None:
-                        task.cancel()
-                        await asyncio.gather(task, return_exceptions=True)
+                    await self._cancel_social_install(pid)
                     social_platforms.disable_platform(svc.store, pid)
                     return web.json_response({"ok": True, "platform": social_row(pid)})
                 if action == "install":
@@ -3154,7 +3176,16 @@ class ConsoleServer:
             if body is None:
                 return _err(400, "请求体不是 JSON")
             from .. import skills_web
+            from .. import settings_ops as _ops
 
+            # 做法带执行类工具 → 要 confirm_exec 才写（管理员工具的小票在网页上是这个参数）
+            grants = _ops.exec_grants(
+                svc, skill_name=str(body.get("name") or ""),
+                new_allowed=body.get("allowed_tools"),
+            ) if body.get("allowed_tools") is not None else []
+            if grants and not body.get("confirm_exec"):
+                return _err(400, f"这份做法带执行类工具（{'、'.join(grants)}），"
+                                 "挂上调研岗后它就能用；确认后带 confirm_exec=true 重试")
             try:
                 view = skills_web.create(svc.get_settings().data_dir, svc.store, body)
             except ValueError as e:
@@ -3171,8 +3202,15 @@ class ConsoleServer:
             if body is None:
                 return _err(400, "请求体不是 JSON")
             from .. import skills_web
+            from .. import settings_ops as _ops
 
             name = str(request.match_info["name"])
+            grants = _ops.exec_grants(
+                svc, skill_name=name, new_allowed=body.get("allowed_tools"),
+            ) if body.get("allowed_tools") is not None else []
+            if grants and not body.get("confirm_exec"):
+                return _err(400, f"这份做法带执行类工具（{'、'.join(grants)}），"
+                                 "挂上调研岗后它就能用；确认后带 confirm_exec=true 重试")
             try:
                 view = skills_web.update(svc.get_settings().data_dir, svc.store, name, body)
             except KeyError:
@@ -3264,6 +3302,33 @@ class ConsoleServer:
             if not body_bytes:
                 return _err(400, "请求体不是 zip（Content-Type: application/zip 或 multipart 字段 file）")
             replace = str(request.query.get("replace") or "").strip() in ("1", "true", "yes")
+            confirm_exec = str(request.query.get("confirm_exec") or "").strip() in ("1", "true", "yes")
+            if not confirm_exec:
+                # 装前看一遍包里声明的工具：带执行类工具要 confirm_exec=1 才装
+                try:
+                    import io as _io
+                    import zipfile as _zf
+
+                    from ..skills import parse_front_matter
+
+                    declared: list[str] = []
+                    with _zf.ZipFile(_io.BytesIO(body_bytes)) as zf:
+                        for n in zf.namelist():
+                            if n.rstrip("/").endswith("SKILL.md"):
+                                fm = parse_front_matter(zf.read(n).decode("utf-8", "replace")) or {}
+                                declared = [str(t) for t in (fm.get("allowed_tools") or [])]
+                                break
+                    tools = getattr(svc, "tools", None)
+                    exec_names = [
+                        t for t in declared
+                        if (tr := (tools.traits(t) if tools is not None else None)) is not None
+                        and tr.get("exec_class") and "worker" in (tr.get("roles") or ())
+                    ]
+                except Exception:
+                    exec_names = []
+                if exec_names:
+                    return _err(400, f"这份做法带执行类工具（{'、'.join(exec_names)}），"
+                                     "挂上调研岗后它就能用；确认后加 ?confirm_exec=1 重传")
             try:
                 view = skills_web.install_zip(
                     svc.store, svc.get_settings().data_dir, body_bytes,
@@ -4486,7 +4551,39 @@ class ConsoleServer:
             mod, not_ready = _agents_ready()
             if not_ready is not None:
                 return not_ready
-            return web.json_response({"profiles": mod.profiles()})
+            profiles = mod.profiles()
+            # admin 认知修正：岗位实际能用什么工具读同一份事实（describe_tools）
+            sp = getattr(svc, "specialists", None)
+            if sp is not None:
+                for p in profiles:
+                    try:
+                        p["tools_view"] = sp.describe_tools(str(p.get("kind") or ""))
+                    except Exception:
+                        logger.exception("算岗位 %s 工具视图出错", p.get("kind"))
+            # 派活页可挑的子 agent 工具清单（注册给 worker、不含 submit_result）
+            worker_tool_choices: list[dict[str, Any]] = []
+            tools = getattr(svc, "tools", None)
+            if tools is not None:
+                try:
+                    for spec in (tools.specs("worker") or []):
+                        fn = spec.get("function") if isinstance(spec, dict) else None
+                        name = str((fn or {}).get("name") or "")
+                        if not name or name == "submit_result":
+                            continue
+                        tr = tools.traits(name) or {}
+                        desc = str((fn or {}).get("description") or "")
+                        label = re.split(r"[，。；\n]", desc, maxsplit=1)[0].strip() or name
+                        worker_tool_choices.append({
+                            "name": name, "label": label,
+                            "needs_workspace": bool(tr.get("needs_workspace")),
+                            "exec_class": bool(tr.get("exec_class")),
+                            "task_only": bool(tr.get("task_only")),
+                        })
+                    worker_tool_choices.sort(key=lambda x: x["name"])
+                except Exception:
+                    logger.exception("列子 agent 工具候选出错")
+            return web.json_response(
+                {"profiles": profiles, "worker_tool_choices": worker_tool_choices})
 
         async def _agents_profile_put(request: web.Request) -> web.Response:
             forbid = self._require_admin(request)
@@ -4498,8 +4595,24 @@ class ConsoleServer:
             body = await _json_body(request)
             if body is None:
                 return _err(400, "请求体不是 JSON")
+            kind = str(request.match_info["kind"])
+            # 调研岗换挂做法：新挂上来的做法带执行类工具 → 要 confirm_exec（与 agent_manage 的 update 同判定）
+            if isinstance(body.get("skills"), list):
+                try:
+                    old = set(mod.profile(kind).get("skills") or [])
+                except Exception:
+                    old = set()
+                added = [s for s in body["skills"] if str(s) not in old]
+                if added:
+                    from .. import settings_ops as _ops
+
+                    grants = _ops.exec_grants(svc, kind=kind, add_skills=added)
+                    if grants and not body.get("confirm_exec"):
+                        return _err(400, f"新挂的做法带执行类工具（{'、'.join(grants)}），"
+                                         "挂上后这个岗就能用；确认后带 confirm_exec=true 重试")
+            body = {k: v for k, v in body.items() if k != "confirm_exec"}  # 门参数不下传
             try:
-                profile = mod.update_profile(str(request.match_info["kind"]), body)
+                profile = mod.update_profile(kind, body)
             except ValueError as e:
                 return _err(400, str(e) or "这个值改不了")
             except Exception:

@@ -155,7 +155,7 @@ class TestRolesAndGuards:
     async def test_specs_only_admin(self, svc: _Svc) -> None:
         admin_specs = {s["function"]["name"] for s in svc.tools.specs("admin")}
         assert "list_groups" in admin_specs
-        assert "send_group_message" in admin_specs
+        assert "group_deliver" in admin_specs
         worker_specs = {s["function"]["name"] for s in svc.tools.specs("worker")}
         main_specs = {s["function"]["name"] for s in svc.tools.specs("main")}
         assert not (admin_specs & worker_specs)
@@ -186,9 +186,9 @@ class TestRolesAndGuards:
         for tool, args in (
             ("group_overview", {"group_id": "99999"}),
             ("read_chat", {"group_id": "99999"}),
-            ("profile_edit", {"group_id": "99999", "action": "add", "category": "recent", "text": "x"}),
-            ("send_group_message", {"group_id": "99999", "text": "hi"}),
-            ("create_task", {"group_id": "99999", "title": "t", "request": "r"}),
+            ("profile_manage", {"group_id": "99999", "action": "add", "category": "recent", "text": "x"}),
+            ("group_deliver", {"action": "message", "group_id": "99999", "text": "hi"}),
+            ("task_manage", {"action": "create", "group_id": "99999", "title": "t", "request": "r"}),
         ):
             r = await svc.tools.call(tool, args, _ctx())
             assert not r.ok, tool
@@ -235,7 +235,7 @@ class TestReadTools:
             G1, kind="task", title="做个东西", quote="要个东西", via="消息",
             requester_id="20002", requester_name="群友甲",
         )
-        r = await svc.tools.call("list_requests", {"status": "pending"}, _ctx())
+        r = await svc.tools.call("request_manage", {"action": "list", "status": "pending"}, _ctx())
         assert r.ok
         assert "做个东西" in r.output
         assert isinstance(r.data, list) and r.data[0]["title"] == "做个东西"
@@ -251,7 +251,7 @@ class TestReadTools:
         )
         with svc.store.tx() as conn:
             members.record(conn, G1, "20002", "群友甲改名了", 1e10)
-        r = await svc.tools.call("list_requests", {"status": "pending"}, _ctx())
+        r = await svc.tools.call("request_manage", {"action": "list", "status": "pending"}, _ctx())
         assert r.ok
         assert "群友甲改名了" in r.output
         assert "群友甲，" not in r.output and "群友甲）" not in r.output
@@ -269,7 +269,7 @@ class TestReadTools:
         svc.profiles.add_entry(G1, "ongoing", "在弄 {@20002} 的板子")
         with svc.store.tx() as conn:
             members.record(conn, G1, "20002", "蓝莓山竹", 1e10)
-        r = await svc.tools.call("read_profile", {"group_id": G1}, _ctx())
+        r = await svc.tools.call("profile_manage", {"action": "read", "group_id": G1}, _ctx())
         assert r.ok, r.error
         assert "在弄 蓝莓山竹 的板子" in r.output
         assert "{@" not in r.output and "20002" not in r.output
@@ -278,14 +278,14 @@ class TestReadTools:
     @pytest.mark.asyncio
     async def test_get_rules_and_identity(self, svc: _Svc) -> None:
         """0.8.0：get_rules 只列仍归全局的项，每群那几项给「到群页改」的说明。"""
-        r = await svc.tools.call("get_rules", {}, _ctx())
+        r = await svc.tools.call("rules_manage", {"action": "get", }, _ctx())
         assert r.ok
         assert "topics.min_gap_hours=3" in r.output     # 仍归全局的照列
         assert "push_per_day" not in r.output           # 归每群管的不再当全局值列出来
         assert "per_day" not in r.output
         assert "approval.admins" not in r.output
         assert "每个群自己的页面" in r.output
-        r2 = await svc.tools.call("get_identity", {}, _ctx())
+        r2 = await svc.tools.call("identity_manage", {"action": "get", }, _ctx())
         assert r2.ok  # identity 没建 → 中文兜底，不炸
 
 
@@ -306,28 +306,28 @@ class TestWriteTools:
     async def test_profile_edit_add_and_lock(self, svc: _Svc) -> None:
         self._wire_profiles(svc)
         r = await svc.tools.call(
-            "profile_edit", {"group_id": G1, "action": "add", "category": "interest", "text": "喜欢折腾小工具"}, _ctx()
+            "profile_manage", {"group_id": G1, "action": "add", "category": "interest", "text": "喜欢折腾小工具"}, _ctx()
         )
         assert r.ok, r.error
         entries = svc.profiles.entries(G1)
         assert any(e["text"] == "喜欢折腾小工具" for e in entries)
         eid = int(r.data["id"])
-        r2 = await svc.tools.call("profile_edit", {"group_id": G1, "action": "unlock", "entry_id": eid}, _ctx())
+        r2 = await svc.tools.call("profile_manage", {"group_id": G1, "action": "unlock", "entry_id": eid}, _ctx())
         assert r2.ok
         e = [x for x in svc.profiles.entries(G1) if x["id"] == eid][0]
         assert int(e["locked"]) == 0
         # 别的群的条目不许动
-        r3 = await svc.tools.call("profile_edit", {"group_id": G2, "action": "delete", "entry_id": eid}, _ctx())
+        r3 = await svc.tools.call("profile_manage", {"group_id": G2, "action": "delete", "entry_id": eid}, _ctx())
         assert not r3.ok
 
     @pytest.mark.asyncio
     async def test_block_domain(self, svc: _Svc) -> None:
         from CharTyr_MaiWork.maiwork import feeds as _feeds
 
-        r = await svc.tools.call("block_domain", {"domain": "Bad-Site.COM", "blocked": True}, _ctx())
+        r = await svc.tools.call("source_manage", {"action": "block_domain", "domain": "Bad-Site.COM", "blocked": True}, _ctx())
         assert r.ok, r.error
         assert "bad-site.com" in _feeds.blocked_domains(svc.store, G1)
-        r2 = await svc.tools.call("block_domain", {"domain": "bad-site.com", "blocked": False}, _ctx())
+        r2 = await svc.tools.call("source_manage", {"action": "block_domain", "domain": "bad-site.com", "blocked": False}, _ctx())
         assert r2.ok
         assert "bad-site.com" not in _feeds.blocked_domains(svc.store, G1)
         # 另一个群不受影响
@@ -336,7 +336,7 @@ class TestWriteTools:
     @pytest.mark.asyncio
     async def test_set_rules_apply(self, svc: _Svc) -> None:
         # 仍归全局、不涉及放宽的字段直接生效（默认 12 → 20）
-        r = await svc.tools.call("set_rules", {"patch": {"topics": {"candidate_ttl_hours": 20}}}, _ctx())
+        r = await svc.tools.call("rules_manage", {"action": "set", "patch": {"topics": {"candidate_ttl_hours": 20}}}, _ctx())
         assert r.ok, r.error
         assert svc.get_settings().topics.candidate_ttl_hours == 20
         # 回执用中文名（管理员点开工具卡片能看到），不露「节.字段」
@@ -345,19 +345,19 @@ class TestWriteTools:
 
     @pytest.mark.asyncio
     async def test_set_rules_bad_value(self, svc: _Svc) -> None:
-        r = await svc.tools.call("set_rules", {"patch": {"topics": {"candidate_ttl_hours": 999}}}, _ctx())
+        r = await svc.tools.call("rules_manage", {"action": "set", "patch": {"topics": {"candidate_ttl_hours": 999}}}, _ctx())
         assert not r.ok
         assert r.error
 
     @pytest.mark.asyncio
     async def test_set_rules_needs_confirm_when_loosening_gap(self, svc: _Svc) -> None:
         """仍归全局的放宽项（开话题最小间隔缩短）要先写小票，同意前不写文件。"""
-        r = await svc.tools.call("set_rules", {"patch": {"topics": {"min_gap_hours": 2}}}, _ctx())
+        r = await svc.tools.call("rules_manage", {"action": "set", "patch": {"topics": {"min_gap_hours": 2}}}, _ctx())
         assert r.ok, r.error
         assert "已请求管理员确认" in r.output
         rows = _pending_rows(svc.store)
         assert len(rows) == 1
-        assert rows[0]["tool"] == "set_rules"
+        assert rows[0]["tool"] == "rules_manage"
         assert _config_field(svc, "topics", "min_gap_hours", 3) == 3  # 没同意前不写文件
 
     @pytest.mark.asyncio
@@ -369,13 +369,13 @@ class TestWriteTools:
         _bind_chat(svc, cid=900)
         try:
             r = await svc.tools.call(
-                "create_task", {"group_id": G1, "title": "整理一份周报", "request": "把这周群里聊的事整理成周报"}, _ctx()
+                "task_manage", {"action": "create", "group_id": G1, "title": "整理一份周报", "request": "把这周群里聊的事整理成周报"}, _ctx()
             )
             assert r.ok, r.error
             assert "已请求管理员确认" in r.output
             assert svc.tasks.list_view(G1) == [], "同意前不能建任务"
             rows = _pending_rows(svc.store)
-            assert len(rows) == 1 and rows[0]["tool"] == "create_task"
+            assert len(rows) == 1 and rows[0]["tool"] == "task_manage"
             assert "子 agent" in rows[0]["summary"] and G1 in rows[0]["summary"]
             done = await svc.admin_pending.execute(int(r.data["pending_id"]), True)
         finally:
@@ -397,15 +397,16 @@ class TestWriteTools:
         _bind_chat(svc, cid=901)
         try:
             r = await svc.tools.call(
-                "create_goal",
-                {"group_id": G1, "title": "盯着服务器状态", "criteria": ["每天能出一次状态摘要"], "check_hours": 12},
+                "goal_manage",
+                {"action": "create", "group_id": G1, "title": "盯着服务器状态",
+                 "criteria": ["每天能出一次状态摘要"], "check_hours": 12},
                 _ctx(),
             )
             assert r.ok, r.error
             assert "已请求管理员确认" in r.output
             assert svc.store.read().execute("SELECT COUNT(*) AS c FROM goals").fetchone()["c"] == 0
             rows = _pending_rows(svc.store)
-            assert len(rows) == 1 and rows[0]["tool"] == "create_goal"
+            assert len(rows) == 1 and rows[0]["tool"] == "goal_manage"
             assert G1 in rows[0]["summary"]
             done = await svc.admin_pending.execute(int(r.data["pending_id"]), True)
         finally:
@@ -424,7 +425,7 @@ class TestWriteTools:
         )
         rid = str(res["id"])
         # 批准群友派的活要写小票（M6：模型不能替管理员拍板）；点同意后才真批
-        r = await svc.tools.call("approve_request", {"request_id": rid}, _ctx())
+        r = await svc.tools.call("request_manage", {"action": "approve", "request_id": rid}, _ctx())
         assert r.ok, r.error
         assert "已请求管理员确认" in r.output
         pid = int(_pending_rows(svc.store)[0]["id"])
@@ -433,7 +434,7 @@ class TestWriteTools:
         row = svc.store.read().execute("SELECT status, task_id FROM requests WHERE id=?", (rid,)).fetchone()
         assert str(row["status"]) == "approved"
         assert row["task_id"]
-        r2 = await svc.tools.call("reject_request", {"request_id": "R-999", "reason": "不合适"}, _ctx())
+        r2 = await svc.tools.call("request_manage", {"action": "reject", "request_id": "R-999", "reason": "不合适"}, _ctx())
         assert not r2.ok
 
     @pytest.mark.asyncio
@@ -441,7 +442,7 @@ class TestWriteTools:
         tid = svc.tasks.create(
             G1, title="t", req="r", criteria=[], source="request", requester_id="1", requester_name="n", status="queued"
         )
-        r = await svc.tools.call("cancel_task", {"task_id": tid, "reason": "管理员说算了"}, _ctx())
+        r = await svc.tools.call("task_manage", {"action": "cancel", "task_id": tid, "reason": "管理员说算了"}, _ctx())
         assert r.ok, r.error
         assert svc.tasks.get(tid)["status"] == "cancelled"
 
@@ -456,14 +457,14 @@ class TestWriteTools:
                 return 1
 
         svc.feeds = _Feeds()
-        r = await svc.tools.call("run_news_now", {"group_id": G1}, _ctx())
+        r = await svc.tools.call("news_manage", {"action": "run_now", "group_id": G1}, _ctx())
         assert r.ok, r.error
         await asyncio.sleep(0.3)
         assert svc.feeds.calls == [G1]
 
     @pytest.mark.asyncio
     async def test_mcp_toggle_not_ready(self, svc: _Svc) -> None:
-        r = await svc.tools.call("mcp_toggle", {"name": "xxx", "enabled": False}, _ctx())
+        r = await svc.tools.call("mcp_manage", {"action": "toggle", "name": "xxx", "enabled": False}, _ctx())
         assert not r.ok
         assert r.error
 
@@ -495,7 +496,7 @@ class TestConfirmGate:
                 await asyncio.sleep(0.01)
             else:
                 await barrier.wait()
-            gate.queue("send_group_message", {"group_id": G1, "text": str(cid)})
+            gate.queue("group_deliver", {"action": "message", "group_id": G1, "text": str(cid)})
 
         await asyncio.gather(go(101), go(202))
         rows = _pending_rows(svc.store)
@@ -505,7 +506,7 @@ class TestConfirmGate:
     async def test_model_cannot_forge_approved_arg(self, svc: _Svc) -> None:
         """模型参数不可信：伪造 _approved=true 绝不能跳过管理员确认。"""
         r = await svc.tools.call(
-            "set_rules", {"patch": {"topics": {"min_gap_hours": 1}}, "_approved": True}, _ctx()
+            "rules_manage", {"action": "set", "patch": {"topics": {"min_gap_hours": 1}}, "_approved": True}, _ctx()
         )
         assert r.ok and "已请求管理员确认" in r.output
         assert _config_field(svc, "topics", "min_gap_hours", 3) == 3   # 规则没改
@@ -514,13 +515,13 @@ class TestConfirmGate:
     @pytest.mark.asyncio
     async def test_send_group_message_queued_not_sent(self, svc: _Svc) -> None:
         r = await svc.tools.call(
-            "send_group_message", {"group_id": G1, "text": "大家好，这是管理员让我说的一句话"}, _ctx()
+            "group_deliver", {"action": "message", "group_id": G1, "text": "大家好，这是管理员让我说的一句话"}, _ctx()
         )
         assert r.ok
         assert "已请求管理员确认" in r.output
         rows = _pending_rows(svc.store)
         assert len(rows) == 1
-        assert rows[0]["tool"] == "send_group_message"
+        assert rows[0]["tool"] == "group_deliver"
         assert rows[0]["status"] == "pending"
         args = json.loads(rows[0]["args"])
         assert args["group_id"] == G1
@@ -529,7 +530,7 @@ class TestConfirmGate:
 
     @pytest.mark.asyncio
     async def test_groupspace_write_queued(self, svc: _Svc) -> None:
-        r = await svc.tools.call("group_notice_send", {"group_id": G1, "content": "这周周报已整理"}, _ctx())
+        r = await svc.tools.call("group_deliver", {"action": "notice", "group_id": G1, "content": "这周周报已整理"}, _ctx())
         assert r.ok
         assert "已请求管理员确认" in r.output
 
@@ -538,7 +539,7 @@ class TestConfirmGate:
         from CharTyr_MaiWork.maiwork import rss as _rss
 
         _rss.add_feed(svc.store, G1, url="https://a.com/feed", title="A", feed_id="f1", now=clock.now())
-        r = await svc.tools.call("rss_remove", {"group_id": G1, "feed_id": "f1"}, _ctx())
+        r = await svc.tools.call("source_manage", {"action": "rss_remove", "group_id": G1, "feed_id": "f1"}, _ctx())
         assert r.ok
         assert "已请求管理员确认" in r.output
         assert any(f["id"] == "f1" for f in _rss.list_feeds(svc.store, G1))
@@ -546,7 +547,7 @@ class TestConfirmGate:
     @pytest.mark.asyncio
     async def test_profile_bulk_delete_needs_confirm(self, svc: _Svc) -> None:
         r = await svc.tools.call(
-            "profile_bulk_delete", {"group_id": G1, "entry_ids": [1, 2, 3, 4]}, _ctx()
+            "profile_manage", {"action": "bulk_delete", "group_id": G1, "entry_ids": [1, 2, 3, 4]}, _ctx()
         )
         assert r.ok
         assert "已请求管理员确认" in r.output
@@ -634,7 +635,7 @@ class TestH1SetRulesLoosen:
     async def test_retired_global_keys_rejected_with_group_hint(self, svc: _Svc, patch: dict) -> None:
         """退役的全局键（归每群管）从 set_rules 一律拒，并说清去群页——绝不静默假保存。"""
         before = _config_raw(svc)
-        r = await svc.tools.call("set_rules", {"patch": patch}, _ctx())
+        r = await svc.tools.call("rules_manage", {"action": "set", "patch": patch}, _ctx())
         assert not r.ok, patch
         assert "每个群" in r.error and "群" in r.error, (patch, r.error)
         assert _pending_rows(svc.store) == []      # 拒了就不该再记一张执行不了的小票
@@ -651,7 +652,7 @@ class TestH1SetRulesLoosen:
         for patch, want_ticket in cases:
             with svc.store.tx() as conn:
                 conn.execute("DELETE FROM admin_chat_pending")
-            r = await svc.tools.call("set_rules", {"patch": patch}, _ctx())
+            r = await svc.tools.call("rules_manage", {"action": "set", "patch": patch}, _ctx())
             assert r.ok, (patch, r.error)
             rows = _pending_rows(svc.store)
             if want_ticket:
@@ -664,7 +665,7 @@ class TestH1SetRulesLoosen:
     @pytest.mark.asyncio
     async def test_approved_ticket_applies(self, svc: _Svc) -> None:
         patch = {"topics": {"min_gap_hours": 2}}
-        r = await svc.tools.call("set_rules", {"patch": patch}, _ctx())
+        r = await svc.tools.call("rules_manage", {"action": "set", "patch": patch}, _ctx())
         assert r.ok
         pid = int(_pending_rows(svc.store)[0]["id"])
         assert _config_field(svc, "topics", "min_gap_hours", 3) == 3
@@ -675,7 +676,7 @@ class TestH1SetRulesLoosen:
     @pytest.mark.asyncio
     async def test_rejected_ticket_leaves_rules_untouched(self, svc: _Svc) -> None:
         patch = {"topics": {"min_gap_hours": 2}}
-        await svc.tools.call("set_rules", {"patch": patch}, _ctx())
+        await svc.tools.call("rules_manage", {"action": "set", "patch": patch}, _ctx())
         pid = int(_pending_rows(svc.store)[0]["id"])
         out = await svc.admin_pending.execute(pid, False)
         assert out.ok
@@ -698,7 +699,7 @@ class TestAutoReviewRulesConfirm:
 
     @pytest.mark.asyncio
     async def test_turn_off_auto_review_needs_no_ticket(self, svc: _Svc) -> None:
-        r = await svc.tools.call("set_rules", {"patch": {"approval": {"auto_review": False}}}, _ctx())
+        r = await svc.tools.call("rules_manage", {"action": "set", "patch": {"approval": {"auto_review": False}}}, _ctx())
         assert r.ok, r.error
         assert _pending_rows(svc.store) == []
         assert _config_field(svc, "approval", "auto_review") is False
@@ -706,11 +707,11 @@ class TestAutoReviewRulesConfirm:
     @pytest.mark.asyncio
     async def test_turn_on_auto_review_needs_ticket_with_chinese_label(self, svc: _Svc) -> None:
         self._settings_off(svc)
-        r = await svc.tools.call("set_rules", {"patch": {"approval": {"auto_review": True}}}, _ctx())
+        r = await svc.tools.call("rules_manage", {"action": "set", "patch": {"approval": {"auto_review": True}}}, _ctx())
         assert r.ok, r.error
         assert "已请求管理员确认" in r.output
         rows = _pending_rows(svc.store)
-        assert len(rows) == 1 and rows[0]["tool"] == "set_rules"
+        assert len(rows) == 1 and rows[0]["tool"] == "rules_manage"
         summary = rows[0]["summary"]
         assert "小型任务自动审批" in summary
         assert "approval.auto_review" not in summary
@@ -718,18 +719,18 @@ class TestAutoReviewRulesConfirm:
 
     @pytest.mark.asyncio
     async def test_raise_auto_review_daily_needs_ticket_with_chinese_label(self, svc: _Svc) -> None:
-        r = await svc.tools.call("set_rules", {"patch": {"approval": {"auto_review_daily": 8}}}, _ctx())
+        r = await svc.tools.call("rules_manage", {"action": "set", "patch": {"approval": {"auto_review_daily": 8}}}, _ctx())
         assert r.ok, r.error
         assert "已请求管理员确认" in r.output
         rows = _pending_rows(svc.store)
-        assert len(rows) == 1 and rows[0]["tool"] == "set_rules"
+        assert len(rows) == 1 and rows[0]["tool"] == "rules_manage"
         summary = rows[0]["summary"]
         assert "自动审批上限" in summary
         assert "approval.auto_review_daily" not in summary
 
     @pytest.mark.asyncio
     async def test_lower_auto_review_daily_needs_no_ticket(self, svc: _Svc) -> None:
-        r = await svc.tools.call("set_rules", {"patch": {"approval": {"auto_review_daily": 2}}}, _ctx())
+        r = await svc.tools.call("rules_manage", {"action": "set", "patch": {"approval": {"auto_review_daily": 2}}}, _ctx())
         assert r.ok, r.error
         assert _pending_rows(svc.store) == []
         assert _config_field(svc, "approval", "auto_review_daily") == 2
@@ -745,7 +746,7 @@ class TestM1SummaryListsAllFields:
     @pytest.mark.asyncio
     async def test_mixed_patch_summary_shows_every_field(self, svc: _Svc) -> None:
         patch = {"topics": {"min_gap_hours": 2}, "approval": {"auto_review_daily": 8}}
-        r = await svc.tools.call("set_rules", {"patch": patch}, _ctx())
+        r = await svc.tools.call("rules_manage", {"action": "set", "patch": patch}, _ctx())
         assert r.ok, r.error
         rows = _pending_rows(svc.store)
         assert len(rows) == 1
@@ -766,7 +767,7 @@ class TestM1SummaryListsAllFields:
             "jev": {"timeout_ms": 900},
             "environments": {"max_parallel": 4, "command_timeout_s": 300, "runtime_max_sec": 7200},
         }
-        r = await svc.tools.call("set_rules", {"patch": patch}, _ctx())
+        r = await svc.tools.call("rules_manage", {"action": "set", "patch": patch}, _ctx())
         assert r.ok, r.error
         summary = _pending_rows(svc.store)[0]["summary"]
         assert len(summary) <= 200
@@ -803,7 +804,7 @@ class TestM2ApprovalFingerprint:
         async def spawner(ctx_, args):
             async def bg():
                 r = await svc.tools.call(
-                    "send_group_message", {"group_id": G1, "text": "后台自己发的"}, ctx_
+                    "group_deliver", {"action": "message", "group_id": G1, "text": "后台自己发的"}, ctx_
                 )
                 seen["bg_out"] = r.output or r.error
 
@@ -821,7 +822,7 @@ class TestM2ApprovalFingerprint:
         await asyncio.sleep(0.1)
         assert "已请求管理员确认" in str(seen.get("bg_out"))
         assert svc.outbox.items == []  # 子任务那句没真发出去
-        new_tickets = [p for p in _pending_rows(svc.store) if p["tool"] == "send_group_message"]
+        new_tickets = [p for p in _pending_rows(svc.store) if p["tool"] == "group_deliver"]
         assert len(new_tickets) == 1
 
     @pytest.mark.asyncio
@@ -835,7 +836,7 @@ class TestM2ApprovalFingerprint:
 
         async def resend(ctx_, args):
             r = await svc.tools.call(
-                "send_group_message", {"group_id": G1, "text": "换了个内容"}, ctx_
+                "group_deliver", {"action": "message", "group_id": G1, "text": "换了个内容"}, ctx_
             )
             seen["out"] = r.output or r.error
             return ToolResult(ok=True, output="done")
@@ -856,7 +857,7 @@ class TestM2ApprovalFingerprint:
         """票里就是 send_group_message，handler 按同样参数再走一遍 _need_confirm → 放行。"""
         svc.outbox = _OutboxRec()
         _bind_chat(svc)
-        r = await svc.tools.call("send_group_message", {"group_id": G1, "text": "大家好"}, _ctx())
+        r = await svc.tools.call("group_deliver", {"action": "message", "group_id": G1, "text": "大家好"}, _ctx())
         assert r.ok and "已请求管理员确认" in r.output
         pid = int(_pending_rows(svc.store)[0]["id"])
         out = await svc.admin_pending.execute(pid, True)
@@ -869,7 +870,7 @@ class TestM2ApprovalFingerprint:
         """普通调用（不在任何 execute 窗口里）照旧写票。"""
         svc.outbox = _OutboxRec()
         _bind_chat(svc)
-        r = await svc.tools.call("send_group_message", {"group_id": G1, "text": "hi"}, _ctx())
+        r = await svc.tools.call("group_deliver", {"action": "message", "group_id": G1, "text": "hi"}, _ctx())
         assert "已请求管理员确认" in r.output
         assert svc.outbox.items == []
 
@@ -898,7 +899,7 @@ class TestM3AlbumUploadPath:
         outside = tmp_path / "secret.png"
         outside.write_bytes(b"x")
         r = await svc.tools.call(
-            "group_album_upload", {"group_id": G1, "path": str(outside), "album_id": "A1"}, _ctx()
+            "group_deliver", {"action": "album_upload", "group_id": G1, "path": str(outside), "album_id": "A1"}, _ctx()
         )
         assert not r.ok
         assert "工作区" in r.error
@@ -911,7 +912,7 @@ class TestM3AlbumUploadPath:
         root = Path(svc.get_settings().workspace_root)
         evil = str(root / "tinker" / ".." / ".." / "etc" / "passwd")
         r = await svc.tools.call(
-            "group_album_upload", {"group_id": G1, "path": evil, "album_id": "A1"}, _ctx()
+            "group_deliver", {"action": "album_upload", "group_id": G1, "path": evil, "album_id": "A1"}, _ctx()
         )
         assert not r.ok
         assert _pending_rows(svc.store) == []
@@ -927,7 +928,7 @@ class TestM3AlbumUploadPath:
         except OSError:
             pytest.skip("这个文件系统建不了符号链接")
         r = await svc.tools.call(
-            "group_album_upload", {"group_id": G1, "path": str(link), "album_id": "A1"}, _ctx()
+            "group_deliver", {"action": "album_upload", "group_id": G1, "path": str(link), "album_id": "A1"}, _ctx()
         )
         assert not r.ok
         assert "符号链接" in r.error
@@ -942,7 +943,7 @@ class TestM3AlbumUploadPath:
         f = other / "pic.png"
         f.write_bytes(b"x")
         r = await svc.tools.call(
-            "group_album_upload", {"group_id": G1, "path": str(f), "album_id": "A1"}, _ctx()
+            "group_deliver", {"action": "album_upload", "group_id": G1, "path": str(f), "album_id": "A1"}, _ctx()
         )
         assert not r.ok
         assert _pending_rows(svc.store) == []
@@ -951,7 +952,7 @@ class TestM3AlbumUploadPath:
     async def test_valid_path_writes_ticket_then_uploads(self, svc: _Svc) -> None:
         good = self._workspace_file(svc)
         r = await svc.tools.call(
-            "group_album_upload", {"group_id": G1, "path": str(good), "album_id": "A1"}, _ctx()
+            "group_deliver", {"action": "album_upload", "group_id": G1, "path": str(good), "album_id": "A1"}, _ctx()
         )
         assert r.ok, r.error
         assert "已请求管理员确认" in r.output
@@ -983,7 +984,7 @@ class TestM4MakeIdeaMutex:
     async def test_fallback_mutex_same_group(self, svc: _Svc) -> None:
         feeds = self._Feeds()
         svc.feeds = feeds
-        rs = [await svc.tools.call("make_idea_now", {"group_id": G1}, _ctx()) for _ in range(8)]
+        rs = [await svc.tools.call("idea_manage", {"action": "make_now", "group_id": G1}, _ctx()) for _ in range(8)]
         assert sum(bool(r.ok) for r in rs) == 1  # 只有第一个起得来
         assert sum("已经在想" in (r.error or "") for r in rs if not r.ok) == 7
         await asyncio.sleep(0.4)
@@ -1000,7 +1001,7 @@ class TestM4MakeIdeaMutex:
 
         svc.make_idea_now = make_idea_now
         svc.feeds = self._Feeds()
-        r = await svc.tools.call("make_idea_now", {"group_id": G1}, _ctx())
+        r = await svc.tools.call("idea_manage", {"action": "make_now", "group_id": G1}, _ctx())
         assert not r.ok
         assert "已经在想" in (r.error or "")
         assert calls == [G1]
@@ -1096,7 +1097,7 @@ class TestM5FocusGroupTicketArgs:
     async def test_focus_group_filled_into_ticket_args(self, svc: _Svc) -> None:
         svc.outbox = _OutboxRec()
         _bind_chat(svc, cid=7, gid=G1)
-        r = await svc.tools.call("send_group_message", {"text": "没给群号的一句"}, _ctx())
+        r = await svc.tools.call("group_deliver", {"action": "message", "text": "没给群号的一句"}, _ctx())
         assert r.ok, r.error
         assert "已请求管理员确认" in r.output
         row = _pending_rows(svc.store)[0]
@@ -1111,7 +1112,7 @@ class TestM5FocusGroupTicketArgs:
     async def test_notice_focus_group_filled(self, svc: _Svc) -> None:
         svc.group_space = _Space()
         _bind_chat(svc, cid=8, gid=G1)
-        r = await svc.tools.call("group_notice_send", {"content": "公告"}, _ctx())
+        r = await svc.tools.call("group_deliver", {"action": "notice", "content": "公告"}, _ctx())
         assert r.ok and "已请求管理员确认" in r.output
         row = _pending_rows(svc.store)[0]
         assert json.loads(row["args"]).get("group_id") == G1
@@ -1137,19 +1138,19 @@ class TestM6ApproveRequestConfirm:
     @pytest.mark.asyncio
     async def test_approve_queues_ticket_not_approved(self, svc: _Svc) -> None:
         rid = self._new_request(svc)
-        r = await svc.tools.call("approve_request", {"request_id": rid}, _ctx())
+        r = await svc.tools.call("request_manage", {"action": "approve", "request_id": rid}, _ctx())
         assert r.ok, r.error
         assert "已请求管理员确认" in r.output
         row = svc.store.read().execute("SELECT status FROM requests WHERE id=?", (rid,)).fetchone()
         assert str(row["status"]) == "pending"
         ticket = _pending_rows(svc.store)[0]
-        assert ticket["tool"] == "approve_request"
+        assert ticket["tool"] == "request_manage"
         assert rid in ticket["summary"]
 
     @pytest.mark.asyncio
     async def test_approve_after_confirm_lands_task(self, svc: _Svc) -> None:
         rid = self._new_request(svc)
-        await svc.tools.call("approve_request", {"request_id": rid}, _ctx())
+        await svc.tools.call("request_manage", {"action": "approve", "request_id": rid}, _ctx())
         pid = int(_pending_rows(svc.store)[0]["id"])
         out = await svc.admin_pending.execute(pid, True)
         assert out.ok, out.error
@@ -1161,7 +1162,7 @@ class TestM6ApproveRequestConfirm:
     @pytest.mark.asyncio
     async def test_approve_rejected_ticket_keeps_pending(self, svc: _Svc) -> None:
         rid = self._new_request(svc)
-        await svc.tools.call("approve_request", {"request_id": rid}, _ctx())
+        await svc.tools.call("request_manage", {"action": "approve", "request_id": rid}, _ctx())
         pid = int(_pending_rows(svc.store)[0]["id"])
         await svc.admin_pending.execute(pid, False)
         row = svc.store.read().execute("SELECT status FROM requests WHERE id=?", (rid,)).fetchone()
@@ -1170,7 +1171,7 @@ class TestM6ApproveRequestConfirm:
     @pytest.mark.asyncio
     async def test_reject_request_no_confirm_needed(self, svc: _Svc) -> None:
         rid = self._new_request(svc)
-        r = await svc.tools.call("reject_request", {"request_id": rid, "reason": "不合适"}, _ctx())
+        r = await svc.tools.call("request_manage", {"action": "reject", "request_id": rid, "reason": "不合适"}, _ctx())
         assert r.ok, r.error
         assert "已请求管理员确认" not in r.output
         assert _pending_rows(svc.store) == []
@@ -1192,7 +1193,7 @@ class TestL1RejectServed:
                 " '666', '路人', '', 'pending', ?, ?)",
                 (now, now),
             )
-        r = await svc.tools.call("reject_request", {"request_id": "R-X"}, _ctx())
+        r = await svc.tools.call("request_manage", {"action": "reject", "request_id": "R-X"}, _ctx())
         assert not r.ok
         assert "服务群" in r.error
         row = svc.store.read().execute("SELECT status FROM requests WHERE id='R-X'").fetchone()
@@ -1224,7 +1225,7 @@ class TestL2ServedOnlyReads:
     @pytest.mark.asyncio
     async def test_list_requests_without_group_only_served(self, svc: _Svc) -> None:
         self._seed(svc)
-        r = await svc.tools.call("list_requests", {}, _ctx(gid=""))
+        r = await svc.tools.call("request_manage", {"action": "list", }, _ctx(gid=""))
         assert r.ok
         assert f"{G1} 的活" in r.output
         assert f"{self.G3} 的活" not in r.output
@@ -1278,7 +1279,7 @@ class TestQueueNeedsBoundChat:
         gate = svc.admin_pending
         gate.chat_id = 0
         gate.msg_id = 0
-        r = await svc.tools.call("send_group_message", {"group_id": G1, "text": "无主的票"}, _ctx())
+        r = await svc.tools.call("group_deliver", {"action": "message", "group_id": G1, "text": "无主的票"}, _ctx())
         assert not r.ok
         assert "对话" in r.error
         assert _pending_rows(svc.store) == []

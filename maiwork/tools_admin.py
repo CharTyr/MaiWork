@@ -39,7 +39,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from . import clock, members, rules
+from . import clock, members, rules, settings_ops
 from .tools import Tool, ToolContext, ToolResult, Tools
 
 logger = logging.getLogger("maiwork.tools_admin")
@@ -74,34 +74,30 @@ def _log_bg_exception(task: asyncio.Task) -> None:
 ROLE = "admin"
 _ROLES = frozenset({ROLE})
 
-# 要管理员确认才动手的工具名（测试 TestConfirmGate 逐个点名）
-CONFIRM_TOOLS = frozenset(
-    {
-        "goal_adjust",  # 暂停 / 恢复 / 取消统一使用注册名开确认票
-        "send_group_message",
-        "group_notice_send",
-        "group_file_manage",
-        "group_album_upload",
-        "rss_remove",
-        "skill_delete",
-        "skill_install",  # 2026-10-15：从网址装 skill（外部内容，管理员点头才下载安装）
-        "mcp_delete",
-        "profile_bulk_delete",
-        "approve_request",  # 群友派的活要 bot 管理员批准；模型可能被群内容注入，绝不能替管理员拍板
-        "create_task",  # 任务开工后，做完 / 做不成 / 缺信息时 coordinator 会自动往群里发消息（coordinator.py 的 outbox.enqueue）
-        "create_goal",  # agent 目标后台检查时会往群里发汇报 / 完成话（coordinator 的 goal:{id}:report / goal:{id}:done）
-        # 改设置（tools_admin_settings.py；用户定）：新增 MCP（MaiWork 会去连一个新地址）、删东西
-        "mcp_add",
-        "agent_delete",
-        "endpoint_delete",
-        "model_delete",
-    }
-)
+# 要管理员确认才动手的工具名：group_deliver 的每个 action（发消息 / 公告 / 相册 /
+# 管群文件）都先写小票。
+CONFIRM_TOOLS = frozenset({"group_deliver"})
 
-# 看情形才要确认的工具：工具自己判断「这次是放宽 / 数据会发去新地址」才调 _need_confirm，
-# 收窄的改动直接做。set_rules（白名单外 / 放宽安全设置）、mcp_update（改地址 / 加主模型 /
-# 白名单放宽）、endpoint_save（新建 / 改地址 / 改协议）。
-_CONDITIONAL_CONFIRM = frozenset({"set_rules", "mcp_update", "endpoint_save"})
+# 看情形才要确认的工具：工具自己判断「这个 action 这次是放宽 / 要删 / 要装 / 会对外说」
+# 才调 _need_confirm，其余 action 直接做：
+# - mcp_manage：add / delete 一律；update 改地址 / 加 main / 白名单放宽
+# - agent_manage：delete 一律；update 挂声明执行类工具的做法
+# - model_manage：两个 delete 一律；endpoint_save 新建 / 改地址 / 改协议
+# - skill_manage：install / delete 一律；write 声明执行类工具
+# - rules_manage：set 白名单外字段 / 放宽安全设置
+# - profile_manage：bulk_delete
+# - source_manage：rss_remove
+# - task_manage：create（开工后 coordinator 会往群里发消息）
+# - goal_manage：create / pause / resume / cancel（后台检查会往群里发汇报）
+# - request_manage：approve（群友派的活要 bot 管理员批准）
+# - social_toggle：开平台才确认
+# - tool_run：执行类 / 只在派活回合用的工具才写小票（按 Tools.traits 特性位）
+_CONDITIONAL_CONFIRM = frozenset({"mcp_manage", "agent_manage", "model_manage",
+                                  "skill_manage", "rules_manage",
+                                  "profile_manage", "source_manage",
+                                  "task_manage", "goal_manage", "request_manage",
+                                  "social_toggle",
+                                  "tool_run"})
 
 # 确认话术（固定，测试断言这一句；对话循环也靠它识别「等确认」）
 NEED_CONFIRM = "已请求管理员确认，同意后我再动手"
@@ -311,6 +307,52 @@ def _served_groups(settings: Any) -> set[str]:
         return {str(k) for k in groups.keys()}
     except Exception:
         return set()
+
+
+def _funnel_line(funnel: Any) -> str:
+    """一批资讯的漏斗要点行（list_news 管理员视图用）；没 funnel → ""。
+
+    只挑管理员看得懂的几项：搜了几次、候选多少（按来源计数，补找带回来的标
+    agent:<工具名>）、打开多少、留下多少；补找交回 / 留下 / 丢弃 / 出错。
+    哪段没有就跳过哪段，绝不把整坨 stats JSON 倒给管理员。
+    """
+    if not isinstance(funnel, dict) or not funnel:
+        return ""
+    parts: list[str] = []
+    if funnel.get("queries") is not None:
+        parts.append(f"搜 {int(funnel.get('queries') or 0)} 次")
+    if funnel.get("discovered") is not None:
+        prov = ""
+        providers = funnel.get("providers")
+        if isinstance(providers, dict) and providers:
+            prov = "（" + "、".join(
+                f"{k} {int(v or 0)}"
+                for k, v in sorted(
+                    providers.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0]))
+                )
+            ) + "）"
+        parts.append(f"候选 {int(funnel.get('discovered') or 0)}{prov}")
+    if funnel.get("opened") is not None:
+        parts.append(f"打开 {int(funnel.get('opened') or 0)}")
+    if funnel.get("kept") is not None:
+        parts.append(f"留下 {int(funnel.get('kept') or 0)}")
+    seg = "，".join(parts)
+    supp = funnel.get("supplement")
+    if isinstance(supp, dict) and supp:
+        if supp.get("ran"):
+            supp_seg = (
+                f"补找：交回 {int(supp.get('returned') or 0)}"
+                f" / 留下 {int(supp.get('kept') or 0)}"
+                f" / 丢弃 {int(supp.get('not_in_output') or 0)}（未在工具输出出现过）"
+            )
+            if supp.get("error"):
+                supp_seg += f"，出错 {supp['error']}"
+        elif supp.get("error"):
+            supp_seg = f"补找没跑成：{supp['error']}"
+        else:
+            supp_seg = "补找没跑"
+        seg = (seg + "；" + supp_seg) if seg else supp_seg
+    return ("  漏斗：" + seg) if seg else ""
 
 
 class PendingGate:
@@ -804,6 +846,13 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             items = b.get("items") or []
             rejected = b.get("rejected") or []
             rejected_total += int(b.get("rejected_count") or len(rejected) or 0)
+            # 每批先给一行漏斗要点：搜了几次、候选多少（含补找的 agent:<工具名> 来源）、
+            # 打开 / 留下多少、补找交回 / 留下 / 丢弃。老批次没有 stats.funnel 就不加。
+            stats = b.get("stats")
+            fline = _funnel_line(
+                (stats or {}).get("funnel") if isinstance(stats, dict) else None)
+            if fline:
+                lines.append(fline)
             if not items and not rejected:
                 note = str(b.get("note") or "").strip()
                 lines.append(f"一批（找到 {int(b.get('found') or 0)} 条，没留下能用的{('：' + note) if note else ''}）")
@@ -1038,19 +1087,27 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             lines.append(f"[{t}] {r['user_name'] or r['user_id']}: {r['text']}")
         return _ok(f"群 {gid} 最近 {hours} 小时 {len(data)} 条：\n" + "\n".join(lines), data=data)
 
-    async def read_logs(ctx: ToolContext, args: dict) -> ToolResult:
+    async def _read_model_logs(ctx: ToolContext, args: dict) -> ToolResult:
         sql = "SELECT ts, purpose, role, model, group_id, ok, status, ms, error FROM model_calls"
         where: list[str] = []
         params: list[Any] = []
         if bool(args.get("failed_only")):
             where.append("ok=0")
-        # 只看服务群和全局（没群号）的调用：下掉的群残留的记录不是管理员该看的
-        served = sorted(_served_groups(_settings()))
-        if served:
-            where.append(f"(group_id IN ({','.join('?' * len(served))}) OR group_id='')")
-            params.extend(served)
+        gid_raw = str(args.get("group_id") or ctx.group_id or "").strip()
+        if gid_raw and gid_raw != "*":
+            gid, err = _served(gid_raw)
+            if err is not None:
+                return err
+            where.append("group_id=?")
+            params.append(gid)
         else:
-            where.append("group_id=''")  # 读不到服务群名单时只看全局，宁可少看
+            # 只看服务群和全局（没群号）的调用：下掉的群残留的记录不是管理员该看的
+            served = sorted(_served_groups(_settings()))
+            if served:
+                where.append(f"(group_id IN ({','.join('?' * len(served))}) OR group_id='')")
+                params.extend(served)
+            else:
+                where.append("group_id=''")  # 读不到服务群名单时只看全局，宁可少看
         sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY ts DESC, id DESC LIMIT ?"
         limit = _int(args.get("limit"), 20, 1, 200)
@@ -1072,6 +1129,211 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                 + (f" {err}" if err else "")
             )
         return _ok(f"最近 {len(data)} 条模型调用：\n" + "\n".join(lines), data=data)
+
+    async def _read_tool_logs(ctx: ToolContext, args: dict) -> ToolResult:
+        """读 tool_calls 表：子 agent / 主模型 / 管理员工具的真实调用记录。
+
+        管理员问「这批资讯到底有没有用上 flovia_x」就靠它——工具名、入参、
+        返回 / 报错、耗时都落过库。服务群口径同模型调用：只看服务群和全局
+        （没群号）的行，非服务群零读取；服务群名单读不到时只看全局，宁可少看。
+        """
+        sql = (
+            "SELECT ts, group_id, task_id, actor, tool, input, output, ms, ok, error"
+            " FROM tool_calls"
+        )
+        where: list[str] = []
+        params: list[Any] = []
+        gid_raw = str(args.get("group_id") or ctx.group_id or "").strip()
+        if gid_raw and gid_raw != "*":
+            gid, err = _served(gid_raw)
+            if err is not None:
+                return err
+            where.append("group_id=?")
+            params.append(gid)
+        else:
+            # 没指定群（含 "*"）：服务群的 + 全局的一起看（read_logs 同口径）
+            served = sorted(_served_groups(_settings()))
+            if served:
+                where.append(f"(group_id IN ({','.join('?' * len(served))}) OR group_id='')")
+                params.extend(served)
+            else:
+                where.append("group_id=''")
+        task_id = str(args.get("task_id") or "").strip()
+        if task_id:  # 前缀匹配：feeds-verify 能捞出本轮核验 / 补找的全部调用
+            where.append("substr(task_id, 1, ?) = ?")
+            params.extend([len(task_id), task_id])
+        tool_q = str(args.get("tool") or "").strip()
+        if tool_q:  # 包含匹配：flovia 能捞出 mcp_flovia_flovia_x
+            where.append("instr(tool, ?) > 0")
+            params.append(tool_q)
+        if bool(args.get("failed_only")):
+            where.append("ok=0")
+        sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY ts DESC, id DESC LIMIT ?"
+        params.append(_int(args.get("limit"), 30, 1, 200))
+        try:
+            rows = svc.store.read().execute(sql, params).fetchall()
+        except Exception as e:
+            return _bad(f"读工具调用记录失败：{e}")
+        data = [dict(r) for r in rows]
+        if not data:
+            return _ok("没有符合条件的工具调用记录", data=[])
+        lines = []
+        for r in data:
+            t = clock.bj(float(r["ts"] or 0)).strftime("%m-%d %H:%M")
+            gid = str(r["group_id"] or "")
+            state = "成功" if int(r["ok"] or 0) else "失败"
+            lines.append(
+                f"[{t}] {r['actor']}" + (f" 群{gid}" if gid else "")
+                + f" {r['tool']} {state} {int(r['ms'] or 0)}ms"
+            )
+            inp = _tail(str(r["input"] or ""), 300)
+            if inp:
+                lines.append(f"  入参: {inp}")
+            outp = _tail(str(r["output"] or ""), 500)
+            if outp:
+                lines.append(f"  输出: {outp}")
+            err_t = _tail(str(r["error"] or ""), 300)
+            if err_t:
+                lines.append(f"  错误: {err_t}")
+        return _ok(f"最近 {len(data)} 条工具调用：\n" + "\n".join(lines), data=data)
+
+    async def read_logs(ctx: ToolContext, args: dict) -> ToolResult:
+        """统一读日志入口：模型调用 + 工具调用。
+
+        - kind="models"（默认）：模型调用日志；kind="tools"：tool_calls 真实工具调用；
+        - kind 没给但传了 tool 或 task_id → 自动按 "tools" 查；
+        - kind="all"：两段都回，data={"model_calls": [...], "tool_calls": [...]}。
+        """
+        kind = str(args.get("kind") or "").strip().lower()
+        if not kind:
+            kind = "tools" if (args.get("tool") or args.get("task_id")) else "models"
+        if kind not in ("models", "tools", "all"):
+            return _bad("kind 只能是 models / tools / all")
+        if kind == "models":
+            return await _read_model_logs(ctx, args)
+        if kind == "tools":
+            return await _read_tool_logs(ctx, args)
+        m_res = await _read_model_logs(ctx, args)
+        if not m_res.ok:
+            return m_res
+        t_res = await _read_tool_logs(ctx, args)
+        if not t_res.ok:
+            return t_res
+        return _ok(
+            m_res.output + "\n\n" + t_res.output,
+            data={"model_calls": m_res.data, "tool_calls": t_res.data},
+        )
+
+    async def tool_run(ctx: ToolContext, args: dict) -> ToolResult:
+        """亲手试调一个注册给子 agent（worker）的工具一次。
+
+        - 还是走 Tools.call 唯一入口（as_role="worker" 强制按 worker 那格查名），
+          照常落 tool_calls：actor 记这段管理员对话、task_id 记 admin-tool:<对话号>；
+        - 执行类 / 只在派活回合用的工具先出小票（看 Tools.traits 特性位，不是名单）；
+        - needs_workspace → svc.env.ephemeral("admin-tool") 的单独临时工作区，
+          出来就删；环境开不出就中文报错，绝不偷摸不带工作区跑；
+        - 回显真实输出 / 真实错误（截 ~4000 字），失败不装成功。
+        """
+        name = str(args.get("name") or "").strip()
+        if not name:
+            return _bad("要给 name（已注册的工具名）")
+        tools_obj = getattr(svc, "tools", None)
+        if tools_obj is None:
+            return _bad("工具层没就位，这次调不了")
+        tr: dict | None = None
+        traits_fn = getattr(tools_obj, "traits", None)
+        if callable(traits_fn):
+            try:
+                tr = traits_fn(name)
+            except Exception:
+                tr = None
+        if tr is None:
+            getter = getattr(tools_obj, "get", None)
+            if callable(getter) and getter(name, ROLE) is not None:
+                return _bad(f"「{name}」是管理员工具，管理员对话里直接就能用，不用试调")
+            return _bad(
+                f"没有注册叫「{name}」的工具。能试调的是注册给子 agent 的工具："
+                "名单看 agent_manage 的 detail（「有效工具 / 做法带来的工具」段）或网页专岗页"
+            )
+        roles = tr.get("roles") or []
+        if "worker" not in roles:
+            return _bad(
+                f"工具「{name}」没注册给子 agent（角色：{'、'.join(str(r) for r in roles) or '无'}），"
+                "不能在这里试调"
+            )
+        run_args = args.get("args")
+        if run_args is None:
+            run_args = {}
+        if not isinstance(run_args, dict):
+            return _bad("args 要是一个 JSON 对象（不给就按空参数调）")
+        run_args = _norm_args(run_args)
+        gid, err = _served(args.get("group_id") or ctx.group_id)
+        if err is not None:
+            return err
+        # 记是哪段管理员对话试的：task_id = admin-tool:<对话号>。
+        # ctx.chat_id 是 admin_chat 每轮动态挂的；小票执行路径从票里的存根拿回来。
+        raw_cid = getattr(ctx, "chat_id", None)
+        if raw_cid is None:
+            raw_cid = args.get("chat_id")
+        try:
+            cid = int(raw_cid or 0)
+        except (TypeError, ValueError):
+            cid = 0
+        ticket_args = {"name": name, "args": run_args, "group_id": gid, "chat_id": cid}
+        if tr.get("exec_class") or tr.get("task_only"):
+            digest = _tail(
+                json.dumps(Tools._mask_sensitive(run_args),
+                           ensure_ascii=False, sort_keys=True, default=str),
+                120,
+            )
+            kind = "执行类" if tr.get("exec_class") else "只在派活回合用的"
+            pending = _need_confirm(
+                "tool_run", ticket_args, f"试调{kind}工具 {name}（参数 {digest}）")
+            if pending is not None:
+                return pending
+        # 要工作区的给单独临时工作区（LocalEnv.ephemeral 同款：用到才建、出来就删）。
+        # 管理员点头之后才开——没确认前不碰资源。
+        ws_ctx: Any = None
+        ws_path: Any = None
+        if tr.get("needs_workspace"):
+            env = getattr(svc, "env", None)
+            eph = getattr(env, "ephemeral", None) if env is not None else None
+            if not callable(eph):
+                return _bad(
+                    f"工具「{name}」要在单独工作区里跑，但执行环境开不出临时工作区")
+            try:
+                ws_ctx = eph("admin-tool", deadline_ts=clock.now() + 120)
+                ws_path = await ws_ctx.__aenter__()
+            except Exception as e:
+                logger.exception("tool_run 开临时工作区失败（%s）", name)
+                return _bad(f"开临时工作区失败，这次没调成：{e}")
+        try:
+            run_ctx = ToolContext(
+                group_id=gid,
+                task_id=f"admin-tool:{cid}",
+                actor=str(getattr(ctx, "actor", "") or "主模型（管理员对话）"),
+                workspace=ws_path,
+                role="worker",
+            )
+            result = await tools_obj.call(name, run_args, run_ctx, as_role="worker")
+        finally:
+            if ws_ctx is not None:
+                try:
+                    await ws_ctx.__aexit__(None, None, None)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("tool_run 临时工作区收尾失败（%s）", name)
+        if not isinstance(result, ToolResult):
+            result = ToolResult(ok=bool(result), output=str(result))
+        if result.ok:
+            return _ok(
+                f"试调 {name} 成功：\n{_tail(result.output, 4000)}",
+                data={"ok": True, "tool": name, "output": result.output},
+            )
+        body = result.error or result.output
+        return _bad(f"试调 {name} 没跑成：{_tail(body, 4000)}")
 
     def _flat_rules(settings: Any) -> list[str]:
         """全局还能改的规则（节.字段=值）。
@@ -1227,7 +1489,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         if not isinstance(raw_ids, list) or not raw_ids:
             return _bad("entry_ids 要给一个非空列表")
         args = {**args, "group_id": gid}
-        pending = _need_confirm("profile_bulk_delete", args, f"一次删掉群 {gid} 的 {len(raw_ids)} 条画像")
+        pending = _need_confirm("profile_manage", args, f"一次删掉群 {gid} 的 {len(raw_ids)} 条画像")
         if pending is not None:
             return pending
         prof = _profiles()
@@ -1304,7 +1566,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         if target is None:
             return _bad(f"群 {gid} 没有 id 为 {feed_id} 的 RSS 源")
         args = {**args, "group_id": gid}
-        pending = _need_confirm("rss_remove", args, f"从群 {gid} 删掉 RSS 源「{target.get('title') or feed_id}」")
+        pending = _need_confirm("source_manage", args, f"从群 {gid} 删掉 RSS 源「{target.get('title') or feed_id}」")
         if pending is not None:
             return pending
         try:
@@ -1512,7 +1774,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             names = "、".join(rules.full_label(k) for k in strict)
             loosen = f"{loosen}；{names}" if loosen else names
         if loosen:
-            pending = _need_confirm("set_rules", args, _patch_summary(validated, loosen))
+            pending = _need_confirm("rules_manage", args, _patch_summary(validated, loosen))
             if pending is not None:
                 return pending
         # 2026-10 docs/18 第一步：不再写 kv 覆盖层，和网页「全部配置」走同一条
@@ -1609,7 +1871,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         # 解析出来的群号（可能是对话焦点群）补进要存票的参数：票的 args 就是执行时的全部凭据，
         # 管理员看到的是哪个群、同意后动的也就是哪个群
         args = {**args, "group_id": gid}
-        pending = _need_confirm("send_group_message", args, f"发到群 {gid}：{_tail(text, 100)}")
+        pending = _need_confirm("group_deliver", args, f"发到群 {gid}：{_tail(text, 100)}")
         if pending is not None:
             return pending
         outbox = getattr(svc, "outbox", None)
@@ -1642,7 +1904,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         if not content:
             return _bad("content 不能为空")
         args = {**args, "group_id": gid}
-        pending = _need_confirm("group_notice_send", args, f"给群 {gid} 发群公告：{_tail(content, 100)}")
+        pending = _need_confirm("group_deliver", args, f"给群 {gid} 发群公告：{_tail(content, 100)}")
         if pending is not None:
             return pending
         space = _group_space(gid)
@@ -1666,7 +1928,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         if space is None:
             return _bad("群空间能力没就位，这次动不了群文件")
         args = {**args, "group_id": gid}
-        pending = _need_confirm("group_file_manage", args, f"群 {gid} 的群文件 {action}")
+        pending = _need_confirm("group_deliver", args, f"群 {gid} 的群文件 {action}")
         if pending is not None:
             return pending
         try:
@@ -1698,7 +1960,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         except ValueError as e:
             return _bad(str(e))
         args = {**args, "group_id": gid}
-        pending = _need_confirm("group_album_upload", args, f"把 {path} 传进群 {gid} 的相册")
+        pending = _need_confirm("group_deliver", args, f"把 {path} 传进群 {gid} 的相册")
         if pending is not None:
             return pending
         space = _group_space(gid)
@@ -1722,7 +1984,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                 return _bad(f"没有 skill「{name}」")
         except Exception as e:
             return _bad(f"查 skill 失败：{e}")
-        pending = _need_confirm("skill_delete", args, f"删掉 skill「{name}」")
+        pending = _need_confirm("skill_manage", args, f"删掉 skill「{name}」")
         if pending is not None:
             return pending
         settings = _settings()
@@ -1737,9 +1999,151 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             return _bad(f"删 skill 失败：{e}")
         return _ok(f"已删掉 skill「{name}」")
 
+    async def skill_write(ctx: ToolContext, args: dict) -> ToolResult:
+        """管理员写 / 改一份做法（skill）；声明执行类工具会先出待确认小票。"""
+        name = str(args.get("name") or "").strip()
+        if not name:
+            return _bad("要给 name（做法名，小写字母/数字/连字符）")
+        settings = _settings()
+        data_dir = getattr(settings, "data_dir", None) or getattr(svc, "data_dir", None)
+        store = getattr(svc, "store", None)
+        if data_dir is None or store is None:
+            return _bad("skill 目录不可用，本次写不了")
+        from . import skills_web
+
+        body: dict[str, Any] = {"name": name}
+        if "description" in args:
+            body["description"] = str(args.get("description") or "")
+        if "body" in args:
+            body["body"] = str(args.get("body") or "")
+        allowed_raw = args.get("allowed_tools")
+        if allowed_raw is not None:
+            body["allowed_tools"] = allowed_raw
+            try:
+                allowed_list = skills_web.normalize_allowed_tools(allowed_raw)
+            except ValueError:
+                return _bad("allowed_tools 要是工具名列表（或空格分隔的字符串）")
+        else:
+            allowed_list = []
+        if "roles" in args:
+            body["roles"] = args["roles"]
+        try:
+            existing = skills_web.get_view(data_dir, store, name)
+        except Exception:
+            existing = None
+        if existing is not None and existing.get("builtin"):
+            return _bad(f"「{name}」是内置做法，改不了（只能在网页停用它）")
+        # 声明执行类工具（挂到调研岗就真能用）→ 待确认小票（exec_grants 唯一判定；
+        # 传原值，字符串写法在它内部同样归一化）
+        grants = settings_ops.exec_grants(svc, skill_name=name, new_allowed=allowed_raw) \
+            if allowed_raw is not None else []
+        if grants:
+            pending = _need_confirm(
+                "skill_manage", args,
+                f"{'新建' if existing is None else '改'}做法「{name}」：声明执行类工具"
+                f"（{'、'.join(grants)}），挂上调研岗后它就能跑命令 / 写文件等，同意才写",
+            )
+            if pending is not None:
+                return pending
+        try:
+            if existing is None:
+                view = skills_web.create(data_dir, store, body)
+            else:
+                view = skills_web.update(data_dir, store, name, body)
+        except (ValueError, FileExistsError, PermissionError) as e:
+            return _bad(str(e))
+        except Exception as e:
+            return _bad(f"写做法失败：{e}")
+        # 回报：声明工具的注册/执行类拆分 + 哪些调研岗挂着它
+        declared = [str(t) for t in (view.get("allowed_tools") or [])]
+        registered: list[str] = []
+        exec_names: list[str] = []
+        unknown: list[str] = []
+        tools = getattr(svc, "tools", None)
+        for t in declared:
+            try:
+                tr = tools.traits(t) if tools is not None else None
+            except Exception:
+                tr = None
+            if tr is None or "worker" not in (tr.get("roles") or ()):
+                unknown.append(t)
+            else:
+                registered.append(t)
+                if tr.get("exec_class"):
+                    exec_names.append(t)
+        attached: list[str] = []
+        agents = getattr(svc, "agents", None)
+        if agents is not None:
+            try:
+                for k in ("news", "idea", "goal"):
+                    if name in list(agents.profile(k).get("skills") or []):
+                        attached.append(k)
+            except Exception:
+                pass
+        lines = [f"做法「{name}」已{'新建' if existing is None else '改好'}。"]
+        if declared:
+            lines.append(
+                f"声明的工具：已注册 {'、'.join(registered) or '（无）'}"
+                + (f"；没注册/连不上 {'、'.join(unknown)}" if unknown else "")
+                + (f"；其中执行类 {'、'.join(exec_names)}" if exec_names else "")
+            )
+        if attached:
+            lines.append(f"现在挂在调研岗：{'、'.join(attached)}")
+        elif declared:
+            lines.append("还没挂到岗位，用 agent_manage 的 update（add_skills）挂上才会生效")
+        return _ok("\n".join(lines), data=view)
+
+    async def social_toggle(ctx: ToolContext, args: dict) -> ToolResult:
+        """开 / 关一个社交平台（开要先确认，会后台装 CLI；关直接执行并取消在跑的安装）。"""
+        from . import tools_admin_settings as _tas
+
+        bad_secret = _tas.secret_args(args)
+        if bad_secret:
+            return _bad(
+                f"密钥不经过对话：参数里不能带 {'、'.join(bad_secret)}。"
+                "Cookie / 登录态只能管理员自己到网页「设置 → 登录态」填；这次什么都没改。"
+            )
+        extra = sorted(str(k) for k in args if str(k) not in ("platform", "enabled"))
+        if extra:
+            return _bad(f"不认识的参数：{'、'.join(extra)}（只认 platform、enabled）")
+        platform = str(args.get("platform") or "").strip()
+        enabled = args.get("enabled")
+        from . import social_platforms
+
+        if platform not in social_platforms.PLATFORMS:
+            return _bad(f"没有这个社交平台：{platform or '（没给 platform）'}（"
+                        f"现有：{'、'.join(social_platforms.PLATFORMS)}）")
+        store = getattr(svc, "store", None)
+        if store is None:
+            return _bad("存储没就位")
+        row = next(r for r in social_platforms.list_platforms(store) if r["id"] == platform)
+        label = str(row.get("name") or platform)
+        if bool(enabled):
+            pending = _need_confirm(
+                "social_toggle", args,
+                f"打开社交平台「{label}」：资讯每批的保底补搜会自动搜它"
+                + ("" if row.get("installed") else "（还没装，会先在后台安装）"),
+            )
+            if pending is not None:
+                return pending
+            social_platforms.enable_platform(store, platform)
+            start = getattr(svc, "start_social_install", None)
+            if not row.get("installed") and callable(start):
+                start(platform)
+            return _ok(f"已打开社交平台「{label}」"
+                       + ("" if row.get("installed") or not callable(start)
+                          else "，正在后台安装（env_overview 能看进度）")
+                       + "。Cookie 只能管理员自己到网页「设置 → 登录态」填。")
+        cancel = getattr(svc, "cancel_social_install", None)
+        if callable(cancel):
+            await cancel(platform)
+        social_platforms.disable_platform(store, platform)
+        return _ok(f"已关闭社交平台「{label}」。Cookie 要改请到网页「设置 → 登录态」填。")
+
     async def skill_install(ctx: ToolContext, args: dict) -> ToolResult:
         url = str(args.get("url") or "").strip()
         replace = bool(args.get("replace"))
+        allow_exec = bool(args.get("allow_exec_tools"))
         try:
             src, kind = skill_source_url(url)
         except ValueError as e:
@@ -1749,8 +2153,9 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         if data_dir is None or getattr(svc, "store", None) is None:
             return _bad("skill 目录不可用，本次无法安装")
         pending = _need_confirm(
-            "skill_install", args,
+            "skill_manage", args,
             f"从 {url} 下载并安装一个 skill" + ("（同名的会被覆盖）" if replace else "")
+            + ("；允许它声明执行类工具" if allow_exec else "")
             + "；这是外部内容，建议先在网页上查看它的内容",
         )
         if pending is not None:
@@ -1762,12 +2167,11 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         except Exception as e:
             return _bad(f"下载失败：{e}")
         from . import skills_web
+        from .skills import parse_front_matter
 
         if kind == "md":
             import io
             import zipfile
-
-            from .skills import parse_front_matter
 
             try:
                 text = blob.decode("utf-8")
@@ -1783,6 +2187,31 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             with zipfile.ZipFile(mem, "w") as zf:
                 zf.writestr(f"{name}/SKILL.md", text)
             blob = mem.getvalue()
+        # 装前看一遍它声明的工具：带执行类工具时管理员得明确同意（allow_exec_tools=true 重试
+        # 会带新指纹出第二张确认票）
+        declared_tools: list[str] = []
+        try:
+            import zipfile as _zf
+            import io as _io
+
+            with _zf.ZipFile(_io.BytesIO(blob)) as zf:
+                for n in zf.namelist():
+                    if n.rstrip("/").endswith("SKILL.md"):
+                        fm = parse_front_matter(zf.read(n).decode("utf-8", "replace")) or {}
+                        declared_tools = [str(t) for t in (fm.get("allowed_tools") or [])]
+                        break
+        except Exception:
+            declared_tools = []
+        if declared_tools and not allow_exec:
+            tools = getattr(svc, "tools", None)
+            exec_names = [t for t in declared_tools
+                          if (tr := (tools.traits(t) if tools is not None else None)) is not None
+                          and tr.get("exec_class") and "worker" in (tr.get("roles") or ())]
+            if exec_names:
+                return _bad(
+                    f"这个 skill 声明了执行类工具（{'、'.join(exec_names)}），挂上调研岗后它就能"
+                    "跑命令 / 写文件等。要装请明确同意：重试时把 allow_exec_tools 设为 true。"
+                )
         try:
             # 同网页上传一样在本线程装（store 不能跨线程用；包有大小上限，很快）
             view = skills_web.install_zip(svc.store, data_dir, blob, filename=url.rsplit("/", 1)[-1], replace=replace)
@@ -1900,6 +2329,27 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                 lines.append(f"• MCP 连接：{len(info)} 个，开着的 {sum(1 for i in info if i.get('enabled'))} 个")
             except Exception:
                 pass
+        try:  # 社交平台逐平台说清：开没开 / 装没装 / Cookie 填没填（永不出 Cookie 值）
+            from . import social_platforms
+
+            for row in social_platforms.list_platforms(getattr(svc, "store", None)):
+                state = "开" if row.get("enabled") else "关"
+                _running = getattr(svc, "social_install_running", None)
+                installing = bool(row.get("installing")) or (
+                    callable(_running) and bool(_running(row["id"])))
+                install = "安装中" if installing else ("已装" if row.get("installed") else "没装")
+                if row.get("needs_cookie"):
+                    cookie = "Cookie 已填" if row.get("cookie_set") else "Cookie 没填"
+                else:
+                    cookie = "不需要 Cookie"
+                tail = f"（最近错误：{row['last_error']}）" if row.get("last_error") else ""
+                lines.append(f"• {row.get('name') or row['id']}：{state} · {install} · {cookie}{tail}")
+            lines.append(
+                "资讯每批的保底补搜会自动搜已启用的平台（最多 3 个方向）；"
+                "Twitter/X 不填 Cookie 时走网页搜索备选"
+            )
+        except Exception:
+            logger.exception("env_overview 读社交平台出错")
         lines.append(
             "怎么补：开关和数量这类设置可以直接改（安全相关的会先等你确认）；装 skill 请提供网址；"
             "MCP 服务可以直接让我加、测连接、重连、改白名单（新加、改地址、放宽权限会先等你确认）；"
@@ -1910,67 +2360,182 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         )
         return _ok("\n".join(lines), data=data)
 
-    async def mcp_toggle(ctx: ToolContext, args: dict) -> ToolResult:
-        name = str(args.get("name") or "").strip()
-        if not name:
-            return _bad("要给 name")
-        enabled = bool(args.get("enabled", True))
-        exts = getattr(svc, "extensions", None)
-        settings = _settings()
-        if exts is None or settings is None:
-            return _bad("这个 MaiWork 还没接 MCP 扩展管理，现在开不了也关不了")
-        try:
-            from . import extensions_web
+    # ------------------------------------------------------------------
+    # 合并工具分派器：把 action 写进 args 再分派给上面的具体函数——
+    # 小票指纹按「调 _need_confirm 时那份 args」算，execute 回放原样送回，
+    # 两边一致才能免第二次确认（implement.md 风险点）。
+    # ------------------------------------------------------------------
 
-            extensions_web.toggle(svc.store, settings, name, enabled)
-            reloader = getattr(exts, "reload", None)
-            if callable(reloader):
-                await reloader(name, svc.tools)
-        except KeyError:
-            return _bad(f"没有叫「{name}」的 MCP 扩展")
-        except ValueError as e:
-            return _bad(str(e))
-        except Exception as e:
-            return _bad(f"开关 MCP 扩展失败：{e}")
-        return _ok(f"MCP 扩展「{name}」已{'打开' if enabled else '关闭'}")
+    _SKILL_ACTIONS = ("list", "write", "install", "delete")
 
-    async def mcp_delete(ctx: ToolContext, args: dict) -> ToolResult:
-        name = str(args.get("name") or "").strip()
-        if not name:
-            return _bad("要给 name")
-        exts = getattr(svc, "extensions", None)
-        settings = _settings()
-        if exts is None or settings is None:
-            return _bad("这个 MaiWork 还没接 MCP 扩展管理，现在删不了")
-        try:
-            from . import extensions_web
+    async def skill_manage(ctx: ToolContext, args: dict) -> ToolResult:
+        """做法（skill）统一入口：list 看扩展和做法；write 写 / 改；install 从网址装；delete 删。"""
+        a = str(args.get("action") or "list").strip().lower()
+        if a not in _SKILL_ACTIONS:
+            return _bad(f"不认识的 action「{a or '（没给）'}」：可用 {'、'.join(_SKILL_ACTIONS)}")
+        args = {**args, "action": a}
+        handlers = {
+            "list": list_extensions,
+            "write": skill_write,
+            "install": skill_install,
+            "delete": skill_delete,
+        }
+        return await handlers[a](ctx, args)
 
-            source = extensions_web.source_of(settings, svc.store, name)
-            if source is None:
-                return _bad(f"没有叫「{name}」的 MCP 扩展")
-            if source != "web":  # 和网页删除同一条规矩
-                return _bad("这个扩展来自配置文件，只能开关，不能删除")
-        except Exception as e:
-            return _bad(f"查 MCP 扩展失败：{e}")
-        pending = _need_confirm("mcp_delete", args, f"删掉 MCP 扩展「{name}」")
-        if pending is not None:
-            return pending
-        try:
-            extensions_web.delete(svc.store, name)
-            remover = getattr(exts, "remove", None)
-            if callable(remover):
-                await remover(name, svc.tools)
-        except KeyError:
-            return _bad(f"没有叫「{name}」的 MCP 扩展")
-        except Exception as e:
-            return _bad(f"删 MCP 扩展失败：{e}")
-        try:
-            from . import search_binding
+    async def rules_manage(ctx: ToolContext, args: dict) -> ToolResult:
+        """规则统一入口：get 看现在生效的；set 改（patch 形如 {"节": {"字段": 值}}）。
 
-            search_binding.clear_binding(svc.store, mcp=name)  # 搜索绑定绑着它 → 跟着清掉（同网页删除）
-        except Exception:
-            logger.exception("清 MCP 扩展 %s 的搜索绑定出错", name)
-        return _ok(f"已删掉 MCP 扩展「{name}」")
+        不给 action 时：带了 patch 就按 set，否则按 get。
+        """
+        a = str(args.get("action") or "").strip().lower()
+        if not a:
+            a = "set" if isinstance(args.get("patch"), dict) else "get"
+        if a not in ("get", "set"):
+            return _bad(f"不认识的 action「{a}」：可用 get、set")
+        args = {**args, "action": a}
+        return await (set_rules if a == "set" else get_rules)(ctx, args)
+
+    _IDENTITY_ACTIONS = ("get", "edit", "remember")
+
+    async def identity_manage(ctx: ToolContext, args: dict) -> ToolResult:
+        """身份统一入口：get 看 SOUL / AGENTS / MEMORY；edit 改其中一份；remember 记一件事。
+
+        不给 action 时：kind+text → edit；只有 text → remember；都没有 → get。
+        """
+        a = str(args.get("action") or "").strip().lower()
+        if not a:
+            if str(args.get("kind") or "").strip() and args.get("text") is not None:
+                a = "edit"
+            elif args.get("text") is not None:
+                a = "remember"
+            else:
+                a = "get"
+        if a not in _IDENTITY_ACTIONS:
+            return _bad(f"不认识的 action「{a}」：可用 {'、'.join(_IDENTITY_ACTIONS)}")
+        args = {**args, "action": a}
+        handlers = {"get": get_identity, "edit": identity_edit, "remember": remember}
+        return await handlers[a](ctx, args)
+
+    _PROFILE_ACTIONS = ("read", "add", "edit", "lock", "unlock", "delete", "bulk_delete", "refresh")
+
+    async def profile_manage(ctx: ToolContext, args: dict) -> ToolResult:
+        """画像统一入口：read 看（默认）；add/edit/lock/unlock/delete 改单条；
+        bulk_delete 批量删（要确认）；refresh 现在重新整理（后台跑）。"""
+        a = str(args.get("action") or "read").strip().lower()
+        if a not in _PROFILE_ACTIONS:
+            return _bad(f"不认识的 action「{a or '（没给）'}」：可用 {'、'.join(_PROFILE_ACTIONS)}")
+        args = {**args, "action": a}
+        if a == "read":
+            return await read_profile(ctx, args)
+        if a == "refresh":
+            return await refresh_profile(ctx, args)
+        if a == "bulk_delete":
+            return await profile_bulk_delete(ctx, args)
+        return await profile_edit(ctx, args)  # add / edit / lock / unlock / delete
+
+    _FOCUS_ACTIONS = ("list", "add", "remove", "auto")
+
+    async def focus_manage(ctx: ToolContext, args: dict) -> ToolResult:
+        """关注成员统一入口：list 看（默认）；add / remove / auto 调。"""
+        a = str(args.get("action") or "list").strip().lower()
+        if a not in _FOCUS_ACTIONS:
+            return _bad(f"不认识的 action「{a or '（没给）'}」：可用 {'、'.join(_FOCUS_ACTIONS)}")
+        args = {**args, "action": a}
+        if a == "list":
+            return await list_focus(ctx, args)
+        return await focus_edit(ctx, args)
+
+    _SOURCE_ACTIONS = ("rss_add", "rss_remove", "block_domain", "unblock_domain")
+
+    async def source_manage(ctx: ToolContext, args: dict) -> ToolResult:
+        """资讯来源统一入口：rss_add / rss_remove（删要确认）/ block_domain / unblock_domain。"""
+        a = str(args.get("action") or "").strip().lower()
+        if a not in _SOURCE_ACTIONS:
+            return _bad(f"不认识的 action「{a or '（没给）'}」：可用 {'、'.join(_SOURCE_ACTIONS)}")
+        if a == "unblock_domain":
+            a = "block_domain"
+            args = {**args, "blocked": False}
+        args = {**args, "action": a}
+        if a == "rss_add":
+            return await rss_add(ctx, args)
+        if a == "rss_remove":
+            return await rss_remove(ctx, args)
+        return await block_domain(ctx, args)
+
+    async def news_manage(ctx: ToolContext, args: dict) -> ToolResult:
+        """资讯统一入口：list 看最近备出来的（默认）；run_now 现在备一批（后台跑）。"""
+        a = str(args.get("action") or "list").strip().lower()
+        if a not in ("list", "run_now"):
+            return _bad(f"不认识的 action「{a}」：可用 list、run_now")
+        args = {**args, "action": a}
+        return await (run_news_now if a == "run_now" else list_news)(ctx, args)
+
+    async def idea_manage(ctx: ToolContext, args: dict) -> ToolResult:
+        """构想统一入口：list 看（默认）；make_now 现在想一个（后台跑，同群互斥）。"""
+        a = str(args.get("action") or "list").strip().lower()
+        if a not in ("list", "make_now"):
+            return _bad(f"不认识的 action「{a}」：可用 list、make_now")
+        args = {**args, "action": a}
+        return await (make_idea_now if a == "make_now" else list_ideas)(ctx, args)
+
+    _TASK_ACTIONS = ("list", "detail", "create", "cancel")
+
+    async def task_manage(ctx: ToolContext, args: dict) -> ToolResult:
+        """任务统一入口：list 看（默认；给了 task_id 没给 action 按 detail）；detail 看详情；
+        create 建并开工（要确认）；cancel 取消。"""
+        a = str(args.get("action") or "").strip().lower()
+        if not a:
+            a = "detail" if str(args.get("task_id") or "").strip() else "list"
+        if a not in _TASK_ACTIONS:
+            return _bad(f"不认识的 action「{a}」：可用 {'、'.join(_TASK_ACTIONS)}")
+        args = {**args, "action": a}
+        handlers = {"list": list_tasks, "detail": task_detail, "create": create_task, "cancel": cancel_task}
+        return await handlers[a](ctx, args)
+
+    _GOAL_ACTIONS = ("list", "create", "pause", "resume", "cancel", "set_interval",
+                     "set_url", "set_guidance", "add_criterion", "remove_criterion", "edit_criterion")
+
+    async def goal_manage(ctx: ToolContext, args: dict) -> ToolResult:
+        """目标统一入口：list 看（默认）；create 立一个（要确认）；
+        其余 action 走原 goal_adjust（pause/resume/cancel 要确认）。"""
+        a = str(args.get("action") or "list").strip().lower()
+        if a not in _GOAL_ACTIONS:
+            return _bad(f"不认识的 action「{a or '（没给）'}」：可用 {'、'.join(_GOAL_ACTIONS)}")
+        args = {**args, "action": a}
+        if a == "list":
+            return await list_goals(ctx, args)
+        if a == "create":
+            return await create_goal(ctx, args)
+        return await goal_adjust(ctx, args)
+
+    async def request_manage(ctx: ToolContext, args: dict) -> ToolResult:
+        """群友派的活统一入口：list 看（默认）；approve 批（要确认）；reject 拒。"""
+        a = str(args.get("action") or "list").strip().lower()
+        if a not in ("list", "approve", "reject"):
+            return _bad(f"不认识的 action「{a}」：可用 list、approve、reject")
+        args = {**args, "action": a}
+        handlers = {"list": list_requests, "approve": approve_request, "reject": reject_request}
+        return await handlers[a](ctx, args)
+
+    _DELIVER_ACTIONS = ("message", "notice", "album_upload", "delete", "rename", "move", "mkdir", "rmdir")
+
+    async def group_deliver(ctx: ToolContext, args: dict) -> ToolResult:
+        """往服务群交付 / 管群文件统一入口（全部动作都要管理员确认）：
+        message 群里说一句；notice 发群公告；album_upload 传群相册；
+        delete / rename / move / mkdir / rmdir 管群文件（file_ 前缀写法也认）。"""
+        a = str(args.get("action") or "").strip().lower()
+        if a.startswith("file_"):
+            a = a[len("file_"):]
+        if a not in _DELIVER_ACTIONS:
+            return _bad(f"不认识的 action「{a or '（没给）'}」：可用 {'、'.join(_DELIVER_ACTIONS)}")
+        args = {**args, "action": a}
+        if a == "message":
+            return await send_group_message(ctx, args)
+        if a == "notice":
+            return await group_notice_send(ctx, args)
+        if a == "album_upload":
+            return await group_album_upload(ctx, args)
+        return await group_file_manage(ctx, args)
 
     async def run_news_now(ctx: ToolContext, args: dict) -> ToolResult:
         gid, err = _served(args.get("group_id") or ctx.group_id)
@@ -2124,7 +2689,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         # 所以要先写小票，管理员同意后才建任务并开工
         args = {**args, "group_id": gid}
         pending = _need_confirm(
-            "create_task",
+            "task_manage",
             args,
             f"会派一个子 agent 去做：{_tail(title, 60)}；做完 / 做不成时会在群 {gid} 里说一句",
         )
@@ -2171,7 +2736,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         # agent 目标立下后，后台检查会往群里发汇报 / 完成话（间接对外说话），先写小票
         args = {**args, "group_id": gid}
         pending = _need_confirm(
-            "create_goal",
+            "goal_manage",
             args,
             f"会立一个后台目标：{_tail(title, 60)}；之后会定期检查，有进展 / 完成时会在群 {gid} 里说一句",
         )
@@ -2215,7 +2780,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             return deny
         # 群友派的活要 **bot 管理员**批准（红线）；模型可能被群内容注入，
         # 绝不能一句话就替管理员把活批了——先写小票，管理员在网页点同意才算数
-        pending = _need_confirm("approve_request", args, f"批准请求 {rid}（{_tail(row['title'], 60)}，群 {gid}）")
+        pending = _need_confirm("request_manage", args, f"批准请求 {rid}（{_tail(row['title'], 60)}，群 {gid}）")
         if pending is not None:
             return pending
         try:
@@ -2304,7 +2869,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         # 暂停/恢复/取消 要确认（危险操作）
         if action in ("pause", "resume", "cancel"):
             pending = _need_confirm(
-                "goal_adjust",
+                "goal_manage",
                 args,
                 f"对目标 {goal_id}「{goal['title']}」执行 {action}",
             )
@@ -2363,98 +2928,142 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         ),
         (
             {
-                "name": "read_profile",
-                "description": "读一个服务群的画像条目（带编号，改的时候用编号）。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"group_id": {"type": "string", "description": "群号（可选）"}},
-                },
-            },
-            read_profile,
-        ),
-        (
-            {
-                "name": "list_focus",
-                "description": "看一个服务群现在关注了哪些成员。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"group_id": {"type": "string", "description": "群号（可选）"}},
-                },
-            },
-            list_focus,
-        ),
-        (
-            {
-                "name": "list_news",
-                "description": "看一个服务群最近备出来的资讯。",
+                "name": "profile_manage",
+                "description": (
+                    "看 / 改一个服务群的画像：action=read 读条目（带编号，默认）；"
+                    "add 新增（category 取 recent / interest / ongoing / convention / resource）；"
+                    "edit 改文字 / lock 锁定 / unlock 解锁 / delete 删（给 entry_id）；"
+                    "bulk_delete 一次删多条（entry_ids，要管理员确认）；"
+                    "refresh 现在重新整理画像（后台跑，不往群里发东西）。"
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "action": {"type": "string", "enum": ["read", "add", "edit", "lock", "unlock", "delete", "bulk_delete", "refresh"]},
                         "group_id": {"type": "string", "description": "群号（可选）"},
-                        "days": {"type": "integer", "description": "看最近几天，默认 7"},
+                        "category": {"type": "string", "description": "add 时的类别"},
+                        "text": {"type": "string", "description": "add / edit 时的文字"},
+                        "entry_id": {"type": "integer", "description": "edit / lock / unlock / delete 时的条目编号"},
+                        "entry_ids": {"type": "array", "items": {"type": "integer"}, "description": "bulk_delete 要删的条目编号"},
                     },
                 },
             },
-            list_news,
+            profile_manage,
         ),
         (
             {
-                "name": "list_ideas",
-                "description": "看一个服务群现在的构想。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"group_id": {"type": "string", "description": "群号（可选）"}},
-                },
-            },
-            list_ideas,
-        ),
-        (
-            {
-                "name": "list_tasks",
-                "description": "看一个服务群的任务列表。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"group_id": {"type": "string", "description": "群号（可选）"}},
-                },
-            },
-            list_tasks,
-        ),
-        (
-            {
-                "name": "task_detail",
-                "description": "看一个任务的详情：要求、完成标准、最近的工具调用。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"task_id": {"type": "string", "description": "任务编号"}},
-                    "required": ["task_id"],
-                },
-            },
-            task_detail,
-        ),
-        (
-            {
-                "name": "list_goals",
-                "description": "看一个服务群在盯的目标（agent 目标 / 成员提醒）。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"group_id": {"type": "string", "description": "群号（可选）"}},
-                },
-            },
-            list_goals,
-        ),
-        (
-            {
-                "name": "list_requests",
-                "description": "看群友派的活（待批 / 已批 / 已拒）。",
+                "name": "focus_manage",
+                "description": "看 / 调一个服务群的关注成员：action=list 看（默认）；add 一直关注 / remove 取消 / auto 改回自动挑。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "group_id": {"type": "string", "description": "群号（可选，默认当前群；填 * 看所有服务群）"},
-                        "status": {"type": "string", "description": "pending / approved / rejected / expired，默认 pending"},
+                        "action": {"type": "string", "enum": ["list", "add", "remove", "auto"]},
+                        "group_id": {"type": "string", "description": "群号（可选）"},
+                        "user_id": {"type": "string", "description": "群友 QQ 号（add / remove / auto 用）"},
                     },
                 },
             },
-            list_requests,
+            focus_manage,
+        ),
+        (
+            {
+                "name": "news_manage",
+                "description": "看 / 备一个服务群的资讯：action=list 看最近备出来的（默认）；run_now 现在备一批（后台跑，不占今天的定时时段）。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "run_now"]},
+                        "group_id": {"type": "string", "description": "群号（可选）"},
+                        "days": {"type": "integer", "description": "list 用：看最近几天，默认 7"},
+                    },
+                },
+            },
+            news_manage,
+        ),
+        (
+            {
+                "name": "idea_manage",
+                "description": "看 / 想一个服务群的构想：action=list 看现在的（默认）；make_now 现在想一个（后台跑，同群同时只想一个）。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "make_now"]},
+                        "group_id": {"type": "string", "description": "群号（可选）"},
+                    },
+                },
+            },
+            idea_manage,
+        ),
+        (
+            {
+                "name": "task_manage",
+                "description": (
+                    "看 / 派 / 取消任务：action=list 看任务列表（默认；给了 task_id 没给 action 按 detail）；"
+                    "detail 看详情（要求、完成标准、最近的工具调用）；"
+                    "create 建一个并立刻开工（要管理员确认；只用于需要子 agent 产出东西的活，"
+                    "MaiWork 自己的维护别派：刷新画像用 profile_manage 的 refresh、备资讯用 "
+                    "news_manage 的 run_now、想构想用 idea_manage 的 make_now）；cancel 取消。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "detail", "create", "cancel"]},
+                        "group_id": {"type": "string", "description": "群号（可选）"},
+                        "task_id": {"type": "string", "description": "任务编号（detail / cancel 用）"},
+                        "title": {"type": "string", "description": "create 用：任务名字"},
+                        "request": {"type": "string", "description": "create 用：要干什么，说清楚"},
+                        "criteria": {"type": "array", "items": {"type": "string"}, "description": "create 用：完成标准（可选）"},
+                        "reason": {"type": "string", "description": "cancel 用：为什么取消（可选）"},
+                    },
+                },
+            },
+            task_manage,
+        ),
+        (
+            {
+                "name": "goal_manage",
+                "description": (
+                    "看 / 立 / 调目标：action=list 看（默认）；create 立一个后台目标"
+                    "（按完成标准一直盯；有进展 / 完成时会在群里说一句，所以要确认）；"
+                    "调整用 add_criterion / remove_criterion / edit_criterion / set_interval / "
+                    "set_url / set_guidance（给 goal_id）；pause / resume / cancel 要确认。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "description": "操作（见描述；默认 list）"},
+                        "group_id": {"type": "string", "description": "群号（可选）"},
+                        "goal_id": {"type": "string", "description": "目标编号（调整用）"},
+                        "title": {"type": "string", "description": "create 用：目标名字"},
+                        "body": {"type": "string", "description": "create 用：目标说明（可选）"},
+                        "criteria": {"type": "array", "items": {"type": "string"}, "description": "create 用：怎么算做到（至少一条）"},
+                        "check_hours": {"type": "integer", "description": "create 用：每几小时检查一次（可选）"},
+                        "index": {"type": "integer", "description": "改标准时用，从 0 开始"},
+                        "text": {"type": "string", "description": "改标准时的内容"},
+                        "hours": {"type": "number", "minimum": 1, "maximum": 72, "description": "set_interval 用：检查间隔小时数（1–72）"},
+                        "url": {"type": "string", "maxLength": 2048, "description": "set_url 用：来源网址（空串清除）"},
+                        "guidance": {"type": "string", "maxLength": 4000, "description": "set_guidance 用：补充指导（空串清除）"},
+                    },
+                },
+            },
+            goal_manage,
+        ),
+        (
+            {
+                "name": "request_manage",
+                "description": "看 / 批 / 拒群友派的活：action=list 看（默认）；approve 批准（批准后自动落成任务并开工，要管理员确认）；reject 拒绝。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "approve", "reject"]},
+                        "request_id": {"type": "string", "description": "请求编号（approve / reject 用）"},
+                        "reason": {"type": "string", "description": "reject 用：为什么拒（可选）"},
+                        "group_id": {"type": "string", "description": "list 用：群号（可选，默认当前群；填 * 看所有服务群）"},
+                        "status": {"type": "string", "description": "list 用：pending / approved / rejected / expired，默认 pending"},
+                    },
+                },
+            },
+            request_manage,
         ),
         (
             {
@@ -2496,12 +3105,23 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         (
             {
                 "name": "read_logs",
-                "description": "看模型调用日志（哪次失败了、什么错），失败原因已遮密钥。",
+                "description": (
+                    "看日志：kind=models 看模型调用（哪次失败了、什么错，默认）；"
+                    "kind=tools 看真实工具调用记录（子 agent / 主模型 / 管理员自己的：谁、什么时候、"
+                    "调了什么工具、入参、返回或报错、耗时、成败）；kind=all 两段都回。"
+                    "传了 tool 或 task_id 不给 kind 时自动按 tools 查；task_id 按前缀过滤，"
+                    "tool 按名字包含过滤；只给服务群和全局的记录，失败原因已遮密钥。"
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "kind": {"type": "string", "enum": ["models", "tools", "all"],
+                                 "description": "看哪种日志：models（模型调用，默认）/ tools（工具调用）/ all（两种）"},
+                        "group_id": {"type": "string", "description": "群号（可选，默认当前聚焦群；填 * 看所有服务群）"},
+                        "task_id": {"type": "string", "description": "任务号前缀（比如 feeds-verify、T-9、admin-tool；tools 用）"},
+                        "tool": {"type": "string", "description": "工具名包含（比如 flovia 能捞出 mcp_flovia_flovia_x；tools 用）"},
                         "failed_only": {"type": "boolean", "description": "只看失败的"},
-                        "limit": {"type": "integer", "description": "最多几条，默认 20"},
+                        "limit": {"type": "integer", "description": "最多几条，默认 20（tools 默认 30），最多 200"},
                     },
                 },
             },
@@ -2509,210 +3129,140 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         ),
         (
             {
-                "name": "get_rules",
-                "description": "看现在生效的规则（主动发言 / 开话题 / 派活审批 / 资讯，含网页改过的覆盖）。",
-                "parameters": {"type": "object", "properties": {}},
-            },
-            get_rules,
-        ),
-        (
-            {
-                "name": "get_identity",
-                "description": "看现在的身份与工作记忆（SOUL / AGENTS / MEMORY）。",
-                "parameters": {"type": "object", "properties": {}},
-            },
-            get_identity,
-        ),
-        (
-            {
-                "name": "list_extensions",
-                "description": "看现在的扩展：MCP 连接和 skill。",
-                "parameters": {"type": "object", "properties": {}},
-            },
-            list_extensions,
-        ),
-        (
-            {
-                "name": "profile_edit",
-                "description": "改一个服务群的画像条目：add 新增 / edit 改文字 / lock 锁定 / unlock 解锁 / delete 删除。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "group_id": {"type": "string", "description": "群号（可选）"},
-                        "action": {"type": "string", "enum": ["add", "edit", "lock", "unlock", "delete"]},
-                        "category": {"type": "string", "description": "add 时的类别：recent / interest / ongoing / convention / resource"},
-                        "text": {"type": "string", "description": "add / edit 时的文字"},
-                        "entry_id": {"type": "integer", "description": "edit / lock / unlock / delete 时的条目编号"},
-                    },
-                    "required": ["action"],
-                },
-            },
-            profile_edit,
-        ),
-        (
-            {
-                "name": "profile_bulk_delete",
-                "description": "一次删多条画像条目（要管理员确认）。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "group_id": {"type": "string", "description": "群号（可选）"},
-                        "entry_ids": {"type": "array", "items": {"type": "integer"}, "description": "要删的条目编号"},
-                    },
-                    "required": ["entry_ids"],
-                },
-            },
-            profile_bulk_delete,
-        ),
-        (
-            {
-                "name": "focus_edit",
-                "description": "手动调一个服务群的关注成员：add 一直关注 / remove 取消 / auto 改回自动挑。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "group_id": {"type": "string", "description": "群号（可选）"},
-                        "user_id": {"type": "string", "description": "群友 QQ 号"},
-                        "action": {"type": "string", "enum": ["add", "remove", "auto"]},
-                    },
-                    "required": ["user_id", "action"],
-                },
-            },
-            focus_edit,
-        ),
-        (
-            {
-                "name": "rss_add",
-                "description": "给一个服务群加一个 RSS 源。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "group_id": {"type": "string", "description": "群号（可选）"},
-                        "url": {"type": "string", "description": "RSS / Atom 地址"},
-                        "title": {"type": "string", "description": "标题（可选）"},
-                    },
-                    "required": ["url"],
-                },
-            },
-            rss_add,
-        ),
-        (
-            {
-                "name": "rss_remove",
-                "description": "从一个服务群删掉一个 RSS 源（要管理员确认）。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "group_id": {"type": "string", "description": "群号（可选）"},
-                        "feed_id": {"type": "string", "description": "RSS 源编号"},
-                    },
-                    "required": ["feed_id"],
-                },
-            },
-            rss_remove,
-        ),
-        (
-            {
-                "name": "block_domain",
-                "description": "屏蔽 / 取消屏蔽一个来源域名（只对这个服务群生效，不写 group_id 就用当前对话的群）。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "group_id": {"type": "string", "description": "群号（可选，不给 = 当前群）"},
-                        "domain": {"type": "string", "description": "域名，如 example.com"},
-                        "blocked": {"type": "boolean", "description": "true 屏蔽 / false 取消屏蔽"},
-                    },
-                    "required": ["domain"],
-                },
-            },
-            block_domain,
-        ),
-        (
-            {
-                "name": "set_rules",
-                "description": '改规则（主动发言 / 开话题 / 派活审批 / 资讯），形如 {"delivery": {"push_per_day": 5}}。直接写进 config.toml 立刻生效；放宽安全设置时要管理员确认。',
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "patch": {"type": "object", "description": "{节: {字段: 值}}，配置里的任意可改字段"},
-                    },
-                    "required": ["patch"],
-                },
-            },
-            set_rules,
-        ),
-        (
-            {
-                "name": "identity_edit",
-                "description": "改身份与工作记忆（只全局三份）：kind 取 soul / agents / memory。每群内容请走网页「本群规矩 / 本群做法」。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "kind": {"type": "string", "enum": ["soul", "agents", "memory"]},
-                        "text": {"type": "string", "description": "新的全文"},
-                    },
-                    "required": ["kind", "text"],
-                },
-            },
-            identity_edit,
-        ),
-        (
-            {
-                "name": "remember",
-                "description": "让 MaiWork 记住一件事：带 group_id 进本群「本群规矩」（append 一行；规矩超上限要管理员先去网页清）；不带 group_id 进全局 MEMORY.md。去重与隐私闸照旧生效。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string", "description": "要记住的事"},
-                        "group_id": {"type": "string", "description": "记在某个服务群名下（可选；不填记全局）"},
-                    },
-                    "required": ["text"],
-                },
-            },
-            remember,
-        ),
-        (
-            {
-                "name": "send_group_message",
-                "description": "让 MaiWork 在一个服务群里说一句话（要管理员确认后才会真发）。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "group_id": {"type": "string", "description": "群号（可选）"},
-                        "text": {"type": "string", "description": "要说的话"},
-                    },
-                    "required": ["text"],
-                },
-            },
-            send_group_message,
-        ),
-        (
-            {
-                "name": "group_notice_send",
-                "description": "发群公告（要管理员确认；机器人得是群主或管理员）。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "group_id": {"type": "string", "description": "群号（可选）"},
-                        "content": {"type": "string", "description": "公告内容"},
-                    },
-                    "required": ["content"],
-                },
-            },
-            group_notice_send,
-        ),
-        (
-            {
-                "name": "group_file_manage",
+                "name": "tool_run",
                 "description": (
-                    "管群文件：delete / rename / move / mkdir / rmdir（要管理员确认；"
-                    "文件和文件夹都只能动机器人自己传 / 自己建的，删文件夹时里面只能有自己的东西）。"
+                    "亲手试调一个注册给子 agent 的工具一次：回显真实返回或真实报错，"
+                    "照常记进工具调用记录（read_logs 能查回来）。"
+                    "执行类和只在派活回合用的工具会先出待确认小票；"
+                    "要工作区的在单独临时工作区里跑。"
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "name": {"type": "string", "description": "已注册工具名（agent_manage 的 detail 里看到的）"},
+                        "args": {"type": "object", "description": "工具参数（JSON 对象，默认 {}）"},
+                        "group_id": {"type": "string", "description": "工具拿群上下文时的群号（可选，默认当前聚焦群）"},
+                    },
+                    "required": ["name"],
+                },
+            },
+            tool_run,
+            150.0,  # 内层还要等子 agent 工具自己的超时 + 开关临时工作区，放宽到 150 秒
+        ),
+        (
+            {
+                "name": "rules_manage",
+                "description": (
+                    "看 / 改现在生效的规则（主动发言 / 开话题 / 派活审批 / 资讯，含网页改过的覆盖）："
+                    "action=get 看（默认）；action=set 改，patch 形如 {\"delivery\": {\"push_per_day\": 5}}，"
+                    "直接写进 config.toml 立刻生效；放宽安全设置时要管理员确认。不给 action 时带了 patch 按 set。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["get", "set"], "description": "看 / 改（默认看）"},
+                        "patch": {"type": "object", "description": "set 用：{节: {字段: 值}}，配置里的任意可改字段"},
+                    },
+                },
+            },
+            rules_manage,
+        ),
+        (
+            {
+                "name": "identity_manage",
+                "description": (
+                    "看 / 改身份与工作记忆、记一件事：action=get 看 SOUL / AGENTS / MEMORY（默认）；"
+                    "action=edit 改其中一份（kind 取 soul / agents / memory，text 给新全文；每群内容走网页"
+                    "「本群规矩 / 本群做法」）；action=remember 记一件事（带 group_id 进本群「本群规矩」"
+                    "追加一行，不带进全局 MEMORY.md；去重与隐私闸照旧）。不给 action 时：kind+text 按 edit、"
+                    "只有 text 按 remember、都没有按 get。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["get", "edit", "remember"], "description": "看 / 改 / 记"},
+                        "kind": {"type": "string", "enum": ["soul", "agents", "memory"], "description": "edit 用：改哪份"},
+                        "text": {"type": "string", "description": "edit 的新全文 / remember 要记住的事"},
+                        "group_id": {"type": "string", "description": "remember 用：记在某个服务群名下（可选；不填记全局）"},
+                    },
+                },
+            },
+            identity_manage,
+        ),
+        (
+            {
+                "name": "source_manage",
+                "description": (
+                    "管一个服务群的资讯来源：action=rss_add 加 RSS 源；rss_remove 删 RSS 源（要管理员确认）；"
+                    "block_domain 屏蔽域名 / unblock_domain 取消屏蔽（只对这个群生效）。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["rss_add", "rss_remove", "block_domain", "unblock_domain"]},
                         "group_id": {"type": "string", "description": "群号（可选）"},
-                        "action": {"type": "string", "enum": ["delete", "rename", "move", "mkdir", "rmdir"]},
+                        "url": {"type": "string", "description": "rss_add 用：RSS / Atom 地址"},
+                        "title": {"type": "string", "description": "rss_add 用：标题（可选）"},
+                        "feed_id": {"type": "string", "description": "rss_remove 用：RSS 源编号"},
+                        "domain": {"type": "string", "description": "block_domain / unblock_domain 用：域名，如 example.com"},
+                    },
+                    "required": ["action"],
+                },
+            },
+            source_manage,
+        ),
+        (
+            {
+                "name": "skill_manage",
+                "description": (
+                    "管做法（skill）：action=list 看现在的扩展（MCP 连接）和做法（默认）；"
+                    "action=write 新建 / 改一份做法（名字、一句话说明、正文、roles、allowed-tools；"
+                    "声明执行类工具会先出待确认小票，同名内置做法改不了）；"
+                    "action=install 从网址装一个做法（要确认，确认后才下载；认 GitHub 上 skill 目录 / "
+                    "SKILL.md 的链接或 .zip，只装管理员点名要的）；action=delete 删一个做法（要确认）。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "write", "install", "delete"],
+                                   "description": "看 / 写 / 装 / 删（默认看）"},
+                        "name": {"type": "string", "description": "做法名（write / delete 用；小写字母/数字/连字符）"},
+                        "description": {"type": "string", "description": "write 用：一句话说明"},
+                        "body": {"type": "string", "description": "write 用：做法正文（写给子 agent 看的：什么时候用这些工具、怎么用）"},
+                        "allowed_tools": {"type": "array", "items": {"type": "string"},
+                                          "description": "write 用：允许调用的工具注册名（如 mcp_flovia_flovia_x、run_command）"},
+                        "roles": {"type": "array", "items": {"type": "string"},
+                                  "description": "write 用：默认 worker；一般不用给"},
+                        "url": {"type": "string", "description": "install 用：https 网址"},
+                        "replace": {"type": "boolean", "description": "install 用：已有同名做法时覆盖（默认否）"},
+                        "allow_exec_tools": {"type": "boolean",
+                                             "description": "install 用：同意安装声明了执行类工具的做法（默认否；"
+                                                           "需要时上一次调用会说明声明了哪些）"},
+                    },
+                },
+            },
+            skill_manage,
+            60.0,  # install 要下载 + 解压，放宽到 60 秒
+        ),
+        (
+            {
+                "name": "group_deliver",
+                "description": (
+                    "往一个服务群交付 / 管群文件（每个 action 都要管理员确认）："
+                    "message 群里说一句话；notice 发群公告（机器人得是群主或管理员）；"
+                    "album_upload 把工作区里的成品图传进群相册；"
+                    "delete / rename / move / mkdir / rmdir 管群文件"
+                    "（只能动机器人自己传 / 自己建的，删文件夹时里面只能有自己的东西）。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["message", "notice", "album_upload", "delete", "rename", "move", "mkdir", "rmdir"]},
+                        "group_id": {"type": "string", "description": "群号（可选）"},
+                        "text": {"type": "string", "description": "message 用：要说的话"},
+                        "content": {"type": "string", "description": "notice 用：公告内容"},
+                        "path": {"type": "string", "description": "album_upload 用：工作区内图片的绝对路径"},
+                        "album_id": {"type": "string", "description": "album_upload 用：相册编号"},
                         "file_id": {"type": "string", "description": "文件编号"},
                         "name": {"type": "string", "description": "新名字 / 文件夹名"},
                         "folder_id": {"type": "string", "description": "目标文件夹 / 要删的文件夹"},
@@ -2720,53 +3270,26 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                     "required": ["action"],
                 },
             },
-            group_file_manage,
+            group_deliver,
         ),
         (
             {
-                "name": "group_album_upload",
-                "description": "把工作区里的一张成品图传进群相册（要管理员确认）。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "group_id": {"type": "string", "description": "群号（可选）"},
-                        "path": {"type": "string", "description": "工作区内图片的绝对路径"},
-                        "album_id": {"type": "string", "description": "相册编号"},
-                    },
-                    "required": ["path"],
-                },
-            },
-            group_album_upload,
-        ),
-        (
-            {
-                "name": "skill_delete",
-                "description": "删掉一个 skill（要管理员确认）。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"name": {"type": "string", "description": "skill 名字"}},
-                    "required": ["name"],
-                },
-            },
-            skill_delete,
-        ),
-        (
-            {
-                "name": "skill_install",
+                "name": "social_toggle",
                 "description": (
-                    "从网址安装一个 skill（要管理员确认；确认后才下载）。认 GitHub 上 skill 目录 / SKILL.md 的链接"
-                    "（只装 SKILL.md 这一份），或一个 .zip 下载链接（整包）。只装管理员点名要的，不自己挑来装。"
+                    "开 / 关一个社交平台（twitter、xiaohongshu、bilibili、youtube、reddit）。"
+                    "打开要先确认，会自动补搜；没装会在后台装。Cookie 不经过对话，"
+                    "让管理员到网页「设置 → 登录态」自己填。"
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "url": {"type": "string", "description": "https 网址"},
-                        "replace": {"type": "boolean", "description": "已有同名 skill 时覆盖（默认否）"},
+                        "platform": {"type": "string", "description": "平台 id"},
+                        "enabled": {"type": "boolean", "description": "true 开 / false 关"},
                     },
-                    "required": ["url"],
+                    "required": ["platform", "enabled"],
                 },
             },
-            skill_install,
+            social_toggle,
         ),
         (
             {
@@ -2780,172 +3303,11 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             },
             env_overview,
         ),
-        (
-            {
-                "name": "mcp_toggle",
-                "description": "开 / 关一个 MCP 扩展。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "扩展名字"},
-                        "enabled": {"type": "boolean", "description": "true 开 / false 关"},
-                    },
-                    "required": ["name"],
-                },
-            },
-            mcp_toggle,
-        ),
-        (
-            {
-                "name": "mcp_delete",
-                "description": "删掉一个网页加的 MCP 扩展（要管理员确认）。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"name": {"type": "string", "description": "扩展名字"}},
-                    "required": ["name"],
-                },
-            },
-            mcp_delete,
-        ),
-        (
-            {
-                "name": "run_news_now",
-                "description": "让一个服务群现在备一批资讯（后台跑，不占今天的定时时段）。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"group_id": {"type": "string", "description": "群号（可选）"}},
-                },
-            },
-            run_news_now,
-        ),
-        (
-            {
-                "name": "make_idea_now",
-                "description": "让一个服务群现在想一个构想（后台跑）。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"group_id": {"type": "string", "description": "群号（可选）"}},
-                },
-            },
-            make_idea_now,
-        ),
-        (
-            {
-                "name": "refresh_profile",
-                "description": "现在重新整理一个服务群的画像（后台跑；同群同时只整理一次）。不往群里发任何东西，不用确认。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"group_id": {"type": "string", "description": "群号（可选）"}},
-                },
-            },
-            refresh_profile,
-        ),
-        (
-            {
-                "name": "create_task",
-                "description": (
-                    "给一个服务群建一个任务并立刻开工（要管理员确认）。"
-                    "只用于需要子 agent 产出东西的活（写文档、做网页、跑脚本等）；"
-                    "MaiWork 自己的维护不要派任务：刷新画像用 refresh_profile、备资讯用 run_news_now、"
-                    "想构想用 make_idea_now。"
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "group_id": {"type": "string", "description": "群号（可选）"},
-                        "title": {"type": "string", "description": "任务名字"},
-                        "request": {"type": "string", "description": "要干什么，说清楚"},
-                        "criteria": {"type": "array", "items": {"type": "string"}, "description": "完成标准（可选）"},
-                    },
-                    "required": ["title", "request"],
-                },
-            },
-            create_task,
-        ),
-        (
-            {
-                "name": "create_goal",
-                "description": "给一个服务群立一个后台目标（按完成标准一直盯；有进展 / 完成时会在群里说一句，所以要管理员确认）。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "group_id": {"type": "string", "description": "群号（可选）"},
-                        "title": {"type": "string", "description": "目标名字"},
-                        "body": {"type": "string", "description": "目标说明（可选）"},
-                        "criteria": {"type": "array", "items": {"type": "string"}, "description": "怎么算做到（至少一条）"},
-                        "check_hours": {"type": "integer", "description": "每几小时检查一次（可选）"},
-                    },
-                    "required": ["title", "criteria"],
-                },
-            },
-            create_goal,
-        ),
-        (
-            {
-                "name": "approve_request",
-                "description": "批准一个群友派的活（批准后自动落成任务并开工）。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"request_id": {"type": "string", "description": "请求编号"}},
-                    "required": ["request_id"],
-                },
-            },
-            approve_request,
-        ),
-        (
-            {
-                "name": "reject_request",
-                "description": "拒绝一个群友派的活。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "request_id": {"type": "string", "description": "请求编号"},
-                        "reason": {"type": "string", "description": "为什么拒（可选）"},
-                    },
-                    "required": ["request_id"],
-                },
-            },
-            reject_request,
-        ),
-        (
-            {
-                "name": "cancel_task",
-                "description": "取消一个任务。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "task_id": {"type": "string", "description": "任务编号"},
-                        "reason": {"type": "string", "description": "为什么取消（可选）"},
-                    },
-                    "required": ["task_id"],
-                },
-            },
-            cancel_task,
-        ),
-        (
-            {
-                "name": "goal_adjust",
-                "description": "调整目标：改标准、暂停/恢复/取消、改检查频率。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "goal_id": {"type": "string", "description": "目标编号"},
-                        "action": {"type": "string", "description": "操作：add_criterion / remove_criterion / edit_criterion / pause / resume / cancel / set_interval / set_url / set_guidance"},
-                        "index": {"type": "integer", "description": "标准序号（改标准时用，从 0 开始）"},
-                        "text": {"type": "string", "description": "标准内容（改标准时用）"},
-                        "hours": {"type": "number", "minimum": 1, "maximum": 72, "description": "检查间隔小时数（set_interval，1–72）"},
-                        "url": {"type": "string", "maxLength": 2048, "description": "来源网址（set_url，空串清除）"},
-                        "guidance": {"type": "string", "maxLength": 4000, "description": "补充指导（set_guidance，空串清除）"},
-                    },
-                    "required": ["goal_id", "action"],
-                },
-            },
-            goal_adjust,
-        ),
     ]
 
-    for spec, handler in _SPECS:
-        _register(spec, handler)
+    for spec, handler, *rest in _SPECS:
+        # 第三项可选：这个工具自己的超时（tool_run 内层还要等 worker 工具跑完，放宽）
+        _register(spec, handler, timeout_s=float(rest[0]) if rest else 30.0)
 
     # 改设置的那批（MCP / 专岗 / 端点与模型库）：和网页设置页同一套校验，密钥不经过对话
     from .tools_admin_settings import register_settings_tools

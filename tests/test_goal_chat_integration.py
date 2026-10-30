@@ -20,7 +20,7 @@ async def test_goal_conversation_confirmation_runs_registered_action(env):
     await env.login()
     gid = goal(env.app)
     env.app.models = _Models(script=[
-        _res(tool_calls=[_call("goal_adjust", {"group_id": G1, "goal_id": gid, "action": "pause"})]),
+        _res(tool_calls=[_call("goal_manage", {"group_id": G1, "goal_id": gid, "action": "pause"})]),
         _res("请确认暂停这个目标"), _res("已暂停"),
     ])
     response = await env.client.post(f"/api/goals/{gid}/chat", json={"text": "暂停这个目标"})

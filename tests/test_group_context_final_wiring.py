@@ -140,8 +140,8 @@ async def test_admin_remember_entry_still_appends_group_rules(env: SimpleEnv) ->
     before = agents.group_rules_get(G1)
 
     res = await app.tools.call(
-        "remember",
-        {"text": "本群喜欢可视化交付", "group_id": G1},
+        "identity_manage",
+        {"action": "remember", "text": "本群喜欢可视化交付", "group_id": G1},
         ADMIN,
     )
     assert res.ok, res.error

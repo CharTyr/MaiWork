@@ -50,6 +50,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -352,6 +353,19 @@ def _in_denied_range(addr: str) -> bool:
     return any(ip.version == net.version and ip in net for net in _NET_DENIED_RANGES)
 
 
+def _base36(n: int) -> str:
+    """非负整数 → base36 小写串（ephemeral 工作区名的时间戳段）。"""
+    n = max(0, int(n))
+    if n == 0:
+        return "0"
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out = ""
+    while n:
+        out = digits[n % 36] + out
+        n //= 36
+    return out
+
+
 def lookup_uid(name: str) -> int | None:
     """查系统账号的 uid；账号不存在 / 平台没有 pwd 模块 → None（放行，交给 systemd 自己报错）。"""
     if pwd is None:
@@ -375,6 +389,10 @@ class LocalEnv:
         self._procs: dict[str, dict[str, Any]] = {}
         # 不等结果的后台收尾任务（超时兜底 systemctl stop）：留强引用到跑完
         self._bg_tasks: set[asyncio.Task] = set()
+        # ephemeral（自动回合单独工作区）登记：名字 -> 本轮截止 ts（None = 不设）。
+        # 只有登记过的名字 run()/start() 才把时长夹到剩余秒——任务工作区不在表里，
+        # 时长行为一字不变（夹时长绝不能影响派活工作区）。
+        self._deadlines: dict[str, float | None] = {}
 
     # ------------------------------------------------------------------
     # 小工具
@@ -722,6 +740,19 @@ class LocalEnv:
     # run：跑一条命令，等它结束
     # ------------------------------------------------------------------
 
+    def _ephemeral_expired(self, name: str) -> bool:
+        """登记过的 ephemeral 工作区已经过点？过点不建目录、不跑命令。"""
+        dl = self._deadlines.get(name)
+        return bool(dl and clock.now() >= dl)
+
+    def _ephemeral_clip(self, name: str, limit: int) -> int:
+        """登记过的 ephemeral 工作区：命令上限夹到本轮剩余秒（未登记/没设截止 → 原样）。"""
+        dl = self._deadlines.get(name)
+        if not dl:
+            return int(limit)
+        remaining = dl - clock.now()
+        return max(1, min(int(limit), int(remaining)))
+
     async def run(
         self,
         name: str,
@@ -731,6 +762,9 @@ class LocalEnv:
         memory: str | None = None,
         cwd: str = "",
     ) -> RunResult:
+        if self._ephemeral_expired(name):
+            # 本轮时间到了：不建工作区目录、不跑，直接回报「到点」
+            return self._make_result(-1, "", "这一轮时间到了（回合截止），命令没跑", clock.now(), True)
         ws = self.workspace(name)
         cmd = str(command)
         if cwd:
@@ -744,6 +778,7 @@ class LocalEnv:
             if timeout_s is None
             else max(1, min(int(timeout_s), self._runtime_max()))
         )
+        limit = self._ephemeral_clip(name, limit)
         guard = limit + 15  # 外层兜底：比 RuntimeMaxSec 多 15 秒，宁可多等不可漏杀
         started = clock.now()
 
@@ -898,6 +933,8 @@ class LocalEnv:
         线上实测 ExecMainStatus 恒 0；status 只能从 .exit 文件拿真退出码）。
         """
         label = self._check_label(label)
+        if self._ephemeral_expired(name):
+            raise ValueError("这一轮时间到了（回合截止），后台进程没起")
         ws = self.workspace(name)
         unit = f"maiwork-{name}-{label}"
         log_dir = ws / "runtime" / "logs"
@@ -912,6 +949,7 @@ class LocalEnv:
         except OSError:
             pass
         limit = min(max(1, int(timeout_s)), self._runtime_max())
+        limit = self._ephemeral_clip(name, limit)
         # M12：ws / log_path / exit_path 拼进 bash -lc 前一律 quote（根目录走配置，可以带空格）
         inner = (
             f"cd {shlex.quote(str(ws))} && ( {command} ) >> {shlex.quote(str(log_path))} 2>&1; "
@@ -1076,6 +1114,91 @@ class LocalEnv:
         if info is None:
             return
         await self._kill_entry(info)
+
+    async def stop_all(self, name: str) -> None:
+        """停掉一个工作区名下**所有**后台进程（单元名 maiwork-<name>-*）。幂等。
+
+        - systemd：`systemctl list-units 'maiwork-<name>-*' --plain --no-legend --all`
+          列出（含已退出的）逐个 stop；
+        - direct：按 self._procs 的登记筛前缀。
+        """
+        name = str(name or "")
+        if not name:
+            return
+        prefix = f"maiwork-{name}-"
+        if self._mode() == "systemd":
+            ws = Path(self._get_settings().environments.workspace_root)
+            env_min = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+            try:
+                code, out, _err = await self._exec(
+                    ["systemctl", "list-units", f"{prefix}*", "--plain", "--no-legend", "--all"],
+                    cwd=ws, env=env_min, timeout_s=10,
+                )
+            except Exception:
+                logger.warning("列工作区 %s 名下单元失败（可能本来就没有）", name)
+                return
+            if code != 0:
+                return
+            for line in str(out or "").splitlines():
+                unit = line.split()[0].strip() if line.split() else ""
+                if unit:
+                    await self.stop(unit)
+            return
+        for unit in [u for u in list(self._procs) if u.startswith(prefix)]:
+            await self.stop(unit)
+
+    def ephemeral(self, prefix: str, *, deadline_ts: float | None = None) -> "_EphemeralWS":
+        """自动回合的单独工作区（async with 用）。
+
+        - 进入：只起个唯一名（不建目录，用到才建）并登记本轮截止；
+        - 期间：run()/start() 对登记名把时长夹到剩余秒，过点直接拒；
+        - 退出（正常/异常/取消）：停名下全部后台进程、按精确名删整个目录、去登记；
+          清理异常只记日志不抛，CancelledError 不吞。
+        """
+        return _EphemeralWS(self, str(prefix or ""), deadline_ts)
+
+    def _ephemeral_new_name(self, prefix: str) -> str:
+        """起一个唯一工作区名：<prefix>-<毫秒base36>-<6位随机>（过 _NAME_RE，≤64）。"""
+        pre = "".join(c for c in str(prefix or "").lower() if c in "abcdefghijklmnopqrstuvwxyz0123456789-").strip("-")
+        if not pre:
+            raise ValueError("ephemeral 前缀不合法（要字母/数字/横线）")
+        root = Path(self._get_settings().environments.workspace_root).resolve()
+        for _ in range(30):
+            ms_b36 = _base36(int(clock.now() * 1000))
+            name = f"{pre}-{ms_b36}-{secrets.token_hex(3)}"
+            if len(name) > 64 or not _NAME_RE.match(name):
+                continue
+            try:
+                if not (root / name).exists() and not (root / name).is_symlink():
+                    return name
+            except OSError:
+                return name
+        raise RuntimeError("起不出唯一的工作区名（重摇 30 次都撞了）")
+
+    async def _ephemeral_cleanup(self, name: str) -> None:
+        """ephemeral 退出收尾：停名下后台进程 → 按精确名删目录 → 去登记。"""
+        self._deadlines.pop(name, None)
+        try:
+            await self.stop_all(name)
+        except Exception:
+            logger.exception("停单独工作区 %s 的后台进程失败（目录照删）", name)
+        if not _NAME_RE.match(name or ""):
+            logger.warning("单独工作区名 %r 不合法，不删", name)
+            return
+        root = Path(self._get_settings().environments.workspace_root).resolve()
+        target = root / name
+        try:
+            root_real = os.path.realpath(str(root))
+            dir_real = os.path.realpath(str(target))
+        except OSError:
+            return
+        try:
+            if target.is_symlink():
+                target.unlink()
+            elif dir_real.startswith(root_real + os.sep) and target.is_dir():
+                shutil.rmtree(dir_real)
+        except OSError:
+            logger.exception("删单独工作区目录失败 %s", target)
 
     async def close(self) -> None:
         """M4：收摊子——杀掉所有 direct 后台进程、关日志句柄、取消 kill 定时器。
@@ -1403,3 +1526,37 @@ class LocalEnv:
             finally:
                 os.close(base_fd)
         return entries
+
+
+class _EphemeralWS:
+    """ephemeral() 的返回值：async with 的单独工作区上下文。
+
+    只在 __aenter__ 起名字 + 登记截止（不建目录）；__aexit__ 里停名下后台进程、
+    删整个目录、去登记——清理异常只记日志，绝不吞 CancelledError（不抑制异常）。
+    """
+
+    def __init__(self, env: "LocalEnv", prefix: str, deadline_ts: float | None) -> None:
+        self._env = env
+        self._prefix = prefix
+        self._deadline_ts = deadline_ts
+        self.name = ""
+        self.path: Path | None = None
+
+    async def __aenter__(self) -> Path:
+        env = self._env
+        name = env._ephemeral_new_name(self._prefix)  # noqa: SLF001
+        env._deadlines[name] = self._deadline_ts  # noqa: SLF001
+        self.name = name
+        root = Path(env._get_settings().environments.workspace_root).resolve()  # noqa: SLF001
+        self.path = root / name
+        return self.path
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        if self.name:
+            try:
+                await self._env._ephemeral_cleanup(self.name)  # noqa: SLF001
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("单独工作区 %s 收尾失败", self.name)
+        return False  # 不抑制任何异常 / 取消

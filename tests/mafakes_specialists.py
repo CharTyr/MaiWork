@@ -168,6 +168,24 @@ class FakeSpecialists:
             ok=bool(report.ok), error=str(report.error or ""))
         return report
 
+    async def run_auto(self, kind, brief, *, phase, group_id, task_id="",
+                       deadline_ts=None, max_steps=0, actor="", output_schema=None):
+        """自动回合入口（2026-10-30 run_auto）：和真实现同签名，转发到 run。
+
+        名单计算（AUTO_PHASES + 做法工具）和单独工作区由真 Specialists 负责；
+        这个 fake 只录「调用点报了 phase」，tools 给环节基础名单（AUTO_PHASES，
+        不含做法工具——fake 没有技能/注册表，测做法工具走真 Specialists）。
+        """
+        from CharTyr_MaiWork.maiwork.specialists import AUTO_PHASES as _AUTO
+
+        return await self.run(
+            kind, brief,
+            group_id=group_id, phase=phase, task_id=task_id,
+            tools=list(_AUTO.get((str(kind), str(phase)), ())),
+            output_schema=output_schema, actor=actor, deadline_ts=deadline_ts,
+            max_steps=max_steps,
+        )
+
     def review(self, gid, report_or_id, accepted, summary, refs=(), *, learn=True,
                main_notes=None, post_notes=True):
         if isinstance(report_or_id, WorkerReport):
