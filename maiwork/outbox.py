@@ -726,6 +726,9 @@ class Outbox:
         # 个人提一嘴的复核者（2026-10）：只有 card_push.IdeaMention 会登记；**没登记就不发**
         # 个人提一嘴（见 set_personal_guard / _is_personal_mention），别的 hook 冒充不了。
         self._personal_guard: Any = None
+        # here.now 过期重发的内存节流：同一任务 60 秒内最多重发一次（进程内）。
+        self._republish_last: dict[str, float] = {}
+        self._republish_lock = asyncio.Lock()
         # 并发收口（2026-10 复审）：同一实例的 flush 串行（asyncio 锁）；
         # 不同实例 / 跨进程靠 `_claim` 的数据库 CAS（status='pending' 条件）兜底。
         self._flush_lock: Optional[asyncio.Lock] = None
@@ -856,7 +859,7 @@ class Outbox:
             from .session_speech import delivery_prefix
             prefix = delivery_prefix(tid, task, self._get_settings())
             rows = conn.execute(
-                "SELECT id, key, kind, status, payload FROM outbox"
+                "SELECT id, key, kind, status, payload, result, created FROM outbox"
                 " WHERE group_id=? AND task_id=? AND (key=? OR key LIKE ?)",
                 (gid, tid, prefix, f"{prefix}:%"),
             ).fetchall()
@@ -886,6 +889,22 @@ class Outbox:
                     )
                 return "queued"
             if any(r["status"] == "sent" for r in artifact):
+                # §4.1：链接已过期的成品行 → 让命令层知道是「旧链接过期了」，
+                # 好回一句「本地副本在网页里，也可以等新链接重发」。
+                now = clock.now()
+                for r in artifact:
+                    if str(r["kind"]) != "herenow" or str(r["status"]) != "sent":
+                        continue
+                    try:
+                        result = json.loads(r["result"] or "{}") if "result" in r.keys() else {}
+                    except Exception:
+                        result = {}
+                    expires_ts = result.get("expires_ts")
+                    if not isinstance(expires_ts, (int, float)) or expires_ts <= 0:
+                        # 旧记录没存过期时间：按 created +24h 推算
+                        expires_ts = float(r["created"] or 0) + 86400.0 if "created" in r.keys() else now + 86400.0
+                    if now >= float(expires_ts):
+                        return "expired"
                 return "sent"
             if any(r["status"] == "sending" for r in artifact):
                 return "sending"
@@ -894,6 +913,117 @@ class Outbox:
             if any(r["status"] == "failed" for r in artifact):
                 return "failed"
             return "missing"
+
+    _REPUBLISH_WINDOW_S = 300.0   # 离过期 5 分钟内就重发（用户点进来正好能用）
+    _REPUBLISH_THROTTLE_S = 60.0  # 同一任务内存节流：60 秒内最多重发一次
+    _REPUBLISH_LINK_FALLBACK_S = 86400.0  # 旧记录缺 expires_ts：按发件时间 +24h 推算
+
+    def _task_artifact_dir_for(self, task_id: str, gid: str) -> Path | None:
+        """<workspace_root>/<任务记的工作区名>/artifacts/<tid>；缺配置 / 读不到 → None。
+
+        工作区名以任务行里的 `workspace` 为准（Delivery 交付时也是按这个找目录）；
+        查不到再回落 settings.workspace_of(gid)。
+        """
+        from .artifacts import artifact_base
+        task = self._store.read().execute("SELECT * FROM tasks WHERE id=? AND group_id=?", (str(task_id), str(gid))).fetchone()
+        if task is None:
+            return None
+        try:
+            return artifact_base(self._get_settings(), dict(task))
+        except (ValueError, OSError):
+            return None
+
+    async def republish_if_expired(self, task_id: str, *, force: bool = False) -> dict:
+        """here.now 成品链接快过期就重发：找到任务的 herenow 发件，重新 publish 本地成品目录并更新 result。
+
+        - force=True：管理员在网页点「重新生成外链」，不看 5 分钟窗口直接发；
+        - 节流：同一任务 60 秒内只发一次（内存，进程内；跨实例不管，跨群各自算）。
+        """
+        tid = str(task_id)
+        if not re.fullmatch(r"T-\d+", tid):
+            return {"ok": False, "reason": "not_found"}
+        now = clock.now()
+        row = self._store.read().execute(
+            "SELECT id, group_id, payload, result, created FROM outbox"
+            " WHERE task_id=? AND kind='herenow' AND status='sent' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        if row is None:
+            return {"ok": False, "reason": "not_found"}
+        gid = str(row["group_id"])
+        if not self._get_settings().is_served(gid):
+            return {"ok": False, "reason": "unserved"}
+        try:
+            result = json.loads(row["result"] or "{}")
+        except (TypeError, ValueError):
+            result = {}
+        expires_ts = result.get("expires_ts")
+        if not isinstance(expires_ts, (int, float)) or expires_ts <= 0:
+            # 旧记录没存过期时间：按发件时间 +24h 推算（匿名 here.now 页面默认 24h）
+            expires_ts = float(row["created"] or 0) + self._REPUBLISH_LINK_FALLBACK_S
+        if not force and now < expires_ts - self._REPUBLISH_WINDOW_S:
+            return {"ok": False, "reason": "not_due", "expires_ts": expires_ts}
+        base = self._task_artifact_dir_for(tid, gid)
+        if base is None or not base.is_dir():
+            return {"ok": False, "reason": "no_artifact", "expires_ts": expires_ts}
+        if self._herenow is None:
+            return {"ok": False, "reason": "no_herenow", "expires_ts": expires_ts}
+        # Claim before any await to the publisher; force bypasses expiry, never throttling.
+        async with self._republish_lock:
+            last = self._republish_last.get(tid)
+            if last is not None and now - last < self._REPUBLISH_THROTTLE_S:
+                return {"ok": False, "reason": "throttled", "expires_ts": expires_ts}
+            self._republish_last[tid] = now
+        try:
+            import tempfile
+            from .artifacts import artifact_entry, stage_public_artifacts
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            candidates = [
+                payload.get("path"),
+                (payload.get("fallback") or {}).get("path") if isinstance(payload.get("fallback"), dict) else None,
+            ]
+            try:
+                attempt = self._store.read().execute(
+                    "SELECT artifacts FROM attempts WHERE task_id=? AND status='passed'"
+                    " ORDER BY n DESC LIMIT 1",
+                    (tid,),
+                ).fetchone()
+                if attempt is not None:
+                    saved = json.loads(attempt["artifacts"] or "[]")
+                    if isinstance(saved, list):
+                        candidates.extend(saved)
+            except Exception:
+                pass
+            entry = artifact_entry(base, candidates)
+            with tempfile.TemporaryDirectory(prefix="maiwork-republish-") as staging:
+                public = Path(staging)
+                count = await asyncio.to_thread(stage_public_artifacts, base, public, entry)
+                if not count:
+                    return {"ok": False, "reason": "empty", "expires_ts": expires_ts}
+                pub = await self._herenow.publish(public)
+        except Exception:
+            logger.exception("here.now 重发出错（%s）", tid)
+            return {"ok": False, "reason": "publish_failed", "expires_ts": expires_ts}
+        # 更新 result：新链接 + 新过期时间（状态已 sent，保持不变）
+        self._set(
+            int(row["id"]),
+            status="sent",
+            result={
+                "url": str(pub.get("url") or ""),
+                "slug": str(pub.get("slug") or ""),
+                "expires_ts": float(pub.get("expires_ts") or expires_ts + 86400),
+            },
+            moment=now,
+        )
+        logger.info("here.now 链接重发（%s）：%s", tid, str(pub.get("url") or ""))
+        return {
+            "ok": True,
+            "url": str(pub.get("url") or ""),
+            "expires_ts": float(pub.get("expires_ts") or expires_ts + 86400),
+        }
 
     # ------------------------------------------------------------------
     # flush
@@ -1332,7 +1462,11 @@ class Outbox:
             if self._herenow is None:
                 raise HostError("没配 here.now，发不了网页链接")
             pub = await self._herenow.publish(Path(str(payload.get("dir") or "")))
-            return {"url": str(pub.get("url") or ""), "slug": str(pub.get("slug") or "")}
+            return {
+                "url": str(pub.get("url") or ""),
+                "slug": str(pub.get("slug") or ""),
+                "expires_ts": float(pub.get("expires_ts") or 0.0),
+            }
         raise HostError(f"未知的发件类型：{kind}")
 
     def _after_sent(self, row: Any, payload_like: Optional[dict] = None) -> None:
@@ -1392,7 +1526,9 @@ class Outbox:
             memo += f"（{note[:60]}）" if note else ""
             memo += "，有人问起可以告诉他往上翻聊天记录"
             self._mentions.add(gid, memo, key=f"deliver:{int(row['id'])}", ttl_s=_DELIVER_MENTION_TTL_S)
-        elif kind == "text":
+        elif kind == "text" and self._is_delivery_text(payload) and not payload.get("follow_up_of"):
+            # 只有「交付说明」类文字才记备忘；普通命令回复 / 报错 / 开场白不再塞进
+            # mentions 挤占 300 字预算。
             text = str(payload.get("text") or "")
             if text:
                 self._mentions.add(
@@ -2330,12 +2466,23 @@ class Delivery:
         "cancelled": "已取消",
     }
     def delivery_records(self, task_id: str) -> list[dict]:
-        """§9.3 任务详情的 delivery：kind「here.now/群文件/网页副本」、text、state 中文、url。"""
+        """§9.3 任务详情的 delivery：kind「here.now/群文件/网页副本」、text、state 中文、url。
+
+        here.now 行额外带 local_url（本地永久副本，前端给「页内预览」）和 expired
+        （链接过没过期；前端给「重新生成外链」）。
+        """
+        tid = str(task_id)
         rows = self._store.read().execute(
             "SELECT id, key, kind, payload, status, result, error, created"
             " FROM outbox WHERE task_id=? ORDER BY id",
-            (str(task_id),),
+            (tid,),
         ).fetchall()
+        # 本地副本路径：前端拿到就能嵌 iframe / 开新页（走同一套五重安全闸）
+        token_row = self._store.read().execute(
+            "SELECT g.token FROM groups g JOIN tasks t ON t.group_id=g.group_id WHERE t.id=?", (tid,)
+        ).fetchone()
+        token = str(token_row["token"] or "") if token_row else ""
+        local_url = f"/g/{token}/artifacts/{tid}/" if token else None
         records: list[dict] = []
         for r in rows:
             try:
@@ -2357,23 +2504,30 @@ class Delivery:
             if str(r["kind"]) == "file" and str(r["status"]) == "uncertain":
                 hint = "群文件可能已发出，请先到群里确认"
                 error_text = f"{error_text}；{hint}" if error_text else hint
-            records.append(
-                {
-                    "id": int(r["id"]),
-                    "key": str(r["key"]),
-                    "kind": self._KIND_CN.get(str(r["kind"]), str(r["kind"])),
-                    "raw_kind": str(r["kind"]),
-                    "text": str(payload.get("note") or payload.get("text") or payload.get("name") or ""),
-                    "state": self._STATE_CN.get(str(r["status"]), str(r["status"])),
-                    "raw_state": str(r["status"]),
-                    "url": url or None,
-                    "error": error_text,
-                    # 群文件失败的大白话原因（不含本机路径）；其余为 None
-                    "reason": (upload_fail_reason(r["error"])
-                               if str(r["kind"]) == "file" and str(r["status"]) == "failed"
-                               else None),
-                }
-            )
+            rec: dict = {
+                "id": int(r["id"]),
+                "key": str(r["key"]),
+                "kind": self._KIND_CN.get(str(r["kind"]), str(r["kind"])),
+                "raw_kind": str(r["kind"]),
+                "text": str(payload.get("note") or payload.get("text") or payload.get("name") or ""),
+                "state": self._STATE_CN.get(str(r["status"]), str(r["status"])),
+                "raw_state": str(r["status"]),
+                "url": url or None,
+                "error": error_text,
+                # 群文件失败的大白话原因（不含本机路径）；其余为 None
+                "reason": (upload_fail_reason(r["error"])
+                           if str(r["kind"]) == "file" and str(r["status"]) == "failed"
+                           else None),
+            }
+            if str(r["kind"]) == "herenow":
+                rec["local_url"] = local_url
+                expires_ts = result.get("expires_ts")
+                if not isinstance(expires_ts, (int, float)) or expires_ts <= 0:
+                    # 旧记录没存过期时间：按发件时间 +24h 推算
+                    expires_ts = float(r["created"] or 0) + 86400.0
+                rec["expires_ts"] = float(expires_ts)
+                rec["expired"] = clock.now() >= float(expires_ts)
+            records.append(rec)
         return records
 
     def undelivered(self, task_id: str) -> bool:

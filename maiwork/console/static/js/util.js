@@ -7,6 +7,18 @@ import { sfx } from "./sound.js";
 export const esc = (s) =>
   String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 export const safeUrl = (u) => (/^https?:\/\//i.test(String(u || "")) ? esc(u) : "#");
+// 成品可走带群访问码的本地路径；拒绝协议相对地址、控制字符和路径跳转。
+export function safeAssetUrl(u) {
+  const s = String(u || "");
+  if (!s || /[\x00-\x20\x7f\\]/.test(s)) return "#";
+  try {
+    if (/^https?:\/\//i.test(s)) { new URL(s); return esc(s); }
+    const path = decodeURIComponent(s.split(/[?#]/)[0]);
+    if (!/^\/(?:g\/|api\/tasks\/)/.test(path) || /[\\\x00-\x20\x7f]/.test(path)) return "#";
+    if (path.split("/").some((p) => p === "." || p === "..")) return "#";
+    return esc(s);
+  } catch (_) { return "#"; }
+}
 // 正文里的 [文字](https://…) 渲染成链接；其余一律转义（内容来自网上和模型，不能信）
 export const richText = (t) =>
   esc(t)
@@ -66,6 +78,79 @@ export function reveal(headSel) {
   const h = document.querySelector(headSel);
   const n = h && h.nextElementSibling;
   if (n && h.getAttribute("aria-expanded") === "true") n.classList.add("reveal");
+}
+
+const _copyOrig = new WeakMap();
+const _copyTimer = new WeakMap();
+// 复制按钮原地变形为「已复制」勾号，1.8 秒后还原；连点不覆盖原始文字。
+export function flashCopied(el, label = "已复制") {
+  if (!el) return;
+  if (!_copyOrig.has(el)) _copyOrig.set(el, el.innerHTML);
+  if (!_copyTimer.has(el) && el.offsetWidth > 0 && el.style) el.style.minWidth = `${el.offsetWidth}px`;
+  clearTimeout(_copyTimer.get(el));
+  const isLink = el.classList && el.classList.contains("link-btn");
+  if (isLink) el.textContent = label;
+  else el.innerHTML = `${SVG.check}${esc(label)}`;
+  if (el.classList) el.classList.add("is-copied");
+  const morph = (elNode) => {
+    if (!elNode || !elNode.animate) return;
+    elNode.animate(
+      calm()
+        ? [{ opacity: 0.7 }, { opacity: 1 }]
+        : [{ opacity: 0.65, filter: "blur(2px)", transform: "scale(0.97)" }, { opacity: 1, filter: "blur(0px)", transform: "scale(1)" }],
+      { duration: calm() ? 150 : 180, easing: "cubic-bezier(0.2, 0.8, 0.2, 1)" }
+    );
+  };
+  morph(el);
+  _copyTimer.set(
+    el,
+    setTimeout(() => {
+      const orig = _copyOrig.get(el);
+      _copyOrig.delete(el);
+      _copyTimer.delete(el);
+      if (el.isConnected === false || orig === undefined) return;
+      el.innerHTML = orig;
+      if (el.style) el.style.minWidth = "";
+      if (el.classList) el.classList.remove("is-copied");
+      morph(el);
+    }, 1800)
+  );
+}
+
+const _FLIP_SEL = ":scope > .item, :scope > .h-sub, :scope > .filters, :scope > div > .row, :scope > .cm, :scope > .cm-pending, :scope > .cm-tool, :scope > .cm-summary";
+const _flipSig = (n) => (n.dataset && (n.dataset.id || n.dataset.entry)) || `${n.tagName}:${n.className}:${String(n.textContent || "").slice(0, 32)}`;
+// 待批/待确认卡片处理后先轻收退出，再用纯 transform FLIP 让下方内容平滑上移（不动画 height）。
+export async function flipRemove(card, container, runRender) {
+  if (!card || card.isConnected === false || calm() || !card.animate) {
+    runRender();
+    return;
+  }
+  try {
+    const exit = card.animate(
+      [{ opacity: 1, transform: "scale(1)" }, { opacity: 0, transform: "scale(0.97)" }],
+      { duration: 160, easing: "cubic-bezier(0.2, 0.8, 0.2, 1)", fill: "forwards" }
+    );
+    if (exit && exit.finished) await exit.finished;
+  } catch (_) {}
+  const firstTop = new Map();
+  if (container && container.querySelectorAll) {
+    for (const item of container.querySelectorAll(_FLIP_SEL)) {
+      if (item !== card && item.getBoundingClientRect) firstTop.set(_flipSig(item), item.getBoundingClientRect().top);
+    }
+  }
+  runRender();
+  if (!firstTop.size || !container || !container.querySelectorAll) return;
+  for (const item of container.querySelectorAll(_FLIP_SEL)) {
+    const prev = firstTop.get(_flipSig(item));
+    if (prev === undefined || !item.getBoundingClientRect || !item.animate) continue;
+    const dy = prev - item.getBoundingClientRect().top;
+    if (Math.abs(dy) > 2 && Math.abs(dy) < 600) {
+      item.animate([{ transform: `translateY(${dy}px)` }, { transform: "translateY(0)" }], {
+        duration: 220,
+        easing: "cubic-bezier(0.32, 0.72, 0, 1)",
+      });
+    }
+  }
 }
 export function toast(text, bad) {
   const t = $("toast");

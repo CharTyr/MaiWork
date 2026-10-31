@@ -65,6 +65,8 @@ class FakeAgents:
         })
         h = self._handoffs.get(str(id))
         if h is not None:
+            if h["status"] in {"failed", "cancelled", "accepted", "rejected"}:
+                raise ValueError(f"交接单终态不许再次审核：{h['status']}")
             h["status"] = "accepted" if accepted else "rejected"
 
     def begin(self, gid, kind, brief, *, task_id="", phase="", parent_id="",

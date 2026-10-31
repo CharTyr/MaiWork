@@ -97,6 +97,20 @@ class FakeGroupSpace:
     async def upload_to_album(self, group_id, album_id, path) -> None:
         self.album_uploads.append((str(group_id), str(album_id), str(path)))
 
+    async def get_notices(self, group_id) -> list[dict]:
+        return [
+            {
+                "publish_time": 1_789_999_000,
+                "sender_id": "10001",
+                "message": {"text": "本周五线下聚会，地点在人民广场。"},
+            }
+        ]
+
+    async def list_albums(self, group_id) -> list[dict]:
+        return [
+            {"album_id": "alb-1", "name": "活动照片", "desc": "线下聚会", "photo_cnt": 12},
+        ]
+
 
 class ScriptedModels:
     """假 Models：按顺序回放脚本项（str → 文本结果；ReplayChatResult → 原样；异常 → 抛）。"""
@@ -325,6 +339,81 @@ async def test_notice_send_tool_called_and_logged(
     assert rows[0]["ok"] == 1
     # 这个群只开了 notice_send：群空间回合里只给这一个工具（调工具那轮 + 收尾那轮）
     assert models.tool_names_of("coordinator.groupspace") == [["group_notice_send"]] * 2
+
+
+# ---------------------------------------------------------------------------
+# 2b. 群公告 / 群相册只读工具（notice_read / album_list 能力）
+# ---------------------------------------------------------------------------
+
+
+async def test_notices_list_tool_called(
+    mem_store: Store, settings, env, tools, tasks, goals
+):
+    """开了 notice_read → 群空间回合给 group_notices_list；模型调用就真读群公告。"""
+    tid = _create_task(tasks)
+    gs = FakeGroupSpace(caps=_caps(notice_read=True))
+    register_groupspace_tools(tools, gs, announce=lambda gid, text: None)
+
+    models = ScriptedModels(
+        [
+            _plan(),
+            _review(pass_=True),
+            _tool_call("group_notices_list", {}),
+            '{"done": true}',
+        ]
+    )
+    workers = FakeWorkers()
+    workers.before_return = _write_artifact_hook(env, tasks, tid)
+
+    coordinator = _build(
+        mem_store=mem_store, settings=settings, env=env, tools=tools, tasks=tasks,
+        goals=goals, models=models, workers=workers, group_space=gs, delivery=FakeDelivery(),
+    )
+    await coordinator.run_task(tid)
+
+    # 只开了 notice_read：群空间回合只给这一个工具
+    assert models.tool_names_of("coordinator.groupspace") == [["group_notices_list"]] * 2
+    rows = mem_store.read().execute(
+        "SELECT actor, tool, ok, output FROM tool_calls WHERE tool='group_notices_list'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["actor"] == "主模型"
+    assert rows[0]["ok"] == 1
+    # 公告正文截 500 字进了工具结果
+    assert "本周五线下聚会" in rows[0]["output"]
+
+
+async def test_albums_list_tool_called(
+    mem_store: Store, settings, env, tools, tasks, goals
+):
+    """开了 album_list → 群空间回合给 group_albums_list，模型能先查 album_id 再上传。"""
+    tid = _create_task(tasks)
+    gs = FakeGroupSpace(caps=_caps(album_list=True))
+    register_groupspace_tools(tools, gs, announce=lambda gid, text: None)
+
+    models = ScriptedModels(
+        [
+            _plan(),
+            _review(pass_=True),
+            _tool_call("group_albums_list", {}),
+            '{"done": true}',
+        ]
+    )
+    workers = FakeWorkers()
+    workers.before_return = _write_artifact_hook(env, tasks, tid)
+
+    coordinator = _build(
+        mem_store=mem_store, settings=settings, env=env, tools=tools, tasks=tasks,
+        goals=goals, models=models, workers=workers, group_space=gs, delivery=FakeDelivery(),
+    )
+    await coordinator.run_task(tid)
+
+    assert models.tool_names_of("coordinator.groupspace") == [["group_albums_list"]] * 2
+    rows = mem_store.read().execute(
+        "SELECT output FROM tool_calls WHERE tool='group_albums_list'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert "alb-1" in rows[0]["output"] and "活动照片" in rows[0]["output"]
 
 
 # ---------------------------------------------------------------------------

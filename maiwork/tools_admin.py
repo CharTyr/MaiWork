@@ -736,6 +736,63 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         gid, err = _served(args.get("group_id") or ctx.group_id)
         if err is not None:
             return err
+        action = str(args.get("action") or "overview").strip().lower()
+        if action in ("notices", "albums", "files"):
+            space = _group_space(gid)
+            if space is None:
+                return _bad("群空间能力没就位，这次读不到")
+            try:
+                if action == "notices":
+                    items = await space.get_notices(gid)
+                    if not items:
+                        return _ok("（没有群公告）")
+                    lines = []
+                    for it in items[:10]:
+                        when = it.get("publish_time") or it.get("time") or it.get("send_time") or ""
+                        try:
+                            when_txt = clock.bj(float(when)).strftime("%Y-%m-%d %H:%M") if when else "（时间未知）"
+                        except (TypeError, ValueError):
+                            when_txt = "（时间未知）"
+                        msg = it.get("message") or {}
+                        body = str(msg.get("text") or it.get("text") or it.get("content") or "")
+                        body = " ".join(body.split())[:500]
+                        sender = str(it.get("sender_id") or it.get("user_id") or "")
+                        who = f"（{sender}）" if sender else ""
+                        lines.append(f"- {when_txt}{who}：{body}")
+                    return _ok("\n".join(lines))
+                if action == "albums":
+                    items = await space.list_albums(gid)
+                    if not items:
+                        return _ok("（没有群相册）")
+                    lines = []
+                    for it in items:
+                        aid = str(it.get("album_id") or it.get("id") or "")
+                        name = str(it.get("name") or it.get("album_name") or "")
+                        desc = " ".join(str(it.get("desc") or it.get("description") or "").split())[:60]
+                        cnt = it.get("photo_cnt") if it.get("photo_cnt") is not None else it.get("count")
+                        meta = f"album_id={aid}" if aid else ""
+                        if cnt is not None:
+                            meta += f"，{cnt} 张"
+                        lines.append(f"- {name}{'（' + desc + '）' if desc else ''}　{meta}".rstrip())
+                    return _ok("\n".join(lines))
+                # files
+                folder_id = str(args.get("folder_id") or "").strip() or None
+                items = await space.list_files(gid, folder_id=folder_id)
+                if not items:
+                    return _ok("（空的，一个文件也没有）")
+                lines = []
+                for it in items:
+                    if it.get("type") == "folder":
+                        lines.append(f"[文件夹] {it.get('name', '')}（folder_id={it.get('folder_id', '')}）")
+                    else:
+                        lines.append(f"[文件] {it.get('name', '')}（file_id={it.get('file_id', '')}，{it.get('size', 0)} 字节）")
+                return _ok("\n".join(lines))
+            except PermissionError as e:
+                return _bad(str(e))
+            except Exception as e:
+                logger.exception("group_overview %s 出错（群 %s）", action, gid)
+                return _bad(f"读不到：{e}")
+        # 默认 overview：原输出一字不变
         settings = _settings()
         parts: list[str] = [f"群 {gid}"]
         prof = _profiles()
@@ -2918,10 +2975,22 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         (
             {
                 "name": "group_overview",
-                "description": "一个服务群的整体情况：画像条数、资讯 / 构想、任务、在盯的事、工作区。",
+                "description": (
+                    "一个服务群的整体情况：画像条数、资讯 / 构想、任务、在盯的事、工作区。"
+                    "action=overview（默认）看概况；notices 看群公告；albums 看群相册；"
+                    "files 看群文件（可给 folder_id）。"
+                ),
                 "parameters": {
                     "type": "object",
-                    "properties": {"group_id": {"type": "string", "description": "群号（可选，默认当前对话聚焦的群）"}},
+                    "properties": {
+                        "group_id": {"type": "string", "description": "群号（可选，默认当前对话聚焦的群）"},
+                        "action": {
+                            "type": "string",
+                            "enum": ["overview", "notices", "albums", "files"],
+                            "description": "overview（默认）/ notices 群公告 / albums 群相册 / files 群文件",
+                        },
+                        "folder_id": {"type": "string", "description": "action=files 时的文件夹 ID（可选）"},
+                    },
                 },
             },
             group_overview,

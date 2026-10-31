@@ -123,6 +123,9 @@ class FakeProfiles:
             await ev.wait()
         return True
 
+    def set_group_space(self, group_space: Any) -> None:
+        self.group_space = group_space
+
     def set_request_deps(self, *, approvals: Any = None, goals: Any = None, outbox: Any = None) -> None:
         self.request_deps = (approvals, goals, outbox)
 
@@ -519,7 +522,8 @@ class FakeFeeds:
 
     # 话头火花（docs/18 §十一）：app 排程要问的几口；够不够格由 spark_ready_map 说了算，
     # 认领过一次记在 spark_taken_calls（真 Feeds 里对应清内存火花 + 记当天）。
-    def note_spark(self, group_id: str, ts: Any = None) -> None:
+    # **kwargs 兼容真实签名（text/user_id/message_id 等脱敏原话入参，FakeFeeds 不记原话）。
+    def note_spark(self, group_id: str, ts: Any = None, **kwargs: Any) -> None:
         self.spark[str(group_id)] = float(ts if ts is not None else 0.0)
 
     def spark_ready(self, group_id: str, now: float) -> bool:

@@ -120,7 +120,8 @@ class _Mentions:
     def __init__(self) -> None:
         self.items: list[dict] = []
 
-    def add(self, group_id: str, text: str, *, key: str, ttl_s: float, turns: int = 5) -> None:
+    def add(self, group_id: str, text: str, *, key: str, ttl_s: float, turns: int = 5,
+            target_user_id: str = "", keywords="") -> None:
         self.items.append({"group_id": str(group_id), "text": str(text), "key": str(key)})
 
 

@@ -24,7 +24,11 @@ Jev 不可用 → 这次不开（不写 topic_log）。
 不再当成冷场开口（拿不到快照 → 失败关闭）。发件箱真发出去之后用结果 hook 回来
 （on_result）：写 topic_log.opener / message_id / followup_due_ts、候选标 used、
 news_items 标 used、加进 mentions。只入队不算发过。
-10 分钟后 follow_up。播报腔整条作废。
+10 分钟后 follow_up（从「真实发出时刻」起算，剔除系统噪声和 MaiWork 自发的卡片/提一嘴/
+交付——它们不是 MaiBot 接话）。播报腔整条作废。
+防撞车（v0.14 §1.4）：同一条素材（资讯 / 构想）在卡片 / 提一嘴 / 开场白三个主动通道里
+12 小时 + 在途期互斥——开场白选材和发送前复核都会看 `channel_dedup`，同素材刚被别的
+通道发过就不再发。
 写 topic_log 时 jev 里带真实分数和卡在哪一层。
 """
 
@@ -36,7 +40,7 @@ import re
 from datetime import timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from . import clock, group_push, run_ref, voice
+from . import channel_dedup, clock, group_push, run_ref, voice
 from .config import Settings
 from .delivery import Mentions, Pushes
 from .host import Host, HostError, Msg
@@ -80,6 +84,11 @@ _MAX_QUIET_S = 90 * 60
 
 # 同一段冷场重复判断的最小间隔（秒）：指纹没变时，判过一次后这么久内不重问 Jev
 _REJUDGE_S = 30 * 60
+
+# 主动通道互斥窗口（秒）：同一条素材（资讯 / 构想）在「资讯卡片 / 构想提一嘴 /
+# 冷场开场白」三个主动通道里，12 小时内 + 排队在途期间只在一个通道发出去，
+# 不发第二遍（v0.14 §1.4：线上同题被两个通道连着发，30 秒间隔）。
+CROSS_CHANNEL_DEDUP_S = 12 * 3600.0
 
 # Jev 判定阈值（2026-10-10 用户决定放宽：原 0.6 / 0.5 线上 130 次判断 0 次过关——
 # 选「可以开」时 ok 几乎都在 0.54~0.58；历史回放新线约 9 天 3 群 8 次。reason 仍须是 fine）
@@ -680,6 +689,10 @@ class Topics:
                     # 入队那一刻的冷场快照（当时本群最后一条消息时刻）：发送前复核群里
                     # 是不是又有人说话了；拿不到这份证据 → 失败关闭作废。
                     "cold_since_ts": float(quiet_ts),
+                    # 这条开场白要用的是哪条素材（防撞车互斥认这个）：
+                    # 卡片 / 提一嘴的发送前复核读它，同素材撞上就作废对方。
+                    "candidate_kind": str(candidate.get("kind") or ""),
+                    "candidate_ref_id": int(candidate["ref_id"]) if candidate.get("ref_id") is not None else 0,
                 },
             )
         except Exception as exc:
@@ -696,10 +709,16 @@ class Topics:
     # ------------------------------------------------------------------
 
     async def follow_up(self, group_id: str, now: float) -> None:
-        """对到期的 topic_log：读 [开场白 ts, ts+600] 消息，写 result。"""
+        """对到期的 topic_log：读「真实发出时刻」起算 10 分钟的消息，写 result。
+
+        窗口起点用 `followup_due_ts - 600`（= 真实发出时刻，发件箱回写时是
+        now_send+600）；异常回退 `ts`（判断时刻）。剔除系统噪声（notice: / 纯事件）
+        和 **MaiWork 自己发出的所有消息**（开场白 / 卡片 / 提一嘴 / 交付）——它们不是
+        「MaiBot 接话」，不能算进 followups（线上实测：自发卡片被算成 followups=1）。
+        """
         gid = str(group_id)
         rows = self._store.read().execute(
-            "SELECT id, ts, message_id, opener FROM topic_log"
+            "SELECT id, ts, message_id, opener, candidate_id, followup_due_ts FROM topic_log"
             " WHERE group_id=? AND opener!='' AND followup_due_ts IS NOT NULL"
             " AND followup_due_ts<=? AND result IS NULL",
             (gid, now),
@@ -711,29 +730,53 @@ class Topics:
             return
         for row in rows:
             topic_id = int(row["id"])
-            topic_ts = float(row["ts"])
-            opener_message_id = str(row["message_id"] or "")
+            # 真实发出时刻：followup_due_ts - 600；拿不到就退回判断时刻
             try:
-                msgs = await self._host.messages(sid, topic_ts, topic_ts + _FOLLOW_UP_DELAY_S, 50, limit_mode="earliest")
+                sent_ts = float(row["followup_due_ts"]) - _FOLLOW_UP_DELAY_S
+            except (TypeError, ValueError):
+                sent_ts = float(row["ts"])
+            if sent_ts <= 0:
+                sent_ts = float(row["ts"])
+            opener_message_id = str(row["message_id"] or "")
+            win_end = sent_ts + _FOLLOW_UP_DELAY_S
+            try:
+                msgs = await self._host.messages(sid, sent_ts, win_end, 50, limit_mode="earliest")
             except HostError:
                 msgs = []
-            # 非机器人发言的不同人数 / 机器人后续条数（不含开场白本身）
-            replies: set[str] = set()
+            # MaiWork 自己发出的所有消息 id（这些不是 MaiBot 接话，不能算 followups）
+            mw_mids = self._own_message_ids(gid, sent_ts, opener_message_id)
+            # 候选的关键词 / 标题词块：判「切题」用
+            topic_words = self._topic_words(topic_id)
+            replies = 0
             followups = 0
+            active_users: set[str] = set()
+            on_topic = 0
             for m in msgs:
                 if not isinstance(m, Msg):
                     continue
-                if float(m.ts) < topic_ts or float(m.ts) > topic_ts + _FOLLOW_UP_DELAY_S:
+                if float(m.ts) < sent_ts or float(m.ts) > win_end:
+                    continue
+                # 系统噪声：notice: 开头的 id / 纯事件文本
+                mid = str(m.id or "")
+                if mid.startswith("notice:") or _is_noise(m.text):
                     continue
                 if m.is_bot:
-                    # 排除开场白自己（按 message_id 识别）
-                    if opener_message_id and str(m.id) == opener_message_id:
+                    # MaiWork 自己发的（含开场白自己）不算 MaiBot 接话
+                    if mid in mw_mids:
                         continue
                     followups += 1
                 else:
+                    replies += 1
                     if m.user_id:
-                        replies.add(str(m.user_id))
-            result = {"replies": len(replies), "followups": int(followups)}
+                        active_users.add(str(m.user_id))
+                    if (bool(opener_message_id) and str(m.reply_to or "") == opener_message_id) or self._hits_topic(m.text, topic_words):
+                        on_topic += 1
+            result = {
+                "replies": int(replies),
+                "followups": int(followups),
+                "active_users": len(active_users),
+                "on_topic": int(on_topic),
+            }
             self._update_log(
                 topic_id,
                 {"result": json.dumps(result, ensure_ascii=False)},
@@ -745,6 +788,84 @@ class Topics:
                 self._reset_backoff(gid)
             else:
                 self._bump_backoff(gid)
+
+    def _own_message_ids(self, gid: str, sent_ts: float, opener_mid: str) -> set:
+        """这个群在开场白前后一小段时间内，MaiWork 自己发出去的消息 id 集合。
+
+        用来把「MaiWork 自己发的」（开场白 / 卡片 / 提一嘴 / 交付，同一个 bot 账号）
+        和「MaiBot 接话」分开——同一个 QQ 账号，光看 is_bot 分不清。
+        """
+        ids: set[str] = set()
+        if opener_mid:
+            ids.add(str(opener_mid))
+        lo, hi = float(sent_ts) - 60.0, float(sent_ts) + _FOLLOW_UP_DELAY_S + 60.0
+        try:
+            rows = self._store.read().execute(
+                "SELECT result FROM outbox WHERE group_id=? AND status IN ('sent','uncertain')"
+                " AND updated>=? AND updated<=?",
+                (str(gid), lo, hi),
+            ).fetchall()
+            for r in rows:
+                try:
+                    data = json.loads(r["result"] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(data, dict):
+                    mid = str(data.get("message_id") or "").strip()
+                    if mid:
+                        ids.add(mid)
+        except Exception:
+            logger.debug("读 outbox 自发消息 id 失败（群 %s）", gid, exc_info=True)
+        try:
+            rows = self._store.read().execute(
+                "SELECT message_id FROM news_cards WHERE group_id=? AND message_id!=''"
+                " AND sent_ts>=? AND sent_ts<=?",
+                (str(gid), lo, hi),
+            ).fetchall()
+            ids.update(str(r["message_id"]) for r in rows if r["message_id"])
+        except Exception:
+            logger.debug("读卡片 message_id 失败（群 %s）", gid, exc_info=True)
+        try:
+            rows = self._store.read().execute(
+                "SELECT message_id FROM idea_mentions WHERE group_id=? AND message_id!=''"
+                " AND sent_ts>=? AND sent_ts<=?",
+                (str(gid), lo, hi),
+            ).fetchall()
+            ids.update(str(r["message_id"]) for r in rows if r["message_id"])
+        except Exception:
+            logger.debug("读提一嘴 message_id 失败（群 %s）", gid, exc_info=True)
+        return ids
+
+    def _topic_words(self, topic_id: int) -> set:
+        """这条话题候选的关键词 / 标题词块（判「切题」用）。"""
+        words: set[str] = set()
+        cand = self._candidate_of_log(topic_id)
+        if not cand:
+            return words
+        from .delivery import usable_keywords
+
+        if cand.get("kind") == "news" and cand.get("ref_id"):
+            row = self._store.read().execute(
+                "SELECT keywords FROM news_items WHERE id=? AND group_id=(SELECT group_id FROM topic_log WHERE id=?)",
+                (cand["ref_id"], int(topic_id)),
+            ).fetchone()
+            if row is not None:
+                words.update(usable_keywords(row["keywords"]))
+        if words:
+            return words
+        # 标题词块补充具体内容；泛词不作为切题依据。
+        generic = {"一个", "可以", "推荐", "功能", "这个", "我们", "什么", "如何", "最新", "全新", "一些", "一下"}
+        title_words = [w for w in _bigrams(str(cand.get("title") or "")) if w not in generic]
+        words.update(usable_keywords(title_words))
+        return words
+
+    @staticmethod
+    def _hits_topic(text: str, words: set) -> bool:
+        """这条消息有没有命中候选的关键词 / 标题词块。"""
+        if not words:
+            return False
+        blob = re.sub(r"\s+", "", str(text or "").lower())
+        return any(w in blob for w in words if len(w) >= 2)
 
     # ------------------------------------------------------------------
     # 退避
@@ -844,6 +965,13 @@ class Topics:
             (gid, now, int(_CANDIDATE_SCAN)),
         ).fetchall()
         cands = [dict(r) for r in rows]
+        if not cands:
+            return []
+        # 防撞车（v0.14 §1.4 方向 A）：这条素材 12h 内已经 / 正在用卡片或提一嘴发 → 不选。
+        cands = [c for c in cands
+                 if not channel_dedup.other_channel_used(
+                     self._store, gid, now,
+                     str(c.get("kind") or ""), c.get("ref_id"))]
         if not cands:
             return []
         interests = self._interest_texts(gid)
@@ -999,6 +1127,18 @@ class Topics:
         except (TypeError, ValueError):
             return "拿不到冷场快照，作废"
         gid = str((info or {}).get("group_id") or "")
+        # 防撞车（v0.14 §1.4 方向 A）：排队 / 重试期间这条素材被卡片或提一嘴发了 → 作废。
+        try:
+            now_i = float((info or {}).get("now") or clock.now())
+        except (TypeError, ValueError):
+            now_i = clock.now()
+        ck = str(payload.get("candidate_kind") or "")
+        try:
+            crid = int(payload.get("candidate_ref_id") or 0)
+        except (TypeError, ValueError):
+            crid = 0
+        if ck in ("news", "idea") and channel_dedup.other_channel_used(self._store, gid, now_i, ck, crid):
+            return "同一条素材刚被卡片 / 提一嘴发过了，不再重复开"
         latest = self._latest_msg_ts(gid)
         if latest is None:
             return "读不到群里最新消息，作废"

@@ -1,6 +1,6 @@
 // MaiWork 网页 · 任务 / 目标详情（右栏或抽屉）。
 import { $, DOT, STATUS, admin, desktop, gadmin, state } from "./state.js";
-import { SVG, dur, esc, ico, msText, safeUrl, tip, when } from "./util.js";
+import { SVG, dur, esc, ico, msText, safeAssetUrl, safeUrl, tip, when } from "./util.js";
 import { api, gview } from "./api.js";
 import { loading } from "./pages/news.js";
 import { findIdea, ideaDetail } from "./pages/ideas.js";
@@ -196,8 +196,13 @@ function taskDetail(id) {
         ? `<div class="dt-sec"><div class="dt-label">成果</div>${t.delivery
             .map((x) => {
               const icon = x.kind === "群文件" ? "package" : x.kind === "here.now" ? "link" : "filebox";
-              const title = x.url ? `<a href="${safeUrl(x.url)}" target="_blank" rel="noopener noreferrer">${esc(x.text)}</a>` : esc(x.text);
-              return `<div class="deliv">${ico(icon)}<div><div class="deliv-k">${esc(x.kind)}</div><div class="deliv-t">${title}</div><div class="deliv-s">${esc(x.state)}</div></div></div>`;
+              const url = x.expired ? x.local_url : (x.url || x.local_url);
+              const title = url && safeAssetUrl(url) !== "#" ? `<a href="${safeAssetUrl(url)}" target="_blank" rel="noopener noreferrer">${esc(x.text)}</a>` : esc(x.text);
+              const canPreview = safeAssetUrl(x.local_url || (!x.expired && x.url)) !== "#";
+              const btn = (x.expired ? `<span class="deliv-x">${x.local_url ? "外链已过期 · 已切本地副本" : "外链已过期"}</span>` : "") + (canPreview
+                ? `<button class="link-btn" data-act="preview" data-tid="${esc(t.id)}" data-url="${esc(x.url || "")}" data-local-url="${esc(x.local_url || "")}" data-expired="${x.expired ? "1" : ""}">页内预览</button>`
+                : "");
+              return `<div class="deliv">${ico(icon)}<div><div class="deliv-k">${esc(x.kind)}</div><div class="deliv-t">${title}</div><div class="deliv-s">${esc(x.state)}${btn ? ` ${btn}` : ""}</div></div></div>`;
             })
             .join("")}</div>`
         : ""

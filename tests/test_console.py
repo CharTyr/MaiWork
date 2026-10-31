@@ -1173,8 +1173,8 @@ class TestGroupViewM2Fields:
         assert view["id"] == G1
         assert "focus" not in view
         assert "card_push" not in view  # 往群里发的开关只给管理员 / 本群群管理员
-        # topic_log 群友也看得到，但不含 verdict
-        assert isinstance(view["topic_log"], list) and len(view["topic_log"]) == 2
+        # topic_log 群友只看得到已开场的那条（未开场的 Jev 判断留在管理员侧），且不含 verdict
+        assert isinstance(view["topic_log"], list) and len(view["topic_log"]) == 1
         assert all("verdict" not in e for e in view["topic_log"])
         assert view["topic_log"][0]["pick"]["title"] == "铝坨坨新配色"
         # 没有任何字段泄出 focus / personal 信息
@@ -1379,6 +1379,7 @@ class TestM3Routes:
         detail = await r.json()
         assert detail["link_check"] == {
             "links": 3, "unopened": 1, "unopened_urls": ["https://never.example/x"],
+            "verified_urls": [],   # 老 kv 行没这个字段 → 空
         }
         # 群友版也给这个字段
         token = env.app.token_of(G1)
@@ -1995,6 +1996,152 @@ class TestGroupViewAgentFish:
         view = await r.json()
         assert view["agent_fish"] == {"main": "", "news": "", "idea": "", "goal": "", "task": ""}
         env.app.agents = real
+
+
+# ----------------------------------------------------------------------
+# §4.1 本地成品永久副本：/g/{token}/artifacts/<tid> 与 /api/tasks/<tid>/artifacts/
+# ----------------------------------------------------------------------
+
+
+class TestTaskArtifactRoutes:
+    """本地成品直读：token 路径（多文件 HTML 的 ./style.css 没法带 X-MW-Group）与
+    X-MW-Group/API 路径都走同一套五重安全闸。"""
+
+    def _artifact_dir(self, tmp_path: Path, tid: str) -> Path:
+        # G1 配的 workspace 是 "tinker" → <root>/tinker/artifacts/<tid>
+        d = tmp_path / "workspaces" / "tinker" / "artifacts" / tid
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _write(self, base: Path, rel: str, text: str, mode: str = "w") -> Path:
+        f = base / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text, encoding="utf-8")
+        return f
+
+    @pytest.mark.asyncio
+    async def test_token_route_serves_index_and_relative_assets(self, env: SimpleEnv) -> None:
+        tid = env.app.tasks.create(G1, title="t", req="r", criteria=[], source="test", status="completed")
+        base = self._artifact_dir(env.tmp_path, tid)
+        self._write(base, "index.html", "<html>hi</html>")
+        self._write(base, "style.css", "body{color:red}")
+        token = env.app.token_of(G1)
+
+        r = await env.client.get(f"/g/{token}/artifacts/{tid}", allow_redirects=False)
+        assert r.status == 302
+        assert r.headers["Location"].endswith("/")
+
+        r2 = await env.client.get(f"/g/{token}/artifacts/{tid}/")
+        assert r2.status == 200
+        assert "hi" in (await r2.text())
+        # 成品 HTML 进独立沙盒：不给 allow-same-origin，脚本碰不到同源 cookie/API
+        csp = r2.headers.get("Content-Security-Policy", "")
+        assert "sandbox allow-scripts" in csp
+        assert "allow-same-origin" not in csp
+
+        r3 = await env.client.get(f"/g/{token}/artifacts/{tid}/style.css")
+        assert r3.status == 200
+        assert "color:red" in (await r3.text())
+
+    @pytest.mark.asyncio
+    async def test_token_route_serves_single_main_file(self, env: SimpleEnv) -> None:
+        tid = env.app.tasks.create(G1, title="t", req="r", criteria=[], source="test", status="completed")
+        base = self._artifact_dir(env.tmp_path, tid)
+        self._write(base, "报告.txt", "只有一份成品")
+        token = env.app.token_of(G1)
+        r = await env.client.get(f"/g/{token}/artifacts/{tid}")
+        assert r.status == 200
+        assert "只有一份成品" in (await r.text())
+
+    @pytest.mark.asyncio
+    async def test_token_route_rejects_input_dir_and_parent_escape(self, env: SimpleEnv) -> None:
+        tid = env.app.tasks.create(G1, title="t", req="r", criteria=[], source="test", status="completed")
+        base = self._artifact_dir(env.tmp_path, tid)
+        self._write(base, "input/secret.txt", "群友上传的原图说明，不公开")
+        self._write(base, "ok.txt", "ok")
+        token = env.app.token_of(G1)
+        for bad in ("input/secret.txt", "../ok.txt", "..%2fok.txt", "%2e%2e/ok.txt"):
+            r = await env.client.get(f"/g/{token}/artifacts/{tid}/{bad}")
+            assert r.status in (400, 403, 404), (bad, r.status)
+
+    @pytest.mark.asyncio
+    async def test_token_route_rejects_symlink(self, env: SimpleEnv) -> None:
+        tid = env.app.tasks.create(G1, title="t", req="r", criteria=[], source="test", status="completed")
+        base = self._artifact_dir(env.tmp_path, tid)
+        self._write(base, "real.txt", "real")
+        outside = env.tmp_path / "outside.txt"
+        outside.write_text("secret", encoding="utf-8")
+        link = base / "link.txt"
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            pytest.skip("本机不让建符号链接")
+        token = env.app.token_of(G1)
+        r = await env.client.get(f"/g/{token}/artifacts/{tid}/link.txt")
+        assert r.status in (400, 403, 404), r.status
+
+    @pytest.mark.asyncio
+    async def test_token_route_bad_token_404(self, env: SimpleEnv) -> None:
+        tid = env.app.tasks.create(G1, title="t", req="r", criteria=[], source="test", status="completed")
+        self._artifact_dir(env.tmp_path, tid)
+        r = await env.client.get(f"/g/not-a-real-token/artifacts/{tid}/")
+        assert r.status == 404
+
+    @pytest.mark.asyncio
+    async def test_token_route_wrong_group_404(self, env: SimpleEnv) -> None:
+        """token 群和任务群对不上 → 404（不漏任务存不存在）。"""
+        tid = env.app.tasks.create(G1, title="t", req="r", criteria=[], source="test", status="completed")
+        base = self._artifact_dir(env.tmp_path, tid)
+        self._write(base, "index.html", "<html>x</html>")
+        # 别群 token 访问这个任务 → 404（不是 403，不暴露存在性）
+        other = env.app.token_of(G2)
+        r = await env.client.get(f"/g/{other}/artifacts/{tid}/")
+        assert r.status == 404
+
+    @pytest.mark.asyncio
+    async def test_api_route_admin_and_member_scope(self, env: SimpleEnv) -> None:
+        tid = env.app.tasks.create(G1, title="t", req="r", criteria=[], source="test", status="completed")
+        base = self._artifact_dir(env.tmp_path, tid)
+        self._write(base, "index.html", "<html>ok</html>")
+
+        # 匿名 → 401
+        r = await env.client.get(f"/api/tasks/{tid}/artifacts/")
+        assert r.status == 401
+
+        # 管理员 → 200
+        await env.login()
+        r2 = await env.client.get(f"/api/tasks/{tid}/artifacts/")
+        assert r2.status == 200
+
+        # 本群群友（X-MW-Group）→ 200（去掉管理员 cookie 只凭 token）
+        token = env.app.token_of(G1)
+        env.client.session.cookie_jar.clear()
+        r3 = await env.client.get(f"/api/tasks/{tid}/artifacts/", headers={"X-MW-Group": token})
+        assert r3.status == 200
+
+        # 别群群友 → 403
+        other = env.app.token_of(G2)
+        r4 = await env.client.get(f"/api/tasks/{tid}/artifacts/", headers={"X-MW-Group": other})
+        assert r4.status == 403
+
+    @pytest.mark.asyncio
+    async def test_api_route_binary_gets_attachment_headers(self, env: SimpleEnv) -> None:
+        tid = env.app.tasks.create(G1, title="t", req="r", criteria=[], source="test", status="completed")
+        base = self._artifact_dir(env.tmp_path, tid)
+        f = base / "报告.pdf"
+        f.write_bytes(b"%PDF-1.4 fake")
+        await env.login()
+        r = await env.client.get(f"/api/tasks/{tid}/artifacts/报告.pdf")
+        assert r.status == 200
+        assert r.headers.get("Content-Disposition", "").startswith("attachment")
+        assert r.headers.get("X-Content-Type-Options") == "nosniff"
+
+    @pytest.mark.asyncio
+    async def test_api_route_bad_task_id_404(self, env: SimpleEnv) -> None:
+        await env.login()
+        for bad in ("T-999999", "evil-task", "../T-1"):
+            r = await env.client.get(f"/api/tasks/{bad}/artifacts/")
+            assert r.status in (400, 404), (bad, r.status)
 
 
 _PORT: list[int] = []

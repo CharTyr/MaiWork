@@ -391,6 +391,53 @@ class TestKv:
         assert row["last_error"] == "超时"
         assert row["last_ok_ts"] == NOW + 10  # ok_ts=None 时保留上次成功时间
 
+    def test_failure_defaults_for_new_and_legacy_feeds(self, tmp_path):
+        s = self._store(tmp_path)
+        entry = rss.add_feed(s, "g1", url="https://a.example.com/f", title="a", feed_id="r1", now=NOW)
+        assert entry["fail_count"] == 0
+        assert entry["error_since_ts"] == 0.0
+        legacy = {k: v for k, v in entry.items() if k not in {"fail_count", "error_since_ts"}}
+        with s.tx() as conn:
+            s.kv_set(conn, "feeds.rss.g1", [legacy])
+        row = rss.list_feeds(s, "g1")[0]
+        assert row["fail_count"] == 0 and row["error_since_ts"] == 0.0
+        assert s.kv_get("feeds.rss.g1") == [legacy]  # 读取时补值，不重写老数据。
+        with s.tx() as conn:
+            s.kv_set(conn, "feeds.rss.g1", [{**legacy, "fail_count": None, "error_since_ts": None}])
+        row = rss.list_feeds(s, "g1")[0]
+        assert row["fail_count"] == 0 and row["error_since_ts"] == 0.0
+
+    def test_mark_checked_accumulates_errors_and_keeps_first_error_time(self, tmp_path, monkeypatch):
+        s = self._store(tmp_path)
+        rss.add_feed(s, "g1", url="https://a.example.com/f", title="a", feed_id="r1", now=NOW)
+        rss.mark_checked(s, "g1", "r1", ok_ts=NOW - 60, error="")
+        for i, error in enumerate(("超时", "HTTP 503"), start=1):
+            monkeypatch.setattr(rss.clock, "now", lambda i=i: NOW + i)
+            rss.mark_checked(s, "g1", "r1", ok_ts=None, error=error)
+            row = rss.list_feeds(s, "g1")[0]
+            assert row["fail_count"] == i
+            assert row["error_since_ts"] == NOW + 1
+            assert row["last_ok_ts"] == NOW - 60
+            assert row["last_error"] == error
+        # 没有成功时间、也没有错误，不代表一次成功，不能抹掉已有失败。
+        rss.mark_checked(s, "g1", "r1", ok_ts=None, error="")
+        assert rss.list_feeds(s, "g1")[0]["fail_count"] == 2
+        assert rss.list_feeds(s, "g1")[0]["error_since_ts"] == NOW + 1
+
+    def test_success_resets_errors_and_next_failure_starts_new_streak(self, tmp_path, monkeypatch):
+        s = self._store(tmp_path)
+        rss.add_feed(s, "g1", url="https://a.example.com/f", title="a", feed_id="r1", now=NOW)
+        monkeypatch.setattr(rss.clock, "now", lambda: NOW)
+        rss.mark_checked(s, "g1", "r1", ok_ts=None, error="超时")
+        rss.mark_checked(s, "g1", "r1", ok_ts=NOW + 10, error="")
+        row = rss.list_feeds(s, "g1")[0]
+        assert row["fail_count"] == 0 and row["error_since_ts"] == 0.0
+        assert row["last_error"] == "" and row["last_ok_ts"] == NOW + 10
+        monkeypatch.setattr(rss.clock, "now", lambda: NOW + 20)
+        rss.mark_checked(s, "g1", "r1", ok_ts=None, error="HTTP 503")
+        row = rss.list_feeds(s, "g1")[0]
+        assert row["fail_count"] == 1 and row["error_since_ts"] == NOW + 20
+
     def test_idempotent_id_collision(self, tmp_path):
         s = self._store(tmp_path)
         gid = "g1"

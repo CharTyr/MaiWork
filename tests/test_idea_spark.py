@@ -233,8 +233,8 @@ class _SparkFeeds(FakeFeeds):
         super().__init__()
         self._real = real
 
-    def note_spark(self, group_id: str, ts=None) -> None:
-        self._real.note_spark(group_id, ts)
+    def note_spark(self, group_id: str, ts=None, **kwargs) -> None:
+        self._real.note_spark(group_id, ts, **kwargs)
 
     def spark_ready(self, group_id: str, now: float) -> bool:
         return bool(self._real.spark_ready(group_id, now))
@@ -357,3 +357,92 @@ class TestSchedulerSpark:
         finally:
             app._running_jobs.discard((G2, "idea_manual"))
             await app.stop()
+
+
+# ----------------------------------------------------------------------
+# 火花信号留脱敏原话（design §2.1 子项2）
+# ----------------------------------------------------------------------
+
+
+class TestSparkQuotes:
+    def test_note_spark_buffers_sanitized_quote(self, tmp_path) -> None:
+        """note_spark 带 text 时把脱敏截断后的原话存进纯内存环。"""
+        _store, feeds = TestSparkGate()._real(tmp_path)
+        feeds.note_spark(
+            GID, NOW, user_id="10001", user_name="阿强",
+            text="[CQ:at,qq=123] 这手柄怎么办啊 https://a.example/x", message_id="m-1",
+        )
+        buf = list(feeds._spark_quotes_buf.get(GID, ()))
+        assert len(buf) == 1
+        q = buf[0]
+        assert q["user_id"] == "10001"
+        assert "CQ" not in q["text"] and "http" not in q["text"]
+        assert "手柄" in q["text"]
+
+    def test_note_spark_without_text_still_marks_ts(self, tmp_path) -> None:
+        """老调用口（不带 text）只记火花时间，缓冲里不多条目。"""
+        _store, feeds = TestSparkGate()._real(tmp_path)
+        feeds.note_spark(GID, NOW)
+        assert feeds._spark_ts.get(GID) == NOW
+        assert not feeds._spark_quotes_buf.get(GID)
+
+    def test_note_spark_quote_truncated_to_120(self, tmp_path) -> None:
+        _store, feeds = TestSparkGate()._real(tmp_path)
+        feeds.note_spark(GID, NOW, text="长" * 300 + "怎么办", message_id="m-1")
+        buf = list(feeds._spark_quotes_buf.get(GID, ()))
+        assert buf and len(buf[0]["text"]) <= 120
+
+    def test_buffer_keeps_at_most_6(self, tmp_path) -> None:
+        _store, feeds = TestSparkGate()._real(tmp_path)
+        for i in range(9):
+            feeds.note_spark(GID, NOW + i, text=f"第{i}条 怎么办啊", message_id=f"m-{i}")
+        buf = list(feeds._spark_quotes_buf.get(GID, ()))
+        assert len(buf) == 6
+        assert buf[0]["text"].startswith("第3条")  # 最旧的丢了
+
+    def test_spark_taken_writes_quotes_to_kv_and_clears_buffer(self, tmp_path) -> None:
+        store, feeds = TestSparkGate()._real(tmp_path)
+        feeds.note_spark(GID, NOW, text="手柄怎么办", user_name="阿强", message_id="m-1")
+        feeds.spark_taken(GID, NOW)
+        saved = store.kv_get(f"ideas.spark_quotes.{GID}", None)
+        assert isinstance(saved, list) and len(saved) == 1
+        assert "手柄" in saved[0]["text"]
+        assert not feeds._spark_quotes_buf.get(GID)
+
+    def test_quotes_older_than_30min_not_saved(self, tmp_path) -> None:
+        store, feeds = TestSparkGate()._real(tmp_path)
+        feeds.note_spark(GID, NOW - 3600, text="太早的 怎么办啊", message_id="m-old")
+        feeds.note_spark(GID, NOW - 60, text="刚说的 怎么办啊", message_id="m-new")
+        feeds.spark_taken(GID, NOW)
+        saved = store.kv_get(f"ideas.spark_quotes.{GID}", None)
+        assert len(saved) == 1 and "刚说的" in saved[0]["text"]
+
+    def test_make_idea_prompt_includes_spark_quotes_and_consumes(self, tmp_path) -> None:
+        """火花触发的构想轮：提示词带「刚才触发火花的群友原话」，用完清掉。"""
+        import json
+
+        from fakes import FakeModelsQueue, seed_idea_chat
+        from test_feeds import _FEAS_OK, _IDEA_BASIS, _IDEA_EVIDENCE, _make_feeds
+
+        reply = json.dumps(
+            {"idea": {"kind": "help", "title": "把手柄救活", "body": "b",
+                      "evidence": _IDEA_EVIDENCE, "basis": dict(_IDEA_BASIS), "icon": "g",
+                      "chat_worthy": False, "feasibility": _FEAS_OK,
+                      "items": [{"kind": "task", "title": "做一页", "desc": ""}]}},
+            ensure_ascii=False,
+        )
+        models = FakeModelsQueue(ready=True, replies=[reply])
+        store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path, models=models)
+        seed_idea_chat(store, GID, now=clock.now())
+        now = clock.now()
+        feeds.note_spark(GID, now - 60, text="手柄坏了怎么办", user_name="阿强", message_id="m-1")
+        feeds.spark_taken(GID, now)
+        import asyncio
+
+        got = asyncio.run(feeds.make_idea(GID))
+        assert isinstance(got, int) and got > 0
+        prompt = models.calls[0][1][-1]["content"]
+        assert "刚才触发火花的群友原话" in prompt
+        assert "手柄坏了怎么办" in prompt
+        # 用完清掉
+        assert store.kv_get(f"ideas.spark_quotes.{GID}", None) in (None, [], "")

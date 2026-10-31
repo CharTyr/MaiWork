@@ -350,14 +350,37 @@ function registerSwim(key, geom) {
 export const swimGeom = (id) => SWIM_GEOMS.get(Number(id));
 
 // 全页一个动画循环：每 0.4 秒（或页面重画后）重新找一遍页面上会游的鱼；连续一阵子找不到就停，下次画鱼再启动。
-// 系统开了「减少动态效果」就不动；标签页在后台时浏览器自己会暂停。
+// 系统开了「减少动态效果」就不动；标签页在后台时浏览器自己会暂停；系统设置改了也跟着停 / 续（§4.3）。
 let swimOn = false;
+let swimFrame = 0;
+const _reduceMotion = () => typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+function stopSwimLoop() {
+  if (swimFrame && typeof cancelAnimationFrame === "function") cancelAnimationFrame(swimFrame);
+  swimFrame = 0;
+  swimOn = false;
+  if (typeof document === "undefined") return;
+  for (const el of document.querySelectorAll("svg.fish-swim[data-fish-id]")) {
+    const g = swimGeom(el.dataset.fishId);
+    const body = el.querySelector(".fish-body");
+    if (g && body) body.setAttribute("d", smoothPath(g.pts));
+    el.querySelector(".fish-bob")?.removeAttribute("transform");
+    for (const head of el.querySelectorAll(".fish-head")) head.removeAttribute("transform");
+  }
+}
+if (typeof matchMedia === "function") {
+  matchMedia("(prefers-reduced-motion: reduce)").addEventListener("change", (e) => {
+    if (e.matches) stopSwimLoop();
+    else startSwimLoop();
+  });
+}
 function startSwimLoop() {
   if (swimOn || typeof requestAnimationFrame !== "function" || typeof document === "undefined" || typeof document.querySelectorAll !== "function") return;
-  if (typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  if (_reduceMotion()) return;
   swimOn = true;
   let items = [], lastScan = -1e9, empty = 0;
   const tick = (now) => {
+    swimFrame = 0;
+    if (!swimOn || _reduceMotion()) { stopSwimLoop(); return; }
     // 页面重画后旧的鱼会被换掉：发现有鱼离开页面就立刻重找，不等 0.4 秒
     if (now - lastScan > 400 || items.some((x) => !x.body.isConnected)) {
       lastScan = now;
@@ -375,7 +398,7 @@ function startSwimLoop() {
       x.bob && x.bob.setAttribute("transform", p.body);
       for (const h of x.heads) h.setAttribute("transform", p.head);
     }
-    requestAnimationFrame(tick);
+    swimFrame = requestAnimationFrame(tick);
   };
-  requestAnimationFrame(tick);
+  swimFrame = requestAnimationFrame(tick);
 }

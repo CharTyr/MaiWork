@@ -947,3 +947,103 @@ async def test_self_intro_replaced_by_template(tmp_path, bad):
     first_line = host.texts[0]["text"].split("\n")[0]
     assert first_line == "我可以帮群里做个番剧追更表，要不要我来弄？"
 
+
+
+# ----------------------------------------------------------------------
+# v0.14 §1.4 方向 B：提一嘴避让「已经 / 正在用开场白发」的同一条构想。
+# 关键：群构想 at_user 为空，不走 personal_guard——必须挂在通用 preflight 上。
+# ----------------------------------------------------------------------
+
+_CROSS = 12 * 3600.0
+
+
+def _mention_row(store, *, gid=GID, idea_id, status="queued", at_user="", sent_ts=None):
+    """直接落一条 idea_mentions 行（绕过 scan），返回 id。"""
+    with store.tx() as conn:
+        cur = conn.execute(
+            "INSERT INTO idea_mentions (group_id, idea_id, status, at_user, created, due_ts, sent_ts)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (gid, int(idea_id), status, at_user, NOON - 60, NOON - 60, sent_ts),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def _topic_candidate(store, *, gid=GID, kind="idea", ref_id=3):
+    with store.tx() as conn:
+        cur = conn.execute(
+            "INSERT INTO topic_candidates (group_id, kind, ref_id, title, brief, link, expires_ts, used_ts, created)"
+            " VALUES (?, ?, ?, 't', 'b', '', ?, ?, ?)",
+            (gid, kind, int(ref_id), NOON + 3600, NOON - 10, NOON - 10),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def _topic_opened(store, *, gid=GID, ts, ref_id=3, kind="idea"):
+    cid = _topic_candidate(store, gid=gid, kind=kind, ref_id=ref_id)
+    with store.tx() as conn:
+        conn.execute(
+            "INSERT INTO topic_log (group_id, ts, quiet_s, jev, pick, candidate_id, opener, message_id)"
+            " VALUES (?, ?, 100, NULL, NULL, ?, '开场白', 'mid-1')",
+            (gid, float(ts), cid),
+        )
+
+
+def _topic_outbox_pending(store, *, gid=GID, key="topic:5", candidate_kind="idea", candidate_ref_id=3):
+    with store.tx() as conn:
+        conn.execute(
+            "INSERT INTO outbox (key, group_id, kind, payload, status, created, updated)"
+            " VALUES (?, ?, 'text', ?, 'pending', ?, ?)",
+            (key, gid,
+             json.dumps({"push_kind": "topic",
+                          "candidate_kind": candidate_kind,
+                          "candidate_ref_id": candidate_ref_id}),
+             NOON, NOON),
+        )
+
+
+async def test_idea_mention_skips_idea_opened_by_topic_12h(tmp_path):
+    """同一条构想 12h 内被开场白提过 → 提一嘴选材排除它。"""
+    store, host, models, _p, im, ob = _make(tmp_path)
+    _enable(store)
+    iid = _idea(store)
+    _topic_opened(store, ts=NOON - 1800, ref_id=iid, kind="idea")
+    assert im.scan(GID, NOON + 60) == 0, "刚被开场白提过的构想不该再进提一嘴"
+
+
+async def test_idea_mention_keeps_idea_when_topic_opened_over_12h(tmp_path):
+    """开场白是 12h 前发的 → 不再互斥，构想照常进提一嘴。"""
+    store, host, models, _p, im, ob = _make(tmp_path)
+    _enable(store)
+    iid = _idea(store)
+    _topic_opened(store, ts=NOON - (_CROSS + 600), ref_id=iid, kind="idea")
+    assert im.scan(GID, NOON + 60) == 1
+
+
+async def test_idea_mention_preflight_drops_group_mention_when_topic_pending(tmp_path):
+    """发送前复核（群构想 at_user 为空也拦）：排队的开场白已占用这条构想 → 作废。"""
+    store, host, models, _p, im, ob = _make(tmp_path)
+    _enable(store)
+    iid = _idea(store)
+    mid = _mention_row(store, idea_id=iid, status="queued")
+    info = {"key": f"idea_mention:{mid}", "group_id": GID, "now": NOON,
+            "payload": {"at_user": "", "guard": {}, "idea_id": iid}}
+    # 没冲突 → 放行
+    assert im.on_before_send(info) is None
+    _topic_outbox_pending(store, candidate_ref_id=iid)
+    reason = im.on_before_send(info)
+    assert reason, "群构想提一嘴也该被「同素材在开场白排队」拦下（不走 personal_guard）"
+
+
+async def test_idea_mention_flush_group_drops_when_topic_opened_later(tmp_path):
+    """群构想（at_user 空）：提一嘴入队后同素材被开场白发了 → 发件箱那一道作废。"""
+    store, host, models, _p, im, ob = _make(tmp_path)
+    _enable(store)
+    iid = _idea(store)
+    im.scan(GID, NOON + 10)
+    await im.flush(GID, NOON + 10)   # 群构想：写好话 + 入队
+    _topic_opened(store, ts=NOON + 20, ref_id=iid, kind="idea")
+    await ob.flush(NOON + 61)
+    row = store.read().execute(
+        "SELECT status, error FROM idea_mentions WHERE group_id=?", (GID,)
+    ).fetchone()
+    assert row["status"] == "dropped", f"同素材刚被开场白提过，提一嘴该被作废，实际 {dict(row)}"

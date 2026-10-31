@@ -292,6 +292,38 @@ class TestReadTools:
         assert "任务" in r.output and "在盯的事" in r.output
 
     @pytest.mark.asyncio
+    async def test_group_overview_actions(self, app) -> None:
+        """group_overview 的 action=notices/albums/files：复用同一个工具名调群空间只读。"""
+        async def _notices(gid):
+            return [{"publish_time": NOW, "sender_id": "10001", "message": {"text": "周五聚会"}}]
+
+        async def _albums(gid):
+            return [{"album_id": "alb-1", "name": "活动照片", "photo_cnt": 3}]
+
+        async def _files(gid, folder_id=None):
+            return [{"type": "file", "name": "名单.xlsx", "file_id": "f-9", "size": 1024}]
+
+        app.group_space = type(
+            "FakeSpace",
+            (),
+            {
+                "get_notices": staticmethod(_notices),
+                "list_albums": staticmethod(_albums),
+                "list_files": staticmethod(_files),
+            },
+        )()
+        r = await _call(app, "group_overview", {"group_id": G1, "action": "notices"})
+        assert r.ok, r.error
+        assert "周五聚会" in r.output
+        r = await _call(app, "group_overview", {"group_id": G1, "action": "albums"})
+        assert r.ok and "alb-1" in r.output and "活动照片" in r.output
+        r = await _call(app, "group_overview", {"group_id": G1, "action": "files"})
+        assert r.ok and "名单.xlsx" in r.output and "f-9" in r.output
+        # 默认 overview 不受影响
+        r = await _call(app, "group_overview", {"group_id": G1})
+        assert r.ok and "画像条目 2 条" in r.output
+
+    @pytest.mark.asyncio
     async def test_read_profile(self, app) -> None:
         r = await _call(app, "profile_manage", {"action": "read", "group_id": G1})
         assert r.ok and "分享夜" in r.output and "自部署" in r.output

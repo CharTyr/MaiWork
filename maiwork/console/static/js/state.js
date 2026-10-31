@@ -27,7 +27,8 @@ const ACTIVE = ["running", "reviewing", "queued"];
 export const FILTERS = [
   { id: "all", label: "全部", match: () => true },
   { id: "active", label: "进行中", match: (t) => ACTIVE.includes(t.status) },
-  { id: "waiting", label: "等待中", match: (t) => ["waiting_input", "shelved", "paused"].includes(t.status) },
+  { id: "waiting_input", label: "等待回复", match: (t) => t.status === "waiting_input" },
+  { id: "paused", label: "已暂停", match: (t) => ["paused", "shelved"].includes(t.status) },
   { id: "done", label: "已完成", match: (t) => t.status === "completed" },
   { id: "failed", label: "未完成", match: (t) => ["failed", "cancelled", "rejected"].includes(t.status) },
 ];
@@ -40,8 +41,8 @@ export const CATS = [
 ];
 export const TONES = ["#FFD8A8", "#D0BFFF", "#A5D8FF", "#B2F2BB", "#FFC9C9", "#FFEC99", "#C3FAE8", "#EEBEFA"];
 
-// 切换页面时才播放进场动画（多个模块会改它，所以放在对象里）
-export const ui = { flash: true };
+// 切换页面或右栏详情时才播放进场动画（多个模块会改它，所以放在对象里）
+export const ui = { flash: true, sideFlash: false };
 
 export const state = {
   ga: {}, // 群号 → {password_set, accounts}（设置 → 群链接 里的群管理员）
@@ -70,6 +71,8 @@ export const state = {
   setSub: "overview",
   ext: null, // /api/extensions
   extEdit: null, // {kind: "mcp"|"skill", name: null|string, data}
+  newsTopic: "", // 资讯页主题筛选（点 .ntag 按主题过）
+  newsQ: "", // 资讯页搜索框内容
 };
 export const admin = () => state.me && state.me.role === "admin";
 // 群管理员：能管自己那一个群（批准、画像、资讯偏好…），看不到全局设置；个人画像只读

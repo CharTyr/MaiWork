@@ -230,7 +230,7 @@ class Goals:
             if kind == "member":
                 if g["remind_ts"] is not None and float(g["remind_ts"]) <= now:
                     out.append({"type": "remind", "goal": self._member_dict(g)})
-                elif g["due_ts"] is not None and float(g["due_ts"]) <= now and g["last_ts"] is None:
+                elif not g["repeat"] and g["due_ts"] is not None and float(g["due_ts"]) <= now and g["last_ts"] is None:
                     out.append({"type": "ask_progress", "goal": self._member_dict(g)})
                 if (
                     g["repeat"] is not None and g["until_ts"] is not None
@@ -272,13 +272,22 @@ class Goals:
                 repeat = row["repeat"]
                 until = row["until_ts"]
                 if kind == "member" and repeat:
-                    nxt = max(float(row["remind_ts"] or now) + 86400, float(now) + 86400)
+                    nxt = self._next_remind(str(repeat), row["remind_ts"], now)
                     if until is not None and float(now) > float(until):
                         updates.update(state="done", remind_ts=None)
-                    else:
+                    elif nxt is not None:
                         updates["remind_ts"] = nxt
+                    else:
+                        updates["remind_ts"] = None
                 else:
-                    updates["remind_ts"] = None
+                    # 纯单次提醒：提醒过了就算结案（done）。只有「提醒早于截止日、
+                    # 后面还要 ask_progress 收尾」的保留 active 等后续问进展。
+                    due = row["due_ts"]
+                    fired = float(row["remind_ts"] or now)
+                    if due is None or float(due) <= fired:
+                        updates.update(state="done", remind_ts=None, last_ts=float(now))
+                    else:
+                        updates["remind_ts"] = None
             elif t in ("ask_progress", "renew"):
                 updates["last_ts"] = float(now)
             elif t == "check":
@@ -287,6 +296,29 @@ class Goals:
                 raise ValueError(f"不认识的处理类型「{type}」")
             cols = ", ".join(f"{k}=?" for k in updates)
             conn.execute(f"UPDATE goals SET {cols} WHERE id=?", [*updates.values(), str(goal_id)])
+
+    @staticmethod
+    def _next_remind(repeat: str, remind_ts: Any, now: float) -> float | None:
+        """按循环规则算下一次提醒时刻（错过只补一次，直接落到未来）。
+
+        - daily：顺延 1 天（原算法一字不动，跨 now）；
+        - weekly：顺延 7 天（跨 now）；
+        - weekdays：顺延 1 天，落在周六 / 周日就跳到下周一同一时刻（北京时间）。
+        认不出的 repeat → None（调用方清 remind_ts，不再提醒）。
+        """
+        base = float(remind_ts or now)
+        r = str(repeat or "").strip().lower()
+        if r == "daily":
+            return max(base + 86400, float(now) + 86400)
+        if r == "weekly":
+            return max(base + 7 * 86400, float(now) + 86400)
+        if r == "weekdays":
+            nxt = base + 86400
+            # 顺着往后挪，直到落在一个工作日（周一=0 … 周日=6）且严格晚于 now
+            while clock.bj(nxt).weekday() >= 5 or nxt <= float(now):
+                nxt += 86400
+            return nxt
+        return None
 
     # ------------------------------------------------------------------
     # 生命周期 / 记进展

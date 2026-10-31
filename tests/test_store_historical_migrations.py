@@ -234,7 +234,7 @@ class TestFullMigrate:
         # 44 = 工作会话、事件与任务轮次；前 43 步不改动。
         assert store_mod._MIGRATIONS[41].__name__ == "_m_goal_stale_notify"
         assert store_mod._MIGRATIONS[42].__name__ == "_m_skills"
-        assert LATEST == 48, "第 45 步补索引、第 46 步主模型条目、第 47 步 round ref、第 48 步便条板，历史迁移位置保持不变"
+        assert LATEST == 49, "第 45 步补索引、第 46 步主模型条目、第 47 步 round ref、第 48 步便条板、第 49 步 mentions 定向，历史迁移位置保持不变"
         assert store_mod._MIGRATIONS[46].__name__ == "_m_round_ref_marks"
         assert store_mod._MIGRATIONS[40].__name__ == "_m_pending_ask_state"
         assert store_mod._MIGRATIONS[34].__name__ == "_m_task_lanes"
@@ -596,7 +596,7 @@ class TestOnline45Upgrade:
         news_batches/ideas/topic_log/judgments 的 run_ref 列。"""
         s = self._online_45(tmp_path / "online45.db")
         try:
-            assert s.migrate() == 48
+            assert s.migrate() == 49
             assert "main_runs" in _tables(s)
             for table in ("model_calls", "tool_calls", "news_batches", "ideas",
                           "topic_log", "judgments"):
@@ -604,7 +604,7 @@ class TestOnline45Upgrade:
                 assert "run_ref" in cols, table
             assert "idx_model_calls_run_ref" in _index_names(s, "model_calls")
             assert "idx_tool_calls_run_ref" in _index_names(s, "tool_calls")
-            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 48
+            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 49
         finally:
             s.close()
 
@@ -613,12 +613,39 @@ class TestOnline45Upgrade:
         s = Store(tmp_path / "v44.db")
         try:
             _run_steps(s, 44)
-            assert s.migrate() == 48
+            assert s.migrate() == 49
             names = _tables(s)
             assert "main_runs" in names and "task_sessions" in names
             assert "idx_events_entity" in _index_names(s, "events")
             cols = {c[0] for c in _columns(s, "model_calls")}
             assert "run_ref" in cols
-            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 48
+            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 49
+        finally:
+            s.close()
+
+    def test_step48_upgrades_to_49_adds_mention_target_columns(self, tmp_path: Path) -> None:
+        """第 49 步 `_m_mention_targets`：48 存量库升上来后，mentions 表多出
+        target_user_id / keywords 两列（定向备忘防误烧）。"""
+        s = Store(tmp_path / "v48.db")
+        try:
+            _run_steps(s, 48)
+            # 老库号上 mentions 没有这两列
+            cols_before = {c[0] for c in _columns(s, "mentions")}
+            assert "target_user_id" not in cols_before
+            assert "keywords" not in cols_before
+            assert s.migrate() == 49
+            cols = {c[0] for c in _columns(s, "mentions")}
+            assert "target_user_id" in cols and "keywords" in cols
+            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 49
+        finally:
+            s.close()
+
+    def test_fresh_db_mentions_has_target_columns(self, tmp_path: Path) -> None:
+        """全新库一路跑到 49：mentions 直接带 target_user_id / keywords。"""
+        s = Store(tmp_path / "fresh.db")
+        try:
+            assert s.migrate() == 49
+            cols = {c[0] for c in _columns(s, "mentions")}
+            assert "target_user_id" in cols and "keywords" in cols
         finally:
             s.close()

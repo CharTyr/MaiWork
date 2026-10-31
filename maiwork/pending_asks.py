@@ -51,7 +51,7 @@ from . import clock
 logger = logging.getLogger("maiwork.pending_asks")
 
 KINDS = ("prepare", "goal", "reminder", "none")
-REPEATS = ("daily", "weekly", "workdays")
+REPEATS = ("daily", "weekly", "weekdays")
 OPEN_STATES = ("pending", "decided")
 TERMINAL_STATES = ("completed", "none", "screened", "review", "expired")
 STALE_S = 48 * 3600
@@ -595,6 +595,8 @@ class PendingAsks:
         except (TypeError, ValueError):
             due_ts = None
         repeat = str(decision.get("repeat") or "").strip().lower()
+        if repeat == "workdays":
+            repeat = "weekdays"
         out["repeat"] = repeat if repeat in REPEATS else None
         if remind_ts is None or remind_ts <= 0:
             return out, False

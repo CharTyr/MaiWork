@@ -21,7 +21,8 @@ import json
 import logging
 import re
 import time
-from typing import Any, Callable, Optional
+from collections import OrderedDict
+from typing import Any, Callable, Optional, Sequence
 
 from . import clock, group_push
 from .config import Settings
@@ -124,8 +125,10 @@ MARKER = "【MaiWork 备忘】"  # 已注入标记：inject 排重用（不含�
 # - request:<待批请求号>：群友 @ 派活后写的那条；同一请求的状态更新
 #   （等管理员批准 → 已开工）用同一个 key 覆盖同一行。
 # - idea-busy:<构想号>:<消息号>：「这条构想已经在等批准 / 已经在做了，不用再建」。
-# 以后新增任务状态行也沿用这两个前缀，就能自动拿到优先级。
-PRIORITY_MEMO_PREFIXES = ("request:", "idea-busy:")
+# - card-reply:<消息号>：群友引用了本群资讯卡片追问，提示 MaiBot 结合卡片内容答、
+#   勿编造卡片外细节（90 秒 / 2 轮纯内存备忘）。
+# 以后新增任务状态行也沿用这些前缀，就能自动拿到优先级。
+PRIORITY_MEMO_PREFIXES = ("request:", "idea-busy:", "card-reply:")
 # 派活行自身太长、预算又必须给它时：按句截断（句末标点优先），不整行丢。
 _PRIORITY_SENTENCE_ENDS = "。！？；!?;."
 _PRIORITY_MIN_BODY = 12  # 截断后正文至少留这么多字（再多行也在可用预算内分份额，不足截短）
@@ -527,6 +530,14 @@ class Mentions:
         self._store = store
         self._get_settings = get_settings
         self._topics = TopicMatcher(store)
+        # 临时提示（@ 判活防抢答、群友引用卡片追问）：纯内存字典，不进库、不抢写锁
+        # （宿主钩子红线：Intake.on_message / inject 里不许为临时状态开事务）。
+        # {(gid, key): {"text","expires_ts","turns_left","target_user_id","keywords"}}
+        self._ephemeral: dict[tuple[str, str], dict] = {}
+        # 最近一条群消息的发言人（msg_id → user_id）：由 Intake 回填（钩子零 I/O），
+        # 定向备忘判「该本人看」用。{gid: OrderedDict[msg_id, user_id]}
+        self._recent_msg_users: dict[str, "OrderedDict[str, str]"] = {}
+        self._recent_msg_user_limit = 512
 
     @staticmethod
     def _served_group_id_for_session(store: Store, session_id: str) -> str:
@@ -541,29 +552,223 @@ class Mentions:
             return ""
         return str(row["group_id"]) if row["group_id"] else ""
 
-    def add(self, group_id: str, text: str, *, key: str, ttl_s: float, turns: int = 5) -> None:
-        """存一条备忘；同 key 覆盖。"""
+    def add(
+        self,
+        group_id: str,
+        text: str,
+        *,
+        key: str,
+        ttl_s: float,
+        turns: int = 5,
+        target_user_id: str = "",
+        keywords: Sequence[str] | str = "",
+    ) -> None:
+        """存一条备忘；同 key 覆盖。
+
+        target_user_id / keywords（迁移 49 两列）：任一个非空就是「定向备忘」——
+        只在「最后一条消息是本人说的」或「最近两条群消息命中关键词 / 任务号」时
+        才拼进上下文并扣轮次；两列都空 = 老行为（谁说话都注入）。keywords 可以是
+        字符串（逗号 / 空格分隔）或序列。
+        """
         gid = str(group_id)
         now = clock.now()
+        kw_raw = keywords if isinstance(keywords, str) else ",".join(str(k) for k in keywords)
+        kw = ",".join(self._kw_list(kw_raw))
         # 先删后插，避免 UNIQUE 冲突报错；同事务
         with self._store.tx() as conn:
             conn.execute(
-                "INSERT INTO mentions (group_id, key, text, expires_ts, turns_left, created)"
-                " VALUES (?, ?, ?, ?, ?, ?)"
+                "INSERT INTO mentions (group_id, key, text, expires_ts, turns_left, created, target_user_id, keywords)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(group_id, key) DO UPDATE SET"
                 " text=excluded.text, expires_ts=excluded.expires_ts,"
-                " turns_left=excluded.turns_left, created=excluded.created",
-                (gid, str(key), str(text), now + float(ttl_s), int(turns), now),
+                " turns_left=excluded.turns_left, created=excluded.created,"
+                " target_user_id=excluded.target_user_id, keywords=excluded.keywords",
+                (gid, str(key), str(text), now + float(ttl_s), int(turns), now,
+                 str(target_user_id or ""), kw),
             )
+
+    # ------------------------------------------------------------------
+    # 临时提示（纯内存，不进库）：@ 判活防抢答、群友引用卡片追问这类「这一轮有用、
+    # 下一轮就该消失」的备忘。宿主钩子红线：不能为它们开库事务，所以放内存字典。
+    # ------------------------------------------------------------------
+
+    def add_ephemeral(
+        self,
+        group_id: str,
+        text: str,
+        *,
+        key: str,
+        ttl_s: float = 15.0,
+        turns: int = 1,
+        target_user_id: str = "",
+        keywords: Sequence[str] | str = "",
+    ) -> None:
+        """塞一条纯内存临时备忘（默认 15 秒 / 1 轮）；同 key 覆盖。零 SQL、零写锁。"""
+        gid = str(group_id)
+        kw_raw = keywords if isinstance(keywords, str) else ",".join(str(k) for k in keywords)
+        self._ephemeral[(gid, str(key))] = {
+            "text": str(text),
+            "expires_ts": clock.now() + float(ttl_s),
+            "turns_left": int(turns),
+            "target_user_id": str(target_user_id or ""),
+            "keywords": ",".join(self._kw_list(kw_raw)),
+        }
+
+    def drop_ephemeral(self, group_id: str, key: str) -> None:
+        """撤一条纯内存临时备忘（@ 判完 / 正式备忘接棒后调用）；没有就当无事。"""
+        self._ephemeral.pop((str(group_id), str(key)), None)
+
+    @staticmethod
+    def _kw_list(raw: str) -> list[str]:
+        """keywords 字段（逗号 / 空格分隔或序列）→ 去空的小写词列表。"""
+        out: list[str] = []
+        for part in re.split(r"[,\s]+", str(raw or "")):
+            w = part.strip().lower()
+            if w:
+                out.append(w)
+        return out
+
+    # ------------------------------------------------------------------
+    # 最近一条群消息的发言人（Intake 回填，钩子零 I/O）：定向备忘判「该本人看」。
+    # ------------------------------------------------------------------
+
+    def note_msg_user(self, group_id: str, message_id: str, user_id: str) -> None:
+        """记「这条消息是谁发的」；钩子侧零 I/O 的纯内存登记，上限 512 条 / 群。"""
+        gid = str(group_id)
+        mid = str(message_id or "")
+        uid = str(user_id or "")
+        if not mid or not uid:
+            return
+        ring = self._recent_msg_users.get(gid)
+        if ring is None:
+            ring = OrderedDict()
+            self._recent_msg_users[gid] = ring
+        ring[mid] = uid
+        ring.move_to_end(mid)
+        while len(ring) > self._recent_msg_user_limit:
+            ring.popitem(last=False)
+
+    def _last_speaker(self, group_id: str, kwargs: Any) -> str:
+        """最后一（非机器人）条消息的发言人 user_id；解析不到 → ""。"""
+        try:
+            # 从 kwargs["items"] 里取最后一条非机器人消息的 msg_id，再到
+            # _recent_msg_users 里查发言人（<message> 标签只有昵称没有 user_id）。
+            items = kwargs.get("items") if isinstance(kwargs, dict) else None
+            if not isinstance(items, list):
+                return ""
+            ring = self._recent_msg_users.get(str(group_id))
+            if not ring:
+                return ""
+            last_mid = ""
+            for item in items:
+                text = self._topics._item_text(item)
+                if not text:
+                    continue
+                matched_block = False
+                for m in _MESSAGE_BLOCK.finditer(text):
+                    matched_block = True
+                    attrs = dict(_MESSAGE_ATTR.findall(m.group(1)))
+                    if attrs.get("is_self_message", "").lower() == "true":
+                        continue
+                    mid = str(attrs.get("msg_id") or "")
+                    if mid:
+                        last_mid = mid
+                pref = _MESSAGE_PREFIX.match(text)
+                if pref is not None and not matched_block:
+                    attrs = dict(_MESSAGE_ATTR.findall(pref.group(1)))
+                    if attrs.get("is_self_message", "").lower() != "true":
+                        last_mid = str(attrs.get("msg_id") or "")
+            return str(ring.get(last_mid) or "") if last_mid else ""
+        except Exception:
+            return ""
+
+    def _recent_text(self, group_id: str, kwargs: Any) -> str:
+        """最近两条群友发言拼的小写文本（关键词命中用）；没有 → ""。"""
+        try:
+            users, _ = self._topics.chat_bodies(kwargs)
+            return "\n".join(users[-2:]).lower() if users else ""
+        except Exception:
+            return ""
+
+    _TASK_NO = re.compile(r"(?<![a-z0-9])t-\d+(?![0-9])", re.IGNORECASE)
+
+    def _targeted_visible(
+        self, row: Any, group_id: str, kwargs: Any, last_speaker: str, recent_text: str
+    ) -> bool:
+        """这条定向备忘这一轮该不该进上下文。
+
+        target_user_id / keywords 都空 → 老行为（总是可见）。任一非空 → 满足任一
+        条件即注入：最后一条消息的发言人是 target_user_id，或最近两条群消息命中
+        keywords / 行文本里的任务号（T-数字）。
+        """
+        tgt = str(self._col(row, "target_user_id") or "").strip()
+        kws = str(self._col(row, "keywords") or "").strip()
+        if not tgt and not kws:
+            return True
+        if tgt and last_speaker and str(tgt) == str(last_speaker):
+            return True
+        # 关键词 / 任务号命中：keywords 列里的词，或行文本里出现的 T-数字
+        for w in self._kw_list(kws):
+            if w and w in recent_text:
+                return True
+        for m in self._TASK_NO.findall(str(self._col(row, "text") or "")):
+            if m.lower() in {n.lower() for n in self._TASK_NO.findall(recent_text)}:
+                return True
+        return False
+
+    @staticmethod
+    def _col(row: Any, name: str) -> str:
+        """从 mentions 行取某列；dict / sqlite3.Row 都兼容，取不到 → ""。"""
+        try:
+            if isinstance(row, dict):
+                return str(row.get(name) or "")
+            return str(row[name] or "")
+        except (KeyError, IndexError):
+            return ""
 
     def _mention_rows(self, group_id: str) -> list[Any]:
         now = clock.now()
         return self._store.read().execute(
-            "SELECT id, key, text, turns_left FROM mentions"
+            "SELECT id, key, text, turns_left, target_user_id, keywords FROM mentions"
             " WHERE group_id=? AND expires_ts>? AND turns_left>0"
             " ORDER BY created DESC",
             (str(group_id), now),
         ).fetchall()
+
+    def _ephemeral_rows(self, group_id: str) -> list[dict]:
+        """这群本轮还活着的临时备忘（dict 形状跟 mentions 行对齐，id 用 -1 占位——
+        它们不进库，递减轮次走自己的 turns_left）。会顺手清掉过期的。"""
+        gid = str(group_id)
+        now = clock.now()
+        out: list[dict] = []
+        dead: list[tuple[str, str]] = []
+        for (g, key), row in self._ephemeral.items():
+            if g != gid:
+                continue
+            if float(row.get("expires_ts") or 0.0) <= now or int(row.get("turns_left") or 0) <= 0:
+                dead.append((g, key))
+                continue
+            out.append({
+                "id": -1,
+                "key": key,
+                "text": row["text"],
+                "turns_left": row["turns_left"],
+                "target_user_id": row.get("target_user_id", ""),
+                "keywords": row.get("keywords", ""),
+                "_eph_key": key,
+            })
+        for k in dead:
+            self._ephemeral.pop(k, None)
+        # 临时行排在持久行前面（防抢答 / 追问这类要赶在闲聊前让 MaiBot 看到）
+        return out
+
+    def _decrement_ephemeral(self, group_id: str, used_keys: list[str]) -> None:
+        """真拼进上下文的临时行扣一轮（纯内存）。"""
+        for key in used_keys:
+            row = self._ephemeral.get((str(group_id), str(key)))
+            if row is None:
+                continue
+            row["turns_left"] = int(row.get("turns_left") or 0) - 1
 
     @staticmethod
     def _is_priority(row: Any) -> bool:
@@ -612,20 +817,31 @@ class Mentions:
             logger.exception("mentions turn 递减失败（group=%s）", group_id)
 
     def _render_for_group(self, group_id: str) -> Optional[str]:
-        """给某个群拼备忘（不含话题接龙）；没货 → None。"""
+        """给某个群拼备忘（不含话题接龙）；没货 → None。
+
+        render() 没有 kwargs（查不到最后发言人 / 最近文本），所以这里不做定向过滤
+        ——定向行照常进，由 inject 的 _memo_with_topics 路径才判可见性。"""
         lines: list[str] = []
         used_ids: list[int] = []
+        used_eph: list[str] = []
         remaining = MAX_TEXT_LENGTH - len(HEADER)
-        for r in self._mention_rows(group_id):
+        rows = self._ephemeral_rows(group_id) + list(self._mention_rows(group_id))
+        for r in rows:
             line = f"- {r['text']}"
             if len(line) > remaining:
                 continue  # 跳过过长的，继续看后面短的
             lines.append(line)
-            used_ids.append(int(r["id"]))
+            ekey = r.get("_eph_key") if isinstance(r, dict) else None
+            if ekey is not None:
+                used_eph.append(str(ekey))
+            else:
+                used_ids.append(int(r["id"]))
             remaining -= len(line) + 1  # +1 是换行
         if not lines:
             return None
         self._decrement_turns(used_ids, group_id)
+        if used_eph:
+            self._decrement_ephemeral(group_id, used_eph)
         return HEADER + "\n" + "\n".join(lines)
 
     def _memo_with_topics(self, group_id: str, kwargs: Any) -> Optional[str]:
@@ -641,13 +857,35 @@ class Mentions:
         2026-10：只递不记账（chat_feeds 表和 record/check_said 已删；「聊到了」状态也删）。
         """
         topic_entries = self._topics.memo_entries(group_id, kwargs)
-        rows = self._mention_rows(group_id)
-        priority_rows = [r for r in rows if self._is_priority(r)]
-        other_rows = [r for r in rows if not self._is_priority(r)]
+        db_rows = self._mention_rows(group_id)
+        eph_rows = self._ephemeral_rows(group_id)
+
+        # 定向备忘（target_user_id / keywords 任一非空）：只在「最后一条消息的发言人
+        # 是本人」或「最近两条群消息命中关键词 / 任务号」时注入并扣轮次；旁人闲聊
+        # 不注入也不扣——防 5 轮被全群闲聊误烧。
+        last_speaker = self._last_speaker(group_id, kwargs)
+        recent_text = self._recent_text(group_id, kwargs)
+
+        def _visible(r: Any) -> bool:
+            return self._targeted_visible(r, group_id, kwargs, last_speaker, recent_text)
+
+        # 临时行排最前（防抢答 / 追问要赶在闲聊前让 MaiBot 看到），持久行按原顺序。
+        all_rows = eph_rows + [r for r in db_rows]
+        visible = [r for r in all_rows if _visible(r)]
+        priority_rows = [r for r in visible if self._is_priority(r)]
+        other_rows = [r for r in visible if not self._is_priority(r)]
         lines: list[str] = []
         used_ids: list[int] = []
         used_keys: list[str] = []
+        used_eph: list[str] = []
         remaining = MAX_TEXT_LENGTH - len(HEADER)
+
+        def _mark(r: Any) -> None:
+            ekey = r.get("_eph_key") if isinstance(r, dict) else None
+            if ekey is not None:
+                used_eph.append(str(ekey))
+            else:
+                used_ids.append(int(r["id"]))
 
         # 1) 派活 / 任务状态行：在可用预算内分配份额；预算不足时截短，耗尽后停止
         #    （后面的行这一轮不进上下文）
@@ -659,7 +897,7 @@ class Mentions:
             if not line:
                 break
             lines.append(line)
-            used_ids.append(int(r["id"]))
+            _mark(r)
             remaining -= len(line) + 1  # +1 是换行
 
         # 2) 话题接龙行：原规则（放不下就少放）
@@ -677,12 +915,14 @@ class Mentions:
             if len(line) + 1 > remaining:
                 continue
             lines.append(line)
-            used_ids.append(int(r["id"]))
+            _mark(r)
             remaining -= len(line) + 1
 
         if not lines:
             return None
         self._decrement_turns(used_ids, group_id)
+        if used_eph:
+            self._decrement_ephemeral(group_id, used_eph)
         if used_keys:
             try:
                 self._topics.record_injected(group_id, used_keys)

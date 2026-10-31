@@ -462,7 +462,7 @@ class TestAskApply:
         assert g0["title"] == "交周报"
         assert g0["due_ts"] == want_ts
         assert g0["remind_ts"] == want_ts
-        # outbox 里有一句固定回话（reply_to 原消息、push_kind=status）
+        # outbox 里有一句固定回话（reply_to 原消息、push_kind=command）
         oks = store.read().execute(
             "SELECT key, group_id, kind, payload FROM outbox WHERE key LIKE 'ask-remind:%'"
         ).fetchall()
@@ -470,7 +470,7 @@ class TestAskApply:
         payload = json.loads(oks[0]["payload"])
         assert payload["text"] == "记下了，2026-09-27 09:00 提醒你"
         assert payload["reply_to"] == "m1"
-        assert payload["push_kind"] == "status"
+        assert payload["push_kind"] == "command"  # 提醒落地回执按 /mw 命令回话算，不占每日推送名额
 
     @pytest.mark.asyncio
     async def test_reminder_not_duplicated_on_second_read(self, store: Store, frozen_now: float) -> None:

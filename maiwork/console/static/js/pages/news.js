@@ -138,7 +138,7 @@ function newsItem(it, i, guide) {
   const sc = it.scores || null;
   const rated = !!myRates()[it.id];
   const tags = [
-    it.topic ? `<span class="ntag">${esc(it.topic)}</span>` : "",
+    it.topic ? `<span class="ntag" data-act="news-topic" data-topic="${esc(it.topic)}" role="button" tabindex="0">${esc(it.topic)}</span>` : "",
     it.followup ? `<span class="ntag fu">后续</span>` : "",
     it.angle === "diverse" ? `<span class="ntag alt">新角度</span>` : "",
     it.angle === "explore" ? `<span class="ntag ex">延伸</span>` : "",
@@ -371,6 +371,29 @@ function newsSwitch() {
   </div>${newsRunBtn()}</div>`;
 }
 
+function _newsFilterBar() {
+  const topic = state.newsTopic || "";
+  const q = (state.newsQ || "").trim();
+  if (!topic && !q) return "";
+  const clearTopic = topic
+    ? `<span class="ntag on" data-act="news-topic" data-topic="" role="button" tabindex="0">${esc(topic)} ×</span>`
+    : "";
+  return `<div class="news-filter">${clearTopic}${q ? `<span class="news-q">搜索：${esc(q)}</span>` : ""}</div>`;
+}
+
+function _newsSearchBox() {
+  return `<div class="news-search"><input id="news-q" type="search" placeholder="搜索标题、摘要或来源" value="${esc(state.newsQ || "")}" aria-label="搜索资讯" /></div>`;
+}
+
+function _matchNews(it) {
+  const topic = state.newsTopic || "";
+  if (topic && String(it.topic || "") !== topic) return false;
+  const q = (state.newsQ || "").trim().toLowerCase();
+  if (!q) return true;
+  const hay = [it.title, it.summary, it.why, ...(it.sources || []).map((s) => s.site || "")].join(" ").toLowerCase();
+  return hay.includes(q);
+}
+
 export function viewNews(g, v) {
   if (g.fresh) {
     return `<h1 class="h-page h-fish">${agentFish("news", 44)}<span>资讯</span></h1>` + emptyState("seedling", "正在建立群画像", "建立后将开始搜集资讯");
@@ -382,18 +405,23 @@ export function viewNews(g, v) {
     return html + guides.map((it, k) => newsItem(it, k, true)).join("");
   }
   const news = (v && v.news) || [];
-  if (!news.length) {
+  const search = _newsSearchBox() + _newsFilterBar();
+  if (!news.length && !state.newsTopic && !(state.newsQ || "").trim()) {
     return newsSwitch() + `<h1 class="h-page h-fish">${agentFish("news", 44)}<span>资讯</span></h1>` + emptyState("newspaper", "暂无资讯", "");
   }
   let i = 0;
+  const filtering = !!(state.newsTopic || (state.newsQ || "").trim());
+  const filtered = news.map((b) => ({ ...b, items: (b.items || []).filter(_matchNews) }))
+    .filter((b) => !filtering || b.items.length);
+  if (filtering && !filtered.length) return newsSwitch() + search +
+    emptyState("newspaper", "没有匹配的资讯", "") + `<button class="btn" data-act="news-clear">清除筛选</button>`;
   return (
-    newsSwitch() +
-    news
+    newsSwitch() + search +
+    filtered
       .map((batch, b) => {
         const rc = batch.rejected_count || 0;
         const head = `<h1 class="h-page${b ? "" : " h-fish"}" ${b ? 'style="margin-top:46px"' : ""}>${b ? "" : agentFish("news", 44)}<span>${esc(slotName(batch.slot_ts))}</span></h1><p class="h-meta">${hhmm(batch.slot_ts)} 搜集 · ${batchStats(batch)}${rc ? ` · 淘汰 ${rc} 条` : ""}</p>`;
         if (batch.skipped || !(batch.items || []).length) {
-          // 收了东西但资讯栏是空的：收的都是文章，指过去，别说「没有值得看的」
           const got = Number((batch.stats && batch.stats.kept) || batch.kept || 0);
           const note = got > 0
             ? `${ico("books")}<span>另有 ${got} 篇已收录至「文章」</span><button class="btn small" data-act="news-tab" data-t="guides">查看</button>`

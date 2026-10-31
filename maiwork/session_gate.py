@@ -208,6 +208,23 @@ class SessionGate:
             logger.debug("学习机器人显示名未落库，留待下一条真实 @")
             return False
 
+    def skip_message(self, platform: str, group_id: str, message_id: str) -> None:
+        """标记某条消息已由别的入口接管（如引用构想提一嘴），后续原生命令直接放行。"""
+        gid = str(group_id or "").strip()
+        mid = str(message_id or "").strip()
+        if not gid or not mid:
+            return
+        try:
+            plat = self._settings().platform_of(gid)
+        except Exception:
+            plat = str(platform or "qq")
+        source = f"{plat}:{gid}:{mid}"
+        key = _DECISION_PREFIX + hashlib.sha256(source.encode()).hexdigest()
+        if len(self._decisions) >= 4096:
+            for old in list(self._decisions)[:2048]:
+                self._decisions.pop(old, None)
+        self._decisions[key] = False
+
     def intake(self, kwargs: dict, spawn) -> bool:
         """返回 True 表示旧派活入口应让路；钩子不等模型。
 

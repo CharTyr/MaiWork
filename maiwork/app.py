@@ -778,6 +778,11 @@ class MaiWorkApp:
                 )
             except Exception:
                 logger.exception("注册群空间工具出错，主模型这次没有群空间工具用")
+            # 初次建群画像要把群公告喂给主模型：把群空间能力接上 profiles
+            try:
+                self.profiles.set_group_space(self.group_space)
+            except Exception:
+                logger.exception("给 profiles 接群空间能力出错")
         # 插件重启：发送中断的标不确定，不重放（docs/02 §6.5）
         recovered = self.outbox.recover()
         if recovered:
@@ -908,6 +913,8 @@ class MaiWorkApp:
             logger.exception("回收非服务群残留出错，继续")
         # 4. 收消息
         self._intake = self._make_intake()
+        for gid in settings.groups:
+            await self._intake.refresh_reply_indexes(gid)
         # 5. 每个服务群建行 + token
         self._ensure_groups()
         self._refresh_served_sessions()
@@ -1841,7 +1848,10 @@ class MaiWorkApp:
             try:
                 mod = getattr(self, mod_name, None)
                 if mod is not None and agents_obj is not None:
-                    mod._agents = agents_obj  # noqa: SLF001
+                    if mod_name == "coordinator" and callable(getattr(mod, "set_agents", None)):
+                        mod.set_agents(agents_obj)
+                    else:
+                        mod._agents = agents_obj  # noqa: SLF001
                     wired.append(mod_name + "(agents)")
             except Exception:
                 logger.exception("给 %s 挂 agents 出错", mod_name)
@@ -2482,6 +2492,8 @@ class MaiWorkApp:
         )
         # 派活判断兜底（quick_judge）：intake 自己建的；停机时要单独收（见 _stop_stack）
         self.quick_judge = getattr(intake, "quick_judge", None)
+        if self.outbox is not None:
+            self.outbox.add_result_hook(intake.on_delivery_result)
         return intake
 
     # ------------------------------------------------------------------
@@ -3101,7 +3113,9 @@ class MaiWorkApp:
                 f"群友「{user_name}」说：{text[:300]}\n"
                 '输出格式：{"ok": true, "title": "一句话提醒内容（不超过 20 字）", '
                 '"due_ts": 到期的 epoch 秒, "remind_ts": 提醒的 epoch 秒}；\n'
-                "remind_ts 默认等于 due_ts。解析不出时间、或时间早于现在 → 只输出 {\"ok\": false}。"
+                "remind_ts 默认等于 due_ts。要循环提醒再加 \"repeat\"："
+                "每天 \"daily\"、每周同一天 \"weekly\"、每个工作日 \"weekdays\"；单次提醒不要这个字段。"
+                "解析不出时间、或时间早于现在 → 只输出 {\"ok\": false}。"
             )
             result = await self.models.chat(
                 agent="main",
@@ -3122,7 +3136,7 @@ class MaiWorkApp:
                 pending.decide(gid, message_id, {
                     "kind": "reminder", "title": str(data["title"]),
                     "remind_ts": float(data["remind_ts"]), "due_ts": float(data["due_ts"]),
-                    "repeat": None, "via": "群里 @ · 提醒解析",
+                    "repeat": data.get("repeat"), "via": "群里 @ · 提醒解析",
                 })
                 landed = bool(self.profiles.apply_pending_ask(gid, message_id)) or self._pending_landed(
                     pending, gid, message_id
@@ -3143,8 +3157,9 @@ class MaiWorkApp:
                 who_id=str(msg.get("user_id") or ""),
                 who_name=user_name,
                 title=str(data["title"]),
-                due_ts=float(data["due_ts"]),
+                due_ts=None if data.get("repeat") else float(data["due_ts"]),
                 remind_ts=float(data["remind_ts"]),
+                repeat=data.get("repeat"),
             )
             self.outbox.enqueue(
                 f"reminder:{goal_id}",
@@ -3153,7 +3168,7 @@ class MaiWorkApp:
                 {
                     "text": f"{user_name}，记下了，{due_txt} 提醒你：{data['title']}",
                     "reply_to": message_id,
-                    "push_kind": "status",
+                    "push_kind": "command",
                 },
             )
             if self.mentions is not None:
@@ -3208,6 +3223,8 @@ class MaiWorkApp:
             self._remember_session_row(gid, sig.session_id, sig.last_ts)
         # 2) 每个服务群串行处理；单个群出错不影响别的
         for gid in list(self._settings.groups.keys()):
+            if self._intake is not None:
+                await self._intake.refresh_reply_indexes(gid, now)
             try:
                 # tick 只做「读消息 + 统计」（快）：refresh=False 不在循环里等主模型；
                 # 有信号最多 60 秒读一次宿主，没信号按 read_interval_minutes 节流
@@ -3443,11 +3460,17 @@ class MaiWorkApp:
                 )
                 title = str(goal.get("title") or "")
                 if etype == "remind":
+                    payload = {"text": f"@{who} 提醒：{title}", "push_kind": "reminder"}
+                    # 真 @：发起人 id 非空就带上 at_user/at_name（正文仍不写裸 QQ 号）。
+                    if str(goal.get("who_id") or ""):
+                        payload["text"] = f"提醒：{title}"
+                        payload["at_user"] = str(goal["who_id"])
+                        payload["at_name"] = who
                     self.outbox.enqueue(
                         f"goal-remind:{goal_id}:{clock.day_key(now)}",
                         gid,
                         "text",
-                        {"text": f"@{who} 提醒：{title}", "push_kind": "reminder"},
+                        payload,
                     )
                     goals.mark(goal_id, "remind", now)
                 elif etype == "ask_progress":
@@ -3464,7 +3487,7 @@ class MaiWorkApp:
                         gid,
                         "text",
                         {
-                            "text": f"「{title}」这个每天的提醒 30 天到了，还要继续的话，"
+                            "text": f"「{title}」这个循环提醒 30 天到了，还要继续的话，"
                             f"让 {who or '当事人'} 在网页上重新设一个，或者群里告诉我",
                             "push_kind": "status",
                         },
@@ -3655,12 +3678,12 @@ class MaiWorkApp:
         await self.topics.follow_up(gid, now)
 
     def _ideas_shelve_round(self, gid: str, now: float) -> None:
-        """7 天没人理的构想自动收起（`Feeds.shelve_ignored_ideas`）。
+        """无人处理的群构想满 7 天、个人构想满 14 天自动收起。
 
         - 每个服务群每轮跑一次：里面就一条便宜 SELECT，没有到期的构想什么都不做；
-          7 天窗口最多晚一轮（分钟级），不影响观感。
+          到期最多晚一轮（分钟级），不影响观感。
         - **不发任何消息**：只把构想状态改成「已收起」，网页上不再占位子。
-        - 个人向 / 已开工 / 关联待批请求还没结果的，模块自己不动（口径在 feeds.py）。
+        - 已开工 / 关联待批请求还没结果 / 提一嘴仍在途的，模块自己不动（口径在 feeds.py）。
         - 配置读不出来时模块 fail-closed（一行都不写），这里不兜错误。
         """
         feeds = self.feeds
@@ -4233,7 +4256,13 @@ def _parse_reminder_json(text: str, now: float) -> dict | None:
         remind_ts = float(data.get("remind_ts")) if data.get("remind_ts") is not None else due_ts
     except (TypeError, ValueError):
         remind_ts = due_ts
-    return {"title": title[:40], "due_ts": due_ts, "remind_ts": remind_ts}
+    out = {"title": title[:40], "due_ts": due_ts, "remind_ts": remind_ts}
+    # 循环提醒：只认 daily / weekly / weekdays；没有就不塞 "repeat" 键
+    # （tests/test_app.py:753 对返回 dict 做全相等断言，多塞个空串会撞）。
+    repeat = str(data.get("repeat") or "").strip().lower()
+    if repeat in ("daily", "weekly", "weekdays"):
+        out["repeat"] = repeat
+    return out
 
 
 class _NullProfiles:

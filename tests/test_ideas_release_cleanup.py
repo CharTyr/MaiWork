@@ -15,9 +15,9 @@ A. make_idea：先有真实需要（evidence / 三段 basis / kind）
 
 B. shelve_ignored_ideas(group_id, now?)
    - 只服务配置里的群；非服务群一行都不写。
-   - 7 天按 created 算（喜欢点击只动 up / down，不算「有人处理」；updated 不参与判断）。
+   - 群构想 7 天、个人构想 14 天，按 created 算（喜欢点击只动 up / down；updated 不参与判断）。
    - 只收 state=new / wanted，且没有 task_id、没有 pending / approved 的关联待批请求；
-     等批准（state=pending）、已开工（started）、已收起（dismissed）、个人向的一律不动。
+     等批准（state=pending）、已开工（started）、已收起（dismissed）、提一嘴仍在途的一律不动。
    - 只改状态不删行、幂等；每条记 idea.auto_shelved 事件；不碰专岗学习、不跨群。
 """
 
@@ -308,16 +308,54 @@ class TestShelveIgnoredIdeas:
         # 早收起的：不重写它的 updated（幂等语义）
         assert float(_row(store, done)["updated"]) == pytest.approx(NOW - 20 * DAY)
 
-    def test_personal_ideas_are_not_shelved(self, tmp_path) -> None:
+    def test_personal_ideas_shelved_after_fourteen_days(self, tmp_path) -> None:
         store, feeds, *_ = _feeds(tmp_path, cfg=_SERVED)
-        personal = _seed_idea(
-            store, title="给阿帆整理的清单", created=NOW - 30 * DAY, target_user_id="u1"
-        )
+        young = _seed_idea(store, title="十天的个人构想", created=NOW - 10 * DAY, target_user_id="u1")
+        personal = _seed_idea(store, title="十五天的个人构想", created=NOW - 15 * DAY, target_user_id="u1")
         group_idea = _seed_idea(store, title="给全群的", created=NOW - 30 * DAY)
 
-        assert feeds.shelve_ignored_ideas(GID, NOW) == [group_idea]
+        assert feeds.shelve_ignored_ideas(GID, NOW) == [personal, group_idea]
+        assert _row(store, young)["state"] == "new"
+        assert _row(store, personal)["state"] == "dismissed"
+        payloads = [json.loads(e["payload"]) for e in _events(store, "idea.auto_shelved")]
+        assert [p["ignored_days"] for p in payloads] == [14, 7]
 
-        assert _row(store, personal)["state"] == "new"
+    @pytest.mark.parametrize("age,shelved", [(14 * DAY - 1, False), (14 * DAY, True), (15 * DAY, True)])
+    def test_personal_fourteen_day_boundary(self, tmp_path, age, shelved):
+        store, feeds, *_ = _feeds(tmp_path, cfg=_SERVED)
+        iid = _seed_idea(store, title="个人构想", created=NOW - age, target_user_id="u1")
+        assert feeds.shelve_ignored_ideas(GID, NOW) == ([iid] if shelved else [])
+        assert _row(store, iid)["state"] == ("dismissed" if shelved else "new")
+
+    @pytest.mark.parametrize("target", ["", "u1"])
+    @pytest.mark.parametrize("status", ["pending", "queued", "sending", "sent", "uncertain", "failed", "cancelled"])
+    def test_inflight_idea_mentions_protect_group_and_personal_ideas(self, tmp_path, target, status):
+        store, feeds, *_ = _feeds(tmp_path, cfg=_SERVED)
+        iid = _seed_idea(store, created=NOW - 20 * DAY, target_user_id=target)
+        with store.tx() as conn:
+            conn.execute("INSERT INTO idea_mentions (group_id, idea_id, status) VALUES (?, ?, ?)",
+                         (GID, iid, status))
+        protected = status in {"pending", "queued", "sending"}
+        assert feeds.shelve_ignored_ideas(GID, NOW) == ([] if protected else [iid])
+        assert _row(store, iid)["state"] == ("new" if protected else "dismissed")
+        assert len(_events(store, "idea.auto_shelved")) == (0 if protected else 1)
+
+    def test_mention_queued_before_update_protects_candidate(self, tmp_path, monkeypatch):
+        from contextlib import contextmanager
+
+        store, feeds, *_ = _feeds(tmp_path, cfg=_SERVED)
+        iid = _seed_idea(store, created=NOW - 20 * DAY)
+        original_tx = store.tx
+        @contextmanager
+        def queue_before_update():
+            with original_tx() as conn:
+                conn.execute("INSERT INTO idea_mentions (group_id, idea_id, status) VALUES (?, ?, 'queued')",
+                             (GID, iid))
+                yield conn
+        monkeypatch.setattr(store, "tx", queue_before_update)
+        assert feeds.shelve_ignored_ideas(GID, NOW) == []
+        assert _row(store, iid)["state"] == "new"
+        assert _events(store, "idea.auto_shelved") == []
 
     def test_likes_do_not_count_as_handled_and_created_wins(self, tmp_path) -> None:
         """喜欢点击（up）只动计数、不算开工；7 天一律看 created，不看 updated。"""

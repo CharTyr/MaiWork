@@ -174,3 +174,50 @@ async def test_link_switch_off(tmp_path):
     s2 = _settings(tmp_path)
     assert await share.group_link_async(store, s2, GID, tab="news", share=None) == ""
     assert share.link_available(s2, None) is False
+
+
+# ----------------------------------------------------------------------
+# §4.2：viz_spec 静态渲染进资讯公开页；构想卡片带 #编号 + 复制口令
+# ----------------------------------------------------------------------
+
+
+def _view_with_spec_viz() -> dict:
+    """资讯条目带 spec 型图解：share 渲染时要内联静态 HTML，不放 iframe/脚本。"""
+    v = _view()
+    v["view"]["news"][0]["items"][0]["viz"] = "spec"
+    return v
+
+
+async def test_news_share_renders_spec_viz_static(tmp_path):
+    """带 spec 图解的资讯条目：公开页里有 vs-static 静态渲染（无脚本、无 iframe）。"""
+    store, _s, hn, sh, holder = _make(tmp_path, view=_view_with_spec_viz())
+    # 给 news_viz 表种一行 spec
+    import json as _json
+    spec = {"title": "图解", "blocks": [{"type": "stat", "value": "42", "label": "个"}]}
+    with store.tx() as conn:
+        conn.execute(
+            "INSERT INTO news_viz (item_id, group_id, status, html, updated) VALUES (?, ?, 'ok', ?, 0)",
+            (11, GID, "spec:" + _json.dumps(spec, ensure_ascii=False)),
+        )
+    url = await sh.publish(GID, tab="news")
+    assert url.startswith("https://")
+    page = hn.pages[0]
+    assert "vs-static" in page       # 静态平铺版
+    assert "42" in page              # spec 内容进去了
+    assert "<iframe" not in page     # 不用 iframe
+    assert "<script>" not in page    # 无脚本（红线）
+    assert "javascript:" not in page
+
+
+async def test_idea_share_has_number_and_command(tmp_path):
+    """构想公开页：每条卡片带 #编号；卡片底部有复制口令提示（纯 CSS，无脚本）。"""
+    store, _s, hn, sh, holder = _make(tmp_path)
+    url = await sh.publish(GID, tab="ideas")
+    page = hn.pages[0]
+    # 标题旁清晰标编号：#12 / #13 这种
+    assert "#12" in page or "I-12" in page
+    # 复制口令：构想 #编号
+    assert "构想 #" in page or "构想 #12" in page
+    # 用纯 CSS user-select:all 实现「一键全选」，不是 JS
+    assert "user-select" in page
+    assert "<script>" not in page

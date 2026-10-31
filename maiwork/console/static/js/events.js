@@ -8,6 +8,7 @@ import { loadUsageDay } from "./settings/usage.js";
 import { avatarSaved } from "./settings/identity.js";
 import { loadLogs } from "./settings/logs.js";
 import { repaintSheet } from "./sheet.js";
+import { refreshDetail } from "./detail.js";
 import { loadChats } from "./chat.js";
 import { renderSide, renderView } from "./render.js";
 
@@ -98,19 +99,19 @@ document.addEventListener("change", async (e) => {
 });
 document.addEventListener("keydown", (e) => {
   // 管理员对话输入框：回车换行，Ctrl / Cmd + 回车发送（2026-10-30 用户定）
-  if (e.target.id === "chat-input" && e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing) {
+  if (e.target && e.target.id === "chat-input" && e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing) {
     e.preventDefault();
     $("chat-form").requestSubmit();
     return;
   }
 });
 document.addEventListener("input", (e) => {
-  if (e.target.id !== "chat-input") return;
+  if (!e.target || e.target.id !== "chat-input") return;
   e.target.style.height = "auto";
   e.target.style.height = `${Math.min(e.target.scrollHeight, 220)}px`;
 });
 document.addEventListener("keydown", (e) => {
-  if (e.key !== "Enter" || !e.target.closest) return;
+  if (e.key !== "Enter" || !e.target || !e.target.closest) return;
   const box = e.target.closest(".chips");
   if (!box || !e.target.closest(".ci-add")) return;
   e.preventDefault();
@@ -125,38 +126,97 @@ document.addEventListener("input", (e) => {
   c.classList.toggle("bad-t", n > lim);
 });
 
-/* 「ⓘ」说明提示（util.js 的 tip()）：同时只开一个；点外面、按 Esc 关；靠右时往左挪，不出屏 */
+/* 「ⓘ」说明提示、气泡菜单与原生 <details> 展开：
+   - tip 同时只开一个，紧接着切到下一个时直接出现不重播动画；靠右时往左挪，不出屏
+   - 点外面或按 Esc 关闭 tip、分栏菜单（section-picker）和构想「更多」菜单（idea-menu），不连带误关抽屉
+   - 普通 <details> 只在用户点击展开时加 .reveal，轮询重绘已展开的节点不重播 */
 const openTips = () => document.querySelectorAll("details.tip[open]");
+const openPickers = () => document.querySelectorAll("details.section-picker[open]");
+document.addEventListener(
+  "click",
+  (e) => {
+    const sum = e.target && e.target.closest && e.target.closest("summary");
+    const d = sum && sum.closest && sum.closest("details");
+    if (d && d.dataset) d.dataset.userToggle = "1";
+  },
+  true
+);
 document.addEventListener(
   "toggle",
   (e) => {
     const d = e.target;
-    if (!d.matches || !d.matches("details.tip") || !d.open) return;
-    for (const x of openTips()) if (x !== d) x.open = false;
-    const pop = d.querySelector(".tip-pop");
-    if (!pop) return;
-    pop.style.removeProperty("--tip-shift");
-    const r = pop.getBoundingClientRect();
-    const over = r.right - (window.innerWidth - 12);
-    const under = 12 - r.left;
-    if (over > 0) pop.style.setProperty("--tip-shift", `${-Math.ceil(over)}px`);
-    else if (under > 0) pop.style.setProperty("--tip-shift", `${Math.ceil(under)}px`);
+    if (!d || !d.matches) return;
+    if (d.matches("details.tip")) {
+      const pop = d.querySelector(".tip-pop");
+      if (!d.open) {
+        if (pop && pop.dataset) delete pop.dataset.instant;
+        return;
+      }
+      const warm = [...openTips()].some((x) => x !== d);
+      for (const x of openTips()) if (x !== d) x.open = false;
+      if (!pop) return;
+      if (pop.dataset) pop.dataset.instant = "1";
+      pop.style.removeProperty("--tip-shift");
+      const r = pop.getBoundingClientRect();
+      const over = r.right - (window.innerWidth - 12);
+      const under = 12 - r.left;
+      if (over > 0) pop.style.setProperty("--tip-shift", `${-Math.ceil(over)}px`);
+      else if (under > 0) pop.style.setProperty("--tip-shift", `${Math.ceil(under)}px`);
+      if (!warm && pop.dataset) delete pop.dataset.instant;
+      return;
+    }
+    if (d.matches("details") && !d.matches(".section-picker")) {
+      const byUser = !!(d.dataset && d.dataset.userToggle === "1");
+      if (d.dataset) delete d.dataset.userToggle;
+      for (const ch of d.children || []) {
+        if (ch.tagName === "SUMMARY" || !ch.classList) continue;
+        if (d.open && byUser) ch.classList.add("reveal");
+        else if (!d.open) ch.classList.remove("reveal");
+      }
+    }
   },
   true
 );
 document.addEventListener("click", (e) => {
-  const inside = e.target.closest && e.target.closest("details.tip");
-  for (const x of openTips()) if (x !== inside) x.open = false;
+  const insideTip = e.target.closest && e.target.closest("details.tip");
+  for (const x of openTips()) if (x !== insideTip) x.open = false;
+  const insidePicker = e.target.closest && e.target.closest("details.section-picker");
+  for (const x of openPickers()) if (x !== insidePicker) x.open = false;
+  if (state.ideaMore != null && !(e.target.closest && e.target.closest('.idea-menu, [data-act="idea-more"]'))) {
+    state.ideaMore = null;
+    refreshDetail();
+  }
 });
-document.addEventListener("keydown", (e) => {
-  if (e.key !== "Escape") return;
-  const open = [...openTips()];
-  if (!open.length) return;
-  e.stopImmediatePropagation(); // 先关提示，不要连带关掉抽屉
-  for (const x of open) x.open = false;
-  const s = open[0].querySelector("summary");
-  if (s) s.focus();
-}, true);
+document.addEventListener(
+  "keydown",
+  (e) => {
+    if (e.key !== "Escape") return;
+    const tips = [...openTips()];
+    if (tips.length) {
+      e.stopImmediatePropagation(); // 先关提示，不要连带关掉抽屉
+      for (const x of tips) x.open = false;
+      const s = tips[0].querySelector("summary");
+      if (s) s.focus();
+      return;
+    }
+    const pickers = [...openPickers()];
+    if (pickers.length) {
+      e.stopImmediatePropagation();
+      for (const x of pickers) x.open = false;
+      const s = pickers[0].querySelector("summary");
+      if (s) s.focus();
+      return;
+    }
+    if (state.ideaMore != null) {
+      e.stopImmediatePropagation();
+      state.ideaMore = null;
+      refreshDetail();
+      const btn = document.querySelector(".idea-more");
+      if (btn) btn.focus();
+    }
+  },
+  true
+);
 
 /* 长名字滚动：只在真的放不下时才动；尊重「减少动态效果」 */
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");

@@ -33,6 +33,7 @@ REFS_MAX = 20            # 参考资料最多列这么多条
 REFS_KEEP = 5            # 超长时只留前这么几条
 REVIEW_MAX = 3000        # 最近一次验收意见正常最多带这么多字
 REVIEW_CUT = 500         # 超长时截到这么多字
+_EXCERPT_CUT = 800       # 成品摘要超长先截到这里，还超就整节去掉
 PROFILE_MAX = 3          # 背景里最多挑这么多条群画像（docs/24 §4.3）
 
 # 任务状态中文（tasks.py `_STATUS_KINDS` 的实际取值，一个不落）
@@ -313,16 +314,20 @@ def build_idea(
 
 
 def _task_refs(view: dict, cap: int = REFS_MAX) -> list[tuple[str, str]]:
-    """任务参考资料：引用核对里群友本来就看得到的那份——成品引用了、但没打开核实过的链接（最多 cap 条）。
+    """任务参考资料：verified_urls（成品引用了、也打开核实过）在前，unopened_urls 在后。
 
-    「打开过哪些页」只能从工具调用记录里算，那是只给总管理员看的东西，不进包（2026-10-08 复核）。
+    「打开过哪些页」只能从工具调用记录里算，那是只给总管理员看的东西，不进包（2026-10-08 复核）；
+    verified_urls 是「成品引用 ∩ 已打开核实」的交集——只取成品正文公开链接，绝不带 opened_urls 本身。
     """
     lc = view.get("link_check")
     if not isinstance(lc, dict):
         return []
     out: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for key, label in (("unopened_urls", "成品里引用了，但没打开核实过，用前请自己核对"),):
+    for key, label in (
+        ("verified_urls", "已打开核实"),
+        ("unopened_urls", "未打开核实"),
+    ):
         raw = lc.get(key)
         for one in (raw if isinstance(raw, (list, tuple)) else []):
             url = _s(one)
@@ -409,30 +414,44 @@ def build_task(
 
     review_all = _dehumanize(_s(view.get("review")), roster_names)[:REVIEW_MAX]
     refs_all = [(u, label) for u, label in _task_refs(view)]
+    excerpt_all = _dehumanize(_s(view.get("artifact_excerpt")), roster_names)
     footer = _footer(now_ts, f"任务 {_s(view.get('id'))}")
 
-    def render(refs: list[tuple[str, str]], review: str) -> str:
+    def render(refs: list[tuple[str, str]], review: str, excerpt: str) -> str:
         sections = [
             ("要做什么", req),
             ("做到什么程度算完", done),
             ("背景", profile),
             # 提问、暂停原因、成品名里也可能有人名：整节过一遍去人
             ("已经做到哪了", _dehumanize(_progress_block(view, review), roster_names)),
+        ]
+        if excerpt:
+            sections.append(("已有成品摘要", excerpt))
+        sections += [
             ("参考资料", "\n".join(f"- {url}（{label}）" for url, label in refs)),
             ("注意", "\n".join(_ATTENTION)),
         ]
         return _assemble(title, sections, footer)
 
-    markdown = render(refs_all, review_all)
+    markdown = render(refs_all, review_all, excerpt_all)
     cut = False
+    if len(markdown) > LIMIT and len(excerpt_all) > _EXCERPT_CUT:
+        # 零、成品摘要最先动刀：先截到 800 字，还超就整节拿掉（2026-10-31 定）
+        excerpt_all = excerpt_all[:_EXCERPT_CUT]
+        cut = True
+        markdown = render(refs_all, review_all, excerpt_all)
+    if len(markdown) > LIMIT and excerpt_all:
+        excerpt_all = ""
+        cut = True
+        markdown = render(refs_all, review_all, excerpt_all)
     if len(markdown) > LIMIT and len(refs_all) > REFS_KEEP:
         # 一、参考资料留前 5 条
         refs_all = refs_all[:REFS_KEEP]
         cut = True
-        markdown = render(refs_all, review_all)
+        markdown = render(refs_all, review_all, excerpt_all)
     if len(markdown) > LIMIT and len(review_all) > REVIEW_CUT:
         # 二、验收意见截到 500 字；「要做什么」「做到什么程度算完」永不砍（砍不动就整份给出）
         review_all = review_all[:REVIEW_CUT]
         cut = True
-        markdown = render(refs_all, review_all)
+        markdown = render(refs_all, review_all, excerpt_all)
     return _pack(markdown, _iso_filename("maiwork", view.get("id")), cut)

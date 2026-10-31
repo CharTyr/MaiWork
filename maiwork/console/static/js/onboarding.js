@@ -314,20 +314,20 @@ function onbPaint(dir) {
     );
   const id = ONB_STEPS[onb.i].id;
   if (id === "hello" && !quiet) {
-    onbAnim(pane.querySelector(".onb-avatar"), [{ transform: "scale(0.6)", opacity: 0 }, { transform: "scale(1)", opacity: 1 }], { duration: 560, delay: delay + 60, easing: EASE_SPRING });
-    onbAnim(pane.querySelector(".onb-spark"), [{ transform: "scale(0) rotate(-40deg)", opacity: 0 }, { transform: "scale(1) rotate(0)", opacity: 1 }], { duration: 520, delay: delay + 320, easing: EASE_SPRING });
+    onbAnim(pane.querySelector(".onb-avatar"), [{ transform: "scale(0.9)", opacity: 0 }, { transform: "scale(1)", opacity: 1 }], { duration: 420, delay: delay + 50, easing: EASE_SPRING });
+    onbAnim(pane.querySelector(".onb-spark"), [{ transform: "scale(0.86) rotate(-12deg)", opacity: 0 }, { transform: "scale(1) rotate(0)", opacity: 1 }], { duration: 380, delay: delay + 220, easing: EASE_SPRING });
   }
   if (id === "done") {
     const mark = pane.querySelector(".onb-done-mark");
     if (quiet) mark.classList.add("drawn");
     else {
-      onbAnim(mark, [{ transform: "scale(0.5)", opacity: 0 }, { transform: "scale(1)", opacity: 1 }], { duration: 520, delay: delay + 40, easing: EASE_SPRING });
+      onbAnim(mark, [{ transform: "scale(0.88)", opacity: 0 }, { transform: "scale(1)", opacity: 1 }], { duration: 400, delay: delay + 40, easing: EASE_SPRING });
       setTimeout(() => mark.classList.add("drawn"), delay + 180);
       pane.querySelectorAll(".onb-sum").forEach((li, i) =>
         onbAnim(li, [{ opacity: 0, transform: "translateY(8px)" }, { opacity: 1, transform: "translateY(0)" }], { duration: 360, delay: delay + 420 + i * 70, easing: "cubic-bezier(0.2, 0.8, 0.2, 1)" })
       );
       pane.querySelectorAll(".onb-mark.ok").forEach((m, i) =>
-        onbAnim(m, [{ transform: "scale(0.4)" }, { transform: "scale(1)" }], { duration: 420, delay: delay + 480 + i * 70, easing: EASE_SPRING })
+        onbAnim(m, [{ transform: "scale(0.88)", opacity: 0 }, { transform: "scale(1)", opacity: 1 }], { duration: 360, delay: delay + 420 + i * 55, easing: EASE_SPRING })
       );
     }
   }
@@ -746,7 +746,7 @@ export async function onbAct(el) {
       const np = el.closest(".onb-pane").querySelector(".onb-picks");
       out.innerHTML = `<i class="onb-ok">${SVG.check}</i>连接成功，可用模型 ${onb.models.length} 个`;
       if (!calm()) {
-        onbAnim(out.querySelector(".onb-ok"), [{ transform: "scale(0.3)", opacity: 0 }, { transform: "scale(1)", opacity: 1 }], { duration: 460, easing: EASE_SPRING });
+        onbAnim(out.querySelector(".onb-ok"), [{ transform: "scale(0.88)", opacity: 0 }, { transform: "scale(1)", opacity: 1 }], { duration: 360, easing: EASE_SPRING });
         [...np.children].forEach((c, i) => onbAnim(c, [{ opacity: 0, transform: "translateY(8px)" }, { opacity: 1, transform: "translateY(0)" }], { duration: 340, delay: 60 + i * 40, easing: "cubic-bezier(0.2, 0.8, 0.2, 1)" }));
       }
     } catch (e) {

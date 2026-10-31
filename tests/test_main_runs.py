@@ -123,8 +123,8 @@ class TestSchema:
     def test_latest_version(self, tmp_path) -> None:
         """库号 46：main_runs 一步。"""
         store = Store(tmp_path / "t.db")
-        assert store.migrate() == 48
-        assert int(store._conn.execute("PRAGMA user_version").fetchone()[0]) == 48
+        assert store.migrate() == 49
+        assert int(store._conn.execute("PRAGMA user_version").fetchone()[0]) == 49
 
 
 # ----------------------------------------------------------------------

@@ -118,6 +118,35 @@ class TestDueRemind:
         assert goals.get("M-1")["remind_ts"] is None
         assert goals.due(fixed_clock[0] + 3600) == []
 
+    def test_single_reminder_with_due_auto_done(self, goals: Goals, fixed_clock):
+        """纯单次提醒（提醒时刻就是截止时刻）发完 → state=done，不再 active。"""
+        # due_ts <= remind_ts：提醒一次就是全部，提醒完即结案
+        _mk_member(goals, remind_ts=NOW + 100, due_ts=NOW + 100)
+        fixed_clock[0] = NOW + 200
+        goals.due(fixed_clock[0])
+        goals.mark("M-1", "remind", fixed_clock[0])
+        row = goals.get("M-1")
+        assert row["state"] == "done"
+        assert row["remind_ts"] is None
+
+    def test_single_reminder_no_due_auto_done(self, goals: Goals, fixed_clock):
+        """连截止日都没有的纯提醒：发完 → done。"""
+        _mk_member(goals, remind_ts=NOW + 100, due_ts=None)
+        fixed_clock[0] = NOW + 200
+        goals.due(fixed_clock[0])
+        goals.mark("M-1", "remind", fixed_clock[0])
+        assert goals.get("M-1")["state"] == "done"
+
+    def test_remind_before_due_stays_active(self, goals: Goals, fixed_clock):
+        """提醒早于截止日（remind_ts < due_ts）：提醒一次后仍 active，等 ask_progress。"""
+        _mk_member(goals, remind_ts=NOW + 100, due_ts=NOW + 86400)
+        fixed_clock[0] = NOW + 200
+        goals.due(fixed_clock[0])
+        goals.mark("M-1", "remind", fixed_clock[0])
+        row = goals.get("M-1")
+        assert row["state"] == "active"
+        assert row["remind_ts"] is None
+
 
 class TestDueDailyRepeat:
     def test_daily_advances_by_one_day(self, goals: Goals, fixed_clock):
@@ -156,6 +185,33 @@ class TestDueDailyRepeat:
         goals.due(fixed_clock[0])
         goals.mark(mid, "remind", fixed_clock[0])
         assert goals.get(mid)["state"] == "done"
+
+
+class TestWeeklyWeekdaysRepeat:
+    def test_weekly_advances_by_seven_days(self, goals: Goals, fixed_clock):
+        """weekly：每次顺延 7 天跨过 now。"""
+        _mk_member(goals, repeat="weekly", due_ts=None, remind_ts=NOW + 100)
+        fixed_clock[0] = NOW + 200
+        goals.due(fixed_clock[0])
+        goals.mark("M-1", "remind", fixed_clock[0])
+        row = goals.get("M-1")
+        assert row["state"] == "active"
+        # 顺延 7 天，且已跨过 now（不连发）
+        assert row["remind_ts"] > fixed_clock[0]
+        assert abs(row["remind_ts"] - (NOW + 100 + 7 * 86400)) < 1e-6
+
+    def test_weekdays_skips_weekend(self, goals: Goals, fixed_clock):
+        """weekdays：顺延落在周末就跳到下周一同一时刻（NOW 是北京时间周一 22:13）。"""
+        # NOW + 4 天 = 周五；提醒定在周五，顺延 +1 天落周六 → 应跳到下周一
+        friday = NOW + 4 * 86400
+        _mk_member(goals, repeat="weekdays", due_ts=None, remind_ts=friday + 100)
+        fixed_clock[0] = friday + 200
+        goals.due(fixed_clock[0])
+        goals.mark("M-1", "remind", fixed_clock[0])
+        row = goals.get("M-1")
+        # 下一次应在工作日（周一=0），跳过了周六 / 周日，落到了周一（friday+3 天，同一时刻）
+        assert clock.bj(row["remind_ts"]).weekday() < 5
+        assert abs(row["remind_ts"] - (friday + 3 * 86400 + 100)) < 1e-6
 
 
 class TestDueAskProgress:

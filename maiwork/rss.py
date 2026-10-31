@@ -1,12 +1,13 @@
 """RSS 资讯源（rss.py）。
 
 - 数据：kv["feeds.rss.<群号>"] = [{id, url, title, enabled, added_ts, last_ok_ts, last_error,
-  auto, origin, reason, label, trial_until}]；
+  auto, origin, reason, label, trial_until, fail_count, error_since_ts}]；
   每群最多 20 个，url 必须为无 userinfo 的公开 http(s) 地址。
-  后五个是自动订阅（docs/10 §九 第二步，auto_sources.py）加的：auto=True = 自动加的源，
+  auto/origin/reason/label/trial_until 是自动订阅（docs/10 §九 第二步，auto_sources.py）加的：auto=True = 自动加的源，
   origin = trusted|map|push（来源：门槛 / 来源地图 / 固定 push 清单），reason = 推荐理由
   （给网页看），label = 来源标签（source_name 口径，用来跟拒绝名单比对），
   trial_until = 试用期截止（epoch 秒）。老条目没有这几个键，读的时候补默认值，照常工作。
+  fail_count 是连续抓取失败次数，error_since_ts 是这轮连续错误的首次时间，明确成功时两者清零。
 - 解析：RSS 2.0（channel/item）和 Atom（feed/entry）都认；先用标准库 Expat
   的 DTD 事件拒绝真正的 DOCTYPE（不误伤注释），再交给 xml.etree 解析。
 - 取最近 lookback_days 内的条目 {title, url, published, summary(去 HTML 截 500)}；
@@ -135,7 +136,7 @@ def end_trial(store: Any, gid: str, feed_id: str) -> None:
     _save_list(store, gid, feeds)
 
 def mark_checked(store: Any, gid: str, feed_id: str, *, ok_ts: float | None, error: str) -> None:
-    """记一次取源结果：ok_ts 非空记 last_ok_ts；error 非空记 last_error（保留上次成功时间）。"""
+    """记一次取源结果；错误累加并保留首次错误时间，明确成功才清零失败状态。"""
     fid = str(feed_id or "")
     feeds = _load_list(store, gid)
     victim = next((e for e in feeds if str(e.get("id")) == fid), None)
@@ -145,8 +146,14 @@ def mark_checked(store: Any, gid: str, feed_id: str, *, ok_ts: float | None, err
         victim["last_ok_ts"] = float(ok_ts)
     if error:
         victim["last_error"] = str(error)[:200]
+        victim["fail_count"] = int(victim.get("fail_count") or 0) + 1
+        if not float(victim.get("error_since_ts") or 0.0):
+            victim["error_since_ts"] = float(clock.now())
     else:
         victim["last_error"] = ""
+        if ok_ts is not None:
+            victim["fail_count"] = 0
+            victim["error_since_ts"] = 0.0
     _save_list(store, gid, feeds)
 
 def _plain(
@@ -161,6 +168,8 @@ def _plain(
         "added_ts": float(added_ts),
         "last_ok_ts": float(last_ok_ts or 0.0),
         "last_error": str(last_error or ""),
+        "fail_count": 0,
+        "error_since_ts": 0.0,
         # 自动订阅标记（docs/10 §九 第二步）：手动加的源一律默认值。
         "auto": bool(auto),
         "origin": str(origin or ""),
@@ -172,6 +181,7 @@ def _plain(
 # 老条目缺的字段：读的时候补上（写入侧照旧只写自己有的键，不动别人的数据）。
 _AUTO_DEFAULTS: dict[str, Any] = {
     "auto": False, "origin": "", "reason": "", "label": "", "trial_until": 0.0,
+    "fail_count": 0, "error_since_ts": 0.0,
 }
 
 def _with_defaults(entry: dict[str, Any]) -> dict[str, Any]:
@@ -184,6 +194,8 @@ def _with_defaults(entry: dict[str, Any]) -> dict[str, Any]:
     out["reason"] = str(out.get("reason") or "")
     out["label"] = str(out.get("label") or "")
     out["trial_until"] = float(out.get("trial_until") or 0.0)
+    out["fail_count"] = int(out.get("fail_count") or 0)
+    out["error_since_ts"] = float(out.get("error_since_ts") or 0.0)
     return out
 
 def _new_id(existing: list[dict[str, Any]]) -> str:

@@ -3888,10 +3888,12 @@ class ConsoleServer:
                         return 0
 
                 urls = saved.get("unopened_urls")
+                vurls = saved.get("verified_urls")
                 detail["link_check"] = {
                     "links": _num("links"),
                     "unopened": _num("unopened"),
                     "unopened_urls": [str(u) for u in urls] if isinstance(urls, list) else [],
+                    "verified_urls": [str(u) for u in vurls] if isinstance(vurls, list) else [],
                 }
             else:
                 detail["link_check"] = None
@@ -4238,14 +4240,64 @@ class ConsoleServer:
                     return it
             return None
 
+        def _handoff_artifact_excerpt(tid: str) -> str:
+            """最新一次 passed 尝试的成品正文摘要（≤4000 字节）；读不到 / 不是文本 → ""。"""
+            store = getattr(svc, "store", None)
+            settings = svc.get_settings()
+            if store is None or settings is None:
+                return ""
+            try:
+                task = store.read().execute(
+                    "SELECT group_id, workspace FROM tasks WHERE id=?", (str(tid),)
+                ).fetchone()
+                attempt = store.read().execute(
+                    "SELECT artifacts FROM attempts WHERE task_id=? AND status='passed'"
+                    " ORDER BY n DESC LIMIT 1",
+                    (str(tid),),
+                ).fetchone()
+            except Exception:
+                return ""
+            if task is None or attempt is None:
+                return ""
+            try:
+                saved = json.loads(attempt["artifacts"] or "[]")
+            except (TypeError, ValueError):
+                return ""
+            if not isinstance(saved, list) or not saved:
+                return ""
+            rel = str(saved[0] or "").strip()
+            if not rel:
+                return ""
+            prefix = f"artifacts/{tid}/"
+            rel = rel.replace("\\", "/")
+            if rel.startswith(prefix):
+                rel = rel[len(prefix):]
+            if Path(rel).suffix.lower() not in {
+                ".md", ".txt", ".html", ".htm", ".csv", ".json", ".xml",
+                ".py", ".js", ".ts", ".docx",
+            }:
+                return ""
+            try:
+                from ..artifacts import artifact_base, artifact_file
+                base = artifact_base(settings, {**dict(task), "id": tid})
+                target = artifact_file(base, rel)
+            except (ValueError, OSError):
+                return ""
+            try:
+                from ..deliverable_check import read_deliverable_text
+                return str(read_deliverable_text(target, max_bytes=4000) or "")
+            except Exception:
+                return ""
+
         def _handoff_task_view(tid: str) -> dict:
-            """群友版任务详情 + 交付记录 + 引用核对（都是群友在任务详情里本来就看得到的）。
+            """群友版任务详情 + 交付记录 + 引用核对 + 成品摘要（都是群友在任务详情里本来就看得到的）。
 
             不从 tool_calls 捞「打开过的链接」：工具调用只给总管理员看（docs/24 §二.2）。
             """
             detail = svc.tasks.detail_view(tid, admin=False)
             _merge_delivery(detail, tid)
             _merge_link_check(detail, tid)
+            detail["artifact_excerpt"] = _handoff_artifact_excerpt(tid)
             return detail
 
         def _handoff_response(gid: str, kind: str, item_id: Any, payload: dict) -> web.Response:
@@ -5283,6 +5335,182 @@ class ConsoleServer:
         app.router.add_post("/api/sound-packs/upload", self._write(_sound_pack_upload))
         app.router.add_post("/api/sound-packs/github", self._write(_sound_pack_github))
         app.router.add_route("DELETE", "/api/sound-packs/{id}", self._write(_sound_pack_delete))
+
+        # ---------- 本地成品永久副本（docs/24 §4.1） ----------
+
+        _TASK_ID_RE = re.compile(r"^T-\d+$")
+        _ARTIFACT_PAGE_SUFFIXES = {".html", ".htm", ".svg"}
+        _ARTIFACT_BINARY_SUFFIXES = {
+            ".pdf", ".docx", ".xlsx", ".pptx", ".zip", ".rar", ".7z",
+            ".gz", ".tar", ".bin", ".dat", ".exe", ".dmg", ".apk", ".ipa",
+        }
+
+        def _serve_task_artifact(request: web.Request, gid: str, task_id: str, rel_path: str) -> web.Response:
+            """只读本地成品副本：token 或登录身份都能用，走同一套五重安全闸。
+
+            返回 404 是「不给看 + 不暴露存在性」；400 是路径本身不合法。
+            """
+            from ..artifacts import artifact_base, artifact_file
+            from ..herenow import _CONTENT_TYPES
+            from urllib.parse import quote
+
+            settings = svc.get_settings()
+            if settings is None or not settings.is_served(gid):
+                return _err(404, "找不到这个任务")
+            if not _TASK_ID_RE.match(str(task_id)):
+                return _err(404, "找不到这个任务")
+
+            try:
+                task = svc.tasks.get(str(task_id))
+            except Exception:
+                task = None
+            if task is None or str(task.get("group_id") or "") != str(gid):
+                return _err(404, "找不到这个任务")
+
+            try:
+                base = artifact_base(settings, task)
+            except (ValueError, OSError):
+                return _err(403, "路径不合法")
+            if not base.is_dir():
+                return _err(404, "这个任务还没有本地副本")
+
+            rel = str(rel_path or "").replace("\\", "/").lstrip("/")
+            while rel.startswith("./"):
+                rel = rel[2:]
+            # 严禁 input/ 原始素材目录
+            first_seg = rel.split("/", 1)[0] if rel else ""
+            if first_seg.lower() == "input":
+                return _err(404, "找不到这个文件")
+            if ".." in [p for p in rel.split("/") if p]:
+                return _err(400, "路径不合法")
+
+            if not rel:
+                from ..artifacts import artifact_entry
+                candidates: list = []
+                try:
+                    store = getattr(svc, "store", None)
+                    if store is not None:
+                        attempt = store.read().execute(
+                            "SELECT artifacts FROM attempts WHERE task_id=? AND status='passed'"
+                            " ORDER BY n DESC LIMIT 1",
+                            (str(task_id),),
+                        ).fetchone()
+                        if attempt is not None:
+                            saved = json.loads(attempt["artifacts"] or "[]")
+                            if isinstance(saved, list):
+                                candidates.extend(saved)
+                except Exception:
+                    pass
+                entry = artifact_entry(base, candidates)
+                if entry is None:
+                    return _err(404, "这个任务还没有成品文件")
+                # 嵌套主页面（site/report.html）要跳转到真实路径，./style.css 才找得到同目录资源
+                entry_rel = entry.relative_to(base.resolve()).as_posix()
+                if len(Path(entry_rel).parts) > 1:
+                    raise web.HTTPFound(request.path + entry_rel)
+                target = entry
+            else:
+                try:
+                    target = artifact_file(base, rel)
+                except (ValueError, OSError):
+                    return _err(403, "路径不合法")
+            if not target.is_file():
+                return _err(404, "找不到这个文件")
+
+            try:
+                data = target.read_bytes()
+            except OSError:
+                return _err(404, "这个文件读不出来")
+
+            suf = target.suffix.lower()
+            headers = {
+                "Cache-Control": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "SAMEORIGIN",
+                "Content-Security-Policy": "frame-ancestors 'self'",
+                # Sandbox documents have an opaque origin. Module scripts/fonts
+                # must be readable without credentials from that origin.
+                "Access-Control-Allow-Origin": "*",
+            }
+            ctype = _CONTENT_TYPES.get(suf, "application/octet-stream").split(";", 1)[0]
+            if suf in (".txt", ".md", ".log"):
+                ctype = "text/plain"
+            if suf in _ARTIFACT_PAGE_SUFFIXES:
+                ctype = "text/html" if suf != ".svg" else "image/svg+xml"
+                headers["Content-Security-Policy"] = (
+                    "sandbox allow-scripts; default-src 'unsafe-inline' data: blob: http: https:; "
+                    "connect-src 'none'; object-src 'none'; base-uri 'none'; "
+                    "form-action 'none'; frame-ancestors 'self'"
+                )
+            elif suf in _ARTIFACT_BINARY_SUFFIXES:
+                headers["Content-Disposition"] = "attachment; filename*=UTF-8''" + quote(target.name)
+            return web.Response(body=data, content_type=ctype, headers=headers)
+
+        @get("/g/{token}/artifacts/{task_id}")
+        @get("/g/{token}/artifacts/{task_id}/{rel_path:.*}")
+        async def _group_artifact(request: web.Request) -> web.Response:
+            token = str(request.match_info["token"]).strip()
+            gid = views.group_id_by_token(svc, token)
+            if gid is None:
+                return _err(404, "找不到这个任务")
+            task_id = str(request.match_info["task_id"])
+            rel = str(request.match_info.get("rel_path") or "")
+            # 不带尾斜杠时补 302 到 <…>/：./style.css 这类相对引用才找得到
+            if not rel and not request.path.endswith("/"):
+                raise web.HTTPFound(request.path + "/")
+            return _serve_task_artifact(request, gid, task_id, rel)
+
+        @get("/api/tasks/{task_id}/artifacts/{rel_path:.*}")
+        async def _api_artifact(request: web.Request) -> web.Response:
+            ident = self._identify(request)
+            if ident.role not in ("admin", "member", "group_admin"):
+                return _err(401, "先登录管理员，或用群链接打开")
+            task_id = str(request.match_info["task_id"])
+            rel = str(request.match_info.get("rel_path") or "")
+            # 群友 / 群管理员只能看本群任务
+            if ident.role in ("member", "group_admin"):
+                try:
+                    task = svc.tasks.get(task_id)
+                except Exception:
+                    task = None
+                if task is None or str(task.get("group_id") or "") != str(ident.group_id):
+                    return _err(403, "只能看自己群的内容")
+                gid = str(ident.group_id or "")
+            else:
+                try:
+                    task = svc.tasks.get(task_id)
+                except Exception:
+                    task = None
+                gid = str(task.get("group_id") or "") if task is not None else ""
+            return _serve_task_artifact(request, gid, task_id, rel)
+
+        @post("/api/tasks/{task_id}/republish")
+        async def _api_task_republish(request: web.Request) -> web.Response:
+            ident = self._identify(request)
+            if ident.role not in ("admin", "member", "group_admin"):
+                return _err(401, "先登录管理员，或用群链接打开")
+            task_id = str(request.match_info["task_id"])
+            try:
+                task = svc.tasks.get(task_id)
+            except Exception:
+                task = None
+            if task is None:
+                return _err(404, "找不到这个任务")
+            gid = str(task.get("group_id") or "")
+            settings = svc.get_settings()
+            if settings is None or not settings.is_served(gid):
+                return _err(404, "找不到这个任务")
+            if _wrong_group(ident, gid):
+                return _err(403, "只能看自己群的内容")
+            outbox = getattr(svc, "outbox", None)
+            if outbox is None or not hasattr(outbox, "republish_if_expired"):
+                return _err(503, "这个功能还没开")
+            try:
+                res = await outbox.republish_if_expired(task_id, force=(ident.role in ("admin", "group_admin")))
+            except Exception:
+                logger.exception("重发 here.now 出错（%s）", task_id)
+                return _err(500, "重发出错，看网页日志")
+            return web.json_response(res if isinstance(res, dict) else {"ok": bool(res)})
 
         # ---------- 静态 ----------
 

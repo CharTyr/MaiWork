@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
+import sqlite3
 import time
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .config import _norm_platform, has_onebot, host_platform
@@ -79,19 +82,35 @@ def _parse_reply_to(raw_message: Any) -> str:
     """从 raw_message 解析 reply_to。
 
     raw_message 可能是：
-    - list（消息段列表）：找 type=="reply" 的段，取 data 里 target_message_id / id / message_id
-    - str：找 [CQ:reply,id=xxx]
+    - dict / list（消息段或 seglist 嵌套）：找 type=="reply" 的段，取 data 里 target_message_id / id / message_id
+    - str：JSON 段或 [CQ:reply,id=xxx]
     """
     if isinstance(raw_message, str):
         m = re.search(r"\[CQ:reply,\s*id=([^\]]+)\]", raw_message)
         if m:
             return m.group(1).strip().rstrip(",]")
+        s = raw_message.strip()
+        if s.startswith(("[", "{")):
+            try:
+                return _parse_reply_to(json.loads(s))
+            except (ValueError, TypeError):
+                return ""
         return ""
+    if isinstance(raw_message, dict):
+        if str(raw_message.get("type") or "").lower() == "seglist":
+            return _parse_reply_to(raw_message.get("data"))
+        raw_message = [raw_message]
     if isinstance(raw_message, list):
         for seg in raw_message:
             if not isinstance(seg, dict):
                 continue
-            if seg.get("type") != "reply":
+            stype = str(seg.get("type") or "").lower()
+            if stype == "seglist":
+                nested = _parse_reply_to(seg.get("data"))
+                if nested:
+                    return nested
+                continue
+            if stype != "reply":
                 continue
             data = seg.get("data")
             if not isinstance(data, dict):
@@ -179,10 +198,14 @@ class Host:
         ctx: Any,  # PluginContext / FakeCtx，测试里用 FakeCtx
         *,
         bot_qq: str = "",
+        maibot_db_path: "Path | None" = None,
     ) -> None:
         self._ctx = ctx
         self._bot_qq: str = bot_qq
         self._bot_qq_cached: bool = bool(bot_qq)
+        # 宿主消息库路径（默认 data/MaiBot.db）：只读回填图片 / 表情包识图描述用；
+        # 测试可注入 tmp_path 下的假库。文件不存在就跳过回填（零报错）。
+        self._maibot_db_path: Path = Path(maibot_db_path) if maibot_db_path else Path("data/MaiBot.db")
         # bot.platforms 缓存：解析成 {规范平台名: 账号}（tg: 前缀归一为 telegram:）
         self._bot_accounts_map: dict[str, str] = {}
         self._bot_accounts_sets: dict[str, set[str]] = {}
@@ -355,6 +378,8 @@ class Host:
                 bot_id = ""
         bot_qq = str(bot_id or self._bot_qq or "").strip()
         result: list[Msg] = []
+        # 回填用：每条消息记住它的 raw_message 与是不是「裸表情包」，按 hash 批量补描述
+        raw_by_id: dict[str, Any] = {}
         for item in raw:
             if not isinstance(item, dict):
                 continue
@@ -389,8 +414,120 @@ class Host:
                     reply_to=reply_to,
                 )
             )
+            raw_by_id[mid] = item.get("raw_message")
         result.sort(key=lambda m: m.ts)
+        await self._backfill_image_descriptions(result, raw_by_id)
         return result
+
+    # ------------------------------------------------------------------
+    # 宿主图片 / 表情包识图描述只读回填（docs/06；Phase 1B §3.1）
+    # ------------------------------------------------------------------
+    # 一批消息最多收集多少个 hash 去查库（防爆量）
+    _IMAGE_DESC_BATCH_MAX = 100
+    _IMG_DESC_MAX = 120
+    _EMOJI_DESC_MAX = 60
+
+    async def _backfill_image_descriptions(self, result: list[Msg], raw_by_id: dict[str, Any]) -> None:
+        """给需要识图描述的消息补上 [图片：…] / [表情包：…]。
+
+        只读宿主 MaiBot.db 的 images 表（mode=ro、to_thread、0.5s 超时）。
+        触发条件：消息文本为空 / 是 [图片] / [表情包] / 含未展开占位，且 raw_message 里
+        能解出 image/emoji/mface 段的 hash / image_hash。文件不存在或查不到就跳过（零报错）。
+        """
+        db_path = self._maibot_db_path
+        try:
+            if not db_path.is_file():
+                return
+        except Exception:
+            return
+        # 收集每条候选消息要查的 hash，及它是不是表情包
+        pending: list[tuple[Msg, str, bool]] = []  # (msg, hash, is_emoji)
+        seen_hashes: set[str] = set()
+        for m in result:
+            text = str(m.text or "")
+            if re.search(r"\[(?:图片|表情包|动画表情|表情)\s*[：:]", text) and not any(
+                tag in text for tag in ("[图片]", "[表情包]", "[表情]")
+            ):
+                continue
+            # 只在「这条消息可能带图且没描述」时才解包：空文本 / 占位 / is_picture
+            looks_image = (
+                not text.strip()
+                or text.strip() in ("[图片]", "[表情包]", "[图片]", "[表情]")
+                or m.is_picture
+                or "[图片]" in text
+                or "[表情" in text
+            )
+            if not looks_image:
+                continue
+            segs = _image_segments(raw_by_id.get(m.id))
+            for h, is_emoji in segs:
+                if h not in seen_hashes and len(seen_hashes) >= self._IMAGE_DESC_BATCH_MAX:
+                    continue
+                seen_hashes.add(h)
+                pending.append((m, h, is_emoji or text.strip() == "[表情包]"))
+        if not pending:
+            return
+        descs = await asyncio.to_thread(self._lookup_image_descriptions, {h for _m, h, _e in pending})
+        if not descs:
+            return
+        # 按 msg 拼回填文字（一条消息可能多张图）
+        by_msg: dict[str, list[str]] = {}
+        for m, h, is_emoji in pending:
+            d = descs.get(h)
+            if d is None:
+                continue
+            desc, db_type = d
+            cleaned = " ".join(str(desc).split())
+            if not cleaned:
+                continue
+            emoji = is_emoji or db_type == "EMOJI"
+            lim = self._EMOJI_DESC_MAX if emoji else self._IMG_DESC_MAX
+            tag = "表情包" if emoji else "图片"
+            by_msg.setdefault(m.id, []).append(f"[{tag}：{cleaned[:lim]}]")
+        for m in result:
+            extra = by_msg.get(m.id)
+            if not extra:
+                continue
+            base = str(m.text or "")
+            # 占位本身（[图片] / [表情包]）替换成带描述的；有正文就拼接
+            if base.strip() in ("[图片]", "[表情包]", "[图片]", "[表情]"):
+                m.text = " ".join(extra)
+            elif base.strip():
+                m.text = f"{base} {' '.join(extra)}"
+            else:
+                m.text = " ".join(extra)
+
+    def _lookup_image_descriptions(self, hashes: set[str]) -> dict[str, tuple[str, str]]:
+        """只读查宿主 images 表：{hash: (description, image_type)}。同步、给 to_thread 用。"""
+        out: dict[str, tuple[str, str]] = {}
+        conn = None
+        try:
+            uri = f"{self._maibot_db_path.resolve().as_uri()}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=0.5)
+            # 校验 images 表与列（image_hash / emoji_hash 两种命名都兼容）
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(images)").fetchall()}
+            hash_col = "image_hash" if "image_hash" in cols else ("emoji_hash" if "emoji_hash" in cols else None)
+            if hash_col is None or "description" not in cols:
+                return out
+            type_col = "image_type" if "image_type" in cols else None
+            want = list(hashes)
+            for i in range(0, len(want), 500):
+                chunk = want[i : i + 500]
+                ph = ",".join("?" for _ in chunk)
+                sel = f"{hash_col}, description" + (f", {type_col}" if type_col else "")
+                sql = (
+                    f"SELECT {sel} FROM images WHERE {hash_col} IN ({ph})"
+                    " AND TRIM(COALESCE(description, '')) != ''"
+                )
+                for r in conn.execute(sql, chunk).fetchall():
+                    h = str(r[0])
+                    out[h] = (str(r[1] or ""), str(r[2] or "") if type_col else "")
+        except Exception:
+            logger.debug("读宿主图片描述失败（%s），本次跳过", self._maibot_db_path, exc_info=True)
+        finally:
+            if conn is not None:
+                conn.close()
+        return out
 
     async def message_by_id(
         self,
@@ -948,3 +1085,49 @@ class Host:
             "card": str(data.get("card") or "").strip(),
             "nickname": str(data.get("nickname") or "").strip(),
         }
+
+
+def _image_segments(raw_message: Any) -> list[tuple[str, bool]]:
+    """从 raw_message 解出 (hash, is_emoji) 列表（模块级辅助，供 _backfill_image_descriptions 用）。
+
+    raw_message 可能是 JSON 数组字符串或 list of segment dict；段 type in
+    ("image","emoji","mface")，hash 字段名兼容 image_hash / hash / file / file_unique / id。
+    """
+    segs: Any = raw_message
+    if isinstance(raw_message, str):
+        s = raw_message.strip()
+        if not (s.startswith("[") or s.startswith("{")):
+            return []
+        try:
+            segs = json.loads(s)
+        except (ValueError, TypeError):
+            return []
+    if isinstance(segs, dict):
+        segs = [segs]
+    if not isinstance(segs, list):
+        return []
+    out: list[tuple[str, bool]] = []
+    for seg in segs:
+        if not isinstance(seg, dict):
+            continue
+        t = str(seg.get("type") or "").lower()
+        if t == "seglist":
+            out.extend(_image_segments(seg.get("data")))
+            continue
+        if t not in ("image", "emoji", "mface"):
+            continue
+        data = seg.get("data")
+        if not isinstance(data, dict):
+            data = seg
+        h = ""
+        for source in (data, seg):
+            for k in ("image_hash", "hash", "file", "file_unique", "id"):
+                v = source.get(k)
+                if v is not None and str(v).strip():
+                    h = str(v).strip()
+                    break
+            if h:
+                break
+        if h:
+            out.append((h, t in ("emoji", "mface")))
+    return out

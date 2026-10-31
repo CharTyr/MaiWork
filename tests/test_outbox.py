@@ -870,3 +870,196 @@ async def test_result_hook_gets_outcome_and_ts(tmp_path):
     assert seen and seen[0]["outcome"] == "sent"
     assert seen[0]["key"] == "k1" and seen[0]["result"]["message_id"]
     assert float(seen[0]["ts"]) == NOON
+
+
+# ----------------------------------------------------------------------
+# outbox 备忘瘦身（Step 2.3）：非「交付说明」文字不再塞进 mentions
+# ----------------------------------------------------------------------
+
+
+async def test_non_delivery_text_writes_no_mention(tmp_path):
+    """普通开场白 / 命令回复 / 报错文字发出去了，但不写 deliver: 备忘（不挤 300 字预算）。"""
+    store, _, host, _, _, ob = _make(tmp_path)
+    ob.enqueue("t1", GID, "text", {"text": "开场白来了", "push_kind": "topic"})
+    ob.enqueue("s1", GID, "text", {"text": "状态更新", "push_kind": "status"})
+    ob.enqueue("e1", GID, "text", {"text": "出错了", "push_kind": "error"})
+    await ob.flush(NOON)
+    assert len(host.texts) == 3
+    mrows = store.read().execute("SELECT key FROM mentions").fetchall()
+    assert mrows == []  # 一条 deliver: 备忘都不写
+
+
+async def test_delivery_text_still_writes_mention(tmp_path):
+    """交付说明文字（push_kind=delivery）照旧写 deliver: 备忘。"""
+    store, _, host, _, _, ob = _make(tmp_path)
+    oid = ob.enqueue("d1", GID, "text", {"text": "做好了", "push_kind": "delivery"})
+    await ob.flush(NOON)
+    mrows = store.read().execute("SELECT key FROM mentions").fetchall()
+    assert any(r["key"] == f"deliver:{oid}" for r in mrows)
+
+
+# ----------------------------------------------------------------------
+# §4.1 here.now 过期重发：republish_if_expired + expires_ts 落库
+# ----------------------------------------------------------------------
+
+
+async def _sent_herenow_row(tmp_path, *, expires_offset: float = 24 * 3600):
+    """交付一个 view（herenow 首选），把行发到 sent，返回 (store, settings, host, ob, delivery, row)。"""
+    hn = FakeHereNow()
+    hn.results.append({
+        "url": "https://page.here.now/old",
+        "slug": "s1",
+        "expires_ts": NOON + expires_offset,
+        "claim_url": "https://here.now/c/x",
+        "claim_token": "tok",
+    })
+    store, settings, host, _, _, ob = _make(tmp_path, herenow=hn)
+    _seed_task(store)
+    f = _artifact_file(tmp_path, "index.html", text="<html>v1</html>")
+    delivery = Delivery(store, ob)
+    await delivery.deliver_task("T-1", kind="view", path=f, name="页面", note="看")
+    await ob.flush(NOON)
+    row = _rows(store)[0]
+    assert row["kind"] == "herenow" and row["status"] == "sent"
+    return store, settings, host, ob, delivery, row, hn
+
+
+async def test_herenow_result_stores_expires_ts(tmp_path):
+    """here.now 发出去了：outbox.result 里要有 expires_ts，旧链接过期后靠它判断。"""
+    store, _s, _h, _o, _d, row, _hn = await _sent_herenow_row(tmp_path)
+    result = json.loads(row["result"])
+    assert "url" in result
+    assert float(result["expires_ts"]) > NOON  # 过期时间存下来了
+
+
+async def test_republish_if_expired_not_yet_expired_does_nothing(tmp_path, monkeypatch):
+    """链接离过期还远：republish_if_expired 不重发，返回 not_due。"""
+    store, _s, _h, ob, _d, row, hn = await _sent_herenow_row(tmp_path)
+    monkeypatch.setattr(clock, "now", lambda: NOON)  # 时钟钉住：expires 还在未来
+    res = await ob.republish_if_expired("T-1")
+    assert res["ok"] is False
+    assert res["reason"] == "not_due"
+    assert len(hn.calls) == 1  # 只发过一次
+
+
+async def test_republish_if_expired_within_window_reissues_link(tmp_path, monkeypatch):
+    """过期前 5 分钟内：republish_if_expired 重新发 here.now 并更新 result。"""
+    store, _s, _h, ob, _d, row, hn = await _sent_herenow_row(tmp_path, expires_offset=200)
+    hn.results.append({
+        "url": "https://page.here.now/new",
+        "slug": "s2",
+        "expires_ts": NOON + 24 * 3600,
+        "claim_url": "https://here.now/c/x2",
+        "claim_token": "tok2",
+    })
+    monkeypatch.setattr(clock, "now", lambda: NOON)
+    res = await ob.republish_if_expired("T-1")
+    assert res["ok"] is True
+    assert len(hn.calls) == 2
+    new_result = json.loads(_rows(store)[0]["result"])
+    assert new_result["url"] == "https://page.here.now/new"
+    assert float(new_result["expires_ts"]) > NOON + 200
+
+
+async def test_republish_if_expired_throttled_60s_per_task(tmp_path, monkeypatch):
+    """每任务 60 秒内存节流：刚重发过就拦下，不连发。"""
+    store, _s, _h, ob, _d, row, hn = await _sent_herenow_row(tmp_path, expires_offset=200)
+    hn.results.append({
+        "url": "https://page.here.now/n2",
+        "slug": "s2",
+        "expires_ts": NOON + 24 * 3600,
+        "claim_url": "https://here.now/c/x2",
+        "claim_token": "tok2",
+    })
+    monkeypatch.setattr(clock, "now", lambda: NOON)
+    first = await ob.republish_if_expired("T-1")
+    assert first["ok"] is True
+    # 60 秒内再来一次：跳过（除非 force）
+    second = await ob.republish_if_expired("T-1")
+    assert second["ok"] is False
+    assert second["reason"] in ("throttled", "not_due")
+    assert len(hn.calls) == 2  # 还是 2 次
+
+
+async def test_republish_if_expired_empty_dir_does_nothing(tmp_path, monkeypatch):
+    """本地成品目录是空的：不重发（没有可发的内容）。"""
+    hn = FakeHereNow()
+    hn.results.append({
+        "url": "https://page.here.now/old", "slug": "s1",
+        "expires_ts": NOON + 200, "claim_url": "x", "claim_token": "t",
+    })
+    store, settings, host, _, _, ob = _make(tmp_path, herenow=hn)
+    _seed_task(store)
+    # 建一个空目录当成品（deliver_task 要真实目录，但内容是空的）
+    d = tmp_path / "ws" / "artifacts" / "T-1"
+    d.mkdir(parents=True, exist_ok=True)
+    # 直接入队（绕过 deliver_task 的目录检查）
+    ob.enqueue(
+        f"task:T-1:deliver", GID, "herenow",
+        {"dir": str(d), "note": "n", "push_kind": "delivery"},
+        task_id="T-1",
+    )
+    await ob.flush(NOON)
+    hn.results.append({
+        "url": "https://page.here.now/new", "slug": "s2",
+        "expires_ts": NOON + 24 * 3600, "claim_url": "x2", "claim_token": "t2",
+    })
+    monkeypatch.setattr(clock, "now", lambda: NOON)
+    res = await ob.republish_if_expired("T-1")
+    # 空目录：不能重发（Herenow.publish 也会拒绝，但我们应该先拦）
+    assert res["ok"] is False
+    assert len(hn.calls) == 1
+
+
+async def test_republish_if_expired_force_bypasses_window(tmp_path, monkeypatch):
+    """管理员点「重新生成外链」：force=True 不看 5 分钟窗口，直接重发。"""
+    store, _s, _h, ob, _d, row, hn = await _sent_herenow_row(tmp_path)  # 24 小时才过期
+    hn.results.append({
+        "url": "https://page.here.now/forced", "slug": "s2",
+        "expires_ts": NOON + 24 * 3600, "claim_url": "x2", "claim_token": "t2",
+    })
+    monkeypatch.setattr(clock, "now", lambda: NOON)
+    res = await ob.republish_if_expired("T-1", force=True)
+    assert res["ok"] is True
+    assert len(hn.calls) == 2
+    assert json.loads(_rows(store)[0]["result"])["url"] == "https://page.here.now/forced"
+
+
+async def test_republish_if_expired_missing_task_returns_not_found(tmp_path):
+    """任务没有 herenow 记录 / 任务不存在 → not_found / no_artifact 之类，不崩。"""
+    store, *_r, ob = _make(tmp_path)
+    res = await ob.republish_if_expired("T-999")
+    assert res["ok"] is False
+
+
+async def test_delivery_records_local_url_and_expired(tmp_path, monkeypatch):
+    """here.now 成品行：带免 Cookie 的群访问码副本链接与过期标记。"""
+    store, _s, _h, ob, delivery, row, _hn = await _sent_herenow_row(tmp_path)
+    with store.tx() as conn:
+        conn.execute("UPDATE groups SET token='test-group-token' WHERE group_id=?", (GID,))
+    monkeypatch.setattr(clock, "now", lambda: NOON)  # 发件当下看：还没过期
+    recs = delivery.delivery_records("T-1")
+    assert recs
+    herenow_rec = next(r for r in recs if r["raw_kind"] == "herenow")
+    assert herenow_rec["url"] == "https://page.here.now/old"
+    # 本地副本链接：前端能直接嵌 iframe / 开新页
+    assert herenow_rec["local_url"] == "/g/test-group-token/artifacts/T-1/"
+    # expires_ts > NOON + 24h（刚发的），还没到 → expired False
+    assert herenow_rec["expired"] is False
+
+
+async def test_delivery_records_expired_flag(tmp_path, monkeypatch):
+    """链接已经过期的：expired=True，前端据此给「重新生成外链」按钮。"""
+    store, _s, _h, ob, delivery, row, _hn = await _sent_herenow_row(tmp_path, expires_offset=-10)
+    monkeypatch.setattr(clock, "now", lambda: NOON)
+    recs = delivery.delivery_records("T-1")
+    herenow_rec = next(r for r in recs if r["raw_kind"] == "herenow")
+    assert herenow_rec["expired"] is True
+
+
+async def test_claim_delivery_expired_returns_local_hint(tmp_path, monkeypatch):
+    """领取时链接已过期：claim_delivery 回 expired，让命令层说本地副本在网页里。"""
+    store, _s, _h, ob, delivery, row, hn = await _sent_herenow_row(tmp_path, expires_offset=-10)
+    monkeypatch.setattr(clock, "now", lambda: NOON)  # 时钟钉住：刚发完，但 expires_ts 已经过
+    outcome = ob.claim_delivery(GID, "T-1")
+    assert outcome == "expired"

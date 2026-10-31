@@ -277,14 +277,16 @@ class TestOutboxWiring:
             (app.idea_mention, "on_result"),
         ):
             assert _hook_count(app.outbox, owner, name) == 1, (type(owner).__name__, name)
-        # 个人提一嘴的复核者是单独登记的（set_personal_guard）：登记一次，且不是普通 preflight
+        # 个人提一嘴的深度复核者仍是单独登记的（set_personal_guard，登记一次）
         guard = getattr(app.outbox, "_personal_guard", None)
         assert guard is not None and getattr(guard, "__self__", None) is app.idea_mention
         assert getattr(guard, "__name__", "") == "on_before_send"
+        # 防撞车（v0.14 §1.4）：卡片 / 提一嘴的 on_before_send 也挂进**通用** preflight
+        # （群构想 at_user 为空、不走 personal_guard，防撞车必须走通用闸）；开场白照旧走它。
         assert _hook_count(app.outbox, app.idea_mention, "on_before_send",
-                           attr="_preflight_hooks") == 0
+                           attr="_preflight_hooks") == 1
         assert _hook_count(app.outbox, app.card_push, "on_before_send",
-                           attr="_preflight_hooks") == 0
+                           attr="_preflight_hooks") == 1
         # 开场白还是走普通 preflight（不能冒充个人提一嘴的复核者）
         assert _hook_count(app.outbox, app.topics, "on_before_send",
                            attr="_preflight_hooks") == 1

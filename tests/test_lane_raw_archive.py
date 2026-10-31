@@ -166,9 +166,10 @@ class TestRawMerge:
 
 class TestMigration:
     def test_latest_version_is_44(self) -> None:
-        assert LATEST == 48, "第 45 步补索引、第 46 步主模型条目、第 47 步 round ref、第 48 步便条板，历史迁移位置保持不变"
+        assert LATEST == 49, "第 45 步补索引、第 46 步主模型条目、第 47 步 round ref、第 48 步便条板、第 49 步定向备忘，历史迁移位置保持不变"
         assert _MIGRATIONS[36].__name__ == "_m_task_lane_raw"
         assert _MIGRATIONS[37].__name__ == "_m_idea_kind"
+        assert _MIGRATIONS[48].__name__ == "_m_mention_targets"
 
     def test_raw_table_exists_with_coverage_columns(self, store: Store) -> None:
         names = {r[0] for r in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}

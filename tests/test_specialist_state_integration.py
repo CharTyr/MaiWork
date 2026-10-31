@@ -83,6 +83,25 @@ async def test_real_state_cancellation_closes_trace(env):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ok,stopped,state", [(False, False, "failed"),
+                                            (False, True, "cancelled"),
+                                            (True, True, "cancelled")])
+@pytest.mark.parametrize("accepted", [False, True])
+async def test_real_failed_and_stopped_reports_remain_terminal(env, monkeypatch, ok, stopped, state, accepted):
+    from unittest.mock import AsyncMock
+
+    agents, worker, sp = env
+    monkeypatch.setattr(worker, "run", AsyncMock(return_value=WorkerReport(
+        ok=ok, stopped=stopped, summary="离线测试交回", error="测试中止")))
+    report = await sp.run("idea", "测试终态保护", group_id=G1, tools=[])
+    assert agents.handoff(G1, report.handoff_id)["status"] == state
+    with pytest.raises(ValueError):
+        sp.review(G1, report, accepted, "禁止重复审核")
+    assert agents.handoff(G1, report.handoff_id)["status"] == state
+    assert agents.memory(G1, "idea")["learned"] == []
+
+
+@pytest.mark.asyncio
 async def test_real_state_generic_task_does_not_learn_across_tasks(env):
     agents, worker, sp = env
     report = await sp.run("task", "执行本次获批任务", group_id=G1, tools=["write_file"], task_id="T-test")

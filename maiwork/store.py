@@ -1359,9 +1359,31 @@ def _m_agent_notes(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE agent_handoffs ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
 
 
+def _m_mention_targets(conn: sqlite3.Connection) -> None:
+    """第 49 步：mentions 表补定向发言人与关键词列，避免全群闲聊误烧轮次。
+
+    - target_user_id：这条备忘只给这个人看（@ 防抢答、交付备忘定向本人）；
+      空 = 老行为，发给谁拼谁都注入。
+    - keywords：这条备忘的命中词（任务号 / 标题词）；最近两条群消息命中了才注入。
+      两列都非空时，任一命中即注入；都空 = 老行为。
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='mentions'"
+    ).fetchone()
+    if exists is None:
+        return
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(mentions)")}
+    for name, ddl in (
+        ("target_user_id", "TEXT NOT NULL DEFAULT ''"),
+        ("keywords", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE mentions ADD COLUMN {name} {ddl}")
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的。
-# 库号对齐线上：45 = _m_hot_indexes（公开 0.11.1 已带），看板两步顺延为 46 / 47；48 = 便条板。
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids, _m_pending_ask_state, _m_goal_stale_notify, _m_skills, _m_task_sessions, _m_hot_indexes, _m_main_runs, _m_round_ref_marks, _m_agent_notes]
+# 库号对齐线上：45 = _m_hot_indexes（公开 0.11.1 已带），看板两步顺延为 46 / 47；48 = 便条板；49 = mentions 定向。
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids, _m_pending_ask_state, _m_goal_stale_notify, _m_skills, _m_task_sessions, _m_hot_indexes, _m_main_runs, _m_round_ref_marks, _m_agent_notes, _m_mention_targets]
 
 
 class Store:

@@ -133,14 +133,14 @@ def _fake_feeds(store, settings, models=None, profiles=None):
 class TestSchema:
     def test_run_ref_columns_exist(self, tmp_path):
         store = Store(tmp_path / "t.db")
-        assert store.migrate() == 48
+        assert store.migrate() == 49
         for table in ("news_batches", "ideas", "topic_log", "judgments"):
             cols = {r["name"] for r in store.read().execute(f"PRAGMA table_info({table})")}
             assert "run_ref" in cols, table
 
     def test_migration_count(self):
         from CharTyr_MaiWork.maiwork.store import _MIGRATIONS
-        assert len(_MIGRATIONS) == 48
+        assert len(_MIGRATIONS) == 49
 
 
 # ----------------------------------------------------------------------

@@ -450,3 +450,114 @@ def test_pushes_count_used_reserves_uncertain_and_skips_followups(tmp_path):
     # 自动补的说明（follow_up_of）不算新的一条推送
     _uncertain_row(store, "k1:note", GID, {"push_kind": "delivery", "follow_up_of": 1}, t0)
     assert p.count_used(GID, t0) == 1
+
+
+# ----------------------------------------------------------------------
+# 定向备忘（迁移 49：target_user_id / keywords）+ 纯内存临时备忘
+# ----------------------------------------------------------------------
+
+
+def _kwargs_last_message(*, msg_id: str, text: str, self_msg: bool = False) -> dict:
+    """造一份 inject 用的 kwargs：items 里塞一条带 msg_id 的 <message> 群消息。"""
+    kw = copy.deepcopy(_BASE_KWARGS)
+    tag = "true" if self_msg else "false"
+    kw["items"].append({
+        "item_type": "UserMessageItem", "meta": {},
+        "parts": [{"type": "text",
+                   "text": f'<message msg_id="{msg_id}" is_self_message="{tag}">{text}</message>'}],
+    })
+    return kw
+
+
+def _injected_text(out: dict | None) -> str:
+    if out is None:
+        return ""
+    return out["items"][0]["parts"][0]["text"]
+
+
+def _turns(store: Store, key: str) -> int:
+    r = store.read().execute("SELECT turns_left FROM mentions WHERE key=?", (key,)).fetchone()
+    return int(r["turns_left"]) if r is not None else -999
+
+
+def test_targeted_memo_not_injected_for_other_chatter(tmp_path):
+    """带 target_user_id 的备忘：旁人闲聊时不注入也不扣轮次。"""
+    store, settings, m = _make_mentions(tmp_path)
+    _seed_group(store)
+    m.add(GID, "张三刚才派的活接手了", key="request:R-1", ttl_s=3600, turns=3,
+          target_user_id="1001", keywords=["R-1"])
+    m.note_msg_user(GID, "m9", "2002")  # 最后一条是别人（2002）说的
+    out = m.inject(_kwargs_last_message(msg_id="m9", text="今天天气不错"))
+    assert "张三刚才派的活" not in _injected_text(out)
+    assert _turns(store, "request:R-1") == 3  # 没注入就不扣
+
+
+def test_targeted_memo_injected_when_target_speaks(tmp_path):
+    """目标群友说话（最后一条消息的发言人是 target_user_id）→ 注入并扣轮次。"""
+    store, settings, m = _make_mentions(tmp_path)
+    _seed_group(store)
+    m.add(GID, "张三刚才派的活接手了", key="request:R-1", ttl_s=3600, turns=3,
+          target_user_id="1001", keywords=["R-1"])
+    m.note_msg_user(GID, "m9", "1001")  # 最后一条就是张三本人说的
+    out = m.inject(_kwargs_last_message(msg_id="m9", text="那个活怎么样了"))
+    assert "张三刚才派的活" in _injected_text(out)
+    assert _turns(store, "request:R-1") == 2
+
+
+def test_targeted_memo_injected_on_keyword_hit(tmp_path):
+    """最近两条群消息命中 keywords → 注入（哪怕说话人不是本人）。"""
+    store, settings, m = _make_mentions(tmp_path)
+    _seed_group(store)
+    m.add(GID, "张三的活接手了", key="request:R-1", ttl_s=3600, turns=3,
+          target_user_id="1001", keywords=["R-1"])
+    m.note_msg_user(GID, "m9", "2002")
+    out = m.inject(_kwargs_last_message(msg_id="m9", text="那个 R-1 做出来没"))
+    assert "张三的活接手了" in _injected_text(out)
+    assert _turns(store, "request:R-1") == 2
+
+
+def test_untargeted_memo_always_injected(tmp_path):
+    """没设 target_user_id / keywords 的老备忘：谁说话都注入（老行为不变）。"""
+    store, settings, m = _make_mentions(tmp_path)
+    _seed_group(store)
+    m.add(GID, "可以提一句：最近的开源项目", key="k1", ttl_s=3600, turns=2)
+    m.note_msg_user(GID, "m9", "2002")
+    out = m.inject(_kwargs_last_message(msg_id="m9", text="随便聊聊"))
+    assert "开源项目" in _injected_text(out)
+    assert _turns(store, "k1") == 1
+
+
+def test_add_ephemeral_injected_once_then_gone(tmp_path):
+    """临时备忘：turns=1，注入一次扣完就没了；不进库。"""
+    store, settings, m = _make_mentions(tmp_path)
+    _seed_group(store)
+    m.add_ephemeral(GID, "正在判断这条 @", key="request:at-m1", ttl_s=60, turns=1)
+    m.note_msg_user(GID, "m9", "1001")
+    out1 = m.inject(_kwargs_last_message(msg_id="m9", text="@ 帮我做个表"))
+    assert "正在判断" in _injected_text(out1)
+    # turns 扣完 → 下次不再注入
+    out2 = m.inject(_kwargs_last_message(msg_id="m9", text="还在吗"))
+    assert "正在判断" not in _injected_text(out2)
+    # 没写进 mentions 表
+    assert store.read().execute("SELECT COUNT(*) c FROM mentions").fetchone()["c"] == 0
+
+
+def test_drop_ephemeral_removes_it(tmp_path):
+    """drop_ephemeral 撤掉后不再注入。"""
+    store, settings, m = _make_mentions(tmp_path)
+    _seed_group(store)
+    m.add_ephemeral(GID, "正在判断", key="request:at-m1", ttl_s=60, turns=1)
+    m.drop_ephemeral(GID, "request:at-m1")
+    out = m.inject(_kwargs_last_message(msg_id="m9", text="hi"))
+    assert "正在判断" not in _injected_text(out)
+
+
+def test_ephemeral_respects_target_user(tmp_path):
+    """临时备忘也守定向：target_user_id 不匹配就不注入。"""
+    store, settings, m = _make_mentions(tmp_path)
+    _seed_group(store)
+    m.add_ephemeral(GID, "正在判断这条 @", key="request:at-m1", ttl_s=60, turns=1,
+                    target_user_id="1001")
+    m.note_msg_user(GID, "m9", "2002")  # 最后一条是别人
+    out = m.inject(_kwargs_last_message(msg_id="m9", text="哈哈"))
+    assert "正在判断" not in _injected_text(out)

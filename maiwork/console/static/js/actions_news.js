@@ -1,14 +1,47 @@
 // MaiWork 网页 · 点击动作（资讯找法相关）：预设搜索服务、优质来源、漏斗展开。
 // 从 actions.js 拆出来（单文件 900 行上限）；act() 先问这里，处理了返回 true。
 import { $, state } from "./state.js";
-import { reveal, toast } from "./util.js";
-import { api } from "./api.js";
+import { calm, reveal, toast } from "./util.js";
+import { api, gview } from "./api.js";
+import { FB_KEY, myFb } from "./pages/news.js";
+import { refreshDetail } from "./detail.js";
 import { loadExt } from "./settings/ext.js";
 import { openSheet, repaintSheet } from "./sheet.js";
 import { renderView } from "./render.js";
 
 export async function actNews(a, el) {
   switch (a) {
+    case "fb": {
+      if (el.disabled) return true;
+      el.disabled = true;
+      if (!calm()) {
+        el.classList.remove("fb-spring"); void el.offsetWidth; el.classList.add("fb-spring");
+        setTimeout(() => el.classList.remove("fb-spring"), 240);
+      }
+      const { kind, id, v } = el.dataset;
+      const group = state.g;
+      const all = myFb();
+      const key = `${kind}:${id}`;
+      const prev = all[key] || null;
+      const next = prev === v ? null : v;
+      try {
+        const r = await api("POST", `/api/${kind}/${encodeURIComponent(id)}/feedback`, { value: next, prev });
+        if (next) all[key] = next; else delete all[key];
+        localStorage.setItem(FB_KEY, JSON.stringify(all));
+        if (state.g !== group) return true;
+        const vw = gview();
+        const list = kind === "news" ? (vw?.news || []).flatMap((b) => b.items || []) : vw?.ideas || [];
+        const it = list.find((x) => String(x.id) === String(id));
+        const nf = r && (r.feedback || (r.up !== undefined ? { up: r.up, down: r.down } : null));
+        if (it && nf) it.feedback = nf;
+        renderView();
+        refreshDetail();
+        if (next) toast(next === "up" ? "已记录，将增加此类内容" : "已记录，将减少此类内容");
+      } catch (err) {
+        if (state.g === group) toast(err.message, true);
+      } finally { el.disabled = false; }
+      return true;
+    }
     case "skill-toggle": {
       el.disabled = true;
       try {
@@ -73,6 +106,28 @@ export async function actNews(a, el) {
       state.openFunnel = state.openFunnel === +el.dataset.id ? null : +el.dataset.id;
       renderView();
       reveal(`.funnel .rej-head[data-id="${el.dataset.id}"]`);
+      return true;
+    case "news-clear":
+      clearTimeout(state._newsQTimer);
+      state.newsTopic = "";
+      state.newsQ = "";
+      state.newsComposing = false;
+      renderView();
+      return true;
+    case "news-topic":
+      // 点主题标签筛选；再点同一个（或空标签）取消筛选（§4.3）
+      state.newsTopic = state.newsTopic === el.dataset.topic ? "" : (el.dataset.topic || "");
+      renderView();
+      return true;
+    case "news-search":
+      // 搜索框变化：debounce 后重画
+      clearTimeout(state._newsQTimer);
+      if (state.newsComposing) return true;
+      state.newsQ = ($("news-q") && $("news-q").value) || "";
+      renderView();
+      return true;
+    case "news-q-input":
+      // input 事件直接绑在 #news-q 上（不走 act）——这里兜底回 true 不打扰
       return true;
     default:
       return false;

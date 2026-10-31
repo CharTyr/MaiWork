@@ -819,3 +819,61 @@ class TestTakenCount:
         assert ga_idea["handoff_count"] == 2
         ga_task = await (await env.client.get(f"/api/tasks/{tid}")).json()
         assert ga_task["handoff_count"] == 1
+
+
+class TestVerifiedUrlsAndArtifactExcerpt:
+    """§4.2：link_check 里的 verified_urls 标「已打开核实」；artifact_excerpt 进「已有成品摘要」。"""
+
+    def test_verified_urls_render_with_label(self) -> None:
+        """link_check.verified_urls → 参考资料区标「已打开核实」；unopened_urls 标「未打开核实」。"""
+        from CharTyr_MaiWork.maiwork import handoff
+
+        lc = {"links": 2, "unopened": 1,
+              "opened_urls": ["https://secret.example/never-render"],
+              "verified_urls": ["https://ref.example/v1"],
+              "unopened_urls": ["https://ref.example/u1"]}
+        md = handoff.build_task(task_view(link_check=lc), [], [], TS)["markdown"]
+        assert "https://ref.example/v1" in md
+        assert "已打开核实" in md
+        assert "https://ref.example/u1" in md
+        assert "未打开核实" in md
+        assert "https://secret.example/never-render" not in md  # 红线：opened_urls 永不进包
+
+    def test_artifact_excerpt_renders_as_summary(self) -> None:
+        """detail['artifact_excerpt'] → 「## 已有成品摘要」一节，去人后输出。"""
+        from CharTyr_MaiWork.maiwork import handoff
+
+        view = task_view(status="completed")
+        view["artifact_excerpt"] = "这是成品正文摘要：铝价涨了 3%。"
+        md = handoff.build_task(view, [], [], TS)["markdown"]
+        assert "## 已有成品摘要" in md
+        assert "铝价涨了 3%" in md
+
+    def test_artifact_excerpt_trimmed_first_when_over_limit(self) -> None:
+        """超 30000 字时：最先砍 artifact_excerpt 到 800 字（比参考资料、验收意见先动刀）。"""
+        from CharTyr_MaiWork.maiwork import handoff
+
+        req = "长" * 32000
+        excerpt = "摘" * 2000  # 2000 字，会被截到 800
+        view = task_view(req=req, artifact_excerpt=excerpt, link_check=_refs(20))
+        out = handoff.build_task(view, [], [], TS)
+        md = out["markdown"]
+        assert out["truncated"] is True
+        # 摘要被砍到 800 字内
+        assert "摘" * 900 not in md  # 留不下完整的
+        assert "摘" * 800 in md or "## 已有成品摘要" not in md  # 要么截断要么整节去掉
+        # 参考资料还留 5 条
+        assert "https://ref.example/5" in md
+
+    def test_artifact_excerpt_dropped_when_still_too_long(self) -> None:
+        """砍到 800 字还超 → 整节清空（摘要不放），继续走参考资料 / 验收意见截。"""
+        from CharTyr_MaiWork.maiwork import handoff
+
+        req = "长" * 31000  # 主文已经很长了
+        excerpt = "摘" * 2000
+        view = task_view(req=req, artifact_excerpt=excerpt, link_check=_refs(20))
+        out = handoff.build_task(view, [], [], TS)
+        md = out["markdown"]
+        assert out["truncated"] is True
+        # req 一字不砍
+        assert req in md

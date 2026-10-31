@@ -950,3 +950,72 @@ class TestMemberInteractionsDropped:
             assert "member_interactions" not in tables
         finally:
             s.close()
+
+
+# ----------------------------------------------------------------------
+# 初次建群画像读群公告（Step 1B §3.2.3）
+# ----------------------------------------------------------------------
+
+
+class _FakeSpace:
+    """假群空间：notice_read 能力 + 两条公告。"""
+
+    def __init__(self, caps=None, notices=None) -> None:
+        self._caps = dict(caps or {"notice_read": True})
+        self._notices = list(notices or [])
+        self.cap_calls: list[str] = []
+
+    async def capabilities_async(self, gid, *, now=None):
+        self.cap_calls.append(str(gid))
+        return dict(self._caps)
+
+    async def get_notices(self, gid):
+        return list(self._notices)
+
+
+class TestFirstProfileNotices:
+    @pytest.mark.asyncio
+    async def test_notices_collected_when_capable(self, store: Store, frozen_now: float) -> None:
+        p = _make(store, FakeHost())
+        space = _FakeSpace(notices=[
+            {"message": {"text": "每周五分享夜"}},
+            {"text": "新人先自我介绍"},
+        ])
+        p.set_group_space(space)
+        out = await p._notices_for_first_profile(GID)
+        assert out == ["每周五分享夜", "新人先自我介绍"]
+        assert space.cap_calls == [GID]
+
+    @pytest.mark.asyncio
+    async def test_no_cap_returns_empty(self, store: Store, frozen_now: float) -> None:
+        p = _make(store, FakeHost())
+        p.set_group_space(_FakeSpace(caps={"notice_read": False}))
+        assert await p._notices_for_first_profile(GID) == []
+
+    @pytest.mark.asyncio
+    async def test_no_space_returns_empty(self, store: Store, frozen_now: float) -> None:
+        p = _make(store, FakeHost())
+        assert await p._notices_for_first_profile(GID) == []
+
+    @pytest.mark.asyncio
+    async def test_get_notices_error_swallowed(self, store: Store, frozen_now: float) -> None:
+        class _Boom(_FakeSpace):
+            async def get_notices(self, gid):
+                raise RuntimeError("网络挂了")
+
+        p = _make(store, FakeHost())
+        p.set_group_space(_Boom())
+        assert await p._notices_for_first_profile(GID) == []
+
+    def test_build_prompt_includes_notices(self, store: Store, frozen_now: float) -> None:
+        p = _make(store, FakeHost())
+        msgs = p._build_prompt(GID, [], notices=["每周五分享夜", "新人先自我介绍"])
+        joined = "\n".join(str(m.get("content") or "") for m in msgs)
+        assert "本群群公告" in joined
+        assert "每周五分享夜" in joined and "新人先自我介绍" in joined
+
+    def test_build_prompt_no_notices_no_section(self, store: Store, frozen_now: float) -> None:
+        p = _make(store, FakeHost())
+        msgs = p._build_prompt(GID, [])
+        joined = "\n".join(str(m.get("content") or "") for m in msgs)
+        assert "本群群公告" not in joined

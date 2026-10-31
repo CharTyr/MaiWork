@@ -73,12 +73,44 @@ document.addEventListener("click", (e) => {
   pulseNav(el);
 });
 
+// 输入先记草稿；拼音组合中暂停所有搜索重绘，提交中文后再防抖。
+function newsSearchInput(e) {
+  if (e.target?.id !== "news-q") return;
+  clearTimeout(state._newsQTimer);
+  state.newsQ = e.target.value || "";
+  if (e.isComposing || state.newsComposing) return;
+  const group = state.g;
+  state._newsQTimer = setTimeout(() => {
+    if (state.g === group && !state.newsComposing && !state.page && state.tab === "news") renderView();
+  }, 280);
+}
+document.addEventListener("compositionstart", (e) => {
+  if (e.target?.id !== "news-q") return;
+  state.newsComposing = true;
+  clearTimeout(state._newsQTimer);
+});
+document.addEventListener("compositionend", (e) => {
+  if (e.target?.id !== "news-q") return;
+  state.newsComposing = false;
+  newsSearchInput(e);
+});
+document.addEventListener("input", newsSearchInput);
+
+// .ntag[data-act="news-topic"] 键盘可达（role=button, tabindex=0）
+document.addEventListener("keydown", (e) => {
+  if ((e.key === "Enter" || e.key === " ") && e.target && e.target.matches && e.target.matches('.ntag[data-act="news-topic"]')) {
+    e.preventDefault();
+    e.target.click();
+  }
+});
+
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     if (onb.open) return;
     if (state.sheet) closeSheet();
     else if (state.detail) {
       state.detail = null;
+      ui.sideFlash = true;
       syncHash();
       renderView();
       renderSide();

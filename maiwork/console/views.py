@@ -477,14 +477,19 @@ def _pulse_topics(topic_log: list[Any], now: float) -> tuple[list[dict[str, Any]
         opener = str(e.get("opener") or "")
         result = e.get("result")
         replies = 0
+        active_users = 0
+        on_topic = 0
         if isinstance(result, dict):
             try:
                 replies = int(result.get("replies") or 0)
+                active_users = int(result.get("active_users") or 0)
+                on_topic = int(result.get("on_topic") or 0)
             except (TypeError, ValueError):
                 replies = 0
         if opener and title:
             buckets[b] = True
-            topics.append({"at": ts, "label": title, "replies": replies})
+            topics.append({"at": ts, "label": title, "replies": replies,
+                            "active_users": active_users, "on_topic": on_topic})
         else:
             buckets.setdefault(b, False)
     topics.sort(key=lambda x: float(x["at"]))
@@ -1214,7 +1219,8 @@ def group_view(svc: Any, group_id: str, *, admin: bool) -> dict[str, Any]:
         view.pop("workspace", None)
         # 群友也看得到开话题记录（设计允许），但不带管理员的判定字段
         view["topic_log"] = [
-            {k: v for k, v in e.items() if k != "verdict"} for e in topic_log
+            {k: v for k, v in e.items() if k != "verdict"}
+            for e in topic_log if bool(e.get("opener"))
         ]
     # `/mw` 指令清单 + 两条大白话用法：管理版和群友版都给同一份，唯一来源是 commands.HELP_ITEMS / USAGE_TIPS
     from ..commands import HELP_ITEMS, help_text, usage_tips

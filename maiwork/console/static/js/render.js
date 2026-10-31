@@ -157,34 +157,43 @@ function upcomingIcon(u) {
 }
 
 export function renderSide() {
-  if (!desktop.matches) return;
+  if (!desktop.matches) {
+    ui.sideFlash = false;
+    return;
+  }
+  const side = $("side");
+  const flash = !!ui.sideFlash && !calm();
+  ui.sideFlash = false;
+  side.classList.remove("side-enter");
+  if (flash) void side.offsetWidth;
   if (state.page === "chat") {
-    $("side").innerHTML = chatSide();
+    side.innerHTML = chatSide();
     return;
   }
   if (state.page === "board") {
-    $("side").innerHTML = "";
+    side.innerHTML = "";
     return;
   }
   if (state.page === "settings") {
-    $("side").innerHTML = settingsSide();
+    side.innerHTML = settingsSide();
     return;
   }
   const g = grp();
   if (!g) {
-    $("side").innerHTML = "";
+    side.innerHTML = "";
     return;
   }
   if (state.detail) {
     preserveGoalChatInput(() => {
-      $("side").innerHTML = `<button class="side-close" data-act="side-close" aria-label="关闭">${SVG.close}</button>${detailHTML()}`;
+      side.innerHTML = `<button class="side-close" data-act="side-close" aria-label="关闭">${SVG.close}</button>${detailHTML()}`;
     });
+    if (flash) side.classList.add("side-enter");
     return;
   }
   const v = gview();
   const t = g.today || {};
   const up = (v && v.upcoming) || [];
-  $("side").innerHTML = `
+  side.innerHTML = `
     ${pulseCard(g, v, true)}
     <h2 class="h-sub">今日</h2>
     <div class="stats">
@@ -198,6 +207,7 @@ export function renderSide() {
         ? `<h2 class="h-sub">日程</h2>${up.map((u) => `<div class="next">${ico(upcomingIcon(u))}<div><div class="next-time">${esc(when(u.at))}</div><div class="next-text">${esc(u.text)}</div></div></div>`).join("")}`
         : ""
     }`;
+  if (flash) side.classList.add("side-enter");
 }
 
 // 横向滚动的分栏（设置子页、全部配置的分节）：重绘前记下滚到哪，重绘后从原位置
@@ -281,23 +291,25 @@ function captureGroupInput(el) {
   const active = document.activeElement;
   if (!active || !active.id || !el.contains(active) || !active.matches("input, textarea, select")) return null;
   const scope = active.closest(".groupctl-slot, .gctx-slot");
-  if (!scope || scope.dataset.g !== state.g) return null;
+  if (active.id !== "news-q" && (!scope || scope.dataset.g !== state.g)) return null;
   let start = null, end = null;
   try { start = active.selectionStart; end = active.selectionEnd; } catch (_) { /* number / checkbox 没文字光标 */ }
-  return { id: active.id, start, end };
+  return { id: active.id, start, end, direction: active.selectionDirection, value: active.value, group: state.g };
 }
 
 function restoreGroupInput(saved, el) {
-  if (!saved) return;
+  if (!saved || saved.group !== state.g) return;
   const input = $(saved.id);
   if (!input || !el.contains(input) || input.disabled) return;
+  if (saved.id === "news-q") input.value = saved.value;
   input.focus({ preventScroll: true });
   if (typeof saved.start === "number" && typeof saved.end === "number") {
-    try { input.setSelectionRange(saved.start, saved.end); } catch (_) { /* 不支持文字光标的字段 */ }
+    try { input.setSelectionRange(saved.start, saved.end, saved.direction); } catch (_) { /* 不支持文字光标的字段 */ }
   }
 }
 
 export function renderView(opts) {
+  if (state.newsComposing && !state.page && state.tab === "news" && document.activeElement?.id === "news-q") return;
   if (state.page === "chat") {
     const typed = $("chat-input") ? $("chat-input").value : "";
     lastView = null;

@@ -50,7 +50,7 @@ import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
-from . import clock, group_push, idea_guard, members, voice
+from . import channel_dedup, clock, group_push, idea_guard, members, voice
 from .store import Store
 
 logger = logging.getLogger("maiwork.card_push")
@@ -365,6 +365,10 @@ class CardPush:
             add_hook(self.on_result)
         else:
             logger.warning("发件箱没有 add_result_hook，卡片发出后回写不了")
+        # 防撞车（v0.14 §1.4 方向 B）：排队 / 重试期间同条素材被开场白发了 → 作废。
+        add_preflight = getattr(outbox, "add_preflight_hook", None)
+        if callable(add_preflight):
+            add_preflight(self.on_before_send)
 
     def _cfg(self, gid: str) -> dict:
         """这个群的「往群里发」设置（group_push 那一份）。
@@ -383,6 +387,60 @@ class CardPush:
 
     # -------------------------------------------------------------- 建待发行
 
+    def on_before_send(self, info: dict) -> Optional[str]:
+        """发件箱发送前的复核（挂 add_preflight_hook；同步、纯代码、不调模型）。
+
+        防撞车（v0.14 §1.4 方向 B）：只在卡片（key 以 `news_card:` 开头）上生效。
+        排队 / 重试期间，这张卡片要发的资讯被开场白发过了（12h 内开过场、或另一条
+        开场白正在排队）→ 返回原因让发件箱作废，不和开场白重复发同一件事。
+        拿不到要发的条目 → 放行（别的闸会管），防撞车不该误伤。
+        """
+        key = str((info or {}).get("key") or "")
+        if not key.startswith("news_card:"):
+            return None
+        gid = str((info or {}).get("group_id") or "")
+        try:
+            now = float((info or {}).get("now") or clock.now())
+        except (TypeError, ValueError):
+            now = clock.now()
+        ids = self._card_outbox_item_ids(info)
+        if not ids:
+            return None
+        used = channel_dedup.topic_used_news_ids(self._store, gid, now)
+        if any(int(i) in used for i in ids):
+            return "同一条资讯刚被冷场开场白发过了，不再重复发"
+        return None
+
+    def _card_outbox_item_ids(self, info: dict) -> set:
+        """这条待发卡片要发的 news_items.id：优先读载荷，缺了再按 key 找回 news_cards。"""
+        payload = (info or {}).get("payload") or {}
+        out: set = set()
+        for x in (payload.get("item_ids") or []):
+            try:
+                out.add(int(x))
+            except (TypeError, ValueError):
+                continue
+        if out:
+            return out
+        try:
+            cid = int(str((info or {}).get("key") or "").split(":", 1)[1])
+        except (TypeError, ValueError, IndexError):
+            return out
+        gid = str((info or {}).get("group_id") or "")
+        try:
+            row = self._store.read().execute(
+                "SELECT item_ids FROM news_cards WHERE id=? AND group_id=?", (cid, gid)
+            ).fetchone()
+        except Exception:
+            return out
+        if row is None:
+            return out
+        try:
+            out.update(int(x) for x in json.loads(row["item_ids"] or "[]"))
+        except (TypeError, ValueError):
+            pass
+        return out
+
     def _carded_item_ids(self, gid: str) -> set[int]:
         """这个群已经进过卡片（已发 / 排队待发 / 发送中 / 不确定）的条目 id。"""
         rows = self._store.read().execute(
@@ -398,14 +456,16 @@ class CardPush:
                 continue
         return out
 
-    def _eligible_items(self, gid: str, batch_id: int, exclude: set[int]) -> list[Any]:
+    def _eligible_items(self, gid: str, batch_id: int, exclude: set[int], *, now: float = 0.0) -> list[Any]:
         rows = self._store.read().execute(
             "SELECT * FROM news_items WHERE group_id=? AND batch_id=? AND rejected=0"
             " AND kind IN ('news','guide') AND COALESCE(target_user_id,'')=''"
             " ORDER BY score DESC, id ASC",
             (gid, int(batch_id)),
         ).fetchall()
-        return [r for r in rows if int(r["id"]) not in exclude]
+        # 防撞车（v0.14 §1.4 方向 B）：12h 内已经 / 正在用开场白发过的资讯不再进卡片。
+        used = channel_dedup.topic_used_news_ids(self._store, gid, now or clock.now())
+        return [r for r in rows if int(r["id"]) not in exclude and int(r["id"]) not in used]
 
     def scan(self, group_id: Any, now: float) -> int:
         """把开关打开之后、12 小时内出来的群资讯批次各建一行待发（每批至多一行）。返回新建的待发行数。"""
@@ -425,7 +485,7 @@ class CardPush:
         ).fetchall()
         made = 0
         for b in batches:
-            picked = self._eligible_items(gid, int(b["id"]), self._carded_item_ids(gid))
+            picked = self._eligible_items(gid, int(b["id"]), self._carded_item_ids(gid), now=now)
             ids = [int(r["id"]) for r in picked[: cfg["news_card_count"]]]
             status, error = ("pending", "") if ids else ("dropped", "这批没有能上卡片的群资讯")
             with self._store.tx() as conn:
@@ -1442,10 +1502,12 @@ class IdeaMention:
             set_guard(self.on_before_send)
         else:
             # 老发件箱没有这个口：退化成普通 preflight（照样尽力复核），但挡不住「生产者没起来」
-            add_preflight = getattr(outbox, "add_preflight_hook", None)
-            if callable(add_preflight):
-                add_preflight(self.on_before_send)
             logger.warning("发件箱没有 set_personal_guard，个人提一嘴发送前复核只能尽力而为")
+        # 防撞车（v0.14 §1.4 方向 B）：群构想 at_user 为空、不走 personal_guard，
+        # 必须把 on_before_send 也挂进通用 preflight——同素材被开场白占了就作废。
+        add_preflight = getattr(outbox, "add_preflight_hook", None)
+        if callable(add_preflight):
+            add_preflight(self.on_before_send)
 
     def _cfg(self, gid: str) -> dict:
         """这个群的「往群里发」设置（group_push 那一份）。
@@ -1649,10 +1711,19 @@ class IdeaMention:
         if not key.startswith("idea_mention:"):
             return None
         payload = (info or {}).get("payload") or {}
+        gid = str((info or {}).get("group_id") or "")
+        # 防撞车（v0.14 §1.4 方向 B）：排队 / 重试期间这条构想被开场白提了 → 作废。
+        # 群构想 at_user 为空也走这一道（不靠 personal_guard），必须先于个人向早退判断。
+        try:
+            now_i = float((info or {}).get("now") or clock.now())
+        except (TypeError, ValueError):
+            now_i = clock.now()
+        iid = self._mention_idea_id(info)
+        if iid and channel_dedup.topic_used(self._store, gid, now_i, "idea", iid):
+            return "同一条构想刚被冷场开场白提过了，不再重复发"
         uid = str(payload.get("at_user") or "").strip()
         if not uid:
             return None  # 群向：个人向的这套闸不管
-        gid = str((info or {}).get("group_id") or "")
         try:
             now = float((info or {}).get("now") or clock.now())
         except (TypeError, ValueError):
@@ -1716,6 +1787,36 @@ class IdeaMention:
             return "发送前复核材料读取失败，作废"
         return None
 
+    def _mention_idea_id(self, info: dict) -> int:
+        """这条提一嘴要发的是哪条构想：优先读载荷，缺了再按 key 找回 idea_mentions。"""
+        payload = (info or {}).get("payload") or {}
+        try:
+            iid = int(payload.get("idea_id") or 0)
+            if iid:
+                return iid
+        except (TypeError, ValueError):
+            pass
+        guard = payload.get("guard")
+        if isinstance(guard, dict):
+            try:
+                iid = int(guard.get("idea_id") or 0)
+                if iid:
+                    return iid
+            except (TypeError, ValueError):
+                pass
+        try:
+            mid = int(str((info or {}).get("key") or "").split(":", 1)[1])
+        except (TypeError, ValueError, IndexError):
+            return 0
+        gid = str((info or {}).get("group_id") or "")
+        try:
+            row = self._store.read().execute(
+                "SELECT idea_id FROM idea_mentions WHERE id=? AND group_id=?", (mid, gid)
+            ).fetchone()
+        except Exception:
+            return 0
+        return int(row["idea_id"]) if row is not None else 0
+
     def scan(self, group_id: Any, now: float) -> int:
         gid = str(group_id)
         if not _served(self._get_settings, gid):
@@ -1731,8 +1832,12 @@ class IdeaMention:
             " ORDER BY i.id",
             (gid, since),
         ).fetchall()
+        # 防撞车（v0.14 §1.4 方向 B）：12h 内已经 / 正在用开场白提过的构想不再进提一嘴。
+        topic_used = channel_dedup.topic_used_idea_ids(self._store, gid, now)
         added = 0
         for r in rows:
+            if int(r["id"]) in topic_used:
+                continue
             uid = str(r["uid"] or "")
             if uid:
                 # 个人向：只给当前关注成员（开关还开着）；同一人 3 天冷却（未落地 / 已提 /

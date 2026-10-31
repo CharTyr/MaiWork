@@ -59,7 +59,12 @@ class SkillSummary:
         # Owned by this service, with no detached jobs; serializes same-name creates too.
         self._lock = asyncio.Lock()
 
+    def set_agents(self, agents: Any) -> None:
+        self._agents = agents
+
     def _served(self, gid: str) -> bool:
+        if self._agents is None:
+            return False
         try:
             self._agents._verify_served(gid)
             return True

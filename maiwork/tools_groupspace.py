@@ -16,6 +16,7 @@ import logging
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from . import clock
 from .tools import Tool, ToolContext, ToolResult, Tools
 from .tools_admin import _check_upload_path
 
@@ -149,6 +150,59 @@ def register_groupspace_tools(
             return ToolResult(ok=False, output="", error=f"传群相册失败：{e}")
         return ToolResult(ok=True, output=f"已把 {path} 传进群相册 {album_id or '（默认相册）'}")
 
+    async def group_notices_list(ctx: ToolContext, args: dict) -> ToolResult:
+        """看本群群公告（只读）：前 10 条，每条给发布时间、发送人、正文截 500 字。"""
+        gid = str(ctx.group_id or "").strip()
+        try:
+            items = await group_space.get_notices(gid)
+        except PermissionError as e:
+            return ToolResult(ok=False, output="", error=str(e))
+        except Exception as e:
+            logger.exception("看群公告出错（群 %s）", gid)
+            return ToolResult(ok=False, output="", error=f"看群公告失败：{e}")
+        if not items:
+            return ToolResult(ok=True, output="（没有群公告）", data=[])
+        lines = []
+        for it in items[:10]:
+            # NapCat / OneBot 返回字段名不完全一致，挨个兜底取
+            when = it.get("publish_time") or it.get("time") or it.get("send_time") or ""
+            try:
+                when_txt = clock.bj(float(when)).strftime("%Y-%m-%d %H:%M") if when else "（时间未知）"
+            except (TypeError, ValueError):
+                when_txt = "（时间未知）"
+            sender = str(it.get("sender_id") or it.get("user_id") or it.get("uploader") or "")
+            msg = it.get("message") or {}
+            body = str(msg.get("text") or it.get("text") or it.get("content") or "")
+            body = " ".join(str(body).split())[:500]
+            who = f"（发送人 {sender}）" if sender else ""
+            lines.append(f"- {when_txt}{who}：{body}")
+        return ToolResult(ok=True, output="\n".join(lines), data=items[:10])
+
+    async def group_albums_list(ctx: ToolContext, args: dict) -> ToolResult:
+        """看本群群相册（只读）：album_id、名称、简介、照片数。上传前先用它查 album_id。"""
+        gid = str(ctx.group_id or "").strip()
+        try:
+            items = await group_space.list_albums(gid)
+        except PermissionError as e:
+            return ToolResult(ok=False, output="", error=str(e))
+        except Exception as e:
+            logger.exception("看群相册出错（群 %s）", gid)
+            return ToolResult(ok=False, output="", error=f"看群相册失败：{e}")
+        if not items:
+            return ToolResult(ok=True, output="（没有群相册）", data=[])
+        lines = []
+        for it in items:
+            aid = str(it.get("album_id") or it.get("id") or "")
+            name = str(it.get("name") or it.get("album_name") or "")
+            desc = " ".join(str(it.get("desc") or it.get("description") or "").split())[:60]
+            cnt = it.get("photo_cnt") if it.get("photo_cnt") is not None else it.get("count")
+            meta = f"album_id={aid}" if aid else ""
+            if cnt is not None:
+                meta += f"，{cnt} 张照片"
+            tail = f"（{desc}）" if desc else ""
+            lines.append(f"- {name}{tail}　{meta}".rstrip())
+        return ToolResult(ok=True, output="\n".join(lines), data=items)
+
     tools.register(
         Tool(
             name="group_files_list",
@@ -234,5 +288,33 @@ def register_groupspace_tools(
                 "完成" if res.ok else (res.error or "失败"),
             ),
             timeout_s=60.0,
+        )
+    )
+    tools.register(
+        Tool(
+            name="group_notices_list",
+            description="看本群群公告（只读）。前 10 条，每条给发布时间、发送人、正文（截 500 字）。",
+            parameters={"type": "object", "properties": {}},
+            roles=frozenset({"main"}),
+            handler=group_notices_list,
+            summarize=lambda args, res: (
+                "看群公告",
+                res.output.splitlines()[0] if res.ok and res.output else (res.error or "没列出东西"),
+            ),
+            timeout_s=30.0,
+        )
+    )
+    tools.register(
+        Tool(
+            name="group_albums_list",
+            description="看本群群相册（只读）。列 album_id、名称、简介与照片数；调 group_album_upload 前先用它查 album_id。",
+            parameters={"type": "object", "properties": {}},
+            roles=frozenset({"main"}),
+            handler=group_albums_list,
+            summarize=lambda args, res: (
+                "看群相册",
+                res.output.splitlines()[0] if res.ok and res.output else (res.error or "没列出东西"),
+            ),
+            timeout_s=30.0,
         )
     )

@@ -31,7 +31,9 @@
 - 自动源在 ``_merge_rss_candidates`` 里每轮 ≤ ``TRIAL_CAND_CAP`` 条候选；
 - 自动退订（每次检查）：两周内给过 ≥10 条候选却 0 条进资讯；或净「没用」≥2；
   或试用两周结束时一条都没被选进资讯（管更新慢的源）；
-- 退订的源同时进「不再推荐」名单（和「管理员删掉自动源」一样），免得下一天又订回来。
+  或连续抓取失败 ≥5 次且首次错误至今满 3 天（手动源不退订）；
+- 订前试取错误在近 7 天跨 ≥3 个北京时间自然日、或订后连续抓取失败退订，均冷却 30 天；
+  其他自动退订和管理员删源仍进永久「不再推荐」名单。
 
 节流（``run`` 内部自己做，不另起循环）：退订检查 + 门槛订阅每天一次；来源地图 + push
 判断每周一次（kv ``feeds.auto_sources_last.<群号>``）。模型没配好就跳过要模型的部分。
@@ -40,7 +42,8 @@
 kv 键：
 - ``feeds.rss_stats.<群号>``：``{feed_id: [{ts, cand, kept:[条目 id]}]}``（裁剪 30 天）
   ——「给过几条候选 / 几条进了资讯」，进资讯的条目 id 用来算 up/down；
-- ``feeds.rss_auto_rejected.<群号>``：[{label, url, reason, ts}]，不再推荐；
+- ``feeds.rss_auto_rejected.<群号>``：[{label, url, reason, ts, cooldown_until?}]，
+  不带截止时间的永久不推荐；死源按截止时间冷却；
 - ``feeds.rss_auto_log.<群号>``：[{ts, action, label, url, origin, reason}] ≤30 条，给网页看；
 - ``feeds.source_map.<群号>``：{ts, sources:[{name,url,why,label,feed_url,status,reason,origin}]}；
 - ``feeds.auto_sources_last.<群号>``：{daily, weekly} 上次跑的时间。
@@ -74,6 +77,13 @@ TRIAL_DAYS = 14.0
 TRIAL_CAND_CAP = 2          # 自动源每轮最多并进几条候选（feeds._merge_rss_candidates）
 TRIAL_CAND_MIN = 10         # 两周内给过这么多候选…
 NET_USELESS_MIN = 2         # …或净「没用」到这个数 → 退订
+FAILURE_WINDOW_DAYS = 7
+FAILURE_MIN_DAYS = 3        # 订前试取错误须跨这么多个北京时间自然日
+FETCH_FAILURE_MIN = 5
+FETCH_FAILURE_DAYS = 3      # 订后连续抓取错误须持续这么多整天
+FAILURE_COOLDOWN_DAYS = 30
+_TRIAL_FAILURE_PREFIXES = ("没找到订阅地址：", "体检没过：")
+_FETCH_FAILURE_REASON = "连续抓取失败满 3 天"
 
 # ---- 名额 ----
 ORIGINS = ("trusted", "map", "push")
@@ -559,14 +569,22 @@ def load_log(store: Any, gid: str) -> list[dict[str, Any]]:
     return [dict(e) for e in _kv_list(store, log_key(str(gid))) if isinstance(e, dict)]
 
 
+def _is_trial_failure(entry: dict[str, Any]) -> bool:
+    # skipped 还有名额、硬闸等含义，只认试取路径实际写下的这两类原因；兼容已有日志形状。
+    return entry.get("action") == "skipped" and str(entry.get("reason") or "").startswith(
+        _TRIAL_FAILURE_PREFIXES
+    )
+
+
 def note_log(store: Any, gid: str, *, action: str, label: str = "", url: str = "",
              origin: str = "", reason: str = "", now: float) -> dict[str, Any]:
     """记一条 {ts, action: subscribed|unsubscribed|rejected|skipped, label, url, origin, reason}。
 
-    rejected = 进了「不再推荐」名单（管理员删 / 自动退订）；skipped = 这次没订上（找不到订阅地址、
-    体检没过——常是暂时的，比如限流 429），不进名单、以后还会再试。
+    rejected = 进了永久「不再推荐」名单（管理员删 / 非死源自动退订）；skipped = 这次没订上
+    （找不到订阅地址、体检没过，常是暂时的，比如限流 429）。单次 skipped 不冷却；
+    真实试取错误在七天内跨三个北京时间自然日，才另记三十天冷却。
 
-    同一件事（动作 + 来源 + 原因都一样）连着记：只更新时间，不刷屏。
+    同一件事（动作 + 来源 + 原因都一样）连着记：只更新时间，不刷屏；试取错误跨日不合并。
     """
     entry = {
         "ts": float(now), "action": str(action), "label": str(label or ""),
@@ -574,7 +592,8 @@ def note_log(store: Any, gid: str, *, action: str, label: str = "", url: str = "
     }
     log = load_log(store, gid)
     if log and log[0].get("action") == entry["action"] and log[0].get("label") == entry["label"] \
-            and log[0].get("reason") == entry["reason"] and abs(float(log[0].get("ts") or 0.0) - float(now)) < 20 * 3600.0:
+            and log[0].get("reason") == entry["reason"] and abs(float(log[0].get("ts") or 0.0) - float(now)) < 20 * 3600.0 \
+            and (not _is_trial_failure(entry) or clock.day_key(float(log[0]["ts"])) == clock.day_key(now)):
         log[0] = entry
     else:
         log.insert(0, entry)
@@ -584,27 +603,50 @@ def note_log(store: Any, gid: str, *, action: str, label: str = "", url: str = "
 
 
 def rejected_list(store: Any, gid: str) -> list[dict[str, Any]]:
-    """「不再推荐」名单：[{label, url, reason, ts}]。"""
+    """拒绝记录：[{label, url, reason, ts, cooldown_until?}]；无截止时间为永久不推荐。"""
     return [dict(e) for e in _kv_list(store, rejected_key(str(gid))) if isinstance(e, dict)]
 
 
+def _rejection_active(entry: dict[str, Any], now: float) -> bool:
+    until = float(entry.get("cooldown_until") or 0.0)
+    return not until or float(now) < until
+
+
 def note_rejected(store: Any, gid: str, *, label: str, url: str = "", reason: str = "",
-                  now: float) -> bool:
-    """把一个来源记进「不再推荐」（已在名单里 → False）。"""
+                  now: float, cooldown_until: float = 0.0) -> bool:
+    """默认永久不再推荐；新死源规则可指定冷却截止（已在有效名单里 → False）。"""
     lab = source_name.normalize_site(label) or str(label or "").strip().lower()
     url_s = str(url or "")
     if not lab and not url_s:
         return False
-    cur = rejected_list(store, gid)
+    cur = [e for e in rejected_list(store, gid) if _rejection_active(e, now)]
     for e in cur:
         if url_s and str(e.get("url") or "") == url_s:
             return False
         if lab and _covered(lab, [str(e.get("label") or "")]):
             return False
-    cur.append({"label": lab, "url": url_s, "reason": str(reason or "")[:200], "ts": float(now)})
+    entry = {"label": lab, "url": url_s, "reason": str(reason or "")[:200], "ts": float(now)}
+    if cooldown_until:
+        entry["cooldown_until"] = float(cooldown_until)
+    cur.append(entry)
     with store.tx() as conn:
         store.kv_set(conn, rejected_key(str(gid)), cur[-200:])
     return True
+
+
+def _note_trial_failure(store: Any, gid: str, *, label: str, url: str, origin: str,
+                        reason: str, now: float) -> None:
+    note_log(store, gid, action="skipped", label=label, url=url, origin=origin, reason=reason, now=now)
+    days = {
+        clock.day_key(float(e["ts"]))
+        for e in load_log(store, gid)
+        if e.get("label") == label and _is_trial_failure(e)
+        and now - FAILURE_WINDOW_DAYS * DAY <= float(e.get("ts") or 0.0) <= now
+    }
+    if len(days) >= FAILURE_MIN_DAYS:
+        error = reason.split("：", 1)[-1]
+        note_rejected(store, gid, label=label, url=url, reason=f"连续试取失败：{error[:60]}",
+                      now=now, cooldown_until=now + FAILURE_COOLDOWN_DAYS * DAY)
 
 
 def note_removed(store: Any, gid: str, entry: Any, *, now: float) -> bool:
@@ -758,7 +800,8 @@ def count_origin(store: Any, gid: str, origin: str) -> int:
 
 
 def gate_reason(store: Any, gid: str, *, label: str, url: str = "", feeds: Any = None,
-                blocked: Any = None, removed: Any = None, rejected: Any = None) -> str:
+                blocked: Any = None, removed: Any = None, rejected: Any = None,
+                now: float | None = None) -> str:
     """来源能不能订的「硬闸」；空串 = 可以往下走体检。
 
     覆盖：本群已订过（同标签或同 url）、屏蔽名单、优质来源被移出名单、自动源拒绝名单。
@@ -787,7 +830,9 @@ def gate_reason(store: Any, gid: str, *, label: str, url: str = "", feeds: Any =
         if _covered(lab, rem):
             return "这个来源被管理员移出了优质来源名单"
         rej = list(rejected) if rejected is not None else rejected_list(store, gid)
-        if url_s and any(str(r.get("url") or "") == url_s for r in rej if isinstance(r, dict)):
+        check_ts = float(clock.now() if now is None else now)
+        rej = [r for r in rej if isinstance(r, dict) and _rejection_active(r, check_ts)]
+        if url_s and any(str(r.get("url") or "") == url_s for r in rej):
             return "这个来源以前被删过（不再推荐）"
         if _covered(lab, [str(r.get("label") or "") for r in rej if isinstance(r, dict)]):
             return "这个来源以前被删过（不再推荐）"
@@ -804,7 +849,7 @@ async def subscribe_label(
     """
     now = float(clock.now() if now is None else now)
     lab = source_name.normalize_site(label) or str(label or "").strip().lower()
-    blocked = gate_reason(store, gid, label=lab, url=url_hint)
+    blocked = gate_reason(store, gid, label=lab, url=url_hint, now=now)
     if blocked:
         return {"ok": False, "reason": blocked, "url": url_hint, "id": ""}
     quota = int(ORIGIN_QUOTA.get(str(origin), 0) or 0)
@@ -825,14 +870,14 @@ async def subscribe_label(
             feed_url = str(found.get("url") or "")
             title = str(found.get("title") or "")
             if not feed_url:
-                note_log(store, gid, action="skipped", label=lab, url="", origin=origin,
-                         reason=f"没找到订阅地址：{found.get('error')}", now=now)
+                _note_trial_failure(store, gid, label=lab, url="", origin=origin,
+                                    reason=f"没找到订阅地址：{found.get('error')}", now=now)
                 return {"ok": False, "reason": str(found.get("error") or "没找到订阅地址"),
                         "url": "", "id": ""}
         check = await check_source(feed_url, transport=transport, now=now)
         if not check.get("ok"):
-            note_log(store, gid, action="skipped", label=lab, url=feed_url, origin=origin,
-                     reason=f"体检没过：{check.get('error')}", now=now)
+            _note_trial_failure(store, gid, label=lab, url=feed_url, origin=origin,
+                                reason=f"体检没过：{check.get('error')}", now=now)
             return {"ok": False, "reason": str(check.get("error") or "体检没过"), "url": feed_url, "id": ""}
         title = title or str(check.get("title") or "")
 
@@ -1151,7 +1196,7 @@ async def find_source_candidates(store: Any, gid: str, queries: Iterable[str], *
                 continue
             if url in have_urls or _covered(label, have_labels):
                 continue
-            if gate_reason(store, gid, label=label, url=""):
+            if gate_reason(store, gid, label=label, url="", now=now):
                 continue
             seen.add(label)
             if label != domain and not is_excluded_label(label):
@@ -1340,14 +1385,18 @@ async def map_sources(store: Any, gid: str, now: float, *, models: Any, profiles
 def unsubscribe_reason(store: Any, gid: str, entry: Any, now: float) -> str:
     """这个自动源该不该退订；空串 = 留着。
 
-    三种：两周内给过 ≥10 条候选却 0 条进资讯；净「没用」≥2；
-    或试用两周结束时一条都没被选进资讯（管更新慢的源）。
+    四种：连续抓取失败 ≥5 次且满 3 天；两周内给过 ≥10 条候选却 0 条进资讯；
+    净「没用」≥2；或试用两周结束时一条都没被选进资讯（管更新慢的源）。
     """
-    if not isinstance(entry, dict):
+    if not isinstance(entry, dict) or not entry.get("auto"):
         return ""
     fid = str(entry.get("id") or "")
     if not fid:
         return ""
+    error_since = float(entry.get("error_since_ts") or 0.0)
+    if int(entry.get("fail_count") or 0) >= FETCH_FAILURE_MIN and error_since > 0 \
+            and float(now) - error_since >= FETCH_FAILURE_DAYS * DAY:
+        return _FETCH_FAILURE_REASON
     st = trial_stats(store, gid, fid, now=now)
     if int(st["cand"]) >= TRIAL_CAND_MIN and not st["kept"]:
         return f"试用两周内给了 {int(st['cand'])} 条候选，但一条都没进资讯"
@@ -1392,7 +1441,9 @@ async def unsubscribe_stale(store: Any, gid: str, now: float) -> list[str]:
         except Exception:
             logger.exception("自动退订删源失败（群 %s，%s）", gid, fid)
             continue
-        note_rejected(store, gid, label=label, url=url, reason=reason, now=now)
+        cooldown_until = now + FAILURE_COOLDOWN_DAYS * DAY if reason == _FETCH_FAILURE_REASON else 0.0
+        note_rejected(store, gid, label=label, url=url, reason=reason, now=now,
+                      cooldown_until=cooldown_until)
         note_log(store, gid, action="unsubscribed", label=label, url=url,
                  origin=str(entry.get("origin") or ""), reason=reason, now=now)
         gone.append(label or url)

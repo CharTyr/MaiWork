@@ -66,9 +66,25 @@ class _FakeApprovals:
 class _FakeMentions:
     def __init__(self) -> None:
         self.items: list[dict] = []
+        self.ephemeral: list[dict] = []
+        self.dropped: list[tuple[str, str]] = []
+        self.msg_users: list[tuple[str, str, str]] = []
 
-    def add(self, group_id: str, text: str, *, key: str, ttl_s: float, turns: int = 5) -> None:
-        self.items.append({"group_id": str(group_id), "text": str(text), "key": str(key), "ttl_s": float(ttl_s)})
+    def add(self, group_id: str, text: str, *, key: str, ttl_s: float, turns: int = 5,
+            target_user_id: str = "", keywords="") -> None:
+        self.items.append({"group_id": str(group_id), "text": str(text), "key": str(key),
+                           "ttl_s": float(ttl_s), "target_user_id": str(target_user_id)})
+
+    def add_ephemeral(self, group_id: str, text: str, *, key: str, ttl_s: float = 15.0,
+                      turns: int = 1, target_user_id: str = "", keywords="") -> None:
+        self.ephemeral.append({"group_id": str(group_id), "text": str(text), "key": str(key),
+                               "target_user_id": str(target_user_id)})
+
+    def drop_ephemeral(self, group_id: str, key: str) -> None:
+        self.dropped.append((str(group_id), str(key)))
+
+    def note_msg_user(self, group_id: str, message_id: str, user_id: str) -> None:
+        self.msg_users.append((str(group_id), str(message_id), str(user_id)))
 
 
 class _FakeCommands:
@@ -550,3 +566,57 @@ class TestIdeaRefWithItems:
             store.close()
         assert len(approvals.created) == 1
         assert approvals.created[0][1]["items"] is None   # 没写「要做」= 全部
+
+
+# ----------------------------------------------------------------------
+# @ 判活期间的防抢答临时备忘（Step 2.3）
+# ----------------------------------------------------------------------
+
+
+class TestAtAntiPreempt:
+    @pytest.mark.asyncio
+    async def test_handle_at_adds_ephemeral_then_judge_drops_it(self) -> None:
+        """@ 一落就塞「正在判断」临时备忘（定向本人），后台判完在 finally 里撤掉。"""
+        jev = _FakeJev({"kind": ("prepare", 0.9, 0.9)})
+        approvals, mentions = _FakeApprovals(), _FakeMentions()
+        intake, signals, spawned = _make(jev=jev, approvals=approvals, mentions=mentions)
+        out = await intake.handle(
+            hook_message(is_at=True, user_id="20002", nickname="阿柒", message_id="m-9", text="帮我做个表")
+        )
+        assert out == {"action": "continue"}
+        # 钩子里就塞了防抢答备忘（key=request:at-m-9，定向说话人 20002）
+        assert any(e["key"] == "request:at-m-9" for e in mentions.ephemeral)
+        eph = next(e for e in mentions.ephemeral if e["key"] == "request:at-m-9")
+        assert eph["target_user_id"] == "20002"
+        assert "正在后台判断" in eph["text"]
+        # 后台判完 → 撤掉
+        await _drain(spawned)
+        assert (G1, "request:at-m-9") in mentions.dropped
+
+    @pytest.mark.asyncio
+    async def test_judge_at_error_still_drops_ephemeral(self) -> None:
+        """后台判词出错也照样撤（finally）——不能留一条「正在判断」卡着。"""
+        jev = _FakeJev(None)  # Jev 无答案 → 走 fallback
+        mentions = _FakeMentions()
+        intake, signals, spawned = _make(jev=jev, mentions=mentions)
+        await intake.handle(
+            hook_message(is_at=True, user_id="20002", message_id="m-err", text="帮我做个表")
+        )
+        await _drain(spawned)
+        assert (G1, "request:at-m-err") in mentions.dropped
+
+    @pytest.mark.asyncio
+    async def test_non_at_message_no_ephemeral(self) -> None:
+        """普通消息不塞防抢答备忘。"""
+        mentions = _FakeMentions()
+        intake, signals, spawned = _make(mentions=mentions)
+        await intake.handle(hook_message(text="随便聊聊", message_id="m-x"))
+        assert mentions.ephemeral == []
+
+    @pytest.mark.asyncio
+    async def test_msg_user_backfilled_for_targeted_memo(self) -> None:
+        """on_message 把 message_id→user_id 记进 Mentions（定向备忘认发言人用）。"""
+        mentions = _FakeMentions()
+        intake, signals, spawned = _make(mentions=mentions)
+        await intake.handle(hook_message(user_id="20002", message_id="m-u", text="hello"))
+        assert (G1, "m-u", "20002") in mentions.msg_users

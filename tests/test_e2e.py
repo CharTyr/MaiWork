@@ -1022,16 +1022,16 @@ class TestMemberReminder:
         before = len(world.ctx_calls("send.hybrid"))
         # 一轮入队（goals 到期在巡检 step 3）、一轮真发（outbox flush 在 step 1）
         await world.settle(2)
-        reminder_texts = [x for x in world.sent_texts() if "@阿柒 提醒：交稿" == x.strip()]
+        reminder_texts = [x for x in world.sent_texts() if "提醒：交稿" == x.strip()]
         assert len(reminder_texts) == 1, f"提醒该发一次：{world.sent_texts()}"
         assert len(world.ctx_calls("send.hybrid")) > before
 
         # 再跑：目标到期「问进展」也会发一条（独立功能，不算重复提醒），把它发完
         await world.settle(2)
         # 之后提醒本身绝不再发（remind_ts 已置空）
-        remind_before = [x for x in world.sent_texts() if "@阿柒 提醒：交稿" == x.strip()]
+        remind_before = [x for x in world.sent_texts() if "提醒：交稿" == x.strip()]
         await world.settle(2)
-        remind_after = [x for x in world.sent_texts() if "@阿柒 提醒：交稿" == x.strip()]
+        remind_after = [x for x in world.sent_texts() if "提醒：交稿" == x.strip()]
         assert len(remind_after) == len(remind_before) == 1
 
 

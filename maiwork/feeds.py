@@ -82,6 +82,7 @@ import itertools
 import json
 import logging
 import re as _re
+from collections import deque
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
@@ -179,12 +180,25 @@ def idea_basis_text(raw: Any) -> str | None:
 _SPARK_MIN_LEN = 6          # 太短的话（「怎么办」）不算话头
 _SPARK_WINDOW_S = 2 * 3600  # 火花只在 2 小时内算数
 _SPARK_GAP_S = 6 * 3600     # 离上一条群面构想至少 6 小时才为火花再出一次
+_SPARK_QUOTES_MAX = 6       # 每群最多留几条火花原话（纯内存环）
+_SPARK_QUOTE_TEXT_MAX = 120  # 单条原话最长多少字（脱敏截断后）
+_SPARK_QUOTE_FRESH_S = 30 * 60  # 火花原话只在 30 分钟内算「刚才的」
 _SPARK_CUES = (
     "怎么办", "搞不定", "卡住", "卡在", "报错", "踩坑", "求推荐", "有没有人", "有没有什么",
     "想买", "在等.{0,6}补货", "哪里买", "值不值", "选哪个", "好麻烦", "烦死", "不会弄",
     "怎么弄", "怎么搞", "求助", "有啥办法", "谁懂",
 )
 _SPARK_RE = _re.compile("|".join(_SPARK_CUES))
+_SPARK_CQ_RE = _re.compile(r"\[CQ:[^\]]*\]")
+_SPARK_LINK_RE = _re.compile(r"https?://\S+")
+
+
+def _spark_quote_text(text: Any) -> str:
+    """火花原话进缓冲前的脱敏：去 CQ 码 / 纯链接、收空白、截 120 字。"""
+    s = _SPARK_CQ_RE.sub(" ", str(text or ""))
+    s = _SPARK_LINK_RE.sub(" ", s)
+    s = " ".join(s.split())
+    return s[:_SPARK_QUOTE_TEXT_MAX]
 
 
 def idea_spark(text: Any) -> bool:
@@ -566,6 +580,7 @@ _IDEAS_DISMISSED_KEEP_DAYS = 3
 _IDEAS_VIEW_CAP = 20
 # 构想宁缺毋滥（docs/18 §十）：没人理的 7 天后自动收起；同一群没处理掉的攒到 2 条就先不再出新的
 _IDEAS_IGNORED_DAYS = 7
+_PERSONAL_IDEAS_IGNORED_DAYS = 14
 _IDEAS_PILE_LIMIT = 2
 # 「还占着位子」的状态：新想法 / 有人点过想要 / 在等管理员批准（pending 也要算，见 make_idea）
 _IDEAS_UNHANDLED_STATES = ("new", "wanted", "pending")
@@ -1466,6 +1481,9 @@ class Feeds:
         # 话头火花（docs/18 §十一）：每群最近一条「明显在为难 / 想要」的发言时间。
         # 纯内存（intake 每条消息都会碰它，不能每条写库）；当天出没出过记在 kv。
         self._spark_ts: dict[str, float] = {}
+        # 火花原话（脱敏截断后）：每群最近 6 条的纯内存环，0 SQL。
+        # 认领时落 kv["ideas.spark_quotes.<群>"]，构想轮拼进生成输入后清空。
+        self._spark_quotes_buf: dict[str, deque] = {}
 
     def _rss_subscribed(self, gid: str) -> bool:
         """本群有没有启用中的 RSS 源（A06：RSS-only 入口判断用；读失败按没有算）。"""
@@ -1834,6 +1852,8 @@ class Feeds:
             logger.warning("专岗 review 收尾没拿到群号（reports=%d），这批不 review", len(reports))
             return
         for report in reports:
+            if not getattr(report, "ok", False) or getattr(report, "stopped", False):
+                continue  # 执行层已落 failed/cancelled，不能再审核为 rejected。
             hid = str(getattr(report, "handoff_id", "") or "")
             if not hid:
                 continue  # 老路 WorkerReport（没接专岗）——跳过
@@ -5508,6 +5528,14 @@ class Feeds:
             lines.append(
                 "构想主要从这里和画像里的「在做的事 / 长期兴趣」出发；evidence 要照抄上面某一句原话。"
             )
+        # 火花触发的这一轮：把刚才触发火花的群友原话塞进去（认领时落的 kv，用完清空）
+        spark_quotes = self._take_spark_quotes(gid, clock.now())
+        if spark_quotes:
+            lines.append("")
+            lines.append("刚才触发火花的群友原话（这次构想主要就是接这几句）：")
+            lines.extend(
+                f"- {q.get('user_name') or '群友'}：{q.get('text') or ''}" for q in spark_quotes
+            )
         if recent_news:
             lines.append("")
             lines.append("最近找过的资讯（只作参考，别围着资讯想）：")
@@ -5562,7 +5590,7 @@ class Feeds:
             ' "uses": ["用到的本事名（至少 1 个，只从上面清单里挑）"],'
             ' "deliver": "page"|"doc"|"tool"|"report", "needs_members": false}}'
             '} | null'
-            + (', "notes_for_others": [可选 0~2 条 {"to": "news"|"goal"|"*", "text": "≤80 字：'
+            + (', "notes_for_others": [可选 0~2 条 {"to": "news"|"goal"|"task"|"*", "text": "≤80 字：'
                '看了构想调查同事交回的素材，值得让别的岗知道的事实；没有就 []"}]'
                if idea_candidate is not None else '')
             + '}'
@@ -5584,6 +5612,7 @@ class Feeds:
             data = json.loads(result.text)
         except (ModelError, ValueError) as e:
             logger.info("出构想失败（群 %s）：%s", gid, e)
+            self._idea_reject_report(gid, idea_report, "主模型构想解析失败")
             return None
         # 模型先想两三个（drafts）：只当日志留痕，不入库、不占任何字段。
         drafts = data.get("drafts") if isinstance(data, dict) else None
@@ -5596,9 +5625,11 @@ class Feeds:
         if not isinstance(idea, dict):
             # {"idea": null} / {"skip": ...} / 整个是 null / idea 不是表：就是这轮不出，
             # 安静返回 None（不算失败、不记错误）。
+            self._idea_reject_report(gid, idea_report, "主模型未产出构想")
             return None
         title = str(idea.get("title") or "").strip()
         if not title:
+            self._idea_reject_report(gid, idea_report, "主模型构想缺少标题")
             return None
         # 第一条：群里确实存在的需要——evidence 必须是本次给它的群聊里真出现过的原话。
         # 对不上 / 空的 → 不入库，记进 kv ideas.blocked.<群号>（管理员在「构想」页看得到）。
@@ -5608,6 +5639,7 @@ class Feeds:
                 self._store, gid, "group", title, "没引用到群里真说过的话"
             )
             logger.info("构想没引用到群里真说过的话，本轮不出（群 %s）：%s", gid, title)
+            self._idea_reject_report(gid, idea_report, "主模型构想缺少真实聊天依据")
             return None
         # 原话只留日志（截断），不进库（docs/18 §十：隐私）。
         logger.debug("构想引的群里原话（群 %s）：%s", gid, evidence[:60])
@@ -5618,18 +5650,22 @@ class Feeds:
                 self._store, gid, "group", title, "痛点 / 值得做 / 感兴趣 没说全"
             )
             logger.info("构想说不出痛点 / 值得做 / 感兴趣，本轮不出（群 %s）：%s", gid, title)
+            self._idea_reject_report(gid, idea_report, "主模型构想理由不完整")
             return None
         # 模型自己说「把握不大」（可选字段 worth）：别为了凑数硬出一条，这轮就不出。
         # 老格式没有这个字段 → 照常走（不破坏现有形状）。
         if _idea_worth_is_low(idea.get("worth")):
             logger.info("构想自报把握不大（worth=low），本轮不出（群 %s）", gid)
+            self._idea_reject_report(gid, idea_report, "主模型构想价值不足")
             return None
         if any(_similar(title, t) >= _IDEA_DEDUP_RATIO for t in recent_ideas):
+            self._idea_reject_report(gid, idea_report, "主模型构想与已有内容重复")
             return None
         # G7 隐私闸：body / basis 含关注成员名字 / 注记 → 这条构想整条丢弃（群友可见）
         body_s = str(idea.get("body") or "").strip()
         if self._scrub_item_text(gid, body_s) is None or self._scrub_item_text(gid, basis_s) is None:
             logger.info("构想含关注成员信息，整条丢弃（群 %s）", gid)
+            self._idea_reject_report(gid, idea_report, "主模型构想未通过隐私检查")
             return None
         # 由头（origin）也过隐私闸：含关注成员信息 → 只为这一项置空，不丢整条构想
         origin_s = clean_idea_origin(idea.get("origin"))
@@ -5655,6 +5691,7 @@ class Feeds:
                     self._store, gid, "group", title, "说是帮一步，却没写要做哪一步"
                 )
                 logger.info("构想说是帮一步却没写要做哪一步，本轮不出（群 %s）：%s", gid, title)
+                self._idea_reject_report(gid, idea_report, "主模型构想缺少执行项目")
                 return None
             feas_ok, feas_reason, feas_norm = idea_feasibility.check(
                 idea.get("feasibility"), cap_inv
@@ -5662,6 +5699,7 @@ class Feeds:
             if not feas_ok:
                 idea_feasibility.record_blocked(self._store, gid, "group", title, feas_reason)
                 logger.info("构想过不了可行性闸，本轮不出（群 %s）：%s —— %s", gid, title, feas_reason)
+                self._idea_reject_report(gid, idea_report, "主模型构想未通过可行性检查")
                 return None
             feasibility_json = json.dumps(feas_norm, ensure_ascii=False)
         keywords: list[str] = []
@@ -5782,7 +5820,7 @@ class Feeds:
         )
         data = getattr(report, "data", None)
         candidate: dict | None = None
-        if getattr(report, "ok", False) and isinstance(data, dict):
+        if getattr(report, "ok", False) and not getattr(report, "stopped", False) and isinstance(data, dict):
             cand = data.get("idea")
             if isinstance(cand, dict) and str(cand.get("title") or "").strip():
                 candidate = dict(cand)
@@ -5814,6 +5852,17 @@ class Feeds:
         lines.append("可以原样采用、改一改再提，也可以完全不参考它提别的；判断权全在你。")
         return "\n".join(lines)
 
+    def _idea_reject_report(self, gid: str, report: Any, reason: str) -> None:
+        """主模型未产出可采用构想时，收口成功交回的调查单；不学习、不贴便条。"""
+        sp = getattr(self, "_specialists", None)
+        hid = str(getattr(report, "handoff_id", "") or "")
+        if sp is None or not hid or not getattr(report, "ok", False) or getattr(report, "stopped", False):
+            return
+        try:
+            sp.review(str(gid), report, False, reason, refs=(f"handoff:{hid}",), learn=False)
+        except Exception:
+            logger.exception("构想早退收尾失败（群 %s hid %s）", gid, hid)
+
     def _idea_finish(
         self, gid: str, report: Any, candidate: dict | None, idea_id: int, title: str,
         *, main_notes: Any = None,
@@ -5827,7 +5876,9 @@ class Feeds:
         if specialists is None or report is None:
             return  # 没调查过（岗位停用 / 跳过）→ 什么都不记
         hid = str(getattr(report, "handoff_id", "") or "")
-        ok = bool(hid)
+        ok = bool(getattr(report, "ok", False)) and not getattr(report, "stopped", False)
+        if not hid or not ok:
+            return
         summary = str(getattr(report, "summary", "") or "")[:300] or "构想调查交回"
         accepted = ok and candidate is not None  # 「意见被认真考虑过」≠「交回了就当数」
         try:
@@ -5876,7 +5927,7 @@ class Feeds:
         """本群还占着位子的构想条数：new（新想法）+ wanted（有人点过想要）+ pending（等批准）。
 
         - 只数没落任务的（task_id 为空）；started / dismissed 已经处理过，不占位子。
-        - 个人向（target_user_id 非空，只给管理员看、也不自动收起）不算：不能让看不见的
+        - 个人向（target_user_id 非空，只给管理员看）不算：不能让看不见的
           个人构想把群面构想的位子占满。
         """
         states = "', '".join(_IDEAS_UNHANDLED_STATES)
@@ -5889,14 +5940,14 @@ class Feeds:
         return int(row["c"] or 0) if row is not None else 0
 
     def shelve_ignored_ideas(self, group_id: str, now: float | None = None) -> list[int]:
-        """7 天没人理的构想（new / wanted）自动收起成 dismissed；返回收起的那几条 id。
+        """无人处理的群构想满 7 天、个人构想满 14 天自动收起成 dismissed。
 
         - **只服务配置里的群**：非服务群（含配置读不出来）一行都不写。
-        - 7 天按 `created` 算：喜欢点击只动 up / down，不算「有人处理」；`updated` 不参与判断，
-          免得任何一次顺手改写把 7 天窗口悄悄续上。
+        - 按 `created` 算：喜欢点击只动 up / down，不算「有人处理」；`updated` 不参与判断，
+          免得任何一次顺手改写把到期窗口悄悄续上。
         - 不动的：等批准（state=pending）、已开工（started / 有 task_id）、关联待批请求
-          还没结果（requests.status ∈ pending / approved：有人在等管理员，收起来就断了）、
-          个人向（target_user_id 非空，只给管理员看）、已经 dismissed 的。
+          还没结果（requests.status ∈ pending / approved），以及尚有
+          pending / queued / sending 提一嘴的构想、已经 dismissed 的。
         - 只改状态不删行；跑第二遍一行都不写（幂等）；每条记一条 `idea.auto_shelved` 事件
           （entity=idea），**不**写任何负面经验 / 规矩（沉默不是差评，不借它学东西）。
         """
@@ -5910,17 +5961,24 @@ class Feeds:
         if not served:
             return []
         ts = float(now) if now is not None else float(clock.now())
-        cutoff = ts - _IDEAS_IGNORED_DAYS * 86400.0
+        params = {"gid": gid, "now": ts,
+                  "group_cut": ts - _IDEAS_IGNORED_DAYS * 86400.0,
+                  "personal_cut": ts - _PERSONAL_IDEAS_IGNORED_DAYS * 86400.0}
         states = "', '".join(_IDEAS_SHELVABLE_STATES)
         open_states = "', '".join(_IDEAS_REQUEST_OPEN)
-        candidates = self._store.read().execute(
-            "SELECT id, state, title FROM ideas WHERE group_id=? AND task_id IS NULL"
-            " AND COALESCE(target_user_id, '')='' AND created<=?"
+        # 选择与更新共用同一条件，入事务后再次检查，排队/审批中途变化不能错收。
+        eligible = (
+            "task_id IS NULL AND ((COALESCE(target_user_id, '')='' AND created<=:group_cut)"
+            " OR (COALESCE(target_user_id, '')<>'' AND created<=:personal_cut))"
             f" AND state IN ('{states}')"
             f" AND NOT EXISTS (SELECT 1 FROM requests r WHERE r.idea_id=ideas.id"
             f"   AND r.status IN ('{open_states}'))"
-            " ORDER BY id",
-            (gid, cutoff),
+            " AND NOT EXISTS (SELECT 1 FROM idea_mentions m WHERE m.idea_id=ideas.id"
+            "   AND m.group_id=ideas.group_id AND m.status IN ('pending','queued','sending'))"
+        )
+        candidates = self._store.read().execute(
+            "SELECT id, state, title, target_user_id FROM ideas WHERE group_id=:gid AND "
+            + eligible + " ORDER BY id", params,
         ).fetchall()
         if not candidates:
             return []
@@ -5929,13 +5987,9 @@ class Feeds:
             for r in candidates:
                 iid = int(r["id"])
                 cur = conn.execute(
-                    "UPDATE ideas SET state='dismissed', updated=?"
-                    " WHERE id=? AND group_id=? AND task_id IS NULL"
-                    " AND COALESCE(target_user_id, '')='' AND created<=?"
-                    f" AND state IN ('{states}')"
-                    f" AND NOT EXISTS (SELECT 1 FROM requests r WHERE r.idea_id=ideas.id"
-                    f"   AND r.status IN ('{open_states}'))",
-                    (ts, iid, gid, cutoff),
+                    "UPDATE ideas SET state='dismissed', updated=:now"
+                    " WHERE id=:iid AND group_id=:gid AND " + eligible,
+                    {**params, "iid": iid},
                 )
                 if int(cur.rowcount or 0) != 1:
                     continue  # 竞态 / 已经不满足了：当没发生过，绝不错收
@@ -5944,13 +5998,14 @@ class Feeds:
                     payload={
                         "title": str(r["title"] or ""),
                         "from": str(r["state"] or "new"),
-                        "ignored_days": _IDEAS_IGNORED_DAYS,
+                        "ignored_days": (_PERSONAL_IDEAS_IGNORED_DAYS if r["target_user_id"]
+                                         else _IDEAS_IGNORED_DAYS),
                     },
                 )
                 shelved.append(iid)
         if shelved:
-            logger.info("构想自动收起 %d 条（%d 天没人理；群 %s）：%s",
-                        len(shelved), _IDEAS_IGNORED_DAYS, gid, shelved[:10])
+            logger.info("构想自动收起 %d 条（群构想 %d 天、个人构想 %d 天；群 %s）：%s",
+                        len(shelved), _IDEAS_IGNORED_DAYS, _PERSONAL_IDEAS_IGNORED_DAYS, gid, shelved[:10])
         return shelved
 
     def _recent_task_titles(self, gid: str) -> list[str]:
@@ -6576,9 +6631,39 @@ class Feeds:
     # 话头火花（docs/18 §十一，2026-10-11 用户拍板）
     # ------------------------------------------------------------------
 
-    def note_spark(self, group_id: str, ts: float | None = None) -> None:
-        """群里刚出现一个「明显在为难 / 想要」的话头（intake 每条消息都调，纯内存、零库写）。"""
-        self._spark_ts[str(group_id)] = float(ts if ts is not None else clock.now())
+    def note_spark(
+        self,
+        group_id: str,
+        ts: float | None = None,
+        *,
+        user_id: str = "",
+        user_name: str = "",
+        text: str = "",
+        message_id: str = "",
+    ) -> None:
+        """群里刚出现一个「明显在为难 / 想要」的话头（intake 每条消息都调，纯内存、零库写）。
+
+        带 `text` 时顺手把脱敏截断后的原话存进 `_spark_quotes_buf[gid]` 纯内存环：
+        去 CQ 码、去纯链接、截 120 字；空了就只记时间。
+        """
+        gid = str(group_id)
+        now = float(ts if ts is not None else clock.now())
+        self._spark_ts[gid] = now
+        clean = _spark_quote_text(text)
+        if clean:
+            buf = self._spark_quotes_buf.get(gid)
+            if buf is None:
+                buf = deque(maxlen=_SPARK_QUOTES_MAX)
+                self._spark_quotes_buf[gid] = buf
+            buf.append(
+                {
+                    "ts": now,
+                    "user_id": str(user_id or ""),
+                    "user_name": str(user_name or ""),
+                    "text": clean,
+                    "message_id": str(message_id or ""),
+                }
+            )
 
     def spark_ready(self, group_id: str, now: float) -> bool:
         """这条火花现在该不该让 MaiWork 顺口出一轮构想（只读，不认领）。
@@ -6604,18 +6689,53 @@ class Feeds:
         return not (last > 0.0 and float(now) - last < _SPARK_GAP_S)
 
     def spark_taken(self, group_id: str, now: float) -> None:
-        """认领这次火花：清掉内存里那条，并把「今天已经火花出过」记进 kv（当天只出一次）。"""
+        """认领这次火花：清掉内存里那条，并把「今天已经火花出过」记进 kv（当天只出一次）。
+
+        顺手把最近 30 分钟的脱敏原话落 kv["ideas.spark_quotes.<群>"]（构想轮读走
+        后清空），缓冲环只留内存、不落库。
+        """
         gid = str(group_id)
         self._spark_ts.pop(gid, None)
         try:
             with self._store.tx() as conn:
                 self._store.kv_set(conn, self._spark_day_key(gid), clock.day_key(now))
+                buf = self._spark_quotes_buf.pop(gid, None)
+                if buf is not None:
+                    fresh = [q for q in buf if float(q.get("ts") or 0.0) >= float(now) - _SPARK_QUOTE_FRESH_S]
+                    if fresh:
+                        self._store.kv_set(conn, self._spark_quotes_key(gid), list(fresh))
         except Exception:
             logger.exception("记火花当天标记出错（群 %s），这次火花照常出", gid)
 
     @staticmethod
     def _spark_day_key(gid: str) -> str:
         return f"ideas.spark_day.{gid}"
+
+    @staticmethod
+    def _spark_quotes_key(gid: str) -> str:
+        return f"ideas.spark_quotes.{gid}"
+
+    def _take_spark_quotes(self, gid: str, now: float) -> list[dict]:
+        """构想轮读走「刚才触发火花的群友原话」：30 分钟内的留下，读走即清 kv（用完清空）。"""
+        gid = str(gid)
+        try:
+            saved = self._store.kv_get(self._spark_quotes_key(gid), None)
+        except Exception:
+            return []
+        if saved is None:
+            return []
+        # 不管读没读到，这轮都清掉：火花原话是一次性的，过期 / 畸形的留着也没用
+        try:
+            with self._store.tx() as conn:
+                self._store.kv_delete(conn, self._spark_quotes_key(gid))
+        except Exception:
+            logger.debug("清火花原话 kv 出错（群 %s），这次不清", gid, exc_info=True)
+        if not isinstance(saved, list):
+            return []
+        return [
+            q for q in saved
+            if isinstance(q, dict) and float(q.get("ts") or 0.0) >= float(now) - _SPARK_QUOTE_FRESH_S
+        ]
 
     def _last_idea_created(self, gid: str) -> float:
         """本群最近一条**群面**构想的时间（个人向的只给管理员看，不算群里的节奏）。"""

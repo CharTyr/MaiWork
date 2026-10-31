@@ -1364,7 +1364,7 @@ class Agents:
 
     def _note_targets(self) -> set[str]:
         try:
-            return {k for k in self._all_kinds() if k not in _NO_NOTES_KINDS}
+            return {k for k in self._all_kinds() if k != MAIN_KIND}
         except Exception:
             return set()
 
@@ -1474,6 +1474,8 @@ class Agents:
         """给本岗看的便条：14 天内、写给本岗或 '*'、不含本岗自己留的；最新在前，≤8 条。"""
         gid_s = self._verify_served(gid)
         kind_s = str(kind or "").strip()
+        if kind_s == MAIN_KIND:
+            return []
         self._ensure_schema()
         ts = float(now) if now is not None else clock.now()
         rows = self._store.read().execute(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import socket
@@ -752,6 +753,28 @@ class TestReminderParse:
         )
         assert out == {"title": "吃药", "due_ts": now + 600, "remind_ts": now + 500}
 
+    def test_parse_repeat_only_when_valid(self) -> None:
+        """无循环不带 repeat 键（老断言做全字典相等）；合法 repeat 才带上。"""
+        from CharTyr_MaiWork.maiwork.app import _parse_reminder_json
+
+        now = 1_790_000_000.0
+        # 没写 repeat → 返回 dict 里没有 "repeat" 键
+        out = _parse_reminder_json(
+            f'{{"ok": true, "title": "吃药", "due_ts": {now + 600}}}', now
+        )
+        assert "repeat" not in out
+        # 合法 daily / weekly / weekdays 带上
+        for rep in ("daily", "weekly", "weekdays"):
+            out = _parse_reminder_json(
+                f'{{"ok": true, "title": "吃药", "due_ts": {now + 600}, "repeat": "{rep}"}}', now
+            )
+            assert out["repeat"] == rep
+        # 不认识的 repeat 不带键
+        out = _parse_reminder_json(
+            f'{{"ok": true, "title": "吃药", "due_ts": {now + 600}, "repeat": "hourly"}}', now
+        )
+        assert "repeat" not in out
+
     def test_parse_ok_false_and_garbage(self) -> None:
         from CharTyr_MaiWork.maiwork.app import _parse_reminder_json
 
@@ -1001,7 +1024,7 @@ class TestM3Loop:
                 "SELECT payload FROM outbox WHERE key LIKE 'goal-remind:%'"
             ).fetchall()
             assert rows
-            assert "@阿柒 提醒：吃药" in rows[0]["payload"]
+            assert json.loads(rows[0]["payload"])["text"] == "提醒：吃药"
             # 提醒过的不再提醒
             row = app.store.read().execute("SELECT remind_ts FROM goals WHERE id=?", (mid,)).fetchone()
             assert row["remind_ts"] is None
@@ -1037,8 +1060,11 @@ class TestM3Loop:
                 "SELECT payload FROM outbox WHERE key LIKE 'goal-remind:%'"
             ).fetchall()
             assert rows
-            assert "@阿柒改了名 提醒：吃药" in rows[0]["payload"]
-            assert "20002" not in rows[0]["payload"]
+            assert json.loads(rows[0]["payload"])["text"] == "提醒：吃药"
+            # 真 @：at_user 带发起人 id，但正文 text 里不出现裸 QQ 号
+            p = json.loads(rows[0]["payload"])
+            assert "20002" not in p["text"] and p["at_user"] == "20002"
+            assert p["at_name"] == "阿柒改了名"
         finally:
             await app.stop()
 

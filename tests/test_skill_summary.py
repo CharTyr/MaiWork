@@ -83,6 +83,72 @@ async def learn(s, tid="T1", gid=G1):
     return await s.summary.summarize_task(tid, group_id=gid)
 
 
+def test_unwired_summary_is_safe_and_coordinator_binds_learning(svc):
+    summary = SkillSummary(svc.store, svc.workers, agents=None, data_dir=svc.root,
+                           get_known_secrets=lambda: [])
+    assert not summary._served(G1)
+    assert summary.list_skills(G1) == []
+    assert summary.find_similar_skill("website monitoring", G1) is None
+    sid = svc.agents.skill_add(G1, "task", name="website-monitoring",
+                              description="Monitor website changes.", body=BODY)
+    c = Coordinator(svc.store, models=None, workers=svc.workers, tools=None,
+                    tasks=None, goals=None, delivery=None, outbox=None, env=None,
+                    profiles=None, get_settings=lambda: None)
+    c._skill_summary = summary
+    c.set_agents(svc.agents)
+    assert c._agents is svc.agents
+    assert summary._served(G1)
+    assert summary.list_skills(G1)[0]["id"] == sid
+    assert summary.find_similar_skill("website monitoring", G1)["id"] == sid
+
+
+@pytest.mark.parametrize("injection", ["specialist", "task"])
+def test_skill_body_injection_counts_usage_but_matching_and_task_index_do_not(svc, injection):
+    from CharTyr_MaiWork.maiwork.group_context import group_context
+
+    task_sid = svc.agents.skill_add(G1, "task", name="website-monitoring",
+                                   description="Monitor website changes.", body=BODY)
+    news_sid = svc.agents.skill_add(G1, "news", description="Verify original sources.",
+                                   body="Use the original source before writing.")
+    assert svc.summary.find_similar_skill("website monitoring", G1)["id"] == task_sid
+    assert svc.agents.skill_get(G1, task_sid)["uses"] == 0
+    assert "website-monitoring" in group_context(svc.agents, G1, "task")
+    assert svc.agents.skill_get(G1, task_sid)["uses"] == 0
+    if injection == "specialist":
+        for count in (1, 2):
+            assert "Use the original source" in group_context(svc.agents, G1, "news")
+            assert svc.agents.skill_get(G1, news_sid)["uses"] == count
+        return
+    c = Coordinator(svc.store, models=None, workers=None, tools=None,
+                    tasks=None, goals=None, delivery=None, outbox=None, env=None,
+                    profiles=None, get_settings=lambda: None)
+    c._agents = svc.agents
+    c._skill_summary = svc.summary
+    for count in (1, 2):
+        assert "## Procedure" in c._find_similar_skill_brief("website monitoring", G1)
+        assert svc.agents.skill_get(G1, task_sid)["uses"] == count
+    assert c._find_similar_skill_brief("unrelated cooking", G1) == ""
+    assert svc.agents.skill_get(G1, task_sid)["uses"] == 2
+
+
+def test_usage_write_failure_does_not_drop_skill_body(svc, monkeypatch):
+    from CharTyr_MaiWork.maiwork.group_context import group_context
+
+    svc.agents.skill_add(G1, "task", name="website-monitoring",
+                         description="Monitor website changes.", body=BODY)
+    svc.agents.skill_add(G1, "news", description="Verify sources.", body="Use original sources.")
+    def fail(*args):
+        raise OSError("usage counter unavailable")
+    monkeypatch.setattr(svc.agents, "skill_touch_use", fail)
+    assert "Use original sources." in group_context(svc.agents, G1, "news")
+    c = Coordinator(svc.store, models=None, workers=None, tools=None,
+                    tasks=None, goals=None, delivery=None, outbox=None, env=None,
+                    profiles=None, get_settings=lambda: None)
+    c._agents = svc.agents
+    c._skill_summary = svc.summary
+    assert "## Procedure" in c._find_similar_skill_brief("website monitoring", G1)
+
+
 @pytest.mark.asyncio
 async def test_real_records_worker_report_and_file_index(svc):
     task(svc)

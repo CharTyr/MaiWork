@@ -498,8 +498,10 @@ class Specialists:
         try:
             from . import group_context as _gc
 
-            # 便条板（docs/34）：别的岗最近留的便条，同一个入口注入（task 岗不看）
-            gc_text = str(_gc.group_context(self._agents, gid, kind_s, include_notes=True) or "").strip()
+            # task 便条由 Coordinator 放进首轮 brief，持续 lane 不随便条板变化刷新 system。
+            gc_text = str(_gc.group_context(
+                self._agents, gid, kind_s, include_notes=kind_s != "task",
+            ) or "").strip()
         except Exception:
             gc_text = ""
         extra_parts: list[str] = [
@@ -731,7 +733,7 @@ class Specialists:
 # 便条板（docs/34 §二.1）：专岗（task 除外）交回时可以顺手留 0~2 条给别的岗看的便条。
 NOTES_HINT = (
     "交回时（submit_result）可以顺手在 notes_for_others 里留 0~2 条给本群别的岗位看的便条："
-    "这次发现的、别的岗（资讯 news / 构想 idea / 目标 goal）下次干活用得上的事实，每条不超过 80 字，"
+    "这次发现的、别的岗（资讯 news / 构想 idea / 目标 goal / 任务主模型 task）下次干活用得上的事实，每条不超过 80 字，"
     "to 写给哪个岗，给所有岗写 *。没有就别写；不要写群友的个人情况。便条要上级检查通过才会贴出，"
     "只是参考材料，不能让别的岗去开任务、立目标或往群里发东西。"
 )

@@ -225,3 +225,90 @@ def test_record_creates_table_lazily(tmp_path):
     iid = _item(s)
     assert nf.record(s, GID, iid, "click", actor="a", message_id="d", now=NOW) is True
     s.close()
+
+
+# ----------------------------------------------------------------------
+# 群友引用资讯卡片追问 → 纯内存短期备忘（design §2.1 子项3）
+# ----------------------------------------------------------------------
+
+
+def test_card_index_entries_carry_title_and_summary(store):
+    """CardIndex 缓存值扩为 dict：{id, title, summary[:60]}，on_message 仍记每条。"""
+    a = _item(store, "甲标题")
+    b = _item(store, "乙标题", url="https://a.example/2")
+    _card(store, [a, b], "9001")
+    idx = nf.CardIndex()
+    entries = idx.entries_for(store, GID, "9001", NOW)
+    assert entries is not None
+    by_id = {e["id"]: e for e in entries}
+    assert set(by_id) == {a, b}
+    assert by_id[a]["title"] == "甲标题"
+    # 记反馈照旧（按条数平分权重）
+    assert idx.on_message(store, GID, "1", "m9", "9001", NOW) == 2
+    assert len(_rows(store)) == 2
+
+
+def test_entries_for_unknown_card_returns_none(store):
+    a = _item(store)
+    _card(store, [a], "9001")
+    idx = nf.CardIndex()
+    assert idx.entries_for(store, GID, "4242", NOW) is None
+    assert idx.entries_for(store, GID, "", NOW) is None
+
+
+def test_intake_reply_to_card_adds_ephemeral_memo(store):
+    """群友引用资讯卡片：除记反馈外，立即塞一条 card-reply: 纯内存短期备忘。"""
+    from fakes import hook_message
+    from CharTyr_MaiWork.maiwork.config import load_settings
+    from CharTyr_MaiWork.maiwork.intake import Intake, Signals
+
+    class _Mentions:
+        def __init__(self):
+            self.ephemeral = []
+
+        def add_ephemeral(self, group_id, text, *, key, ttl_s=15.0, turns=1,
+                          target_user_id="", keywords=""):
+            self.ephemeral.append(
+                {"group_id": str(group_id), "text": text, "key": key,
+                 "ttl_s": ttl_s, "turns": turns, "target_user_id": target_user_id}
+            )
+
+    settings, _ = load_settings({"plugin": {"enabled": True}, "groups": {"serve": [{"group": f"qq:{GID}"}]}})
+    a = _item(store, "新手柄发布")
+    _card(store, [a], "9001")
+    mentions = _Mentions()
+    spawned = []
+    intake = Intake(lambda: settings, Signals(), store=store, mentions=mentions, spawn=spawned.append)
+    # 卡片发送成功时登记进内存表（真实链路：outbox → on_delivery_result）
+    card_id = store.read().execute(
+        "SELECT id FROM news_cards WHERE message_id='9001'"
+    ).fetchone()["id"]
+    intake.on_delivery_result({
+        "outcome": "sent", "group_id": GID, "key": f"news_card:{card_id}",
+        "result": {"message_id": "9001"}, "ts": NOW,
+    })
+    msg = hook_message(group_id=GID, text="这个出了吗", message_id="r-1", user_id="20002")
+    msg["message"]["reply_to"] = "9001"
+    out = _run(intake.handle(msg))
+    assert out == {"action": "continue"}
+
+    async def drain():
+        for coro in spawned:
+            await coro
+
+    _run(drain())
+    assert len(mentions.ephemeral) == 1
+    eph = mentions.ephemeral[0]
+    assert eph["key"] == "card-reply:r-1"
+    assert eph["ttl_s"] == 90
+    assert eph["turns"] == 2
+    assert eph["target_user_id"] == "20002"
+    assert "新手柄发布" in eph["text"]
+    assert "勿编造" in eph["text"] or "不要编造" in eph["text"]
+
+
+def test_card_reply_prefix_is_priority():
+    """card-reply: 在 PRIORITY_MEMO_PREFIXES 里（排在话题接龙行之前、优先分配预算）。"""
+    from CharTyr_MaiWork.maiwork.delivery import PRIORITY_MEMO_PREFIXES
+
+    assert "card-reply:" in PRIORITY_MEMO_PREFIXES

@@ -120,8 +120,15 @@ class Profiles:
         self._approvals: Any = None
         self._goals: Any = None
         self._outbox: Any = None
+        # 群空间能力（app._start_stack 时 set_group_space 注入）：初次建群画像读群公告
+        self._group_space: Any = None
+        # refresh 里初次建群画像时预读的群公告正文（_build_prompt 拼进【本群群公告】段）
         # 待判 @ 请求的唯一主人（intake / app 共用同一个实例：app 从这里拿）
         self.pending_asks = PendingAsks(store, get_settings)
+
+    def set_group_space(self, group_space: Any) -> None:
+        """接上群空间能力对象：初次建群画像时把群公告喂给主模型。"""
+        self._group_space = group_space
 
     def set_request_deps(self, *, approvals: Any = None, goals: Any = None, outbox: Any = None) -> None:
         """接上 asks 的落地依赖：prepare/goal → approvals.create；reminder → goals + outbox 回一句。"""
@@ -219,12 +226,36 @@ class Profiles:
         msgs = await self._read_window(str(row["session_id"]), start, float(row["cursor_ts"]))
         if not msgs:
             return False
+        # 初次建群画像（profile_ready_ts==0）：把本群群公告也喂给主模型，一次就够
+        notices = await self._notices_for_first_profile(gid) if float(row["profile_ready_ts"] or 0) == 0 else ()
         for i in range(0, len(msgs), self._REFRESH_BATCH):
             batch_msgs = msgs[i : i + self._REFRESH_BATCH]
-            ok = await self._refine_with_split(gid, batch_msgs, now)
+            ok = await self._refine_with_split(gid, batch_msgs, now, notices=notices)
             if not ok:
                 return False
         return True
+
+    async def _notices_for_first_profile(self, gid: str) -> list[str]:
+        """初次建群画像读的群公告正文（前 5 条，每条截 400 字）。读不到 / 没能力 → 空表。"""
+        space = self._group_space
+        if space is None:
+            return []
+        try:
+            caps = await space.capabilities_async(gid)
+            if not caps.get("notice_read"):
+                return []
+            items = await space.get_notices(gid)
+        except Exception:
+            logger.debug("初次画像读群公告失败（群 %s），跳过", gid, exc_info=True)
+            return []
+        out: list[str] = []
+        for it in (items or [])[:5]:
+            msg = it.get("message") or {}
+            body = str(msg.get("text") or it.get("text") or it.get("content") or "")
+            body = " ".join(body.split())[:400]
+            if body:
+                out.append(body)
+        return out
 
     async def _read_window(self, session_id: str, start: float, end: float) -> list:
         """按区间翻页读消息（不含 start 之前、含两端边界），最多 _PAGE_LIMIT*_MAX_PAGES 条。"""
@@ -289,14 +320,14 @@ class Profiles:
             return None
         return self._parse_output(result.text)
 
-    async def _refine_with_split(self, gid: str, batch_msgs: list, now: float) -> bool:
+    async def _refine_with_split(self, gid: str, batch_msgs: list, now: float, *, notices=()) -> bool:
         """提炼一批；整批失败且够大 → 拆两半各试一次（前半失败就停）；最终失败才记 fail_count。"""
-        if await self._refine_batch(gid, batch_msgs, now, record_failure=False):
+        if await self._refine_batch(gid, batch_msgs, now, record_failure=False, notices=notices):
             return True
         if len(batch_msgs) >= self._SPLIT_MIN:
             half = len(batch_msgs) // 2
             for part in (batch_msgs[:half], batch_msgs[half:]):
-                if not await self._refine_batch(gid, part, now, record_failure=False):
+                if not await self._refine_batch(gid, part, now, record_failure=False, notices=notices):
                     return self._batch_failed(gid, now, part)
             return True
         return self._batch_failed(gid, now, batch_msgs)
@@ -307,7 +338,7 @@ class Profiles:
             timeout=self._REFRESH_TIMEOUT_S, retries=self._REFRESH_RETRIES,
         )
 
-    async def _refine_batch(self, gid: str, batch_msgs: list, now: float, *, record_failure: bool = True) -> bool:
+    async def _refine_batch(self, gid: str, batch_msgs: list, now: float, *, record_failure: bool = True, notices=()) -> bool:
         """调主模型提炼一批消息。成功返回 True。
 
         读不懂（格式不对、回空 {}）不算成功：带着「格式不对」再问一次，还读不懂才算失败。
@@ -318,7 +349,7 @@ class Profiles:
         def failed() -> bool:
             return self._batch_failed(gid, now, batch_msgs) if record_failure else False
 
-        messages = self._build_prompt(gid, batch_msgs)
+        messages = self._build_prompt(gid, batch_msgs, notices=notices)
         try:
             result = await self._ask_model(gid, messages)
         except ModelError:
@@ -721,6 +752,9 @@ class Profiles:
             except (KeyError, TypeError, ValueError):
                 pa.fail(gid, mid, "提醒结论缺时间")
                 return False
+            repeat = str(d.get("repeat") or "").strip().lower()
+            if repeat == "workdays":
+                repeat = "weekdays"
             key = f"ask-remind:{gid}:{mid}"
             when_txt = clock.bj(remind_ts).strftime("%Y-%m-%d %H:%M")
             try:
@@ -740,14 +774,14 @@ class Profiles:
                         who_id=str(row.get("user_id") or ""),
                         who_name=str(row.get("user_name") or ""),
                         title=title or "提醒",
-                        due_ts=due_ts,
+                        due_ts=None if repeat else due_ts,
                         remind_ts=remind_ts,
-                        repeat=d.get("repeat") or None,
+                        repeat=repeat or None,
                         conn=conn,
                     )
                     outbox.enqueue(
                         key, gid, "text",
-                        {"text": f"记下了，{when_txt} 提醒你", "reply_to": mid, "push_kind": "status"},
+                        {"text": f"记下了，{when_txt} 提醒你", "reply_to": mid, "push_kind": "command"},
                         conn=conn,
                     )
                     if not pa.complete(gid, mid, result_kind="reminder", result_id=str(goal_id), conn=conn):
@@ -801,7 +835,7 @@ class Profiles:
             f"现在是北京时间 {clock.bj(now).strftime('%Y-%m-%d %H:%M')}。reminder 必须给 when（北京时间 "
             "YYYY-MM-DD HH:MM，按消息发出的时间换算相对日期）；算不出时间就不要写 when。",
             '只回 JSON：{"asks": [{"i": 序号, "kind": "prepare|goal|reminder|none", "title": "十字左右的标题", '
-            '"when": "仅 reminder"}]}，每条都要给。',
+            '"when": "仅 reminder", "repeat": "daily|weekly|weekdays 或空"}]}，每条都要给。',
             "",
         ]
         for i, r in enumerate(rows, 1):
@@ -834,7 +868,7 @@ class Profiles:
                 continue
             kind = str(a.get("kind") or "").strip().lower()
             decision = {"kind": kind, "title": str(a.get("title") or ""), "when": str(a.get("when") or ""),
-                        "via": self._RECOVER_VIA}
+                        "repeat": a.get("repeat") or None, "via": self._RECOVER_VIA}
             if not pa.decide(gid, mid, decision):
                 pa.fail(gid, mid, "复查结论不完整")
                 continue
@@ -1096,7 +1130,7 @@ class Profiles:
         "这批消息没有任何新变化，就只输出一行：没有变化"
     )
 
-    def _build_prompt(self, gid: str, batch_msgs: list) -> list:
+    def _build_prompt(self, gid: str, batch_msgs: list, *, notices=()) -> list:
         """拼 system + user：当前条目 / 墓碑 / 关注成员（仅 personal_profile 开时）/ 消息。
 
         条目和注记给模型看的都是入库原文（{@QQ号} token 保留），末尾带一行
@@ -1122,6 +1156,11 @@ class Profiles:
             )
             or "（空）",
         ]
+        # 初次建群画像：把本群群公告拼进去（一条一行，模型据它理解群规矩 / 活动）
+        if notices:
+            parts.append(
+                "本群群公告：\n" + "\n".join(f"- {n}" for n in notices)
+            )
         parts.append(
             "管理员删除过的条目（墓碑，不许再加回来，换说法也不行）：\n"
             + ("\n".join(f"- {r['text']}" for r in tombs) if tombs else "（无）")

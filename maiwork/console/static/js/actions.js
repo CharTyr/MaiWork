@@ -1,8 +1,8 @@
 // MaiWork 网页 · 所有按钮的点击动作（data-act）。
 import { $, admin, state, ui } from "./state.js";
-import { reveal, toast } from "./util.js";
+import { calm, flashCopied, flipRemove, reveal, toast } from "./util.js";
 import { api, grp, gview } from "./api.js";
-import { FB_KEY, RATE_KEY, clientId, myFb, myRates } from "./pages/news.js";
+import { RATE_KEY, clientId, myRates } from "./pages/news.js";
 import { findIdea, ideaAsk, ideaItems, ideaPicked } from "./pages/ideas.js";
 import { refreshDetail } from "./detail.js";
 import { handoffCopy, handoffDownload, openHandoff } from "./handoff.js";
@@ -18,6 +18,7 @@ import { actModels } from "./settings/models.js";
 import { actJev } from "./settings/jev.js";
 import { actOptDeps } from "./settings/optdeps.js";
 import { actAttention } from "./settings/attention.js";
+import { actPreview } from "./preview.js";
 import { chipAdd, rowsAdd } from "./settings/rules.js";
 import { loadUsage, loadUsageDay } from "./settings/usage.js";
 import { avatarSaved } from "./settings/identity.js";
@@ -54,6 +55,7 @@ export async function act(el, e) {
   if (await actJev(a, el)) return;
   if (await actOptDeps(a, el)) return;
   if (await actAttention(a, el)) return;
+  if (await actPreview(el)) return;
   const g = grp();
   switch (a) {
     case "load-retry":
@@ -147,13 +149,14 @@ export async function act(el, e) {
       reveal(`.cm-tool-h[data-id="${el.dataset.id}"]`);
       break;
     case "chat-confirm": {
+      const card = el.closest && el.closest(".cm-pending");
       el.disabled = true;
       try {
         const r = await api("POST", `/api/chat/pending/${encodeURIComponent(el.dataset.id)}`, { approve: el.dataset.ok === "1" });
         toast(el.dataset.ok === "1" ? (r.status === "done" ? "已执行" : `执行失败：${r.result || ""}`) : "已取消", r.status === "failed");
         await loadChat(state.chatId, true);
         if (state.chat) state.chat.running = true;
-        paintChat(true);
+        await flipRemove(card, $("chat-stream"), () => paintChat(true));
         chatPoll();
       } catch (err) {
         el.disabled = false;
@@ -519,10 +522,9 @@ export async function act(el, e) {
     case "copy":
       try {
         await navigator.clipboard.writeText(el.dataset.link);
+        flashCopied(el, "已复制");
         toast(`${el.dataset.what || "链接"}已复制`);
-      } catch (err) {
-        toast("复制失败，请手动复制", true);
-      }
+      } catch (err) { toast("复制失败，请手动复制", true); }
       break;
     case "ga-edit": {
       const gid = el.dataset.g;
@@ -565,35 +567,12 @@ export async function act(el, e) {
       break;
     case "side-close":
       state.detail = null;
+      ui.sideFlash = true;
       syncHash();
       renderView();
       renderSide();
       break;
-    case "fb": {
-      const { kind, id, v } = el.dataset;
-      const all = myFb();
-      const key = `${kind}:${id}`;
-      const prev = all[key] || null;
-      const next = prev === v ? null : v;
-      try {
-        const r = await api("POST", `/api/${kind}/${encodeURIComponent(id)}/feedback`, { value: next, prev });
-        if (next) all[key] = next;
-        else delete all[key];
-        localStorage.setItem(FB_KEY, JSON.stringify(all));
-        patchView((vw) => {
-          const list = kind === "news" ? (vw.news || []).flatMap((b) => b.items || []) : vw.ideas || [];
-          const it = list.find((x) => String(x.id) === String(id));
-          const nf = r && (r.feedback || (r.up !== undefined ? { up: r.up, down: r.down } : null));
-          if (it && nf) it.feedback = nf;
-        });
-        renderView();
-        refreshDetail();
-        if (next) toast(next === "up" ? "已记录，将增加此类内容" : "已记录，将减少此类内容");
-      } catch (err) {
-        toast(err.message, true);
-      }
-      break;
-    }
+    // "fb"（资讯/构想反馈）在 actions_news.actNews 里处理
     case "idea": {
       const op = el.dataset.op;
       el.disabled = true;
@@ -615,7 +594,7 @@ export async function act(el, e) {
       break;
     }
     case "ask-review": {
-      const gid = el.dataset.gid;
+      const gid = el.dataset.gid, card = el.closest && el.closest(".item");
       if (String(state.g) !== String(gid) || !["admin", "group_admin"].includes((state.me || {}).role)) break;
       const op = el.dataset.op;
       if (!confirm(op === "ignore" ? "忽略这条待复核？原话仍保留，不会再自动处理。" : "转为请求？仍需管理员审批，不会直接开工。")) break;
@@ -626,7 +605,7 @@ export async function act(el, e) {
         if (String(state.g) !== String(gid)) break;
         await loadView(true);
         renderTopBits();
-        renderView();
+        await flipRemove(card, $("view"), () => renderView());
         renderSide();
         toast(op === "ignore" ? "已忽略，原话仍保留" : "已转为请求，等待审批");
       } catch (err) {
@@ -636,13 +615,13 @@ export async function act(el, e) {
       break;
     }
     case "req": {
-      const op = el.dataset.op;
+      const op = el.dataset.op, card = el.closest && el.closest(".item");
       el.disabled = true;
       try {
         await api("POST", `/api/requests/${encodeURIComponent(el.dataset.id)}/${op}`, {});
         await loadView(true);
         renderTopBits();
-        renderView();
+        await flipRemove(card, $("view"), () => renderView());
         renderSide();
         toast(op === "approve" ? "已批准，将通知发起人" : "已拒绝，将通知发起人");
       } catch (err) {
@@ -790,6 +769,7 @@ export async function act(el, e) {
     case "idea-more":
       state.ideaMore = state.ideaMore === Number(el.dataset.id) ? null : Number(el.dataset.id);
       refreshDetail();
+      if (state.ideaMore != null && !calm()) document.querySelector(".idea-menu")?.classList.add("pop-in");
       break;
     case "idea-item": {
       const id = Number(el.dataset.id);
@@ -805,17 +785,16 @@ export async function act(el, e) {
       if (!it) break;
       try {
         await navigator.clipboard.writeText(ideaAsk(it));
+        flashCopied(el, "已复制");
         toast("已复制，请在群内 @MaiBot 并粘贴");
-      } catch (err) {
-        toast("复制失败，请手动复制", true);
-      }
+      } catch (err) { toast("复制失败，请手动复制", true); }
       break;
     }
     case "handoff":
       openHandoff(el.dataset.kind, el.dataset.id);
       break;
     case "handoff-copy":
-      handoffCopy();
+      handoffCopy(el);
       break;
     case "handoff-download":
       handoffDownload();

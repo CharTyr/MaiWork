@@ -35,9 +35,10 @@ import asyncio
 import logging
 import math
 import re
+import threading
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, Sequence
 
 from . import clock
 from .config import Settings, _norm_platform, host_platform
@@ -86,6 +87,136 @@ _AT_QUESTIONS: Dict[str, Any] = {
         },
     }
 }
+
+# 引用回复「构想提一嘴」的意图判断（后台才问；钩子不等）
+_IDEA_REPLY_QUESTIONS: Dict[str, Any] = {
+    "verdict": {
+        "type": "choice",
+        "instructions": "群里有人引用回复了 MaiWork 刚发的「构想提一嘴」（一个构想卡片）。"
+        "最后一条（USER）是这条回复。这条回复是想让 MaiWork 按这个构想开工吗？",
+        "criteria": {
+            "yes": "是让 MaiWork 按这个构想（或其中某个条目）开始做 / 安排 / 派活",
+            "chat": "只是闲聊评价（夸/笑/讨论/说风凉话），不是让它开工",
+        },
+    }
+}
+
+# 「构想提一嘴」回复的快速判词（后台，先匹配再决定问不问 Jev）
+_IDEA_REPLY_REJECT_RE = re.compile(r"算了|不用|别做|不需要|先不(?:要|用|做)|别弄|别搞|不做了?")
+_IDEA_REPLY_YES_RE = re.compile(
+    r"^(?:好|好的|好耶|可以|可|行|ok|嗯|嗯嗯|做|做吧|就做|要做|搞|搞这个|安排|上|弄|来吧|走起|整|整一个|要|要得|麻烦|谢谢|辛苦了)"
+    r"(?:[，,、\s]*(?:做|就做|要做|搞|弄|要|安排|来)?\s*第\s*[0-9０-９]+\s*[个项条])?(?:[啊呀吧呢哦呗啦哇!！。.,，~～\s]*)$",
+    re.IGNORECASE,
+)
+_IDEA_REPLY_MAX_TEXT = 24  # 超过这个长度当长句，不算「短肯定句」，转给 Jev
+
+
+def _raw_segments(raw: Any) -> list[dict]:
+    """把宿主 raw_message（列表或 seglist 嵌套字典）拍平成段列表；纯字符串返回 []。"""
+    if isinstance(raw, dict):
+        if raw.get("type") == "seglist" and isinstance(raw.get("data"), list):
+            out: list[dict] = []
+            for item in raw["data"]:
+                out.extend(_raw_segments(item))
+            return out
+        return [raw] if "type" in raw else []
+    if isinstance(raw, list):
+        out = []
+        for item in raw:
+            out.extend(_raw_segments(item))
+        return out
+    return []
+
+
+def _clean_idea_reply_text(text: str, message: dict | None = None) -> str:
+    """提取群友引用回复的正文：剔除宿主拼在前面的 `[reply]<被引用全文>` 与 `@机器人`。"""
+    segs = _raw_segments(message.get("raw_message")) if isinstance(message, dict) else []
+    if segs:
+        parts: list[str] = []
+        for seg in segs:
+            if seg.get("type") == "text":
+                data = seg.get("data")
+                val = data.get("text") if isinstance(data, dict) else data
+                if val is not None:
+                    parts.append(str(val))
+        s = "".join(parts)
+    else:
+        s = re.sub(r"\[CQ:(?:reply|at),[^\]]*\]", "", str(text or ""))
+        if s.lstrip().startswith("[reply]"):
+            s = re.sub(r"^\s*\[reply\][\s\S]*?(?:@[^\s]+(?:\s+|$))+", "", s)
+    return re.sub(r"^(?:\s*@[^\s]+(?:\s+|$))+", "", s).strip()
+
+
+class _IdeaMentionIndex:
+    """构想提一嘴（idea_mentions）的内存索引：`(group_id, str(message_id)) -> dict`。
+
+    只含 `status='sent'` 且 `message_id != ''` 的行；每群 60 秒懒刷新（同 CardIndex 模式）。
+    命中后值里有：idea_id / title / target_user_id / items（构想 items，parse_idea_items 规整过）。
+    """
+
+    _TTL_S = 60.0
+
+    def __init__(self) -> None:
+        self._cache: dict[str, tuple[float, dict[str, dict]]] = {}
+        self._lock = threading.Lock()
+        self._generation = 0
+
+    def lookup(self, store: Any, group_id: str, message_id: str, now: float | None = None) -> dict | None:
+        """(群, 引用的消息 id) → 构想行；miss → None。出错一律当没命中。"""
+        gid = str(group_id)
+        mid = str(message_id or "").strip()
+        if not mid:
+            return None
+        with self._lock:
+            cached = self._cache.get(gid)
+            hit = cached[1].get(mid) if cached else None
+            return dict(hit) if hit else None
+
+    def register(self, gid: str, mid: str, hit: dict) -> None:
+        with self._lock:
+            cached_at, previous = self._cache.get(str(gid), (0.0, {}))
+            table = dict(previous)
+            table[str(mid)] = dict(hit)
+            self._cache[str(gid)] = (cached_at, table)
+            self._generation += 1
+
+    def refresh(self, store: Any, gid: str, now: float) -> None:
+        with self._lock:
+            cached = self._cache.get(str(gid))
+            if cached and now - cached[0] < self._TTL_S:
+                return
+            generation = self._generation
+        table = self._load(store, str(gid), now)
+        with self._lock:
+            if generation != self._generation:
+                current = self._cache.get(str(gid))
+                if current:
+                    table.update(current[1])
+            self._cache[str(gid)] = (now, table)
+
+    @staticmethod
+    def _load(store: Any, gid: str, now: float) -> dict[str, dict]:
+        from .feeds import parse_idea_items
+
+        out: dict[str, dict] = {}
+        rows = store.read().execute(
+            "SELECT m.message_id, m.idea_id, i.title, COALESCE(i.target_user_id,'') AS tuid, i.items"
+            " FROM idea_mentions m LEFT JOIN ideas i ON i.id=m.idea_id"
+            " WHERE m.group_id=? AND m.status='sent' AND m.message_id!=''"
+            " AND COALESCE(m.sent_ts,m.created)>=?",
+            (gid, now - 30 * 86400),
+        ).fetchall()
+        for r in rows:
+            mid = str(r["message_id"] or "").strip()
+            if not mid:
+                continue
+            out[mid] = {
+                "idea_id": int(r["idea_id"]) if r["idea_id"] is not None else 0,
+                "title": str(r["title"] or ""),
+                "target_user_id": str(r["tuid"] or ""),
+                "items": parse_idea_items(r["items"]) if "items" in r.keys() else [],
+            }
+        return out
 
 _CONFIDENCE_MIN = 0.6
 # 「准备 / 盯着」直接建待批要更有把握：线上有条玩笑请求以 0.61 混了进去（2026-09-30）。
@@ -267,6 +398,8 @@ class Intake:
         from .news_feedback import CardIndex
 
         self._card_index = CardIndex()
+        # 构想提一嘴（idea_mentions）的内存索引：引用回复命中 → 直接转派活
+        self._idea_mention_index = _IdeaMentionIndex()
         # 提问的回答恢复（docs/02 §7.2）：waiting_tasks(群号) 给缓存的
         # [(task_id, question_msg_id, requester_id)]（app 提供，30 秒一刷）；
         # 命中后 spawn on_answer(group_id, task_id, text)（app 挂 coordinator.resume）
@@ -408,6 +541,13 @@ class Intake:
         is_bot = bool(bot_id and user_id and user_id == bot_id)
         context = self._ring_context(group_id)
         self._ring_add(group_id, "MaiBot" if is_bot else (user_name or user_id), text, message_id, is_bot)
+        # 定向备忘要认「最后一条消息是谁发的」：<message> 标签只有昵称没有 user_id，
+        # 所以钩子侧把 message_id→user_id 记进 Mentions 的纯内存表（零 I/O）。
+        if not is_bot and message_id and user_id and self._mentions is not None:
+            try:
+                self._mentions.note_msg_user(group_id, message_id, user_id)
+            except Exception:
+                pass
         # 1) 机器人自己发的：只记信号，不当请求
         if is_bot:
             return
@@ -429,20 +569,66 @@ class Intake:
         #      查卡片 + 写库放后台线程（独立短连接），钩子和共享事件循环都不等它
         if self._store is not None:
             reply_to = _reply_to_of(message)
+            if reply_to:
+                self._card_reply_memo(group_id, user_id, message_id, reply_to)
             if reply_to and self._feedback_inflight < _FEEDBACK_INFLIGHT_MAX:
                 at = _ts_of(message.get("timestamp")) or clock.now()
                 self._feedback_inflight += 1
                 _spawn_safely(self._spawn, self._record_feedback(group_id, user_id, message_id, reply_to, at))
         # 2.6) 话头火花（docs/18 §十一）：群里明显在为难 / 想要的话头，记一笔内存火花
         #      （零库写、零模型）。@ 机器人的是派活请求，走下面那条路，不算话头。
+        #      原话脱敏后留给构想轮引（feeds.note_spark kwargs；老的两位签名回调退回不带）。
         if self._on_spark is not None and not (
             bool(message.get("is_at")) or bool(message.get("is_mentioned"))
         ):
             try:
                 if idea_spark(text):
-                    self._on_spark(group_id, _ts_of(message.get("timestamp")) or clock.now())
+                    spark_ts = _ts_of(message.get("timestamp")) or clock.now()
+                    try:
+                        self._on_spark(
+                            group_id, spark_ts,
+                            user_id=str(user_id), user_name=str(user_name or ""),
+                            text=text, message_id=message_id,
+                        )
+                    except TypeError:
+                        # 老回调只收 (gid, ts)（测试里常见的两位 lambda）
+                        self._on_spark(group_id, spark_ts)
             except Exception:
                 logger.debug("记话头火花出错（群 %s），已吞掉", group_id, exc_info=True)
+        # 3.5) 引用回复「构想提一嘴」→ 直接派活（必须在 _handle_at 之前：
+        #      QQ 引用机器人消息会自动带 @ 使 is_at=True，不先拦住会被当成普通派活再判一遍）。
+        #      个人向构想的隐私门禁在钩子里判（命中与否、能不能回话点破），后台才碰 Jev/建单。
+        if self._store is not None:
+            reply_to = _reply_to_of(message)
+            if reply_to:
+                hit = self._idea_mention_index.lookup(self._store, group_id, reply_to)
+                if hit is not None:
+                    skip = getattr(self._session_gate, "skip_message", None)
+                    if callable(skip):
+                        try:
+                            skip(platform, group_id, message_id)
+                        except Exception:
+                            pass
+                    target = str(hit.get("target_user_id") or "")
+                    allowed = True
+                    if target and str(user_id) != target:
+                        try:
+                            allowed = bool(
+                                self._approvals is not None
+                                and self._approvals.is_admin(str(user_id), platform, group_id=group_id)
+                            )
+                        except Exception:
+                            allowed = False
+                    if not allowed:
+                        # 别人的个人向构想：静默忽略，绝不在群里回话点破
+                        return
+                    _spawn_safely(
+                        self._spawn,
+                        self._handle_idea_mention_reply(
+                            settings, group_id, user_id, user_name, message_id, text, hit, message=message
+                        ),
+                    )
+                    return
         if self._session_gate is not None and self._session_gate.intake({
             "group_id": group_id, "platform": platform, "user_id": user_id,
             "text": text, "message": message}, self._spawn):
@@ -457,6 +643,81 @@ class Intake:
         if (bool(message.get("is_at")) or bool(message.get("is_mentioned"))) and not _is_command(text):
             await self._handle_at(settings, group_id, user_id, user_name, message_id, text, context)
 
+    async def refresh_reply_indexes(self, group_id: str, now: float | None = None) -> None:
+        """启动和后台 tick 预热；独立只读连接在线程中查库，接收钩子不调用。"""
+        gid = str(group_id)
+        if self._store is None or not self._get_settings().is_served(gid):
+            return
+        moment = clock.now() if now is None else float(now)
+        last = getattr(self, "_reply_refresh_at", {})
+        if gid in last and moment - last[gid] < 60:
+            return
+        self._reply_refresh_at = {**last, gid: moment}
+        path = getattr(self._store, "path", None)
+        if path is None:
+            return
+        def work():
+            from .store import Store
+            st = Store(path)
+            try:
+                self._card_index._cards(st, gid, moment)
+                self._idea_mention_index.refresh(st, gid, moment)
+            finally:
+                st.close()
+        try:
+            await asyncio.to_thread(work)
+        except Exception:
+            self._reply_refresh_at.pop(gid, None)
+            logger.debug("刷新引用消息索引失败（群 %s）", gid, exc_info=True)
+
+    def on_delivery_result(self, info: dict) -> None:
+        """发送成功时增量登记，下一条群友回复即可命中；不等待下一次刷新。"""
+        if info.get("outcome") != "sent" or self._store is None:
+            return
+        gid = str(info.get("group_id") or "")
+        if not self._get_settings().is_served(gid):
+            return
+        mid = str((info.get("result") or {}).get("message_id") or "")
+        key = str(info.get("key") or "")
+        if not mid:
+            return
+        match = re.fullmatch(r"(news_card|idea_mention):([0-9]+)(?::fallback)?", key)
+        if not match:
+            return
+        conn = self._store.read()
+        if match[1] == "news_card":
+            import json
+            row = conn.execute("SELECT item_ids FROM news_cards WHERE id=? AND group_id=?", (int(match[2]), gid)).fetchone()
+            if row is None:
+                return
+            ids = json.loads(row["item_ids"] or "[]")
+            entries = []
+            for iid in ids[:3]:
+                item = conn.execute("SELECT id,title,summary FROM news_items WHERE id=? AND group_id=?", (int(iid), gid)).fetchone()
+                if item:
+                    entries.append({"id": int(item["id"]), "title": str(item["title"] or ""), "summary": str(item["summary"] or "")[:60]})
+            self._card_index.register(gid, mid, entries, float(info.get("ts") or clock.now()))
+        else:
+            from .feeds import parse_idea_items
+            row = conn.execute(
+                "SELECT i.id,i.title,i.target_user_id,i.items FROM idea_mentions m JOIN ideas i ON i.id=m.idea_id"
+                " WHERE m.id=? AND m.group_id=? AND i.group_id=?", (int(match[2]), gid, gid),
+            ).fetchone()
+            if row:
+                self._idea_mention_index.register(gid, mid, {"idea_id": int(row["id"]), "title": str(row["title"] or ""),
+                    "target_user_id": str(row["target_user_id"] or ""), "items": parse_idea_items(row["items"])})
+
+    def _card_reply_memo(self, group_id: str, user_id: str, message_id: str, reply_to: str) -> None:
+        entries = self._card_index.cached_entries(group_id, reply_to)
+        if not entries or self._mentions is None:
+            return
+        bits = [f"「{e.get('title') or ''}」{str(e.get('summary') or '')[:60]}" for e in entries[:3]]
+        self._mentions.add_ephemeral(
+            group_id, "群友刚引用了本群资讯卡片（含：" + "；".join(bits)[:180]
+            + "），请结合卡片内容回答，勿编造卡片外细节。",
+            key=f"card-reply:{message_id}", ttl_s=90.0, turns=2, target_user_id=str(user_id),
+        )
+
     async def _record_feedback(
         self, group_id: str, user_id: str, message_id: str, reply_to: str, at: float
     ) -> None:
@@ -470,12 +731,15 @@ class Intake:
                 return
             index = self._card_index
 
-            def work() -> None:
+            def work() -> list[dict] | None:
                 from .store import Store
 
                 st = Store(path)
                 try:
+                    # 命中卡片 → 把卡片上的条目带回来（备忘要用标题摘要），再照旧记反馈
+                    entries = index.entries_for(st, group_id, reply_to, at)
                     index.on_message(st, group_id, user_id, message_id, reply_to, at)
+                    return entries
                 finally:
                     st.close()
 
@@ -532,7 +796,7 @@ class Intake:
             return
         task_id = ""
         # 规则 1：回复了那条提问（消息里有引用段时）
-        reply_to = _parse_reply_to(message.get("raw_message"))
+        reply_to = _reply_to_of(message)
         if reply_to:
             for tid, qmid, rid in waiting:
                 qmid_s = str(qmid or "").strip()
@@ -551,7 +815,7 @@ class Intake:
                         task_id = str(tid)
                         break
         # 规则 2：请求人 @ 机器人 + 这个群里只有一个等待任务
-        if not task_id and (bool(message.get("is_at")) or bool(message.get("is_mentioned"))):
+        if not task_id and not reply_to and (bool(message.get("is_at")) or bool(message.get("is_mentioned"))):
             # 按任务数，不按提问条数：同一个任务可能有原提问 + 提醒两条（2026-10-10）
             mine = {str(t[0]) for t in waiting if str(t[2] or "") == str(user_id)}
             if len(mine) == 1:
@@ -611,6 +875,20 @@ class Intake:
         if not self._feature(group_id, "task"):
             logger.info("本群任务功能已关闭，这条 @ 不派活（群 %s 消息 %s）", group_id, message_id)
             return
+        # @ 还没判完这几秒，别让 MaiBot 替我们接话承诺交付：塞一条纯内存临时备忘
+        # （15 秒 / 1 轮，定向本人），判完 _judge_at 的 finally 里撤掉、正式备忘接棒。
+        if self._mentions is not None:
+            try:
+                self._mentions.add_ephemeral(
+                    group_id,
+                    "MaiWork 正在后台判断这条 @ 是否为派活或目标（约数秒），请先自然简短接话，不要替自己承诺稍后提交文件或报告。",
+                    key=f"request:at-{message_id}",
+                    ttl_s=15.0,
+                    turns=1,
+                    target_user_id=str(user_id),
+                )
+            except Exception:
+                pass
         # 落库必须在钩子里（本地短事务 + 有界等锁；写不进就落 spool）：
         # 宿主超时掐断 / 插件重载都不丢这条 @
         spool_key = self._record(group_id, user_id, user_name, message_id, text, "收到 @，等判断")
@@ -739,6 +1017,14 @@ class Intake:
         except Exception:
             logger.exception("后台问 Jev 出错（群 %s，消息 %s）", group_id, message_id)
             self._fail(group_id, message_id, "后台问 Jev 出错")
+        finally:
+            # 判完了：撤掉那条「正在判断」的临时防抢答备忘（成了请求 / 提醒的，
+            # 正式的 request:R-x / 提醒备忘会自动接棒）。
+            if self._mentions is not None:
+                try:
+                    self._mentions.drop_ephemeral(group_id, f"request:at-{message_id}")
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # 派活判断兜底（quick_judge）：Jev 不在 / 拿不准时的第二条快路
@@ -905,6 +1191,8 @@ class Intake:
             f"可以只简短说一句「好，交给它了」，也可以不回。",
             key=f"request:{res['id']}",
             ttl_s=_REQUEST_MENTION_TTL_S,
+            target_user_id=str(user_id),
+            keywords=[str(res["id"]), str(text or "")[:60]],
         )
         return True
 
@@ -1115,6 +1403,133 @@ class Intake:
                 group_id, message_id,
             )
 
+    async def _handle_idea_mention_reply(
+        self,
+        settings: Settings,
+        group_id: str,
+        user_id: str,
+        user_name: str,
+        message_id: str,
+        text: str,
+        hit: dict,
+        *,
+        message: dict | None = None,
+    ) -> None:
+        """群友引用回复「构想提一嘴」：判出「采纳执行」→ 按这条构想建待批请求。
+
+        后台任务（钩子里只做了命中判断和隐私门禁，零阻塞）。拒绝词快速退出；
+        短肯定句直接算「要做」；其余问 Jev；Jev 不在又说不清 → 当闲聊，
+        只塞一条 30 秒纯内存备忘让 MaiBot 顺聊，绝不自己乱建单。
+        """
+        clean = _clean_idea_reply_text(text, message)
+        # 0) 显式拒绝：算了 / 不用 / 别做…… → 什么都不做
+        if _IDEA_REPLY_REJECT_RE.search(clean):
+            return
+        # 1) 短肯定句（≤24 字、以肯定词开头，或点名「第 N 个」）→ 不问 Jev
+        affirmative = len(clean) <= _IDEA_REPLY_MAX_TEXT and bool(
+            _IDEA_REPLY_YES_RE.fullmatch(clean)
+        )
+        verdict = ""
+        if affirmative:
+            verdict = "yes"
+        else:
+            jev = self._jev
+            if jev is not None:
+                try:
+                    available = bool(jev.available())
+                except Exception:
+                    available = False
+                if available:
+                    try:
+                        timeout_ms = min(
+                            _JEV_BG_WAIT_MAX_MS,
+                            max(100, int(getattr(getattr(settings, "jev", None), "timeout_ms", 1500) or 1500)),
+                        )
+                        answers = await _bounded(
+                            jev.ask(
+                                [
+                                    {"speaker": "MaiWork", "text": f"构想提一嘴：{hit.get('title') or ''}"},
+                                    {"speaker": "USER", "text": clean[:_STATE_TEXT_MAX]},
+                                ],
+                                _IDEA_REPLY_QUESTIONS,
+                                purpose="intake",
+                                group_id=group_id,
+                                timeout_ms=timeout_ms,
+                            ),
+                            _JEV_BG_WAIT_MAX_MS / 1000.0,
+                        )
+                        raw = answers.get("verdict") if isinstance(answers, dict) else None
+                        if isinstance(raw, (tuple, list)) and len(raw) >= 3:
+                            label, conf = str(raw[0]), raw[2]
+                            try:
+                                conf_f = float(conf)
+                            except (TypeError, ValueError):
+                                conf_f = 0.0
+                            if label == "yes" and conf_f >= _CONFIDENCE_MIN:
+                                verdict = "yes"
+                    except Exception:
+                        logger.debug("问 Jev（构想提一嘴回复）出错（群 %s），这次当闲聊", group_id, exc_info=True)
+        # 2) 闲聊评价 / 判不出 → 不建单，塞一条 30 秒纯内存备忘让 MaiBot 顺聊
+        if verdict != "yes":
+            if self._mentions is not None:
+                try:
+                    self._mentions.add_ephemeral(
+                        group_id,
+                        f"群友刚回复了 MaiWork 发的构想提一嘴「{str(hit.get('title') or '')[:40]}」，"
+                        "看起来是闲聊评价不是派活；可以顺着聊，不用帮 MaiWork 答应做任何事。",
+                        key=f"idea-reply:{message_id}",
+                        ttl_s=30.0,
+                        turns=1,
+                        target_user_id=str(user_id),
+                    )
+                except Exception:
+                    pass
+            return
+        # 3) 确认要做 → 解析子条目序号（「做第 2 个」→ items=[2]；没点名 → None=全部），
+        #    复用 _create_idea_request（审批 / 回执 / 防重全继承）
+        if not (self._feature(group_id, "idea") and self._feature(group_id, "task")):
+            logger.info("本群构想或任务功能已关，这条构想回复不建单（群 %s 消息 %s）", group_id, message_id)
+            return
+        idea_id = int(hit.get("idea_id") or 0)
+        if idea_id <= 0:
+            return
+        idea = {"id": idea_id, "title": str(hit.get("title") or "构想"), "state": "new", "wanted": None}
+        # 从库里补 icon / state（命中行没带）；读不到就按 new 走
+        try:
+            row = self._store.read().execute(
+                "SELECT icon, state FROM ideas WHERE id=? AND group_id=?", (idea_id, str(group_id))
+            ).fetchone()
+            if row is not None:
+                idea["icon"] = str(row["icon"] or "package")
+                idea["state"] = str(row["state"] or "new")
+        except Exception:
+            logger.debug("补构想状态失败（群 %s 构想 %s），按 new 走", group_id, idea_id, exc_info=True)
+        idea["wanted"] = self._idea_reply_items(clean)
+        await self._create_idea_request(group_id, idea, user_id, user_name, message_id, clean)
+
+    @staticmethod
+    def _idea_reply_items(text: str) -> list[int] | None:
+        """从回复里点子条目的序号：「做第 2 个」→ [2]；没点名 → None（全部条目）。
+
+        先试 `parse_idea_wanted`（「要做：1、3」显式语法），没有再兜底认裸数字串
+        （去重、≤24 个）——回复里出现数字基本都是点条目序号。
+        """
+        explicit = parse_idea_wanted(text)
+        if explicit is not None:
+            return explicit
+        value = str(text or "").translate(_FULLWIDTH_DIGITS).strip()
+        selected = re.findall(r"第\s*([0-9]+)\s*[个项条]", value)
+        if not selected and re.fullmatch(r"[0-9]+(?:[\s、,，/]+[0-9]+)*", value):
+            selected = re.findall(r"[0-9]+", value)
+        nums: list[int] = []
+        for chunk in selected:
+            n = int(chunk)
+            if n > 0 and n not in nums:
+                nums.append(n)
+            if len(nums) >= _IDEA_ITEM_NO_MAX:
+                break
+        return nums or None
+
     def _idea_of(self, group_id: str, text: str) -> dict | None:
         """消息里带「构想 #N」且这条构想属于本群 → 构想行（dict，带 wanted）；否则 None。
 
@@ -1197,6 +1612,8 @@ class Intake:
             f"可以只简短说一句「好，交给它了」，也可以不回。",
             key=f"request:{res['id']}",
             ttl_s=_REQUEST_MENTION_TTL_S,
+            target_user_id=str(user_id),
+            keywords=[str(res["id"]), title[:40]],
         )
 
     # ------------------------------------------------------------------
@@ -1302,12 +1719,24 @@ class Intake:
             logger.debug("读 pending_asks 失败", exc_info=True)
             return []
 
-    def _add_mention(self, group_id: str, text: str, *, key: str, ttl_s: float) -> None:
+    def _add_mention(
+        self,
+        group_id: str,
+        text: str,
+        *,
+        key: str,
+        ttl_s: float,
+        target_user_id: str = "",
+        keywords: Sequence[str] | str = "",
+    ) -> None:
         mentions = self._mentions
         if mentions is None:
             return
         try:
-            mentions.add(group_id, text, key=key, ttl_s=ttl_s)
+            mentions.add(
+                group_id, text, key=key, ttl_s=ttl_s,
+                target_user_id=target_user_id, keywords=keywords,
+            )
         except Exception:
             logger.exception("写可提起清单出错（群 %s，key %s）", group_id, key)
 

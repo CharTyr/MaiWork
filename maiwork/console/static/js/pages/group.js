@@ -21,9 +21,9 @@ function topicItem(s, i) {
       ${ico(opened ? "speech" : "hourglass")}
       <div>
         <h3 class="item-title">${esc(span)} · ${opened ? "已开启话题" : "未开启话题"}</h3>
-        <p class="item-body soft">已静默 ${esc(dur(t.quiet_s))}${t.usual_gap_s ? `（平时约 ${esc(dur(t.usual_gap_s))}一条消息）` : ""}。${esc(times)}Jev：${esc(judgeText(t))}${j && j.detail ? `（${esc(j.detail)}）` : ""}。${t.pick && t.pick.title && opened ? `选用「${esc(t.pick.title)}」。` : ""}</p>
+        ${gadmin() ? `<p class="item-body soft">已静默 ${esc(dur(t.quiet_s))}${t.usual_gap_s ? `（平时约 ${esc(dur(t.usual_gap_s))}一条消息）` : ""}。${esc(times)}Jev：${esc(judgeText(t))}${j && j.detail ? `（${esc(j.detail)}）` : ""}。${t.pick && t.pick.title && opened ? `选用「${esc(t.pick.title)}」。` : ""}</p>` : ""}
         ${opened ? `<div class="opener">${esc(t.opener)}</div>` : ""}
-        ${opened ? `<div class="status"><span class="dot ${r && r.replies ? "used" : ""}"></span><span class="status-text">${r ? (r.replies ? `${r.replies} 人回应${r.followups ? `，MaiBot 回复 ${r.followups} 句` : ""}` : "无人回应，将延长下次间隔") : "等待回应"}</span></div>` : ""}
+        ${opened ? `<div class="status"><span class="dot ${r && r.replies ? "used" : ""}"></span><span class="status-text">${r ? (r.replies ? `${r.replies} 句回应${r.active_users ? `（${r.active_users} 人参与）` : ""}${r.on_topic ? `，${r.on_topic} 句切题` : ""}${r.followups ? `，MaiBot 回复 ${r.followups} 句` : ""}` : "无人回应，将延长下次间隔") : "等待回应"}</span></div>` : ""}
         ${
           gadmin()
             ? `<div class="verdict">判断是否正确？
@@ -226,9 +226,26 @@ export function viewGroup(g, v) {
   }
   const log = v.topic_log || [];
   html += `<h2 class="h-sub">话题记录</h2>`;
-  const today = daySummary(log, (ts) => dayIndex(ts) === dayIndex(now()));
+  const all = stretches(log);
+  const openers = all.filter((s) => s.opened);
+  const skipped = all.filter((s) => !s.opened);
+  const today = gadmin() ? daySummary(log, (ts) => dayIndex(ts) === dayIndex(now()))
+    : openers.length ? `今日开启话题 ${openers.filter((s) => dayIndex(s.rep.ts) === dayIndex(now())).length} 次` : "";
   if (today) html += `<p class="h-meta">${esc(today)}</p>`;
-  html += log.length ? stretches(log).map((s, k) => topicItem(s, k)).join("") : `<p class="h-meta">暂无</p>`;
+  if (!log.length) {
+    html += `<p class="h-meta">暂无</p>`;
+  } else {
+    if (gadmin()) {
+      // 管理员看得到「没开启成话题」的 Jev 判断记录（收在 details 里不打扰）
+      html += openers.length ? openers.map((s, k) => topicItem(s, k)).join("") : "";
+      if (skipped.length)
+        html += `<details class="disc"><summary>${skipped.length} 条没开启成话题的判断</summary>` + skipped.map((s, k) => topicItem(s, k + openers.length)).join("") + `</details>`;
+      if (!openers.length && !skipped.length) html += `<p class="h-meta">暂无</p>`;
+    } else {
+      // 群友只看「开起来了的话题」，看不到 Jev 跳过的判断
+      html += openers.length ? openers.map((s, k) => topicItem(s, k)).join("") : `<p class="h-meta">暂无</p>`;
+    }
+  }
   html += ctxBlock(g);
   html += `<h2 class="h-sub">群画像</h2>`;
   html += profileSection(v);

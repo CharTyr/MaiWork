@@ -12,7 +12,7 @@ import { loadIdentity } from "./settings/identity.js";
 import { loadModels } from "./settings/models.js";
 import { loadLogSummary } from "./settings/logs.js";
 import { loadAttention } from "./settings/attention.js";
-import { closeSheet, openSheet, repaintSheet } from "./sheet.js";
+import { closeSheet, openSheet, repaintSheet, resetSheet } from "./sheet.js";
 import { enterChat, loadChat } from "./chat.js";
 import { render, renderRail, renderSide, renderTabbar, renderTop, renderView } from "./render.js";
 import { maybeOnboard, openOnboarding } from "./onboarding.js";
@@ -56,6 +56,13 @@ export function parseHash() {
   return { ref: decodeURIComponent(parts[0] || ""), tab, id: decodeURIComponent(parts[2] || "") };
 }
 
+function resetNewsFilters() {
+  clearTimeout(state._newsQTimer);
+  state.newsQ = "";
+  state.newsTopic = "";
+  state.newsComposing = false;
+}
+
 export function applyHash() {
   const h = parseHash();
   state.page = h.settings && admin() ? "settings" : h.chat && admin() ? "chat" : h.board && admin() ? "board" : null;
@@ -63,11 +70,15 @@ export function applyHash() {
   if (h.settings) state.setSub = SET_SUBS.some((x) => x[0] === h.sub) ? h.sub : "overview";
   if (TABS.some((x) => x.id === h.tab)) state.tab = h.tab;
   if (gadmin()) {
+    const prev = state.g;
     const hit = state.groups.find((x) => x.id === h.ref || x.token === h.ref);
     state.g = hit ? hit.id : state.g && state.groups.some((x) => x.id === state.g) ? state.g : state.groups.length ? state.groups[0].id : null;
+    // 切群后资讯页的主题 / 搜索条件清零（§4.3）
+    if (prev !== state.g) resetNewsFilters();
   }
   if (!h.chat && !h.settings && !h.board && h.id) state.detail = { type: /^G-/.test(h.id) ? "goal" : /^I-/.test(h.id) ? "idea" : "task", id: h.id };
   else state.detail = null;
+  if (!state.detail) resetSheet();
 }
 
 async function loadMe() {
@@ -146,6 +157,8 @@ export async function retryLoad(el) {
 }
 
 export async function reboot() {
+  resetSheet();
+  resetNewsFilters();
   resetSocial();
   state.loadErr = {};
   state.view = null;
@@ -245,6 +258,7 @@ export function go(patch) {
   const gChanged = patch.g && patch.g !== state.g;
   Object.assign(state, patch);
   if (gChanged) {
+    resetNewsFilters();
     state.view = null;
     if (state.loadErr) delete state.loadErr.view; // 上一个群的失败不带到新群
   }

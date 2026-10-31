@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 from typing import Any, Awaitable, Callable
 
 from . import clock
@@ -107,45 +108,110 @@ def record(
 
 
 class CardIndex:
-    """群 → {卡片消息编号: [条目]}，60 秒最多刷一次（按群）。"""
+    """群 → {卡片消息编号: [{id,title,summary}]}，60 秒最多刷一次（按群）。
+
+    缓存值从纯 id 列表扩成 dict 条目（design §2.1 子项3）：群友引用卡片追问时，
+    备忘要带上「含：标题摘要」让 MaiBot 结合卡片内容回答。
+    """
 
     def __init__(self) -> None:
-        self._cache: dict[str, tuple[float, dict[str, list[int]]]] = {}
+        self._cache: dict[str, tuple[float, dict[str, list[dict]]]] = {}
+        self._lock = threading.Lock()
+        self._generation = 0
 
-    def _cards(self, store: Any, gid: str, now: float) -> dict[str, list[int]]:
-        hit = self._cache.get(gid)
-        if hit is not None and now - hit[0] < _CARD_CACHE_S:
-            return hit[1]
-        out: dict[str, list[int]] = {}
+    def cached_entries(self, group_id: Any, reply_to: Any) -> list[dict] | None:
+        """钩子只读内存，不刷新、不查库；返回独立快照。"""
+        with self._lock:
+            hit = self._cache.get(str(group_id))
+            entries = hit[1].get(str(reply_to)) if hit else None
+            return [dict(e) for e in entries] if entries else None
+
+    def register(self, group_id: Any, message_id: Any, entries: list[dict], now: float) -> None:
+        if not str(message_id or ""):
+            return
+        with self._lock:
+            cached_at, previous = self._cache.get(str(group_id), (0.0, {}))
+            table = dict(previous)
+            table[str(message_id)] = [dict(e) for e in entries]
+            self._cache[str(group_id)] = (cached_at, table)
+            self._generation += 1
+
+    def _cards(self, store: Any, gid: str, now: float) -> dict[str, list[dict]]:
+        with self._lock:
+            hit = self._cache.get(gid)
+            if hit is not None and now - hit[0] < _CARD_CACHE_S:
+                return hit[1]
+            generation = self._generation
+        out: dict[str, list[dict]] = {}
         rows = store.read().execute(
             "SELECT message_id, item_ids FROM news_cards WHERE group_id=? AND status IN ('sent','uncertain')"
             " AND message_id!='' AND COALESCE(sent_ts, created)>=?",
             (gid, now - _CARD_DAYS * 86400.0),
         ).fetchall()
+        # 先把这一批卡片上的条目 id 全收齐，一次带出标题 / 摘要（别逐卡查库）
+        all_ids: list[int] = []
+        per_card: dict[str, list[int]] = {}
         for r in rows:
             try:
                 ids = [int(x) for x in json.loads(r["item_ids"] or "[]")]
             except (ValueError, TypeError):
                 ids = []
+            ids = [i for i in ids if i > 0]
             if ids:
-                out[str(r["message_id"])] = ids
-        self._cache[gid] = (now, out)
+                per_card[str(r["message_id"])] = ids
+                for i in ids:
+                    if i not in all_ids:
+                        all_ids.append(i)
+        titles: dict[int, tuple[str, str]] = {}
+        if all_ids:
+            try:
+                placeholders = ",".join("?" for _ in all_ids)
+                for it in store.read().execute(
+                    f"SELECT id, title, summary FROM news_items WHERE id IN ({placeholders})", all_ids
+                ).fetchall():
+                    titles[int(it["id"])] = (str(it["title"] or ""), str(it["summary"] or "")[:60])
+            except Exception:
+                logger.debug("查卡片条目标题摘要失败（群 %s），标题就空着", gid, exc_info=True)
+        for mid, ids in per_card.items():
+            out[mid] = [
+                {"id": i, "title": titles.get(i, ("", ""))[0], "summary": titles.get(i, ("", ""))[1]}
+                for i in ids
+            ]
+        with self._lock:
+            if generation != self._generation:
+                # 查询期间发送成功的增量登记不能被较早的数据库快照覆盖。
+                current = self._cache.get(gid)
+                if current:
+                    out.update(current[1])
+            self._cache[gid] = (now, out)
         return out
+
+    def entries_for(self, store: Any, group_id: Any, reply_to: Any, now: float) -> list[dict] | None:
+        """这个「回复的卡片消息编号」对应卡片上的条目列表；不是卡片 → None。永不抛。"""
+        try:
+            rid = str(reply_to or "").strip()
+            if not rid:
+                return None
+            entries = self._cards(store, str(group_id), float(now)).get(rid)
+            return list(entries) if entries else None
+        except Exception:
+            logger.debug("查资讯卡片条目失败（群 %s）", group_id, exc_info=True)
+            return None
 
     def on_message(self, store: Any, group_id: Any, user_id: Any, message_id: Any, reply_to: Any, now: float) -> int:
         """收到一条群消息：回复的是资讯卡片 → 给卡片上每条记 reply；返回记了几条。永不抛。"""
         try:
-            rid = str(reply_to or "").strip()
-            if not rid:
-                return 0
             gid = str(group_id)
-            ids = self._cards(store, gid, float(now)).get(rid)
-            if not ids:
+            entries = self.entries_for(store, gid, reply_to, now)
+            if not entries:
                 return 0
-            w = WEIGHTS["reply"] / len(ids)
+            w = WEIGHTS["reply"] / len(entries)
             actor = actor_hash(gid, user_id)
             n = 0
-            for iid in ids:
+            for e in entries:
+                iid = int(e.get("id") or 0)
+                if iid <= 0:
+                    continue
                 if record(store, gid, iid, "reply", actor=actor, message_id=str(message_id or ""), weight=w, now=now):
                     n += 1
             return n

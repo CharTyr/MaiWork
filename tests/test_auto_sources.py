@@ -565,6 +565,95 @@ class TestSubscribeGate:
         assert auto_sources.count_origin(store, GID, "map") == 0
 
 
+class TestFailureCooldown:
+    async def _fail(self, store, ts, *, direct=True, gid=GID):
+        return await auto_sources.subscribe_label(
+            store, gid, "dead.example.com", origin="trusted", now=ts,
+            url_hint="https://dead.example.com/feed" if direct else "",
+            transport=_transport({}),
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("direct", [False, True], ids=["discover", "check"])
+    async def test_trial_failures_across_three_beijing_days_cool_for_thirty_days(
+        self, store, monkeypatch, direct,
+    ):
+        # 前两次只隔两分钟、UTC 日期相同，但跨北京时间午夜，不能被日志去重吞掉。
+        first = clock.bj(NOW).replace(hour=23, minute=59, second=0, microsecond=0).timestamp()
+        for ts in (first, first + 120):
+            assert not (await self._fail(store, ts, direct=direct))["ok"]
+            assert auto_sources.rejected_list(store, GID) == []
+        third = first + DAY + 120
+        assert not (await self._fail(store, third, direct=direct))["ok"]
+        rejected = auto_sources.rejected_list(store, GID)
+        assert len(rejected) == 1
+        assert rejected[0]["reason"].startswith("连续试取失败：")
+        assert rejected[0]["ts"] == third
+        assert len(auto_sources.load_log(store, GID)) == 3
+        monkeypatch.setattr(clock, "now", lambda: third + 30 * DAY - 1)
+        assert auto_sources.gate_reason(store, GID, label="dead.example.com")
+        monkeypatch.setattr(clock, "now", lambda: third + 30 * DAY)
+        assert auto_sources.gate_reason(store, GID, label="dead.example.com") == ""
+        # 冷却结束能重新试取；七天窗外的旧失败不会立刻把它送回冷却。
+        await self._fail(store, third + 30 * DAY, direct=direct)
+        assert auto_sources.gate_reason(store, GID, label="dead.example.com") == ""
+
+    @pytest.mark.asyncio
+    async def test_three_utc_dates_but_only_two_beijing_dates_do_not_cool(self, store):
+        first = clock.bj(NOW).replace(hour=7, minute=59, second=0, microsecond=0).timestamp()
+        for ts in (first, first + 16 * 3600, first + DAY + 120):
+            await self._fail(store, ts)
+        assert auto_sources.rejected_list(store, GID) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("oldest_age, cooldown", [(7 * DAY, True), (7 * DAY + 1, False)])
+    async def test_trial_failure_window_is_seven_days(self, store, oldest_age, cooldown):
+        for ts in (NOW - oldest_age, NOW - DAY, NOW):
+            await self._fail(store, ts)
+        assert bool(auto_sources.rejected_list(store, GID)) is cooldown
+
+    @pytest.mark.asyncio
+    async def test_only_real_trial_failures_for_this_group_and_label_count(self, store):
+        for ts in (NOW - 2 * DAY, NOW - DAY):
+            auto_sources.note_log(store, GID, action="skipped", label="dead.example.com",
+                                  reason="自动源名额满了", now=ts)
+            auto_sources.note_log(store, GID, action="skipped", label="other.example.com",
+                                  reason="体检没过：HTTP 404", now=ts)
+            auto_sources.note_log(store, "other-group", action="skipped", label="dead.example.com",
+                                  reason="体检没过：HTTP 404", now=ts)
+        await self._fail(store, NOW)
+        assert auto_sources.rejected_list(store, GID) == []
+        await self._fail(store, NOW + DAY)
+        assert auto_sources.rejected_list(store, GID) == []
+        await self._fail(store, NOW + 2 * DAY)
+        assert len(auto_sources.rejected_list(store, GID)) == 1
+
+    @pytest.mark.asyncio
+    async def test_search_candidates_use_round_time_for_cooldown(self, store, monkeypatch):
+        class Search:
+            async def search(self, query, **kwargs):
+                return [{"url": "https://dead.example.com/articles/1"}]
+
+        auto_sources.note_rejected(store, GID, label="dead.example.com", now=NOW,
+                                   cooldown_until=NOW + 30 * DAY)
+        monkeypatch.setattr(clock, "now", lambda: NOW + 90 * DAY)
+        assert await auto_sources.find_source_candidates(
+            store, GID, ["来源"], search=Search(), now=NOW + 30 * DAY - 1,
+        ) == []
+        candidates = await auto_sources.find_source_candidates(
+            store, GID, ["来源"], search=Search(), now=NOW + 30 * DAY,
+        )
+        assert len(candidates) == 1 and candidates[0]["url"] == "https://dead.example.com/"
+
+    @pytest.mark.asyncio
+    async def test_repeated_failures_within_one_beijing_day_do_not_cool(self, store):
+        first = clock.bj(NOW).replace(hour=10, minute=0, second=0, microsecond=0).timestamp()
+        for ts in (first, first + 60, first + 120, first + 3600):
+            await self._fail(store, ts)
+        assert auto_sources.rejected_list(store, GID) == []
+        assert len(auto_sources.load_log(store, GID)) == 1
+
+
 # ----------------------------------------------------------------------
 # 五、试用期：每轮 ≤2 条候选
 # ----------------------------------------------------------------------
@@ -641,6 +730,53 @@ class TestTrialCap:
 
 
 class TestStatsAndUnsubscribe:
+    @pytest.mark.parametrize("auto, count, since, expected", [
+        (True, 4, NOW - 3 * DAY, ""),
+        (True, 5, NOW - 3 * DAY + 1, ""),
+        (True, 5, NOW - 3 * DAY, "连续抓取失败满 3 天"),
+        (True, 6, NOW - 4 * DAY, "连续抓取失败满 3 天"),
+        (True, 5, 0.0, ""),
+        (True, 5, NOW + DAY, ""),
+        (False, 20, NOW - 30 * DAY, ""),
+    ])
+    def test_fetch_error_unsubscribe_requires_auto_five_failures_and_three_full_days(
+        self, store, auto, count, since, expected,
+    ):
+        entry = {"id": "rA", "auto": auto, "origin": "trusted", "fail_count": count,
+                 "error_since_ts": since}
+        assert auto_sources.unsubscribe_reason(store, GID, entry, NOW) == expected
+
+    @pytest.mark.asyncio
+    async def test_fetch_error_unsubscribes_auto_only_then_cooldown_expires(self, store, monkeypatch):
+        for fid, auto in (("rA", True), ("rM", False)):
+            rss.add_feed(store, GID, url=f"https://{fid.lower()}.example.com/feed", title=fid,
+                         feed_id=fid, now=NOW - 3 * DAY, auto=auto, origin="trusted",
+                         label=f"{fid.lower()}.example.com")
+            for ts in (NOW - 3 * DAY, NOW - 2 * DAY, NOW - DAY, NOW - 1, NOW):
+                monkeypatch.setattr(clock, "now", lambda ts=ts: ts)
+                rss.mark_checked(store, GID, fid, ok_ts=None, error="HTTP 503")
+        assert await auto_sources.unsubscribe_stale(store, GID, NOW) == ["ra.example.com"]
+        assert [e["id"] for e in rss.list_feeds(store, GID)] == ["rM"]
+        assert auto_sources.unsubscribe_reason(store, GID, rss.list_feeds(store, GID)[0], NOW) == ""
+        monkeypatch.setattr(clock, "now", lambda: NOW + 30 * DAY - 1)
+        assert auto_sources.gate_reason(store, GID, label="ra.example.com")
+        monkeypatch.setattr(clock, "now", lambda: NOW + 30 * DAY)
+        assert auto_sources.gate_reason(store, GID, label="ra.example.com") == ""
+
+    def test_success_resets_error_streak_before_unsubscribe(self, store, monkeypatch):
+        rss.add_feed(store, GID, url="https://a.example.com/feed", title="A", feed_id="rA",
+                     now=NOW - 5 * DAY, auto=True, origin="trusted")
+        for ts in (NOW - 5 * DAY, NOW - 4 * DAY, NOW - 3 * DAY, NOW - 2 * DAY):
+            monkeypatch.setattr(clock, "now", lambda ts=ts: ts)
+            rss.mark_checked(store, GID, "rA", ok_ts=None, error="超时")
+        rss.mark_checked(store, GID, "rA", ok_ts=NOW - DAY, error="")
+        monkeypatch.setattr(clock, "now", lambda: NOW)
+        rss.mark_checked(store, GID, "rA", ok_ts=None, error="HTTP 503")
+        entry = rss.list_feeds(store, GID)[0]
+        assert entry["fail_count"] == 1
+        assert entry["error_since_ts"] == NOW
+        assert auto_sources.unsubscribe_reason(store, GID, entry, NOW) == ""
+
     def test_note_round_records_candidates_and_kept_ids(self, store):
         items = [
             {"_rss_feed_id": "rA", "title": "a", "_news_id": 11},

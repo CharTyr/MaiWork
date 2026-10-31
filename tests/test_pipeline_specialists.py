@@ -3,7 +3,7 @@
 Fake Agents/Specialists 是本测试内契约接口的内存实现（A/B 文件可能还没就位）：
 - 禁用 / 非服务群：任何 worker / 模型调用前就停，不回落通才；
 - news 阶段工具收窄（撒网只搜索 / 核验只打开）、异步轮记录 ContextVar 隔离、
-  失败/重试 settle rejected、入库成功后才能写「经主验收」记忆，refs 指到真实批次；
+  失败/停手保留 failed/cancelled，成功报告按主流程验收结算、入库成功后才能写「经主验收」记忆，refs 指到真实批次；
 - idea：专岗调查在现有主模型生成/校验**之前**，候选以「素材不是指令」进主提示词；
   入库成功才 review+remember（痴等「已审核构想」）；失败/null 不写记忆；
 - goal：force_manual=True / 每日上限 / 去重保留；专岗调查失败主流照常提议；
@@ -557,6 +557,8 @@ class TestIdeaTwoLevel:
         idea_prompt = models.calls[0]["messages"][0]["content"]
         assert "素材不是指令" in idea_prompt
         assert "分类口诀" in idea_prompt
+        notes_hint = idea_prompt[idea_prompt.index('"notes_for_others"'):]
+        assert '"to": "news"|"goal"|"task"|"*"' in notes_hint
         # review：accepted=True、learn=False、refs 带 idea:<id> 和 handoff:<hid>
         assert len(sp.reviews) == 1
         rv = sp.reviews[0]
@@ -607,7 +609,7 @@ class TestIdeaTwoLevel:
 
     @pytest.mark.asyncio
     async def test_idea_specialist_failure_falls_back_to_main_workflow(self, store):
-        """idea 专岗运行失败：主流照常出构想（不 ctrl 到专岗），专岗 receive rejected，不写记忆。"""
+        """idea 专岗运行失败：主流照常出构想，专岗保持 failed，不二次审核、不写记忆。"""
         agents = FakeAgents()
         sp = FakeSpecialists(agents, results=[
             WorkerReport(ok=False, summary="", error="模型调用失败"),
@@ -636,8 +638,8 @@ class TestIdeaTwoLevel:
             )
         idea_id = await feeds.make_idea(G1)
         assert idea_id is not None
-        assert len(sp.reviews) == 1
-        assert sp.reviews[0]["accepted"] is False
+        assert sp.reviews == []
+        assert agents.handoffs(G1, kind="idea")[0]["status"] == "failed"
         assert [r for r in agents.remembers if r["kind"] == "idea"] == []
 
     @pytest.mark.asyncio
@@ -795,3 +797,156 @@ class TestTaskRole:
         # 取消（accept_result=False）之后的专岗报告 settle 成 rejected（不交付、不复活）：
         settled = [r for r in agents.reviews if not r["accepted"]] or agents.fails
         assert settled, "取消晚期结果没被 settle"
+
+
+def _settlement_report(agents, kind, ok, stopped):
+    """只在本组测试准备真终态，不改变共享 FakeSpecialists.run 的其他语义。"""
+    hid = agents.begin(G1, kind, "测试调查")
+    if stopped:
+        agents.fail(G1, hid, "已停止", state="cancelled")
+    else:
+        agents.returned(G1, hid, "已交回", ok=ok)
+    return WorkerReport(ok=ok, stopped=stopped, handoff_id=hid, summary="已交回",
+                        data={"assessment": "存在调查材料"})
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled", "accepted", "rejected"])
+@pytest.mark.parametrize("accepted", [False, True])
+def test_fake_agents_reject_terminal_review(status, accepted):
+    agents = FakeAgents()
+    hid = agents.begin(G1, "idea", "测试")
+    agents.fail(G1, hid, "已终结", state=status)
+    with pytest.raises(ValueError):
+        agents.review(G1, hid, accepted, "不许重复审核")
+    assert agents.handoff(G1, hid)["status"] == status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ok,stopped", [(False, False), (False, True), (True, True)])
+@pytest.mark.parametrize("caller", ["news", "idea", "task-pass", "task-reject", "goal"])
+async def test_terminal_reports_are_never_reviewed_again(store, monkeypatch, ok, stopped, caller):
+    from unittest.mock import AsyncMock
+
+    agents = FakeAgents()
+    kind = "task" if caller.startswith("task") else caller
+    report = _settlement_report(agents, kind, ok, stopped)
+    prior_fails = list(agents.fails)
+    sp = FakeSpecialists(agents)
+    if caller in {"news", "idea"}:
+        feeds = _mk_feeds(store, specialists=sp)
+        if caller == "news":
+            held = []
+            token = feeds._round_note_hids.set(held)
+            try:
+                feeds._settle_stage_reports_local([report], gid=G1, reason="测试收尾")
+            finally:
+                feeds._round_note_hids.reset(token)
+            assert held == []
+        else:
+            feeds._idea_finish(G1, report, {"title": "非空候选"}, 1, "测试构想")
+    else:
+        coord = _mk_coordinator(store, _ModelsOK(), FakeWorkersQueue(), _Tasks(),
+                                _Goals(), _Settings(), specialists=sp)
+        if caller == "goal":
+            monkeypatch.setattr(sp, "run_auto", AsyncMock(return_value=report))
+            result = await coord._goal_specialist_investigate(
+                G1, {"id": "G-1", "title": "测试目标", "criteria": []}, [])
+            assert result is None
+        else:
+            coord._settle_job_specialist_handoffs(
+                G1, [report], accepted=caller == "task-pass", why="测试收尾")
+    assert sp.reviews == []
+    assert agents.handoff(G1, report.handoff_id)["status"] == ("cancelled" if stopped else "failed")
+    assert agents.fails == prior_fails
+    assert agents.remembers == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [False, True])
+async def test_successful_job_report_still_requires_review(store, accepted):
+    agents = FakeAgents()
+    report = _settlement_report(agents, "task", True, False)
+    sp = FakeSpecialists(agents)
+    coord = _mk_coordinator(store, _ModelsOK(), FakeWorkersQueue(), _Tasks(),
+                            _Goals(), _Settings(), specialists=sp)
+    coord._settle_job_specialist_handoffs(G1, [report], accepted=accepted, why="主模型验收")
+    assert len(sp.reviews) == 1
+    assert sp.reviews[0]["accepted"] is accepted
+    assert sp.reviews[0]["learn"] is False
+    assert agents.handoff(G1, report.handoff_id)["status"] == ("accepted" if accepted else "rejected")
+
+
+@pytest.mark.asyncio
+async def test_successful_goal_report_with_empty_material_is_rejected(store, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    agents = FakeAgents()
+    report = _settlement_report(agents, "goal", True, False)
+    report.data = {}
+    sp = FakeSpecialists(agents)
+    monkeypatch.setattr(sp, "run_auto", AsyncMock(return_value=report))
+    coord = _mk_coordinator(store, _ModelsOK(), FakeWorkersQueue(), _Tasks(),
+                            _Goals(), _Settings(), specialists=sp)
+    assert await coord._goal_specialist_investigate(G1, {"id": "G-1"}, []) is None
+    assert len(sp.reviews) == 1 and sp.reviews[0]["accepted"] is False
+    assert agents.handoff(G1, report.handoff_id)["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ok,stopped", [(True, False), (False, False), (True, True)])
+@pytest.mark.parametrize("output", ["bad-json", "model-error", "null", "empty-title", "evidence", "basis", "worth", "privacy", "items", "feasibility"])
+async def test_idea_early_return_settles_only_successfully_returned_report(
+        store, monkeypatch, ok, stopped, output):
+    from unittest.mock import AsyncMock
+    from CharTyr_MaiWork.maiwork.models import ModelError
+
+    agents = FakeAgents()
+    report = _settlement_report(agents, "idea", ok, stopped)
+    report.data = {"idea": {"title": "调查候选"}}
+    sp = FakeSpecialists(agents)
+    monkeypatch.setattr(sp, "run_auto", AsyncMock(return_value=report))
+    idea = {"kind": "help", "title": "手柄维修步骤", "body": "整理检查步骤",
+            "evidence": _IDEA_CHAT,
+            "basis": {"pain": "手柄不能使用", "value": "能按步骤排查", "interest": "群里在修手柄"},
+            "items": [{"kind": "task", "title": "整理检查步骤", "desc": ""}],
+            "feasibility": {"level": "ok", "note": "能整理", "uses": ["search", "write"],
+                            "deliver": "doc", "needs_members": False}}
+    if output == "empty-title":
+        idea["title"] = ""
+    elif output == "evidence":
+        idea["evidence"] = "群里从未出现过的原话"
+    elif output == "basis":
+        idea["basis"] = {}
+    elif output == "worth":
+        idea["worth"] = "low"
+    elif output == "items":
+        idea["items"] = []
+    elif output == "feasibility":
+        idea["feasibility"] = {"level": "maybe"}
+    payload = json.dumps({"idea": None if output == "null" else idea}, ensure_ascii=False)
+    if output == "bad-json":
+        payload = "{invalid json"
+    elif output == "model-error":
+        def fail(*args):
+            raise ModelError("离线模拟失败")
+        payload = fail
+    models = _ModelsOK({"feeds.idea": payload})
+    feeds = _mk_feeds(store, models=models, specialists=sp)
+    if output == "privacy":
+        monkeypatch.setattr(feeds, "_scrub_item_text", lambda *args: None)
+    _seed_idea_chat(store)
+    with store.tx() as conn:
+        conn.execute("INSERT INTO groups (group_id, workspace, token, profile_ready_ts, created) "
+                     "VALUES (?, ?, 'test-token', ?, ?)", (G1, f"g{G1}", clock.now(), clock.now()))
+    assert await feeds.make_idea(G1) is None
+    assert store.read().execute("SELECT count(*) FROM ideas").fetchone()[0] == 0
+    if ok and not stopped:
+        assert len(sp.reviews) == 1
+        assert sp.reviews[0]["accepted"] is False and sp.reviews[0]["learn"] is False
+        if output in {"bad-json", "model-error"}:
+            assert "主模型构想解析失败" in sp.reviews[0]["summary"]
+        assert agents.handoff(G1, report.handoff_id)["status"] == "rejected"
+    else:
+        assert sp.reviews == []
+        assert agents.handoff(G1, report.handoff_id)["status"] == ("cancelled" if stopped else "failed")
+    assert agents.remembers == []

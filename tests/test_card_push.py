@@ -549,3 +549,103 @@ async def test_no_public_url_card_uses_herenow_link(tmp_path):
     await cp.flush(GID, NOON + 10)
     assert renderer.calls[0]["link"] == "https://pub1.here.now/"
     assert cp.share.calls == [(GID, "news", "")]
+
+
+# ----------------------------------------------------------------------
+# v0.14 §1.4 方向 B：卡片选材避让「已经 / 正在用开场白发」的同一条素材
+# ----------------------------------------------------------------------
+
+_CROSS = 12 * 3600.0
+
+
+def _topic_candidate(store, *, gid=GID, kind="news", ref_id=7):
+    """落一条 topic_candidates 行，返回 id（topic_log.candidate_id 指它）。"""
+    with store.tx() as conn:
+        cur = conn.execute(
+            "INSERT INTO topic_candidates (group_id, kind, ref_id, title, brief, link, expires_ts, used_ts, created)"
+            " VALUES (?, ?, ?, 't', 'b', '', ?, ?, ?)",
+            (gid, kind, int(ref_id), NOON + 3600, NOON - 10, NOON - 10),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def _topic_opened(store, *, gid=GID, ts, ref_id=7, kind="news"):
+    """落一条「已经开过场」的 topic_log（opener 非空 = 真发出去了），候选指向 ref_id。"""
+    cid = _topic_candidate(store, gid=gid, kind=kind, ref_id=ref_id)
+    with store.tx() as conn:
+        conn.execute(
+            "INSERT INTO topic_log (group_id, ts, quiet_s, jev, pick, candidate_id, opener, message_id)"
+            " VALUES (?, ?, 100, NULL, NULL, ?, '开场白', 'mid-1')",
+            (gid, float(ts), cid),
+        )
+
+
+def _topic_outbox_pending(store, *, gid=GID, key="topic:5", candidate_kind="news", candidate_ref_id=7):
+    """落一条还在发件箱排队的开场白，payload 里带着它要用的候选。"""
+    with store.tx() as conn:
+        conn.execute(
+            "INSERT INTO outbox (key, group_id, kind, payload, status, created, updated)"
+            " VALUES (?, ?, 'text', ?, 'pending', ?, ?)",
+            (key, gid,
+             json.dumps({"push_kind": "topic",
+                          "candidate_kind": candidate_kind,
+                          "candidate_ref_id": candidate_ref_id}),
+             NOON, NOON),
+        )
+
+
+async def test_card_selection_skips_item_opened_by_topic_12h(tmp_path):
+    """同一条资讯 12h 内被开场白发过 → 卡片选材排除，不再重复发。"""
+    store, _, _, _, _, _, cp, _ = _make(tmp_path)
+    _enable(store, news_card_count=2)
+    _, ids = _batch(store)
+    _topic_opened(store, ts=NOON - 3600, ref_id=ids[0])  # 1h 前开场白发过 ids[0]
+    cp.scan(GID, NOON + 60)
+    cards = store.read().execute("SELECT item_ids FROM news_cards WHERE group_id=?", (GID,)).fetchall()
+    picked = set()
+    for r in cards:
+        picked.update(json.loads(r["item_ids"] or "[]"))
+    assert ids[0] not in picked, f"刚被开场白发过的资讯不该再进卡片，实际 {picked}"
+    assert ids[1] in picked
+
+
+async def test_card_selection_skips_item_with_topic_outbox_pending(tmp_path):
+    """开场白还在发件箱里排队（outbox topic:* pending）→ 卡片选材也排除同条资讯。"""
+    store, _, _, _, _, _, cp, _ = _make(tmp_path)
+    _enable(store, news_card_count=2)
+    _, ids = _batch(store)
+    _topic_outbox_pending(store, candidate_ref_id=ids[0])
+    cp.scan(GID, NOON + 60)
+    cards = store.read().execute("SELECT item_ids FROM news_cards WHERE group_id=?", (GID,)).fetchall()
+    picked = set()
+    for r in cards:
+        picked.update(json.loads(r["item_ids"] or "[]"))
+    assert ids[0] not in picked
+
+
+async def test_card_selection_keeps_item_when_topic_opened_over_12h(tmp_path):
+    """开场白是 12h 之前发的 → 不再互斥，资讯照常进卡片。"""
+    store, _, _, _, _, _, cp, _ = _make(tmp_path)
+    _enable(store, news_card_count=2)
+    _, ids = _batch(store)
+    _topic_opened(store, ts=NOON - (_CROSS + 600), ref_id=ids[0])
+    cp.scan(GID, NOON + 60)
+    cards = store.read().execute("SELECT item_ids FROM news_cards WHERE group_id=?", (GID,)).fetchall()
+    picked = set()
+    for r in cards:
+        picked.update(json.loads(r["item_ids"] or "[]"))
+    assert ids[0] in picked
+
+
+async def test_card_flush_preflight_drops_when_topic_opened_later(tmp_path):
+    """发送前复核：卡片入队后，同条资讯又被开场白发了 → 发件箱那一道作废它。"""
+    store, _, host, _, _, renderer, cp, ob = _make(tmp_path)
+    _enable(store)
+    _, ids = _batch(store)
+    cp.scan(GID, NOON + 10)
+    await cp.flush(GID, NOON + 10)  # 入队（图片 or 文字都行）
+    # 排队期间，同条资讯被开场白发过了
+    _topic_opened(store, ts=NOON + 20, ref_id=ids[0])
+    await ob.flush(NOON + 61)
+    row = store.read().execute("SELECT status, error FROM news_cards WHERE group_id=?", (GID,)).fetchone()
+    assert row["status"] == "dropped", f"同素材刚被开场白发过，卡片该被发送前复核作废，实际 {dict(row)}"

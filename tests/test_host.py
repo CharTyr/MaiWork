@@ -844,3 +844,125 @@ class TestTimeoutMs:
         await h.knowledge("q")
         _, kw = ctx.calls[0]
         assert kw["timeout_ms"] == 15000
+
+
+# ----------------------------------------------------------------------
+# 宿主 images 表识图描述只读回填（Phase 1B §3.1）
+# ----------------------------------------------------------------------
+
+
+def _maibot_db(path, rows):
+    """造一个最小宿主 MaiBot.db：只有 images 表。"""
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE images (image_hash TEXT, image_type TEXT, description TEXT, vlm_processed INTEGER)"
+    )
+    conn.executemany(
+        "INSERT INTO images (image_hash, image_type, description, vlm_processed) VALUES (?,?,?,?)",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestImageDescriptionBackfill:
+    @pytest.mark.asyncio
+    async def test_image_desc_backfilled(self, tmp_path) -> None:
+        """is_picture 空文本消息 → 查 images 表补 [图片：desc]。"""
+        db = tmp_path / "MaiBot.db"
+        _maibot_db(db, [("hashA", "IMAGE", "一只橘猫蹲在窗台上", 1)])
+        raw = [
+            {
+                "message_id": "1",
+                "timestamp": 1790000000.0,
+                "message_info": {"user_info": {"user_id": "u1", "user_nickname": "甲"}},
+                "processed_plain_text": "",
+                "is_picture": True,
+                "raw_message": [{"type": "image", "data": {"image_hash": "hashA"}}],
+            },
+        ]
+        ctx = FakeCtx({"message.get_by_time_in_chat": raw})
+        h = Host(ctx, maibot_db_path=db)
+        msgs = await h.messages("sid-1", 0, 2000000000, 100)
+        assert msgs[0].text == "[图片：一只橘猫蹲在窗台上]"
+
+    @pytest.mark.asyncio
+    async def test_emoji_desc_even_when_vlm_processed_zero(self, tmp_path) -> None:
+        """裸 [表情包]（is_picture=0）+ vlm_processed=0 也能回填 [表情包：desc]。"""
+        db = tmp_path / "MaiBot.db"
+        _maibot_db(db, [("emojiHash", "EMOJI", "捂脸笑哭", 0)])  # 线上 EMOJI 全是 0
+        raw = [
+            {
+                "message_id": "1",
+                "timestamp": 1790000000.0,
+                "message_info": {"user_info": {"user_id": "u1"}},
+                "processed_plain_text": "[表情包]",
+                "is_picture": False,
+                "is_emoji": False,
+                "raw_message": [{"type": "emoji", "data": {"image_hash": "emojiHash"}}],
+            },
+        ]
+        ctx = FakeCtx({"message.get_by_time_in_chat": raw})
+        h = Host(ctx, maibot_db_path=db)
+        msgs = await h.messages("sid-1", 0, 2000000000, 100)
+        assert msgs[0].text == "[表情包：捂脸笑哭]"
+
+    @pytest.mark.asyncio
+    async def test_text_plus_image_concatenated(self, tmp_path) -> None:
+        """有文字又有图 → 拼成「正文 [图片：desc]」。"""
+        db = tmp_path / "MaiBot.db"
+        _maibot_db(db, [("h9", "IMAGE", "电路板", 1)])
+        raw = [
+            {
+                "message_id": "1",
+                "timestamp": 1790000000.0,
+                "message_info": {"user_info": {"user_id": "u1"}},
+                "processed_plain_text": "看这个",
+                "is_picture": True,
+                "raw_message": [{"type": "image", "data": {"image_hash": "h9"}}],
+            },
+        ]
+        ctx = FakeCtx({"message.get_by_time_in_chat": raw})
+        h = Host(ctx, maibot_db_path=db)
+        msgs = await h.messages("sid-1", 0, 2000000000, 100)
+        assert msgs[0].text == "看这个 [图片：电路板]"
+
+    @pytest.mark.asyncio
+    async def test_no_db_file_skips_silently(self, tmp_path) -> None:
+        """库文件不存在 → 跳过回填不报错（兼容所有离线测试）。"""
+        raw = [
+            {
+                "message_id": "1",
+                "timestamp": 1790000000.0,
+                "message_info": {"user_info": {"user_id": "u1"}},
+                "processed_plain_text": "",
+                "is_picture": True,
+                "raw_message": [{"type": "image", "data": {"image_hash": "x"}}],
+            },
+        ]
+        ctx = FakeCtx({"message.get_by_time_in_chat": raw})
+        h = Host(ctx, maibot_db_path=tmp_path / "nonexistent.db")
+        msgs = await h.messages("sid-1", 0, 2000000000, 100)
+        assert msgs[0].text == "[图片]"  # 只回占位
+
+    @pytest.mark.asyncio
+    async def test_no_matching_desc_leaves_placeholder(self, tmp_path) -> None:
+        """库里没这条 hash 的描述 → 保留原占位。"""
+        db = tmp_path / "MaiBot.db"
+        _maibot_db(db, [("other", "IMAGE", "别的", 1)])
+        raw = [
+            {
+                "message_id": "1",
+                "timestamp": 1790000000.0,
+                "message_info": {"user_info": {"user_id": "u1"}},
+                "processed_plain_text": "",
+                "is_picture": True,
+                "raw_message": [{"type": "image", "data": {"image_hash": "missing"}}],
+            },
+        ]
+        ctx = FakeCtx({"message.get_by_time_in_chat": raw})
+        h = Host(ctx, maibot_db_path=db)
+        msgs = await h.messages("sid-1", 0, 2000000000, 100)
+        assert msgs[0].text == "[图片]"

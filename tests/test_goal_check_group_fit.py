@@ -128,7 +128,7 @@ class FakeMentions:
     def __init__(self):
         self.added: list[dict] = []
 
-    def add(self, group_id, text, *, key, ttl_s, turns=5):
+    def add(self, group_id, text, *, key, ttl_s, turns=5, target_user_id="", keywords=""):
         self.added.append(
             {"group_id": str(group_id), "text": str(text), "key": str(key),
              "ttl_s": float(ttl_s), "turns": int(turns)}

@@ -307,7 +307,7 @@ class Commands:
         if sub == "取消":
             return await self._cancel(gid, user_id, arg)
         if sub == "领取":
-            return self._claim_delivery(gid, arg)
+            return await self._claim_delivery(gid, arg)
         # 不认的子命令：看着像派活（和 @ 派活同一份请求词表）就给一行能照抄的 /mw do
         rest = _rest_after_head(raw)
         return do_hint(rest) if has_request_cue(rest) else usage_text(sub)
@@ -386,7 +386,7 @@ class Commands:
             return ""
         return str(msg.get("processed_plain_text") or "").strip()[:_QUOTE_MAX]
 
-    def _claim_delivery(self, gid: str, task_id: str) -> str:
+    async def _claim_delivery(self, gid: str, task_id: str) -> str:
         """只有明确索取本群指定任务的这条指令能升级待发交付。"""
         if not re.fullmatch(r"T-\d+", str(task_id or "")):
             return "把本群任务号带上，例如 /mw 领取 T-3"
@@ -399,6 +399,21 @@ class Commands:
             return f"{task_id} 正在发送中，请稍等，不会重复上传"
         if outcome == "not_ready":
             return f"{task_id} 还没完成，请完成后再领"
+        if outcome == "expired":
+            try:
+                result = await self._outbox.republish_if_expired(task_id)
+            except Exception:
+                logger.exception("领取成品时重发链接失败（%s）", task_id)
+                result = {}
+            local = ""
+            public = str(self._get_settings().console.public_url or "").rstrip("/")
+            if public:
+                row = self._store.read().execute("SELECT token FROM groups WHERE group_id=?", (gid,)).fetchone()
+                if row is not None and row["token"]:
+                    local = f"；本地副本：{public}/g/{row['token']}/artifacts/{task_id}/"
+            if result.get("ok") and result.get("url"):
+                return f"{task_id} 的新链接：{result['url']}" + local
+            return f"{task_id} 的外链已过期；本地副本在本群网页任务详情里" + local
         if outcome in ("uncertain", "failed", "broken"):
             return f"{task_id} 的交付需要管理员到网页核对，不会盲目重复上传"
         return "本群没有可领取的这份成品，请核对任务号或找管理员查看发件状态"

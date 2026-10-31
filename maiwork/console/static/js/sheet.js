@@ -1,7 +1,7 @@
 // MaiWork 网页 · 抽屉：登录、编辑表单、打开 / 关闭。
-import { $, CATS, desktop, isGA, state } from "./state.js";
+import { $, CATS, desktop, isGA, state, ui } from "./state.js";
 import { RATE_REASONS } from "./pages/news.js";
-import { SVG, esc, tip } from "./util.js";
+import { SVG, calm, esc, tip } from "./util.js";
 import { gname, grp } from "./api.js";
 import { detailHTML, loadTask } from "./detail.js";
 import { handoffSheet } from "./handoff.js";
@@ -14,6 +14,7 @@ import { appearanceSheet } from "./theme.js";
 import { socialCookieSheet } from "./settings/social.js";
 import { sfx } from "./sound.js";
 import { boardItemSheet } from "./board.js";
+import { previewSheet } from "./preview.js";
 
 function loginSheet() {
   if (isGA())
@@ -95,6 +96,7 @@ function sheetHTML(kind) {
   if (kind === "edit") return editSheet();
   if (kind === "handoff") return handoffSheet();
   if (kind === "board-item") return boardItemSheet();
+  if (kind === "preview") return previewSheet();
   return detailHTML();
 }
 
@@ -102,17 +104,158 @@ function chatsSheet() {
   return `<h1 class="h-page">对话</h1>` + chatSide();
 }
 
+// §4.3 抽屉焦点陷进：开时记住焦点、关时还原；Tab 只能在抽屉里转
+let _sheetPrevFocus = null;
+let _sheetBack = null;
+let _closeTimer = 0;
+let _dragBound = false;
+let _drag = null;
+
+// 手机底部抽屉跟手下滑的位移、遮罩透明度与松手是否关闭（导出纯函数便于单测）
+export function sheetDragMath(dy, velocity, height = 480) {
+  const h = Math.max(220, Number(height) || 480);
+  const offset = dy < 0 ? Math.max(-28, dy * 0.18) : dy;
+  const scrim = Math.max(0, Math.min(1, 1 - Math.max(0, dy) / (h * 0.78)));
+  const distThreshold = Math.min(110, h * 0.28);
+  const dismiss = dy > 0 && velocity > -0.25 && (dy >= distThreshold || (dy >= 24 && velocity >= 0.45));
+  return { offset, scrim, dismiss };
+}
+
+function _clearDragInline() {
+  const sh = $("sheet");
+  const sc = $("scrim");
+  if (sh) {
+    sh.classList.remove("dragging");
+    if (sh.style) sh.style.transform = "";
+  }
+  if (sc) {
+    sc.classList.remove("dragging");
+    if (sc.style) sc.style.opacity = "";
+  }
+}
+
+function _bindSheetDrag(sh) {
+  if (_dragBound || !sh || !sh.addEventListener) return;
+  _dragBound = true;
+  const isWide = () => window.matchMedia && window.matchMedia("(min-width: 760px)").matches;
+  const stamp = (e) => e.timeStamp || (typeof performance !== "undefined" ? performance.now() : Date.now());
+  sh.addEventListener("pointerdown", (e) => {
+    if (_drag || !state.sheet || calm() || isWide()) return;
+    if (e.button && e.button !== 0) return;
+    const t = e.target;
+    const fromGrab = !!(t && t.closest && t.closest(".grab"));
+    if (!fromGrab) {
+      if (sh.scrollTop > 0) return;
+      if (t && t.closest && t.closest("button, a, input, textarea, select, label, summary, iframe, .ho-text, .pv-frame")) return;
+    }
+    const ts = stamp(e);
+    _drag = { id: e.pointerId, x0: e.clientX, y0: e.clientY, lastY: e.clientY, lastT: ts, v: 0, fromGrab, locked: false };
+  });
+  sh.addEventListener("pointermove", (e) => {
+    if (!_drag || e.pointerId !== _drag.id) return;
+    if (!state.sheet || calm() || isWide()) {
+      _drag = null;
+      _clearDragInline();
+      return;
+    }
+    const dx = e.clientX - _drag.x0;
+    const dy = e.clientY - _drag.y0;
+    if (!_drag.locked) {
+      if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 6) {
+        _drag = null;
+        return;
+      }
+      if (!_drag.fromGrab && (dy < -6 || sh.scrollTop > 0)) {
+        _drag = null;
+        return;
+      }
+      if (Math.abs(dy) < 6 || (!_drag.fromGrab && dy <= 0)) return;
+      _drag.locked = true;
+      sh.setPointerCapture?.(e.pointerId);
+      sh.classList.add("dragging");
+      $("scrim")?.classList.add("dragging");
+    }
+    e.preventDefault?.();
+    const ts = stamp(e);
+    const dt = ts - _drag.lastT;
+    if (dt > 0) {
+      const instV = (e.clientY - _drag.lastY) / dt;
+      _drag.v = _drag.v ? _drag.v * 0.35 + instV * 0.65 : instV;
+      _drag.lastY = e.clientY;
+      _drag.lastT = ts;
+    }
+    const { offset, scrim } = sheetDragMath(dy, _drag.v, sh.offsetHeight || 480);
+    if (sh.style) sh.style.transform = `translateY(${offset.toFixed(1)}px)`;
+    const sc = $("scrim");
+    if (sc && sc.style) sc.style.opacity = scrim.toFixed(3);
+  });
+  const endDrag = (cancel) => (e) => {
+    if (!_drag || e.pointerId !== _drag.id) return;
+    const d = _drag;
+    _drag = null;
+    if (!d.locked) return;
+    try {
+      sh.releasePointerCapture?.(e.pointerId);
+    } catch (_) {}
+    const dy = e.clientY - d.y0;
+    const ts = stamp(e);
+    const dt = ts - d.lastT;
+    const v = dt > 0 && dt < 80 ? (d.v ? d.v * 0.4 + ((e.clientY - d.lastY) / dt) * 0.6 : (e.clientY - d.lastY) / dt) : d.v;
+    if (!cancel && state.sheet && sheetDragMath(dy, v, sh.offsetHeight || 480).dismiss) {
+      closeSheet();
+      return;
+    }
+    _clearDragInline();
+  };
+  sh.addEventListener("pointerup", endDrag(false));
+  sh.addEventListener("pointercancel", endDrag(true));
+}
+
+const _sheetInert = (on) => {
+  for (const id of ["app", "tabbar"]) {
+    const el = $(id);
+    if (on) el?.setAttribute("inert", ""); else el?.removeAttribute("inert");
+  }
+};
+
+function _sheetTrap(e) {
+  if (e.key !== "Tab" || !state.sheet) return;
+  const sh = $("sheet");
+  if (!sh || sh.hidden) return;
+  const focusables = [...sh.querySelectorAll(
+    'a[href], button:not([disabled]), textarea, input, select, [tabindex]:not([tabindex="-1"])'
+  )].filter((el) => el.offsetParent !== null && !el.matches(":disabled"));
+  if (!focusables.length) { e.preventDefault(); sh.focus(); return; }
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const inside = focusables.includes(document.activeElement);
+  if (e.shiftKey) {
+    if (!inside || document.activeElement === first) { e.preventDefault(); last.focus(); }
+  } else if (!inside || document.activeElement === last) {
+    e.preventDefault(); first.focus();
+  }
+}
+
 export function openSheet(kind) {
   const was = state.sheet;
+  clearTimeout(_closeTimer);
+  _drag = null;
+  _clearDragInline();
+  if (kind !== "preview" || was !== "preview") _sheetBack = kind === "preview" && was === "detail" ? "detail" : null;
+  if (!was) _sheetPrevFocus = document.activeElement; // 第一扇抽屉记焦点
   state.sheet = kind;
   const sh = $("sheet");
+  _bindSheetDrag(sh);
   sh.innerHTML = sheetChrome() + sheetHTML(kind);
   sh.hidden = false;
   $("scrim").hidden = false;
   sh.scrollTop = 0;
   if (!was) {
+    _sheetInert(true);
+    document.addEventListener("keydown", _sheetTrap, true);
     sfx("open");
     requestAnimationFrame(() => {
+      if (!state.sheet || sh.hidden) return;
       sh.classList.add("on");
       $("scrim").classList.add("on");
     });
@@ -136,8 +279,30 @@ export function repaintSheet(opts = {}) {
   sh.scrollTop = top;
 }
 
+// 路由/登录身份重置必须无条件解除背景禁用，不走预览的返回栈。
+export function resetSheet() {
+  clearTimeout(_closeTimer);
+  _drag = null;
+  _clearDragInline();
+  state.sheet = null;
+  _sheetBack = null;
+  draft.models = null;
+  document.removeEventListener("keydown", _sheetTrap, true);
+  _sheetInert(false);
+  for (const id of ["sheet", "scrim"]) {
+    const el = $(id);
+    if (el) { el.classList.remove("on"); el.hidden = true; }
+  }
+  if (_sheetPrevFocus && document.contains(_sheetPrevFocus)) _sheetPrevFocus.focus({ preventScroll: true });
+  _sheetPrevFocus = null;
+}
+
 export function closeSheet() {
-  if (!state.sheet) return;
+  if (!state.sheet) { resetSheet(); return; }
+  if (state.sheet === "preview" && _sheetBack === "detail" && state.detail && !desktop.matches) {
+    openSheet("detail");
+    return;
+  }
   if (state.sheet === "handoff") {
     // 手机上从详情抽屉打开的交接包：关掉回到详情，不把详情一起关没
     const back = state.handoff && state.handoff.back && state.detail;
@@ -159,16 +324,32 @@ export function closeSheet() {
   }
   state.sheet = null;
   draft.models = null;
+  _drag = null;
+  _clearDragInline();
   sfx("close");
   const sh = $("sheet");
   sh.classList.remove("on");
   $("scrim").classList.remove("on");
-  setTimeout(() => {
+  document.removeEventListener("keydown", _sheetTrap, true);
+  _sheetInert(false);
+  // 焦点还给开抽屉前的那个元素（可能被换掉了，检查还连着再还）
+  if (_sheetPrevFocus && document.contains(_sheetPrevFocus)) _sheetPrevFocus.focus({ preventScroll: true });
+  _sheetPrevFocus = null;
+  clearTimeout(_closeTimer);
+  const finishClose = () => {
+    clearTimeout(_closeTimer);
+    sh.removeEventListener?.("transitionend", onEnd);
     if (!state.sheet) {
       sh.hidden = true;
       $("scrim").hidden = true;
     }
-  }, 420);
+  };
+  const onEnd = (ev) => {
+    if (ev && ev.target && ev.target !== sh) return;
+    finishClose();
+  };
+  sh.addEventListener("transitionend", onEnd);
+  _closeTimer = setTimeout(finishClose, 280);
 }
 
 export function openDetail(type, id) {
@@ -176,6 +357,7 @@ export function openDetail(type, id) {
   syncHash();
   if (type === "task") loadTask(id);
   if (desktop.matches) {
+    ui.sideFlash = true;
     renderView();
     renderSide();
     $("side").scrollTop = 0;

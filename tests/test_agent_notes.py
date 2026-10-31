@@ -51,7 +51,7 @@ def _returned(agents, gid, kind, notes):
 # ---------------------------------------------------------------- 迁移
 
 def test_migration_creates_agent_notes(store):
-    assert store.migrate() == len(store_mod._MIGRATIONS) == 48
+    assert store.migrate() == len(store_mod._MIGRATIONS) == 49
     cols = {r["name"] for r in store.read().execute("PRAGMA table_info(agent_notes)")}
     assert {"group_id", "from_kind", "to_kind", "body", "handoff_id", "created"} <= cols
 

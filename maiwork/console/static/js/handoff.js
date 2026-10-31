@@ -1,8 +1,9 @@
 // MaiWork 网页 · 交接包（docs/24）：把构想 / 任务写成一份说明，复制或下载给自己的个人 agent。
 // 预览 GET 不计数；真点了复制 / 下载才 POST /taken 记一次（失败不影响复制）。
 import { $, desktop, state } from "./state.js";
-import { SVG, esc, tip, toast } from "./util.js";
+import { SVG, esc, flashCopied, tip, toast } from "./util.js";
 import { api } from "./api.js";
+import { sfx } from "./sound.js";
 import { clientId, loading } from "./pages/news.js";
 import { findIdea, ideaItems, ideaPicked } from "./pages/ideas.js";
 import { openSheet, repaintSheet } from "./sheet.js";
@@ -66,12 +67,15 @@ function taken(action) {
   api("POST", `/api/handoff/${h.kind}/${encodeURIComponent(h.id)}/taken`, body).catch(() => {});
 }
 
-export async function handoffCopy() {
+export async function handoffCopy(el) {
   const h = state.handoff;
   if (!h || !h.data) return;
   try {
     await navigator.clipboard.writeText(h.data.markdown || "");
-    toast("已复制");
+    if (el) {
+      flashCopied(el, "已复制");
+      sfx("success");
+    } else toast("已复制");
     taken("copy");
   } catch (err) {
     // 网页不是 https 时浏览器常不给剪贴板：选中全文，让人自己复制

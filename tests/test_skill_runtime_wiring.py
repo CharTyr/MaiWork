@@ -70,6 +70,25 @@ def _plan_names(tools) -> list[str]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("missing_specialists", [False, True])
+async def test_real_app_binds_skill_summary_after_agents_start(tmp_path, missing_specialists):
+    app = _app(tmp_path)
+    if missing_specialists:
+        app.specialists_factory = lambda *_: None
+    await app.start()
+    try:
+        summary = app.coordinator._skill_summary
+        assert summary is not None
+        assert summary._agents is app.agents
+        app.agents.skill_add(G1, "task", name="website-monitoring",
+                             description="Monitor website changes.", body="Compare verified releases.")
+        assert summary.find_similar_skill("website monitoring", G1)["name"] == "website-monitoring"
+        assert "Compare verified releases." in app.coordinator._find_similar_skill_brief("website monitoring", G1)
+    finally:
+        await app.stop()
+
+
+@pytest.mark.asyncio
 async def test_real_app_start_wires_agents_into_tools_registry(tmp_path: Path) -> None:
     app = _app(tmp_path)
     await app.start()

@@ -1084,3 +1084,278 @@ async def test_jev_log_stuck_null_when_opened(tmp_path):
     out = await topics.check(GID, t)
     assert out.startswith("queued:topic_id=")
     assert _read_jev(store)["stuck"] is None
+
+
+# ----------------------------------------------------------------------
+# v0.14 §1.4：三通道 12 小时双向防撞车（方向 A：开场白避让卡片 / 提一嘴）
+# ----------------------------------------------------------------------
+
+_CROSS = 12 * 3600.0
+
+
+def _news_card(store, *, gid=GID, item_ids, status="pending", sent_ts=None, card_id=None):
+    """直接落一条 news_cards 行（item_ids 是 JSON 数组）。"""
+    import json as _j
+    with store.tx() as conn:
+        cur = conn.execute(
+            "INSERT INTO news_cards (group_id, batch_id, status, item_ids, created, due_ts, sent_ts)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (gid, card_id if card_id is not None else 9000 + len(item_ids), status,
+             _j.dumps(list(item_ids)), NOW - 60, NOW - 60, sent_ts),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def _idea_mention_row(store, *, gid=GID, idea_id, status="pending", sent_ts=None):
+    """直接落一条 idea_mentions 行。"""
+    with store.tx() as conn:
+        cur = conn.execute(
+            "INSERT INTO idea_mentions (group_id, idea_id, status, created, due_ts, sent_ts)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (gid, int(idea_id), status, NOW - 60, NOW - 60, sent_ts),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def _outbox_pending(store, key, *, gid=GID, kind="image", payload=None):
+    import json as _j
+    with store.tx() as conn:
+        conn.execute(
+            "INSERT INTO outbox (key, group_id, kind, payload, status, created, updated)"
+            " VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+            (key, gid, kind, _j.dumps(payload or {}), NOW, NOW),
+        )
+
+
+@pytest.mark.asyncio
+async def test_candidate_skipped_when_news_card_in_flight(tmp_path):
+    """候选对应的资讯已经在卡片里（news_cards 在途）→ Topics 选材把它滤掉。"""
+    t = _bj_ts(2026, 9, 27, 15, 0)
+    store, settings, topics, *_ = _make_topics(tmp_path, cfg=_QUIET_CFG)
+    _news_card(store, item_ids=[7], status="pending")
+    _seed_candidate(store, check_now=t, title="刚上卡片那条", kind="news", ref_id=7)
+    cands = topics._list_candidates(GID, t, limit=5)
+    assert all(int(c["ref_id"]) != 7 for c in cands)
+
+
+@pytest.mark.asyncio
+async def test_candidate_skipped_when_card_sent_within_12h(tmp_path):
+    """候选对应的资讯 12h 内已被卡片发过（sent/uncertain）→ 选材滤掉。"""
+    t = _bj_ts(2026, 9, 27, 15, 0)
+    store, settings, topics, *_ = _make_topics(tmp_path, cfg=_QUIET_CFG)
+    _news_card(store, item_ids=[7], status="sent", sent_ts=t - 3600)
+    _seed_candidate(store, check_now=t, title="一小时前上过卡片", kind="news", ref_id=7)
+    cands = topics._list_candidates(GID, t, limit=5)
+    assert all(int(c["ref_id"]) != 7 for c in cands)
+
+
+@pytest.mark.asyncio
+async def test_candidate_kept_when_card_sent_over_12h(tmp_path):
+    """卡片是 12h 之前发的 → 候选不受互斥影响，照常能选。"""
+    t = _bj_ts(2026, 9, 27, 15, 0)
+    store, settings, topics, *_ = _make_topics(tmp_path, cfg=_QUIET_CFG)
+    _news_card(store, item_ids=[7], status="sent", sent_ts=t - (_CROSS + 60))
+    _seed_candidate(store, check_now=t, title="超过12h前的卡片", kind="news", ref_id=7)
+    cands = topics._list_candidates(GID, t, limit=5)
+    assert any(int(c["ref_id"]) == 7 for c in cands)
+
+
+@pytest.mark.asyncio
+async def test_candidate_skipped_when_card_outbox_pending(tmp_path):
+    """卡片还没写 news_cards、只进了发件箱（outbox key=news_card:* pending）→ 滤掉。"""
+    t = _bj_ts(2026, 9, 27, 15, 0)
+    store, settings, topics, *_ = _make_topics(tmp_path, cfg=_QUIET_CFG)
+    _outbox_pending(store, "news_card:3", payload={"item_ids": [7]})
+    _seed_candidate(store, check_now=t, title="卡片在排队", kind="news", ref_id=7)
+    cands = topics._list_candidates(GID, t, limit=5)
+    assert all(int(c["ref_id"]) != 7 for c in cands)
+
+
+@pytest.mark.asyncio
+async def test_candidate_skipped_when_idea_mention_in_flight(tmp_path):
+    """构想提一嘴在途（idea_mentions pending/queued/sending）→ 构想候选滤掉。"""
+    t = _bj_ts(2026, 9, 27, 15, 0)
+    store, settings, topics, *_ = _make_topics(tmp_path, cfg=_QUIET_CFG)
+    _idea_mention_row(store, idea_id=3, status="queued")
+    _seed_candidate(store, check_now=t, title="刚在提一嘴", kind="idea", ref_id=3)
+    cands = topics._list_candidates(GID, t, limit=5)
+    assert all(int(c["ref_id"]) != 3 or str(c["kind"]) != "idea" for c in cands)
+
+
+@pytest.mark.asyncio
+async def test_candidate_skipped_when_idea_mention_sent_12h(tmp_path):
+    """构想 12h 内已被提一嘴发过 → 构想候选滤掉。"""
+    t = _bj_ts(2026, 9, 27, 15, 0)
+    store, settings, topics, *_ = _make_topics(tmp_path, cfg=_QUIET_CFG)
+    _idea_mention_row(store, idea_id=3, status="sent", sent_ts=t - 7200)
+    _seed_candidate(store, check_now=t, title="两小时前提过", kind="idea", ref_id=3)
+    cands = topics._list_candidates(GID, t, limit=5)
+    assert all(int(c["ref_id"]) != 3 or str(c["kind"]) != "idea" for c in cands)
+
+
+@pytest.mark.asyncio
+async def test_on_before_send_drops_when_candidate_now_in_flight(tmp_path):
+    """发送前复核：入队后这条候选的资讯上了卡片 → 开场白作废。"""
+    t = _bj_ts(2026, 9, 27, 15, 0)
+    store, settings, topics, *_ = _make_topics(tmp_path, cfg=_QUIET_CFG)
+    _seed_candidate(store, check_now=t, title="测试候选", kind="news", ref_id=7)
+    info = {
+        "key": "topic:5",
+        "group_id": GID,
+        "now": t,
+        "payload": {"cold_since_ts": t - 1800.0, "candidate_kind": "news", "candidate_ref_id": 7},
+    }
+    # 没冲突 → 放行（返回 None）
+    assert topics.on_before_send(info) is None
+    # 这条资讯 12h 内被卡片发了 → 作废
+    _news_card(store, item_ids=[7], status="sent", sent_ts=t - 600)
+    reason = topics.on_before_send(info)
+    assert reason, "候选刚被卡片发过，发送前复核该作废"
+
+
+@pytest.mark.asyncio
+async def test_on_before_send_drops_when_idea_mention_in_flight(tmp_path):
+    """发送前复核：入队后这条构想开始提一嘴（idea_mentions 在途）→ 开场白作废。"""
+    t = _bj_ts(2026, 9, 27, 15, 0)
+    store, settings, topics, *_ = _make_topics(tmp_path, cfg=_QUIET_CFG)
+    _seed_candidate(store, check_now=t, title="构想候选", kind="idea", ref_id=3)
+    info = {
+        "key": "topic:6",
+        "group_id": GID,
+        "now": t,
+        "payload": {"cold_since_ts": t - 1800.0, "candidate_kind": "idea", "candidate_ref_id": 3},
+    }
+    assert topics.on_before_send(info) is None
+    _idea_mention_row(store, idea_id=3, status="queued")
+    assert topics.on_before_send(info), "构想开始提一嘴了，发送前复核该作废"
+
+
+# ----------------------------------------------------------------------
+# v0.14 §1.4：follow_up 按真实发出时刻起算 + 剔除 MaiWork 自发与系统噪声
+# ----------------------------------------------------------------------
+
+
+def _followup_log(store, *, ts, opener_mid="op-1", due_ts=None):
+    with store.tx() as conn:
+        cur = conn.execute(
+            "INSERT INTO topic_log (group_id, ts, quiet_s, usual_gap_s, jev, pick, candidate_id,"
+            " opener, message_id, followup_due_ts, result, verdict)"
+            " VALUES (?, ?, 1800, 300, NULL, NULL, 1, '开场白', ?, ?, NULL, NULL)",
+            (GID, ts, opener_mid, due_ts if due_ts is not None else ts + 600.0),
+        )
+        return int(cur.lastrowid or 0)
+
+
+@pytest.mark.asyncio
+async def test_follow_up_uses_real_send_ts_not_judgment_ts(tmp_path):
+    """统计窗口以真实发出时刻（followup_due_ts-600）起算，不是判话题那一刻。"""
+    signals = SignalsStub()
+    signals.mark(GID, SID, NOW - 3600)
+    judge_ts = _bj_ts(2026, 9, 27, 14, 0)      # 判断时刻
+    send_ts = judge_ts + 240.0                # 4 分钟后才真正发出去
+    msgs = [
+        # 判断时刻~发送之间有人说话（在旧窗口内、新窗口起点前）：不该算
+        Msg(id="pre", ts=judge_ts + 60, user_id="u0", user_name="早", text="早说的话", is_bot=False, is_at=False, is_picture=False, reply_to=""),
+        # 发送后 10 分钟内真人回话：该算
+        Msg(id="m1", ts=send_ts + 60, user_id="u1", user_name="张三", text="有意思", is_bot=False, is_at=False, is_picture=False, reply_to=""),
+        Msg(id="m2", ts=send_ts + 120, user_id="u1", user_name="张三", text="再说一句", is_bot=False, is_at=False, is_picture=False, reply_to=""),
+        Msg(id="m3", ts=send_ts + 150, user_id="u2", user_name="李四", text="顶", is_bot=False, is_at=False, is_picture=False, reply_to=""),
+    ]
+    host = FakeHost(msgs=msgs, session_id=SID)
+    store, settings, topics, *_ = _make_topics(tmp_path, host=host, signals=signals, cfg=_QUIET_CFG)
+    # 开场白真实发出时刻：outbox.updated=send_ts（MwMsg 窗口才认得出来）
+    with store.tx() as conn:
+        conn.execute(
+            "INSERT INTO outbox (key, group_id, kind, payload, status, result, created, updated)"
+            " VALUES ('topic:1', ?, 'text', '{}', 'sent', ?, ?, ?)",
+            (GID, '{"message_id":"op-1"}', send_ts, send_ts),
+        )
+    tid = _followup_log(store, ts=judge_ts, opener_mid="op-1", due_ts=send_ts + 600)
+    await topics.follow_up(GID, send_ts + 700)
+    import json
+    result = json.loads(dict(store.read().execute("SELECT result FROM topic_log WHERE id=?", (tid,)).fetchone())["result"])
+    assert result["replies"] == 3, f"真人发言条数（发出后10分钟内、含同一人多条），实际 {result}"
+    assert result["active_users"] == 2, f"参与的去重人数，实际 {result}"
+
+
+@pytest.mark.asyncio
+async def test_follow_up_excludes_maibot_own_proactive_messages(tmp_path):
+    """MaiWork 自己发的卡片/提一嘴不能算进 followups（PRD 线上实测 bug）。"""
+    signals = SignalsStub()
+    signals.mark(GID, SID, NOW - 3600)
+    send_ts = _bj_ts(2026, 9, 27, 14, 0)
+    msgs = [
+        # MaiWork 自己发出的开场白（在 outbox 留过 message_id）
+        Msg(id="op-1", ts=send_ts, user_id="bot", user_name="b", text="开场白", is_bot=True, is_at=False, is_picture=False, reply_to=""),
+        # MaiWork 自己发的资讯卡片（outbox 留过 message_id）→ 不算 MaiBot 接话
+        Msg(id="card-9", ts=send_ts + 30, user_id="bot", user_name="b", text="资讯卡", is_bot=True, is_at=False, is_picture=False, reply_to=""),
+        # 真正的 MaiBot 接话（不在任何 MaiWork 记录里）→ 算 followups
+        Msg(id="mb-1", ts=send_ts + 90, user_id="bot", user_name="b", text="MaiBot接了", is_bot=True, is_at=False, is_picture=False, reply_to=""),
+        Msg(id="h1", ts=send_ts + 100, user_id="u1", user_name="张三", text="好耶", is_bot=False, is_at=False, is_picture=False, reply_to=""),
+    ]
+    host = FakeHost(msgs=msgs, session_id=SID)
+    store, settings, topics, *_ = _make_topics(tmp_path, host=host, signals=signals, cfg=_QUIET_CFG)
+    # outbox 里留两条 MaiWork 自己发出去的（开场白 + 卡片），updated=真实发出时刻
+    with store.tx() as conn:
+        for key, mid, ts in (("topic:1", "op-1", send_ts), ("news_card:9", "card-9", send_ts + 30)):
+            conn.execute(
+                "INSERT INTO outbox (key, group_id, kind, payload, status, result, created, updated)"
+                " VALUES (?, ?, 'text', '{}', 'sent', ?, ?, ?)",
+                (key, GID, f'{{"message_id":"{mid}"}}', ts, ts),
+            )
+    tid = _followup_log(store, ts=send_ts, opener_mid="op-1", due_ts=send_ts + 600)
+    await topics.follow_up(GID, send_ts + 700)
+    import json
+    result = json.loads(dict(store.read().execute("SELECT result FROM topic_log WHERE id=?", (tid,)).fetchone())["result"])
+    assert result["followups"] == 1, f"MaiWork 自发的卡片不能算 MaiBot 接话，实际 {result}"
+    assert result["replies"] == 1
+
+
+@pytest.mark.asyncio
+async def test_follow_up_excludes_notice_and_pure_events(tmp_path):
+    """notice: 开头的系统消息 / 纯事件文本不进统计。"""
+    signals = SignalsStub()
+    signals.mark(GID, SID, NOW - 3600)
+    send_ts = _bj_ts(2026, 9, 27, 14, 0)
+    msgs = [
+        Msg(id="notice:join", ts=send_ts + 30, user_id="", user_name="", text="", is_bot=False, is_at=False, is_picture=False, reply_to=""),
+        Msg(id="ev", ts=send_ts + 40, user_id="u9", user_name="x", text="[事件-群消息撤回]", is_bot=False, is_at=False, is_picture=False, reply_to=""),
+        Msg(id="h1", ts=send_ts + 50, user_id="u1", user_name="张三", text="接话", is_bot=False, is_at=False, is_picture=False, reply_to=""),
+    ]
+    host = FakeHost(msgs=msgs, session_id=SID)
+    store, settings, topics, *_ = _make_topics(tmp_path, host=host, signals=signals, cfg=_QUIET_CFG)
+    tid = _followup_log(store, ts=send_ts, opener_mid="op-1", due_ts=send_ts + 600)
+    await topics.follow_up(GID, send_ts + 700)
+    import json
+    result = json.loads(dict(store.read().execute("SELECT result FROM topic_log WHERE id=?", (tid,)).fetchone())["result"])
+    assert result["replies"] == 1
+    assert result["active_users"] == 1
+
+
+@pytest.mark.asyncio
+async def test_follow_up_on_topic_counts_replies_to_opener(tmp_path):
+    """on_topic：引用回复开场白 / 命中候选关键词的真人消息数。"""
+    signals = SignalsStub()
+    signals.mark(GID, SID, NOW - 3600)
+    send_ts = _bj_ts(2026, 9, 27, 14, 0)
+    msgs = [
+        # 引用回复开场白 → 切题
+        Msg(id="h1", ts=send_ts + 60, user_id="u1", user_name="张三", text="同感", is_bot=False, is_at=False, is_picture=False, reply_to="op-1"),
+        # 命中候选关键词（标题词块） → 切题
+        Msg(id="h2", ts=send_ts + 90, user_id="u2", user_name="李四", text="这个开源掌机真不错", is_bot=False, is_at=False, is_picture=False, reply_to=""),
+        # 完全跑题 → 只算 replies，不算 on_topic
+        Msg(id="h3", ts=send_ts + 120, user_id="u3", user_name="王五", text="中午吃什么", is_bot=False, is_at=False, is_picture=False, reply_to=""),
+    ]
+    host = FakeHost(msgs=msgs, session_id=SID)
+    store, settings, topics, *_ = _make_topics(tmp_path, host=host, signals=signals, cfg=_QUIET_CFG)
+    # 候选真实存在，标题含「开源掌机」→ h2 命中标题词块算切题
+    cid = _seed_candidate(store, check_now=send_ts, title="开源掌机新玩法", kind="news", ref_id=7)
+    tid = _followup_log(store, ts=send_ts, opener_mid="op-1", due_ts=send_ts + 600)
+    with store.tx() as conn:
+        conn.execute("UPDATE topic_log SET candidate_id=? WHERE id=?", (cid, tid))
+    await topics.follow_up(GID, send_ts + 700)
+    import json
+    result = json.loads(dict(store.read().execute("SELECT result FROM topic_log WHERE id=?", (tid,)).fetchone())["result"])
+    assert result["replies"] == 3
+    assert result["active_users"] == 3
+    assert result["on_topic"] == 2, f"切题数该算引用回复+命中关键词的，实际 {result}"

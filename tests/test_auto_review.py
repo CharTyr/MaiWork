@@ -620,7 +620,7 @@ class _FakeMentions:
     def __init__(self) -> None:
         self.items: list[dict] = []
 
-    def add(self, group_id, text, *, key, ttl_s, turns=5) -> None:
+    def add(self, group_id, text, *, key, ttl_s, turns=5, target_user_id="", keywords="") -> None:
         self.items.append({"group_id": group_id, "text": text, "key": key})
 
 

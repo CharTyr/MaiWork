@@ -78,6 +78,10 @@ def _skill_block(agents: Any, gid: str, kind: str, *, titles: dict[str, str] | N
     if not body:
         return ""
     title = _kind_title(str(kind), titles)
+    try:
+        agents.skill_touch_use(gid, str(kind), str(items[0].get("name") or ""))
+    except Exception:
+        logger.debug("记录本群做法使用失败（群 %s 岗 %s）", gid, kind, exc_info=True)
     return f"【本群{title}的做法（MaiWork 总结的，是参考）】\n" + body
 
 
@@ -106,8 +110,8 @@ def group_context(
         if block:
             parts.append(block)
     notes = ""
-    if include_notes and kind != "task":
-        # 便条板（docs/34）：专岗开工 / 主模型出构想、检查目标、定资讯关注点时注入，
+    if include_notes:
+        # 便条板（docs/34）：专岗开工、任务规划等显式请求时注入，
         # 其他调用方不传就不出这段。
         try:
             fn = getattr(agents, "notes_block", None)

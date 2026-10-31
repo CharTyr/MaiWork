@@ -58,7 +58,34 @@ def _http(url: Any) -> str:
 # ----------------------------------------------------------------------
 
 
-def _news_entries(view: dict) -> list[dict]:
+def _spec_fragment(store: Any, item_id: Any) -> str:
+    """news_viz 里的 spec 行 → 静态 HTML 片段（vs-static，无脚本无 iframe）。没有/不是 spec → ""。"""
+    if store is None:
+        return ""
+    try:
+        iid = int(item_id)
+    except (TypeError, ValueError):
+        return ""
+    try:
+        row = store.read().execute(
+            "SELECT html FROM news_viz WHERE item_id=? AND status='ok'", (iid,)
+        ).fetchone()
+    except Exception:
+        return ""
+    if row is None or not str(row["html"]).startswith("spec:"):
+        return ""
+    try:
+        from . import news_viz, viz_spec
+        spec = news_viz._load_spec(str(row["html"]))
+        if spec is None:
+            return ""
+        return viz_spec.render(spec, uid=f"sv-{iid}", static=True)
+    except Exception:
+        logger.exception("spec 静态渲染失败（资讯 %s）", iid)
+        return ""
+
+
+def _news_entries(view: dict, store: Any = None) -> list[dict]:
     out: list[dict] = []
     for batch in view.get("news") or []:
         if not isinstance(batch, dict):
@@ -75,13 +102,19 @@ def _news_entries(view: dict) -> list[dict]:
                 if isinstance(r, dict) and _t(r.get("text")):
                     who = _t(r.get("who") or r.get("name"), 30)
                     quotes.append((f"{who}：" if who else "") + _t(r.get("text"), 200))
-            out.append({
+            entry: dict = {
                 "id": str(it.get("id") or ""),
                 "title": it.get("title"),
                 "paras": [it.get("summary"), it.get("why") and f"为什么推荐：{it.get('why')}"],
                 "bullets": [f"群里说过 · {q}" for q in quotes[:5]],
                 "links": links[:5],
-            })
+            }
+            # §4.2：spec 型图解 → 内联静态渲染（vs-static，无脚本无 iframe）
+            if it.get("viz") == "spec":
+                frag = _spec_fragment(store, it.get("id"))
+                if frag:
+                    entry["viz_html"] = frag
+            out.append(entry)
     return out  # 好文（guides）另有入口，这一页不放
 
 
@@ -90,8 +123,15 @@ def _idea_entries(view: dict) -> list[dict]:
     for it in view.get("ideas") or []:
         if not isinstance(it, dict):
             continue
+        state = str(it.get("state") or "new")
+        if state == "dismissed":
+            continue
+        iid = str(it.get("id") or "").strip()
         out.append({
-            "id": f"I-{it.get('id')}",
+            "id": f"I-{iid}",
+            "num": iid,
+            "actionable": state in ("new", "wanted") and str(it.get("kind") or "") != "talk",
+            "items": [x for x in (it.get("items") or []) if isinstance(x, dict)],
             "title": it.get("title"),
             "paras": [it.get("body"),
                       (it.get("basis") or it.get("reason")) and f"依据：{it.get('basis') or it.get('reason')}",
@@ -148,9 +188,9 @@ def _task_entries(view: dict) -> list[dict]:
     return out
 
 
-def _entries(view: dict, tab: str, item: str) -> tuple[str, list[dict]]:
+def _entries(view: dict, tab: str, item: str, store: Any = None) -> tuple[str, list[dict]]:
     if tab == "news":
-        heading, entries = "资讯", _news_entries(view)
+        heading, entries = "资讯", _news_entries(view, store=store)
         if item:
             want = item.split("-")[-1]
             entries = [e for e in entries if e["id"] == want]
@@ -167,14 +207,22 @@ def _entries(view: dict, tab: str, item: str) -> tuple[str, list[dict]]:
     return heading, (entries if item else entries[:TAB_LIMIT])
 
 
-def render_page(data: dict, *, tab: str, item: str = "") -> str:
-    """群友版视图 → 单文件 HTML（纯函数：同样内容出同样字节，digest 才有意义）。"""
+def render_page(data: dict, *, tab: str, item: str = "", store: Any = None) -> str:
+    """群友版视图 → 单文件 HTML（纯函数：同样内容出同样字节，digest 才有意义）。
+
+    store 给了就能顺带把 spec 图解渲进资讯卡片（tests/test_share.py 红线：无脚本）。
+    """
     view = data.get("view") if isinstance(data.get("view"), dict) else data
     name = _t(data.get("name"), 60) or "本群"
-    heading, entries = _entries(view or {}, tab, item)
+    heading, entries = _entries(view or {}, tab, item, store=store)
+    has_viz = any(e.get("viz_html") for e in entries)
     cards = []
     for e in entries:
-        parts = [f'<h2>{_e(e.get("title"), _TITLE_MAX) or "（无标题）"}</h2>']
+        num = str(e.get("num") or "")
+        title_html = f'<h2>{_e(e.get("title"), _TITLE_MAX) or "（无标题）"}</h2>'
+        if num:
+            title_html = f'<h2><span class="num">#{_e(num, 20)}</span> {_e(e.get("title"), _TITLE_MAX) or "（无标题）"}</h2>'
+        parts = [title_html]
         if e.get("badge"):
             parts.append(f'<span class="badge">{_e(e["badge"], 20)}</span>')
         for p in e.get("paras") or []:
@@ -182,13 +230,36 @@ def render_page(data: dict, *, tab: str, item: str = "") -> str:
                 parts.append(f"<p>{_e(p)}</p>")
         if e.get("bullets"):
             parts.append("<ul>" + "".join(f"<li>{_e(b, 220)}</li>" for b in e["bullets"]) + "</ul>")
+        if e.get("items"):
+            parts.append('<ol class="idea-items">' + "".join(
+                f'<li>{_e(x.get("no") or n, 10)}. {_e(x.get("title"), 200)}'
+                + (f'<p>{_e(x.get("desc"))}</p>' if x.get("desc") else "") + '</li>'
+                for n, x in enumerate(e["items"], 1)
+            ) + '</ol>')
+        if e.get("viz_html"):
+            parts.append(str(e["viz_html"]))  # viz_spec 自己转义过
         if e.get("links"):
             parts.append('<p class="links">' + " · ".join(
                 f'<a href="{escape(u, quote=True)}" rel="noopener noreferrer nofollow">{_e(label, 60)}</a>'
                 for u, label in e["links"]) + "</p>")
+        if num and e.get("actionable", True):
+            # 复制口令：纯 CSS user-select:all 一键全选（无脚本）
+            cmd_at = f"@机器人 构想 #{_e(num, 20)}"
+            cmd_mw = f"/mw 派活 构想 #{_e(num, 20)}"
+            parts.append(
+                '<p class="cmd">想做这个？复制口令发给机器人：'
+                f'<code class="copy">{cmd_at}</code> 或 <code class="copy">{cmd_mw}</code></p>'
+            )
         cards.append('<section class="card">' + "".join(parts) + "</section>")
     body = "\n".join(cards) or '<p class="empty">这里暂时没有内容。</p>'
     safe_name = escape(name, quote=True)
+    viz_css = ""
+    if has_viz:
+        try:
+            from . import viz_spec
+            viz_css = viz_spec.CSS + viz_spec._STATIC_CSS
+        except Exception:
+            viz_css = ""
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -207,10 +278,17 @@ def render_page(data: dict, *, tab: str, item: str = "") -> str:
   .card h2 {{ font-size:17px; line-height:1.45; margin:0 0 8px; word-break:break-word; }}
   .card p, .card li {{ font-size:15px; line-height:1.7; margin:0 0 8px; white-space:pre-wrap; word-break:break-word; }}
   .card ul {{ padding-left:4px; list-style:none; margin:0 0 8px; }}
+  .idea-items {{ padding-left:4px; list-style:none; margin:0 0 8px; }}
   .badge {{ display:inline-block; font-size:12px; color:#07c160; background:#e8f8ef;
             border-radius:999px; padding:2px 10px; margin:0 0 8px; }}
   .links a {{ color:#576b95; text-decoration:none; word-break:break-all; }}
+  .cmd {{ font-size:13px; color:#666; margin-top:10px; }}
+  .copy {{ user-select:all; -webkit-user-select:all; background:#f0f0f2;
+           border-radius:6px; padding:1px 6px; font-size:13px;
+           font-family:ui-monospace,Menlo,monospace; }}
+  .num {{ color:#888; font-weight:500; font-size:14px; margin-right:4px; }}
   .empty {{ color:#888; text-align:center; }}
+{viz_css}
 </style>
 </head>
 <body>
@@ -253,7 +331,7 @@ class Share:
         if self.herenow is None or self._view_fn is None:
             return ""
         try:
-            html = render_page(self._view_fn(gid) or {}, tab=tab, item=item)
+            html = render_page(self._view_fn(gid) or {}, tab=tab, item=item, store=self._store)
         except Exception:
             logger.warning("生成公开页失败（群 %s %s/%s）", gid, tab, item, exc_info=True)
             return ""
