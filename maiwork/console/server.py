@@ -2605,6 +2605,7 @@ class ConsoleServer:
                         "last_used": float(it.get("last_used") or 0.0),
                         "created": float(it.get("created") or 0.0),
                         "updated": float(it.get("updated") or 0.0),
+                        "origin": str(it.get("origin") or ""),
                     })
                 return web.json_response({"skills": out_rows})
             except ValueError as e:

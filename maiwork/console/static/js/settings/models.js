@@ -91,37 +91,66 @@ export function usersOf(modelId) {
   return out;
 }
 
-export function modelsPage() {
+function capSummary(m) {
+  const profiles = (state.agents && state.agents.profiles) || [];
+  const main = profiles.find((p) => p.kind === "main");
+  const mainModel = main && main.model ? m.models.find((x) => x.id === main.model) : null;
+  const sReady = state.settings && state.settings.models ? state.settings.models.ready !== false : !!(main && main.model);
+  const mainOk = !!(main && main.model) || (!profiles.length && sReady && m.models.some((x) => !isImageModel(x)));
+  const mainText = mainModel ? (mainModel.name || mainModel.model) : main && main.model ? main.model : mainOk ? "已配置" : "未设置";
+  const visionCount = m.models.filter((x) => !isImageModel(x) && x.vision).length;
+  const imageModels = m.models.filter(isImageModel);
+  const activeImg = m.image_model ? imageModels.find((x) => x.id === String(m.image_model)) : null;
+  const imgText = activeImg ? (activeImg.name || activeImg.model) : imageModels.length ? "待指定默认模型" : "未配置";
+  const cell = (label, val, ok) => `<div class="cap-cell"><span class="cap-k"><span class="dot ${ok ? "ok" : ""}"></span>${label}</span><b class="cap-v">${esc(val)}</b></div>`;
+  return `<div class="cap-strip" role="region" aria-label="模型能力状态">
+    ${cell("主模型", mainText, mainOk)}
+    ${cell("图片识别", visionCount ? `${visionCount} 个模型支持` : "未配置视觉模型", visionCount > 0)}
+    ${cell("图片生成", imgText, !!activeImg)}
+  </div>`;
+}
+
+export function modelsFormSheet() {
+  const edit = state.mdlEdit;
+  if (!edit || !state.mdl) return "";
+  return edit.type === "ep" ? endpointForm(edit.draft, !!edit.isNew) : modelForm(edit.draft, !!edit.isNew);
+}
+
+export function modelsPage(opts = {}) {
   const m = state.mdl;
   if (!m && state.mdlError) return `<p class="err" role="alert">${esc(state.mdlError)}</p><button class="btn" data-act="mdl-reload">刷新</button>`;
   if (!m) return loading();
   const s = state.settings || {};
   const ready = s.models ? s.models.ready !== false : true;
   const edit = state.mdlEdit;
+  const inSheet = state.sheet === "settings-form";
+  const inlineNewEp = !inSheet && edit && edit.type === "ep" && edit.isNew;
   return `
-    ${ready ? "" : `<div class="warn-box">未设置主模型，MaiWork 无法运行<button class="btn small" data-act="set-sub" data-sub="agents" style="margin-left:8px">前往设置</button></div>`}
+    ${ready ? "" : `<div class="warn-box">未设置主模型，MaiWork 无法运行<button class="btn small warn-act" data-act="set-tab" data-sub="models" data-tab="agents">前往设置</button></div>`}
+    ${capSummary(m)}
     <div class="h-sub-row"><h2 class="h-sub">端点${tip("端点是模型服务的接入地址。先添加端点，再在端点下添加模型，然后到「专岗」中为各岗位指定模型。")}</h2><button class="btn small" data-act="mdl-ep-new">添加</button></div>
-    ${edit && edit.type === "ep" && edit.isNew ? endpointForm(edit.draft, true) : ""}
-    ${m.endpoints.length ? m.endpoints.map(endpointBlock).join("") : edit && edit.isNew ? "" : `<p class="h-meta">暂无端点</p>`}
-    ${jevSection()}`;
+    ${inlineNewEp ? endpointForm(edit.draft, true) : ""}
+    ${m.endpoints.length ? m.endpoints.map(endpointBlock).join("") : inlineNewEp ? "" : `<p class="h-meta">暂无端点</p>`}
+    ${opts && opts.omitJev ? "" : jevSection()}`;
 }
 
 function endpointBlock(ep) {
   const edit = state.mdlEdit;
+  const inSheet = state.sheet === "settings-form";
   const models = state.mdl.models.filter((x) => x.endpoint === ep.id);
-  const head = edit && edit.type === "ep" && !edit.isNew && edit.id === ep.id
+  const head = !inSheet && edit && edit.type === "ep" && !edit.isNew && edit.id === ep.id
     ? endpointForm(edit.draft, false)
     : `<div class="set-row mdl-ep">${ico("link")}<div>
         <div class="set-name">${esc(ep.name || ep.id)}<span class="tag">${esc((PROTOCOLS[ep.protocol] || PROTOCOLS.openai).name)}</span></div>
         <div class="set-text"><span class="mono">${esc(ep.base_url || "未填写地址")}</span> · 密钥${ep.key_set ? "已填写" : "<b>未填写</b>"}${ep.checked_at ? ` · ${esc(when(ep.checked_at))} 已测试` : ""}</div>
       </div><span class="row-btns"><button class="btn small" data-act="mdl-ep-edit" data-id="${esc(ep.id)}">修改</button><button class="btn small ghost" data-act="mdl-ep-del" data-id="${esc(ep.id)}">删除</button></span></div>`;
-  const newModel = edit && edit.type === "model" && edit.isNew && edit.draft.endpoint === ep.id ? modelForm(edit.draft, true) : "";
-  return `<section class="mdl-ep-box">
+  const newModel = !inSheet && edit && edit.type === "model" && edit.isNew && edit.draft.endpoint === ep.id ? modelForm(edit.draft, true) : "";
+  return `<section class="set-group mdl-ep-box">
     ${head}
     <div class="mdl-list">
       ${models.map(modelRow).join("") || (newModel ? "" : `<p class="fine">暂无模型</p>`)}
       ${newModel}
-      ${newModel ? "" : `<button class="btn small" data-act="mdl-model-new" data-ep="${esc(ep.id)}">添加模型</button>`}
+      ${newModel ? "" : `<div class="mdl-ep-foot"><button class="btn small" data-act="mdl-model-new" data-ep="${esc(ep.id)}">添加模型</button></div>`}
     </div>
   </section>`;
 }
@@ -152,24 +181,29 @@ function verificationMessage(r) {
 
 function modelRow(x) {
   const edit = state.mdlEdit;
-  if (edit && edit.type === "model" && !edit.isNew && edit.id === x.id) return modelForm(edit.draft, false);
+  if (state.sheet !== "settings-form" && edit && edit.type === "model" && !edit.isNew && edit.id === x.id) return modelForm(edit.draft, false);
   const users = usersOf(x.id);
   const image = isImageModel(x);
   const currentImage = image && String((state.mdl && state.mdl.image_model) || "") === x.id;
   const result = (state.mdlVerification || {})[x.id];
   // 生图模型不跑「验证」（那是聊天口径：会发测试对话，白花钱），改给「设为生图模型」。
-  const acts = image
-    ? `${currentImage
-        ? `<span class="tag">当前生图模型</span>`
-        : `<button type="button" class="btn small" style="min-height:44px;margin-top:8px" data-act="mdl-image-model" data-id="${esc(x.id)}">设为生图模型</button>`}${tip("生图模型仅在任务需要生成图片时调用，不参与对话，因此无需验证。")}`
-    : `<button type="button" class="btn small" style="min-height:44px;margin-top:8px" data-act="mdl-model-verify" data-id="${esc(x.id)}">验证</button>${tip("发送几条测试消息，检查模型能否正常回复和调用工具。会消耗少量 token。")}
-      <div class="set-text mdl-verify-result" role="status" aria-live="polite"${result ? "" : " hidden"}>${result ? esc(verificationMessage(result)) : ""}</div>`;
-  return `<div class="set-row mdl-model">${ico("robot")}<div>
-      <div class="set-name">${esc(x.name || x.model)}${image ? `<span class="tag">${esc(USE_NAMES.image)}</span>` : ""}${x.name && x.name !== x.model ? ` <span class="fine mono">${esc(x.model)}</span>` : ""}</div>
+  const extraAct = image
+    ? `${currentImage ? "" : `<button type="button" class="btn small" data-act="mdl-image-model" data-id="${esc(x.id)}">设为生图模型</button>`}${tip("生图模型仅在任务需要生成图片时调用，不参与对话，因此无需验证。")}`
+    : `<button type="button" class="btn small" data-act="mdl-model-verify" data-id="${esc(x.id)}">验证</button>${tip("发送几条测试消息，检查模型能否正常回复和调用工具。会消耗少量 token。")}`;
+  const verifyOut = image
+    ? ""
+    : `<div class="set-text mdl-verify-result" role="status" aria-live="polite"${result ? "" : " hidden"}>${result ? esc(verificationMessage(result)) : ""}</div>`;
+  const badges = [
+    image ? `<span class="tag">${esc(USE_NAMES.image)}</span>` : "",
+    currentImage ? `<span class="tag ntag ok">当前生图模型</span>` : "",
+    !image && x.vision ? `<span class="tag">支持图片</span>` : "",
+  ].join("");
+  return `<div class="set-row mdl-model"><div>
+      <div class="set-name">${esc(x.name || x.model)}${badges}${x.name && x.name !== x.model ? ` <span class="fine mono">${esc(x.model)}</span>` : ""}</div>
       <div class="set-text mdl-meta">${esc(modelMeta(x))}</div>
       <div class="set-text">${image ? "供子 agent 生成图片" : users.length ? `使用者：${esc(users.join("、"))}` : "未被使用"}</div>
-      ${acts}
-    </div><span class="row-btns"><button class="btn small" data-act="mdl-model-edit" data-id="${esc(x.id)}">修改</button><button class="btn small ghost" data-act="mdl-model-del" data-id="${esc(x.id)}">删除</button></span></div>`;
+      ${verifyOut}
+    </div><span class="row-btns mdl-row-btns">${extraAct}<button class="btn small" data-act="mdl-model-edit" data-id="${esc(x.id)}">修改</button><button class="btn small ghost" data-act="mdl-model-del" data-id="${esc(x.id)}">删除</button></span></div>`;
 }
 
 let headerSeq = 0;
@@ -593,9 +627,7 @@ export async function actModels(action, el) {
         out.hidden = false;
         if (r.ok && !r.stale && r.suggested_max_tokens) {
           const save = document.createElement("button");
-          save.className = "btn small";
-          save.style.minHeight = "44px";
-          save.style.margin = "8px 0";
+          save.className = "btn small mdl-apply-btn";
           save.dataset.act = "mdl-model-apply-limit";
           save.dataset.id = id;
           save.textContent = `应用建议值 ${r.suggested_max_tokens}`;

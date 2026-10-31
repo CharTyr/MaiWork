@@ -44,7 +44,7 @@ from CharTyr_MaiWork.maiwork.goals import Goals
 from CharTyr_MaiWork.maiwork.host import Host
 from CharTyr_MaiWork.maiwork.store import Store
 from CharTyr_MaiWork.maiwork.tasks import Tasks
-from CharTyr_MaiWork.maiwork.tools import Tools
+from CharTyr_MaiWork.maiwork.tools import Tool, ToolResult, Tools
 
 pytestmark = pytest.mark.asyncio
 
@@ -149,9 +149,42 @@ def _kinds(store: Store, tid: str) -> list[tuple[str, dict]]:
     return [(str(r["kind"]), json.loads(r["payload"] or "{}")) for r in rows]
 
 
+class _VisionReady:
+    """给 ModelsQueue 包一层「已配看图模型」（has_vision → True，其余全部透传）。
+
+    2026-10-31 能力边界刹车后：任务带原图 = 需要看图能力——没有 read_image 工具或
+    没配 vision 模型就走「重排 → 暂停」。本文件的用例测的是原图收集与透传，不是
+    能力闸，所以统一把 harness 摆成「看图能力已就绪」；要测闸本身去
+    test_capability_brakes.py。
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def has_vision(self, kind="task"):  # noqa: ARG002
+        return True
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+async def _read_image_stub(ctx, args):  # noqa: ARG001
+    return ToolResult(ok=True, output="（测试桩）", data={})
+
+
 def _coordinator(
     *, mem_store, settings, env, tools, tasks, goals, models, workers, host=None
 ):
+    if tools.get("read_image", "worker") is None:
+        tools.register(Tool(
+            name="read_image",
+            description="测试桩（只证明注册表里真有）",
+            parameters={"type": "object", "properties": {}},
+            roles=frozenset({"worker"}),
+            handler=_read_image_stub,
+        ))
+    if not callable(getattr(models, "has_vision", None)):
+        models = _VisionReady(models)
     return _build(
         mem_store=mem_store, settings=settings, env=env, tools=tools, tasks=tasks,
         goals=goals, models=models, workers=workers, host=host,

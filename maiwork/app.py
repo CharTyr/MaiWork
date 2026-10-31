@@ -694,6 +694,7 @@ class MaiWorkApp:
             register_exec_tools(
                 self.tools, env=self.env, host=self.host,
                 get_settings=self.get_settings, session_of=self._session_of_group,
+                models=self.models,
             )
             # 「受限」时不给子 agent 跑命令的工具（文件读写工具保留）
             self._drop_command_tools_if_stopped(self.tools)
@@ -1879,10 +1880,33 @@ class MaiWorkApp:
             return AutoReviewer(
                 self.store, self.models, self.approvals, self.get_settings,
                 run_task_starter=self.spawn_run_task,
+                has_vision=self._has_vision_capability,
+                has_imagegen=self._has_imagegen_capability,
             )
         except Exception:
             logger.exception("建 AutoReviewer 出错，派活自动审核这次跳过")
             return None
+
+    def _has_vision_capability(self) -> bool:
+        """现在配了看图（vision=true）的 chat 模型吗——供自动审核的能力边界判断。"""
+        fn = getattr(getattr(self, "models", None), "has_vision", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn("task"))
+        except Exception:
+            logger.debug("查看图模型就绪状态出错，按没配处理", exc_info=True)
+            return False
+
+    def _has_imagegen_capability(self) -> bool:
+        """现在配了生图模型吗（use="image" 条目 + 端点有地址和密钥），同 coordinator 口径。"""
+        try:
+            from .tools_imagegen import image_entries
+
+            return bool(image_entries(self.get_settings()))
+        except Exception:
+            logger.debug("查生图模型就绪状态出错，按没配处理", exc_info=True)
+            return False
 
     def _make_goal_fit(self) -> Any:
         """立目标前的判断（goal_fit.py，R5）；模块没就位 / 构造失败就 None，这块功能跳过。"""
@@ -3818,6 +3842,11 @@ class MaiWorkApp:
                 search=getattr(self, "search", None),
                 # 资讯关闭：跳过自动订阅 / 退订 / 来源发现（资讯专属），其余共享分支照跑
                 news_enabled=self._feature_on(gid, "news"),
+                # 闲时 skill 探索（2026-10-31）：本机沙箱 + 4 道硬门槛都在模块里
+                workers=self.workers,
+                env=self.env,
+                tools=self.tools,
+                get_known_secrets=self.known_secrets,
             )
         if out.get("mentions") or out.get("taste") or out.get("lessons") or out.get("auto"):
             logger.info("反馈 / 口味 / 做事经验 / 自动订阅（群 %s）：%s", gid, out)

@@ -11,6 +11,8 @@ import { loadIdentity } from "./settings/identity.js";
 import { loadAgents } from "./settings/agents.js";
 import { loadLogSummary } from "./settings/logs.js";
 import { loadModels } from "./settings/models.js";
+import { loadAppearance } from "./settings/appearance.js";
+import { loadSocial } from "./settings/social.js";
 import { closeSheet, repaintSheet } from "./sheet.js";
 import { chatPoll, enterChat, loadChat, paintChat } from "./chat.js";
 import { render, renderRail, renderSide, renderView } from "./render.js";
@@ -443,13 +445,15 @@ window.addEventListener("hashchange", () => {
     Promise.all([
       state.settings ? null : loadSettings(),
       state.setSub === "extensions" && !state.ext ? loadExt() : null,
+      state.setSub === "extensions" ? loadSocial() : null,
       state.setSub === "rules" ? loadRules() : null,
+      state.setSub === "rules" ? loadAppearance() : null,
       state.setSub === "usage" ? loadUsage() : null,
-      ["memory", "agents"].includes(state.setSub) ? loadIdentity() : null,
+      ["models", "rules"].includes(state.setSub) ? loadIdentity() : null,
       state.setSub === "models" ? loadModels() : null,
-      state.setSub === "agents" && !state.agents ? loadAgents() : null,
+      state.setSub === "models" && !state.agents ? loadAgents() : null,
       state.setSub === "usage" ? loadLogSummary() : null,
-      state.setSub === "links" ? loadGA() : null,
+      state.setSub === "sources" ? loadGA() : null,
     ]).then(() => render());
     return;
   }

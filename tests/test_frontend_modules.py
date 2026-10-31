@@ -90,7 +90,7 @@ def test_specialist_admin_interface_contract():
     assert "state.agentLoadSeq" in text, "切群时必须防止旧请求覆盖当前群"
     assert 'a.kind === "task"' in text, "通用任务也应有只读交接记录"
     router = (JS / "router.js").read_text(encoding="utf-8")
-    assert router.count('state.setSub === "agents"') >= 2
+    assert router.count("loadAgents()") >= 2
 
 
 def test_specialist_fish_avatar_contract():
@@ -215,9 +215,9 @@ def test_guide_only_batch_points_to_articles():
 
 
 def test_settings_agents_nav_uses_fish_emoji():
-    """设置里「专岗」的图标是 🐟（Fluent 3D，和其他图标同一套），不是机器人。"""
+    """专岗并入「模型与专岗」二级分栏；🐟 图标资源与映射保持有效供专岗与标题复用。"""
     idx = (JS / "settings/index.js").read_text(encoding="utf-8")
-    assert '["agents", "专岗", "fish",' in idx
+    assert '["agents", "专岗与人格"]' in idx
     util = (JS / "util.js").read_text(encoding="utf-8")
     icons = util[util.index("const ICONS"):].split("\n", 1)[0]
     assert " fish " in icons or " fish\"" in icons

@@ -12,7 +12,7 @@ def test_vertical_picker_in_settings_and_config_sections():
     source = "\n".join(line for line in source.splitlines() if not line.startswith("import ")).replace("export ", "")
     setup = r'''
 import assert from "node:assert/strict";
-const state = {settings: null, setSub: "social", rules: {sections: [
+const state = {settings: null, setSub: "extensions", setTab: {}, rules: {sections: [
   {id: "feeds", label: "资讯", fields: []}, {id: "tasks", label: "任务", fields: []}
 ]}, cfgSec: "tasks"};
 const esc = s => String(s ?? "").replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;");
@@ -21,8 +21,8 @@ const loading = () => "加载中";
     body = r'''
 const settings = settingsPage();
 assert.doesNotMatch(settings, /class="section-picker"/); // 分栏圆按钮只在「全部设置」页
-assert.match(settings, /data-act="set-sub" data-sub="social" aria-selected="true"/);
-assert.doesNotMatch(settings, /data-sub="social-login"|class="set-picker"/);
+assert.match(settings, /data-act="set-sub" data-sub="extensions" aria-selected="true"/);
+assert.doesNotMatch(settings, /data-sub="social-login"|data-sub="social"|class="set-picker"/);
 assert.match(settings, /class="set-nav"/); // 保留原分栏
 const config = rulesPage();
 assert.match(config, /class="section-tabs">\s*<details class="section-picker">/);

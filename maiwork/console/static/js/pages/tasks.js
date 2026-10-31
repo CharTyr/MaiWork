@@ -59,7 +59,7 @@ export function viewTasks(g, v) {
   }
   let i = 0;
   if (pending.length) {
-    html += `<h2 class="h-sub" style="margin-top:22px">${gadmin() ? "待审批" : "等待审批"} <small>${pending.length} 件</small></h2>`;
+    html += `<h2 class="h-sub h-sub-tight">${gadmin() ? "待审批" : "等待审批"} <small>${pending.length} 件</small></h2>`;
     html += pending
       .map(
         (p) => `
@@ -105,7 +105,9 @@ export function viewTasks(g, v) {
     }).join("")}</div>`;
     const f = FILTERS.find((x) => x.id === state.filter) || FILTERS[0];
     const rows = list.filter(f.match);
-    html += rows.length ? `<div>${rows.map((t) => taskRow(t, i++)).join("")}</div>` : `<p class="h-meta" style="margin-top:18px">暂无</p>`;
+    html += rows.length
+      ? `<div>${rows.map((t) => taskRow(t, i++)).join("")}</div>`
+      : `<div class="empty-filter"><span class="h-meta">当前筛选下暂无任务</span><button type="button" class="btn small" data-act="filter" data-f="all">查看全部</button></div>`;
   }
   return html + goalsHtml;
 }

@@ -69,6 +69,8 @@ export const state = {
   chat: null,
   chatOpen: {},
   setSub: "overview",
+  setTab: {}, // 各合并设置页的当前二级分栏：{models, extensions, sources, usage, rules}
+  groupSub: "feed", // 管理员在群页的二级分栏："feed"（动态与画像）| "admin"（本群设置）
   ext: null, // /api/extensions
   extEdit: null, // {kind: "mcp"|"skill", name: null|string, data}
   newsTopic: "", // 资讯页主题筛选（点 .ntag 按主题过）

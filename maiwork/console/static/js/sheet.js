@@ -6,7 +6,10 @@ import { gname, grp } from "./api.js";
 import { detailHTML, loadTask } from "./detail.js";
 import { handoffSheet } from "./handoff.js";
 import { groupPicker } from "./settings/index.js";
-import { draft } from "./settings/models.js";
+import { draft, modelsFormSheet } from "./settings/models.js";
+import { jevFormSheet } from "./settings/jev.js";
+import { extFormSheet } from "./settings/ext.js";
+import { agentsFormSheet } from "./settings/agents.js";
 import { chatSide } from "./chat.js";
 import { renderRail, renderSide, renderView } from "./render.js";
 import { syncHash } from "./router.js";
@@ -87,11 +90,43 @@ function editSheet() {
 
 export const sheetChrome = () => `<div class="grab"></div><button class="sheet-close" data-act="close" aria-label="关闭">${SVG.close}</button>`;
 
+function hasSettingsForm() {
+  return Boolean(
+    state.mdlEdit ||
+    state.jevPick ||
+    state.jevEdit ||
+    state.extEdit ||
+    state.agentNew ||
+    state.agentEdit ||
+    state.agentFishEdit
+  );
+}
+
+function clearSettingsForm() {
+  state.mdlEdit = null;
+  state.jevPick = false;
+  state.jevEdit = null;
+  state.extEdit = null;
+  state.agentNew = false;
+  state.agentEdit = null;
+  state.agentFishEdit = null;
+  state.agentFishDraft = null;
+}
+
+function settingsFormSheet() {
+  if (state.mdlEdit) return modelsFormSheet();
+  if (state.jevEdit || state.jevPick) return jevFormSheet();
+  if (state.extEdit) return extFormSheet();
+  if (state.agentNew || state.agentEdit || state.agentFishEdit) return agentsFormSheet();
+  return "";
+}
+
 function sheetHTML(kind) {
   if (kind === "chats") return chatsSheet();
   if (kind === "groups") return groupPicker();
   if (kind === "appearance") return appearanceSheet();
   if (kind === "social-cookie") return socialCookieSheet();
+  if (kind === "settings-form") return settingsFormSheet();
   if (kind === "login") return loginSheet();
   if (kind === "edit") return editSheet();
   if (kind === "handoff") return handoffSheet();
@@ -236,15 +271,42 @@ function _sheetTrap(e) {
   }
 }
 
+let _sheetPrevSel = "";
+
+function _focusSelector(el) {
+  if (!el || !el.dataset || !el.dataset.act) return "";
+  const q = (v) => (typeof CSS !== "undefined" && CSS.escape ? CSS.escape(v) : String(v).replace(/["\\]/g, "\\$&"));
+  let s = `[data-act="${q(el.dataset.act)}"]`;
+  for (const k of ["id", "ep", "name", "kind"]) {
+    if (el.dataset[k]) s += `[data-${k}="${q(el.dataset[k])}"]`;
+  }
+  return s;
+}
+
+function _restoreSheetFocus() {
+  const target = _sheetPrevFocus && document.contains(_sheetPrevFocus)
+    ? _sheetPrevFocus
+    : _sheetPrevSel && typeof document.querySelector === "function"
+      ? document.querySelector(_sheetPrevSel)
+      : null;
+  if (target && typeof target.focus === "function") target.focus({ preventScroll: true });
+  _sheetPrevFocus = null;
+  _sheetPrevSel = "";
+}
+
 export function openSheet(kind) {
   const was = state.sheet;
   clearTimeout(_closeTimer);
   _drag = null;
   _clearDragInline();
   if (kind !== "preview" || was !== "preview") _sheetBack = kind === "preview" && was === "detail" ? "detail" : null;
-  if (!was) _sheetPrevFocus = document.activeElement; // 第一扇抽屉记焦点
+  if (!was) {
+    _sheetPrevFocus = document.activeElement; // 第一扇抽屉记焦点
+    _sheetPrevSel = _focusSelector(_sheetPrevFocus);
+  }
   state.sheet = kind;
   const sh = $("sheet");
+  if (sh.dataset) sh.dataset.kind = kind || "";
   _bindSheetDrag(sh);
   sh.innerHTML = sheetChrome() + sheetHTML(kind);
   sh.hidden = false;
@@ -265,6 +327,17 @@ export function openSheet(kind) {
 }
 
 export function repaintSheet(opts = {}) {
+  let openedNow = false;
+  if (!opts.preserveSheet && state.page === "settings") {
+    if (hasSettingsForm()) {
+      if (state.sheet !== "settings-form") {
+        openSheet("settings-form");
+        openedNow = true;
+      }
+    } else if (state.sheet === "settings-form") {
+      closeSheet({ skipRender: true });
+    }
+  }
   if (state.page === "settings") {
     const y = window.scrollY;
     renderView();
@@ -272,7 +345,7 @@ export function repaintSheet(opts = {}) {
     renderRail();
     window.scrollTo(0, y);
   }
-  if (!state.sheet || opts.preserveSheet) return;
+  if (!state.sheet || opts.preserveSheet || openedNow) return;
   const sh = $("sheet");
   const top = sh.scrollTop;
   sh.innerHTML = sheetChrome() + sheetHTML(state.sheet);
@@ -287,17 +360,21 @@ export function resetSheet() {
   state.sheet = null;
   _sheetBack = null;
   draft.models = null;
+  clearSettingsForm();
   document.removeEventListener("keydown", _sheetTrap, true);
   _sheetInert(false);
   for (const id of ["sheet", "scrim"]) {
     const el = $(id);
-    if (el) { el.classList.remove("on"); el.hidden = true; }
+    if (el) {
+      if (el.dataset) el.dataset.kind = "";
+      el.classList.remove("on");
+      el.hidden = true;
+    }
   }
-  if (_sheetPrevFocus && document.contains(_sheetPrevFocus)) _sheetPrevFocus.focus({ preventScroll: true });
-  _sheetPrevFocus = null;
+  _restoreSheetFocus();
 }
 
-export function closeSheet() {
+export function closeSheet(opts = {}) {
   if (!state.sheet) { resetSheet(); return; }
   if (state.sheet === "preview" && _sheetBack === "detail" && state.detail && !desktop.matches) {
     openSheet("detail");
@@ -322,19 +399,23 @@ export function closeSheet() {
     state.boardOpen = {};
     if (state.page === "board") renderView();
   }
+  if (state.sheet === "settings-form") {
+    clearSettingsForm();
+    if (!opts.skipRender && state.page === "settings") renderView();
+  }
   state.sheet = null;
   draft.models = null;
   _drag = null;
   _clearDragInline();
   sfx("close");
   const sh = $("sheet");
+  if (sh.dataset) sh.dataset.kind = "";
   sh.classList.remove("on");
   $("scrim").classList.remove("on");
   document.removeEventListener("keydown", _sheetTrap, true);
   _sheetInert(false);
-  // 焦点还给开抽屉前的那个元素（可能被换掉了，检查还连着再还）
-  if (_sheetPrevFocus && document.contains(_sheetPrevFocus)) _sheetPrevFocus.focus({ preventScroll: true });
-  _sheetPrevFocus = null;
+  // 焦点还给开抽屉前的那个元素（若视图重绘过则按原按钮标识还原）
+  _restoreSheetFocus();
   clearTimeout(_closeTimer);
   const finishClose = () => {
     clearTimeout(_closeTimer);

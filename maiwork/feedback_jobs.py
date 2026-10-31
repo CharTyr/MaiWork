@@ -82,6 +82,10 @@ async def run(
     transport: Any = None,
     search: Any = None,
     news_enabled: bool = True,
+    workers: Any = None,
+    env: Any = None,
+    tools: Any = None,
+    get_known_secrets: Callable[[], list[str]] | None = None,
 ) -> dict[str, Any]:
     gid = str(gid)
     _last[gid] = now
@@ -116,4 +120,21 @@ async def run(
             out["lessons"] = int((lessons_out or {}).get("changes", 0) or 0)
         except Exception:
             logger.exception("本群做法 skill 复盘这一轮出错（群 %s）", gid)
+    # 闲时自主探索成熟 skill（2026-10-31 能力边界与自主探索）：每群每天最多 1 次、
+    # 只在没有任务在跑的空闲期；节流与 4 道硬门槛全在模块里，炸了只记日志。
+    # workers / env / search / agents 任一没注入（老调用方 / 测试替身）就跳过。
+    if (workers is not None and env is not None and search is not None
+            and agents is not None):
+        try:
+            from . import skill_explore
+
+            explore_out = await skill_explore.run(
+                store, models, workers, env, agents, gid, now,
+                profiles=profiles, tools=tools,
+                get_known_secrets=get_known_secrets, search=search,
+            )
+            if explore_out.get("ran") or explore_out.get("skill_id"):
+                out["skill_explore"] = explore_out
+        except Exception:
+            logger.exception("闲时 skill 探索这一轮出错（群 %s）", gid)
     return out

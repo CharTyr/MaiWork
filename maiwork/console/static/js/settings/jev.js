@@ -23,22 +23,32 @@ export async function loadJev() {
   }
 }
 
+export function jevFormSheet() {
+  const v = state.jev;
+  if (!v) return "";
+  if (state.jevEdit) return jevForm(state.jevEdit.draft, !!state.jevEdit.isNew);
+  if (state.jevPick) return pickBox(presetsLeft(v));
+  return "";
+}
+
 export function jevSection() {
   const v = state.jev;
-  const edit = state.jevEdit;
+  const inSheet = state.sheet === "settings-form";
+  const edit = inSheet ? null : state.jevEdit;
   const left = v ? presetsLeft(v) : [];
-  const picking = !!(v && state.jevPick && !edit);
+  const picking = !inSheet && !!(v && state.jevPick && !edit);
   // 平时只给一个「添加」：还有没接的预设就先让人挑一家，全接过了直接进自定义表单
   const addBtn = !v || picking || (edit && edit.isNew) ? "" : `<button class="btn small" data-act="${left.length ? "jev-pick" : "jev-new"}">添加</button>`;
   const head = `<div class="h-sub-row"><h2 class="h-sub">快速判断${tip("Jev 等判断模型可在一两秒内回答「是否」「选哪个」类问题，比主模型更快、成本更低。同一时间只能使用一个服务。")}</h2>${addBtn}</div>`;
   if (!v) return head + (state.jevError ? `<p class="err" role="alert">${esc(state.jevError)}</p>` : `<p class="fine">加载中…</p>`);
   const eps = v.endpoints || [];
+  const rows = eps.map((ep) => (edit && !edit.isNew && edit.id === ep.id ? jevForm(edit.draft, false) : jevRow(ep, v.use))).join("");
   return `${head}
     ${v.use && !eps.some((e) => e.id === v.use) ? `<div class="warn-box">所选服务已不存在，快速判断暂由主模型处理。请重新选择服务。</div>` : ""}
     ${v.enabled === false ? `<p class="fine">快速判断已在「全部设置」中关闭，重新开启后以下选择才会生效。</p>` : ""}
     ${picking ? pickBox(left) : ""}
     ${edit && edit.isNew ? jevForm(edit.draft, true) : ""}
-    ${eps.map((ep) => (edit && !edit.isNew && edit.id === ep.id ? jevForm(edit.draft, false) : jevRow(ep, v.use))).join("")}
+    ${rows ? `<div class="set-group">${rows}</div>` : ""}
     ${quickJudgeBlock(v.quick_judge)}`;
 }
 

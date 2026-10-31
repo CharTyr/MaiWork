@@ -101,6 +101,7 @@ async def test_settings_attention_and_optional_components_responsive(env, monkey
                 assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth'), width
                 await page.screenshot(path=str(tmp_path / f'attention-{width}.png'), full_page=True)
                 await page.goto(base + '/#/settings/extensions')
+                await page.get_by_role('tab', name='可选组件', exact=True).click()
                 await expect(page.get_by_role('heading', name='可选组件', exact=True)).to_be_visible()
                 await expect(page.get_by_role('button', name='安装', exact=True)).to_be_visible()
                 assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth'), width

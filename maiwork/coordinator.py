@@ -197,6 +197,7 @@ _INPUT_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 单张解码后超过 10MB 不要
 _INPUT_IMAGES_HINT = (
     "群友这条请求附带 / 引用了 {n} 张图片，已经存到工作区：{paths}。"
     "要改图、看图的活必须基于这些原图做，不要另画一张。"
+    "看图上写了什么、认表格、看排版用 read_image 读这几张原图（read_file 读图片会被拦）。"
 )
 _INPUT_IMAGES_REVIEW_HINT = (
     "原图在 {paths}，改图类活要对照原图判断是不是在原图基础上改的。"
@@ -630,6 +631,34 @@ def job_needs_image_capability(text: str) -> bool:
     return bool(_NEED_IMAGE_RE.search(str(text or "")))
 
 
+# 看图 / 识图（2026-10-31 能力边界刹车）：要「真正看懂图片内容」的活——读图上的字、
+# 认表格、看排版、说截图是什么——子 agent 必须有 read_image，而且**得真配了
+# vision=True 的 chat 模型**。没配 → 走现有能力闸（重排一次 → 暂停），绝不硬派一条
+# 只能瞎猜的看图活。画图（job_needs_image_capability）是另一件事，那条管生图模型。
+_VISION_TOOL_NAME = "read_image"
+_NEED_VISION_RE = re.compile(
+    # 「看看这张图 / 看一下截图 / 看看照片」：看 + （下/一下/眼/张/个）+ 图类词
+    r"看{1,2}(?:下|一下|眼|张|个)?.{0,3}(?:截图|照片|图片|表情包|图)"
+    # 「图里写了什么 / 截图上的字 / 照片里的内容」：图类词 + 里/中/上 + 内容动词
+    r"|(?:截图|照片|图片|表情包|图).{0,4}(?:里|中|上).{0,4}(?:写|说|是|有|内容|字|什么|啥)"
+    # 「识别/辨认/看懂/读出/提取 + 图类词」
+    r"|(?:识别|辨认|看懂|读出|提取).{0,4}(?:截图|照片|图片|表情包|图|文字)"
+    # 「图写了什么 / 截图是什么意思 / 图片里有什么」：图类词 + 疑问短语
+    r"|(?:截图|照片|图片|表情包|图).{0,4}"
+    r"(?:写了什么|说了什么|里有什么|什么意思|是什么|上面写|说的啥|写的啥)"
+)
+
+
+def job_needs_vision_capability(text: str) -> bool:
+    """交接单 / 完成标准文本里有没有「要真正看图」的字样（看图读字 / 识表 / 看排版）。
+
+    命中的活没有 read_image + vision 模型就只能瞎猜（read_file 看到 PNG 魔数会被
+    拦下引导到 read_image）。「把图片整理好」「下载封面图」「画一张海报」不算——
+    那是整理 / 下载 / 画图，不需要看懂图的内容。
+    """
+    return bool(_NEED_VISION_RE.search(str(text or "")))
+
+
 def job_needs_exec_capability(text: str) -> bool:
     """交接单 / 完成标准文本里有没有「要下载 / 本地存图 / 压缩包 / 跑代码」的字样。
 
@@ -661,6 +690,7 @@ _NEED_LABELS = {
     "extract": "抓正文工具",
     "write": "写文件工具（write_file）",
     "image": "生图工具（generate_image）",
+    "vision": "看图工具（read_image）+ 识图模型",
     # 2026-10-15 任务 B：提示词里会点名的工具，自动补进名单
     "render_report": "报告网页工具（render_report）",
     "read_skill": "读 skill 工具（read_skill）",
@@ -794,6 +824,11 @@ class ExecCheckReport:
                 "也可以改为不用图片交付（改用文字或表格说明），"
                 "或先在网页「设置 → 模型」添加一个用途为「生图」的模型。"
             )
+        elif needs == {"vision"}:
+            tail = (
+                "也可以把「看看图上写了什么」改成只用文字材料的做法，"
+                "或先在网页「设置 → 模型」给一个对话模型勾上「识图 vision」。"
+            )
         else:
             tail = "也可以把这条活改派给能拿到这些工具的岗位，或取消。"
         return (
@@ -846,8 +881,9 @@ _RAILWAY_KEEP_LOCAL = ("read_file", "write_file", "list_files")
 _MACHINE_TOOLS = ("machine_run", "machine_put_file", "machine_read_file", "machine_fetch_file")
 
 
-# 主模型验收回合固定给的两个只读核对工具（tools_exec 注册，roles={"main"}）
-_REVIEW_TOOLS = ("inspect_file", "inspect_files")
+# 主模型验收回合固定给的三个只读核对工具（tools_exec 注册，roles={"main"}；
+# inspect_image 只在装配时给了 models 才注册，没注册 specs() 会自动跳过）
+_REVIEW_TOOLS = ("inspect_file", "inspect_files", "inspect_image")
 # 排计划回合固定给的两个读 skill 工具（skills_tools 注册，roles={"main", "worker"}；
 # 主模型经 ToolContext(role="main") 调，内容只给 roles 含 main 的 skill）
 _PLAN_SKILL_TOOLS = ("list_skills", "read_skill")
@@ -2243,7 +2279,10 @@ class Coordinator:
             + ' "after": ["要用前一步的产出（比如先调研、再按调研做页面）时写这个：'
             '前一步 jobs 的编号（第 1 个是 1），可以写 1 个或几个；'
             '互不依赖的不写 after，才会同时跑；写了 after 的会等那几步跑完、把那几步交回的东西给它"]}]（1 到 2 个）,'
-            ' "question": null | "如果信息不够、不能开工，写一句要在群里问发起人的话；能开工就是 null"}'
+            ' "question": null | "如果信息不够、不能开工，写一句要在群里问发起人的话；能开工就是 null",'
+            ' "unsupported": null | "这项需求超出 MaiWork 的能力边界（原图修图 / 改表情、'
+            '做视频动画、无文字冷门图反查精确出处、登录外部账号 / 过验证码等）时，'
+            '写一句大白话原因；能做就是 null——写了 unsupported 就别硬排计划"}'
         )
         if locked:
             prompt_lines.append(
@@ -2260,6 +2299,23 @@ class Coordinator:
         image_line = self._imagegen_capability_line()
         if image_line:
             prompt_lines.append(image_line)
+        # 2026-10-31 能力边界刹车：把「什么做不到」明白写给排计划的主模型——整条需求
+        # 都在边界外时用 unsupported 字段直接说做不到，不硬排一个注定做不成的计划
+        # （比开工后才被能力闸拦下省一整轮子 agent + 重排）。
+        vision_line = self._vision_capability_line()
+        prompt_lines.append(
+            "能力边界（排计划前先看这条，整条需求在边界外就用 unsupported 说明，别硬派）："
+            "能做的：查资料、做网页 / 文件 / 文案、"
+            + (
+                "看群友给的图（读图上的字、认表格、看排版，子 agent 用 read_image）；"
+                if self._vision_configured()
+                else ""
+            )
+            + "做不到的：基于原图修图 / 改表情 / 换脸这类修图改图、做视频 / 动画 / 音频、"
+            "没有文字的冷门图片或漫画截图反查精确出处、登录外部私人账号 / 过验证码、"
+            "在线下真实世界办事。"
+            + vision_line
+        )
         role_lines = self._role_tools_hint_lines()
         if role_lines:
             prompt_lines.append("")
@@ -2377,6 +2433,25 @@ class Coordinator:
                 summary=lead_lane.summary_text or None,
                 covered_count=lead_lane.covered, covered_rev=lead_rev,
             )
+
+        # 2026-10-31 能力边界刹车：主模型开工前直接说「超出能力边界」→ 返回壳计划，
+        # _run_one_attempt 走 _finish_unsupported 收尾（零子 agent、不开远程机器、
+        # 不重试）。别的字段可能根本没给（没清单没活都不算错），别走下面的清单校验。
+        unsupported = str(data.get("unsupported") or "").strip()[:400]
+        if unsupported:
+            return {
+                "criteria": list(crit or []),
+                "requirements": locked,
+                "deliver_kind": "text",
+                "scale": "brief",
+                "jobs": [],
+                "question": "",
+                "env": "",
+                "machine": "",
+                "env_reason": "",
+                "research": False,
+                "unsupported": unsupported,
+            }
 
         req_fresh = False
         req_changed = False
@@ -2555,6 +2630,8 @@ class Coordinator:
             "env_reason": env_reason,
             # 有子任务被标成调研类 → 验收时做引用核对（交付里没链接就不加那段，见 _review）
             "research": any(j["type"] == "research" for j in jobs),
+            # 2026-10-31 能力边界刹车：空串 = 没说做不到（上面非空时早返回了）
+            "unsupported": unsupported,
         }
 
     # ------------------------------------------------------------------
@@ -2693,6 +2770,15 @@ class Coordinator:
                 # 运行中被改了要求（版本 +1、排回 queued）：这一轮记作废，不留悬着的尝试。
                 # 只认版本变化；暂停 / 终态维持原有处理。
                 self._tasks.accept_result(tid, attempt_id, req_version)
+            return "done"
+
+        # 2026-10-31 能力边界刹车：主模型开工前认出「超出能力边界」→ 直接收尾：
+        # 零子 agent、不开远程机器（下面 _setup_exec_env 根本没走到）、不重试。
+        if str(plan.get("unsupported") or "").strip():
+            self._finish_unsupported(
+                tid, gid, attempt_id, attempt_n, plan["unsupported"]
+            )
+            self._write_tokens(tid)
             return "done"
 
         # question → waiting_input + 群里问一句
@@ -3068,8 +3154,16 @@ class Coordinator:
 
         # docs/22 §4 G（2026-10-07 本地）：没做到的必须项**全部**带 blocked（客观做不到）
         # 且证据写清了尝试过程、而且已经是第 2 次及以后的尝试 → 不再整轮重跑，转
-        # waiting_input 用代码拼一句话问发起人（第一次一律先返工）。
-        blocked_ask = self._blocked_ask_items(review, attempt_n)
+        # waiting_input 用代码拼一句话问发起人。
+        # 2026-10-31 刹车三：第 1 轮也放行，但要求子 agent 真调过工具（服务器侧遥测），
+        # 不让「还没干活就喊做不到」的模型把任务糊弄停。
+        blocked_ask = self._blocked_ask_items(
+            review, attempt_n,
+            has_tool_evidence=(
+                _as_int(attempt_n) == 1
+                and self._round_has_tool_evidence(tid, reports)
+            ),
+        )
         if blocked_ask:
             return self._ask_blocked(
                 tid, gid, attempt_id, attempt_n, blocked_ask,
@@ -3459,6 +3553,16 @@ class Coordinator:
             "数字、图表、资讯卡片别用它——那些要能逐个对原文的确定性做法。）"
         )
 
+    def _vision_capability_line(self) -> str:
+        """没配看图模型时给排计划主模型的一句警示；配了 → ""（边界段「能做的」已写明）。"""
+        if self._vision_configured():
+            return ""
+        return (
+            "另外：现在没配看图模型，「看看图上写了什么 / 截图里是什么」这类要真正"
+            "看懂图的需求也做不到——别硬排（子 agent 读不了图只能瞎猜），"
+            "这种需求用 unsupported 说明，或把活改成只用文字材料的做法。"
+        )
+
     def _imagegen_unavailable_reason(self, kind: str) -> str:
         """要画图但这条活拿不到生图工具时的中文原因（说清是哪一种）。"""
         if not self._worker_tool_registered(_IMAGE_TOOL_NAME):
@@ -3469,6 +3573,35 @@ class Coordinator:
                 "（端点要填地址和密钥）"
             )
         return f"按岗位「{kind}」的实际上限，子 agent 拿不到 {_IMAGE_TOOL_NAME}"
+
+    # ------------------------------------------------------------------
+    # 看图能力（2026-10-31 能力边界刹车）：[[model_list]] 里 vision=true 的 chat 条目
+    # ------------------------------------------------------------------
+
+    def _vision_configured(self) -> bool:
+        """现在配了看图模型吗（[[model_list]] 里 vision=true 的候选）。
+
+        判定走 `models.has_vision`（models.py Step 1 加的视觉候选链）；读不出来 →
+        False（宁可当没配，也不硬派一条只能瞎猜的看图活）。
+        """
+        fn = getattr(getattr(self, "_models", None), "has_vision", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn("task"))
+        except Exception:
+            logger.debug("查看图模型配置失败，按「没配」处理", exc_info=True)
+            return False
+
+    def _vision_unavailable_reason(self, kind: str) -> str:
+        """要看图但这条活拿不到看图工具 / 没配看图模型时的中文原因（说清是哪一种）。"""
+        if not self._worker_tool_registered(_VISION_TOOL_NAME):
+            return f"现在没有可用的看图工具（{_VISION_TOOL_NAME} 没注册）"
+        if not self._vision_configured():
+            return (
+                "现在没配看图模型——先到网页「设置 → 模型」给一个对话模型勾上「识图 vision」"
+            )
+        return f"按岗位「{kind}」的实际上限，子 agent 拿不到 {_VISION_TOOL_NAME}"
 
     def _job_tool_names(self, job: dict, *, on_remote: bool, box: Any) -> tuple[str, ...]:
         """这条活**实际**会交给子 agent 的工具名（给「提示词只点名真拿得到的工具」用）。
@@ -3698,7 +3831,15 @@ class Coordinator:
                         job=idx + 1, agent=str(job.get("agent") or "task"), brief=short0,
                         status="filled", tool=tool_name, need=tool_name,
                     ))
-                if not (needs_exec or is_research or needs_file or needs_image):
+                # 2026-10-31 能力边界刹车：要「真正看图」的活（任务带原图 input/，
+                # 或 brief/完成标准写了「看看图上写了什么 / 识表 / 看排版」）必须有
+                # read_image **和** vision=True 的模型。判据和生图一样走「子 agent
+                # 实际拿到的工具 + 模型就绪」：能补就补，补不了记 task.exec_unavailable
+                # （need="vision"）走重排 → 暂停，绝不硬派一条只能瞎猜的看图活。
+                needs_vision = bool(
+                    getattr(self, "_input_images", {}).get(tid)
+                ) or job_needs_vision_capability(text)
+                if not (needs_exec or is_research or needs_file or needs_image or needs_vision):
                     continue
                 short = " ".join(str(text).split())[:40]
                 effective, kind, why = self._job_effective_tools(
@@ -3748,6 +3889,51 @@ class Coordinator:
                         findings.append(ExecFinding(
                             job=idx + 1, agent=kind, brief=short, status="unavailable",
                             reason=reason, need="image",
+                        ))
+                if needs_vision and not self._has_worker_tool(
+                    effective, lambda n: n == _VISION_TOOL_NAME
+                ):
+                    filled = ""
+                    if (not why and self._vision_configured()
+                            and self._worker_tool_registered(_VISION_TOOL_NAME)
+                            and self._try_fill_worker_tool(
+                                job, _VISION_TOOL_NAME, on_remote=on_remote, box=box
+                            )):
+                        filled = _VISION_TOOL_NAME
+                    if filled:
+                        note = (
+                            f"开工前自检：这条活要看图（{short}…），子 agent 实际拿不到看图工具，"
+                            f"已按岗位允许的范围补上 {filled}（第 {idx + 1} 条活）"
+                        )
+                        logger.info("任务 %s %s", tid, note)
+                        self._record_exec_event(
+                            tid, gid, "task.tool_autofill", note,
+                            job=idx + 1, tool=filled, agent=kind, need="vision",
+                        )
+                        findings.append(ExecFinding(
+                            job=idx + 1, agent=kind, brief=short, status="filled",
+                            tool=filled, need="vision",
+                        ))
+                        effective, kind, why = self._job_effective_tools(
+                            job, on_remote=on_remote, box=box
+                        )
+                    else:
+                        reason = why or self._vision_unavailable_reason(kind)
+                        note = (
+                            f"开工前自检：这条活要看图（{short}…），{reason}，"
+                            "照现在的计划做不成；别硬做——改成只用文字材料的做法"
+                            "（或改派能给看图工具的岗位），管理员也可以先到"
+                            "「设置 → 模型」给一个对话模型勾上「识图 vision」"
+                            f"（第 {idx + 1} 条活）"
+                        )
+                        logger.warning("任务 %s %s", tid, note)
+                        self._record_exec_event(
+                            tid, gid, "task.exec_unavailable", note,
+                            job=idx + 1, agent=kind, need="vision",
+                        )
+                        findings.append(ExecFinding(
+                            job=idx + 1, agent=kind, brief=short, status="unavailable",
+                            reason=reason, need="vision",
                         ))
                 if needs_exec:
                     real_exec = [
@@ -6671,17 +6857,66 @@ class Coordinator:
         kinds = [r["kind"] for r in rows if r["lane"].startswith("worker:") and r["kind"]]
         return kinds or ["task"]
 
-    def _blocked_ask_items(self, review: dict, attempt_n: int) -> list[dict]:
+    def _round_has_tool_evidence(self, tid: str, reports: Any) -> bool:
+        """这一轮子 agent 真调过工具吗——只认服务器侧遥测，不认模型自己写的。
+
+        两个来源（任一即算；`submit_result` 是交回通道，不算真试过）：
+        - 交接单 `review.used_tools` 非空（专岗挂上时，Agents 在交回 / 失败时落的
+          服务器侧遥测，不从模型 data 里取）；
+        - `tool_calls` 表里有本子任务「子 agent」的成功调用（主模型自己查资料的
+          调用不算——这条闸要的是干活那侧真试过）。
+        读库出错 → False（没有证据就别放行第一轮止损）。
+        """
+        for report in reports if isinstance(reports, (list, tuple)) else []:
+            hid = str(getattr(report, "handoff_id", "") or "")
+            if not hid:
+                continue
+            try:
+                row = self._store.read().execute(
+                    "SELECT review FROM agent_handoffs WHERE id=?", (hid,)
+                ).fetchone()
+            except Exception:
+                logger.debug("读交接单遥测失败（%s），跳过", hid, exc_info=True)
+                continue
+            if row is None:
+                continue
+            try:
+                rv = json.loads(str(row["review"] or "{}"))
+            except (ValueError, TypeError):
+                continue
+            if isinstance(rv, dict) and rv.get("used_tools"):
+                return True
+        try:
+            row = self._store.read().execute(
+                "SELECT 1 FROM tool_calls WHERE task_id=? AND ok=1"
+                " AND tool<>'submit_result' AND actor LIKE '子 agent%' LIMIT 1",
+                (str(tid),),
+            ).fetchone()
+            return row is not None
+        except Exception:
+            logger.exception("查本轮工具调用证据失败（任务 %s），按没有证据处理", tid)
+            return False
+
+    def _blocked_ask_items(
+        self, review: dict, attempt_n: int, *, has_tool_evidence: bool = False
+    ) -> list[dict]:
         """docs/22 §4 G：这一轮该不该「不重跑、直接问发起人」。
 
         条件（全满足才问）：
         - 这轮没过；
         - **所有**没做到的必须项都带 blocked（客观做不到）且有写清尝试过程的证据；
-        - 已经是第 2 次及以后的尝试（第一次一律先返工）。
+        - 已经是第 2 次及以后的尝试；**或第 1 次但有真实工具调用证据**
+          （2026-10-31 刹车三：子 agent 真试过、全部必须项客观做不到时，重跑一遍
+          也不会改变结果——直接问发起人止损，不再强制烧一轮返工。
+          `has_tool_evidence` 只认服务器侧遥测 `_round_has_tool_evidence`，
+          模型自己写的证据不算）。
         """
         if bool(review.get("pass")):
             return []
-        if _as_int(attempt_n) is None or int(attempt_n) < 2:
+        n = _as_int(attempt_n)
+        if n is None:
+            return []
+        if n < 2 and not (n == 1 and has_tool_evidence):
             return []
         judgement = review.get("items_judgement")
         if not isinstance(judgement, dict):
@@ -6819,6 +7054,69 @@ class Coordinator:
         self._write_tokens(tid)
         logger.info("任务 %s 有必须项需要真人参与，转 waiting_input 问发起人：%s", tid, question)
         return "done"
+
+    def _finish_unsupported(
+        self, tid: str, gid: str, attempt_id: int | None, attempt_n: int, reason: str,
+    ) -> None:
+        """主模型开工前就说超出能力边界：任务直接失败 + @ 发起人说明（不重试、不派活）。
+
+        - 当前 attempt 记 failed（summary 带原因）；
+        - 任务转 failed（reason=f"能力不支持：…"）；
+        - 记 task.plan.unsupported 事件；
+        - 发件箱 @ 发起人：「<标题>」目前做不到：<原因>（push_kind=status，key
+          unsupported:<tid>）；
+        - 取消 / 安全网暂停优先：状态不是 running/reviewing 就什么都不改（晚到的
+          取消不被这条路径复活）。
+        """
+        reason_s = str(reason or "").strip() or "这项需求超出 MaiWork 的能力边界"
+        try:
+            cur = self._tasks.get(tid)
+        except Exception:
+            cur = None
+        status = str((cur or {}).get("status") or "")
+        if status not in ("running", "reviewing"):
+            logger.info("任务 %s 已是「%s」，unsupported 收尾不再改状态", tid, status or "?")
+            return
+        full_reason = f"能力不支持：{reason_s}"
+        if attempt_id is not None:
+            try:
+                self._tasks.finish_attempt(
+                    attempt_id, status="failed", summary=full_reason, review=full_reason,
+                )
+            except Exception:
+                logger.exception("记 unsupported 尝试失败（任务 %s）", tid)
+        try:
+            self._tasks.transition(tid, "failed", reason=full_reason, review=full_reason)
+        except (KeyError, ValueError) as e:
+            logger.warning("任务 %s →failed（能力不支持）非法：%s", tid, e)
+            return
+        except Exception:
+            logger.exception("任务 %s →failed（能力不支持）出错", tid)
+            return
+        try:
+            self._task_fact_event(
+                tid, gid, "task.plan.unsupported",
+                attempt=attempt_n, note=reason_s[:400],
+            )
+        except Exception:
+            logger.exception("记 task.plan.unsupported 失败（任务 %s）", tid)
+        task = self._tasks.get(tid) or {}
+        title = str(task.get("title") or "") or "任务"
+        # @ 发起人用名册当前名（按 requester_id），查不到回落 requester_name 老快照
+        requester = members.name_of(
+            self._store, gid, task.get("requester_id"), fallback=task.get("requester_name")
+        ).strip()
+        text = f"「{title}」目前做不到：{reason_s}"[:400]
+        if requester:
+            text = f"@{requester} {text}"
+        try:
+            self._outbox.enqueue(
+                f"unsupported:{tid}", gid, "text",
+                {"text": text, "push_kind": "status"}, task_id=tid,
+            )
+        except Exception:
+            logger.exception("unsupported 说明入队失败（任务 %s）", tid)
+        logger.info("任务 %s 开工前判定超出能力边界，已收尾并告知发起人：%s", tid, reason_s)
 
     def _wait_for_originator(
         self, tid: str, gid: str, attempt_id: int | None, question: str, *,

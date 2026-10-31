@@ -54,7 +54,9 @@ async def test_group_feature_switches_render_and_toggle(tmp_path: Path, monkeypa
                 errors: list[str] = []
                 page.on("pageerror", lambda e: errors.append(str(e)))
                 await page.goto(base + f"/#/{G1}/group")
-                # 群控区渲染出「功能启用」与三个开关
+                # 管理员群页切换到「本群设置」二级分栏，渲染出「功能启用」与三个即时开关
+                await page.wait_for_selector('[data-act="group-sub"][data-sub="admin"]', timeout=15000)
+                await page.click('[data-act="group-sub"][data-sub="admin"]')
                 await page.wait_for_selector(".groupctl-slot", timeout=15000)
                 # 区块先出转圈占位、数据回来才填内容：等内容到了再读（CI 上偶发读到占位）
                 await page.wait_for_function(
@@ -63,13 +65,10 @@ async def test_group_feature_switches_render_and_toggle(tmp_path: Path, monkeypa
                 )
                 html = await page.inner_html(".groupctl-slot")
                 assert "功能启用" in html and "资讯" in html and "构想" in html and "任务" in html
-                # 开「功能启用」的编辑（该区块的修改按钮），草稿默认任务开着
-                await page.click('[data-act="gctl-features-edit"]')
+                # 常驻 .switch 默认任务开着，点击即存并展示关闭影响说明
                 await page.wait_for_selector("#gctl-task", timeout=5000)
                 assert await page.is_checked("#gctl-task")
-                # 关掉任务并保存
-                await page.evaluate("() => { const el = document.querySelector('#gctl-task'); el.checked = false; el.dispatchEvent(new Event('input', {bubbles:true})); }")
-                await page.click('[data-act="gctl-features-save"]')
+                await page.click("#gctl-task")
                 await page.wait_for_function(
                     "document.querySelector('.groupctl-slot') && document.querySelector('.groupctl-slot').innerHTML.includes('已关闭')",
                     timeout=8000,

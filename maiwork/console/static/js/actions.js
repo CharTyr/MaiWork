@@ -6,13 +6,15 @@ import { RATE_KEY, clientId, myRates } from "./pages/news.js";
 import { findIdea, ideaAsk, ideaItems, ideaPicked } from "./pages/ideas.js";
 import { refreshDetail } from "./detail.js";
 import { handoffCopy, handoffDownload, openHandoff } from "./handoff.js";
-import { checkedProviders, headerRow, loadExt, pickedTool, readHeaders } from "./settings/ext.js";
+import { actSettingsNav } from "./settings/index.js";
+import { actExt } from "./settings/ext.js";
 import { actNews } from "./actions_news.js";
 import { actTheme } from "./theme.js";
 import { actAppearance } from "./settings/appearance.js";
 import { actSocial } from "./settings/social.js";
 import { actCtx } from "./pages/groupctx.js";
 import { actControls } from "./pages/groupcontrols.js";
+import { actGroup } from "./pages/group.js";
 import { actAgents } from "./settings/agents.js";
 import { actModels } from "./settings/models.js";
 import { actJev } from "./settings/jev.js";
@@ -45,11 +47,18 @@ function findEntry(id) {
 export async function act(el, e) {
   const a = el.dataset.act;
   if (await actNews(a, el)) return;
+  if (await actSettingsNav(a, el)) return;
+  if (await actExt(a, el, loadSettings)) return;
   if (await actTheme(a, el)) return;
   if (await actAppearance(a, el)) return;
   if (await actSocial(a, el)) return;
   if (await actCtx(a, el)) return;
   if (await actControls(a, el)) return;
+  if (actGroup(a, el)) {
+    ui.flash = true;
+    renderView();
+    return;
+  }
   if (await actAgents(a, el)) return;
   if (await actModels(a, el)) return;
   if (await actJev(a, el)) return;
@@ -179,23 +188,6 @@ export async function act(el, e) {
     case "models":
       await enterSettings("models");
       break;
-    case "ext-new":
-    case "ext-edit": {
-      state.extEdit = { kind: el.dataset.kind, name: el.dataset.name || null, data: null };
-      repaintSheet();
-      if (el.dataset.kind === "skill" && el.dataset.name) {
-        try {
-          state.extEdit.data = await api("GET", `/api/extensions/skills/${encodeURIComponent(el.dataset.name)}`);
-        } catch (err) {
-          state.extEdit = null;
-          toast(err.message, true);
-        }
-        repaintSheet();
-      }
-      const first = document.querySelector(".ext-form input:not([readonly]), .ext-form textarea");
-      if (first) first.focus({ preventScroll: false });
-      break;
-    }
     case "log-expand":
       state.logs.expanded = !state.logs.expanded;
       if (state.logs.expanded) await loadLogs();
@@ -303,7 +295,7 @@ export async function act(el, e) {
       break;
     case "cfg-goto":
       state.cfgSec = el.dataset.s || "";
-      await enterSettings("rules");
+      await enterSettings("rules", "config");
       break;
     case "cfg-sec":
       state.cfgSec = el.dataset.s || "";
@@ -369,125 +361,6 @@ export async function act(el, e) {
         setTimeout(tick, 5000);
       } catch (err) {
         el.disabled = false;
-        toast(err.message, true);
-      }
-      break;
-    }
-    case "mcp-paste":
-      state.extEdit = { kind: "mcp-paste", name: null, data: null };
-      repaintSheet();
-      setTimeout(() => $("mp-text") && $("mp-text").focus(), 50);
-      break;
-    case "ext-cancel":
-      state.extEdit = null;
-      repaintSheet();
-      break;
-    case "hdr-add":
-      $("x-hdrs").insertAdjacentHTML("beforeend", headerRow("", false));
-      break;
-    case "hdr-del": {
-      const row = el.closest(".hdr-row");
-      if (row.dataset.old === "1") {
-        row.dataset.removed = row.dataset.removed === "1" ? "0" : "1";
-        row.classList.toggle("removed", row.dataset.removed === "1");
-      } else row.remove();
-      break;
-    }
-    case "mcp-test": {
-      const out = $("x-check");
-      const url = $("x-url").value.trim();
-      if (!/^https:\/\/\S+$/.test(url)) {
-        out.textContent = "地址须以 https:// 开头";
-        out.style.color = "var(--red)";
-        break;
-      }
-      const f = $("mcp-form");
-      const { headers } = readHeaders();
-      el.disabled = true;
-      out.style.color = "";
-      out.textContent = "正在连接…";
-      try {
-        const r = await api("POST", "/api/extensions/mcp/test", { url, headers, name: f.dataset.name || undefined });
-        out.textContent = r.ok ? `连接成功，${(r.tools || []).length} 个工具` : `连接失败：${r.error || "原因不明"}`;
-        out.style.color = r.ok ? "" : "var(--red)";
-      } catch (err) {
-        out.textContent = err.message;
-        out.style.color = "var(--red)";
-      } finally {
-        el.disabled = false;
-      }
-      break;
-    }
-    case "mcp-toggle": {
-      el.disabled = true;
-      try {
-        await api("POST", `/api/extensions/mcp/${encodeURIComponent(el.dataset.name)}/toggle`, { enabled: el.dataset.on === "1" });
-        await loadExt();
-        repaintSheet();
-        toast(el.dataset.on === "1" ? "已开启" : "已关闭");
-      } catch (err) {
-        el.disabled = false;
-        toast(err.message, true);
-      }
-      break;
-    }
-    case "search-edit":
-      state.searchEdit = true;
-      repaintSheet();
-      break;
-    case "search-cancel":
-      state.searchEdit = false;
-      repaintSheet();
-      break;
-    case "search-save": {
-      const { mcp, tool } = pickedTool("sx-tool");
-      const ex = pickedTool("sx-extract");
-      el.disabled = true;
-      try {
-        state.extSearch = await api("PUT", "/api/extensions/search", {
-          mcp,
-          tool,
-          extract_mcp: ex.mcp,
-          extract_tool: ex.tool,
-          fallback: checkedProviders("sx-fb", mcp),
-          broad: checkedProviders("sx-br", mcp),
-        });
-        state.searchEdit = false;
-        await loadExt();
-        if (state.settings) await loadSettings();
-        repaintSheet();
-        toast(`搜索服务已切换为 ${mcp}`);
-      } catch (err) {
-        el.disabled = false;
-        toast(err.message, true);
-      }
-      break;
-    }
-    case "search-off": {
-      if (!confirm("确定关闭联网搜索？关闭后将停止更新资讯。")) break;
-      try {
-        await api("DELETE", "/api/extensions/search");
-        state.searchEdit = false;
-        await loadExt();
-        if (state.settings) await loadSettings();
-        repaintSheet();
-        toast("已关闭联网搜索");
-      } catch (err) {
-        toast(err.message, true);
-      }
-      break;
-    }
-    case "mcp-del":
-    case "skill-del": {
-      const isMcp = a === "mcp-del";
-      if (!confirm(`确定删除「${el.dataset.name}」？${isMcp ? "密钥将一并删除。" : "整个 skill 将一并删除。"}`)) break;
-      try {
-        await api("DELETE", `/api/extensions/${isMcp ? "mcp" : "skills"}/${encodeURIComponent(el.dataset.name)}`);
-        state.extEdit = null;
-        await loadExt();
-        repaintSheet();
-        toast("已删除");
-      } catch (err) {
         toast(err.message, true);
       }
       break;
@@ -667,19 +540,6 @@ export async function act(el, e) {
         if (r && r.ok === false) throw new Error("内容涉及个人画像，未发送");
         el.textContent = "已交给 MaiBot";
         toast("已交给 MaiBot，将在合适时机提及");
-      } catch (err) {
-        el.disabled = false;
-        toast(err.message, true);
-      }
-      break;
-    }
-    case "mcp-reload": {
-      el.disabled = true;
-      try {
-        const r = await api("POST", `/api/extensions/mcp/${encodeURIComponent(el.dataset.name)}/reload`, {});
-        await Promise.all([loadSettings(), state.page === "settings" ? loadExt() : null]);
-        repaintSheet();
-        toast(r && r.ok ? `已重新连接，${r.tools || 0} 个工具` : `连接失败：${(r && r.error) || "原因不明"}`, !(r && r.ok));
       } catch (err) {
         el.disabled = false;
         toast(err.message, true);

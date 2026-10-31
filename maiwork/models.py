@@ -860,6 +860,7 @@ class _Candidate:
     max_tokens: int        # 这个条目的默认输出上限（调用方没传用它）
     efforts: tuple = ()    # 条目 efforts（agent profile 的强度只在它勾了才发）
     entry_id: str = ""     # 模型库条目 id（验证记录按它绑定；旧四槽链是 ""）
+    vision: bool = False   # 条目勾了「支持图片输入」（model_list.vision；旧四槽链是 False）
 
 
 
@@ -951,8 +952,141 @@ def _content_text(content: Any) -> str:
 
 def _json_messages(messages: list[dict], json_mode: bool) -> list[dict]:
     """json_mode 的「在提示里要求」前置一条 system 提示（2026-09-29 线上对照实验的规矩，
-    见 chat() 里的说明）。"""
+    见 chat() 里的说明）。消息原样透传（含 image_url 图片块——OpenAI 协议就吃这个形状）。"""
     return [{"role": "system", "content": _JSON_ONLY_HINT}, *messages] if json_mode else list(messages)
+
+
+# ----------------------------------------------------------------------
+# 多模态图片块（内部统一 OpenAI 风格 image_url；发请求时按协议翻译）
+# ----------------------------------------------------------------------
+
+_DATA_IMAGE_RE = re.compile(r"^data:([^;,]+);base64,(.*)$", re.DOTALL)
+
+
+def _content_blocks(content: Any) -> list[dict] | None:
+    """content 是多模态块列表 → 返回里面的 dict 块；str / 其他 → None（走老文本路）。"""
+    if isinstance(content, list):
+        return [b for b in content if isinstance(b, dict)]
+    return None
+
+
+def _image_block_url(block: dict) -> str:
+    """image_url 块里的 url（OpenAI 形状允许 image_url 是 str 或 {"url": …}）。"""
+    iu = block.get("image_url")
+    if isinstance(iu, dict):
+        return str(iu.get("url") or "")
+    return str(iu or "")
+
+
+def _parse_data_image_url(url: str) -> tuple[str, str] | None:
+    """`data:<mime>;base64,<数据>` → (mime, base64)；不是这个形状 → None。"""
+    m = _DATA_IMAGE_RE.match(str(url or "").strip())
+    if not m:
+        return None
+    return str(m.group(1) or "image/jpeg"), str(m.group(2) or "")
+
+
+def _image_block_to_anthropic(block: dict) -> dict | None:
+    """内部 image_url 块 → Anthropic image 块；翻不出来的（空 url 等）→ None。"""
+    url = _image_block_url(block)
+    if not url:
+        return None
+    parsed = _parse_data_image_url(url)
+    if parsed is not None:
+        mime, data = parsed
+        return {"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}}
+    if url.startswith("http://") or url.startswith("https://"):
+        return {"type": "image", "source": {"type": "url", "url": url}}
+    return None
+
+
+def _image_url_for_log(block: dict) -> dict:
+    """日志里的 image_url：base64 / 长 URL 一律换成占位符（原始内容绝不入库）。"""
+    url = _image_block_url(block)
+    if url.startswith("data:"):
+        head, _, data = url.partition(",")
+        return {"url": f"{head},<已省略 {len(data)} 字符>"}
+    if url:
+        return {"url": f"<图片地址 {len(url)} 字符，不落库>"}
+    return {"url": ""}
+
+
+def _sanitize_log_content(content: Any, keys: list[str]) -> str:
+    """日志里的 message.content：纯文本照旧遮罩；多模态块列表逐块 JSON 化，
+    图片的 base64 / URL 数据全换占位符——model_calls 里永远没有原始图。"""
+    if not isinstance(content, list):
+        return _redact_full(content, keys)
+    out: list[Any] = []
+    for part in content:
+        if not isinstance(part, dict):
+            out.append(_redact_full(part, keys))
+            continue
+        ptype = str(part.get("type") or "")
+        if ptype == "text":
+            out.append({"type": "text", "text": _redact_full(part.get("text"), keys)})
+        elif ptype in ("image_url", "input_image"):
+            out.append({"type": ptype, "image_url": _image_url_for_log(part)})
+        elif ptype == "image":
+            src = part.get("source") if isinstance(part.get("source"), dict) else {}
+            out.append({
+                "type": "image",
+                "source": {
+                    "type": str(src.get("type") or ""),
+                    "media_type": str(src.get("media_type") or ""),
+                    "data": f"<已省略 {len(str(src.get('data') or ''))} 字符>",
+                },
+            })
+        else:
+            # 别的块类型（tool_use / thinking 等）：保留类型，内容不落库
+            out.append({"type": ptype or "?", "_note": "（非文本块，内容不落库）"})
+    return json.dumps(out, ensure_ascii=False)
+
+
+def _responses_content_parts(content: Any) -> list[dict[str, Any]]:
+    """消息 content → Responses 协议的 content 部件（input_text / input_image）。
+
+    内部 image_url 块翻成 `{"type": "input_image", "image_url": <url>}`；
+    已经是 input_text / input_image 形状的块原样过（调用方拼好的不再翻）。"""
+    parts: list[dict[str, Any]] = []
+    blocks = _content_blocks(content)
+    if blocks is None:
+        text = _content_text(content)
+        if text:
+            parts.append({"type": "input_text", "text": text})
+        return parts
+    for b in blocks:
+        ptype = str(b.get("type") or "")
+        if ptype in ("text", "input_text"):
+            text = str(b.get("text") or "")
+            if text:
+                parts.append({"type": "input_text", "text": text})
+        elif ptype in ("image_url", "input_image"):
+            url = _image_block_url(b) if ptype == "image_url" else str(b.get("image_url") or "")
+            if url:
+                parts.append({"type": "input_image", "image_url": url})
+    return parts
+
+
+def _anthropic_content_blocks(content: Any) -> list[dict[str, Any]]:
+    """消息 content → Anthropic 的 content 块（text / image）。
+
+    内部 image_url 块的 data URI 翻成 base64 source，http(s) URL 翻成 url source；
+    翻不出来的图片块丢弃（不发坏块）；content 本来就是 Anthropic image 块的原样过。"""
+    blocks = _content_blocks(content)
+    if blocks is None:
+        return [{"type": "text", "text": _content_text(content) or ""}]
+    out: list[dict[str, Any]] = []
+    for b in blocks:
+        ptype = str(b.get("type") or "")
+        if ptype == "text":
+            out.append({"type": "text", "text": str(b.get("text") or "")})
+        elif ptype == "image_url":
+            blk = _image_block_to_anthropic(b)
+            if blk is not None:
+                out.append(blk)
+        elif ptype == "image" and isinstance(b.get("source"), dict):
+            out.append({"type": "image", "source": dict(b["source"])})
+    return out or [{"type": "text", "text": ""}]
 
 
 def _build_openai_request(
@@ -1017,8 +1151,9 @@ def _build_responses_request(
         if role == "user":
             if json_mode and not system_parts:
                 system_parts.append(_JSON_ONLY_HINT)  # 没有 system 就把 JSON 要求塞 instructions
-            if text:
-                input_items.append({"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]})
+            parts = _responses_content_parts(m.get("content"))
+            if parts:
+                input_items.append({"type": "message", "role": "user", "content": parts})
             continue
         if role == "assistant":
             if text:
@@ -1138,7 +1273,7 @@ def _build_anthropic_request(
             i += 1
             continue
         if role == "user":
-            out_messages.append({"role": "user", "content": [{"type": "text", "text": _content_text(m.get("content")) or ""}]})
+            out_messages.append({"role": "user", "content": _anthropic_content_blocks(m.get("content"))})
             i += 1
             continue
         if role == "assistant":
@@ -1857,6 +1992,7 @@ class Models:
                         str(v) for v in (getattr(entry, "efforts", ()) or ()) if str(v) in _EFFORT_LEVELS
                     ),
                     entry_id=entry_id,
+                    vision=bool(getattr(entry, "vision", False)),
                 )
             )
         return out
@@ -1879,6 +2015,57 @@ class Models:
             tuple(getattr(settings, "endpoints", ()) or ()),
             tuple(getattr(settings, "model_list", ()) or ()),
         )
+
+    def vision_candidates(self, kind: str = "task") -> list[_Candidate]:
+        """看图用的候选链：优先这个岗位候选链里 vision=True 的，
+        再补模型库里所有标了 vision 的聊天条目（按 entry_id 去重）。
+
+        与 chat() 同一条解析路（`_current_candidates` + `_entries_to_candidates`）：
+        条目失效 / 端点缺地址密钥的自然不在链上——`has_vision` 是真「能跑」的判定，
+        不是「配置里写了」的判定。use="image" 的生图条目在 `_entries_to_candidates`
+        里已被挡掉，到不了这里。
+        """
+        out: list[_Candidate] = []
+        seen: set[str] = set()
+        try:
+            base = self._current_candidates(str(kind or "task"))
+        except Exception:
+            logger.exception("取岗位 %s 候选链失败（视觉候选按空链处理）", kind)
+            base = []
+        for c in base:
+            if bool(getattr(c, "vision", False)):
+                out.append(c)
+                if c.entry_id:
+                    seen.add(c.entry_id)
+        try:
+            settings = self._get_settings()
+            endpoints = tuple(getattr(settings, "endpoints", ()) or ())
+            model_list = tuple(getattr(settings, "model_list", ()) or ())
+            extra_ids = tuple(
+                str(getattr(m, "id", "") or "")
+                for m in model_list
+                if bool(getattr(m, "vision", False))
+                and str(getattr(m, "id", "") or "") not in seen
+            )
+            for c in self._entries_to_candidates(extra_ids, endpoints, model_list):
+                if not bool(getattr(c, "vision", False)):
+                    continue
+                if c.entry_id and c.entry_id in seen:
+                    continue
+                out.append(c)
+                if c.entry_id:
+                    seen.add(c.entry_id)
+        except Exception:
+            logger.exception("扫描模型库视觉条目失败（按已找到的 %d 个候选用）", len(out))
+        return out
+
+    def has_vision(self, kind: str = "task") -> bool:
+        """现在有没有真能跑的图片理解模型（vision_candidates 非空）。读坏 → False。"""
+        try:
+            return bool(self.vision_candidates(kind))
+        except Exception:
+            logger.exception("查视觉候选失败（%s），按「没有」处理", kind)
+            return False
 
     def _escalation_candidates(self, kind: str) -> list[_Candidate]:
         """任务双岗协作（docs/20 §5.3）：岗位「做不动时换用」的候选链。
@@ -3769,7 +3956,8 @@ class Models:
                 continue
             entry: dict[str, Any] = {
                 "role": _redact_full(m.get("role"), keys),
-                "content": _redact_full(m.get("content"), keys)[:_LOG_CONTENT_MAX],
+                # 多模态块列表走 _sanitize_log_content：base64 图只留占位符（绝不入库）
+                "content": _sanitize_log_content(m.get("content"), keys)[:_LOG_CONTENT_MAX],
             }
             tcs = m.get("tool_calls")
             if isinstance(tcs, list) and tcs:

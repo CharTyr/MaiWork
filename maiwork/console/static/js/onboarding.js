@@ -693,6 +693,7 @@ export async function onbAct(el) {
     await closeOnboarding("done");
     if (onb.open) return; // 没关掉（保存失败已提示），留在引导里
     state.cfgSec = sub === "rules" ? sec : state.cfgSec;
+    if (sub === "rules") state.setTab = { ...(state.setTab || {}), rules: "config" };
     return enterSettings(sub);
   }
   if (a === "onb-goto") {

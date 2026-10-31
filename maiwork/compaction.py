@@ -163,11 +163,34 @@ def estimate_tokens(text: Any) -> int:
     return max(1, math.ceil(len(s) / CHARS_PER_TOKEN))
 
 
+# 一块图片固定算这么多 token（不看 base64 长度：1MB 的图也就是 1600，不会估成百万）
+IMAGE_BLOCK_TOKENS = 1600
+_IMAGE_BLOCK_TYPES = frozenset({"image_url", "input_image", "image"})
+
+
 def estimate_message_tokens(msg: dict) -> int:
-    """一条消息的估算：content + assistant 的 tool_calls 参数。"""
+    """一条消息的估算：content + assistant 的 tool_calls 参数。
+
+    content 是多模态块列表时：text 块按文本估，image_url / input_image / image
+    块各算 IMAGE_BLOCK_TOKENS——图片块里装的是 base64，按字符估会爆成天文数字。
+    """
     if not isinstance(msg, dict):
         return 0
-    total = estimate_tokens(msg.get("content"))
+    content = msg.get("content")
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if not isinstance(part, dict):
+                total += estimate_tokens(part)
+                continue
+            if str(part.get("type") or "") in _IMAGE_BLOCK_TYPES:
+                total += IMAGE_BLOCK_TOKENS
+            elif str(part.get("type") or "") == "text":
+                total += estimate_tokens(part.get("text"))
+            else:
+                total += estimate_tokens(json.dumps(part, ensure_ascii=False, default=str))
+    else:
+        total = estimate_tokens(content)
     for tc in msg.get("tool_calls") or ():
         if not isinstance(tc, dict):
             continue

@@ -219,6 +219,14 @@ def _default_profiles() -> dict[str, dict[str, Any]]:
     }
 
 
+_SELECT_SKILL = (
+    "SELECT s.*,"
+    " (SELECT source FROM agent_skill_versions v WHERE v.skill_id = s.id ORDER BY v.ts DESC, v.id DESC LIMIT 1) AS _ver_source,"
+    " (SELECT note FROM agent_skill_versions v WHERE v.skill_id = s.id ORDER BY v.ts DESC, v.id DESC LIMIT 1) AS _ver_note"
+    " FROM agent_skills s"
+)
+
+
 class Agents:
     """专岗核心。store 是 maiwork.store.Store；get_settings 是「无参返回 Settings」的 callable。"""
 
@@ -639,6 +647,10 @@ class Agents:
         return _SKILL_TASK_DESC_MAX if kind_s == "task" else _SKILL_SPECIALIST_DESC_MAX
 
     def _skill_row(self, row) -> dict[str, Any]:
+        keys = row.keys() if hasattr(row, "keys") else ()
+        ver_source = str(row["_ver_source"] or "") if "_ver_source" in keys else ""
+        ver_note = str(row["_ver_note"] or "") if "_ver_note" in keys else ""
+        origin = "explore" if ver_source == "auto" and ver_note.startswith("闲时探索") else ver_source
         return {
             "id": int(row["id"]),
             "kind": str(row["kind"]),
@@ -651,6 +663,7 @@ class Agents:
             "last_used": float(row["last_used"] or 0.0),
             "created": float(row["created"] or 0.0),
             "updated": float(row["updated"] or 0.0),
+            "origin": origin,
         }
 
     def _skill_row_tx(self, conn, gid_s: str, sid: int) -> dict[str, Any]:
@@ -660,7 +673,7 @@ class Agents:
         行没了 → KeyError（调用方零写入）。
         """
         row = conn.execute(
-            "SELECT * FROM agent_skills WHERE id=? AND group_id=?", (int(sid), str(gid_s))
+            f"{_SELECT_SKILL} WHERE s.id=? AND s.group_id=?", (int(sid), str(gid_s))
         ).fetchone()
         if row is None:
             raise KeyError(f"没有这个 skill（id={sid}）")
@@ -739,17 +752,17 @@ class Agents:
     def skills(self, gid: str, kind: str | None = None, *, include_archived: bool = True) -> list[dict[str, Any]]:
         """本群 skill：默认全部 kind + archived；kind 给了就只看那一岗。main 一律 ValueError。"""
         gid_s = self._verify_served(gid)
-        sql = "SELECT * FROM agent_skills WHERE group_id=?"
+        sql = f"{_SELECT_SKILL} WHERE s.group_id=?"
         params: list[Any] = [gid_s]
         if kind is not None:
             kind_s = self._kind_known(kind)
             if kind_s == MAIN_KIND:
                 raise ValueError("主模型没有做事经验 skill（它不写做法）")
-            sql += " AND kind=?"
+            sql += " AND s.kind=?"
             params.append(kind_s)
         if not include_archived:
-            sql += " AND status='active'"
-        sql += " ORDER BY name"
+            sql += " AND s.status='active'"
+        sql += " ORDER BY s.name"
         rows = self._store.read().execute(sql, tuple(params)).fetchall()
         return [self._skill_row(r) for r in rows]
 
@@ -758,7 +771,7 @@ class Agents:
         gid_s = self._verify_served(gid)
         sid = _skill_id(id)
         row = self._store.read().execute(
-            "SELECT * FROM agent_skills WHERE id=? AND group_id=?",
+            f"{_SELECT_SKILL} WHERE s.id=? AND s.group_id=?",
             (sid, gid_s),
         ).fetchone()
         if row is None:
@@ -772,10 +785,10 @@ class Agents:
         if kind_s == MAIN_KIND:
             raise ValueError("主模型没有做事经验 skill（它不写做法）")
         name_s = str(name or "").strip()
-        sql = "SELECT * FROM agent_skills WHERE group_id=? AND kind=? AND name=?"
+        sql = f"{_SELECT_SKILL} WHERE s.group_id=? AND s.kind=? AND s.name=?"
         params: list[Any] = [gid_s, kind_s, name_s]
         if active_only:
-            sql += " AND status='active'"
+            sql += " AND s.status='active'"
         row = self._store.read().execute(sql, tuple(params)).fetchone()
         if row is None:
             raise KeyError(f"没有这个 skill（{kind_s} / {name_s}）")

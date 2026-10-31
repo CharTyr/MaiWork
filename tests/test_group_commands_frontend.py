@@ -18,7 +18,7 @@ const esc = (s) => String(s ?? '').replaceAll('&', '&amp;').replaceAll('"', '&qu
 const context = vm.createContext({ console });
 const id = (x) => x;
 const stubs = {
-  '../state.js': { CATS: [], TONES: ['#eee'], admin: () => CFG.admin, gadmin: () => CFG.admin },
+  '../state.js': { CATS: [], TONES: ['#eee'], state: { groupSub: 'feed' }, admin: () => CFG.admin, gadmin: () => CFG.admin },
   '../util.js': { tip: (h) => (h ? '<details class="tip">' + h + '</details>' : ''), tipLabel: (f, t, h) => '<label for="' + f + '">' + t + '</label>' + (h ? '<details class="tip">' + h + '</details>' : ''), SVG: new Proxy({}, { get: (_, k) => `[${String(k)}]` }), dayIndex: () => 0, dayWord: () => '今天', dur: () => '', esc,
                   hhmm: () => '', ico: () => '', now: () => 0, richText: esc, safeUrl: id, when: () => '' },
   '../topiclog.js': { daySummary: () => '', judgeText: () => '', stretches: () => [] },

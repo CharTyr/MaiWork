@@ -1,33 +1,65 @@
 // MaiWork 网页 · 设置 ·「扩展」：MCP、技能、联网搜索。
-import { state } from "../state.js";
+import { $, state } from "../state.js";
 import { SVG, dayWord, esc, ico, tip, tipLabel, toast } from "../util.js";
 import { api } from "../api.js";
+import { repaintSheet } from "../sheet.js";
 import { loading } from "../pages/news.js";
 import { loadOptDeps, optDepsSection } from "./optdeps.js";
 
 export const ROLE_NAMES = { worker: "子 agent", main: "主模型" };
 
-export function extPage() {
+export function extFormSheet() {
+  const ed = state.extEdit;
+  if (!ed || !state.ext) return "";
+  if (ed.kind === "mcp-paste") return mcpPasteForm();
+  if (ed.kind === "mcp") {
+    const m = ed.name ? (state.ext.mcp || []).find((x) => x.name === ed.name) : null;
+    return mcpForm(m);
+  }
+  if (ed.kind === "skill") {
+    const k = ed.name ? (state.ext.skills || []).find((x) => x.name === ed.name) : null;
+    return skillForm(k);
+  }
+  return "";
+}
+
+export function extPage(tab = "all") {
   const x = state.ext;
   if (!x) return loading((state.loadErr || {}).ext, "ext");
-  const ed = state.extEdit;
+  const inSheet = state.sheet === "settings-form";
+  const ed = inSheet ? null : state.extEdit;
   const mcp = x.mcp || [];
   const skills = x.skills || [];
   const newMcp = ed && ed.kind === "mcp" && !ed.name;
   const pasting = ed && ed.kind === "mcp-paste";
   const newSkill = ed && ed.kind === "skill" && !ed.name;
-  return `
-    ${searchCard()}
+  if (tab === "optdeps") return optDepsSection();
+  if (tab === "search") {
+    const addedPresets = mcp.filter((m) => presetByEntry(m.name));
+    const unadded = presetsNotAdded();
+    const presetRows = [
+      ...addedPresets.map((m) => (ed && ed.kind === "mcp" && ed.name === m.name ? mcpForm(m) : mcpRow(m))),
+      ...unadded.map(presetRow),
+    ].join("");
+    return `
+      ${searchCard()}
+      ${presetRows ? `<h2 class="h-sub">搜索服务${tip("开启任一搜索服务后，即可在上方「联网搜索」中选用。")}</h2><div class="set-group">${presetRows}</div>` : ""}`;
+  }
+  const mcpRows = [
+    ...mcp.map((m) => (ed && ed.kind === "mcp" && ed.name === m.name ? mcpForm(m) : mcpRow(m))),
+    ...(tab === "all" ? presetsNotAdded().map(presetRow) : []),
+  ].join("");
+  const skillRows = skills.map((k) => (ed && ed.kind === "skill" && ed.name === k.name ? skillForm(k) : skillRow(k))).join("");
+  const mcpBlock = `
     <div class="h-sub-row"><h2 class="h-sub">MCP${tip("MCP 服务为 MaiWork 提供外部工具，例如搜索、读取网页。仅支持远程（https）服务。")}</h2>${newMcp || pasting ? "" : `<span class="row-btns"><button class="btn small" data-act="mcp-paste">粘贴配置</button><button class="btn small" data-act="ext-new" data-kind="mcp">添加</button></span>`}</div>
     ${pasting ? mcpPasteForm() : ""}
     ${newMcp ? mcpForm(null) : ""}
-    ${mcp.map((m) => (ed && ed.kind === "mcp" && ed.name === m.name ? mcpForm(m) : mcpRow(m))).join("")}
-    ${presetsNotAdded().map(presetRow).join("")}
-    ${!mcp.length && !presetsNotAdded().length && !newMcp ? `<p class="h-meta">暂无</p>` : ""}
+    ${mcpRows ? `<div class="set-group">${mcpRows}</div>` : !newMcp ? `<p class="h-meta">暂无</p>` : ""}
     <div class="h-sub-row"><h2 class="h-sub">skill${tip("skill 是给模型的操作说明，例如某类工作的做法和注意事项。模型会根据「简介」决定何时使用。")}</h2>${newSkill ? "" : `<span class="row-btns"><label class="btn small file-btn">上传 zip<input type="file" id="skill-zip" accept=".zip,application/zip" hidden /></label><button class="btn small" data-act="ext-new" data-kind="skill">添加</button></span>`}</div>
     ${newSkill ? skillForm(null) : ""}
-    ${skills.length ? skills.map((k) => (ed && ed.kind === "skill" && ed.name === k.name ? skillForm(k) : skillRow(k))).join("") : newSkill ? "" : `<p class="h-meta">暂无</p>`}
-    ${optDepsSection()}`;
+    ${skillRows ? `<div class="set-group">${skillRows}</div>` : newSkill ? "" : `<p class="h-meta">暂无</p>`}`;
+  if (tab === "mcp") return mcpBlock;
+  return `${searchCard()}${mcpBlock}${optDepsSection()}`;
 }
 
 // 联网搜索：从已接的 MCP 里挑一个工具来用（后端 GET/PUT/DELETE /api/extensions/search）。
@@ -441,4 +473,159 @@ export async function loadExt() {
     state.toolChoices = null;
   }
   await loadOptDeps();
+}
+
+export async function actExt(a, el, reloadSettings) {
+  switch (a) {
+    case "ext-new":
+    case "ext-edit": {
+      state.extEdit = { kind: el.dataset.kind, name: el.dataset.name || null, data: null };
+      repaintSheet();
+      if (el.dataset.kind === "skill" && el.dataset.name) {
+        try {
+          state.extEdit.data = await api("GET", `/api/extensions/skills/${encodeURIComponent(el.dataset.name)}`);
+        } catch (err) {
+          state.extEdit = null;
+          toast(err.message, true);
+        }
+        repaintSheet();
+      }
+      const first = document.querySelector(".ext-form input:not([readonly]), .ext-form textarea");
+      if (first) first.focus({ preventScroll: false });
+      return true;
+    }
+    case "mcp-paste":
+      state.extEdit = { kind: "mcp-paste", name: null, data: null };
+      repaintSheet();
+      setTimeout(() => $("mp-text") && $("mp-text").focus(), 50);
+      return true;
+    case "ext-cancel":
+      state.extEdit = null;
+      repaintSheet();
+      return true;
+    case "hdr-add":
+      $("x-hdrs").insertAdjacentHTML("beforeend", headerRow("", false));
+      return true;
+    case "hdr-del": {
+      const row = el.closest(".hdr-row");
+      if (row.dataset.old === "1") {
+        row.dataset.removed = row.dataset.removed === "1" ? "0" : "1";
+        row.classList.toggle("removed", row.dataset.removed === "1");
+      } else row.remove();
+      return true;
+    }
+    case "mcp-test": {
+      const out = $("x-check");
+      const url = $("x-url").value.trim();
+      if (!/^https:\/\/\S+$/.test(url)) {
+        out.textContent = "地址须以 https:// 开头";
+        out.style.color = "var(--red)";
+        return true;
+      }
+      const f = $("mcp-form");
+      const { headers } = readHeaders();
+      el.disabled = true;
+      out.style.color = "";
+      out.textContent = "正在连接…";
+      try {
+        const r = await api("POST", "/api/extensions/mcp/test", { url, headers, name: f.dataset.name || undefined });
+        out.textContent = r.ok ? `连接成功，${(r.tools || []).length} 个工具` : `连接失败：${r.error || "原因不明"}`;
+        out.style.color = r.ok ? "" : "var(--red)";
+      } catch (err) {
+        out.textContent = err.message;
+        out.style.color = "var(--red)";
+      } finally {
+        el.disabled = false;
+      }
+      return true;
+    }
+    case "mcp-toggle": {
+      el.disabled = true;
+      try {
+        await api("POST", `/api/extensions/mcp/${encodeURIComponent(el.dataset.name)}/toggle`, { enabled: el.dataset.on === "1" });
+        await loadExt();
+        repaintSheet();
+        toast(el.dataset.on === "1" ? "已开启" : "已关闭");
+      } catch (err) {
+        el.disabled = false;
+        toast(err.message, true);
+      }
+      return true;
+    }
+    case "mcp-reload": {
+      el.disabled = true;
+      try {
+        const r = await api("POST", `/api/extensions/mcp/${encodeURIComponent(el.dataset.name)}/reload`, {});
+        await Promise.all([reloadSettings ? reloadSettings() : null, state.page === "settings" ? loadExt() : null]);
+        repaintSheet();
+        toast(r && r.ok ? `已重新连接，${r.tools || 0} 个工具` : `连接失败：${(r && r.error) || "原因不明"}`, !(r && r.ok));
+      } catch (err) {
+        el.disabled = false;
+        toast(err.message, true);
+      }
+      return true;
+    }
+    case "mcp-del":
+    case "skill-del": {
+      const isMcp = a === "mcp-del";
+      if (!confirm(`确定删除「${el.dataset.name}」？${isMcp ? "密钥将一并删除。" : "整个 skill 将一并删除。"}`)) return true;
+      try {
+        await api("DELETE", `/api/extensions/${isMcp ? "mcp" : "skills"}/${encodeURIComponent(el.dataset.name)}`);
+        state.extEdit = null;
+        await loadExt();
+        repaintSheet();
+        toast("已删除");
+      } catch (err) {
+        toast(err.message, true);
+      }
+      return true;
+    }
+    case "search-edit":
+      state.searchEdit = true;
+      repaintSheet();
+      return true;
+    case "search-cancel":
+      state.searchEdit = false;
+      repaintSheet();
+      return true;
+    case "search-save": {
+      const { mcp, tool } = pickedTool("sx-tool");
+      const ex = pickedTool("sx-extract");
+      el.disabled = true;
+      try {
+        state.extSearch = await api("PUT", "/api/extensions/search", {
+          mcp,
+          tool,
+          extract_mcp: ex.mcp,
+          extract_tool: ex.tool,
+          fallback: checkedProviders("sx-fb", mcp),
+          broad: checkedProviders("sx-br", mcp),
+        });
+        state.searchEdit = false;
+        await loadExt();
+        if (state.settings && reloadSettings) await reloadSettings();
+        repaintSheet();
+        toast(`搜索服务已切换为 ${mcp}`);
+      } catch (err) {
+        el.disabled = false;
+        toast(err.message, true);
+      }
+      return true;
+    }
+    case "search-off": {
+      if (!confirm("确定关闭联网搜索？关闭后将停止更新资讯。")) return true;
+      try {
+        await api("DELETE", "/api/extensions/search");
+        state.searchEdit = false;
+        await loadExt();
+        if (state.settings && reloadSettings) await reloadSettings();
+        repaintSheet();
+        toast("已关闭联网搜索");
+      } catch (err) {
+        toast(err.message, true);
+      }
+      return true;
+    }
+  }
+  return false;
 }

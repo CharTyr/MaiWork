@@ -33,7 +33,7 @@ function schedulePoll() {
     if (state.page !== "settings" || state.setSub !== "extensions") return;
     const running = ((state.optDeps || {}).groups || []).filter((g) => g.installing || g.uninstalling);
     const loaded = await loadOptDeps();
-    repaintSheet();
+    repaintSheet({ preserveSheet: true });
     if (loaded && running.length && !busy()) {
       const finished = ((state.optDeps || {}).groups || []).filter((g) => running.some((r) => r.id === g.id));
       if (finished.length !== running.length || finished.some((g) => !["ok", "failed", "interrupted"].includes((g.last_install || {}).state))) return;
@@ -102,7 +102,7 @@ export function optDepsSection() {
   if (v.available === false && !usable.length) return `${head}<p class="h-meta">${esc(v.note || "本机执行未开启，无法安装")}</p>`;
   const offNote = v.available === false ? `<p class="h-meta">${esc(v.note || "本机执行未开启，无法安装")}</p>` : "";
   const refreshError = state.optDepsErr ? `<p class="h-meta" role="status">刷新失败：${esc(state.optDepsErr)} <button type="button" class="link-btn" data-act="od-reload">重试</button></p>` : "";
-  return `${head}${offNote}${refreshError}${usable.map(groupRow).join("")}${v.check_error ? `<p class="fine">检查失败：${esc(v.check_error)}</p>` : ""}`;
+  return `${head}${offNote}${refreshError}${usable.length ? `<div class="set-group">${usable.map(groupRow).join("")}</div>` : ""}${v.check_error ? `<p class="fine">检查失败：${esc(v.check_error)}</p>` : ""}`;
 }
 
 export async function actOptDeps(a, el) {

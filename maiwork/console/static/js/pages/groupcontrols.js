@@ -58,9 +58,14 @@ export function repaintControls() {
   }
 }
 
-function switchRow(c, key, label, help, value) {
+function switchRow(c, key, label, help, value, toggleAct = "") {
+  const actAttr = toggleAct === "gctl-feature-toggle"
+    ? ` data-act="gctl-feature-toggle" data-key="${key}" data-g="${esc(c.gid)}" data-on="${value ? "0" : "1"}"`
+    : toggleAct === "gctl-push-toggle"
+      ? ` data-act="gctl-push-toggle" data-key="${key}" data-g="${esc(c.gid)}" data-on="${value ? "0" : "1"}"`
+      : "";
   return `<div class="set-row cp-row gctl-row"><div class="lbl-row"><label class="set-name" for="gctl-${key}">${label}</label>${tip(`<span id="gctl-${key}-help">${help}</span>`)}</div>
-    <label class="switch"><input id="gctl-${key}" data-gctl="${key}" type="checkbox" ${value ? "checked" : ""} aria-label="${label}" aria-describedby="gctl-${key}-help" /><span></span></label></div>`;
+    <label class="switch"><input id="gctl-${key}" data-gctl="${key}"${actAttr} type="checkbox" ${value ? "checked" : ""}${c.saving ? " disabled" : ""} aria-label="${label}" aria-describedby="gctl-${key}-help" /><span></span></label></div>`;
 }
 
 function fieldErrorAttrs(c, key, help = "") {
@@ -69,12 +74,17 @@ function fieldErrorAttrs(c, key, help = "") {
 
 function pushHTML(c) {
   const p = c.push || {}, cfg = p.config || {};
-  let html = `<div class="h-sub-row"><h2 class="h-sub">主动发言${tip("MaiWork 在本群主动发送的内容。设置仅对本群生效。")}</h2>${c.edit !== "push" ? `<button class="btn small" data-act="gctl-push-edit" data-g="${esc(c.gid)}">修改</button>` : ""}</div>`;
-  if (c.edit === "push") {
+  const editing = c.edit === "push";
+  const src = editing ? c.draft : cfg;
+  const toggleAct = editing ? "" : "gctl-push-toggle";
+  let html = `<div class="h-sub-row"><h2 class="h-sub">主动发言${tip("MaiWork 在本群主动发送的内容。设置仅对本群生效。")}</h2>${!editing ? `<button class="btn small" data-act="gctl-push-edit" data-g="${esc(c.gid)}">修改</button>` : ""}</div>`;
+  html += `<div class="set-group">`;
+  html += switchRow(c, "topics_enabled", "开启话题", "群聊冷场时发送一句开场白，后续对话由 MaiBot 接续。", src.topics_enabled, toggleAct);
+  html += switchRow(c, "news_card_enabled", "资讯卡片", "选取优质资讯制作成图片发送到群内；已配置公开网址时附带本群链接。", src.news_card_enabled, toggleAct);
+  html += switchRow(c, "idea_mention_enabled", "构想提及", "在群内简短提及构想；个人构想仅 @ 本人，不涉及画像内容。", src.idea_mention_enabled, toggleAct);
+  html += `</div>`;
+  if (editing) {
     const d = c.draft;
-    html += switchRow(c, "topics_enabled", "开启话题", "群聊冷场时发送一句开场白，后续对话由 MaiBot 接续。", d.topics_enabled);
-    html += switchRow(c, "news_card_enabled", "资讯卡片", "选取优质资讯制作成图片发送到群内；已配置公开网址时附带本群链接。", d.news_card_enabled);
-    html += switchRow(c, "idea_mention_enabled", "构想提及", "在群内简短提及构想；个人构想仅 @ 本人，不涉及画像内容。", d.idea_mention_enabled);
     html += `<div class="login">
       <label for="gctl-news_card_count">每张卡片条数</label><select id="gctl-news_card_count" data-gctl="news_card_count" ${fieldErrorAttrs(c, "news_card_count")}>${[1, 2, 3].map(n => `<option value="${n}" ${n === Number(d.news_card_count) ? "selected" : ""}>${n} 条</option>`).join("")}</select>
       <div class="lbl-row"><label for="gctl-daily_max">每日上限</label>${tip(`<span id="gctl-cap-help">以上三种内容合计；0 表示不限制（不建议）。</span>`)}</div><input id="gctl-daily_max" data-gctl="daily_max" type="number" min="0" max="24" step="1" value="${esc(d.daily_max)}" ${fieldErrorAttrs(c, "daily_max", "gctl-cap-help")} />
@@ -83,9 +93,7 @@ function pushHTML(c) {
     </div>`;
     html += saveActions(c, "push");
   } else {
-    const line = (label, on) => `<div class="set-row gctl-row"><div><div class="set-name">${label}</div><div class="set-text">${on ? "已开启" : "已关闭"}</div></div></div>`;
-    html += line("开启话题", cfg.topics_enabled) + line("资讯卡片", cfg.news_card_enabled) + line("构想提及", cfg.idea_mention_enabled);
-    html += `<div class="fine">每日上限 ${Number(cfg.daily_max) === 0 ? "不限" : `${esc(cfg.daily_max)} 条`} · 免打扰 ${esc(cfg.quiet_hours || "23:00-08:00")}<br />今日已发送 ${Number(p.sent_today) || 0} 条（占用额度 ${Number(p.quota_used) || 0}）${tip("未确认送达的消息也计入额度，以免重复发送。")}</div>`;
+    html += `<div class="fine">每张卡片 ${Number(cfg.news_card_count) || 3} 条 · 每日上限 ${Number(cfg.daily_max) === 0 ? "不限" : `${esc(cfg.daily_max)} 条`} · 免打扰 ${esc(cfg.quiet_hours || "23:00-08:00")}<br />今日已发送 ${Number(p.sent_today) || 0} 条（占用额度 ${Number(p.quota_used) || 0}）${tip("未确认送达的消息也计入额度，以免重复发送。")}</div>`;
     if ((p.recent || []).length) html += `<details><summary>最近发送</summary>${p.recent.map(r => `<p class="fine">${esc(when(r.ts))} · ${esc(r.state || r.status)}${r.text ? ` · ${esc(r.text)}` : ""}</p>`).join("")}</details>`;
   }
   return html;
@@ -94,18 +102,13 @@ function pushHTML(c) {
 function featuresHTML(c) {
   const f = c.features || {};
   const help = "三个功能各自独立。关闭后本群不再新增对应工作，历史和文件保留；任务关闭会一并暂停目标检查和提醒。";
-  let html = `<div class="h-sub-row"><h2 class="h-sub">功能启用${tip(help)}</h2>${c.edit !== "features" ? `<button class="btn small" data-act="gctl-features-edit" data-g="${esc(c.gid)}">修改</button>` : ""}</div>`;
-  if (c.edit === "features") {
-    const d = c.draft;
-    html += switchRow(c, "news", "资讯", "定时采集并整理本群关心的资讯；含手动备料、资讯卡片与来源维护。", d.news);
-    html += switchRow(c, "idea", "构想", "按群画像定时 / 话头触发出构想；含手动生成与构想提及。", d.idea);
-    html += switchRow(c, "task", "任务", "接派活、审批后开工、目标追踪与提醒；关闭会暂停目标检查，正在执行的任务做完。", d.task);
-    if (d.task === false) html += `<p class="fine warn-inline" role="note">关闭任务会同时暂停本群的目标检查和提醒；已在执行的任务会做完，排队任务重新开启后要手动恢复。</p>`;
-    html += errorHTML(c) + saveActions(c, "features");
-  } else {
-    const line = (label, on) => `<div class="set-row gctl-row"><div><div class="set-name">${label}</div><div class="set-text">${on ? "已开启" : "已关闭"}</div></div></div>`;
-    html += line("资讯", f.news) + line("构想", f.idea) + line("任务", f.task);
-    if (f.task === false) html += `<p class="fine">任务已关闭：目标检查和提醒一并暂停，历史与文件仍可查看。</p>`;
+  let html = `<div class="h-sub-row"><h2 class="h-sub">功能启用${tip(help)}</h2></div><div class="set-group">`;
+  html += switchRow(c, "news", "资讯", "定时采集并整理本群关心的资讯；含手动搜集、资讯卡片与来源维护。", f.news, "gctl-feature-toggle");
+  html += switchRow(c, "idea", "构想", "按群画像定时或由话头触发生成构想；含手动生成与构想提及。", f.idea, "gctl-feature-toggle");
+  html += switchRow(c, "task", "任务", "接收任务、审批后开工、目标追踪与提醒；关闭会暂停目标检查，正在执行的任务继续完成。", f.task, "gctl-feature-toggle");
+  html += `</div>`;
+  if (f.task === false) {
+    html += `<p class="fine warn-inline" role="note">任务已关闭：本群的目标检查和提醒已一并暂停；已在执行的任务会继续完成，排队任务重新开启后需手动恢复。</p>`;
   }
   return html;
 }
@@ -172,6 +175,41 @@ export async function actControls(action, el) {
   if (!current(c) || el.dataset.g !== c.gid || c.saving) return true;
   if (action === "gctl-reload") { await load(c); return true; }
   if (action === "gctl-cancel") { c.edit = null; c.draft = null; c.error = ""; repaintControls(); return true; }
+  if (action === "gctl-feature-toggle" || action === "gctl-push-toggle") {
+    const isFeat = action === "gctl-feature-toggle";
+    const key = el.dataset.key;
+    const allowed = isFeat ? FEATURE_KEYS : ["topics_enabled", "news_card_enabled", "idea_mention_enabled"];
+    if (!allowed.includes(key)) return true;
+    if (!isFeat && c.edit === "push") { readDraft(c); return true; }
+    const prevObj = isFeat ? c.features : c.push.config;
+    const prevVal = !!prevObj[key];
+    const nextVal = typeof el.checked === "boolean" ? el.checked : el.dataset.on === "1";
+    prevObj[key] = nextVal;
+    c.saving = true;
+    c.error = "";
+    repaintControls();
+    try {
+      const body = isFeat
+        ? Object.fromEntries(FEATURE_KEYS.map(k => [k, !!c.features[k]]))
+        : Object.fromEntries(PUSH_KEYS.map(k => [k, c.push.config[k]]));
+      const result = await api("PUT", `/api/groups/${encodeURIComponent(c.gid)}/${isFeat ? "features" : "push"}`, body);
+      if (!current(c) || state.groupControls !== c) return true;
+      if (isFeat) c.features = result;
+      else c.push = result;
+      toast("已保存（仅本群）");
+    } catch (e) {
+      prevObj[key] = prevVal;
+      if (typeof el.checked === "boolean") el.checked = prevVal;
+      if (current(c)) {
+        c.error = e.message;
+        toast(e.message, true);
+      }
+    } finally {
+      c.saving = false;
+      repaintControls();
+    }
+    return true;
+  }
   const kind = action.includes("approval") ? "approval" : action.includes("features") ? "features" : "push";
   if (kind === "approval" && !admin()) return true;
   if (action.endsWith("-edit")) {

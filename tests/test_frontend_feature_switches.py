@@ -30,8 +30,8 @@ def test_groupcontrols_features_block_and_task_off_copy() -> None:
     # 任务关闭的连带提示（目标检查 / 手动恢复）
     assert "目标检查" in text
     assert "手动恢复" in text
-    # 保存走 features 接口
-    assert 'data-act="gctl-features-edit"' in text
+    # 开关常驻，点击直接走 features 接口保存
+    assert 'data-act="gctl-feature-toggle"' in text
 
 
 def test_held_tasks_have_explanation_and_manual_resume():

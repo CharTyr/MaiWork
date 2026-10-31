@@ -114,6 +114,7 @@ class CaptureWorkers:
             "allowed_tools": list(allowed_tools or []),
             "agent_type": str(agent_type),
             "task_id": task_id,
+            "workspace": workspace,
         })
         if self.before_return is not None:
             out = self.before_return()

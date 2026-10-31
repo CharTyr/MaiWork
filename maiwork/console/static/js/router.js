@@ -46,11 +46,35 @@ export function syncHash() {
   if (location.hash !== h) history.replaceState(null, "", h);
 }
 
+const KNOWN_SET_SUBS = ["overview", "models", "extensions", "sources", "usage", "rules"];
+const LEGACY_SET_ROUTES = {
+  overview: ["overview", ""],
+  models: ["models", "models"],
+  agents: ["models", "agents"],
+  jev: ["models", "jev"],
+  extensions: ["extensions", ""],
+  mcp: ["extensions", "mcp"],
+  optdeps: ["extensions", "optdeps"],
+  social: ["extensions", "search"],
+  "social-login": ["extensions", "search"],
+  sources: ["sources", "feeds"],
+  links: ["sources", "links"],
+  usage: ["usage", "usage"],
+  logs: ["usage", "logs"],
+  appearance: ["rules", "appearance"],
+  memory: ["rules", "memory"],
+  rules: ["rules", "config"],
+};
+
 export function parseHash() {
   const parts = location.hash.replace(/^#\/?/, "").split("/");
   if (parts[0] === "board") return { board: true, id: "", ref: "", tab: "", sub: "" };
   if (parts[0] === "chat") return { chat: true, id: parts[1] || "", ref: "", tab: "", sub: "" };
-  if (parts[0] === "settings") return { settings: true, sub: parts[1] === "logs" ? "usage" : parts[1] === "social-login" ? "social" : parts[1] || "overview", ref: "", tab: "", id: "" };
+  if (parts[0] === "settings") {
+    const raw = parts[1] || "overview";
+    const mapped = LEGACY_SET_ROUTES[raw] || [raw, ""];
+    return { settings: true, sub: mapped[0], setTab: mapped[1], ref: "", tab: "", id: "" };
+  }
   // 旧的目标页链接仍能打开原目标详情，只是落到「任务」。
   const tab = parts[1] === "goals" ? "tasks" : parts[1] || "";
   return { ref: decodeURIComponent(parts[0] || ""), tab, id: decodeURIComponent(parts[2] || "") };
@@ -67,7 +91,14 @@ export function applyHash() {
   const h = parseHash();
   state.page = h.settings && admin() ? "settings" : h.chat && admin() ? "chat" : h.board && admin() ? "board" : null;
   if (h.chat && h.id) state.chatId = Number(h.id) || h.id;
-  if (h.settings) state.setSub = SET_SUBS.some((x) => x[0] === h.sub) ? h.sub : "overview";
+  if (h.settings) {
+    const valid = SET_SUBS && SET_SUBS.length ? SET_SUBS.map((x) => x[0]) : KNOWN_SET_SUBS;
+    state.setSub = valid.includes(h.sub) ? h.sub : "overview";
+    if (h.setTab) {
+      state.setTab = state.setTab || {};
+      state.setTab[state.setSub] = h.setTab;
+    }
+  }
   if (TABS.some((x) => x.id === h.tab)) state.tab = h.tab;
   if (gadmin()) {
     const prev = state.g;
@@ -187,15 +218,11 @@ export async function reboot() {
   if (admin()) pollUpdate(true);
   const settingsReady = admin()
     ? loadSettings().then(async () => {
-        if (state.page === "settings" && state.setSub === "extensions") await loadExt();
-        if (state.page === "settings" && state.setSub === "agents") await loadAgents();
-        if (state.page === "settings" && state.setSub === "models") await loadModels();
-        if (state.page === "settings" && state.setSub === "rules") await loadRules();
+        if (state.page === "settings" && state.setSub === "extensions") await Promise.all([loadExt(), loadSocial()]);
+        if (state.page === "settings" && state.setSub === "models") await Promise.all([loadModels(), loadAgents(), loadIdentity()]);
+        if (state.page === "settings" && state.setSub === "sources") await loadGA();
         if (state.page === "settings" && state.setSub === "usage") await Promise.all([loadUsage(), loadLogSummary()]);
-        if (state.page === "settings" && ["memory", "agents"].includes(state.setSub)) await loadIdentity();
-        if (state.page === "settings" && state.setSub === "links") await loadGA();
-        if (state.page === "settings" && state.setSub === "appearance") await loadAppearance();
-        if (state.page === "settings" && ["social"].includes(state.setSub)) await loadSocial();
+        if (state.page === "settings" && state.setSub === "rules") await Promise.all([loadAppearance(), loadIdentity(), loadRules()]);
         renderRail();
         repaintSheet();
       })
@@ -220,22 +247,30 @@ export async function reboot() {
   }
 }
 
-export async function enterSettings(sub) {
+export async function enterSettings(sub, tab) {
   if (!admin()) return;
   closeSheet();
   state.extEdit = null;
-  go({ page: "settings", setSub: sub || state.setSub || "overview", detail: null });
+  const valid = SET_SUBS && SET_SUBS.length ? SET_SUBS.map((x) => x[0]) : KNOWN_SET_SUBS;
+  let nextSub = sub || state.setSub || "overview";
+  let nextTab = tab || "";
+  if (!valid.includes(nextSub) && LEGACY_SET_ROUTES[nextSub]) {
+    [nextSub, nextTab] = LEGACY_SET_ROUTES[nextSub];
+  } else if (!valid.includes(nextSub)) {
+    nextSub = "overview";
+  }
+  if (nextTab) {
+    state.setTab = state.setTab || {};
+    state.setTab[nextSub] = nextTab;
+  }
+  go({ page: "settings", setSub: nextSub, detail: null });
   if (!state.settings) await loadSettings();
   else if (state.setSub === "overview") await loadAttention();
-  if (state.setSub === "extensions") await loadExt();
-  if (state.setSub === "agents") await loadAgents();
-  if (state.setSub === "models") await loadModels();
-  if (state.setSub === "rules") await loadRules();
+  if (state.setSub === "extensions") await Promise.all([loadExt(), loadSocial()]);
+  if (state.setSub === "models") await Promise.all([loadModels(), loadAgents(), loadIdentity()]);
+  if (state.setSub === "sources") await loadGA();
   if (state.setSub === "usage") await Promise.all([loadUsage(), loadLogSummary()]);
-  if (["memory", "agents"].includes(state.setSub)) await loadIdentity();
-  if (state.setSub === "links") await loadGA();
-  if (state.setSub === "appearance") await loadAppearance();
-  if (["social"].includes(state.setSub)) await loadSocial();
+  if (state.setSub === "rules") await Promise.all([loadAppearance(), loadIdentity(), loadRules()]);
   if (state.page === "settings") {
     renderView();
     renderSide();

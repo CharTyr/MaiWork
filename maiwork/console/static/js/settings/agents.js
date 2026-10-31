@@ -31,6 +31,20 @@ const isCustom = (p) => !ORDER.includes(p.kind);
 const modelById = (id) => ((state.mdl && state.mdl.models) || []).find((x) => x.id === id);
 const modelName = (id) => { const x = modelById(id); return x ? x.name || x.model : id ? `${id}（已从模型库删除）` : ""; };
 
+export function agentsFormSheet() {
+  if (state.agentNew) return newAgentForm();
+  const profiles = (state.agents && state.agents.profiles) || [];
+  if (state.agentEdit) {
+    const p = profiles.find((x) => x.kind === state.agentEdit);
+    return p ? profileForm(p) : "";
+  }
+  if (state.agentFishEdit) {
+    const p = profiles.find((x) => x.kind === state.agentFishEdit);
+    return p ? fishForm(p) : "";
+  }
+  return "";
+}
+
 export function agentsPage() {
   const profiles = sortProfiles((state.agents && state.agents.profiles) || []);
   if (state.agentError && !profiles.length) return `<p class="err" role="alert">${esc(state.agentError)}</p><button class="btn" data-act="agent-reload">刷新</button>`;
@@ -38,12 +52,14 @@ export function agentsPage() {
   const groups = state.groups || [];
   const snapshot = state.agentSnapshot;
   const noModels = !((state.mdl && state.mdl.models) || []).length;
+  const inSheet = state.sheet === "settings-form";
+  const rows = profiles.map((p) => !inSheet && state.agentEdit === p.kind ? profileForm(p) : !inSheet && state.agentFishEdit === p.kind ? fishForm(p) : profileRow(p)).join("");
   return `
-    ${noModels ? `<div class="warn-box">暂无模型<button class="btn small" data-act="set-sub" data-sub="models" style="margin-left:8px">前往添加</button></div>` : ""}
+    ${noModels ? `<div class="warn-box">暂无模型<button class="btn small warn-act" data-act="set-tab" data-sub="models" data-tab="models">前往添加</button></div>` : ""}
     <div class="agent-avatar">${avatarBlock()}</div>
     <div class="h-sub-row"><h2 class="h-sub">专岗${tip("主模型负责分析和检查，专岗负责执行具体工作。")}</h2><button class="btn small" data-act="agent-new">新建</button></div>
-    ${state.agentNew ? newAgentForm() : ""}
-    ${profiles.map((p) => state.agentEdit === p.kind ? profileForm(p) : state.agentFishEdit === p.kind ? fishForm(p) : profileRow(p)).join("")}
+    ${!inSheet && state.agentNew ? newAgentForm() : ""}
+    ${rows ? `<div class="set-group">${rows}</div>` : ""}
     <h2 class="h-sub">本群工作记录${tip("各专岗在所选群中的工作记录。")}</h2>
     ${groups.length ? `<label for="agent-group" class="fine">群</label><select id="agent-group">${groups.map((g) => `<option value="${esc(g.id)}"${state.agentGroup === g.id ? " selected" : ""}>${esc(g.name || `群 ${g.id}`)}</option>`).join("")}</select>` : `<p class="fine">暂无群</p>`}
     ${state.agentError ? `<p class="err" role="alert">${esc(state.agentError)}</p><button class="btn small" data-act="agent-reload">刷新</button>` : ""}

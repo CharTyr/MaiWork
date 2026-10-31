@@ -188,6 +188,13 @@ _BODY_START = "----- 正文开始（原样，未删改）-----"
 _BODY_END = "----- 正文结束 -----"
 _SPILL_DIR = "tool_spill"        # 工具输出归档根目录（workers.py / coordinator.py 同一套口径）
 
+# 看图工具（2026-10-31）：read_image（worker）/ inspect_image（main）
+_READ_IMAGE_MAX = 10 * 1024 * 1024   # 单张图片上限（10MB）
+_READ_IMAGE_SYSTEM = (
+    "你是群工具「看图」的眼睛：用户给一张图、可能带一个问题，你按问题看图回答。"
+    "图里有什么就说什么，不编；看不清或图里没有的东西直说没有。回答用中文，简洁。"
+)
+
 
 def _parse_offset(args: dict) -> tuple[int, str]:
     """offset：从文件开头数第几个字开始读。
@@ -275,12 +282,15 @@ def register_exec_tools(
     host: Any,  # Host（host.py），用它的 messages/knowledge
     get_settings: Callable[[], Any],
     session_of: Callable[[str], str] | None = None,
+    models: Any = None,  # Models（models.py）；给了才注册 read_image / inspect_image
 ) -> None:
     """把 M3 工具注册进 tools。
 
     - session_of(group_id) -> session_id：由接线层提供（去 store.groups 查）；
       没给或查不到时 read_chat_history 直接报「没找到本群会话」。
     - env 的 local_mode / 各种上限从 get_settings() 现读（配置改了下次生效）。
+    - models：给了才注册看图工具 read_image（worker）/ inspect_image（main）
+      ——这两个要调视觉模型；没接 models 的老调用方行为不变（没这两个工具）。
     """
     session_of = session_of or (lambda _gid: "")
 
@@ -507,6 +517,22 @@ def register_exec_tools(
         _path, err = _bound(ctx, rel)
         if err:
             return err
+        # 图片魔数拦截（2026-10-31）：文本工具读 PNG/JPEG/GIF/WebP 只会出一屏乱码
+        # （线上 T-17 的浪费），先看头 16 字节，是图就直接报错引导改用看图工具。
+        try:
+            with open(_path, "rb") as _fh:
+                _head = _fh.read(16)
+        except OSError:
+            _head = b""
+        if _head and _image_mime(_head):
+            alt = "read_image" if tool == "read_file" else "inspect_image"
+            return ToolResult(
+                ok=False, output="",
+                error=(
+                    f"{rel} 是图片文件（PNG/JPEG/GIF/WebP 之一），文本工具读出来是乱码："
+                    f"改用 {alt}（按内容看图，能问它问题）"
+                ),
+            )
         offset, offset_err = _parse_offset(args)
         if offset_err:
             return ToolResult(ok=False, output="", error=offset_err)
@@ -620,6 +646,105 @@ def register_exec_tools(
 
     async def inspect_file(ctx: ToolContext, args: dict) -> ToolResult:
         return await _read_page(ctx, args, tool="inspect_file")
+
+    async def _read_image(ctx: ToolContext, args: dict, *, tool: str, role: str, kind: str) -> ToolResult:
+        """read_image（worker）/ inspect_image（main）的公共实现（2026-10-31 看图工具）。
+
+        闸序和文本工具一致：成品目录隔离 → 归档隔离 → env.resolve 越界 → 存在性 →
+        大小 → **内容魔数认图**（不认扩展名）→ 有真能跑的视觉模型 → 调模型看图。
+        没有视觉模型时直接回中文错（不调模型、不烧 token）。
+        """
+        if models is None:
+            return ToolResult(ok=False, output="", error="这次没有接模型层，看图工具用不了")
+        rel = str(args.get("path") or "").strip()
+        if not rel:
+            return ToolResult(ok=False, output="", error="path 不能为空")
+        refused, scope_text = _scope_other_artifacts(ctx, rel)
+        if refused:
+            return _scope_error(scope_text)
+        spilled, mine = _scope_other_task_spill(ctx, rel)
+        if spilled:
+            return _spill_scope_error(mine)
+        path, err = _bound(ctx, rel)
+        if err:
+            return err
+        if path.is_dir():
+            return ToolResult(ok=False, output="", error=f"{rel} 是目录，不是文件")
+        try:
+            size = int(path.stat().st_size)
+        except FileNotFoundError:
+            return ToolResult(ok=False, output="", error=f"工作区内没有这个文件：{rel}")
+        except OSError as e:
+            return ToolResult(ok=False, output="", error=f"读不了这个文件：{rel}（{e}）")
+        if size > _READ_IMAGE_MAX:
+            return ToolResult(
+                ok=False, output="",
+                error=(
+                    f"这张图太大了（{size / 1048576:.1f}MB，上限 {_READ_IMAGE_MAX // 1048576}MB）："
+                    "换一张小图，或先把图压小再试"
+                ),
+            )
+        try:
+            data = path.read_bytes()
+        except OSError as e:
+            return ToolResult(ok=False, output="", error=f"这张图读不出来：{rel}（{e}）")
+        mime = _image_mime(data)
+        if not mime:
+            return ToolResult(
+                ok=False, output="",
+                error=f"{rel} 不是图片文件（按内容判，只认 PNG / JPEG / GIF / WebP；扩展名说了不算）",
+            )
+        try:
+            cands = models.vision_candidates(kind)
+        except Exception:
+            logger.exception("取视觉候选链失败（%s）", tool)
+            cands = []
+        if not cands:
+            return ToolResult(
+                ok=False, output="",
+                error=(
+                    "现在没有可用的图片理解模型：到网页「设置 → 模型」加一条"
+                    "「支持图片输入（vision）」的模型，或把它的 vision 勾上，再试"
+                ),
+            )
+        question = str(args.get("question") or "").strip()
+        ask = question or "这张图里有什么？写了什么字？是干什么用的？按你看到的说，不编。"
+        uri = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+        messages = [
+            {"role": "system", "content": _READ_IMAGE_SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": ask},
+                    {"type": "image_url", "image_url": {"url": uri}},
+                ],
+            },
+        ]
+        try:
+            result = await models.chat(
+                role,
+                messages,
+                agent=("main" if role == "main" else "task"),
+                purpose=f"tools.{tool}",
+                group_id=str(getattr(ctx, "group_id", "") or ""),
+                task_id=str(getattr(ctx, "task_id", "") or ""),
+                timeout=120,
+                retries=1,
+                _candidates=cands,
+            )
+        except Exception as e:
+            logger.exception("%s 调视觉模型失败（%s）", tool, rel)
+            return ToolResult(ok=False, output="", error=f"看图模型调用失败：{getattr(e, 'message', e) or e}")
+        answer = str(getattr(result, "text", "") or "").strip()
+        if not answer:
+            return ToolResult(ok=False, output="", error="看图模型没给出内容：换个问题，或稍后再试")
+        return ToolResult(ok=True, output=answer, data={"path": rel, "mime": mime, "bytes": size})
+
+    async def read_image(ctx: ToolContext, args: dict) -> ToolResult:
+        return await _read_image(ctx, args, tool="read_image", role="worker", kind="task")
+
+    async def inspect_image(ctx: ToolContext, args: dict) -> ToolResult:
+        return await _read_image(ctx, args, tool="inspect_image", role="main", kind="main")
 
     async def write_file(ctx: ToolContext, args: dict) -> ToolResult:
         rel = str(args.get("path") or "").strip()
@@ -1163,6 +1288,57 @@ def register_exec_tools(
             timeout_s=10.0,
         )
     )
+    if models is not None:
+        tools.register(
+            Tool(
+                name="read_image",
+                description=(
+                    "看工作区内一张图片：按内容认图（PNG/JPEG/GIF/WebP，扩展名不算数，单张上限 10MB），"
+                    "把图交给视觉模型回答你的问题——图里有什么、写了什么字、什么布局。"
+                    "文本工具（read_file）读图只会出乱码；要图里的信息就用这个工具。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "工作区内图片的相对路径"},
+                        "question": {"type": "string", "description": "想问这张图什么（可选），如「图里的标题是什么字」"},
+                    },
+                    "required": ["path"],
+                },
+                roles=frozenset({"worker"}),
+                handler=read_image,
+                summarize=lambda args, res: (
+                    str(args.get("path", "")),
+                    (res.output[:120] + "…") if res.ok and len(res.output) > 120 else (res.output if res.ok else res.error),
+                ),
+                timeout_s=130.0,
+                needs_workspace=True,
+            )
+        )
+        tools.register(
+            Tool(
+                name="inspect_image",
+                description=(
+                    "（主模型验收用）看工作区内一张图片：和子 agent 的 read_image 是同一个东西的验收版，"
+                    "按内容认图（PNG/JPEG/GIF/WebP，上限 10MB），可以问「图里是不是画了要求的 XX」。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "工作区内图片的相对路径"},
+                        "question": {"type": "string", "description": "想核对这张图的什么（可选）"},
+                    },
+                    "required": ["path"],
+                },
+                roles=frozenset({"main"}),
+                handler=inspect_image,
+                summarize=lambda args, res: (
+                    f"（验收看图）{args.get('path', '')}",
+                    (res.output[:120] + "…") if res.ok and len(res.output) > 120 else (res.output if res.ok else res.error),
+                ),
+                timeout_s=130.0,
+            )
+        )
     tools.register(
         Tool(
             name="inspect_files",

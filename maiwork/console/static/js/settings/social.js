@@ -51,7 +51,7 @@ function schedulePoll() {
   if (!running && !pollDeadline) return;
   if (!pollDeadline) pollDeadline = Date.now() + 180000;
   pollTimer = setTimeout(async () => {
-    const visible = state.page === "settings" && ["social"].includes(state.setSub);
+    const visible = state.page === "settings" && ["extensions", "social"].includes(state.setSub);
     if (!visible || document.hidden) { pollDeadline = 0; return; }
     if (Date.now() >= pollDeadline) {
       pollDeadline = 0;
@@ -93,7 +93,7 @@ function platformRow(p) {
 function content(rows) {
   const error = social.err ? `<div class="warn-box" role="status">${esc(social.err)} <button class="btn" data-act="social-reload">重试</button></div>` : "";
   if (social.platforms === null) return error || loading();
-  return error + (rows || `<p class="h-meta">暂无平台</p>`);
+  return error + (rows ? `<div class="set-group">${rows}</div>` : `<p class="h-meta">暂无平台</p>`);
 }
 
 export function socialPage() {

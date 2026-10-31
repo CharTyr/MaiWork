@@ -129,6 +129,7 @@ function skillForm(c, kind, s) {
 
 function skillMeta(kind, s) {
   return [
+    s.origin === "auto" ? "自动整理" : "",
     s.locked ? "已锁定" : "",
     s.status === "archived" ? "已归档" : "",
     kind === "task" ? `已使用 ${Number(s.uses) || 0} 次` : "",
@@ -177,7 +178,7 @@ function taskRow(c, s) {
   const open = String(c.open) === String(s.id);
   return `<div class="pf skill${s.status === "archived" ? " archived" : ""}">
     <div>
-      <button type="button" class="skill-name" data-act="gctx-skill-open" data-id="${esc(String(s.id))}" aria-expanded="${open ? "true" : "false"}">${esc(s.name || "")}</button>
+      <button type="button" class="skill-name" data-act="gctx-skill-open" data-id="${esc(String(s.id))}" aria-expanded="${open ? "true" : "false"}">${esc(s.name || "")}</button>${s.origin === "explore" ? ` <span class="tag">自动探索</span>` : ""}
       ${s.description ? `<div class="pf-meta">${esc(s.description)}</div>` : ""}
       <div class="pf-meta">${esc(skillMeta("task", s))}</div>
       ${open ? `<div class="skill-body">${esc(s.body || "")}</div>` : ""}

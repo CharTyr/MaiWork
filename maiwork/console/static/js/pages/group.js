@@ -1,5 +1,5 @@
 // MaiWork 网页 · 「群」页：话题、这个群（本群规矩 / 本群做法 / 群画像）、关注成员、群空间。
-import { CATS, TONES, admin, gadmin } from "../state.js";
+import { CATS, TONES, admin, gadmin, state } from "../state.js";
 import { SVG, dayIndex, dayWord, dur, esc, hhmm, ico, now, richText, safeUrl, tip, when } from "../util.js";
 import { daySummary, judgeText, stretches } from "../topiclog.js";
 import { gname, gplat, platTag } from "../api.js";
@@ -215,14 +215,36 @@ function ctxBlock(g) {
   return `<h2 class="h-sub">本群 <span class="private">${SVG.lock}仅管理员可见</span></h2>${ctxSection(g.id)}`;
 }
 
+function groupSubNav() {
+  if (!gadmin()) return "";
+  const cur = state.groupSub === "admin" ? "admin" : "feed";
+  return `<div class="seg set-seg group-seg" role="tablist">
+    <button type="button" role="tab" data-act="group-sub" data-sub="feed" aria-selected="${cur === "feed"}">动态与画像</button>
+    <button type="button" role="tab" data-act="group-sub" data-sub="admin" aria-selected="${cur === "admin"}">本群设置</button>
+  </div>`;
+}
+
+export function actGroup(a, el) {
+  if (a !== "group-sub" || !gadmin()) return false;
+  state.groupSub = el && el.dataset && el.dataset.sub === "admin" ? "admin" : "feed";
+  return true;
+}
+
 export function viewGroup(g, v) {
   const members = g.members ? `${g.members} 人 · ` : "";
   let html = `<h1 class="h-page">${esc(gname(g))}</h1><p class="h-meta">${platTag(g, v)}${members}工作区 <span class="mono">${esc((v && v.workspace) || "")}</span></p>`;
   html += pulseCard(g, v, false);
   if (!v) return html + loading();
+  html += groupSubNav();
+  const showAdmin = gadmin() && state.groupSub === "admin";
   if (g.fresh) {
-    html += emptyState("seedling", "正在建立群画像", "") + commandsBlock(v);
-    return gadmin() ? html + ctxBlock(g) + controlsSection(g.id, v) + focusSection(v) : html;
+    if (showAdmin) return html + controlsSection(g.id, v) + ctxBlock(g);
+    html += emptyState("seedling", "正在建立群画像", "");
+    if (gadmin()) html += focusSection(v);
+    return html + commandsBlock(v);
+  }
+  if (showAdmin) {
+    return html + controlsSection(g.id, v) + ctxBlock(g) + groupSpaceBlock(v, g);
   }
   const log = v.topic_log || [];
   html += `<h2 class="h-sub">话题记录</h2>`;
@@ -246,10 +268,9 @@ export function viewGroup(g, v) {
       html += openers.length ? openers.map((s, k) => topicItem(s, k)).join("") : `<p class="h-meta">暂无</p>`;
     }
   }
-  html += ctxBlock(g);
   html += `<h2 class="h-sub">群画像</h2>`;
   html += profileSection(v);
+  if (gadmin()) html += focusSection(v);
   html += commandsBlock(v);
-  if (gadmin()) html += controlsSection(g.id, v) + groupSpaceBlock(v, g) + focusSection(v);
   return html;
 }

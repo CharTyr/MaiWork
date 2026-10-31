@@ -40,7 +40,7 @@ export async function avatarSaved(a) {
 
 export async function loadIdentity() {
   api("GET", "/api/settings/avatar")
-    .then((a) => ((state.avatarCfg = a), ["memory", "agents"].includes(state.setSub) && repaintSheet()))
+    .then((a) => ((state.avatarCfg = a), ["models", "rules", "memory", "agents"].includes(state.setSub) && repaintSheet()))
     .catch(() => (state.avatarCfg = null));
   try {
     state.identity = await api("GET", "/api/identity");
