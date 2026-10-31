@@ -495,6 +495,11 @@ def make_config(tmp_path: Path, **sections: Any) -> dict:
     raw["storage"]["data_dir"] = str(tmp_path / "data")
     raw["environments"]["local_mode"] = "direct"
     raw["environments"]["workspace_root"] = str(tmp_path / "workspaces")
+    # 隔离罩缺口：一次性云 VM 默认开着会真去 ssh railway.new / 调 Freestyle API（E2E
+    # 不注假 runner），连不上要等几十秒，任务停在 running 把等任务断言拖爆。默认全关；
+    # 专测远端路径的用例自己再 override 回来并注入假 runner。
+    raw["environments"]["railway"] = False
+    raw["environments"]["freestyle"] = False
     raw["console"]["password"] = "e2e-密码"
     raw["console"]["listen"] = "127.0.0.1:18691"
     raw["models"].update(

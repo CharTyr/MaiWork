@@ -676,21 +676,32 @@ def test_isolated_write_yields_none_when_locked(tmp_path) -> None:
     store.close()
 
 
-def test_flush_spool_round_stops_after_first_lock_failure(tmp_path) -> None:
-    """整轮有界：锁被占时一轮只等一次锁（不是 4 条 × timeout），4 条全留着等退避重试。"""
+def test_flush_spool_round_stops_after_first_lock_failure(tmp_path, monkeypatch) -> None:
+    """整轮有界：锁被占时一轮只等一次锁（不是 4 条 × timeout），4 条全留着等退避重试。
+
+    不变量用「锁尝试次数」来钉，不是墙钟——CI 高负载下一次 busy_timeout 等待本身
+    就可能被拖到 0.4s+，按时间断言会把「没做整轮有界」和「机器慢」混为一谈。
+    """
     store = _store(tmp_path)
     pa = PendingAsks(store, _settings)
     for i in range(4):
         assert pa.spool_write(GID, {"message_id": f"m-r{i}", "text": "帮我整理"}, "等判断")
+    attempts = 0
+    real_iso = pa.isolated_write
+
+    def _counting_iso(timeout_s):
+        nonlocal attempts
+        attempts += 1
+        return real_iso(timeout_s)
+
+    monkeypatch.setattr(pa, "isolated_write", _counting_iso)
     lock = _WriteLock(store)
     try:
-        start = time.monotonic()
         landed, waiting = pa.flush_spool_once(timeout_s=0.2)
-        took = time.monotonic() - start
     finally:
         lock.release()
     assert landed == [] and waiting == 4
-    assert took < 0.45, f"一轮等了 {took:.2f}s（4 条 × 0.2s 就是没做整轮有界）"
+    assert attempts == 1, f"一轮试了 {attempts} 次写锁（4 条 × timeout 就是没做整轮有界）"
     assert len(_spool_files(tmp_path)) == 4, "一条都不许丢"
     # 放锁之后一轮全部落地
     landed, waiting = pa.flush_spool_once(timeout_s=1.0)

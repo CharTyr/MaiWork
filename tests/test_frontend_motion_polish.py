@@ -728,12 +728,31 @@ async def test_motion_polish_in_real_browsers(env, browser_cache, engine: str) -
             await expect(desk.locator(".idea-menu")).to_have_count(0)
             await expect(desk.locator('[data-act="side-close"]')).to_be_visible()
 
+            # MutationObserver 在 is-copied 加上的同一刻原子取证（class / 文案 / minWidth 三项同刻）。
+            # 若用 click 之后三条独立 protocol 读取，1.8s 还原定时器可能在读取间隙先跑（CPU 满载），
+            # 使三次结果来自不同状态，而非同一时刻的反馈。
+            await desk.evaluate(
+                """() => {
+                  const btn = document.querySelector('[data-act="idea-copy"]');
+                  window.__copyShot = null;
+                  new MutationObserver((_, obs) => {
+                    if (btn.classList.contains('is-copied')) {
+                      window.__copyShot = {
+                        copied: true,
+                        text: btn.textContent,
+                        minWidth: btn.style.minWidth,
+                      };
+                      obs.disconnect();
+                    }
+                  }).observe(btn, { attributes: true, attributeFilter: ['class'] });
+                }"""
+            )
             copy_btn = desk.locator('[data-act="idea-copy"]')
             await copy_btn.click()
-            await expect(copy_btn).to_have_class(re.compile(r"\bis-copied\b"))
-            await expect(copy_btn).to_contain_text("已复制")
-            min_w = await copy_btn.evaluate("(el) => el.style.minWidth")
-            assert min_w.endswith("px"), f"复制变形期间应锁定 minWidth: {min_w}"
+            await desk.wait_for_function("() => window.__copyShot !== null")
+            shot = await desk.evaluate("() => window.__copyShot")
+            assert shot["text"].find("已复制") >= 0, f"复制变形期间应显示已复制: {shot}"
+            assert shot["minWidth"].endswith("px"), f"复制变形期间应锁定 minWidth: {shot}"
             await desk_ctx.close()
 
             # 3. 减少动态效果：保留 0.16s~0.18s 温和透明度过渡，抽屉无滑入位移且禁用拖拽跟手

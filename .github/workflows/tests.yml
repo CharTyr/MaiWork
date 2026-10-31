@@ -19,7 +19,6 @@ jobs:
     env:
       # Test fixtures contain UTF-8 text; keep their default encoding consistent across runners.
       PYTHONUTF8: "1"
-      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -27,6 +26,12 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: tests/requirements.txt
+      - name: Keep browser cache outside the checkout
+        run: >-
+          python -c "import os; from pathlib import Path;
+          cache = Path(os.environ['RUNNER_TEMP']) / 'maiwork-playwright';
+          f = open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8');
+          f.write('PLAYWRIGHT_BROWSERS_PATH=' + str(cache) + '\n'); f.close()"
       - run: pip install -r tests/requirements.txt
       # 前端单测用 node 跑真实 ESM 模块（三平台统一版本）
       - uses: actions/setup-node@v4
@@ -38,4 +43,4 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
       - run: python -m playwright install chromium webkit
         if: matrix.os != 'ubuntu-latest'
-      - run: python -m pytest tests -q -n auto
+      - run: python -m pytest tests -q -n auto --maxfail=1
