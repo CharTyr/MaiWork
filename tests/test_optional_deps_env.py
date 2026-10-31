@@ -11,6 +11,7 @@ LocalEnv 在拼环境时把那个目录加进 `PYTHONPATH`，子 agent 的 `pyth
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -48,6 +49,7 @@ def _setenv(argv: list[str]) -> dict[str, str]:
     return out
 
 
+@pytest.mark.skipif(os.name == "nt", reason="此测试真实启动 /bin/bash，仅适用于 POSIX")
 @pytest.mark.asyncio
 async def test_direct_command_gets_pythonpath(tmp_path: Path) -> None:
     root = tmp_path / "ws"
@@ -59,6 +61,7 @@ async def test_direct_command_gets_pythonpath(tmp_path: Path) -> None:
     assert f"[{libs}]" in r.stdout
 
 
+@pytest.mark.skipif(os.name == "nt", reason="此测试真实启动 /bin/bash，仅适用于 POSIX")
 @pytest.mark.asyncio
 async def test_direct_command_without_libs_has_no_pythonpath(tmp_path: Path) -> None:
     """还没装（目录不存在）时不要塞一个空 PYTHONPATH 进去。"""
@@ -68,6 +71,7 @@ async def test_direct_command_without_libs_has_no_pythonpath(tmp_path: Path) -> 
     assert r.stdout.strip() == "[]"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="此测试真实启动 /bin/bash，仅适用于 POSIX")
 @pytest.mark.asyncio
 async def test_direct_command_still_minimal_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """加了 PYTHONPATH 也不许把宿主环境带进来。"""

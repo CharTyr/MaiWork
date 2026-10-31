@@ -1,8 +1,4 @@
 """Real Chromium/WebKit checks for the opaque artifact sandbox (local fake host only)."""
-import os
-import pwd
-from pathlib import Path
-
 import pytest
 from playwright.async_api import async_playwright, expect
 
@@ -12,12 +8,7 @@ from test_review_artifacts import task, artifact
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])
-async def test_r2_opaque_sandbox_loads_relative_css_and_modules_without_cookie(env, monkeypatch, engine):
-    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    caches = (real_home / "Library/Caches/ms-playwright", real_home / ".cache/ms-playwright")
-    cache = next((p for p in caches if p.is_dir()), None)
-    assert cache is not None, "需要已安装的浏览器，不能跳过成品沙盒验收"
-    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(cache))
+async def test_r2_opaque_sandbox_loads_relative_css_and_modules_without_cookie(env, browser_cache, engine):
     tid = task(env)
     directory = artifact(env, tid)
     (directory / "index.html").write_text('<!doctype html><link rel="stylesheet" href="./style.css"><body><p id="result">loading</p><script type="module" src="./app.mjs"></script></body>')

@@ -144,8 +144,9 @@ async def test_private_home_credentials(store, monkeypatch, pid):
         homes.append(home)
         target = home / (".xiaohongshu-cli/cookies.json" if pid == "xiaohongshu" else ".config/rdt-cli/credential.json")
         data = json.loads(target.read_text())
-        assert target.stat().st_mode & 0o777 == 0o600
-        assert home.stat().st_mode & 0o777 == 0o700
+        if os.name != "nt":
+            assert target.stat().st_mode & 0o777 == 0o600
+            assert home.stat().st_mode & 0o777 == 0o700
         assert isinstance(data["saved_at"], float)
         if pid == "reddit":
             assert data["cookies"]["reddit_session"] == "fixture-session"

@@ -142,10 +142,14 @@ class TestWrite:
         assert "# per_day 的注释" in text2
 
     def test_mode_0600(self, tmp_path: Path) -> None:
+        # Windows 的 os.chmod 只认只读位，权限位语义不成立——POSIX 才断言 0600。
         d = _plugin_dir(tmp_path)
         data_dir = tmp_path / "data"
         data_dir.mkdir()
         config_file.write_fields(d, data_dir, {"topics.per_day": 5})
+        assert (d / "config.toml").is_file()
+        if os.name == "nt":
+            return
         mode = stat.S_IMODE(os.stat(d / "config.toml").st_mode)
         assert mode == 0o600
 
@@ -157,6 +161,8 @@ class TestWrite:
             config_file.write_fields(d, data_dir, {"topics.per_day": i})
         backups = sorted((data_dir / "config-backups").glob("config.toml-*"))
         assert len(backups) == 10
+        if os.name == "nt":  # Windows chmod 只认只读位，权限位语义不成立
+            return
         for b in backups:
             assert stat.S_IMODE(os.stat(b).st_mode) == 0o600
 

@@ -78,7 +78,7 @@ class TestCapabilityOnApp:
     def test_workspace_root_dynamic_private(self, tmp_path):
         app = _make_app(tmp_path, _dec("dynamic", True))
         root = app._workspace_root_for(_dec("dynamic", True))
-        assert str(root) == "/var/lib/private/maiwork/workspaces"
+        assert root.as_posix() == "/var/lib/private/maiwork/workspaces"
 
 
 class TestStoppedUnregistersCommandTools:

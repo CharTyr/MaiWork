@@ -547,6 +547,9 @@ def secure_write_text(base: Any, name: str, text: str) -> Path | None:
     2. 文件名用 `O_CREAT|O_EXCL|O_NOFOLLOW` 建（带随机后缀，EEXIST 就换名重试）；
     3. 全程只在拿到的目录 fd 里操作，写完关掉所有 fd。
 
+    没有目录句柄的平台（原生 Windows）改走 `_secure_write_text_plain`（逐级拒链接 / 重解析点 +
+    独占新建），结果口径相同。
+
     成功返回「base/name」这个 Path（绝对路径，模型能照着读）；拒绝 / 失败返回 None
     （调用方保留完整正文，不假装归档成功）。`base` 必须是绝对路径。
     """
@@ -560,6 +563,10 @@ def secure_write_text(base: Any, name: str, text: str) -> Path | None:
         return None
     if not base_path.is_absolute():
         return None
+    from .environments import pathsafe
+
+    if not pathsafe.has_dir_fd():
+        return _secure_write_text_plain(base_path, name, text)
     fds: list[int] = []
     try:
         cur = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
@@ -629,6 +636,45 @@ def secure_write_text(base: Any, name: str, text: str) -> Path | None:
                 os.close(fd)
             except OSError:  # pragma: no cover - 防御
                 pass
+
+
+def _secure_write_text_plain(base_path: Path, name: str, text: str) -> Path | None:
+    """`secure_write_text` 的无目录句柄版本（原生 Windows）。
+
+    从盘符根起逐级 `lstat`，任何一级是符号链接 / 重解析点 / 不是目录 → 拒绝（缺的级 0o700 现建）；
+    文件名同样带随机后缀、`O_CREAT|O_EXCL` 独占新建（撞名换名重试）。拒绝 / 失败返回 None。
+    本机执行能力在这些平台恒为 stopped，没有子 agent 进程能并发换链接（见 environments/pathsafe.py）。
+    """
+    from .environments import pathsafe
+
+    try:
+        comps = [c for c in base_path.parts[1:] if c not in ("", ".")]
+        if any(c == ".." for c in comps):
+            return None
+        try:
+            directory = pathsafe.ensure_dirs(Path(base_path.anchor), comps, create=True, mode=0o700)
+        except OSError:
+            logger.warning("归档目录 %s 里有软链接 / 重解析点 / 不是目录，拒绝写入", base_path)
+            return None
+        stem, dot, suffix = str(name).partition(".")
+        suffix = f".{suffix}" if dot else ""
+        for _ in range(20):
+            fname = f"{stem}-{os.urandom(4).hex()}{suffix}"
+            try:
+                fd = pathsafe.create_exclusive(directory / fname, 0o600)
+            except FileExistsError:
+                continue
+            except OSError:
+                logger.warning("归档文件 %s 建不出来（可能被软链接占着），本次不写", fname)
+                return None
+            with os.fdopen(fd, "wb") as f:
+                f.write(text.encode("utf-8", errors="replace"))
+            return base_path / fname
+        logger.warning("归档文件名连续撞车，本次不写")
+        return None
+    except Exception:
+        logger.exception("安全写文件失败，本次不写")
+        return None
 
 
 def _archive_tool_body(content: str, directory: Any) -> str | None:

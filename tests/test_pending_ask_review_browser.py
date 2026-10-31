@@ -9,17 +9,9 @@ env = review_web.env
 
 
 @pytest.mark.asyncio
-async def test_review_real_browser_responsive_and_convert(env, monkeypatch):
-    # The isolation fixture replaces HOME; select only the installed browser cache,
-    # keeping the fake HOME and all host/systemd isolation guards intact.
-    import os
-    import pwd
-    from pathlib import Path
-    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    caches = (real_home / 'Library/Caches/ms-playwright', real_home / '.cache/ms-playwright')
-    cache = next((p for p in caches if p.is_dir()), None)
-    assert cache is not None, '需要已安装的 Chromium，不能跳过真实浏览器验收'
-    monkeypatch.setenv('PLAYWRIGHT_BROWSERS_PATH', str(cache))
+async def test_review_real_browser_responsive_and_convert(env, browser_cache):
+    # browser_cache 夹具把 PLAYWRIGHT_BROWSERS_PATH 指到真缓存，
+    # 同时保留隔离罩的假 HOME 与 systemd 防护。
     pa = review_web.seed(env)
     base = str(env.client.make_url('/')).rstrip('/')
     async with async_playwright() as pw:
@@ -50,17 +42,9 @@ async def test_review_real_browser_responsive_and_convert(env, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_settings_attention_and_optional_components_responsive(env, monkeypatch, tmp_path):
+async def test_settings_attention_and_optional_components_responsive(env, browser_cache, tmp_path):
     import json
-    import os
-    import pwd
-    from pathlib import Path
 
-    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    caches = (real_home / 'Library/Caches/ms-playwright', real_home / '.cache/ms-playwright')
-    cache = next((p for p in caches if p.is_dir()), None)
-    assert cache is not None, '需要已安装的 Chromium，不能跳过真实浏览器验收'
-    monkeypatch.setenv('PLAYWRIGHT_BROWSERS_PATH', str(cache))
     review_web.seed(env)
     base = str(env.client.make_url('/')).rstrip('/')
     async with async_playwright() as pw:

@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import os
-import pwd
 from pathlib import Path
 
 import pytest
@@ -18,19 +16,8 @@ from test_group_controls_runtime_wiring import G1, ADMIN_PW, _raw_config, _write
 from CharTyr_MaiWork.maiwork.app import MaiWorkApp
 
 
-def _browsers(monkeypatch) -> None:
-    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    for cache in (real_home / "Library/Caches/ms-playwright", real_home / ".cache/ms-playwright"):
-        if cache.is_dir():
-            monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(cache))
-            return
-    pytest.skip("本机没装 playwright 浏览器")
-
-
 @pytest.mark.asyncio
-async def test_group_feature_switches_render_and_toggle(tmp_path: Path, monkeypatch) -> None:
-    pytest.importorskip("playwright.async_api")
-    _browsers(monkeypatch)
+async def test_group_feature_switches_render_and_toggle(tmp_path: Path, browser_cache) -> None:
     from playwright.async_api import async_playwright
 
     raw = _raw_config(tmp_path / "data")

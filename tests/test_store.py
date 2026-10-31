@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import stat
 from pathlib import Path
@@ -204,11 +205,15 @@ class TestSecrets:
 
 class TestFilePermission:
     def test_db_file_0600(self, tmp_path: Path) -> None:
-        # exFAT 上 chmod 无效，但 pytest 的 tmp_path 在 APFS（/private/var）下，可以断言
+        # exFAT 上 chmod 无效，但 pytest 的 tmp_path 在 APFS（/private/var）下，可以断言；
+        # Windows 的 os.chmod 只认只读位，权限位语义不成立——只验建库落盘，POSIX 才断言位。
         db = tmp_path / "perm" / "m.db"
         s = Store(db)
         s.migrate()
         s.close()
+        assert db.is_file()
+        if os.name == "nt":
+            return
         mode = stat.S_IMODE(db.stat().st_mode)
         assert mode == 0o600
         dmode = stat.S_IMODE(db.parent.stat().st_mode)

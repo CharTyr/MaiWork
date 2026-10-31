@@ -52,7 +52,7 @@ class FakeRunner:
     async def run(self, argv, *, cwd, env, timeout):
         argv = list(argv)
         self.calls.append(argv)
-        if Path(argv[0]).name == "ssh-keygen":
+        if Path(argv[0]).stem.lower() == "ssh-keygen":
             key = Path(argv[argv.index("-f") + 1])
             key.write_text("PRIVATE")
             key.with_suffix(".pub").write_text("ssh-ed25519 AAAATEST maiwork\n")
@@ -73,10 +73,13 @@ def _run(coro):
 # 平台规则本身在 tests/test_openssh_client.py；这里只验 SshEnv 用的是那份规则。
 
 
-def test_ssh_env_keeps_posix_path_and_drops_process_secrets() -> None:
+def test_ssh_env_follows_platform_rules_and_drops_process_secrets() -> None:
     """SshEnv 给子进程的环境 = 公共规则 + HOME；插件进程的变量一个都不带。"""
     env = SshEnv._env()
-    assert env["PATH"] == ssh_module.LocalEnv._MINIMAL_PATH
+    expected = ssh_module.openssh_client.minimal_env(
+        posix_path=ssh_module.LocalEnv._MINIMAL_PATH, platform=ssh_module._PLATFORM,
+    )
+    assert env["PATH"] == expected["PATH"]
     assert env["LANG"] == "C.UTF-8"
     allowed = {"PATH", "LANG", "HOME", "PROGRAMDATA", "SystemRoot", "windir"}
     assert set(env) <= allowed
@@ -326,7 +329,7 @@ def test_acquire_picks_first_reachable_in_order_and_marks_busy(tmp_path) -> None
     box = _run(env.acquire("T-1"))
     assert box is not None and box.name == "乙" and box.kind == "ssh"
     assert box.workdir == "/home/b/maiwork/T-1"
-    ssh_calls = [c for c in runner.calls if c[0] == "ssh"]
+    ssh_calls = [c for c in runner.calls if Path(c[0]).stem.lower() == "ssh"]
     assert all("BatchMode=yes" in c and "IdentitiesOnly=yes" in c for c in ssh_calls)
     assert any("-p" in c and "2200" in c for c in ssh_calls)
     # 同一台忙着：第二个任务只能拿别的（甲连不上）→ None，原因写清
@@ -394,7 +397,9 @@ def test_put_and_get_only_relative_safe_paths(tmp_path) -> None:
     local.write_text("print(1)")
     _run(env.put(box, local, "scripts/s.py"))
     scp = runner.calls[-1]
-    assert scp[0] == "scp" and "-P" in scp and "2222" in scp
+    assert Path(scp[0]).stem.lower() == "scp" and "-P" in scp and "2222" in scp
+    if ssh_module._PLATFORM != "nt":
+        assert scp[0] == "scp"
     assert scp[-1] == "a@10.0.0.1:/home/u/maiwork/T-1/scripts/s.py"
     out = tmp_path / "got" / "r.txt"
     _run(env.get(box, "out/r.txt", out))
@@ -411,7 +416,7 @@ def test_minimal_env_for_subprocess(tmp_path) -> None:
 
     async def runner(argv, *, cwd, env, timeout):
         seen.update(env)
-        if Path(argv[0]).name == "ssh-keygen":
+        if Path(argv[0]).stem.lower() == "ssh-keygen":
             key = Path(argv[argv.index("-f") + 1]); key.write_text("K"); key.with_suffix(".pub").write_text("ssh-ed25519 X\n")
             return 0, "", ""
         return 0, "/home/u/maiwork/T-1\n", ""

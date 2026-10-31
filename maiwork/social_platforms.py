@@ -26,7 +26,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote_plus, urlsplit
 import weakref
 
-from .optional_deps import windows_system_env
+from .optional_deps import windows_system_env, windows_system_path
 
 logger = logging.getLogger("maiwork.social_platforms")
 KV_KEY = "social.platforms"
@@ -297,11 +297,13 @@ def _venv_exe(venv: Path, name: str) -> Path:
     return venv / _VENV_BIN / (name + _EXE_SUFFIX)
 
 
-def _fixed_path() -> str:
-    if os.name != "nt":
+_OS_NAME = os.name  # 测试可注入；直接改 os.name 会让 Path() 变 WindowsPath 当场炸
+
+
+def _fixed_path(os_name: str | None = None) -> str:
+    if (os_name if os_name is not None else _OS_NAME) != "nt":
         return _FIXED_PATH
-    root = windows_system_env().get("SystemRoot", "")
-    return os.pathsep.join([str(Path(root) / "System32"), root]) if root else ""
+    return windows_system_path()
 
 
 def _prepare_root(store, p):
@@ -437,15 +439,29 @@ def cookie_status(store, platform_id):
     return bool(store.secret_get(COOKIE_PREFIX + p.id).strip())
 
 
-def _child_env(home: Path, root: Path) -> dict[str, str]:
+def _child_env(home: Path, root: Path, *, os_name: str | None = None) -> dict[str, str]:
     # Deliberately excludes host secrets, PYTHONPATH, browser/config locations,
     # proxy credentials and arbitrary subprocess configuration.
-    return {"PATH": os.pathsep.join(filter(None, [str(root / "venv" / _VENV_BIN), _fixed_path()])),
+    name = os_name if os_name is not None else _OS_NAME
+    env = {"PATH": os.pathsep.join(filter(None, [str(root / "venv" / _VENV_BIN), _fixed_path(name)])),
             "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"),
             "XDG_CACHE_HOME": str(home / ".cache"), "XDG_DATA_HOME": str(home / ".local/share"),
             "TMPDIR": str(home), "LANG": "C.UTF-8", "PYTHONNOUSERSITE": "1",
             "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_NO_INPUT": "1", "PIP_NO_CACHE_DIR": "1",
             **windows_system_env()}
+    if name == "nt":
+        # Windows Python 3.8+ 的 Path.home() / expanduser("~") 只读 USERPROFILE（不读 HOME），
+        # 缺了会抛 RuntimeError: Could not determine home directory——CLI 就读不到
+        # home 下的登录态文件。APPDATA/LOCALAPPDATA 对齐 XDG 两处，TEMP/TMP 落回 home：
+        # 全部指向这个一次性私有临时目录，绝不碰宿主机真实用户目录。
+        env.update({
+            "USERPROFILE": str(home),
+            "APPDATA": str(home / ".config"),
+            "LOCALAPPDATA": str(home / ".cache"),
+            "TEMP": str(home),
+            "TMP": str(home),
+        })
+    return env
 
 
 def _credential_file(path: Path, data: dict) -> None:
@@ -466,6 +482,8 @@ def _credentials(home, p, cookies, env):
         _credential_file(home / ".config" / "rdt-cli" / "credential.json", {
             "cookies": cookies, "source": "maiwork", "username": None, "modhash": None,
             "saved_at": time.time(), "last_verified_at": None})
+        # APPDATA 对齐到 home/.config，同一份凭据也可从
+        # %APPDATA%/rdt-cli/credential.json 找到，无需写第二份。
 
 
 def _kill_group(proc):

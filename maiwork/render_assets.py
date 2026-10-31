@@ -173,6 +173,10 @@ _EXE_PATTERNS = (
     "chromium_headless_shell-*/chrome-mac*/headless_shell",
     "chromium_headless_shell-*/chrome-headless-shell-mac*/chrome-headless-shell",
     "chromium-*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium",
+    # Windows：新布局（chrome-headless-shell-win64）与旧布局（chrome-win）都认
+    "chromium_headless_shell-*/chrome-headless-shell-win*/chrome-headless-shell.exe",
+    "chromium_headless_shell-*/chrome-win*/headless_shell.exe",
+    "chromium-*/chrome-win*/chrome.exe",
 )
 
 
@@ -184,13 +188,24 @@ def _rev(path: Path) -> int:
     return 0
 
 
+_OS_NAME = os.name  # 测试可注入；改 os.name 会让 Path() 变 WindowsPath 当场炸
+
+
+def _is_exe(path: Path) -> bool:
+    """可执行文件判定：Windows 的 .exe 不需要 POSIX 执行位（文件系统根本没有），
+    只要求是个文件；POSIX 仍要求 os.X_OK——没执行位的脚本不该被当成浏览器。"""
+    if _OS_NAME == "nt":
+        return path.is_file()
+    return path.is_file() and os.access(path, os.X_OK)
+
+
 def find_chromium(browsers_dir: Path) -> Path | None:
     """`ms-playwright` 目录里下载好的 Chromium 可执行文件（版本号最大的那个）。"""
     base = Path(browsers_dir)
     if not base.is_dir():
         return None
     for pattern in _EXE_PATTERNS:
-        hits = [p for p in base.glob(pattern) if p.is_file() and os.access(p, os.X_OK)]
+        hits = [p for p in base.glob(pattern) if _is_exe(p)]
         if hits:
             return max(hits, key=_rev)
     return None
@@ -297,16 +312,45 @@ _CJK_NAME = re.compile(
     r"思源|黑体|宋体)"
 )
 _FONT_SUFFIX = (".ttf", ".otf", ".ttc", ".otc")
-_SYSTEM_FONT_DIRS = (
-    Path("/usr/share/fonts"), Path("/usr/local/share/fonts"),
-    Path.home() / ".fonts", Path.home() / ".local" / "share" / "fonts",
-)
+
+
+def _system_font_dirs(os_name: str, *, env: Mapping[str, str], home: Path) -> list[Path]:
+    r"""按平台给「系统字体目录」清单（**惰性**：导入时不展开 `Path.home()` / 环境变量）。
+
+    - POSIX（Linux）：fontconfig 常见目录 + 用户字体目录；
+    - macOS：`/System/Library/Fonts`（STHeiti / Songti / Hiragino 都在这）、
+      Supplemental、`/Library/Fonts`、用户 `~/Library/Fonts`；
+    - Windows：`%SystemRoot%\Fonts`、`%LOCALAPPDATA%\Microsoft\Windows\Fonts`
+      （用户级字体装在后者）；环境变量读不到就跳过，不编造路径。
+    """
+    if os_name == "nt":
+        out: list[Path] = []
+        root = str(env.get("SystemRoot") or env.get("WINDIR") or "").strip()
+        if root:
+            out.append(Path(root) / "Fonts")
+        local = str(env.get("LOCALAPPDATA") or "").strip()
+        if local:
+            out.append(Path(local) / "Microsoft" / "Windows" / "Fonts")
+        return out
+    if os_name == "macos":
+        return [
+            Path("/System/Library/Fonts"),
+            Path("/System/Library/Fonts/Supplemental"),
+            Path("/Library/Fonts"),
+            home / "Library" / "Fonts",
+        ]
+    return [
+        Path("/usr/share/fonts"), Path("/usr/local/share/fonts"),
+        home / ".fonts", home / ".local" / "share" / "fonts",
+    ]
 
 
 def _fc_list(argv: Sequence[str]) -> str:
+    from .optional_deps import windows_system_path
+
     res = subprocess.run(
         list(argv), capture_output=True, text=True, timeout=10,
-        env={"PATH": _MIN_PATH, "LANG": "C.UTF-8"},
+        env={"PATH": windows_system_path() or _MIN_PATH, "LANG": "C.UTF-8"},
     )
     return res.stdout if res.returncode == 0 else ""
 
@@ -314,7 +358,7 @@ def _fc_list(argv: Sequence[str]) -> str:
 def system_cjk_fonts(
     *,
     fc_runner: Callable[[Sequence[str]], str] | None = None,
-    dirs: Iterable[Path] = _SYSTEM_FONT_DIRS,
+    dirs: Iterable[Path] | None = None,
     limit: int = 5,
 ) -> list[str]:
     """系统里已有的中文字体（`fc-list :lang=zh family`，没有 fc-list 就扫常见字体目录）。
@@ -332,6 +376,9 @@ def system_cjk_fonts(
             found.append(name)
     if found:
         return found[:limit]
+    if dirs is None:
+        os_name = "nt" if _OS_NAME == "nt" else ("macos" if sys.platform == "darwin" else "posix")
+        dirs = _system_font_dirs(os_name, env=os.environ, home=Path.home())
     seen = 0
     for base in dirs:
         try:
@@ -376,11 +423,12 @@ def chromium_env(browsers_dir: Path, *, hostlibs: Path | None) -> dict[str, str]
 
     Windows 另补 SystemRoot / windir：少了这两项，子进程里的 `import playwright`
     会因为 Winsock 初始化失败报 WinError 10106，被误判成「没装 playwright」。
+    Windows 的 PATH 改用 `windows_system_path()`：`/usr/local/bin:...` 在那边是无效路径。
     """
-    from .optional_deps import windows_system_env
+    from .optional_deps import windows_system_env, windows_system_path
 
     env = {
-        "PATH": _MIN_PATH,
+        "PATH": windows_system_path() or _MIN_PATH,
         "HOME": str(Path(browsers_dir).parent),
         "LANG": "C.UTF-8",
         "PLAYWRIGHT_BROWSERS_PATH": str(browsers_dir),

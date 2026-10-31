@@ -22,6 +22,7 @@ Linux（root、trafilatura 已装、/root/.typesafe_key 存在）跑，一批「
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -56,6 +57,48 @@ def plugin_dir() -> Path:
     return PLUGIN_DIR
 
 
+@pytest.fixture(scope="session")
+def real_browser_cache() -> Path | None:
+    """隔离罩之外的**真实** Playwright 浏览器缓存目录；没装浏览器返回 None。
+
+    `_isolated_host`（function 级 autouse）把 HOME / USERPROFILE 换到每个测试自己的
+    临时目录，所以测试里 `Path.home()` 拿不到真缓存；session 级夹具先于所有 function
+    级夹具解析，这里读到的还是宿主真实环境：
+
+    - 先认环境变量 `PLAYWRIGHT_BROWSERS_PATH`（CI 明确指给工作区里的目录）——
+      显式指了却找不到就直接报错（CI 浏览器装错地方要红，不许悄悄回落）；
+    - 没指就按平台默认位置找：Windows `%LOCALAPPDATA%\\ms-playwright`，
+      macOS `~/Library/Caches/ms-playwright`，Linux `~/.cache/ms-playwright`。
+      拿真 HOME——Windows 认 USERPROFILE，POSIX 认 HOME，**不用 pwd**
+      （Windows Python 根本没有这个模块）。
+    """
+    env = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if env:
+        path = Path(env)
+        if path.is_dir():
+            return path
+        raise RuntimeError(f"PLAYWRIGHT_BROWSERS_PATH 指向的浏览器缓存目录不存在：{env}")
+    if os.name == "nt":
+        roots = [os.environ.get("LOCALAPPDATA"), os.environ.get("USERPROFILE") and str(Path(os.environ["USERPROFILE"]) / "AppData" / "Local")]
+        candidates = [Path(r) / "ms-playwright" for r in roots if r]
+    else:
+        home = os.environ.get("HOME") or str(Path.home())
+        candidates = [Path(home) / "Library/Caches/ms-playwright", Path(home) / ".cache/ms-playwright"]
+    for cache in candidates:
+        if cache.is_dir():
+            return cache
+    return None
+
+
+@pytest.fixture
+def browser_cache(real_browser_cache: Path | None, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """真浏览器验收测试用：拿到缓存目录并把 PLAYWRIGHT_BROWSERS_PATH 指过去。"""
+    if real_browser_cache is None:
+        pytest.fail("需要已安装的 Playwright 浏览器（playwright install chromium webkit），不许跳过真实验收")
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(real_browser_cache))
+    return real_browser_cache
+
+
 @pytest.fixture(autouse=True)
 def _isolated_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """假宿主机隔离罩：非 root、无密钥、空 HOME、不许碰真实 systemd。每个测试自动生效。"""
@@ -70,12 +113,15 @@ def _isolated_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv(_config.DEV_ALLOW_DIRECT_ENV, "1")
 
     # (b) 密钥与 HOME：环境变量清空；Path.home() 和 HOME 都指到空目录。
+    #     Windows 的 Path.home() / expanduser("~") 只认 USERPROFILE（Python 3.8+ 不读
+    #     HOME），不一起换的话 Windows 上子进程会摸到真用户目录。
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.delenv("TYPESAFE_KEY_FILE", raising=False)
     fake_home = tmp_path / "tmp-home"
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
 
     # (c) 安全网：测试里起 systemd-run / systemctl 真实进程 → 立刻炸。
     real_create_subprocess_exec = asyncio.create_subprocess_exec
@@ -100,6 +146,40 @@ def _isolated_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         _cap, "probe", lambda run_as="maiwork": _cap.detect(_fake_caps, run_as=run_as)
     )
 
+
+
+@pytest.fixture
+def simulate_no_dir_fd(monkeypatch: pytest.MonkeyPatch):
+    """在 Linux / macOS 上如实模拟原生 Windows 的文件 API：没有 O_NOFOLLOW / O_DIRECTORY，
+    任何带 dir_fd 的调用、按 fd 列目录都直接 NotImplementedError（Windows 版 Python 就是这样）。
+
+    被测代码只要还偷偷走目录句柄那条路，这里就会当场炸，而不是在用户的 Windows 上才炸。
+    """
+    import os
+    import shutil
+
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    monkeypatch.delattr(os, "O_DIRECTORY", raising=False)
+
+    def _no_fd(real, name):
+        def wrapped(*args, **kwargs):
+            if kwargs.get("dir_fd") is not None or kwargs.get("src_dir_fd") is not None \
+                    or kwargs.get("dst_dir_fd") is not None:
+                raise NotImplementedError(f"{name}: dir_fd unavailable on this platform")
+            if name == "listdir" and args and isinstance(args[0], int):
+                raise NotImplementedError("listdir: fd unavailable on this platform")
+            return real(*args, **kwargs)
+        return wrapped
+
+    for fn in ("open", "mkdir", "stat", "lstat", "unlink", "rename", "replace", "listdir", "rmdir"):
+        monkeypatch.setattr(os, fn, _no_fd(getattr(os, fn), fn))
+    monkeypatch.setattr(os, "supports_dir_fd", set())
+    monkeypatch.setattr(os, "supports_fd", set())
+    monkeypatch.setattr(shutil, "_use_fd_functions", False, raising=False)
+    from CharTyr_MaiWork.maiwork.environments import pathsafe
+
+    assert not pathsafe.has_dir_fd()
+    yield
 
 
 @pytest.fixture(autouse=True)

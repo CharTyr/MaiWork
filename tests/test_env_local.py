@@ -23,6 +23,21 @@ from CharTyr_MaiWork.maiwork.environments.local import LocalEnv
 
 ON_MACOS = sys.platform == "darwin"
 
+# direct 模式真跑 /bin/bash、start 真起子进程——原生 Windows 没有 bash，且 capability 恒为
+# stopped（本机根本不注册 run_command），这组只在 POSIX 上有意义。
+_POSIX = os.name != "nt"
+POSIX_ONLY = pytest.mark.skipif(
+    not _POSIX, reason="真跑 /bin/bash 的 direct 模式只在 POSIX 上有意义（Windows capability 恒 stopped）"
+)
+
+
+def _symlink_or_skip(link: Path, target: Path, *, is_dir: bool = False) -> None:
+    """Windows 上建符号链接要开发者模式 / 管理员；建不了就如实跳过（不假装测过）。"""
+    try:
+        link.symlink_to(target, target_is_directory=is_dir)
+    except (OSError, NotImplementedError) as e:  # pragma: no cover - 只在没权限的机器上走
+        pytest.skip(f"这台机器建不了符号链接：{e}")
+
 
 def _settings(root: Path, *, mode: str = "direct", **env_over):
     values = {"local_mode": mode, "workspace_root": str(root), **env_over}
@@ -87,6 +102,7 @@ def runner_with(exit_code: int = 0, out: str = "", err: str = ""):
 
 
 class TestRunnerPlumbing:
+    @POSIX_ONLY
     @pytest.mark.asyncio
     async def test_default_runner_direct_real_echo(self, tmp_path: Path) -> None:
         """不注入 runner 时（direct）真跑子进程：证明默认管道本身是通的。"""
@@ -175,10 +191,11 @@ class TestResolve:
         env = _env(tmp_path)
         ws = env.workspace("ws")
         (ws / "links").mkdir()
-        (ws / "links" / "evil.txt").symlink_to(outside / "secret.txt")
+        _symlink_or_skip(ws / "links" / "evil.txt", outside / "secret.txt")
         with pytest.raises(PermissionError):
             env.resolve("ws", "links/evil.txt")
 
+    @POSIX_ONLY
     def test_symlink_inside_workspace_ok(self, tmp_path: Path) -> None:
         """指向工作区内部的链接不算逃逸。"""
         env = _env(tmp_path)
@@ -384,8 +401,9 @@ class TestRunSystemdArgv:
         stop_coro.close()
 
 
+@POSIX_ONLY
 class TestRunDirect:
-    """direct 模式在 macOS 上真跑（这就是 direct 存在的意义）。"""
+    """direct 模式在 POSIX 上真跑 /bin/bash（这就是 direct 存在的意义）。"""
 
     @pytest.mark.asyncio
     async def test_echo_and_cwd(self, tmp_path: Path) -> None:
@@ -542,13 +560,14 @@ class TestReadWriteList:
         outside = tmp_path / "private"
         outside.mkdir()
         (outside / "outside-secret.txt").write_text("绝不能列出", encoding="utf-8")
-        (ws / "tasks" / "outside-dir").symlink_to(outside, target_is_directory=True)
-        (ws / "tasks" / "outside-file").symlink_to(outside / "outside-secret.txt")
+        _symlink_or_skip(ws / "tasks" / "outside-dir", outside, is_dir=True)
+        _symlink_or_skip(ws / "tasks" / "outside-file", outside / "outside-secret.txt")
         entries = await env.list_files("ws", "tasks", depth=4)
         assert entries == []  # 连外部文件的长度也不探测
         with pytest.raises(PermissionError):
             await env.list_files("ws", "tasks/outside-dir", depth=1)
 
+    @POSIX_ONLY
     @pytest.mark.asyncio
     async def test_list_files_does_not_follow_directory_replaced_during_walk(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -578,8 +597,9 @@ class TestReadWriteList:
         assert not any("outside-secret" in e["path"] for e in entries)
 
 
+@POSIX_ONLY
 class TestDirectProcessRegistry:
-    """direct 模式的 start/status/logs/stop：内存登记 + 真子进程。"""
+    """direct 模式的 start/status/logs/stop：内存登记 + 真子进程（/bin/bash 只在 POSIX 有）。"""
 
     @pytest.mark.asyncio
     async def test_start_status_logs_stop(self, tmp_path: Path) -> None:
@@ -810,6 +830,7 @@ class TestDynamicUserArgv:
         ws = str((tmp_path / "private" / "maiwork" / "workspaces" / "ws").resolve())
         assert f"WorkingDirectory={ws}" in argv
 
+    @POSIX_ONLY
     def test_chown_65534_for_plugin_written_files(self, tmp_path: Path, monkeypatch) -> None:
         """dynamic 下通过已打开的安全 fd chown 65534:65534。"""
         chowned: list[tuple[int, int, int, int]] = []
@@ -823,6 +844,7 @@ class TestDynamicUserArgv:
         ws_st = ws.stat()
         assert (ws_st.st_dev, ws_st.st_ino) in {(dev, ino) for dev, ino, _u, _g in chowned}
 
+    @POSIX_ONLY
     def test_fixed_still_chowns_run_as(self, tmp_path: Path, monkeypatch) -> None:
         """固定用户方式不变：root 时 chown 给 run_as 用户（本机没有 maiwork 用户 → 警告跳过）。"""
         import logging

@@ -28,6 +28,9 @@
 防御要点（红线：子 agent 只能写自己的工作区）：
 - 工作区名只允许 [A-Za-z0-9_-]{1,64}；
 - resolve() 拒绝对路径、拒绝 ..、realpath 之后必须仍在工作区内（防符号链接逃逸）；
+- 文件读写：Linux / macOS 用可信根目录 fd 逐段 dir_fd + O_NOFOLLOW；没有目录句柄的平台
+  （原生 Windows，本机执行能力恒为 stopped）改走 pathsafe.py 的逐段 lstat 拒符号链接 /
+  重解析点 + 原子替换（docs/07 §11.1）；
 - 命令、子目录名一律拼进 argv 传 exec，不经过本机 shell 二次解释；
 - run() 在 RuntimeMaxSec 之外再用 asyncio.wait_for(+15s) 兜底，超时要 kill
   systemd-run 进程并 systemctl stop 兜底单元，所以 run 也带 --unit=maiwork-run-<随机>。
@@ -60,6 +63,7 @@ from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from .. import clock
 from . import capability as _cap
+from . import pathsafe as _pathsafe
 
 try:  # Windows 没有 pwd 模块；固定用户的 chown 在非 POSIX 上安全降级为跳过
     import pwd
@@ -123,10 +127,17 @@ def write_new_file_verified(root: Any, rel_dir: str, name: str, data: bytes) -> 
       FileExistsError（不覆盖别人，也不跟 hardlink 走）；
     - 写完从**同一个 dir_fd** 读回来逐字比对，不一致返回 False（调用方按「没归档」处理，
       保留完整正文）；文件名由调用方起（带随机段，避免撞名）。
+
+    没有目录句柄的平台（原生 Windows）改走 `pathsafe.create_new_verified`：逐段拒符号链接 /
+    重解析点、`O_CREAT|O_EXCL` 独占新建、写完读回核对，语义同上。
     """
     body = bytes(data or b"")
     if not name or name in (".", "..") or "/" in name or "\\" in name:
         raise PermissionError(f"文件名不安全：{name!r}")
+    if not _pathsafe.has_dir_fd():
+        return _pathsafe.create_new_verified(
+            Path(root).resolve(), _pathsafe.split_rel(rel_dir), name, body
+        )
     parts = [p for p in str(rel_dir or "").split("/") if p not in ("", ".")]
     if any(p == ".." for p in parts):
         raise PermissionError(f"路径越界（不允许 ..）：{rel_dir!r}")
@@ -602,6 +613,13 @@ class LocalEnv:
         root = Path(self._get_settings().environments.workspace_root).resolve()
         root.mkdir(parents=True, exist_ok=True)
         ws = root / name
+        if not _pathsafe.has_dir_fd():
+            # 原生 Windows：逐段 lstat 拒链接 / 重解析点（本机不跑子 agent 命令，见 pathsafe）
+            _pathsafe.ensure_dirs(root, [name], create=True)
+            for sub in _WS_SUBDIRS:
+                _pathsafe.ensure_dirs(ws, [sub], create=True)
+            self._chown_for_run_as(ws)
+            return ws
         root_fd = os.open(root, self._dir_flags())
         try:
             ws_fd = self._open_dir(root_fd, name, create=True)
@@ -620,6 +638,21 @@ class LocalEnv:
         """工作区内相对路径 → 绝对路径。越界（绝对路径、..、符号链接指出去）→ PermissionError。"""
         ws = self.workspace(name)
         rel_str = str(rel or "")
+        if not _pathsafe.has_dir_fd():
+            # 原生 Windows：段名过闸（..、盘符、冒号、保留设备名），已存在的段逐个拒链接 / 重解析点
+            parts = _pathsafe.split_rel(rel_str)
+            current = ws
+            for part in parts:
+                current = current / part
+                try:
+                    st = os.lstat(current)
+                except FileNotFoundError:
+                    break
+                if _pathsafe.is_link_like(st):
+                    raise PermissionError(f"路径越界（符号链接 / 重解析点）：{rel_str!r}")
+                if stat.S_ISREG(st.st_mode) and st.st_nlink != 1:
+                    raise PermissionError(f"文件不是独立的普通文件：{rel_str!r}")
+            return ws.joinpath(*parts)
         cand = Path(rel_str)
         if cand.is_absolute():
             raise PermissionError(f"路径必须是工作区内的相对路径：{rel_str!r}")
@@ -1239,6 +1272,7 @@ class LocalEnv:
     # ------------------------------------------------------------------
     # 文件读写：可信 workspace_root 锚定 fd，逐段 dir_fd + O_NOFOLLOW。
     # 写文件先在同一目录创建独立 inode，再原子替换；不对旧 inode 截断/写入。
+    # 没有目录句柄的平台（原生 Windows）改走 pathsafe：逐段 lstat 拒链接 / 重解析点 + 原子替换。
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -1262,7 +1296,15 @@ class LocalEnv:
 
     @contextmanager
     def _parent_fd(self, name: str, rel: str, *, create: bool = False):
-        """打开工作区和目标的每段父目录；直到使用完目标才释放锚定 fd。"""
+        """打开工作区和目标的每段父目录；直到使用完目标才释放锚定 fd。
+
+        没有目录句柄的平台（原生 Windows）：产出的「父目录」是已逐段校验的 Path（不是 fd），
+        配合 `_open_file_at` 的同名分支使用。
+        """
+        if not _pathsafe.has_dir_fd():
+            ws, parent, last, _recheck = self._plain_parent(name, rel, create=create)
+            yield ws, parent, last
+            return
         raw = str(rel or "")
         candidate = Path(raw)
         if candidate.is_absolute():
@@ -1286,6 +1328,8 @@ class LocalEnv:
     @staticmethod
     def _open_file_at(parent_fd: int, last: str) -> int:
         """只允许普通非链接文件；缺失由调用方区分读与创建。"""
+        if isinstance(parent_fd, Path):  # 原生 Windows：_parent_fd 产出的是已校验目录 Path
+            return _pathsafe.open_read_fd(parent_fd / last, last)
         try:
             fd = os.open(
                 last, os.O_RDONLY | LocalEnv._nofollow_flag() | os.O_NONBLOCK
@@ -1303,6 +1347,81 @@ class LocalEnv:
             os.close(fd)
             raise PermissionError(f"文件不是独立的普通文件：{last}")
         return fd
+
+    # 没有目录句柄的平台（原生 Windows）：逐段 lstat 拒链接 / 重解析点 + 原子替换，见 pathsafe.py。
+    # 本机执行能力在这些平台恒为 stopped，没有子 agent 进程能在检查与使用之间并发换链接。
+
+    def _plain_parent(self, name: str, rel: str, *, create: bool = False):
+        """Windows 版 `_parent_fd`：返回 (工作区, 已校验父目录, 末段名, 复核函数)。"""
+        ws = self.workspace(name)
+        parts = _pathsafe.split_rel(rel)
+        if not parts:
+            raise IsADirectoryError(f"{str(rel or '')!r} 是目录，不是文件")
+        root = Path(self._get_settings().environments.workspace_root).resolve()
+        chain = [name, *parts[:-1]]
+        parent = _pathsafe.ensure_dirs(root, chain, create=create)
+        return ws, parent, parts[-1], lambda: _pathsafe.ensure_dirs(root, chain)
+
+    def _write_file_plain(self, name: str, rel: str, data: bytes, *, append: bool) -> Path:
+        """Windows 版 write_file：独占临时文件 + 复核 + os.replace；绝不对旧文件截断 / 写入。"""
+        ws, parent, last, recheck = self._plain_parent(name, rel, create=True)
+        target = parent / last
+        try:
+            old = _pathsafe.lstat_regular(target, last)
+        except FileNotFoundError:
+            old = None
+        prefix = b""
+        if old is not None and append:
+            if old.st_size + len(data) > _MAX_FILE_BYTES:
+                raise ValueError(
+                    f"单个文件不能超过 {_MAX_FILE_BYTES // (1024 * 1024)}MB：{rel!r} 写入后会超限"
+                )
+            with os.fdopen(_pathsafe.open_read_fd(target, last), "rb") as f:
+                prefix = f.read(_MAX_FILE_BYTES + 1)
+            if len(prefix) + len(data) > _MAX_FILE_BYTES:
+                raise ValueError(f"单个文件不能超过 {_MAX_FILE_BYTES // (1024 * 1024)}MB：{rel!r}")
+        _pathsafe.replace_atomic(parent, last, prefix + data, old=old, label=str(rel), recheck=recheck)
+        return ws
+
+    def _list_files_plain(self, name: str, raw: str, depth: int, limit: int) -> list[dict]:
+        """Windows 版 list_files：链接 / 重解析点不列、不跟随。"""
+        parts = _pathsafe.split_rel(raw)
+        self.workspace(name)
+        root = Path(self._get_settings().environments.workspace_root).resolve()
+        try:
+            base = _pathsafe.ensure_dirs(root, [name, *parts])
+        except FileNotFoundError:
+            raise FileNotFoundError(f"工作区内没有这个目录：{raw!r}") from None
+        entries: list[dict] = []
+
+        def walk(path: Path, rel_parts: tuple[str, ...], level: int) -> None:
+            if level >= depth or len(entries) >= limit:
+                return
+            try:
+                children = sorted(os.listdir(path))
+            except PermissionError:
+                return
+            for part in children:
+                if len(entries) >= limit:
+                    return
+                child = path / part
+                try:
+                    st = os.lstat(child)
+                except FileNotFoundError:
+                    continue
+                if _pathsafe.is_link_like(st):
+                    continue  # 连链接目标的名字/大小都不探测
+                is_dir = stat.S_ISDIR(st.st_mode)
+                entries.append({
+                    "path": "/".join((*rel_parts, part)),
+                    "size": 0 if is_dir else int(st.st_size),
+                    "is_dir": is_dir,
+                })
+                if is_dir:
+                    walk(child, (*rel_parts, part), level + 1)
+
+        walk(base, tuple(parts), 0)
+        return entries
 
     async def read_file(self, name: str, rel: str, *, max_bytes: int = _READ_DEFAULT_BYTES) -> str:
         max_bytes = max(1, int(max_bytes))
@@ -1410,6 +1529,10 @@ class LocalEnv:
             raise ValueError(
                 f"单个文件不能超过 {_MAX_FILE_BYTES // (1024 * 1024)}MB：{rel!r} 写入后会超限"
             )
+        if not _pathsafe.has_dir_fd():
+            ws = self._write_file_plain(name, rel, data, append=append)
+            self._chown_for_run_as(ws)
+            return
         with self._parent_fd(name, rel, create=True) as (ws, parent_fd, last):
             old_fd = None
             old_stat = None
@@ -1478,6 +1601,8 @@ class LocalEnv:
             raise PermissionError(f"路径必须在工作区内：{raw!r}")
         depth = max(0, int(depth))
         limit = max(1, int(limit))
+        if not _pathsafe.has_dir_fd():
+            return self._list_files_plain(name, raw, depth, limit)
         entries: list[dict] = []
 
         def walk(fd: int, parts: tuple[str, ...], level: int) -> None:

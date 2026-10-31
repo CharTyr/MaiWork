@@ -56,7 +56,7 @@ logger = logging.getLogger("maiwork.optional_deps")
 
 __all__ = [
     "GROUPS", "Group", "Package", "OptionalDeps", "Busy", "Unavailable",
-    "pylibs_dir", "package_specs", "pip_argv", "pip_env", "windows_system_env", "probe_command",
+    "pylibs_dir", "package_specs", "pip_argv", "pip_env", "windows_system_env", "windows_system_path", "probe_command",
     "KV_PREFIX", "INSTALL_TIMEOUT_S", "MAX_ERROR_CHARS", "PIP_PATH", "PIP_ENV_KEYS",
 ]
 
@@ -81,6 +81,9 @@ PIP_ENV_KEYS = (
 )
 
 
+_OS_NAME = os.name  # 测试可注入；直接改 os.name 会让 Path() 变 WindowsPath 当场炸
+
+
 def windows_system_env() -> dict[str, str]:
     """Windows 上给子进程补 SystemRoot / windir；其余平台返回空。
 
@@ -90,12 +93,22 @@ def windows_system_env() -> dict[str, str]:
     「OSError [WinError 10106] 无法加载或初始化请求的服务提供程序」，
     于是被误判成「没装 playwright」。实测：只补这两项即恢复。
     """
-    if os.name != "nt":
+    if _OS_NAME != "nt":
         return {}
     root = str(os.environ.get("SystemRoot") or os.environ.get("WINDIR") or "").strip()
     if not root:
         return {}
     return {"SystemRoot": root, "windir": root}
+
+
+def windows_system_path() -> str:
+    r"""Windows 子进程的最小 PATH：`%SystemRoot%\System32;%SystemRoot%`；其余平台返回 ""。
+
+    和 `windows_system_env` 同一个 SystemRoot 取法；三处（pip / playwright / 社交平台 CLI）
+    共用这一个，别各写一份——少一个 `os.name` 判断就少一个不一致的地方。
+    """
+    root = windows_system_env().get("SystemRoot", "")
+    return os.pathsep.join([str(Path(root) / "System32"), root]) if root else ""
 
 # 只检测、不安装的外部命令（系统级软件，MaiWork 不替用户装）。
 _TOOL_CHECKS: dict[str, dict[str, Any]] = {
@@ -213,10 +226,11 @@ def pip_argv(python: str, target: Path, specs: Sequence[str]) -> list[str]:
 def pip_env(target: Path) -> dict[str, str]:
     """pip 进程的最小环境：最小 PATH、HOME 指到目录上一级（别去写 /root）、禁缓存。
 
-    Windows 另补 SystemRoot / windir（少了 pip 连不上网，见 `windows_system_env`）。
+    Windows 另补 SystemRoot / windir（少了 pip 连不上网，见 `windows_system_env`），
+    且 PATH 改用 `windows_system_path()`（`/usr/local/bin:...` 在 Windows 上无效）。
     """
     return {
-        "PATH": PIP_PATH,
+        "PATH": windows_system_path() or PIP_PATH,
         "HOME": str(Path(target).parent),
         "LANG": "C.UTF-8",
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",

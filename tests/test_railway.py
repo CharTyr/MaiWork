@@ -95,7 +95,7 @@ def _argv_ssh(calls: list[dict]) -> list[str]:
     """找出那次「不带命令连一次」的 ssh argv。"""
     for c in calls:
         argv = c["argv"]
-        if argv and Path(str(argv[0])).name == "ssh":
+        if argv and Path(str(argv[0])).stem.lower() == "ssh":
             return argv
     raise AssertionError(f"没有 ssh 调用：{[c['argv'] for c in calls]}")
 
@@ -292,7 +292,9 @@ class TestRun:
         assert result.stderr == "warn"
         assert result.timed_out is False
         argv = calls[-1]["argv"]
-        assert argv[0] == "ssh"
+        assert Path(argv[0]).stem.lower() == "ssh"
+        if railway_module._PLATFORM != "nt":
+            assert argv[0] == "ssh"
         assert "railway.new" in argv
         assert "--" in argv
         idx = argv.index("--")
@@ -344,12 +346,15 @@ class TestRun:
         await env.run(box, "true", timeout_s=30)
         run_env = calls[-1]["env"]
         # 只放白名单小集合；密钥相关一律不在
-        assert set(run_env) <= {"PATH", "HOME", "LANG", "LC_ALL", "TERM"}
+        allowed = {"PATH", "HOME", "LANG", "LC_ALL", "TERM"}
+        if railway_module._PLATFORM == "nt":
+            allowed.update({"SystemRoot", "windir", "PROGRAMDATA"})
+        assert set(run_env) <= allowed
         for k in run_env:
             assert not any(w in k.upper() for w in ("KEY", "TOKEN", "SECRET", "PASS")), f"环境变量泄了 {k}"
         # acquire 那次连一次同样最小
         acq_env = calls[1]["env"]
-        assert set(acq_env) <= {"PATH", "HOME", "LANG", "LC_ALL", "TERM"}
+        assert set(acq_env) <= allowed
 
     @pytest.mark.asyncio
     async def test_env_follows_platform_rules(self, tmp_path: Path) -> None:
@@ -359,7 +364,10 @@ class TestRun:
         env, _s, _ = _make_env(tmp_path, runner=runner)
         box = await env.acquire("job-win")
         assert box is not None
-        assert calls[-1]["env"]["PATH"] == railway_module.LocalEnv._MINIMAL_PATH
+        expected = railway_module.openssh_client.minimal_env(
+            posix_path=railway_module.LocalEnv._MINIMAL_PATH, platform=railway_module._PLATFORM,
+        )
+        assert calls[-1]["env"]["PATH"] == expected["PATH"]
 
     @pytest.mark.asyncio
     async def test_windows_launches_clients_by_absolute_path(self, tmp_path: Path, monkeypatch) -> None:
@@ -405,7 +413,9 @@ class TestFileOps:
         await env.put(box, local_up, "/app/up.txt")
         await env.get(box, "/app/job.log", local_dn)
         put_argv, get_argv = calls[-2]["argv"], calls[-1]["argv"]
-        assert put_argv[0] == "scp" and get_argv[0] == "scp"
+        assert Path(put_argv[0]).stem.lower() == "scp" and Path(get_argv[0]).stem.lower() == "scp"
+        if railway_module._PLATFORM != "nt":
+            assert put_argv[0] == "scp" and get_argv[0] == "scp"
         assert str(local_up) in put_argv
         assert "railway.new:/app/up.txt" in put_argv
         assert "railway.new:/app/job.log" in get_argv

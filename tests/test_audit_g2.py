@@ -18,6 +18,20 @@ from CharTyr_MaiWork.maiwork.environments.local import LocalEnv
 
 pytestmark = pytest.mark.asyncio
 
+# dir_fd + O_NOFOLLOW 的「检查后被换」竞态模拟只在 POSIX 目录句柄那条路上成立；
+# 无 dir_fd 的平台（原生 Windows）走 pathsafe 分支，等效竞态由 test_env_windows_paths 覆盖。
+POSIX_ONLY = pytest.mark.skipif(
+    os.name == "nt", reason="dir_fd 竞态模拟只在 POSIX 目录句柄路径上成立；Windows 分支由 test_env_windows_paths 覆盖"
+)
+
+
+def _symlink_or_skip(link: Path, target: Path, *, is_dir: bool = False) -> None:
+    """Windows 上建符号链接要开发者模式 / 管理员；建不了就如实跳过（不假装测过）。"""
+    try:
+        link.symlink_to(target, target_is_directory=is_dir)
+    except (OSError, NotImplementedError) as e:  # pragma: no cover - 只在没权限的机器上走
+        pytest.skip(f"这台机器建不了符号链接：{e}")
+
 
 def _env(root: Path) -> LocalEnv:
     settings, _ = load_settings(
@@ -39,7 +53,7 @@ class TestFinalSymlinkRejected:
         # resolve 通过不了的情况已有测试覆盖；这里直接调 read_file 走完整防线
         (tmp_path / "ws1" / "links").mkdir(exist_ok=True)
         link = tmp_path / "ws1" / "links" / "evil.txt"
-        link.symlink_to(secret)
+        _symlink_or_skip(link, secret)
         with pytest.raises(PermissionError):
             await env.read_file("ws1", "links/evil.txt")
 
@@ -52,7 +66,7 @@ class TestFinalSymlinkRejected:
         target = outside / "victim.txt"
         target.write_text("original", encoding="utf-8")
         link = tmp_path / "ws1" / "evil.txt"
-        link.symlink_to(target)
+        _symlink_or_skip(link, target)
         with pytest.raises(PermissionError):
             await env.write_file("ws1", "evil.txt", "OVERWRITTEN")
         assert target.read_text(encoding="utf-8") == "original"
@@ -66,7 +80,7 @@ class TestFinalSymlinkRejected:
         target = outside / "victim.txt"
         target.write_text("original\n", encoding="utf-8")
         link = tmp_path / "ws1" / "evil.txt"
-        link.symlink_to(target)
+        _symlink_or_skip(link, target)
         with pytest.raises(PermissionError):
             await env.write_file("ws1", "evil.txt", "MORE\n", append=True)
         assert target.read_text(encoding="utf-8") == "original\n"
@@ -82,7 +96,7 @@ class TestParentSymlinkRejected:
         (outside / "data.txt").write_text("x", encoding="utf-8")
         (tmp_path / "ws1" / "realdir").mkdir(exist_ok=True)
         linkdir = tmp_path / "ws1" / "linkdir"
-        linkdir.symlink_to(outside, target_is_directory=True)
+        _symlink_or_skip(linkdir, outside, is_dir=True)
         with pytest.raises(PermissionError):
             await env.read_file("ws1", "linkdir/data.txt")
 
@@ -92,7 +106,7 @@ class TestParentSymlinkRejected:
         outside = tmp_path / "outside"
         outside.mkdir()
         linkdir = tmp_path / "ws1" / "linkdir"
-        linkdir.symlink_to(outside, target_is_directory=True)
+        _symlink_or_skip(linkdir, outside, is_dir=True)
         with pytest.raises(PermissionError):
             await env.write_file("ws1", "linkdir/new.txt", "nope")
         assert not (outside / "new.txt").exists()
@@ -115,7 +129,7 @@ class TestToctouRaceSimulated:
         real = tmp_path / "ws1" / "in.txt"
         real.write_text("ok", encoding="utf-8")
         link = tmp_path / "ws1" / "swapped.txt"
-        link.symlink_to(secret)
+        _symlink_or_skip(link, secret)
         # monkeypatch resolve：跳过 resolve 的链接检查（模拟检查后路径被换）
         original_resolve = env.resolve
         env.resolve = lambda name, rel: link if "swapped" in rel else original_resolve(name, rel)  # type: ignore[method-assign]
@@ -130,7 +144,7 @@ class TestToctouRaceSimulated:
         target = outside / "victim.txt"
         target.write_text("original", encoding="utf-8")
         link = tmp_path / "ws1" / "swapped.txt"
-        link.symlink_to(target)
+        _symlink_or_skip(link, target)
         original_resolve = env.resolve
         env.resolve = lambda name, rel: link if "swapped" in rel else original_resolve(name, rel)  # type: ignore[method-assign]
         with pytest.raises(PermissionError):
@@ -167,13 +181,14 @@ class TestAnchoredDirectorySafety:
     async def test_workspace_symlink_does_not_create_directories_outside(self, tmp_path: Path) -> None:
         outside = tmp_path / "outside"
         outside.mkdir()
-        (tmp_path / "ws1").symlink_to(outside, target_is_directory=True)
+        _symlink_or_skip(tmp_path / "ws1", outside, is_dir=True)
         env = _env(tmp_path)
         with pytest.raises(PermissionError):
             env.workspace("ws1")
         assert not (outside / "tasks").exists()
         assert not (outside / "artifacts").exists()
 
+    @POSIX_ONLY
     async def test_write_parent_swapped_at_open_cannot_truncate_outside(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -193,7 +208,7 @@ class TestAnchoredDirectorySafety:
             # 旧实现：最后一段用绝对路径打开。新实现：父段在 workspace fd 下打开。
             if not swaps and (str(path) == "swap" or str(path).endswith("/swap/victim.txt")):
                 parent.rename(ws / "old-parent")
-                parent.symlink_to(outside, target_is_directory=True)
+                _symlink_or_skip(parent, outside, is_dir=True)
                 swaps.append(True)
             return original_open(path, flags, *args, **kwargs)
 
@@ -213,6 +228,7 @@ class TestAnchoredDirectorySafety:
             await env.write_file("ws1", "victim.txt", "REPLACED")
         assert outside.read_text(encoding="utf-8") == "KEEP"
 
+    @POSIX_ONLY
     async def test_chown_tree_skips_symlinks_and_hardlinks(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -221,7 +237,7 @@ class TestAnchoredDirectorySafety:
         (root / "ordinary.txt").write_text("normal", encoding="utf-8")
         outside = tmp_path / "outside.txt"
         outside.write_text("KEEP", encoding="utf-8")
-        (root / "symlink.txt").symlink_to(outside)
+        _symlink_or_skip(root / "symlink.txt", outside)
         os.link(outside, root / "hardlink.txt")
         touched: list[tuple[int, int]] = []
         monkeypatch.setattr(os, "chown", lambda path, uid, gid: touched.append(

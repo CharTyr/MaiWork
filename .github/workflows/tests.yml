@@ -10,8 +10,16 @@ permissions:
 
 jobs:
   pytest:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      # Test fixtures contain UTF-8 text; keep their default encoding consistent across runners.
+      PYTHONUTF8: "1"
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,6 +28,14 @@ jobs:
           cache: pip
           cache-dependency-path: tests/requirements.txt
       - run: pip install -r tests/requirements.txt
-      # 真浏览器验收测试要用 Chromium（装在 ~/.cache/ms-playwright）
-      - run: python -m playwright install --with-deps chromium
+      # 前端单测用 node 跑真实 ESM 模块（三平台统一版本）
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # 真浏览器验收测试要 Chromium + WebKit（test_frontend_motion_polish /
+      # test_review_artifact_browser 参数化两种引擎）。--with-deps 仅 Linux apt 适用。
+      - run: python -m playwright install --with-deps chromium webkit
+        if: matrix.os == 'ubuntu-latest'
+      - run: python -m playwright install chromium webkit
+        if: matrix.os != 'ubuntu-latest'
       - run: python -m pytest tests -q -n auto

@@ -19,7 +19,7 @@ const defaults={state,$:id=>fields[id]||null,admin:()=>state.me.role==='admin',g
  chipEditor:()=>'<div>旧批准名单编辑器</div>',ROWS_COLS:{},AV_SRC:{},PROTOCOLS:{}};
 const context=vm.createContext({console,document:{addEventListener(){}},Date,URLSearchParams});
 const mods=new Map();async function load(file){if(mods.has(file))return mods.get(file);let src=fs.readFileSync(file,'utf8'),m;
- if(path.relative(cfg.root,file)===cfg.target){
+ if(path.relative(cfg.root,file).split(path.sep).join('/')===cfg.target){
   if(cfg.target==='onboarding.js')src+='\nexport {onbSave};';
   m=new vm.SourceTextModule(src,{context,identifier:file});mods.set(file,m);await m.link((s,p)=>load(path.resolve(path.dirname(p.identifier),s)));
  }else{

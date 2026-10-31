@@ -221,9 +221,10 @@ def test_spool_write_is_atomic_private_and_bounded(tmp_path) -> None:
     ) is True
     files = _spool_files(tmp_path)
     assert len(files) == 1 and files[0].name.endswith(".json")
-    mode = os.stat(files[0]).st_mode & 0o777
-    assert mode == 0o600, oct(mode)
-    assert (os.stat(files[0].parent).st_mode & 0o777) == 0o700
+    if os.name != "nt":  # Windows 的 os.chmod 只认只读位，0600/0700 语义不成立
+        mode = os.stat(files[0]).st_mode & 0o777
+        assert mode == 0o600, oct(mode)
+        assert (os.stat(files[0].parent).st_mode & 0o777) == 0o700
     data = json.loads(files[0].read_text(encoding="utf-8"))
     assert len(data["text"]) == 500 and len(data["reason"]) == 200 and len(data["user_name"]) == 100
     assert data["group_id"] == GID and data["message_id"] == "m-spool"

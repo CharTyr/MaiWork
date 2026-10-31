@@ -378,7 +378,7 @@ async def test_install_env_has_no_host_secrets(store, tmp_path: Path, monkeypatc
     assert set(od.PIP_ENV_KEYS) - windows_only <= set(env)
     assert (set(env) & windows_only) == set(od.windows_system_env())
     assert "TYPESAFE_API_KEY" not in env and "MAIWORK_TEST_SECRET" not in env
-    assert env["PATH"] == od.PIP_PATH
+    assert env["PATH"] == (od.windows_system_path() or od.PIP_PATH)
     assert env["HOME"] == str(tmp_path)  # pylibs 的上一级，不是宿主 HOME
 
 
@@ -580,6 +580,7 @@ async def test_uninstall_without_local_env_is_refused_and_keeps_last_check(store
     assert g["uninstalling"] is False and g["installing"] is False
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows chmod 不支持 POSIX 目录权限与可执行位")
 def test_relax_perms_opens_pylibs_root_dir(tmp_path: Path) -> None:
     """pip 由插件进程（root）跑：umask 紧的时候连 pylibs 根目录都是 0700，子 agent 进不去。
 

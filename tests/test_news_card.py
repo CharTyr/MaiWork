@@ -85,25 +85,12 @@ async def test_render_png_without_playwright_raises(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_render_png_real_browser(monkeypatch):
-    """本机装了 playwright + chromium 就真画一张（服务器宿主 venv 自带 playwright 1.58）。
+async def test_render_png_real_browser(browser_cache):
+    """真画一张（conftest browser_cache 已把 PLAYWRIGHT_BROWSERS_PATH 指到真缓存）。
 
     2026-10-15 起最终产物是 JPEG（quality 85，线上 PNG 1~3.5MB → 小 50~80%）；
     没有 Pillow 时才回落 PNG。
     """
-    import os
-    import pwd
-    from pathlib import Path
-
-    pytest.importorskip("playwright.async_api")
-    # 测试夹具把 HOME 换成了临时目录；浏览器在真实家目录的缓存里
-    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    for cache in (real_home / "Library/Caches/ms-playwright", real_home / ".cache/ms-playwright"):
-        if cache.is_dir():
-            monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(cache))
-            break
-    else:
-        pytest.skip("本机没装 playwright 浏览器")
     data = await news_card.render_png(_data())
     if data[:3] == b"\xff\xd8\xff":
         assert len(data) > 10_000

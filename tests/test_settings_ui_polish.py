@@ -145,7 +145,7 @@ async function load(file) {
   if (mods.has(file)) return mods.get(file);
   const src = fs.readFileSync(file, 'utf8');
   let mod;
-  if (real.has(path.relative(ROOT, file))) {
+  if (real.has(path.relative(ROOT, file).split(path.sep).join('/'))) {
     mod = new vm.SourceTextModule(src, { context, identifier: file });
     mods.set(file, mod);
     await mod.link((spec, parent) => load(path.resolve(path.dirname(parent.identifier), spec)));
@@ -232,7 +232,7 @@ async function load(file) {
   if (mods.has(file)) return mods.get(file);
   const src = fs.readFileSync(file, 'utf8');
   let mod;
-  if (real.has(path.relative(ROOT, file))) {
+  if (real.has(path.relative(ROOT, file).split(path.sep).join('/'))) {
     mod = new vm.SourceTextModule(src, { context, identifier: file });
     mods.set(file, mod);
     await mod.link((spec, parent) => load(path.resolve(path.dirname(parent.identifier), spec)));
@@ -337,7 +337,7 @@ async function load(file) {
   if (mods.has(file)) return mods.get(file);
   const src = fs.readFileSync(file, 'utf8');
   let mod;
-  if (real.has(path.relative(ROOT, file))) {
+  if (real.has(path.relative(ROOT, file).split(path.sep).join('/'))) {
     mod = new vm.SourceTextModule(src, { context, identifier: file });
     mods.set(file, mod);
     await mod.link((spec, parent) => load(path.resolve(path.dirname(parent.identifier), spec)));
@@ -423,7 +423,7 @@ async function load(file) {
   if (mods.has(file)) return mods.get(file);
   const src = fs.readFileSync(file, 'utf8');
   let mod;
-  if (real.has(path.relative(ROOT, file))) {
+  if (real.has(path.relative(ROOT, file).split(path.sep).join('/'))) {
     mod = new vm.SourceTextModule(src, { context, identifier: file });
     mods.set(file, mod);
     await mod.link((spec, parent) => load(path.resolve(path.dirname(parent.identifier), spec)));
@@ -627,7 +627,7 @@ function getMod(file) {
   if (mods.has(file)) return mods.get(file);
   const src = fs.readFileSync(file, 'utf8');
   let mod;
-  if (real.has(path.relative(ROOT, file))) {
+  if (real.has(path.relative(ROOT, file).split(path.sep).join('/'))) {
     mod = new vm.SourceTextModule(src, {
       context, identifier: file,
       importModuleDynamically: async (spec, parent) => {

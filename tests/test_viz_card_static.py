@@ -11,8 +11,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
-import pwd
 import struct
 from pathlib import Path
 
@@ -101,13 +99,9 @@ def test_card_html_for_uses_static_for_spec_rows(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _browsers(monkeypatch) -> None:
-    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    for cache in (real_home / "Library/Caches/ms-playwright", real_home / ".cache/ms-playwright"):
-        if cache.is_dir():
-            monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(cache))
-            return
-    pytest.skip("本机没装 playwright 浏览器")
+def _browsers() -> None:
+    """真浏览器验收前置：缓存位置由 conftest `browser_cache` 夹具统一解析（三平台）。"""
+    pytest.importorskip("playwright.async_api")
 
 
 CHECK_JS = """() => {
@@ -123,8 +117,8 @@ CHECK_JS = """() => {
 
 
 @pytest.mark.asyncio
-async def test_static_page_nothing_hidden_or_clipped(monkeypatch) -> None:
-    _browsers(monkeypatch)
+async def test_static_page_nothing_hidden_or_clipped(browser_cache) -> None:
+    _browsers()
     from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
@@ -146,9 +140,9 @@ def _png_h(uri: str) -> int:
 
 
 @pytest.mark.asyncio
-async def test_shoot_static_viz_never_cut(monkeypatch) -> None:
+async def test_shoot_static_viz_never_cut(browser_cache, monkeypatch) -> None:
     """新格式图解：第二条也整块画出来（不再截到 300 高）；超出总高度预算的就不画，不截半。"""
-    _browsers(monkeypatch)
+    _browsers()
     from playwright.async_api import async_playwright
 
     html = viz_spec.page(_spec(), uid="v1", static=True)
@@ -180,10 +174,10 @@ async def test_shoot_static_viz_never_cut(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_old_html_viz_also_never_cut(monkeypatch) -> None:
+async def test_old_html_viz_also_never_cut(browser_cache, monkeypatch) -> None:
     """线上 2026-10-15 用户报：第二条起的图解底部被截掉、虚化。老格式 HTML 图解也一样：
     整块画（不再截到 300 高 + 渐隐），放不下预算就不画。"""
-    _browsers(monkeypatch)
+    _browsers()
     from playwright.async_api import async_playwright
 
     old = '<!doctype html><html><body style="margin:0"><div style="height:640px;background:#eef">老图解</div></body></html>'
@@ -205,9 +199,9 @@ async def test_old_html_viz_also_never_cut(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_runaway_tall_viz_skipped_not_cut(monkeypatch) -> None:
+async def test_runaway_tall_viz_skipped_not_cut(browser_cache, monkeypatch) -> None:
     """单张失控的超长图解（> _VIZ_STATIC_MAX_H）不画，也不截半。"""
-    _browsers(monkeypatch)
+    _browsers()
     from playwright.async_api import async_playwright
 
     tall = '<!doctype html><html><body style="margin:0"><div style="height:900px">长</div></body></html>'

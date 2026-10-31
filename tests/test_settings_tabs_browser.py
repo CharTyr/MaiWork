@@ -8,8 +8,6 @@
 
 from __future__ import annotations
 
-import os
-import pwd
 from pathlib import Path
 
 import pytest
@@ -19,15 +17,6 @@ from fakes import FakeCtx, FakeProfiles
 from test_rules_web import PASSWORD, _raw_config, _write_plugin_dir
 
 from CharTyr_MaiWork.maiwork.app import MaiWorkApp
-
-
-def _browsers(monkeypatch) -> None:
-    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    for cache in (real_home / "Library/Caches/ms-playwright", real_home / ".cache/ms-playwright"):
-        if cache.is_dir():
-            monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(cache))
-            return
-    pytest.skip("本机没装 playwright 浏览器")
 
 
 TRACE_JS = """() => { window.__tr=[]; const t0=performance.now();
@@ -49,9 +38,7 @@ def _monotonic(seq: list[float], start: float) -> bool:
 
 
 @pytest.mark.asyncio
-async def test_cfg_tabs_slide_without_jump(tmp_path: Path, monkeypatch) -> None:
-    pytest.importorskip("playwright.async_api")
-    _browsers(monkeypatch)
+async def test_cfg_tabs_slide_without_jump(tmp_path: Path, browser_cache) -> None:
     from playwright.async_api import async_playwright
 
     raw = _raw_config(tmp_path / "data")

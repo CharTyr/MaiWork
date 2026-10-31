@@ -655,8 +655,6 @@ def test_rejected_surfaces_stay_unanimated() -> None:
 
 
 import json
-import os
-import pwd
 import pytest
 from playwright.async_api import async_playwright, expect
 from CharTyr_MaiWork.maiwork import clock
@@ -665,13 +663,8 @@ from test_console import G1, env  # noqa: E402, F401
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])
-async def test_motion_polish_in_real_browsers(env, monkeypatch, engine: str) -> None:
+async def test_motion_polish_in_real_browsers(env, browser_cache, engine: str) -> None:
     """在真实 Chromium 与 WebKit（Safari 内核）上端到端验证抽屉拖拽关闭、桌面右栏进入、气泡菜单 Esc 层级、复制按钮变形与温和减少动态效果。"""
-    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    caches = (real_home / "Library/Caches/ms-playwright", real_home / ".cache/ms-playwright")
-    cache = next((p for p in caches if p.is_dir()), None)
-    assert cache is not None, "需要已安装的浏览器，不能跳过前端动效真浏览器测试"
-    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(cache))
 
     now = clock.now()
     with env.app.store.tx() as conn:

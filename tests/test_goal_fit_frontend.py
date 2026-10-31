@@ -34,7 +34,7 @@ async function load(file) {
   if (mods.has(file)) return mods.get(file);
   const src = fs.readFileSync(file, 'utf8');
   let m;
-  if (real.has(path.relative(cfg.root, file))) {
+  if (real.has(path.relative(cfg.root, file).split(path.sep).join('/'))) {
     m = new vm.SourceTextModule(src, {context, identifier: file});
     mods.set(file, m);
     await m.link((s, p) => load(path.resolve(path.dirname(p.identifier), s)));
