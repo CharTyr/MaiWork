@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from CharTyr_MaiWork.maiwork.outbox import Delivery
@@ -66,7 +68,8 @@ async def test_deliver_task_image_dir_enqueues_one_row_per_image(tmp_path):
     p1 = json.loads(rows[1]["payload"])
     assert p0["text"] == "画好了，两只猫" and p0["push_kind"] == "delivery"
     assert p1["text"] == ""
-    assert p0["path"].endswith("images/a.png") and p1["path"].endswith("images/b.png")
+    assert Path(p0["path"]).parts[-2:] == ("images", "a.png")
+    assert Path(p1["path"]).parts[-2:] == ("images", "b.png")
     assert all(r["task_id"] == "T-1" for r in rows)
 
 

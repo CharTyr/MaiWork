@@ -263,7 +263,8 @@ async def test_generated_page_is_mobile_friendly(tmp_path):
 
 async def test_generated_page_escapes_title_note_and_name(tmp_path):
     hn = FakeHereNow()
-    evil_name = "<img src=x onerror=1>.bin"   # 文件名不能含路径分隔符，注入用别的标签测
+    # Windows 文件名不许含 <>"：注入载荷改用合法字符（' & =），HTML 转义照样测到
+    evil_name = "o'neill&a=b.bin"
     f = _artifact_file(tmp_path, evil_name, size=10)
     store, settings, host, ob = _make(tmp_path, herenow=hn)
     _seed_task(store, title="<script>alert(1)</script>")
@@ -273,10 +274,10 @@ async def test_generated_page_escapes_title_note_and_name(tmp_path):
                                 note="说明 <b>注</b>")
     await ob.flush(NOON)
     page = _page_of(hn)
-    for raw in ("<script>alert(1)</script>", "<img src=x onerror=1>", "<b>注</b>"):
+    for raw in ("<script>alert(1)</script>", "o'neill&a=b", "<b>注</b>"):
         assert raw not in page, f"没转义：{raw}"
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page
-    assert "&lt;img src=x onerror=1&gt;" in page
+    assert "o&#x27;neill&amp;a=b" in page
     assert "说明 &lt;b&gt;注&lt;/b&gt;" in page
 
 

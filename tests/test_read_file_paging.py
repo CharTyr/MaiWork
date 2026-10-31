@@ -172,21 +172,21 @@ async def _read_all(tools: Tools, ctx: ToolContext, path: str, *, limit: int | N
 class TestPagingRebuild:
     async def test_50k_chinese_file_rebuilds_page_by_page(self, tools, ws):
         text = _cn_text(50_000)
-        (ws / "research.md").write_text(text, encoding="utf-8")
+        (ws / "research.md").write_bytes(text.encode("utf-8"))
         rebuilt = await _read_all(tools, _ctx(ws), "research.md")
         assert len(text) == 50_000
         assert rebuilt == text  # 一字不差
 
     async def test_20k_chinese_file_rebuilds_page_by_page(self, tools, ws):
         text = _cn_text(20_000)
-        (ws / "notes.md").write_text(text, encoding="utf-8")
+        (ws / "notes.md").write_bytes(text.encode("utf-8"))
         rebuilt = await _read_all(tools, _ctx(ws), "notes.md")
         assert rebuilt == text
 
     async def test_small_explicit_limit_rebuilds_too(self, tools, ws):
         """自己指定小 limit 也要能拼全（游标按真实页长算，不是按请求的 limit 算）。"""
         text = _cn_text(5_555)
-        (ws / "a.md").write_text(text, encoding="utf-8")
+        (ws / "a.md").write_bytes(text.encode("utf-8"))
         rebuilt = await _read_all(tools, _ctx(ws), "a.md", limit=700)
         assert rebuilt == text
 
@@ -194,7 +194,7 @@ class TestPagingRebuild:
         text = _cn_text(15_000)
         long_rel = f"{'d' * 80}/{'e' * 60}/research.md"
         (ws / long_rel).parent.mkdir(parents=True)
-        (ws / long_rel).write_text(text, encoding="utf-8")
+        (ws / long_rel).write_bytes(text.encode("utf-8"))
         r = await tools.call("read_file", {"path": long_rel, "limit": 5000}, _ctx(ws))
         assert r.ok
         assert len(r.output) <= TOOL_MSG_BUDGET
@@ -213,14 +213,14 @@ class TestPagingRebuild:
 
         assert tools_exec._TOOL_MSG_BUDGET <= workers._TOOL_MSG_MAX
         text = _cn_text(12_000)
-        (ws / "cap.md").write_text(text, encoding="utf-8")
+        (ws / "cap.md").write_bytes(text.encode("utf-8"))
         r = await tools.call("read_file", {"path": "cap.md"}, _ctx(ws))
         assert r.ok and len(r.output) <= workers._TOOL_MSG_MAX
 
     async def test_worker_tool_message_keeps_the_whole_page(self, tools, ws):
         """端到端：真跑 Workers，子 agent 看到的那条 tool 消息不得被再截一刀。"""
         text = _cn_text(30_000)
-        (ws / "research.md").write_text(text, encoding="utf-8")
+        (ws / "research.md").write_bytes(text.encode("utf-8"))
         models = _Replay(
             [
                 _Chat(tool_calls=[_tool_call("read_file", {"path": "research.md"}, "c1")]),
@@ -249,7 +249,7 @@ class TestPagingRebuild:
 class TestPageParamsStrict:
     @pytest.fixture(autouse=True)
     def _file(self, ws):
-        (ws / "f.md").write_text(_cn_text(12_000), encoding="utf-8")
+        (ws / "f.md").write_bytes(_cn_text(12_000).encode("utf-8"))
 
     @pytest.mark.parametrize("bad", ["100", 1.5, True, [100], {"n": 1}, "", "  ", "\t"])
     async def test_offset_must_be_int(self, tools, ws, bad):
@@ -309,37 +309,47 @@ class TestPageParamsStrict:
 class TestCompatAndUnits:
     async def test_small_file_verbatim_without_params(self, tools, ws):
         """旧调用（只给 path）：短文件原样返回，不加任何元信息。"""
-        (ws / "a.txt").write_text("第一版内容\n第二行", encoding="utf-8")
+        (ws / "a.txt").write_bytes("第一版内容\n第二行".encode("utf-8"))
         r = await tools.call("read_file", {"path": "a.txt"}, _ctx(ws))
         assert r.ok and r.output == "第一版内容\n第二行"
         assert BODY_START not in r.output
 
+    async def test_crlf_file_round_trips_verbatim(self, tools, ws):
+        """盘上就是 CRLF 的文件（Windows 手写/检出）：原样回读、逐页重建都是 CRLF 字节。
+        锁死「正文原样」契约——CRLF 不许被归一成 LF，也不许翻两次。"""
+        text = "第一行\r\n第二行\r\n第三行\r\n"
+        (ws / "win.txt").write_bytes(text.encode("utf-8"))
+        r = await tools.call("read_file", {"path": "win.txt"}, _ctx(ws))
+        assert r.ok and r.output == text  # 原样：CRLF 字节不动
+        rebuilt = await _read_all(tools, _ctx(ws), "win.txt", limit=8)
+        assert rebuilt == text  # 分页重建一字不差，换行也不被改
+
     async def test_small_file_verbatim_when_limit_covers_all(self, tools, ws):
-        (ws / "a.txt").write_text("abc", encoding="utf-8")
+        (ws / "a.txt").write_bytes("abc".encode("utf-8"))
         r = await tools.call("read_file", {"path": "a.txt", "offset": 0, "limit": 10}, _ctx(ws))
         assert r.ok and r.output == "abc"
 
     async def test_empty_file(self, tools, ws):
-        (ws / "empty.txt").write_text("", encoding="utf-8")
+        (ws / "empty.txt").write_bytes("".encode("utf-8"))
         r = await tools.call("read_file", {"path": "empty.txt"}, _ctx(ws))
         assert r.ok and r.output == ""
 
     async def test_offset_unit_is_characters_not_bytes(self, tools, ws):
         # 每个汉字 3 字节：offset 若按字节算，这里会从半个字中间开始
-        (ws / "cn.txt").write_text("あいうえお漢字テスト", encoding="utf-8")
+        (ws / "cn.txt").write_bytes("あいうえお漢字テスト".encode("utf-8"))
         r = await tools.call("read_file", {"path": "cn.txt", "offset": 2, "limit": 3}, _ctx(ws))
         assert r.ok and _body(r.output) == "うえお"
         assert (r.data or {}).get("offset") == 2
 
     async def test_small_limit_pages_even_a_small_file(self, tools, ws):
-        (ws / "s.txt").write_text("0123456789", encoding="utf-8")
+        (ws / "s.txt").write_bytes("0123456789".encode("utf-8"))
         r = await tools.call("read_file", {"path": "s.txt", "limit": 4}, _ctx(ws))
         assert r.ok and _body(r.output) == "0123"
         assert (r.data or {}).get("next_offset") == 4
         assert "还有 6 字" in r.output
 
     async def test_last_page_says_eof_and_no_cursor(self, tools, ws):
-        (ws / "s.txt").write_text("0123456789", encoding="utf-8")
+        (ws / "s.txt").write_bytes("0123456789".encode("utf-8"))
         r = await tools.call("read_file", {"path": "s.txt", "offset": 8, "limit": 4}, _ctx(ws))
         assert r.ok and _body(r.output) == "89"
         assert "末尾" in r.output
@@ -347,7 +357,7 @@ class TestCompatAndUnits:
         assert (r.data or {}).get("eof") is True
 
     async def test_metadata_states_unit_and_origin(self, tools, ws):
-        (ws / "s.txt").write_text(_cn_text(6_000), encoding="utf-8")
+        (ws / "s.txt").write_bytes(_cn_text(6_000).encode("utf-8"))
         r = await tools.call("read_file", {"path": "s.txt"}, _ctx(ws))
         assert r.ok
         assert "字" in r.output and "字符" in r.output  # 单位写清楚
@@ -356,7 +366,7 @@ class TestCompatAndUnits:
 
     async def test_page_body_is_exact_no_strip(self, tools, ws):
         text = "  前导空格\n\n\t制表符与空行\n结尾无换行"
-        (ws / "w.txt").write_text(text, encoding="utf-8")
+        (ws / "w.txt").write_bytes(text.encode("utf-8"))
         r = await tools.call("read_file", {"path": "w.txt", "limit": 5}, _ctx(ws))
         assert r.ok and _body(r.output) == text[:5]
         r2 = await tools.call("read_file", {"path": "w.txt", "offset": 5, "limit": 5}, _ctx(ws))
@@ -365,7 +375,7 @@ class TestCompatAndUnits:
     async def test_long_file_first_call_never_dumps_everything(self, tools, ws):
         """老实现一次回最多 5 万字（worker 再截到 6000）；新实现单页必须收得住。"""
         text = _cn_text(50_000)
-        (ws / "big.md").write_text(text, encoding="utf-8")
+        (ws / "big.md").write_bytes(text.encode("utf-8"))
         r = await tools.call("read_file", {"path": "big.md"}, _ctx(ws))
         assert r.ok
         assert len(r.output) <= TOOL_MSG_BUDGET
@@ -382,7 +392,7 @@ class TestCompatAndUnits:
 class TestScopeUnchanged:
     async def test_scope_violation_still_rejected_with_paging(self, tools, ws):
         (ws / "artifacts/T-2").mkdir(parents=True)
-        (ws / "artifacts/T-2/other.md").write_text(_cn_text(9_000), encoding="utf-8")
+        (ws / "artifacts/T-2/other.md").write_bytes(_cn_text(9_000).encode("utf-8"))
         ctx = _ctx(ws, artifact_scope=("artifacts/T-1",))
         r = await tools.call("read_file", {"path": "artifacts/T-2/other.md", "offset": 0}, ctx)
         assert not r.ok and "别的任务" in r.error
@@ -390,14 +400,14 @@ class TestScopeUnchanged:
     async def test_own_scope_pages_normally(self, tools, ws):
         (ws / "artifacts/T-1").mkdir(parents=True)
         text = _cn_text(9_000)
-        (ws / "artifacts/T-1/mine.md").write_text(text, encoding="utf-8")
+        (ws / "artifacts/T-1/mine.md").write_bytes(text.encode("utf-8"))
         ctx = _ctx(ws, artifact_scope=("artifacts/T-1",))
         assert await _read_all(tools, ctx, "artifacts/T-1/mine.md") == text
 
     async def test_escape_still_rejected_with_offset(self, tools, ws, tmp_path):
         outside = ws.parent / "outside"
         outside.mkdir()
-        (outside / "secret.txt").write_text("shh", encoding="utf-8")
+        (outside / "secret.txt").write_bytes("shh".encode("utf-8"))
         r = await tools.call("read_file", {"path": "../outside/secret.txt", "offset": 0}, _ctx(ws))
         assert not r.ok and "不允许" in r.error
 
@@ -415,7 +425,7 @@ class TestScopeUnchanged:
 class TestInspectFilePaging:
     async def test_inspect_file_pages_like_read_file(self, tools, ws):
         text = _cn_text(12_000)
-        (ws / "out.md").write_text(text, encoding="utf-8")
+        (ws / "out.md").write_bytes(text.encode("utf-8"))
         ctx = _main_ctx(ws)
         r = await tools.call("inspect_file", {"path": "out.md", "offset": 6_000, "limit": 5000}, ctx)
         assert r.ok
@@ -425,7 +435,7 @@ class TestInspectFilePaging:
         assert "末尾" in r2.output
 
     async def test_inspect_file_small_file_verbatim(self, tools, ws):
-        (ws / "out.md").write_text("# 交付报告", encoding="utf-8")
+        (ws / "out.md").write_bytes("# 交付报告".encode("utf-8"))
         r = await tools.call("inspect_file", {"path": "out.md"}, _main_ctx(ws))
         assert r.ok and r.output == "# 交付报告"
 
@@ -454,7 +464,7 @@ class TestInspectFilePaging:
 class TestByteCap:
     async def test_oversized_file_reports_byte_cap_honestly(self, tools, ws):
         # 8 万汉字 ≈ 24 万字节 > 单次 20 万字节上限
-        (ws / "huge.md").write_text("汉" * 80_000, encoding="utf-8")
+        (ws / "huge.md").write_bytes(("汉" * 80_000).encode("utf-8"))
         ctx = _ctx(ws)
         r = await tools.call("read_file", {"path": "huge.md"}, ctx)
         assert r.ok
@@ -467,7 +477,7 @@ class TestByteCap:
         assert (r.data or {}).get("total_chars", 0) < 80_000
 
     async def test_byte_capped_last_page_says_no_more(self, tools, ws):
-        (ws / "huge.md").write_text("汉" * 80_000, encoding="utf-8")
+        (ws / "huge.md").write_bytes(("汉" * 80_000).encode("utf-8"))
         ctx = _ctx(ws)
         r0 = await tools.call("read_file", {"path": "huge.md"}, ctx)
         total = (r0.data or {})["total_chars"]
@@ -481,7 +491,7 @@ class TestByteCap:
 
     async def test_prefix_end_with_byte_cap_does_not_claim_file_complete(self, tools, ws):
         """offset 正好等于「本次可读前缀长度」且顶到字节上限：不能说源文件读完。"""
-        (ws / "huge.md").write_text("汉" * 80_000, encoding="utf-8")
+        (ws / "huge.md").write_bytes(("汉" * 80_000).encode("utf-8"))
         ctx = _ctx(ws)
         r0 = await tools.call("read_file", {"path": "huge.md"}, ctx)
         total = (r0.data or {})["total_chars"]
@@ -501,7 +511,7 @@ class TestByteCap:
 
     async def test_offset_beyond_readable_prefix_also_says_prefix(self, tools, ws):
         """顶到字节上限时，连报错也不能把「本次可读前缀」说成文件总长度。"""
-        (ws / "huge.md").write_text("汉" * 80_000, encoding="utf-8")
+        (ws / "huge.md").write_bytes(("汉" * 80_000).encode("utf-8"))
         ctx = _ctx(ws)
         r0 = await tools.call("read_file", {"path": "huge.md"}, ctx)
         total = (r0.data or {})["total_chars"]
@@ -513,7 +523,7 @@ class TestByteCap:
     async def test_normal_file_at_end_still_says_file_complete(self, tools, ws):
         """没顶到字节上限时，末尾提示照旧（别为了修上面那条把好消息也说糊）。"""
         text = _cn_text(3_000)
-        (ws / "ok.md").write_text(text, encoding="utf-8")
+        (ws / "ok.md").write_bytes(text.encode("utf-8"))
         r = await tools.call("read_file", {"path": "ok.md", "offset": len(text)}, _ctx(ws))
         assert r.ok and "已经在文件末尾" in r.output and "没有更多内容" in r.output
         d = r.data or {}

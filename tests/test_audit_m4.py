@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,10 @@ from CharTyr_MaiWork.maiwork.environments.local import LocalEnv
 
 pytestmark = pytest.mark.asyncio
 
+# direct 模式真起 /bin/bash 子进程：原生 Windows 没有 bash，真进程用例只在 POSIX 上有意义
+# （Windows capability 恒 stopped，本机根本不注册 run_command/start_process）。
+_POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="direct 模式真起 /bin/bash 子进程，只在 POSIX 上有意义")
+
 
 def _env(root: Path) -> LocalEnv:
     settings, _ = load_settings(
@@ -26,6 +31,7 @@ def _env(root: Path) -> LocalEnv:
 
 
 class TestCloseKillsProcesses:
+    @_POSIX_ONLY
     async def test_close_kills_background_process(self, tmp_path: Path) -> None:
         env = _env(tmp_path)
         unit = await env.start("ws1", "sleep 60", label="sleeper", timeout_s=120)
@@ -37,6 +43,7 @@ class TestCloseKillsProcesses:
         # 句柄关了、定时器取消了
         assert unit not in env._procs
 
+    @_POSIX_ONLY
     async def test_close_cancels_timer_and_closes_log_handle(self, tmp_path: Path) -> None:
         env = _env(tmp_path)
         unit = await env.start("ws1", "sleep 60", label="sleeper2", timeout_s=120)
@@ -49,6 +56,7 @@ class TestCloseKillsProcesses:
         if fh is not None:
             assert fh.closed
 
+    @_POSIX_ONLY
     async def test_close_idempotent(self, tmp_path: Path) -> None:
         env = _env(tmp_path)
         await env.start("ws1", "sleep 60", label="a", timeout_s=120)

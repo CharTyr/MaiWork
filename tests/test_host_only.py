@@ -49,7 +49,7 @@ _ALLOWED_GETATTR = {"maiwork/outbox.py"}
 def test_no_getattr_capability_shim(plugin_dir: Path) -> None:
     offenders: list[str] = []
     for py in _py_files(plugin_dir, keep_allowed=True):
-        rel = str(py.relative_to(plugin_dir))
+        rel = py.relative_to(plugin_dir).as_posix()  # 统一 / 分隔（Windows 上 relative_to 出来是 \）
         if rel in _ALLOWED_GETATTR:
             continue
         if "def __getattr__" in py.read_text(encoding="utf-8"):

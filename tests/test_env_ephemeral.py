@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,11 @@ def _env(root: Path, *, mode: str = "direct", runner=None, **env_over) -> LocalE
     return LocalEnv(lambda: settings, runner=runner)
 
 
+# direct 模式真跑 /bin/bash（含真子进程）：原生 Windows 没有 bash，只在 POSIX 上有意义。
+# 假 runner（systemd argv / 时长夹）的用例不受影响，全平台照跑。
+_POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="direct 模式真跑 /bin/bash，只在 POSIX 上有意义")
+
+
 def runner_with(exit_code: int = 0, out: str = "", err: str = ""):
     calls: list[dict] = []
 
@@ -43,6 +49,7 @@ def runner_with(exit_code: int = 0, out: str = "", err: str = ""):
 
 
 class TestEnter:
+    @_POSIX_ONLY
     @pytest.mark.asyncio
     async def test_no_dir_on_enter_created_on_use(self, tmp_path):
         env = _env(tmp_path)
@@ -94,6 +101,7 @@ class TestDeadlineClip:
             with pytest.raises(ValueError, match="时间|截止"):
                 await env.start(ws.name, "sleep 1", label="p1", timeout_s=60)
 
+    @_POSIX_ONLY
     @pytest.mark.asyncio
     async def test_start_timeout_clipped(self, tmp_path):
         env = _env(tmp_path, runtime_max_sec=1800)
@@ -118,6 +126,7 @@ class TestDeadlineClip:
 
 
 class TestCleanup:
+    @_POSIX_ONLY
     @pytest.mark.asyncio
     async def test_exception_inside_still_cleans(self, tmp_path):
         env = _env(tmp_path)
@@ -130,6 +139,7 @@ class TestCleanup:
         assert ws is not None and not ws.exists()
         assert ws.name not in env._deadlines  # noqa: SLF001
 
+    @_POSIX_ONLY
     @pytest.mark.asyncio
     async def test_cancelled_still_cleans_and_reraises(self, tmp_path):
         env = _env(tmp_path)
@@ -150,6 +160,7 @@ class TestCleanup:
         assert ws is not None and not ws.exists(), "取消也要删工作区"
         assert ws.name not in env._deadlines  # noqa: SLF001
 
+    @_POSIX_ONLY
     @pytest.mark.asyncio
     async def test_background_process_stopped_on_exit(self, tmp_path):
         env = _env(tmp_path)
@@ -158,6 +169,7 @@ class TestCleanup:
             assert (await env.status(unit))["active"] is True
         assert (await env.status(unit))["active"] is False
 
+    @_POSIX_ONLY
     @pytest.mark.asyncio
     async def test_cleanup_error_logged_not_raised(self, tmp_path, monkeypatch):
         env = _env(tmp_path)

@@ -123,7 +123,10 @@ def env(tmp_path: Path) -> Env:
     data = tmp_path / "data"
     plug = tmp_path / "plug"
     plug.mkdir(parents=True, exist_ok=True)
-    body = BASE_BODY % {"g1": G1, "g2": G2, "data": data, "secret": SECRET}
+    # data_dir 写进 TOML 基本字符串前转义反斜杠：Windows 的 C:\... 里 \U 会被当成
+    # unicode 转义，tomlkit 直接拒解析（线上 Windows CI 54 红的就是这条）。
+    data_toml = str(data).replace("\\", "\\\\")
+    body = BASE_BODY % {"g1": G1, "g2": G2, "data": data_toml, "secret": SECRET}
     (plug / "config.toml").write_text(body, encoding="utf-8")
     store = Store(data / "maiwork.db")
     store.migrate()

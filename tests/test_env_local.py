@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import sys
 import types
 from pathlib import Path
@@ -718,8 +719,9 @@ class TestSystemdProcessArgv:
         assert "RuntimeMaxSec=600" in argv
         assert "--uid=maiwork" in argv and "--gid=maiwork" in argv
         assert "MemoryMax=512M" in argv
-        log_path = str((tmp_path / "ws" / "runtime" / "logs" / "watcher.log").resolve())
-        exit_path = str((tmp_path / "ws" / "runtime" / "logs" / "watcher.exit").resolve())
+        # 拼进 bash -lc 的路径一律过 shlex.quote（Windows 反斜杠路径也必须被引号包住）
+        log_path = shlex.quote(str((tmp_path / "ws" / "runtime" / "logs" / "watcher.log").resolve()))
+        exit_path = shlex.quote(str((tmp_path / "ws" / "runtime" / "logs" / "watcher.exit").resolve()))
         assert f">> {log_path} 2>&1; rc=$?; echo $rc > {exit_path}; exit $rc" in argv[-1]
         assert argv[-1].startswith("cd ")
         # 单元里给最小环境：HOME=工作区（线上实测不设时是只读的 /home/maiwork）

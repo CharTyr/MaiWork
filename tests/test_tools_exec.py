@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,11 @@ from CharTyr_MaiWork.maiwork.tools import ToolContext, Tools
 from CharTyr_MaiWork.maiwork.tools_exec import register_exec_tools
 
 from fakes import FakeCtx, FakeHost
+
+# direct 模式真跑 /bin/bash 命令 / 真起子进程：原生 Windows 没有 bash（capability 恒
+# stopped，本机不注册 run_command），真命令用例只在 POSIX 上有意义。假断言、越界拒收、
+# 角色限制等平台无关用例不受影响。
+_POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="direct 模式真跑 /bin/bash，只在 POSIX 上有意义")
 
 
 @pytest.fixture
@@ -116,6 +122,7 @@ class TestWorkerTools:
         r = await tools.call("list_files", {}, ctx)
         assert r.ok and "d1/f.txt" in r.output
 
+    @_POSIX_ONLY
     async def test_run_command_echo(self, setup):
         tools, _e, _h, ws_path, _s = setup
         r = await tools.call("run_command", {"command": "echo hello"}, _ctx(ws_path))
@@ -126,6 +133,7 @@ class TestWorkerTools:
         r = await tools.call("run_command", {}, _ctx(ws_path))
         assert not r.ok
 
+    @_POSIX_ONLY
     async def test_start_check_stop_process(self, setup):
         tools, _e, _h, ws_path, _s = setup
         ctx = _ctx(ws_path)
@@ -182,6 +190,7 @@ class TestOutOfBoundsIsRecordedFailure:
 
 @pytest.mark.asyncio
 class TestRunCommandTimeoutClamped:
+    @_POSIX_ONLY
     async def test_timeout_s_over_limit_is_clamped(self, setup, settings):
         tools, _e, _h, ws_path, _s = setup
         assert settings.environments.command_timeout_s == 300
@@ -190,11 +199,13 @@ class TestRunCommandTimeoutClamped:
         r = await tools.call("run_command", {"command": "sleep 0.2; echo done", "timeout_s": 99999}, _ctx(ws_path))
         assert r.ok and r.data["timed_out"] is False  # 默认 300 内，跑完了
 
+    @_POSIX_ONLY
     async def test_timeout_s_respected_when_small(self, setup):
         tools, _e, _h, ws_path, _s = setup
         r = await tools.call("run_command", {"command": "sleep 30", "timeout_s": 1}, _ctx(ws_path))
         assert r.ok and r.data["timed_out"] is True  # 结果照常返回，但标了超时
 
+    @_POSIX_ONLY
     async def test_timeout_respects_configured_command_timeout_s(self, setup, settings, store, tmp_path):
         """[environments] command_timeout_s 是真上限：配 1 秒后，sleep 30 必被掐。"""
         s2, _ = load_settings(
@@ -394,6 +405,7 @@ class TestMainReadOnlyTools:
 
 @pytest.mark.asyncio
 class TestSummaries:
+    @_POSIX_ONLY
     async def test_run_command_summarize_includes_exit_and_ms(self, setup):
         tools, _e, _h, ws_path, store = setup
         await tools.call("run_command", {"command": "false"}, _ctx(ws_path))

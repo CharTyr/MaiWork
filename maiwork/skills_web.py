@@ -164,11 +164,11 @@ def _check_size(text: str) -> None:
 
 
 def _write_skill_md(skill_dir: Path, text: str) -> None:
-    """exFAT 规矩：新建文件先 touch 再写。"""
+    """先 touch 再写以兼容 exFAT；按 UTF-8 字节保留传入文本的换行。"""
     target = skill_dir / "SKILL.md"
     if not target.exists():
         target.touch()
-    target.write_text(text, encoding="utf-8")
+    target.write_bytes(text.encode("utf-8"))
 
 
 def _split_body(text: str) -> str:
@@ -179,7 +179,7 @@ def _split_body(text: str) -> str:
     for i in range(1, len(lines)):
         if lines[i].strip() == "---":
             rest = "".join(lines[i + 1:])
-            return rest.lstrip("\n")
+            return rest.lstrip("\r\n")
     return str(text or "")
 
 

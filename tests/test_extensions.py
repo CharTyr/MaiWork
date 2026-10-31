@@ -595,8 +595,8 @@ class TestSettingsExtensionsView:
         data_dir = tmp_path / "data"
         skill_dir = data_dir / "skills" / "demo"
         skill_dir.mkdir(parents=True)
-        (skill_dir / "SKILL.md").write_text(
-            "---\nname: demo\ndescription: 演示 skill\n---\n\n# 演示\n正文\n", encoding="utf-8"
+        (skill_dir / "SKILL.md").write_bytes(
+            "---\nname: demo\ndescription: 演示 skill\n---\n\n# 演示\n正文\n".encode("utf-8")
         )
         await app.start()
         client = TestClient(TestServer(app.console.app), cookie_jar=aiohttp.CookieJar(unsafe=True))
@@ -628,11 +628,12 @@ class TestSettingsExtensionsView:
 def _make_skill(data_dir: Path, name: str, *, front: str = "", body: str = "", files: dict[str, str] | None = None) -> Path:
     d = data_dir / "skills" / name
     d.mkdir(parents=True, exist_ok=True)
-    (d / "SKILL.md").write_text(front + body, encoding="utf-8")
+    # 写死 LF 字节：Windows 的 write_text 会把 \n 翻成 \r\n，读端原样回读就变了样。
+    (d / "SKILL.md").write_bytes((front + body).encode("utf-8"))
     for rel, content in (files or {}).items():
         p = d / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
+        p.write_bytes(content.encode("utf-8"))
     return d
 
 

@@ -1,9 +1,12 @@
 // Production module executor. DOM/network are boundary doubles, module bodies are untouched.
 import { readFile } from 'node:fs/promises';
-import { resolve, dirname } from 'node:path';
+import { resolve, dirname, relative, sep } from 'node:path';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
 const ROOT = resolve(import.meta.dirname, '../../maiwork/console/static/js');
+// Module keys are always POSIX-style ('pages/tasks.js'); on Windows resolve()
+// yields backslashes that would never match the base/real maps.
+const relKey = (abs) => relative(ROOT, abs).split(sep).join('/');
 const CASE = process.argv[2];
 const noop = () => '';
 const state = {g:'1', ref:'token', me:{role:'member'}, groups:[{id:'1',token:'token'},{id:'2',token:'two'}], tasks:{}, detail:null, tab:'news', page:null, newsQ:'', newsTopic:'', skew:0};
@@ -51,7 +54,7 @@ async function load(real, overrides={}) {
  for(const rel of real) {
    const src=await readFile(resolve(ROOT,rel),'utf8');sources.set(rel,src);
    for(const match of src.matchAll(/import\s*\{([^}]+)\}\s*from\s*["']([^"']+)["']/g)) {
-     const path=resolve(dirname(resolve(ROOT,rel)),match[2]).slice(ROOT.length+1);
+     const path=relKey(resolve(dirname(resolve(ROOT,rel)),match[2]));
      if(!names.has(path))names.set(path,new Set());
      for(const part of match[1].split(','))names.get(path).add(part.trim().split(/\s+as\s+/)[0]);
    }
@@ -63,7 +66,7 @@ async function load(real, overrides={}) {
   else {const values={...(base[rel]||{}),...(overrides[rel]||{})};const keys=[...new Set([...(names.get(rel)||[]),...Object.keys(values)])];mod=new vm.SyntheticModule(keys,function(){for(const k of keys)this.setExport(k,k in values?values[k]:noop);},{context,identifier:resolve(ROOT,rel)});}
   modules.set(rel,mod);return mod;
  }
- const entry=get(real[0]);await entry.link((sp,ref)=>get(resolve(dirname(ref.identifier),sp).slice(ROOT.length+1)));await entry.evaluate();
+ const entry=get(real[0]);await entry.link((sp,ref)=>get(relKey(resolve(dirname(ref.identifier),sp))));await entry.evaluate();
  return rel=>get(rel).namespace;
 }
 const rec={kind:'here.now',text:'成品',state:'已发送',local_url:'/g/token/artifacts/T-1/',url:'https://old.example/page',expired:true};

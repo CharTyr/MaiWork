@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import posixpath
 from types import SimpleNamespace
 from typing import Any
 
@@ -46,20 +47,30 @@ def _reader(text):
     return lambda p: text if p == "/proc/self/mountinfo" else None
 
 
-def test_persisted_false_on_overlay_root() -> None:
+@pytest.fixture
+def _posix_mountinfo_paths(monkeypatch: pytest.MonkeyPatch):
+    """mountinfo 只存在于 Linux：注入的就是 Linux 挂载表，data_dir 的绝对化也按 POSIX 语义走。
+
+    不这么做的话 Windows 上 os.path.abspath("/MaiMBot/data/...") 会变 C:\\MaiMBot\\...，
+    挂载点匹配必然落空（测的是 Linux 语义，不是 Windows 没有 mountinfo 这条路径）。
+    """
+    monkeypatch.setattr(ct, "os", SimpleNamespace(path=posixpath))
+
+
+def test_persisted_false_on_overlay_root(_posix_mountinfo_paths) -> None:
     assert ct.data_dir_persisted("/MaiMBot/data/maiwork", read=_reader(_OVERLAY_ROOT)) is False
 
 
-def test_persisted_true_on_bind_mount_parent() -> None:
+def test_persisted_true_on_bind_mount_parent(_posix_mountinfo_paths) -> None:
     assert ct.data_dir_persisted("/MaiMBot/data/maiwork", read=_reader(_BIND)) is True
 
 
-def test_persisted_false_outside_bind_mount() -> None:
+def test_persisted_false_outside_bind_mount(_posix_mountinfo_paths) -> None:
     # /MaiMBot/database 不在 /MaiMBot/data 下，仍是容器层
     assert ct.data_dir_persisted("/MaiMBot/database", read=_reader(_BIND)) is False
 
 
-def test_persisted_true_on_non_overlay_root() -> None:
+def test_persisted_true_on_non_overlay_root(_posix_mountinfo_paths) -> None:
     text = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n"
     assert ct.data_dir_persisted("/x/y", read=_reader(text)) is True
 

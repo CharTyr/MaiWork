@@ -851,8 +851,9 @@ class TestSkillCreateRead:
         try:
             d = _skill_dir(app) / "kit"
             d.mkdir(parents=True)
-            (d / "SKILL.md").write_text("---\ndescription: 手动放的\n---\n\n正文\n", encoding="utf-8")
-            (d / "模板.md").write_text("模板", encoding="utf-8")
+            # 写死 LF 字节：Windows 的 write_text 会翻成 \r\n，正文比对就走样
+            (d / "SKILL.md").write_bytes("---\ndescription: 手动放的\n---\n\n正文\n".encode("utf-8"))
+            (d / "模板.md").write_bytes("模板".encode("utf-8"))
             await _login(client)
             r = await client.get("/api/extensions/skills/kit")
             assert r.status == 200
@@ -864,6 +865,32 @@ class TestSkillCreateRead:
             r = await client.get("/api/extensions")
             one = next(s for s in (await r.json())["skills"] if s["name"] == "kit")
             assert one["source"] == "file"
+        finally:
+            await client.close()
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_crlf_skill_md_body_round_trip(self, tmp_path: Path) -> None:
+        """Windows 上管理员手写的 CRLF SKILL.md：front matter 后的空行剥掉，
+        但正文内部的 \\r\\n 字节原样保留（不全局 normalize 业务文本）。"""
+        from CharTyr_MaiWork.maiwork import skills_web
+
+        crlf = b"---\r\ndescription: \xe6\x89\x8b\xe5\x86\x99\r\n---\r\n\r\n\xe6\xad\xa3\xe6\x96\x87\r\n\xe8\xa1\x8c\xe4\xba\x8c\r\n"
+        # 单元级：_split_body 剥 front matter 后的空行（\r\n 也算），正文内部 CRLF 留
+        text = crlf.decode("utf-8")
+        assert skills_web._split_body(text) == "正文\r\n行二\r\n"
+        # 接口级：盘上就是 CRLF 的文件，GET 的 body 不带前导 \r\n、内部 CRLF 原样
+        app, client = await _make(tmp_path)
+        try:
+            d = _skill_dir(app) / "kit"
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_bytes(crlf)
+            await _login(client)
+            r = await client.get("/api/extensions/skills/kit")
+            assert r.status == 200
+            data = await r.json()
+            assert data["body"] == "正文\r\n行二\r\n"
+            assert not data["body"].startswith("\r\n") and not data["body"].startswith("\n")
         finally:
             await client.close()
             await app.stop()

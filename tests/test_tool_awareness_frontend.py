@@ -36,8 +36,11 @@ const api = async () => ({}), repaintSheet = () => {}, loadModels = async () => 
 const document = { addEventListener: () => {}, querySelector: () => null, querySelectorAll: () => [] };
 """
     )
+    # 脚本走 stdin 而不是 -e 参数：Windows CreateProcess 命令行上限约 32K，
+    # 整个 JS 塞进 argv 会触发 WinError 206；stdin 不限长且 --input-type=module 保真 ESM。
     result = subprocess.run(
-        ["node", "--input-type=module", "-e", setup + source + "\n" + body],
+        ["node", "--input-type=module"],
+        input=setup + source + "\n" + body,
         capture_output=True, text=True, timeout=20,
     )
     assert result.returncode == 0, result.stderr

@@ -158,7 +158,8 @@ def test_package_specs_only_whitelist() -> None:
 def test_pip_argv_targets_our_dir() -> None:
     argv = od.pip_argv("/usr/bin/python3", Path("/home/maiwork/pylibs"), ["python-docx>=1.1.0"])
     assert argv[:4] == ["/usr/bin/python3", "-m", "pip", "install"]
-    assert "--target" in argv and "/home/maiwork/pylibs" in argv
+    # argv 里存的是 str(target)：按本机平台拼回同一个字符串再比（Windows 上是 \\home\\...）
+    assert "--target" in argv and str(Path("/home/maiwork/pylibs")) in argv
     assert "--upgrade" in argv
     assert argv[-1] == "python-docx>=1.1.0"
 

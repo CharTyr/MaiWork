@@ -253,7 +253,9 @@ class TestActions:
         data = await r.json()
         assert data == {"ok": True, "msg": "正在安装"}
         st = await _wait_install(env.store, "bilibili")
-        assert st["cli_path"].endswith("/bili")
+        # 记录在案的是 venv 里可执行文件路径：POSIX 为 …/bin/bili，Windows 为 …\Scripts\bili.exe。
+        assert Path(st["cli_path"]).name == "bili" + sp._EXE_SUFFIX
+        assert Path(st["cli_path"]).parent.name == sp._VENV_BIN
         assert st["installed_at"] > 0
 
     @pytest.mark.asyncio

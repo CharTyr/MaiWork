@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -257,7 +258,16 @@ async def test_webp_and_gif_are_sent_as_real_png(tmp_path):
     rows = _image_rows(store)
     assert len(rows) == 2
     first = json.loads(rows[0]["payload"])
-    assert first["path"].endswith(".webp.png") and ".png/" in first["path"]
+    if os.open not in os.supports_dir_fd:
+        assert [Path(json.loads(r["payload"])["path"]) for r in rows] == [
+            (d / "a.webp").resolve(), (d / "b.gif").resolve(),
+        ]
+        await ob.flush(NOON)
+        assert host.images == [] and len(host.uploads) == 2
+        assert all(r["status"] == "sent" for r in _rows(store) if r["kind"] == "file")
+        return
+    assert Path(first["path"]).name.endswith(".webp.png")
+    assert Path(first["path"]).parent.name == ".png"
     # 回落仍指向**原成品**（群文件不挑格式），原文件也一个字没动
     assert first["fallback"]["path"].endswith("a.webp")
     assert (d / "a.webp").exists() and (d / "b.gif").exists()
@@ -282,6 +292,13 @@ async def test_converted_png_is_reused_on_repeat_delivery(tmp_path):
     delivery = Delivery(store, ob)
     await delivery.deliver_task("T-1", kind="image", path=d, name="封面", note="")
     made = sorted((d / ".png").iterdir())
+    if os.open not in os.supports_dir_fd:
+        assert made == []
+        assert Path(json.loads(_image_rows(store)[0]["payload"])["path"]) == (d / "a.webp").resolve()
+        await delivery.deliver_task("T-1", kind="image", path=d, name="封面", note="")
+        assert len(_image_rows(store)) == 1
+        assert list((d / ".png").iterdir()) == []
+        return
     assert [p.name for p in made] == ["a.webp.png"]
     before = [p.stat().st_mtime_ns for p in made]
     await delivery.deliver_task("T-1", kind="image", path=d, name="封面", note="")
@@ -303,6 +320,38 @@ async def test_png_and_jpeg_are_not_touched(tmp_path):
         str((d / "c.jpg").resolve()), str((d / "p0.png").resolve()), str((d / "p1.png").resolve())
     ]
     assert not (d / ".png").exists()
+
+
+async def test_missing_directory_handles_keeps_safe_file_fallback(tmp_path, monkeypatch):
+    """PNG 缓存不能安全锚定时发原件；不要求 Windows 放开目录句柄写入。"""
+    from CharTyr_MaiWork.maiwork import outbox as outbox_mod
+
+    store, _s, host, _p, _m, ob = _make(tmp_path)
+    _seed(store)
+    d = tmp_path / "ws" / "artifacts" / "T-1" / "images"
+    d.mkdir(parents=True)
+    original = _webp_bytes()
+    source = d / "a.webp"
+    source.write_bytes(original)
+    cache = (d / ".png").resolve()
+    real_open = outbox_mod.os.open
+
+    def no_directory_handle(path, flags, *args, **kwargs):
+        if Path(path) == cache:
+            raise NotImplementedError("directory handles unavailable")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(outbox_mod.os, "open", no_directory_handle)
+    await Delivery(store, ob).deliver_task("T-1", kind="image", path=d, name="封面", note="画好了")
+    payload = json.loads(_image_rows(store)[0]["payload"])
+    assert Path(payload["path"]) == source.resolve()
+    assert source.read_bytes() == original
+    assert list(cache.iterdir()) == []
+    await ob.flush(NOON)
+    assert host.images == [] and len(host.uploads) == 1
+    files = [r for r in _rows(store) if r["kind"] == "file"]
+    assert len(files) == 1 and files[0]["status"] == "sent"
+    assert json.loads(files[0]["payload"])["note"] == _note_fallback(TITLE, "file")
 
 
 async def test_pillow_missing_falls_back_to_group_file_with_honest_note(tmp_path, monkeypatch):
