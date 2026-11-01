@@ -265,7 +265,7 @@ PLATFORMS = {
     "xiaohongshu": Platform("xiaohongshu", "小红书", "xhs", "xiaohongshu-cli", True, _xhs_cmd, partial(_parse, "xiaohongshu"), "在浏览器登录小红书，复制请求头中的完整 Cookie。建议包含 a1 和 web_session；是否有效以检测结果为准。"),
     "bilibili": Platform("bilibili", "B站", "bili", "bilibili-cli", False, _bili_cmd, partial(_parse, "bilibili")),
     "youtube": Platform("youtube", "YouTube", "yt-dlp", "yt-dlp[default]", False, _youtube_cmd, partial(_parse, "youtube")),
-    "reddit": Platform("reddit", "Reddit", "rdt", "git+https://github.com/public-clis/rdt-cli.git@5e4fb3720d5c174e976cd425ccc3b879d52cac66", True, _reddit_cmd, partial(_parse, "reddit"), "在浏览器登录 Reddit，复制请求头中的完整 Cookie。是否有效以检测结果为准。"),
+    "reddit": Platform("reddit", "Reddit", "rdt", "https://codeload.github.com/public-clis/rdt-cli/zip/5e4fb3720d5c174e976cd425ccc3b879d52cac66", True, _reddit_cmd, partial(_parse, "reddit"), "在浏览器登录 Reddit，复制请求头中的完整 Cookie。是否有效以检测结果为准。"),
 }
 
 
