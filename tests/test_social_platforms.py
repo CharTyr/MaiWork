@@ -113,6 +113,8 @@ async def test_twitter_credentials_only_in_env(store, monkeypatch):
     calls = fake_runner(monkeypatch, '{"ok":true,"data":[]}')
     assert await sp.search(store, "twitter", 'a "; $(echo no)', limit=2) == []
     argv, timeout, env, cwd = calls[0]
+    assert Path(argv[0]).name == "python" + sp._EXE_SUFFIX
+    assert Path(argv[1]).name == "twitter_search_cli.py"
     assert 'a "; $(echo no)' in argv
     assert "fixture-auth" not in str(argv)
     assert env["TWITTER_AUTH_TOKEN"] == "fixture-auth" and env["TWITTER_CT0"] == "fixture-csrf"
@@ -120,6 +122,31 @@ async def test_twitter_credentials_only_in_env(store, monkeypatch):
     assert env["HOME"] != os.environ.get("HOME")
     assert not Path(env["HOME"]).exists()
     assert timeout == sp.SEARCH_TIMEOUT_S
+
+
+def test_twitter_bootstrap_scopes_cookies_before_live_lookup(monkeypatch):
+    from types import SimpleNamespace
+    from CharTyr_MaiWork.maiwork.twitter_search_cli import prepare_search
+
+    cookies = []
+    session = SimpleNamespace(cookies=SimpleNamespace(set=lambda *args, **kwargs: cookies.append((args, kwargs))))
+    client = SimpleNamespace(_get_cffi_session=lambda: session, _url_fetch=object())
+    def scan(fetch):
+        assert fetch is client._url_fetch
+        assert cookies == [
+            (("auth_token", "test-auth"), {"domain": "x.com", "path": "/"}),
+            (("ct0", "test-csrf"), {"domain": "x.com", "path": "/"}),
+        ]
+        graphql._cached_query_ids["SearchTimeline"] = "live-id"
+    graphql = SimpleNamespace(_scan_bundles=scan, _cached_query_ids={})
+    monkeypatch.setenv("TWITTER_AUTH_TOKEN", "test-auth")
+    monkeypatch.setenv("TWITTER_CT0", "test-csrf")
+    prepare_search(client, graphql)
+    assert graphql._cached_query_ids["SearchTimeline"] == "live-id"
+    graphql._cached_query_ids.clear()
+    graphql._scan_bundles = lambda fetch: None
+    with pytest.raises(RuntimeError, match="live search operation unavailable"):
+        prepare_search(client, graphql)
 
 @pytest.mark.asyncio
 async def test_missing_cookie_does_not_start_process(store, monkeypatch):

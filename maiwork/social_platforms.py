@@ -627,6 +627,9 @@ async def _inner_search(store, p, query, limit, *, check=False):
                 _credentials(home, p, cookies, env)
                 argv = p.search_cmd(q, "", n)
                 argv[0] = cli
+                if p.id == "twitter":
+                    argv = [str(_venv_exe(root / "venv", "python")),
+                            str(Path(__file__).with_name("twitter_search_cli.py").resolve()), *argv[1:]]
                 code, out, _ = await _run_cli(argv, timeout=CHECK_TIMEOUT_S if check else SEARCH_TIMEOUT_S, env=env, cwd=home)
                 if code:
                     raise SocialPlatformError("平台搜索失败，请检查连接或更新登录状态")
