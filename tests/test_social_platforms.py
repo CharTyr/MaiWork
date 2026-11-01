@@ -38,6 +38,7 @@ def test_registry_and_status(store):
     assert sp.PLATFORMS["bilibili"].package == "bilibili-cli"
     assert sp.PLATFORMS["xiaohongshu"].package == "xiaohongshu-cli"
     assert sp.PLATFORMS["twitter"].cli_name == "twitter"
+    assert sp.PLATFORMS["twitter"].package == "twitter-cli==0.8.5"
     assert all(not r["installed"] and not r["installing"] for r in rows.values())
     assert rows["twitter"]["supports_cookie"] is True
     assert rows["youtube"]["supports_cookie"] is False
@@ -157,6 +158,44 @@ def test_twitter_bootstrap_scopes_cookies_before_live_lookup(monkeypatch):
     graphql._scan_bundles = lambda fetch: None
     with pytest.raises(RuntimeError, match="live search operation unavailable"):
         prepare_search(client, graphql)
+
+@pytest.mark.parametrize("stage", ["import", "scan", "no_search_op", "success"])
+def test_twitter_bootstrap_failure_stages_are_credential_safe(monkeypatch, capsys, stage):
+    import logging
+    from types import ModuleType, SimpleNamespace
+    from CharTyr_MaiWork.maiwork import twitter_search_cli as adapter
+
+    monkeypatch.setattr(logging, "disable", lambda level: None)
+    monkeypatch.setenv("TWITTER_AUTH_TOKEN", "private-auth-value")
+    monkeypatch.setenv("TWITTER_CT0", "private-csrf-value")
+    package = ModuleType("twitter_cli")
+    entry = ModuleType("twitter_cli.cli")
+    called = []
+    entry.cli = lambda: called.append(True)
+    monkeypatch.setitem(sys.modules, "twitter_cli", package)
+    monkeypatch.setitem(sys.modules, "twitter_cli.cli", entry)
+    if stage != "import":
+        session = SimpleNamespace(cookies=SimpleNamespace(set=lambda *args, **kwargs: None))
+        package.client = SimpleNamespace(_get_cffi_session=lambda: session, _url_fetch=object())
+        def scan(fetch):
+            if stage == "scan":
+                raise RuntimeError("private-auth-value private-csrf-value raw response")
+            if stage == "success":
+                package.graphql._cached_query_ids["SearchTimeline"] = "live-id"
+        package.graphql = SimpleNamespace(_scan_bundles=scan, _cached_query_ids={})
+    if stage == "success":
+        adapter.main()
+        assert called == [True]
+        assert capsys.readouterr().out == ""
+    else:
+        with pytest.raises(SystemExit) as exc:
+            adapter.main()
+        assert exc.value.code == 1
+        output = capsys.readouterr()
+        assert json.loads(output.out) == {"ok": False, "error": {"code": "bootstrap_failed", "stage": stage}}
+        assert output.err == ""
+        assert not called
+
 
 @pytest.mark.asyncio
 async def test_missing_cookie_does_not_start_process(store, monkeypatch):

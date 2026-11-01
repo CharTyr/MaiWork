@@ -261,7 +261,7 @@ class Platform:
 
 
 PLATFORMS = {
-    "twitter": Platform("twitter", "Twitter/X", "twitter", "twitter-cli>=0.8.5,<0.9", True, _twitter_cmd, partial(_parse, "twitter"), "在浏览器登录 X，复制请求头 Cookie；必须包含 auth_token 和 ct0。不要分享给其他人。"),
+    "twitter": Platform("twitter", "Twitter/X", "twitter", "twitter-cli==0.8.5", True, _twitter_cmd, partial(_parse, "twitter"), "在浏览器登录 X，复制请求头 Cookie；必须包含 auth_token 和 ct0。不要分享给其他人。"),
     "xiaohongshu": Platform("xiaohongshu", "小红书", "xhs", "xiaohongshu-cli", True, _xhs_cmd, partial(_parse, "xiaohongshu"), "在浏览器登录小红书，复制请求头中的完整 Cookie。建议包含 a1 和 web_session；是否有效以检测结果为准。"),
     "bilibili": Platform("bilibili", "B站", "bili", "bilibili-cli", False, _bili_cmd, partial(_parse, "bilibili")),
     "youtube": Platform("youtube", "YouTube", "yt-dlp", "yt-dlp[default]", False, _youtube_cmd, partial(_parse, "youtube")),
