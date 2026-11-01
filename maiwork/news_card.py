@@ -41,12 +41,11 @@ import logging
 import re
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urljoin, urlparse
 
-from . import render_assets
+from . import clock, render_assets
 
 logger = logging.getLogger(__name__)
 
@@ -314,11 +313,12 @@ _WEEK = "一二三四五六日"
 
 
 def slot_word(slot_ts: float | None, label: str = "") -> str:
-    """时段词：优先 slot_label 里「·」后面那个词，认不出就按 slot_ts 本地钟点算。"""
+    """时段词：优先 slot_label 里「·」后面那个词，认不出就按 slot_ts 的北京时间钟点算。"""
     tail = (label or "").split("·")[-1].strip()
     if tail in _SKIES:
         return tail
-    h = datetime.fromtimestamp(slot_ts).hour if slot_ts else datetime.now().hour
+    # 北京时间（同 clock / 睡觉时段）：服务器多半是 UTC（Docker 默认），按本机钟点会差 8 小时
+    h = clock.bj(slot_ts if slot_ts else clock.now()).hour
     if h < 6:
         return "凌晨"
     if h < 11:
@@ -332,7 +332,7 @@ def slot_word(slot_ts: float | None, label: str = "") -> str:
 
 def _date_line(slot_ts: float | None, label: str) -> str:
     if slot_ts:
-        d = datetime.fromtimestamp(slot_ts)
+        d = clock.bj(slot_ts)
         return f"{d.month}月{d.day}日 · 周{_WEEK[d.weekday()]}"
     head = (label or "").split("·")[0].strip()
     return head
@@ -354,7 +354,7 @@ def _ago(ts: Any, now: float) -> str:
         return f"{int(d // 3600)} 小时前"
     if d < 86400 * 30:
         return f"{int(d // 86400)} 天前"
-    dt = datetime.fromtimestamp(t)
+    dt = clock.bj(t)
     return f"{dt.month}月{dt.day}日"
 
 

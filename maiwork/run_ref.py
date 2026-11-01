@@ -44,6 +44,25 @@ def current() -> str:
         return ""
 
 
+def detach() -> None:
+    """在**新起的后台任务里**第一句调：把继承来的轮标记清掉。
+
+    `create_task` 会复制当时的 context：管理员对话一轮里点「重新整理画像」起的长活
+    会带着那一轮的 ref 跑完（调用挂错条目、`main_run.auto` 也因此不给它自己开条目），
+    哪怕那一轮早就收尾了。新任务的 context 是复制品，这里清掉不影响父任务。
+    """
+    try:
+        CURRENT_REF.set("")
+    except Exception:
+        pass
+
+
+async def detached(coro: Any) -> Any:
+    """包一层：先 `detach()` 再跑 coro。给「交出去就不管」的后台派工用。"""
+    detach()
+    return await coro
+
+
 def new(kind: str, group_id: str) -> str:
     """造一条轮标记：``<kind>:<gid>:<ms>:<seq>``（和 main_runs 的 ref 同一形状）。"""
     return (f"{str(kind or '')[:40]}:{str(group_id or '')[:40]}:"
