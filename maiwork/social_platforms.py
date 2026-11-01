@@ -447,6 +447,9 @@ def _child_env(home: Path, root: Path, *, os_name: str | None = None) -> dict[st
             "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"),
             "XDG_CACHE_HOME": str(home / ".cache"), "XDG_DATA_HOME": str(home / ".local/share"),
             "TMPDIR": str(home), "LANG": "C.UTF-8", "PYTHONNOUSERSITE": "1",
+            # Windows ignores LANG for Python's pipe encoding. Match _run_cli's
+            # UTF-8 decoder and allow CLI JSON containing emoji/non-GBK text.
+            "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1",
             "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_NO_INPUT": "1", "PIP_NO_CACHE_DIR": "1",
             **windows_system_env()}
     if name == "nt":

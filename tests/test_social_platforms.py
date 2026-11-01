@@ -56,6 +56,16 @@ def test_youtube_ignores_global_configuration():
     argv = sp.PLATFORMS["youtube"].search_cmd("topic", "", 3)
     assert "--ignore-config" in argv and "ytsearch3:topic" in argv
 
+
+@pytest.mark.asyncio
+async def test_cli_unicode_json_roundtrip(tmp_path):
+    payload = {"title": "小红书 🔥 𠮷", "ok": True}
+    script = "import json; print(json.dumps(" + repr(payload) + ", ensure_ascii=False))"
+    env = sp._child_env(tmp_path, tmp_path)
+    code, out, err = await sp._run_cli([sys.executable, "-c", script], timeout=5, env=env, cwd=tmp_path)
+    assert code == 0, err
+    assert json.loads(out) == payload
+
 def test_cookie_write_only_and_validation(store):
     cookie = "auth_token=fixture-auth; ct0=fixture-csrf"
     sp.set_cookie(store, "twitter", cookie)
