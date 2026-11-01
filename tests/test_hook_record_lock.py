@@ -42,7 +42,7 @@ import pytest
 from fakes import hook_message
 
 from CharTyr_MaiWork.maiwork.config import load_settings
-from CharTyr_MaiWork.maiwork.intake import Intake, Signals, _CHAIN_WRITE_WAIT_S
+from CharTyr_MaiWork.maiwork.intake import Intake, Signals, _CHAIN_WRITE_WAIT_S, _HOOK_RECORD_WAIT_S
 from CharTyr_MaiWork.maiwork.pending_asks import SPOOL_DIRNAME, PendingAsks
 from CharTyr_MaiWork.maiwork.store import Store
 
@@ -343,11 +343,20 @@ def test_unknown_old_spool_file_is_kept_and_warned(tmp_path, caplog) -> None:
 
 
 @pytest.mark.asyncio
-async def test_hook_does_not_wait_for_write_lock_and_at_still_lands(tmp_path) -> None:
-    """真持锁：钩子 < 0.9s 返回、这条 @ 已经写进 spool；放锁后补落库，判词照常建待批请求。"""
+async def test_hook_does_not_wait_for_write_lock_and_at_still_lands(tmp_path, monkeypatch) -> None:
+    """真持锁：钩子不拖住、这条 @ 已经写进 spool；放锁后补落库，判词照常建待批请求。"""
     jev = _Jev()
     intake, store, spawned, approvals = _make_intake(tmp_path, jev=jev)
+    pa = intake._pending
     lock = _WriteLock(store)
+    record_attempts: list[float] = []
+    real_record = pa.record_pending_bounded
+
+    def counting_record(gid, msg, reason, *, timeout_s=0.15):
+        record_attempts.append(timeout_s)
+        return real_record(gid, msg, reason, timeout_s=timeout_s)
+
+    monkeypatch.setattr(pa, "record_pending_bounded", counting_record)
     try:
         start = time.monotonic()
         out = await intake.handle(
@@ -356,8 +365,11 @@ async def test_hook_does_not_wait_for_write_lock_and_at_still_lands(tmp_path) ->
         took = time.monotonic() - start
         assert out == {"action": "continue"}
         # 这条断言量的是**钩子总耗时**：150ms 有界等锁 + 一次 spool 原子落盘（含 fsync）。
-        # 只要哪一步变成跟 Store 的 5 秒 busy_timeout 走，这里立刻红（旧实现 5.36s）。
-        assert took < _HOOK_TOTAL_MAX_S, f"钩子被拖住了（{took:.2f}s）"
+        # macOS runner 上 fsync 慢，挂钟上限放宽到 2s；真正钉住的是「有界等锁只进一次，
+        # 不跟 Store 的 5 秒 busy_timeout 走」（旧实现 5.36s）。
+        assert took < 2.0, f"钩子被拖住了（{took:.2f}s）"
+        assert len(record_attempts) == 1, f"有界等锁只试一次，实际 {len(record_attempts)} 次"
+        assert record_attempts[0] <= 0.3, f"等锁预算应是 {_HOOK_RECORD_WAIT_S}s 级，实际 {record_attempts[0]:.2f}s"
         # 钩子回来时锁还没放：这条 @ 在磁盘 spool 里（已经持久），库里还没有
         assert store.read().execute(
             "SELECT 1 FROM pending_asks WHERE message_id='m-lock'"
@@ -506,11 +518,20 @@ async def test_decide_false_does_not_build_request(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_hook_total_time_under_lock_stays_bounded(tmp_path) -> None:
-    """锁一直被占：连来 5 条 @，每一条钩子总耗时（有界等锁 + spool 落盘 fsync）都在上限内。"""
+async def test_hook_total_time_under_lock_stays_bounded(tmp_path, monkeypatch) -> None:
+    """锁一直被占：连来 5 条 @，每一条都走有界等锁 + spool，不跟 5 秒 busy_timeout 走。"""
     intake, store, spawned, _approvals = _make_intake(tmp_path, jev=_Jev())
+    pa = intake._pending
     lock = _WriteLock(store)
     times: list[float] = []
+    record_attempts: list[float] = []
+    real_record = pa.record_pending_bounded
+
+    def counting_record(gid, msg, reason, *, timeout_s=0.15):
+        record_attempts.append(timeout_s)
+        return real_record(gid, msg, reason, timeout_s=timeout_s)
+
+    monkeypatch.setattr(pa, "record_pending_bounded", counting_record)
     try:
         for i in range(5):
             start = time.monotonic()
@@ -520,11 +541,13 @@ async def test_hook_total_time_under_lock_stays_bounded(tmp_path) -> None:
             times.append(time.monotonic() - start)
             assert out == {"action": "continue"}
         assert len(_spool_files(tmp_path)) == 5, "每条都要落进 spool（一条都不能丢）"
+        assert len(record_attempts) == 5, f"每条只试一次有界等锁，实际 {len(record_attempts)} 次"
+        assert all(t <= 0.3 for t in record_attempts), f"等锁预算应是 {_HOOK_RECORD_WAIT_S}s 级"
     finally:
         lock.release()
         for coro in spawned:
             coro.close()
-    assert max(times) < _HOOK_TOTAL_MAX_S, f"最慢一条 {max(times):.2f}s（旧实现会被拖 5 秒）"
+    assert max(times) < 5.0, f"最慢一条 {max(times):.2f}s（旧实现会被拖 5 秒）"
     store.close()
 
 
