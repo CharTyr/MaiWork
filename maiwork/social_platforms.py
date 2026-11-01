@@ -261,11 +261,11 @@ class Platform:
 
 
 PLATFORMS = {
-    "twitter": Platform("twitter", "Twitter/X", "twitter", "twitter-cli>=0.8.5,<0.9", True, _twitter_cmd, partial(_parse, "twitter"), "在浏览器登录 X，复制请求头 Cookie；必须包含 auth_token 和 ct0。不要分享给其他人。"),
+    "twitter": Platform("twitter", "Twitter/X", "twitter", "twitter-cli==0.8.5", True, _twitter_cmd, partial(_parse, "twitter"), "在浏览器登录 X，复制请求头 Cookie；必须包含 auth_token 和 ct0。不要分享给其他人。"),
     "xiaohongshu": Platform("xiaohongshu", "小红书", "xhs", "xiaohongshu-cli", True, _xhs_cmd, partial(_parse, "xiaohongshu"), "在浏览器登录小红书，复制请求头中的完整 Cookie。建议包含 a1 和 web_session；是否有效以检测结果为准。"),
     "bilibili": Platform("bilibili", "B站", "bili", "bilibili-cli", False, _bili_cmd, partial(_parse, "bilibili")),
     "youtube": Platform("youtube", "YouTube", "yt-dlp", "yt-dlp[default]", False, _youtube_cmd, partial(_parse, "youtube")),
-    "reddit": Platform("reddit", "Reddit", "rdt", "git+https://github.com/public-clis/rdt-cli.git@5e4fb3720d5c174e976cd425ccc3b879d52cac66", True, _reddit_cmd, partial(_parse, "reddit"), "在浏览器登录 Reddit，复制请求头中的完整 Cookie。是否有效以检测结果为准。"),
+    "reddit": Platform("reddit", "Reddit", "rdt", "https://codeload.github.com/public-clis/rdt-cli/zip/5e4fb3720d5c174e976cd425ccc3b879d52cac66", True, _reddit_cmd, partial(_parse, "reddit"), "在浏览器登录 Reddit，复制请求头中的完整 Cookie。是否有效以检测结果为准。"),
 }
 
 
@@ -447,6 +447,9 @@ def _child_env(home: Path, root: Path, *, os_name: str | None = None) -> dict[st
             "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"),
             "XDG_CACHE_HOME": str(home / ".cache"), "XDG_DATA_HOME": str(home / ".local/share"),
             "TMPDIR": str(home), "LANG": "C.UTF-8", "PYTHONNOUSERSITE": "1",
+            # Windows ignores LANG for Python's pipe encoding. Match _run_cli's
+            # UTF-8 decoder and allow CLI JSON containing emoji/non-GBK text.
+            "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1",
             "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_NO_INPUT": "1", "PIP_NO_CACHE_DIR": "1",
             **windows_system_env()}
     if name == "nt":
@@ -627,6 +630,9 @@ async def _inner_search(store, p, query, limit, *, check=False):
                 _credentials(home, p, cookies, env)
                 argv = p.search_cmd(q, "", n)
                 argv[0] = cli
+                if p.id == "twitter":
+                    argv = [str(_venv_exe(root / "venv", "python")),
+                            str(Path(__file__).with_name("twitter_search_cli.py").resolve()), *argv[1:]]
                 code, out, _ = await _run_cli(argv, timeout=CHECK_TIMEOUT_S if check else SEARCH_TIMEOUT_S, env=env, cwd=home)
                 if code:
                     raise SocialPlatformError("平台搜索失败，请检查连接或更新登录状态")

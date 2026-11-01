@@ -38,6 +38,7 @@ def test_registry_and_status(store):
     assert sp.PLATFORMS["bilibili"].package == "bilibili-cli"
     assert sp.PLATFORMS["xiaohongshu"].package == "xiaohongshu-cli"
     assert sp.PLATFORMS["twitter"].cli_name == "twitter"
+    assert sp.PLATFORMS["twitter"].package == "twitter-cli==0.8.5"
     assert all(not r["installed"] and not r["installing"] for r in rows.values())
     assert rows["twitter"]["supports_cookie"] is True
     assert rows["youtube"]["supports_cookie"] is False
@@ -55,6 +56,16 @@ def test_documented_commands(pid, expected):
 def test_youtube_ignores_global_configuration():
     argv = sp.PLATFORMS["youtube"].search_cmd("topic", "", 3)
     assert "--ignore-config" in argv and "ytsearch3:topic" in argv
+
+
+@pytest.mark.asyncio
+async def test_cli_unicode_json_roundtrip(tmp_path):
+    payload = {"title": "小红书 🔥 𠮷", "ok": True}
+    script = "import json; print(json.dumps(" + repr(payload) + ", ensure_ascii=False))"
+    env = sp._child_env(tmp_path, tmp_path)
+    code, out, err = await sp._run_cli([sys.executable, "-c", script], timeout=5, env=env, cwd=tmp_path)
+    assert code == 0, err
+    assert json.loads(out) == payload
 
 def test_cookie_write_only_and_validation(store):
     cookie = "auth_token=fixture-auth; ct0=fixture-csrf"
@@ -113,6 +124,8 @@ async def test_twitter_credentials_only_in_env(store, monkeypatch):
     calls = fake_runner(monkeypatch, '{"ok":true,"data":[]}')
     assert await sp.search(store, "twitter", 'a "; $(echo no)', limit=2) == []
     argv, timeout, env, cwd = calls[0]
+    assert Path(argv[0]).name == "python" + sp._EXE_SUFFIX
+    assert Path(argv[1]).name == "twitter_search_cli.py"
     assert 'a "; $(echo no)' in argv
     assert "fixture-auth" not in str(argv)
     assert env["TWITTER_AUTH_TOKEN"] == "fixture-auth" and env["TWITTER_CT0"] == "fixture-csrf"
@@ -120,6 +133,69 @@ async def test_twitter_credentials_only_in_env(store, monkeypatch):
     assert env["HOME"] != os.environ.get("HOME")
     assert not Path(env["HOME"]).exists()
     assert timeout == sp.SEARCH_TIMEOUT_S
+
+
+def test_twitter_bootstrap_scopes_cookies_before_live_lookup(monkeypatch):
+    from types import SimpleNamespace
+    from CharTyr_MaiWork.maiwork.twitter_search_cli import prepare_search
+
+    cookies = []
+    session = SimpleNamespace(cookies=SimpleNamespace(set=lambda *args, **kwargs: cookies.append((args, kwargs))))
+    client = SimpleNamespace(_get_cffi_session=lambda: session, _url_fetch=object())
+    def scan(fetch):
+        assert fetch is client._url_fetch
+        assert cookies == [
+            (("auth_token", "test-auth"), {"domain": "x.com", "path": "/"}),
+            (("ct0", "test-csrf"), {"domain": "x.com", "path": "/"}),
+        ]
+        graphql._cached_query_ids["SearchTimeline"] = "live-id"
+    graphql = SimpleNamespace(_scan_bundles=scan, _cached_query_ids={})
+    monkeypatch.setenv("TWITTER_AUTH_TOKEN", "test-auth")
+    monkeypatch.setenv("TWITTER_CT0", "test-csrf")
+    prepare_search(client, graphql)
+    assert graphql._cached_query_ids["SearchTimeline"] == "live-id"
+    graphql._cached_query_ids.clear()
+    graphql._scan_bundles = lambda fetch: None
+    with pytest.raises(RuntimeError, match="live search operation unavailable"):
+        prepare_search(client, graphql)
+
+@pytest.mark.parametrize("stage", ["import", "scan", "no_search_op", "success"])
+def test_twitter_bootstrap_failure_stages_are_credential_safe(monkeypatch, capsys, stage):
+    import logging
+    from types import ModuleType, SimpleNamespace
+    from CharTyr_MaiWork.maiwork import twitter_search_cli as adapter
+
+    monkeypatch.setattr(logging, "disable", lambda level: None)
+    monkeypatch.setenv("TWITTER_AUTH_TOKEN", "private-auth-value")
+    monkeypatch.setenv("TWITTER_CT0", "private-csrf-value")
+    package = ModuleType("twitter_cli")
+    entry = ModuleType("twitter_cli.cli")
+    called = []
+    entry.cli = lambda: called.append(True)
+    monkeypatch.setitem(sys.modules, "twitter_cli", package)
+    monkeypatch.setitem(sys.modules, "twitter_cli.cli", entry)
+    if stage != "import":
+        session = SimpleNamespace(cookies=SimpleNamespace(set=lambda *args, **kwargs: None))
+        package.client = SimpleNamespace(_get_cffi_session=lambda: session, _url_fetch=object())
+        def scan(fetch):
+            if stage == "scan":
+                raise RuntimeError("private-auth-value private-csrf-value raw response")
+            if stage == "success":
+                package.graphql._cached_query_ids["SearchTimeline"] = "live-id"
+        package.graphql = SimpleNamespace(_scan_bundles=scan, _cached_query_ids={})
+    if stage == "success":
+        adapter.main()
+        assert called == [True]
+        assert capsys.readouterr().out == ""
+    else:
+        with pytest.raises(SystemExit) as exc:
+            adapter.main()
+        assert exc.value.code == 1
+        output = capsys.readouterr()
+        assert json.loads(output.out) == {"ok": False, "error": {"code": "bootstrap_failed", "stage": stage}}
+        assert output.err == ""
+        assert not called
+
 
 @pytest.mark.asyncio
 async def test_missing_cookie_does_not_start_process(store, monkeypatch):
