@@ -42,7 +42,7 @@ import pytest
 from fakes import hook_message
 
 from CharTyr_MaiWork.maiwork.config import load_settings
-from CharTyr_MaiWork.maiwork.intake import Intake, Signals
+from CharTyr_MaiWork.maiwork.intake import Intake, Signals, _CHAIN_WRITE_WAIT_S
 from CharTyr_MaiWork.maiwork.pending_asks import SPOOL_DIRNAME, PendingAsks
 from CharTyr_MaiWork.maiwork.store import Store
 
@@ -529,15 +529,26 @@ async def test_hook_total_time_under_lock_stays_bounded(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_judge_chain_writes_do_not_block_the_loop(tmp_path) -> None:
+async def test_judge_chain_writes_do_not_block_the_loop(tmp_path, monkeypatch) -> None:
     """判词链（decide / complete / fail）写库也不许在事件循环上等 5 秒写锁。
 
-    锁一直被占：判词跑完（问过 Jev）但不建请求、不写结论——整段耗时必须是「毫秒级 +
-    0.2s 有界等锁」，绝不能是 Store 的 5 秒 busy_timeout；行留在库里等独立重试。
+    锁一直被占：判词跑完（问过 Jev）但不建请求、不写结论——有界等锁只试一次，
+    绝不能是 Store 的 5 秒 busy_timeout；行留在库里等独立重试。
+    挂钟时间覆盖 macOS runner 的真实 SQLite busy_timeout 精度与连接开销，不再按
+    0.6s 硬卡；真正钉住的行为是「有界等锁只进一次 isolated_write，不拖成 5 秒」。
     """
     jev = _Jev()
     intake, store, spawned, approvals = _make_intake(tmp_path, jev=jev)
+    pa = intake._pending
     lock = _WriteLock(store)
+    write_attempts: list[float] = []
+    real_isolated = pa.isolated_write
+
+    def counting_isolated(timeout_s: float):
+        write_attempts.append(timeout_s)
+        return real_isolated(timeout_s)
+
+    monkeypatch.setattr(pa, "isolated_write", counting_isolated)
     try:
         start = time.monotonic()
         await asyncio.wait_for(
@@ -549,7 +560,9 @@ async def test_judge_chain_writes_do_not_block_the_loop(tmp_path) -> None:
         lock.release()
         for coro in spawned:
             coro.close()
-    assert took < _HOOK_TOTAL_MAX_S, f"判词链在事件循环上等了写锁（{took:.2f}s）"
+    assert len(write_attempts) == 1, f"有界等锁只试一次，实际 {len(write_attempts)} 次"
+    assert write_attempts[0] <= 0.3, f"等锁预算应是 {_CHAIN_WRITE_WAIT_S}s 级，实际 {write_attempts[0]:.2f}s"
+    assert took < 5.0, f"判词链在事件循环上等了写锁（{took:.2f}s）"
     assert jev.calls == 1
     assert approvals.created == [], "结论没写进库就不许建请求（留给独立重试，只判一次）"
     store.close()
