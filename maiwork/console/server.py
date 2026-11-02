@@ -3028,16 +3028,21 @@ class ConsoleServer:
         def _runtime_of(name: str):
             return svc.extensions.runtime_of(name) if svc.extensions is not None else None
 
+        def _search_payload() -> dict:
+            from .. import search_binding
+
+            return search_binding.search_view(
+                svc.store, svc.get_settings(), _runtime_of, reader=getattr(svc, "reader", None)
+            )
+
         @get("/api/extensions/search")
         async def _search_binding_get(request: web.Request) -> web.Response:
-            """{binding, status: {ok, text}, candidates: [{mcp, tools: [{name, description, guess}]}]}。"""
+            """{binding, status: {ok, text}, candidates: [...], reader: {...}}。"""
             forbid = self._require_admin(request)
             if forbid is not None:
                 return forbid
-            from .. import search_binding
-
             try:
-                return web.json_response(search_binding.search_view(svc.store, svc.get_settings(), _runtime_of))
+                return web.json_response(_search_payload())
             except Exception:
                 logger.exception("拼搜索绑定视图出错")
                 return _err(500, "读搜索绑定出错了")
@@ -3059,7 +3064,7 @@ class ConsoleServer:
             except Exception:
                 logger.exception("保存搜索绑定出错")
                 return _err(500, "保存搜索绑定出错了")
-            return web.json_response(search_binding.search_view(svc.store, svc.get_settings(), _runtime_of))
+            return web.json_response(_search_payload())
 
         async def _search_binding_delete(request: web.Request) -> web.Response:
             """解绑（幂等）。"""
@@ -3069,7 +3074,7 @@ class ConsoleServer:
             from .. import search_binding
 
             search_binding.clear_binding(svc.store)
-            return web.json_response(search_binding.search_view(svc.store, svc.get_settings(), _runtime_of))
+            return web.json_response(_search_payload())
 
         app.router.add_route("PUT", "/api/extensions/search", self._write(_search_binding_put))
         app.router.add_route("DELETE", "/api/extensions/search", self._write(_search_binding_delete))
@@ -3084,7 +3089,7 @@ class ConsoleServer:
         @get("/api/extensions/presets")
         async def _presets_get(request: web.Request) -> web.Response:
             """六家预设搜索服务 + 各自状态：{presets: [{id, label, free, free_note, key_page_url, docs_url,
-            logo, entry, source, enabled, ok, key_set}]}。"""
+            logo, entry, source, enabled, ok, error, key_set, search_tool, extract_tool}]}。"""
             forbid = self._require_admin(request)
             if forbid is not None:
                 return forbid
@@ -3095,8 +3100,8 @@ class ConsoleServer:
                 return _err(500, "读预设搜索服务出错了")
 
         async def _preset_activate(request: web.Request) -> web.Response:
-            """POST /api/extensions/presets/{id}：打开这家 / 换密钥（{key}）/ 改回免密钥（{clear_key: true}）。
-            还没有搜索绑定时顺手设成主搜索。返回 {presets, name, bound, label}。"""
+            """POST /api/extensions/presets/{id}：打开这家 / 换密钥（{key}）/ 改回免密钥（{clear_key: true}）
+            / 一键设为主用（{set_primary: true}）。返回 {presets, search, name, bound, label, ok, error}。"""
             forbid = self._require_admin(request)
             if forbid is not None:
                 return forbid
@@ -3107,7 +3112,7 @@ class ConsoleServer:
             if body is None:
                 body = {}
             if not isinstance(body, dict):
-                return _err(400, "请求体要写成 {\"key\": 可选密钥, \"clear_key\": 可选}")
+                return _err(400, "请求体要写成 {\"key\": 可选密钥, \"clear_key\": 可选, \"set_primary\": 可选}")
             from .. import search_presets_web
             from ..search_presets import PRESETS
 
@@ -3115,10 +3120,17 @@ class ConsoleServer:
             key = body.get("key")
             if key is not None and not isinstance(key, str):
                 return _err(400, "key 要是字符串")
+            make_primary = bool(body.get("set_primary"))
             try:
-                name, bound = search_presets_web.activate(
-                    svc.store, svc.get_settings(), pid, key=key, clear_key=bool(body.get("clear_key"))
-                )
+                if make_primary:
+                    name = search_presets_web.set_primary(
+                        svc.store, svc.get_settings(), pid, key=key, clear_key=bool(body.get("clear_key"))
+                    )
+                    bound = True
+                else:
+                    name, bound = search_presets_web.activate(
+                        svc.store, svc.get_settings(), pid, key=key, clear_key=bool(body.get("clear_key"))
+                    )
             except KeyError:
                 return _err(404, "没有这个预设搜索服务")
             except ValueError as e:
@@ -3128,8 +3140,42 @@ class ConsoleServer:
             except Exception:
                 logger.exception("打开预设搜索服务 %s 后连接出错", pid)
             out = _presets_payload()
-            out.update({"name": name, "bound": bound, "label": PRESETS[pid].label})
+            cur = next((x for x in out["presets"] if x.get("id") == pid), {})
+            out.update({
+                "name": name,
+                "bound": bound,
+                "label": PRESETS[pid].label,
+                "ok": bool(cur.get("ok")),
+                "error": str(cur.get("error") or ""),
+                "search": _search_payload(),
+            })
             return web.json_response(out)
+
+        async def _preset_test(request: web.Request) -> web.Response:
+            """POST /api/extensions/presets/{id}/test：对已启用预设发一次真实搜索查询（limit=1），
+            识别配额耗尽 / 401 / 连接异常并遮罩密钥。"""
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            not_ready = _ext_ready()
+            if not_ready is not None:
+                return not_ready
+            from .. import search_presets_web
+
+            pid = str(request.match_info["id"])
+            try:
+                res = await search_presets_web.test_preset(
+                    svc.store,
+                    svc.get_settings(),
+                    pid,
+                    runtime_of=_runtime_of,
+                    reload_mcp=svc.reload_mcp,
+                )
+            except KeyError:
+                return _err(404, "没有这个预设搜索服务")
+            except ValueError as e:
+                return _err(400, str(e))
+            return web.json_response(res)
 
         async def _presets_setup(request: web.Request) -> web.Response:
             """POST /api/extensions/presets-setup：首次引导一次配好 {items: [{id, key?}]}；
@@ -3143,7 +3189,7 @@ class ConsoleServer:
             body = await _json_body(request)
             if not isinstance(body, dict):
                 return _err(400, "请求体要写成 {\"items\": [{\"id\": 预设, \"key\": 可选密钥}]}")
-            from .. import search_binding, search_presets_web
+            from .. import search_presets_web
 
             try:
                 names = search_presets_web.setup(svc.store, svc.get_settings(), body.get("items"))
@@ -3155,10 +3201,11 @@ class ConsoleServer:
                 except Exception:
                     logger.exception("引导打开预设搜索服务 %s 后连接出错", name)
             out = _presets_payload()
-            out["search"] = search_binding.search_view(svc.store, svc.get_settings(), _runtime_of)
+            out["search"] = _search_payload()
             return web.json_response(out)
 
         app.router.add_post("/api/extensions/presets/{id}", self._write(_preset_activate))
+        app.router.add_post("/api/extensions/presets/{id}/test", self._write(_preset_test))
         app.router.add_post("/api/extensions/presets-setup", self._write(_presets_setup))
 
         @get("/api/extensions/skills/{name}")

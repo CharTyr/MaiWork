@@ -5,6 +5,7 @@ import { api } from "../api.js";
 import { repaintSheet } from "../sheet.js";
 import { loading } from "../pages/news.js";
 import { loadOptDeps, optDepsSection } from "./optdeps.js";
+import { actSearch, presetByEntry, presetLogo, searchRoleTags, searchSection } from "./search.js";
 
 export const ROLE_NAMES = { worker: "子 agent", main: "主模型" };
 
@@ -34,21 +35,8 @@ export function extPage(tab = "all") {
   const pasting = ed && ed.kind === "mcp-paste";
   const newSkill = ed && ed.kind === "skill" && !ed.name;
   if (tab === "optdeps") return optDepsSection();
-  if (tab === "search") {
-    const addedPresets = mcp.filter((m) => presetByEntry(m.name));
-    const unadded = presetsNotAdded();
-    const presetRows = [
-      ...addedPresets.map((m) => (ed && ed.kind === "mcp" && ed.name === m.name ? mcpForm(m) : mcpRow(m))),
-      ...unadded.map(presetRow),
-    ].join("");
-    return `
-      ${searchCard()}
-      ${presetRows ? `<h2 class="h-sub">搜索服务${tip("开启任一搜索服务后，即可在上方「联网搜索」中选用。")}</h2><div class="set-group">${presetRows}</div>` : ""}`;
-  }
-  const mcpRows = [
-    ...mcp.map((m) => (ed && ed.kind === "mcp" && ed.name === m.name ? mcpForm(m) : mcpRow(m))),
-    ...(tab === "all" ? presetsNotAdded().map(presetRow) : []),
-  ].join("");
+  if (tab === "search") return searchSection();
+  const mcpRows = mcp.map((m) => (ed && ed.kind === "mcp" && ed.name === m.name ? mcpForm(m) : mcpRow(m))).join("");
   const skillRows = skills.map((k) => (ed && ed.kind === "skill" && ed.name === k.name ? skillForm(k) : skillRow(k))).join("");
   const mcpBlock = `
     <div class="h-sub-row"><h2 class="h-sub">MCP${tip("MCP 服务为 MaiWork 提供外部工具，例如搜索、读取网页。仅支持远程（https）服务。")}</h2>${newMcp || pasting ? "" : `<span class="row-btns"><button class="btn small" data-act="mcp-paste">粘贴配置</button><button class="btn small" data-act="ext-new" data-kind="mcp">添加</button></span>`}</div>
@@ -59,142 +47,7 @@ export function extPage(tab = "all") {
     ${newSkill ? skillForm(null) : ""}
     ${skillRows ? `<div class="set-group">${skillRows}</div>` : newSkill ? "" : `<p class="h-meta">暂无</p>`}`;
   if (tab === "mcp") return mcpBlock;
-  return `${searchCard()}${mcpBlock}${optDepsSection()}`;
-}
-
-// 联网搜索：从已接的 MCP 里挑一个工具来用（后端 GET/PUT/DELETE /api/extensions/search）。
-// 「抓网页正文」可以另选任意一家 MCP 的工具，不必和搜索同一家。
-function searchCard() {
-  const sx = state.extSearch;
-  if (!sx) return "";
-  const b = sx.binding;
-  const st = sx.status || {};
-  const cands = (sx.candidates || []).filter((c) => (c.tools || []).length);
-  const editing = state.searchEdit || !b;
-  const head = `<div class="h-sub-row"><h2 class="h-sub">联网搜索${tip("选择用于联网搜索的服务和工具。搜索偏好可写入 AGENTS.md。")}</h2>${!editing ? `<span class="row-btns"><button class="btn small" data-act="search-edit">更换</button></span>` : ""}</div>`;
-  const stLine = `<div class="set-text ext-st"><span class="dot ${st.ok ? "ok" : b ? "failed" : ""}"></span>${esc(b ? st.text || "" : "未设置")}</div>`;
-  if (!editing) {
-    const exMcp = b.extract_mcp || b.mcp;
-    return `${head}
-      <div class="ext-row search-now">
-        ${presetByEntry(b.mcp) ? logoImg(presetByEntry(b.mcp)) : ico("magnifier")}
-        <div class="ext-main">
-          <div class="set-name">${esc(labelOf(b.mcp))} · <span class="mono">${esc(b.tool)}</span></div>
-          ${b.extract_tool ? `<div class="set-text">网页读取：${esc(exMcp)} · <span class="mono">${esc(b.extract_tool)}</span></div>` : ""}
-          ${extraProviders(b)}
-          ${stLine}
-        </div>
-      </div>`;
-  }
-  if (!cands.length) {
-    return `${head}${stLine}<p class="h-meta">请先在下方开启一个搜索服务</p>`;
-  }
-  const all = cands.flatMap((c) => c.tools.map((t) => ({ mcp: c.mcp, ...t })));
-  const pick = b ? all.find((t) => t.mcp === b.mcp && t.name === b.tool) : all.find((t) => t.guess === "search") || all[0];
-  // 抓正文：有绑定就用绑定的；没有就猜一个「像抓正文」的（同一家优先）
-  let exPick = null;
-  if (b && b.extract_tool) exPick = all.find((t) => t.mcp === (b.extract_mcp || b.mcp) && t.name === b.extract_tool) || null;
-  else if (!b) exPick = all.find((t) => t.guess === "extract" && pick && t.mcp === pick.mcp) || all.find((t) => t.guess === "extract") || null;
-  const same = (t, p) => !!p && t.mcp === p.mcp && t.name === p.name;
-  // 扩展名和工具名分开放在 data-* 里（别拼成一个值：HTML 属性里的 NUL 会被浏览器换掉，拆不开）
-  const opt = (t, sel, hint) =>
-    `<option value="${esc(t.mcp + " · " + t.name)}" data-mcp="${esc(t.mcp)}" data-tool="${esc(t.name)}" ${sel ? "selected" : ""}>${esc(t.mcp)} · ${esc(t.name)}${t.guess === hint ? (hint === "search" ? "（搜索）" : "（网页读取）") : ""}</option>`;
-  return `${head}${b ? stLine : ""}
-    <div class="login ext-form search-form">
-      <label for="sx-tool">搜索工具</label>
-      <select id="sx-tool">${all.map((t) => opt(t, same(t, pick), "search")).join("")}</select>
-      ${tipLabel("sx-extract", "网页读取工具（可选）", "用于读取网页正文，可以与搜索工具来自不同服务。")}
-      <select id="sx-extract"><option value="" ${exPick ? "" : "selected"}>不使用</option>${all.map((t) => opt(t, same(t, exPick), "extract")).join("")}</select>
-      <div class="lbl-row"><label>备用服务</label>${tip("主搜索服务不可用时，按顺序改用这些服务。")}</div>
-      ${providerChecks("sx-fb", b && b.fallback, "")}
-      <div class="lbl-row"><label>同时搜索</label>${tip("搜集资讯时同时使用这些服务，可提高覆盖面，搜索次数会相应增加。")}</div>
-      ${providerChecks("sx-br", b && b.broad, "")}
-      <div class="actions">
-        <button class="btn primary" data-act="search-save">保存</button>
-        ${b ? `<button class="btn" data-act="search-cancel">取消</button><button class="btn danger" data-act="search-off">关闭联网搜索</button>` : ""}
-      </div>
-    </div>`;
-}
-
-// 备用 / 广撒网：只认已打开的预设服务（后端按预设写死工具和参数）
-const searchBinding = () => (state.extSearch && state.extSearch.binding) || null;
-function searchRoleTags(name) {
-  const b = searchBinding();
-  if (!b) return "";
-  const out = [];
-  if ((b.fallback || []).includes(name)) out.push(`<span class="tag">备用</span>`);
-  if ((b.broad || []).includes(name)) out.push(`<span class="tag">同时搜索</span>`);
-  return out.join("");
-}
-const enabledPresets = () => presetList().filter((p) => p.entry && p.enabled);
-const labelOf = (name) => {
-  const p = presetByEntry(name);
-  return p ? p.label : name;
-};
-function extraProviders(b) {
-  const fb = (b.fallback || []).map(labelOf);
-  const br = (b.broad || []).map(labelOf);
-  return `${fb.length ? `<div class="set-text">备用服务：${esc(fb.join("、"))}</div>` : ""}${br.length ? `<div class="set-text">同时搜索：${esc(br.join("、"))}</div>` : ""}`;
-}
-function providerChecks(cls, picked, hint) {
-  const list = enabledPresets();
-  if (!list.length) return `<p class="fine" style="margin:0">暂无已开启的搜索服务</p>`;
-  return `<div class="prov-checks">${list
-    .map(
-      (p) =>
-        `<label class="prov-chk"><input type="checkbox" class="${cls}" value="${esc(p.entry)}" ${(picked || []).includes(p.entry) ? "checked" : ""} />${logoImg(p, "prov-logo")}<span>${esc(p.label)}</span></label>`
-    )
-    .join("")}</div>${hint ? `<p class="fine" style="margin:0">${hint}</p>` : ""}`;
-}
-export const checkedProviders = (cls, main) => [...document.querySelectorAll(`input.${cls}:checked`)].map((i) => i.value).filter((v) => v && v !== main);
-
-// 下拉当前选中的 {mcp, tool}（id = sx-tool 搜索 / sx-extract 抓正文；选「不用」→ 两个都是 ""）
-export function pickedTool(id) {
-  const sel = document.getElementById(id);
-  const o = sel && sel.selectedOptions && sel.selectedOptions[0];
-  return { mcp: (o && o.dataset.mcp) || "", tool: (o && o.dataset.tool) || "" };
-}
-
-// ───────── 预设的搜索服务（后端 GET /api/extensions/presets）─────────
-// 已经接上的预设就是 MCP 列表里的普通一行（换成各家 logo、多一个「密钥」按钮）；
-// 还没接的也列在 MCP 列表里，点「打开」就接上，免费的密钥可填可不填，要密钥的给官网链接。
-const presetList = () => (state.extPresets && state.extPresets.presets) || [];
-export const presetByEntry = (name) => presetList().find((p) => p.entry === name) || null;
-const presetsNotAdded = () => presetList().filter((p) => !p.entry);
-const logoImg = (p, cls = "ico ext-logo") => `<img class="${cls}" src="${esc(p.logo)}" alt="" loading="lazy" />`;
-const freeTag = (p) => (p.free ? `<span class="ntag ok">免费可用</span>` : `<span class="ntag warn">需要密钥</span>`);
-
-function presetRow(p) {
-  const editing = state.presetEdit === p.id;
-  return `
-    <div class="ext-row preset-row${editing ? " is-open" : ""}">
-      ${logoImg(p)}
-      <div class="ext-main">
-        <div class="set-name">${esc(p.label)}<span class="tag">预设</span>${freeTag(p)}</div>
-        <div class="set-text">${esc(p.free_note || "")}</div>
-        <div class="set-text ext-st"><span class="dot"></span>未开启 · 搜索服务</div>
-        ${editing ? presetKeyForm(p) : ""}
-      </div>
-      <div class="row-btns ext-btns">${editing ? "" : `<button class="btn small" data-act="preset-open" data-id="${esc(p.id)}">${p.free ? "开启" : "填写密钥并开启"}</button>`}</div>
-    </div>`;
-}
-
-// 填密钥的小表单：已接上的改密钥 / 没接上的打开时填（免费的可以不填）
-function presetKeyForm(p) {
-  const added = !!p.entry;
-  const ph = p.key_set ? "已填写，留空则不修改" : p.free ? "可留空，使用免费额度" : "输入密钥";
-  return `
-    <div class="preset-form login" data-id="${esc(p.id)}">
-      <label for="pk-key">API 密钥 ${p.free ? `<small class="lbl-hint">可选</small>` : ""}</label>
-      <input id="pk-key" type="password" autocomplete="new-password" spellcheck="false" placeholder="${esc(ph)}" />
-      <p class="fine preset-get"><a href="${esc(p.key_page_url)}" target="_blank" rel="noopener noreferrer">前往 ${esc(p.label)} 官网获取密钥 ↗</a></p>
-      <p class="err" id="pk-err" hidden></p>
-      <div class="actions">
-        <button type="button" class="btn primary small" data-act="preset-save" data-id="${esc(p.id)}">${added ? "保存" : "开启"}</button>
-        <button type="button" class="btn small" data-act="preset-cancel">取消</button>
-        ${added && p.free && p.key_set ? `<button type="button" class="btn small ghost" data-act="preset-clear-key" data-id="${esc(p.id)}">清除密钥</button>` : ""}
-      </div>
-    </div>`;
+  return `${searchSection()}${mcpBlock}${optDepsSection()}`;
 }
 
 function mcpRow(m) {
@@ -208,12 +61,11 @@ function mcpRow(m) {
   const hdrs = (m.header_names || []).length ? ` · 请求头 ${m.header_names.map(esc).join("、")}` : "";
   return `
     <div class="ext-row${p ? " preset-row" : ""}">
-      ${p ? logoImg(p) : ico("link")}
+      ${p ? presetLogo(p) : ico("link")}
       <div class="ext-main">
         <div class="set-name">${p ? esc(p.label) : esc(m.name)}${p ? `<span class="tag">预设</span>` : ""}${m.source === "config" ? `<span class="tag">来自配置</span>` : ""}${m.search_role === "search" ? `<span class="tag">搜索</span>` : m.search_role === "extract" ? `<span class="tag">网页读取</span>` : ""}${searchRoleTags(m.name)}</div>
         ${p ? `<div class="set-text">${p.key_set ? "已填写密钥" : esc(p.free_note || "")}</div>` : `<div class="set-text mono-link">${esc(m.url || "")}</div>`}
         <div class="set-text ext-st">${st} · ${esc(roles)}可用${p ? "" : hdrs}</div>
-        ${p && state.presetEdit === p.id ? presetKeyForm(p) : ""}
         ${
           (m.tool_names || []).length
             ? `<div class="ext-tools">${m.tool_names.slice(0, 12).map((t) => `<span class="ntag">${esc(t)}</span>`).join("")}${m.tool_names.length > 12 ? `<span class="ntag">共 ${m.tool_names.length} 个</span>` : ""}</div>`
@@ -223,7 +75,7 @@ function mcpRow(m) {
       <div class="row-btns ext-btns">
         <button class="btn small" data-act="mcp-toggle" data-name="${esc(m.name)}" data-on="${m.enabled ? "0" : "1"}">${m.enabled ? "关闭" : "开启"}</button>
         ${m.enabled ? `<button class="btn small" data-act="mcp-reload" data-name="${esc(m.name)}">重新连接</button>` : ""}
-        ${p && m.source !== "config" && state.presetEdit !== p.id ? `<button class="btn small" data-act="preset-open" data-id="${esc(p.id)}">密钥</button>` : ""}
+        ${p && m.source !== "config" ? `<button class="btn small" data-act="preset-key" data-id="${esc(p.id)}">密钥</button>` : ""}
         ${m.source === "config" ? "" : `<button class="btn small" data-act="ext-edit" data-kind="mcp" data-name="${esc(m.name)}">修改</button>`}
       </div>
     </div>`;
@@ -476,9 +328,11 @@ export async function loadExt() {
 }
 
 export async function actExt(a, el, reloadSettings) {
+  if (await actSearch(a, el, reloadSettings)) return true;
   switch (a) {
     case "ext-new":
     case "ext-edit": {
+      state.searchSheet = null;
       state.extEdit = { kind: el.dataset.kind, name: el.dataset.name || null, data: null };
       repaintSheet();
       if (el.dataset.kind === "skill" && el.dataset.name) {
@@ -495,6 +349,7 @@ export async function actExt(a, el, reloadSettings) {
       return true;
     }
     case "mcp-paste":
+      state.searchSheet = null;
       state.extEdit = { kind: "mcp-paste", name: null, data: null };
       repaintSheet();
       setTimeout(() => $("mp-text") && $("mp-text").focus(), 50);
@@ -544,6 +399,7 @@ export async function actExt(a, el, reloadSettings) {
       try {
         await api("POST", `/api/extensions/mcp/${encodeURIComponent(el.dataset.name)}/toggle`, { enabled: el.dataset.on === "1" });
         await loadExt();
+        if (state.settings && reloadSettings) await reloadSettings();
         repaintSheet();
         toast(el.dataset.on === "1" ? "已开启" : "已关闭");
       } catch (err) {
@@ -573,54 +429,9 @@ export async function actExt(a, el, reloadSettings) {
         await api("DELETE", `/api/extensions/${isMcp ? "mcp" : "skills"}/${encodeURIComponent(el.dataset.name)}`);
         state.extEdit = null;
         await loadExt();
+        if (isMcp && state.settings && reloadSettings) await reloadSettings();
         repaintSheet();
         toast("已删除");
-      } catch (err) {
-        toast(err.message, true);
-      }
-      return true;
-    }
-    case "search-edit":
-      state.searchEdit = true;
-      repaintSheet();
-      return true;
-    case "search-cancel":
-      state.searchEdit = false;
-      repaintSheet();
-      return true;
-    case "search-save": {
-      const { mcp, tool } = pickedTool("sx-tool");
-      const ex = pickedTool("sx-extract");
-      el.disabled = true;
-      try {
-        state.extSearch = await api("PUT", "/api/extensions/search", {
-          mcp,
-          tool,
-          extract_mcp: ex.mcp,
-          extract_tool: ex.tool,
-          fallback: checkedProviders("sx-fb", mcp),
-          broad: checkedProviders("sx-br", mcp),
-        });
-        state.searchEdit = false;
-        await loadExt();
-        if (state.settings && reloadSettings) await reloadSettings();
-        repaintSheet();
-        toast(`搜索服务已切换为 ${mcp}`);
-      } catch (err) {
-        el.disabled = false;
-        toast(err.message, true);
-      }
-      return true;
-    }
-    case "search-off": {
-      if (!confirm("确定关闭联网搜索？关闭后将停止更新资讯。")) return true;
-      try {
-        await api("DELETE", "/api/extensions/search");
-        state.searchEdit = false;
-        await loadExt();
-        if (state.settings && reloadSettings) await reloadSettings();
-        repaintSheet();
-        toast("已关闭联网搜索");
       } catch (err) {
         toast(err.message, true);
       }

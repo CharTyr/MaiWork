@@ -401,7 +401,13 @@ async def _fetch_page_text(
             return False, f"页面返回 {resp.status_code}", "", "", ""
         ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
         if ctype and not any(ctype.startswith(p) for p in _ALLOWED_PREFIXES):
-            return False, f"页面类型是 {ctype}，只支持网页/纯文本/JSON", "", "", ""
+            return (
+                False,
+                f"页面类型是 {ctype}（该链接可访问，是直链文件而非网页正文），只支持网页/纯文本/JSON{final_url_note(current)}",
+                "",
+                "",
+                "",
+            )
         raw = resp.content[: _MAX_BODY_BYTES + 1]
         if len(raw) > _MAX_BODY_BYTES:
             raw = raw[:_MAX_BODY_BYTES]
@@ -527,6 +533,35 @@ def opened_urls_from_rows(rows: Any) -> set[str]:
             if key:
                 opened.add(key)
     return opened
+
+
+def reachable_direct_file_urls_from_rows(rows: Any) -> set[str]:
+    """fetch_page 遇到 HTTP 200 的非文本直链（如 PDF/压缩包）时记下的可访问地址（规范化）。
+
+    只给任务引用核对用（`coordinator._opened_urls`）：工具本身仍返 ok=False，
+    资讯补打开（`news_recheck.opened_links` → `opened_urls_from_rows`）不认它，不会把 PDF 当读过正文。
+    """
+    from .coordinator import normalize_link_for_check
+
+    reachable: set[str] = set()
+    for row in rows or []:
+        try:
+            tool = str(row["tool"] or "")
+            raw_input = str(row["input"] or "")
+            output = str(row["output"] or "")
+        except (KeyError, TypeError, ValueError):
+            continue
+        if tool != "fetch_page" or "页面类型是 " not in output:
+            continue
+        urls = _urls_from_json_input(raw_input)
+        final = final_url_from_summary(output)
+        if final:
+            urls.append(final)
+        for one in urls:
+            key = normalize_link_for_check(one)
+            if key:
+                reachable.add(key)
+    return reachable
 
 
 def final_url_note(url: str) -> str:

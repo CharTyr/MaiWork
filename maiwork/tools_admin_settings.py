@@ -197,7 +197,7 @@ def register_settings_tools(
         return {k: args[k] for k in fields if k in args}
 
     # ------------------------------------------------------------------
-    # 一、MCP（extensions_web + svc.reload_mcp，和网页「设置 → 工具」同一套）
+    # 一、MCP（extensions_web + svc.reload_mcp，和网页「设置 → 工具与平台」同一套）
     # ------------------------------------------------------------------
 
     def _ext_ready() -> ToolResult | None:
@@ -385,7 +385,7 @@ def register_settings_tools(
             if await asyncio.to_thread(tools_builtin._host_is_forbidden, host, tools_builtin._default_resolver):
                 return _bad(
                     f"这个地址（{host or '空'}）指向内网或本机，或者解析不出来，不去连。"
-                    "要连内网里的 MCP，请管理员自己在网页「设置 → 工具」里加"
+                    "要连内网里的 MCP，请管理员自己在网页「设置 → 工具与平台」里加"
                 )
         try:
             timeout_s = max(1, min(60, int(args.get("timeout_s") or 20)))
@@ -1069,7 +1069,7 @@ def register_settings_tools(
     specs: list[tuple[dict, Callable[[ToolContext, dict], Awaitable[ToolResult]], float]] = [
         ({"name": "mcp_manage",
           "description": (
-              "管 MCP 扩展（和网页「设置 → 工具」同一套）：action=list 看列表（默认）；"
+              "管 MCP 扩展（和网页「设置 → 工具与平台」同一套）：action=list 看列表（默认）；"
               "add 新增（要确认）；update 改（改地址、给主模型用、放宽白名单要确认，收窄直接改）；"
               "toggle 开关；test 试连（给 name 测已存的带它存的请求头，只给 url 测新地址不带任何请求头）；"
               "reload 重连刷工具列表；delete 删（要确认，只能删网页加的）。" + _no_key),

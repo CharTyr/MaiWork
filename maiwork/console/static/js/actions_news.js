@@ -6,7 +6,7 @@ import { api, gview } from "./api.js";
 import { FB_KEY, myFb } from "./pages/news.js";
 import { refreshDetail } from "./detail.js";
 import { loadExt } from "./settings/ext.js";
-import { openSheet, repaintSheet } from "./sheet.js";
+import { repaintSheet } from "./sheet.js";
 import { renderView } from "./render.js";
 
 export async function actNews(a, el) {
@@ -53,38 +53,6 @@ export async function actNews(a, el) {
       } catch (err) {
         el.disabled = false;
         toast(err.message, true);
-      }
-      return true;
-    }
-    case "preset-open":
-      state.presetEdit = el.dataset.id;
-      repaintSheet();
-      setTimeout(() => $("pk-key") && $("pk-key").focus({ preventScroll: true }), 30);
-      return true;
-    case "preset-cancel":
-      state.presetEdit = null;
-      repaintSheet();
-      return true;
-    case "preset-save":
-    case "preset-clear-key": {
-      const id = el.dataset.id;
-      const clear = el.dataset.act === "preset-clear-key";
-      const key = clear ? "" : (($("pk-key") && $("pk-key").value) || "").trim();
-      const err = $("pk-err");
-      el.disabled = true;
-      try {
-        const body = clear ? { clear_key: true } : key ? { key } : {};
-        const r = await api("POST", `/api/extensions/presets/${encodeURIComponent(id)}`, body);
-        state.presetEdit = null;
-        await loadExt();
-        repaintSheet();
-        toast(clear ? "已改回免费" : r && r.bound ? `已开启，现在用 ${r.label || id} 搜索` : key ? "密钥已保存" : "已开启");
-      } catch (e2) {
-        el.disabled = false;
-        if (err) {
-          err.textContent = e2.message;
-          err.hidden = false;
-        } else toast(e2.message, true);
       }
       return true;
     }

@@ -145,6 +145,15 @@ class TestWorksWithoutDirFd:
         with pytest.raises(FileExistsError):
             write_new_file_verified(ws, "tool_spill/T-1", "spill-1.txt", b"again")
 
+    async def test_write_new_file_verified_creates_lazy_ephemeral_root(self, tmp_path, no_dir_fd):
+        env = _env(tmp_path / "ws")
+        env.workspace("seed")  # 确保 workspace_root 存在
+        async with env.ephemeral("skill-explore") as eph_ws:
+            assert not eph_ws.exists()
+            assert write_new_file_verified(eph_ws, "tool_spill/T-1", "spill-1.txt", "正文".encode()) is True
+            assert (eph_ws / "tool_spill" / "T-1" / "spill-1.txt").read_bytes() == "正文".encode()
+        assert not eph_ws.exists()
+
     async def test_secure_write_text(self, tmp_path, no_dir_fd):
         base = tmp_path.resolve() / "ws" / "g1" / "tool_spill" / "T-1"
         path = compaction.secure_write_text(base, "spill.txt", "完整正文")

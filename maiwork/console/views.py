@@ -1321,7 +1321,7 @@ def _search_health(svc: Any) -> dict[str, Any]:
     search = getattr(svc, "search", None)
     if search is None:
         return {"key": "search", "icon": "magnifier", "name": "搜索", "state": "warn",
-                "text": "还没选：去「设置 → 工具」选一个"}
+                "text": "还没选：去「设置 → 工具与平台」选一个"}
     try:
         ok, text = search.status()
     except Exception:

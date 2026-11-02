@@ -563,3 +563,76 @@ class TestArchiveScope:
             "write_file", {"path": "tool_spill/T-a/自己的.txt", "content": "备注"}, ctx
         )
         assert ok.ok, ok.error
+
+
+class TestEphemeralLazyWorkspaceArchive:
+    """线上复现（skill-explore）：ephemeral 进入时不建目录，长输出归档在跑命令前先发生。"""
+
+    @pytest.mark.parametrize("wire_env", [True, False])
+    async def test_ephemeral_spills_before_any_ws_tool_and_cleans_on_exit(
+        self, tools, env, settings, caplog, wire_env
+    ):
+        payload = _blob_text(9000)
+        _register_tool(tools, "fetch_page", _ok_handler(payload))
+        tid = "skill-explore.900000001.1793440895"
+
+        async with env.ephemeral("skill-explore") as eph_ws:
+            assert not eph_ws.exists(), "ephemeral 进场仍保持惰性不建目录"
+            models = _Replay(
+                [
+                    _Chat(tool_calls=[_tool_call("fetch_page", {}, "c1")]),
+                    _Chat(tool_calls=[_tool_call("submit_result", {"summary": "好"}, "c2")]),
+                ]
+            )
+            w = Workers(models, tools, get_settings=lambda: settings)
+            if wire_env:
+                w.set_env(env)
+            caplog.clear()
+            report = await w.run(
+                "探索做法",
+                group_id="g1",
+                tools=["fetch_page", "read_file"],
+                workspace=eph_ws,
+                task_id=tid,
+            )
+            assert report.ok, report.error
+            assert "工具输出归档写失败" not in caplog.text
+            assert "没能归档" not in caplog.text
+            rel = _rel_pointer(_tool_msg_text(models))
+            ctx = ToolContext(
+                group_id="g1", task_id=tid, actor="子 agent", role="worker", workspace=eph_ws
+            )
+            r = await tools.call("read_file", {"path": rel, "offset": 0, "limit": 5000}, ctx)
+            assert r.ok, r.error
+            assert _page_body(r.output) == payload[:5000]
+        assert not eph_ws.exists(), "退出 ephemeral 后归档与临时工作区一并清掉"
+
+    async def test_symlinked_ephemeral_workspace_root_never_writes_outside(
+        self, tools, env, settings, tmp_path
+    ):
+        outside = tmp_path / "outside-eph"
+        outside.mkdir()
+        payload = _blob_text(9000)
+        _register_tool(tools, "fetch_page", _ok_handler(payload))
+        async with env.ephemeral("skill-explore") as eph_ws:
+            eph_ws.parent.mkdir(parents=True, exist_ok=True)
+            eph_ws.symlink_to(outside, target_is_directory=True)
+            models = _Replay(
+                [
+                    _Chat(tool_calls=[_tool_call("fetch_page", {}, "c1")]),
+                    _Chat(tool_calls=[_tool_call("submit_result", {"summary": "好"}, "c2")]),
+                ]
+            )
+            w = Workers(models, tools, get_settings=lambda: settings)
+            w.set_env(env)
+            report = await w.run(
+                "探索做法",
+                group_id="g1",
+                tools=["fetch_page", "read_file"],
+                workspace=eph_ws,
+                task_id="skill-explore.g1.1",
+            )
+            assert report.ok, report.error
+            assert list(outside.rglob("*")) == [], "工作区本身被换成外链时绝不往外写归档"
+            assert _tool_msg_text(models) == payload
+

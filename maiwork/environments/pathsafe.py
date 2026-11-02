@@ -250,7 +250,15 @@ def replace_atomic(
 def create_new_verified(anchor: Path, parts: Iterable[str], name: str, data: bytes) -> bool:
     """`write_new_file_verified` 的无 dir_fd 版本：逐段建目录、独占新建、写完读回来逐字核对。"""
     check_part(name)
-    directory = ensure_dirs(anchor, list(parts), create=True)
+    cur = Path(anchor)
+    missing_root: list[str] = []
+    while not os.path.lexists(cur):
+        if not cur.name:
+            raise FileNotFoundError(str(anchor))
+        missing_root.append(cur.name)
+        cur = cur.parent
+    cur_anchor = cur.parent.resolve() / cur.name if cur.name else cur.resolve()
+    directory = ensure_dirs(cur_anchor, [*reversed(missing_root), *parts], create=True)
     target = directory / name
     fd = create_exclusive(target, 0o644)
     try:

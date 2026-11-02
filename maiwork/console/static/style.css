@@ -537,8 +537,8 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .set-row:last-child { border-bottom: 0; }
 .social-logo { width: 30px; height: 30px; object-fit: contain; border-radius: 6px; flex: none; }
 .social-row .row-btns { flex-wrap: wrap; justify-content: flex-end; }
-.social-settings .btn, .onb-social-list .btn { min-height: 44px; min-width: 44px; }
-.social-settings .warn-box { overflow-wrap: anywhere; }
+.social-settings .btn, .search-settings .btn, .onb-social-list .btn { min-height: 44px; min-width: 44px; }
+.social-settings .warn-box, .search-settings .warn-box { overflow-wrap: anywhere; }
 .onb-social-list { display: grid; gap: 8px; margin-top: 20px; }
 .onb-social-option { display: flex; align-items: center; gap: 12px; min-height: 56px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 16px; cursor: pointer; }
 .onb-social-option input { width: 20px; height: 20px; accent-color: var(--blue); flex: none; }
@@ -1192,7 +1192,7 @@ body.booting .app, body.booting .tabbar { visibility: hidden; }
 .agent-tool-sub { margin: 6px 0 0; }
 @media (max-width: 519px) { .agent-tool-row { grid-template-columns: minmax(0, 1fr); gap: 2px; } }
 /* 预设搜索服务：各家彩色 logo 放进统一的圆角小方块（和 .ico 同尺寸，带细描边免得白底 logo 糊进卡片） */
-.ext-row .ext-logo { width: 28px; height: 28px; border-radius: 8px; object-fit: cover; filter: none; box-shadow: 0 0 0 1px var(--line), 0 2px 6px rgba(0, 0, 0, 0.06); background: #fff; }
+.ext-row .ext-logo, .set-row .ext-logo { width: 28px; height: 28px; border-radius: 8px; object-fit: cover; filter: none; box-shadow: 0 0 0 1px var(--line), 0 2px 6px rgba(0, 0, 0, 0.06); background: #fff; }
 .preset-row .set-name .ntag { margin-left: 6px; }
 .preset-row .set-name .tag + .tag, .preset-row .set-name .tag { margin-left: 6px; }
 .preset-form.login { display: grid; gap: 6px; margin-top: 12px; padding: 14px; border-radius: 16px; border: 1px solid var(--line); background: var(--fill-2); max-width: 460px; }
@@ -1202,10 +1202,13 @@ body.booting .app, body.booting .tabbar { visibility: hidden; }
 .preset-get a { color: var(--blue); text-decoration: none; font-weight: 600; }
 .preset-get a:hover { text-decoration: underline; }
 .prov-checks { display: flex; flex-wrap: wrap; gap: 8px; }
-.prov-chk { display: inline-flex; align-items: center; gap: 7px; padding: 6px 12px 6px 7px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); font-size: 13px; font-weight: 600; cursor: pointer; transition: border-color 0.15s, background 0.15s; }
+.prov-chk { display: inline-flex; align-items: center; gap: 7px; padding: 6px 12px 6px 7px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); color: var(--ink); font-size: 13px; font-weight: 600; cursor: pointer; transition: border-color 0.15s, background 0.15s; }
 .prov-chk input { position: absolute; opacity: 0; pointer-events: none; }
-.prov-chk:has(input:checked) { border-color: var(--blue); background: var(--alt-bg); color: var(--blue); }
-.prov-chk:has(input:focus-visible) { outline: 2px solid var(--blue); outline-offset: 2px; }
+.prov-chk:has(input:checked), .prov-chk.is-on { border-color: var(--blue); background: var(--alt-bg); color: var(--blue); }
+.prov-chk:has(input:focus-visible), .prov-chk:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.fb-order-list { display: grid; gap: 8px; }
+.fb-order-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.fb-move-btns { display: inline-flex; gap: 6px; }
 .prov-logo { width: 20px; height: 20px; border-radius: 6px; object-fit: cover; box-shadow: 0 0 0 1px var(--line); background: #fff; }
 .ext-form { margin: 12px 0 18px; padding: 18px; border-radius: 20px; border: 1px solid var(--line); background: var(--fill-2); gap: 8px; }
 .ext-form-h { font-size: 17px; font-weight: 800; margin-bottom: 2px; }

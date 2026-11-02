@@ -195,14 +195,17 @@ function taskDetail(id) {
       (t.delivery || []).length
         ? `<div class="dt-sec"><div class="dt-label">成果</div>${t.delivery
             .map((x) => {
-              const icon = x.kind === "群文件" ? "package" : x.kind === "here.now" ? "link" : "filebox";
+              const icon = x.kind === "群文件" ? "package" : x.kind === "here.now" ? "link" : x.kind === "图片" ? "camera" : x.kind === "群内回复" ? "speech" : "filebox";
               const url = x.expired ? x.local_url : (x.url || x.local_url);
-              const title = url && safeAssetUrl(url) !== "#" ? `<a href="${safeAssetUrl(url)}" target="_blank" rel="noopener noreferrer">${esc(x.text)}</a>` : esc(x.text);
+              const hasUrl = url && safeAssetUrl(url) !== "#";
+              const body = hasUrl
+                ? `<div class="deliv-t"><a href="${safeAssetUrl(url)}" target="_blank" rel="noopener noreferrer">${esc(x.text)}</a></div>`
+                : foldText(`deliv:${t.id}:${x.id || x.key || ""}`, x.text);
               const canPreview = safeAssetUrl(x.local_url || (!x.expired && x.url)) !== "#";
               const btn = (x.expired ? `<span class="deliv-x">${x.local_url ? "外链已过期 · 已切本地副本" : "外链已过期"}</span>` : "") + (canPreview
                 ? `<button class="link-btn" data-act="preview" data-tid="${esc(t.id)}" data-url="${esc(x.url || "")}" data-local-url="${esc(x.local_url || "")}" data-expired="${x.expired ? "1" : ""}">页内预览</button>`
                 : "");
-              return `<div class="deliv">${ico(icon)}<div><div class="deliv-k">${esc(x.kind)}</div><div class="deliv-t">${title}</div><div class="deliv-s">${esc(x.state)}${btn ? ` ${btn}` : ""}</div></div></div>`;
+              return `<div class="deliv">${ico(icon)}<div><div class="deliv-k">${esc(x.kind)}</div>${body}<div class="deliv-s">${esc(x.state)}${btn ? ` ${btn}` : ""}</div></div></div>`;
             })
             .join("")}</div>`
         : ""

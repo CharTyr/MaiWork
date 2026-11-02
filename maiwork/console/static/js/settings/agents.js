@@ -140,9 +140,15 @@ function toolsBlock(p) {
     </div>`;
 }
 
+function resolveSkillsSelection(kind, boxes) {
+  const checked = boxes.filter((x) => x.checked).map((x) => x.value);
+  return (kind === "task" || isCustom({ kind })) && checked.length === boxes.length ? null : checked;
+}
+
 function profileForm(p) {
-  const selected = new Set(p.skills || []);
   const catalog = state.agentSkills || [];
+  const generalistOpen = (p.kind === "task" || isCustom(p)) && p.skills === null;
+  const selected = new Set(generalistOpen ? catalog.map((k) => k.name) : (p.skills || []));
   const names = [...new Set([...catalog.map((k) => k.name), ...selected])];
   const docs = (state.agentDocs || {})[p.kind];
   const main = p.kind === "main";
@@ -439,7 +445,7 @@ export async function actAgents(action, el) {
       if (body.backup && body.backup === body.model) return fail("备用模型不能与当前模型相同"), true;
       if ($("agent-escalate")) body.escalate = $("agent-escalate").value;
       if ($("agent-enabled")) body.enabled = $("agent-enabled").checked;
-      if ($("agent-skills")) body.skills = [...document.querySelectorAll("#agent-skills input:checked")].map((x) => x.value);
+      if ($("agent-skills")) body.skills = resolveSkillsSelection(kind, [...document.querySelectorAll("#agent-skills input[type=checkbox]")]);
       const docs = (state.agentDocs || {})[kind];
       const writes = [];
       for (const which of ["soul", "agents"]) {

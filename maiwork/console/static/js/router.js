@@ -251,6 +251,7 @@ export async function enterSettings(sub, tab) {
   if (!admin()) return;
   closeSheet();
   state.extEdit = null;
+  state.searchSheet = null;
   const valid = SET_SUBS && SET_SUBS.length ? SET_SUBS.map((x) => x[0]) : KNOWN_SET_SUBS;
   let nextSub = sub || state.setSub || "overview";
   let nextTab = tab || "";

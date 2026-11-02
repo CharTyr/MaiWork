@@ -16,12 +16,12 @@
 from __future__ import annotations
 
 import logging
-import re
 import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
 from .tools import Tool, ToolContext, ToolResult, Tools
+from .tools_railway import resolve_fetch_target
 
 logger = logging.getLogger("maiwork.tools_ssh")
 
@@ -31,7 +31,6 @@ _RUN_TIMEOUT_MAX = 1800
 _RUN_TIMEOUT_DEFAULT = 300
 _READ_MAX = 20000
 _FETCH_MAX_BYTES = 20 * 1024 * 1024
-_LOCAL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 def register_machine_tools(
@@ -147,16 +146,11 @@ def register_machine_tools(
         if box is None:
             return _no_box()
         remote = str(args.get("remote_path") or "").strip()
-        name = str(args.get("local_name") or "").strip() or Path(remote).name
-        if not _LOCAL_NAME_RE.match(name):
-            return ToolResult(ok=False, output="", error=f"local_name 不合法：{name!r}（字母数字 . _ -，不能带路径）")
-        if local_env is None or ctx.workspace is None:
-            return ToolResult(ok=False, output="", error="这次没带工作区，不能拷回文件")
-        rel = f"artifacts/{ctx.task_id}/{name}"
-        try:
-            target = local_env.resolve(ctx.workspace.name, rel)
-        except (PermissionError, ValueError) as e:
-            return ToolResult(ok=False, output="", error=f"不允许访问：{e}")
+        rel, target, err_res = resolve_fetch_target(
+            ctx, local_env, args.get("local_name"), remote
+        )
+        if err_res is not None or target is None:
+            return err_res or ToolResult(ok=False, output="", error="解析落点失败")
         try:
             Path(target).parent.mkdir(parents=True, exist_ok=True)
             await env.get(box, remote, target)
@@ -197,7 +191,7 @@ def register_machine_tools(
             "把专用机器工作目录下的一个文件拷回本机工作区 artifacts/<任务ID>/ 下。"
             "做好的成品最后一定要拷回来——只留在机器上是没法交付的（单文件 ≤20MB）。",
             {"remote_path": {"type": "string", "description": "机器工作目录下的相对路径"},
-             "local_name": {"type": "string", "description": "拷回后叫什么名字（可选）"}},
+             "local_name": {"type": "string", "description": "拷回本机工作区 artifacts/<任务ID>/ 下的相对路径（可选，如 index.html、说明.md、steps/1/research.md；不给就用远端文件名）"}},
             ["remote_path"], 240.0,
         ))
     for name, handler, desc, props, required, timeout in specs:

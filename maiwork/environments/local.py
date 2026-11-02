@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 from contextlib import contextmanager
+import errno
 import inspect
 import ipaddress
 import json
@@ -134,18 +135,34 @@ def write_new_file_verified(root: Any, rel_dir: str, name: str, data: bytes) -> 
     body = bytes(data or b"")
     if not name or name in (".", "..") or "/" in name or "\\" in name:
         raise PermissionError(f"文件名不安全：{name!r}")
+    raw_root = Path(root)
     if not _pathsafe.has_dir_fd():
         return _pathsafe.create_new_verified(
-            Path(root).resolve(), _pathsafe.split_rel(rel_dir), name, body
+            raw_root, _pathsafe.split_rel(rel_dir), name, body
         )
     parts = [p for p in str(rel_dir or "").split("/") if p not in ("", ".")]
     if any(p == ".." for p in parts):
         raise PermissionError(f"路径越界（不允许 ..）：{rel_dir!r}")
-    root_fd = os.open(Path(root).resolve(), LocalEnv._dir_flags())
+    cur = raw_root
+    missing_root: list[str] = []
+    while not os.path.lexists(cur):
+        if not cur.name:
+            raise FileNotFoundError(str(raw_root))
+        missing_root.append(cur.name)
+        cur = cur.parent
+    anchor = cur.parent.resolve() / cur.name if cur.name else cur.resolve()
+    try:
+        root_fd = os.open(anchor, LocalEnv._dir_flags())
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK, errno.ENOTDIR):
+            raise PermissionError(f"工作区根目录不是普通目录或为符号链接：{root}") from None
+        raise
     dir_fd = os.dup(root_fd)
     os.close(root_fd)
     try:
-        for part in parts:
+        for part in (*reversed(missing_root), *parts):
             child = LocalEnv._open_dir(dir_fd, part, create=True)
             os.close(dir_fd)
             dir_fd = child

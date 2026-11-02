@@ -372,10 +372,13 @@ class Specialists:
         except Exception:
             return False
 
+    _TASK_CORE_SKILLS: tuple[str, ...] = ("research-report", "general-task", "office-docs")
+
     def _resolve_allowed_skills(self, kind: str, profile: dict | None = None) -> tuple[str, ...] | None:
         """岗位 skill 白名单 ∩ 当前生效的 skill（动态开关已在 skills.list 内处理）。
 
         - task / 自定义专岗（c_xxx）且 profile.skills 为 None：保持旧行为（None = 通才）。
+        - task 若曾被存成旧子集或空列表：保底并入内置通用任务做法技能（仍受扩展页手动停用约束）。
         - 其余专岗（news/idea/goal，都是调研岗）：profile.skills 为 None / 类型坏 /
           读 skills 目录出错 → ()（这岗位目前不给 skill；fail-closed）。
         """
@@ -399,6 +402,10 @@ class Specialists:
                 return None if is_generalist else ()
         except Exception:
             return None if is_generalist else ()
+        if kind == "task":
+            for core in self._TASK_CORE_SKILLS:
+                if core not in wanted:
+                    wanted.append(core)
         if not wanted:
             return ()
         try:

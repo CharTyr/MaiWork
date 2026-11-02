@@ -463,6 +463,166 @@ class TestGates:
         assert not out.get("skill_id")
         assert _skill_rows(store, GID) == []
 
+    @pytest.mark.parametrize("bad_ref", ["`auto_post`", "auto_post.", "auto_post(text='x')"])
+    async def test_unregistered_tool_in_prose_variants_still_discards(
+        self, store, settings, env, tools, agents, bad_ref
+    ):
+        """行内反引号、英文句尾句点、函数调用写法的假工具名一样要拦。"""
+        bad_md = _VALID_MD.replace("read_file", bad_ref)
+        out = await self._go(store, settings, env, tools, agents, calls=[
+            ("fetch_page", 1, "页"), ("run_command", 1, "ok"),
+        ], data={"skill_markdown": bad_md, "source_url": "src",
+                 "smoke_test": "ok"})
+        assert not out.get("skill_id")
+        assert _skill_rows(store, GID) == []
+
+    async def test_chinese_period_fenced_code_and_paths_pass_gates(
+        self, store, settings, env, tools, agents
+    ):
+        """线上真实交回形态：中文句号 description + 代码块内 Python 函数名 + 文件名/模块属性/参数旗标不误杀。"""
+        cn_md = """---
+name: throughput-chain-sim
+description: 把产能口径拆成资源流图并跑离散时间仿真定位瓶颈节点。
+version: 0.1.0
+author: MaiWork
+---
+# 产线口径离散时间仿真
+
+## When to Use
+需要验证稳定日产口径、定位瓶颈节点时使用。
+
+## Prerequisites
+使用标准库或 `scipy.stats.chi2_contingency`；中间结果可放在 `artifacts/sim_out/table.json`。
+
+## Procedure
+1. 用 fetch_page 打开公开文档核对公式。
+2. 用 write_file 写入 `chain_sim.py`，脚本结构如下：
+```python
+def simulate_ticks(max_cap: int, init_buf: int) -> dict:
+    blocked_ticks = 0
+    return {"blocked_ticks": blocked_ticks}
+```
+3. 用 run_command 执行 `python3 chain_sim.py --max_ticks 1000` 验证输出。
+
+## Pitfalls
+不要凭口算代替逐 tick 缓冲上限检查。
+
+## Verification
+对照 `chain_sim.py` 输出的总量与理论稳态上限，误差应小于 1e-6。
+"""
+        out = await self._go(store, settings, env, tools, agents, calls=[
+            ("fetch_page", 1, "公开产线文档"), ("run_command", 1, "error=0.0000%"),
+        ], data={"skill_markdown": cn_md, "source_url": "src",
+                 "smoke_test": "python3 chain_sim.py --max_ticks 1000 -> 0.0000%"})
+        assert out["ran"] is True and out.get("skill_id"), f"不应被误杀：{out}"
+        saved = _skill_rows(store, GID)
+        assert len(saved) == 1 and saved[0]["name"] == "throughput-chain-sim"
+
+    async def test_explore_step_budget_at_least_20_and_prompt_guides_submission(
+        self, store, settings, env, tools, agents
+    ):
+        """线上 16/18 轮卡在 12 步耗尽：探索步数上限放宽到 ≥20，且提示词写清步数与代码块规矩。"""
+        seen_kwargs: list[dict] = []
+
+        class _StepRecordingWorkers(CaptureWorkers):
+            async def run(self, brief, **kw):
+                seen_kwargs.append(dict(kw))
+                return await super().run(brief, **kw)
+
+        workers = _StepRecordingWorkers(reports=[_report(data={
+            "skill_markdown": _VALID_MD, "source_url": "src", "smoke_test": "ok",
+        })])
+        workers.before_return = _seed_calls(store, GID, _explore_tid(GID, NOW), [
+            ("fetch_page", 1, "页"), ("run_command", 1, "ok"),
+        ])
+        models = ModelsQueue(replies=[_PICK])
+        out = await skill_explore.run(**_run_kwargs(
+            store, settings, env, tools, agents, workers, models=models))
+        assert out.get("skill_id")
+        assert int(seen_kwargs[0].get("max_steps") or 0) >= 20
+        brief = str(workers.calls[0].get("brief") or "")
+        assert "20" in brief and "submit_result" in brief
+        assert "```" in brief
+
+    async def test_real_workers_and_ephemeral_end_to_end_long_fetch_no_archive_warning(
+        self, store, settings, env, tools, agents, caplog
+    ):
+        """端到端接真 Workers + 真 LocalEnv.ephemeral：长网页归档不报错、中文句号 + 代码块顺利入库。"""
+        from types import SimpleNamespace
+        from CharTyr_MaiWork.maiwork.tools import Tools
+        from CharTyr_MaiWork.maiwork.tools_exec import register_exec_tools
+        from CharTyr_MaiWork.maiwork.workers import Workers as RealWorkers
+        from fakes import FakeHost
+
+        real_tools = Tools(store)
+        register_exec_tools(real_tools, env=env, host=FakeHost(), get_settings=lambda: settings)
+
+        async def _web_search(ctx, args):
+            return ToolResult(ok=True, output="1. example doc")
+
+        async def _fetch_page(ctx, args):
+            return ToolResult(ok=True, output="公开技术文档正文段落。" * 800)  # 8800 字 > 6000
+
+        async def _submit(ctx, args):
+            return ToolResult(
+                ok=True, output=str(args.get("summary") or ""),
+                data={"summary": str(args.get("summary") or ""), "data": args.get("data"), "evidence": []},
+            )
+
+        for tname, fn in (("web_search", _web_search), ("fetch_page", _fetch_page), ("submit_result", _submit)):
+            if real_tools.get(tname, "worker") is not None:
+                real_tools.unregister(tname)
+            real_tools.register(Tool(
+                name=tname, description=tname,
+                parameters={"type": "object", "properties": {}},
+                roles=frozenset({"worker"}), handler=fn,
+            ))
+        if real_tools.get("read_image", "worker") is None:
+            _add_worker_tool(real_tools, "read_image")
+
+        cn_md = (
+            "---\nname: csv-quick-preview\ndescription: 快速预览 CSV 表头与前几行结构。\n"
+            "version: 0.1.0\nauthor: MaiWork\n---\n# CSV 快速预览\n\n"
+            "## When to Use\n处理大型 CSV 前先看表头。\n\n"
+            "## Prerequisites\n文件已在工作区内。\n\n"
+            "## Procedure\n1. 用 fetch_page 核对标准库 csv 用法。\n"
+            "2. 用 write_file 写 `preview_csv.py`：\n```python\ndef read_head_rows(fp):\n    return fp\n```\n\n"
+            "## Pitfalls\n不要整份读入超大文件。\n\n"
+            "## Verification\n确认打印出全部列名。\n"
+        )
+
+        def _tc(cid, name, args):
+            return {"id": cid, "type": "function", "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+
+        replies = [
+            SimpleNamespace(text=_PICK, tool_calls=[], model="fake", prompt_tokens=10, completion_tokens=5),
+            SimpleNamespace(text="", tool_calls=[_tc("c1", "fetch_page", {})], model="fake", prompt_tokens=10, completion_tokens=5),
+            SimpleNamespace(text="", tool_calls=[_tc("c2", "write_file", {"path": "preview_csv.py", "content": "print('ok')\n"})], model="fake", prompt_tokens=10, completion_tokens=5),
+            SimpleNamespace(text="", tool_calls=[_tc("c3", "submit_result", {
+                "summary": "验证通过",
+                "data": {"skill_markdown": cn_md, "source_url": "https://example.com/doc", "smoke_test": "write_file preview_csv.py ok"},
+            })], model="fake", prompt_tokens=10, completion_tokens=5),
+        ]
+
+        class _BothModels:
+            async def chat(self, *a, **kw):
+                return replies.pop(0)
+
+        env.workspace("seed")  # 确保 workspace_root 已建好（和线上 /home/maiwork/workspaces 一致）
+        real_workers = RealWorkers(_BothModels(), real_tools, get_settings=lambda: settings)
+        real_workers.set_env(env)
+        caplog.clear()
+        out = await skill_explore.run(
+            store=store, models=_BothModels(), workers=real_workers, env=env,
+            agents=agents, gid=GID, now=NOW, profiles=FakeProfiles(),
+            tools=real_tools, get_known_secrets=lambda: [], search=_Search(),
+        )
+        assert "工具输出归档写失败" not in caplog.text
+        assert "没能归档" not in caplog.text
+        assert out["ran"] is True and out.get("skill_id"), f"端到端探索应入库：{out}"
+        ws_root = Path(settings.environments.workspace_root)
+        assert list(ws_root.glob("skill-explore-*")) == [], "临时工作区退出后已清理"
+
     async def test_suspicious_content_discards(
         self, store, settings, env, tools, agents
     ):

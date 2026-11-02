@@ -36,6 +36,7 @@ EXPLORE_MIN_GAP_S = 24 * 3600       # 距上次「成功写库」不到一天 �
 EXPLORE_ATTEMPT_GAP_S = 4 * 3600    # 距上次「尝试（失败 / 跳过 / 门槛不过）」不到 4h → 跳过
 _EXPLORE_WINDOW_S = 14 * 86400      # 任务信号回看 14 天
 _EXPLORE_MAX_S = 180                # 沙箱探索单次限时（秒）
+_EXPLORE_MAX_STEPS = 20             # 沙箱探索单轮步数上限（够外搜 + 打开文档 + 试跑 + 修一次报错 + 交回）
 _TASK_SCAN_MAX = 40                 # 回看任务最多扫这么多条
 _SIGNAL_MAX = 20                    # 给主模型的任务信号行数上限
 _TOPICS_MAX = 8                     # 给主模型的话题条数上限
@@ -51,8 +52,13 @@ _EXPLORE_TOOLS = [
 _SMOKE_TOOLS = frozenset({"run_command", "read_image", "write_file"})
 _SMOKE_FAIL_MARKERS = ("Traceback", "Command failed")
 _SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-# snake_case（≥2 段、总长 ≥4）才可能是工具名；数据字段 / 变量名走白名单放行
-_TOOL_LIKE_RE = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+){1,4}\b")
+# 围栏代码块（``` / ~~~）装的是脚本代码，里面的 Python / Shell 函数与变量名不算工具引用
+_FENCED_CODE_RE = re.compile(r"(?ms)^[ \t]*(?:```|~~~).*?^[ \t]*(?:```|~~~)[ \t]*$")
+# 独立 snake_case（≥2 段、总长 ≥4）才可能是工具名；排除路径片段（/foo_bar/）、文件名（foo_bar.py）、
+# 模块属性（pkg.foo_bar）、命令行旗标（--foo_bar）；数据字段 / 变量名走白名单放行
+_TOOL_LIKE_RE = re.compile(
+    r"(?<![./\-])\b[a-z][a-z0-9]*(?:_[a-z0-9]+){1,4}\b(?!(?:\.[A-Za-z0-9_]|/))"
+)
 _NON_TOOL_WORDS = frozenset({
     "api_key", "access_token", "refresh_token", "secret_key", "session_key",
     "file_name", "file_path", "dir_path", "base_url", "image_url",
@@ -287,7 +293,9 @@ def _parse_pick(raw: Any) -> dict | None:
 def _explore_brief(pick: dict) -> str:
     queries = "、".join(pick["search_queries"]) or "（自拟）"
     return (
-        "你在一个本机隔离沙箱里探索一个成熟做法，目标是把它写成一份可复用的 skill。\n\n"
+        "你在一个本机隔离沙箱里探索一个成熟做法，目标是把它写成一份可复用的 skill。\n"
+        f"本轮硬预算：最多 {_EXPLORE_MAX_STEPS} 步、{_EXPLORE_MAX_S} 秒；一旦最小真机试跑通过，"
+        "立刻调用 submit_result 交回，不要反复扩写大脚本耗尽步数。\n\n"
         f"探索方向：{pick['topic']}\n"
         f"参考外搜关键词：{queries}\n"
         f"最小真机试跑目标：{pick['smoke_goal']}\n\n"
@@ -295,20 +303,21 @@ def _explore_brief(pick: dict) -> str:
         "1. 用 web_search 找这个做法的公开资料（skills.sh、GitHub 上的 SKILL.md、"
         "或官方文档），并用 fetch_page 真打开至少一份，照着它写——不许凭记忆编。\n"
         "2. 在沙箱里做一次最小真机试跑，验证做法真能跑通（比如用 run_command 跑一条"
-        "命令 / 小脚本，或用 write_file + read_image 实测产出）；把验证过程记下来。\n"
+        "命令 / 小脚本，或用 write_file + read_image 实测产出）；通过后马上交回。\n"
         "3. 用 submit_result 交回，data 必须长这样：\n"
         '   {"skill_markdown": "<完整 Markdown>", "source_url": "<你真打开过的资料地址>",'
         ' "smoke_test": "<你实际跑的验证命令/步骤 + 结果一句话>"}\n\n'
         "skill_markdown 格式（≤4000 字，front matter 与 5 个章节一字不差、顺序一致）：\n"
         "---\n"
         f"name: {pick['skill_name']}\n"
-        "description: <一句话能力描述，句号结尾，≤60 字符>\n"
+        "description: <一句话能力描述，句号结尾（. 或 。），≤60 字符>\n"
         "version: 0.1.0\n"
         "author: MaiWork\n"
         "---\n"
         "# <标题>\n"
         "## When to Use\n## Prerequisites\n## Procedure\n## Pitfalls\n## Verification\n\n"
-        "Procedure 用编号步骤；引用的工具名必须是真实存在的工具。"
+        "Procedure 用编号步骤；正文里引用的工具名必须是真实存在的已注册工具，"
+        "Python / Shell 脚本自己的函数名与变量名一律放进 ``` 围栏代码块里。"
         "只写公开资料里看到 + 沙箱里验证过的做法；不要写具体群友名字、具体网址、任何密钥。"
     )
 
@@ -364,13 +373,14 @@ def _registered_names(tools: Any) -> set[str]:
 
 def _gate_structure(body: str, tools: Any) -> dict | None:
     """门槛 3：5 节标准结构 + ≤4000 字（_validate 内含 _suspicious），
-    且正文出现的 snake_case 工具名全部已注册。"""
+    且围栏代码块外的正文出现的独立 snake_case 工具名全部已注册。"""
     front = SkillSummary._validate(body)  # noqa: SLF001  （同包复用同一份校验口径）
     if not front:
         return None
     registered = _registered_names(tools)
+    prose = _FENCED_CODE_RE.sub("\n", body)
     bad = sorted({
-        n for n in _TOOL_LIKE_RE.findall(body)
+        n for n in _TOOL_LIKE_RE.findall(prose)
         if len(n) >= 4 and n not in registered and n not in _NON_TOOL_WORDS
     })
     if bad:
@@ -486,7 +496,7 @@ async def run(
                     _explore_brief(pick),
                     group_id=gid, tools=list(_EXPLORE_TOOLS),
                     task_id=explore_tid, workspace=ws,
-                    actor="子 agent（闲时探索）", max_steps=12,
+                    actor="子 agent（闲时探索）", max_steps=_EXPLORE_MAX_STEPS,
                     deadline_ts=now + _EXPLORE_MAX_S,
                 )
     except Exception:

@@ -690,6 +690,8 @@ class MaiWorkApp:
         # 执行方式自动判定：fixed（固定用户隔离）/ dynamic（自动分配用户隔离）/ stopped（受限）
         self._detect_local_capability()
         self.env = self._make_env()
+        if self.workers is not None:
+            self.workers.set_env(self.env)
         try:
             register_exec_tools(
                 self.tools, env=self.env, host=self.host,
@@ -3600,8 +3602,9 @@ class MaiWorkApp:
                 except Exception:
                     logger.exception("waiting_input → shelved 出错（任务 %s）", tid)
             elif age >= 6 * 3600 and self.outbox is not None:
-                question = str(row["question"] or "")[:60]
-                title = str(row["title"] or "")[:20]
+                from .coordinator import cut_at_punctuation
+                question = cut_at_punctuation(str(row["question"] or ""), 80)
+                title = cut_at_punctuation(str(row["title"] or ""), 20)
                 hint = ANSWER_HINT
                 if row["session_id"] and self.get_settings().session.enabled:
                     from .session_runner import SESSION_ANSWER_HINT

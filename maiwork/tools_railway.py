@@ -46,7 +46,123 @@ _VM_FETCH_MAX_BYTES = 20 * 1024 * 1024  # vm_fetch_file 单文件上限 20MB
 _EXPIRE_WARN_S = 600          # 剩 <10 分钟，就在每个工具结果后附「快到期」提醒
 _DEFAULT_REMOTE_ROOT = "/app"  # box 没带 remote_root 时的兜底（老调用 / 假 box）
 _REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-_LOCAL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")  # 拷回本机用的文件名（不含路径符）
+_WIN_RESERVED_STEMS = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+})
+_FORBIDDEN_SEG_CHARS = frozenset(':*?"<>|\\/\x00')
+
+
+def _norm_write_scope(raw_scope: Any) -> list[str]:
+    if not raw_scope or isinstance(raw_scope, (str, bytes)):
+        return []
+    out: list[str] = []
+    for item in raw_scope:
+        s = str(item or "").strip().replace("\\", "/").strip("/")
+        if not s:
+            continue
+        parts = [p for p in s.split("/") if p not in ("", ".")]
+        if parts:
+            out.append("/".join(parts))
+    return out
+
+
+def clean_fetch_subpath(raw_name: Any, remote_path: Any, task_id: Any) -> tuple[str, str]:
+    """把 local_name 规范成 artifacts/<task_id>/ 下的安全相对子路径；失败返回 ('', 中文原因)。
+
+    允许安全子目录（如 steps/1/research.md、images/out.png）、中文文件名，并容忍冗余的
+    `artifacts/<task_id>/` 前缀；严拒绝对路径、反斜杠、`..`、隐藏文件、input/ 覆盖和
+    Windows 保留设备名。
+    """
+    task_s = str(task_id or "").strip()
+    if not task_s:
+        return "", "缺少任务编号，不能拷回文件"
+    explicit = str(raw_name or "").strip()
+    raw = explicit or Path(str(remote_path or "").replace("\\", "/")).name.strip()
+    if not raw:
+        return "", "local_name 不能为空"
+    if "\\" in raw or raw.startswith("/") or (len(raw) >= 2 and raw[1] == ":"):
+        return "", f"local_name 不合法：{raw!r}（请给任务目录下的相对路径，不能用绝对路径或反斜杠）"
+    while raw.startswith("./"):
+        raw = raw[2:].strip()
+    task_prefix = f"artifacts/{task_s}/"
+    if raw.startswith(task_prefix):
+        raw = raw[len(task_prefix):]
+    elif raw in ("artifacts", f"artifacts/{task_s}"):
+        return "", f"local_name 需要写到具体文件名：{explicit or raw!r}"
+    elif raw.startswith("artifacts/"):
+        return "", f"local_name 不合法：{explicit or raw!r}（不能写进别的任务目录）"
+    parts = raw.split("/")
+    if not parts or len(parts) > 6 or len(raw) > 180 or any(p in ("", ".", "..") for p in parts):
+        return "", f"local_name 不合法：{explicit or raw!r}（不允许空段、.. 或超过 6 层子目录）"
+    if parts[0].lower() == "input":
+        return "", "不能覆盖原始输入目录 input/ 下的文件"
+    for seg in parts:
+        if len(seg) > 80 or seg != seg.strip() or seg.startswith(".") or seg.endswith("."):
+            return "", f"local_name 不合法：{explicit or raw!r}（文件名不能以点开头或结尾，单段 ≤80 字）"
+        if any(ord(ch) < 32 or ord(ch) == 127 or ch in _FORBIDDEN_SEG_CHARS for ch in seg):
+            return "", f"local_name 不合法：{explicit or raw!r}（含不允许的特殊字符）"
+        if seg.split(".", 1)[0].upper() in _WIN_RESERVED_STEMS:
+            return "", f"local_name 不合法：{explicit or raw!r}（不能使用系统保留名）"
+    return "/".join(parts), ""
+
+
+def check_fetch_write_scope(ctx: ToolContext, rel: str) -> str:
+    """对齐 write_file 的步骤写范围检查（返回 '' = 允许写）。"""
+    scope = _norm_write_scope(getattr(ctx, "write_scope", None))
+    if not scope:
+        return ""
+    parts = [p for p in str(rel or "").split("/") if p not in ("", ".")]
+    if not parts or parts[0].lower() != "artifacts" or len(parts) < 2:
+        return ""
+    allowed = [s.split("/") for s in scope]
+    if not any(parts[: len(a)] == a for a in allowed):
+        dirs = "、".join(f"{s}/" for s in scope)
+        return f"这一步只能写 {dirs}（中间步骤各写各的文件夹，不能写交付成品的位置）"
+    if len(parts) >= 4 and parts[2] == "steps":
+        own = "/".join(parts[:4])
+        if not any("/".join(a) == own or "/".join(a).startswith(own + "/") for a in allowed):
+            return f"artifacts/{parts[1]}/steps/{parts[3]}/ 是别的步骤的文件夹，不能写（各步骤各写各的）"
+    return ""
+
+
+def resolve_fetch_target(
+    ctx: ToolContext, local_env: Any, raw_name: Any, remote_path: Any
+) -> tuple[str, Path | None, ToolResult | None]:
+    """统一解析 vm_fetch_file / machine_fetch_file 的本机落点并做越界、符号链接、写范围检查。"""
+    if local_env is None or ctx.workspace is None:
+        return "", None, ToolResult(ok=False, output="", error="这次没带工作区，不能拷回文件")
+    task_s = str(ctx.task_id or "").strip()
+    sub, err = clean_fetch_subpath(raw_name, remote_path, task_s)
+    if err:
+        return "", None, ToolResult(ok=False, output="", error=err)
+    scope = _norm_write_scope(getattr(ctx, "write_scope", None))
+    if (
+        not str(raw_name or "").strip()
+        and len(scope) == 1
+        and scope[0].startswith(f"artifacts/{task_s}/")
+        and "/" not in sub
+    ):
+        rel = f"{scope[0]}/{sub}"
+    else:
+        rel = f"artifacts/{task_s}/{sub}"
+    denied = check_fetch_write_scope(ctx, rel)
+    if denied:
+        return "", None, ToolResult(ok=False, output="", error=denied)
+    ws_root = ctx.workspace.resolve()
+    probe = ws_root
+    for seg in rel.split("/"):
+        probe = probe / seg
+        if probe.is_symlink():
+            return "", None, ToolResult(ok=False, output="", error="路径越界（不允许通过符号链接拷回文件）")
+    try:
+        target = Path(local_env.resolve(ctx.workspace.name, rel))
+    except (PermissionError, ValueError) as e:
+        return "", None, ToolResult(ok=False, output="", error=f"不允许访问：{e}")
+    if target.is_symlink():
+        return "", None, ToolResult(ok=False, output="", error="路径越界（目标不能是符号链接）")
+    return rel, target, None
 
 
 def _remote_root(box: Any) -> str:
@@ -301,21 +417,11 @@ def register_vm_tools(
         root = _remote_root(box)
         if not remote.startswith(f"{root}/"):
             return ToolResult(ok=False, output="", error=f"只能从 VM 的 {root}/ 下拷回文件")
-        # 落点文件名：白名单（不含路径符），拒 .. / 子目录
-        name = str(args.get("local_name") or "").strip() or Path(remote).name
-        if not _LOCAL_NAME_RE.match(name):
-            return ToolResult(
-                ok=False, output="",
-                error=f"local_name 不合法：{name!r}（只能用字母、数字、点、下划线、横线，字母或数字开头，1~64 个字符；不能带路径）",
-            )
-        if local_env is None or ctx.workspace is None:
-            return ToolResult(ok=False, output="", error="这次没带工作区，不能拷回文件")
-        ws_name = ctx.workspace.name
-        rel = f"artifacts/{ctx.task_id}/{name}"
-        try:
-            target = local_env.resolve(ws_name, rel)  # 越界（..、符号链接）在这里就拒
-        except (PermissionError, ValueError) as e:
-            return ToolResult(ok=False, output="", error=f"不允许访问：{e}")
+        rel, target, err_res = resolve_fetch_target(
+            ctx, local_env, args.get("local_name"), remote
+        )
+        if err_res is not None or target is None:
+            return err_res or ToolResult(ok=False, output="", error="解析落点失败")
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             await env.get(box, remote, target)
@@ -425,7 +531,13 @@ def register_vm_tools(
                     "type": "object",
                     "properties": {
                         "remote_path": {"type": "string", "description": "VM 上的绝对路径，必须在这个任务的工作目录下"},
-                        "local_name": {"type": "string", "description": "拷回本机工作区 artifacts/<任务ID>/ 下叫什么名字（可选）"},
+                        "local_name": {
+                            "type": "string",
+                            "description": (
+                                "拷回本机工作区 artifacts/<任务ID>/ 下的相对路径（可选，如 index.html、"
+                                "说明.md、steps/1/research.md、images/out.png；不给就用远端文件名）"
+                            ),
+                        },
                     },
                     "required": ["remote_path"],
                 },

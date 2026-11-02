@@ -1342,7 +1342,7 @@ class Personal:
         if callable(available_probe):
             if not available_probe():
                 _, text = self._search.status()
-                raise SearchUnavailable(text or "还没指定联网搜索：去 设置 → 工具 里选一个 MCP 用作联网搜索")
+                raise SearchUnavailable(text or "还没指定联网搜索：去 设置 → 工具与平台 里选一个 MCP 用作联网搜索")
             return
         probe = getattr(self._search, "search", None)
         if callable(probe):

@@ -438,6 +438,25 @@ async def test_conventional_markdown_blank_lines_are_valid(svc):
 
 
 @pytest.mark.asyncio
+async def test_chinese_period_in_description_is_valid_while_unpunctuated_rejected(svc):
+    task(svc)
+    svc.workers.output = BODY.replace(
+        "description: Monitor website changes.",
+        "description: 核对公开页面更新并对比上次结果。",
+    )
+    sid = await learn(svc)
+    assert sid is not None
+    assert svc.agents.skill_get(G1, sid)["description"] == "核对公开页面更新并对比上次结果。"
+
+    task(svc, tid="T2")
+    svc.workers.output = BODY.replace(
+        "description: Monitor website changes.",
+        "description: 核对公开页面更新但忘写句号",
+    )
+    assert await learn(svc, tid="T2") is None
+
+
+@pytest.mark.asyncio
 async def test_credentials_are_redacted_before_record_truncation(svc):
     task(svc)
     svc.store.read().execute("UPDATE tool_calls SET output=?", ("x" * 1990 + "private-test-token",))

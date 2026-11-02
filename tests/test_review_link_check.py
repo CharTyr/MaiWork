@@ -9,9 +9,10 @@
    → 不加这段，行为不变。
 3. 留痕：验收意见里带「引用核对：N 条链接，M 条没打开过」，结构化结果存
    kv["task.link_check.<任务ID>"]。
-4. 调研类子任务（计划里 type=research，缺省按 brief 关键词兜底）：子 agent 的
-   system 提示带报告框架（一句话结论 / 大家都同意的 / 有分歧的 / 吐槽最多的 /
-   新冒头的 / 没人提的；每条带链接并标「多源」「单源」）。非调研任务不加。
+4. 调研类子任务（计划里 type=research，缺省按 brief 关键词兜底）：网页 / 文件交付或中间调研步的
+   子 agent system 提示带报告框架（一句话结论 / 大家都同意的 / 有分歧的 / 吐槽最多的 /
+   新冒头的 / 没人提的；每条带链接并标「多源」「单源」）；群聊直出文字（deliver_kind=text 最终步）
+   走群聊查证口径（开原文核实、先给结论附链接、不套报告六段模板）。非调研任务不加。
 """
 
 from __future__ import annotations
@@ -214,8 +215,13 @@ async def test_plan_build_job_is_not_research(mem_store, settings, env, tools, t
 
 async def test_research_job_worker_gets_report_framework(mem_store, settings, env, tools, tasks, goals):
     tid = _create_task(tasks)
-    models = ModelsQueue(replies=[_research_plan(), _review(pass_=True, artifact="", review="还行")])
+    plan_view = _research_plan(
+        deliver_kind="view",
+        jobs=[{"brief": "调研一下大家怎么看这个方案", "type": "research", "tools": ["fetch_page", "write_file"]}],
+    )
     workers = FakeWorkers(reports=[WorkerReport(ok=True, summary="调研完了", evidence=[])])
+    workers.before_return = _write_artifact_hook(env, tasks, tid, {"index.html": "<html>ok</html>"})
+    models = ModelsQueue(replies=[plan_view, _review(pass_=True, artifact="index.html", review="还行")])
     coord = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
                    tasks=tasks, goals=goals, models=models, workers=workers)
     await coord.run_task(tid)

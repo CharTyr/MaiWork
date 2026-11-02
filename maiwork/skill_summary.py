@@ -254,7 +254,7 @@ class SkillSummary:
         if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", front.get("name", "")) or len(front["name"]) > 64:
             return None
         desc = front.get("description", "")
-        if not desc or len(desc) > 60 or not desc.endswith("."):
+        if not desc or len(desc) > 60 or not desc.endswith((".", "。")):
             return None
         if front.get("author") != "MaiWork" or not re.fullmatch(r"\d+\.\d+\.\d+", front.get("version", "")):
             return None

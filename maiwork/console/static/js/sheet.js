@@ -9,6 +9,7 @@ import { groupPicker } from "./settings/index.js";
 import { draft, modelsFormSheet } from "./settings/models.js";
 import { jevFormSheet } from "./settings/jev.js";
 import { extFormSheet } from "./settings/ext.js";
+import { searchFormSheet } from "./settings/search.js";
 import { agentsFormSheet } from "./settings/agents.js";
 import { chatSide } from "./chat.js";
 import { renderRail, renderSide, renderView } from "./render.js";
@@ -96,6 +97,7 @@ function hasSettingsForm() {
     state.jevPick ||
     state.jevEdit ||
     state.extEdit ||
+    state.searchSheet ||
     state.agentNew ||
     state.agentEdit ||
     state.agentFishEdit
@@ -107,6 +109,7 @@ function clearSettingsForm() {
   state.jevPick = false;
   state.jevEdit = null;
   state.extEdit = null;
+  state.searchSheet = null;
   state.agentNew = false;
   state.agentEdit = null;
   state.agentFishEdit = null;
@@ -116,6 +119,7 @@ function clearSettingsForm() {
 function settingsFormSheet() {
   if (state.mdlEdit) return modelsFormSheet();
   if (state.jevEdit || state.jevPick) return jevFormSheet();
+  if (state.searchSheet) return searchFormSheet();
   if (state.extEdit) return extFormSheet();
   if (state.agentNew || state.agentEdit || state.agentFishEdit) return agentsFormSheet();
   return "";

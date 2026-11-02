@@ -144,7 +144,7 @@ def save_binding(
     names = {e.name for e in extensions_web.merged_entries(settings, store)}
     for name in (mcp, extract_mcp):
         if name and name not in names:
-            raise ValueError(f"没有这个扩展「{name}」——先去 设置 → 工具 里添加")
+            raise ValueError(f"没有这个扩展「{name}」——先去 设置 → 工具与平台 里添加")
     if tool_spec_of(mcp, tool) is None:
         raise ValueError(f"扩展 {mcp} 没有这个工具「{tool}」——先 reload 一下扩展拿最新工具清单")
     if extract_tool:
@@ -161,7 +161,7 @@ def save_binding(
     for label, lst in (("递补搜索", fallback), ("撒网搜索", broad)):
         for name in lst:
             if name not in names:
-                raise ValueError(f"{label}名单里的「{name}」不是已有的扩展——先去 设置 → 工具 里添加")
+                raise ValueError(f"{label}名单里的「{name}」不是已有的扩展——先去 设置 → 工具与平台 里添加")
             if name == mcp:
                 raise ValueError(f"{label}名单不用写主搜索家自己（{name}）")
             if search_presets.preset_of_url(url_of.get(name, "")) is None:
@@ -253,7 +253,7 @@ def status_of(
     """
     binding = get_binding(store)
     if binding is None:
-        return False, "还没指定联网搜索：去 设置 → 工具 里选一个 MCP 用作联网搜索"
+        return False, "还没指定联网搜索：去 设置 → 工具与平台 里选一个 MCP 用作联网搜索"
     usable, problem, reason = tool_state(
         store, settings, runtime_of, binding["mcp"], binding["tool"], role="搜索"
     )
@@ -284,18 +284,18 @@ def tool_state(
     """
     entry = _entry_of(settings, store, mcp)
     if entry is None:
-        return False, f"{role}绑定的扩展「{mcp}」不在了：去 设置 → 工具 重新选一个", "扩展不在了"
+        return False, f"{role}绑定的扩展「{mcp}」不在了：去 设置 → 工具与平台 重新选一个", "扩展不在了"
     if not entry.enabled:
-        return False, f"{role}绑定的扩展「{mcp}」没启用：去 设置 → 工具 打开它", "扩展没启用"
+        return False, f"{role}绑定的扩展「{mcp}」没启用：去 设置 → 工具与平台 打开它", "扩展没启用"
     runtime = runtime_of(mcp)
     client = getattr(runtime, "client", None) if runtime is not None else None
     if client is None:
-        return False, f"{role}绑定的扩展「{mcp}」还没连上：去 设置 → 工具 里 reload 一下", "还没连上"
+        return False, f"{role}绑定的扩展「{mcp}」还没连上：去 设置 → 工具与平台 里 reload 一下", "还没连上"
     if getattr(runtime, "ok", None) is False:
         err = str(getattr(runtime, "error", "") or "").strip() or "连不上"
         return (
             False,
-            f"{role}绑定的扩展「{mcp}」连不上（{err}）：去 设置 → 工具 里 reload 一下",
+            f"{role}绑定的扩展「{mcp}」连不上（{err}）：去 设置 → 工具与平台 里 reload 一下",
             err,
         )
     tools_remote = runtime.tools_remote() if hasattr(runtime, "tools_remote") else {}
@@ -304,7 +304,7 @@ def tool_state(
         # 老假对象（没有 ok）保持老口径，不许把绑定填错说成别的。
         return (
             False,
-            f"扩展「{mcp}」没有这个工具「{tool}」：去 设置 → 工具 重新绑定",
+            f"扩展「{mcp}」没有这个工具「{tool}」：去 设置 → 工具与平台 重新绑定",
             f"没有工具「{tool}」",
         )
     return True, "", ""
@@ -362,13 +362,43 @@ def candidates_of(settings: Any, store: Any, runtime_of: Callable[[str], Any]) -
     return out
 
 
-def search_view(store: Any, settings: Any, runtime_of: Callable[[str], Any]) -> dict[str, Any]:
-    """GET /api/extensions/search 的响应：{binding, status: {ok, text}, candidates}。"""
+def _reader_summary(settings: Any, reader: Any = None) -> dict[str, Any]:
+    """网页读取（Jina Reader）摘要：只回布尔和脱敏状态，绝不回 jina_api_key。"""
+    r_cfg = getattr(settings, "reader", None) if settings is not None else None
+    jina_enabled = bool(getattr(r_cfg, "jina_enabled", True)) if r_cfg is not None else True
+    jina_key_set = bool(str(getattr(r_cfg, "jina_api_key", "") or "").strip()) if r_cfg is not None else False
+    if reader is not None and hasattr(reader, "status"):
+        try:
+            r_ok, r_text = reader.status()
+        except Exception:
+            r_ok, r_text = False, "Jina Reader 状态读取失败"
+    elif not jina_enabled:
+        r_ok, r_text = False, "已停用"
+    else:
+        r_ok = True
+        r_text = (
+            "先用 Jina Reader（带密钥，每分钟 500 次）"
+            if jina_key_set
+            else "先用 Jina Reader（免费额度，每分钟 20 次，按服务器 IP 算）"
+        )
+    return {
+        "jina_enabled": jina_enabled,
+        "jina_key_set": jina_key_set,
+        "ok": bool(r_ok),
+        "text": str(r_text or ""),
+    }
+
+
+def search_view(
+    store: Any, settings: Any, runtime_of: Callable[[str], Any], *, reader: Any = None
+) -> dict[str, Any]:
+    """GET /api/extensions/search 的响应：{binding, status: {ok, text}, candidates, reader}。"""
     ok, text = status_of(store, settings, runtime_of)
     return {
         "binding": get_binding(store),
         "status": {"ok": ok, "text": text},
         "candidates": candidates_of(settings, store, runtime_of),
+        "reader": _reader_summary(settings, reader),
     }
 
 

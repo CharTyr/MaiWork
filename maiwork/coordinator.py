@@ -176,7 +176,10 @@ SCALE_FULL = "full"
 _SCALES = (SCALE_BRIEF, SCALE_STANDARD, SCALE_FULL)
 # brief 时由代码钉在**唯一那条活**末尾的一句（用户 2026-10 定）：光把 deliver_kind 改成
 # text 挡不住子 agent 还照模型写的「做网页」brief 干活，这句直接告诉子 agent 别做。
-BRIEF_JOB_TAIL = "这是随口一问：只交回几句话的结论和关键出处，不做网页、文件或长报告。"
+BRIEF_JOB_TAIL = (
+    "这是随口一问：只交回几句话的结论和 1~3 个核实过的关键出处，"
+    "不做网页、文件或长报告，也不要额外写 说明.md / notes.md 等过程记录文件。"
+)
 # 判「已经钉过」用开头这几个字（不是整句）：步骤存档按 200 字截断，整句可能被截掉尾巴，
 # 只看整句会在下一轮复用存档时又追加一遍，前后拼出半句残话。
 _BRIEF_JOB_TAIL_MARK = "这是随口一问"
@@ -275,6 +278,8 @@ def with_brief_job_tail(brief: Any) -> str:
 
 def _cut_note_at_punctuation(text: str, limit: int = _NOTE_MAX) -> str:
     """把 text 截到 ≤limit 字：能在句读处收尾就在句读处收（不硬截半句）。"""
+    if len(text) <= limit:
+        return text.strip()
     head = text[:limit]
     cut = -1
     for i in range(len(head) - 1, -1, -1):
@@ -287,6 +292,43 @@ def _cut_note_at_punctuation(text: str, limit: int = _NOTE_MAX) -> str:
             return head[:cut].strip()
         return head[:cut + 1].strip()
     return head.strip()
+
+
+cut_at_punctuation = _cut_note_at_punctuation
+
+_REVIEW_QUOTE_RE = re.compile(r"（验收模型原话：(.+?)）", re.DOTALL)
+_GROUP_ASK_JARGON_RE = re.compile(
+    r"(?:[，,、；;]?\s*(?:并|再|然后)?)?(?:告诉|告知|提交给|汇报给)验收"
+    r"|artifacts/\S+|steps/\d+/\S*|(?<![A-Za-z])job\s*\d+"
+)
+
+
+def _clean_group_ask_detail(text: Any) -> str:
+    """刮掉向群友提问时混入的内部验收/目录话术。"""
+    cleaned = _GROUP_ASK_JARGON_RE.sub("", str(text or ""))
+    return " ".join(cleaned.split()).strip("，,、；; ")
+
+
+def humanize_failure_reason(review_text: Any, *, max_len: int = 120) -> str:
+    """把内部验收长意见收拾成可发进群的一句人话原因（不露 R1 / 判定没做到 / 验收模型原话 / 引用核对）。"""
+    raw = str(review_text or "").strip()
+    raw = re.sub(r"\n?\s*引用核对：.*", "", raw, flags=re.DOTALL).strip()
+    m = _REVIEW_QUOTE_RE.search(raw)
+    if m and m.group(1).strip():
+        raw = m.group(1).strip()
+    raw = re.sub(r"（已经返工过一次，也没有更强的模型可换）", "", raw)
+    raw = re.sub(r"[；;]?\s*加分项没做到：[^。（\n]*", "", raw)
+    raw = re.sub(r"（判定(?:没做到|部分做到)）", "", raw)
+    raw = re.sub(r"（验收模型原话：?", "", raw)
+    raw = re.sub(r"\bR\d+\b\s*", "", raw)
+    raw = re.sub(r"^(?:没过|不通过)\s*[:：]\s*", "", raw)
+    raw = re.sub(r"artifacts/\S+|steps/\d+/\S*|\breply\.md\b|\bresearch\.md\b", "", raw)
+    raw = re.sub(r"(?<![A-Za-z])job\s*\d+", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"子\s*agent", "这边", raw, flags=re.IGNORECASE)
+    cleaned = " ".join(raw.split()).strip("；;，,、 ")
+    if not cleaned:
+        return "试了几轮还是没达到要求"
+    return _cut_note_at_punctuation(cleaned, max_len)
 
 
 def delivery_note_fallback(task_title: Any, deliver_kind: Any = "view") -> str:
@@ -1820,16 +1862,51 @@ class Coordinator:
             preset = vm_platforms.get(kind)
             hint = preset.plan_hint if preset is not None else f"{kind} 是一台一次性机器"
             lines.append(hint + ("（其余要跑命令的活先选 ssh）。" if ssh_ok else "。"))
-        lines.append("不管在哪台机器上做，成品最后都必须拷回本机工作区才能交付。")
+        lines.append(
+            "纯查资料、读图、生图、写文字或用 render_report 出网页这类不跑命令的活，"
+            "代码会自动留在本机工作区直接做，不用占远程机器；要跑命令的活，成品最后都必须拷回本机工作区才能交付。"
+        )
         return field, "".join(lines), allowed
 
-    def _normalize_env_choice(self, raw: Any) -> str:
+    @staticmethod
+    def _job_needs_exec(job: dict, criteria_text: str = "") -> bool:
+        """这条活需不需要隔离跑命令 / 上远程机器。
+
+        纯检索、抓网页、读图、生图、写文件、render_report 出网页都在本机工作区直接完成，
+        不需要占远程机器，也不该被逼着走 vm_fetch_file / machine_fetch_file 来回拷文件。
+        """
+        tools = {str(t or "").strip() for t in (job.get("tools") or [])}
+        if tools.intersection((*_LOCAL_EXEC_TOOLS, *_VM_TOOLS, *_MACHINE_TOOLS)):
+            return True
+        text = f"{job.get('brief') or ''} {criteria_text}".strip()
+        return job_needs_exec_capability(text)
+
+    @classmethod
+    def _jobs_need_exec(cls, jobs: Any, criteria: Any = ()) -> bool:
+        criteria_text = " ".join(str(c) for c in (criteria or []))
+        return any(
+            cls._job_needs_exec(j, criteria_text)
+            for j in (jobs or [])
+            if isinstance(j, dict)
+        )
+
+    @classmethod
+    def _plan_needs_exec(cls, plan: dict) -> bool:
+        """计划里有没有至少一条活真要跑命令。没带非空 jobs 列表（单测直接测 _setup_exec_env）按需要算。"""
+        jobs = plan.get("jobs") if isinstance(plan, dict) else None
+        if not isinstance(jobs, list) or not jobs:
+            return True
+        return cls._jobs_need_exec(jobs, plan.get("criteria") or ())
+
+    def _normalize_env_choice(self, raw: Any, *, needs_exec: bool = True) -> str:
         """计划里的 env 规范成可用的值。
 
-        机器可用时**一律用机器**（2026-10-15 用户定）：报 local 或乱写都规范成第一台可用
-        机器（专用机器优先，其次优先那家一次性机器）——本机只做兜底。一台机器都没有才 local。
-        要的那种机器没开时照旧换另一种机器（换不到才回落本机）。
+        不跑命令的活（needs_exec=False）留在本机工作区（local），不占远程机器配额；
+        要跑命令的活（needs_exec=True）在机器可用时一律用机器：报 local 或乱写都规范成
+        第一台可用机器（专用机器优先，其次优先那家一次性机器），一台机器都没有才 local。
         """
+        if not needs_exec:
+            return "local"
         choice = str(raw or "").strip().lower()
         _f, _g, allowed = self._env_options()
         oneshot = self._oneshot_kinds()[:1]
@@ -1878,6 +1955,12 @@ class Coordinator:
         except Exception:
             pass
         return f"本机 · {run_as} 用户 · 内存上限 {mem}"
+
+    def _local_non_exec_env_desc(self) -> str:
+        """不跑命令的纯检索/读写活留在本机工作区时的 env 展示文案。"""
+        if self._local_can_exec():
+            return self._local_env_desc()
+        return "本机工作区 · 纯检索与文件读写（本任务不跑命令）"
 
     @staticmethod
     def _railway_env_desc(box: Any) -> str:
@@ -2221,7 +2304,8 @@ class Coordinator:
             "原话只是「搜搜 / 看看 / 查一下 / 啥情况」这类随口一问、没要求做表 / 页 / 文件 → "
             '写 "brief"；明确要求整理成表 / 页 / 文档 → 写 "standard"；'
             '明确要求全面 / 深度 / 报告 → 写 "full"。'
-            "brief 就只回几句话（交付形式用 text、只派 1 条活），不做网页也不做文件；"
+            "brief 就只回几句话（交付形式用 text、只派 1 条活，不要加「补充」加分项，"
+            "也不要让子 agent 额外写 说明.md / notes.md 等过程记录文件），不做网页也不做文件；"
             "standard 按原话做，要一页就一页，别扩成全景报告；full 才按完整报告做。"
         )
         # 执行环境可选项：只有就位的才出现在提示词里（模型不会瞎选）
@@ -2262,8 +2346,9 @@ class Coordinator:
             + ' "scale": "brief|standard|full"（按原话定规模：随口一问、没要求做表/页/文件 = brief；'
             '明确要求整理成表/页/文档 = standard；明确要求全面/深度/报告 = full；'
             '没写按 standard）,'
-            + ' "deliver_kind": "view|file|text|image"（view=做成网页给人打开看；file=做成文件给人下载/编辑；'
-            'text=不用成品，直接在群里文字回复；brief 必须是 text；'
+            + ' "deliver_kind": "view|file|text|image"（view=做成网页给人打开看，对比表 / 排障卡 / 速查清单 / 调研报告一律用 view 或 image，不要发裸 .md/.txt 群文件；'
+            'file=只有群友明确要下载或编辑正式文档与数据包如 .docx / .xlsx / .pdf / .csv / .zip / 代码文件时才选 file；'
+            'text=不用附件或网页，直接在群里文字回复，短文案 / 吐槽 / 回信一律选 text；brief 必须是 text；'
             'image=成品就是**一到四张图片**（照片 / 插画 / 封面 / 概念图）——直接发进群 + 一句说明，'
             '不要为了图去做网页）,'
             + env_field
@@ -2614,7 +2699,9 @@ class Coordinator:
                         tid, "、".join(str(m.get("id")) for m in missing), target + 1,
                     )
 
-        env_choice = self._normalize_env_choice(data.get("env"))
+        env_choice = self._normalize_env_choice(
+            data.get("env"), needs_exec=self._jobs_need_exec(jobs, criteria)
+        )
         machine = str(data.get("machine") or "").strip()[:64] if env_choice == "ssh" else ""
         env_reason = str(data.get("env_reason") or "").strip()
 
@@ -2807,9 +2894,14 @@ class Coordinator:
         # 执行环境：主模型选 railway → 拿一台一次性机器（拿不到回落本机并在 env/时间线写清原因）
         on_railway, railway_box = await self._setup_exec_env(tid, plan, gid)
 
-        # 本机不能隔离跑命令、也没拿到一次性机器：不假装开工，给一句实在话就收
-        # （_setup_exec_env 已把原因写进 env 字段和时间线）
-        if not on_railway and railway_box is None and not self._local_can_exec():
+        # 本机不能隔离跑命令、也没拿到一次性机器：只有这条任务真要跑命令时才做不了；
+        # 纯检索 / 读写工作区文件的活根本不碰命令，照常在本机工作区完成。
+        if (
+            self._plan_needs_exec(plan)
+            and not on_railway
+            and railway_box is None
+            and not self._local_can_exec()
+        ):
             cap = getattr(self, "_capability", None)
             why = str(getattr(cap, "reason", "") or "这台机器不能隔离跑命令")
             msg = f"本机不能隔离跑命令（{why}），专用机器和一次性机器也都没拿到：这个任务做不了"
@@ -2882,17 +2974,24 @@ class Coordinator:
             for n in range(1, len(jobs) + 1)
         }
 
+        criteria_text_for_jobs = " ".join(str(c) for c in (plan.get("criteria") or []))
+
         async def _job(i: int) -> Any:
             j = jobs[i]
             job_no = i + 1
+            job_on_remote = bool(
+                on_railway and self._job_needs_exec(j, criteria_text_for_jobs)
+            )
+            job_box = railway_box if job_on_remote else None
             deps = [d for d in (j.get("after") or []) if 1 <= d <= len(jobs)]
             brief = self._enrich_brief(
                 j["brief"], tid, plan["deliver_kind"],
-                railway_box if on_railway else False,
+                job_box if job_on_remote else False,
                 steps_dir=steps_dirs.get(job_no, ""),
                 # 双保险（2026-10-15 任务 B）：brief 里点名的工具只用**这条活真拿得到**的
                 # （岗位上限 / 环境换名之后的名单，和真跑活同一个解析入口）。
-                tools=self._job_tool_names(j, on_remote=bool(on_railway), box=railway_box),
+                tools=self._job_tool_names(j, on_remote=job_on_remote, box=job_box),
+                scale=normalize_scale(plan.get("scale")),
             )
             for d in deps:
                 await done[d - 1].wait()
@@ -2942,7 +3041,7 @@ class Coordinator:
                 return reused_rep
             rep = await self._run_job(
                 brief=brief,
-                tools=self._remote_job_tools(j["tools"], railway_box) if on_railway else j["tools"],
+                tools=self._remote_job_tools(j["tools"], job_box) if job_on_remote else j["tools"],
                 gid=gid,
                 tid=tid,
                 job_idx=i + 1,
@@ -2955,6 +3054,8 @@ class Coordinator:
                 lane=f"worker:{i + 1}" if lanes_on else "",
                 escalate=rejections >= _ESCALATE_AFTER_REJECTIONS,
                 req_version=req_version,
+                deliver_kind=str(plan.get("deliver_kind") or ""),
+                steps_dir=steps_dirs.get(job_no, ""),
             )
             # docs/22 §4 E：每条活跑完存档（下一轮可以复用；没交出也存，好让下一轮知道）
             self._save_step_record(
@@ -3105,6 +3206,7 @@ class Coordinator:
                         nx["brief"], tid, plan["deliver_kind"], False,
                         steps_dir=steps_dirs.get(i + 1, ""),
                         tools=tuple(j.get("tools") or ()),
+                        scale=normalize_scale(plan.get("scale")),
                     ),
                     tools=j["tools"],
                     gid=gid,
@@ -3120,6 +3222,8 @@ class Coordinator:
                     escalate=rejections >= _ESCALATE_AFTER_REJECTIONS,
                     req_version=req_version,
                     step=True,
+                    deliver_kind=str(plan.get("deliver_kind") or ""),
+                    steps_dir=steps_dirs.get(i + 1, ""),
                 )
 
             outs = await asyncio.gather(*[_step(nx) for nx in nexts])
@@ -3200,6 +3304,24 @@ class Coordinator:
     # 执行 jobs
     # ------------------------------------------------------------------
 
+    def _worker_can_read_skill(self, kind: str, skill_name: str) -> bool:
+        """当前岗位在本轮是否真被允许用 read_skill 读到 skill_name（不许提示词开空头支票）。"""
+        specialists = getattr(self, "_specialists", None)
+        if specialists is not None and hasattr(specialists, "_resolve_allowed_skills"):
+            try:
+                allowed = specialists._resolve_allowed_skills(str(kind or "task"))  # noqa: SLF001
+            except Exception:
+                allowed = ()
+            if isinstance(allowed, (list, tuple)):
+                return skill_name in allowed
+        skills = getattr(self, "_skills", None) or getattr(specialists, "_skills", None)
+        if skills is not None and hasattr(skills, "list"):
+            try:
+                return any(str(i.get("name") or "") == skill_name for i in skills.list("worker"))
+            except Exception:
+                return False
+        return True
+
     async def _run_job(
         self, *, brief: str, tools: list[str], gid: str, tid: str, job_idx: int, ws_name: str,
         job_type: str = "other",
@@ -3211,6 +3333,8 @@ class Coordinator:
         escalate: bool = False,
         req_version: int = 1,
         step: bool = False,
+        deliver_kind: str = "",
+        steps_dir: str = "",
     ) -> Any:
         sem = self._semaphore_for(ws_name)
         async with sem:
@@ -3221,19 +3345,26 @@ class Coordinator:
                 from .workers import WorkerReport
 
                 return WorkerReport(ok=False, summary="", error=f"拿不到工作区：{e}")
-            # 调研类子任务：system 提示追加报告框架（做东西的活不加）。
-            # 2026-10-15 任务 B：框架里点名的工具（read_skill / render_report）**只在这条活
-            # 真拿得到时**才写——不然就是让子 agent 去调一个会被拒的工具。
+            # 调研类子任务：system 提示追加报告框架（做东西的活不加）；
+            # 直接在群里回文字（deliver_kind=text 且不是中间步骤）走聊天查证口径，不套六段报告八股。
             system_extra = ""
             if str(job_type) == "research":
                 try:
-                    from .workers import research_report_framework
+                    from .workers import research_chat_framework, research_report_framework
 
                     job_tools = {str(t) for t in (tools or ())}
-                    system_extra = research_report_framework(
-                        read_skill="read_skill" in job_tools,
-                        render_report="render_report" in job_tools,
+                    can_read_report = "read_skill" in job_tools and self._worker_can_read_skill(
+                        str(agent or "task"), "research-report"
                     )
+                    if str(deliver_kind) == "text" and not str(steps_dir or "").strip():
+                        system_extra = research_chat_framework(
+                            read_skill=can_read_report,
+                        )
+                    else:
+                        system_extra = research_report_framework(
+                            read_skill=can_read_report,
+                            render_report="render_report" in job_tools,
+                        )
                 except Exception:
                     logger.exception("取调研报告框架失败")
             brief = self._find_similar_skill_brief(brief, gid) + brief
@@ -3332,6 +3463,12 @@ class Coordinator:
         换了地方都在 env 字段 / 时间线写清原因；最后都拿不到且本机受限，返回 (False, None)，
         调用方据此判失败，不假装开工。
         """
+        if not self._plan_needs_exec(plan):
+            try:
+                self._tasks.set_env(tid, self._local_non_exec_env_desc())
+            except Exception:
+                logger.exception("写任务 %s 的 env 字段失败", tid)
+            return False, None
         want = str(plan.get("env") or "local")
         want_raw = want                       # 计划里原本要的环境（写 note 用）
         local_ok = self._local_can_exec()
@@ -3697,6 +3834,8 @@ class Coordinator:
         if name not in effective:
             return False
         keep = set(effective)
+        if on_remote:
+            keep.update(_LOCAL_EXEC_TOOLS)
         job["tools"] = [t for t in trial_tools if t in keep]
         return True
 
@@ -3795,6 +3934,8 @@ class Coordinator:
                     continue
                 text = f"{job.get('brief') or ''} {criteria_text}"
                 needs_exec = job_needs_exec_capability(text)
+                job_remote = bool(on_remote and self._job_needs_exec(job, criteria_text))
+                job_box = box if job_remote else None
                 is_research = str(job.get("type") or "") == "research"
                 needs_file = job_needs_file_output(text)
                 # 2026-10-15 任务 A3：要画图（画图 / 生图 / 配图 / 海报 / 插画）但拿不到
@@ -3813,7 +3954,7 @@ class Coordinator:
                     if not self._worker_tool_registered(tool_name):
                         continue
                     if not self._try_fill_worker_tool(
-                        job, tool_name, on_remote=on_remote, box=box
+                        job, tool_name, on_remote=job_remote, box=job_box
                     ):
                         continue
                     short0 = " ".join(str(text).split())[:40]
@@ -3843,7 +3984,7 @@ class Coordinator:
                     continue
                 short = " ".join(str(text).split())[:40]
                 effective, kind, why = self._job_effective_tools(
-                    job, on_remote=on_remote, box=box
+                    job, on_remote=job_remote, box=job_box
                 )
                 if needs_image and not self._has_worker_tool(
                     effective, lambda n: n == _IMAGE_TOOL_NAME
@@ -3852,7 +3993,7 @@ class Coordinator:
                     if (not why and self._worker_tool_registered(_IMAGE_TOOL_NAME)
                             and self._imagegen_configured()
                             and self._try_fill_worker_tool(
-                                job, _IMAGE_TOOL_NAME, on_remote=on_remote, box=box
+                                job, _IMAGE_TOOL_NAME, on_remote=job_remote, box=job_box
                             )):
                         filled = _IMAGE_TOOL_NAME
                     if filled:
@@ -3870,7 +4011,7 @@ class Coordinator:
                             tool=filled, need="image",
                         ))
                         effective, kind, why = self._job_effective_tools(
-                            job, on_remote=on_remote, box=box
+                            job, on_remote=job_remote, box=job_box
                         )
                     else:
                         reason = why or self._imagegen_unavailable_reason(kind)
@@ -3897,7 +4038,7 @@ class Coordinator:
                     if (not why and self._vision_configured()
                             and self._worker_tool_registered(_VISION_TOOL_NAME)
                             and self._try_fill_worker_tool(
-                                job, _VISION_TOOL_NAME, on_remote=on_remote, box=box
+                                job, _VISION_TOOL_NAME, on_remote=job_remote, box=job_box
                             )):
                         filled = _VISION_TOOL_NAME
                     if filled:
@@ -3915,7 +4056,7 @@ class Coordinator:
                             tool=filled, need="vision",
                         ))
                         effective, kind, why = self._job_effective_tools(
-                            job, on_remote=on_remote, box=box
+                            job, on_remote=job_remote, box=job_box
                         )
                     else:
                         reason = why or self._vision_unavailable_reason(kind)
@@ -3942,7 +4083,7 @@ class Coordinator:
                     ]
                     if not real_exec:
                         filled = "" if why else self._try_fill_exec_tool(
-                            job, on_remote=on_remote, box=box
+                            job, on_remote=job_remote, box=job_box
                         )
                         if filled:
                             note = (
@@ -3960,7 +4101,7 @@ class Coordinator:
                                 tool=filled, need="exec",
                             ))
                             effective, kind, why = self._job_effective_tools(
-                                job, on_remote=on_remote, box=box
+                                job, on_remote=job_remote, box=job_box
                             )
                         else:
                             reason = why or (
@@ -4001,7 +4142,7 @@ class Coordinator:
                     kind_label = "调研活" if is_research else "要产出文件的活"
                     candidate = "" if why else self._candidate_fill_tool(need)
                     if candidate and self._try_fill_worker_tool(
-                        job, candidate, on_remote=on_remote, box=box
+                        job, candidate, on_remote=job_remote, box=job_box
                     ):
                         note = (
                             f"开工前自检：这条活是{kind_label}（{short}…），子 agent 实际"
@@ -4018,7 +4159,7 @@ class Coordinator:
                             tool=candidate, need=need,
                         ))
                         effective, kind, why = self._job_effective_tools(
-                            job, on_remote=on_remote, box=box
+                            job, on_remote=job_remote, box=job_box
                         )
                         continue
                     reason = why or (
@@ -4587,7 +4728,10 @@ class Coordinator:
                 existing = [p for p in paths if p in real]
                 missing = [p for p in paths if p not in real]
             if existing:
-                piece += "；它交付的工作区文件：" + "、".join(existing)
+                piece += (
+                    "；它交付的工作区文件：" + "、".join(existing)
+                    + "（用 read_file 读文件时若提示还有剩余内容，继续传 offset 读到底，别漏掉后半段的链接和数据）"
+                )
             for p in missing:
                 piece += f"；注意：它声称的 {p} 不存在，别当资料用"
             lines.append(piece)
@@ -4790,7 +4934,7 @@ class Coordinator:
 
     def _enrich_brief(
         self, brief: str, tid: str, deliver_kind: str, on_railway: bool = False,
-        steps_dir: str = "", tools: Any = None,
+        steps_dir: str = "", tools: Any = None, scale: str = "standard",
     ) -> str:
         """给这条活的 brief 补上代码侧硬要求。
 
@@ -4810,7 +4954,9 @@ class Coordinator:
             out += (
                 f"\n\n这一步的产出写到工作区 {target_dir}/ 下"
                 "（这一步是中间步骤：后面的活要用你的产出；各步骤各写各的文件夹，"
-                "别写交付成品的位置）。"
+                "别写交付成品的位置。"
+                "凡是你搜到并打开核实过的来源，把完整原始链接 https://... 和关键事实一起写进这份步骤文件里，"
+                "方便下一步直接做可点击引用，不要只写媒体名或站点名）。"
             )
         else:
             out += f"\n\n成品放在工作区 {target_dir}/ 下；"
@@ -4855,7 +5001,10 @@ class Coordinator:
             else:
                 out += "用你手上的材料整理出图片（裁剪、拼版、导出都可以）；查不到就老实说查不到。"
         elif deliver_kind == "file":
-            out += "做成文件给人下载或编辑，文件名起清楚。"
+            out += (
+                "做成正式文件给人下载或编辑（如 .docx / .xlsx / .pdf / .csv / .zip），文件名起清楚；"
+                "除非群友点名要 Markdown，否则不要直接交裸 .md 当群文件。"
+            )
         elif deliver_kind == "text" and not steps_dir:
             # 线上 T-13（2026-10-10）：直接回文字的活，答案必须落在 reply.md 里——
             # 群里发出去的就是这个文件里的原文，子 agent 只写在交回总结里等于没交付。
@@ -4863,11 +5012,17 @@ class Coordinator:
                 f"\n\n这次是直接回文字的活：把**要发进群里的完整回复原文**写进工作区 "
                 f"{self._artifact_dir(tid)}/{TEXT_REPLY_NAME}"
                 "（只写正文本身，比如整封信；不要标题、不要「全文共 125 字」「已数过」"
-                "这类字数统计和自我说明）。"
+                "这类字数统计和自我说明，不要套「一句话结论 / 大家都同意的」这类报告小标题，"
+                "也不要标「（单源）」「（多源）」核验标签）。"
                 "群里发出去的就是这个文件里的文字，一个字不改；"
                 "所以按一条聊天消息来写，别太长。验收只认这个文件："
                 "文件不在或是空的，就算没做成。"
             )
+            if normalize_scale(scale) == SCALE_BRIEF:
+                out += (
+                    "这是随口一问的简短回话：正文控制在几句话（一般不超过 300 字，链接另算），"
+                    "直奔结论并附上 1~3 个核实过的关键链接即可，别写成小论文。"
+                )
         if on_railway and self._is_ssh_box(on_railway):
             out += (
                 f"\n\n这轮在专用机器「{getattr(on_railway, 'name', '')}」上做（用户自己的 VPS / VM，没有时间限制）："
@@ -5061,7 +5216,8 @@ class Coordinator:
         prompt_lines.append(
             f"（这次交付的规模档 scale={scale}：brief=几句话直接回答；standard=按原话做一页 / "
             "一个文件；full=全面 / 深度报告。篇幅与原话相符：brief 是几句话，要一页就一页"
-            "——做多了、做少了都在 review 里按这个量说清。）"
+            "——做多了、做少了都在 review 里按这个量说清；brief 按正文算，附带的核实链接 URL 字符长度另算，"
+            "不要因为带了完整链接判超字数。）"
         )
         # 线上 T-14（2026-10-10）：群友给的原图在工作区里；改图类活要对着它判。
         input_images = self._input_images.get(tid) or []
@@ -5130,7 +5286,12 @@ class Coordinator:
         if bool(plan.get("research")):
             try:
                 link_check = await self._link_check(
-                    tid=tid, ws_name=ws_name, listing=listing, summary=summary, evidence=evidence
+                    tid=tid,
+                    ws_name=ws_name,
+                    listing=listing,
+                    summary=summary,
+                    evidence=evidence,
+                    deliver_kind=str(plan.get("deliver_kind") or ""),
                 )
             except Exception:
                 logger.exception("验收引用核对出错（任务 %s），这次跳过", tid)
@@ -5233,6 +5394,10 @@ class Coordinator:
                 '「blocked」只在**客观做不到**时才写，比如：来源拒绝访问、没有权限、'
                 "没人参与、这个数据根本不存在。判断标准是「换谁来做都拿不到」；"
                 "只是这次没做好、工具没用好、换个做法还能做到的，一律不要写 blocked。"
+                "对「查图片/梗图出处、找原帖、搜冷门条目」这类查证需求，如果子 agent 已真调工具"
+                "试过多个独立渠道/搜图入口仍均无收录或全被拦截（不再是漏试常规手段），也属于客观卡住："
+                "在该条目写清 blocked（公开渠道均未收录，需发起人补充线索），并在 evidence 里列出试过的具体渠道，"
+                "系统会直接转去向发起人补充问线索，不要让子 agent 空转硬猜或硬判失败。"
                 "写了 blocked 就在 evidence 里写清你**试过什么**（试了哪些入口 / 问了谁 / "
                 "换过哪些来源），没写清尝试过程的不算。"
             )
@@ -5704,16 +5869,39 @@ class Coordinator:
     # 验收引用核对（调研类任务）：交付里的链接是不是这个任务真打开过
     # ------------------------------------------------------------------
 
+    _LINK_CHECK_IGNORE_DIRS = frozenset(
+        {"steps", "input", "rawsearch", "scratch", "tmp", "temp", "cache", "logs", "notes", "work"}
+    )
+    _LINK_CHECK_IGNORE_FILES = frozenset(
+        {
+            "notes.md",
+            "note.md",
+            "说明.md",
+            "核对说明.md",
+            "核验说明.md",
+            "排查说明.md",
+            "链接核对.md",
+            "checked_links.md",
+            "links.md",
+            "draft.md",
+            "scratch.md",
+            "todo.md",
+            "process.md",
+            "log.md",
+        }
+    )
+
     def _opened_urls(self, tid: str) -> set[str]:
-        """本任务成功打开过的 URL（规范化）。
+        """本任务成功打开过的 URL，以及 HTTP 200 可访问的非网页直链文件（规范化）。
 
         fetch_page（请求地址 + 「最终地址」标记）和扩展的抓正文工具（mcp_ 开头、名字像
         抓正文、不像搜索；input JSON 里的 url/urls/link + output «URL: <最终地址>» 行）
         成功过的都算打开过——线上 T-4 时子 agent 用 mcp_*_fetch_page_content 真打开了
-        31 次全被漏算；web_search / mcp 搜索工具的结果只算「见过」，照旧不算打开过。
-        解析逻辑在 tools_builtin.opened_urls_from_rows（和 news_recheck.opened_links 共用）。
+        31 次全被漏算；fetch_page 遇到 HTTP 200 的 PDF/压缩包等直链文件在任务引用核对里
+        也算核实可访问（资讯补打开照旧不认）。web_search / mcp 搜索工具的结果只算「见过」，
+        照旧不算打开过。
         """
-        from .tools_builtin import opened_urls_from_rows
+        from .tools_builtin import opened_urls_from_rows, reachable_direct_file_urls_from_rows
 
         try:
             rows = self._store.read().execute(
@@ -5723,23 +5911,73 @@ class Coordinator:
         except Exception:
             logger.exception("读打开记录失败（任务 %s）", tid)
             return set()
-        return opened_urls_from_rows(rows)
+        return opened_urls_from_rows(rows) | reachable_direct_file_urls_from_rows(rows)
 
-    async def _gather_deliverable_texts(
-        self, ws_name: str, listing: list[dict], summary: str, evidence: list[str]
+    _LINK_CHECK_IGNORE_SUBSTRS = (
+        "notes",
+        "scratch",
+        "draft",
+        "todo",
+        "说明",
+        "笔记",
+        "草稿",
+        "备忘",
+        "排查",
+        "核对",
+    )
+
+    @classmethod
+    def _has_scratch_stem(cls, filename: str) -> bool:
+        stem = filename.lower().rsplit(".", 1)[0]
+        return any(tok in stem for tok in cls._LINK_CHECK_IGNORE_SUBSTRS)
+
+    def _select_link_check_paths(
+        self, tid: str, listing: list[dict], deliver_kind: str
     ) -> list[str]:
-        """交付物文本：summary + evidence + 工作区里的文本成品（md/html/json…；二进制跳过）。"""
-        texts: list[str] = [str(summary or ""), "\n".join(str(e) for e in (evidence or []))]
-        files = 0
+        """挑真正面向群友交付的文本成品路径，跳过 steps/ 与过程笔记文件。"""
+        prefix = f"{self._artifact_dir(tid)}/" if tid else ""
+        candidates: list[tuple[str, list[str]]] = []
         for entry in listing or []:
             if not isinstance(entry, dict) or entry.get("is_dir"):
                 continue
             path = str(entry.get("path") or "")
             if not path.lower().endswith(_TEXT_ARTIFACT_SUFFIXES):
                 continue
-            if files >= _ARTIFACT_SCAN_MAX_FILES:
-                break
-            files += 1
+            rel = path[len(prefix) :] if prefix and path.startswith(prefix) else path.lstrip("/")
+            parts = [p for p in rel.split("/") if p]
+            if not parts:
+                continue
+            if len(parts) > 1 and parts[0].lower() in self._LINK_CHECK_IGNORE_DIRS:
+                continue
+            if parts[-1].lower() in self._LINK_CHECK_IGNORE_FILES:
+                continue
+            candidates.append((path, parts))
+        if len(candidates) > 1:
+            non_scratch = [(p, pts) for p, pts in candidates if not self._has_scratch_stem(pts[-1])]
+            if non_scratch:
+                candidates = non_scratch
+        kind = str(deliver_kind or "").strip().lower()
+        if kind == "view":
+            root_html = [
+                p for p, pts in candidates if len(pts) == 1 and pts[0].lower().endswith((".html", ".htm"))
+            ]
+            if root_html:
+                return root_html
+        return [p for p, _pts in candidates]
+
+    async def _gather_deliverable_texts(
+        self,
+        ws_name: str,
+        listing: list[dict],
+        summary: str,
+        evidence: list[str],
+        *,
+        tid: str = "",
+        deliver_kind: str = "",
+    ) -> list[str]:
+        """交付物文本：summary + evidence + 真正交付的文本成品（跳过过程笔记与中间步骤目录）。"""
+        texts: list[str] = [str(summary or ""), "\n".join(str(e) for e in (evidence or []))]
+        for path in self._select_link_check_paths(tid, listing, deliver_kind)[:_ARTIFACT_SCAN_MAX_FILES]:
             try:
                 texts.append(await self._env.read_file(ws_name, path, max_bytes=_ARTIFACT_SCAN_MAX_BYTES))
             except Exception:
@@ -5747,11 +5985,18 @@ class Coordinator:
         return texts
 
     async def _link_check(
-        self, *, tid: str, ws_name: str, listing: list[dict], summary: str, evidence: list[str]
+        self,
+        *,
+        tid: str,
+        ws_name: str,
+        listing: list[dict],
+        summary: str,
+        evidence: list[str],
+        deliver_kind: str = "",
     ) -> dict:
         """交付里引用的链接 vs 本任务真打开过的链接；返回 {links, unopened, unopened_urls}。
 
-        计数按**唯一链接**算：summary / evidence / 每个成品文件分别抽链接，再跨文本按
+        计数按**唯一链接**算：summary / evidence / 真正交付的成品文件分别抽链接，再跨文本按
         `normalize_link_for_check` 去重（2026-10 本地修复：以前各文本分别 extend，同一个
         链接在几处出现就计几次——线上 T8 记成「66 条 / 39 条没打开」，按唯一算实际 41 / 28）。
         去重后保留**首见**的那份展示 URL（原样，不重写成规范形式）；query 值不同的链接按
@@ -5759,7 +6004,9 @@ class Coordinator:
         """
         links: list[str] = []
         seen: set[str] = set()
-        for text in await self._gather_deliverable_texts(ws_name, listing, summary, evidence):
+        for text in await self._gather_deliverable_texts(
+            ws_name, listing, summary, evidence, tid=tid, deliver_kind=deliver_kind
+        ):
             for url in extract_http_links(text):
                 key = normalize_link_for_check(url)
                 if not key or key in seen:
@@ -6168,6 +6415,7 @@ class Coordinator:
         except Exception:
             task_title = ""
         note = self._scrub_note(gid, review.get("note") or "", task_title, kind)
+        task_scale = normalize_scale(plan.get("scale"))
         if kind == "text":
             # 线上 T-13 第二问题（2026-10-10）：宿主 MaiBot（同一个 QQ 账号）已经用引用回复
             # 答过这件事了，这份小文本活再发一条就是重复刷屏 → 不往群里发，答案留在任务页。
@@ -6182,10 +6430,14 @@ class Coordinator:
                 self._write_tokens(task_id)
                 await self._summarize_task_to_skill(task_id, gid)
                 return "done"
-            note = await self._session_delivery_note(task_id, note)
-            await self._deliver_text_reply(task_id, gid, ws_name, note)
+            lead_text = await self._session_delivery_note(
+                task_id, note, deliver_kind="text", scale=task_scale
+            )
+            await self._deliver_text_reply(task_id, gid, ws_name, note, lead_text=lead_text)
         else:
-            note = await self._session_delivery_note(task_id, note)
+            note = await self._session_delivery_note(
+                task_id, note, deliver_kind=kind, scale=task_scale
+            )
             assert artifact_path is not None
             name = artifact_path.name or artifact_path.parent.name or task_id
             if kind == "image":
@@ -6224,15 +6476,19 @@ class Coordinator:
         except Exception as exc:
             logger.info("会话工作回应没发出（%s），不影响干活", type(exc).__name__)
 
-    async def _session_delivery_note(self, task_id, note):
+    async def _session_delivery_note(
+        self, task_id, note, *, deliver_kind: str = "", scale: str = "standard"
+    ):
         speech = getattr(self, "_session_speech", None)
         task = self._tasks.get(task_id)
         if speech is not None and task and task.get("session_id") and getattr(getattr(self._get_settings(), "session", None), "enabled", False):
             try:
-                return await speech.finish(task, note)
+                return await speech.finish(
+                    task, note, deliver_kind=deliver_kind, scale=scale
+                )
             except Exception as exc:
                 logger.info("会话交付回话不可用（%s），保留原说明", type(exc).__name__)
-        return note
+        return "" if deliver_kind == "text" else note
 
     async def _summarize_task_to_skill(self, task_id: str, gid: str) -> None:
         """交付后的有界总结；证据、隔离和幂等由 SkillSummary 检查。"""
@@ -6267,12 +6523,13 @@ class Coordinator:
         return ""
 
     async def _deliver_text_reply(
-        self, task_id: str, gid: str, ws_name: str, note: str
+        self, task_id: str, gid: str, ws_name: str, note: str, *, lead_text: str = ""
     ) -> None:
         """text 交付（线上 T-13）：把 `artifacts/<任务>/reply.md` 的原文发进群。
 
         - 0 < 原文 ≤ `TEXT_REPLY_MAX` 字：过隐私闸后整段当群消息发（**替代**那条交付说明，
-          不另外再发 note）；被隐私闸拦下 → 回落老行为（只发说明）。
+          不另外再发 note；若是会话任务且有简短过渡话 `lead_text`，只接在正文前）；
+          被隐私闸拦下 → 回落老行为（只发说明）。
         - 原文超长：当群文件发（`deliver_task(kind="file")`，走它那一套入队 key 和回落）。
         - 文件读不到（验收之后不该发生）：回落老行为（只发说明）+ 记警告，绝不抛。
         """
@@ -6288,36 +6545,38 @@ class Coordinator:
             logger.exception("读 text 交付正文失败（任务 %s），回落只发交付说明", task_id)
             reply_path = None
 
+        fallback_note = lead_text or note
+        is_direct_reply = False
         if reply and len(reply) <= TEXT_REPLY_MAX:
             cleaned = scrub(gid, reply, self._store)
             if cleaned is not None and str(cleaned).strip():
                 text = str(cleaned)
+                is_direct_reply = True
             else:
                 logger.warning("任务 %s 的回复原文没过隐私闸，改发交付说明", task_id)
-                text = note
+                text = fallback_note
         elif reply:
             # 太长：聊天消息装不下，当群文件发（发不出去由 deliver_task 的回落兜着）
             try:
                 await self._delivery.deliver_task(
-                    task_id, kind="file", path=reply_path, name="回复.md", note=note
+                    task_id, kind="file", path=reply_path, name="回复.md", note=fallback_note
                 )
             except Exception:
                 logger.exception("text 正文当群文件交付失败（任务 %s），回落只发交付说明", task_id)
-                text = note
+                text = fallback_note
             else:
                 return
         else:
             logger.warning("任务 %s 验收通过但读不到 %s，回落只发交付说明", task_id, reply_rel)
-            text = note
+            text = fallback_note
 
         try:
             from .session_speech import delivery_key, delivery_address
             settings = self._get_settings()
             key = delivery_key(self._store, settings, task_id, "text:" + reply)
             address = delivery_address(self._store, settings, task_id, gid)
-            task = self._tasks.get(task_id)
-            if address and settings.session.relay_text and text != note:
-                text = note + "\n\n" + text
+            if address and settings.session.relay_text and is_direct_reply and lead_text:
+                text = lead_text + "\n\n" + text
             self._outbox.enqueue(
                 key + ":text",
                 gid,
@@ -6938,13 +7197,13 @@ class Coordinator:
         重新拆清单，这是预期行为）。
         """
         parts = [
-            f"{it.get('id')} {str(it.get('text') or '')}（{str(it.get('reason') or '客观做不到')}）"
+            f"{it.get('id')} {str(it.get('text') or '')}（{_clean_group_ask_detail(it.get('reason')) or '客观做不到'}）"
             for it in blocked_items
         ]
-        question = (
-            "这几条做不到：" + "；".join(parts)
-            + "。要按现在做到的部分交付，还是换个要求？"
-        )[:400]
+        head = "这几条做不到："
+        tail = "。要按现在做到的部分交付，还是换个要求？"
+        body = _cut_note_at_punctuation("；".join(parts), max(0, 400 - len(head) - len(tail))).rstrip(_NOTE_BREAKS + " ")
+        question = (head + body + tail)[:400]
         if not self._wait_for_originator(
             tid, gid, attempt_id, question,
             reason="客观做不到", outbox_key=f"ask:{tid}:{attempt_n}",
@@ -7013,18 +7272,17 @@ class Coordinator:
         记事件 `task.human_wait`。
         """
         parts = [
-            f"{it.get('id')} {str(it.get('text') or '')}——{str(it.get('needs_human') or '')}"
+            f"{it.get('id')} {str(it.get('text') or '')}——{_clean_group_ask_detail(it.get('needs_human'))}"
             for it in human_items
         ]
         ask_count = self._human_ask_count(tid)
-        # 总长 ≤200：先把固定的首尾两句留出来，中间的要求列表按剩余长度截
+        # 总长 ≤200：先把固定的首尾两句留出来，中间的要求列表按剩余长度在句读处收尾
         lead = "还差一点：" if ask_count >= 1 else ""
         head = "这一步需要有人参与："
         tail = "。准备好的材料在任务页里。做完后回复我结果，我接着做。"
         room = _HUMAN_QUESTION_MAX - len(lead) - len(head) - len(tail)
-        question = (lead + head + "；".join(parts)[: max(0, room)] + tail)[
-            :_HUMAN_QUESTION_MAX
-        ]
+        body = _cut_note_at_punctuation("；".join(parts), max(0, room)).rstrip(_NOTE_BREAKS + " ")
+        question = (lead + head + body + tail)[:_HUMAN_QUESTION_MAX]
         if not self._wait_for_originator(
             tid, gid, attempt_id, question,
             reason="需要有人参与", outbox_key=f"human:{tid}:{attempt_n}",
@@ -7158,13 +7416,14 @@ class Coordinator:
             )
         except Exception:
             logger.exception("入队提问失败（%s）", outbox_key)
-        self._tasks.finish_attempt(
-            attempt_id,
-            status="waiting",
-            summary=summary,
-            evidence=[str(e) for e in (evidence or [])],
-            review=review,
-        )
+        if attempt_id is not None:
+            self._tasks.finish_attempt(
+                attempt_id,
+                status="waiting",
+                summary=summary,
+                evidence=[str(e) for e in (evidence or [])],
+                review=review,
+            )
         return True
 
     def _handle_unpassed(
@@ -7203,7 +7462,7 @@ class Coordinator:
             return "done"
         task = self._tasks.get(task_id)
         title = str(task.get("title") if task else "") or "任务"
-        short = (review or "没通过")[:60]
+        short = humanize_failure_reason(review)
         try:
             self._outbox.enqueue(
                 f"task:{task_id}:failed",

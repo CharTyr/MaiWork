@@ -306,7 +306,7 @@ def _office_item(svc: Any) -> dict[str, Any]:
     if not float(view.get("checked_at") or 0):
         return _item(
             "office", "wait", label,
-            "尚未检测本机安装情况（可选）。打开网页「设置 → 工具」会自动检测一次，"
+            "尚未检测本机安装情况（可选）。打开网页「设置 → 工具与平台」会自动检测一次，"
             "未安装可在那里一键安装",
             sub="extensions",
         )
@@ -325,7 +325,7 @@ def _office_item(svc: Any) -> dict[str, Any]:
         why = f"；上次安装失败：{last.get('error')}"
     return _item(
         "office", "warn", label,
-        "未安装（可选）。需要交付 Word / Excel / PPT 时，可在网页「设置 → 工具」一键安装"
+        "未安装（可选）。需要交付 Word / Excel / PPT 时，可在网页「设置 → 工具与平台」一键安装"
         "（装到 MaiWork 自己的目录，不改动 MaiBot 的环境）；未安装也可交付 Markdown、CSV 或 HTML"
         + why,
         sub="extensions",
@@ -336,7 +336,7 @@ def _card_render_item(svc: Any) -> dict[str, Any] | None:
     """资讯卡片画图（中文字体 + 画图浏览器，可选组件里的 fonts / browser 两组，render_assets.py）。
 
     两组都 ok / system（系统自带）→ ok；有 missing / broken → warn，带上组自己的现成说明，
-    指路「设置 → 工具」一键装；还没探测过（unknown）或正在装 → wait。
+    指路「设置 → 工具与平台」一键装；还没探测过（unknown）或正在装 → wait。
     老版本没有这两组 → None（不出这一项）。
     """
     deps = getattr(svc, "optional_deps", None)
@@ -359,14 +359,14 @@ def _card_render_item(svc: Any) -> dict[str, Any] | None:
             parts.append(f"{line}（{hint}）" if hint else line)
         return _item(
             "card_render", "warn", "资讯卡片画图",
-            "；".join(p for p in parts if p) + "。没装好之前资讯卡片会改发文字；可在「设置 → 工具 → 可选组件」一键安装",
+            "；".join(p for p in parts if p) + "。没装好之前资讯卡片会改发文字；可在「设置 → 工具与平台 → 可选组件」一键安装",
             sub="extensions",
         )
     if all(s in ("ok", "system") for s in states):
         return _item("card_render", "ok", "资讯卡片画图", "中文字体和画图浏览器都能用")
     return _item(
         "card_render", "wait", "资讯卡片画图",
-        "还没检查中文字体和画图浏览器（打开「设置 → 工具」会检查一次）", sub="extensions",
+        "还没检查中文字体和画图浏览器（打开「设置 → 工具与平台」会检查一次）", sub="extensions",
     )
 
 

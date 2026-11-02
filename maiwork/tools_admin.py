@@ -180,7 +180,7 @@ def skill_source_url(url: str) -> tuple[str, str]:
 
     - 直接的 .zip 链接 → zip；
     - GitHub 上某个 skill 目录 / SKILL.md 页面 → raw.githubusercontent.com 的 SKILL.md（只装这一份文件；
-      带脚本 / 附件的 skill 请管理员下载 zip 后在网页「设置 → 工具」上传）；
+      带脚本 / 附件的 skill 请管理员下载 zip 后在网页「设置 → 工具与平台」上传）；
     - 直接的 …/SKILL.md 原文链接 → md。"""
     u = str(url or "").strip()
     if not u.lower().startswith("https://") or any(c in u for c in " \n\r\t\"'<>"):
@@ -1468,7 +1468,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                 pass
         hint = (
             "要加 MCP、测连接、重连、改它给谁用和工具白名单，可以直接在对话里说（新加和放宽会先等管理员确认）；"
-            "要密钥（请求头）的请管理员自己到网页「设置 → 工具」填。"
+            "要密钥（请求头）的请管理员自己到网页「设置 → 工具与平台」填。"
         )
         if not lines:
             return _ok("现在一个扩展也没有。" + hint, data=data)
@@ -2284,8 +2284,8 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             return _bad(f"安装失败：{e}")
         name = str((view or {}).get("name") or "") if isinstance(view, dict) else ""
         if name:
-            return _ok(f"已安装 skill「{name}」；网页「设置 → 工具」里能看到、能停用", data=view)
-        return _ok("已安装 skill；网页「设置 → 工具」里能看到、能停用", data=view)
+            return _ok(f"已安装 skill「{name}」；网页「设置 → 工具与平台」里能看到、能停用", data=view)
+        return _ok("已安装 skill；网页「设置 → 工具与平台」里能看到、能停用", data=view)
 
     async def env_overview(ctx: ToolContext, args: dict) -> ToolResult:
         """现在这套 MaiWork 能做到什么（模型 / 搜索 / 干活环境 / 交付 / skill / MCP），缺的怎么补。"""
@@ -2358,14 +2358,14 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                     elif state == "partial":
                         lines.append(
                             f"• {g.get('label')}：只安装了一部分（{'、'.join(have)}）；"
-                            "请到网页「设置 → 工具」重新安装"
+                            "请到网页「设置 → 工具与平台」重新安装"
                         )
                     elif state == "unknown":
-                        lines.append(f"• {g.get('label')}：尚未检测（打开网页「设置 → 工具」会自动检测一次）")
+                        lines.append(f"• {g.get('label')}：尚未检测（打开网页「设置 → 工具与平台」会自动检测一次）")
                     else:
                         lines.append(
                             f"• {g.get('label')}：未安装（可选）。需要交付 Word / Excel / PPT 时，"
-                            f"可在网页「设置 → 工具」一键安装（装到 MaiWork 自己的目录，"
+                            f"可在网页「设置 → 工具与平台」一键安装（装到 MaiWork 自己的目录，"
                             f"不改动 MaiBot 的环境）；未安装也可交付 Markdown、CSV 或 HTML{why}"
                         )
                 if rows:
@@ -2418,7 +2418,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             "MCP 服务可以直接让我加、测连接、重连、改白名单（新加、改地址、放宽权限会先等你确认）；"
             "专岗换模型 / 思考强度 / 备用、建自定义专岗，以及模型端点和模型库，也可以在对话里让我改"
             "（新加端点、改端点地址或协议、删除会先等你确认）。"
-            "密钥请自己在网页上填（「设置 → 模型」「设置 → 工具」「设置 → 全部设置 → 运行环境」），"
+            "密钥请自己在网页上填（「设置 → 模型」「设置 → 工具与平台」「设置 → 全部设置 → 运行环境」），"
             "不要发在对话里。"
         )
         return _ok("\n".join(lines), data=data)

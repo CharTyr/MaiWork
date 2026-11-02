@@ -2455,7 +2455,7 @@ class Delivery:
     # 网页视图
     # ------------------------------------------------------------------
 
-    _KIND_CN = {"herenow": "here.now", "file": "群文件", "text": "网页副本"}
+    _KIND_CN = {"herenow": "here.now", "file": "群文件", "image": "图片", "text": "群内回复"}
     _STATE_CN = {
         "pending": "待发",
         "sending": "发送中",
@@ -2466,8 +2466,9 @@ class Delivery:
         "cancelled": "已取消",
     }
     def delivery_records(self, task_id: str) -> list[dict]:
-        """§9.3 任务详情的 delivery：kind「here.now/群文件/网页副本」、text、state 中文、url。
+        """§9.3 任务详情的 delivery：只列真实交付成品与 webonly 兜底（排除会话发言、跟进说明、失败/提问通知）。
 
+        kind：「here.now / 群文件 / 图片 / 群内回复 / 网页副本」、text、state 中文、url。
         here.now 行额外带 local_url（本地永久副本，前端给「页内预览」）和 expired
         （链接过没过期；前端给「重新生成外链」）。
         """
@@ -2485,6 +2486,11 @@ class Delivery:
         local_url = f"/g/{token}/artifacts/{tid}/" if token else None
         records: list[dict] = []
         for r in rows:
+            raw_kind = str(r["kind"])
+            r_key = str(r["key"])
+            is_webonly = raw_kind == "text" and r_key.endswith(":webonly")
+            if not (_is_artifact_outbox_row(raw_kind, r_key) or is_webonly):
+                continue
             try:
                 payload = json.loads(r["payload"] or "{}")
             except Exception:
@@ -2494,21 +2500,21 @@ class Delivery:
             except Exception:
                 result = {}
             url = result.get("url")
-            if not url and r["kind"] == "text":
+            if not url and is_webonly:
                 m = re.search(r"https?://\S+", str(payload.get("text") or ""))
                 url = m.group(0) if m else None
-            if r["kind"] == "file" and result.get("file_id"):
+            if raw_kind == "file" and result.get("file_id"):
                 url = None  # 群文件没有稳定外链，前端展示文件名
             error_text = str(r["error"] or "")
             # M1：群文件发送超时（uncertain）可能其实已经传上去了——详情里提示先去群里确认
-            if str(r["kind"]) == "file" and str(r["status"]) == "uncertain":
+            if raw_kind == "file" and str(r["status"]) == "uncertain":
                 hint = "群文件可能已发出，请先到群里确认"
                 error_text = f"{error_text}；{hint}" if error_text else hint
             rec: dict = {
                 "id": int(r["id"]),
-                "key": str(r["key"]),
-                "kind": self._KIND_CN.get(str(r["kind"]), str(r["kind"])),
-                "raw_kind": str(r["kind"]),
+                "key": r_key,
+                "kind": "网页副本" if is_webonly else self._KIND_CN.get(raw_kind, raw_kind),
+                "raw_kind": raw_kind,
                 "text": str(payload.get("note") or payload.get("text") or payload.get("name") or ""),
                 "state": self._STATE_CN.get(str(r["status"]), str(r["status"])),
                 "raw_state": str(r["status"]),
@@ -2516,10 +2522,10 @@ class Delivery:
                 "error": error_text,
                 # 群文件失败的大白话原因（不含本机路径）；其余为 None
                 "reason": (upload_fail_reason(r["error"])
-                           if str(r["kind"]) == "file" and str(r["status"]) == "failed"
+                           if raw_kind == "file" and str(r["status"]) == "failed"
                            else None),
             }
-            if str(r["kind"]) == "herenow":
+            if raw_kind == "herenow":
                 rec["local_url"] = local_url
                 expires_ts = result.get("expires_ts")
                 if not isinstance(expires_ts, (int, float)) or expires_ts <= 0:

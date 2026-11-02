@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -78,13 +79,14 @@ class _SpillZone:
 
     base: Path            # 工作区根（可信锚点；安全写从它开始逐段走）
     rel_dir: str          # 工作区相对目录（给模型看的那种形式）
+    ensure_base: Any = None  # 惰性工作区（如 ephemeral）首次落归档前按标准权限建好根目录
 
     @property
     def directory(self) -> Path:
         return self.base / self.rel_dir
 
 
-def _spill_zone(workspace: Any, task_id: str) -> _SpillZone | None:
+def _spill_zone(workspace: Any, task_id: str, *, env: Any = None) -> _SpillZone | None:
     """`<workspace>/tool_spill/<任务ID>/` 和它的工作区相对路径；缺一个就不归档。"""
     if workspace is None or not task_id:
         return None
@@ -96,7 +98,20 @@ def _spill_zone(workspace: Any, task_id: str) -> _SpillZone | None:
         return None
     if not rel or rel.startswith(".."):
         return None
-    return _SpillZone(base=base, rel_dir=rel)
+    ensure_base = None
+    ws_fn = getattr(env, "workspace", None) if env is not None else None
+    if callable(ws_fn) and base.name:
+        try:
+            getter = getattr(env, "_get_settings", None)
+            if callable(getter):
+                ws_root = Path(getter().environments.workspace_root).resolve()
+                if base.parent.resolve() == ws_root:
+                    ensure_base = lambda _fn=ws_fn, _n=base.name: _fn(_n)
+            else:
+                ensure_base = lambda _fn=ws_fn, _n=base.name: _fn(_n)
+        except Exception:
+            ensure_base = None
+    return _SpillZone(base=base, rel_dir=rel, ensure_base=ensure_base)
 
 
 def _pointer_line(rel: str, total: int) -> str:
@@ -143,6 +158,8 @@ def _write_archive(text: str, zone: _SpillZone) -> str:
     try:
         from .environments.local import write_new_file_verified
 
+        if zone.ensure_base is not None and not os.path.lexists(zone.base):
+            zone.ensure_base()
         written = write_new_file_verified(
             zone.base, zone.rel_dir, name, text.encode("utf-8")
         )
@@ -440,7 +457,8 @@ _RESEARCH_FRAMEWORK_BODY = (
     "六段是组织框架，不是扩搜配额：按任务原话和手上已有的证据组织，"
     "关键问题有可靠依据、未确认的点已说明就停，不用为了凑满每一节再去搜。\n"
     "每一点都要带链接，并标明「多源」（至少 2 个独立采集或独立确认的来源；"
-    "不同站点转载同一来源，不算独立佐证）还是「单源」。\n"
+    "不同站点转载同一来源，不算独立佐证）还是「单源」。"
+    "只在搜索摘要里见过、没打开核实过的链接绝不写进成品。\n"
     "别把说法不一致直接当成事实矛盾：置信程度或时间点不同，不自动等于事实矛盾；"
     "对关联未知的机构，不写成已证实由同一攻击者所为。\n"
     "先定问题和字段、拿不准的标 [不确定]。"
@@ -466,12 +484,26 @@ def research_report_framework(*, read_skill: bool = True, render_report: bool = 
 
 RESEARCH_REPORT_FRAMEWORK = research_report_framework()
 
+
+def research_chat_framework(*, read_skill: bool = False) -> str:
+    """群聊直接回文字（deliver_kind=text）的调研口径：保真核源，但不套六段报告八股。"""
+    out = (
+        "这是一件在群里直接回话的查证活：\n"
+        "- 先查清再说：关键事实、数字、时间点必须打开原文核实，不编造链接、电话或结论；拿不准的明确说明还没确认。\n"
+        "- 像懂行的群友直接回话：先给清楚结论，再补必要细节，顺手附上 1~3 个核实过的原文链接即可（只在搜索摘要里见过、没打开过的链接绝不放进去）。\n"
+        "- 不要套报告模板，不要标「（单源）」「（多源）」这类核验标签，不要分五六节列提纲。"
+    )
+    if read_skill:
+        out += "\n查证取舍可参考内置 skill research-report（read_skill 读），但成文按群聊回话写。"
+    return out
+
+
 # 线上 T-11：成品里出现了 job1 / research.md / T-11 / 「上一步」「主模型」这些内部说法，
 # 群友看得见。由 coordinator._enrich_brief 追加到**每条活**（调研 + 制作）的 brief 末尾。
 AUDIENCE_NOTE = (
     "成品是给群友看的：不写 job 编号、不写 research.md / artifacts/ 这类文件路径、"
     "不写任务号、不写「上一步」「主模型」「子 agent」这类内部说法——"
-    "要引用别的东西就说清是什么（比如「第 1 步查到的资料」「这次的调研记录」）。"
+    "要说明出处就直接写媒体名、官方页面名或公开渠道名，不要提内部步骤或调研记录。"
 )
 
 
@@ -567,8 +599,10 @@ class Workers:
         identity: Any = None,
         tasks: Any = None,
         get_settings: Any = None,
+        *,
+        env: Any = None,
         # 兼容旧位置参数：老代码是 Workers(models, tools, skills_hint_fn, identity, tasks)，
-        # get_settings 只能放 keyword-only。
+        # get_settings / env 放后面。
     ) -> None:
         self._models = models
         self._tools = tools
@@ -582,6 +616,11 @@ class Workers:
         self._tasks = tasks
         # get_settings：取 Settings（context_window 等压缩参数）；没给时用默认 128000。
         self._get_settings = get_settings
+        # env（LocalEnv；惰性工作区首次落长输出归档时按标准权限建好目录，含 systemd chown）。
+        self._env = env
+
+    def set_env(self, env: Any) -> None:
+        self._env = env
 
     def tool_catalog(self) -> Any:
         """子 agent（worker 角色）现在能用的工具清单 [(名字, 描述)]；取不到 → None。
@@ -765,7 +804,7 @@ class Workers:
             agent_kind = str(agent or agent_type or "task")
             wrapped_up = False  # 到期强制交回的标记（一次：append 提示 + 只给 submit_result）
             stall_wrapped = False  # 止损收紧成只交回的标记（同样只做一次）
-            spill_zone = _spill_zone(workspace, task_id)
+            spill_zone = _spill_zone(workspace, task_id, env=self._env)
             archive_notes: list[str] = []  # 归档失败要告诉模型的提示（这一轮攒着）
             # 阶段 4 检查点：记住开工时的需求版本；运行中被改了要求（Tasks.revise 递增版本），
             # 下一步开头就停手——旧要求的结果反正会被 accept_result 作废，不再白花模型调用。

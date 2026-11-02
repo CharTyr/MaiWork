@@ -806,8 +806,8 @@ def save_config_patch(store: Any, body: Any, *, base: Settings, plugin_dir: Any 
         key = _norm_key(raw_key)
         spec = CONFIG_BY_KEY.get(key)
         if spec is None:
-            raise ValueError(f'不认识或不能在这里改的字段 "{key}"（[models] 走「设置 → 模型」、'
-                             "[extensions] 走「设置 → 工具」、plugin.config_version 不可改）")
+            raise ValueError(f'不认识或不能在这里改的字段 "{key}"（[models] 走「设置 → 模型与专岗」、'
+                             "[extensions] 走「设置 → 工具与平台」、plugin.config_version 不可改）")
         hint = group_managed_hint(key)
         if hint:
             raise ValueError(f"「{spec['label']}」现在每个群自己一份，到「{hint}」里改；"
