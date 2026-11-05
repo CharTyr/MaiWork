@@ -581,10 +581,6 @@ class OutboxPayloadError(HostError):
     """这条载荷本身不合法（路径 / 类型 / 大小）：重试多少次都一样，直接判失败。"""
 
 
-class OutboxPrepareError(RuntimeError):
-    """发送前备料失败；尚未调用渠道发送，不得误记为发送结果未知。"""
-
-
 def _is_artifact_outbox_row(kind: str, key: str) -> bool:
     """真实交付项；失败兜底告知和后续说明都不算成品。
 
@@ -728,8 +724,8 @@ class Outbox:
         # 发送前新鲜度检查（0.8.0 收口）：生产者自己挂上来，同步、纯代码；
         # 见 add_preflight_hook。generic 发件箱不读群消息、不调模型。
         self._preflight_hooks: list[Any] = []
-        # 发送前异步备料（例如按实际投递时段重画资讯卡片）；只在领取 sending 后调用。
-        self._send_prepare_hooks: list[Any] = []
+        # 领取 sending 前的轻量发送策略；允许更新纯文本载荷或暂缓待刷新的图片。
+        self._preclaim_hooks: list[Any] = []
         # 个人提一嘴的复核者（2026-10）：只有 card_push.IdeaMention 会登记；**没登记就不发**
         # 个人提一嘴（见 set_personal_guard / _is_personal_mention），别的 hook 冒充不了。
         self._personal_guard: Any = None
@@ -781,32 +777,36 @@ class Outbox:
         if callable(hook):
             self._preflight_hooks.append(hook)
 
-    def add_send_prepare_hook(self, hook: Any) -> None:
-        """挂发送前的异步备料回调（可挂多个）：fn(info) -> None 或新 payload。
+    def add_preclaim_hook(self, hook: Any) -> None:
+        """挂发送前的轻量策略（可挂多个）：可改 info["payload"]，返回 True 暂缓本条。
 
-        在开关、TTL、新鲜度、额度检查通过且 CAS 领取 sending 后调用；因此可安全地做
-        较慢的渲染工作。回调可原地更新 info["payload"]，也可返回新的 dict。载荷变化
-        会先持久化，再交给 _execute；回调异常沿用本条消息的重试 / 失败处理。
+        只在发送闸门通过后、CAS 领取 sending 前同步调用。禁止 I/O 和耗时工作；
+        资讯图片过时时应返回 True，让 CardPush 后台长任务刷新，而不是在发件箱里渲染。
         """
         if callable(hook):
-            self._send_prepare_hooks.append(hook)
+            self._preclaim_hooks.append(hook)
 
-    async def _prepare_send_payload(self, row: Any, payload: dict, now: float) -> dict:
-        """运行生产者的发送前异步备料，并返回将要持久化 / 发送的载荷。"""
-        if not self._send_prepare_hooks:
-            return payload
+    def _prepare_preclaim_payload(self, row: Any, payload: dict, now: float) -> tuple[dict, bool]:
+        """执行发送前轻量策略，返回（持久化载荷，是否暂缓）。"""
+        if not self._preclaim_hooks:
+            return payload, False
         info = self._hook_info(row, payload, now)
-        for hook in list(self._send_prepare_hooks):
+        for hook in list(self._preclaim_hooks):
             result = hook(info)
             if inspect.isawaitable(result):
-                result = await result
-            if result is not None:
-                if not isinstance(result, dict):
-                    raise TypeError("发送前备料 hook 必须返回 dict 或 None")
+                close = getattr(result, "close", None)
+                if callable(close):
+                    close()
+                raise TypeError("发送前策略必须同步完成")
+            if result is True:
+                return payload, True
+            if isinstance(result, dict):
                 info["payload"] = result
+            elif result not in (None, False):
+                raise TypeError("发送前策略必须返回 bool、dict 或 None")
             if not isinstance(info.get("payload"), dict):
-                raise TypeError("发送前备料 hook 必须保留 dict 载荷")
-        return dict(info["payload"])
+                raise TypeError("发送前策略必须保留 dict 载荷")
+        return dict(info["payload"]), False
 
     def set_personal_guard(self, hook: Any) -> None:
         """登记「个人提一嘴的发送前复核」（生产者 card_push.IdeaMention 自己挂）。
@@ -871,6 +871,42 @@ class Outbox:
             oid = int(cur.lastrowid or 0)
             self._wake_command(group_id, payload or {}, not_before)
             return oid
+
+    def update_pending(self, key: str, kind: str, payload: dict, *, moment: Optional[float] = None) -> bool:
+        """仅更新仍待发的行；发送已被领取时返回 False，避免覆盖正在发送的载荷。"""
+        now = float(moment) if moment is not None else clock.now()
+        with self._store.tx() as conn:
+            cur = conn.execute(
+                "UPDATE outbox SET kind=?, payload=?, error='', updated=?"
+                " WHERE key=? AND status='pending'",
+                (str(kind), json.dumps(payload or {}, ensure_ascii=False), now, str(key)),
+            )
+        return int(cur.rowcount or 0) == 1
+
+    def drop_pending(self, key: str, error: str, *, moment: Optional[float] = None) -> bool:
+        """将指定的 pending 行作废并通知生产者；发送已领取时不改动。"""
+        now = float(moment) if moment is not None else clock.now()
+        with self._store.tx() as conn:
+            row = conn.execute(
+                "SELECT id, payload FROM outbox WHERE key=? AND status='pending'", (str(key),)
+            ).fetchone()
+            if row is None:
+                return False
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except Exception:
+                payload = {}
+            cur = conn.execute(
+                "UPDATE outbox SET status='dropped', error=?, updated=?"
+                " WHERE id=? AND status='pending'",
+                (str(error), now, int(row["id"])),
+            )
+            if int(cur.rowcount or 0) != 1:
+                return False
+            oid = int(row["id"])
+        self._fire_result(_row_after(self._store, oid), payload,
+                          outcome="dropped", error=str(error), now=now)
+        return True
 
     def claim_delivery(self, group_id: str, task_id: str) -> str:
         """群友当场索取本群已完成任务：仅提升尚未发出的交付，不重传已发/不确定的原件。
@@ -1088,7 +1124,8 @@ class Outbox:
             params.append(int(oid))
             conn.execute(f"UPDATE outbox SET {', '.join(fields)} WHERE id=?", params)
 
-    def _claim(self, oid: int, *, moment: Optional[float] = None) -> int:
+    def _claim(self, oid: int, *, payload: Optional[dict] = None,
+               moment: Optional[float] = None) -> int:
         """pending → sending 的数据库 CAS：抢到返回累计尝试次数，抢不到返回 0。
 
         `WHERE id=? AND status='pending' AND not_before<=?`：另一个 flush（同一／
@@ -1100,11 +1137,18 @@ class Outbox:
         """
         now = float(moment) if moment is not None else clock.now()
         with self._store.tx() as conn:
-            cur = conn.execute(
-                "UPDATE outbox SET status='sending', attempts=attempts+1, updated=?"
-                " WHERE id=? AND status='pending' AND not_before<=?",
-                (now, int(oid), now),
-            )
+            if payload is None:
+                cur = conn.execute(
+                    "UPDATE outbox SET status='sending', attempts=attempts+1, updated=?"
+                    " WHERE id=? AND status='pending' AND not_before<=?",
+                    (now, int(oid), now),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE outbox SET status='sending', attempts=attempts+1, updated=?, payload=?"
+                    " WHERE id=? AND status='pending' AND not_before<=?",
+                    (now, json.dumps(payload, ensure_ascii=False), int(oid), now),
+                )
             if int(cur.rowcount or 0) != 1:
                 return 0
             row = conn.execute("SELECT attempts FROM outbox WHERE id=?", (int(oid),)).fetchone()
@@ -1960,6 +2004,13 @@ class Outbox:
         return ""
 
     async def _flush_locked(self, now: float, *, allowed_groups: Any = None) -> None:
+        base_now = float(now)
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+
+        def current_now() -> float:
+            return base_now + max(0.0, loop.time() - started_at)
+
         if allowed_groups is None:
             try:
                 settings = self._get_settings()
@@ -1973,6 +2024,7 @@ class Outbox:
         # 抢不到（CAS 0 行）的行：这一轮不再碰，避免反复重试同一行
         skipped: set[int] = set()
         while True:
+            now = current_now()
             rows = [r for r in self._due_rows(now)
                     if str(r["group_id"]) in served and int(r["id"]) not in skipped]
             if not rows:
@@ -2043,41 +2095,33 @@ class Outbox:
                     self._postpone(oid, gid, reason or "推送节制", now, payload=payload)
                     continue
 
-            # 先落库 sending（CAS：只有仍是 pending 且到点的行才抢得到），再执行（崩了 recover 能捡到）
-            attempts = self._claim(oid, moment=now)
+            # 只运行轻量同步策略。过时时段的资讯图片留在 pending，由 CardPush 后台长活刷新；
+            # 浏览器渲染绝不能占着 sending，也不能阻塞这一轮其它消息。
+            try:
+                prepared_payload, defer = self._prepare_preclaim_payload(row, payload, now)
+            except Exception:
+                logger.exception("发送前轻量策略出错（key=%s），本轮保留待发", row["key"])
+                skipped.add(oid)
+                continue
+            if defer:
+                logger.debug("发件 %s 等待后台刷新载荷，本轮跳过", oid)
+                skipped.add(oid)
+                continue
+            payload = prepared_payload
+
+            # 先原子领取 sending 并持久化轻量更新后的载荷，再执行渠道发送。
+            attempts = self._claim(oid, payload=payload, moment=now)
             if attempts <= 0:
                 # 另一个 flush / 另一个发件箱实例已经把它拿走或改过状态：明确跳过，
                 # 不发、不记账、不触发结果 hook（同一 key 全场只发一次）
                 logger.debug("发件 %s 已被其它 flush 抢先处理，本轮跳过", oid)
                 skipped.add(oid)
                 continue
+            row = _row_after(self._store, oid)
             try:
-                # 使用本轮 flush 的投递时间；它也是所有发送闸 / TTL 判断的统一时间源。
-                prepare_now = float(now)
-                try:
-                    prepared_payload = await self._prepare_send_payload(row, payload, prepare_now)
-                except Exception as exc:
-                    logger.exception("发送前备料 hook 出错（key=%s）", row["key"])
-                    raise OutboxPrepareError("发送前备料失败") from exc
-                if prepared_payload != payload:
-                    payload = prepared_payload
-                    checked_now = prepare_now
-                    self._set(oid, status="sending", payload=payload, moment=checked_now)
-                    row = _row_after(self._store, oid)
-                    # 载荷更新后复核开关、TTL 和生产者新鲜度。额度在领取 sending 前已检查；
-                    # sending 行本身会被 used_today 计入，不能在这里再次问额度闸。
-                    feature_reason = self._feature_drop_reason(row, payload)
-                    ttl_reason = _ttl_expired(payload, checked_now)
-                    stale_reason = self._preflight(row, payload, checked_now)
-                    drop_reason = feature_reason or ttl_reason or stale_reason
-                    if drop_reason:
-                        self._set(oid, status="dropped", error=f"作废：{drop_reason}",
-                                  moment=checked_now)
-                        self._fire_result(_row_after(self._store, oid), payload,
-                                          outcome="dropped", error=drop_reason, now=checked_now)
-                        continue
                 result = await self._execute(row)
             except Exception as exc:
+                now = current_now()
                 err = _redact(str(exc), [])
                 if self._is_timeout(exc):
                     # 超时：可能已经发出去了，绝不重发
@@ -2104,6 +2148,7 @@ class Outbox:
                 self._fire_result(_row_after(self._store, oid), payload,
                                   outcome="failed", error=err, now=now)
                 continue
+            now = current_now()
             self._set(oid, status="sent", result=result, moment=now)
             if kind == "file":
                 self._note_file_result(now)

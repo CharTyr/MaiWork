@@ -15,7 +15,7 @@
   各自的每日上限」退役，三种自制消息共用一个 daily_max（在 group_push，由 Pushes 数）。
   每群开关默认关；开开关那一刻之前的批次 / 构想不补发（since 存在 group_push 里）。
 - **发送只有发件箱一条路**：scan 建待发行；flush 只做「备料 + 入队」——卡片画好图**落盘
-  缓存**（实际投递跨了时段才重画，同一时段的安全重试复用新图）、提一嘴按 SOUL 写好话，然后交给 Outbox。真正的发送、
+  缓存**（按备料时段生成；排队跨时段由 CardPush 后台长活刷新）、提一嘴按 SOUL 写好话，然后交给 Outbox。真正的发送、
   以及发送前再查一遍（服务群 / 开关 / 睡觉时段 / 额度）都在 Outbox.flush：待发期间关掉
   开关就作废，不发陈旧的卡片 / 话。
 - 结果回写走发件箱的结果 hook（on_result）：sent 才写 sent / 备忘；超时写 uncertain
@@ -369,9 +369,9 @@ class CardPush:
         add_preflight = getattr(outbox, "add_preflight_hook", None)
         if callable(add_preflight):
             add_preflight(self.on_before_send)
-        add_send_prepare = getattr(outbox, "add_send_prepare_hook", None)
-        if callable(add_send_prepare):
-            add_send_prepare(self.on_prepare_send)
+        add_preclaim = getattr(outbox, "add_preclaim_hook", None)
+        if callable(add_preclaim):
+            add_preclaim(self.on_before_claim)
 
     def _cfg(self, gid: str) -> dict:
         """这个群的「往群里发」设置（group_push 那一份）。
@@ -414,29 +414,20 @@ class CardPush:
             return "同一条资讯刚被冷场开场白发过了，不再重复发"
         return None
 
-    async def on_prepare_send(self, info: dict) -> None:
-        """按实际投递时段更新资讯卡片抬头（图片重画、文字只改首行）。
-
-        额度 / 静默时段可能把已画好的卡片推迟到另一个时段。该 hook 在 Outbox 真正
-        发送前、且已通过发送闸门后运行；只在时段标签变化时重画，载荷更新后由 Outbox
-        持久化，后续安全重试会复用这次新图。
-        """
+    def on_before_claim(self, info: dict) -> bool:
+        """发送前只修正文字标题；图片跨时段时暂缓，由 CardPush 长活重画。"""
         info = info or {}
         if str(info.get("push_kind") or "") != "news_card":
-            return
+            return False
         key = str(info.get("key") or "")
         if not key.startswith("news_card:"):
-            return
-        try:
-            cid = int(key.split(":", 2)[1])
-        except (TypeError, ValueError, IndexError):
-            return
+            return False
         kind = str(info.get("kind") or "")
         if kind not in ("image", "text"):
-            return
+            return False
         payload = info.get("payload")
         if not isinstance(payload, dict):
-            return
+            return False
 
         try:
             dispatch_ts = float(info.get("now"))
@@ -444,7 +435,7 @@ class CardPush:
             dispatch_ts = clock.now()
         dispatch_label = _slot_label(dispatch_ts)
         if str(payload.get("rendered_slot_label") or "") == dispatch_label:
-            return
+            return False
 
         if kind == "text":
             text = str(payload.get("text") or "")
@@ -454,34 +445,10 @@ class CardPush:
                 lines[0] = f"{prefix}{dispatch_label}】"
                 payload["text"] = "\n".join(lines)
                 payload["rendered_slot_label"] = dispatch_label
-            return
+            return False
 
-        card = self._store.read().execute(
-            "SELECT batch_id, item_ids FROM news_cards WHERE id=? AND group_id=?",
-            (cid, str(info.get("group_id") or "")),
-        ).fetchone()
-        if card is None:
-            return
-        gid = str(info.get("group_id") or "")
-        items = self._items_for_card(gid, card["item_ids"])
-        if not items:
-            logger.warning("发送前找不到资讯卡片条目，沿用已缓存图片（卡片 %s）", cid)
-            return
-
-        # 复用入队时附在图片消息上的链接，避免渲染时链接状态变化。
-        attachment = str(payload.get("text") or "")
-        link = attachment[len("看全部资讯："):] if attachment.startswith("看全部资讯：") else ""
-        data = self._card_data(gid, items, int(card["batch_id"] or 0), link)
-        data["slot_ts"] = dispatch_ts
-        data["slot_label"] = dispatch_label
-        png = await self._render(data)
-        if not png:
-            raise RuntimeError("发送前重画资讯卡片没有生成图片")
-
-        path = self._image_path(cid, bytes(png))
-        await asyncio.to_thread(self._write_cached_image, path, bytes(png))
-        payload["path"] = str(path)
-        payload["rendered_slot_label"] = dispatch_label
+        # 图片渲染可能启动 Chromium，不能在 Outbox.flush 中等待。
+        return kind == "image"
 
     @staticmethod
     def _write_cached_image(path: Path, data: bytes) -> None:
@@ -490,6 +457,10 @@ class CardPush:
         try:
             temp_path.write_bytes(data)
             temp_path.replace(path)
+            for suffix in _IMAGE_SUFFIXES:
+                other = path.with_suffix(suffix)
+                if other != path:
+                    other.unlink(missing_ok=True)
         except Exception:
             try:
                 temp_path.unlink(missing_ok=True)
@@ -586,12 +557,102 @@ class CardPush:
 
     # -------------------------------------------------------------- 投递
 
+    def _queued_image_rows(self, gid: str, moment: float) -> list[tuple[Any, dict]]:
+        """待发队列中图片时段已过时的卡片；只读，不领取 Outbox 的 sending 状态。"""
+        rows = self._store.read().execute(
+            "SELECT c.*, o.id AS outbox_id, o.kind AS outbox_kind, o.payload AS outbox_payload"
+            " FROM news_cards c JOIN outbox o ON o.key='news_card:' || CAST(c.id AS TEXT)"
+            " WHERE c.group_id=? AND c.status='queued' AND o.status='pending'"
+            " AND o.kind='image' AND o.not_before<=? ORDER BY c.id",
+            (str(gid), float(moment)),
+        ).fetchall()
+        current_label = _slot_label(moment)
+        out: list[tuple[Any, dict]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["outbox_payload"] or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            try:
+                expires_ts = float(payload.get("expires_ts") or 0)
+            except (TypeError, ValueError):
+                expires_ts = 0.0
+            if expires_ts and float(moment) >= expires_ts:
+                continue
+            if str(payload.get("rendered_slot_label") or "") != current_label:
+                out.append((row, payload))
+        return out
+
     def has_due(self, group_id: Any, now: float) -> bool:
+        gid = str(group_id)
         row = self._store.read().execute(
             "SELECT 1 FROM news_cards WHERE group_id=? AND status='pending' AND due_ts<=? LIMIT 1",
-            (str(group_id), float(now)),
+            (gid, float(now)),
         ).fetchone()
-        return row is not None
+        if row is not None:
+            return True
+        if self._pushes.in_quiet(float(now), gid):
+            return False
+        ok, _ = self._pushes.can_push(gid, "news_card", float(now))
+        return bool(ok and self._queued_image_rows(gid, float(now)))
+
+    async def _refresh_queued_image(
+        self, row: Any, old_payload: dict, moment: float, *, follow_clock: bool,
+    ) -> None:
+        """在资讯卡后台长活中刷新待发图片；失败时把待发载荷降级为文字。"""
+        cid = int(row["id"])
+        gid = str(row["group_id"])
+        outbox = self._outbox
+        if outbox is None:
+            return
+        items = self._items_for_card(gid, row["item_ids"])
+        if not items:
+            drop = getattr(outbox, "drop_pending", None)
+            if callable(drop):
+                drop(f"news_card:{cid}", "资讯条目已撤下，卡片无法刷新", moment=moment)
+            return
+
+        attachment = str(old_payload.get("text") or "")
+        link = attachment[len("看全部资讯："):] if attachment.startswith("看全部资讯：") else ""
+        data = self._card_data(gid, items, int(row["batch_id"] or 0), link)
+        render_at = clock.now() if follow_clock else float(moment)
+        png = b""
+        rendered_label = self._stamp_slot(data, render_at)
+        finished_at = render_at
+        try:
+            png, rendered_label, finished_at = await self._render_for_slot(
+                data, render_at, follow_clock=follow_clock,
+            )
+        except Exception as exc:
+            logger.warning("刷新待发资讯图片失败，改发文字（群 %s 卡片 %s）：%s", gid, cid, exc)
+            finished_at = clock.now() if follow_clock else float(moment)
+
+        expires_ts = float(old_payload.get("expires_ts") or (float(row["created"]) + EXPIRE_S))
+        if finished_at >= expires_ts:
+            return  # Outbox 会按 TTL 作废；过期图片不再写回队列
+
+        refreshed = dict(old_payload)
+        kind = "text"
+        mode = "text"
+        if png:
+            path = self._image_path(cid, png)
+            try:
+                await asyncio.to_thread(self._write_cached_image, path, png)
+                refreshed["path"] = str(path)
+                kind = mode = "image"
+            except Exception as exc:
+                logger.warning("刷新后的资讯图片无法落盘，改发文字（群 %s 卡片 %s）：%s", gid, cid, exc)
+                png = b""
+        if not png:
+            fallback_at = clock.now() if follow_clock else finished_at
+            rendered_label = self._stamp_slot(data, fallback_at)
+            refreshed.pop("path", None)
+            refreshed["text"] = self._text_fallback(data)
+        refreshed["rendered_slot_label"] = rendered_label
+        if outbox.update_pending(f"news_card:{cid}", kind, refreshed, moment=finished_at):
+            self._set(cid, mode=mode)
 
     def _set(self, cid: int, **fields: Any) -> None:
         cols = ", ".join(f"{k}=?" for k in fields)
@@ -650,6 +711,34 @@ class CardPush:
             "items": items,
         }
 
+    @staticmethod
+    def _stamp_slot(data: dict, moment: float) -> str:
+        """让卡片图片和文字兜底共用备料时刻的时段标签。"""
+        data["slot_ts"] = float(moment)
+        data["slot_label"] = _slot_label(float(moment))
+        return str(data["slot_label"])
+
+    async def _render_for_slot(
+        self, data: dict, moment: float, *, follow_clock: bool,
+    ) -> tuple[bytes, str, float]:
+        """按当前时段渲染；若恰好跨过时段边界，后台长活再尝试一次。
+
+        返回的标签始终对应实际画进图片的时刻。若第二次仍跨边界，Outbox 的轻量
+        发送前检查会继续暂缓，交给下一轮 CardPush 长活刷新，不会把旧标题发出去。
+        """
+        render_ts = float(moment)
+        png = b""
+        rendered_label = self._stamp_slot(data, render_ts)
+        finished_ts = render_ts
+        for attempt in range(2):
+            rendered_label = self._stamp_slot(data, render_ts)
+            png = bytes(await self._render(data) or b"")
+            finished_ts = clock.now() if follow_clock else render_ts
+            if _slot_label(finished_ts) == rendered_label or attempt == 1:
+                break
+            render_ts = finished_ts
+        return png, rendered_label, float(finished_ts)
+
     def _viz_html(self, gid: str, item_id: Any) -> str:
         try:
             from . import news_viz
@@ -686,7 +775,7 @@ class CardPush:
     def _image_path(self, cid: int, data: bytes = b"") -> Path:
         """卡片图的落盘位置（workspace_root/.web/.push/card-<id>.jpg|.png）。
 
-        入队图片先落盘；若真正发送时跨了时段会重画并原子替换缓存，后续同一时段的重试复用新图。
+        入队图片先落盘；排队跨时段后由 CardPush 后台长活重画并原子替换缓存。
         扩展名**跟着内容走**：JPEG 魔数 → .jpg，其余 → .png（Pillow 缺失时 render_png
         回落 PNG，落盘也得是 .png）。
         """
@@ -737,12 +826,14 @@ class CardPush:
         gid = str(group_id)
         if not _served(self._get_settings, gid):
             return
-        moment = clock.now() if now is None else float(now)
+        follow_clock = now is None
+        moment = clock.now() if follow_clock else float(now)
         rows = self._store.read().execute(
             "SELECT * FROM news_cards WHERE group_id=? AND status='pending' AND due_ts<=? ORDER BY id",
             (gid, moment),
         ).fetchall()
-        if not rows:
+        queued_images = self._queued_image_rows(gid, moment)
+        if not rows and not queued_images:
             return
         if self._pushes.in_quiet(moment, gid):
             return  # 睡觉时段：原样留着，醒来那轮再备料（不白画一张图）
@@ -750,17 +841,40 @@ class CardPush:
         if not cfg["news_card_enabled"]:
             for row in rows:
                 self._set(int(row["id"]), status="dropped", error="开关已关")
+            drop = getattr(self._outbox, "drop_pending", None)
+            if callable(drop):
+                for row, _payload in queued_images:
+                    drop(f"news_card:{int(row['id'])}", "资讯卡片开关已关", moment=moment)
             return
         outbox = self._outbox
         if outbox is None:
             logger.warning("资讯卡片还没接到发件箱（app 未接线），这批卡片先不发（群 %s）", gid)
             return
+
+        # 队列中跨时段的图片只在这个后台长活里重画。Outbox 遇到它们会保留 pending，
+        # 所以浏览器慢或被取消都不会留下 sending / uncertain 状态。
+        for row, old_payload in queued_images:
+            render_moment = clock.now() if follow_clock else moment
+            if self._pushes.in_quiet(render_moment, gid):
+                return
+            ok_push, _reason = self._pushes.can_push(gid, "news_card", render_moment)
+            if not ok_push:
+                return
+            await self._refresh_queued_image(row, old_payload, render_moment,
+                                             follow_clock=follow_clock)
+
         for row in rows:
             cid = int(row["id"])
-            if moment - float(row["created"]) > EXPIRE_S:
+            render_moment = clock.now() if follow_clock else moment
+            if render_moment - float(row["created"]) >= EXPIRE_S:
                 self._set(cid, status="dropped", error="超过 12 小时没发出去，作废")
                 logger.info("资讯卡片作废（群 %s 批次 %s）：超过 12 小时", gid, row["batch_id"])
                 continue
+            if self._pushes.in_quiet(render_moment, gid):
+                return
+            ok_push, _reason = self._pushes.can_push(gid, "news_card", render_moment)
+            if not ok_push:
+                return  # 额度用完时不先启动 Chromium；卡片留在 pending 等下一轮
             try:
                 ids = [int(x) for x in json.loads(row["item_ids"] or "[]")]
             except (TypeError, ValueError):
@@ -784,43 +898,89 @@ class CardPush:
             # 先图解、再画卡（2026-10 线上问题）：图解长活和卡片长活本来互不等待，
             # 卡片画图时图解还没做好，发到群里的卡片从来没带过图解。等一小会儿
             # （有上限、远小于 TTL），超时 / 失败就照旧画卡发出。
-            await self._viz_first(gid, live_ids, moment, float(row["created"]))
+            await self._viz_first(gid, live_ids, render_moment, float(row["created"]))
             link = await self._link(gid)
             data = self._card_data(gid, live, int(row["batch_id"]), link)
             png: bytes = b""
+            rendered_label = ""
+            finished_at = clock.now() if follow_clock else render_moment
             try:
-                png = await self._render(data)
+                render_moment = clock.now() if follow_clock else render_moment
+                if self._pushes.in_quiet(render_moment, gid):
+                    return
+                ok_push, _reason = self._pushes.can_push(gid, "news_card", render_moment)
+                if not ok_push:
+                    return
+                png, rendered_label, finished_at = await self._render_for_slot(
+                    data, render_moment, follow_clock=follow_clock,
+                )
             except Exception as e:  # 渲染失败（没浏览器 / 超时 / 意外）→ 纯文字列表兜底
                 logger.warning("资讯卡片渲染失败，改发文字（群 %s）：%s", gid, e)
+                finished_at = clock.now() if follow_clock else render_moment
+                rendered_label = self._stamp_slot(data, finished_at)
+            expires_ts = float(row["created"]) + EXPIRE_S
+            if finished_at >= expires_ts:
+                self._set(cid, status="dropped", error="超过 12 小时没发出去，作废")
+                logger.info("资讯卡片作废（群 %s 批次 %s）：渲染完成时已过期", gid, row["batch_id"])
+                continue
             payload: dict[str, Any] = {
                 "push_kind": "news_card",
-                # 标记缓存图 / 文字首行使用的时段；真正发送前若已跨时段再更新。
-                "rendered_slot_label": str(data.get("slot_label") or ""),
+                # 记录实际画进图片 / 写进文字首行的标签；旧图片不会冒充当前时段。
+                "rendered_slot_label": rendered_label,
                 # 自动卡片的期限沿用现有 12 小时窗口：被睡觉时段 / 每日上限推迟过期后，
                 # 发件箱直接作废，绝不把陈旧批次发进群。
-                "expires_ts": float(row["created"]) + EXPIRE_S,
+                "expires_ts": expires_ts,
             }
             kind = "text"
             mode = "text"
             if png:
                 try:
                     path = self._image_path(cid, png)
-                    path.write_bytes(bytes(png))
+                    await asyncio.to_thread(self._write_cached_image, path, png)
                     payload.update({"path": str(path), "text": f"看全部资讯：{link}" if link else ""})
                     kind, mode = "image", "image"
                 except OSError as e:
                     logger.warning("资讯卡片图片落盘失败，改发文字（群 %s）：%s", gid, e)
                     png = b""
             if not png:
+                rendered_label = self._stamp_slot(data, clock.now() if follow_clock else finished_at)
+                payload["rendered_slot_label"] = rendered_label
                 payload["text"] = self._text_fallback(data)
             try:
-                outbox.enqueue(f"news_card:{cid}", gid, kind, payload)
+                # 队列行与卡片状态在同一事务提交，避免 Outbox 抢先发出后又被写回 queued。
+                key = f"news_card:{cid}"
+                with self._store.tx() as conn:
+                    existing = conn.execute(
+                        "SELECT id, status FROM outbox WHERE key=?", (key,)
+                    ).fetchone()
+                    if existing is None:
+                        outbox.enqueue(key, gid, kind, payload, conn=conn)
+                    elif str(existing["status"] or "") == "pending":
+                        conn.execute(
+                            "UPDATE outbox SET kind=?, payload=?, updated=?"
+                            " WHERE id=? AND status='pending'",
+                            (kind, json.dumps(payload, ensure_ascii=False), finished_at,
+                             int(existing["id"])),
+                        )
+                    else:
+                        raise RuntimeError("同一资讯卡片已有非待发的发件箱记录")
+                    updated = conn.execute(
+                        "UPDATE news_cards SET status='queued', item_ids=?, mode=?, due_ts=?"
+                        " WHERE id=? AND status='pending'",
+                        (json.dumps(live_ids), mode, finished_at, cid),
+                    )
+                    if int(updated.rowcount or 0) != 1:
+                        raise RuntimeError("资讯卡片状态已被其他任务处理")
             except Exception as e:
                 logger.exception("资讯卡片入队失败（群 %s 卡片 %s）", gid, cid)
-                self._set(cid, status="failed", error=f"入队失败：{str(e)[:_ERR_MAX]}")
+                with self._store.tx() as conn:
+                    conn.execute(
+                        "UPDATE news_cards SET status='failed', error=?"
+                        " WHERE id=? AND status='pending'",
+                        (f"入队失败：{str(e)[:_ERR_MAX]}", cid),
+                    )
                 continue
             # 只入队：sent / 备忘都等发件箱真发出去之后由 on_result 写
-            self._set(cid, status="queued", item_ids=json.dumps(live_ids), mode=mode, due_ts=moment)
 
     def _settle(self, gid: str, cid: int, outcome: str, *, result: Optional[dict] = None,
                 error: str = "", moment: Optional[float] = None) -> None:
@@ -924,13 +1084,15 @@ class CardPush:
                 out.append(r)
         return out
 
-    def _fallback_text(self, gid: str, row: Any) -> tuple[str, float]:
+    def _fallback_text(self, gid: str, row: Any, *, now: Optional[float] = None) -> tuple[str, float]:
         """兜底用的纯文字（就是「画图失败退回纯文字列表」那一套）+ 12 小时期限。"""
         items = self._items_for_card(gid, row["item_ids"])
         if not items:
             return "", 0.0
         link = self._cached_link(gid)
         data = self._card_data(gid, items, int(row["batch_id"] or 0), link)
+        slot_ts = clock.now() if now is None else float(now)
+        self._stamp_slot(data, slot_ts)
         return self._text_fallback(data), float(row["created"] or 0) + EXPIRE_S
 
     def _enqueue_text_fallback(self, gid: str, cid: int, *, now: float) -> bool:
@@ -954,13 +1116,18 @@ class CardPush:
         ).fetchone()
         if row is None:
             return False
-        text, expires = self._fallback_text(gid, row)
+        text, expires = self._fallback_text(gid, row, now=now)
+        rendered_slot_label = _slot_label(now)
         if not text:
             self._kv_set(self._fallback_kv(cid),
                          {"status": "no_items", "ts": float(now), "outbox_id": 0})
             self._note_card_error(cid, "没有可发送的条目，未补发文字版")
             return False
-        payload = {"push_kind": "news_card", "text": text, "expires_ts": float(expires)}
+        payload = {
+            "push_kind": "news_card", "text": text,
+            "rendered_slot_label": rendered_slot_label,
+            "expires_ts": float(expires),
+        }
         try:
             oid = outbox.enqueue(key, gid, "text", payload)
         except Exception:
@@ -1009,13 +1176,14 @@ class CardPush:
         """手动重发一张 failed / uncertain 的卡片（网页管理员接口调它）。
 
         - 只允许 failed / uncertain，别的状态抛 ValueError（网页 409）；卡片不存在抛 KeyError（404）；
-        - 有缓存图（card-<id>.jpg / .png）就先用缓存，没有就重新画；发送前按实际投递时段校正抬头；
-          画图失败退回纯文字；
+        - 有缓存图（card-<id>.jpg / .png）就先用缓存，没有就按本次备料时段重新画；
+          排队期间跨时段的图片会由 CardPush 后台长活更新，画图失败退回纯文字；
         - 一张卡片**每天最多手动重发 1 次**（kv 记北京日期）；
         - 照旧走发件箱：开关 / 睡觉时段 / 每日额度都还管；有效期从这次重发重新算 12 小时
           （不然失败很久的卡片一入队就被 TTL 作废，点了等于没点）。
         """
-        moment = clock.now() if now is None else float(now)
+        follow_clock = now is None
+        moment = clock.now() if follow_clock else float(now)
         row = self._store.read().execute(
             "SELECT * FROM news_cards WHERE id=?", (int(cid),)
         ).fetchone()
@@ -1040,30 +1208,57 @@ class CardPush:
 
         link = await self._link(gid)
         items = self._items_for_card(gid, row["item_ids"])
-        cached = next(
-            (p for p in self._image_paths(cid) if p.is_file() and not p.is_symlink()), None
-        )
+        box = self._store.read().execute(
+            "SELECT id, status, kind, payload FROM outbox WHERE key=?",
+            (f"news_card:{int(cid)}",),
+        ).fetchone()
+        previous_payload: dict = {}
+        if box is not None:
+            try:
+                previous_payload = json.loads(box["payload"] or "{}")
+            except (TypeError, ValueError):
+                previous_payload = {}
+            if not isinstance(previous_payload, dict):
+                previous_payload = {}
+        paths = self._image_paths(cid)
+        preferred = Path(str(previous_payload.get("path") or ""))
+        cached = preferred if preferred in paths and preferred.is_file() and not preferred.is_symlink() else None
+        if cached is None:
+            cached = next((p for p in paths if p.is_file() and not p.is_symlink()), None)
         path: Optional[Path] = cached
         used_cache = cached is not None
         mode = "image" if cached is not None else "text"
         data: Optional[dict] = None
+        rendered_slot_label = ""
         if cached is None:
             if not items:
                 raise ValueError("这张卡片的条目已全部撤下，没有可发送的内容")
             data = self._card_data(gid, items, int(row["batch_id"] or 0), link)
             img: bytes = b""
+            rendered_at = clock.now() if follow_clock else moment
             try:
-                img = await self._render(data)
+                img, rendered_slot_label, finished_at = await self._render_for_slot(
+                    data, rendered_at, follow_clock=follow_clock,
+                )
             except Exception as e:  # 画不出来 → 退回纯文字，和自动路径一个口径
                 logger.warning("手动重发画图失败，改发纯文字（群 %s 卡片 %s）：%s", gid, cid, e)
+                finished_at = clock.now() if follow_clock else moment
+                rendered_slot_label = self._stamp_slot(data, finished_at)
+            if finished_at >= moment + EXPIRE_S:
+                raise ValueError("卡片渲染完成时已超过重发有效期，请稍后重新提交")
             if img:
                 path = self._image_path(cid, bytes(img))
                 try:
-                    path.write_bytes(bytes(img))
+                    await asyncio.to_thread(self._write_cached_image, path, bytes(img))
                     mode = "image"
-                except OSError as e:
+                except Exception as e:
                     logger.warning("手动重发图片落盘失败，改发纯文字（群 %s 卡片 %s）：%s", gid, cid, e)
                     path, mode = None, "text"
+                    img = b""
+            if not img:
+                rendered_slot_label = self._stamp_slot(
+                    data, clock.now() if follow_clock else finished_at,
+                )
         payload: dict[str, Any] = {
             "push_kind": "news_card",
             # 有效期从这次重发重新算：手动重发是管理员明确要求的，不能被老 TTL 当场作废
@@ -1071,32 +1266,65 @@ class CardPush:
         }
         if mode == "image" and path is not None:
             payload.update({"path": str(path), "text": f"看全部资讯：{link}" if link else ""})
+            # 只有上次载荷也是图片时，它的标签才对应缓存图片；未知缓存会被 Outbox 暂缓刷新。
+            if cached is None:
+                payload["rendered_slot_label"] = rendered_slot_label
+            elif box is not None and str(box["kind"] or "") == "image":
+                payload["rendered_slot_label"] = str(previous_payload.get("rendered_slot_label") or "")
         else:
             if not items:
                 raise ValueError("这张卡片的条目已全部撤下，没有可发送的内容")
             if data is None:
                 data = self._card_data(gid, items, int(row["batch_id"] or 0), link)
+                rendered_slot_label = self._stamp_slot(data, moment)
             payload["text"] = self._text_fallback(data)
+            payload["rendered_slot_label"] = rendered_slot_label or self._stamp_slot(data, moment)
             mode = "text"
         kind = "image" if mode == "image" else "text"
-        box = self._store.read().execute(
-            "SELECT id FROM outbox WHERE key=?", (f"news_card:{int(cid)}",)
-        ).fetchone()
-        if box is None:
-            oid = int(outbox.enqueue(f"news_card:{int(cid)}", gid, kind, payload))
-        else:
-            oid = int(box["id"])
-            with self._store.tx() as conn:
-                conn.execute(
+        key = f"news_card:{int(cid)}"
+        with self._store.tx() as conn:
+            current_card = conn.execute(
+                "SELECT status FROM news_cards WHERE id=?", (int(cid),)
+            ).fetchone()
+            current_status = str(current_card["status"] or "") if current_card is not None else ""
+            if current_status not in ("failed", "uncertain"):
+                raise ValueError("卡片已被其他请求处理，不能重复重发")
+            kv_row = conn.execute("SELECT value FROM kv WHERE key=?", (kvkey,)).fetchone()
+            if kv_row is not None:
+                try:
+                    current_rec = json.loads(kv_row["value"] or "{}")
+                except (TypeError, ValueError):
+                    current_rec = {}
+                if isinstance(current_rec, dict) and str(current_rec.get("date") or "") == today:
+                    raise ValueError("这张卡片今天已手动重发过一次，请明天再操作")
+
+            current_box = conn.execute(
+                "SELECT id, status FROM outbox WHERE key=?", (key,)
+            ).fetchone()
+            if current_box is None:
+                oid = int(outbox.enqueue(key, gid, kind, payload, conn=conn))
+            else:
+                box_status = str(current_box["status"] or "")
+                if box_status not in ("failed", "uncertain"):
+                    raise ValueError("发件箱已进入发送流程，不能重置为待发")
+                oid = int(current_box["id"])
+                updated = conn.execute(
                     "UPDATE outbox SET status='pending', kind=?, payload=?, attempts=attempts+1,"
-                    " not_before=0, error='', updated=? WHERE id=?",
+                    " not_before=0, error='', updated=? WHERE id=? AND status IN ('failed','uncertain')",
                     (kind, json.dumps(payload, ensure_ascii=False), moment, oid),
                 )
-        # 只改状态和模式：**不往 error 里写「手动重发」**——那是给网页显示的错误行，
-        # 写操作记录会被读成一条报错；重发次数限制记在下面 kv["news_card.resend.<id>"] 里，
-        # 和 error 字段无关（2026-10-15 复核）。真发送失败时 on_result 会用新原因覆盖 error。
-        self._set(cid, status="queued", mode=mode, due_ts=moment)
-        self._kv_set(kvkey, {"date": today, "ts": moment, "mode": mode, "outbox_id": oid})
+                if int(updated.rowcount or 0) != 1:
+                    raise ValueError("发件箱已进入发送流程，不能重置为待发")
+            card_update = conn.execute(
+                "UPDATE news_cards SET status='queued', mode=?, due_ts=?"
+                " WHERE id=? AND status IN ('failed','uncertain')",
+                (mode, moment, int(cid)),
+            )
+            if int(card_update.rowcount or 0) != 1:
+                raise ValueError("卡片已被其他请求处理，不能重复重发")
+            self._store.kv_set(conn, kvkey, {
+                "date": today, "ts": moment, "mode": mode, "outbox_id": oid,
+            })
         logger.info("管理员手动重发资讯卡片（群 %s 卡片 %s，%s）", gid, cid, mode)
         return {
             "ok": True, "card_id": int(cid), "group_id": gid, "mode": mode,
