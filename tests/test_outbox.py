@@ -143,7 +143,7 @@ def _artifact_file(
 
 def _rows(store: Store):
     return store.read().execute(
-        "SELECT id, key, kind, status, payload, error, result, attempts, not_before, task_id"
+        "SELECT id, key, kind, status, payload, error, result, attempts, not_before, task_id, updated"
         " FROM outbox ORDER BY id"
     ).fetchall()
 
@@ -285,7 +285,7 @@ async def test_flush_other_error_retries_once_then_failed_and_redacts_secrets(tm
     row = _rows(store)[0]
     assert row["status"] == "pending"            # 排了一次重试
     assert int(row["attempts"]) == 1
-    assert float(row["not_before"]) == NOON + 300
+    assert float(row["not_before"]) == float(row["updated"]) + 300
     assert "重试" in row["error"]
     assert "sk-abcdefghijklmnop" not in row["error"]
     assert "toptoken123" not in row["error"]
