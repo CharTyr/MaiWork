@@ -218,7 +218,8 @@ function taskDetail(id) {
 function handoffEntry(t) {
   const n = Number(t.handoff_count) || 0;
   const count = gadmin() && n > 0 ? `<span class="ho-count">已导出 ${n} 次</span>` : "";
-  return `<div class="ho-entry ho-task"><button class="link-btn" data-act="handoff" data-kind="task" data-id="${esc(t.id)}">交给我的 agent</button>${count}</div>`;
+  const ask = admin() ? `<button class="link-btn" type="button" data-act="chat-ask-ref" data-g="${esc(t.group_id || state.g || "")}" data-ref="${esc(t.id)}" data-title="${esc(t.title || "")}">在对话中询问</button>` : "";
+  return `<div class="ho-entry ho-task"><button class="link-btn" data-act="handoff" data-kind="task" data-id="${esc(t.id)}">交给我的 agent</button>${ask}${count}</div>`;
 }
 
 function goalDetail(goal) {
@@ -260,7 +261,8 @@ function goalDetail(goal) {
     ${goal.by ? `<div class="dt-sec"><div class="dt-label">来源</div><div class="dt-text">${esc(goal.by)}</div></div>` : ""}
     ${row ? `<div class="dt-sec"><div class="dt-label">相关任务</div>${taskRow(row, 0)}</div>` : ""}
     ${chatBlock}
-    ${acts}`;
+    ${acts}
+    ${admin() ? `<div class="ho-entry ho-goal"><button class="link-btn" type="button" data-act="chat-ask-ref" data-g="${esc(goal.group_id || state.g || "")}" data-ref="${esc(goal.id)}" data-title="${esc(goal.title || "")}">在对话中询问</button></div>` : ""}`;
 }
 
 export function detailHTML() {

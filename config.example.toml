@@ -5,7 +5,7 @@
 # 是否启用 MaiWork；默认关闭。宿主在没写 enabled 时会当成开启，所以这里必须显式写。
 enabled = false
 # 配置版本；改默认值时会升。一般不用手改。
-config_version = "0.5.4"
+config_version = "0.5.5"
 
 
 [groups]
@@ -213,6 +213,8 @@ use = "typesafe"
 
 
 [quick_judge]
+# 由 MaiBot 聊天规划器优先通过工具接单；未跑完时再由 Jev / 快速判断兜底。
+planner_tool = true
 # 派活判断兜底：没配 Jev、Jev 连不上、或 Jev 拿不准时，用模型快速判一条
 # 「群里 @ 的是不是派活」（一条 @ 一次模型调用，不攒批、不等待）。判得准的当场建
 # 待批请求 / 提醒；判不准的仍然写进 pending_asks，等主模型读群时再判（老慢路径照旧，

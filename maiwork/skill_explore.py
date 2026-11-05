@@ -461,7 +461,52 @@ async def run(
         out["reason"] = "task skill 已满且都锁定"
         return out
 
+    # 真要开工 → 整轮包成一条 main_runs 条目（库号 50：归 task 栏，不占主模型栏）；
+    # 轮里选题那次模型调用 / 沙箱那轮工具调用都自动挂条目 ref，看板精确回看。
+    from .main_run import MainRuns
+
+    scope = MainRuns(store).scope(
+        gid, "skill_explore", title="闲时探索做法", lane="task")
+    async with scope:
+        return await _run_round(
+            store, models, workers, env, agents, gid, now,
+            profiles=profiles, tools=tools,
+            get_known_secrets=get_known_secrets, scope=scope)
+
+
+async def _run_round(
+    store: Any,
+    models: Any,
+    workers: Any,
+    env: Any,
+    agents: Any,
+    gid: str,
+    now: float,
+    *,
+    profiles: Any = None,
+    tools: Any = None,
+    get_known_secrets: Any = None,
+    scope: Any = None,
+) -> dict[str, Any]:
+    """闲时探索的正文（节流 / 服务群校验都过了，main_runs 条目已开）。"""
+    out: dict[str, Any] = {"ran": False, "skill_id": None, "reason": ""}
+
+    def _fail(reason: str, title: str = "") -> dict[str, Any]:
+        """结果已定是失败（不抛异常的正常返回）：把条目也标 failed，顺手改写标题。"""
+        if title:
+            try:
+                scope.set_title(title)
+            except Exception:
+                pass
+        try:
+            scope.fail(reason)
+        except Exception:
+            pass
+        out["reason"] = reason
+        return out
+
     # ---- 选题 -----------------------------------------------------------------
+    st = _state(store, gid)
     topics = _recent_topics(profiles, gid)
     signals = _task_signals(store, gid, now)
     explored = [str(k) for k in (st.get("explored_keys") or []) if str(k or "").strip()]
@@ -477,12 +522,19 @@ async def run(
         pick = None
     if pick is None:
         _mark_attempt(store, gid, st, now)
-        out["reason"] = "选题失败"
-        return out
+        return _fail("选题失败")
     if pick.get("skip"):
         _mark_attempt(store, gid, st, now)
+        # skip 不算失败（这轮本来就没事做）：条目仍标 done，只改标题说明没方向。
+        try:
+            scope.set_title("闲时探索：本轮暂无合适方向")
+        except Exception:
+            pass
         out["reason"] = "主模型说没方向"
         return out
+
+    topic = str(pick.get("topic") or pick.get("skill_name") or "")[:60]
+    explore_title = f"闲时探索：{topic}"[:80]
 
     # ---- 沙箱探索 + 真机试跑 -----------------------------------------------------
     out["ran"] = True
@@ -502,12 +554,10 @@ async def run(
     except Exception:
         logger.info("闲时探索沙箱一轮出错（群 %s），记一次尝试", gid, exc_info=True)
         _mark_attempt(store, gid, st, now)
-        out["reason"] = "沙箱探索出错"
-        return out
+        return _fail("沙箱探索出错", explore_title)
     if not getattr(report, "ok", False):
         _mark_attempt(store, gid, st, now)
-        out["reason"] = "子 agent 没做成"
-        return out
+        return _fail("子 agent 没做成", explore_title)
     data = report.data if isinstance(getattr(report, "data", None), dict) else {}
     body = str(data.get("skill_markdown") or "")
 
@@ -529,8 +579,7 @@ async def run(
     if gate:
         logger.info("闲时探索丢弃（群 %s）：%s（方向 %s）", gid, gate, pick["skill_name"])
         _mark_attempt(store, gid, st, now)
-        out["reason"] = gate
-        return out
+        return _fail(gate, explore_title)
 
     # ---- 写库 ------------------------------------------------------------------
     front = SkillSummary._validate(clean)  # noqa: SLF001  （清洗后再校一次拿 front）
@@ -558,9 +607,12 @@ async def run(
     except Exception:
         logger.info("闲时探索写库失败（群 %s，方向 %s）", gid, pick["skill_name"], exc_info=True)
         _mark_attempt(store, gid, st, now)
-        out["reason"] = "写库失败"
-        return out
+        return _fail("写库失败", explore_title)
     _mark_run(store, gid, st, now, pick["skill_name"])
+    try:
+        scope.set_title(f"闲时探索：{topic}（已沉淀 {front['name']}）"[:80])
+    except Exception:
+        pass
     out["skill_id"] = sid
     out["reason"] = "ok"
     logger.info("闲时探索沉淀了一份 skill（群 %s）：%s（id=%s）", gid, front["name"], sid)

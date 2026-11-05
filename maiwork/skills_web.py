@@ -35,6 +35,45 @@ from .skills import (
 logger = logging.getLogger("maiwork.skills_web")
 
 KV_SKILLS_WEB = "extensions.skills.web"   # 网页加过的 skill 名单
+KV_SKILLS_SEEDED = "extensions.skills.seeded"  # 补种过的默认全局 skill（种过一次就不再种，删了不复活）
+
+# 冷场开场白的写法：首次运行补种成网页可编辑的全局 skill；topics 开场白回合按名字注入
+TOPIC_OPENER_SKILL = "topic-opener"
+TOPIC_OPENER_DESCRIPTION = (
+    "冷场破冰开话题的写法（开场白回合自动带入，派活排计划无需读取）：像熟人群友随手甩一句 15～50 字的槽点、"
+    "反差细节或二选一，留一半话头给群友接，不写前因后果小作文，不提自身人设标签。"
+)
+TOPIC_OPENER_DEFAULT_BODY = """# 冷场开话题写法
+
+## 先想清楚
+群聊破冰最忌「先复述一遍背景 + 破折号 + 一句温吞感慨（有点尴尬了 / 我挺好奇的 / 大家怎么看）」：话说太满，群友没法接。
+真人在群里起话头，只甩最扎眼的那一下，留一半话头给别人吐槽或站队。
+
+## 长度与节奏
+- 平时 **15～50 字**，硬上限 **75 字**（不含链接长度）。
+- 一句说完就停；省掉「最近看到」「听说某公司宣布」这类导语，直接说那个点。
+- 最多一个链接，也可以不带。
+
+## 四个好用的切口
+1. 具体取舍 / 站队题
+   - 差：索尼宣布更多第一方游戏移植 PC——这对主机玩家来说有点尴尬了，大家怎么看？
+   - 好：索尼独占一个个上 PC，现在买 PS5 还图啥，图手柄吗
+2. 槽点直球
+   - 差：最近有报道称 Win11 更新后部分游戏帧率下降，这个问题值得关注。
+   - 好：Win11 这次更新又把帧率干掉一截，回滚是不是唯一解
+3. 老坑 / 具体细节共鸣
+   - 差：时之笛是一款经典游戏，其中水之神殿给很多人留下了深刻印象。
+   - 好：时之笛水之神殿那双铁靴子，穿脱一百次的阴影还在
+4. 反常识结果直出（不必带问号）
+   - 差：有人测试了 Steam Deck 的蓝牙延迟，结果令人意外，我挺好奇的。
+   - 好：Steam Deck 接蓝牙耳机延迟居然比有线还稳，离谱
+
+## 死禁区
+- 不写三段式小作文，不用破折号总结腔，不写前因后果。
+- 不提自己的名字、昵称、性别、年龄、所在城市，不自称「老玩家 / 重度玩家 / 鉴赏家」。
+- 不点名群友，不招揽任务，不写成提供服务的邀约。
+- 只输出发进群的那句话；不输出思考草稿、字数盘算或对要求的复述。
+"""
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SIZE_MAX_BYTES = 40 * 1024               # 单个 SKILL.md ≤ 40KB
 _FILES_LIST_MAX = 50
@@ -303,6 +342,71 @@ def get_view(
         return None
 
 
+def export_zip(data_dir: Path | str, store: Any, name: str) -> bytes:
+    """导出内置 / 自定义 skill 的全部普通文件；不跟符号链接、不受预览 50 条限制。
+
+    ValueError 名字不合法；KeyError 不存在或 SKILL.md 不可安全读取。
+    包内保留唯一顶层目录，可直接交给 install_zip 安装。
+    """
+    custom = _safe_skill_dir(_root(data_dir), name)
+    skill_dir = _builtin_dir(name) or custom
+    if get_view(data_dir, store, name) is None:
+        raise KeyError(name)
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        for dirpath, dirnames, filenames in os.walk(skill_dir, followlinks=False):
+            dirnames[:] = sorted(d for d in dirnames if not (Path(dirpath) / d).is_symlink())
+            for filename in sorted(filenames):
+                path = Path(dirpath) / filename
+                if not stat.S_ISREG(path.lstat().st_mode):
+                    continue
+                relative = path.relative_to(skill_dir).as_posix()
+                archive.write(path, f"{skill_dir.name}/{relative}")
+    return output.getvalue()
+
+
+def list_suggestions(
+    svc: Any, existing_names: set[str] | None = None, *, limit: int = 12,
+) -> list[dict[str, Any]]:
+    """管理员可提升为全局做法的本群 task skill，按使用次数 / 更新时间倒序。
+
+    只读服务群 active 做法，不增加 uses；全局同名忽略大小写，最多十二条。
+    """
+    agents = getattr(svc, "agents", None)
+    count = max(0, min(12, int(limit)))
+    if agents is None or count == 0:
+        return []
+    from .models import _redact_full
+    from .names import clean_group_name
+
+    settings = svc.get_settings()
+    store = svc.store
+    if existing_names is None:
+        existing_names = {item["name"] for item in list_view(settings.data_dir, store, settings)}
+    existing = {str(name).casefold() for name in existing_names}
+    getter = getattr(svc, "known_secrets", None)
+    secrets = list(getter() or []) if callable(getter) else []
+    candidates: list[tuple[dict[str, Any], float]] = []
+    for gid in settings.groups:
+        group = store.read().execute("SELECT name FROM groups WHERE group_id=?", (gid,)).fetchone()
+        group_name = clean_group_name(str(group["name"] or ""), gid) if group else ""
+        for row in agents.skills(gid, "task", include_archived=False):
+            if row.get("status", "active") != "active" or str(row.get("name") or "").casefold() in existing:
+                continue
+            item = {
+                "group_id": str(gid), "group_name": group_name,
+                "id": int(row["id"]), "name": str(row.get("name") or ""),
+                "description": str(row.get("description") or ""),
+                "body": str(row.get("body") or ""), "origin": str(row.get("origin") or ""),
+                "uses": int(row.get("uses") or 0),
+            }
+            item = {key: _redact_full(value, secrets) if isinstance(value, str) else value
+                    for key, value in item.items()}
+            candidates.append((item, float(row.get("updated") or 0)))
+    candidates.sort(key=lambda pair: (-pair[0]["uses"], -pair[1]))
+    return [item for item, _ in candidates[:count]]
+
+
 # ----------------------------------------------------------------------
 # 写
 # ----------------------------------------------------------------------
@@ -361,6 +465,28 @@ def create(data_dir: Path | str, store: Any, body: dict[str, Any]) -> dict[str, 
     view = get_view(data_dir, store, name)
     assert view is not None
     return view
+
+
+def ensure_seeded_skills(data_dir: Path | str, store: Any) -> None:
+    """补种默认全局 skill（目前只有 topic-opener）：每个只种一次；
+    管理员删了不会再种回来，目录里已有同名的不覆盖。"""
+    if store is None:
+        return
+    raw = store.kv_get(KV_SKILLS_SEEDED)
+    seeded = [str(x) for x in raw] if isinstance(raw, list) else []
+    if TOPIC_OPENER_SKILL in seeded:
+        return
+    skill_dir = _safe_skill_dir(_root(data_dir), TOPIC_OPENER_SKILL)
+    if not skill_dir.exists() and not skill_dir.is_symlink():
+        create(data_dir, store, {
+            "name": TOPIC_OPENER_SKILL,
+            "description": TOPIC_OPENER_DESCRIPTION,
+            "roles": ["main"],
+            "body": TOPIC_OPENER_DEFAULT_BODY,
+        })
+    seeded.append(TOPIC_OPENER_SKILL)
+    with store.tx() as conn:
+        store.kv_set(conn, KV_SKILLS_SEEDED, seeded)
 
 
 def update(data_dir: Path | str, store: Any, name: str, body: dict[str, Any]) -> dict[str, Any]:

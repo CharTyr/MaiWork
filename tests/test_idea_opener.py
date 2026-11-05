@@ -161,4 +161,4 @@ async def test_news_opener_keeps_old_shape(tmp_path) -> None:
     assert "不必" in text and "问句" in text
     assert "新话题" in text and "硬接" in text
     assert "不要编造" in text
-    assert "120 字" in text and "最多一个链接" in text
+    assert "75 字" in text and "最多一个链接" in text

@@ -2,16 +2,17 @@
 import { state, $ } from "../state.js";
 import { agentFish, agentSeed, api } from "../api.js";
 import { fishSvg, fishTraits, parseCustom, customSeed, FISH_SPECIES, FISH_EYES, FISH_COLORS, FISH_COLOR_NAMES, FISH_BASE_RE } from "../fish.js";
-import { esc, tip, toast, SVG } from "../util.js";
+import { esc, ico, tip, toast, SVG, gface, safeUrl, when } from "../util.js";
 import { repaintSheet } from "../sheet.js";
 import { loading } from "../pages/news.js";
 import { avatarBlock } from "./identity.js";
 import { EFFORT_NAMES, loadModels } from "./models.js";
 import { confirmExecTools, execConfirmNeeded } from "./ext.js";
+import { skillIconName } from "./skills.js";
 
 
 // 每个岗位一条程序生成的小鱼；fish_seed 为空时按岗位名固定，「换一条」只改这个岗位的种子。
-const fishOf = (kind, size) => agentFish(kind, size);
+const fishOf = (kind, size, opts) => agentFish(kind, size, opts);
 const newSeed = () => Math.random().toString(36).slice(2, 10);
 const LABELS = { queued: "排队中", running: "进行中", returned: "待检查", accepted: "已通过", rejected: "未采用", failed: "失败", cancelled: "已取消" };
 const SPECIALISTS = new Set(["news", "idea", "goal"]);
@@ -60,11 +61,38 @@ export function agentsPage() {
     <div class="h-sub-row"><h2 class="h-sub">专岗${tip("主模型负责分析和检查，专岗负责执行具体工作。")}</h2><button class="btn small" data-act="agent-new">新建</button></div>
     ${!inSheet && state.agentNew ? newAgentForm() : ""}
     ${rows ? `<div class="set-group">${rows}</div>` : ""}
-    <h2 class="h-sub">本群工作记录${tip("各专岗在所选群中的工作记录。")}</h2>
-    ${groups.length ? `<label for="agent-group" class="fine">群</label><select id="agent-group">${groups.map((g) => `<option value="${esc(g.id)}"${state.agentGroup === g.id ? " selected" : ""}>${esc(g.name || `群 ${g.id}`)}</option>`).join("")}</select>` : `<p class="fine">暂无群</p>`}
+    ${journalTop(groups)}
     ${state.agentError ? `<p class="err" role="alert">${esc(state.agentError)}</p><button class="btn small" data-act="agent-reload">刷新</button>` : ""}
     ${groups.length && !snapshot && !state.agentError ? loading() : ""}
-    ${snapshot && snapshot.group_id === state.agentGroup ? (snapshot.agents || []).filter((a) => a.kind !== "main").map(journalSection).join("") : ""}`;
+    ${snapshot && snapshot.group_id === state.agentGroup ? journalBody(snapshot) : ""}`;
+}
+
+// 本群工作记录的标题行：一个群只显示胶囊，多个群才给下拉
+function journalTop(groups) {
+  let pick = "";
+  if (groups.length === 1) pick = `<span class="journal-group-badge">${gface(groups[0])}<span>${esc(groups[0].name || `群 ${groups[0].id}`)}</span></span>`;
+  else if (groups.length > 1) {
+    const curGroup = groups.find((g) => g.id === state.agentGroup) || groups[0];
+    const options = groups.map((g) => `<option value="${esc(g.id)}"${state.agentGroup === g.id ? " selected" : ""}>${esc(g.name || `群 ${g.id}`)}</option>`).join("");
+    pick = `<div class="journal-group-pick">${curGroup ? gface(curGroup) : ""}<select id="agent-group" aria-label="选择服务群">${options}</select>${SVG.down || ""}</div>`;
+  }
+  return `<div class="h-sub-row journal-top"><h2 class="h-sub">本群工作记录${tip("展示各专岗在所选群中的最近交接与近期完成记录（用于避免重复工作）。本群规则和本群做法请在群页「本群设置」中修改。")}</h2>${pick}</div>
+    ${groups.length ? "" : `<p class="fine">暂无服务群</p>`}`;
+}
+
+const journalTotal = (a) => (a.recent_handoffs || []).length + (a.kind === "task" ? 0 : (a.learned || []).length);
+
+// 专岗胶囊切换 + 选中专岗的单块记录面板
+function journalBody(snapshot) {
+  const list = (snapshot.agents || []).filter((a) => a.kind !== "main");
+  if (!list.length) return "";
+  const cur = list.find((a) => a.kind === state.agentJournalKind)
+    || list.find((a) => (a.recent_handoffs || []).length > 0 || (a.kind !== "task" && (a.learned || []).length > 0)) || list[0];
+  const tabs = list.map((a) => {
+    const on = a === cur;
+    return `<button type="button" role="tab" class="journal-tab" data-act="agent-journal-tab" data-kind="${esc(a.kind)}" aria-selected="${on ? "true" : "false"}"><span class="agent-fish xs">${fishOf(a.kind, 22, on ? {} : { still: true })}</span><span>${esc(a.title)}</span><span class="journal-tab-cnt">${journalTotal(a)}</span></button>`;
+  }).join("");
+  return `<div class="journal-tabs" role="tablist" aria-label="选择专岗">${tabs}</div>${journalPanel(cur)}`;
 }
 
 function newAgentForm() {
@@ -75,17 +103,29 @@ function newAgentForm() {
   </div>`;
 }
 
+function countAgentSkills(p) {
+  const all = state.agentSkills || (state.ext && state.ext.skills) || [];
+  if (p.kind === "main") {
+    return all.filter((s) => s.enabled !== false && (!(s.roles || []).length || (s.roles || []).includes("main"))).length;
+  }
+  const workerAll = all.filter((s) => s.enabled !== false && (!(s.roles || []).length || (s.roles || []).includes("worker")));
+  if ((p.kind === "task" || isCustom(p)) && p.skills === null) return workerAll.length;
+  const bound = new Set(p.skills || []);
+  return workerAll.filter((s) => bound.has(s.name)).length;
+}
+
 function profileRow(p) {
   const tag = TAGS[p.kind] || (isCustom(p) ? "自定义" : "");
   const fresh = state.agentFishNew === p.kind;
   const off = p.kind !== "main" && p.enabled === false;
+  const skCount = countAgentSkills(p);
   const model = p.model
     ? `${esc(modelName(p.model))}${p.effort ? ` · 思考强度 ${esc(EFFORT_NAMES[p.effort] || p.effort)}` : ""}${p.backup ? ` · 备用 ${esc(modelName(p.backup))}` : ""}`
     : `<b>未选择模型</b>${p.kind === "main" ? "（无法运行）" : "（暂用主模型）"}`;
   return `<div class="set-row agent-row"><span class="agent-fish${fresh ? " is-new" : ""}" data-fish="${esc(p.kind)}">${fishOf(p.kind, 48)}</span><div>
     <div class="set-name">${esc(p.title)}${tag ? `<span class="tag">${esc(tag)}</span>` : ""}</div>
     <div class="set-text">${esc(LEADS[p.kind] || "由主模型按 AGENTS.md 分派任务")}</div>
-    <div class="set-text ext-st"><span class="dot ${off ? "" : "ok"}"></span>${off ? "已停用 · " : ""}${model}</div>
+    <div class="set-text ext-st"><span class="dot ${off ? "" : "ok"}"></span>${off ? "已停用 · " : ""}${model} · <button type="button" class="link-btn ag-skill-link" data-act="agent-goto-skills" data-role="${esc(p.kind)}">${skCount ? `已启用 ${skCount} 项技能` : "查看技能"}</button></div>
     </div><div class="agent-row-acts"><button class="btn small ghost" data-act="agent-fish-reroll" data-kind="${esc(p.kind)}" title="随机生成">随机</button><button class="btn small ghost" data-act="agent-fish-custom" data-kind="${esc(p.kind)}" title="选择鱼种、颜色和眼神">自定义</button><button class="btn small" data-act="agent-profile-edit" data-kind="${esc(p.kind)}">设置</button></div></div>`;
 }
 
@@ -162,11 +202,12 @@ function profileForm(p) {
     <label for="agent-backup">备用模型</label><select id="agent-backup">${modelOptions(p.backup, "不使用")}</select>
     ${main ? "" : `<div class="lbl-row"><label for="agent-escalate">返工模型</label>${tip("结果被退回两次后，改用该模型继续修改；与当前模型相同时不再重试。")}</div><select id="agent-escalate">${modelOptions(p.escalate, "同主模型")}</select>`}
     ${main ? "" : `<label class="chk"><input id="agent-enabled" type="checkbox"${p.enabled !== false ? " checked" : ""} />启用</label>`}
-    ${main ? "" : `<label>可用 skill</label><div id="agent-skills">${names.map((name) => {
+    ${main ? `<div class="lbl-row"><label>可用技能</label></div><p class="fine" style="margin:0">已启用 ${countAgentSkills(p)} 项主模型技能，可在 <button type="button" class="link-btn" data-act="agent-goto-skills" data-role="main">技能中心</button> 查看或管理。</p>` : `<div class="h-sub-row" style="margin-top:8px"><label style="margin:0">可用技能</label><button type="button" class="link-btn" data-act="agent-goto-skills" data-role="${esc(p.kind)}">前往技能中心</button></div><div id="agent-skills" class="ag-sk-list">${names.map((name) => {
       const k = catalog.find((x) => x.name === name);
       const brings = k && (k.allowed_tools || []).length ? `<span class="fine">（带工具：${k.allowed_tools.map(esc).join("、")}）</span>` : "";
-      return `<label class="chk"><input type="checkbox" value="${esc(name)}"${selected.has(name) ? " checked" : ""} />${esc(name)}${brings}${k && k.enabled === false ? `<span class="fine">（已停用）</span>` : ""}</label>`;
-    }).join("") || `<p class="fine">暂无 skill</p>`}</div>`}
+      const iconName = typeof skillIconName === "function" ? skillIconName(k) : "sparkles";
+      return `<label class="chk ag-sk-row"><input type="checkbox" value="${esc(name)}"${selected.has(name) ? " checked" : ""} /><span class="ag-sk-ico">${ico(iconName)}</span><span class="ag-sk-body"><span class="ag-sk-t">${esc(name)}${brings}${k && k.enabled === false ? `<span class="fine">（已停用）</span>` : ""}</span>${k && k.description ? `<span class="ag-sk-d">${esc(k.description)}</span>` : ""}</span></label>`;
+    }).join("") || `<p class="fine">暂无技能</p>`}</div>`}
     ${main ? "" : toolsBlock(p)}
     ${!docs ? loading() : `
       ${docBlock(p.kind, "soul", "SOUL.md", "性格与语气" + (docs.soul && docs.soul.synced_from_maibot ? "；当前内容已从 MaiBot 同步。" : "。"), docs.soul, lim.soul, `<button type="button" class="btn small" data-act="agent-soul-sync" data-kind="${esc(p.kind)}">从 MaiBot 同步</button>`)}
@@ -214,42 +255,86 @@ function repaintFishForm(kind, focusSel) {
   if (focusSel) { const el = document.querySelector(focusSel); if (el) el.focus(); }
 }
 
-// 这个群的工作记录（只读）：最近做过的 + 交接。本群规矩和本群做法搬到了群页「这个群」区（docs/17 §八.4）
-function journalSection(a) {
+// 这个群的工作记录（只读）：最近交接 + 近期完成。本群规矩和本群做法在群页「本群设置」（docs/17 §八.4）
+function journalPanel(a) {
   const learned = a.learned || [];
   const handoffs = a.recent_handoffs || [];
-  const meta = [a.kind === "task" ? "" : `近期完成 <b>${learned.length}</b>`, `最近交接 <b>${handoffs.length}</b>`]
+  const isTask = a.kind === "task";
+  const meta = [`最近交接 <b>${handoffs.length}</b>`, isTask ? "" : `近期完成 <b>${learned.length}</b>`]
     .filter(Boolean).join('<span class="journal-dot">·</span>');
-  return `<section class="agent-journal">
-    <div class="journal-head"><span class="agent-fish sm">${fishOf(a.kind, 30)}</span><div class="journal-title"><h3 class="set-name">${esc(a.title)}</h3><div class="journal-meta">${meta}</div></div></div>
-    ${a.kind === "task" ? "" : `<details class="journal-row"><summary>近期完成<span class="fine">用于避免重复工作</span></summary>
-      ${learned.map((m) => `<div class="agent-entry"><p>${esc(m.text || "")}</p>${referenceLinks(m.refs)}${m.source_id ? `<span class="fine">依据：${esc(m.source_id)}</span>` : ""}</div>`).join("") || `<p class="fine">暂无记录</p>`}
-    </details>`}
-    <details class="journal-row"><summary>最近交接<span class="fine">交给我的任务和检查结果</span></summary>
-      ${handoffs.map(handoffEntry).join("") || `<p class="fine">暂无交接记录</p>`}
-    </details>
+  const sub = !isTask && (state.agentJournalSub === "learned" || (!state.agentJournalSub && !handoffs.length && learned.length)) ? "learned" : "handoffs";
+  const segBtn = (key, label) => `<button type="button" role="tab" data-act="agent-journal-sub" data-sub="${key}" aria-selected="${sub === key ? "true" : "false"}"${sub === key ? ' class="on"' : ""}>${label}</button>`;
+  const seg = !isTask && (handoffs.length || learned.length) ? `<div class="seg journal-seg" role="tablist" aria-label="记录类型">${segBtn("handoffs", "最近交接")}${segBtn("learned", "近期完成")}</div>` : "";
+  const empty = (t) => `<div class="journal-empty"><p class="fine">${t}</p></div>`;
+  let body;
+  if (!handoffs.length && (isTask || !learned.length)) body = empty("暂无工作记录。该专岗在本群执行任务或完成检查后将在此留存。");
+  else if (sub === "handoffs") body = handoffs.length ? `<div class="journal-list">${handoffs.map(handoffEntry).join("")}</div>` : empty("暂无交接记录");
+  else body = learned.length ? `<div class="journal-list">${[...learned].reverse().map(learnedEntry).join("")}</div>` : empty("暂无近期完成记录");
+  return `<section class="set-group agent-journal" data-kind="${esc(a.kind)}">
+    <div class="journal-head"><div class="journal-who"><span class="agent-fish sm">${fishOf(a.kind, 34)}</span><div class="journal-title"><h3 class="set-name">${esc(a.title)}${a.enabled === false ? `<span class="tag">已停用</span>` : ""}</h3><div class="journal-meta">${meta}</div></div></div>${seg}</div>
+    ${body}
   </section>`;
 }
 
-function referenceLinks(refs) {
-  return `<div class="agent-refs">${(refs || []).map((ref) => {
-    const s = String(ref);
-    return /^https?:\/\//i.test(s) ? `<a href="${esc(s)}" target="_blank" rel="noopener noreferrer">查看依据 ↗</a>` : `<span class="fine">${esc(s)}</span>`;
-  }).join(" · ")}</div>`;
+// 状态 → [圆点类, 色调类]
+const STATUS_TONE = { accepted: ["ok", "ok"], running: ["running", "run"], queued: ["pool", "run"], returned: ["reviewing", "warn"], rejected: ["waiting", "warn"], failed: ["failed", "bad"] };
+const uniq = (xs) => [...new Set(xs.map((x) => String(x).trim()).filter(Boolean))];
+
+// 后端 review 可能是 JSON 字符串、对象或纯文本；只取摘要、依据、工具，绝不原样露 JSON
+function parseReview(raw) {
+  let v = raw;
+  if (typeof v === "string") {
+    const t = v.trim();
+    if (!t) return { summary: "", refs: [], usedTools: [] };
+    try { v = JSON.parse(t); } catch { return { summary: t, refs: [], usedTools: [] }; }
+  }
+  if (!v || typeof v !== "object" || Array.isArray(v)) return { summary: typeof v === "string" ? v : "", refs: [], usedTools: [] };
+  const arr = (x) => (Array.isArray(x) ? x.filter((y) => typeof y === "string") : []);
+  return { summary: typeof v.summary === "string" ? v.summary.trim() : "", refs: arr(v.refs), usedTools: arr(v.used_tools) };
 }
 
+function fmtTime(ts) {
+  if (!ts) return "";
+  const s = when(ts);
+  return s || new Date(ts * 1000).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+const refItem = (s) => (/^https?:\/\//i.test(s) ? `<a href="${safeUrl(s)}" target="_blank" rel="noopener noreferrer">查看依据 ↗</a>` : `<span class="ntag">${esc(s)}</span>`);
+const chips = (xs) => `<span class="ext-tools">${xs.map((t) => `<span class="ntag">${esc(t)}</span>`).join("")}</span>`;
+const field = (k, v) => `<div class="jh-field"><span class="jh-k">${k}</span>${v}</div>`;
+
 function handoffEntry(h) {
-  const created = h.created ? new Date(h.created * 1000).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
-  return `<details class="agent-entry"><summary><span class="tag">${esc(LABELS[h.status] || h.status || "")}</span>${esc(PHASES[h.phase] || h.phase || h.task_id || "轮次")}<span class="fine"> ${esc(created)}</span></summary>
-    <p>${esc(h.summary || "尚未提交")}</p>
-    ${h.review ? `<p class="fine">检查结果：${esc(typeof h.review === "string" ? h.review : JSON.stringify(h.review))}</p>` : ""}
-    <p class="fine">要求：${esc(h.brief || "")}</p>
-    ${h.criteria ? `<p class="fine">检查标准：${esc(typeof h.criteria === "string" ? h.criteria : JSON.stringify(h.criteria))}</p>` : ""}
-    ${referenceLinks(h.evidence)}
-    ${(h.tools || []).length ? `<p class="fine">使用的工具：${h.tools.map(esc).join("、")}</p>` : ""}
-    ${(h.skills || []).length ? `<p class="fine">使用的 skill：${h.skills.map(esc).join("、")}</p>` : ""}
-    <p class="fine">编号 ${esc(h.id || "")}${h.parent_id ? ` · 来自 ${esc(h.parent_id)}` : ""}</p>
-  </details>`;
+  const [dot, tone] = STATUS_TONE[h.status] || ["", ""];
+  const rev = parseReview(h.review);
+  const criteria = Array.isArray(h.criteria) ? h.criteria.filter((c) => typeof c === "string" && c.trim()).map((c) => c.trim())
+    : typeof h.criteria === "string" && h.criteria.trim() && !/^\s*\[\s*\]\s*$/.test(h.criteria) ? [h.criteria.trim()] : [];
+  const tools = uniq([...(h.tools || []), ...rev.usedTools]);
+  const skills = h.skills || [];
+  const refs = uniq([...(h.evidence || []), ...rev.refs]);
+  const summary = h.error ? `<p class="jh-summary bad-t">${esc(h.error)}</p>`
+    : h.summary ? `<p class="jh-summary">${esc(h.summary)}</p>`
+      : `<p class="jh-summary is-muted">${h.status === "running" || h.status === "queued" ? "正在执行，尚未提交结果" : "未提交结果摘要"}</p>`;
+  const more = [
+    h.brief ? field("任务要求", `<p>${esc(h.brief)}</p>`) : "",
+    criteria.length ? field("检查标准", `<ul class="jh-criteria">${criteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>`) : "",
+    tools.length ? field("使用工具", chips(tools)) : "",
+    skills.length ? field("使用 skill", chips(skills)) : "",
+    refs.length ? field("依据", `<span class="jh-refs">${refs.map(refItem).join("")}</span>`) : "",
+    h.id ? `<div class="jh-id fine">编号 ${esc(h.id)}${h.parent_id ? ` · 上级 ${esc(h.parent_id)}` : ""}</div>` : "",
+  ].join("");
+  return `<div class="agent-entry handoff-entry">
+    <div class="jh-top"><span class="jh-status ${tone}"><span class="dot ${dot}"></span>${esc(LABELS[h.status] || h.status || "未知")}</span><span class="jh-phase">${esc(PHASES[h.phase] || h.phase || "工作轮次")}</span>${h.task_id ? `<span class="ntag">${esc(h.task_id)}</span>` : ""}<span class="jh-time">${esc(fmtTime(h.updated || h.created))}</span></div>
+    ${summary}
+    ${rev.summary ? `<div class="jh-review"><span class="jh-k">检查意见</span><span>${esc(rev.summary)}</span></div>` : ""}
+    ${more ? `<details class="jh-more"><summary>查看要求与明细</summary><div class="jh-more-body">${more}</div></details>` : ""}
+  </div>`;
+}
+
+function learnedEntry(m) {
+  const refs = uniq([m.source_id, ...(m.refs || [])].filter(Boolean));
+  const t = m.updated ? fmtTime(m.updated) : "";
+  const meta = (t ? `<span class="jh-time">${esc(t)}</span>` : "") + refs.map(refItem).join("");
+  return `<div class="agent-entry learned-entry"><p class="jl-text">${esc(m.text || "")}</p>${meta ? `<div class="jl-meta">${meta}</div>` : ""}</div>`;
 }
 
 export async function loadAgents() {
@@ -271,6 +356,7 @@ async function loadAgentGroup(gid) {
   const seq = (state.agentLoadSeq || 0) + 1;
   state.agentLoadSeq = seq;
   state.agentGroup = gid;
+  state.agentJournalSub = null; // 专岗保持不变，方便跨群对比
   state.agentSnapshot = null;
   state.agentError = "";
   repaintSheet();
@@ -309,6 +395,12 @@ function setDocText(kind, which, item) {
 
 export async function actAgents(action, el) {
   switch (action) {
+    case "agent-goto-skills": {
+      state.skillRole = el.dataset.role || "";
+      const { enterSettings } = await import("../router.js");
+      await enterSettings("extensions", "skills");
+      return true;
+    }
     case "agent-profile-edit": {
       const kind = el.dataset.kind;
       state.agentEdit = kind; state.agentFishEdit = null; state.agentFishDraft = null; state.agentNew = false;
@@ -370,6 +462,8 @@ export async function actAgents(action, el) {
       } catch (err) { toast(err.message, true); }
       return true;
     }
+    case "agent-journal-tab": state.agentJournalKind = el.dataset.kind || null; state.agentJournalSub = null; repaintSheet(); return true;
+    case "agent-journal-sub": state.agentJournalSub = el.dataset.sub || null; repaintSheet(); return true;
     case "agent-reload": await loadAgents(); repaintSheet(); return true;
     case "agent-fish-custom": {
       state.agentEdit = null;

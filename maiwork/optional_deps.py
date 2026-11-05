@@ -620,6 +620,7 @@ class OptionalDeps:
         return rec if isinstance(rec, dict) else {}
 
     def _capability_blocks_local_exec(self) -> bool:
+        """判定现在不能跑命令（stopped / 受限）：LocalEnv 还在，但 env.run 起不来东西。"""
         cap = self._capability
         return cap is not None and not bool(getattr(cap, "ok", True))
 
@@ -627,8 +628,8 @@ class OptionalDeps:
         """能不能在本机跑命令 / 探测（不能就装、卸都做不了）。"""
         if self._env is None:
             return "本机执行环境不可用（这台机器无法隔离运行命令），无法安装可选依赖"
-        cap = self._capability
         if self._capability_blocks_local_exec():
+            cap = self._capability
             why = str(getattr(cap, "reason", "") or "本机执行未启用")
             return f"本机执行未启用（{why}），无法安装可选依赖"
         return ""

@@ -128,10 +128,17 @@ class HostContractTest(unittest.TestCase):
         text = repr(comps)
         self.assertIn("chat.receive.after_process", text)
         self.assertIn("maiwork_intake", text)
-        # 不给 MaiBot 的 planner 注册任何工具
-        for c in comps:
-            kind = str(c.get("component_type") or c.get("type") or "").lower()
-            self.assertNotIn("tool", kind, c)
+        # 宿主只暴露群聊接单工具，内部工具不进入 planner。
+        tools = [c for c in comps if "tool" in str(c.get("component_type") or c.get("type") or "").lower()]
+        self.assertEqual(len(tools), 1, tools)
+        self.assertEqual(tools[0]["name"], "maiwork_handoff")
+        self.assertEqual(tools[0]["chat_scope"], "group")
+        self.assertEqual(tools[0]["metadata"]["visibility"], "visible")
+        after = next(c for c in comps if c["name"] == "maiwork_planner_after")
+        self.assertEqual(after["metadata"]["hook"], "maisaka.planner.after_response")
+        self.assertEqual(after["metadata"]["mode"], "observe")
+        self.assertEqual(after["metadata"]["timeout_ms"], 1000)
+        self.assertEqual(after["metadata"]["error_policy"], "skip")
 
     def test_session_command_in_real_host_registry(self) -> None:
         """会话原生命令放进**宿主真实的** ComponentRegistry：只认 @ 本 bot 的显示名、

@@ -1990,7 +1990,7 @@ class Feeds:
         await scope.__aenter__()
         note_token = self._round_note_hids.set([])  # 本轮压着便条的 news 交接单（docs/34 §五 4）
         try:
-            return await self._prepare_news_round(group_id)
+            return await self._prepare_news_round(group_id, scope=scope)
         finally:
             self._round_note_hids.reset(note_token)
             try:
@@ -1998,7 +1998,7 @@ class Feeds:
             except Exception:
                 logger.exception("收资讯轮 round ref 失败")
 
-    async def _prepare_news_round(self, group_id: str) -> int:
+    async def _prepare_news_round(self, group_id: str, *, scope: Any = None) -> int:
         gid = str(group_id)
         settings = self._get_settings()
         # 开工前提（画像成形 / news 专岗启停 / 模型就绪）：和手动「现在就备一批」共用同一个
@@ -2023,6 +2023,14 @@ class Feeds:
                 note = f"{note}；也没订 RSS 源，这轮没有候选入口"
             self._skipped_batch(gid, note)
             return 0
+
+        # 前置检查全过了、真要开工：登记「正在跑」上板（看板 news 栏出 running 条目）。
+        try:
+            if scope is not None:
+                scope.activate(lane="news", group_id=gid,
+                               title="正在采集本群资讯", task_id="")
+        except Exception:
+            logger.exception("资讯轮上板登记失败（群 %s）", gid)
 
         # 这轮的 task_id 标记：子 agent 的工具调用按它落库，统计（搜了几次/看了几篇）按它点数；
         # C03 起这轮的主要模型调用（定关注点/挑/打分/写帖/自检/挑实测）也带它落进 usage 表，
@@ -5449,14 +5457,14 @@ class Feeds:
         scope = run_ref.tagged(ref)
         await scope.__aenter__()
         try:
-            return await self._make_idea_round(group_id)
+            return await self._make_idea_round(group_id, scope=scope)
         finally:
             try:
                 await scope.__aexit__(None, None, None)
             except Exception:
                 logger.exception("收构想轮 round ref 失败")
 
-    async def _make_idea_round(self, group_id: str) -> int | None:
+    async def _make_idea_round(self, group_id: str, *, scope: Any = None) -> int | None:
         gid = str(group_id)
         if not self._profile_ready(gid):
             return None
@@ -5486,6 +5494,13 @@ class Feeds:
         if not idea_chat_lines:
             logger.info("群里最近三天没有一句真话可引，本轮不构想（群 %s）", gid)
             return None
+        # 前置检查全过了、真要开工：登记「正在跑」上板（看板 idea 栏出 running 条目）。
+        try:
+            if scope is not None:
+                scope.activate(lane="idea", group_id=gid,
+                               title="正在构思本群新想法", task_id="")
+        except Exception:
+            logger.exception("构想轮上板登记失败（群 %s）", gid)
         entries = self._safe_entries(gid)
         recent_ideas = self._recent_idea_titles(gid)
         recent_news = self._recent_news_titles(gid)

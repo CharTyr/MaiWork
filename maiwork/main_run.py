@@ -61,18 +61,34 @@ class MainRuns:
     # 开 / 收
     # ------------------------------------------------------------------
 
-    def _begin(self, group_id: str, purpose: str, title: str = "") -> str:
-        """插一条 running，返回它的 ref（也用于 model_calls / tool_calls 的 run_ref）。"""
+    def _begin(self, group_id: str, purpose: str, title: str = "",
+               *, lane: str = "main") -> str:
+        """插一条 running，返回它的 ref（也用于 model_calls / tool_calls 的 run_ref）。
+
+        lane（库号 50）：条目归到哪一栏（默认 'main'；闲时探索等归 'task'）。
+        老库（还没有 lane 列，库号 <50 的半截环境）插不进去时按没列再插一次。
+        """
         ref = run_ref.new(f"main:{str(purpose or '')[:60]}", group_id)
         try:
             with self._store.tx() as conn:
-                conn.execute(
-                    "INSERT INTO main_runs (group_id, purpose, title, status, started, finished, ok, error, ref)"
-                    " VALUES (?,?,?,?,?,?,?,?,?)",
-                    (str(group_id or ""), str(purpose or "")[:200],
-                     str(title or "")[:TITLE_MAX] or _title_for(purpose),
-                     "running", clock.now(), 0.0, 0, "", ref),
-                )
+                cols = {r["name"] for r in conn.execute("PRAGMA table_info(main_runs)")}
+                if "lane" in cols:
+                    conn.execute(
+                        "INSERT INTO main_runs (group_id, purpose, title, status, started, finished, ok, error, ref, lane)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (str(group_id or ""), str(purpose or "")[:200],
+                         str(title or "")[:TITLE_MAX] or _title_for(purpose),
+                         "running", clock.now(), 0.0, 0, "", ref,
+                         str(lane or "main")[:40]),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO main_runs (group_id, purpose, title, status, started, finished, ok, error, ref)"
+                        " VALUES (?,?,?,?,?,?,?,?,?)",
+                        (str(group_id or ""), str(purpose or "")[:200],
+                         str(title or "")[:TITLE_MAX] or _title_for(purpose),
+                         "running", clock.now(), 0.0, 0, "", ref),
+                    )
         except Exception:
             logger.exception("写 main_runs（begin）失败（purpose=%s group=%s）", purpose, group_id)
             return ""  # 连 ref 都不给：后面的落库拿不到它，这轮的调用就当没条目
@@ -95,13 +111,16 @@ class MainRuns:
     # scope：一轮多次调用并进同一条目（admin_chat._turn / _feedback_round / personal 轮）
     # ------------------------------------------------------------------
 
-    def scope(self, group_id: str, purpose: str, title: str = "") -> "_MainRunScope":
+    def scope(self, group_id: str, purpose: str, title: str = "",
+              *, lane: str = "main") -> "_MainRunScope":
         """async with 上下文：进去开条目、CURRENT_REF 设成它的 ref；出来按结局写终态。
 
         在里面发生的每次 models.chat / tools.call 都会自动挂这条 ref（含别的
-        agent 的调用——这一轮里专岗调用也是这一轮的一部分）。
+        agent 的调用——这一轮里专岗调用也是这一轮的一部分）。`lane` 定条目归
+        哪一栏（默认 main；闲时探索这类后台活归 task 栏）。
         """
-        return _MainRunScope(self, group_id=group_id, purpose=purpose, title=title)
+        return _MainRunScope(self, group_id=group_id, purpose=purpose, title=title,
+                             lane=lane)
 
     def close_orphans(self, reason: str = "进程中断，没能收尾") -> int:
         """启动收尾：上次进程留下的 running 全部标 cancelled（幂等）。返回标了几条。"""
@@ -182,20 +201,45 @@ class _AutoScope:
 
 
 class _MainRunScope:
-    def __init__(self, runs: MainRuns, *, group_id: str, purpose: str, title: str = "") -> None:
+    def __init__(self, runs: MainRuns, *, group_id: str, purpose: str,
+                 title: str = "", lane: str = "main") -> None:
         self._runs = runs
         self._gid = str(group_id or "")
         self._purpose = str(purpose or "")
         self._title = str(title or "")
+        self._lane = str(lane or "main")
         self._token: contextvars.Token | None = None
         self._ref = ""
+        self._failed_error: str = ""   # fail() 预先记的败因（scope 正常退出也按 failed 收）
 
     @property
     def ref(self) -> str:
         return self._ref
 
+    def set_title(self, title: str) -> None:
+        """改条目标题（跑出结果再定夺的轮用：题目 / 方向事后才知道）。写失败只记日志。"""
+        if not self._ref:
+            return
+        try:
+            with self._runs._store.tx() as conn:
+                conn.execute(
+                    "UPDATE main_runs SET title=? WHERE ref=?",
+                    (str(title or "")[:TITLE_MAX], self._ref),
+                )
+        except Exception:
+            logger.exception("改 main_runs 标题失败（ref=%s）", self._ref)
+
+    def fail(self, error: str) -> None:
+        """预先记败因：scope 正常退出（没抛异常）时条目照样按 failed 收尾。
+
+        轮「正常走完但结果是失败」（门槛没过 / 选题失败）用：业务函数 return
+        不抛异常，条目不能显示成 done。
+        """
+        self._failed_error = str(error or "")[:_ERROR_MAX]
+
     async def __aenter__(self) -> "_MainRunScope":
-        self._ref = self._runs._begin(self._gid, self._purpose, self._title)
+        self._ref = self._runs._begin(self._gid, self._purpose, self._title,
+                                      lane=self._lane)
         if self._ref:
             self._token = run_ref.CURRENT_REF.set(self._ref)
         return self
@@ -209,7 +253,10 @@ class _MainRunScope:
         if not self._ref:
             return False
         if exc is None:
-            self._runs._finish(self._ref, "done")
+            if self._failed_error:
+                self._runs._finish(self._ref, "failed", self._failed_error)
+            else:
+                self._runs._finish(self._ref, "done")
         elif isinstance(exc, asyncio.CancelledError):
             self._runs._finish(self._ref, "cancelled", "被取消（热重载 / 停用）")
         else:

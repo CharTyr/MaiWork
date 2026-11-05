@@ -36,7 +36,7 @@ import logging
 import math
 import re
 import threading
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional, Sequence
 
@@ -363,8 +363,24 @@ class Intake:
         # 不派活、不恢复等回答的任务；构想关闭时不认「构想 #N」。
         feature_on: Callable[[str, str], bool] | None = None,
         session_gate: Any = None,
+        planner_handoff: bool = False,
+        planner_wait_s: float = 12.0,
+        planner_extend_s: float = 8.0,
+        message_lookup: Callable[..., Awaitable[dict | None]] | None = None,
     ) -> None:
         self._get_settings = get_settings
+        self._planner_handoff = planner_handoff
+        self._planner_wait_s = max(0.0, float(planner_wait_s))
+        self._planner_extend_s = max(0.0, float(planner_extend_s))
+        self._message_lookup = message_lookup
+        self._recent_msgs: dict[str, OrderedDict] = {}
+        self._recent_msg_aliases: dict[str, OrderedDict] = {}
+        self._planner_receipts: OrderedDict = OrderedDict()
+        self._at_waiters: OrderedDict = OrderedDict()
+        self._session_planner_mids: OrderedDict = OrderedDict()
+        self._reminder_inflight: set[tuple[str, str]] = set()
+        self._running_reminders: set[tuple[str, str]] = set()
+        self._reminder_results: OrderedDict = OrderedDict()
         self._signals = signals
         self._jev = jev
         self._approvals = approvals
@@ -444,6 +460,198 @@ class Intake:
             pass
         else:
             self.kick_spool_recover()
+
+    def _planner_handoff_active(self, settings: Settings | None, group_id: str) -> bool:
+        return bool(self._planner_handoff and getattr(getattr(settings, "quick_judge", None), "planner_tool", True)
+                    and self._feature(group_id, "task"))
+
+    def _prune_planner(self) -> None:
+        now = clock.now()
+        for table in (self._at_waiters, self._session_planner_mids):
+            for key, value in list(table.items()):
+                stamp = value[0] if isinstance(value, tuple) else value["ts"]
+                if now - stamp > 120:
+                    table.pop(key, None)
+            while len(table) > 512:
+                table.popitem(last=False)
+
+    def _planner_entry(self, gid: str, mid: str) -> dict:
+        self._prune_planner()
+        key = (gid, mid)
+        if key not in self._at_waiters:
+            self._at_waiters[key] = {"ts": clock.now(), "event": asyncio.Event(), "outcome": "",
+                                     "seen_in_planner": False, "replied_as_chat": False}
+        entry = self._at_waiters[key]
+        self._at_waiters.move_to_end(key)
+        self._prune_planner()
+        return entry
+
+    def note_planner_request(self, group_id: str, session_id: str, raw_msg_ids: list[str]) -> None:
+        gid = str(group_id)
+        self._prune_planner()
+        mids = list(dict.fromkeys(self._recent_msg_aliases.get(gid, {}).get(str(mid), str(mid))
+                                  for mid in raw_msg_ids if str(mid).strip()))
+        self._session_planner_mids[(gid, str(session_id))] = (clock.now(), mids)
+        for mid in mids:
+            self._planner_entry(gid, mid)["seen_in_planner"] = True
+        self._prune_planner()
+
+    def note_planner_response(self, group_id: str, session_id: str, output_items: Any) -> None:
+        gid, sid = str(group_id), str(session_id)
+        self._prune_planner()
+        funcs = {str((item.get("tool_call") or {}).get("func_name") or "")
+                 for item in (output_items if isinstance(output_items, list) else [])
+                 if isinstance(item, dict) and item.get("item_type") == "FunctionCallItem"}
+        mids = self._session_planner_mids.get((gid, sid), (0, []))[1]
+        if funcs.intersection({"maiwork_handoff", "chartyr.maiwork.maiwork_handoff"}):
+            for mid in mids:
+                self._planner_entry(gid, mid)["seen_in_planner"] = True
+            return
+        if "reply" in funcs:
+            for mid in mids:
+                self._planner_entry(gid, mid)["replied_as_chat"] = True
+        if funcs.intersection({"stop", "wait"}):
+            self._session_planner_mids.pop((gid, sid), None)
+            for mid in mids:
+                entry = self._planner_entry(gid, mid)
+                if entry["outcome"] != "handoff":
+                    entry["outcome"] = "chat"
+                    self._decide(gid, mid, {"kind": "none", "why": "planner 已按闲聊处理"})
+                    entry["event"].set()
+
+    @staticmethod
+    def _handoff_error(reason: str) -> dict:
+        return {"success": False, "error": reason, "content": reason}
+
+    def _cache_planner_receipt(self, key: tuple[str, str], receipt: dict) -> dict:
+        self._planner_receipts[key] = receipt
+        self._planner_receipts.move_to_end(key)
+        while len(self._planner_receipts) > 256:
+            self._planner_receipts.popitem(last=False)
+        return dict(receipt)
+
+    async def handoff_from_planner(
+        self, *, group_id: str, platform: str = "", session_id: str = "",
+        msg_id: str = "", kind: str = "", title: str = "",
+    ) -> dict:
+        """只按来源消息认发起人；工具上下文不能替群友取得免批权限。"""
+        settings = self._get_settings()
+        gid = str(group_id or "").strip()
+        if settings is None or not gid or not settings.is_served(gid):
+            return self._handoff_error("本群未启用 MaiWork")
+        if platform and host_platform(settings.platform_of(gid)) != host_platform(platform):
+            return self._handoff_error("消息平台不匹配")
+        if not self._feature(gid, "task") or not getattr(getattr(settings, "quick_judge", None), "planner_tool", True):
+            return self._handoff_error("本群规划器接单已关闭")
+        kind_s, raw_mid = str(kind or "").strip(), str(msg_id or "").strip()
+        if kind_s not in ("task", "goal", "reminder") or not raw_mid:
+            return self._handoff_error("需要有效的请求类型和来源消息编号")
+        real_mid = self._recent_msg_aliases.get(gid, {}).get(raw_mid, raw_mid)
+        rec = self._recent_msgs.get(gid, {}).get(real_mid)
+        if rec is None and self._pending is not None:
+            rec = self._pending.get(gid, raw_mid)
+        if rec is None and self._message_lookup is not None:
+            fetched = await self._message_lookup(raw_mid, session_id)
+            if isinstance(fetched, dict):
+                chat = fetched.get("chat_info") or {}
+                fetched_gid = str((chat.get("group_info") or {}).get("group_id") or fetched.get("group_id") or "")
+                uid, uname = self._speaker(fetched)
+                if fetched_gid == gid:
+                    rec = {"message_id": str(fetched.get("message_id") or raw_mid), "user_id": uid,
+                           "user_name": uname, "text": str(fetched.get("processed_plain_text") or fetched.get("display_message") or "")}
+        if not rec or not rec.get("user_id") or str(rec["user_id"]) == self._bot_id(settings.platform_of(gid)):
+            return self._handoff_error("找不到本群群友的来源消息，请使用群友消息编号")
+        real_mid = str(rec["message_id"])
+        uid, uname, text = str(rec["user_id"]), str(rec.get("user_name") or ""), str(rec.get("text") or "")
+        key = (gid, real_mid)
+        if key in self._planner_receipts:
+            return dict(self._planner_receipts[key])
+        if kind_s == "reminder" and self._on_reminder is None:
+            return self._handoff_error("提醒功能尚未就绪")
+        if kind_s != "reminder" and self._approvals is None:
+            return self._handoff_error("接单功能尚未就绪")
+        started_at = float(rec.get("ts") or clock.now())
+        if not self._work_allowed(gid, started_at, real_mid):
+            return self._handoff_error("本群任务功能变更前收到的旧消息不再接单")
+        entry = self._planner_entry(gid, real_mid)
+        entry["outcome"] = "handoff"
+        entry["event"].set()
+        clean_title = str(title or "").strip()[:_TITLE_MAX] or text.strip()[:_TITLE_MAX]
+        prior = self._pending.get(gid, real_mid) if self._pending is not None else None
+        if prior and prior.get("state") in ("completed", "screened", "none", "expired"):
+            rid = str(prior.get("result_id") or "")
+            ids = [rid] if rid else []
+            if rid and prior.get("result_kind") == "request" and self._store is not None:
+                request = self._store.read().execute(
+                    "SELECT task_id, goal_id FROM requests WHERE group_id=? AND id=?", (gid, rid)
+                ).fetchone()
+                if request is not None:
+                    ids.extend(str(request[k]) for k in ("task_id", "goal_id") if request[k])
+            if prior.get("state") == "screened":
+                content = "类似请求已被多次拒绝，本次不再创建。"
+            else:
+                content = f"这条消息已经处理：{'、'.join(ids)}" if ids else "这条消息已经处理，无需重复接单"
+            return self._cache_planner_receipt(key, {"success": True, "content": content})
+        prior_kind = str((prior.get("decision") or {}).get("kind") or "") if prior else ""
+        if ((kind_s != "reminder" and (prior_kind == "reminder" or key in self._running_reminders or key in self._reminder_results))
+                or (kind_s == "reminder" and prior_kind in ("prepare", "goal"))):
+            return self._cache_planner_receipt(key, {"success": True, "content": "这条消息已由 MaiWork 后台接手，沿用已有接单类型，无需重复创建。"})
+        spool_key = self._record(gid, uid, uname, real_mid, text,
+                                 "planner 接单（提醒）" if kind_s == "reminder" else "planner 接单")
+        if spool_key is _RECORD_FAILED:
+            return self._handoff_error("来源消息未能持久保存，请稍后重试")
+        if kind_s == "reminder":
+            if spool_key is None and self._decide(gid, real_mid, {"kind": "reminder", "title": clean_title}) is None:
+                return self._handoff_error("提醒接单结论暂未保存，请稍后重试")
+            if key not in self._reminder_inflight and key not in self._running_reminders and key not in self._reminder_results:
+                self._reminder_inflight.add(key)
+                _spawn_safely(self._spawn, self._planner_reminder(
+                    self._on_reminder, gid, uid, uname, real_mid, text, clean_title, spool_key))
+            return self._cache_planner_receipt(key, {"success": True, "content": "已交给 MaiWork 在后台解析并安排提醒，请勿重复创建或承诺具体时间。"})
+        if isinstance(spool_key, str) and not await self._wait_recorded(spool_key):
+            return self._handoff_error("来源消息仍在等待保存，MaiWork 会继续恢复处理")
+        label = "prepare" if kind_s == "task" else "goal"
+        via = "群里请求 · planner 接单"
+        decided = self._decide(gid, real_mid, {"kind": label, "title": clean_title, "via": via})
+        if decided is not True:
+            return self._handoff_error("这条消息已处理或暂未能保存接单结论")
+        # create 内的来源消息检查与事务复查覆盖后台兜底和迟到工具之间的竞争。
+        try:
+            res = self._approvals.create(gid, kind=kind_s, title=clean_title, quote=text, via=via,
+                                         requester_id=uid, requester_name=uname, message_id=real_mid,
+                                         screen=True, started_at=started_at)
+        except Exception:
+            logger.exception("planner 建待批请求出错（群 %s，消息 %s）", gid, real_mid)
+            self._fail(gid, real_mid, "建待批请求出错")
+            return self._handoff_error("创建待批请求失败，MaiWork 会继续恢复处理")
+        if res.get("status") == "screened":
+            self._complete(gid, real_mid, "screened", "")
+            return self._cache_planner_receipt(key, {"success": True, "content": "类似请求已被多次拒绝，本次不再创建。"})
+        rid = str(res.get("id") or "")
+        if not rid:
+            self._fail(gid, real_mid, "建待批请求没拿到编号")
+            return self._handoff_error("接单未获得请求编号，请稍后重试")
+        self._complete(gid, real_mid, "request", rid)
+        state = "等管理员批准" if res.get("status") == "pending" else "已获准交给 MaiWork"
+        ids = "、".join(str(res[k]) for k in ("id", "task_id", "goal_id") if res.get(k))
+        content = f"MaiWork 已接单 {ids}（{state}），无需在聊天里重复制作或承诺交付时间。"
+        self._add_mention(gid, f"{uname or uid} 的请求已由 MaiWork 接手：{ids}（{state}），不要自己重复制作。",
+                          key=f"request:{rid}", ttl_s=_REQUEST_MENTION_TTL_S, target_user_id=uid,
+                          keywords=[rid, str(text or "")[:60]])
+        return self._cache_planner_receipt(key, {"success": True, "content": content})
+
+    async def _planner_reminder(self, cb: Any, gid: str, uid: str, uname: str, mid: str,
+                                text: str, title: str, spool_key: Any) -> None:
+        try:
+            if isinstance(spool_key, str) and not await self._wait_recorded(spool_key):
+                return
+            row = self._pending.get(gid, mid) if self._pending is not None else None
+            if row and row.get("state") in ("completed", "screened", "none", "expired"):
+                return
+            if self._decide(gid, mid, {"kind": "reminder", "title": title}) is not None:
+                await self._run_reminder(cb, gid, uid, uname, mid, text)
+        finally:
+            self._reminder_inflight.discard((gid, mid))
 
     def _feature(self, group_id: str, module: str) -> bool:
         """这个群的这个模块开着吗；没注入闸（老调用口 / 极简构造）按开。"""
@@ -539,6 +747,21 @@ class Intake:
         #    所以上下文里永远不会出现它自己。机器人自己的消息一样记（标 MaiBot）。
         bot_id = self._bot_id(platform)
         is_bot = bool(bot_id and user_id and user_id == bot_id)
+        if not is_bot and message_id and user_id:
+            from .delivery import to_display_message_id
+
+            recent = self._recent_msgs.setdefault(group_id, OrderedDict())
+            aliases = self._recent_msg_aliases.setdefault(group_id, OrderedDict())
+            recent[message_id] = {"message_id": message_id, "user_id": str(user_id),
+                                  "user_name": str(user_name or ""), "text": str(text or ""),
+                                  "ts": _ts_of(message.get("timestamp")) or clock.now()}
+            recent.move_to_end(message_id)
+            alias = to_display_message_id(message_id)
+            aliases[alias] = message_id
+            aliases.move_to_end(alias)
+            for ring in (recent, aliases):
+                while len(ring) > 512:
+                    ring.popitem(last=False)
         context = self._ring_context(group_id)
         self._ring_add(group_id, "MaiBot" if is_bot else (user_name or user_id), text, message_id, is_bot)
         # 定向备忘要认「最后一条消息是谁发的」：<message> 标签只有昵称没有 user_id，
@@ -877,7 +1100,10 @@ class Intake:
             return
         # @ 还没判完这几秒，别让 MaiBot 替我们接话承诺交付：塞一条纯内存临时备忘
         # （15 秒 / 1 轮，定向本人），判完 _judge_at 的 finally 里撤掉、正式备忘接棒。
-        if self._mentions is not None:
+        wait_for_planner = self._planner_handoff_active(settings, group_id)
+        if wait_for_planner:
+            self._planner_entry(group_id, message_id)
+        if not wait_for_planner and self._mentions is not None:
             try:
                 self._mentions.add_ephemeral(
                     group_id,
@@ -904,7 +1130,7 @@ class Intake:
             self._spawn,
             self._judge_at(
                 settings, group_id, user_id, user_name, message_id, text, context,
-                spool_key=spool_key, started_at=clock.now(),
+                spool_key=spool_key, started_at=clock.now(), wait_for_planner=wait_for_planner,
             ),
         )
 
@@ -920,6 +1146,7 @@ class Intake:
         *,
         spool_key: Optional[str] = None,
         started_at: float | None = None,
+        wait_for_planner: bool = False,
     ) -> None:
         """后台问 Jev 并按判词走原来的后续路径；异常只记日志 + 留待重试，绝不外抛。
 
@@ -942,6 +1169,21 @@ class Intake:
             )
             return
         try:
+            if wait_for_planner:
+                entry = self._planner_entry(group_id, message_id)
+                try:
+                    await asyncio.wait_for(entry["event"].wait(), self._planner_wait_s)
+                except asyncio.TimeoutError:
+                    if entry["seen_in_planner"] and not entry["outcome"] and not entry["replied_as_chat"]:
+                        try:
+                            await asyncio.wait_for(entry["event"].wait(), self._planner_extend_s)
+                        except asyncio.TimeoutError:
+                            pass
+                if entry["outcome"] == "handoff":
+                    return
+                if entry["outcome"] == "chat" or entry["replied_as_chat"]:
+                    self._decide(group_id, message_id, {"kind": "none", "why": "planner 已按闲聊处理"})
+                    return
             if not self._work_allowed(group_id, started_at, message_id):
                 return
             timeout_ms = min(
@@ -962,6 +1204,8 @@ class Intake:
                         _JEV_BG_WAIT_MAX_MS / 1000.0,
                     )
             if not self._work_allowed(group_id, started_at, message_id):
+                return
+            if self._at_waiters.get((group_id, message_id), {}).get("outcome") == "handoff":
                 return
             ctx = {"context": list(context or []), "started_at": started_at}
             if not isinstance(answers, dict):
@@ -1113,6 +1357,13 @@ class Intake:
         text: str,
     ) -> bool:
         """后台交 app 解析时间并建提醒；app 落地成功时自己关掉待判行（同一事务）。"""
+        key = (str(group_id), str(message_id))
+        if key in self._running_reminders or key in self._reminder_results:
+            return True
+        row = self._pending.get(group_id, message_id) if self._pending is not None else None
+        if row and row.get("state") in ("completed", "screened", "none", "expired"):
+            return True
+        self._running_reminders.add(key)
         try:
             msg = {
                 "group_id": group_id,
@@ -1128,6 +1379,12 @@ class Intake:
             logger.exception("提醒慢路径出错（群 %s）", group_id)
             self._fail(group_id, message_id, "提醒落地出错")
             return False
+        finally:
+            self._running_reminders.discard(key)
+        if result is not False:
+            self._reminder_results[key] = True
+            while len(self._reminder_results) > 256:
+                self._reminder_results.popitem(last=False)
         return result is not False
 
     async def _create_request(

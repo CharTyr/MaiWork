@@ -555,6 +555,116 @@ async def test_inflight_probe_is_discarded_after_rebind(store, tmp_path: Path) -
 
 
 # ----------------------------------------------------------------------
+# stopped 模式（判定不可用）：LocalEnv 还在（给文件工具用）但不能跑命令
+# ----------------------------------------------------------------------
+
+
+class _CountingAssets:
+    """假画图组件：只记 refresh / checked / maybe_refresh 被调了几次。"""
+
+    group_ids = ("fonts", "browser")
+
+    def __init__(self, *, checked: bool = True) -> None:
+        self.refresh_calls = 0
+        self.maybe_calls = 0
+        self._checked = checked
+
+    async def refresh(self) -> None:
+        self.refresh_calls += 1
+        self._checked = True
+
+    async def wait(self) -> None:
+        return None
+
+    def busy(self) -> bool:
+        return False
+
+    def checked(self) -> bool:
+        return self._checked
+
+    def maybe_refresh(self, *, max_age: float = 300.0) -> bool:
+        self.maybe_calls += 1
+        return False
+
+    def status_groups(self) -> list[dict[str, Any]]:
+        return []
+
+
+@pytest.mark.asyncio
+async def test_stopped_capability_refresh_does_not_run_commands(store, tmp_path: Path) -> None:
+    """stopped 模式下 LocalEnv 还在（文件工具要用），但它跑不了命令：别去探，也别记成检查错误。
+
+    以前这里只看 `_env is None`，结果拿 env.run 的失败（Windows 上 WinError 2）写进 kv，
+    网页顶部就挂一条「探测失败」的红字——而真正的原因是执行环境本来就停着。
+    """
+    env = _FakeEnv(_probe_stdout(_installed()))
+    assets = _CountingAssets(checked=False)
+    deps = od.OptionalDeps(
+        store, lambda: _Settings(tmp_path / "ws"), env=env,
+        capability=_cap("stopped", ok=False), assets=assets,
+    )
+    view = await deps.refresh()
+    assert env.calls == []                                # 一条命令都没跑
+    assert view["available"] is False
+    assert view["check_error"] == ""
+    assert view["checked_at"] == 0
+    assert view["groups"][0]["state"] == "unknown"
+    assert assets.refresh_calls == 1                      # 画图组件照旧刷（它不走本机执行）
+    assert view["checking"] is False
+
+
+@pytest.mark.asyncio
+async def test_stopped_capability_ignores_stale_probe_error(store, tmp_path: Path) -> None:
+    """kv 里留着上次（还能跑命令时）的失败记录：stopped 模式下不许再拿出来当「检查错误」。
+
+    必须**同一执行环境指纹**（不然旧记录早就被 `_env_key` 挡掉了，这条测试就测的是别的东西）。
+    """
+    cap = _cap("stopped", ok=False)          # 判定从「能用」变「停着」：指纹只带 mode，不变
+    deps0 = od.OptionalDeps(
+        store, lambda: _Settings(tmp_path / "ws"), env=_FakeEnv("", exit_code=1), capability=cap,
+    )
+    deps0._write_kv(od.CHECK_KEY, {
+        "at": 1234.0, "env": deps0._env_key(), "python": "", "version": "", "packages": {},
+        "soffice": {"found": False, "path": ""},
+        "error": "探测失败：FileNotFoundError: [WinError 2]",
+    })
+
+    deps = od.OptionalDeps(
+        store, lambda: _Settings(tmp_path / "ws"), env=_FakeEnv(_probe_stdout(_installed())),
+        capability=cap,
+    )
+    view = deps.status()
+    assert view["check_error"] == ""
+    assert view["checked_at"] == 0
+    assert view["groups"][0]["state"] == "unknown"
+    assert view["checking"] is False
+
+
+@pytest.mark.asyncio
+async def test_stopped_capability_checked_follows_assets(store, tmp_path: Path) -> None:
+    """stopped 模式下办公文档那组永远探不了：是否「已检查」由字体 / 浏览器探测决定。"""
+    env = _FakeEnv(_probe_stdout(_installed()))
+    cap = _cap("stopped", ok=False)
+
+    # 没有画图组件：通用 Python 依赖不可探测，但也别说了谎（当成已检查，别每次 GET 都重探）
+    plain = od.OptionalDeps(store, lambda: _Settings(tmp_path / "ws"), env=env, capability=cap)
+    assert plain.checked() is True
+
+    assets = _CountingAssets(checked=False)
+    deps = od.OptionalDeps(
+        store, lambda: _Settings(tmp_path / "ws"), env=env, capability=cap, assets=assets,
+    )
+    assert deps.checked() is False
+    assets._checked = True
+    assert deps.checked() is True
+
+    # maybe_refresh 不许为「办公文档那组」起后台探测任务
+    assert deps.maybe_refresh() is False
+    assert not [t for t in deps._tasks if not t.done()]
+    assert env.calls == []
+
+
+# ----------------------------------------------------------------------
 # 卸载的前置闸 / 权限
 # ----------------------------------------------------------------------
 

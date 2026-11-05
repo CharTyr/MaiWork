@@ -586,6 +586,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
        "str", check=_check_jev_use),
 
     # ---- quick_judge ----
+    _F("quick_judge.planner_tool", "规划器优先接单", "开启后由 MaiBot 聊天规划器优先通过工具创建任务、目标或提醒，正常闲聊不再调用 Jev；未跑完时自动回退后台判断。", "bool"),
     _F("quick_judge.enabled", "任务识别备用方案", "未配置 Jev 或 Jev 无法确定时，使用模型判断该 @ 消息是否为任务请求。", "bool"),
     _F("quick_judge.model", "判断模型", "填写模型库中的条目 id；留空则与主模型相同。", "str"),
     _F("quick_judge.keyword_filter", "关键词预筛选", "不含请求词的 @ 消息视为闲聊；表述含糊的任务请求可能被遗漏。", "bool"),

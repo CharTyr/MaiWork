@@ -6,6 +6,7 @@ import { repaintSheet } from "../sheet.js";
 import { loading } from "../pages/news.js";
 import { loadOptDeps, optDepsSection } from "./optdeps.js";
 import { actSearch, presetByEntry, presetLogo, searchRoleTags, searchSection } from "./search.js";
+import { actSkills, skillDetailView } from "./skills.js";
 
 export const ROLE_NAMES = { worker: "子 agent", main: "主模型" };
 
@@ -19,6 +20,7 @@ export function extFormSheet() {
   }
   if (ed.kind === "skill") {
     const k = ed.name ? (state.ext.skills || []).find((x) => x.name === ed.name) : null;
+    if (ed.name && ed.mode !== "edit" && typeof skillDetailView === "function") return skillDetailView(k);
     return skillForm(k);
   }
   return "";
@@ -38,16 +40,17 @@ export function extPage(tab = "all") {
   if (tab === "search") return searchSection();
   const mcpRows = mcp.map((m) => (ed && ed.kind === "mcp" && ed.name === m.name ? mcpForm(m) : mcpRow(m))).join("");
   const skillRows = skills.map((k) => (ed && ed.kind === "skill" && ed.name === k.name ? skillForm(k) : skillRow(k))).join("");
-  const mcpBlock = `
+  const mcpOnlyBlock = `
     <div class="h-sub-row"><h2 class="h-sub">MCP${tip("MCP 服务为 MaiWork 提供外部工具，例如搜索、读取网页。仅支持远程（https）服务。")}</h2>${newMcp || pasting ? "" : `<span class="row-btns"><button class="btn small" data-act="mcp-paste">粘贴配置</button><button class="btn small" data-act="ext-new" data-kind="mcp">添加</button></span>`}</div>
     ${pasting ? mcpPasteForm() : ""}
     ${newMcp ? mcpForm(null) : ""}
-    ${mcpRows ? `<div class="set-group">${mcpRows}</div>` : !newMcp ? `<p class="h-meta">暂无</p>` : ""}
+    ${mcpRows ? `<div class="set-group">${mcpRows}</div>` : !newMcp ? `<p class="h-meta">暂无</p>` : ""}`;
+  if (tab === "mcp") return mcpOnlyBlock;
+  const skillBlock = `
     <div class="h-sub-row"><h2 class="h-sub">skill${tip("skill 是给模型的操作说明，例如某类工作的做法和注意事项。模型会根据「简介」决定何时使用。")}</h2>${newSkill ? "" : `<span class="row-btns"><label class="btn small file-btn">上传 zip<input type="file" id="skill-zip" accept=".zip,application/zip" hidden /></label><button class="btn small" data-act="ext-new" data-kind="skill">添加</button></span>`}</div>
     ${newSkill ? skillForm(null) : ""}
     ${skillRows ? `<div class="set-group">${skillRows}</div>` : newSkill ? "" : `<p class="h-meta">暂无</p>`}`;
-  if (tab === "mcp") return mcpBlock;
-  return `${searchSection()}${mcpBlock}${optDepsSection()}`;
+  return `${searchSection()}${mcpOnlyBlock}${skillBlock}${optDepsSection()}`;
 }
 
 function mcpRow(m) {
@@ -260,7 +263,7 @@ function skillForm(k) {
   return `
     <form id="skill-form" class="login ext-form" autocomplete="off" data-name="${esc(isNew ? "" : k.name)}">
       <div class="ext-form-h">${isNew ? "添加 skill" : `修改 ${esc(k.name)}`}</div>
-      ${isNew ? `<label for="k-name">名称</label><input id="k-name" spellcheck="false" placeholder="字母、数字、_ 或 -，例如 write-report" />` : ""}
+      ${isNew ? `<label for="k-name">名称</label><input id="k-name" spellcheck="false" value="${esc(d.name || "")}" placeholder="字母、数字、_ 或 -，例如 write-report" />` : ""}
       ${tipLabel("k-desc", "简介", "模型根据简介判断何时使用该 skill。")}
       <input id="k-desc" value="${esc(d.description || "")}" placeholder="例如：周报格式和注意事项" />
       <label>使用范围</label>
@@ -320,7 +323,12 @@ export async function loadExt() {
     state.extPresets = null;
   }
   try {
-    state.toolChoices = (await api("GET", "/api/agents")).worker_tool_choices || [];
+    const ag = await api("GET", "/api/agents");
+    if (ag && Array.isArray(ag.profiles)) {
+      state.agents = ag;
+      if (state.ext && Array.isArray(state.ext.skills)) state.agentSkills = state.ext.skills;
+    }
+    state.toolChoices = (ag && ag.worker_tool_choices) || [];
   } catch (e) {
     state.toolChoices = null;
   }
@@ -329,11 +337,12 @@ export async function loadExt() {
 
 export async function actExt(a, el, reloadSettings) {
   if (await actSearch(a, el, reloadSettings)) return true;
+  if (typeof actSkills === "function" && (await actSkills(a, el))) return true;
   switch (a) {
     case "ext-new":
     case "ext-edit": {
       state.searchSheet = null;
-      state.extEdit = { kind: el.dataset.kind, name: el.dataset.name || null, data: null };
+      state.extEdit = { kind: el.dataset.kind, name: el.dataset.name || null, mode: el.dataset.name ? "edit" : "edit", data: null };
       repaintSheet();
       if (el.dataset.kind === "skill" && el.dataset.name) {
         try {

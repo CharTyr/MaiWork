@@ -11,8 +11,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..context import Ctx, _f
-from ..trace import STEP_TEXT_MAX, Trace
+from ..context import Ctx, _clip, _f
+from ..trace import Trace
 
 SOURCE = "main"
 
@@ -21,7 +21,7 @@ _STATUS_TEXT = {
 }
 
 try:
-    from ...main_run import RUN_STALE_S as _STALE_S
+    from ....main_run import RUN_STALE_S as _STALE_S
 except Exception:  # main_run 模块缺席的半截环境：不挡看板
     _STALE_S = 6 * 3600
 
@@ -30,6 +30,16 @@ def _visible(ctx: Ctx, r: Any) -> bool:
     """服务群的条目，或不属于任何群的（不聚焦群的管理员对话等，group_id 空）。"""
     gid = str(r["group_id"] or "")
     return not gid or gid in ctx.served
+
+
+def _lane_select(ctx: Ctx) -> str:
+    """SELECT 里 lane 列的取法：库号 50 起有 lane 列；半截库（还没跑第 50 步）
+    没这列 → 退回常量 'main'，别让整条 main 栏查不出来。"""
+    try:
+        cols = {str(r["name"]) for r in ctx.fetch("PRAGMA table_info(main_runs)")}
+    except Exception:
+        cols = set()
+    return "lane" if "lane" in cols else "'main' AS lane"
 
 
 def _row_to_item(r: Any, now: float) -> dict[str, Any]:
@@ -43,18 +53,22 @@ def _row_to_item(r: Any, now: float) -> dict[str, Any]:
     # lanes / 详情同形：stale running 的 finished 回退到 started（当中断那刻）；
     # 没写收尾的 0 也回退（详情不再给库原值——同一件只有一种形状）。
     fin_out = (finished or started) if status != "running" else None
+    lane = str(r["lane"] or "main") if "lane" in r.keys() else "main"
     item = {
-        "source": SOURCE, "id": int(r["id"]), "lane": "main",
+        "source": SOURCE, "id": int(r["id"]), "lane": lane,
         "group_id": str(r["group_id"] or ""),
         "title": str(r["title"] or ""),
-        "status": status, "status_text": _STATUS_TEXT.get(status, status),
+        # running 的措辞：main 栏「正在判断」；归去别栏的后台活（闲时探索等）「正在跑」
+        "status": status,
+        "status_text": ("正在跑" if status == "running" and lane != "main"
+                        else _STATUS_TEXT.get(status, status)),
         "phase": "",
         "started": started,
         "finished": fin_out,
         "updated": finished or started,
         "ok": ok, "stuck": False, "task_id": "",
         "_run_ref": str(r["ref"] or ""),
-        "error": str(r["error"] or "")[:STEP_TEXT_MAX],
+        "error": _clip(str(r["error"] or ""), 400),
     }
     item["trace"] = _trace_of(item, now)
     return item
@@ -67,9 +81,10 @@ def _trace_of(item: dict[str, Any], now: float) -> Trace:
 
 
 def active(ctx: Ctx) -> list[dict[str, Any]]:
+    lane_sel = _lane_select(ctx)
     out: list[dict[str, Any]] = []
     for r in ctx.fetch(
-        "SELECT id, group_id, purpose, title, status, started, finished, ok, error, ref"
+        f"SELECT id, group_id, purpose, title, status, started, finished, ok, error, ref, {lane_sel}"
         " FROM main_runs WHERE status='running' ORDER BY started DESC",
         (),
     ):
@@ -84,9 +99,10 @@ def active(ctx: Ctx) -> list[dict[str, Any]]:
 
 def finished(ctx: Ctx, since: float) -> list[dict[str, Any]]:
     stale_before = ctx.now - _STALE_S
+    lane_sel = _lane_select(ctx)
     out: list[dict[str, Any]] = []
     for r in ctx.fetch(
-        "SELECT id, group_id, purpose, title, status, started, finished, ok, error, ref"
+        f"SELECT id, group_id, purpose, title, status, started, finished, ok, error, ref, {lane_sel}"
         " FROM main_runs"
         " WHERE (status != 'running' AND COALESCE(NULLIF(finished,0), started) >= ?)"
         "    OR (status = 'running' AND started <= ? AND started >= ?)"
@@ -106,7 +122,7 @@ def get(ctx: Ctx, item_id: Any) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         return None
     r = ctx.fetch_one(
-        "SELECT id, group_id, purpose, title, status, started, finished, ok, error, ref"
+        f"SELECT id, group_id, purpose, title, status, started, finished, ok, error, ref, {_lane_select(ctx)}"
         " FROM main_runs WHERE id=?",
         (rid,),
     )

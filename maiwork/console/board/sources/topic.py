@@ -33,6 +33,17 @@ def _title_of(r: Any) -> tuple[str, str]:
     return ("在群里开了个话题", "开了个话题")
 
 
+def _rejected_of(r: Any) -> str:
+    """result JSON 里的 rejected（没开成的原因）；解析不出 → 空串。"""
+    result = str(r["result"] or "")
+    try:
+        import json as _j
+        rej = _j.loads(result) if result else None
+        return str(rej.get("rejected") or "") if isinstance(rej, dict) else ""
+    except Exception:
+        return ""
+
+
 def _row_to_item(r: Any, now: float) -> dict[str, Any]:
     ts = _f(r["ts"])
     verdict = str(r["verdict"] or "")
@@ -47,6 +58,8 @@ def _row_to_item(r: Any, now: float) -> dict[str, Any]:
         "started": ts, "finished": ts, "updated": ts,
         "ok": ok, "stuck": False, "task_id": "",
         "_run_ref": str(r["run_ref"] or ""),
+        # 没开成的原因（result.rejected）：详情的 error / 列表的 error_brief 用
+        "error": _rejected_of(r) if ok is False else "",
     }
     item["trace"] = _trace_of(item, now)
     return item
@@ -142,6 +155,7 @@ def get(ctx: Ctx, item_id: Any) -> dict[str, Any] | None:
         for jrow in jrows or []:
             extra.append({
                 "ts": _f(jrow["ts"]), "type": "think",
+                "uid": f"j:{jrow['id']}", "round_id": "",
                 "actor": "Jev", "model": "",
                 "tool": "", "input": "", "output": "",
                 "text": _topic_judgment_text(jrow, item, jev_json),

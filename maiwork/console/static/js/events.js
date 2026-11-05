@@ -10,6 +10,7 @@ import { loadLogs } from "./settings/logs.js";
 import { repaintSheet } from "./sheet.js";
 import { refreshDetail } from "./detail.js";
 import { loadChats } from "./chat.js";
+import { closeChatFloating, ensureChatCatalog, onChatInput, onChatKeydown, syncComposerBar } from "./chat_slash.js";
 import { renderSide, renderView } from "./render.js";
 
 document.addEventListener("change", async (e) => {
@@ -17,6 +18,10 @@ document.addEventListener("change", async (e) => {
     try {
       await api("PATCH", `/api/chat/${encodeURIComponent(state.chat.id)}`, { group_id: e.target.value });
       if (state.chat.info) state.chat.info.group_id = e.target.value;
+      if (state.chatSkill && state.chatSkill.scope === "group") state.chatSkill = null;
+      state.chatCatalog = null;
+      if (typeof ensureChatCatalog === "function") void ensureChatCatalog(e.target.value, true);
+      if (typeof syncComposerBar === "function") syncComposerBar();
       await loadChats();
       renderSide();
       toast(e.target.value ? "已切换到本群" : "已切换到所有群");
@@ -98,6 +103,7 @@ document.addEventListener("change", async (e) => {
   }
 });
 document.addEventListener("keydown", (e) => {
+  if (typeof onChatKeydown === "function" && onChatKeydown(e)) return;
   // 管理员对话输入框：回车换行，Ctrl / Cmd + 回车发送（2026-10-30 用户定）
   if (e.target && e.target.id === "chat-input" && e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing) {
     e.preventDefault();
@@ -106,7 +112,20 @@ document.addEventListener("keydown", (e) => {
   }
 });
 document.addEventListener("input", (e) => {
+  if (e.target && e.target.id === "skill-q") {
+    state.skillQ = e.target.value || "";
+    if (e.isComposing) return;
+    const pos = typeof e.target.selectionStart === "number" ? e.target.selectionStart : state.skillQ.length;
+    renderView();
+    const next = $("skill-q");
+    if (next) {
+      next.focus();
+      next.setSelectionRange?.(pos, pos);
+    }
+    return;
+  }
   if (!e.target || e.target.id !== "chat-input") return;
+  if (typeof onChatInput === "function" && onChatInput(e)) return;
   e.target.style.height = "auto";
   e.target.style.height = `${Math.min(e.target.scrollHeight, 220)}px`;
 });
@@ -182,6 +201,9 @@ document.addEventListener("click", (e) => {
   for (const x of openTips()) if (x !== insideTip) x.open = false;
   const insidePicker = e.target.closest && e.target.closest("details.section-picker");
   for (const x of openPickers()) if (x !== insidePicker) x.open = false;
+  if ((state.chatMenu || state.chatCtxOpen) && !(e.target.closest && e.target.closest(".chat-composer"))) {
+    if (typeof closeChatFloating === "function") closeChatFloating();
+  }
   if (state.ideaMore != null && !(e.target.closest && e.target.closest('.idea-menu, [data-act="idea-more"]'))) {
     state.ideaMore = null;
     refreshDetail();
@@ -191,6 +213,11 @@ document.addEventListener(
   "keydown",
   (e) => {
     if (e.key !== "Escape") return;
+    if ((state.chatMenu || state.chatCtxOpen) && typeof closeChatFloating === "function" && closeChatFloating()) {
+      e.stopImmediatePropagation();
+      $("chat-input")?.focus();
+      return;
+    }
     const tips = [...openTips()];
     if (tips.length) {
       e.stopImmediatePropagation(); // 先关提示，不要连带关掉抽屉

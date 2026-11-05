@@ -1617,6 +1617,25 @@ def _reasoning_of(message: Any) -> str:
     return ""
 
 
+def _strip_leaked_reasoning(
+    content_text: str, reasoning_text: str, *, has_tool_calls: bool = False,
+) -> tuple[str, str]:
+    """上游把思考链原样塞进 content（content == reasoning_content）或 content 里留着
+    <think>…</think> 时，把思考部分从 text 里拿掉：思考只留给 model_calls 日志，
+    草稿绝不进业务。返回 (干净的 text, reasoning)。"""
+    if reasoning_text.strip() and (
+        content_text == reasoning_text or content_text.strip() == reasoning_text.strip()
+    ):
+        return "", reasoning_text
+    if not has_tool_calls and content_text.lstrip().startswith("<think>"):
+        rest = content_text.lstrip()[len("<think>"):]
+        if "</think>" in rest:
+            thought, _, after = rest.partition("</think>")
+            return after.lstrip(), reasoning_text or thought.strip()
+        return "", reasoning_text or rest.strip()
+    return content_text, reasoning_text
+
+
 def _usage_fields(usage: Any, prompt_key: str, completion_key: str) -> dict[str, Any]:
     """从端点的 usage 对象收成统一的记账字段（三协议共用规则）。
 
@@ -4168,19 +4187,26 @@ class Models:
         u = _usage_fields(usage_raw, "prompt_tokens", "completion_tokens")
         details = usage_raw.get("prompt_tokens_details") if isinstance(usage_raw, dict) else None
         cached = int(details.get("cached_tokens") or 0) if isinstance(details, dict) else 0
+        raw_text = str(content) if content is not None else ""
+        raw_reasoning = _reasoning_of(message)
+        tcs = [dict(t) for t in tool_calls] if isinstance(tool_calls, list) else []
+        # 上游把思考链倒进 content / 留着 <think> 时，草稿不进 text（只留 reasoning 记日志）
+        clean_text, clean_reasoning = _strip_leaked_reasoning(
+            raw_text, raw_reasoning, has_tool_calls=bool(tcs))
+        raw_msg = {**message, "content": clean_text} if (clean_text != raw_text and not tcs) else message
         return ChatResult(
-            text=str(content) if content is not None else "",
-            tool_calls=[dict(t) for t in tool_calls] if isinstance(tool_calls, list) else [],
+            text=clean_text,
+            tool_calls=tcs,
             model=model,
             prompt_tokens=u["prompt"],
             completion_tokens=u["completion"],
-            raw_message=message,
+            raw_message=raw_msg,
             finish_reason=str(choice.get("finish_reason") or "") if isinstance(choice, dict) else "",
             usage_known=u["known"],
             cache_read_tokens=cached,
             cache_write_tokens=0,
             # reasoning_content 只留作日志（写 model_calls.response.reasoning），不进 text
-            reasoning=_reasoning_of(message),
+            reasoning=clean_reasoning,
             reasoning_redacted=False,
         )
 

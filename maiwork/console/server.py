@@ -2207,14 +2207,15 @@ class ConsoleServer:
             # 七类来源 + 批量计数，网页每 10 秒拉一次：放线程里跑，不卡事件循环（同用量历史；
             # 别的线程里 store.read() 拿的是只读连接）
             data = await asyncio.to_thread(board.board_view, svc, hours=request.query.get("hours"))
-            return web.json_response(data)
+            # 整包过密钥遮罩（同 /api/board/items：交接单 brief / 便条 / 错误里可能带密钥）
+            return web.json_response(_redact_json(data, _secret_list()))
 
         @get("/api/board/items/{source}/{id}")
         async def _board_item(request: web.Request) -> web.Response:
             """看板单条的逐步过程（只总管理员）：steps = tool_calls + model_calls 文本 + 状态节点。
 
             整包过密钥遮罩（库里旧行可能没遮过）。不存在 / 非服务群 / 乱 source → 404。
-            ?after=<ts> 只回 ts > after 的增量 steps（增量轮询用）。
+            ?after=<ts> 只回 ts >= after 的增量 steps（增量轮询用）。
             """
             forbid = self._require_admin(request)
             if forbid is not None:
@@ -2833,7 +2834,12 @@ class ConsoleServer:
             except Exception:
                 logger.exception("拼 skill 清单出错")
                 skills = []
-            return web.json_response({"mcp": mcp, "skills": skills})
+            try:
+                suggestions = skills_web.list_suggestions(svc, existing_names={item["name"] for item in skills})
+            except Exception:
+                logger.exception("拼 skill 推荐清单出错")
+                suggestions = []
+            return web.json_response({"mcp": mcp, "skills": skills, "skill_suggestions": suggestions})
 
         @post("/api/extensions/mcp")
         async def _mcp_create(request: web.Request) -> web.Response:
@@ -3207,6 +3213,25 @@ class ConsoleServer:
         app.router.add_post("/api/extensions/presets/{id}", self._write(_preset_activate))
         app.router.add_post("/api/extensions/presets/{id}/test", self._write(_preset_test))
         app.router.add_post("/api/extensions/presets-setup", self._write(_presets_setup))
+
+        @get("/api/extensions/skills/{name}/export")
+        async def _skill_export(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            from .. import skills_web
+
+            name = str(request.match_info["name"])
+            try:
+                blob = skills_web.export_zip(svc.get_settings().data_dir, svc.store, name)
+            except KeyError:
+                return _err(404, "找不到这个做法")
+            except ValueError as e:
+                return _err(400, str(e) or "这个做法导出不了")
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+            return web.Response(body=blob, content_type="application/zip", headers={
+                "Content-Disposition": f'attachment; filename="{safe_name}.zip"',
+            })
 
         @get("/api/extensions/skills/{name}")
         async def _skill_get(request: web.Request) -> web.Response:
@@ -4998,6 +5023,35 @@ class ConsoleServer:
                 return _err(404, "找不到这个对话")
             return _chat_json(chat)
 
+        async def _chat_discovery(request: web.Request, resource: str) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            mod, not_ready = _chat_ready()
+            if not_ready is not None:
+                return not_ready
+            gid = str(request.query.get("group_id") or "").strip()
+            if gid:
+                resolved = self._resolve_ref(gid)
+                if resolved is None:
+                    return _err(404, "没有这个群")
+                gid = resolved
+            try:
+                rows = await _call(getattr(mod, f"available_{resource}"), group_id=gid)
+            except KeyError:
+                return _err(404, "没有这个群")
+            except ValueError as e:
+                return _err(400, str(e) or "查不了这个清单")
+            return _chat_json({resource: list(rows or [])})
+
+        @get("/api/chat/skills")
+        async def _chat_skills(request: web.Request) -> web.Response:
+            return await _chat_discovery(request, "skills")
+
+        @get("/api/chat/refs")
+        async def _chat_refs(request: web.Request) -> web.Response:
+            return await _chat_discovery(request, "refs")
+
         @get("/api/chat/{id}")
         async def _chat_detail(request: web.Request) -> web.Response:
             forbid = self._require_admin(request)
@@ -5029,6 +5083,7 @@ class ConsoleServer:
                     "running": _running_of(mod, chat_id, out.get("running")),
                     "messages": list(out.get("messages") or []),
                     "pending": list(out.get("pending") or []),
+                    **({"status": out["status"]} if isinstance(out.get("status"), dict) else {}),
                 }
             )
 
@@ -5047,10 +5102,12 @@ class ConsoleServer:
             if body is None:
                 return _err(400, "请求体不是 JSON")
             text = str(body.get("text") or "").strip()
-            if not text:
+            has_skill = isinstance(body.get("skill"), str) and bool(body["skill"].strip())
+            if not text and not has_skill:
                 return _err(400, "说的话不能是空的")
             try:
-                mid = await _call(mod.send, chat_id, text)
+                kwargs = {"skill": body["skill"]} if "skill" in body else {}
+                mid = await _call(mod.send, chat_id, text, **kwargs)
             except (KeyError, ValueError) as e:
                 # 忙是 ChatBusy（ValueError 子类）→ 409；对话在、只是话不合规（太长）→ 400；否则 404
                 if _is_busy_error(e):
@@ -5109,8 +5166,12 @@ class ConsoleServer:
             chat_id, bad_id = _id_param(request.match_info["id"], "对话")
             if bad_id is not None:
                 return bad_id
+            body = await _json_body(request) if await request.read() else {}
+            if body is None:
+                return _err(400, "请求体不是 JSON")
             try:
-                out = await _call(mod.compact, chat_id)
+                kwargs = {"focus": body["focus"]} if "focus" in body else {}
+                out = await _call(mod.compact, chat_id, **kwargs)
             except (KeyError, ValueError) as e:
                 if _is_busy_error(e):
                     return _err(409, str(e) or "上一句还在处理，等一下再整理")
@@ -5121,6 +5182,29 @@ class ConsoleServer:
                 return _err(404, "找不到这个对话")
             summary = out.get("summary") if isinstance(out.get("summary"), dict) else out
             return _chat_json({"summary": summary, "chat_id": chat_id})
+
+        async def _chat_control(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            mod, not_ready = _chat_ready()
+            if not_ready is not None:
+                return not_ready
+            chat_id, bad_id = _id_param(request.match_info["id"], "对话")
+            if bad_id is not None:
+                return bad_id
+            action = request.match_info["action"]
+            try:
+                out = await _call(getattr(mod, action), chat_id)
+            except KeyError:
+                return _err(404, "找不到这个对话")
+            except ValueError as e:
+                if _is_busy_error(e):
+                    return _err(409, str(e) or "上一句还在处理，等一下")
+                return _err(400, str(e) or "现在不能这样做")
+            return _chat_json(out)
+
+        app.router.add_post("/api/chat/{id}/{action:stop|retry}", self._write(_chat_control))
 
         # pending 路由先落：路径段数和 /api/chat/{id} 不同，顺序只为了让「静态段优先」一眼可见
         app.router.add_post("/api/chat/pending/{pid}", self._write(_chat_pending))

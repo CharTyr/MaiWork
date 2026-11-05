@@ -577,6 +577,7 @@ class RenderAssets:
         self._system_fonts = system_fonts or system_cjk_fonts
         self._cache: dict[str, Any] | None = None
         self._checking = False
+        # 刷新要排队跑：装完那次刷新不能被「正在刷新」挡掉直接返回（见 refresh()）
         self._refresh_lock = asyncio.Lock()
         self._running: dict[str, str] = {}
         self._tasks: set[asyncio.Task] = set()
@@ -614,10 +615,24 @@ class RenderAssets:
         except Exception:
             logger.warning("写 kv %s 出错", key, exc_info=True)
 
+    def _root_key(self) -> str:
+        root = self.root()
+        return str(root) if root is not None else ""
+
     def _check(self) -> dict[str, Any]:
-        if self._cache is None:
-            rec = self._kv_get(CHECK_KEY, None)
-            self._cache = rec if isinstance(rec, dict) else {}
+        """上次探测结果（进程内缓存 → kv），**只认当前这个目录的**。
+
+        换了工作区根 = 换了 MaiWork 自己的目录：旧目录的「启动检查通过」拿到新目录上就是
+        假话（新目录里可能根本没有浏览器）。所以记录里存了写它时的根，对不上就当没有。
+        """
+        key = self._root_key()
+        if self._cache is not None and str(self._cache.get("root") or "") == key:
+            return self._cache
+        rec = self._kv_get(CHECK_KEY, None)
+        if isinstance(rec, dict) and str(rec.get("root") or "") == key:
+            self._cache = rec
+        else:
+            self._cache = {}
         return self._cache
 
     def _spawn(self, coro: Any) -> None:
@@ -659,7 +674,7 @@ class RenderAssets:
         async with self._refresh_lock:
             self._checking = True
             try:
-                rec: dict[str, Any] = {"at": clock.now()}
+                rec: dict[str, Any] = {"at": clock.now(), "root": self._root_key()}
                 try:
                     fonts, _b, _h = self._dirs()
                 except AssetError as exc:

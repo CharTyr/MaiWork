@@ -15,7 +15,9 @@
 
 from __future__ import annotations
 
+import base64
 import copy
+import hashlib
 import html
 import json
 import logging
@@ -191,6 +193,62 @@ def task_quota_free_kind(task_id: Any, push_kind: Any) -> str:
 _MESSAGE_BLOCK = re.compile(r"<message\s+([^>]*)>(.*?)</message>", re.DOTALL)
 _MESSAGE_PREFIX = re.compile(r"^<message\s+([^>]*)>", re.DOTALL)
 _MESSAGE_ATTR = re.compile(r'([a-zA-Z_]+)="([^"]*)"')
+
+
+PLANNER_HANDOFF_TOOL = "maiwork_handoff"
+
+
+def to_display_message_id(message_id: Any) -> str:
+    """与 planner 展示一致的消息短号；短号和原号都可用于查发言人。"""
+    normalized = str(message_id or "").strip()
+    if len(normalized) <= 12:
+        return normalized
+    digest = hashlib.sha1(normalized.encode("utf-8")).digest()
+    return "m" + base64.b32encode(digest).decode("ascii").lower()[:6]
+
+
+def extract_planner_msg_ids(kwargs: Any) -> list[str]:
+    """按上下文顺序取群友消息号，排除机器人消息并去重。"""
+    items = kwargs.get("items") if isinstance(kwargs, dict) else None
+    if not isinstance(items, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = TopicMatcher._item_text(item)
+        matches = list(_MESSAGE_BLOCK.finditer(text))
+        if not matches:
+            prefix = _MESSAGE_PREFIX.match(text)
+            matches = [prefix] if prefix is not None else []
+        for match in matches:
+            attrs = dict(_MESSAGE_ATTR.findall(match.group(1)))
+            if attrs.get("is_self_message", "").lower() == "true":
+                continue
+            mid = str(attrs.get("msg_id") or "").strip()
+            if mid and mid not in seen:
+                seen.add(mid)
+                result.append(mid)
+    return result
+
+
+def strip_planner_tool(kwargs: Any, tool_name: str = PLANNER_HANDOFF_TOOL) -> dict | None:
+    """移除当前请求中的交接工具；只浅拷贝顶层，保留上下文对象。"""
+    definitions = kwargs.get("tool_definitions") if isinstance(kwargs, dict) else None
+    if not isinstance(definitions, list) or not definitions:
+        return None
+    names = {tool_name, f"chartyr.maiwork.{tool_name}"}
+
+    def matches(definition: Any) -> bool:
+        if not isinstance(definition, dict):
+            return False
+        function = definition.get("function")
+        nested_name = function.get("name") if isinstance(function, dict) else None
+        return definition.get("name") in names or nested_name in names
+
+    filtered = [definition for definition in definitions if not matches(definition)]
+    if len(filtered) == len(definitions):
+        return None
+    return {**kwargs, "tool_definitions": filtered}
 
 
 class TopicMatcher:
@@ -643,8 +701,9 @@ class Mentions:
         if ring is None:
             ring = OrderedDict()
             self._recent_msg_users[gid] = ring
-        ring[mid] = uid
-        ring.move_to_end(mid)
+        for key in (mid, to_display_message_id(mid)):
+            ring[key] = uid
+            ring.move_to_end(key)
         while len(ring) > self._recent_msg_user_limit:
             ring.popitem(last=False)
 

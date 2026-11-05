@@ -39,7 +39,7 @@ import sqlite3
 import uuid
 from typing import Any, Callable, Iterable
 
-from . import clock
+from . import clock, run_ref
 from .store import _AGENT_NOTES_DDL
 
 logger = logging.getLogger("maiwork.agents")
@@ -271,6 +271,11 @@ class Agents:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(agent_handoffs)")}
             if "notes" not in cols:  # 没跑过第 48 步迁移、表又早建好的库
                 conn.execute("ALTER TABLE agent_handoffs ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
+            if "run_ref" not in cols:  # 没跑过第 50 步迁移、表又早建好的库
+                conn.execute("ALTER TABLE agent_handoffs ADD COLUMN run_ref TEXT NOT NULL DEFAULT ''")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_agent_handoffs_run_ref"
+                " ON agent_handoffs(run_ref)")
         self._schema_ready = True
 
     # ------------------------------------------------------------------
@@ -1554,8 +1559,8 @@ class Agents:
             conn.execute(
                 "INSERT INTO agent_handoffs (id, group_id, kind, task_id, phase, parent_id,"
                 " status, brief, criteria, tools, skills, summary, data, evidence, review,"
-                " error, created, updated)"
-                " VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, '', '', '[]', '', '', ?, ?)",
+                " error, created, updated, run_ref)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, '', '', '[]', '', '', ?, ?, ?)",
                 (
                     hid, gid_s, kind_s,
                     str(task_id or "")[:_TASK_ID_MAX],
@@ -1566,12 +1571,24 @@ class Agents:
                     json.dumps(tools_list, ensure_ascii=False),
                     json.dumps(skills_list, ensure_ascii=False),
                     now, now,
+                    run_ref.current()[:200],
                 ),
             )
         return hid
 
     def running(self, gid: str, id: str) -> None:
         self._transition(gid, id, "running")
+
+    def set_handoff_run_ref(self, gid: str, id: str, ref: str) -> None:
+        """给交接单补 run_ref（库号 50）：无外圈 ref 时 Specialists 给那轮一个
+        自己的 ref（handoff:<交接单号>），写进交接单让看板按 ref 精确回看。"""
+        gid_s = self._verify_served(gid)
+        self._ensure_schema()
+        with self._store.tx() as conn:
+            conn.execute(
+                "UPDATE agent_handoffs SET run_ref=? WHERE id=? AND group_id=?",
+                (str(ref or "")[:200], str(id or ""), gid_s),
+            )
 
     def returned(
         self,
@@ -1816,12 +1833,15 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     " error TEXT NOT NULL DEFAULT '',"
     " created REAL NOT NULL DEFAULT 0,"
     " updated REAL NOT NULL DEFAULT 0,"
-    " notes TEXT NOT NULL DEFAULT ''"
+    " notes TEXT NOT NULL DEFAULT '',"
+    " run_ref TEXT NOT NULL DEFAULT ''"
     ")",
     "CREATE INDEX IF NOT EXISTS idx_agent_handoffs_group"
     " ON agent_handoffs(group_id, created)",
     "CREATE INDEX IF NOT EXISTS idx_agent_handoffs_group_kind"
     " ON agent_handoffs(group_id, kind, created)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_handoffs_run_ref"
+    " ON agent_handoffs(run_ref)",
     # 便条板（docs/34）：DDL 与 store 第 48 步同一份
     *_AGENT_NOTES_DDL,
 )
@@ -2115,6 +2135,8 @@ def _handoff_row(r: sqlite3.Row, *, for_list: bool) -> dict[str, Any]:
         "review": str(r["review"] or ""),
         "created": float(r["created"] or 0.0),
         "updated": float(r["updated"] or 0.0),
+        # 库号 50 列；半截库（表早于第 50 步、迁移还没跑）没有就当空。
+        "run_ref": str(r["run_ref"] or "") if "run_ref" in r.keys() else "",
     }
     # data 是结构化成果（可能很大）：列表给截断版（API/详情可再读），原始完整版不落字段。
     data_raw = str(r["data"] or "")

@@ -30,19 +30,23 @@ import logging
 from typing import Any
 
 from .. import views
-from .context import Ctx, DEFAULT_HOURS, STUCK_AFTER_S, normalize_hours
-from .trace import Trace, batch_counts, batch_last_step, steps as _trace_steps
+from .context import DEFAULT_HOURS, STUCK_AFTER_S, Ctx, _clip, _f, normalize_hours
 from .sources import goal as goal_src
 from .sources import handoff as handoff_src
 from .sources import idea as idea_src
 from .sources import main as main_src
 from .sources import news as news_src
+from .sources import round as round_src
 from .sources import task as task_src
 from .sources import topic as topic_src
+from .trace import Trace, batch_counts, batch_last_step
+from .trace import steps as _trace_steps
 
 logger = logging.getLogger("maiwork.console.board")
 
 HISTORY_LIMIT = 50           # 每条 lane 的历史最多多少条
+BOARD_NOTES_LIMIT = 50       # 顶层 notes：窗口内最近的便条上限
+PARENT_NOTES_LIMIT = 50      # 父卡详情聚合的子单便条上限
 
 __all__ = ["board_view", "item_view", "normalize_hours"]
 
@@ -54,7 +58,163 @@ _SOURCES = {
     "goal": goal_src,
     "topic": topic_src,
     "main": main_src,
+    "round": round_src,
 }
+
+
+def _parent_key(item: dict[str, Any]) -> tuple[str, str] | None:
+    """这件（非交接单）认领子交接单的精确库键：(列名, 值)。
+
+    只认写死的三种挂法，不搞模糊猜（run_ref 空的老单子一律留独立卡）：
+    - task / goal：agent_handoffs.task_id == item.task_id（goal 的是 goal-check:<id>）
+    - news_batch / idea：agent_handoffs.run_ref == item._run_ref（非空才算）
+    - round（lane 是 news / idea / goal）：agent_handoffs.run_ref == 轮的 ref
+    """
+    source = str(item.get("source") or "")
+    if source in ("task", "goal"):
+        tid = str(item.get("task_id") or "")
+        return ("task_id", tid) if tid else None
+    if source in ("news_batch", "idea"):
+        ref = str(item.get("_run_ref") or "")
+        return ("run_ref", ref) if ref else None
+    if source == "round" and str(item.get("lane") or "") in ("news", "idea", "goal"):
+        ref = str(item.get("_run_ref") or item.get("id") or "")
+        return ("run_ref", ref) if ref else None
+    return None
+
+
+def _child_stats(ctx: Ctx, items: list[dict[str, Any]]
+                 ) -> dict[int, tuple[int, int]]:
+    """id(item) → (handoff_count, note_count)：子交接单数 + 挂上去的便条数。
+
+    handoff 本身数自己那张单的便条；task / goal / news_batch / idea / round
+    按 _parent_key 的子单（含跨栏的 c_*）数；其它来源恒 0。不按 since 限：
+    卡片统计的是「这件总共有几单几条」，和详情同源 → 同形。
+    """
+    out: dict[int, tuple[int, int]] = {}
+    if ctx.conn is None:
+        return out
+    # 父卡：(列, 值) 分组成一次 IN 查询；交接单：(group_id, id) → note 数
+    by_col: dict[str, dict[str, list[tuple[str, int]]]] = {}
+    hid_index: dict[tuple[str, str], list[int]] = {}
+    for it in items:
+        if str(it.get("source") or "") == "handoff":
+            key = (str(it.get("group_id") or ""), str(it.get("id") or ""))
+            hid_index.setdefault(key, []).append(id(it))
+            continue
+        pk = _parent_key(it)
+        if pk is not None:
+            by_col.setdefault(pk[0], {}).setdefault(pk[1], []).append(
+                (str(it.get("group_id") or ""), id(it)))
+
+    # 子单（id, group_id, col值）一把全捞，按库键回挂到父卡
+    for col, val_map in by_col.items():
+        marks = ",".join("?" * len(val_map))
+        rows = ctx.fetch(
+            f"SELECT id, group_id, {col} AS pkey FROM agent_handoffs WHERE {col} IN ({marks})",
+            tuple(val_map.keys()),
+        )
+        for val, holders in val_map.items():
+            kids = [(str(r["id"]), str(r["group_id"] or ""))
+                    for r in rows if str(r["pkey"] or "") == val]
+            for gid, iid in holders:
+                mine = [hid for hid, hgid in kids if hgid == gid]
+                out[iid] = (len(mine), _notes_count(ctx, gid, mine))
+
+    # 交接单自己的 note_count（按群分组查，同 id 跨群不串）
+    gids = sorted({k[0] for k in hid_index})
+    for gid in gids:
+        hids = sorted(h for g, h in hid_index if g == gid)
+        if not hids:
+            continue
+        marks = ",".join("?" * len(hids))
+        counts = {
+            str(r["handoff_id"]): int(r["n"] or 0)
+            for r in ctx.fetch(
+                f"SELECT handoff_id, COUNT(*) AS n FROM agent_notes"
+                f" WHERE group_id=? AND handoff_id IN ({marks}) GROUP BY handoff_id",
+                (gid, *hids),
+            )
+        }
+        for hid in hids:
+            for iid in hid_index.get((gid, hid), []):
+                out[iid] = (0, counts.get(hid, 0))
+    return out
+
+
+def _notes_count(ctx: Ctx, gid: str, handoff_ids: list[str]) -> int:
+    """这组交接单下面贴了几条便条。"""
+    if not handoff_ids:
+        return 0
+    marks = ",".join("?" * len(handoff_ids))
+    row = ctx.fetch_one(
+        f"SELECT COUNT(*) AS n FROM agent_notes WHERE group_id=? AND handoff_id IN ({marks})",
+        (gid, *handoff_ids),
+    )
+    return int(row["n"]) if row else 0
+
+
+def _child_rows(ctx: Ctx, item: dict[str, Any]) -> list[Any]:
+    """父卡的子交接单行（按 created 升序；没有父键 → 空）。"""
+    pk = _parent_key(item)
+    if pk is None:
+        return []
+    col, val = pk
+    return ctx.fetch(
+        "SELECT id, kind, phase, status, summary, review, error, run_ref, created, updated"
+        f" FROM agent_handoffs WHERE group_id=? AND {col}=? ORDER BY created ASC, id ASC",
+        (str(item.get("group_id") or ""), val),
+    )
+
+
+def _rounds_of(ctx: Ctx, rows: list[Any]) -> list[dict[str, Any]]:
+    """子交接单行 → 详情 rounds（第几轮、谁、什么状态、小结 / 验收 / 失败原因）。"""
+    out: list[dict[str, Any]] = []
+    for idx, r in enumerate(rows, start=1):
+        status = str(r["status"] or "")
+        out.append({
+            "id": str(r["id"]),
+            "no": idx,
+            "kind": str(r["kind"] or ""),
+            "kind_title": ctx.lane_title(str(r["kind"] or "")),
+            "phase": str(r["phase"] or ""),
+            "status": status,
+            "status_text": handoff_src._STATUS_TEXT.get(status, status),
+            "started": _f(r["created"]),
+            "finished": _f(r["updated"]) if status in handoff_src._DONE else None,
+            "ok": (True if status == "accepted" else (False if status in handoff_src._DONE else None)),
+            "summary": _clip(str(r["summary"] or ""), 200),
+            "review": _clip(str(r["review"] or ""), 200),
+            "error": _clip(str(r["error"] or ""), 200),
+        })
+    return out
+
+
+def _parent_notes(ctx: Ctx, gid: str, rows: list[Any]) -> list[dict[str, Any]]:
+    """父卡详情聚合的便条：它名下所有子交接单贴上板的（按贴出顺序）。"""
+    hids = [str(r["id"]) for r in rows]
+    if not hids:
+        return []
+    marks = ",".join("?" * len(hids))
+    return [
+        {"from_kind": str(n["from_kind"]), "to_kind": str(n["to_kind"]),
+         "body": str(n["body"]), "created": _f(n["created"])}
+        for n in ctx.fetch(
+            "SELECT from_kind, to_kind, body, created FROM agent_notes"
+            f" WHERE group_id=? AND handoff_id IN ({marks}) ORDER BY id LIMIT {PARENT_NOTES_LIMIT}",
+            (gid, *hids),
+        )
+    ]
+
+
+def _round_map_of(rows: list[Any]) -> dict[str, str]:
+    """共享轮 ref → 交接单号：steps 的 round_id 标哪轮用（handoff:<id> 的不查表）。"""
+    out: dict[str, str] = {}
+    for r in rows:
+        ref = str(r["run_ref"] or "") if "run_ref" in r.keys() else ""
+        if ref and not ref.startswith("handoff:"):
+            out[ref] = str(r["id"])
+    return out
 
 
 def board_view(svc: Any, *, hours: Any = None, now: float | None = None) -> dict[str, Any]:
@@ -71,16 +231,51 @@ def board_view(svc: Any, *, hours: Any = None, now: float | None = None) -> dict
         running_items.extend(src.active(ctx))
         history_items.extend(src.finished(ctx, since))
 
-    # 批量：每个 Trace 的「几步工具 / 几步思考 / 最后一步」
     all_items = running_items + history_items
+
+    # 子交接单折叠：同栏且能认到板上爸的手单，收进爸的卡片（rounds）里；
+    # 还在跑的单不藏进已结束的爸（跑着的活必须留一眼看到）。
+    parents_by_lane: dict[str, dict[tuple, bool]] = {}
+    for it in all_items:
+        pk = _parent_key(it)
+        if pk is None:
+            continue
+        key = (str(it.get("group_id") or ""), pk[0], pk[1])
+        lane_map = parents_by_lane.setdefault(str(it.get("lane") or ""), {})
+        # 同键多张父卡：全结束才算「爸都走了」（还有活爸 → 跑着的单照常折进去）
+        lane_map[key] = lane_map.get(key, True) and (it.get("finished") is not None)
+
+    def _folded(it: dict[str, Any]) -> bool:
+        if str(it.get("source") or "") != "handoff":
+            return False
+        lane_map = parents_by_lane.get(str(it.get("lane") or ""), {})
+        gid = str(it.get("group_id") or "")
+        for col in ("task_id", "run_ref"):
+            val = str(it.get("task_id") or "") if col == "task_id" else str(it.get("_run_ref") or "")
+            k = (gid, col, val)
+            if not val or k not in lane_map:
+                continue
+            if it.get("finished") is None and lane_map[k]:
+                continue    # 活单不藏进已结束的爸
+            return True
+        return False
+
+    visible_running = [it for it in running_items if not _folded(it)]
+    visible_history = [it for it in history_items if not _folded(it)]
+
+    # 批量：每个 Trace 的「几步工具 / 几步思考 / 最后一步」
     traces = [it["trace"] for it in all_items]
     counts_map = batch_counts(ctx, traces)
     last_map = batch_last_step(ctx, traces)
+    stats_map = _child_stats(ctx, all_items)
     for it, tr in zip(all_items, traces):
         it["_trace_key"] = tr.key
         c = counts_map.get(tr.key) or {}
         it["counts"] = {"tools": int(c.get("tools") or 0), "thinks": int(c.get("thinks") or 0)}
         it["last_step"] = last_map.get(tr.key)
+        hc, nc = stats_map.get(id(it), (0, 0))
+        it["handoff_count"] = hc
+        it["note_count"] = nc
 
     lanes: dict[str, dict[str, Any]] = {}
     for kind in ctx.lane_kinds():
@@ -92,7 +287,7 @@ def board_view(svc: Any, *, hours: Any = None, now: float | None = None) -> dict
             "history": [],
             "counts": {"running": 0, "done": 0, "failed": 0},
         }
-    for it in running_items:
+    for it in visible_running:
         lane = lanes.get(it["lane"]) or lanes.setdefault(it["lane"], {
             "kind": it["lane"], "kind_title": ctx.lane_title(it["lane"]),
             "fish_seed": ctx.fish.get(it["lane"], ""),
@@ -100,7 +295,7 @@ def board_view(svc: Any, *, hours: Any = None, now: float | None = None) -> dict
         })
         lane["running"].append(_lane_out(ctx, it))
         lane["counts"]["running"] += 1
-    for it in history_items:
+    for it in visible_history:
         lane = lanes.get(it["lane"])
         if lane is None:
             continue
@@ -118,7 +313,34 @@ def board_view(svc: Any, *, hours: Any = None, now: float | None = None) -> dict
         "hours": hours_i,
         "stuck_after_s": STUCK_AFTER_S,
         "lanes": [lanes[k] for k in ctx.lane_kinds() if k in lanes],
+        "notes": _board_notes(ctx, since),
     }
+
+
+def _board_notes(ctx: Ctx, since: float) -> list[dict[str, Any]]:
+    """顶层便条板：窗口内服务群贴上板的便条（新→旧，至多 50）。"""
+    if not ctx.served:
+        return []
+    marks = ",".join("?" * len(ctx.served))
+    out: list[dict[str, Any]] = []
+    for r in ctx.fetch(
+        "SELECT id, group_id, from_kind, to_kind, body, handoff_id, created"
+        f" FROM agent_notes WHERE created >= ? AND group_id IN ({marks})"
+        f" ORDER BY created DESC, id DESC LIMIT {BOARD_NOTES_LIMIT}",
+        (since, *sorted(ctx.served)),
+    ):
+        gid = str(r["group_id"] or "")
+        out.append({
+            "id": int(r["id"]),
+            "group_id": gid,
+            "group_name": ctx.group_name(gid),
+            "from_kind": str(r["from_kind"] or ""),
+            "to_kind": str(r["to_kind"] or ""),
+            "body": str(r["body"] or ""),
+            "handoff_id": str(r["handoff_id"] or ""),
+            "created": _f(r["created"]),
+        })
+    return out
 
 
 def _lane_out(ctx: Ctx, it: dict[str, Any]) -> dict[str, Any]:
@@ -164,11 +386,32 @@ def item_view(svc: Any, source: Any, item_id: Any, *, after: Any = None,
     trace = item["trace"]
     extra = item.get("_extra_think")
     counts, last_step = _counts_last(ctx, trace)
+
+    # 子交接单：父卡给 rounds / 聚合便条 / steps 的 round_id 名册；叶卡空
+    children = _child_rows(ctx, item)
+    rounds = _rounds_of(ctx, children)
+    round_map = _round_map_of(children)
+    if "_notes" in item:  # 交接单详情带自己的便条（docs/34）
+        notes = item["_notes"]
+    elif children:
+        notes = _parent_notes(ctx, str(item.get("group_id") or ""), children)
+    else:
+        notes = []
+
+    hc, nc = _child_stats(ctx, [item]).get(id(item), (0, 0))
+    item["handoff_count"] = hc
+    item["note_count"] = nc
     out_item = ctx.finish_item(item)
     out_item["counts"] = counts
     out_item["last_step"] = last_step
-    body = _trace_steps(ctx, trace, out_item, after=after_f, extra_think=extra)
-    out = {"item": out_item, "link": body["link"], "steps": body["steps"]}
-    if "_notes" in item:  # 便条板（docs/34）：只有专岗交接单带
-        out["notes"] = item["_notes"]
-    return out
+    body = _trace_steps(ctx, trace, out_item, after=after_f, extra_think=extra,
+                        round_map=round_map)
+    return {
+        "item": out_item,
+        "link": body["link"],
+        "steps": body["steps"],
+        "total_steps": body["total_steps"],
+        "truncated": body["truncated"],
+        "rounds": rounds,
+        "notes": notes,
+    }

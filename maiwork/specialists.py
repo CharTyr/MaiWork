@@ -20,6 +20,7 @@ import asyncio
 import logging
 from typing import Any
 
+from . import run_ref
 from .workers import WorkerReport, Workers
 
 logger = logging.getLogger("maiwork.specialists")
@@ -570,27 +571,61 @@ class Specialists:
             lane_kw["history"] = history
         if escalate:
             lane_kw["escalate"] = True
+        # 交接单挂 run_ref（库号 50）：外圈有 ref 直接沿用（begin 已落库）；
+        # 没有就给这一轮一个自己的 ref（handoff:<交接单号>），包进 workers.run —
+        # 它轮里的工具 / 模型调用按 ref 精确挂回这张交接单，看板可回看。
+        eff_ref = run_ref.current() or f"handoff:{handoff_id}"
+        if not run_ref.current():
+            setter = getattr(self._agents, "set_handoff_run_ref", None)
+            if callable(setter):
+                try:
+                    setter(gid, handoff_id, eff_ref)
+                except Exception:
+                    logger.exception("交接单 run_ref 落库失败（%s）", handoff_id)
         try:
-            report = await self._workers.run(
-                str(brief),
-                group_id=gid,
-                tools=list(effective_tools),
-                task_id=str(task_id or ""),
-                actor=actor_s,
-                max_steps=max_steps or 0,
-                output_schema=output_schema,
-                workspace=workspace,
-                skills_hint=skills_hint,
-                system_extra=system_extra,
-                deadline_ts=deadline_ts,
-                artifact_scope=artifact_scope,
-                write_scope=write_scope,
-                agent_type=kind_s,
-                allowed_tools=tuple(effective_tools),
-                allowed_skills=allowed_skills,
-                **telemetry,
-                **lane_kw,
-            )
+            if run_ref.current():
+                report = await self._workers.run(
+                    str(brief),
+                    group_id=gid,
+                    tools=list(effective_tools),
+                    task_id=str(task_id or ""),
+                    actor=actor_s,
+                    max_steps=max_steps or 0,
+                    output_schema=output_schema,
+                    workspace=workspace,
+                    skills_hint=skills_hint,
+                    system_extra=system_extra,
+                    deadline_ts=deadline_ts,
+                    artifact_scope=artifact_scope,
+                    write_scope=write_scope,
+                    agent_type=kind_s,
+                    allowed_tools=tuple(effective_tools),
+                    allowed_skills=allowed_skills,
+                    **telemetry,
+                    **lane_kw,
+                )
+            else:
+                async with run_ref.tagged(eff_ref):
+                    report = await self._workers.run(
+                        str(brief),
+                        group_id=gid,
+                        tools=list(effective_tools),
+                        task_id=str(task_id or ""),
+                        actor=actor_s,
+                        max_steps=max_steps or 0,
+                        output_schema=output_schema,
+                        workspace=workspace,
+                        skills_hint=skills_hint,
+                        system_extra=system_extra,
+                        deadline_ts=deadline_ts,
+                        artifact_scope=artifact_scope,
+                        write_scope=write_scope,
+                        agent_type=kind_s,
+                        allowed_tools=tuple(effective_tools),
+                        allowed_skills=allowed_skills,
+                        **telemetry,
+                        **lane_kw,
+                    )
         except asyncio.CancelledError:
             try:
                 self._agents.fail(gid, handoff_id, "已取消", state="cancelled")

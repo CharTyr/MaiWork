@@ -172,11 +172,19 @@ class Ctx:
 
     def finish_item(self, item: dict[str, Any]) -> dict[str, Any]:
         """给 Item 补上对外字段：去内部字段（lane / task_id / _run_ref /
-        _trace_key / error / trace / _extra_think），加 group_name /
-        elapsed_s / title 截断 / counts / last_step 占位。"""
+        _trace_key / trace / _extra_think），加 group_name / elapsed_s /
+        title 截断 / error 截断 / error_brief / jump。"""
         out = dict(item)
+        # error：详情保留（≤400 字），lanes 那层由 _lane_out 剥掉
+        out["error"] = _clip(out.get("error") or "", 400)
+        # error_brief：一行内（≤80 字）的失败简报；只在确定失败 / 打回 / 取消时给
+        raw_err = str(item.get("error") or "")
+        failure = (out.get("ok") is False
+                   or str(out.get("status") or "") in ("failed", "rejected", "cancelled"))
+        out["error_brief"] = _clip(raw_err, 80) if failure and raw_err else ""
+        out["jump"] = _jump_of(out)
         for k in ("lane", "task_id", "_run_ref", "_trace_key",
-                  "trace", "_extra_think", "_finished_ts", "_notes"):
+                  "trace", "_extra_think", "_finished_ts", "_notes", "_personal"):
             out.pop(k, None)
         out["title"] = _clip(out.get("title") or "")
         gid = str(out.get("group_id") or "")
@@ -187,6 +195,55 @@ class Ctx:
             end = _f(out.get("finished")) or self.now
             out["elapsed_s"] = max(0, int(end - _f(out.get("started"))))
         return out
+
+
+def _jump(tab: str, detail_type: str = "", detail_id: str = "") -> dict[str, str]:
+    return {"tab": tab, "detail_type": detail_type, "detail_id": detail_id}
+
+
+def _jump_of(item: dict[str, Any]) -> dict[str, str] | None:
+    """只读跳转目标：这条卡片点进去落在控制台哪个页 / 哪条详情。
+
+    纯由 item 自身字段决定（lanes 和详情同形才有意义）；跳不了 / 没目标 → None。
+    个人向构想只给 group 页，绝不把 detail id 送出去（隐私同个人构想标题脱敏）。
+    """
+    source = str(item.get("source") or "")
+    tid = str(item.get("task_id") or "")
+    gid = str(item.get("group_id") or "")
+    iid = str(item.get("id") or "")
+    if source == "task":
+        return _jump("tasks", "task", iid)
+    if source == "goal":
+        return _jump("tasks", "goal", iid)
+    if source == "idea":
+        if bool(item.get("_personal")):
+            return _jump("group")
+        return _jump("ideas", "idea", f"I-{iid}")
+    if source == "news_batch":
+        return _jump("news")
+    if source == "topic":
+        return _jump("group")
+    if source == "round":
+        lane = str(item.get("lane") or "")
+        if lane == "news":
+            return _jump("news")
+        if lane == "idea":
+            return _jump("ideas")
+        if lane == "goal":
+            return (_jump("tasks", "goal", tid.split(":", 1)[1])
+                    if tid.startswith("goal-check:") else None)
+        if lane == "topic":
+            return _jump("group")
+        return None
+    if source == "main":
+        return _jump("group") if gid else None
+    if source == "handoff":
+        if tid.startswith("T-"):
+            return _jump("tasks", "task", tid)
+        if tid.startswith("goal-check:"):
+            return _jump("tasks", "goal", tid.split(":", 1)[1])
+        return _jump("group") if gid else None
+    return None
 
 
 def _paused_kind(raw: Any) -> str:

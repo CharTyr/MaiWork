@@ -5,6 +5,7 @@ import { api, gname, mq, platTag, quiet } from "../api.js";
 import { repaintSheet } from "../sheet.js";
 import { loading } from "../pages/news.js";
 import { extPage } from "./ext.js";
+import { skillsPage } from "./skills.js";
 import { optDepsSection } from "./optdeps.js";
 import { agentsPage } from "./agents.js";
 import { jevSection } from "./jev.js";
@@ -37,7 +38,7 @@ export function groupPicker() {
 export const SET_SUBS = [
   ["overview", "概况", "gear", "运行状态和今日用量"],
   ["models", "模型与专岗", "robot", "端点、模型库、专岗和快速判断"],
-  ["extensions", "工具与平台", "tools", "联网搜索、社交平台、MCP 和组件"],
+  ["extensions", "工具与平台", "tools", "联网搜索、技能、MCP 和组件"],
   ["sources", "群与来源", "newspaper", "群链接、群管理员和资讯来源"],
   ["usage", "用量", "chart", "每日统计和调用记录"],
   ["rules", "系统", "moon", "外观、通用记忆和全部设置"],
@@ -51,7 +52,8 @@ export const SET_TABS = {
   ],
   extensions: [
     ["search", "搜索与平台"],
-    ["mcp", "MCP 与 skill"],
+    ["skills", "技能"],
+    ["mcp", "MCP"],
     ["optdeps", "可选组件"],
   ],
   sources: [
@@ -100,6 +102,7 @@ function renderModelsSection() {
 
 function renderExtSection() {
   const t = activeSetTab("extensions");
+  if (t === "skills") return skillsPage();
   if (t === "mcp") return extPage("mcp");
   if (t === "optdeps") return state.ext ? optDepsSection() : extPage("optdeps");
   return extPage("search") + socialPage();

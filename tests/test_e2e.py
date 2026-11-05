@@ -513,6 +513,8 @@ def make_config(tmp_path: Path, **sections: Any) -> dict:
     raw["jev"]["key_file"] = str(tmp_path / "typesafe_key")
     raw["approval"]["admins"] = [ADMIN]
     raw["approval"]["required"] = True
+    # 假宿主直接驱动 intake / JevStub，没有 Maisaka planner；用例可显式覆盖开启。
+    raw["quick_judge"]["planner_tool"] = False
     for section, values in sections.items():
         if isinstance(raw.get(section), dict) and isinstance(values, dict):
             raw[section].update(values)

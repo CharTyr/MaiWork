@@ -23,7 +23,7 @@ logger = logging.getLogger("maiwork.voice")
 # 提示词里的口吻规矩（开场白和构想提一嘴共用；测试按这几句认）
 SPEAK_RULES = (
     "# 说话要求",
-    "- 口吻按上面「MaiWork 的身份」来；没有就用自然的口语。",
+    "- 口吻按上面「MaiWork 的身份」来（身份设定只管语气和选词，绝不在话里提自己的名字、昵称、年龄、性别、所在城市或「作为玩家 / 鉴赏家」这类人设标签）；没有就用自然的口语。",
     "- 不自我介绍：不说「我是……」「我叫……」，不说「作为 AI / 助手 / 机器人」。",
     "- 不寒暄、不铺垫：不说「大家好」「各位好」「打扰一下」这类开场，直接说事。",
 )
@@ -58,6 +58,59 @@ def is_self_intro(text: Any) -> bool:
     return any(p.search(s) for p in _SELF_INTRO)
 
 
+# SOUL 里声明的名字 / 昵称
+_SOUL_IAM = re.compile(r"我是\s*([^\s（(，,。；;：:\n]{2,12})")
+_SOUL_IAM_SKIP = re.compile(r"^(?:说|真|觉得|在|不是|想|有点|一个|一名|群里|本群|这群|这个群)")
+# 「我是玩家」这类泛称不是名字，不拿来拦话
+_GENERIC_NOUNS = frozenset({"玩家", "老玩家", "游戏玩家", "朋友", "老熟人", "熟人", "群友",
+                            "气氛组", "搭档", "助手", "机器人", "AI", "ai"})
+_SOUL_NICK = re.compile(r"(?:你叫|名叫|昵称[是为：:\s]*)\s*([^\n。；;！!？?（(]{2,30})")
+_SOUL_SPLIT = re.compile(r"[、，,/／\s]+")
+
+# 自贴人设标签（「作为续作」这类不是人的不算）
+_PERSONA_TAG = (
+    re.compile(r"我作为[^\s，,。！？!?]{1,12}"),
+    re.compile(r"作为(?:一个|一名|重度|深度|资深)?(?:游戏玩家|玩家|女生|男生|艺术鉴赏家|鉴赏家)"),
+)
+
+# 思考草稿 / 复述提示词（开场白护栏）
+_LEAKED_DRAFT = (
+    re.compile(r"(?:不超过|别超过|控制在)\s*\d+\s*字"),
+    re.compile(r"\d+\s*字以[内下]"),
+    re.compile(r"字数(?:算一下|够了|差不多)"),
+    re.compile(r"不点名|不招揽|只回开场白|不用问句结尾|不必以问句结尾"),
+    re.compile(r"冷场(?:了|之后).{0,15}(?:聊一句|起个话头|随口)"),
+    re.compile(r"(?:我得|我要|得|先)(?:是|用|按|保持).{0,15}口吻"),
+    re.compile(r"(?:^\s*(?:用|按)|[，,。！？!?\n]\s*(?:用|按)|(?:我|咱|先|得|要|注意|保持)[^\s，,。！？!?]{0,4}[是用按保持])[^\s，,。！？!?]{1,12}的?口吻"),
+    re.compile(r"挑(?:一?个)?具体(?:细节|点|切口)\s*[：:]"),
+    re.compile(r"</?think>|<｜end▁of▁thinking｜>|<\|end_of_thinking\|>|(?:^|\s)end\s+[\u4e00-\u9fff]"),
+)
+
+
+def soul_names(soul: Any) -> tuple[str, ...]:
+    """SOUL 里声明的名字 / 昵称（「我是X」「你叫X」「昵称：X、Y」），按出现顺序去重。"""
+    text = str(soul or "")
+    out: list[str] = []
+    for m in _SOUL_IAM.finditer(text):
+        name = m.group(1).strip()
+        if name and not _SOUL_IAM_SKIP.match(name) and name not in _GENERIC_NOUNS and name not in out:
+            out.append(name)
+    for m in _SOUL_NICK.finditer(text):
+        for tok in _SOUL_SPLIT.split(m.group(1)):
+            tok = tok.strip().strip("「」『』\"'“”‘’")
+            if 2 <= len(tok) <= 12 and tok not in _GENERIC_NOUNS and tok not in out:
+                out.append(tok)
+    return tuple(out)
+
+
+def is_leaked_draft(text: Any) -> bool:
+    """这句话是不是混进了思考草稿 / 复述提示词（纯函数）。"""
+    s = str(text or "")
+    if not s.strip():
+        return False
+    return any(p.search(s) for p in _LEAKED_DRAFT)
+
+
 @dataclass
 class Persona:
     """MaiWork 开口时的人设：只有 SOUL（可能为空）。"""
@@ -74,6 +127,32 @@ class Persona:
         """system 那一句：有 SOUL 就是 SOUL；没有就只说在干嘛。"""
         soul = str(self.soul or "").strip()
         return soul or _PLAIN_SYSTEM
+
+    def leaks_identity(self, text: Any, *, allow_text: Any = "") -> bool:
+        """话里有没有露人设：自我介绍、提 MaiWork / MaiBot、自贴人设标签、说出 SOUL 里的名字。
+        allow_text（如话题标题 / 简报）里本来就有的词放过。"""
+        if not text:
+            return False
+        if is_self_intro(text):
+            return True
+        s = str(text).strip()
+        allow_low = str(allow_text or "").lower()
+        low = s.lower()
+        for word in ("maiwork", "maibot"):
+            if word in low and word not in allow_low:
+                return True
+        if any(p.search(s) for p in _PERSONA_TAG):
+            return True
+        for name in soul_names(self.soul):
+            if name.lower() in allow_low:
+                continue
+            if name.isascii():
+                hit = re.search(rf"(?<![A-Za-z0-9]){re.escape(name)}(?![A-Za-z0-9])", s, re.IGNORECASE)
+            else:
+                hit = name in s
+            if hit:
+                return True
+        return False
 
 
 def persona(identity: Any) -> Persona:

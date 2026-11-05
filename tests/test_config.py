@@ -59,8 +59,32 @@ class TestDefaults:
         # 0.5.2：[session] 工作会话入口和固定机器人显示名候选
         # 0.5.3：[console] herenow_share（没填公开网址时自动用 here.now 公开群友页）
         # 0.5.4：[console] board_hours（任务看板「最近动态」窗口）
-        assert CONFIG_VERSION == "0.5.4"
+        # 0.5.5：[quick_judge] planner_tool（规划器优先接单，默认开启）
+        assert CONFIG_VERSION == "0.5.5"
         assert MaiWorkConfig().plugin.config_version == CONFIG_VERSION
+
+    def test_planner_tool_defaults_enabled_for_old_config(self) -> None:
+        from CharTyr_MaiWork.maiwork.config import QuickJudgeSectionConfig, QuickJudgeSetting
+
+        assert QuickJudgeSectionConfig().planner_tool is True
+        assert QuickJudgeSetting().planner_tool is True
+        settings, problems = settings_of({"quick_judge": {"enabled": False}})
+        assert settings.quick_judge.planner_tool is True
+        assert problems == []
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_planner_tool_setting_survives_normalization(self, enabled: bool) -> None:
+        settings, problems = settings_of({"quick_judge": {"planner_tool": enabled}})
+        assert settings.quick_judge.planner_tool is enabled
+        assert problems == []
+
+    def test_planner_tool_is_a_basic_boolean_setting(self) -> None:
+        from CharTyr_MaiWork.maiwork import rules
+
+        spec = next(spec for spec in rules.CONFIG_SCHEMA if spec["key"] == "quick_judge.planner_tool")
+        assert spec["label"] == "规划器优先接单"
+        assert spec["type"] == "bool"
+        assert spec["advanced"] is False
 
     def test_railway_verify_new_fields_defaults(self) -> None:
         """0.3.5 新字段：railway_daily_max=2、verify_per_round=2、verify_minutes=10。"""
@@ -434,6 +458,7 @@ class TestM2Sections:
         raw = tomllib.loads(text)
         # 版本标记和代码里的 CONFIG_VERSION 对齐
         assert raw["plugin"]["config_version"] == CONFIG_VERSION
+        assert raw["quick_judge"]["planner_tool"] is True
         # 新结构：端点 + 模型库都在，条目能挂上
         assert raw["endpoints"] and raw["model_list"]
         s, problems = load_settings(raw)

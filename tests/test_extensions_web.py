@@ -105,7 +105,7 @@ class TestGetExtensions:
             r = await client.get("/api/extensions")
             assert r.status == 200
             data = await r.json()
-            assert set(data.keys()) == {"mcp", "skills"}
+            assert set(data.keys()) == {"mcp", "skills", "skill_suggestions"}
             text = json.dumps(data, ensure_ascii=False)
             assert HEADER_SECRET not in text
             assert WEB_SECRET not in text

@@ -68,11 +68,18 @@ export const state = {
   chatId: null,
   chat: null,
   chatOpen: {},
+  chatSkill: null, // 当前输入坞选中的技能胶囊：{name, scope, description}
+  chatMenu: null, // 输入坞浮动菜单：{kind: "slash"|"ref", q: "", idx: 0, start: 0, end: 0}
+  chatCtxOpen: false, // 上下文余量气泡是否展开
+  chatCatalog: null, // {groupId, skills: [], refs: [], loading: false}
   setSub: "overview",
   setTab: {}, // 各合并设置页的当前二级分栏：{models, extensions, sources, usage, rules}
   groupSub: "feed", // 管理员在群页的二级分栏："feed"（动态与画像）| "admin"（本群设置）
   ext: null, // /api/extensions
-  extEdit: null, // {kind: "mcp"|"skill", name: null|string, data}
+  extEdit: null, // {kind: "mcp"|"skill", name: null|string, mode?: "view"|"edit", data}
+  skillRole: "", // 技能中心当前角色筛选（"" = 全部，"main" | 专岗 kind）
+  skillQ: "", // 技能中心搜索词
+  skillMore: {}, // 技能中心各分组展开状态：{custom: bool, builtin: bool}
   newsTopic: "", // 资讯页主题筛选（点 .ntag 按主题过）
   newsQ: "", // 资讯页搜索框内容
 };

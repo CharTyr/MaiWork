@@ -22,6 +22,7 @@ from typing import Any, Callable
 from . import clock, members, run_ref
 from . import group_features
 from .config import Settings, load_settings
+from .delivery import extract_planner_msg_ids, strip_planner_tool
 from .environments import vm_platforms
 from .tasks import ANSWER_HINT
 from .host import Host
@@ -1434,29 +1435,77 @@ class MaiWorkApp:
         按 deadline 自检，超了就「不改动消息」（不回传整包，也少一次大帧回程）。
         """
         try:
-            if not self._started or self.mentions is None:
+            def stripped_result() -> dict:
+                modified = strip_planner_tool(kwargs)
+                if modified is not None:
+                    return {"action": "continue", "modified_kwargs": modified}
                 return dict(_CONTINUE)
-            session_id = ""
+
+            if not self._started or self.mentions is None:
+                return stripped_result()
+            session_id = str(kwargs.get("session_id") or "").strip() if isinstance(kwargs, dict) else ""
             gid = ""
-            if isinstance(kwargs, dict):
-                session_id = str(kwargs.get("session_id") or "").strip()
+            working_kwargs = kwargs
             if session_id:
-                # 非服务群：只查内存里的信号/持久会话映射，不读库、不调宿主；
-                # G4：信号可能是热更新删群前的残留，查到群后必须用 is_served 复核
+                # 群归属只看已验证的内存映射；未知群不读库、不调宿主。
                 gid = self._group_for_session_cached(session_id)
-                if not gid:
-                    return dict(_CONTINUE)
-                if self._settings is None or not self._settings.is_served(gid):
-                    return dict(_CONTINUE)
+                if not gid or self._settings is None or not self._settings.is_served(gid):
+                    return stripped_result()
+                allow_tool = bool(getattr(getattr(self._settings, "quick_judge", None), "planner_tool", True))
+                allow_tool = allow_tool and self._feature_on(gid, "task")
+                if not allow_tool:
+                    working_kwargs = strip_planner_tool(kwargs) or kwargs
+                elif self._intake is not None:
+                    definitions = kwargs.get("tool_definitions")
+                    if isinstance(definitions, list) and definitions:
+                        self._intake.note_planner_request(gid, session_id, extract_planner_msg_ids(kwargs))
+            else:
+                working_kwargs = strip_planner_tool(kwargs) or kwargs
             modified = self.mentions.inject(
-                kwargs, group_id=gid, deadline=time.monotonic() + _PLANNER_HOOK_BUDGET_S
+                working_kwargs, group_id=gid, deadline=time.monotonic() + _PLANNER_HOOK_BUDGET_S
             )
             if isinstance(modified, dict):
                 return {"action": "continue", "modified_kwargs": modified}
+            if working_kwargs is not kwargs:
+                return {"action": "continue", "modified_kwargs": working_kwargs}
             return dict(_CONTINUE)
         except Exception:
             logger.exception("planner 备忘钩子出错，已吞掉")
             return dict(_CONTINUE)
+
+    def on_planner_after_response(self, kwargs: dict) -> dict:
+        """观察服务群 planner 输出；只使用内存会话映射。"""
+        try:
+            if not self._started or self._intake is None or self._settings is None:
+                return dict(_CONTINUE)
+            sid = str(kwargs.get("session_id") or "").strip()
+            gid = self._group_for_session_cached(sid) if sid else ""
+            if gid and self._settings.is_served(gid):
+                self._intake.note_planner_response(gid, sid, kwargs.get("output_items"))
+        except Exception:
+            logger.exception("planner 收尾钩子出错，已吞掉")
+        return dict(_CONTINUE)
+
+    async def on_planner_handoff(self, kwargs: dict) -> dict:
+        """把交接参数转给 intake；发起人身份必须由原消息核实。"""
+        try:
+            if not self._started or self._intake is None:
+                return {"success": False, "error": "MaiWork 未启用", "content": "MaiWork 未启用"}
+            sid = str(kwargs.get("session_id") or kwargs.get("chat_id") or kwargs.get("stream_id") or "").strip()
+            gid = str(kwargs.get("group_id") or "").strip()
+            if not gid and sid:
+                gid = self._group_for_session_cached(sid)
+            return await self._intake.handoff_from_planner(
+                group_id=gid,
+                platform=str(kwargs.get("platform") or "").strip(),
+                session_id=sid,
+                msg_id=str(kwargs.get("msg_id") or "").strip(),
+                kind=str(kwargs.get("kind") or "").strip(),
+                title=str(kwargs.get("title") or "").strip(),
+            )
+        except Exception:
+            logger.exception("planner 请求交接出错，已吞掉")
+            return {"success": False, "error": "MaiWork 交接失败", "content": "MaiWork 交接失败"}
 
     def _group_for_session_cached(self, session_id: str) -> str:
         """session_id → 服务群号；钩子中只查内存，不查未知群的数据库行。
@@ -2515,6 +2564,8 @@ class MaiWorkApp:
             # 按群功能开关：任务 / 构想关闭时不派活、不恢复等回答的任务
             feature_on=self._feature_on,
             session_gate=self.session_gate,
+            planner_handoff=True,
+            message_lookup=(self.host.message_by_id if self.host else None),
         )
         # 派活判断兜底（quick_judge）：intake 自己建的；停机时要单独收（见 _stop_stack）
         self.quick_judge = getattr(intake, "quick_judge", None)
@@ -2740,6 +2791,12 @@ class MaiWorkApp:
             from .skills import Skills
             from .skills_tools import register_skill_tools
 
+            try:
+                from . import skills_web
+
+                skills_web.ensure_seeded_skills(settings.data_dir, self.store)
+            except Exception:
+                logger.exception("补种默认全局 skill 出错，跳过本次补种")
             # 接 store/settings 后，Skills 会跟着 kv / MCP enabled 变化自动带走/回来 skill
             self.skills = Skills(settings.data_dir, store=self.store, settings=self.get_settings)
             try:
@@ -2756,6 +2813,12 @@ class MaiWorkApp:
                     self.feeds._skills = self.skills  # noqa: SLF001
             except Exception:
                 logger.exception("给 feeds 接 skills 出错，搜索 skill 提示这次照带")
+            # 开场白的写法 skill（topic-opener）吃同一套开关
+            try:
+                if getattr(self, "topics", None) is not None:
+                    self.topics._skills = self.skills  # noqa: SLF001
+            except Exception:
+                logger.exception("给 topics 接 skills 出错，开场白这次用默认写法")
         except Exception:
             logger.exception("skill 扩展就位出错，这次没有 skill 用")
             self.skills = None

@@ -57,7 +57,35 @@ logger = logging.getLogger("maiwork.topics")
 _BROADCAST_WORDS = ("据报道", "以下是", "今日资讯", "今日热点", "新闻速报")
 
 # 开场白最长（清洗后）
-_OPENER_MAX_CHARS = 120
+_OPENER_MAX_CHARS = 75
+_URL_RE = re.compile(r"https?://\S+")
+
+
+_OPENER_SYSTEM = "你在一个 QQ 群里随口搭一句话。只输出发进群的那句话本身，不要输出思考草稿或解释。"
+
+
+def _strip_opener_quotes(text: str) -> str:
+    return str(text or "").strip().strip('"').strip("'").strip("“”").strip("‘’").strip()
+
+
+def _keep_first_url(s: str) -> str:
+    """链接最多留第一个，去掉其余链接留下的多余空格。"""
+    if len(_URL_RE.findall(s)) <= 1:
+        return s
+    count = 0
+
+    def _replace(m: "re.Match[str]") -> str:
+        nonlocal count
+        count += 1
+        return m.group(0) if count == 1 else ""
+
+    s = _URL_RE.sub(_replace, s)
+    return re.sub(r"[ \t]{2,}", " ", s).strip()
+
+
+def _opener_prose_len(text: str) -> int:
+    """开场白正文字数（链接不算）。"""
+    return len(_URL_RE.sub("", text).strip())
 
 # 回写 topic_log 时的错误文本上限
 _ERR_MAX = 300
@@ -224,7 +252,9 @@ class Topics:
         identity: Any = None,  # identity.py（开场白人设只认 SOUL；None 就是没人设，不回退读 MaiBot 人格）
         *,
         outbox: Any = None,  # 发件箱（0.8.0：唯一的发送路径）；没接 = 不开话题
+        skills: Any = None,  # Skills 实例：开场白写法读 topic-opener；None 用自带默认写法
     ) -> None:
+        self._skills = skills
         self._store = store
         self._host = host
         self._models = models
@@ -327,14 +357,14 @@ class Topics:
         scope = run_ref.tagged(ref)
         await scope.__aenter__()
         try:
-            return await self._check_round(group_id, now)
+            return await self._check_round(group_id, now, scope=scope)
         finally:
             try:
                 await scope.__aexit__(None, None, None)
             except Exception:
                 logger.exception("收开话题轮 round ref 失败")
 
-    async def _check_round(self, group_id: str, now: float) -> str:
+    async def _check_round(self, group_id: str, now: float, *, scope: Any = None) -> str:
         gid = str(group_id)
         try:
             settings = self._get_settings()
@@ -449,6 +479,14 @@ class Topics:
             age = float(now) - float(judged.get("ts") or 0.0)
             if 0.0 <= age < _REJUDGE_S:
                 return "skip:same_as_last"
+
+        # 全部前置检查过了、真要读消息问 Jev：登记「正在跑」上板（看板 topic 栏）。
+        try:
+            if scope is not None:
+                scope.activate(lane="topic", group_id=gid,
+                               title="正在判断是否开启话题", task_id="")
+        except Exception:
+            logger.exception("开话题轮上板登记失败（群 %s）", gid)
 
         # 9b) 读最近消息：多读一些（60 条），滤掉杂音后留最近 20 条给 Jev
         msgs: List[Msg] = []
@@ -654,10 +692,25 @@ class Topics:
             self._update_log(topic_id, {"opener": "", "result": json.dumps({"rejected": "开场白为空"}, ensure_ascii=False)})
             return "skip:empty_opener"
 
-        # 自我介绍 / 寒暄（2026-10-01 用户定：不要自我介绍和废话）→ 这次不开
-        if voice.is_self_intro(opener_text):
+        # 混进思考草稿 / 复述提示词 → 这次不开
+        if voice.is_leaked_draft(opener_text):
+            self._update_log(topic_id, {"opener": "", "result": json.dumps({"rejected": "开场白混入思考草稿，不发"}, ensure_ascii=False)})
+            return "rejected:leaked_draft"
+
+        # 自我介绍 / 寒暄 / 露人设（名字、昵称、人设标签）→ 这次不开
+        persona_now = voice.persona(self._identity)
+        allow_topic = f"{candidate.get('title', '')} {candidate.get('brief', '')}"
+        if voice.is_self_intro(opener_text) or persona_now.leaks_identity(opener_text, allow_text=allow_topic):
             self._update_log(topic_id, {"opener": "", "result": json.dumps({"rejected": "开场白在自我介绍 / 寒暄，不发"}, ensure_ascii=False)})
             return "rejected:self_intro"
+
+        # 超长 → 整句不发（绝不截半截话）；播报腔先认，交给下面的清洗
+        stripped = _strip_opener_quotes(opener_text)
+        if not any(w in stripped for w in _BROADCAST_WORDS):
+            stripped = _keep_first_url(stripped)
+            if _opener_prose_len(stripped) > _OPENER_MAX_CHARS or len(stripped) > 300:
+                self._update_log(topic_id, {"opener": "", "result": json.dumps({"rejected": f"开场白超过 {_OPENER_MAX_CHARS} 字，不硬截半截话"}, ensure_ascii=False)})
+                return "rejected:too_long"
 
         # 清洗
         cleaned = self._clean_opener(opener_text)
@@ -1316,10 +1369,12 @@ class Topics:
             # 开场白只要规矩（不给 learned skill，不学任何岗的做法）；人格走 persona.section()
             gc_text = self._group_context_safe(gid, "main")
             gc_part = f"\n# 这个群的规矩（管理员定的，必须照做）\n{gc_text}\n\n" if gc_text else ""
+            skill_text = self._opener_skill_section()
+            skill_part = f"\n{skill_text}\n\n" if skill_text else ""
             user_prompt = f"""群里冷场了一段时间，你随手起个话头。
 
 {persona.section()}
-{gc_part}# 群里最近的对话
+{gc_part}{skill_part}# 群里最近的对话
 {recent_text}
 
 # 想聊的话题（候选素材）
@@ -1335,11 +1390,12 @@ class Topics:
 - 只聊事情本身，不招揽任务，不把话头写成提供服务的邀约
 - 最多一个链接（也可以不带，自然就行）
 - 别写「据报道」「以下是」「今日资讯」「新闻速报」这种播报腔
-- 别超过 120 字
+- 平时 15～50 字，最多别超过 75 字（链接不算）
 
 只回开场白本身，不要别的解释。"""
         return [
-            {"role": "system", "content": persona.system()},
+            # SOUL 已在 user 里的 persona.section()，system 不再重复一遍
+            {"role": "system", "content": _OPENER_SYSTEM},
             {"role": "user", "content": user_prompt},
         ]
 
@@ -1387,10 +1443,12 @@ class Topics:
             head = "这件事没有由头，按下面的标题 / 想法直接起一个话头；不要编造群里之前聊过或有人正在做这件事。"
         gc_text = self._group_context_safe(gid, "main")
         gc_part = f"\n# 这个群的规矩（管理员定的，必须照做）\n{gc_text}\n\n" if gc_text else ""
+        skill_text = self._opener_skill_section()
+        skill_part = f"\n{skill_text}\n\n" if skill_text else ""
         return f"""群里冷场了一段时间，你想围绕下面这件事随口聊一句。
 
 {persona.section()}
-{gc_part}# 群里最近的对话
+{gc_part}{skill_part}# 群里最近的对话
 {recent_text}
 
 # 想聊的事（构想素材，不等于群友已经决定要做）
@@ -1405,9 +1463,19 @@ class Topics:
 - 只提这件事本身，不点名任何群友，不提任何人的个人情况、习惯、经历
 - 别推销：不许写「我可以帮」「给大家带来」「推荐给大家」「安利」「感兴趣的话」「点进去看看」
 - 别写「据报道」「以下是」「今日资讯」「新闻速报」这种播报腔
-- 最多一个链接（也可以不带，自然就行）；别超过 120 字
+- 最多一个链接（也可以不带，自然就行）；平时 15～50 字，最多别超过 75 字（链接不算）
 
 只回开场白本身，不要别的解释。"""
+
+    def _opener_skill_section(self) -> str:
+        """开场白写法（skill topic-opener）：接了 Skills 就读活的那份（停用 / 删了返回 ""）；
+        没接（测试桩 / 老调用方）用自带默认写法。"""
+        from . import skills as _skills_mod
+        from .skills_web import TOPIC_OPENER_DEFAULT_BODY, TOPIC_OPENER_SKILL
+
+        if self._skills is not None:
+            return _skills_mod.guidance(self._skills, TOPIC_OPENER_SKILL, max_chars=2500)
+        return f"【做法参考（skill {TOPIC_OPENER_SKILL}，照这个口径写）】\n{TOPIC_OPENER_DEFAULT_BODY.strip()}"
 
     def _scrub_group_text(self, gid: str, text: str) -> Optional[str]:
         """G7 隐私闸：开场白要发进群，不能含关注成员的名字 / 注记。"""
@@ -1417,31 +1485,16 @@ class Topics:
 
     @staticmethod
     def _clean_opener(text: str) -> Optional[str]:
-        """去除首尾引号、限 120 字、链接最多保留 1 个、播报腔作废。"""
-        s = str(text or "").strip().strip('"').strip("'").strip("“”").strip("‘’").strip()
+        """去除首尾引号、链接最多保留 1 个、播报腔作废；超长（正文 > 75 字）整句作废，绝不截半截。"""
+        s = _strip_opener_quotes(text)
         if not s:
             return None
         for w in _BROADCAST_WORDS:
             if w in s:
                 return None
-        # 链接最多 1 个
-        import re
-        url_pat = re.compile(r"https?://\S+")
-        urls = url_pat.findall(s)
-        if len(urls) > 1:
-            # 保留第一个，其余去掉
-            first = urls[0]
-            # 把除了第一个外的 URL 换成空
-            count = 0
-
-            def _replace(m):
-                nonlocal count
-                count += 1
-                return m.group(0) if count == 1 else ""
-
-            s = url_pat.sub(_replace, s)
-        if len(s) > _OPENER_MAX_CHARS:
-            s = s[:_OPENER_MAX_CHARS]
+        s = _keep_first_url(s)
+        if _opener_prose_len(s) > _OPENER_MAX_CHARS or len(s) > 300:
+            return None
         return s
 
 

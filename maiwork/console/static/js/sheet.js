@@ -17,7 +17,7 @@ import { syncHash } from "./router.js";
 import { appearanceSheet } from "./theme.js";
 import { socialCookieSheet } from "./settings/social.js";
 import { sfx } from "./sound.js";
-import { boardItemSheet } from "./board.js";
+import { boardItemSheet, boardNotesSheet } from "./board.js";
 import { previewSheet } from "./preview.js";
 
 function loginSheet() {
@@ -135,6 +135,7 @@ function sheetHTML(kind) {
   if (kind === "edit") return editSheet();
   if (kind === "handoff") return handoffSheet();
   if (kind === "board-item") return boardItemSheet();
+  if (kind === "board-notes") return boardNotesSheet();
   if (kind === "preview") return previewSheet();
   return detailHTML();
 }
@@ -401,6 +402,8 @@ export function closeSheet(opts = {}) {
   if (state.sheet === "board-item") {
     state.boardItem = null;
     state.boardOpen = {};
+    state.boardStepFilter = "all"; // 步骤 / 轮次筛选只跟着这张抽屉走
+    state.boardRound = "";
     if (state.page === "board") renderView();
   }
   if (state.sheet === "settings-form") {

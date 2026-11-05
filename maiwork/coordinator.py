@@ -74,7 +74,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
-from . import clock, compaction, deliverable_check, members, requirements
+from . import clock, compaction, deliverable_check, members, requirements, run_ref
 from .environments import vm_platforms
 from .goals import chat_evidence_match as _chat_evidence_match
 from .goals import criterion_backed as _criterion_backed
@@ -7576,6 +7576,18 @@ class Coordinator:
             logger.info("目标专岗（goal）已停用或未就位，本次检查跳过（群 %s 目标 %s）", gid, goal_id)
             return
 
+        # 前置检查全过了 → 真跑一轮：round ref（goal:<goal_id>:<ms>:<seq>）挂上板，
+        # 轮里的主模型调用 / 工具调用都精确串到这一轮，看板 goal 栏显示「正在跑」。
+        ref = run_ref.new(f"goal:{str(goal_id)[:40]}", gid)
+        async with run_ref.tagged(
+            ref, lane="goal", group_id=gid,
+            title=f"正在检查目标：{str(goal.get('title') or '')[:60]}",
+            task_id=f"goal-check:{str(goal_id)[:40]}",
+        ):
+            await self._check_goal_round(goal_id, goal, gid)
+
+    async def _check_goal_round(self, goal_id: str, goal: dict, gid: str) -> None:
+        """check_goal 的主体（前置检查已过，round ref 已挂上）。"""
         # 下级任务状态
         rows = self._store.read().execute(
             "SELECT id, title, status, review FROM tasks WHERE goal_id=? ORDER BY created DESC LIMIT 5",

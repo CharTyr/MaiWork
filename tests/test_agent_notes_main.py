@@ -63,7 +63,10 @@ def test_main_sites_ask_for_notes():
     assert '_group_context_safe(gid, "news", include_notes=True)' in src_focus
     src_idea = inspect.getsource(feeds_mod.Feeds._make_idea_round)
     assert '_group_context_safe(gid, "idea", include_notes=True)' in src_idea
-    src_goal = inspect.getsource(coord_mod.Coordinator.check_goal)
+    src_goal = (
+        inspect.getsource(coord_mod.Coordinator.check_goal)
+        + inspect.getsource(coord_mod.Coordinator._check_goal_round)
+    )
     assert "include_notes=True" in src_goal
     # 回包里可附便条（不另起调用）
     assert "notes_for_others" in src_idea and "notes_for_others" in src_goal

@@ -14,7 +14,8 @@ import { loadModels } from "./settings/models.js";
 import { loadAppearance } from "./settings/appearance.js";
 import { loadSocial } from "./settings/social.js";
 import { closeSheet, repaintSheet } from "./sheet.js";
-import { chatPoll, enterChat, loadChat, paintChat } from "./chat.js";
+import { enterChat } from "./chat.js";
+import { submitChatForm } from "./chat_slash.js";
 import { render, renderRail, renderSide, renderView } from "./render.js";
 import { applyHash, loadGroups, loadSettings, loadView, parseHash, reboot, syncHash } from "./router.js";
 import { act } from "./actions.js";
@@ -150,24 +151,7 @@ document.addEventListener("submit", async (e) => {
     return;
   }
   if (f.id === "chat-form") {
-    const input = $("chat-input");
-    const text = input.value.trim();
-    if (!text || !state.chat) return;
-    if (state.chat.running) return toast("上一条消息仍在处理中", true);
-    btn.disabled = true;
-    try {
-      await api("POST", `/api/chat/${encodeURIComponent(state.chat.id)}/messages`, { text });
-      input.value = "";
-      input.style.height = "";
-      state.chat.running = true;
-      await loadChat(state.chat.id, true);
-      state.chat.running = true;
-      paintChat("smooth");
-      chatPoll();
-    } catch (ex) {
-      btn.disabled = false;
-      toast(ex.message, true);
-    }
+    await submitChatForm(f);
     return;
   }
   if (f.id === "rules-form") {

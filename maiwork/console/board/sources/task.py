@@ -50,6 +50,8 @@ def _row_to_item(r: Any, now: float) -> dict[str, Any]:
         "ok": (True if status == "done" else (False if status in _DONE else None)),
         "stuck": bool(status in _RUNNING and not held and now - updated > 600),
         "task_id": str(r["id"]),
+        # 失败 / 取消的原因放 review（worker 报的验收 / 失败说明）
+        "error": (str(r["review"] or "") if status in ("failed", "cancelled") else ""),
         "_finished_ts": _f(r["finished_ts"]),   # 原始 finished_ts（trace 窗口用；回落值会封死窗口）
     }
     item["trace"] = _trace_of(item, now)
@@ -67,7 +69,7 @@ def active(ctx: Ctx) -> list[dict[str, Any]]:
     marks = ",".join("?" * len(_RUNNING))
     out: list[dict[str, Any]] = []
     for r in ctx.fetch(
-        "SELECT id, group_id, title, status, paused_reason, created, updated, started_ts, finished_ts"
+        "SELECT id, group_id, title, status, paused_reason, review, created, updated, started_ts, finished_ts"
         f" FROM tasks WHERE status IN ({marks}) ORDER BY updated DESC",
         _RUNNING,
     ):
@@ -80,7 +82,7 @@ def active(ctx: Ctx) -> list[dict[str, Any]]:
 def finished(ctx: Ctx, since: float) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for r in ctx.fetch(
-        "SELECT id, group_id, title, status, paused_reason, created, updated, started_ts, finished_ts"
+        "SELECT id, group_id, title, status, paused_reason, review, created, updated, started_ts, finished_ts"
         " FROM tasks WHERE status IN ('done','failed','cancelled')"
         " AND COALESCE(finished_ts, updated) >= ?"
         " ORDER BY COALESCE(finished_ts, updated) DESC LIMIT 4000",
@@ -94,7 +96,7 @@ def finished(ctx: Ctx, since: float) -> list[dict[str, Any]]:
 
 def get(ctx: Ctx, item_id: Any) -> dict[str, Any] | None:
     r = ctx.fetch_one(
-        "SELECT id, group_id, title, status, paused_reason, created, updated, started_ts, finished_ts"
+        "SELECT id, group_id, title, status, paused_reason, review, created, updated, started_ts, finished_ts"
         " FROM tasks WHERE id=?",
         (str(item_id or ""),),
     )

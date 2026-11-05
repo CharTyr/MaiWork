@@ -53,6 +53,7 @@ const LEGACY_SET_ROUTES = {
   agents: ["models", "agents"],
   jev: ["models", "jev"],
   extensions: ["extensions", ""],
+  skills: ["extensions", "skills"],
   mcp: ["extensions", "mcp"],
   optdeps: ["extensions", "optdeps"],
   social: ["extensions", "search"],

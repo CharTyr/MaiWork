@@ -234,7 +234,7 @@ class TestFullMigrate:
         # 44 = 工作会话、事件与任务轮次；前 43 步不改动。
         assert store_mod._MIGRATIONS[41].__name__ == "_m_goal_stale_notify"
         assert store_mod._MIGRATIONS[42].__name__ == "_m_skills"
-        assert LATEST == 49, "第 45 步补索引、第 46 步主模型条目、第 47 步 round ref、第 48 步便条板、第 49 步 mentions 定向，历史迁移位置保持不变"
+        assert LATEST == 50, "第 45 步补索引、第 46 步主模型条目、第 47 步 round ref、第 48 步便条板、第 49 步 mentions 定向、第 50 步看板精修（main_runs lane / 交接单 run_ref），历史迁移位置保持不变"
         assert store_mod._MIGRATIONS[46].__name__ == "_m_round_ref_marks"
         assert store_mod._MIGRATIONS[40].__name__ == "_m_pending_ask_state"
         assert store_mod._MIGRATIONS[34].__name__ == "_m_task_lanes"
@@ -596,7 +596,7 @@ class TestOnline45Upgrade:
         news_batches/ideas/topic_log/judgments 的 run_ref 列。"""
         s = self._online_45(tmp_path / "online45.db")
         try:
-            assert s.migrate() == 49
+            assert s.migrate() == 50
             assert "main_runs" in _tables(s)
             for table in ("model_calls", "tool_calls", "news_batches", "ideas",
                           "topic_log", "judgments"):
@@ -604,7 +604,7 @@ class TestOnline45Upgrade:
                 assert "run_ref" in cols, table
             assert "idx_model_calls_run_ref" in _index_names(s, "model_calls")
             assert "idx_tool_calls_run_ref" in _index_names(s, "tool_calls")
-            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 49
+            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 50
         finally:
             s.close()
 
@@ -613,13 +613,13 @@ class TestOnline45Upgrade:
         s = Store(tmp_path / "v44.db")
         try:
             _run_steps(s, 44)
-            assert s.migrate() == 49
+            assert s.migrate() == 50
             names = _tables(s)
             assert "main_runs" in names and "task_sessions" in names
             assert "idx_events_entity" in _index_names(s, "events")
             cols = {c[0] for c in _columns(s, "model_calls")}
             assert "run_ref" in cols
-            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 49
+            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 50
         finally:
             s.close()
 
@@ -633,19 +633,57 @@ class TestOnline45Upgrade:
             cols_before = {c[0] for c in _columns(s, "mentions")}
             assert "target_user_id" not in cols_before
             assert "keywords" not in cols_before
-            assert s.migrate() == 49
+            assert s.migrate() == 50
             cols = {c[0] for c in _columns(s, "mentions")}
             assert "target_user_id" in cols and "keywords" in cols
-            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 49
+            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 50
         finally:
             s.close()
 
     def test_fresh_db_mentions_has_target_columns(self, tmp_path: Path) -> None:
-        """全新库一路跑到 49：mentions 直接带 target_user_id / keywords。"""
+        """全新库一路跑到最新：mentions 直接带 target_user_id / keywords。"""
         s = Store(tmp_path / "fresh.db")
         try:
-            assert s.migrate() == 49
+            assert s.migrate() == 50
             cols = {c[0] for c in _columns(s, "mentions")}
             assert "target_user_id" in cols and "keywords" in cols
+        finally:
+            s.close()
+
+    def test_step49_upgrades_to_50_board_refinement(self, tmp_path: Path) -> None:
+        """第 50 步（看板精修）：49 存量库升上来后，main_runs 补 lane 列 +
+        idx_main_runs_lane_started 索引（老行默认 'main'）；agent_handoffs
+        若已懒建则补 run_ref + idx_agent_handoffs_run_ref。"""
+        s = Store(tmp_path / "v49.db")
+        try:
+            _run_steps(s, 49)
+            assert "lane" not in {c[0] for c in _columns(s, "main_runs")}
+            s.read().execute(
+                "INSERT INTO main_runs (group_id, purpose, title, status, started,"
+                " finished, ok, error, ref) VALUES ('g1','p','t','done',1,2,1,'','r1')"
+            )
+            # 懒建表 49 时可能已被建过（当时无 run_ref）
+            s.read().executescript("""
+CREATE TABLE IF NOT EXISTS agent_handoffs (
+    id TEXT PRIMARY KEY, group_id TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT '', task_id TEXT NOT NULL DEFAULT '',
+    phase TEXT NOT NULL DEFAULT '', parent_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'queued', brief TEXT NOT NULL DEFAULT '',
+    criteria TEXT NOT NULL DEFAULT '', tools TEXT NOT NULL DEFAULT '',
+    skills TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
+    data TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '[]',
+    review TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '[]',
+    created REAL NOT NULL DEFAULT 0, updated REAL NOT NULL DEFAULT 0
+);
+""")
+            assert s.migrate() == 50
+            assert "lane" in {c[0] for c in _columns(s, "main_runs")}
+            assert "idx_main_runs_lane_started" in _index_names(s, "main_runs")
+            row = s.read().execute("SELECT lane FROM main_runs WHERE ref='r1'").fetchone()
+            assert str(row["lane"]) == "main"
+            assert "run_ref" in {c[0] for c in _columns(s, "agent_handoffs")}
+            assert "idx_agent_handoffs_run_ref" in _index_names(s, "agent_handoffs")
+            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 50
         finally:
             s.close()

@@ -8,7 +8,7 @@
 - skill：<data_dir>/skills/<名>/SKILL.md（极简 front matter 解析，不用 yaml 库）、
   list/read/read_file（越界、符号链接拒绝）、list_skills / read_skill 工具、
   Workers 的 skills_hint（构造函数或 run 参数注入 system 提示，最多 20 条）。
-- 红线：不给 MaiBot 的 planner 注册任何组件（plugin.get_components 没有新增）。
+- 红线：MaiBot 的 planner 只注册群聊接单工具 maiwork_handoff；MCP/skill 不进入宿主组件。
 
 密钥一律假值，HTTP 一律 httpx.MockTransport。
 """
@@ -877,7 +877,7 @@ class TestWorkersSkillsHint:
 
 
 # ----------------------------------------------------------------------
-# 红线：不给 MaiBot 的 planner 注册任何组件
+# 红线：MaiBot 的 planner 只注册群聊接单工具
 # ----------------------------------------------------------------------
 
 
@@ -887,12 +887,19 @@ class TestNoHostComponentRegistration:
 
         comps = create_plugin().get_components()
         text = repr(comps)
-        # 还是只有那两个钩子，没有新增任何组件（MCP/skill 只进 MaiWork 自己的 Tools）
+        # MCP/skill 只进 MaiWork 自己的 Tools；宿主唯一工具是群聊接单入口。
         assert "maiwork_intake" in text
         assert "maiwork_mentions" in text
         assert "list_skills" not in text
         assert "read_skill" not in text
         assert "mcp_" not in text
-        for c in comps:
-            kind = str(c.get("component_type") or c.get("type") or "").lower()
-            assert "tool" not in kind, c
+        tools = [c for c in comps if "tool" in str(c.get("component_type") or c.get("type") or "").lower()]
+        assert len(tools) == 1, tools
+        assert tools[0]["name"] == "maiwork_handoff"
+        assert tools[0]["chat_scope"] == "group"
+        assert tools[0]["metadata"]["visibility"] == "visible"
+        after = next(c for c in comps if c["name"] == "maiwork_planner_after")
+        assert after["metadata"]["hook"] == "maisaka.planner.after_response"
+        assert after["metadata"]["mode"] == "observe"
+        assert after["metadata"]["timeout_ms"] == 1000
+        assert after["metadata"]["error_policy"] == "skip"

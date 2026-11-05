@@ -16,14 +16,22 @@
               "tools": 1
             },
             "elapsed_s": 50,
+            "error_brief": "",
             "finished": 1799999250.0,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": 1,
+            "jump": {
+              "detail_id": "",
+              "detail_type": "",
+              "tab": "group"
+            },
             "last_step": {
               "text": "probe：输出",
               "ts": 1799999230.0
             },
+            "note_count": 0,
             "ok": true,
             "phase": "",
             "source": "main",
@@ -40,11 +48,19 @@
               "tools": 0
             },
             "elapsed_s": 50,
+            "error_brief": "",
             "finished": 1799999150.0,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": 4,
+            "jump": {
+              "detail_id": "",
+              "detail_type": "",
+              "tab": "group"
+            },
             "last_step": null,
+            "note_count": 0,
             "ok": false,
             "phase": "",
             "source": "main",
@@ -61,11 +77,19 @@
               "tools": 0
             },
             "elapsed_s": 0,
+            "error_brief": "",
             "finished": 1799974800.0,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": 3,
+            "jump": {
+              "detail_id": "",
+              "detail_type": "",
+              "tab": "group"
+            },
             "last_step": null,
+            "note_count": 0,
             "ok": false,
             "phase": "",
             "source": "main",
@@ -86,11 +110,19 @@
               "tools": 0
             },
             "elapsed_s": 60,
+            "error_brief": "",
             "finished": null,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": 2,
+            "jump": {
+              "detail_id": "",
+              "detail_type": "",
+              "tab": "group"
+            },
             "last_step": null,
+            "note_count": 0,
             "ok": null,
             "phase": "",
             "source": "main",
@@ -117,14 +149,22 @@
               "tools": 1
             },
             "elapsed_s": 0,
+            "error_brief": "",
             "finished": 1799999850.0,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": 1,
+            "jump": {
+              "detail_id": "",
+              "detail_type": "",
+              "tab": "news"
+            },
             "last_step": {
               "text": "打分",
               "ts": 1799999848.0
             },
+            "note_count": 0,
             "ok": true,
             "phase": "",
             "source": "news_batch",
@@ -141,11 +181,19 @@
               "tools": 0
             },
             "elapsed_s": 0,
+            "error_brief": "",
             "finished": 1799999700.0,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": "h-acc",
+            "jump": {
+              "detail_id": "",
+              "detail_type": "",
+              "tab": "group"
+            },
             "last_step": null,
+            "note_count": 0,
             "ok": true,
             "phase": "verify",
             "source": "handoff",
@@ -162,11 +210,19 @@
               "tools": 0
             },
             "elapsed_s": 0,
+            "error_brief": "",
             "finished": 1799999600.0,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": 2,
+            "jump": {
+              "detail_id": "",
+              "detail_type": "",
+              "tab": "news"
+            },
             "last_step": null,
+            "note_count": 0,
             "ok": true,
             "phase": "",
             "source": "news_batch",
@@ -183,11 +239,19 @@
               "tools": 0
             },
             "elapsed_s": 0,
+            "error_brief": "",
             "finished": 1799999500.0,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": 3,
+            "jump": {
+              "detail_id": "",
+              "detail_type": "",
+              "tab": "news"
+            },
             "last_step": null,
+            "note_count": 0,
             "ok": null,
             "phase": "",
             "source": "news_batch",
@@ -208,14 +272,22 @@
               "tools": 1
             },
             "elapsed_s": 700,
+            "error_brief": "",
             "finished": null,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": "h-run-stuck",
+            "jump": {
+              "detail_id": "",
+              "detail_type": "",
+              "tab": "group"
+            },
             "last_step": {
               "text": "核验中",
               "ts": 1799999360.0
             },
+            "note_count": 0,
             "ok": null,
             "phase": "verify",
             "source": "handoff",
@@ -242,14 +314,22 @@
               "tools": 0
             },
             "elapsed_s": 0,
+            "error_brief": "",
             "finished": 1799999840.0,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": 1,
+            "jump": {
+              "detail_id": "I-1",
+              "detail_type": "idea",
+              "tab": "ideas"
+            },
             "last_step": {
               "text": "出构想",
               "ts": 1799999835.0
             },
+            "note_count": 0,
             "ok": true,
             "phase": "",
             "source": "idea",
@@ -266,11 +346,19 @@
               "tools": 0
             },
             "elapsed_s": 0,
+            "error_brief": "",
             "finished": 1799999830.0,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": 3,
+            "jump": {
+              "detail_id": "",
+              "detail_type": "",
+              "tab": "group"
+            },
             "last_step": null,
+            "note_count": 0,
             "ok": true,
             "phase": "",
             "source": "idea",
@@ -287,11 +375,19 @@
               "tools": 0
             },
             "elapsed_s": 0,
+            "error_brief": "",
             "finished": 1799999550.0,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": 2,
+            "jump": {
+              "detail_id": "I-2",
+              "detail_type": "idea",
+              "tab": "ideas"
+            },
             "last_step": null,
+            "note_count": 0,
             "ok": true,
             "phase": "",
             "source": "idea",
@@ -312,11 +408,19 @@
               "tools": 0
             },
             "elapsed_s": 100,
+            "error_brief": "",
             "finished": null,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": "h-run",
+            "jump": {
+              "detail_id": "",
+              "detail_type": "",
+              "tab": "group"
+            },
             "last_step": null,
+            "note_count": 0,
             "ok": null,
             "phase": "",
             "source": "handoff",
@@ -343,14 +447,22 @@
               "tools": 0
             },
             "elapsed_s": 120,
+            "error_brief": "",
             "finished": null,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": "G-1",
+            "jump": {
+              "detail_id": "G-1",
+              "detail_type": "goal",
+              "tab": "tasks"
+            },
             "last_step": {
               "text": "盯一眼",
               "ts": 1799999900.0
             },
+            "note_count": 0,
             "ok": null,
             "phase": "",
             "source": "goal",
@@ -367,11 +479,19 @@
               "tools": 0
             },
             "elapsed_s": 4870,
+            "error_brief": "",
             "finished": 1799999870.0,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": "G-2",
+            "jump": {
+              "detail_id": "G-2",
+              "detail_type": "goal",
+              "tab": "tasks"
+            },
             "last_step": null,
+            "note_count": 0,
             "ok": true,
             "phase": "",
             "source": "goal",
@@ -388,11 +508,19 @@
               "tools": 0
             },
             "elapsed_s": 3860,
+            "error_brief": "",
             "finished": 1799999860.0,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": "G-3",
+            "jump": {
+              "detail_id": "G-3",
+              "detail_type": "goal",
+              "tab": "tasks"
+            },
             "last_step": null,
+            "note_count": 0,
             "ok": false,
             "phase": "",
             "source": "goal",
@@ -409,11 +537,19 @@
               "tools": 0
             },
             "elapsed_s": 0,
+            "error_brief": "",
             "finished": 1799999500.0,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": "h-fail",
+            "jump": {
+              "detail_id": "",
+              "detail_type": "",
+              "tab": "group"
+            },
             "last_step": null,
+            "note_count": 0,
             "ok": false,
             "phase": "",
             "source": "handoff",
@@ -443,14 +579,22 @@
               "tools": 0
             },
             "elapsed_s": 190,
+            "error_brief": "",
             "finished": 1799999800.0,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": "T-done",
+            "jump": {
+              "detail_id": "T-done",
+              "detail_type": "task",
+              "tab": "tasks"
+            },
             "last_step": {
               "text": "做完了",
               "ts": 1799999650.0
             },
+            "note_count": 0,
             "ok": true,
             "phase": "",
             "source": "task",
@@ -471,14 +615,22 @@
               "tools": 1
             },
             "elapsed_s": 900,
+            "error_brief": "",
             "finished": null,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": "T-run",
+            "jump": {
+              "detail_id": "T-run",
+              "detail_type": "task",
+              "tab": "tasks"
+            },
             "last_step": {
               "text": "web_search：输出",
               "ts": 1799999200.0
             },
+            "note_count": 0,
             "ok": null,
             "phase": "",
             "source": "task",
@@ -495,11 +647,19 @@
               "tools": 0
             },
             "elapsed_s": 3600,
+            "error_brief": "",
             "finished": null,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": "T-wait",
+            "jump": {
+              "detail_id": "T-wait",
+              "detail_type": "task",
+              "tab": "tasks"
+            },
             "last_step": null,
+            "note_count": 0,
             "ok": null,
             "phase": "",
             "source": "task",
@@ -516,11 +676,19 @@
               "tools": 0
             },
             "elapsed_s": 7200,
+            "error_brief": "",
             "finished": null,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": "T-off",
+            "jump": {
+              "detail_id": "T-off",
+              "detail_type": "task",
+              "tab": "tasks"
+            },
             "last_step": null,
+            "note_count": 0,
             "ok": null,
             "phase": "",
             "source": "task",
@@ -547,14 +715,22 @@
               "tools": 0
             },
             "elapsed_s": 0,
+            "error_brief": "",
             "finished": 1799999820.0,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": 1,
+            "jump": {
+              "detail_id": "",
+              "detail_type": "",
+              "tab": "group"
+            },
             "last_step": {
               "text": "开场白草稿",
               "ts": 1799999821.0
             },
+            "note_count": 0,
             "ok": true,
             "phase": "",
             "source": "topic",
@@ -571,11 +747,19 @@
               "tools": 0
             },
             "elapsed_s": 0,
+            "error_brief": "没有合适候选",
             "finished": 1799999540.0,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": 2,
+            "jump": {
+              "detail_id": "",
+              "detail_type": "",
+              "tab": "group"
+            },
             "last_step": null,
+            "note_count": 0,
             "ok": false,
             "phase": "",
             "source": "topic",
@@ -605,11 +789,19 @@
               "tools": 0
             },
             "elapsed_s": 0,
+            "error_brief": "",
             "finished": 1799999600.0,
             "group_id": "900000001",
             "group_name": "黄金群一",
+            "handoff_count": 0,
             "id": "h-rej",
+            "jump": {
+              "detail_id": "",
+              "detail_type": "",
+              "tab": "group"
+            },
             "last_step": null,
+            "note_count": 0,
             "ok": false,
             "phase": "",
             "source": "handoff",
@@ -626,6 +818,7 @@
         "running": []
       }
     ],
+    "notes": [],
     "now": 1800000000.0,
     "stuck_after_s": 600
   },
@@ -637,14 +830,23 @@
           "tools": 0
         },
         "elapsed_s": 120,
+        "error": "",
+        "error_brief": "",
         "finished": null,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": "G-1",
+        "jump": {
+          "detail_id": "G-1",
+          "detail_type": "goal",
+          "tab": "tasks"
+        },
         "last_step": {
           "text": "盯一眼",
           "ts": 1799999900.0
         },
+        "note_count": 0,
         "ok": null,
         "phase": "",
         "source": "goal",
@@ -656,6 +858,8 @@
         "updated": 1799999880.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -667,10 +871,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：进行中",
           "tool": "",
           "ts": 1799999880.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "goal",
@@ -682,12 +888,16 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "盯一眼",
           "tool": "",
           "ts": 1799999900.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:8"
         }
-      ]
+      ],
+      "total_steps": 2,
+      "truncated": false
     },
     "goal/G-2": {
       "item": {
@@ -696,11 +906,20 @@
           "tools": 0
         },
         "elapsed_s": 4870,
+        "error": "",
+        "error_brief": "",
         "finished": 1799999870.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": "G-2",
+        "jump": {
+          "detail_id": "G-2",
+          "detail_type": "goal",
+          "tab": "tasks"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": true,
         "phase": "",
         "source": "goal",
@@ -712,6 +931,8 @@
         "updated": 1799999870.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -723,10 +944,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：完成了",
           "tool": "",
           "ts": 1799995000.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "",
@@ -738,12 +961,16 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：完成了",
           "tool": "",
           "ts": 1799999870.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:done"
         }
-      ]
+      ],
+      "total_steps": 2,
+      "truncated": false
     },
     "goal/G-3": {
       "item": {
@@ -752,11 +979,20 @@
           "tools": 0
         },
         "elapsed_s": 3860,
+        "error": "",
+        "error_brief": "",
         "finished": 1799999860.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": "G-3",
+        "jump": {
+          "detail_id": "G-3",
+          "detail_type": "goal",
+          "tab": "tasks"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": false,
         "phase": "",
         "source": "goal",
@@ -768,6 +1004,8 @@
         "updated": 1799999860.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -779,10 +1017,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：已取消",
           "tool": "",
           "ts": 1799996000.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "",
@@ -794,12 +1034,16 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：已取消",
           "tool": "",
           "ts": 1799999860.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:cancelled"
         }
-      ]
+      ],
+      "total_steps": 2,
+      "truncated": false
     },
     "goal/G-4": {
       "item": {
@@ -808,11 +1052,20 @@
           "tools": 0
         },
         "elapsed_s": 3600,
+        "error": "",
+        "error_brief": "",
         "finished": 1799859600.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": "G-4",
+        "jump": {
+          "detail_id": "G-4",
+          "detail_type": "goal",
+          "tab": "tasks"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": true,
         "phase": "",
         "source": "goal",
@@ -824,6 +1077,8 @@
         "updated": 1799859600.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -835,10 +1090,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：完成了",
           "tool": "",
           "ts": 1799856000.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "",
@@ -850,12 +1107,16 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：完成了",
           "tool": "",
           "ts": 1799859600.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:done"
         }
-      ]
+      ],
+      "total_steps": 2,
+      "truncated": false
     },
     "handoff/h-acc": {
       "item": {
@@ -864,11 +1125,20 @@
           "tools": 0
         },
         "elapsed_s": 0,
+        "error": "",
+        "error_brief": "",
         "finished": 1799999700.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": "h-acc",
+        "jump": {
+          "detail_id": "",
+          "detail_type": "",
+          "tab": "group"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": true,
         "phase": "verify",
         "source": "handoff",
@@ -880,6 +1150,8 @@
         "updated": 1799999700.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -891,10 +1163,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：已通过",
           "tool": "",
           "ts": 1799999700.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "",
@@ -906,13 +1180,16 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：已通过",
           "tool": "",
           "ts": 1799999700.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:accepted"
         }
       ],
-      "notes": []
+      "total_steps": 2,
+      "truncated": false
     },
     "handoff/h-fail": {
       "item": {
@@ -921,11 +1198,20 @@
           "tools": 0
         },
         "elapsed_s": 0,
+        "error": "",
+        "error_brief": "",
         "finished": 1799999500.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": "h-fail",
+        "jump": {
+          "detail_id": "",
+          "detail_type": "",
+          "tab": "group"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": false,
         "phase": "",
         "source": "handoff",
@@ -937,6 +1223,8 @@
         "updated": 1799999500.0
       },
       "link": "time_window",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -948,10 +1236,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：没做成",
           "tool": "",
           "ts": 1799999500.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "",
@@ -963,10 +1253,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：没做成",
           "tool": "",
           "ts": 1799999500.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:failed"
         },
         {
           "actor": "news",
@@ -978,10 +1270,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "老轮打分",
           "tool": "",
           "ts": 1799999590.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:4"
         },
         {
           "actor": "task",
@@ -993,10 +1287,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "做完了",
           "tool": "",
           "ts": 1799999650.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:2"
         },
         {
           "actor": "main",
@@ -1008,10 +1304,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开场白草稿",
           "tool": "",
           "ts": 1799999821.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:6"
         },
         {
           "actor": "news",
@@ -1023,10 +1321,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "出构想",
           "tool": "",
           "ts": 1799999835.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:5"
         },
         {
           "actor": "子 agent",
@@ -1038,10 +1338,12 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "web_search",
           "ts": 1799999845.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:3"
         },
         {
           "actor": "news",
@@ -1053,10 +1355,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "打分",
           "tool": "",
           "ts": 1799999848.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:3"
         },
         {
           "actor": "goal",
@@ -1068,13 +1372,16 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "盯一眼",
           "tool": "",
           "ts": 1799999900.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:8"
         }
       ],
-      "notes": []
+      "total_steps": 9,
+      "truncated": false
     },
     "handoff/h-queued": {
       "item": {
@@ -1083,11 +1390,20 @@
           "tools": 0
         },
         "elapsed_s": 50,
+        "error": "",
+        "error_brief": "",
         "finished": null,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": "h-queued",
+        "jump": {
+          "detail_id": "",
+          "detail_type": "",
+          "tab": "group"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": null,
         "phase": "",
         "source": "handoff",
@@ -1099,6 +1415,8 @@
         "updated": 1799999950.0
       },
       "link": "time_window",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -1110,13 +1428,16 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：排队中",
           "tool": "",
           "ts": 1799999950.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         }
       ],
-      "notes": []
+      "total_steps": 1,
+      "truncated": false
     },
     "handoff/h-rej": {
       "item": {
@@ -1125,11 +1446,20 @@
           "tools": 0
         },
         "elapsed_s": 0,
+        "error": "",
+        "error_brief": "",
         "finished": 1799999600.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": "h-rej",
+        "jump": {
+          "detail_id": "",
+          "detail_type": "",
+          "tab": "group"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": false,
         "phase": "",
         "source": "handoff",
@@ -1141,6 +1471,8 @@
         "updated": 1799999600.0
       },
       "link": "time_window",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -1152,10 +1484,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：已打回",
           "tool": "",
           "ts": 1799999600.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "",
@@ -1167,10 +1501,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：已打回",
           "tool": "",
           "ts": 1799999600.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:rejected"
         },
         {
           "actor": "task",
@@ -1182,10 +1518,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "做完了",
           "tool": "",
           "ts": 1799999650.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:2"
         },
         {
           "actor": "main",
@@ -1197,10 +1535,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开场白草稿",
           "tool": "",
           "ts": 1799999821.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:6"
         },
         {
           "actor": "news",
@@ -1212,10 +1552,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "出构想",
           "tool": "",
           "ts": 1799999835.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:5"
         },
         {
           "actor": "子 agent",
@@ -1227,10 +1569,12 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "web_search",
           "ts": 1799999845.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:3"
         },
         {
           "actor": "news",
@@ -1242,10 +1586,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "打分",
           "tool": "",
           "ts": 1799999848.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:3"
         },
         {
           "actor": "goal",
@@ -1257,13 +1603,16 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "盯一眼",
           "tool": "",
           "ts": 1799999900.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:8"
         }
       ],
-      "notes": []
+      "total_steps": 8,
+      "truncated": false
     },
     "handoff/h-run": {
       "item": {
@@ -1272,11 +1621,20 @@
           "tools": 0
         },
         "elapsed_s": 100,
+        "error": "",
+        "error_brief": "",
         "finished": null,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": "h-run",
+        "jump": {
+          "detail_id": "",
+          "detail_type": "",
+          "tab": "group"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": null,
         "phase": "",
         "source": "handoff",
@@ -1288,6 +1646,8 @@
         "updated": 1799999900.0
       },
       "link": "time_window",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -1299,10 +1659,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：正在跑",
           "tool": "",
           "ts": 1799999900.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "goal",
@@ -1314,13 +1676,16 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "盯一眼",
           "tool": "",
           "ts": 1799999900.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:8"
         }
       ],
-      "notes": []
+      "total_steps": 2,
+      "truncated": false
     },
     "handoff/h-run-stuck": {
       "item": {
@@ -1329,14 +1694,23 @@
           "tools": 1
         },
         "elapsed_s": 700,
+        "error": "",
+        "error_brief": "",
         "finished": null,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": "h-run-stuck",
+        "jump": {
+          "detail_id": "",
+          "detail_type": "",
+          "tab": "group"
+        },
         "last_step": {
           "text": "核验中",
           "ts": 1799999360.0
         },
+        "note_count": 0,
         "ok": null,
         "phase": "verify",
         "source": "handoff",
@@ -1348,6 +1722,8 @@
         "updated": 1799999300.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -1359,10 +1735,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：正在跑",
           "tool": "",
           "ts": 1799999300.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "子 agent",
@@ -1374,10 +1752,12 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "web_search",
           "ts": 1799999350.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:1"
         },
         {
           "actor": "news",
@@ -1389,13 +1769,16 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "核验中",
           "tool": "",
           "ts": 1799999360.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:1"
         }
       ],
-      "notes": []
+      "total_steps": 3,
+      "truncated": false
     },
     "idea/1": {
       "item": {
@@ -1404,14 +1787,23 @@
           "tools": 0
         },
         "elapsed_s": 0,
+        "error": "",
+        "error_brief": "",
         "finished": 1799999840.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": 1,
+        "jump": {
+          "detail_id": "I-1",
+          "detail_type": "idea",
+          "tab": "ideas"
+        },
         "last_step": {
           "text": "出构想",
           "ts": 1799999835.0
         },
+        "note_count": 0,
         "ok": true,
         "phase": "",
         "source": "idea",
@@ -1423,6 +1815,8 @@
         "updated": 1799999840.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "news",
@@ -1434,10 +1828,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "出构想",
           "tool": "",
           "ts": 1799999835.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:5"
         },
         {
           "actor": "",
@@ -1449,10 +1845,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：有了新构想",
           "tool": "",
           "ts": 1799999840.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "",
@@ -1464,12 +1862,16 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：有了新构想",
           "tool": "",
           "ts": 1799999840.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:new"
         }
-      ]
+      ],
+      "total_steps": 3,
+      "truncated": false
     },
     "idea/2": {
       "item": {
@@ -1478,11 +1880,20 @@
           "tools": 0
         },
         "elapsed_s": 0,
+        "error": "",
+        "error_brief": "",
         "finished": 1799999550.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": 2,
+        "jump": {
+          "detail_id": "I-2",
+          "detail_type": "idea",
+          "tab": "ideas"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": true,
         "phase": "",
         "source": "idea",
@@ -1494,6 +1905,8 @@
         "updated": 1799999550.0
       },
       "link": "time_window",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "子 agent",
@@ -1505,10 +1918,12 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "web_search",
           "ts": 1799999200.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:2"
         },
         {
           "actor": "main",
@@ -1520,10 +1935,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "管理员回复",
           "tool": "",
           "ts": 1799999220.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:7"
         },
         {
           "actor": "子 agent",
@@ -1535,10 +1952,12 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "probe",
           "ts": 1799999230.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:4"
         },
         {
           "actor": "子 agent",
@@ -1550,10 +1969,12 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "web_search",
           "ts": 1799999350.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:1"
         },
         {
           "actor": "news",
@@ -1565,10 +1986,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "核验中",
           "tool": "",
           "ts": 1799999360.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:1"
         },
         {
           "actor": "",
@@ -1580,10 +2003,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：有了新构想",
           "tool": "",
           "ts": 1799999550.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "",
@@ -1595,10 +2020,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：有了新构想",
           "tool": "",
           "ts": 1799999550.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:new"
         },
         {
           "actor": "news",
@@ -1610,10 +2037,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "老轮打分",
           "tool": "",
           "ts": 1799999590.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:4"
         },
         {
           "actor": "task",
@@ -1625,10 +2054,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "做完了",
           "tool": "",
           "ts": 1799999650.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:2"
         },
         {
           "actor": "main",
@@ -1640,10 +2071,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开场白草稿",
           "tool": "",
           "ts": 1799999821.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:6"
         },
         {
           "actor": "news",
@@ -1655,10 +2088,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "出构想",
           "tool": "",
           "ts": 1799999835.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:5"
         },
         {
           "actor": "子 agent",
@@ -1670,10 +2105,12 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "web_search",
           "ts": 1799999845.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:3"
         },
         {
           "actor": "news",
@@ -1685,10 +2122,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "打分",
           "tool": "",
           "ts": 1799999848.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:3"
         },
         {
           "actor": "goal",
@@ -1700,12 +2139,16 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "盯一眼",
           "tool": "",
           "ts": 1799999900.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:8"
         }
-      ]
+      ],
+      "total_steps": 14,
+      "truncated": false
     },
     "idea/3": {
       "item": {
@@ -1714,11 +2157,20 @@
           "tools": 0
         },
         "elapsed_s": 0,
+        "error": "",
+        "error_brief": "",
         "finished": 1799999830.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": 3,
+        "jump": {
+          "detail_id": "",
+          "detail_type": "",
+          "tab": "group"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": true,
         "phase": "",
         "source": "idea",
@@ -1730,6 +2182,8 @@
         "updated": 1799999830.0
       },
       "link": "time_window",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "子 agent",
@@ -1741,10 +2195,12 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "probe",
           "ts": 1799999230.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:4"
         },
         {
           "actor": "子 agent",
@@ -1756,10 +2212,12 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "web_search",
           "ts": 1799999350.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:1"
         },
         {
           "actor": "news",
@@ -1771,10 +2229,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "核验中",
           "tool": "",
           "ts": 1799999360.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:1"
         },
         {
           "actor": "news",
@@ -1786,10 +2246,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "老轮打分",
           "tool": "",
           "ts": 1799999590.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:4"
         },
         {
           "actor": "task",
@@ -1801,10 +2263,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "做完了",
           "tool": "",
           "ts": 1799999650.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:2"
         },
         {
           "actor": "main",
@@ -1816,10 +2280,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开场白草稿",
           "tool": "",
           "ts": 1799999821.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:6"
         },
         {
           "actor": "",
@@ -1831,10 +2297,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：有了新构想",
           "tool": "",
           "ts": 1799999830.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "",
@@ -1846,10 +2314,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：有了新构想",
           "tool": "",
           "ts": 1799999830.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:new"
         },
         {
           "actor": "news",
@@ -1861,10 +2331,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "出构想",
           "tool": "",
           "ts": 1799999835.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:5"
         },
         {
           "actor": "子 agent",
@@ -1876,10 +2348,12 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "web_search",
           "ts": 1799999845.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:3"
         },
         {
           "actor": "news",
@@ -1891,10 +2365,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "打分",
           "tool": "",
           "ts": 1799999848.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:3"
         },
         {
           "actor": "goal",
@@ -1906,12 +2382,16 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "盯一眼",
           "tool": "",
           "ts": 1799999900.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:8"
         }
-      ]
+      ],
+      "total_steps": 12,
+      "truncated": false
     },
     "main/1": {
       "item": {
@@ -1921,14 +2401,22 @@
         },
         "elapsed_s": 50,
         "error": "",
+        "error_brief": "",
         "finished": 1799999250.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": 1,
+        "jump": {
+          "detail_id": "",
+          "detail_type": "",
+          "tab": "group"
+        },
         "last_step": {
           "text": "probe：输出",
           "ts": 1799999230.0
         },
+        "note_count": 0,
         "ok": true,
         "phase": "",
         "source": "main",
@@ -1940,6 +2428,8 @@
         "updated": 1799999250.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -1951,10 +2441,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：完成了",
           "tool": "",
           "ts": 1799999200.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "main",
@@ -1966,10 +2458,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "管理员回复",
           "tool": "",
           "ts": 1799999220.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:7"
         },
         {
           "actor": "子 agent",
@@ -1981,10 +2475,12 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "probe",
           "ts": 1799999230.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:4"
         },
         {
           "actor": "",
@@ -1996,12 +2492,16 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：完成了",
           "tool": "",
           "ts": 1799999250.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:done"
         }
-      ]
+      ],
+      "total_steps": 4,
+      "truncated": false
     },
     "main/2": {
       "item": {
@@ -2011,11 +2511,19 @@
         },
         "elapsed_s": 60,
         "error": "",
+        "error_brief": "",
         "finished": null,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": 2,
+        "jump": {
+          "detail_id": "",
+          "detail_type": "",
+          "tab": "group"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": null,
         "phase": "",
         "source": "main",
@@ -2027,6 +2535,8 @@
         "updated": 1799999940.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -2038,12 +2548,16 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：正在判断",
           "tool": "",
           "ts": 1799999940.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         }
-      ]
+      ],
+      "total_steps": 1,
+      "truncated": false
     },
     "main/3": {
       "item": {
@@ -2053,11 +2567,19 @@
         },
         "elapsed_s": 0,
         "error": "",
+        "error_brief": "",
         "finished": 1799974800.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": 3,
+        "jump": {
+          "detail_id": "",
+          "detail_type": "",
+          "tab": "group"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": false,
         "phase": "",
         "source": "main",
@@ -2069,6 +2591,8 @@
         "updated": 1799974800.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -2080,10 +2604,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：中断 / 取消了",
           "tool": "",
           "ts": 1799974800.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "",
@@ -2095,12 +2621,16 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：中断 / 取消了",
           "tool": "",
           "ts": 1799974800.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:cancelled"
         }
-      ]
+      ],
+      "total_steps": 2,
+      "truncated": false
     },
     "main/4": {
       "item": {
@@ -2110,11 +2640,19 @@
         },
         "elapsed_s": 50,
         "error": "",
+        "error_brief": "",
         "finished": 1799999150.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": 4,
+        "jump": {
+          "detail_id": "",
+          "detail_type": "",
+          "tab": "group"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": false,
         "phase": "",
         "source": "main",
@@ -2126,6 +2664,8 @@
         "updated": 1799999150.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -2137,10 +2677,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：没做成",
           "tool": "",
           "ts": 1799999100.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "",
@@ -2152,12 +2694,16 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：没做成",
           "tool": "",
           "ts": 1799999150.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:failed"
         }
-      ]
+      ],
+      "total_steps": 2,
+      "truncated": false
     },
     "news_batch/1": {
       "item": {
@@ -2166,14 +2712,23 @@
           "tools": 1
         },
         "elapsed_s": 0,
+        "error": "",
+        "error_brief": "",
         "finished": 1799999850.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": 1,
+        "jump": {
+          "detail_id": "",
+          "detail_type": "",
+          "tab": "news"
+        },
         "last_step": {
           "text": "打分",
           "ts": 1799999848.0
         },
+        "note_count": 0,
         "ok": true,
         "phase": "",
         "source": "news_batch",
@@ -2185,6 +2740,8 @@
         "updated": 1799999850.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "子 agent",
@@ -2196,10 +2753,12 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "web_search",
           "ts": 1799999845.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:3"
         },
         {
           "actor": "news",
@@ -2211,10 +2770,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "打分",
           "tool": "",
           "ts": 1799999848.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:3"
         },
         {
           "actor": "",
@@ -2226,10 +2787,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：找完了",
           "tool": "",
           "ts": 1799999850.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "",
@@ -2241,12 +2804,16 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：找完了",
           "tool": "",
           "ts": 1799999850.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:done"
         }
-      ]
+      ],
+      "total_steps": 4,
+      "truncated": false
     },
     "news_batch/2": {
       "item": {
@@ -2255,11 +2822,20 @@
           "tools": 0
         },
         "elapsed_s": 0,
+        "error": "",
+        "error_brief": "",
         "finished": 1799999600.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": 2,
+        "jump": {
+          "detail_id": "",
+          "detail_type": "",
+          "tab": "news"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": true,
         "phase": "",
         "source": "news_batch",
@@ -2271,6 +2847,8 @@
         "updated": 1799999600.0
       },
       "link": "time_window",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "子 agent",
@@ -2282,10 +2860,12 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "web_search",
           "ts": 1799999200.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:2"
         },
         {
           "actor": "main",
@@ -2297,10 +2877,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "管理员回复",
           "tool": "",
           "ts": 1799999220.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:7"
         },
         {
           "actor": "子 agent",
@@ -2312,10 +2894,12 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "probe",
           "ts": 1799999230.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:4"
         },
         {
           "actor": "子 agent",
@@ -2327,10 +2911,12 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "web_search",
           "ts": 1799999350.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:1"
         },
         {
           "actor": "news",
@@ -2342,10 +2928,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "核验中",
           "tool": "",
           "ts": 1799999360.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:1"
         },
         {
           "actor": "news",
@@ -2357,10 +2945,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "老轮打分",
           "tool": "",
           "ts": 1799999590.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:4"
         },
         {
           "actor": "",
@@ -2372,10 +2962,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：找完了",
           "tool": "",
           "ts": 1799999600.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "",
@@ -2387,10 +2979,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：找完了",
           "tool": "",
           "ts": 1799999600.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:done"
         },
         {
           "actor": "task",
@@ -2402,10 +2996,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "做完了",
           "tool": "",
           "ts": 1799999650.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:2"
         },
         {
           "actor": "main",
@@ -2417,10 +3013,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开场白草稿",
           "tool": "",
           "ts": 1799999821.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:6"
         },
         {
           "actor": "news",
@@ -2432,10 +3030,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "出构想",
           "tool": "",
           "ts": 1799999835.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:5"
         },
         {
           "actor": "子 agent",
@@ -2447,10 +3047,12 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "web_search",
           "ts": 1799999845.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:3"
         },
         {
           "actor": "news",
@@ -2462,10 +3064,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "打分",
           "tool": "",
           "ts": 1799999848.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:3"
         },
         {
           "actor": "goal",
@@ -2477,12 +3081,16 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "盯一眼",
           "tool": "",
           "ts": 1799999900.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:8"
         }
-      ]
+      ],
+      "total_steps": 14,
+      "truncated": false
     },
     "news_batch/3": {
       "item": {
@@ -2491,11 +3099,20 @@
           "tools": 0
         },
         "elapsed_s": 0,
+        "error": "",
+        "error_brief": "",
         "finished": 1799999500.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": 3,
+        "jump": {
+          "detail_id": "",
+          "detail_type": "",
+          "tab": "news"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": null,
         "phase": "",
         "source": "news_batch",
@@ -2507,6 +3124,8 @@
         "updated": 1799999500.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -2518,10 +3137,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：跳过了",
           "tool": "",
           "ts": 1799999500.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "",
@@ -2533,12 +3154,16 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：跳过了",
           "tool": "",
           "ts": 1799999500.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:skipped"
         }
-      ]
+      ],
+      "total_steps": 2,
+      "truncated": false
     },
     "news_batch/4": null,
     "news_batch/5": null,
@@ -2549,14 +3174,23 @@
           "tools": 0
         },
         "elapsed_s": 190,
+        "error": "",
+        "error_brief": "",
         "finished": 1799999800.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": "T-done",
+        "jump": {
+          "detail_id": "T-done",
+          "detail_type": "task",
+          "tab": "tasks"
+        },
         "last_step": {
           "text": "做完了",
           "ts": 1799999650.0
         },
+        "note_count": 0,
         "ok": true,
         "phase": "",
         "source": "task",
@@ -2568,6 +3202,8 @@
         "updated": 1799999800.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -2579,10 +3215,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：完成了",
           "tool": "",
           "ts": 1799999610.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "task",
@@ -2594,10 +3232,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "做完了",
           "tool": "",
           "ts": 1799999650.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:2"
         },
         {
           "actor": "",
@@ -2609,12 +3249,16 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：完成了",
           "tool": "",
           "ts": 1799999800.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:done"
         }
-      ]
+      ],
+      "total_steps": 3,
+      "truncated": false
     },
     "task/T-off": {
       "item": {
@@ -2623,11 +3267,20 @@
           "tools": 0
         },
         "elapsed_s": 7200,
+        "error": "",
+        "error_brief": "",
         "finished": null,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": "T-off",
+        "jump": {
+          "detail_id": "T-off",
+          "detail_type": "task",
+          "tab": "tasks"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": null,
         "phase": "",
         "source": "task",
@@ -2639,6 +3292,8 @@
         "updated": 1799992800.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -2650,12 +3305,16 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：排队中",
           "tool": "",
           "ts": 1799992800.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         }
-      ]
+      ],
+      "total_steps": 1,
+      "truncated": false
     },
     "task/T-old": {
       "item": {
@@ -2664,11 +3323,20 @@
           "tools": 0
         },
         "elapsed_s": 3600,
+        "error": "",
+        "error_brief": "",
         "finished": 1799895600.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": "T-old",
+        "jump": {
+          "detail_id": "T-old",
+          "detail_type": "task",
+          "tab": "tasks"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": true,
         "phase": "",
         "source": "task",
@@ -2680,6 +3348,8 @@
         "updated": 1799895600.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -2691,10 +3361,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：完成了",
           "tool": "",
           "ts": 1799892000.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "",
@@ -2706,12 +3378,16 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：完成了",
           "tool": "",
           "ts": 1799895600.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:done"
         }
-      ]
+      ],
+      "total_steps": 2,
+      "truncated": false
     },
     "task/T-run": {
       "item": {
@@ -2720,14 +3396,23 @@
           "tools": 1
         },
         "elapsed_s": 900,
+        "error": "",
+        "error_brief": "",
         "finished": null,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": "T-run",
+        "jump": {
+          "detail_id": "T-run",
+          "detail_type": "task",
+          "tab": "tasks"
+        },
         "last_step": {
           "text": "web_search：输出",
           "ts": 1799999200.0
         },
+        "note_count": 0,
         "ok": null,
         "phase": "",
         "source": "task",
@@ -2739,6 +3424,8 @@
         "updated": 1799999100.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -2750,10 +3437,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：正在跑",
           "tool": "",
           "ts": 1799999100.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "子 agent",
@@ -2765,12 +3454,16 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "web_search",
           "ts": 1799999200.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:2"
         }
-      ]
+      ],
+      "total_steps": 2,
+      "truncated": false
     },
     "task/T-wait": {
       "item": {
@@ -2779,11 +3472,20 @@
           "tools": 0
         },
         "elapsed_s": 3600,
+        "error": "",
+        "error_brief": "",
         "finished": null,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": "T-wait",
+        "jump": {
+          "detail_id": "T-wait",
+          "detail_type": "task",
+          "tab": "tasks"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": null,
         "phase": "",
         "source": "task",
@@ -2795,6 +3497,8 @@
         "updated": 1799996400.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -2806,12 +3510,16 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：等人答复",
           "tool": "",
           "ts": 1799996400.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         }
-      ]
+      ],
+      "total_steps": 1,
+      "truncated": false
     },
     "topic/1": {
       "item": {
@@ -2820,14 +3528,23 @@
           "tools": 0
         },
         "elapsed_s": 0,
+        "error": "",
+        "error_brief": "",
         "finished": 1799999820.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": 1,
+        "jump": {
+          "detail_id": "",
+          "detail_type": "",
+          "tab": "group"
+        },
         "last_step": {
           "text": "开场白草稿",
           "ts": 1799999821.0
         },
+        "note_count": 0,
         "ok": true,
         "phase": "",
         "source": "topic",
@@ -2839,6 +3556,8 @@
         "updated": 1799999820.0
       },
       "link": "exact",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "Jev",
@@ -2850,10 +3569,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "Jev 判断：可以开（ok=0.90），群里冷了一会儿了，候选「候选话题甲」对得上",
           "tool": "",
           "ts": 1799999819.0,
-          "type": "think"
+          "type": "think",
+          "uid": "j:1"
         },
         {
           "actor": "",
@@ -2865,10 +3586,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：开了个话题",
           "tool": "",
           "ts": 1799999820.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "",
@@ -2880,10 +3603,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：开了个话题",
           "tool": "",
           "ts": 1799999820.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:good"
         },
         {
           "actor": "main",
@@ -2895,12 +3620,16 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开场白草稿",
           "tool": "",
           "ts": 1799999821.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:6"
         }
-      ]
+      ],
+      "total_steps": 4,
+      "truncated": false
     },
     "topic/2": {
       "item": {
@@ -2909,11 +3638,20 @@
           "tools": 0
         },
         "elapsed_s": 0,
+        "error": "没有合适候选",
+        "error_brief": "没有合适候选",
         "finished": 1799999540.0,
         "group_id": "900000001",
         "group_name": "黄金群一",
+        "handoff_count": 0,
         "id": 2,
+        "jump": {
+          "detail_id": "",
+          "detail_type": "",
+          "tab": "group"
+        },
         "last_step": null,
+        "note_count": 0,
         "ok": false,
         "phase": "",
         "source": "topic",
@@ -2925,6 +3663,8 @@
         "updated": 1799999540.0
       },
       "link": "time_window",
+      "notes": [],
+      "rounds": [],
       "steps": [
         {
           "actor": "",
@@ -2936,10 +3676,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开始：没开成",
           "tool": "",
           "ts": 1799999540.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:start"
         },
         {
           "actor": "",
@@ -2951,10 +3693,12 @@
           "output": "",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "结束：没开成",
           "tool": "",
           "ts": 1799999540.0,
-          "type": "status"
+          "type": "status",
+          "uid": "s:end:bad"
         },
         {
           "actor": "news",
@@ -2966,10 +3710,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "老轮打分",
           "tool": "",
           "ts": 1799999590.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:4"
         },
         {
           "actor": "task",
@@ -2981,10 +3727,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "做完了",
           "tool": "",
           "ts": 1799999650.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:2"
         },
         {
           "actor": "main",
@@ -2996,10 +3744,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "开场白草稿",
           "tool": "",
           "ts": 1799999821.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:6"
         },
         {
           "actor": "news",
@@ -3011,10 +3761,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "出构想",
           "tool": "",
           "ts": 1799999835.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:5"
         },
         {
           "actor": "子 agent",
@@ -3026,10 +3778,12 @@
           "output": "输出",
           "reasoning": "",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "",
           "tool": "web_search",
           "ts": 1799999845.0,
-          "type": "tool"
+          "type": "tool",
+          "uid": "t:3"
         },
         {
           "actor": "news",
@@ -3041,10 +3795,12 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "打分",
           "tool": "",
           "ts": 1799999848.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:3"
         },
         {
           "actor": "goal",
@@ -3056,12 +3812,16 @@
           "output": "",
           "reasoning": "想的过程",
           "reasoning_redacted": false,
+          "round_id": "",
           "text": "盯一眼",
           "tool": "",
           "ts": 1799999900.0,
-          "type": "think"
+          "type": "think",
+          "uid": "m:8"
         }
-      ]
+      ],
+      "total_steps": 9,
+      "truncated": false
     }
   }
 }

@@ -31,6 +31,7 @@ def _row_to_item(r: Any, now: float) -> dict[str, Any]:
         "started": created, "finished": created, "updated": updated,
         "ok": True, "stuck": False, "task_id": "",
         "_run_ref": str(r["run_ref"] or ""),
+        "_personal": personal,   # jump 用：个人构想只给 group 页，不露 detail id
     }
     item["trace"] = _trace_of(item, now)
     return item

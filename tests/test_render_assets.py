@@ -8,12 +8,13 @@ MaiWork 不能改镜像、不能 apt 装系统包，所以把字体 / 浏览器�
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sys
 import types
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import httpx
 import pytest
@@ -309,6 +310,108 @@ async def test_optional_deps_merges_asset_groups(tmp_path: Path, store: Store) -
     # 本机执行不可用也能装字体（字体 / 浏览器是给 MaiWork 自己画图用的，不走子 agent）
     deps.start_install("fonts")
     await deps.wait()
+
+
+# ----------------------------------------------------------------------
+# 刷新与安装并发 / 换工作区根
+# ----------------------------------------------------------------------
+
+
+class _SlowProbeRunner(_Runner):
+    """第一次「启动探测」卡住等放行；探测结果跟着浏览器目录里的实际情况走。
+
+    模拟真实场景：管理员点安装时，页面状态刚好在刷新（探测卡着）；
+    下载前目录里没有浏览器，下载完才有——所以早先那份探测结果就是「启动失败」。
+    """
+
+    def __init__(self, *, make_exe: Path, before_install: Callable[[], Awaitable[None]]) -> None:
+        super().__init__({"playwright": True, "launch": "ok"}, make_exe=make_exe)
+        self.before_install = before_install
+        self.entered = asyncio.Event()       # 外部那次刷新：进到探测里了
+        self.gate = asyncio.Event()          # 放行：外部那次刷新可以返回了
+        self._first_probe = True
+
+    async def __call__(self, argv, *, env, timeout):
+        if argv[1] == "-c":
+            self.calls.append((list(argv), dict(env)))
+            if self._first_probe:
+                self._first_probe = False
+                self.entered.set()
+                await self.gate.wait()
+            probe = self.probe if self.make_exe.exists() else {
+                "playwright": True, "launch": "failed", "launch_error": "Executable doesn't exist",
+            }
+            return 0, _probe_out(**probe), ""
+        if argv[1:3] == ["-m", "playwright"] and self.before_install is not None:
+            hook, self.before_install = self.before_install, None
+            await hook()                     # 下载期间：外部那次刷新正卡在探测里
+            self.calls.append((list(argv), dict(env)))
+            self.make_exe.parent.mkdir(parents=True, exist_ok=True)
+            self.make_exe.write_text("x")
+            self.make_exe.chmod(0o755)
+            return self.install_code, "downloaded", ""
+        return await super().__call__(argv, env=env, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_browser_install_refreshes_after_concurrent_refresh(tmp_path: Path, store: Store) -> None:
+    """安装时页面正在刷新：装完那次 refresh 必须**再探一次**，不能吃上刷新前的结果。
+
+    以前 `refresh()` 开头 `if self._checking: return`，第二次调用直接返回；
+    `_install_browser` 随后读到「下载前」的缓存 → 误报「下载命令说成功了，
+    但在 MaiWork 目录里没找到浏览器」。
+    """
+    exe = tmp_path / "ms-playwright" / "chromium_headless_shell-1" / "chrome-linux" / "headless_shell"
+    during = asyncio.Event()
+
+    async def during_download() -> None:
+        during.set()
+
+    runner = _SlowProbeRunner(make_exe=exe, before_install=during_download)
+    assets = ra.RenderAssets(store, lambda: _Settings(tmp_path), runner=runner, python="/py",
+                             system_fonts=lambda: [])
+
+    pending = asyncio.create_task(assets.refresh())   # 页面状态刷新：卡在「下载前」的探测里
+    await runner.entered.wait()
+    assets.start_install("browser")                   # 管理员这时点了安装（它的首步刷新要排队）
+    runner.gate.set()                                 # 放行：外部那次刷新先跑完
+    await pending
+    await asyncio.wait_for(during.wait(), 5)          # 装真的走到下载那一步了
+    await assets.wait()
+
+    g = {x["id"]: x for x in assets.status_groups()}["browser"]
+    assert g["last_install"]["error"] == "" and "没找到浏览器" not in g["last_install"]["error"]
+    assert g["last_install"]["state"] == "ok"
+    assert g["state"] == "ok"
+    assert (assets._check().get("browser") or {}).get("local") == str(exe)
+    # 装完之后那次刷新是真探了一次（不是被 `_checking` 挡掉的空转）
+    assert runner.calls[-1][1].get("MW_EXE") == str(exe)
+
+
+@pytest.mark.asyncio
+async def test_root_change_invalidates_cached_check(tmp_path: Path, store: Store) -> None:
+    """换了工作区根（= 换了 MaiWork 自己的目录）：上一次那份启动检查不许冒充新目录的结果。
+
+    A 目录里浏览器能起（launch ok），切到 B 目录后 B 里根本没有浏览器：
+    不认根的话页面会照样显示「启动检查通过」。
+    """
+    box = {"root": tmp_path / "a"}
+    exe_a = box["root"] / "ms-playwright" / "chromium_headless_shell-1" / "chrome-linux" / "headless_shell"
+    exe_a.parent.mkdir(parents=True)
+    exe_a.write_text("x")
+    exe_a.chmod(0o755)
+    runner = _Runner({"playwright": True, "launch": "ok"})
+    assets = ra.RenderAssets(store, lambda: _Settings(box["root"]), runner=runner, python="/py",
+                             system_fonts=lambda: [])
+    await assets.refresh()
+    assert assets.checked() is True
+    assert {x["id"]: x for x in assets.status_groups()}["browser"]["state"] == "ok"
+
+    box["root"] = tmp_path / "b"             # 新的工作区根：里面什么都没有
+    assert assets.checked() is False
+    g = {x["id"]: x for x in assets.status_groups()}["browser"]
+    assert g["state"] == "unknown"           # 不能拿 A 的启动检查冒充 B
+    assert store.kv_get(ra.CHECK_KEY) is not None
 
 
 # ----------------------------------------------------------------------

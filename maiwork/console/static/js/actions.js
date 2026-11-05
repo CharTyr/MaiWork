@@ -26,8 +26,9 @@ import { loadUsage, loadUsageDay } from "./settings/usage.js";
 import { avatarSaved } from "./settings/identity.js";
 import { loadLogs, loadLogSummary } from "./settings/logs.js";
 import { closeSheet, openDetail, openSheet, repaintSheet } from "./sheet.js";
-import { loadBoardItem } from "./board.js";
-import { chatPoll, enterChat, loadChat, loadChats, paintChat } from "./chat.js";
+import { actBoard } from "./board.js";
+import { chatPoll, loadChat, paintChat } from "./chat.js";
+import { actChat } from "./chat_slash.js";
 import { renderSide, renderView } from "./render.js";
 import { dismissUpdate } from "./update.js";
 import { enterBoard, enterSettings, go, loadGroups, loadSettings, loadView, reboot, renderTopBits, retryLoad, syncHash } from "./router.js";
@@ -46,6 +47,8 @@ function findEntry(id) {
 
 export async function act(el, e) {
   const a = el.dataset.act;
+  if (await actBoard(a, el)) return; // 看板全是只读动作，集中走 board.js
+  if (await actChat(a, el)) return;
   if (await actNews(a, el)) return;
   if (await actSettingsNav(a, el)) return;
   if (await actExt(a, el, loadSettings)) return;
@@ -67,6 +70,27 @@ export async function act(el, e) {
   if (await actPreview(el)) return;
   const g = grp();
   switch (a) {
+    case "chat-confirm": {
+      const card = el.closest && el.closest(".cm-pending");
+      el.disabled = true;
+      try {
+        const r = await api("POST", `/api/chat/pending/${encodeURIComponent(el.dataset.id)}`, { approve: el.dataset.ok === "1" });
+        toast(el.dataset.ok === "1" ? (r.status === "done" ? "已执行" : `执行失败：${r.result || ""}`) : "已取消", r.status === "failed");
+        await loadChat(state.chatId, true);
+        if (state.chat) state.chat.running = true;
+        await flipRemove(card, $("chat-stream"), () => paintChat(true));
+        chatPoll();
+      } catch (err) {
+        el.disabled = false;
+        toast(err.message, true);
+        if (err.status === 409 && state.chatId) {
+          await loadChat(state.chatId, false);
+          paintChat(false);
+          chatPoll();
+        }
+      }
+      break;
+    }
     case "load-retry":
       await retryLoad(el);
       break;
@@ -82,103 +106,9 @@ export async function act(el, e) {
     case "groups":
       openSheet("groups");
       break;
-    case "chat":
-      await enterChat();
-      break;
     case "board":
       await enterBoard();
       break;
-    case "board-filter":
-      state.boardFilter = el.dataset.g || "";
-      renderView();
-      break;
-    case "board-item": {
-      if (!admin()) break;
-      state.boardItem = { source: el.dataset.src, id: el.dataset.id, kind: el.dataset.kind, data: null, err: "" };
-      state.boardOpen = {};
-      openSheet("board-item");
-      renderView();
-      await loadBoardItem(false);
-      if (state.sheet === "board-item") repaintSheet();
-      break;
-    }
-    case "chat-open":
-      closeSheet();
-      await enterChat(Number(el.dataset.id));
-      break;
-    case "chat-list":
-      await loadChats();
-      openSheet("chats");
-      break;
-    case "chat-new": {
-      try {
-        const c = await api("POST", "/api/chat", { group_id: (state.chat && state.chat.info && state.chat.info.group_id) || state.g || "" });
-        closeSheet();
-        await enterChat(c.id);
-        setTimeout(() => $("chat-input") && $("chat-input").focus(), 50);
-      } catch (err) {
-        toast(err.message, true);
-      }
-      break;
-    }
-    case "chat-suggest":
-      $("chat-input").value = el.dataset.t;
-      $("chat-input").focus();
-      break;
-    case "chat-summary":
-      state.chatOpen["s" + el.dataset.id] = !state.chatOpen["s" + el.dataset.id];
-      paintChat(false);
-      break;
-    case "chat-compact": {
-      const C = state.chat;
-      if (!C) break;
-      if (C.running) {
-        toast("请在回复完成后再压缩");
-        break;
-      }
-      el.disabled = true;
-      const label = el.textContent;
-      el.textContent = "正在压缩…";
-      try {
-        await api("POST", `/api/chat/${encodeURIComponent(C.id)}/compact`);
-        await loadChat(C.id);
-        paintChat(true);
-        toast("已压缩");
-      } catch (err) {
-        toast(err.status === 409 ? "请在回复完成后再压缩" : err.message, true);
-      } finally {
-        el.disabled = false;
-        el.textContent = label;
-      }
-      break;
-    }
-    case "chat-tool":
-      state.chatOpen[el.dataset.id] = !state.chatOpen[el.dataset.id];
-      paintChat(false);
-      reveal(`.cm-tool-h[data-id="${el.dataset.id}"]`);
-      break;
-    case "chat-confirm": {
-      const card = el.closest && el.closest(".cm-pending");
-      el.disabled = true;
-      try {
-        const r = await api("POST", `/api/chat/pending/${encodeURIComponent(el.dataset.id)}`, { approve: el.dataset.ok === "1" });
-        toast(el.dataset.ok === "1" ? (r.status === "done" ? "已执行" : `执行失败：${r.result || ""}`) : "已取消", r.status === "failed");
-        await loadChat(state.chatId, true);
-        if (state.chat) state.chat.running = true;
-        await flipRemove(card, $("chat-stream"), () => paintChat(true));
-        chatPoll();
-      } catch (err) {
-        el.disabled = false;
-        toast(err.message, true);
-        // 409：别的页面已经处理过 / 上一句还在跑 → 重新拉一遍，把过期的确认卡片收掉
-        if (err.status === 409 && state.chatId) {
-          await loadChat(state.chatId, false);
-          paintChat(false);
-          chatPoll();
-        }
-      }
-      break;
-    }
     case "settings":
       await enterSettings(state.page === "settings" ? state.setSub : "overview");
       break;

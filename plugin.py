@@ -15,8 +15,10 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Dict
 
-from maibot_sdk import Command, HookHandler, MaiBotPlugin
-from maibot_sdk.types import ErrorPolicy, HookMode
+from maibot_sdk import Command, HookHandler, MaiBotPlugin, Tool
+from maibot_sdk.types import ErrorPolicy, HookMode, ToolParameterInfo, ToolParamType as ToolParameterType
+
+from .maiwork.delivery import PLANNER_HANDOFF_TOOL, strip_planner_tool
 
 from .maiwork.config import (
     CONFIG_VERSION,
@@ -29,7 +31,7 @@ from .maiwork.config import (
 logger = logging.getLogger("maiwork")
 
 PLUGIN_ID = "chartyr.maiwork"
-PLUGIN_VERSION = "0.15.3"
+PLUGIN_VERSION = "0.16.0"
 
 __all__ = [
     "PLUGIN_ID",
@@ -79,6 +81,9 @@ class MaiWorkPlugin(MaiBotPlugin):
         for component in components:
             if component.get("name") == "maiwork_session":
                 component["metadata"]["command_pattern"] = self._registered_session_pattern
+            if component.get("name") == PLANNER_HANDOFF_TOOL:
+                component["chat_scope"] = "group"
+                component["metadata"]["visibility"] = "visible"
         return components
 
     @Command("maiwork_session", description="工作会话 @ 入口", pattern=r"(?!)",
@@ -92,6 +97,30 @@ class MaiWorkPlugin(MaiBotPlugin):
         except BaseException:
             logger.warning("会话原生命令未完成，消息继续", exc_info=True)
         return True, None, False
+
+    @Tool(
+        PLANNER_HANDOFF_TOOL,
+        description="仅在群友提出需要后台调研/制作交付、长期盯梢或定时提醒的新请求时调用（无论是否 @ 机器人）；日常闲聊、问候、玩梗、常识简答、/mw 指令或正在进行的工作会话续接补充切勿调用。调用后按返回状态自然简短回复群友，不要自己在聊天里重复制作或虚报交付时间。",
+        parameters=[
+            ToolParameterInfo(name="msg_id", param_type=ToolParameterType.STRING,
+                              description='提出该请求的群友消息编号（取 <message msg_id="..."> 中的 msg_id）。', required=True),
+            ToolParameterInfo(name="kind", param_type=ToolParameterType.STRING,
+                              description='"task" 为需要后台调研/整理/制作交付的一次性任务，"goal" 为需要持续盯梢或条件达成再通知的长期目标，"reminder" 为定时提醒。', required=True,
+                              enum_values=["task", "goal", "reminder"]),
+            ToolParameterInfo(name="title", param_type=ToolParameterType.STRING,
+                              description="一句话概括要做的事（不超过 30 字，可留空）。", required=False, default=""),
+        ],
+        chat_scope="group",
+        visibility="visible",
+    )
+    async def maiwork_handoff(self, **kwargs: Any) -> Dict[str, Any]:
+        try:
+            if self._app is None:
+                return {"success": False, "error": "MaiWork 未启用", "content": "MaiWork 未启用"}
+            return await self._app.on_planner_handoff(kwargs)
+        except Exception:
+            logger.exception("MaiWork planner 交接工具出错，已吞掉")
+            return {"success": False, "error": "MaiWork 交接失败", "content": "MaiWork 交接失败"}
 
     # ------------------------------------------------------------------
     # 内部
@@ -241,11 +270,30 @@ class MaiWorkPlugin(MaiBotPlugin):
         # app.on_planner_before_request → Mentions.inject 里按 deadline 自检。
         try:
             if self._app is None:
+                modified = strip_planner_tool(kwargs)
+                if modified is not None:
+                    return {"action": "continue", "modified_kwargs": modified}
                 return {"action": "continue"}
             return self._app.on_planner_before_request(kwargs)
         except Exception:
             logger.exception("MaiWork planner 备忘钩子出错，已吞掉")
             return {"action": "continue"}
+
+    @HookHandler(
+        "maisaka.planner.after_response",
+        name="maiwork_planner_after",
+        description="MaiWork：观察 planner 工具调用与闲聊收尾",
+        mode=HookMode.OBSERVE,
+        timeout_ms=1000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def maiwork_planner_after(self, **kwargs: Any) -> Dict[str, Any]:
+        try:
+            if self._app is not None:
+                self._app.on_planner_after_response(kwargs)
+        except Exception:
+            logger.exception("MaiWork planner 收尾钩子出错，已吞掉")
+        return {"action": "continue"}
 
 
 def create_plugin() -> MaiWorkPlugin:
