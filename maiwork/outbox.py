@@ -2064,8 +2064,8 @@ class Outbox:
                     checked_now = prepare_now
                     self._set(oid, status="sending", payload=payload, moment=checked_now)
                     row = _row_after(self._store, oid)
-                    # 载荷更新后再走一遍发送前检查；时间判断沿用本轮 flush 的时间戳，
-                    # 保持 TTL、额度和静默时段都使用同一时间口径。
+                    # 载荷更新后复核开关、TTL 和生产者新鲜度。额度在领取 sending 前已检查；
+                    # sending 行本身会被 used_today 计入，不能在这里再次问额度闸。
                     feature_reason = self._feature_drop_reason(row, payload)
                     ttl_reason = _ttl_expired(payload, checked_now)
                     stale_reason = self._preflight(row, payload, checked_now)
@@ -2076,18 +2076,6 @@ class Outbox:
                         self._fire_result(_row_after(self._store, oid), payload,
                                           outcome="dropped", error=drop_reason, now=checked_now)
                         continue
-                    if not follow_up:
-                        ok_push, reason = self._pushes.can_push(gid, gate_kind, checked_now)
-                        if not ok_push:
-                            if reason == _DROP_REASON:
-                                self._set(oid, status="dropped", error=f"作废：{reason}",
-                                          moment=checked_now)
-                                self._fire_result(_row_after(self._store, oid), payload,
-                                                  outcome="dropped", error=reason, now=checked_now)
-                                continue
-                            self._postpone(oid, gid, reason or "推送节制", checked_now,
-                                           payload=payload)
-                            continue
                 result = await self._execute(row)
             except Exception as exc:
                 err = _redact(str(exc), [])
