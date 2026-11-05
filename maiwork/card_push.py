@@ -438,7 +438,10 @@ class CardPush:
         if not isinstance(payload, dict):
             return
 
-        dispatch_ts = clock.now()
+        try:
+            dispatch_ts = float(info.get("now"))
+        except (TypeError, ValueError):
+            dispatch_ts = clock.now()
         dispatch_label = _slot_label(dispatch_ts)
         if str(payload.get("rendered_slot_label") or "") == dispatch_label:
             return
@@ -469,17 +472,9 @@ class CardPush:
         attachment = str(payload.get("text") or "")
         link = attachment[len("看全部资讯："):] if attachment.startswith("看全部资讯：") else ""
         data = self._card_data(gid, items, int(card["batch_id"] or 0), link)
-        png: bytes = b""
-        # 若恰好在渲染期间跨过早 / 午 / 晚分界，再用新时段重画一次。
-        for attempt in range(2):
-            data["slot_ts"] = dispatch_ts
-            data["slot_label"] = dispatch_label
-            png = await self._render(data)
-            latest_ts = clock.now()
-            latest_label = _slot_label(latest_ts)
-            if latest_label == dispatch_label or attempt == 1:
-                break
-            dispatch_ts, dispatch_label = latest_ts, latest_label
+        data["slot_ts"] = dispatch_ts
+        data["slot_label"] = dispatch_label
+        png = await self._render(data)
         if not png:
             raise RuntimeError("发送前重画资讯卡片没有生成图片")
 

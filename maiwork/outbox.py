@@ -2052,8 +2052,8 @@ class Outbox:
                 skipped.add(oid)
                 continue
             try:
-                # 用发送前的当前时间给生产者备料，不沿用本轮 flush 开始时的旧时间戳。
-                prepare_now = clock.now()
+                # 使用本轮 flush 的投递时间；它也是所有发送闸 / TTL 判断的统一时间源。
+                prepare_now = float(now)
                 try:
                     prepared_payload = await self._prepare_send_payload(row, payload, prepare_now)
                 except Exception as exc:
@@ -2061,11 +2061,11 @@ class Outbox:
                     raise OutboxPrepareError("发送前备料失败") from exc
                 if prepared_payload != payload:
                     payload = prepared_payload
-                    checked_now = clock.now()
+                    checked_now = prepare_now
                     self._set(oid, status="sending", payload=payload, moment=checked_now)
                     row = _row_after(self._store, oid)
-                    # 异步渲染期间可能跨过有效期、关掉功能开关，或再次进入静默时段；
-                    # 载荷发生变化说明做过备料，此处补查发送闸，避免渲染耗时绕过原有规则。
+                    # 载荷更新后再走一遍发送前检查；时间判断沿用本轮 flush 的时间戳，
+                    # 保持 TTL、额度和静默时段都使用同一时间口径。
                     feature_reason = self._feature_drop_reason(row, payload)
                     ttl_reason = _ttl_expired(payload, checked_now)
                     stale_reason = self._preflight(row, payload, checked_now)
