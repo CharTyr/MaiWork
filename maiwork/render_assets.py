@@ -577,6 +577,7 @@ class RenderAssets:
         self._system_fonts = system_fonts or system_cjk_fonts
         self._cache: dict[str, Any] | None = None
         self._checking = False
+        self._refresh_lock = asyncio.Lock()
         self._running: dict[str, str] = {}
         self._tasks: set[asyncio.Task] = set()
         if register:
@@ -653,31 +654,32 @@ class RenderAssets:
         return info
 
     async def refresh(self) -> None:
-        if self._checking:
-            return
-        self._checking = True
-        try:
-            rec: dict[str, Any] = {"at": clock.now()}
+        # 安装完成后必须看到一份新探测结果。并发的页面状态刷新不能让调用方提前返回，
+        # 否则 _install_browser 可能读到安装前缓存，误报「命令成功但没找到浏览器」。
+        async with self._refresh_lock:
+            self._checking = True
             try:
-                fonts, _b, _h = self._dirs()
-            except AssetError as exc:
-                rec["error"] = str(exc)
-                fonts = None
-            try:
-                system = await asyncio.to_thread(self._system_fonts)
-            except Exception:
-                system = []
-            rec["fonts"] = font_state(fonts, system=system, font=self._font)
-            try:
-                rec["browser"] = await self._probe_browser()
-            except asyncio.TimeoutError:
-                rec["browser"] = {"playwright": True, "launch": "failed", "launch_error": "启动探测超时"}
-            except Exception as exc:  # noqa: BLE001
-                rec["browser"] = {"playwright": False, "error": f"{type(exc).__name__}: {exc}"[:MAX_ERROR_CHARS]}
-            self._cache = rec
-            self._kv_set(CHECK_KEY, rec)
-        finally:
-            self._checking = False
+                rec: dict[str, Any] = {"at": clock.now()}
+                try:
+                    fonts, _b, _h = self._dirs()
+                except AssetError as exc:
+                    rec["error"] = str(exc)
+                    fonts = None
+                try:
+                    system = await asyncio.to_thread(self._system_fonts)
+                except Exception:
+                    system = []
+                rec["fonts"] = font_state(fonts, system=system, font=self._font)
+                try:
+                    rec["browser"] = await self._probe_browser()
+                except asyncio.TimeoutError:
+                    rec["browser"] = {"playwright": True, "launch": "failed", "launch_error": "启动探测超时"}
+                except Exception as exc:  # noqa: BLE001
+                    rec["browser"] = {"playwright": False, "error": f"{type(exc).__name__}: {exc}"[:MAX_ERROR_CHARS]}
+                self._cache = rec
+                self._kv_set(CHECK_KEY, rec)
+            finally:
+                self._checking = False
 
     def checked(self) -> bool:
         return float(self._check().get("at") or 0.0) > 0
