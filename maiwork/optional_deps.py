@@ -602,6 +602,10 @@ class OptionalDeps:
         （工作区根 / 判定 / 本地模式 / 运行账号变过）就当没有——不然网页上会出现
         「新目录的路径 + 旧目录的探测结果」。插件重启后是同一个环境 → 照旧看得见上次结果。
         """
+        # stopped 模式下虽然仍会建 LocalEnv（供文件工具使用），但它不能运行命令。
+        # 这时不要复用旧的命令探测错误（例如 Windows 上的 WinError 2）。
+        if self._capability_blocks_local_exec():
+            return {}
         if self._cache is not None:
             return self._cache
         rec = self._kv_get(CHECK_KEY, None)
@@ -615,12 +619,16 @@ class OptionalDeps:
         rec = self._kv_get(KV_PREFIX + str(group_id), None)
         return rec if isinstance(rec, dict) else {}
 
+    def _capability_blocks_local_exec(self) -> bool:
+        cap = self._capability
+        return cap is not None and not bool(getattr(cap, "ok", True))
+
     def _run_note(self) -> str:
         """能不能在本机跑命令 / 探测（不能就装、卸都做不了）。"""
         if self._env is None:
             return "本机执行环境不可用（这台机器无法隔离运行命令），无法安装可选依赖"
         cap = self._capability
-        if cap is not None and not bool(getattr(cap, "ok", True)):
+        if self._capability_blocks_local_exec():
             why = str(getattr(cap, "reason", "") or "本机执行未启用")
             return f"本机执行未启用（{why}），无法安装可选依赖"
         return ""
@@ -672,6 +680,13 @@ class OptionalDeps:
                 "python": "", "version": "", "packages": {},
                 "soffice": {"found": False, "path": ""}, "error": self._unavailable_note(),
             }
+        if self._capability_blocks_local_exec():
+            # LocalEnv 在 stopped 模式下还用于文件操作，但 env.run 会因无法启动命令而失败。
+            # 这是已知不可探测状态，应由页面顶部的执行环境说明表达，不显示成检查错误。
+            return {
+                "python": "", "version": "", "packages": {},
+                "soffice": {"found": False, "path": ""}, "error": "",
+            }
         res = await env.run(_PROBE_WORKSPACE, probe_command(), timeout_s=self._probe_timeout_s)
         return _parse_probe(
             str(getattr(res, "stdout", "") or ""),
@@ -686,6 +701,9 @@ class OptionalDeps:
             except Exception:
                 logger.warning("探测画图组件出错", exc_info=True)
         if self._env is None:
+            self._cache = {}
+            return self.status()
+        if self._capability_blocks_local_exec():
             self._cache = {}
             return self.status()
         self._checking = True
@@ -706,6 +724,9 @@ class OptionalDeps:
         return self.status()
 
     def checked(self) -> bool:
+        if self._capability_blocks_local_exec():
+            # 通用 Python 依赖不可探测；仍以独立的字体 / Chromium 探测决定页面是否已检查。
+            return self._assets is None or bool(self._assets.checked())
         office = float(self._check().get("at") or 0.0) > 0
         if self._assets is None:
             return office
@@ -719,7 +740,7 @@ class OptionalDeps:
                 self._assets.maybe_refresh(max_age=max_age)
             except Exception:
                 logger.debug("后台刷新画图组件出错", exc_info=True)
-        if self._env is None or self._checking:
+        if self._env is None or self._capability_blocks_local_exec() or self._checking:
             return False
         at = float(self._check().get("at") or 0.0)
         if at > 0 and clock.now() - at < max_age:
