@@ -170,7 +170,7 @@ def _boxes(store):
 # ---------------------------------------------------------------- resend 数据层
 
 
-async def test_resend_uses_cached_jpeg(tmp_path):
+async def test_resend_refreshes_cached_jpeg_with_unknown_slot_before_send(tmp_path):
     store, _, host, *_r, cp, ob = _make(tmp_path)
     _enable(store)
     _, ids = _batch(store)
@@ -189,8 +189,13 @@ async def test_resend_uses_cached_jpeg(tmp_path):
     payload = json.loads(box["payload"])
     assert str(payload["path"]).endswith(f"card-{cid}.jpg")
     assert payload["push_kind"] == "news_card" and float(payload["expires_ts"]) > NOON
+    # 旧缓存没有时段标记，后台长活先刷新；Outbox 本身不在发送期间启动浏览器。
+    dispatch = NOON + 1
+    assert cp.has_due(GID, dispatch)
+    await cp.flush(GID, dispatch)
+    assert len(cp._render.calls) == 1
     # 真发出去
-    await ob.flush(NOON + 1)
+    await ob.flush(dispatch)
     assert len(host.images) == 1 and host.images[0]["data"] == JPEG
     assert _cards(store)[0]["status"] == "sent"
 

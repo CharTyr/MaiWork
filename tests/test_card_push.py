@@ -334,8 +334,13 @@ async def test_shared_cap_defers_extra_card_instead_of_dropping(tmp_path):
     assert [r["status"] for r in _cards(store)] == ["sent", "queued"]
     second = _boxes(store)[1]
     assert second["status"] == "pending" and float(second["not_before"]) > evening
-    # 第二天凌晨额度回来（还没过第二张的 12 小时窗口）：接着发
-    await ob.flush(_ts(0, 30, day=16))
+    # 第二天凌晨额度回来（还没过第二张的 12 小时窗口）：后台先刷新跨时段图片，
+    # Outbox 只发送刷新后的载荷，不在 sending 阶段启动浏览器。
+    morning = _ts(0, 30, day=16)
+    assert cp.has_due(GID, morning)
+    await cp.flush(GID, morning)
+    assert len(host.images) == 1
+    await ob.flush(morning)
     assert len(host.images) == 2
     assert [r["status"] for r in _cards(store)] == ["sent", "sent"]
 
