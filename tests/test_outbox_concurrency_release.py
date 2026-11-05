@@ -124,7 +124,7 @@ def _make(tmp_path, *, daily_max: int = 3, host: GatedHost | None = None) -> Wor
 
 def _rows(store: Store) -> list:
     return store.read().execute(
-        "SELECT id, key, status, attempts, not_before, error, updated FROM outbox ORDER BY id"
+        "SELECT id, key, status, attempts, not_before, error FROM outbox ORDER BY id"
     ).fetchall()
 
 
@@ -283,7 +283,7 @@ async def test_concurrent_flushes_never_exceed_two_attempts(tmp_path):
     await asyncio.wait_for(a, 2)
     row = _rows(world.store)[0]
     assert row["status"] == "pending" and int(row["attempts"]) == 1
-    assert float(row["not_before"]) == float(row["updated"]) + 300
+    assert float(row["not_before"]) == NOON + 300
 
     await ob1.flush(NOON + 400)
     row = _rows(world.store)[0]

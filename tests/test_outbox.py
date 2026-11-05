@@ -143,7 +143,7 @@ def _artifact_file(
 
 def _rows(store: Store):
     return store.read().execute(
-        "SELECT id, key, kind, status, payload, error, result, attempts, not_before, task_id, updated"
+        "SELECT id, key, kind, status, payload, error, result, attempts, not_before, task_id"
         " FROM outbox ORDER BY id"
     ).fetchall()
 
@@ -285,7 +285,7 @@ async def test_flush_other_error_retries_once_then_failed_and_redacts_secrets(tm
     row = _rows(store)[0]
     assert row["status"] == "pending"            # 排了一次重试
     assert int(row["attempts"]) == 1
-    assert float(row["not_before"]) == float(row["updated"]) + 300
+    assert float(row["not_before"]) == NOON + 300
     assert "重试" in row["error"]
     assert "sk-abcdefghijklmnop" not in row["error"]
     assert "toptoken123" not in row["error"]
@@ -861,7 +861,7 @@ async def test_uncertain_reserves_quota_but_is_not_recorded_as_sent(tmp_path):
 
 
 async def test_result_hook_gets_outcome_and_ts(tmp_path):
-    """结果 hook：发出去才 sent（带 message_id），时间戳与 sent 状态更新时间一致。"""
+    """结果 hook：发出去才 sent（带 message_id），并带上这一轮 flush 的时间。"""
     seen: list[dict] = []
     store, _, host, *_r, ob = _make(tmp_path)
     ob.add_result_hook(seen.append)
@@ -869,7 +869,7 @@ async def test_result_hook_gets_outcome_and_ts(tmp_path):
     await ob.flush(NOON)
     assert seen and seen[0]["outcome"] == "sent"
     assert seen[0]["key"] == "k1" and seen[0]["result"]["message_id"]
-    assert float(seen[0]["ts"]) == float(_rows(store)[0]["updated"])
+    assert float(seen[0]["ts"]) == NOON
 
 
 # ----------------------------------------------------------------------

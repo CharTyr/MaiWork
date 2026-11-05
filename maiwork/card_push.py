@@ -579,7 +579,7 @@ class CardPush:
                 expires_ts = float(payload.get("expires_ts") or 0)
             except (TypeError, ValueError):
                 expires_ts = 0.0
-            if expires_ts and float(moment) >= expires_ts:
+            if expires_ts and float(moment) > expires_ts:
                 continue
             if str(payload.get("rendered_slot_label") or "") != current_label:
                 out.append((row, payload))
@@ -630,7 +630,7 @@ class CardPush:
             finished_at = clock.now() if follow_clock else float(moment)
 
         expires_ts = float(old_payload.get("expires_ts") or (float(row["created"]) + EXPIRE_S))
-        if finished_at >= expires_ts:
+        if finished_at > expires_ts:
             return  # Outbox 会按 TTL 作废；过期图片不再写回队列
 
         refreshed = dict(old_payload)
@@ -723,8 +723,8 @@ class CardPush:
     ) -> tuple[bytes, str, float]:
         """按当前时段渲染；若恰好跨过时段边界，后台长活再尝试一次。
 
-        返回的标签始终对应实际画进图片的时刻。若第二次仍跨边界，Outbox 的轻量
-        发送前检查会继续暂缓，交给下一轮 CardPush 长活刷新，不会把旧标题发出去。
+        返回的标签始终对应实际画进图片的时刻。若两次渲染都跨过时段边界，丢弃
+        可能带旧标题的图片并让调用方走纯文字兜底，避免重发路径依赖后台任务解锁。
         """
         render_ts = float(moment)
         png = b""
@@ -734,7 +734,11 @@ class CardPush:
             rendered_label = self._stamp_slot(data, render_ts)
             png = bytes(await self._render(data) or b"")
             finished_ts = clock.now() if follow_clock else render_ts
-            if _slot_label(finished_ts) == rendered_label or attempt == 1:
+            if _slot_label(finished_ts) == rendered_label:
+                break
+            if attempt == 1:
+                rendered_label = self._stamp_slot(data, finished_ts)
+                png = b""
                 break
             render_ts = finished_ts
         return png, rendered_label, float(finished_ts)
@@ -866,7 +870,7 @@ class CardPush:
         for row in rows:
             cid = int(row["id"])
             render_moment = clock.now() if follow_clock else moment
-            if render_moment - float(row["created"]) >= EXPIRE_S:
+            if render_moment - float(row["created"]) > EXPIRE_S:
                 self._set(cid, status="dropped", error="超过 12 小时没发出去，作废")
                 logger.info("资讯卡片作废（群 %s 批次 %s）：超过 12 小时", gid, row["batch_id"])
                 continue
@@ -919,7 +923,7 @@ class CardPush:
                 finished_at = clock.now() if follow_clock else render_moment
                 rendered_label = self._stamp_slot(data, finished_at)
             expires_ts = float(row["created"]) + EXPIRE_S
-            if finished_at >= expires_ts:
+            if finished_at > expires_ts:
                 self._set(cid, status="dropped", error="超过 12 小时没发出去，作废")
                 logger.info("资讯卡片作废（群 %s 批次 %s）：渲染完成时已过期", gid, row["batch_id"])
                 continue
@@ -1176,8 +1180,8 @@ class CardPush:
         """手动重发一张 failed / uncertain 的卡片（网页管理员接口调它）。
 
         - 只允许 failed / uncertain，别的状态抛 ValueError（网页 409）；卡片不存在抛 KeyError（404）；
-        - 有缓存图（card-<id>.jpg / .png）就先用缓存，没有就按本次备料时段重新画；
-          排队期间跨时段的图片会由 CardPush 后台长活更新，画图失败退回纯文字；
+        - 只有明确标记为当前时段的缓存图才直接复用；旧时段或无标记缓存会按本次备料时段重画；
+          排队期间跨时段的图片由 CardPush 后台长活更新，画图失败退回纯文字；
         - 一张卡片**每天最多手动重发 1 次**（kv 记北京日期）；
         - 照旧走发件箱：开关 / 睡觉时段 / 每日额度都还管；有效期从这次重发重新算 12 小时
           （不然失败很久的卡片一入队就被 TTL 作废，点了等于没点）。
@@ -1225,6 +1229,18 @@ class CardPush:
         cached = preferred if preferred in paths and preferred.is_file() and not preferred.is_symlink() else None
         if cached is None:
             cached = next((p for p in paths if p.is_file() and not p.is_symlink()), None)
+        cached_label = str(previous_payload.get("rendered_slot_label") or "")
+        cache_matches_slot = (
+            cached is not None
+            and cached == preferred
+            and box is not None
+            and str(box["kind"] or "") == "image"
+            and cached_label == _slot_label(moment)
+        )
+        if cached is not None and not cache_matches_slot:
+            # 历史载荷缺少时段标记或缓存来自旧时段：重发在 Outbox 之外，
+            # 这里直接重画，避免依赖后台刷新任务才能解除 pending。
+            cached = None
         path: Optional[Path] = cached
         used_cache = cached is not None
         mode = "image" if cached is not None else "text"
@@ -1244,7 +1260,7 @@ class CardPush:
                 logger.warning("手动重发画图失败，改发纯文字（群 %s 卡片 %s）：%s", gid, cid, e)
                 finished_at = clock.now() if follow_clock else moment
                 rendered_slot_label = self._stamp_slot(data, finished_at)
-            if finished_at >= moment + EXPIRE_S:
+            if finished_at > moment + EXPIRE_S:
                 raise ValueError("卡片渲染完成时已超过重发有效期，请稍后重新提交")
             if img:
                 path = self._image_path(cid, bytes(img))

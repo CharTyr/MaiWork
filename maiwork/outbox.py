@@ -2005,12 +2005,6 @@ class Outbox:
 
     async def _flush_locked(self, now: float, *, allowed_groups: Any = None) -> None:
         base_now = float(now)
-        loop = asyncio.get_running_loop()
-        started_at = loop.time()
-        execution_started = False
-
-        def current_now() -> float:
-            return base_now + max(0.0, loop.time() - started_at)
 
         if allowed_groups is None:
             try:
@@ -2025,10 +2019,9 @@ class Outbox:
         # 抢不到（CAS 0 行）的行：这一轮不再碰，避免反复重试同一行
         skipped: set[int] = set()
         while True:
-            # flush(now) 的首轮资格判断以调用方提供的时刻为准；否则进入协程时
-            # 几微秒的调度耗时也会把 expires_ts == now 错判为过期。
-            # 首次进入渠道发送后，再按单调时钟推进，确保慢发送期间 TTL 继续生效。
-            now = current_now() if execution_started else base_now
+            # flush(now) 使用调用方提供的确定时刻；微秒级协程调度耗时不应改变
+            # TTL 等号边界、重试 not_before 或额度记账时间。
+            now = base_now
             rows = [r for r in self._due_rows(now)
                     if str(r["group_id"]) in served and int(r["id"]) not in skipped]
             if not rows:
@@ -2123,10 +2116,9 @@ class Outbox:
                 continue
             row = _row_after(self._store, oid)
             try:
-                execution_started = True
                 result = await self._execute(row)
             except Exception as exc:
-                now = current_now()
+                now = base_now
                 err = _redact(str(exc), [])
                 if self._is_timeout(exc):
                     # 超时：可能已经发出去了，绝不重发
@@ -2153,7 +2145,7 @@ class Outbox:
                 self._fire_result(_row_after(self._store, oid), payload,
                                   outcome="failed", error=err, now=now)
                 continue
-            now = current_now()
+            now = base_now
             self._set(oid, status="sent", result=result, moment=now)
             if kind == "file":
                 self._note_file_result(now)

@@ -133,7 +133,7 @@ def _make(tmp_path, *, cfg: dict | None = None, groups=(GID,), sub: str = "w") -
 
 def _outbox_rows(store: Store) -> list:
     return store.read().execute(
-        "SELECT id, key, group_id, kind, payload, status, attempts, not_before, error, result, updated"
+        "SELECT id, key, group_id, kind, payload, status, attempts, not_before, error, result"
         " FROM outbox ORDER BY id"
     ).fetchall()
 
@@ -376,7 +376,7 @@ async def test_safe_failure_retries_once_then_failed_and_not_counted(tmp_path):
     row = _outbox_rows(world.store)[0]
     assert row["status"] == "pending"              # 排了一次重试：仍在待发
     assert int(row["attempts"]) == 1
-    assert float(row["not_before"]) == float(row["updated"]) + 300
+    assert float(row["not_before"]) == NOON + 300
     assert "重试" in row["error"]
     assert _push_rows(world.store) == []           # 失败不算 sent、不占额度
     await world.ob.flush(NOON + 400)

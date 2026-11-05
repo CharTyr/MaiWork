@@ -982,7 +982,9 @@ class TestTwitterOembedSecurity:
 
         def short_timeout(seconds):
             deadlines.append(seconds)
-            return real_timeout(0.03)
+            # cancel 分支要验证流主动抛出的 CancelledError，而不是和 30ms
+            # 人工超时竞争；Windows 全量并行测试负载下尤其容易被超时抢先触发。
+            return real_timeout(1.0 if mode == "cancel" else 0.03)
 
         monkeypatch.setattr(tools_builtin.asyncio, "timeout", short_timeout)
 
