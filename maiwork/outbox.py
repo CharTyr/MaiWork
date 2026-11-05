@@ -57,6 +57,7 @@ import asyncio
 import base64
 import hashlib
 import io
+import inspect
 import json
 import logging
 import os
@@ -580,6 +581,10 @@ class OutboxPayloadError(HostError):
     """这条载荷本身不合法（路径 / 类型 / 大小）：重试多少次都一样，直接判失败。"""
 
 
+class OutboxPrepareError(RuntimeError):
+    """发送前备料失败；尚未调用渠道发送，不得误记为发送结果未知。"""
+
+
 def _is_artifact_outbox_row(kind: str, key: str) -> bool:
     """真实交付项；失败兜底告知和后续说明都不算成品。
 
@@ -723,6 +728,8 @@ class Outbox:
         # 发送前新鲜度检查（0.8.0 收口）：生产者自己挂上来，同步、纯代码；
         # 见 add_preflight_hook。generic 发件箱不读群消息、不调模型。
         self._preflight_hooks: list[Any] = []
+        # 发送前异步备料（例如按实际投递时段重画资讯卡片）；只在领取 sending 后调用。
+        self._send_prepare_hooks: list[Any] = []
         # 个人提一嘴的复核者（2026-10）：只有 card_push.IdeaMention 会登记；**没登记就不发**
         # 个人提一嘴（见 set_personal_guard / _is_personal_mention），别的 hook 冒充不了。
         self._personal_guard: Any = None
@@ -773,6 +780,33 @@ class Outbox:
         """
         if callable(hook):
             self._preflight_hooks.append(hook)
+
+    def add_send_prepare_hook(self, hook: Any) -> None:
+        """挂发送前的异步备料回调（可挂多个）：fn(info) -> None 或新 payload。
+
+        在开关、TTL、新鲜度、额度检查通过且 CAS 领取 sending 后调用；因此可安全地做
+        较慢的渲染工作。回调可原地更新 info["payload"]，也可返回新的 dict。载荷变化
+        会先持久化，再交给 _execute；回调异常沿用本条消息的重试 / 失败处理。
+        """
+        if callable(hook):
+            self._send_prepare_hooks.append(hook)
+
+    async def _prepare_send_payload(self, row: Any, payload: dict, now: float) -> dict:
+        """运行生产者的发送前异步备料，并返回将要持久化 / 发送的载荷。"""
+        if not self._send_prepare_hooks:
+            return payload
+        info = self._hook_info(row, payload, now)
+        for hook in list(self._send_prepare_hooks):
+            result = hook(info)
+            if inspect.isawaitable(result):
+                result = await result
+            if result is not None:
+                if not isinstance(result, dict):
+                    raise TypeError("发送前备料 hook 必须返回 dict 或 None")
+                info["payload"] = result
+            if not isinstance(info.get("payload"), dict):
+                raise TypeError("发送前备料 hook 必须保留 dict 载荷")
+        return dict(info["payload"])
 
     def set_personal_guard(self, hook: Any) -> None:
         """登记「个人提一嘴的发送前复核」（生产者 card_push.IdeaMention 自己挂）。
@@ -1037,7 +1071,8 @@ class Outbox:
         ).fetchall()
 
     def _set(self, oid: int, *, status: str, error: str = "", result: Optional[dict] = None,
-             not_before: Optional[float] = None, moment: Optional[float] = None) -> None:
+             not_before: Optional[float] = None, payload: Optional[dict] = None,
+             moment: Optional[float] = None) -> None:
         with self._store.tx() as conn:
             fields = ["status=?", "error=?", "updated=?"]
             params: list[Any] = [status, error, float(moment) if moment is not None else clock.now()]
@@ -1047,6 +1082,9 @@ class Outbox:
             if not_before is not None:
                 fields.append("not_before=?")
                 params.append(float(not_before))
+            if payload is not None:
+                fields.append("payload=?")
+                params.append(json.dumps(payload, ensure_ascii=False))
             params.append(int(oid))
             conn.execute(f"UPDATE outbox SET {', '.join(fields)} WHERE id=?", params)
 
@@ -2014,6 +2052,42 @@ class Outbox:
                 skipped.add(oid)
                 continue
             try:
+                # 用发送前的当前时间给生产者备料，不沿用本轮 flush 开始时的旧时间戳。
+                prepare_now = clock.now()
+                try:
+                    prepared_payload = await self._prepare_send_payload(row, payload, prepare_now)
+                except Exception as exc:
+                    logger.exception("发送前备料 hook 出错（key=%s）", row["key"])
+                    raise OutboxPrepareError("发送前备料失败") from exc
+                if prepared_payload != payload:
+                    payload = prepared_payload
+                    checked_now = clock.now()
+                    self._set(oid, status="sending", payload=payload, moment=checked_now)
+                    row = _row_after(self._store, oid)
+                    # 异步渲染期间可能跨过有效期、关掉功能开关，或再次进入静默时段；
+                    # 载荷发生变化说明做过备料，此处补查发送闸，避免渲染耗时绕过原有规则。
+                    feature_reason = self._feature_drop_reason(row, payload)
+                    ttl_reason = _ttl_expired(payload, checked_now)
+                    stale_reason = self._preflight(row, payload, checked_now)
+                    drop_reason = feature_reason or ttl_reason or stale_reason
+                    if drop_reason:
+                        self._set(oid, status="dropped", error=f"作废：{drop_reason}",
+                                  moment=checked_now)
+                        self._fire_result(_row_after(self._store, oid), payload,
+                                          outcome="dropped", error=drop_reason, now=checked_now)
+                        continue
+                    if not follow_up:
+                        ok_push, reason = self._pushes.can_push(gid, gate_kind, checked_now)
+                        if not ok_push:
+                            if reason == _DROP_REASON:
+                                self._set(oid, status="dropped", error=f"作废：{reason}",
+                                          moment=checked_now)
+                                self._fire_result(_row_after(self._store, oid), payload,
+                                                  outcome="dropped", error=reason, now=checked_now)
+                                continue
+                            self._postpone(oid, gid, reason or "推送节制", checked_now,
+                                           payload=payload)
+                            continue
                 result = await self._execute(row)
             except Exception as exc:
                 err = _redact(str(exc), [])

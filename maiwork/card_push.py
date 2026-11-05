@@ -15,7 +15,7 @@
   各自的每日上限」退役，三种自制消息共用一个 daily_max（在 group_push，由 Pushes 数）。
   每群开关默认关；开开关那一刻之前的批次 / 构想不补发（since 存在 group_push 里）。
 - **发送只有发件箱一条路**：scan 建待发行；flush 只做「备料 + 入队」——卡片画好图**落盘
-  缓存**（重试用同一个文件，不重画）、提一嘴按 SOUL 写好话，然后交给 Outbox。真正的发送、
+  缓存**（实际投递跨了时段才重画，同一时段的安全重试复用新图）、提一嘴按 SOUL 写好话，然后交给 Outbox。真正的发送、
   以及发送前再查一遍（服务群 / 开关 / 睡觉时段 / 额度）都在 Outbox.flush：待发期间关掉
   开关就作废，不发陈旧的卡片 / 话。
 - 结果回写走发件箱的结果 hook（on_result）：sent 才写 sent / 备忘；超时写 uncertain
@@ -73,7 +73,7 @@ PRUNE_AGE_S = 7 * 86400.0
 _MEMO_TTL_S = 6 * 3600
 _ERR_MAX = 300
 _CARD_KINDS = ("news", "guide")
-# 卡片图落盘缓存的位置（相对 workspace_root）：发送失败重试用同一个文件，不重画
+# 卡片图落盘缓存的位置（相对 workspace_root）：发送失败重试优先复用当前时段的图片
 _IMAGE_DIR = (".web", ".push")
 # 卡片图扩展名（2026-10-15 起默认 JPEG，小 50~80%）：.jpg 优先，.png 是 Pillow 缺失时的
 # 回落与老缓存；清缓存两种都认。落盘时按内容选，不拿错内容当后缀骗人。
@@ -369,6 +369,9 @@ class CardPush:
         add_preflight = getattr(outbox, "add_preflight_hook", None)
         if callable(add_preflight):
             add_preflight(self.on_before_send)
+        add_send_prepare = getattr(outbox, "add_send_prepare_hook", None)
+        if callable(add_send_prepare):
+            add_send_prepare(self.on_prepare_send)
 
     def _cfg(self, gid: str) -> dict:
         """这个群的「往群里发」设置（group_push 那一份）。
@@ -410,6 +413,94 @@ class CardPush:
         if any(int(i) in used for i in ids):
             return "同一条资讯刚被冷场开场白发过了，不再重复发"
         return None
+
+    async def on_prepare_send(self, info: dict) -> None:
+        """按实际投递时段更新资讯卡片抬头（图片重画、文字只改首行）。
+
+        额度 / 静默时段可能把已画好的卡片推迟到另一个时段。该 hook 在 Outbox 真正
+        发送前、且已通过发送闸门后运行；只在时段标签变化时重画，载荷更新后由 Outbox
+        持久化，后续安全重试会复用这次新图。
+        """
+        info = info or {}
+        if str(info.get("push_kind") or "") != "news_card":
+            return
+        key = str(info.get("key") or "")
+        if not key.startswith("news_card:"):
+            return
+        try:
+            cid = int(key.split(":", 2)[1])
+        except (TypeError, ValueError, IndexError):
+            return
+        kind = str(info.get("kind") or "")
+        if kind not in ("image", "text"):
+            return
+        payload = info.get("payload")
+        if not isinstance(payload, dict):
+            return
+
+        dispatch_ts = clock.now()
+        dispatch_label = _slot_label(dispatch_ts)
+        if str(payload.get("rendered_slot_label") or "") == dispatch_label:
+            return
+
+        if kind == "text":
+            text = str(payload.get("text") or "")
+            lines = text.splitlines()
+            prefix = "【资讯精选 · "
+            if lines and lines[0].startswith(prefix) and lines[0].endswith("】"):
+                lines[0] = f"{prefix}{dispatch_label}】"
+                payload["text"] = "\n".join(lines)
+                payload["rendered_slot_label"] = dispatch_label
+            return
+
+        card = self._store.read().execute(
+            "SELECT batch_id, item_ids FROM news_cards WHERE id=? AND group_id=?",
+            (cid, str(info.get("group_id") or "")),
+        ).fetchone()
+        if card is None:
+            return
+        gid = str(info.get("group_id") or "")
+        items = self._items_for_card(gid, card["item_ids"])
+        if not items:
+            logger.warning("发送前找不到资讯卡片条目，沿用已缓存图片（卡片 %s）", cid)
+            return
+
+        # 复用入队时附在图片消息上的链接，避免渲染时链接状态变化。
+        attachment = str(payload.get("text") or "")
+        link = attachment[len("看全部资讯："):] if attachment.startswith("看全部资讯：") else ""
+        data = self._card_data(gid, items, int(card["batch_id"] or 0), link)
+        png: bytes = b""
+        # 若恰好在渲染期间跨过早 / 午 / 晚分界，再用新时段重画一次。
+        for attempt in range(2):
+            data["slot_ts"] = dispatch_ts
+            data["slot_label"] = dispatch_label
+            png = await self._render(data)
+            latest_ts = clock.now()
+            latest_label = _slot_label(latest_ts)
+            if latest_label == dispatch_label or attempt == 1:
+                break
+            dispatch_ts, dispatch_label = latest_ts, latest_label
+        if not png:
+            raise RuntimeError("发送前重画资讯卡片没有生成图片")
+
+        path = self._image_path(cid, bytes(png))
+        await asyncio.to_thread(self._write_cached_image, path, bytes(png))
+        payload["path"] = str(path)
+        payload["rendered_slot_label"] = dispatch_label
+
+    @staticmethod
+    def _write_cached_image(path: Path, data: bytes) -> None:
+        """原子替换发送前更新的图片缓存，避免崩溃留下半张图片。"""
+        temp_path = path.with_name(path.name + ".tmp")
+        try:
+            temp_path.write_bytes(data)
+            temp_path.replace(path)
+        except Exception:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     def _card_outbox_item_ids(self, info: dict) -> set:
         """这条待发卡片要发的 news_items.id：优先读载荷，缺了再按 key 找回 news_cards。"""
@@ -600,7 +691,7 @@ class CardPush:
     def _image_path(self, cid: int, data: bytes = b"") -> Path:
         """卡片图的落盘位置（workspace_root/.web/.push/card-<id>.jpg|.png）。
 
-        画一次就落盘：发送失败重试 / 管理员手动重发都用同一个文件，不重画（省一次起浏览器）。
+        入队图片先落盘；若真正发送时跨了时段会重画并原子替换缓存，后续同一时段的重试复用新图。
         扩展名**跟着内容走**：JPEG 魔数 → .jpg，其余 → .png（Pillow 缺失时 render_png
         回落 PNG，落盘也得是 .png）。
         """
@@ -708,6 +799,8 @@ class CardPush:
                 logger.warning("资讯卡片渲染失败，改发文字（群 %s）：%s", gid, e)
             payload: dict[str, Any] = {
                 "push_kind": "news_card",
+                # 标记缓存图 / 文字首行使用的时段；真正发送前若已跨时段再更新。
+                "rendered_slot_label": str(data.get("slot_label") or ""),
                 # 自动卡片的期限沿用现有 12 小时窗口：被睡觉时段 / 每日上限推迟过期后，
                 # 发件箱直接作废，绝不把陈旧批次发进群。
                 "expires_ts": float(row["created"]) + EXPIRE_S,
@@ -921,7 +1014,8 @@ class CardPush:
         """手动重发一张 failed / uncertain 的卡片（网页管理员接口调它）。
 
         - 只允许 failed / uncertain，别的状态抛 ValueError（网页 409）；卡片不存在抛 KeyError（404）；
-        - 有缓存图（card-<id>.jpg / .png）就用缓存，没有就重新画；画图失败退回纯文字；
+        - 有缓存图（card-<id>.jpg / .png）就先用缓存，没有就重新画；发送前按实际投递时段校正抬头；
+          画图失败退回纯文字；
         - 一张卡片**每天最多手动重发 1 次**（kv 记北京日期）；
         - 照旧走发件箱：开关 / 睡觉时段 / 每日额度都还管；有效期从这次重发重新算 12 小时
           （不然失败很久的卡片一入队就被 TTL 作废，点了等于没点）。
