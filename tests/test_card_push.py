@@ -320,7 +320,7 @@ async def test_pending_over_12h_dropped(tmp_path):
 
 async def test_shared_cap_defers_extra_card_instead_of_dropping(tmp_path):
     """一个总上限（1）：第二张卡片不丢，留到明天额度回来（还在 12 小时窗口里）再发。"""
-    store, settings, host, _p, _m, _r, cp, ob = _make(tmp_path)
+    store, settings, host, _p, _m, renderer, cp, ob = _make(tmp_path)
     evening = _ts(20, 0)
     group_push.set_config(store, GID, {"news_card_enabled": True, "daily_max": 1,
                                        "quiet_hours": "00:00-00:00"},
@@ -334,10 +334,89 @@ async def test_shared_cap_defers_extra_card_instead_of_dropping(tmp_path):
     assert [r["status"] for r in _cards(store)] == ["sent", "queued"]
     second = _boxes(store)[1]
     assert second["status"] == "pending" and float(second["not_before"]) > evening
-    # 第二天凌晨额度回来（还没过第二张的 12 小时窗口）：接着发
-    await ob.flush(_ts(0, 30, day=16))
+    # 第二天凌晨额度回来（还没过第二张的 12 小时窗口）：后台先刷新跨时段图片，
+    # Outbox 只发送刷新后的载荷，不在 sending 阶段启动浏览器。
+    morning = _ts(0, 30, day=16)
+    assert cp.has_due(GID, morning)
+    await cp.flush(GID, morning)
+    expected_label = card_push._slot_label(morning)
+    assert renderer.calls[-1]["slot_label"] == expected_label
+    refreshed_payload = json.loads(_boxes(store)[1]["payload"])
+    assert refreshed_payload["rendered_slot_label"] == expected_label
+    assert len(host.images) == 1
+    await ob.flush(morning)
     assert len(host.images) == 2
     assert [r["status"] for r in _cards(store)] == ["sent", "sent"]
+
+
+async def test_queued_image_refresh_failure_falls_back_to_current_slot_text(tmp_path):
+    store, settings, host, _p, _m, renderer, cp, ob = _make(tmp_path)
+    evening = _ts(20, 0)
+    group_push.set_config(
+        store, GID,
+        {"news_card_enabled": True, "daily_max": 3, "quiet_hours": "00:00-00:00"},
+        settings, now=evening - 3600,
+    )
+    _batch(store, created=evening)
+    cp.scan(GID, evening)
+    await cp.flush(GID, evening + 1)
+    assert _boxes(store)[0]["kind"] == "image"
+
+    renderer.error = RenderError("Chromium 不可用")
+    morning = _ts(0, 30, day=16)
+    await cp.flush(GID, morning)
+
+    box = _boxes(store)[0]
+    payload = json.loads(box["payload"])
+    expected_label = card_push._slot_label(morning)
+    assert box["kind"] == "text" and box["status"] == "pending"
+    assert payload["rendered_slot_label"] == expected_label
+    assert payload["text"].startswith(f"【资讯精选 · {expected_label}】")
+    await ob.flush(morning)
+    assert len(host.texts) == 1 and host.images == []
+    assert host.texts[0]["text"].startswith(f"【资讯精选 · {expected_label}】")
+    assert _cards(store)[0]["status"] == "sent"
+
+
+async def test_card_created_exactly_12_hours_ago_remains_sendable(tmp_path):
+    store, settings, host, _p, _m, _r, cp, ob = _make(tmp_path)
+    created = NOON
+    expires_at = created + card_push.EXPIRE_S
+    group_push.set_config(
+        store, GID,
+        {"news_card_enabled": True, "daily_max": 3, "quiet_hours": "00:00-00:00"},
+        settings, now=created - 3600,
+    )
+    _batch(store, created=created)
+    cp.scan(GID, created)
+
+    await cp.flush(GID, expires_at)
+    assert _cards(store)[0]["status"] == "queued"
+    await ob.flush(expires_at)
+
+    assert len(host.images) == 1
+    assert _cards(store)[0]["status"] == "sent"
+
+
+async def test_render_crossing_two_slot_boundaries_uses_current_text_label(tmp_path, monkeypatch):
+    _store, _settings, _host, _pushes, _mentions, renderer, cp, _ob = _make(tmp_path)
+    morning = _ts(10, 59)
+    noon = _ts(11, 1)
+    afternoon = _ts(13, 1)
+    assert len({card_push._slot_label(t) for t in (morning, noon, afternoon)}) == 3
+    moments = iter((noon, afternoon))
+    monkeypatch.setattr(card_push.clock, "now", lambda: next(moments))
+    data = {"slot_ts": morning, "slot_label": card_push._slot_label(morning), "items": []}
+
+    image, label, finished_at = await cp._render_for_slot(
+        data, morning, follow_clock=True,
+    )
+
+    expected = card_push._slot_label(afternoon)
+    assert renderer.calls and len(renderer.calls) == 2
+    assert image == b"" and finished_at == afternoon
+    assert label == expected and data["slot_label"] == expected
+    assert cp._text_fallback(data).startswith(f"【资讯精选 · {expected}】")
 
 
 async def test_queued_card_past_window_dropped_instead_of_sent_next_day(tmp_path):

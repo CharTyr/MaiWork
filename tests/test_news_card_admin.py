@@ -73,12 +73,13 @@ class Renderer:
     def __init__(self) -> None:
         self.calls: list[dict] = []
         self.error: Exception | None = None
+        self.data = JPEG
 
     async def __call__(self, data):
         self.calls.append(data)
         if self.error is not None:
             raise self.error
-        return JPEG
+        return self.data
 
 
 def _make(tmp_path, *, groups=(GID, OTHER)):
@@ -170,28 +171,58 @@ def _boxes(store):
 # ---------------------------------------------------------------- resend 数据层
 
 
-async def test_resend_uses_cached_jpeg(tmp_path):
+async def test_resend_uses_cached_jpeg_when_slot_matches(tmp_path):
     store, _, host, *_r, cp, ob = _make(tmp_path)
     _enable(store)
     _, ids = _batch(store)
     cid = _card(store, item_ids=ids)
-    _box(store, cid)
     cache = cp._image_path(cid, JPEG)
     cache.write_bytes(JPEG)
+    _box(store, cid, payload={
+        "push_kind": "news_card", "path": str(cache),
+        "rendered_slot_label": card_push._slot_label(NOON),
+    })
 
     out = await cp.resend(cid, now=NOON)
 
     assert out["ok"] is True and out["used_cache"] is True and out["mode"] == "image"
     assert out["card_id"] == cid and out["group_id"] == GID
+    assert cp._render.calls == []
     assert _cards(store)[0]["status"] == "queued"
     box = _boxes(store)[0]
     assert box["status"] == "pending" and int(box["attempts"]) == 3
     payload = json.loads(box["payload"])
     assert str(payload["path"]).endswith(f"card-{cid}.jpg")
     assert payload["push_kind"] == "news_card" and float(payload["expires_ts"]) > NOON
-    # 真发出去
-    await ob.flush(NOON + 1)
+    assert payload["rendered_slot_label"] == card_push._slot_label(NOON)
+    await ob.flush(NOON)
     assert len(host.images) == 1 and host.images[0]["data"] == JPEG
+    assert _cards(store)[0]["status"] == "sent"
+
+
+async def test_resend_rerenders_cached_image_with_unknown_slot(tmp_path):
+    store, _, host, *_r, cp, ob = _make(tmp_path)
+    _enable(store)
+    _, ids = _batch(store)
+    cid = _card(store, item_ids=ids)
+    old_cache = cp._image_path(cid, JPEG)
+    old_cache.write_bytes(JPEG)
+    _box(store, cid, payload={"push_kind": "news_card", "path": str(old_cache)})
+    png = b"\x89PNG\r\n\x1a\nnew-card-bytes"
+    cp._render.data = png
+
+    out = await cp.resend(cid, now=NOON)
+
+    assert out["used_cache"] is False and out["mode"] == "image"
+    assert len(cp._render.calls) == 1
+    payload = json.loads(_boxes(store)[0]["payload"])
+    new_cache = Path(payload["path"])
+    assert new_cache.suffix == ".png" and new_cache.is_file()
+    assert not old_cache.exists()
+    assert payload["rendered_slot_label"] == card_push._slot_label(NOON)
+    # 无需后台 CardPush.flush 解锁 pending，resend 已经生成当前时段图片。
+    await ob.flush(NOON)
+    assert len(host.images) == 1 and host.images[0]["data"] == png
     assert _cards(store)[0]["status"] == "sent"
 
 
@@ -389,10 +420,14 @@ def _app_card(env: SimpleEnv, *, status="failed", error="图发不出去") -> in
     """往真 app 的库里插一张卡片（连带一张失败的 outbox 行 + 缓存图，避开真浏览器）。"""
     store = env.app.store
     cid = _card(store, status=status, error=error)
-    _box(store, cid, status=status)
     cp = env.app.card_push
     assert cp is not None, "app 里没建起 card_push"
-    cp._image_path(cid, JPEG).write_bytes(JPEG)
+    path = cp._image_path(cid, JPEG)
+    path.write_bytes(JPEG)
+    _box(store, cid, status=status, payload={
+        "push_kind": "news_card", "path": str(path),
+        "rendered_slot_label": card_push._slot_label(card_push.clock.now()),
+    })
     return cid
 
 
