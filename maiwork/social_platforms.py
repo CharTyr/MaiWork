@@ -17,7 +17,6 @@ import logging
 import os
 from pathlib import Path
 import re
-import shlex
 import signal
 import sys
 import tempfile
@@ -274,11 +273,6 @@ def _platform(platform_id: Any) -> Platform:
     if not p:
         raise SocialPlatformError("不支持这个社交平台")
     return p
-
-
-def cmd_line(argv: list) -> str:
-    """For public argument display only. Credentials never enter search argv."""
-    return shlex.join([str(a) for a in argv])
 
 
 def managed_root(store: Any, platform_id: str) -> Path:

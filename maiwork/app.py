@@ -956,7 +956,6 @@ class MaiWorkApp:
         host, port = settings.console.listen
         await self.console.start(host, port)
         self._listen = settings.console.listen
-        self._console_auth_ensured = True
         # 7. 后台循环
         self._task = asyncio.create_task(self._loop(), name="maiwork-loop")
         logger.info("MaiWork 已启动：%d 个服务群，数据目录 %s", len(settings.groups), settings.data_dir)
@@ -1986,16 +1985,43 @@ class MaiWorkApp:
             logger.exception("挂自动审核回调出错，派活自动审核这次不生效")
 
     def _spawn_auto_review(self, request_id: str, group_id: str) -> None:
-        """Approvals.create 落了 pending 之后的回调：后台审一次 + 判一次目标贴合（失败只记日志）。"""
+        """Approvals.create 落了 pending 之后的回调：后台审一次 + 判一次目标贴合（失败只记日志）。
+
+        自动审核没就位或拿不准（review 返回 None）时，同一个后台协程补发一条
+        「已记下、等管理员批准」的群回执——不然群友 @ 了机器人什么动静都没有。"""
         rid = str(request_id or "")
         if not rid:
             return
-        reviewer = self.auto_review
-        if reviewer is not None:
-            self._spawn_bg(reviewer.review(rid, group_id=str(group_id or "")), name=f"maiwork-review-{rid}")
+        if self.auto_review is not None or self.outbox is not None:
+            self._spawn_bg(self._review_and_ack_pending(rid, str(group_id or "")), name=f"maiwork-review-{rid}")
         judge = self.goal_fit
         if judge is not None:
             self._spawn_bg(judge.judge(rid), name=f"maiwork-goalfit-{rid}")
+
+    async def _review_and_ack_pending(self, rid: str, gid: str) -> None:
+        """先让自动审核跑一次；它没批（None）且请求仍待批时，发一条「已记下等批准」回执。
+
+        只回执**来自群消息、没标来源**的请求（群友 @ 派活）：/mw do 自己有指令回执、
+        MaiWork 自己提的目标（source='maiwork'）不嚷嚷，都不发这条。"""
+        if self.auto_review is not None:
+            res = await self.auto_review.review(rid, group_id=gid)
+            if res is not None:
+                return
+        if self.outbox is not None and self.store is not None:
+            row = self.store.read().execute("SELECT * FROM requests WHERE id=?", (rid,)).fetchone()
+            if row is not None and str(row["status"] or "") == "pending" and not str(row["source"] or "").strip() \
+                    and str(row["message_id"] or "").strip() and str(row["via"] or "") != "群里 /mw do 指令":
+                self.outbox.enqueue(
+                    f"request-ack:{rid}",
+                    str(row["group_id"] or gid),
+                    "text",
+                    {
+                        "text": f"收到，已记下请求 {rid}「{str(row['title'] or '')[:20]}」，等管理员批准后开工（管理员可发 /mw 批准 {rid}）。",
+                        "push_kind": "command",
+                        "at_user": str(row["requester_id"] or ""),
+                        "reply_to": str(row["message_id"] or ""),
+                    },
+                )
 
     def _make_identity(self) -> Any:
         """identity.py（身份与工作记忆）；没就位 / 构造失败就 None，各注入点自动跳过。"""
@@ -2269,26 +2295,6 @@ class MaiWorkApp:
                 self.feeds._verify_runner = self._make_verify_runner()  # noqa: SLF001
             except Exception:
                 logger.exception("换资讯实测 runner 出错")
-
-    def _make_railway(self) -> Any:
-        """（老名字，railway 专用）保留给老调用 / 测试替身：建 railway 那一家。"""
-        factory = self.railway_factory
-        if factory is None:
-            return self._make_vm_envs().get("railway")
-        settings = self.get_settings()
-        try:
-            env = factory(self.get_settings, settings.data_dir, store=self.store)
-        except Exception:
-            logger.exception("建 RailwayEnv 出错，一次性 VM 实测这次跳过")
-            return None
-        try:
-            from .tools_railway import register_vm_tools
-
-            register_vm_tools(self.tools, get_box=lambda: getattr(env, "current_box", None), env=env)
-        except Exception:
-            logger.exception("注册 vm 工具出错，一次性 VM 实测这次跳过")
-            return None
-        return env
 
     def _make_ssh(self) -> Any:
         """专用 SSH 机器执行环境 + machine_* 工具；建不起来 → None（派活就只剩本机 / 一次性 VM）。"""
@@ -3429,6 +3435,20 @@ class MaiWorkApp:
         counts = self.store.prune(now)
         with self.store.tx() as conn:
             self.store.kv_set(conn, "prune.last_day", today)
+        # 退出服务的群照样按时间清（只按 ts 删、不读内容）：14 天群聊副本 + 去重账本、
+        # 关注成员发言留存、机器人发言索引——群退了之后按群清理再也不跑，靠这里兜底。
+        try:
+            from .chatlog import prune_expired as _prune_chatlog
+
+            counts["chat_log"] = _prune_chatlog(self.store, now=now)
+        except Exception:
+            logger.exception("chat_log 过期清理出错")
+        try:
+            from .profile import prune_expired_messages as _prune_focus_msgs
+
+            counts.update(_prune_focus_msgs(self.store, now=now))
+        except Exception:
+            logger.exception("关注成员 / 机器人发言过期清理出错")
         # 卡片图缓存（card_push）：只删 7 天前就已发完 / 失败 / 作废的那一份 card-<id>.png
         removed = 0
         try:
@@ -3505,8 +3525,10 @@ class MaiWorkApp:
                 continue
             by_group.setdefault(gid0, []).append(r)
         for gid, items in by_group.items():
-            titles = "、".join(f"「{str(r.get('title') or '')[:16]}」" for r in items[:3])
-            text = f"有 {len(items)} 件事等管理员批准：{titles}。在群里发 /mw 批准 ID，或到网页上处理"
+            titles = "、".join(f"{r.get('id')}「{str(r.get('title') or '')[:16]}」" for r in items[:3])
+            first_id = str(items[0].get("id") or "ID")
+            cmd_hint = f"/mw 批准 {first_id}" if len(items) == 1 else f"/mw 批准 {first_id}（或对应编号）"
+            text = f"有 {len(items)} 件事等管理员批准：{titles}。在群里发 {cmd_hint}，或到网页上处理"
             self.outbox.enqueue(
                 f"approval-remind:{gid}:{clock.day_key(now)}",
                 gid,

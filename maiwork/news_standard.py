@@ -84,5 +84,3 @@ def for_scoring() -> str:
     return _join(_read("criteria"), _read("scoring"))
 
 
-def clear_cache() -> None:
-    _cache.clear()

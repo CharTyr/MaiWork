@@ -4,9 +4,10 @@ import { esc, tip, toast, when } from "../util.js";
 import { api } from "../api.js";
 import { loading } from "./news.js";
 
-const PUSH_KEYS = ["topics_enabled", "news_card_enabled", "news_card_count", "idea_mention_enabled", "daily_max", "quiet_hours"];
+const PUSH_KEYS = ["topics_enabled", "news_card_enabled", "news_card_count", "idea_mention_enabled", "personal_mention_enabled", "daily_max", "quiet_hours"];
+const PUSH_TOGGLE_KEYS = ["topics_enabled", "news_card_enabled", "idea_mention_enabled", "personal_mention_enabled"];
 const FEATURE_KEYS = ["news", "idea", "task"];
-const BOOLS = new Set(["topics_enabled", "news_card_enabled", "idea_mention_enabled", "required", "news", "idea", "task"]);
+const BOOLS = new Set(["topics_enabled", "news_card_enabled", "idea_mention_enabled", "personal_mention_enabled", "required", "news", "idea", "task"]);
 const NUMBERS = new Set(["news_card_count", "daily_max"]);
 const role = () => (state.me && state.me.role) || "none";
 const current = c => !!c && state.g === c.gid && role() === c.role && gadmin();
@@ -82,12 +83,13 @@ function pushHTML(c) {
   html += switchRow(c, "topics_enabled", "开启话题", "群聊冷场时发送一句开场白，后续对话由 MaiBot 接续。", src.topics_enabled, toggleAct);
   html += switchRow(c, "news_card_enabled", "资讯卡片", "选取优质资讯制作成图片发送到群内；已配置公开网址时附带本群链接。", src.news_card_enabled, toggleAct);
   html += switchRow(c, "idea_mention_enabled", "构想提及", "在群内简短提及构想；个人构想仅 @ 本人，不涉及画像内容。", src.idea_mention_enabled, toggleAct);
+  html += switchRow(c, "personal_mention_enabled", "个人资讯顺口提", "关注成员本人在群内聊起相关话题时，将近期匹配的个人向资讯放入 MaiBot 备忘自然带一句（不占主动发送额度，严格脱敏且不透露画像）。", !!src.personal_mention_enabled, toggleAct);
   html += `</div>`;
   if (editing) {
     const d = c.draft;
     html += `<div class="login">
       <label for="gctl-news_card_count">每张卡片条数</label><select id="gctl-news_card_count" data-gctl="news_card_count" ${fieldErrorAttrs(c, "news_card_count")}>${[1, 2, 3].map(n => `<option value="${n}" ${n === Number(d.news_card_count) ? "selected" : ""}>${n} 条</option>`).join("")}</select>
-      <div class="lbl-row"><label for="gctl-daily_max">每日上限</label>${tip(`<span id="gctl-cap-help">以上三种内容合计；0 表示不限制（不建议）。</span>`)}</div><input id="gctl-daily_max" data-gctl="daily_max" type="number" min="0" max="24" step="1" value="${esc(d.daily_max)}" ${fieldErrorAttrs(c, "daily_max", "gctl-cap-help")} />
+      <div class="lbl-row"><label for="gctl-daily_max">每日上限</label>${tip(`<span id="gctl-cap-help">开启话题、资讯卡片、构想提及三种主动发送合计；0 表示不限制（不建议）。</span>`)}</div><input id="gctl-daily_max" data-gctl="daily_max" type="number" min="0" max="24" step="1" value="${esc(d.daily_max)}" ${fieldErrorAttrs(c, "daily_max", "gctl-cap-help")} />
       <div class="lbl-row"><label for="gctl-quiet_hours">免打扰时段</label>${tip(`<span id="gctl-quiet-help">该时段内不主动发送，格式如 23:00-08:00。</span>`)}</div><input id="gctl-quiet_hours" data-gctl="quiet_hours" value="${esc(d.quiet_hours)}" placeholder="23:00-08:00" ${fieldErrorAttrs(c, "quiet_hours", "gctl-quiet-help")} />
       ${errorHTML(c)}
     </div>`;
@@ -178,7 +180,7 @@ export async function actControls(action, el) {
   if (action === "gctl-feature-toggle" || action === "gctl-push-toggle") {
     const isFeat = action === "gctl-feature-toggle";
     const key = el.dataset.key;
-    const allowed = isFeat ? FEATURE_KEYS : ["topics_enabled", "news_card_enabled", "idea_mention_enabled"];
+    const allowed = isFeat ? FEATURE_KEYS : PUSH_TOGGLE_KEYS;
     if (!allowed.includes(key)) return true;
     if (!isFeat && c.edit === "push") { readDraft(c); return true; }
     const prevObj = isFeat ? c.features : c.push.config;
@@ -191,7 +193,7 @@ export async function actControls(action, el) {
     try {
       const body = isFeat
         ? Object.fromEntries(FEATURE_KEYS.map(k => [k, !!c.features[k]]))
-        : Object.fromEntries(PUSH_KEYS.map(k => [k, c.push.config[k]]));
+        : Object.fromEntries(PUSH_KEYS.map(k => [k, BOOLS.has(k) ? !!c.push.config[k] : c.push.config[k]]));
       const result = await api("PUT", `/api/groups/${encodeURIComponent(c.gid)}/${isFeat ? "features" : "push"}`, body);
       if (!current(c) || state.groupControls !== c) return true;
       if (isFeat) c.features = result;
@@ -216,7 +218,7 @@ export async function actControls(action, el) {
     c.edit = kind;
     c.error = "";
     c.errorField = "";
-    c.draft = kind === "push" ? Object.fromEntries(PUSH_KEYS.map(k => [k, c.push.config[k]])) : kind === "features" ? Object.fromEntries(FEATURE_KEYS.map(k => [k, !!c.features[k]])) : {
+    c.draft = kind === "push" ? Object.fromEntries(PUSH_KEYS.map(k => [k, BOOLS.has(k) ? !!c.push.config[k] : c.push.config[k]])) : kind === "features" ? Object.fromEntries(FEATURE_KEYS.map(k => [k, !!c.features[k]])) : {
       approvers: c.approval.approvers.join("\n"), exempt_users: c.approval.exempt_users.join("\n"), required: !!c.approval.required && !c.approval.exempt_group,
     };
     repaintControls();

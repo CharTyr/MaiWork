@@ -78,6 +78,28 @@ _USUAL_DAYS = 21
 # usual_gap：有数据的天数低于这个数就认为样本不足
 _USUAL_MIN_SAMPLES = 5
 
+
+def prune_expired_messages(store: Any, *, now: float) -> dict[str, int]:
+    """focus_messages（14 天）/ bot_messages（7 天）按时间清全部群；返回各表删了几条。
+
+    只按 ts 删、不读内容、不按群过滤——服务群本来就在 tick 里按群清，这里由每日
+    _prune_round 兜住「群退出服务后按群清理再也不跑」的洞。
+    """
+    out: dict[str, int] = {}
+    with store.tx() as conn:
+        cur = conn.execute(
+            "DELETE FROM focus_messages WHERE ts<?",
+            (float(now) - _FOCUS_MSG_KEEP_SECONDS,),
+        )
+        out["focus_messages"] = int(cur.rowcount or 0)
+        cur = conn.execute(
+            "DELETE FROM bot_messages WHERE ts<?",
+            (float(now) - _BOT_MSG_KEEP_SECONDS,),
+        )
+        out["bot_messages"] = int(cur.rowcount or 0)
+    return out
+
+
 _SKIP_NOT_SERVED = "不是服务群"
 _SKIP_NO_SESSION = "拿不到会话 ID"
 _SKIP_THROTTLED = "距上次读取不足读消息间隔"
@@ -207,7 +229,6 @@ class Profiles:
         且 pending ≥ 5；或首次（profile_ready_ts==0 且 pending>0）。
         消息不在库里存原文，提炼前从 host 重新读 [last_refresh（首次用 read_since）, cursor_ts]。
         """
-        settings = self._get_settings()
         if not self._models.settings().ready():
             return False
         gid = str(group_id)
@@ -388,7 +409,8 @@ class Profiles:
             # 读群发现的请求（docs/02 §3.1/§5.1）：结论和游标同一个事务落库——游标推进了，
             # 结论一定也在；落地（建请求 / 提醒）放到事务之后，失败留在 pending_asks 里重试。
             decided = self._record_asks(conn, gid, batch_msgs, asks)
-            self._finish_batch_tx(conn, gid, batch_msgs, now, op_counts)
+            cap_counts = self._enforce_caps(conn, gid, now)
+            self._finish_batch_tx(conn, gid, batch_msgs, now, op_counts, cap_counts)
         if changed or sum(op_counts.values()):
             self._write_profile_md(gid)
         for mid in decided:
@@ -401,6 +423,13 @@ class Profiles:
 
     # add 和已有/墓碑文字相似度达到这个值就算同一条（已有的变 touch、墓碑的不许加回）
     _SIM_THRESHOLD = 0.85
+    # 每类条目上限（用户 2026-11-07 定）：代码执行，不靠模型自觉——原来规则只写
+    # 「每类约 8 条」，结果模型只加不删，「最近在聊」每群堆到 650+ 条、提示词越滚越大。
+    # 超出上限按 last_ts 从旧到新软删（deleted=2，可恢复）；锁定条目永不自动删。
+    _CATEGORY_CAPS = {"recent": 12, "interest": 15, "ongoing": 15, "resource": 15, "convention": 20}
+    # 「最近在聊」超过这个时长没再被聊到（last_ts）就软删：短期话题看 chat_log 就行，
+    # 画像里不堆流水账。锁定的不许愿过期。其它类别不设过期。
+    _RECENT_EXPIRE_SECONDS = 7 * 86400
     # 条目最多保留的证据消息数
     _EVIDENCE_MAX = 20
     # 单条文本一句话上限（字）；超了截断（不拒整条，模型啰嗦不至于废掉整批）
@@ -592,6 +621,58 @@ class Profiles:
                 ids = evidence_ids(op)
                 do_touch(eid, ids, len(ids))
         return counts
+
+    def _enforce_caps(self, conn, gid: str, now: float) -> dict:
+        """执行「最近在聊」过期和每类上限（在调用方事务里）。返回 {"expire": n, "overcap": n}。
+
+        - recent 且没锁定的条目 last_ts 距今 ≥ _RECENT_EXPIRE_SECONDS → 软删（expire）；
+        - 之后每类仍超 _CATEGORY_CAPS → 没锁定的按 last_ts 从旧到新软删（overcap）。
+        全部打 deleted=2（和模型 remove 同标记：可恢复，同文字之后照样能再加回；
+        管理员墓碑 deleted=1 不受影响）。锁定条目永不自动删；一类里锁定数本身
+        超过上限时全部保留、没锁定的先删完为止。
+        """
+        rows = conn.execute(
+            "SELECT id, category, locked, last_ts FROM profile_entries"
+            " WHERE group_id=? AND deleted=0",
+            (gid,),
+        ).fetchall()
+
+        def soft_delete(entry_id: int) -> None:
+            conn.execute(
+                "UPDATE profile_entries SET deleted=2, updated=? WHERE id=?",
+                (now, int(entry_id)),
+            )
+
+        out = {"expire": 0, "overcap": 0}
+        expired: set[int] = set()
+        for r in rows:
+            if (
+                str(r["category"]) == "recent"
+                and not int(r["locked"])
+                and now - float(r["last_ts"] or 0) >= self._RECENT_EXPIRE_SECONDS
+            ):
+                expired.add(int(r["id"]))
+        for eid in expired:
+            soft_delete(eid)
+        out["expire"] = len(expired)
+
+        by_cat: dict[str, list] = {}
+        for r in rows:
+            if int(r["id"]) in expired:
+                continue
+            by_cat.setdefault(str(r["category"]), []).append(r)
+        for cat, items in by_cat.items():
+            cap = int(self._CATEGORY_CAPS.get(cat) or 0)
+            if cap <= 0 or len(items) <= cap:
+                continue
+            unlocked = sorted(
+                (r for r in items if not int(r["locked"])),
+                key=lambda r: float(r["last_ts"] or 0),
+            )
+            for r in unlocked[: len(items) - cap]:
+                soft_delete(int(r["id"]))
+                out["overcap"] += 1
+        return out
 
     def _apply_people(self, conn, gid: str, people: list, now: float) -> bool:
         """people 只写当前关注成员（且 removed=0）；note 截 120 字；名单外的忽略。
@@ -910,7 +991,6 @@ class Profiles:
         只带当前未删除条目，不许加新的：ops 里只保留 update/remove。
         失败不推进 last_weekly_ts（下次还可以补整）。
         """
-        settings = self._get_settings()
         if not self._models.settings().ready():
             return False
         if not self._weekly_due(gid, now):
@@ -973,6 +1053,7 @@ class Profiles:
                 if kept_ops
                 else {"add": 0, "update": 0, "remove": 0, "touch": 0}
             )
+            cap_counts = self._enforce_caps(tx_conn, gid, now)
             tx_conn.execute(
                 "UPDATE groups SET last_weekly_ts=? WHERE group_id=?", (now2, gid)
             )
@@ -981,7 +1062,10 @@ class Profiles:
                 "profile.weekly",
                 group_id=gid,
                 entity="profile",
-                payload={"update": counts.get("update", 0), "remove": counts.get("remove", 0)},
+                payload={
+                    "update": counts.get("update", 0), "remove": counts.get("remove", 0),
+                    "expire": cap_counts.get("expire", 0), "overcap": cap_counts.get("overcap", 0),
+                },
             )
         if counts.get("update") or counts.get("remove"):
             self._write_profile_md(gid)
@@ -1063,10 +1147,12 @@ class Profiles:
         return False
 
     def _finish_batch_tx(
-        self, conn, gid: str, batch_msgs: list, now: float, op_counts: dict
+        self, conn, gid: str, batch_msgs: list, now: float, op_counts: dict,
+        cap_counts: dict | None = None,
     ) -> None:
         """整批成功的收账（在调用方事务里）：pending 清空、last_refresh 推到本批最后消息、
-        首次写 profile_ready、fail_count 清零、记 profile.refresh 事件（各类 op 计数）。"""
+        首次写 profile_ready、fail_count 清零、记 profile.refresh 事件（各类 op 计数 +
+        上限/过期软删计数）。"""
         last_ts = float(batch_msgs[-1].ts)
         conn.execute(
             "UPDATE groups SET pending_count=0, fail_count=0,"
@@ -1075,26 +1161,28 @@ class Profiles:
             " WHERE group_id=?",
             (last_ts, now, gid),
         )
+        payload = dict(op_counts)
+        if cap_counts:
+            payload.update(cap_counts)
         self._store.event(
             conn,
             "profile.refresh",
             group_id=gid,
             entity="profile",
-            payload=dict(op_counts),
+            payload=payload,
         )
 
     # -- 提示词 --
 
-    _PROMPT_SYSTEM = (
-        "你在为 MaiWork（QQ 群的后台助手）维护一个群的画像。你的任务：读一段群聊记录，"
-        "更新这个群的画像条目和关注成员注记。按要求的「一行一件事」格式输出，不要写别的话。"
-    )
-
+    # 提示词拆两段：system = 身份 + 全部规则（每次调用一字不变，缓存能整段命中）；
+    # user = 当前条目 / 墓碑 / 关注成员 / 这批消息（每次都变）。
     _PROMPT_RULES = (
         "规则：\n"
         "1. 只记群「整体」的话题、兴趣、在做的事、约定术语、常用资源这五类；"
         "不记某个人的隐私（手机号、住址、感情私事、不愿公开的个人信息等）。\n"
-        "2. 每条一句话，不超过 40 字；每类最多约 8 条。\n"
+        "2. 每条一句话，不超过 40 字；每类有条数上限（最近在聊 12、长期兴趣 / 在做的事 / "
+        "常用资源各 15、约定和说法 20），超了程序会删最旧的——优先修改 / 合并已有条目，"
+        "别新增近义条目凑数。\n"
         "3. 这批消息没有带来新变化就不动，只输出一行「没有变化」。\n"
         "4. 锁定的条目不能改、不能删。\n"
         "5. 管理员删除过的条目（墓碑）不许再加回来（换个说法也不行）。\n"
@@ -1130,11 +1218,18 @@ class Profiles:
         "这批消息没有任何新变化，就只输出一行：没有变化"
     )
 
+    _PROMPT_SYSTEM = (
+        "你在为 MaiWork（QQ 群的后台助手）维护一个群的画像。你的任务：读一段群聊记录，"
+        "更新这个群的画像条目和关注成员注记。按要求的「一行一件事」格式输出，不要写别的话。"
+        "\n\n" + _PROMPT_RULES
+    )
+
     def _build_prompt(self, gid: str, batch_msgs: list, *, notices=()) -> list:
         """拼 system + user：当前条目 / 墓碑 / 关注成员（仅 personal_profile 开时）/ 消息。
 
         条目和注记给模型看的都是入库原文（{@QQ号} token 保留），末尾带一行
         「条目里提到的人」对照表；消息行的说话人写「名字（QQ 号）」给模型对照着写 token。
+        规则在 _PROMPT_SYSTEM（固定前缀，缓存命中），这里只拼动态内容。
         """
         settings = self._get_settings()
         conn = self._store.read()
@@ -1214,7 +1309,6 @@ class Profiles:
                 pending_ask_ids.discard(str(m.id))
             lines.append(f"[{i}] {hhmm} {name}: {text}{flag}")
         parts.append("这批消息：\n" + "\n".join(lines))
-        parts.append(self._PROMPT_RULES)
         return [
             {"role": "system", "content": self._PROMPT_SYSTEM},
             {"role": "user", "content": "\n\n".join(parts)},
@@ -1760,6 +1854,35 @@ class Profiles:
             out.append(d)
         return out
 
+    # 主模型提示词拿画像的类别优先级：entries() 按 category 字母序排，
+    # convention 多的群取前 20 条全是约定，兴趣和在做的事永远轮不到（线上实测：
+    # 两群约定 85 / 169 条、兴趣只有 1 / 6 条）。
+    _PROMPT_CATEGORY_ORDER = ("ongoing", "interest", "recent", "resource", "convention")
+
+    def entries_for_prompt(self, group_id: str, limit: int = 20) -> list[dict]:
+        """给主模型提示词用的画像条目：各类按 _PROMPT_CATEGORY_ORDER 轮流取
+        （各自内部新的先来），凑够 limit 或取完为止；返回和 entries() 同形状的 dict。"""
+        by_cat: dict[str, list[dict]] = {}
+        for e in self.entries(group_id):
+            by_cat.setdefault(str(e.get("category") or ""), []).append(e)
+        order = list(self._PROMPT_CATEGORY_ORDER) + sorted(
+            c for c in by_cat if c not in self._PROMPT_CATEGORY_ORDER
+        )
+        queues = [by_cat.get(c, []) for c in order]
+        limit = max(0, int(limit))
+        picked: list[dict] = []
+        while len(picked) < limit:
+            progressed = False
+            for q in queues:
+                if len(picked) >= limit:
+                    break
+                if q:
+                    picked.append(q.pop(0))
+                    progressed = True
+            if not progressed:
+                break
+        return picked
+
     def add_entry(self, group_id: str, category: str, text: str) -> int:
         """管理员新增条目：source=admin、locked=1；类别必须是五类之一。"""
         gid = str(group_id)
@@ -1787,6 +1910,8 @@ class Profiles:
                 entity_id=str(entry_id),
                 payload={"category": category, "text": text},
             )
+            # 管理员条目是锁定的、必留；加完把这类的总量收回上限（挤掉最旧的没锁条目）
+            self._enforce_caps(conn, gid, now)
         return entry_id
 
     def edit_entry(

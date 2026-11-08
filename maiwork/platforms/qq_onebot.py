@@ -47,7 +47,6 @@ CAPABILITY_KEYS = (
 # 适配器 api 名（文档 docs/06 末尾名单；旧版没有这些 → 能力全关）
 API_GET_ROOT_FILES = "adapter.napcat.file.get_group_root_files"
 API_GET_FILES_BY_FOLDER = "adapter.napcat.file.get_group_files_by_folder"
-API_GET_FILE_SYSTEM_INFO = "adapter.napcat.file.get_group_file_system_info"
 API_CREATE_FOLDER = "adapter.napcat.file.create_group_file_folder"
 API_DELETE_FILE = "adapter.napcat.file.delete_group_file"
 API_DELETE_FOLDER = "adapter.napcat.file.delete_group_folder"
@@ -55,11 +54,8 @@ API_RENAME_FILE = "adapter.napcat.file.rename_group_file"
 API_MOVE_FILE = "adapter.napcat.file.move_group_file"
 API_GET_NOTICES = "adapter.napcat.group.get_group_notice"
 API_SEND_NOTICE = "adapter.napcat.group.send_group_notice"
-API_DELETE_NOTICE = "adapter.napcat.group.delete_group_notice"
 API_ALBUM_LIST = "adapter.napcat.file.get_qun_album_list"
-API_ALBUM_MEDIA_LIST = "adapter.napcat.file.get_group_album_media_list"
 API_ALBUM_UPLOAD = "adapter.napcat.file.upload_image_to_qun_album"
-API_ALBUM_DEL_MEDIA = "adapter.napcat.file.del_group_album_media"
 
 # 〔待实测〕api.call 的 args 参数名：按 NapCat/OneBot 通行写法（snake_case，
 # 群号/文件 ID/文件夹 ID 都是字符串，文件夹用 folder_id、根目录省略或给 "/"）。
@@ -71,7 +67,6 @@ ARG_FOLDER = "folder"       # 部分 NapCat 版本列目录用 "folder" 而不�
 ARG_NAME = "name"
 ARG_CONTENT = "content"
 ARG_ALBUM_ID = "album_id"
-ARG_PATH = "path"
 ARG_IMAGE = "image"         # upload_image_to_qun_album 的图片参数名也可能是 "file"〔待实测〕
 
 _ROLE_ADMIN_SET = ("owner", "admin")
@@ -141,7 +136,6 @@ class GroupSpace:
     # ------------------------------------------------------------------
 
     def _caps_with(self, group_id: str, role: str) -> dict[str, bool]:
-        gid = str(group_id)
         apis = self._apis
         admin = role in _ROLE_ADMIN_SET
         return {

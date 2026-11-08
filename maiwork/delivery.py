@@ -5,7 +5,10 @@
   inject(kwargs) 往 maisaka.planner.before_request 的 items 里追加。
 - TopicMatcher：群友自己聊起某个话题时，用最近几条群消息去对资讯/构想的关键词
   （docs/02 §4.1「群友自己聊起时接得上」）。纯代码匹配，不调模型、不做网络，
-  候选每群一份缓存 60 秒，钩子里不做重查询。
+  候选每群一份缓存 60 秒，钩子里不做重查询。构想带核验过的预览（kv
+  idea.preview.<id>）时，接龙行递「顺手查到的实情」+ 出处；personal_mention_enabled
+  开着的群里，关注成员本人说起命中其个人向资讯关键词的事时，最多再递 1 行
+  「你最近看到过这条」（隐私闸 + 24h 2 次 / 30 分钟冷却，见 personal_news_entry）。
 - Pushes：每群一个每日总上限 + 一份睡觉时段（都从 group_push 读，三种自制消息
   topic / news_card / idea_mention 一起数）；kind="error" / "command" / "admin" /
   "awaited_delivery" 不受限。结果不明（sending / uncertain）的发送安全保留额度。
@@ -278,11 +281,19 @@ class TopicMatcher:
     TAKE = 2
     GENERIC_DF = 3   # 本群这么多条候选都有的词算泛词
     ASK_DAYS = 2     # 有人问「最近有啥新鲜事」时只递近 2 天的
+    # 个人向资讯「随口带一句」的节制（纯内存）：同一（群, 资讯）24 小时最多真注入 2 次，
+    # 且两次之间至少隔 30 分钟；一轮最多 1 条个人资讯行（Mentions 那边卡）。
+    PNEWS_WINDOW_S = 24 * 3600
+    PNEWS_MAX = 2
+    PNEWS_COOLDOWN_S = 30 * 60
+    PNEWS_MIN_SCORE = 3.5
 
     def __init__(self, store: Store) -> None:
         self._store = store
         self._cache: dict[str, tuple[float, list[dict]]] = {}
         self._jabs: dict[tuple[str, str], list[float]] = {}
+        # 个人资讯注入记账：{(gid, "pnews:<id>"): [ts]}——只记**真注进去**的（见 j 节制）
+        self._pnews: dict[tuple[str, str], list[float]] = {}
 
     # ------------------------------------------------------------------
     # 解析：items 里的群聊消息
@@ -402,16 +413,22 @@ class TopicMatcher:
             (gid, float(now) - self.IDEA_DAYS * 86400),
         ).fetchall()
         for r in rows:
-            out.append(
-                {
-                    "key": f"idea:{int(r['id'])}",
-                    "title": str(r["title"] or ""),
-                    "body": str(r["body"] or ""),
-                    "link": "",
-                    "keywords": self._keywords_of(r["keywords"]),
-                    "created": float(r["created"] or 0.0),
-                }
-            )
+            cand = {
+                "key": f"idea:{int(r['id'])}",
+                "title": str(r["title"] or ""),
+                "body": str(r["body"] or ""),
+                "link": "",
+                "keywords": self._keywords_of(r["keywords"]),
+                "created": float(r["created"] or 0.0),
+            }
+            # 构想预览（kv idea.preview.<id>）：有核验过的摘要 / 来源时，接龙行
+            # 递「顺手查到的实情」而不是泛 proposal 话；kv 坏了绝不影响候选加载。
+            try:
+                preview = self._store.kv_get(f"idea.preview.{int(r['id'])}", None)
+            except Exception:
+                preview = None
+            self._apply_idea_preview(cand, preview)
+            out.append(cand)
         # 本群 ≥GENERIC_DF 条候选都有的词是泛词（935 群的 llm / prompt 这种），不能当「具体词」
         df: dict[str, int] = {}
         for c in out:
@@ -420,6 +437,44 @@ class TopicMatcher:
         for c in out:
             c["spec"] = {kw for kw in c["keywords"] if specific_kw(kw) and df.get(kw, 0) < self.GENERIC_DF}
         return out
+
+    @staticmethod
+    def _apply_idea_preview(cand: dict, preview: Any) -> None:
+        """构想预览（kv idea.preview.<id>）核验后并进候选。
+
+        合法 = dict + points 是「全是非空字符串」的 list + sources 是
+        「dict 且带 http(s):// url」的 list；缺任何一条都原样不动。
+        核验过的 summary / 首条 points 当正文（SNIPPET_LEN 露出的是查到的
+        实情而不是泛 proposal 话），第一个核验过的 url 当出处链接。
+        """
+        if not isinstance(preview, dict):
+            return
+        points = preview.get("points")
+        if (
+            not isinstance(points, list)
+            or not points
+            or not all(isinstance(p, str) and str(p).strip() for p in points)
+        ):
+            return
+        sources = preview.get("sources")
+        if not isinstance(sources, list) or not sources:
+            return
+        verified = [
+            str(s.get("url") or "").strip()
+            for s in sources
+            if isinstance(s, dict)
+            and str(s.get("url") or "").strip().startswith(("http://", "https://"))
+        ]
+        if not verified:
+            return
+        summary = str(preview.get("summary") or points[0]).strip()
+        if not summary:
+            summary = str(points[0]).strip()
+        pts_extra = "；".join(str(p).strip() for p in points[1:] if str(p).strip())
+        body = f"{summary}；{pts_extra}" if pts_extra else summary
+        cand["body"] = body[:160]
+        cand["link"] = verified[0]
+        cand["has_preview"] = True
 
     def candidates_for(self, group_id: str, now: Optional[float] = None) -> list[dict]:
         """本群候选；内存缓存每群一份，60 秒内直接用。"""
@@ -490,6 +545,141 @@ class TopicMatcher:
             stamps.append(ts)
 
     # ------------------------------------------------------------------
+    # 个人向资讯「随口带一句」（纯代码、零 LLM、失败关闭）
+    #
+    # 这是反应式备忘，不是 outbox 推送：只在「本人正在说、且刚说的那条命
+    # 中关键词」时，给 MaiBot 的 planner 上下文递一句「你最近看到过这条」。
+    # 闸门（a–c，served / focus 开关 / group_push 开关）由 Mentions 先过；
+    # 这里只负责：本人行确认（focus_members 复核）→ 查 news_items → 关键词
+    # 对得上 → 隐私闸 → 频控。频控只记**真拼进上下文**的那次（预算挤掉不算）。
+    # ------------------------------------------------------------------
+
+    def _pnews_recent(self, gid: str, key: str, now: float) -> list[float]:
+        """(gid, key) 在 24h 窗口内的真注入时刻（顺手清旧）。"""
+        stamps = self._pnews.get((gid, key))
+        if not stamps:
+            return []
+        cutoff = float(now) - self.PNEWS_WINDOW_S
+        fresh = [s for s in stamps if s > cutoff]
+        if len(fresh) != len(stamps):
+            self._pnews[(gid, key)] = fresh
+        return fresh
+
+    def _pnews_allowed(self, gid: str, key: str, now: float) -> bool:
+        """同一（群, 资讯）24h 内 ≤PNEWS_MAX 次，且距上次 ≥PNEWS_COOLDOWN_S。"""
+        recent = self._pnews_recent(gid, key, now)
+        if len(recent) >= self.PNEWS_MAX:
+            return False
+        if recent and float(now) - recent[-1] < self.PNEWS_COOLDOWN_S:
+            return False
+        return True
+
+    def record_pnews_injected(self, group_id: str, key: str, now: Optional[float] = None) -> None:
+        """真注进去之后才记账（挤不进 300 字预算 / 没注成都不能记）。"""
+        gid = str(group_id)
+        ts = clock.now() if now is None else float(now)
+        stamps = self._pnews.get((gid, str(key)))
+        if stamps is None:
+            stamps = []
+            self._pnews[(gid, str(key))] = stamps
+        stamps.append(ts)
+
+    @staticmethod
+    def _is_focus_member(store: Any, gid: str, user_id: str) -> bool:
+        """本人还是不是在册关注成员（removed=0）；查不到 / 出错一律 False。"""
+        try:
+            row = store.read().execute(
+                "SELECT 1 FROM focus_members WHERE group_id=? AND user_id=? AND removed=0 LIMIT 1",
+                (str(gid), str(user_id)),
+            ).fetchone()
+        except Exception:
+            return False
+        return row is not None
+
+    def _personal_news_candidates(self, gid: str, user_id: str, now: float) -> list[dict]:
+        """本人名下的个人向资讯：未拒、不敏感、news/guide、近 NEWS_DAYS 天、
+        分够（≥PNEWS_MIN_SCORE）、口碑不差（down ≤ up）。新在前。"""
+        rows = self._store.read().execute(
+            "SELECT id, title, summary, body, keywords, sources, created, score, up, down, sensitive"
+            " FROM news_items"
+            " WHERE group_id=? AND target_user_id=? AND rejected=0 AND sensitive=0"
+            " AND kind IN ('news','guide') AND created>=?"
+            " ORDER BY created DESC",
+            (str(gid), str(user_id), float(now) - self.NEWS_DAYS * 86400),
+        ).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            if float(r["score"] or 0.0) < self.PNEWS_MIN_SCORE:
+                continue
+            if int(r["down"] or 0) > int(r["up"] or 0):
+                continue
+            kws = self._keywords_of(r["keywords"])
+            if not kws:
+                continue
+            out.append({
+                "key": f"pnews:{int(r['id'])}",
+                "title": str(r["title"] or ""),
+                "body": str(r["summary"] or "") or str(r["body"] or ""),
+                "link": self._first_link(r["sources"]),
+                "keywords": kws,
+                "spec": {kw for kw in kws if specific_kw(kw)},
+                "created": float(r["created"] or 0.0),
+            })
+        return out
+
+    def personal_news_entry(
+        self,
+        group_id: str,
+        user_id: str,
+        last_user_msg: str,
+        recent_text: str,
+        now: Optional[float] = None,
+    ) -> Optional[dict]:
+        """本人的个人向资讯对上了 → 一条 {text, key}；任何一步不过 → None。
+
+        行里只放标题 / 中性摘要 / 出处，不点名、不提「怎么留意到的」——
+        隐私闸（privacy.scrub）命中的整条弃掉，绝不截短放行。
+        """
+        gid = str(group_id)
+        uid = str(user_id or "")
+        ts = clock.now() if now is None else float(now)
+        try:
+            if not self._is_focus_member(self._store, gid, uid):
+                return None
+            cands = self._personal_news_candidates(gid, uid, ts)
+            if not cands:
+                return None
+            hits = self.match_hits(cands, recent_text, last_user_msg)
+            if not hits:
+                return None
+            for cand, _hit in hits:
+                key = str(cand["key"])
+                snippet = str(cand.get("body") or "")[: self.SNIPPET_LEN]
+                link = str(cand.get("link") or "")
+                link_part = f"（有人问出处再给：{link}）" if link else ""
+                line = (
+                    "你最近看到过这条，刚好和眼前聊的有关，想顺口带一句就自然提、"
+                    f"别说怎么留意到的：{cand.get('title') or ''}——{snippet}{link_part}"
+                )
+                from . import privacy  # 局部导入：隐私闸只在真要用的时候进场
+
+                try:
+                    scrubbed = privacy.scrub(gid, line, self._store)
+                except Exception:
+                    logger.exception("个人资讯隐私闸异常，本条不注入（群 %s）", gid)
+                    continue
+                if scrubbed is None:
+                    # 命中关注成员注记 / 画像摘要片段 → 这条整条弃掉
+                    continue
+                if not self._pnews_allowed(gid, key, ts):
+                    continue
+                return {"text": scrubbed, "key": key}
+            return None
+        except Exception:
+            logger.exception("个人向资讯匹配异常，已吞掉（群 %s 人 %s）", gid, uid)
+            return None
+
+    # ------------------------------------------------------------------
     # 组合：给 inject 用的话题行
     # ------------------------------------------------------------------
 
@@ -501,6 +691,12 @@ class TopicMatcher:
         link_part = f"（有人问出处再给：{link}）" if link else ""
         what = f"{cand.get('title') or ''}——{snippet}{link_part}"
         if str(cand.get("key") or "").startswith("idea:"):
+            if cand.get("has_preview"):
+                # 有核验过的构想预览：递的是查到的实情 + 出处，不是「想到的一个点子」
+                return (
+                    "群里在聊的和你之前留意过的一个点子有关，顺手查到过一点实情，"
+                    f"想接就自然带一句、别照念：{what}"
+                )
             return f"群里在聊的和你之前想到的一个点子有关，想接就自然接一句：{what}"
         if mode == "ask":
             return f"群里有人在问最近有什么新鲜事，你最近看到过这条，想说就挑着说、别照念：{what}"
@@ -741,6 +937,117 @@ class Mentions:
         except Exception:
             return ""
 
+    @staticmethod
+    def _message_blocks(item_text: str) -> list[tuple[bool, str, str]]:
+        """一段 item 文本 → [(是否机器人, msg_id, 正文)]，按出现顺序。"""
+        out: list[tuple[bool, str, str]] = []
+        matches = list(_MESSAGE_BLOCK.finditer(item_text))
+        if matches:
+            for m in matches:
+                attrs = dict(_MESSAGE_ATTR.findall(m.group(1)))
+                mid = str(attrs.get("msg_id") or "")
+                body = html.unescape(m.group(2).strip())
+                if not body and not mid:
+                    continue
+                out.append((
+                    attrs.get("is_self_message", "").lower() == "true",
+                    mid,
+                    body,
+                ))
+            return out
+        pref = _MESSAGE_PREFIX.match(item_text)
+        if pref is not None:
+            attrs = dict(_MESSAGE_ATTR.findall(pref.group(1)))
+            mid = str(attrs.get("msg_id") or "")
+            body = item_text[pref.end():]
+            if body.endswith("</message>"):
+                body = body[: -len("</message>")]
+            body = html.unescape(body.strip())
+            if body or mid:
+                out.append((
+                    attrs.get("is_self_message", "").lower() == "true",
+                    mid,
+                    body,
+                ))
+        return out
+
+    def _last_speaker_message(self, group_id: str, kwargs: Any) -> tuple[str, str]:
+        """（最后一条非机器人消息的发言人, 那条消息的正文）。
+
+        msg_id → user_id 走 _recent_msg_users（Intake 回填的纯内存表）。
+        发言人解析不到（没登记 / 没 msg_id / 无消息）→ ("", "")：宁可不递
+        个人资讯，也不能把别人的发言当成关注成员说的。
+        """
+        try:
+            items = kwargs.get("items") if isinstance(kwargs, dict) else None
+            if not isinstance(items, list):
+                return "", ""
+            ring = self._recent_msg_users.get(str(group_id)) or {}
+            last_mid = ""
+            last_body = ""
+            for item in items:
+                text = self._topics._item_text(item)
+                if not text:
+                    continue
+                for is_self, mid, body in self._message_blocks(text):
+                    if is_self:
+                        continue
+                    last_mid, last_body = mid, body
+            if not last_body:
+                return "", ""
+            speaker = str(ring.get(last_mid) or "") if last_mid else ""
+            if not speaker:
+                return "", ""
+            return speaker, last_body
+        except Exception:
+            return "", ""
+
+    def _personal_news_entries(self, group_id: str, kwargs: Any) -> list[dict]:
+        """个人向资讯「随口带一句」这轮递不递（最多 1 条）；任何一道闸不过 → []。
+
+        闸门（全部失败关闭，顺序即成本从低到高）：
+        a) served 群（拿不到 settings / 不在名单 → 零 SQL）
+        b) focus.personal_profile 且 focus.personal_feeds 两个都开着
+        c) group_push.personal_mention_enabled 显式 true（默认关！）
+        d) 最后一条非机器人消息的发言人认得出来
+        e)–i) focus_members 在册复核、本人的个人向资讯关键词对上（命中 ≥2 个
+           关键词、含 1 个具体词、且 ≥1 个命中就出现在**本人这条**消息里）、
+           隐私闸 privacy.scrub ——都在 TopicMatcher.personal_news_entry 里。
+        j) 频控（24h ≤2 次 + 30 分钟冷却）：只挡不记，真拼进上下文后由
+           _memo_with_topics 调 record_pnews_injected 记账。
+        """
+        gid = str(group_id)
+        try:
+            settings = self._get_settings()
+        except Exception:
+            return []
+        if settings is None:
+            return []
+        try:
+            if not settings.is_served(gid):
+                return []
+        except Exception:
+            return []
+        focus = getattr(settings, "focus", None)
+        if not (bool(getattr(focus, "personal_profile", False))
+                and bool(getattr(focus, "personal_feeds", False))):
+            return []
+        try:
+            if group_push.get_config(self._store, gid, settings).get(
+                    "personal_mention_enabled") is not True:
+                return []
+        except Exception:
+            return []
+        speaker, last_user_msg = self._last_speaker_message(gid, kwargs)
+        if not speaker or not last_user_msg:
+            return []
+        users, _selfs = self._topics.chat_bodies(kwargs)
+        recent = "\n".join(users[-self._topics.RECENT_LIMIT:])
+        if not recent:
+            return []
+        entry = self._topics.personal_news_entry(gid, speaker, last_user_msg, recent)
+        return [entry] if entry else []
+
     def _recent_text(self, group_id: str, kwargs: Any) -> str:
         """最近两条群友发言拼的小写文本（关键词命中用）；没有 → ""。"""
         try:
@@ -914,8 +1221,14 @@ class Mentions:
         接龙行（不够就少放）和其它备忘行。
 
         2026-10：只递不记账（chat_feeds 表和 record/check_said 已删；「聊到了」状态也删）。
+
+        2026-10 个人向资讯（personal_mention_enabled 开着的群）：关注成员本人
+        正在说、且刚说的那条命中其个人资讯关键词时，追加至多 1 行「你最近看到
+        过这条」。它排在话题接龙行之后、其它备忘行之前，共用 300 字总预算，
+        派活 / 任务状态行永远先分——绝不因为个人资讯丢任务行。
         """
         topic_entries = self._topics.memo_entries(group_id, kwargs)
+        personal_entries = self._personal_news_entries(group_id, kwargs)
         db_rows = self._mention_rows(group_id)
         eph_rows = self._ephemeral_rows(group_id)
 
@@ -937,6 +1250,7 @@ class Mentions:
         used_ids: list[int] = []
         used_keys: list[str] = []
         used_eph: list[str] = []
+        used_pnews: list[str] = []
         remaining = MAX_TEXT_LENGTH - len(HEADER)
 
         def _mark(r: Any) -> None:
@@ -968,6 +1282,16 @@ class Mentions:
             used_keys.append(entry["key"])
             remaining -= len(line) + 1
 
+        # 2.5) 个人向资讯「随口带一句」：至多 1 行；只有真的拼进预算才记账
+        #      （被 300 字挤掉不算用掉 24h 的 2 次 / 30 分钟冷却）
+        for entry in personal_entries:
+            line = f"- {entry['text']}"
+            if len(line) + 1 > remaining:
+                continue
+            lines.append(line)
+            used_pnews.append(entry["key"])
+            remaining -= len(line) + 1
+
         # 3) 其它备忘行：原规则（放不下就跳过，继续看后面短的）
         for r in other_rows:
             line = f"- {r['text']}"
@@ -987,6 +1311,12 @@ class Mentions:
                 self._topics.record_injected(group_id, used_keys)
             except Exception:
                 logger.exception("话题接龙记账失败（group=%s）", group_id)
+        if used_pnews:
+            try:
+                for key in used_pnews:
+                    self._topics.record_pnews_injected(group_id, key)
+            except Exception:
+                logger.exception("个人资讯注入记账失败（group=%s）", group_id)
         return HEADER + "\n" + "\n".join(lines)
 
     def _resolve_group(self, session_id: str) -> str:

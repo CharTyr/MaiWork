@@ -521,6 +521,10 @@ class Commands:
         if not is_approver:
             return "只有 bot 管理员或本群管理员能批准 / 拒绝"
         rid_s = str(rid or "").strip()
+        # 提醒文案里的占位符「ID」（/mw 批准 ID）不是真编号：照「没带 ID」处理，
+        # 一件待批直接批它、多件就列编号让人选。
+        if rid_s.upper() in {"ID", "<ID>", "[ID]"}:
+            rid_s = ""
         if not rid_s:
             try:
                 pending = self._approvals.pending_view(gid) or []

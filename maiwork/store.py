@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import stat
@@ -17,6 +18,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from . import clock
+
+logger = logging.getLogger("maiwork.store")
 
 # M1 表结构（字段以这里为准，要点见 docs/07-代码接口.md §4）
 _M1_SQL = """

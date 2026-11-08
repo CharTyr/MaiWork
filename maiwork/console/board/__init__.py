@@ -29,7 +29,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from .. import views
 from .context import DEFAULT_HOURS, STUCK_AFTER_S, Ctx, _clip, _f, normalize_hours
 from .sources import goal as goal_src
 from .sources import handoff as handoff_src

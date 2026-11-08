@@ -87,19 +87,24 @@ async def test_view_job_gets_render_report_autofilled(store, settings, env, tool
     assert "render_report" in _note_for(store, "T-1", "task.tool_autofill")
 
 
-async def test_research_job_gets_render_report_autofilled(store, settings, env, tools, agents):
-    """调研活（system 提示会点名 render_report 交网页）：同样补上。"""
+@pytest.mark.parametrize("deliver_kind", ["text", "file"])
+async def test_research_job_does_not_get_render_report_unless_view(
+    store, settings, env, tools, agents, deliver_kind,
+):
+    """render_report 只有 deliver_kind=view 才补：text / file 即使标了 type=research
+    也不补（调研框架里网页 / 文件类才提它；直出文字走聊天查证口径不提）。
+    """
     workers = CaptureWorkers()
     coord = _coordinator(store, settings, env, tools, agents, workers,
                          specialists=_make_specialists(agents, workers))
-    plan = {"criteria": ["给出结论"], "deliver_kind": "file",
+    plan = {"criteria": ["给出结论"], "deliver_kind": deliver_kind,
             "jobs": [_job(["web_search", "fetch_page", "write_file"], brief="查一下大家怎么看",
                           agent="task")]}
     plan["jobs"][0]["type"] = "research"
 
     coord._exec_capability_self_check("T-1", GID, plan, on_remote=False)  # noqa: SLF001
 
-    assert "render_report" in plan["jobs"][0]["tools"]
+    assert "render_report" not in plan["jobs"][0]["tools"]
 
 
 async def test_read_skill_autofilled_when_worker_skills_exist(store, settings, env, tools, agents):

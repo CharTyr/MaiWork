@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..context import Ctx, _clip, _f
-from ..trace import STEP_TEXT_MAX, Trace
+from ..trace import Trace
 
 SOURCE = "topic"
 

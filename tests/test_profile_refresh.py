@@ -1180,12 +1180,13 @@ class TestMembersWiring:
         p = _make(store, host, models, settings)
         await p.tick(GID)
         prompt = models.calls[0][1][1]["content"]
+        system_prompt = models.calls[0][1][0]["content"]
         hhmm = clock.bj(T0 - 100).strftime("%H:%M")
         assert f"[1] {hhmm} iBad Bro(QQ {self.U}): 短的" in prompt
         assert "MaiBot: 机器人的话" in prompt
         assert "路人(QQ u2): 嗯" in prompt
-        assert "{@" in prompt  # 规则里写了「提到群友写 {@QQ号}」
-        assert "关注成员 | QQ号" in prompt
+        assert "{@" in system_prompt  # 规则里写了「提到群友写 {@QQ号}」
+        assert "关注成员 | QQ号" in system_prompt
         # 关注成员名单用名册里的当前名字（focus_members.name 是老快照）
         with store.tx() as conn:
             conn.execute(
@@ -1380,3 +1381,236 @@ class TestMembersWiring:
 
 import asyncio  # noqa: E402  —— 追加段落用（在文件末尾）
 from CharTyr_MaiWork.maiwork import members  # noqa: E402
+
+
+# ----------------------------------------------------------------------
+# 每类上限 + 「最近在聊」过期（代码执行，不靠模型自觉）
+# ----------------------------------------------------------------------
+
+
+def _seed_entry(
+    store: Store,
+    gid: str,
+    category: str,
+    text: str,
+    *,
+    locked: int = 0,
+    last_ts: float = T0,
+    deleted: int = 0,
+    source: str = "model",
+) -> int:
+    with store.tx() as conn:
+        cur = conn.execute(
+            "INSERT INTO profile_entries"
+            " (group_id, category, text, evidence_count, first_ts, last_ts,"
+            "  locked, deleted, source, updated)"
+            " VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
+            (gid, category, text, last_ts, last_ts, locked, deleted, source, last_ts),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def _entry_state(store: Store, entry_id: int) -> dict:
+    row = store.read().execute(
+        "SELECT id, deleted, locked FROM profile_entries WHERE id=?", (entry_id,)
+    ).fetchone()
+    return dict(row) if row else {}
+
+
+class TestEnforceCaps:
+    def _make_p(self, store: Store, tmp_path: Path) -> Profiles:
+        p = _make(store, FakeHost(), FakeModelsQueue(), _settings(tmp_path))
+        p.ensure_group(GID)
+        return p
+
+    def test_recent_expires_after_seven_days(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        p = self._make_p(store, tmp_path)
+        stale = _seed_entry(store, GID, "recent", "旧话题", last_ts=T0 - 8 * 86400)
+        fresh = _seed_entry(store, GID, "recent", "新话题", last_ts=T0 - 6 * 86400)
+        locked_stale = _seed_entry(
+            store, GID, "recent", "锁定的旧话题", locked=1, last_ts=T0 - 8 * 86400
+        )
+        old_interest = _seed_entry(
+            store, GID, "interest", "常青兴趣", last_ts=T0 - 30 * 86400
+        )
+        with store.tx() as conn:
+            out = p._enforce_caps(conn, GID, T0)
+        assert out["expire"] == 1
+        assert _entry_state(store, stale)["deleted"] == 2
+        assert _entry_state(store, fresh)["deleted"] == 0
+        assert _entry_state(store, locked_stale)["deleted"] == 0  # 锁定不过期
+        assert _entry_state(store, old_interest)["deleted"] == 0  # 过期只管 recent
+
+    def test_over_cap_evicts_oldest_unlocked(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        p = self._make_p(store, tmp_path)
+        ids = [
+            _seed_entry(store, GID, "convention", f"约定{i}", last_ts=T0 - i * 60)
+            for i in range(22)  # 约定上限 20
+        ]
+        with store.tx() as conn:
+            out = p._enforce_caps(conn, GID, T0)
+        assert out["overcap"] == 2
+        # 最旧的两条（下标 20、21，last_ts 最小）被软删
+        assert _entry_state(store, ids[21])["deleted"] == 2
+        assert _entry_state(store, ids[20])["deleted"] == 2
+        assert _entry_state(store, ids[19])["deleted"] == 0
+
+    def test_locked_entries_survive_over_cap(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        p = self._make_p(store, tmp_path)
+        locked_ids = [
+            _seed_entry(store, GID, "interest", f"锁兴趣{i}", locked=1, last_ts=T0 - i)
+            for i in range(15)  # 兴趣上限 15，全锁
+        ]
+        loose = _seed_entry(store, GID, "interest", "没锁的", last_ts=T0)
+        with store.tx() as conn:
+            out = p._enforce_caps(conn, GID, T0)
+        assert out["overcap"] == 1
+        assert _entry_state(store, loose)["deleted"] == 2
+        for eid in locked_ids:
+            assert _entry_state(store, eid)["deleted"] == 0
+        # 锁定条数本身超过上限时：全保留，一条不删
+        locked_ids.append(
+            _seed_entry(store, GID, "interest", "第16条锁", locked=1, last_ts=T0)
+        )
+        with store.tx() as conn:
+            out = p._enforce_caps(conn, GID, T0)
+        assert out["overcap"] == 0
+        for eid in locked_ids:
+            assert _entry_state(store, eid)["deleted"] == 0
+
+    def test_soft_deleted_text_can_be_added_back(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        p = self._make_p(store, tmp_path)
+        old = _seed_entry(store, GID, "recent", "同一句话", last_ts=T0 - 8 * 86400)
+        with store.tx() as conn:
+            p._enforce_caps(conn, GID, T0)
+        assert _entry_state(store, old)["deleted"] == 2
+        # deleted=2 不是管理员墓碑：同文字还能再进画像
+        ops = [{"op": "add", "category": "recent", "text": "同一句话", "evidence": []}]
+        with store.tx() as conn:
+            counts = p._apply_ops(conn, GID, ops, [_msg("m1", T0)], T0)
+        assert counts["add"] == 1
+        alive = p.entries(GID)
+        assert any(e["text"] == "同一句话" for e in alive)
+
+    def test_admin_add_entry_triggers_caps(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        p = self._make_p(store, tmp_path)
+        ids = [
+            _seed_entry(store, GID, "convention", f"约定{i}", last_ts=T0 - i * 60)
+            for i in range(20)  # 已满
+        ]
+        admin_id = p.add_entry(GID, "convention", "管理员加的")
+        # 管理员条目是锁定的、必留；最旧那条没锁的被挤出去
+        assert _entry_state(store, admin_id)["deleted"] == 0
+        assert _entry_state(store, ids[19])["deleted"] == 2
+        alive_conv = [e for e in p.entries(GID) if e["category"] == "convention"]
+        assert len(alive_conv) == 20
+
+    @pytest.mark.asyncio
+    async def test_refresh_runs_caps_and_reports_counts(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path)  # batch=3
+        models = FakeModelsQueue(replies=["没有变化"])
+        host = FakeHost([_msg(f"m{i}", T0 - 60 + i) for i in range(3)])
+        p = _make(store, host, models, settings)
+        # 13 条新 recent（上限 12）+ 1 条 8 天前的 recent
+        for i in range(13):
+            _seed_entry(store, GID, "recent", f"话题{i}", last_ts=T0 - i * 60)
+        stale = _seed_entry(store, GID, "recent", "过期话题", last_ts=T0 - 8 * 86400)
+        r = await p.tick(GID)
+        assert r.refreshed is True
+        assert _entry_state(store, stale)["deleted"] == 2
+        alive_recent = [e for e in p.entries(GID) if e["category"] == "recent"]
+        assert len(alive_recent) == 12
+        ev = _events(store, "profile.refresh")
+        assert ev, "应该有 profile.refresh 事件"
+        import json as _json
+
+        payload = _json.loads(ev[-1]["payload"] or "{}")
+        assert payload.get("expire") == 1
+        assert payload.get("overcap") == 1
+
+
+class TestPromptOrder:
+    """固定内容（规则）在 system、动态内容（条目/消息）在 user——让前缀能命中缓存。"""
+
+    def test_system_carries_rules_user_carries_dynamic(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        p = _make(store, FakeHost(), FakeModelsQueue(), _settings(tmp_path))
+        p.ensure_group(GID)
+        _seed_entry(store, GID, "interest", "爱折腾")
+        msgs = p._build_prompt(GID, [_msg("m1", T0, text="周末去爬山")])
+        assert msgs[0]["role"] == "system" and msgs[1]["role"] == "user"
+        system, user = str(msgs[0]["content"]), str(msgs[1]["content"])
+        assert "一行一件事" in system and "输出格式" in system  # 规则在 system
+        assert "当前画像条目" in user and "这批消息" in user  # 动态在 user
+        assert "爱折腾" in user and "周末去爬山" in user
+        assert "输出格式" not in user  # user 里不再带规则
+
+    def test_rules_tell_model_caps_are_code_enforced(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        p = _make(store, FakeHost(), FakeModelsQueue(), _settings(tmp_path))
+        msgs = p._build_prompt(GID, [])
+        system = str(msgs[0]["content"])
+        assert "每类最多约 8 条" not in system  # 旧的不实说法拿掉
+        assert "上限" in system
+
+
+class TestEntriesForPrompt:
+    """派活计划拿画像：按类别优先级轮流取，不再按字母序拿一坨约定。"""
+
+    def _make_p(self, store: Store, tmp_path: Path) -> Profiles:
+        p = _make(store, FakeHost(), FakeModelsQueue(), _settings(tmp_path))
+        p.ensure_group(GID)
+        return p
+
+    def test_sparse_categories_not_hidden_by_conventions(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        p = self._make_p(store, tmp_path)
+        for i in range(30):
+            _seed_entry(store, GID, "convention", f"约定{i}", last_ts=T0 - i)
+        ongoing = _seed_entry(store, GID, "ongoing", "在做的事", last_ts=T0)
+        interest = _seed_entry(store, GID, "interest", "长期兴趣", last_ts=T0)
+        picked = p.entries_for_prompt(GID, limit=20)
+        picked_ids = {int(e["id"]) for e in picked}
+        assert ongoing in picked_ids and interest in picked_ids
+        assert len(picked) == 20
+        # 在做的事优先级最高，排最前
+        assert picked[0]["category"] == "ongoing"
+
+    def test_round_robin_gives_each_category_a_share(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        p = self._make_p(store, tmp_path)
+        cats = ("ongoing", "interest", "recent", "resource", "convention")
+        for i, cat in enumerate(cats):
+            for n in range(4):
+                _seed_entry(store, GID, cat, f"{cat}{n}", last_ts=T0 - n)
+        picked = p.entries_for_prompt(GID, limit=20)
+        assert len(picked) == 20
+        seen = {e["category"] for e in picked}
+        assert seen == set(cats)
+        # 各类内部还是新的先来
+        ongoings = [e["text"] for e in picked if e["category"] == "ongoing"]
+        assert ongoings == ["ongoing0", "ongoing1", "ongoing2", "ongoing3"]
+
+    def test_sparse_group_returns_what_exists(
+        self, store: Store, frozen_now: float, tmp_path: Path
+    ) -> None:
+        p = self._make_p(store, tmp_path)
+        _seed_entry(store, GID, "recent", "唯一话题", last_ts=T0)
+        picked = p.entries_for_prompt(GID, limit=20)
+        assert [e["text"] for e in picked] == ["唯一话题"]

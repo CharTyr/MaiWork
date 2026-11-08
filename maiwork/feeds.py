@@ -83,8 +83,8 @@ import json
 import logging
 import re as _re
 from collections import deque
-from typing import Any, Callable
-from urllib.parse import parse_qsl, urlencode, urlsplit
+from typing import Any, Callable, Iterable
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from . import clock, goals, idea_feasibility, members, news_rating, news_standard, search_stats
 from . import page_date, run_ref, source_name, verify_budget
@@ -153,6 +153,114 @@ IDEA_KIND_TALK = "talk"
 def clean_idea_kind(value: Any) -> str:
     """模型给的 kind → `help` / `talk`（认不出按 help，docs/18 §十）。"""
     return IDEA_KIND_TALK if str(value or "").strip().lower() == IDEA_KIND_TALK else IDEA_KIND_HELP
+
+
+# 构想「先手小样」（构想先手小样，Item 5）：help 构想带一份「已经先查到的干货」——
+# 专岗调查时真用 fetch_page 打开过的页面才能当来源（硬校验，见 _idea_investigate /
+# _make_idea_round 里的工具遥测比对），主模型不许自己报一个没打开过的链接。
+# 零表迁移：整条样例按 idea_id 存 kv，key = IDEA_PREVIEW_KV_PREFIX + <idea_id>。
+IDEA_PREVIEW_KV_PREFIX = "idea.preview."
+_IDEA_PREVIEW_SUMMARY_MAX = 100
+_IDEA_PREVIEW_POINT_MAX = 120
+_IDEA_PREVIEW_POINTS_MAX = 4
+_IDEA_PREVIEW_SOURCES_MAX = 3
+_IDEA_PREVIEW_TITLE_MAX = 60
+
+
+def _preview_canon_url(url: str) -> str:
+    """URL 归一化兜底：小写 scheme/host、去 fragment、去末尾 /（feeds.py 里没有 _canon_url，
+    按「strip fragment + trailing slash」口径自写一份；别处定义了 _canon_url 时优先用它）。"""
+    canon = globals().get("_canon_url")
+    if callable(canon):
+        try:
+            return str(canon(str(url or "").strip()) or "")
+        except Exception:
+            return ""
+    try:
+        parts = urlsplit(str(url or "").strip())
+    except (ValueError, TypeError):
+        return ""
+    scheme = str(parts.scheme or "").lower()
+    netloc = str(parts.netloc or "").lower()
+    path = str(parts.path or "")
+    if path != "/":
+        path = path.rstrip("/")
+    return urlunsplit((scheme, netloc, path, str(parts.query or ""), ""))
+
+
+def _preview_url_hostname(url: str) -> str:
+    """preview 来源标题兜底：取 URL 的 hostname（解析不了 → 空串）。"""
+    try:
+        return str(urlsplit(str(url or "").strip()).hostname or "").strip()
+    except (ValueError, TypeError):
+        return ""
+
+
+def _preview_norm(raw: Any, *, allowed: Any = None) -> dict | None:
+    """把一份 preview 收成 {summary, points(1..4), sources(1..3 [{title, url}])}；不合法 → None。
+
+    - points：1..4 条非空串，各截 120 字；
+    - sources：1..3 条，url 必须 http(s)；title 空 → 回退 URL hostname，再空就丢这条；
+    - summary：非空 ≤100 字；模型没给 → 回退 points[0] 的前 80 字；
+    - allowed（URL → 真打开过的 URL 的查找表）给了就硬过一道：只有表里的 URL 才留，
+      留下的 url 换成真打开的那一条（小写/结尾斜杠差异照收，但绝不放行没打开过的）。
+    """
+    if not isinstance(raw, dict):
+        return None
+    raw_points = raw.get("points")
+    points: list[str] = []
+    for p in raw_points if isinstance(raw_points, list) else ():
+        s = str(p or "").strip()[:_IDEA_PREVIEW_POINT_MAX]
+        if s:
+            points.append(s)
+        if len(points) >= _IDEA_PREVIEW_POINTS_MAX:
+            break
+    if not points:
+        return None
+    raw_sources = raw.get("sources")
+    sources: list[dict] = []
+    for src in raw_sources if isinstance(raw_sources, list) else ():
+        if not isinstance(src, dict):
+            continue
+        url = str(src.get("url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            continue
+        if isinstance(allowed, dict):
+            hit = allowed.get(url) or allowed.get(_preview_canon_url(url))
+            if not hit:
+                continue  # 只被搜过 / 打开失败 / 纯编出来的 URL 一律剥掉
+            url = str(hit)
+        title = str(src.get("title") or "").strip()[:_IDEA_PREVIEW_TITLE_MAX]
+        if not title:
+            title = _preview_url_hostname(url)[:_IDEA_PREVIEW_TITLE_MAX]
+        if not title:
+            continue
+        sources.append({"title": title, "url": url})
+        if len(sources) >= _IDEA_PREVIEW_SOURCES_MAX:
+            break
+    if not sources:
+        return None
+    summary = str(raw.get("summary") or "").strip()[:_IDEA_PREVIEW_SUMMARY_MAX]
+    if not summary:
+        summary = points[0][:80]
+    if not summary:
+        return None
+    return {"summary": summary, "points": points, "sources": sources}
+
+
+def get_idea_preview(store: Any, idea_id: Any) -> dict | None:
+    """读这条构想的已核验先手小样（kv["idea.preview.<id>"]）；没有 / 形状不对 → None。
+
+    绝不抛：kv 读不出来、idea_id 转不了 int、存的形状残缺一律按「没有小样」处理。
+    """
+    try:
+        raw = store.kv_get(f"{IDEA_PREVIEW_KV_PREFIX}{int(idea_id)}", None)
+    except Exception:
+        return None
+    try:
+        return _preview_norm(raw)
+    except Exception:
+        return None
 
 
 # 构想的「为什么」（docs/18 §十）：三条都要占，缺一条就不出。存库时拼成三行文字。
@@ -1300,6 +1408,22 @@ def _similar(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
 
 
+def _any_similar(text: str, others: Iterable[str], threshold: float) -> bool:
+    """等价于 any(_similar(text, t) >= threshold for t in others)，判定逐字相同。
+
+    difflib 保证 ratio() <= quick_ratio() <= real_quick_ratio()，两个便宜上界先排
+    掉绝大多数对再算真相似度。方向必须保持 a=text、b=t（ratio 不对称，不能反）。
+    """
+    sm = difflib.SequenceMatcher(None, text, "", autojunk=False)
+    for t in others:
+        sm.set_seq2(t)
+        if (sm.real_quick_ratio() >= threshold
+                and sm.quick_ratio() >= threshold
+                and sm.ratio() >= threshold):
+            return True
+    return False
+
+
 def _norm_topic_label(raw: Any) -> str:
     """话题标签规范化：去首尾空白、中间的换行压成空格、拉丁字母转小写（中文不变）。"""
     text = str(raw or "").strip().replace("\n", " ")
@@ -2137,7 +2261,9 @@ class Feeds:
             logger.exception("资讯补打开意外出错（群 %s），这轮跳过补打开", gid)
 
         # ③ 第一道（代码侧）：没打开过 / 付费 / 屏蔽来源 / URL·标题重复
-        survivors = self._hard_reject_code(gid, settings, candidates)
+        # 标题查重成批算 SequenceMatcher，中文标题上界筛不干净时秒级——挪出事件循环
+        # （调用链只读库：Store.read() 在线程里给 query_only 连接）。
+        survivors = await asyncio.to_thread(self._hard_reject_code, gid, settings, candidates)
 
         # ④ 打分（幸存者为空就不调模型，省额度）
         if survivors:
@@ -2408,7 +2534,7 @@ class Feeds:
                 item["reject"] = ("hard", "这个来源被标没用太多次")
             elif url_key and url_key in seen_urls:
                 item["reject"] = ("hard", "和最近出过的重复（同一个链接）")
-            elif any(_similar(item["title"], t) >= _TITLE_DEDUP_RATIO for t in seen_titles):
+            elif _any_similar(item["title"], seen_titles, _TITLE_DEDUP_RATIO):
                 item["reject"] = ("hard", "和最近出过的重复（标题高度相似）")
             if "reject" not in item:
                 self._news_freshness_reject(item)
@@ -3729,10 +3855,10 @@ class Feeds:
                 continue
             # 标题近似：撞候选里已留的（留先见的），或撞最近已发过的
             title = str(c.get("title") or "")
-            if title and any(_similar(title, t) >= 0.85 for t in seen_titles_keep):
+            if title and _any_similar(title, seen_titles_keep, 0.85):
                 dropped.append((url, "标题和这轮的另一条高度相似"))
                 continue
-            if title and any(_similar(title, t) >= 0.85 for t in published_titles):
+            if title and _any_similar(title, published_titles, 0.85):
                 dropped.append((url, "标题和最近发过的高度相似"))
                 continue
             alive.append(c)
@@ -3827,7 +3953,7 @@ class Feeds:
         except (ModelError, ValueError, TypeError, KeyError) as e:
             logger.info("挑候选失败（群 %s）：%s，回落前 10 条", gid, e)
             return [(c, "news", "") for c in kept[:10]], False
-        except Exception as e:
+        except Exception:
             logger.exception("挑候选意外出错（群 %s），回落前 10 条", gid)
             return [(c, "news", "") for c in kept[:10]], False
         picks_raw = data.get("picks") if isinstance(data, dict) else None
@@ -4207,10 +4333,10 @@ class Feeds:
                 raise ValueError(discover_bad)
             return []
 
-        # ③ 粗筛（不调模型）
+        # ③ 粗筛（不调模型）；标题查重同上挪出事件循环（调用链只读库）
         t2 = clock.now()
         try:
-            kept, dropped, _ = self._prefilter(gid_s, settings, candidates)
+            kept, dropped, _ = await asyncio.to_thread(self._prefilter, gid_s, settings, candidates)
         except Exception:
             logger.exception("粗筛意外出错（群 %s），候选全放行进挑", gid_s)
             kept, dropped = list(candidates), []
@@ -5673,7 +5799,7 @@ class Feeds:
             logger.info("构想自报把握不大（worth=low），本轮不出（群 %s）", gid)
             self._idea_reject_report(gid, idea_report, "主模型构想价值不足")
             return None
-        if any(_similar(title, t) >= _IDEA_DEDUP_RATIO for t in recent_ideas):
+        if _any_similar(title, recent_ideas, _IDEA_DEDUP_RATIO):
             self._idea_reject_report(gid, idea_report, "主模型构想与已有内容重复")
             return None
         # G7 隐私闸：body / basis 含关注成员名字 / 注记 → 这条构想整条丢弃（群友可见）
@@ -5691,6 +5817,31 @@ class Feeds:
         if icon not in _ICONS:
             icon = "bulb"
         kind = clean_idea_kind(idea.get("kind"))
+        # 先手小样（构想先手小样，Item 5）：主模型报的 idea.preview 只能引用专岗调查那轮
+        # **真用 fetch_page 打开成功**的 URL（_opened_urls 白名单），编不出来没打开过的链接；
+        # talk 不落小样；summary / points / sources.title 全过隐私闸，一条不过就整块小样
+        # 丢掉（构想本身照走它的老规矩）。
+        verified_preview: dict | None = None
+        if kind != IDEA_KIND_TALK:
+            opened_urls = {}
+            if isinstance(idea_candidate, dict):
+                opened_urls = idea_candidate.get("_opened_urls") or {}
+            if isinstance(opened_urls, dict) and opened_urls:
+                pv = _preview_norm(idea.get("preview"), allowed=opened_urls)
+                if pv is not None:
+                    private = self._scrub_item_text(gid, pv["summary"]) is None
+                    if not private:
+                        private = any(
+                            self._scrub_item_text(gid, p) is None for p in pv["points"]
+                        )
+                    if not private:
+                        private = any(
+                            self._scrub_item_text(gid, s["title"]) is None for s in pv["sources"]
+                        )
+                    if private:
+                        logger.info("先手小样含关注成员信息，整块小样丢弃（构想照走，群 %s）", gid)
+                    else:
+                        verified_preview = pv
         if kind == IDEA_KIND_TALK:
             # 话题：值得群里聊一聊，没有 MaiWork 要动手的部分——模型塞了 items / feasibility
             # 也不留（网页上按「交给我的 agent / 等冷场提起来」走）。
@@ -5742,6 +5893,12 @@ class Feeds:
                 ),
             )
             idea_id = int(cur.lastrowid or 0)
+            if verified_preview is not None and idea_id > 0:
+                # 先手小样随构想同事务落 kv（key = idea.preview.<id>）：
+                # 构想在这条 tx 里 rollback，小样也绝不会落下半截。
+                self._store.kv_set(
+                    conn, f"{IDEA_PREVIEW_KV_PREFIX}{idea_id}", verified_preview
+                )
         # 进话题候选池：talk 一律进（它就是要等冷场被提起来）；help 照老规矩看 chat_worthy。
         if kind == IDEA_KIND_TALK or bool(idea.get("chat_worthy")):
             try:
@@ -5825,11 +5982,23 @@ class Feeds:
             '"origin": "这个构想接的是群里之前聊过 / 有人说想做的哪件事（短名词短语，'
             '≤16 字，不含人名、QQ 号），想不出就空字符串"}} 或 '
             '{"idea": null}。',
+            "5. 先手小样（可选）：**只有你这轮真用 fetch_page 打开过 1~3 个相关页面**、且 "
+            'kind="help" 时，才可在 data["idea"] 里多带一个 '
+            '"preview": {"summary": "一句先查到的核心结论（≤80 字）", '
+            '"points": ["已从原文核实的具体干货要点 1", "要点 2"], '
+            '"sources": [{"title": "来源标题或站点名", "url": "本轮用 fetch_page 真打开过的网址"}]}；'
+            'sources 里的 url 必须是你**本轮** fetch_page 打开成功（有正文返回）的那一个，'
+            '只是搜过没打开、打开失败、或凭印象写的链接一律不放。'
+            'kind="talk" 或没真打开外部页面 → 不带 "preview"（宁缺毋滥）。',
         ])
         brief = "\n".join(parts)
         deadline_ts = clock.now() + _IDEA_INVESTIGATE_SECONDS
+        # 本轮调查的遥测标记：专岗工具调用按这个 task_id 落 tool_calls，交回后凭它硬核
+        # preview.sources 里的 URL「这轮确实 fetch_page 打开成功过」——只搜过 / 打开失败 /
+        # 纯编出来的链接一律剥掉（构想先手小样，Item 5）。
+        inv_mark = f"idea-inv:{gid}:{int(clock.now() * 1000)}"
         report = await specialists.run_auto(
-            "idea", brief, group_id=str(gid), phase="investigate",
+            "idea", brief, group_id=str(gid), phase="investigate", task_id=inv_mark,
             deadline_ts=deadline_ts, max_steps=_IDEA_INVESTIGATE_MAX_STEPS,
             actor="构想调查",
         )
@@ -5839,7 +6008,50 @@ class Feeds:
             cand = data.get("idea")
             if isinstance(cand, dict) and str(cand.get("title") or "").strip():
                 candidate = dict(cand)
+                # 先手小样硬校验（构想先手小样，Item 5）：preview.sources 里每条 URL 都必须
+                # 能在本轮 inv_mark 下找到一条 ok=1 且 output 非空的 fetch_page 记录——
+                # 只被 web_search 搜过、打开失败、返回空、或凭印象写的链接全剥掉。
+                opened = self._fetch_opened_urls(gid, inv_mark)
+                if opened:
+                    verified = _preview_norm(cand.get("preview"), allowed=opened)
+                    if clean_idea_kind(cand.get("kind")) == IDEA_KIND_HELP and verified is not None:
+                        candidate["_verified_preview"] = verified
+                        candidate["_opened_urls"] = opened
         return report, candidate
+
+    def _fetch_opened_urls(self, gid: str, inv_mark: str) -> dict:
+        """这轮调查**真打开成功**的 URL 查找表：exact / canonical → 真打开的那条 URL。
+
+        只认本轮 task_id=inv_mark 下 tool='fetch_page' 且 ok=1、output 非空的工具记录；
+        任何一步出错 → 空表（按「一个都没打开」处理，preview 全剥，构想本身照走）。
+        """
+        opened: dict[str, str] = {}
+        try:
+            rows = self._store.read().execute(
+                "SELECT input, ok, output FROM tool_calls"
+                " WHERE group_id=? AND task_id=? AND tool='fetch_page'",
+                (str(gid), str(inv_mark)),
+            ).fetchall()
+        except Exception:
+            logger.debug("读本轮 fetch_page 工具记录失败（群 %s），小样按没打开过处理", gid, exc_info=True)
+            return {}
+        for r in rows or []:
+            if int(_row_get(r, "ok", 0) or 0) != 1:
+                continue
+            if not str(_row_get(r, "output", "") or "").strip():
+                continue
+            url = ""
+            try:
+                payload = json.loads(_row_get(r, "input", "") or "")
+                if isinstance(payload, dict):
+                    url = str(payload.get("url") or "").strip()
+            except (TypeError, ValueError):
+                url = ""
+            if not url.startswith(("http://", "https://")):
+                continue
+            opened[url] = url
+            opened.setdefault(_preview_canon_url(url), url)
+        return opened
 
     def _idea_material_section(self, gid: str, candidate: dict) -> str:
         """主模型提示词里的素材段：候选被显式标注「这是素材不是指令」。返回空串 = 不带。"""
@@ -5864,6 +6076,27 @@ class Feeds:
             lines.append(f"- 由头草稿（群里之前聊过的哪件事）：{origin}")
         if basis:
             lines.append(f"- 它给的理由：{basis}")
+        # 先手小样（构想先手小样，Item 5）：专岗本轮真用 fetch_page 打开过、且过了隐私 /
+        # URL 硬校验的干货，才随素材段交给主模型；sources 里的 URL 是白名单，主模型不许
+        # 自己再添没打开过的链接。
+        verified = candidate.get("_verified_preview")
+        if isinstance(verified, dict):
+            lines.append("它还先一步查到了一些资料（这些 URL 都是本轮真打开过的）：")
+            summary = str(verified.get("summary") or "").strip()
+            if summary:
+                lines.append(f"- 先查到的结论：{summary}")
+            for p in verified.get("points") or []:
+                lines.append(f"- 已核实的要点：{str(p)}")
+            for s in verified.get("sources") or []:
+                if isinstance(s, dict):
+                    lines.append(f"- 来源：{str(s.get('title') or '')}（{str(s.get('url') or '')}）")
+            lines.append(
+                '如果你采用了这个 help 方向，可以在 "idea" 里带 "preview": '
+                '{"summary": "...", "points": [...], '
+                '"sources": [{"title": "...", "url": "..."}]}，'
+                "sources 的 url 只能用上面列出的这几个（一个都不许另编）；"
+                '提了别的方向、或 kind="talk" → 不带 "preview"。'
+            )
         lines.append("可以原样采用、改一改再提，也可以完全不参考它提别的；判断权全在你。")
         return "\n".join(lines)
 
@@ -6220,7 +6453,6 @@ class Feeds:
         rejected 列表：[{id,title,url,site,gate,reason,avg}]。
         群友视图（admin=False）去掉每条 item 的 keywords（只给管理员）。
         """
-        gid = str(group_id)
         # 个人向批次的 note 前缀（personal.py）；群资讯视图一律略过（个人向不上群视图）
         batches = self._batches(group_id, days)
         out: list[dict] = []
@@ -6526,7 +6758,7 @@ class Feeds:
                 keywords = [str(x) for x in raw_kw if str(x or "").strip()]
         except (ValueError, TypeError):
             keywords = []
-        return {
+        out = {
             "id": int(r["id"]),
             "icon": str(r["icon"] or "bulb"),
             # 构想类型（docs/18 §十）：help / talk；老构想（kind 空）→ ''
@@ -6545,6 +6777,11 @@ class Feeds:
             "keywords": keywords,
             "items": idea_items_view(_row_get(r, "items")),
         }
+        # 先手小样（Item 5）：只有 help 构想带这个键（None = 没有核验过的小样）；
+        # kv 里存的那份已经过 fetch_page 遥测 + 隐私两道闸，管理员 / 群友视图同一份。
+        if str(_row_get(r, "kind", "") or "").strip().lower() == IDEA_KIND_HELP:
+            out["preview"] = get_idea_preview(self._store, int(r["id"]))
+        return out
 
     def today_count(self, group_id: str) -> int:
         """今天（北京时间）入选的资讯条数。"""

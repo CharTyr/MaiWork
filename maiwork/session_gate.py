@@ -15,9 +15,12 @@ from .host import host_platform
 logger = logging.getLogger("maiwork.session_gate")
 _CONTINUE = (True, None, False)
 _CONSUMED = (True, None, True)
-COMMAND_NAME = "maiwork_session"
 _NAMES_KEY = "session.bot_names"
 _DECISION_PREFIX = "session.ingress."
+
+# 等澄清时的短答：主人一句「是 / 不是」就算回答，不必再花一次模型分类。
+_ASKING_YES_RE = re.compile(r'^(?:是|是的|对|对的|没错|对呀|是呀|嗯|嗯嗯|好|好的|继续|是在继续|对头)[。！!～~\s]*$')
+_ASKING_NO_RE = re.compile(r'^(?:不是|不对|没有|不用|不用了|算了|别管|别管了|不是的|没|取消)[。！!～~\s]*$')
 
 
 def bounded_names(values) -> tuple[str, ...]:
@@ -338,7 +341,9 @@ class SessionGate:
             with self._connect() as conn:
                 belongs = bool(conn.execute("SELECT 1 FROM session_events WHERE session_id=? AND source_key=? LIMIT 1",
                     (row["id"], f"{platform}:{gid}:{quote_id}")).fetchone() or conn.execute(
-                    "SELECT 1 FROM tasks WHERE session_id=? AND question_msg_id=? LIMIT 1", (row["id"], quote_id)).fetchone())
+                    "SELECT 1 FROM tasks WHERE session_id=? AND question_msg_id=? LIMIT 1", (row["id"], quote_id)).fetchone() or conn.execute(
+                    "SELECT 1 FROM outbox WHERE group_id=? AND (key LIKE ? OR task_id IN (SELECT id FROM tasks WHERE session_id=?)) AND json_extract(result, '$.message_id')=? LIMIT 1",
+                    (gid, f'session:%:{row["id"]}%', row["id"], quote_id)).fetchone())
         state = {"group_id": gid, "text": body,
             "quote": str(quote.get("target_message_content") or "")[:2000] if belongs or adopting else "",
             "summary": str(request[0] if request else "")[:200], "state": row["state"],
@@ -346,22 +351,31 @@ class SessionGate:
             "waiting_answer": row["state"] == "asking" or bool(task and task[0] == "waiting_input"),
             "closing_proposed": closing_proposed,
             "recent_instructions": [r[0][:1000] for r in reversed(recent)]}
-        timeout_ms = min(1400, self._settings().session.triage_timeout_ms)
-        try:
-            got = await asyncio.wait_for(self._ask(state, admin=admin, timeout_ms=timeout_ms), timeout_ms / 1000)
-        except Exception:
-            got = None
-        label, confidence = "chat", 0.0
-        if isinstance(got, dict):
-            label = str(got.get("label") or "chat")
+        # 等澄清时的短答 / 引用本会话发言：不问分类器，直接当澄清吃掉（clarify_a）。
+        asking_reply = not admin and row["state"] == "asking" and (
+            bool(_ASKING_YES_RE.match(body)) or bool(_ASKING_NO_RE.match(body)) or belongs)
+        got = None
+        if asking_reply:
+            label, confidence = "for_maiwork", 1.0
+        else:
+            timeout_ms = min(1400, self._settings().session.triage_timeout_ms)
             try:
-                confidence = float(got.get("confidence", 0))
-            except (TypeError, ValueError):
-                pass
+                got = await asyncio.wait_for(self._ask(state, admin=admin, timeout_ms=timeout_ms), timeout_ms / 1000)
+            except Exception:
+                got = None
+            label, confidence = "chat", 0.0
+            if isinstance(got, dict):
+                label = str(got.get("label") or "chat")
+                try:
+                    confidence = float(got.get("confidence", 0))
+                except (TypeError, ValueError):
+                    pass
         kind = None
         if admin:
             if isinstance(got, dict) and got.get("stop") is True and .8 <= confidence <= 1:
                 kind = "admin_stop"
+        elif asking_reply:
+            kind = "clarify_a"
         elif (label == "unsure" or label == "for_maiwork" and confidence < .8) and 0 <= confidence <= 1:
             kind = "clarify_q"
         elif label == "for_maiwork" and .8 <= confidence <= 1 and body:
@@ -384,6 +398,21 @@ class SessionGate:
             if previous:
                 conn.execute("ROLLBACK")
                 return _CONSUMED if json.loads(previous[0])["consumed"] else _CONTINUE
+            # 已经在等澄清了还拿不准：不问第二遍「你是在继续…吗？」，撤掉挂着的旧澄清、
+            # 按任务重投影会话状态，这条消息放行（不消费、不记会话事件）让 MaiBot 照常处理。
+            if (kind == "clarify_q" and row["state"] == "asking" and label == "unsure" and confidence >= .4
+                    and conn.execute("SELECT 1 FROM kv WHERE key=?", ("session.clarification." + row["id"],)).fetchone()):
+                conn.execute("DELETE FROM kv WHERE key=?", ("session.clarification." + row["id"],))
+                self.sessions.sync_task_state(conn, row["id"])
+                self.store.kv_set(conn, key, {"consumed": False})
+                conn.execute("COMMIT")
+                self._decisions[key] = False
+                while len(self._decisions) > 2048:
+                    self._decisions.pop(next(iter(self._decisions)))
+                fresh = conn.execute("SELECT * FROM task_sessions WHERE id=?", (row["id"],)).fetchone()
+                if fresh is not None:
+                    self._index[(platform, gid)] = dict(fresh)
+                return _CONTINUE
             if kind:
                 self.sessions.record_event(conn, row["id"], source_key=source, kind=kind,
                     text=body, user_id=uid, quoted_ref=str(quote.get("target_message_id") or ""))

@@ -1112,12 +1112,6 @@ class ConsoleServer:
         # 端点 / 模型库 / 自定义专岗的校验和写入在 settings_ops（管理员对话的同名工具共用同一套）；
         # 这里只管鉴权、读请求体、把 OpError 翻成 HTTP 状态码。
 
-        def _endpoint_public(ep: Any) -> dict[str, Any]:
-            return _ops.endpoint_public(svc, ep)
-
-        def _model_public(entry: Any) -> dict[str, Any]:
-            return _ops.model_public(entry)
-
         def _image_model_id() -> str:
             """现在用哪个生图模型：网页选过的优先，其次模型库里第一个 use="image" 的条目。
 
@@ -5710,29 +5704,6 @@ class ConsoleServer:
                 })
         except Exception:
             logger.exception("回写端点测试记录失败")
-
-
-    def _save_checked(self, base_url: str, available: list[str]) -> None:
-        """把 available / checked_at 存回 kv["models.checked"]（测试连接结果，不是配置）。
-
-        模型设置本体在 config.toml 的 [models]（网页保存也写它）；这份回写只在
-        端点一致时并进来显示（models.settings() 里对齐）。
-        """
-        svc = self._svc
-        checked_at = clock.now()
-        try:
-            with svc.store.tx() as conn:
-                svc.store.kv_set(conn, "models.checked", {"base_url": base_url.rstrip("/"), "available": list(available), "checked_at": checked_at})
-        except Exception:
-            logger.exception("回写模型测试记录失败")
-        # 内存里的缓存也顺手对齐（settings() 缓存键含 kv 值，其实下次自己就会重算）
-        try:
-            ms = svc.models.settings()
-            if ms.base_url == base_url.rstrip("/"):
-                ms.available = list(available)
-                ms.checked_at = checked_at
-        except Exception:
-            pass
 
 
 def create_app(svc: Any) -> web.Application:

@@ -6,6 +6,9 @@
 - `topics_enabled` / `news_card_enabled` / `news_card_count` / `idea_mention_enabled`：
   三种 MaiWork 自己往群里发的东西的开关（默认都沿用老行为：开话题看 `[topics] enabled`、
   卡片和提一嘴默认关）。
+- `personal_mention_enabled`：关注成员本人说话时、把其个人向资讯自然带进 planner
+  备忘的反应式开关（默认关）。它是 Mentions 备忘注入，**不是** outbox 推送，
+  不占每日总上限、不进 KIND_SWITCH。
 - `daily_max`：**一个**每日总上限，三种 kind 一起数（沿用原 `[delivery] push_per_day`
   默认 3，不加大）；0 = 不限。
 - `quiet_hours`：睡觉时段（沿用原 `[delivery] quiet_hours`）。
@@ -82,6 +85,7 @@ _SAFE_DEFAULTS = {
     "news_card_enabled": False,
     "news_card_count": 3,
     "idea_mention_enabled": False,
+    "personal_mention_enabled": False,
     "daily_max": DEFAULT_DAILY_MAX,
     "quiet_hours": DEFAULT_QUIET_HOURS,
     "news_card_since": 0.0,
@@ -96,7 +100,8 @@ KIND_SWITCH = {
     "news_card": "news_card_enabled",
     "idea_mention": "idea_mention_enabled",
 }
-BOOL_FIELDS = ("topics_enabled", "news_card_enabled", "idea_mention_enabled")
+BOOL_FIELDS = ("topics_enabled", "news_card_enabled", "idea_mention_enabled",
+               "personal_mention_enabled")
 INT_RANGES = {"news_card_count": (1, 3), "daily_max": (0, 24)}   # daily_max 0 = 不限
 SINCE_OF_SWITCH = {"news_card_enabled": "news_card_since", "idea_mention_enabled": "idea_mention_since"}
 SINCE_FIELDS = ("news_card_since", "idea_mention_since")
@@ -290,6 +295,7 @@ def _from_settings(settings: Any) -> dict:
         "news_card_enabled": False,
         "news_card_count": 3,
         "idea_mention_enabled": False,
+        "personal_mention_enabled": False,
         "daily_max": daily_max,
         "quiet_hours": quiet,
         "news_card_since": 0.0,
@@ -419,11 +425,6 @@ def kind_enabled(cfg: dict, push_kind: Any) -> bool:
     if field is None:
         return True
     return _strict_bool((cfg or {}).get(field), default=False)
-
-
-def switch_field(push_kind: Any) -> str:
-    """kind → 开关字段名；不受开关管的 kind 返回 ""（给网页 / 日志用）。"""
-    return KIND_SWITCH.get(str(push_kind or ""), "")
 
 
 # ----------------------------------------------------------------------

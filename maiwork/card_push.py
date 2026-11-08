@@ -58,7 +58,6 @@ logger = logging.getLogger("maiwork.card_push")
 # 设置只有一份（group_push.py）；这两个常量是老调用口用的旧键名
 KV_PREFIX = group_push.LEGACY_KV_PREFIX
 LEGACY_KV_PREFIX = group_push.LEGACY_KV_PREFIX
-GROUP_PUSH_KV_PREFIX = group_push.KV_PREFIX
 
 EXPIRE_S = 12 * 3600.0
 # 画卡前先给卡片条目补图解，最多等这么久（2026-10 线上问题：同一批资讯同时触发

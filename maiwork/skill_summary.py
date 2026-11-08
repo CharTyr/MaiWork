@@ -235,43 +235,54 @@ class SkillSummary:
         return sid
 
     @staticmethod
-    def _validate(body: str | None) -> dict | None:
-        if not body or len(body) > 4000 or _suspicious(body):
-            return None
+    def _check(body: str | None) -> tuple[dict | None, str]:
+        """_validate 同款校验，但失败时带一句中文原因（进日志用，判定逐条对应）。"""
+        if not body:
+            return None, "正文为空"
+        if len(body) > 4000:
+            return None, "超过 4000 字"
+        if _suspicious(body):
+            return None, "有可疑指令"
         lines = body.splitlines()
         if not lines or lines[0] != "---":
-            return None
+            return None, "缺 front matter"
         try:
             end = lines.index("---", 1)
         except ValueError:
-            return None
+            return None, "front matter 没闭合"
         front = {}
         for line in lines[1:end]:
             key, sep, value = line.partition(":")
             if not sep or key in front or key not in {"name", "description", "version", "author"}:
-                return None
+                return None, "front matter 字段非法或重复"
             front[key] = value.strip().strip("\"'")
         if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", front.get("name", "")) or len(front["name"]) > 64:
-            return None
+            return None, "name 非法或超过 64 字"
         desc = front.get("description", "")
-        if not desc or len(desc) > 60 or not desc.endswith((".", "。")):
-            return None
+        if not desc:
+            return None, "front matter 缺 description"
+        if len(desc) > 60 or not desc.endswith((".", "。")):
+            return None, "description 超过 60 字或没用句号结尾"
         if front.get("author") != "MaiWork" or not re.fullmatch(r"\d+\.\d+\.\d+", front.get("version", "")):
-            return None
+            return None, "author / version 不对"
         content = "\n".join(lines[end + 1:])
         if not re.match(r"\s*# [^\n]+\n\s*\S", content):
-            return None
+            return None, "正文开头不是 # 标题"
         headers = list(re.finditer(r"^## (.+)$", content, re.MULTILINE))
         if [h.group(1) for h in headers] != list(_SECTIONS):
-            return None
+            return None, "章节名或顺序不对"
         for i, h in enumerate(headers):
             stop = headers[i + 1].start() if i + 1 < len(headers) else len(content)
             if not content[h.end():stop].strip():
-                return None
+                return None, "有章节是空的"
         procedure = content[headers[2].end():headers[3].start()]
         if not re.search(r"^\d+\. \S", procedure, re.MULTILINE):
-            return None
-        return front
+            return None, "Procedure 没有编号步骤"
+        return front, ""
+
+    @staticmethod
+    def _validate(body: str | None) -> dict | None:
+        return SkillSummary._check(body)[0]
 
     def _export(self, gid: str, skill: dict, tid: str) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", gid):

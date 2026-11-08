@@ -266,6 +266,29 @@ class TestDecide:
         assert "没找到请求 R-99" in reply
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("placeholder", ["ID", "<ID>", "[ID]", "id"])
+    async def test_approve_placeholder_id_behaves_like_no_id(self, tmp_path: Path, placeholder: str) -> None:
+        """提醒文案里的「/mw 批准 ID」占位符不是真编号：照「没带 ID」处理，
+        只有一件待批时直接批掉它（而不是回「没找到请求 ID」）。"""
+        started: list[str] = []
+        env = _env(tmp_path, run_task_starter=started.append)
+        _request(env)
+        reply = await env.say(f"/mw 批准 {placeholder}", user=ADMIN)
+        assert "开工" in reply and "没找到" not in reply
+        assert env.approvals.pending_view(G1) == []
+        assert started and started[0].startswith("T-")
+
+    @pytest.mark.asyncio
+    async def test_approve_placeholder_id_with_multiple_lists_them(self, tmp_path: Path) -> None:
+        """占位符 + 多件待批：和没带 ID 一样列出来让人选。"""
+        env = _env(tmp_path)
+        r1 = _request(env, title="第一件")
+        r2 = _request(env, title="第二件")
+        reply = await env.say("/mw 批准 ID", user=ADMIN)
+        assert r1["id"] in reply and r2["id"] in reply
+        assert len(env.approvals.pending_view(G1)) == 2
+
+    @pytest.mark.asyncio
     async def test_approve_twice_is_explained(self, tmp_path: Path) -> None:
         env = _env(tmp_path)
         req = _request(env)

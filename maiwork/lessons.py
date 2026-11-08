@@ -41,6 +41,7 @@ import hashlib
 import json
 import logging
 import re
+import unicodedata
 from typing import Any, Callable, Iterable
 
 from .agents import Agents, KINDS, MAIN_KIND, _used_tool_names
@@ -92,6 +93,9 @@ _REFLECT_SHAPES = frozenset(("patch", "write", "skip", "pass"))
 _CURATE_SHAPES = frozenset(("patch", "skip", "pass"))   # 每周整理只许 patch / pass(skip)
 
 # 可疑指令过滤（「忽略」/「无视」/「指令」/「提示词」/ system prompt / api key / 网址）
+# ASCII "ignore" 特殊处理：只拦独立词（ignore previous / Ignore all / (ignore)），
+# 不拦代码 / 配置标识符里的子串（.gitignore / .dockerignore / ignore_errors / ignore_case）。
+_IGNORE_WORD_RE = re.compile(r"(?<![a-z0-9_.-])ignore(?![a-z0-9_-])")
 _SUSPICIOUS_PATTERNS = (
     "ignore", "忽略", "无视",
     "指令", "提示词", "system prompt",
@@ -255,7 +259,8 @@ def _model_action(parsed: dict[str, Any]) -> tuple[str, Any] | None:
     return key, value
 
 
-def _suspicious(text: str) -> bool:
+def suspicious_hits(text: str) -> list[str]:
+    """命中了哪些可疑触发词，按 _SUSPICIOUS_PATTERNS 的顺序返回（确定性）。"""
     from .privacy import fold as _fold
 
     try:
@@ -263,15 +268,29 @@ def _suspicious(text: str) -> bool:
     except Exception:
         s = str(text or "").lower()
     if not s:
-        return False
+        return []
+    norm = "".join(
+        ch for ch in unicodedata.normalize("NFKC", str(text or ""))
+        if unicodedata.category(ch) != "Cf"
+    ).casefold()
+    hits: list[str] = []
     for pat in _SUSPICIOUS_PATTERNS:
+        if pat == "ignore":
+            # 只拦独立词（含全角 / 零宽混淆）：.gitignore / ignore_errors 这类标识符子串不算
+            if _IGNORE_WORD_RE.search(norm):
+                hits.append(pat)
+            continue
         try:
             if _fold(pat) in s:
-                return True
+                hits.append(pat)
         except Exception:
             if pat in s:
-                return True
-    return False
+                hits.append(pat)
+    return hits
+
+
+def _suspicious(text: str) -> bool:
+    return bool(suspicious_hits(text))
 
 
 def _kind_title(agents: Any, kind: str) -> str:

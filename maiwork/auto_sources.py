@@ -195,12 +195,6 @@ def row_is_rss(row: Any) -> bool:
     return str(_get(row, "src_provider", "") or "").startswith("rss:")
 
 
-def row_feed_id(row: Any) -> str:
-    """RSS 条目 → feed_id；不是 RSS 条目 → ""。"""
-    prov = str(_get(row, "src_provider", "") or "")
-    return prov[4:] if prov.startswith("rss:") else ""
-
-
 def row_is_group_wide(row: Any) -> bool:
     """只算群向条目（target_user_id 为空）；个人向的不算来源成绩。"""
     return not str(_get(row, "target_user_id", "") or "").strip()

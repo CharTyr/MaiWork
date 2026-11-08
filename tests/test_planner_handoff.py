@@ -481,6 +481,98 @@ async def test_different_late_kind_does_not_create_second_work(handoff_env, fall
 
 
 @pytest.mark.asyncio
+async def test_handoff_content_tells_planner_to_stop_and_never_reply(handoff_env):
+    """接单回执直接叫 planner 这轮调 stop 收尾：MaiWork 自己进群回群友，
+    planner 不许再用 reply 回同一条消息、不许再答应、不许自己重复制作。"""
+    e = handoff_env
+    await e.intake.handle(hook_message(group_id=G1, message_id="ack2", user_id="user_A", nickname="成员", text="整理一份资料", is_at=True))
+    result = await e.intake.handoff_from_planner(group_id=G1, msg_id="ack2", kind="task")
+    assert result["success"]
+    content = result["content"]
+    assert "直接调用 stop 结束" in content and "严禁再调用 reply" in content
+    assert "直接在群里回复群友" in content
+    await _drain(e.spawned)
+
+
+@pytest.mark.asyncio
+async def test_handoff_reminder_content_tells_planner_to_stop(handoff_env):
+    """提醒类交接回执同样要求直接 stop、严禁 reply / 承诺具体时间。"""
+    e = handoff_env
+    parsed = []
+    async def cb(gid, msg):
+        parsed.append(msg)
+    e.intake._on_reminder = cb
+    await e.intake.handle(hook_message(group_id=G1, message_id="rem1", user_id="user_A", text="明天提醒我"))
+    result = await e.intake.handoff_from_planner(group_id=G1, msg_id="rem1", kind="reminder")
+    assert result["success"]
+    content = result["content"]
+    assert "直接调用 stop 结束" in content and "严禁再调用 reply" in content
+    assert "MaiWork 会直接发群回执" in content
+    await _drain(e.spawned)
+
+
+@pytest.mark.asyncio
+async def test_handoff_ack_drops_at_hint_and_adds_ack_memo(handoff_env):
+    """planner 交接成功：撤掉 request:at-* 防抢答备忘，换 request:ack-*「严禁 reply / web_search」备忘。"""
+    e = handoff_env
+    await e.intake.handle(hook_message(group_id=G1, message_id="ack3", user_id="user_A", nickname="成员", text="整理一份资料", is_at=True))
+    assert any(x["key"] == "request:at-ack3" for x in e.mentions.ephemeral)
+    result = await e.intake.handoff_from_planner(group_id=G1, msg_id="ack3", kind="task")
+    assert result["success"]
+    rid = e.store.read().execute("SELECT id FROM requests").fetchone()[0]
+    assert (G1, "request:at-ack3") in e.mentions.dropped
+    ack = next(x for x in e.mentions.ephemeral if x["key"] == f"request:ack-{rid}")
+    assert ack["target_user_id"] == "user_A"
+    assert "严禁" in ack["text"] and "reply" in ack["text"] and "web_search" in ack["text"] and "stop" in ack["text"]
+    assert any(x["key"] == f"request:{rid}" and "严禁" in x["text"] for x in e.mentions.items)
+    await _drain(e.spawned)
+
+
+@pytest.mark.asyncio
+async def test_at_with_request_cue_gets_handoff_rule_hint(handoff_env):
+    """planner 交接模式下 @ + 请求词：临时备忘直接点破规则——派活调 maiwork_handoff、
+    严禁 web_search / reply 同一条消息、交接后 stop。"""
+    e = handoff_env
+    await e.intake.handle(hook_message(group_id=G1, message_id="cue1", user_id="user_A", nickname="成员", text="帮我查下资料", is_at=True))
+    eph = next(x for x in e.mentions.ephemeral if x["key"] == "request:at-cue1")
+    assert "maiwork_handoff" in eph["text"] and "严禁" in eph["text"] and "web_search" in eph["text"]
+    assert "stop" in eph["text"] and eph["target_user_id"] == "user_A"
+    await _drain(e.spawned)
+
+
+@pytest.mark.asyncio
+async def test_at_without_request_cue_no_hint_memo(handoff_env):
+    """planner 交接模式下普通 @（没有派活词）：不塞「派活规则」备忘。"""
+    e = handoff_env
+    await e.intake.handle(hook_message(group_id=G1, message_id="chat1", user_id="user_A", text="你好", is_at=True))
+    assert not e.mentions.ephemeral
+    await _drain(e.spawned)
+
+
+@pytest.mark.asyncio
+async def test_planner_replied_request_cue_still_goes_to_jev(handoff_env):
+    """planner 已经把这条 @ 当闲聊 reply 了，但原文有派活词：不压后台判词，照旧问 Jev。"""
+    e = handoff_env
+    await e.intake.handle(hook_message(group_id=G1, message_id="cue2", user_id="user_A", nickname="成员", text="帮我做个表", is_at=True))
+    e.intake.note_planner_request(G1, "session", ["cue2"])
+    e.intake.note_planner_response(G1, "session", calls("reply"))
+    await _drain(e.spawned)
+    assert len(e.jev.calls) == 1
+    assert e.store.read().execute("SELECT id FROM requests").fetchall()
+
+
+def test_tool_description_routes_work_to_handoff_and_forbids_double_reply():
+    """maiwork_handoff 的 tool 描述是 planner 唯一拿到的规则书：派活必须走交接、
+    交接后严禁 reply 同一条消息、下一轮直接 stop；闲聊 / 简单问答不要调。"""
+    tool = next(c for c in MaiWorkPlugin().get_components() if c["name"] == "maiwork_handoff")
+    desc = str(tool["metadata"].get("description") or "")
+    assert "maiwork_handoff" not in desc  # 描述里说人话不念函数名
+    assert "严禁再调用 reply" in desc and "stop" in desc
+    assert "web_search" in desc
+    assert "找资料" in desc and "定时提醒" in desc
+
+
+@pytest.mark.asyncio
 async def test_handoff_sets_mention_keywords_and_respects_feature_disable_cutoff(handoff_env, monkeypatch):
     from CharTyr_MaiWork.maiwork import clock, group_features
     e = handoff_env

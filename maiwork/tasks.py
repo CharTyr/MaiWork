@@ -414,6 +414,9 @@ class Tasks:
             )
             if row["session_id"] and getattr(getattr(self._get_settings(), "session", None), "enabled", False):
                 from .sessions import Sessions
+                if to_s in _TERMINAL or to_s == "failed":
+                    # 任务到终态：挂着的「等澄清」一并撤掉，会话状态由 sync 重投影（不再 ask）。
+                    conn.execute("DELETE FROM kv WHERE key=?", ("session.clarification." + str(row["session_id"]),))
                 getattr(self, "_sessions", Sessions(self._store)).sync_task_state(conn, str(row["session_id"]))
         return self.get(task_id)  # type: ignore[return-value]
 

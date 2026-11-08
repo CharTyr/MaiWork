@@ -31,7 +31,7 @@ from .maiwork.config import (
 logger = logging.getLogger("maiwork")
 
 PLUGIN_ID = "chartyr.maiwork"
-PLUGIN_VERSION = "0.16.0"
+PLUGIN_VERSION = "0.16.1"
 
 __all__ = [
     "PLUGIN_ID",
@@ -100,7 +100,7 @@ class MaiWorkPlugin(MaiBotPlugin):
 
     @Tool(
         PLANNER_HANDOFF_TOOL,
-        description="仅在群友提出需要后台调研/制作交付、长期盯梢或定时提醒的新请求时调用（无论是否 @ 机器人）；日常闲聊、问候、玩梗、常识简答、/mw 指令或正在进行的工作会话续接补充切勿调用。调用后按返回状态自然简短回复群友，不要自己在聊天里重复制作或虚报交付时间。",
+        description="把群友明确交给你的找资料/找书/搜集证据、整理制作、网页/文档/代码生成、持续盯办、定时提醒等工作交给 MaiWork 接手执行。仅在群聊中当前被 @ 或群友明确向你提出工作请求时调用（此类派活必须优先调用本工具，不要调 web_search 自己查）；普通闲聊、简单常识问答、纯玩梗、情绪交流不要调用。调用成功后 MaiWork 会亲自在群里回复接单，你严禁再调用 reply 回复同一条消息（下一轮直接调用 stop 结束）。",
         parameters=[
             ToolParameterInfo(name="msg_id", param_type=ToolParameterType.STRING,
                               description='提出该请求的群友消息编号（取 <message msg_id="..."> 中的 msg_id）。', required=True),

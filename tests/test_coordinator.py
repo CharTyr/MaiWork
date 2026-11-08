@@ -93,7 +93,7 @@ class FakeWorkers:
 
     async def run(self, brief, *, group_id, tools, task_id="", actor="", max_steps=12,
                   output_schema=None, workspace=None, system_extra="", artifact_scope=None,
-                  write_scope=None):
+                  write_scope=None, skills_hint=None):
         self.calls.append(
             {
                 "brief": brief,
@@ -106,6 +106,7 @@ class FakeWorkers:
                 "workspace": workspace,
                 "system_extra": system_extra,
                 "artifact_scope": artifact_scope,
+                "skills_hint": skills_hint,
             }
         )
         if self.before_return is not None:
@@ -681,7 +682,7 @@ async def test_same_workspace_tasks_serialized(
     class _Worker:
         async def run(self, brief, *, group_id, tools, task_id="", actor="", max_steps=12,
                       output_schema=None, workspace=None, system_extra="", artifact_scope=None,
-                  write_scope=None):
+                  write_scope=None, skills_hint=None):
             entered.append(task_id)
             order.append(f"enter:{task_id}")
             await asyncio.sleep(0.05)
@@ -1355,3 +1356,36 @@ async def test_delivery_allows_task_artifact_dir_itself(
     assert task["status"] == "completed"
     assert len(delivery.delivered) == 1
     assert delivery.delivered[0]["path"] == env.workspace(tasks.get(tid)["workspace"]) / "artifacts" / tid
+
+
+async def test_plan_prompt_uses_entries_for_prompt(
+    mem_store: Store, settings, env, tools, tasks, goals
+):
+    """派活提示词拿画像走 entries_for_prompt（按类别优先级），不是 entries() 字母序前 20 条。"""
+    tid = _create_task(tasks)
+    models = ModelsQueue(replies=[_plan(), _review(pass_=True)])
+    workers = FakeWorkers()
+
+    class _P(_Profiles):
+        def entries(self, group_id):  # 老接口：给的全是约定
+            return [{"text": f"约定{i}", "category": "convention"} for i in range(30)]
+
+        def entries_for_prompt(self, group_id, limit=20):  # 新接口：含在做的事
+            return [{"text": "在做的秘密项目", "category": "ongoing"}]
+
+    async def _write_artifact():
+        ws = env.workspace(tasks.get(tid)["workspace"])
+        (ws / "artifacts" / tid).mkdir(parents=True, exist_ok=True)
+        (ws / "artifacts" / tid / "index.html").write_text("<html>ok</html>", encoding="utf-8")
+
+    workers.before_return = _write_artifact
+    coordinator = _build(
+        mem_store=mem_store, settings=settings, env=env, tools=tools,
+        tasks=tasks, goals=goals, models=models, workers=workers,
+    )
+    coordinator._profiles = _P()  # noqa: SLF001
+    await coordinator.run_task(tid)
+    assert models.calls, "主模型一次都没被调到"
+    plan_messages = models.calls[0][1]
+    joined = "\n".join(str(m.get("content") or "") for m in plan_messages)
+    assert "在做的秘密项目" in joined

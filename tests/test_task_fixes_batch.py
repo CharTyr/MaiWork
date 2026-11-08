@@ -78,7 +78,7 @@ class FakeWorkers:
 
     async def run(self, brief, *, group_id, tools, task_id="", actor="", max_steps=12,
                   output_schema=None, workspace=None, system_extra="", artifact_scope=None,
-                  write_scope=None):
+                  write_scope=None, skills_hint=None):
         import asyncio as _aio
         self.calls.append({"brief": brief, "tools": list(tools), "task_id": task_id})
         if self.before_return is not None:

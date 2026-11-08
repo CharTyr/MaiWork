@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Optional, Set
+from typing import Any, Set
 
 logger = logging.getLogger("maiwork.channel_dedup")
 

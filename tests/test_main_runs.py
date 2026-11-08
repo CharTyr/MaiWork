@@ -555,3 +555,13 @@ class TestBoardLane:
         assert secret_text not in blob
         lane = next(x for x in data["lanes"] if x["kind"] == "main")
         assert lane["history"][0]["title"] == "回答管理员"
+
+
+def test_prune_tolerates_missing_main_runs_table(tmp_path) -> None:
+    """老库没有 main_runs 表（迁移没跑到的半截库）：每日清理不报错，当清了 0 条。"""
+    store = Store(tmp_path / "t.db")
+    store.migrate()
+    with store.tx() as conn:
+        conn.execute("DROP TABLE main_runs")
+    counts = store.prune(clock.now())
+    assert counts["main_runs"] == 0

@@ -135,6 +135,9 @@ class FakeProfiles:
     def entries(self, group_id: str) -> List[dict]:
         return list(self.entries_map.get(group_id, []))
 
+    def entries_for_prompt(self, group_id: str, limit: int = 20) -> List[dict]:
+        return list(self.entries_map.get(group_id, []))[: int(limit)]
+
     def add_entry(self, group_id: str, category: str, text: str) -> int:
         entries = self.entries_map.setdefault(group_id, [])
         entry_id = max((int(e.get("id", 0)) for e in entries), default=0) + 1

@@ -185,6 +185,56 @@ BRIEF_JOB_TAIL = (
 _BRIEF_JOB_TAIL_MARK = "这是随口一问"
 
 # ---------------------------------------------------------------------------
+# brief 规模档（随口一问）：子 agent 的说明由代码一次性拼好的「合同」（2026-11，
+# docs/26 问题 C 收口 —— 模型写的 jobs[0].brief 不再下发，免得和 BRIEF_JOB_TAIL
+# 打架；它只存进 task.plan.scale 事件的 model_brief 备查）。
+# 这一段吸收了原本五层各自为政的要求：BRIEF_JOB_TAIL（不写别的文件）+
+# deliver=text 段（reply.md 验收、禁报告小标题）+ 篇幅段（≤300 字、1~3 链接）+
+# research_chat_framework（打开核实、不标单源/多源）+ AUDIENCE_NOTE（不露内部说法）。
+# ---------------------------------------------------------------------------
+
+
+def _brief_contract(artifact_dir: str) -> str:
+    """随口一问的活钉在子 agent 说明末尾的固定合同（代码写死，不接受模型改写）。"""
+    return (
+        "这是随口一问：查清楚后直接回话，别把它做成项目。\n"
+        f"- 把要发进群里的完整回复原文写进工作区 {artifact_dir}/{TEXT_REPLY_NAME}"
+        "（也可以直接放在 submit_result 的 data.reply 字段里交回；"
+        "只写正文：不写标题、不写「全文共 N 字」这类自我说明、"
+        "不套「一句话结论 / 大家都同意的」这类报告小标题、不标「（单源）（多源）」）；"
+        "验收只认这个文件，文件不在或是空的就算没做成。\n"
+        "- 正文几句话（一般不超过 300 字，链接另算）：先给结论；查外部事实的活再附 1~3 个你打开核实过的关键链接"
+        "（纯写稿、改写或只整理群聊本身不用硬塞链接）；只在搜索摘要里见过、没打开过的链接不要放。\n"
+        "- 不写 notes.md / 核对表 / 说明文件等任何其它文件；不做网页、不做文件、不做报告。"
+        "要给群友看的只有 reply.md 这一段话，别写任务号、job、artifacts 路径这类内部说法。"
+    )
+
+
+def _strip_brief_job_tail(brief: Any) -> str:
+    """把代码钉上的 `BRIEF_JOB_TAIL` 从模型 brief 里剥掉（兜底路径用，幂等）。
+
+    存档被截短时整句可能只剩开头半句：从 `_BRIEF_JOB_TAIL_MARK` 出现的位置起
+    到末尾全部剥掉，不留半句残话。
+    """
+    text = str(brief or "")
+    mark = text.find(_BRIEF_JOB_TAIL_MARK)
+    if mark >= 0:
+        # 钉尾巴时是 "\n<BRIEF_JOB_TAIL>"，mark 指在「这是随口一问」开头
+        text = text[:mark]
+    return text.rstrip()
+
+
+# 主模型在 jobs[0].tools 里挑了这些轻量只读感知工具时保留（前提是注册表真有）；
+# 重型或冲突工具（render_report / run_command / vm_* / read_skill 等）一律不进 brief 名单。
+_BRIEF_EXTRA_READ_TOOLS = (
+    "social_search",
+    "read_chat_history",
+    "search_memory",
+    "read_profile",
+    "read_file",
+)
+
+# ---------------------------------------------------------------------------
 # 群友给的原图（线上 T-14，2026-10-10）
 #
 # 线上事实：群友引用一张图说「把它改得凶一点，加一句『我可不是什么好好小姐』」。任务的
@@ -1483,6 +1533,43 @@ class Coordinator:
             return False
         return bool(p.exists())
 
+    async def _maybe_sync_text_reply(
+        self, ws_name: str, tid: str, *, deliver_kind: str,
+        steps_dir: str, report: Any,
+    ) -> None:
+        """text 活的自动兜底：子 agent 把回复写进 submit_result.data.reply 而
+        reply.md 不在 / 是空时，由 Coordinator 把那段原文同步落盘（best-effort）。
+
+        验收只认 `artifacts/<任务>/reply.md` 的文件（见 _deliver_text_reply）；合同
+        允许子 agent 两种交法（文件或 data.reply），这条同步让「写了 data.reply
+        却没写文件」也照样过验收和交付。已有非空 reply.md 不覆盖（文件是正主）。
+
+        只限 deliver_kind=text 且不是中间步骤（steps_dir 空的活）；出错只记日志，
+        不挡活本身。
+        """
+        try:
+            if str(deliver_kind or "") != "text" or str(steps_dir or "").strip():
+                return
+            if report is None or not getattr(report, "ok", False):
+                return
+            data = getattr(report, "data", None)
+            if not isinstance(data, dict):
+                return
+            reply_body = str(data.get("reply") or data.get("text") or "").strip()
+            if not reply_body:
+                return
+            reply_rel = f"{self._artifact_dir(tid)}/{TEXT_REPLY_NAME}"
+            existing = self._env.resolve(ws_name, reply_rel)
+            if existing.exists() and existing.is_file() and existing.read_text(
+                encoding="utf-8"
+            ).strip():
+                return
+            await self._env.write_file(ws_name, reply_rel, reply_body)
+            logger.info("任务 %s 子 agent 把回复写在 data.reply，已同步落盘 %s", tid, reply_rel)
+        except Exception:
+            # best-effort：同步失败就当没这回事，验收 / 交付照旧按文件判
+            logger.exception("任务 %s 同步 data.reply → reply.md 失败", tid)
+
     # ------------------------------------------------------------------
     # 群友给的原图（线上 T-14，2026-10-10）
     # ------------------------------------------------------------------
@@ -1893,6 +1980,10 @@ class Coordinator:
     @classmethod
     def _plan_needs_exec(cls, plan: dict) -> bool:
         """计划里有没有至少一条活真要跑命令。没带非空 jobs 列表（单测直接测 _setup_exec_env）按需要算。"""
+        if isinstance(plan, dict) and normalize_scale(plan.get("scale")) == SCALE_BRIEF:
+            # 随口一问（brief）：纯查证问答永远留本机，不扫「下载」这类关键词
+            # 申请远程 VM / 专用机器（环境选择在 _plan 里也同样固定 local）。
+            return False
         jobs = plan.get("jobs") if isinstance(plan, dict) else None
         if not isinstance(jobs, list) or not jobs:
             return True
@@ -2031,7 +2122,7 @@ class Coordinator:
         try:
             if not root.is_dir():
                 return None  # 常规单文件
-            base = root.resolve()
+            root.resolve()
         except OSError:
             return None
         try:
@@ -2176,7 +2267,12 @@ class Coordinator:
                 )
         entries = []
         try:
-            entries = (self._profiles.entries(gid) or [])[:20]
+            # 类别优先级取条目（在做的事 / 兴趣不被约定淹没）；老接口兜底字母序前 20
+            pick = getattr(self._profiles, "entries_for_prompt", None)
+            if callable(pick):
+                entries = pick(gid, limit=20) or []
+            else:
+                entries = (self._profiles.entries(gid) or [])[:20]
         except Exception:
             entries = []
         profile_lines = [f"- {e.get('text', '')}" for e in entries]
@@ -2641,6 +2737,14 @@ class Coordinator:
         # 「就回几句话」。只动交付形式、活数和代码自己加的那条篇幅要求；锁定清单里
         # 模型给的条目一个字都不改，standard / full 行为完全不变。
         scale = normalize_scale(data.get("scale"))
+        # 返工轮的验收意见（首轮为空）：brief 的说明由 _enrich_brief 拼合同，这份意见
+        # 经 plan["rework_note"] 原样传过去；standard / full 照旧走 lane 前情和 brief 原文。
+        rework_note = str(prior_review or "").strip()
+        # 模型写的 jobs[0].brief 原文（还没被 BRIEF_JOB_TAIL / covers 指令改过）：
+        # brief 的说明由代码拼，这段原文只进 task.plan.scale 事件备查。
+        model_brief_raw = (
+            str(jobs[0].get("brief") or "").strip() if jobs and isinstance(jobs[0], dict) else ""
+        )
         brief_before_kind, brief_before_jobs = deliver_kind, len(jobs)
         if scale == SCALE_BRIEF:
             deliver_kind = "text"
@@ -2650,6 +2754,9 @@ class Coordinator:
                 # 子 agent 只看 brief：把「这是随口一问、只回几句话」直接钉在活末尾，
                 # 免得它照模型原来写的「做网页」brief 干活（幂等，不重复追加）。
                 jobs[0]["brief"] = with_brief_job_tail(jobs[0]["brief"])
+                # 工具也由代码钉：固定基础集（搜索 / 抓正文 / write_file / 有图时 read_image）
+                # + 主模型挑的轻量只读感知白名单；重型工具一律不进，岗位上限照常收窄。
+                jobs[0]["tools"] = self._brief_worker_tools(tid, jobs[0])
             if req_items:
                 scaled = requirements.with_brief_scale(req_items)
                 if scaled != req_items:
@@ -2659,16 +2766,39 @@ class Coordinator:
             else:
                 # 旧逻辑（模型没给清单）：不凭空锁一份清单，把篇幅要求放进 criteria。
                 criteria = _with_brief_criteria(criteria)
+        # brief_source：这轮 brief 的说明是从哪来的——"req"（群友原话，首轮）/
+        # "req+review"（原话 + 上次验收意见）/"model"（req 为空退回模型写的 brief 兜底）。
+        if scale == SCALE_BRIEF and not str(task.get("req") or "").strip():
+            brief_source = "model"
+        elif scale == SCALE_BRIEF:
+            brief_source = "req+review" if rework_note else "req"
+        else:
+            brief_source = "model"
         if req_items and (req_fresh or req_changed):
             requirements.save(self._store, tid, req_version, req_items)
+        # 环境选择：brief（随口一问）是纯查证问答，固定留本机——不扫「下载」这类
+        # 关键词申请远程 VM / 专用机器（needs_exec 只在非 brief 时算）。
+        needs_exec = scale != SCALE_BRIEF and self._jobs_need_exec(jobs, criteria)
+        env_choice = self._normalize_env_choice(data.get("env"), needs_exec=needs_exec)
+        machine = str(data.get("machine") or "").strip()[:64] if env_choice == "ssh" else ""
+        env_reason = str(data.get("env_reason") or "").strip()
+
         brief_forced = bool(
             scale == SCALE_BRIEF
             and (brief_before_kind != deliver_kind or brief_before_jobs != len(jobs))
         )
-        self._task_fact_event(
-            tid, gid, "task.plan.scale",
+        scale_event: dict[str, Any] = dict(
             scale=scale, deliver_kind=deliver_kind, jobs=len(jobs), forced=brief_forced,
         )
+        if scale == SCALE_BRIEF:
+            scale_event.update(
+                # 这轮 brief 的实际派单：工具名单 / 环境 / 说明来源 / 模型原文备查
+                tools=list(jobs[0]["tools"]) if jobs else [],
+                env=env_choice,
+                brief_source=brief_source,
+                model_brief=model_brief_raw[:500],
+            )
+        self._task_fact_event(tid, gid, "task.plan.scale", **scale_event)
         logger.info(
             "任务 %s 规模档 scale=%s（交付形式 %s，活数 %d%s）",
             tid, scale, deliver_kind, len(jobs), "，已按 brief 强制" if brief_forced else "",
@@ -2699,12 +2829,6 @@ class Coordinator:
                         tid, "、".join(str(m.get("id")) for m in missing), target + 1,
                     )
 
-        env_choice = self._normalize_env_choice(
-            data.get("env"), needs_exec=self._jobs_need_exec(jobs, criteria)
-        )
-        machine = str(data.get("machine") or "").strip()[:64] if env_choice == "ssh" else ""
-        env_reason = str(data.get("env_reason") or "").strip()
-
         return {
             "criteria": criteria,
             "requirements": req_items,
@@ -2715,6 +2839,9 @@ class Coordinator:
             "env": env_choice,
             "machine": machine,
             "env_reason": env_reason,
+            # brief 合同的输入：上次验收意见（首轮 ""）+ 说明来源，给 _enrich_brief 用
+            "rework_note": rework_note,
+            "brief_source": brief_source,
             # 有子任务被标成调研类 → 验收时做引用核对（交付里没链接就不加那段，见 _review）
             "research": any(j["type"] == "research" for j in jobs),
             # 2026-10-31 能力边界刹车：空串 = 没说做不到（上面非空时早返回了）
@@ -2992,6 +3119,7 @@ class Coordinator:
                 # （岗位上限 / 环境换名之后的名单，和真跑活同一个解析入口）。
                 tools=self._job_tool_names(j, on_remote=job_on_remote, box=job_box),
                 scale=normalize_scale(plan.get("scale")),
+                rework_note=str(plan.get("rework_note") or ""),
             )
             for d in deps:
                 await done[d - 1].wait()
@@ -3056,6 +3184,7 @@ class Coordinator:
                 req_version=req_version,
                 deliver_kind=str(plan.get("deliver_kind") or ""),
                 steps_dir=steps_dirs.get(job_no, ""),
+                scale=normalize_scale(plan.get("scale")),
             )
             # docs/22 §4 E：每条活跑完存档（下一轮可以复用；没交出也存，好让下一轮知道）
             self._save_step_record(
@@ -3207,6 +3336,7 @@ class Coordinator:
                         steps_dir=steps_dirs.get(i + 1, ""),
                         tools=tuple(j.get("tools") or ()),
                         scale=normalize_scale(plan.get("scale")),
+                        rework_note=str(plan.get("rework_note") or ""),
                     ),
                     tools=j["tools"],
                     gid=gid,
@@ -3224,6 +3354,7 @@ class Coordinator:
                     step=True,
                     deliver_kind=str(plan.get("deliver_kind") or ""),
                     steps_dir=steps_dirs.get(i + 1, ""),
+                    scale=normalize_scale(plan.get("scale")),
                 )
 
             outs = await asyncio.gather(*[_step(nx) for nx in nexts])
@@ -3335,7 +3466,12 @@ class Coordinator:
         step: bool = False,
         deliver_kind: str = "",
         steps_dir: str = "",
+        scale: str = "standard",
     ) -> Any:
+        # 随口一问（brief）：说明是代码拼好的合同（含核实链接 / 禁报告小标题 /
+        # 不露内部说法），调研框架、similar-skill 前置、skills_hint / read_skill
+        # 这些层全是多余的，全部跳过（standard / full 不动）。
+        is_brief = normalize_scale(scale) == SCALE_BRIEF
         sem = self._semaphore_for(ws_name)
         async with sem:
             try:
@@ -3347,8 +3483,9 @@ class Coordinator:
                 return WorkerReport(ok=False, summary="", error=f"拿不到工作区：{e}")
             # 调研类子任务：system 提示追加报告框架（做东西的活不加）；
             # 直接在群里回文字（deliver_kind=text 且不是中间步骤）走聊天查证口径，不套六段报告八股。
+            # brief 的合同里已含聊天查证口径，两层都不加。
             system_extra = ""
-            if str(job_type) == "research":
+            if str(job_type) == "research" and not is_brief:
                 try:
                     from .workers import research_chat_framework, research_report_framework
 
@@ -3367,7 +3504,8 @@ class Coordinator:
                         )
                 except Exception:
                     logger.exception("取调研报告框架失败")
-            brief = self._find_similar_skill_brief(brief, gid) + brief
+            if not is_brief:
+                brief = self._find_similar_skill_brief(brief, gid) + brief
             try:
                 specialists = getattr(self, "_specialists", None)
                 kind = str(agent or "task")
@@ -3395,7 +3533,7 @@ class Coordinator:
                     except Exception:
                         logger.debug("读任务便条出错（群 %s），这次不注入", gid, exc_info=True)
                 if specialists is None:
-                    return await self._workers.run(
+                    report = await self._workers.run(
                         brief,
                         group_id=gid,
                         tools=tools,
@@ -3405,7 +3543,14 @@ class Coordinator:
                         system_extra=system_extra,
                         artifact_scope=artifact_scope,
                         write_scope=write_scope,
+                        # brief 合同已点名「直接回话」，skill 清单这一层不附
+                        **({"skills_hint": ""} if is_brief else {}),
                     )
+                    await self._maybe_sync_text_reply(
+                        ws_name, tid,
+                        deliver_kind=deliver_kind, steps_dir=steps_dir, report=report,
+                    )
+                    return report
                 if system_extra:
                     brief = brief + "\n\n" + system_extra
                 # 专岗改版 4/4：这条活是主模型挑的「哪个岗」就跑哪个岗（kind = plan.jobs[].agent；
@@ -3420,7 +3565,13 @@ class Coordinator:
                     workspace=ws_path,
                     artifact_scope=artifact_scope,
                     write_scope=write_scope,
+                    # brief 合同已点名「直接回话」：skill 名单压空、system 不附 skill 提示
+                    **({"suppress_skills": True} if is_brief else {}),
                     **lane_kw,
+                )
+                await self._maybe_sync_text_reply(
+                    ws_name, tid,
+                    deliver_kind=deliver_kind, steps_dir=steps_dir, report=report,
                 )
                 if lane and opening is not None:
                     # 工作视图 + 原始历史 + 压缩覆盖一条事务写；expect_rev 钉住读到的原始历史版本
@@ -3812,6 +3963,56 @@ class Coordinator:
             return ""
         return ""
 
+    def _brief_worker_tools(self, tid: str, job: dict | None = None) -> list[str]:
+        """brief（随口一问）活的工具名单：代码固定基础集 + 轻量只读感知白名单。
+
+        - 基础固定集：搜索一个（web_search 优先）、抓正文一个（fetch_page 优先）、
+          write_file（写 reply.md）；有原图且 read_image 注册了再加 read_image；
+          每一个都要注册表里有才给（拿不到就验收如实判失败，不塞假名字）。
+        - 轻量只读感知白名单（_BRIEF_EXTRA_READ_TOOLS）：主模型在 jobs[0].tools 里
+          显式挑了其中已注册的就保留；重型或冲突工具（render_report / generate_image /
+          run_command / vm_* / machine_* / read_skill 等）一律不进。
+        - 挂了 specialists 就再走一遍和真跑活同一个解析（`_job_effective_tools`）
+          按岗位上限收窄（收窄不放大）；解析不出来 → 空名单（fail-closed，不派假能力）。
+        submit_result 由 workers.run 每次自动保底，不进这份候选名单。
+        """
+        candidates: list[str] = []
+        for need in ("search", "extract", "write"):
+            name = self._candidate_fill_tool(need)
+            if name and name not in candidates:
+                candidates.append(name)
+        if bool((getattr(self, "_input_images", None) or {}).get(tid)) and (
+            self._worker_tool_registered(_VISION_TOOL_NAME)
+        ):
+            candidates.append(_VISION_TOOL_NAME)
+        if isinstance(job, dict):
+            for raw in job.get("tools") or []:
+                t = str(raw or "").strip()
+                if (
+                    t in _BRIEF_EXTRA_READ_TOOLS
+                    and self._worker_tool_registered(t)
+                    and t not in candidates
+                ):
+                    candidates.append(t)
+        specialists = getattr(self, "_specialists", None)
+        if specialists is not None:
+            effective, _kind, why = self._job_effective_tools(
+                {
+                    "tools": candidates,
+                    "agent": (job or {}).get("agent") or "task",
+                },
+                on_remote=False,
+                box=None,
+            )
+            if why:
+                # 解析不出来 → fail-closed：宁可空名单让验收如实判失败，
+                # 也不把没解析过的候选当成「子 agent 真拿得到」。
+                logger.warning("任务 %s brief 工具名单按岗位解析失败：%s", tid, why)
+                return []
+            allowed = set(effective)
+            candidates = [t for t in candidates if t in allowed]
+        return candidates
+
     def _try_fill_worker_tool(
         self, job: dict, tool_name: str, *, on_remote: bool, box: Any
     ) -> bool:
@@ -3849,8 +4050,9 @@ class Coordinator:
         """提示词会点名、但这条活名单里还没有的工具 → [(工具名, 中文说明)]（2026-10-15 任务 B）。
 
         规矩（只补提示词**真会写到**的，不滥补）：
-        - `render_report`：deliver_kind=view（brief 里让子 agent 用 render_report 交网页）
-          或这条活是调研活（报告框架点名它）；
+        - `render_report`：只限 deliver_kind=view（只有 view 路径的提示词才点名它：
+          brief 里让子 agent 用 render_report 交网页；调研框架里网页 / 文件类才提它，
+          text 直出文字走聊天查证口径不提）；
         - `read_skill`：现在有可用 worker skill（system 提示会附 skill 清单并让读全文）。
 
         **不在这里管 `generate_image`**（2026-10-15 复核更正 docstring）：生图工具由
@@ -3865,9 +4067,8 @@ class Coordinator:
         if not isinstance(job, dict):
             return out
         existing = {str(t) for t in (job.get("tools") or ())}
-        is_research = str(job.get("type") or "") == "research"
         if "render_report" not in existing and (
-            str(plan.get("deliver_kind") or "") == "view" or is_research
+            str(plan.get("deliver_kind") or "") == "view"
         ):
             out.append((
                 "render_report",
@@ -3929,49 +4130,14 @@ class Coordinator:
             if not isinstance(jobs, list) or not jobs:
                 return ExecCheckReport()
             criteria_text = " ".join(str(c) for c in (plan.get("criteria") or []))
+            # 随口一问（brief）：工具名单 / 说明 / 环境都已由代码钉死，能力闸只保留
+            # 「看图」一项（有原图或文字要看图 → 必须有 read_image + vision 模型）；
+            # render_report / read_skill / exec / write / image 的补与不补全跳过。
+            is_brief = normalize_scale(plan.get("scale")) == SCALE_BRIEF
             for idx, job in enumerate(jobs):
                 if not isinstance(job, dict):
                     continue
                 text = f"{job.get('brief') or ''} {criteria_text}"
-                needs_exec = job_needs_exec_capability(text)
-                job_remote = bool(on_remote and self._job_needs_exec(job, criteria_text))
-                job_box = box if job_remote else None
-                is_research = str(job.get("type") or "") == "research"
-                needs_file = job_needs_file_output(text)
-                # 2026-10-15 任务 A3：要画图（画图 / 生图 / 配图 / 海报 / 插画）但拿不到
-                # generate_image（或没配生图模型）→ 和「要执行能力但拿不到」同一条路。
-                # 判据是**这条活的 brief**（真派下去要干的活）；只有整个任务的交付形态就是
-                # 图片（deliver_kind=image）时，完成标准里提到画图也算。这样「完成标准里
-                # 顺带提一句画一张图（补充 / 加分项）」不会把整条任务卡住——补充项没做到
-                # 本来就由清单判定管，不该在开工前当硬门槛。
-                needs_image = job_needs_image_capability(job.get("brief") or "") or (
-                    str(plan.get("deliver_kind") or "") == "image"
-                    and job_needs_image_capability(criteria_text)
-                )
-                # 2026-10-15 任务 B：提示词会点名的工具先补齐（只补、不判「做不到」）——
-                # 这一趟对所有活都跑，不受下面那条「要不要做能力检查」的早退影响。
-                for tool_name, why_line in self._prompt_named_tool_fills(job, plan):
-                    if not self._worker_tool_registered(tool_name):
-                        continue
-                    if not self._try_fill_worker_tool(
-                        job, tool_name, on_remote=job_remote, box=job_box
-                    ):
-                        continue
-                    short0 = " ".join(str(text).split())[:40]
-                    note0 = (
-                        f"开工前自检：{why_line}，已按岗位允许的范围补上 {tool_name}"
-                        f"（第 {idx + 1} 条活「{short0}…」）"
-                    )
-                    logger.info("任务 %s %s", tid, note0)
-                    self._record_exec_event(
-                        tid, gid, "task.tool_autofill", note0,
-                        job=idx + 1, tool=tool_name, agent=str(job.get("agent") or "task"),
-                        need=tool_name,
-                    )
-                    findings.append(ExecFinding(
-                        job=idx + 1, agent=str(job.get("agent") or "task"), brief=short0,
-                        status="filled", tool=tool_name, need=tool_name,
-                    ))
                 # 2026-10-31 能力边界刹车：要「真正看图」的活（任务带原图 input/，
                 # 或 brief/完成标准写了「看看图上写了什么 / 识表 / 看排版」）必须有
                 # read_image **和** vision=True 的模型。判据和生图一样走「子 agent
@@ -3980,6 +4146,53 @@ class Coordinator:
                 needs_vision = bool(
                     getattr(self, "_input_images", {}).get(tid)
                 ) or job_needs_vision_capability(text)
+                if is_brief and not needs_vision:
+                    continue
+                # brief（随口一问）：名单由 _brief_worker_tools 钉死（没有执行 / 生图 /
+                # 写报告工具），合同也不许它做网页做文件——exec / file / image 这些
+                # 「做不成就重排」的闸对 brief 全关，只有上面的 vision 一项还在管。
+                needs_exec = not is_brief and job_needs_exec_capability(text)
+                job_remote = bool(on_remote and self._job_needs_exec(job, criteria_text))
+                job_box = box if job_remote else None
+                is_research = str(job.get("type") or "") == "research"
+                needs_file = not is_brief and job_needs_file_output(text)
+                # 2026-10-15 任务 A3：要画图（画图 / 生图 / 配图 / 海报 / 插画）但拿不到
+                # generate_image（或没配生图模型）→ 和「要执行能力但拿不到」同一条路。
+                # 判据是**这条活的 brief**（真派下去要干的活）；只有整个任务的交付形态就是
+                # 图片（deliver_kind=image）时，完成标准里提到画图也算。这样「完成标准里
+                # 顺带提一句画一张图（补充 / 加分项）」不会把整条任务卡住——补充项没做到
+                # 本来就由清单判定管，不该在开工前当硬门槛。
+                needs_image = not is_brief and (
+                    job_needs_image_capability(job.get("brief") or "") or (
+                        str(plan.get("deliver_kind") or "") == "image"
+                        and job_needs_image_capability(criteria_text)
+                    )
+                )
+                # 2026-10-15 任务 B：提示词会点名的工具先补齐（只补、不判「做不到」）——
+                # 这一趟对所有活都跑，不受下面那条「要不要做能力检查」的早退影响。
+                if not is_brief:
+                    for tool_name, why_line in self._prompt_named_tool_fills(job, plan):
+                        if not self._worker_tool_registered(tool_name):
+                            continue
+                        if not self._try_fill_worker_tool(
+                            job, tool_name, on_remote=job_remote, box=job_box
+                        ):
+                            continue
+                        short0 = " ".join(str(text).split())[:40]
+                        note0 = (
+                            f"开工前自检：{why_line}，已按岗位允许的范围补上 {tool_name}"
+                            f"（第 {idx + 1} 条活「{short0}…」）"
+                        )
+                        logger.info("任务 %s %s", tid, note0)
+                        self._record_exec_event(
+                            tid, gid, "task.tool_autofill", note0,
+                            job=idx + 1, tool=tool_name, agent=str(job.get("agent") or "task"),
+                            need=tool_name,
+                        )
+                        findings.append(ExecFinding(
+                            job=idx + 1, agent=str(job.get("agent") or "task"), brief=short0,
+                            status="filled", tool=tool_name, need=tool_name,
+                        ))
                 if not (needs_exec or is_research or needs_file or needs_image or needs_vision):
                     continue
                 short = " ".join(str(text).split())[:40]
@@ -4125,8 +4338,11 @@ class Coordinator:
                             ))
                 # docs/22 §4 D：调研活必须有搜索 + 抓正文 + write_file；
                 # 要产出文件的活必须有 write_file。缺了就按岗位允许的范围补。
+                # （brief 跳过：名单已由 _brief_worker_tools 钉死，不需要这套补齐。）
                 need_list: list[str] = []
-                if is_research:
+                if is_brief:
+                    pass
+                elif is_research:
                     if not self._has_worker_tool(effective, _is_search_tool):
                         need_list.append("search")
                     if not self._has_worker_tool(effective, _is_extract_tool):
@@ -4476,18 +4692,6 @@ class Coordinator:
             return
         try:
             await env.release(box)
-        except Exception:
-            logger.exception("释放一次性机器出错（任务跑完兜底）")
-
-    async def _release_railway(self, box: Any) -> None:
-        """（老名字，railway 专用）保留给老调用 / 测试替身。"""
-        if box is None:
-            return
-        railway = getattr(self, "_railway", None)
-        if railway is None:
-            return
-        try:
-            await railway.release(box)
         except Exception:
             logger.exception("释放一次性机器出错（任务跑完兜底）")
 
@@ -4935,6 +5139,7 @@ class Coordinator:
     def _enrich_brief(
         self, brief: str, tid: str, deliver_kind: str, on_railway: bool = False,
         steps_dir: str = "", tools: Any = None, scale: str = "standard",
+        rework_note: str = "",
     ) -> str:
         """给这条活的 brief 补上代码侧硬要求。
 
@@ -4942,7 +5147,39 @@ class Coordinator:
         该工具时才点名它」的双保险，2026-10-15 任务 B）：名单里没有 render_report /
         generate_image 时，brief 里就不出现这两个名字。None = 调用方不知道名单（老调用 /
         测试），按「有」处理，行为不变。
+
+        `rework_note`：上一轮验收意见原文（首轮 ""）。brief 合同的「上次验收意见」
+        段用它；standard / full 的说明拼装不读它（返工交代照旧写进模型 brief 本身）。
         """
+        if normalize_scale(scale) == SCALE_BRIEF:
+            # brief（随口一问）：说明 = 一份代码拼好的合同——群友原话（req 空才退回
+            # 模型写的 brief，剥掉 BRIEF_JOB_TAIL）+（极短指代且有具体标题时补一行
+            # 「任务主题」）+（有原图时点名原图）+（返工轮带上次验收意见）+ 固定合同。
+            # 模型写的 jobs[0].brief 一律不下发（它和 BRIEF_JOB_TAIL 打架，线上 T-17/19）；
+            # 下面 standard / full 的成品目录句、deliver_kind 段、AUDIENCE_NOTE 也都
+            # 不再加——合同里都有了。
+            task_row = (
+                (self._tasks.get(tid) if getattr(self, "_tasks", None) is not None else None)
+                or {}
+            )
+            task_req = str(task_row.get("req") or "").strip()
+            task_title = str(task_row.get("title") or "").strip()
+            parts: list[str] = [task_req or _strip_brief_job_tail(brief)]
+            if (
+                0 < len(task_req) <= 10
+                and task_title
+                and task_title not in ("整理", "T")
+                and task_title not in task_req
+            ):
+                parts.append(f"任务主题：{task_title}")
+            input_images = (getattr(self, "_input_images", None) or {}).get(tid) or []
+            if input_images:
+                parts.append(input_images_hint(input_images))
+            note = str(rework_note or "").strip()
+            if note:
+                parts.append(f"上次验收意见：{note}")
+            parts.append(_brief_contract(self._artifact_dir(tid)))
+            return "\n\n".join(p for p in parts if p)
         tools_known = tools is not None
         tool_names = {str(t) for t in (tools or ())}
         out = str(brief)
@@ -6983,7 +7220,7 @@ class Coordinator:
                 purpose="coordinator.lead", history=before, prev_summary=prev_summary,
                 prev_covered=prev_covered, raw_cap=raw_count, keep_tokens=budget,
             )
-        except Exception as e:  # 防御：压缩这一路任何岔子都不许把前情弄丢
+        except Exception:  # 防御：压缩这一路任何岔子都不许把前情弄丢
             logger.exception("领队前情压缩异常（%s）", tid)
             view, text, covered = before, None, None
         if text is None:

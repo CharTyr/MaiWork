@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any, Callable
@@ -262,12 +263,13 @@ class Personal:
         except (ModelError, ValueError) as e:
             logger.info("个人向备料-子 agent 失败（群 %s 人 %s）：%s", gid, uid[:8], e)
             return 0
-        except Exception as e:
+        except Exception:
             logger.exception("个人向备料-子 agent 意外（群 %s）", gid)
             return 0
 
         # ③ 第一道（代码侧）+ 打分（相关度对着 persona 条目）+ 第一道（模型侧）
-        survivors = self._hard_reject_code(gid, candidates)
+        # 标题查重同 feeds 挪出事件循环（调用链只读库）
+        survivors = await asyncio.to_thread(self._hard_reject_code, gid, candidates)
         if survivors:
             try:
                 await self._score(gid, name, persona, survivors)
@@ -290,7 +292,7 @@ class Personal:
         # ⑥ 每次最多 personal_per_day 条（2026-10，C01：从写帖之后挪到写帖之前——
         # 确定会被截掉的条目不再花写帖的钱；被截的照落库、带「超出这次上限」的原因）
         per_day = max(1, int(getattr(focus, "personal_per_day", 3)))
-        kept = self._keep_top(survivors, per_day)
+        self._keep_top(survivors, per_day)
 
         # ⑤ 写帖子（写给他本人；原话只取他自己的）——只写最终留下的这几条
         posting = [item for item in survivors if "reject" not in item]
@@ -561,7 +563,7 @@ class Personal:
     def _hard_reject_code(self, gid: str, candidates: list[dict]) -> list[dict]:
         """不调模型的第一道硬性淘汰；返回幸存列表（原序）。"""
         from . import verify_budget
-        from .feeds import _similar, _site_of, _TITLE_DEDUP_RATIO, _domain_blocked, blocked_domains
+        from .feeds import _any_similar, _site_of, _TITLE_DEDUP_RATIO, _domain_blocked, blocked_domains
 
         settings = self._get_settings()
         blocked = set(blocked_domains(self._store, gid))
@@ -587,7 +589,7 @@ class Personal:
                 item["reject"] = ("hard", "来源在屏蔽名单里")
             elif url_key and url_key in seen_urls:
                 item["reject"] = ("hard", "和最近出过的重复（同一个链接）")
-            elif any(_similar(item["title"], t) >= _TITLE_DEDUP_RATIO for t in seen_titles):
+            elif _any_similar(item["title"], seen_titles, _TITLE_DEDUP_RATIO):
                 item["reject"] = ("hard", "和最近出过的重复（标题高度相似）")
             if "reject" not in item:
                 survivors.append(item)
@@ -1054,7 +1056,7 @@ class Personal:
         docs/18 §十：先有真实需要——个人向没有群聊可核 evidence，要求由头（他自己说过想做的那件事）
         写得出；三条 basis 缺一条、help 没给 items / 过不了可行性闸 → 不入库，只记 kv 拦截记录。
         """
-        from .feeds import _similar, _IDEA_DEDUP_RATIO
+        from .feeds import _any_similar, _IDEA_DEDUP_RATIO
         from .privacy import scrub
 
         title = str(idea.get("title") or "").strip()
@@ -1072,7 +1074,7 @@ class Personal:
             "SELECT title FROM ideas WHERE group_id=? AND target_user_id=? AND created>=?",
             (gid, uid, since),
         ).fetchall()
-        if any(_similar(title, str(r["title"])) >= _IDEA_DEDUP_RATIO for r in rows):
+        if _any_similar(title, (str(r["title"]) for r in rows), _IDEA_DEDUP_RATIO):
             return
         # 先有真实需要：由头 = 他自己在群里说过想做的那件事（没有群聊可比对，这就是依据）。
         origin = clean_idea_origin(idea.get("origin"))

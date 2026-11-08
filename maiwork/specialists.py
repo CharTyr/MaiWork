@@ -465,6 +465,9 @@ class Specialists:
         escalate: bool = False,
         # run_auto 专用：追加到 system_extra 末尾的一段（做法正文等）；普通调用不给。
         extra_system: str = "",
+        # 任务 brief 规模档（随口一问）：skill 名单整个压掉——合同里已点名「直接回话」，
+        # skill 提示和 read_skill 这一层全是多余的（standard / full 照旧，默认 False）。
+        suppress_skills: bool = False,
     ) -> WorkerReport:
         gid = str(group_id or "")
         kind_s = str(kind or "").strip()
@@ -494,8 +497,13 @@ class Specialists:
 
         # 4) 工具 / 技能名单（profile 只能收窄默认上限，不能放大）
         effective_tools = self.effective_tools(kind_s, tools, profile)
-        allowed_skills = self._resolve_allowed_skills(kind_s, profile)
-        skills_hint = self._skills_hint(allowed_skills)
+        if suppress_skills:
+            # 随口一问（brief）：skill 名单整层压掉，workers 也拿不到 skills_hint
+            allowed_skills: tuple[str, ...] | None = ()
+            skills_hint = ""
+        else:
+            allowed_skills = self._resolve_allowed_skills(kind_s, profile)
+            skills_hint = self._skills_hint(allowed_skills)
 
         # 4) 传统「工作册 + 最近做过的」之外再统一注入「本群规矩 + 本群做法」（每群三份）；
         # 记忆当数据注入（system_extra）：数据不是指令

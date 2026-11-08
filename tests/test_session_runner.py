@@ -508,6 +508,64 @@ async def test_disabled_runner_reads_nothing_and_admits_old_behavior(rig, monkey
 
 
 @pytest.mark.asyncio
+async def test_clarify_no_answer_drops_clarification_and_resyncs(rig):
+    """主人答「不是」：澄清作废（kv 删、会话按任务回 idle、事件记「非本会话指令」），不开新活。"""
+    r = rig
+    sid = open_idle(r)
+    linked_task(r, sid)  # completed：撤澄清后会话该回到 idle
+    with r.store.tx() as conn:
+        r.store.kv_set(conn, "session.clarification." + sid, {"text": "用那个"})
+        conn.execute("UPDATE task_sessions SET state='asking' WHERE id=?", (sid,))
+    event(r, sid, "不是", kind="clarify_a", mid="ans-no")
+    await r.make().tick()
+    assert r.store.kv_get("session.clarification." + sid) is None
+    assert session(r, sid)["state"] == "idle"
+    assert events(r)[0]["status"] == "applied" and events(r)[0]["note"] == "主人澄清非本会话指令"
+    assert not r.started and not r.judged
+
+
+@pytest.mark.asyncio
+async def test_clarify_yes_answer_reuses_original_instruction(rig):
+    """主人答「是」：拿挂着的原指令直接分类执行，需求里不带「【主人澄清】」尾巴。"""
+    r = rig
+    sid = open_idle(r)
+    with r.store.tx() as conn:
+        r.store.kv_set(conn, "session.clarification." + sid, {"text": "用那个"})
+        conn.execute("UPDATE task_sessions SET state='asking' WHERE id=?", (sid,))
+    event(r, sid, "是", kind="clarify_a", mid="ans-yes")
+    await r.make().tick()
+    assert r.store.kv_get("session.clarification." + sid) is None
+    assert r.judged and r.judged[0]["text"] == "用那个"
+    task = r.tasks.get(r.started[0])
+    assert "用那个" in task["req"] and "主人澄清" not in task["req"]
+    assert events(r)[0]["status"] == "applied"
+
+
+@pytest.mark.asyncio
+async def test_terminal_and_failed_transitions_drop_pending_clarification(rig):
+    """任务到终态（completed / cancelled / failed）：挂着的「等澄清」一并撤掉，会话回 idle。"""
+    r = rig
+    sid = open_idle(r)
+
+    def arm(tid):
+        with r.store.tx() as conn:
+            r.store.kv_set(conn, "session.clarification." + sid, {"text": "用那个"})
+            conn.execute("UPDATE task_sessions SET state='asking' WHERE id=?", (sid,))
+
+    tid = linked_task(r, sid, status="queued")
+    arm(tid)
+    r.tasks.transition(tid, "cancelled")
+    assert r.store.kv_get("session.clarification." + sid) is None
+    assert session(r, sid)["state"] == "idle"
+
+    tid2 = linked_task(r, sid, status="running")
+    arm(tid2)
+    r.tasks.transition(tid2, "failed")
+    assert r.store.kv_get("session.clarification." + sid) is None
+    assert session(r, sid)["state"] == "idle"
+
+
+@pytest.mark.asyncio
 async def test_app_revised_task_restarts_without_waiting_for_loop(tmp_path):
     """阶段 4：运行中改了要求 → 旧那轮停下后马上按新要求重开，不等 30 秒主循环。"""
     from test_app import _app

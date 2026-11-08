@@ -2083,11 +2083,9 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         if allowed_raw is not None:
             body["allowed_tools"] = allowed_raw
             try:
-                allowed_list = skills_web.normalize_allowed_tools(allowed_raw)
+                skills_web.normalize_allowed_tools(allowed_raw)
             except ValueError:
                 return _bad("allowed_tools 要是工具名列表（或空格分隔的字符串）")
-        else:
-            allowed_list = []
         if "roles" in args:
             body["roles"] = args["roles"]
         try:

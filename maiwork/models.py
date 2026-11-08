@@ -343,14 +343,6 @@ class EndpointThrottle:
                 st.sends.append(now)
             yield
 
-    async def wait_cooldown(self, base_url: str, *, concurrency: int = _MAX_CONCURRENCY_DEFAULT) -> None:
-        """只等 429 冷却：列模型 / 测连接用（不占并发名额、不算每分钟额度）。"""
-        st = self._state(self.normalize(base_url), concurrency)
-        async with st.lock:
-            wait = max(0.0, st.cooldown_until - self._now_s())
-        if wait > 0:
-            await self._sleep_s(wait)
-
     def note_429(
         self, base_url: str, retry_after_s: float | None, *, concurrency: int = _MAX_CONCURRENCY_DEFAULT
     ) -> float:
@@ -2840,7 +2832,7 @@ class Models:
         checked_value["base_url"] = writes["models.base_url"]
 
         # 1) 写 config.toml（失败抛错 → 数据库不动，不留半截）
-        result = self._config_writer(writes)
+        self._config_writer(writes)
 
         # 2) 文件写成功后才落 kv / 事件（payload 不含密钥）
         now = clock.now()

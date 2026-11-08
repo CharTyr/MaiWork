@@ -124,7 +124,9 @@ class FakeSpecialists:
     async def run(self, kind, brief, *, group_id, phase="", task_id="",
                   tools=None, output_schema=None, actor="", deadline_ts=None,
                   parent_id="", workspace=None, max_steps=0, artifact_scope=None, criteria=None,
-                  write_scope=None, history=None, escalate=False):
+                  write_scope=None, history=None, escalate=False,
+                  # brief（随口一问）会传 True；fake 只收着不还原真实现（skill 名单不在它的职责里）
+                  suppress_skills=False):
         try:
             profile = self._agents.profile(kind)
         except Exception:

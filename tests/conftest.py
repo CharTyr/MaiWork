@@ -47,6 +47,14 @@ if PLUGIN_DIR.name != "CharTyr_MaiWork" and "CharTyr_MaiWork" not in sys.modules
 TEST_DIR = Path(__file__).resolve().parent
 if str(TEST_DIR) not in sys.path:
     sys.path.insert(0, str(TEST_DIR))
+# 有些测试互相 `from tests.test_coordinator import ...`：把 tests/ 注册成命名空间包，
+# 这样从仓库根跑 pytest 也找得到（以前只有 cwd 恰好在插件目录时碰巧能导）。
+if "tests" not in sys.modules:
+    import types as _types
+
+    _tests_pkg = _types.ModuleType("tests")
+    _tests_pkg.__path__ = [str(TEST_DIR)]
+    sys.modules["tests"] = _tests_pkg
 
 # 安全网拦的真实系统命令（basename，-- 不管绝对路径还是裸名都拦）
 _SYSTEMD_BINARIES = ("systemd-run", "systemctl")
@@ -117,6 +125,8 @@ def _isolated_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     #     HOME），不一起换的话 Windows 上子进程会摸到真用户目录。
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.delenv("TYPESAFE_KEY_FILE", raising=False)
+    monkeypatch.delenv("FREESTYLE_API_KEY", raising=False)
+    monkeypatch.delenv("RAILWAY_API_TOKEN", raising=False)
     fake_home = tmp_path / "tmp-home"
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))

@@ -27,7 +27,6 @@ from .config import (
     Settings,
     _WORKSPACE_RE,
     _default_workspace,
-    normalize_domain,
     parse_serve_group,
 )
 
@@ -211,22 +210,6 @@ def _check_proxy_list(value: Any) -> list[str]:
         if s not in out:
             out.append(s)
     return out
-
-
-def _check_domain_list(field_zh: str) -> Any:
-    def check(value: Any) -> list[str]:
-        if not isinstance(value, list):
-            raise ValueError(f"{field_zh}要填域名列表")
-        out: list[str] = []
-        for raw in value:
-            d = normalize_domain(raw)
-            if not d:
-                raise ValueError(f"{field_zh}里的 {raw!r} 不是合法域名")
-            if d not in out:
-                out.append(d)
-        return out
-
-    return check
 
 
 def _check_str_list(field_zh: str) -> Any:
@@ -757,11 +740,6 @@ SECRET_FIELDS: dict[str, dict[str, Any]] = {
 
 def _norm_key(key: Any) -> str:
     return str(key or "").strip()
-
-
-def read_config_override(store: Any) -> dict[str, dict[str, Any]]:
-    """兼容残留：数据库覆盖层已废弃（配置唯一真实来源是 config.toml），永远 {}。"""
-    return {}
 
 
 def _ctx_of(base: Settings | None, data_dir: Any = None, plugin_dir: Any = None) -> tuple[Any, Any]:

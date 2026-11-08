@@ -76,10 +76,6 @@ PRESETS: dict[str, Preset] = {
     )
 }
 
-# 给网页 / 文档用的一句话总览
-PRESET_IDS: tuple[str, ...] = tuple(PRESETS.keys())
-
-
 def public_list() -> list[dict]:
     """给网页的预设清单（**绝不含密钥**；密钥只由管理员自己填进端点）。"""
     out: list[dict] = []

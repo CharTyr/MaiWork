@@ -12,6 +12,7 @@ import logging
 import re
 
 from . import clock, members
+from .session_gate import _ASKING_NO_RE, _ASKING_YES_RE
 
 logger = logging.getLogger("maiwork.session_runner")
 SESSION_ANSWER_HINT = "@我回答就行"
@@ -47,9 +48,12 @@ class SessionRunner:
     def _message_id(event):
         return str(event["source_key"]).split(":", 2)[-1]
 
-    def _mark(self, conn, event, status="applied", note="已应用"):
+    def _finish_event(self, conn, event_id, status="applied", note="已应用"):
         conn.execute("UPDATE session_events SET status=?,applied_at=?,note=? WHERE id=? AND status='received'",
-                     (status, clock.now(), str(note)[:240], event["id"]))
+                     (status, clock.now(), str(note)[:240], event_id))
+
+    def _mark(self, conn, event, status="applied", note="已应用"):
+        self._finish_event(conn, event["id"], status, note)
 
     def _reply(self, conn, session, key, text, *, event=None, direct=True, task_id=None):
         if self.outbox is None:
@@ -217,7 +221,22 @@ class SessionRunner:
             return
         clarification = self.store.kv_get("session.clarification." + session["id"])
         if kind == "clarify_a" and isinstance(clarification, dict):
-            text = str(clarification.get("text") or "") + "\n【主人澄清】" + text
+            if _ASKING_NO_RE.match(text):
+                # 主人明确说「不是」：澄清作废、会话状态按任务重投影，不建澄清任务。
+                with self.store.tx() as conn:
+                    conn.execute("DELETE FROM kv WHERE key=?", ("session.clarification." + session["id"],))
+                    self.sessions.sync_task_state(conn, session["id"])
+                    self._finish_event(conn, event["id"], "applied", "主人澄清非本会话指令")
+                return
+            if _ASKING_YES_RE.match(text):
+                # 主人说「是」：按原指令继续分类执行，不再追加「【主人澄清】是」；
+                # clarification 一并清掉，免得后面的「还是拿不准」分支拿它再追问。
+                text = str(clarification.get("text") or "").strip()
+                clarification = None
+                with self.store.tx() as conn:
+                    conn.execute("DELETE FROM kv WHERE key=?", ("session.clarification." + session["id"],))
+            else:
+                text = str(clarification.get("text") or "") + "\n【主人澄清】" + text
         action = await self._judge(session, event, text)
         # 判断期间可能被管理员关闭，或关了总开关：迟到的结果不落新活。
         session = self._get(session["id"])

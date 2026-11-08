@@ -21,8 +21,6 @@ from CharTyr_MaiWork.maiwork import clock
 from CharTyr_MaiWork.maiwork.config import load_settings
 from CharTyr_MaiWork.maiwork.store import Store
 
-pytestmark = pytest.mark.asyncio
-
 GID = "900000001"
 
 
@@ -123,6 +121,7 @@ class TestM8StorePrune:
 
 
 class TestM9TaskExceptionGuards:
+    @pytest.mark.asyncio
     async def test_on_long_job_done_swallows_cancelled(self, tmp_path: Path) -> None:
         from fakes import FakeCtx, FakeProfiles
 
@@ -149,6 +148,7 @@ class TestM9TaskExceptionGuards:
         app._on_long_job_done(t)
         app._on_long_job_done(t2)
 
+    @pytest.mark.asyncio
     async def test_commands_start_task_done_callback_logs(self, tmp_path: Path, caplog) -> None:
         """commands._start_task 的 create_task 带 done callback：协程炸了进日志。"""
         from fakes import FakeCtx, FakeProfiles

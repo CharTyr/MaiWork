@@ -55,7 +55,6 @@ logger = logging.getLogger("maiwork.console.avatar")
 MAX_BYTES = 2 * 1024 * 1024          # 头像字节上限（上传和出站下载同限）
 FETCH_TIMEOUT_S = 8.0                # 出站超时（含连接 + 读）
 CACHE_TTL_S = 24 * 3600              # 平台头像磁盘缓存 24 小时
-MEMBER_INFO_TTL_S = 6 * 3600         # 群名片 / QQ 昵称缓存 6 小时（task 2，这里只放常量）
 
 _QLOGO_BOT = "https://q1.qlogo.cn/g?b=qq&nk={qq}&s=640"
 _QLOGO_MEMBER = "https://q1.qlogo.cn/g?b=qq&nk={qq}&s=160"

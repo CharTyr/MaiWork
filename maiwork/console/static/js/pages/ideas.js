@@ -7,9 +7,32 @@ import { hash } from "./group.js";
 
 const IDEA_STATE = { new: "", wanted: "有成员需要，等待审批", pending: "等待审批", started: "进行中", dismissed: "已忽略" };
 // 话题类构想（kind=talk）：值得群里聊一聊，不需要 MaiWork 动手 → 不开工，交给 MaiBot 冷场时提起；
-// 「帮一步」（help）和老构想（没有类型）照旧
-const kindTag = (it) => (it.kind === "talk" ? `<span class="idea-kind">话题</span>` : "");
+// 「帮一步」（help）和老构想（没有类型）照旧；调查时已打开原文核实过先手小样的标「附先手小样」
+const cleanHttpUrl = (u) => {
+  const s = String(u || "").trim();
+  return /^https?:\/\/[^\s"'<>\\]+$/i.test(s) && !/[\x00-\x20\x7f]/.test(s) ? esc(s) : "";
+};
 export const pureIdea = (it) => it.kind === "talk";
+export function normalizedPreview(it) {
+  if (!it || pureIdea(it) || !it.preview || typeof it.preview !== "object") return null;
+  const points = (Array.isArray(it.preview.points) ? it.preview.points : [])
+    .map((p) => String(p || "").trim())
+    .filter(Boolean)
+    .slice(0, 4);
+  const sources = (Array.isArray(it.preview.sources) ? it.preview.sources : [])
+    .map((s) => s && { title: String(s.title || "").trim(), href: cleanHttpUrl(s.url) })
+    .filter((s) => s && s.href)
+    .slice(0, 3);
+  if (!points.length || !sources.length) return null;
+  const summary = String(it.preview.summary || "").trim() || points[0];
+  return { summary, points, sources };
+}
+const kindTag = (it) =>
+  it.kind === "talk"
+    ? `<span class="idea-kind">话题</span>`
+    : normalizedPreview(it)
+      ? `<span class="idea-kind idea-kind-preview">附先手小样</span>`
+      : "";
 const ideaDot = (st) => (st === "started" ? "running" : st === "wanted" || st === "pending" ? "pending" : "");
 
 export function viewIdeas(g, v) {
@@ -24,12 +47,14 @@ export function viewIdeas(g, v) {
       const did = `I-${it.id}`;
       const sel = state.detail && state.detail.id === did ? " selected" : "";
       const st = IDEA_STATE[it.state] || "";
+      const pv = normalizedPreview(it);
       return `
       <article class="item ruled tap enter${sel}${it.state === "dismissed" ? " faded" : ""}" style="--i:${k}" data-act="idea-open" data-id="${esc(did)}" tabindex="0">
         ${ico(it.icon || "bulb")}
         <div>
           <h2 class="item-title">${esc(it.title)}${kindTag(it)}</h2>
           <p class="item-body soft clamp3">${esc(it.body)}</p>
+          ${pv ? `<div class="idea-pv-inline"><span class="idea-pv-k">先查到</span><span class="idea-pv-v">${esc(pv.summary)}</span></div>` : ""}
           ${st ? `<div class="status"><span class="dot ${ideaDot(it.state)}"></span><span class="status-text">${esc(st)}</span></div>` : ""}
           ${forWho(it.for_member)}
         </div>
@@ -93,6 +118,20 @@ function ideaItemsBlock(it, open) {
   return `<div class="dt-sec idea-items"><div class="dt-label">包含项目${open && items.length > 1 ? ` <small>${picked.length}/${items.length}</small>` : ""}</div>${items.map(row).join("")}</div>`;
 }
 
+function ideaPreviewBlock(it) {
+  const pv = normalizedPreview(it);
+  if (!pv) return "";
+  return `
+    <div class="dt-sec idea-preview">
+      <div class="dt-label">先手小样 <small>调查时已打开原文核实</small></div>
+      <div class="idea-pv-box">
+        ${pv.summary && pv.summary !== pv.points[0] ? `<p class="idea-pv-sum">${esc(pv.summary)}</p>` : ""}
+        <ul class="idea-pv-list">${pv.points.map((p) => `<li>${esc(p)}</li>`).join("")}</ul>
+        <div class="idea-pv-sources">${pv.sources.map((s) => `<a class="idea-pv-src" href="${s.href}" target="_blank" rel="noopener noreferrer">${esc(s.title || "来源原文")}</a>`).join("")}</div>
+      </div>
+    </div>`;
+}
+
 export function ideaDetail(it) {
   const st = IDEA_STATE[it.state] || "新构想";
   const f = it.feasibility || {};
@@ -122,10 +161,11 @@ export function ideaDetail(it) {
       ${ico(it.icon || "bulb")}
       <div>
         <h2 class="dt-title">${esc(it.title)}${kindTag(it)}</h2>
-        <div class="dt-state"><span class="dot ${ideaDot(it.state)}"></span>${esc(st)}${it.created_ts ? ` · ${esc(dayWord(it.created_ts))}提出` : ""}</div>
+        <div class="dt-state"><span class="dot ${ideaDot(it.state)}</span>${esc(st)}${it.created_ts ? ` · ${esc(dayWord(it.created_ts))}提出` : ""}</div>
       </div>
     </div>
     <div class="dt-sec"><div class="dt-text">${esc(it.body)}</div></div>
+    ${ideaPreviewBlock(it)}
     ${ideaItemsBlock(it, open)}
     ${rows.length ? `<div class="dt-sec idea-rows"><div class="dt-label">补充</div>${rows.map(([k, t]) => `<div class="idea-row"><div class="idea-row-k">${esc(k)}</div><div class="idea-row-v">${esc(t)}</div></div>`).join("")}</div>` : ""}
     ${forWho(it.for_member)}

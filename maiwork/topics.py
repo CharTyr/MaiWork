@@ -616,7 +616,7 @@ class Topics:
         # 11) 判定（Jev 判了，不管开不开都写 topic_log）
         ok_p = float(answers.get("ok", 0.0))
         reason_t = answers.get("reason")
-        reason_label, reason_prob, reason_conf = reason_t if reason_t else ("open_question", 0.0, 0.0)
+        reason_label, _reason_prob, reason_conf = reason_t if reason_t else ("open_question", 0.0, 0.0)
         fit_arr: List[Tuple[int, float]] = []  # (candidate_index, fit)
         for i in range(len(candidates)):
             v = answers.get(f"fit_{i}")
@@ -1498,9 +1498,3 @@ class Topics:
         return s
 
 
-def _insight(quiet_s: float) -> str:
-    """把安静秒数翻成「几分钟 / 几小时」。"""
-    m = int(quiet_s / 60)
-    if m < 60:
-        return f"{m} 分钟"
-    return f"{m // 60} 小时 {m % 60} 分钟"

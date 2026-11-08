@@ -2237,7 +2237,6 @@ class Outbox:
             raise ValueError(f"只有失败或不确定的才能重发（现在是 {row['status']}）")
         if str(row["kind"]) == "file" and str(row["status"]) == "uncertain" and not force:
             raise ValueError("群文件可能已发出，请先到群里确认；确认没发出来才能强制重发")
-            raise ValueError(f"只有失败或不确定的才能重发（现在是 {row['status']}）")
         with self._store.tx() as conn:
             conn.execute(
                 "UPDATE outbox SET status='pending', attempts=attempts+1,"

@@ -219,7 +219,7 @@ class SessionSpeech:
         started_key = f"session.started.{task['id']}.{req_ver}"
         if self.store.kv_get(started_key):
             return
-        text = await self.natural(session, "刚准备开始这轮工作，用自然话回应主人，不能声称已完成。", {"task_id": task["id"], "标题": task["title"], "状态": task["status"]})
+        text = await self.natural(session, "刚收到主人的派活准备开工，只用简短自然的一句话（30字以内）表示已接单、这就去处理；严禁在这里直接回答问题、给结论、评价题目或说「还没跑完」。", {"task_id": task["id"], "标题": task["title"], "状态": "刚接单准备开始"})
         self.relay(task, text, source="main")
         if text:
             with self.store.tx() as conn:

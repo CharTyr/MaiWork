@@ -607,7 +607,7 @@ class Intake:
                 self._reminder_inflight.add(key)
                 _spawn_safely(self._spawn, self._planner_reminder(
                     self._on_reminder, gid, uid, uname, real_mid, text, clean_title, spool_key))
-            return self._cache_planner_receipt(key, {"success": True, "content": "已交给 MaiWork 在后台解析并安排提醒，请勿重复创建或承诺具体时间。"})
+            return self._cache_planner_receipt(key, {"success": True, "content": "已交给 MaiWork 在后台解析并安排提醒（MaiWork 会直接发群回执）；本轮请直接调用 stop 结束，严禁再调用 reply 回复这条消息或承诺具体时间。"})
         if isinstance(spool_key, str) and not await self._wait_recorded(spool_key):
             return self._handoff_error("来源消息仍在等待保存，MaiWork 会继续恢复处理")
         label = "prepare" if kind_s == "task" else "goal"
@@ -634,10 +634,20 @@ class Intake:
         self._complete(gid, real_mid, "request", rid)
         state = "等管理员批准" if res.get("status") == "pending" else "已获准交给 MaiWork"
         ids = "、".join(str(res[k]) for k in ("id", "task_id", "goal_id") if res.get(k))
-        content = f"MaiWork 已接单 {ids}（{state}），无需在聊天里重复制作或承诺交付时间。"
-        self._add_mention(gid, f"{uname or uid} 的请求已由 MaiWork 接手：{ids}（{state}），不要自己重复制作。",
+        content = f"MaiWork 已接单 {ids}（{state}）并会直接在群里回复群友；本轮请直接调用 stop 结束，严禁再调用 reply 回复同一条消息或重复制作。"
+        self._add_mention(gid, f"{uname or uid} 的请求已由 MaiWork 接手并直接回复：{ids}（{state}），严禁再对这条消息调用 reply 或自己重复制作。",
                           key=f"request:{rid}", ttl_s=_REQUEST_MENTION_TTL_S, target_user_id=uid,
                           keywords=[rid, str(text or "")[:60]])
+        if self._mentions is not None:
+            try:
+                self._mentions.drop_ephemeral(gid, f"request:at-{real_mid}")
+                self._mentions.add_ephemeral(
+                    gid,
+                    f"【派活已接手】{uname or uid} 刚才 @ 你派的活已由 MaiWork 接手并直接回复：{ids}（{state}）；"
+                    "本轮严禁调用 reply 或 web_search，请直接调用 stop 结束。",
+                    key=f"request:ack-{rid}", ttl_s=45.0, turns=2, target_user_id=str(uid))
+            except Exception:
+                logger.exception("写派活接手临时备忘出错（群 %s）", gid)
         return self._cache_planner_receipt(key, {"success": True, "content": content})
 
     async def _planner_reminder(self, cb: Any, gid: str, uid: str, uname: str, mid: str,
@@ -1103,16 +1113,29 @@ class Intake:
         wait_for_planner = self._planner_handoff_active(settings, group_id)
         if wait_for_planner:
             self._planner_entry(group_id, message_id)
-        if not wait_for_planner and self._mentions is not None:
+        if self._mentions is not None:
             try:
-                self._mentions.add_ephemeral(
-                    group_id,
-                    "MaiWork 正在后台判断这条 @ 是否为派活或目标（约数秒），请先自然简短接话，不要替自己承诺稍后提交文件或报告。",
-                    key=f"request:at-{message_id}",
-                    ttl_s=15.0,
-                    turns=1,
-                    target_user_id=str(user_id),
-                )
+                if not wait_for_planner:
+                    self._mentions.add_ephemeral(
+                        group_id,
+                        "MaiWork 正在后台判断这条 @ 是否为派活或目标（约数秒）并会直接回复接单，请勿调用 web_search 或替自己承诺稍后提交文件或报告。",
+                        key=f"request:at-{message_id}",
+                        ttl_s=15.0,
+                        turns=1,
+                        target_user_id=str(user_id),
+                    )
+                elif has_request_cue(text):
+                    from .delivery import to_display_message_id
+                    self._mentions.add_ephemeral(
+                        group_id,
+                        f"【派活规则】{user_name or user_id or '群友'} 刚才 @ 了你（msg_id={to_display_message_id(message_id)}）："
+                        "这是派活/查资料/提醒请求，请优先调用 maiwork_handoff 交给 MaiWork；"
+                        "MaiWork 会亲自回复接单，你严禁调用 web_search 自己查或调用 reply 回复同一条消息（交接后直接调用 stop 结束）。",
+                        key=f"request:at-{message_id}",
+                        ttl_s=20.0,
+                        turns=2,
+                        target_user_id=str(user_id),
+                    )
             except Exception:
                 pass
         # 落库必须在钩子里（本地短事务 + 有界等锁；写不进就落 spool）：
@@ -1181,7 +1204,7 @@ class Intake:
                             pass
                 if entry["outcome"] == "handoff":
                     return
-                if entry["outcome"] == "chat" or entry["replied_as_chat"]:
+                if (entry["outcome"] == "chat" or entry["replied_as_chat"]) and not has_request_cue(text):
                     self._decide(group_id, message_id, {"kind": "none", "why": "planner 已按闲聊处理"})
                     return
             if not self._work_allowed(group_id, started_at, message_id):
@@ -1445,12 +1468,22 @@ class Intake:
             group_id,
             f"{name} 刚才 @ 你派的活已由 MaiWork 接手（{state_zh}）。"
             f"你不用答应，不要自己做、不要说你来做或给出成品；"
-            f"可以只简短说一句「好，交给它了」，也可以不回。",
+            f"MaiWork 会直接在群里回复群友，你严禁再对这条消息调用 reply。",
             key=f"request:{res['id']}",
             ttl_s=_REQUEST_MENTION_TTL_S,
             target_user_id=str(user_id),
             keywords=[str(res["id"]), str(text or "")[:60]],
         )
+        if self._mentions is not None:
+            try:
+                self._mentions.add_ephemeral(
+                    group_id,
+                    f"【派活已接手】{name} 刚才 @ 你派的活已由 MaiWork 接手并直接回复（{state_zh}）；"
+                    "本轮严禁调用 reply 或 web_search，请直接调用 stop 结束。",
+                    key=f"request:ack-{res['id']}", ttl_s=45.0, turns=2,
+                    target_user_id=str(user_id))
+            except Exception:
+                logger.exception("写派活接手临时备忘出错（群 %s）", group_id)
         return True
 
     # ------------------------------------------------------------------

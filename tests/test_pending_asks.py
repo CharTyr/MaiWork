@@ -287,6 +287,7 @@ class TestAskPrompt:
         ok = await g.profiles.refresh(GID, force=True)
         assert ok is True
         prompt = models.calls[0][1][1]["content"]
+        system_prompt = models.calls[0][1][0]["content"]
         # 未处理的那条标出来了，别的没标（只看 [序号] 开头的消息行；规则段也含这句话）
         msg_lines = [ln for ln in prompt.splitlines() if ln.lstrip().startswith("[")]
         flagged = [ln for ln in msg_lines if "这条 @ 了 MaiBot，快速判断没判准，请你判断" in ln]
@@ -294,9 +295,9 @@ class TestAskPrompt:
         assert "@她 在吗" in flagged[0]
         normal_line = [ln for ln in msg_lines if "随便聊聊" in ln]
         assert normal_line and "快速判断没判准" not in normal_line[0]
-        # 规则里声明了 asks 和输出格式
-        assert "请求 | 消息序号" in prompt  # 2026-09-29 起一行一件事：请求写成「请求 | …」行
-        assert "prepare 或 goal 或 reminder" in prompt
+        # 规则（在 system）里声明了 asks 和输出格式
+        assert "请求 | 消息序号" in system_prompt  # 2026-09-29 起一行一件事：请求写成「请求 | …」行
+        assert "prepare 或 goal 或 reminder" in system_prompt
 
 
 class TestAskApply:

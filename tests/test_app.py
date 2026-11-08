@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import socket
 from pathlib import Path
 from typing import Any
@@ -897,6 +898,91 @@ class TestM3Loop:
             assert models.purposes == ["approvals.goal_fit"]     # task 请求不判
             row2 = app.store.read().execute("SELECT goal_fit FROM requests WHERE id=?", (task["id"],)).fetchone()
             assert str(row2["goal_fit"]) == ""
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_pending_request_gets_ack_receipt_when_not_auto_reviewed(self, tmp_path: Path) -> None:
+        """群友 @ 来的待批请求：自动审核没批（模型没配 / 不适用）也有一条
+        「收到，已记下…等管理员批准」的群回执（reply_to 原消息、带 /mw 批准 提示）。"""
+        app = _app(tmp_path)
+        await app.start()
+        try:
+            r = app.approvals.create(
+                G1, kind="task", title="整理一份铝坨坨资料", quote="帮我整理",
+                via="群里 @ · Jev 判断是「准备东西」（把握 0.90）",
+                requester_id="20002", requester_name="阿柒", message_id="m-ack",
+            )
+            row = None
+            for _ in range(50):
+                row = app.store.read().execute(
+                    "SELECT payload FROM outbox WHERE key=?", (f"request-ack:{r['id']}",)).fetchone()
+                if row:
+                    break
+                await asyncio.sleep(0.02)
+            assert row, "自动审核没批也该发「已记下」回执"
+            payload = json.loads(row[0])
+            assert payload["push_kind"] == "command" and payload["at_user"] == "20002"
+            assert payload["reply_to"] == "m-ack"
+            assert "已记下" in payload["text"] and f"/mw 批准 {r['id']}" in payload["text"]
+            assert "铝坨坨" in payload["text"]
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("label,extra", [
+        ("mw_do", {"via": "群里 /mw do 指令"}),
+        ("maiwork_source", {"via": "MaiWork 构想", "source": "maiwork"}),
+        ("no_message", {"via": "网页手动登记", "message_id": ""}),
+    ])
+    async def test_pending_request_ack_skipped_for_non_group_at_origins(self, tmp_path: Path, label, extra) -> None:
+        """不发「已记下」回执的三种：/mw do（自己有指令回执）、source 有标记（MaiWork 自己）、
+        没有来源群消息（没处 reply_to）。"""
+        app = _app(tmp_path)
+        await app.start()
+        try:
+            kw = dict(kind="task", title=f"测试 {label}", quote="做点事",
+                      requester_id="20002", requester_name="阿柒", message_id="m-skip")
+            kw.update(extra)
+            r = app.approvals.create(G1, **kw)
+            await asyncio.sleep(0.25)  # 等后台 review 协程跑完
+            row = app.store.read().execute(
+                "SELECT count(*) AS n FROM outbox WHERE key=?", (f"request-ack:{r['id']}",)).fetchone()
+            assert row["n"] == 0
+            pending = app.store.read().execute(
+                "SELECT status FROM requests WHERE id=?", (r["id"],)).fetchone()
+            assert pending["status"] in ("pending", "approved")
+        finally:
+            await app.stop()
+
+    @pytest.mark.asyncio
+    async def test_pending_reminder_text_names_real_approve_command(self, tmp_path: Path) -> None:
+        """待批提醒直接给出可复制的真指令：/mw 批准 <真 ID>，不再是占位「ID」。"""
+        app = _app(tmp_path)
+        app.coordinator_factory = lambda *a, **kw: None
+        await app.start()
+        try:
+            r1 = app.approvals.create(
+                G1, kind="task", title="旧请求一", quote="", via="群里 @",
+                requester_id="20002", requester_name="阿柒",
+            )
+            r2 = app.approvals.create(
+                G1, kind="task", title="旧请求二", quote="", via="群里 @",
+                requester_id="20003", requester_name="老八",
+            )
+            from CharTyr_MaiWork.maiwork import clock
+            t = clock.now()
+            with app.store.tx() as conn:
+                conn.execute("UPDATE requests SET created=? WHERE id=?", (t - 25 * 3600, r1["id"]))
+                conn.execute("UPDATE requests SET created=? WHERE id=?", (t - 25 * 3600, r2["id"]))
+            await app.run_loop_once()
+            row = app.store.read().execute(
+                "SELECT payload FROM outbox WHERE key LIKE 'approval-remind:%'").fetchone()
+            assert row, "该有一条待批提醒进群"
+            text = json.loads(row[0])["text"]
+            assert "批准 ID" not in text
+            assert "/mw 批准" in text and re.search(r"/mw 批准 R-\w+", text)
+            assert r1["id"] in text and r2["id"] in text
         finally:
             await app.stop()
 

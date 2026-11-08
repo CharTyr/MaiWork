@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 import time
 import pytest
+from CharTyr_MaiWork.maiwork import clock
 from CharTyr_MaiWork.maiwork.config import load_settings
 from CharTyr_MaiWork.maiwork.sessions import Sessions
 from CharTyr_MaiWork.maiwork.session_gate import SessionGate, build_pattern, matches
@@ -365,4 +366,91 @@ async def test_session_change_notification_observes_committed_state(setup):
         assert not observed
     await asyncio.sleep(0)
     assert observed == [None]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ["是", "是的", "继续", "好", "不是", "算了", "不用了", "取消"])
+async def test_asking_short_answer_is_clarify_without_triage(setup, answer):
+    """会话在等澄清时，主人回一句「是 / 不是」就算回答（clarify_a 吃掉），不问分类器。"""
+    store, _, row, gate, calls = setup
+    store.read().execute("UPDATE task_sessions SET state='asking' WHERE id=?", (row["id"],))
+    gate.refresh()
+    assert (await gate.handle(message("@東雪蓮 " + answer))) == (True, None, True)
+    assert calls == []
+    event = store.read().execute("SELECT kind,text FROM session_events").fetchone()
+    assert event[0] == "clarify_a" and event[1] == answer
+
+
+@pytest.mark.asyncio
+async def test_asking_long_sentence_still_triages(setup):
+    """不是短答的整句（哪怕以「是」开头）照旧走分类器，不被短答规则吞。"""
+    store, _, row, gate, calls = setup
+    store.read().execute("UPDATE task_sessions SET state='asking' WHERE id=?", (row["id"],))
+    gate.refresh()
+    assert (await gate.handle(message("@東雪蓮 是的我都看了再说"))) == (True, None, True)
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_quote_of_sent_session_message_is_clarify_without_triage(setup):
+    """主人引用的是本会话已经发出去的群里发言（outbox 已发送记了 message_id）→
+    必属本会话，不问分类器直接当澄清吃掉。"""
+    store, _, row, gate, calls = setup
+    store.read().execute("UPDATE task_sessions SET state='asking' WHERE id=?", (row["id"],))
+    with store.tx() as conn:
+        conn.execute("INSERT INTO outbox(key,group_id,kind,payload,status,attempts,result,error,not_before,created,updated)"
+                     " VALUES(?,?,'text','{}','sent',1,?,'',0,1,1)",
+                     (f"session:speech:{row['id']}:T-1:1:1", GID, '{"message_id":"bot-sent-1"}'))
+    gate.refresh()
+    async def boom(*args, **kwargs):
+        raise AssertionError("引用本会话发言不该再调分类器")
+    gate._triage = boom
+    kwargs = message("[reply]@我回答就行 @東雪蓮 这个")
+    kwargs["message"]["raw_message"].insert(0, {"type": "reply", "data": {
+        "target_message_id": "bot-sent-1", "target_message_content": "你是在继续吗？"}})
+    assert (await gate.handle(kwargs)) == (True, None, True)
+    event = store.read().execute("SELECT kind,quoted_ref FROM session_events").fetchone()
+    assert tuple(event) == ("clarify_a", "bot-sent-1")
+
+
+@pytest.mark.asyncio
+async def test_quote_of_other_message_still_triages(setup):
+    """引用的是别的消息（不属本会话）：照旧调分类器，不按澄清处理。"""
+    store, _, row, gate, calls = setup
+    store.read().execute("UPDATE task_sessions SET state='asking' WHERE id=?", (row["id"],))
+    gate.refresh()
+    kwargs = message("[reply]别人的话 @東雪蓮 这个")
+    kwargs["message"]["raw_message"].insert(0, {"type": "reply", "data": {
+        "target_message_id": "other-1", "target_message_content": "别人的话"}})
+    assert (await gate.handle(kwargs)) == (True, None, True)
+    assert len(calls) == 1
+    event = store.read().execute("SELECT kind,quoted_ref FROM session_events").fetchone()
+    assert tuple(event) == ("clarify_a", "other-1")
+
+
+@pytest.mark.asyncio
+async def test_second_unsure_while_asking_never_asks_twice(setup):
+    """还在等澄清时又一句拿不准：不问第二遍「你是在继续…吗？」，
+    撤掉挂着的澄清、按任务重投影会话（回 idle）、消息放行（不消费、不记事件）。"""
+    store, _, row, gate, calls = setup
+    now = clock.now()
+    with store.tx() as conn:
+        conn.execute("INSERT INTO tasks(id,group_id,workspace,title,status,created,updated,session_id,turn_no)"
+                     " VALUES('T-1',?,'w','上一件事','completed',?,?,?,1)", (GID, now, now, row["id"]))
+        store.kv_set(conn, "session.clarification." + row["id"], {"text": "用那个"})
+    store.read().execute("UPDATE task_sessions SET state='asking',current_task_id='T-1' WHERE id=?", (row["id"],))
+    gate.refresh()
+    async def unsure(*args, **kwargs):
+        return {"label": "unsure", "confidence": .9}
+    gate._triage = unsure
+    assert (await gate.handle(message("@東雪蓮 随便说点什么"))) == (True, None, False)
+    assert len(calls) == 0
+    assert store.kv_get("session.clarification." + row["id"]) is None
+    assert store.read().execute("SELECT count(*) FROM session_events").fetchone()[0] == 0
+    assert store.read().execute("SELECT count(*) FROM outbox WHERE key LIKE 'session:clarify:%'").fetchone()[0] == 0
+    assert store.read().execute("SELECT state FROM task_sessions WHERE id=?", (row["id"],)).fetchone()[0] == "idle"
+    assert gate._index[("qq", GID)]["state"] == "idle"
+    # 同一条消息重放：持久化的「不消费」决定还在，不会再判一次
+    gate._decisions.clear()
+    assert (await gate.handle(message("@東雪蓮 随便说点什么"))) == (True, None, False)
 

@@ -33,7 +33,8 @@ const m=new vm.SourceTextModule(fs.readFileSync(cfg.path,'utf8'),{context});awai
 let initial=m.namespace.controlsSection('g1');await new Promise(r=>setImmediate(r));
 const loads=[...calls];calls.length=0;
 if(cfg.switchTo)state.g=cfg.switchTo;
-for(const a of cfg.actions||[])await m.namespace.actControls(a,{dataset:{g:'g1'},disabled:false});
+for(const a of cfg.actions||[])      if(typeof a==='string')await m.namespace.actControls(a,{dataset:{g:'g1'},disabled:false});
+      else await m.namespace.actControls(a.act,{dataset:{g:'g1',...(a.dataset||{})},...(typeof a.checked==='boolean'?{checked:a.checked}:{}),disabled:false});
 if(cfg.draftInput)for(const f of listeners.input||[])f({target:{dataset:{gctl:'approvers'}}});
 if(cfg.snapshotUpdate)m.namespace.controlsSection('g1',{card_push:{group_push:{...push,sent_today:2,quota_used:3}}});
 m.namespace.repaintControls();
@@ -125,3 +126,19 @@ def test_error_stays_next_to_the_form_that_failed(tmp_path):
 def test_approval_draft_preserves_blank_lines_while_typing(tmp_path):
     out = run_controls(tmp_path, actions=["gctl-approval-edit"], fields={"gctl-approvers": "qq:4321\n\n"}, draftInput=True)
     assert "qq:4321\n\n</textarea>" in out["html"]
+
+
+def test_personal_mention_switch_defaults_off_and_toggles_via_push_api(tmp_path):
+    out_default = run_controls(tmp_path)
+    assert "个人资讯顺口提" in out_default["html"]
+    assert 'id="gctl-personal_mention_enabled"' in out_default["html"]
+
+    out_toggle = run_controls(
+        tmp_path,
+        actions=[{"act": "gctl-push-toggle", "dataset": {"key": "personal_mention_enabled", "on": "1"}, "checked": True}],
+    )
+    assert len(out_toggle["calls"]) == 1
+    call = out_toggle["calls"][0]
+    assert call["method"] == "PUT" and call["url"] == "/api/groups/g1/push"
+    assert call["body"]["personal_mention_enabled"] is True
+

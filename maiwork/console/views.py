@@ -1335,13 +1335,13 @@ def _reader_health(svc: Any) -> dict[str, Any]:
     ok：Jina 能用（或关着、走老顺序）；warn：Jina 在冷却（被限流 / 密钥不对 / 额度用完）。
     """
     search = getattr(svc, "search", None)
-    ex_ok, ex_text = False, "没选抓正文工具"
+    ex_text = "没选抓正文工具"
     avail = getattr(search, "extract_available", None)
     if callable(avail):
         try:
-            ex_ok, ex_text = avail()
+            _, ex_text = avail()
         except Exception:
-            ex_ok, ex_text = False, "抓正文工具状态读不出来"
+            ex_text = "抓正文工具状态读不出来"
     extract_part = f"抓正文工具（{ex_text}）"
     reader = getattr(svc, "reader", None)
     enabled = False

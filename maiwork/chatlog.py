@@ -118,6 +118,20 @@ def prune_old(store: Any, group_id: str, *, now: float, keep_days: int = _KEEP_D
         return 0
 
 
+def prune_expired(store: Any, *, now: float, keep_days: int = _KEEP_DAYS) -> int:
+    """按时间清全部群的 chat_log / chat_log_ids（退出服务的群也清）；返回 chat_log 删了几条。
+
+    只按 ts 删、不读内容、不按群过滤——和 prune_old 的按群清理并存，由每日
+    _prune_round 兜住「群退出服务后按群清理再也不跑」的洞。两张表同一事务删，
+    保持一致。
+    """
+    cutoff = float(now) - max(1, int(keep_days)) * 86400.0
+    with store.tx() as conn:
+        cur = conn.execute("DELETE FROM chat_log WHERE ts<?", (cutoff,))
+        conn.execute("DELETE FROM chat_log_ids WHERE ts<?", (cutoff,))
+    return int(cur.rowcount or 0)
+
+
 def _fts_escape(query: str) -> str:
     """FTS5 查询串转义：只把它当一段普通文本（phrase）匹配，不让特殊字符炸查询。"""
     return '"' + query.replace('"', ' ') + '"'

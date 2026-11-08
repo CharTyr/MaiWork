@@ -19,6 +19,12 @@ B. `coordinator.normalize_scale`（纯函数）+ `_plan`：计划 JSON 的 `scal
    text、jobs 最多 1 条、清单里加一条「篇幅：几句话回答清楚，不做网页/文件」
    （条数满了就挂到底线 R0 的文字后，不占条数）；standard/full 行为不变；验收提示带 scale
    和「篇幅与原话相符：brief 是几句话，要一页就一页」；scale 记进任务事件便于观测。
+C. brief 的工人路径收口：模型写的 jobs[0].brief 不再下发，子 agent 说明由
+   `_enrich_brief` 一次性拼成「群友原话 + 固定合同」（返工轮带上次验收意见；req 空
+   退回剥了尾巴的模型 brief；极短指代 + 有具体标题补「任务主题」；有原图点名原图）。
+   工具名单由 `_brief_worker_tools` 钉死（搜索 / 抓正文 / write_file + 有原图时
+   read_image + 轻量只读白名单），岗位上限照常收窄；环境固定 local；能力自检只保留
+   看图闸；跑活时跳过调研框架 / skill 提示；submit_result.data.reply 自动补写 reply.md。
 """
 
 from __future__ import annotations
@@ -45,7 +51,11 @@ from tests.test_coordinator import (  # noqa: F401  （fixtures / 模型桩，�
     tools,
 )
 
+from tests.test_specialists import FakeAgents  # noqa: F401  （专岗 fake，C 节用）
+
 from CharTyr_MaiWork.maiwork.store import Store
+from CharTyr_MaiWork.maiwork.tools import Tool, ToolResult
+from CharTyr_MaiWork.maiwork.workers import WorkerReport
 
 pytestmark = pytest.mark.asyncio
 
@@ -129,6 +139,28 @@ def _event_payloads(store: Store, tid: str, kind: str) -> list[dict]:
         except (ValueError, TypeError):
             out.append({})
     return out
+
+
+def _event_kinds(store: Store, tid: str) -> list[str]:
+    rows = store.read().execute(
+        "SELECT kind FROM events WHERE entity_id=? ORDER BY id", (tid,)
+    ).fetchall()
+    return [str(r["kind"]) for r in rows]
+
+
+def _add_worker_tool(tools, name: str) -> None:
+    """注册一个 worker 角色工具桩（测的是名单挑选，handler 不会被调到）。已注册跳过。"""
+
+    async def _h(ctx, args):  # noqa: ARG001
+        return ToolResult(ok=True, output="x", data={})
+
+    try:
+        tools.register(Tool(
+            name=name, description="测试桩", parameters={"type": "object", "properties": {}},
+            roles=frozenset({"worker"}), handler=_h,
+        ))
+    except ValueError:
+        pass  # register_exec_tools 可能已经注册过同名工具（roles 不同也算撞名）
 
 
 # ===========================================================================
@@ -513,3 +545,422 @@ async def test_brief_scale_item_is_bonus_and_does_not_change_pass_formula():
     # 计划 / 验收提示里看得到（加分项）
     assert req.BRIEF_SCALE_TEXT in req.prompt_line(bonus[0])
     assert any(req.BRIEF_SCALE_TEXT in c for c in req.criteria_texts(items))
+
+
+# ===========================================================================
+# C. brief 的工人路径收口（合同说明 / 钉死工具 / 能力闸 / 跑活精简 / reply 同步）
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# C1. _enrich_brief（scale="brief"）：说明 = 原话 + 合同，模型 brief 不下发
+# ---------------------------------------------------------------------------
+
+
+async def test_brief_enrich_brief_is_req_plus_contract_not_model_brief(
+    mem_store, settings, env, tools, tasks, goals,
+):
+    coord = _note_mod()
+    tid = _create_task(tasks, req="搜搜韩国银行被攻击的事")
+    c = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+               tasks=tasks, goals=goals, models=ModelsQueue(), workers=FakeWorkers())
+    model_brief = "先写 notes.md 存素材，再做网页用 render_report 交付"
+    out = c._enrich_brief(model_brief, tid, "text", scale="brief")  # noqa: SLF001
+    # 原话在第一段（模型写的 brief 一个字都不下发）
+    assert out.startswith("搜搜韩国银行被攻击的事")
+    assert "先写 notes.md 存素材" not in out
+    assert "render_report" not in out
+    assert "做网页用" not in out
+    # 固定合同：reply.md 验收、几句话 + 核实链接、不做网页不做文件、不露内部说法
+    assert f"artifacts/{tid}/reply.md" in out
+    assert "data.reply" in out
+    assert "300 字" in out
+    assert "不做网页、不做文件、不做报告" in out
+    # 老 brief 层那套（成品目录句 / deliver_kind 段 / AUDIENCE_NOTE）不再拼
+    assert "成品放在工作区" not in out
+
+
+async def test_brief_enrich_brief_includes_rework_note(
+    mem_store, settings, env, tools, tasks, goals,
+):
+    tid = _create_task(tasks, req="搜搜韩国银行")
+    c = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+               tasks=tasks, goals=goals, models=ModelsQueue(), workers=FakeWorkers())
+    out = c._enrich_brief(  # noqa: SLF001
+        "随便写", tid, "text", scale="brief", rework_note="上次没附链接",
+    )
+    assert "上次验收意见：上次没附链接" in out
+
+
+async def test_brief_enrich_brief_falls_back_to_stripped_model_brief_when_req_empty(
+    mem_store, settings, env, tools, tasks, goals,
+):
+    coord = _note_mod()
+    tid = _create_task(tasks, req="", reply=None)
+    c = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+               tasks=tasks, goals=goals, models=ModelsQueue(), workers=FakeWorkers())
+    model_brief = "查一下韩国银行的事\n" + coord.BRIEF_JOB_TAIL
+    out = c._enrich_brief(model_brief, tid, "text", scale="brief")  # noqa: SLF001
+    # req 空 → 退回模型写的 brief（剥掉代码钉过的尾巴，不叠第二遍）
+    assert out.startswith("查一下韩国银行的事")
+    assert "不做网页、文件或长报告" not in out  # 模型尾巴剥干净了
+    assert out.count("这是随口一问") == 1  # 只剩合同里那一份
+    assert "做网页、不做文件、不做报告" in out  # 合同本身在
+
+
+async def test_brief_enrich_brief_adds_task_title_for_short_deictic_req(
+    mem_store, settings, env, tools, tasks, goals,
+):
+    tid = _create_task(tasks, title="韩国银行AI攻击事件", req="搜搜")
+    c = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+               tasks=tasks, goals=goals, models=ModelsQueue(), workers=FakeWorkers())
+    out = c._enrich_brief("随便写", tid, "text", scale="brief")  # noqa: SLF001
+    assert out.startswith("搜搜")
+    assert "任务主题：韩国银行AI攻击事件" in out
+    # 标题是「整理」这种泛词 / 请求本身不含标题内容时不补
+    tid2 = _create_task(tasks, title="整理", req="搜搜")
+    out2 = c._enrich_brief("随便写", tid2, "text", scale="brief")  # noqa: SLF001
+    assert "任务主题" not in out2
+
+
+async def test_brief_enrich_brief_names_input_images(
+    mem_store, settings, env, tools, tasks, goals,
+):
+    tid = _create_task(tasks, req="看看这张图上写了什么")
+    c = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+               tasks=tasks, goals=goals, models=ModelsQueue(), workers=FakeWorkers())
+    c._input_images[tid] = [  # noqa: SLF001
+        f"artifacts/{tid}/input/1.png", f"artifacts/{tid}/input/2.png",
+    ]
+    out = c._enrich_brief("随便写", tid, "text", scale="brief")  # noqa: SLF001
+    assert "2 张图片" in out
+    assert f"artifacts/{tid}/input/1.png" in out
+    assert "read_image" in out
+
+
+# ---------------------------------------------------------------------------
+# C2. _brief_worker_tools + _plan：钉死名单 / 环境 local / 事件字段
+# ---------------------------------------------------------------------------
+
+
+async def test_brief_worker_tools_fixed_base_plus_allowlisted_reads(
+    mem_store, settings, env, tools, tasks, goals,
+):
+    tid = _create_task(tasks, req="搜搜")
+    c = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+               tasks=tasks, goals=goals, models=ModelsQueue(), workers=FakeWorkers())
+    for name in ("social_search", "read_chat_history", "read_image"):
+        _add_worker_tool(tools, name)
+    job = {
+        "brief": "搜搜",
+        "agent": "task",
+        "tools": ["social_search", "read_chat_history",
+                  "render_report", "run_command", "read_skill"],
+    }
+    out = c._brief_worker_tools(tid, job)  # noqa: SLF001
+    assert out[:3] == ["web_search", "fetch_page", "write_file"]
+    # 主模型挑的轻量只读感知工具保留（注册表真有才行）
+    assert "social_search" in out and "read_chat_history" in out
+    # 重型 / 冲突工具一律不进
+    for heavy in ("render_report", "run_command", "read_skill"):
+        assert heavy not in out
+    # 没原图 → 不给 read_image；有原图且注册了 → 给
+    assert "read_image" not in out
+    c._input_images[tid] = [f"artifacts/{tid}/input/1.png"]  # noqa: SLF001
+    out2 = c._brief_worker_tools(tid, job)  # noqa: SLF001
+    assert "read_image" in out2
+
+
+async def test_brief_worker_tools_respects_role_ceiling(
+    mem_store, settings, env, tools, tasks, goals,
+):
+    from CharTyr_MaiWork.maiwork.specialists import Specialists
+
+    tid = _create_task(tasks, req="搜搜")
+    c = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+               tasks=tasks, goals=goals, models=ModelsQueue(), workers=FakeWorkers())
+    c._specialists = Specialists(FakeAgents(), FakeWorkers(), None)  # noqa: SLF001
+    # news（只读调研岗）的白名单里没有 write_file → 收窄不放大
+    out = c._brief_worker_tools(tid, {"brief": "搜搜", "agent": "news", "tools": []})  # noqa: SLF001
+    assert "web_search" in out and "fetch_page" in out
+    assert "write_file" not in out
+
+
+async def test_plan_brief_pins_tools_env_and_event_fields(
+    mem_store, settings, env, tools, tasks, goals,
+):
+    coord = _note_mod()
+    tid = _create_task(tasks, title="韩国银行AI攻击事件", req="搜搜今天韩国银行的事")
+    models = ModelsQueue(replies=[_plan_json(
+        scale="brief", deliver_kind="view",
+        jobs=[{"brief": "下载全部帖子做 50 页深度报告",
+               "tools": ["write_file", "run_command", "render_report"]}],
+    )])
+    c = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+               tasks=tasks, goals=goals, models=models, workers=FakeWorkers())
+    plan = await c._plan(tasks.get(tid))
+    assert plan["scale"] == "brief" and plan["deliver_kind"] == "text"
+    assert len(plan["jobs"]) == 1
+    # 工具由代码钉死：固定基础集；模型挑的 run_command / render_report 不进
+    tools0 = plan["jobs"][0]["tools"]
+    assert tools0 == ["web_search", "fetch_page", "write_file"]
+    # brief 里写了「下载」也不申请远程：纯查证问答永远留本机
+    assert plan["env"] == "local"
+    assert c._plan_needs_exec(plan) is False  # noqa: SLF001
+    # 说明来源 + 返工交代
+    assert plan["brief_source"] == "req"
+    assert plan["rework_note"] == ""
+    # task.plan.scale 事件带实际派单信息
+    payload = _event_payloads(mem_store, tid, "task.plan.scale")[-1]
+    assert payload["tools"] == ["web_search", "fetch_page", "write_file"]
+    assert payload["env"] == "local"
+    assert payload["brief_source"] == "req"
+    assert payload["model_brief"] == "下载全部帖子做 50 页深度报告"
+
+
+async def test_plan_brief_rework_round_marks_req_plus_review(
+    mem_store, settings, env, tools, tasks, goals,
+):
+    tid = _create_task(tasks, req="搜搜今天韩国银行的事")
+    models = ModelsQueue(replies=[
+        _plan_json(scale="brief", jobs=[{"brief": "查一下", "tools": []}]),
+        _plan_json(scale="brief", jobs=[{"brief": "再查一下", "tools": []}]),
+    ])
+    c = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+               tasks=tasks, goals=goals, models=models, workers=FakeWorkers())
+    first = await c._plan(tasks.get(tid))
+    assert first["brief_source"] == "req"
+    second = await c._plan(tasks.get(tid), prior_review="上次没附链接")
+    assert second["brief_source"] == "req+review"
+    assert second["rework_note"] == "上次没附链接"
+    payload = _event_payloads(mem_store, tid, "task.plan.scale")[-1]
+    assert payload["brief_source"] == "req+review"
+    assert payload["model_brief"] == "再查一下"
+
+
+# ---------------------------------------------------------------------------
+# C3. _exec_capability_self_check（scale="brief"）：只保留看图闸
+# ---------------------------------------------------------------------------
+
+
+async def test_brief_self_check_skips_render_report_read_skill_exec_fills(
+    mem_store, settings, env, tools, tasks, goals,
+):
+    c = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+               tasks=tasks, goals=goals, models=ModelsQueue(), workers=FakeWorkers())
+    for name in ("render_report", "read_skill", "run_command"):
+        _add_worker_tool(tools, name)
+    # brief 档：deliver_kind 已被 _plan 压成 text；brief 里就算写了「下载」
+    # 也不补执行工具、不补 render_report / read_skill
+    plan = {
+        "scale": "brief", "deliver_kind": "text", "criteria": ["包含链接"],
+        "jobs": [{"brief": "下载并查一下韩国银行的事",
+                  "tools": ["web_search", "fetch_page", "write_file"],
+                  "agent": "task", "type": "research"}],
+    }
+    report = c._exec_capability_self_check(  # noqa: SLF001
+        "T-9", GID, plan, on_remote=False,
+    )
+    assert plan["jobs"][0]["tools"] == ["web_search", "fetch_page", "write_file"]
+    for kind in ("task.tool_autofill", "task.exec_autofill", "task.exec_unavailable"):
+        assert kind not in _event_kinds(mem_store, "T-9")
+    assert not report.blocked
+
+
+async def test_brief_self_check_vision_gate_blocks_without_vision_model(
+    mem_store, settings, env, tools, tasks, goals,
+):
+    # ModelsQueue 没有 has_vision → _vision_configured() = False（没配看图模型）
+    c = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+               tasks=tasks, goals=goals, models=ModelsQueue(), workers=FakeWorkers())
+    _add_worker_tool(tools, "read_image")
+    c._input_images["T-8"] = ["artifacts/T-8/input/1.png"]  # noqa: SLF001
+    plan = {
+        "scale": "brief", "deliver_kind": "text", "criteria": [],
+        "jobs": [{"brief": "看看图上写了什么", "tools": ["web_search"],
+                  "agent": "task", "type": "research"}],
+    }
+    report = c._exec_capability_self_check(  # noqa: SLF001
+        "T-8", GID, plan, on_remote=False,
+    )
+    assert report.blocked
+    assert [f.need for f in report.blocked_findings] == ["vision"]
+    payload = _event_payloads(mem_store, "T-8", "task.exec_unavailable")[-1]
+    assert payload.get("need") == "vision"
+
+
+# ---------------------------------------------------------------------------
+# C4. _run_job / specialists.run（scale="brief"）：跳框架、压 skills、同步 reply.md
+# ---------------------------------------------------------------------------
+
+
+async def test_brief_run_job_skips_frameworks_and_skill_layers(
+    mem_store, settings, env, tools, tasks, goals, monkeypatch,
+):
+    tid = _create_task(tasks, req="搜搜韩国银行", reply=None)
+    coord = _note_mod()
+    # brief 不许碰 similar-skill 前置（碰了就炸）
+    monkeypatch.setattr(
+        coord.Coordinator, "_find_similar_skill_brief",
+        lambda self, brief, gid: "SKILL-PREVIEW ",
+    )
+    workers = FakeWorkers()
+    c = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+               tasks=tasks, goals=goals, models=ModelsQueue(), workers=workers)
+    await c._run_job(  # noqa: SLF001
+        brief="这是随口一问：查清楚后直接回话", tools=["web_search"],
+        gid=GID, tid=tid, job_idx=1, ws_name=settings.workspace_of(GID),
+        job_type="research", deliver_kind="text", scale="brief",
+    )
+    call = workers.calls[-1]
+    assert "SKILL-PREVIEW" not in call["brief"]
+    assert call["system_extra"] == ""  # research 活也不套调研 / 聊天框架
+    assert call["skills_hint"] == ""   # skill 清单不附
+
+
+async def test_brief_run_job_passes_suppress_skills_to_specialists(
+    mem_store, settings, env, tools, tasks, goals,
+):
+    tid = _create_task(tasks, req="搜搜韩国银行", reply=None)
+
+    class _Sp:
+        def __init__(self):
+            self.kwargs: list[dict] = []
+
+        async def run(self, kind, brief, **kw):
+            self.kwargs.append(kw)
+            return WorkerReport(ok=True, summary="做完了")
+
+    sp = _Sp()
+    workers = FakeWorkers()
+    c = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+               tasks=tasks, goals=goals, models=ModelsQueue(), workers=workers)
+    c._specialists = sp  # noqa: SLF001
+    await c._run_job(  # noqa: SLF001
+        brief="这是随口一问：查清楚后直接回话", tools=["web_search"],
+        gid=GID, tid=tid, job_idx=1, ws_name=settings.workspace_of(GID),
+        agent="news", deliver_kind="text", scale="brief",
+    )
+    assert sp.kwargs and sp.kwargs[0].get("suppress_skills") is True
+
+
+async def test_specialists_suppress_skills_zeroes_skills_hint_and_allowed(
+    mem_store, settings, env, tools, tasks, goals,
+):
+    from tests.test_specialists import FakeWorkers as SpFakeWorkers
+
+    from CharTyr_MaiWork.maiwork.specialists import Specialists
+
+    sp_workers = SpFakeWorkers()
+    specialists = Specialists(FakeAgents(), sp_workers, None)
+    await specialists.run(
+        "news", "这是随口一问：查清楚后直接回话",
+        group_id=GID, suppress_skills=True,
+    )
+    call = sp_workers.calls[-1]
+    assert call.skills_hint == ""
+    assert call.allowed_skills == ()
+
+
+# ---------------------------------------------------------------------------
+# C5. _maybe_sync_text_reply：data.reply 自动落盘 reply.md
+# ---------------------------------------------------------------------------
+
+
+def _reply_md_path(env, ws_name: str, tid: str) -> Path:
+    return env.resolve(ws_name, f"artifacts/{tid}/reply.md")
+
+
+async def test_sync_text_reply_writes_reply_md_from_data_reply(
+    mem_store, settings, env, tools, tasks, goals,
+):
+    tid = _create_task(tasks, req="搜搜", reply=None)
+    ws_name = settings.workspace_of(GID)
+    c = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+               tasks=tasks, goals=goals, models=ModelsQueue(), workers=FakeWorkers())
+    await c._maybe_sync_text_reply(  # noqa: SLF001
+        ws_name, tid, deliver_kind="text", steps_dir="",
+        report=WorkerReport(ok=True, summary="做完了", data={"reply": "是钓鱼邮件引起的。"}),
+    )
+    p = _reply_md_path(env, ws_name, tid)
+    assert p.exists() and "钓鱼邮件" in p.read_text(encoding="utf-8")
+
+
+async def test_sync_text_reply_does_not_overwrite_existing_reply_md(
+    mem_store, settings, env, tools, tasks, goals,
+):
+    tid = _create_task(tasks, req="搜搜", reply="工人已经写好的正文")
+    ws_name = settings.workspace_of(GID)
+    c = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+               tasks=tasks, goals=goals, models=ModelsQueue(), workers=FakeWorkers())
+    await c._maybe_sync_text_reply(  # noqa: SLF001
+        ws_name, tid, deliver_kind="text", steps_dir="",
+        report=WorkerReport(ok=True, summary="做完了", data={"reply": "另一份正文"}),
+    )
+    p = _reply_md_path(env, ws_name, tid)
+    assert "工人已经写好的正文" in p.read_text(encoding="utf-8")
+    assert "另一份" not in p.read_text(encoding="utf-8")
+
+
+async def test_sync_text_reply_noops_for_non_text_or_failed_or_empty(
+    mem_store, settings, env, tools, tasks, goals,
+):
+    tid = _create_task(tasks, req="搜搜", reply=None)
+    ws_name = settings.workspace_of(GID)
+    c = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+               tasks=tasks, goals=goals, models=ModelsQueue(), workers=FakeWorkers())
+    p = _reply_md_path(env, ws_name, tid)
+    # 非 text 交付不写
+    await c._maybe_sync_text_reply(  # noqa: SLF001
+        ws_name, tid, deliver_kind="view", steps_dir="",
+        report=WorkerReport(ok=True, summary="做完了", data={"reply": "x"}),
+    )
+    assert not p.exists()
+    # 中间步骤（有 steps_dir）不写
+    await c._maybe_sync_text_reply(  # noqa: SLF001
+        ws_name, tid, deliver_kind="text", steps_dir="steps/1",
+        report=WorkerReport(ok=True, summary="做完了", data={"reply": "x"}),
+    )
+    assert not p.exists()
+    # 失败 / 空 data 不写
+    await c._maybe_sync_text_reply(  # noqa: SLF001
+        ws_name, tid, deliver_kind="text", steps_dir="",
+        report=WorkerReport(ok=False, summary="", error="挂了"),
+    )
+    assert not p.exists()
+    await c._maybe_sync_text_reply(  # noqa: SLF001
+        ws_name, tid, deliver_kind="text", steps_dir="",
+        report=WorkerReport(ok=True, summary="做完了", data={}),
+    )
+    assert not p.exists()
+
+
+async def test_run_job_syncs_data_reply_to_reply_md(
+    mem_store, settings, env, tools, tasks, goals,
+):
+    """端到端：brief 活跑完，子 agent 把回复写在 data.reply → reply.md 自动出现。"""
+    tid = _create_task(tasks, req="搜搜", reply=None)
+    ws_name = settings.workspace_of(GID)
+    workers = FakeWorkers(reports=[
+        WorkerReport(ok=True, summary="做完了", data={"reply": "是钓鱼邮件引起的。"}),
+    ])
+    c = _coord(mem_store=mem_store, settings=settings, env=env, tools=tools,
+               tasks=tasks, goals=goals, models=ModelsQueue(), workers=workers)
+    await c._run_job(  # noqa: SLF001
+        brief="这是随口一问：查清楚后直接回话", tools=["web_search", "write_file"],
+        gid=GID, tid=tid, job_idx=1, ws_name=ws_name,
+        job_type="research", deliver_kind="text", scale="brief",
+    )
+    p = _reply_md_path(env, ws_name, tid)
+    assert p.exists() and "钓鱼邮件" in p.read_text(encoding="utf-8")
+
+
+async def test_brief_contract_does_not_force_links_for_pure_writing():
+    """纯写稿 / 改写 / 整理群聊的 brief 任务不用硬塞外部链接；查外部事实才附打开核实过的链接。"""
+    from CharTyr_MaiWork.maiwork.coordinator import _brief_contract
+
+    contract = _brief_contract("artifacts/T-1")
+    assert "查外部事实" in contract
+    assert "纯写稿" in contract and "不用硬塞链接" in contract
+    assert "只在搜索摘要里见过、没打开过的链接不要放" in contract
+

@@ -26,8 +26,6 @@ from CharTyr_MaiWork.maiwork.host import HostError
 from CharTyr_MaiWork.maiwork.outbox import Delivery, Outbox
 from CharTyr_MaiWork.maiwork.store import Store
 
-pytestmark = pytest.mark.asyncio
-
 GID = "900000001"
 SECRET = "super-secret-key-material"
 
@@ -71,6 +69,7 @@ class TestIterFilesSkipsSymlinks:
 
 
 class TestPublishNeverReadsSymlink:
+    @pytest.mark.asyncio
     async def test_manifest_excludes_secret(self, tmp_path: Path) -> None:
         """发布目录里的符号链接不进 manifest、内容不被读。"""
         import httpx
@@ -108,6 +107,7 @@ class TestPublishNeverReadsSymlink:
 
 
 class TestZipFallbackSkipsSymlinks:
+    @pytest.mark.asyncio
     async def test_zip_fallback_excludes_symlink(self, tmp_path: Path) -> None:
         """view 回落群文件打 zip：符号链接不进 zip。"""
         secret = _outside(tmp_path)
@@ -168,6 +168,7 @@ class TestZipFallbackSkipsSymlinks:
 
 
 class TestFileUploadGuards:
+    @pytest.mark.asyncio
     async def test_upload_symlink_rejected(self, tmp_path: Path) -> None:
         """outbox 执行 file 上传：路径是符号链接 → failed，不调宿主。"""
         secret = _outside(tmp_path)
@@ -203,6 +204,7 @@ class TestFileUploadGuards:
         assert row["status"] == "failed"
         assert host.uploads == []
 
+    @pytest.mark.asyncio
     async def test_upload_outside_workspace_rejected(self, tmp_path: Path) -> None:
         """outbox 执行 file 上传：resolve 后不在 workspace_root 下 → failed，不调宿主。"""
         secret = _outside(tmp_path)
@@ -237,6 +239,7 @@ class TestFileUploadGuards:
         assert row["status"] == "failed"
         assert host.uploads == []
 
+    @pytest.mark.asyncio
     async def test_legit_workspace_file_uploads(self, tmp_path: Path) -> None:
         """工作区内的正常文件照常上传（守卫不误伤）。"""
         store = Store(tmp_path / "t.db")

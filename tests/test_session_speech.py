@@ -207,6 +207,21 @@ async def test_thanks_never_ends_even_when_judge_would_end(rig, text):
 
 
 @pytest.mark.asyncio
+async def test_start_ack_purpose_is_order_ack_only(rig):
+    """刚接单的开场白：提示词只让说「已接单、这就去处理」，严禁当场回答题目。"""
+    r = rig
+    sid = open_idle(r)
+    tid = linked_task(r, sid, status="running")
+    s, m = speech(r)
+    await s.start(r.tasks.get(tid))
+    role, messages = m.chat.call_args.args[:2]
+    prompt = "\n".join(x["content"] for x in messages)
+    assert "已接单" in prompt
+    assert "严禁在这里直接回答问题" in prompt
+    assert "刚接单准备开始" in prompt
+
+
+@pytest.mark.asyncio
 async def test_end_natural_response_and_proposal_requires_confirmation(rig):
     r = rig
     sid = open_idle(r)
