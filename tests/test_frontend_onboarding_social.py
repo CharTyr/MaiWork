@@ -6,7 +6,7 @@ JS = Path(__file__).resolve().parent.parent / "maiwork/console/static/js"
 
 
 def test_social_onboarding_selection_and_partial_failure():
-    source = (JS / "social-brand.js").read_text() + "\n" + (JS / "onboarding-social.js").read_text()
+    source = (JS / "social-brand.js").read_text(encoding="utf-8") + "\n" + (JS / "onboarding-social.js").read_text(encoding="utf-8")
     source = "\n".join(line for line in source.splitlines() if not line.startswith("import ")).replace("export ", "")
     setup = '''
 import assert from "node:assert/strict";
@@ -34,5 +34,9 @@ checks[1].checked = false; fail = true;
 await assert.rejects(saveOnbSocial(), /连接中断/);
 assert.equal(calls.filter(c => c.path.includes("youtube/enable")).length, 1);
 '''
-    result = subprocess.run(["node", "--input-type=module", "-e", setup + source + "\n" + body], capture_output=True, text=True, timeout=15)
+    result = subprocess.run(
+        ["node", "--input-type=module"],
+        input=setup + source + "\n" + body,
+        capture_output=True, text=True, encoding="utf-8", timeout=15,
+    )
     assert result.returncode == 0, result.stderr

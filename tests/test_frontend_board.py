@@ -36,11 +36,12 @@ def _node(body: str) -> subprocess.CompletedProcess:
     """用 node 直接 import board_steps.js 跑单测（它是纯函数模块；state.js 要 window.matchMedia，垫一下）。"""
     setup = (
         "globalThis.window = { matchMedia: () => ({ matches: false, addEventListener() {} }) };\n"
-        f'const mod = await import("file://{(JS / "board_steps.js").as_posix()}");\n'
+        f'const mod = await import("{((JS / "board_steps.js").resolve()).as_uri()}");\n'
     )
     return subprocess.run(
-        ["node", "--input-type=module", "-e", setup + body],
-        capture_output=True, text=True, timeout=20,
+        ["node", "--input-type=module"],
+        input=setup + body,
+        capture_output=True, text=True, encoding="utf-8", timeout=20,
     )
 
 

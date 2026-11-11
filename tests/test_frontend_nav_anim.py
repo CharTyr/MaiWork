@@ -8,7 +8,7 @@ STATIC = Path(__file__).resolve().parent.parent / "maiwork/console/static"
 def test_tabbar_and_rail_preserve_dom_on_tab_switch():
     """Switching between 资讯 / 构想 / 任务 / 群 must update aria-current and tab-pill in place
     so CSS transitions and click animations are not destroyed by innerHTML replacement."""
-    source = (STATIC / "js/render.js").read_text()
+    source = (STATIC / "js/render.js").read_text(encoding="utf-8")
     source = "\n".join(line for line in source.splitlines() if not line.startswith("import ")).replace("export ", "")
     setup = r'''
 import assert from "node:assert/strict";
@@ -92,7 +92,11 @@ const ideasBtn = rail.items.find(x => x.dataset.tab === "ideas");
 assert.equal(taskBtn.getAttribute("aria-current"), "true");
 assert.equal(ideasBtn.getAttribute("aria-current"), "false");
 '''
-    result = subprocess.run(["node", "--input-type=module", "-e", setup + source + body], capture_output=True, text=True, timeout=15)
+    result = subprocess.run(
+        ["node", "--input-type=module"],
+        input=setup + source + body,
+        capture_output=True, text=True, encoding="utf-8", timeout=15,
+    )
     assert result.returncode == 0, result.stderr
 
 

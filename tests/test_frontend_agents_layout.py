@@ -32,13 +32,19 @@ const FISH_SPECIES = [], FISH_EYES = [], FISH_COLORS = [], FISH_COLOR_NAMES = {}
 const api = async () => ({}), repaintSheet = () => {}, loadModels = async () => {}, EFFORT_NAMES = {};
 const document = {addEventListener: () => {}, querySelector: () => null};
 '''
-    result = subprocess.run(["node", "--input-type=module", "-e", setup + source + "\n" + body],
-                            capture_output=True, text=True, timeout=15)
+    result = subprocess.run(
+        ["node", "--input-type=module"],
+        input=setup + source + "\n" + body,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=15,
+    )
     assert result.returncode == 0, result.stderr
 
 
 def _source() -> str:
-    src = (JS / "settings/agents.js").read_text()
+    src = (JS / "settings/agents.js").read_text(encoding="utf-8")
     return "\n".join(line for line in src.splitlines() if not line.startswith("import ")).replace("export ", "")
 
 
@@ -115,8 +121,8 @@ assert.equal(l.match(/S1/g).length, 1);
 
 
 def test_picker_is_only_wired_into_the_all_settings_page():
-    index_src = (JS / "settings/index.js").read_text()
-    rules_src = (JS / "settings/rules.js").read_text()
+    index_src = (JS / "settings/index.js").read_text(encoding="utf-8")
+    rules_src = (JS / "settings/rules.js").read_text(encoding="utf-8")
     assert "sectionPicker" not in index_src, "设置各分栏不再用竖向圆按钮"
     assert "sectionPicker" in rules_src, "「全部设置」保留竖向分类菜单"
 

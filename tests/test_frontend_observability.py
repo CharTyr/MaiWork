@@ -36,9 +36,11 @@ def _run_node(body: str) -> subprocess.CompletedProcess[str]:
         "globalThis.clearInterval = () => {};\n"
     )
     res = subprocess.run(
-        [node, "--input-type=module", "-e", setup + body + "\nprocess.exit(0);\n"],
+        [node, "--input-type=module"],
+        input=setup + body + "\nprocess.exit(0);\n",
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=25,
     )
     assert res.returncode == 0, res.stderr
@@ -48,7 +50,7 @@ def _run_node(body: str) -> subprocess.CompletedProcess[str]:
 def test_ctxmap_treemap_grid_and_escaping() -> None:
     _run_node(
         f"""
-const mod = await import("file://{(JS / "ctxmap.js").as_posix()}");
+const mod = await import("{((JS / "ctxmap.js").resolve()).as_uri()}");
 assert.equal(mod.CELLS, 400);
 assert.equal(mod.normalizeCtxMap(null), null);
 
@@ -99,7 +101,7 @@ assert.ok(insHtml.includes("sys&lt;b&gt;") && !insHtml.includes("sys<b>"));
 def test_jev_bars_all_three_shapes_and_escaping() -> None:
     _run_node(
         f"""
-const {{ jevBarsHTML }} = await import("file://{(JS / "jev_bars.js").as_posix()}");
+const {{ jevBarsHTML }} = await import("{((JS / "jev_bars.js").resolve()).as_uri()}");
 assert.equal(jevBarsHTML(null), "");
 assert.equal(jevBarsHTML({{}}), "");
 
@@ -143,7 +145,7 @@ assert.match(stepHtml, /冷场可开/);
 def test_board_steps_renders_ttft_jev_and_ctxmap() -> None:
     _run_node(
         f"""
-const {{ stepsSectionHTML }} = await import("file://{(JS / "board_steps.js").as_posix()}");
+const {{ stepsSectionHTML }} = await import("{((JS / "board_steps.js").resolve()).as_uri()}");
 const html = stepsSectionHTML({{
   context_map: {{
     used_tokens: 12000,
@@ -183,10 +185,10 @@ assert.match(html, /data-call="99"/);
 def test_board_flow_and_changes_and_index_notes() -> None:
     _run_node(
         f"""
-const {{ state }} = await import("file://{(JS / "state.js").as_posix()}");
-const {{ boardFlowHTML }} = await import("file://{(JS / "board_flow.js").as_posix()}");
-const {{ changeCardHTML, changesPage }} = await import("file://{(JS / "settings/changes.js").as_posix()}");
-const {{ INDEX_NOTE_MAX }} = await import("file://{(JS / "pages/groupctx.js").as_posix()}");
+const {{ state }} = await import("{((JS / "state.js").resolve()).as_uri()}");
+const {{ boardFlowHTML }} = await import("{((JS / "board_flow.js").resolve()).as_uri()}");
+const {{ changeCardHTML, changesPage }} = await import("{((JS / "settings/changes.js").resolve()).as_uri()}");
+const {{ INDEX_NOTE_MAX }} = await import("{((JS / "pages/groupctx.js").resolve()).as_uri()}");
 
 assert.equal(INDEX_NOTE_MAX, 1200);
 

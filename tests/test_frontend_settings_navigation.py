@@ -8,7 +8,7 @@ JS = Path(__file__).resolve().parent.parent / "maiwork/console/static/js"
 def test_vertical_picker_in_settings_and_config_sections():
     files = [JS / "settings/navigation.js", JS / "settings/index.js", JS / "settings/rules.js"]
     assert files[0].is_file(), "缺少竖向分栏选择器"
-    source = "\n".join(p.read_text() for p in files)
+    source = "\n".join(p.read_text(encoding="utf-8") for p in files)
     source = "\n".join(line for line in source.splitlines() if not line.startswith("import ")).replace("export ", "")
     setup = r'''
 import assert from "node:assert/strict";
@@ -36,5 +36,9 @@ assert.ok(escaped.includes("bad&quot;"));
 assert.ok(escaped.includes("&lt;script>"));
 assert.doesNotMatch(escaped, /<script>/);
 '''
-    result = subprocess.run(["node", "--input-type=module", "-e", setup + source + body], capture_output=True, text=True, timeout=15)
+    result = subprocess.run(
+        ["node", "--input-type=module"],
+        input=setup + source + body,
+        capture_output=True, text=True, encoding="utf-8", timeout=15,
+    )
     assert result.returncode == 0, result.stderr

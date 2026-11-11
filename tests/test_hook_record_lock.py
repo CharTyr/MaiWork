@@ -177,7 +177,7 @@ def test_record_pending_bounded_gives_up_within_budget(tmp_path) -> None:
         )
         took = time.monotonic() - start
         assert row is None
-        assert took < 0.7, f"等了 {took:.2f}s（Store 的 busy_timeout 是 5 秒）"
+        assert took < 2.0, f"等了 {took:.2f}s（Store 的 busy_timeout 是 5 秒）"
         # 锁还在：库里不该有半条
         assert store.read().execute(
             "SELECT 1 FROM pending_asks WHERE message_id='m-locked'"

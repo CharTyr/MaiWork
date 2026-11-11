@@ -7,7 +7,8 @@
 **给 MaiBot 配一个真正在群里干活的搭档**：懂这个群 · 主动找资讯 · 提点子 · 盯长期目标 · 接活做完交出来
 
 [![Version](https://img.shields.io/github/v/release/CharTyr/MaiWork?label=version)](https://github.com/CharTyr/MaiWork/releases)
-[![MaiBot](https://img.shields.io/badge/MaiBot-1.3.2%20实测-green.svg)](https://github.com/Mai-with-u/MaiBot)
+[![Tests](https://github.com/CharTyr/MaiWork/actions/workflows/tests.yml/badge.svg)](https://github.com/CharTyr/MaiWork/actions/workflows/tests.yml)
+[![MaiBot](https://img.shields.io/badge/MaiBot-1.0%20~%201.4-green.svg)](https://github.com/Mai-with-u/MaiBot)
 [![SDK](https://img.shields.io/badge/插件%20SDK-2.x-green.svg)](https://github.com/Mai-with-u/MaiBot)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-orange.svg)](LICENSE)
 [![Stars](https://img.shields.io/github/stars/CharTyr/MaiWork)](https://github.com/CharTyr/MaiWork/stargazers)
@@ -35,12 +36,12 @@
 | 能干什么 | 具体怎么做 |
 |------|------|
 | **主动找资讯** | 每天固定几个时段，按群里最近聊的话题上网搜新消息，逐篇打开原文核实、筛掉水文和旧闻，只留真值得看的 |
-| **提点子、盯目标** | 从群聊里想到「这件事我可以帮你们做」并列出步骤；需要长期跟进的事立成目标，定期自己往前推 |
-| **接活、连续改、真验收** | 群友 @MaiBot 派活（查资料、写对比报告、做小工具、出文档），做完先过一遍验收才交付；开工后派活的人在群里直接 @ 它就能补充要求、追问进度、让它重改 |
+| **提点子、盯目标** | 从群聊里想到「这件事我可以帮你们做」（调查核实过的还会附带先手小样），管理员一键直接执行；需要长期跟进的事立成目标，定期自己往前推 |
+| **快问快答、重活真验收** | 随口一问走轻量快车道直接作答；调研报告、写代码等重活做完先过验收才交付，开工后派活的人在群里直接 @ 它就能补充要求、追问进度、让它重改 |
 | **画图、报告页、办公文档** | 调研类任务做成手机电脑都好读的报告网页；配一个生图模型就能画插画和封面；Word / Excel / PPT 组件在网页上一键安装 |
-| **克制不刷屏** | 主动往群里发的消息每天有条数上限，睡觉时段绝不打扰；大部分内容安安静静放在本群网页上 |
-| **管理员握着方向盘** | 群友派的活默认要管理员批准才能动工；低风险小活可以开自动放行（随时能关） |
-| **自带网页工作台** | 每个群有自己的资讯 / 构想 / 在做的事 / 群页面；管理员还能在网页上直接跟 MaiWork 聊天查日志、试工具、改设置，或在「看板」里看每个岗位正在忙什么 |
+| **克制不刷屏、花销有刹车** | 主动发言每天有条数上限，免打扰时段绝不主动吵群（但群友主动派的活做完仍即时回复）；可设**每日 Token 硬熔断上限**，超限自动停掉当日后台定时任务 |
+| **管理员握着方向盘** | 群友派的活默认要管理员批准才能动工；改过的配置自动记录前后对比并支持**一键撤销**，网页还能**一键下载脱敏数据备份** |
+| **自带透明网页工作台** | 每个群有专属的资讯 / 构想 / 在做的事 / 群管理页；管理员能在对话里查日志、用 `/` 点名技能、改设置，或在「看板」看**实时流向脉冲**与**上下文面积图** |
 | **对接你自己的 Agent** | 不想让 MaiWork 自己跑的任务，可以一键把群里的来龙去脉打包，带回你自己的私人 Agent 接着做 |
 
 每项功能的细节见[功能详解](docs/guide/features.md)。
@@ -62,13 +63,13 @@
 
 ### 看板
 
-总管理员专属的「透明机房」：主模型、资讯、构想、目标、通用任务、开话题各占一栏，现在谁在忙、刚干完什么一目了然；卡住超过 10 分钟的会醒目标出来。
+总管理员专属的「透明机房」：顶部实时流向图通过事件流实时点亮「群消息进入 → 主模型调度 → 子专岗执行 → 对外交付」每一步脉冲；下方主模型、资讯、构想、目标、通用任务、开话题各占一栏，谁在忙、刚干完什么一目了然，卡住超过 10 分钟的会醒目标出来。
 
 <div align="center">
 <img src="docs/images/board.png" width="92%" alt="看板" />
 </div>
 
-点开任意一件活，能顺着时间线看清全过程：调了哪个工具、传了什么参数、耗时多久、模型怎么想的、岗位之间互相留了什么便条。
+点开任意一件活，能顺着时间线看清全过程：Jev 判断概率条、调了哪个工具、首字与总耗时、模型怎么思考的、**单轮上下文面积地图**（系统提示、历史对话、工具返回各占多少 Token 一眼看穿），以及岗位之间互相留了什么便条。
 
 <div align="center">
 <img src="docs/images/board-item.png" width="92%" alt="看板：单件过程" />

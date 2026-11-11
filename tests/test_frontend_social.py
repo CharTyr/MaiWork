@@ -11,7 +11,7 @@ LOGOS = Path(__file__).resolve().parent.parent / "maiwork/console/static/assets/
 
 
 def run_social(body):
-    source = (JS / "social-brand.js").read_text() + "\n" + (JS / "settings/social.js").read_text()
+    source = (JS / "social-brand.js").read_text(encoding="utf-8") + "\n" + (JS / "settings/social.js").read_text(encoding="utf-8")
     source = "\n".join(line for line in source.splitlines() if not line.startswith("import "))
     source = source.replace("export ", "")
     setup = r'''
@@ -32,13 +32,17 @@ const clearTimeout = () => {};
 let reply = async (method, path) => method === "GET" ? {platforms: social.platforms || []} : {ok: true};
 const api = async (method, path, data) => {calls.push({method, path, data}); return reply(method, path, data);};
 '''
-    result = subprocess.run(["node", "--input-type=module", "-e", setup + source + "\n{\n" + body + "\n}"], capture_output=True, text=True, timeout=15)
+    result = subprocess.run(
+        ["node", "--input-type=module"],
+        input=setup + source + "\n{\n" + body + "\n}",
+        capture_output=True, text=True, encoding="utf-8", timeout=15,
+    )
     assert result.returncode == 0, result.stderr
 
 
 def test_brand_logo_allowlist_matches_backend_platforms():
     """前端白名单落后于后端注册表时，新平台会静默退回通用图标——这里挡住这种漂移。"""
-    source = (JS / "social-brand.js").read_text()
+    source = (JS / "social-brand.js").read_text(encoding="utf-8")
     listed = re.search(r"const known = \[([^\]]*)\]", source)
     assert listed, "social-brand.js 里应有平台白名单"
     ids = set(re.findall(r'"([a-z0-9_]+)"', listed.group(1)))

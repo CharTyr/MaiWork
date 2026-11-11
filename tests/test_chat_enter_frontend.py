@@ -54,8 +54,11 @@ def test_enter_key_behavior() -> None:
   assert.equal(submitted.length, 2, "输入法组词中不发送");
 }
 """
-    result = subprocess.run(["node", "--input-type=module", "-e", SETUP + _source() + body],
-                            capture_output=True, text=True, timeout=15)
+    result = subprocess.run(
+        ["node", "--input-type=module"],
+        input=SETUP + _source() + body,
+        capture_output=True, text=True, encoding="utf-8", timeout=15,
+    )
     assert result.returncode == 0, result.stderr
 
 

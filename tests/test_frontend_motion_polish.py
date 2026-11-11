@@ -258,7 +258,7 @@ fire("pointerup", { pointerId: 1, clientX: 100, clientY: 240, timeStamp: 150 });
 assert.equal(state.sheet, null, "松手超过阈值应关闭抽屉");
 assert.ok(!nodes.sheet.classList.contains("dragging"));
 """ % repr(str(JS / "sheet.js"))
-    res = subprocess.run([_node(), "--input-type=module", "-e", script], capture_output=True, text=True, timeout=20)
+    res = subprocess.run([_node(), "--input-type=module"], input=script, capture_output=True, text=True, encoding="utf-8", timeout=20)
     assert res.returncode == 0, res.stderr
 
 
@@ -333,7 +333,7 @@ calmVal = true;
 flashCopied(btn);
 assert.ok(!animCalls[0].frames.some((f) => f.filter || f.transform), "减少动态效果下仅做透明度过渡");
 """ % repr(str(JS / "util.js"))
-    res = subprocess.run([_node(), "--input-type=module", "-e", script], capture_output=True, text=True, timeout=20)
+    res = subprocess.run([_node(), "--input-type=module"], input=script, capture_output=True, text=True, encoding="utf-8", timeout=20)
     assert res.returncode == 0, res.stderr
 
 
@@ -449,7 +449,7 @@ fire("click", { target: { closest: () => null } });
 assert.equal(state.ideaMore, null, "点击外部应关闭 .idea-menu");
 assert.equal(picker.open, false, "点击外部应关闭 .section-picker");
 """ % repr(str(JS / "events.js"))
-    res = subprocess.run([_node(), "--input-type=module", "-e", script], capture_output=True, text=True, timeout=20)
+    res = subprocess.run([_node(), "--input-type=module"], input=script, capture_output=True, text=True, encoding="utf-8", timeout=20)
     assert res.returncode == 0, res.stderr
 
 
@@ -530,7 +530,7 @@ assert.equal(animated[1].target, "sibling");
 assert.equal(animated[1].frames[0].transform, "translateY(180px)");
 assert.equal(animated[1].frames[1].transform, "translateY(0)");
 """ % repr(str(JS / "util.js"))
-    res = subprocess.run([_node(), "--input-type=module", "-e", script], capture_output=True, text=True, timeout=20)
+    res = subprocess.run([_node(), "--input-type=module"], input=script, capture_output=True, text=True, encoding="utf-8", timeout=20)
     assert res.returncode == 0, res.stderr
 
 
@@ -617,7 +617,7 @@ fire("click", { target: user.summary });
 fire("toggle", { target: user.d });
 assert.equal(user.body.classes.has("reveal"), true, "用户点击展开 details 应添加 .reveal");
 """ % repr(str(JS / "events.js"))
-    res = subprocess.run([_node(), "--input-type=module", "-e", script], capture_output=True, text=True, timeout=20)
+    res = subprocess.run([_node(), "--input-type=module"], input=script, capture_output=True, text=True, encoding="utf-8", timeout=20)
     assert res.returncode == 0, res.stderr
 
 

@@ -6,7 +6,7 @@ STATIC = Path(__file__).resolve().parent.parent / "maiwork/console/static"
 
 
 def test_unchanged_rail_is_not_rebuilt_and_status_changes_still_render():
-    source = (STATIC / "js/render.js").read_text()
+    source = (STATIC / "js/render.js").read_text(encoding="utf-8")
     source = "\n".join(line for line in source.splitlines() if not line.startswith("import ")).replace("export ", "")
     setup = r'''
 import assert from "node:assert/strict";
@@ -29,13 +29,17 @@ assert.match(html, /r-badge">2/);
 state.groups[0].avatar = "/new-avatar.png"; renderRail();
 assert.match(html, /new-avatar/);
 '''
-    result = subprocess.run(["node", "--input-type=module", "-e", setup + source + body], capture_output=True, text=True, timeout=15)
+    result = subprocess.run(
+        ["node", "--input-type=module"],
+        input=setup + source + body,
+        capture_output=True, text=True, encoding="utf-8", timeout=15,
+    )
     assert result.returncode == 0, result.stderr
 
 
 def test_group_avatar_has_no_repeated_fade_or_lazy_placeholder():
-    css = (STATIC / "style.css").read_text()
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
     assert "gav-in" not in css
-    source = (STATIC / "js/util.js").read_text()
+    source = (STATIC / "js/util.js").read_text(encoding="utf-8")
     face = next(line for line in source.splitlines() if "export const gface" in line)
     assert 'loading="lazy"' not in face
