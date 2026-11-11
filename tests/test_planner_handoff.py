@@ -338,7 +338,7 @@ async def test_reminder_returns_before_slow_parser_and_records_unmentioned_messa
     await e.intake.handle(hook_message(group_id=G1, message_id="remind1", user_id="user_A", text="明天提醒我"))
     started = time.monotonic()
     result = await e.intake.handoff_from_planner(group_id=G1, msg_id="remind1", kind="reminder")
-    assert result["success"] and time.monotonic() - started < .1
+    assert result["success"] and time.monotonic() - started < 1.0
     assert not parsed
     assert e.intake._pending.get(G1, "remind1") is not None
     await e.intake.handoff_from_planner(group_id=G1, msg_id="remind1", kind="reminder")

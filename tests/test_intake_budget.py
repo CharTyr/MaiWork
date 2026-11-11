@@ -55,7 +55,7 @@ async def test_feedback_is_deferred_and_does_not_block_loop(tmp_path):
 
     def feedback(*args):
         calls.append(args)
-        time.sleep(0.25)
+        time.sleep(0.6)
 
     intake._card_index.on_message = feedback
     msg = hook_message(GID, message_id="reply-1", text="这条不错")
@@ -66,7 +66,7 @@ async def test_feedback_is_deferred_and_does_not_block_loop(tmp_path):
     task = asyncio.create_task(spawned.pop())
     start = time.monotonic()
     await asyncio.sleep(0.04)
-    assert time.monotonic() - start < 0.16, "后台反馈也不能同步堵住共享事件循环"
+    assert time.monotonic() - start < 0.45, "后台反馈也不能同步堵住共享事件循环"
     await task
     assert len(calls) == 1
     store.close()

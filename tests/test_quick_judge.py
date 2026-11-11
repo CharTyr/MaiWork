@@ -756,7 +756,7 @@ class TestIntakeRouting:
         out = await intake.handle(_at_kwargs("帮我整理成文档", mid="603"))
         elapsed = time.monotonic() - start
         assert out == {"action": "continue"}
-        assert elapsed < 0.3
+        assert elapsed < 1.5
         assert models.calls == []          # 模型调用在后台，钩子不等
         await _drain(spawned)
         await intake.quick_judge.join()

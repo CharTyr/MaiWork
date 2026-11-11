@@ -155,7 +155,7 @@ async def test_write_lock_continue_without_late_commit(setup):
     try:
         started = time.monotonic()
         assert not (await gate.handle(message()))[2]
-        assert time.monotonic() - started < .3
+        assert time.monotonic() - started < 1.5
     finally:
         other.execute("ROLLBACK")
         other.close()

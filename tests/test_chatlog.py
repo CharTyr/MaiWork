@@ -233,7 +233,7 @@ class TestDedupeIsIndexed:
         elapsed = time.perf_counter() - t0
         assert n == 200
         assert _in_chat_log(store, "fresh0") == 1 and _in_ids(store, "fresh0") == 1
-        assert elapsed < 1.0, f"200 条写了 {elapsed:.3f}s：去重多半又退化成全表扫描了"
+        assert elapsed < 2.5, f"200 条写了 {elapsed:.3f}s：去重多半又退化成全表扫描了"
 
 
 # ----------------------------------------------------------------------

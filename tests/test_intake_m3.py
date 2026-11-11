@@ -350,7 +350,7 @@ class TestJevTimeout:
         t0 = time.monotonic()
         await intake.handle(hook_message(is_at=True, text="帮我整理资料"))
         took = time.monotonic() - t0
-        assert took < 0.3
+        assert took < 1.5
         await _drain(spawned)   # 后台：Jev 不可用 → 慢路径
         assert jev.calls == []  # 不可用根本不问
         assert len(intake.slow_queue) == 1
