@@ -69,5 +69,6 @@ export function memoryPage(s) {
   if (!d) return loading((state.loadErr || {}).identity, "identity");
   const lim = d.limits || {};
   return `
+    <p class="fine">日常调教只需区分两处：<b>跨所有群通用的经验</b>写在本页；<b>只对某个群生效的要求与做法</b>请到对应群页面的「本群设置」中管理。</p>
     ${idBlock("memory", "通用记忆", "MaiWork 积累的经验，适用于所有群，可手动修改。不要写入具体的群或成员信息；各群的规则和做法在对应群页面中设置。", d.memory, lim.memory)}`;
 }

@@ -317,6 +317,8 @@ def _ask_review_item(row: dict[str, Any], now: float, group_name: str) -> dict[s
         "attempts": int(row.get("attempts") or 0),
         "why": _review_why(row),
         "kind": "goal" if (row.get("decision") or {}).get("kind") == "goal" else "task",
+        # Jev 判词细节（库号 51）：选项概率 / 耗时 / 阈值；没有的给空壳（形状稳定）
+        "jev": (row.get("decision") or {}).get("jev") or {},
     }
 
 
@@ -1217,9 +1219,20 @@ def group_view(svc: Any, group_id: str, *, admin: bool) -> dict[str, Any]:
         out.pop("focus", None)
         # G3：群友不提供工作区名（实现细节）；sleep 保留（前端要画睡觉时段）
         view.pop("workspace", None)
-        # 群友也看得到开话题记录（设计允许），但不带管理员的判定字段
+        # 群友也看得到开话题记录（设计允许），但不带管理员的判定字段；
+        # jev 里的内部分数（耗时 / 选项概率 / 候选兴趣分布 / 阈值）一样剥掉——
+        # 群友只看「为什么开 / 没开」的结论
+        _JEV_MEMBER_HIDDEN = ("ms", "reason_probs", "fits", "ok_need", "fit_need")
+
+        def _member_entry(e: dict) -> dict:
+            out_e = {k: v for k, v in e.items() if k != "verdict"}
+            jev = out_e.get("jev")
+            if isinstance(jev, dict):
+                out_e["jev"] = {k: v for k, v in jev.items() if k not in _JEV_MEMBER_HIDDEN}
+            return out_e
+
         view["topic_log"] = [
-            {k: v for k, v in e.items() if k != "verdict"}
+            _member_entry(e)
             for e in topic_log if bool(e.get("opener"))
         ]
     # `/mw` 指令清单 + 两条大白话用法：管理版和群友版都给同一份，唯一来源是 commands.HELP_ITEMS / USAGE_TIPS

@@ -100,7 +100,7 @@ def _think_step(r: Any, clip_n: int = STEP_TEXT_MAX,
             reasoning_redacted = bool(data.get("reasoning_redacted"))
     except Exception:
         pass
-    return {
+    step = {
         "ts": _f(r["ts"]), "type": "think",
         "uid": f"m:{r['id']}",
         "round_id": _round_id_of(r["run_ref"], round_map),
@@ -113,6 +113,28 @@ def _think_step(r: Any, clip_n: int = STEP_TEXT_MAX,
         "ok": bool(r["ok"]),
         "error": str(r["error"] or ""),
     }
+    # 库号 51 新列（first_token_ms / context_map）：有数据才挂——老行 / 老库
+    # 保持原形状（行为不变黄金对照过）
+    try:
+        ft_ms = int(r["first_token_ms"] or 0)
+    except Exception:
+        ft_ms = 0
+    if ft_ms > 0:
+        step["first_token_ms"] = ft_ms
+    try:
+        raw_map = str(r["context_map"] or "")
+    except Exception:
+        raw_map = ""
+    if raw_map.strip():
+        try:
+            import json as _json2
+            parsed = _json2.loads(raw_map)
+            if isinstance(parsed, dict) and parsed:
+                step["context_map"] = parsed
+                step["model_call_id"] = int(r["id"])
+        except (TypeError, ValueError):
+            pass
+    return step
 
 
 def batch_counts(ctx: Ctx, traces: list[Trace]) -> dict[str, dict[str, int]]:
@@ -272,7 +294,7 @@ def steps(ctx: Ctx, trace: Trace, item: dict[str, Any], *, after: float = 0.0,
                     (trace.value, start, end),
                 )
                 mc_rows = ctx.fetch(
-                    "SELECT id, ts, agent, model, ok, ms, error, response, run_ref FROM model_calls"
+                    "SELECT id, ts, agent, model, ok, ms, error, response, run_ref, first_token_ms, context_map FROM model_calls"
                     " WHERE task_id=? AND ts>=? AND ts<=? ORDER BY ts ASC, id ASC",
                     (trace.value, start, end),
                 )
@@ -285,7 +307,7 @@ def steps(ctx: Ctx, trace: Trace, item: dict[str, Any], *, after: float = 0.0,
                     (trace.value,),
                 )
                 mc_rows = ctx.fetch(
-                    "SELECT id, ts, agent, model, ok, ms, error, response, run_ref FROM model_calls"
+                    "SELECT id, ts, agent, model, ok, ms, error, response, run_ref, first_token_ms, context_map FROM model_calls"
                     " WHERE task_id=? ORDER BY ts ASC, id ASC",
                     (trace.value,),
                 )
@@ -298,7 +320,7 @@ def steps(ctx: Ctx, trace: Trace, item: dict[str, Any], *, after: float = 0.0,
                     (trace.value, start, end),
                 )
                 mc_rows = ctx.fetch(
-                    "SELECT id, ts, agent, model, ok, ms, error, response, run_ref FROM model_calls"
+                    "SELECT id, ts, agent, model, ok, ms, error, response, run_ref, first_token_ms, context_map FROM model_calls"
                     " WHERE run_ref=? AND ts>=? AND ts<=? ORDER BY ts ASC, id ASC",
                     (trace.value, start, end),
                 )
@@ -310,7 +332,7 @@ def steps(ctx: Ctx, trace: Trace, item: dict[str, Any], *, after: float = 0.0,
                     (trace.value,),
                 )
                 mc_rows = ctx.fetch(
-                    "SELECT id, ts, agent, model, ok, ms, error, response, run_ref FROM model_calls"
+                    "SELECT id, ts, agent, model, ok, ms, error, response, run_ref, first_token_ms, context_map FROM model_calls"
                     " WHERE run_ref=? ORDER BY ts ASC, id ASC",
                     (trace.value,),
                 )
@@ -321,7 +343,7 @@ def steps(ctx: Ctx, trace: Trace, item: dict[str, Any], *, after: float = 0.0,
                 (trace.group_id, start, end),
             )
             mc_rows = ctx.fetch(
-                "SELECT id, ts, agent, model, ok, ms, error, response, run_ref FROM model_calls"
+                "SELECT id, ts, agent, model, ok, ms, error, response, run_ref, first_token_ms, context_map FROM model_calls"
                 " WHERE group_id=? AND ts>=? AND ts<=? ORDER BY ts ASC, id ASC",
                 (trace.group_id, start, end),
             )

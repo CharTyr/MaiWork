@@ -5,6 +5,7 @@ import { agentFish } from "../api.js";
 import { emptyState } from "./news.js";
 import { findIdea, ideaItems } from "./ideas.js";
 import { goalSections } from "./goals.js";
+import { jevBarsHTML } from "../jev_bars.js";
 
 export function taskRow(t, i) {
   const sel = state.detail && state.detail.id === t.id ? " selected" : "";
@@ -91,6 +92,7 @@ export function viewTasks(g, v) {
       ${ico("magnifier")}<div>
       <div class="quote"><span class="quote-by">${esc(r.who)} · ${esc(when(r.ts))}</span>${esc(r.text)}</div>
       <div class="via">${esc(r.why)}${r.attempts ? ` · 已重试 ${esc(r.attempts)} 次` : ""}</div>
+      ${r.jev ? jevBarsHTML(r.jev, { compact: true }) || "" : ""}
       <div class="actions">
         <button class="btn primary" data-act="ask-review" data-gid="${esc(g.id)}" data-id="${esc(r.message_id)}" data-op="request" data-kind="task">转为任务请求</button>
         <button class="btn" data-act="ask-review" data-gid="${esc(g.id)}" data-id="${esc(r.message_id)}" data-op="request" data-kind="goal">转为目标请求</button>

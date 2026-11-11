@@ -40,6 +40,8 @@ class LocalCaps:
     has_systemd_run: bool
     run_as_exists: bool
     run_as_is_root: bool = False  # run_as 是 root 或 uid 0（运行时会被 local.py 拒跑）
+    # 本机真由 systemd 托管（/run/systemd/system 在）；Docker 里常有 systemd-run 二进制却没 systemd
+    has_systemd_bus: bool = True
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,7 @@ def _probe(run_as: str = "maiwork") -> LocalCaps:
         import shutil
 
         has_systemd_run = bool(shutil.which("systemd-run"))
+    has_systemd_bus = bool(os.path.isdir("/run/systemd/system")) if is_linux else False
     run_as_exists = False
     run_as_is_root = False
     if is_linux:
@@ -90,7 +93,7 @@ def _probe(run_as: str = "maiwork") -> LocalCaps:
             run_as_exists = False
     return LocalCaps(
         is_linux=is_linux, is_root=is_root, has_systemd_run=has_systemd_run, run_as_exists=run_as_exists,
-        run_as_is_root=run_as_is_root,
+        run_as_is_root=run_as_is_root, has_systemd_bus=has_systemd_bus,
     )
 
 
@@ -115,6 +118,13 @@ def detect(caps: LocalCaps, run_as: str = "maiwork") -> Decision:
             reason="系统里没有 systemd-run（常见于 Docker 容器）",
             hint="用 systemd 的 Linux 并以 root 跑 MaiBot 才能隔离；Docker 部署请改用「一次性机器」（设置 → 执行环境开 Railway）",
             log_line="本机干活：不能用——系统里没有 systemd-run（常见于 Docker 容器）；工作区放在插件数据目录下，由插件直接读写",
+        )
+    if not caps.has_systemd_bus:
+        return Decision(
+            mode="stopped", ok=False, exec_kind="plugin", unit_user="",
+            reason="当前环境未由 systemd 托管（常见于 Docker 容器）",
+            hint="用 systemd 的 Linux 并以 root 跑 MaiBot 才能隔离；Docker 部署请改用「一次性机器」（设置 → 执行环境开 Railway）",
+            log_line="本机干活：不能用——当前环境未由 systemd 托管（常见于 Docker 容器）；工作区放在插件数据目录下，由插件直接读写",
         )
     if not caps.is_root:
         return Decision(

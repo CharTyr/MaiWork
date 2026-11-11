@@ -7,22 +7,26 @@ import { api } from "../api.js";
 import { esc, tip, toast, SVG } from "../util.js";
 
 export const RULES_MAX = 3000;
+export const INDEX_NOTE_MAX = 1200;
 export const SKILL_DESC_MAX = 120;
 export const SKILL_NAME_MAX = 40;
 export const skillBodyMax = (kind) => (kind === "task" ? 4000 : 2500);
 const KIND_ORDER = ["news", "idea", "goal", "task"];
+const NOTE_KIND_ORDER = ["news", "idea", "goal"];
 const KIND_TITLES = { news: "资讯", idea: "构想", goal: "目标", task: "通用执行" };
 const SOURCES = { auto: "MaiWork 修改", admin: "管理员修改", rollback: "版本回退", migrate: "从旧设置迁移" };
+const NOTE_SOURCES = { specialist: "专岗提交更新", admin_web: "网页修改", group_admin: "群管理员修改", admin: "管理员修改", rollback: "版本回退" };
 const WHO = { admin: "网页修改", migrate: "从旧设置迁移", admin_chat: "聊天中记录" };
 const shortDay = (ts) => (ts ? new Date(ts * 1000).toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" }) : "");
 const longTime = (ts) => new Date((ts || 0) * 1000).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
 const enc = encodeURIComponent;
 const rulesUrl = (gid, tail = "") => `/api/groups/${enc(gid)}/rules${tail}`;
 const skillsUrl = (gid, id, tail = "") => `/api/groups/${enc(gid)}/skills${id != null ? `/${enc(id)}` : ""}${tail}`;
+const notesUrl = (gid, kind = "", tail = "") => `/api/groups/${enc(gid)}/agent-notes${kind ? `/${enc(kind)}` : ""}${tail}`;
 
 // 当前群的数据和界面状态；换群就整份换掉（没保存的表单、展开的历史不带过去）
 function ctx(gid) {
-  if (!state.gctx || state.gctx.gid !== gid) state.gctx = { gid, rules: null, skills: null, error: "", edit: null, open: null, hist: null, drafts: {} };
+  if (!state.gctx || state.gctx.gid !== gid) state.gctx = { gid, rules: null, skills: null, notes: null, error: "", edit: null, open: null, hist: null, drafts: {} };
   return state.gctx;
 }
 
@@ -35,10 +39,15 @@ export async function loadCtx(gid) {
   c.loading = true;
   c.error = "";
   try {
-    const [rules, sk] = await Promise.all([api("GET", rulesUrl(gid)), api("GET", skillsUrl(gid))]);
+    const [rules, sk, nt] = await Promise.all([
+      api("GET", rulesUrl(gid)),
+      api("GET", skillsUrl(gid)),
+      api("GET", notesUrl(gid)).catch(() => ({ notes: [] })),
+    ]);
     if (state.gctx !== c) return; // 期间换了群
     c.rules = rules || { body: "" };
     c.skills = (sk && Array.isArray(sk.skills)) ? sk.skills : [];
+    c.notes = (nt && Array.isArray(nt.notes)) ? nt.notes : [];
   } catch (err) {
     if (state.gctx !== c) return;
     c.error = err.message;
@@ -59,7 +68,7 @@ function ctxInner() {
   if (!c) return "";
   if (c.error) return `<p class="err" role="alert">${esc(c.error)}</p><button class="btn small" data-act="gctx-reload">刷新</button>`;
   if (c.rules == null) return `<p class="fine">加载中…</p>`;
-  return rulesBlock(c) + skillsBlock(c);
+  return rulesBlock(c) + indexNotesBlock(c) + skillsBlock(c);
 }
 
 // 编辑中的文字：整页重画（比如定时刷新）时不丢
@@ -95,9 +104,87 @@ function rulesBlock(c) {
   </div>`;
 }
 
-/* ───── 本群做法（skill） ───── */
+/* ───── 常驻索引笔记（agent_index_notes） ───── */
 
 const titleOf = (kind) => KIND_TITLES[kind] || (((state.agents && state.agents.profiles) || []).find((p) => p.kind === kind) || {}).title || kind;
+
+function noteHistoryBlock(c, kind) {
+  const h = c.hist;
+  if (!h || h.id !== `note:${kind}`) return "";
+  if (h.error) return `<p class="err" role="alert">${esc(h.error)}</p>`;
+  if (!h.versions) return `<p class="fine">加载中…</p>`;
+  if (!h.versions.length) return `<p class="fine">暂无历史版本</p>`;
+  return `<div class="skill-hist">${h.versions
+    .map(
+      (v) => `<details><summary>v${Number(v.version) || 1} · ${esc(longTime(v.created_ts || v.ts))} · ${esc(NOTE_SOURCES[v.source] || v.source || "")}</summary>
+      <div class="skill-body">${esc(v.content || "") || `<span class="fine">（空）</span>`}</div>
+      <div class="actions"><button type="button" class="btn small" data-act="gctx-note-rollback" data-kind="${esc(kind)}" data-ver="${esc(String(v.version))}" data-g="${esc(c.gid)}">恢复此版本</button></div>
+    </details>`
+    )
+    .join("")}</div>`;
+}
+
+function noteRow(c, kind, n) {
+  const k = esc(kind);
+  const g = esc(c.gid);
+  const content = String((n && n.content) || "");
+  const locked = Boolean(n && n.locked);
+  const ts = n && n.updated_ts ? Number(n.updated_ts) : 0;
+  const ver = n && n.version ? Number(n.version) : 0;
+  const editing = c.edit && c.edit.noteKind === kind;
+  if (editing) {
+    return `<div class="skills" data-note-kind="${k}">
+      <div class="set-name">${esc(titleOf(kind))}</div>
+      <div class="skill-form">
+        <label class="fine" for="gctx-note-${k}">常驻笔记</label>
+        <textarea id="gctx-note-${k}" rows="6" maxlength="${INDEX_NOTE_MAX}" aria-describedby="gctx-note-help-${k} gctx-err-note-${k}" placeholder="记录常用来源索引、追踪线索或关键背景（最多 ${INDEX_NOTE_MAX} 字）">${esc(draft(c, `gctx-note-${kind}`, content))}</textarea>
+        <p class="fine" id="gctx-note-help-${k}">最多 ${INDEX_NOTE_MAX} 字；清空并保存即可移除</p>
+        <p class="err" id="gctx-err-note-${k}" role="alert" hidden></p>
+        <div class="actions"><button type="button" class="btn small primary" data-act="gctx-note-save" data-kind="${k}" data-g="${g}">保存</button><button type="button" class="btn small" data-act="gctx-cancel">取消</button></div>
+      </div>
+    </div>`;
+  }
+  const meta = [
+    ver > 0 ? `v${ver}` : "",
+    n && n.updated_by ? NOTE_SOURCES[n.updated_by] || n.updated_by : "",
+    locked ? "已锁定" : "",
+    ts ? `${shortDay(ts)} 更新` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const histOpen = c.hist && c.hist.id === `note:${kind}`;
+  return `<div class="skills" data-note-kind="${k}">
+    <div class="set-name">${esc(titleOf(kind))}</div>
+    <div class="pf skill">
+      <div>${content ? `<div class="skill-body">${esc(content)}</div>` : `<p class="fine">暂无常驻笔记。专岗完成工作并通过检查后可自动维护，也可手动填写</p>`}${meta ? `<div class="pf-meta">${esc(meta)}</div>` : ""}</div>
+      <div class="pf-acts">
+        <button type="button" class="btn small" data-act="gctx-note-hist" data-kind="${k}" data-g="${g}" aria-expanded="${histOpen ? "true" : "false"}">历史</button>
+        <button type="button" class="icon-btn" data-act="gctx-note-edit" data-kind="${k}" data-g="${g}" aria-label="${content ? "修改常驻笔记" : "填写常驻笔记"}" title="${content ? "修改" : "填写"}">${SVG.pen}</button>
+        <button type="button" class="icon-btn" data-act="gctx-note-lock" data-kind="${k}" data-g="${g}" aria-pressed="${locked ? "true" : "false"}" aria-label="${locked ? "解锁" : "锁定"}" title="${locked ? "解锁" : "锁定"}">${SVG.pin}</button>
+      </div>
+    </div>
+    ${histOpen ? noteHistoryBlock(c, kind) : ""}
+  </div>`;
+}
+
+function indexNotesBlock(c) {
+  const notes = c.notes || [];
+  const byKind = Object.fromEntries(notes.map((n) => [n.kind, n]));
+  const extraKinds = [
+    ...new Set([
+      ...notes.map((n) => n.kind),
+      ...((c.skills || []).map((s) => s.kind)),
+      ...(((state.agents && state.agents.profiles) || []).map((p) => p.kind)),
+    ]),
+  ].filter((k) => k && k !== "main" && k !== "task" && !NOTE_KIND_ORDER.includes(k));
+  const kinds = [...NOTE_KIND_ORDER, ...extraKinds];
+  return `<div class="gctx-notes">
+    <div class="pf-name">常驻笔记${tip("各专岗在本群的常驻索引备忘（上限 1200 字），每次执行自动置顶带入。仅在交接验收通过且未锁定时允许专岗更新。")}</div>
+    ${kinds.map((k) => noteRow(c, k, byKind[k] || null)).join("")}
+  </div>`;
+}
+
+/* ───── 本群做法（skill） ───── */
 
 function skillsBlock(c) {
   const all = c.skills || [];
@@ -202,7 +289,7 @@ function taskBlock(c, all) {
 /* ───── 动作 ───── */
 
 function clearFormError(key) {
-  const ids = key === "rules" ? ["gctx-rules"] : [`gctx-name-${key}`, `gctx-desc-${key}`, `gctx-body-${key}`];
+  const ids = key === "rules" ? ["gctx-rules"] : String(key).startsWith("note-") ? [`gctx-${key}`] : [`gctx-name-${key}`, `gctx-desc-${key}`, `gctx-body-${key}`];
   for (const id of ids) $(id)?.removeAttribute?.("aria-invalid");
   const box = $(`gctx-err-${key}`) || $(`gctx-${key}-err`);
   if (box) { box.textContent = ""; box.hidden = true; }
@@ -223,6 +310,11 @@ function sameGroup(el) {
   const c = state.gctx;
   if (!c || (g && g !== c.gid) || (state.g && c.gid !== state.g)) { toast("群已切换，请重试", true); return null; }
   return c;
+}
+
+function replaceNote(c, kind, note) {
+  if (!note || typeof note !== "object") return;
+  c.notes = (c.notes || []).filter((n) => n.kind !== kind).concat([note]);
 }
 
 function replaceKind(c, kind, list) {
@@ -325,6 +417,49 @@ export async function actCtx(action, el) {
       if (!confirm("恢复到此版本？当前内容将先保存为一个历史版本。")) return true;
       if (d.id === "rules") return write(el, c, "POST", rulesUrl(c.gid, `/versions/${enc(d.vid)}/restore`), {}, "已恢复", (out) => (c.rules = out));
       return write(el, c, "POST", skillsUrl(c.gid, d.id, `/versions/${enc(d.vid)}/restore`), {}, "已恢复", (out) => replaceKind(c, d.kind, out.skills));
+    }
+    case "gctx-note-edit":
+      clearForm(c);
+      c.edit = { noteKind: d.kind };
+      repaintCtx();
+      focusSoon(`gctx-note-${d.kind}`);
+      return true;
+    case "gctx-note-save": {
+      if (!sameGroup(el)) return true;
+      const kind = d.kind;
+      const errKey = `note-${kind}`;
+      clearFormError(errKey);
+      const content = (($(`gctx-note-${kind}`) || {}).value || "").trim();
+      if (content.length > INDEX_NOTE_MAX) return formError(errKey, `常驻笔记最多 ${INDEX_NOTE_MAX} 字。`, `gctx-note-${kind}`), true;
+      return write(el, c, "PUT", notesUrl(c.gid, kind), { content }, content ? "已保存常驻笔记" : "已清空常驻笔记", (out) => replaceNote(c, kind, out.note), errKey);
+    }
+    case "gctx-note-lock": {
+      if (!sameGroup(el)) return true;
+      const kind = d.kind;
+      const on = el.getAttribute("aria-pressed") !== "true";
+      return write(el, c, "PUT", notesUrl(c.gid, kind), { locked: on }, on ? "已锁定常驻笔记" : "已解锁常驻笔记", (out) => replaceNote(c, kind, out.note));
+    }
+    case "gctx-note-hist": {
+      const hid = `note:${d.kind}`;
+      if (c.hist && c.hist.id === hid) { c.hist = null; repaintCtx(); return true; }
+      const mine = { id: hid, versions: null };
+      c.hist = mine;
+      repaintCtx();
+      try {
+        const out = await api("GET", notesUrl(c.gid, d.kind, "/versions"));
+        if (c.hist !== mine || state.gctx !== c) return true;
+        mine.versions = out && Array.isArray(out.versions) ? out.versions : [];
+      } catch (err) {
+        if (c.hist !== mine) return true;
+        mine.error = err.message;
+      }
+      repaintCtx();
+      return true;
+    }
+    case "gctx-note-rollback": {
+      if (!sameGroup(el)) return true;
+      if (!confirm("恢复到此版本？当前内容将先保存为一个历史版本。")) return true;
+      return write(el, c, "POST", notesUrl(c.gid, d.kind, "/rollback"), { version: Number(d.ver) }, "已恢复", (out) => replaceNote(c, d.kind, out.note));
     }
     default: return false;
   }

@@ -423,9 +423,13 @@ export function viewNews(g, v) {
         const head = `<h1 class="h-page${b ? "" : " h-fish"}" ${b ? 'style="margin-top:46px"' : ""}>${b ? "" : agentFish("news", 44)}<span>${esc(slotName(batch.slot_ts))}</span></h1><p class="h-meta">${hhmm(batch.slot_ts)} 搜集 · ${batchStats(batch)}${rc ? ` · 淘汰 ${rc} 条` : ""}</p>`;
         if (batch.skipped || !(batch.items || []).length) {
           const got = Number((batch.stats && batch.stats.kept) || batch.kept || 0);
+          const rawNote = String(batch.note || "");
+          const safeNote = !gadmin() && /设置\s*→|工具与平台|MCP|子\s*agent|模型出关注点|搜索用不了|指定联网搜索|Traceback|Exception/i.test(rawNote)
+            ? "本轮暂无新资讯"
+            : (rawNote || "本轮无合适资讯，已跳过");
           const note = got > 0
             ? `${ico("books")}<span>另有 ${got} 篇已收录至「文章」</span><button class="btn small" data-act="news-tab" data-t="guides">查看</button>`
-            : `${ico("teacup")}<span>${esc(batch.note || "本轮无合适资讯，已跳过")}</span>`;
+            : `${ico("teacup")}<span>${esc(safeNote)}</span>`;
           return head + `<div class="skipped enter${got > 0 ? " to-guides" : ""}" style="--i:${i++}">${note}</div>` + funnelBlock(batch) + rejectedBlock(batch);
         }
         return head + batch.items.map((it) => newsItem(it, i++, false)).join("") + funnelBlock(batch) + rejectedBlock(batch);

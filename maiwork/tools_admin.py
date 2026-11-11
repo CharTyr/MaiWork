@@ -669,14 +669,26 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         timeout_s: float = 30.0,
         summarize: Callable[[dict, ToolResult], tuple[str, str]] | None = None,
     ) -> None:
+        name = str(spec["name"])
+
         async def _wrapped(ctx: ToolContext, args: dict) -> ToolResult:
             # 双保险：tools.call 已经按 role 挡过一次，这里再挡一次（防以后有人绕过 call）
             if str(getattr(ctx, "role", "") or "") != ROLE:
                 return _bad(_ADMIN_ONLY)
             # 下划线开头的键是内部标记，模型传来的一律剥掉（防伪造 _approved 之类）
-            return await handler(ctx, _norm_args(args))
+            norm = _norm_args(args)
+            # 审计：管理员对话里发生的设置修改标 actor=admin_chat（工具名 + action 作细节）
+            try:
+                from . import settings_audit
 
-        name = str(spec["name"])
+                action = str(norm.get("action") or "")
+                with settings_audit.audit_context(
+                    "admin_chat", actor_detail=name,
+                    reason=f"action={action}" if action else "",
+                ):
+                    return await handler(ctx, norm)
+            except ImportError:
+                return await handler(ctx, norm)
 
         def _sum(args: dict, res: ToolResult) -> tuple[str, str]:
             if summarize is not None:
@@ -2630,7 +2642,11 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
         if not callable(prepare):
             return _bad("这个 MaiWork 的资讯模块没有备料入口")
         try:
-            _spawn_bg(prepare(gid))
+            try:
+                coro = prepare(gid, manual=True)
+            except TypeError:
+                coro = prepare(gid)
+            _spawn_bg(coro)
         except RuntimeError:
             return _bad("现在没有事件循环，起不了后台备料")
         return _ok(f"已经让群 {gid} 现在备一批资讯（后台跑，好了会在网页上出现）")
@@ -2667,7 +2683,10 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
 
         async def _run() -> None:
             try:
-                await maker(gid)
+                try:
+                    await maker(gid, manual=True)
+                except TypeError:
+                    await maker(gid)
             except Exception:
                 logger.exception("管理员点的构想出错了（群 %s）", gid)
             finally:

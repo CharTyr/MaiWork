@@ -20,6 +20,8 @@ import { actModels } from "./settings/models.js";
 import { actJev } from "./settings/jev.js";
 import { actOptDeps } from "./settings/optdeps.js";
 import { actAttention } from "./settings/attention.js";
+import { actChanges } from "./settings/changes.js";
+import { actCtxMap } from "./ctxmap.js";
 import { actPreview } from "./preview.js";
 import { chipAdd, rowsAdd } from "./settings/rules.js";
 import { loadUsage, loadUsageDay } from "./settings/usage.js";
@@ -67,6 +69,8 @@ export async function act(el, e) {
   if (await actJev(a, el)) return;
   if (await actOptDeps(a, el)) return;
   if (await actAttention(a, el)) return;
+  if (await actChanges(a, el)) return;
+  if (await actCtxMap(a, el)) return;
   if (await actPreview(el)) return;
   const g = grp();
   switch (a) {
@@ -576,7 +580,7 @@ export async function act(el, e) {
       try {
         await navigator.clipboard.writeText(ideaAsk(it));
         flashCopied(el, "已复制");
-        toast("已复制，请在群内 @MaiBot 并粘贴");
+        toast("已复制群口令，粘贴到群里发送即可");
       } catch (err) { toast("复制失败，请手动复制", true); }
       break;
     }

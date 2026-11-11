@@ -705,7 +705,9 @@ class Outbox:
         mentions: Mentions,
         get_settings: Callable[[], Any],
         herenow: Any = None,
+        runtime_bus: Any = None,
     ) -> None:
+        self._runtime_bus = runtime_bus
         self._store = store
         self._host = host
         self._pushes = pushes
@@ -2115,11 +2117,36 @@ class Outbox:
                 skipped.add(oid)
                 continue
             row = _row_after(self._store, oid)
+            # 投递在途（outbox，库号 51）：看板「正在做什么」跟一条发送航班——
+            # 只有群号 / kind / 短标，绝不带正文
+            bus = self._runtime_bus
+            flight_id = f"outbox:{oid}"
+            if bus is not None:
+                try:
+                    bus.emit(
+                        "outbox", stage="outbox", status="start",
+                        group_id=str(gid or ""), role="outbox",
+                        flight_id=flight_id, ok=True, badge=str(kind or ""),
+                    )
+                except Exception:
+                    pass
+            send_t0 = clock.now()
             try:
                 result = await self._execute(row)
             except Exception as exc:
                 now = base_now
                 err = _redact(str(exc), [])
+                if bus is not None:
+                    try:
+                        bus.emit(
+                            "outbox", stage="outbox", status="error",
+                            group_id=str(gid or ""), role="outbox",
+                            flight_id=flight_id,
+                            ms=int((clock.now() - send_t0) * 1000),
+                            ok=False, badge=str(kind or ""),
+                        )
+                    except Exception:
+                        pass
                 if self._is_timeout(exc):
                     # 超时：可能已经发出去了，绝不重发
                     self._set(oid, status="uncertain", error=err, moment=now)
@@ -2146,6 +2173,17 @@ class Outbox:
                                   outcome="failed", error=err, now=now)
                 continue
             now = base_now
+            if bus is not None:
+                try:
+                    bus.emit(
+                        "outbox", stage="outbox", status="done",
+                        group_id=str(gid or ""), role="outbox",
+                        flight_id=flight_id,
+                        ms=int((clock.now() - send_t0) * 1000),
+                        ok=True, badge=str(kind or ""),
+                    )
+                except Exception:
+                    pass
             self._set(oid, status="sent", result=result, moment=now)
             if kind == "file":
                 self._note_file_result(now)

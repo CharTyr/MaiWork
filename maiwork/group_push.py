@@ -380,6 +380,7 @@ def set_config(store: Any, group_id: Any, patch: dict, settings: Any = None, *,
             )
     moment = clock.now() if now is None else float(now)
     cur = dict(get_config(store, gid, settings))
+    pre = dict(cur)
     for key, value in patch.items():
         if key in RETIRED_FIELDS:
             # 退役字段**所有**调用口都拒（legacy settings=None 同样拒）：静默收下
@@ -412,6 +413,17 @@ def set_config(store: Any, group_id: Any, patch: dict, settings: Any = None, *,
     cur = _normalize(cur, settings)
     with store.tx() as conn:
         store.kv_set(conn, f"{KV_PREFIX}{gid}", cur)
+    try:
+        from . import settings_audit
+
+        settings_audit.record(
+            store, scope=f"group:{gid}", target_key="group_push",
+            summary="修改本群主动发言设置",
+            before={k: pre.get(k) for k in patch},
+            after={k: cur.get(k) for k in patch},
+        )
+    except Exception:
+        logger.debug("主动发言设置修改记账失败", exc_info=True)
     return cur
 
 

@@ -130,3 +130,23 @@ class TestProbeIsolated:
         )
         caps = capability._probe()
         assert caps.has_systemd_run is False
+
+
+class TestDockerSystemdBus:
+    """Docker 里有 systemd-run 二进制、却没被 systemd 托管：判 stopped，工作区留在数据目录。"""
+
+    def _caps(self):
+        return capability.LocalCaps(
+            is_linux=True, is_root=True, has_systemd_run=True, run_as_exists=False, has_systemd_bus=False,
+        )
+
+    def test_no_bus_is_stopped(self):
+        r = capability.detect(self._caps(), run_as="maiwork")
+        assert r.mode == "stopped" and r.ok is False and r.exec_kind == "plugin"
+        assert "systemd 托管" in r.log_line
+
+    def test_no_bus_workspace_under_data_dir(self):
+        dec = capability.detect(self._caps(), run_as="maiwork")
+        r = capability.resolve_workspace_root(Path("/home/maiwork/workspaces"), dec, data_dir=Path("/data/mw"))
+        assert r == Path("/data/mw/workspaces")
+        assert r != Path("/var/lib/private/maiwork/workspaces")

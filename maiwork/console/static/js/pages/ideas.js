@@ -90,15 +90,16 @@ export function ideaPicked(it) {
   return ideaItems(it).filter((x) => !off.includes(x.no));
 }
 
+const botName = () => (state.me && state.me.bot && state.me.bot.name) || "MaiBot";
+
 export function ideaAsk(it) {
-  const lines = [`帮我做这个构想：${it.title}`];
-  if (it.body) lines.push(it.body);
+  const name = botName();
   const all = ideaItems(it);
   const picked = ideaPicked(it);
-  picked.forEach((x) => lines.push(`${x.no}. ${x.title}`));
   const some = all.length && picked.length < all.length;
-  lines.push(some ? `（构想 #${it.id}，要做：${picked.map((x) => x.no).join("、")}）` : `（构想 #${it.id}）`);
-  return lines.join("\n");
+  return some
+    ? `@${name} 构想 #${it.id}（要做：${picked.map((x) => x.no).join("、")}）`
+    : `@${name} 构想 #${it.id}`;
 }
 
 function ideaItemsBlock(it, open) {
@@ -145,17 +146,18 @@ export function ideaDetail(it) {
   const menu = more
     ? `<div class="idea-menu">
         <div class="idea-menu-row"><span>是否有用</span>${fbButtons("ideas", it)}</div>
-        ${gadmin() && open && !none && !pure ? `<button class="idea-menu-btn" data-act="idea" data-op="do" data-id="${it.id}">${SVG.check}<span>直接执行</span></button>` : ""}
         ${gadmin() && open ? `<button class="idea-menu-btn danger" data-act="idea" data-op="dismiss" data-id="${it.id}">${SVG.close}<span>忽略</span></button>` : ""}
       </div>`
     : "";
   let main;
   if (open && pure) main = `<button class="btn primary idea-go" data-act="handoff" data-kind="idea" data-id="${it.id}">交给我的 agent</button>`;
   else if (none) main = `<button class="btn primary idea-go" disabled>请至少勾选一项</button>`;
-  else if (open) main = `<button class="btn primary idea-go" data-act="idea-copy" data-id="${it.id}">${SVG.copy}复制要求</button>`;
+  else if (open && gadmin()) main = `<button class="btn primary idea-go" data-act="idea" data-op="do" data-id="${it.id}">${SVG.check}直接执行</button><button class="btn" data-act="idea-copy" data-id="${it.id}">${SVG.copy}复制口令</button>`;
+  else if (open) main = `<button class="btn primary idea-go" data-act="idea-copy" data-id="${it.id}">${SVG.copy}复制群口令</button>`;
   else if (it.state === "started" && it.task_id) main = `<button class="btn primary idea-go" data-act="task" data-id="${esc(it.task_id)}">查看任务</button>`;
   else if (it.state === "pending" && gadmin()) main = `<button class="btn primary idea-go" data-act="tab" data-tab="tasks">前往审批</button>`;
   else main = `<button class="btn idea-go" disabled>${esc(st)}</button>`;
+  const bname = esc(botName());
   return `
     <div class="dt-head">
       ${ico(it.icon || "bulb")}
@@ -175,8 +177,8 @@ export function ideaDetail(it) {
         <button class="idea-more" data-act="idea-more" data-id="${it.id}" aria-expanded="${more}" aria-label="更多">${SVG.more}</button>
         ${main}
       </div>
-      ${open && pure ? `<p class="idea-how">这是一个话题，MaiBot 会在冷场时提起；如需深入，可交给自己的 agent</p>` : ""}
-      ${open && !pure ? `<p class="idea-how">复制后在群内 @MaiBot 发送${gadmin() ? "" : "，审批通过后开始执行"}</p>` : ""}
+      ${open && pure ? `<p class="idea-how">这是一个话题，${bname} 会在冷场时提起；如需深入，可交给自己的 agent</p>` : ""}
+      ${open && !pure ? `<p class="idea-how">${gadmin() ? `点「直接执行」立即转为任务；也可复制后在群内 @${bname} 发送` : `复制后在群内 @${bname} 发送，审批通过后开始执行`}</p>` : ""}
       ${open && pure ? (handoffCount(it) ? `<div class="ho-entry">${handoffCount(it)}</div>` : "") : handoffBtn(it, none)}
     </div>`;
 }

@@ -234,6 +234,9 @@ daily_max = 30
 [usage]
 # 一天 token 总量超过这个数就在网页/日志提醒；0 = 不提醒；只提醒不暂停。
 alert_daily_tokens = 0
+# 每日全站 token 硬上限：当天总量达到这个数就暂停后台自动搜集（资讯 / 构想 / 开话题 / 闲时探索），
+# 次日零点（北京时间）自动恢复；手动点的不受影响。0 = 不设硬上限。
+hard_limit_daily_tokens = 0
 # 单个任务 token 超过这个数就提醒；0 = 不提醒。
 alert_task_tokens = 0
 

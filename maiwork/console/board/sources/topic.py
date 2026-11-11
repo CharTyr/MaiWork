@@ -146,23 +146,33 @@ def get(ctx: Ctx, item_id: Any) -> dict[str, Any] | None:
     if run_ref:
         try:
             jrows = ctx.fetch(
-                "SELECT id, ts, ok, error, answers, verdict FROM judgments"
+                "SELECT id, ts, ok, error, answers, verdict, ms, probs FROM judgments"
                 " WHERE run_ref=? ORDER BY ts ASC, id ASC",
                 (run_ref,),
             )
         except Exception:
             jrows = []
         for jrow in jrows or []:
-            extra.append({
+            step = {
                 "ts": _f(jrow["ts"]), "type": "think",
                 "uid": f"j:{jrow['id']}", "round_id": "",
                 "actor": "Jev", "model": "",
                 "tool": "", "input": "", "output": "",
                 "text": _topic_judgment_text(jrow, item, jev_json),
                 "reasoning": "", "reasoning_redacted": False,
-                "ms": 0,
+                "ms": int(jrow["ms"] or 0),
                 "ok": bool(jrow["ok"]),
                 "error": str(jrow["error"] or ""),
-            })
+            }
+            # 库号 51：选项概率挂进判断步（有数据才挂，老行保持原形状）
+            try:
+                import json as _json
+                probs_raw = str(jrow["probs"] or "")
+                parsed = _json.loads(probs_raw) if probs_raw.strip() else None
+                if isinstance(parsed, dict) and parsed:
+                    step["jev"] = {"probs": parsed, "ms": int(jrow["ms"] or 0)}
+            except Exception:
+                pass
+            extra.append(step)
     item["_extra_think"] = extra
     return item

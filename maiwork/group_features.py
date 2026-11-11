@@ -91,6 +91,7 @@ def set_config(store: Any, group_id: Any, patch: dict, settings: Any = None, *, 
     with store.tx() as conn:
         latest = _read_config(conn, gid)
         changes = [(m, value) for m, value in patch.items() if latest[m] != value]
+        pre_values = {m: latest[m] for m, _ in changes}
         for m, value in changes:
             latest[m] = value
             if value:
@@ -111,4 +112,14 @@ def set_config(store: Any, group_id: Any, patch: dict, settings: Any = None, *, 
             store.kv_set(conn, f"{KV_PREFIX}{gid}", latest)
             for m, value in changes:
                 store.event(conn, "features.toggled", group_id=gid, entity="group", entity_id=gid, payload={"group_id": gid, "module": m, "enabled": value, "by": str(by or "")})
+    try:
+        from . import settings_audit
+
+        settings_audit.record(
+            store, scope=f"group:{gid}", target_key="group_features",
+            summary="修改本群功能开关",
+            before=pre_values, after={m: latest[m] for m, _ in changes},
+        )
+    except Exception:
+        logger.debug("功能开关修改记账失败", exc_info=True)
     return latest

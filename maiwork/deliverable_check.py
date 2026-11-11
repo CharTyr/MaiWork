@@ -78,6 +78,15 @@ def _collect(folded: str, pattern: re.Pattern[str], *, cap: int = MAX_HITS) -> l
     return out
 
 
+# CI / 代码示例里 `job 1:`、`steps/1/` 是正常写法：这两条只扫围栏代码块之外的正文
+_CODE_PRONE = frozenset(("job 编号", "步骤目录"))
+_FENCE_RE = re.compile(r"```.*?(?:```|\Z)", re.S)
+
+
+def _strip_fences(text: str) -> str:
+    return _FENCE_RE.sub(" ", text)
+
+
 def _internal_patterns(task_id: Any = "") -> list[tuple[str, re.Pattern[str]]]:
     patterns = [(why, re.compile(pat)) for why, pat in _INTERNAL_FIXED]
     tid = str(task_id or "").strip()
@@ -112,8 +121,10 @@ def scan_text(text: Any, *, task_id: Any = "") -> dict:
                 break
     internal: list[str] = []
     if folded:
+        prose = _fold(_strip_fences(str(text or "")))
         for _why, pattern in _internal_patterns(task_id):
-            for piece in _collect(folded, pattern):
+            source = prose if _why in _CODE_PRONE else folded
+            for piece in _collect(source, pattern):
                 if piece not in internal:
                     internal.append(piece)
                 if len(internal) >= MAX_HITS:

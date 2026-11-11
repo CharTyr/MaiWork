@@ -26,7 +26,7 @@ export const ONB_STEPS = [
   { id: "env", name: "能力说明" },
   { id: "done", name: "完成" },
 ];
-export const onb = { open: false, i: 0, busy: false, cfg: null, models: null, info: null, sequence: 0, done: {}, anims: [], presets: null, sxPicked: null };
+export const onb = { open: false, i: 0, busy: false, cfg: null, models: null, info: null, sequence: 0, done: {}, anims: [], presets: null, sxPicked: null, approvals: null };
 const EASE_SPRING = "cubic-bezier(0.34, 1.4, 0.64, 1)";
 document.addEventListener("change", (event) => {
   if (event.target && event.target.id === "onb-proto" && $("onb-url")) $("onb-url").placeholder = (PROTOCOLS[event.target.value] || PROTOCOLS.openai).ph;
@@ -56,9 +56,15 @@ export function onbPane(id) {
     // 2026-10：端点 + 模型库。引导里只加一个端点、挑主模型和专岗用的模型；细项去「模型」页调
     const ep = onbEndpoint();
     const list = onb.models || ep.available || [];
-    const byId = (mid) => { const x = ((state.mdl && state.mdl.models) || []).find((y) => y.id === mid); return x ? x.model : ""; };
+    const byId = (mid) => {
+      const x = ((state.mdl && state.mdl.models) || []).find((y) => y.id === mid);
+      if (!x || x.placeholder || String(x.model || "").includes("填服务商那边的模型名")) return "";
+      return x.model || "";
+    };
     const prof = (k) => (((state.agents && state.agents.profiles) || []).find((p) => p.kind === k) || {});
     const curMain = byId(prof("main").model), curWork = byId(prof("task").model);
+    const isPlaceholderUrl = Boolean(ep.placeholder) || (ep.base_url === "https://api.example.com/v1" && !ep.key_set);
+    const shownUrl = isPlaceholderUrl ? "" : (ep.base_url || "");
     // 下拉 + 手填二合一（docs/13 A03）：列表接口 404 的端点也能直接填模型 ID
     const sel = (sid, v, empty) =>
       `<input id="${sid}" list="onb-model-list" spellcheck="false" autocomplete="off" value="${esc(v || "")}" placeholder="${esc(empty || "从列表选择或输入 ID")}" />`;
@@ -71,7 +77,7 @@ export function onbPane(id) {
         <label for="onb-proto">接口格式</label>
         <select id="onb-proto">${Object.entries(PROTOCOLS).map(([k, v]) => `<option value="${k}"${k === proto ? " selected" : ""}>${esc(v.name)}</option>`).join("")}</select>
         <label for="onb-url">端点地址</label>
-        <input id="onb-url" type="url" inputmode="url" spellcheck="false" value="${esc(ep.base_url || "")}" placeholder="${esc((PROTOCOLS[proto] || PROTOCOLS.openai).ph)}" />
+        <input id="onb-url" type="url" inputmode="url" spellcheck="false" value="${esc(shownUrl)}" placeholder="${esc((PROTOCOLS[proto] || PROTOCOLS.openai).ph)}" />
         <label for="onb-key">API 密钥</label>
         <input id="onb-key" type="password" autocomplete="new-password" placeholder="${ep.key_set ? "已填写，留空则不修改" : "输入密钥"}" />
         <div class="onb-test"><button class="btn" type="button" data-act="onb-test">测试连接</button><span class="onb-status" id="onb-status">${list.length ? `<i class="onb-ok">${SVG.check}</i>可用模型 ${list.length} 个` : ""}</span></div>
@@ -111,7 +117,8 @@ export function onbPane(id) {
     return `
       <div class="onb-step-ico">${ico("lock")}</div>
       <h1 class="onb-title">群管理员（可选）</h1>
-      <div class="onb-lead">每个群可设置一个密码，群管理员仅能管理本群${tip("审批名单在群页面的「任务审批」中设置。")}</div>
+      <div class="onb-lead">填写你的聊天账号以便在群内审批任务，也可为各群设置独立管理密码${tip("此处填写的审批账号会同步到所选服务群；后续免审批成员等细项可在群页面的「任务审批」中设置。")}</div>
+      ${onbApproversBlock()}
       ${onbGaBlock()}`;
   }
   if (id === "look") {
@@ -210,6 +217,34 @@ const onbServed = () => {
     .map((r) => String((r && r.group) || "").trim().replace(/^(qq|telegram|tg|qqbot):/i, ""))
     .filter((x) => /^-?[0-9A-Za-z:=_|.]{1,64}$/.test(x));
 };
+function onbNormApprover(raw) {
+  const t = String(raw || "").trim();
+  if (!t) return "";
+  if (!t.includes(":")) return /^\d+$/.test(t) ? `qq:${t}` : "";
+  const i = t.indexOf(":");
+  const plat = t.slice(0, i).trim().toLowerCase();
+  const acc = t.slice(i + 1).trim();
+  const canon = plat === "tg" ? "telegram" : plat;
+  return /^(?:qq|telegram|qqbot)$/.test(canon) && /^\S{1,64}$/.test(acc) ? `${canon}:${acc}` : "";
+}
+function onbApproverPrefill() {
+  const seen = [];
+  for (const gid of onbServed()) {
+    const apv = (onb.approvals && onb.approvals[gid] && onb.approvals[gid].approvers) || [];
+    for (const a of apv) if (a && !seen.includes(a)) seen.push(a);
+  }
+  return seen;
+}
+function onbApproversBlock() {
+  const gids = onbServed();
+  if (!gids.length) return `<p class="fine">尚未添加服务群；添加服务群后可在此设置群内审批人与群管密码。</p>`;
+  const prefill = onbApproverPrefill().join(", ");
+  return `
+    <div class="login onb-form">
+      <label for="onb-approvers">群内审批人账号（可选）</label>
+      <input id="onb-approvers" spellcheck="false" autocomplete="off" value="${esc(prefill)}" placeholder="例如 qq:123456789（多个用逗号隔开，可留空）" />
+    </div>`;
+}
 function onbGaBlock() {
   const gids = onbServed().filter((gid) => onb.ga && onb.ga[gid]);
   if (!gids.length) return "";
@@ -505,17 +540,50 @@ async function onbSave(id) {
     onb.presets = (r && r.presets) || onb.presets;
     return "";
   }
-  if (id === "admins" && onb.ga) {
-    for (const gid of Object.keys(onb.ga)) {
-      const field = $(`onb-ga-pw-${gid}`);
-      if (!field) continue;
-      const pw = field.value || "";
-      if (!pw) continue;
-      if (pw.length < 8) return "密码至少 8 位。";
-      try {
-        onb.ga[gid] = await api("PUT", `/api/groups/${encodeURIComponent(gid)}/group-admin`, { password: pw });
-      } catch (e) {
-        return `群 ${gid}：${e.message}`;
+  if (id === "admins") {
+    const apvInput = $("onb-approvers");
+    if (apvInput) {
+      const prefill = onbApproverPrefill();
+      const rawParts = apvInput.value.split(/[\s,，、;；]+/).map((s) => s.trim()).filter(Boolean);
+      const parsed = [];
+      for (const p of rawParts) {
+        const norm = onbNormApprover(p);
+        if (!norm) return `账号格式不正确：「${p}」（请用 qq:123456789、telegram:账号 或 qqbot:openid）`;
+        if (!parsed.includes(norm)) parsed.push(norm);
+      }
+      if (JSON.stringify(parsed) !== JSON.stringify(prefill)) {
+        const preSet = new Set(prefill);
+        for (const gid of onbServed()) {
+          const cur = (onb.approvals && onb.approvals[gid]) || { approvers: [], exempt_users: [], required: true, exempt_group: false };
+          const kept = (cur.approvers || []).filter((x) => !preSet.has(x));
+          const nextApprovers = [...new Set([...kept, ...parsed])];
+          try {
+            const saved = await api("PUT", `/api/groups/${encodeURIComponent(gid)}/approval`, {
+              approvers: nextApprovers,
+              exempt_users: cur.exempt_users || [],
+              required: cur.required !== false,
+              exempt_group: Boolean(cur.exempt_group),
+            });
+            onb.approvals = onb.approvals || {};
+            onb.approvals[gid] = saved;
+          } catch (e) {
+            return `群 ${gid} 审批名单：${e.message}`;
+          }
+        }
+      }
+    }
+    if (onb.ga) {
+      for (const gid of Object.keys(onb.ga)) {
+        const field = $(`onb-ga-pw-${gid}`);
+        if (!field) continue;
+        const pw = field.value || "";
+        if (!pw) continue;
+        if (pw.length < 8) return "密码至少 8 位。";
+        try {
+          onb.ga[gid] = await api("PUT", `/api/groups/${encodeURIComponent(gid)}/group-admin`, { password: pw });
+        } catch (e) {
+          return `群 ${gid}：${e.message}`;
+        }
       }
     }
   }
@@ -595,12 +663,16 @@ async function onbGo(delta) {
   onb.i = to;
   if (ONB_STEPS[to].id === "admins") {
     onb.ga = {};
+    onb.approvals = {};
     await Promise.all(
-      onbServed().map((gid) =>
+      onbServed().flatMap((gid) => [
         api("GET", `/api/groups/${encodeURIComponent(gid)}/group-admin`)
           .then((r) => (onb.ga[gid] = r))
-          .catch(() => {})
-      )
+          .catch(() => {}),
+        api("GET", `/api/groups/${encodeURIComponent(gid)}/approval`)
+          .then((r) => (onb.approvals[gid] = r))
+          .catch(() => {}),
+      ])
     );
   }
   if (ONB_STEPS[to].id === "search" && !onb.presets) {

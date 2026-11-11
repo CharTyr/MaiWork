@@ -1413,9 +1413,76 @@ def _m_board_refinement(conn: sqlite3.Connection) -> None:
         )
 
 
+# 第 51 步（可观测性）：给运行过程类日志补展示列 + 设置改动留痕 + 专岗索引便条。
+# - model_calls.first_token_ms：流式首 token 到达毫秒数（TTFT；非流式恒 0）；
+#   model_calls.context_map：本次请求的上下文分组地图 JSON（预算页 / 看板详情用）。
+# - judgments.probs：选择题各选项概率 JSON（{题: {选项: 概率}}），Jev 判断透明度。
+# - agent_handoffs.my_notes：交接单「我的便条」栏；表是 agents.py 懒建的，
+#   库号 51 升上来时可能还不存在 → 跳过，懒建 DDL 带列；已建过的老库在这里补。
+# - settings_changes：管理员改设置的留痕（谁 / 改了什么 / 前后值 / 能不能回退），
+#   prune 按「90 天 + 最新 500 行」收口。
+# - agent_index_notes / agent_index_note_versions：每群每岗的索引便条（含版本历史）。
+# 所有 DDL 幂等：老库升 51 重跑安全；新库建表也走同一段。
+def _m_observability_and_notes(conn: sqlite3.Connection) -> None:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(model_calls)")}
+    if cols and "first_token_ms" not in cols:
+        conn.execute("ALTER TABLE model_calls ADD COLUMN first_token_ms INTEGER NOT NULL DEFAULT 0")
+    if cols and "context_map" not in cols:
+        conn.execute("ALTER TABLE model_calls ADD COLUMN context_map TEXT NOT NULL DEFAULT ''")
+
+    jcols = {r["name"] for r in conn.execute("PRAGMA table_info(judgments)")}
+    if jcols and "probs" not in jcols:
+        conn.execute("ALTER TABLE judgments ADD COLUMN probs TEXT NOT NULL DEFAULT ''")
+
+    hcols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_handoffs)")}
+    if hcols and "my_notes" not in hcols:
+        conn.execute("ALTER TABLE agent_handoffs ADD COLUMN my_notes TEXT NOT NULL DEFAULT ''")
+
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS settings_changes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL,
+        actor TEXT NOT NULL DEFAULT 'admin_web',
+        actor_detail TEXT NOT NULL DEFAULT '',
+        scope TEXT NOT NULL DEFAULT 'global',
+        target_key TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        reason TEXT NOT NULL DEFAULT '',
+        before_json TEXT NOT NULL DEFAULT '{}',
+        after_json TEXT NOT NULL DEFAULT '{}',
+        revertible INTEGER NOT NULL DEFAULT 1,
+        reverted_at REAL,
+        reverted_by_id INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_settings_changes_ts ON settings_changes(ts DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_settings_changes_scope ON settings_changes(scope, ts DESC, id DESC);
+    CREATE TABLE IF NOT EXISTS agent_index_notes (
+        group_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        content TEXT NOT NULL DEFAULT '',
+        locked INTEGER NOT NULL DEFAULT 0,
+        updated_ts REAL NOT NULL DEFAULT 0,
+        updated_by TEXT NOT NULL DEFAULT '',
+        version INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (group_id, kind)
+    );
+    CREATE TABLE IF NOT EXISTS agent_index_note_versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT '',
+        handoff_id INTEGER NOT NULL DEFAULT 0,
+        created_ts REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_index_note_ver ON agent_index_note_versions(group_id, kind, version DESC);
+    """)
+
+
 # 迁移是有序列表，每步一个函数；新阶段只能往后加，不改旧的。
-# 库号对齐线上：45 = _m_hot_indexes（公开 0.11.1 已带），看板两步顺延为 46 / 47；48 = 便条板；49 = mentions 定向；50 = 看板精修。
-_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids, _m_pending_ask_state, _m_goal_stale_notify, _m_skills, _m_task_sessions, _m_hot_indexes, _m_main_runs, _m_round_ref_marks, _m_agent_notes, _m_mention_targets, _m_board_refinement]
+# 库号对齐线上：45 = _m_hot_indexes（公开 0.11.1 已带），看板两步顺延为 46 / 47；48 = 便条板；49 = mentions 定向；50 = 看板精修；51 = 可观测性 + 索引便条。
+_MIGRATIONS = [_m1, _m_profile, _m2, _m3, _m_persona, _m_quality, _m_humane, _m_personal, _m_group_space, _m_pending_asks, _m_model_calls, _m_admin_chat, _m_focus_names, _m_idea_items, _m_auto_review, _m_landed_task_ids, _m_task_nets, _m_group_folders, _m_members, _m_card_push, _m_member_checked, _m_news_ratings, _m_news_viz, _m_news_bridge, _m_news_src, _m_news_followup, _m_model_agent, _m_usage_src, _m_idea_origin, _m_goal_requester, _m_chat_feeds, _m_drop_member_interactions, _m_drop_chat_feeds, _m_agent_skills_group_rules, _m_task_lanes, _m_news_brief, _m_task_lane_raw, _m_idea_kind, _m_goal_fit, _m_chat_log_ids, _m_pending_ask_state, _m_goal_stale_notify, _m_skills, _m_task_sessions, _m_hot_indexes, _m_main_runs, _m_round_ref_marks, _m_agent_notes, _m_mention_targets, _m_board_refinement, _m_observability_and_notes]
 
 
 class Store:
@@ -1598,6 +1665,9 @@ class Store:
     # 留着比调用本身久没有意义）
     _MAIN_RUNS_KEEP_S = 3 * 86400
     _MAIN_RUNS_MAX_ROWS = 2000
+    # settings_changes（库号 51，设置改动留痕）：90 天 / 最新 500 行
+    _SETTINGS_CHANGES_KEEP_S = 90 * 86400
+    _SETTINGS_CHANGES_MAX_ROWS = 500
 
     def prune(self, now: float) -> dict[str, int]:
         """清掉过期数据：events / tool_calls / usage / judgments 保留 30 天，
@@ -1619,6 +1689,7 @@ class Store:
             counts["mentions"] = int(cur.rowcount or 0)
             counts["model_calls"] = self._prune_model_calls_tx(conn, now)
             counts["main_runs"] = self._prune_main_runs_tx(conn, now)
+            counts["settings_changes"] = self._prune_settings_changes_tx(conn, now)
             cur = conn.execute(
                 "DELETE FROM session_events WHERE session_id IN ("
                 " SELECT id FROM task_sessions WHERE state='closed' AND closed_at < ?)",
@@ -1643,6 +1714,25 @@ class Store:
         except Exception:
             # 老库没有这张表（迁移没跑到的半截库）：不算错误，当清了 0 条
             logger.debug("main_runs 清理失败（可能表还没建）", exc_info=True)
+            return 0
+
+    def _prune_settings_changes_tx(self, conn: sqlite3.Connection, now: float) -> int:
+        """在调用方事务里按「90 天 + 最新 500 行」清 settings_changes；返回删掉的行数。
+
+        表是库号 51 才建的，老库（迁移没跑到的半截库）没有它 → 不算错误，当清了 0 条。
+        """
+        try:
+            cutoff = float(now) - self._SETTINGS_CHANGES_KEEP_S
+            cur = conn.execute("DELETE FROM settings_changes WHERE ts < ?", (cutoff,))
+            removed = int(cur.rowcount or 0)
+            cur = conn.execute(
+                "DELETE FROM settings_changes WHERE id NOT IN ("
+                " SELECT id FROM settings_changes ORDER BY ts DESC, id DESC LIMIT ?)",
+                (self._SETTINGS_CHANGES_MAX_ROWS,),
+            )
+            return removed + int(cur.rowcount or 0)
+        except Exception:
+            logger.debug("settings_changes 清理失败（可能表还没建）", exc_info=True)
             return 0
 
     def _prune_model_calls_tx(self, conn: sqlite3.Connection, now: float) -> int:

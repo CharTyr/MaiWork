@@ -525,6 +525,9 @@ class WorkerReport:
     # 便条板（docs/34）：交回时附的「留给别的岗的便条」[{to, text}]（0~2 条，已清洗）；
     # 由 Specialists 暂存到交接单，主模型检查通过才上板。
     notes: list = field(default_factory=list)
+    # 常驻笔记（docs/35）：交回时附的本岗自我索引候选（≤1200 字）；
+    # 由 Specialists 暂存到交接单，主模型检查通过 + 没锁定才写进常驻笔记。
+    my_notes: str = ""
 
 
 def _system_prompt(
@@ -736,6 +739,8 @@ class Workers:
         raw_history: list[dict] | None = None,
         # 第 2 次没过换升级模型（docs/20 §5.3）：原样透传给 models.chat
         escalate: bool = False,
+        # 轻任务快车道（scale == "brief"）：无工具调用但有正文时直接当回复交回，不催促
+        allow_plain_reply: bool = False,
     ) -> WorkerReport:
         # 本轮硬权限工具名单：默认 = 请求 tools + submit_result（每轮都硬门）；
         # allowed_tools 给了再收窄成「请求 ∩ allowed_tools」（submit_result 保底）。
@@ -943,7 +948,17 @@ class Workers:
 
                 tool_calls = result.tool_calls or []
                 if not tool_calls:
-                    if result.text.strip() and nudges < _MAX_NUDGES:
+                    plain_text = result.text.strip()
+                    if allow_plain_reply and plain_text:
+                        _append({"role": "assistant", "content": result.text})
+                        return WorkerReport(
+                            ok=True,
+                            summary=plain_text[:500],
+                            evidence=[],
+                            data={"reply": plain_text},
+                            steps=steps,
+                        )
+                    if plain_text and nudges < _MAX_NUDGES:
                         nudges += 1
                         _append({"role": "assistant", "content": result.text})
                         _append(
@@ -1057,6 +1072,7 @@ class Workers:
                     evidence=[str(x) for x in evidence] if isinstance(evidence, list) else [],
                     challenge=data.get("challenge") if isinstance(data.get("challenge"), dict) else None,
                     notes=_clean_notes(data.get("notes_for_others")),
+                    my_notes=str(data.get("my_notes") or "").strip()[:1200],
                 )
 
             # 其余（或 submit 失败）→ 把结果作为 role=tool 消息回给模型继续。

@@ -274,6 +274,11 @@ class Identity:
         limit = self._limit_of(kind)
         if len(text.encode("utf-8")) > limit:
             raise ValueError(f"超过单个文件上限（{limit} 字节）：请删减到 {limit // 1024}KB 以内")
+        before_text = ""
+        try:
+            before_text = str(self.read(kind).get("text") or "")
+        except Exception:
+            before_text = ""
         self._ensure_dirs()
         self._write_file(self._path_of(kind), text)
         if kind in ("soul", "agents"):
@@ -283,6 +288,16 @@ class Identity:
                 pass  # 迁移还没跑（极端老部署启动早期）：只落旧全局
         if kind == "soul":
             self._set_soul_synced(False)  # 手动改过的不再是「从 MaiBot 同步」
+        try:
+            from . import settings_audit
+
+            settings_audit.record(
+                self._store, scope="global", target_key=f"identity:{kind}",
+                summary=f"修改身份文档 {kind}",
+                before={"text": before_text}, after={"text": text},
+            )
+        except Exception:
+            logger.debug("身份文档修改记账失败", exc_info=True)
         return self.read(kind)
 
     # ------------------------------------------------------------------
@@ -383,12 +398,27 @@ class Identity:
         limit = self._limit_of(str(which))
         if len(text_s.encode("utf-8")) > limit:
             raise ValueError(f"超过单个文件上限（{limit} 字节）：请删减到 {limit // 1024}KB 以内")
+        before_text = ""
+        try:
+            before_text = str(self.agent_read(kind, which).get("text") or "")
+        except Exception:
+            before_text = ""
         self._ensure_dirs()
         path.parent.mkdir(parents=True, exist_ok=True)
         self._chmod(path.parent, 0o700)
         self._write_file(path, text_s)
         if str(which) == "soul":
             self._agent_set_soul_synced(kind, False)
+        try:
+            from . import settings_audit
+
+            settings_audit.record(
+                self._store, scope="global", target_key=f"agent_doc:{kind}:{which}",
+                summary=f"修改专岗文档 {kind}/{which}",
+                before={"text": before_text}, after={"text": text_s},
+            )
+        except Exception:
+            logger.debug("专岗文档修改记账失败", exc_info=True)
         return self.agent_read(kind, which)
 
     async def agent_sync_soul(self, kind: str) -> dict[str, Any]:
@@ -483,12 +513,12 @@ class Identity:
     # 自定义专岗：建 / 删（专岗改版 4/4）
     # ------------------------------------------------------------------
 
-    async def agent_init_custom(self, kind: str, title: str) -> None:
+    async def agent_init_custom(self, kind: str, title: str, when: str = "") -> None:
         """新建自定义专岗（POST /api/agents 的落点）：identity/agents/<kind>/ 就位。
         - SOUL 从 MaiBot 同步（没人格就空，和 _migrate_agent_docs_once 的规矩一致）；
         - AGENTS 用 custom.md 预设；
         - 然后在 main 的 AGENTS.md 里自动加一行 stub（「新建的专岗」小节），
-          提示主模型「什么时候派给它」还没写。
+          若带 when 则直接写进该行，否则提示「什么时候派给它」还没写。
         """
         kind_s = str(kind or "").strip()
         if not self._agent_kind_ok(kind_s) or kind_s in _BUILTIN_AGENT_KINDS:
@@ -500,9 +530,9 @@ class Identity:
         # AGENTS：custom 预设
         self.agent_reset_agents(kind_s)
         # main AGENTS.md 加一行 stub（幂等：同一 kind 不重复加）
-        self._append_custom_stub_to_main_agents(kind_s, title_s)
+        self._append_custom_stub_to_main_agents(kind_s, title_s, when=when)
 
-    def _append_custom_stub_to_main_agents(self, kind: str, title: str) -> None:
+    def _append_custom_stub_to_main_agents(self, kind: str, title: str, when: str = "") -> None:
         """在 main 的 AGENTS.md「新建的专岗」小节里补一行 stub（管理员可再改）。
         位置：优先找既有的「## 新建的专岗」小节；没有就挂在文末（新建这一节）。"""
         try:
@@ -513,7 +543,9 @@ class Identity:
             text = path.read_text(encoding="utf-8")
         except OSError:
             text = ""
-        stub = f"- 「{title}」({kind})：什么时候派给它？（请补上）"
+        clean_when = " ".join(str(when or "").split())[:300]
+        body = clean_when if clean_when else "什么时候派给它？（请补上）"
+        stub = f"- 「{title}」({kind})：{body}"
         # 幂等：已经有一行 (kind) 就不重复（管理员改过名字行还在）
         if f"({kind})" in text:
             return
@@ -574,9 +606,10 @@ class Identity:
         lines = str(text or "").splitlines()
         stub_mark = f"({kind})"
         proto_mark = "什么时候派给它？（请补上）"
+        auto_line_re = re.compile(rf"^\s*-\s*「[^」]*」\({re.escape(kind)}\)：")
         for i, ln in enumerate(lines):
-            if stub_mark in ln and proto_mark in ln:
-                # 还是 stub 原型（管理员没动）→ 删整行
+            if (stub_mark in ln and proto_mark in ln) or auto_line_re.match(ln):
+                # 自动生成的专岗行 → 删整行
                 lines.pop(i)
                 self._ensure_dirs()
                 self._write_file(path, "\n".join(lines) + ("\n" if text.endswith("\n") else ""))
@@ -904,6 +937,19 @@ class Identity:
                 )
         except Exception:
             logger.exception("memory.write 事件落库失败")
+        try:
+            from . import settings_audit
+
+            settings_audit.record(
+                self._store,
+                scope=(f"group:{gid}" if scope == "group" else "global"),
+                target_key=f"memory:{scope}",
+                summary=f"记入经验（{scope}）：{text[:40]}",
+                before={}, after={"text": text},
+                revertible=False,  # 记忆只追加不覆盖，不走一键撤销
+            )
+        except Exception:
+            logger.debug("remember 记账失败", exc_info=True)
         return {"ok": True, "deduped": False, "text": text}
 
     def _append_line_into_group_rules(self, gid: str, text_key_src: str, line_text: str) -> tuple[bool, str | None]:

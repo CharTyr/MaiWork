@@ -85,6 +85,34 @@ def _spec_fragment(store: Any, item_id: Any) -> str:
         return ""
 
 
+def _news_item_entry(it: dict, *, store: Any = None, badge: str = "") -> dict:
+    links = []
+    for s in it.get("sources") or []:
+        if isinstance(s, dict) and _http(s.get("url")):
+            links.append((_http(s.get("url")), _t(s.get("site") or s.get("title") or "原文", 60)))
+    quotes = []
+    for r in it.get("refs") or []:
+        if isinstance(r, dict) and _t(r.get("text")):
+            who = _t(r.get("who") or r.get("name"), 30)
+            quotes.append((f"{who}：" if who else "") + _t(r.get("text"), 200))
+    summary = it.get("summary") or it.get("body")
+    why = it.get("why") or it.get("reason")
+    entry: dict = {
+        "id": str(it.get("id") or ""),
+        "title": it.get("title"),
+        "badge": badge,
+        "paras": [summary, why and f"为什么推荐：{why}"],
+        "bullets": [f"群里说过 · {q}" for q in quotes[:5]],
+        "links": links[:5],
+    }
+    # §4.2：spec 型图解 → 内联静态渲染（vs-static，无脚本无 iframe）
+    if it.get("viz") == "spec":
+        frag = _spec_fragment(store, it.get("id"))
+        if frag:
+            entry["viz_html"] = frag
+    return entry
+
+
 def _news_entries(view: dict, store: Any = None) -> list[dict]:
     out: list[dict] = []
     for batch in view.get("news") or []:
@@ -93,29 +121,20 @@ def _news_entries(view: dict, store: Any = None) -> list[dict]:
         for it in batch.get("items") or []:
             if not isinstance(it, dict):
                 continue
-            links = []
-            for s in it.get("sources") or []:
-                if isinstance(s, dict) and _http(s.get("url")):
-                    links.append((_http(s.get("url")), _t(s.get("site") or s.get("title") or "原文", 60)))
-            quotes = []
-            for r in it.get("refs") or []:
-                if isinstance(r, dict) and _t(r.get("text")):
-                    who = _t(r.get("who") or r.get("name"), 30)
-                    quotes.append((f"{who}：" if who else "") + _t(r.get("text"), 200))
-            entry: dict = {
-                "id": str(it.get("id") or ""),
-                "title": it.get("title"),
-                "paras": [it.get("summary"), it.get("why") and f"为什么推荐：{it.get('why')}"],
-                "bullets": [f"群里说过 · {q}" for q in quotes[:5]],
-                "links": links[:5],
-            }
-            # §4.2：spec 型图解 → 内联静态渲染（vs-static，无脚本无 iframe）
-            if it.get("viz") == "spec":
-                frag = _spec_fragment(store, it.get("id"))
-                if frag:
-                    entry["viz_html"] = frag
-            out.append(entry)
-    return out  # 好文（guides）另有入口，这一页不放
+            out.append(_news_item_entry(it, store=store))
+    return out
+
+
+def _guide_entries(view: dict, *, data: dict | None = None, store: Any = None) -> list[dict]:
+    raw_guides = view.get("guides")
+    if raw_guides is None and isinstance(data, dict):
+        raw_guides = data.get("guides")
+    out: list[dict] = []
+    for it in raw_guides or []:
+        if not isinstance(it, dict):
+            continue
+        out.append(_news_item_entry(it, store=store, badge="好文"))
+    return out
 
 
 def _idea_entries(view: dict) -> list[dict]:
@@ -188,12 +207,25 @@ def _task_entries(view: dict) -> list[dict]:
     return out
 
 
-def _entries(view: dict, tab: str, item: str, store: Any = None) -> tuple[str, list[dict]]:
+def _entries(
+    view: dict, tab: str, item: str, store: Any = None, *, data: dict | None = None
+) -> tuple[str, list[dict]]:
     if tab == "news":
-        heading, entries = "资讯", _news_entries(view, store=store)
+        news_list = _news_entries(view, store=store)
+        guide_list = _guide_entries(view, data=data, store=store)
         if item:
             want = item.split("-")[-1]
-            entries = [e for e in entries if e["id"] == want]
+            matched_news = [e for e in news_list if e["id"] == want]
+            matched_guides = [e for e in guide_list if e["id"] == want]
+            entries = matched_news + matched_guides
+            heading = "好文收录" if (matched_guides and not matched_news) else "资讯"
+            return heading, entries
+        entries = list(news_list[:TAB_LIMIT])
+        if guide_list:
+            capped_guides = [dict(g) for g in guide_list[:TAB_LIMIT]]
+            capped_guides[0]["section"] = "好文收录"
+            entries.extend(capped_guides)
+        return "资讯", entries
     elif tab == "ideas":
         heading, entries = "构想", _idea_entries(view)
         if item:
@@ -214,10 +246,17 @@ def render_page(data: dict, *, tab: str, item: str = "", store: Any = None) -> s
     """
     view = data.get("view") if isinstance(data.get("view"), dict) else data
     name = _t(data.get("name"), 60) or "本群"
-    heading, entries = _entries(view or {}, tab, item, store=store)
+    bot_obj = data.get("bot") if isinstance(data.get("bot"), dict) else {}
+    bot_name = (
+        str(bot_obj.get("name") or data.get("bot_name") or (view or {}).get("bot_name") or "MaiBot").strip()
+        or "MaiBot"
+    )
+    heading, entries = _entries(view or {}, tab, item, store=store, data=data)
     has_viz = any(e.get("viz_html") for e in entries)
     cards = []
     for e in entries:
+        if e.get("section"):
+            cards.append(f'<h2 class="sec-title">{_e(e["section"], 40)}</h2>')
         num = str(e.get("num") or "")
         title_html = f'<h2>{_e(e.get("title"), _TITLE_MAX) or "（无标题）"}</h2>'
         if num:
@@ -243,12 +282,12 @@ def render_page(data: dict, *, tab: str, item: str = "", store: Any = None) -> s
                 f'<a href="{escape(u, quote=True)}" rel="noopener noreferrer nofollow">{_e(label, 60)}</a>'
                 for u, label in e["links"]) + "</p>")
         if num and e.get("actionable", True):
-            # 复制口令：纯 CSS user-select:all 一键全选（无脚本）
-            cmd_at = f"@机器人 构想 #{_e(num, 20)}"
+            # 复制口令：纯 CSS user-select:all 一键全选（无脚本）；/mw 在前免原生 @
             cmd_mw = f"/mw 派活 构想 #{_e(num, 20)}"
+            cmd_at = f"@{_e(bot_name, 30)} 构想 #{_e(num, 20)}"
             parts.append(
                 '<p class="cmd">想做这个？复制口令发给机器人：'
-                f'<code class="copy">{cmd_at}</code> 或 <code class="copy">{cmd_mw}</code></p>'
+                f'<code class="copy">{cmd_mw}</code> 或 <code class="copy">{cmd_at}</code></p>'
             )
         cards.append('<section class="card">' + "".join(parts) + "</section>")
     body = "\n".join(cards) or '<p class="empty">这里暂时没有内容。</p>'
@@ -287,6 +326,7 @@ def render_page(data: dict, *, tab: str, item: str = "", store: Any = None) -> s
            border-radius:6px; padding:1px 6px; font-size:13px;
            font-family:ui-monospace,Menlo,monospace; }}
   .num {{ color:#888; font-weight:500; font-size:14px; margin-right:4px; }}
+  .sec-title {{ font-size:15px; color:#555; margin:20px 2px 10px; font-weight:600; }}
   .empty {{ color:#888; text-align:center; }}
 {viz_css}
 </style>
@@ -310,7 +350,14 @@ def _default_view_fn(svc: Any) -> Callable[[str], dict]:
     def _fn(gid: str) -> dict:
         from .console import views
 
-        return views.group_view(svc, gid, admin=False)
+        raw = views.group_view(svc, gid, admin=False)
+        out = dict(raw) if isinstance(raw, dict) else {}
+        try:
+            bot_name = str((views._bot_info(svc) or {}).get("name") or "").strip()  # noqa: SLF001
+        except Exception:
+            bot_name = ""
+        out["bot_name"] = bot_name or "MaiBot"
+        return out
     return _fn
 
 

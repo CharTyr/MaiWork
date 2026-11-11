@@ -257,6 +257,16 @@ def _redact_full(text: Any, secrets: list[str]) -> str:
     return out
 
 
+# config.example.toml 里原样留着的占位值：照抄示例没改 = 还没配（2026-11 开箱即用）。
+# 只认这几句字面值；api.example.com 单独不算（测试里常拿它配真测试密钥）。
+_TEMPLATE_PLACEHOLDERS = frozenset({"sk-填你的端点密钥", "填你的端点密钥", "填你的密钥", "填服务商那边的模型名"})
+
+
+def is_template_placeholder(val: Any) -> bool:
+    """是不是 config.example.toml 的模板占位值（密钥 / 模型名没换成自己的）。"""
+    return str(val or "").strip() in _TEMPLATE_PLACEHOLDERS
+
+
 @dataclass
 class _EndpointState:
     """一个端点的限流状态（只在内存、只属于一个事件循环）。"""
@@ -458,6 +468,281 @@ def _estimate_request(
         + json_tokens
     )
     return msg_tokens + system_tokens, tool_tokens, overhead
+
+
+def _mark_first_token(flight: dict | None, has_content: bool) -> None:
+    """流式路上：第一个有内容的增量到了 → 记 TTFT 并回调（看板实时流发 first_token）。
+
+    flight["t0"] 是这次尝试的发出时刻（clock.now 口径）；非流式 / 没接 flight 不记。
+    """
+    if not isinstance(flight, dict) or not has_content:
+        return
+    if int(flight.get("first_token_ms") or 0) > 0:
+        return
+    t0 = float(flight.get("t0") or 0.0)
+    if t0 <= 0:
+        return
+    ft = max(1, int((clock.now() - t0) * 1000))
+    flight["first_token_ms"] = ft
+    cb = flight.get("on_first")
+    if callable(cb):
+        try:
+            cb(ft)
+        except Exception:
+            pass
+
+
+# ----------------------------------------------------------------------
+# 上下文分组地图（库号 51）：预算页 / 看板详情的「这次请求里都装了什么」
+# ----------------------------------------------------------------------
+
+_CONTEXT_MAP_GROUP_LABELS = {
+    "system": "身份与规矩",
+    "rules": "本群规则",
+    "skills": "做法与技能",
+    "memory": "群画像与记忆",
+    "notes": "专岗笔记与便条",
+    "tools": "工具规格",
+    "summary": "前情摘要",
+    "history": "对话与指令",
+    "tool_io": "工具调用与返回",
+}
+_CONTEXT_MAP_GROUP_ORDER = (
+    "system", "rules", "skills", "memory", "notes", "tools", "summary", "history", "tool_io",
+)
+_CONTEXT_MAP_MAX_PARTS = 48          # 超过就把中段同组（对话 / 工具往返）并成段
+_CONTEXT_MAP_PREVIEW_MAX = 120       # 每段预览单行 ≤120 字（遮密钥后）
+_CONTEXT_MAP_LABEL_MAX = 28
+
+# 摘要 / 压缩轮留下的消息标记 → summary 组
+_CONTEXT_MAP_SUMMARY_MARKERS = ("【前情摘要", "前情提要", "[摘要]", "compaction")
+
+# system 提示词按 【小节头】 切块分组的规则（按出现顺序先试更具体的）
+_CONTEXT_MAP_SYSTEM_RULES = (
+    ("rules", ("【本群规矩", "【本群规则")),
+    ("notes", ("【本岗常驻笔记", "【同事便条", "【专岗便条")),
+    ("skills", ("【本群做法", "【skill", "【Skill", "【技能")),
+    ("memory", ("【群画像", "【本群记忆", "【近期做过")),
+)
+_CONTEXT_MAP_SYSTEM_HEADER_RE = re.compile(r"【[^【】]{1,40}】")
+
+
+def _context_map_group_of(role: str, content: str) -> str:
+    """整条消息（非 system 提示词内部小节）默认归哪组。"""
+    if role == "tool":
+        return "tool_io"
+    head = str(content or "")[:120]
+    if any(m in head for m in _CONTEXT_MAP_SUMMARY_MARKERS):
+        return "summary"
+    return "history"
+
+
+def _split_system_sections(content: str) -> list[tuple[str, str]]:
+    """把 system 提示词按 【小节头】 拆成 (分组, 段落文本) 若干份。
+
+    头前那段（身份 / 通用规矩）归 system；【小节】按头名归 rules / notes /
+    skills / memory；认不出的头留在 system。没有头就一整段 system。
+    """
+    text = str(content or "")
+    if not text.strip():
+        return []
+    matches = list(_CONTEXT_MAP_SYSTEM_HEADER_RE.finditer(text))
+    if not matches:
+        return [("system", text)]
+    out: list[tuple[str, str]] = []
+    first_start = matches[0].start()
+    if first_start > 0 and text[:first_start].strip():
+        out.append(("system", text[:first_start]))
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        section = text[m.start():end]
+        header = m.group(0)
+        group = "system"
+        for g, prefixes in _CONTEXT_MAP_SYSTEM_RULES:
+            if any(header.startswith(p) or p.lstrip("【") in header for p in prefixes):
+                group = g
+                break
+        if section.strip():
+            out.append((group, section))
+    return out or [("system", text)]
+
+
+def _clip_single_line(text: Any, limit: int) -> str:
+    """压成单行再截断（地图预览用，不在这里遮密钥——外面 dump 后统一遮）。"""
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    return s[: max(1, int(limit))]
+
+
+def build_context_map(
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    *,
+    prompt_tokens: int = 0,
+    context_window: int = 0,
+) -> dict:
+    """给「这次请求装了什么」画分组地图（纯函数，绝不抛）。
+
+    parts：按消息拆（system 提示词再按 【小节头】 细分），每段记 idx / group /
+    group_label / label / role / tokens / chars / preview；对话与工具往返（history /
+    tool_io）段数超过 _CONTEXT_MAP_MAX_PARTS 时把中段同组的并成一段（带 span_count）。
+    prompt_tokens>0 且估算和>0：线性缩放让估算和=实测值（calibrated=True）。
+    limit_tokens = context_window 或默认 128000。
+    """
+    try:
+        parts: list[dict] = []
+        for i, msg in enumerate(messages or []):
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "")
+            content = msg.get("content")
+            if not isinstance(content, str):
+                try:
+                    content = json.dumps(content, ensure_ascii=False, default=str)
+                except Exception:
+                    content = str(content or "")
+            # 助手带 tool_calls：调用体并进同一条的 tool_io 段（有正文的算对话）
+            tc_text = ""
+            if msg.get("tool_calls"):
+                try:
+                    tc_text = json.dumps(msg["tool_calls"], ensure_ascii=False, default=str)
+                except Exception:
+                    tc_text = str(msg["tool_calls"])
+            whole = f"{content or ''}\n{tc_text}".strip()
+            est = _estimate_text(whole) if whole else 0
+            overhead = _MESSAGE_OVERHEAD_TOKENS
+            if role == "system":
+                sections = _split_system_sections(content or "")
+                for j, (group, section) in enumerate(sections):
+                    # 每小节独立估算；整条消息的 4 token 开销挂到第一小节
+                    sec_est = _estimate_text(section) + (overhead if j == 0 else 0)
+                    parts.append({
+                        "idx": i, "group": group,
+                        "group_label": _CONTEXT_MAP_GROUP_LABELS[group],
+                        "label": _clip_single_line(section, _CONTEXT_MAP_LABEL_MAX),
+                        "role": role, "tokens": max(0, sec_est),
+                        "chars": len(section),
+                        "preview": _clip_single_line(section, _CONTEXT_MAP_PREVIEW_MAX),
+                    })
+                continue
+            group = _context_map_group_of(role, whole)
+            if msg.get("tool_calls") and not str(content or "").strip():
+                group = "tool_io"  # 纯工具调用（没正文）的助手回合
+            parts.append({
+                "idx": i, "group": group,
+                "group_label": _CONTEXT_MAP_GROUP_LABELS[group],
+                "label": _clip_single_line(whole or role, _CONTEXT_MAP_LABEL_MAX),
+                "role": role, "tokens": max(0, est + overhead),
+                "chars": len(whole),
+                "preview": _clip_single_line(whole, _CONTEXT_MAP_PREVIEW_MAX),
+            })
+        # 工具规格一条：JSON 化的 schema 估算
+        tool_est = _estimate_tools(tools)
+        if tools and tool_est > 0:
+            try:
+                names = [str(t.get("function", {}).get("name") or t.get("name") or "")
+                         for t in tools if isinstance(t, dict)]
+            except Exception:
+                names = []
+            label = f"{len(list(tools))} 个工具"
+            parts.append({
+                "idx": len(list(messages or [])), "group": "tools",
+                "group_label": _CONTEXT_MAP_GROUP_LABELS["tools"],
+                "label": label[:_CONTEXT_MAP_LABEL_MAX],
+                "role": "tools", "tokens": tool_est,
+                "chars": 0,
+                "preview": _clip_single_line("、".join(n for n in names if n), _CONTEXT_MAP_PREVIEW_MAX),
+            })
+        # 段数超上限：从最前面开始，把连续的 history / tool_io 并成一段（尾部近因保留原文）
+        while len(parts) > _CONTEXT_MAP_MAX_PARTS:
+            span_start = -1
+            for k, p in enumerate(parts[:-8]):  # 最后 8 段永不合（近因是重点）
+                if p["group"] in ("history", "tool_io"):
+                    span_start = k
+                    break
+            if span_start < 0:
+                break
+            span_end = span_start
+            while (span_end + 1 < len(parts) - 8
+                   and parts[span_end + 1]["group"] in ("history", "tool_io")):
+                span_end += 1
+            if span_end == span_start:
+                # 合不了就找下一段可合的起点
+                nxt = -1
+                for k in range(span_start + 1, len(parts) - 8):
+                    if parts[k]["group"] in ("history", "tool_io"):
+                        nxt = k
+                        break
+                if nxt < 0:
+                    break
+                span_start = span_end = nxt
+            span = parts[span_start:span_end + 1]
+            merged = {
+                "idx": span[0]["idx"],
+                "group": span[0]["group"],
+                "group_label": span[0]["group_label"],
+                "label": f"{span[0]['group_label']} ×{len(span)}",
+                "role": "mixed",
+                "tokens": sum(int(p["tokens"]) for p in span),
+                "chars": sum(int(p["chars"]) for p in span),
+                "preview": span[0]["preview"],
+                "span_count": len(span),
+            }
+            parts[span_start:span_end + 1] = [merged]
+        out = {
+            "used_tokens": sum(int(p["tokens"]) for p in parts) + _REQUEST_WRAPPER_TOKENS,
+            "limit_tokens": int(context_window or 128000),
+            "calibrated": False,
+            "groups": [
+                {"group": g, "label": _CONTEXT_MAP_GROUP_LABELS[g],
+                 "tokens": sum(int(p["tokens"]) for p in parts if p["group"] == g)}
+                for g in _CONTEXT_MAP_GROUP_ORDER
+                if any(p["group"] == g for p in parts)
+            ],
+            "parts": parts,
+        }
+        return _calibrate_context_map(out, int(prompt_tokens or 0))
+    except Exception:
+        logger.debug("build_context_map 失败，返回空地图", exc_info=True)
+        return {"used_tokens": 0, "limit_tokens": int(context_window or 128000),
+                "calibrated": False, "groups": [], "parts": []}
+
+
+def _calibrate_context_map(ctx_map: dict, prompt_tokens: int) -> dict:
+    """端点真报了 prompt_tokens → 地图各段按估算比例线性缩放，使合计=实测值。
+
+    prompt_tokens≤0 或估算和≤0：原样返回（calibrated 保持 False）。
+    """
+    if not isinstance(ctx_map, dict):
+        return ctx_map
+    est = int(ctx_map.get("used_tokens") or 0)
+    real = int(prompt_tokens or 0)
+    parts = ctx_map.get("parts")
+    if real <= 0 or est <= 0 or not isinstance(parts, list) or not parts:
+        ctx_map["calibrated"] = False
+        return ctx_map
+    scale = real / est
+    acc = 0
+    for p in parts:
+        if not isinstance(p, dict):
+            continue
+        p["tokens"] = max(0, int(round(int(p.get("tokens") or 0) * scale)))
+        acc += p["tokens"]
+    # 舍入差并到最大那段（地图总量必须恰好等于实测）
+    if parts:
+        biggest = max((p for p in parts if isinstance(p, dict)),
+                      key=lambda p: int(p.get("tokens") or 0), default=None)
+        if biggest is not None:
+            biggest["tokens"] = max(0, int(biggest.get("tokens") or 0) + (real - acc - _REQUEST_WRAPPER_TOKENS))
+    ctx_map["used_tokens"] = real
+    ctx_map["calibrated"] = True
+    ctx_map["groups"] = [
+        {"group": g, "label": _CONTEXT_MAP_GROUP_LABELS[g],
+         "tokens": sum(int(p["tokens"]) for p in parts
+                       if isinstance(p, dict) and p.get("group") == g)}
+        for g in _CONTEXT_MAP_GROUP_ORDER
+        if any(isinstance(p, dict) and p.get("group") == g for p in parts)
+    ]
+    return ctx_map
 
 
 def _strip_internal_keys(messages: list[dict]) -> list[dict]:
@@ -1762,10 +2047,14 @@ class Models:
         transport=None,
         config_writer: Any = None,
         agents: Any = None,
+        runtime_bus: Any = None,
     ) -> None:
         self._store = store
         self._get_settings = get_settings
         self._transport = transport
+        # 运行事件总线（runtime_bus.py，可选）：看板「正在做什么」的实时流；没接不发
+        self._runtime_bus = runtime_bus
+        self._flight_seq = 0
         self._client: httpx.AsyncClient | None = None
         # 端点级限流（并发上限 / 429 冷却 / 每分钟上限）；状态只在内存、不落库
         self._throttle = EndpointThrottle()
@@ -1892,7 +2181,7 @@ class Models:
                 main_backup=main_cs[1].service_model if len(main_cs) > 1 else "",
                 worker=first_w.service_model if first_w else "",
                 worker_backup=worker_cs[1].service_model if len(worker_cs) > 1 else "",
-                key_set=bool(primary_ep and primary_ep.api_key),
+                key_set=bool(primary_ep and primary_ep.api_key and not is_template_placeholder(primary_ep.api_key)),
                 source=source,
                 retries=int(getattr(primary_ep, "retries", old.retries)) if primary_ep else old.retries,
                 retry_delay_s=int(getattr(primary_ep, "retry_delay_s", old.retry_delay_s)) if primary_ep else old.retry_delay_s,
@@ -2008,8 +2297,10 @@ class Models:
                 continue
             if not str(getattr(ep, "api_key", "") or "").strip():
                 continue
+            if is_template_placeholder(getattr(ep, "api_key", "")):
+                continue  # 照抄示例的占位密钥 = 没配
             service_model = str(getattr(entry, "model", "") or "").strip()
-            if not service_model:
+            if not service_model or is_template_placeholder(service_model):
                 continue
             out.append(
                 _Candidate(
@@ -3536,6 +3827,14 @@ class Models:
                 continue
             used_estimate = int(numbers["estimated_input_tokens"])
             log_request = self._build_log_request(msgs, tools, json_mode, secret_keys, body_max_tokens)
+            # 上下文分组地图（库号 51）：在 _build_log_request 截断前就按完整请求画好，
+            # 端点真报了 prompt_tokens 再由 _log_attempt 校准入库
+            try:
+                ctx_map = build_context_map(
+                    msgs, tools, context_window=int(getattr(cand, "context_window", 0) or 0)
+                )
+            except Exception:
+                ctx_map = None
             try_n = 0
             resend = False  # 刚按 400 的点名改了请求：立刻重发，不等、不占重试次数
             while try_n < max_tries:
@@ -3591,10 +3890,12 @@ class Models:
                     })
                 start = clock.now()
                 status = 0
+                flight = self._flight_start(agent_kind, model, group_id, purpose=purpose)
                 try:
                     async with self._throttle.slot(endpoint, concurrency=max_conc, max_rpm=max_rpm):
                         status, err_text, data = await asyncio.wait_for(
-                            self._post_protocol(client, protocol, url, body, headers, timeout), timeout=timeout
+                            self._post_protocol(client, protocol, url, body, headers, timeout, flight=flight),
+                            timeout=timeout,
                         )
                 except (httpx.HTTPError, asyncio.TimeoutError, _StreamError) as e:
                     ms = int((clock.now() - start) * 1000)
@@ -3613,6 +3914,7 @@ class Models:
                         request=log_request, response=None, keys=secret_keys,
                         purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
                         usage_src="unknown",  # 网络错误/超时/断流：请求可能已在服务端生成，按「不知道」记
+                        flight=flight, context_map=ctx_map,
                     )
                     continue
                 ms = int((clock.now() - start) * 1000)
@@ -3636,6 +3938,7 @@ class Models:
                         request=log_request, response=None, keys=secret_keys,
                         purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
                         usage_src="none",  # 端点明说没这个模型：确定没生成
+                        flight=flight, context_map=ctx_map,
                     )
                     logger.warning("模型 %s 在这个端点不可用（%s），%d 分钟内先不用它，换下一个候选",
                                    model, last_err.message[:160], int(_UNAVAILABLE_TTL_S // 60))
@@ -3660,6 +3963,7 @@ class Models:
                         purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
                         # 429 是限流拒了，确定没生成；5xx/408 可能已经在服务端处理 → 不知道
                         usage_src="none" if status == 429 else "unknown",
+                        flight=flight, context_map=ctx_map,
                     )
                     continue
                 if status != 200:
@@ -3674,6 +3978,7 @@ class Models:
                         request=log_request, response=None, keys=secret_keys,
                         purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
                         usage_src="none",  # 其他 4xx：请求被拒，确定没生成
+                        flight=flight, context_map=ctx_map,
                     )
                     adapted = self._adapt_after_reject(
                         adapt_key, protocol, status, err_text, effort_send, cand.efforts,
@@ -3702,6 +4007,7 @@ class Models:
                         request=log_request, response=None, keys=secret_keys,
                         purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
                         usage_src="unknown",  # 200 但解析炸：响应收到了，真实用量不知道
+                        flight=flight, context_map=ctx_map,
                     )
                     raise
                 log_response = self._build_log_response(data, result, secret_keys)
@@ -3721,6 +4027,7 @@ class Models:
                         purpose=purpose, group_id=group_id, task_id=task_id, agent=agent_kind,
                         usage_src="reported" if result.usage_known else "unknown",
                         cache_read=result.cache_read_tokens, cache_write=result.cache_write_tokens,
+                        flight=flight, context_map=ctx_map,
                     )
                     continue
                 self._log_attempt(
@@ -3731,6 +4038,7 @@ class Models:
                     # 成功但端点没报用量：那两栏 0 是「不知道」，不是真没花
                     usage_src="reported" if result.usage_known else "unknown",
                     cache_read=result.cache_read_tokens, cache_write=result.cache_write_tokens,
+                    flight=flight, context_map=ctx_map,
                 )
                 self._unavailable.pop(adapt_key, None)  # 探测成功：解除熔断
                 # 保守 usage 校正：只有端点真报过输入用量才算（unknown 不动系数）；
@@ -3791,6 +4099,7 @@ class Models:
         body: dict,
         headers: dict | None,
         timeout: float,
+        flight: dict | None = None,
     ) -> tuple[int, str, dict]:
         """按协议发一次请求，统一回 (状态码, 出错时响应文本, 拼好的「非流式」形状 data)。
 
@@ -3798,12 +4107,15 @@ class Models:
         - responses：/responses。stream=True 发出去，端点回 SSE 就把事件收成整份
           （_responses_from_events），回普通 JSON 直接用；
         - anthropic：/v1/messages 非流式。
+
+        flight（库号 51）：这次尝试的在途小票。流式协议在路上就把首 token 毫秒数
+        写进 flight["first_token_ms"] 并回调 flight["on_first"]（看板实时流）。
         """
         if protocol == "openai":
-            return await self._stream_openai(client, url, body, headers or {}, timeout)
+            return await self._stream_openai(client, url, body, headers or {}, timeout, flight=flight)
         if protocol == "anthropic":
             return await self._post_json(client, url, body, headers or {}, timeout)
-        return await self._post_responses(client, url, body, headers or {}, timeout)
+        return await self._post_responses(client, url, body, headers or {}, timeout, flight=flight)
 
     @staticmethod
     async def _post_json(
@@ -3822,7 +4134,8 @@ class Models:
     @classmethod
     async def _post_responses(
         cls,
-        client: httpx.AsyncClient, url: str, body: dict, headers: dict, timeout: float
+        client: httpx.AsyncClient, url: str, body: dict, headers: dict, timeout: float,
+        flight: dict | None = None,
     ) -> tuple[int, str, dict]:
         """Responses：响是 SSE 就收事件拼整份；不是 SSE（多数兼容端点）当 JSON 直接解析。"""
         async with client.stream("POST", url, json=body, headers=headers, timeout=timeout) as resp:
@@ -3858,6 +4171,7 @@ class Models:
                 if obj.get("error") or etype in ("error", "response.failed"):
                     raise _StreamError(f"模型报错：{_stream_error_text(obj)}")
                 events.append(obj)
+                _mark_first_token(flight, bool(isinstance(etype, str) and "delta" in etype))
                 if etype in _RESPONSES_TERMINAL:
                     completed_seen = True
             if not done and not completed_seen:
@@ -3866,7 +4180,8 @@ class Models:
 
     @staticmethod
     async def _stream_openai(
-        client: httpx.AsyncClient, url: str, body: dict, headers: dict, timeout: float
+        client: httpx.AsyncClient, url: str, body: dict, headers: dict, timeout: float,
+        flight: dict | None = None,
     ) -> tuple[int, str, dict]:
         """发一次（流式）请求，返回 (状态码, 出错时的响应文本, 拼好的「非流式」形状 data)。
 
@@ -3955,6 +4270,11 @@ class Models:
                                 slot["function"]["name"] += str(name)
                             if isinstance(fn.get("arguments"), str):
                                 slot["function"]["arguments"] += fn["arguments"]
+                    # 首 token：正文 / 思考 / 工具调用任一先到都算（TTFT，库号 51）
+                    _mark_first_token(
+                        flight,
+                        bool(delta.get("content") or rc or delta.get("tool_calls")),
+                    )
             if not done and not finish_reason:
                 raise _StreamError("连接断了，回答没收完")
             message: dict[str, Any] = {"role": role, "content": "".join(text_parts)}
@@ -4054,6 +4374,64 @@ class Models:
             ensure_ascii=False,
         )
 
+    # ------------------------------------------------------------------
+    # 看板实时流（runtime_bus，库号 51）：每次尝试发 start / first_token / done|error
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _flight_stage(agent_kind: str) -> str:
+        """stage 规则：主模型 / 管理员对话 / 统筹口子的调用算「主通道」，其余算专岗。"""
+        kind = str(agent_kind or "")
+        return "main" if kind in ("main", "admin_chat", "coordinator") else "worker"
+
+    @staticmethod
+    def _flight_badge(agent_kind: str, stage: str) -> str:
+        """正式中文短标（≤24 字）：主通道「主模型思考」，专岗标岗位名（自定义岗给通用标）。"""
+        kind = str(agent_kind or "")
+        if stage == "main":
+            return "主模型思考"
+        if not kind or kind == "task" or kind.startswith("c_"):
+            return "专岗调用"
+        return f"{kind} 调用"[:24]
+
+    def _flight_start(
+        self, agent_kind: str, model: str, group_id: str, *, purpose: str = ""
+    ) -> dict:
+        """这次尝试的在途小票：发 start 事件（接了总线才发）；回流式 TTFT 用。"""
+        self._flight_seq += 1
+        stage = self._flight_stage(agent_kind)
+        flight: dict[str, Any] = {
+            "flight_id": f"call-{self._flight_seq}",
+            "t0": clock.now(),
+            "first_token_ms": 0,
+            "stage": stage,
+            "role": str(agent_kind or ""),
+            "badge": self._flight_badge(agent_kind, stage),
+        }
+        bus = self._runtime_bus
+        if bus is not None:
+            def _on_first(ft_ms: int, f: dict = flight, gid: str = group_id, mdl: str = model) -> None:
+                try:
+                    bus.emit(
+                        "model_call", stage=str(f["stage"]), status="first_token",
+                        group_id=str(gid or ""), role=str(f["role"]), model=str(mdl or ""),
+                        flight_id=str(f["flight_id"]), first_token_ms=int(ft_ms),
+                        ok=True, badge=str(f["badge"]),
+                    )
+                except Exception:
+                    pass
+            flight["on_first"] = _on_first
+            try:
+                bus.emit(
+                    "model_call", stage=stage, status="start",
+                    group_id=str(group_id or ""), role=str(agent_kind or ""),
+                    model=str(model or ""), flight_id=str(flight["flight_id"]),
+                    ok=True, badge=str(flight["badge"]),
+                )
+            except Exception:
+                pass
+        return flight
+
     def _log_attempt(
         self,
         model: str,
@@ -4076,16 +4454,56 @@ class Models:
         usage_src: str = "",
         cache_read: int = 0,
         cache_write: int = 0,
+        flight: dict | None = None,
+        context_map: dict | None = None,
     ) -> None:
         """每次尝试写两条账：usage（原有）+ model_calls（管理员网页看）。写失败只记日志。
 
         usage_src（C03）：reported = 服务商实报；unknown = 不知道（成功但没报用量、
         或请求可能已在服务端处理：网络错误 / 超时 / 流中断 / 5xx / 408）；
         none = 确定没生成（429 和其他 4xx 被拒）。旧行 '' = 老数据。
+
+        flight / context_map（库号 51）：flight 是这次在途任务的小票（ttft / 看板实时流用）；
+        context_map 是请求的上下文分组地图（dict）；端点真报了 prompt_tokens 时
+        在这里按实测值线性校准一次再入库。飞行事件的 done / error 也在这里收尾发。
         """
         now = clock.now()
-        error_db = _redact_full(error, keys)[:_LOG_ERR_MAX]
+        # 端点真报了输入用量 → 地图按实测值校准（calibrated=True；parts 线性缩放）
+        if context_map is not None:
+            try:
+                context_map = _calibrate_context_map(context_map, int(prompt_tokens or 0))
+            except Exception:
+                pass
+        ctx_map_db = ""
+        if isinstance(context_map, dict) and context_map:
+            try:
+                ctx_map_db = _redact_full(
+                    json.dumps(context_map, ensure_ascii=False, default=str), keys
+                )
+            except Exception:
+                ctx_map_db = ""
+        ft_ms = int(flight.get("first_token_ms") or 0) if isinstance(flight, dict) else 0
         agent_s = str(agent or "")
+        # 看板实时流：这次尝试收尾（done / error）。发不出去不拖慢记账。
+        bus = self._runtime_bus
+        if bus is not None and isinstance(flight, dict):
+            try:
+                bus.emit(
+                    "model_call",
+                    stage=str(flight.get("stage") or "worker"),
+                    status="done" if ok else "error",
+                    group_id=str(group_id or ""),
+                    role=str(flight.get("role") or agent_s or ""),
+                    model=str(model or ""),
+                    flight_id=str(flight.get("flight_id") or ""),
+                    ms=int(ms),
+                    first_token_ms=ft_ms,
+                    ok=bool(ok),
+                    badge=str(flight.get("badge") or ""),
+                )
+            except Exception:
+                pass
+        error_db = _redact_full(error, keys)[:_LOG_ERR_MAX]
         usage_src_s = str(usage_src or "")
         cache_read_i = max(0, int(cache_read or 0))
         cache_write_i = max(0, int(cache_write or 0))
@@ -4128,8 +4546,8 @@ class Models:
                 conn.execute(
                     "INSERT INTO model_calls (ts, purpose, role, agent, model, group_id, task_id, attempt, ok,"
                     " status, ms, prompt_tokens, completion_tokens, error, request, response,"
-                    " usage_src, cache_read, cache_write, run_ref)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " usage_src, cache_read, cache_write, run_ref, first_token_ms, context_map)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         now,
                         str(purpose or ""),
@@ -4151,6 +4569,8 @@ class Models:
                         cache_read_i,
                         cache_write_i,
                         ref,
+                        ft_ms,
+                        ctx_map_db,
                     ),
                 )
                 if purpose != "session.triage":

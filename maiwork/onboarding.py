@@ -35,6 +35,29 @@ STEPS = ("hello", "models", "groups", "keys", "search", "social", "admins", "loo
 REQUIRED = ("models", "groups")
 
 
+def _admins_configured(svc: Any, settings: Any) -> bool:
+    """有没有人能批准：任一服务群的每群批准名单非空；没服务群才看旧全局 admins。"""
+    groups = getattr(settings, "groups", None) or {}
+    if not groups:
+        return bool(tuple(getattr(getattr(settings, "approval", None), "admins", ()) or ()))
+    try:
+        ga = getattr(svc, "group_approvals", None)
+        if ga is None:
+            from .group_approval import GroupApprovals
+
+            ga = GroupApprovals(svc.store, get_settings=svc.get_settings)
+        for gid in list(groups.keys()):
+            try:
+                if tuple(ga.get(gid).approvers or ()):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
+
 def _checks(svc: Any) -> dict[str, bool]:
     settings = svc.get_settings()
     out = {"models": False, "groups": False, "jev": False, "search": False, "admins": False, "social": False}
@@ -44,7 +67,7 @@ def _checks(svc: Any) -> dict[str, bool]:
         out["models"] = False
     if settings is not None:
         out["groups"] = bool(getattr(settings, "groups", None))
-        out["admins"] = bool(tuple(getattr(settings.approval, "admins", ()) or ()))
+        out["admins"] = _admins_configured(svc, settings)
     # 搜索（2026-10）：有效搜索链可用就算配好（绑定存数据库 kv["extensions.search"]）
     try:
         search = getattr(svc, "search", None)

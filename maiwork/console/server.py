@@ -97,6 +97,43 @@ class Identity:
 _PERSONAL_READONLY = "群管理员只能看，不能改个人画像"
 
 
+# 备份里要整条删掉的 kv（登录会话 / 网页密码 / 群管理员密码 / 社交平台 cookie / 扩展密钥）
+_BACKUP_SCRUB_PREFIXES = ("auth.", "console.", "group_admin.", "social.", "extensions.mcp", "extensions.search")
+
+
+def _safe_backup_bytes(src_path: Path) -> bytes:
+    """在线拷一份库、删掉凭据类 kv、VACUUM 抹掉空闲页，返回字节（临时目录用完即删）。"""
+    import shutil
+    import sqlite3
+    import tempfile
+
+    tmpdir = tempfile.mkdtemp(prefix="maiwork-backup-")
+    try:
+        Path(tmpdir).chmod(0o700)
+        dst_path = Path(tmpdir) / "backup.db"
+        src = sqlite3.connect(f"file:{src_path}?mode=ro", uri=True)
+        dst = sqlite3.connect(str(dst_path))
+        try:
+            src.backup(dst)
+        finally:
+            src.close()
+        try:
+            dst.execute("PRAGMA journal_mode=DELETE")
+            dst.execute("PRAGMA secure_delete=ON")
+            for prefix in _BACKUP_SCRUB_PREFIXES:
+                dst.execute(
+                    "DELETE FROM kv WHERE substr(key, 1, ?) = ?", (len(prefix), prefix)
+                )
+            dst.commit()
+            dst.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            dst.execute("VACUUM")
+        finally:
+            dst.close()
+        return dst_path.read_bytes()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _err(status: int, text: str) -> web.Response:
     return web.json_response({"error": text}, status=status)
 
@@ -150,6 +187,9 @@ class ConsoleServer:
         self._svc = svc
         self._bg_tasks: set[Any] = set()  # 后台小任务（更新检查）的引用，防被回收
         self._social_installs: dict[str, asyncio.Task] = {}
+        # SSE 连接的停止信号（/api/board/events）：stop() 在 runner.cleanup() 之前
+        # 全部点亮，不然 cleanup 会等流式响应自己退（可能永远不结束）
+        self._sse_stops: set[asyncio.Event] = set()
         self.app: web.Application = self._build_app()
         self.app.on_cleanup.append(self._cleanup_social_installs)
         self._runner: web.AppRunner | None = None
@@ -228,6 +268,13 @@ class ConsoleServer:
         self._social_installs[platform_id] = asyncio.create_task(install())
 
     async def stop(self) -> None:
+        # SSE 流先全部点亮停止信号：runner.cleanup() 会等挂着的流式响应退，
+        # 不先停它们 cleanup 可能一直等（重启 / 停机被卡住）
+        for ev in list(self._sse_stops):
+            try:
+                ev.set()
+            except Exception:
+                pass
         await self._cleanup_social_installs()
         runner, self._runner = self._runner, None
         port, self.port = self.port, None
@@ -783,14 +830,37 @@ class ConsoleServer:
                 return _err(400, "请求体不是 JSON")
             user_id = str(body.get("user_id") or "").strip()
             action = str(body.get("action") or "").strip()
-            if not user_id.isdigit():
-                return _err(400, "QQ 号应该是纯数字")
+            try:
+                plat = str(svc.get_settings().platform_of(gid) or "qq")
+            except Exception:
+                plat = "qq"
+            if plat == "qq":
+                if not user_id.isdigit():
+                    return _err(400, "QQ 号应该是纯数字")
+            elif not re.fullmatch(r"-?[0-9A-Za-z_.:=|]{1,64}", user_id):
+                return _err(400, "账号格式不正确")
             if action not in ("add", "remove", "auto"):
                 return _err(400, "action 只支持 add / remove / auto")
             if action == "remove" and self._identify(request).role != "admin":
                 return _err(403, "移除关注会删掉个人画像，只有总管理员能做")
             svc.profiles.set_focus(gid, user_id, action)
             return web.json_response({"ok": True})
+
+        @get("/api/settings/backup")
+        async def _settings_backup(request: web.Request) -> web.Response:
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            try:
+                data = await asyncio.to_thread(_safe_backup_bytes, Path(svc.store.path))
+            except Exception:
+                logger.exception("生成数据库备份失败")
+                return _err(500, "备份没做成，看日志")
+            day = clock.day_key(clock.now())
+            return web.Response(
+                body=data, content_type="application/octet-stream",
+                headers={"Content-Disposition": f'attachment; filename="maiwork-backup-{day}.db"'},
+            )
 
         @post("/api/groups/{gid}/token")
         async def _token_reset(request: web.Request) -> web.Response:
@@ -1952,6 +2022,7 @@ class ConsoleServer:
                         "ok": bool(d.get("ok")),
                         "status": int(d.get("status") or 0),
                         "ms": int(d.get("ms") or 0),
+                        "first_token_ms": int(d.get("first_token_ms") or 0),
                         "prompt_tokens": int(d.get("prompt_tokens") or 0),
                         "completion_tokens": int(d.get("completion_tokens") or 0),
                         "error": _redact_secret(str(d.get("error") or ""), _secret_list()),
@@ -2002,11 +2073,15 @@ class ConsoleServer:
                     "ok": bool(d.get("ok")),
                     "status": int(d.get("status") or 0),
                     "ms": int(d.get("ms") or 0),
+                    "first_token_ms": int(d.get("first_token_ms") or 0),
                     "prompt_tokens": int(d.get("prompt_tokens") or 0),
                     "completion_tokens": int(d.get("completion_tokens") or 0),
                     "error": _redact_secret(str(d.get("error") or ""), secrets),
                     "request": _redact_json(req_json, secrets),
                     "response": _redact_json(resp_json, secrets),
+                    "context_map": (
+                        lambda v: v if isinstance(v, dict) else {}
+                    )(_safe_loads(d.get("context_map"))),
                 }
             )
 
@@ -2224,6 +2299,89 @@ class ConsoleServer:
             if data is None:
                 return _err(404, "这条记录不存在")
             return web.json_response(_redact_json(data, _secret_list()))
+
+        @get("/api/board/events")
+        async def _board_events(request: web.Request) -> web.StreamResponse:
+            """看板实时流（SSE，只总管理员）：起手一份 snapshot，随后随总线推
+            `event: runtime`，每 15 秒一个 `: ping` 心跳。
+
+            事件只有白名单字段（kind / stage / status / 群号 / 岗位 / 模型 / 耗时 /
+            短标）——绝不带群友原话 / 提示词。stop() 点亮 `_sse_stops` 时这路马上退
+            （runner.cleanup() 不等它）。
+            """
+            forbid = self._require_admin(request)
+            if forbid is not None:
+                return forbid
+            resp = web.StreamResponse(
+                status=200,
+                headers={
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+            await resp.prepare(request)
+            bus = getattr(svc, "runtime_bus", None)
+            stop_ev = asyncio.Event()
+            self._sse_stops.add(stop_ev)
+            sub_id = None
+            queue: asyncio.Queue | None = None
+            try:
+                snap: dict[str, Any] = {"seq": 0, "ts": clock.now(), "active": [], "recent": []}
+                if bus is not None:
+                    try:
+                        got = bus.snapshot()
+                        if isinstance(got, dict):
+                            snap = got
+                    except Exception:
+                        pass
+                    sub_id, queue = bus.subscribe()
+                await resp.write(
+                    f"event: snapshot\ndata: {json.dumps(snap, ensure_ascii=False, default=str)}\n\n".encode("utf-8")
+                )
+                if queue is None:
+                    return resp
+                while not stop_ev.is_set():
+                    get_task = asyncio.ensure_future(queue.get())
+                    stop_task = asyncio.ensure_future(stop_ev.wait())
+                    ping_task = asyncio.ensure_future(asyncio.sleep(15))
+                    try:
+                        done, pending = await asyncio.wait(
+                            {get_task, stop_task, ping_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        for t in (get_task, stop_task, ping_task):
+                            if not t.done():
+                                t.cancel()
+                    if stop_task in done or stop_ev.is_set():
+                        break
+                    if get_task in done:
+                        try:
+                            event = get_task.result()
+                        except Exception:
+                            continue
+                        try:
+                            payload = json.dumps(event, ensure_ascii=False, default=str)
+                            await resp.write(f"event: runtime\ndata: {payload}\n\n".encode("utf-8"))
+                        except (ConnectionResetError, BrokenPipeError, RuntimeError):
+                            break
+                    else:
+                        # 15 秒心跳（SSE 注释帧）：代理不会把连接掐了
+                        try:
+                            await resp.write(b": ping\n\n")
+                        except (ConnectionResetError, BrokenPipeError, RuntimeError):
+                            break
+            except (ConnectionResetError, BrokenPipeError, RuntimeError, asyncio.CancelledError):
+                pass
+            finally:
+                if bus is not None and sub_id is not None:
+                    try:
+                        bus.unsubscribe(sub_id)
+                    except Exception:
+                        pass
+                self._sse_stops.discard(stop_ev)
+            return resp
 
         # ---------- M2：资讯 / 构想 / 开话题（docs/07 §9.2 末段） ----------
 
@@ -4764,8 +4922,11 @@ class ConsoleServer:
             from .. import settings_ops as _ops
 
             # 建 kv + 落 identity 文档目录（管理员对话的 agent_create 走同一个函数）
+            raw_inst = body.get("instructions") if "instructions" in body else body.get("when", "")
             try:
-                profile = await _ops.agent_create_custom(svc, str(body.get("title") or ""))
+                profile = await _ops.agent_create_custom(
+                    svc, str(body.get("title") or ""), instructions=raw_inst
+                )
             except _ops.OpError as e:
                 return _err(e.status, e.message)
             return web.json_response(profile)
@@ -4808,6 +4969,14 @@ class ConsoleServer:
             ]
             for kind in all_kinds:
                 p = profiles.get(kind) or {"title": kind}
+                # 索引便条（库号 51，agent_index_notes）：agents 模块升级了才有这口；
+                # 没有的给 None（前端留空），绝不因此让整页 500
+                index_note = None
+                if kind != "task" and hasattr(mod, "get_index_note"):
+                    try:
+                        index_note = mod.get_index_note(gid, kind)
+                    except Exception:
+                        index_note = None
                 agents_out.append(
                     {
                         "kind": kind,
@@ -4816,6 +4985,7 @@ class ConsoleServer:
                         # 只读去重材料（list）；按群按岗取，绝不跨群
                         "learned": list((mod.memory(gid, kind) or {}).get("learned") or []),
                         "recent_handoffs": mod.handoffs(gid, kind=kind, limit=5),
+                        "index_note": index_note,
                     }
                 )
             return {"group_id": gid, "agents": agents_out}
@@ -5653,6 +5823,15 @@ class ConsoleServer:
         @get("/g/{token}")
         async def _group_link(request: web.Request) -> web.Response:
             raise web.HTTPFound(f"/#/{request.match_info['token']}/news")
+
+        # 回补路由（并行工作流加的 backport_routes.py）：在位就注册，不在位不挡路
+        try:
+            from . import backport_routes
+            backport_routes.register(self, app, svc)
+        except ImportError:
+            pass
+        except Exception:
+            logger.exception("注册回补路由出错，按现状继续")
 
         app.router.add_static("/static/", _STATIC_DIR, show_index=False)
 

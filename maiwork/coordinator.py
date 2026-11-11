@@ -64,6 +64,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -1535,17 +1536,13 @@ class Coordinator:
 
     async def _maybe_sync_text_reply(
         self, ws_name: str, tid: str, *, deliver_kind: str,
-        steps_dir: str, report: Any,
+        steps_dir: str, report: Any, scale: str = "standard",
     ) -> None:
-        """text 活的自动兜底：子 agent 把回复写进 submit_result.data.reply 而
-        reply.md 不在 / 是空时，由 Coordinator 把那段原文同步落盘（best-effort）。
-
-        验收只认 `artifacts/<任务>/reply.md` 的文件（见 _deliver_text_reply）；合同
-        允许子 agent 两种交法（文件或 data.reply），这条同步让「写了 data.reply
-        却没写文件」也照样过验收和交付。已有非空 reply.md 不覆盖（文件是正主）。
-
-        只限 deliver_kind=text 且不是中间步骤（steps_dir 空的活）；出错只记日志，
-        不挡活本身。
+        """text 活的自动兜底：reply.md 不在 / 是空时，按优先级把回复正文同步落盘（best-effort）：
+        1) dict data 的 reply / text；
+        2) 非空字符串 data；
+        3) scale == brief 且 report.summary 非平凡状态词。
+        已有非空 reply.md 不覆盖（文件是正主）。只限 deliver_kind=text 且不是中间步骤。
         """
         try:
             if str(deliver_kind or "") != "text" or str(steps_dir or "").strip():
@@ -1553,9 +1550,15 @@ class Coordinator:
             if report is None or not getattr(report, "ok", False):
                 return
             data = getattr(report, "data", None)
-            if not isinstance(data, dict):
-                return
-            reply_body = str(data.get("reply") or data.get("text") or "").strip()
+            reply_body = ""
+            if isinstance(data, dict):
+                reply_body = str(data.get("reply") or data.get("text") or "").strip()
+            elif isinstance(data, str) and data.strip():
+                reply_body = data.strip()
+            if not reply_body and normalize_scale(scale) == SCALE_BRIEF:
+                s = str(getattr(report, "summary", "") or "").strip()
+                if s and s.lower() not in {"done", "ok", "completed", "完成", "已完成"}:
+                    reply_body = s
             if not reply_body:
                 return
             reply_rel = f"{self._artifact_dir(tid)}/{TEXT_REPLY_NAME}"
@@ -1565,10 +1568,10 @@ class Coordinator:
             ).strip():
                 return
             await self._env.write_file(ws_name, reply_rel, reply_body)
-            logger.info("任务 %s 子 agent 把回复写在 data.reply，已同步落盘 %s", tid, reply_rel)
+            logger.info("任务 %s 子 agent 文本回复已同步落盘 %s", tid, reply_rel)
         except Exception:
             # best-effort：同步失败就当没这回事，验收 / 交付照旧按文件判
-            logger.exception("任务 %s 同步 data.reply → reply.md 失败", tid)
+            logger.exception("任务 %s 同步文本回复 → reply.md 失败", tid)
 
     # ------------------------------------------------------------------
     # 群友给的原图（线上 T-14，2026-10-10）
@@ -2171,22 +2174,37 @@ class Coordinator:
                 p = agents_mod.profile(k)
                 title = str(p.get("title") or k).strip() or k
                 enabled = bool(p.get("enabled", True))
+                desc = " ".join(str(p.get("instructions") or "").split())[:200]
             except Exception:
-                title, enabled = k, True
+                title, enabled, desc = k, True, ""
             if not enabled:
                 continue  # 停用的就别在主模型面前露脸（主模型误以为能派）
-            out.append(f"- 「{title}」kind={k}")
+            if desc:
+                out.append(f"- 「{title}」kind={k}（职责/何时分派：{desc}）")
+            else:
+                out.append(f"- 「{title}」kind={k}")
         return out
 
     def _known_dispatch_kinds(self) -> frozenset[str]:
-        """主模型 jobs[].agent 能被派给哪些岗：内建 four + kv 里的自定义（不含 main）。"""
+        """主模型 jobs[].agent 能被派给哪些岗：内建 four + kv 里已启用的自定义（不含 main）。"""
         base = frozenset(("news", "idea", "goal", "task"))
         try:
             spec = self._specialists
             agents_mod = getattr(spec, "agents", None) if spec is not None else None
             if agents_mod is None:
                 return base
-            extra = {str(k) for k in (agents_mod.custom_kinds() or []) if str(k or "").strip()}
+            extra: set[str] = set()
+            for raw_k in agents_mod.custom_kinds() or []:
+                k = str(raw_k or "").strip()
+                if not k:
+                    continue
+                try:
+                    p = agents_mod.profile(k)
+                    if p.get("enabled", True) is False:
+                        continue
+                except Exception:
+                    pass
+                extra.add(k)
         except Exception:
             return base
         return base | frozenset(extra)
@@ -3532,23 +3550,59 @@ class Coordinator:
                             brief = notes + "\n\n" + brief
                     except Exception:
                         logger.debug("读任务便条出错（群 %s），这次不注入", gid, exc_info=True)
+                def _runner_accepts(fn: Any, kw_name: str) -> bool:
+                    try:
+                        sig = inspect.signature(fn)
+                    except (TypeError, ValueError):
+                        return False
+                    for prm in sig.parameters.values():
+                        if prm.kind == inspect.Parameter.VAR_KEYWORD:
+                            return True
+                        if prm.name == kw_name and prm.kind in (
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            inspect.Parameter.KEYWORD_ONLY,
+                        ):
+                            return True
+                    return False
+
                 if specialists is None:
-                    report = await self._workers.run(
-                        brief,
-                        group_id=gid,
-                        tools=tools,
-                        task_id=tid,
-                        actor=f"子 agent #{job_idx}",
-                        workspace=ws_path,
-                        system_extra=system_extra,
-                        artifact_scope=artifact_scope,
-                        write_scope=write_scope,
-                        # brief 合同已点名「直接回话」，skill 清单这一层不附
-                        **({"skills_hint": ""} if is_brief else {}),
-                    )
+                    worker_extra_kw: dict[str, Any] = {"skills_hint": ""} if is_brief else {}
+                    if is_brief and _runner_accepts(self._workers.run, "allow_plain_reply"):
+                        worker_extra_kw["allow_plain_reply"] = True
+                    try:
+                        report = await self._workers.run(
+                            brief,
+                            group_id=gid,
+                            tools=tools,
+                            task_id=tid,
+                            actor=f"子 agent #{job_idx}",
+                            workspace=ws_path,
+                            system_extra=system_extra,
+                            artifact_scope=artifact_scope,
+                            write_scope=write_scope,
+                            **worker_extra_kw,
+                        )
+                    except TypeError as exc:
+                        if "allow_plain_reply" in worker_extra_kw and "allow_plain_reply" in str(exc):
+                            worker_extra_kw.pop("allow_plain_reply", None)
+                            report = await self._workers.run(
+                                brief,
+                                group_id=gid,
+                                tools=tools,
+                                task_id=tid,
+                                actor=f"子 agent #{job_idx}",
+                                workspace=ws_path,
+                                system_extra=system_extra,
+                                artifact_scope=artifact_scope,
+                                write_scope=write_scope,
+                                **worker_extra_kw,
+                            )
+                        else:
+                            raise
                     await self._maybe_sync_text_reply(
                         ws_name, tid,
-                        deliver_kind=deliver_kind, steps_dir=steps_dir, report=report,
+                        deliver_kind=deliver_kind, steps_dir=steps_dir,
+                        report=report, scale=scale,
                     )
                     return report
                 if system_extra:
@@ -3556,22 +3610,43 @@ class Coordinator:
                 # 专岗改版 4/4：这条活是主模型挑的「哪个岗」就跑哪个岗（kind = plan.jobs[].agent；
                 # 没挑 / 不在册都在 _plan 里落网成 task）。该岗自己的 SOUL/AGENTS/
                 # 模型/skills 由 specialists → workers 按 kind 各自注/挑。
-                report = await specialists.run(
-                    kind, brief,
-                    group_id=gid, task_id=tid,
-                    criteria=criteria,
-                    tools=list(tools or []),
-                    actor=f"子 agent #{job_idx}",
-                    workspace=ws_path,
-                    artifact_scope=artifact_scope,
-                    write_scope=write_scope,
-                    # brief 合同已点名「直接回话」：skill 名单压空、system 不附 skill 提示
-                    **({"suppress_skills": True} if is_brief else {}),
-                    **lane_kw,
-                )
+                spec_extra_kw: dict[str, Any] = {"suppress_skills": True} if is_brief else {}
+                if is_brief and _runner_accepts(specialists.run, "allow_plain_reply"):
+                    spec_extra_kw["allow_plain_reply"] = True
+                try:
+                    report = await specialists.run(
+                        kind, brief,
+                        group_id=gid, task_id=tid,
+                        criteria=criteria,
+                        tools=list(tools or []),
+                        actor=f"子 agent #{job_idx}",
+                        workspace=ws_path,
+                        artifact_scope=artifact_scope,
+                        write_scope=write_scope,
+                        **spec_extra_kw,
+                        **lane_kw,
+                    )
+                except TypeError as exc:
+                    if "allow_plain_reply" in spec_extra_kw and "allow_plain_reply" in str(exc):
+                        spec_extra_kw.pop("allow_plain_reply", None)
+                        report = await specialists.run(
+                            kind, brief,
+                            group_id=gid, task_id=tid,
+                            criteria=criteria,
+                            tools=list(tools or []),
+                            actor=f"子 agent #{job_idx}",
+                            workspace=ws_path,
+                            artifact_scope=artifact_scope,
+                            write_scope=write_scope,
+                            **spec_extra_kw,
+                            **lane_kw,
+                        )
+                    else:
+                        raise
                 await self._maybe_sync_text_reply(
                     ws_name, tid,
-                    deliver_kind=deliver_kind, steps_dir=steps_dir, report=report,
+                    deliver_kind=deliver_kind, steps_dir=steps_dir,
+                    report=report, scale=scale,
                 )
                 if lane and opening is not None:
                     # 工作视图 + 原始历史 + 压缩覆盖一条事务写；expect_rev 钉住读到的原始历史版本
@@ -6611,13 +6686,16 @@ class Coordinator:
         self, task_id: str, gid: str, ws_name: str, plan: dict, review: dict
     ) -> str:
         """通过：finish_attempt(passed) 已经做过，这里 transition → completed + 交付。"""
-        # 群空间小回合：验收通过、正式交付之前（不需要就不动模型；出错不影响交付）
-        await self._groupspace_round(task_id, gid, ws_name, plan, review)
-        # 「记经验」小回合：群空间之后、交付之前（没 identity / 没 remember 工具 → 零额外模型调用）
-        try:
-            await self._remember_round(task_id, gid, ws_name, plan, review)
-        except Exception:
-            logger.exception("记经验小回合出错（任务 %s，不影响交付）", task_id)
+        task_scale = normalize_scale(plan.get("scale"))
+        is_brief = task_scale == SCALE_BRIEF
+        if not is_brief:
+            # 群空间小回合：验收通过、正式交付之前（不需要就不动模型；出错不影响交付）
+            await self._groupspace_round(task_id, gid, ws_name, plan, review)
+            # 「记经验」小回合：群空间之后、交付之前（没 identity / 没 remember 工具 → 零额外模型调用）
+            try:
+                await self._remember_round(task_id, gid, ws_name, plan, review)
+            except Exception:
+                logger.exception("记经验小回合出错（任务 %s，不影响交付）", task_id)
         kind = plan["deliver_kind"]
         artifact_path: Path | None = None
         if kind != "text":
@@ -6652,7 +6730,6 @@ class Coordinator:
         except Exception:
             task_title = ""
         note = self._scrub_note(gid, review.get("note") or "", task_title, kind)
-        task_scale = normalize_scale(plan.get("scale"))
         if kind == "text":
             # 线上 T-13 第二问题（2026-10-10）：宿主 MaiBot（同一个 QQ 账号）已经用引用回复
             # 答过这件事了，这份小文本活再发一条就是重复刷屏 → 不往群里发，答案留在任务页。
@@ -6665,7 +6742,8 @@ class Coordinator:
                 )
                 logger.info("任务 %s：MaiBot 已经在群里回过，跳过重复交付", task_id)
                 self._write_tokens(task_id)
-                await self._summarize_task_to_skill(task_id, gid)
+                if not is_brief:
+                    await self._summarize_task_to_skill(task_id, gid)
                 return "done"
             lead_text = await self._session_delivery_note(
                 task_id, note, deliver_kind="text", scale=task_scale
@@ -6691,11 +6769,50 @@ class Coordinator:
                 )
             except Exception:
                 logger.exception("deliver_task 失败")
+        self._expedite_interactive_delivery(task_id, gid)
         self._write_tokens(task_id)
         # Delivery has been attempted; await the bounded learning round in this
         # owned task rather than spawning a detached background coroutine.
-        await self._summarize_task_to_skill(task_id, gid)
+        if not is_brief:
+            await self._summarize_task_to_skill(task_id, gid)
         return "done"
+
+    # 夜猫子：发起人 45 分钟内刚派活 / 回答过，这会儿人还醒着 → 睡觉时段也当场交付
+    INTERACTIVE_DELIVERY_WINDOW_S = 2700.0
+
+    def _expedite_interactive_delivery(self, task_id: str, gid: str) -> None:
+        """睡觉时段里完成、且发起人最近 45 分钟还在互动的任务：复用 `/mw 领取` 的
+        `outbox.claim_delivery`，把待发成品升级为 awaited_delivery（@发起人、文件说明、
+        额度口径都和领取一模一样）。久远的任务照旧等睡觉时段结束。出错只记日志。"""
+        try:
+            outbox = self._outbox
+            claim = getattr(outbox, "claim_delivery", None)
+            pushes = getattr(self, "_pushes", None) or getattr(outbox, "_pushes", None)
+            if claim is None or pushes is None:
+                return
+            now = clock.now()
+            if not pushes.in_quiet(now, gid):
+                return
+            conn = self._store.read()
+            row = conn.execute(
+                "SELECT created FROM tasks WHERE id=? AND group_id=?", (str(task_id), str(gid))
+            ).fetchone()
+            if row is None:
+                return
+            last = float(row["created"] or 0)
+            ev = conn.execute(
+                "SELECT MAX(ts) AS ts FROM events WHERE entity='task' AND entity_id=?"
+                " AND kind IN ('task.answer','task.revise','task.revised')",
+                (str(task_id),),
+            ).fetchone()
+            if ev is not None and ev["ts"] is not None:
+                last = max(last, float(ev["ts"]))
+            if now - last > self.INTERACTIVE_DELIVERY_WINDOW_S:
+                return
+            outcome = claim(str(gid), str(task_id))
+            logger.info("任务 %s 发起人刚互动过，睡觉时段当场交付（%s）", task_id, outcome)
+        except Exception:
+            logger.exception("夜间即时交付判断失败（任务 %s）", task_id)
 
     def _relay_main_text(self, ctx: Any, text: str) -> None:
         """D8：主模型边说边调工具时附带的那句自然话交给会话发言；工具调用 / 结果、

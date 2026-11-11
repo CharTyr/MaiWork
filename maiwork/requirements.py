@@ -25,6 +25,8 @@
 
 from __future__ import annotations
 
+import re
+
 import logging
 from typing import Any
 
@@ -150,6 +152,17 @@ def criteria_texts(items: Any) -> list[str]:
     return out
 
 
+# 技术 / 领域复合词：「占位符 / 占位图 / 测试未覆盖 / 医保未覆盖」是正常内容，不是「没去做」。
+# 先把这些词从证据里抹掉，再找标记词（抹成空格，别把前后两半拼出新标记）。
+_PLACEHOLDER_BENIGN = re.compile(
+    r"占位(?:符|图|元素|文本|文字|字符|块|框|组件|样式|属性)"
+    r"|(?:测试|单测|用例|代码|分支|行)未覆盖"
+    r"|未覆盖(?:分支|率|行|代码|用例|的(?:分支|代码|行))"
+    r"|(?:医保|保险|保障|报销|险种|社保)未覆盖"
+    r"|未覆盖(?:目录|药品|病种|项目|人群)"
+)
+
+
 def placeholder_marker(text: Any) -> str:
     """证据里有没有「没去做」的标记词（去空白后找）；返回命中的第一个，没有 → ''。
 
@@ -157,7 +170,7 @@ def placeholder_marker(text: Any) -> str:
     **「查不到」「未确认」本身不是标记词**：查过之后如实写清「查过哪些地方、没查到」是
     合法的证据，不许当留空。
     """
-    folded = " ".join(str(text or "").split())
+    folded = _PLACEHOLDER_BENIGN.sub(" ", " ".join(str(text or "").split()))
     for marker in PLACEHOLDER_MARKERS:
         if marker in folded:
             return marker

@@ -26,6 +26,7 @@ requester_id、消息正文；个人向构想标题一律「个人构想」。�
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -313,7 +314,87 @@ def board_view(svc: Any, *, hours: Any = None, now: float | None = None) -> dict
         "stuck_after_s": STUCK_AFTER_S,
         "lanes": [lanes[k] for k in ctx.lane_kinds() if k in lanes],
         "notes": _board_notes(ctx, since),
+        # 「正在做什么」实时块（库号 51，runtime_bus）：SSE 推送之外的首屏快照；
+        # 没接总线给空壳（形状不变），事件里只补群名，绝不加内容字段
+        "live": _live_view(ctx, svc),
     }
+
+
+def _live_view(ctx: Ctx, svc: Any) -> dict[str, Any]:
+    """runtime_bus.snapshot() 的看板形状；没接总线 → 空的同形壳（绝不 500）。"""
+    bus = getattr(svc, "runtime_bus", None) if svc is not None else None
+    if bus is None:
+        return {"seq": 0, "ts": ctx.now, "active": [], "recent": []}
+    try:
+        snap = bus.snapshot()
+    except Exception:
+        return {"seq": 0, "ts": ctx.now, "active": [], "recent": []}
+    if not isinstance(snap, dict):
+        return {"seq": 0, "ts": ctx.now, "active": [], "recent": []}
+    # 给事件补群名（复制着改，不动总线里的那份）
+    recent = []
+    for e in list(snap.get("recent") or []):
+        if isinstance(e, dict):
+            ev = dict(e)
+            gid = str(ev.get("group_id") or "")
+            if gid and gid != "admin":
+                ev["group_name"] = ctx.group_name(gid)
+            recent.append(ev)
+    active = []
+    for f in list(snap.get("active") or []):
+        if isinstance(f, dict):
+            fl = dict(f)
+            gid = str(fl.get("group_id") or "")
+            if gid and gid != "admin":
+                fl["group_name"] = ctx.group_name(gid)
+            active.append(fl)
+    return {
+        "seq": int(snap.get("seq") or 0),
+        "ts": _f(snap.get("ts") or ctx.now),
+        "active": active,
+        "recent": recent,
+    }
+
+
+def _latest_context_map(ctx: Ctx, trace: Trace) -> dict[str, Any] | None:
+    """这条链路上最近一次思考（model_calls）的上下文分组地图；没有 → None。
+
+    按 Trace 的钥匙找：task_id / run_ref / 同群+时间窗（和 steps() 同一口径，
+    只取最新一条 context_map 非空的）。查不到 / 表还没建 → None（绝不 500）。
+    """
+    if ctx.conn is None:
+        return None
+    col = {
+        "task_id": "task_id",
+        "run_ref": "run_ref",
+    }.get(trace.kind)
+    try:
+        if col and trace.value:
+            row = ctx.fetch_one(
+                f"SELECT context_map FROM model_calls WHERE {col}=? AND context_map != ''"
+                " ORDER BY id DESC LIMIT 1",
+                (trace.value,),
+            )
+        else:
+            start = trace.start
+            end = trace.end if trace.end else ctx.now
+            row = ctx.fetch_one(
+                "SELECT context_map FROM model_calls WHERE group_id=? AND ts>=? AND ts<=?"
+                " AND context_map != '' ORDER BY id DESC LIMIT 1",
+                (str(trace.group_id or ""), start, end),
+            )
+    except Exception:
+        return None
+    if row is None:
+        return None
+    raw = str(row["context_map"] or "")
+    if not raw.strip():
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) and parsed else None
 
 
 def _board_notes(ctx: Ctx, since: float) -> list[dict[str, Any]]:
@@ -405,7 +486,7 @@ def item_view(svc: Any, source: Any, item_id: Any, *, after: Any = None,
     out_item["last_step"] = last_step
     body = _trace_steps(ctx, trace, out_item, after=after_f, extra_think=extra,
                         round_map=round_map)
-    return {
+    out: dict[str, Any] = {
         "item": out_item,
         "link": body["link"],
         "steps": body["steps"],
@@ -414,3 +495,9 @@ def item_view(svc: Any, source: Any, item_id: Any, *, after: Any = None,
         "rounds": rounds,
         "notes": notes,
     }
+    # 最近一次思考的上下文地图（库号 51）：有数据才挂——老库 / 没有 model_calls
+    # 的详情保持原形状（行为不变黄金对照过）
+    ctx_map = _latest_context_map(ctx, trace)
+    if ctx_map is not None:
+        out["context_map"] = ctx_map
+    return out

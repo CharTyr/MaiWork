@@ -134,9 +134,9 @@ class TestSchema50:
     def test_fresh_migrate_reaches_50(self, tmp_path: Path) -> None:
         s = Store(tmp_path / "t.db")
         try:
-            assert s.migrate() == 50
-            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 50
-            assert len(_MIGRATIONS) == 50
+            assert s.migrate() == 51
+            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 51
+            assert len(_MIGRATIONS) == 51
             assert "lane" in _columns(s, "main_runs")
             assert "idx_main_runs_lane_started" in _index_names(s, "main_runs")
         finally:
@@ -193,7 +193,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_handoffs_status ON agent_handoffs(status, u
             )
             assert "run_ref" not in _columns(s, "agent_handoffs")
 
-            assert s.migrate() == 50
+            assert s.migrate() == 51
             assert "lane" in _columns(s, "main_runs")
             assert "idx_main_runs_lane_started" in _index_names(s, "main_runs")
             row = conn.execute("SELECT lane FROM main_runs WHERE ref=?",
@@ -216,7 +216,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_handoffs_status ON agent_handoffs(status, u
                 str(r["name"]) for r in s.read().execute(
                     "SELECT name FROM sqlite_master WHERE type='table'")
             }
-            assert s.migrate() == 50
+            assert s.migrate() == 51
             # Agents._ensure_schema 建的懒表带上 run_ref
             settings = _loaded_settings()
             a = Agents(s, lambda: settings)

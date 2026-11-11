@@ -374,6 +374,17 @@ def create(store: Any, settings: Settings, body: dict[str, Any]) -> dict[str, An
             if h_value:
                 store.secret_set(conn, secret_name(name, h_name), h_value)
     logger.info("网页新增 MCP 扩展 %s（%s），头 %d 个（值只进不出）", name, url_no_query(entry["url"]), len(headers))
+    try:
+        from . import settings_audit
+
+        settings_audit.record(
+            store, scope="global", target_key=f"mcp:{name}",
+            summary=f"新增 MCP 扩展 {name}",
+            before={}, after=dict(entry),
+            revertible=not any(v for v in headers.values()),
+        )
+    except Exception:
+        logger.debug("MCP 新增记账失败", exc_info=True)
     return entry
 
 
@@ -469,6 +480,7 @@ def update(store: Any, name: str, body: dict[str, Any]) -> dict[str, Any]:
     idx = next((i for i, e in enumerate(entries) if str(e.get("name") or "") == name), -1)
     if idx < 0:
         raise KeyError(name)
+    prev_entry = dict(entries[idx])
     current, headers, remove_headers = _merge_update(entries[idx], body)
     entries[idx] = current
     with store.tx() as conn:
@@ -487,6 +499,18 @@ def update(store: Any, name: str, body: dict[str, Any]) -> dict[str, Any]:
                 if h_name in remove_headers:
                     conn.execute("DELETE FROM secrets WHERE name=?", (s_name,))
     logger.info("网页修改 MCP 扩展 %s（头值只进不出）", name)
+    try:
+        from . import settings_audit
+
+        secret_touched = bool(remove_headers) or any(v for v in headers.values())
+        settings_audit.record(
+            store, scope="global", target_key=f"mcp:{name}",
+            summary=f"修改 MCP 扩展 {name}",
+            before=prev_entry, after=dict(current),
+            revertible=not secret_touched,
+        )
+    except Exception:
+        logger.debug("MCP 修改记账失败", exc_info=True)
     return current
 
 
@@ -497,6 +521,7 @@ def delete(store: Any, name: str) -> None:
     kept = [e for e in entries if str(e.get("name") or "") != name]
     if len(kept) == len(entries):
         raise KeyError(name)
+    victim = next(e for e in entries if str(e.get("name") or "") == name)
     prefix = secret_name(name, "")
     with store.tx() as conn:
         store.kv_set(conn, KV_MCP, kept)
@@ -510,6 +535,17 @@ def delete(store: Any, name: str) -> None:
         if disabled != _disabled_names(store):
             store.kv_set(conn, KV_MCP_DISABLED, disabled)
     logger.info("网页删除 MCP 扩展 %s", name)
+    try:
+        from . import settings_audit
+
+        settings_audit.record(
+            store, scope="global", target_key=f"mcp:{name}",
+            summary=f"删除 MCP 扩展 {name}",
+            before=dict(victim), after={},
+            revertible=not (victim.get("header_names") or []),
+        )
+    except Exception:
+        logger.debug("MCP 删除记账失败", exc_info=True)
 
 
 def toggle(store: Any, settings: Settings, name: str, enabled: bool) -> None:
@@ -546,6 +582,17 @@ def toggle(store: Any, settings: Settings, name: str, enabled: bool) -> None:
             store.kv_set(conn, KV_MCP_DISABLED, disabled)
         _ = cfg
     logger.info("网页把 MCP 扩展 %s 开关拨成 %s", name, "开" if enabled else "关")
+    try:
+        from . import settings_audit
+
+        settings_audit.record(
+            store, scope="global", target_key=f"mcp:{name}",
+            summary=("开启" if enabled else "关闭") + f" MCP 扩展 {name}",
+            before={"enabled": not enabled}, after={"enabled": bool(enabled)},
+            revertible=(source == "web"),
+        )
+    except Exception:
+        logger.debug("MCP 开关记账失败", exc_info=True)
 
 
 def stored_headers_for(store: Any, settings: Settings, name: str) -> dict[str, str]:

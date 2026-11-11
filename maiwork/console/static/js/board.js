@@ -9,6 +9,8 @@ import { api } from "./api.js";
 import { fishSvg } from "./fish.js";
 import { loading } from "./pages/news.js";
 import { mergeSteps, stepsSectionHTML } from "./board_steps.js";
+import { boardFlowHTML } from "./board_flow.js";
+import { actCtxMap } from "./ctxmap.js";
 import { loadTask } from "./detail.js";
 import { closeSheet, openSheet, repaintSheet } from "./sheet.js";
 import { go } from "./router.js";
@@ -170,6 +172,7 @@ export function boardPage() {
     </div>`;
   html += `</div>`;
   if (fail) html += `<div class="warn-box stale-note" role="status">连接中断，正在重试。当前显示的可能不是最新内容。</div>`;
+  html += boardFlowHTML(b, f) || "";
   const total = lanes.reduce((n, l) => n + (l.running || []).length + (l.history || []).length, 0);
   const matched = scoped(true).filter((x) => statusKeep(x, true, st)).length + scoped(false).filter((x) => statusKeep(x, false, st)).length;
   if (!lanes.length) html += `<p class="h-meta">暂无专岗</p>`;
@@ -302,6 +305,14 @@ export async function actBoard(a, el) {
     }
     case "board-notes":
       openSheet("board-notes");
+      break;
+    case "board-flow-toggle":
+      state.boardFlowCollapsed = !state.boardFlowCollapsed;
+      renderView();
+      break;
+    case "board-ctx-view":
+    case "board-ctx-part":
+      await actCtxMap(a, el);
       break;
   }
   return true;

@@ -340,8 +340,18 @@ class GroupApprovals:
             exempt_group=bool(rec.exempt_group),
             required=bool(rec.required),
         )
+        before = self.get(gid_s).as_dict()
         with self._store.tx() as conn:
             self._store.kv_set(conn, KV_PREFIX + gid_s, rec.as_dict())
+        try:
+            from . import settings_audit
+
+            settings_audit.record(
+                self._store, scope=f"group:{gid_s}", target_key="group_approval",
+                summary="修改派活审批策略", before=before, after=rec.as_dict(),
+            )
+        except Exception:
+            logger.debug("派活审批策略修改记账失败", exc_info=True)
         return rec
 
     def set(self, gid: Any, body: Any) -> GroupApproval:

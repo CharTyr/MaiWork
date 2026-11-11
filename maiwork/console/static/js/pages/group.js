@@ -7,6 +7,8 @@ import { pulseCard } from "../pulse.js";
 import { emptyState, loading } from "./news.js";
 import { ctxSection } from "./groupctx.js";
 import { controlsSection } from "./groupcontrols.js";
+import { jevBarsHTML } from "../jev_bars.js";
+import { groupChangesSection } from "../settings/changes.js";
 
 // 一段冷场一张卡：同一段里判了几次合在一起，Jev 那句用这段的代表（开了的那条 / 最新一次）。
 function topicItem(s, i) {
@@ -22,6 +24,7 @@ function topicItem(s, i) {
       <div>
         <h3 class="item-title">${esc(span)} · ${opened ? "已开启话题" : "未开启话题"}</h3>
         ${gadmin() ? `<p class="item-body soft">已静默 ${esc(dur(t.quiet_s))}${t.usual_gap_s ? `（平时约 ${esc(dur(t.usual_gap_s))}一条消息）` : ""}。${esc(times)}Jev：${esc(judgeText(t))}${j && j.detail ? `（${esc(j.detail)}）` : ""}。${t.pick && t.pick.title && opened ? `选用「${esc(t.pick.title)}」。` : ""}</p>` : ""}
+        ${gadmin() && j ? jevBarsHTML(j, { compact: true }) || "" : ""}
         ${opened ? `<div class="opener">${esc(t.opener)}</div>` : ""}
         ${opened ? `<div class="status"><span class="dot ${r && r.replies ? "used" : ""}"></span><span class="status-text">${r ? (r.replies ? `${r.replies} 句回应${r.active_users ? `（${r.active_users} 人参与）` : ""}${r.on_topic ? `，${r.on_topic} 句切题` : ""}${r.followups ? `，MaiBot 回复 ${r.followups} 句` : ""}` : "无人回应，将延长下次间隔") : "等待回应"}</span></div>` : ""}
         ${
@@ -238,13 +241,13 @@ export function viewGroup(g, v) {
   html += groupSubNav();
   const showAdmin = gadmin() && state.groupSub === "admin";
   if (g.fresh) {
-    if (showAdmin) return html + controlsSection(g.id, v) + ctxBlock(g);
+    if (showAdmin) return html + controlsSection(g.id, v) + (groupChangesSection(g.id) || "") + ctxBlock(g);
     html += emptyState("seedling", "正在建立群画像", "");
     if (gadmin()) html += focusSection(v);
     return html + commandsBlock(v);
   }
   if (showAdmin) {
-    return html + controlsSection(g.id, v) + ctxBlock(g) + groupSpaceBlock(v, g);
+    return html + controlsSection(g.id, v) + (groupChangesSection(g.id) || "") + ctxBlock(g) + groupSpaceBlock(v, g);
   }
   const log = v.topic_log || [];
   html += `<h2 class="h-sub">话题记录</h2>`;

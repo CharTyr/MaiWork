@@ -253,7 +253,9 @@ class Topics:
         *,
         outbox: Any = None,  # 发件箱（0.8.0：唯一的发送路径）；没接 = 不开话题
         skills: Any = None,  # Skills 实例：开场白写法读 topic-opener；None 用自带默认写法
+        runtime_bus: Any = None,  # 运行事件总线（库号 51，可选）：群消息信号上看板实时流
     ) -> None:
+        self._runtime_bus = runtime_bus
         self._skills = skills
         self._store = store
         self._host = host
@@ -350,6 +352,10 @@ class Topics:
         `topic:<gid>:<ms>:<seq>` 的 round ref 下跑：轮里的 model_calls / judgments
         自动挂它，topic_log 行存同一份 ref → 看板精确关联（link=exact）。
         """
+        from . import usage_alerts
+
+        if usage_alerts.hard_limit_tripped(self._store, self._get_settings) is not None:
+            return "skip: 今天用量到了每日硬上限，开话题暂停"
         try:
             ref = run_ref.new("topic", str(group_id))
         except Exception:
@@ -376,6 +382,19 @@ class Topics:
         # 是红线，上游误传群号也不能放行。
         if settings is None or not group_push.served(settings, gid):
             return "skip:unserved"
+
+        # 服务群的冷场轮检开始了（signal，库号 51）：看板「正在做什么」亮一眼，
+        # 不带聊天内容 / 群友资料——事件只有群号 + 短标
+        bus = self._runtime_bus
+        if bus is not None:
+            try:
+                bus.emit(
+                    "signal", stage="signal", status="done",
+                    group_id=gid, role="topics", ok=True,
+                    badge="群消息信号",
+                )
+            except Exception:
+                pass
 
         # 每群一份「往群里发」设置（group_push：睡觉时段 / 开关 / 每日总上限的唯一真源）
         cfg = group_push.get_config(self._store, gid, settings)
@@ -604,6 +623,16 @@ class Topics:
         )
         if answers is None:
             return "skip:jev_unavailable"
+        # Jev 细节（库号 51）：耗时 + 各选项概率（ContextVar，别的并发轮不串台）。
+        # answers 是 None 就早退了，走到这一定问过一次。
+        jev_detail: dict = {}
+        try:
+            got = self._jev.last_detail()
+            if isinstance(got, dict):
+                jev_detail = got
+        except Exception:
+            jev_detail = {}
+        jev_probs: dict = jev_detail.get("probs") if isinstance(jev_detail.get("probs"), dict) else {}
 
         # Jev 真答了才记指纹：没答（超时/熔断）下一轮照问。
         with self._store.tx() as conn:
@@ -639,6 +668,17 @@ class Topics:
                 "fit": float(fit_arr[0][1]),
             }
 
+        # 候选兴趣分布（库号 51）：Jev 每道 fit_* 的概率；挑中的那条标 picked。
+        # 成员身份看时由 views.py 剥掉。
+        fits_extra: List[Dict[str, Any]] = []
+        for ci, fp in fit_arr[:6]:
+            fits_extra.append({
+                "idx": int(ci),
+                "title": str(candidates[ci]["title"])[:60],
+                "fit_p": round(float(fp), 4),
+                "picked": bool(candidate_idx is not None and ci == candidate_idx),
+            })
+
         # 写 topic_log（jev 字段 JSON / pick / 后续 fill）
         topic_id = self._write_judgment(
             gid,
@@ -656,6 +696,11 @@ class Topics:
             fit_best=fit_best,
             fit_title=fit_title,
             opened=candidate is not None,
+            jev_extra={
+                "ms": int(jev_detail.get("ms") or 0),
+                "reason_probs": jev_probs.get("reason") if isinstance(jev_probs.get("reason"), dict) else {},
+                "fits": fits_extra,
+            },
         )
 
         if candidate is None:
@@ -1085,6 +1130,7 @@ class Topics:
         fit_best: float | None = None,
         fit_title: str = "",
         opened: bool = False,
+        jev_extra: dict | None = None,
     ) -> int:
         ok = bool(answers.get("ok") is not None and float(answers.get("ok", 0.0)) >= _OK_THRESHOLD and reason == "fine")
         # stuck：这轮没开是卡在哪一层——时机不过关（ok 分不够或 reason 不是 fine）
@@ -1111,6 +1157,21 @@ class Topics:
             "stuck": stuck,
             "stretch_ts": float(quiet_ts),
         }
+        # Jev 详情（库号 51）：耗时 + 每道选择题的选项概率 + 候选兴趣分布。
+        # 成员身份看时由 views.py 剥掉（只留 ok/reason/confidence 那层）。
+        extra = jev_extra if isinstance(jev_extra, dict) else {}
+        if extra.get("ms"):
+            jev_obj["ms"] = int(extra["ms"])
+        reason_probs_raw = extra.get("reason_probs")
+        if isinstance(reason_probs_raw, dict) and reason_probs_raw:
+            # 选项概率换中文名（跟 reason 的 _REASON_ZH 同一个口径）
+            jev_obj["reason_probs"] = {
+                _REASON_ZH.get(str(label), str(label)): p
+                for label, p in reason_probs_raw.items()
+            }
+        fits = extra.get("fits")
+        if isinstance(fits, list) and fits:
+            jev_obj["fits"] = fits[:6]
 
         jev_json = json.dumps(jev_obj, ensure_ascii=False)
         pick_json = json.dumps(pick or {}, ensure_ascii=False)

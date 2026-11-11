@@ -166,7 +166,7 @@ class TestRawMerge:
 
 class TestMigration:
     def test_latest_version_is_44(self) -> None:
-        assert LATEST == 50, "第 45 步补索引、第 46 步主模型条目、第 47 步 round ref、第 48 步便条板、第 49 步定向备忘、第 50 步看板精修（lane / 交接单 run_ref），历史迁移位置保持不变"
+        assert LATEST == 51, "第 45 步补索引、第 46 步主模型条目、第 47 步 round ref、第 48 步便条板、第 49 步定向备忘、第 50 步看板精修（lane / 交接单 run_ref）、第 51 步观测与常驻笔记，历史迁移位置保持不变"
         assert _MIGRATIONS[36].__name__ == "_m_task_lane_raw"
         assert _MIGRATIONS[37].__name__ == "_m_idea_kind"
         assert _MIGRATIONS[48].__name__ == "_m_mention_targets"

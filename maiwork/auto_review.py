@@ -59,11 +59,7 @@ _ANGLE_RUN = re.compile(r"(<{2,}|>{2,})")
 # 明显的注入特征（统一小写后比对）：命中就**不调模型**，直接留人批。
 # 清单保守即可——**宁可多留人批**，也不让群友用一句话骗过自动批准。
 _INJECTION_MARKERS: tuple[str, ...] = (
-    "approve",
-    "ignore",
     "system prompt",
-    "忽略",
-    "无视",
     "以上规则",
     "之前的指令",
     "系统提示",
@@ -86,6 +82,17 @@ def _strip_markers(text: str) -> str:
     )
 
 
+# 有歧义的词用正则：放过 .gitignore / ignorecase / 忽略大小写 这类正常技术说法
+_INJECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    # 「自动 approve PR」是 CI 正常说法；其余 approve 一律当注入特征
+    ("approve", re.compile(r"approve(?!\w)(?!s?\s*(?:the\s+|a\s+)?(?:prs?|pull\s*requests?|merge\s*requests?|mrs?)\b)")),
+    ("ignore", re.compile(
+        r"(?<![.\w])ignore(?![_\-]?case\b)(?!\s+(?:blank|empty|whitespace|case|errors?|warnings?|ssl|certs?)\b)(?!\w)")),
+    ("忽略", re.compile(r"忽略(?!大小写|空行|空白|空格|报错|错误|警告|证书|注释|格式|首行|表头|重复)")),
+    ("无视", re.compile(r"无视(?!大小写|空行|空白|空格|报错|错误|警告|证书|注释|格式|首行|表头|重复)")),
+)
+
+
 def _injection_hit(row: dict) -> str:
     """title / quote / via 合起来（大小写不敏感）命中注入特征 → 返回命中的特征词，否则 ""。"""
     text = " ".join(
@@ -93,6 +100,9 @@ def _injection_hit(row: dict) -> str:
     ).lower()
     for marker in _INJECTION_MARKERS:
         if marker in text:
+            return marker
+    for marker, pattern in _INJECTION_PATTERNS:
+        if pattern.search(text):
             return marker
     return ""
 

@@ -24,6 +24,7 @@ READONLY_ACTS = {
     "board-filter", "board-hours", "board-status", "board-reset", "board-lane-more",
     "board-item", "board-step-filter", "board-round-filter", "board-jump-end",
     "board-goto", "board-notes", "chat-ask-ref",
+    "board-flow-toggle", "board-ctx-view", "board-ctx-part",
 }
 
 

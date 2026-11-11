@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -399,6 +400,58 @@ def validate_answers(raw: Any, questions: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _clamp01(value: Any) -> Optional[float]:
+    """概率值夹到 [0,1]；不是数返回 None。"""
+    try:
+        p = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, p))
+
+
+def _extract_probs(answers_raw: Any, questions: Dict[str, Any]) -> Dict[str, Any]:
+    """把每道题的选项概率提出来（judgments.probs / last_detail 用）。
+
+    choice：直接抄服务返回的 probabilities（键集合已校验过和 criteria 一致），
+    每项夹 [0,1] 后四舍五入到 4 位；noul：折成 {"yes": p, "no": 1-p}。
+    """
+    out: Dict[str, Any] = {}
+    if not isinstance(answers_raw, dict):
+        return out
+    for qid, q in (questions or {}).items():
+        if not isinstance(q, dict):
+            continue
+        entry = answers_raw.get(qid)
+        if not isinstance(entry, dict):
+            continue
+        if q.get("type") == "choice":
+            raw = entry.get("probabilities")
+            if isinstance(raw, dict):
+                dist: Dict[str, float] = {}
+                for label, v in raw.items():
+                    p = _clamp01(v)
+                    if p is not None:
+                        dist[str(label)] = round(p, 4)
+                if dist:
+                    out[str(qid)] = dist
+        elif q.get("type") == "noul":
+            p = _clamp01(entry.get("noul"))
+            if p is not None:
+                out[str(qid)] = {"yes": round(p, 4), "no": round(1.0 - p, 4)}
+    return out
+
+
+# 闸门事件的中文短标（≤24 字）：按用途给业务名，认不出的叫「快速判断」
+_GATE_BADGES = {
+    "topic_check": "冷场判断",
+    "intake": "@消息分流",
+}
+
+
+def _gate_badge(purpose: str) -> str:
+    return _GATE_BADGES.get(str(purpose or ""), "快速判断")
+
+
 # ----------------------------------------------------------------------
 # Jev 客户端
 # ----------------------------------------------------------------------
@@ -419,6 +472,7 @@ class Jev:
         get_settings: Callable[[], Settings],
         *,
         transport: Any = None,
+        runtime_bus: Any = None,
     ) -> None:
         self._store = store
         self._get_settings = get_settings
@@ -428,6 +482,47 @@ class Jev:
         # 熔断按目标各算：记着上次用的是哪个服务，换了就重新开始
         self._target_id = ""
         self._lock = asyncio.Lock()
+        # 运行事件总线（库号 51，可选）：闸门判断也上看板实时流；没接不发
+        self._runtime_bus = runtime_bus
+        self._jev_seq = 0
+        # 最近一次 ask 的细节（ContextVar：同一线程的并发 ask 互不串台）。
+        # 只装 {probs, ms, endpoint, ok} —— 绝不放 state / 群友原话。
+        self._last_detail: contextvars.ContextVar = contextvars.ContextVar(
+            f"jev_detail_{id(self)}", default=None
+        )
+        self._flight: Optional[Dict[str, Any]] = None
+
+    def last_detail(self) -> Optional[Dict[str, Any]]:
+        """本次调用上下文里最近一次 ask 的细节；没问过 / 跨上下文 → None。"""
+        detail = self._last_detail.get()
+        return dict(detail) if isinstance(detail, dict) else None
+
+    def _note_detail(self, *, probs: Dict[str, Any], ms: int, ok: bool) -> None:
+        """登记 last_detail（ContextVar 内，随每次 ask 覆盖）。"""
+        try:
+            self._last_detail.set(
+                {"probs": dict(probs or {}), "ms": int(ms),
+                 "endpoint": str(self._target_id or ""), "ok": bool(ok)}
+            )
+        except Exception:
+            pass
+
+    def _gate_emit(self, status: str, *, ms: int = 0, ok: bool = True) -> None:
+        """闸门事件（stage=gate）发到运行事件总线；没接 / 发不出去当没发。"""
+        bus = self._runtime_bus
+        flight = self._flight or {}
+        if bus is None:
+            return
+        try:
+            bus.emit(
+                "jev_gate", stage="gate", status=status,
+                group_id=str(flight.get("group_id") or ""), role="jev",
+                model=str(self._target_id or ""),
+                flight_id=str(flight.get("flight_id") or ""),
+                ms=int(ms), ok=bool(ok), badge=str(flight.get("badge") or ""),
+            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 配置 / 密钥
@@ -469,6 +564,8 @@ class Jev:
         self._consecutive_failures += 1
         if self._consecutive_failures >= _BREAKER_THRESHOLD:
             self._breaker_open_until = clock.now() + _BREAKER_COOLDOWN_S
+        self._note_detail(probs={}, ms=ms, ok=False)
+        self._gate_emit("error", ms=ms, ok=False)
         self._log_failure(ms, error, purpose=purpose, group_id=group_id, state=state, key=key, answers=answers)
 
     def _record_success(self) -> None:
@@ -588,6 +685,14 @@ class Jev:
             if self._breaker_open():
                 logger.debug("Jev 熔断中，跳过本次调用（purpose=%s）", purpose)
                 return None
+            # 闸门开始（start）：真发 HTTP 才登记在途——熔断 / 配置早退不算一次航班
+            self._jev_seq += 1
+            self._flight = {
+                "flight_id": f"jev-{self._jev_seq}",
+                "group_id": str(group_id or ""),
+                "badge": _gate_badge(purpose),
+            }
+            self._gate_emit("start")
             start = clock.now()
             answers: Optional[Dict[str, Any]] = None
             try:
@@ -624,6 +729,10 @@ class Jev:
                     self._record_failure(ms, f"{tag}invalid_answers: {exc}", purpose=purpose, group_id=group_id, state=state, key=key)
                     return None
                 self._record_success()
+                # 选项概率（库号 51）： judgments.probs / last_detail 用
+                probs = _extract_probs(normalized.get("answers", {}), questions)
+                self._note_detail(probs=probs, ms=ms, ok=True)
+                self._gate_emit("done", ms=ms, ok=True)
                 # 成功也落库
                 self._log_success(
                     ms,
@@ -633,6 +742,7 @@ class Jev:
                     answers_raw=normalized.get("answers", {}),
                     answers_validated=answers,
                     key=key,
+                    probs=probs,
                 )
                 return answers
             except (httpx.HTTPError, asyncio.TimeoutError) as exc:
@@ -724,6 +834,7 @@ class Jev:
         answers_raw: Any,
         answers_validated: Dict[str, Any],
         key: str,
+        probs: Optional[Dict[str, Any]] = None,
     ) -> None:
         state_text = _state_summary(state, key)
         # validated 的 answers（最多截断）
@@ -738,8 +849,33 @@ class Jev:
             answers_text = _answers_json(serializable, key)
         except Exception:
             answers_text = _answers_json(answers_raw, key)
+        probs_text = ""
+        try:
+            probs_text = json.dumps(probs or {}, ensure_ascii=False) if probs else ""
+        except (TypeError, ValueError):
+            probs_text = ""
         try:
             with (self._store.immediate_tx() if purpose == "session.triage" else self._store.tx()) as conn:
+                cols = {r["name"] for r in conn.execute("PRAGMA table_info(judgments)")}
+                if "probs" in cols:
+                    conn.execute(
+                        "INSERT INTO judgments (ts, day, purpose, group_id, state_summary, answers, ms, ok, error, run_ref, probs)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            clock.now(),
+                            clock.day_key(clock.now()),
+                            str(purpose or ""),
+                            str(group_id or ""),
+                            state_text,
+                            answers_text,
+                            int(ms),
+                            1,
+                            "",
+                            run_ref.current(),
+                            probs_text,
+                        ),
+                    )
+                    return
                 conn.execute(
                     "INSERT INTO judgments (ts, day, purpose, group_id, state_summary, answers, ms, ok, error, run_ref)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

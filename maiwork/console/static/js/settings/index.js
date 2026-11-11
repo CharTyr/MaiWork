@@ -19,6 +19,7 @@ import { updateSection } from "../update.js";
 import { attentionSection } from "./attention.js";
 import { appearancePage } from "./appearance.js";
 import { socialPage } from "./social.js";
+import { changesPage, loadChanges } from "./changes.js";
 
 /* ───────────── 设置 / 群切换（抽屉） ───────────── */
 
@@ -41,7 +42,7 @@ export const SET_SUBS = [
   ["extensions", "工具与平台", "tools", "联网搜索、技能、MCP 和组件"],
   ["sources", "群与来源", "newspaper", "群链接、群管理员和资讯来源"],
   ["usage", "用量", "chart", "每日统计和调用记录"],
-  ["rules", "系统", "moon", "外观、通用记忆和全部设置"],
+  ["rules", "系统", "moon", "外观、通用记忆、全部设置和修改记录"],
 ];
 
 export const SET_TABS = {
@@ -68,6 +69,7 @@ export const SET_TABS = {
     ["appearance", "外观"],
     ["memory", "通用记忆"],
     ["config", "全部设置"],
+    ["changes", "修改记录"],
   ],
 };
 
@@ -123,6 +125,7 @@ function renderSystemSection() {
   const t = activeSetTab("rules");
   if (t === "memory") return memoryPage();
   if (t === "config") return rulesPage();
+  if (t === "changes") return changesPage();
   return appearancePage();
 }
 
@@ -163,6 +166,7 @@ export async function actSettingsNav(a, el) {
   state.setTab = state.setTab || {};
   state.setTab[sub] = tab;
   if (state.setSub !== sub) state.setSub = sub;
+  if (sub === "rules" && tab === "changes" && !state.changes) await loadChanges();
   repaintSheet();
   return true;
 }
@@ -251,6 +255,6 @@ function settingsOverview(s) {
     <p class="fine">${alert ? `提醒线 ${tokens(alert)} tokens，已使用 ${Math.round((used / alert) * 100)}%。` : "未设置提醒线。"}${u.errors ? ` 今日错误 ${u.errors} 次。` : ""}${usageExtra(u)}</p>
     ${updateSection()}
     <h2 class="h-sub">运行状态</h2>
-    <div class="set-group">${(s.health || []).map((h) => `<div class="set-row">${ico(h.icon || "gear")}<div><div class="set-name">${esc(h.name)}</div><div class="set-text">${esc(h.text)}</div>${h.copy ? `<div class="set-text mono-link">${esc(h.copy)}</div><div class="actions"><button class="btn small" data-act="copy" data-link="${esc(h.copy)}" data-what="公钥">复制公钥</button></div>` : ""}</div><span class="dot ${h.state === "ok" ? "ok" : h.state === "warn" ? "pending" : ""}"></span></div>`).join("")}</div>
+    <div class="set-group">${(s.health || []).map((h) => `<div class="set-row">${ico(h.icon || "gear")}<div><div class="set-name">${esc(h.name)}</div><div class="set-text">${esc(h.text)}</div>${h.copy ? `<div class="set-text mono-link">${esc(h.copy)}</div><div class="actions"><button class="btn small" data-act="copy" data-link="${esc(h.copy)}" data-what="公钥">复制公钥</button></div>` : ""}</div><span class="dot ${h.state === "ok" ? "ok" : h.state === "warn" ? "pending" : ""}"></span></div>`).join("")}<div class="set-row">${ico("floppy")}<div><div class="set-name">数据备份</div><div class="set-text">导出脱敏数据库快照（含群画像、群规、做法、任务与资讯记录，不含任何密钥或登录态）</div></div><span class="row-btns"><a class="btn small" href="/api/settings/backup" download>下载备份</a></span></div></div>
     <div class="actions set-foot-acts"><button class="btn" data-act="onb-restart">重新进行初始设置</button><button class="btn" data-act="logout">退出登录</button></div>`;
 }

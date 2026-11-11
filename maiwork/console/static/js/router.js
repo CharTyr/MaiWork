@@ -21,6 +21,7 @@ import { loadAppearance } from "./settings/appearance.js";
 import { loadSocial, resetSocial } from "./settings/social.js";
 import { loadTheme } from "./theme.js";
 import { loadBoard, loadBoardItem } from "./board.js";
+import { loadChanges } from "./settings/changes.js";
 
 /* ───────────── 路由 ───────────── */
 
@@ -65,6 +66,7 @@ const LEGACY_SET_ROUTES = {
   appearance: ["rules", "appearance"],
   memory: ["rules", "memory"],
   rules: ["rules", "config"],
+  changes: ["rules", "changes"],
 };
 
 export function parseHash() {
@@ -202,6 +204,8 @@ export async function reboot() {
   state.agentLoadSeq = (state.agentLoadSeq || 0) + 1;
   state.tasks = {};
   state.board = null;
+  state.changes = null;
+  state.groupChanges = null;
   loadTheme(); // 主题和音效：不挡开页，拿不到就沿用首屏缓存的
   try {
     await loadMe();
@@ -223,7 +227,7 @@ export async function reboot() {
         if (state.page === "settings" && state.setSub === "models") await Promise.all([loadModels(), loadAgents(), loadIdentity()]);
         if (state.page === "settings" && state.setSub === "sources") await loadGA();
         if (state.page === "settings" && state.setSub === "usage") await Promise.all([loadUsage(), loadLogSummary()]);
-        if (state.page === "settings" && state.setSub === "rules") await Promise.all([loadAppearance(), loadIdentity(), loadRules()]);
+        if (state.page === "settings" && state.setSub === "rules") await Promise.all([loadAppearance(), loadIdentity(), loadRules(), loadChanges()]);
         renderRail();
         repaintSheet();
       })
@@ -272,7 +276,7 @@ export async function enterSettings(sub, tab) {
   if (state.setSub === "models") await Promise.all([loadModels(), loadAgents(), loadIdentity()]);
   if (state.setSub === "sources") await loadGA();
   if (state.setSub === "usage") await Promise.all([loadUsage(), loadLogSummary()]);
-  if (state.setSub === "rules") await Promise.all([loadAppearance(), loadIdentity(), loadRules()]);
+  if (state.setSub === "rules") await Promise.all([loadAppearance(), loadIdentity(), loadRules(), loadChanges()]);
   if (state.page === "settings") {
     renderView();
     renderSide();

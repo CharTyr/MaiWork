@@ -27,6 +27,7 @@ from .environments import vm_platforms
 from .tasks import ANSWER_HINT
 from .host import Host
 from .intake import Intake, Signals
+from .runtime_bus import RuntimeBus
 from .models import Models
 from .store import Store
 
@@ -130,6 +131,16 @@ class MaiWorkApp:
         self.models: Models | None = None
         self.profiles: Any = None
         self.signals = Signals()
+        # 运行事件总线（库号 51，runtime_bus.py）：看板「正在做什么」的实时流。
+        # 服务群闸门：读不到设置先放行（启动早期），读到了才按服务群名单过滤。
+        def _bus_served(gid: str) -> bool:
+            try:
+                settings = self.get_settings()
+                return bool(settings is not None and settings.is_served(str(gid)))
+            except Exception:
+                return True
+
+        self.runtime_bus = RuntimeBus(is_served=_bus_served)
         self._intake: Intake | None = None
         # 派活判断兜底（quick_judge.QuickJudge；由 _make_intake 建，停机时收）
         self.quick_judge: Any = None
@@ -576,6 +587,7 @@ class MaiWorkApp:
         self.models = Models(
             self.store, self.get_settings, transport=self.http_transport,
             config_writer=self._write_config_and_apply,
+            runtime_bus=self.runtime_bus,
         )
         self.profiles = self._make_profiles()
         # 关注成员个人画像模块（persona.py；模块没就位还不至于拖垮别的）
@@ -613,7 +625,8 @@ class MaiWorkApp:
         except Exception:
             logger.exception("每群三份启动迁移出错，按现状继续启动（旧来源留到下次再迁）")
 
-        self.jev = Jev(self.store, self.get_settings, transport=self.jev_transport)
+        self.jev = Jev(self.store, self.get_settings, transport=self.jev_transport,
+                       runtime_bus=self.runtime_bus)
         # 搜索（2026-10）：内置服务全删，只走「扩展」里绑定的那个 MCP——Search 现读
         # kv["extensions.search"] 绑定 + Extensions 的运行状态；扩展在 _start_extensions 才连上，
         # 这里先建好壳子（available() 现查，不缓存）。
@@ -643,6 +656,7 @@ class MaiWorkApp:
             self.store, self.host, self.models, self.jev, self.profiles,
             self.mentions, self.pushes, self.get_settings, self.signals,
             identity=self.identity,
+            runtime_bus=self.runtime_bus,
         )
         # 3.55 一次性 VM（资讯实测 + 派活，docs/07 §11.1b / §11.1d）：按
         # 「设置 → 全部设置 → 运行环境 → 优先用哪家临时机器」（railway / freestyle）建**当前选中的那一家**
@@ -738,6 +752,7 @@ class MaiWorkApp:
         self.outbox = Outbox(
             self.store, self.host, self.pushes, self.mentions, self.get_settings,
             herenow=self.herenow,
+            runtime_bus=self.runtime_bus,
         )
         self.outbox.set_wake_hook(self._wake_outbox)
         # 提问回执（docs/02 §7.2）：ask:{task_id}:{attempt} 发出 → 回写 question_msg_id
@@ -2572,6 +2587,7 @@ class MaiWorkApp:
             session_gate=self.session_gate,
             planner_handoff=True,
             message_lookup=(self.host.message_by_id if self.host else None),
+            runtime_bus=self.runtime_bus,
         )
         # 派活判断兜底（quick_judge）：intake 自己建的；停机时要单独收（见 _stop_stack）
         self.quick_judge = getattr(intake, "quick_judge", None)
@@ -4090,7 +4106,11 @@ class MaiWorkApp:
 
         async def _run_manual(g: str) -> int:
             try:
-                items = int(await self.feeds.prepare_news(g) or 0)
+                try:
+                    raw_items = await self.feeds.prepare_news(g, manual=True)
+                except TypeError:
+                    raw_items = await self.feeds.prepare_news(g)
+                items = int(raw_items or 0)
             except asyncio.CancelledError:
                 self._finish_manual_news(g, run_id, "failed", "这批备料跑到一半就中断了（服务停了或重启了）", 0)
                 raise
@@ -4233,7 +4253,14 @@ class MaiWorkApp:
             return {"started": False, "reason": "模型还没配好"}
         if (gid, "idea") in self._running_jobs or (gid, "idea_manual") in self._running_jobs:
             return {"started": False, "reason": "这个群已经在想构想了，等它想完"}
-        self._spawn_long_job(gid, "idea_manual", self.feeds.make_idea)
+
+        async def _run_manual_idea(g: str) -> int | None:
+            try:
+                return await self.feeds.make_idea(g, manual=True)
+            except TypeError:
+                return await self.feeds.make_idea(g)
+
+        self._spawn_long_job(gid, "idea_manual", _run_manual_idea)
         return {"started": True, "reason": ""}
 
     def refresh_profile_now(self, gid: str) -> dict:

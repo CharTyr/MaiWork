@@ -29,7 +29,17 @@ function cfgField(key) {
   return null;
 }
 
-const PLATFORM_NAMES = { qq: "QQ", telegram: "Telegram", discord: "Discord", wechat: "微信", kook: "KOOK" };
+const PLATFORM_NAMES = { qq: "QQ", telegram: "Telegram", qqbot: "QQ 官方" };
+function validGroupChip(v) {
+  const i = String(v || "").indexOf(":");
+  if (i <= 0) return false;
+  const plat = v.slice(0, i);
+  const gid = v.slice(i + 1);
+  if (plat === "qq") return /^\d+$/.test(gid);
+  if (plat === "telegram" || plat === "tg") return /^-?\d+$/.test(gid);
+  if (plat === "qqbot") return /^[0-9A-Za-z_.:=-]{1,64}$/.test(gid);
+  return /^[a-z][a-z0-9_]*$/.test(plat) && /^-?[0-9A-Za-z_.:=-]{1,64}$/.test(gid);
+}
 // 「平台:账号」（MaiBot 标准写法）；只写数字当 qq；认不出返回 ""
 function normAccount(raw) {
   const t = String(raw || "").trim();
@@ -56,7 +66,7 @@ export function chipEditor(id, kind, vals) {
   const adder =
     kind === "times"
       ? `<input type="time" class="ca-time" step="60" aria-label="新增时间" />`
-      : `<input class="ca-plat" value="qq" list="mw-platforms" spellcheck="false" aria-label="平台" /><span class="ca-colon">:</span><input class="ca-acc" inputmode="${kind === "groups" ? "numeric" : "text"}" spellcheck="false" placeholder="${kind === "groups" ? "群号" : "账号"}" aria-label="${kind === "groups" ? "群号" : "账号"}" />`;
+      : `<input class="ca-plat" value="qq" list="mw-platforms" spellcheck="false" aria-label="平台" /><span class="ca-colon">:</span><input class="ca-acc" inputmode="text" spellcheck="false" placeholder="${kind === "groups" ? "群号 / 群 ID" : "账号"}" aria-label="${kind === "groups" ? "群号" : "账号"}" />`;
   return `
     <div class="chips" id="${id}" data-kind="${kind}">
       <div class="ci-list">${items || `<span class="ci-empty">暂无</span>`}</div>
@@ -73,13 +83,14 @@ export function chipAdd(box) {
     v = (box.querySelector(".ca-time").value || "").slice(0, 5);
     if (!/^\d{2}:\d{2}$/.test(v)) v = "";
   } else {
-    const plat = box.querySelector(".ca-plat").value.trim() || "qq";
+    const plat = box.querySelector(".ca-plat").value.trim().toLowerCase() || "qq";
     const acc = box.querySelector(".ca-acc").value.trim();
-    v = acc ? normAccount(`${plat}:${acc}`) : "";
-    if (kind === "groups" && v && !/^[a-z][a-z0-9_]*:\d+$/.test(v)) v = "";
+    const canonPlat = plat === "tg" ? "telegram" : plat;
+    v = acc ? normAccount(`${canonPlat}:${acc}`) : "";
+    if (kind === "groups" && v && !validGroupChip(v)) v = "";
   }
   if (!v) {
-    err.textContent = kind === "times" ? "请选择时间" : kind === "groups" ? "请填写群号（数字）" : "请填写账号（默认平台为 qq）";
+    err.textContent = kind === "times" ? "请选择时间" : kind === "groups" ? "请填写有效的群 ID（QQ 为数字，Telegram 支持负数群 ID，QQ 官方为 openid）" : "请填写账号（默认平台为 qq）";
     err.hidden = false;
     return;
   }

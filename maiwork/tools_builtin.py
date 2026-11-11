@@ -812,6 +812,10 @@ def register_builtin(
         notes = clean_notes(args.get("notes_for_others"))
         if notes:
             out["notes_for_others"] = notes
+        # 常驻笔记（docs/35）：可选的自我索引，验收通过才写进本岗常驻笔记（双重门槛）
+        my_notes = str(args.get("my_notes") or "").strip()
+        if my_notes:
+            out["my_notes"] = my_notes[:1200]
         return ToolResult(ok=True, output=f"已交回：{summary}", data=out)
 
     tools.register(
@@ -980,6 +984,10 @@ def register_builtin(
                             },
                             "required": ["text"],
                         },
+                    },
+                    "my_notes": {
+                        "type": "string",
+                        "description": "（可选）本岗常驻笔记：下次干类似活用得上的自我索引（哪里查过、什么结论、坑在哪），≤1200 字；不写个人隐私；上级检查通过才会写入（任务岗不生效）",
                     },
                 },
                 "required": ["summary"],

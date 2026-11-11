@@ -103,12 +103,12 @@ def _check_account_list(field_zh: str) -> Any:
 
     def check(value: Any) -> list[str]:
         if not isinstance(value, list):
-            raise ValueError(f'{field_zh}要是一个列表，每条写成「平台:账号」，如 ["qq:100000001"]')
+            raise ValueError(f'{field_zh}要是一个列表，每条写成「平台:账号」，如 ["qq:123456789"]')
         out: list[str] = []
         for raw in value:
             n = norm_account(raw)
             if not n:
-                raise ValueError(f"{field_zh}里的 {raw!r} 认不出，要写成「平台:账号」，如 qq:100000001")
+                raise ValueError(f"{field_zh}里的 {raw!r} 认不出，要写成「平台:账号」，如 qq:123456789")
             if n not in out:
                 out.append(n)
         return out
@@ -595,6 +595,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
 
     # ---- usage ----
     _F("usage.alert_daily_tokens", "每日用量提醒线", "当日用量超过该值时提醒；0 表示不提醒。", "int", min=0, max=10**9),
+    _F("usage.hard_limit_daily_tokens", "每日用量硬上限", "当日全站 token 总量达到该值时，自动暂停后台搜集与新任务，次日零点恢复；0 表示不设硬上限。", "int", min=0, max=10**9),
     _F("usage.alert_task_tokens", "单任务用量提醒线", "单个任务用量超过该值时提醒；0 表示不提醒。", "int", min=0, max=10**9),
 
     # ---- models（2026-10 改版 1a：端点/模型库走 /api/settings/endpoints*、/api/settings/model-list*；
@@ -824,6 +825,14 @@ def save_config_patch(store: Any, body: Any, *, base: Settings, plugin_dir: Any 
 
     if not writes:
         return []
+    # 审计：写文件前抓旧值（密钥字段不落真值——脱敏 + 标不可撤销）
+    before_map: dict[str, Any] = {}
+    try:
+        for key in writes:
+            section, _, fname = key.partition(".")
+            before_map[key] = _flat_base_value(base, section, fname)
+    except Exception:
+        before_map = {}
     p_dir, d_dir = _ctx_of(base, plugin_dir=plugin_dir)
     config_file.write_fields(p_dir, d_dir, writes)
     # 改密码：旧的自动生成哈希失效（有文件密码了）；已登录会话照旧
@@ -836,6 +845,21 @@ def save_config_patch(store: Any, body: Any, *, base: Settings, plugin_dir: Any 
             logger.exception("清旧的自动生成密码哈希出错")
     changed = "、".join(sorted(writes))
     logger.info("配置已写进 config.toml：%s（密钥值不落日志）", changed)
+    try:
+        from . import settings_audit
+
+        for key in sorted(writes):
+            spec = CONFIG_BY_KEY.get(key) or {}
+            secret = spec.get("type") == "secret"
+            settings_audit.record(
+                store, scope="global", target_key=f"config:{key}",
+                summary=f"修改全局设置「{full_label(key)}」",
+                before={key: settings_audit.REDACTED if secret else before_map.get(key)},
+                after={key: settings_audit.REDACTED if secret else writes[key]},
+                revertible=not secret,
+            )
+    except Exception:
+        logger.debug("config.toml 修改记账失败", exc_info=True)
     return sorted(writes)
 
 
@@ -853,9 +877,31 @@ def reset_config_field(store: Any, key: Any, *, base: Settings | None = None, pl
                          "config.toml 里那一行只作新群的迁移种子，不再从网页改")
     if spec.get("readonly"):
         raise ValueError(f"{spec['label']}不能从网页改：{spec.get('readonly_reason') or '只能改 config.toml 文件'}")
+    before_val: Any = None
+    after_val: Any = None
+    try:
+        section_s, _, fname_s = key_s.partition(".")
+        if base is not None:
+            before_val = _flat_base_value(base, section_s, fname_s)
+        after_val = _flat_base_value(_default_settings(), section_s, fname_s)
+    except Exception:
+        after_val = None
     p_dir, d_dir = _ctx_of(base, plugin_dir=plugin_dir)
     config_file.delete_fields(p_dir, d_dir, [key_s])
     logger.info("配置已从 config.toml 删掉（回代码默认值）：%s", key_s)
+    try:
+        from . import settings_audit
+
+        secret = spec.get("type") == "secret"
+        settings_audit.record(
+            store, scope="global", target_key=f"config:{key_s}",
+            summary=f"重置全局设置「{full_label(key_s)}」",
+            before={key_s: settings_audit.REDACTED if secret else before_val},
+            after={key_s: settings_audit.REDACTED if secret else after_val},
+            revertible=not secret,
+        )
+    except Exception:
+        logger.debug("config.toml 重置记账失败", exc_info=True)
     return [key_s]
 
 

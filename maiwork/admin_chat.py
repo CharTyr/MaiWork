@@ -260,7 +260,8 @@ class AdminChat:
 
     def _status(self, chat_id: int, row: dict) -> dict:
         messages = [{"role": "system", "content": self._system_prompt(row)}] + self._history(chat_id)
-        status = self._turn_budget(messages, self._admin_specs())
+        specs = self._admin_specs()
+        status = self._turn_budget(messages, specs)
         try:
             model = _s(self.models.settings().main)
         except Exception:
@@ -270,6 +271,21 @@ class AdminChat:
         status.update(model=model, ready=self._ready(self.models),
                       summary_covers=int(latest[1].get("covers") or 0) if latest else 0,
                       has_uncompacted=bool(self._rows_after(chat_id, covered_to)))
+        # 上下文分组地图（库号 51）：网页「管理员对话」状态栏画「这轮塞了什么」。
+        # 这条接口本来就只有管理员能看（管理员对话只有管理员）；估不到就 None，绝不 500。
+        ctx_map = None
+        try:
+            from . import models as _models_mod
+            build = getattr(_models_mod, "build_context_map", None)
+            if callable(build):
+                ctx_map = build(
+                    messages, specs,
+                    prompt_tokens=int(status.get("estimated_input_tokens") or 0),
+                    context_window=int(status.get("context_window") or 0),
+                )
+        except Exception:
+            ctx_map = None
+        status["context_map"] = ctx_map if isinstance(ctx_map, dict) else {}
         return status
 
     def available_skills(self, group_id: str = "") -> list[dict]:

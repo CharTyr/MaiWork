@@ -5,6 +5,7 @@ import { api, gname } from "./api.js";
 import { closeSheet, openSheet } from "./sheet.js";
 import { renderSide } from "./render.js";
 import { chatPoll, enterChat, loadChat, loadChats, paintChat } from "./chat.js";
+import { ctxMapHTML } from "./ctxmap.js";
 
 export const SLASH_COMMANDS = [
   { key: "/compact", cmd: "compact", title: "/compact", hint: "[侧重说明]", description: "将历史消息整理为摘要，可附加侧重说明" },
@@ -128,7 +129,9 @@ function skillPillHTML() {
 function ctxPopoverHTML(C) {
   if (!state.chatCtxOpen || !C) return "";
   const r = contextRingView(C.status);
-  return `<div class="chat-ctx-pop" role="dialog" aria-label="上下文与模型状态">
+  const cm = C.status && C.status.context_map;
+  const hasMap = cm && (cm.used_tokens || (Array.isArray(cm.parts) && cm.parts.length));
+  return `<div class="chat-ctx-pop${hasMap ? " has-map" : ""}" role="dialog" aria-label="上下文与模型状态">
     <div class="chat-ctx-head"><b>${esc(r.modelLabel)}</b><span class="ntag ${r.ready ? "ok" : "warn"}">${r.ready ? "就绪" : "未就绪"}</span></div>
     <div class="chat-ctx-grid">
       <div><span>当前估算</span><b>${tokens(r.used)}</b></div>
@@ -136,7 +139,7 @@ function ctxPopoverHTML(C) {
       <div><span>自动整理线</span><b>${r.trigger ? tokens(r.trigger) : "—"}</b></div>
       <div><span>已摘要消息</span><b>${r.covers} 条</b></div>
     </div>
-    <div class="chat-ctx-bar"><i style="width:${r.pct}%"></i></div>
+    ${hasMap ? ctxMapHTML(cm, { id: "chat-ctx", compact: true, actPrefix: "ctxmap" }) || "" : `<div class="chat-ctx-bar"><i style="width:${r.pct}%"></i></div>`}
     <div class="chat-ctx-foot">
       <span class="fine">已占用 ${r.pct}% 窗口</span>
       <button type="button" class="btn small" data-act="chat-compact" ${C.running || !r.canCompact ? "disabled" : ""}>压缩对话</button>

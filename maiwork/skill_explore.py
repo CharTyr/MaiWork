@@ -586,6 +586,16 @@ async def run(
     """
     out: dict[str, Any] = {"ran": False, "skill_id": None, "reason": ""}
     gid = str(gid)
+    try:
+        from . import usage_alerts
+
+        get_s = getattr(agents, "_get_settings", None)
+        hard = usage_alerts.hard_limit_tripped(store, get_s) if get_s is not None else None
+    except Exception:
+        hard = None
+    if hard is not None:
+        out["reason"] = "今天用量到了每日硬上限，后台探索暂停"
+        return out
     if store is None or models is None or workers is None or env is None or agents is None:
         out["reason"] = "缺依赖"
         return out

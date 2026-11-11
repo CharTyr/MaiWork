@@ -3,7 +3,9 @@
 //   toolSummary(tool, input, output)   工具调用的一行摘要（未转义原文，渲染时由调用方过 esc）
 //   mergeSteps(prevData, nextData)     ?after= 增量回来的步骤并进旧数据（按 uid 去重）
 //   stepsSectionHTML(d, filterState)   轮次总览 + 快筛条 + 步骤列表的 HTML
-import { dur, esc, hhmm, msText } from "./util.js";
+import { dur, esc, hhmm, msText, tokens } from "./util.js";
+import { ctxMapHTML } from "./ctxmap.js";
+import { jevBarsHTML } from "./jev_bars.js";
 
 const STEP_CAP = 500; // 过程最多展示的步数（和 trace.py 上限一致）
 const SUM_CAP = 72; // 工具一行摘要的长度上限
@@ -173,9 +175,13 @@ function stepHTML(s, i, open) {
   }
   if (s.type === "think") {
     const bad = stFailed(s);
-    const sub = [who, ms].filter(Boolean).join(" · ");
+    const ft = s.first_token_ms && s.first_token_ms > 0 ? `首字 ${esc(msText(s.first_token_ms))}` : "";
+    const sub = [who, ft, ms].filter(Boolean).join(" · ");
+    const hasCtx = s.context_map && (s.context_map.used_tokens || (Array.isArray(s.context_map.parts) && s.context_map.parts.length));
     return `<li class="st st-think${bad ? " bad" : ""}">
       <div class="st-row">${t}<span class="st-badge think">思考</span><span class="st-sub">${sub}${bad ? `${sub ? " · " : ""}<span class="bad-t">失败</span>` : ""}</span></div>
+      ${s.jev ? jevBarsHTML(s.jev, { compact: true }) || "" : ""}
+      ${hasCtx ? `<details class="st-io st-ctx" data-i="c:${esc(key)}"${open && open["c:" + key] ? " open" : ""}><summary>上下文构成 · ${tokens(s.context_map.used_tokens || 0)} token</summary>${ctxMapHTML(s.context_map, { id: "st-" + key, callId: s.model_call_id, compact: true, actPrefix: "board-ctx" })}</details>` : ""}
       ${s.reasoning ? `<details class="st-io st-reason" data-i="r:${esc(key)}"${open && (open["r:" + key] || open["r" + i]) ? " open" : ""}><summary>思考过程</summary><pre class="st-text st-why">${esc(s.reasoning)}</pre></details>` : s.reasoning_redacted ? `<div class="st-sub st-why-note">思考过程已由模型加密，无法查看</div>` : ""}
       ${s.text ? `<pre class="st-text">${esc(s.text)}</pre>` : ""}
       ${s.error ? `<pre class="st-text bad-t">${esc(s.error)}</pre>` : ""}
@@ -202,7 +208,11 @@ export function stepsSectionHTML(d, filterState) {
     d.truncated || total > STEP_CAP || all.length >= STEP_CAP
       ? `<p class="h-meta">共 ${total} 步，中间已省略部分步骤，仅保留首尾关键记录。</p>`
       : "";
-  return `${roundsHTML(d, fs)}
+  const hasTopCtx = d && d.context_map && (d.context_map.used_tokens || (Array.isArray(d.context_map.parts) && d.context_map.parts.length));
+  const topCtx = hasTopCtx
+    ? `<details class="st-io bi-ctx" data-i="c:top"${fs.open && fs.open["c:top"] ? " open" : ""}><summary>本轮上下文窗口 · ${tokens(d.context_map.used_tokens || 0)} / ${tokens(d.context_map.limit_tokens || 128000)} token</summary>${ctxMapHTML(d.context_map, { id: "bi-main", actPrefix: "board-ctx" })}</details>`
+    : "";
+  return `${topCtx}${roundsHTML(d, fs)}
   <div class="st-head"><h2 class="h-sub">过程 <small>${steps.length} 步 · 工具 ${all.filter((x) => x.type === "tool").length} · 思考 ${all.filter((x) => x.type === "think").length}</small></h2>${steps.length > 8 ? `<button class="btn sm" data-act="board-jump-end" type="button">跳到最新</button>` : ""}</div>
   <div class="st-filters" role="group" aria-label="筛选过程步骤">${chips}</div>
   ${steps.length ? `<ol class="steps">${steps.map(({ s, i }) => stepHTML(s, i, fs.open)).join("")}</ol>` : `<p class="h-meta">当前筛选下没有步骤。</p>`}

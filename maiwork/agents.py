@@ -273,6 +273,8 @@ class Agents:
                 conn.execute("ALTER TABLE agent_handoffs ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
             if "run_ref" not in cols:  # 没跑过第 50 步迁移、表又早建好的库
                 conn.execute("ALTER TABLE agent_handoffs ADD COLUMN run_ref TEXT NOT NULL DEFAULT ''")
+            if "my_notes" not in cols:  # 常驻笔记（本版新增）；老库补列
+                conn.execute("ALTER TABLE agent_handoffs ADD COLUMN my_notes TEXT NOT NULL DEFAULT ''")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_agent_handoffs_run_ref"
                 " ON agent_handoffs(run_ref)")
@@ -365,6 +367,17 @@ class Agents:
             entry.update(clean)
             raw[kind_s] = entry
             self._store.kv_set(conn, _KV_PROFILES, raw)
+        try:
+            from . import settings_audit
+
+            settings_audit.record(
+                self._store, scope="global", target_key=f"agent_profile:{kind_s}",
+                summary=f"修改专岗设置（{kind_s}）",
+                before={k: current.get(k) for k in clean},
+                after=dict(clean),
+            )
+        except Exception:
+            logger.debug("专岗设置修改记账失败", exc_info=True)
         return self.profile(kind_s)
 
     def _merged_profiles(self) -> dict[str, dict[str, Any]]:
@@ -1326,6 +1339,17 @@ class Agents:
                 " updated=excluded.updated, updated_by=excluded.updated_by",
                 (gid_s, body_s, ts, by_s),
             )
+        try:
+            from . import settings_audit
+
+            settings_audit.record(
+                self._store, scope=f"group:{gid_s}", target_key="group_rules",
+                summary="修改本群规矩",
+                before={"body": str(prev["body"] or "") if prev is not None else ""},
+                after={"body": body_s},
+            )
+        except Exception:
+            logger.debug("本群规矩修改记账失败", exc_info=True)
         return self.group_rules_get(gid_s)
 
     def group_rules_versions(self, gid: str) -> list[dict[str, Any]]:
@@ -1525,6 +1549,231 @@ class Agents:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
+    # 常驻笔记（每群每岗一份的自我索引，docs/35）：
+    # 专岗交回成果时顺带写下「本岗现在知道什么」，下一轮换岗时当参考索引注入。
+    # 是数据不是指令；和本群规矩冲突时以规矩为准。≤1200 字、留最近 10 版、可锁定。
+    # ------------------------------------------------------------------
+
+    def _index_note_kind_ok(self, kind: Any) -> str:
+        """常驻笔记认的岗位：内建调研岗（news/idea/goal）+ 已建自定义专岗；main/task 不留。
+        其余 ValueError（API 映 400/404）。"""
+        kind_s = str(kind or "").strip()
+        if kind_s in ("main", "task"):
+            raise ValueError("主模型和任务岗不支持常驻笔记")
+        if kind_s in PROFILES_KINDS:
+            return kind_s
+        if self.is_custom_kind(kind_s):
+            return kind_s
+        raise ValueError(f"没有这个岗位：{kind_s or '(空)'}")
+
+    def get_index_note(self, gid: str, kind: str) -> dict[str, Any]:
+        """这一岗的常驻笔记：{"group_id","kind","content","locked","version",
+        "updated_ts","updated_by","max_chars"}；没写过 → content ""、version 0。"""
+        gid_s = self._verify_served(gid)
+        kind_s = self._index_note_kind_ok(kind)
+        self._ensure_schema()
+        row = self._store.read().execute(
+            "SELECT * FROM agent_index_notes WHERE group_id=? AND kind=?",
+            (gid_s, kind_s),
+        ).fetchone()
+        out = {
+            "group_id": gid_s,
+            "kind": kind_s,
+            "content": "",
+            "locked": False,
+            "version": 0,
+            "updated_ts": 0.0,
+            "updated_by": "",
+            "max_chars": INDEX_NOTE_MAX_CHARS,
+        }
+        if row is not None:
+            out.update({
+                "content": str(row["content"] or ""),
+                "locked": bool(int(row["locked"] or 0)),
+                "version": int(row["version"] or 0),
+                "updated_ts": float(row["updated_ts"] or 0.0),
+                "updated_by": str(row["updated_by"] or ""),
+            })
+        return out
+
+    def list_index_notes(self, gid: str) -> list[dict[str, Any]]:
+        """本群全部常驻笔记（内建调研岗 + 自定义专岗，按 kind 排序；只列写过的）。"""
+        gid_s = self._verify_served(gid)
+        self._ensure_schema()
+        kinds = set(self._index_note_kinds())
+        rows = self._store.read().execute(
+            "SELECT * FROM agent_index_notes WHERE group_id=? ORDER BY kind",
+            (gid_s,),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            k = str(r["kind"] or "")
+            if k not in kinds:
+                continue
+            out.append({
+                "group_id": gid_s,
+                "kind": k,
+                "content": str(r["content"] or ""),
+                "locked": bool(int(r["locked"] or 0)),
+                "version": int(r["version"] or 0),
+                "updated_ts": float(r["updated_ts"] or 0.0),
+                "updated_by": str(r["updated_by"] or ""),
+                "max_chars": INDEX_NOTE_MAX_CHARS,
+            })
+        return out
+
+    def _index_note_kinds(self) -> list[str]:
+        """能留常驻笔记的岗位清单：内建调研岗（不含 main/task）+ 自定义专岗。"""
+        return [k for k in self._all_kinds() if k not in ("main", "task")]
+
+    def set_index_note(
+        self,
+        gid: str,
+        kind: str,
+        *,
+        content: Any = None,
+        locked: Any = None,
+        source: str = "admin_web",
+        handoff_id: str = "",
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """写常驻笔记（content / locked 分开传；None = 不改这一项）。
+
+        - content 超过 1200 字：管理员来源 ValueError；专岗自写（source="specialist"）截断；
+        - 隐私闸（隐私.scrub）不通过：管理员来源 ValueError，专岗自写静默跳过；
+        - 手动来源（admin_web/group_admin/admin_chat/revert）同时记进设置审计。
+        """
+        gid_s = self._verify_served(gid)
+        kind_s = self._index_note_kind_ok(kind)
+        self._ensure_schema()
+        src = str(source or "admin_web")[:32]
+        cur = self.get_index_note(gid_s, kind_s)
+        updates: dict[str, Any] = {}
+        if content is not None:
+            text = str(content)
+            if len(text) > INDEX_NOTE_MAX_CHARS:
+                if src == "specialist":
+                    text = text[:INDEX_NOTE_MAX_CHARS]
+                else:
+                    raise ValueError(f"常驻笔记最多 {INDEX_NOTE_MAX_CHARS} 字")
+            try:
+                from . import privacy
+
+                if privacy.scrub(gid_s, text, self._store) is None:
+                    if src == "specialist":
+                        logger.info("常驻笔记含关注成员信息，跳过（群 %s 岗 %s）", gid_s, kind_s)
+                        return self.get_index_note(gid_s, kind_s)
+                    raise ValueError("常驻笔记含关注成员信息，未写入")
+            except ValueError:
+                raise
+            except Exception:
+                logger.debug("常驻笔记隐私闸出错，按放行处理（群 %s 岗 %s）", gid_s, kind_s, exc_info=True)
+            if text != cur["content"]:
+                updates["content"] = text
+        if locked is not None:
+            lock_v = bool(locked)
+            if lock_v != cur["locked"]:
+                updates["locked"] = lock_v
+        if not updates:
+            return self.get_index_note(gid_s, kind_s)
+        ts = float(clock.now() if now is None else now)
+        with self._store.tx() as conn:
+            if "content" in updates:
+                new_version = int(cur["version"] or 0) + 1
+                conn.execute(
+                    "INSERT INTO agent_index_note_versions"
+                    " (group_id, kind, version, content, source, handoff_id, created_ts)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (gid_s, kind_s, new_version, str(updates["content"]), src,
+                     str(handoff_id or "")[:64], ts),
+                )
+                # 版本表只留最近 10 版
+                conn.execute(
+                    "DELETE FROM agent_index_note_versions WHERE group_id=? AND kind=? AND id IN ("
+                    "  SELECT id FROM agent_index_note_versions WHERE group_id=? AND kind=?"
+                    "  ORDER BY version DESC, id DESC LIMIT -1 OFFSET ?"
+                    ")",
+                    (gid_s, kind_s, gid_s, kind_s, INDEX_NOTE_VERSIONS_MAX),
+                )
+            conn.execute(
+                "INSERT INTO agent_index_notes (group_id, kind, content, locked, version, updated_ts, updated_by)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(group_id, kind) DO UPDATE SET"
+                " content=excluded.content, locked=excluded.locked, version=excluded.version,"
+                " updated_ts=excluded.updated_ts, updated_by=excluded.updated_by",
+                (
+                    gid_s, kind_s,
+                    str(updates.get("content", cur["content"])),
+                    1 if bool(updates.get("locked", cur["locked"])) else 0,
+                    (int(cur["version"] or 0) + 1) if "content" in updates else int(cur["version"] or 0),
+                    ts, src,
+                ),
+            )
+        try:
+            from . import settings_audit
+
+            actor, _, _ = settings_audit.current_actor()
+            if src != "specialist" or actor == "revert":
+                settings_audit.record(
+                    self._store, scope=f"group:{gid_s}",
+                    target_key=f"agent_index_note:{kind_s}",
+                    summary=f"修改常驻笔记（{kind_s} 岗）",
+                    before={"content": cur["content"], "locked": cur["locked"]},
+                    after={
+                        "content": str(updates.get("content", cur["content"])),
+                        "locked": bool(updates.get("locked", cur["locked"])),
+                    },
+                )
+        except Exception:
+            logger.debug("常驻笔记记账失败", exc_info=True)
+        return self.get_index_note(gid_s, kind_s)
+
+    def index_note_versions(self, gid: str, kind: str) -> list[dict[str, Any]]:
+        """这一岗常驻笔记的历史版本：最新在前，最多 10 条。"""
+        gid_s = self._verify_served(gid)
+        kind_s = self._index_note_kind_ok(kind)
+        self._ensure_schema()
+        rows = self._store.read().execute(
+            "SELECT * FROM agent_index_note_versions WHERE group_id=? AND kind=?"
+            " ORDER BY version DESC, id DESC LIMIT ?",
+            (gid_s, kind_s, INDEX_NOTE_VERSIONS_MAX),
+        ).fetchall()
+        return [
+            {
+                "id": int(r["id"]),
+                "group_id": gid_s,
+                "kind": kind_s,
+                "version": int(r["version"] or 0),
+                "content": str(r["content"] or ""),
+                "source": str(r["source"] or ""),
+                "handoff_id": str(r["handoff_id"] or ""),
+                "created_ts": float(r["created_ts"] or 0.0),
+            }
+            for r in rows
+        ]
+
+    def rollback_index_note(
+        self, gid: str, kind: str, version: Any, *, source: str = "admin_web"
+    ) -> dict[str, Any]:
+        """把常驻笔记回滚到某一版（版本号不存在 → KeyError，API 映 404）。"""
+        gid_s = self._verify_served(gid)
+        kind_s = self._index_note_kind_ok(kind)
+        self._ensure_schema()
+        try:
+            v = int(version)
+        except (TypeError, ValueError):
+            raise KeyError("没有这个版本") from None
+        row = self._store.read().execute(
+            "SELECT content FROM agent_index_note_versions WHERE group_id=? AND kind=? AND version=?",
+            (gid_s, kind_s, v),
+        ).fetchone()
+        if row is None:
+            raise KeyError("没有这个版本")
+        return self.set_index_note(
+            gid_s, kind_s, content=str(row["content"] or ""), source=source,
+        )
+
+    # ------------------------------------------------------------------
     # 交接单（handoff）
     # ------------------------------------------------------------------
 
@@ -1602,9 +1851,13 @@ class Agents:
         error: str = "",
         used_tools: Iterable[str] | None = None,
         notes: Any = None,
+        my_notes: str = "",
     ) -> None:
         """notes = 专岗交回的「留给别的岗的便条」（0~2 条），先暂存在交接单上；
-        只有 review(accepted=True) 时才搬上便条板（docs/34）。task 岗不存。"""
+        只有 review(accepted=True) 时才搬上便条板（docs/34）。task 岗不存。
+
+        my_notes = 专岗自写的常驻笔记候选（≤1200 字），先暂存在交接单上；
+        只有 review(accepted=True) 且没锁定时才写进常驻笔记（双重门槛）。main/task 不存。"""
         summary_s = str(summary or "")[:_SUMMARY_MAX]
         evidence_list = _clean_str_list(evidence, _REFS_MAX * 4, _REF_MAX)  # 证据比 refs 多几倍
         error_s = str(error or "")[:_ERROR_MAX]
@@ -1625,6 +1878,9 @@ class Agents:
         pending = clean_notes(notes)
         if pending and str(cur["kind"]) not in _NO_NOTES_KINDS:
             update["notes"] = json.dumps(pending, ensure_ascii=False)
+        my_notes_s = str(my_notes or "").strip()[:INDEX_NOTE_MAX_CHARS]
+        if my_notes_s and str(cur["kind"]) not in _NO_NOTES_KINDS:
+            update["my_notes"] = my_notes_s
         self._apply_transition(cur, to_state, update=update, gid=gid_s, hid=hid)
 
     def review(
@@ -1682,6 +1938,20 @@ class Agents:
                 Agents._remember_tx(conn, gid_s, kind, summary_s, refs_list, source_id=hid, now=clock.now())
             if board:
                 Agents._post_notes_tx(conn, gid_s, board, self._note_targets(), hid, clock.now())
+        # 常驻笔记双重门槛：验收通过 + 本岗有自写候选 + 没锁定，才写进常驻笔记
+        # （task/main 到不了这里——它们不留笔记）。写失败不挡验收（已提交）。
+        if accepted and kind not in _NO_NOTES_KINDS:
+            try:
+                cand = str(cur["my_notes"] or "").strip() if "my_notes" in cur.keys() else ""
+                if cand:
+                    note = self.get_index_note(gid_s, kind)
+                    if not note.get("locked"):
+                        self.set_index_note(
+                            gid_s, kind, content=cand,
+                            source="specialist", handoff_id=hid,
+                        )
+            except Exception:
+                logger.debug("常驻笔记写入失败（群 %s 岗 %s 单 %s）", gid_s, kind, hid, exc_info=True)
 
     def fail(self, gid: str, id: str, error: str, *, state: str = "failed", used_tools: Iterable[str] | None = None) -> None:
         target = "cancelled" if str(state) == "cancelled" else "failed"
@@ -1834,7 +2104,8 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     " created REAL NOT NULL DEFAULT 0,"
     " updated REAL NOT NULL DEFAULT 0,"
     " notes TEXT NOT NULL DEFAULT '',"
-    " run_ref TEXT NOT NULL DEFAULT ''"
+    " run_ref TEXT NOT NULL DEFAULT '',"
+    " my_notes TEXT NOT NULL DEFAULT ''"
     ")",
     "CREATE INDEX IF NOT EXISTS idx_agent_handoffs_group"
     " ON agent_handoffs(group_id, created)",
@@ -1842,6 +2113,29 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     " ON agent_handoffs(group_id, kind, created)",
     "CREATE INDEX IF NOT EXISTS idx_agent_handoffs_run_ref"
     " ON agent_handoffs(run_ref)",
+    # 常驻笔记（每群每岗一份的自我索引）：主表 + 版本表（留最近 10 版）
+    "CREATE TABLE IF NOT EXISTS agent_index_notes ("
+    " group_id TEXT NOT NULL,"
+    " kind TEXT NOT NULL,"
+    " content TEXT NOT NULL DEFAULT '',"
+    " locked INTEGER NOT NULL DEFAULT 0,"
+    " version INTEGER NOT NULL DEFAULT 0,"
+    " updated_ts REAL NOT NULL DEFAULT 0,"
+    " updated_by TEXT NOT NULL DEFAULT '',"
+    " PRIMARY KEY (group_id, kind)"
+    ")",
+    "CREATE TABLE IF NOT EXISTS agent_index_note_versions ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " group_id TEXT NOT NULL,"
+    " kind TEXT NOT NULL,"
+    " version INTEGER NOT NULL DEFAULT 0,"
+    " content TEXT NOT NULL DEFAULT '',"
+    " source TEXT NOT NULL DEFAULT '',"
+    " handoff_id TEXT NOT NULL DEFAULT '',"
+    " created_ts REAL NOT NULL DEFAULT 0"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_agent_index_note_versions"
+    " ON agent_index_note_versions(group_id, kind, version)",
     # 便条板（docs/34）：DDL 与 store 第 48 步同一份
     *_AGENT_NOTES_DDL,
 )
@@ -2137,6 +2431,8 @@ def _handoff_row(r: sqlite3.Row, *, for_list: bool) -> dict[str, Any]:
         "updated": float(r["updated"] or 0.0),
         # 库号 50 列；半截库（表早于第 50 步、迁移还没跑）没有就当空。
         "run_ref": str(r["run_ref"] or "") if "run_ref" in r.keys() else "",
+        # 常驻笔记候选（本版列；老库没有就当空）
+        "my_notes": str(r["my_notes"] or "") if "my_notes" in r.keys() else "",
     }
     # data 是结构化成果（可能很大）：列表给截断版（API/详情可再读），原始完整版不落字段。
     data_raw = str(r["data"] or "")
@@ -2159,6 +2455,10 @@ NOTES_READ_MAX = 8
 NOTE_MAX_CHARS = 80
 NOTES_PER_HANDOFF = 2
 _NO_NOTES_KINDS = frozenset(("task", "main"))
+
+# 常驻笔记（每群每岗一份的自我索引）：≤1200 字、留最近 10 版
+INDEX_NOTE_MAX_CHARS = 1200
+INDEX_NOTE_VERSIONS_MAX = 10
 
 
 def clean_notes(raw: Any) -> list[dict[str, str]]:

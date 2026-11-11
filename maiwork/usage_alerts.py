@@ -66,6 +66,48 @@ def _served_groups(settings: Any) -> list[str]:
         return []
 
 
+def hard_key(day: str) -> str:
+    """硬上限提醒的防重复键：全站一天一次。"""
+    return f"{ALERTED_PREFIX}hard.{day}"
+
+
+def daily_hard_limit_status(store: Any, settings: Any, now: float | None = None) -> dict:
+    """今天（北京日）全站 token 是否撞了每日硬上限。
+
+    返回 {"tripped", "limit", "used", "day"}；limit<=0 = 不设上限（tripped 恒 False、不查库）。
+    读库失败按没撞（不因统计出错停掉后台）。
+    """
+    ts = clock.now() if now is None else float(now)
+    day = clock.day_key(ts)
+    try:
+        limit = int(getattr(getattr(settings, "usage", None), "hard_limit_daily_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0 or store is None:
+        return {"tripped": False, "limit": max(0, limit), "used": 0, "day": day}
+    placeholders = ",".join("?" for _ in _ROLES)
+    try:
+        row = store.read().execute(
+            "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS n"
+            f" FROM usage WHERE day = ? AND role IN ({placeholders})",
+            (day, *_ROLES),
+        ).fetchone()
+        used = int(row["n"] or 0) if row is not None else 0
+    except Exception:
+        used = 0
+    return {"tripped": used >= limit, "limit": limit, "used": used, "day": day}
+
+
+def hard_limit_tripped(store: Any, get_settings: Any) -> dict | None:
+    """后台自动活入口用：撞了返回状态 dict，没撞 / 出错返回 None。"""
+    try:
+        settings = get_settings() if callable(get_settings) else get_settings
+        st = daily_hard_limit_status(store, settings)
+    except Exception:
+        return None
+    return st if st.get("tripped") else None
+
+
 def _remember(store: Any, key: str, alert: dict, now: float) -> None:
     """把提醒写进 kv（键防重复，值给网页读）。"""
     record = dict(alert)
@@ -137,10 +179,21 @@ def check(store: Any, get_settings: Callable[[], Any] | Any, now: float) -> list
         return []
     daily_limit = int(getattr(usage, "alert_daily_tokens", 0) or 0)
     task_limit = int(getattr(usage, "alert_task_tokens", 0) or 0)
-    if daily_limit <= 0 and task_limit <= 0:
-        return []
-    served = _served_groups(settings)
     out: list[dict] = []
+    hard = daily_hard_limit_status(store, settings, now)
+    if hard["tripped"] and store.kv_get(hard_key(hard["day"])) is None:
+        alert = {
+            "group_id": "", "kind": "hard_limit",
+            "text": (
+                f"今天 MaiWork 已用 {_wan(hard['used'])} 万 tokens，达到每日硬上限 {_wan(hard['limit'])} 万，"
+                "后台自动搜集已暂停，明早零点自动恢复。"
+            ),
+        }
+        _remember(store, hard_key(hard["day"]), alert, now)
+        out.append(alert)
+    if daily_limit <= 0 and task_limit <= 0:
+        return out
+    served = _served_groups(settings)
     if daily_limit > 0:
         out.extend(_daily_alerts(store, served, daily_limit, now))
     if task_limit > 0:

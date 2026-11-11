@@ -24,6 +24,7 @@ from typing import Any
 
 from . import config as _cfg
 from . import config_file as _cf
+from .models import is_template_placeholder
 
 logger = logging.getLogger("maiwork.settings_ops")
 
@@ -60,7 +61,9 @@ def endpoint_public(svc: Any, ep: Any) -> dict[str, Any]:
     """一个端点的对外视图：api_key 只给 key_set 布尔，请求头只给名字。"""
     d: dict[str, Any] = {
         "id": str(ep.id), "name": str(ep.name), "protocol": str(ep.protocol),
-        "base_url": str(ep.base_url), "key_set": bool(str(getattr(ep, "api_key", "") or "")),
+        "base_url": str(ep.base_url),
+        "key_set": bool(str(getattr(ep, "api_key", "") or "") and not is_template_placeholder(getattr(ep, "api_key", ""))),
+        "placeholder": bool(is_template_placeholder(getattr(ep, "api_key", ""))),
         "retries": int(ep.retries), "retry_delay_s": int(ep.retry_delay_s),
         "max_concurrency": int(ep.max_concurrency), "max_rpm": int(ep.max_rpm),
         # 网页「按行加头」用：只回名字，绝不回值（值是凭据）
@@ -252,6 +255,18 @@ async def save_endpoint(svc: Any, path_id: str, body: dict[str, Any]) -> dict[st
     new_text = _write_section(svc, "endpoints", entries)
     await apply_config_after_file_write(svc, new_text)
     logger.info("端点「%s」已保存（key_set=%s）", cand["id"], bool(cand.get("api_key")))
+    try:
+        from . import settings_audit
+
+        settings_audit.record(
+            getattr(svc, "store", None), scope="global",
+            target_key=f"endpoint:{cand['id']}",
+            summary=("新建" if old is None else "修改") + f"端点「{cand['id']}」",
+            before=dict(old) if old else {}, after=dict(cand),
+            revertible=False,  # 端点含密钥字段，不支持撤销
+        )
+    except Exception:
+        logger.debug("端点保存记账失败", exc_info=True)
     return cand
 
 
@@ -270,6 +285,7 @@ async def delete_endpoint(svc: Any, path_id: str) -> None:
     """删一个端点（DELETE /api/settings/endpoints/{id} 的落点）。"""
     path_id = str(path_id or "").strip()
     check_endpoint_delete(svc, path_id)
+    old = find_endpoint(svc.get_settings(), path_id)
     entries = [e for e in endpoint_entries(svc.get_settings()) if e["id"] != path_id]
     new_text = _write_section(svc, "endpoints", entries)
     await apply_config_after_file_write(svc, new_text)
@@ -281,6 +297,18 @@ async def delete_endpoint(svc: Any, path_id: str) -> None:
     except Exception:
         pass
     logger.info("端点「%s」已删除", path_id)
+    try:
+        from . import settings_audit
+
+        settings_audit.record(
+            getattr(svc, "store", None), scope="global",
+            target_key=f"endpoint:{path_id}",
+            summary=f"删除端点「{path_id}」",
+            before=dict(old) if old else {}, after={},
+            revertible=False,  # 端点含密钥字段，不支持撤销
+        )
+    except Exception:
+        logger.debug("端点删除记账失败", exc_info=True)
 
 
 # ----------------------------------------------------------------------
@@ -357,6 +385,18 @@ async def save_model(svc: Any, path_id: str, body: dict[str, Any]) -> dict[str, 
     new_text = _write_section(svc, "model_list", entries)
     await apply_config_after_file_write(svc, new_text)
     logger.info("模型条目「%s」已保存（服务端模型名 %s）", cand["id"], cand.get("model", ""))
+    try:
+        from . import settings_audit
+
+        settings_audit.record(
+            getattr(svc, "store", None), scope="global",
+            target_key=f"model:{cand['id']}",
+            summary=("新建" if old is None else "修改") + f"模型条目「{cand['id']}」",
+            before=dict(old) if old else {}, after=dict(cand),
+            revertible=False,  # 模型链回写要过验证管线，不走一键撤销
+        )
+    except Exception:
+        logger.debug("模型条目保存记账失败", exc_info=True)
     return cand
 
 
@@ -385,10 +425,23 @@ async def delete_model(svc: Any, path_id: str) -> None:
     path_id = str(path_id or "").strip()
     check_model_delete(svc, path_id)
     settings = svc.get_settings()
+    old = next((m for m in (getattr(settings, "model_list", ()) or ()) if str(getattr(m, "id", "")) == path_id), None)
     entries = [model_public(m) for m in (getattr(settings, "model_list", ()) or ()) if str(m.id) != path_id]
     new_text = _write_section(svc, "model_list", entries)
     await apply_config_after_file_write(svc, new_text)
     logger.info("模型条目「%s」已删除", path_id)
+    try:
+        from . import settings_audit
+
+        settings_audit.record(
+            getattr(svc, "store", None), scope="global",
+            target_key=f"model:{path_id}",
+            summary=f"删除模型条目「{path_id}」",
+            before=model_public(old) if old is not None else {}, after={},
+            revertible=False,
+        )
+    except Exception:
+        logger.debug("模型条目删除记账失败", exc_info=True)
 
 
 # ----------------------------------------------------------------------
@@ -493,11 +546,18 @@ def _agents_mod(svc: Any) -> Any:
     return mod
 
 
-async def agent_create_custom(svc: Any, title: str) -> dict[str, Any]:
+async def agent_create_custom(svc: Any, title: str, instructions: Any = "") -> dict[str, Any]:
     """新建自定义专岗（POST /api/agents 的落点）：建 kv + 落身份文档目录。返回 profile。"""
     mod = _agents_mod(svc)
+    if not isinstance(instructions, str):
+        raise OpError(400, "instructions 要是字符串")
+    if len(instructions) > 3000:
+        raise OpError(400, "instructions 过长（上限 3000 字）")
+    clean_inst = instructions.strip()
     try:
         profile = mod.create_custom(str(title or ""))
+        if clean_inst:
+            profile = mod.update_profile(str(profile["kind"]), {"instructions": clean_inst})
     except ValueError as e:
         raise OpError(400, str(e)) from None
     # 建 kv 成功后落 identity 文档（SOUL 从 MaiBot 同步或空 + AGENTS=custom 预设
@@ -508,9 +568,20 @@ async def agent_create_custom(svc: Any, title: str) -> dict[str, Any]:
         logger.warning("identity 没就位：自定义专岗 %s 只建了 kv，文档目录跳过", profile.get("kind"))
     else:
         try:
-            await ident.agent_init_custom(str(profile["kind"]), str(profile["title"]))
+            await ident.agent_init_custom(str(profile["kind"]), str(profile["title"]), when=clean_inst)
         except Exception:
             logger.exception("自定义专岗 %s 建文档目录出错（kv 那份在）", profile.get("kind"))
+    try:
+        from . import settings_audit
+
+        settings_audit.record(
+            getattr(svc, "store", None), scope="global",
+            target_key=f"agent_custom:{profile.get('kind')}",
+            summary=f"新建自定义专岗「{profile.get('title')}」",
+            before={}, after=dict(profile),
+        )
+    except Exception:
+        logger.debug("自定义专岗新建记账失败", exc_info=True)
     return profile
 
 
@@ -533,6 +604,11 @@ def check_agent_delete(svc: Any, kind: str) -> dict[str, Any]:
 def agent_delete_custom(svc: Any, kind: str) -> str:
     """删自定义专岗（DELETE /api/agents/{kind} 的落点）：清 kv，文档目录挪到 .trash。返回被删的 kind。"""
     mod = _agents_mod(svc)
+    before_profile: dict[str, Any] = {}
+    try:
+        before_profile = dict(mod.profile(str(kind or "")))
+    except Exception:
+        before_profile = {}
     try:
         deleted = mod.delete_custom(str(kind or ""))
     except ValueError as e:
@@ -551,4 +627,16 @@ def agent_delete_custom(svc: Any, kind: str) -> str:
             ident.agent_trash_custom(deleted)
         except Exception:
             logger.exception("删专岗 %s 挪文档到 .trash 出错（kv 已删）", deleted)
+    try:
+        from . import settings_audit
+
+        settings_audit.record(
+            getattr(svc, "store", None), scope="global",
+            target_key=f"agent_custom:{deleted}",
+            summary=f"删除自定义专岗「{deleted}」",
+            before=before_profile, after={},
+            revertible=False,  # 专岗编号随机生成，无法忠实还原，不走一键撤销
+        )
+    except Exception:
+        logger.debug("自定义专岗删除记账失败", exc_info=True)
     return deleted

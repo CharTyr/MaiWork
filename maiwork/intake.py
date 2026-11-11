@@ -253,6 +253,22 @@ _LANDED_MAX = 500
 _FEEDBACK_INFLIGHT_MAX = 4          # 卡片反馈后台写库同时最多几条
 # 网页构想详情「复制要求」带的编号（「（构想 #12）」）：认出来就按这条构想建请求，不问 Jev。
 # 2026-10：还认「（构想 #12，要做：1、3）」这种挑了项目的写法（尾部不跨右括号 / 换行）。
+# @ 回答识别（规则 2）：去掉 @ 之后只剩寒暄 / 戳一下，不当成对等待任务的回答
+_GREETING_ONLY = frozenset({"早", "早安", "午安", "晚安", "你好", "嗨", "在吗", "在不在", "哈哈", "哈哈哈"})
+_AT_STRIP = re.compile(r"^(?:\s|\[CQ:at,[^\]]*\]|@\S+)+|(?:\s|\[CQ:at,[^\]]*\]|@\S+)+$")
+_TRAIL_PUNCT = " \t\r\n~～!！?？。.,，、…"
+
+
+def _bare_answer_body(text: str) -> str:
+    """去掉首尾的 @名字 / CQ at 段 / 空白和语气标点，剩下用户真正说的话。"""
+    body = str(text or "")
+    prev = None
+    while prev != body:
+        prev = body
+        body = _AT_STRIP.sub("", body).strip(_TRAIL_PUNCT)
+    return body
+
+
 _IDEA_REF = re.compile(r"构想\s*[#＃]\s*(\d{1,9})([^\n）)]{0,80})")
 # 尾部里的「要做：1、3 / 1,3 / 1 3」；分隔符中英文逗号、顿号、空格、点、斜杠都认
 _IDEA_WANT = re.compile(r"要做\s*[:：]?\s*([0-9０-９][0-9０-９\s、,，.．/／-]*)")
@@ -367,7 +383,9 @@ class Intake:
         planner_wait_s: float = 12.0,
         planner_extend_s: float = 8.0,
         message_lookup: Callable[..., Awaitable[dict | None]] | None = None,
+        runtime_bus: Any = None,  # 运行事件总线（库号 51，可选）：@ 消息分流上看板实时流
     ) -> None:
+        self._runtime_bus = runtime_bus
         self._get_settings = get_settings
         self._planner_handoff = planner_handoff
         self._planner_wait_s = max(0.0, float(planner_wait_s))
@@ -869,7 +887,8 @@ class Intake:
         # 3) 提问的回答（docs/02 §7.2）：回复了 waiting_input/shelved 任务那条提问，
         #    或发起人 @ 机器人而且这个群里只有这一个等待任务 → 后台恢复任务。
         #    纯内存查（app 给的 30 秒缓存），不做重查询。
-        self._maybe_answer(group_id, user_id, message_id, text, message)
+        if self._maybe_answer(group_id, user_id, message_id, text, message):
+            return  # 已当回答恢复任务：不再落 _handle_at 重复判派活
         # 4) @ MaiBot：钩子里只做纯本地的事（认构想编号、落 pending_asks），
         #    Jev 判词丢后台；其余全部后台
         #    别的插件的指令（/pic 之类）不是 MaiWork 的活，连 Jev 都不问
@@ -997,8 +1016,9 @@ class Intake:
 
     def _maybe_answer(
         self, group_id: str, user_id: str, message_id: str, text: str, message: dict
-    ) -> None:
-        """认出「这是对某条提问的回答」→ spawn on_answer(group_id, task_id, 文本)。
+    ) -> bool:
+        """认出「这是对某条提问的回答」→ spawn on_answer(group_id, task_id, 文本)，返回 True；
+        没认出 → False（调用方继续往下走 @ 处理）。
 
         两条规则（docs/02 §7.2）：
         - 消息的 reply_to（原始消息里的引用，host._parse_reply_to 解析）等于某个
@@ -1010,23 +1030,23 @@ class Intake:
         provider = self._waiting_tasks
         cb = self._on_answer
         if provider is None or cb is None:
-            return
+            return False
         # 功能开关：任务关闭时不恢复等回答的任务（回复不触发开工）
         if not self._feature(group_id, "task"):
-            return
+            return False
         text_s = str(text or "").strip()
         if not text_s:
-            return
+            return False
         mid = str(message_id or "")
         if mid and mid in self._answered_ids:
-            return
+            return False
         try:
             waiting = list(provider(group_id) or [])
         except Exception:
             logger.debug("等待任务缓存查询出错（群 %s）", group_id, exc_info=True)
-            return
+            return False
         if not waiting:
-            return
+            return False
         task_id = ""
         # 规则 1：回复了那条提问（消息里有引用段时）
         reply_to = _reply_to_of(message)
@@ -1048,13 +1068,28 @@ class Intake:
                         task_id = str(tid)
                         break
         # 规则 2：请求人 @ 机器人 + 这个群里只有一个等待任务
-        if not task_id and not reply_to and (bool(message.get("is_at")) or bool(message.get("is_mentioned"))):
+        is_at = bool(message.get("is_at")) or bool(message.get("is_mentioned"))
+        if (not task_id and not reply_to and is_at
+                and _bare_answer_body(text_s) not in _GREETING_ONLY and _bare_answer_body(text_s)):
             # 按任务数，不按提问条数：同一个任务可能有原提问 + 提醒两条（2026-10-10）
             mine = {str(t[0]) for t in waiting if str(t[2] or "") == str(user_id)}
             if len(mine) == 1:
                 task_id = next(iter(mine))
         if not task_id:
-            return
+            return False
+        if is_at and self._mentions is not None:
+            try:
+                self._mentions.add_ephemeral(
+                    group_id,
+                    "群友刚回复了 MaiWork 正在等的任务提问，MaiWork 正在按这条回答继续做这个任务；"
+                    "请不要另给冲突的答复或替它承诺结果。",
+                    key=f"request:answer:{task_id}:{mid or 'latest'}",
+                    ttl_s=90,
+                    turns=2,
+                    target_user_id=str(user_id),
+                )
+            except Exception:
+                logger.debug("加回答备忘失败（群 %s）", group_id, exc_info=True)
         if mid:
             self._answered_ids[mid] = clock.now()
             # 顺手清一清 10 分钟前的（这个表只会按群消息量慢慢长）
@@ -1063,6 +1098,7 @@ class Intake:
             for k in stale:
                 del self._answered_ids[k]
         _spawn_safely(self._spawn, self._run_answer(cb, group_id, task_id, text_s))
+        return True
 
     async def _run_answer(
         self,
@@ -1102,6 +1138,20 @@ class Intake:
         idea = self._idea_of(group_id, text)
         if idea is not None:
             if self._feature(group_id, "idea") and self._feature(group_id, "task"):
+                # 同步先认领：MaiBot planner 紧跟着跑时能看到 MaiWork 已接下这条构想
+                if self._mentions is not None:
+                    try:
+                        self._mentions.add_ephemeral(
+                            group_id,
+                            f"MaiWork 已认领这条「构想 #{idea.get('id')}」请求，正在按构想建单并会亲自回复；"
+                            "请勿替它回复或承诺。",
+                            key=f"request:at-{message_id}",
+                            ttl_s=20.0,
+                            turns=2,
+                            target_user_id=str(user_id),
+                        )
+                    except Exception:
+                        pass
                 _spawn_safely(self._spawn, self._create_idea_request(group_id, idea, user_id, user_name, message_id, text))
             return
         # 任务关闭：派活 / 提醒都走 task 开关（已确认连带目标）。不持久化、不判断。
@@ -1191,6 +1241,18 @@ class Intake:
                 group_id, message_id,
             )
             return
+        # @ 消息进分流了（signal，库号 51）：看板「正在做什么」亮一眼——
+        # 只发群号 + 短标，绝不带 @ 的原话
+        bus = self._runtime_bus
+        if bus is not None:
+            try:
+                bus.emit(
+                    "signal", stage="signal", status="done",
+                    group_id=str(group_id or ""), role="intake", ok=True,
+                    badge="@消息分流",
+                )
+            except Exception:
+                pass
         try:
             if wait_for_planner:
                 entry = self._planner_entry(group_id, message_id)
@@ -1226,6 +1288,28 @@ class Intake:
                         jev.ask(state, _AT_QUESTIONS, purpose="intake", group_id=group_id, timeout_ms=timeout_ms),
                         _JEV_BG_WAIT_MAX_MS / 1000.0,
                     )
+            # Jev 细节（库号 51）：kind 那道题的选项概率 + 耗时，挂进判词存 pending_asks
+            # （decision.jev → 网页「待判 @」看板显示它为什么这么判）
+            jev_meta: dict = {}
+            if jev is not None:
+                try:
+                    detail = jev.last_detail()
+                    if isinstance(detail, dict):
+                        probs = detail.get("probs") if isinstance(detail.get("probs"), dict) else {}
+                        jev_meta = {
+                            "probs": probs.get("kind", probs),
+                            "ms": int(detail.get("ms") or 0),
+                            "threshold": float(_REQUEST_CONFIDENCE_MIN),
+                        }
+                except Exception:
+                    jev_meta = {}
+
+            def _with_jev(d: dict) -> dict:
+                """判词里带上 jev 细节（有的话）；pending_asks._normalize 认得这键。"""
+                if jev_meta:
+                    d = dict(d)
+                    d["jev"] = jev_meta
+                return d
             if not self._work_allowed(group_id, started_at, message_id):
                 return
             if self._at_waiters.get((group_id, message_id), {}).get("outcome") == "handoff":
@@ -1247,10 +1331,10 @@ class Intake:
                 zh = _KIND_ZH.get(label, label)
                 # 结论先落库，落住了才建请求：`_decide` 说这条已经不归这次判词管
                 # （终态 / 已被独立重试接手 / 库写不进去）就不重复建——保证一条 @ 只判一次
-                if self._decide(group_id, message_id, {
+                if self._decide(group_id, message_id, _with_jev({
                     "kind": label, "title": text.strip()[:_TITLE_MAX] or zh,
                     "via": f"群里 @ · Jev 判断是「{zh}」（把握 {confidence_f:.2f}）",
-                }) is not True:
+                })) is not True:
                     logger.info(
                         "这条 @ 的判词没记下（终态 / 已被独立重试接手 / 写锁被占），不重复建请求（群 %s 消息 %s）",
                         group_id, message_id,
@@ -1264,7 +1348,7 @@ class Intake:
                     # 时间还没解析：只记「是提醒」，行保持待处理，解析建成后才关
                     # （`_decide` 这里返回 False 是正常的「还没时间」，照样要建提醒）；
                     # 只有「结论压根没写成功」（None）才不建，免得和独立重试重复触发
-                    if self._decide(group_id, message_id, {"kind": "reminder", "title": text.strip()[:_TITLE_MAX]}) is None:
+                    if self._decide(group_id, message_id, _with_jev({"kind": "reminder", "title": text.strip()[:_TITLE_MAX]})) is None:
                         logger.info(
                             "写锁被占，这条 @ 的提醒判词没记下，留给独立重试（群 %s 消息 %s）",
                             group_id, message_id,
@@ -1274,7 +1358,7 @@ class Intake:
                 return
             if label == "none" and confidence_f >= _CONFIDENCE_MIN:
                 # Jev 明确判成闲聊且把握够：正常闲聊，待判行记成终态（不进慢路径）
-                self._decide(group_id, message_id, {"kind": "none", "why": f"Jev 判闲聊（把握 {confidence_f:.2f}）"})
+                self._decide(group_id, message_id, _with_jev({"kind": "none", "why": f"Jev 判闲聊（把握 {confidence_f:.2f}）"}))
                 return
             self._fallback(f"jev_判成「{label or '无效'}」（把握 {confidence_f:.2f}）",
                            group_id, user_id, user_name, message_id, text, **ctx)

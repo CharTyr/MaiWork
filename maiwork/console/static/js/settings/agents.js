@@ -97,8 +97,9 @@ function journalBody(snapshot) {
 
 function newAgentForm() {
   return `<div class="login ext-form">
-    <div class="ext-form-h">新建专岗${tip("创建后，需在主模型的 AGENTS.md 中写明何时向该专岗分派任务。")}</div>
-    <label for="agent-new-title">名称</label><input id="agent-new-title" maxlength="40" placeholder="例如：编写代码、制作表格" />
+    <div class="ext-form-h">新建专岗${tip("填写职责或分派场景后，主模型会在规划任务时自动选用，无需手动修改主模型 AGENTS.md。")}</div>
+    <label for="agent-new-title">名称</label><input id="agent-new-title" maxlength="40" placeholder="例如：代码审查、日文翻译" />
+    <label for="agent-new-when">擅长做什么（何时分派给它，可选）</label><input id="agent-new-when" maxlength="200" placeholder="例如：审查代码与 SQL 性能、翻译日文技术资料" />
     <div class="actions"><button class="btn primary" data-act="agent-create">创建</button><button class="btn" data-act="agent-new-cancel">取消</button></div>
   </div>`;
 }
@@ -124,7 +125,7 @@ function profileRow(p) {
     : `<b>未选择模型</b>${p.kind === "main" ? "（无法运行）" : "（暂用主模型）"}`;
   return `<div class="set-row agent-row"><span class="agent-fish${fresh ? " is-new" : ""}" data-fish="${esc(p.kind)}">${fishOf(p.kind, 48)}</span><div>
     <div class="set-name">${esc(p.title)}${tag ? `<span class="tag">${esc(tag)}</span>` : ""}</div>
-    <div class="set-text">${esc(LEADS[p.kind] || "由主模型按 AGENTS.md 分派任务")}</div>
+    <div class="set-text">${esc(LEADS[p.kind] || (p.instructions && p.instructions.trim()) || "自定义专岗（自动纳入主模型分派清单）")}</div>
     <div class="set-text ext-st"><span class="dot ${off ? "" : "ok"}"></span>${off ? "已停用 · " : ""}${model} · <button type="button" class="link-btn ag-skill-link" data-act="agent-goto-skills" data-role="${esc(p.kind)}">${skCount ? `已启用 ${skCount} 项技能` : "查看技能"}</button></div>
     </div><div class="agent-row-acts"><button class="btn small ghost" data-act="agent-fish-reroll" data-kind="${esc(p.kind)}" title="随机生成">随机</button><button class="btn small ghost" data-act="agent-fish-custom" data-kind="${esc(p.kind)}" title="选择鱼种、颜色和眼神">自定义</button><button class="btn small" data-act="agent-profile-edit" data-kind="${esc(p.kind)}">设置</button></div></div>`;
 }
@@ -196,6 +197,7 @@ function profileForm(p) {
   return `<div class="login ext-form agent-form">
     <div class="ext-form-h"><span class="agent-fish sm">${fishOf(p.kind, 28)}</span>设置 ${esc(p.title)}</div>
     <label for="agent-title">名称</label><input id="agent-title" maxlength="40" value="${esc(p.title)}" />
+    ${isCustom(p) ? `<div class="lbl-row"><label for="agent-when">擅长做什么（何时分派给它）</label>${tip("主模型在规划任务时会自动读取这段说明，决定何时把步骤交给该专岗，无需手改主模型 AGENTS.md。")}</div><input id="agent-when" maxlength="200" value="${esc(p.instructions || "")}" placeholder="例如：负责翻译日文资料、审查代码质量" />` : ""}
     <h3 class="set-name" style="margin-top:14px">模型</h3>
     <label for="agent-model">模型</label><select id="agent-model">${modelOptions(p.model, main ? "请选择模型" : "同主模型")}</select>
     <label for="agent-effort">思考强度</label><select id="agent-effort">${effortOptions(p.model, p.effort)}</select>
@@ -209,9 +211,9 @@ function profileForm(p) {
       return `<label class="chk ag-sk-row"><input type="checkbox" value="${esc(name)}"${selected.has(name) ? " checked" : ""} /><span class="ag-sk-ico">${ico(iconName)}</span><span class="ag-sk-body"><span class="ag-sk-t">${esc(name)}${brings}${k && k.enabled === false ? `<span class="fine">（已停用）</span>` : ""}</span>${k && k.description ? `<span class="ag-sk-d">${esc(k.description)}</span>` : ""}</span></label>`;
     }).join("") || `<p class="fine">暂无技能</p>`}</div>`}
     ${main ? "" : toolsBlock(p)}
-    ${!docs ? loading() : `
+    ${!docs ? loading() : `<details class="cfg-advanced"><summary>高级 · 自定义岗位提示词（SOUL.md / AGENTS.md）</summary>
       ${docBlock(p.kind, "soul", "SOUL.md", "性格与语气" + (docs.soul && docs.soul.synced_from_maibot ? "；当前内容已从 MaiBot 同步。" : "。"), docs.soul, lim.soul, `<button type="button" class="btn small" data-act="agent-soul-sync" data-kind="${esc(p.kind)}">从 MaiBot 同步</button>`)}
-      ${docBlock(p.kind, "agents", "AGENTS.md", main ? "工作规则，需写明何时向哪个专岗分派任务。" : "工作规则。", docs.agents, lim.agents, `<button type="button" class="btn small ghost" data-act="agent-agents-reset" data-kind="${esc(p.kind)}">恢复默认</button>`)}`}
+      ${docBlock(p.kind, "agents", "AGENTS.md", main ? "高级工作规则；自定义专岗的分派说明已自动注入，一般无需手改。" : "高级工作规则，默认预设已足够日常使用。", docs.agents, lim.agents, `<button type="button" class="btn small ghost" data-act="agent-agents-reset" data-kind="${esc(p.kind)}">恢复默认</button>`)}</details>`}
     <p class="err" id="agent-err" hidden></p>
     <div class="actions"><button class="btn primary" data-act="agent-profile-save" data-kind="${esc(p.kind)}">保存</button><button class="btn" data-act="agent-profile-cancel">取消</button>${isCustom(p) ? `<button class="btn ghost danger" data-act="agent-delete" data-kind="${esc(p.kind)}">删除专岗</button>` : ""}</div>
   </div>`;
@@ -260,20 +262,56 @@ function journalPanel(a) {
   const learned = a.learned || [];
   const handoffs = a.recent_handoffs || [];
   const isTask = a.kind === "task";
-  const meta = [`最近交接 <b>${handoffs.length}</b>`, isTask ? "" : `近期完成 <b>${learned.length}</b>`]
-    .filter(Boolean).join('<span class="journal-dot">·</span>');
-  const sub = !isTask && (state.agentJournalSub === "learned" || (!state.agentJournalSub && !handoffs.length && learned.length)) ? "learned" : "handoffs";
+  const note = !isTask && a.index_note ? a.index_note : null;
+  const hasNote = !!(note && note.content);
+  const meta = [
+    `最近交接 <b>${handoffs.length}</b>`,
+    isTask ? "" : `近期完成 <b>${learned.length}</b>`,
+    !isTask && hasNote ? `常驻笔记 <b>v${Number(note.version) || 1}</b>` : "",
+  ]
+    .filter(Boolean)
+    .join('<span class="journal-dot">·</span>');
+  const sub =
+    !isTask && state.agentJournalSub === "note"
+      ? "note"
+      : !isTask && (state.agentJournalSub === "learned" || (!state.agentJournalSub && !handoffs.length && learned.length))
+        ? "learned"
+        : !isTask && !state.agentJournalSub && !handoffs.length && !learned.length && hasNote
+          ? "note"
+          : "handoffs";
   const segBtn = (key, label) => `<button type="button" role="tab" data-act="agent-journal-sub" data-sub="${key}" aria-selected="${sub === key ? "true" : "false"}"${sub === key ? ' class="on"' : ""}>${label}</button>`;
-  const seg = !isTask && (handoffs.length || learned.length) ? `<div class="seg journal-seg" role="tablist" aria-label="记录类型">${segBtn("handoffs", "最近交接")}${segBtn("learned", "近期完成")}</div>` : "";
+  const seg = !isTask && (handoffs.length || learned.length || hasNote)
+    ? `<div class="seg journal-seg" role="tablist" aria-label="记录类型">${segBtn("handoffs", "最近交接")}${segBtn("learned", "近期完成")}${segBtn("note", "常驻笔记")}</div>`
+    : "";
   const empty = (t) => `<div class="journal-empty"><p class="fine">${t}</p></div>`;
   let body;
-  if (!handoffs.length && (isTask || !learned.length)) body = empty("暂无工作记录。该专岗在本群执行任务或完成检查后将在此留存。");
-  else if (sub === "handoffs") body = handoffs.length ? `<div class="journal-list">${handoffs.map(handoffEntry).join("")}</div>` : empty("暂无交接记录");
-  else body = learned.length ? `<div class="journal-list">${[...learned].reverse().map(learnedEntry).join("")}</div>` : empty("暂无近期完成记录");
+  if (!handoffs.length && (isTask || (!learned.length && !hasNote && sub !== "note"))) {
+    body = empty("暂无工作记录。该专岗在本群执行任务或完成检查后将在此留存。");
+  } else if (sub === "note") {
+    body = noteEntry(note);
+  } else if (sub === "handoffs") {
+    body = handoffs.length ? `<div class="journal-list">${handoffs.map(handoffEntry).join("")}</div>` : empty("暂无交接记录");
+  } else {
+    body = learned.length ? `<div class="journal-list">${[...learned].reverse().map(learnedEntry).join("")}</div>` : empty("暂无近期完成记录");
+  }
   return `<section class="set-group agent-journal" data-kind="${esc(a.kind)}">
     <div class="journal-head"><div class="journal-who"><span class="agent-fish sm">${fishOf(a.kind, 34)}</span><div class="journal-title"><h3 class="set-name">${esc(a.title)}${a.enabled === false ? `<span class="tag">已停用</span>` : ""}</h3><div class="journal-meta">${meta}</div></div></div>${seg}</div>
     ${body}
   </section>`;
+}
+
+function noteEntry(note) {
+  const content = note && note.content ? String(note.content) : "";
+  const locked = Boolean(note && note.locked);
+  const ts = note && note.updated_ts ? fmtTime(note.updated_ts) : "";
+  return `<div class="journal-list"><div class="agent-entry learned-entry">
+    ${content ? `<p class="jl-text" style="white-space:pre-wrap">${esc(content)}</p>` : `<p class="fine">暂无常驻索引笔记</p>`}
+    <div class="jl-meta">
+      ${locked ? `<span class="tag">已锁定</span>` : ""}
+      ${ts ? `<span class="jh-time">${esc(ts)}</span>` : ""}
+      <button type="button" class="link-btn" data-act="agent-goto-gctx" data-g="${esc(state.agentGroup || "")}">前往本群设置管理</button>
+    </div>
+  </div></div>`;
 }
 
 // 状态 → [圆点类, 色调类]
@@ -414,17 +452,18 @@ export async function actAgents(action, el) {
     case "agent-new-cancel": state.agentNew = false; repaintSheet(); return true;
     case "agent-create": {
       const title = ($("agent-new-title") && $("agent-new-title").value.trim()) || "";
+      const instructions = ($("agent-new-when") && $("agent-new-when").value.trim()) || "";
       if (!title) return toast("请填写专岗名称", true), true;
       el.disabled = true;
       try {
-        const p = await api("POST", "/api/agents", { title });
+        const p = await api("POST", "/api/agents", instructions ? { title, instructions } : { title });
         state.agentNew = false;
         await loadAgents();
         state.agentEdit = p.kind;
         repaintSheet();
         await loadDocs(p.kind);
         repaintSheet();
-        toast("已创建。请在主模型的 AGENTS.md 中写明何时分派任务");
+        toast(instructions ? "已创建，主模型将按分派说明自动选用" : "已创建，可补充该专岗擅长的工作场景");
       } catch (err) { el.disabled = false; toast(err.message, true); }
       return true;
     }
@@ -435,7 +474,7 @@ export async function actAgents(action, el) {
       try {
         await api("DELETE", `/api/agents/${encodeURIComponent(kind)}`);
         state.agentEdit = null;
-        await loadAgents(); repaintSheet(); toast("已删除。请同步删除主模型 AGENTS.md 中的相关内容");
+        await loadAgents(); repaintSheet(); toast("已删除专岗");
       } catch (err) { toast(err.message, true); }
       return true;
     }
@@ -464,6 +503,14 @@ export async function actAgents(action, el) {
     }
     case "agent-journal-tab": state.agentJournalKind = el.dataset.kind || null; state.agentJournalSub = null; repaintSheet(); return true;
     case "agent-journal-sub": state.agentJournalSub = el.dataset.sub || null; repaintSheet(); return true;
+    case "agent-goto-gctx": {
+      const gid = el.dataset.g || state.agentGroup || state.g;
+      if (!gid) return true;
+      state.groupSub = "admin";
+      const { go } = await import("../router.js");
+      go({ page: null, g: gid, tab: "group", detail: null });
+      return true;
+    }
     case "agent-reload": await loadAgents(); repaintSheet(); return true;
     case "agent-fish-custom": {
       state.agentEdit = null;
@@ -537,6 +584,7 @@ export async function actAgents(action, el) {
       if (!body.title) return fail("请填写名称"), true;
       if (kind === "main" && !body.model) return fail("主模型必须选择模型"), true;
       if (body.backup && body.backup === body.model) return fail("备用模型不能与当前模型相同"), true;
+      if ($("agent-when")) body.instructions = $("agent-when").value.trim();
       if ($("agent-escalate")) body.escalate = $("agent-escalate").value;
       if ($("agent-enabled")) body.enabled = $("agent-enabled").checked;
       if ($("agent-skills")) body.skills = resolveSkillsSelection(kind, [...document.querySelectorAll("#agent-skills input[type=checkbox]")]);

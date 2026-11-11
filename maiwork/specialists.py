@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import Any
 
@@ -24,6 +25,23 @@ from . import run_ref
 from .workers import WorkerReport, Workers
 
 logger = logging.getLogger("maiwork.specialists")
+
+
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    """检查 callable 是否接收指定关键字参数（含 **kwargs），兼容轻量测试桩。"""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for p in sig.parameters.values():
+        if p.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if p.name == name and p.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
 
 
 def agents_of(specialists: Any) -> Any:
@@ -468,6 +486,8 @@ class Specialists:
         # 任务 brief 规模档（随口一问）：skill 名单整个压掉——合同里已点名「直接回话」，
         # skill 提示和 read_skill 这一层全是多余的（standard / full 照旧，默认 False）。
         suppress_skills: bool = False,
+        # 轻任务快车道：透传给 Workers.run（无工具调用但有正文时直接当回复交回）
+        allow_plain_reply: bool = False,
     ) -> WorkerReport:
         gid = str(group_id or "")
         kind_s = str(kind or "").strip()
@@ -579,6 +599,8 @@ class Specialists:
             lane_kw["history"] = history
         if escalate:
             lane_kw["escalate"] = True
+        if allow_plain_reply and _accepts_kwarg(self._workers.run, "allow_plain_reply"):
+            lane_kw["allow_plain_reply"] = True
         # 交接单挂 run_ref（库号 50）：外圈有 ref 直接沿用（begin 已落库）；
         # 没有就给这一轮一个自己的 ref（handoff:<交接单号>），包进 workers.run —
         # 它轮里的工具 / 模型调用按 ref 精确挂回这张交接单，看板可回看。
@@ -590,50 +612,44 @@ class Specialists:
                     setter(gid, handoff_id, eff_ref)
                 except Exception:
                     logger.exception("交接单 run_ref 落库失败（%s）", handoff_id)
+
+        async def _call_workers(extra_kw: dict[str, Any]) -> WorkerReport:
+            return await self._workers.run(
+                str(brief),
+                group_id=gid,
+                tools=list(effective_tools),
+                task_id=str(task_id or ""),
+                actor=actor_s,
+                max_steps=max_steps or 0,
+                output_schema=output_schema,
+                workspace=workspace,
+                skills_hint=skills_hint,
+                system_extra=system_extra,
+                deadline_ts=deadline_ts,
+                artifact_scope=artifact_scope,
+                write_scope=write_scope,
+                agent_type=kind_s,
+                allowed_tools=tuple(effective_tools),
+                allowed_skills=allowed_skills,
+                **telemetry,
+                **extra_kw,
+            )
+
+        async def _invoke_workers() -> WorkerReport:
+            try:
+                return await _call_workers(lane_kw)
+            except TypeError as exc:
+                if "allow_plain_reply" in lane_kw and "allow_plain_reply" in str(exc):
+                    fallback_kw = {k: v for k, v in lane_kw.items() if k != "allow_plain_reply"}
+                    return await _call_workers(fallback_kw)
+                raise
+
         try:
             if run_ref.current():
-                report = await self._workers.run(
-                    str(brief),
-                    group_id=gid,
-                    tools=list(effective_tools),
-                    task_id=str(task_id or ""),
-                    actor=actor_s,
-                    max_steps=max_steps or 0,
-                    output_schema=output_schema,
-                    workspace=workspace,
-                    skills_hint=skills_hint,
-                    system_extra=system_extra,
-                    deadline_ts=deadline_ts,
-                    artifact_scope=artifact_scope,
-                    write_scope=write_scope,
-                    agent_type=kind_s,
-                    allowed_tools=tuple(effective_tools),
-                    allowed_skills=allowed_skills,
-                    **telemetry,
-                    **lane_kw,
-                )
+                report = await _invoke_workers()
             else:
                 async with run_ref.tagged(eff_ref):
-                    report = await self._workers.run(
-                        str(brief),
-                        group_id=gid,
-                        tools=list(effective_tools),
-                        task_id=str(task_id or ""),
-                        actor=actor_s,
-                        max_steps=max_steps or 0,
-                        output_schema=output_schema,
-                        workspace=workspace,
-                        skills_hint=skills_hint,
-                        system_extra=system_extra,
-                        deadline_ts=deadline_ts,
-                        artifact_scope=artifact_scope,
-                        write_scope=write_scope,
-                        agent_type=kind_s,
-                        allowed_tools=tuple(effective_tools),
-                        allowed_skills=allowed_skills,
-                        **telemetry,
-                        **lane_kw,
-                    )
+                    report = await _invoke_workers()
         except asyncio.CancelledError:
             try:
                 self._agents.fail(gid, handoff_id, "已取消", state="cancelled")
@@ -662,6 +678,7 @@ class Specialists:
                     **telemetry,
                     ok=True,
                     **({"notes": list(report.notes)} if kind_s != "task" and getattr(report, "notes", None) else {}),
+                    **({"my_notes": str(report.my_notes)} if kind_s not in ("task", "main") and getattr(report, "my_notes", "") else {}),
                 )
             else:
                 self._agents.returned(

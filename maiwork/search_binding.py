@@ -82,10 +82,20 @@ def set_binding(store: Any, binding: dict[str, Any]) -> dict[str, str]:
     norm = _norm_binding(binding)
     if norm is None:
         raise ValueError("绑定要写成 {\"mcp\": 扩展名, \"tool\": 搜索工具名}")
+    before = get_binding(store) or {}
     with store.tx() as conn:
         store.kv_set(conn, KV_SEARCH, norm)
     logger.info("搜索绑定已保存：用 %s 的 %s%s", norm["mcp"], norm["tool"],
                 f"（抓正文 {norm['extract_mcp']} 的 {norm['extract_tool']}）" if norm["extract_tool"] else "")
+    try:
+        from . import settings_audit
+
+        settings_audit.record(
+            store, scope="global", target_key="search_binding",
+            summary="修改联网搜索绑定", before=before, after=dict(norm),
+        )
+    except Exception:
+        logger.debug("搜索绑定修改记账失败", exc_info=True)
     return norm
 
 
@@ -116,6 +126,15 @@ def clear_binding(store: Any, *, mcp: str | None = None) -> bool:
     with store.tx() as conn:
         conn.execute("DELETE FROM kv WHERE key=?", (KV_SEARCH,))
     logger.info("搜索绑定已解除（原绑定：%s 的 %s）", current["mcp"], current["tool"])
+    try:
+        from . import settings_audit
+
+        settings_audit.record(
+            store, scope="global", target_key="search_binding",
+            summary="解除联网搜索绑定", before=dict(current), after={},
+        )
+    except Exception:
+        logger.debug("搜索绑定解除记账失败", exc_info=True)
     return True
 
 

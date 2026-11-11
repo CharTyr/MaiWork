@@ -13,6 +13,7 @@ import { settingsPage, settingsSide } from "./settings/index.js";
 import { chatPage, chatSide } from "./chat.js";
 import { hasUpdate, updateBanner } from "./update.js";
 import { boardPage } from "./board.js";
+import { mountBoardFlow, stopBoardSSE, syncBoardSSE } from "./board_flow.js";
 
 /* ───────────── 渲染 ───────────── */
 
@@ -309,6 +310,7 @@ function restoreGroupInput(saved, el) {
 }
 
 export function renderView(opts) {
+  if (state.page !== "board") stopBoardSSE();
   if (state.newsComposing && !state.page && state.tab === "news" && document.activeElement?.id === "news-q") return;
   if (state.page === "chat") {
     const typed = $("chat-input") ? $("chat-input").value : "";
@@ -320,11 +322,15 @@ export function renderView(opts) {
   }
   if (state.page === "board") {
     const html = boardPage();
-    if (opts && opts.poll && html === lastView && !ui.flash) return;
+    if (opts && opts.poll && html === lastView && !ui.flash) {
+      syncBoardSSE();
+      return;
+    }
     lastView = html;
     $("view").innerHTML = html;
     if (!ui.flash) $("view").querySelectorAll(".enter").forEach((x) => x.classList.remove("enter"));
     ui.flash = false;
+    mountBoardFlow();
     return;
   }
   if (state.page === "settings") {
@@ -400,6 +406,7 @@ export function render() {
   document.body.classList.toggle("on-board", state.page === "board");
   document.body.classList.remove("booting");
   if (lone) {
+    stopBoardSSE();
     $("view").innerHTML = admin() ? noGroups() : landing();
     document.title = "MaiWork";
     return;

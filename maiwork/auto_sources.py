@@ -885,6 +885,18 @@ async def subscribe_label(
         return {"ok": False, "reason": str(e), "url": feed_url, "id": ""}
     note_log(store, gid, action="subscribed", label=lab, url=feed_url, origin=str(origin),
              reason=str(reason), now=now)
+    try:
+        from . import settings_audit
+
+        settings_audit.record(
+            store, scope=f"group:{gid}", target_key=f"rss_source:{feed_url}",
+            summary=f"自动订阅来源 {lab or feed_url}",
+            before={}, after=dict(entry),
+            actor="auto_source",
+            reason=str(reason or origin or ""),
+        )
+    except Exception:
+        logger.debug("自动订阅记账失败", exc_info=True)
     return {"ok": True, "reason": "", "url": feed_url, "id": str(entry.get("id") or "")}
 
 
@@ -1440,6 +1452,17 @@ async def unsubscribe_stale(store: Any, gid: str, now: float) -> list[str]:
                       cooldown_until=cooldown_until)
         note_log(store, gid, action="unsubscribed", label=label, url=url,
                  origin=str(entry.get("origin") or ""), reason=reason, now=now)
+        try:
+            from . import settings_audit
+
+            settings_audit.record(
+                store, scope=f"group:{gid}", target_key=f"rss_source:{url or fid}",
+                summary=f"自动退订来源 {label or url}",
+                before=dict(entry), after={},
+                actor="auto_source", reason=reason,
+            )
+        except Exception:
+            logger.debug("自动退订记账失败", exc_info=True)
         gone.append(label or url)
         logger.info("自动退订（群 %s）：%s —— %s", gid, label or url, reason)
     return gone

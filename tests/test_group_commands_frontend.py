@@ -27,6 +27,8 @@ const stubs = {
   './news.js': { emptyState: () => '[empty]', loading: () => '[loading]' },
   './groupctx.js': { ctxSection: () => '' },
   './groupcontrols.js': { controlsSection: () => '' },
+  '../jev_bars.js': { jevBarsHTML: () => '' },
+  '../settings/changes.js': { groupChangesSection: () => '' },
 };
 const modules = new Map();
 async function link(spec) {

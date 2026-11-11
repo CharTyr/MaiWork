@@ -2102,10 +2102,22 @@ class Feeds:
 
     # ---- 资讯（原有逻辑） -------------------------------------------------------------
 
-    async def prepare_news(self, group_id: str) -> int:
+    def _hard_limit_tripped(self) -> bool:
+        """今天全站用量撞了每日硬上限 → 资讯 / 构想这轮不跑（零模型调用，次日零点自动恢复）。"""
+        from . import usage_alerts
+
+        hit = usage_alerts.hard_limit_tripped(self._store, self._get_settings)
+        if hit is not None:
+            logger.info("今天用量 %s 已到每日硬上限 %s，后台搜集这轮跳过", hit["used"], hit["limit"])
+            return True
+        return False
+
+    async def prepare_news(self, group_id: str, *, manual: bool = False) -> int:
         """一轮资讯：在 `news:<gid>:<ms>:<seq>` 的 round ref 下跑完，轮里的
         model_calls / tool_calls 自动挂它；批次行存同一份 ref → 看板精确关联
         （link=exact）。ref 不开 main_runs 条目（tagged scope），写库失败只记日志。"""
+        if not manual and self._hard_limit_tripped():
+            return 0
         try:
             ref = run_ref.new("news", str(group_id))
         except Exception:
@@ -5573,9 +5585,11 @@ class Feeds:
             logger.exception("取子 agent 工具清单出错，构想可行性按基本能力算")
             return None
 
-    async def make_idea(self, group_id: str) -> int | None:
+    async def make_idea(self, group_id: str, *, manual: bool = False) -> int | None:
         """一轮构想：在 `idea:<gid>:<ms>:<seq>` 的 round ref 下跑完（同一轮出多条
         构想都挂同一个 ref）；构想行存同一份 ref → 看板精确关联（link=exact）。"""
+        if not manual and self._hard_limit_tripped():
+            return None
         try:
             ref = run_ref.new("idea", str(group_id))
         except Exception:
@@ -6446,6 +6460,25 @@ class Feeds:
             (gid, since),
         ).fetchall()
 
+    _INTERNAL_BATCH_NOTE_MARKERS: tuple[str, ...] = (
+        "还没指定联网搜索",
+        "设置 →",
+        "工具与平台",
+        "MCP",
+        "模型出关注点失败",
+        "搜索用不了",
+        "子 agent",
+        "Traceback",
+        "Exception",
+    )
+
+    @classmethod
+    def _scrub_member_batch_note(cls, note: str) -> str:
+        text = str(note or "")
+        if text and any(m in text for m in cls._INTERNAL_BATCH_NOTE_MARKERS):
+            return "本轮暂无新资讯"
+        return text
+
     def news_view(self, group_id: str, *, days: int = _NEWS_VIEW_DAYS, admin: bool = False) -> list[dict]:
         """资讯栏（§9.3）：只含通过三道门的 kind=news 条目（好文走 guides_view、被筛的只管理员可见）。
 
@@ -6477,13 +6510,14 @@ class Feeds:
                 " FROM news_items WHERE batch_id=? AND rejected=1 ORDER BY id ASC",
                 (int(b["id"]),),
             ).fetchall()
+            raw_note = str(b["note"] or "")
             entry = {
                 "id": int(b["id"]),
                 "slot_ts": float(b["slot_ts"]),
                 "found": int(b["found"]),
                 "kept": int(b["kept"]),
                 "skipped": bool(b["skipped"]),
-                "note": str(b["note"] or ""),
+                "note": raw_note if admin else self._scrub_member_batch_note(raw_note),
                 "rejected_count": len(rejected_rows),
                 "items": items,
                 # 这一轮工具用量：{searches, pages, kept}；老批次没有 → None

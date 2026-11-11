@@ -575,6 +575,31 @@ class PendingAsks:
             v = str(decision.get(k) or "").strip()
             if v:
                 out[k] = v[:_TITLE_MAX] if k == "title" else v[:200]
+        # Jev 细节（库号 51）：选项概率 / 耗时 / 阈值，只收这三个白名单键，
+        # 网页「待判 @」看板用它解释为什么这么判；不认得的塞不进库。
+        jev = decision.get("jev")
+        if isinstance(jev, dict):
+            jev_out: dict = {}
+            probs = jev.get("probs")
+            if isinstance(probs, dict) and probs:
+                clean: dict = {}
+                for label, p in list(probs.items())[:16]:
+                    try:
+                        clean[str(label)[:40]] = round(max(0.0, min(1.0, float(p))), 4)
+                    except (TypeError, ValueError):
+                        continue
+                if clean:
+                    jev_out["probs"] = clean
+            try:
+                jev_out["ms"] = max(0, int(jev.get("ms") or 0))
+            except (TypeError, ValueError):
+                jev_out["ms"] = 0
+            try:
+                jev_out["threshold"] = float(jev.get("threshold") or 0.0)
+            except (TypeError, ValueError):
+                jev_out["threshold"] = 0.0
+            if jev_out.get("probs") or jev_out.get("ms"):
+                out["jev"] = jev_out
         if kind != "reminder":
             return out, True
         from .profile import _parse_bj_when  # profile 顶层导入本模块，这里局部导入防循环

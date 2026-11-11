@@ -80,8 +80,7 @@ CREATE INDEX IF NOT EXISTS idx_chat_feeds_key ON chat_feeds(group_id, key);
 STEP_PROFILE = 2      # _m_profile
 STEP_CHAT_FEEDS = 31  # _m_chat_feeds
 STEP_CHAT_LOG_IDS = 40  # _m_chat_log_ids（FTS5 chat_log 的去重账本）
-LATEST = len(_MIGRATIONS)  # 41（34 = 历史步骤 + 35 task_lanes + 36 brief + 37 lane 原始历史
-#                              + 38 构想 kind + 39 goal fit + 40 chat_log 去重账本）
+LATEST = len(_MIGRATIONS)  # 51（41..50 见下方注释 + 51 观测与索引便条）
 
 _DEAD_MODULE = "CharTyr_MaiWork.maiwork.chat_feed"
 
@@ -234,7 +233,8 @@ class TestFullMigrate:
         # 44 = 工作会话、事件与任务轮次；前 43 步不改动。
         assert store_mod._MIGRATIONS[41].__name__ == "_m_goal_stale_notify"
         assert store_mod._MIGRATIONS[42].__name__ == "_m_skills"
-        assert LATEST == 50, "第 45 步补索引、第 46 步主模型条目、第 47 步 round ref、第 48 步便条板、第 49 步 mentions 定向、第 50 步看板精修（main_runs lane / 交接单 run_ref），历史迁移位置保持不变"
+        assert store_mod._MIGRATIONS[50].__name__ == "_m_observability_and_notes"
+        assert LATEST == 51, "第 45 步补索引、第 46 步主模型条目、第 47 步 round ref、第 48 步便条板、第 49 步 mentions 定向、第 50 步看板精修（main_runs lane / 交接单 run_ref）、第 51 步观测与索引便条（first_token_ms/context_map、judgments.probs、settings_changes、agent_index_notes），历史迁移位置保持不变"
         assert store_mod._MIGRATIONS[46].__name__ == "_m_round_ref_marks"
         assert store_mod._MIGRATIONS[40].__name__ == "_m_pending_ask_state"
         assert store_mod._MIGRATIONS[34].__name__ == "_m_task_lanes"
@@ -596,7 +596,7 @@ class TestOnline45Upgrade:
         news_batches/ideas/topic_log/judgments 的 run_ref 列。"""
         s = self._online_45(tmp_path / "online45.db")
         try:
-            assert s.migrate() == 50
+            assert s.migrate() == 51
             assert "main_runs" in _tables(s)
             for table in ("model_calls", "tool_calls", "news_batches", "ideas",
                           "topic_log", "judgments"):
@@ -604,7 +604,7 @@ class TestOnline45Upgrade:
                 assert "run_ref" in cols, table
             assert "idx_model_calls_run_ref" in _index_names(s, "model_calls")
             assert "idx_tool_calls_run_ref" in _index_names(s, "tool_calls")
-            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 50
+            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 51
         finally:
             s.close()
 
@@ -613,13 +613,13 @@ class TestOnline45Upgrade:
         s = Store(tmp_path / "v44.db")
         try:
             _run_steps(s, 44)
-            assert s.migrate() == 50
+            assert s.migrate() == 51
             names = _tables(s)
             assert "main_runs" in names and "task_sessions" in names
             assert "idx_events_entity" in _index_names(s, "events")
             cols = {c[0] for c in _columns(s, "model_calls")}
             assert "run_ref" in cols
-            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 50
+            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 51
         finally:
             s.close()
 
@@ -633,10 +633,10 @@ class TestOnline45Upgrade:
             cols_before = {c[0] for c in _columns(s, "mentions")}
             assert "target_user_id" not in cols_before
             assert "keywords" not in cols_before
-            assert s.migrate() == 50
+            assert s.migrate() == 51
             cols = {c[0] for c in _columns(s, "mentions")}
             assert "target_user_id" in cols and "keywords" in cols
-            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 50
+            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 51
         finally:
             s.close()
 
@@ -644,7 +644,7 @@ class TestOnline45Upgrade:
         """全新库一路跑到最新：mentions 直接带 target_user_id / keywords。"""
         s = Store(tmp_path / "fresh.db")
         try:
-            assert s.migrate() == 50
+            assert s.migrate() == 51
             cols = {c[0] for c in _columns(s, "mentions")}
             assert "target_user_id" in cols and "keywords" in cols
         finally:
@@ -677,13 +677,101 @@ CREATE TABLE IF NOT EXISTS agent_handoffs (
     created REAL NOT NULL DEFAULT 0, updated REAL NOT NULL DEFAULT 0
 );
 """)
-            assert s.migrate() == 50
+            assert s.migrate() == 51
             assert "lane" in {c[0] for c in _columns(s, "main_runs")}
             assert "idx_main_runs_lane_started" in _index_names(s, "main_runs")
             row = s.read().execute("SELECT lane FROM main_runs WHERE ref='r1'").fetchone()
             assert str(row["lane"]) == "main"
             assert "run_ref" in {c[0] for c in _columns(s, "agent_handoffs")}
             assert "idx_agent_handoffs_run_ref" in _index_names(s, "agent_handoffs")
-            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 50
+            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 51
+        finally:
+            s.close()
+
+
+# ----------------------------------------------------------------------
+# 库号 50（看板精修完）→ 51（观测与索引便条）的升级路径
+# ----------------------------------------------------------------------
+
+class TestStep51Observability:
+    """第 51 步 `_m_observability_and_notes`：存量 50 库升上来——
+    model_calls 补 first_token_ms / context_map、judgments 补 probs、
+    agent_handoffs（有这表才）补 my_notes；新建 settings_changes（+两索引）、
+    agent_index_notes（PK 复合键）与 agent_index_note_versions（+索引）。
+    旧行一根汗毛不能少。"""
+
+    def test_fresh_db_has_step51_shape(self, store: Store) -> None:
+        from CharTyr_MaiWork.maiwork.agents import Agents
+
+        assert store.migrate() == LATEST
+        mc = {c[0] for c in _columns(store, "model_calls")}
+        assert {"first_token_ms", "context_map"} <= mc
+        assert "probs" in {c[0] for c in _columns(store, "judgments")}
+        Agents(store, lambda: None)._ensure_schema()
+        assert "my_notes" in {c[0] for c in _columns(store, "agent_handoffs")}
+        names = _tables(store)
+        assert {"settings_changes", "agent_index_notes", "agent_index_note_versions"} <= names
+        assert {"idx_settings_changes_ts", "idx_settings_changes_scope"} <= _index_names(
+            store, "settings_changes")
+        assert "idx_agent_index_note_ver" in _index_names(store, "agent_index_note_versions")
+        # agent_index_notes 主键 (group_id, kind)
+        pk = [c[0] for c in _columns(store, "agent_index_notes") if c[4]]
+        assert pk == ["group_id", "kind"]
+
+    def test_step50_upgrades_to_51_keeps_rows(self, tmp_path: Path) -> None:
+        s = Store(tmp_path / "v50.db")
+        try:
+            _run_steps(s, 50)
+            with s.tx() as conn:
+                conn.execute(
+                    "INSERT INTO model_calls (ts, purpose, role, agent, model, group_id,"
+                    " request, response, ms, ok, status, prompt_tokens, completion_tokens,"
+                    " error, task_id, run_ref)"
+                    " VALUES (1.0,'p','main','a','m','g1','{}','{}',5,1,200,10,3,'','t1','r1')"
+                )
+                conn.execute(
+                    "INSERT INTO judgments (ts, purpose, group_id, answers, verdict,"
+                    " run_ref, ms, ok, error)"
+                    " VALUES (1.0,'topic_check','g1','{}','', 'r1', 3, 1, '')"
+                )
+            assert "first_token_ms" not in {c[0] for c in _columns(s, "model_calls")}
+            assert "probs" not in {c[0] for c in _columns(s, "judgments")}
+            assert "settings_changes" not in _tables(s)
+            assert s.migrate() == 51
+            assert "first_token_ms" in {c[0] for c in _columns(s, "model_calls")}
+            assert "context_map" in {c[0] for c in _columns(s, "model_calls")}
+            assert "probs" in {c[0] for c in _columns(s, "judgments")}
+            assert "settings_changes" in _tables(s)
+            # 旧行原样还在
+            row = s.read().execute(
+                "SELECT model, task_id FROM model_calls WHERE run_ref='r1'"
+            ).fetchone()
+            assert str(row["model"]) == "m" and str(row["task_id"]) == "t1"
+            jrow = s.read().execute("SELECT ms FROM judgments WHERE run_ref='r1'").fetchone()
+            assert int(jrow["ms"]) == 3
+            assert int(s.read().execute("PRAGMA user_version").fetchone()[0]) == 51
+        finally:
+            s.close()
+
+    def test_step50_without_agent_handoffs_still_upgrades(self, tmp_path: Path) -> None:
+        """agent_handoffs 是懒建表：老库可能还没有——升级不该炸，也没法硬补列。"""
+        s = Store(tmp_path / "v50noh.db")
+        try:
+            _run_steps(s, 50)
+            assert "agent_handoffs" not in _tables(s)
+            assert s.migrate() == 51
+            assert "agent_handoffs" not in _tables(s)  # 不替它建表
+            assert "settings_changes" in _tables(s)
+        finally:
+            s.close()
+
+    def test_step51_rerun_is_idempotent(self, tmp_path: Path) -> None:
+        s = Store(tmp_path / "twice51.db")
+        try:
+            s.migrate()
+            store_mod._m_observability_and_notes(s.read())
+            store_mod._m_observability_and_notes(s.read())
+            assert "first_token_ms" in {c[0] for c in _columns(s, "model_calls")}
+            assert "settings_changes" in _tables(s)
         finally:
             s.close()

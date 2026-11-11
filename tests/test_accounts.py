@@ -21,7 +21,7 @@ def test_norm_account() -> None:
 
 def test_default_admin_is_platform_form() -> None:
     s, _ = load_settings({})
-    assert s.approval.admins == ("qq:100000001",)
+    assert s.approval.admins == ()
 
 
 def test_config_lists_normalized_and_bad_reported() -> None:

@@ -31,7 +31,7 @@ from .maiwork.config import (
 logger = logging.getLogger("maiwork")
 
 PLUGIN_ID = "chartyr.maiwork"
-PLUGIN_VERSION = "0.16.1"
+PLUGIN_VERSION = "0.17.0"
 
 __all__ = [
     "PLUGIN_ID",
