@@ -1,12 +1,9 @@
-"""资讯候选「补打开」测试（2026-09-29 用户定：主流程派一个子 agent 去打开、抓正文并核对，核对用子 agent 模型）。
+"""资讯候选原文直接打开与核对测试（2026-11 零子 agent 改版）：
 
-背景（线上实测 2026-09-28 23:39 那轮）：找资讯的子 agent 15 分钟时间盒到点，只看过搜索摘要的
-3 条交了回来（fetched=false），被第一道「原文没打开过/打不开」全扔，那轮一条没发。
-
-现在：第一道之前，把「没打开过」+「说打开过但这轮没有打开记录」的候选一批交给一个补打开子 agent：
-- 它用 fetch_page 打开原文（打不开可以 web_search 找同一件事的别的来源，换了就改 url）；
-- 对照原文核对：摘要站不站得住（站不住 drop）、按原文重写摘要和原文依据、填发布时间、判旧闻（stale）；
-- 代码只认它**真打开过**的链接（查这次补打开的 fetch_page 记录），嘴上说 keep 但没打开的照旧按没打开淘汰。
+日常不再派 `feeds-verify:` / `feeds-recheck:` 子 agent，所有搜索挑出的候选与 RSS 条目
+一律由 `feeds._open_candidates` 直接调 `fetch_page` 打开原文、换用跳转 `final_url`、
+提取页面发布日期并绑定正文证据；内容支撑、质量与新旧分别由 `_score` 与 `_hard_reject_*` 判定。
+同时保留对 `news_recheck.opened_links`（`fetch_page` 与扩展抓正文工具记录解析）的单元测试。
 """
 
 from __future__ import annotations
@@ -157,29 +154,29 @@ def _setup(tmp_path, items, steps, *, scores=None):
 
 
 def test_unopened_item_is_opened_checked_and_kept(tmp_path) -> None:
+    c0 = _cand(0, title="只看过摘要的新闻", url="https://news.a.com/1")
+    c0["summary"] = "搜索摘要里的一句"
     items = [
-        _cand(0, title="只看过摘要的新闻", url="https://news.a.com/1", fetched=False, quote="搜索摘要里的一句"),
+        c0,
         _cand(1, title="真打开过的新闻", url="https://news.b.com/2"),
     ]
     steps = [
-        {"report": _ok({"items": items}), "open": ["https://news.b.com/2"], "search": True},
-        {"report": _ok({"items": [_verdict(0, "https://news.a.com/1")]}), "open": ["https://news.a.com/1"]},
+        {"report": _ok({"items": items}), "search": True},
     ]
     store, feeds, workers, _ = _setup(tmp_path, items, steps)
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 2
     assert len(_accepted(_rows(store))) == 2
-    # 补打开只派了一次，只带没打开过的那条（两阶段恒生效：前面还多撒网 + 核验两个环节）
-    recheck_calls = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-recheck:")]
-    assert len(recheck_calls) == 1
-    rc = recheck_calls[0]
-    assert str(rc["task_id"]).startswith("feeds-recheck:")
-    assert set(rc["tools"]) == {"fetch_page", "web_search"}
-    assert rc["deadline_ts"] and rc["deadline_ts"] > NOW
-    assert "https://news.a.com/1" in rc["brief"]
-    assert "https://news.b.com/2" not in rc["brief"]
-    assert "首页" in rc["brief"]  # 叮嘱别开首页 / 列表页
-    assert "今天" in rc["brief"]  # 给了今天的日期（判旧闻要用）
+    assert workers.calls == []
+    from CharTyr_MaiWork.maiwork.news_recheck import opened_links
+
+    tid_rows = store.read().execute(
+        "SELECT DISTINCT task_id FROM tool_calls WHERE tool='fetch_page' AND ok=1"
+    ).fetchall()
+    assert len(tid_rows) == 1
+    opened, records = opened_links(store, str(tid_rows[0]["task_id"]))
+    assert records >= 2
+    assert "news.a.com/1" in opened and "news.b.com/2" in opened
 
 
 def test_says_keep_but_never_opened_is_still_rejected(tmp_path) -> None:
@@ -195,44 +192,41 @@ def test_says_keep_but_never_opened_is_still_rejected(tmp_path) -> None:
 
 
 def test_drop_when_page_does_not_support_it(tmp_path) -> None:
-    items = [_cand(0, title="标题党", url="https://news.a.com/1", fetched=False)]
+    items = [_cand(0, title="标题党", url="https://news.a.com/1")]
     steps = [
         {"report": _ok({"items": items}), "search": True},
-        {"report": _ok({"items": [_verdict(0, "https://news.a.com/1", verdict="drop", reason="原文没提这件事")]}),
-         "open": ["https://news.a.com/1"]},
     ]
-    store, feeds, _, _ = _setup(tmp_path, items, steps)
+    scores = _scores_json(_score(0, junk=True, junk_reason="原文没提这件事"))
+    store, feeds, workers, _ = _setup(tmp_path, items, steps, scores=scores)
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 0
     reason = _rej_reason(_rows(store), "news.a.com") or ""
-    assert "补打开核对" in reason and "原文没提这件事" in reason
+    assert "原文没提这件事" in reason
+    assert workers.calls == []
 
 
 def test_stale_news_rejected(tmp_path) -> None:
-    """线上真例：9 月 26 日转发的公告，正文说「争取 9 月 20 日上线」——事情已经过去了。"""
-    items = [_cand(0, title="发售时间的重要更新", url="https://news.a.com/1", fetched=False)]
+    """线上真例：搜索结果没带日期，打开原文后页面读出过旧发布时间 → 按旧闻拒。"""
+    item = _cand(0, title="发售时间的重要更新", url="https://news.a.com/1", published=None)
+    item["page_published"] = "2026-09-10"
     steps = [
-        {"report": _ok({"items": items}), "search": True},
-        {"report": _ok({"items": [_verdict(0, "https://news.a.com/1", stale=True,
-                                            reason="正文说争取 9 月 20 日上线，已经过去")]}),
-         "open": ["https://news.a.com/1"]},
+        {"report": _ok({"items": [item]}), "search": True},
     ]
-    store, feeds, _, _ = _setup(tmp_path, items, steps)
+    store, feeds, _, _ = _setup(tmp_path, [item], steps)
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 0
     reason = _rej_reason(_rows(store), "news.a.com") or ""
-    assert "旧闻" in reason and "9 月 20 日" in reason
+    assert "旧闻" in reason
 
 
 def test_replaced_source_is_used(tmp_path) -> None:
-    """原链接打不开，子 agent 找了同一件事的别的来源并打开了 → 用新链接。"""
-    items = [_cand(0, title="换个来源", url="https://blocked.a.com/1", fetched=False)]
+    """打开时跳转到同一件事的最终地址 → 用新链接入库。"""
+    item = _cand(0, title="换个来源", url="https://short.a.com/1")
+    item["original_url"] = "https://other.b.com/same-story"
     steps = [
-        {"report": _ok({"items": items}), "search": True},
-        {"report": _ok({"items": [_verdict(0, "https://other.b.com/same-story")]}),
-         "open": ["https://other.b.com/same-story"]},
+        {"report": _ok({"items": [item]}), "search": True},
     ]
-    store, feeds, _, _ = _setup(tmp_path, items, steps)
+    store, feeds, _, _ = _setup(tmp_path, [item], steps)
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 1
     acc = _accepted(_rows(store))
@@ -240,24 +234,26 @@ def test_replaced_source_is_used(tmp_path) -> None:
 
 
 def test_claimed_opened_but_no_record_gets_rechecked(tmp_path) -> None:
-    """子 agent 说 fetched=true，但这轮的打开记录里没有这个链接 → 也补打开核对。"""
+    """代码直接逐条调 fetch_page 打开两条候选并留痕，不再派 feeds-recheck: 子 agent。"""
     items = [
         _cand(0, title="说打开过其实没有", url="https://news.a.com/1", fetched=True),
         _cand(1, title="真打开过", url="https://news.b.com/2", fetched=True),
     ]
     steps = [
-        {"report": _ok({"items": items}), "open": ["https://news.b.com/2"], "search": True,
-         # 真打开过的那条，把「这轮打开过」记到 collect 名义下（补打开的 probe 只查它）
-         "collect_open": ["https://news.b.com/2"]},
-        {"report": _ok({"items": [_verdict(0, "https://news.a.com/1")]}), "open": ["https://news.a.com/1"]},
+        {"report": _ok({"items": items}), "search": True},
     ]
     store, feeds, workers, _ = _setup(tmp_path, items, steps)
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 2
-    # 嘴上说 opened、没留记录的也照样派去补打开
-    recheck_calls = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-recheck:")]
-    assert len(recheck_calls) == 1
-    assert "https://news.a.com/1" in str(recheck_calls[0]["brief"])
+    assert workers.calls == []
+    fetched_inputs = {
+        str(r["input"])
+        for r in store.read().execute(
+            "SELECT input FROM tool_calls WHERE tool='fetch_page' AND ok=1"
+        ).fetchall()
+    }
+    assert "https://news.a.com/1" in fetched_inputs
+    assert "https://news.b.com/2" in fetched_inputs
 
 
 def test_final_url_counts_as_opened(tmp_path) -> None:
@@ -304,11 +300,10 @@ def test_recheck_failure_does_not_break_the_round(tmp_path) -> None:
 
 
 def test_batch_stats_count_recheck_pages(tmp_path) -> None:
-    """网页上「看了几篇」要把补打开的也算进去。"""
-    items = [_cand(0, title="只看过摘要", url="https://news.a.com/1", fetched=False)]
+    """网页上「看了几篇」要把代码直接 fetch_page 打开成功的算进去。"""
+    items = [_cand(0, title="只看过摘要", url="https://news.a.com/1")]
     steps = [
         {"report": _ok({"items": items}), "search": True},
-        {"report": _ok({"items": [_verdict(0, "https://news.a.com/1")]}), "open": ["https://news.a.com/1"]},
     ]
     store, feeds, _, _ = _setup(tmp_path, items, steps)
     with _TimePatch():

@@ -191,8 +191,9 @@ def _round_feeds(store, settings, agents, monkeypatch, *, outcome: str):
         return []
 
     async def _collect(gid, focus, s, *, collect_mark, stats_out):
-        await feeds._run_stage(gid, phase="verify", brief="核验", task_id=f"{collect_mark}:v",
-                               tools=["fetch_page"])
+        # 零子 agent 改版后 news 剩下的唯一子 agent 环节是补找（supplement）
+        await feeds._run_stage(gid, phase="supplement", brief="补找", task_id=f"{collect_mark}:s",
+                               tools=["web_search", "fetch_page"])
         if outcome == "no_candidates":
             return []
         return [{
@@ -200,9 +201,6 @@ def _round_feeds(store, settings, agents, monkeypatch, *, outcome: str):
             "url_key": "example.com/a", "kind": "news", "why": "群里在聊显卡",
             "published_ts": clock.now(),
         }]
-
-    async def _recheck(st, runner, gid, candidates, **kw):
-        await feeds._recheck_run(gid, kw["recheck_mark"], "重看这几条", group_id=gid)
 
     async def _score(gid, s, survivors, *, task_id=""):
         for it in survivors:
@@ -217,8 +215,7 @@ def _round_feeds(store, settings, agents, monkeypatch, *, outcome: str):
     monkeypatch.setattr(feeds, "_collect_rss", _rss)
     monkeypatch.setattr(feeds, "_collect_two_phase", _collect)
     monkeypatch.setattr(feeds, "_merge_rss_candidates", lambda *a, **k: 0)
-    monkeypatch.setattr(news_recheck, "recheck", _recheck)
-    monkeypatch.setattr(feeds, "_hard_reject_code", lambda gid, s, c: list(c))
+    monkeypatch.setattr(feeds, "_hard_reject_code", lambda gid, s, c, **_kw: list(c))
     monkeypatch.setattr(feeds, "_score", _score)
     monkeypatch.setattr(feeds, "_hard_reject_model", lambda *a, **k: None)
     monkeypatch.setattr(feeds, "_resolve_dup_in_batch", lambda *a, **k: None)
@@ -238,10 +235,10 @@ async def test_news_round_published_posts_notes(store, settings, agents, monkeyp
     assert kept == 1
     batch = store.read().execute("SELECT kept, skipped FROM news_batches WHERE group_id=?", (G1,)).fetchone()
     assert (batch["kept"], batch["skipped"]) == (1, 0)
-    assert len(sp.hids) == 2  # 核验 + 补打开两张 news 交接单
+    assert len(sp.hids) == 1  # 零子 agent 改版后只剩补找（supplement）一张 news 交接单
     assert all(agents.handoff(G1, h)["status"] == "accepted" for h in sp.hids)
     board = _board(store)
-    assert sorted(b for _, b, _ in board) == ["recheck 环节留的便条", "verify 环节留的便条"]
+    assert sorted(b for _, b, _ in board) == ["supplement 环节留的便条"]
     assert {h for _, _, h in board} == set(sp.hids)
     assert all(f == "news" for f, _, _ in board)
 

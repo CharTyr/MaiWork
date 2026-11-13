@@ -83,23 +83,26 @@ def test_all_chunks_failed_keeps_every_candidate_record(tmp_path) -> None:
     数据形状对齐线上 #199（found 12 / kept 0 / skipped 1；survivors 8 是日志推断，
     这里用假数据把 12–8=4 条先被第一道拒掉的候选造清楚）。
     """
+    from CharTyr_MaiWork.maiwork.feeds import blocked_domains_set
+    from test_feeds_freshness import FakeWorkers
+
     items = _search_items(12)
     # 先被第一道（代码侧硬淘汰）拒掉的 4 条：理由各不相同，后面一条都不许被覆盖
-    items[1].update(fetched=False, quote="")                # 原文没打开过
-    items[3].update(quote="")                               # 打开过但没有原文依据
-    items[5].update(paywall=True)                           # 原文要登录 / 付费
-    items[7]["published"] = 1_790_000_000.0 - 10 * 86400   # 旧闻（> _NEWS_MAX_AGE_DAYS=7 天）
+    items[1].update(fetched=False, quote="")                               # 原文没打开过/打不开
+    items[3].update(body="《空壳页》\n首页 | 登录", summary="", quote="")  # 正文依据不足
+    items[5].update(original_url="https://blocked.example.com/a")          # 跳转落回屏蔽域名
+    items[7]["published"] = 1_790_000_000.0 - 10 * 86400                   # 旧闻（> _NEWS_MAX_AGE_DAYS=7 天）
     expected_hard = {
         items[1]["title"]: "原文没打开过",
-        items[3]["title"]: "原文没打开过",
-        items[5]["title"]: "原文要登录/付费",
+        items[3]["title"]: "正文依据不足",
+        items[5]["title"]: "来源在屏蔽名单里",
         items[7]["title"]: "旧闻",
     }
     models = FakeModelsQueue(ready=True, replies=[_FOCUS_JSON, ModelError(_451)])
-    from test_feeds_freshness import FakeWorkers
 
     store, _settings, feeds, models, _workers, topics, _profiles = _make_feeds(
         tmp_path, models=models, workers=FakeWorkers(_ok_report({"items": items})))
+    blocked_domains_set(store, GID, ["blocked.example.com"])
     # 12 条要真走到打分：粗筛有「一个方向最多占 40%」的均衡上限，12 条挤在一个方向会被削到 10；
     # 分给两个方向（8+4）就照实留下 12 条。再把「挑」的占位回复换成真挑满 12 条。
     patch_two_phase_feeds(feeds, models, {1: items[:8], 2: items[8:]})

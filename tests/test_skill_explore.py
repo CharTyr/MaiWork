@@ -162,6 +162,10 @@ def _set_state(store, gid, **kv):
 
 
 class TestThrottle:
+    async def test_attempt_gap_is_24h(self):
+        """尝试间隔 = 24h（失败 / 跳过 / 门槛不过都按天节流，不再几小时一撞）。"""
+        assert skill_explore.EXPLORE_ATTEMPT_GAP_S == 24 * 3600
+
     async def test_skips_when_last_run_within_24h(
         self, store, settings, env, tools, agents
     ):
@@ -173,21 +177,22 @@ class TestThrottle:
         assert out["ran"] is False
         assert models.calls == [] and workers.calls == []
 
-    async def test_skips_when_last_attempt_within_4h(
+    async def test_skips_when_last_attempt_within_24h(
         self, store, settings, env, tools, agents
     ):
+        """距上次失败尝试 23h < 24h：跳过，连选题模型都不调。"""
         workers = CaptureWorkers()
         models = ModelsQueue(replies=[_PICK])
-        _set_state(store, GID, last_attempt=NOW - 3600)
+        _set_state(store, GID, last_attempt=NOW - 23 * 3600)
         out = await skill_explore.run(**_run_kwargs(
             store, settings, env, tools, agents, workers, models=models))
         assert out["ran"] is False
         assert models.calls == [] and workers.calls == []
 
-    async def test_runs_again_after_4h_attempt_gap(
+    async def test_runs_again_after_24h_attempt_gap(
         self, store, settings, env, tools, agents
     ):
-        """距上次失败 ≥4h：可以再试。"""
+        """距上次失败 ≥24h：可以再试。"""
         workers = CaptureWorkers(reports=[_report(data={
             "skill_markdown": _VALID_MD,
             "source_url": "skills.sh/csv-quick-preview",
@@ -270,7 +275,7 @@ class TestPickAndRun:
             store, settings, env, tools, agents, workers, models=models))
         assert out["ran"] is False
         assert workers.calls == []
-        # skip 也算一次尝试（4 小时后可再来），不算成功
+        # skip 也算一次尝试（24 小时后可再来），不算成功
         st = _state(store, GID)
         assert st.get("last_attempt") == NOW and "last_run" not in st
 

@@ -53,7 +53,10 @@ class TestGuideAgeCap:
         """guide 没有发布时间 → 硬拒「文章没有发布时间，宁缺毋滥不收」。"""
         _store, settings, feeds, models, workers, topics, _p = _make_feeds(
             tmp_path,
-            models=FakeModelsQueue(ready=True, replies=[_FOCUS_JSON]),
+            models=FakeModelsQueue(ready=True, replies=[
+                _FOCUS_JSON,
+                _scores_json(_score(0, topic="教程")),
+            ]),
             workers=FakeWorkers(_ok_report({"items": [
                 _guide(0, published=""),
             ]})),
@@ -306,7 +309,9 @@ class TestGuideSecondGate:
 
 class TestGuideBrief:
     def test_collect_brief_mentions_guide_criteria(self, tmp_path) -> None:
-        """子 agent brief 里写明 guide 的收录标准（教程/指南/深度分析才收，60 天内）。"""
+        """零子 agent 改版后，guide 收录标准（教程/指南/深度分析才收，60 天内）进打分提示词。"""
+        from test_feeds_freshness import _score_prompt
+
         _store, settings, feeds, models, workers, topics, _p = _make_feeds(
             tmp_path,
             models=FakeModelsQueue(ready=True, replies=[
@@ -318,8 +323,9 @@ class TestGuideBrief:
         )
         with _TimePatch():
             _run(feeds.prepare_news(GID))
-        brief = str(workers.calls[0]["brief"])
-        assert "60" in brief or "天" in brief
-        assert "教程" in brief or "指南" in brief or "文章" in brief
+        assert workers.calls == []
+        prompt = _score_prompt(models)
+        assert "60" in prompt
+        assert "教程" in prompt or "指南" in prompt or "文章" in prompt
 
 

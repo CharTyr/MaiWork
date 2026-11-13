@@ -7,7 +7,8 @@
 - 搜索不可用（SearchUnavailable：没配置或暂时坏）但本群有启用的 RSS 源 → 照常取 RSS，
   跳过撒网（_collect_two_phase），走 RSS-only 一轮；硬淘汰 / 打分 / 隐私 / 去重不放宽；
   定关注点（_plan_focus 只服务撒网）跳过省 token；
-  补打开照走（2026-10-05 §九 第一步 3：RSS 条目也要过内容核验，只派这一个子 agent）；
+  RSS 原文照开（2026-10-05 §九 第一步 3：RSS 条目也要过内容核验；2026-11 零子 agent
+  改版后由主流程代码 fetch_page，不派子 agent）；
   批次统计里带 source_mode="rss_only"，网页能看出这一轮是 RSS-only。
 - 搜索可用 → 原逻辑。
 - 两者都不可用（没搜索且没订 RSS）→ 仍 _skipped_batch，原因准确；
@@ -79,7 +80,7 @@ class _BrokenSearch:
 
 
 class FakeWorkers:
-    """假 workers.run：记录调用；RSS-only 轮里只该派补打开（撒网 / 核验都不派）。"""
+    """假 workers.run：记录调用（2026-11 零子 agent 改版后一轮里一次都不该派）。"""
 
     def __init__(self, store: Any = None) -> None:
         self.calls: List[Dict[str, Any]] = []
@@ -91,8 +92,8 @@ class FakeWorkers:
 
         task_id = str(kwargs.get("task_id") or "")
         if self.store is not None and task_id.startswith("feeds-recheck:"):
-            # 补打开真打开了 RSS 原文（正文里有 quote）：只有这样 RSS 条目才过第一道
-            return fixture_recheck_keep(self.store, brief, task_id, _QUOTE)
+            # 补打开子 agent 已删——还按老路派工直接断言失败
+            raise AssertionError("零子 agent 改版后 RSS 打开原文不该派 feeds-recheck: 子 agent")
         return WorkerReport(ok=True, summary="好", data={"items": []}, evidence=[], steps=1)
 
 
@@ -168,7 +169,12 @@ def _posts_json(*posts: dict) -> str:
 
 
 def _make_feeds(tmp_path, *, models=None, search=None) -> tuple:
-    """构造一个 Feeds：画像已 ready、专岗没接（None=老路）。搜索默认给「没配置」桩。"""
+    """构造一个 Feeds：画像已 ready、专岗没接（None=老路）。搜索默认给「没配置」桩。
+
+    2026-11 零子 agent 改版：打开原文不派子 agent——主流程代码 fetch_page（fixture 版：
+    预置外的链接回带 _QUOTE 的正文，RSS 条目自报的 quote 对得上）。"""
+    from fakes import make_fixture_page_tools
+
     store = Store(tmp_path / "t.db")
     store.migrate()
     with store.tx() as conn:
@@ -185,6 +191,8 @@ def _make_feeds(tmp_path, *, models=None, search=None) -> tuple:
     topics = FakeTopics()
     feeds = Feeds(store, models, workers, profiles, topics, lambda: settings,
                   search=search if search is not None else _UnavailableSearch())
+    # fixture fetch_page：RSS 候选链接不在预置里 → 正文带 _QUOTE（RSS 自报的 quote 照旧能对上）
+    feeds.set_tools(make_fixture_page_tools(store, default_rss_quote=_QUOTE))
     return store, settings, feeds, models, workers, topics
 
 
@@ -233,11 +241,13 @@ async def test_rss_only_without_search_configured(tmp_path) -> None:
     purposes = [str(k.get("purpose") or "") for _r, _m, k in models.calls]
     assert "feeds.focus" not in purposes, "RSS-only 不该花定关注点的 token"
     assert "feeds.pick" not in purposes, "RSS-only 不该有挑这步"
-    # 不撒网 / 不定关注点 / 不核验，只派一次补打开（2026-10-05 §九 第一步 3：
-    # RSS 条目的 quote 只是源摘要，没真打开过原文核对）
-    assert len(workers.calls) == 1, f"RSS-only 只该派一次补打开：{workers.calls}"
-    assert str(workers.calls[0]["task_id"]).startswith("feeds-recheck:")
-    assert "https://ok.example.com/fresh" in str(workers.calls[0]["brief"])
+    # 零子 agent 改版：RSS 条目的原文由主流程代码 fetch_page 真打开（RSS 条目的 quote
+    # 只是源摘要，没真打开过原文核对），一次子 agent 都不派
+    assert workers.calls == [], f"RSS-only 不该派任何子 agent：{workers.calls}"
+    fetched = store.read().execute(
+        "SELECT * FROM tool_calls WHERE tool='fetch_page'").fetchall()
+    assert any("https://ok.example.com/fresh" in str(r["input"]) for r in fetched), \
+        f"RSS 原文要真打开：{[dict(r) for r in fetched]}"
     # 打分、写帖照走（不放宽）
     assert "feeds.score" in purposes and "feeds.post" in purposes
     # 批次统计看得出这一轮是 RSS-only

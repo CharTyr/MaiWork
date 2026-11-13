@@ -98,17 +98,21 @@ def _env(tmp_path):
 
 @pytest.mark.asyncio
 async def test_no_skill_tools_identical_list_no_workspace(store, tmp_path, skills):
-    """没做法声明工具：名单与今天逐字一致、不给 workspace、提示无做法段。"""
+    """没做法声明工具：名单与今天逐字一致、不给 workspace、提示无做法段。
+
+    2026-11 零子 agent 改版：news 的 verify / recheck 环节已删，news 剩 supplement
+    （基础名单空 → 这轮只剩 submit_result；主流程开原文不再需要子 agent 工具）。
+    """
     agents = FakeAgents()
     agents.update_profile("news", {"skills": []})
     workers = RecWorkers()
     sp = Specialists(agents, workers, skills, env=_env(tmp_path), tools=_tools(store))
-    report = await sp.run_auto("news", "核对", phase="verify", group_id="900000001",
-                               task_id="feeds-verify:x", actor="资讯核验")
+    report = await sp.run_auto("news", "补找", phase="supplement", group_id="900000001",
+                               task_id="feeds-collect:x", actor="资讯补找")
     assert report.ok is True
     call = workers.calls[0]
-    assert call["tools"] == ["fetch_page", "submit_result"]
-    assert call["allowed_tools"] == ("fetch_page", "submit_result")
+    assert call["tools"] == ["submit_result"]
+    assert call["allowed_tools"] == ("submit_result",)
     assert call["workspace"] is None
     assert "做法" not in (call["system_extra"] or "")
     assert not list(tmp_path.glob("ws/rr-*")), "没要工作区的回合绝不建临时工作区"
@@ -126,7 +130,8 @@ async def test_phase_lists_match_auto_phases(store, tmp_path, skills):
         agents._profiles[k]["tools"] = factory9
     workers = RecWorkers()
     sp = Specialists(agents, workers, skills, env=_env(tmp_path), tools=_tools(store))
-    for kind, phase in (("news", "verify"), ("news", "recheck"),
+    # 2026-11 零子 agent 改版：news 的 verify / recheck 环节已删，news 只剩 supplement
+    for kind, phase in (("news", "supplement"),
                         ("idea", "investigate"), ("goal", "check")):
         workers.calls.clear()
         await sp.run_auto(kind, "b", phase=phase, group_id="900000001")

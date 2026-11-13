@@ -321,17 +321,24 @@ def _end_to_end(tmp_path, items, *, seed_published: list | None = None,
     return store, settings, feeds, models, workers
 
 
-# ---- 事 3.1：核验按内容筛 ----
+# ---- 事 3.1：按内容筛（2026-11 零子 agent 改版：原核验子 agent 的质量闸并进打分 ----
+# junk / junk_reason 字段，理由格式照旧「垃圾：<大白话>」）
 
 
 def test_verify_quality_false_water_is_rejected_with_plain_reason(tmp_path) -> None:
-    """核验交 quality=false + 「水文：没有新信息」→ 这条被拒进被拒列表，理由照搬大白话。"""
+    """打分判 junk + 「水文：没有新信息」→ 这条被拒进被拒列表，理由照搬大白话。"""
     items = [
-        _quality_cand(0, url="https://portal.163.com/article/water1",
-                      quality=False, quality_reason="水文：没有新信息", title="门户水文一篇"),
-        _quality_cand(1, url="https://pcgamer.com/real-story", quality=True, title="真材实料的报道"),
+        _quality_cand(0, url="https://portal.163.com/article/water1", title="门户水文一篇"),
+        _quality_cand(1, url="https://pcgamer.com/real-story", title="真材实料的报道"),
     ]
-    store, settings, feeds, models, workers = _end_to_end(tmp_path, items)
+    scores = _scores_json(
+        dict(_score(0), junk=True, junk_reason="水文：没有新信息"),
+        _score(1, topic="话题1"),
+    )
+    store, settings, feeds, models, workers, topics, _ = _make_feeds(
+        tmp_path, items=items, scores=scores,
+    )
+    gid = GID
     with _TimePatch():
         got = _run(feeds.prepare_news(GID))
     assert got == 1
@@ -348,12 +355,16 @@ def test_verify_quality_false_water_is_rejected_with_plain_reason(tmp_path) -> N
 def test_verify_quality_false_republish_and_rewrite_reasons_kept(tmp_path) -> None:
     """低质转载 / 洗稿的理由同样进被拒列表（大白话、能指认改写自谁）。"""
     items = [
-        _quality_cand(0, url="https://news.qq.com/repub1", quality=False,
-                      quality_reason="低质转载：整段搬运，没注明出处", title="门户转载一篇"),
-        _quality_cand(1, url="https://gamersky.com/rewrite1", quality=False,
-                      quality_reason="洗稿：改写自 IGN 的报道", title="洗稿一篇"),
+        _quality_cand(0, url="https://news.qq.com/repub1", title="门户转载一篇"),
+        _quality_cand(1, url="https://gamersky.com/rewrite1", title="洗稿一篇"),
     ]
-    store, settings, feeds, models, workers = _end_to_end(tmp_path, items)
+    scores = _scores_json(
+        dict(_score(0), junk=True, junk_reason="低质转载：整段搬运，没注明出处"),
+        dict(_score(1), junk=True, junk_reason="洗稿：改写自 IGN 的报道"),
+    )
+    store, settings, feeds, models, workers, topics, _ = _make_feeds(
+        tmp_path, items=items, scores=scores,
+    )
     with _TimePatch():
         got = _run(feeds.prepare_news(GID))
     assert got == 0
@@ -385,32 +396,35 @@ def test_verify_without_quality_field_passes(tmp_path) -> None:
 
 
 def test_verify_brief_has_quality_rules_and_portal_hint(tmp_path) -> None:
-    """核验 brief：按内容判水文 / 低质转载 / 洗稿的规矩 + 门户「打开时重点看」的提示，
-    「这类站更常见这些问题」绝不能写成黑名单口吻。"""
+    """质量闸并进打分提示词（核验 brief 已删）：按内容判水文 / 低质转载 / 洗稿的规矩 +
+    门户「打开时重点看」的提示，「这类站更常见这些问题」绝不能写成黑名单口吻。"""
     items = [_quality_cand(0, url="https://example.com/x", title="占位")]
     store, settings, feeds, models, workers = _end_to_end(tmp_path, items)
     with _TimePatch():
         _run(feeds.prepare_news(GID))
-    briefs = [str(c["brief"]) for c in workers.calls
-              if str(c.get("task_id") or "").startswith("feeds-verify:")]
-    assert briefs, "核验子 agent 没被派"
-    text = "\\n".join(briefs)
-    for word in ("水文", "低质转载", "洗稿", "找到原始出处", "重点看"):
+    assert workers.calls == [], "零子 agent 改版后没有核验子 agent"
+    from test_feeds_quality import _score_prompt
+
+    text = _score_prompt(models)
+    for word in ("水文", "低质转载", "洗稿", "原始出处", "门户", "重点"):
         assert word in text, word
     assert "163" in text and "gamersky" in text  # 门户 / 导购站的名字只是「重点看」的例子
     assert "blacklist" not in text and "黑名单" not in text
 
 
 def test_recheck_brief_has_quality_rules(tmp_path) -> None:
-    """补打开 brief 也按内容筛：换来源时优先原文链接。"""
-    items = [_quality_cand(0, url="https://example.com/x", fetched=False, title="没打开")]
+    """RSS-only 轮（补打开的老场景）也走同一个打分提示词：按内容筛的规矩一处不漏。"""
+    items = [
+        _quality_cand(0, url="https://example.com/x", fetched=False, title="没打开"),
+        _quality_cand(1, url="https://example.com/y", title="正常一条"),
+    ]
     store, settings, feeds, models, workers = _end_to_end(tmp_path, items)
     with _TimePatch():
         _run(feeds.prepare_news(GID))
-    briefs = [str(c["brief"]) for c in workers.calls
-              if str(c.get("task_id") or "").startswith("feeds-recheck:")]
-    assert briefs, "补打开子 agent 没被派"
-    text = "\\n".join(briefs)
+    assert workers.calls == [], "零子 agent 改版后没有补打开子 agent"
+    from test_feeds_quality import _score_prompt
+
+    text = _score_prompt(models)
     for word in ("水文", "低质转载", "洗稿"):
         assert word in text, word
 
@@ -465,31 +479,15 @@ def test_verify_swapped_link_hitting_recently_rejected_is_rejected_immediately(t
 
 
 def test_recheck_swapped_link_hitting_published_is_rejected_immediately(tmp_path) -> None:
-    """补打开换源换到「最近已发布」的同链接 → 立刻拒，不再让它进打分。"""
+    """打开原文跳转 / 换源换到「最近已发布」的同链接 → 立刻拒，不再让它进打分。
+
+    零子 agent 改版：fetch_page 的 final_url（转载页认出的原文链接）走同一套
+    「换链接后立刻再查一次重」——预置 original_url 模拟 fixture 回 final_url。
+    """
     dup_key = _normalize_url("https://other.b.com/same-story")
-    items = [_quality_cand(0, url="https://blocked.a.com/1", fetched=False, title="补打开换源")]
+    items = [_quality_cand(0, url="https://blocked.a.com/1",
+                           original_url="https://other.b.com/same-story", title="打开换源")]
     store, settings, feeds, models, workers = _end_to_end(tmp_path, items, seed_published=[dup_key])
-    # 补打开子 agent 交回：换成已发布过的链接
-    from CharTyr_MaiWork.maiwork.workers import WorkerReport as _WR
-    steps_report = _WR(ok=True, summary="好了", data={"items": [{
-        "index": 0, "verdict": "keep", "url": "https://other.b.com/same-story",
-        "summary": "重写的摘要，两三句。", "quote": "原文里的一句话。", "published": "2026-09-24",
-        "stale": False, "reason": "",
-    }]}, evidence=[], steps=2)
-    # _make_feeds 的 fake workers 只回放一份 report（核验）；补打开那份要换——直接 monkeypatch
-    real_run = workers.run
-    state = {"n": 0}
-
-    async def _run2(brief, **kw):
-        tid = str(kw.get("task_id") or "")
-        if tid.startswith("feeds-recheck:"):
-            # 补打开打开新链接
-            from test_news_recheck import _log_fetch
-            _log_fetch(store, tid, "https://other.b.com/same-story")
-            return steps_report
-        return await real_run(brief, **kw)
-
-    workers.run = _run2  # type: ignore[assignment]
     with _TimePatch():
         got = _run(feeds.prepare_news(GID))
     assert got == 0

@@ -122,16 +122,19 @@ class TestInjectedIntoPrompts:
         )
         with _TimePatch():
             _run(feeds.prepare_news(GID))
-        # 两阶段恒生效：文章/资讯的分寸在核验子 agent 的 brief 里；撒网（2026-10-01 起
-        # 代码按计划搜）不再派子 agent——「怎么找」那套在定关注点的提示词里。
+        # 2026-11 零子 agent 改版：撒网与核验都不再派子 agent；文章/资讯分寸进 feeds.score 提示词，
+        # 「怎么找 / 跳一步」进 feeds.focus 提示词。
         by_mark = lambda p: "\n".join(
             str(c["brief"]) for c in workers.calls if str(c.get("task_id") or "").startswith(p))
-        verify_briefs = by_mark("feeds-verify:")
-        assert by_mark("feeds-discover:") == ""  # 撒网不再派子 agent
-        assert news_standard.section("criteria", "文章") in verify_briefs
-        assert news_standard.section("finding", "找候选") in verify_briefs
+        assert by_mark("feeds-discover:") == ""
+        assert by_mark("feeds-verify:") == ""
         focus_prompt = str(models.calls[0][1][0]["content"])
+        assert news_standard.section("finding", "定关注点") in focus_prompt
         assert news_standard.section("finding", "跳一步") in focus_prompt
+        score_prompt = next(
+            str(msgs[0]["content"]) for _r, msgs, kw in models.calls if kw.get("purpose") == "feeds.score"
+        )
+        assert news_standard.section("criteria", "文章") in score_prompt
 
     def test_score_prompt_uses_standard(self, tmp_path) -> None:
         from fakes import FakeModelsQueue

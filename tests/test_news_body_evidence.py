@@ -1,4 +1,10 @@
-"""News must quote an actual article body fetched in this verification run."""
+"""News must quote an actual article body fetched in this verification run.
+
+2026-11 零子 agent 改版：没有核验 / 找料子 agent——主流程代码自己 fetch_page
+（群向 _open_candidates、个人向 Personal._collect Phase C，都走 verify_budget 账本
++ bind_pages 绑本轮真读到的正文），打分模型只写回 summary/quote/fetched，
+第一道硬拒（代码）+ 打分后硬复核（模型写回的 quote 逐字再核）照原样把关。
+"""
 from __future__ import annotations
 
 import httpx
@@ -13,10 +19,14 @@ from fakes import FakeModelsQueue, FakeProfiles
 from test_feeds_quality import GID, _make_feeds, _score, _scores_json
 from test_personal import UID, _make_personal
 
-URL = "https://example.com/article"
+URL = "https://example.com/articles/local-deploy-tool"  # 深路径，不是栏目 / 列表页
 TITLE = "开发者发布本地部署工具"
 BODY = "该工具现已开源，允许本地部署。免费版每天限用二十次。"
 QUOTE = "免费版每天限用二十次。"
+
+GROUP_MARK = "feeds-collect:test-body"
+FOCUS = [{"query": "本地部署工具",
+          "searches": [{"q": "本地部署工具", "site": "", "news": True, "kind": "news"}]}]
 
 
 def _item(**changes):
@@ -26,8 +36,87 @@ def _item(**changes):
     return item
 
 
+def _real_tools(store, settings, html: str) -> Tools:
+    """真 Tools + 内置工具，HTTP 用 MockTransport 喂给定 HTML（不碰公网）。"""
+    tools = Tools(store)
+    register_builtin(tools, search=None, profiles=FakeProfiles(),
+                     http_transport=httpx.MockTransport(lambda request: httpx.Response(
+                         200, headers={"content-type": "text/html"}, text=html)),
+                     get_settings=lambda: settings, resolver=lambda host: ["93.184.216.34"])
+    return tools
+
+
+def _candidate(item: dict) -> dict:
+    """「老格式」候选：_collect_two_phase 挑中后开原文前的样子（summary/quote 留空）。"""
+    from CharTyr_MaiWork.maiwork.feeds import _normalize_url, _source_site
+
+    url = str(item.get("url") or "")
+    return {
+        "title": str(item.get("title") or ""),
+        "url": url,
+        "url_key": _normalize_url(url),
+        "site": _source_site(url),
+        "kind": str(item.get("kind") or "news"),
+        "summary": "",
+        "quote": "",
+        "conditions": [],
+        "image_url": "",
+        "fetched": False,
+        "paywall": False,
+        "published_ts": item.get("published"),
+        "published_raw": item.get("published"),
+        "date_basis": "search",
+        "_hint_snippet": str(item.get("summary") or "")[:300],
+    }
+
+
+def _write_back(items: list[dict], src: dict) -> None:
+    """模拟打分环节写回：summary/quote/fetched/paywall 都信模型（证据仍用代码绑的）。"""
+    for it in items:
+        if it.get("reject"):
+            continue
+        it["summary"] = str(src.get("summary") or "")
+        it["quote"] = str(src.get("quote") or "")
+        it["fetched"] = src.get("fetched", True)  # 可能是字符串「false」，要照旧被拒
+        it["paywall"] = bool(src.get("paywall"))
+        it.setdefault("_flags", {})["grounded"] = True
+
+
+async def _collect(pipeline, tmp_path, item, html, *, no_open=False):
+    """零子 agent 流水线：代码 fetch_page → 第一道（代码）→ 打分写回 → 模型侧复核。
+
+    no_open=True 模拟「原文没打开过」（工具不装，候选没进打开环节）。
+    """
+    if pipeline == "group":
+        store, settings, owner, *_ = _make_feeds(tmp_path, items=[])
+        if not no_open:
+            owner.set_tools(_real_tools(store, settings, html))
+        else:
+            owner._tools = None
+        items = [_candidate(item)]
+        await owner._open_candidates(GID, items, task_id=GROUP_MARK)
+        owner._hard_reject_code(GID, settings, items, require_quote=False)
+        _write_back(items, item)
+        owner._hard_reject_model(items)
+        assert verify_budget._status(GROUP_MARK) is None, "账本要随这轮关掉"
+    else:
+        store, settings, owner, *_ = _make_personal(tmp_path, items=[item])
+        if not no_open:
+            owner.set_tools(_real_tools(store, settings, html))
+        else:
+            owner._tools = None
+        items = await owner._collect(GID, FOCUS, UID)
+        owner._hard_reject_code(GID, items, require_quote=False)
+        _write_back(items, item)
+        owner._hard_reject_model(items)
+        assert not [t for t in verify_budget._RUNS if t.startswith("personal-collect:")], \
+            "账本要随这轮关掉"
+    survivors = [c for c in items if not c.get("reject")]
+    return items, survivors
+
+
 class BodyWorkers:
-    """Real local fetch handler + preset verifier, without a model or public network."""
+    """Real local fetch handler + preset reporter, for stages still run via Workers."""
     def __init__(self, item, html, *, fetched_url=URL, fetch=True):
         self.item = item
         self.html = html
@@ -40,38 +129,13 @@ class BodyWorkers:
     async def run(self, brief, **kwargs):
         self.mark = kwargs["task_id"]
         if self.fetch:
-            # Headline/navigation-only pages may legitimately fail the fetch tool;
-            # the model can still claim fetched=true, and the gate must reject it.
             self.fetch_result = await self.tools.call("fetch_page", {"url": self.fetched_url}, ToolContext(
                 group_id=GID, task_id=self.mark, actor="test verifier", role="worker"))
-        return WorkerReport(True, "核验", data={"items": [dict(self.item)]})
+        return WorkerReport(True, "补打开", data={"items": [dict(self.item)]})
 
 
 def _wire_tools(store, settings, worker):
-    worker.tools = Tools(store)
-    register_builtin(worker.tools, search=None, profiles=FakeProfiles(),
-                     http_transport=httpx.MockTransport(lambda request: httpx.Response(
-                         200, headers={"content-type": "text/html"}, text=worker.html)),
-                     get_settings=lambda: settings, resolver=lambda host: ["93.184.216.34"])
-
-
-async def _collect(pipeline, tmp_path, item, html, **worker_opts):
-    worker = BodyWorkers(item, html, **worker_opts)
-    if pipeline == "group":
-        store, settings, owner, *_ = _make_feeds(tmp_path, items=[], workers=worker)
-        _wire_tools(store, settings, worker)
-        items, _ = await owner._verify_batch(GID, [(dict(item), "news", "核验")],
-                                          "feeds-verify:test:body", clock.now() + 60)
-        survivors = owner._hard_reject_code(GID, settings, items)
-    else:
-        store, settings, owner, *_ = _make_personal(tmp_path, workers=worker)
-        _wire_tools(store, settings, worker)
-        items = await owner._collect(GID, [], UID)
-        survivors = owner._hard_reject_code(GID, items)
-    assert verify_budget._status(worker.mark) is None
-    if worker.fetch and "<article>" in html:
-        assert worker.fetch_result.ok, worker.fetch_result.error
-    return items, survivors
+    worker.tools = _real_tools(store, settings, worker.html)
 
 
 @pytest.mark.asyncio
@@ -91,9 +155,10 @@ async def test_unsubstantiated_evidence_rejected(tmp_path, pipeline, case):
         item["quote"] = "首页 社区 商店 支持 登录"
         html = f"<html><title>{TITLE}</title><nav>{item['quote']}</nav><h1>{TITLE}</h1></html>"
     elif case == "unfetched":
-        opts["fetch"] = False
+        opts["no_open"] = True
     elif case == "other_page":
-        opts["fetched_url"] = "https://example.com/unrelated"
+        # 打开候选链接时服务端交的是另一篇文章：write_back 的 quote 对不上本轮正文
+        html = f"<html><title>另一篇完全无关的文档</title><article><p>{"这是另一篇文章的正文，和候选标题没有任何关系。" * 20}</p></article></html>"
     elif case == "wrong_type":
         item["fetched"] = "false"
     elif case == "only_title_admission":

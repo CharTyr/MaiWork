@@ -237,9 +237,13 @@ class TestWhitelist:
 
 class TestPhaseTools:
     def test_auto_phases_table(self):
-        """表里的环节名单 = 今天调用点写死的名单，逐字搬进来。"""
-        assert AUTO_PHASES[("news", "verify")] == ("fetch_page",)
-        assert AUTO_PHASES[("news", "recheck")] == ("fetch_page", "web_search")
+        """表里的环节名单 = 今天调用点写死的名单，逐字搬进来。
+
+        2026-11 零子 agent 改版：news 的 verify / recheck 环节已删
+        （打开原文由主流程代码直接 fetch_page），表里不再有它们。
+        """
+        assert ("news", "verify") not in AUTO_PHASES
+        assert ("news", "recheck") not in AUTO_PHASES
         assert AUTO_PHASES[("news", "supplement")] == ()
         assert AUTO_PHASES[("idea", "investigate")] == (
             "web_search", "social_search", "fetch_page", "read_profile",
@@ -253,7 +257,8 @@ class TestPhaseTools:
         agents.update_profile("idea", {"skills": []})
         sp = _sp(agents, FakeWorkers(), skills, tools=_tools(store, tmp_path))
         assert sp.phase_tools("idea", "investigate") == list(AUTO_PHASES[("idea", "investigate")])
-        assert sp.phase_tools("news", "verify") == ["fetch_page"]
+        # news/verify 环节已删：表里没有 → 基础名单空（没做法工具时整份空）
+        assert sp.phase_tools("news", "verify") == []
 
     def test_phase_tools_plus_granted_minus_task_only(self, store, tmp_path, skills):
         _mk_skill(tmp_path, "g", allowed="run_command generate_image mcp_x")
@@ -338,7 +343,8 @@ class TestDescribeTools:
         assert d["mode"] == "fixed_plus_skills"
         assert "web_search" in d["factory"]
         assert d["skills"][0]["skill"] == "g"
-        assert d["phases"]["verify"] == ["fetch_page", "run_command"]
+        # 2026-11 零子 agent 改版：news 只剩 supplement 环节（做法带来的工具叠上）
+        assert d["phases"] == {"supplement": ["run_command"]}
 
     def test_task_kind_per_job(self, store, tmp_path, skills):
         agents = FakeAgents()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any, Callable, Dict, List, Tuple
 
 
@@ -773,13 +774,20 @@ class FakePlannedSearch:
             if not isinstance(it, dict) or not it.get("url"):
                 continue
             pub = it.get("published")
-            out.append({
+            row = {
                 "title": str(it.get("title") or ""),
                 "url": str(it.get("url") or ""),
                 "snippet": str(it.get("summary") or it.get("snippet") or ""),
                 "published": float(pub) if isinstance(pub, (int, float)) and pub else None,
                 "provider": str(it.get("provider") or provider or ""),
-            })
+            }
+            # 预置标了 kind（guide 好文）/ explore（拓展）就原样带过去——真搜索结果没这字段，
+            # 候选里带上了 _pick 回落才不至于把「挑出来的好文」降格成资讯。
+            if it.get("kind"):
+                row["kind"] = str(it.get("kind"))
+            if it.get("explore"):
+                row["explore"] = True
+            out.append(row)
         return out
 
     async def search(self, query: str, *, limit: int = 8, days: Any = None, site: str = "", news: bool = False) -> List[dict]:
@@ -846,36 +854,20 @@ def ensure_pick_fallback(models: Any) -> Any:
 async def two_phase_workers_run(report: Any, brief: str, kwargs: Dict[str, Any], *, store: Any = None) -> Any:
     """「预置一份老路 report」的假 workers 接上两阶段流水线的通用派发。
 
-    2026-10-01 起撒网不再派子 agent（代码按计划搜；预置「discover」候选由
-    FakePlannedSearch 出，见 patch_two_phase_feeds / *_make_feeds）。剩下的派发：
-    - task_id 以 feeds-verify: 开头：只把 brief 里列出的链接（「链接：<url>」行）
-      对应的预置条目回给这一组核验（几组并发各回各的，不会重复交全量）；
-    - 其他 task_id（feeds-recheck: 等）：老行为——预置是异常就抛，否则原样回。
+    2026-11 零子 agent 改版：资讯线（撒网 / 核验 / 补打开）和个人向找料一律不派
+    子 agent——代码直接搜、直接 fetch_page（fixture 工具见 make_fixture_page_tools）。
+    还按老路子派工的标记在这里直接断言失败，逼着用例改到新路：
+    feeds-discover: / feeds-verify: / feeds-recheck: / personal-collect:。
     """
-    from CharTyr_MaiWork.maiwork.workers import WorkerReport
-
     task_id = str(kwargs.get("task_id") or "")
     if isinstance(report, BaseException):
         raise report
-    assert not task_id.startswith("feeds-discover:"), (
-        "撒网子 agent 已删除（2026-10-01 代码按计划搜）；"
-        "这个用例还在指望 feeds-discover: 派工——改用 FakePlannedSearch + patch_two_phase_feeds"
-    )
-    data = getattr(report, "data", None)
-    preset_items = list(data.get("items") or []) if isinstance(data, dict) else []
-    if task_id.startswith("feeds-verify:"):
-        kept = [
-            dict(it)
-            for it in preset_items
-            if isinstance(it, dict) and str(it.get("url") or "") and str(it.get("url") or "") in str(brief)
-        ]
-        record_fixture_pages(task_id, kept)
-        return WorkerReport(ok=True, summary="核验好", data={"items": kept}, evidence=[], steps=2)
-    if task_id.startswith("personal-collect:"):
-        record_fixture_pages(task_id, preset_items)
-    if task_id.startswith("feeds-recheck:") and store is not None:
-        # 给了 store 的用例：补打开真打开 brief 里每条链接（工具记录 + 正文含 quote）
-        return fixture_recheck_keep(store, brief, task_id, FIXTURE_RECHECK_QUOTE)
+    for dead in ("feeds-discover:", "feeds-verify:", "feeds-recheck:", "personal-collect:"):
+        assert not task_id.startswith(dead), (
+            f"{dead[:-1]} 子 agent 已删除（2026-11 零子 agent 改版："
+            "主流程代码直接 fetch_page）；这个用例还在指望派工——"
+            "改用 patch_two_phase_feeds / patch_personal_collect 接 fixture 工具"
+        )
     return report
 
 
@@ -947,7 +939,13 @@ def patch_two_phase_feeds(
     if fail_all:
         return fake
     fake.set_planned(True)
+    # 2026-11 零子 agent 改版：打开原文由主流程代码自己 fetch_page（不走子 agent）。
+    # 测试侧接上 fixture 版 fetch_page——真走 _open_candidates 的预算/绑定/查重，
+    # 页面内容按预置条目造（正文含 quote，published 带回页面日期）。
+    _wire_fixture_page_tools(feeds, items)
     if models is not None:
+        models._fixture_tools = getattr(feeds, "_tools", None)
+        _wrap_score_enrichment(models, items)
         q = getattr(models, "reply_queue", None)
         if isinstance(q, list) and q and isinstance(q[0], str) and '"focus"' in q[0]:
             import json as _json
@@ -969,6 +967,276 @@ def patch_two_phase_feeds(
                         q[0] = _json.dumps(parsed, ensure_ascii=False)
             except Exception:
                 pass
+    return fake
+
+
+# ---------------------------------------------------------------------------
+# 2026-11 零子 agent 改版：fixture 版 fetch_page（核验/补打开子 agent 全删后，
+# 主流程代码自己调 self._tools.call("fetch_page")——测试给它接这一份）
+# ---------------------------------------------------------------------------
+
+
+def _preset_list(items: Any) -> List[dict]:
+    """patch 传进来的 items（{focus: [..]} / [item] / callable 同种）拍平成条目列表。"""
+    if callable(items):
+        try:
+            items = items()
+        except Exception:
+            return []
+    if isinstance(items, dict) and all(isinstance(k, int) for k in items):
+        return [it for _k in sorted(items) for it in (items[_k] or []) if isinstance(it, dict)]
+    if isinstance(items, list):
+        return [it for it in items if isinstance(it, dict)]
+    return []
+
+
+def make_fixture_page_tools(
+    store: Any,
+    items: Any = None,
+    *,
+    default_rss_quote: str = FIXTURE_RECHECK_QUOTE,
+) -> Any:
+    """造一只装着 fixture 版 fetch_page 的 Tools（真走预算 / 记录 / 绑定，不碰网络）。
+
+    - 预算：verify_budget.consume(ctx.task_id)——没开账本的照旧放行，超上限照账本的话拒；
+    - 命中预置条目（url / original_url 规范化后对得上）：
+        * fetched is False → ToolResult(ok=False)（模拟打不开；RSS 类预置没 fetched 键=打得开）；
+        * 否则 record_page 进账本 + 回 ok（body=fixture_article，published 按预置转 YYYY-MM-DD）；
+    - 没命中（RSS 源直接塞进来的链接等）：回 ok，正文里带 default_rss_quote——
+      打分补的 quote 对得上，evidence 闸门照常认；
+    - summarize 照真 fetch_page 的形状吐（取到正文 N 字 + 最终地址 + 页面发布日期行），
+      page_date.dates_from_rows 靠工具调用行读页面日期。
+    """
+    from CharTyr_MaiWork.maiwork import clock as _clock
+    from CharTyr_MaiWork.maiwork import page_date as _page_date
+    from CharTyr_MaiWork.maiwork import verify_budget as _vb
+    from CharTyr_MaiWork.maiwork.feeds import _normalize_url as _norm_url, _parse_published
+    from CharTyr_MaiWork.maiwork.tools import Tool, ToolResult, Tools
+    from CharTyr_MaiWork.maiwork.tools_builtin import final_url_note
+
+    tools = Tools(store)
+    tools._is_fixture_page_tools = True
+    # （测试侧台账，不算生产数据）_open_candidates 读到的「页面正文」按规范化 URL 索引，
+    # 打分补写（_wrap_score_enrichment）拿这里的内容填 summary/quote，保证逐字对得上。
+    pages: Dict[str, dict] = {}
+    tools.fixture_pages = pages
+
+    def _find(url: str) -> dict | None:
+        key = _norm_url(str(url or ""))
+        if not key:
+            return None
+        for it in _preset_list(items):
+            if key in {_norm_url(str(it.get("url") or "")), _norm_url(str(it.get("original_url") or ""))}:
+                return it
+        return None
+
+    async def _handler(ctx: Any, args: dict) -> ToolResult:
+        url = str(args.get("url") or "").strip()
+        ok_budget, note = _vb.consume(str(getattr(ctx, "task_id", "") or ""))
+        if not ok_budget:
+            return ToolResult(ok=False, output="", error=note)
+        it = _find(url)
+        if it is not None and it.get("fetched") is False:
+            # 预置明说打不开（老「fetched=False」用例）→ 真 fetch_page 失败的样子
+            return ToolResult(ok=False, output="", error="打不开这个页面")
+        if it is not None:
+            body = str(it.get("body") or "") if "body" in it else fixture_article(it)
+            title = str(it.get("title") or "")
+            final_url = str(it.get("original_url") or it.get("url") or url)
+            if "page_published" in it:
+                published = str(it.get("page_published") or "")
+                pub = None
+            else:
+                pub = it.get("published")
+                published = ""
+        else:
+            body = f"这篇文章的正文这样写道：{default_rss_quote}。正文接着介绍页面要点和相关背景。"
+            title = ""
+            final_url = url
+            pub = None
+            published = ""
+        if isinstance(pub, str):
+            try:
+                pub = _parse_published(pub)
+            except Exception:
+                pub = None
+        if not published and isinstance(pub, (int, float)) and pub:
+            published = _clock.bj(float(pub)).strftime("%Y-%m-%d")
+        _vb.record_page(str(getattr(ctx, "task_id", "") or ""), url, final_url, body, title=title)
+        pages[_norm_url(final_url)] = {"body": body, "title": title, "final_url": final_url}
+        return ToolResult(
+            ok=True, output=body,
+            data={
+                "url": url,
+                "final_url": final_url,
+                "title": title,
+                "image_url": str(it.get("image_url") or "") if it is not None else "",
+                "published": published,
+                "via": "fixture",
+            },
+        )
+
+    def _summarize(args: dict, res: ToolResult) -> tuple:
+        inp = str((args or {}).get("url") or "")
+        if not res.ok:
+            return inp, res.error or "失败了"
+        data = res.data or {}
+        out = f"取到正文 {len(str(res.output or ''))} 字"
+        out += final_url_note(str(data.get("final_url") or ""))
+        out += _page_date.note(str(data.get("published") or ""))
+        return inp, out
+
+    tools.register(Tool(
+        name="fetch_page",
+        description="打开网页读正文（fixture：不联网，按预置条目回正文）",
+        parameters={
+            "type": "object",
+            "properties": {"url": {"type": "string", "description": "要打开的网页地址"}},
+            "required": ["url"],
+        },
+        roles=frozenset({"worker", "main"}),
+        handler=_handler,
+        summarize=_summarize,
+        timeout_s=45.0,
+    ))
+    return tools
+
+
+def _wire_fixture_page_tools(owner: Any, items: Any = None) -> None:
+    """给 Feeds / Personal 接上 fixture fetch_page（已接了自定义 Tools 的跳过；旧 fixture 可刷新）。"""
+    cur = getattr(owner, "_tools", None)
+    if cur is not None and not getattr(cur, "_is_fixture_page_tools", False):
+        return
+    store = getattr(owner, "_store", None)
+    if store is None:
+        return
+    owner.set_tools(make_fixture_page_tools(store, items))
+
+
+# 打分提示词里每条候选的 URL（「[i]（…）标题 —— 线索（URL，发布于 …）」行）：
+# [^\n]*? 非贪婪——同行右边再出现「（http…）」（比如线索里引了另一链接）也不抢这个位置的 URL。
+_SCORE_I_URL_RE = re.compile(r"^\s*\[(\d+)\][^\n]*?（(https?://[^\s，、；;)）]+)", re.M)
+# 同一行把标题也抓出来（「[i]（资讯）标题 ——」/「[i] 标题 ——」两种形状），
+# 生产 apply-back 是「回了 title 就按 title 对」——补写也照这条规则定到条目，
+# 不然第一道筛掉中间一条后编号错位，会把别条的摘要 / 依据补到这条上。
+_SCORE_I_TITLE_RE = re.compile(r"^\s*\[(\d+)\][^\n]*?([^\n]*?)\s*——\s*", re.M)
+_SCORE_LEAD_PAREN_RE = re.compile(r"^（[^）]*）\s*")
+
+
+def _wrap_score_enrichment(models: Any, items: Any = None) -> None:
+    """包一层 models.chat：打分（feeds.score / personal.score）回复里**没给**
+    summary / quote / conditions 的条目，按「本轮真读到的正文」（fixture 页面台账 +
+    预置条目）补上——模拟真模型照正文写回抽取字段。
+
+    老测试造的打分回复只含分数 / 标帜（子 agent 时代 summary/quote 是核验子 agent 写的）；
+    零子 agent 改版后打分要吃这些字段写回——不给就当模型漏写，照正文补，显式给了
+    （含 "summary": "" / "paywall": true 这类）一字不动。解析不出 {"scores": [...]}
+    或提示词对不上 URL 的回复原样放过。
+    """
+    models._fixture_items = items
+    if getattr(models, "_fixture_score_wrap", False):
+        return
+    had_inst_chat = "chat" in getattr(models, "__dict__", {})
+    orig_inst_chat = models.chat if had_inst_chat else None
+
+    async def _chat(*a: Any, **kw: Any) -> Any:
+        result = await (orig_inst_chat(*a, **kw) if orig_inst_chat is not None else type(models).chat(models, *a, **kw))
+        try:
+            purpose = str(kw.get("purpose") or "")
+            if purpose not in ("feeds.score", "personal.score"):
+                return result
+            from CharTyr_MaiWork.maiwork.feeds import (
+                _normalize_url as _norm_url,
+                _parse_model_json,
+            )
+
+            raw_text = str(getattr(result, "text", "") or "")
+            data = _parse_model_json(raw_text)
+            scores = data.get("scores") if isinstance(data, dict) else None
+            if not isinstance(scores, list):
+                return result
+            prompt = ""
+            msgs = kw.get("messages")
+            if isinstance(msgs, list) and msgs:
+                prompt = "\n".join(str(m.get("content") or "") for m in msgs if isinstance(m, dict))
+            url_by_i = {int(m.group(1)): m.group(2) for m in _SCORE_I_URL_RE.finditer(prompt)}
+            # 编号 → 标题（提示词里的候选行）；title→url 再从这里推
+            title_by_i: Dict[int, str] = {}
+            for m in _SCORE_I_TITLE_RE.finditer(prompt):
+                t = _SCORE_LEAD_PAREN_RE.sub("", str(m.group(2) or "")).strip()
+                if t:
+                    title_by_i[int(m.group(1))] = t
+            url_by_title = {t: url_by_i[i] for i, t in title_by_i.items() if i in url_by_i}
+
+            cur_items = getattr(models, "_fixture_items", items)
+            by_url = {}
+            for it in _preset_list(cur_items):
+                # setdefault：预置两条撞同一个规范化链接时先见的赢——
+                # 和 _find 的回查口径一致，不然后到的预置会抢走前条的正文依据。
+                for raw in (it.get("url"), it.get("original_url")):
+                    key = _norm_url(str(raw or ""))
+                    if key:
+                        by_url.setdefault(key, it)
+            pages = getattr(getattr(models, "_fixture_tools", None), "fixture_pages", None) or {}
+            for s in scores:
+                if not isinstance(s, dict):
+                    continue
+                url = ""
+                # 和生产 apply-back 同口径：回了 title 先按 title 定条目（编号在
+                # 「第一道筛掉中间候选跳号」时对不上），对不上再退回编号
+                s_title = str(s.get("title") or "").strip()
+                if s_title:
+                    url = str(url_by_title.get(s_title) or "")
+                if not url:
+                    try:
+                        url = url_by_i.get(int(s.get("i")), "")
+                    except (TypeError, ValueError):
+                        url = ""
+                it = by_url.get(_norm_url(url))
+                page = pages.get(_norm_url(url)) if url else None
+                body = str((page or {}).get("body") or "")
+                if it is not None and not body:
+                    body = fixture_article(it)
+                if "summary" not in s:
+                    s["summary"] = str(it.get("summary") or "") if it else ""
+                    if not s["summary"]:
+                        s["summary"] = body[:200]
+                if "quote" not in s:
+                    s["quote"] = str(it.get("quote") or "") if it else ""
+                    if not s["quote"]:
+                        s["quote"] = body[:150]
+                if it is not None and "conditions" not in s and it.get("conditions"):
+                    s["conditions"] = list(it.get("conditions") or [])
+            enriched = json.dumps(data, ensure_ascii=False)
+            result.text = f"```json\n{enriched}\n```" if raw_text.lstrip().startswith("```") else enriched
+        except Exception:
+            pass  # 补写失败原样回，别影响这条 chat
+        return result
+
+    models.chat = _chat
+    models._fixture_score_wrap = True
+
+
+def patch_personal_collect(
+    personal: Any,
+    models: Any = None,
+    items: Any = None,
+    *,
+    fail_all: bool = False,
+    **search_kw: Any,
+) -> "FakePlannedSearch":
+    """把 Personal 接到「代码找料」的假搜索 + fixture fetch_page 上（2026-11 零子 agent 改版）。
+
+    老 personal-collect: 子 agent 已删：Phase A 代码按计划搜（FakePlannedSearch 供结果），
+    Phase C 代码自己 fetch_page（fixture 版，预算 PERSONAL_PAGE_CAP 照走）。
+    items 同 FakePlannedSearch（预置条目带 quote/summary/fetched/published；fetched=False → 打不开）。
+    """
+    fake = FakePlannedSearch(items, fail_all=fail_all, **search_kw)
+    personal._search = fake
+    _wire_fixture_page_tools(personal, items)
+    if models is not None:
+        _wrap_score_enrichment(models, items)
+        models._fixture_tools = getattr(personal, "_tools", None)
     return fake
 
 

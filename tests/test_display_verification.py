@@ -271,12 +271,27 @@ def _assert_source_rules(text: str) -> None:
 
 
 def test_verify_brief_has_source_identity_rules(tmp_path) -> None:
-    _store, _settings, feeds, *_ = _make_feeds(tmp_path)
-    cand = {"title": "Hearthstone balance update", "url": "https://forum.example.com/t/1", "snippet": "查看最新平衡更新"}
+    score_reply = json.dumps({"scores": [{
+        "i": 0, "title": "Hearthstone balance update",
+        "summary": "官方发布最新平衡性调整。", "quote": "Balance update details.",
+        "conditions": [], "paywall": False, "published": "",
+        "info": 4, "source": 4, "relevance": 4, "timeliness": 4, "chat": 4,
+        "profile": None, "topic": "炉石", "grounded": True, "junk": False,
+        "why": "w", "icon": "gamepad",
+    }]}, ensure_ascii=False)
+    models = FakeModelsQueue(ready=True, replies=[score_reply])
+    _store, settings, feeds, *_ = _make_feeds(tmp_path, models=models)
+    cand = {
+        "title": "Hearthstone balance update",
+        "url": "https://forum.example.com/t/1",
+        "_hint_snippet": "查看最新平衡更新",
+        "_source_body": "Balance update details.",
+        "kind": "news",
+    }
     with _TimePatch():
-        brief = feeds._verify_brief(GID, [(cand, "news", "")])
-    _assert_source_rules(brief)
-    assert "镜像" in brief, "仍不许搜镜像 / 存档站"
+        _run(feeds._score(GID, settings, [cand]))
+    score_prompt = str(models.calls[-1][1][0]["content"])
+    _assert_source_rules(score_prompt)
 
 
 def test_recheck_brief_has_source_identity_rules() -> None:
@@ -320,18 +335,33 @@ def test_recheck_result_conditions_are_merged(tmp_path) -> None:
 
 
 def test_personal_collect_brief_rules_and_conditions(tmp_path) -> None:
-    from test_feeds import FakeWorkers, _ok_report
+    from fakes import FakeModelsQueue
+    from test_feeds import FakeWorkers
     from test_personal import GID as PGID, UID, _make_personal, _time_patch
 
-    items = {"items": [{"title": "新开源 FPGA 学习板上架", "url": "https://example.com/board",
-                        "summary": "一块新的 FPGA 学习板。", "kind": "news", "published": "",
-                        "fetched": True, "quote": "原文一句", "paywall": False,
-                        "conditions": ["仅限预售"]}]}
-    workers = FakeWorkers(_ok_report(items))
-    _store, _s, personal, *_ = _make_personal(tmp_path, workers=workers)
+    raw_items = [{
+        "title": "新开源 FPGA 学习板上架", "url": "https://example.com/board",
+        "summary": "一块新的 FPGA 学习板。", "kind": "news", "published": NOW - 86400,
+        "fetched": True, "quote": "原文一句，确实写着板子已上架。", "paywall": False,
+        "conditions": ["仅限预售"],
+    }]
+    score_reply = json.dumps({"scores": [{
+        "i": 0, "title": "新开源 FPGA 学习板上架",
+        "info": 5, "source": 5, "relevance": 5, "timeliness": 5, "chat": 4,
+        "profile": 0, "topic": "FPGA", "grounded": True, "junk": False,
+        "why": "他在做 FPGA", "icon": "tools",
+    }]}, ensure_ascii=False)
+    models = FakeModelsQueue(ready=True, replies=[score_reply])
+    workers = FakeWorkers()
+    _store, _s, personal, models, *_ = _make_personal(
+        tmp_path, models=models, workers=workers, items=raw_items,
+    )
     with _time_patch():
         got = _run(personal._collect(PGID, [{"query": "FPGA", "why": "在做"}], UID))
-    _assert_source_rules(workers.calls[-1]["brief"])
-    schema = workers.calls[-1]["output_schema"]
-    assert "conditions" in schema["properties"]["items"]["items"]["properties"]
-    assert got and got[0]["conditions"] == ["仅限预售"]
+    assert workers.calls == []
+    assert len(got) == 1
+    with _time_patch():
+        _run(personal._score(PGID, "阿帆", {"doing": ["在做 FPGA"]}, got))
+    score_prompt = str(models.calls[-1][1][0]["content"])
+    _assert_source_rules(score_prompt)
+    assert got[0]["conditions"] == ["仅限预售"]

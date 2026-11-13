@@ -181,14 +181,18 @@ async def test_fetch_page_unlimited_outside_verify(tmp_path) -> None:
 
 
 def test_verify_batch_opens_budget_per_group(tmp_path) -> None:
-    """挑 12 条 → 3 个核验组，每组 4 条 → 每组上限 min(4×2+1, 6)=6；
-    跑完账本全部关掉（不残留）。"""
-    search = FakeBroadSearch(results=[
-        {"title": f"S{i}", "url": f"https://s.com/{i}", "snippet": "s", "published": None} for i in range(12)
-    ])
-    verify = [_ok_report({"items": [_verify_item("https://s.com/0")]}) for _ in range(3)]
+    """2026-11 零子 agent 改版：挑 12 条后由 _open_candidates 开一份 feeds-collect 账本
+    （上限=要开条数 12），跑完关账不残留，不派 feeds-verify 子 agent。"""
+    from fakes import patch_two_phase_feeds
+
+    preset = [
+        {"title": f"S{i}", "url": f"https://s.com/{i}", "summary": f"摘要{i}",
+         "kind": "news", "published": None, "fetched": True,
+         "quote": f"这是第 {i} 条的正文依据。", "paywall": False}
+        for i in range(12)
+    ]
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
-        tmp_path, verify=verify, search=search,
+        tmp_path, verify=[],
     )
     picks = [{"i": i, "kind": "news", "hook": f"理由{i}"} for i in range(12)]
     models.reply_queue = [
@@ -196,6 +200,8 @@ def test_verify_batch_opens_budget_per_group(tmp_path) -> None:
         json.dumps({"picks": picks}, ensure_ascii=False),
         _scores_json(_score(0)),
     ]
+    patch_two_phase_feeds(feeds, models, {1: preset[:4], 2: preset[4:8], 3: preset[8:]})
+    models.reply_queue[1] = json.dumps({"picks": picks}, ensure_ascii=False)
     seen: Dict[str, int] = {}
     orig_open = verify_budget.open_run
 
@@ -209,112 +215,137 @@ def test_verify_batch_opens_budget_per_group(tmp_path) -> None:
             _run(feeds.prepare_news(GID))
     finally:
         verify_budget.open_run = orig_open
-    dev = [t for t in seen if t.startswith("feeds-verify:")]
-    assert len(dev) >= 2, seen  # 12 条分 3 组
-    assert all(v == 6 for v in seen.values()), seen
+    col = [t for t in seen if t.startswith("feeds-collect:")]
+    assert len(col) == 1, seen
+    assert seen[col[0]] == 12, seen
+    assert not any(t.startswith("feeds-verify:") for t in seen), seen
+    assert workers.calls == []
     # 收尾关账：老账不残留（同账本已关，复用时应重新开账；不残留= consume 直接放行）
-    assert verify_budget.consume(dev[0])[0] is True
+    assert verify_budget.consume(col[0])[0] is True
 
 
 # ----------------------------------------------------------------------
-# A2 核验 brief：只开候选链接本身，不许搜镜像 / 存档；没日期用搜索结果自带日期
+# A2 零子 agent 直接打开：只开候选链接本身、保留搜索日期、未读到日期不编
 # ----------------------------------------------------------------------
 
 
 def test_verify_brief_forbids_mirror_rabbit_hole_and_keeps_search_date(tmp_path) -> None:
-    c = _candidate(
-        "https://youtu.be/abc123", title="某个视频",
-        published=NOW - 3 * 86400,
-    )
+    """代码直接调用 fetch_page 只开候选链接本身（1 次），不找镜像/存档，保留自带搜索日期。"""
+    from fakes import make_fixture_page_tools
+
+    pub = NOW - 3 * 86400
+    c = _candidate("https://youtu.be/abc123", title="某个视频", published=pub)
+    c["published_ts"] = pub
+    c["date_basis"] = "search"
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path)
+    tools = make_fixture_page_tools(store, [{
+        "title": "某个视频", "url": "https://youtu.be/abc123",
+        "summary": "视频介绍了新品细节。", "quote": "视频展示了最新细节。",
+        "fetched": True, "page_published": "",
+    }])
+    called_urls: List[str] = []
+    orig_call = tools.call
+
+    async def _spy_call(name: str, args: dict, ctx: Any) -> Any:
+        called_urls.append(str((args or {}).get("url") or ""))
+        return await orig_call(name, args, ctx)
+
+    tools.call = _spy_call  # type: ignore[method-assign]
+    feeds.set_tools(tools)
     with _TimePatch():
-        brief = feeds._verify_brief(GID, [(c, "guide", "群友想看这个")])
-    # 只开候选链接本身；打不开最多换一个备用地址；不许找镜像 / 存档站 / API
-    assert "只开" in brief and "候选" in brief
-    assert "备用" in brief or "再试" in brief
-    assert ("镜像" in brief) and ("存档" in brief)
-    # 搜索结果自带的发布日期列给子 agent，让它照抄而不是去页面上挖矿
-    assert "搜索结果自带的发布日期" in brief
+        _run(feeds._open_candidates(GID, [c], task_id="feeds-collect:t1"))
+    assert called_urls == ["https://youtu.be/abc123"]
+    assert c["published_ts"] == pub
+    assert workers.calls == []
 
 
 def test_verify_brief_shows_candidate_search_date(tmp_path) -> None:
-    """候选自带搜索日期的，brief 里把那条具体日期（北京时间）写出来。"""
+    """候选自带搜索日期的，收集阶段留住 published_ts，打分提示词里带出该日期。"""
+    from fakes import FakeModelsQueue
+
     pub = NOW - 3 * 86400
     c = _candidate("https://youtu.be/abc123", title="某个视频", published=pub)
+    c["published_raw"] = pub
+    c["published_ts"] = pub
+    c["date_basis"] = "search"
+    c["_source_body"] = "视频正文里展示了很多新细节。"
+    score_reply = json.dumps({"scores": [{
+        "i": 0, "title": "某个视频", "summary": "摘要", "quote": "展示了很多新细节",
+        "info": 4, "source": 4, "relevance": 4, "timeliness": 4, "chat": 4,
+        "profile": None, "topic": "视频", "grounded": True, "junk": False, "why": "w", "icon": "video",
+    }]}, ensure_ascii=False)
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path)
+    feeds._models = FakeModelsQueue(ready=True, replies=[score_reply])
     with _TimePatch():
-        brief = feeds._verify_brief(GID, [(c, "guide", "群友想看这个")])
-    from CharTyr_MaiWork.maiwork import clock as _clock
-
-    date_text = _clock.bj(pub).strftime("%Y-%m-%d")
-    assert date_text in brief
+        _run(feeds._score(GID, settings, [c]))
+    score_prompt = str(feeds._models.calls[-1][1][0]["content"])
+    assert str(pub) in score_prompt or "发布于" in score_prompt
 
 
 def test_verify_brief_without_search_date_still_mentions_fallback_rule(tmp_path) -> None:
-    """候选本身没日期（搜索结果没给）：brief 也写明没日期就留空，别到处翻。"""
+    """候选本身没日期时，打分提示词明确告诉模型读不到日期就留空、别编。"""
+    from fakes import FakeModelsQueue
+
     c = _candidate("https://example.com/a", title="没日期的", published=None)
+    c["_source_body"] = "一篇没有写出发布时间的文章正文内容。"
+    score_reply = json.dumps({"scores": [{
+        "i": 0, "title": "没日期的", "summary": "摘要", "quote": "没有写出发布时间的文章",
+        "published": "",
+        "info": 4, "source": 4, "relevance": 4, "timeliness": 4, "chat": 4,
+        "profile": None, "topic": "话题", "grounded": True, "junk": False, "why": "w", "icon": "newspaper",
+    }]}, ensure_ascii=False)
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path)
-    brief = feeds._verify_brief(GID, [(c, "news", "理由")])
-    assert "留空" in brief
-    assert "镜像" in brief and "存档" in brief
+    feeds._models = FakeModelsQueue(ready=True, replies=[score_reply])
+    with _TimePatch():
+        _run(feeds._score(GID, settings, [c]))
+    score_prompt = str(feeds._models.calls[-1][1][0]["content"])
+    assert "读不到给空字符串，别编" in score_prompt
 
 
 # ----------------------------------------------------------------------
-# A3 日期兜底：核验没拿到日期 → 用撒网候选自带的搜索结果日期补
+# A3 日期兜底：页面没拿到日期 → 保留撒网候选自带的搜索结果日期
 # ----------------------------------------------------------------------
 
 
 def test_verify_fills_published_from_discovery_candidate(tmp_path) -> None:
-    """核验交回的条目 published=""（页面上找不到日期），撒网候选自带日期：
-    入库前 published_ts 已补上；带进自己日期的条目不被覆盖。"""
+    """页面里找不到日期时，保留撒网候选自带的搜索日期；页面自带日期则以页面为准，不被覆盖。"""
+    from CharTyr_MaiWork.maiwork import clock as _clock
+    from fakes import _wrap_score_enrichment, make_fixture_page_tools
 
-    class FillWorkers:
-        """核验子 agent 假人：交回条目一个没日期、一个有自己的日期。"""
-
-        def __init__(self) -> None:
-            self.calls: List[Dict[str, Any]] = []
-
-        async def run(self, brief: str, **kwargs: Any) -> Any:
-            self.calls.append({"brief": brief, **kwargs})
-            tid = str(kwargs.get("task_id") or "")
-            if tid.startswith("feeds-verify:"):
-                # 本真核验子 agent 只交回自己这一组的条目（brief 里有自己的候选链接）
-                pool = [
-                    {
-                        "title": "生化危机 9 评测", "url": "https://v.com/no-date",
-                        "summary": "视频里详细评测了生化危机 9。",
-                        "kind": "guide", "published": "",  # 页面上找不到日期
-                        "fetched": True, "quote": "原文确实评测了生化危机 9。", "paywall": False,
-                    },
-                    {
-                        "title": "另一篇自带日期", "url": "https://v.com/with-date",
-                        "summary": "这篇自己在页面上标了日期。",
-                        "kind": "guide", "published": NOW - 10 * 86400,  # 自己的日期：不被覆盖
-                        "fetched": True, "quote": "原文确实在。", "paywall": False,
-                    },
-                ]
-                return _ok_report({"items": [it for it in pool if it["url"] in brief]})
-            return _ok_report({"items": []})
-
-    workers = FillWorkers()
-    store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path, workers=workers)
-    # 2026-10-01 起撒网是代码按计划搜：候选由假搜索的预设 items 出（带搜索结果自带的日期）
+    page_items = [
+        {
+            "title": "生化危机 9 评测", "url": "https://v.com/no-date",
+            "summary": "视频里详细评测了生化危机 9。", "kind": "guide",
+            "page_published": "",  # 页面上找不到日期
+            "fetched": True, "quote": "原文确实评测了生化危机 9。", "paywall": False,
+        },
+        {
+            "title": "另一篇自带日期", "url": "https://v.com/with-date",
+            "summary": "这篇自己在页面上标了日期。", "kind": "guide",
+            "page_published": _clock.bj(NOW - 10 * 86400).strftime("%Y-%m-%d"),  # 页面自己的日期
+            "fetched": True, "quote": "原文确实在。", "paywall": False,
+        },
+    ]
+    store, settings, feeds, models, workers, topics, _ = _make_feeds(tmp_path)
+    # 撒网候选自带搜索日期
     feeds._search = FakeBroadSearch(results=[
         {"title": "生化危机 9 评测", "url": "https://v.com/no-date", "snippet": "s",
          "published": NOW - 3 * 86400},
         {"title": "另一篇自带日期", "url": "https://v.com/with-date", "snippet": "s",
          "published": NOW - 5 * 86400},
     ])
+    feeds.set_tools(make_fixture_page_tools(store, page_items))
+    models._fixture_tools = feeds._tools
+    _wrap_score_enrichment(models, page_items)
 
     seen_items: list[dict] = []
-    orig_verify_batch = feeds._verify_batch
+    orig_open_candidates = feeds._open_candidates
 
-    async def spy_verify_batch(gid_, picks_, verify_mark, deadline_ts):
-        items_, opened = await orig_verify_batch(gid_, picks_, verify_mark, deadline_ts)
-        seen_items.extend(items_)
-        return items_, opened
+    async def spy_open(gid_, candidates_, *, task_id, funnel=None):
+        await orig_open_candidates(gid_, candidates_, task_id=task_id, funnel=funnel)
+        seen_items.extend(candidates_)
 
-    feeds._verify_batch = spy_verify_batch
+    feeds._open_candidates = spy_open  # type: ignore[method-assign]
     picks = [{"i": 0, "kind": "guide", "hook": "群里在等这个"}, {"i": 1, "kind": "guide", "hook": "也想看这个"}]
     models.reply_queue = [
         _FOCUS_JSON,
@@ -326,10 +357,10 @@ def test_verify_fills_published_from_discovery_candidate(tmp_path) -> None:
     by_item = {str(it.get("url_key")): it for it in seen_items}
     item_no_date = by_item.get("v.com/no-date")
     item_with_date = by_item.get("v.com/with-date")
-    # 兜底在核验之后就绪（进硬淘汰之前就带上日期；两道硬拒都不会再动它）
+    # 页面没日期保留搜索结果日期；页面自带日期覆写成页面日期
     assert item_no_date is not None and item_with_date is not None
     assert float(item_no_date["published_ts"] or 0) == NOW - 3 * 86400
-    assert float(item_with_date["published_ts"] or 0) == NOW - 10 * 86400
+    assert abs(float(item_with_date["published_ts"] or 0) - (NOW - 10 * 86400)) < 86400.0
     rows = store.read().execute(
         "SELECT url_key, published_ts, rejected, reject_reason FROM news_items ORDER BY id"
     ).fetchall()
@@ -337,26 +368,35 @@ def test_verify_fills_published_from_discovery_candidate(tmp_path) -> None:
     no_date = by_key.get("v.com/no-date")
     with_date = by_key.get("v.com/with-date")
     assert no_date is not None and with_date is not None
-    # 搜索结果自带的日期补了上来 → 「文章没有发布时间」这道硬拒没触发
+    # 搜索结果自带的日期留了下来 → 「文章没有发布时间」这道硬拒没触发
     assert float(no_date["published_ts"] or 0) == NOW - 3 * 86400
-    assert float(with_date["published_ts"] or 0) == NOW - 10 * 86400
+    assert abs(float(with_date["published_ts"] or 0) - (NOW - 10 * 86400)) < 86400.0
     assert "没有发布时间" not in str(no_date["reject_reason"] or "")
 
 
 # ----------------------------------------------------------------------
-# A1 附带：核验时间盒收紧（VERIFY_MINUTES 4 分钟）写进 brief 和 deadline
+# A1 附带：零子 agent 打开原文不派 feeds-verify: 子 agent
 # ----------------------------------------------------------------------
 
 
 def test_verify_deadline_is_tight_box(tmp_path) -> None:
-    """核验整体不该拖：每组的时间盒 4 分钟（原来 8），brief 与 deadline_ts 同步。"""
+    """2026-11 零子 agent 改版：不再派 feeds-verify: 子 agent，workers.calls 为空。"""
+    from fakes import _wire_fixture_page_tools, _wrap_score_enrichment
+
+    preset = [
+        {"title": "S0", "url": "https://s.com/0", "summary": "摘要",
+         "kind": "news", "published": None, "fetched": True,
+         "quote": "原文确实在。", "paywall": False},
+    ]
     search = FakeBroadSearch(results=[
         {"title": "S0", "url": "https://s.com/0", "snippet": "s", "published": None},
     ])
-    verify = [_ok_report({"items": [_verify_item("https://s.com/0")]})]
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
-        tmp_path, verify=verify, search=search,
+        tmp_path, verify=[], search=search,
     )
+    _wire_fixture_page_tools(feeds, preset)
+    models._fixture_tools = feeds._tools
+    _wrap_score_enrichment(models, preset)
     models.reply_queue = [
         _FOCUS_JSON,
         json.dumps({"picks": [{"i": 0, "kind": "news", "hook": "值得开"}]}, ensure_ascii=False),
@@ -364,9 +404,4 @@ def test_verify_deadline_is_tight_box(tmp_path) -> None:
     ]
     with _TimePatch():
         _run(feeds.prepare_news(GID))
-    verifies = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-verify:")]
-    assert verifies
-    dl = verifies[0].get("deadline_ts")
-    assert dl is not None
-    assert abs((dl - NOW) - 4 * 60) < 0.001, dl
-    assert "4 分钟" in verifies[0]["brief"]
+    assert workers.calls == []

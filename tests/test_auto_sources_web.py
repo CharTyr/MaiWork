@@ -274,6 +274,11 @@ class TestRssPipelineMarking:
         workers.store = store  # 补打开替身真打开 RSS 原文（工具记录 + 正文）
         feeds = Feeds(store, models, workers, profiles, _FakeTopics(),
                       lambda: settings, search=_EmptySearch())
+        from fakes import _wire_fixture_page_tools, _wrap_score_enrichment
+
+        _wire_fixture_page_tools(feeds)
+        models._fixture_tools = feeds._tools
+        _wrap_score_enrichment(models)
         feeds._rss_transport = httpx.MockTransport(
             lambda req: httpx.Response(200, text=_good_xml())
             if "good" in str(req.url) else httpx.Response(404, text="no")

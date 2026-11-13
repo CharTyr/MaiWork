@@ -3,7 +3,9 @@
 线上 ling-3.1-flash 回 HTTP 503 {"error":{"code":"model_not_found","message":"No available
 channel for model ... under group code (distributor)"}}：旧规则当普通 5xx 连试 1+retries 次、
 每次等 retry_delay_s，下一轮又从头撞。现在：
-- 认出「模型不可用」（503/404/400/200 内嵌错误都认）→ 只试这一次、不等，立刻换下一个候选；
+- 认出「模型不可用」（400/404/410/422/503 状态码，或 200 内嵌错误换算出这些码的都认；
+  含 OpenRouter 退役 / stealth 模型下架的 "no longer available"、"model ... was retired"、
+  "testing period ... ended"、模型已下线/退役/停用 等写法）→ 只试这一次、不等，立刻换下一个候选；
 - 内存熔断 `端点|模型` 一段时间（_UNAVAILABLE_TTL_S），期内的调用直接跳过它让备用上；
 - 全部候选都在熔断期 → 仍试熔断最早到期的那个（探测恢复）；
 - 到期自动恢复；普通 503 过载 / 429 不误判，照旧重试。
@@ -41,7 +43,18 @@ NOT_FOUND_503 = {
         (404, "model gpt-9 not found"),
         (400, '{"error":{"message":"Model Not Exist"}}'),
         (400, "模型不存在"),
+        # OpenRouter 等站点退役 / stealth 模型下架的 404/410 写法（2026-11 线上撞到的）
+        (404, '{"error":{"message":"Crouton Alpha is no longer available. This stealth model was retired on November 9, 2026.","code":404}}'),
+        (404, '{"error":{"message":"The testing period for this model has ended.","code":404}}'),
+        (410, '{"error":{"message":"This model was retired."}}'),
+        (410, "model has been deprecated and removed"),
+        (422, "Model has been removed"),
+        (404, "模型已下线"),
+        (404, "模型已退役"),
+        (503, "模型已停用"),
+        # 200 内嵌错误没带数字码时 _embedded_error 换算成 502（NewAPI 线上回法）
         (502, "model_not_found"),
+        (502, "This model was retired."),
     ],
 )
 def test_detects_unavailable(status, text) -> None:
@@ -59,6 +72,16 @@ def test_detects_unavailable(status, text) -> None:
         (404, '{"error":{"message":"路径不存在"}}'),
         (400, '{"error":{"message":"max_tokens is too large for model gpt-4"}}'),
         (200, ""),
+        # 「暂时不可用」是过载不是退役：绝不熔断、照旧重试
+        (503, "all accounts are temporarily unavailable"),
+        (503, "Service temporarily overloaded"),
+        # 页面/路由 404 不算模型退役
+        (404, "page not found"),
+        # 状态码不在白名单：文字再像也不算
+        (429, "no longer available rate limit"),
+        (500, "model_not_found"),
+        (501, "This model was retired."),
+        (504, "no longer available"),
     ],
 )
 def test_not_unavailable(status, text) -> None:
@@ -122,7 +145,43 @@ class TestUnavailableFallback:
         await models.close()
 
     @pytest.mark.asyncio
+    async def test_404_retired_stealth_model_falls_back_and_breaks(self, tmp_path, slept, now) -> None:
+        """OpenRouter 退役写法（stealth model was retired）：立刻换备用 + 熔断期内不再撞首选。"""
+        ep = FakeEndpoint({
+            "m1": [{"kind": "status", "status": 404, "body": {"error": {
+                "message": "Crouton Alpha is no longer available. This stealth model was retired on November 9, 2026.",
+                "code": 404,
+            }}}],
+            "m-bak": [{"kind": "ok", "content": "备用"}],
+        })
+        store, models = _make(tmp_path, _cfg(), ep)
+        r = await models.chat("main", [{"role": "user", "content": "x"}])
+        assert r.text == "备用"
+        assert [c["model"] for c in ep.calls] == ["m1", "m-bak"]
+        assert slept == [], "退役识别 → 不等 retry_delay_s 直接换"
+        # _UNAVAILABLE_TTL_S 期内第二次调用：首选还在熔断 → 直接打备用
+        now["v"] += mm._UNAVAILABLE_TTL_S - 60
+        r = await models.chat("main", [{"role": "user", "content": "y"}])
+        assert r.model == "m-bak"
+        assert [c["model"] for c in ep.calls] == ["m1", "m-bak", "m-bak"]
+        await models.close()
+
+    @pytest.mark.asyncio
+    async def test_410_retired_model_falls_back(self, tmp_path, slept, now) -> None:
+        ep = FakeEndpoint({
+            "m1": [{"kind": "status", "status": 410, "body": {"error": {"message": "This model was retired."}}}],
+            "m-bak": [{"kind": "ok", "content": "备用"}],
+        })
+        store, models = _make(tmp_path, _cfg(), ep)
+        r = await models.chat("main", [{"role": "user", "content": "x"}])
+        assert r.text == "备用"
+        assert [c["model"] for c in ep.calls] == ["m1", "m-bak"]
+        assert slept == []
+        await models.close()
+
+    @pytest.mark.asyncio
     async def test_200_embedded_model_not_found_falls_back(self, tmp_path, slept, now) -> None:
+        """200 内嵌错误（NewAPI 回法：code 是字符串 model_not_found → 换算成 502）照样熔断换备用。"""
         ep = FakeEndpoint({
             "m1": [{"kind": "status", "status": 200, "body": NOT_FOUND_503}],
             "m-bak": [{"kind": "ok", "content": "备用"}],

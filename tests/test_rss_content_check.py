@@ -5,10 +5,14 @@
 水文 / 洗稿 / 低质转载这道（补打开核对的第 2 条要求）对它们等于没有。
 
 做法：
-- `prepare_news` 里把 RSS 并池挪到补打开**之前**，RSS 条目和搜索候选一起进补打开；
+- `prepare_news` 里把 RSS 并池挪到打开原文**之前**，RSS 条目和搜索候选一起开原文；
 - `pick_unverified` 不再跳过 `from_rss`：RSS 条目的 quote 只是源里的摘要，一律要核对；
-  RSS 条目优先送（它们从没核对过），总量照旧 `_RECHECK_CAP` 封顶、不多派子 agent；
-- RSS-only 轮（搜索坏、只有 RSS）也走补打开，不再整轮跳过。
+  RSS 条目优先送（它们从没核对过），总量照旧 `_RECHECK_CAP` 封顶；
+- RSS-only 轮（搜索坏、只有 RSS）也走打开原文，不再整轮跳过。
+
+2026-11 零子 agent 改版：打开原文不再派补打开子 agent——主流程代码 fetch_page
+（_open_candidates），水文 / 洗稿 / 低质转载由打分环节的 junk 闸判（评分提示词照
+搬原核验清单），没读到正文照样硬拒。
 """
 
 from __future__ import annotations
@@ -84,45 +88,18 @@ def _rss_cand(url: str, *, title: str = "RSS 水文一条", ts: float = NOW - 36
     }
 
 
-def _log_fetch(store: Store, task_id: str, url: str) -> None:
-    with store.tx() as conn:
-        conn.execute(
-            "INSERT INTO tool_calls (ts, group_id, task_id, actor, tool, input, output, ok)"
-            " VALUES (?, ?, ?, '子 agent #1', 'fetch_page', ?, ?, 1)",
-            (NOW, GID, task_id, url, "取到正文 500 字（直接打开）"),
-        )
+class _FakeWorkers:
+    """假 workers.run：只记录调用（零子 agent 改版后一轮里一次都不该派）。"""
 
-
-def _verdict(index: int, url: str, *, verdict: str = "keep", reason: str = "",
-             summary: str = "按原文重写的摘要：两三句讲清楚。", quote: str = "原文里的一句话。",
-             published: str = "2026-09-24") -> dict:
-    return {"index": index, "verdict": verdict, "url": url, "summary": summary, "quote": quote,
-            "published": published, "stale": False, "reason": reason}
-
-
-class _RecheckWorkers:
-    """补打开子 agent 的替身：写这次 task_id 下的 fetch_page 记录，交回预置结论。
-
-    RSS-only 轮里除了补打开不该有别的子 agent（撒网 / 核验都被跳过）。"""
-
-    def __init__(self, store_ref: list, items: list[dict], *, opened: list[str] | None = None) -> None:
-        self.store_ref = store_ref
-        self.items = list(items)
-        self.opened = list(opened or [])
+    def __init__(self) -> None:
         self.calls: list[dict] = []
 
     async def run(self, brief: str, **kwargs):
+        self.calls.append({"brief": brief, "task_id": str(kwargs.get("task_id") or ""), **kwargs})
         tid = str(kwargs.get("task_id") or "")
-        self.calls.append({"brief": brief, "task_id": tid, **kwargs})
-        assert tid.startswith("feeds-recheck:"), f"RSS-only 轮只该派补打开：{tid}"
-        for url in self.opened:
-            _log_fetch(self.store_ref[0], tid, url)
-        # 真打开的页面正文里写着它 keep 时抄回的 quote（fetch_page 本轮记下的正文）
-        from fakes import record_fixture_pages
-
-        record_fixture_pages(tid, [dict(v, fetched=True) for v in self.items
-                                   if str(v.get("url") or "") in self.opened])
-        return WorkerReport(ok=True, summary="核对好了", data={"items": self.items}, evidence=[], steps=2)
+        assert not tid.startswith(("feeds-recheck:", "feeds-verify:", "feeds-discover:")), \
+            f"零子 agent 改版后不该派资讯子 agent：{tid}"
+        return WorkerReport(ok=True, summary="好", data={"items": []}, evidence=[], steps=1)
 
 
 def _score(idx: int, *, topic: str = "话题甲") -> dict:
@@ -138,7 +115,7 @@ def _post(idx: int, title: str) -> dict:
             "refs": [], "audience": [], "keywords": ["关键词甲"]}
 
 
-def _make_feeds(tmp_path, *, workers: _RecheckWorkers, replies: list[Any]) -> tuple:
+def _make_feeds(tmp_path, *, workers=None, replies: list[Any]) -> tuple:
     store = Store(tmp_path / "t.db")
     store.migrate()
     with store.tx() as conn:
@@ -148,12 +125,10 @@ def _make_feeds(tmp_path, *, workers: _RecheckWorkers, replies: list[Any]) -> tu
     profiles = FakeProfiles()
     profiles.entries_map[GID] = [{"category": "ongoing", "text": "在做开源硬件项目"}]
     topics = _Topics()
+    if workers is None:
+        workers = _FakeWorkers()
     feeds = Feeds(store, models, workers, profiles, topics, lambda: settings, search=_UnavailableSearch())
     return store, settings, feeds, models, workers, topics
-
-
-def _recheck_calls(workers: _RecheckWorkers) -> list[dict]:
-    return [c for c in workers.calls]
 
 
 # ----------------------------------------------------------------------
@@ -194,14 +169,14 @@ def test_already_rejected_items_not_picked() -> None:
 
 # ----------------------------------------------------------------------
 # 端到端（RSS-only 轮：搜索坏、只有 RSS，第 1 步说的两条入口之一）
+# 2026-11 零子 agent 改版：开原文 = 主流程代码 fetch_page（fixture）；质量闸 = 打分 junk
 # ----------------------------------------------------------------------
 
 
-def _setup_rss_only(tmp_path, *, items: list[dict], opened: list[str], replies: list[Any]) -> tuple:
-    ref: list = [None]
-    workers = _RecheckWorkers(ref, items, opened=opened)
+def _setup_rss_only(tmp_path, *, replies: list[Any], wire_tools: bool = True) -> tuple:
+    """RSS-only 轮：一个 RSS 候选 + fixture fetch_page（正文里真写着它的 quote）。"""
+    workers = _FakeWorkers()
     store, settings, feeds, models, _w, _topics = _make_feeds(tmp_path, workers=workers, replies=replies)
-    ref[0] = store
     rss.add_feed(store, GID, url="https://good.example.com/feed", title="好博客", feed_id="rG", now=NOW)
     cands = [_rss_cand("https://ok.example.com/fresh")]
 
@@ -209,39 +184,55 @@ def _setup_rss_only(tmp_path, *, items: list[dict], opened: list[str], replies: 
         return list(cands)
 
     feeds._collect_rss = fake_collect
+    if wire_tools:
+        from fakes import make_fixture_page_tools, _wrap_score_enrichment
+
+        # 预置同名同链条目：fixture 正文（fixture_article）写着它的 quote / summary
+        preset = [{"title": cands[0]["title"], "url": cands[0]["url"],
+                   "quote": cands[0]["quote"], "summary": cands[0]["summary"],
+                   "published": cands[0]["published_ts"], "fetched": True}]
+        feeds.set_tools(make_fixture_page_tools(store, preset))
+        _wrap_score_enrichment(models, preset)
+        models._fixture_tools = feeds._tools
     return store, settings, feeds, workers
 
 
 def test_rss_item_dispatched_to_recheck_and_dropped_as_low_quality(tmp_path) -> None:
-    """RSS 条目：补打开打开原文后判「低质转载」→ 硬拒（quote 是源摘要，不算核对过）。"""
+    """RSS 条目：代码真打开原文后，打分判「低质转载」（junk）→ 硬拒。"""
     reason = "低质转载：整段搬运，没注明出处"
     store, settings, feeds, workers = _setup_rss_only(
         tmp_path,
-        items=[_verdict(0, "https://ok.example.com/fresh", verdict="drop", reason=reason)],
-        opened=["https://ok.example.com/fresh"],
-        replies=[],
+        replies=[
+            json.dumps({"scores": [dict(_score(0, topic="硬件"),
+                                        junk=True, junk_reason=reason)]},
+                       ensure_ascii=False),
+        ],
     )
     with _TimePatch():
         kept = _run(feeds.prepare_news(GID))
     assert kept == 0, "内容不合格的 RSS 条目要丢掉"
-    calls = _recheck_calls(workers)
-    assert len(calls) == 1, "RSS-only 轮也要派一次补打开"
-    assert "https://ok.example.com/fresh" in str(calls[0]["brief"])
+    assert workers.calls == [], "零子 agent 改版后 RSS-only 轮不派任何子 agent"
+    fetched = store.read().execute(
+        "SELECT * FROM tool_calls WHERE tool='fetch_page'").fetchall()
+    assert any("https://ok.example.com/fresh" in str(r["input"]) for r in fetched), \
+        "RSS 原文要真打开过"
     row = store.read().execute("SELECT * FROM news_items ORDER BY id").fetchall()[0]
     assert int(row["rejected"]) == 1
     assert row["reject_gate"] == "hard"
-    assert "补打开核对" in str(row["reject_reason"]) and reason in str(row["reject_reason"])
+    assert "垃圾" in str(row["reject_reason"]) and reason in str(row["reject_reason"])
     store.close()
 
 
 def test_rss_item_verified_kept_with_rewritten_quote(tmp_path) -> None:
-    """核对通过：摘要 / 依据按原文重写，日期用原文的，站点是真实域名（不是源标题）。"""
+    """核对通过：摘要 / 依据按原文写回（打分抽取），站点是真实域名（不是源标题）。"""
+    score = dict(_score(0, topic="硬件"),
+                 summary="按原文重写的摘要：两三句讲清楚。",
+                 quote="RSS 源里的原文依据。",
+                 conditions=[])
     store, settings, feeds, workers = _setup_rss_only(
         tmp_path,
-        items=[_verdict(0, "https://ok.example.com/fresh")],
-        opened=["https://ok.example.com/fresh"],
         replies=[
-            json.dumps({"scores": [_score(0, topic="硬件")]}, ensure_ascii=False),
+            json.dumps({"scores": [score]}, ensure_ascii=False),
             json.dumps({"posts": [_post(0, "RSS 水文一条")]}, ensure_ascii=False),
         ],
     )
@@ -256,19 +247,15 @@ def test_rss_item_verified_kept_with_rewritten_quote(tmp_path) -> None:
 
 
 def test_rss_only_round_without_check_result_rejects_unread_rss(tmp_path) -> None:
-    """补打开没交回结论（子 agent 空手 / 打不开）：RSS 条目的 quote 只是源摘要，
-    本轮没读到正文就没有原文依据——硬拒并写清理由（2026-10-13 巡检：仅标题级核对的卡片照样发了）。
+    """原文打不开：RSS 条目的 quote 只是源摘要，本轮没读到正文就没有原文依据——
+    硬拒并写清理由（2026-10-13 巡检：仅标题级核对的卡片照样发了）。
     以前这里「没核对出问题就放行」，等于把 RSS 源摘要当成原文依据。"""
     store, settings, feeds, workers = _setup_rss_only(
-        tmp_path,
-        items=[],
-        opened=[],
-        replies=[],
-    )
+        tmp_path, replies=[], wire_tools=False)
     with _TimePatch():
         kept = _run(feeds.prepare_news(GID))
     assert kept == 0, "没读到正文的 RSS 条目不能凭源摘要发出去"
-    assert len(_recheck_calls(workers)) == 1
+    assert workers.calls == []
     row = store.read().execute("SELECT * FROM news_items ORDER BY id").fetchall()[0]
     assert int(row["rejected"]) == 1 and row["reject_gate"] == "hard"
     assert "正文" in str(row["reject_reason"]) or "原文" in str(row["reject_reason"])

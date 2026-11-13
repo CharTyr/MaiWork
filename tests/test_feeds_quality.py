@@ -272,11 +272,6 @@ def _rej_reason(rows: list, url_part: str) -> str | None:
     return None
 
 
-def _brief(workers: FakeWorkers) -> str:
-    assert workers.calls, "子 agent 没被调用"
-    return str(workers.calls[0]["brief"])
-
-
 def _score_prompt(models: FakeModelsQueue) -> str:
     """打分那次的提示词（两阶段后队列里隔着 feeds.pick，不能直接按下标 1 拿）。"""
     for _role, messages, kwargs in models.calls:
@@ -297,15 +292,11 @@ def test_prepare_news_not_ready_returns_0(tmp_path) -> None:
     assert _rows(store) == []
 
 
-def _verify_briefs(workers: FakeWorkers) -> str:
-    """两阶段恒生效后，「怎么打开 / 每条交什么」的规矩都在核验（feeds-verify:）brief 里。"""
-    texts = [str(c["brief"]) for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-verify:")]
-    assert texts, "核验子 agent 没被调用"
-    return "\n".join(texts)
-
-
 def test_brief_asks_news_and_guides_with_fetch_and_paywall(tmp_path) -> None:
-    """核验 brief 要同时认资讯和好文，真打开过 + 引用原文，付费的标出来。"""
+    """核验子 agent 删掉后，它的质量清单原样并进了打分提示词（2026-11 零子 agent 改版）：
+    打分要求从「本轮读到的原文正文」写摘要、逐字抄 quote、标 paywall/published、判 junk
+    （含洗稿 / 低质转载 / 商店页这些原文核验清单里的条目）；kind 同时认资讯和好文。
+    """
     items = [
         _cand(0, title="全新的 FPGA TEST 板卡"),
         _cand(1, kind="guide", url="https://tut.com/aaa-bbb-guide", title="从零开始的部署手册", published=NOW - 30 * 86400),
@@ -314,17 +305,19 @@ def test_brief_asks_news_and_guides_with_fetch_and_paywall(tmp_path) -> None:
     store, settings, feeds, models, workers, topics, _ = _make_feeds(
         tmp_path, items=items, scores=scores
     )
+    # kind 由「挑」模型定（撒网登记簿不带 kind）：挑的回复把第 1 条标成好文
+    models.reply_queue[1] = json.dumps(
+        {"picks": [{"i": 0, "kind": "news", "hook": "板卡"},
+                   {"i": 1, "kind": "guide", "hook": "手册"}]}, ensure_ascii=False)
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 2
     rows = _rows(store)
     assert {r["kind"] for r in _accepted(rows)} == {"news", "guide"}
-    brief = _verify_briefs(workers)
-    assert "文章" in brief  # 2026-09-29 起 brief 里叫「文章」（kind=guide，从严）
-    assert "资讯" in brief
-    assert "fetch_page" in brief
-    assert "fetched" in brief
-    assert "quote" in brief
-    assert "paywall" in brief
+    assert workers.calls == [], "零子 agent 改版后一轮里不派任何子 agent"
+    prompt = _score_prompt(models)
+    assert "原文正文" in prompt  # 每条候选带着本轮真读到的正文（节选）进打分
+    assert "quote" in prompt and "paywall" in prompt and "published" in prompt
+    assert "junk" in prompt and "低质转载" in prompt and "洗稿" in prompt
 
 
 def test_guides_off_brief_keeps_news_only(tmp_path) -> None:
@@ -343,11 +336,15 @@ def test_guides_off_brief_keeps_news_only(tmp_path) -> None:
 
 
 def test_not_fetched_candidates_rejected(tmp_path) -> None:
-    """fetched 不真或 quote 空 → 第一道淘汰，理由「原文没打开过/打不开」。"""
+    """原文打不开的候选 → 第一道淘汰，理由「没真打开过原文（不能只信搜索摘要）」。
+
+    零子 agent 改版：fetched=False 预置 = fixture fetch_page 打不开这条，
+    _open_candidates 绑不上正文证据 → 打分前就拒。
+    """
     items = [
         _cand(0, title="没打开", url="https://a.com/1", fetched=False, quote="有点依据"),
-        _cand(1, title="空引用", url="https://b.com/2", fetched=True, quote="   "),
-        _cand(2, title="打不开", url="https://c.com/3", fetched=False, quote=""),
+        _cand(1, title="空引用", url="https://b.com/2", fetched=False, quote="   "),
+        _cand(2, title="页面失联", url="https://c.com/3", fetched=False, quote=""),
         _cand(3, title="正常", url="https://d.com/4"),
     ]
     scores = _scores_json(_score(0, topic="唯一话题"))
@@ -362,7 +359,7 @@ def test_not_fetched_candidates_rejected(tmp_path) -> None:
     hard = _rejected(rows)
     assert {r["reject_gate"] for r in hard} == {"hard"}
     for r in hard:
-        assert "原文没打开过" in r["reject_reason"]
+        assert "打开" in r["reject_reason"] and "原文" in r["reject_reason"]
     # 打分只招呼到幸存的那 1 条；「有人味」写帖子是过第二道门槛才写；
     # 2026-11 起写帖子一回没落着的会补一次重试（本用例队列里没备帖子回复 → 重试也落空回落）。
     # 两阶段恒生效后中间多一次「挑」（feeds.pick）：定关注点 → 挑 → 打分 → 写帖子 ×2，共 5 次。
@@ -374,9 +371,11 @@ def test_not_fetched_candidates_rejected(tmp_path) -> None:
 
 
 def test_paywall_rejected(tmp_path) -> None:
-    items = [_cand(0, paywall=True, title="付费墙", url="https://pay.com/x")]
+    """打分模型回 paywall=true → 打分后的硬复核拒「原文要登录/付费」。"""
+    items = [_cand(0, title="付费墙", url="https://pay.com/x")]
     store, settings, feeds, models, workers, topics, _ = _make_feeds(
-        tmp_path, items=items, scores="{}"
+        tmp_path, items=items,
+        scores=_scores_json(dict(_score(0), paywall=True)),
     )
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 0
@@ -385,7 +384,7 @@ def test_paywall_rejected(tmp_path) -> None:
     assert rows[0]["rejected"] == 1
     assert rows[0]["reject_gate"] == "hard"
     assert "付费" in rows[0]["reject_reason"] or "登录" in rows[0]["reject_reason"]
-    assert len(models.calls) == 2  # 定关注点 + 挑；没调打分
+    assert len(models.calls) == 3  # 定关注点 + 挑 + 打分；没过门槛没人写帖子
 
 
 def _last_funnel_rejects(store) -> dict:
@@ -746,6 +745,11 @@ def test_happy_path_pool_gate_and_scores_stored(tmp_path) -> None:
     store, settings, feeds, models, workers, topics, _ = _make_feeds(
         tmp_path, items=items, scores=scores
     )
+    # kind 由「挑」模型定（撒网登记簿不带 kind）：挑的回复把第 1 条标成好文，
+    # 跟线上「模型按计划挑 guide 计划搜到的链接」一个路数
+    models.reply_queue[1] = json.dumps(
+        {"picks": [{"i": 0, "kind": "news", "hook": "新板子"},
+                   {"i": 1, "kind": "guide", "hook": "好教程"}]}, ensure_ascii=False)
     with _TimePatch():
         got = _run(feeds.prepare_news(GID))
     assert got == 2
@@ -825,6 +829,9 @@ def test_guide_never_enters_pool(tmp_path) -> None:
     store, settings, feeds, models, workers, topics, _ = _make_feeds(
         tmp_path, items=items, scores=scores
     )
+    # kind 由「挑」模型定（线上靠 plan kind=guide 让模型挑时标好文）
+    models.reply_queue[1] = json.dumps(
+        {"picks": [{"i": 0, "kind": "guide", "hook": "值得开"}]}, ensure_ascii=False)
     with _TimePatch():
         assert _run(feeds.prepare_news(GID)) == 1
     assert topics.calls == []

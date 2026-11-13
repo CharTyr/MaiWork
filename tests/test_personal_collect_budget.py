@@ -48,43 +48,63 @@ class _BudgetSpyWorkers:
         return _ok_report(_WORKER_ITEMS)
 
 
-def test_personal_collect_is_tagged_and_budgeted(tmp_path) -> None:
-    workers = _BudgetSpyWorkers()
+def test_personal_collect_is_tagged_and_budgeted(tmp_path, monkeypatch) -> None:
+    """找料的标记 / 账本（2026-11 零子 agent 改版：不再派找料子 agent——代码直接搜 +
+    fetch_page；标记照旧 = personal-collect:<群>:<人 id 前 8 位>:<毫秒>，工具调用按它归账）。
+
+    监听 verify_budget.consume：每次打开页面都会带 task_id 过账本，
+    能拿到当时的账本状态（cap / search_cap）。
+    """
+    seen: list[tuple[str, Any]] = []
+    orig_consume = verify_budget.consume
+
+    def _spy(tid: str):
+        seen.append((str(tid), verify_budget._status(str(tid))))
+        return orig_consume(tid)
+
+    monkeypatch.setattr(verify_budget, "consume", _spy)
     models = FakeModelsQueue(ready=True, replies=[
         json.dumps({"focus": [{"query": "FPGA", "why": "在做"}], "idea": None}, ensure_ascii=False),
         _personal_scores_json(),
         json.dumps({"posts": []}, ensure_ascii=False),
     ])
-    _store, _s, personal, *_ = _make_personal(tmp_path, models=models, workers=workers)
+    _store, _s, personal, *_ = _make_personal(tmp_path, models=models)
     with _time_patch():
         _run(personal.prepare_personal(GID, UID))
-    assert workers.calls, "要派找料子 agent"
-    tid = str(workers.calls[0].get("task_id") or "")
-    assert tid.startswith(f"personal-collect:{GID}:{UID[:8]}:"), tid
-    assert workers.status_during is not None, "跑的时候账本要开着"
-    assert workers.status_during["cap"] == PERSONAL_PAGE_CAP
-    assert workers.status_during["search_cap"] == PERSONAL_SEARCH_CAP
-    assert verify_budget._status(tid) is None, "跑完要关账"
-    # 提示词里告诉它上限（别一上来就撞墙）
-    brief = workers.calls[0]["brief"]
-    assert str(PERSONAL_SEARCH_CAP) in brief and str(PERSONAL_PAGE_CAP) in brief
+    assert personal._search.calls, "代码按计划搜过"
+    tids = [t for t, st in seen if st is not None]
+    assert tids, "fetch_page 应该过了打开页数账本"
+    assert all(t.startswith(f"personal-collect:{GID}:{UID[:8]}:") for t in tids), tids
+    st = [s for t, s in seen if t == tids[0] and s is not None][0]
+    assert st["cap"] == PERSONAL_PAGE_CAP
+    assert st["search_cap"] == PERSONAL_SEARCH_CAP
+    assert verify_budget._status(tids[0]) is None, "跑完要关账"
 
 
-def test_budget_closed_even_if_worker_raises(tmp_path) -> None:
-    class _Boom:
-        tid = ""
+def test_budget_closed_even_if_worker_raises(tmp_path, monkeypatch) -> None:
+    """跑的路上炸了（绑定正文记录这一步）→ 账本照样关掉（finally close_run）。"""
+    opened: list[str] = []
+    orig_open = verify_budget.open_run
 
-        async def run(self, brief: str, **kwargs: Any) -> Any:
-            _Boom.tid = str(kwargs.get("task_id") or "")
-            raise ValueError("炸了")
+    def _spy(tid: str, **kw: Any):
+        opened.append(str(tid))
+        return orig_open(tid, **kw)
 
+    monkeypatch.setattr(verify_budget, "open_run", _spy)
+
+    def _boom_bind(tid: str, items: list) -> None:
+        raise ValueError("炸了")
+
+    monkeypatch.setattr(verify_budget, "bind_pages", _boom_bind)
     models = FakeModelsQueue(ready=True, replies=[
         json.dumps({"focus": [{"query": "FPGA", "why": "在做"}], "idea": None}, ensure_ascii=False),
     ])
-    _store, _s, personal, *_ = _make_personal(tmp_path, models=models, workers=_Boom())
+    _store, _s, personal, *_ = _make_personal(tmp_path, models=models)
     with _time_patch():
         assert _run(personal.prepare_personal(GID, UID)) == 0
-    assert _Boom.tid and verify_budget._status(_Boom.tid) is None
+    tids = [t for t in opened if t.startswith("personal-collect:")]
+    assert tids, "这轮开了找料账本"
+    assert all(verify_budget._status(t) is None for t in tids), "炸完账本该关的都关了"
 
 
 def test_search_budget_ledger() -> None:

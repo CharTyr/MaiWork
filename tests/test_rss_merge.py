@@ -180,6 +180,11 @@ def _make_feeds(tmp_path, *, models=None, workers=None) -> tuple:
     workers.store = store  # 补打开替身真打开 RSS 原文（工具记录 + 正文）
     feeds = Feeds(store, models, workers, profiles, topics, lambda: settings,
                   search=_EmptySearch())
+    from fakes import _wire_fixture_page_tools, _wrap_score_enrichment
+
+    _wire_fixture_page_tools(feeds)
+    models._fixture_tools = feeds._tools
+    _wrap_score_enrichment(models)
     return store, settings, feeds, models, workers, topics
 
 

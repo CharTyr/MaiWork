@@ -33,21 +33,36 @@ import json
 import logging
 from typing import Any, Callable
 
-from . import clock, idea_feasibility, idea_guard, members
+from . import clock, idea_feasibility, idea_guard, members, page_date, verify_budget
 from .config import Settings
 from .feeds import (
     _IDEA_ITEMS_MAX,
+    _NEWS_MAX_AGE_DAYS,
     _POST_ACCURACY_RULES,
+    _QUOTE_MAX,
     _SCORE_SOURCE_MAX,
+    _TITLE_DEDUP_RATIO,
     CONDITIONS_RULE,
     CONDITIONS_SCHEMA,
+    GUIDE_MAX_AGE_DAYS,
     SOURCE_IDENTITY_RULES,
     IDEA_KIND_TALK,
     _adopt_title_zh,
+    _any_similar,
     _conditions_text,
+    _domain_blocked,
+    _is_archive_or_listing_page,
+    _is_listing_url,
+    _is_reference_page,
     _localize_title,
     _looks_chinese,
+    _normalize_url,
+    _parse_published,
     _pub_date,
+    _public_http_url,
+    _site_of,
+    _source_site,
+    blocked_domains,
     check_display_texts,
     clean_conditions,
     clean_idea_kind,
@@ -143,6 +158,7 @@ class Personal:
         search: Any = None,
         host: Any = None,
         identity: Any = None,  # identity.py（AGENTS 规矩注入定关注点；None 自动跳过）
+        tools: Any = None,  # Tools 注册表（tools.py）：找料的主流程代码自己调 fetch_page 打开原文
     ) -> None:
         self._store = store
         self._models = models
@@ -153,8 +169,16 @@ class Personal:
         self._search = search
         self._host = host
         self._identity = identity
+        # 工具注册表（2026-11 零子 agent 改版）：找料不再派子 agent，主流程代码
+        # 直接 web_search + fetch_page（verify_budget 账本照旧按 personal-collect: 标记管）。
+        # None（没接）→ 开不了原文，候选按「没真打开过」淘汰。
+        self._tools: Any = tools
         # 每群三份统一注入（docs/17 §八.2）：app._wire_specialists 挂上后生效
         self._agents: Any = None
+
+    def set_tools(self, tools: Any) -> None:
+        """事后接工具注册表（app 启动 / 测试打桩）：fetch_page 由主流程代码自己调。"""
+        self._tools = tools
 
     # ------------------------------------------------------------------
     # 调度（app 后台循环）：到期的人（每群每轮最多 1 个）、记做过
@@ -267,9 +291,10 @@ class Personal:
             logger.exception("个人向备料-子 agent 意外（群 %s）", gid)
             return 0
 
-        # ③ 第一道（代码侧）+ 打分（相关度对着 persona 条目）+ 第一道（模型侧）
+        # ③ 第一道（代码侧）+ 打分（相关度对着 persona 条目，顺带从正文补 summary/quote）+ 第一道（模型侧）
         # 标题查重同 feeds 挪出事件循环（调用链只读库）
-        survivors = await asyncio.to_thread(self._hard_reject_code, gid, candidates)
+        survivors = await asyncio.to_thread(
+            self._hard_reject_code, gid, candidates, require_quote=False)
         if survivors:
             try:
                 await self._score(gid, name, persona, survivors)
@@ -392,8 +417,14 @@ class Personal:
         lines.append("")
         lines.append(
             '请给出 1–2 个拿去搜索的关注点（具体一点，对着他做的/关心的），'
+            '每个关注点顺带想 1–3 条搜索计划（searches：每条就是一次真搜索，'
+            'q=问法、site=限定站点可空、news=只要新闻 true/否则 false、'
+            'kind=news 资讯 / guide 长文·教程；写不出就留空，代码会拿 query 本身当一搜）；'
+            '关心的是国际话题就把 intl 标 true、searches 里至少有 1 条英文问法，否则 false。'
             '顺带想 0–1 个「给你的点子」（想不出就 idea 给 null）。只回 JSON：'
-            '{"focus": [{"query": "搜索关键词", "why": "对着他哪件事"}],'
+            '{"focus": [{"query": "搜索关键词", "why": "对着他哪件事",'
+            ' "intl": 国际话题 true / 本地·中文圈 false,'
+            ' "searches": [{"q": "…", "site": "", "news": true, "kind": "news"}]}],'
             ' "idea": {"kind": "help"|"talk",'
             ' "title": "具体的事 + 我帮到哪一步（≤30 字，不要用「我可以帮你」开头）", '
             '"body": "这个点子是什么、为什么值得他花时间（一两句）",'
@@ -420,7 +451,32 @@ class Personal:
             group_id=gid,
         )
         data = json.loads(result.text)
-        out_focus: list[dict] = focus_items(data)[:2]
+        # [feeds] guides 关掉时个人向也只收资讯（kind 一律 news），不让模型塞好文计划
+        guides_ok = bool(getattr(self._get_settings().feeds, "guides", True))
+        out_focus: list[dict] = []
+        for f in focus_items(data)[:2]:
+            item = dict(f)
+            intl_raw = item.get("intl")
+            item["intl"] = bool(intl_raw) if isinstance(intl_raw, bool) else False
+            searches: list[dict] = []
+            raw_searches = item.get("searches")
+            if isinstance(raw_searches, list):
+                for s in raw_searches[:3]:
+                    if not isinstance(s, dict):
+                        continue
+                    q = str(s.get("q") or "").strip()
+                    if not q:
+                        continue
+                    kind = str(s.get("kind") or "news").strip().lower()
+                    searches.append({
+                        "q": q[:100],
+                        "site": str(s.get("site") or "").strip()[:100],
+                        "news": bool(s.get("news")),
+                        "kind": "guide" if (kind == "guide" and guides_ok) else "news",
+                    })
+            if searches:
+                item["searches"] = searches
+            out_focus.append(item)
         if not out_focus:
             raise ValueError("模型没给出能用的关注点（返回格式不对或是空的）")
         idea = data.get("idea") if isinstance(data, dict) else None
@@ -445,125 +501,254 @@ class Personal:
         return {"focus": out_focus, "idea": out_idea}
 
     # ------------------------------------------------------------------
-    # 子 agent 找候选
+    # 找候选（2026-11 零子 agent 改版：不再派找料子 agent——代码直接搜 + 直接打开）
     # ------------------------------------------------------------------
 
     async def _collect(self, gid: str, focus_list: list[dict], uid: str = "") -> list[dict]:
-        """派一个找料子 agent。带标记 personal-collect:<群>:<人前 8 位>:<毫秒> 归账，
-        并开搜索 / 打开页数硬上限的账本（跑完必关）。"""
-        from . import verify_budget
+        """主流程代码自己找料：按关注点带的搜索计划搜 → 预筛 → fetch_page 真打开原文。
 
+        A) 每个关注点按计划（没计划回退成 query 本身一搜）并发搜，一轮最多
+           PERSONAL_SEARCH_CAP 次（Semaphore(4)；搜一次错不拖累，全挂才抛）；
+        B) 预筛（和群资讯同一套口径）：非公开地址 / 首页栏目归档索引页 / 百科资料页 /
+           屏蔽来源 / lookback 里发过或标题近似的 / 太旧（news>7 天、guide>60 天），
+           再按关注点轮询留 ≤PERSONAL_PAGE_CAP 条；
+        C) 逐条 fetch_page 真打开（≤4 并发、单条 45 秒），工具调用 / 页面记录 /
+           页面日期照旧按 personal-collect:<群>:<人前 8 位>:<毫秒> 归账
+           （账本：打开 ≤PERSONAL_PAGE_CAP、工具搜索 ≤PERSONAL_SEARCH_CAP，跑完必关）；
+           正文绑到候选上（_fetched_evidence/_source_body），fetched 同步。
+
+        返回「老格式」候选 dict（summary/quote 留空等打分从正文补，kind 一律 news）。
+        """
+        search = self._search
+        if search is None:
+            raise SearchUnavailable("没配搜索服务，本次跳过联网搜索")
         mark = f"personal-collect:{gid}:{str(uid)[:8]}:{int(clock.now() * 1000)}"
-        verify_budget.open_run(mark, cap_page_calls=PERSONAL_PAGE_CAP, cap_search_calls=PERSONAL_SEARCH_CAP)
+
+        # A) 代码照计划搜（不走工具，不占工具账本；次数按 PERSONAL_SEARCH_CAP 封死）
+        # [feeds] guides 关掉时个人向也只收资讯；两个方向列了同一搜只搜一次
+        guides_ok = bool(getattr(self._get_settings().feeds, "guides", True))
+        jobs: list[tuple[int, str, str, bool, str]] = []  # (focus_no, q, site, news, kind)
+        job_keys: set[tuple] = set()
+        for fi, f in enumerate(focus_list, 1):
+            entries = [s for s in (f.get("searches") or []) if isinstance(s, dict)]
+            if not any(str(s.get("q") or "").strip() for s in entries):
+                entries = [{"q": f.get("query"), "site": "", "news": True, "kind": "news"}]
+            for s in entries[:3]:
+                q = str(s.get("q") or "").strip()
+                if not q:
+                    continue
+                kind = str(s.get("kind") or "news").strip().lower()
+                kind = "guide" if (kind == "guide" and guides_ok) else "news"
+                site_s = str(s.get("site") or "").strip()
+                news_b = bool(s.get("news"))
+                key = (q.lower(), site_s.lower(), news_b, kind)
+                if key in job_keys:
+                    continue
+                job_keys.add(key)
+                jobs.append((fi, q, site_s, news_b, kind))
+        jobs = jobs[:PERSONAL_SEARCH_CAP]
+        sem = asyncio.Semaphore(4)
+
+        async def _search_one(focus_no: int, q: str, site: str, news: bool, kind: str) -> list[dict]:  # noqa: E501
+            days = GUIDE_MAX_AGE_DAYS if kind == "guide" else _NEWS_MAX_AGE_DAYS
+            async with sem:
+                results = await search.search(q, limit=6, days=days, site=site, news=news)
+            out: list[dict] = []
+            for r in results or []:
+                if isinstance(r, dict):
+                    out.append({"focus": focus_no, "query": q, "kind": kind, **r})
+            return out
+
+        gathered = await asyncio.gather(
+            *(_search_one(fi, q, site, news, kind) for fi, q, site, news, kind in jobs),
+            return_exceptions=True,
+        )
+        results: list[dict] = []
+        failures: list[BaseException] = []
+        for g in gathered:
+            if isinstance(g, BaseException):
+                failures.append(g)
+            else:
+                results.extend(g)
+        if jobs and failures and not results:
+            raise ValueError(f"个人向搜索失败：{failures[-1]}")
+        # 按规范化链接去重（先见的留）
+        seen_keys: set[str] = set()
+        raw_cands: list[dict] = []
+        for r in results:
+            key = _normalize_url(r.get("url"))
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            raw_cands.append(r)
+
+        # B) 预筛（只读库，挪出事件循环）
+        kept = await asyncio.to_thread(self._personal_prefilter, gid, raw_cands)
+
+        # C) 真打开原文（fetch_page；账本照旧按 personal-collect: 标记管，跑完必关）
+        items = [
+            {
+                "title": str(r.get("title") or "").strip(),
+                "url": _public_http_url(r.get("url")),
+                "summary": "",
+                "kind": "news",
+                "published_raw": r.get("published"),
+                "published_ts": _parse_published(r.get("published")),
+                "date_basis": "search",
+                "fetched": False,
+                "paywall": False,
+                "quote": "",
+                "url_key": _normalize_url(r.get("url")),
+                "conditions": [],
+                "_hint_snippet": str(r.get("snippet") or r.get("summary") or "")[:300],
+                "src_query": r.get("query"),
+                "src_provider": r.get("provider"),
+                "src_focus": r.get("focus"),
+            }
+            for r in kept
+            if _public_http_url(r.get("url"))
+        ]
+        if not items:
+            return items
+        verify_budget.open_run(
+            mark, cap_page_calls=PERSONAL_PAGE_CAP, cap_search_calls=PERSONAL_SEARCH_CAP)
         try:
-            items = await self._collect_inner(gid, focus_list, mark)
+            tools = getattr(self, "_tools", None)
+            if tools is not None:
+                from .tools import ToolContext
+
+                async def _one(item: dict) -> None:
+                    url = str(item.get("url") or "")
+                    if not url:
+                        return
+                    ctx = ToolContext(
+                        group_id=gid, task_id=mark,
+                        actor="个人向打开原文", role="worker",
+                    )
+                    try:
+                        async with sem:
+                            res = await asyncio.wait_for(
+                                tools.call("fetch_page", {"url": url}, ctx), timeout=45.0
+                            )
+                    except Exception as e:
+                        logger.info("个人向打开原文出错（群 %s，%s）：%s", gid, url[:80], e)
+                        return
+                    if not getattr(res, "ok", False):
+                        return
+                    data = res.data if isinstance(res.data, dict) else {}
+                    if not str(item.get("image_url") or "").strip():
+                        img = str(data.get("image_url") or "").strip()
+                        if img:
+                            item["image_url"] = img
+                    final_url = _public_http_url(data.get("final_url"))
+                    if final_url:
+                        new_key = _normalize_url(final_url)
+                        if new_key and new_key != item.get("url_key"):
+                            item["url"] = final_url
+                            item["url_key"] = new_key
+                    if not str(item.get("title") or "").strip():
+                        t = ""
+                        out = str(getattr(res, "output", "") or "")
+                        if out.startswith("《") and "》\n" in out:
+                            t = out[1:out.index("》\n")]
+                        if not t:
+                            t = str(data.get("title") or "")
+                        if t.strip():
+                            item["title"] = t.strip()[:200]
+
+                await asyncio.gather(*(_one(it) for it in items), return_exceptions=True)
+                # 页面日期优先（personal 走自己的 mark 点数，和群向同一个 resolve_dates）
+                try:
+                    page_date.resolve_dates(self._store, mark, items, _parse_published)
+                except Exception:
+                    logger.debug("个人向按页面定发布日期失败（%s）", mark, exc_info=True)
             # 关账本前把本轮真读到的正文挂上（第一道按它核依据，模型自报的不算）
             verify_budget.bind_pages(mark, items)
+            for it in items:
+                it["fetched"] = bool(it.get("_fetched_evidence"))
             return items
         finally:
             verify_budget.close_run(mark)
 
-    async def _collect_inner(self, gid: str, focus_list: list[dict], mark: str) -> list[dict]:
-        # 时间盒：和群资讯同一个 [feeds] collect_minutes（2026-09-29 线上一轮跑了一个多小时）
+    def _personal_prefilter(self, gid: str, raw_cands: list[dict]) -> list[dict]:
+        """找料预筛（不调模型）：非公开地址 / 不是一篇内容的页 / 屏蔽来源 /
+        lookback 里发过或标题近似的 / 太旧，刷掉后按关注点轮询留 ≤PERSONAL_PAGE_CAP 条。"""
         settings = self._get_settings()
-        collect_minutes = max(1, int(getattr(settings.feeds, "collect_minutes", 15) or 15))
-        lines = []
-        for f in focus_list:
-            lines.append(f"- {f['query']}" + (f"（原因：{f['why']}）" if f.get("why") else ""))
-        # 找料也是「资讯」这一步（docs/17 §八.2）：本群规矩 + 本群资讯做法一起给子 agent
-        gc = self._group_context_safe(gid, "news")
-        gc_part = f"\n{gc}" if gc else ""
-        brief = (
-            "给一位群成员挑他个人会感兴趣的「资讯」（最近几天的新闻/发布/动态）。关注点：\n"
-            + "\n".join(lines)
-            + gc_part
-            + "\n\n要求：\n"
-            "1. 用 web_search 搜最近几天（days 填 3–7）；\n"
-            "2. 每条候选必须用 fetch_page 真打开过原文再看一遍，确实和关注点相关、有信息量才收；\n"
-            "3. 凑数的、旧的、广告软文、营销号都不要；要登录或付费才能看的也别收，标 paywall: true；\n"
-            f"4. 最多交回 {_COLLECT_CAP} 条，宁缺毋滥；\n"
-            "5. 每条：title、url、summary（2–4 句中文纯文本，别用 Markdown）、kind（一律 news）、"
-            "published（ISO 或 epoch，拿不到就空字符串）、fetched（真打开过就 true）、"
-            "quote（从原文抄一小段能支撑摘要的依据，≤200 字）、paywall、" + CONDITIONS_RULE + "；\n"
-            "5.1 " + SOURCE_IDENTITY_RULES + "（为此可以多开那一个完整原文链接）；\n"
-            "6. 最后用 submit_result 交回，data 按约定的 JSON Schema；"
-            f"你只有大约 {collect_minutes} 分钟，到点前记得把已经找到的交回来（部分结果也算，不会丢）；\n"
-            f"7. 这次最多搜 {PERSONAL_SEARCH_CAP} 次、打开 {PERSONAL_PAGE_CAP} 个页面（用完工具会拒绝）："
-            "先想好几个准的搜索词再搜，别换着说法反复搜同一件事；够 3 条好的就可以交回。"
-        )
-        report = await self._workers.run(
-            brief,
-            group_id=gid,
-            task_id=mark,
-            tools=["web_search", "social_search", "fetch_page"],
-            deadline_ts=clock.now() + collect_minutes * 60,
-            output_schema={
-                "type": "object",
-                "properties": {
-                    "items": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "title": {"type": "string"},
-                                "url": {"type": "string"},
-                                "summary": {"type": "string"},
-                                "kind": {"type": "string"},
-                                "published": {"type": "string"},
-                                "fetched": {"type": "boolean"},
-                                "quote": {"type": "string"},
-                                "paywall": {"type": "boolean"},
-                                "conditions": CONDITIONS_SCHEMA,
-                            },
-                            "required": ["title", "url", "summary", "kind", "fetched", "quote", "paywall"],
-                        },
-                    }
-                },
-                "required": ["items"],
-            },
-        )
-        if not getattr(report, "ok", False):
-            raise ValueError(str(getattr(report, "error", "") or getattr(report, "summary", "") or "子 agent 没干成"))
-        data = report.data
-        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
-            raise ValueError("子 agent 交回的格式不对")
-        from .feeds import _normalize_url, _parse_published, _public_http_url, _QUOTE_MAX
-
-        items = []
-        for raw in data["items"][:_COLLECT_CAP]:
-            if not isinstance(raw, dict):
+        blocked = set(blocked_domains(self._store, gid))
+        lookback_days = max(1, int(getattr(settings.feeds, "lookback_days", 14)))
+        since = clock.now() - lookback_days * 86400.0
+        try:
+            rows = self._store.read().execute(
+                "SELECT url_key, title, sources FROM news_items WHERE group_id=? AND created>=? AND rejected=0",
+                (gid, since),
+            ).fetchall()
+            seen_urls = {str(r["url_key"]) for r in rows if r["url_key"]}
+            seen_titles = _titles_with_originals(rows)
+        except Exception:
+            logger.debug("个人向读最近发过的失败（群 %s），这轮预筛不查重", gid, exc_info=True)
+            seen_urls, seen_titles = set(), []
+        now = clock.now()
+        by_focus: dict[int, list[dict]] = {}
+        for r in raw_cands:
+            url = str(r.get("url") or "").strip()
+            key = _normalize_url(url)
+            site = _source_site(url)
+            if not _public_http_url(url):
                 continue
-            title = str(raw.get("title") or "").strip()
-            url = _public_http_url(raw.get("url"))
-            summary = str(raw.get("summary") or "").strip()
-            if not title or not url or not summary:
+            if key and key in seen_urls:
                 continue
-            items.append(
-                {
-                    "title": title,
-                    "url": url,
-                    "summary": summary,
-                    "kind": "news",
-                    "published_raw": raw.get("published"),
-                    "published_ts": _parse_published(raw.get("published")),
-                    "fetched": raw.get("fetched") is True,
-                    "evidence_sufficient": raw.get("evidence_sufficient", True) is True and raw.get("grounded", True) is True,
-                    "quote": str(raw.get("quote") or "").replace("\n", " ").strip()[:_QUOTE_MAX],
-                    "paywall": bool(raw.get("paywall")),
-                    "url_key": _normalize_url(url),
-                    "conditions": clean_conditions(raw.get("conditions")),
-                }
-            )
-        return items
+            title = str(r.get("title") or "")
+            if _is_listing_url(url) or _is_archive_or_listing_page(url, title) or _is_reference_page(url, title):
+                continue
+            if site and _domain_blocked(site, blocked):
+                continue
+            if title and _any_similar(title, seen_titles, _TITLE_DEDUP_RATIO):
+                continue
+            pub = _parse_published(r.get("published"))
+            kind = str(r.get("kind") or "news")
+            max_days = GUIDE_MAX_AGE_DAYS if kind == "guide" else _NEWS_MAX_AGE_DAYS
+            if isinstance(pub, (int, float)) and pub and (now - float(pub)) > max_days * 86400.0:
+                continue
+            fi = r.get("focus")
+            bucket = int(fi) if isinstance(fi, (int, float)) else 0
+            by_focus.setdefault(bucket, []).append(r)
+            if key:
+                seen_urls.add(key)
+            if title:
+                seen_titles.append(title)
+        # 按关注点轮询（一个方向吃不满时别的方向补位），总数 ≤PERSONAL_PAGE_CAP
+        kept: list[dict] = []
+        order = sorted(by_focus)
+        while len(kept) < PERSONAL_PAGE_CAP and any(by_focus.get(k) for k in order):
+            progressed = False
+            for k in order:
+                if len(kept) >= PERSONAL_PAGE_CAP:
+                    break
+                bucket = by_focus.get(k) or []
+                if bucket:
+                    kept.append(bucket.pop(0))
+                    progressed = True
+            if not progressed:
+                break
+        return kept
 
     # ------------------------------------------------------------------
     # 第一道（代码侧）：和「给他本人的最近」对重
     # ------------------------------------------------------------------
 
-    def _hard_reject_code(self, gid: str, candidates: list[dict]) -> list[dict]:
-        """不调模型的第一道硬性淘汰；返回幸存列表（原序）。"""
-        from . import verify_budget
-        from .feeds import _any_similar, _site_of, _TITLE_DEDUP_RATIO, _domain_blocked, blocked_domains
+    def _hard_reject_code(
+        self,
+        gid: str,
+        candidates: list[dict],
+        *,
+        require_quote: bool = True,
+    ) -> list[dict]:
+        """不调模型的第一道硬性淘汰；返回幸存列表（原序）。
+
+        require_quote=False（2026-11 零子 agent 改版）：候选的 summary/quote 由打分环节
+        从正文补，这里只认「本轮代码真打开过原文」（_fetched_evidence 是本回绑定，
+        且文章正文非空）；模型填了 quote 的照样逐字核对。"""
+        from .feeds import Feeds
 
         settings = self._get_settings()
         blocked = set(blocked_domains(self._store, gid))
@@ -580,9 +765,26 @@ class Personal:
             url_key = item["url_key"]
             site = _site_of(item["url"])
             item["site"] = site
-            evidence_problem = verify_budget.evidence_problem(item)
-            if evidence_problem:
-                item["reject"] = ("hard", evidence_problem)
+            if item.get("reject"):
+                continue  # 预筛 / 打开环节已给了淘汰理由，别覆盖
+            if not require_quote:
+                # 零子 agent：只信本轮代码真读到的正文（不能拿搜索摘要当依据）
+                page = item.get("_fetched_evidence")
+                if not isinstance(page, verify_budget.FetchedPage):
+                    item["reject"] = ("hard", "原文没打开过/打不开")
+                elif _normalize_url(str(item.get("url") or "")) not in {
+                    _normalize_url(page.url),
+                    _normalize_url(page.final_url),
+                }:
+                    item["reject"] = ("hard", "原文依据与本轮打开的链接不一致")
+                elif not str(item.get("_source_body") or "").strip():
+                    item["reject"] = ("hard", "原文只有标题/导航，正文依据不足")
+            else:
+                evidence_problem = verify_budget.evidence_problem(item)
+                if evidence_problem:
+                    item["reject"] = ("hard", evidence_problem)
+            if "reject" in item:
+                pass  # 依据关没过：理由已在上面写好，别覆盖
             elif item.get("paywall"):
                 item["reject"] = ("hard", "原文要登录/付费")
             elif site and _domain_blocked(site, blocked):
@@ -592,6 +794,8 @@ class Personal:
             elif _any_similar(item["title"], seen_titles, _TITLE_DEDUP_RATIO):
                 item["reject"] = ("hard", "和最近出过的重复（标题高度相似）")
             if "reject" not in item:
+                Feeds._news_freshness_reject(item, defer_guide_no_date=not require_quote)
+            if "reject" not in item:
                 survivors.append(item)
                 if url_key:
                     seen_urls.add(url_key)
@@ -599,8 +803,26 @@ class Personal:
         return survivors
 
     def _hard_reject_model(self, survivors: list[dict]) -> None:
+        from .feeds import Feeds
+
         for item in survivors:
             if "reject" in item:
+                continue
+            # 先走「不用信模型自报」的几道（2026-11 零子 agent 改版，顺序同群资讯）：
+            # paywall（打分写回）→ 新鲜度（含文章没发布时间的兜底）→ 依据逐字对正文。
+            if item.get("paywall"):
+                item["reject"] = ("hard", "原文要登录/付费")
+                continue
+            Feeds._news_freshness_reject(item)
+            if "reject" in item:
+                continue
+            evidence_problem = verify_budget.evidence_problem(item)
+            if evidence_problem:
+                item["reject"] = ("hard", evidence_problem)
+                continue
+            if not str(item.get("summary") or "").strip():
+                # 打分没从正文写出摘要（读不出有效内容）→ 不能进写帖 / 入库
+                item["reject"] = ("hard", "正文读不出有效内容（空摘要）")
                 continue
             flags = item.get("_flags") or {}
             if flags.get("grounded") is not True:
@@ -651,16 +873,23 @@ class Personal:
             lines.append("最近给过他的（判「同一件事」用）：")
             lines.extend(f"- {t}" for t in recent[:15])
             lines.append("")
-        lines.append("下面是一批候选（编号从 0 开始；quote 是子 agent 从原文抄的依据）：")
+        lines.append(
+            "下面是一批候选（编号从 0 开始；每条带本轮代码真读到的原文正文节选——"
+            "summary/quote 都由你从这里写，「搜索线索」只是提示，不算依据）："
+        )
         for i, c in enumerate(candidates):
             quote = str(c.get("quote") or "")
             pub = c.get("published_raw")
             pub_text = f"，发布于 {pub}" if pub else ""
             conds = _conditions_text(c)
+            lead = str(c.get("summary") or "")[:300]
+            if not lead:
+                hint = str(c.get("_hint_snippet") or "").replace("\n", " ")[:250]
+                lead = (f"［搜索线索：{hint}］" if hint else "（没有摘要，以正文为准）")
             # 代码在本轮打开网页时留下的正文（不是模型自报），给 grounded 判断对照
             source_body = str(c.get("_source_body") or "").replace("\n", " ")[:_SCORE_SOURCE_MAX]
             lines.append(
-                f"[{i}] {c['title']} —— {c['summary'][:150]}（{c['url']}{pub_text}）"
+                f"[{i}] {c['title']} —— {lead}（{c['url']}{pub_text}）"
                 + (f" 原文依据：{quote[:150]}" if quote else "")
                 + (f" 必须保留的限定：{conds}" if conds else "")
                 + (f" 本轮读到的原文正文（节选）：{source_body}" if source_body else "")
@@ -670,6 +899,13 @@ class Personal:
         lines.append(
             "请给每条打分，只回 JSON："
             '{"scores": [{"i": 编号,'
+            ' "summary": 这条的中文摘要（2–4 句、≤400 字、纯文本别用 Markdown；'
+            '严格按「本轮读到的原文正文」写，搜索摘要只能当线索不能照抄；读不出内容的给空字符串）,'
+            f' "quote": 从上面「本轮读到的原文正文」里逐字抄一小段（≤{_QUOTE_MAX} 字，'
+            '必须能在原文里一字不差找到，别改写别拼接别自己编）,'
+            ' "conditions": 摘要成立必须保留的限定词数组（没有给 []）,'
+            ' "paywall": 原文要登录/付费才能看全吗 true/false,'
+            ' "published": 正文里读到的发布日期（"YYYY-MM-DD"；读不到给空字符串，别编）,'
             ' "info": 信息量 1到5,'
             ' "source": 来源等级 1到5（官方/一手 > 权威媒体 > 个人博客 > 二手转述）,'
             ' "relevance": 和「这个人」做的/关心的事的相关度 1到5（必须对着上面某一条打）,'
@@ -679,7 +915,10 @@ class Personal:
             ' "topic": 话题标签（不超过 8 个字）,'
             ' "sensitive": 政治/争议话题吗 true/false,'
             ' "grounded": 摘要能在 quote/原文里找到依据吗 true/false,'
-            ' "junk": 标题党/软文广告/营销号/纯情绪没事实吗 true/false,'
+            # 质量闸并入打分（2026-11 零子 agent 改版，原找料子 agent 的检查一条不丢）：
+            ' "junk": 标题党/软文广告/营销号/纯情绪没事实吗（水文（没有新信息、凑字数、标题党）、'
+            '低质转载（整段搬运、没注明原始出处）、洗稿（换说法重写别人的报道、没有自己的东西）也都算；'
+            + SOURCE_IDENTITY_RULES + '）true/false,'
             ' "junk_reason": junk 是 true 的话写一个简短原因，否则空字符串,'
             ' "same_as_recent": 是不是和「最近给过他的」某条讲的是同一件事 true/false,'
             ' "why": "为什么给他（一句话，对着他哪件事）",'
@@ -733,7 +972,21 @@ class Personal:
                 "chat": _f15("chat", s),
             }
             five["avg"] = round(sum(five.values()) / 5.0, 3)
+            # 抽取字段（2026-11 零子 agent 改版）：summary/quote/conditions/paywall/published
+            # 由模型照正文写回；键没在回复里出现 → None（留候选原值，不覆盖）。
+            ext = {
+                "summary": (str(s["summary"]).replace("\n", " ").strip()[:400]
+                            if "summary" in s else None),
+                "quote": (str(s["quote"]).replace("\n", " ").strip()[:_QUOTE_MAX]
+                          if "quote" in s else None),
+                "conditions": (clean_conditions(s.get("conditions"))
+                               if "conditions" in s else None),
+                "paywall": (bool(s.get("paywall")) if "paywall" in s else None),
+                "published": (str(s.get("published") or "").strip()[:40]
+                              if "published" in s else None),
+            }
             return {
+                "ext": ext,
                 "scores": five,
                 "why": str(s.get("why") or "").strip()[:200],
                 "icon": icon,
@@ -774,6 +1027,25 @@ class Personal:
                 item.setdefault("_flags", {"grounded": True, "junk": False, "junk_reason": "", "same_as_recent": False})
                 continue
             item["scores"] = s["scores"]
+            # 抽取字段写回（模型给了才盖；没给保留候选原值）
+            ext = s.get("ext") or {}
+            if ext.get("summary") is not None:
+                item["summary"] = ext["summary"]
+            if ext.get("quote") is not None:
+                item["quote"] = ext["quote"]
+            if ext.get("conditions") is not None:
+                item["conditions"] = ext["conditions"]
+            if ext.get("paywall") is not None:
+                item["paywall"] = ext["paywall"]
+            if ext.get("published"):
+                # 模型读的日期只作兜底：页头 / 搜索结果已经定好的 published_ts 是权威值，不盖
+                pub_ts = _parse_published(ext["published"])
+                if isinstance(pub_ts, (int, float)) and not isinstance(
+                    item.get("published_ts"), (int, float)
+                ):
+                    item["published_ts"] = pub_ts
+                    item["published_raw"] = ext["published"]
+                    item["date_basis"] = "model"
             item["why"] = s["why"]
             item["icon"] = s["icon"]
             item["topic"] = s["topic"]

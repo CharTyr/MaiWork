@@ -36,7 +36,8 @@
   10/20/40/60 秒退避、封顶 60 秒，加 ±20% 抖动）；
   用完再尝候选里的下一条，同样规则；其他 4xx 不重试、不换，直接抛。
   例外：「模型在这个端点不可用」（_model_unavailable，model_not_found / No available
-  channel 等，503/404/400/200 内嵌都认）只试一次立刻换下一条，并在内存熔断
+  channel / 退役下架写法等，400/404/410/422/502/503 与 200 内嵌换算出这些码的认）只试一次
+  立刻换下一条，并在内存熔断
   `端点|模型` _UNAVAILABLE_TTL_S 秒（全部候选都熔断时探测最早到期的那个）。
   chat(retries=n) 可临时覆盖设置里的重试次数（后台主循环里直接 await 的调用传 1）。
 - 端点级限流（EndpointThrottle，状态只在进程内存、不落库）：按
@@ -119,8 +120,12 @@ def _NOW() -> float:
 
 _UNAVAILABLE_TTL_S = 600.0  # 「模型在这个端点不可用」后熔断多久（秒）；只在内存
 _UNAVAILABLE_RE = re.compile(
-    r"model_not_found|no available channel|no such model|模型不存在|模型不可用"
-    r"|\bmodel\b[^\n]{0,80}?(?:does not exist|not exist|not found)",
+    r"model_not_found|no available channel|no such model|no longer available"
+    r"|模型不存在|模型不可用|模型已下线|模型已退役|模型已停用"
+    r"|\bmodel\b[^\n]{0,80}?(?:does not exist|not exist|not found)"
+    r"|(?:stealth )?\bmodel\b[^\n]{0,80}?"
+    r"(?:was retired|has been retired|is retired|deprecated and removed|was removed|has been removed)"
+    r"|testing period[^\n]{0,80}?(?:has )?ended",
     re.IGNORECASE,
 )
 
@@ -129,10 +134,13 @@ def _model_unavailable(status: int, err_text: str) -> bool:
     """端点明说「这个模型在这里用不了」（不是过载 / 限流）：重试没意义，该立刻换备用。
 
     认 model_not_found、No available channel（NewAPI 分组没渠道，线上 503）、
-    model ... does not exist / not found、模型不存在 等写法；状态码可以是 503/404/400，
-    或 200 内嵌错误换算出来的码。429 / 408 一律不算（那是限流 / 超时，照旧重试）。
+    model ... does not exist / not found、no longer available、stealth model was retired /
+    deprecated and removed、testing period ... ended、模型不存在 / 已下线 / 已退役 / 已停用
+    等写法；只在 400/404/410/422/502/503 状态码下认（502 覆盖 200 内嵌错误没带数字码、
+    _embedded_error 换算成 502 的情形——NewAPI 线上就这么回）。其余 5xx、429 / 408
+    一律不算（过载 / 限流 / 超时，照旧重试），页面 404 没点名模型也不算。
     """
-    if status in (200, 408, 429):
+    if status not in (400, 404, 410, 422, 502, 503):
         return False
     return bool(_UNAVAILABLE_RE.search(str(err_text or "")))
 
@@ -3647,8 +3655,11 @@ class Models:
         没有就按连续 429 次数 10/20/40/60 秒退避、封顶 60 秒，加 ±20% 抖动）；
         用完再换备用模型，备用同样规则。其他 4xx 不重试、不换备用，直接抛。
         例外：端点明说「这个模型在这里不可用」（_model_unavailable：model_not_found、
-        No available channel、model … does not exist / not found、模型不存在；状态码 503/404/400
-        或 200 内嵌错误都算，429/408 不算）→ 这个候选只试这一次、不等，立刻换下一个；并在内存里
+        No available channel、model … does not exist / not found、no longer available、退役 /
+        下架 / 测试期结束等写法、模型不存在 / 已下线 / 已退役 / 已停用；只在 400/404/410/422/502/503
+        状态码下认，含 200 内嵌错误换算出的这些码（502 正好是内嵌错误没带码时的兜底码），
+        429/408 等不算）→ 这个候选只试这一次、不等，
+        立刻换下一个；并在内存里
         熔断「端点|模型」_UNAVAILABLE_TTL_S 秒，期内的调用直接跳过它（只记日志、不写 model_calls）；
         候选全在熔断期时只探测熔断最早到期的那个；到期或探测成功自动恢复。
         备用救回（首选没成、别的候选成了）记一行 info：首选、实际模型、本次总耗时。

@@ -797,13 +797,9 @@ class TestNewsFreshness:
         prompt = _score_prompt(models)
         assert "商店页" in prompt
         assert "不是新闻" in prompt
-        # 核验子 agent 的 brief（两阶段恒生效后「看那类页面算不算资讯」在这里）：「最近 7 天」+「商店页不算资讯」
-        briefs = "\n".join(
-            str(c["brief"]) for c in workers.calls
-            if str(c.get("task_id") or "").startswith("feeds-verify:")
-        )
-        assert "7 天" in briefs
-        assert "商店页" in briefs
+        assert "7 天" in prompt
+        # 2026-11 零子 agent 改版：不再派核验子 agent
+        assert workers.calls == []
         rows = _rejected_rows(store)
         assert len(rows) == 1
         assert rows[0]["reject_gate"] == "hard"

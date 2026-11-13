@@ -16,7 +16,7 @@
 ④ `skill_summary._clean` 隐私脱敏 + `lessons._suspicious` 可疑指令过滤。
 ③ / ④ 不过关时给主模型 **1 次**原地修正机会（`purpose="skill_explore.revise"`，
 每轮至多一次，修正稿照样重过 ③ / ④ 两道闸）；① / ② 遥测门槛永远硬卡。
-最终仍不过：这次探索整份丢弃、记 `last_attempt`（4 小时内不再试），
+最终仍不过：这次探索整份丢弃、记 `last_attempt`（24 小时内不再试），
 绝不污染本群做法库。状态存 `kv["skill_explore.state.<gid>"]`。
 """
 
@@ -35,7 +35,7 @@ from .skill_summary import SkillSummary
 logger = logging.getLogger("maiwork.skill_explore")
 
 EXPLORE_MIN_GAP_S = 24 * 3600       # 距上次「成功写库」不到一天 → 跳过
-EXPLORE_ATTEMPT_GAP_S = 4 * 3600    # 距上次「尝试（失败 / 跳过 / 门槛不过）」不到 4h → 跳过
+EXPLORE_ATTEMPT_GAP_S = 24 * 3600   # 距上次「尝试（失败 / 跳过 / 门槛不过）」不到 24h → 跳过
 _EXPLORE_WINDOW_S = 14 * 86400      # 任务信号回看 14 天
 _EXPLORE_MAX_S = 180                # 沙箱探索单次限时（秒）
 _EXPLORE_MAX_STEPS = 20             # 沙箱探索单轮步数上限（够外搜 + 打开文档 + 试跑 + 修一次报错 + 交回）
@@ -116,7 +116,7 @@ def _save_state(store: Any, gid: str, st: dict[str, Any]) -> None:
 
 
 def _mark_attempt(store: Any, gid: str, st: dict[str, Any], now: float) -> None:
-    """尝试过一次但没成（跳过 / 模型出错 / 门槛不过）：记 last_attempt，4h 后再来。"""
+    """尝试过一次但没成（跳过 / 模型出错 / 门槛不过）：记 last_attempt，24h 后再来。"""
     out = dict(st)
     out["last_attempt"] = now
     _save_state(store, gid, out)
@@ -611,7 +611,7 @@ async def run(
         out["reason"] = "今天探索过了"
         return out
     if now - last_attempt < EXPLORE_ATTEMPT_GAP_S:
-        out["reason"] = "距上次尝试不到 4 小时"
+        out["reason"] = "距上次尝试不到 24 小时"
         return out
     if _in_quiet(agents, store, gid, now):
         out["reason"] = "睡觉时段"

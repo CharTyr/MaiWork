@@ -48,7 +48,15 @@ def open_run(task_id: str) -> None:
         _RUNS[tid] = {"order": [], "by_key": {}}
 
 
-def record(task_id: str, *, query: str, focus: Any, provider: str, results: Any) -> None:
+def record(
+    task_id: str,
+    *,
+    query: str,
+    focus: Any,
+    provider: str,
+    results: Any,
+    kind: str = "",
+) -> None:
     tid = str(task_id or "")
     if not tid:
         return
@@ -57,6 +65,7 @@ def record(task_id: str, *, query: str, focus: Any, provider: str, results: Any)
     except (TypeError, ValueError):
         focus_i = None
     q = str(query or "")
+    default_kind = str(kind or "").strip().lower()
     with _LOCK:
         run = _RUNS.get(tid)
         if run is None:
@@ -89,6 +98,11 @@ def record(task_id: str, *, query: str, focus: Any, provider: str, results: Any)
                 "provider": str(raw.get("provider") or provider or "").strip(),
                 "queries": [q] if q else [],
             }
+            raw_kind = str(raw.get("kind") or default_kind).strip().lower()
+            if raw_kind == "guide":
+                candidate["kind"] = "guide"
+            if raw.get("explore") is True:
+                candidate["explore"] = True
             run["by_key"][key] = candidate
             run["order"].append(key)
 

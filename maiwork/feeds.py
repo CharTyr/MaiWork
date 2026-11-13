@@ -5,19 +5,22 @@
    （中文原因）后返回 0，不静默退出；
 2. 搜索没配（SearchUnavailable）→ 记一条 skipped 批次；
 3. 主模型（json_mode）按画像条目 + 最近 14 天反馈标题出 3–5 个关注点；
-4. 找候选恒走两阶段（「广撒网再挑着打开」，2026-09-30 用户决定对所有群生效，不再有开关）：
-   撒网（只用 web_search）→ 代码保底补搜 → 程序粗筛 → 主模型挑 8–12 条 → 核验子 agent
-   （只用 fetch_page）真打开原文核对，同时找「资讯」（最近几天的新闻/发布/动态）
-   和「好文」（教程、好文章、工具介绍，不看新不新；[feeds] guides=false 就只找资讯）。
-   每条候选必须真用 fetch_page 打开过（交回 fetched=true + quote≤200 字原文依据），
-   要登录/付费的标 paywall=true；每条带 kind（news|guide）；
+4. 找候选恒走两阶段（「广撒网再挑着打开」）：
+   撒网（代码并发搜）→ 代码保底补搜 → 可选 `supplement` 专岗补找 → 程序粗筛 → 主模型挑 8–12 条，
+   同时找「资讯」（最近几天的新闻/发布/动态）和「好文」（教程、好文章、工具介绍；
+   [feeds] guides=false 就只找资讯），每个候选带 kind（news|guide）；与 RSS 候选并池后，
+   由 `_open_candidates` 直接并发调用 `fetch_page` 打开原文（日常 0 子 agent），
+   记录本轮正文证据（`_fetched_evidence` / `_source_body`）并按页面解析发布时间；
 5. 第一道（硬性淘汰，不管分数）：
-   - 代码侧：fetched 不真 / quote 空（「原文没打开过/打不开」）、paywall（「要登录/付费」）、
-     URL 规范化 / 标题近似撞最近 lookback_days 天已出的（「重复」）、
+   - 代码侧（`_hard_reject_code(..., require_quote=False)`）：未绑到本轮真打开的正文证据
+     （「原文没打开过/打不开」/「原文依据与本轮打开的链接不一致」/「原文只有标题/导航，正文依据不足」）、
+     paywall（「要登录/付费」）、URL 规范化 / 标题近似撞最近 lookback_days 天已出的（「重复」）、
      屏蔽名单（每群一份：kv["feeds.blocked.<gid>"]，网页 / 管理员对话按群维护，按域名及子域；
      被标「没用」净值 down-up 累计 ≥3 的域名自动屏蔽，「这个来源被标没用太多次」）；
-   - 打分模型顺带判：grounded=false（「摘要在原文找不到依据」）、junk=true（「垃圾：原因」）、
-     same_as_recent=true（「和最近出过的是同一件事（重复）」，参考最近 14 天已出标题）；
+   - 打分环节 `_score` 同时照本轮打开的正文写出 `summary` / `quote` / `conditions` / `paywall` /
+     可选 `published`，并判 grounded / junk（含水文 / 低质转载 / 洗稿）/ same_as_recent；
+     紧接着 `_hard_reject_model` 复核 paywall、新鲜度（含无日期好文）、`verify_budget.evidence_problem`
+     与非空 `summary`；
 6. 第二道（上网页）：打分模型对每条出 info/source/relevance/timeliness/chat 五项 1–5 分
    （好文的 timeliness 解释成「现在还适用」，核对版本/价格/接口过时没）、
    profile（对应群画像条目的编号；画像给全、按重要性排、上限 60 条）、bridge（从群的哪条兴趣跳过来）、
@@ -719,7 +722,8 @@ _IDEA_GUIDE: tuple[str, ...] = (
 _GUIDES_VIEW_DAYS = 30      # 好文专栏：最近 30 天
 _GUIDES_VIEW_CAP = 20       # 好文专栏最多 20 条
 _QUOTE_MAX = 200            # 子 agent 交回的原文依据最长（截断照收，只有空才淘汰）
-_SCORE_SOURCE_MAX = 1500    # 打分提示里每条带的本轮真读到正文节选上限（控制整批提示长度）
+_SCORE_SOURCE_MAX = 2500    # 打分提示里每条带的本轮真读到正文节选上限（控制整批提示长度；
+# 2026-11 零子 agent 改版起 summary/quote 由打分环节从这段正文里写，给足上下文）
 # 卡片短摘要（brief）的长度口径（2026-10-08 线上巡检 #1301）：打分落库转换处原来 [:140]
 # 硬截，把 176 字的模型原文切在词中间（alpha → al），还把「免费 / 付费限定」整句丢掉；
 # 截断发生在展示核验之前，所以那一轮核验看到的就是截断后的文本、没拦下来（conditions 也在
@@ -1568,6 +1572,7 @@ class Feeds:
         verify_runner: Any = None,
         identity: Any = None,  # identity.py（SOUL/工作记忆注入；None 走老的纯 host 逻辑）
         rss_transport: Any = None,  # httpx.MockTransport（tests）；None = 真实网络
+        tools: Any = None,  # Tools 注册表（tools.py）：主流程代码自己调 fetch_page 打开原文用
     ) -> None:
         self._store = store
         self._models = models
@@ -1590,6 +1595,10 @@ class Feeds:
         self.on_start = on_start
         # RSS 客户端注入（httpx.MockTransport，tests 用；None = 真实网络，接口/备料自己起）
         self._rss_transport: Any = rss_transport
+        # 工具注册表（2026-11 零子 agent 改版）：核验 / 补打开不再派子 agent，主流程代码
+        # 直接经 tools.call("fetch_page") 打开原文（verify_budget 账本 + 页面日期照常走）。
+        # None（老测试没接）→ 打不开正文，候选按「没真打开过」淘汰。
+        self._tools: Any = tools
         # 专岗（specialists.py，契约 C）：app._wire_specialists 挂上；None = 老路（tests 兼容）。
         # 挂上后：news 阶段经 run(kind="news") + 禁岗不回落、task 不动、完成才 review/记经验。
         self._specialists: Any = None
@@ -1608,6 +1617,10 @@ class Feeds:
         # 火花原话（脱敏截断后）：每群最近 6 条的纯内存环，0 SQL。
         # 认领时落 kv["ideas.spark_quotes.<群>"]，构想轮拼进生成输入后清空。
         self._spark_quotes_buf: dict[str, deque] = {}
+
+    def set_tools(self, tools: Any) -> None:
+        """事后接工具注册表（app 启动 / 测试打桩）：fetch_page 由主流程代码自己调。"""
+        self._tools = tools
 
     def _rss_subscribed(self, gid: str) -> bool:
         """本群有没有启用中的 RSS 源（A06：RSS-only 入口判断用；读失败按没有算）。"""
@@ -1681,8 +1694,9 @@ class Feeds:
                         "kind": "news",
                         "published_raw": it.get("published"),
                         "published_ts": it.get("published"),
-                        "fetched": True,  # RSS 源本身算「打开过」；quote 交给子 agent 补
-                        "quote": summary[:_QUOTE_MAX] if summary else title[:_QUOTE_MAX],
+                        "fetched": False,  # 等 _open_candidates 用 fetch_page 真打开原文
+                        "quote": "",
+                        "_hint_snippet": summary[:300],
                         "paywall": False,
                         "image_url": "",
                         "url_key": _normalize_url(url_i),
@@ -2251,31 +2265,24 @@ class Feeds:
         if merged_rss:
             logger.info("RSS 并进候选池（群 %s）：%d 条", gid, merged_rss)
 
-        # ②.3 补打开（2026-09-29）：没真打开过原文的候选，派一个子 agent 一批打开 + 对照原文核对
-        # （news_recheck.py）；出任何错都不拖累这轮，候选原样往下走、照旧按没打开淘汰。
-        # 专岗接上时跑 news 角色的重看工具（fetch_page+web_search），不是通才 workers.run。
-        # RSS 条目也送（pick_unverified 不再跳过 from_rss）：它们的 quote 只是源里的摘要，
-        # 从没打开过原文——RSS-only 轮（搜索坏、只有 RSS）同样要核对，所以这里不再跳过。
-        recheck_mark = collect_mark.replace("feeds-collect:", "feeds-recheck:", 1)
+        # ②.3 打开原文（2026-11 零子 agent 改版）：不再派核验 / 补打开子 agent——搜索挑中的
+        # 候选和 RSS 并进池的条目都在这里由主流程代码用 fetch_page 真打开（一份账本、
+        # 同一 collect task_id 落 tool_calls，统计 / 页面日期按老规矩点数）。开完绑正文证据，
+        # 打不开的照常按「没真打开过」在下面的第一道淘汰；出任何错都不拖累这轮。
         try:
-            from . import news_recheck
-
-            async def _recheck_runner(brief, **kwargs):
-                return await self._recheck_run(gid, recheck_mark, brief, **kwargs)
-
-            await news_recheck.recheck(
-                self._store, _RecheckRunnerProxy(self._workers, _recheck_runner), gid, candidates,
-                collect_mark=collect_mark, recheck_mark=recheck_mark,
-                parse_published=_parse_published, normalize_url=_normalize_url, site_of=_source_site,
-                dup_check=self._dup_url_key_check(gid, settings),
+            await self._open_candidates(
+                gid, candidates, task_id=collect_mark,
+                funnel=two_phase_stats.get("funnel") if isinstance(two_phase_stats, dict) else None,
             )
         except Exception:
-            logger.exception("资讯补打开意外出错（群 %s），这轮跳过补打开", gid)
+            logger.exception("资讯打开原文意外出错（群 %s），候选按没打开处理", gid)
 
-        # ③ 第一道（代码侧）：没打开过 / 付费 / 屏蔽来源 / URL·标题重复
-        # 标题查重成批算 SequenceMatcher，中文标题上界筛不干净时秒级——挪出事件循环
-        # （调用链只读库：Store.read() 在线程里给 query_only 连接）。
-        survivors = await asyncio.to_thread(self._hard_reject_code, gid, settings, candidates)
+        # ③ 第一道（代码侧）：没真打开过（正文证据为本）/ 付费 / 屏蔽来源 / URL·标题重复
+        # —— 2026-11 起不再要求模型回 quote（打分环节才从正文里补 summary/quote），
+        # quote 有值才做逐字核对。标题查重成批算 SequenceMatcher，中文标题上界筛不干净时秒级
+        # ——挪出事件循环（调用链只读库：Store.read() 在线程里给 query_only 连接）。
+        survivors = await asyncio.to_thread(
+            self._hard_reject_code, gid, settings, candidates, require_quote=False)
 
         # ④ 打分（幸存者为空就不调模型，省额度）
         if survivors:
@@ -2510,12 +2517,25 @@ class Feeds:
     # 第一道（代码侧）
     # ------------------------------------------------------------------
 
-    def _hard_reject_code(self, gid: str, settings: Settings, candidates: list[dict]) -> list[dict]:
+    def _hard_reject_code(
+        self,
+        gid: str,
+        settings: Settings,
+        candidates: list[dict],
+        *,
+        require_quote: bool = True,
+    ) -> list[dict]:
         """第一道硬性淘汰里「不调模型」的部分；被筛的打上 item["reject"]=(gate, reason)。
 
         返回幸存列表（candidates 里没打 reject 的；顺序保持子 agent 交回的原序）。
         资讯的新鲜度硬规则也在这里：发布时间超过 _NEWS_MAX_AGE_DAYS 天的资讯一律算旧闻
         （拿不到发布时间的不拦，交给模型的新鲜度分）。
+
+        require_quote=False（2026-11 零子 agent 改版，群资讯轮走这条路）：
+        候选的 summary/quote 由打分环节从正文补，这里不再要模型自报的 quote——
+        只认「本轮代码真打开过原文」（_fetched_evidence 是本回绑定，且文章正文非空）；
+        模型填了 quote 的照样做逐字核对。kind=guide 且没读到发布时间的（等打分再定），
+        不再在这里硬拒（published_ts 是数字的照旧在这里查新旧）。
         """
         blocked = self._blocked_domains(gid, settings)
         auto_blocked = set(self._auto_blocked_domains(gid))
@@ -2534,10 +2554,27 @@ class Feeds:
             item["site"] = site
             if item.get("reject"):
                 continue  # 补打开核对已经给了淘汰理由（旧闻 / 原文不支持），别覆盖
-            # 2026-10-13：依据必须是本轮代码真读到的正文里的原话（不是标题 / 导航 / 模型自报）
-            evidence_problem = verify_budget.evidence_problem(item)
-            if evidence_problem:
-                item["reject"] = ("hard", evidence_problem)
+            if not require_quote:
+                # 零子 agent：只信本轮代码真读到的正文（不能拿搜索摘要当依据）。
+                # _fetched_evidence 是 bind_pages 绑上的 FetchedPage（本回打开记录）；
+                # 页面只有标题/导航、读不出正文（_source_body 空）一样不行。
+                page = item.get("_fetched_evidence")
+                if not isinstance(page, verify_budget.FetchedPage):
+                    item["reject"] = ("hard", "原文没打开过/打不开")
+                elif _normalize_url(str(item.get("url") or "")) not in {
+                    _normalize_url(page.url),
+                    _normalize_url(page.final_url),
+                }:
+                    item["reject"] = ("hard", "原文依据与本轮打开的链接不一致")
+                elif not str(item.get("_source_body") or "").strip():
+                    item["reject"] = ("hard", "原文只有标题/导航，正文依据不足")
+            else:
+                # 2026-10-13：依据必须是本轮代码真读到的正文里的原话（不是标题 / 导航 / 模型自报）
+                evidence_problem = verify_budget.evidence_problem(item)
+                if evidence_problem:
+                    item["reject"] = ("hard", evidence_problem)
+            if "reject" in item:
+                pass  # 依据关没过：理由已在上面写好，别覆盖
             elif item.get("paywall"):
                 item["reject"] = ("hard", "原文要登录/付费")
             elif site and _domain_blocked(site, blocked):
@@ -2549,7 +2586,7 @@ class Feeds:
             elif _any_similar(item["title"], seen_titles, _TITLE_DEDUP_RATIO):
                 item["reject"] = ("hard", "和最近出过的重复（标题高度相似）")
             if "reject" not in item:
-                self._news_freshness_reject(item)
+                self._news_freshness_reject(item, defer_guide_no_date=not require_quote)
             if "reject" not in item:
                 survivors.append(item)
                 if url_key:
@@ -2558,15 +2595,18 @@ class Feeds:
         return survivors
 
     @staticmethod
-    def _news_freshness_reject(item: dict) -> None:
+    def _news_freshness_reject(item: dict, *, defer_guide_no_date: bool = False) -> None:
         """新鲜度硬规则（代码判）：
         - 资讯：发布时间已知且超过 _NEWS_MAX_AGE_DAYS 天 → 旧闻；拿不到发布时间的不拦（交给模型的新鲜度分）。
         - 文章（guide）：必须有发布时间且在 GUIDE_MAX_AGE_DAYS 天内（宁缺毋滥；线上见过 1426 天的工具页
-          被模型打「还适用 4 分」）。"""
+          被模型打「还适用 4 分」）。
+        defer_guide_no_date（2026-11 零子 agent 群资讯轮）：页面没读到发布时间时先放行——
+        打分后 _hard_reject_model 里的「文章没有发布时间」兜底照样拒（宁缺毋滥不松）。"""
         if item.get("kind") == "guide":
             published = item.get("published_ts")
             if not isinstance(published, (int, float)):
-                item["reject"] = ("hard", "文章没有发布时间，宁缺毋滥不收")
+                if not defer_guide_no_date:
+                    item["reject"] = ("hard", "文章没有发布时间，宁缺毋滥不收")
                 return
             age_days = (clock.now() - float(published)) / 86400.0
             if age_days > GUIDE_MAX_AGE_DAYS:
@@ -2645,6 +2685,23 @@ class Feeds:
     def _hard_reject_model(self, survivors: list[dict]) -> None:
         for item in survivors:
             if "reject" in item:
+                continue
+            # 打分后的硬复核（2026-11 零子 agent 改版）：模型刚写回的 paywall / quote / 日期
+            # 都可能改变结论——顺序：付费 → 新鲜度（含「文章没有发布时间」兜底）→
+            # 引用的原话逐字对本轮读到的正文（模型新给的 quote 尤其要重查）。
+            if item.get("paywall"):
+                item["reject"] = ("hard", "原文要登录/付费")
+                continue
+            self._news_freshness_reject(item)
+            if "reject" in item:
+                continue
+            problem = verify_budget.evidence_problem(item)
+            if problem:
+                item["reject"] = ("hard", problem)
+                continue
+            if not str(item.get("summary") or "").strip():
+                # 打分没从正文写出摘要（读不出有效内容）→ 不能进写帖 / 入库
+                item["reject"] = ("hard", "正文读不出有效内容（空摘要）")
                 continue
             flags = item.get("_flags") or {}
             relation = str(flags.get("relation") or "")
@@ -3756,7 +3813,7 @@ class Feeds:
             funnel["queries"] = int(funnel.get("queries") or 0) + 1
             _funnel_note_query(funnel, q)
             discovery.record(
-                run_mark, query=q, focus=focus_no, provider="", results=results or []
+                run_mark, query=q, focus=focus_no, provider="", results=results or [], kind=kind
             )
 
         gathered = await asyncio.gather(
@@ -3920,13 +3977,23 @@ class Feeds:
             kept = rr
         return kept[:cap_total], dropped, {}
 
+    @staticmethod
+    def _cand_kind(c: dict) -> str:
+        """候选自带的 kind（补找/老格式会带 guide）；没标 / 乱标 → news。"""
+        return "guide" if str(c.get("kind") or "").strip().lower() == "guide" else "news"
+
     async def _pick(self, gid: str, focus: list[dict], kept: list[dict], *, task_id: str = "") -> tuple[list[tuple[dict, str, str]], bool]:
-        """挑（协程版；本体）。失败回落前 10 条（hook 空 → 不拦）。
+        """挑（协程版；本体）。失败回落前 10 条（hook 空 → 不拦；候选自带 kind 保留）。
         task_id（C03）：本轮资讯的标记，落进 usage 表算这轮的模型用量。"""
         from .models import ModelError
 
         if not kept:
             return [], False
+        guides_ok = bool(getattr(self._get_settings().feeds, "guides", True))
+
+        def _kind_of(c: dict) -> str:
+            return "guide" if guides_ok and self._cand_kind(c) == "guide" else "news"
+
         profile_lines = self._brief_profile_lines(gid)
         lines: list[str] = [f"{i}. {f['query']}" for i, f in enumerate(focus, 1)]
         cand_lines: list[str] = []
@@ -3964,13 +4031,13 @@ class Feeds:
             data = _parse_model_json(result.text)
         except (ModelError, ValueError, TypeError, KeyError) as e:
             logger.info("挑候选失败（群 %s）：%s，回落前 10 条", gid, e)
-            return [(c, "news", "") for c in kept[:10]], False
+            return [(c, _kind_of(c), "") for c in kept[:10]], False
         except Exception:
             logger.exception("挑候选意外出错（群 %s），回落前 10 条", gid)
-            return [(c, "news", "") for c in kept[:10]], False
+            return [(c, _kind_of(c), "") for c in kept[:10]], False
         picks_raw = data.get("picks") if isinstance(data, dict) else None
         if not isinstance(picks_raw, list):
-            return [(c, "news", "") for c in kept[:10]], False
+            return [(c, _kind_of(c), "") for c in kept[:10]], False
         out: list[tuple[dict, str, str]] = []
         used = kept if len(kept) <= FETCH_PICK[1] else kept[: FETCH_PICK[1]]
         seen_i: set[int] = set()
@@ -3987,197 +4054,15 @@ class Feeds:
             if not hook:
                 continue  # 没具体理由的不开
             kind = str(p.get("kind") or "news").strip().lower()
-            if kind not in ("news", "guide"):
+            if kind not in ("news", "guide") or (kind == "guide" and not guides_ok):
                 kind = "news"
             out.append((kept[i], kind, hook))
             seen_i.add(i)
             if len(out) >= FETCH_PICK[1]:
                 break
         if not out:
-            return [(c, "news", "") for c in used[:10]], False
+            return [(c, _kind_of(c), "") for c in used[:10]], False
         return out, True
-
-    def _verify_brief(self, gid: str, group: list[tuple[dict, str, str]]) -> str:
-        """核验子 agent 的 brief：资讯标准 + 本组每条（url/title/snippet/kind/hook），只许 fetch_page。
-
-        2026-09-30 线上实录（8 分钟 23 次 fetch_page 的「找日期打转」）后加硬规矩：
-        只开候选链接本身（打不开最多换一个备用地址），不许搜镜像 / 存档站 / API；
-        页面上没有可见发布日期，就用搜索结果自带的日期（下面每条已列出），没有就留空。
-        2026-10（炉石补丁帖把玩家回帖拼进 quote）：分清来源身份（SOURCE_IDENTITY_RULES），
-        引导页允许多开它链出的那一个完整原文；交回 conditions（读者必须知道的限定条件）。
-        """
-        today = clock.bj(clock.now()).strftime("%Y-%m-%d")
-        guides = True  # 核验这步不作「找不找文章」的决定：挑里带 kind，照老格式交回
-        lines: list[str] = []
-        for n, (c, kind, hook) in enumerate(group):
-            hint = f"（同事判断这是 {'资讯' if kind == 'news' else '文章'}）"
-            hook_text = f"\n    同事为什么觉得值得打开：{hook}" if hook else ""
-            pub = c.get("published")
-            date_text = (
-                f"\n    搜索结果自带的发布日期：{clock.bj(float(pub)).strftime('%Y-%m-%d')}"
-                "（页面上找不到可见日期就用这条，别为了它在页面上翻来翻去）"
-                if isinstance(pub, (int, float)) and pub else ""
-            )
-            lines.append(
-                f"[{n}] 标题：{c.get('title') or ''}{hint}\n    链接：{c.get('url') or ''}\n"
-                f"    搜索摘要：{str(c.get('snippet') or '')[:200]}{hook_text}{date_text}"
-            )
-        gc = self._group_context_safe(gid, "news")
-        return (
-            (gc.strip() + "\n" if gc else "")
-            + f"今天是 {today}（北京时间）。下面 {len(group)} 条是同事撒网搜出来、粗筛后挑中要打开的候选。\n"
-            "请逐条用 fetch_page 打开原文核对：\n"
-            + news_standard.for_collect(guides)
-            + "\n\n要求：\n"
-            "1. 每条都必须用 fetch_page 真打开过原文（只用 fetch_page，**不要搜索**）；\n"
-            "2. **只开候选链接本身**：打不开最多再换一个备用地址（比如标题链接跳转后的地址）试一次；"
-            "唯一的例外：候选页只是引导、关键内容在它链出的完整原文里（见第 9 条），允许为此多开这一个完整原文链接。"
-            "**绝不为了找信息去搜或去开镜像站、存档站（web.archive）、oEmbed / API 之类的接口**——"
-            "候选打不开就标打不开，别硬啃；\n"
-            "3. 发布日期：页面上有直接可见的就用页面上的（它和搜索结果自带的对不上以页面为准），"
-            "页面上只写相对时间（「3 小时前」「昨天」「2 days ago」）就把那段文字原样填进 published、别自己换算，"
-            "页面上找不到可见日期就用「搜索结果自带的发布日期」，没有再留空——"
-            "**不许为了找日期多开任何页面**；\n"
-            f"4. 每条：title（原标题或大意）、url（原文链接）、summary（2–4 句中文纯文本，别用 Markdown）、"
-            f"kind（{'news 或 guide，照同事的 hint 填，你判断 hint 明显不对可以改'}）、"
-            f"published（发布时间，ISO 格式或 epoch 秒，拿不到空字符串）、"
-            f"fetched（确实打开过 true）、quote（从原文抄一小段能支撑摘要的依据，≤{_QUOTE_MAX} 字）、"
-            "paywall（要登录/付费 true）、image_url（有封面图就抄过来）、"
-            + CONDITIONS_RULE + "；\n"
-            "5. 每条候选的打开次数有限（程序按组封死），次数用完工具会直接拒绝——"
-            "别再找别的页面，用已经打开到的内容按格式交回；\n"
-            "6. **按内容卡质量（逐篇看内容，不看站点出身）**：逐条判断这篇是不是——"
-            "水文（没有新信息、凑字数、标题党）、低质转载（整段搬运、没注明或丢了原始出处）、"
-            "洗稿（换说法重写别人的报道、没有自己的东西）。是 → quality=false，"
-            "quality_reason 用中文大白话写清，例如「水文：没有新信息」"
-            "「低质转载：整段搬运，没注明出处」「洗稿：改写自 IGN 的报道」；"
-            "不是 → quality=true；\n"
-            "7. **找到原始出处就交原文链接**：转载但信息完整的，页面上认得出原始来源"
-            "（正文里注明的来源 / 原文链接）→ 先用 fetch 打开原文确认是同一件事、能打开，"
-            "再把它填进 original_url（没打开过的不许填），url 维持你打开核对的那条；"
-            "认不出就留空，别硬编；\n"
-            "8. 门户 / 导购站（163、新浪、搜狐、news.qq、17173、gamersky、什么值得买等）这类站"
-            "更常见上面这些问题，打开时**重点看**——但只是多看一眼的提醒，不是「一概不收」："
-            "内容过关（有自己的采访 / 实测 / 完整信息）的门户稿照样收；\n"
-            "9. " + SOURCE_IDENTITY_RULES + "；\n"
-            "10. 最后用 submit_result 交回，data 按约定的 JSON Schema；\n"
-            f"你只有大约 {VERIFY_MINUTES} 分钟，到点前把已经核对完的交回来。\n\n"
-            + "\n\n".join(lines)
-        )
-
-    async def _verify_batch(
-        self,
-        gid: str,
-        picks: list[tuple[dict, str, str]],
-        verify_mark: str,
-        deadline_ts: float,
-    ) -> tuple[list[dict], int]:
-        """把挑中的候选均分给最多 VERIFY_WORKERS 个子 agent 并发核验。
-
-        返回 (items, opened)：items 是老格式候选 dict（query/provider/focus 已从挑的候选接回）；
-        opened = 交回时报 fetched=true 的条数。一个子 agent 炸了只丢它自己那份（别的照收）。
-
-        专岗接上时每个核验组走 ContextVar 的 `_stage_isolated`：并发组串不到对方那轮，
-        整批失败（return_exceptions=True）就把落空那组的 handoff 收尾成终态（retry rejected）。
-        """
-        import asyncio
-
-        if not picks:
-            return [], 0
-        n_workers = max(1, min(VERIFY_WORKERS, len(picks)))
-        groups: list[list[tuple[dict, str, str]]] = [[] for _ in range(n_workers)]
-        for k, pick in enumerate(picks):
-            groups[k % n_workers].append(pick)
-        groups = [g for g in groups if g]
-
-        async def _one(k: int, group: list[tuple[dict, str, str]]) -> list[dict]:
-            # 这组核验的打开页数账本（代码硬上限；fetch_page handler 按 task_id 查账）。
-            # 宁可按「刚好够用」开（cap_for：条数×2+1、最多 6），防「找日期打转」。
-            from . import verify_budget
-
-            group_mark = f"{verify_mark}:{k}"
-            verify_budget.open_run(group_mark, cap_page_calls=verify_budget.cap_for(len(group)))
-
-            async def _inner() -> list[dict]:
-                report = await self._run_stage(
-                    gid, phase="verify", brief=self._verify_brief(gid, group),
-                    task_id=group_mark,
-                    output_schema=_NEWS_OUTPUT_SCHEMA, deadline_ts=deadline_ts,
-                    actor=f"资讯核验 子 agent #{k}", max_steps=0,
-                )
-                data = getattr(report, "data", None)
-                if not getattr(report, "ok", False):
-                    raise ValueError(str(getattr(report, "error", "") or getattr(report, "summary", "") or "核验子 agent 没干成"))
-                if not isinstance(data, dict) or not isinstance(data.get("items"), list):
-                    raise ValueError("核验子 agent 交回的格式不对")
-                by_key = {_normalize_url(c.get("url") or ""): c for c in (g[0] for g in group)}
-                items = self._parse_news_items(data["items"], results=True)
-                dup_check = self._dup_url_key_check(gid, self._get_settings())
-                for item in items:
-                    # 按内容卡质量（2026-10-03，不按站点拉黑）：水文 / 低质转载 / 洗稿直接拒，
-                    # 理由用核验子 agent 写的中文大白话，进被拒列表网页可见
-                    if item.get("quality") is False and not item.get("reject"):
-                        q_reason = str(item.get("quality_reason") or "").strip()
-                        item["reject"] = ("hard", q_reason or "水文 / 低质转载 / 洗稿，按内容不过关")
-                        continue
-                    # 换链接后立刻再查一次重（核验把 url 改写成了 original_url）：
-                    # 新 url_key 撞「最近已发布 / 最近被拒」立刻按「同一个链接」拒，不再往下打分
-                    if item.get("_src_url_key") and not item.get("reject") and dup_check(str(item.get("url_key") or "")):
-                        item["reject"] = ("hard", "和最近出过的重复（同一个链接）")
-                        continue
-                    src = by_key.get(str(item.get("_src_url_key") or item.get("url_key") or ""))
-                    if src is None:
-                        continue
-                    if src.get("query"):
-                        item["src_query"] = str(src.get("query") or "")
-                    if src.get("provider"):
-                        item["src_provider"] = str(src.get("provider") or "")
-                    if src.get("focus") is not None:
-                        item["src_focus"] = src.get("focus")
-                    # 发布日期兜底（2026-09-30 线上实测）：核验没拿到日期时，
-                    # 用撒网候选自带的搜索结果日期补上——搜索结果本身经常带日期，
-                    # 别因为这被「文章没有发布时间，宁缺毋滥不收」硬拒掉。
-                    # （核验自己拿到日期的以它为准，不覆盖。）
-                    if not isinstance(item.get("published_ts"), (int, float)):
-                        cand_pub = src.get("published")
-                        if isinstance(cand_pub, (int, float)) and cand_pub:
-                            item["published_ts"] = float(cand_pub)
-                            item["date_basis"] = "search"
-                            if item.get("published_raw") in (None, ""):
-                                item["published_raw"] = float(cand_pub)
-                # 代码兜底（2026-10-05 §九 第一步 2）：核验没拿到、搜索结果也没有日期时，
-                # 用 fetch_page 从原始 HTML（meta / JSON-LD / <time>）读到的日期补上——
-                # 好文（guide）不再因为「页面上的日期没被看见」被硬拒。
-                self._fill_dates_from_pages(group_mark, items)
-                # 关账本之前把本轮真读到的正文挂到候选上（第一道按它核依据）
-                verify_budget.bind_pages(group_mark, items)
-                return items
-
-            try:
-                return await self._stage_isolated(_inner(), gid)
-            except Exception:
-                self._drop_news_round_records(gid, f"核验组 #{k} 失败，重试被拒")
-                raise
-            finally:
-                verify_budget.close_run(group_mark)
-
-        results = await asyncio.gather(
-            *[_one(k, g) for k, g in enumerate(groups)], return_exceptions=True
-        )
-        out: list[dict] = []
-        for res in results:
-            if isinstance(res, BaseException):
-                logger.info("核验子 agent 一组失败（群 %s），只丢它那一组：%s", gid, res)
-                continue
-            out.extend(res)
-        # 轮循分组会把顺序打散（组 0 拿第 0/3/6… 条）；交回前按挑（picks）的顺序排回去，
-        # 让下游「第 i 条候选」和打分模型的编号在老用例口径下始终对得上。
-        order = {
-            _normalize_url(c.get("url") or ""): idx for idx, (c, _kind, _hook) in enumerate(picks)
-        }
-        out.sort(key=lambda it: order.get(str(it.get("_src_url_key") or it.get("url_key") or ""), len(order)))
-        opened = sum(1 for it in out if it.get("fetched"))
-        return out, opened
 
     async def _collect_two_phase(
         self,
@@ -4188,7 +4073,10 @@ class Feeds:
         collect_mark: str,
         stats_out: dict,
     ) -> list[dict]:
-        """两阶段的主编排：撒网（代码按计划搜）→ 保底 → 粗筛 → 挑 → 核验 → 候选（老格式，下游照旧）。
+        """两阶段的主编排：撒网（代码按计划搜）→ 保底 → 粗筛 → 挑 → 候选（老格式，下游照旧）。
+
+        2026-11 零子 agent 改版：原「核验子 agent」一步已删——挑中的候选直接落成「没打开」
+        格式的候选 dict，打开原文由 _prepare_news_round 的 _open_candidates 统一做。
 
         collect_mark 是这轮的「老标记」（feeds-collect:...）：撒网登记簿沿用 feeds-discover:
         同一个 base 的 run id（统计 _round_stats 按标记点数，见那里）。
@@ -4365,24 +4253,52 @@ class Feeds:
             picks, _used_model = await self._pick(gid_s, focus, kept, task_id=collect_mark)
         except Exception:
             logger.exception("挑候选意外出错（群 %s），回落前 10 条", gid_s)
-            picks = [(c, "news", "") for c in kept[:10]]
+            guides_ok = bool(getattr(settings.feeds, "guides", True))
+            picks = [(c, self._cand_kind(c) if guides_ok else "news", "") for c in kept[:10]]
         funnel["timings_s"]["pick"] = max(0.0, clock.now() - t3)
         funnel["picked"] = len(picks)
         if not picks:
             self._drop_news_round_records(gid_s, "挑完没开任何候选")
             return []
 
-        # ⑤ 核验（并发；一组炸只丢一组）
-        t4 = clock.now()
-        items, opened = await self._verify_batch(
-            gid_s, picks, verify_mark=verify_mark,
-            deadline_ts=clock.now() + VERIFY_MINUTES * 60,
-        )
-        funnel["timings_s"]["verify"] = max(0.0, clock.now() - t4)
-        funnel["opened"] = opened
+        # ⑤ 候选落成「没打开」格式（2026-11 零子 agent 改版：核验子 agent 已删，
+        # 打开原文由 _prepare_news_round 的 _open_candidates 统一做——RSS 条目同一批走）：
+        # 挑中的候选直接转成老格式 dict，title/summary/quote 留空等打分环节从正文里补；
+        # 撒网端的 query/provider/focus 照旧接回去（src_query/src_provider 入库），
+        # 搜索摘要只留 _hint_snippet（给打分当线索、不算依据）。verify_mark 不再派工。
+        del verify_mark  # 历史标记（老批次统计向后兼容在 _round_stats），本轮不用
+        items: list[dict] = []
+        for cand, kind, hook in picks:
+            url = _public_http_url(cand.get("url"))
+            if not url:
+                continue
+            item: dict = {
+                "title": str(cand.get("title") or "").strip(),
+                "url": url,
+                "url_key": _normalize_url(url),
+                "site": _source_site(url),
+                "kind": str(kind or "news"),
+                "summary": "",
+                "quote": "",
+                "conditions": [],
+                "image_url": str(cand.get("image_url") or ""),
+                "fetched": False,
+                "paywall": False,
+                # 搜索摘要只是线索：打分时给模型看一眼，但明写「不算依据，以正文为准」
+                "_hint_snippet": str(cand.get("snippet") or "")[:300],
+                "_pick_hook": str(hook or "")[:200],
+                "src_query": cand.get("query"),
+                "src_provider": cand.get("provider"),
+                "src_focus": cand.get("focus"),
+                "explore": bool(cand.get("explore")),
+            }
+            if cand.get("published"):
+                item["published_ts"] = cand.get("published")
+                # 日期来自搜索结果（不是页面 / 不是模型）：resolve_dates 认这个依据
+                item["date_basis"] = "search"
+            item["published_raw"] = cand.get("published")
+            items.append(item)
         funnel["returned"] = len(items)
-        # 搜索次数合计：代码撒网在 _run_planned_searches 里逐次计数 + 保底补搜的次数，
-        # 都在这里 funnel["queries"] 里（2026-10-01 起撒网不再派子 agent，没有 tool_calls 要补）
         # 「不同角度 / 拓展」标记（老 _collect 的规矩，两阶段恒生效后挪这里）：
         # 候选来自哪个方向看 src_focus（挑的时候接回来的撒网方向编号），
         # 那个方向是 diverse → angle='diverse'；该方向 source=explore 或条目标了
@@ -4400,6 +4316,109 @@ class Feeds:
             ):
                 item["angle"] = "explore"
         return items
+
+    async def _open_candidates(
+        self,
+        gid: str,
+        candidates: list[dict],
+        *,
+        task_id: str,
+        funnel: dict | None = None,
+    ) -> None:
+        """统一打开原文（2026-11 零子 agent 改版）：搜索挑中的候选和 RSS 并进池的条目
+        都在这里用 fetch_page 真打开——不再派核验 / 补打开子 agent。
+
+        - 每条一次 fetch_page（并发 ≤4，单条 45 秒超时；一条失败不拖累整批）；
+        - 开 verify_budget 账本（上限=要开的条数）：fetch_page handler 里 consume/record_page
+          照旧走，工具调用按 collect task_id 落 tool_calls（统计/页面日期都在它名下点数）；
+        - res.ok 之后：补 image_url / 空 title；final_url 是合法公网地址且换了链接 →
+          改写 url/url_key/site（旧 key 留 _src_url_key），立刻再查一次重；
+        - 全开完（关账前）：_fill_dates_from_pages 拿页面日期 → bind_pages 绑上本轮正文
+          （_fetched_evidence/_source_body；标题党页面自动没有证据）→ fetched 同步；
+        - 没接 tools（老测试 / 没注册 fetch_page）：一条不开，候选按「没真打开过」淘汰；
+        - funnel 给了就填 opened / timings_s["verify"]（沿用老环节名，网页漏斗不动）。
+        """
+        t_open = clock.now()
+        tools = getattr(self, "_tools", None)
+        to_open = [c for c in candidates if isinstance(c, dict)
+                   and not c.get("reject") and not c.get("_fetched_evidence")]
+        try:
+            if tools is None or not to_open:
+                if isinstance(funnel, dict):
+                    funnel["timings_s"]["verify"] = max(0.0, clock.now() - t_open)
+                    funnel["opened"] = sum(
+                        1 for c in candidates if not c.get("from_rss") and c.get("_fetched_evidence"))
+                return
+            verify_budget.open_run(task_id, cap_page_calls=max(1, len(to_open)))
+            try:
+                from .tools import ToolContext
+
+                settings = self._get_settings()
+                dup_check = self._dup_url_key_check(gid, settings)
+                sem = asyncio.Semaphore(4)
+
+                async def _one(item: dict) -> None:
+                    url = str(item.get("url") or "")
+                    if not url:
+                        return
+                    ctx = ToolContext(
+                        group_id=gid, task_id=task_id,
+                        actor="资讯打开原文", role="worker",
+                    )
+                    try:
+                        async with sem:
+                            res = await asyncio.wait_for(
+                                tools.call("fetch_page", {"url": url}, ctx), timeout=45.0
+                            )
+                    except Exception as e:  # 超时 / 工具炸：这条当打不开，别拖垮整批
+                        logger.info("打开原文出错（群 %s，%s）：%s", gid, url[:80], e)
+                        return
+                    if not getattr(res, "ok", False):
+                        return
+                    data = res.data if isinstance(res.data, dict) else {}
+                    if data:
+                        if not str(item.get("image_url") or "").strip():
+                            img = str(data.get("image_url") or "").strip()
+                            if img:
+                                item["image_url"] = img
+                        # 跳转了：用最终地址（合法公网 http/https 且规范化后不是同一条）改写，
+                        # 旧 key 留 _src_url_key（接回 src_query / 统计用）；
+                        # 换链接后立刻再查一次重（和补打开换源同一规矩，不花模型调用）
+                        final_url = _public_http_url(data.get("final_url"))
+                        if final_url:
+                            new_key = _normalize_url(final_url)
+                            if new_key and new_key != item.get("url_key"):
+                                item["_src_url_key"] = item.get("url_key")
+                                item["url"] = final_url
+                                item["url_key"] = new_key
+                                item["site"] = _source_site(final_url)
+                                if dup_check(str(item.get("url_key") or "")):
+                                    item["reject"] = ("hard", "和最近出过的重复（同一个链接）")
+                    # 空标题兜底：正文「《Title》\n…」抬头，其次工具 data 里的 title
+                    if not str(item.get("title") or "").strip():
+                        t = ""
+                        out = str(getattr(res, "output", "") or "")
+                        if out.startswith("《") and "》\n" in out:
+                            t = out[1:out.index("》\n")]
+                        if not t:
+                            t = str(data.get("title") or "")
+                        if t.strip():
+                            item["title"] = t.strip()[:200]
+
+                await asyncio.gather(*(_one(c) for c in to_open), return_exceptions=True)
+                # 打开全结束了（还在账本期）：页面日期优先 → 绑上本轮真读到的正文
+                self._fill_dates_from_pages(task_id, to_open)
+                verify_budget.bind_pages(task_id, to_open)
+                for c in to_open:
+                    c["fetched"] = bool(c.get("_fetched_evidence"))
+            finally:
+                verify_budget.close_run(task_id)
+            if isinstance(funnel, dict):
+                funnel["timings_s"]["verify"] = max(0.0, clock.now() - t_open)
+                funnel["opened"] = sum(
+                    1 for c in candidates if not c.get("from_rss") and c.get("_fetched_evidence"))
+        except Exception:
+            logger.exception("统一打开原文意外出错（群 %s），候选按没打开处理", gid)
 
     async def _floor_searches(
         self, gid: str, focus: list[dict], candidates: list[dict], funnel: dict
@@ -4477,18 +4496,21 @@ class Feeds:
                 if not url:
                     continue
                 published = raw.get("published")
-                added.append(
-                    {
-                        "title": str(raw.get("title") or "").strip(),
-                        "url": url,
-                        "snippet": str(raw.get("snippet") or "").strip(),
-                        "published": float(published) if isinstance(published, (int, float)) and published else None,
-                        "query": query,
-                        "focus": focus_i,
-                        "provider": str(raw.get("provider") or provider or "").strip(),
-                        "queries": [query] if query else [],
-                    }
-                )
+                cand = {
+                    "title": str(raw.get("title") or "").strip(),
+                    "url": url,
+                    "snippet": str(raw.get("snippet") or "").strip(),
+                    "published": float(published) if isinstance(published, (int, float)) and published else None,
+                    "query": query,
+                    "focus": focus_i,
+                    "provider": str(raw.get("provider") or provider or "").strip(),
+                    "queries": [query] if query else [],
+                }
+                if str(raw.get("kind") or "").strip().lower() == "guide":
+                    cand["kind"] = "guide"
+                if raw.get("explore") is True:
+                    cand["explore"] = True
+                added.append(cand)
                 n += 1
             return n
 
@@ -4680,6 +4702,14 @@ class Feeds:
         instr = (
             "请给每条打分，只回 JSON："
             '{"scores": [{"i": 编号,'
+            ' "summary": 这条的中文摘要（2–4 句、≤400 字、纯文本别用 Markdown；'
+            '严格按「本轮读到的原文正文」写，搜索/RSS 摘要只能当线索不能照抄；'
+            '正文和标题对不上、读不出内容的给空字符串）,'
+            ' "quote": 从上面「本轮读到的原文正文」里逐字抄一小段（≤200 字，'
+            '必须能在原文里一字不差找到，别改写别拼接别自己编）,'
+            ' "conditions": 摘要成立必须保留的限定词数组（限时/指定型号/仅部分用户之类，没有给 []）,'
+            ' "paywall": 原文要登录/付费才能看全吗 true/false,'
+            ' "published": 正文里读到的发布日期（"YYYY-MM-DD"；读不到给空字符串，别编）,'
             ' "info": 信息量 1到5, "source": 来源 1到5, "relevance": 相关度 1到5, "timeliness": 时效 1到5,'
             ' "chat": 值得聊 1到5, "novelty": 新鲜感 1到5, "surprise": 意外度 1到5（各项分档见上面的资讯标准）,'
             ' "profile": relevance 对应的是上面哪一条画像（回它的编号；没有就说 null）,'
@@ -4689,8 +4719,15 @@ class Feeds:
             ' "topic": 这条的话题标签（不超过 8 个字，同一类事给同一个标签）,'
             ' "sensitive": 政治/争议话题吗 true/false,'
             ' "grounded": 上面的摘要能在 quote/原文里找到依据吗 true/false,'
-            ' "junk": 按资讯标准是垃圾吗（标题党/软文/营销号/纯情绪；资讯的商店页、资料页、政府通讯稿也算）true/false,'
-            ' "junk_reason": junk 是 true 的话写一个简短原因（如「不是新闻（商店页/资料页）」「政府通讯稿，和群无关」），否则空字符串,'
+            # 质量闸并入打分（2026-11 零子 agent 改版，原核验子 agent 的检查一条不丢）：
+            ' "junk": 按资讯标准是垃圾吗（标题党/软文/营销号/纯情绪；资讯的商店页、资料页、政府通讯稿也算；'
+            '水文（没有新信息、凑字数、标题党）、低质转载（整段搬运、没注明原始出处）、'
+            '洗稿（换说法重写别人的报道、没有自己的东西）也都算；'
+            '门户 / 导购站（163、新浪、搜狐、news.qq、17173、gamersky、什么值得买等）的稿件重点多看内容本身，'
+            '有过关实测或一手信息照收；'
+            + SOURCE_IDENTITY_RULES + '）true/false,'
+            ' "junk_reason": junk 是 true 的话写一个简短原因（如「不是新闻（商店页/资料页）」「政府通讯稿，和群无关」'
+            '「水文：没有新信息」「低质转载：整段搬运，没注明出处」「洗稿：改写自别家报道」），否则空字符串,'
             ' "same_as_recent": 是不是和上面「最近发过的」某条讲的是同一件事 true/false,'
             ' "dup_of": 如果这条和上面「最近发过的」某条（R 开头编号）是「同一件事」，'
             '就回那个编号（例如 "R2"），否则回 null。同一件事指：同一个事件/公告/产品消息，'
@@ -4774,7 +4811,21 @@ class Feeds:
             # G2：guide 的 not_article 判断（是新闻/工具页/资料页就不是文章）
             flags["not_article"] = bool(s.get("not_article", False))
             flags["not_article_reason"] = str(s.get("not_article_reason") or "")[:80]
+            # 抽取字段（2026-11 零子 agent 改版）：summary/quote/conditions/paywall/published
+            # 由模型照正文写回；键没在回复里出现 → None（留候选原值，不覆盖）。
+            ext = {
+                "summary": (str(s["summary"]).replace("\n", " ").strip()[:400]
+                            if "summary" in s else None),
+                "quote": (str(s["quote"]).replace("\n", " ").strip()[:_QUOTE_MAX]
+                          if "quote" in s else None),
+                "conditions": (clean_conditions(s.get("conditions"))
+                               if "conditions" in s else None),
+                "paywall": (bool(s.get("paywall")) if "paywall" in s else None),
+                "published": (str(s.get("published") or "").strip()[:40]
+                              if "published" in s else None),
+            }
             return {
+                "ext": ext,
                 "scores": five,
                 "why": str(s.get("why") or "").strip()[:200],
                 # 卡片短摘要：只给群卡片用（网页照旧 summary）；换行变空格，正常长度原样保留，
@@ -4865,7 +4916,8 @@ class Feeds:
                     ls.append("")
                 ls.append(
                     "下面是这一批要打分的候选（编号沿用全批的编号；kind=news 资讯 / guide 好文；"
-                    "quote 是子 agent 从原文抄的依据）："
+                    "每条带本轮代码真读到的原文正文节选——summary/quote 都由你从这里写，"
+                    "「搜索/RSS 线索」只是提示，不算依据）："
                 )
                 for i in pending:
                     c = candidates[i]
@@ -4876,10 +4928,19 @@ class Feeds:
                     pub = c.get("published_raw")
                     pub_text = f"，发布于 {pub}" if pub else ""
                     conds = _conditions_text(c)
+                    # 已有摘要（RSS 源给过的只作线索、不算依据）统一标注成线索或摘要
+                    if c.get("from_rss"):
+                        hint = str(c.get("_hint_snippet") or c.get("summary") or "").replace("\n", " ")[:250]
+                        lead = (f"［搜索/RSS 线索：{hint}］" if hint else "（没有摘要，以正文为准）")
+                    else:
+                        lead = str(c.get("summary") or "")[:300]
+                        if not lead:
+                            hint = str(c.get("_hint_snippet") or "").replace("\n", " ")[:250]
+                            lead = (f"［搜索/RSS 线索：{hint}］" if hint else "（没有摘要，以正文为准）")
                     # 代码在本轮打开网页时留下的正文（不是模型自报），给 grounded 判断对照
                     source_body = str(c.get("_source_body") or "").replace("\n", " ")[:_SCORE_SOURCE_MAX]
                     ls.append(
-                        f"[{i}]（{kind_zh}）{c['title']} —— {c['summary'][:300]}（{c['url']}{pub_text}）"
+                        f"[{i}]（{kind_zh}）{c['title']} —— {lead}（{c['url']}{pub_text}）"
                         + (f" 原文依据：{quote[:150]}" if quote else "")
                         + (f" 必须保留的限定：{conds}" if conds else "")
                         + (f" 本轮读到的原文正文（节选）：{source_body}" if source_body else "")
@@ -4997,6 +5058,26 @@ class Feeds:
                 })
                 continue
             item["scores"] = s["scores"]
+            # 抽取字段写回（模型给了才盖；没给保留候选原值——RSS 源摘要 / 老字段照旧）
+            ext = s.get("ext") or {}
+            if ext.get("summary") is not None:
+                item["summary"] = ext["summary"]
+            if ext.get("quote") is not None:
+                item["quote"] = ext["quote"]
+            if ext.get("conditions") is not None:
+                item["conditions"] = ext["conditions"]
+            if ext.get("paywall") is not None:
+                item["paywall"] = ext["paywall"]
+            if ext.get("published"):
+                # 模型读的日期只作兜底：页头 / RSS / 搜索结果已经定好的 published_ts
+                # （page_date resolve 或候选自带的）是权威值，绝不被模型猜的盖掉
+                pub_ts = _parse_published(ext["published"])
+                if isinstance(pub_ts, (int, float)) and not isinstance(
+                    item.get("published_ts"), (int, float)
+                ):
+                    item["published_ts"] = pub_ts
+                    item["published_raw"] = ext["published"]
+                    item["date_basis"] = "model"
             item["why"] = s["why"]
             item["brief"] = s["brief"]
             item["icon"] = s["icon"]

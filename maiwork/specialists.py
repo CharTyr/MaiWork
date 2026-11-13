@@ -79,8 +79,9 @@ RESEARCH_KINDS = ("news", "idea", "goal")
 # 自动回合各环节的基础工具名单（2026-10-30 起：调用点写死的名单收进这张表，
 # 展示与实际读同一份事实；做法带来的工具由 phase_tools 现算叠上）。
 AUTO_PHASES: dict[tuple[str, str], tuple[str, ...]] = {
-    ("news", "verify"):      ("fetch_page",),
-    ("news", "recheck"):     ("fetch_page", "web_search"),
+    # 2026-11 零子 agent 改版：news 的 verify（核验子 agent）/ recheck（补打开子 agent）
+    # 两个环节已删——打开原文由主流程代码直接 fetch_page（feeds._open_candidates /
+    # Personal._collect），不再派子 agent，表里也就没有它们的工具名单。
     ("news", "supplement"):  (),                      # 只给做法带来的工具
     ("idea", "investigate"): ("web_search", "social_search", "fetch_page", "read_profile",
                               "list_skills", "read_skill"),

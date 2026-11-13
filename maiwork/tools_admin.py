@@ -1234,7 +1234,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
             else:
                 where.append("group_id=''")
         task_id = str(args.get("task_id") or "").strip()
-        if task_id:  # 前缀匹配：feeds-verify 能捞出本轮核验 / 补找的全部调用
+        if task_id:  # 前缀匹配：feeds-collect 能捞出本轮撒网 / 打开原文 / 补找的全部调用
             where.append("substr(task_id, 1, ?) = ?")
             params.extend([len(task_id), task_id])
         tool_q = str(args.get("tool") or "").strip()
@@ -3210,7 +3210,7 @@ def register_admin_tools(tools: Tools, svc: Any) -> PendingGate:
                         "kind": {"type": "string", "enum": ["models", "tools", "all"],
                                  "description": "看哪种日志：models（模型调用，默认）/ tools（工具调用）/ all（两种）"},
                         "group_id": {"type": "string", "description": "群号（可选，默认当前聚焦群；填 * 看所有服务群）"},
-                        "task_id": {"type": "string", "description": "任务号前缀（比如 feeds-verify、T-9、admin-tool；tools 用）"},
+                        "task_id": {"type": "string", "description": "任务号前缀（比如 feeds-collect、T-9、admin-tool；tools 用）"},
                         "tool": {"type": "string", "description": "工具名包含（比如 flovia 能捞出 mcp_flovia_flovia_x；tools 用）"},
                         "failed_only": {"type": "boolean", "description": "只看失败的"},
                         "limit": {"type": "integer", "description": "最多几条，默认 20（tools 默认 30），最多 200"},

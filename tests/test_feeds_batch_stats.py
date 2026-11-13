@@ -96,9 +96,9 @@ def test_batch_stats_recorded_and_exposed(tmp_path) -> None:
         assert got == 2
         batches = feeds.news_view(GID)
 
-    # 2026-10-01 起撒网不再派子 agent：全程没有任何 feeds-discover: 派工
-    assert counting.calls
-    assert not any(str(c.get("task_id") or "").startswith("feeds-discover:") for c in counting.calls)
+    # 2026-11 零子 agent 改版：撒网 / 打开原文都不派子 agent，一轮里一次派工都没有；
+    # 工具用量由主流程代码走 tools 时自己落 tool_calls（fetch_page 见上面的 _rows 断言）
+    assert counting.calls == [], f"一轮里不该有任何子 agent 派工：{counting.calls}"
     assert len(batches) == 1
     stats = batches[0]["stats"]
     # 两阶段恒生效后 stats 还带漏斗（funnel）；basic 三个数按老口径对
@@ -144,8 +144,9 @@ def test_score_failure_keeps_collected_counts(tmp_path) -> None:
     assert len(batches) == 1
     assert batches[0]["skipped"] is True
     stats = batches[0]["stats"]
-    # 收集阶段之后才失败：已经搜过 / 看过的次数保留（funnel 另带，见上）
-    assert [stats[k] for k in ("searches", "pages", "kept")] == [2, 1, 0]
+    # 收集阶段之后才失败：已经搜过 / 看过的次数保留（funnel 另带，见上）。
+    # 零子 agent 改版：打开原文 = 主流程 fetch_page，3 条挑中候选都真开过 → pages=3
+    assert [stats[k] for k in ("searches", "pages", "kept")] == [2, 3, 0]
 
 
 def test_old_batch_has_no_stats(tmp_path) -> None:
@@ -179,14 +180,28 @@ def test_stats_of_one_batch_do_not_leak_into_another(tmp_path) -> None:
     def _wire(counting_rows, report):
         feeds._workers = CountingWorkers(store, report, counting_rows)
         # 这一轮「代码撒网」要找的东西也换（假搜索是从 workers 预置供的，换回合得跟着换）
-        from fakes import FakePlannedSearch
+        from fakes import FakePlannedSearch, _wrap_score_enrichment
 
+        data = getattr(report, "data", None) or {}
         if isinstance(feeds._search, FakePlannedSearch):
-            data = getattr(report, "data", None) or {}
             feeds._search._items_callable = None  # 不再懒取旧 workers 的 report
             feeds._search.items_by_focus = {1: list(data.get("items") or [])}
             feeds._search.planned_searches = {}
             feeds._search.set_planned(False)
+        # fixture fetch_page 的预置也换（patch_two_phase_feeds 接的 tools 还认
+        # 第一轮 workers 的 report——它闭包里的 workers 变量不跟着 _workers 换）
+        from fakes import make_fixture_page_tools
+
+        feeds.set_tools(
+            make_fixture_page_tools(store, list(data.get("items") or []))
+        )
+        # 新换的 models 同样接「打分没给 summary/quote 就照正文补」（patch_two_phase_feeds
+        # 只对第一轮那份接过一次；换 models 要重接，幂等）
+        _wrap_score_enrichment(
+            feeds._models,
+            getattr(feeds._search, "_current_items", None) or [],
+        )
+        feeds._models._fixture_tools = getattr(feeds, "_tools", None)
 
         async def _seeded(gid, focus, _settings, *, collect_mark, stats_out):
             feeds._workers._record(collect_mark, "web_search")

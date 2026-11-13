@@ -10,7 +10,8 @@ prepare_news 的第 ② 步固定为：
 2. 保底（代码）：某个方向搜不够（<2 次问 / <6 条候选）→ 代码直接补搜；
 3. 粗筛（代码，不调模型）：已入库链接 / 屏蔽来源 / 太旧 / 标题近似撞掉，再按方向均衡（40% 上限）留 ≤24 条；
 4. 挑（主模型一次 json_mode）：挑 8–12 条真去打开，每条带一句话理由（hook），失败回落前 10 条；
-5. 核验（最多 3 个子 agent 并发，只用 fetch_page，task_id feeds-verify: 开头）：真打开原文按老格式交回；
+5. 打开原文（2026-11 零子 agent 改版：_open_candidates 主流程代码 fetch_page，并发 ≤4、
+   tool_calls 记到本轮 collect 标记；不再派核验子 agent）；
 6. 之后完全走老路（第一道 / 打分 / 帖子 / 入库）。
 
 漏斗统计（kv feeds.batch_stats.<批次> 的 "funnel"）+ 可追溯：news_items.src_query / src_provider，
@@ -274,8 +275,13 @@ def test_two_phase_always_on_even_with_stale_kv(tmp_path) -> None:
         assert kept == 1, write_stale_kv
         discovers = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-discover:")]
         assert discovers == [], workers.calls  # 撒网不再派子 agent
+        # 2026-11 零子 agent 改版：核验 / 补打开子 agent 已删——一次派工都没有；
+        # 挑中的候选由主流程代码 fetch_page 真打开（tool_calls 记到本轮 collect 标记下）
         verifies = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-verify:")]
-        assert verifies and all(v["tools"] == ["fetch_page"] for v in verifies), workers.calls
+        assert verifies == [], workers.calls
+        opened = store.read().execute(
+            "SELECT input FROM tool_calls WHERE tool='fetch_page' AND ok=1").fetchall()
+        assert any("https://a.com/1" in str(r["input"]) for r in opened), [dict(r) for r in opened]
         # 老路的标志：一个 web_search+fetch_page 一把梭、task_id feeds-collect: 的子 agent——不再存在
         collects = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-collect:")]
         assert collects == [], workers.calls
@@ -665,78 +671,107 @@ def test_prefilter_caps_focus_share(tmp_path) -> None:
 
 
 def test_pick_model_failure_falls_back(tmp_path) -> None:
-    """挑的模型调炸了 → 前 10 条粗筛结果直接进核验，不报错。"""
+    """挑的模型调炸了 → 前 10 条粗筛结果直接开原文（主流程代码 fetch_page），不报错。"""
     search = FakeBroadSearch(results=[
         {"title": f"S{i}", "url": f"https://s.com/{i}", "snippet": "s", "published": None} for i in range(12)
     ])
-    verify = [_ok_report({"items": [_verify_item("https://s.com/0")]})]
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
-        tmp_path, verify=verify, search=search,
+        tmp_path, search=search,
     )
     from CharTyr_MaiWork.maiwork.models import ModelError
     models.reply_queue = [_FOCUS_JSON, ModelError("模型炸了"), _scores_json(_score(0))]
     with _TimePatch():
         kept = _run(feeds.prepare_news(GID))
     assert kept == 1
-    verifies = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-verify:")]
-    assert verifies
-    brief_all = "\n".join(v["brief"] for v in verifies)
-    assert "https://s.com/0" in brief_all
+    assert workers.calls == [], "零子 agent 改版后一轮里不派任何子 agent"
+    opened = store.read().execute(
+        "SELECT input FROM tool_calls WHERE tool='fetch_page' AND ok=1").fetchall()
+    urls = [str(r["input"]) for r in opened]
+    assert "https://s.com/0" in urls, urls
+    # 回落挑前 10 条：开了且只开了 ≤10 个候选链接（s.com/0..s.com/9）
+    assert 1 <= sum(1 for u in urls if u.startswith("https://s.com/")) <= 10
 
 
 # ----------------------------------------------------------------------
-# 核验（verify）
+# 打开原文（2026-11 零子 agent 改版：_open_candidates = 主流程代码 fetch_page，
+# 不再派核验子 agent）
 # ----------------------------------------------------------------------
 
 
-def test_verify_workers_concurrent_and_fail_isolated(tmp_path) -> None:
-    """核验子 agent 并发跑（max ≥2）；一个炸了只丢它自己那份，别人的照收。"""
-    search = FakeBroadSearch(results=[
-        {"title": f"S{i}", "url": f"https://s.com/{i}", "snippet": "s", "published": None} for i in range(12)
-    ])
-    verify = [
-        _ok_report(None, ok=False, error="炸了"),  # 第 1 组炸
-        _ok_report({"items": [_verify_item("https://s.com/4")]}),  # 第 2 组回 1 条
-    ]
-    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
-        tmp_path, verify=verify, search=search,
-    )
-    picks = [{"i": i, "kind": "news", "hook": f"理由{i}"} for i in range(12)]
-    models.reply_queue = [
-        _FOCUS_JSON,
-        json.dumps({"picks": picks}, ensure_ascii=False),
-        _scores_json(_score(0)),
-    ]
-    with _TimePatch():
-        kept = _run(feeds.prepare_news(GID))
-    assert kept == 1  # 炸的那组不拖累好组：好组回来 1 条入库
-    assert workers.max_parallel >= 2, workers.max_parallel
-    verifies = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-verify:")]
-    assert len(verifies) >= 2
-    assert all(v["tools"] == ["fetch_page"] for v in verifies)
-    rows = store.read().execute("SELECT * FROM news_items WHERE rejected=0").fetchall()
-    assert len(rows) == 1
-    assert rows[0]["src_provider"] != ""
+def test_open_candidates_concurrent_and_fail_isolated(tmp_path) -> None:
+    """打开原文并发跑（上限 4）；一条打不开只丢它自己，别的照常绑正文过第一道。"""
+    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path)
+    from fakes import make_fixture_page_tools
 
-
-def test_verify_output_order_follows_picks(tmp_path) -> None:
-    """并发核验按轮循分组会把候选顺序打散；交回入库前按挑的顺序排回去，
-    让「打分的 i ↔ 候选的 i」在老用例口径下稳定（顺序就是子 agent 看到的顺序）。"""
-    picks = [
-        (_candidate(f"https://o.com/{i}", title=f"顺序{i}"), "news", f"理由{i}")
+    items = [
+        {"title": f"S{i}", "url": f"https://s.com/{i}", "summary": "摘要",
+         "kind": "news", "fetched": (i != 5),
+         "quote": f"第 {i} 条的原话。", "paywall": False}
         for i in range(6)
     ]
-    r0 = _ok_report({"items": [_verify_item("https://o.com/3"), _verify_item("https://o.com/0")]})
-    r1 = _ok_report({"items": [_verify_item("https://o.com/4"), _verify_item("https://o.com/1")]})
-    r2 = _ok_report({"items": [_verify_item("https://o.com/5"), _verify_item("https://o.com/2")]})
-    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
-        tmp_path, verify=[r0, r1, r2],
-    )
-    items, opened = _run(feeds._verify_batch(
-        GID, picks, verify_mark="feeds-verify:order:1", deadline_ts=NOW + 60,
-    ))
-    assert [it["url"] for it in items] == [f"https://o.com/{i}" for i in range(6)]
-    assert opened == 6
+    # 预置不给 published：页面没日期 → 第一道新鲜度让给模型侧（这里只测打开/正文证据）
+    feeds.set_tools(make_fixture_page_tools(store, items))
+
+    # 并发度记录：进一次 fetch_page +1，出来 -1（fixture handler 里 sleep(0) 让位）
+    orig_call = feeds._tools.call
+    cur = 0
+    peak = 0
+    called: list[str] = []
+
+    async def wrapped(name, args, ctx):
+        nonlocal cur, peak
+        if name == "fetch_page":
+            cur += 1
+            peak = max(peak, cur)
+            called.append(str(args.get("url") or ""))
+            await asyncio.sleep(0)
+        try:
+            return await orig_call(name, args, ctx)
+        finally:
+            if name == "fetch_page":
+                cur -= 1
+
+    feeds._tools.call = wrapped
+    cands = [
+        dict(_candidate(f"https://s.com/{i}", title=f"S{i}"),
+             url_key=_normalize_url(f"https://s.com/{i}"), site="s.com", kind="news")
+        for i in range(6)
+    ]
+    funnel = {"timings_s": {}, "opened": 0}
+    _run(feeds._open_candidates(GID, cands, task_id="feeds-collect:open:1", funnel=funnel))
+    assert peak >= 2, "打开原文要并发跑"
+    assert len(called) == 6, "候选各开一次，不合并不重开"
+    # 5 号打不开（fixture 预置 fetched=False）→ 没正文，其余都绑上了本轮正文证据
+    got_body = [c for c in cands if c.get("_fetched_evidence")]
+    assert [c["url"] for c in got_body] == [f"https://s.com/{i}" for i in range(6) if i != 5]
+    assert cands[5].get("fetched") is False
+    assert funnel["opened"] == 5
+    # 第一道只拒打不开的那条，理由「没真打开过」
+    survivors = feeds._hard_reject_code(GID, settings, cands, require_quote=False)
+    assert len(survivors) == 5
+    assert cands[5]["reject"][0] == "hard" and "打开" in cands[5]["reject"][1]
+
+
+def test_open_candidates_preserves_pick_order(tmp_path) -> None:
+    """_open_candidates 就地改候选、不打乱顺序：「打分的 i ↔ 候选的 i」不变。"""
+    store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(tmp_path)
+    from fakes import make_fixture_page_tools
+
+    items = [
+        {"title": f"顺序{i}", "url": f"https://o.com/{i}", "summary": "摘要",
+         "kind": "news", "fetched": True,
+         "quote": f"第 {i} 条的原话。", "paywall": False}
+        for i in range(6)
+    ]
+    feeds.set_tools(make_fixture_page_tools(store, items))
+    cands = [
+        dict(_candidate(f"https://o.com/{i}", title=f"顺序{i}"),
+             url_key=_normalize_url(f"https://o.com/{i}"), site="o.com", kind="news")
+        for i in range(6)
+    ]
+    _run(feeds._open_candidates(GID, cands, task_id="feeds-collect:open:2"))
+    assert [c["url"] for c in cands] == [f"https://o.com/{i}" for i in range(6)]
+    assert all(c.get("fetched") is True for c in cands)
 
 
 def test_verify_picks_without_hook_dropped(tmp_path) -> None:
@@ -744,9 +779,8 @@ def test_verify_picks_without_hook_dropped(tmp_path) -> None:
     search = FakeBroadSearch(results=[
         {"title": f"S{i}", "url": f"https://s.com/{i}", "snippet": "s", "published": None} for i in range(6)
     ])
-    verify = [_ok_report({"items": [_verify_item("https://s.com/1")]})]
     store, settings, feeds, models, workers, topics = _ready_two_phase_feeds(
-        tmp_path, verify=verify, search=search,
+        tmp_path, search=search,
     )
     picks = [
         {"i": 0, "kind": "news", "hook": "   "},  # 空 hook → 丢
@@ -761,10 +795,12 @@ def test_verify_picks_without_hook_dropped(tmp_path) -> None:
     with _TimePatch():
         kept = _run(feeds.prepare_news(GID))
     assert kept == 1
-    verifies = [c for c in workers.calls if str(c.get("task_id") or "").startswith("feeds-verify:")]
-    brief_all = "\n".join(v["brief"] for v in verifies)
-    assert "https://s.com/1" in brief_all
-    assert "https://s.com/0" not in brief_all
+    assert workers.calls == []
+    opened = store.read().execute(
+        "SELECT input FROM tool_calls WHERE tool='fetch_page'").fetchall()
+    urls = [str(r["input"]) for r in opened]
+    assert "https://s.com/1" in urls, urls
+    assert "https://s.com/0" not in urls, urls
 
 
 # ----------------------------------------------------------------------

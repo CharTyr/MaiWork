@@ -1825,9 +1825,22 @@ class MaiWorkApp:
         if cls is None:
             return None
         try:
+            import inspect as _inspect
+
+            extra = {}
+            try:
+                sig = _inspect.signature(cls)
+                if "tools" in sig.parameters or any(
+                    p.kind == _inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                ):
+                    # 零子 agent 改版：找料的主流程代码自己调 fetch_page，把工具注册表递进去
+                    extra["tools"] = self.tools
+            except (TypeError, ValueError):
+                pass
             return cls(
                 self.store, self.models, self.workers, self.profiles, self.topics,
                 self.get_settings, search=self.search, host=self.host, identity=self.identity,
+                **extra,
             )
         except Exception:
             logger.exception("建 Personal 出错，关注成员个人向产出这次跳过")
@@ -1843,11 +1856,24 @@ class MaiWorkApp:
         if cls is None:
             return None
         try:
+            import inspect as _inspect
+
+            extra = {}
+            try:
+                sig = _inspect.signature(cls)
+                if "tools" in sig.parameters or any(
+                    p.kind == _inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                ):
+                    # 零子 agent 改版：补打开的主流程代码自己调 fetch_page，把工具注册表递进去
+                    extra["tools"] = self.tools
+            except (TypeError, ValueError):
+                pass
             return cls(
                 self.store, self.models, self.workers, self.profiles, self.topics,
                 self.get_settings, search=self.search, host=self.host, on_start=self._on_idea_started,
                 verify_runner=self._make_verify_runner(), identity=self.identity,
                 rss_transport=self.rss_transport,
+                **extra,
             )
         except Exception:
             logger.exception("建 Feeds 出错，资讯/构想这次跳过")

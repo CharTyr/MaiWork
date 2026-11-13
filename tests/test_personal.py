@@ -30,7 +30,15 @@ from CharTyr_MaiWork.maiwork import clock
 from CharTyr_MaiWork.maiwork.config import load_settings
 from CharTyr_MaiWork.maiwork.store import Store
 
-from fakes import FakeCtx, FakeModelsQueue, FakeProfiles, focus_reply
+from fakes import (
+    FakeCtx,
+    FakeModelsQueue,
+    FakeProfiles,
+    focus_reply,
+    patch_personal_collect,
+    _wire_fixture_page_tools,
+    _wrap_score_enrichment,
+)
 from test_feeds import FakeSearch, UnavailableSearch, FakeWorkers, _ok_report  # noqa: F401
 
 BJ = timezone(timedelta(hours=8))
@@ -191,8 +199,15 @@ def _make_personal(
     removed: int = 0,
     focus_on: bool = True,
     seed_persona: bool = True,
+    items=None,
 ):
-    """装好个人向模块 + 一个带画像的关注成员（默认阿帆 / UID）。"""
+    """装好个人向模块 + 一个带画像的关注成员（默认阿帆 / UID）。
+
+    2026-11 零子 agent 改版：找料不再派 personal-collect: 子 agent——Phase A 代码按计划搜
+    （FakePlannedSearch 供结果）、Phase C 代码自己 fetch_page（fixture 版）。search=None 时
+    自动接 patch_personal_collect（items 默认 _WORKER_ITEMS）；显式给 search 的用例照旧接
+    fixture 工具 + 打分补写。
+    """
     store = Store(tmp_path / "t.db")
     store.migrate()
     _seed_group(store, GID, ready=True)
@@ -221,6 +236,21 @@ def _make_personal(
     personal = Personal(
         store, models, workers, profiles, topics, lambda: settings, search=search
     )
+    def _live_items():
+        r = getattr(workers, "report", None) if workers is not None else None
+        data = getattr(r, "data", None)
+        if isinstance(data, dict) and isinstance(data.get("items"), list):
+            return list(data["items"])
+        return list(_WORKER_ITEMS["items"])
+
+    eff_items = _live_items if items is None else items
+    if search is None:
+        # 代码找料的默认接线：假搜索供候选 + fixture fetch_page
+        patch_personal_collect(personal, models, eff_items)
+    else:
+        _wire_fixture_page_tools(personal, eff_items)
+        _wrap_score_enrichment(models, eff_items)
+        models._fixture_tools = getattr(personal, "_tools", None)
     return store, settings, personal, models, workers, topics, profiles
 
 
@@ -273,9 +303,11 @@ class TestPersonalPrepare:
         assert workers.calls == []
 
     def test_collect_has_time_box(self, tmp_path) -> None:
-        """子 agent 找资讯要有时间盒（和群资讯同一个 [feeds] collect_minutes）。
-        2026-09-29 线上：个人资讯子 agent 没有时间盒，一轮跑了一个多小时、反复压缩对话。"""
-        from CharTyr_MaiWork.maiwork import clock
+        """找料有硬边界（2026-11 零子 agent 改版：原来靠子 agent 时间盒，现在代码自己跑——
+        不再派工，靠搜索/打开页数硬上限拦打转：PERSONAL_SEARCH_CAP / PERSONAL_PAGE_CAP）。
+        2026-09-29 线上：个人资讯找料没有边界，一轮跑了一个多小时、反复压缩对话。"""
+        from CharTyr_MaiWork.maiwork import personal as personal_mod
+        from CharTyr_MaiWork.maiwork import verify_budget
 
         models = FakeModelsQueue(
             ready=True,
@@ -287,14 +319,14 @@ class TestPersonalPrepare:
             ],
         )
         store, settings, personal, models, workers, topics, _ = _make_personal(tmp_path, models=models)
-        before = clock.now()
         _run(personal.prepare_personal(GID, UID))
-        assert workers.calls, "应该派了子 agent"
-        dl = workers.calls[0].get("deadline_ts")
-        assert dl is not None, "个人资讯子 agent 必须带 deadline_ts"
-        minutes = int(getattr(settings.feeds, "collect_minutes", 15) or 15)
-        assert before + minutes * 60 - 5 <= dl <= clock.now() + minutes * 60 + 5
-        assert f"{minutes} 分钟" in workers.calls[0]["brief"]
+        assert workers.calls == [], "零子 agent 改版后找料不再派工"
+        # 硬上限进代码：一次找料搜索 ≤10 次、打开 ≤8 页（都在 PERSONAL_*_CAP 里钉死）
+        assert len(personal._search.calls) <= personal_mod.PERSONAL_SEARCH_CAP
+        assert personal_mod.PERSONAL_SEARCH_CAP == 10
+        assert personal_mod.PERSONAL_PAGE_CAP == 8
+        # 这轮用过的页数账本收尾时清掉（不残留）
+        assert not any(tid.startswith("personal-collect:") for tid in verify_budget._RUNS)
 
     def test_happy_path_writes_target_user_id(self, tmp_path) -> None:
         """全流程：过线的两条入 news_items 且 target_user_id=UID；被筛的一条也入库。"""
@@ -361,7 +393,7 @@ class TestPersonalPrepare:
             json.dumps(posts, ensure_ascii=False),
         ])
         store, settings, personal, models, workers, topics, _ = _make_personal(
-            tmp_path, models=models, workers=FakeWorkers(_ok_report(items4))
+            tmp_path, models=models, items=items4["items"]
         )
         with _time_patch():
             got = _run(personal.prepare_personal(GID, UID))
@@ -431,7 +463,7 @@ class TestPersonalPrepare:
             json.dumps(posts, ensure_ascii=False),
         ])
         store, settings, personal, models, workers, topics, _ = _make_personal(
-            tmp_path, models=models, workers=FakeWorkers(_ok_report(items5))
+            tmp_path, models=models, items=items5["items"]
         )
         with _time_patch():
             got = _run(personal.prepare_personal(GID, UID))
@@ -478,7 +510,7 @@ class TestPersonalPrepare:
             again = _run(personal.prepare_personal(GID, UID))
         assert again == 0
         assert len(models.calls) == n_calls_after_first
-        assert len(workers.calls) == 1  # 只跑过一轮子 agent
+        assert workers.calls == []  # 零子 agent 改版后找料不派工，两轮都没碰 workers
 
     def test_idea_optional_with_target_user_id(self, tmp_path) -> None:
         """可顺带产出 0–1 条「我可以帮你……」构想，落 ideas.target_user_id，不进候选池。"""
@@ -601,6 +633,9 @@ class TestPersonalPrepare:
                  "audience": [], "keywords": ["FPGA"]},
             ]}, ensure_ascii=False),
         ])
+        # 换一份带回复队列的 models：同样接打分补写 + fixture 页面台账（和 _make_personal 里一样）
+        models2._fixture_tools = getattr(personal, "_tools", None)
+        _wrap_score_enrichment(models2, _WORKER_ITEMS["items"])
         personal._models = models2
         with _time_patch():
             _run(personal.prepare_personal(GID, UID))

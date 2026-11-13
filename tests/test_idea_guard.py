@@ -318,9 +318,9 @@ def _seed_unhandled_idea(store, uid: str, *, created: float, title: str = "我�
 
 
 def test_generation_gate_blocks_second_unhandled_idea_for_same_member(tmp_path) -> None:
-    store, settings, personal, models, workers, topics, _ = tp._make_personal(tmp_path)
+    models = _prep_models(tp.FakeModelsQueue, "我可以帮你把新的例程跑一遍")
+    store, settings, personal, models, workers, topics, _ = tp._make_personal(tmp_path, models=models)
     _seed_unhandled_idea(store, tp.UID, created=tp.NOW - 3600)
-    personal._models = _prep_models(type(models), "我可以帮你把新的例程跑一遍")
     with tp._time_patch():
         tp._run(personal.prepare_personal(tp.GID, tp.UID))
     rows = store.read().execute(
@@ -331,9 +331,9 @@ def test_generation_gate_blocks_second_unhandled_idea_for_same_member(tmp_path) 
 
 def test_generation_gate_allows_new_idea_after_old_one_ages_out(tmp_path) -> None:
     """7 天以前的旧行不再锁死：新的个人向构照常出。"""
-    store, settings, personal, models, workers, topics, _ = tp._make_personal(tmp_path)
+    models = _prep_models(tp.FakeModelsQueue, "我可以帮你把新的例程跑一遍")
+    store, settings, personal, models, workers, topics, _ = tp._make_personal(tmp_path, models=models)
     _seed_unhandled_idea(store, tp.UID, created=tp.NOW - 8 * 86400.0)
-    personal._models = _prep_models(type(models), "我可以帮你把新的例程跑一遍")
     with tp._time_patch():
         tp._run(personal.prepare_personal(tp.GID, tp.UID))
     rows = store.read().execute(
@@ -344,10 +344,10 @@ def test_generation_gate_allows_new_idea_after_old_one_ages_out(tmp_path) -> Non
 
 def test_generation_gate_group_cap_is_narrow(tmp_path) -> None:
     """每群 7 天最多 3 条个人向构想；到顶只挡构想，个人向资讯照出。"""
-    store, settings, personal, models, workers, topics, _ = tp._make_personal(tmp_path)
+    models = _prep_models(tp.FakeModelsQueue, "我可以帮你把新的例程跑一遍")
+    store, settings, personal, models, workers, topics, _ = tp._make_personal(tmp_path, models=models)
     for i, uid in enumerate(("90001", "90002", "90003")):
         _seed_unhandled_idea(store, uid, created=tp.NOW - 3600, title=f"我可以帮你第 {i} 份")
-    personal._models = _prep_models(type(models), "我可以帮你把新的例程跑一遍")
     with tp._time_patch():
         got = tp._run(personal.prepare_personal(tp.GID, tp.UID))
     assert got > 0     # 个人向资讯照出

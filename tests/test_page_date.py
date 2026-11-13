@@ -297,13 +297,16 @@ def _guide_items(url: str = "https://gcores.com/deep") -> list[dict]:
 
 
 def _setup_guide(tmp_path, *, code_date: str) -> tuple:
-    ref: list = [None]
+    from fakes import _wrap_score_enrichment, make_fixture_page_tools
+
     items = _guide_items()
-    workers = _CodeDateWorkers(ref, items, {"https://gcores.com/deep": code_date})
-    store, settings, feeds, models, _w, _topics, _profiles = _make_feeds(
-        tmp_path, items=items, scores=_scores_json(_score(0, topic="长文")), workers=workers
+    page_items = [dict(items[0], page_published=code_date)]
+    store, settings, feeds, models, workers, _topics, _profiles = _make_feeds(
+        tmp_path, items=items, scores=_scores_json(_score(0, topic="长文"))
     )
-    ref[0] = store
+    feeds.set_tools(make_fixture_page_tools(store, page_items))
+    models._fixture_tools = feeds._tools
+    _wrap_score_enrichment(models, page_items)
     return store, feeds, workers, models
 
 

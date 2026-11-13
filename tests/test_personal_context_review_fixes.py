@@ -180,8 +180,10 @@ def _personal_env(
     workers = FakeWorkers(_ok_report(_WORKER_ITEMS))
     topics = FakeTopics()
     from CharTyr_MaiWork.maiwork.personal import Personal
+    from fakes import patch_personal_collect
 
     personal = Personal(store, models, workers, FakeProfiles(), topics, lambda: settings)
+    patch_personal_collect(personal, models, _WORKER_ITEMS["items"])
     if agents == "auto":
         agents = _agents_with_content(store, gid, other) if other else Agents(store, lambda: _Settings((gid,)))
     personal._agents = agents  # noqa: SLF001  （app._wire_specialists 的接线点）
@@ -225,15 +227,15 @@ def test_plan_focus_prompt_no_other_group_content(tmp_path):
 
 
 def test_collect_brief_has_rules_and_news_skill_only(tmp_path):
-    """找料子 agent 的 brief 注 group_context(kind=news)：规矩 + 资讯做法，不注构想做法。"""
-    _store, _settings_obj, personal, _models, workers, _topics, _agents = _personal_env(tmp_path)
+    """零子 agent 改版：找料不派子 agent；打分/定关注点照样按 news 注规矩 + 资讯做法，不注构想做法。"""
+    _store, _settings_obj, personal, models, workers, _topics, _agents = _personal_env(tmp_path)
     _run_personal(personal)
-    assert workers.calls, "该派了找料子 agent"
-    brief = str(workers.calls[0]["brief"])
-    assert _RULES in brief
-    assert _NEWS_SKILL in brief
-    assert _IDEA_SKILL not in brief, "找的是资讯，不该注构想做法"
-    assert _G2_NEWS not in brief and _G2_RULES not in brief
+    assert workers.calls == []
+    prompt = _prompts(models)["personal.score"]
+    assert _RULES in prompt
+    assert _NEWS_SKILL in prompt
+    assert _IDEA_SKILL not in prompt, "打分的是资讯，不该注构想做法"
+    assert _G2_NEWS not in prompt and _G2_RULES not in prompt
 
 
 def test_score_prompt_has_rules_and_news_skill_only(tmp_path):
@@ -280,7 +282,7 @@ def test_missing_agents_still_runs_and_injects_nothing(tmp_path):
     )
     got = _run_personal(personal)
     assert got > 0
-    assert workers.calls
+    assert workers.calls == []
     captured = _prompts(models)
     for purpose in ("personal.focus", "personal.score", "personal.post"):
         blob = captured.get(purpose, "")
@@ -294,7 +296,7 @@ def test_broken_agents_does_not_break_pipeline(tmp_path):
     )
     got = _run_personal(personal)
     assert got > 0
-    assert workers.calls
+    assert workers.calls == []
     blob = _prompts(models)["personal.focus"]
     assert _RULES not in blob and _NEWS_SKILL not in blob
 

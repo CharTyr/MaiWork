@@ -345,25 +345,23 @@ class TestNewsStageDispatch:
         report = await feeds._recheck_run(G1, "feeds-recheck:x", "重看这几条", group_id=G1)
         assert report.ok is True
         assert sp.runs_of("news")[0]["phase"] == "recheck"
-        assert sp.runs_of("news")[0]["tools"] == ["fetch_page", "web_search"]
+        # 2026-11 零子 agent 改版：recheck 已从 AUTO_PHASES 撤掉（补打开不再派子 agent，
+        # 走 _open_candidates）；这条保留的兼容路径跑起来基础名单为空。
+        assert sp.runs_of("news")[0]["tools"] == []
         assert [r["id"] for r in sp.reviews] == [report.handoff_id]
         assert agents.calls["review"] and agents.calls["review"][0][2] is True
 
     @pytest.mark.asyncio
     async def test_two_phase_dispatch_collect_verify_tools(self, store):
-        """两阶段（2026-10-01 起撒网是代码按计划搜，不再派子 agent）：撒网阶段一次专岗/worker
-        派工都不发生，核验照旧走 sp.run tools=["fetch_page"] 且 agent_type kind=news。"""
+        """两阶段找料全程不派子 agent（2026-11 零子 agent 改版）：
+        撒网代码按计划搜、核验子 agent 已删——挑完直接成「没打开」候选，
+        打开原文挪到 _prepare_news_round 的 _open_candidates（主流程 fetch_page）。
+        _collect_two_phase 里一次专岗/worker 派工都不发生。"""
         with store.tx() as conn:
             store.kv_set(conn, "feeds.two_phase", [G1])
         workers = FakeWorkersQueue()
         agents = FakeAgents()
-        sp = FakeSpecialists(agents, results=[
-            # 核验阶段：3 组份可能并发；把同格式带回放在队列里足够
-            WorkerReport(ok=True, summary="v1", data={"items": [{
-                "title": "x", "url": "https://a.com/x1", "summary": "s", "kind": "news",
-                "fetched": True, "quote": "q", "published": "", "paywall": False, "image_url": "",
-            }]}),
-        ])
+        sp = FakeSpecialists(agents, results=[])
         models = _ModelsOK({
             "feeds.pick": '{"picks":[{"i":0,"kind":"news","hook":"h"}]}',
         })
@@ -385,14 +383,13 @@ class TestNewsStageDispatch:
         feeds._search = _SearchOK()  # 代码撒网：预设链接完整的搜索结果 → 登记簿有候选
         focus = [{"query": "test", "why": "", "angle": "", "source": ""}]
         items = await feeds._collect_two_phase(G1, focus, settings, collect_mark="feeds-collect:test", stats_out={})
-        assert sp.runs_of("news")
-        # 撒网阶段一派工都没发生（没有 web_search 的专岗/worker 调用）；核验阶段只给了 fetch_page
-        assert all(set(r.get("tools") or []) == {"fetch_page"} for r in sp.runs_of("news"))
+        # 一个子 agent 都没派（news 专岗 0 次、workers 0 次）
+        assert sp.runs_of("news") == []
         assert workers.calls == []
+        # 挑中的候选是「没打开」格式：等 _open_candidates / 打分环节补
         assert items and items[0]["url"] == "https://a.com/x1"
-        # 每条 eff_tools 都不含 mcp_*
-        for r in sp.runs_of("news"):
-            assert not any(str(t).startswith("mcp_") for t in r["eff_tools"])
+        assert items[0]["fetched"] is False
+        assert items[0]["kind"] == "news"
 
     @pytest.mark.asyncio
     async def test_disabled_news_role_rejected_before_workers_and_no_memory(self, store):

@@ -140,9 +140,9 @@ def test_hard_reject_runs_off_event_loop(tmp_path, monkeypatch) -> None:
     seen_items: list[dict] = []
     orig = feeds._hard_reject_code
 
-    def _spy(gid, s, c):
+    def _spy(gid, s, c, **kw):
         seen.append(threading.get_ident())
-        survivors = orig(gid, s, c)
+        survivors = orig(gid, s, c, **kw)
         seen_items.extend(c)
         return survivors
 
@@ -179,7 +179,17 @@ def test_personal_hard_reject_runs_off_event_loop(tmp_path, monkeypatch) -> None
                 json.dumps({"posts": []}, ensure_ascii=False),
             ],
         ),
-        search=FakeSearch(),
+        items=[{
+            "title": "",
+            "url": "https://example.com/fpga-board",
+            "body": "《新开源 FPGA 学习板上架》\n一块新的 FPGA 学习板正式上架，资料齐全，原文依据充分。",
+            "summary": "一块新的 FPGA 学习板。",
+            "kind": "news",
+            "published": NOW - 86400,
+            "fetched": True,
+            "quote": "一块新的 FPGA 学习板正式上架，资料齐全，原文依据充分。",
+            "paywall": False,
+        }],
     )
     # 已发过标题（和候选「新开源 FPGA 学习板上架」相似度 0.93 ≥ 0.8）→ 硬拒
     with store.tx() as conn:
@@ -193,9 +203,9 @@ def test_personal_hard_reject_runs_off_event_loop(tmp_path, monkeypatch) -> None
     seen_items: list[dict] = []
     orig = personal._hard_reject_code
 
-    def _spy(gid, c):
+    def _spy(gid, c, **kw):
         seen.append(threading.get_ident())
-        survivors = orig(gid, c)
+        survivors = orig(gid, c, **kw)
         seen_items.extend(c)
         return survivors
 
